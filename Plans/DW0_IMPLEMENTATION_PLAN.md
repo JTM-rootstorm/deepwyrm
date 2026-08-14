@@ -830,3 +830,140 @@ DW0 is finished only when all of the following are true:
 - no DW0 non-goal has become a hidden prerequisite
 
 Once these conditions hold, freeze a DW0 completion commit/tag and move hardware-driver/VFS expansion into DW1 rather than continuing to enlarge DW0.
+
+---
+
+# 15. Mandatory security validation flow and gate
+
+Security review is a **required DW0 acceptance gate**. It complements functional testing and does not replace unit tests, QEMU tests, code review, or architectural invariants. Daybreak Blue / Codex Security should be used as a dedicated security-review lane when available, but Deepwyrm must not acquire a runtime or build dependency on that service.
+
+## 15.1 Review flow
+
+For security-sensitive changes and at every phase gate, use this sequence:
+
+```text
+implementation
+    |
+targeted functional tests
+    |
+static/lint/invariant checks + targeted fuzz/property tests
+    |
+Daybreak Blue security review of the exact revision/diff
+    |
+triage findings against Deepwyrm threat model and locked invariants
+    |
+remediate confirmed findings
+    |
+add regression tests reproducing the failure class
+    |
+rerun targeted + affected integration tests
+    |
+re-review security-relevant remediation
+    |
+coordinator records security-gate disposition
+```
+
+Security review must be performed against an identified commit or diff. A report against stale code does not satisfy the gate after security-sensitive changes have landed.
+
+If Daybreak Blue is temporarily unavailable, the coordinator may use equivalent manual/security-tool review for an intermediate phase, but **DW0 milestone closure requires a recorded security review of the release candidate** before tagging.
+
+## 15.2 Required DW0 security-review surfaces
+
+Review at minimum:
+
+- every production `unsafe` block and the safe abstraction that contains it
+- x86_64 syscall entry/return register sanitization
+- user pointer, length, alignment, range, and integer-overflow validation
+- `DwBootInfoV1` and boot-module range validation
+- physical/virtual mapping ownership and user/kernel isolation
+- NX, W^X, page-zero, MMIO-execute, and permission-transition enforcement
+- handle-table generation/stale-handle behavior
+- object-type and rights validation on every handle-consuming syscall
+- rights reduction, duplication, and transfer so authority cannot increase accidentally
+- channel byte+handle transfer atomicity and rollback behavior
+- queue/backpressure and peer-close races
+- wait/wake paths for lost wakeups, use-after-free, and race-driven authority leaks
+- task termination and TaskGroup descendant authority
+- narrow bootstrap ELF parser arithmetic, segment overlap, permissions, and malformed-input rejection
+- bootstrap capability construction so primordial userspace receives no unintended ambient authority
+- future driver-resource stubs/interfaces for accidental unrestricted physical-memory, MMIO, IRQ, or DMA authority
+
+## 15.3 Adversarial and negative tests
+
+DW0 should accumulate reusable adversarial tests rather than one-off review notes. Include, where applicable:
+
+- null, noncanonical, kernel-space, unmapped, page-boundary, and overflowed user pointers
+- zero-length and maximum-length ABI structures/messages
+- malformed structure sizes, versions, flags, and nonzero reserved fields
+- stale, invalid, wrong-type, and insufficient-rights handles
+- attempts to duplicate or transfer greater rights than possessed
+- failed channel sends proving transferred handles remain with the sender
+- successful transfers proving sender handles are invalidated exactly once
+- mapping overlaps, integer wraparound, W+X requests, executable MMIO, and user mappings of kernel ranges
+- malformed/truncated/overlapping ELF program headers and adversarial segment sizes
+- concurrent close/wait/send/receive/terminate operations under multi-vCPU QEMU smoke testing
+
+Host-side parsers and pure algorithms should use fuzzing/property testing when practical. Kernel-only paths should use deterministic adversarial guest tests and randomized stress only where failures remain reproducible enough to debug.
+
+## 15.4 Finding disposition
+
+Before a phase or milestone security gate can close:
+
+- **Critical/High:** no confirmed unresolved finding may remain.
+- **Medium:** must be fixed or have an explicit written disposition, rationale, compensating control if any, and target milestone for remediation.
+- **Low/Informational:** may be tracked, but must not contradict a locked DW0 security invariant.
+- False positives must be documented with enough technical reasoning to avoid repeated rediscovery.
+
+Severity labels from automated tooling are inputs, not unquestionable truth. The coordinator validates exploitability and architectural impact before disposition.
+
+## 15.5 Security review artifact
+
+Maintain a milestone review record, for example:
+
+```text
+security/DW0_SECURITY_REVIEW.md
+```
+
+The record should include:
+
+- reviewed Deepwyrm commit
+- reviewed Wyrmroot integration commit when cross-repository behavior is relevant
+- review date/tooling
+- threat-model scope
+- findings and dispositions
+- regression tests added
+- explicitly accepted residual risks
+- final gate status
+
+Do not include secrets, private prompts, credentials, or unnecessary proprietary scanner internals in the repository record.
+
+## 15.6 Phase integration
+
+Security is not deferred entirely to DW0-H:
+
+- **DW0-A:** ABI schema/layout, generated boundary types, reserved fields, status/error behavior.
+- **DW0-B:** BootInfo handoff, architecture entry, exception paths, register state.
+- **DW0-C:** page tables, usercopy, mapping arithmetic, W^X, user/kernel isolation.
+- **DW0-D:** handle lifetime, stale handles, object typing, rights monotonicity.
+- **DW0-E:** syscall dispatch, task authority, ring transitions, task termination.
+- **DW0-F:** IPC transfer atomicity, backpressure, waits, timers, wait/wake races.
+- **DW0-G:** bootstrap ELF parser, initial process mappings, capability handoff.
+- **DW0-H:** whole-milestone threat-model review, SMP stress, residual-risk triage, release-candidate review.
+
+## 15.7 Mandatory DW0 security exit gate
+
+The earlier DW0 exit criteria are necessary but not sufficient. DW0 **must not be tagged complete** until all of the following are also true:
+
+- the release-candidate commit has completed the security-review flow
+- all security-sensitive `unsafe` blocks are documented and reviewed
+- no confirmed Critical/High finding remains unresolved
+- every Medium finding has an explicit disposition
+- confirmed security bugs have regression tests where technically practical
+- handle/rights escalation tests pass
+- user-pointer and VM isolation adversarial tests pass
+- malformed bootstrap ELF/BootInfo tests fail closed
+- IPC handle-transfer rollback/atomicity security tests pass
+- multi-vCPU security/concurrency smoke tests complete without known authority or memory-safety violations
+- `security/DW0_SECURITY_REVIEW.md` (or the canonical equivalent) records the reviewed revision and final `PASS`/accepted-risk state
+
+Any security-sensitive code change after the recorded release-candidate review invalidates the final gate for the affected surface and requires targeted re-review before the DW0 tag is created.
