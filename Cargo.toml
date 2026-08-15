@@ -2,6 +2,7 @@
 members = [
     "crates/deepwyrm-abi",
     "kernel",
+    "tools/abi-gen",
     "tools/xtask",
 ]
 resolver = "2"

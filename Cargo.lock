@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "abi-gen"
+version = "0.0.0"
+
+[[package]]
 name = "deepwyrm-abi"
 version = "0.0.0"
 

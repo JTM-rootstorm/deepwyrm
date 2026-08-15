@@ -8,27 +8,32 @@ fn xtask(args: &[&str]) -> Output {
 }
 
 #[test]
-fn help_succeeds_and_labels_the_surface_as_not_implemented() {
+fn help_distinguishes_available_dw0a_tooling_from_deferred_operations() {
     let output = xtask(&["help"]);
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("help should be UTF-8");
-    assert!(stdout.contains("command surface only"));
-    assert!(stdout.contains("planned but not implemented"));
-    for command in ["build", "image", "run", "inspect-image", "gdb", "test host"] {
+    for command in [
+        "format",
+        "check",
+        "abi generate",
+        "abi check",
+        "test host",
+        "toolchain",
+    ] {
         assert!(stdout.contains(command), "help omitted `{command}`");
     }
+    assert!(stdout.contains("not implemented"));
 }
 
 #[test]
-fn every_operation_fails_nonzero_without_doing_work() {
+fn deferred_operations_fail_nonzero_without_doing_work() {
     let commands: &[&[&str]] = &[
         &["build"],
         &["image"],
         &["run"],
         &["inspect-image"],
         &["gdb"],
-        &["test", "host"],
         &["test", "guest", "ipc"],
         &["test", "integration"],
     ];
@@ -50,7 +55,9 @@ fn every_operation_fails_nonzero_without_doing_work() {
             "operation did not explain its status: {args:?}"
         );
         assert!(
-            stderr.contains("No build, image, VM, debugger, or test operation was performed."),
+            stderr.contains(
+                "No build, image, VM, debugger, guest, or integration operation was performed."
+            ),
             "operation did not confirm its inert behavior: {args:?}"
         );
     }
@@ -60,6 +67,8 @@ fn every_operation_fails_nonzero_without_doing_work() {
 fn invalid_syntax_is_distinct_from_an_unimplemented_operation() {
     for args in [
         &[][..],
+        &["abi"][..],
+        &["abi", "invalid"][..],
         &["test"][..],
         &["test", "invalid"][..],
         &["unknown"][..],
@@ -73,5 +82,18 @@ fn invalid_syntax_is_distinct_from_an_unimplemented_operation() {
         let stderr = String::from_utf8(output.stderr).expect("error should be UTF-8");
         assert!(stderr.contains("error:"));
         assert!(stderr.contains("Run `cargo xtask help` for usage."));
+    }
+}
+
+#[test]
+fn toolchain_diagnostics_are_host_only_and_do_not_claim_a_pin() {
+    let output = xtask(&["toolchain"]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("diagnostics should be UTF-8");
+    assert!(stdout.contains("host tool availability"));
+    assert!(stdout.contains("does not assert toolchain adoption or pinning"));
+    for tool in ["clang:", "ld.lld:", "llvm-readelf:", "gdb:"] {
+        assert!(stdout.contains(tool), "diagnostics omitted `{tool}`");
     }
 }

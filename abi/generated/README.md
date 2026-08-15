@@ -1,8 +1,12 @@
-# Generated ABI placeholder
+# Generated Deepwyrm ABI artifacts
 
-This directory is reserved for deterministic outputs produced from the
-canonical schema.
+This directory is owned by `abi-gen`. Do not edit generated files directly.
 
-No generator or generated ABI contract exists in the bootstrap scaffold. Once
-generation is implemented, files in this directory must be treated as derived
-artifacts and checked for schema drift by the repository tooling.
+From the Deepwyrm repository root:
+
+```text
+cargo xtask abi generate
+cargo xtask abi check
+```
+
+`check` regenerates the expected files in memory and fails on missing, stale, or unexpected output.
