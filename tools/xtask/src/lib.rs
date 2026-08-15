@@ -445,8 +445,8 @@ fn gdb_arguments(profile: &HarnessProfile, request: &HarnessRequest) -> Vec<Stri
 }
 
 fn parse_guest_result_file(path: &Path, request_path: &Path, exit_status: i32) -> io::Result<u8> {
-    let request_digest = match read_bounded(request_path, "guest-test request", MAX_REQUEST_BYTES) {
-        Ok(bytes) => sha256_hex(&bytes),
+    let request_bytes = match read_bounded(request_path, "guest-test request", MAX_REQUEST_BYTES) {
+        Ok(bytes) => bytes,
         Err(error) => {
             return emit_infrastructure_result(
                 None,
@@ -456,7 +456,16 @@ fn parse_guest_result_file(path: &Path, request_path: &Path, exit_status: i32) -
             );
         }
     };
-    let request = match load_harness_request(request_path) {
+    let request_digest = sha256_hex(&request_bytes);
+    let request = match std::str::from_utf8(&request_bytes)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "guest-test request is not UTF-8",
+            )
+        })
+        .and_then(|text| parse_harness_request(text, request_path))
+    {
         Ok(request) => request,
         Err(error) => {
             return emit_infrastructure_result(
@@ -885,7 +894,11 @@ fn load_profiles(path: &Path) -> io::Result<BTreeMap<String, HarnessProfile>> {
 
 fn load_harness_request(path: &Path) -> io::Result<HarnessRequest> {
     let text = read_bounded_utf8(path, "guest harness request", MAX_REQUEST_BYTES)?;
-    let values = parse_flat_toml(&text, path)?;
+    parse_harness_request(&text, path)
+}
+
+fn parse_harness_request(text: &str, path: &Path) -> io::Result<HarnessRequest> {
+    let values = parse_flat_toml(text, path)?;
     if values.get("schema_version").map(String::as_str) != Some("1") {
         return invalid_input("guest harness request requires schema_version = 1".into());
     }
