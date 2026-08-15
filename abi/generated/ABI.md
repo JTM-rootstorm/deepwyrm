@@ -157,6 +157,7 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_HANDLE_INVALID` | `DwHandle` | `0` | The only ABI-visible invalid handle value. |
 | `DW_DEADLINE_NOW` | `DwDeadline` | `0` | Request immediate deadline evaluation. |
 | `DW_DEADLINE_INFINITE` | `DwDeadline` | `18446744073709551615` | No finite monotonic deadline. |
+| `DW_BASE_PAGE_SIZE` | `u32` | `4096` | Canonical ABI-0 page size for MemoryObject lengths, offsets, and userspace mapping ranges; equal to the boot handoff page size. |
 | `DW_CHANNEL_MAX_PAYLOAD` | `u32` | `65536` | Maximum DW0 channel payload bytes. |
 | `DW_CHANNEL_MAX_HANDLES` | `u32` | `16` | Maximum DW0 channel handles per message. |
 | `DW_WAIT_MANY_MAX_ITEMS` | `u32` | `64` | Maximum handles accepted by one ABI-0 wait_many operation. |
@@ -169,6 +170,14 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_OBJECT_INFO_BASIC_V1` | `u32` | `1` | Typed object_get_info topic for basic type and rights metadata. |
 | `DW_OBJECT_INFO_TASK_STATE_V1` | `u32` | `65537` | Typed object_get_info topic for process or thread termination state. |
 | `DW_OBJECT_INFO_MEMORY_OBJECT_V1` | `u32` | `131073` | Typed object_get_info topic for MemoryObject byte size. |
+| `DW_MEMORY_PROTECTION_READ` | `DwMemoryProtection` | `1` | Permit userspace reads from a mapping. |
+| `DW_MEMORY_PROTECTION_WRITE` | `DwMemoryProtection` | `2` | Permit userspace writes to a mapping. |
+| `DW_MEMORY_PROTECTION_EXECUTE` | `DwMemoryProtection` | `4` | Permit userspace instruction fetches from a mapping. |
+| `DW_MEMORY_PROTECTION_SUPPORTED_MASK` | `DwMemoryProtection` | `7` | All mapping-protection bits recognized by ABI 0. |
+| `DW_MEMORY_OBJECT_CREATE_FLAGS_SUPPORTED_MASK` | `DwMemoryObjectCreateFlags` | `0` | ABI 0 supports no nonzero MemoryObject creation flags. |
+| `DW_ADDRESS_REGION_MAP_FLAG_FIXED` | `DwAddressRegionMapFlags` | `1` | Map at requested_address exactly, without replacing an existing mapping. |
+| `DW_ADDRESS_REGION_MAP_FLAGS_SUPPORTED_MASK` | `DwAddressRegionMapFlags` | `1` | All AddressRegion mapping flags recognized by ABI 0. |
+| `DW_ADDRESS_REGION_MAP_ARGS_V1_VERSION` | `u32` | `1` | Required version value for DwAddressRegionMapArgsV1. |
 | `DW_TASK_STATE_CREATED` | `DwTaskState` | `1` | Task exists but has not started. |
 | `DW_TASK_STATE_RUNNING` | `DwTaskState` | `2` | Task has started and has not terminated. |
 | `DW_TASK_STATE_EXITED` | `DwTaskState` | `3` | Task reached a terminal state. |
@@ -329,8 +338,23 @@ Read-only MemoryObject size information. Size 32, alignment 8.
 |---:|---|---|---|
 | 0 | `size` | `u32` | Byte size of this structure. |
 | 4 | `version` | `u32` | Structure version; set to one. |
-| 8 | `byte_size` | `u64` | MemoryObject byte size. |
+| 8 | `byte_size` | `u64` | Exact MemoryObject byte size, fixed for the object lifetime. |
 | 16 | `reserved` | `[u64; 2]` | Reserved; all elements must be zero. |
+
+### `DwAddressRegionMapArgsV1`
+
+Versioned arguments selecting one page-aligned MemoryObject mapping. Size 72, alignment 8.
+
+| Offset | Field | Type | Meaning |
+|---:|---|---|---|
+| 0 | `size` | `u32` | Byte size of this structure; must equal the V1 size in ABI 0. |
+| 4 | `version` | `u32` | Structure version; set to one. |
+| 8 | `memory_object_offset` | `DwOffset` | Page-aligned byte offset into the MemoryObject. |
+| 16 | `byte_len` | `DwSize` | Nonzero page-aligned mapping length. |
+| 24 | `requested_address` | `DwUserAddress` | Zero for allocator-chosen placement; exact nonzero page-aligned userspace address with FIXED. |
+| 32 | `protections` | `DwMemoryProtection` | Explicit nonzero protection bits; ABI-0 x86_64 supports READ, READ plus WRITE, or READ plus EXECUTE. |
+| 36 | `flags` | `DwAddressRegionMapFlags` | Zero for allocator-chosen placement or FIXED for exact no-replace placement. |
+| 40 | `reserved` | `[u64; 4]` | Reserved; all elements must be zero. |
 
 ### `DwProcessCreateArgsV1`
 
@@ -578,47 +602,47 @@ Explicitly terminate a thread.
 
 ### `0x00020001` `memory_object_create` (DW0-C)
 
-Create a page-backed memory object with nonzero, known, object-compatible requested rights.
+Create a zero-filled page-backed MemoryObject with an immutable size. Zero, unaligned, or overflowing byte_len and any nonzero flags are INVALID_ARGUMENT; inaccessible output storage is BAD_ADDRESS; backing exhaustion is NO_MEMORY. Requested rights must be nonzero, known, and object-compatible, and failure publishes no handle.
 
 | Register | Argument | Type | Direction | Object | Rights |
 |---|---|---|---|---|---|
-| `RDI` | `byte_len` | `u64` | in | NONE | NONE |
-| `RSI` | `flags` | `u64` | in | NONE | NONE |
+| `RDI` | `byte_len` | `DwSize` | in | NONE | NONE |
+| `RSI` | `flags` | `DwMemoryObjectCreateFlags` | in | NONE | NONE |
 | `RDX` | `requested_rights` | `DwRights` | in | NONE | NONE |
 | `R10` | `out_handle` | `DwUserAddress` | out | NONE | NONE |
 
 ### `0x00020010` `address_region_map` (DW0-C)
 
-Map a memory-object range with explicit W^X-checked protections.
+Transactionally map a page-aligned MemoryObject range using exact-size DwAddressRegionMapArgsV1. Malformed size/version/reserved fields, unknown flags or protections, zero/W+X protections, unaligned or overflowing ranges, and ranges beyond the MemoryObject are INVALID_ARGUMENT. WRITE-only or EXECUTE-only is NOT_SUPPORTED on DW0 x86_64 and READ is never added implicitly. Allocator-chosen placement requires address zero; FIXED requires an exact nonzero page-aligned lower-userspace address, never replaces, and returns ALREADY_EXISTS on overlap. Noncanonical, page-zero, kernel, or outside-region addresses are BAD_ADDRESS. Every mapping requires source MAP+READ; requested WRITE additionally requires source WRITE and requested EXECUTE requires source EXECUTE. Successful mapping captures the source handle's READ/WRITE/EXECUTE authority as the ceiling for later protect operations, including after the source handle closes; violation is ACCESS_DENIED. Failure to find allocator-chosen space returns NO_MEMORY. Every failure leaves mappings and out_address unchanged.
 
 | Register | Argument | Type | Direction | Object | Rights |
 |---|---|---|---|---|---|
 | `RDI` | `address_region` | `DwHandle` | in | ADDRESS_REGION | MAP+MODIFY |
-| `RSI` | `memory_object` | `DwHandle` | in | MEMORY_OBJECT | MAP |
+| `RSI` | `memory_object` | `DwHandle` | in | MEMORY_OBJECT | MAP+READ |
 | `RDX` | `args` | `DwUserAddress` | in | NONE | NONE |
 | `R10` | `args_size` | `u64` | in | NONE | NONE |
 | `R8` | `out_address` | `DwUserAddress` | out | NONE | NONE |
 
 ### `0x00020011` `address_region_unmap` (DW0-C)
 
-Remove mappings from an address region.
+Transactionally remove a nonempty page-aligned fully mapped userspace range. Zero, unaligned, or overflowing ranges are INVALID_ARGUMENT; noncanonical, page-zero, kernel, or outside-region addresses are BAD_ADDRESS; any unmapped hole is NOT_FOUND. Failure leaves the complete range unchanged.
 
 | Register | Argument | Type | Direction | Object | Rights |
 |---|---|---|---|---|---|
 | `RDI` | `address_region` | `DwHandle` | in | ADDRESS_REGION | MODIFY |
 | `RSI` | `address` | `DwUserAddress` | in | NONE | NONE |
-| `RDX` | `byte_len` | `u64` | in | NONE | NONE |
+| `RDX` | `byte_len` | `DwSize` | in | NONE | NONE |
 
 ### `0x00020012` `address_region_protect` (DW0-C)
 
-Change mapping protections while enforcing W^X.
+Transactionally change a nonempty page-aligned fully mapped userspace range without exceeding its captured mapping authority. Zero, unknown, or W+X protections and zero, unaligned, or overflowing ranges are INVALID_ARGUMENT; WRITE-only or EXECUTE-only is NOT_SUPPORTED on DW0 x86_64 and READ is never added implicitly. Noncanonical, page-zero, kernel, or outside-region addresses are BAD_ADDRESS; any unmapped hole is NOT_FOUND; exceeding mapping authority is ACCESS_DENIED. Failure leaves the complete range unchanged.
 
 | Register | Argument | Type | Direction | Object | Rights |
 |---|---|---|---|---|---|
 | `RDI` | `address_region` | `DwHandle` | in | ADDRESS_REGION | MODIFY |
 | `RSI` | `address` | `DwUserAddress` | in | NONE | NONE |
-| `RDX` | `byte_len` | `u64` | in | NONE | NONE |
-| `R10` | `protections` | `u64` | in | NONE | NONE |
+| `RDX` | `byte_len` | `DwSize` | in | NONE | NONE |
+| `R10` | `protections` | `DwMemoryProtection` | in | NONE | NONE |
 
 ### `0x00030001` `channel_create` (DW0-F)
 

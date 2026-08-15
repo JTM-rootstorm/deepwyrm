@@ -59,6 +59,21 @@ pub struct DwSize(pub u64);
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DwOffset(pub u64);
 
+/// Bitset of requested userspace mapping protections; distinct from handle rights.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DwMemoryProtection(pub u32);
+
+/// Bitset of MemoryObject creation options; ABI 0 supports no nonzero bits.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DwMemoryObjectCreateFlags(pub u32);
+
+/// Bitset controlling AddressRegion mapping placement.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DwAddressRegionMapFlags(pub u32);
+
 /// Explicit native clock-domain identifier.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -347,6 +362,9 @@ pub const DW_DEADLINE_NOW: DwDeadline = DwDeadline(0);
 /// No finite monotonic deadline.
 pub const DW_DEADLINE_INFINITE: DwDeadline = DwDeadline(18446744073709551615);
 
+/// Canonical ABI-0 page size for MemoryObject lengths, offsets, and userspace mapping ranges; equal to the boot handoff page size.
+pub const DW_BASE_PAGE_SIZE: u32 = 4096;
+
 /// Maximum DW0 channel payload bytes.
 pub const DW_CHANNEL_MAX_PAYLOAD: u32 = 65536;
 
@@ -382,6 +400,30 @@ pub const DW_OBJECT_INFO_TASK_STATE_V1: u32 = 65537;
 
 /// Typed object_get_info topic for MemoryObject byte size.
 pub const DW_OBJECT_INFO_MEMORY_OBJECT_V1: u32 = 131073;
+
+/// Permit userspace reads from a mapping.
+pub const DW_MEMORY_PROTECTION_READ: DwMemoryProtection = DwMemoryProtection(1);
+
+/// Permit userspace writes to a mapping.
+pub const DW_MEMORY_PROTECTION_WRITE: DwMemoryProtection = DwMemoryProtection(2);
+
+/// Permit userspace instruction fetches from a mapping.
+pub const DW_MEMORY_PROTECTION_EXECUTE: DwMemoryProtection = DwMemoryProtection(4);
+
+/// All mapping-protection bits recognized by ABI 0.
+pub const DW_MEMORY_PROTECTION_SUPPORTED_MASK: DwMemoryProtection = DwMemoryProtection(7);
+
+/// ABI 0 supports no nonzero MemoryObject creation flags.
+pub const DW_MEMORY_OBJECT_CREATE_FLAGS_SUPPORTED_MASK: DwMemoryObjectCreateFlags = DwMemoryObjectCreateFlags(0);
+
+/// Map at requested_address exactly, without replacing an existing mapping.
+pub const DW_ADDRESS_REGION_MAP_FLAG_FIXED: DwAddressRegionMapFlags = DwAddressRegionMapFlags(1);
+
+/// All AddressRegion mapping flags recognized by ABI 0.
+pub const DW_ADDRESS_REGION_MAP_FLAGS_SUPPORTED_MASK: DwAddressRegionMapFlags = DwAddressRegionMapFlags(1);
+
+/// Required version value for DwAddressRegionMapArgsV1.
+pub const DW_ADDRESS_REGION_MAP_ARGS_V1_VERSION: u32 = 1;
 
 /// Task exists but has not started.
 pub const DW_TASK_STATE_CREATED: DwTaskState = DwTaskState(1);
@@ -467,16 +509,16 @@ pub const DW_SYSCALL_THREAD_EXIT: DwSyscallId = DwSyscallId(0x00010022);
 /// Explicitly terminate a thread.
 pub const DW_SYSCALL_THREAD_TERMINATE: DwSyscallId = DwSyscallId(0x00010023);
 
-/// Create a page-backed memory object with nonzero, known, object-compatible requested rights.
+/// Create a zero-filled page-backed MemoryObject with an immutable size. Zero, unaligned, or overflowing byte_len and any nonzero flags are INVALID_ARGUMENT; inaccessible output storage is BAD_ADDRESS; backing exhaustion is NO_MEMORY. Requested rights must be nonzero, known, and object-compatible, and failure publishes no handle.
 pub const DW_SYSCALL_MEMORY_OBJECT_CREATE: DwSyscallId = DwSyscallId(0x00020001);
 
-/// Map a memory-object range with explicit W^X-checked protections.
+/// Transactionally map a page-aligned MemoryObject range using exact-size DwAddressRegionMapArgsV1. Malformed size/version/reserved fields, unknown flags or protections, zero/W+X protections, unaligned or overflowing ranges, and ranges beyond the MemoryObject are INVALID_ARGUMENT. WRITE-only or EXECUTE-only is NOT_SUPPORTED on DW0 x86_64 and READ is never added implicitly. Allocator-chosen placement requires address zero; FIXED requires an exact nonzero page-aligned lower-userspace address, never replaces, and returns ALREADY_EXISTS on overlap. Noncanonical, page-zero, kernel, or outside-region addresses are BAD_ADDRESS. Every mapping requires source MAP+READ; requested WRITE additionally requires source WRITE and requested EXECUTE requires source EXECUTE. Successful mapping captures the source handle's READ/WRITE/EXECUTE authority as the ceiling for later protect operations, including after the source handle closes; violation is ACCESS_DENIED. Failure to find allocator-chosen space returns NO_MEMORY. Every failure leaves mappings and out_address unchanged.
 pub const DW_SYSCALL_ADDRESS_REGION_MAP: DwSyscallId = DwSyscallId(0x00020010);
 
-/// Remove mappings from an address region.
+/// Transactionally remove a nonempty page-aligned fully mapped userspace range. Zero, unaligned, or overflowing ranges are INVALID_ARGUMENT; noncanonical, page-zero, kernel, or outside-region addresses are BAD_ADDRESS; any unmapped hole is NOT_FOUND. Failure leaves the complete range unchanged.
 pub const DW_SYSCALL_ADDRESS_REGION_UNMAP: DwSyscallId = DwSyscallId(0x00020011);
 
-/// Change mapping protections while enforcing W^X.
+/// Transactionally change a nonempty page-aligned fully mapped userspace range without exceeding its captured mapping authority. Zero, unknown, or W+X protections and zero, unaligned, or overflowing ranges are INVALID_ARGUMENT; WRITE-only or EXECUTE-only is NOT_SUPPORTED on DW0 x86_64 and READ is never added implicitly. Noncanonical, page-zero, kernel, or outside-region addresses are BAD_ADDRESS; any unmapped hole is NOT_FOUND; exceeding mapping authority is ACCESS_DENIED. Failure leaves the complete range unchanged.
 pub const DW_SYSCALL_ADDRESS_REGION_PROTECT: DwSyscallId = DwSyscallId(0x00020012);
 
 /// Create connected endpoints with nonzero, known, object-compatible requested rights.
@@ -746,13 +788,37 @@ pub struct DwMemoryObjectInfoV1 {
     pub size: u32,
     /// Structure version; set to one.
     pub version: u32,
-    /// MemoryObject byte size.
+    /// Exact MemoryObject byte size, fixed for the object lifetime.
     pub byte_size: u64,
     /// Reserved; all elements must be zero.
     pub reserved: [u64; 2],
 }
 
 pub const DW_MEMORY_OBJECT_INFO_V1_SIZE: u32 = 32;
+
+/// Versioned arguments selecting one page-aligned MemoryObject mapping.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DwAddressRegionMapArgsV1 {
+    /// Byte size of this structure; must equal the V1 size in ABI 0.
+    pub size: u32,
+    /// Structure version; set to one.
+    pub version: u32,
+    /// Page-aligned byte offset into the MemoryObject.
+    pub memory_object_offset: DwOffset,
+    /// Nonzero page-aligned mapping length.
+    pub byte_len: DwSize,
+    /// Zero for allocator-chosen placement; exact nonzero page-aligned userspace address with FIXED.
+    pub requested_address: DwUserAddress,
+    /// Explicit nonzero protection bits; ABI-0 x86_64 supports READ, READ plus WRITE, or READ plus EXECUTE.
+    pub protections: DwMemoryProtection,
+    /// Zero for allocator-chosen placement or FIXED for exact no-replace placement.
+    pub flags: DwAddressRegionMapFlags,
+    /// Reserved; all elements must be zero.
+    pub reserved: [u64; 4],
+}
+
+pub const DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE: u32 = 72;
 
 /// Arguments for creating a child process and installing its bootstrap channel without a magic handle value.
 #[repr(C)]
@@ -945,6 +1011,12 @@ mod generated_layout_tests {
         assert_eq!(align_of::<DwSize>(), 8);
         assert_eq!(size_of::<DwOffset>(), 8);
         assert_eq!(align_of::<DwOffset>(), 8);
+        assert_eq!(size_of::<DwMemoryProtection>(), 4);
+        assert_eq!(align_of::<DwMemoryProtection>(), 4);
+        assert_eq!(size_of::<DwMemoryObjectCreateFlags>(), 4);
+        assert_eq!(align_of::<DwMemoryObjectCreateFlags>(), 4);
+        assert_eq!(size_of::<DwAddressRegionMapFlags>(), 4);
+        assert_eq!(align_of::<DwAddressRegionMapFlags>(), 4);
         assert_eq!(size_of::<DwClockId>(), 4);
         assert_eq!(align_of::<DwClockId>(), 4);
         assert_eq!(size_of::<DwTaskState>(), 4);
@@ -1073,6 +1145,16 @@ mod generated_layout_tests {
         assert_eq!(offset_of!(DwMemoryObjectInfoV1, version), 4);
         assert_eq!(offset_of!(DwMemoryObjectInfoV1, byte_size), 8);
         assert_eq!(offset_of!(DwMemoryObjectInfoV1, reserved), 16);
+        assert_eq!(size_of::<DwAddressRegionMapArgsV1>(), 72);
+        assert_eq!(align_of::<DwAddressRegionMapArgsV1>(), 8);
+        assert_eq!(offset_of!(DwAddressRegionMapArgsV1, size), 0);
+        assert_eq!(offset_of!(DwAddressRegionMapArgsV1, version), 4);
+        assert_eq!(offset_of!(DwAddressRegionMapArgsV1, memory_object_offset), 8);
+        assert_eq!(offset_of!(DwAddressRegionMapArgsV1, byte_len), 16);
+        assert_eq!(offset_of!(DwAddressRegionMapArgsV1, requested_address), 24);
+        assert_eq!(offset_of!(DwAddressRegionMapArgsV1, protections), 32);
+        assert_eq!(offset_of!(DwAddressRegionMapArgsV1, flags), 36);
+        assert_eq!(offset_of!(DwAddressRegionMapArgsV1, reserved), 40);
         assert_eq!(size_of::<DwProcessCreateArgsV1>(), 88);
         assert_eq!(align_of::<DwProcessCreateArgsV1>(), 8);
         assert_eq!(offset_of!(DwProcessCreateArgsV1, size), 0);
@@ -1220,6 +1302,7 @@ mod generated_layout_tests {
         assert_eq!(DW_HANDLE_INVALID.0, 0);
         assert_eq!(DW_DEADLINE_NOW.0, 0);
         assert_eq!(DW_DEADLINE_INFINITE.0, 18446744073709551615);
+        assert_eq!(DW_BASE_PAGE_SIZE, 4096);
         assert_eq!(DW_CHANNEL_MAX_PAYLOAD, 65536);
         assert_eq!(DW_CHANNEL_MAX_HANDLES, 16);
         assert_eq!(DW_WAIT_MANY_MAX_ITEMS, 64);
@@ -1232,6 +1315,14 @@ mod generated_layout_tests {
         assert_eq!(DW_OBJECT_INFO_BASIC_V1, 1);
         assert_eq!(DW_OBJECT_INFO_TASK_STATE_V1, 65537);
         assert_eq!(DW_OBJECT_INFO_MEMORY_OBJECT_V1, 131073);
+        assert_eq!(DW_MEMORY_PROTECTION_READ.0, 1);
+        assert_eq!(DW_MEMORY_PROTECTION_WRITE.0, 2);
+        assert_eq!(DW_MEMORY_PROTECTION_EXECUTE.0, 4);
+        assert_eq!(DW_MEMORY_PROTECTION_SUPPORTED_MASK.0, 7);
+        assert_eq!(DW_MEMORY_OBJECT_CREATE_FLAGS_SUPPORTED_MASK.0, 0);
+        assert_eq!(DW_ADDRESS_REGION_MAP_FLAG_FIXED.0, 1);
+        assert_eq!(DW_ADDRESS_REGION_MAP_FLAGS_SUPPORTED_MASK.0, 1);
+        assert_eq!(DW_ADDRESS_REGION_MAP_ARGS_V1_VERSION, 1);
         assert_eq!(DW_TASK_STATE_CREATED.0, 1);
         assert_eq!(DW_TASK_STATE_RUNNING.0, 2);
         assert_eq!(DW_TASK_STATE_EXITED.0, 3);

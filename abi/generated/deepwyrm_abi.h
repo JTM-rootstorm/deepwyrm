@@ -83,6 +83,24 @@ typedef uint64_t DwOffset;
 DW_STATIC_ASSERT(sizeof(DwOffset) == 8, "DwOffset size");
 DW_STATIC_ASSERT(DW_ALIGNOF(DwOffset) == 8, "DwOffset alignment");
 
+/* Bitset of requested userspace mapping protections; distinct from handle rights. */
+typedef uint32_t DwMemoryProtection;
+
+DW_STATIC_ASSERT(sizeof(DwMemoryProtection) == 4, "DwMemoryProtection size");
+DW_STATIC_ASSERT(DW_ALIGNOF(DwMemoryProtection) == 4, "DwMemoryProtection alignment");
+
+/* Bitset of MemoryObject creation options; ABI 0 supports no nonzero bits. */
+typedef uint32_t DwMemoryObjectCreateFlags;
+
+DW_STATIC_ASSERT(sizeof(DwMemoryObjectCreateFlags) == 4, "DwMemoryObjectCreateFlags size");
+DW_STATIC_ASSERT(DW_ALIGNOF(DwMemoryObjectCreateFlags) == 4, "DwMemoryObjectCreateFlags alignment");
+
+/* Bitset controlling AddressRegion mapping placement. */
+typedef uint32_t DwAddressRegionMapFlags;
+
+DW_STATIC_ASSERT(sizeof(DwAddressRegionMapFlags) == 4, "DwAddressRegionMapFlags size");
+DW_STATIC_ASSERT(DW_ALIGNOF(DwAddressRegionMapFlags) == 4, "DwAddressRegionMapFlags alignment");
+
 /* Explicit native clock-domain identifier. */
 typedef uint32_t DwClockId;
 
@@ -319,6 +337,8 @@ DW_STATIC_ASSERT(DW_ALIGNOF(DwBootEntropyFlags) == 4, "DwBootEntropyFlags alignm
 #define DW_DEADLINE_NOW ((DwDeadline)(0))
 /* No finite monotonic deadline. */
 #define DW_DEADLINE_INFINITE ((DwDeadline)(18446744073709551615))
+/* Canonical ABI-0 page size for MemoryObject lengths, offsets, and userspace mapping ranges; equal to the boot handoff page size. */
+#define DW_BASE_PAGE_SIZE ((uint32_t)(4096))
 /* Maximum DW0 channel payload bytes. */
 #define DW_CHANNEL_MAX_PAYLOAD ((uint32_t)(65536))
 /* Maximum DW0 channel handles per message. */
@@ -343,6 +363,22 @@ DW_STATIC_ASSERT(DW_ALIGNOF(DwBootEntropyFlags) == 4, "DwBootEntropyFlags alignm
 #define DW_OBJECT_INFO_TASK_STATE_V1 ((uint32_t)(65537))
 /* Typed object_get_info topic for MemoryObject byte size. */
 #define DW_OBJECT_INFO_MEMORY_OBJECT_V1 ((uint32_t)(131073))
+/* Permit userspace reads from a mapping. */
+#define DW_MEMORY_PROTECTION_READ ((DwMemoryProtection)(1))
+/* Permit userspace writes to a mapping. */
+#define DW_MEMORY_PROTECTION_WRITE ((DwMemoryProtection)(2))
+/* Permit userspace instruction fetches from a mapping. */
+#define DW_MEMORY_PROTECTION_EXECUTE ((DwMemoryProtection)(4))
+/* All mapping-protection bits recognized by ABI 0. */
+#define DW_MEMORY_PROTECTION_SUPPORTED_MASK ((DwMemoryProtection)(7))
+/* ABI 0 supports no nonzero MemoryObject creation flags. */
+#define DW_MEMORY_OBJECT_CREATE_FLAGS_SUPPORTED_MASK ((DwMemoryObjectCreateFlags)(0))
+/* Map at requested_address exactly, without replacing an existing mapping. */
+#define DW_ADDRESS_REGION_MAP_FLAG_FIXED ((DwAddressRegionMapFlags)(1))
+/* All AddressRegion mapping flags recognized by ABI 0. */
+#define DW_ADDRESS_REGION_MAP_FLAGS_SUPPORTED_MASK ((DwAddressRegionMapFlags)(1))
+/* Required version value for DwAddressRegionMapArgsV1. */
+#define DW_ADDRESS_REGION_MAP_ARGS_V1_VERSION ((uint32_t)(1))
 /* Task exists but has not started. */
 #define DW_TASK_STATE_CREATED ((DwTaskState)(1))
 /* Task has started and has not terminated. */
@@ -400,13 +436,13 @@ DW_STATIC_ASSERT(DW_ALIGNOF(DwBootEntropyFlags) == 4, "DwBootEntropyFlags alignm
 #define DW_SYSCALL_THREAD_EXIT ((DwSyscallId)(UINT32_C(0x00010022)))
 /* Explicitly terminate a thread. */
 #define DW_SYSCALL_THREAD_TERMINATE ((DwSyscallId)(UINT32_C(0x00010023)))
-/* Create a page-backed memory object with nonzero, known, object-compatible requested rights. */
+/* Create a zero-filled page-backed MemoryObject with an immutable size. Zero, unaligned, or overflowing byte_len and any nonzero flags are INVALID_ARGUMENT; inaccessible output storage is BAD_ADDRESS; backing exhaustion is NO_MEMORY. Requested rights must be nonzero, known, and object-compatible, and failure publishes no handle. */
 #define DW_SYSCALL_MEMORY_OBJECT_CREATE ((DwSyscallId)(UINT32_C(0x00020001)))
-/* Map a memory-object range with explicit W^X-checked protections. */
+/* Transactionally map a page-aligned MemoryObject range using exact-size DwAddressRegionMapArgsV1. Malformed size/version/reserved fields, unknown flags or protections, zero/W+X protections, unaligned or overflowing ranges, and ranges beyond the MemoryObject are INVALID_ARGUMENT. WRITE-only or EXECUTE-only is NOT_SUPPORTED on DW0 x86_64 and READ is never added implicitly. Allocator-chosen placement requires address zero; FIXED requires an exact nonzero page-aligned lower-userspace address, never replaces, and returns ALREADY_EXISTS on overlap. Noncanonical, page-zero, kernel, or outside-region addresses are BAD_ADDRESS. Every mapping requires source MAP+READ; requested WRITE additionally requires source WRITE and requested EXECUTE requires source EXECUTE. Successful mapping captures the source handle's READ/WRITE/EXECUTE authority as the ceiling for later protect operations, including after the source handle closes; violation is ACCESS_DENIED. Failure to find allocator-chosen space returns NO_MEMORY. Every failure leaves mappings and out_address unchanged. */
 #define DW_SYSCALL_ADDRESS_REGION_MAP ((DwSyscallId)(UINT32_C(0x00020010)))
-/* Remove mappings from an address region. */
+/* Transactionally remove a nonempty page-aligned fully mapped userspace range. Zero, unaligned, or overflowing ranges are INVALID_ARGUMENT; noncanonical, page-zero, kernel, or outside-region addresses are BAD_ADDRESS; any unmapped hole is NOT_FOUND. Failure leaves the complete range unchanged. */
 #define DW_SYSCALL_ADDRESS_REGION_UNMAP ((DwSyscallId)(UINT32_C(0x00020011)))
-/* Change mapping protections while enforcing W^X. */
+/* Transactionally change a nonempty page-aligned fully mapped userspace range without exceeding its captured mapping authority. Zero, unknown, or W+X protections and zero, unaligned, or overflowing ranges are INVALID_ARGUMENT; WRITE-only or EXECUTE-only is NOT_SUPPORTED on DW0 x86_64 and READ is never added implicitly. Noncanonical, page-zero, kernel, or outside-region addresses are BAD_ADDRESS; any unmapped hole is NOT_FOUND; exceeding mapping authority is ACCESS_DENIED. Failure leaves the complete range unchanged. */
 #define DW_SYSCALL_ADDRESS_REGION_PROTECT ((DwSyscallId)(UINT32_C(0x00020012)))
 /* Create connected endpoints with nonzero, known, object-compatible requested rights. */
 #define DW_SYSCALL_CHANNEL_CREATE ((DwSyscallId)(UINT32_C(0x00030001)))
@@ -731,7 +767,7 @@ typedef struct DwMemoryObjectInfoV1 {
     uint32_t size;
     /* Structure version; set to one. */
     uint32_t version;
-    /* MemoryObject byte size. */
+    /* Exact MemoryObject byte size, fixed for the object lifetime. */
     uint64_t byte_size;
     /* Reserved; all elements must be zero. */
     uint64_t reserved[2];
@@ -743,6 +779,37 @@ DW_STATIC_ASSERT(offsetof(DwMemoryObjectInfoV1, size) == 0, "DwMemoryObjectInfoV
 DW_STATIC_ASSERT(offsetof(DwMemoryObjectInfoV1, version) == 4, "DwMemoryObjectInfoV1.version offset");
 DW_STATIC_ASSERT(offsetof(DwMemoryObjectInfoV1, byte_size) == 8, "DwMemoryObjectInfoV1.byte_size offset");
 DW_STATIC_ASSERT(offsetof(DwMemoryObjectInfoV1, reserved) == 16, "DwMemoryObjectInfoV1.reserved offset");
+
+/* Versioned arguments selecting one page-aligned MemoryObject mapping. */
+typedef struct DwAddressRegionMapArgsV1 {
+    /* Byte size of this structure; must equal the V1 size in ABI 0. */
+    uint32_t size;
+    /* Structure version; set to one. */
+    uint32_t version;
+    /* Page-aligned byte offset into the MemoryObject. */
+    DwOffset memory_object_offset;
+    /* Nonzero page-aligned mapping length. */
+    DwSize byte_len;
+    /* Zero for allocator-chosen placement; exact nonzero page-aligned userspace address with FIXED. */
+    DwUserAddress requested_address;
+    /* Explicit nonzero protection bits; ABI-0 x86_64 supports READ, READ plus WRITE, or READ plus EXECUTE. */
+    DwMemoryProtection protections;
+    /* Zero for allocator-chosen placement or FIXED for exact no-replace placement. */
+    DwAddressRegionMapFlags flags;
+    /* Reserved; all elements must be zero. */
+    uint64_t reserved[4];
+} DwAddressRegionMapArgsV1;
+#define DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE ((uint32_t)(72))
+DW_STATIC_ASSERT(sizeof(DwAddressRegionMapArgsV1) == 72, "DwAddressRegionMapArgsV1 size");
+DW_STATIC_ASSERT(DW_ALIGNOF(DwAddressRegionMapArgsV1) == 8, "DwAddressRegionMapArgsV1 alignment");
+DW_STATIC_ASSERT(offsetof(DwAddressRegionMapArgsV1, size) == 0, "DwAddressRegionMapArgsV1.size offset");
+DW_STATIC_ASSERT(offsetof(DwAddressRegionMapArgsV1, version) == 4, "DwAddressRegionMapArgsV1.version offset");
+DW_STATIC_ASSERT(offsetof(DwAddressRegionMapArgsV1, memory_object_offset) == 8, "DwAddressRegionMapArgsV1.memory_object_offset offset");
+DW_STATIC_ASSERT(offsetof(DwAddressRegionMapArgsV1, byte_len) == 16, "DwAddressRegionMapArgsV1.byte_len offset");
+DW_STATIC_ASSERT(offsetof(DwAddressRegionMapArgsV1, requested_address) == 24, "DwAddressRegionMapArgsV1.requested_address offset");
+DW_STATIC_ASSERT(offsetof(DwAddressRegionMapArgsV1, protections) == 32, "DwAddressRegionMapArgsV1.protections offset");
+DW_STATIC_ASSERT(offsetof(DwAddressRegionMapArgsV1, flags) == 36, "DwAddressRegionMapArgsV1.flags offset");
+DW_STATIC_ASSERT(offsetof(DwAddressRegionMapArgsV1, reserved) == 40, "DwAddressRegionMapArgsV1.reserved offset");
 
 /* Arguments for creating a child process and installing its bootstrap channel without a magic handle value. */
 typedef struct DwProcessCreateArgsV1 {

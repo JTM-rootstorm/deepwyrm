@@ -19,6 +19,12 @@ value = 0xffffffffffffffff
 doc = "No finite monotonic deadline."
 
 [[constant]]
+name = "DW_BASE_PAGE_SIZE"
+type = "u32"
+value = 4096
+doc = "Canonical ABI-0 page size for MemoryObject lengths, offsets, and userspace mapping ranges; equal to the boot handoff page size."
+
+[[constant]]
 name = "DW_CHANNEL_MAX_PAYLOAD"
 type = "u32"
 value = 65536
@@ -89,6 +95,54 @@ name = "DW_OBJECT_INFO_MEMORY_OBJECT_V1"
 type = "u32"
 value = 0x00020001
 doc = "Typed object_get_info topic for MemoryObject byte size."
+
+[[constant]]
+name = "DW_MEMORY_PROTECTION_READ"
+type = "DwMemoryProtection"
+value = 0x00000001
+doc = "Permit userspace reads from a mapping."
+
+[[constant]]
+name = "DW_MEMORY_PROTECTION_WRITE"
+type = "DwMemoryProtection"
+value = 0x00000002
+doc = "Permit userspace writes to a mapping."
+
+[[constant]]
+name = "DW_MEMORY_PROTECTION_EXECUTE"
+type = "DwMemoryProtection"
+value = 0x00000004
+doc = "Permit userspace instruction fetches from a mapping."
+
+[[constant]]
+name = "DW_MEMORY_PROTECTION_SUPPORTED_MASK"
+type = "DwMemoryProtection"
+value = 0x00000007
+doc = "All mapping-protection bits recognized by ABI 0."
+
+[[constant]]
+name = "DW_MEMORY_OBJECT_CREATE_FLAGS_SUPPORTED_MASK"
+type = "DwMemoryObjectCreateFlags"
+value = 0
+doc = "ABI 0 supports no nonzero MemoryObject creation flags."
+
+[[constant]]
+name = "DW_ADDRESS_REGION_MAP_FLAG_FIXED"
+type = "DwAddressRegionMapFlags"
+value = 0x00000001
+doc = "Map at requested_address exactly, without replacing an existing mapping."
+
+[[constant]]
+name = "DW_ADDRESS_REGION_MAP_FLAGS_SUPPORTED_MASK"
+type = "DwAddressRegionMapFlags"
+value = 0x00000001
+doc = "All AddressRegion mapping flags recognized by ABI 0."
+
+[[constant]]
+name = "DW_ADDRESS_REGION_MAP_ARGS_V1_VERSION"
+type = "u32"
+value = 1
+doc = "Required version value for DwAddressRegionMapArgsV1."
 
 [[constant]]
 name = "DW_TASK_STATE_CREATED"
@@ -221,8 +275,20 @@ name = "DwMemoryObjectInfoV1"
 doc = "Read-only MemoryObject size information."
 field0 = "size|u32|Byte size of this structure."
 field1 = "version|u32|Structure version; set to one."
-field2 = "byte_size|u64|MemoryObject byte size."
+field2 = "byte_size|u64|Exact MemoryObject byte size, fixed for the object lifetime."
 field3 = "reserved|[u64;2]|Reserved; all elements must be zero."
+
+[[record]]
+name = "DwAddressRegionMapArgsV1"
+doc = "Versioned arguments selecting one page-aligned MemoryObject mapping."
+field0 = "size|u32|Byte size of this structure; must equal the V1 size in ABI 0."
+field1 = "version|u32|Structure version; set to one."
+field2 = "memory_object_offset|DwOffset|Page-aligned byte offset into the MemoryObject."
+field3 = "byte_len|DwSize|Nonzero page-aligned mapping length."
+field4 = "requested_address|DwUserAddress|Zero for allocator-chosen placement; exact nonzero page-aligned userspace address with FIXED."
+field5 = "protections|DwMemoryProtection|Explicit nonzero protection bits; ABI-0 x86_64 supports READ, READ plus WRITE, or READ plus EXECUTE."
+field6 = "flags|DwAddressRegionMapFlags|Zero for allocator-chosen placement or FIXED for exact no-replace placement."
+field7 = "reserved|[u64;4]|Reserved; all elements must be zero."
 
 [[record]]
 name = "DwProcessCreateArgsV1"
@@ -442,9 +508,9 @@ arg2 = "code|u32|in|NONE|NONE"
 name = "memory_object_create"
 number = 0x00020001
 phase = "DW0-C"
-doc = "Create a page-backed memory object with nonzero, known, object-compatible requested rights."
-arg0 = "byte_len|u64|in|NONE|NONE"
-arg1 = "flags|u64|in|NONE|NONE"
+doc = "Create a zero-filled page-backed MemoryObject with an immutable size. Zero, unaligned, or overflowing byte_len and any nonzero flags are INVALID_ARGUMENT; inaccessible output storage is BAD_ADDRESS; backing exhaustion is NO_MEMORY. Requested rights must be nonzero, known, and object-compatible, and failure publishes no handle."
+arg0 = "byte_len|DwSize|in|NONE|NONE"
+arg1 = "flags|DwMemoryObjectCreateFlags|in|NONE|NONE"
 arg2 = "requested_rights|DwRights|in|NONE|NONE"
 arg3 = "out_handle|DwUserAddress|out|NONE|NONE"
 
@@ -452,9 +518,9 @@ arg3 = "out_handle|DwUserAddress|out|NONE|NONE"
 name = "address_region_map"
 number = 0x00020010
 phase = "DW0-C"
-doc = "Map a memory-object range with explicit W^X-checked protections."
+doc = "Transactionally map a page-aligned MemoryObject range using exact-size DwAddressRegionMapArgsV1. Malformed size/version/reserved fields, unknown flags or protections, zero/W+X protections, unaligned or overflowing ranges, and ranges beyond the MemoryObject are INVALID_ARGUMENT. WRITE-only or EXECUTE-only is NOT_SUPPORTED on DW0 x86_64 and READ is never added implicitly. Allocator-chosen placement requires address zero; FIXED requires an exact nonzero page-aligned lower-userspace address, never replaces, and returns ALREADY_EXISTS on overlap. Noncanonical, page-zero, kernel, or outside-region addresses are BAD_ADDRESS. Every mapping requires source MAP+READ; requested WRITE additionally requires source WRITE and requested EXECUTE requires source EXECUTE. Successful mapping captures the source handle's READ/WRITE/EXECUTE authority as the ceiling for later protect operations, including after the source handle closes; violation is ACCESS_DENIED. Failure to find allocator-chosen space returns NO_MEMORY. Every failure leaves mappings and out_address unchanged."
 arg0 = "address_region|DwHandle|in|ADDRESS_REGION|MAP+MODIFY"
-arg1 = "memory_object|DwHandle|in|MEMORY_OBJECT|MAP"
+arg1 = "memory_object|DwHandle|in|MEMORY_OBJECT|MAP+READ"
 arg2 = "args|DwUserAddress|in|NONE|NONE"
 arg3 = "args_size|u64|in|NONE|NONE"
 arg4 = "out_address|DwUserAddress|out|NONE|NONE"
@@ -463,20 +529,20 @@ arg4 = "out_address|DwUserAddress|out|NONE|NONE"
 name = "address_region_unmap"
 number = 0x00020011
 phase = "DW0-C"
-doc = "Remove mappings from an address region."
+doc = "Transactionally remove a nonempty page-aligned fully mapped userspace range. Zero, unaligned, or overflowing ranges are INVALID_ARGUMENT; noncanonical, page-zero, kernel, or outside-region addresses are BAD_ADDRESS; any unmapped hole is NOT_FOUND. Failure leaves the complete range unchanged."
 arg0 = "address_region|DwHandle|in|ADDRESS_REGION|MODIFY"
 arg1 = "address|DwUserAddress|in|NONE|NONE"
-arg2 = "byte_len|u64|in|NONE|NONE"
+arg2 = "byte_len|DwSize|in|NONE|NONE"
 
 [[syscall]]
 name = "address_region_protect"
 number = 0x00020012
 phase = "DW0-C"
-doc = "Change mapping protections while enforcing W^X."
+doc = "Transactionally change a nonempty page-aligned fully mapped userspace range without exceeding its captured mapping authority. Zero, unknown, or W+X protections and zero, unaligned, or overflowing ranges are INVALID_ARGUMENT; WRITE-only or EXECUTE-only is NOT_SUPPORTED on DW0 x86_64 and READ is never added implicitly. Noncanonical, page-zero, kernel, or outside-region addresses are BAD_ADDRESS; any unmapped hole is NOT_FOUND; exceeding mapping authority is ACCESS_DENIED. Failure leaves the complete range unchanged."
 arg0 = "address_region|DwHandle|in|ADDRESS_REGION|MODIFY"
 arg1 = "address|DwUserAddress|in|NONE|NONE"
-arg2 = "byte_len|u64|in|NONE|NONE"
-arg3 = "protections|u64|in|NONE|NONE"
+arg2 = "byte_len|DwSize|in|NONE|NONE"
+arg3 = "protections|DwMemoryProtection|in|NONE|NONE"
 
 [[syscall]]
 name = "channel_create"

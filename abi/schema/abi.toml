@@ -67,6 +67,21 @@ base = "u64"
 doc = "Fixed-width byte offset transported through the native ABI."
 
 [[newtype]]
+name = "DwMemoryProtection"
+base = "u32"
+doc = "Bitset of requested userspace mapping protections; distinct from handle rights."
+
+[[newtype]]
+name = "DwMemoryObjectCreateFlags"
+base = "u32"
+doc = "Bitset of MemoryObject creation options; ABI 0 supports no nonzero bits."
+
+[[newtype]]
+name = "DwAddressRegionMapFlags"
+base = "u32"
+doc = "Bitset controlling AddressRegion mapping placement."
+
+[[newtype]]
 name = "DwClockId"
 base = "u32"
 doc = "Explicit native clock-domain identifier."
