@@ -6,3 +6,16 @@ publish = false
 
 [lib]
 path = "src/lib.rs"
+
+[features]
+default = []
+test-support = []
+
+[[bin]]
+name = "deepwyrm-kernel"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+deepwyrm-abi = { path = "../crates/deepwyrm-abi" }

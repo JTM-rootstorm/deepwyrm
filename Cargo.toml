@@ -9,6 +9,8 @@ resolver = "2"
 
 [profile.dev]
 debug = 2
+panic = "abort"
 
 [profile.release]
 debug = 2
+panic = "abort"

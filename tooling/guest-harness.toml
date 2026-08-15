@@ -1,0 +1,43 @@
+# Deepwyrm DW0-B host-only guest-harness profile contract.
+#
+# Wyrmroot owns image construction and produces a separate request manifest
+# containing the paired revisions, artifact identities, and destinations.
+# This file owns only centralized machine limits and debugger settings.
+schema_version = 1
+
+[profile.default]
+machine = "q35"
+vcpu = 1
+memory_mib = 1024
+timeout_seconds = 120
+gdb_port = 1234
+
+[profile.minimal]
+machine = "q35"
+vcpu = 1
+memory_mib = 256
+timeout_seconds = 120
+gdb_port = 1234
+
+[profile.smp]
+machine = "q35"
+vcpu = 4
+memory_mib = 2048
+timeout_seconds = 180
+gdb_port = 1234
+
+[profile.debug]
+machine = "q35"
+vcpu = 1
+memory_mib = 2048
+timeout_seconds = 180
+gdb_port = 1234
+
+[guest_test.boot-handoff-pass]
+id = 1
+
+[guest_test.exception-fail-path]
+id = 2
+
+[guest_test.panic-path]
+id = 3

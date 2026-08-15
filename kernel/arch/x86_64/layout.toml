@@ -1,0 +1,58 @@
+schema = "deepwyrm-x86_64-layout"
+version = 1
+entry_contract = "DW_BOOT_X86_64_ENTRY_V1"
+elf_type = "ET_EXEC"
+entry_symbol = "_dw_kernel_entry"
+link_base = "0xffffffff80000000"
+base_page_size = 4096
+red_zone = false
+kernel_boot_stack_size = 65536
+kernel_boot_stack_alignment = 4096
+loader_transition_stack_size = 16384
+loader_transition_stack_alignment = 4096
+p_paddr_policy = "ignored"
+allowed_program_header_types = ["PT_LOAD"]
+
+[load_policy]
+upper_canonical = true
+non_overlapping = true
+writable_xor_executable = true
+entry_in_executable_segment = true
+
+[entry_state]
+transfer = "jmp"
+returns = false
+boot_info_register = "RDI"
+boot_info_address = "identity-mapped-physical"
+boot_info_alignment = 8
+defined_incoming_gprs = ["RDI"]
+loader_stack_owner = "loader"
+loader_stack_rsp = "one-past-end"
+loader_stack_rsp_mod_16 = 0
+loader_stack_lifetime = "until-kernel-page-table-replacement"
+immediate_kernel_stack_switch = true
+kernel_stack_owner = "kernel"
+kernel_stack_rsp_mod_16_before_call = 0
+rust_entry_rsp_mod_16 = 8
+rust_entry_abi = "sysv64"
+interrupts_enabled = false
+direction_flag_set = false
+cr0_write_protect = true
+execute_disable = true
+paging_mode = "x86_64-4-level"
+initial_processor = "BSP"
+descriptor_state = "valid-CS-SS-others-unspecified"
+tls_state = "FS-GS-unspecified"
+fp_simd_state = "unavailable-until-kernel-initialization"
+uefi_services_available = false
+firmware_exit = "ExitBootServices-complete"
+
+[handoff_mappings]
+kernel_load_segments = "mapped-at-p_vaddr"
+physical_allocation = "arbitrary-suitable-firmware-pages"
+boot_info = "identity-mapped"
+referenced_ranges = "identity-mapped"
+lifetime = "until-kernel-page-table-replacement"
+mutable = false
+page_zero_mapped = false
+framebuffer_pixels_identity_mapped = false

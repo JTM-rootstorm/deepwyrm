@@ -13,6 +13,9 @@ version = "0.0.0"
 [[package]]
 name = "deepwyrm-kernel"
 version = "0.0.0"
+dependencies = [
+ "deepwyrm-abi",
+]
 
 [[package]]
 name = "xtask"
