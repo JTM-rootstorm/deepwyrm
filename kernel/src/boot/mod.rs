@@ -85,6 +85,23 @@ impl BootPhysicalRange {
     }
 }
 
+/// A loader module that may be wrapped in a read-only userspace capability.
+///
+/// Construction is private to validated BootInfo intake. In ABI V1 only the
+/// Wyrmroot bootfs module is delegable; the bootstrap ELF is consumed by the
+/// kernel and the kind-3 paging carrier remains kernel-internal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DelegableBootModule {
+    range: BootPhysicalRange,
+}
+
+impl DelegableBootModule {
+    /// Exact immutable payload range authorized for later read-only wrapping.
+    pub const fn range(self) -> BootPhysicalRange {
+        self.range
+    }
+}
+
 /// A validated fixed-stride physical table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BootInfoTable {
@@ -214,10 +231,31 @@ impl ValidatedBootInfo {
         Ok(self.memory_ranges[index])
     }
 
-    /// Returns one immutable boot-module record copied during intake.
-    pub fn module(&self, index: u64) -> Result<DwBootModuleV1, BootInfoValidationError> {
+    /// Returns a typed module payload only when the ABI permits delegation.
+    ///
+    /// The internal kind-3 paging carrier and the kernel-consumed bootstrap ELF
+    /// fail closed instead of escaping through a generic module-record API.
+    pub fn delegable_module(
+        &self,
+        index: u64,
+    ) -> Result<DelegableBootModule, BootInfoValidationError> {
         let index = checked_snapshot_index(index, self.modules.entry_count)?;
-        Ok(self.module_entries[index])
+        let module = self.module_entries[index];
+        if module.kind != DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS {
+            return Err(BootInfoValidationError::ModuleNotDelegable);
+        }
+        Ok(DelegableBootModule {
+            range: module_range(module),
+        })
+    }
+
+    /// Returns one module range solely for allocator reservation collection.
+    pub(crate) fn module_reservation_range(
+        &self,
+        index: u64,
+    ) -> Result<BootPhysicalRange, BootInfoValidationError> {
+        let index = checked_snapshot_index(index, self.modules.entry_count)?;
+        Ok(module_range(self.module_entries[index]))
     }
 
     /// Returns the copied and validated internal x86_64 paging handoff.
@@ -253,15 +291,18 @@ pub enum BootInfoValidationError {
     InvalidCommandLine,
     InvalidPagingHandoff,
     PagingHandoffFrameRoleOverlap,
+    PagingHandoffFrameNotReserved,
+    ModuleNotDelegable,
     TableIndexOutOfBounds,
 }
 
 /// Copies and validates a loader-supplied `DwBootInfoV1` handoff.
 ///
 /// This is intentionally a structural boundary only.  It verifies every
-/// encoded table and payload range before later boot code receives it, but it
-/// does not establish a frame allocator, map physical pages, or interpret the
-/// allocator policy implied by a memory-map kind.
+/// encoded table and payload range before later boot code receives it. It also
+/// requires every declared paging frame to have exactly one normalized
+/// `RESERVED` memory-map owner before exposing the paging snapshot. It does not
+/// establish a frame allocator or map physical pages.
 pub fn validate_boot_info<R: BootInfoByteReader>(
     reader: &R,
     boot_info_physical_start: u64,
@@ -404,12 +445,13 @@ pub fn validate_boot_info_with_limits<R: BootInfoByteReader>(
     }
 
     let paging_handoff = parse_paging_handoff_snapshot(reader, paging_handoff_module)?;
-    validate_paging_handoff_frame_roles(
+    validate_paging_handoff_roles_and_reservation(
         &paging_handoff,
         boot_info_range,
         memory_map,
         modules,
         &module_entries[..modules.entry_count as usize],
+        &memory_ranges[..memory_map.entry_count as usize],
         command_line,
         entropy,
         framebuffer,
@@ -720,12 +762,13 @@ fn parse_paging_handoff_snapshot<R: BootInfoByteReader>(
     clippy::too_many_arguments,
     reason = "the complete ABI-enumerated handoff set is explicit at this trust boundary"
 )]
-fn validate_paging_handoff_frame_roles(
+fn validate_paging_handoff_roles_and_reservation(
     paging: &ValidatedPagingHandoff,
     boot_info: BootPhysicalRange,
     memory_map: BootInfoTable,
     modules: BootInfoTable,
     module_entries: &[DwBootModuleV1],
+    memory_ranges: &[DwBootMemoryRangeV1],
     command_line: Option<BootPhysicalRange>,
     entropy: Option<BootPhysicalRange>,
     framebuffer: Option<DwBootFramebufferV1>,
@@ -778,6 +821,50 @@ fn validate_paging_handoff_frame_roles(
                 return Err(BootInfoValidationError::PagingHandoffFrameRoleOverlap);
             }
         }
+        validate_paging_frame_reserved_coverage(frame_range, memory_ranges)?;
+    }
+    Ok(())
+}
+
+fn validate_paging_frame_reserved_coverage(
+    frame: BootPhysicalRange,
+    memory_ranges: &[DwBootMemoryRangeV1],
+) -> Result<(), BootInfoValidationError> {
+    let frame_end = frame
+        .physical_start
+        .checked_add(frame.byte_len)
+        .ok_or(BootInfoValidationError::ArithmeticOverflow)?;
+    let mut covering_records = 0_usize;
+
+    for record in memory_ranges {
+        let byte_len = record
+            .page_count
+            .checked_mul(u64::from(DW_BOOT_BASE_PAGE_SIZE))
+            .ok_or(BootInfoValidationError::ArithmeticOverflow)?;
+        let range = BootPhysicalRange {
+            physical_start: record.physical_start,
+            byte_len,
+        };
+        if !ranges_overlap(frame, range)? {
+            continue;
+        }
+        let range_end = range
+            .physical_start
+            .checked_add(range.byte_len)
+            .ok_or(BootInfoValidationError::ArithmeticOverflow)?;
+        if record.kind != DW_BOOT_MEMORY_KIND_RESERVED
+            || range.physical_start > frame.physical_start
+            || range_end < frame_end
+        {
+            return Err(BootInfoValidationError::PagingHandoffFrameNotReserved);
+        }
+        covering_records = covering_records
+            .checked_add(1)
+            .ok_or(BootInfoValidationError::ArithmeticOverflow)?;
+    }
+
+    if covering_records != 1 {
+        return Err(BootInfoValidationError::PagingHandoffFrameNotReserved);
     }
     Ok(())
 }
@@ -1235,13 +1322,19 @@ mod tests {
         put_u32(&mut header, 0, DW_BOOT_INFO_V1_SIZE);
         put_u32(&mut header, 4, DW_BOOT_INFO_V1_VERSION);
         put_u64(&mut header, 16, MEMORY_MAP);
-        put_u64(&mut header, 24, 1);
+        put_u64(&mut header, 24, 2);
         put_u32(&mut header, 32, DW_BOOT_MEMORY_RANGE_V1_SIZE);
         put_u64(&mut header, 40, MODULES);
         put_u64(&mut header, 48, 3);
         put_u32(&mut header, 56, DW_BOOT_MODULE_V1_SIZE);
         fixture.bytes_at(BOOT_INFO, &header);
         fixture.bytes_at(MEMORY_MAP, &memory_range(0x10_0000, 16));
+        let mut paging_memory = memory_range(PAGING_FRAMES[0], 49);
+        put_u32(&mut paging_memory, 8, DW_BOOT_MEMORY_KIND_RESERVED.0);
+        fixture.bytes_at(
+            MEMORY_MAP + u64::from(DW_BOOT_MEMORY_RANGE_V1_SIZE),
+            &paging_memory,
+        );
         fixture.bytes_at(
             MODULES,
             &module(
@@ -1278,15 +1371,18 @@ mod tests {
         let fixture = valid_fixture();
         let boot_info = validate_boot_info(&fixture, BOOT_INFO).expect("valid handoff");
 
-        assert_eq!(boot_info.memory_map().entry_count(), 1);
+        assert_eq!(boot_info.memory_map().entry_count(), 2);
         assert_eq!(boot_info.modules().entry_count(), 3);
         assert_eq!(boot_info.memory_range(0).unwrap().page_count, 16);
         assert_eq!(
-            boot_info.module(1).unwrap().kind,
-            DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS
+            boot_info.delegable_module(1).unwrap().range(),
+            BootPhysicalRange {
+                physical_start: 0x30_0000,
+                byte_len: 0x2000,
+            }
         );
         assert_eq!(
-            boot_info.memory_range(1),
+            boot_info.memory_range(2),
             Err(BootInfoValidationError::TableIndexOutOfBounds)
         );
         assert_eq!(boot_info.paging_handoff().table_frame_count(), 4);
@@ -1319,7 +1415,14 @@ mod tests {
         fixture.bytes_at(PAGING_HANDOFF + 112, &0_u64.to_le_bytes());
 
         assert_eq!(boot_info.memory_range(0).unwrap().page_count, 16);
-        assert_eq!(boot_info.module(1).unwrap().physical_start, 0x30_0000);
+        assert_eq!(
+            boot_info
+                .delegable_module(1)
+                .unwrap()
+                .range()
+                .physical_start(),
+            0x30_0000
+        );
         assert_eq!(
             boot_info.paging_handoff().table_frame(0).unwrap(),
             PAGING_FRAMES[0]
@@ -1454,6 +1557,63 @@ mod tests {
         let info = validate_boot_info(&reader, BOOT_INFO).expect("valid one-snapshot carrier");
         assert_eq!(reader.paging_reads.get(), 1);
         assert_eq!(info.paging_handoff().table_frame_count(), 4);
+    }
+
+    #[test]
+    fn only_bootfs_has_a_delegable_module_view() {
+        let fixture = valid_fixture();
+        let info = validate_boot_info(&fixture, BOOT_INFO).expect("valid handoff");
+
+        assert_eq!(
+            info.delegable_module(0),
+            Err(BootInfoValidationError::ModuleNotDelegable)
+        );
+        assert_eq!(
+            info.delegable_module(2),
+            Err(BootInfoValidationError::ModuleNotDelegable)
+        );
+        assert_eq!(
+            info.delegable_module(3),
+            Err(BootInfoValidationError::TableIndexOutOfBounds)
+        );
+        assert_eq!(
+            info.delegable_module(1).unwrap().range(),
+            BootPhysicalRange {
+                physical_start: 0x30_0000,
+                byte_len: 0x2000,
+            }
+        );
+    }
+
+    #[test]
+    fn paging_frames_require_exactly_one_reserved_memory_map_owner() {
+        for kind in [DW_BOOT_MEMORY_KIND_USABLE, DW_BOOT_MEMORY_KIND_MMIO] {
+            let mut fixture = valid_fixture();
+            fixture.bytes_at(MEMORY_MAP + 64 + 8, &kind.0.to_le_bytes());
+            assert_eq!(
+                validate_boot_info(&fixture, BOOT_INFO),
+                Err(BootInfoValidationError::PagingHandoffFrameNotReserved),
+                "accepted paging frames classified as kind {}",
+                kind.0
+            );
+        }
+
+        let mut uncovered = valid_fixture();
+        uncovered.bytes_at(MEMORY_MAP + 64 + 16, &0x70_0000_u64.to_le_bytes());
+        assert_eq!(
+            validate_boot_info(&uncovered, BOOT_INFO),
+            Err(BootInfoValidationError::PagingHandoffFrameNotReserved)
+        );
+
+        let mut duplicate_owner = valid_fixture();
+        duplicate_owner.bytes_at(BOOT_INFO + 24, &3_u64.to_le_bytes());
+        let mut duplicate_range = memory_range(PAGING_FRAMES[0], 49);
+        put_u32(&mut duplicate_range, 8, DW_BOOT_MEMORY_KIND_RESERVED.0);
+        duplicate_owner.bytes_at(MEMORY_MAP + 128, &duplicate_range);
+        assert_eq!(
+            validate_boot_info(&duplicate_owner, BOOT_INFO),
+            Err(BootInfoValidationError::PagingHandoffFrameNotReserved)
+        );
     }
 
     #[test]

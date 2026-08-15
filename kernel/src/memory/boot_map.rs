@@ -7,9 +7,10 @@
 //! of the frame allocator.
 
 #[cfg(test)]
-use deepwyrm_abi::DW_BOOT_MEMORY_KIND_RESERVED;
+use deepwyrm_abi::DW_BOOT_MEMORY_KIND_MMIO;
 use deepwyrm_abi::{
-    DW_BOOT_BASE_PAGE_SIZE, DW_BOOT_INFO_V1_SIZE, DW_BOOT_MEMORY_KIND_USABLE, DwBootMemoryRangeV1,
+    DW_BOOT_BASE_PAGE_SIZE, DW_BOOT_INFO_V1_SIZE, DW_BOOT_MEMORY_KIND_RESERVED,
+    DW_BOOT_MEMORY_KIND_USABLE, DwBootMemoryRangeV1,
 };
 
 use crate::boot::{
@@ -114,6 +115,7 @@ pub enum BootMapError {
     OutputCapacityExceeded,
     HandoffRangeUncovered { kind: BootstrapReservationKind },
     HandoffRangeUsable { kind: BootstrapReservationKind },
+    HandoffRangeNotReserved { kind: BootstrapReservationKind },
 }
 
 impl From<PhysicalMemoryError> for BootMapError {
@@ -230,12 +232,14 @@ pub(crate) fn collect_bootstrap_reservations(
         )?,
     )?;
     for index in 0..modules.entry_count() {
-        let module = boot_info.module(index).map_err(BootMapError::Snapshot)?;
+        let module = boot_info
+            .module_reservation_range(index)
+            .map_err(BootMapError::Snapshot)?;
         push_reservation(
             output,
             &mut used,
             BootstrapReservationKind::ModuleData { index },
-            physical_range(module.physical_start, module.byte_len)?,
+            physical_range(module.physical_start(), module.byte_len())?,
         )?;
     }
     let paging = boot_info.paging_handoff();
@@ -374,10 +378,12 @@ fn validate_enumerated_handoff_coverage(
         physical_limit,
     )?;
     for index in 0..modules.entry_count() {
-        let module = boot_info.module(index).map_err(BootMapError::Snapshot)?;
+        let module = boot_info
+            .module_reservation_range(index)
+            .map_err(BootMapError::Snapshot)?;
         require_nonusable_coverage(
             records,
-            physical_range(module.physical_start, module.byte_len)?,
+            physical_range(module.physical_start(), module.byte_len())?,
             BootstrapReservationKind::ModuleData { index },
             physical_limit,
         )?;
@@ -385,7 +391,7 @@ fn validate_enumerated_handoff_coverage(
     let paging = boot_info.paging_handoff();
     for index in 0..paging.table_frame_count() {
         let physical_start = paging.table_frame(index).map_err(BootMapError::Snapshot)?;
-        require_nonusable_coverage(
+        require_reserved_coverage(
             records,
             physical_range(physical_start, u64::from(DW_BOOT_BASE_PAGE_SIZE))?,
             BootstrapReservationKind::PagingTableFrame {
@@ -455,6 +461,35 @@ fn require_nonusable_coverage(
         }
         if record.kind == DW_BOOT_MEMORY_KIND_USABLE {
             return Err(BootMapError::HandoffRangeUsable { kind });
+        }
+        covered_until = core::cmp::min(pages.end, end);
+        if covered_until == end {
+            return Ok(());
+        }
+    }
+    Err(BootMapError::HandoffRangeUncovered { kind })
+}
+
+fn require_reserved_coverage(
+    records: &[DwBootMemoryRangeV1],
+    range: PhysicalRange,
+    kind: BootstrapReservationKind,
+    physical_limit: PhysicalAddressLimit,
+) -> Result<(), BootMapError> {
+    let end = range
+        .end()
+        .map_err(|_| BootMapError::Physical(PhysicalMemoryError::AddressOverflow))?;
+    let mut covered_until = range.physical_start();
+    for record in records {
+        let pages = record_pages(*record, physical_limit)?;
+        if pages.end <= covered_until {
+            continue;
+        }
+        if pages.start > covered_until {
+            return Err(BootMapError::HandoffRangeUncovered { kind });
+        }
+        if record.kind != DW_BOOT_MEMORY_KIND_RESERVED {
+            return Err(BootMapError::HandoffRangeNotReserved { kind });
         }
         covered_until = core::cmp::min(pages.end, end);
         if covered_until == end {
@@ -705,24 +740,30 @@ mod tests {
     }
 
     #[test]
-    fn paging_table_frames_require_full_nonusable_map_coverage() {
+    fn paging_table_frames_require_exact_reserved_map_coverage() {
         let frame = PhysicalRange::new(0x2000, u64::from(DW_BOOT_BASE_PAGE_SIZE)).unwrap();
         let kind = BootstrapReservationKind::PagingTableFrame { index: 7 };
         let reserved = [record(0x2000, 1, DW_BOOT_MEMORY_KIND_RESERVED, 0)];
         assert_eq!(
-            require_nonusable_coverage(&reserved, frame, kind, limit()),
+            require_reserved_coverage(&reserved, frame, kind, limit()),
             Ok(())
         );
 
         let usable = [record(0x2000, 1, DW_BOOT_MEMORY_KIND_USABLE, 0)];
         assert_eq!(
-            require_nonusable_coverage(&usable, frame, kind, limit()),
-            Err(BootMapError::HandoffRangeUsable { kind })
+            require_reserved_coverage(&usable, frame, kind, limit()),
+            Err(BootMapError::HandoffRangeNotReserved { kind })
+        );
+
+        let mmio = [record(0x2000, 1, DW_BOOT_MEMORY_KIND_MMIO, 0)];
+        assert_eq!(
+            require_reserved_coverage(&mmio, frame, kind, limit()),
+            Err(BootMapError::HandoffRangeNotReserved { kind })
         );
 
         let outside = [record(0x1000, 1, DW_BOOT_MEMORY_KIND_RESERVED, 0)];
         assert_eq!(
-            require_nonusable_coverage(&outside, frame, kind, limit()),
+            require_reserved_coverage(&outside, frame, kind, limit()),
             Err(BootMapError::HandoffRangeUncovered { kind })
         );
     }
