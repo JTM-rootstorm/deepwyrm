@@ -1,15 +1,19 @@
 # Deepwyrm Bootstrap Status
 
-Deepwyrm is currently a bootstrap scaffold governed by the architecture and
-DW0 planning documents.
+Deepwyrm is implementing DW0 in the order defined by the architecture and DW0
+planning documents.
 
 ## Current claim boundary
 
-No DW0 phase gate has been completed. In particular, the repository does not
-currently provide:
+Phase DW0-A passed its host-only ABI layout gate at Deepwyrm revision
+`4751a2d3929675357e31389301d152f86e2ab7cb`. The detailed command, clean-checkout,
+review, and limitation record is in
+[`DW0_A_VALIDATION.md`](DW0_A_VALIDATION.md).
 
-- a canonical native ABI schema, generator, generated contract, or passing ABI
-  layout/drift gate;
+The repository now provides a canonical ABI 0 schema, deterministic generator,
+fixed-width Rust and C definitions, committed drift-checked outputs, a `no_std`
+`deepwyrm-abi` crate, and focused host commands. It does not currently provide:
+
 - a bootable x86_64 Deepwyrm kernel, UEFI handoff, serial/panic path, or guest
   test completion path;
 - implemented memory, object, handle, task, syscall, IPC, synchronization, or
@@ -17,14 +21,12 @@ currently provide:
 - a primordial ELF loader or primordial Wyrmroot process launch;
 - a canonical Deepwyrm/Wyrmroot image, QEMU integration result, or tested
   compatible revision pair; or
-- a completed DW0 security, libc-independence, toolchain, image-delivery, or
-  milestone-closure gate.
+- a completed DW0 release-candidate security, libc-independence, toolchain,
+  image-delivery, or milestone-closure gate.
 
-Existing package manifests, placeholder modules, directory boundaries,
-toolchain provenance metadata, workflow files, and command-surface scaffolding
-only establish repository structure. They do not establish kernel behavior,
-ABI values, toolchain usability, build reproducibility, guest execution, or a
-passing phase gate.
+DW0-A evidence establishes only the host ABI/schema/tooling gate. It does not
+establish kernel behavior, guest toolchain acceptance, boot reproducibility,
+guest execution, or any later phase gate.
 
 ## Authority
 

@@ -1,6 +1,6 @@
 schema_version = 1
 document_kind = "deepwyrm-toolchain-provenance"
-behavior = "metadata-only"
+behavior = "provenance-and-dw0a-host-validation"
 
 [rust]
 role = "canonical-rust-compiler-source"
@@ -14,88 +14,100 @@ activation_status = "not-configured"
 
 [version_policy]
 rust_source = "provenance-base-commit"
-host_tools = "unresolved-until-milestone-build-environment-is-adopted"
+host_tools = "exact-observation-for-dw0a-validation-not-a-guest-toolchain-pin"
+
+[dw0a_host_validation]
+recorded_on = "2026-08-15"
+deepwyrm_revision = "4751a2d3929675357e31389301d152f86e2ab7cb"
+host = "x86_64-unknown-linux-gnu"
+rustc = "1.96.1 (31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd)"
+rustc_llvm = "22.1.2"
+cargo = "1.96.1 (356927216 2026-06-26)"
+llvm_family = "22.1.8"
+gdb = "17.2"
+scope = "DW0-A host ABI generation, C11 header probe, layout tests, drift checks, and workspace validation"
+guest_toolchain_claim = "none"
 
 [[components]]
 id = "llvm"
 family = "llvm"
 role = "canonical-code-generation-and-tool-family"
-version_status = "unresolved"
-installation_status = "not-asserted"
+version_status = "observed-22.1.8"
+installation_status = "observed-for-dw0a"
 
 [[components]]
 id = "clang"
 family = "llvm"
 role = "canonical-c-compiler"
-version_status = "unresolved"
-installation_status = "not-asserted"
+version_status = "observed-22.1.8"
+installation_status = "observed-for-dw0a"
 
 [[components]]
 id = "clang++"
 family = "llvm"
 role = "canonical-cpp-compiler-when-required"
-version_status = "unresolved"
-installation_status = "not-asserted"
+version_status = "observed-22.1.8"
+installation_status = "observed-for-dw0a"
 
 [[components]]
 id = "ld.lld"
 family = "llvm"
 role = "canonical-linker"
-version_status = "unresolved"
-installation_status = "not-asserted"
+version_status = "observed-22.1.8"
+installation_status = "observed-for-dw0a"
 
 [[components]]
 id = "compiler-rt"
 family = "llvm"
 role = "preferred-compiler-builtins-when-required"
-version_status = "unresolved"
-installation_status = "not-asserted"
+version_status = "observed-22.1.8-x86_64-builtins-present"
+installation_status = "observed-for-dw0a"
 
 [[components]]
 id = "llvm-ar"
 family = "llvm"
 role = "canonical-archiver"
-version_status = "unresolved"
-installation_status = "not-asserted"
+version_status = "observed-22.1.8"
+installation_status = "observed-for-dw0a"
 
 [[components]]
 id = "llvm-readelf"
 family = "llvm"
 role = "canonical-object-inspection"
-version_status = "unresolved"
-installation_status = "not-asserted"
+version_status = "observed-22.1.8"
+installation_status = "observed-for-dw0a"
 
 [[components]]
 id = "llvm-objdump"
 family = "llvm"
 role = "canonical-object-inspection"
-version_status = "unresolved"
-installation_status = "not-asserted"
+version_status = "observed-22.1.8"
+installation_status = "observed-for-dw0a"
 
 [[components]]
 id = "llvm-objcopy"
 family = "llvm"
 role = "canonical-binary-manipulation"
-version_status = "unresolved"
-installation_status = "not-asserted"
+version_status = "observed-22.1.8"
+installation_status = "observed-for-dw0a"
 
 [[components]]
 id = "llvm-symbolizer"
 family = "llvm"
 role = "canonical-symbolization"
-version_status = "unresolved"
-installation_status = "not-asserted"
+version_status = "observed-22.1.8"
+installation_status = "observed-for-dw0a"
 
 [[components]]
 id = "llvm-nm"
 family = "llvm"
 role = "canonical-symbol-inspection"
-version_status = "unresolved"
-installation_status = "not-asserted"
+version_status = "observed-22.1.8"
+installation_status = "observed-for-dw0a"
 
 [[components]]
 id = "gdb"
 family = "gnu"
 role = "canonical-host-debugger-for-qemu-gdbstub"
-version_status = "unresolved"
-installation_status = "not-asserted"
+version_status = "observed-17.2"
+installation_status = "observed-for-diagnostics-only"

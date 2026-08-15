@@ -1,4 +1,4 @@
-name: Bootstrap scaffold
+name: DW0-A host validation
 
 'on':
   push:
@@ -7,45 +7,68 @@ name: Bootstrap scaffold
 permissions:
   contents: read
 
+env:
+  RUST_TOOLCHAIN: 1.96.1
+
 jobs:
-  metadata:
-    name: Validate repository scaffold
+  host-abi:
+    name: Validate workspace and native ABI
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Validate bootstrap metadata
+      - name: Install the DW0-A host Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install "${RUST_TOOLCHAIN}" \
+            --profile minimal \
+            --component clippy,rustfmt
+          rustup default "${RUST_TOOLCHAIN}"
+
+      - name: Validate required sources
         shell: bash
         run: |
           set -euo pipefail
 
           readonly required_files=(
-            README.md
-            LICENSE
             Plans/ARCHITECTURE_INDEX.md
             Plans/DEEPWYRM_PRE_PHASE0_INVARIANTS.md
             Plans/DW0_IMPLEMENTATION_PLAN.md
-            tests/README.md
-            tests/host/README.md
-            tests/guest/README.md
-            tests/integration/README.md
+            abi/schema/abi.toml
+            abi/schema/syscalls.toml
+            tools/abi-gen/Cargo.toml
+            crates/deepwyrm-abi/Cargo.toml
+            docs/DW0_A_VALIDATION.md
+            security/DW0_A_SECURITY_REVIEW.md
           )
 
           for path in "${required_files[@]}"; do
             if [[ ! -s "${path}" ]]; then
-              printf 'missing or empty bootstrap scaffold file: %s\n' "${path}" >&2
+              printf 'missing or empty DW0-A source: %s\n' "${path}" >&2
               exit 1
             fi
           done
 
-          unexpected_files="$(find tests -type f ! -name README.md -print)"
-          if [[ -n "${unexpected_files}" ]]; then
-            printf 'bootstrap-only test scaffold contains executable test material:\n%s\n' \
-              "${unexpected_files}" >&2
-            exit 1
-          fi
+      - name: Report host tools
+        run: cargo xtask toolchain
 
-          printf '%s\n' \
-            'Bootstrap metadata and documentation scaffold validated.' \
-            'No build, kernel, guest, image, integration, or phase gate was run.'
+      - name: Verify formatting
+        run: cargo xtask format
+
+      - name: Reject generated ABI drift
+        run: cargo xtask abi check
+
+      - name: Run focused ABI host tests
+        run: cargo xtask test host abi
+
+      - name: Run workspace tests
+        run: cargo test --locked --workspace --all-targets
+
+      - name: Reject lint warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Reject rustdoc warnings
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --workspace --no-deps

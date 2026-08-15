@@ -5,12 +5,10 @@ outputs, and disposable local artifacts.
 
 ## Authored and generated source
 
-The future ABI schema and generator are authored source. Files under
-`abi/generated/` may be versioned for bootstrap convenience when the
-coordinated DW0-A workflow explicitly establishes them. They are therefore not
-blanket-ignored.
+The ABI schema and generator are authored source. Files under `abi/generated/`
+are committed, generator-owned outputs and are therefore not blanket-ignored.
 
-Once ABI generation exists:
+For every ABI change:
 
 - change the canonical schema or generator rather than editing derived output
   as an independent contract;
@@ -18,8 +16,7 @@ Once ABI generation exists:
 - run the implemented drift verification; and
 - review schema and generated changes together.
 
-The current placeholder under `abi/generated/` is not an implemented or
-generated ABI contract.
+`cargo xtask abi check` rejects missing, stale, and unexpected generated files.
 
 ## Disposable local output
 

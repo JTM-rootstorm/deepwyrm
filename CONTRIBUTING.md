@@ -1,10 +1,9 @@
 # Contributing to Deepwyrm
 
-Deepwyrm is in bootstrap scaffolding. No DW0 phase gate is complete, and the
-repository does not yet contain a bootable kernel or an implemented native ABI.
-Placeholders, package boundaries, and planned command names are not evidence of
-implemented behavior. See [the bootstrap status](docs/BOOTSTRAP_STATUS.md) for
-the current claim boundary.
+Deepwyrm is implementing DW0 in ordered phases. The native ABI schema and its
+host validation tooling exist, but the repository does not yet contain a
+bootable kernel or implemented syscall behavior. See
+[the bootstrap status](docs/BOOTSTRAP_STATUS.md) for the current claim boundary.
 
 ## Read the architecture first
 
@@ -40,11 +39,10 @@ were actually run, their exact results, and any remaining unverified claims.
 
 ## Generated files and local artifacts
 
-The ABI schema is intended to become the canonical source of truth.
-Generator-owned ABI outputs may be committed when the coordinated DW0-A
-workflow establishes that policy, so `abi/generated/` is deliberately not
-ignored. Once generation exists, changes to committed generated files must be
-made from the schema/generator and pass the repository's drift check.
+The ABI schema is the canonical source of truth. Generator-owned ABI outputs
+are committed, so `abi/generated/` is deliberately not ignored. Changes to
+generated files must originate in the schema or generator and pass
+`cargo xtask abi check`.
 
 Rust build output and repository-local staging directories are ignored. Keep
 boot media, VM disks, logs, and transient test results out of source paths.
