@@ -1,0 +1,28 @@
+# Rust and host-tool build output
+/target/
+
+# Repository-local build, packaging, image, and test output
+/.cache/
+/artifacts/
+/build/
+/dist/
+/images/
+/logs/
+/tmp/
+
+# Coverage and profiling output
+*.profdata
+*.profraw
+
+# Debugger state
+.gdb_history
+
+# Editor and operating-system metadata
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Do not ignore abi/generated/. Generated ABI files may be intentionally
+# versioned and must be checked for schema drift once generation exists.

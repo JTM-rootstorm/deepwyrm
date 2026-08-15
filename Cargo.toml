@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "crates/deepwyrm-abi",
+    "kernel",
+    "tools/xtask",
+]
+resolver = "2"
+
+[profile.dev]
+debug = 2
+
+[profile.release]
+debug = 2

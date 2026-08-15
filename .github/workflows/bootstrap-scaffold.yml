@@ -1,0 +1,51 @@
+name: Bootstrap scaffold
+
+'on':
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  metadata:
+    name: Validate repository scaffold
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate bootstrap metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          readonly required_files=(
+            README.md
+            LICENSE
+            Plans/ARCHITECTURE_INDEX.md
+            Plans/DEEPWYRM_PRE_PHASE0_INVARIANTS.md
+            Plans/DW0_IMPLEMENTATION_PLAN.md
+            tests/README.md
+            tests/host/README.md
+            tests/guest/README.md
+            tests/integration/README.md
+          )
+
+          for path in "${required_files[@]}"; do
+            if [[ ! -s "${path}" ]]; then
+              printf 'missing or empty bootstrap scaffold file: %s\n' "${path}" >&2
+              exit 1
+            fi
+          done
+
+          unexpected_files="$(find tests -type f ! -name README.md -print)"
+          if [[ -n "${unexpected_files}" ]]; then
+            printf 'bootstrap-only test scaffold contains executable test material:\n%s\n' \
+              "${unexpected_files}" >&2
+            exit 1
+          fi
+
+          printf '%s\n' \
+            'Bootstrap metadata and documentation scaffold validated.' \
+            'No build, kernel, guest, image, integration, or phase gate was run.'

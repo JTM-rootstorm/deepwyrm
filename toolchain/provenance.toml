@@ -1,0 +1,101 @@
+schema_version = 1
+document_kind = "deepwyrm-toolchain-provenance"
+behavior = "metadata-only"
+
+[rust]
+role = "canonical-rust-compiler-source"
+source = "wyrmroot-maintained-fork"
+repository = "https://github.com/JTM-rootstorm/rust.git"
+base_commit = "8bab26f4f68e0e26f0bb7960be334d5b520ea452"
+selection_status = "provenance-only"
+installation_status = "not-asserted"
+usability_status = "not-asserted"
+activation_status = "not-configured"
+
+[version_policy]
+rust_source = "provenance-base-commit"
+host_tools = "unresolved-until-milestone-build-environment-is-adopted"
+
+[[components]]
+id = "llvm"
+family = "llvm"
+role = "canonical-code-generation-and-tool-family"
+version_status = "unresolved"
+installation_status = "not-asserted"
+
+[[components]]
+id = "clang"
+family = "llvm"
+role = "canonical-c-compiler"
+version_status = "unresolved"
+installation_status = "not-asserted"
+
+[[components]]
+id = "clang++"
+family = "llvm"
+role = "canonical-cpp-compiler-when-required"
+version_status = "unresolved"
+installation_status = "not-asserted"
+
+[[components]]
+id = "ld.lld"
+family = "llvm"
+role = "canonical-linker"
+version_status = "unresolved"
+installation_status = "not-asserted"
+
+[[components]]
+id = "compiler-rt"
+family = "llvm"
+role = "preferred-compiler-builtins-when-required"
+version_status = "unresolved"
+installation_status = "not-asserted"
+
+[[components]]
+id = "llvm-ar"
+family = "llvm"
+role = "canonical-archiver"
+version_status = "unresolved"
+installation_status = "not-asserted"
+
+[[components]]
+id = "llvm-readelf"
+family = "llvm"
+role = "canonical-object-inspection"
+version_status = "unresolved"
+installation_status = "not-asserted"
+
+[[components]]
+id = "llvm-objdump"
+family = "llvm"
+role = "canonical-object-inspection"
+version_status = "unresolved"
+installation_status = "not-asserted"
+
+[[components]]
+id = "llvm-objcopy"
+family = "llvm"
+role = "canonical-binary-manipulation"
+version_status = "unresolved"
+installation_status = "not-asserted"
+
+[[components]]
+id = "llvm-symbolizer"
+family = "llvm"
+role = "canonical-symbolization"
+version_status = "unresolved"
+installation_status = "not-asserted"
+
+[[components]]
+id = "llvm-nm"
+family = "llvm"
+role = "canonical-symbol-inspection"
+version_status = "unresolved"
+installation_status = "not-asserted"
+
+[[components]]
+id = "gdb"
+family = "gnu"
+role = "canonical-host-debugger-for-qemu-gdbstub"
+version_status = "unresolved"
+installation_status = "not-asserted"
