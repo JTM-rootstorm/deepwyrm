@@ -49,4 +49,3 @@ doc = "Query structured object information."
 name = "MODIFY"
 value = 0x0000000000000200
 doc = "Change object configuration or lifecycle state."
-

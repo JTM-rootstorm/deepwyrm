@@ -188,4 +188,3 @@ field13 = "command_line_physical_start|u64|Physical address of opaque command-li
 field14 = "command_line_byte_len|u64|Number of command-line bytes; no implicit terminator."
 field15 = "entropy|DwBootEntropyV1|Optional firmware entropy descriptor; all-zero means absent."
 field16 = "reserved|[u64;8]|Reserved; all elements must be zero."
-
