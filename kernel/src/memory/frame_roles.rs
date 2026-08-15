@@ -1,0 +1,1240 @@
+//! Authoritative physical-frame ownership and role transitions.
+//!
+//! The range allocator is deliberately kept as a mechanism below this module.
+//! Every allocation made available to the rest of the kernel is represented by
+//! one generation-stamped, non-copy grant and one nonoverlapping registry
+//! record. Raw physical addresses are metadata, never ownership authority.
+
+#![allow(
+    dead_code,
+    reason = "DW0-C establishes typed frame ownership before the architecture publisher consumes it"
+)]
+
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use super::boot_map::{BootMapError, BootstrapReservation, SanitizedBootMap};
+use super::physical::{
+    BASE_PAGE_SIZE, PageRange, PhysicalFrameAllocator, PhysicalMemoryError, PhysicalRange,
+};
+
+static NEXT_MANAGER_DOMAIN: AtomicU64 = AtomicU64::new(1);
+static FRAME_ROLE_MANAGER_CLAIMED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FrameRoleError {
+    Physical(PhysicalMemoryError),
+    Capacity,
+    GenerationExhausted,
+    ManagerDomainExhausted,
+    ForeignManager,
+    InvalidGrant,
+    WrongRole,
+    Overlap,
+    ExternalAllocatorOverlap,
+    DynamicOutsideAllocator,
+    InvalidTableOwner,
+    InvalidTableParent,
+    DuplicateTableRoot,
+    ReadOnlyBacking,
+    InvariantViolation,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct GrantTransitionError<G> {
+    error: FrameRoleError,
+    grant: G,
+}
+
+impl<G> GrantTransitionError<G> {
+    const fn new(error: FrameRoleError, grant: G) -> Self {
+        Self { error, grant }
+    }
+
+    pub(crate) const fn error(&self) -> FrameRoleError {
+        self.error
+    }
+
+    pub(crate) fn into_grant(self) -> G {
+        self.grant
+    }
+}
+
+impl From<PhysicalMemoryError> for FrameRoleError {
+    fn from(error: PhysicalMemoryError) -> Self {
+        Self::Physical(error)
+    }
+}
+
+fn claim_manager(claimed: &AtomicBool) -> Result<(), FrameRoleInitializationError> {
+    claimed
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map(|_| ())
+        .map_err(|_| FrameRoleInitializationError::AlreadyInitialized)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FrameRoleInitializationError {
+    BootMap(BootMapError),
+    AlreadyInitialized,
+    Role(FrameRoleError),
+}
+
+/// Opaque observation identity. It can query a role, but cannot mutate or free
+/// it without the corresponding non-copy grant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FrameRoleIdentity {
+    domain: u64,
+    raw: u64,
+}
+
+impl FrameRoleIdentity {
+    const EMPTY: Self = Self { domain: 0, raw: 0 };
+}
+
+/// Opaque identity retained by `MemoryObject` mappings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BackingIdentity(FrameRoleIdentity);
+
+impl BackingIdentity {
+    pub(crate) const EMPTY: Self = Self(FrameRoleIdentity::EMPTY);
+}
+
+/// One frame-role namespace for an architecture address space.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TableOwnerKey {
+    domain: u64,
+    raw: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TableLevel {
+    Pml4,
+    Pdpt,
+    Pd,
+    Pt,
+}
+
+impl TableLevel {
+    const fn child(self) -> Option<Self> {
+        match self {
+            Self::Pml4 => Some(Self::Pdpt),
+            Self::Pdpt => Some(Self::Pd),
+            Self::Pd => Some(Self::Pt),
+            Self::Pt => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TableIdentity {
+    role: FrameRoleIdentity,
+    owner: TableOwnerKey,
+    level: TableLevel,
+    physical_start: u64,
+}
+
+impl TableIdentity {
+    pub(crate) const fn physical_start(self) -> u64 {
+        self.physical_start
+    }
+
+    pub(crate) const fn owner(self) -> TableOwnerKey {
+        self.owner
+    }
+
+    pub(crate) const fn level(self) -> TableLevel {
+        self.level
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ObjectBackingKind {
+    AllocatorOwned,
+    ImmutableModule { module_index: u32 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KernelImageSegment {
+    Text,
+    ReadOnlyData,
+    WritableData,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExternalFrameRole {
+    TransitionTable { table_index: u32 },
+    KernelImage { segment: KernelImageSegment },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FrameRoleKind {
+    AllocatedUninitialized,
+    Zeroed,
+    ObjectBacking(ObjectBackingKind),
+    TableCandidate {
+        owner: TableOwnerKey,
+        level: TableLevel,
+    },
+    PageTable {
+        owner: TableOwnerKey,
+        level: TableLevel,
+    },
+    External(ExternalFrameRole),
+    ExternalImmutableModule {
+        module_index: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrameRole {
+    AllocatedUninitialized,
+    Zeroed,
+    ObjectBacking(ObjectBackingKind),
+    TableCandidate {
+        owner: TableOwnerKey,
+        level: TableLevel,
+    },
+    PageTable {
+        owner: TableOwnerKey,
+        level: TableLevel,
+        parent: Option<FrameRoleIdentity>,
+    },
+    External(ExternalFrameRole),
+    ExternalImmutableModule {
+        module_index: u32,
+    },
+}
+
+impl FrameRole {
+    const fn is_dynamic(self) -> bool {
+        !matches!(
+            self,
+            Self::External(_) | Self::ExternalImmutableModule { .. }
+        )
+    }
+
+    const fn kind(self) -> FrameRoleKind {
+        match self {
+            Self::AllocatedUninitialized => FrameRoleKind::AllocatedUninitialized,
+            Self::Zeroed => FrameRoleKind::Zeroed,
+            Self::ObjectBacking(kind) => FrameRoleKind::ObjectBacking(kind),
+            Self::TableCandidate { owner, level } => FrameRoleKind::TableCandidate { owner, level },
+            Self::PageTable {
+                owner,
+                level,
+                parent: _,
+            } => FrameRoleKind::PageTable { owner, level },
+            Self::External(role) => FrameRoleKind::External(role),
+            Self::ExternalImmutableModule { module_index } => {
+                FrameRoleKind::ExternalImmutableModule { module_index }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RoleRecord {
+    range: PageRange,
+    role: FrameRole,
+}
+
+#[derive(Clone, Copy)]
+struct RoleSlot {
+    generation: u32,
+    record: Option<RoleRecord>,
+}
+
+const EMPTY_ROLE_SLOT: RoleSlot = RoleSlot {
+    generation: 0,
+    record: None,
+};
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct AllocationGrant {
+    identity: FrameRoleIdentity,
+    range: PageRange,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ZeroedGrant {
+    identity: FrameRoleIdentity,
+    range: PageRange,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ObjectBackingGrant {
+    identity: BackingIdentity,
+    range: PageRange,
+    kind: ObjectBackingKind,
+}
+
+impl ObjectBackingGrant {
+    pub(crate) const fn identity(&self) -> BackingIdentity {
+        self.identity
+    }
+
+    pub(crate) const fn physical_start(&self) -> u64 {
+        self.range.start
+    }
+
+    pub(crate) const fn byte_len(&self) -> u64 {
+        self.range.end - self.range.start
+    }
+
+    pub(crate) const fn kind(&self) -> ObjectBackingKind {
+        self.kind
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct TableCandidateGrant {
+    identity: FrameRoleIdentity,
+    range: PageRange,
+    owner: TableOwnerKey,
+    level: TableLevel,
+}
+
+impl TableCandidateGrant {
+    pub(crate) const fn physical_start(&self) -> u64 {
+        self.range.start
+    }
+}
+
+/// The sole dynamic allocator and physical-role registry.
+pub(crate) struct FrameRoleManager<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
+    domain: u64,
+    allocator: PhysicalFrameAllocator<RANGE_CAPACITY>,
+    roles: [RoleSlot; ROLE_CAPACITY],
+    next_table_owner: u64,
+}
+
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn new(allocator: PhysicalFrameAllocator<RANGE_CAPACITY>) -> Result<Self, FrameRoleError> {
+        let domain = NEXT_MANAGER_DOMAIN
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1).filter(|next| *next != 0)
+            })
+            .map_err(|_| FrameRoleError::ManagerDomainExhausted)?;
+        Ok(Self {
+            domain,
+            allocator,
+            roles: [EMPTY_ROLE_SLOT; ROLE_CAPACITY],
+            next_table_owner: 1,
+        })
+    }
+
+    /// Creates the kernel's sole dynamic frame owner from a consumed map.
+    ///
+    /// Validation and allocator construction complete before the global
+    /// one-shot claim. Once claimed, initialization is terminal even if the
+    /// subsequent manager-domain allocation fails.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the sole boot-memory owner, must not have created or
+    /// retained any other allocator over the handoff's usable ranges, and must
+    /// retain the returned manager for the lifetime of all issued grants.
+    #[allow(
+        unsafe_code,
+        reason = "boot ownership uniqueness cannot be derived from a repeatable sanitized-map value alone"
+    )]
+    pub(crate) unsafe fn from_boot_map(
+        map: SanitizedBootMap,
+        reservations: &[BootstrapReservation],
+    ) -> Result<Self, FrameRoleInitializationError> {
+        let allocator = super::boot_map::initialize_frame_allocator(&map, reservations)
+            .map_err(FrameRoleInitializationError::BootMap)?;
+        claim_manager(&FRAME_ROLE_MANAGER_CLAIMED)?;
+        Self::new(allocator).map_err(FrameRoleInitializationError::Role)
+    }
+
+    pub(crate) fn allocate(&mut self, page_count: u64) -> Result<AllocationGrant, FrameRoleError> {
+        let (slot, generation) = self.next_slot()?;
+        let identity = self.identity(slot, generation)?;
+        let range = self.allocator.allocate_run(page_count)?;
+        self.roles[slot] = RoleSlot {
+            generation,
+            record: Some(RoleRecord {
+                range,
+                role: FrameRole::AllocatedUninitialized,
+            }),
+        };
+        Ok(AllocationGrant { identity, range })
+    }
+
+    /// Attests that architecture-owned access initialized every byte in the
+    /// allocation to zero.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have exclusively zeroed the complete physical run and
+    /// completed any cache maintenance required before returning the grant.
+    #[allow(
+        unsafe_code,
+        reason = "physical zeroing is an architecture access fact represented by a typed state transition"
+    )]
+    pub(crate) unsafe fn assume_zeroed(
+        &mut self,
+        grant: AllocationGrant,
+    ) -> Result<ZeroedGrant, GrantTransitionError<AllocationGrant>> {
+        if let Err(error) = self.transition(
+            grant.identity,
+            grant.range,
+            FrameRole::AllocatedUninitialized,
+            FrameRole::Zeroed,
+        ) {
+            return Err(GrantTransitionError::new(error, grant));
+        }
+        Ok(ZeroedGrant {
+            identity: grant.identity,
+            range: grant.range,
+        })
+    }
+
+    pub(crate) fn assign_object_backing(
+        &mut self,
+        grant: ZeroedGrant,
+    ) -> Result<ObjectBackingGrant, GrantTransitionError<ZeroedGrant>> {
+        let kind = ObjectBackingKind::AllocatorOwned;
+        if let Err(error) = self.transition(
+            grant.identity,
+            grant.range,
+            FrameRole::Zeroed,
+            FrameRole::ObjectBacking(kind),
+        ) {
+            return Err(GrantTransitionError::new(error, grant));
+        }
+        Ok(ObjectBackingGrant {
+            identity: BackingIdentity(grant.identity),
+            range: grant.range,
+            kind,
+        })
+    }
+
+    pub(crate) fn create_table_owner(&mut self) -> Result<TableOwnerKey, FrameRoleError> {
+        let raw = self.next_table_owner;
+        self.next_table_owner = raw
+            .checked_add(1)
+            .filter(|next| *next != 0)
+            .ok_or(FrameRoleError::InvalidTableOwner)?;
+        Ok(TableOwnerKey {
+            domain: self.domain,
+            raw,
+        })
+    }
+
+    pub(crate) fn prepare_table(
+        &mut self,
+        grant: ZeroedGrant,
+        owner: TableOwnerKey,
+        level: TableLevel,
+    ) -> Result<TableCandidateGrant, GrantTransitionError<ZeroedGrant>> {
+        if let Err(error) = self.validate_owner(owner) {
+            return Err(GrantTransitionError::new(error, grant));
+        }
+        if grant.range.page_count() != 1 {
+            return Err(GrantTransitionError::new(FrameRoleError::WrongRole, grant));
+        }
+        if let Err(error) = self.transition(
+            grant.identity,
+            grant.range,
+            FrameRole::Zeroed,
+            FrameRole::TableCandidate { owner, level },
+        ) {
+            return Err(GrantTransitionError::new(error, grant));
+        }
+        Ok(TableCandidateGrant {
+            identity: grant.identity,
+            range: grant.range,
+            owner,
+            level,
+        })
+    }
+
+    pub(crate) fn commit_table(
+        &mut self,
+        grant: TableCandidateGrant,
+        parent: Option<TableIdentity>,
+    ) -> Result<TableIdentity, GrantTransitionError<TableCandidateGrant>> {
+        if let Err(error) = self.validate_owner(grant.owner) {
+            return Err(GrantTransitionError::new(error, grant));
+        }
+        if grant.level == TableLevel::Pml4
+            && self
+                .roles
+                .iter()
+                .filter_map(|slot| slot.record)
+                .any(|record| {
+                    matches!(
+                        record.role,
+                        FrameRole::PageTable {
+                            owner,
+                            level: TableLevel::Pml4,
+                            parent: None,
+                        } if owner == grant.owner
+                    )
+                })
+        {
+            return Err(GrantTransitionError::new(
+                FrameRoleError::DuplicateTableRoot,
+                grant,
+            ));
+        }
+        let parent_role = match (grant.level, parent) {
+            (TableLevel::Pml4, None) => None,
+            (TableLevel::Pml4, Some(_)) | (_, None) => {
+                return Err(GrantTransitionError::new(
+                    FrameRoleError::InvalidTableParent,
+                    grant,
+                ));
+            }
+            (level, Some(parent)) => {
+                let record = match self.record(parent.role) {
+                    Ok(record) => record,
+                    Err(_) => {
+                        return Err(GrantTransitionError::new(
+                            FrameRoleError::InvalidTableParent,
+                            grant,
+                        ));
+                    }
+                };
+                let FrameRole::PageTable {
+                    owner,
+                    level: parent_level,
+                    parent: _,
+                } = record.role
+                else {
+                    return Err(GrantTransitionError::new(
+                        FrameRoleError::InvalidTableParent,
+                        grant,
+                    ));
+                };
+                if record.range.start != parent.physical_start
+                    || record.range.page_count() != 1
+                    || owner != parent.owner
+                    || parent_level != parent.level
+                    || parent.owner != grant.owner
+                    || parent.level.child() != Some(level)
+                {
+                    return Err(GrantTransitionError::new(
+                        FrameRoleError::InvalidTableParent,
+                        grant,
+                    ));
+                }
+                Some(parent.role)
+            }
+        };
+        if let Err(error) = self.transition(
+            grant.identity,
+            grant.range,
+            FrameRole::TableCandidate {
+                owner: grant.owner,
+                level: grant.level,
+            },
+            FrameRole::PageTable {
+                owner: grant.owner,
+                level: grant.level,
+                parent: parent_role,
+            },
+        ) {
+            return Err(GrantTransitionError::new(error, grant));
+        }
+        Ok(TableIdentity {
+            role: grant.identity,
+            owner: grant.owner,
+            level: grant.level,
+            physical_start: grant.range.start,
+        })
+    }
+
+    /// Imports one transition-table or kernel-image range which has already
+    /// been excluded from the allocator.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have validated the range's boot provenance, role, and
+    /// lifetime against the copied handoff and live architecture state.
+    #[allow(
+        unsafe_code,
+        reason = "external boot provenance cannot be derived from allocator state alone"
+    )]
+    pub(crate) unsafe fn import_external(
+        &mut self,
+        range: PhysicalRange,
+        role: ExternalFrameRole,
+    ) -> Result<FrameRoleIdentity, FrameRoleError> {
+        let pages = self.validate_external_page_range(range)?;
+        let identity = self.insert_role(pages, FrameRole::External(role))?;
+        Ok(identity)
+    }
+
+    /// Imports immutable module pages as typed read-only object backing.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have validated the module reservation, immutable
+    /// lifetime, initialized tail bytes, and exclusion from allocator ranges.
+    #[allow(
+        unsafe_code,
+        reason = "immutable boot-module provenance is established by the boot handoff boundary"
+    )]
+    pub(crate) unsafe fn import_immutable_module(
+        &mut self,
+        range: PhysicalRange,
+        module_index: u32,
+    ) -> Result<ObjectBackingGrant, FrameRoleError> {
+        let pages = self.validate_immutable_module_range(range)?;
+        let identity =
+            self.insert_role(pages, FrameRole::ExternalImmutableModule { module_index })?;
+        Ok(ObjectBackingGrant {
+            identity: BackingIdentity(identity),
+            range: pages,
+            kind: ObjectBackingKind::ImmutableModule { module_index },
+        })
+    }
+
+    pub(crate) fn cancel_allocation(
+        &mut self,
+        grant: AllocationGrant,
+    ) -> Result<(), GrantTransitionError<AllocationGrant>> {
+        if let Err(error) = self.cancel(
+            grant.identity,
+            grant.range,
+            FrameRole::AllocatedUninitialized,
+        ) {
+            return Err(GrantTransitionError::new(error, grant));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cancel_zeroed(
+        &mut self,
+        grant: ZeroedGrant,
+    ) -> Result<(), GrantTransitionError<ZeroedGrant>> {
+        if let Err(error) = self.cancel(grant.identity, grant.range, FrameRole::Zeroed) {
+            return Err(GrantTransitionError::new(error, grant));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cancel_object_backing(
+        &mut self,
+        grant: ObjectBackingGrant,
+    ) -> Result<(), GrantTransitionError<ObjectBackingGrant>> {
+        let result = match grant.kind {
+            ObjectBackingKind::AllocatorOwned => self.cancel(
+                grant.identity.0,
+                grant.range,
+                FrameRole::ObjectBacking(grant.kind),
+            ),
+            ObjectBackingKind::ImmutableModule { .. } => Err(FrameRoleError::WrongRole),
+        };
+        if let Err(error) = result {
+            return Err(GrantTransitionError::new(error, grant));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cancel_table_candidate(
+        &mut self,
+        grant: TableCandidateGrant,
+    ) -> Result<(), GrantTransitionError<TableCandidateGrant>> {
+        if let Err(error) = self.cancel(
+            grant.identity,
+            grant.range,
+            FrameRole::TableCandidate {
+                owner: grant.owner,
+                level: grant.level,
+            },
+        ) {
+            return Err(GrantTransitionError::new(error, grant));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_object_backing(
+        &self,
+        backing: BackingIdentity,
+        physical_start: u64,
+        byte_len: u64,
+        writable: bool,
+    ) -> Result<(), FrameRoleError> {
+        let range = PageRange::from_page_count(
+            physical_start,
+            byte_len
+                .checked_div(BASE_PAGE_SIZE)
+                .filter(|_| byte_len.is_multiple_of(BASE_PAGE_SIZE))
+                .ok_or(FrameRoleError::WrongRole)?,
+            self.allocator.physical_limit(),
+        )?;
+        let record = self.record(backing.0)?;
+        if !record.range.contains(range) {
+            return Err(FrameRoleError::WrongRole);
+        }
+        match record.role {
+            FrameRole::ObjectBacking(ObjectBackingKind::AllocatorOwned) => Ok(()),
+            FrameRole::ExternalImmutableModule { .. } if writable => {
+                Err(FrameRoleError::ReadOnlyBacking)
+            }
+            FrameRole::ExternalImmutableModule { .. } => Ok(()),
+            _ => Err(FrameRoleError::WrongRole),
+        }
+    }
+
+    pub(crate) fn role(
+        &self,
+        identity: FrameRoleIdentity,
+    ) -> Result<FrameRoleKind, FrameRoleError> {
+        Ok(self.record(identity)?.role.kind())
+    }
+
+    pub(crate) fn available_frames(&self) -> u64 {
+        self.allocator.available_frames()
+    }
+
+    pub(crate) fn check_invariants(&self) -> Result<(), FrameRoleError> {
+        let mut dynamic_pages = 0_u64;
+        for (left_index, left) in self.roles.iter().enumerate() {
+            let Some(left) = left.record else {
+                continue;
+            };
+            for right in self.roles[left_index + 1..]
+                .iter()
+                .filter_map(|slot| slot.record)
+            {
+                if left.range.overlaps(right.range) {
+                    return Err(FrameRoleError::InvariantViolation);
+                }
+            }
+            if left.role.is_dynamic() {
+                if !self.allocator.contains_initial(left.range)
+                    || self.allocator.overlaps_free(left.range)
+                {
+                    return Err(FrameRoleError::InvariantViolation);
+                }
+                dynamic_pages = dynamic_pages
+                    .checked_add(left.range.page_count())
+                    .ok_or(FrameRoleError::InvariantViolation)?;
+            } else if self.allocator.overlaps_initial(left.range) {
+                return Err(FrameRoleError::InvariantViolation);
+            }
+        }
+        if self.allocator.available_frames().checked_add(dynamic_pages)
+            != Some(self.allocator.initial_frames())
+        {
+            return Err(FrameRoleError::InvariantViolation);
+        }
+        Ok(())
+    }
+
+    fn transition(
+        &mut self,
+        identity: FrameRoleIdentity,
+        range: PageRange,
+        expected: FrameRole,
+        replacement: FrameRole,
+    ) -> Result<(), FrameRoleError> {
+        let slot = self.slot(identity)?;
+        let record = self.roles[slot]
+            .record
+            .ok_or(FrameRoleError::InvalidGrant)?;
+        if record.range != range || record.role != expected {
+            return Err(FrameRoleError::WrongRole);
+        }
+        self.roles[slot].record = Some(RoleRecord {
+            range,
+            role: replacement,
+        });
+        Ok(())
+    }
+
+    fn cancel(
+        &mut self,
+        identity: FrameRoleIdentity,
+        range: PageRange,
+        expected: FrameRole,
+    ) -> Result<(), FrameRoleError> {
+        let slot = self.slot(identity)?;
+        let record = self.roles[slot]
+            .record
+            .ok_or(FrameRoleError::InvalidGrant)?;
+        if record.range != range || record.role != expected || !record.role.is_dynamic() {
+            return Err(FrameRoleError::WrongRole);
+        }
+        self.allocator.free_run(range)?;
+        self.roles[slot].record = None;
+        Ok(())
+    }
+
+    fn validate_external_page_range(
+        &self,
+        range: PhysicalRange,
+    ) -> Result<PageRange, FrameRoleError> {
+        if !range.physical_start().is_multiple_of(BASE_PAGE_SIZE)
+            || !range.byte_len().is_multiple_of(BASE_PAGE_SIZE)
+        {
+            return Err(FrameRoleError::Physical(
+                PhysicalMemoryError::InvalidPageRange,
+            ));
+        }
+        let pages = PageRange::from_page_count(
+            range.physical_start(),
+            range.byte_len() / BASE_PAGE_SIZE,
+            self.allocator.physical_limit(),
+        )?;
+        self.validate_external_pages(pages)
+    }
+
+    fn validate_immutable_module_range(
+        &self,
+        range: PhysicalRange,
+    ) -> Result<PageRange, FrameRoleError> {
+        if !range.physical_start().is_multiple_of(BASE_PAGE_SIZE) {
+            return Err(FrameRoleError::Physical(
+                PhysicalMemoryError::InvalidPageRange,
+            ));
+        }
+        let pages = PageRange::cover(range, self.allocator.physical_limit())?;
+        self.validate_external_pages(pages)
+    }
+
+    fn validate_external_pages(&self, pages: PageRange) -> Result<PageRange, FrameRoleError> {
+        if self.allocator.overlaps_initial(pages) {
+            return Err(FrameRoleError::ExternalAllocatorOverlap);
+        }
+        if self
+            .roles
+            .iter()
+            .filter_map(|slot| slot.record)
+            .any(|record| record.range.overlaps(pages))
+        {
+            return Err(FrameRoleError::Overlap);
+        }
+        Ok(pages)
+    }
+
+    fn insert_role(
+        &mut self,
+        range: PageRange,
+        role: FrameRole,
+    ) -> Result<FrameRoleIdentity, FrameRoleError> {
+        if self
+            .roles
+            .iter()
+            .filter_map(|slot| slot.record)
+            .any(|record| record.range.overlaps(range))
+        {
+            return Err(FrameRoleError::Overlap);
+        }
+        let (slot, generation) = self.next_slot()?;
+        let identity = self.identity(slot, generation)?;
+        self.roles[slot] = RoleSlot {
+            generation,
+            record: Some(RoleRecord { range, role }),
+        };
+        Ok(identity)
+    }
+
+    fn next_slot(&self) -> Result<(usize, u32), FrameRoleError> {
+        let slot = self
+            .roles
+            .iter()
+            .position(|slot| slot.record.is_none())
+            .ok_or(FrameRoleError::Capacity)?;
+        let generation = self.roles[slot]
+            .generation
+            .checked_add(1)
+            .filter(|next| *next != 0)
+            .ok_or(FrameRoleError::GenerationExhausted)?;
+        Ok((slot, generation))
+    }
+
+    fn identity(&self, slot: usize, generation: u32) -> Result<FrameRoleIdentity, FrameRoleError> {
+        let slot = u32::try_from(slot)
+            .ok()
+            .and_then(|slot| slot.checked_add(1))
+            .ok_or(FrameRoleError::Capacity)?;
+        Ok(FrameRoleIdentity {
+            domain: self.domain,
+            raw: (u64::from(generation) << 32) | u64::from(slot),
+        })
+    }
+
+    fn slot(&self, identity: FrameRoleIdentity) -> Result<usize, FrameRoleError> {
+        if identity.domain != self.domain {
+            return Err(FrameRoleError::ForeignManager);
+        }
+        let generation = (identity.raw >> 32) as u32;
+        let slot = usize::try_from(
+            (identity.raw as u32)
+                .checked_sub(1)
+                .ok_or(FrameRoleError::InvalidGrant)?,
+        )
+        .map_err(|_| FrameRoleError::InvalidGrant)?;
+        let entry = self.roles.get(slot).ok_or(FrameRoleError::InvalidGrant)?;
+        if generation == 0 || entry.generation != generation || entry.record.is_none() {
+            return Err(FrameRoleError::InvalidGrant);
+        }
+        Ok(slot)
+    }
+
+    fn record(&self, identity: FrameRoleIdentity) -> Result<RoleRecord, FrameRoleError> {
+        let slot = self.slot(identity)?;
+        self.roles[slot].record.ok_or(FrameRoleError::InvalidGrant)
+    }
+
+    fn validate_owner(&self, owner: TableOwnerKey) -> Result<(), FrameRoleError> {
+        if owner.domain != self.domain || owner.raw == 0 || owner.raw >= self.next_table_owner {
+            return Err(FrameRoleError::InvalidTableOwner);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    unsafe_code,
+    reason = "the synthetic model helper attests zeroing without dereferencing physical memory"
+)]
+pub(crate) fn synthetic_allocator_backing(
+    physical_start: u64,
+    page_count: u64,
+) -> ObjectBackingGrant {
+    use super::physical::PhysicalAddressLimit;
+
+    let limit = PhysicalAddressLimit::new(1_u64 << 40).expect("test physical limit is valid");
+    let candidate = PageRange::from_page_count(physical_start, page_count, limit)
+        .expect("test backing range is valid");
+    let allocator = PhysicalFrameAllocator::<1>::from_candidates(&[candidate], limit, [])
+        .expect("test allocator initializes");
+    let mut roles =
+        FrameRoleManager::<1, 1>::new(allocator).expect("test role manager initializes");
+    let allocation = roles.allocate(page_count).expect("test backing allocates");
+    // SAFETY: host model tests never dereference synthetic physical memory;
+    // the helper exists only to exercise typed ownership consumption.
+    let zeroed = unsafe { roles.assume_zeroed(allocation) }.expect("test backing is zeroed");
+    roles
+        .assign_object_backing(zeroed)
+        .expect("test object backing role commits")
+}
+
+#[cfg(test)]
+#[allow(
+    unsafe_code,
+    reason = "the synthetic model helper supplies immutable boot provenance without physical access"
+)]
+pub(crate) fn synthetic_immutable_module_backing(
+    physical_start: u64,
+    page_count: u64,
+    module_index: u32,
+) -> ObjectBackingGrant {
+    use super::physical::PhysicalAddressLimit;
+
+    let limit = PhysicalAddressLimit::new(1_u64 << 40).expect("test physical limit is valid");
+    let candidate = PageRange::from_page_count(BASE_PAGE_SIZE, 1, limit)
+        .expect("test allocator range is valid");
+    let allocator = PhysicalFrameAllocator::<1>::from_candidates(&[candidate], limit, [])
+        .expect("test allocator initializes");
+    let mut roles =
+        FrameRoleManager::<1, 1>::new(allocator).expect("test role manager initializes");
+    let byte_len = page_count
+        .checked_mul(BASE_PAGE_SIZE)
+        .expect("test module length is valid");
+    let range = PhysicalRange::new(physical_start, byte_len).expect("test module range is valid");
+    // SAFETY: this is a metadata-only host model with disjoint synthetic
+    // immutable-module provenance.
+    unsafe { roles.import_immutable_module(range, module_index) }
+        .expect("test immutable module role commits")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::physical::PhysicalAddressLimit;
+    use super::*;
+
+    type TestManager = FrameRoleManager<2, 16>;
+
+    fn manager(physical_start: u64, page_count: u64) -> TestManager {
+        let limit = PhysicalAddressLimit::new(1_u64 << 40).unwrap();
+        let candidate = PageRange::from_page_count(physical_start, page_count, limit).unwrap();
+        let allocator = PhysicalFrameAllocator::from_candidates(&[candidate], limit, []).unwrap();
+        FrameRoleManager::new(allocator).unwrap()
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "the host model never dereferences synthetic physical memory"
+    )]
+    fn allocate_zeroed(roles: &mut TestManager, page_count: u64) -> ZeroedGrant {
+        let allocation = roles.allocate(page_count).unwrap();
+        // SAFETY: the host model never dereferences the synthetic physical run.
+        unsafe { roles.assume_zeroed(allocation) }.unwrap()
+    }
+
+    #[test]
+    fn free_xor_owned_and_stale_generation_are_exact() {
+        let mut roles = manager(BASE_PAGE_SIZE, 8);
+        let initial = roles.available_frames();
+        let allocation = roles.allocate(2).unwrap();
+        let stale = allocation.identity;
+        let stale_range = allocation.range;
+        assert_eq!(roles.available_frames(), initial - 2);
+        assert_eq!(roles.role(stale), Ok(FrameRoleKind::AllocatedUninitialized));
+        assert_eq!(roles.check_invariants(), Ok(()));
+
+        roles.cancel_allocation(allocation).unwrap();
+        assert_eq!(roles.available_frames(), initial);
+        assert_eq!(roles.role(stale), Err(FrameRoleError::InvalidGrant));
+
+        let replacement = roles.allocate(2).unwrap();
+        assert_ne!(replacement.identity, stale);
+        assert_eq!(replacement.range.start, BASE_PAGE_SIZE);
+        let stale_grant = AllocationGrant {
+            identity: stale,
+            range: stale_range,
+        };
+        let error = roles.cancel_allocation(stale_grant).unwrap_err();
+        assert_eq!(error.error(), FrameRoleError::InvalidGrant);
+        assert_eq!(roles.available_frames(), initial - 2);
+        roles.cancel_allocation(replacement).unwrap();
+        assert_eq!(roles.check_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn foreign_manager_rejection_returns_the_live_grant() {
+        let mut owner = manager(BASE_PAGE_SIZE, 2);
+        let mut foreign = manager(BASE_PAGE_SIZE * 8, 2);
+        let allocation = owner.allocate(1).unwrap();
+
+        let error = foreign.cancel_allocation(allocation).unwrap_err();
+        assert_eq!(error.error(), FrameRoleError::ForeignManager);
+        let allocation = error.into_grant();
+        owner.cancel_allocation(allocation).unwrap();
+        assert_eq!(owner.available_frames(), 2);
+        assert_eq!(owner.check_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn singleton_claim_is_one_shot_without_global_test_interference() {
+        let claimed = AtomicBool::new(false);
+        assert_eq!(claim_manager(&claimed), Ok(()));
+        assert_eq!(
+            claim_manager(&claimed),
+            Err(FrameRoleInitializationError::AlreadyInitialized)
+        );
+    }
+
+    #[test]
+    fn table_role_matrix_recovers_candidates_and_never_reclaims_committed_tables() {
+        let mut roles = manager(BASE_PAGE_SIZE, 8);
+        let initial = roles.available_frames();
+        let owner = roles.create_table_owner().unwrap();
+        let other_owner = roles.create_table_owner().unwrap();
+
+        let root = allocate_zeroed(&mut roles, 1);
+        let root = roles.prepare_table(root, owner, TableLevel::Pml4).unwrap();
+        let root_identity = root.identity;
+        let root = roles.commit_table(root, None).unwrap();
+        assert_eq!(
+            roles.role(root_identity),
+            Ok(FrameRoleKind::PageTable {
+                owner,
+                level: TableLevel::Pml4,
+            })
+        );
+
+        let duplicate_root = allocate_zeroed(&mut roles, 1);
+        let duplicate_root = roles
+            .prepare_table(duplicate_root, owner, TableLevel::Pml4)
+            .unwrap();
+        let error = roles.commit_table(duplicate_root, None).unwrap_err();
+        assert_eq!(error.error(), FrameRoleError::DuplicateTableRoot);
+        roles.cancel_table_candidate(error.into_grant()).unwrap();
+
+        let foreign_child = allocate_zeroed(&mut roles, 1);
+        let foreign_child = roles
+            .prepare_table(foreign_child, other_owner, TableLevel::Pdpt)
+            .unwrap();
+        let error = roles.commit_table(foreign_child, Some(root)).unwrap_err();
+        assert_eq!(error.error(), FrameRoleError::InvalidTableParent);
+        roles.cancel_table_candidate(error.into_grant()).unwrap();
+
+        let wrong_level = allocate_zeroed(&mut roles, 1);
+        let wrong_level = roles
+            .prepare_table(wrong_level, owner, TableLevel::Pd)
+            .unwrap();
+        let error = roles.commit_table(wrong_level, Some(root)).unwrap_err();
+        assert_eq!(error.error(), FrameRoleError::InvalidTableParent);
+        roles.cancel_table_candidate(error.into_grant()).unwrap();
+
+        let child = allocate_zeroed(&mut roles, 1);
+        let child = roles.prepare_table(child, owner, TableLevel::Pdpt).unwrap();
+        let child_identity = child.identity;
+        let child = roles.commit_table(child, Some(root)).unwrap();
+        assert_eq!(child.owner(), owner);
+        assert_eq!(child.level(), TableLevel::Pdpt);
+        assert_eq!(
+            roles.role(child_identity),
+            Ok(FrameRoleKind::PageTable {
+                owner,
+                level: TableLevel::Pdpt,
+            })
+        );
+
+        assert_eq!(roles.available_frames(), initial - 2);
+        assert_eq!(roles.check_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn rejected_multi_page_table_transition_returns_zeroed_grant_for_rollback() {
+        let mut roles = manager(BASE_PAGE_SIZE, 4);
+        let initial = roles.available_frames();
+        let owner = roles.create_table_owner().unwrap();
+        let zeroed = allocate_zeroed(&mut roles, 2);
+
+        let error = roles
+            .prepare_table(zeroed, owner, TableLevel::Pml4)
+            .unwrap_err();
+        assert_eq!(error.error(), FrameRoleError::WrongRole);
+        roles.cancel_zeroed(error.into_grant()).unwrap();
+        assert_eq!(roles.available_frames(), initial);
+        assert_eq!(roles.check_invariants(), Ok(()));
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "the test supplies synthetic boot-provenance attestations"
+    )]
+    fn external_roles_are_disjoint_and_immutable_backing_is_read_only() {
+        let mut roles = manager(BASE_PAGE_SIZE, 4);
+        let transition = PhysicalRange::new(0x20_000, BASE_PAGE_SIZE).unwrap();
+        // SAFETY: the synthetic external range is disjoint from the allocator.
+        let transition = unsafe {
+            roles.import_external(
+                transition,
+                ExternalFrameRole::TransitionTable { table_index: 0 },
+            )
+        }
+        .unwrap();
+        assert_eq!(
+            roles.role(transition),
+            Ok(FrameRoleKind::External(
+                ExternalFrameRole::TransitionTable { table_index: 0 }
+            ))
+        );
+
+        let overlapping_external = PhysicalRange::new(0x20_000, BASE_PAGE_SIZE).unwrap();
+        // SAFETY: this deliberately repeats validated synthetic provenance to
+        // prove that the registry still rejects the overlapping role.
+        assert_eq!(
+            unsafe {
+                roles.import_external(
+                    overlapping_external,
+                    ExternalFrameRole::KernelImage {
+                        segment: KernelImageSegment::Text,
+                    },
+                )
+            },
+            Err(FrameRoleError::Overlap)
+        );
+
+        let allocator_overlap = PhysicalRange::new(BASE_PAGE_SIZE, BASE_PAGE_SIZE).unwrap();
+        // SAFETY: the intentionally conflicting input exercises the manager's
+        // independent allocator-exclusion check.
+        assert_eq!(
+            unsafe {
+                roles.import_external(
+                    allocator_overlap,
+                    ExternalFrameRole::KernelImage {
+                        segment: KernelImageSegment::WritableData,
+                    },
+                )
+            },
+            Err(FrameRoleError::ExternalAllocatorOverlap)
+        );
+
+        let unaligned = PhysicalRange::new(0x28_001, BASE_PAGE_SIZE).unwrap();
+        // SAFETY: the deliberately unaligned synthetic input proves that an
+        // external role cannot capture bytes before its stated provenance.
+        assert_eq!(
+            unsafe {
+                roles.import_external(
+                    unaligned,
+                    ExternalFrameRole::KernelImage {
+                        segment: KernelImageSegment::ReadOnlyData,
+                    },
+                )
+            },
+            Err(FrameRoleError::Physical(
+                PhysicalMemoryError::InvalidPageRange
+            ))
+        );
+
+        let unaligned_end = PhysicalRange::new(0x2c_000, BASE_PAGE_SIZE + 1).unwrap();
+        // SAFETY: the deliberately non-page-sized synthetic input proves a
+        // generic external role cannot capture an unattested trailing tail.
+        assert_eq!(
+            unsafe {
+                roles.import_external(
+                    unaligned_end,
+                    ExternalFrameRole::KernelImage {
+                        segment: KernelImageSegment::ReadOnlyData,
+                    },
+                )
+            },
+            Err(FrameRoleError::Physical(
+                PhysicalMemoryError::InvalidPageRange
+            ))
+        );
+
+        let module_range = PhysicalRange::new(0x24_000, BASE_PAGE_SIZE + 1).unwrap();
+        // SAFETY: the synthetic immutable range is page-aligned, initialized,
+        // and disjoint from both the allocator and transition role.
+        let module = unsafe { roles.import_immutable_module(module_range, 7) }.unwrap();
+        assert_eq!(module.byte_len(), BASE_PAGE_SIZE * 2);
+        assert_eq!(
+            roles.validate_object_backing(
+                module.identity(),
+                module.physical_start(),
+                module.byte_len(),
+                false,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            roles.validate_object_backing(
+                module.identity(),
+                module.physical_start(),
+                module.byte_len(),
+                true,
+            ),
+            Err(FrameRoleError::ReadOnlyBacking)
+        );
+        let error = roles.cancel_object_backing(module).unwrap_err();
+        assert_eq!(error.error(), FrameRoleError::WrongRole);
+        assert!(matches!(
+            error.into_grant().kind(),
+            ObjectBackingKind::ImmutableModule { module_index: 7 }
+        ));
+        assert_eq!(roles.check_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn object_backing_identity_cannot_validate_a_table_role() {
+        let mut roles = manager(BASE_PAGE_SIZE, 4);
+        let owner = roles.create_table_owner().unwrap();
+        let table = allocate_zeroed(&mut roles, 1);
+        let table = roles.prepare_table(table, owner, TableLevel::Pml4).unwrap();
+        let table = roles.commit_table(table, None).unwrap();
+        let confused = BackingIdentity(table.role);
+
+        assert_eq!(
+            roles.validate_object_backing(confused, table.physical_start(), BASE_PAGE_SIZE, false,),
+            Err(FrameRoleError::WrongRole)
+        );
+        assert_eq!(roles.check_invariants(), Ok(()));
+    }
+}

@@ -4,7 +4,11 @@
 //! facts. Page-table publication remains an architecture-owned boundary, while
 //! user ranges, exact copies, `MemoryObject`, and `AddressRegion` stay portable.
 
+mod ownership;
 mod vm;
+
+pub(crate) use ownership::frame_roles;
+pub use ownership::{boot_map, physical};
 
 #[allow(
     unused_imports,
@@ -16,7 +20,5 @@ pub(crate) use vm::address_region;
     reason = "the private VM facade precedes its architecture and handle consumers"
 )]
 pub(crate) use vm::object;
-pub mod boot_map;
-pub mod physical;
 pub(crate) mod user_range;
 pub(crate) mod usercopy;

@@ -108,17 +108,17 @@ impl PhysicalAddressLimit {
 
 /// A page-aligned half-open physical range, private to physical-memory code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PageRange {
-    pub(crate) start: u64,
-    pub(crate) end: u64,
+pub(super) struct PageRange {
+    pub(super) start: u64,
+    pub(super) end: u64,
 }
 
 impl PageRange {
-    pub(crate) const fn empty() -> Self {
+    pub(super) const fn empty() -> Self {
         EMPTY_RANGE
     }
 
-    pub(crate) fn from_page_count(
+    pub(super) fn from_page_count(
         physical_start: u64,
         page_count: u64,
         limit: PhysicalAddressLimit,
@@ -142,7 +142,7 @@ impl PageRange {
         Ok(range)
     }
 
-    pub(crate) fn cover(
+    pub(super) fn cover(
         range: PhysicalRange,
         limit: PhysicalAddressLimit,
     ) -> Result<Self, PhysicalMemoryError> {
@@ -167,28 +167,30 @@ impl PageRange {
         Ok(page_range)
     }
 
-    pub(crate) const fn contains(self, other: Self) -> bool {
+    pub(super) const fn contains(self, other: Self) -> bool {
         self.start <= other.start && other.end <= self.end
     }
 
-    pub(crate) const fn overlaps(self, other: Self) -> bool {
+    pub(super) const fn overlaps(self, other: Self) -> bool {
         self.start < other.end && other.start < self.end
     }
 
-    pub(crate) const fn page_count(self) -> u64 {
+    pub(super) const fn page_count(self) -> u64 {
         (self.end - self.start) / BASE_PAGE_SIZE
     }
 }
 
 /// A single allocated base-page frame.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PhysicalFrame {
+pub(super) struct PhysicalFrame {
     physical_start: u64,
 }
 
+#[cfg(test)]
 impl PhysicalFrame {
     /// Physical address of this page-aligned base frame.
-    pub const fn physical_start(self) -> u64 {
+    pub(super) const fn physical_start(self) -> u64 {
         self.physical_start
     }
 }
@@ -208,7 +210,7 @@ pub enum PhysicalMemoryError {
 /// A simple first-fit allocator over sanitized, already-reserved physical
 /// ranges. `RANGE_CAPACITY` is caller-selected so production bootstrap storage
 /// remains fixed while host tests can exercise fragmentation explicitly.
-pub struct PhysicalFrameAllocator<const RANGE_CAPACITY: usize> {
+pub(super) struct PhysicalFrameAllocator<const RANGE_CAPACITY: usize> {
     initial: [PageRange; RANGE_CAPACITY],
     initial_len: usize,
     free: [PageRange; RANGE_CAPACITY],
@@ -219,7 +221,7 @@ pub struct PhysicalFrameAllocator<const RANGE_CAPACITY: usize> {
 impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
     /// Initializes the allocator from candidate ranges after subtracting every
     /// supplied reservation and the mandatory page-zero reservation.
-    pub(crate) fn from_candidates<I>(
+    pub(super) fn from_candidates<I>(
         candidates: &[PageRange],
         limit: PhysicalAddressLimit,
         reservations: I,
@@ -256,25 +258,18 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
     }
 
     /// Allocates the lowest available base frame.
-    pub fn allocate_frame(&mut self) -> Result<PhysicalFrame, PhysicalMemoryError> {
-        if self.free_len == 0 {
-            return Err(PhysicalMemoryError::NoFramesAvailable);
-        }
-        let first = &mut self.free[0];
-        let physical_start = first.start;
-        first.start = first
-            .start
-            .checked_add(BASE_PAGE_SIZE)
-            .ok_or(PhysicalMemoryError::AddressOverflow)?;
-        if first.start == first.end {
-            self.remove_free(0);
-        }
-        Ok(PhysicalFrame { physical_start })
+    #[cfg(test)]
+    pub(super) fn allocate_frame(&mut self) -> Result<PhysicalFrame, PhysicalMemoryError> {
+        let range = self.allocate_run(1)?;
+        Ok(PhysicalFrame {
+            physical_start: range.start,
+        })
     }
 
     /// Returns one frame if, and only if, it was previously allocated from this
     /// allocator. Reserved, foreign, and already-free frames are rejected.
-    pub fn free_frame(&mut self, frame: PhysicalFrame) -> Result<(), PhysicalMemoryError> {
+    #[cfg(test)]
+    pub(super) fn free_frame(&mut self, frame: PhysicalFrame) -> Result<(), PhysicalMemoryError> {
         if !frame.physical_start.is_multiple_of(BASE_PAGE_SIZE)
             || frame.physical_start >= self.limit.exclusive()
         {
@@ -288,6 +283,40 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
             start: frame.physical_start,
             end,
         };
+        self.free_run(range)
+    }
+
+    /// Allocates the lowest available contiguous run with exactly
+    /// `page_count` base pages.
+    pub(super) fn allocate_run(
+        &mut self,
+        page_count: u64,
+    ) -> Result<PageRange, PhysicalMemoryError> {
+        if page_count == 0 {
+            return Err(PhysicalMemoryError::InvalidPageRange);
+        }
+        let byte_len = page_count
+            .checked_mul(BASE_PAGE_SIZE)
+            .ok_or(PhysicalMemoryError::AddressOverflow)?;
+        let index = self.free[..self.free_len]
+            .iter()
+            .position(|range| range.end - range.start >= byte_len)
+            .ok_or(PhysicalMemoryError::NoFramesAvailable)?;
+        let start = self.free[index].start;
+        let end = start
+            .checked_add(byte_len)
+            .ok_or(PhysicalMemoryError::AddressOverflow)?;
+        self.free[index].start = end;
+        if self.free[index].start == self.free[index].end {
+            self.remove_free(index);
+        }
+        Ok(PageRange { start, end })
+    }
+
+    /// Returns one previously allocated contiguous run. Callers above this
+    /// mechanism must prove that no live role still owns the run.
+    pub(super) fn free_run(&mut self, range: PageRange) -> Result<(), PhysicalMemoryError> {
+        self.validate_candidate(range)?;
         if !self.initial[..self.initial_len]
             .iter()
             .any(|initial| initial.contains(range))
@@ -304,10 +333,38 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
     }
 
     /// Number of currently available frames.
-    pub fn available_frames(&self) -> u64 {
+    pub(super) fn available_frames(&self) -> u64 {
         self.free[..self.free_len]
             .iter()
             .fold(0_u64, |total, range| total + range.page_count())
+    }
+
+    pub(super) const fn physical_limit(&self) -> PhysicalAddressLimit {
+        self.limit
+    }
+
+    pub(super) fn initial_frames(&self) -> u64 {
+        self.initial[..self.initial_len]
+            .iter()
+            .fold(0_u64, |total, range| total + range.page_count())
+    }
+
+    pub(super) fn contains_initial(&self, range: PageRange) -> bool {
+        self.initial[..self.initial_len]
+            .iter()
+            .any(|initial| initial.contains(range))
+    }
+
+    pub(super) fn overlaps_initial(&self, range: PageRange) -> bool {
+        self.initial[..self.initial_len]
+            .iter()
+            .any(|initial| initial.overlaps(range))
+    }
+
+    pub(super) fn overlaps_free(&self, range: PageRange) -> bool {
+        self.free[..self.free_len]
+            .iter()
+            .any(|free| free.overlaps(range))
     }
 
     fn subtract(&mut self, reservation: PageRange) -> Result<(), PhysicalMemoryError> {

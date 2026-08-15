@@ -913,10 +913,6 @@ mod tests {
         }
     }
 
-    #[allow(
-        unsafe_code,
-        reason = "tests exercise the allocator-owned backing grant boundary with synthetic frames"
-    )]
     fn object<const OBJECTS: usize, const LEASES: usize>(
         authority: &mut MemoryObjectAuthority<OBJECTS, LEASES>,
         ceiling: Protection,
@@ -924,27 +920,20 @@ mod tests {
         object_at(authority, 0x20_000, ceiling)
     }
 
-    #[allow(
-        unsafe_code,
-        reason = "tests exercise the allocator-owned backing grant boundary with disjoint synthetic frames"
-    )]
     fn object_at<const OBJECTS: usize, const LEASES: usize>(
         authority: &mut MemoryObjectAuthority<OBJECTS, LEASES>,
         physical_start: u64,
         ceiling: Protection,
     ) -> MemoryObjectKey {
-        // SAFETY: synthetic frames are metadata only and have no aliases in this test.
-        unsafe {
-            authority
-                .grant_allocator_backing(
-                    physical_start,
-                    PAGE_SIZE * 8,
-                    PAGE_SIZE * 8,
-                    MemoryObjectKind::PageBacked,
-                    ceiling,
-                )
-                .unwrap()
-        }
+        let backing = crate::memory::frame_roles::synthetic_allocator_backing(physical_start, 8);
+        authority
+            .grant_backing(
+                backing,
+                PAGE_SIZE * 8,
+                MemoryObjectKind::PageBacked,
+                ceiling,
+            )
+            .unwrap()
     }
 
     #[allow(

@@ -1,9 +1,9 @@
 //! Fixed-capacity, authority-owned `MemoryObject` backing and mapping leases.
 //!
 //! This is deliberately below handles and syscalls. The only construction
-//! boundary is an allocator-owned unsafe backing grant; consumers receive
-//! opaque object keys and short-lived mapping leases rather than physical
-//! addresses or independently constructible backing metadata.
+//! boundary consumes a typed frame-role grant; consumers receive opaque object
+//! keys and short-lived mapping leases rather than physical addresses or
+//! independently constructible backing metadata.
 
 #![allow(
     dead_code,
@@ -11,6 +11,7 @@
 )]
 
 use super::address_region::{AddressSpaceKey, RegionKey, mint_authority_domain};
+use crate::memory::frame_roles::{BackingIdentity, ObjectBackingGrant, ObjectBackingKind};
 
 /// The DW0 base page size.
 pub(crate) const PAGE_SIZE: u64 = 4096;
@@ -32,6 +33,23 @@ pub(crate) enum MemoryObjectError {
     UnsupportedProtection,
     ProtectionCeiling,
     WritableExecutableAlias,
+    BackingKind,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct MemoryObjectCreateError {
+    error: MemoryObjectError,
+    backing: ObjectBackingGrant,
+}
+
+impl MemoryObjectCreateError {
+    pub(crate) const fn error(&self) -> MemoryObjectError {
+        self.error
+    }
+
+    pub(crate) fn into_backing(self) -> ObjectBackingGrant {
+        self.backing
+    }
 }
 
 /// A permission set used both as an object-wide protection ceiling and as one
@@ -200,6 +218,7 @@ impl MemoryObjectInfo {
 /// dereferenceable pointer or allocator capability leaves this module.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MemoryObjectRange {
+    backing: BackingIdentity,
     physical_start: u64,
     object_offset: u64,
     byte_len: u64,
@@ -207,6 +226,7 @@ pub(crate) struct MemoryObjectRange {
 
 impl MemoryObjectRange {
     pub(super) const EMPTY: Self = Self {
+        backing: BackingIdentity::EMPTY,
         physical_start: 0,
         object_offset: 0,
         byte_len: 0,
@@ -218,6 +238,10 @@ impl MemoryObjectRange {
     )]
     pub(crate) const fn physical_start(self) -> u64 {
         self.physical_start
+    }
+
+    pub(crate) const fn backing_identity(self) -> BackingIdentity {
+        self.backing
     }
 
     pub(crate) const fn object_offset(self) -> u64 {
@@ -307,6 +331,7 @@ impl LeaseTicket {
 
 #[derive(Clone, Copy)]
 struct ObjectRecord {
+    backing: BackingIdentity,
     physical_start: u64,
     logical_byte_len: u64,
     rounded_byte_len: u64,
@@ -369,6 +394,7 @@ const EMPTY_PENDING: PendingLease = PendingLease {
         region: RegionKey::EMPTY,
         object_slot: 0,
         range: MemoryObjectRange {
+            backing: BackingIdentity::EMPTY,
             physical_start: 0,
             object_offset: 0,
             byte_len: 0,
@@ -398,30 +424,47 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         }
     }
 
-    /// Grants allocator-owned backing to this authority.
-    ///
-    /// # Safety
-    ///
-    /// The caller must prove the allocator exclusively owns the aligned,
-    /// nonempty page covering `[physical_start, physical_start + backing_len)`;
-    /// it must not be a page table, loader-temporary range, or a frame already
-    /// granted to another object. Every byte that a rounded mapping can expose,
-    /// including tail bytes beyond `logical_byte_len`, must already be
-    /// initialized; anonymous backing and immutable-module tail padding must be
-    /// zeroed. The allocator must retain that ownership until this authority's
-    /// object lifecycle says it may reclaim the frames.
-    #[allow(
-        unsafe_code,
-        reason = "this explicit boundary records allocator ownership transfer without dereferencing the backing"
-    )]
-    pub(crate) unsafe fn grant_allocator_backing(
+    /// Consumes a frame-role grant, binding its exclusive backing identity to
+    /// one object. A failed creation returns the grant for caller rollback.
+    pub(crate) fn grant_backing(
         &mut self,
-        physical_start: u64,
-        backing_len: u64,
+        backing: ObjectBackingGrant,
         logical_byte_len: u64,
         kind: MemoryObjectKind,
         protection_ceiling: MemoryProtection,
-    ) -> Result<MemoryObjectKey, MemoryObjectError> {
+    ) -> Result<MemoryObjectKey, MemoryObjectCreateError> {
+        let validated = self.validate_backing(&backing, logical_byte_len, kind, protection_ceiling);
+        let (slot, generation, rounded_byte_len) = match validated {
+            Ok(validated) => validated,
+            Err(error) => return Err(MemoryObjectCreateError { error, backing }),
+        };
+        let physical_start = backing.physical_start();
+        self.objects[slot] = ObjectSlot {
+            generation,
+            record: Some(ObjectRecord {
+                backing: backing.identity(),
+                physical_start,
+                logical_byte_len,
+                rounded_byte_len,
+                kind,
+                protection_ceiling,
+            }),
+        };
+        Ok(MemoryObjectKey {
+            domain: self.domain,
+            raw: encode_raw_key(slot, generation),
+        })
+    }
+
+    fn validate_backing(
+        &self,
+        backing: &ObjectBackingGrant,
+        logical_byte_len: u64,
+        kind: MemoryObjectKind,
+        protection_ceiling: MemoryProtection,
+    ) -> Result<(usize, u32, u64), MemoryObjectError> {
+        let physical_start = backing.physical_start();
+        let backing_len = backing.byte_len();
         if backing_len == 0 || logical_byte_len == 0 {
             return Err(MemoryObjectError::Empty);
         }
@@ -436,6 +479,18 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         if rounded_byte_len > backing_len {
             return Err(MemoryObjectError::BackingTooSmall);
         }
+        if !matches!(
+            (kind, backing.kind()),
+            (
+                MemoryObjectKind::PageBacked,
+                ObjectBackingKind::AllocatorOwned
+            ) | (
+                MemoryObjectKind::ImmutableBootModule,
+                ObjectBackingKind::ImmutableModule { .. }
+            )
+        ) {
+            return Err(MemoryObjectError::BackingKind);
+        }
         if matches!(kind, MemoryObjectKind::ImmutableBootModule) && protection_ceiling.writable() {
             return Err(MemoryObjectError::ProtectionCeiling);
         }
@@ -445,20 +500,7 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             .position(|slot| slot.record.is_none())
             .ok_or(MemoryObjectError::Capacity)?;
         let generation = next_generation(self.objects[slot].generation)?;
-        self.objects[slot] = ObjectSlot {
-            generation,
-            record: Some(ObjectRecord {
-                physical_start,
-                logical_byte_len,
-                rounded_byte_len,
-                kind,
-                protection_ceiling,
-            }),
-        };
-        Ok(MemoryObjectKey {
-            domain: self.domain,
-            raw: encode_raw_key(slot, generation),
-        })
+        Ok((slot, generation, rounded_byte_len))
     }
 
     pub(crate) fn object_info(
@@ -769,6 +811,7 @@ fn object_range(
         .checked_add(object_offset)
         .ok_or(MemoryObjectError::Overflow)?;
     Ok(MemoryObjectRange {
+        backing: object.backing,
         physical_start,
         object_offset,
         byte_len,
@@ -800,27 +843,20 @@ mod tests {
     use super::*;
     use std::boxed::Box;
 
-    #[allow(
-        unsafe_code,
-        reason = "tests exercise the explicit allocator-owned grant boundary with synthetic frames"
-    )]
     fn grant<const OBJECTS: usize, const LEASES: usize>(
         authority: &mut MemoryObjectAuthority<OBJECTS, LEASES>,
         logical_byte_len: u64,
         ceiling: MemoryProtection,
     ) -> MemoryObjectKey {
-        // SAFETY: synthetic test frames are not dereferenced or shared.
-        unsafe {
-            authority
-                .grant_allocator_backing(
-                    0x20_000,
-                    PAGE_SIZE * 4,
-                    logical_byte_len,
-                    MemoryObjectKind::PageBacked,
-                    ceiling,
-                )
-                .unwrap()
-        }
+        let backing = crate::memory::frame_roles::synthetic_allocator_backing(0x20_000, 4);
+        authority
+            .grant_backing(
+                backing,
+                logical_byte_len,
+                MemoryObjectKind::PageBacked,
+                ceiling,
+            )
+            .unwrap()
     }
 
     #[allow(
@@ -863,6 +899,76 @@ mod tests {
         assert_eq!(info.logical_byte_len(), PAGE_SIZE + 1);
         assert_eq!(info.rounded_byte_len(), PAGE_SIZE * 2);
         assert_eq!(info.kind(), MemoryObjectKind::PageBacked);
+    }
+
+    #[test]
+    fn typed_backing_identity_is_retained_and_failed_creation_returns_the_grant() {
+        let mut authority = MemoryObjectAuthority::<2, 2>::new();
+        let backing = crate::memory::frame_roles::synthetic_allocator_backing(0x20_000, 1);
+        let expected_identity = backing.identity();
+        let error = authority
+            .grant_backing(
+                backing,
+                PAGE_SIZE * 2,
+                MemoryObjectKind::PageBacked,
+                MemoryProtection::READ_WRITE,
+            )
+            .unwrap_err();
+        assert_eq!(error.error(), MemoryObjectError::BackingTooSmall);
+
+        let backing = error.into_backing();
+        assert_eq!(backing.identity(), expected_identity);
+        let key = authority
+            .grant_backing(
+                backing,
+                PAGE_SIZE,
+                MemoryObjectKind::PageBacked,
+                MemoryProtection::READ_WRITE,
+            )
+            .unwrap();
+        assert_eq!(
+            authority.object_record(key).unwrap().backing,
+            expected_identity
+        );
+    }
+
+    #[test]
+    fn immutable_module_grant_rejects_role_confusion_and_writable_ceiling() {
+        let mut authority = MemoryObjectAuthority::<2, 2>::new();
+        let backing =
+            crate::memory::frame_roles::synthetic_immutable_module_backing(0x30_000, 1, 9);
+        let error = authority
+            .grant_backing(
+                backing,
+                PAGE_SIZE,
+                MemoryObjectKind::PageBacked,
+                MemoryProtection::READ,
+            )
+            .unwrap_err();
+        assert_eq!(error.error(), MemoryObjectError::BackingKind);
+
+        let error = authority
+            .grant_backing(
+                error.into_backing(),
+                PAGE_SIZE,
+                MemoryObjectKind::ImmutableBootModule,
+                MemoryProtection::READ_WRITE,
+            )
+            .unwrap_err();
+        assert_eq!(error.error(), MemoryObjectError::ProtectionCeiling);
+
+        let key = authority
+            .grant_backing(
+                error.into_backing(),
+                PAGE_SIZE,
+                MemoryObjectKind::ImmutableBootModule,
+                MemoryProtection::READ,
+            )
+            .unwrap();
+        assert_eq!(
+            authority.object_info(key).unwrap().kind(),
+            MemoryObjectKind::ImmutableBootModule
+        );
     }
 
     #[test]

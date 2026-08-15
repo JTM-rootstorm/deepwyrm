@@ -290,7 +290,7 @@ pub(crate) fn collect_bootstrap_reservations(
 
 /// Initializes an allocation-free frame allocator from sanitized candidates
 /// after subtracting every collected reservation.
-pub fn initialize_frame_allocator<const RANGE_CAPACITY: usize>(
+pub(super) fn initialize_frame_allocator<const RANGE_CAPACITY: usize>(
     map: &SanitizedBootMap,
     reservations: &[BootstrapReservation],
 ) -> Result<PhysicalFrameAllocator<RANGE_CAPACITY>, BootMapError> {
