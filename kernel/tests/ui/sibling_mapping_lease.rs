@@ -1,0 +1,12 @@
+#![allow(dead_code)]
+
+#[path = "../../src/memory/vm.rs"]
+mod vm;
+
+mod sibling {
+    use super::vm::object::MappingLease;
+
+    fn retain_mapping_lease(lease: MappingLease) {
+        let _ = lease;
+    }
+}

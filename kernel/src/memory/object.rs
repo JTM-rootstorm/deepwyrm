@@ -10,6 +10,8 @@
     reason = "DW0-C establishes this authority model before the later page-table and syscall integration supplies production callers"
 )]
 
+use super::address_region::{AddressSpaceKey, RegionKey, mint_authority_domain};
+
 /// The DW0 base page size.
 pub(crate) const PAGE_SIZE: u64 = 4096;
 
@@ -22,6 +24,7 @@ pub(crate) enum MemoryObjectError {
     Capacity,
     InvalidObjectKey,
     InvalidLease,
+    ForeignLease,
     DuplicateLease,
     LeaseCapacity,
     GenerationExhausted,
@@ -98,18 +101,69 @@ pub(crate) enum MemoryObjectKind {
 
 /// Opaque authority-issued identity for one page-backed object.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct MemoryObjectKey(u64);
+pub(crate) struct MemoryObjectKey {
+    domain: u64,
+    raw: u64,
+}
 
 impl MemoryObjectKey {
-    pub(crate) const EMPTY: Self = Self(0);
+    pub(super) const EMPTY: Self = Self { domain: 0, raw: 0 };
 }
 
 /// Opaque authority-issued identity for one committed mapping lease.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct MappingLease(u64);
+pub(super) struct MappingLease {
+    domain: u64,
+    raw: u64,
+}
 
 impl MappingLease {
-    pub(crate) const EMPTY: Self = Self(0);
+    pub(super) const EMPTY: Self = Self { domain: 0, raw: 0 };
+}
+
+/// Opaque proof that the future handle-rights seam validated MAP + READ and
+/// any requested WRITE/EXECUTE authority for exactly one MemoryObject.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct MapAuthorization {
+    object: MemoryObjectKey,
+    address_space: AddressSpaceKey,
+    region: RegionKey,
+    ceiling: MemoryProtection,
+}
+
+impl MapAuthorization {
+    pub(super) fn capture(
+        self,
+        address_space: AddressSpaceKey,
+        region: RegionKey,
+    ) -> Result<CapturedMappingAuthority, MemoryObjectError> {
+        if self.address_space != address_space || self.region != region {
+            return Err(MemoryObjectError::ForeignLease);
+        }
+        Ok(CapturedMappingAuthority {
+            object: self.object,
+            ceiling: self.ceiling,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CapturedMappingAuthority {
+    object: MemoryObjectKey,
+    ceiling: MemoryProtection,
+}
+
+impl CapturedMappingAuthority {
+    pub(super) const EMPTY: Self = Self {
+        object: MemoryObjectKey::EMPTY,
+        ceiling: MemoryProtection::READ,
+    };
+    pub(super) const fn object(self) -> MemoryObjectKey {
+        self.object
+    }
+    const fn ceiling(self) -> MemoryProtection {
+        self.ceiling
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,7 +206,7 @@ pub(crate) struct MemoryObjectRange {
 }
 
 impl MemoryObjectRange {
-    pub(crate) const EMPTY: Self = Self {
+    pub(super) const EMPTY: Self = Self {
         physical_start: 0,
         object_offset: 0,
         byte_len: 0,
@@ -181,69 +235,73 @@ impl MemoryObjectRange {
 
 /// A requested lease in a prospective replacement batch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct LeaseRequest {
-    object: MemoryObjectKey,
+pub(super) struct LeaseRequest {
+    address_space: AddressSpaceKey,
+    region: RegionKey,
+    mapping_authority: CapturedMappingAuthority,
     object_offset: u64,
     byte_len: u64,
     protection: MemoryProtection,
-    captured_ceiling: MemoryProtection,
 }
 
 impl LeaseRequest {
-    pub(crate) const EMPTY: Self = Self {
-        object: MemoryObjectKey(0),
+    pub(super) const EMPTY: Self = Self {
+        address_space: AddressSpaceKey::EMPTY,
+        region: RegionKey::EMPTY,
+        mapping_authority: CapturedMappingAuthority::EMPTY,
         object_offset: 0,
         byte_len: 0,
         protection: MemoryProtection::READ,
-        captured_ceiling: MemoryProtection::READ,
     };
 
-    pub(crate) const fn new(
-        object: MemoryObjectKey,
+    pub(super) const fn new(
+        address_space: AddressSpaceKey,
+        region: RegionKey,
+        mapping_authority: CapturedMappingAuthority,
         object_offset: u64,
         byte_len: u64,
         protection: MemoryProtection,
-        captured_ceiling: MemoryProtection,
     ) -> Self {
         Self {
-            object,
+            address_space,
+            region,
+            mapping_authority,
             object_offset,
             byte_len,
             protection,
-            captured_ceiling,
         }
     }
 }
 
 /// A newly allocated lease paired with the exact validated backing range.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct LeaseTicket {
+pub(super) struct LeaseTicket {
     lease: MappingLease,
     object: MemoryObjectKey,
     range: MemoryObjectRange,
     protection: MemoryProtection,
-    captured_ceiling: MemoryProtection,
+    mapping_authority: CapturedMappingAuthority,
 }
 
 impl LeaseTicket {
-    pub(crate) const fn lease(self) -> MappingLease {
+    pub(super) const fn lease(self) -> MappingLease {
         self.lease
     }
 
-    pub(crate) const fn object(self) -> MemoryObjectKey {
+    pub(super) const fn object(self) -> MemoryObjectKey {
         self.object
     }
 
-    pub(crate) const fn range(self) -> MemoryObjectRange {
+    pub(super) const fn range(self) -> MemoryObjectRange {
         self.range
     }
 
-    pub(crate) const fn protection(self) -> MemoryProtection {
+    pub(super) const fn protection(self) -> MemoryProtection {
         self.protection
     }
 
-    pub(crate) const fn captured_ceiling(self) -> MemoryProtection {
-        self.captured_ceiling
+    pub(super) const fn mapping_authority(self) -> CapturedMappingAuthority {
+        self.mapping_authority
     }
 }
 
@@ -269,6 +327,8 @@ const EMPTY_OBJECT_SLOT: ObjectSlot = ObjectSlot {
 
 #[derive(Clone, Copy)]
 struct LeaseRecord {
+    address_space: AddressSpaceKey,
+    region: RegionKey,
     object_slot: usize,
     #[allow(
         dead_code,
@@ -280,7 +340,7 @@ struct LeaseRecord {
         dead_code,
         reason = "retained source authority prevents future replacement paths from widening a lease"
     )]
-    captured_ceiling: MemoryProtection,
+    mapping_authority: CapturedMappingAuthority,
 }
 
 #[derive(Clone, Copy)]
@@ -305,6 +365,8 @@ const EMPTY_PENDING: PendingLease = PendingLease {
     slot: 0,
     generation: 0,
     record: LeaseRecord {
+        address_space: AddressSpaceKey::EMPTY,
+        region: RegionKey::EMPTY,
         object_slot: 0,
         range: MemoryObjectRange {
             physical_start: 0,
@@ -312,7 +374,7 @@ const EMPTY_PENDING: PendingLease = PendingLease {
             byte_len: 0,
         },
         protection: MemoryProtection::READ,
-        captured_ceiling: MemoryProtection::READ,
+        mapping_authority: CapturedMappingAuthority::EMPTY,
     },
 };
 
@@ -322,13 +384,15 @@ const EMPTY_PENDING: PendingLease = PendingLease {
 /// mutably borrowed. The prepared batch exposes only tickets and can commit
 /// only after its address-space publisher reports an atomic PTE replacement.
 pub(crate) struct MemoryObjectAuthority<const OBJECTS: usize, const LEASES: usize> {
+    domain: u64,
     objects: [ObjectSlot; OBJECTS],
     leases: [LeaseSlot; LEASES],
 }
 
 impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, LEASES> {
-    pub(crate) const fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
+            domain: mint_authority_domain(),
             objects: [EMPTY_OBJECT_SLOT; OBJECTS],
             leases: [EMPTY_LEASE_SLOT; LEASES],
         }
@@ -391,7 +455,10 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
                 protection_ceiling,
             }),
         };
-        Ok(MemoryObjectKey(encode_raw_key(slot, generation)))
+        Ok(MemoryObjectKey {
+            domain: self.domain,
+            raw: encode_raw_key(slot, generation),
+        })
     }
 
     pub(crate) fn object_info(
@@ -404,6 +471,42 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             rounded_byte_len: record.rounded_byte_len,
             kind: record.kind,
             protection_ceiling: record.protection_ceiling,
+        })
+    }
+
+    /// Issues an opaque mapping authority after the future handle layer has
+    /// validated the exact native rights for `object`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have validated MAP + READ for `object`, plus WRITE
+    /// and/or EXECUTE exactly when present in `ceiling`, from a live
+    /// rights-bearing handle. DW0-C has no handle table yet, so this narrow
+    /// seam is the only construction path and deliberately remains unsafe.
+    #[allow(
+        unsafe_code,
+        reason = "the future rights-validation seam is the sole authority source until DW0-D handles exist"
+    )]
+    pub(super) unsafe fn issue_map_authorization(
+        &self,
+        object: MemoryObjectKey,
+        address_space: AddressSpaceKey,
+        region: RegionKey,
+        ceiling: MemoryProtection,
+    ) -> Result<MapAuthorization, MemoryObjectError> {
+        let record = self.object_record(object)?;
+        MemoryProtection::ceiling(ceiling.bits())?;
+        if !record.protection_ceiling.contains(ceiling) {
+            return Err(MemoryObjectError::ProtectionCeiling);
+        }
+        if !address_space.same_domain(region) {
+            return Err(MemoryObjectError::ForeignLease);
+        }
+        Ok(MapAuthorization {
+            object,
+            address_space,
+            region,
+            ceiling,
         })
     }
 
@@ -422,17 +525,31 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
     /// Validates a complete replacement while retaining mutable authority.
     /// Dropping the returned batch releases no resource; `commit` is the only
     /// mutation point and is intentionally infallible after publication.
-    pub(crate) fn prepare_replace<const BATCH: usize>(
+    pub(super) fn prepare_replace<const BATCH: usize>(
         &mut self,
+        address_space: AddressSpaceKey,
+        region: RegionKey,
         released: &[MappingLease],
         requested: &[LeaseRequest],
     ) -> Result<PreparedReplace<'_, OBJECTS, LEASES, BATCH>, MemoryObjectError> {
+        if !address_space.same_domain(region) {
+            return Err(MemoryObjectError::ForeignLease);
+        }
+        if released.is_empty() && requested.is_empty() {
+            return Err(MemoryObjectError::Empty);
+        }
         if released.len() > BATCH || requested.len() > BATCH {
             return Err(MemoryObjectError::LeaseCapacity);
         }
         let mut release_slots = [usize::MAX; BATCH];
         for (position, lease) in released.iter().copied().enumerate() {
             let slot = self.lease_slot(lease)?;
+            let record = self.leases[slot]
+                .record
+                .expect("validated lease slot has a record");
+            if record.address_space != address_space || record.region != region {
+                return Err(MemoryObjectError::ForeignLease);
+            }
             if release_slots[..position].contains(&slot) {
                 return Err(MemoryObjectError::DuplicateLease);
             }
@@ -468,14 +585,23 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         let mut tickets = [None; BATCH];
         let mut candidate_cursor = 0;
         for (position, request) in requested.iter().copied().enumerate() {
-            let object_slot = self.object_slot(request.object)?;
+            if request.address_space != address_space || request.region != region {
+                return Err(MemoryObjectError::ForeignLease);
+            }
+            let object_key = request.mapping_authority.object();
+            let object_slot = self.object_slot(object_key)?;
             let object = self.objects[object_slot]
                 .record
                 .expect("validated object slot has a record");
             MemoryProtection::mapping(request.protection.0)?;
-            MemoryProtection::ceiling(request.captured_ceiling.0)?;
-            if !object.protection_ceiling.contains(request.captured_ceiling)
-                || !request.captured_ceiling.contains(request.protection)
+            MemoryProtection::ceiling(request.mapping_authority.ceiling().0)?;
+            if !object
+                .protection_ceiling
+                .contains(request.mapping_authority.ceiling())
+                || !request
+                    .mapping_authority
+                    .ceiling()
+                    .contains(request.protection)
             {
                 return Err(MemoryObjectError::ProtectionCeiling);
             }
@@ -503,12 +629,17 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
                 }
             };
             let generation = next_generation(self.leases[slot].generation)?;
-            let lease = MappingLease(encode_raw_key(slot, generation));
+            let lease = MappingLease {
+                domain: self.domain,
+                raw: encode_raw_key(slot, generation),
+            };
             let record = LeaseRecord {
+                address_space,
+                region,
                 object_slot,
                 range,
                 protection: request.protection,
-                captured_ceiling: request.captured_ceiling,
+                mapping_authority: request.mapping_authority,
             };
             pending[position] = PendingLease {
                 slot,
@@ -517,10 +648,10 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             };
             tickets[position] = Some(LeaseTicket {
                 lease,
-                object: request.object,
+                object: object_key,
                 range,
                 protection: request.protection,
-                captured_ceiling: request.captured_ceiling,
+                mapping_authority: request.mapping_authority,
             });
         }
         Ok(PreparedReplace {
@@ -534,8 +665,11 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
     }
 
     fn object_slot(&self, object: MemoryObjectKey) -> Result<usize, MemoryObjectError> {
+        if object.domain != self.domain {
+            return Err(MemoryObjectError::InvalidObjectKey);
+        }
         let (slot, generation) =
-            decode_raw_key(object.0).ok_or(MemoryObjectError::InvalidObjectKey)?;
+            decode_raw_key(object.raw).ok_or(MemoryObjectError::InvalidObjectKey)?;
         let entry = self
             .objects
             .get(slot)
@@ -554,7 +688,11 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
     }
 
     fn lease_slot(&self, lease: MappingLease) -> Result<usize, MemoryObjectError> {
-        let (slot, generation) = decode_raw_key(lease.0).ok_or(MemoryObjectError::InvalidLease)?;
+        if lease.domain != self.domain {
+            return Err(MemoryObjectError::InvalidLease);
+        }
+        let (slot, generation) =
+            decode_raw_key(lease.raw).ok_or(MemoryObjectError::InvalidLease)?;
         let entry = self
             .leases
             .get(slot)
@@ -567,7 +705,7 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
 }
 
 /// A validated replacement batch held under an exclusive authority borrow.
-pub(crate) struct PreparedReplace<'a, const OBJECTS: usize, const LEASES: usize, const BATCH: usize>
+pub(super) struct PreparedReplace<'a, const OBJECTS: usize, const LEASES: usize, const BATCH: usize>
 {
     authority: &'a mut MemoryObjectAuthority<OBJECTS, LEASES>,
     released: [usize; BATCH],
@@ -580,14 +718,14 @@ pub(crate) struct PreparedReplace<'a, const OBJECTS: usize, const LEASES: usize,
 impl<const OBJECTS: usize, const LEASES: usize, const BATCH: usize>
     PreparedReplace<'_, OBJECTS, LEASES, BATCH>
 {
-    pub(crate) fn tickets(&self) -> &[Option<LeaseTicket>] {
+    pub(super) fn tickets(&self) -> &[Option<LeaseTicket>] {
         &self.tickets[..self.pending_len]
     }
 
     /// Commits only after the caller's address-space publisher has atomically
     /// accepted the corresponding PTE replacement. This has no fallible work:
     /// it clears released leases and installs the already-validated tickets.
-    pub(crate) fn commit(mut self) {
+    pub(super) fn commit(mut self) {
         for slot in self.released[..self.released_len].iter().copied() {
             self.authority.leases[slot].record = None;
         }
@@ -656,7 +794,11 @@ fn decode_raw_key(raw: u64) -> Option<(usize, u32)> {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
+    use super::super::address_region::AddressSpaceAuthority;
     use super::*;
+    use std::boxed::Box;
 
     #[allow(
         unsafe_code,
@@ -681,6 +823,34 @@ mod tests {
         }
     }
 
+    #[allow(
+        unsafe_code,
+        reason = "tests stand in for the future handle-rights validation seam"
+    )]
+    fn mapping<const OBJECTS: usize, const LEASES: usize>(
+        authority: &MemoryObjectAuthority<OBJECTS, LEASES>,
+        object: MemoryObjectKey,
+        ceiling: MemoryProtection,
+    ) -> CapturedMappingAuthority {
+        let _ = authority;
+        CapturedMappingAuthority { object, ceiling }
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "test-local address-space registries satisfy the unique-root authority contract"
+    )]
+    fn ids() -> (AddressSpaceKey, RegionKey) {
+        // SAFETY: this test-local registry uniquely owns its synthetic root.
+        // Leaking it makes the registry outlive every returned identity.
+        let spaces = Box::leak(Box::new(unsafe { AddressSpaceAuthority::<1, 1>::new() }));
+        let space = spaces.create_address_space().unwrap();
+        let region = spaces
+            .create_region::<1>(space, PAGE_SIZE, PAGE_SIZE)
+            .unwrap();
+        (space, region.region_key())
+    }
+
     #[test]
     fn allocator_grant_preserves_exact_and_rounded_lengths() {
         let mut authority = MemoryObjectAuthority::<2, 4>::new();
@@ -696,21 +866,56 @@ mod tests {
     }
 
     #[test]
+    fn final_page_tail_is_mapping_capacity_but_not_logical_object_size() {
+        let (space, region) = ids();
+        let mut authority = MemoryObjectAuthority::<2, 4>::new();
+        let key = grant(&mut authority, PAGE_SIZE + 1, MemoryProtection::READ_WRITE);
+        let info = authority.object_info(key).unwrap();
+        assert_eq!(info.logical_byte_len(), PAGE_SIZE + 1);
+        assert_eq!(info.rounded_byte_len(), PAGE_SIZE * 2);
+        let token = mapping(&authority, key, MemoryProtection::READ_WRITE);
+        authority
+            .prepare_replace::<1>(
+                space,
+                region,
+                &[],
+                &[LeaseRequest::new(
+                    space,
+                    region,
+                    token,
+                    PAGE_SIZE,
+                    PAGE_SIZE,
+                    MemoryProtection::READ,
+                )],
+            )
+            .unwrap()
+            .commit();
+        assert_eq!(authority.active_lease_count(), 1);
+    }
+
+    #[test]
     fn replacement_rejects_bad_ranges_and_wx_aliases_without_commit() {
+        let (space, region) = ids();
         let mut authority = MemoryObjectAuthority::<2, 4>::new();
         let key = grant(
             &mut authority,
             PAGE_SIZE * 2,
             MemoryProtection::READ_WRITE_EXECUTE,
         );
+        let read = mapping(&authority, key, MemoryProtection::READ);
+        let read_write = mapping(&authority, key, MemoryProtection::READ_WRITE);
+        let read_write_execute = mapping(&authority, key, MemoryProtection::READ_WRITE_EXECUTE);
         assert!(matches!(
             authority.prepare_replace::<2>(
+                space,
+                region,
                 &[],
                 &[LeaseRequest::new(
-                    key,
+                    space,
+                    region,
+                    read,
                     1,
                     PAGE_SIZE,
-                    MemoryProtection::READ,
                     MemoryProtection::READ,
                 )],
             ),
@@ -718,12 +923,15 @@ mod tests {
         ));
         let prepared = authority
             .prepare_replace::<2>(
+                space,
+                region,
                 &[],
                 &[LeaseRequest::new(
-                    key,
+                    space,
+                    region,
+                    read_write,
                     0,
                     PAGE_SIZE,
-                    MemoryProtection::READ_WRITE,
                     MemoryProtection::READ_WRITE,
                 )],
             )
@@ -732,13 +940,16 @@ mod tests {
         assert_eq!(authority.active_lease_count(), 1);
         assert!(matches!(
             authority.prepare_replace::<2>(
+                space,
+                region,
                 &[],
                 &[LeaseRequest::new(
-                    key,
+                    space,
+                    region,
+                    read_write_execute,
                     PAGE_SIZE,
                     PAGE_SIZE,
                     MemoryProtection::READ_EXECUTE,
-                    MemoryProtection::READ_WRITE_EXECUTE,
                 )],
             ),
             Err(MemoryObjectError::WritableExecutableAlias)
@@ -748,20 +959,44 @@ mod tests {
 
     #[test]
     fn protection_ceiling_is_captured_per_object() {
+        let (space, region) = ids();
         let mut authority = MemoryObjectAuthority::<2, 2>::new();
         let key = grant(&mut authority, PAGE_SIZE, MemoryProtection::READ_WRITE);
+        let read_write = mapping(&authority, key, MemoryProtection::READ_WRITE);
         assert!(matches!(
             authority.prepare_replace::<1>(
+                space,
+                region,
                 &[],
                 &[LeaseRequest::new(
-                    key,
+                    space,
+                    region,
+                    read_write,
                     0,
                     PAGE_SIZE,
                     MemoryProtection::READ_EXECUTE,
-                    MemoryProtection::READ_WRITE,
                 )],
             ),
             Err(MemoryObjectError::ProtectionCeiling)
         ));
+    }
+
+    #[test]
+    fn empty_replacements_and_sentinels_never_enter_lease_transitions() {
+        let (space, region) = ids();
+        let mut authority = MemoryObjectAuthority::<1, 1>::new();
+        assert!(matches!(
+            authority.prepare_replace::<1>(space, region, &[], &[]),
+            Err(MemoryObjectError::Empty)
+        ));
+        assert!(matches!(
+            authority.prepare_replace::<1>(space, region, &[], &[LeaseRequest::EMPTY]),
+            Err(MemoryObjectError::ForeignLease)
+        ));
+        assert!(matches!(
+            authority.prepare_replace::<1>(AddressSpaceKey::EMPTY, RegionKey::EMPTY, &[], &[],),
+            Err(MemoryObjectError::ForeignLease)
+        ));
+        assert_eq!(authority.active_lease_count(), 0);
     }
 }
