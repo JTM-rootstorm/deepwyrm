@@ -157,7 +157,7 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_HANDLE_INVALID` | `DwHandle` | `0` | The only ABI-visible invalid handle value. |
 | `DW_DEADLINE_NOW` | `DwDeadline` | `0` | Request immediate deadline evaluation. |
 | `DW_DEADLINE_INFINITE` | `DwDeadline` | `18446744073709551615` | No finite monotonic deadline. |
-| `DW_BASE_PAGE_SIZE` | `u32` | `4096` | Canonical ABI-0 page size for MemoryObject lengths, offsets, and userspace mapping ranges; equal to the boot handoff page size. |
+| `DW_BASE_PAGE_SIZE` | `u32` | `4096` | Canonical ABI-0 page size for MemoryObject lengths, offsets, and userspace mapping ranges; equal to the boot handoff page size and used for checked page-rounding of mappable capacity. |
 | `DW_CHANNEL_MAX_PAYLOAD` | `u32` | `65536` | Maximum DW0 channel payload bytes. |
 | `DW_CHANNEL_MAX_HANDLES` | `u32` | `16` | Maximum DW0 channel handles per message. |
 | `DW_WAIT_MANY_MAX_ITEMS` | `u32` | `64` | Maximum handles accepted by one ABI-0 wait_many operation. |
@@ -169,7 +169,7 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_CLOCK_BOOTTIME` | `DwClockId` | `1` | Reserved clock domain for future suspend-aware elapsed time. |
 | `DW_OBJECT_INFO_BASIC_V1` | `u32` | `1` | Typed object_get_info topic for basic type and rights metadata. |
 | `DW_OBJECT_INFO_TASK_STATE_V1` | `u32` | `65537` | Typed object_get_info topic for process or thread termination state. |
-| `DW_OBJECT_INFO_MEMORY_OBJECT_V1` | `u32` | `131073` | Typed object_get_info topic for MemoryObject byte size. |
+| `DW_OBJECT_INFO_MEMORY_OBJECT_V1` | `u32` | `131073` | Typed object_get_info topic for exact logical MemoryObject byte size. |
 | `DW_MEMORY_PROTECTION_READ` | `DwMemoryProtection` | `1` | Permit userspace reads from a mapping. |
 | `DW_MEMORY_PROTECTION_WRITE` | `DwMemoryProtection` | `2` | Permit userspace writes to a mapping. |
 | `DW_MEMORY_PROTECTION_EXECUTE` | `DwMemoryProtection` | `4` | Permit userspace instruction fetches from a mapping. |
@@ -332,13 +332,13 @@ Structured process or thread termination information. Size 64, alignment 8.
 
 ### `DwMemoryObjectInfoV1`
 
-Read-only MemoryObject size information. Size 32, alignment 8.
+Read-only exact logical MemoryObject size information. Size 32, alignment 8.
 
 | Offset | Field | Type | Meaning |
 |---:|---|---|---|
 | 0 | `size` | `u32` | Byte size of this structure. |
 | 4 | `version` | `u32` | Structure version; set to one. |
-| 8 | `byte_size` | `u64` | Exact MemoryObject byte size, fixed for the object lifetime. |
+| 8 | `byte_size` | `u64` | Exact logical content byte size, fixed for the object lifetime; APIs report this value rather than page-rounded mappable capacity. |
 | 16 | `reserved` | `[u64; 2]` | Reserved; all elements must be zero. |
 
 ### `DwAddressRegionMapArgsV1`
@@ -349,8 +349,8 @@ Versioned arguments selecting one page-aligned MemoryObject mapping. Size 72, al
 |---:|---|---|---|
 | 0 | `size` | `u32` | Byte size of this structure; must equal the V1 size in ABI 0. |
 | 4 | `version` | `u32` | Structure version; set to one. |
-| 8 | `memory_object_offset` | `DwOffset` | Page-aligned byte offset into the MemoryObject. |
-| 16 | `byte_len` | `DwSize` | Nonzero page-aligned mapping length. |
+| 8 | `memory_object_offset` | `DwOffset` | Page-aligned byte offset into the MemoryObject's page-rounded mappable capacity. |
+| 16 | `byte_len` | `DwSize` | Nonzero page-aligned mapping length; offset plus length must not exceed page-rounded mappable capacity. |
 | 24 | `requested_address` | `DwUserAddress` | Zero for allocator-chosen placement; exact nonzero page-aligned userspace address with FIXED. |
 | 32 | `protections` | `DwMemoryProtection` | Explicit nonzero protection bits; ABI-0 x86_64 supports READ, READ plus WRITE, or READ plus EXECUTE. |
 | 36 | `flags` | `DwAddressRegionMapFlags` | Zero for allocator-chosen placement or FIXED for exact no-replace placement. |
@@ -469,7 +469,7 @@ Unknown topics return `DW_STATUS_NOT_SUPPORTED`.
 |---|---|---|---|---|
 | `DW_OBJECT_INFO_BASIC_V1` | `ANY` | `DwObjectInfoV1` | `DW_STATUS_WRONG_OBJECT_TYPE` | Available for every live handle carrying INSPECT. |
 | `DW_OBJECT_INFO_TASK_STATE_V1` | `PROCESS,THREAD` | `DwTaskTerminationInfoV1` | `DW_STATUS_WRONG_OBJECT_TYPE` | Reports structured process or thread lifecycle and termination state. |
-| `DW_OBJECT_INFO_MEMORY_OBJECT_V1` | `MEMORY_OBJECT` | `DwMemoryObjectInfoV1` | `DW_STATUS_WRONG_OBJECT_TYPE` | Reports the fixed byte size of a MemoryObject. |
+| `DW_OBJECT_INFO_MEMORY_OBJECT_V1` | `MEMORY_OBJECT` | `DwMemoryObjectInfoV1` | `DW_STATUS_WRONG_OBJECT_TYPE` | Reports exact logical byte_size; mappable capacity is checked align_up(byte_size, DW_BASE_PAGE_SIZE). |
 
 ## Syscalls
 
@@ -613,7 +613,7 @@ Create a zero-filled page-backed MemoryObject with an immutable size. Zero, unal
 
 ### `0x00020010` `address_region_map` (DW0-C)
 
-Transactionally map a page-aligned MemoryObject range using exact-size DwAddressRegionMapArgsV1. Malformed size/version/reserved fields, unknown flags or protections, zero/W+X protections, unaligned or overflowing ranges, and ranges beyond the MemoryObject are INVALID_ARGUMENT. WRITE-only or EXECUTE-only is NOT_SUPPORTED on DW0 x86_64 and READ is never added implicitly. Allocator-chosen placement requires address zero; FIXED requires an exact nonzero page-aligned lower-userspace address, never replaces, and returns ALREADY_EXISTS on overlap. Noncanonical, page-zero, kernel, or outside-region addresses are BAD_ADDRESS. Every mapping requires source MAP+READ; requested WRITE additionally requires source WRITE and requested EXECUTE requires source EXECUTE. Successful mapping captures the source handle's READ/WRITE/EXECUTE authority as the ceiling for later protect operations, including after the source handle closes; violation is ACCESS_DENIED. Failure to find allocator-chosen space returns NO_MEMORY. Every failure leaves mappings and out_address unchanged.
+Transactionally map a page-aligned MemoryObject range using exact-size DwAddressRegionMapArgsV1. Malformed size/version/reserved fields, unknown flags or protections, zero/W+X protections, unaligned or overflowing ranges, and offset plus length beyond the checked align_up(logical byte_size, DW_BASE_PAGE_SIZE) mappable capacity are INVALID_ARGUMENT. WRITE-only or EXECUTE-only is NOT_SUPPORTED on DW0 x86_64 and READ is never added implicitly. DwMemoryObjectInfoV1 and other size APIs report only exact logical byte_size. Any final-page tail between byte_size and mappable capacity is hardware-addressable padding, is zero-initialized before first publication, never contains unrelated data, and may be shared or modified subject to mapping protections. Callers must parse or use object content only through exact logical byte_size; the ABI promises no subpage access enforcement within that tail. Allocator-chosen placement requires address zero; FIXED requires an exact nonzero page-aligned lower-userspace address, never replaces, and returns ALREADY_EXISTS on overlap. Noncanonical, page-zero, kernel, or outside-region addresses are BAD_ADDRESS. Every mapping requires source MAP+READ; requested WRITE additionally requires source WRITE and requested EXECUTE requires source EXECUTE. Successful mapping captures the source handle's READ/WRITE/EXECUTE authority as the ceiling for later protect operations, including after the source handle closes; violation is ACCESS_DENIED. Failure to find allocator-chosen space returns NO_MEMORY. Every failure leaves mappings and out_address unchanged.
 
 | Register | Argument | Type | Direction | Object | Rights |
 |---|---|---|---|---|---|

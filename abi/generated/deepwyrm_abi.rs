@@ -362,7 +362,7 @@ pub const DW_DEADLINE_NOW: DwDeadline = DwDeadline(0);
 /// No finite monotonic deadline.
 pub const DW_DEADLINE_INFINITE: DwDeadline = DwDeadline(18446744073709551615);
 
-/// Canonical ABI-0 page size for MemoryObject lengths, offsets, and userspace mapping ranges; equal to the boot handoff page size.
+/// Canonical ABI-0 page size for MemoryObject lengths, offsets, and userspace mapping ranges; equal to the boot handoff page size and used for checked page-rounding of mappable capacity.
 pub const DW_BASE_PAGE_SIZE: u32 = 4096;
 
 /// Maximum DW0 channel payload bytes.
@@ -398,7 +398,7 @@ pub const DW_OBJECT_INFO_BASIC_V1: u32 = 1;
 /// Typed object_get_info topic for process or thread termination state.
 pub const DW_OBJECT_INFO_TASK_STATE_V1: u32 = 65537;
 
-/// Typed object_get_info topic for MemoryObject byte size.
+/// Typed object_get_info topic for exact logical MemoryObject byte size.
 pub const DW_OBJECT_INFO_MEMORY_OBJECT_V1: u32 = 131073;
 
 /// Permit userspace reads from a mapping.
@@ -512,7 +512,7 @@ pub const DW_SYSCALL_THREAD_TERMINATE: DwSyscallId = DwSyscallId(0x00010023);
 /// Create a zero-filled page-backed MemoryObject with an immutable size. Zero, unaligned, or overflowing byte_len and any nonzero flags are INVALID_ARGUMENT; inaccessible output storage is BAD_ADDRESS; backing exhaustion is NO_MEMORY. Requested rights must be nonzero, known, and object-compatible, and failure publishes no handle.
 pub const DW_SYSCALL_MEMORY_OBJECT_CREATE: DwSyscallId = DwSyscallId(0x00020001);
 
-/// Transactionally map a page-aligned MemoryObject range using exact-size DwAddressRegionMapArgsV1. Malformed size/version/reserved fields, unknown flags or protections, zero/W+X protections, unaligned or overflowing ranges, and ranges beyond the MemoryObject are INVALID_ARGUMENT. WRITE-only or EXECUTE-only is NOT_SUPPORTED on DW0 x86_64 and READ is never added implicitly. Allocator-chosen placement requires address zero; FIXED requires an exact nonzero page-aligned lower-userspace address, never replaces, and returns ALREADY_EXISTS on overlap. Noncanonical, page-zero, kernel, or outside-region addresses are BAD_ADDRESS. Every mapping requires source MAP+READ; requested WRITE additionally requires source WRITE and requested EXECUTE requires source EXECUTE. Successful mapping captures the source handle's READ/WRITE/EXECUTE authority as the ceiling for later protect operations, including after the source handle closes; violation is ACCESS_DENIED. Failure to find allocator-chosen space returns NO_MEMORY. Every failure leaves mappings and out_address unchanged.
+/// Transactionally map a page-aligned MemoryObject range using exact-size DwAddressRegionMapArgsV1. Malformed size/version/reserved fields, unknown flags or protections, zero/W+X protections, unaligned or overflowing ranges, and offset plus length beyond the checked align_up(logical byte_size, DW_BASE_PAGE_SIZE) mappable capacity are INVALID_ARGUMENT. WRITE-only or EXECUTE-only is NOT_SUPPORTED on DW0 x86_64 and READ is never added implicitly. DwMemoryObjectInfoV1 and other size APIs report only exact logical byte_size. Any final-page tail between byte_size and mappable capacity is hardware-addressable padding, is zero-initialized before first publication, never contains unrelated data, and may be shared or modified subject to mapping protections. Callers must parse or use object content only through exact logical byte_size; the ABI promises no subpage access enforcement within that tail. Allocator-chosen placement requires address zero; FIXED requires an exact nonzero page-aligned lower-userspace address, never replaces, and returns ALREADY_EXISTS on overlap. Noncanonical, page-zero, kernel, or outside-region addresses are BAD_ADDRESS. Every mapping requires source MAP+READ; requested WRITE additionally requires source WRITE and requested EXECUTE requires source EXECUTE. Successful mapping captures the source handle's READ/WRITE/EXECUTE authority as the ceiling for later protect operations, including after the source handle closes; violation is ACCESS_DENIED. Failure to find allocator-chosen space returns NO_MEMORY. Every failure leaves mappings and out_address unchanged.
 pub const DW_SYSCALL_ADDRESS_REGION_MAP: DwSyscallId = DwSyscallId(0x00020010);
 
 /// Transactionally remove a nonempty page-aligned fully mapped userspace range. Zero, unaligned, or overflowing ranges are INVALID_ARGUMENT; noncanonical, page-zero, kernel, or outside-region addresses are BAD_ADDRESS; any unmapped hole is NOT_FOUND. Failure leaves the complete range unchanged.
@@ -780,7 +780,7 @@ pub struct DwTaskTerminationInfoV1 {
 
 pub const DW_TASK_TERMINATION_INFO_V1_SIZE: u32 = 64;
 
-/// Read-only MemoryObject size information.
+/// Read-only exact logical MemoryObject size information.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DwMemoryObjectInfoV1 {
@@ -788,7 +788,7 @@ pub struct DwMemoryObjectInfoV1 {
     pub size: u32,
     /// Structure version; set to one.
     pub version: u32,
-    /// Exact MemoryObject byte size, fixed for the object lifetime.
+    /// Exact logical content byte size, fixed for the object lifetime; APIs report this value rather than page-rounded mappable capacity.
     pub byte_size: u64,
     /// Reserved; all elements must be zero.
     pub reserved: [u64; 2],
@@ -804,9 +804,9 @@ pub struct DwAddressRegionMapArgsV1 {
     pub size: u32,
     /// Structure version; set to one.
     pub version: u32,
-    /// Page-aligned byte offset into the MemoryObject.
+    /// Page-aligned byte offset into the MemoryObject's page-rounded mappable capacity.
     pub memory_object_offset: DwOffset,
-    /// Nonzero page-aligned mapping length.
+    /// Nonzero page-aligned mapping length; offset plus length must not exceed page-rounded mappable capacity.
     pub byte_len: DwSize,
     /// Zero for allocator-chosen placement; exact nonzero page-aligned userspace address with FIXED.
     pub requested_address: DwUserAddress,

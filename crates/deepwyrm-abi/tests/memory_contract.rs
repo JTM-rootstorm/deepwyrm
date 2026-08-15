@@ -64,3 +64,50 @@ fn map_metadata_requires_the_unconditional_rights_baseline() {
     assert_eq!(memory_object.required_object_type, "MEMORY_OBJECT");
     assert_eq!(memory_object.required_rights, "MAP+READ");
 }
+
+#[test]
+fn logical_size_and_page_rounded_mapping_capacity_remain_distinct() {
+    let page_size = u64::from(DW_BASE_PAGE_SIZE);
+    let logical_size = page_size + 1;
+    let mapping_capacity = logical_size
+        .checked_add(page_size - 1)
+        .map(|value| value & !(page_size - 1))
+        .expect("test logical size must round without overflow");
+
+    assert_eq!(mapping_capacity, page_size * 2);
+    assert!(logical_size + 1 <= mapping_capacity);
+    assert_eq!(mapping_capacity + page_size, page_size * 3);
+
+    let generated_artifacts = [
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../abi/generated/deepwyrm_abi.rs"
+        )),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../abi/generated/deepwyrm_abi.h"
+        )),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../abi/generated/ABI.md"
+        )),
+    ];
+    let required_markers = [
+        "Exact logical content byte size",
+        "checked align_up(logical byte_size, DW_BASE_PAGE_SIZE) mappable capacity",
+        "hardware-addressable padding",
+        "zero-initialized before first publication",
+        "never contains unrelated data",
+        "may be shared or modified subject to mapping protections",
+        "parse or use object content only through exact logical byte_size",
+    ];
+
+    for artifact in generated_artifacts {
+        for marker in required_markers {
+            assert!(
+                artifact.contains(marker),
+                "generated ABI artifact is missing logical-size marker: {marker}"
+            );
+        }
+    }
+}
