@@ -149,6 +149,12 @@ typedef uint32_t DwBootModuleFlags;
 DW_STATIC_ASSERT(sizeof(DwBootModuleFlags) == 4, "DwBootModuleFlags size");
 DW_STATIC_ASSERT(DW_ALIGNOF(DwBootModuleFlags) == 4, "DwBootModuleFlags alignment");
 
+/* Flags for the kernel-internal x86_64 paging-handoff carrier; ABI V1 supports no nonzero bits. */
+typedef uint32_t DwBootX86_64PagingHandoffFlags;
+
+DW_STATIC_ASSERT(sizeof(DwBootX86_64PagingHandoffFlags) == 4, "DwBootX86_64PagingHandoffFlags size");
+DW_STATIC_ASSERT(DW_ALIGNOF(DwBootX86_64PagingHandoffFlags) == 4, "DwBootX86_64PagingHandoffFlags alignment");
+
 /* Properties of a framebuffer descriptor. */
 typedef uint32_t DwBootFramebufferFlags;
 
@@ -291,6 +297,8 @@ DW_STATIC_ASSERT(DW_ALIGNOF(DwBootEntropyFlags) == 4, "DwBootEntropyFlags alignm
 #define DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP ((DwBootModuleKind)(1))
 /* Read-only Wyrmroot bootfs image. */
 #define DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS ((DwBootModuleKind)(2))
+/* Exactly one READ_ONLY kernel-internal DwBootX86_64PagingHandoffV1 carrier; it must never be transferred to userspace. */
+#define DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1 ((DwBootModuleKind)(3))
 
 /* The module must only be exposed to userspace with read-only authority. */
 #define DW_BOOT_MODULE_FLAG_READ_ONLY ((DwBootModuleFlags)(1))
@@ -325,6 +333,36 @@ DW_STATIC_ASSERT(DW_ALIGNOF(DwBootEntropyFlags) == 4, "DwBootEntropyFlags alignm
 #define DW_BOOT_MEMORY_RANGE_V1_VERSION ((uint32_t)(1))
 /* Required version value for DwBootModuleV1 records. */
 #define DW_BOOT_MODULE_V1_VERSION ((uint32_t)(1))
+/* Required version value for DwBootX86_64PagingHandoffV1. */
+#define DW_BOOT_X86_64_PAGING_HANDOFF_V1_VERSION ((uint32_t)(1))
+/* DwBootX86_64PagingHandoffV1 supports no nonzero flags. */
+#define DW_BOOT_X86_64_PAGING_HANDOFF_FLAGS_SUPPORTED_MASK ((DwBootX86_64PagingHandoffFlags)(0))
+/* Deepwyrm x86_64 paging-layout contract version bound by the V1 carrier. */
+#define DW_BOOT_X86_64_PAGING_HANDOFF_LAYOUT_VERSION ((uint32_t)(2))
+/* Layout-v2 temporary virtual address whose four-level path the handoff identifies. */
+#define DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS ((uint64_t)(18446742974197923840))
+/* PML4 index derived from the layout-v2 temporary virtual address. */
+#define DW_BOOT_X86_64_PAGING_HANDOFF_PML4_INDEX ((uint16_t)(510))
+/* PDPT index derived from the layout-v2 temporary virtual address. */
+#define DW_BOOT_X86_64_PAGING_HANDOFF_PDPT_INDEX ((uint16_t)(0))
+/* Page-directory index derived from the layout-v2 temporary virtual address. */
+#define DW_BOOT_X86_64_PAGING_HANDOFF_PD_INDEX ((uint16_t)(0))
+/* Page-table index derived from the layout-v2 temporary virtual address. */
+#define DW_BOOT_X86_64_PAGING_HANDOFF_PT_INDEX ((uint16_t)(0))
+/* Required module-relative byte offset of the flat table-frame list. */
+#define DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAMES_OFFSET ((uint32_t)(112))
+/* Required byte stride of each u64 table-frame physical address. */
+#define DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAME_STRIDE ((uint32_t)(8))
+/* Minimum list count covering the distinct CR3 root and three-child temporary path. */
+#define DW_BOOT_X86_64_PAGING_HANDOFF_MIN_TABLE_FRAME_COUNT ((uint32_t)(4))
+/* Maximum number of transition page-table frames accepted in the V1 carrier. */
+#define DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT ((uint32_t)(256))
+/* Maximum exact V1 carrier extent: 112-byte header plus 256 u64 frame addresses. */
+#define DW_BOOT_X86_64_PAGING_HANDOFF_MAX_BYTE_LEN ((uint32_t)(2160))
+/* Minimum valid x86_64 physical-address width encoded by the V1 carrier. */
+#define DW_BOOT_X86_64_PAGING_HANDOFF_MIN_PHYSICAL_ADDRESS_WIDTH ((uint32_t)(12))
+/* Maximum valid x86_64 page-table physical-address width encoded by the V1 carrier. */
+#define DW_BOOT_X86_64_PAGING_HANDOFF_MAX_PHYSICAL_ADDRESS_WIDTH ((uint32_t)(52))
 /* Required version value for DwBootFramebufferV1 records. */
 #define DW_BOOT_FRAMEBUFFER_V1_VERSION ((uint32_t)(1))
 /* Required version value for DwBootEntropyV1 records. */
@@ -529,6 +567,73 @@ DW_STATIC_ASSERT(offsetof(DwBootModuleV1, flags) == 12, "DwBootModuleV1.flags of
 DW_STATIC_ASSERT(offsetof(DwBootModuleV1, physical_start) == 16, "DwBootModuleV1.physical_start offset");
 DW_STATIC_ASSERT(offsetof(DwBootModuleV1, byte_len) == 24, "DwBootModuleV1.byte_len offset");
 DW_STATIC_ASSERT(offsetof(DwBootModuleV1, reserved) == 32, "DwBootModuleV1.reserved offset");
+
+/* Fixed header for the sole READ_ONLY kernel-internal x86_64 transition-page-table carrier. The containing module's physical_start is 4096-byte aligned, begins with this header, and is followed at table_frames_offset by a flat u64 list. The list is strictly ascending and unique, contains the distinct CR3 root and three temporary-path child frames, and enumerates every current transition page-table frame exactly once with no data frames. Every physical address is nonzero, 4096-byte aligned, has no bits outside physical_address_width, and remains reserved until Deepwyrm replaces CR3. The containing module's byte_len, total_byte_len, and table_frames_offset plus table_frame_count times table_frame_stride must be exactly equal. */
+typedef struct DwBootX86_64PagingHandoffV1 {
+    /* Fixed header byte size; must equal DW_BOOT_X86_64_PAGING_HANDOFF_V1_SIZE. */
+    uint32_t size;
+    /* Structure version; must equal DW_BOOT_X86_64_PAGING_HANDOFF_V1_VERSION. */
+    uint32_t version;
+    /* Must contain only supported bits; V1 requires zero. */
+    DwBootX86_64PagingHandoffFlags flags;
+    /* MAXPHYADDR width in bits; must be within the V1 bounds and cover every encoded physical address. */
+    uint32_t physical_address_width;
+    /* Exact current CR3 root-frame physical address with its low 12 bits zero. */
+    uint64_t cr3_root_physical;
+    /* Module-relative list offset; must equal the V1 table-frames-offset constant. */
+    uint32_t table_frames_offset;
+    /* Strictly bounded flat-list count from the V1 minimum through maximum inclusive. */
+    uint32_t table_frame_count;
+    /* List element byte stride; must equal the V1 u64 stride constant. */
+    uint32_t table_frame_stride;
+    /* Exact complete carrier extent, including the header and flat list. */
+    uint32_t total_byte_len;
+    /* Must equal the accepted Deepwyrm x86_64 paging-layout version. */
+    uint32_t paging_layout_version;
+    /* Reserved; producer sets zero and consumer rejects nonzero. */
+    uint32_t reserved0;
+    /* Must equal the layout-v2 temporary virtual-address constant. */
+    uint64_t temporary_virtual_address;
+    /* Must equal the PML4 index derived from temporary_virtual_address. */
+    uint16_t pml4_index;
+    /* Must equal the PDPT index derived from temporary_virtual_address. */
+    uint16_t pdpt_index;
+    /* Must equal the page-directory index derived from temporary_virtual_address. */
+    uint16_t pd_index;
+    /* Must equal the page-table index derived from temporary_virtual_address. */
+    uint16_t pt_index;
+    /* Distinct PML4 child frame selected by pml4_index; low 12 bits must be zero. */
+    uint64_t temporary_pdpt_frame_physical;
+    /* Distinct PDPT child frame selected by pdpt_index; low 12 bits must be zero. */
+    uint64_t temporary_pd_frame_physical;
+    /* Distinct page-directory child frame selected by pd_index; low 12 bits must be zero. */
+    uint64_t temporary_pt_frame_physical;
+    /* Reserved; all elements must be zero. */
+    uint64_t reserved[3];
+} DwBootX86_64PagingHandoffV1;
+#define DW_BOOT_X86_64_PAGING_HANDOFF_V1_SIZE ((uint32_t)(112))
+DW_STATIC_ASSERT(sizeof(DwBootX86_64PagingHandoffV1) == 112, "DwBootX86_64PagingHandoffV1 size");
+DW_STATIC_ASSERT(DW_ALIGNOF(DwBootX86_64PagingHandoffV1) == 8, "DwBootX86_64PagingHandoffV1 alignment");
+DW_STATIC_ASSERT(offsetof(DwBootX86_64PagingHandoffV1, size) == 0, "DwBootX86_64PagingHandoffV1.size offset");
+DW_STATIC_ASSERT(offsetof(DwBootX86_64PagingHandoffV1, version) == 4, "DwBootX86_64PagingHandoffV1.version offset");
+DW_STATIC_ASSERT(offsetof(DwBootX86_64PagingHandoffV1, flags) == 8, "DwBootX86_64PagingHandoffV1.flags offset");
+DW_STATIC_ASSERT(offsetof(DwBootX86_64PagingHandoffV1, physical_address_width) == 12, "DwBootX86_64PagingHandoffV1.physical_address_width offset");
+DW_STATIC_ASSERT(offsetof(DwBootX86_64PagingHandoffV1, cr3_root_physical) == 16, "DwBootX86_64PagingHandoffV1.cr3_root_physical offset");
+DW_STATIC_ASSERT(offsetof(DwBootX86_64PagingHandoffV1, table_frames_offset) == 24, "DwBootX86_64PagingHandoffV1.table_frames_offset offset");
+DW_STATIC_ASSERT(offsetof(DwBootX86_64PagingHandoffV1, table_frame_count) == 28, "DwBootX86_64PagingHandoffV1.table_frame_count offset");
+DW_STATIC_ASSERT(offsetof(DwBootX86_64PagingHandoffV1, table_frame_stride) == 32, "DwBootX86_64PagingHandoffV1.table_frame_stride offset");
+DW_STATIC_ASSERT(offsetof(DwBootX86_64PagingHandoffV1, total_byte_len) == 36, "DwBootX86_64PagingHandoffV1.total_byte_len offset");
+DW_STATIC_ASSERT(offsetof(DwBootX86_64PagingHandoffV1, paging_layout_version) == 40, "DwBootX86_64PagingHandoffV1.paging_layout_version offset");
+DW_STATIC_ASSERT(offsetof(DwBootX86_64PagingHandoffV1, reserved0) == 44, "DwBootX86_64PagingHandoffV1.reserved0 offset");
+DW_STATIC_ASSERT(offsetof(DwBootX86_64PagingHandoffV1, temporary_virtual_address) == 48, "DwBootX86_64PagingHandoffV1.temporary_virtual_address offset");
+DW_STATIC_ASSERT(offsetof(DwBootX86_64PagingHandoffV1, pml4_index) == 56, "DwBootX86_64PagingHandoffV1.pml4_index offset");
+DW_STATIC_ASSERT(offsetof(DwBootX86_64PagingHandoffV1, pdpt_index) == 58, "DwBootX86_64PagingHandoffV1.pdpt_index offset");
+DW_STATIC_ASSERT(offsetof(DwBootX86_64PagingHandoffV1, pd_index) == 60, "DwBootX86_64PagingHandoffV1.pd_index offset");
+DW_STATIC_ASSERT(offsetof(DwBootX86_64PagingHandoffV1, pt_index) == 62, "DwBootX86_64PagingHandoffV1.pt_index offset");
+DW_STATIC_ASSERT(offsetof(DwBootX86_64PagingHandoffV1, temporary_pdpt_frame_physical) == 64, "DwBootX86_64PagingHandoffV1.temporary_pdpt_frame_physical offset");
+DW_STATIC_ASSERT(offsetof(DwBootX86_64PagingHandoffV1, temporary_pd_frame_physical) == 72, "DwBootX86_64PagingHandoffV1.temporary_pd_frame_physical offset");
+DW_STATIC_ASSERT(offsetof(DwBootX86_64PagingHandoffV1, temporary_pt_frame_physical) == 80, "DwBootX86_64PagingHandoffV1.temporary_pt_frame_physical offset");
+DW_STATIC_ASSERT(offsetof(DwBootX86_64PagingHandoffV1, reserved) == 88, "DwBootX86_64PagingHandoffV1.reserved offset");
 
 /* Optional linear framebuffer description embedded in DwBootInfoV1. */
 typedef struct DwBootFramebufferV1 {

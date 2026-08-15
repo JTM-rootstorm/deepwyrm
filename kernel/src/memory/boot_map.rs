@@ -8,7 +8,9 @@
 
 #[cfg(test)]
 use deepwyrm_abi::DW_BOOT_MEMORY_KIND_RESERVED;
-use deepwyrm_abi::{DW_BOOT_INFO_V1_SIZE, DW_BOOT_MEMORY_KIND_USABLE, DwBootMemoryRangeV1};
+use deepwyrm_abi::{
+    DW_BOOT_BASE_PAGE_SIZE, DW_BOOT_INFO_V1_SIZE, DW_BOOT_MEMORY_KIND_USABLE, DwBootMemoryRangeV1,
+};
 
 use crate::boot::{
     BootInfoValidationError, BootPhysicalRange, MAX_BOOT_MEMORY_MAP_ENTRIES, ValidatedBootInfo,
@@ -78,7 +80,8 @@ pub enum BootstrapReservationKind {
     CommandLine,
     Entropy,
     FramebufferPixels,
-    AcpiRsdpAddress,
+    AcpiRsdpMaximumExtent,
+    PagingTableFrame { index: u32 },
 }
 
 /// One exact physical allocation that cannot be returned by the bootstrap
@@ -235,6 +238,18 @@ pub(crate) fn collect_bootstrap_reservations(
             physical_range(module.physical_start, module.byte_len)?,
         )?;
     }
+    let paging = boot_info.paging_handoff();
+    for index in 0..paging.table_frame_count() {
+        let physical_start = paging.table_frame(index).map_err(BootMapError::Snapshot)?;
+        push_reservation(
+            output,
+            &mut used,
+            BootstrapReservationKind::PagingTableFrame {
+                index: index as u32,
+            },
+            physical_range(physical_start, u64::from(DW_BOOT_BASE_PAGE_SIZE))?,
+        )?;
+    }
     if let Some(range) = boot_info.command_line() {
         push_boot_range(
             output,
@@ -259,8 +274,11 @@ pub(crate) fn collect_bootstrap_reservations(
         push_reservation(
             output,
             &mut used,
-            BootstrapReservationKind::AcpiRsdpAddress,
-            physical_range(boot_info.header().acpi_rsdp_physical_address, 1)?,
+            BootstrapReservationKind::AcpiRsdpMaximumExtent,
+            physical_range(
+                boot_info.header().acpi_rsdp_physical_address,
+                u64::from(DW_BOOT_BASE_PAGE_SIZE),
+            )?,
         )?;
     }
     Ok(used)
@@ -364,6 +382,18 @@ fn validate_enumerated_handoff_coverage(
             physical_limit,
         )?;
     }
+    let paging = boot_info.paging_handoff();
+    for index in 0..paging.table_frame_count() {
+        let physical_start = paging.table_frame(index).map_err(BootMapError::Snapshot)?;
+        require_nonusable_coverage(
+            records,
+            physical_range(physical_start, u64::from(DW_BOOT_BASE_PAGE_SIZE))?,
+            BootstrapReservationKind::PagingTableFrame {
+                index: index as u32,
+            },
+            physical_limit,
+        )?;
+    }
     if let Some(range) = boot_info.command_line() {
         require_nonusable_coverage(
             records,
@@ -389,13 +419,16 @@ fn validate_enumerated_handoff_coverage(
         )?;
     }
     if boot_info.header().acpi_rsdp_physical_address != 0 {
-        // The ABI carries no RSDP byte length. Proving the advertised address
-        // itself is non-usable is the strongest containment check available in
-        // DW0-C; its surrounding loader allocation stays LOADER_DATA/RESERVED.
+        // The ABI carries no RSDP byte length. Conservatively cover the locked
+        // maximum declared extent (one base page), which can intersect two
+        // physical pages when the record starts near a page boundary.
         require_nonusable_coverage(
             records,
-            physical_range(boot_info.header().acpi_rsdp_physical_address, 1)?,
-            BootstrapReservationKind::AcpiRsdpAddress,
+            physical_range(
+                boot_info.header().acpi_rsdp_physical_address,
+                u64::from(DW_BOOT_BASE_PAGE_SIZE),
+            )?,
+            BootstrapReservationKind::AcpiRsdpMaximumExtent,
             physical_limit,
         )?;
     }
@@ -568,13 +601,17 @@ mod tests {
                 range: range(0x7000),
             },
             BootstrapReservation {
-                kind: BootstrapReservationKind::AcpiRsdpAddress,
+                kind: BootstrapReservationKind::AcpiRsdpMaximumExtent,
                 range: range(0x8000),
+            },
+            BootstrapReservation {
+                kind: BootstrapReservationKind::PagingTableFrame { index: 0 },
+                range: range(0x9000),
             },
         ];
         let mut allocator = initialize_frame_allocator::<16>(&map, &reservations).unwrap();
-        assert_eq!(allocator.available_frames(), 7);
-        for page in 9_u64..=15 {
+        assert_eq!(allocator.available_frames(), 6);
+        for page in 10_u64..=15 {
             assert_eq!(
                 allocator.allocate_frame().unwrap().physical_start(),
                 page * 0x1000
@@ -626,7 +663,8 @@ mod tests {
             BootstrapReservationKind::CommandLine,
             BootstrapReservationKind::Entropy,
             BootstrapReservationKind::FramebufferPixels,
-            BootstrapReservationKind::AcpiRsdpAddress,
+            BootstrapReservationKind::AcpiRsdpMaximumExtent,
+            BootstrapReservationKind::PagingTableFrame { index: 0 },
         ] {
             assert_eq!(
                 require_nonusable_coverage(&covered, handoff, kind, limit()),
@@ -663,6 +701,29 @@ mod tests {
             Err(BootMapError::HandoffRangeUsable {
                 kind: BootstrapReservationKind::ModuleData { index: 1 },
             })
+        );
+    }
+
+    #[test]
+    fn paging_table_frames_require_full_nonusable_map_coverage() {
+        let frame = PhysicalRange::new(0x2000, u64::from(DW_BOOT_BASE_PAGE_SIZE)).unwrap();
+        let kind = BootstrapReservationKind::PagingTableFrame { index: 7 };
+        let reserved = [record(0x2000, 1, DW_BOOT_MEMORY_KIND_RESERVED, 0)];
+        assert_eq!(
+            require_nonusable_coverage(&reserved, frame, kind, limit()),
+            Ok(())
+        );
+
+        let usable = [record(0x2000, 1, DW_BOOT_MEMORY_KIND_USABLE, 0)];
+        assert_eq!(
+            require_nonusable_coverage(&usable, frame, kind, limit()),
+            Err(BootMapError::HandoffRangeUsable { kind })
+        );
+
+        let outside = [record(0x1000, 1, DW_BOOT_MEMORY_KIND_RESERVED, 0)];
+        assert_eq!(
+            require_nonusable_coverage(&outside, frame, kind, limit()),
+            Err(BootMapError::HandoffRangeUncovered { kind })
         );
     }
 

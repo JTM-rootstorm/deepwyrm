@@ -22,6 +22,39 @@ fn layout_manifest_is_exact_and_fails_closed_on_drift() {
     assert_eq!(layout.base_page_size, 4_096);
     assert_eq!(layout.kernel_boot_stack_size, 65_536);
     assert_eq!(layout.kernel_boot_stack_alignment, 4_096);
+    assert_eq!(layout.temporary_virtual_address, 0xffff_ff00_0000_0000);
+    assert_eq!(layout.temporary_indices, [510, 0, 0, 0]);
+    assert_eq!(
+        layout.temporary_virtual_address,
+        deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS
+    );
+    assert_eq!(
+        layout.temporary_indices,
+        [
+            deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_PML4_INDEX,
+            deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_PDPT_INDEX,
+            deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_PD_INDEX,
+            deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_PT_INDEX,
+        ]
+    );
+    assert_eq!(
+        layout.minimum_table_frame_count,
+        u64::from(deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_MIN_TABLE_FRAME_COUNT)
+    );
+    assert_eq!(
+        layout.maximum_table_frame_count,
+        u64::from(deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT)
+    );
+    assert_eq!(
+        deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAMES_OFFSET,
+        deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_V1_SIZE
+    );
+    assert_eq!(
+        deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_MAX_BYTE_LEN,
+        deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAMES_OFFSET
+            + deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT
+                * deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAME_STRIDE
+    );
     assert_eq!(
         layout.max_normalized_memory_map_entries,
         deepwyrm_kernel::boot::MAX_BOOT_MEMORY_MAP_ENTRIES as u64
@@ -33,8 +66,8 @@ fn layout_manifest_is_exact_and_fails_closed_on_drift() {
 
     for malformed in [
         format!("{source}\nunknown_contract_key = true\n"),
-        source.replacen("version = 1", "version = 1\nversion = 1", 1),
-        source.replace("version = 1", "version = 2"),
+        source.replacen("version = 2", "version = 2\nversion = 2", 1),
+        source.replace("version = 2", "version = 1"),
         source.replace(
             "allowed_program_header_types = [\"PT_LOAD\"]",
             "allowed_program_header_types = [\"PT_LOAD\", \"PT_NOTE\"]",
@@ -62,6 +95,25 @@ fn layout_manifest_is_exact_and_fails_closed_on_drift() {
         source.replace(
             "acpi_table_traversal = \"deferred-dw0-c\"",
             "acpi_table_traversal = \"loader-walk\"",
+        ),
+        source.replace(
+            "temporary_virtual_address = \"0xffffff0000000000\"",
+            "temporary_virtual_address = \"0xffffffff80000000\"",
+        ),
+        source.replace("pml4_index = 510", "pml4_index = 511"),
+        source.replace(
+            "maximum_table_frame_count = 256",
+            "maximum_table_frame_count = 257",
+        ),
+        source.replace(
+            "initial_leaf = \"exactly-zero-non-present\"",
+            "initial_leaf = \"present\"",
+        ),
+        source.replace("pcide_enabled = false", "pcide_enabled = true"),
+        source.replace("pge_enabled = false", "pge_enabled = true"),
+        source.replace(
+            "identity_alias_mutable_by_deepwyrm = true",
+            "identity_alias_mutable_by_deepwyrm = false",
         ),
     ] {
         assert!(kernel_build::Layout::parse(&malformed).is_err());
@@ -351,11 +403,16 @@ fn validate_elf(bytes: &[u8], layout: kernel_build::Layout) {
         );
         assert!(header.file_size <= header.memory_size);
         assert_ne!(header.flags & (PF_W | PF_X), PF_W | PF_X, "RWX PT_LOAD");
+        let end = header
+            .virtual_address
+            .checked_add(header.memory_size)
+            .expect("PT_LOAD range does not overflow");
+        assert!(
+            layout.temporary_virtual_address < header.virtual_address
+                || layout.temporary_virtual_address >= end,
+            "temporary mapping overlaps a PT_LOAD"
+        );
         if let Some(next) = loads.get(index + 1) {
-            let end = header
-                .virtual_address
-                .checked_add(header.memory_size)
-                .expect("PT_LOAD range does not overflow");
             assert!(end <= next.virtual_address, "overlapping PT_LOAD ranges");
         }
     }

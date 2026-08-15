@@ -107,6 +107,7 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_BOOT_MODULE_KIND_UNSPECIFIED` | `0` | Invalid or unspecified module kind. |  |
 | `DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP` | `1` | Primordial fully-static Wyrmroot bootstrap ELF. |  |
 | `DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS` | `2` | Read-only Wyrmroot bootfs image. |  |
+| `DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1` | `3` | Exactly one READ_ONLY kernel-internal DwBootX86_64PagingHandoffV1 carrier; it must never be transferred to userspace. |  |
 
 ## Module Flag
 
@@ -151,6 +152,21 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_BOOT_BASE_PAGE_SIZE` | `u32` | `4096` | DW0 base page size in bytes for BootInfo memory ranges and handoff mappings. |
 | `DW_BOOT_MEMORY_RANGE_V1_VERSION` | `u32` | `1` | Required version value for DwBootMemoryRangeV1 records. |
 | `DW_BOOT_MODULE_V1_VERSION` | `u32` | `1` | Required version value for DwBootModuleV1 records. |
+| `DW_BOOT_X86_64_PAGING_HANDOFF_V1_VERSION` | `u32` | `1` | Required version value for DwBootX86_64PagingHandoffV1. |
+| `DW_BOOT_X86_64_PAGING_HANDOFF_FLAGS_SUPPORTED_MASK` | `DwBootX86_64PagingHandoffFlags` | `0` | DwBootX86_64PagingHandoffV1 supports no nonzero flags. |
+| `DW_BOOT_X86_64_PAGING_HANDOFF_LAYOUT_VERSION` | `u32` | `2` | Deepwyrm x86_64 paging-layout contract version bound by the V1 carrier. |
+| `DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS` | `u64` | `18446742974197923840` | Layout-v2 temporary virtual address whose four-level path the handoff identifies. |
+| `DW_BOOT_X86_64_PAGING_HANDOFF_PML4_INDEX` | `u16` | `510` | PML4 index derived from the layout-v2 temporary virtual address. |
+| `DW_BOOT_X86_64_PAGING_HANDOFF_PDPT_INDEX` | `u16` | `0` | PDPT index derived from the layout-v2 temporary virtual address. |
+| `DW_BOOT_X86_64_PAGING_HANDOFF_PD_INDEX` | `u16` | `0` | Page-directory index derived from the layout-v2 temporary virtual address. |
+| `DW_BOOT_X86_64_PAGING_HANDOFF_PT_INDEX` | `u16` | `0` | Page-table index derived from the layout-v2 temporary virtual address. |
+| `DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAMES_OFFSET` | `u32` | `112` | Required module-relative byte offset of the flat table-frame list. |
+| `DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAME_STRIDE` | `u32` | `8` | Required byte stride of each u64 table-frame physical address. |
+| `DW_BOOT_X86_64_PAGING_HANDOFF_MIN_TABLE_FRAME_COUNT` | `u32` | `4` | Minimum list count covering the distinct CR3 root and three-child temporary path. |
+| `DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT` | `u32` | `256` | Maximum number of transition page-table frames accepted in the V1 carrier. |
+| `DW_BOOT_X86_64_PAGING_HANDOFF_MAX_BYTE_LEN` | `u32` | `2160` | Maximum exact V1 carrier extent: 112-byte header plus 256 u64 frame addresses. |
+| `DW_BOOT_X86_64_PAGING_HANDOFF_MIN_PHYSICAL_ADDRESS_WIDTH` | `u32` | `12` | Minimum valid x86_64 physical-address width encoded by the V1 carrier. |
+| `DW_BOOT_X86_64_PAGING_HANDOFF_MAX_PHYSICAL_ADDRESS_WIDTH` | `u32` | `52` | Maximum valid x86_64 page-table physical-address width encoded by the V1 carrier. |
 | `DW_BOOT_FRAMEBUFFER_V1_VERSION` | `u32` | `1` | Required version value for DwBootFramebufferV1 records. |
 | `DW_BOOT_ENTROPY_V1_VERSION` | `u32` | `1` | Required version value for DwBootEntropyV1 records. |
 | `DW_BOOT_INFO_V1_VERSION` | `u32` | `1` | Required version value for DwBootInfoV1 records. |
@@ -224,6 +240,33 @@ One loaded boot module supplied by the Wyrmroot EFI loader. Size 64, alignment 8
 | 16 | `physical_start` | `u64` | Physical start address of module bytes. |
 | 24 | `byte_len` | `u64` | Exact module byte length. |
 | 32 | `reserved` | `[u64; 4]` | Reserved; all elements must be zero. |
+
+### `DwBootX86_64PagingHandoffV1`
+
+Fixed header for the sole READ_ONLY kernel-internal x86_64 transition-page-table carrier. The containing module's physical_start is 4096-byte aligned, begins with this header, and is followed at table_frames_offset by a flat u64 list. The list is strictly ascending and unique, contains the distinct CR3 root and three temporary-path child frames, and enumerates every current transition page-table frame exactly once with no data frames. Every physical address is nonzero, 4096-byte aligned, has no bits outside physical_address_width, and remains reserved until Deepwyrm replaces CR3. The containing module's byte_len, total_byte_len, and table_frames_offset plus table_frame_count times table_frame_stride must be exactly equal. Size 112, alignment 8.
+
+| Offset | Field | Type | Meaning |
+|---:|---|---|---|
+| 0 | `size` | `u32` | Fixed header byte size; must equal DW_BOOT_X86_64_PAGING_HANDOFF_V1_SIZE. |
+| 4 | `version` | `u32` | Structure version; must equal DW_BOOT_X86_64_PAGING_HANDOFF_V1_VERSION. |
+| 8 | `flags` | `DwBootX86_64PagingHandoffFlags` | Must contain only supported bits; V1 requires zero. |
+| 12 | `physical_address_width` | `u32` | MAXPHYADDR width in bits; must be within the V1 bounds and cover every encoded physical address. |
+| 16 | `cr3_root_physical` | `u64` | Exact current CR3 root-frame physical address with its low 12 bits zero. |
+| 24 | `table_frames_offset` | `u32` | Module-relative list offset; must equal the V1 table-frames-offset constant. |
+| 28 | `table_frame_count` | `u32` | Strictly bounded flat-list count from the V1 minimum through maximum inclusive. |
+| 32 | `table_frame_stride` | `u32` | List element byte stride; must equal the V1 u64 stride constant. |
+| 36 | `total_byte_len` | `u32` | Exact complete carrier extent, including the header and flat list. |
+| 40 | `paging_layout_version` | `u32` | Must equal the accepted Deepwyrm x86_64 paging-layout version. |
+| 44 | `reserved0` | `u32` | Reserved; producer sets zero and consumer rejects nonzero. |
+| 48 | `temporary_virtual_address` | `u64` | Must equal the layout-v2 temporary virtual-address constant. |
+| 56 | `pml4_index` | `u16` | Must equal the PML4 index derived from temporary_virtual_address. |
+| 58 | `pdpt_index` | `u16` | Must equal the PDPT index derived from temporary_virtual_address. |
+| 60 | `pd_index` | `u16` | Must equal the page-directory index derived from temporary_virtual_address. |
+| 62 | `pt_index` | `u16` | Must equal the page-table index derived from temporary_virtual_address. |
+| 64 | `temporary_pdpt_frame_physical` | `u64` | Distinct PML4 child frame selected by pml4_index; low 12 bits must be zero. |
+| 72 | `temporary_pd_frame_physical` | `u64` | Distinct PDPT child frame selected by pdpt_index; low 12 bits must be zero. |
+| 80 | `temporary_pt_frame_physical` | `u64` | Distinct page-directory child frame selected by pd_index; low 12 bits must be zero. |
+| 88 | `reserved` | `[u64; 3]` | Reserved; all elements must be zero. |
 
 ### `DwBootFramebufferV1`
 

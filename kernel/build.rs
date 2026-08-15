@@ -387,6 +387,26 @@ pub(crate) struct Layout {
         reason = "published intake limits are consumed by contract agreement tests"
     )]
     pub(crate) max_module_entries: u64,
+    #[allow(
+        dead_code,
+        reason = "published transition-table values are consumed by contract agreement tests"
+    )]
+    pub(crate) temporary_virtual_address: u64,
+    #[allow(
+        dead_code,
+        reason = "published transition-table values are consumed by contract agreement tests"
+    )]
+    pub(crate) temporary_indices: [u16; 4],
+    #[allow(
+        dead_code,
+        reason = "published transition-table values are consumed by contract agreement tests"
+    )]
+    pub(crate) minimum_table_frame_count: u64,
+    #[allow(
+        dead_code,
+        reason = "published transition-table values are consumed by contract agreement tests"
+    )]
+    pub(crate) maximum_table_frame_count: u64,
 }
 
 impl Layout {
@@ -441,7 +461,7 @@ impl Layout {
             "handoff_mappings.boot_info",
             "handoff_mappings.referenced_ranges",
             "handoff_mappings.lifetime",
-            "handoff_mappings.mutable",
+            "handoff_mappings.referenced_ranges_mutable",
             "handoff_mappings.page_zero_mapped",
             "handoff_mappings.framebuffer_pixels_identity_mapped",
             "early_intake.max_normalized_memory_map_entries",
@@ -458,6 +478,31 @@ impl Layout {
             "early_intake.acpi_mapping_overlap",
             "early_intake.acpi_table_traversal",
             "early_intake.acpi_memory_types_identity_mapped",
+            "transition_tables.contract",
+            "transition_tables.layout_version",
+            "transition_tables.temporary_virtual_address",
+            "transition_tables.temporary_page_count",
+            "transition_tables.pml4_index",
+            "transition_tables.pdpt_index",
+            "transition_tables.pd_index",
+            "transition_tables.pt_index",
+            "transition_tables.minimum_table_frame_count",
+            "transition_tables.maximum_table_frame_count",
+            "transition_tables.initial_leaf",
+            "transition_tables.temporary_leaf_permissions",
+            "transition_tables.identity_alias_permissions",
+            "transition_tables.identity_alias_mutable_by_deepwyrm",
+            "transition_tables.cache_selection_bits",
+            "transition_tables.pat_entry_zero",
+            "transition_tables.mtrr_policy",
+            "transition_tables.pcide_enabled",
+            "transition_tables.pge_enabled",
+            "transition_tables.cr3_low_bits_zero",
+            "transition_tables.ownership_transfer",
+            "transition_tables.lifetime",
+            "transition_tables.concurrency",
+            "transition_tables.physical_role_policy",
+            "transition_tables.new_root_table_access",
         ];
 
         let values = parse_flat_toml(source)?;
@@ -472,7 +517,7 @@ impl Layout {
         }
 
         expect_string(&values, "schema", "deepwyrm-x86_64-layout")?;
-        expect_u64(&values, "version", 1)?;
+        expect_u64(&values, "version", 2)?;
         expect_string(&values, "entry_contract", "DW_BOOT_X86_64_ENTRY_V1")?;
         expect_string(&values, "elf_type", "ET_EXEC")?;
         expect_string(&values, "entry_symbol", "_dw_kernel_entry")?;
@@ -552,6 +597,41 @@ impl Layout {
             ),
             ("early_intake.acpi_mapping_overlap", "coalesce"),
             ("early_intake.acpi_table_traversal", "deferred-dw0-c"),
+            (
+                "transition_tables.contract",
+                "DW_BOOT_X86_64_PAGING_HANDOFF_V1",
+            ),
+            ("transition_tables.initial_leaf", "exactly-zero-non-present"),
+            (
+                "transition_tables.temporary_leaf_permissions",
+                "supervisor-rw-nx-base-page",
+            ),
+            (
+                "transition_tables.identity_alias_permissions",
+                "supervisor-rw-nx-base-page",
+            ),
+            ("transition_tables.pat_entry_zero", "observed-write-back"),
+            (
+                "transition_tables.mtrr_policy",
+                "alias-consistent-no-effective-write-back-claim",
+            ),
+            (
+                "transition_tables.ownership_transfer",
+                "loader-to-deepwyrm-after-exit-boot-services",
+            ),
+            ("transition_tables.lifetime", "until-deepwyrm-cr3-switch"),
+            (
+                "transition_tables.concurrency",
+                "bsp-aps-off-if-clear-nonreentrant",
+            ),
+            (
+                "transition_tables.physical_role_policy",
+                "exclusive-table-frames-no-kernel-module-data-alias",
+            ),
+            (
+                "transition_tables.new_root_table_access",
+                "deepwyrm-owned-before-cr3-switch",
+            ),
         ] {
             expect_string(&values, key, expected_value)?;
         }
@@ -582,13 +662,21 @@ impl Layout {
             "entry_state.interrupts_enabled",
             "entry_state.direction_flag_set",
             "entry_state.uefi_services_available",
-            "handoff_mappings.mutable",
+            "handoff_mappings.referenced_ranges_mutable",
             "handoff_mappings.page_zero_mapped",
             "handoff_mappings.framebuffer_pixels_identity_mapped",
             "early_intake.acpi_memory_types_identity_mapped",
+            "transition_tables.pcide_enabled",
+            "transition_tables.pge_enabled",
         ] {
             expect_bool(&values, key, false)?;
         }
+        expect_bool(
+            &values,
+            "transition_tables.identity_alias_mutable_by_deepwyrm",
+            true,
+        )?;
+        expect_bool(&values, "transition_tables.cr3_low_bits_zero", true)?;
 
         let link_base = parse_hex_string(required_value(&values, "link_base")?)?;
         let base_page_size = parse_u64(required_value(&values, "base_page_size")?)?;
@@ -601,8 +689,29 @@ impl Layout {
         )?)?;
         let max_module_entries =
             parse_u64(required_value(&values, "early_intake.max_module_entries")?)?;
+        let temporary_virtual_address = parse_hex_string(required_value(
+            &values,
+            "transition_tables.temporary_virtual_address",
+        )?)?;
+        let temporary_indices = [
+            parse_index(&values, "transition_tables.pml4_index")?,
+            parse_index(&values, "transition_tables.pdpt_index")?,
+            parse_index(&values, "transition_tables.pd_index")?,
+            parse_index(&values, "transition_tables.pt_index")?,
+        ];
+        let minimum_table_frame_count = parse_u64(required_value(
+            &values,
+            "transition_tables.minimum_table_frame_count",
+        )?)?;
+        let maximum_table_frame_count = parse_u64(required_value(
+            &values,
+            "transition_tables.maximum_table_frame_count",
+        )?)?;
 
         expect_u64(&values, "early_intake.acpi_rsdp_max_intersecting_pages", 2)?;
+        expect_u64(&values, "transition_tables.layout_version", 2)?;
+        expect_u64(&values, "transition_tables.temporary_page_count", 1)?;
+        expect_u64(&values, "transition_tables.cache_selection_bits", 0)?;
 
         if link_base < 0xffff_8000_0000_0000 || link_base % base_page_size != 0 {
             return Err("link_base must be upper-canonical and base-page aligned".into());
@@ -623,6 +732,27 @@ impl Layout {
         if max_normalized_memory_map_entries != 128 || max_module_entries != 16 {
             return Err("early intake limits must match the bounded BootInfo snapshots".into());
         }
+        if temporary_virtual_address != 0xffff_ff00_0000_0000
+            || temporary_virtual_address % base_page_size != 0
+            || temporary_virtual_address < 0xffff_8000_0000_0000
+        {
+            return Err("temporary mapping address must be the dedicated upper-half page".into());
+        }
+        let derived_indices = [
+            ((temporary_virtual_address >> 39) & 0x1ff) as u16,
+            ((temporary_virtual_address >> 30) & 0x1ff) as u16,
+            ((temporary_virtual_address >> 21) & 0x1ff) as u16,
+            ((temporary_virtual_address >> 12) & 0x1ff) as u16,
+        ];
+        if temporary_indices != derived_indices || temporary_indices != [510, 0, 0, 0] {
+            return Err("temporary mapping indices must be derived from the dedicated VA".into());
+        }
+        if minimum_table_frame_count != 4 || maximum_table_frame_count != 256 {
+            return Err("transition table frame bounds must be 4..=256".into());
+        }
+        if temporary_indices[0] == ((link_base >> 39) & 0x1ff) as u16 {
+            return Err("temporary mapping must not share the kernel PT_LOAD PML4 slot".into());
+        }
 
         Ok(Self {
             link_base,
@@ -631,6 +761,10 @@ impl Layout {
             kernel_boot_stack_alignment,
             max_normalized_memory_map_entries,
             max_module_entries,
+            temporary_virtual_address,
+            temporary_indices,
+            minimum_table_frame_count,
+            maximum_table_frame_count,
         })
     }
 }
@@ -653,7 +787,11 @@ fn parse_flat_toml(source: &str) -> Result<BTreeMap<String, String>, String> {
             };
             if !matches!(
                 name,
-                "load_policy" | "entry_state" | "handoff_mappings" | "early_intake"
+                "load_policy"
+                    | "entry_state"
+                    | "handoff_mappings"
+                    | "early_intake"
+                    | "transition_tables"
             ) {
                 return Err(format!("line {line_number}: unknown section `{name}`"));
             }
@@ -678,6 +816,14 @@ fn parse_flat_toml(source: &str) -> Result<BTreeMap<String, String>, String> {
         }
     }
     Ok(values)
+}
+
+fn parse_index(values: &BTreeMap<String, String>, key: &str) -> Result<u16, String> {
+    let value = parse_u64(required_value(values, key)?)?;
+    u16::try_from(value)
+        .ok()
+        .filter(|value| *value < 512)
+        .ok_or_else(|| format!("{key} must be a four-level page-table index"))
 }
 
 fn required_value<'a>(values: &'a BTreeMap<String, String>, key: &str) -> Result<&'a str, String> {

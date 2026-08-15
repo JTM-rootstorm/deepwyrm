@@ -16,12 +16,23 @@ use deepwyrm_abi::{
     DW_BOOT_MEMORY_KIND_RESERVED, DW_BOOT_MEMORY_KIND_RUNTIME_SERVICES,
     DW_BOOT_MEMORY_KIND_UNUSABLE, DW_BOOT_MEMORY_KIND_USABLE, DW_BOOT_MEMORY_RANGE_V1_SIZE,
     DW_BOOT_MEMORY_RANGE_V1_VERSION, DW_BOOT_MODULE_FLAG_READ_ONLY,
-    DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS, DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP,
-    DW_BOOT_MODULE_V1_SIZE, DW_BOOT_MODULE_V1_VERSION, DW_BOOT_PIXEL_FORMAT_BGRX8,
-    DW_BOOT_PIXEL_FORMAT_BITMASK, DW_BOOT_PIXEL_FORMAT_RGBX8, DwBootEntropyFlags,
-    DwBootEntropySource, DwBootEntropyV1, DwBootFramebufferFlags, DwBootFramebufferV1,
-    DwBootInfoFlags, DwBootInfoV1, DwBootMemoryKind, DwBootMemoryRangeV1, DwBootModuleFlags,
-    DwBootModuleKind, DwBootModuleV1, DwBootPixelFormat,
+    DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1, DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS,
+    DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP, DW_BOOT_MODULE_V1_SIZE, DW_BOOT_MODULE_V1_VERSION,
+    DW_BOOT_PIXEL_FORMAT_BGRX8, DW_BOOT_PIXEL_FORMAT_BITMASK, DW_BOOT_PIXEL_FORMAT_RGBX8,
+    DW_BOOT_X86_64_PAGING_HANDOFF_FLAGS_SUPPORTED_MASK,
+    DW_BOOT_X86_64_PAGING_HANDOFF_LAYOUT_VERSION, DW_BOOT_X86_64_PAGING_HANDOFF_MAX_BYTE_LEN,
+    DW_BOOT_X86_64_PAGING_HANDOFF_MAX_PHYSICAL_ADDRESS_WIDTH,
+    DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT,
+    DW_BOOT_X86_64_PAGING_HANDOFF_MIN_PHYSICAL_ADDRESS_WIDTH,
+    DW_BOOT_X86_64_PAGING_HANDOFF_MIN_TABLE_FRAME_COUNT, DW_BOOT_X86_64_PAGING_HANDOFF_PD_INDEX,
+    DW_BOOT_X86_64_PAGING_HANDOFF_PDPT_INDEX, DW_BOOT_X86_64_PAGING_HANDOFF_PML4_INDEX,
+    DW_BOOT_X86_64_PAGING_HANDOFF_PT_INDEX, DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAME_STRIDE,
+    DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAMES_OFFSET,
+    DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS, DW_BOOT_X86_64_PAGING_HANDOFF_V1_SIZE,
+    DW_BOOT_X86_64_PAGING_HANDOFF_V1_VERSION, DwBootEntropyFlags, DwBootEntropySource,
+    DwBootEntropyV1, DwBootFramebufferFlags, DwBootFramebufferV1, DwBootInfoFlags, DwBootInfoV1,
+    DwBootMemoryKind, DwBootMemoryRangeV1, DwBootModuleFlags, DwBootModuleKind, DwBootModuleV1,
+    DwBootPixelFormat, DwBootX86_64PagingHandoffFlags, DwBootX86_64PagingHandoffV1,
 };
 
 const KNOWN_BOOT_INFO_FLAGS: u64 = DW_BOOT_INFO_FLAG_FRAMEBUFFER_PRESENT.0;
@@ -36,6 +47,10 @@ pub const MAX_BOOT_MEMORY_MAP_ENTRIES: usize = 128;
 /// Maximum boot-module records retained by the allocation-free DW0-B BootInfo
 /// snapshot.
 pub const MAX_BOOT_MODULE_ENTRIES: usize = 16;
+
+const MAX_PAGING_HANDOFF_TABLE_FRAMES: usize =
+    DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT as usize;
+const MAX_PAGING_HANDOFF_BYTES: usize = DW_BOOT_X86_64_PAGING_HANDOFF_MAX_BYTE_LEN as usize;
 
 /// An architecture-entry adapter that can copy bytes from a physical range.
 ///
@@ -124,6 +139,42 @@ pub struct ValidatedBootInfo {
     framebuffer: Option<DwBootFramebufferV1>,
     memory_ranges: [DwBootMemoryRangeV1; MAX_BOOT_MEMORY_MAP_ENTRIES],
     module_entries: [DwBootModuleV1; MAX_BOOT_MODULE_ENTRIES],
+    paging_handoff: ValidatedPagingHandoff,
+}
+
+/// Owned, one-snapshot structural interpretation of the loader's internal
+/// paging carrier.
+///
+/// This snapshot does not attest the live CR3 graph, CPU control state, page
+/// permissions, cache configuration, or ownership transfer. The architecture
+/// transition boundary must compare those facts with this declaration before
+/// it mutates the temporary leaf or replaces CR3.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValidatedPagingHandoff {
+    header: DwBootX86_64PagingHandoffV1,
+    table_frames: [u64; MAX_PAGING_HANDOFF_TABLE_FRAMES],
+    table_frame_count: usize,
+}
+
+impl ValidatedPagingHandoff {
+    /// Returns the copied fixed carrier header.
+    pub const fn header(&self) -> &DwBootX86_64PagingHandoffV1 {
+        &self.header
+    }
+
+    /// Number of copied transition page-table frame addresses.
+    pub const fn table_frame_count(&self) -> usize {
+        self.table_frame_count
+    }
+
+    /// Returns one copied transition page-table frame address.
+    pub fn table_frame(&self, index: usize) -> Result<u64, BootInfoValidationError> {
+        self.table_frames
+            .get(index)
+            .copied()
+            .filter(|_| index < self.table_frame_count)
+            .ok_or(BootInfoValidationError::TableIndexOutOfBounds)
+    }
 }
 
 impl ValidatedBootInfo {
@@ -168,6 +219,11 @@ impl ValidatedBootInfo {
         let index = checked_snapshot_index(index, self.modules.entry_count)?;
         Ok(self.module_entries[index])
     }
+
+    /// Returns the copied and validated internal x86_64 paging handoff.
+    pub const fn paging_handoff(&self) -> &ValidatedPagingHandoff {
+        &self.paging_handoff
+    }
 }
 
 /// Precise fail-closed reasons suitable for an early serial/panic path.
@@ -195,6 +251,8 @@ pub enum BootInfoValidationError {
     InvalidFramebuffer,
     InvalidEntropy,
     InvalidCommandLine,
+    InvalidPagingHandoff,
+    PagingHandoffFrameRoleOverlap,
     TableIndexOutOfBounds,
 }
 
@@ -242,7 +300,7 @@ pub fn validate_boot_info_with_limits<R: BootInfoByteReader>(
         DW_BOOT_INFO_V1_VERSION,
         None,
     )?;
-    checked_range(boot_info_physical_start, u64::from(header.size), 8)?;
+    let boot_info_range = checked_range(boot_info_physical_start, u64::from(header.size), 8)?;
     validate_zeroes(&header.reserved)?;
     if header.reserved0 != 0 || header.reserved1 != 0 {
         return Err(BootInfoValidationError::NonZeroReserved);
@@ -291,6 +349,7 @@ pub fn validate_boot_info_with_limits<R: BootInfoByteReader>(
 
     let mut bootstrap = None;
     let mut bootfs = None;
+    let mut paging_handoff_module = None;
     let mut module_entries = core::array::from_fn(|_| DwBootModuleV1::default());
     for (index, module) in module_entries
         .iter_mut()
@@ -310,22 +369,52 @@ pub fn validate_boot_info_with_limits<R: BootInfoByteReader>(
                 }
             }
             kind if kind == DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS.0 => {
-                if module.flags.0 & DW_BOOT_MODULE_FLAG_READ_ONLY.0 == 0 {
+                if module.flags != DW_BOOT_MODULE_FLAG_READ_ONLY {
                     return Err(BootInfoValidationError::InvalidModuleFlags);
                 }
                 if bootfs.replace(range).is_some() {
                     return Err(BootInfoValidationError::DuplicateRequiredModule);
                 }
             }
+            kind if kind == DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1.0 => {
+                if module.flags != DW_BOOT_MODULE_FLAG_READ_ONLY {
+                    return Err(BootInfoValidationError::InvalidModuleFlags);
+                }
+                if paging_handoff_module.replace(*module).is_some() {
+                    return Err(BootInfoValidationError::DuplicateRequiredModule);
+                }
+            }
             _ => return Err(BootInfoValidationError::UnknownModuleKind),
         }
     }
-    let (Some(bootstrap), Some(bootfs)) = (bootstrap, bootfs) else {
+    let (Some(_bootstrap), Some(_bootfs), Some(paging_handoff_module)) =
+        (bootstrap, bootfs, paging_handoff_module)
+    else {
         return Err(BootInfoValidationError::MissingRequiredModule);
     };
-    if ranges_overlap(bootstrap, bootfs)? {
-        return Err(BootInfoValidationError::OverlappingModules);
+
+    let active_modules = &module_entries[..modules.entry_count as usize];
+    for (left, module) in active_modules.iter().copied().enumerate() {
+        let left_range = module_range(module);
+        for right in active_modules.iter().copied().skip(left + 1) {
+            if ranges_overlap(left_range, module_range(right))? {
+                return Err(BootInfoValidationError::OverlappingModules);
+            }
+        }
     }
+
+    let paging_handoff = parse_paging_handoff_snapshot(reader, paging_handoff_module)?;
+    validate_paging_handoff_frame_roles(
+        &paging_handoff,
+        boot_info_range,
+        memory_map,
+        modules,
+        &module_entries[..modules.entry_count as usize],
+        command_line,
+        entropy,
+        framebuffer,
+        header.acpi_rsdp_physical_address,
+    )?;
 
     Ok(ValidatedBootInfo {
         header,
@@ -336,6 +425,7 @@ pub fn validate_boot_info_with_limits<R: BootInfoByteReader>(
         framebuffer,
         memory_ranges,
         module_entries,
+        paging_handoff,
     })
 }
 
@@ -496,6 +586,217 @@ fn parse_module(
         u64::from(DW_BOOT_BASE_PAGE_SIZE),
     )?;
     Ok(record)
+}
+
+fn parse_paging_handoff_snapshot<R: BootInfoByteReader>(
+    reader: &R,
+    module: DwBootModuleV1,
+) -> Result<ValidatedPagingHandoff, BootInfoValidationError> {
+    if module.flags != DW_BOOT_MODULE_FLAG_READ_ONLY
+        || module.byte_len < u64::from(DW_BOOT_X86_64_PAGING_HANDOFF_V1_SIZE)
+        || module.byte_len > u64::from(DW_BOOT_X86_64_PAGING_HANDOFF_MAX_BYTE_LEN)
+    {
+        return Err(BootInfoValidationError::InvalidPagingHandoff);
+    }
+    let byte_len = usize::try_from(module.byte_len)
+        .map_err(|_| BootInfoValidationError::InvalidPagingHandoff)?;
+    let mut snapshot = [0_u8; MAX_PAGING_HANDOFF_BYTES];
+    read(reader, module.physical_start, &mut snapshot[..byte_len])?;
+    let bytes = &snapshot[..byte_len];
+
+    let header = DwBootX86_64PagingHandoffV1 {
+        size: u32_at(bytes, 0)?,
+        version: u32_at(bytes, 4)?,
+        flags: DwBootX86_64PagingHandoffFlags(u32_at(bytes, 8)?),
+        physical_address_width: u32_at(bytes, 12)?,
+        cr3_root_physical: u64_at(bytes, 16)?,
+        table_frames_offset: u32_at(bytes, 24)?,
+        table_frame_count: u32_at(bytes, 28)?,
+        table_frame_stride: u32_at(bytes, 32)?,
+        total_byte_len: u32_at(bytes, 36)?,
+        paging_layout_version: u32_at(bytes, 40)?,
+        reserved0: u32_at(bytes, 44)?,
+        temporary_virtual_address: u64_at(bytes, 48)?,
+        pml4_index: u16_at(bytes, 56)?,
+        pdpt_index: u16_at(bytes, 58)?,
+        pd_index: u16_at(bytes, 60)?,
+        pt_index: u16_at(bytes, 62)?,
+        temporary_pdpt_frame_physical: u64_at(bytes, 64)?,
+        temporary_pd_frame_physical: u64_at(bytes, 72)?,
+        temporary_pt_frame_physical: u64_at(bytes, 80)?,
+        reserved: u64_array_at(bytes, 88, 3)?,
+    };
+    if header.size != DW_BOOT_X86_64_PAGING_HANDOFF_V1_SIZE
+        || header.version != DW_BOOT_X86_64_PAGING_HANDOFF_V1_VERSION
+        || header.flags != DW_BOOT_X86_64_PAGING_HANDOFF_FLAGS_SUPPORTED_MASK
+        || header.reserved0 != 0
+        || header.reserved != [0; 3]
+        || header.paging_layout_version != DW_BOOT_X86_64_PAGING_HANDOFF_LAYOUT_VERSION
+        || header.temporary_virtual_address
+            != DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS
+        || header.pml4_index != DW_BOOT_X86_64_PAGING_HANDOFF_PML4_INDEX
+        || header.pdpt_index != DW_BOOT_X86_64_PAGING_HANDOFF_PDPT_INDEX
+        || header.pd_index != DW_BOOT_X86_64_PAGING_HANDOFF_PD_INDEX
+        || header.pt_index != DW_BOOT_X86_64_PAGING_HANDOFF_PT_INDEX
+    {
+        return Err(BootInfoValidationError::InvalidPagingHandoff);
+    }
+    if !(DW_BOOT_X86_64_PAGING_HANDOFF_MIN_PHYSICAL_ADDRESS_WIDTH
+        ..=DW_BOOT_X86_64_PAGING_HANDOFF_MAX_PHYSICAL_ADDRESS_WIDTH)
+        .contains(&header.physical_address_width)
+    {
+        return Err(BootInfoValidationError::InvalidPagingHandoff);
+    }
+    if header.table_frames_offset != DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAMES_OFFSET
+        || header.table_frame_stride != DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAME_STRIDE
+        || !(DW_BOOT_X86_64_PAGING_HANDOFF_MIN_TABLE_FRAME_COUNT
+            ..=DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT)
+            .contains(&header.table_frame_count)
+    {
+        return Err(BootInfoValidationError::InvalidPagingHandoff);
+    }
+    let exact_byte_len = header
+        .table_frame_count
+        .checked_mul(header.table_frame_stride)
+        .and_then(|list_len| header.table_frames_offset.checked_add(list_len))
+        .ok_or(BootInfoValidationError::ArithmeticOverflow)?;
+    if header.total_byte_len != exact_byte_len
+        || module.byte_len != u64::from(exact_byte_len)
+        || usize::try_from(exact_byte_len).ok() != Some(byte_len)
+    {
+        return Err(BootInfoValidationError::InvalidPagingHandoff);
+    }
+
+    let frame_count = usize::try_from(header.table_frame_count)
+        .map_err(|_| BootInfoValidationError::InvalidPagingHandoff)?;
+    let list_offset = usize::try_from(header.table_frames_offset)
+        .map_err(|_| BootInfoValidationError::InvalidPagingHandoff)?;
+    let mut table_frames = [0_u64; MAX_PAGING_HANDOFF_TABLE_FRAMES];
+    for (index, frame) in table_frames.iter_mut().take(frame_count).enumerate() {
+        let offset = index
+            .checked_mul(DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAME_STRIDE as usize)
+            .and_then(|offset| list_offset.checked_add(offset))
+            .ok_or(BootInfoValidationError::ArithmeticOverflow)?;
+        *frame = u64_at(bytes, offset)?;
+    }
+    let physical_limit = 1_u64
+        .checked_shl(header.physical_address_width)
+        .ok_or(BootInfoValidationError::InvalidPagingHandoff)?;
+    let frames = &table_frames[..frame_count];
+    if frames.windows(2).any(|pair| pair[0] >= pair[1])
+        || frames.iter().any(|frame| {
+            *frame == 0
+                || !frame.is_multiple_of(u64::from(DW_BOOT_BASE_PAGE_SIZE))
+                || *frame >= physical_limit
+        })
+    {
+        return Err(BootInfoValidationError::InvalidPagingHandoff);
+    }
+    let required_frames = [
+        header.cr3_root_physical,
+        header.temporary_pdpt_frame_physical,
+        header.temporary_pd_frame_physical,
+        header.temporary_pt_frame_physical,
+    ];
+    for (index, frame) in required_frames.iter().copied().enumerate() {
+        if frame == 0
+            || !frame.is_multiple_of(u64::from(DW_BOOT_BASE_PAGE_SIZE))
+            || frame >= physical_limit
+            || required_frames[..index].contains(&frame)
+            || !frames.contains(&frame)
+        {
+            return Err(BootInfoValidationError::InvalidPagingHandoff);
+        }
+    }
+
+    Ok(ValidatedPagingHandoff {
+        header,
+        table_frames,
+        table_frame_count: frame_count,
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the complete ABI-enumerated handoff set is explicit at this trust boundary"
+)]
+fn validate_paging_handoff_frame_roles(
+    paging: &ValidatedPagingHandoff,
+    boot_info: BootPhysicalRange,
+    memory_map: BootInfoTable,
+    modules: BootInfoTable,
+    module_entries: &[DwBootModuleV1],
+    command_line: Option<BootPhysicalRange>,
+    entropy: Option<BootPhysicalRange>,
+    framebuffer: Option<DwBootFramebufferV1>,
+    acpi_rsdp_physical_address: u64,
+) -> Result<(), BootInfoValidationError> {
+    let memory_map_range = table_physical_range(memory_map)?;
+    let module_table_range = table_physical_range(modules)?;
+    // The ABI carries only the RSDP start. Layout v2 permits a validated ACPI
+    // 2.0 declared length through one base page, which can intersect two
+    // physical pages when the 8-byte-aligned record begins near a page end.
+    // Excluding the full maximum extent is conservative and prevents a table
+    // frame from aliasing any possible retained RSDP tail.
+    let acpi_rsdp_maximum_range = if acpi_rsdp_physical_address == 0 {
+        None
+    } else {
+        Some(checked_range(
+            acpi_rsdp_physical_address,
+            u64::from(DW_BOOT_BASE_PAGE_SIZE),
+            8,
+        )?)
+    };
+    for index in 0..paging.table_frame_count {
+        let frame = paging.table_frames[index];
+        let frame_range = BootPhysicalRange {
+            physical_start: frame,
+            byte_len: u64::from(DW_BOOT_BASE_PAGE_SIZE),
+        };
+        if ranges_overlap(frame_range, boot_info)?
+            || ranges_overlap(frame_range, memory_map_range)?
+            || ranges_overlap(frame_range, module_table_range)?
+            || command_line.is_some_and(|range| ranges_overlap(frame_range, range).unwrap_or(true))
+            || entropy.is_some_and(|range| ranges_overlap(frame_range, range).unwrap_or(true))
+            || framebuffer.is_some_and(|value| {
+                ranges_overlap(
+                    frame_range,
+                    BootPhysicalRange {
+                        physical_start: value.physical_start,
+                        byte_len: value.byte_len,
+                    },
+                )
+                .unwrap_or(true)
+            })
+            || acpi_rsdp_maximum_range
+                .is_some_and(|range| ranges_overlap(frame_range, range).unwrap_or(true))
+        {
+            return Err(BootInfoValidationError::PagingHandoffFrameRoleOverlap);
+        }
+        for module in module_entries {
+            if ranges_overlap(frame_range, module_range(*module))? {
+                return Err(BootInfoValidationError::PagingHandoffFrameRoleOverlap);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn module_range(module: DwBootModuleV1) -> BootPhysicalRange {
+    BootPhysicalRange {
+        physical_start: module.physical_start,
+        byte_len: module.byte_len,
+    }
+}
+
+fn table_physical_range(
+    table: BootInfoTable,
+) -> Result<BootPhysicalRange, BootInfoValidationError> {
+    let byte_len = table
+        .entry_count
+        .checked_mul(u64::from(table.entry_size))
+        .ok_or(BootInfoValidationError::ArithmeticOverflow)?;
+    checked_range(table.physical_start, byte_len, 8)
 }
 
 fn parse_framebuffer(bytes: &[u8]) -> Result<DwBootFramebufferV1, BootInfoValidationError> {
@@ -742,6 +1043,18 @@ fn u32_at(bytes: &[u8], offset: usize) -> Result<u32, BootInfoValidationError> {
     Ok(u32::from_le_bytes(bytes))
 }
 
+fn u16_at(bytes: &[u8], offset: usize) -> Result<u16, BootInfoValidationError> {
+    let end = offset
+        .checked_add(2)
+        .ok_or(BootInfoValidationError::ArithmeticOverflow)?;
+    let bytes: [u8; 2] = bytes
+        .get(offset..end)
+        .ok_or(BootInfoValidationError::ReadFailure)?
+        .try_into()
+        .map_err(|_| BootInfoValidationError::ReadFailure)?;
+    Ok(u16::from_le_bytes(bytes))
+}
+
 fn u64_at(bytes: &[u8], offset: usize) -> Result<u64, BootInfoValidationError> {
     let end = offset
         .checked_add(8)
@@ -787,6 +1100,7 @@ fn u64_array_at<const N: usize>(
 mod tests {
     extern crate std;
 
+    use std::cell::Cell;
     use std::vec;
     use std::vec::Vec;
 
@@ -795,6 +1109,8 @@ mod tests {
     const BOOT_INFO: u64 = 0x1000;
     const MEMORY_MAP: u64 = 0x2000;
     const MODULES: u64 = 0x3000;
+    const PAGING_HANDOFF: u64 = 0x5000;
+    const PAGING_FRAMES: [u64; 4] = [0x60_0000, 0x61_0000, 0x62_0000, 0x63_0000];
 
     struct Fixture {
         base: u64,
@@ -822,6 +1138,24 @@ mod tests {
             let end = start.checked_add(destination.len()).ok_or(())?;
             destination.copy_from_slice(self.bytes.get(start..end).ok_or(())?);
             Ok(())
+        }
+    }
+
+    struct CountingReader {
+        fixture: Fixture,
+        paging_reads: Cell<usize>,
+    }
+
+    impl BootInfoByteReader for CountingReader {
+        fn read_exact(&self, physical_start: u64, destination: &mut [u8]) -> Result<(), ()> {
+            if physical_start == PAGING_HANDOFF {
+                let reads = self.paging_reads.get();
+                self.paging_reads.set(reads + 1);
+                if reads != 0 {
+                    return Err(());
+                }
+            }
+            self.fixture.read_exact(physical_start, destination)
         }
     }
 
@@ -854,6 +1188,47 @@ mod tests {
         bytes
     }
 
+    fn paging_handoff() -> [u8; 144] {
+        let mut bytes = [0_u8; 144];
+        put_u32(&mut bytes, 0, DW_BOOT_X86_64_PAGING_HANDOFF_V1_SIZE);
+        put_u32(&mut bytes, 4, DW_BOOT_X86_64_PAGING_HANDOFF_V1_VERSION);
+        put_u32(&mut bytes, 12, 52);
+        put_u64(&mut bytes, 16, PAGING_FRAMES[0]);
+        put_u32(
+            &mut bytes,
+            24,
+            DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAMES_OFFSET,
+        );
+        put_u32(
+            &mut bytes,
+            28,
+            DW_BOOT_X86_64_PAGING_HANDOFF_MIN_TABLE_FRAME_COUNT,
+        );
+        put_u32(
+            &mut bytes,
+            32,
+            DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAME_STRIDE,
+        );
+        put_u32(&mut bytes, 36, 144);
+        put_u32(&mut bytes, 40, DW_BOOT_X86_64_PAGING_HANDOFF_LAYOUT_VERSION);
+        put_u64(
+            &mut bytes,
+            48,
+            DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS,
+        );
+        bytes[56..58].copy_from_slice(&DW_BOOT_X86_64_PAGING_HANDOFF_PML4_INDEX.to_le_bytes());
+        bytes[58..60].copy_from_slice(&DW_BOOT_X86_64_PAGING_HANDOFF_PDPT_INDEX.to_le_bytes());
+        bytes[60..62].copy_from_slice(&DW_BOOT_X86_64_PAGING_HANDOFF_PD_INDEX.to_le_bytes());
+        bytes[62..64].copy_from_slice(&DW_BOOT_X86_64_PAGING_HANDOFF_PT_INDEX.to_le_bytes());
+        put_u64(&mut bytes, 64, PAGING_FRAMES[1]);
+        put_u64(&mut bytes, 72, PAGING_FRAMES[2]);
+        put_u64(&mut bytes, 80, PAGING_FRAMES[3]);
+        for (index, frame) in PAGING_FRAMES.iter().copied().enumerate() {
+            put_u64(&mut bytes, 112 + index * 8, frame);
+        }
+        bytes
+    }
+
     fn valid_fixture() -> Fixture {
         let mut fixture = Fixture::new();
         let mut header = [0_u8; DW_BOOT_INFO_V1_SIZE as usize];
@@ -863,7 +1238,7 @@ mod tests {
         put_u64(&mut header, 24, 1);
         put_u32(&mut header, 32, DW_BOOT_MEMORY_RANGE_V1_SIZE);
         put_u64(&mut header, 40, MODULES);
-        put_u64(&mut header, 48, 2);
+        put_u64(&mut header, 48, 3);
         put_u32(&mut header, 56, DW_BOOT_MODULE_V1_SIZE);
         fixture.bytes_at(BOOT_INFO, &header);
         fixture.bytes_at(MEMORY_MAP, &memory_range(0x10_0000, 16));
@@ -885,6 +1260,16 @@ mod tests {
                 0x2000,
             ),
         );
+        fixture.bytes_at(
+            MODULES + 2 * u64::from(DW_BOOT_MODULE_V1_SIZE),
+            &module(
+                DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1.0,
+                DW_BOOT_MODULE_FLAG_READ_ONLY.0,
+                PAGING_HANDOFF,
+                144,
+            ),
+        );
+        fixture.bytes_at(PAGING_HANDOFF, &paging_handoff());
         fixture
     }
 
@@ -894,7 +1279,7 @@ mod tests {
         let boot_info = validate_boot_info(&fixture, BOOT_INFO).expect("valid handoff");
 
         assert_eq!(boot_info.memory_map().entry_count(), 1);
-        assert_eq!(boot_info.modules().entry_count(), 2);
+        assert_eq!(boot_info.modules().entry_count(), 3);
         assert_eq!(boot_info.memory_range(0).unwrap().page_count, 16);
         assert_eq!(
             boot_info.module(1).unwrap().kind,
@@ -903,6 +1288,11 @@ mod tests {
         assert_eq!(
             boot_info.memory_range(1),
             Err(BootInfoValidationError::TableIndexOutOfBounds)
+        );
+        assert_eq!(boot_info.paging_handoff().table_frame_count(), 4);
+        assert_eq!(
+            boot_info.paging_handoff().table_frame(0).unwrap(),
+            PAGING_FRAMES[0]
         );
     }
 
@@ -926,9 +1316,14 @@ mod tests {
 
         fixture.bytes_at(MEMORY_MAP + 24, &1_u64.to_le_bytes());
         fixture.bytes_at(MODULES + 64 + 16, &0x40_0000_u64.to_le_bytes());
+        fixture.bytes_at(PAGING_HANDOFF + 112, &0_u64.to_le_bytes());
 
         assert_eq!(boot_info.memory_range(0).unwrap().page_count, 16);
         assert_eq!(boot_info.module(1).unwrap().physical_start, 0x30_0000);
+        assert_eq!(
+            boot_info.paging_handoff().table_frame(0).unwrap(),
+            PAGING_FRAMES[0]
+        );
     }
 
     #[test]
@@ -1017,6 +1412,162 @@ mod tests {
         assert_eq!(
             validate_boot_info(&fixture, BOOT_INFO),
             Err(BootInfoValidationError::OverlappingModules)
+        );
+    }
+
+    #[test]
+    fn paging_handoff_is_required_exactly_once_and_read_as_one_snapshot() {
+        let mut missing = valid_fixture();
+        missing.bytes_at(BOOT_INFO + 48, &2_u64.to_le_bytes());
+        assert_eq!(
+            validate_boot_info(&missing, BOOT_INFO),
+            Err(BootInfoValidationError::MissingRequiredModule)
+        );
+
+        let mut duplicate = valid_fixture();
+        duplicate.bytes_at(BOOT_INFO + 48, &4_u64.to_le_bytes());
+        duplicate.bytes_at(
+            MODULES + 3 * u64::from(DW_BOOT_MODULE_V1_SIZE),
+            &module(
+                DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1.0,
+                DW_BOOT_MODULE_FLAG_READ_ONLY.0,
+                0x70_0000,
+                144,
+            ),
+        );
+        assert_eq!(
+            validate_boot_info(&duplicate, BOOT_INFO),
+            Err(BootInfoValidationError::DuplicateRequiredModule)
+        );
+
+        let mut mutable = valid_fixture();
+        mutable.bytes_at(MODULES + 2 * 64 + 12, &0_u32.to_le_bytes());
+        assert_eq!(
+            validate_boot_info(&mutable, BOOT_INFO),
+            Err(BootInfoValidationError::InvalidModuleFlags)
+        );
+
+        let reader = CountingReader {
+            fixture: valid_fixture(),
+            paging_reads: Cell::new(0),
+        };
+        let info = validate_boot_info(&reader, BOOT_INFO).expect("valid one-snapshot carrier");
+        assert_eq!(reader.paging_reads.get(), 1);
+        assert_eq!(info.paging_handoff().table_frame_count(), 4);
+    }
+
+    #[test]
+    fn paging_handoff_rejects_malformed_header_extent_and_frame_list_bytes() {
+        for (offset, bytes) in [
+            (0, 0_u32.to_le_bytes()),
+            (4, 0_u32.to_le_bytes()),
+            (8, 1_u32.to_le_bytes()),
+            (12, 53_u32.to_le_bytes()),
+            (24, 120_u32.to_le_bytes()),
+            (28, 3_u32.to_le_bytes()),
+            (32, 16_u32.to_le_bytes()),
+            (36, 143_u32.to_le_bytes()),
+            (40, 1_u32.to_le_bytes()),
+            (44, 1_u32.to_le_bytes()),
+        ] {
+            let mut fixture = valid_fixture();
+            fixture.bytes_at(PAGING_HANDOFF + offset, &bytes);
+            assert_eq!(
+                validate_boot_info(&fixture, BOOT_INFO),
+                Err(BootInfoValidationError::InvalidPagingHandoff),
+                "accepted malformed carrier field at offset {offset}"
+            );
+        }
+
+        for (offset, value) in [
+            (16, 0),
+            (48, 0),
+            (64, PAGING_FRAMES[0]),
+            (88, 1),
+            (112, 0),
+            (120, PAGING_FRAMES[0]),
+        ] {
+            let mut fixture = valid_fixture();
+            fixture.bytes_at(PAGING_HANDOFF + offset, &value.to_le_bytes());
+            assert_eq!(
+                validate_boot_info(&fixture, BOOT_INFO),
+                Err(BootInfoValidationError::InvalidPagingHandoff),
+                "accepted malformed carrier word at offset {offset}"
+            );
+        }
+
+        let mut wrong_index = valid_fixture();
+        wrong_index.bytes_at(PAGING_HANDOFF + 56, &511_u16.to_le_bytes());
+        assert_eq!(
+            validate_boot_info(&wrong_index, BOOT_INFO),
+            Err(BootInfoValidationError::InvalidPagingHandoff)
+        );
+
+        let mut wrong_module_extent = valid_fixture();
+        wrong_module_extent.bytes_at(MODULES + 2 * 64 + 24, &143_u64.to_le_bytes());
+        assert_eq!(
+            validate_boot_info(&wrong_module_extent, BOOT_INFO),
+            Err(BootInfoValidationError::InvalidPagingHandoff)
+        );
+
+        for (offset, bytes, expected) in [
+            (
+                0,
+                u64::from(DW_BOOT_MODULE_V1_VERSION)
+                    .wrapping_shl(32)
+                    .to_le_bytes(),
+                BootInfoValidationError::StructureTooSmall,
+            ),
+            (
+                4,
+                0_u64.to_le_bytes(),
+                BootInfoValidationError::UnsupportedVersion,
+            ),
+            (
+                32,
+                1_u64.to_le_bytes(),
+                BootInfoValidationError::NonZeroReserved,
+            ),
+        ] {
+            let mut fixture = valid_fixture();
+            fixture.bytes_at(MODULES + 2 * 64 + offset, &bytes);
+            assert_eq!(validate_boot_info(&fixture, BOOT_INFO), Err(expected));
+        }
+
+        let mut unaligned_module = valid_fixture();
+        unaligned_module.bytes_at(MODULES + 2 * 64 + 16, &(PAGING_HANDOFF + 8).to_le_bytes());
+        assert_eq!(
+            validate_boot_info(&unaligned_module, BOOT_INFO),
+            Err(BootInfoValidationError::UnalignedAddress)
+        );
+
+        let mut overflowing_module = valid_fixture();
+        overflowing_module.bytes_at(MODULES + 2 * 64 + 16, &(u64::MAX - 4095).to_le_bytes());
+        overflowing_module.bytes_at(MODULES + 2 * 64 + 24, &8192_u64.to_le_bytes());
+        assert_eq!(
+            validate_boot_info(&overflowing_module, BOOT_INFO),
+            Err(BootInfoValidationError::ArithmeticOverflow)
+        );
+    }
+
+    #[test]
+    fn paging_table_frames_cannot_alias_any_enumerated_handoff_storage() {
+        for conflicting_frame in [PAGING_HANDOFF, 0x20_0000, BOOT_INFO, MEMORY_MAP, MODULES] {
+            let mut fixture = valid_fixture();
+            fixture.bytes_at(PAGING_HANDOFF + 16, &conflicting_frame.to_le_bytes());
+            fixture.bytes_at(PAGING_HANDOFF + 112, &conflicting_frame.to_le_bytes());
+            assert_eq!(
+                validate_boot_info(&fixture, BOOT_INFO),
+                Err(BootInfoValidationError::PagingHandoffFrameRoleOverlap),
+                "accepted table/data role alias at {conflicting_frame:#x}"
+            );
+        }
+
+        let mut rsdp_tail_alias = valid_fixture();
+        rsdp_tail_alias.bytes_at(BOOT_INFO + 64, &(PAGING_FRAMES[0] - 8).to_le_bytes());
+        assert_eq!(
+            validate_boot_info(&rsdp_tail_alias, BOOT_INFO),
+            Err(BootInfoValidationError::PagingHandoffFrameRoleOverlap)
         );
     }
 

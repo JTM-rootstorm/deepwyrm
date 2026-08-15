@@ -19,6 +19,96 @@ value = 1
 doc = "Required version value for DwBootModuleV1 records."
 
 [[constant]]
+name = "DW_BOOT_X86_64_PAGING_HANDOFF_V1_VERSION"
+type = "u32"
+value = 1
+doc = "Required version value for DwBootX86_64PagingHandoffV1."
+
+[[constant]]
+name = "DW_BOOT_X86_64_PAGING_HANDOFF_FLAGS_SUPPORTED_MASK"
+type = "DwBootX86_64PagingHandoffFlags"
+value = 0
+doc = "DwBootX86_64PagingHandoffV1 supports no nonzero flags."
+
+[[constant]]
+name = "DW_BOOT_X86_64_PAGING_HANDOFF_LAYOUT_VERSION"
+type = "u32"
+value = 2
+doc = "Deepwyrm x86_64 paging-layout contract version bound by the V1 carrier."
+
+[[constant]]
+name = "DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS"
+type = "u64"
+value = 0xffffff0000000000
+doc = "Layout-v2 temporary virtual address whose four-level path the handoff identifies."
+
+[[constant]]
+name = "DW_BOOT_X86_64_PAGING_HANDOFF_PML4_INDEX"
+type = "u16"
+value = 510
+doc = "PML4 index derived from the layout-v2 temporary virtual address."
+
+[[constant]]
+name = "DW_BOOT_X86_64_PAGING_HANDOFF_PDPT_INDEX"
+type = "u16"
+value = 0
+doc = "PDPT index derived from the layout-v2 temporary virtual address."
+
+[[constant]]
+name = "DW_BOOT_X86_64_PAGING_HANDOFF_PD_INDEX"
+type = "u16"
+value = 0
+doc = "Page-directory index derived from the layout-v2 temporary virtual address."
+
+[[constant]]
+name = "DW_BOOT_X86_64_PAGING_HANDOFF_PT_INDEX"
+type = "u16"
+value = 0
+doc = "Page-table index derived from the layout-v2 temporary virtual address."
+
+[[constant]]
+name = "DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAMES_OFFSET"
+type = "u32"
+value = 112
+doc = "Required module-relative byte offset of the flat table-frame list."
+
+[[constant]]
+name = "DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAME_STRIDE"
+type = "u32"
+value = 8
+doc = "Required byte stride of each u64 table-frame physical address."
+
+[[constant]]
+name = "DW_BOOT_X86_64_PAGING_HANDOFF_MIN_TABLE_FRAME_COUNT"
+type = "u32"
+value = 4
+doc = "Minimum list count covering the distinct CR3 root and three-child temporary path."
+
+[[constant]]
+name = "DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT"
+type = "u32"
+value = 256
+doc = "Maximum number of transition page-table frames accepted in the V1 carrier."
+
+[[constant]]
+name = "DW_BOOT_X86_64_PAGING_HANDOFF_MAX_BYTE_LEN"
+type = "u32"
+value = 2160
+doc = "Maximum exact V1 carrier extent: 112-byte header plus 256 u64 frame addresses."
+
+[[constant]]
+name = "DW_BOOT_X86_64_PAGING_HANDOFF_MIN_PHYSICAL_ADDRESS_WIDTH"
+type = "u32"
+value = 12
+doc = "Minimum valid x86_64 physical-address width encoded by the V1 carrier."
+
+[[constant]]
+name = "DW_BOOT_X86_64_PAGING_HANDOFF_MAX_PHYSICAL_ADDRESS_WIDTH"
+type = "u32"
+value = 52
+doc = "Maximum valid x86_64 page-table physical-address width encoded by the V1 carrier."
+
+[[constant]]
 name = "DW_BOOT_FRAMEBUFFER_V1_VERSION"
 type = "u32"
 value = 1
@@ -95,6 +185,11 @@ doc = "Primordial fully-static Wyrmroot bootstrap ELF."
 name = "WYRMROOT_BOOTFS"
 value = 2
 doc = "Read-only Wyrmroot bootfs image."
+
+[[module_kind]]
+name = "DEEPWYRM_X86_64_PAGING_HANDOFF_V1"
+value = 3
+doc = "Exactly one READ_ONLY kernel-internal DwBootX86_64PagingHandoffV1 carrier; it must never be transferred to userspace."
 
 [[module_flag]]
 name = "READ_ONLY"
@@ -173,6 +268,30 @@ field3 = "flags|DwBootModuleFlags|Supported module properties."
 field4 = "physical_start|u64|Physical start address of module bytes."
 field5 = "byte_len|u64|Exact module byte length."
 field6 = "reserved|[u64;4]|Reserved; all elements must be zero."
+
+[[record]]
+name = "DwBootX86_64PagingHandoffV1"
+doc = "Fixed header for the sole READ_ONLY kernel-internal x86_64 transition-page-table carrier. The containing module's physical_start is 4096-byte aligned, begins with this header, and is followed at table_frames_offset by a flat u64 list. The list is strictly ascending and unique, contains the distinct CR3 root and three temporary-path child frames, and enumerates every current transition page-table frame exactly once with no data frames. Every physical address is nonzero, 4096-byte aligned, has no bits outside physical_address_width, and remains reserved until Deepwyrm replaces CR3. The containing module's byte_len, total_byte_len, and table_frames_offset plus table_frame_count times table_frame_stride must be exactly equal."
+field0 = "size|u32|Fixed header byte size; must equal DW_BOOT_X86_64_PAGING_HANDOFF_V1_SIZE."
+field1 = "version|u32|Structure version; must equal DW_BOOT_X86_64_PAGING_HANDOFF_V1_VERSION."
+field2 = "flags|DwBootX86_64PagingHandoffFlags|Must contain only supported bits; V1 requires zero."
+field3 = "physical_address_width|u32|MAXPHYADDR width in bits; must be within the V1 bounds and cover every encoded physical address."
+field4 = "cr3_root_physical|u64|Exact current CR3 root-frame physical address with its low 12 bits zero."
+field5 = "table_frames_offset|u32|Module-relative list offset; must equal the V1 table-frames-offset constant."
+field6 = "table_frame_count|u32|Strictly bounded flat-list count from the V1 minimum through maximum inclusive."
+field7 = "table_frame_stride|u32|List element byte stride; must equal the V1 u64 stride constant."
+field8 = "total_byte_len|u32|Exact complete carrier extent, including the header and flat list."
+field9 = "paging_layout_version|u32|Must equal the accepted Deepwyrm x86_64 paging-layout version."
+field10 = "reserved0|u32|Reserved; producer sets zero and consumer rejects nonzero."
+field11 = "temporary_virtual_address|u64|Must equal the layout-v2 temporary virtual-address constant."
+field12 = "pml4_index|u16|Must equal the PML4 index derived from temporary_virtual_address."
+field13 = "pdpt_index|u16|Must equal the PDPT index derived from temporary_virtual_address."
+field14 = "pd_index|u16|Must equal the page-directory index derived from temporary_virtual_address."
+field15 = "pt_index|u16|Must equal the page-table index derived from temporary_virtual_address."
+field16 = "temporary_pdpt_frame_physical|u64|Distinct PML4 child frame selected by pml4_index; low 12 bits must be zero."
+field17 = "temporary_pd_frame_physical|u64|Distinct PDPT child frame selected by pdpt_index; low 12 bits must be zero."
+field18 = "temporary_pt_frame_physical|u64|Distinct page-directory child frame selected by pd_index; low 12 bits must be zero."
+field19 = "reserved|[u64;3]|Reserved; all elements must be zero."
 
 [[record]]
 name = "DwBootFramebufferV1"

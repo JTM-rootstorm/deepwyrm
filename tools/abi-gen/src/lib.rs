@@ -1161,8 +1161,11 @@ fn require_snake_name(name: &str, table: &Table) -> Result<()> {
 }
 
 fn require_camel_type(name: &str, table: &Table) -> Result<()> {
+    let architecture_token_count = name.matches("X86_64").count();
+    let normalized = name.replace("X86_64", "X8664");
     if !name.starts_with("Dw")
-        || !name
+        || architecture_token_count > 1
+        || !normalized
             .chars()
             .all(|character| character.is_ascii_alphanumeric())
     {
@@ -2045,6 +2048,10 @@ mod tests {
             "DW_BOOT_BASE_PAGE_SIZE",
             "DW_BOOT_MEMORY_RANGE_V1_VERSION",
             "DW_BOOT_MODULE_V1_VERSION",
+            "DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1",
+            "DW_BOOT_X86_64_PAGING_HANDOFF_V1_VERSION",
+            "DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS",
+            "DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT",
             "DW_BOOT_FRAMEBUFFER_V1_VERSION",
             "DW_BOOT_ENTROPY_V1_VERSION",
             "DW_BOOT_INFO_V1_VERSION",
@@ -2095,6 +2102,19 @@ mod tests {
             format!("{text}\n[[unknown]]\nname = \"X\"\n")
         });
         assert!(load_error(&section_root).contains("unsupported section `[[unknown]]`"));
+    }
+
+    #[test]
+    fn type_names_allow_only_the_canonical_x86_64_architecture_token() {
+        let root = TempRoot::copy_schema();
+        root.rewrite("abi.toml", |text| {
+            text.replacen(
+                "name = \"DwBootX86_64PagingHandoffFlags\"",
+                "name = \"DwBootBad_Type\"",
+                1,
+            )
+        });
+        assert!(load_error(&root).contains("`DwBootBad_Type` is not a Deepwyrm ABI type name"));
     }
 
     #[test]
@@ -2205,7 +2225,7 @@ mod tests {
         let probe = root.path().join("abi/generated/header_probe.c");
         fs::write(
             &probe,
-            "#include \"deepwyrm_abi.h\"\n_Static_assert(DW_STATUS_BAD_ADDRESS == -16, \"status parity\");\n_Static_assert(DW_RIGHT_MODIFY == 512, \"rights parity\");\n_Static_assert(DW_OBJECT_TYPE_TIMER == 8, \"object parity\");\n_Static_assert(DW_SYSCALL_TIMER_CANCEL == 0x00050012, \"syscall parity\");\n_Static_assert(DW_DEADLINE_INFINITE == UINT64_MAX, \"deadline parity\");\n_Static_assert(DW_BOOT_BASE_PAGE_SIZE == UINT32_C(4096), \"boot page parity\");\n_Static_assert(DW_BOOT_INFO_V1_VERSION == UINT32_C(1), \"boot version parity\");\nint main(void) {\n    DwDeadline deadline = DW_DEADLINE_INFINITE;\n    uint32_t payload = DW_CHANNEL_MAX_PAYLOAD;\n    DwStatus status = DW_STATUS_SUCCESS;\n    return (deadline == 0 || payload == 0 || status != 0);\n}\n",
+            "#include \"deepwyrm_abi.h\"\n_Static_assert(DW_STATUS_BAD_ADDRESS == -16, \"status parity\");\n_Static_assert(DW_RIGHT_MODIFY == 512, \"rights parity\");\n_Static_assert(DW_OBJECT_TYPE_TIMER == 8, \"object parity\");\n_Static_assert(DW_SYSCALL_TIMER_CANCEL == 0x00050012, \"syscall parity\");\n_Static_assert(DW_DEADLINE_INFINITE == UINT64_MAX, \"deadline parity\");\n_Static_assert(DW_BOOT_BASE_PAGE_SIZE == UINT32_C(4096), \"boot page parity\");\n_Static_assert(DW_BOOT_INFO_V1_VERSION == UINT32_C(1), \"boot version parity\");\n_Static_assert(DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1 == 3, \"paging module kind parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_V1_SIZE == UINT32_C(112), \"paging header size parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS == UINT64_C(0xffffff0000000000), \"paging temporary address parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_PML4_INDEX == UINT16_C(510), \"paging PML4 parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_MIN_TABLE_FRAME_COUNT == UINT32_C(4), \"paging minimum frames parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT == UINT32_C(256), \"paging maximum frames parity\");\nint main(void) {\n    DwDeadline deadline = DW_DEADLINE_INFINITE;\n    uint32_t payload = DW_CHANNEL_MAX_PAYLOAD;\n    DwStatus status = DW_STATUS_SUCCESS;\n    return (deadline == 0 || payload == 0 || status != 0);\n}\n",
         )
         .unwrap();
         let output = Command::new("clang")

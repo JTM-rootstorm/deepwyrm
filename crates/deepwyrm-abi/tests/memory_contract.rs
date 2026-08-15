@@ -75,7 +75,7 @@ fn logical_size_and_page_rounded_mapping_capacity_remain_distinct() {
         .expect("test logical size must round without overflow");
 
     assert_eq!(mapping_capacity, page_size * 2);
-    assert!(logical_size + 1 <= mapping_capacity);
+    assert!(logical_size < mapping_capacity);
     assert_eq!(mapping_capacity + page_size, page_size * 3);
 
     let generated_artifacts = [

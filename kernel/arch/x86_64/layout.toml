@@ -1,5 +1,5 @@
 schema = "deepwyrm-x86_64-layout"
-version = 1
+version = 2
 entry_contract = "DW_BOOT_X86_64_ENTRY_V1"
 elf_type = "ET_EXEC"
 entry_symbol = "_dw_kernel_entry"
@@ -53,7 +53,7 @@ physical_allocation = "arbitrary-suitable-firmware-pages"
 boot_info = "identity-mapped"
 referenced_ranges = "identity-mapped"
 lifetime = "until-kernel-page-table-replacement"
-mutable = false
+referenced_ranges_mutable = false
 page_zero_mapped = false
 framebuffer_pixels_identity_mapped = false
 
@@ -72,3 +72,30 @@ acpi_rsdp_max_intersecting_pages = 2
 acpi_mapping_overlap = "coalesce"
 acpi_table_traversal = "deferred-dw0-c"
 acpi_memory_types_identity_mapped = false
+
+[transition_tables]
+contract = "DW_BOOT_X86_64_PAGING_HANDOFF_V1"
+layout_version = 2
+temporary_virtual_address = "0xffffff0000000000"
+temporary_page_count = 1
+pml4_index = 510
+pdpt_index = 0
+pd_index = 0
+pt_index = 0
+minimum_table_frame_count = 4
+maximum_table_frame_count = 256
+initial_leaf = "exactly-zero-non-present"
+temporary_leaf_permissions = "supervisor-rw-nx-base-page"
+identity_alias_permissions = "supervisor-rw-nx-base-page"
+identity_alias_mutable_by_deepwyrm = true
+cache_selection_bits = 0
+pat_entry_zero = "observed-write-back"
+mtrr_policy = "alias-consistent-no-effective-write-back-claim"
+pcide_enabled = false
+pge_enabled = false
+cr3_low_bits_zero = true
+ownership_transfer = "loader-to-deepwyrm-after-exit-boot-services"
+lifetime = "until-deepwyrm-cr3-switch"
+concurrency = "bsp-aps-off-if-clear-nonreentrant"
+physical_role_policy = "exclusive-table-frames-no-kernel-module-data-alias"
+new_root_table_access = "deepwyrm-owned-before-cr3-switch"

@@ -122,6 +122,11 @@ base = "u32"
 doc = "Properties of a loaded boot module."
 
 [[newtype]]
+name = "DwBootX86_64PagingHandoffFlags"
+base = "u32"
+doc = "Flags for the kernel-internal x86_64 paging-handoff carrier; ABI V1 supports no nonzero bits."
+
+[[newtype]]
 name = "DwBootFramebufferFlags"
 base = "u32"
 doc = "Properties of a framebuffer descriptor."
