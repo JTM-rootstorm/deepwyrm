@@ -1,0 +1,126 @@
+schema_version = 1
+abi_name = "Deepwyrm"
+abi_version = 0
+byte_order = "little"
+pointer_width = 64
+syscall_instruction = "SYSCALL"
+syscall_number_register = "RAX"
+syscall_argument_registers = "RDI,RSI,RDX,R10,R8,R9"
+syscall_result_register = "RAX"
+syscall_clobbers = "RCX,R11"
+syscall_result_rule = "DwStatus sign-extended to 64 bits"
+
+[[newtype]]
+name = "DwStatus"
+base = "i32"
+doc = "Signed native status value; zero is success and negative values are failures."
+
+[[newtype]]
+name = "DwHandle"
+base = "u64"
+doc = "Opaque process-local handle value; only zero has an ABI-visible meaning."
+
+[[newtype]]
+name = "DwRights"
+base = "u64"
+doc = "Bitset of authority held through a handle."
+
+[[newtype]]
+name = "DwObjectType"
+base = "u32"
+doc = "Open numeric namespace identifying a kernel object type."
+
+[[newtype]]
+name = "DwSignals"
+base = "u64"
+doc = "Bitset of observable wait signals."
+
+[[newtype]]
+name = "DwUserAddress"
+base = "u64"
+doc = "Untrusted userspace virtual address transported as a fixed-width scalar."
+
+[[newtype]]
+name = "DwDeadline"
+base = "u64"
+doc = "Absolute monotonic deadline in nanoseconds."
+
+[[newtype]]
+name = "DwHandleTransferOperation"
+base = "u32"
+doc = "Open numeric namespace for channel handle-transfer behavior."
+
+[[newtype]]
+name = "DwSyscallId"
+base = "u32"
+doc = "Explicit native syscall identifier; zero is invalid."
+
+[[newtype]]
+name = "DwSize"
+base = "u64"
+doc = "Fixed-width byte size transported through the native ABI."
+
+[[newtype]]
+name = "DwOffset"
+base = "u64"
+doc = "Fixed-width byte offset transported through the native ABI."
+
+[[newtype]]
+name = "DwClockId"
+base = "u32"
+doc = "Explicit native clock-domain identifier."
+
+[[newtype]]
+name = "DwTaskState"
+base = "u32"
+doc = "Open numeric namespace for task lifecycle state."
+
+[[newtype]]
+name = "DwTerminationReason"
+base = "u32"
+doc = "Structured task termination reason."
+
+[[newtype]]
+name = "DwExceptionType"
+base = "u32"
+doc = "Structured exception classification; delivery is deferred beyond DW0-A."
+
+[[newtype]]
+name = "DwBootInfoFlags"
+base = "u64"
+doc = "Presence and feature flags for DwBootInfoV1."
+
+[[newtype]]
+name = "DwBootMemoryKind"
+base = "u32"
+doc = "Deepwyrm-owned normalized physical memory classification."
+
+[[newtype]]
+name = "DwBootModuleKind"
+base = "u32"
+doc = "Open numeric namespace identifying a loaded boot module."
+
+[[newtype]]
+name = "DwBootModuleFlags"
+base = "u32"
+doc = "Properties of a loaded boot module."
+
+[[newtype]]
+name = "DwBootFramebufferFlags"
+base = "u32"
+doc = "Properties of a framebuffer descriptor."
+
+[[newtype]]
+name = "DwBootPixelFormat"
+base = "u32"
+doc = "Open numeric namespace for framebuffer pixel layout."
+
+[[newtype]]
+name = "DwBootEntropySource"
+base = "u32"
+doc = "Open numeric namespace identifying firmware entropy provenance."
+
+[[newtype]]
+name = "DwBootEntropyFlags"
+base = "u32"
+doc = "Properties of a firmware entropy descriptor."

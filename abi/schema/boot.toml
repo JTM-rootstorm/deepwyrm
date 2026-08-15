@@ -1,0 +1,191 @@
+schema_version = 1
+
+[[boot_info_flag]]
+name = "FRAMEBUFFER_PRESENT"
+value = 0x0000000000000001
+doc = "The embedded framebuffer descriptor is present and must validate."
+
+[[memory_kind]]
+name = "UNSPECIFIED"
+value = 0
+doc = "Invalid or unspecified classification."
+
+[[memory_kind]]
+name = "USABLE"
+value = 1
+doc = "Physical memory available for Deepwyrm after protected ranges are excluded."
+
+[[memory_kind]]
+name = "RESERVED"
+value = 2
+doc = "Reserved memory that must not be allocated."
+
+[[memory_kind]]
+name = "ACPI_RECLAIM"
+value = 3
+doc = "ACPI reclaimable memory; reclaim policy belongs to the kernel."
+
+[[memory_kind]]
+name = "ACPI_NVS"
+value = 4
+doc = "ACPI nonvolatile storage that must be preserved."
+
+[[memory_kind]]
+name = "MMIO"
+value = 5
+doc = "Memory-mapped I/O or firmware-described device address space."
+
+[[memory_kind]]
+name = "RUNTIME_SERVICES"
+value = 6
+doc = "Firmware runtime-service memory; Deepwyrm does not call it in DW0 but preserves it."
+
+[[memory_kind]]
+name = "UNUSABLE"
+value = 7
+doc = "Memory reported as unusable or failed."
+
+[[module_kind]]
+name = "UNSPECIFIED"
+value = 0
+doc = "Invalid or unspecified module kind."
+
+[[module_kind]]
+name = "WYRMROOT_BOOTSTRAP"
+value = 1
+doc = "Primordial fully-static Wyrmroot bootstrap ELF."
+
+[[module_kind]]
+name = "WYRMROOT_BOOTFS"
+value = 2
+doc = "Read-only Wyrmroot bootfs image."
+
+[[module_flag]]
+name = "READ_ONLY"
+value = 0x00000001
+doc = "The module must only be exposed to userspace with read-only authority."
+
+[[pixel_format]]
+name = "UNSPECIFIED"
+value = 0
+doc = "Invalid or unspecified pixel format."
+
+[[pixel_format]]
+name = "RGBX8"
+value = 1
+doc = "Eight-bit red, green, blue, and reserved channels in byte order."
+
+[[pixel_format]]
+name = "BGRX8"
+value = 2
+doc = "Eight-bit blue, green, red, and reserved channels in byte order."
+
+[[pixel_format]]
+name = "BITMASK"
+value = 3
+doc = "Channel layout is described by the four mask fields."
+
+[[framebuffer_flag]]
+name = "LINEAR"
+value = 0x00000001
+doc = "The framebuffer is a directly addressable linear pixel buffer."
+
+[[entropy_source]]
+name = "UNSPECIFIED"
+value = 0
+doc = "Invalid or unspecified entropy provenance."
+
+[[entropy_source]]
+name = "UEFI_RNG_PROTOCOL"
+value = 1
+doc = "Bytes obtained from the UEFI RNG protocol."
+
+[[entropy_source]]
+name = "FIRMWARE_PLATFORM"
+value = 2
+doc = "Bytes obtained from another documented firmware/platform facility."
+
+[[entropy_source]]
+name = "MIXED_FIRMWARE"
+value = 3
+doc = "Bytes combined from multiple firmware sources by the loader."
+
+[[entropy_flag]]
+name = "CONDITIONED"
+value = 0x00000001
+doc = "The provider reports that the bytes are conditioned entropy output."
+
+[[record]]
+name = "DwBootMemoryRangeV1"
+doc = "One normalized physical memory-map entry."
+field0 = "size|u32|Byte size of this entry, including any compatible trailing extension."
+field1 = "version|u32|Structure version; set to one."
+field2 = "kind|DwBootMemoryKind|Normalized memory classification."
+field3 = "reserved0|u32|Reserved; producer sets zero and consumer rejects nonzero."
+field4 = "physical_start|u64|Physical start address."
+field5 = "page_count|u64|Number of 4096-byte pages."
+field6 = "firmware_attributes|u64|Raw UEFI memory attributes preserved as opaque bits."
+field7 = "reserved|[u64;3]|Reserved; all elements must be zero."
+
+[[record]]
+name = "DwBootModuleV1"
+doc = "One loaded boot module supplied by the Wyrmroot EFI loader."
+field0 = "size|u32|Byte size of this entry, including any compatible trailing extension."
+field1 = "version|u32|Structure version; set to one."
+field2 = "kind|DwBootModuleKind|Module semantic kind."
+field3 = "flags|DwBootModuleFlags|Supported module properties."
+field4 = "physical_start|u64|Physical start address of module bytes."
+field5 = "byte_len|u64|Exact module byte length."
+field6 = "reserved|[u64;4]|Reserved; all elements must be zero."
+
+[[record]]
+name = "DwBootFramebufferV1"
+doc = "Optional linear framebuffer description embedded in DwBootInfoV1."
+field0 = "size|u32|Byte size of this descriptor."
+field1 = "version|u32|Structure version; set to one."
+field2 = "flags|DwBootFramebufferFlags|Supported framebuffer properties."
+field3 = "pixel_format|DwBootPixelFormat|Pixel byte/mask layout."
+field4 = "physical_start|u64|Physical framebuffer base."
+field5 = "byte_len|u64|Mapped framebuffer byte length."
+field6 = "width|u32|Visible width in pixels."
+field7 = "height|u32|Visible height in pixels."
+field8 = "pixels_per_scanline|u32|Pixel stride between scanlines."
+field9 = "reserved0|u32|Reserved; must be zero."
+field10 = "red_mask|u32|Red channel bit mask for BITMASK format, otherwise zero."
+field11 = "green_mask|u32|Green channel bit mask for BITMASK format, otherwise zero."
+field12 = "blue_mask|u32|Blue channel bit mask for BITMASK format, otherwise zero."
+field13 = "reserved_mask|u32|Reserved channel bit mask for BITMASK format, otherwise zero."
+field14 = "reserved|[u64;4]|Reserved; all elements must be zero."
+
+[[record]]
+name = "DwBootEntropyV1"
+doc = "Optional firmware entropy bytes embedded in DwBootInfoV1."
+field0 = "size|u32|Byte size of this descriptor."
+field1 = "version|u32|Structure version; set to one."
+field2 = "source|DwBootEntropySource|Entropy provenance."
+field3 = "flags|DwBootEntropyFlags|Supported entropy properties."
+field4 = "physical_start|u64|Physical start address of entropy bytes."
+field5 = "byte_len|u64|Number of entropy bytes."
+field6 = "reserved|[u64;4]|Reserved; all elements must be zero."
+
+[[record]]
+name = "DwBootInfoV1"
+doc = "Physical loader-to-kernel handoff produced only after ExitBootServices succeeds."
+field0 = "size|u32|Byte size of this structure, including compatible trailing extensions."
+field1 = "version|u32|Structure version; set to one."
+field2 = "flags|DwBootInfoFlags|Presence and feature flags."
+field3 = "memory_map_physical_start|u64|Physical address of the memory-entry table."
+field4 = "memory_map_entry_count|u64|Number of memory entries."
+field5 = "memory_map_entry_size|u32|Byte stride of each memory entry."
+field6 = "reserved0|u32|Reserved; must be zero."
+field7 = "modules_physical_start|u64|Physical address of the module-entry table."
+field8 = "module_count|u64|Number of module entries."
+field9 = "module_entry_size|u32|Byte stride of each module entry."
+field10 = "reserved1|u32|Reserved; must be zero."
+field11 = "acpi_rsdp_physical_address|u64|Physical RSDP address, or zero when absent."
+field12 = "framebuffer|DwBootFramebufferV1|Optional framebuffer descriptor controlled by flags."
+field13 = "command_line_physical_start|u64|Physical address of opaque command-line bytes."
+field14 = "command_line_byte_len|u64|Number of command-line bytes; no implicit terminator."
+field15 = "entropy|DwBootEntropyV1|Optional firmware entropy descriptor; all-zero means absent."
+field16 = "reserved|[u64;8]|Reserved; all elements must be zero."
+

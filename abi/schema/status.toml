@@ -1,0 +1,87 @@
+schema_version = 1
+
+[[status]]
+name = "SUCCESS"
+value = 0
+doc = "The operation completed successfully."
+
+[[status]]
+name = "INVALID_ARGUMENT"
+value = -1
+doc = "An argument, flag, size, version, or reserved field is invalid."
+
+[[status]]
+name = "BAD_HANDLE"
+value = -2
+doc = "A handle value is invalid or stale in the calling process."
+
+[[status]]
+name = "WRONG_OBJECT_TYPE"
+value = -3
+doc = "A handle refers to an object type not accepted by the operation."
+
+[[status]]
+name = "ACCESS_DENIED"
+value = -4
+doc = "The caller lacks the required handle rights or authority."
+
+[[status]]
+name = "BAD_STATE"
+value = -5
+doc = "The target object is not in a state that permits the operation."
+
+[[status]]
+name = "NOT_FOUND"
+value = -6
+doc = "The requested object or entry does not exist."
+
+[[status]]
+name = "ALREADY_EXISTS"
+value = -7
+doc = "The requested object or entry already exists."
+
+[[status]]
+name = "WOULD_BLOCK"
+value = -8
+doc = "The operation cannot complete without blocking."
+
+[[status]]
+name = "TIMED_OUT"
+value = -9
+doc = "The absolute deadline elapsed before completion."
+
+[[status]]
+name = "INTERRUPTED"
+value = -10
+doc = "The operation was interrupted before completion."
+
+[[status]]
+name = "PEER_CLOSED"
+value = -11
+doc = "The peer endpoint has closed."
+
+[[status]]
+name = "NO_MEMORY"
+value = -12
+doc = "Required memory could not be allocated."
+
+[[status]]
+name = "NO_RESOURCES"
+value = -13
+doc = "A bounded kernel resource is exhausted."
+
+[[status]]
+name = "NOT_SUPPORTED"
+value = -14
+doc = "The requested operation or optional feature is unsupported."
+
+[[status]]
+name = "BUFFER_TOO_SMALL"
+value = -15
+doc = "A supplied output buffer is too small; required size is reported where defined."
+
+[[status]]
+name = "BAD_ADDRESS"
+value = -16
+doc = "A userspace address or range is invalid or inaccessible."
+

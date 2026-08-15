@@ -1,0 +1,52 @@
+schema_version = 1
+
+[[right]]
+name = "READ"
+value = 0x0000000000000001
+doc = "Read object state or payload."
+
+[[right]]
+name = "WRITE"
+value = 0x0000000000000002
+doc = "Write object state or payload."
+
+[[right]]
+name = "EXECUTE"
+value = 0x0000000000000004
+doc = "Use executable content or start executable state."
+
+[[right]]
+name = "MAP"
+value = 0x0000000000000008
+doc = "Map backing memory into an address region."
+
+[[right]]
+name = "WAIT"
+value = 0x0000000000000010
+doc = "Wait for object signals."
+
+[[right]]
+name = "SIGNAL"
+value = 0x0000000000000020
+doc = "Change object signal state where supported."
+
+[[right]]
+name = "DUPLICATE"
+value = 0x0000000000000040
+doc = "Duplicate the handle with equal or reduced nonzero rights."
+
+[[right]]
+name = "TRANSFER"
+value = 0x0000000000000080
+doc = "Transfer the handle through an operation that accepts handles."
+
+[[right]]
+name = "INSPECT"
+value = 0x0000000000000100
+doc = "Query structured object information."
+
+[[right]]
+name = "MODIFY"
+value = 0x0000000000000200
+doc = "Change object configuration or lifecycle state."
+

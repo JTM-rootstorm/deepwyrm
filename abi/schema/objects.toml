@@ -1,0 +1,103 @@
+schema_version = 1
+
+[[object]]
+name = "NONE"
+value = 0
+phase = "sentinel"
+doc = "No object type; never identifies a live kernel object."
+
+[[object]]
+name = "TASK_GROUP"
+value = 1
+phase = "DW0"
+doc = "Hierarchical task and future resource-accounting boundary."
+
+[[object]]
+name = "PROCESS"
+value = 2
+phase = "DW0"
+doc = "Native process object."
+
+[[object]]
+name = "THREAD"
+value = 3
+phase = "DW0"
+doc = "Native thread object."
+
+[[object]]
+name = "MEMORY_OBJECT"
+value = 4
+phase = "DW0"
+doc = "Page-backed and shareable memory object."
+
+[[object]]
+name = "ADDRESS_REGION"
+value = 5
+phase = "DW0"
+doc = "Region of a process virtual address space."
+
+[[object]]
+name = "CHANNEL"
+value = 6
+phase = "DW0"
+doc = "One endpoint of a buffered bidirectional channel."
+
+[[object]]
+name = "EVENT"
+value = 7
+phase = "DW0"
+doc = "Explicitly signaled waitable event."
+
+[[object]]
+name = "TIMER"
+value = 8
+phase = "DW0"
+doc = "Absolute-monotonic-deadline timer."
+
+[[object]]
+name = "INTERRUPT"
+value = 16
+phase = "reserved"
+doc = "Reserved for a future interrupt-delivery object."
+
+[[object]]
+name = "DEVICE_RESOURCE"
+value = 17
+phase = "reserved"
+doc = "Reserved for future rights-scoped device resources."
+
+[[object]]
+name = "EXCEPTION"
+value = 18
+phase = "reserved"
+doc = "Reserved for future structured exception delivery."
+
+[[signal]]
+name = "READABLE"
+value = 0x0000000000000001
+applies_to = "CHANNEL"
+doc = "At least one channel message can be received."
+
+[[signal]]
+name = "WRITABLE"
+value = 0x0000000000000002
+applies_to = "CHANNEL"
+doc = "Some queue capacity exists; this level signal does not reserve space or guarantee that an arbitrary racing send will fit."
+
+[[signal]]
+name = "PEER_CLOSED"
+value = 0x0000000000000004
+applies_to = "CHANNEL"
+doc = "The peer channel endpoint has closed."
+
+[[signal]]
+name = "EXITED"
+value = 0x0000000000000008
+applies_to = "PROCESS,THREAD"
+doc = "The process or thread reached its terminal state."
+
+[[signal]]
+name = "SIGNALED"
+value = 0x0000000000000010
+applies_to = "EVENT,TIMER"
+doc = "The event or timer is signaled."

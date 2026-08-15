@@ -1,0 +1,586 @@
+schema_version = 1
+
+[[constant]]
+name = "DW_HANDLE_INVALID"
+type = "DwHandle"
+value = 0
+doc = "The only ABI-visible invalid handle value."
+
+[[constant]]
+name = "DW_DEADLINE_NOW"
+type = "DwDeadline"
+value = 0
+doc = "Request immediate deadline evaluation."
+
+[[constant]]
+name = "DW_DEADLINE_INFINITE"
+type = "DwDeadline"
+value = 0xffffffffffffffff
+doc = "No finite monotonic deadline."
+
+[[constant]]
+name = "DW_CHANNEL_MAX_PAYLOAD"
+type = "u32"
+value = 65536
+doc = "Maximum DW0 channel payload bytes."
+
+[[constant]]
+name = "DW_CHANNEL_MAX_HANDLES"
+type = "u32"
+value = 16
+doc = "Maximum DW0 channel handles per message."
+
+[[constant]]
+name = "DW_WAIT_MANY_MAX_ITEMS"
+type = "u32"
+value = 64
+doc = "Maximum handles accepted by one ABI-0 wait_many operation."
+
+[[constant]]
+name = "DW_ATOMIC_WAKE_ALL"
+type = "u32"
+value = 0xffffffff
+doc = "Wake every waiter eligible for atomic_wake."
+
+[[constant]]
+name = "DW_HANDLE_TRANSFER_MOVE"
+type = "DwHandleTransferOperation"
+value = 1
+doc = "Move a handle on commit; no duplicate transfer operation exists in ABI 0."
+
+[[constant]]
+name = "DW_WAIT_MODE_ANY"
+type = "u32"
+value = 0
+doc = "Return the lowest-index ready item."
+
+[[constant]]
+name = "DW_WAIT_MODE_ALL"
+type = "u32"
+value = 1
+doc = "Reserved in ABI 0; operations return NOT_SUPPORTED."
+
+[[constant]]
+name = "DW_CLOCK_MONOTONIC_ACTIVE"
+type = "DwClockId"
+value = 0
+doc = "Monotonic active-time clock used by ABI-0 deadlines."
+
+[[constant]]
+name = "DW_CLOCK_BOOTTIME"
+type = "DwClockId"
+value = 1
+doc = "Reserved clock domain for future suspend-aware elapsed time."
+
+[[constant]]
+name = "DW_OBJECT_INFO_BASIC_V1"
+type = "u32"
+value = 0x00000001
+doc = "Typed object_get_info topic for basic type and rights metadata."
+
+[[constant]]
+name = "DW_OBJECT_INFO_TASK_STATE_V1"
+type = "u32"
+value = 0x00010001
+doc = "Typed object_get_info topic for process or thread termination state."
+
+[[constant]]
+name = "DW_OBJECT_INFO_MEMORY_OBJECT_V1"
+type = "u32"
+value = 0x00020001
+doc = "Typed object_get_info topic for MemoryObject byte size."
+
+[[constant]]
+name = "DW_TASK_STATE_CREATED"
+type = "DwTaskState"
+value = 1
+doc = "Task exists but has not started."
+
+[[constant]]
+name = "DW_TASK_STATE_RUNNING"
+type = "DwTaskState"
+value = 2
+doc = "Task has started and has not terminated."
+
+[[constant]]
+name = "DW_TASK_STATE_EXITED"
+type = "DwTaskState"
+value = 3
+doc = "Task reached a terminal state."
+
+[[constant]]
+name = "DW_TERMINATION_NORMAL_EXIT"
+type = "DwTerminationReason"
+value = 1
+doc = "Application exited normally with a 32-bit code."
+
+[[constant]]
+name = "DW_TERMINATION_AUTHORIZED"
+type = "DwTerminationReason"
+value = 2
+doc = "Task was terminated through authorized task control."
+
+[[constant]]
+name = "DW_TERMINATION_UNHANDLED_EXCEPTION"
+type = "DwTerminationReason"
+value = 3
+doc = "Task terminated because of an unhandled structured exception."
+
+[[constant]]
+name = "DW_TERMINATION_RESOURCE_POLICY"
+type = "DwTerminationReason"
+value = 4
+doc = "Task was terminated by a resource or policy decision."
+
+[[constant]]
+name = "DW_TERMINATION_TASK_GROUP_TEARDOWN"
+type = "DwTerminationReason"
+value = 5
+doc = "Task terminated during ancestor TaskGroup teardown."
+
+[[constant]]
+name = "DW_EXCEPTION_NONE"
+type = "DwExceptionType"
+value = 0
+doc = "No exception applies to this termination record."
+
+[[constant]]
+name = "DW_EXCEPTION_PAGE_FAULT"
+type = "DwExceptionType"
+value = 1
+doc = "Page fault exception."
+
+[[constant]]
+name = "DW_EXCEPTION_ILLEGAL_INSTRUCTION"
+type = "DwExceptionType"
+value = 2
+doc = "Illegal instruction exception."
+
+[[constant]]
+name = "DW_EXCEPTION_BREAKPOINT"
+type = "DwExceptionType"
+value = 3
+doc = "Breakpoint exception."
+
+[[constant]]
+name = "DW_EXCEPTION_DIVIDE_ERROR"
+type = "DwExceptionType"
+value = 4
+doc = "Divide error exception."
+
+[[constant]]
+name = "DW_EXCEPTION_GENERAL_PROTECTION"
+type = "DwExceptionType"
+value = 5
+doc = "General protection exception."
+
+[[constant]]
+name = "DW_EXCEPTION_DEBUG_TRAP"
+type = "DwExceptionType"
+value = 6
+doc = "Debug trap exception."
+
+[[record]]
+name = "DwAbiInfoV1"
+doc = "Kernel ABI and bounded implementation-limit discovery."
+field0 = "size|u32|Byte size of this structure."
+field1 = "version|u32|Structure version; set to one."
+field2 = "abi_version|u32|Native ABI version; zero for DW0."
+field3 = "page_size|u32|Base page size in bytes."
+field4 = "feature_bits|u64|Open feature bitset; unknown bits remain representable."
+field5 = "max_channel_payload|u32|Maximum channel payload bytes."
+field6 = "max_channel_handles|u32|Maximum handles per channel message."
+field7 = "reserved|[u64;4]|Reserved; all elements must be zero."
+
+[[record]]
+name = "DwObjectInfoV1"
+doc = "Basic rights-controlled object information returned by object_get_info_v1."
+field0 = "size|u32|Byte size of this structure."
+field1 = "version|u32|Structure version; set to one."
+field2 = "object_type|DwObjectType|Open object-type namespace value."
+field3 = "reserved0|u32|Reserved; must be zero."
+field4 = "rights|DwRights|Rights held by the queried handle."
+field5 = "reserved|[u64;4]|Reserved; all elements must be zero."
+
+[[record]]
+name = "DwTaskTerminationInfoV1"
+doc = "Structured process or thread termination information."
+field0 = "size|u32|Byte size of this structure."
+field1 = "version|u32|Structure version; set to one."
+field2 = "state|DwTaskState|Current task lifecycle state."
+field3 = "reason|DwTerminationReason|Termination classification, or zero before exit."
+field4 = "application_code|u32|Application-defined 32-bit normal-exit code."
+field5 = "exception_type|DwExceptionType|Structured exception classification when applicable."
+field6 = "detail|u32|Reason-specific detail value."
+field7 = "reserved0|u32|Reserved; must be zero."
+field8 = "fault_address|u64|Faulting address when applicable, otherwise zero."
+field9 = "reserved|[u64;3]|Reserved; all elements must be zero."
+
+[[record]]
+name = "DwMemoryObjectInfoV1"
+doc = "Read-only MemoryObject size information."
+field0 = "size|u32|Byte size of this structure."
+field1 = "version|u32|Structure version; set to one."
+field2 = "byte_size|u64|MemoryObject byte size."
+field3 = "reserved|[u64;2]|Reserved; all elements must be zero."
+
+[[record]]
+name = "DwProcessCreateArgsV1"
+doc = "Arguments for creating a child process and installing its bootstrap channel without a magic handle value."
+field0 = "size|u32|Byte size of this structure."
+field1 = "version|u32|Structure version; set to one."
+field2 = "task_group|DwHandle|Parent task group requiring MODIFY."
+field3 = "bootstrap_channel|DwHandle|Channel endpoint moved into the child on successful creation."
+field4 = "process_rights|DwRights|Nonzero rights requested for the returned process handle."
+field5 = "root_region_rights|DwRights|Nonzero rights requested for the root address-region handle."
+field6 = "child_bootstrap_rights|DwRights|Nonzero subset of source rights installed in the child."
+field7 = "flags|u64|Must be zero in ABI 0."
+field8 = "reserved|[u64;4]|Reserved; all elements must be zero."
+
+[[record]]
+name = "DwProcessCreateResultV1"
+doc = "Handles returned after successful process construction."
+field0 = "size|u32|Byte size of this structure."
+field1 = "version|u32|Structure version; set to one."
+field2 = "process|DwHandle|Caller-local process handle."
+field3 = "root_address_region|DwHandle|Caller-local root address-region handle."
+field4 = "child_bootstrap_handle|DwHandle|Informational child-local value; unusable by the creating process."
+field5 = "reserved|[u64;4]|Reserved; all elements must be zero."
+
+[[record]]
+name = "DwThreadStartArgsV1"
+doc = "Initial user register state for starting a created thread."
+field0 = "size|u32|Byte size of this structure."
+field1 = "version|u32|Structure version; set to one."
+field2 = "thread|DwHandle|Created thread requiring EXECUTE."
+field3 = "entry|DwUserAddress|Initial instruction pointer."
+field4 = "stack_pointer|DwUserAddress|Initial stack pointer."
+field5 = "startup_argument0|u64|First Wyrmroot-owned initial argument value."
+field6 = "startup_argument1|u64|Second Wyrmroot-owned initial argument value."
+field7 = "flags|u64|Must be zero in ABI 0."
+field8 = "reserved|[u64;3]|Reserved; all elements must be zero."
+
+[[record]]
+name = "DwHandleTransferV1"
+doc = "One handle transaction descriptor for channel_send."
+field0 = "handle|DwHandle|Source handle; duplicate source handles in one send are invalid."
+field1 = "requested_rights|DwRights|Nonzero subset of rights held by the source handle."
+field2 = "operation|DwHandleTransferOperation|Must be MOVE in ABI 0."
+field3 = "reserved0|u32|Reserved; must be zero."
+field4 = "reserved|[u64;2]|Reserved; all elements must be zero."
+
+[[record]]
+name = "DwReceivedHandleInfoV1"
+doc = "One caller-local handle created by a successful channel_receive."
+field0 = "handle|DwHandle|New receiving-process handle."
+field1 = "rights|DwRights|Rights carried by the transaction."
+field2 = "object_type|DwObjectType|Received kernel object type."
+field3 = "reserved0|u32|Reserved; must be zero."
+field4 = "reserved|[u64;2]|Reserved; all elements must be zero."
+
+[[record]]
+name = "DwChannelReceiveResultV1"
+doc = "Actual and required capacities reported by channel_receive."
+field0 = "size|u32|Byte size of this structure."
+field1 = "version|u32|Structure version; set to one."
+field2 = "actual_bytes|u32|Payload bytes copied on success."
+field3 = "actual_handles|u32|Handle records created on success."
+field4 = "required_bytes|u32|Selected datagram payload size on SUCCESS or BUFFER_TOO_SMALL; unspecified on other failures."
+field5 = "required_handles|u32|Selected datagram handle count on SUCCESS or BUFFER_TOO_SMALL; unspecified on other failures."
+field6 = "reserved|[u64;4]|Reserved; all elements must be zero."
+
+[[record]]
+name = "DwWaitItemV1"
+doc = "One handle and nonzero desired signal mask for wait_many."
+field0 = "handle|DwHandle|Waitable handle requiring WAIT."
+field1 = "signals|DwSignals|Nonzero desired signal mask."
+
+[[record]]
+name = "DwWaitResultV1"
+doc = "Deterministic wait result; the lowest ready input index wins."
+field0 = "size|u32|Byte size of this structure."
+field1 = "version|u32|Structure version; set to one."
+field2 = "index|u32|Lowest ready input index, or zero for wait_one."
+field3 = "reserved0|u32|Reserved; must be zero."
+field4 = "observed|DwSignals|Full observed signal state for the selected item."
+field5 = "reserved|[u64;3]|Reserved; all elements must be zero."
+
+[[syscall]]
+name = "abi_get_info"
+number = 0x00000001
+phase = "DW0-A"
+doc = "Write DwAbiInfoV1 and report required size without relying on a release string."
+arg0 = "out_info|DwUserAddress|out|NONE|NONE"
+arg1 = "out_size|u64|in|NONE|NONE"
+arg2 = "out_required_size|DwUserAddress|out|NONE|NONE"
+
+[[syscall]]
+name = "handle_close"
+number = 0x00000010
+phase = "DW0-D"
+doc = "Close one caller-local handle; no right is required beyond possession."
+arg0 = "handle|DwHandle|in|ANY|NONE"
+
+[[syscall]]
+name = "handle_duplicate"
+number = 0x00000011
+phase = "DW0-D"
+doc = "Create a duplicate with a nonzero rights subset; zero or escalating rights fail."
+arg0 = "handle|DwHandle|in|ANY|DUPLICATE"
+arg1 = "requested_rights|DwRights|in|NONE|NONE"
+arg2 = "out_handle|DwUserAddress|out|NONE|NONE"
+
+[[syscall]]
+name = "object_get_info_v1"
+number = 0x00000012
+phase = "DW0-D"
+doc = "Return structured object information; reserved input fields and undersized buffers fail closed."
+arg0 = "handle|DwHandle|in|ANY|INSPECT"
+arg1 = "topic|u32|in|NONE|NONE"
+arg2 = "out_info|DwUserAddress|out|NONE|NONE"
+arg3 = "out_size|u64|in|NONE|NONE"
+arg4 = "out_required_size|DwUserAddress|out|NONE|NONE"
+
+[[syscall]]
+name = "task_group_create"
+number = 0x00010001
+phase = "DW0-E"
+doc = "Create a child task group."
+arg0 = "parent|DwHandle|in|TASK_GROUP|MODIFY"
+arg1 = "requested_rights|DwRights|in|NONE|NONE"
+arg2 = "out_handle|DwUserAddress|out|NONE|NONE"
+
+[[syscall]]
+name = "task_group_terminate"
+number = 0x00010002
+phase = "DW0-E"
+doc = "Recursively terminate a task group and its descendants."
+arg0 = "task_group|DwHandle|in|TASK_GROUP|MODIFY"
+arg1 = "reason|u32|in|NONE|NONE"
+
+[[syscall]]
+name = "process_create"
+number = 0x00010010
+phase = "DW0-E"
+doc = "Create a process using DwProcessCreateArgsV1 and atomically install its bootstrap channel."
+arg0 = "args|DwUserAddress|in|NONE|NONE"
+arg1 = "args_size|u64|in|NONE|NONE"
+arg2 = "out_result|DwUserAddress|out|NONE|NONE"
+arg3 = "result_size|u64|in|NONE|NONE"
+
+[[syscall]]
+name = "process_exit"
+number = 0x00010011
+phase = "DW0-E"
+doc = "Exit the calling process normally with a 32-bit application code."
+arg0 = "exit_code|u32|in|NONE|NONE"
+
+[[syscall]]
+name = "process_terminate"
+number = 0x00010012
+phase = "DW0-E"
+doc = "Explicitly terminate a process with structured reason metadata."
+arg0 = "process|DwHandle|in|PROCESS|MODIFY"
+arg1 = "reason|u32|in|NONE|NONE"
+arg2 = "code|u32|in|NONE|NONE"
+
+[[syscall]]
+name = "thread_create"
+number = 0x00010020
+phase = "DW0-E"
+doc = "Create a thread in CREATED state."
+arg0 = "process|DwHandle|in|PROCESS|MODIFY"
+arg1 = "requested_rights|DwRights|in|NONE|NONE"
+arg2 = "out_thread|DwUserAddress|out|NONE|NONE"
+
+[[syscall]]
+name = "thread_start"
+number = 0x00010021
+phase = "DW0-E"
+doc = "Start a created thread using DwThreadStartArgsV1."
+arg0 = "args|DwUserAddress|in|NONE|NONE"
+arg1 = "args_size|u64|in|NONE|NONE"
+
+[[syscall]]
+name = "thread_exit"
+number = 0x00010022
+phase = "DW0-E"
+doc = "Exit the calling thread normally with a 32-bit code."
+arg0 = "exit_code|u32|in|NONE|NONE"
+
+[[syscall]]
+name = "thread_terminate"
+number = 0x00010023
+phase = "DW0-E"
+doc = "Explicitly terminate a thread."
+arg0 = "thread|DwHandle|in|THREAD|MODIFY"
+arg1 = "reason|u32|in|NONE|NONE"
+arg2 = "code|u32|in|NONE|NONE"
+
+[[syscall]]
+name = "memory_object_create"
+number = 0x00020001
+phase = "DW0-C"
+doc = "Create a page-backed memory object."
+arg0 = "byte_len|u64|in|NONE|NONE"
+arg1 = "flags|u64|in|NONE|NONE"
+arg2 = "requested_rights|DwRights|in|NONE|NONE"
+arg3 = "out_handle|DwUserAddress|out|NONE|NONE"
+
+[[syscall]]
+name = "address_region_map"
+number = 0x00020010
+phase = "DW0-C"
+doc = "Map a memory-object range with explicit W^X-checked protections."
+arg0 = "address_region|DwHandle|in|ADDRESS_REGION|MAP+MODIFY"
+arg1 = "memory_object|DwHandle|in|MEMORY_OBJECT|MAP"
+arg2 = "args|DwUserAddress|in|NONE|NONE"
+arg3 = "args_size|u64|in|NONE|NONE"
+arg4 = "out_address|DwUserAddress|out|NONE|NONE"
+
+[[syscall]]
+name = "address_region_unmap"
+number = 0x00020011
+phase = "DW0-C"
+doc = "Remove mappings from an address region."
+arg0 = "address_region|DwHandle|in|ADDRESS_REGION|MODIFY"
+arg1 = "address|DwUserAddress|in|NONE|NONE"
+arg2 = "byte_len|u64|in|NONE|NONE"
+
+[[syscall]]
+name = "address_region_protect"
+number = 0x00020012
+phase = "DW0-C"
+doc = "Change mapping protections while enforcing W^X."
+arg0 = "address_region|DwHandle|in|ADDRESS_REGION|MODIFY"
+arg1 = "address|DwUserAddress|in|NONE|NONE"
+arg2 = "byte_len|u64|in|NONE|NONE"
+arg3 = "protections|u64|in|NONE|NONE"
+
+[[syscall]]
+name = "channel_create"
+number = 0x00030001
+phase = "DW0-F"
+doc = "Create a connected pair of channel endpoints."
+arg0 = "requested_rights|DwRights|in|NONE|NONE"
+arg1 = "out_endpoint0|DwUserAddress|out|NONE|NONE"
+arg2 = "out_endpoint1|DwUserAddress|out|NONE|NONE"
+
+[[syscall]]
+name = "channel_send"
+number = 0x00030002
+phase = "DW0-F"
+doc = "Atomically queue bytes and moved handles; failures preserve sender handles and successful commit transfers object references to the queue."
+arg0 = "channel|DwHandle|in|CHANNEL|WRITE"
+arg1 = "bytes|DwUserAddress|in|NONE|NONE"
+arg2 = "byte_len|u32|in|NONE|NONE"
+arg3 = "transfers|DwUserAddress|in|NONE|NONE"
+arg4 = "transfer_count|u32|in|NONE|NONE"
+arg5 = "flags|u64|in|NONE|NONE"
+
+[[syscall]]
+name = "channel_receive"
+number = 0x00030003
+phase = "DW0-F"
+doc = "Receive one atomic datagram; BUFFER_TOO_SMALL consumes nothing and receiver handles are created only on success."
+arg0 = "channel|DwHandle|in|CHANNEL|READ"
+arg1 = "out_bytes|DwUserAddress|out|NONE|NONE"
+arg2 = "byte_capacity|u32|in|NONE|NONE"
+arg3 = "out_handles|DwUserAddress|out|NONE|NONE"
+arg4 = "handle_capacity|u32|in|NONE|NONE"
+arg5 = "out_result|DwUserAddress|out|NONE|NONE"
+
+[[syscall]]
+name = "wait_one"
+number = 0x00040001
+phase = "DW0-F"
+doc = "Wait for a nonzero signal mask on one handle."
+arg0 = "handle|DwHandle|in|ANY|WAIT"
+arg1 = "signals|DwSignals|in|NONE|NONE"
+arg2 = "deadline|DwDeadline|in|NONE|NONE"
+arg3 = "out_result|DwUserAddress|out|NONE|NONE"
+
+[[syscall]]
+name = "wait_many"
+number = 0x00040002
+phase = "DW0-F"
+doc = "WAIT_ANY over a nonempty DwWaitItemV1 array; the lowest ready index is deterministic and WAIT_ALL is reserved."
+arg0 = "items|DwUserAddress|in|NONE|NONE"
+arg1 = "item_count|u32|in|NONE|NONE"
+arg2 = "mode|u32|in|NONE|NONE"
+arg3 = "deadline|DwDeadline|in|NONE|NONE"
+arg4 = "out_result|DwUserAddress|out|NONE|NONE"
+
+[[syscall]]
+name = "event_create"
+number = 0x00040010
+phase = "DW0-F"
+doc = "Create an unsignaled manual-reset event."
+arg0 = "requested_rights|DwRights|in|NONE|NONE"
+arg1 = "out_event|DwUserAddress|out|NONE|NONE"
+
+[[syscall]]
+name = "event_signal"
+number = 0x00040011
+phase = "DW0-F"
+doc = "Set or reset a manual event; only SIGNALED is valid, and empty or overlapping clear/set masks are invalid."
+arg0 = "event|DwHandle|in|EVENT|SIGNAL"
+arg1 = "clear_mask|DwSignals|in|NONE|NONE"
+arg2 = "set_mask|DwSignals|in|NONE|NONE"
+
+[[syscall]]
+name = "atomic_wait32"
+number = 0x00040020
+phase = "DW0-F"
+doc = "Wait while a validated aligned userspace u32 equals expected; mismatch returns WOULD_BLOCK and callers recheck their atomic predicate after wake."
+arg0 = "address|DwUserAddress|in|NONE|NONE"
+arg1 = "expected|u32|in|NONE|NONE"
+arg2 = "deadline|DwDeadline|in|NONE|NONE"
+
+[[syscall]]
+name = "atomic_wake"
+number = 0x00040021
+phase = "DW0-F"
+doc = "Wake up to count waiters on an aligned userspace u32 address; zero is a no-op and DW_ATOMIC_WAKE_ALL wakes every eligible waiter."
+arg0 = "address|DwUserAddress|in|NONE|NONE"
+arg1 = "count|u32|in|NONE|NONE"
+arg2 = "out_woken|DwUserAddress|out|NONE|NONE"
+
+[[syscall]]
+name = "clock_get"
+number = 0x00050001
+phase = "DW0-F"
+doc = "Read an explicit clock domain in nanoseconds."
+arg0 = "clock_id|DwClockId|in|NONE|NONE"
+arg1 = "out_nanoseconds|DwUserAddress|out|NONE|NONE"
+
+[[syscall]]
+name = "timer_create"
+number = 0x00050010
+phase = "DW0-F"
+doc = "Create a one-shot monotonic timer."
+arg0 = "requested_rights|DwRights|in|NONE|NONE"
+arg1 = "out_timer|DwUserAddress|out|NONE|NONE"
+
+[[syscall]]
+name = "timer_set"
+number = 0x00050011
+phase = "DW0-F"
+doc = "Arm or replace a one-shot timer, atomically clearing prior signal state; INFINITE is invalid and cancel is explicit."
+arg0 = "timer|DwHandle|in|TIMER|MODIFY"
+arg1 = "deadline|DwDeadline|in|NONE|NONE"
+
+[[syscall]]
+name = "timer_cancel"
+number = 0x00050012
+phase = "DW0-F"
+doc = "Cancel a one-shot timer and clear its signaled state."
+arg0 = "timer|DwHandle|in|TIMER|MODIFY"
+
+[[syscall]]
+name = "debug_write"
+number = 0xffff0001
+phase = "DW0-debug-only"
+doc = "Debug/test-only diagnostic bytes; unavailable in production ABI builds."
+arg0 = "bytes|DwUserAddress|in|NONE|NONE"
+arg1 = "byte_len|u64|in|NONE|NONE"
