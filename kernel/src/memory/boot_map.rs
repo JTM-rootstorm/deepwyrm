@@ -439,6 +439,9 @@ fn physical_range(physical_start: u64, byte_len: u64) -> Result<PhysicalRange, B
         super::physical::PhysicalRangeError::AddressOverflow => {
             BootMapError::Physical(PhysicalMemoryError::AddressOverflow)
         }
+        super::physical::PhysicalRangeError::InvalidAddressLimit => {
+            BootMapError::Physical(PhysicalMemoryError::OutsidePhysicalLimit)
+        }
     })
 }
 

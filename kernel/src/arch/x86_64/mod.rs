@@ -11,6 +11,7 @@ pub mod entry;
 pub mod exceptions;
 pub mod gdt;
 pub mod idt;
+pub mod mm;
 pub mod tss;
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]

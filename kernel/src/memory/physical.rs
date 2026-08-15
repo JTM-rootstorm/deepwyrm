@@ -62,6 +62,7 @@ impl PhysicalRange {
 pub enum PhysicalRangeError {
     EmptyRange,
     AddressOverflow,
+    InvalidAddressLimit,
 }
 
 /// Architecture-supplied exclusive physical-address limit.
@@ -75,12 +76,24 @@ pub struct PhysicalAddressLimit {
 }
 
 impl PhysicalAddressLimit {
-    /// Validates a page-aligned, nonzero exclusive physical limit.
+    /// Validates a power-of-two exclusive physical limit no wider than the
+    /// x86_64 four-level PTE address field. Architecture code must derive this
+    /// value from one trusted MAXPHYADDR fact and pass the same token to the
+    /// sanitizer, allocator, and page-table owner.
     pub fn new(exclusive: u64) -> Result<Self, PhysicalRangeError> {
-        if exclusive == 0 || !exclusive.is_multiple_of(BASE_PAGE_SIZE) {
-            return Err(PhysicalRangeError::EmptyRange);
+        if exclusive < BASE_PAGE_SIZE || !exclusive.is_power_of_two() || exclusive > (1_u64 << 52) {
+            return Err(PhysicalRangeError::InvalidAddressLimit);
         }
         Ok(Self { exclusive })
+    }
+
+    /// Constructs the shared exclusive limit from a validated physical-address
+    /// width. This is the production architecture integration path.
+    pub fn from_address_bits(bits: u8) -> Result<Self, PhysicalRangeError> {
+        if !(12..=52).contains(&bits) {
+            return Err(PhysicalRangeError::InvalidAddressLimit);
+        }
+        Self::new(1_u64 << bits)
     }
 
     /// First invalid physical address.
@@ -431,6 +444,18 @@ mod tests {
         assert_eq!(
             PhysicalRange::new(u64::MAX, 1),
             Err(PhysicalRangeError::AddressOverflow)
+        );
+        assert_eq!(
+            PhysicalAddressLimit::from_address_bits(40),
+            Ok(PhysicalAddressLimit::new(1_u64 << 40).unwrap())
+        );
+        assert_eq!(
+            PhysicalAddressLimit::from_address_bits(53),
+            Err(PhysicalRangeError::InvalidAddressLimit)
+        );
+        assert_eq!(
+            PhysicalAddressLimit::new(0x3000),
+            Err(PhysicalRangeError::InvalidAddressLimit)
         );
     }
 
