@@ -320,6 +320,24 @@ pub const DW_BOOT_ENTROPY_SOURCE_MIXED_FIRMWARE: DwBootEntropySource = DwBootEnt
 /// The provider reports that the bytes are conditioned entropy output.
 pub const DW_BOOT_ENTROPY_FLAG_CONDITIONED: DwBootEntropyFlags = DwBootEntropyFlags(1);
 
+/// DW0 base page size in bytes for BootInfo memory ranges and handoff mappings.
+pub const DW_BOOT_BASE_PAGE_SIZE: u32 = 4096;
+
+/// Required version value for DwBootMemoryRangeV1 records.
+pub const DW_BOOT_MEMORY_RANGE_V1_VERSION: u32 = 1;
+
+/// Required version value for DwBootModuleV1 records.
+pub const DW_BOOT_MODULE_V1_VERSION: u32 = 1;
+
+/// Required version value for DwBootFramebufferV1 records.
+pub const DW_BOOT_FRAMEBUFFER_V1_VERSION: u32 = 1;
+
+/// Required version value for DwBootEntropyV1 records.
+pub const DW_BOOT_ENTROPY_V1_VERSION: u32 = 1;
+
+/// Required version value for DwBootInfoV1 records.
+pub const DW_BOOT_INFO_V1_VERSION: u32 = 1;
+
 /// The only ABI-visible invalid handle value.
 pub const DW_HANDLE_INVALID: DwHandle = DwHandle(0);
 
@@ -1193,6 +1211,12 @@ mod generated_layout_tests {
         assert_eq!(DW_BOOT_ENTROPY_SOURCE_FIRMWARE_PLATFORM.0, 2);
         assert_eq!(DW_BOOT_ENTROPY_SOURCE_MIXED_FIRMWARE.0, 3);
         assert_eq!(DW_BOOT_ENTROPY_FLAG_CONDITIONED.0, 1);
+        assert_eq!(DW_BOOT_BASE_PAGE_SIZE, 4096);
+        assert_eq!(DW_BOOT_MEMORY_RANGE_V1_VERSION, 1);
+        assert_eq!(DW_BOOT_MODULE_V1_VERSION, 1);
+        assert_eq!(DW_BOOT_FRAMEBUFFER_V1_VERSION, 1);
+        assert_eq!(DW_BOOT_ENTROPY_V1_VERSION, 1);
+        assert_eq!(DW_BOOT_INFO_V1_VERSION, 1);
         assert_eq!(DW_HANDLE_INVALID.0, 0);
         assert_eq!(DW_DEADLINE_NOW.0, 0);
         assert_eq!(DW_DEADLINE_INFINITE.0, 18446744073709551615);

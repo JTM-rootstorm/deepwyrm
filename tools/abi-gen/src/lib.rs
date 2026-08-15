@@ -13,6 +13,7 @@ const SCHEMA_FILES: &[(&str, &[&str])] = &[
     (
         "boot.toml",
         &[
+            "constant",
             "boot_info_flag",
             "memory_kind",
             "module_kind",
@@ -493,17 +494,19 @@ impl Model {
         let syscall_doc = &documents["syscalls.toml"];
         let mut constants = Vec::new();
         let bases = newtype_bases(&newtypes);
-        for table in tables(syscall_doc, "constant") {
-            table.reject_unknown(&["name", "type", "value", "doc"], None)?;
-            let constant = Constant {
-                name: table.text("name")?,
-                ty: table.text("type")?,
-                value: table.integer("value")?,
-                doc: table.text("doc")?,
-            };
-            require_upper_name(&constant.name, table)?;
-            validate_scalar_value(&constant.ty, constant.value, &bases, table)?;
-            constants.push(constant);
+        for document in [boot_doc, syscall_doc] {
+            for table in tables(document, "constant") {
+                table.reject_unknown(&["name", "type", "value", "doc"], None)?;
+                let constant = Constant {
+                    name: table.text("name")?,
+                    ty: table.text("type")?,
+                    value: table.integer("value")?,
+                    doc: table.text("doc")?,
+                };
+                require_upper_name(&constant.name, table)?;
+                validate_scalar_value(&constant.ty, constant.value, &bases, table)?;
+                constants.push(constant);
+            }
         }
         reject_duplicate_names(constants.iter().map(|item| item.name.as_str()), "constant")?;
 
@@ -524,6 +527,7 @@ impl Model {
                 records.push(record);
             }
         }
+        validate_boot_contract_constants(boot_doc, &constants)?;
 
         let object_names = value_sets
             .iter()
@@ -670,6 +674,33 @@ impl Model {
             object_info_topics,
             syscalls,
         })
+    }
+}
+
+fn validate_boot_contract_constants(boot_doc: &Document, constants: &[Constant]) -> Result<()> {
+    for table in tables(boot_doc, "record") {
+        let record_name = table.text("name")?;
+        let Some(stem) = record_name
+            .strip_prefix("Dw")
+            .and_then(|name| name.strip_suffix("V1"))
+        else {
+            continue;
+        };
+        let expected = format!("DW_{}_V1_VERSION", camel_to_upper_snake(stem));
+        require_u32_constant(constants, &expected, 1)?;
+    }
+    require_u32_constant(constants, "DW_BOOT_BASE_PAGE_SIZE", 4096)
+}
+
+fn require_u32_constant(constants: &[Constant], name: &str, value: i128) -> Result<()> {
+    match constants.iter().find(|constant| constant.name == name) {
+        Some(constant) if constant.ty == "u32" && constant.value == value => Ok(()),
+        Some(_) => Err(Error::new(format!(
+            "boot contract constant `{name}` must have type u32 and value {value}"
+        ))),
+        None => Err(Error::new(format!(
+            "boot contract requires constant `{name}` with type u32 and value {value}"
+        ))),
     }
 }
 
@@ -2011,6 +2042,12 @@ mod tests {
         assert_eq!(outputs, render(&model).unwrap());
         let documentation = &outputs["ABI.md"];
         for name in [
+            "DW_BOOT_BASE_PAGE_SIZE",
+            "DW_BOOT_MEMORY_RANGE_V1_VERSION",
+            "DW_BOOT_MODULE_V1_VERSION",
+            "DW_BOOT_FRAMEBUFFER_V1_VERSION",
+            "DW_BOOT_ENTROPY_V1_VERSION",
+            "DW_BOOT_INFO_V1_VERSION",
             "DW_DEADLINE_NOW",
             "DW_DEADLINE_INFINITE",
             "DW_WAIT_MANY_MAX_ITEMS",
@@ -2132,6 +2169,33 @@ mod tests {
     }
 
     #[test]
+    fn rejects_missing_or_mismatched_boot_contract_constants() {
+        let root = TempRoot::copy_schema();
+        root.rewrite("boot.toml", |text| {
+            text.replacen(
+                "name = \"DW_BOOT_INFO_V1_VERSION\"\ntype = \"u32\"\nvalue = 1",
+                "name = \"DW_BOOT_INFO_V1_VERSION\"\ntype = \"u32\"\nvalue = 2",
+                1,
+            )
+        });
+        assert!(load_error(&root).contains(
+            "boot contract constant `DW_BOOT_INFO_V1_VERSION` must have type u32 and value 1"
+        ));
+
+        let root = TempRoot::copy_schema();
+        root.rewrite("boot.toml", |text| {
+            text.replacen(
+                "name = \"DW_BOOT_BASE_PAGE_SIZE\"",
+                "name = \"DW_BOOT_PAGE_SIZE_MISSING\"",
+                1,
+            )
+        });
+        assert!(load_error(&root).contains(
+            "boot contract requires constant `DW_BOOT_BASE_PAGE_SIZE` with type u32 and value 4096"
+        ));
+    }
+
+    #[test]
     fn generated_c_header_passes_clang_when_available() {
         if Command::new("clang").arg("--version").output().is_err() {
             return;
@@ -2141,7 +2205,7 @@ mod tests {
         let probe = root.path().join("abi/generated/header_probe.c");
         fs::write(
             &probe,
-            "#include \"deepwyrm_abi.h\"\n_Static_assert(DW_STATUS_BAD_ADDRESS == -16, \"status parity\");\n_Static_assert(DW_RIGHT_MODIFY == 512, \"rights parity\");\n_Static_assert(DW_OBJECT_TYPE_TIMER == 8, \"object parity\");\n_Static_assert(DW_SYSCALL_TIMER_CANCEL == 0x00050012, \"syscall parity\");\n_Static_assert(DW_DEADLINE_INFINITE == UINT64_MAX, \"deadline parity\");\nint main(void) {\n    DwDeadline deadline = DW_DEADLINE_INFINITE;\n    uint32_t payload = DW_CHANNEL_MAX_PAYLOAD;\n    DwStatus status = DW_STATUS_SUCCESS;\n    return (deadline == 0 || payload == 0 || status != 0);\n}\n",
+            "#include \"deepwyrm_abi.h\"\n_Static_assert(DW_STATUS_BAD_ADDRESS == -16, \"status parity\");\n_Static_assert(DW_RIGHT_MODIFY == 512, \"rights parity\");\n_Static_assert(DW_OBJECT_TYPE_TIMER == 8, \"object parity\");\n_Static_assert(DW_SYSCALL_TIMER_CANCEL == 0x00050012, \"syscall parity\");\n_Static_assert(DW_DEADLINE_INFINITE == UINT64_MAX, \"deadline parity\");\n_Static_assert(DW_BOOT_BASE_PAGE_SIZE == UINT32_C(4096), \"boot page parity\");\n_Static_assert(DW_BOOT_INFO_V1_VERSION == UINT32_C(1), \"boot version parity\");\nint main(void) {\n    DwDeadline deadline = DW_DEADLINE_INFINITE;\n    uint32_t payload = DW_CHANNEL_MAX_PAYLOAD;\n    DwStatus status = DW_STATUS_SUCCESS;\n    return (deadline == 0 || payload == 0 || status != 0);\n}\n",
         )
         .unwrap();
         let output = Command::new("clang")

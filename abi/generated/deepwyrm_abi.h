@@ -301,6 +301,18 @@ DW_STATIC_ASSERT(DW_ALIGNOF(DwBootEntropyFlags) == 4, "DwBootEntropyFlags alignm
 /* The provider reports that the bytes are conditioned entropy output. */
 #define DW_BOOT_ENTROPY_FLAG_CONDITIONED ((DwBootEntropyFlags)(1))
 
+/* DW0 base page size in bytes for BootInfo memory ranges and handoff mappings. */
+#define DW_BOOT_BASE_PAGE_SIZE ((uint32_t)(4096))
+/* Required version value for DwBootMemoryRangeV1 records. */
+#define DW_BOOT_MEMORY_RANGE_V1_VERSION ((uint32_t)(1))
+/* Required version value for DwBootModuleV1 records. */
+#define DW_BOOT_MODULE_V1_VERSION ((uint32_t)(1))
+/* Required version value for DwBootFramebufferV1 records. */
+#define DW_BOOT_FRAMEBUFFER_V1_VERSION ((uint32_t)(1))
+/* Required version value for DwBootEntropyV1 records. */
+#define DW_BOOT_ENTROPY_V1_VERSION ((uint32_t)(1))
+/* Required version value for DwBootInfoV1 records. */
+#define DW_BOOT_INFO_V1_VERSION ((uint32_t)(1))
 /* The only ABI-visible invalid handle value. */
 #define DW_HANDLE_INVALID ((DwHandle)(0))
 /* Request immediate deadline evaluation. */

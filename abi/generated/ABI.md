@@ -148,6 +148,12 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 
 | Name | Type | Value | Meaning |
 |---|---|---:|---|
+| `DW_BOOT_BASE_PAGE_SIZE` | `u32` | `4096` | DW0 base page size in bytes for BootInfo memory ranges and handoff mappings. |
+| `DW_BOOT_MEMORY_RANGE_V1_VERSION` | `u32` | `1` | Required version value for DwBootMemoryRangeV1 records. |
+| `DW_BOOT_MODULE_V1_VERSION` | `u32` | `1` | Required version value for DwBootModuleV1 records. |
+| `DW_BOOT_FRAMEBUFFER_V1_VERSION` | `u32` | `1` | Required version value for DwBootFramebufferV1 records. |
+| `DW_BOOT_ENTROPY_V1_VERSION` | `u32` | `1` | Required version value for DwBootEntropyV1 records. |
+| `DW_BOOT_INFO_V1_VERSION` | `u32` | `1` | Required version value for DwBootInfoV1 records. |
 | `DW_HANDLE_INVALID` | `DwHandle` | `0` | The only ABI-visible invalid handle value. |
 | `DW_DEADLINE_NOW` | `DwDeadline` | `0` | Request immediate deadline evaluation. |
 | `DW_DEADLINE_INFINITE` | `DwDeadline` | `18446744073709551615` | No finite monotonic deadline. |

@@ -1,5 +1,41 @@
 schema_version = 1
 
+[[constant]]
+name = "DW_BOOT_BASE_PAGE_SIZE"
+type = "u32"
+value = 4096
+doc = "DW0 base page size in bytes for BootInfo memory ranges and handoff mappings."
+
+[[constant]]
+name = "DW_BOOT_MEMORY_RANGE_V1_VERSION"
+type = "u32"
+value = 1
+doc = "Required version value for DwBootMemoryRangeV1 records."
+
+[[constant]]
+name = "DW_BOOT_MODULE_V1_VERSION"
+type = "u32"
+value = 1
+doc = "Required version value for DwBootModuleV1 records."
+
+[[constant]]
+name = "DW_BOOT_FRAMEBUFFER_V1_VERSION"
+type = "u32"
+value = 1
+doc = "Required version value for DwBootFramebufferV1 records."
+
+[[constant]]
+name = "DW_BOOT_ENTROPY_V1_VERSION"
+type = "u32"
+value = 1
+doc = "Required version value for DwBootEntropyV1 records."
+
+[[constant]]
+name = "DW_BOOT_INFO_V1_VERSION"
+type = "u32"
+value = 1
+doc = "Required version value for DwBootInfoV1 records."
+
 [[boot_info_flag]]
 name = "FRAMEBUFFER_PRESENT"
 value = 0x0000000000000001
