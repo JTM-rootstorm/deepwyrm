@@ -377,6 +377,16 @@ pub(crate) struct Layout {
     pub(crate) base_page_size: u64,
     pub(crate) kernel_boot_stack_size: u64,
     pub(crate) kernel_boot_stack_alignment: u64,
+    #[allow(
+        dead_code,
+        reason = "published intake limits are consumed by contract agreement tests"
+    )]
+    pub(crate) max_normalized_memory_map_entries: u64,
+    #[allow(
+        dead_code,
+        reason = "published intake limits are consumed by contract agreement tests"
+    )]
+    pub(crate) max_module_entries: u64,
 }
 
 impl Layout {
@@ -434,6 +444,20 @@ impl Layout {
             "handoff_mappings.mutable",
             "handoff_mappings.page_zero_mapped",
             "handoff_mappings.framebuffer_pixels_identity_mapped",
+            "early_intake.max_normalized_memory_map_entries",
+            "early_intake.max_module_entries",
+            "early_intake.acpi_scope",
+            "early_intake.acpi_guid_preference",
+            "early_intake.acpi_duplicate_selected_guid",
+            "early_intake.acpi_preferred_invalid",
+            "early_intake.acpi_rsdp_signature",
+            "early_intake.acpi_rsdp_length_rule",
+            "early_intake.acpi_rsdp_checksum",
+            "early_intake.acpi_rsdp_mapping",
+            "early_intake.acpi_rsdp_max_intersecting_pages",
+            "early_intake.acpi_mapping_overlap",
+            "early_intake.acpi_table_traversal",
+            "early_intake.acpi_memory_types_identity_mapped",
         ];
 
         let values = parse_flat_toml(source)?;
@@ -506,6 +530,28 @@ impl Layout {
                 "handoff_mappings.lifetime",
                 "until-kernel-page-table-replacement",
             ),
+            ("early_intake.acpi_scope", "rsdp-only"),
+            (
+                "early_intake.acpi_guid_preference",
+                "ACPI_20_TABLE_GUID-then-ACPI_TABLE_GUID",
+            ),
+            ("early_intake.acpi_duplicate_selected_guid", "reject"),
+            ("early_intake.acpi_preferred_invalid", "reject-no-downgrade"),
+            ("early_intake.acpi_rsdp_signature", "RSD PTR "),
+            (
+                "early_intake.acpi_rsdp_length_rule",
+                "revision-lt-2:20;revision-ge-2:declared-36..4096",
+            ),
+            (
+                "early_intake.acpi_rsdp_checksum",
+                "v1-first-20-and-v2-full-record",
+            ),
+            (
+                "early_intake.acpi_rsdp_mapping",
+                "validated-record-intersecting-base-pages-only",
+            ),
+            ("early_intake.acpi_mapping_overlap", "coalesce"),
+            ("early_intake.acpi_table_traversal", "deferred-dw0-c"),
         ] {
             expect_string(&values, key, expected_value)?;
         }
@@ -539,6 +585,7 @@ impl Layout {
             "handoff_mappings.mutable",
             "handoff_mappings.page_zero_mapped",
             "handoff_mappings.framebuffer_pixels_identity_mapped",
+            "early_intake.acpi_memory_types_identity_mapped",
         ] {
             expect_bool(&values, key, false)?;
         }
@@ -548,6 +595,14 @@ impl Layout {
         let kernel_boot_stack_size = parse_u64(required_value(&values, "kernel_boot_stack_size")?)?;
         let kernel_boot_stack_alignment =
             parse_u64(required_value(&values, "kernel_boot_stack_alignment")?)?;
+        let max_normalized_memory_map_entries = parse_u64(required_value(
+            &values,
+            "early_intake.max_normalized_memory_map_entries",
+        )?)?;
+        let max_module_entries =
+            parse_u64(required_value(&values, "early_intake.max_module_entries")?)?;
+
+        expect_u64(&values, "early_intake.acpi_rsdp_max_intersecting_pages", 2)?;
 
         if link_base < 0xffff_8000_0000_0000 || link_base % base_page_size != 0 {
             return Err("link_base must be upper-canonical and base-page aligned".into());
@@ -565,12 +620,17 @@ impl Layout {
         {
             return Err("kernel boot stack must be an aligned 65536-byte range".into());
         }
+        if max_normalized_memory_map_entries != 128 || max_module_entries != 16 {
+            return Err("early intake limits must match the bounded BootInfo snapshots".into());
+        }
 
         Ok(Self {
             link_base,
             base_page_size,
             kernel_boot_stack_size,
             kernel_boot_stack_alignment,
+            max_normalized_memory_map_entries,
+            max_module_entries,
         })
     }
 }
@@ -591,7 +651,10 @@ fn parse_flat_toml(source: &str) -> Result<BTreeMap<String, String>, String> {
             else {
                 return Err(format!("line {line_number}: malformed section"));
             };
-            if !matches!(name, "load_policy" | "entry_state" | "handoff_mappings") {
+            if !matches!(
+                name,
+                "load_policy" | "entry_state" | "handoff_mappings" | "early_intake"
+            ) {
                 return Err(format!("line {line_number}: unknown section `{name}`"));
             }
             section = name;

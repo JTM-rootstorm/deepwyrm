@@ -22,6 +22,14 @@ fn layout_manifest_is_exact_and_fails_closed_on_drift() {
     assert_eq!(layout.base_page_size, 4_096);
     assert_eq!(layout.kernel_boot_stack_size, 65_536);
     assert_eq!(layout.kernel_boot_stack_alignment, 4_096);
+    assert_eq!(
+        layout.max_normalized_memory_map_entries,
+        deepwyrm_kernel::boot::MAX_BOOT_MEMORY_MAP_ENTRIES as u64
+    );
+    assert_eq!(
+        layout.max_module_entries,
+        deepwyrm_kernel::boot::MAX_BOOT_MODULE_ENTRIES as u64
+    );
 
     for malformed in [
         format!("{source}\nunknown_contract_key = true\n"),
@@ -38,6 +46,22 @@ fn layout_manifest_is_exact_and_fails_closed_on_drift() {
         source.replace(
             "p_paddr_policy = \"ignored\"",
             "p_paddr_policy = \"load-address\"",
+        ),
+        source.replace(
+            "acpi_duplicate_selected_guid = \"reject\"",
+            "acpi_duplicate_selected_guid = \"first\"",
+        ),
+        source.replace(
+            "acpi_preferred_invalid = \"reject-no-downgrade\"",
+            "acpi_preferred_invalid = \"fallback\"",
+        ),
+        source.replace(
+            "acpi_rsdp_length_rule = \"revision-lt-2:20;revision-ge-2:declared-36..4096\"",
+            "acpi_rsdp_length_rule = \"unbounded\"",
+        ),
+        source.replace(
+            "acpi_table_traversal = \"deferred-dw0-c\"",
+            "acpi_table_traversal = \"loader-walk\"",
         ),
     ] {
         assert!(kernel_build::Layout::parse(&malformed).is_err());
