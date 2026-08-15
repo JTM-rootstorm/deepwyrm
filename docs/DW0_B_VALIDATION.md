@@ -3,7 +3,7 @@
 ## Current disposition
 
 The Deepwyrm DW0-B source, host, and freestanding build gates pass at revision
-`d827dcbc3723904a2601fee3a9af42e27cdad693`. The manager-owned Q35/UEFI guest
+`0bc8e6667e27ebd6aa5e3d572f34b9a1dfddefc7`. The coordinator-owned Q35/UEFI guest
 gate remains pending an exact Wyrmroot image and request manifest; therefore
 this record does not yet claim complete functional phase acceptance.
 
@@ -37,11 +37,11 @@ cargo fmt --all -- --check
 git diff --check
 ```
 
-The full workspace run passed 76 tests: eight ABI-generator tests, three
+The full workspace run passed 80 tests: eight ABI-generator tests, three
 generated ABI tests, 36 kernel unit tests, nine APIC model tests, five entry and
-layout-contract tests, eleven xtask unit tests, and four xtask command-surface
+layout-contract tests, fifteen xtask unit tests, and four xtask command-surface
 tests. Each of the three compile-time guest selectors also passed its 73-test
-host configuration.
+kernel host configuration.
 
 The accepted immutable toolchain is coordinator request
 `RUST-PHASE0B-TOOLCHAIN-001`, Rust commit
@@ -49,19 +49,30 @@ The accepted immutable toolchain is coordinator request
 `63e532b52e6d4c2ef4ed4a003e2aafd7ec11b55e3de5a635c1aea8bfa849f332`,
 and root-manifest SHA-256
 `553cbfe6eb5cd9976c4f078a3731269f2a2ecd4f3ff5d574ab3813bae8fcf1f1`.
-Explicit immutable Cargo and rustc paths built the production kernel and all
-three `x86_64-unknown-none` selector kernels successfully.
+The canonical toolchain-tree digest is
+`5d4275428555a7cd6ae7decc100456fe31cfa4562a7f5eb81a3cf7fe08aa03a5`.
+Planning revalidated that digest, the selected Cargo, rustc, rust-lld, target
+core and compiler-builtins libraries, and the rustc-driver and LLVM internal
+libraries. The host-neutral build-tools identity gate then verified Clang
+22.1.8, libclang-cpp, host LLVM, and the Clang configuration before the exact
+compiler path was passed through `DEEPWYRM_CLANG`.
+
+Two isolated builds of the production kernel and all three
+`x86_64-unknown-none` selector kernels were byte-identical. The durable local
+artifacts are under
+`artifacts/dw0-b/0bc8e6667e27ebd6aa5e3d572f34b9a1dfddefc7/`.
 
 ## Kernel artifact evidence
 
 | Artifact | SHA-256 |
 |---|---|
-| Production kernel ELF | `0b274e9a1f62cd3a86cc360e68a4f9c672335dc0aa2e474971b30bd505fcf61e` |
-| `boot-handoff-pass` kernel ELF | `4ba6310df63c4936585f06be521a18eaab5410ce884cec079c28c5168e3552a5` |
-| `exception-fail-path` kernel ELF | `47843b823f65855d2e1b24e3b13cd9b9a24c16662c71572b3282de9d75097566` |
-| `panic-path` kernel ELF | `d131abfec24206b1793ff9a56c13658cdaf9963b1b5b4d853a668a2dc1494422` |
+| Production kernel ELF | `9360190ba6337f72ab2c8a7b1aaa59d74e3f6a93e4009be26da9e526dc5dcaa8` |
+| `boot-handoff-pass` kernel ELF | `57ee0c5d84603fdfe4dfbb23395b9e69211f96fbb8fff991f95abb8d047fe9ae` |
+| `exception-fail-path` kernel ELF | `74bd4ce857dc0096693bc4b3bf8a01ea3b42e71e056a5c9f3ad1b4b1c121d4d5` |
+| `panic-path` kernel ELF | `d0384412f83b9815be1ad70dfce7fe50ab43b2902f19b5276627db655a6d8d9e` |
 | x86_64 layout manifest | `481c40faa8dff4d2856846e6cb1fd4266ff113ba08da9944be62ab8493cab790` |
-| trusted toolchain identity | `995f1f251acf4e65d7cfd686618dd82920d884de0e8b9b1ddd47d1ab826e9b39` |
+| trusted toolchain identity | `2cd16c0690e243b2d68add2fcbb23f78d4a91e324948e04f19b8209267ecdb93` |
+| host-neutral build-tools identity | `ebf00477133c83f2bd4fc68242d04a8e1c3601880451fe517b926e7a74376674` |
 
 The production artifact is ELF64 x86_64 `ET_EXEC`, enters at
 `0xffffffff80000000`, and has exactly three 4 KiB-aligned non-overlapping
@@ -70,12 +81,14 @@ dynamic segment, relocation segment, TLS segment, interpreter, or production
 test-completion symbol/string. The entry, Rust bridge, exception table and
 representative exception/APIC symbols remain available in the host debug ELF.
 
-## Pending manager-owned functional gate
+## Pending coordinator-owned functional gate
 
 The exact paired Wyrmroot revision, ESP/image identities, VM profile, selector
 requests, fresh serial captures, observed QEMU exit statuses, and GDB entry
 breakpoint evidence must be appended after the coordinator-owned VM run. The
-required outcomes are:
+request is not eligible to run until Wyrmroot produces a clean boot-ready image
+that is bound to this exact Deepwyrm revision and artifact set. The required
+outcomes are:
 
 | Selector | Record | QEMU host status |
 |---|---|---:|

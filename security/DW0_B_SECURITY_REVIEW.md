@@ -3,7 +3,7 @@
 ## Reviewed identity and method
 
 This manual intermediate-phase review covers Deepwyrm commit
-`d827dcbc3723904a2601fee3a9af42e27cdad693`, including the raw x86_64 entry
+`0bc8e6667e27ebd6aa5e3d572f34b9a1dfddefc7`, including the raw x86_64 entry
 boundary, BootInfo intake, early diagnostics, descriptor and exception setup,
 APIC model, test-only completion transport, and host harness planning.
 
@@ -46,9 +46,17 @@ it does not replace the required security review of a future release candidate.
 - Guest-result hashing and parsing use one bounded request buffer, preventing a
   concurrent request replacement from changing the parsed identity after the
   digest is computed.
+- Root and sysroot manifests are each read once through an atomic no-symlink
+  boundary, then hashed and parsed from those exact bytes. The selected target
+  libraries and rustc internal libraries are independently rehashed.
+- The approved deterministic toolchain-tree digest is revalidated without
+  dereferencing its source symlink entries. Host Clang, libclang-cpp, LLVM, and
+  configuration identities are verified before canonical artifact builds.
+- Guest planning validates the complete central profile and selector metadata
+  and binds the GDB stub to loopback only. Bounded request, configuration, and
+  result readers reject symlink traversal.
 
-No Critical, High, or unresolved Medium source-security finding remains within
-DW0-B scope.
+No Critical or High source-security finding remains within DW0-B scope.
 
 ## Accepted deferrals
 
@@ -62,11 +70,32 @@ That is accepted only for DW0-B's single-BSP, interrupts-disabled, terminal
 paths. DW0-C page-table ownership must add guard pages, and SMP or nonterminal
 reuse requires per-CPU stacks.
 
+DW0-B snapshots structurally valid memory-map records but does not establish
+semantic ownership of their physical ranges. DW0-C must validate physical
+width and range semantics, overlaps, reservations, and ownership before it
+constructs replacement mappings.
+
 Command-line and entropy payloads remain physical ranges under the loader's
 immutable transition mappings. DW0-B does not consume them or replace those
 mappings; they must be copied or consumed before the transition CR3 is retired.
 ACPI table traversal is likewise deferred: DW0-B retains only the validated
 RSDP address and never identity-maps all ACPI reclaim or NVS memory.
+
+The fixed system `tar` and `sha256sum` executables, host libc, libstdc++,
+libgcc, kernel, and other ordinary host runtime components remain Medium
+platform assumptions. The accepted Rust artifact also retains absolute source
+symlink entries and historical command text. They are included as
+non-dereferenced tree-digest entries but are not runtime-authorized inputs.
+
+The build-tools verifier and `kernel/build.rs` remain separate commands.
+Canonical rebuild evidence must therefore record the verified absolute Clang
+and configuration paths and set that exact Clang path through
+`DEEPWYRM_CLANG`. Same-user replacement between verification and process
+execution remains a Medium host-integrity limitation.
+
+`guest-result` deliberately reports `freshness_proof: false`. The coordinator
+must create a fresh bounded capture, bind it to the exact request and artifacts,
+and retain the observed exit status; parser success alone is not VM evidence.
 
 ## Disposition
 
