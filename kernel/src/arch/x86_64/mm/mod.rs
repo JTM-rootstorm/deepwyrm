@@ -14,6 +14,7 @@
 use crate::memory::physical::{BASE_PAGE_SIZE, PhysicalAddressLimit};
 
 mod journal;
+pub(crate) mod transition;
 
 #[allow(
     unused_imports,
@@ -22,6 +23,16 @@ mod journal;
 pub(crate) use journal::{
     AtomicPageTableTarget, X86AddressSpacePublishError, X86AddressSpacePublisher,
 };
+#[allow(
+    unused_imports,
+    reason = "the one-shot C1 claim is wired by the later bootstrap integration"
+)]
+pub(crate) use transition::claim_live_transition_mapper;
+#[allow(
+    unused_imports,
+    reason = "the C1 linear facade and terminal handoff precede their C2 consumer"
+)]
+pub(crate) use transition::{LiveTransitionMapper, TransitionActivationHandoff};
 
 const PAGE_SIZE: u64 = BASE_PAGE_SIZE;
 const MAX_MUTATIONS: usize = 4;

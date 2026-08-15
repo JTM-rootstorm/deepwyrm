@@ -418,6 +418,8 @@ Locked handoff rules:
 
 The exact physical and higher-half kernel loading arrangement is implementation detail, but loader and kernel must use one documented linker/handoff scheme and test it in QEMU. Do not duplicate untracked address constants between repositories.
 
+For the accepted DW0-C transition profile, the reviewed loader maps every used transition-table frame, including the active CR3 root, exactly once at `VA == PA` through a supervisor-writable, non-executable, non-global base-page leaf with zero cache-selection bits. This producer guarantee is the narrow unsafe bootstrap anchor for Deepwyrm's first live graph read. Before any transition-table mutation, Deepwyrm revalidates the copied carrier, CPU control state, PAT entry zero, the complete reachable graph, the fixed temporary path, and every required identity alias. This check establishes consistency with the reviewed producer contract; it is not independent physical or cryptographic authentication and does not cover a malicious loader, compromised firmware, unsafe memory corruption, or DMA modification.
+
 ---
 
 # 5. Primordial process contract

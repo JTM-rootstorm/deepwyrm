@@ -255,6 +255,40 @@ pub(crate) struct AllocationGrant {
     range: PageRange,
 }
 
+impl AllocationGrant {
+    pub(crate) const fn physical_start(&self) -> u64 {
+        self.range.start
+    }
+
+    pub(crate) const fn byte_len(&self) -> u64 {
+        self.range.end - self.range.start
+    }
+}
+
+/// Linear record of the exact loader transition-table set imported after
+/// live graph attestation. Keeping this token alive prevents later bootstrap
+/// code from treating those frames as anonymous external memory.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct TransitionTableRoleSet<const CAPACITY: usize> {
+    identities: [FrameRoleIdentity; CAPACITY],
+    count: usize,
+}
+
+impl<const CAPACITY: usize> TransitionTableRoleSet<CAPACITY> {
+    pub(crate) const fn len(&self) -> usize {
+        self.count
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn identity(&self, index: usize) -> Option<FrameRoleIdentity> {
+        if index < self.count {
+            Some(self.identities[index])
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ZeroedGrant {
     identity: FrameRoleIdentity,
@@ -392,6 +426,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }),
         };
         Ok(AllocationGrant { identity, range })
+    }
+
+    /// Revalidates a live allocation grant before architecture code mutates
+    /// its physical contents.
+    pub(crate) fn validate_allocation(
+        &self,
+        grant: &AllocationGrant,
+    ) -> Result<(), FrameRoleError> {
+        let record = self.record(grant.identity)?;
+        if record.range != grant.range || record.role != FrameRole::AllocatedUninitialized {
+            return Err(FrameRoleError::WrongRole);
+        }
+        Ok(())
     }
 
     /// Attests that architecture-owned access initialized every byte in the
@@ -723,6 +770,84 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let pages = self.validate_external_page_range(range)?;
         let identity = self.insert_role(pages, FrameRole::External(role))?;
         Ok(identity)
+    }
+
+    /// Atomically imports the complete live-attested transition-table set.
+    ///
+    /// Every range, overlap, capacity, generation, and identity check finishes
+    /// before the first registry slot changes. Failure therefore imports none
+    /// of the supplied frames.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have consumed a one-shot live transition attestation
+    /// proving that `frames` is the exact, strictly ascending set of retained
+    /// loader table frames for the current root. The accepted loader contract
+    /// supplies their boot provenance and allocator exclusion.
+    #[allow(
+        unsafe_code,
+        reason = "external transition-table provenance is established by the one-shot architecture attestation"
+    )]
+    pub(crate) unsafe fn import_transition_tables<const CAPACITY: usize>(
+        &mut self,
+        frames: &[u64],
+    ) -> Result<TransitionTableRoleSet<CAPACITY>, FrameRoleError> {
+        if frames.is_empty() || frames.len() > CAPACITY {
+            return Err(FrameRoleError::Capacity);
+        }
+
+        let mut ranges = [PageRange::empty(); CAPACITY];
+        let mut slots = [usize::MAX; CAPACITY];
+        let mut generations = [0_u32; CAPACITY];
+        let mut identities = [FrameRoleIdentity::EMPTY; CAPACITY];
+        let mut table_indices = [0_u32; CAPACITY];
+
+        for (index, &frame) in frames.iter().enumerate() {
+            if index != 0 && frames[index - 1] >= frame {
+                return Err(FrameRoleError::Overlap);
+            }
+            let range = PageRange::from_page_count(frame, 1, self.allocator.physical_limit())?;
+            ranges[index] = self.validate_external_pages(range)?;
+            table_indices[index] = u32::try_from(index).map_err(|_| FrameRoleError::Capacity)?;
+        }
+
+        let mut selected = 0;
+        for (slot, role) in self.roles.iter().enumerate() {
+            if role.record.is_some() {
+                continue;
+            }
+            let generation = role
+                .generation
+                .checked_add(1)
+                .filter(|next| *next != 0)
+                .ok_or(FrameRoleError::GenerationExhausted)?;
+            slots[selected] = slot;
+            generations[selected] = generation;
+            identities[selected] = self.identity(slot, generation)?;
+            selected += 1;
+            if selected == frames.len() {
+                break;
+            }
+        }
+        if selected != frames.len() {
+            return Err(FrameRoleError::Capacity);
+        }
+
+        for index in 0..frames.len() {
+            self.roles[slots[index]] = RoleSlot {
+                generation: generations[index],
+                record: Some(RoleRecord {
+                    range: ranges[index],
+                    role: FrameRole::External(ExternalFrameRole::TransitionTable {
+                        table_index: table_indices[index],
+                    }),
+                }),
+            };
+        }
+        Ok(TransitionTableRoleSet {
+            identities,
+            count: frames.len(),
+        })
     }
 
     /// Imports immutable module pages as typed read-only object backing.
@@ -1533,6 +1658,66 @@ mod tests {
             error.into_grant().kind(),
             ObjectBackingKind::ImmutableModule { module_index: 7 }
         ));
+        assert_eq!(roles.check_invariants(), Ok(()));
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "the host model supplies an exact synthetic live transition-table set"
+    )]
+    fn transition_table_set_import_is_atomic_and_exact() {
+        let limit = PhysicalAddressLimit::new(1_u64 << 40).unwrap();
+        let candidate = PageRange::from_page_count(BASE_PAGE_SIZE, 1, limit).unwrap();
+        let allocator =
+            PhysicalFrameAllocator::<1>::from_candidates(&[candidate], limit, []).unwrap();
+        let mut capacity_limited = FrameRoleManager::<1, 1>::new(allocator).unwrap();
+
+        // SAFETY: both synthetic external frames are page-aligned, retained,
+        // strictly ordered, and disjoint from the allocator.
+        assert_eq!(
+            unsafe { capacity_limited.import_transition_tables::<4>(&[0x20_000, 0x21_000]) },
+            Err(FrameRoleError::Capacity)
+        );
+        assert_eq!(capacity_limited.check_invariants(), Ok(()));
+
+        // A successful import of the first frame proves the failed batch did
+        // not partially consume the sole role slot.
+        // SAFETY: this one-frame set has the same synthetic provenance.
+        let imported =
+            unsafe { capacity_limited.import_transition_tables::<4>(&[0x20_000]) }.unwrap();
+        assert_eq!(imported.len(), 1);
+        assert_eq!(
+            capacity_limited.role(imported.identity(0).unwrap()),
+            Ok(FrameRoleKind::External(
+                ExternalFrameRole::TransitionTable { table_index: 0 }
+            ))
+        );
+        assert_eq!(capacity_limited.check_invariants(), Ok(()));
+
+        let allocator =
+            PhysicalFrameAllocator::<1>::from_candidates(&[candidate], limit, []).unwrap();
+        let mut roles = FrameRoleManager::<1, 4>::new(allocator).unwrap();
+        // SAFETY: the deliberately duplicated set exercises prepublication
+        // rejection; no role may be installed.
+        assert_eq!(
+            unsafe { roles.import_transition_tables::<4>(&[0x30_000, 0x30_000]) },
+            Err(FrameRoleError::Overlap)
+        );
+        // SAFETY: the corrected exact set is ordered and allocator-disjoint.
+        let imported =
+            unsafe { roles.import_transition_tables::<4>(&[0x30_000, 0x31_000]) }.unwrap();
+        assert_eq!(imported.len(), 2);
+        for index in 0..2 {
+            assert_eq!(
+                roles.role(imported.identity(index).unwrap()),
+                Ok(FrameRoleKind::External(
+                    ExternalFrameRole::TransitionTable {
+                        table_index: index as u32,
+                    }
+                ))
+            );
+        }
         assert_eq!(roles.check_invariants(), Ok(()));
     }
 

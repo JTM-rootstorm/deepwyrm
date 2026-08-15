@@ -1,0 +1,1615 @@
+//! Live loader page-table attestation for the DW0-C1 transition window.
+//!
+//! Boot intake proves that the paging carrier is structurally well formed.
+//! This module separately reconciles that copied declaration with CPU state
+//! and the complete live four-level table graph before any temporary entry is
+//! allowed to change.
+
+#![allow(
+    dead_code,
+    reason = "DW0-C1 establishes the live transition boundary before C2 consumes its mapper"
+)]
+
+use super::{
+    ACCESSED, CACHE_DISABLE, DIRTY, FrameAddress, GLOBAL, HUGE, NO_EXECUTE, PAGE_SIZE,
+    PERMITTED_ENTRY_FLAGS, PRESENT, PagingCapabilities, SOFTWARE_HIGH, SOFTWARE_LOW, USER,
+    WRITABLE, WRITE_THROUGH,
+};
+use crate::boot::ValidatedPagingHandoff;
+use crate::memory::frame_roles::{
+    AllocationGrant, FrameRoleError, FrameRoleManager, TransitionTableRoleSet, ZeroedGrant,
+};
+use core::convert::Infallible;
+use core::marker::PhantomData;
+use core::sync::atomic::{AtomicU8, Ordering};
+use deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT;
+
+mod private {
+    use super::*;
+
+    const ENTRY_COUNT: usize = 512;
+    const MAX_TABLE_FRAMES: usize = DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT as usize;
+    const LOW_CANONICAL_LIMIT: u64 = 1_u64 << 47;
+    const ADDRESS_OFFSET_MASK: u64 = PAGE_SIZE - 1;
+    const DISALLOWED_TABLE_FLAGS: u64 =
+        USER | WRITE_THROUGH | CACHE_DISABLE | HUGE | GLOBAL | SOFTWARE_LOW | SOFTWARE_HIGH;
+    const DISALLOWED_LEAF_FLAGS: u64 =
+        USER | WRITE_THROUGH | CACHE_DISABLE | HUGE | GLOBAL | SOFTWARE_LOW | SOFTWARE_HIGH;
+
+    /// CPU facts captured at the non-reentrant BSP transition boundary.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) struct TransitionCpuState {
+        pub(super) physical_address_width: u8,
+        pub(super) cr3: u64,
+        pub(super) cpl: u8,
+        pub(super) paging_enabled: bool,
+        pub(super) long_mode_active: bool,
+        pub(super) four_level_paging: bool,
+        pub(super) no_execute_enabled: bool,
+        pub(super) write_protect_enabled: bool,
+        pub(super) interrupts_enabled: bool,
+        pub(super) pcid_enabled: bool,
+        pub(super) global_pages_enabled: bool,
+        pub(super) pat_supported: bool,
+        pub(super) pat_entry_zero: u8,
+    }
+
+    /// A fixed snapshot extracted from already-validated boot intake.
+    pub(super) struct TransitionHandoff {
+        physical_address_width: u8,
+        cr3_root_physical: u64,
+        temporary_virtual_address: u64,
+        temporary_indices: [usize; 4],
+        temporary_child_frames: [u64; 3],
+        table_frames: [u64; MAX_TABLE_FRAMES],
+        table_frame_count: usize,
+    }
+
+    impl TransitionHandoff {
+        #[allow(
+            dead_code,
+            reason = "host tests construct the post-intake snapshot directly; production consumes validated boot intake"
+        )]
+        pub(super) fn from_validated(
+            handoff: &ValidatedPagingHandoff,
+        ) -> Result<Self, TransitionAttestationError<core::convert::Infallible>> {
+            let header = handoff.header();
+            let physical_address_width = u8::try_from(header.physical_address_width)
+                .map_err(|_| TransitionAttestationError::InvalidCarrier)?;
+            let table_frame_count = handoff.table_frame_count();
+            if table_frame_count == 0 || table_frame_count > MAX_TABLE_FRAMES {
+                return Err(TransitionAttestationError::InvalidCarrier);
+            }
+            let mut table_frames = [0_u64; MAX_TABLE_FRAMES];
+            for (index, frame) in table_frames[..table_frame_count].iter_mut().enumerate() {
+                *frame = handoff
+                    .table_frame(index)
+                    .map_err(|_| TransitionAttestationError::InvalidCarrier)?;
+            }
+            Ok(Self {
+                physical_address_width,
+                cr3_root_physical: header.cr3_root_physical,
+                temporary_virtual_address: header.temporary_virtual_address,
+                temporary_indices: [
+                    usize::from(header.pml4_index),
+                    usize::from(header.pdpt_index),
+                    usize::from(header.pd_index),
+                    usize::from(header.pt_index),
+                ],
+                temporary_child_frames: [
+                    header.temporary_pdpt_frame_physical,
+                    header.temporary_pd_frame_physical,
+                    header.temporary_pt_frame_physical,
+                ],
+                table_frames,
+                table_frame_count,
+            })
+        }
+
+        fn contains_table_frame(&self, frame: u64) -> bool {
+            self.table_frames[..self.table_frame_count]
+                .binary_search(&frame)
+                .is_ok()
+        }
+    }
+
+    /// Narrow physical-table reader used only while the declared loader root is
+    /// still current. Its production implementation is supplied by the linear
+    /// DW0-C1 transition mapper boundary.
+    pub(super) trait TransitionTableReader {
+        type Error;
+
+        fn read_entry(&mut self, table: FrameAddress, index: usize) -> Result<u64, Self::Error>;
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum TransitionAttestationError<E> {
+        Access(E),
+        #[allow(
+            dead_code,
+            reason = "constructed by the target-only validated-handoff adapter"
+        )]
+        InvalidCarrier,
+        WrongProcessorState,
+        WrongControlState,
+        WrongRoot,
+        InvalidEntry,
+        UnlistedTable,
+        AliasedOrCyclicTable,
+        IncompleteTableGraph,
+        InvalidTemporaryPath,
+        TemporaryLeafPresent,
+        InvalidIdentityAlias,
+    }
+
+    /// Linear proof that the copied carrier describes the exact live root.
+    ///
+    /// This value deliberately is neither `Copy` nor `Clone`. Later DW0-C1 work
+    /// consumes it to construct the temporary mapper; it is not itself permission
+    /// to write CR3.
+    #[derive(Debug)]
+    pub(super) struct AttestedTransition {
+        capabilities: PagingCapabilities,
+        root: FrameAddress,
+        temporary_virtual_address: u64,
+        temporary_pt_frame: FrameAddress,
+        temporary_leaf_index: usize,
+        table_frames: [u64; MAX_TABLE_FRAMES],
+        table_frame_count: usize,
+    }
+
+    impl AttestedTransition {
+        pub(super) const fn capabilities(&self) -> PagingCapabilities {
+            self.capabilities
+        }
+
+        pub(super) const fn root(&self) -> FrameAddress {
+            self.root
+        }
+
+        pub(super) const fn temporary_virtual_address(&self) -> u64 {
+            self.temporary_virtual_address
+        }
+
+        pub(super) const fn temporary_pt_frame(&self) -> FrameAddress {
+            self.temporary_pt_frame
+        }
+
+        fn contains_transition_table(&self, frame: FrameAddress) -> bool {
+            self.table_frames[..self.table_frame_count].contains(&frame.address())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct TableNode {
+        frame: FrameAddress,
+        level: u8,
+        virtual_prefix: u64,
+        writable_path: bool,
+    }
+
+    const EMPTY_NODE: TableNode = TableNode {
+        frame: FrameAddress(0),
+        level: 0,
+        virtual_prefix: 0,
+        writable_path: false,
+    };
+
+    pub(super) fn attest_transition<R: TransitionTableReader>(
+        cpu: TransitionCpuState,
+        handoff: &TransitionHandoff,
+        reader: &mut R,
+    ) -> Result<AttestedTransition, TransitionAttestationError<R::Error>> {
+        if cpu.cpl != 0 {
+            return Err(TransitionAttestationError::WrongProcessorState);
+        }
+        if cpu.interrupts_enabled
+            || cpu.pcid_enabled
+            || cpu.global_pages_enabled
+            || !cpu.paging_enabled
+            || !cpu.long_mode_active
+            || !cpu.four_level_paging
+            || !cpu.no_execute_enabled
+            || !cpu.write_protect_enabled
+            || !cpu.pat_supported
+            || cpu.pat_entry_zero != 6
+            || cpu.physical_address_width != handoff.physical_address_width
+        {
+            return Err(TransitionAttestationError::WrongControlState);
+        }
+        if cpu.cr3 & ADDRESS_OFFSET_MASK != 0 || cpu.cr3 != handoff.cr3_root_physical {
+            return Err(TransitionAttestationError::WrongRoot);
+        }
+
+        let capabilities = PagingCapabilities::validate(
+            cpu.physical_address_width,
+            cpu.four_level_paging,
+            cpu.no_execute_enabled,
+            cpu.write_protect_enabled,
+        )
+        .map_err(|_| TransitionAttestationError::WrongControlState)?;
+        let root = FrameAddress::new(cpu.cr3, capabilities.physical_limit())
+            .map_err(|_| TransitionAttestationError::WrongRoot)?;
+        if handoff.table_frames[..handoff.table_frame_count]
+            .iter()
+            .any(|frame| *frame >= LOW_CANONICAL_LIMIT)
+        {
+            return Err(TransitionAttestationError::InvalidIdentityAlias);
+        }
+        if !handoff.contains_table_frame(root.address()) {
+            return Err(TransitionAttestationError::UnlistedTable);
+        }
+
+        attest_complete_graph(handoff, capabilities, root, reader)?;
+        attest_temporary_path(handoff, capabilities, root, reader)?;
+
+        let temporary_pt_frame = FrameAddress::new(
+            handoff.temporary_child_frames[2],
+            capabilities.physical_limit(),
+        )
+        .map_err(|_| TransitionAttestationError::InvalidTemporaryPath)?;
+        Ok(AttestedTransition {
+            capabilities,
+            root,
+            temporary_virtual_address: handoff.temporary_virtual_address,
+            temporary_pt_frame,
+            temporary_leaf_index: handoff.temporary_indices[3],
+            table_frames: handoff.table_frames,
+            table_frame_count: handoff.table_frame_count,
+        })
+    }
+
+    /// Raw operations beneath the single-page transition window.
+    ///
+    /// # Safety
+    ///
+    /// An implementation must address the exact still-active transition root used
+    /// by [`attest_transition`]. Leaf access must use aligned atomics; invalidation
+    /// and window writes must be infallible, ordered architecture operations.
+    /// Window accesses must address only the frame currently installed in that
+    /// leaf and must not retain references.
+    #[allow(
+        unsafe_code,
+        reason = "volatile scratch-leaf and mapped-window behavior is an architecture safety contract"
+    )]
+    pub(super) unsafe trait TransitionScratchBackend: TransitionTableReader {
+        fn load_temporary_leaf(&mut self, table: FrameAddress, index: usize) -> u64;
+        fn compare_exchange_temporary_leaf(
+            &mut self,
+            table: FrameAddress,
+            index: usize,
+            current: u64,
+            new: u64,
+        ) -> Result<(), u64>;
+        fn invalidate_temporary_page(&mut self, virtual_address: u64);
+        fn write_window_u64(&mut self, index: usize, value: u64);
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum TransitionScratchError<E> {
+        Access(E),
+        Busy,
+        TransitionTableAlias,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum TransitionZeroError<E> {
+        InvalidAllocation,
+        Scratch(TransitionScratchError<E>),
+        FrameRole(FrameRoleError),
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    pub(crate) struct TransitionZeroFailure<E> {
+        error: TransitionZeroError<E>,
+        grant: AllocationGrant,
+    }
+
+    impl<E> TransitionZeroFailure<E> {
+        pub(super) const fn error(&self) -> &TransitionZeroError<E> {
+            &self.error
+        }
+
+        pub(super) fn into_grant(self) -> AllocationGrant {
+            self.grant
+        }
+    }
+
+    /// Exclusive mapper for the one loader-provided transition page.
+    ///
+    /// Every operation begins and ends with the temporary leaf exactly zero. The
+    /// API exposes values rather than mapped references, so no alias can outlive a
+    /// remap. This value is intentionally linear and has no `Clone`/`Copy` impl.
+    struct TransitionScratchMapper<B> {
+        attested: AttestedTransition,
+        backend: B,
+        poisoned: bool,
+        _not_send_sync: PhantomData<*mut ()>,
+    }
+
+    impl<B: TransitionScratchBackend> TransitionScratchMapper<B> {
+        pub(super) fn from_attested(
+            attested: AttestedTransition,
+            mut backend: B,
+        ) -> Result<Self, TransitionScratchError<B::Error>> {
+            let leaf = backend
+                .load_temporary_leaf(attested.temporary_pt_frame, attested.temporary_leaf_index);
+            if leaf != 0 {
+                return Err(TransitionScratchError::Busy);
+            }
+            Ok(Self {
+                attested,
+                backend,
+                poisoned: false,
+                _not_send_sync: PhantomData,
+            })
+        }
+
+        pub(super) const fn capabilities(&self) -> PagingCapabilities {
+            self.attested.capabilities
+        }
+
+        fn zero_frame_unchecked(
+            &mut self,
+            frame: FrameAddress,
+        ) -> Result<(), TransitionScratchError<B::Error>> {
+            self.with_frame(frame, |backend| {
+                for index in 0..ENTRY_COUNT {
+                    backend.write_window_u64(index, 0);
+                }
+            })
+        }
+
+        /// Zeroes a complete allocator grant and consumes it into the manager's
+        /// typed zeroed state. All frame addresses are validated before the first
+        /// byte changes; a failure returns the still-owned allocation grant.
+        #[allow(
+            unsafe_code,
+            reason = "exclusive physical zeroing is immediately consumed into the typed frame-role transition"
+        )]
+        pub(super) fn zero_allocation<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
+            &mut self,
+            roles: &mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
+            grant: AllocationGrant,
+        ) -> Result<ZeroedGrant, TransitionZeroFailure<B::Error>> {
+            if let Err(error) = roles.validate_allocation(&grant) {
+                return Err(TransitionZeroFailure {
+                    error: TransitionZeroError::FrameRole(error),
+                    grant,
+                });
+            }
+            let start = grant.physical_start();
+            let byte_len = grant.byte_len();
+            if byte_len == 0 || !byte_len.is_multiple_of(PAGE_SIZE) {
+                return Err(TransitionZeroFailure {
+                    error: TransitionZeroError::InvalidAllocation,
+                    grant,
+                });
+            }
+            let mut offset = 0_u64;
+            while offset < byte_len {
+                if FrameAddress::new(start + offset, self.capabilities().physical_limit()).is_err()
+                {
+                    return Err(TransitionZeroFailure {
+                        error: TransitionZeroError::InvalidAllocation,
+                        grant,
+                    });
+                }
+                offset += PAGE_SIZE;
+            }
+
+            offset = 0;
+            while offset < byte_len {
+                let frame = FrameAddress::new(start + offset, self.capabilities().physical_limit())
+                    .expect("complete allocation range was prevalidated");
+                if let Err(error) = self.zero_frame_unchecked(frame) {
+                    return Err(TransitionZeroFailure {
+                        error: TransitionZeroError::Scratch(error),
+                        grant,
+                    });
+                }
+                offset += PAGE_SIZE;
+            }
+
+            // SAFETY: the exclusive scratch mapper wrote zero to every u64 in
+            // every page of the grant and completed each unmap/invalidation before
+            // this role transition. The non-Copy grant remained exclusively owned.
+            match unsafe { roles.assume_zeroed(grant) } {
+                Ok(zeroed) => Ok(zeroed),
+                Err(error) => Err(TransitionZeroFailure {
+                    error: TransitionZeroError::FrameRole(error.error()),
+                    grant: error.into_grant(),
+                }),
+            }
+        }
+
+        fn with_frame<T>(
+            &mut self,
+            frame: FrameAddress,
+            operation: impl FnOnce(&mut B) -> T,
+        ) -> Result<T, TransitionScratchError<B::Error>> {
+            assert!(!self.poisoned, "transition scratch mapper is poisoned");
+            if self.attested.contains_transition_table(frame) {
+                return Err(TransitionScratchError::TransitionTableAlias);
+            }
+            let installed = frame.address() | PRESENT | WRITABLE | NO_EXECUTE;
+            if self
+                .backend
+                .compare_exchange_temporary_leaf(
+                    self.attested.temporary_pt_frame,
+                    self.attested.temporary_leaf_index,
+                    0,
+                    installed,
+                )
+                .is_err()
+            {
+                return Err(TransitionScratchError::Busy);
+            }
+            self.backend
+                .invalidate_temporary_page(self.attested.temporary_virtual_address);
+            let result = operation(&mut self.backend);
+
+            let mut expected = installed;
+            for _ in 0..3 {
+                match self.backend.compare_exchange_temporary_leaf(
+                    self.attested.temporary_pt_frame,
+                    self.attested.temporary_leaf_index,
+                    expected,
+                    0,
+                ) {
+                    Ok(()) => {
+                        self.backend
+                            .invalidate_temporary_page(self.attested.temporary_virtual_address);
+                        return Ok(result);
+                    }
+                    Err(observed) if observed & !(ACCESSED | DIRTY) == installed => {
+                        expected = observed;
+                    }
+                    Err(observed) => {
+                        self.poisoned = true;
+                        panic!("hostile transition scratch leaf drift: observed {observed:#018x}");
+                    }
+                }
+            }
+            self.poisoned = true;
+            panic!("transition scratch leaf did not converge after A/D drift");
+        }
+    }
+
+    fn attest_complete_graph<R: TransitionTableReader>(
+        handoff: &TransitionHandoff,
+        capabilities: PagingCapabilities,
+        root: FrameAddress,
+        reader: &mut R,
+    ) -> Result<(), TransitionAttestationError<R::Error>> {
+        let mut pending = [EMPTY_NODE; MAX_TABLE_FRAMES];
+        let mut visited = [0_u64; MAX_TABLE_FRAMES];
+        pending[0] = TableNode {
+            frame: root,
+            level: 3,
+            virtual_prefix: 0,
+            writable_path: true,
+        };
+        let mut identity_alias_counts = [0_u8; MAX_TABLE_FRAMES];
+        let mut pending_count = 1;
+        let mut cursor = 0;
+        let mut visited_count = 0;
+
+        while cursor < pending_count {
+            let node = pending[cursor];
+            cursor += 1;
+            if visited[..visited_count].contains(&node.frame.address()) {
+                return Err(TransitionAttestationError::AliasedOrCyclicTable);
+            }
+            if visited_count == MAX_TABLE_FRAMES {
+                return Err(TransitionAttestationError::IncompleteTableGraph);
+            }
+            visited[visited_count] = node.frame.address();
+            visited_count += 1;
+
+            for index in 0..ENTRY_COUNT {
+                let entry = reader
+                    .read_entry(node.frame, index)
+                    .map_err(TransitionAttestationError::Access)?;
+                if entry & PRESENT == 0 {
+                    if entry != 0 {
+                        return Err(TransitionAttestationError::InvalidEntry);
+                    }
+                    continue;
+                }
+                validate_entry_bits(entry, capabilities, node.level == 0)?;
+                if node.level == 0 {
+                    let mapped_frame = entry & physical_address_mask(capabilities);
+                    if let Ok(table_index) = handoff.table_frames[..handoff.table_frame_count]
+                        .binary_search(&mapped_frame)
+                    {
+                        let virtual_address =
+                            entry_virtual_address(node.virtual_prefix, index, node.level);
+                        let required = PRESENT | WRITABLE | NO_EXECUTE;
+                        if virtual_address != mapped_frame
+                            || !node.writable_path
+                            || entry & !(ACCESSED | DIRTY) != mapped_frame | required
+                            || identity_alias_counts[table_index] != 0
+                        {
+                            return Err(TransitionAttestationError::InvalidIdentityAlias);
+                        }
+                        identity_alias_counts[table_index] = 1;
+                    }
+                    continue;
+                }
+                let child_address = entry & physical_address_mask(capabilities);
+                if !handoff.contains_table_frame(child_address) {
+                    return Err(TransitionAttestationError::UnlistedTable);
+                }
+                let child = FrameAddress::new(child_address, capabilities.physical_limit())
+                    .map_err(|_| TransitionAttestationError::InvalidEntry)?;
+                if pending_count == MAX_TABLE_FRAMES {
+                    return Err(TransitionAttestationError::IncompleteTableGraph);
+                }
+                pending[pending_count] = TableNode {
+                    frame: child,
+                    level: node.level - 1,
+                    virtual_prefix: entry_virtual_address(node.virtual_prefix, index, node.level),
+                    writable_path: node.writable_path && entry & WRITABLE != 0,
+                };
+                pending_count += 1;
+            }
+        }
+
+        if visited_count != handoff.table_frame_count
+            || handoff.table_frames[..handoff.table_frame_count]
+                .iter()
+                .any(|frame| !visited[..visited_count].contains(frame))
+            || identity_alias_counts[..handoff.table_frame_count]
+                .iter()
+                .any(|count| *count != 1)
+        {
+            return Err(TransitionAttestationError::IncompleteTableGraph);
+        }
+        Ok(())
+    }
+
+    fn attest_temporary_path<R: TransitionTableReader>(
+        handoff: &TransitionHandoff,
+        capabilities: PagingCapabilities,
+        root: FrameAddress,
+        reader: &mut R,
+    ) -> Result<(), TransitionAttestationError<R::Error>> {
+        let mut table = root;
+        for depth in 0..3 {
+            let entry = reader
+                .read_entry(table, handoff.temporary_indices[depth])
+                .map_err(TransitionAttestationError::Access)?;
+            validate_entry_bits(entry, capabilities, false)?;
+            if entry & WRITABLE == 0
+                || entry & DISALLOWED_TABLE_FLAGS != 0
+                || entry & physical_address_mask(capabilities)
+                    != handoff.temporary_child_frames[depth]
+            {
+                return Err(TransitionAttestationError::InvalidTemporaryPath);
+            }
+            table = FrameAddress::new(
+                handoff.temporary_child_frames[depth],
+                capabilities.physical_limit(),
+            )
+            .map_err(|_| TransitionAttestationError::InvalidTemporaryPath)?;
+        }
+        let leaf = reader
+            .read_entry(table, handoff.temporary_indices[3])
+            .map_err(TransitionAttestationError::Access)?;
+        if leaf != 0 {
+            return Err(TransitionAttestationError::TemporaryLeafPresent);
+        }
+        Ok(())
+    }
+
+    fn validate_entry_bits<E>(
+        entry: u64,
+        capabilities: PagingCapabilities,
+        leaf: bool,
+    ) -> Result<(), TransitionAttestationError<E>> {
+        let address_mask = physical_address_mask(capabilities);
+        if entry & !(address_mask | PERMITTED_ENTRY_FLAGS) != 0
+            || entry & PRESENT == 0
+            || entry
+                & if leaf {
+                    DISALLOWED_LEAF_FLAGS
+                } else {
+                    DISALLOWED_TABLE_FLAGS
+                }
+                != 0
+        {
+            return Err(TransitionAttestationError::InvalidEntry);
+        }
+        let address = entry & address_mask;
+        if address == 0
+            || address & ADDRESS_OFFSET_MASK != 0
+            || address >= capabilities.physical_limit().exclusive()
+            || (leaf && entry & WRITABLE != 0 && entry & NO_EXECUTE == 0)
+        {
+            return Err(TransitionAttestationError::InvalidEntry);
+        }
+        let _hardware_mutable = entry & (ACCESSED | DIRTY);
+        Ok(())
+    }
+
+    fn physical_address_mask(capabilities: PagingCapabilities) -> u64 {
+        (capabilities.physical_limit().exclusive() - 1) & !ADDRESS_OFFSET_MASK
+    }
+
+    fn entry_virtual_address(prefix: u64, index: usize, level: u8) -> u64 {
+        let shift = 12 + u32::from(level) * 9;
+        let address = prefix | ((index as u64) << shift);
+        if address & (1_u64 << 47) != 0 {
+            address | 0xffff_0000_0000_0000
+        } else {
+            address
+        }
+    }
+
+    const LIVE_TRANSITION_UNCLAIMED: u8 = 0;
+    const LIVE_TRANSITION_ATTESTING: u8 = 1;
+    const LIVE_TRANSITION_OWNED: u8 = 2;
+    const LIVE_TRANSITION_POISONED: u8 = 3;
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    static LIVE_TRANSITION_STATE: AtomicU8 = AtomicU8::new(LIVE_TRANSITION_UNCLAIMED);
+
+    fn claim_transition_state(state: &AtomicU8) -> Result<(), ()> {
+        state
+            .compare_exchange(
+                LIVE_TRANSITION_UNCLAIMED,
+                LIVE_TRANSITION_ATTESTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|_| ())
+    }
+
+    /// Production failure before the linear temporary mapper becomes available.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum LiveTransitionError {
+        AlreadyClaimed,
+        InvalidCarrier,
+        Attestation(TransitionAttestationError<Infallible>),
+        Scratch(TransitionScratchError<Infallible>),
+        FrameRole(FrameRoleError),
+        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+        TargetUnavailable,
+    }
+
+    /// The sole live DW0-C1 transition mapper.
+    pub(crate) struct LiveTransitionMapper {
+        mapper: TransitionScratchMapper<LiveTransitionBackend>,
+        _transition_roles: TransitionTableRoleSet<MAX_TABLE_FRAMES>,
+    }
+
+    /// Terminal C1 handoff consumed by the later C2 activation operation.
+    ///
+    /// It deliberately exposes no mapper methods: after conversion, scratch
+    /// authority cannot be used independently of the future consuming CR3 switch.
+    pub(crate) struct TransitionActivationHandoff(LiveTransitionMapper);
+
+    impl LiveTransitionMapper {
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        pub(crate) fn zero_allocation<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
+            &mut self,
+            roles: &mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
+            grant: AllocationGrant,
+        ) -> Result<ZeroedGrant, TransitionZeroFailure<Infallible>> {
+            self.mapper.zero_allocation(roles, grant)
+        }
+
+        pub(crate) fn into_activation_handoff(self) -> TransitionActivationHandoff {
+            TransitionActivationHandoff(self)
+        }
+
+        fn from_private_parts(
+            mapper: TransitionScratchMapper<LiveTransitionBackend>,
+            transition_roles: TransitionTableRoleSet<MAX_TABLE_FRAMES>,
+        ) -> Self {
+            Self {
+                mapper,
+                _transition_roles: transition_roles,
+            }
+        }
+    }
+
+    /// Claims and attests the loader transition root, atomically imports its exact
+    /// table set into the authoritative role registry, and returns the only mapper
+    /// allowed to mutate its fixed temporary leaf.
+    ///
+    /// # Safety
+    ///
+    /// Calling this function is the explicit unsafe assertion of exclusive
+    /// early-transition ownership. The caller must be the BSP on the one-shot
+    /// early boot path, before any AP startup, at CPL0 with IF clear, and must
+    /// own the sole boot-memory role manager. The atomic claim makes that
+    /// assertion linear within Deepwyrm; it cannot observe BSP/AP ownership
+    /// independently. This boundary trusts the accepted loader's integrity and
+    /// self-consistency contract for the exact CR3 root and retained identity
+    /// aliases; the live walk does not independently or cryptographically prove
+    /// physical authenticity against a malicious loader, firmware/unsafe memory
+    /// corruption, or DMA. Failure poisons this transition opportunity; callers
+    /// must not continue boot or try to reconstruct a mapper.
+    #[allow(
+        unsafe_code,
+        reason = "one-shot live CPU observation and transition-table identity access"
+    )]
+    pub(crate) unsafe fn claim_live_transition_mapper<
+        const RANGE_CAPACITY: usize,
+        const ROLE_CAPACITY: usize,
+    >(
+        handoff: &ValidatedPagingHandoff,
+        roles: &mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
+    ) -> Result<LiveTransitionMapper, LiveTransitionError> {
+        claim_live_transition_mapper_impl(handoff, roles)
+    }
+
+    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    fn claim_live_transition_mapper_impl<
+        const RANGE_CAPACITY: usize,
+        const ROLE_CAPACITY: usize,
+    >(
+        handoff: &ValidatedPagingHandoff,
+        roles: &mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
+    ) -> Result<LiveTransitionMapper, LiveTransitionError> {
+        let _ = (handoff, roles);
+        Err(LiveTransitionError::TargetUnavailable)
+    }
+
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    #[allow(
+        unsafe_code,
+        reason = "the unsafe one-shot facade delegates live register observation and attested external-role import here"
+    )]
+    fn claim_live_transition_mapper_impl<
+        const RANGE_CAPACITY: usize,
+        const ROLE_CAPACITY: usize,
+    >(
+        handoff: &ValidatedPagingHandoff,
+        roles: &mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
+    ) -> Result<LiveTransitionMapper, LiveTransitionError> {
+        let handoff = TransitionHandoff::from_validated(handoff)
+            .map_err(|_| LiveTransitionError::InvalidCarrier)?;
+        claim_transition_state(&LIVE_TRANSITION_STATE)
+            .map_err(|_| LiveTransitionError::AlreadyClaimed)?;
+
+        // SAFETY: this function's caller establishes the documented bootstrap CPU
+        // state and transition mapping lifetime.
+        let cpu = unsafe { observe_live_transition_cpu() };
+        let mut backend = LiveTransitionBackend {
+            temporary_virtual_address: handoff.temporary_virtual_address,
+        };
+        let attested = match attest_transition(cpu, &handoff, &mut backend) {
+            Ok(attested) => attested,
+            Err(error) => {
+                LIVE_TRANSITION_STATE.store(LIVE_TRANSITION_POISONED, Ordering::Release);
+                return Err(LiveTransitionError::Attestation(error));
+            }
+        };
+        let mapper = match TransitionScratchMapper::from_attested(attested, backend) {
+            Ok(mapper) => mapper,
+            Err(error) => {
+                LIVE_TRANSITION_STATE.store(LIVE_TRANSITION_POISONED, Ordering::Release);
+                return Err(LiveTransitionError::Scratch(error));
+            }
+        };
+        // SAFETY: the consumed live attestation retained in `mapper` proves this
+        // exact sorted set is the current transition graph; the unsafe entry
+        // contract supplies the accepted loader provenance and sole role manager.
+        let transition_roles = match unsafe {
+            roles.import_transition_tables::<MAX_TABLE_FRAMES>(
+                &mapper.attested.table_frames[..mapper.attested.table_frame_count],
+            )
+        } {
+            Ok(roles) => roles,
+            Err(error) => {
+                LIVE_TRANSITION_STATE.store(LIVE_TRANSITION_POISONED, Ordering::Release);
+                return Err(LiveTransitionError::FrameRole(error));
+            }
+        };
+        LIVE_TRANSITION_STATE.store(LIVE_TRANSITION_OWNED, Ordering::Release);
+        Ok(LiveTransitionMapper::from_private_parts(
+            mapper,
+            transition_roles,
+        ))
+    }
+
+    struct LiveTransitionBackend {
+        temporary_virtual_address: u64,
+    }
+
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    impl TransitionTableReader for LiveTransitionBackend {
+        type Error = Infallible;
+
+        #[allow(
+            unsafe_code,
+            reason = "the attested carrier guarantees identity aliases for every transition table"
+        )]
+        fn read_entry(&mut self, table: FrameAddress, index: usize) -> Result<u64, Self::Error> {
+            debug_assert!(index < ENTRY_COUNT);
+            let address = table.address() + (index as u64) * 8;
+            // SAFETY: construction is confined to the loader transition lifetime;
+            // the carrier enumerates this complete reserved table frame and the
+            // loader contract supplies its supervisor identity alias.
+            Ok(unsafe { core::ptr::read_volatile(address as *const u64) })
+        }
+    }
+
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    #[allow(
+        unsafe_code,
+        reason = "volatile transition PTE/window access and invlpg are the audited DW0-C1 boundary"
+    )]
+    unsafe impl TransitionScratchBackend for LiveTransitionBackend {
+        fn load_temporary_leaf(&mut self, table: FrameAddress, index: usize) -> u64 {
+            debug_assert!(index < ENTRY_COUNT);
+            let address = table.address() + (index as u64) * 8;
+            // SAFETY: each x86_64 PTE is naturally aligned and the accepted loader
+            // contract retains this exact identity alias through transition. All
+            // Deepwyrm access to the scratch leaf uses this atomic protocol.
+            unsafe { (&*(address as *const core::sync::atomic::AtomicU64)).load(Ordering::SeqCst) }
+        }
+
+        fn compare_exchange_temporary_leaf(
+            &mut self,
+            table: FrameAddress,
+            index: usize,
+            current: u64,
+            new: u64,
+        ) -> Result<(), u64> {
+            debug_assert!(index < ENTRY_COUNT);
+            let address = table.address() + (index as u64) * 8;
+            // SAFETY: see `load_temporary_leaf`; compare-exchange is the sole
+            // mutation protocol for this retained, aligned transition PTE.
+            unsafe { &*(address as *const core::sync::atomic::AtomicU64) }
+                .compare_exchange(current, new, Ordering::SeqCst, Ordering::SeqCst)
+                .map(|_| ())
+        }
+
+        fn invalidate_temporary_page(&mut self, virtual_address: u64) {
+            debug_assert_eq!(virtual_address, self.temporary_virtual_address);
+            // SAFETY: `invlpg` is executed at CPL0 for the canonical fixed window
+            // while the attested transition CR3 remains current.
+            unsafe {
+                core::arch::asm!(
+                    "invlpg [{}]",
+                    in(reg) virtual_address,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
+
+        fn write_window_u64(&mut self, index: usize, value: u64) {
+            debug_assert!(index < ENTRY_COUNT);
+            let address = self.temporary_virtual_address + (index as u64) * 8;
+            // SAFETY: the mapper has installed exactly one exclusive page for this
+            // bounded operation and no reference escapes the write.
+            unsafe { core::ptr::write_volatile(address as *mut u64, value) };
+        }
+    }
+
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    #[allow(
+        unsafe_code,
+        reason = "privileged register observation is confined to the documented one-shot BSP boundary"
+    )]
+    unsafe fn observe_live_transition_cpu() -> TransitionCpuState {
+        use core::arch::asm;
+        use core::arch::x86_64::__cpuid;
+
+        // SAFETY: the surrounding unsafe contract guarantees CPL0 early boot.
+        let maximum_leaf = __cpuid(0x8000_0000).eax;
+        // SAFETY: CPUID leaf zero is architecturally available on x86_64.
+        let maximum_basic_leaf = __cpuid(0).eax;
+        let pat_supported = maximum_basic_leaf >= 1
+        // SAFETY: the basic maximum reports leaf one as available.
+        && __cpuid(1).edx & (1 << 16) != 0;
+        let physical_address_width = if maximum_leaf >= 0x8000_0008 {
+            // SAFETY: the extended CPUID leaf was reported present.
+            (__cpuid(0x8000_0008).eax & 0xff) as u8
+        } else {
+            0
+        };
+        let cr0: u64;
+        let cr3: u64;
+        let cr4: u64;
+        let rflags: u64;
+        let cs: u16;
+        let efer_low: u32;
+        let efer_high: u32;
+        // SAFETY: these are read-only observations at the CPL0 BSP boundary.
+        unsafe {
+            asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
+            asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+            asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+            asm!("pushfq", "pop {}", out(reg) rflags, options(nomem, preserves_flags));
+            asm!("mov {:x}, cs", out(reg) cs, options(nomem, nostack, preserves_flags));
+            asm!(
+                "rdmsr",
+                in("ecx") 0xc000_0080_u32,
+                out("eax") efer_low,
+                out("edx") efer_high,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        let efer = u64::from(efer_low) | (u64::from(efer_high) << 32);
+        let pat = if pat_supported {
+            let pat_low: u32;
+            let pat_high: u32;
+            // SAFETY: CPUID.01H:EDX.PAT proved that IA32_PAT is implemented.
+            unsafe {
+                asm!(
+                    "rdmsr",
+                    in("ecx") 0x277_u32,
+                    out("eax") pat_low,
+                    out("edx") pat_high,
+                    options(nomem, nostack, preserves_flags),
+                );
+            }
+            u64::from(pat_low) | (u64::from(pat_high) << 32)
+        } else {
+            0
+        };
+        TransitionCpuState {
+            physical_address_width,
+            cr3,
+            cpl: (cs & 3) as u8,
+            paging_enabled: cr0 & (1 << 31) != 0,
+            long_mode_active: efer & (1 << 10) != 0,
+            four_level_paging: cr4 & (1 << 12) == 0,
+            no_execute_enabled: efer & (1 << 11) != 0,
+            write_protect_enabled: cr0 & (1 << 16) != 0,
+            interrupts_enabled: rflags & (1 << 9) != 0,
+            pcid_enabled: cr4 & (1 << 17) != 0,
+            global_pages_enabled: cr4 & (1 << 7) != 0,
+            pat_supported,
+            pat_entry_zero: pat as u8,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        extern crate std;
+
+        use super::*;
+        use crate::memory::frame_roles::synthetic_frame_role_manager;
+        use std::collections::BTreeMap;
+        use std::vec::Vec;
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum ScratchEvent {
+            LeafLoad(u64),
+            LeafCas {
+                current: u64,
+                new: u64,
+                observed: u64,
+            },
+            Invalidate(u64),
+            WindowWrite(usize, u64),
+        }
+
+        #[derive(Default)]
+        struct FakeReader {
+            entries: BTreeMap<(u64, usize), u64>,
+            mapped_frame: Option<u64>,
+            events: Vec<ScratchEvent>,
+            next_clear_drift: Option<u64>,
+        }
+
+        impl TransitionTableReader for FakeReader {
+            type Error = ();
+
+            fn read_entry(
+                &mut self,
+                table: FrameAddress,
+                index: usize,
+            ) -> Result<u64, Self::Error> {
+                Ok(*self.entries.get(&(table.address(), index)).unwrap_or(&0))
+            }
+        }
+
+        #[allow(
+            unsafe_code,
+            reason = "the host fake models the exact leaf/window relationship in ordinary memory"
+        )]
+        unsafe impl TransitionScratchBackend for FakeReader {
+            fn load_temporary_leaf(&mut self, table: FrameAddress, index: usize) -> u64 {
+                let value = *self.entries.get(&(table.address(), index)).unwrap_or(&0);
+                self.events.push(ScratchEvent::LeafLoad(value));
+                value
+            }
+
+            fn compare_exchange_temporary_leaf(
+                &mut self,
+                table: FrameAddress,
+                index: usize,
+                current: u64,
+                new: u64,
+            ) -> Result<(), u64> {
+                let entry = self.entries.entry((table.address(), index)).or_insert(0);
+                if current != 0
+                    && new == 0
+                    && let Some(drift) = self.next_clear_drift.take()
+                {
+                    *entry |= drift;
+                }
+                let observed = *entry;
+                self.events.push(ScratchEvent::LeafCas {
+                    current,
+                    new,
+                    observed,
+                });
+                if observed != current {
+                    self.mapped_frame =
+                        (observed & PRESENT != 0).then_some(observed & 0x000f_ffff_ffff_f000);
+                    return Err(observed);
+                }
+                *entry = new;
+                self.mapped_frame = (new & PRESENT != 0).then_some(new & 0x000f_ffff_ffff_f000);
+                Ok(())
+            }
+
+            fn invalidate_temporary_page(&mut self, virtual_address: u64) {
+                self.events.push(ScratchEvent::Invalidate(virtual_address));
+            }
+
+            fn write_window_u64(&mut self, index: usize, value: u64) {
+                self.events.push(ScratchEvent::WindowWrite(index, value));
+                let frame = self.mapped_frame.expect("window is mapped");
+                self.entries.insert((frame, index), value);
+            }
+        }
+
+        fn handoff() -> TransitionHandoff {
+            let mut table_frames = [0_u64; MAX_TABLE_FRAMES];
+            table_frames[..7]
+                .copy_from_slice(&[0x1000, 0x2000, 0x3000, 0x4000, 0x5000, 0x6000, 0x7000]);
+            TransitionHandoff {
+                physical_address_width: 40,
+                cr3_root_physical: 0x1000,
+                temporary_virtual_address: 0xffff_ff00_0000_0000,
+                temporary_indices: [510, 0, 0, 0],
+                temporary_child_frames: [0x2000, 0x3000, 0x4000],
+                table_frames,
+                table_frame_count: 7,
+            }
+        }
+
+        fn cpu() -> TransitionCpuState {
+            TransitionCpuState {
+                physical_address_width: 40,
+                cr3: 0x1000,
+                cpl: 0,
+                paging_enabled: true,
+                long_mode_active: true,
+                four_level_paging: true,
+                no_execute_enabled: true,
+                write_protect_enabled: true,
+                interrupts_enabled: false,
+                pcid_enabled: false,
+                global_pages_enabled: false,
+                pat_supported: true,
+                pat_entry_zero: 6,
+            }
+        }
+
+        fn graph() -> FakeReader {
+            let mut reader = FakeReader::default();
+            reader
+                .entries
+                .insert((0x1000, 510), 0x2000 | PRESENT | WRITABLE);
+            reader
+                .entries
+                .insert((0x2000, 0), 0x3000 | PRESENT | WRITABLE);
+            reader
+                .entries
+                .insert((0x3000, 0), 0x4000 | PRESENT | WRITABLE);
+            reader
+                .entries
+                .insert((0x1000, 0), 0x5000 | PRESENT | WRITABLE);
+            reader
+                .entries
+                .insert((0x5000, 0), 0x6000 | PRESENT | WRITABLE);
+            reader
+                .entries
+                .insert((0x6000, 0), 0x7000 | PRESENT | WRITABLE);
+            for frame in (0x1000..=0x7000).step_by(PAGE_SIZE as usize) {
+                reader.entries.insert(
+                    (0x7000, (frame / PAGE_SIZE) as usize),
+                    frame | PRESENT | WRITABLE | NO_EXECUTE,
+                );
+            }
+            reader
+        }
+
+        #[test]
+        fn attests_exact_live_graph_and_empty_temporary_leaf() {
+            let mut reader = graph();
+            let attested = attest_transition(cpu(), &handoff(), &mut reader).unwrap();
+
+            assert_eq!(attested.root().address(), 0x1000);
+            assert_eq!(attested.temporary_pt_frame().address(), 0x4000);
+            assert_eq!(attested.temporary_virtual_address(), 0xffff_ff00_0000_0000);
+            assert_eq!(
+                attested.capabilities().physical_limit().exclusive(),
+                1_u64 << 40
+            );
+        }
+
+        #[test]
+        fn rejects_cpu_drift_unlisted_tables_and_nonzero_temporary_leaf() {
+            let mut wrong_cpu = cpu();
+            wrong_cpu.cr3 = 0x2000;
+            assert!(matches!(
+                attest_transition(wrong_cpu, &handoff(), &mut graph()),
+                Err(TransitionAttestationError::WrongRoot)
+            ));
+
+            let mut unlisted = graph();
+            unlisted
+                .entries
+                .insert((0x3000, 1), 0x8000 | PRESENT | WRITABLE);
+            assert!(matches!(
+                attest_transition(cpu(), &handoff(), &mut unlisted),
+                Err(TransitionAttestationError::UnlistedTable)
+            ));
+
+            let mut occupied = graph();
+            occupied
+                .entries
+                .insert((0x4000, 0), 0x8000 | PRESENT | NO_EXECUTE);
+            assert!(matches!(
+                attest_transition(cpu(), &handoff(), &mut occupied),
+                Err(TransitionAttestationError::TemporaryLeafPresent)
+            ));
+        }
+
+        #[test]
+        fn linear_mapper_uses_exact_cas_invalidation_and_window_order() {
+            let mut backend = graph();
+            let attested = attest_transition(cpu(), &handoff(), &mut backend).unwrap();
+            let mut mapper = TransitionScratchMapper::from_attested(attested, backend).unwrap();
+            mapper.backend.events.clear();
+            let mut roles = synthetic_frame_role_manager::<1, 8>(0x8000, 1);
+            let allocation = roles.allocate(1).unwrap();
+            mapper.backend.entries.insert((0x8000, 7), 0xfeed_beef);
+            let zeroed = mapper.zero_allocation(&mut roles, allocation).unwrap();
+            let _backing = roles.assign_object_backing(zeroed).unwrap();
+
+            assert_eq!(mapper.backend.entries.get(&(0x4000, 0)), Some(&0));
+            assert_eq!(mapper.backend.mapped_frame, None);
+            let installed = 0x8000 | PRESENT | WRITABLE | NO_EXECUTE;
+            assert_eq!(
+                mapper.backend.events.first(),
+                Some(&ScratchEvent::LeafCas {
+                    current: 0,
+                    new: installed,
+                    observed: 0,
+                })
+            );
+            assert_eq!(
+                mapper.backend.events.get(1),
+                Some(&ScratchEvent::Invalidate(0xffff_ff00_0000_0000))
+            );
+            assert_eq!(mapper.backend.events.len(), ENTRY_COUNT + 4);
+            for (index, event) in mapper.backend.events[2..2 + ENTRY_COUNT].iter().enumerate() {
+                assert_eq!(event, &ScratchEvent::WindowWrite(index, 0));
+            }
+            assert_eq!(
+                mapper.backend.events.get(ENTRY_COUNT + 2),
+                Some(&ScratchEvent::LeafCas {
+                    current: installed,
+                    new: 0,
+                    observed: installed,
+                })
+            );
+            assert_eq!(
+                mapper.backend.events.last(),
+                Some(&ScratchEvent::Invalidate(0xffff_ff00_0000_0000))
+            );
+            assert_eq!(mapper.backend.entries.get(&(0x8000, 7)), Some(&0));
+        }
+
+        #[test]
+        fn mapper_rejects_typed_allocation_of_transition_alias_before_leaf_cas() {
+            let mut backend = graph();
+            let attested = attest_transition(cpu(), &handoff(), &mut backend).unwrap();
+            let mut mapper = TransitionScratchMapper::from_attested(attested, backend).unwrap();
+            mapper.backend.events.clear();
+            let mut roles = synthetic_frame_role_manager::<1, 8>(0x1000, 1);
+            let allocation = roles.allocate(1).unwrap();
+
+            let failure = mapper
+                .zero_allocation(&mut roles, allocation)
+                .expect_err("transition table aliases are never scratch targets");
+            assert_eq!(
+                failure.error(),
+                &TransitionZeroError::Scratch(TransitionScratchError::TransitionTableAlias)
+            );
+            roles.cancel_allocation(failure.into_grant()).unwrap();
+            assert!(mapper.backend.events.is_empty());
+        }
+
+        #[test]
+        fn rejects_every_required_bootstrap_cpu_control_fact() {
+            let mut cases = [cpu(); 10];
+            cases[0].cpl = 3;
+            cases[1].interrupts_enabled = true;
+            cases[2].pcid_enabled = true;
+            cases[3].global_pages_enabled = true;
+            cases[4].paging_enabled = false;
+            cases[5].long_mode_active = false;
+            cases[6].four_level_paging = false;
+            cases[7].write_protect_enabled = false;
+            cases[8].pat_supported = false;
+            cases[9].pat_entry_zero = 0;
+
+            for (index, state) in cases.into_iter().enumerate() {
+                let error = attest_transition(state, &handoff(), &mut graph()).unwrap_err();
+                if index == 0 {
+                    assert_eq!(error, TransitionAttestationError::WrongProcessorState);
+                } else {
+                    assert_eq!(error, TransitionAttestationError::WrongControlState);
+                }
+            }
+
+            let mut wrong_nx = cpu();
+            wrong_nx.no_execute_enabled = false;
+            assert_eq!(
+                attest_transition(wrong_nx, &handoff(), &mut graph()).unwrap_err(),
+                TransitionAttestationError::WrongControlState
+            );
+            let mut wrong_width = cpu();
+            wrong_width.physical_address_width = 39;
+            assert_eq!(
+                attest_transition(wrong_width, &handoff(), &mut graph()).unwrap_err(),
+                TransitionAttestationError::WrongControlState
+            );
+        }
+
+        #[test]
+        fn rejects_cycles_incomplete_graphs_and_hostile_entry_bits() {
+            let mut cyclic = graph();
+            cyclic
+                .entries
+                .insert((0x1000, 509), 0x1000 | PRESENT | WRITABLE);
+            assert!(matches!(
+                attest_transition(cpu(), &handoff(), &mut cyclic),
+                Err(TransitionAttestationError::AliasedOrCyclicTable)
+            ));
+
+            let mut incomplete_handoff = handoff();
+            incomplete_handoff.table_frames[7] = 0x8000;
+            incomplete_handoff.table_frame_count = 8;
+            assert!(matches!(
+                attest_transition(cpu(), &incomplete_handoff, &mut graph()),
+                Err(TransitionAttestationError::IncompleteTableGraph)
+            ));
+
+            let mut nonzero_nonpresent = graph();
+            nonzero_nonpresent.entries.insert((0x1000, 1), ACCESSED);
+            assert!(matches!(
+                attest_transition(cpu(), &handoff(), &mut nonzero_nonpresent),
+                Err(TransitionAttestationError::InvalidEntry)
+            ));
+
+            let mut writable_executable = graph();
+            writable_executable
+                .entries
+                .insert((0x4000, 1), 0x8000 | PRESENT | WRITABLE);
+            assert!(matches!(
+                attest_transition(cpu(), &handoff(), &mut writable_executable),
+                Err(TransitionAttestationError::InvalidEntry)
+            ));
+
+            let mut user_path = graph();
+            user_path
+                .entries
+                .insert((0x1000, 510), 0x2000 | PRESENT | WRITABLE | USER);
+            assert!(matches!(
+                attest_transition(cpu(), &handoff(), &mut user_path),
+                Err(TransitionAttestationError::InvalidEntry)
+            ));
+
+            let mut multiparent = graph();
+            multiparent
+                .entries
+                .insert((0x1000, 1), 0x2000 | PRESENT | WRITABLE);
+            assert!(matches!(
+                attest_transition(cpu(), &handoff(), &mut multiparent),
+                Err(TransitionAttestationError::AliasedOrCyclicTable)
+            ));
+
+            let mut huge = graph();
+            huge.entries.insert(
+                (0x6000, 1),
+                0x20_0000 | PRESENT | WRITABLE | NO_EXECUTE | HUGE,
+            );
+            assert!(matches!(
+                attest_transition(cpu(), &handoff(), &mut huge),
+                Err(TransitionAttestationError::InvalidEntry)
+            ));
+
+            let mut above_width = graph();
+            above_width
+                .entries
+                .insert((0x4000, 1), (1_u64 << 40) | PRESENT | NO_EXECUTE);
+            assert!(matches!(
+                attest_transition(cpu(), &handoff(), &mut above_width),
+                Err(TransitionAttestationError::InvalidEntry)
+            ));
+
+            let mut reserved_bit = graph();
+            reserved_bit
+                .entries
+                .insert((0x4000, 1), (1_u64 << 51) | PRESENT | NO_EXECUTE);
+            assert!(matches!(
+                attest_transition(cpu(), &handoff(), &mut reserved_bit),
+                Err(TransitionAttestationError::InvalidEntry)
+            ));
+        }
+
+        #[test]
+        fn identity_aliases_are_exact_unique_base_page_mappings() {
+            let mut ad_drift = graph();
+            for frame in (0x1000..=0x7000).step_by(PAGE_SIZE as usize) {
+                *ad_drift
+                    .entries
+                    .get_mut(&(0x7000, (frame / PAGE_SIZE) as usize))
+                    .unwrap() |= ACCESSED | DIRTY;
+            }
+            assert!(attest_transition(cpu(), &handoff(), &mut ad_drift).is_ok());
+
+            let mut missing = graph();
+            missing.entries.remove(&(0x7000, 1));
+            assert!(matches!(
+                attest_transition(cpu(), &handoff(), &mut missing),
+                Err(TransitionAttestationError::IncompleteTableGraph)
+            ));
+
+            let mut table_as_data = graph();
+            table_as_data
+                .entries
+                .insert((0x7000, 8), 0x1000 | PRESENT | WRITABLE | NO_EXECUTE);
+            assert!(matches!(
+                attest_transition(cpu(), &handoff(), &mut table_as_data),
+                Err(TransitionAttestationError::InvalidIdentityAlias)
+            ));
+
+            let mut cache_marked = graph();
+            *cache_marked.entries.get_mut(&(0x7000, 1)).unwrap() |= WRITE_THROUGH;
+            assert!(matches!(
+                attest_transition(cpu(), &handoff(), &mut cache_marked),
+                Err(TransitionAttestationError::InvalidEntry)
+            ));
+
+            let mut read_only = graph();
+            *read_only.entries.get_mut(&(0x7000, 1)).unwrap() &= !WRITABLE;
+            assert!(matches!(
+                attest_transition(cpu(), &handoff(), &mut read_only),
+                Err(TransitionAttestationError::InvalidIdentityAlias)
+            ));
+
+            let mut executable = graph();
+            *executable.entries.get_mut(&(0x7000, 1)).unwrap() &= !NO_EXECUTE;
+            assert!(matches!(
+                attest_transition(cpu(), &handoff(), &mut executable),
+                Err(TransitionAttestationError::InvalidEntry)
+            ));
+
+            let mut global = graph();
+            *global.entries.get_mut(&(0x7000, 1)).unwrap() |= GLOBAL;
+            assert!(matches!(
+                attest_transition(cpu(), &handoff(), &mut global),
+                Err(TransitionAttestationError::InvalidEntry)
+            ));
+
+            for ancestor in [(0x1000, 0), (0x5000, 0), (0x6000, 0)] {
+                let mut read_only_path = graph();
+                *read_only_path.entries.get_mut(&ancestor).unwrap() &= !WRITABLE;
+                assert!(matches!(
+                    attest_transition(cpu(), &handoff(), &mut read_only_path),
+                    Err(TransitionAttestationError::InvalidIdentityAlias)
+                ));
+            }
+        }
+
+        #[test]
+        fn rejects_non_low_canonical_table_identity_before_first_read() {
+            struct NoRead;
+
+            impl TransitionTableReader for NoRead {
+                type Error = ();
+
+                fn read_entry(
+                    &mut self,
+                    _table: FrameAddress,
+                    _index: usize,
+                ) -> Result<u64, Self::Error> {
+                    panic!("non-canonical table identity reached the reader")
+                }
+            }
+
+            let mut invalid = handoff();
+            invalid.table_frames[6] = LOW_CANONICAL_LIMIT;
+            assert_eq!(
+                attest_transition(cpu(), &invalid, &mut NoRead).unwrap_err(),
+                TransitionAttestationError::InvalidIdentityAlias
+            );
+        }
+
+        #[test]
+        fn scratch_clear_recovers_only_accessed_dirty_drift() {
+            let mut backend = graph();
+            let attested = attest_transition(cpu(), &handoff(), &mut backend).unwrap();
+            let mut mapper = TransitionScratchMapper::from_attested(attested, backend).unwrap();
+            mapper.backend.events.clear();
+            mapper.backend.next_clear_drift = Some(ACCESSED | DIRTY);
+            let mut roles = synthetic_frame_role_manager::<1, 4>(0x8000, 1);
+            let allocation = roles.allocate(1).unwrap();
+            let zeroed = mapper.zero_allocation(&mut roles, allocation).unwrap();
+            roles.cancel_zeroed(zeroed).unwrap();
+
+            let installed = 0x8000 | PRESENT | WRITABLE | NO_EXECUTE;
+            assert!(mapper.backend.events.contains(&ScratchEvent::LeafCas {
+                current: installed,
+                new: 0,
+                observed: installed | ACCESSED | DIRTY,
+            }));
+            assert!(mapper.backend.events.contains(&ScratchEvent::LeafCas {
+                current: installed | ACCESSED | DIRTY,
+                new: 0,
+                observed: installed | ACCESSED | DIRTY,
+            }));
+            assert_eq!(mapper.backend.entries.get(&(0x4000, 0)), Some(&0));
+            assert_eq!(mapper.backend.mapped_frame, None);
+        }
+
+        #[test]
+        fn hostile_scratch_restore_drift_panics_fail_stop() {
+            use std::panic::{AssertUnwindSafe, catch_unwind};
+
+            let mut backend = graph();
+            let attested = attest_transition(cpu(), &handoff(), &mut backend).unwrap();
+            let mut mapper = TransitionScratchMapper::from_attested(attested, backend).unwrap();
+            mapper.backend.next_clear_drift = Some(0x1000);
+            let mut roles = synthetic_frame_role_manager::<1, 4>(0x8000, 1);
+            let allocation = roles.allocate(1).unwrap();
+
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let _ = mapper.zero_allocation(&mut roles, allocation);
+            }));
+            assert!(result.is_err());
+            assert!(mapper.poisoned);
+            assert_ne!(mapper.backend.entries.get(&(0x4000, 0)), Some(&0));
+            let frame = FrameAddress::new(0xa000, mapper.capabilities().physical_limit()).unwrap();
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    let _ = mapper.zero_frame_unchecked(frame);
+                }))
+                .is_err()
+            );
+        }
+
+        #[test]
+        fn foreign_allocation_role_rejection_has_zero_physical_effect() {
+            let mut backend = graph();
+            let attested = attest_transition(cpu(), &handoff(), &mut backend).unwrap();
+            let mut mapper = TransitionScratchMapper::from_attested(attested, backend).unwrap();
+            mapper.backend.events.clear();
+            mapper.backend.entries.insert((0x8000, 23), u64::MAX);
+            let mut owner = synthetic_frame_role_manager::<1, 4>(0x8000, 1);
+            let mut foreign = synthetic_frame_role_manager::<1, 4>(0xa000, 1);
+            let allocation = owner.allocate(1).unwrap();
+
+            let failure = mapper
+                .zero_allocation(&mut foreign, allocation)
+                .expect_err("a foreign role manager must reject before mapping");
+            assert_eq!(
+                failure.error(),
+                &TransitionZeroError::FrameRole(FrameRoleError::ForeignManager)
+            );
+            assert_eq!(mapper.backend.entries.get(&(0x8000, 23)), Some(&u64::MAX));
+            assert!(mapper.backend.events.is_empty());
+            owner.cancel_allocation(failure.into_grant()).unwrap();
+        }
+
+        #[test]
+        fn busy_mapper_construction_and_one_shot_claim_do_not_restore_authority() {
+            let mut backend = graph();
+            let attested = attest_transition(cpu(), &handoff(), &mut backend).unwrap();
+            backend
+                .entries
+                .insert((0x4000, 0), 0x5000 | PRESENT | WRITABLE | NO_EXECUTE);
+            assert!(matches!(
+                TransitionScratchMapper::from_attested(attested, backend),
+                Err(TransitionScratchError::Busy)
+            ));
+
+            let state = AtomicU8::new(LIVE_TRANSITION_UNCLAIMED);
+            assert_eq!(claim_transition_state(&state), Ok(()));
+            assert_eq!(state.load(Ordering::Acquire), LIVE_TRANSITION_ATTESTING);
+            state.store(LIVE_TRANSITION_POISONED, Ordering::Release);
+            assert_eq!(claim_transition_state(&state), Err(()));
+            assert_eq!(state.load(Ordering::Acquire), LIVE_TRANSITION_POISONED);
+            state.store(LIVE_TRANSITION_OWNED, Ordering::Release);
+            assert_eq!(claim_transition_state(&state), Err(()));
+            assert_eq!(state.load(Ordering::Acquire), LIVE_TRANSITION_OWNED);
+        }
+
+        #[test]
+        #[allow(
+            unsafe_code,
+            reason = "the synthetic manager helper creates the host-only allocator namespace"
+        )]
+        fn mapper_zeroes_complete_grant_before_typed_role_transition() {
+            let mut backend = graph();
+            let attested = attest_transition(cpu(), &handoff(), &mut backend).unwrap();
+            let mut mapper = TransitionScratchMapper::from_attested(attested, backend).unwrap();
+            let mut roles = synthetic_frame_role_manager::<1, 8>(0x8000, 2);
+            let allocation = roles.allocate(2).unwrap();
+            mapper.backend.entries.insert((0x8000, 17), u64::MAX);
+            mapper.backend.entries.insert((0x9000, 511), u64::MAX);
+
+            let zeroed = mapper
+                .zero_allocation(&mut roles, allocation)
+                .expect("the full grant is physically zeroed");
+            let _backing = roles.assign_object_backing(zeroed).unwrap();
+
+            for frame in [0x8000, 0x9000] {
+                for index in 0..ENTRY_COUNT {
+                    assert_eq!(mapper.backend.entries.get(&(frame, index)), Some(&0));
+                }
+            }
+            assert_eq!(roles.check_invariants(), Ok(()));
+        }
+
+        #[test]
+        fn zeroing_failure_returns_live_allocation_grant_for_cancellation() {
+            let mut backend = graph();
+            let attested = attest_transition(cpu(), &handoff(), &mut backend).unwrap();
+            let mut mapper = TransitionScratchMapper::from_attested(attested, backend).unwrap();
+            let mut roles = synthetic_frame_role_manager::<1, 4>(0x8000, 1);
+            let allocation = roles.allocate(1).unwrap();
+            mapper.backend.events.clear();
+            mapper.backend.entries.insert((0x8000, 31), u64::MAX);
+            let conflict = 0xa000 | PRESENT | WRITABLE | NO_EXECUTE;
+            mapper.backend.entries.insert((0x4000, 0), conflict);
+
+            let failure = mapper
+                .zero_allocation(&mut roles, allocation)
+                .expect_err("an occupied scratch leaf rejects before zeroing");
+            assert_eq!(
+                failure.error(),
+                &TransitionZeroError::Scratch(TransitionScratchError::Busy)
+            );
+            let installed = 0x8000 | PRESENT | WRITABLE | NO_EXECUTE;
+            assert_eq!(
+                mapper.backend.events,
+                [ScratchEvent::LeafCas {
+                    current: 0,
+                    new: installed,
+                    observed: conflict,
+                }]
+            );
+            assert_eq!(mapper.backend.entries.get(&(0x8000, 31)), Some(&u64::MAX));
+            mapper.backend.entries.insert((0x4000, 0), 0);
+            roles.cancel_allocation(failure.into_grant()).unwrap();
+            assert_eq!(roles.available_frames(), 1);
+            assert_eq!(roles.check_invariants(), Ok(()));
+        }
+    }
+}
+
+pub(crate) use private::claim_live_transition_mapper;
+#[allow(
+    unused_imports,
+    reason = "C1 facade error types precede their bootstrap and C2 consumers"
+)]
+pub(crate) use private::{
+    LiveTransitionError, LiveTransitionMapper, TransitionActivationHandoff,
+    TransitionAttestationError, TransitionScratchError, TransitionZeroError, TransitionZeroFailure,
+};

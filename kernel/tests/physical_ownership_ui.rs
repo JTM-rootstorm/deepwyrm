@@ -100,6 +100,42 @@ fn physical_ownership_compile_fail_contracts() {
             fixture: "safe_x86_address_space_publisher_new.rs",
             expected_error: "error[E0133]: call to unsafe function `X86AddressSpacePublisher::<'a, T, RANGE_CAPACITY, ROLE_CAPACITY, CANDIDATE_CAPACITY, ENTRY_CAPACITY, INVALIDATION_CAPACITY>::new` is unsafe and requires unsafe block",
         },
+        CompileFailCase {
+            fixture: "transition_scratch_mapper_clone.rs",
+            expected_error: "error[E0277]: the trait bound `LiveTransitionMapper: Clone` is not satisfied",
+        },
+        CompileFailCase {
+            fixture: "transition_scratch_mapper_send.rs",
+            expected_error: "error[E0277]: `*mut ()` cannot be sent between threads safely",
+        },
+        CompileFailCase {
+            fixture: "transition_scratch_mapper_sync.rs",
+            expected_error: "error[E0277]: `*mut ()` cannot be shared between threads safely",
+        },
+        CompileFailCase {
+            fixture: "transition_activation_handoff_moves_mapper.rs",
+            expected_error: "error[E0382]: use of moved value: `mapper`",
+        },
+        CompileFailCase {
+            fixture: "transition_private_module.rs",
+            expected_error: "error[E0603]: module `private` is private",
+        },
+        CompileFailCase {
+            fixture: "transition_private_constructor.rs",
+            expected_error: "error[E0624]: associated function `from_private_parts` is private",
+        },
+        CompileFailCase {
+            fixture: "transition_mapper_backend_escape.rs",
+            expected_error: "error[E0616]: field `mapper` of struct `LiveTransitionMapper` is private",
+        },
+        CompileFailCase {
+            fixture: "transition_mapper_raw_zero.rs",
+            expected_error: "error[E0599]: no method named `zero_frame` found for mutable reference `&mut LiveTransitionMapper` in the current scope",
+        },
+        CompileFailCase {
+            fixture: "safe_claim_live_transition_mapper.rs",
+            expected_error: "error[E0133]: call to unsafe function `claim_live_transition_mapper` is unsafe and requires unsafe block",
+        },
     ];
 
     for case in cases {
