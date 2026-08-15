@@ -19,6 +19,7 @@ fn help_distinguishes_available_dw0a_tooling_from_deferred_operations() {
         "abi generate",
         "abi check",
         "test host",
+        "memory",
         "run --plan",
         "gdb --plan",
         "guest-result",
@@ -72,6 +73,7 @@ fn invalid_syntax_is_distinct_from_an_unimplemented_operation() {
         &["abi", "invalid"][..],
         &["test"][..],
         &["test", "invalid"][..],
+        &["test", "host", "not-a-filter"][..],
         &["unknown"][..],
     ] {
         let output = xtask(args);

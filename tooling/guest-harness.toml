@@ -1,4 +1,4 @@
-# Deepwyrm DW0-B host-only guest-harness profile contract.
+# Deepwyrm DW0-B/DW0-C host-only guest-harness profile contract.
 #
 # Wyrmroot owns image construction and produces a separate request manifest
 # containing the paired revisions, artifact identities, and destinations.
@@ -41,3 +41,24 @@ id = 2
 
 [guest_test.panic-path]
 id = 3
+
+# DW0-C memory-foundation gates. These names and IDs are test-build-only
+# selector metadata: central tooling supplies only the selector, while the
+# kernel build resolves and embeds the unique ID from this file.
+[guest_test.memory-mapping]
+id = 4
+
+[guest_test.memory-unmapping]
+id = 5
+
+[guest_test.memory-permissions]
+id = 6
+
+[guest_test.memory-invalid-pointer]
+id = 7
+
+[guest_test.memory-user-kernel-isolation]
+id = 8
+
+[guest_test.memory-shared-memory-object]
+id = 9

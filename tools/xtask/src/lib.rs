@@ -41,7 +41,7 @@ Commands:
   check                              Run the workspace check
   abi generate                       Generate ABI-owned artifacts
   abi check                          Verify generated ABI artifacts have no drift
-  test host [filter]                 Run focused host tests
+  test host [abi|memory]             Run focused host tests
   run --plan --request <path>        Emit the canonical QEMU run plan only
   gdb --plan --request <path>        Emit paused QEMU/GDB command plans only
   test guest <selector> --plan --request <path>
@@ -82,8 +82,14 @@ enum Invocation {
     Check,
     AbiGenerate,
     AbiCheck,
-    HostTests(Option<String>),
+    HostTests(Option<HostTestFilter>),
     HarnessPlan(HarnessKind, PathBuf, Option<String>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostTestFilter {
+    Abi,
+    Memory,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,6 +157,12 @@ struct HarnessRequest {
     toolchain_rust_lld_sha256: String,
     toolchain_sysroot_manifest: String,
     toolchain_sysroot_manifest_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GuestBuildSelection {
+    selector: String,
+    expected_test_id: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -306,12 +318,22 @@ fn run_invocation(invocation: Invocation) -> io::Result<u8> {
         }
         Invocation::HostTests(filter) => {
             command.args(["test", "--locked"]);
-            if filter.as_deref() == Some("abi") {
-                command.args(["--package", "abi-gen", "--package", "deepwyrm-abi"]);
-            } else {
-                command.args(["--workspace", "--all-targets"]);
-                if let Some(filter) = filter {
-                    command.args(["--", &filter]);
+            match filter {
+                Some(HostTestFilter::Abi) => {
+                    command.args(["--package", "abi-gen", "--package", "deepwyrm-abi"]);
+                }
+                Some(HostTestFilter::Memory) => {
+                    command.args([
+                        "--package",
+                        "deepwyrm-kernel",
+                        "--lib",
+                        "--tests",
+                        "--",
+                        "memory",
+                    ]);
+                }
+                None => {
+                    command.args(["--workspace", "--all-targets"]);
                 }
             }
         }
@@ -353,6 +375,7 @@ fn emit_harness_plan(
     }
 
     let qemu_args = qemu_arguments(profile, &request, kind);
+    let test_build = guest_build_selection(kind, &request);
     let mut stdout = io::stdout().lock();
     write!(
         stdout,
@@ -395,6 +418,14 @@ fn emit_harness_plan(
         request.toolchain_sysroot_manifest_sha256,
         json_array(&qemu_args),
     )?;
+    if let Some(selection) = test_build {
+        write!(
+            stdout,
+            ",\"test_build\":{{\"cargo_feature\":\"test-support\",\"environment\":{{\"DEEPWYRM_GUEST_TEST_SELECTOR\":\"{}\"}},\"expected_embedded_test_id\":{},\"id_source\":\"tooling/guest-harness.toml\"}}",
+            json_string(&selection.selector),
+            selection.expected_test_id,
+        )?;
+    }
     if kind == HarnessKind::Gdb {
         let gdb_args = gdb_arguments(profile, &request);
         write!(
@@ -408,6 +439,16 @@ fn emit_harness_plan(
         ",\"result_contract\":{{\"serial_prefix\":\"DWTEST1|\",\"record_bytes\":38,\"terminal_statuses\":[\"PASS\",\"FAIL\",\"PANIC\"],\"host_outcomes\":[\"TIMEOUT\",\"INFRASTRUCTURE\"],\"debug_exit_status\":{{\"PASS\":33,\"FAIL\":35,\"PANIC\":37}},\"serial_exit_mismatch\":\"INFRASTRUCTURE\",\"exactly_one_terminal_record\":true}}}}"
     )?;
     Ok(0)
+}
+
+fn guest_build_selection(
+    kind: HarnessKind,
+    request: &HarnessRequest,
+) -> Option<GuestBuildSelection> {
+    (kind == HarnessKind::GuestTest).then(|| GuestBuildSelection {
+        selector: request.selector.clone(),
+        expected_test_id: request.test_id,
+    })
 }
 
 fn qemu_arguments(
@@ -2155,7 +2196,19 @@ fn parse_test(args: &[String]) -> Action {
         ));
     }
     match tier {
-        "host" if args.len() <= 2 => Action::Command(Invocation::HostTests(args.get(1).cloned())),
+        "host" => match args {
+            [_] => Action::Command(Invocation::HostTests(None)),
+            [_, filter] => match filter.as_str() {
+                "abi" => Action::Command(Invocation::HostTests(Some(HostTestFilter::Abi))),
+                "memory" => {
+                    Action::Command(Invocation::HostTests(Some(HostTestFilter::Memory)))
+                }
+                _ => Action::UsageError(
+                    "unknown host-test filter; expected `abi` or `memory`".into(),
+                ),
+            },
+            _ => Action::UsageError("`test host` accepts at most one filter".into()),
+        },
         "guest" => match args {
             [_, selector, plan, request_flag, request_path] if plan == "--plan" && request_flag == "--request" => {
                 if let Err(error) = validate_selector(selector) { return Action::UsageError(error); }
@@ -2164,7 +2217,6 @@ fn parse_test(args: &[String]) -> Action {
             _ => Action::UsageError("`test guest` requires `<selector> --plan --request <path>`; execution is unavailable".into()),
         },
         "integration" if args.len() <= 2 => Action::NotImplemented(display_test_command(tier, args.get(1).map(String::as_str))),
-        "host" => Action::UsageError("`test host` accepts at most one filter".into()),
         _ => Action::UsageError("`test integration` accepts at most one filter".into()),
     }
 }
@@ -2218,7 +2270,7 @@ fn print_help(mut writer: impl Write, command: Option<&str>) -> io::Result<()> {
         ),
         Some("test") => write!(
             writer,
-            "Usage: cargo xtask test <host|guest|integration> ...\n\n`test guest` emits a plan only; guest execution remains coordinator-owned.\n"
+            "Usage: cargo xtask test <host|guest|integration> ...\n\nHost filters are `abi` and `memory`. `test guest` emits a plan only; guest execution remains coordinator-owned.\n"
         ),
         Some(command @ ("run" | "gdb")) => write!(
             writer,
@@ -2307,7 +2359,11 @@ mod tests {
             (&["abi", "check"][..], Action::Command(Invocation::AbiCheck)),
             (
                 &["test", "host", "abi"][..],
-                Action::Command(Invocation::HostTests(Some("abi".into()))),
+                Action::Command(Invocation::HostTests(Some(HostTestFilter::Abi))),
+            ),
+            (
+                &["test", "host", "memory"][..],
+                Action::Command(Invocation::HostTests(Some(HostTestFilter::Memory))),
             ),
             (
                 &["run", "--plan", "--request", "request.toml"][..],
@@ -2417,6 +2473,34 @@ mod tests {
         );
         assert!(load_profiles(&invalid).is_err());
         fs::remove_file(invalid).unwrap();
+    }
+
+    #[test]
+    fn dw0c_memory_selectors_have_stable_build_owned_ids() {
+        let config = workspace_root().join(HARNESS_CONFIG);
+        for (selector, test_id) in [
+            ("memory-mapping", 4),
+            ("memory-unmapping", 5),
+            ("memory-permissions", 6),
+            ("memory-invalid-pointer", 7),
+            ("memory-user-kernel-isolation", 8),
+            ("memory-shared-memory-object", 9),
+        ] {
+            let path = temp_file(
+                &request("guest-test", selector)
+                    .replace("test_id = 1", &format!("test_id = {test_id}")),
+            );
+            let parsed = load_harness_request(&path).unwrap();
+            validate_guest_selector_metadata(&config, &parsed).unwrap();
+            assert_eq!(
+                guest_build_selection(HarnessKind::GuestTest, &parsed),
+                Some(GuestBuildSelection {
+                    selector: selector.into(),
+                    expected_test_id: test_id,
+                })
+            );
+            fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
