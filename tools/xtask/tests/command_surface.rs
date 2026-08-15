@@ -19,6 +19,9 @@ fn help_distinguishes_available_dw0a_tooling_from_deferred_operations() {
         "abi generate",
         "abi check",
         "test host",
+        "run --plan",
+        "gdb --plan",
+        "guest-result",
         "toolchain",
     ] {
         assert!(stdout.contains(command), "help omitted `{command}`");
@@ -31,10 +34,7 @@ fn deferred_operations_fail_nonzero_without_doing_work() {
     let commands: &[&[&str]] = &[
         &["build"],
         &["image"],
-        &["run"],
         &["inspect-image"],
-        &["gdb"],
-        &["test", "guest", "ipc"],
         &["test", "integration"],
     ];
 
