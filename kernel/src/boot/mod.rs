@@ -184,6 +184,13 @@ impl ValidatedPagingHandoff {
         self.table_frame_count
     }
 
+    /// Returns the exact bounded transition-frame declaration retained by
+    /// this validated snapshot without copying its fixed-capacity backing.
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    pub(crate) fn table_frames(&self) -> &[u64] {
+        &self.table_frames[..self.table_frame_count]
+    }
+
     /// Returns one copied transition page-table frame address.
     pub fn table_frame(&self, index: usize) -> Result<u64, BootInfoValidationError> {
         self.table_frames

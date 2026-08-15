@@ -10,8 +10,12 @@
     reason = "DW0-C establishes typed frame ownership before the architecture publisher consumes it"
 )]
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+use super::boot_map::BootstrapMemoryWitness;
 use super::boot_map::{BootMapError, BootstrapReservation, SanitizedBootMap};
 use super::physical::{
     BASE_PAGE_SIZE, PageRange, PhysicalFrameAllocator, PhysicalMemoryError, PhysicalRange,
@@ -270,22 +274,75 @@ impl AllocationGrant {
 /// code from treating those frames as anonymous external memory.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct TransitionTableRoleSet<const CAPACITY: usize> {
-    identities: [FrameRoleIdentity; CAPACITY],
+    _domain: u64,
     count: usize,
+    _capacity: core::marker::PhantomData<[(); CAPACITY]>,
 }
 
 impl<const CAPACITY: usize> TransitionTableRoleSet<CAPACITY> {
     pub(crate) const fn len(&self) -> usize {
         self.count
     }
+}
 
-    #[cfg(test)]
-    pub(crate) const fn identity(&self, index: usize) -> Option<FrameRoleIdentity> {
-        if index < self.count {
-            Some(self.identities[index])
-        } else {
-            None
+/// Fully validated but unpublished role assignment for the three linker
+/// kernel segments retained by the first Deep-owned root.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct StagedKernelImageRoles {
+    domain: u64,
+    ranges: [PageRange; 3],
+    segments: [KernelImageSegment; 3],
+    slots: [usize; 3],
+    generations: [u32; 3],
+    identities: [FrameRoleIdentity; 3],
+}
+
+impl StagedKernelImageRoles {
+    pub(crate) fn validate_page(
+        &self,
+        physical_start: u64,
+        segment: KernelImageSegment,
+    ) -> Result<(), FrameRoleError> {
+        let index = self
+            .segments
+            .iter()
+            .position(|candidate| *candidate == segment)
+            .ok_or(FrameRoleError::WrongRole)?;
+        if !(self.ranges[index].start <= physical_start
+            && physical_start < self.ranges[index].end
+            && physical_start.is_multiple_of(BASE_PAGE_SIZE))
+        {
+            return Err(FrameRoleError::WrongRole);
         }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct KernelImageRoleSet {
+    _identities: [FrameRoleIdentity; 3],
+    ranges: [PageRange; 3],
+    segments: [KernelImageSegment; 3],
+}
+
+impl KernelImageRoleSet {
+    pub(crate) fn validate_page(
+        &self,
+        physical_start: u64,
+        segment: KernelImageSegment,
+    ) -> Result<(), FrameRoleError> {
+        let index = self
+            .segments
+            .iter()
+            .position(|candidate| *candidate == segment)
+            .ok_or(FrameRoleError::WrongRole)?;
+        if !(self.ranges[index].start <= physical_start
+            && physical_start < self.ranges[index].end
+            && physical_start.is_multiple_of(BASE_PAGE_SIZE))
+        {
+            return Err(FrameRoleError::WrongRole);
+        }
+        Ok(())
     }
 }
 
@@ -412,6 +469,55 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .map_err(FrameRoleInitializationError::BootMap)?;
         claim_manager(&FRAME_ROLE_MANAGER_CLAIMED)?;
         Self::new(allocator).map_err(FrameRoleInitializationError::Role)
+    }
+
+    /// Initializes the sole manager directly in caller-owned static storage,
+    /// avoiding a large bootstrap-stack temporary.
+    ///
+    /// # Safety
+    ///
+    /// In addition to [`Self::from_boot_map`]'s ownership contract, `slot`
+    /// must be unique, uninitialized storage which remains alive for every
+    /// grant and active paging session issued by the returned manager.
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    #[allow(
+        unsafe_code,
+        reason = "one-shot bootstrap constructs the large role registry directly in static storage"
+    )]
+    pub(crate) unsafe fn from_boot_map_in<'a>(
+        slot: &'a mut MaybeUninit<Self>,
+        map: &'a SanitizedBootMap,
+        reservations: &'a [BootstrapReservation],
+    ) -> Result<(&'a mut Self, BootstrapMemoryWitness<'a>), FrameRoleInitializationError> {
+        let destination = slot.as_mut_ptr();
+        let allocator_slot = unsafe {
+            &mut *core::ptr::addr_of_mut!((*destination).allocator)
+                .cast::<MaybeUninit<PhysicalFrameAllocator<RANGE_CAPACITY>>>()
+        };
+        unsafe {
+            super::boot_map::initialize_frame_allocator_in(allocator_slot, map, reservations)
+        }
+        .map_err(FrameRoleInitializationError::BootMap)?;
+        claim_manager(&FRAME_ROLE_MANAGER_CLAIMED)?;
+        let domain = NEXT_MANAGER_DOMAIN
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1).filter(|next| *next != 0)
+            })
+            .map_err(|_| {
+                FrameRoleInitializationError::Role(FrameRoleError::ManagerDomainExhausted)
+            })?;
+        unsafe {
+            core::ptr::addr_of_mut!((*destination).domain).write(domain);
+            let roles = core::ptr::addr_of_mut!((*destination).roles).cast::<RoleSlot>();
+            for index in 0..ROLE_CAPACITY {
+                roles.add(index).write(EMPTY_ROLE_SLOT);
+            }
+            core::ptr::addr_of_mut!((*destination).next_table_owner).write(1);
+            Ok((
+                &mut *destination,
+                BootstrapMemoryWitness::new(map, reservations),
+            ))
+        }
     }
 
     pub(crate) fn allocate(&mut self, page_count: u64) -> Result<AllocationGrant, FrameRoleError> {
@@ -772,6 +878,132 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok(identity)
     }
 
+    /// Validates the exact three kernel image ranges and reserves registry
+    /// slots without changing role state. The caller retains an unchanged
+    /// manager on every error.
+    ///
+    /// # Safety
+    ///
+    /// The supplied ranges and segment labels must come from the live-attested
+    /// loader root and exact linker bounds, with firmware already exited and
+    /// the physical storage retained through the pending CR3 switch.
+    #[allow(
+        unsafe_code,
+        reason = "kernel image provenance is established by the live transition graph"
+    )]
+    pub(crate) unsafe fn stage_kernel_image_roles(
+        &self,
+        declarations: [(PhysicalRange, KernelImageSegment); 3],
+    ) -> Result<StagedKernelImageRoles, FrameRoleError> {
+        let mut ranges = [PageRange::empty(); 3];
+        let mut segments = [KernelImageSegment::Text; 3];
+        for (index, (range, segment)) in declarations.into_iter().enumerate() {
+            if segments[..index].contains(&segment) {
+                return Err(FrameRoleError::WrongRole);
+            }
+            ranges[index] = self.validate_external_page_range(range)?;
+            segments[index] = segment;
+            if ranges[..index]
+                .iter()
+                .any(|existing| existing.overlaps(ranges[index]))
+            {
+                return Err(FrameRoleError::Overlap);
+            }
+        }
+        if !segments.contains(&KernelImageSegment::Text)
+            || !segments.contains(&KernelImageSegment::ReadOnlyData)
+            || !segments.contains(&KernelImageSegment::WritableData)
+        {
+            return Err(FrameRoleError::WrongRole);
+        }
+
+        let mut slots = [usize::MAX; 3];
+        let mut generations = [0_u32; 3];
+        let mut identities = [FrameRoleIdentity::EMPTY; 3];
+        let mut selected = 0;
+        for (slot, role) in self.roles.iter().enumerate() {
+            if role.record.is_some() {
+                continue;
+            }
+            let generation = role
+                .generation
+                .checked_add(1)
+                .filter(|next| *next != 0)
+                .ok_or(FrameRoleError::GenerationExhausted)?;
+            slots[selected] = slot;
+            generations[selected] = generation;
+            identities[selected] = self.identity(slot, generation)?;
+            selected += 1;
+            if selected == 3 {
+                break;
+            }
+        }
+        if selected != 3 {
+            return Err(FrameRoleError::Capacity);
+        }
+        Ok(StagedKernelImageRoles {
+            domain: self.domain,
+            ranges,
+            segments,
+            slots,
+            generations,
+            identities,
+        })
+    }
+
+    /// Publishes a previously staged image-role set. The exclusive manager
+    /// borrow prevents intervening mutation, so this phase is infallible.
+    pub(crate) fn publish_staged_kernel_image(
+        &mut self,
+        staged: StagedKernelImageRoles,
+    ) -> KernelImageRoleSet {
+        assert_eq!(
+            staged.domain, self.domain,
+            "staged kernel image roles belong to another manager"
+        );
+        assert!(
+            staged.segments.contains(&KernelImageSegment::Text)
+                && staged.segments.contains(&KernelImageSegment::ReadOnlyData)
+                && staged.segments.contains(&KernelImageSegment::WritableData),
+            "staged kernel image segment set changed before publication"
+        );
+        for index in 0..3 {
+            assert!(
+                staged.slots[index] < ROLE_CAPACITY
+                    && !staged.slots[..index].contains(&staged.slots[index])
+                    && !staged.ranges[..index]
+                        .iter()
+                        .any(|range| range.overlaps(staged.ranges[index]))
+                    && self.validate_external_pages(staged.ranges[index]).is_ok()
+                    && self.identity(staged.slots[index], staged.generations[index])
+                        == Ok(staged.identities[index])
+                    && staged.identities[index].domain == self.domain
+                    && self.roles[staged.slots[index]].record.is_none()
+                    && self.roles[staged.slots[index]]
+                        .generation
+                        .checked_add(1)
+                        .is_some_and(|generation| generation == staged.generations[index]),
+                "staged kernel image role changed before publication"
+            );
+        }
+        for index in 0..3 {
+            self.roles[staged.slots[index]] = RoleSlot {
+                generation: staged.generations[index],
+                record: Some(RoleRecord {
+                    range: staged.ranges[index],
+                    role: FrameRole::External(ExternalFrameRole::KernelImage {
+                        segment: staged.segments[index],
+                    }),
+                }),
+            };
+        }
+        KernelImageRoleSet {
+            _identities: staged.identities,
+            ranges: staged.ranges,
+            segments: staged.segments,
+        }
+    }
+
     /// Atomically imports the complete live-attested transition-table set.
     ///
     /// Every range, overlap, capacity, generation, and identity check finishes
@@ -799,7 +1031,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let mut ranges = [PageRange::empty(); CAPACITY];
         let mut slots = [usize::MAX; CAPACITY];
         let mut generations = [0_u32; CAPACITY];
-        let mut identities = [FrameRoleIdentity::EMPTY; CAPACITY];
         let mut table_indices = [0_u32; CAPACITY];
 
         for (index, &frame) in frames.iter().enumerate() {
@@ -823,7 +1054,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .ok_or(FrameRoleError::GenerationExhausted)?;
             slots[selected] = slot;
             generations[selected] = generation;
-            identities[selected] = self.identity(slot, generation)?;
             selected += 1;
             if selected == frames.len() {
                 break;
@@ -845,8 +1075,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             };
         }
         Ok(TransitionTableRoleSet {
-            identities,
+            _domain: self.domain,
             count: frames.len(),
+            _capacity: core::marker::PhantomData,
         })
     }
 
@@ -961,6 +1192,25 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             FrameRole::ExternalImmutableModule { .. } => Ok(()),
             _ => Err(FrameRoleError::WrongRole),
         }
+    }
+
+    /// Confirms that one exact base page belongs to the boot-authenticated
+    /// kernel image segment whose permissions C2 is about to retain.
+    pub(crate) fn validate_kernel_image_page(
+        &self,
+        physical_start: u64,
+        segment: KernelImageSegment,
+    ) -> Result<(), FrameRoleError> {
+        let page = PageRange::from_page_count(physical_start, 1, self.allocator.physical_limit())?;
+        self.roles
+            .iter()
+            .filter_map(|slot| slot.record)
+            .find(|record| record.range.contains(page))
+            .filter(|record| {
+                record.role == FrameRole::External(ExternalFrameRole::KernelImage { segment })
+            })
+            .map(|_| ())
+            .ok_or(FrameRoleError::WrongRole)
     }
 
     pub(crate) fn role(
@@ -1664,6 +1914,117 @@ mod tests {
     #[test]
     #[allow(
         unsafe_code,
+        reason = "synthetic ranges model live-attested linker segment provenance"
+    )]
+    fn kernel_image_roles_stage_atomically_and_reject_overlap() {
+        let mut roles = manager(BASE_PAGE_SIZE, 4);
+        let text = PhysicalRange::new(0x30_000, BASE_PAGE_SIZE).unwrap();
+        let rodata = PhysicalRange::new(0x31_000, BASE_PAGE_SIZE).unwrap();
+        let data = PhysicalRange::new(0x32_000, BASE_PAGE_SIZE).unwrap();
+        let declarations = [
+            (text, KernelImageSegment::Text),
+            (rodata, KernelImageSegment::ReadOnlyData),
+            (data, KernelImageSegment::WritableData),
+        ];
+        let staged = unsafe { roles.stage_kernel_image_roles(declarations) }.unwrap();
+
+        assert_eq!(
+            roles.validate_kernel_image_page(0x30_000, KernelImageSegment::Text),
+            Err(FrameRoleError::WrongRole)
+        );
+        assert_eq!(roles.check_invariants(), Ok(()));
+        roles.publish_staged_kernel_image(staged);
+        assert_eq!(
+            roles.validate_kernel_image_page(0x30_000, KernelImageSegment::Text),
+            Ok(())
+        );
+        assert_eq!(roles.check_invariants(), Ok(()));
+
+        let fresh = manager(BASE_PAGE_SIZE, 4);
+        let overlapping = [
+            (text, KernelImageSegment::Text),
+            (text, KernelImageSegment::ReadOnlyData),
+            (data, KernelImageSegment::WritableData),
+        ];
+        assert_eq!(
+            unsafe { fresh.stage_kernel_image_roles(overlapping) },
+            Err(FrameRoleError::Overlap)
+        );
+        assert_eq!(
+            fresh.validate_kernel_image_page(0x30_000, KernelImageSegment::Text),
+            Err(FrameRoleError::WrongRole)
+        );
+        assert_eq!(fresh.check_invariants(), Ok(()));
+    }
+
+    #[test]
+    #[should_panic(expected = "staged kernel image roles belong to another manager")]
+    #[allow(
+        unsafe_code,
+        reason = "synthetic ranges model live-attested linker segment provenance"
+    )]
+    fn staged_kernel_image_roles_reject_a_foreign_manager() {
+        let source = manager(BASE_PAGE_SIZE, 4);
+        let mut foreign = manager(0x10_000, 4);
+        let staged = unsafe {
+            source.stage_kernel_image_roles([
+                (
+                    PhysicalRange::new(0x30_000, BASE_PAGE_SIZE).unwrap(),
+                    KernelImageSegment::Text,
+                ),
+                (
+                    PhysicalRange::new(0x31_000, BASE_PAGE_SIZE).unwrap(),
+                    KernelImageSegment::ReadOnlyData,
+                ),
+                (
+                    PhysicalRange::new(0x32_000, BASE_PAGE_SIZE).unwrap(),
+                    KernelImageSegment::WritableData,
+                ),
+            ])
+        }
+        .unwrap();
+        foreign.publish_staged_kernel_image(staged);
+    }
+
+    #[test]
+    #[should_panic(expected = "staged kernel image role changed before publication")]
+    #[allow(
+        unsafe_code,
+        reason = "synthetic overlap models hostile mutation between stage and publication"
+    )]
+    fn staged_kernel_image_roles_revalidate_intervening_overlap() {
+        let mut roles = manager(BASE_PAGE_SIZE, 4);
+        let declarations = [
+            (
+                PhysicalRange::new(0x30_000, BASE_PAGE_SIZE).unwrap(),
+                KernelImageSegment::Text,
+            ),
+            (
+                PhysicalRange::new(0x31_000, BASE_PAGE_SIZE).unwrap(),
+                KernelImageSegment::ReadOnlyData,
+            ),
+            (
+                PhysicalRange::new(0x32_000, BASE_PAGE_SIZE).unwrap(),
+                KernelImageSegment::WritableData,
+            ),
+        ];
+        let staged = unsafe { roles.stage_kernel_image_roles(declarations) }.unwrap();
+        unsafe {
+            roles
+                .import_external(
+                    declarations[0].0,
+                    ExternalFrameRole::KernelImage {
+                        segment: KernelImageSegment::Text,
+                    },
+                )
+                .unwrap();
+        }
+        roles.publish_staged_kernel_image(staged);
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
         reason = "the host model supplies an exact synthetic live transition-table set"
     )]
     fn transition_table_set_import_is_atomic_and_exact() {
@@ -1687,11 +2048,15 @@ mod tests {
         let imported =
             unsafe { capacity_limited.import_transition_tables::<4>(&[0x20_000]) }.unwrap();
         assert_eq!(imported.len(), 1);
+        let record = capacity_limited
+            .roles
+            .iter()
+            .filter_map(|slot| slot.record)
+            .find(|record| record.range.start == 0x20_000)
+            .unwrap();
         assert_eq!(
-            capacity_limited.role(imported.identity(0).unwrap()),
-            Ok(FrameRoleKind::External(
-                ExternalFrameRole::TransitionTable { table_index: 0 }
-            ))
+            record.role.kind(),
+            FrameRoleKind::External(ExternalFrameRole::TransitionTable { table_index: 0 })
         );
         assert_eq!(capacity_limited.check_invariants(), Ok(()));
 
@@ -1709,13 +2074,17 @@ mod tests {
             unsafe { roles.import_transition_tables::<4>(&[0x30_000, 0x31_000]) }.unwrap();
         assert_eq!(imported.len(), 2);
         for index in 0..2 {
+            let record = roles
+                .roles
+                .iter()
+                .filter_map(|slot| slot.record)
+                .find(|record| record.range.start == 0x30_000 + (index as u64) * BASE_PAGE_SIZE)
+                .unwrap();
             assert_eq!(
-                roles.role(imported.identity(index).unwrap()),
-                Ok(FrameRoleKind::External(
-                    ExternalFrameRole::TransitionTable {
-                        table_index: index as u32,
-                    }
-                ))
+                record.role.kind(),
+                FrameRoleKind::External(ExternalFrameRole::TransitionTable {
+                    table_index: index as u32,
+                })
             );
         }
         assert_eq!(roles.check_invariants(), Ok(()));
@@ -1734,6 +2103,36 @@ mod tests {
             roles.validate_object_backing(confused, table.physical_start(), BASE_PAGE_SIZE, false,),
             Err(FrameRoleError::WrongRole)
         );
+        assert_eq!(roles.check_invariants(), Ok(()));
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "synthetic malicious map classification exercises pre-allocation kernel exclusion"
+    )]
+    fn kernel_image_allocator_overlap_rejects_without_allocation() {
+        let roles = manager(BASE_PAGE_SIZE, 8);
+        let available = roles.available_frames();
+        let declarations = [
+            (
+                PhysicalRange::new(BASE_PAGE_SIZE, BASE_PAGE_SIZE).unwrap(),
+                KernelImageSegment::Text,
+            ),
+            (
+                PhysicalRange::new(0x20_000, BASE_PAGE_SIZE).unwrap(),
+                KernelImageSegment::ReadOnlyData,
+            ),
+            (
+                PhysicalRange::new(0x21_000, BASE_PAGE_SIZE).unwrap(),
+                KernelImageSegment::WritableData,
+            ),
+        ];
+        assert_eq!(
+            unsafe { roles.stage_kernel_image_roles(declarations) },
+            Err(FrameRoleError::ExternalAllocatorOverlap)
+        );
+        assert_eq!(roles.available_frames(), available);
         assert_eq!(roles.check_invariants(), Ok(()));
     }
 }

@@ -4,6 +4,8 @@
 //! Architecture code supplies the physical-address limit, while higher layers
 //! provide the ranges that must remain reserved during the boot transition.
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+use core::mem::MaybeUninit;
 use deepwyrm_abi::DW_BOOT_BASE_PAGE_SIZE;
 
 /// The only frame size supported during DW0-C bootstrap allocation.
@@ -255,6 +257,57 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
             .copy_from_slice(&allocator.free[..allocator.free_len]);
         allocator.initial_len = allocator.free_len;
         Ok(allocator)
+    }
+
+    /// Initializes an allocator directly in unique static bootstrap storage.
+    ///
+    /// # Safety
+    ///
+    /// `slot` must be uninitialized, uniquely owned storage that outlives all
+    /// allocations issued by the returned allocator. A failure leaves the
+    /// slot terminal and it must not be reused.
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    #[allow(
+        unsafe_code,
+        reason = "the BSP constructs the fixed-capacity allocator field in place to bound its bootstrap stack"
+    )]
+    pub(super) unsafe fn from_candidates_in<'a, I>(
+        slot: &'a mut MaybeUninit<Self>,
+        candidates: &[PageRange],
+        limit: PhysicalAddressLimit,
+        reservations: I,
+    ) -> Result<&'a mut Self, PhysicalMemoryError>
+    where
+        I: IntoIterator<Item = PhysicalRange>,
+    {
+        let destination = slot.as_mut_ptr();
+        unsafe {
+            let initial = core::ptr::addr_of_mut!((*destination).initial).cast::<PageRange>();
+            let free = core::ptr::addr_of_mut!((*destination).free).cast::<PageRange>();
+            for index in 0..RANGE_CAPACITY {
+                initial.add(index).write(EMPTY_RANGE);
+                free.add(index).write(EMPTY_RANGE);
+            }
+            core::ptr::addr_of_mut!((*destination).initial_len).write(0);
+            core::ptr::addr_of_mut!((*destination).free_len).write(0);
+            core::ptr::addr_of_mut!((*destination).limit).write(limit);
+            let allocator = &mut *destination;
+            for candidate in candidates {
+                allocator.validate_candidate(*candidate)?;
+                allocator.insert_free(*candidate)?;
+            }
+            allocator.subtract(PageRange {
+                start: 0,
+                end: BASE_PAGE_SIZE,
+            })?;
+            for reservation in reservations {
+                allocator.subtract(PageRange::cover(reservation, limit)?)?;
+            }
+            allocator.initial[..allocator.free_len]
+                .copy_from_slice(&allocator.free[..allocator.free_len]);
+            allocator.initial_len = allocator.free_len;
+            Ok(allocator)
+        }
     }
 
     /// Allocates the lowest available base frame.

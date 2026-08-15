@@ -19,7 +19,7 @@ use crate::memory::physical::BASE_PAGE_SIZE;
 
 const ENTRY_COUNT: usize = 512;
 
-mod target_seal {
+pub(super) mod target_seal {
     pub trait Sealed {}
 }
 
@@ -29,9 +29,12 @@ mod target_seal {
 ///
 /// An implementation must serialize one page-table root for the complete
 /// borrow, and `apply` must either publish every supplied write followed by
-/// every invalidation or return an error with all entries unchanged and no
-/// invalidation or other TLB-visible effect. Writes are supplied
-/// child-before-parent and never contain duplicate locations.
+/// every invalidation or return an error with every owned-root entry unchanged
+/// and no requested mapping invalidation or other mapping-visible TLB effect.
+/// An error may follow private scratch-leaf CAS and private-window `invlpg`
+/// maintenance only when that scratch state is fully restored before return.
+/// Writes are supplied child-before-parent and never contain duplicate
+/// locations.
 ///
 /// The unsafe boundary which pairs a target with a publisher must additionally
 /// attest that this serialization domain is the exact supplied root and
@@ -64,6 +67,15 @@ pub(crate) struct JournalWrite {
     reason = "the live atomic mapper consumes these accessors after the host journal gate"
 )]
 impl JournalWrite {
+    #[cfg(test)]
+    pub(crate) const fn test_new(table: FrameAddress, index: usize, value: u64) -> Self {
+        Self {
+            table,
+            index,
+            value,
+        }
+    }
+
     pub(crate) const fn table(self) -> FrameAddress {
         self.table
     }

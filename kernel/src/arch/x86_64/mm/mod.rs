@@ -16,6 +16,21 @@ use crate::memory::physical::{BASE_PAGE_SIZE, PhysicalAddressLimit};
 mod journal;
 pub(crate) mod transition;
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unused_imports,
+    reason = "the C2 one-shot activation facade is wired by later bootstrap sequencing"
+)]
+pub(crate) use transition::activate_bootstrap_deep_paging;
+#[allow(
+    unused_imports,
+    reason = "the C2 activation typestate precedes its target-only CR3 backend"
+)]
+pub(crate) use transition::{
+    ActivationCpuState, ActivationPrepareError, ActiveDeepPaging, Cr3ActivationTarget,
+    InactiveRootAuthority, PreparedActivation,
+};
+
 #[allow(
     unused_imports,
     reason = "DW0-C exposes the sealed publisher before the live temporary mapper is wired"

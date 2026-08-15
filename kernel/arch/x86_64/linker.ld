@@ -22,6 +22,7 @@ SECTIONS
 {
     . = DW_KERNEL_LINK_BASE;
     __dw_kernel_image_start = .;
+    __dw_text_start = .;
 
     .text ALIGN(CONSTANT(MAXPAGESIZE)) :
     {
@@ -29,7 +30,9 @@ SECTIONS
         KEEP(*(.text.exceptions))
         *(.text .text.*)
     } :text
+    __dw_text_end = .;
 
+    __dw_rodata_start = ALIGN(CONSTANT(MAXPAGESIZE));
     .rodata ALIGN(CONSTANT(MAXPAGESIZE)) :
     {
         KEEP(*(.rodata.exceptions))
@@ -38,7 +41,9 @@ SECTIONS
         *(.got .got.*)
         *(.eh_frame .eh_frame.*)
     } :rodata
+    __dw_rodata_end = .;
 
+    __dw_data_start = ALIGN(CONSTANT(MAXPAGESIZE));
     .data ALIGN(CONSTANT(MAXPAGESIZE)) :
     {
         *(.data .data.*)
@@ -54,6 +59,7 @@ SECTIONS
         *(COMMON)
         __dw_bss_end = .;
     } :data
+    __dw_data_end = .;
 
     __dw_kernel_image_end = .;
 

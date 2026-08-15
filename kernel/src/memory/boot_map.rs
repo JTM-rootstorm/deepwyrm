@@ -6,13 +6,17 @@
 //! exact physical ranges which an architecture-owned transition must keep out
 //! of the frame allocator.
 
-#[cfg(test)]
-use deepwyrm_abi::DW_BOOT_MEMORY_KIND_MMIO;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+use deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT;
 use deepwyrm_abi::{
-    DW_BOOT_BASE_PAGE_SIZE, DW_BOOT_INFO_V1_SIZE, DW_BOOT_MEMORY_KIND_RESERVED,
-    DW_BOOT_MEMORY_KIND_USABLE, DwBootMemoryRangeV1,
+    DW_BOOT_BASE_PAGE_SIZE, DW_BOOT_INFO_V1_SIZE, DW_BOOT_MEMORY_KIND_ACPI_NVS,
+    DW_BOOT_MEMORY_KIND_ACPI_RECLAIM, DW_BOOT_MEMORY_KIND_MMIO, DW_BOOT_MEMORY_KIND_RESERVED,
+    DW_BOOT_MEMORY_KIND_RUNTIME_SERVICES, DW_BOOT_MEMORY_KIND_UNUSABLE, DW_BOOT_MEMORY_KIND_USABLE,
+    DwBootMemoryRangeV1,
 };
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+use crate::boot::MAX_BOOT_MODULE_ENTRIES;
 use crate::boot::{
     BootInfoValidationError, BootPhysicalRange, MAX_BOOT_MEMORY_MAP_ENTRIES, ValidatedBootInfo,
 };
@@ -20,9 +24,18 @@ use crate::boot::{
 use super::physical::{
     PageRange, PhysicalAddressLimit, PhysicalFrameAllocator, PhysicalMemoryError, PhysicalRange,
 };
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+use core::mem::MaybeUninit;
 
 /// Maximum usable extents retained by allocation-free DW0-C map sanitization.
 pub const MAX_SANITIZED_USABLE_RANGES: usize = MAX_BOOT_MEMORY_MAP_ENTRIES;
+
+/// Maximum complete reservation set emitted by a structurally valid V1
+/// handoff: three fixed tables, every module and transition table, plus four
+/// optional singleton ranges.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) const MAX_BOOTSTRAP_RESERVATIONS: usize =
+    3 + MAX_BOOT_MODULE_ENTRIES + DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT as usize + 4;
 
 const EMPTY_USABLE_RANGE: SanitizedUsableRange = SanitizedUsableRange {
     pages: PageRange::empty(),
@@ -56,6 +69,8 @@ impl SanitizedUsableRange {
 pub struct SanitizedBootMap {
     usable: [SanitizedUsableRange; MAX_SANITIZED_USABLE_RANGES],
     usable_len: usize,
+    normalized: [DwBootMemoryRangeV1; MAX_BOOT_MEMORY_MAP_ENTRIES],
+    normalized_len: usize,
     physical_limit: PhysicalAddressLimit,
 }
 
@@ -69,6 +84,43 @@ impl SanitizedBootMap {
     pub fn usable_range(&self, index: usize) -> Option<SanitizedUsableRange> {
         self.usable.get(..self.usable_len)?.get(index).copied()
     }
+}
+
+/// Exact normalized memory-map and bootstrap-reservation provenance consumed
+/// by the sole production frame-role manager.
+///
+/// Construction stays inside the private ownership parent. Architecture code
+/// may validate this witness but cannot pair an arbitrary map and reservation
+/// slice after allocator initialization.
+#[derive(Clone, Copy)]
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+pub(crate) struct BootstrapMemoryWitness<'a> {
+    map: &'a SanitizedBootMap,
+    reservations: &'a [BootstrapReservation],
+}
+
+/// Failure while proving that the executing kernel image is backed only by
+/// normalized `RESERVED` memory disjoint from every bootstrap allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+pub(crate) enum KernelImageBoundaryError {
+    InvalidRange {
+        range_index: usize,
+    },
+    Uncovered {
+        range_index: usize,
+    },
+    NotReserved {
+        range_index: usize,
+    },
+    KernelRangeOverlap {
+        left: usize,
+        right: usize,
+    },
+    BootstrapReservationOverlap {
+        range_index: usize,
+        reservation: BootstrapReservationKind,
+    },
 }
 
 /// Range provenance retained for focused diagnostics and tests.
@@ -94,6 +146,14 @@ pub struct BootstrapReservation {
 }
 
 impl BootstrapReservation {
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    pub(crate) fn placeholder() -> Self {
+        Self {
+            kind: BootstrapReservationKind::BootInfo,
+            range: PhysicalRange::new(0, 1).expect("one-byte placeholder range is valid"),
+        }
+    }
+
     /// Reservation provenance.
     pub const fn kind(self) -> BootstrapReservationKind {
         self.kind
@@ -113,6 +173,7 @@ pub enum BootMapError {
     UnsortedInput,
     OverlappingInput,
     OutputCapacityExceeded,
+    UnknownMemoryKind,
     HandoffRangeUncovered { kind: BootstrapReservationKind },
     HandoffRangeUsable { kind: BootstrapReservationKind },
     HandoffRangeNotReserved { kind: BootstrapReservationKind },
@@ -151,32 +212,62 @@ pub fn sanitize_boot_map(
     Ok(sanitized)
 }
 
+/// Sanitizes the production map directly into its final bootstrap storage.
+///
+/// # Safety
+///
+/// `slot` must be unique, uninitialized storage owned by the one-shot BSP
+/// bootstrap. A failure is terminal for the slot and it must not be reused.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "the sole BSP sanitizer initializes its bounded map witness in static storage"
+)]
+pub(crate) unsafe fn sanitize_boot_map_in<'a>(
+    slot: &'a mut MaybeUninit<SanitizedBootMap>,
+    boot_info: &ValidatedBootInfo,
+    boot_info_physical_start: u64,
+    physical_limit: PhysicalAddressLimit,
+) -> Result<&'a mut SanitizedBootMap, BootMapError> {
+    let destination = slot.as_mut_ptr();
+    unsafe {
+        let usable = core::ptr::addr_of_mut!((*destination).usable).cast::<SanitizedUsableRange>();
+        for index in 0..MAX_SANITIZED_USABLE_RANGES {
+            usable.add(index).write(EMPTY_USABLE_RANGE);
+        }
+        core::ptr::addr_of_mut!((*destination).usable_len).write(0);
+        let normalized =
+            core::ptr::addr_of_mut!((*destination).normalized).cast::<DwBootMemoryRangeV1>();
+        for index in 0..MAX_BOOT_MEMORY_MAP_ENTRIES {
+            normalized.add(index).write(DwBootMemoryRangeV1::default());
+        }
+        core::ptr::addr_of_mut!((*destination).normalized_len).write(0);
+        core::ptr::addr_of_mut!((*destination).physical_limit).write(physical_limit);
+    }
+    let sanitized = unsafe { &mut *destination };
+    let record_count = boot_info.memory_map().entry_count() as usize;
+    for index in 0..record_count {
+        let record = boot_info
+            .memory_range(index as u64)
+            .map_err(BootMapError::Snapshot)?;
+        sanitized.push_normalized(record)?;
+    }
+    validate_enumerated_handoff_coverage(
+        boot_info,
+        sanitized.normalized_records(),
+        boot_info_physical_start,
+        physical_limit,
+    )?;
+    Ok(sanitized)
+}
+
 fn sanitize_records(
     records: &[DwBootMemoryRangeV1],
     physical_limit: PhysicalAddressLimit,
 ) -> Result<SanitizedBootMap, BootMapError> {
-    let mut sanitized = SanitizedBootMap {
-        usable: [EMPTY_USABLE_RANGE; MAX_SANITIZED_USABLE_RANGES],
-        usable_len: 0,
-        physical_limit,
-    };
-    let mut previous: Option<PageRange> = None;
-
+    let mut sanitized = SanitizedBootMap::empty(physical_limit);
     for record in records {
-        let pages = record_pages(*record, physical_limit)?;
-        if let Some(previous) = previous {
-            if pages.start < previous.start {
-                return Err(BootMapError::UnsortedInput);
-            }
-            if pages.start < previous.end {
-                return Err(BootMapError::OverlappingInput);
-            }
-        }
-        previous = Some(pages);
-
-        if record.kind == DW_BOOT_MEMORY_KIND_USABLE {
-            sanitized.push_usable(pages, record.firmware_attributes)?;
-        }
+        sanitized.push_normalized(*record)?;
     }
     Ok(sanitized)
 }
@@ -309,7 +400,82 @@ pub(super) fn initialize_frame_allocator<const RANGE_CAPACITY: usize>(
     .map_err(BootMapError::Physical)
 }
 
+/// Initializes the production allocator directly inside its final manager
+/// field so fixed-capacity range arrays never become stack return values.
+///
+/// # Safety
+///
+/// `slot` must be unique, uninitialized bootstrap storage. A failure is
+/// terminal for the slot and the caller must not retry initialization.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "the sole BSP manager initializes its allocator field in place"
+)]
+pub(super) unsafe fn initialize_frame_allocator_in<'a, const RANGE_CAPACITY: usize>(
+    slot: &'a mut MaybeUninit<PhysicalFrameAllocator<RANGE_CAPACITY>>,
+    map: &SanitizedBootMap,
+    reservations: &[BootstrapReservation],
+) -> Result<&'a mut PhysicalFrameAllocator<RANGE_CAPACITY>, BootMapError> {
+    let mut candidates = [PageRange::empty(); MAX_SANITIZED_USABLE_RANGES];
+    for (slot, usable) in candidates[..map.usable_len]
+        .iter_mut()
+        .zip(map.usable[..map.usable_len].iter())
+    {
+        *slot = usable.pages;
+    }
+    unsafe {
+        PhysicalFrameAllocator::from_candidates_in(
+            slot,
+            &candidates[..map.usable_len],
+            map.physical_limit,
+            reservations.iter().map(|reservation| reservation.range),
+        )
+    }
+    .map_err(BootMapError::Physical)
+}
+
 impl SanitizedBootMap {
+    fn empty(physical_limit: PhysicalAddressLimit) -> Self {
+        Self {
+            usable: [EMPTY_USABLE_RANGE; MAX_SANITIZED_USABLE_RANGES],
+            usable_len: 0,
+            normalized: [DwBootMemoryRangeV1::default(); MAX_BOOT_MEMORY_MAP_ENTRIES],
+            normalized_len: 0,
+            physical_limit,
+        }
+    }
+
+    fn normalized_records(&self) -> &[DwBootMemoryRangeV1] {
+        &self.normalized[..self.normalized_len]
+    }
+
+    fn push_normalized(&mut self, record: DwBootMemoryRangeV1) -> Result<(), BootMapError> {
+        if !known_memory_kind(record.kind.0) {
+            return Err(BootMapError::UnknownMemoryKind);
+        }
+        let pages = record_pages(record, self.physical_limit)?;
+        if let Some(previous) = self.normalized_records().last().copied() {
+            let previous = record_pages(previous, self.physical_limit)?;
+            if pages.start < previous.start {
+                return Err(BootMapError::UnsortedInput);
+            }
+            if pages.start < previous.end {
+                return Err(BootMapError::OverlappingInput);
+            }
+        }
+        let slot = self
+            .normalized
+            .get_mut(self.normalized_len)
+            .ok_or(BootMapError::OutputCapacityExceeded)?;
+        *slot = record;
+        self.normalized_len += 1;
+        if record.kind == DW_BOOT_MEMORY_KIND_USABLE {
+            self.push_usable(pages, record.firmware_attributes)?;
+        }
+        Ok(())
+    }
+
     fn push_usable(
         &mut self,
         pages: PageRange,
@@ -333,6 +499,112 @@ impl SanitizedBootMap {
         self.usable_len += 1;
         Ok(())
     }
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+impl<'a> BootstrapMemoryWitness<'a> {
+    pub(super) const fn new(
+        map: &'a SanitizedBootMap,
+        reservations: &'a [BootstrapReservation],
+    ) -> Self {
+        Self { map, reservations }
+    }
+
+    /// Proves all kernel image extents are exact page ranges covered solely by
+    /// normalized `RESERVED` records and disjoint from every handoff range.
+    pub(crate) fn validate_kernel_image_ranges(
+        self,
+        ranges: &[PhysicalRange; 3],
+    ) -> Result<(), KernelImageBoundaryError> {
+        for (left_index, left) in ranges.iter().copied().enumerate() {
+            if !left
+                .physical_start()
+                .is_multiple_of(u64::from(DW_BOOT_BASE_PAGE_SIZE))
+                || !left
+                    .byte_len()
+                    .is_multiple_of(u64::from(DW_BOOT_BASE_PAGE_SIZE))
+            {
+                return Err(KernelImageBoundaryError::InvalidRange {
+                    range_index: left_index,
+                });
+            }
+            for (right_index, right) in ranges.iter().copied().enumerate().skip(left_index + 1) {
+                if ranges_overlap(left, right) {
+                    return Err(KernelImageBoundaryError::KernelRangeOverlap {
+                        left: left_index,
+                        right: right_index,
+                    });
+                }
+            }
+            require_kernel_reserved_coverage(
+                self.map.normalized_records(),
+                left,
+                left_index,
+                self.map.physical_limit,
+            )?;
+            for reservation in self.reservations.iter().copied() {
+                if ranges_overlap(left, reservation.range) {
+                    return Err(KernelImageBoundaryError::BootstrapReservationOverlap {
+                        range_index: left_index,
+                        reservation: reservation.kind,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn known_memory_kind(kind: u32) -> bool {
+    kind == DW_BOOT_MEMORY_KIND_USABLE.0
+        || kind == DW_BOOT_MEMORY_KIND_RESERVED.0
+        || kind == DW_BOOT_MEMORY_KIND_ACPI_RECLAIM.0
+        || kind == DW_BOOT_MEMORY_KIND_ACPI_NVS.0
+        || kind == DW_BOOT_MEMORY_KIND_MMIO.0
+        || kind == DW_BOOT_MEMORY_KIND_RUNTIME_SERVICES.0
+        || kind == DW_BOOT_MEMORY_KIND_UNUSABLE.0
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+fn ranges_overlap(left: PhysicalRange, right: PhysicalRange) -> bool {
+    let Ok(left_end) = left.end() else {
+        return true;
+    };
+    let Ok(right_end) = right.end() else {
+        return true;
+    };
+    left.physical_start() < right_end && right.physical_start() < left_end
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+fn require_kernel_reserved_coverage(
+    records: &[DwBootMemoryRangeV1],
+    range: PhysicalRange,
+    range_index: usize,
+    physical_limit: PhysicalAddressLimit,
+) -> Result<(), KernelImageBoundaryError> {
+    let end = range
+        .end()
+        .map_err(|_| KernelImageBoundaryError::InvalidRange { range_index })?;
+    let mut covered_until = range.physical_start();
+    for record in records {
+        let pages = record_pages(*record, physical_limit)
+            .map_err(|_| KernelImageBoundaryError::InvalidRange { range_index })?;
+        if pages.end <= covered_until {
+            continue;
+        }
+        if pages.start > covered_until {
+            return Err(KernelImageBoundaryError::Uncovered { range_index });
+        }
+        if record.kind != DW_BOOT_MEMORY_KIND_RESERVED {
+            return Err(KernelImageBoundaryError::NotReserved { range_index });
+        }
+        covered_until = core::cmp::min(pages.end, end);
+        if covered_until == end {
+            return Ok(());
+        }
+    }
+    Err(KernelImageBoundaryError::Uncovered { range_index })
 }
 
 fn record_pages(
@@ -563,6 +835,7 @@ fn push_reservation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::frame_roles::{KernelImageSegment, synthetic_frame_role_manager};
 
     fn limit() -> PhysicalAddressLimit {
         PhysicalAddressLimit::new(0x20_000).unwrap()
@@ -570,6 +843,22 @@ mod tests {
 
     fn range(start: u64) -> PhysicalRange {
         PhysicalRange::new(start, 0x1000).unwrap()
+    }
+
+    fn kernel_ranges() -> [PhysicalRange; 3] {
+        [range(0x2000), range(0x3000), range(0x4000)]
+    }
+
+    fn reserved_kernel_map() -> SanitizedBootMap {
+        sanitize_records(
+            &[
+                record(0x1000, 2, DW_BOOT_MEMORY_KIND_RESERVED, 0),
+                record(0x3000, 4, DW_BOOT_MEMORY_KIND_RESERVED, 0),
+                record(0x10_000, 8, DW_BOOT_MEMORY_KIND_USABLE, 0),
+            ],
+            limit(),
+        )
+        .unwrap()
     }
 
     fn record(
@@ -588,19 +877,16 @@ mod tests {
     }
 
     fn usable_map() -> SanitizedBootMap {
-        let mut usable = [EMPTY_USABLE_RANGE; MAX_SANITIZED_USABLE_RANGES];
-        usable[0] = SanitizedUsableRange {
+        let mut map = SanitizedBootMap::empty(limit());
+        map.usable[0] = SanitizedUsableRange {
             pages: PageRange {
                 start: 0,
                 end: 0x10_000,
             },
             firmware_attributes: 0x8,
         };
-        SanitizedBootMap {
-            usable,
-            usable_len: 1,
-            physical_limit: limit(),
-        }
+        map.usable_len = 1;
+        map
     }
 
     #[test]
@@ -766,6 +1052,133 @@ mod tests {
             require_reserved_coverage(&outside, frame, kind, limit()),
             Err(BootMapError::HandoffRangeUncovered { kind })
         );
+    }
+
+    #[test]
+    fn kernel_image_requires_complete_exact_reserved_coverage() {
+        let map = reserved_kernel_map();
+        assert_eq!(
+            BootstrapMemoryWitness::new(&map, &[]).validate_kernel_image_ranges(&kernel_ranges()),
+            Ok(())
+        );
+
+        let mmio = sanitize_records(
+            &[
+                record(0x2000, 1, DW_BOOT_MEMORY_KIND_MMIO, 0),
+                record(0x3000, 2, DW_BOOT_MEMORY_KIND_RESERVED, 0),
+            ],
+            limit(),
+        )
+        .unwrap();
+        assert_eq!(
+            BootstrapMemoryWitness::new(&mmio, &[]).validate_kernel_image_ranges(&kernel_ranges()),
+            Err(KernelImageBoundaryError::NotReserved { range_index: 0 })
+        );
+
+        let gap = sanitize_records(
+            &[
+                record(0x1000, 1, DW_BOOT_MEMORY_KIND_RESERVED, 0),
+                record(0x3000, 4, DW_BOOT_MEMORY_KIND_RESERVED, 0),
+            ],
+            limit(),
+        )
+        .unwrap();
+        let spanning_gap = [
+            PhysicalRange::new(0x1000, 0x3000).unwrap(),
+            range(0x5000),
+            range(0x6000),
+        ];
+        assert_eq!(
+            BootstrapMemoryWitness::new(&gap, &[]).validate_kernel_image_ranges(&spanning_gap),
+            Err(KernelImageBoundaryError::Uncovered { range_index: 0 })
+        );
+    }
+
+    #[test]
+    fn sanitizer_rejects_unknown_memory_kind_before_witness_issuance() {
+        assert!(matches!(
+            sanitize_records(
+                &[record(
+                    0x1000,
+                    1,
+                    deepwyrm_abi::DwBootMemoryKind(u32::MAX),
+                    0,
+                )],
+                limit(),
+            ),
+            Err(BootMapError::UnknownMemoryKind)
+        ));
+    }
+
+    #[test]
+    fn every_bootstrap_reservation_kind_blocks_kernel_image_aliasing() {
+        let map = reserved_kernel_map();
+        for kind in [
+            BootstrapReservationKind::BootInfo,
+            BootstrapReservationKind::MemoryMapTable,
+            BootstrapReservationKind::ModuleTable,
+            BootstrapReservationKind::ModuleData { index: 0 },
+            BootstrapReservationKind::CommandLine,
+            BootstrapReservationKind::Entropy,
+            BootstrapReservationKind::FramebufferPixels,
+            BootstrapReservationKind::AcpiRsdpMaximumExtent,
+            BootstrapReservationKind::PagingTableFrame { index: 0 },
+        ] {
+            let reservations = [BootstrapReservation {
+                kind,
+                range: PhysicalRange::new(0x2800, 0x100).unwrap(),
+            }];
+            assert_eq!(
+                BootstrapMemoryWitness::new(&map, &reservations)
+                    .validate_kernel_image_ranges(&kernel_ranges()),
+                Err(KernelImageBoundaryError::BootstrapReservationOverlap {
+                    range_index: 0,
+                    reservation: kind,
+                })
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "synthetic host roles prove rejected boot provenance has no publication side effect"
+    )]
+    fn rejected_kernel_boundary_leaves_allocator_and_roles_unchanged() {
+        let map = reserved_kernel_map();
+        let reservations = [BootstrapReservation {
+            kind: BootstrapReservationKind::BootInfo,
+            range: range(0x2000),
+        }];
+        let mut roles = synthetic_frame_role_manager::<1, 8>(0x10_000, 8);
+        let available = roles.available_frames();
+        assert_eq!(
+            BootstrapMemoryWitness::new(&map, &reservations)
+                .validate_kernel_image_ranges(&kernel_ranges()),
+            Err(KernelImageBoundaryError::BootstrapReservationOverlap {
+                range_index: 0,
+                reservation: BootstrapReservationKind::BootInfo,
+            })
+        );
+        assert_eq!(roles.available_frames(), available);
+        assert_eq!(roles.check_invariants(), Ok(()));
+
+        let declarations = [
+            (kernel_ranges()[0], KernelImageSegment::Text),
+            (kernel_ranges()[1], KernelImageSegment::ReadOnlyData),
+            (kernel_ranges()[2], KernelImageSegment::WritableData),
+        ];
+        let staged = unsafe { roles.stage_kernel_image_roles(declarations) }
+            .expect("rejected boundary must not have published a role");
+        let _published = roles.publish_staged_kernel_image(staged);
+        for (range, segment) in declarations {
+            assert_eq!(
+                roles.validate_kernel_image_page(range.physical_start(), segment),
+                Ok(())
+            );
+        }
+        assert_eq!(roles.available_frames(), available);
+        assert_eq!(roles.check_invariants(), Ok(()));
     }
 
     #[test]

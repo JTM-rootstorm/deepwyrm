@@ -22,6 +22,51 @@ use boot::BootInfoByteReader;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 const MAX_X86_PHYSICAL_ADDRESS_EXCLUSIVE: u64 = 1_u64 << 52;
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+const BOOTSTRAP_FRAME_RANGE_CAPACITY: usize = memory::boot_map::MAX_SANITIZED_USABLE_RANGES;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+const BOOTSTRAP_FRAME_ROLE_CAPACITY: usize = 544;
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+struct BootstrapStorage<T>(core::cell::UnsafeCell<core::mem::MaybeUninit<T>>);
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+impl<T> BootstrapStorage<T> {
+    const fn uninit() -> Self {
+        Self(core::cell::UnsafeCell::new(core::mem::MaybeUninit::uninit()))
+    }
+
+    fn slot(&self) -> *mut core::mem::MaybeUninit<T> {
+        self.0.get()
+    }
+}
+
+// SAFETY: these cells are reachable only from the one-shot BSP `kernel_main`
+// path before AP startup; no shared reference to their contents is issued.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "one-shot BSP ownership serializes bootstrap static storage"
+)]
+unsafe impl<T> Sync for BootstrapStorage<T> {}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+static BOOTSTRAP_ROLE_MANAGER: BootstrapStorage<
+    memory::frame_roles::FrameRoleManager<
+        BOOTSTRAP_FRAME_RANGE_CAPACITY,
+        BOOTSTRAP_FRAME_ROLE_CAPACITY,
+    >,
+> = BootstrapStorage::uninit();
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+static BOOTSTRAP_RESERVATIONS: BootstrapStorage<
+    [memory::boot_map::BootstrapReservation; memory::boot_map::MAX_BOOTSTRAP_RESERVATIONS],
+> = BootstrapStorage::uninit();
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+static BOOTSTRAP_SANITIZED_MAP: BootstrapStorage<memory::boot_map::SanitizedBootMap> =
+    BootstrapStorage::uninit();
+
 /// Transfers from the raw architecture entry into validated DW0-B bring-up.
 ///
 /// This symbol is architecture-internal. The loader enters through
@@ -39,7 +84,7 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
     }
 
     let reader = IdentityMappedBootInfoReader;
-    let _boot_info = boot::validate_boot_info(&reader, boot_info_physical)
+    let boot_info = boot::validate_boot_info(&reader, boot_info_physical)
         .unwrap_or_else(|error| panic!("invalid DwBootInfoV1 handoff: {error:?}"));
 
     #[cfg(feature = "test-support")]
@@ -53,12 +98,76 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
 
     #[cfg(not(feature = "test-support"))]
     {
+        let physical_width =
+            u8::try_from(boot_info.paging_handoff().header().physical_address_width)
+                .unwrap_or_else(|_| panic!("paging handoff physical width is not representable"));
+        let physical_limit =
+            memory::physical::PhysicalAddressLimit::from_address_bits(physical_width)
+                .unwrap_or_else(|error| panic!("invalid paging physical limit: {error:?}"));
+        // SAFETY: `kernel_main` is the sole BSP owner and this static slot is
+        // uninitialized. A sanitizer failure terminates this boot attempt.
+        let sanitized = unsafe {
+            memory::boot_map::sanitize_boot_map_in(
+                &mut *BOOTSTRAP_SANITIZED_MAP.slot(),
+                &boot_info,
+                boot_info_physical,
+                physical_limit,
+            )
+        }
+        .unwrap_or_else(|error| panic!("invalid bootstrap memory map: {error:?}"));
+        let reservations = unsafe {
+            let array = (*BOOTSTRAP_RESERVATIONS.slot()).as_mut_ptr();
+            let element = array.cast::<memory::boot_map::BootstrapReservation>();
+            for index in 0..memory::boot_map::MAX_BOOTSTRAP_RESERVATIONS {
+                element
+                    .add(index)
+                    .write(memory::boot_map::BootstrapReservation::placeholder());
+            }
+            &mut *array
+        };
+        let reservation_count = memory::boot_map::collect_bootstrap_reservations(
+            &boot_info,
+            boot_info_physical,
+            reservations,
+        )
+        .unwrap_or_else(|error| panic!("invalid bootstrap reservations: {error:?}"));
+        // SAFETY: `kernel_main` is the non-reentrant BSP owner of the consumed
+        // boot snapshot and has created no other allocator over its candidates.
+        let (roles, memory_witness) = unsafe {
+            memory::frame_roles::FrameRoleManager::<
+                BOOTSTRAP_FRAME_RANGE_CAPACITY,
+                BOOTSTRAP_FRAME_ROLE_CAPACITY,
+            >::from_boot_map_in(
+                &mut *BOOTSTRAP_ROLE_MANAGER.slot(),
+                &sanitized,
+                &reservations[..reservation_count],
+            )
+        }
+        .unwrap_or_else(|error| panic!("failed to claim physical ownership: {error:?}"));
+        // SAFETY: the raw entry and descriptor installer establish the sole-BSP,
+        // CPL0, IF-clear, stationary stack/descriptor contract. No AP or other
+        // mapper can run during this complete consuming activation session.
+        let mut active_paging = unsafe {
+            arch::x86_64::mm::activate_bootstrap_deep_paging(
+                boot_info.paging_handoff(),
+                roles,
+                memory_witness,
+            )
+        }
+        .unwrap_or_else(|error| panic!("failed to activate Deep-owned paging: {error:?}"));
         let _ = debug::emit_early_record(
             debug::DiagnosticLevel::Info,
             "boot",
-            "validated DwBootInfoV1 handoff",
+            "activated Deep-owned page tables",
         );
-        halt_bootstrap_cpu()
+        loop {
+            core::hint::black_box(&mut active_paging);
+            // SAFETY: the active session remains owned on this stack, APs are
+            // offline, and DW0-C2 has no scheduler or later phase to resume.
+            unsafe {
+                core::arch::asm!("cli; hlt", options(nomem, nostack));
+            }
+        }
     }
 }
 
@@ -104,22 +213,4 @@ impl BootInfoByteReader for IdentityMappedBootInfoReader {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     debug::handle_early_panic(info)
-}
-
-#[cfg(all(
-    not(feature = "test-support"),
-    target_os = "none",
-    target_arch = "x86_64"
-))]
-#[allow(
-    unsafe_code,
-    reason = "terminal DW0-B bootstrap endpoint keeps interrupts disabled"
-)]
-fn halt_bootstrap_cpu() -> ! {
-    loop {
-        // SAFETY: DW0-B has no scheduler or later initialization to resume.
-        unsafe {
-            core::arch::asm!("cli; hlt", options(nomem, nostack));
-        }
-    }
 }

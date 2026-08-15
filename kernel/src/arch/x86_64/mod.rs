@@ -110,6 +110,35 @@ static NMI_IST: EmergencyIstStack = EmergencyIstStack::new();
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 static MACHINE_CHECK_IST: EmergencyIstStack = EmergencyIstStack::new();
 
+/// Exact static descriptor objects retained by the first Deep-owned root.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+pub(crate) struct EarlyDescriptorAddresses {
+    pub(crate) gdt: u64,
+    pub(crate) gdt_limit: u16,
+    pub(crate) idt: u64,
+    pub(crate) idt_limit: u16,
+    pub(crate) tss: u64,
+    pub(crate) tss_limit: u16,
+}
+
+/// Returns the installed one-shot descriptor object addresses without
+/// exposing mutation authority over their static storage.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn early_descriptor_addresses() -> Option<EarlyDescriptorAddresses> {
+    if INSTALL_STATE.load(Ordering::Acquire) != INSTALLED {
+        return None;
+    }
+    Some(EarlyDescriptorAddresses {
+        gdt: GDT.value.get() as u64,
+        gdt_limit: (core::mem::size_of::<GlobalDescriptorTable>() - 1) as u16,
+        idt: FINAL_IDT.value.get() as u64,
+        idt_limit: (core::mem::size_of::<InterruptDescriptorTable>() - 1) as u16,
+        tss: TSS.value.get() as u64,
+        tss_limit: (core::mem::size_of::<TaskStateSegment>() - 1) as u16,
+    })
+}
+
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[allow(
     unsafe_code,
