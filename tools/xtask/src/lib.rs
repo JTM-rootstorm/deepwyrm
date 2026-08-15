@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 pub const EXIT_NOT_IMPLEMENTED: u8 = 1;
 pub const EXIT_USAGE: u8 = 2;
@@ -24,6 +24,7 @@ const COMMANDS: &[&str] = &[
 const TEST_TIERS: &[&str] = &["host", "guest", "integration"];
 const HARNESS_CONFIG: &str = "tooling/guest-harness.toml";
 const TRUSTED_TOOLCHAIN_CONFIG: &str = "tooling/rust-toolchain.toml";
+const BUILD_TOOLS_CONFIG: &str = "tooling/build-tools.toml";
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_SERIAL_BYTES: usize = 4 * 1024 * 1024;
@@ -48,6 +49,8 @@ Commands:
   guest-result <serial-log> --request <path> --exit-status <code>
                                      Classify one DWTEST1 terminal record and QEMU exit
   toolchain                          Report host tool availability
+  toolchain verify-build-tools --root <path> --clang-config <path>
+                                     Verify accepted host Clang/LLVM identities
   build                              Build Deepwyrm [not implemented]
   image                              Construct boot media [not implemented]
   inspect-image                      Inspect boot media [not implemented]
@@ -65,6 +68,10 @@ enum Action {
         exit_status: i32,
     },
     Toolchain,
+    VerifyBuildTools {
+        root: PathBuf,
+        clang_config: PathBuf,
+    },
     NotImplemented(String),
     UsageError(String),
 }
@@ -152,6 +159,9 @@ struct TrustedToolchain {
     rust_commit: String,
     target: String,
     config_sha256: String,
+    artifact_root: PathBuf,
+    toolchain_root: PathBuf,
+    toolchain_tree_sha256: String,
     root_manifest_path: PathBuf,
     root_manifest_sha256: String,
     cargo_path: PathBuf,
@@ -160,8 +170,30 @@ struct TrustedToolchain {
     rustc_sha256: String,
     rust_lld_path: PathBuf,
     rust_lld_sha256: String,
+    rustc_driver_internal_library: TrustedArtifact,
+    llvm_internal_library: TrustedArtifact,
     sysroot_manifest_path: PathBuf,
     sysroot_manifest_sha256: String,
+    freestanding_core: Option<TrustedArtifact>,
+    freestanding_compiler_builtins: Option<TrustedArtifact>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TrustedArtifact {
+    path: PathBuf,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BuildToolsIdentity {
+    clang_version: String,
+    clang_binary: String,
+    clang_sha256: String,
+    libclang_cpp: String,
+    libclang_cpp_sha256: String,
+    host_llvm: String,
+    host_llvm_sha256: String,
+    clang_config_sha256: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -233,6 +265,7 @@ fn dispatch(action: Action) -> io::Result<u8> {
             exit_status,
         } => parse_guest_result_file(&serial_log, &request_path, exit_status),
         Action::Toolchain => print_toolchain_diagnostics(),
+        Action::VerifyBuildTools { root, clang_config } => verify_build_tools(&root, &clang_config),
         Action::NotImplemented(command) => {
             let mut stderr = io::stderr().lock();
             writeln!(
@@ -427,7 +460,7 @@ fn qemu_arguments(
         args.extend([
             "-S".into(),
             "-gdb".into(),
-            format!("tcp::{}", profile.gdb_port),
+            format!("tcp:127.0.0.1:{}", profile.gdb_port),
         ]);
     }
     args
@@ -440,7 +473,7 @@ fn gdb_arguments(profile: &HarnessProfile, request: &HarnessRequest) -> Vec<Stri
         "-ex".into(),
         format!("file {}", request.deepwyrm_symbols),
         "-ex".into(),
-        format!("target remote :{}", profile.gdb_port),
+        format!("target remote 127.0.0.1:{}", profile.gdb_port),
     ]
 }
 
@@ -476,9 +509,11 @@ fn parse_guest_result_file(path: &Path, request_path: &Path, exit_status: i32) -
             );
         }
     };
-    if let Err(error) = validate_request(HarnessKind::GuestTest, &request, None).and_then(|()| {
-        validate_guest_selector_metadata(&workspace_root().join(HARNESS_CONFIG), &request)
-    }) {
+    let harness_config = workspace_root().join(HARNESS_CONFIG);
+    if let Err(error) = validate_request(HarnessKind::GuestTest, &request, None)
+        .and_then(|()| load_profiles(&harness_config).map(|_| ()))
+        .and_then(|()| validate_guest_selector_metadata(&harness_config, &request))
+    {
         return emit_infrastructure_result(
             Some(&request.selector),
             Some(request.test_id),
@@ -486,7 +521,10 @@ fn parse_guest_result_file(path: &Path, request_path: &Path, exit_status: i32) -
             &format!("invalid guest-test request: {error}"),
         );
     }
-    let request_root = request_path.parent().unwrap_or_else(|| Path::new(""));
+    let request_root = request_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let declared_serial = request_root.join(&request.serial_log);
     if declared_serial != path || !declared_serial.starts_with(request_root) {
         return emit_infrastructure_result(
@@ -494,6 +532,40 @@ fn parse_guest_result_file(path: &Path, request_path: &Path, exit_status: i32) -
             Some(request.test_id),
             Some(&request_digest),
             "serial log path is not the request-declared path under the request root",
+        );
+    }
+    let relative_parent = Path::new(&request.serial_log)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    let canonical_root = match fs::canonicalize(request_root) {
+        Ok(path) => path,
+        Err(error) => {
+            return emit_infrastructure_result(
+                Some(&request.selector),
+                Some(request.test_id),
+                Some(&request_digest),
+                &format!("cannot canonicalize request root: {error}"),
+            );
+        }
+    };
+    let declared_parent = declared_serial.parent().unwrap_or(request_root);
+    let canonical_parent = match fs::canonicalize(declared_parent) {
+        Ok(path) => path,
+        Err(error) => {
+            return emit_infrastructure_result(
+                Some(&request.selector),
+                Some(request.test_id),
+                Some(&request_digest),
+                &format!("cannot canonicalize declared serial parent: {error}"),
+            );
+        }
+    };
+    if canonical_parent != canonical_root.join(relative_parent) {
+        return emit_infrastructure_result(
+            Some(&request.selector),
+            Some(request.test_id),
+            Some(&request_digest),
+            "declared serial parent escapes the canonical request-root boundary",
         );
     }
     let bytes = match read_bounded(path, "serial log", MAX_SERIAL_BYTES) {
@@ -817,11 +889,28 @@ fn sha256_hex(input: &[u8]) -> String {
 fn load_profiles(path: &Path) -> io::Result<BTreeMap<String, HarnessProfile>> {
     let text = read_bounded_utf8(path, "guest harness config", MAX_CONFIG_BYTES)?;
     let mut profiles = BTreeMap::new();
-    let mut current = None::<String>;
     let mut values = BTreeMap::<String, BTreeMap<String, String>>::new();
+    let mut guest_tests = BTreeMap::<String, Option<u32>>::new();
+    enum Section {
+        Profile(String),
+        GuestTest(String),
+    }
+    let mut current = None::<Section>;
+    let mut saw_schema = false;
     for (line_number, raw_line) in text.lines().enumerate() {
         let line = raw_line.split('#').next().unwrap_or("").trim();
-        if line.is_empty() || line == "schema_version = 1" {
+        if line.is_empty() {
+            continue;
+        }
+        if line == "schema_version = 1" {
+            if saw_schema || current.is_some() {
+                return invalid_input(format!(
+                    "{}:{}: schema_version must appear once before sections",
+                    path.display(),
+                    line_number + 1
+                ));
+            }
+            saw_schema = true;
             continue;
         }
         if line.starts_with("[profile.") && line.ends_with(']') {
@@ -834,12 +923,29 @@ fn load_profiles(path: &Path) -> io::Result<BTreeMap<String, HarnessProfile>> {
                 ));
             }
             values.insert(name.into(), BTreeMap::new());
-            current = Some(name.into());
+            current = Some(Section::Profile(name.into()));
+            continue;
+        }
+        if line.starts_with("[guest_test.") && line.ends_with(']') {
+            let selector = &line[12..line.len() - 1];
+            validate_selector(selector)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            if guest_tests.insert(selector.into(), None).is_some() {
+                return invalid_input(format!(
+                    "{}:{}: duplicate guest-test selector `{selector}`",
+                    path.display(),
+                    line_number + 1
+                ));
+            }
+            current = Some(Section::GuestTest(selector.into()));
             continue;
         }
         if line.starts_with('[') {
-            current = None;
-            continue;
+            return invalid_input(format!(
+                "{}:{}: unsupported harness configuration section",
+                path.display(),
+                line_number + 1
+            ));
         }
         let (key, value) = parse_toml_scalar(line).map_err(|error| {
             io::Error::new(
@@ -847,26 +953,70 @@ fn load_profiles(path: &Path) -> io::Result<BTreeMap<String, HarnessProfile>> {
                 format!("{}:{}: {error}", path.display(), line_number + 1),
             )
         })?;
-        let section = current.as_ref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "{}:{}: value outside a profile",
+        match current.as_ref() {
+            Some(Section::Profile(section)) => {
+                let profile_values = values
+                    .get_mut(section)
+                    .expect("current profile was inserted");
+                if profile_values.insert(key.into(), value).is_some() {
+                    return invalid_input(format!(
+                        "{}:{}: duplicate key `{key}`",
+                        path.display(),
+                        line_number + 1
+                    ));
+                }
+            }
+            Some(Section::GuestTest(selector)) => {
+                if key != "id" {
+                    return invalid_input(format!(
+                        "{}:{}: guest-test `{selector}` only accepts `id`",
+                        path.display(),
+                        line_number + 1
+                    ));
+                }
+                let id = value.parse::<u32>().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "{}:{}: guest-test id must be an integer",
+                            path.display(),
+                            line_number + 1
+                        ),
+                    )
+                })?;
+                if id == 0
+                    || guest_tests
+                        .insert(selector.clone(), Some(id))
+                        .flatten()
+                        .is_some()
+                {
+                    return invalid_input(format!(
+                        "{}:{}: guest-test `{selector}` has an invalid or duplicate id",
+                        path.display(),
+                        line_number + 1
+                    ));
+                }
+            }
+            None => {
+                return invalid_input(format!(
+                    "{}:{}: value outside a supported section",
                     path.display(),
                     line_number + 1
-                ),
-            )
-        })?;
-        let profile_values = values
-            .get_mut(section)
-            .expect("current profile was inserted");
-        if profile_values.insert(key.into(), value).is_some() {
-            return invalid_input(format!(
-                "{}:{}: duplicate key `{key}`",
-                path.display(),
-                line_number + 1
-            ));
+                ));
+            }
         }
+    }
+    if !saw_schema || guest_tests.values().any(Option::is_none) {
+        return invalid_input(
+            "guest harness configuration is missing schema or guest-test id".into(),
+        );
+    }
+    let unique_ids = guest_tests
+        .values()
+        .filter_map(|id| *id)
+        .collect::<BTreeSet<_>>();
+    if unique_ids.len() != guest_tests.len() {
+        return invalid_input("guest harness configuration has duplicate guest-test IDs".into());
     }
     for (name, values) in values {
         let profile = HarnessProfile {
@@ -1072,7 +1222,8 @@ fn parse_flat_toml(text: &str, path: &Path) -> io::Result<BTreeMap<String, Strin
 }
 
 fn read_bounded(path: &Path, label: &str, limit: usize) -> io::Result<Vec<u8>> {
-    let metadata = fs::metadata(path)?;
+    let file = open_no_symlinks(path, label)?;
+    let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         return invalid_input(format!("{label} must be a regular file"));
     }
@@ -1080,13 +1231,77 @@ fn read_bounded(path: &Path, label: &str, limit: usize) -> io::Result<Vec<u8>> {
         return invalid_input(format!("{label} exceeds the {limit}-byte limit"));
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    fs::File::open(path)?
-        .take(limit as u64 + 1)
-        .read_to_end(&mut bytes)?;
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
     if bytes.len() > limit {
         return invalid_input(format!("{label} exceeds the {limit}-byte limit"));
     }
     Ok(bytes)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn open_no_symlinks(path: &Path, label: &str) -> io::Result<fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::FromRawFd;
+    use std::os::raw::c_long;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+
+    unsafe extern "C" {
+        fn syscall(number: c_long, ...) -> c_long;
+    }
+
+    // Linux x86_64 constants from asm/unistd.h and linux/openat2.h. This is the
+    // only unsafe boundary: openat2 atomically rejects symlinks in every component.
+    const SYS_OPENAT2: c_long = 437;
+    const AT_FDCWD: c_long = -100;
+    const O_CLOEXEC: u64 = 0o2_000_000;
+    const O_NONBLOCK: u64 = 0o4_000;
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+
+    let raw_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{label} path contains an interior NUL"),
+        )
+    })?;
+    let how = OpenHow {
+        flags: O_CLOEXEC | O_NONBLOCK,
+        mode: 0,
+        resolve: RESOLVE_NO_SYMLINKS,
+    };
+    // SAFETY: raw_path and how remain valid for the syscall; the returned fd is
+    // transferred immediately to File only when non-negative.
+    let fd = unsafe {
+        syscall(
+            SYS_OPENAT2,
+            AT_FDCWD,
+            raw_path.as_ptr(),
+            &how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!("cannot open {label} without traversing symbolic links: {error}"),
+        ));
+    }
+    // SAFETY: successful openat2 returns an owned file descriptor.
+    Ok(unsafe { fs::File::from_raw_fd(fd as i32) })
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn open_no_symlinks(_path: &Path, label: &str) -> io::Result<fs::File> {
+    invalid_input(format!(
+        "{label} cannot be read safely: atomic no-symlink open is unavailable on this host"
+    ))
 }
 
 fn read_bounded_utf8(path: &Path, label: &str, limit: usize) -> io::Result<String> {
@@ -1200,11 +1415,111 @@ fn required_absolute_path(values: &BTreeMap<String, String>, key: &str) -> io::R
 }
 
 fn validate_toolchain_provenance(request: &HarnessRequest) -> io::Result<TrustedToolchain> {
-    let trusted = load_trusted_toolchain(&workspace_root().join(TRUSTED_TOOLCHAIN_CONFIG))?;
+    let mut trusted = load_trusted_toolchain(&workspace_root().join(TRUSTED_TOOLCHAIN_CONFIG))?;
     validate_request_toolchain_identity(request, &trusted)?;
+    let root_manifest = read_bounded(&trusted.root_manifest_path, "root manifest", 64 * 1024)?;
+    verify_artifact_bytes(
+        &root_manifest,
+        &trusted.root_manifest_sha256,
+        "root manifest",
+    )?;
+    bind_freestanding_artifacts(&mut trusted, &root_manifest)?;
     verify_trusted_toolchain_artifacts(&trusted)?;
-    validate_sysroot_manifest(&trusted)?;
+    let sysroot_manifest = read_bounded(
+        &trusted.sysroot_manifest_path,
+        "sysroot manifest",
+        64 * 1024,
+    )?;
+    verify_artifact_bytes(
+        &sysroot_manifest,
+        &trusted.sysroot_manifest_sha256,
+        "sysroot manifest",
+    )?;
+    validate_sysroot_manifest(&trusted, &sysroot_manifest)?;
     Ok(trusted)
+}
+
+fn verify_build_tools(root_input: &Path, clang_config_input: &Path) -> io::Result<u8> {
+    let identity = load_build_tools_identity(&workspace_root().join(BUILD_TOOLS_CONFIG))?;
+    let root = canonical_operator_directory(root_input, "build-tools root")?;
+    let clang_config = canonical_operator_file(clang_config_input, "Clang configuration")?;
+    let clang = root.join(&identity.clang_binary);
+    let libclang_cpp = root.join(&identity.libclang_cpp);
+    let host_llvm = root.join(&identity.host_llvm);
+    for (path, expected, label) in [
+        (&clang, &identity.clang_sha256, "clang-22"),
+        (&libclang_cpp, &identity.libclang_cpp_sha256, "libclang-cpp"),
+        (&host_llvm, &identity.host_llvm_sha256, "host LLVM"),
+        (
+            &clang_config,
+            &identity.clang_config_sha256,
+            "Clang configuration",
+        ),
+    ] {
+        verify_trusted_artifact(path, expected, label, 512 * 1024 * 1024)?;
+    }
+    let mut stdout = io::stdout().lock();
+    writeln!(
+        stdout,
+        "{{\"schema_version\":1,\"status\":\"VERIFIED\",\"clang_version\":\"{}\",\"root\":\"{}\",\"clang_config\":\"{}\"}}",
+        identity.clang_version,
+        json_string(&root.display().to_string()),
+        json_string(&clang_config.display().to_string()),
+    )?;
+    Ok(0)
+}
+
+fn load_build_tools_identity(path: &Path) -> io::Result<BuildToolsIdentity> {
+    let values = parse_flat_toml(
+        &read_bounded_utf8(path, "build-tools identity", MAX_CONFIG_BYTES)?,
+        path,
+    )?;
+    if values.get("schema").map(String::as_str) != Some("deepwyrm-build-tools-identity-v1") {
+        return invalid_input("build-tools identity has an unknown schema".into());
+    }
+    let clang_version = required_string(&values, "clang_version")?;
+    if clang_version != "22.1.8" {
+        return invalid_input("build-tools identity has an unexpected Clang version".into());
+    }
+    Ok(BuildToolsIdentity {
+        clang_version,
+        clang_binary: required_relative_path(&values, "clang_binary")?,
+        clang_sha256: required_sha256(&values, "clang_sha256")?,
+        libclang_cpp: required_relative_path(&values, "libclang_cpp")?,
+        libclang_cpp_sha256: required_sha256(&values, "libclang_cpp_sha256")?,
+        host_llvm: required_relative_path(&values, "host_llvm")?,
+        host_llvm_sha256: required_sha256(&values, "host_llvm_sha256")?,
+        clang_config_sha256: required_sha256(&values, "clang_config_sha256")?,
+    })
+}
+
+fn canonical_operator_directory(path: &Path, label: &str) -> io::Result<PathBuf> {
+    let canonical = canonical_operator_path(path, label)?;
+    if !fs::metadata(&canonical)?.is_dir() {
+        return invalid_input(format!("{label} must be a directory"));
+    }
+    Ok(canonical)
+}
+
+fn canonical_operator_file(path: &Path, label: &str) -> io::Result<PathBuf> {
+    let canonical = canonical_operator_path(path, label)?;
+    if !fs::metadata(&canonical)?.is_file() {
+        return invalid_input(format!("{label} must be a regular file"));
+    }
+    Ok(canonical)
+}
+
+fn canonical_operator_path(path: &Path, label: &str) -> io::Result<PathBuf> {
+    if !path.is_absolute() {
+        return invalid_input(format!("{label} must be an absolute canonical path"));
+    }
+    let canonical = fs::canonicalize(path)?;
+    if canonical != path {
+        return invalid_input(format!(
+            "{label} must not contain symbolic links or normalization"
+        ));
+    }
+    Ok(canonical)
 }
 
 fn load_trusted_toolchain(path: &Path) -> io::Result<TrustedToolchain> {
@@ -1217,6 +1532,15 @@ fn load_trusted_toolchain(path: &Path) -> io::Result<TrustedToolchain> {
     }
     if values.get("request_id").map(String::as_str) != Some("RUST-PHASE0B-TOOLCHAIN-001") {
         return invalid_input("trusted toolchain config has an unexpected request ID".into());
+    }
+    if values.get("toolchain_tree_recipe").map(String::as_str)
+        != Some(
+            "tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf - -C <toolchain-root> . | sha256sum",
+        )
+    {
+        return invalid_input(
+            "trusted toolchain config has an unexpected tree digest recipe".into(),
+        );
     }
     let artifact_root = workspace_root()
         .parent()
@@ -1238,6 +1562,9 @@ fn load_trusted_toolchain(path: &Path) -> io::Result<TrustedToolchain> {
         rust_commit,
         target,
         config_sha256: required_sha256(&values, "config_sha256")?,
+        artifact_root: artifact_root.clone(),
+        toolchain_root: toolchain_root.clone(),
+        toolchain_tree_sha256: required_sha256(&values, "toolchain_tree_sha256")?,
         root_manifest_path: artifact_root.join(required_relative_path(&values, "root_manifest")?),
         root_manifest_sha256: required_sha256(&values, "root_manifest_sha256")?,
         cargo_path: toolchain_root.join(required_relative_path(&values, "cargo_binary")?),
@@ -1246,9 +1573,22 @@ fn load_trusted_toolchain(path: &Path) -> io::Result<TrustedToolchain> {
         rustc_sha256: required_sha256(&values, "rustc_sha256")?,
         rust_lld_path: toolchain_root.join(required_relative_path(&values, "rust_lld_binary")?),
         rust_lld_sha256: required_sha256(&values, "rust_lld_sha256")?,
+        rustc_driver_internal_library: TrustedArtifact {
+            path: toolchain_root.join(required_relative_path(
+                &values,
+                "rustc_driver_internal_library",
+            )?),
+            sha256: required_sha256(&values, "rustc_driver_internal_library_sha256")?,
+        },
+        llvm_internal_library: TrustedArtifact {
+            path: toolchain_root.join(required_relative_path(&values, "llvm_internal_library")?),
+            sha256: required_sha256(&values, "llvm_internal_library_sha256")?,
+        },
         sysroot_manifest_path: artifact_root
             .join(required_relative_path(&values, "sysroot_manifest")?),
         sysroot_manifest_sha256: required_sha256(&values, "sysroot_manifest_sha256")?,
+        freestanding_core: None,
+        freestanding_compiler_builtins: None,
     })
 }
 
@@ -1332,13 +1672,8 @@ fn validate_request_toolchain_identity(
 }
 
 fn verify_trusted_toolchain_artifacts(trusted: &TrustedToolchain) -> io::Result<()> {
+    verify_toolchain_tree(trusted)?;
     for (path, expected_hash, label, limit) in [
-        (
-            &trusted.root_manifest_path,
-            &trusted.root_manifest_sha256,
-            "root manifest",
-            64 * 1024,
-        ),
         (
             &trusted.cargo_path,
             &trusted.cargo_sha256,
@@ -1357,19 +1692,174 @@ fn verify_trusted_toolchain_artifacts(trusted: &TrustedToolchain) -> io::Result<
             "rust-lld",
             512 * 1024 * 1024,
         ),
-        (
-            &trusted.sysroot_manifest_path,
-            &trusted.sysroot_manifest_sha256,
-            "sysroot manifest",
-            64 * 1024,
-        ),
     ] {
-        let actual = sha256_hex(&read_bounded(path, label, limit)?);
-        if actual != *expected_hash {
-            return invalid_input(format!("trusted {label} hash does not match its identity"));
-        }
+        verify_trusted_artifact(path, expected_hash, label, limit)?;
+    }
+    verify_trusted_artifact(
+        &trusted.rustc_driver_internal_library.path,
+        &trusted.rustc_driver_internal_library.sha256,
+        "librustc_driver",
+        512 * 1024 * 1024,
+    )?;
+    verify_trusted_artifact(
+        &trusted.llvm_internal_library.path,
+        &trusted.llvm_internal_library.sha256,
+        "toolchain libLLVM",
+        512 * 1024 * 1024,
+    )?;
+    let core = trusted.freestanding_core.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "trusted root manifest lacks freestanding core identity",
+        )
+    })?;
+    verify_trusted_artifact(
+        &core.path,
+        &core.sha256,
+        "freestanding core rlib",
+        512 * 1024 * 1024,
+    )?;
+    let builtins = trusted
+        .freestanding_compiler_builtins
+        .as_ref()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "trusted root manifest lacks freestanding compiler-builtins identity",
+            )
+        })?;
+    verify_trusted_artifact(
+        &builtins.path,
+        &builtins.sha256,
+        "freestanding compiler-builtins rlib",
+        512 * 1024 * 1024,
+    )
+}
+
+fn verify_toolchain_tree(trusted: &TrustedToolchain) -> io::Result<()> {
+    // Coordinator-approved GNU tar/coreutils recipe; system-tool identity remains
+    // an explicit Medium host assumption rather than a request-controlled PATH lookup.
+    let mut tar = Command::new("/usr/bin/tar")
+        .args([
+            "--sort=name",
+            "--mtime=@0",
+            "--owner=0",
+            "--group=0",
+            "--numeric-owner",
+            "-cf",
+            "-",
+            "-C",
+        ])
+        .arg(&trusted.toolchain_root)
+        .arg(".")
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let tar_stdout = tar
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("tar did not provide a digest stream"))?;
+    let sha = Command::new("/usr/bin/sha256sum")
+        .stdin(Stdio::from(tar_stdout))
+        .output()?;
+    let tar_status = tar.wait()?;
+    if !tar_status.success() || !sha.status.success() {
+        return invalid_input("canonical toolchain tree digest command failed".into());
+    }
+    let digest = std::str::from_utf8(&sha.stdout)
+        .ok()
+        .and_then(|output| output.split_ascii_whitespace().next())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "sha256sum produced no digest")
+        })?;
+    if digest != trusted.toolchain_tree_sha256 {
+        return invalid_input("toolchain tree digest does not match trusted identity".into());
     }
     Ok(())
+}
+
+fn verify_trusted_artifact(
+    path: &Path,
+    expected_hash: &str,
+    label: &str,
+    limit: usize,
+) -> io::Result<()> {
+    verify_artifact_bytes(&read_bounded(path, label, limit)?, expected_hash, label)
+}
+
+fn verify_artifact_bytes(bytes: &[u8], expected_hash: &str, label: &str) -> io::Result<()> {
+    if sha256_hex(bytes) != expected_hash {
+        return invalid_input(format!("trusted {label} hash does not match its identity"));
+    }
+    Ok(())
+}
+
+fn bind_freestanding_artifacts(
+    trusted: &mut TrustedToolchain,
+    root_manifest: &[u8],
+) -> io::Result<()> {
+    let text = std::str::from_utf8(root_manifest)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "root manifest is not UTF-8"))?;
+    let core = extract_root_manifest_artifact(
+        text,
+        "artifacts.freestanding_core",
+        &trusted.artifact_root,
+    )?;
+    let builtins = extract_root_manifest_artifact(
+        text,
+        "artifacts.freestanding_compiler_builtins",
+        &trusted.artifact_root,
+    )?;
+    trusted.freestanding_core = Some(core);
+    trusted.freestanding_compiler_builtins = Some(builtins);
+    Ok(())
+}
+
+fn extract_root_manifest_artifact(
+    text: &str,
+    section_name: &str,
+    artifact_root: &Path,
+) -> io::Result<TrustedArtifact> {
+    let header = format!("[{section_name}]");
+    let mut in_section = false;
+    let mut found = false;
+    let mut values = BTreeMap::new();
+    for raw_line in text.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            if line == header {
+                if found {
+                    return invalid_input(format!(
+                        "root manifest has duplicate [{section_name}] sections"
+                    ));
+                }
+                found = true;
+                in_section = true;
+            } else {
+                in_section = false;
+            }
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let (key, value) = parse_toml_scalar(line)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if !matches!(key, "path" | "sha256") || values.insert(key.into(), value).is_some() {
+            return invalid_input(format!(
+                "root manifest [{section_name}] has an unsupported or duplicate key"
+            ));
+        }
+    }
+    if !found {
+        return invalid_input(format!("root manifest lacks [{section_name}]"));
+    }
+    Ok(TrustedArtifact {
+        path: artifact_root.join(required_relative_path(&values, "path")?),
+        sha256: required_sha256(&values, "sha256")?,
+    })
 }
 
 fn canonical_rust_commit(path: &Path) -> io::Result<String> {
@@ -1397,10 +1887,28 @@ fn canonical_rust_commit(path: &Path) -> io::Result<String> {
     invalid_input("canonical toolchain provenance lacks [rust].base_commit".into())
 }
 
-fn validate_sysroot_manifest(trusted: &TrustedToolchain) -> io::Result<()> {
-    let path = &trusted.sysroot_manifest_path;
-    let text = read_bounded_utf8(path, "sysroot manifest", 64 * 1024)?;
-    let values = parse_flat_toml(&text, path).map_err(|_| {
+fn validate_sysroot_manifest(
+    trusted: &TrustedToolchain,
+    sysroot_manifest: &[u8],
+) -> io::Result<()> {
+    let core = trusted.freestanding_core.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "trusted root manifest lacks freestanding core identity",
+        )
+    })?;
+    let builtins = trusted
+        .freestanding_compiler_builtins
+        .as_ref()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "trusted root manifest lacks freestanding compiler-builtins identity",
+            )
+        })?;
+    let text = std::str::from_utf8(sysroot_manifest)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "sysroot manifest is not UTF-8"))?;
+    let values = parse_flat_toml(text, &trusted.sysroot_manifest_path).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "sysroot manifest content contract is not yet agreed; require schema = \"deepwyrm-rust-sysroot-manifest-v1\" with Rust commit, x86_64-unknown-none target, configuration hash, and component hashes",
@@ -1419,6 +1927,8 @@ fn validate_sysroot_manifest(trusted: &TrustedToolchain) -> io::Result<()> {
         ("cargo_sha256", trusted.cargo_sha256.as_str()),
         ("rustc_sha256", trusted.rustc_sha256.as_str()),
         ("rust_lld_sha256", trusted.rust_lld_sha256.as_str()),
+        ("core_sha256", core.sha256.as_str()),
+        ("compiler_builtins_sha256", builtins.sha256.as_str()),
     ];
     for (key, expected) in required {
         if values.get(key).map(String::as_str) != Some(expected) {
@@ -1585,10 +2095,29 @@ fn parse(args: &[String]) -> Action {
         "test" => parse_test(&args[1..]),
         "guest-result" => parse_guest_result(&args[1..]),
         "toolchain" if args.len() == 1 => Action::Toolchain,
+        "toolchain" => parse_toolchain(&args[1..]),
         "build" | "image" | "inspect-image" if args.len() == 1 => {
             Action::NotImplemented(command.into())
         }
         _ => Action::UsageError(format!("`{command}` does not accept those arguments")),
+    }
+}
+
+fn parse_toolchain(args: &[String]) -> Action {
+    match args {
+        [subcommand, root_flag, root, config_flag, clang_config]
+            if subcommand == "verify-build-tools"
+                && root_flag == "--root"
+                && config_flag == "--clang-config" =>
+        {
+            Action::VerifyBuildTools {
+                root: root.into(),
+                clang_config: clang_config.into(),
+            }
+        }
+        _ => Action::UsageError(
+            "`toolchain verify-build-tools` requires `--root <path> --clang-config <path>`".into(),
+        ),
     }
 }
 
@@ -1699,7 +2228,11 @@ fn print_help(mut writer: impl Write, command: Option<&str>) -> io::Result<()> {
             writer,
             "Usage: cargo xtask guest-result <serial-log> --request <path> --exit-status <code>\n\nClassifies one fixed-width DWTEST1 terminal record against the observed QEMU exit status. It does not prove capture freshness.\n"
         ),
-        Some(command @ ("format" | "check" | "toolchain")) => write!(
+        Some("toolchain") => write!(
+            writer,
+            "Usage: cargo xtask toolchain [verify-build-tools --root <path> --clang-config <path>]\n\nThe verifier performs only identity checks; it never builds or executes Clang.\n"
+        ),
+        Some(command @ ("format" | "check")) => write!(
             writer,
             "Usage: cargo xtask {command}\n\nStatus: available host tooling.\n"
         ),
@@ -1713,7 +2246,7 @@ fn print_help(mut writer: impl Write, command: Option<&str>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT_TEMP: AtomicUsize = AtomicUsize::new(0);
@@ -1807,6 +2340,20 @@ mod tests {
                     Some("arch.entry".into()),
                 )),
             ),
+            (
+                &[
+                    "toolchain",
+                    "verify-build-tools",
+                    "--root",
+                    "/opt/llvm-22",
+                    "--clang-config",
+                    "/etc/clang.cfg",
+                ][..],
+                Action::VerifyBuildTools {
+                    root: "/opt/llvm-22".into(),
+                    clang_config: "/etc/clang.cfg".into(),
+                },
+            ),
         ] {
             assert_eq!(parse(&strings(args)), expected);
         }
@@ -1837,24 +2384,71 @@ mod tests {
     fn qemu_plan_uses_real_media_and_test_only_selector_channel() {
         let request =
             load_harness_request(&temp_file(&request("guest-test", "arch.entry"))).unwrap();
-        let profile = HarnessProfile {
-            name: "default".into(),
-            machine: "q35".into(),
-            vcpu: 1,
-            memory_mib: 1024,
-            timeout_seconds: 120,
-            gdb_port: 1234,
-        };
-        let args = qemu_arguments(&profile, &request, HarnessKind::GuestTest).join(" ");
+        let profiles = load_profiles(&workspace_root().join(HARNESS_CONFIG)).unwrap();
+        let profile = profiles.get("default").unwrap();
+        let args = qemu_arguments(profile, &request, HarnessKind::GuestTest).join(" ");
         assert!(args.contains("if=virtio,format=raw,readonly=on,file=images/wyrmroot-esp.img"));
         assert!(args.contains("file:artifacts/dw0-b/serial.log"));
         assert!(args.contains("opt/org.deepwyrm.test.selector,string=arch.entry"));
         assert!(args.contains("isa-debug-exit,iobase=0xf4,iosize=0x04"));
         assert!(!args.contains("virtfs"));
-        let run_args = qemu_arguments(&profile, &request, HarnessKind::Run).join(" ");
-        let gdb_args = qemu_arguments(&profile, &request, HarnessKind::Gdb).join(" ");
+        let run_args = qemu_arguments(profile, &request, HarnessKind::Run).join(" ");
+        let gdb_args = qemu_arguments(profile, &request, HarnessKind::Gdb).join(" ");
         assert!(!run_args.contains("isa-debug-exit"));
         assert!(!gdb_args.contains("isa-debug-exit"));
+        assert!(gdb_args.contains("tcp:127.0.0.1:1234"));
+        assert!(!gdb_args.contains("tcp::"));
+        let gdb_client = gdb_arguments(profile, &request).join(" ");
+        assert!(gdb_client.contains("target remote 127.0.0.1:1234"));
+    }
+
+    #[test]
+    fn centralized_harness_config_loads_profiles_and_guest_test_metadata() {
+        let config = workspace_root().join(HARNESS_CONFIG);
+        let profiles = load_profiles(&config).unwrap();
+        assert_eq!(profiles.get("default").unwrap().machine, "q35");
+        assert_eq!(profiles.get("smp").unwrap().vcpu, 4);
+        let parsed =
+            load_harness_request(&temp_file(&request("guest-test", "boot-handoff-pass"))).unwrap();
+        validate_guest_selector_metadata(&config, &parsed).unwrap();
+
+        let invalid = temp_file(
+            "schema_version = 1\n[profile.default]\nmachine = \"q35\"\nvcpu = 1\nmemory_mib = 1\ntimeout_seconds = 1\ngdb_port = 1234\n[guest_test.one]\nid = 1\nunexpected = 2\n",
+        );
+        assert!(load_profiles(&invalid).is_err());
+        fs::remove_file(invalid).unwrap();
+    }
+
+    #[test]
+    fn build_tools_identity_is_host_neutral_and_fixed() {
+        let identity =
+            load_build_tools_identity(&workspace_root().join(BUILD_TOOLS_CONFIG)).unwrap();
+        assert_eq!(identity.clang_version, "22.1.8");
+        assert_eq!(identity.clang_binary, "bin/clang-22");
+        assert_eq!(identity.libclang_cpp, "lib64/libclang-cpp.so.22.1");
+        assert_eq!(identity.host_llvm, "lib64/libLLVM.so.22.1");
+    }
+
+    #[test]
+    fn trusted_toolchain_binds_tree_and_internal_library_identities() {
+        let trusted =
+            load_trusted_toolchain(&workspace_root().join(TRUSTED_TOOLCHAIN_CONFIG)).unwrap();
+        assert_eq!(
+            trusted.toolchain_tree_sha256,
+            "5d4275428555a7cd6ae7decc100456fe31cfa4562a7f5eb81a3cf7fe08aa03a5"
+        );
+        assert!(
+            trusted
+                .rustc_driver_internal_library
+                .path
+                .ends_with("lib/librustc_driver-7cb6fba0afdc0262.so")
+        );
+        assert!(
+            trusted
+                .llvm_internal_library
+                .path
+                .ends_with("lib/libLLVM.so.22.1-rust-1.97.1-stable")
+        );
     }
 
     #[test]
@@ -1920,8 +2514,33 @@ mod tests {
             1
         );
 
+        let escaped_root = temp_path("escaped");
+        fs::create_dir(&escaped_root).unwrap();
+        let escaped_parent = escaped_root.join("dw0-b");
+        fs::create_dir(&escaped_parent).unwrap();
+        let escaped_serial = escaped_parent.join("serial.log");
+        fs::write(&escaped_serial, terminal("01", 1, 0)).unwrap();
+        let escape_request = directory.join("escape-request.toml");
+        fs::write(&escape_request, request("guest-test", "boot-handoff-pass")).unwrap();
+        let intermediate_link = directory.join("artifacts");
+        symlink(&escaped_root, &intermediate_link).unwrap();
+        assert_eq!(
+            parse_guest_result_file(
+                &directory.join("artifacts/dw0-b/serial.log"),
+                &escape_request,
+                33,
+            )
+            .unwrap(),
+            1
+        );
+
         fs::remove_file(serial_path).unwrap();
         fs::remove_file(request_path).unwrap();
+        fs::remove_file(escape_request).unwrap();
+        fs::remove_file(intermediate_link).unwrap();
+        fs::remove_file(escaped_serial).unwrap();
+        fs::remove_dir(escaped_parent).unwrap();
+        fs::remove_dir(escaped_root).unwrap();
         fs::remove_dir(directory).unwrap();
     }
 
@@ -1931,6 +2550,45 @@ mod tests {
         fs::write(&oversized, vec![b'x'; MAX_REQUEST_BYTES + 1]).unwrap();
         assert!(read_bounded(&oversized, "request", MAX_REQUEST_BYTES).is_err());
         fs::remove_file(oversized).unwrap();
+
+        let growing = temp_file("small");
+        assert!(fs::metadata(&growing).unwrap().len() <= MAX_REQUEST_BYTES as u64);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&growing)
+            .unwrap()
+            .write_all(&vec![b'x'; MAX_REQUEST_BYTES + 1])
+            .unwrap();
+        assert!(read_bounded(&growing, "request", MAX_REQUEST_BYTES).is_err());
+        fs::remove_file(growing).unwrap();
+
+        let target = temp_file("bounded");
+        let link = temp_path("link");
+        symlink(&target, &link).unwrap();
+        assert!(read_bounded(&link, "request", MAX_REQUEST_BYTES).is_err());
+        fs::remove_file(link).unwrap();
+        fs::remove_file(target).unwrap();
+
+        let directory = temp_path("dir");
+        let outside = temp_path("outside");
+        fs::create_dir(&directory).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let outside_file = outside.join("component.txt");
+        fs::write(&outside_file, "bounded").unwrap();
+        let component_link = directory.join("linked-component");
+        symlink(&outside, &component_link).unwrap();
+        assert!(
+            read_bounded(
+                &component_link.join("component.txt"),
+                "request",
+                MAX_REQUEST_BYTES
+            )
+            .is_err()
+        );
+        fs::remove_file(component_link).unwrap();
+        fs::remove_file(outside_file).unwrap();
+        fs::remove_dir(outside).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
 
     #[test]
@@ -2004,12 +2662,25 @@ mod tests {
             load_trusted_toolchain(&workspace_root().join(TRUSTED_TOOLCHAIN_CONFIG)).unwrap();
         let missing_schema = temp_file("rust_toolchain_commit = \"not-a-contract\"\n");
         let mut fixture = trusted.clone();
+        let core_hash = "a".repeat(64);
+        let builtins_hash = "b".repeat(64);
+        fixture.freestanding_core = Some(TrustedArtifact {
+            path: missing_schema.clone(),
+            sha256: core_hash.clone(),
+        });
+        fixture.freestanding_compiler_builtins = Some(TrustedArtifact {
+            path: missing_schema.clone(),
+            sha256: builtins_hash.clone(),
+        });
         fixture.sysroot_manifest_path = missing_schema.clone();
-        assert!(validate_sysroot_manifest(&fixture).is_err());
+        assert!(
+            validate_sysroot_manifest(&fixture, b"rust_toolchain_commit = \"not-a-contract\"\n")
+                .is_err()
+        );
         fs::remove_file(missing_schema).unwrap();
 
         let valid = temp_file(&format!(
-            "schema = \"deepwyrm-rust-sysroot-manifest-v1\"\nrust_toolchain_commit = \"{}\"\ntarget = \"{}\"\ntoolchain_config_sha256 = \"{}\"\ncargo_sha256 = \"{}\"\nrustc_sha256 = \"{}\"\nrust_lld_sha256 = \"{}\"\n",
+            "schema = \"deepwyrm-rust-sysroot-manifest-v1\"\nrust_toolchain_commit = \"{}\"\ntarget = \"{}\"\ntoolchain_config_sha256 = \"{}\"\ncargo_sha256 = \"{}\"\nrustc_sha256 = \"{}\"\nrust_lld_sha256 = \"{}\"\ncore_sha256 = \"{core_hash}\"\ncompiler_builtins_sha256 = \"{builtins_hash}\"\n",
             trusted.rust_commit,
             trusted.target,
             trusted.config_sha256,
@@ -2018,8 +2689,63 @@ mod tests {
             trusted.rust_lld_sha256,
         ));
         fixture.sysroot_manifest_path = valid.clone();
-        validate_sysroot_manifest(&fixture).unwrap();
+        let valid_bytes = read_bounded(&valid, "test sysroot", MAX_CONFIG_BYTES).unwrap();
+        validate_sysroot_manifest(&fixture, &valid_bytes).unwrap();
+        let contradictory = valid_bytes.to_vec();
+        let contradictory = String::from_utf8(contradictory)
+            .unwrap()
+            .replace(&core_hash, &"c".repeat(64));
+        assert!(validate_sysroot_manifest(&fixture, contradictory.as_bytes()).is_err());
         fs::remove_file(valid).unwrap();
+    }
+
+    #[test]
+    fn root_manifest_binds_and_hashes_freestanding_rlibs_without_build_commands() {
+        let directory = temp_path("artifact-dir");
+        fs::create_dir(&directory).unwrap();
+        let core_path = directory.join("core.rlib");
+        let builtins_path = directory.join("builtins.rlib");
+        fs::write(&core_path, "core").unwrap();
+        fs::write(&builtins_path, "builtins").unwrap();
+        let core_hash = sha256_hex(b"core");
+        let builtins_hash = sha256_hex(b"builtins");
+        let manifest = format!(
+            "[build]\ncommand = \"must-not-run\"\n[artifacts.freestanding_core]\npath = \"core.rlib\"\nsha256 = \"{core_hash}\"\n[artifacts.freestanding_compiler_builtins]\npath = \"builtins.rlib\"\nsha256 = \"{builtins_hash}\"\n"
+        );
+        let core =
+            extract_root_manifest_artifact(&manifest, "artifacts.freestanding_core", &directory)
+                .unwrap();
+        let builtins = extract_root_manifest_artifact(
+            &manifest,
+            "artifacts.freestanding_compiler_builtins",
+            &directory,
+        )
+        .unwrap();
+        verify_trusted_artifact(&core.path, &core.sha256, "core", MAX_REQUEST_BYTES).unwrap();
+        verify_trusted_artifact(
+            &builtins.path,
+            &builtins.sha256,
+            "builtins",
+            MAX_REQUEST_BYTES,
+        )
+        .unwrap();
+
+        let mismatch = TrustedArtifact {
+            path: core_path.clone(),
+            sha256: "0".repeat(64),
+        };
+        assert!(
+            verify_trusted_artifact(&mismatch.path, &mismatch.sha256, "core", MAX_REQUEST_BYTES)
+                .is_err()
+        );
+        let link = directory.join("core-link.rlib");
+        symlink(&core_path, &link).unwrap();
+        assert!(verify_trusted_artifact(&link, &core_hash, "core", MAX_REQUEST_BYTES).is_err());
+
+        fs::remove_file(link).unwrap();
+        fs::remove_file(core_path).unwrap();
+        fs::remove_file(builtins_path).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
 
     fn terminal(status: &str, test_id: u32, detail: u32) -> Vec<u8> {

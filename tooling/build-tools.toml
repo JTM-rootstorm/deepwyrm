@@ -1,0 +1,10 @@
+# Host-neutral identity for build tools. Operators supply canonical host paths.
+schema = "deepwyrm-build-tools-identity-v1"
+clang_version = "22.1.8"
+clang_binary = "bin/clang-22"
+clang_sha256 = "02ee323c47e4647fec0ecafe250d96597d41826a56507fb2d6fcc553393d5d7c"
+libclang_cpp = "lib64/libclang-cpp.so.22.1"
+libclang_cpp_sha256 = "cdd179a7d61a4c85a02a760bb56c19e251a24f3eb699bd57d0e75708330adf22"
+host_llvm = "lib64/libLLVM.so.22.1"
+host_llvm_sha256 = "bca772eba897b8e234d6ce1315542f7cb71f24dffcc3614c93703be2ed252435"
+clang_config_sha256 = "5560e13afbfa119f2734f8c5ec86c7e4f8ca1623b4303db6678496bbd0f911ef"

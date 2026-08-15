@@ -23,6 +23,7 @@ fn help_distinguishes_available_dw0a_tooling_from_deferred_operations() {
         "gdb --plan",
         "guest-result",
         "toolchain",
+        "verify-build-tools",
     ] {
         assert!(stdout.contains(command), "help omitted `{command}`");
     }
