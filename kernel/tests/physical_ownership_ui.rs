@@ -92,6 +92,14 @@ fn physical_ownership_compile_fail_contracts() {
             fixture: "table_candidate_grant_clone.rs",
             expected_error: "error[E0277]: the trait bound `TableCandidateGrant: Clone` is not satisfied",
         },
+        CompileFailCase {
+            fixture: "staged_table_commit_clone.rs",
+            expected_error: "error[E0277]: the trait bound `StagedTableCommit: Clone` is not satisfied",
+        },
+        CompileFailCase {
+            fixture: "safe_x86_address_space_publisher_new.rs",
+            expected_error: "error[E0133]: call to unsafe function `X86AddressSpacePublisher::<'a, T, RANGE_CAPACITY, ROLE_CAPACITY, CANDIDATE_CAPACITY, ENTRY_CAPACITY, INVALIDATION_CAPACITY>::new` is unsafe and requires unsafe block",
+        },
     ];
 
     for case in cases {

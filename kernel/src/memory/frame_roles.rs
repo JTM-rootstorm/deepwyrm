@@ -115,7 +115,7 @@ pub(crate) enum TableLevel {
 }
 
 impl TableLevel {
-    const fn child(self) -> Option<Self> {
+    pub(crate) const fn child(self) -> Option<Self> {
         match self {
             Self::Pml4 => Some(Self::Pdpt),
             Self::Pdpt => Some(Self::Pd),
@@ -294,9 +294,39 @@ pub(crate) struct TableCandidateGrant {
     level: TableLevel,
 }
 
+pub(crate) enum TableCommitParent<'a> {
+    Committed(TableIdentity),
+    Candidate(&'a TableCandidateGrant),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct StagedTableCommit {
+    grant: TableCandidateGrant,
+    slot: usize,
+    parent: Option<FrameRoleIdentity>,
+}
+
 impl TableCandidateGrant {
     pub(crate) const fn physical_start(&self) -> u64 {
         self.range.start
+    }
+
+    pub(crate) const fn owner(&self) -> TableOwnerKey {
+        self.owner
+    }
+
+    pub(crate) const fn level(&self) -> TableLevel {
+        self.level
+    }
+}
+
+impl StagedTableCommit {
+    pub(crate) const fn candidate(&self) -> &TableCandidateGrant {
+        &self.grant
+    }
+
+    pub(crate) fn into_candidate(self) -> TableCandidateGrant {
+        self.grant
     }
 }
 
@@ -458,21 +488,51 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         grant: TableCandidateGrant,
         parent: Option<TableIdentity>,
     ) -> Result<TableIdentity, GrantTransitionError<TableCandidateGrant>> {
+        let parent = parent.map(TableCommitParent::Committed);
+        let staged = self.stage_table_commit(grant, parent)?;
+        Ok(self.publish_staged_table(staged))
+    }
+
+    pub(crate) fn stage_table_commit(
+        &self,
+        grant: TableCandidateGrant,
+        parent: Option<TableCommitParent<'_>>,
+    ) -> Result<StagedTableCommit, GrantTransitionError<TableCandidateGrant>> {
         if let Err(error) = self.validate_owner(grant.owner) {
             return Err(GrantTransitionError::new(error, grant));
+        }
+        let slot = match self.slot(grant.identity) {
+            Ok(slot) => slot,
+            Err(error) => return Err(GrantTransitionError::new(error, grant)),
+        };
+        if self.roles[slot].record
+            != Some(RoleRecord {
+                range: grant.range,
+                role: FrameRole::TableCandidate {
+                    owner: grant.owner,
+                    level: grant.level,
+                },
+            })
+        {
+            return Err(GrantTransitionError::new(FrameRoleError::WrongRole, grant));
         }
         if grant.level == TableLevel::Pml4
             && self
                 .roles
                 .iter()
-                .filter_map(|slot| slot.record)
+                .enumerate()
+                .filter(|(other_slot, _)| *other_slot != slot)
+                .filter_map(|(_, slot)| slot.record)
                 .any(|record| {
                     matches!(
                         record.role,
                         FrameRole::PageTable {
                             owner,
                             level: TableLevel::Pml4,
-                            parent: None,
+                            ..
+                        } | FrameRole::TableCandidate {
+                            owner,
+                            level: TableLevel::Pml4,
                         } if owner == grant.owner
                     )
                 })
@@ -490,31 +550,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     grant,
                 ));
             }
-            (level, Some(parent)) => {
-                let record = match self.record(parent.role) {
-                    Ok(record) => record,
-                    Err(_) => {
-                        return Err(GrantTransitionError::new(
-                            FrameRoleError::InvalidTableParent,
-                            grant,
-                        ));
-                    }
-                };
-                let FrameRole::PageTable {
-                    owner,
-                    level: parent_level,
-                    parent: _,
-                } = record.role
-                else {
-                    return Err(GrantTransitionError::new(
-                        FrameRoleError::InvalidTableParent,
-                        grant,
-                    ));
-                };
-                if record.range.start != parent.physical_start
-                    || record.range.page_count() != 1
-                    || owner != parent.owner
-                    || parent_level != parent.level
+            (level, Some(TableCommitParent::Committed(parent))) => {
+                if self.validate_table_identity(parent).is_err()
                     || parent.owner != grant.owner
                     || parent.level.child() != Some(level)
                 {
@@ -525,28 +562,146 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 }
                 Some(parent.role)
             }
+            (level, Some(TableCommitParent::Candidate(parent))) => {
+                let record = match self.record(parent.identity) {
+                    Ok(record) => record,
+                    Err(_) => {
+                        return Err(GrantTransitionError::new(
+                            FrameRoleError::InvalidTableParent,
+                            grant,
+                        ));
+                    }
+                };
+                if record.range != parent.range
+                    || record.role
+                        != (FrameRole::TableCandidate {
+                            owner: parent.owner,
+                            level: parent.level,
+                        })
+                    || parent.owner != grant.owner
+                    || parent.level.child() != Some(level)
+                {
+                    return Err(GrantTransitionError::new(
+                        FrameRoleError::InvalidTableParent,
+                        grant,
+                    ));
+                }
+                Some(parent.identity)
+            }
         };
-        if let Err(error) = self.transition(
-            grant.identity,
-            grant.range,
-            FrameRole::TableCandidate {
+        Ok(StagedTableCommit {
+            grant,
+            slot,
+            parent: parent_role,
+        })
+    }
+
+    pub(crate) fn publish_staged_table(&mut self, staged: StagedTableCommit) -> TableIdentity {
+        assert_eq!(
+            self.validate_staged_table(&staged),
+            Ok(()),
+            "staged table commit became invalid before publication"
+        );
+        let grant = staged.grant;
+        self.roles[staged.slot].record = Some(RoleRecord {
+            range: grant.range,
+            role: FrameRole::PageTable {
                 owner: grant.owner,
                 level: grant.level,
+                parent: staged.parent,
             },
-            FrameRole::PageTable {
-                owner: grant.owner,
-                level: grant.level,
-                parent: parent_role,
-            },
-        ) {
-            return Err(GrantTransitionError::new(error, grant));
-        }
-        Ok(TableIdentity {
+        });
+        TableIdentity {
             role: grant.identity,
             owner: grant.owner,
             level: grant.level,
             physical_start: grant.range.start,
+        }
+    }
+
+    pub(crate) fn cancel_staged_table(
+        &mut self,
+        staged: StagedTableCommit,
+    ) -> Result<(), GrantTransitionError<TableCandidateGrant>> {
+        self.cancel_table_candidate(staged.grant)
+    }
+
+    pub(crate) fn validate_table_identity(
+        &self,
+        table: TableIdentity,
+    ) -> Result<(), FrameRoleError> {
+        let record = self.record(table.role)?;
+        if record.range.start != table.physical_start
+            || record.range.page_count() != 1
+            || record.role
+                != (FrameRole::PageTable {
+                    owner: table.owner,
+                    level: table.level,
+                    parent: match record.role {
+                        FrameRole::PageTable { parent, .. } => parent,
+                        _ => None,
+                    },
+                })
+        {
+            return Err(FrameRoleError::WrongRole);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn table_identity(
+        &self,
+        owner: TableOwnerKey,
+        level: TableLevel,
+        physical_start: u64,
+    ) -> Result<TableIdentity, FrameRoleError> {
+        self.validate_owner(owner)?;
+        let (slot, _) = self
+            .roles
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, entry)| entry.record.map(|record| (slot, record)))
+            .find(|(_, record)| {
+                record.range.start == physical_start
+                    && record.range.page_count() == 1
+                    && matches!(
+                        record.role,
+                        FrameRole::PageTable {
+                            owner: record_owner,
+                            level: record_level,
+                            ..
+                        } if record_owner == owner && record_level == level
+                    )
+            })
+            .ok_or(FrameRoleError::WrongRole)?;
+        Ok(TableIdentity {
+            role: self.identity(slot, self.roles[slot].generation)?,
+            owner,
+            level,
+            physical_start,
         })
+    }
+
+    pub(crate) fn validate_table_child(
+        &self,
+        parent: TableIdentity,
+        child: TableIdentity,
+    ) -> Result<(), FrameRoleError> {
+        self.validate_table_identity(parent)?;
+        self.validate_table_identity(child)?;
+        if parent.owner != child.owner || parent.level.child() != Some(child.level) {
+            return Err(FrameRoleError::InvalidTableParent);
+        }
+        let child_record = self.record(child.role)?;
+        if !matches!(
+            child_record.role,
+            FrameRole::PageTable {
+                parent: Some(parent_role),
+                ..
+            } if parent_role == parent.role
+        ) {
+            return Err(FrameRoleError::InvalidTableParent);
+        }
+        Ok(())
     }
 
     /// Imports one transition-table or kernel-image range which has already
@@ -891,6 +1046,71 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         Ok(())
     }
+
+    fn validate_staged_table(&self, staged: &StagedTableCommit) -> Result<(), FrameRoleError> {
+        let grant = &staged.grant;
+        self.validate_owner(grant.owner)?;
+        if self.slot(grant.identity)? != staged.slot
+            || self.roles[staged.slot].record
+                != Some(RoleRecord {
+                    range: grant.range,
+                    role: FrameRole::TableCandidate {
+                        owner: grant.owner,
+                        level: grant.level,
+                    },
+                })
+        {
+            return Err(FrameRoleError::InvalidGrant);
+        }
+
+        match (grant.level, staged.parent) {
+            (TableLevel::Pml4, None) => {
+                if self
+                    .roles
+                    .iter()
+                    .enumerate()
+                    .filter(|(slot, _)| *slot != staged.slot)
+                    .filter_map(|(_, slot)| slot.record)
+                    .any(|record| {
+                        matches!(
+                            record.role,
+                            FrameRole::PageTable {
+                                owner,
+                                level: TableLevel::Pml4,
+                                ..
+                            } | FrameRole::TableCandidate {
+                                owner,
+                                level: TableLevel::Pml4,
+                            } if owner == grant.owner
+                        )
+                    })
+                {
+                    return Err(FrameRoleError::DuplicateTableRoot);
+                }
+            }
+            (TableLevel::Pml4, Some(_)) | (_, None) => {
+                return Err(FrameRoleError::InvalidTableParent);
+            }
+            (level, Some(parent)) => {
+                if parent == grant.identity {
+                    return Err(FrameRoleError::InvalidTableParent);
+                }
+                let parent = self.record(parent)?;
+                let valid_parent = match parent.role {
+                    FrameRole::PageTable {
+                        owner,
+                        level: parent_level,
+                        ..
+                    } => owner == grant.owner && parent_level.child() == Some(level),
+                    _ => false,
+                };
+                if !valid_parent {
+                    return Err(FrameRoleError::InvalidTableParent);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -918,6 +1138,24 @@ pub(crate) fn synthetic_allocator_backing(
     roles
         .assign_object_backing(zeroed)
         .expect("test object backing role commits")
+}
+
+#[cfg(test)]
+pub(crate) fn synthetic_frame_role_manager<
+    const RANGE_CAPACITY: usize,
+    const ROLE_CAPACITY: usize,
+>(
+    physical_start: u64,
+    page_count: u64,
+) -> FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY> {
+    use super::physical::PhysicalAddressLimit;
+
+    let limit = PhysicalAddressLimit::new(1_u64 << 40).expect("test physical limit is valid");
+    let candidate = PageRange::from_page_count(physical_start, page_count, limit)
+        .expect("test allocator range is valid");
+    let allocator = PhysicalFrameAllocator::from_candidates(&[candidate], limit, [])
+        .expect("test allocator initializes");
+    FrameRoleManager::new(allocator).expect("test role manager initializes")
 }
 
 #[cfg(test)]
@@ -1085,6 +1323,82 @@ mod tests {
 
         assert_eq!(roles.available_frames(), initial - 2);
         assert_eq!(roles.check_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn staged_root_requires_a_unique_candidate_and_can_publish_after_rollback() {
+        let mut roles = manager(BASE_PAGE_SIZE, 4);
+        let owner = roles.create_table_owner().unwrap();
+        let first = allocate_zeroed(&mut roles, 1);
+        let first = roles.prepare_table(first, owner, TableLevel::Pml4).unwrap();
+        let second = allocate_zeroed(&mut roles, 1);
+        let second = roles
+            .prepare_table(second, owner, TableLevel::Pml4)
+            .unwrap();
+
+        let rejected = roles.stage_table_commit(first, None).unwrap_err();
+        assert_eq!(rejected.error(), FrameRoleError::DuplicateTableRoot);
+        let first = rejected.into_grant();
+        roles.cancel_table_candidate(second).unwrap();
+
+        let staged = roles.stage_table_commit(first, None).unwrap();
+        let root = roles.publish_staged_table(staged);
+        assert_eq!(root.owner(), owner);
+        assert_eq!(root.level(), TableLevel::Pml4);
+        assert_eq!(roles.validate_table_identity(root), Ok(()));
+        assert_eq!(roles.check_invariants(), Ok(()));
+    }
+
+    #[test]
+    #[should_panic(expected = "staged table commit became invalid before publication")]
+    fn staged_child_panics_closed_if_its_candidate_parent_is_cancelled() {
+        let mut roles = manager(BASE_PAGE_SIZE, 4);
+        let owner = roles.create_table_owner().unwrap();
+        let parent = allocate_zeroed(&mut roles, 1);
+        let parent = roles
+            .prepare_table(parent, owner, TableLevel::Pdpt)
+            .unwrap();
+        let child = allocate_zeroed(&mut roles, 1);
+        let child = roles.prepare_table(child, owner, TableLevel::Pd).unwrap();
+        let staged = roles
+            .stage_table_commit(child, Some(TableCommitParent::Candidate(&parent)))
+            .unwrap();
+
+        roles.cancel_table_candidate(parent).unwrap();
+        let _ = roles.publish_staged_table(staged);
+    }
+
+    #[test]
+    #[should_panic(expected = "staged table commit became invalid before publication")]
+    fn staged_child_cannot_publish_before_its_candidate_parent() {
+        let mut roles = manager(BASE_PAGE_SIZE, 4);
+        let owner = roles.create_table_owner().unwrap();
+        let parent = allocate_zeroed(&mut roles, 1);
+        let parent = roles
+            .prepare_table(parent, owner, TableLevel::Pdpt)
+            .unwrap();
+        let child = allocate_zeroed(&mut roles, 1);
+        let child = roles.prepare_table(child, owner, TableLevel::Pd).unwrap();
+        let staged = roles
+            .stage_table_commit(child, Some(TableCommitParent::Candidate(&parent)))
+            .unwrap();
+
+        let _ = roles.publish_staged_table(staged);
+    }
+
+    #[test]
+    #[should_panic(expected = "staged table commit became invalid before publication")]
+    fn foreign_manager_cannot_publish_a_staged_table_token() {
+        let mut owner = manager(BASE_PAGE_SIZE, 2);
+        let owner_key = owner.create_table_owner().unwrap();
+        let root = allocate_zeroed(&mut owner, 1);
+        let root = owner
+            .prepare_table(root, owner_key, TableLevel::Pml4)
+            .unwrap();
+        let staged = owner.stage_table_commit(root, None).unwrap();
+
+        let mut foreign = manager(BASE_PAGE_SIZE * 8, 2);
+        let _ = foreign.publish_staged_table(staged);
     }
 
     #[test]

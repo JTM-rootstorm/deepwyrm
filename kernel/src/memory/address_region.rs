@@ -28,7 +28,7 @@ pub(crate) struct AddressSpaceKey {
 
 impl AddressSpaceKey {
     pub(super) const EMPTY: Self = Self { domain: 0, raw: 0 };
-    pub(super) const fn same_domain(self, region: RegionKey) -> bool {
+    pub(crate) const fn same_domain(self, region: RegionKey) -> bool {
         self.domain != 0 && self.domain == region.domain
     }
 }
@@ -237,6 +237,14 @@ pub(crate) struct Mapping {
 }
 
 impl Mapping {
+    pub(crate) const fn address_space(self) -> AddressSpaceKey {
+        self.address_space
+    }
+
+    pub(crate) const fn region(self) -> RegionKey {
+        self.region
+    }
+
     #[allow(
         dead_code,
         reason = "the architecture publisher consumes virtual starts when it materializes page-table entries"
@@ -359,7 +367,7 @@ const EMPTY_MAPPING: Mapping = Mapping {
     lease: EMPTY_LEASE,
 };
 
-mod publisher_seal {
+pub(crate) mod publisher_seal {
     pub trait Sealed {}
 }
 
@@ -405,7 +413,11 @@ pub(crate) struct AddressRegion<const SLOTS: usize> {
 }
 
 impl<const SLOTS: usize> AddressRegion<SLOTS> {
-    pub(super) const fn region_key(&self) -> RegionKey {
+    pub(crate) const fn address_space_key(&self) -> AddressSpaceKey {
+        self.address_space
+    }
+
+    pub(crate) const fn region_key(&self) -> RegionKey {
         self.region
     }
     const fn new(

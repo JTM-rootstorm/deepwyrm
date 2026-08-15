@@ -13,6 +13,16 @@
 
 use crate::memory::physical::{BASE_PAGE_SIZE, PhysicalAddressLimit};
 
+mod journal;
+
+#[allow(
+    unused_imports,
+    reason = "DW0-C exposes the sealed publisher before the live temporary mapper is wired"
+)]
+pub(crate) use journal::{
+    AtomicPageTableTarget, X86AddressSpacePublishError, X86AddressSpacePublisher,
+};
+
 const PAGE_SIZE: u64 = BASE_PAGE_SIZE;
 const MAX_MUTATIONS: usize = 4;
 const MAX_NEW_TABLES: usize = 3;
@@ -414,6 +424,7 @@ pub enum MapError<E> {
     ParentConflict,
     InvalidPath,
     InsufficientTableFrames,
+    FrameMismatch,
 }
 
 /// A four-level root whose state can change only through an atomic backend.
@@ -612,6 +623,41 @@ impl PageTableRoot {
             preserve_mask: ACCESSED | DIRTY | LEAF_NON_PERMISSION_ATTRIBUTES,
         });
         plan.leaf_data = Some(frame);
+        commit(access, &plan)
+    }
+
+    /// Atomically replaces one present base-page frame and its permissions.
+    pub fn replace_page<A: PageTableTransaction>(
+        &self,
+        access: &mut A,
+        page: VirtualPage,
+        expected_physical_start: u64,
+        replacement_physical_start: u64,
+        permissions: MappingPermissions,
+    ) -> Result<(), MapError<A::Error>> {
+        validate_mapping(page, permissions).map_err(policy_error)?;
+        let expected = FrameAddress::new(expected_physical_start, self.physical_limit())
+            .map_err(|_| MapError::InvalidPath)?;
+        let replacement = FrameAddress::new(replacement_physical_start, self.physical_limit())
+            .map_err(|_| MapError::InvalidPath)?;
+        if replacement == self.frame {
+            return Err(MapError::InvalidPath);
+        }
+        let mut plan = MutationPlan::empty(self.frame, page);
+        let (leaf_table, old) = self.walk_leaf(access, page, &mut plan)?;
+        let actual = decode_leaf(old, permissions.user, self.physical_limit())?;
+        if actual != expected {
+            return Err(MapError::FrameMismatch);
+        }
+        plan.push_mutation(EntryMutation {
+            table: leaf_table,
+            index: page.index(0),
+            expected: old,
+            compare_mask: !(ACCESSED | DIRTY),
+            replacement: leaf_entry(replacement, permissions),
+            preserve_mask: 0,
+        });
+        plan.leaf_data = Some(replacement);
         commit(access, &plan)
     }
 
