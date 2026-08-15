@@ -18,7 +18,7 @@ host_tools = "exact-observation-for-dw0a-validation-not-a-guest-toolchain-pin"
 
 [dw0a_host_validation]
 recorded_on = "2026-08-15"
-deepwyrm_revision = "4751a2d3929675357e31389301d152f86e2ab7cb"
+deepwyrm_revision = "37338e8d44c08ef039eb34a01292a6b6cb5cac3a"
 host = "x86_64-unknown-linux-gnu"
 rustc = "1.96.1 (31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd)"
 rustc_llvm = "22.1.2"

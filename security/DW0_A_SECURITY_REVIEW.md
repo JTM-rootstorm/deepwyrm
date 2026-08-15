@@ -3,7 +3,7 @@
 ## Reviewed identity and method
 
 This manual intermediate-phase review covers Deepwyrm commit
-`4751a2d3929675357e31389301d152f86e2ab7cb`, including the canonical schema,
+`37338e8d44c08ef039eb34a01292a6b6cb5cac3a`, including the canonical schema,
 generator, generated boundary types, `deepwyrm-abi`, and host command surface.
 Seven bounded implementation and adversarial-review lanes examined ABI/schema,
 x86_64 contract compatibility, tooling, memory contracts, objects/handles,

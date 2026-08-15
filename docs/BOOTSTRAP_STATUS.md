@@ -6,7 +6,7 @@ planning documents.
 ## Current claim boundary
 
 Phase DW0-A passed its host-only ABI layout gate at Deepwyrm revision
-`4751a2d3929675357e31389301d152f86e2ab7cb`. The detailed command, clean-checkout,
+`37338e8d44c08ef039eb34a01292a6b6cb5cac3a`. The detailed command, clean-checkout,
 review, and limitation record is in
 [`DW0_A_VALIDATION.md`](DW0_A_VALIDATION.md).
 

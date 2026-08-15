@@ -3,7 +3,7 @@
 ## Disposition
 
 Phase DW0-A's host-only ABI layout gate passes for Deepwyrm revision
-`4751a2d3929675357e31389301d152f86e2ab7cb`.
+`37338e8d44c08ef039eb34a01292a6b6cb5cac3a`.
 
 This disposition covers the workspace, canonical ABI 0 schema, deterministic
 generation, committed fixed-width Rust and C representations, drift checks,
