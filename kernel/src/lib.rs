@@ -11,6 +11,7 @@ pub mod arch;
 pub mod boot;
 pub mod debug;
 pub mod interrupt;
+pub mod memory;
 
 #[cfg(feature = "test-support")]
 pub mod test_support;
