@@ -92,7 +92,7 @@ fn c2_large_bootstrap_state_is_not_stack_owned() {
     let layout = fs::read_to_string(manifest_dir.join("arch/x86_64/layout.toml"))
         .expect("read live architecture layout");
 
-    assert!(layout.contains("kernel_boot_stack_size = 65536"));
+    assert!(layout.contains("kernel_boot_stack_size = 131072"));
     for storage in [
         "static BOOTSTRAP_ROLE_MANAGER",
         "static BOOTSTRAP_RESERVATIONS",

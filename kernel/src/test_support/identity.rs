@@ -9,6 +9,7 @@
 )]
 
 use super::protocol::{CompletionOutcome, CompletionRecord};
+use crate::arch::x86_64::exceptions::{EarlyException, ExceptionVector};
 
 /// Guest test selected and provenanced at kernel build time.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -16,6 +17,47 @@ pub(crate) enum BuildGuestTest {
     BootHandoffPass,
     ExceptionFailPath,
     PanicPath,
+    MemoryMapping,
+    MemoryUnmapping,
+    MemoryPermissions,
+    MemoryInvalidPointer,
+    MemoryUserKernelIsolation,
+    MemorySharedMemoryObject,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExpectedPageFaultKind {
+    UnmappedSupervisorRead,
+    WriteProtectedSupervisorWrite,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ExpectedPageFaultFacts {
+    pub(super) address: u64,
+    pub(super) instruction_pointer: u64,
+    pub(super) error_code: u64,
+    pub(super) processor_id: u8,
+}
+
+pub(super) fn expected_page_fault_matches(
+    exception: EarlyException,
+    expected: ExpectedPageFaultFacts,
+    observed_processor_id: u8,
+) -> bool {
+    exception.vector == ExceptionVector::PageFault
+        && exception.fault_address == Some(expected.address)
+        && exception.error_code == Some(expected.error_code)
+        && exception.frame.instruction_pointer == expected.instruction_pointer
+        && observed_processor_id == expected.processor_id
+}
+
+pub(super) const fn expected_fault_selector(kind: ExpectedPageFaultKind) -> (BuildGuestTest, u64) {
+    match kind {
+        ExpectedPageFaultKind::UnmappedSupervisorRead => (BuildGuestTest::MemoryUnmapping, 0),
+        ExpectedPageFaultKind::WriteProtectedSupervisorWrite => {
+            (BuildGuestTest::MemoryPermissions, 3)
+        }
+    }
 }
 
 const INVALID_OPCODE_VECTOR: u8 = 6;
@@ -26,7 +68,25 @@ impl BuildGuestTest {
             Self::BootHandoffPass => 1,
             Self::ExceptionFailPath => 2,
             Self::PanicPath => 3,
+            Self::MemoryMapping => 4,
+            Self::MemoryUnmapping => 5,
+            Self::MemoryPermissions => 6,
+            Self::MemoryInvalidPointer => 7,
+            Self::MemoryUserKernelIsolation => 8,
+            Self::MemorySharedMemoryObject => 9,
         }
+    }
+
+    pub(crate) const fn is_memory_foundation(self) -> bool {
+        matches!(
+            self,
+            Self::MemoryMapping
+                | Self::MemoryUnmapping
+                | Self::MemoryPermissions
+                | Self::MemoryInvalidPointer
+                | Self::MemoryUserKernelIsolation
+                | Self::MemorySharedMemoryObject
+        )
     }
 }
 
@@ -85,6 +145,18 @@ const fn parse_known_selector(value: &str) -> BuildGuestTest {
         BuildGuestTest::ExceptionFailPath
     } else if string_equals(value, "panic-path") {
         BuildGuestTest::PanicPath
+    } else if string_equals(value, "memory-mapping") {
+        BuildGuestTest::MemoryMapping
+    } else if string_equals(value, "memory-unmapping") {
+        BuildGuestTest::MemoryUnmapping
+    } else if string_equals(value, "memory-permissions") {
+        BuildGuestTest::MemoryPermissions
+    } else if string_equals(value, "memory-invalid-pointer") {
+        BuildGuestTest::MemoryInvalidPointer
+    } else if string_equals(value, "memory-user-kernel-isolation") {
+        BuildGuestTest::MemoryUserKernelIsolation
+    } else if string_equals(value, "memory-shared-memory-object") {
+        BuildGuestTest::MemorySharedMemoryObject
     } else {
         panic!("unknown build-selected guest test")
     }
@@ -133,6 +205,7 @@ const fn parse_nonzero_decimal_u32(value: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arch::x86_64::exceptions::ExceptionFrame;
     use crate::test_support::{DebugExitValue, expected_host_exit_status};
 
     #[test]
@@ -158,11 +231,29 @@ mod tests {
     }
 
     #[test]
-    fn only_the_three_central_selectors_have_kernel_identities() {
+    fn all_nine_central_selectors_have_exact_kernel_identities() {
         let cases = [
             ("boot-handoff-pass", BuildGuestTest::BootHandoffPass, 1),
             ("exception-fail-path", BuildGuestTest::ExceptionFailPath, 2),
             ("panic-path", BuildGuestTest::PanicPath, 3),
+            ("memory-mapping", BuildGuestTest::MemoryMapping, 4),
+            ("memory-unmapping", BuildGuestTest::MemoryUnmapping, 5),
+            ("memory-permissions", BuildGuestTest::MemoryPermissions, 6),
+            (
+                "memory-invalid-pointer",
+                BuildGuestTest::MemoryInvalidPointer,
+                7,
+            ),
+            (
+                "memory-user-kernel-isolation",
+                BuildGuestTest::MemoryUserKernelIsolation,
+                8,
+            ),
+            (
+                "memory-shared-memory-object",
+                BuildGuestTest::MemorySharedMemoryObject,
+                9,
+            ),
         ];
         for (selector, identity, id) in cases {
             assert_eq!(parse_known_selector(selector), identity);
@@ -186,6 +277,12 @@ mod tests {
             (BuildGuestTest::ExceptionFailPath, 14),
             (BuildGuestTest::BootHandoffPass, 6),
             (BuildGuestTest::PanicPath, 6),
+            (BuildGuestTest::MemoryMapping, 6),
+            (BuildGuestTest::MemoryUnmapping, 6),
+            (BuildGuestTest::MemoryPermissions, 6),
+            (BuildGuestTest::MemoryInvalidPointer, 6),
+            (BuildGuestTest::MemoryUserKernelIsolation, 6),
+            (BuildGuestTest::MemorySharedMemoryObject, 6),
         ] {
             assert_eq!(
                 exception_outcome_for(test, vector),
@@ -209,6 +306,69 @@ mod tests {
         assert!(!invalid_opcode_trigger_allowed_for(
             BuildGuestTest::PanicPath
         ));
+    }
+
+    #[test]
+    fn only_memory_selectors_enter_the_post_activation_dispatch() {
+        for test in [
+            BuildGuestTest::MemoryMapping,
+            BuildGuestTest::MemoryUnmapping,
+            BuildGuestTest::MemoryPermissions,
+            BuildGuestTest::MemoryInvalidPointer,
+            BuildGuestTest::MemoryUserKernelIsolation,
+            BuildGuestTest::MemorySharedMemoryObject,
+        ] {
+            assert!(test.is_memory_foundation());
+        }
+        for test in [
+            BuildGuestTest::BootHandoffPass,
+            BuildGuestTest::ExceptionFailPath,
+            BuildGuestTest::PanicPath,
+        ] {
+            assert!(!test.is_memory_foundation());
+        }
+    }
+
+    #[test]
+    fn expected_page_fault_contract_checks_every_terminal_fact() {
+        let expected = ExpectedPageFaultFacts {
+            address: 0x4000_0000,
+            instruction_pointer: 0xffff_ffff_8000_1234,
+            error_code: 3,
+            processor_id: 7,
+        };
+        let matching = EarlyException::new(
+            ExceptionVector::PageFault,
+            Some(3),
+            ExceptionFrame {
+                instruction_pointer: expected.instruction_pointer,
+                code_segment: 8,
+                rflags: 2,
+                stack_pointer: None,
+                stack_segment: None,
+            },
+            Some(expected.address),
+        )
+        .unwrap();
+        assert!(expected_page_fault_matches(matching, expected, 7));
+
+        let mut cases = [matching; 4];
+        cases[0].fault_address = Some(expected.address + 8);
+        cases[1].error_code = Some(1);
+        cases[2].frame.instruction_pointer += 1;
+        cases[3].vector = ExceptionVector::GeneralProtection;
+        for mismatch in cases {
+            assert!(!expected_page_fault_matches(mismatch, expected, 7));
+        }
+        assert!(!expected_page_fault_matches(matching, expected, 8));
+        assert_eq!(
+            expected_fault_selector(ExpectedPageFaultKind::UnmappedSupervisorRead),
+            (BuildGuestTest::MemoryUnmapping, 0)
+        );
+        assert_eq!(
+            expected_fault_selector(ExpectedPageFaultKind::WriteProtectedSupervisorWrite),
+            (BuildGuestTest::MemoryPermissions, 3)
+        );
     }
 
     #[test]

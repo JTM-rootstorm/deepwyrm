@@ -16,6 +16,8 @@ use crate::memory::physical::{BASE_PAGE_SIZE, PhysicalAddressLimit};
 mod journal;
 pub(crate) mod transition;
 
+#[cfg(all(feature = "test-support", target_os = "none", target_arch = "x86_64"))]
+pub(crate) use transition::LiveActivePagingTarget;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[allow(
     unused_imports,

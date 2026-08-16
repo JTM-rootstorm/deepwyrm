@@ -5,28 +5,27 @@ planning documents.
 
 ## Current claim boundary
 
-Phase DW0-A passed its host-only ABI layout gate at Deepwyrm revision
-`37338e8d44c08ef039eb34a01292a6b6cb5cac3a`. The detailed command, clean-checkout,
-review, and limitation record is in
-[`DW0_A_VALIDATION.md`](DW0_A_VALIDATION.md).
+Phase DW0-A passed its host-only ABI layout gate at revision
+`37338e8d44c08ef039eb34a01292a6b6cb5cac3a`. DW0-B source and freestanding build
+gates passed at `0bc8e6667e27ebd6aa5e3d572f34b9a1dfddefc7`, while its exact
+Wyrmroot/Q35 execution gate remains pending. The detailed records are
+[`DW0_A_VALIDATION.md`](DW0_A_VALIDATION.md) and
+[`DW0_B_VALIDATION.md`](DW0_B_VALIDATION.md).
 
-The repository now provides a canonical ABI 0 schema, deterministic generator,
-fixed-width Rust and C definitions, committed drift-checked outputs, a `no_std`
-`deepwyrm-abi` crate, and focused host commands. It does not currently provide:
+DW0-C now has committed physical ownership, mapping authority, atomic
+publication, transition attestation, and one-shot Deep-root activation through
+revision `2c32c82aef71c1e52cfde2fc368beb93a63d8f8c`. An uncommitted C3 candidate
+adds real build-selected memory guest bodies and passes its host and target
+artifact gates. [`DW0_C_VALIDATION.md`](DW0_C_VALIDATION.md) records the exact
+qualified evidence and pending gates. DW0-C is not complete until mandatory
+security review and coordinator-owned execution of all six selectors pass
+against an exact paired image.
 
-- a bootable x86_64 Deepwyrm kernel, UEFI handoff, serial/panic path, or guest
-  test completion path;
-- implemented memory, object, handle, task, syscall, IPC, synchronization, or
-  time behavior;
-- a primordial ELF loader or primordial Wyrmroot process launch;
-- a canonical Deepwyrm/Wyrmroot image, QEMU integration result, or tested
-  compatible revision pair; or
-- a completed DW0 release-candidate security, libc-independence, toolchain,
-  image-delivery, or milestone-closure gate.
-
-DW0-A evidence establishes only the host ABI/schema/tooling gate. It does not
-establish kernel behavior, guest toolchain acceptance, boot reproducibility,
-guest execution, or any later phase gate.
+The repository still does not provide DW0-D handles, DW0-E tasks/syscalls,
+later IPC/synchronization/time behavior, a primordial Wyrmroot process, or a
+completed DW0 release-candidate security and end-to-end gate. No source or
+artifact result in these records establishes a compatible Wyrmroot revision
+pair or VM behavior that was not actually tested.
 
 ## Authority
 

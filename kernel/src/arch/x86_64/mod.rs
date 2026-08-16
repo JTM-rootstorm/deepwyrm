@@ -14,6 +14,30 @@ pub mod idt;
 pub mod mm;
 pub mod tss;
 
+#[cfg(test)]
+mod bootstrap_cpu_policy_tests {
+    const CR4_SMAP: u64 = 1 << 21;
+    const RFLAGS_AC: u64 = 1 << 18;
+
+    const fn normalized_cr4(cr4: u64) -> u64 {
+        cr4 & !CR4_SMAP
+    }
+
+    const fn normalized_rflags(rflags: u64) -> u64 {
+        rflags & !RFLAGS_AC
+    }
+
+    #[test]
+    fn dw0_c_normalization_preserves_every_unrelated_control_and_flag_bit() {
+        for value in [0, u64::MAX, 0x0123_4567_89ab_cdef, CR4_SMAP, RFLAGS_AC] {
+            assert_eq!(normalized_cr4(value) & CR4_SMAP, 0);
+            assert_eq!(normalized_cr4(value) & !CR4_SMAP, value & !CR4_SMAP);
+            assert_eq!(normalized_rflags(value) & RFLAGS_AC, 0);
+            assert_eq!(normalized_rflags(value) & !RFLAGS_AC, value & !RFLAGS_AC);
+        }
+    }
+}
+
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 use core::cell::UnsafeCell;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]

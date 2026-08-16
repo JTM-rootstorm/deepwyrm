@@ -323,14 +323,7 @@ fn run_invocation(invocation: Invocation) -> io::Result<u8> {
                     command.args(["--package", "abi-gen", "--package", "deepwyrm-abi"]);
                 }
                 Some(HostTestFilter::Memory) => {
-                    command.args([
-                        "--package",
-                        "deepwyrm-kernel",
-                        "--lib",
-                        "--tests",
-                        "--",
-                        "memory",
-                    ]);
+                    command.args(["--package", "deepwyrm-kernel", "--lib", "--tests"]);
                 }
                 None => {
                     command.args(["--workspace", "--all-targets"]);

@@ -94,9 +94,10 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             test_support::trigger_expected_invalid_opcode()
         }
         test_support::BuildGuestTest::PanicPath => panic!("DW0-B panic-path guest test"),
+        test if test.is_memory_foundation() => {}
+        _ => unreachable!("all build-selected guest tests have explicit dispatch"),
     }
 
-    #[cfg(not(feature = "test-support"))]
     {
         let physical_width =
             u8::try_from(boot_info.paging_handoff().header().physical_address_width)
@@ -147,7 +148,7 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
         // SAFETY: the raw entry and descriptor installer establish the sole-BSP,
         // CPL0, IF-clear, stationary stack/descriptor contract. No AP or other
         // mapper can run during this complete consuming activation session.
-        let mut active_paging = unsafe {
+        let active_paging = unsafe {
             arch::x86_64::mm::activate_bootstrap_deep_paging(
                 boot_info.paging_handoff(),
                 roles,
@@ -155,13 +156,22 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             )
         }
         .unwrap_or_else(|error| panic!("failed to activate Deep-owned paging: {error:?}"));
+        #[cfg(not(feature = "test-support"))]
         let _ = debug::emit_early_record(
             debug::DiagnosticLevel::Info,
             "boot",
             "activated Deep-owned page tables",
         );
+        #[cfg(feature = "test-support")]
+        match test_support::BUILD_GUEST_TEST {
+            test if test.is_memory_foundation() => {
+                test_support::run_memory_guest_test(active_paging)
+            }
+            _ => unreachable!("DW0-B terminal selectors cannot pass the early dispatch"),
+        }
+        #[cfg(not(feature = "test-support"))]
         loop {
-            core::hint::black_box(&mut active_paging);
+            core::hint::black_box(&active_paging);
             // SAFETY: the active session remains owned on this stack, APs are
             // offline, and DW0-C2 has no scheduler or later phase to resume.
             unsafe {

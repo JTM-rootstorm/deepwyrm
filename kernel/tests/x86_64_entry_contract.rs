@@ -20,7 +20,7 @@ fn layout_manifest_is_exact_and_fails_closed_on_drift() {
     let layout = kernel_build::Layout::parse(&source).expect("parse canonical layout manifest");
     assert_eq!(layout.link_base, 0xffff_ffff_8000_0000);
     assert_eq!(layout.base_page_size, 4_096);
-    assert_eq!(layout.kernel_boot_stack_size, 65_536);
+    assert_eq!(layout.kernel_boot_stack_size, 131_072);
     assert_eq!(layout.kernel_boot_stack_alignment, 4_096);
     assert_eq!(layout.temporary_virtual_address, 0xffff_ff00_0000_0000);
     assert_eq!(layout.temporary_indices, [510, 0, 0, 0]);
@@ -68,6 +68,10 @@ fn layout_manifest_is_exact_and_fails_closed_on_drift() {
         format!("{source}\nunknown_contract_key = true\n"),
         source.replacen("version = 2", "version = 2\nversion = 2", 1),
         source.replace("version = 2", "version = 1"),
+        source.replace(
+            "kernel_boot_stack_size = 131072",
+            "kernel_boot_stack_size = 65536",
+        ),
         source.replace(
             "allowed_program_header_types = [\"PT_LOAD\"]",
             "allowed_program_header_types = [\"PT_LOAD\", \"PT_NOTE\"]",
@@ -123,14 +127,23 @@ fn layout_manifest_is_exact_and_fails_closed_on_drift() {
 #[test]
 fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
     let harness = fs::read_to_string(guest_harness_path()).expect("read guest harness manifest");
-    assert_eq!(
-        kernel_build::select_guest_test(true, Some("boot-handoff-pass"), false, &harness),
-        Ok(Some(1))
-    );
-    assert_eq!(
-        kernel_build::select_guest_test(true, Some("exception-fail-path"), false, &harness),
-        Ok(Some(2))
-    );
+    for (selector, id) in [
+        ("boot-handoff-pass", 1),
+        ("exception-fail-path", 2),
+        ("panic-path", 3),
+        ("memory-mapping", 4),
+        ("memory-unmapping", 5),
+        ("memory-permissions", 6),
+        ("memory-invalid-pointer", 7),
+        ("memory-user-kernel-isolation", 8),
+        ("memory-shared-memory-object", 9),
+    ] {
+        assert_eq!(
+            kernel_build::select_guest_test(true, Some(selector), false, &harness),
+            Ok(Some(id)),
+            "selector {selector} must retain its immutable harness ID"
+        );
+    }
     assert!(kernel_build::select_guest_test(true, Some("unknown-test"), false, &harness).is_err());
     assert!(kernel_build::select_guest_test(true, None, false, &harness).is_err());
     assert!(kernel_build::select_guest_test(false, Some("panic-path"), false, "").is_err());
@@ -192,9 +205,55 @@ fn entry_shim_switches_stacks_before_its_first_push() {
 
     let rust_entry = fs::read_to_string(entry_rust_path()).expect("read Rust entry boundary");
     assert!(rust_entry.contains("extern \"sysv64\" fn dw_kernel_rust_entry"));
+    let normalize = rust_entry
+        .find("normalize_dw0_c_cpu_state();")
+        .expect("consumer-owned CPU normalization call");
+    let kernel_main = rust_entry
+        .find("crate::kernel_main(boot_info_physical)")
+        .expect("kernel main call");
+    assert!(normalize < kernel_main);
+    for required in [
+        "\"pushfq\"",
+        "\"mov {scratch}, cr4\"",
+        "\"btr {scratch}, 21\"",
+        "\"mov cr4, {scratch}\"",
+        "\"btr qword ptr [rsp], 18\"",
+        "\"popfq\"",
+    ] {
+        assert!(
+            rust_entry.contains(required),
+            "entry normalization omitted `{required}`"
+        );
+    }
+    assert_eq!(rust_entry.matches("\"pushfq\"").count(), 1);
+    assert_eq!(rust_entry.matches("\"popfq\"").count(), 1);
+    assert_eq!(rust_entry.matches("\"mov cr4, {scratch}\"").count(), 1);
+    assert!(!rust_entry.contains("options(nomem"));
     assert!(rust_entry.contains("crate::kernel_main(boot_info_physical)"));
     assert!(rust_entry.contains("#[allow("));
     assert!(rust_entry.contains("unsafe_code,"));
+}
+
+#[test]
+fn kernel_assembler_disables_clang_default_configuration_discovery() {
+    let build_script =
+        fs::read_to_string(kernel_root().join("build.rs")).expect("read kernel build script");
+    let assembler = build_script
+        .split_once("pub(crate) fn assemble_source")
+        .expect("assembler helper")
+        .1
+        .split_once("fn required_env")
+        .expect("assembler helper terminator")
+        .0;
+    assert_eq!(
+        assembler.matches(".arg(\"--no-default-config\")").count(),
+        1
+    );
+    assert!(
+        assembler.find(".arg(\"--no-default-config\")")
+            < assembler.find("--target={KERNEL_TARGET}"),
+        "Clang default configuration must be disabled before target selection"
+    );
 }
 
 #[test]
@@ -302,6 +361,7 @@ dw_test_bss_probe:
     .expect("write section probe");
     run_success(
         Command::new(&clang)
+            .arg("--no-default-config")
             .arg("--target=x86_64-unknown-none")
             .args(["-ffreestanding", "-fno-pic", "-c"])
             .arg(&section_source)

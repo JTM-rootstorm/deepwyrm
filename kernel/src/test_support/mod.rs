@@ -7,6 +7,8 @@
 #![cfg(feature = "test-support")]
 
 mod identity;
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+mod memory;
 mod protocol;
 mod transport;
 
@@ -23,8 +25,15 @@ pub use transport::{
 
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 pub(crate) use x86_64::{
-    complete_exception_vector, complete_panic, complete_pass, trigger_expected_invalid_opcode,
+    complete_exception, complete_fail, complete_panic, complete_pass, expect_terminal_page_fault,
+    read_user_alias_word, trigger_expected_invalid_opcode, write_then_read_user_alias,
 };
+
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+pub(crate) use identity::ExpectedPageFaultKind;
+
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+pub(crate) use memory::run_memory_guest_test;
 
 #[cfg(target_os = "none")]
 pub(crate) use identity::{BUILD_GUEST_TEST, BuildGuestTest};

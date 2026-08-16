@@ -368,7 +368,7 @@ impl EarlyExceptionReporter for SerialEarlyExceptionReporter {
             backtrace_frames: &[],
         });
         #[cfg(feature = "test-support")]
-        crate::test_support::complete_exception_vector(exception.vector.vector());
+        crate::test_support::complete_exception(exception);
         #[cfg(not(feature = "test-support"))]
         halt_forever()
     }

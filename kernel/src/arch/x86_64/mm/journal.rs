@@ -800,12 +800,14 @@ where
                 continue;
             }
             let boundary = next_boundary(before, after, address, old, new)?;
-            let old_page = old
-                .map(|mapping| page_descriptor(mapping, address))
-                .transpose()?;
-            let new_page = new
-                .map(|mapping| page_descriptor(mapping, address))
-                .transpose()?;
+            let old_page = match old {
+                Some(mapping) => Some(page_descriptor(mapping, address)?),
+                None => None,
+            };
+            let new_page = match new {
+                Some(mapping) => Some(page_descriptor(mapping, address)?),
+                None => None,
+            };
             if old_page == new_page {
                 cursor = (boundary != u64::MAX).then_some(boundary);
                 continue;
@@ -816,12 +818,14 @@ where
                 if changed_pages == INVALIDATION_CAPACITY {
                     return Err(X86AddressSpacePublishError::Capacity);
                 }
-                let old_page = old
-                    .map(|mapping| page_descriptor(mapping, page_address))
-                    .transpose()?;
-                let new_page = new
-                    .map(|mapping| page_descriptor(mapping, page_address))
-                    .transpose()?;
+                let old_page = match old {
+                    Some(mapping) => Some(page_descriptor(mapping, page_address)?),
+                    None => None,
+                };
+                let new_page = match new {
+                    Some(mapping) => Some(page_descriptor(mapping, page_address)?),
+                    None => None,
+                };
                 publish_page(self.root, &mut journal, page_address, old_page, new_page)?;
                 changed_pages += 1;
                 page_address = page_address
@@ -931,7 +935,7 @@ fn validate_mapping_batch<E, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: u
             )
             .map_err(X86AddressSpacePublishError::FrameRole)?;
         let end = mapping.virtual_start() + mapping.byte_len();
-        for other in mappings[index + 1..].iter().copied() {
+        for other in &mappings[index + 1..] {
             let other_end = other
                 .virtual_start()
                 .checked_add(other.byte_len())
@@ -1027,28 +1031,54 @@ where
 }
 
 fn first_mapping_start(before: &[Mapping], after: &[Mapping]) -> Option<u64> {
-    before
-        .iter()
-        .chain(after)
-        .map(|mapping| mapping.virtual_start())
-        .min()
+    let mut first = None;
+    let mut index = 0;
+    while index < before.len() {
+        let mapping = &before[index];
+        let start = mapping.virtual_start();
+        first = Some(first.map_or(start, |current: u64| current.min(start)));
+        index += 1;
+    }
+    index = 0;
+    while index < after.len() {
+        let mapping = &after[index];
+        let start = mapping.virtual_start();
+        first = Some(first.map_or(start, |current: u64| current.min(start)));
+        index += 1;
+    }
+    first
 }
 
 fn next_mapping_start(before: &[Mapping], after: &[Mapping], address: u64) -> Option<u64> {
-    before
-        .iter()
-        .chain(after)
-        .map(|mapping| mapping.virtual_start())
-        .filter(|start| *start > address)
-        .min()
+    let mut next = next_mapping_start_in(before, address);
+    if let Some(after_start) = next_mapping_start_in(after, address) {
+        next = Some(next.map_or(after_start, |current| current.min(after_start)));
+    }
+    next
+}
+
+fn next_mapping_start_in(mappings: &[Mapping], address: u64) -> Option<u64> {
+    let mut next = None;
+    let mut index = 0;
+    while index < mappings.len() {
+        let mapping = &mappings[index];
+        let start = mapping.virtual_start();
+        if start > address {
+            next = Some(next.map_or(start, |current: u64| current.min(start)));
+        }
+        index += 1;
+    }
+    next
 }
 
 fn mapping_at<E>(
     mappings: &[Mapping],
     address: u64,
-) -> Result<Option<Mapping>, X86AddressSpacePublishError<E>> {
+) -> Result<Option<&Mapping>, X86AddressSpacePublishError<E>> {
     let mut found = None;
-    for mapping in mappings.iter().copied() {
+    let mut index = 0;
+    while index < mappings.len() {
+        let mapping = &mappings[index];
         let end = mapping
             .virtual_start()
             .checked_add(mapping.byte_len())
@@ -1059,6 +1089,7 @@ fn mapping_at<E>(
             }
             found = Some(mapping);
         }
+        index += 1;
     }
     Ok(found)
 }
@@ -1067,11 +1098,19 @@ fn next_boundary<E>(
     before: &[Mapping],
     after: &[Mapping],
     address: u64,
-    old: Option<Mapping>,
-    new: Option<Mapping>,
+    old: Option<&Mapping>,
+    new: Option<&Mapping>,
 ) -> Result<u64, X86AddressSpacePublishError<E>> {
     let mut boundary = u64::MAX;
-    for mapping in [old, new].into_iter().flatten() {
+    if let Some(mapping) = old {
+        boundary = boundary.min(
+            mapping
+                .virtual_start()
+                .checked_add(mapping.byte_len())
+                .ok_or(X86AddressSpacePublishError::InvalidMapping)?,
+        );
+    }
+    if let Some(mapping) = new {
         boundary = boundary.min(
             mapping
                 .virtual_start()
@@ -1080,20 +1119,12 @@ fn next_boundary<E>(
         );
     }
     if old.is_none()
-        && let Some(start) = before
-            .iter()
-            .map(|mapping| mapping.virtual_start())
-            .filter(|start| *start > address)
-            .min()
+        && let Some(start) = next_mapping_start_in(before, address)
     {
         boundary = boundary.min(start);
     }
     if new.is_none()
-        && let Some(start) = after
-            .iter()
-            .map(|mapping| mapping.virtual_start())
-            .filter(|start| *start > address)
-            .min()
+        && let Some(start) = next_mapping_start_in(after, address)
     {
         boundary = boundary.min(start);
     }
@@ -1104,7 +1135,7 @@ fn next_boundary<E>(
 }
 
 fn page_descriptor<E>(
-    mapping: Mapping,
+    mapping: &Mapping,
     address: u64,
 ) -> Result<PageDescriptor, X86AddressSpacePublishError<E>> {
     let offset = address
@@ -2047,6 +2078,29 @@ mod tests {
                 .unwrap();
         }
 
+        let slot_zero = region.mappings()[0].expect("first mapping slot remains published");
+        let slot_one = region.mappings()[1].expect("second mapping slot remains published");
+        let (first_mapping, second_mapping) =
+            if slot_zero.virtual_start() < slot_one.virtual_start() {
+                (slot_zero, slot_one)
+            } else {
+                (slot_one, slot_zero)
+            };
+        let reverse_order = [second_mapping, first_mapping];
+        assert_eq!(first_mapping_start(&reverse_order, &[]), Some(0x4000));
+        assert_eq!(
+            next_mapping_start(&reverse_order, &[], 0x4000),
+            Some(0x5000)
+        );
+        assert_eq!(
+            mapping_at::<()>(&reverse_order, 0x4000),
+            Ok(Some(&reverse_order[1]))
+        );
+        assert_eq!(mapping_at::<()>(&reverse_order, 0x6000), Ok(None));
+        assert_eq!(
+            next_boundary::<()>(&reverse_order, &[], 0x4000, Some(&reverse_order[1]), None),
+            Ok(0x5000)
+        );
         assert!(candidates.iter().all(Option::is_none));
         assert_eq!(target.invalidated, [0x4000, 0x5000, 0x4000, 0x5000, 0x4000]);
         assert_eq!(

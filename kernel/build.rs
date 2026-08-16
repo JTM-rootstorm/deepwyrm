@@ -29,6 +29,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_TEST_SUPPORT");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_GUEST_TEST_SELECTOR");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_GUEST_TEST_ID");
+    println!("cargo:rustc-check-cfg=cfg(deepwyrm_c3_one_shot_ui)");
 
     let layout_source = fs::read_to_string(&layout_path)
         .map_err(|error| format!("{}: {error}", layout_path.display()))?;
@@ -333,6 +334,7 @@ fn validate_selector(value: &str) -> Result<(), String> {
 pub(crate) fn assemble_source(source: &Path, output: &Path, layout: Layout) -> Result<(), String> {
     let clang = env::var_os("DEEPWYRM_CLANG").unwrap_or_else(|| "clang".into());
     let status = Command::new(&clang)
+        .arg("--no-default-config")
         .arg(format!("--target={KERNEL_TARGET}"))
         .args([
             "-ffreestanding",
@@ -724,10 +726,10 @@ impl Layout {
         {
             return Err("kernel boot stack alignment must equal the base page size".into());
         }
-        if kernel_boot_stack_size != 65_536
+        if kernel_boot_stack_size != 131_072
             || kernel_boot_stack_size % kernel_boot_stack_alignment != 0
         {
-            return Err("kernel boot stack must be an aligned 65536-byte range".into());
+            return Err("kernel boot stack must be an aligned 131072-byte range".into());
         }
         if max_normalized_memory_map_entries != 128 || max_module_entries != 16 {
             return Err("early intake limits must match the bounded BootInfo snapshots".into());

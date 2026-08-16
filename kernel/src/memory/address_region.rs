@@ -237,11 +237,11 @@ pub(crate) struct Mapping {
 }
 
 impl Mapping {
-    pub(crate) const fn address_space(self) -> AddressSpaceKey {
+    pub(crate) const fn address_space(&self) -> AddressSpaceKey {
         self.address_space
     }
 
-    pub(crate) const fn region(self) -> RegionKey {
+    pub(crate) const fn region(&self) -> RegionKey {
         self.region
     }
 
@@ -249,11 +249,11 @@ impl Mapping {
         dead_code,
         reason = "the architecture publisher consumes virtual starts when it materializes page-table entries"
     )]
-    pub(crate) const fn virtual_start(self) -> u64 {
+    pub(crate) const fn virtual_start(&self) -> u64 {
         self.virtual_start
     }
 
-    pub(crate) const fn byte_len(self) -> u64 {
+    pub(crate) const fn byte_len(&self) -> u64 {
         self.byte_len
     }
 
@@ -261,11 +261,11 @@ impl Mapping {
         dead_code,
         reason = "the architecture publisher consumes allocator-owned backing metadata when it materializes page-table entries"
     )]
-    pub(crate) const fn backing(self) -> MemoryObjectRange {
+    pub(crate) const fn backing(&self) -> MemoryObjectRange {
         self.backing
     }
 
-    pub(crate) const fn protection(self) -> Protection {
+    pub(crate) const fn protection(&self) -> Protection {
         self.protection
     }
 
@@ -273,7 +273,7 @@ impl Mapping {
         dead_code,
         reason = "the architecture publisher uses the opaque lease for publication and invalidation provenance"
     )]
-    pub(super) const fn lease(self) -> MappingLease {
+    pub(super) const fn lease(&self) -> MappingLease {
         self.lease
     }
 

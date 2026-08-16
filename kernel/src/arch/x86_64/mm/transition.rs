@@ -53,6 +53,8 @@ mod private {
         pub(super) interrupts_enabled: bool,
         pub(super) pcid_enabled: bool,
         pub(super) global_pages_enabled: bool,
+        pub(super) smap_enabled: bool,
+        pub(super) access_flag_set: bool,
         pub(super) pat_supported: bool,
         pub(super) pat_entry_zero: u8,
     }
@@ -222,6 +224,8 @@ mod private {
         if cpu.interrupts_enabled
             || cpu.pcid_enabled
             || cpu.global_pages_enabled
+            || cpu.smap_enabled
+            || cpu.access_flag_set
             || !cpu.paging_enabled
             || !cpu.long_mode_active
             || !cpu.four_level_paging
@@ -1237,6 +1241,8 @@ mod private {
             interrupts_enabled: rflags & (1 << 9) != 0,
             pcid_enabled: cr4 & (1 << 17) != 0,
             global_pages_enabled: cr4 & (1 << 7) != 0,
+            smap_enabled: cr4 & (1 << 21) != 0,
+            access_flag_set: rflags & (1 << 18) != 0,
             pat_supported,
             pat_entry_zero: pat as u8,
         }
@@ -1370,6 +1376,8 @@ mod private {
                 interrupts_enabled: false,
                 pcid_enabled: false,
                 global_pages_enabled: false,
+                smap_enabled: false,
+                access_flag_set: false,
                 pat_supported: true,
                 pat_entry_zero: 6,
             }
@@ -1514,7 +1522,7 @@ mod private {
 
         #[test]
         fn rejects_every_required_bootstrap_cpu_control_fact() {
-            let mut cases = [cpu(); 10];
+            let mut cases = [cpu(); 12];
             cases[0].cpl = 3;
             cases[1].interrupts_enabled = true;
             cases[2].pcid_enabled = true;
@@ -1525,6 +1533,8 @@ mod private {
             cases[7].write_protect_enabled = false;
             cases[8].pat_supported = false;
             cases[9].pat_entry_zero = 0;
+            cases[10].smap_enabled = true;
+            cases[11].access_flag_set = true;
 
             for (index, state) in cases.into_iter().enumerate() {
                 let error = attest_transition(state, &handoff(), &mut graph()).unwrap_err();
@@ -1886,6 +1896,8 @@ mod private {
 #[path = "activation.rs"]
 mod activation;
 
+#[cfg(all(feature = "test-support", target_os = "none", target_arch = "x86_64"))]
+pub(crate) use activation::LiveActivePagingTarget;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) use activation::activate_bootstrap_deep_paging;
 pub(crate) use activation::{
