@@ -1,13 +1,22 @@
-# DW0-C Candidate Validation Record
+# DW0-C Validation Record
 
 ## Current disposition
 
-The DW0-C physical/virtual-memory source, host, and freestanding artifact gates
-pass for the uncommitted C3 candidate based on Deepwyrm revision
-`2c32c82aef71c1e52cfde2fc368beb93a63d8f8c`. This is not a completed phase
-claim. The mandatory final security review and the coordinator-owned execution
-of all six guest selectors against an exact Deepwyrm/Wyrmroot image remain
-pending.
+The DW0-C physical/virtual-memory source, host, freestanding artifact, and
+source-security gates pass through committed Deepwyrm revision
+`9c7d65d3df83ce44b2ce1f15c2ae88587f9b570b`. Its compatible Wyrmroot
+source/pin revision is `15fa42dda23834a80197161249738f001bb2d76f`; the accepted
+Wyrmroot evidence descendant is `89235c7feef2a89ef2882ee096428b456496fa39`.
+
+All source, host, freestanding-artifact, cross-repository pin/build-evidence,
+and source-security work attainable within the current DW0-C/WYR0-C scope is
+complete for this exact pair. This is not formal DW0-C phase closure: no
+canonical ESP/image exists yet, no VM was operated for this record, and the six
+guest selectors have not executed through the real Wyrmroot loader. Guest, VM,
+and completed-phase acceptance therefore remain pending on that image and
+coordinator-owned execution. No physical-hardware acceptance claim is made;
+VM execution cannot establish one. This record also does not close the earlier
+pending DW0-B loader/guest execution gate.
 
 ## Implemented scope
 
@@ -22,6 +31,11 @@ pending.
   validated inactive Deep-owned root, and one-shot CR3 activation;
 - consumer-owned entry normalization that clears exactly CR4.SMAP and
   RFLAGS.AC before C1, with both C1 and C2 rejecting subsequent drift;
+- dedicated 16-KiB #DF, NMI, and #MC IST stacks, each preceded by one 4-KiB
+  low/down-growth guard page. The first Deep-owned root leaves each guard leaf
+  exactly zero, maps all twelve usable pages supervisor RW/NX/non-global with
+  default cache selection, revalidates installed TSS/IDT facts, and activates
+  the guards with the existing one-shot CR3 publication;
 - an architecture-private active scratch/control path retained after transition
   mappings retire; and
 - immutable guest-test identities 4 through 9 with real mapping, unmapping,
@@ -48,12 +62,12 @@ cargo xtask test host memory
 ```
 
 The selector/fault classifier passed 12 tests. The C3 dispatch, privacy,
-terminal-fault, one-shot, CPU-profile, and backing-frame source contracts passed six tests. The corrected
-canonical memory gate deliberately has no name filter: its observed run passed
-148 kernel unit tests, nine APIC integration tests, one mapping-authority UI test, two
-physical-ownership UI tests, four activation-contract tests, six entry-contract
-tests, six C3 source-contract tests, and four host-only artifact/provenance tests.
-The explicit target-artifact test is ignored in ordinary host runs and is invoked
+terminal-fault, one-shot, CPU-profile, backing-frame, and guarded-IST source
+contracts passed. The final locked workspace run included 155 kernel tests and
+all integration and compile-fail UI suites. The canonical unfiltered
+`cargo xtask test host memory` gate, selector-aware strict all-target/all-
+feature Clippy, release checks, formatting, and diff checks also passed. The
+explicit target-artifact test is ignored in ordinary host runs and was invoked
 separately with the accepted toolchain.
 
 ## Freestanding artifact evidence
@@ -90,34 +104,68 @@ observed hashes of the build tools, Clang libraries, and three inspectors,
 hashed to
 `c770c18880ac0215dfad43e5afe99ff2e9f31627c046c7dcd01dc74b5423626c`.
 
-Immediately before the first build and after the thirteenth, the gate hashed a
+Immediately before the first build and after the fourteenth, the gate hashed a
 sorted `SHA-256 path` manifest over exact files `.cargo/config.toml`,
 `Cargo.lock`, the workspace/kernel/deepwyrm-abi manifests, `kernel/build.rs`,
 and the three tooling identity/harness files, plus every regular file under
 `abi/generated`, `crates/deepwyrm-abi/src`, `kernel/arch`, and `kernel/src`.
 The test file itself is deliberately outside that recipe. Both observations
-were `7d5d9101c3214d4b959e26431ec8589762bf9cb5690a45a8c68e0574b422f909`.
-Before the thirteen successful builds, an actual-source target UI build enabled a
+were `1fab0e837ea97866eb5c8e5271da603e3865a6a8c55d27b7d697d8bfd306468e`.
+Before the fourteen successful builds, an actual-source target UI build enabled a
 checked private probe and required exact compiler error E0382 when code tried
 to duplicate the active C2 session. A successful UI build is a gate failure.
 The successful builds comprise production and the six canonical selectors,
-plus a separate `-Z emit-stack-sizes` selector build for each of the six stack
-oracles. For every selector, the complete `.text` disassembly of that stack-size
-carrier exactly matched the corresponding canonical plain selector build.
+plus separate `-Z emit-stack-sizes` builds for production and each selector.
+For every mode, the complete `.text` disassembly of the stack-size carrier
+exactly matched its canonical plain build.
 
 ```text
-DEEPWYRM_ACCEPTED_CARGO=<accepted-cargo> \
-DEEPWYRM_ACCEPTED_RUSTC=<accepted-rustc> \
-DEEPWYRM_ACCEPTED_RUST_LLD=<accepted-rust-lld> \
+TMPDIR=/home/mike/Documents/Programming/OS-Project/deepwyrm/target/ist-oracle-tmp \
+DEEPWYRM_ACCEPTED_CARGO=/home/mike/Documents/Programming/OS-Project/.artifacts/rust/RUST-PHASE0B-TOOLCHAIN-001/8bab26f4/63e532b52e6d4c2e/toolchains/wyrmroot-1.97.1-8bab26f4/bin/cargo \
+DEEPWYRM_ACCEPTED_RUSTC=/home/mike/Documents/Programming/OS-Project/.artifacts/rust/RUST-PHASE0B-TOOLCHAIN-001/8bab26f4/63e532b52e6d4c2e/toolchains/wyrmroot-1.97.1-8bab26f4/bin/rustc \
+DEEPWYRM_ACCEPTED_RUST_LLD=/home/mike/Documents/Programming/OS-Project/.artifacts/rust/RUST-PHASE0B-TOOLCHAIN-001/8bab26f4/63e532b52e6d4c2e/toolchains/wyrmroot-1.97.1-8bab26f4/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld \
 DEEPWYRM_CLANG=/usr/lib/llvm/22/bin/clang \
 DEEPWYRM_LLVM_NM=/usr/lib/llvm/22/bin/llvm-nm \
 DEEPWYRM_LLVM_OBJDUMP=/usr/lib/llvm/22/bin/llvm-objdump \
 DEEPWYRM_LLVM_READELF=/usr/lib/llvm/22/bin/llvm-readelf \
-cargo test -p deepwyrm-kernel --test x86_64_memory_target_artifact -- \
-  --ignored --exact production_and_six_memory_selector_artifacts_are_separated
+cargo test --locked -p deepwyrm-kernel \
+  --test x86_64_memory_target_artifact -- \
+  --ignored --exact production_and_six_memory_selector_artifacts_are_separated \
+  --nocapture
 ```
 
+The accepted run used
+`/home/mike/Documents/Programming/OS-Project/deepwyrm/target/ist-oracle-tmp`
+as its repository-owned `TMPDIR`; the accepted Cargo, rustc, and rust-lld came
+from request `RUST-PHASE0B-TOOLCHAIN-001`, and the LLVM inspection paths were
+the `/usr/lib/llvm/22/bin` paths shown above.
+
 | Artifact identity | SHA-256 |
+|---|---|
+| production | `2c20b97290385fd171f4ec79d02eddca58ec3e4fa452631e10a2620d63596d5e` |
+| `memory-mapping` | `8b77197bb731d66954f882936544b681f4e0f8b3d00e867111960b42bbc283ce` |
+| `memory-unmapping` | `822249003e8322d74063e8157ce8d771cc0959afbcab5a1e44b37912ddc69bb9` |
+| `memory-permissions` | `bb04f72b2c833285c38b4b1ff2ee9fff43ce520630ea76be5ba8b359ad1ff80b` |
+| `memory-invalid-pointer` | `77935e4ce8b53c8057c06eb38f9e37a37623d0eb3a4d384bf49dc453af2ffd68` |
+| `memory-user-kernel-isolation` | `679ae4cabd92223ff350763fe3e650782d47ce25d460c0db33a6b1d011a62bdf` |
+| `memory-shared-memory-object` | `18aec22a4a3d452f6d7efc28055bb6bddb2fd95584eaa3c2c2059a566316d082` |
+
+These are the current guarded-IST artifact identities for the exact source
+state committed as `9c7d65d3df83ce44b2ce1f15c2ae88587f9b570b`.
+
+### Historical pre-guard artifact checkpoint
+
+The preceding clean `b263a7a912c79b9e7d4b2439370417d7ae2ee076`
+checkpoint produced the following superseded identities. They are retained for
+provenance only and are not compatible evidence for the guarded-IST revision:
+
+Its build-input manifest was
+`7d5d9101c3214d4b959e26431ec8589762bf9cb5690a45a8c68e0574b422f909`;
+the normalized environment hash was the same
+`c770c18880ac0215dfad43e5afe99ff2e9f31627c046c7dcd01dc74b5423626c`
+identity recorded for the current gate.
+
+| Artifact identity | Historical SHA-256 |
 |---|---|
 | production | `6dc95666792f166d3ae86737770ed50660a2de0887b7c1dfeee8936f4a7cb6a5` |
 | `memory-mapping` | `499a3b1bb45b9210886e90f35d11a6d9501466c438a4349573ddc10b4d98e67b` |
@@ -126,6 +174,17 @@ cargo test -p deepwyrm-kernel --test x86_64_memory_target_artifact -- \
 | `memory-invalid-pointer` | `7f2a19b4e788ffd2d05170fc11253194bca3389a384cb35615d6cda445f956e0` |
 | `memory-user-kernel-isolation` | `04f525800285c61685f238e894790ea16de5674bb3f9d124ade39dde2b967b21` |
 | `memory-shared-memory-object` | `9797ff850bf5b601ef842eb3159b6024f4e304a6042fc8ad9a9ce6d2cc8c38be` |
+
+Wyrmroot's superseded acknowledgment of that pre-guard checkpoint used
+source/pin revision `6230d2c26b0260add3fad1e1cc55c878c0362ab5`, evidence
+descendant `737728d256c8b3a246889d840903ac751f187ef6`, and pinned Deepwyrm
+`b263a7a912c79b9e7d4b2439370417d7ae2ee076`. Its historical loader EFI was
+`c2d15d31db924a235a46730aca3e9dbf4b8edf58c2d6ceddb7bae9e82f776675`, PDB
+`810489525e70d3f57447709b523444ea018738d2b22876ed2cd9b1a5de486e6f`, and
+schema-2 provenance
+`47e7627da08fc783c74c21d705ed5c01e55fced4f9da320e876025865b51fe5a`.
+Those revisions and artifacts remain historical and must not be paired with
+the guarded Deepwyrm commit.
 
 For every selector, the stack oracle separately derives explicit audited
 publication, usercopy, normal-terminal, fault-arming, delivered-page-fault
@@ -146,12 +205,24 @@ remained within the bound:
 
 | Selector | Measured chain | Returns | Required reserve | Total | Spare |
 |---|---:|---:|---:|---:|---:|
-| `memory-mapping` | 49,576 | 256 | 4,096 | 53,928 | 77,144 |
-| `memory-unmapping` | 53,328 | 256 | 4,096 | 57,680 | 73,392 |
-| `memory-permissions` | 55,264 | 256 | 4,096 | 59,616 | 71,456 |
-| `memory-invalid-pointer` | 58,480 | 256 | 4,096 | 62,832 | 68,240 |
-| `memory-user-kernel-isolation` | 51,672 | 256 | 4,096 | 56,024 | 75,048 |
-| `memory-shared-memory-object` | 54,448 | 256 | 4,096 | 58,800 | 72,272 |
+| `memory-mapping` | 49,592 | 256 | 4,096 | 53,944 | 77,128 |
+| `memory-unmapping` | 53,344 | 256 | 4,096 | 57,696 | 73,376 |
+| `memory-permissions` | 55,280 | 256 | 4,096 | 59,632 | 71,440 |
+| `memory-invalid-pointer` | 58,496 | 256 | 4,096 | 62,848 | 68,224 |
+| `memory-user-kernel-isolation` | 51,688 | 256 | 4,096 | 56,040 | 75,032 |
+| `memory-shared-memory-object` | 54,464 | 256 | 4,096 | 58,816 | 72,256 |
+
+The separate guarded-IST oracle enumerates the maximum production and selector
+exception paths, including the previously omitted live formatter-padding
+branch `pad_integral -> Com1::write_char -> encode_utf8_raw ->
+from_raw_parts_mut::precondition_check -> is_aligned_to`. A shared builder used
+by both validators and its host regression prevent that branch from silently
+dropping out of the maximum candidate set.
+
+| Mode | Panic chain | Other terminal chain | Entry bytes | Depth | Returns | Used | Required reserve | Spare |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| production | 2,176 | 904 halt | 207 | 19 | 152 | 2,535 | 4,096 | 13,849 |
+| each selector | 2,272 | 1,685 completion | 207 | 19 | 152 | 2,631 | 4,096 | 13,753 |
 
 The production ELF contained C2 activation but no C3 runner, fault-site, or
 test-completion symbols. Its disassembly contained one balanced entry
@@ -160,17 +231,43 @@ normalization, exactly one CR4 write, and the normalization call before
 `DWTEST1`, expected-fault/completion/debug-exit markers, test symbols, and the
 debug-exit I/O instruction form. Every selector ELF retained C2 activation, the C3
 runner, and both fixed terminal-fault sites. All seven canonical linked artifacts
-were byte-distinct. The gate's isolated scratch artifacts were removed after
-inspection; the hashes above identify that observed dirty-candidate run rather
-than a retained release artifact set. They remain provisional until a clean,
-committed candidate is rebuilt with the same gate.
+were byte-distinct. ELF inspection proved exactly three non-RWX `PT_LOAD`
+segments, the expected 12-KiB writable `p_memsz` growth, the linked page-aligned
+guard-region geometry, and three complete 16-KiB usable IST stacks. Source/host
+graph tests plus artifact/code checks verify that the first Deep-owned root
+leaves the three guard PTEs exactly zero and maps the twelve usable pages with
+the required permissions. The gate's isolated scratch artifacts were removed
+after inspection; the hashes above identify the exact guarded source state,
+not a retained release artifact set.
+
+## Compatible Wyrmroot evidence
+
+Wyrmroot source/pin revision
+`15fa42dda23834a80197161249738f001bb2d76f` consumes Deepwyrm
+`9c7d65d3df83ce44b2ce1f15c2ae88587f9b570b`. Its accepted evidence descendant
+is `89235c7feef2a89ef2882ee096428b456496fa39`:
+
+| Wyrmroot evidence | SHA-256 |
+|---|---|
+| loader EFI | `e47f6aaae15d5e4f8cf34fcfa827cf95ff43e5ec1bab288b02bc65b98800c031` |
+| loader PDB | `7655e2c3102d54268703617132aaf86acf47484c4ec7595e6cafdac67d26e911` |
+| schema-2 provenance | `384841ca8c3c867a87e23e27d8ec5420ce47fc2db0b1ce3aafa276f9e90047be` |
+| PE inspection report | `f616d99b1385ed13d3d59091f5c02db5966c0228532ea632868794831f151b11` |
+
+Wyrmroot's bounded guarded-IST acknowledgment review found no new Critical,
+High, Medium, or Low findings. This is not an absolute zero-findings statement:
+existing accepted Medium limitations remain recorded in Wyrmroot's
+`security/WYR0_B_SECURITY_REVIEW.md`. This revision pair and its artifact
+records establish source/pin and loader-build compatibility only; they do not
+establish an assembled image or guest execution.
 
 ## Pending coordinator-owned functional gate
 
-No VM was operated for this record. The main/root coordinator must run these
-selectors through the canonical Wyrmroot loader and Q35/UEFI image, with fresh
-bounded serial capture, matching debug-exit status, exact paired revisions, and
-artifact/image hashes:
+No canonical ESP/image exists in the workspace and no VM was operated for this
+record. Once Wyrmroot provides the canonical image path, the main/root
+coordinator must run these selectors through the Wyrmroot loader and Q35/UEFI
+image, with fresh bounded serial capture, matching debug-exit status, the exact
+revision pair above, and artifact/image hashes:
 
 | Selector | Test ID | Required terminal outcome |
 |---|---:|---|
@@ -182,5 +279,9 @@ artifact/image hashes:
 | `memory-shared-memory-object` | 9 | PASS |
 
 Missing, stale, duplicate, mismatched, or nonterminal evidence is
-`INFRASTRUCTURE`, never PASS. The source-security candidate disposition is in
+`INFRASTRUCTURE`, never PASS. The source-security disposition is in
 [`security/DW0_C_SECURITY_REVIEW.md`](../security/DW0_C_SECURITY_REVIEW.md).
+Successful execution can satisfy the named DW0-C guest/VM evidence, but formal
+DW0-C closure also requires the separate earlier DW0-B loader/guest gate to
+close with the exact evidence required by that record. It cannot establish
+physical-hardware acceptance.
