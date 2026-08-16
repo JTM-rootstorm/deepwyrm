@@ -67,6 +67,26 @@ impl TaskStateSegment {
         self.interrupt_stack_table[index.as_array_index()] = stack_top;
         Ok(())
     }
+
+    /// Reads one installed IST top for activation-time carrier validation.
+    #[must_use]
+    #[cfg_attr(
+        not(any(test, all(target_os = "none", target_arch = "x86_64"))),
+        allow(
+            dead_code,
+            reason = "installed IST facts are consumed only by target activation"
+        )
+    )]
+    #[allow(
+        unsafe_code,
+        reason = "the packed hardware TSS requires an unaligned value read without forming a reference"
+    )]
+    pub(crate) fn interrupt_stack(&self, index: InterruptStackIndex) -> u64 {
+        let table = core::ptr::addr_of!(self.interrupt_stack_table).cast::<u64>();
+        // SAFETY: `index` is one of the seven architectural slots and the
+        // packed TSS remains live for the duration of this value-only read.
+        unsafe { table.add(index.as_array_index()).read_unaligned() }
+    }
 }
 
 impl Default for TaskStateSegment {
@@ -138,6 +158,8 @@ mod tests {
             tss.set_interrupt_stack(InterruptStackIndex::Seven, 0x3000),
             Ok(())
         );
+        assert_eq!(tss.interrupt_stack(InterruptStackIndex::One), 0);
+        assert_eq!(tss.interrupt_stack(InterruptStackIndex::Seven), 0x3000);
         assert_eq!(InterruptStackIndex::One.idt_bits(), 1);
         assert_eq!(InterruptStackIndex::Seven.idt_bits(), 7);
     }

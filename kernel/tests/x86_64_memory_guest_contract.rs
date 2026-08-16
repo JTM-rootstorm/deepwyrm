@@ -33,6 +33,44 @@ fn c3_memory_dispatch_occurs_only_after_the_deep_root_is_active() {
 }
 
 #[test]
+fn c3_live_root_rechecks_exact_ist_guards_before_selector_work() {
+    let activation = source("src/arch/x86_64/mm/activation.rs");
+    let guard_walk = activation
+        .split_once("fn guard_leaf_is_exact_zero(&mut self")
+        .expect("exact active guard walk")
+        .1
+        .split_once("fn validate_live_ist_guard_layout")
+        .expect("exact guard walk terminator")
+        .0;
+    assert!(guard_walk.contains("!= PRESENT | WRITABLE"));
+    assert!(guard_walk.contains("validate_table_child(current, child)"));
+    assert!(guard_walk.contains("Ok(entry == 0)"));
+    let validator = activation
+        .split_once("fn validate_live_ist_guard_layout(&mut self)")
+        .expect("post-C2 IST guard validator")
+        .1
+        .split_once("fn allocate_zeroed")
+        .expect("IST validator terminator")
+        .0;
+    assert!(validator.contains("for stack in ist.stacks()"));
+    assert!(validator.contains("self.guard_leaf_is_exact_zero(stack.guard_page)?"));
+    assert!(validator.contains("while page < stack.top"));
+    assert!(validator.contains("payload_pages != 12"));
+    assert!(validator.contains("KernelImageSegment::WritableData"));
+    assert!(validator.contains("PRESENT | WRITABLE | NO_EXECUTE"));
+
+    let runner = activation
+        .split_once("pub(crate) fn run_memory_foundation_test(")
+        .expect("consuming live-root runner")
+        .1;
+    let guard_check = runner
+        .find("authority.validate_live_ist_guard_layout()")
+        .expect("post-C2 live guard check");
+    let selector_dispatch = runner.find("match test").expect("selector dispatch");
+    assert!(guard_check < selector_dispatch);
+}
+
+#[test]
 fn c3_test_authority_is_target_only_linear_and_nonescaping() {
     let activation = source("src/arch/x86_64/mm/activation.rs");
     let module = source("src/test_support/mod.rs");
@@ -42,9 +80,15 @@ fn c3_test_authority_is_target_only_linear_and_nonescaping() {
     assert!(module.contains("target_arch = \"x86_64\", target_os = \"none\""));
     assert!(activation.contains("struct ActiveRootTestAuthority<"));
     assert!(!activation.contains("pub(crate) struct ActiveRootTestAuthority"));
+    assert!(activation.contains(
+        "#[cfg(all(feature = \"test-support\", target_os = \"none\", target_arch = \"x86_64\"))]\nstruct ActiveRootTestAuthority<"
+    ));
     assert!(activation.contains("_not_send_sync: core::marker::PhantomData<*mut ()>"));
     assert!(activation.contains("fn bind_test_publisher<'borrow>("));
     assert!(!activation.contains("pub(crate) fn bind_test_publisher"));
+    assert!(activation.contains("const TEST_REGION_START: u64 = 0x0000_0000_4000_0000;"));
+    assert!(activation.contains("let user_half = page.is_user_half();"));
+    assert!(activation.contains("if effective_user != user_half"));
     assert!(activation.contains("pub(crate) fn run_memory_foundation_test(\n        mut self,"));
     assert!(activation.contains(") -> ! {\n        let authority = &mut ActiveRootTestAuthority"));
     assert!(activation.contains("fn run_mapped_case(&mut self, test:"));

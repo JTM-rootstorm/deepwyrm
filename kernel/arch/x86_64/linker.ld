@@ -54,6 +54,35 @@ SECTIONS
     {
         __dw_bss_start = .;
         *(.bss.boot_stack)
+
+        /*
+         * The three terminal IST stacks descend toward one deliberately
+         * nonpresent base page each.  The loader maps the complete writable
+         * PT_LOAD during transition; Deepwyrm's first owned root omits only
+         * these three guard leaves.
+         */
+        . = ALIGN(DW_KERNEL_BASE_PAGE_SIZE);
+        __dw_ist_region_start = .;
+
+        __dw_double_fault_ist_guard = .;
+        . += DW_KERNEL_BASE_PAGE_SIZE;
+        __dw_double_fault_ist_bottom = .;
+        . += 4 * DW_KERNEL_BASE_PAGE_SIZE;
+        __dw_double_fault_ist_top = .;
+
+        __dw_nmi_ist_guard = .;
+        . += DW_KERNEL_BASE_PAGE_SIZE;
+        __dw_nmi_ist_bottom = .;
+        . += 4 * DW_KERNEL_BASE_PAGE_SIZE;
+        __dw_nmi_ist_top = .;
+
+        __dw_machine_check_ist_guard = .;
+        . += DW_KERNEL_BASE_PAGE_SIZE;
+        __dw_machine_check_ist_bottom = .;
+        . += 4 * DW_KERNEL_BASE_PAGE_SIZE;
+        __dw_machine_check_ist_top = .;
+
+        __dw_ist_region_end = .;
         *(.bss .bss.*)
         *(.sbss .sbss.*)
         *(COMMON)
@@ -78,3 +107,23 @@ ASSERT((__dw_boot_stack_bottom & (DW_KERNEL_BOOT_STACK_ALIGNMENT - 1)) == 0,
        "boot stack does not satisfy its required alignment")
 ASSERT((__dw_boot_stack_top - __dw_boot_stack_bottom) == DW_KERNEL_BOOT_STACK_SIZE,
        "boot stack size does not match layout.toml")
+ASSERT((__dw_ist_region_start & (DW_KERNEL_BASE_PAGE_SIZE - 1)) == 0,
+       "IST region must be base-page aligned")
+ASSERT((__dw_double_fault_ist_bottom - __dw_double_fault_ist_guard) == DW_KERNEL_BASE_PAGE_SIZE,
+       "double-fault IST guard must be exactly one page")
+ASSERT((__dw_double_fault_ist_top - __dw_double_fault_ist_bottom) == 4 * DW_KERNEL_BASE_PAGE_SIZE,
+       "double-fault IST usable stack must be exactly 16 KiB")
+ASSERT(__dw_double_fault_ist_top == __dw_nmi_ist_guard,
+       "double-fault and NMI IST ranges must be contiguous and disjoint")
+ASSERT((__dw_nmi_ist_bottom - __dw_nmi_ist_guard) == DW_KERNEL_BASE_PAGE_SIZE,
+       "NMI IST guard must be exactly one page")
+ASSERT((__dw_nmi_ist_top - __dw_nmi_ist_bottom) == 4 * DW_KERNEL_BASE_PAGE_SIZE,
+       "NMI IST usable stack must be exactly 16 KiB")
+ASSERT(__dw_nmi_ist_top == __dw_machine_check_ist_guard,
+       "NMI and machine-check IST ranges must be contiguous and disjoint")
+ASSERT((__dw_machine_check_ist_bottom - __dw_machine_check_ist_guard) == DW_KERNEL_BASE_PAGE_SIZE,
+       "machine-check IST guard must be exactly one page")
+ASSERT((__dw_machine_check_ist_top - __dw_machine_check_ist_bottom) == 4 * DW_KERNEL_BASE_PAGE_SIZE,
+       "machine-check IST usable stack must be exactly 16 KiB")
+ASSERT((__dw_ist_region_end - __dw_ist_region_start) == 15 * DW_KERNEL_BASE_PAGE_SIZE,
+       "IST region must contain exactly three guards and three four-page stacks")

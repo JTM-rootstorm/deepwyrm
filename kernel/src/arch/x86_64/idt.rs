@@ -116,6 +116,26 @@ impl InterruptDescriptorTable {
         Self { entries }
     }
 
+    /// Verifies the complete installed final-IDT IST assignment.
+    #[cfg_attr(
+        not(any(test, all(target_os = "none", target_arch = "x86_64"))),
+        allow(
+            dead_code,
+            reason = "installed IDT facts are consumed only by target activation"
+        )
+    )]
+    pub(crate) fn has_exact_terminal_ist_assignment(&self) -> bool {
+        self.entries.iter().enumerate().all(|(vector, gate)| {
+            let expected = match vector {
+                2 => InterruptStackIndex::Two.idt_bits(),
+                8 => InterruptStackIndex::One.idt_bits(),
+                18 => InterruptStackIndex::Three.idt_bits(),
+                _ => 0,
+            };
+            gate.ist == expected
+        })
+    }
+
     /// Reports whether the named vector has a present hardware gate.
     #[must_use]
     pub fn is_present(&self, vector: u8) -> bool {
@@ -256,6 +276,7 @@ mod tests {
     #[test]
     fn only_approved_early_vectors_have_gates() {
         let idt = InterruptDescriptorTable::new(handlers());
+        assert!(idt.has_exact_terminal_ist_assignment());
         for vector in EXCEPTION_VECTOR_RANGE {
             assert!(idt.is_present(vector));
         }
@@ -310,7 +331,11 @@ mod tests {
         assert_eq!(idt.entries[2].ist, InterruptStackIndex::Two.idt_bits());
         assert_eq!(idt.entries[8].ist, InterruptStackIndex::One.idt_bits());
         assert_eq!(idt.entries[18].ist, InterruptStackIndex::Three.idt_bits());
-        assert_eq!(idt.entries[14].ist, 0);
+        for (vector, gate) in idt.entries.iter().enumerate() {
+            if !matches!(vector, 2 | 8 | 18) {
+                assert_eq!(gate.ist, 0, "unexpected IST assignment for vector {vector}");
+            }
+        }
     }
 
     #[test]

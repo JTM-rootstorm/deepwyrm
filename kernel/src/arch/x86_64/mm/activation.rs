@@ -40,6 +40,43 @@ const MIN_ACTIVATION_STACK_HEADROOM: u64 = PAGE_SIZE;
 const DISALLOWED_COMMON: u64 =
     USER | WRITE_THROUGH | CACHE_DISABLE | HUGE | GLOBAL | SOFTWARE_LOW | SOFTWARE_HIGH;
 
+/// One exact linker-owned descending IST stack and its low guard page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IstStackBounds {
+    pub(crate) guard_page: u64,
+    pub(crate) bottom: u64,
+    pub(crate) top: u64,
+}
+
+/// The only three IST ranges retained by the first Deep-owned root.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IstStackLayout {
+    pub(crate) double_fault: IstStackBounds,
+    pub(crate) non_maskable_interrupt: IstStackBounds,
+    pub(crate) machine_check: IstStackBounds,
+}
+
+impl IstStackLayout {
+    pub(crate) const fn stacks(self) -> [IstStackBounds; 3] {
+        [
+            self.double_fault,
+            self.non_maskable_interrupt,
+            self.machine_check,
+        ]
+    }
+
+    pub(crate) fn has_exact_shape(self) -> bool {
+        let stacks = self.stacks();
+        stacks.iter().all(|stack| {
+            stack.guard_page >= 0xffff_8000_0000_0000
+                && stack.guard_page.is_multiple_of(PAGE_SIZE)
+                && stack.bottom == stack.guard_page.checked_add(PAGE_SIZE).unwrap_or(0)
+                && stack.top == stack.bottom.checked_add(16 * 1024).unwrap_or(0)
+        }) && stacks[0].top == stacks[1].guard_page
+            && stacks[1].top == stacks[2].guard_page
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct DeepScratchBinding {
     window_page: u64,
@@ -167,6 +204,8 @@ struct ExecutionCarrierFacts {
     tss_limit: u16,
     code_selector: u16,
     task_register: u16,
+    ist: IstStackLayout,
+    installed_ist_tops: [u64; 3],
 }
 
 impl KernelSegment {
@@ -207,6 +246,7 @@ enum InactiveGraphError<E> {
     InvalidEntry,
     DuplicateOrCyclicTable,
     MissingSegmentPage,
+    MappedGuardPage,
     ExtraTable,
     ExtraLeaf,
     MappingMismatch,
@@ -294,6 +334,38 @@ fn segment_for_page(segments: &[KernelSegment; 3], page: u64) -> Option<KernelSe
         .find(|segment| segment.contains(page))
 }
 
+fn is_ist_guard(ist: IstStackLayout, page: u64) -> bool {
+    ist.stacks().iter().any(|stack| stack.guard_page == page)
+}
+
+fn validate_ist_layout(
+    segments: &[KernelSegment; 3],
+    scratch_window_page: u64,
+    scratch_control_page: u64,
+    ist: IstStackLayout,
+) -> Result<(), InactiveGraphError<core::convert::Infallible>> {
+    let Some(writable) = segments
+        .iter()
+        .copied()
+        .find(|segment| segment.kind == SegmentKind::Writable)
+    else {
+        return Err(InactiveGraphError::InvalidSegmentLayout);
+    };
+    if !ist.has_exact_shape()
+        || ist.stacks().iter().any(|stack| {
+            !writable.contains(stack.guard_page)
+                || stack.top > writable.end
+                || stack.guard_page == scratch_window_page
+                || stack.guard_page == scratch_control_page
+                || (scratch_window_page >= stack.bottom && scratch_window_page < stack.top)
+                || (scratch_control_page >= stack.bottom && scratch_control_page < stack.top)
+        })
+    {
+        return Err(InactiveGraphError::InvalidSegmentLayout);
+    }
+    Ok(())
+}
+
 fn subtree_is_required(
     virtual_prefix: u64,
     child_level: u8,
@@ -313,6 +385,7 @@ fn subtree_is_required(
 fn validate_segment_layout(
     segments: &[KernelSegment; 3],
     scratch: DeepScratchBinding,
+    ist: IstStackLayout,
 ) -> Result<(), InactiveGraphError<core::convert::Infallible>> {
     let scratch_page = scratch.window_page;
     if scratch_page & ADDRESS_OFFSET_MASK != 0
@@ -332,7 +405,7 @@ fn validate_segment_layout(
     {
         return Err(InactiveGraphError::InvalidSegmentLayout);
     }
-    Ok(())
+    validate_ist_layout(segments, scratch.window_page, scratch.control_page, ist)
 }
 
 fn read_entry<A: ActivationGraphAccess>(
@@ -349,19 +422,26 @@ fn read_entry<A: ActivationGraphAccess>(
     .map_err(InactiveGraphError::Access)
 }
 
-fn resolve_leaf<A: ActivationGraphAccess>(
+fn resolve_optional_leaf<A: ActivationGraphAccess>(
     access: &mut A,
     transition: bool,
     root: FrameAddress,
     page: u64,
     capabilities: PagingCapabilities,
-) -> Result<u64, InactiveGraphError<A::Error>> {
+) -> Result<Option<u64>, InactiveGraphError<A::Error>> {
     let mut table = root;
     for level in (0..=3).rev() {
         let index = ((page >> (12 + level * 9)) & 0x1ff) as usize;
         let entry = read_entry(access, transition, table, index)?;
         if entry & PRESENT == 0 {
-            return Err(InactiveGraphError::MissingSegmentPage);
+            if entry != 0 {
+                return Err(InactiveGraphError::InvalidEntry);
+            }
+            return if level == 0 {
+                Ok(None)
+            } else {
+                Err(InactiveGraphError::MissingSegmentPage)
+            };
         }
         table = validate_present_entry(entry, capabilities, level == 0)
             .map_err(|_| InactiveGraphError::InvalidEntry)?;
@@ -371,10 +451,21 @@ fn resolve_leaf<A: ActivationGraphAccess>(
             return Err(InactiveGraphError::InvalidEntry);
         }
         if level == 0 {
-            return Ok(entry);
+            return Ok(Some(entry));
         }
     }
     unreachable!("four-level walk always returns at the leaf")
+}
+
+fn resolve_leaf<A: ActivationGraphAccess>(
+    access: &mut A,
+    transition: bool,
+    root: FrameAddress,
+    page: u64,
+    capabilities: PagingCapabilities,
+) -> Result<u64, InactiveGraphError<A::Error>> {
+    resolve_optional_leaf(access, transition, root, page, capabilities)?
+        .ok_or(InactiveGraphError::MissingSegmentPage)
 }
 
 fn validate_scratch_path<A: ActivationGraphAccess>(
@@ -458,11 +549,12 @@ fn validate_inactive_graph_with_workspace<
     transition_root: FrameAddress,
     scratch: DeepScratchBinding,
     segments: &[KernelSegment; 3],
+    ist: IstStackLayout,
     capabilities: PagingCapabilities,
     pending: &mut [Option<PendingTable>; MAX_DEEP_TABLE_FRAMES],
     visited: &mut [u64; MAX_DEEP_TABLE_FRAMES],
 ) -> Result<(), InactiveGraphError<A::Error>> {
-    validate_segment_layout(segments, scratch).map_err(|error| match error {
+    validate_segment_layout(segments, scratch, ist).map_err(|error| match error {
         InactiveGraphError::InvalidSegmentLayout => InactiveGraphError::InvalidSegmentLayout,
         _ => unreachable!("layout validation has one error"),
     })?;
@@ -516,6 +608,9 @@ fn validate_inactive_graph_with_workspace<
                         return Err(InactiveGraphError::InvalidScratchPath);
                     }
                 } else {
+                    if is_ist_guard(ist, virtual_page) {
+                        return Err(InactiveGraphError::MappedGuardPage);
+                    }
                     let segment = segment_for_page(segments, virtual_page)
                         .ok_or(InactiveGraphError::ExtraLeaf)?;
                     if entry & !physical_mask(capabilities) & !HARDWARE_MUTABLE
@@ -561,24 +656,33 @@ fn validate_inactive_graph_with_workspace<
         let mut page = segment.start;
         while page < segment.end {
             let transition = resolve_leaf(access, true, transition_root, page, capabilities)?;
-            let inactive = resolve_leaf(
+            let expected = segment.expected_flags();
+            if transition & !physical_mask(capabilities) & !HARDWARE_MUTABLE != expected {
+                return Err(InactiveGraphError::MappingMismatch);
+            }
+            let transition_physical = transition & physical_mask(capabilities);
+            kernel_roles
+                .validate_kernel_page(transition_physical, segment.frame_role())
+                .map_err(InactiveGraphError::FrameRole)?;
+            let inactive = resolve_optional_leaf(
                 access,
                 false,
                 root_frame(root, capabilities)?,
                 page,
                 capabilities,
             )?;
-            let expected = segment.expected_flags();
-            if transition & !physical_mask(capabilities) & !HARDWARE_MUTABLE != expected
-                || inactive & !physical_mask(capabilities) & !HARDWARE_MUTABLE != expected
-                || transition & physical_mask(capabilities)
-                    != inactive & physical_mask(capabilities)
-            {
-                return Err(InactiveGraphError::MappingMismatch);
+            if is_ist_guard(ist, page) {
+                if inactive.is_some() {
+                    return Err(InactiveGraphError::MappedGuardPage);
+                }
+            } else {
+                let inactive = inactive.ok_or(InactiveGraphError::MissingSegmentPage)?;
+                if inactive & !physical_mask(capabilities) & !HARDWARE_MUTABLE != expected
+                    || inactive & physical_mask(capabilities) != transition_physical
+                {
+                    return Err(InactiveGraphError::MappingMismatch);
+                }
             }
-            kernel_roles
-                .validate_kernel_page(inactive & physical_mask(capabilities), segment.frame_role())
-                .map_err(InactiveGraphError::FrameRole)?;
             page += PAGE_SIZE;
         }
     }
@@ -603,6 +707,7 @@ fn validate_inactive_graph<
     transition_root: FrameAddress,
     scratch: DeepScratchBinding,
     segments: &[KernelSegment; 3],
+    ist: IstStackLayout,
     capabilities: PagingCapabilities,
 ) -> Result<(), InactiveGraphError<A::Error>> {
     let mut pending = [None; MAX_DEEP_TABLE_FRAMES];
@@ -615,6 +720,7 @@ fn validate_inactive_graph<
         transition_root,
         scratch,
         segments,
+        ist,
         capabilities,
         &mut pending,
         &mut visited,
@@ -1372,8 +1478,18 @@ fn build_and_bind_deep_root<'a, const RANGE_CAPACITY: usize, const ROLE_CAPACITY
     let result = (|| {
         let segments =
             live_kernel_segments().map_err(|_| DeepRootBuildError::InvalidKernelLayout)?;
+        let ist = crate::arch::x86_64::linked_ist_stack_layout()
+            .map_err(|_| DeepRootBuildError::InvalidKernelLayout)?;
         let capabilities = mapper.capabilities();
-        if mapper.temporary_virtual_address() & ADDRESS_OFFSET_MASK != 0 {
+        let window_page = mapper.temporary_virtual_address();
+        let control_page = window_page
+            .checked_add(PAGE_SIZE)
+            .ok_or(DeepRootBuildError::InvalidKernelLayout)?;
+        if window_page & ADDRESS_OFFSET_MASK != 0
+            || ((window_page >> 12) & 0x1ff) == 0x1ff
+            || window_page >> 21 != control_page >> 21
+            || validate_ist_layout(&segments, window_page, control_page, ist).is_err()
+        {
             return Err(DeepRootBuildError::InvalidKernelLayout);
         }
         let declarations =
@@ -1401,6 +1517,29 @@ fn build_and_bind_deep_root<'a, const RANGE_CAPACITY: usize, const ROLE_CAPACITY
         for segment in segments {
             let mut page = segment.start;
             while page < segment.end {
+                if is_ist_guard(ist, page) {
+                    let guard_pt = ensure_leaf_table(
+                        &mut mapper,
+                        roles,
+                        owner,
+                        root_identity,
+                        page,
+                        edges,
+                        &mut edge_count,
+                    )?;
+                    let guard_index = ((page >> 12) & 0x1ff) as usize;
+                    if mapper
+                        .read_owned_table_entry(roles, guard_pt, guard_index)
+                        .map_err(|_| DeepRootBuildError::Transition)?
+                        != 0
+                    {
+                        return Err(DeepRootBuildError::MappingMismatch);
+                    }
+                    page = page
+                        .checked_add(PAGE_SIZE)
+                        .ok_or(DeepRootBuildError::InvalidKernelLayout)?;
+                    continue;
+                }
                 let transition_leaf = mapper
                     .resolve_transition_leaf(page)
                     .map_err(|_| DeepRootBuildError::Transition)?;
@@ -1428,13 +1567,6 @@ fn build_and_bind_deep_root<'a, const RANGE_CAPACITY: usize, const ROLE_CAPACITY
             }
         }
 
-        let window_page = mapper.temporary_virtual_address();
-        let control_page = window_page
-            .checked_add(PAGE_SIZE)
-            .ok_or(DeepRootBuildError::InvalidKernelLayout)?;
-        if ((window_page >> 12) & 0x1ff) == 0x1ff || window_page >> 21 != control_page >> 21 {
-            return Err(DeepRootBuildError::InvalidKernelLayout);
-        }
         let scratch_pt = ensure_leaf_table(
             &mut mapper,
             roles,
@@ -1619,6 +1751,8 @@ fn validate_execution_carriers(
         tss_limit: descriptors.tss_limit,
         code_selector: crate::arch::x86_64::gdt::KERNEL_CODE_SELECTOR.bits(),
         task_register: crate::arch::x86_64::gdt::KERNEL_TSS_SELECTOR.bits(),
+        ist: descriptors.ist,
+        installed_ist_tops: descriptors.installed_ist_tops,
     };
     if !execution_carriers_match(cpu, segments, facts) {
         return Err(LiveActivationError::WrongControlState);
@@ -1644,10 +1778,27 @@ fn live_boot_stack_bounds() -> Result<(u64, u64), LiveActivationError> {
     Ok((bottom, top))
 }
 
-fn range_is_retained_writable(writable: KernelSegment, start: u64, inclusive_limit: u16) -> bool {
+fn range_avoids_ist_guards(ist: IstStackLayout, start: u64, end: u64) -> bool {
+    start < end
+        && ist.stacks().iter().all(|stack| {
+            let guard_end = stack.guard_page + PAGE_SIZE;
+            end <= stack.guard_page || start >= guard_end
+        })
+}
+
+fn range_is_retained_writable(
+    writable: KernelSegment,
+    ist: IstStackLayout,
+    start: u64,
+    inclusive_limit: u16,
+) -> bool {
     start
         .checked_add(u64::from(inclusive_limit) + 1)
-        .is_some_and(|end| start >= writable.start && end <= writable.end && start < end)
+        .is_some_and(|end| {
+            start >= writable.start
+                && end <= writable.end
+                && range_avoids_ist_guards(ist, start, end)
+        })
 }
 
 fn execution_carriers_match(
@@ -1665,17 +1816,30 @@ fn execution_carriers_match(
         .stack_pointer
         .checked_sub(MIN_ACTIVATION_STACK_HEADROOM)
         .is_some_and(|lowest_push| lowest_push >= facts.stack_bottom)
-        && cpu.stack_pointer <= facts.stack_top;
+        && cpu.stack_pointer <= facts.stack_top
+        && range_avoids_ist_guards(facts.ist, facts.stack_bottom, facts.stack_top);
+    let ist_stacks = facts.ist.stacks();
+    let ist_tops_match =
+        facts.installed_ist_tops == [ist_stacks[0].top, ist_stacks[1].top, ist_stacks[2].top];
+    let ist_stacks_retained = ist_stacks.iter().all(|stack| {
+        stack.bottom >= writable.start
+            && stack.top <= writable.end
+            && stack.bottom < stack.top
+            && range_avoids_ist_guards(facts.ist, stack.bottom, stack.top)
+    });
     stack_has_headroom
+        && facts.ist.has_exact_shape()
+        && ist_tops_match
+        && ist_stacks_retained
         && cpu.code_selector == facts.code_selector
         && cpu.gdt_base == facts.gdt_base
         && cpu.gdt_limit == facts.gdt_limit
         && cpu.idt_base == facts.idt_base
         && cpu.idt_limit == facts.idt_limit
         && cpu.task_register == facts.task_register
-        && range_is_retained_writable(*writable, facts.gdt_base, facts.gdt_limit)
-        && range_is_retained_writable(*writable, facts.idt_base, facts.idt_limit)
-        && range_is_retained_writable(*writable, facts.tss_base, facts.tss_limit)
+        && range_is_retained_writable(*writable, facts.ist, facts.gdt_base, facts.gdt_limit)
+        && range_is_retained_writable(*writable, facts.ist, facts.idt_base, facts.idt_limit)
+        && range_is_retained_writable(*writable, facts.ist, facts.tss_base, facts.tss_limit)
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -1747,6 +1911,8 @@ unsafe impl<'a, 'handoff, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
             .as_ref()
             .ok_or(LiveActivationError::WrongControlState)?;
         let segments = live_kernel_segments()?;
+        let ist = crate::arch::x86_64::linked_ist_stack_layout()
+            .map_err(|_| LiveActivationError::InvalidKernelLayout)?;
         let carrier_cpu = unsafe { observe_activation_cpu(handoff.capabilities()) }?;
         validate_live_observation(carrier_cpu, handoff)?;
         validate_execution_carriers(carrier_cpu, &segments)?;
@@ -1762,6 +1928,7 @@ unsafe impl<'a, 'handoff, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
             transition_root,
             self.scratch,
             &segments,
+            ist,
             capabilities,
             graph_pending,
             graph_visited,
@@ -1960,6 +2127,92 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     const TEST_REGION_START: u64 = 0x0000_0000_4000_0000;
     const TEST_REGION_PAGES: u64 = 16;
     const ALIAS_VALUE: u64 = 0x4457_3043_334d_454d;
+
+    fn guard_leaf_is_exact_zero(&mut self, virtual_address: u64) -> Result<bool, u32> {
+        let page = VirtualPage::new(virtual_address).map_err(|_| 0x00d0_u32)?;
+        let mut current = self.identity;
+        for level in (1..=3).rev() {
+            let entry = self
+                .scratch
+                .read_location(
+                    FrameAddress::new(current.physical_start(), self.root.physical_limit())
+                        .map_err(|_| 0x00d1_u32)?,
+                    page.index(level),
+                )
+                .map_err(|_| 0x00d2_u32)?;
+            if entry & !(physical_mask(self.root.capabilities) | HARDWARE_MUTABLE)
+                != PRESENT | WRITABLE
+            {
+                return Ok(false);
+            }
+            let child_level = match level {
+                3 => TableLevel::Pdpt,
+                2 => TableLevel::Pd,
+                1 => TableLevel::Pt,
+                _ => unreachable!(),
+            };
+            let child = self
+                .roles
+                .table_identity(
+                    self.identity.owner(),
+                    child_level,
+                    entry & physical_mask(self.root.capabilities),
+                )
+                .map_err(|_| 0x00d3_u32)?;
+            self.roles
+                .validate_table_child(current, child)
+                .map_err(|_| 0x00d4_u32)?;
+            current = child;
+        }
+        let entry = self
+            .scratch
+            .read_location(
+                FrameAddress::new(current.physical_start(), self.root.physical_limit())
+                    .map_err(|_| 0x00d5_u32)?,
+                page.index(0),
+            )
+            .map_err(|_| 0x00d6_u32)?;
+        Ok(entry == 0)
+    }
+
+    fn validate_live_ist_guard_layout(&mut self) -> Result<(), u32> {
+        let ist = crate::arch::x86_64::linked_ist_stack_layout().map_err(|_| 0x00e0_u32)?;
+        let mut payload_pages = 0_u8;
+        for stack in ist.stacks() {
+            if !self.guard_leaf_is_exact_zero(stack.guard_page)? {
+                return Err(0x00e1);
+            }
+            let first = self.walk_leaf(stack.bottom)?;
+            let mut page = stack.bottom;
+            while page < stack.top {
+                let walk = self.walk_leaf(page)?;
+                let offset = page.checked_sub(stack.bottom).ok_or(0x00e2_u32)?;
+                if walk.physical_start
+                    != first.physical_start.checked_add(offset).ok_or(0x00e3_u32)?
+                    || walk.user
+                    || !walk.writable
+                    || walk.executable
+                    || walk.entry & !physical_mask(self.root.capabilities) & !HARDWARE_MUTABLE
+                        != PRESENT | WRITABLE | NO_EXECUTE
+                    || self
+                        .roles
+                        .validate_kernel_image_page(
+                            walk.physical_start,
+                            KernelImageSegment::WritableData,
+                        )
+                        .is_err()
+                {
+                    return Err(0x00e4);
+                }
+                payload_pages = payload_pages.checked_add(1).ok_or(0x00e5_u32)?;
+                page = page.checked_add(PAGE_SIZE).ok_or(0x00e6_u32)?;
+            }
+        }
+        if payload_pages != 12 {
+            return Err(0x00e7);
+        }
+        Ok(())
+    }
 
     #[allow(
         unsafe_code,
@@ -2931,6 +3184,9 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             scratch: &mut self.target.scratch,
             _not_send_sync: core::marker::PhantomData,
         };
+        if let Err(detail) = authority.validate_live_ist_guard_layout() {
+            crate::test_support::complete_fail(detail)
+        }
         match test {
             test if test.is_memory_foundation() => authority.run_mapped_case(test),
             _ => crate::test_support::complete_fail(0x00ff),
@@ -3410,6 +3666,21 @@ mod tests {
         }
     }
 
+    fn test_ist_layout(guard_page: u64) -> IstStackLayout {
+        fn stack(guard_page: u64) -> IstStackBounds {
+            IstStackBounds {
+                guard_page,
+                bottom: guard_page + PAGE_SIZE,
+                top: guard_page + 5 * PAGE_SIZE,
+            }
+        }
+        IstStackLayout {
+            double_fault: stack(guard_page),
+            non_maskable_interrupt: stack(guard_page + 5 * PAGE_SIZE),
+            machine_check: stack(guard_page + 10 * PAGE_SIZE),
+        }
+    }
+
     const FIXTURE_TEXT: u64 = 0xffff_8000_0000_0000;
     const FIXTURE_RODATA: u64 = FIXTURE_TEXT + PAGE_SIZE;
     const FIXTURE_DATA: u64 = FIXTURE_RODATA + PAGE_SIZE;
@@ -3427,6 +3698,7 @@ mod tests {
         transition_tables: [u64; 4],
         capabilities: PagingCapabilities,
         segments: [KernelSegment; 3],
+        ist: IstStackLayout,
     }
 
     impl GraphFixture {
@@ -3447,6 +3719,7 @@ mod tests {
                     pt: self.scratch_pt,
                 },
                 &self.segments,
+                self.ist,
                 self.capabilities,
             )
         }
@@ -3457,6 +3730,7 @@ mod tests {
         reason = "synthetic host graph models typed page-table and kernel-image provenance"
     )]
     fn graph_fixture() -> GraphFixture {
+        let ist = test_ist_layout(FIXTURE_DATA + PAGE_SIZE);
         let segments = [
             KernelSegment {
                 start: FIXTURE_TEXT,
@@ -3470,7 +3744,7 @@ mod tests {
             },
             KernelSegment {
                 start: FIXTURE_DATA,
-                end: FIXTURE_DATA + PAGE_SIZE,
+                end: FIXTURE_DATA + 16 * PAGE_SIZE,
                 kind: SegmentKind::Writable,
             },
         ];
@@ -3502,7 +3776,6 @@ mod tests {
         for (page, physical, flags) in [
             (FIXTURE_TEXT, 0x20_0000, PRESENT),
             (FIXTURE_RODATA, 0x21_0000, PRESENT | NO_EXECUTE),
-            (FIXTURE_DATA, 0x22_0000, PRESENT | WRITABLE | NO_EXECUTE),
         ] {
             add_path(
                 &mut access.transition,
@@ -3511,6 +3784,20 @@ mod tests {
                 physical | flags,
             );
             add_path(&mut access.inactive, page, kernel_tables, physical | flags);
+        }
+        for offset in 0..16 {
+            let page = FIXTURE_DATA + offset * PAGE_SIZE;
+            let physical = 0x22_0000 + offset * PAGE_SIZE;
+            let flags = PRESENT | WRITABLE | NO_EXECUTE;
+            add_path(
+                &mut access.transition,
+                page,
+                transition_tables,
+                physical | flags,
+            );
+            if !is_ist_guard(ist, page) {
+                add_path(&mut access.inactive, page, kernel_tables, physical | flags);
+            }
         }
         add_path(&mut access.inactive, FIXTURE_SCRATCH, scratch_tables, 0);
         access.inactive.insert(
@@ -3531,7 +3818,7 @@ mod tests {
                     KernelImageSegment::ReadOnlyData,
                 ),
                 (
-                    PhysicalRange::new(0x22_0000, PAGE_SIZE).unwrap(),
+                    PhysicalRange::new(0x22_0000, 16 * PAGE_SIZE).unwrap(),
                     KernelImageSegment::WritableData,
                 ),
             ])
@@ -3549,6 +3836,7 @@ mod tests {
             transition_tables,
             capabilities,
             segments,
+            ist,
         }
     }
 
@@ -3646,6 +3934,144 @@ mod tests {
             0x23_0000 | PRESENT,
         );
         assert_eq!(fixture.validate(), Err(InactiveGraphError::MappingMismatch));
+    }
+
+    #[test]
+    fn graph_rejects_each_present_ist_guard_leaf() {
+        for guard_index in 0..3 {
+            let mut fixture = graph_fixture();
+            let guard = fixture.ist.stacks()[guard_index].guard_page;
+            let physical = 0x22_0000 + (guard - FIXTURE_DATA);
+            fixture.access.inactive.insert(
+                (fixture.kernel_tables[3], page_index(guard, 0)),
+                physical | PRESENT | WRITABLE | NO_EXECUTE,
+            );
+            assert_eq!(
+                fixture.validate(),
+                Err(InactiveGraphError::MappedGuardPage),
+                "guard {guard_index} must remain absent"
+            );
+        }
+    }
+
+    #[test]
+    fn graph_rejects_missing_ist_usable_page_and_fourth_hole() {
+        let mut missing_usable = graph_fixture();
+        let usable = missing_usable.ist.double_fault.bottom;
+        missing_usable
+            .access
+            .inactive
+            .remove(&(missing_usable.kernel_tables[3], page_index(usable, 0)));
+        assert_eq!(
+            missing_usable.validate(),
+            Err(InactiveGraphError::MissingSegmentPage)
+        );
+
+        let mut fourth_hole = graph_fixture();
+        fourth_hole
+            .access
+            .inactive
+            .remove(&(fourth_hole.kernel_tables[3], page_index(FIXTURE_DATA, 0)));
+        assert_eq!(
+            fourth_hole.validate(),
+            Err(InactiveGraphError::MissingSegmentPage)
+        );
+    }
+
+    #[test]
+    fn graph_rejects_ist_usable_permission_drift() {
+        let mut fixture = graph_fixture();
+        let usable = fixture.ist.non_maskable_interrupt.bottom;
+        let physical = 0x22_0000 + (usable - FIXTURE_DATA);
+        fixture.access.inactive.insert(
+            (fixture.kernel_tables[3], page_index(usable, 0)),
+            physical | PRESENT | NO_EXECUTE,
+        );
+        assert_eq!(fixture.validate(), Err(InactiveGraphError::InvalidEntry));
+    }
+
+    #[test]
+    fn graph_rejects_ist_usable_physical_drift() {
+        let mut fixture = graph_fixture();
+        let usable = fixture.ist.machine_check.bottom;
+        let physical = 0x22_0000 + (usable - FIXTURE_DATA) + PAGE_SIZE;
+        fixture.access.inactive.insert(
+            (fixture.kernel_tables[3], page_index(usable, 0)),
+            physical | PRESENT | WRITABLE | NO_EXECUTE,
+        );
+        assert_eq!(fixture.validate(), Err(InactiveGraphError::MappingMismatch));
+    }
+
+    #[test]
+    fn graph_rejects_transition_ist_frame_without_the_exact_kernel_role() {
+        let mut fixture = graph_fixture();
+        let usable = fixture.ist.double_fault.bottom;
+        fixture.access.transition.insert(
+            (fixture.transition_tables[3], page_index(usable, 0)),
+            0x40_0000 | PRESENT | WRITABLE | NO_EXECUTE,
+        );
+        assert_eq!(
+            fixture.validate(),
+            Err(InactiveGraphError::FrameRole(FrameRoleError::WrongRole))
+        );
+    }
+
+    #[test]
+    fn ist_layout_rejects_malformed_or_conflicting_ranges() {
+        let fixture = graph_fixture();
+        assert_eq!(
+            validate_ist_layout(
+                &fixture.segments,
+                FIXTURE_SCRATCH,
+                FIXTURE_SCRATCH + PAGE_SIZE,
+                fixture.ist,
+            ),
+            Ok(())
+        );
+
+        let mut shortened = fixture.ist;
+        shortened.non_maskable_interrupt.top -= PAGE_SIZE;
+        assert_eq!(
+            validate_ist_layout(
+                &fixture.segments,
+                FIXTURE_SCRATCH,
+                FIXTURE_SCRATCH + PAGE_SIZE,
+                shortened,
+            ),
+            Err(InactiveGraphError::InvalidSegmentLayout)
+        );
+
+        let outside = test_ist_layout(FIXTURE_SCRATCH);
+        assert_eq!(
+            validate_ist_layout(
+                &fixture.segments,
+                FIXTURE_SCRATCH,
+                FIXTURE_SCRATCH + PAGE_SIZE,
+                outside,
+            ),
+            Err(InactiveGraphError::InvalidSegmentLayout)
+        );
+    }
+
+    #[test]
+    fn guard_leaf_absence_rejects_a_missing_parent_path() {
+        let fixture = graph_fixture();
+        let mut access = FakeGraphAccess::default();
+        let root = FrameAddress::new(
+            fixture.root.physical_start(),
+            fixture.capabilities.physical_limit(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_optional_leaf(
+                &mut access,
+                false,
+                root,
+                fixture.ist.double_fault.guard_page,
+                fixture.capabilities,
+            ),
+            Err(InactiveGraphError::MissingSegmentPage)
+        );
     }
 
     #[test]
@@ -3838,6 +4264,7 @@ mod tests {
                     pt: root,
                 },
                 &segments,
+                test_ist_layout(MID_TWO),
                 capabilities,
             ),
             Err(InactiveGraphError::Capacity)
@@ -3850,104 +4277,8 @@ mod tests {
         reason = "synthetic host role setup models completed physical zeroing"
     )]
     fn full_owned_graph_matches_transition_segments_and_empty_scratch() {
-        const TEXT: u64 = 0xffff_8000_0000_0000;
-        const RODATA: u64 = TEXT + PAGE_SIZE;
-        const DATA: u64 = RODATA + PAGE_SIZE;
-        const SCRATCH: u64 = 0xffff_ff00_0000_0000;
-        let segments = [
-            KernelSegment {
-                start: TEXT,
-                end: RODATA,
-                kind: SegmentKind::Text,
-            },
-            KernelSegment {
-                start: RODATA,
-                end: DATA,
-                kind: SegmentKind::ReadOnly,
-            },
-            KernelSegment {
-                start: DATA,
-                end: DATA + PAGE_SIZE,
-                kind: SegmentKind::Writable,
-            },
-        ];
-        let capabilities = PagingCapabilities::validate(40, true, true, true).unwrap();
-        let mut roles = synthetic_frame_role_manager::<1, 16>(0x8000, 7);
-        let owner = roles.create_table_owner().unwrap();
-        let root = commit_table(&mut roles, owner, TableLevel::Pml4, None);
-        let kernel_pdpt = commit_table(&mut roles, owner, TableLevel::Pdpt, Some(root));
-        let kernel_pd = commit_table(&mut roles, owner, TableLevel::Pd, Some(kernel_pdpt));
-        let kernel_pt = commit_table(&mut roles, owner, TableLevel::Pt, Some(kernel_pd));
-        let scratch_pdpt = commit_table(&mut roles, owner, TableLevel::Pdpt, Some(root));
-        let scratch_pd = commit_table(&mut roles, owner, TableLevel::Pd, Some(scratch_pdpt));
-        let scratch_pt = commit_table(&mut roles, owner, TableLevel::Pt, Some(scratch_pd));
-        let new_kernel = [
-            root.physical_start(),
-            kernel_pdpt.physical_start(),
-            kernel_pd.physical_start(),
-            kernel_pt.physical_start(),
-        ];
-        let new_scratch = [
-            root.physical_start(),
-            scratch_pdpt.physical_start(),
-            scratch_pd.physical_start(),
-            scratch_pt.physical_start(),
-        ];
-        let old = [0x1000, 0x2000, 0x3000, 0x4000];
-        let mut access = FakeGraphAccess::default();
-        for (page, physical, flags) in [
-            (TEXT, 0x20_0000, PRESENT),
-            (RODATA, 0x21_0000, PRESENT | NO_EXECUTE),
-            (DATA, 0x22_0000, PRESENT | WRITABLE | NO_EXECUTE),
-        ] {
-            add_path(&mut access.transition, page, old, physical | flags);
-            add_path(&mut access.inactive, page, new_kernel, physical | flags);
-        }
-        // SAFETY: the synthetic fixture supplies disjoint, page-exact boot
-        // provenance solely to exercise C2 role authentication.
-        let staged = unsafe {
-            roles.stage_kernel_image_roles([
-                (
-                    PhysicalRange::new(0x20_0000, PAGE_SIZE).unwrap(),
-                    KernelImageSegment::Text,
-                ),
-                (
-                    PhysicalRange::new(0x21_0000, PAGE_SIZE).unwrap(),
-                    KernelImageSegment::ReadOnlyData,
-                ),
-                (
-                    PhysicalRange::new(0x22_0000, PAGE_SIZE).unwrap(),
-                    KernelImageSegment::WritableData,
-                ),
-            ])
-        }
-        .unwrap();
-        add_path(&mut access.inactive, SCRATCH, new_scratch, 0);
-        access.inactive.insert(
-            (
-                scratch_pt.physical_start(),
-                page_index(SCRATCH + PAGE_SIZE, 0),
-            ),
-            scratch_pt.physical_start() | PRESENT | WRITABLE | NO_EXECUTE,
-        );
-
-        assert_eq!(
-            validate_inactive_graph(
-                &mut access,
-                &roles,
-                &staged,
-                root,
-                FrameAddress::new(old[0], capabilities.physical_limit()).unwrap(),
-                DeepScratchBinding {
-                    window_page: SCRATCH,
-                    control_page: SCRATCH + PAGE_SIZE,
-                    pt: scratch_pt,
-                },
-                &segments,
-                capabilities,
-            ),
-            Ok(())
-        );
+        let mut fixture = graph_fixture();
+        assert_eq!(fixture.validate(), Ok(()));
     }
 
     #[test]
@@ -4128,10 +4459,12 @@ mod tests {
             },
             KernelSegment {
                 start: 0xffff_8000_0000_2000,
-                end: 0xffff_8000_0000_6000,
+                end: 0xffff_8000_0002_0000,
                 kind: SegmentKind::Writable,
             },
         ];
+        let ist = test_ist_layout(0xffff_8000_0000_8000);
+        let ist_stacks = ist.stacks();
         let facts = ExecutionCarrierFacts {
             stack_bottom: 0xffff_8000_0000_4000,
             stack_top: 0xffff_8000_0000_6000,
@@ -4143,6 +4476,8 @@ mod tests {
             tss_limit: 0x0067,
             code_selector: 0x08,
             task_register: 0x18,
+            ist,
+            installed_ist_tops: [ist_stacks[0].top, ist_stacks[1].top, ist_stacks[2].top],
         };
         assert!(execution_carriers_match(cpu, &segments, facts));
 
@@ -4165,8 +4500,17 @@ mod tests {
         assert!(!execution_carriers_match(cpu, &segments, facts));
 
         cpu.task_register = facts.task_register;
+        let wrong_ist_top = ExecutionCarrierFacts {
+            installed_ist_tops: [
+                facts.installed_ist_tops[0] - PAGE_SIZE,
+                facts.installed_ist_tops[1],
+                facts.installed_ist_tops[2],
+            ],
+            ..facts
+        };
+        assert!(!execution_carriers_match(cpu, &segments, wrong_ist_top));
         let crossing_idt = ExecutionCarrierFacts {
-            idt_base: 0xffff_8000_0000_5800,
+            idt_base: ist.double_fault.guard_page,
             ..facts
         };
         cpu.idt_base = crossing_idt.idt_base;

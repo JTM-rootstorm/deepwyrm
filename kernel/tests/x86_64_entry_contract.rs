@@ -2,6 +2,7 @@
 #[path = "../build.rs"]
 mod kernel_build;
 
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
@@ -411,12 +412,78 @@ dw_test_bss_probe:
         "dw_x86_64_apic_spurious_entry",
         "dw_x86_64_exception_dispatch",
         "dw_x86_64_terminal_interrupt_dispatch",
+        "__dw_ist_region_start",
+        "__dw_ist_region_end",
+        "__dw_double_fault_ist_guard",
+        "__dw_double_fault_ist_bottom",
+        "__dw_double_fault_ist_top",
+        "__dw_nmi_ist_guard",
+        "__dw_nmi_ist_bottom",
+        "__dw_nmi_ist_top",
+        "__dw_machine_check_ist_guard",
+        "__dw_machine_check_ist_bottom",
+        "__dw_machine_check_ist_top",
     ] {
         assert!(
             symbols.lines().any(|line| line.ends_with(symbol)),
             "missing retained symbol `{symbol}`"
         );
     }
+
+    let symbol_addresses = symbols
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let address = u64::from_str_radix(fields.next()?, 16).ok()?;
+            let _kind = fields.next()?;
+            let name = fields.next()?;
+            Some((name, address))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let address = |name: &str| {
+        *symbol_addresses
+            .get(name)
+            .unwrap_or_else(|| panic!("missing address for `{name}`"))
+    };
+    let page = layout.base_page_size;
+    let stacks = [
+        (
+            "__dw_double_fault_ist_guard",
+            "__dw_double_fault_ist_bottom",
+            "__dw_double_fault_ist_top",
+        ),
+        (
+            "__dw_nmi_ist_guard",
+            "__dw_nmi_ist_bottom",
+            "__dw_nmi_ist_top",
+        ),
+        (
+            "__dw_machine_check_ist_guard",
+            "__dw_machine_check_ist_bottom",
+            "__dw_machine_check_ist_top",
+        ),
+    ];
+    for (guard, bottom, top) in stacks {
+        assert_eq!(address(guard) % page, 0, "{guard} alignment");
+        assert_eq!(address(bottom) - address(guard), page, "{guard} extent");
+        assert_eq!(address(top) - address(bottom), 4 * page, "{top} extent");
+    }
+    assert_eq!(
+        address("__dw_ist_region_start"),
+        address("__dw_double_fault_ist_guard")
+    );
+    assert_eq!(
+        address("__dw_double_fault_ist_top"),
+        address("__dw_nmi_ist_guard")
+    );
+    assert_eq!(
+        address("__dw_nmi_ist_top"),
+        address("__dw_machine_check_ist_guard")
+    );
+    assert_eq!(
+        address("__dw_ist_region_end") - address("__dw_ist_region_start"),
+        15 * page
+    );
 }
 
 fn validate_elf(bytes: &[u8], layout: kernel_build::Layout) {

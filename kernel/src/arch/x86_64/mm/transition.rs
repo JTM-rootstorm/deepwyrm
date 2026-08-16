@@ -1904,6 +1904,8 @@ pub(crate) use activation::{
     ActivationCpuState, ActivationPrepareError, ActiveDeepPaging, Cr3ActivationTarget,
     InactiveRootAuthority, PreparedActivation,
 };
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) use activation::{IstStackBounds, IstStackLayout};
 pub(crate) use private::claim_live_transition_mapper;
 #[allow(
     unused_imports,

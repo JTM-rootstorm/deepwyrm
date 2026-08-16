@@ -14,6 +14,9 @@ pub mod idt;
 pub mod mm;
 pub mod tss;
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+use mm::transition::{IstStackBounds, IstStackLayout};
+
 #[cfg(test)]
 mod bootstrap_cpu_policy_tests {
     const CR4_SMAP: u64 = 1 << 21;
@@ -39,6 +42,8 @@ mod bootstrap_cpu_policy_tests {
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+use crate::memory::physical::BASE_PAGE_SIZE;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 use core::cell::UnsafeCell;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 use core::mem::MaybeUninit;
@@ -55,7 +60,7 @@ use idt::{EarlyIdtHandlers, ExceptionHandlerTable, HandlerAddress, InterruptDesc
 use tss::{InterruptStackIndex, TaskStateSegment};
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-const EMERGENCY_IST_STACK_BYTES: usize = 16 * 1024;
+const IST_GUARD_BYTES: u64 = BASE_PAGE_SIZE;
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 const INSTALL_UNSTARTED: u8 = 0;
@@ -88,35 +93,6 @@ impl<T> EarlyStorage<T> {
 )]
 unsafe impl<T> Sync for EarlyStorage<T> {}
 
-/// A bounded, separately aligned interrupt stack. Guard pages are deferred to
-/// DW0-C because the transition CR3 covers PT_LOAD memory but establishes no
-/// independent guard-page mapping policy yet.
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
-#[repr(align(4096))]
-struct EmergencyIstStack {
-    bytes: UnsafeCell<[u8; EMERGENCY_IST_STACK_BYTES]>,
-}
-
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
-impl EmergencyIstStack {
-    const fn new() -> Self {
-        Self {
-            bytes: UnsafeCell::new([0; EMERGENCY_IST_STACK_BYTES]),
-        }
-    }
-
-    fn top(&'static self) -> u64 {
-        self.bytes.get() as u64 + EMERGENCY_IST_STACK_BYTES as u64
-    }
-}
-
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
-#[allow(
-    unsafe_code,
-    reason = "each static IST stack has one designated TSS slot and no shared Rust references"
-)]
-unsafe impl Sync for EmergencyIstStack {}
-
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 static INSTALL_STATE: AtomicU8 = AtomicU8::new(INSTALL_UNSTARTED);
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -128,12 +104,6 @@ static EMERGENCY_IDT: EarlyStorage<InterruptDescriptorTable> = EarlyStorage::uni
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 static FINAL_IDT: EarlyStorage<InterruptDescriptorTable> = EarlyStorage::uninit();
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-static DOUBLE_FAULT_IST: EmergencyIstStack = EmergencyIstStack::new();
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
-static NMI_IST: EmergencyIstStack = EmergencyIstStack::new();
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
-static MACHINE_CHECK_IST: EmergencyIstStack = EmergencyIstStack::new();
-
 /// Exact static descriptor objects retained by the first Deep-owned root.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[derive(Clone, Copy)]
@@ -144,13 +114,28 @@ pub(crate) struct EarlyDescriptorAddresses {
     pub(crate) idt_limit: u16,
     pub(crate) tss: u64,
     pub(crate) tss_limit: u16,
+    pub(crate) ist: IstStackLayout,
+    pub(crate) installed_ist_tops: [u64; 3],
 }
 
 /// Returns the installed one-shot descriptor object addresses without
 /// exposing mutation authority over their static storage.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "the published installed state makes the one-shot TSS and final IDT immutable"
+)]
 pub(crate) fn early_descriptor_addresses() -> Option<EarlyDescriptorAddresses> {
     if INSTALL_STATE.load(Ordering::Acquire) != INSTALLED {
+        return None;
+    }
+    let ist = linked_ist_stack_layout().ok()?;
+    // SAFETY: the installed state is published only after the complete TSS is
+    // written, and no later code mutates the one-shot descriptor object.
+    let tss = unsafe { &*(*TSS.value.get()).as_ptr() };
+    // SAFETY: the same published installed state makes the final IDT immutable.
+    let idt = unsafe { &*(*FINAL_IDT.value.get()).as_ptr() };
+    if !idt.has_exact_terminal_ist_assignment() {
         return None;
     }
     Some(EarlyDescriptorAddresses {
@@ -160,7 +145,64 @@ pub(crate) fn early_descriptor_addresses() -> Option<EarlyDescriptorAddresses> {
         idt_limit: (core::mem::size_of::<InterruptDescriptorTable>() - 1) as u16,
         tss: TSS.value.get() as u64,
         tss_limit: (core::mem::size_of::<TaskStateSegment>() - 1) as u16,
+        ist,
+        installed_ist_tops: [
+            tss.interrupt_stack(InterruptStackIndex::One),
+            tss.interrupt_stack(InterruptStackIndex::Two),
+            tss.interrupt_stack(InterruptStackIndex::Three),
+        ],
     })
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "linker-defined IST bounds are immutable kernel-layout facts"
+)]
+pub(crate) fn linked_ist_stack_layout() -> Result<IstStackLayout, EarlyDescriptorInstallError> {
+    unsafe extern "C" {
+        static __dw_ist_region_start: u8;
+        static __dw_ist_region_end: u8;
+        static __dw_double_fault_ist_guard: u8;
+        static __dw_double_fault_ist_bottom: u8;
+        static __dw_double_fault_ist_top: u8;
+        static __dw_nmi_ist_guard: u8;
+        static __dw_nmi_ist_bottom: u8;
+        static __dw_nmi_ist_top: u8;
+        static __dw_machine_check_ist_guard: u8;
+        static __dw_machine_check_ist_bottom: u8;
+        static __dw_machine_check_ist_top: u8;
+    }
+    let layout = IstStackLayout {
+        double_fault: IstStackBounds {
+            guard_page: core::ptr::addr_of!(__dw_double_fault_ist_guard) as u64,
+            bottom: core::ptr::addr_of!(__dw_double_fault_ist_bottom) as u64,
+            top: core::ptr::addr_of!(__dw_double_fault_ist_top) as u64,
+        },
+        non_maskable_interrupt: IstStackBounds {
+            guard_page: core::ptr::addr_of!(__dw_nmi_ist_guard) as u64,
+            bottom: core::ptr::addr_of!(__dw_nmi_ist_bottom) as u64,
+            top: core::ptr::addr_of!(__dw_nmi_ist_top) as u64,
+        },
+        machine_check: IstStackBounds {
+            guard_page: core::ptr::addr_of!(__dw_machine_check_ist_guard) as u64,
+            bottom: core::ptr::addr_of!(__dw_machine_check_ist_bottom) as u64,
+            top: core::ptr::addr_of!(__dw_machine_check_ist_top) as u64,
+        },
+    };
+    let region_start = core::ptr::addr_of!(__dw_ist_region_start) as u64;
+    let region_end = core::ptr::addr_of!(__dw_ist_region_end) as u64;
+    let stacks = layout.stacks();
+    let valid = layout.has_exact_shape()
+        && region_start == stacks[0].guard_page
+        && region_end == stacks[2].top
+        && region_end
+            .checked_sub(region_start)
+            .is_some_and(|bytes| bytes == 15 * IST_GUARD_BYTES);
+    if !valid {
+        return Err(EarlyDescriptorInstallError::InvalidEmergencyStack);
+    }
+    Ok(layout)
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -245,12 +287,13 @@ unsafe fn initialize_and_activate() -> Result<(), EarlyDescriptorInstallError> {
     // targets a retained terminal stub; this covers faults during GDT reset.
     unsafe { idt::activate(emergency_idt) };
 
+    let ist = linked_ist_stack_layout()?;
     let mut tss = TaskStateSegment::empty();
-    tss.set_interrupt_stack(InterruptStackIndex::One, DOUBLE_FAULT_IST.top())
+    tss.set_interrupt_stack(InterruptStackIndex::One, ist.double_fault.top)
         .map_err(|_| EarlyDescriptorInstallError::InvalidEmergencyStack)?;
-    tss.set_interrupt_stack(InterruptStackIndex::Two, NMI_IST.top())
+    tss.set_interrupt_stack(InterruptStackIndex::Two, ist.non_maskable_interrupt.top)
         .map_err(|_| EarlyDescriptorInstallError::InvalidEmergencyStack)?;
-    tss.set_interrupt_stack(InterruptStackIndex::Three, MACHINE_CHECK_IST.top())
+    tss.set_interrupt_stack(InterruptStackIndex::Three, ist.machine_check.top)
         .map_err(|_| EarlyDescriptorInstallError::InvalidEmergencyStack)?;
 
     // SAFETY: `INSTALL_STATE` excludes a second initializer. No reference is
