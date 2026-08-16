@@ -2,10 +2,16 @@
 
 ## Reviewed identity and method
 
-This manual intermediate-phase review covers Deepwyrm commit
-`0bc8e6667e27ebd6aa5e3d572f34b9a1dfddefc7`, including the raw x86_64 entry
-boundary, BootInfo intake, early diagnostics, descriptor and exception setup,
-APIC model, test-only completion transport, and host harness planning.
+This manual intermediate-phase review originally covered pre-signing Deepwyrm
+commit `0bc8e6667e27ebd6aa5e3d572f34b9a1dfddefc7`, including the raw x86_64
+entry boundary, BootInfo intake, early diagnostics, descriptor and exception
+setup, APIC model, test-only completion transport, and host harness planning.
+Its signed equivalent is `a194194016b10dce269f286950dfa90b27851217`; both commits
+have tree `5766bba49c27118f6fcf9a85f6edb9742a00f9a0` and preserve the author and
+complete commit message. Per Mike, no build, test, or artifact was rerun or
+regenerated after signing. The source-security disposition carries to the
+signed commit solely through exact tree equivalence; historical artifacts
+remain attributed to the pre-signing identity.
 
 Seven bounded implementation and review lanes examined architecture state,
 hostile handoff parsing, unsafe boundaries, descriptor and exception state,
@@ -99,7 +105,8 @@ and retain the observed exit status; parser success alone is not VM evidence.
 
 ## Disposition
 
-PASS for the DW0-B source-security gate at the reviewed revision. Functional
-phase acceptance still requires the coordinator-owned fresh QEMU capture gate
-against an exact Deepwyrm/Wyrmroot artifact pair. Any security-relevant change
-to the reviewed surfaces invalidates this disposition until re-review.
+PASS for the DW0-B source-security gate at the reviewed pre-signing revision
+and its exact same-tree signed equivalent. Functional phase acceptance still
+requires the coordinator-owned fresh QEMU capture gate against an exact
+Deepwyrm/Wyrmroot artifact pair. Any security-relevant tree change to the
+reviewed surfaces invalidates this disposition until re-review.

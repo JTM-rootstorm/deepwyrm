@@ -2,23 +2,38 @@
 
 ## Review state
 
-This record describes the DW0-C security surface through committed Deepwyrm
-revision `9c7d65d3df83ce44b2ce1f15c2ae88587f9b570b`. The final review used
-`gpt-daybreak-blue-latest` at high reasoning on 2026-08-16 against base
-`b263a7a912c79b9e7d4b2439370417d7ae2ee076` plus binary diff SHA-256
+This record describes the DW0-C security surface reviewed at pre-signing
+Deepwyrm revision `9c7d65d3df83ce44b2ce1f15c2ae88587f9b570b`, whose signed
+same-tree equivalent is `b424d7d89d9acc57ceff8d966c3931e26a51f614`. The final
+review used `gpt-daybreak-blue-latest` at high reasoning on 2026-08-16 against
+pre-signing base `b263a7a912c79b9e7d4b2439370417d7ae2ee076`, whose signed
+same-tree equivalent is `bd9da0bb8b5c867556eff7e3e29764f9fec706ab`, plus binary diff SHA-256
 `c634ed053fb6c3ae42205babea81b345c5096f94f1ef49170ee889aa3aa890bb`,
 which is exactly the source state committed as
 `9c7d65d3df83ce44b2ce1f15c2ae88587f9b570b`. Its disposition was C0/H0/M0/L0.
 
-The compatible Wyrmroot source/pin revision is
-`15fa42dda23834a80197161249738f001bb2d76f`; its evidence descendant is
-`89235c7feef2a89ef2882ee096428b456496fa39`. Wyrmroot's coordinator-supplied
-bounded guarded-IST acknowledgment review found no new Critical, High, Medium,
-or Low findings. Existing accepted Medium limitations remain recorded in
-Wyrmroot's `security/WYR0_B_SECURITY_REVIEW.md`; the bounded result is not an
-absolute zero-findings disposition. All source, host, freestanding-artifact,
-cross-repository pin/build-evidence, and source-security work attainable within
-the current DW0-C/WYR0-C scope is complete for this exact pair. Formal DW0-C
+The pre-signing compatible Wyrmroot source/pin revision
+`15fa42dda23834a80197161249738f001bb2d76f` and evidence descendant
+`89235c7feef2a89ef2882ee096428b456496fa39` have same-tree signed equivalents
+`ee1b899045a3294f140945e013ba42a60f57aa84` and
+`2b16b94818632f562a0551205d94e62bba847502`. The current live signed repin is
+`eaaba1491c2f45d4fbd8b02358989547e9a8d98a`; its signed no-rerun evidence
+descendant is `a8f12ba5e86db8b93f4be68f727d6cd65204c895`.
+
+Per Mike, no build, test, or artifact was rerun or regenerated after signing
+and repinning. The Deep source-security disposition carries to
+`b424d7d89d9acc57ceff8d966c3931e26a51f614` solely because it preserves tree
+`4053153adfaca4a3582d53768c2a6fc11572ee7f`; the reviewed pre-signing base and
+signed base both preserve tree `483f6255950320e75448d4d9a52829a9b906326b`.
+Historical artifact evidence remains attributed to the pre-signing identities.
+
+Wyrmroot's coordinator-supplied bounded guarded-IST acknowledgment review found
+no new Critical, High, Medium, or Low findings. Existing accepted Medium
+limitations remain recorded in Wyrmroot's `security/WYR0_B_SECURITY_REVIEW.md`;
+the bounded result is not an absolute zero-findings disposition. All source,
+host, freestanding-artifact, cross-repository pin/build-evidence, and source-
+security work attainable within the current DW0-C/WYR0-C scope is complete for
+the live signed pair on this no-rerun/tree-equivalence basis. Formal DW0-C
 closure still requires the canonical image and coordinator-owned guest
 execution. This record does not close the earlier pending DW0-B loader/guest
 execution gate.
@@ -131,17 +146,20 @@ The exact commands and observed artifact hashes are recorded in
   canonical ESP/image exists and they have not executed through the Wyrmroot
   loader. Functional phase acceptance requires the coordinator-owned fresh VM
   gate against the exact recorded revision pair and image identity.
-- The artifact hashes identify observed builds of the exact source state
-  committed as `9c7d65d3df83ce44b2ce1f15c2ae88587f9b570b`; the isolated scratch
-  artifacts were removed and are not retained release artifacts.
+- The artifact hashes identify observed pre-signing builds of exact source
+  state `9c7d65d3df83ce44b2ce1f15c2ae88587f9b570b`; the isolated scratch
+  artifacts were removed and are not retained release artifacts. They were not
+  regenerated or reattributed to the signed commit.
 
 ## Disposition
 
-The exact committed Deepwyrm source state has an attainable source-security
-PASS with C0/H0/M0/L0. The earlier adversarial C0/H0/M1/L0 result is retained
-as historical review provenance: its Medium finding identified an omitted live
-formatter-padding branch in both IST stack oracles. Commit
-`9c7d65d3df83ce44b2ce1f15c2ae88587f9b570b` resolves that finding with shared
+The reviewed pre-signing Deepwyrm source state and its exact same-tree signed
+equivalent `b424d7d89d9acc57ceff8d966c3931e26a51f614` have an attainable
+source-security PASS with C0/H0/M0/L0. The earlier adversarial C0/H0/M1/L0
+result is retained as historical review provenance: its Medium finding
+identified an omitted live formatter-padding branch in both IST stack oracles.
+Pre-signing commit `9c7d65d3df83ce44b2ce1f15c2ae88587f9b570b`, now signed as
+`b424d7d89d9acc57ceff8d966c3931e26a51f614`, resolves that finding with shared
 production/selector enumeration and a host regression; the final exact-diff
 re-review cleared it.
 

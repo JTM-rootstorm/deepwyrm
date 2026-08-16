@@ -2,10 +2,18 @@
 
 ## Current disposition
 
-The Deepwyrm DW0-B source, host, and freestanding build gates pass at revision
-`0bc8e6667e27ebd6aa5e3d572f34b9a1dfddefc7`. The coordinator-owned Q35/UEFI guest
-gate remains pending an exact Wyrmroot image and request manifest; therefore
-this record does not yet claim complete functional phase acceptance.
+The Deepwyrm DW0-B source, host, and freestanding build gates pass at signed
+revision `a194194016b10dce269f286950dfa90b27851217`. It is the same-tree signed
+equivalent of pre-signing revision
+`0bc8e6667e27ebd6aa5e3d572f34b9a1dfddefc7`; both commits have tree
+`5766bba49c27118f6fcf9a85f6edb9742a00f9a0`. Per Mike's publication
+instruction, no build, test, or artifact was rerun or regenerated after the
+signing rewrite. The evidence below remains attributed to the pre-signing
+commit and carries forward only through that exact tree equivalence.
+
+The coordinator-owned Q35/UEFI guest gate remains pending an exact Wyrmroot
+image and request manifest; therefore this record does not yet claim complete
+functional phase acceptance.
 
 ## Implemented scope
 
@@ -59,8 +67,9 @@ compiler path was passed through `DEEPWYRM_CLANG`.
 
 Two isolated builds of the production kernel and all three
 `x86_64-unknown-none` selector kernels were byte-identical. The durable local
-artifacts are under
-`artifacts/dw0-b/0bc8e6667e27ebd6aa5e3d572f34b9a1dfddefc7/`.
+artifacts remain under the historical pre-signing path
+`artifacts/dw0-b/0bc8e6667e27ebd6aa5e3d572f34b9a1dfddefc7/`. They were not
+reattributed, rebuilt, moved, or regenerated for the signed commit.
 
 ## Kernel artifact evidence
 

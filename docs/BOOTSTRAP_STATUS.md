@@ -7,25 +7,34 @@ planning documents.
 
 Phase DW0-A passed its host-only ABI layout gate at revision
 `37338e8d44c08ef039eb34a01292a6b6cb5cac3a`. DW0-B source and freestanding build
-gates passed at `0bc8e6667e27ebd6aa5e3d572f34b9a1dfddefc7`, while its exact
-Wyrmroot/Q35 execution gate remains pending. The detailed records are
+gates pass at signed same-tree revision
+`a194194016b10dce269f286950dfa90b27851217`; their historical evidence was
+generated at pre-signing revision
+`0bc8e6667e27ebd6aa5e3d572f34b9a1dfddefc7`. Its exact Wyrmroot/Q35 execution
+gate remains pending. The detailed records are
 [`DW0_A_VALIDATION.md`](DW0_A_VALIDATION.md) and
 [`DW0_B_VALIDATION.md`](DW0_B_VALIDATION.md).
 
 DW0-C now has committed physical ownership, mapping authority, atomic
 publication, transition attestation, one-shot Deep-root activation, six real
 build-selected memory guest bodies, and guarded #DF/NMI/#MC IST stacks through
-revision `9c7d65d3df83ce44b2ce1f15c2ae88587f9b570b`. Its source, host,
+signed revision `b424d7d89d9acc57ceff8d966c3931e26a51f614`, the same-tree
+equivalent of pre-signing revision
+`9c7d65d3df83ce44b2ce1f15c2ae88587f9b570b`. Its source, host,
 freestanding artifact, and final source-security review gates pass with
 C0/H0/M0/L0.
 [`DW0_C_VALIDATION.md`](DW0_C_VALIDATION.md) and
 [`DW0_C_SECURITY_REVIEW.md`](../security/DW0_C_SECURITY_REVIEW.md) record the
 exact qualified evidence.
 
-The compatible Wyrmroot source/pin revision is
-`15fa42dda23834a80197161249738f001bb2d76f`, with accepted evidence descendant
-`89235c7feef2a89ef2882ee096428b456496fa39`. That evidence records loader EFI
-SHA-256 `e47f6aaae15d5e4f8cf34fcfa827cf95ff43e5ec1bab288b02bc65b98800c031`,
+The current compatible live signed Wyrmroot repin is
+`eaaba1491c2f45d4fbd8b02358989547e9a8d98a`, with signed no-rerun evidence
+descendant `a8f12ba5e86db8b93f4be68f727d6cd65204c895`. Before the repin,
+pre-signing source/pin `15fa42dda23834a80197161249738f001bb2d76f` and evidence
+`89235c7feef2a89ef2882ee096428b456496fa39` became same-tree signed equivalents
+`ee1b899045a3294f140945e013ba42a60f57aa84` and
+`2b16b94818632f562a0551205d94e62bba847502`. The pre-signing evidence records
+loader EFI SHA-256 `e47f6aaae15d5e4f8cf34fcfa827cf95ff43e5ec1bab288b02bc65b98800c031`,
 PDB `7655e2c3102d54268703617132aaf86acf47484c4ec7595e6cafdac67d26e911`,
 schema-2 provenance
 `384841ca8c3c867a87e23e27d8ec5420ce47fc2db0b1ce3aafa276f9e90047be`,
@@ -36,9 +45,18 @@ High, Medium, or Low findings. Existing accepted Medium limitations remain
 recorded in Wyrmroot's `security/WYR0_B_SECURITY_REVIEW.md`; this is not an
 absolute zero-findings disposition.
 
+Per Mike, signing and repinning did not rerun or regenerate builds, tests, or
+artifacts. The hashes above remain explicitly pre-signing historical evidence.
+Their application to the current signed pair rests on
+verified source-tree equivalence and the signed Wyrmroot repin/no-rerun record,
+not newly generated artifact evidence. The pre-signing Deepwyrm evidence commit
+`4954de6bad2f4c4f547e6975f88714897ba804ba` has signed same-tree equivalent
+`11ea233b101d5c84a0e2e6cd4db4cd35e0f1a217`.
+
 All source, host, freestanding-artifact, cross-repository pin/build-evidence,
 and source-security work attainable within the current DW0-C/WYR0-C scope is
-complete for this exact pair. DW0-C is not formally complete: no canonical
+complete for this exact live signed pair on that no-rerun/tree-equivalence
+basis. DW0-C is not formally complete: no canonical
 ESP/image exists yet and none of the six selectors has executed through the
 real Wyrmroot loader in the coordinator-owned VM gate. The pair above
 establishes source/pin and loader-build compatibility, not guest, VM, image, or

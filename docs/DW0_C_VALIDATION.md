@@ -3,14 +3,37 @@
 ## Current disposition
 
 The DW0-C physical/virtual-memory source, host, freestanding artifact, and
-source-security gates pass through committed Deepwyrm revision
-`9c7d65d3df83ce44b2ce1f15c2ae88587f9b570b`. Its compatible Wyrmroot
-source/pin revision is `15fa42dda23834a80197161249738f001bb2d76f`; the accepted
-Wyrmroot evidence descendant is `89235c7feef2a89ef2882ee096428b456496fa39`.
+source-security gates pass through signed Deepwyrm revision
+`b424d7d89d9acc57ceff8d966c3931e26a51f614`. The current live signed Wyrmroot
+repin is `eaaba1491c2f45d4fbd8b02358989547e9a8d98a`; its signed no-rerun evidence
+descendant is `a8f12ba5e86db8b93f4be68f727d6cd65204c895`.
+
+Per Mike's publication instruction, no build, test, or artifact was rerun or
+regenerated after the signing rewrites and Wyrmroot repin. The
+results and artifact hashes below remain explicitly attributed to their
+pre-signing identities. Their application to the live signed pair rests on
+verified tree equivalence plus the signed repin/no-rerun evidence:
+
+- Deepwyrm `9c7d65d3df83ce44b2ce1f15c2ae88587f9b570b` became signed
+  `b424d7d89d9acc57ceff8d966c3931e26a51f614`, preserving tree
+  `4053153adfaca4a3582d53768c2a6fc11572ee7f`;
+- the earlier Deepwyrm pre-guard checkpoint
+  `b263a7a912c79b9e7d4b2439370417d7ae2ee076` became signed
+  `bd9da0bb8b5c867556eff7e3e29764f9fec706ab`, preserving tree
+  `483f6255950320e75448d4d9a52829a9b906326b`;
+- pre-signing Deepwyrm evidence commit
+  `4954de6bad2f4c4f547e6975f88714897ba804ba` became signed
+  `11ea233b101d5c84a0e2e6cd4db4cd35e0f1a217`, preserving tree
+  `71bd0c00f96627e5b5721c0f43b8a12ab1e0a5e1`; and
+- Wyrmroot source/pin `15fa42dda23834a80197161249738f001bb2d76f` and evidence
+  `89235c7feef2a89ef2882ee096428b456496fa39` became same-tree signed
+  equivalents `ee1b899045a3294f140945e013ba42a60f57aa84` and
+  `2b16b94818632f562a0551205d94e62bba847502` before the current live repin.
 
 All source, host, freestanding-artifact, cross-repository pin/build-evidence,
 and source-security work attainable within the current DW0-C/WYR0-C scope is
-complete for this exact pair. This is not formal DW0-C phase closure: no
+complete for this exact live signed pair on the no-rerun/tree-equivalence basis
+above. This is not formal DW0-C phase closure: no
 canonical ESP/image exists yet, no VM was operated for this record, and the six
 guest selectors have not executed through the real Wyrmroot loader. Guest, VM,
 and completed-phase acceptance therefore remain pending on that image and
@@ -150,14 +173,19 @@ the `/usr/lib/llvm/22/bin` paths shown above.
 | `memory-user-kernel-isolation` | `679ae4cabd92223ff350763fe3e650782d47ce25d460c0db33a6b1d011a62bdf` |
 | `memory-shared-memory-object` | `18aec22a4a3d452f6d7efc28055bb6bddb2fd95584eaa3c2c2059a566316d082` |
 
-These are the current guarded-IST artifact identities for the exact source
-state committed as `9c7d65d3df83ce44b2ce1f15c2ae88587f9b570b`.
+These are the guarded-IST artifact identities generated for the exact
+pre-signing source state
+`9c7d65d3df83ce44b2ce1f15c2ae88587f9b570b`. They were not rerun,
+regenerated, or reattributed after its same-tree signing rewrite to
+`b424d7d89d9acc57ceff8d966c3931e26a51f614`.
 
 ### Historical pre-guard artifact checkpoint
 
-The preceding clean `b263a7a912c79b9e7d4b2439370417d7ae2ee076`
-checkpoint produced the following superseded identities. They are retained for
-provenance only and are not compatible evidence for the guarded-IST revision:
+The preceding clean pre-signing checkpoint
+`b263a7a912c79b9e7d4b2439370417d7ae2ee076`, whose same-tree signed equivalent
+is `bd9da0bb8b5c867556eff7e3e29764f9fec706ab`, produced the following
+superseded identities. They are retained for provenance only and are not
+compatible evidence for the guarded-IST revision:
 
 Its build-input manifest was
 `7d5d9101c3214d4b959e26431ec8589762bf9cb5690a45a8c68e0574b422f909`;
@@ -240,12 +268,12 @@ the required permissions. The gate's isolated scratch artifacts were removed
 after inspection; the hashes above identify the exact guarded source state,
 not a retained release artifact set.
 
-## Compatible Wyrmroot evidence
+## Compatible Wyrmroot evidence and signed repin
 
-Wyrmroot source/pin revision
-`15fa42dda23834a80197161249738f001bb2d76f` consumes Deepwyrm
-`9c7d65d3df83ce44b2ce1f15c2ae88587f9b570b`. Its accepted evidence descendant
-is `89235c7feef2a89ef2882ee096428b456496fa39`:
+The following artifacts were generated before history signing for Wyrmroot
+source/pin revision `15fa42dda23834a80197161249738f001bb2d76f`, consuming
+pre-signing Deepwyrm `9c7d65d3df83ce44b2ce1f15c2ae88587f9b570b`, and recorded by
+pre-signing evidence descendant `89235c7feef2a89ef2882ee096428b456496fa39`:
 
 | Wyrmroot evidence | SHA-256 |
 |---|---|
@@ -253,6 +281,15 @@ is `89235c7feef2a89ef2882ee096428b456496fa39`:
 | loader PDB | `7655e2c3102d54268703617132aaf86acf47484c4ec7595e6cafdac67d26e911` |
 | schema-2 provenance | `384841ca8c3c867a87e23e27d8ec5420ce47fc2db0b1ce3aafa276f9e90047be` |
 | PE inspection report | `f616d99b1385ed13d3d59091f5c02db5966c0228532ea632868794831f151b11` |
+
+Those Wyrmroot commits have same-tree signed equivalents
+`ee1b899045a3294f140945e013ba42a60f57aa84` and
+`2b16b94818632f562a0551205d94e62bba847502`. The current live signed repin
+`eaaba1491c2f45d4fbd8b02358989547e9a8d98a` binds Wyrmroot to signed Deepwyrm
+`b424d7d89d9acc57ceff8d966c3931e26a51f614`; signed evidence descendant
+`a8f12ba5e86db8b93f4be68f727d6cd65204c895` records that no builds, tests, or
+artifacts were rerun. The table remains historical pre-signing artifact
+evidence and is not a newly generated signed-pair output.
 
 Wyrmroot's bounded guarded-IST acknowledgment review found no new Critical,
 High, Medium, or Low findings. This is not an absolute zero-findings statement:
