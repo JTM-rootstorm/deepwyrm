@@ -3,6 +3,7 @@ name = "deepwyrm-abi"
 version = "0.0.0"
 edition = "2024"
 publish = false
+license.workspace = true
 
 [lib]
 path = "src/lib.rs"

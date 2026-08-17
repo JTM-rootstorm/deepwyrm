@@ -7,6 +7,9 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+license = "GPL-2.0-or-later"
+
 [profile.dev]
 debug = 2
 panic = "abort"

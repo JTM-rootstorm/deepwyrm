@@ -27,4 +27,4 @@ Shared boot and ABI contracts are coordinated across both projects. Wyrmroot con
 
 ## License
 
-Deepwyrm is licensed under the [GNU General Public License v3.0](LICENSE).
+Deepwyrm is licensed under [GPL-2.0-or-later](LICENSE).
