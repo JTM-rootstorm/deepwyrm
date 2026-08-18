@@ -3,6 +3,7 @@ extern crate std;
 use super::super::object::MemoryObjectKind;
 use super::*;
 use crate::object::{InternalRef, ObjectRegistry};
+use crate::task::{TaskAuthority, TaskError, complete_task_finalization};
 use deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT;
 use std::boxed::Box;
 use std::ops::{Deref, DerefMut};
@@ -824,4 +825,109 @@ fn object_authorizations_cannot_replay_across_authority_domains() {
     assert!(failure.into_final_releases().is_empty());
     assert_eq!(publisher.calls, 0);
     assert_eq!(second.active_lease_count(), 0);
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "test-local AddressSpaceAuthority uniquely owns its synthetic address-space identities"
+)]
+fn root_region_handle_close_preserves_address_space_until_process_exit() {
+    type Tasks = TaskAuthority<2, 2, 2, 2>;
+    let mut registry = ObjectRegistry::<8>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (process, process_handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let mut spaces = unsafe { AddressSpaceAuthority::<2, 2>::new() };
+    let mut regions = AddressRegionObjectAuthority::<2, 4>::new();
+
+    let (region_key, region_handle): (AddressRegionObjectKey, _) = regions
+        .create_root_region(
+            &mut registry,
+            &mut tasks,
+            &mut spaces,
+            process,
+            &process_handle,
+        )
+        .unwrap();
+    assert_eq!(
+        tasks.root_region(process).unwrap(),
+        Some(region_key.object_id())
+    );
+    assert_eq!(
+        regions
+            .region(region_key)
+            .unwrap()
+            .mappings()
+            .iter()
+            .flatten()
+            .count(),
+        0
+    );
+    assert!(registry.release_handle(region_handle).unwrap().is_none());
+    assert!(matches!(
+        regions.create_root_region(
+            &mut registry,
+            &mut tasks,
+            &mut spaces,
+            process,
+            &process_handle
+        ),
+        Err(AddressRegionObjectError::Task(TaskError::BadState))
+    ));
+
+    let effects = tasks
+        .terminate_process_authorized(&mut registry, process, 0x77)
+        .unwrap();
+    assert_eq!(effects.drained.final_release_count(), 0);
+    let (process_pin, thread_pins) = effects.pins.into_parts();
+    assert!(thread_pins.into_iter().flatten().next().is_none());
+    assert!(
+        registry
+            .release_internal(process_pin.unwrap())
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        regions.region_mut_for_live_process(&tasks, region_key),
+        Err(AddressRegionObjectError::Task(TaskError::BadState))
+    ));
+
+    let runtime_pin = regions.retire_exited_root(&mut tasks, process).unwrap();
+    let region_final = registry.release_internal(runtime_pin).unwrap().unwrap();
+    let finalization = regions
+        .take_finalization(&mut spaces, region_final)
+        .unwrap();
+    assert!(complete_address_region_finalization(&mut registry, finalization).is_none());
+    assert_eq!(tasks.root_region(process), Ok(None));
+
+    let process_final = registry.release_handle(process_handle).unwrap().unwrap();
+    let task_finalization = tasks.take_finalization(process_final).unwrap();
+    assert!(complete_task_finalization(&mut registry, task_finalization).is_none());
+    let root_final = registry.release_internal(root_owner).unwrap().unwrap();
+    let root_finalization = tasks.take_finalization(root_final).unwrap();
+    assert!(complete_task_finalization(&mut registry, root_finalization).is_none());
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "test-local AddressSpaceAuthority uniquely owns its synthetic address-space identities"
+)]
+fn address_space_identity_release_refuses_live_region_records() {
+    let mut spaces = unsafe { AddressSpaceAuthority::<1, 1>::new() };
+    let address_space = spaces.create_address_space().unwrap();
+    let region = spaces
+        .create_region::<1>(address_space, PAGE_SIZE, PAGE_SIZE)
+        .unwrap();
+    assert_eq!(
+        spaces.release_address_space(address_space),
+        Err(AddressRegionError::LiveRegions)
+    );
+    spaces.release_region(&region).unwrap();
+    spaces.release_address_space(address_space).unwrap();
+    assert_eq!(
+        spaces.release_address_space(address_space),
+        Err(AddressRegionError::OutsideRegion)
+    );
 }

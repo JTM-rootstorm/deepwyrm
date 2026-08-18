@@ -73,6 +73,8 @@ pub(crate) enum AddressRegionError {
     Unmapped,
     NoSpace,
     Capacity,
+    LiveMappings,
+    LiveRegions,
     PublisherIdentity,
     InvalidProtection,
     UnsupportedProtection,
@@ -121,7 +123,7 @@ const EMPTY_ADDRESS_SPACE_SLOT: AddressSpaceSlot = AddressSpaceSlot {
     active: false,
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RegionRecord {
     address_space_slot: usize,
     start: u64,
@@ -382,6 +384,19 @@ const fn protection_error(error: MemoryObjectError) -> AddressRegionError {
         _ => AddressRegionError::InvalidProtection,
     }
 }
+
+#[cfg(deepwyrm_integrated)]
+#[path = "address_region/object_adapter.rs"]
+mod object_adapter;
+#[cfg(deepwyrm_integrated)]
+#[allow(
+    unused_imports,
+    reason = "DW0-E2 exports the typed AddressRegion adapter ahead of E5 syscall consumers"
+)]
+pub(crate) use object_adapter::{
+    AddressRegionObjectAuthority, AddressRegionObjectError, AddressRegionObjectKey,
+    AddressRegionPayloadBinding, AddressRegionPayloadCleanup, complete_address_region_finalization,
+};
 
 #[cfg(test)]
 #[allow(

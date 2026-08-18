@@ -50,6 +50,9 @@ impl TaskGroupKey {
     }
 }
 impl ProcessKey {
+    pub(crate) const fn from_object_id(object: ObjectId) -> Self {
+        Self(object)
+    }
     pub(crate) const fn object_id(self) -> ObjectId {
         self.0
     }
@@ -168,6 +171,7 @@ struct ProcessRecord<const THREADS: usize, const HANDLES: usize> {
     parent: InternalRef,
     state: TaskStateRecord,
     execution_pin: Option<InternalRef>,
+    root_region: Option<ObjectId>,
     threads: [Option<ObjectId>; THREADS],
     handles: HandleTable<HANDLES>,
 }

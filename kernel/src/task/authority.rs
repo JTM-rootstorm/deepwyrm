@@ -130,6 +130,7 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             parent,
             state: TaskStateRecord::created(),
             execution_pin: None,
+            root_region: None,
             threads: [None; THREADS],
             handles: HandleTable::new(),
         });
@@ -228,6 +229,47 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         key: ProcessKey,
     ) -> Result<DrainResult<HANDLES>, TaskError> {
         Ok(self.process_mut(key)?.handles.drain(registry))
+    }
+
+    pub(crate) fn attach_root_region(
+        &mut self,
+        key: ProcessKey,
+        object: ObjectId,
+    ) -> Result<(), TaskError> {
+        let process = self.process_mut(key)?;
+        if process.state.state != DW_TASK_STATE_CREATED || process.root_region.is_some() {
+            return Err(TaskError::BadState);
+        }
+        process.root_region = Some(object);
+        Ok(())
+    }
+
+    pub(crate) fn rollback_root_region_attachment(
+        &mut self,
+        key: ProcessKey,
+        object: ObjectId,
+    ) -> Result<(), TaskError> {
+        let process = self.process_mut(key)?;
+        if process.state.state != DW_TASK_STATE_CREATED || process.root_region != Some(object) {
+            return Err(TaskError::BadState);
+        }
+        process.root_region = None;
+        Ok(())
+    }
+
+    pub(crate) fn take_exited_root_region(
+        &mut self,
+        key: ProcessKey,
+    ) -> Result<Option<ObjectId>, TaskError> {
+        let process = self.process_mut(key)?;
+        if process.state.state != DW_TASK_STATE_EXITED {
+            return Err(TaskError::BadState);
+        }
+        Ok(process.root_region.take())
+    }
+
+    pub(crate) fn root_region(&self, key: ProcessKey) -> Result<Option<ObjectId>, TaskError> {
+        Ok(self.process(key)?.root_region)
     }
 
     pub(crate) fn process_info(
@@ -525,6 +567,10 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         assert!(
             record.execution_pin.is_none(),
             "finalizing Process still owns execution authority"
+        );
+        assert!(
+            record.root_region.is_none(),
+            "finalizing Process still names a root AddressRegion"
         );
         let parent_slot = self.group_slot(TaskGroupKey(record.parent.id()))?;
         let parent = self.groups[parent_slot]

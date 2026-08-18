@@ -688,6 +688,24 @@ impl payload_cleanup_seal::Sealed for crate::task::TaskPayloadCleanup {
 #[cfg(deepwyrm_integrated)]
 impl PayloadCleanupProof for crate::task::TaskPayloadCleanup {}
 
+#[cfg(deepwyrm_integrated)]
+impl payload_binding_seal::Sealed for crate::memory::address_region::AddressRegionPayloadBinding {
+    fn into_creation(self) -> CreationRef {
+        self.into_creation()
+    }
+}
+#[cfg(deepwyrm_integrated)]
+impl PayloadBindingProof for crate::memory::address_region::AddressRegionPayloadBinding {}
+
+#[cfg(deepwyrm_integrated)]
+impl payload_cleanup_seal::Sealed for crate::memory::address_region::AddressRegionPayloadCleanup {
+    fn into_final_release(self) -> FinalRelease {
+        self.into_final_release()
+    }
+}
+#[cfg(deepwyrm_integrated)]
+impl PayloadCleanupProof for crate::memory::address_region::AddressRegionPayloadCleanup {}
+
 fn next_generation(generation: u32) -> Option<u32> {
     generation.checked_add(1).filter(|next| *next != 0)
 }

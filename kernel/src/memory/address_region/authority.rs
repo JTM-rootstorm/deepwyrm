@@ -90,6 +90,54 @@ impl<const SPACES: usize, const REGIONS: usize> AddressSpaceAuthority<SPACES, RE
         ))
     }
 
+    pub(super) fn release_region<const SLOTS: usize>(
+        &mut self,
+        region: &AddressRegion<SLOTS>,
+    ) -> Result<(), AddressRegionError> {
+        if region.mappings().iter().any(Option::is_some) {
+            return Err(AddressRegionError::LiveMappings);
+        }
+        let address_space_slot = self.address_space_slot(region.address_space_key())?;
+        if region.region_key().domain == 0 || region.region_key().domain != self.domain {
+            return Err(AddressRegionError::OutsideRegion);
+        }
+        let (slot, generation) =
+            decode_key(region.region_key().raw).ok_or(AddressRegionError::OutsideRegion)?;
+        let entry = self
+            .regions
+            .get_mut(slot)
+            .ok_or(AddressRegionError::OutsideRegion)?;
+        if entry.generation != generation
+            || entry.record
+                != Some(RegionRecord {
+                    address_space_slot,
+                    start: region.start,
+                    byte_len: region.byte_len,
+                })
+        {
+            return Err(AddressRegionError::OutsideRegion);
+        }
+        entry.record = None;
+        Ok(())
+    }
+
+    pub(super) fn release_address_space(
+        &mut self,
+        key: AddressSpaceKey,
+    ) -> Result<(), AddressRegionError> {
+        let slot = self.address_space_slot(key)?;
+        if self
+            .regions
+            .iter()
+            .filter_map(|region| region.record)
+            .any(|region| region.address_space_slot == slot)
+        {
+            return Err(AddressRegionError::LiveRegions);
+        }
+        self.spaces[slot].active = false;
+        Ok(())
+    }
+
     fn address_space_slot(&self, key: AddressSpaceKey) -> Result<usize, AddressRegionError> {
         if key.domain == 0 || key.domain != self.domain {
             return Err(AddressRegionError::OutsideRegion);
