@@ -13,6 +13,10 @@ The canonical schema is under `abi/schema`. Numeric namespace values remain repr
 - Result: `RAX`; DwStatus sign-extended to 64 bits
 - Clobbers: `RCX,R11`
 
+## Freestanding x86_64 syscall veneer
+
+`syscall_veneer_x86_64.S` exports `dw_syscall6(number, arg0, arg1, arg2, arg3, arg4, arg5)` as a libc-independent SysV link veneer for freestanding native tests/runtime code. It rearranges the ordinary function-call registers into the raw Deepwyrm syscall convention, executes `SYSCALL`, and returns the sign-extended `DwStatus` in `RAX`. It is a native ABI binding, not libc.
+
 ## Rights-input invariant
 
 Every requested_rights value is nonzero, known, and compatible with the target object type. Duplicate and MOVE transfer requests must be subsets of the named source handle's rights, and the source must carry DUPLICATE or TRANSFER respectively. Creator syscalls mint the requested initial authority for a new object; that authority is bounded by the new object's compatible rights and is authorized by the controlling-handle requirements in syscall metadata, or by the create operation itself when no controlling handle exists. In process_create, MODIFY on the parent task group authorizes minting the returned process and root-region handles, while child_bootstrap_rights may only reduce the transferred Channel handle. Unknown or zero rights are INVALID_ARGUMENT; source-right escalation is ACCESS_DENIED; all failures occur before mutation.

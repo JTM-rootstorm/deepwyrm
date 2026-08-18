@@ -11,3 +11,8 @@ include!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../abi/generated/deepwyrm_abi.rs"
 ));
+
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../abi/generated/syscall_kernel.rs"
+));

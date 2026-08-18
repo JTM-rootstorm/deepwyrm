@@ -44,7 +44,9 @@ const OUTPUT_FILES: &[&str] = &[
     "deepwyrm_abi.rs",
     "deepwyrm_abi.h",
     "syscall_dispatch.rs",
+    "syscall_kernel.rs",
     "syscall_wrappers.rs",
+    "syscall_veneer_x86_64.S",
     "ABI.md",
     "README.md",
 ];
@@ -312,10 +314,15 @@ impl Model {
         };
         if abi.byte_order != "little"
             || abi.pointer_width != 64
-            || abi.argument_registers.len() != 6
+            || abi.instruction != "SYSCALL"
+            || abi.number_register != "RAX"
+            || abi.argument_registers != ["RDI", "RSI", "RDX", "R10", "R8", "R9"]
+            || abi.result_register != "RAX"
+            || abi.clobbers != "RCX,R11"
+            || abi.result_rule != "DwStatus sign-extended to 64 bits"
         {
             return Err(Error::new(format!(
-                "{}: unsupported ABI machine contract",
+                "{}: unsupported raw x86_64 syscall convention",
                 abi_doc.top.label()
             )));
         }
@@ -569,10 +576,20 @@ impl Model {
                     abi.argument_registers.len()
                 )));
             }
+            let phase = table.text("phase")?;
+            if !matches!(
+                phase.as_str(),
+                "DW0-A" | "DW0-B" | "DW0-C" | "DW0-D" | "DW0-E" | "DW0-F" | "DW0-G" | "DW0-H"
+            ) {
+                return Err(Error::new(format!(
+                    "{}: syscall `{name}` uses unsupported implementation phase `{phase}`",
+                    table.label()
+                )));
+            }
             syscalls.push(Syscall {
                 name,
                 number,
-                phase: table.text("phase")?,
+                phase,
                 doc: table.text("doc")?,
                 arguments,
             });

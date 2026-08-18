@@ -9,8 +9,16 @@ pub(super) fn render(model: &Model) -> Result<BTreeMap<String, String>> {
         render_dispatch_metadata(model)?,
     );
     outputs.insert(
+        "syscall_kernel.rs".to_owned(),
+        render_kernel_dispatch(model)?,
+    );
+    outputs.insert(
         "syscall_wrappers.rs".to_owned(),
         render_wrapper_metadata(model)?,
+    );
+    outputs.insert(
+        "syscall_veneer_x86_64.S".to_owned(),
+        render_x86_64_syscall_veneer(model)?,
     );
     outputs.insert("ABI.md".to_owned(), render_markdown(model)?);
     outputs.insert("README.md".to_owned(), render_readme());
@@ -514,6 +522,179 @@ pub(super) fn c_named(name: &str) -> Result<&str> {
     }
 }
 
+fn rust_syscall_variant(name: &str) -> String {
+    name.split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
+fn rust_phase_variant(phase: &str) -> Result<&'static str> {
+    match phase {
+        "DW0-A" => Ok("Dw0A"),
+        "DW0-B" => Ok("Dw0B"),
+        "DW0-C" => Ok("Dw0C"),
+        "DW0-D" => Ok("Dw0D"),
+        "DW0-E" => Ok("Dw0E"),
+        "DW0-F" => Ok("Dw0F"),
+        "DW0-G" => Ok("Dw0G"),
+        "DW0-H" => Ok("Dw0H"),
+        other => Err(Error::new(format!(
+            "unsupported syscall implementation phase `{other}`"
+        ))),
+    }
+}
+
+pub(super) fn render_kernel_dispatch(model: &Model) -> Result<String> {
+    let mut out = generated_preamble("//");
+    writeln!(
+        out,
+        "/// Build-phase classification used by kernel dispatch; this is generator metadata, not native ABI."
+    )
+    .unwrap();
+    writeln!(out, "#[repr(u8)]").unwrap();
+    writeln!(
+        out,
+        "#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]"
+    )
+    .unwrap();
+    writeln!(out, "pub enum DwSyscallImplementationPhase {{").unwrap();
+    for (index, variant) in [
+        "Dw0A", "Dw0B", "Dw0C", "Dw0D", "Dw0E", "Dw0F", "Dw0G", "Dw0H",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        writeln!(out, "    {variant} = {index},").unwrap();
+    }
+    writeln!(out, "}}\n").unwrap();
+    writeln!(out, "impl DwSyscallImplementationPhase {{").unwrap();
+    writeln!(
+        out,
+        "    pub const fn is_active_through(self, through: Self) -> bool {{ (self as u8) <= (through as u8) }}"
+    )
+    .unwrap();
+    writeln!(out, "}}\n").unwrap();
+
+    writeln!(
+        out,
+        "/// String-free schema-owned syscall identity for kernel routing."
+    )
+    .unwrap();
+    writeln!(out, "#[derive(Clone, Copy, Debug, Eq, PartialEq)]").unwrap();
+    writeln!(out, "pub enum DwKnownSyscall {{").unwrap();
+    for syscall in &model.syscalls {
+        writeln!(out, "    {},", rust_syscall_variant(&syscall.name)).unwrap();
+    }
+    writeln!(out, "}}\n").unwrap();
+    writeln!(out, "impl DwKnownSyscall {{").unwrap();
+    writeln!(
+        out,
+        "    pub const fn from_id(id: DwSyscallId) -> Option<Self> {{"
+    )
+    .unwrap();
+    writeln!(out, "        match id.0 {{").unwrap();
+    for syscall in &model.syscalls {
+        writeln!(
+            out,
+            "            0x{:08x} => Some(Self::{}),",
+            syscall.number,
+            rust_syscall_variant(&syscall.name)
+        )
+        .unwrap();
+    }
+    writeln!(out, "            _ => None,").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}\n").unwrap();
+
+    writeln!(out, "    pub const fn id(self) -> DwSyscallId {{").unwrap();
+    writeln!(out, "        match self {{").unwrap();
+    for syscall in &model.syscalls {
+        writeln!(
+            out,
+            "            Self::{} => DwSyscallId(0x{:08x}),",
+            rust_syscall_variant(&syscall.name),
+            syscall.number
+        )
+        .unwrap();
+    }
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}\n").unwrap();
+
+    writeln!(
+        out,
+        "    pub const fn implementation_phase(self) -> DwSyscallImplementationPhase {{"
+    )
+    .unwrap();
+    writeln!(out, "        match self {{").unwrap();
+    for syscall in &model.syscalls {
+        writeln!(
+            out,
+            "            Self::{} => DwSyscallImplementationPhase::{},",
+            rust_syscall_variant(&syscall.name),
+            rust_phase_variant(&syscall.phase)?
+        )
+        .unwrap();
+    }
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}\n").unwrap();
+
+    writeln!(out, "    pub const fn argument_count(self) -> u8 {{").unwrap();
+    writeln!(out, "        match self {{").unwrap();
+    for syscall in &model.syscalls {
+        writeln!(
+            out,
+            "            Self::{} => {},",
+            rust_syscall_variant(&syscall.name),
+            syscall.arguments.len()
+        )
+        .unwrap();
+    }
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}\n").unwrap();
+    Ok(out)
+}
+
+pub(super) fn render_x86_64_syscall_veneer(model: &Model) -> Result<String> {
+    // Model loading already rejects any convention that does not match this audited veneer.
+    let mut out = generated_preamble("#");
+    writeln!(out, ".text").unwrap();
+    writeln!(out, ".p2align 4").unwrap();
+    writeln!(out, ".globl dw_syscall6").unwrap();
+    writeln!(out, ".type dw_syscall6,@function").unwrap();
+    writeln!(out, "dw_syscall6:").unwrap();
+    writeln!(
+        out,
+        "    # SysV: number,a0,a1,a2,a3,a4 in registers; a5 at 8(%rsp)."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    # Deepwyrm raw: RAX=number, RDI,RSI,RDX,R10,R8,R9=args."
+    )
+    .unwrap();
+    writeln!(out, "    movq %rdi, %rax").unwrap();
+    writeln!(out, "    movq %rsi, %rdi").unwrap();
+    writeln!(out, "    movq %rdx, %rsi").unwrap();
+    writeln!(out, "    movq %rcx, %rdx").unwrap();
+    writeln!(out, "    movq %r8, %r10").unwrap();
+    writeln!(out, "    movq %r9, %r8").unwrap();
+    writeln!(out, "    movq 8(%rsp), %r9").unwrap();
+    writeln!(out, "    syscall").unwrap();
+    writeln!(out, "    retq").unwrap();
+    writeln!(out, ".size dw_syscall6, .-dw_syscall6").unwrap();
+    writeln!(out, ".section .note.GNU-stack,\"\",@progbits").unwrap();
+    let _ = model;
+    Ok(out)
+}
+
 pub(super) fn render_dispatch_metadata(model: &Model) -> Result<String> {
     let mut out = generated_preamble("//");
     writeln!(out, "#[derive(Clone, Copy, Debug, Eq, PartialEq)]").unwrap();
@@ -661,6 +842,8 @@ pub(super) fn render_markdown(model: &Model) -> Result<String> {
     )
     .unwrap();
     writeln!(out, "- Clobbers: `{}`\n", model.abi.clobbers).unwrap();
+    writeln!(out, "## Freestanding x86_64 syscall veneer\n").unwrap();
+    writeln!(out, "`syscall_veneer_x86_64.S` exports `dw_syscall6(number, arg0, arg1, arg2, arg3, arg4, arg5)` as a libc-independent SysV link veneer for freestanding native tests/runtime code. It rearranges the ordinary function-call registers into the raw Deepwyrm syscall convention, executes `SYSCALL`, and returns the sign-extended `DwStatus` in `RAX`. It is a native ABI binding, not libc.\n").unwrap();
     writeln!(
         out,
         "## Rights-input invariant\n\n{}\n",
@@ -809,7 +992,7 @@ pub(super) fn title(section: &str) -> String {
 }
 
 pub(super) fn render_readme() -> String {
-    "# Generated Deepwyrm ABI artifacts\n\nThis directory is owned by `abi-gen`. Do not edit generated files directly.\n\nFrom the Deepwyrm repository root:\n\n```text\ncargo xtask abi generate\ncargo xtask abi check\n```\n\n`check` regenerates the expected files in memory and fails on missing, stale, or unexpected output.\n".to_owned()
+    "# Generated Deepwyrm ABI artifacts\n\nThis directory is owned by `abi-gen`. Do not edit generated files directly.\n\nGenerated surfaces include the Rust/C ABI definitions, string-free kernel syscall routing, host-side dispatch/wrapper metadata, the libc-independent x86_64 syscall veneer, and ABI documentation.\n\nFrom the Deepwyrm repository root:\n\n```text\ncargo xtask abi generate\ncargo xtask abi check\n```\n\n`check` regenerates the expected files in memory and fails on missing, stale, or unexpected output.\n".to_owned()
 }
 
 pub(super) fn record_size_constant(name: &str) -> String {

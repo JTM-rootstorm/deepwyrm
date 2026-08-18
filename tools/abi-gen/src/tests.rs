@@ -263,6 +263,69 @@ fn rejects_syscall_rights_incompatible_with_declared_object() {
 }
 
 #[test]
+fn raw_x86_64_syscall_convention_is_locked_for_generated_veneer() {
+    for (from, to) in [
+        (
+            "syscall_instruction = \"SYSCALL\"",
+            "syscall_instruction = \"SYSENTER\"",
+        ),
+        (
+            "syscall_argument_registers = \"RDI,RSI,RDX,R10,R8,R9\"",
+            "syscall_argument_registers = \"RDI,RSI,RDX,RCX,R8,R9\"",
+        ),
+        (
+            "syscall_clobbers = \"RCX,R11\"",
+            "syscall_clobbers = \"RCX\"",
+        ),
+    ] {
+        let root = TempRoot::copy_schema();
+        root.rewrite("abi.toml", |text| text.replacen(from, to, 1));
+        assert!(load_error(&root).contains("unsupported raw x86_64 syscall convention"));
+    }
+}
+
+#[test]
+fn generated_kernel_dispatch_and_veneer_follow_schema() {
+    let root = TempRoot::copy_schema();
+    let model = Model::load(root.path()).unwrap();
+    let outputs = render(&model).unwrap();
+    let kernel = &outputs["syscall_kernel.rs"];
+    assert!(kernel.contains("pub enum DwKnownSyscall"));
+    assert!(kernel.contains("0x00010001 => Some(Self::TaskGroupCreate)"));
+    assert!(kernel.contains("Self::ProcessCreate => DwSyscallImplementationPhase::Dw0F"));
+    assert!(kernel.contains("Self::ThreadStart => 2"));
+    assert!(!kernel.contains("task_group_create"));
+    assert!(!kernel.contains("DW0-E"));
+
+    let veneer = &outputs["syscall_veneer_x86_64.S"];
+    for instruction in [
+        "movq %rdi, %rax",
+        "movq %rsi, %rdi",
+        "movq %rdx, %rsi",
+        "movq %rcx, %rdx",
+        "movq %r8, %r10",
+        "movq %r9, %r8",
+        "movq 8(%rsp), %r9",
+        "syscall",
+        "retq",
+    ] {
+        assert!(
+            veneer.contains(instruction),
+            "veneer omitted `{instruction}`"
+        );
+    }
+}
+
+#[test]
+fn rejects_unknown_syscall_implementation_phase() {
+    let root = TempRoot::copy_schema();
+    root.rewrite("syscalls.toml", |text| {
+        text.replacen("phase = \"DW0-A\"", "phase = \"DW1-Z\"", 1)
+    });
+    assert!(load_error(&root).contains("uses unsupported implementation phase `DW1-Z`"));
+}
+
+#[test]
 fn canonical_e0_task_syscall_contract_is_typed_and_staged() {
     let root = TempRoot::copy_schema();
     let model = Model::load(root.path()).unwrap();
@@ -348,6 +411,30 @@ fn rejects_missing_or_mismatched_boot_contract_constants() {
     assert!(load_error(&root).contains(
         "boot contract requires constant `DW_BOOT_BASE_PAGE_SIZE` with type u32 and value 4096"
     ));
+}
+
+#[test]
+fn generated_syscall_veneer_assembles_when_clang_is_available() {
+    if Command::new("clang").arg("--version").output().is_err() {
+        return;
+    }
+    let root = TempRoot::copy_schema();
+    run(["generate", "--root", root.path().to_str().unwrap()]).unwrap();
+    let veneer = root.path().join("abi/generated/syscall_veneer_x86_64.S");
+    let object = root.path().join("abi/generated/syscall_veneer_x86_64.o");
+    let output = Command::new("clang")
+        .args(["-target", "x86_64-unknown-none", "-c"])
+        .arg(&veneer)
+        .arg("-o")
+        .arg(&object)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "clang stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(object.metadata().unwrap().len() > 0);
 }
 
 #[test]
