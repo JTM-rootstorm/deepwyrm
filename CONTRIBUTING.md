@@ -37,6 +37,20 @@ in a plan is only a desired interface until the checked-out repository both
 implements it and documents its current validation status. Record commands that
 were actually run, their exact results, and any remaining unverified claims.
 
+## Licensing changes
+
+Read [`LICENSING.md`](LICENSING.md) before adding copied/adapted third-party code
+or changing a package license. `GPL-2.0-or-later` is the repository default and
+all current Deepwyrm components retain it. Do not tighten kernel, ABI,
+generator, generated-ABI, or kernel-coupled code to `GPL-3.0-or-later` without
+an explicit compatibility review.
+
+A clearly separable future host or userspace component may use
+`GPL-3.0-or-later` when its copyright and dependency provenance permits it and
+the exception is explicitly recorded. Do not silently relicense imported
+third-party code, and do not infer permission from where a file lives in the
+repository.
+
 ## Generated files and local artifacts
 
 The ABI schema is the canonical source of truth. Generator-owned ABI outputs

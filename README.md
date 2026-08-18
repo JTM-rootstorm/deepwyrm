@@ -23,8 +23,9 @@ Shared boot and ABI contracts are coordinated across both projects. Wyrmroot con
 - [DW0 implementation plan](Plans/DW0_IMPLEMENTATION_PLAN.md)
 - [Native ABI schema and generated artifacts](abi/README.md)
 - [Bootstrap and validation status](docs/BOOTSTRAP_STATUS.md)
+- [Licensing policy](LICENSING.md)
 - [Contributing](CONTRIBUTING.md)
 
 ## License
 
-Deepwyrm is licensed under [GPL-2.0-or-later](LICENSE).
+Deepwyrm's repository default is [GPL-2.0-or-later](LICENSE). All current components retain that license. The repository carries a GPLv3-or-later text and policy for future explicitly approved component-level use; see [LICENSING.md](LICENSING.md) for the compatibility rules and current exception list.
