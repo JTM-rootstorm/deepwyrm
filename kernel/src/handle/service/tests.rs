@@ -311,3 +311,43 @@ fn memory_object_info_reports_exact_logical_size() {
     let mut roles = crate::memory::frame_roles::synthetic_frame_role_manager::<1, 1>(0x80_000, 1);
     complete_memory_finalization(&mut registry, &mut roles, finalization);
 }
+
+#[test]
+fn e_task_state_query_reuses_inspect_gated_service_lookup() {
+    use crate::task::TaskAuthority;
+    use deepwyrm_abi::{
+        DW_OBJECT_INFO_TASK_STATE_V1, DW_RIGHT_INSPECT, DW_RIGHT_MODIFY, DW_TASK_STATE_CREATED,
+    };
+
+    let mut registry = ObjectRegistry::<4>::new();
+    let mut tasks = TaskAuthority::<1, 1, 1, 4>::new();
+    let (_group, owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (process, process_ref) = tasks.create_process(&mut registry, &owner).unwrap();
+    assert!(registry.release_internal(owner).unwrap().is_none());
+    let mut table = HandleTable::<4>::new();
+    let inspected = table
+        .install(
+            process_ref,
+            DwRights(DW_RIGHT_INSPECT.0 | DW_RIGHT_MODIFY.0),
+        )
+        .unwrap();
+    let result = object_get_info_v1_with_tasks(
+        &table,
+        &mut registry,
+        &MemoryObjectAuthority::<1, 1>::new(),
+        &tasks,
+        inspected,
+        DW_OBJECT_INFO_TASK_STATE_V1,
+    )
+    .unwrap();
+    let ObjectInfoResult::TaskState(info) = result else {
+        panic!("task state topic returned wrong result kind");
+    };
+    assert_eq!(info.state, DW_TASK_STATE_CREATED);
+    assert_eq!(tasks.process_info(process).unwrap(), info);
+    assert!(
+        handle_close(&mut table, &mut registry, inspected)
+            .unwrap()
+            .is_none()
+    );
+}

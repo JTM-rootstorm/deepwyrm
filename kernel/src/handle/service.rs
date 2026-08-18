@@ -9,7 +9,7 @@ use deepwyrm_abi::{
     DW_OBJECT_TYPE_PROCESS, DW_OBJECT_TYPE_THREAD, DW_RIGHT_INSPECT, DW_STATUS_ACCESS_DENIED,
     DW_STATUS_BAD_HANDLE, DW_STATUS_INVALID_ARGUMENT, DW_STATUS_NO_RESOURCES,
     DW_STATUS_NOT_SUPPORTED, DW_STATUS_WRONG_OBJECT_TYPE, DwHandle, DwMemoryObjectInfoV1,
-    DwObjectInfoV1, DwRights, DwStatus,
+    DwObjectInfoV1, DwRights, DwStatus, DwTaskTerminationInfoV1,
 };
 
 use crate::memory::object::MemoryObjectAuthority;
@@ -20,6 +20,7 @@ use crate::handle::{AcceptedObjectTypes, HandleTable, HandleTableError, Resolved
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ObjectInfoResult {
     Basic(DwObjectInfoV1),
+    TaskState(DwTaskTerminationInfoV1),
     MemoryObject(DwMemoryObjectInfoV1),
 }
 
@@ -54,6 +55,47 @@ pub(crate) fn object_get_info_v1<
     handle: DwHandle,
     topic: u32,
 ) -> Result<ObjectInfoResult, DwStatus> {
+    object_get_info_v1_impl(table, registry, memory, handle, topic, task_state_reserved)
+}
+
+pub(crate) fn object_get_info_v1_with_tasks<
+    const HANDLES: usize,
+    const OBJECTS: usize,
+    const MEMORY_OBJECTS: usize,
+    const LEASES: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+>(
+    table: &HandleTable<HANDLES>,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    memory: &MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
+    tasks: &crate::task::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    handle: DwHandle,
+    topic: u32,
+) -> Result<ObjectInfoResult, DwStatus> {
+    object_get_info_v1_impl(table, registry, memory, handle, topic, |resolved| {
+        task_state_info(tasks, resolved)
+    })
+}
+
+fn object_get_info_v1_impl<
+    const HANDLES: usize,
+    const OBJECTS: usize,
+    const MEMORY_OBJECTS: usize,
+    const LEASES: usize,
+    F,
+>(
+    table: &HandleTable<HANDLES>,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    memory: &MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
+    handle: DwHandle,
+    topic: u32,
+    task_state: F,
+) -> Result<ObjectInfoResult, DwStatus>
+where
+    F: FnOnce(&ResolvedHandle) -> Result<ObjectInfoResult, DwStatus>,
+{
     let resolved = table
         .lookup(registry, handle, AcceptedObjectTypes::Any, DW_RIGHT_INSPECT)
         .map_err(table_status)?;
@@ -61,7 +103,7 @@ pub(crate) fn object_get_info_v1<
     let result = match topic {
         DW_OBJECT_INFO_BASIC_V1 => Ok(ObjectInfoResult::Basic(basic_info(&resolved))),
         DW_OBJECT_INFO_MEMORY_OBJECT_V1 => memory_info(memory, &resolved),
-        DW_OBJECT_INFO_TASK_STATE_V1 => task_state_reserved(&resolved),
+        DW_OBJECT_INFO_TASK_STATE_V1 => task_state(&resolved),
         _ => Err(DW_STATUS_NOT_SUPPORTED),
     };
 
@@ -98,6 +140,31 @@ fn memory_info<const MEMORY_OBJECTS: usize, const LEASES: usize>(
         byte_size: info.logical_byte_len(),
         reserved: [0; 2],
     }))
+}
+
+fn task_state_info<
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    tasks: &crate::task::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    resolved: &ResolvedHandle,
+) -> Result<ObjectInfoResult, DwStatus> {
+    let info = if resolved.object_type() == DW_OBJECT_TYPE_PROCESS {
+        tasks
+            .process_info(crate::task::ProcessKey::from_object_id(
+                resolved.object_id(),
+            ))
+            .unwrap_or_else(|error| panic!("live Process handle lost E2 task payload: {error:?}"))
+    } else if resolved.object_type() == DW_OBJECT_TYPE_THREAD {
+        tasks
+            .thread_info(crate::task::ThreadKey::from_object_id(resolved.object_id()))
+            .unwrap_or_else(|error| panic!("live Thread handle lost E2 task payload: {error:?}"))
+    } else {
+        return Err(DW_STATUS_WRONG_OBJECT_TYPE);
+    };
+    Ok(ObjectInfoResult::TaskState(info))
 }
 
 fn task_state_reserved(resolved: &ResolvedHandle) -> Result<ObjectInfoResult, DwStatus> {
