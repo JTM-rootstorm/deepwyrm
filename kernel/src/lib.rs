@@ -12,6 +12,11 @@ pub mod boot;
 pub mod debug;
 pub mod interrupt;
 pub mod memory;
+#[allow(
+    dead_code,
+    reason = "DW0-D2 lands the generic object core before DW0-D3 handle consumers"
+)]
+pub(crate) mod object;
 
 #[cfg(feature = "test-support")]
 pub mod test_support;
