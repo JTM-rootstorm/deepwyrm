@@ -217,7 +217,8 @@ pub(crate) enum ThreadKernelStackLayoutError {
     reason = "linker-defined E3 thread stack arena bounds are immutable kernel-layout facts"
 )]
 pub(crate) fn linked_thread_kernel_stack_layout() -> Result<
-    [crate::task::KernelStackBounds; crate::task::E3_THREAD_STACK_COUNT],
+    [crate::memory::kernel_stack::KernelStackBounds;
+        crate::memory::kernel_stack::E3_THREAD_STACK_COUNT],
     ThreadKernelStackLayoutError,
 > {
     unsafe extern "C" {
@@ -226,35 +227,36 @@ pub(crate) fn linked_thread_kernel_stack_layout() -> Result<
     }
     let region_start = core::ptr::addr_of!(__dw_thread_kernel_stack_region_start) as u64;
     let region_end = core::ptr::addr_of!(__dw_thread_kernel_stack_region_end) as u64;
-    let expected_bytes = crate::task::E3_THREAD_STACK_STRIDE
-        .checked_mul(crate::task::E3_THREAD_STACK_COUNT as u64)
+    let expected_bytes = crate::memory::kernel_stack::E3_THREAD_STACK_STRIDE
+        .checked_mul(crate::memory::kernel_stack::E3_THREAD_STACK_COUNT as u64)
         .ok_or(ThreadKernelStackLayoutError::InvalidGeometry)?;
-    if !region_start.is_multiple_of(crate::task::E3_THREAD_STACK_ALIGNMENT)
+    if !region_start.is_multiple_of(crate::memory::kernel_stack::E3_THREAD_STACK_ALIGNMENT)
         || region_end.checked_sub(region_start) != Some(expected_bytes)
     {
         return Err(ThreadKernelStackLayoutError::InvalidGeometry);
     }
-    let placeholder = crate::task::KernelStackBounds::new(
-        crate::task::E3_BASE_PAGE_SIZE,
-        crate::task::E3_BASE_PAGE_SIZE * 2,
-        crate::task::E3_BASE_PAGE_SIZE * 2 + crate::task::E3_THREAD_STACK_SIZE,
+    let placeholder = crate::memory::kernel_stack::KernelStackBounds::new(
+        crate::memory::kernel_stack::E3_BASE_PAGE_SIZE,
+        crate::memory::kernel_stack::E3_BASE_PAGE_SIZE * 2,
+        crate::memory::kernel_stack::E3_BASE_PAGE_SIZE * 2
+            + crate::memory::kernel_stack::E3_THREAD_STACK_SIZE,
     )
     .map_err(|_| ThreadKernelStackLayoutError::InvalidGeometry)?;
-    let mut stacks = [placeholder; crate::task::E3_THREAD_STACK_COUNT];
+    let mut stacks = [placeholder; crate::memory::kernel_stack::E3_THREAD_STACK_COUNT];
     for (index, stack) in stacks.iter_mut().enumerate() {
-        let offset = crate::task::E3_THREAD_STACK_STRIDE
+        let offset = crate::memory::kernel_stack::E3_THREAD_STACK_STRIDE
             .checked_mul(index as u64)
             .ok_or(ThreadKernelStackLayoutError::InvalidGeometry)?;
         let guard_page = region_start
             .checked_add(offset)
             .ok_or(ThreadKernelStackLayoutError::InvalidGeometry)?;
         let bottom = guard_page
-            .checked_add(crate::task::E3_THREAD_STACK_GUARD_SIZE)
+            .checked_add(crate::memory::kernel_stack::E3_THREAD_STACK_GUARD_SIZE)
             .ok_or(ThreadKernelStackLayoutError::InvalidGeometry)?;
         let top = bottom
-            .checked_add(crate::task::E3_THREAD_STACK_SIZE)
+            .checked_add(crate::memory::kernel_stack::E3_THREAD_STACK_SIZE)
             .ok_or(ThreadKernelStackLayoutError::InvalidGeometry)?;
-        *stack = crate::task::KernelStackBounds::new(guard_page, bottom, top)
+        *stack = crate::memory::kernel_stack::KernelStackBounds::new(guard_page, bottom, top)
             .map_err(|_| ThreadKernelStackLayoutError::InvalidGeometry)?;
     }
     if stacks.last().is_none_or(|stack| stack.top != region_end) {

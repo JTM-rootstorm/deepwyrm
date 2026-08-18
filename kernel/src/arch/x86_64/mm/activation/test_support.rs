@@ -234,9 +234,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         let expected_pages = 12_usize
             .checked_add(
-                crate::task::E3_THREAD_STACK_COUNT
-                    * usize::try_from(crate::task::E3_THREAD_STACK_SIZE / PAGE_SIZE)
-                        .map_err(|_| 0x00ee_u32)?,
+                crate::memory::kernel_stack::E3_THREAD_STACK_COUNT
+                    * usize::try_from(
+                        crate::memory::kernel_stack::E3_THREAD_STACK_SIZE / PAGE_SIZE,
+                    )
+                    .map_err(|_| 0x00ee_u32)?,
             )
             .ok_or(0x00ef_u32)?;
         if payload_pages != expected_pages {

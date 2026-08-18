@@ -4,6 +4,7 @@
 //! facts. Page-table publication remains an architecture-owned boundary, while
 //! user ranges, exact copies, `MemoryObject`, and `AddressRegion` stay portable.
 
+pub(crate) mod kernel_stack;
 mod ownership;
 mod vm;
 

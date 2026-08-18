@@ -6,33 +6,10 @@ use super::{
 };
 
 pub(crate) const E3_INITIAL_USER_RFLAGS: u64 = 0x202;
-pub(crate) const E3_BASE_PAGE_SIZE: u64 = 4096;
 
-const fn parse_decimal_u64(value: &str) -> u64 {
-    let bytes = value.as_bytes();
-    let mut index = 0;
-    let mut output = 0_u64;
-    while index < bytes.len() {
-        let digit = bytes[index];
-        assert!(
-            digit >= b'0' && digit <= b'9',
-            "build-generated E3 layout value is not decimal"
-        );
-        output = output * 10 + (digit - b'0') as u64;
-        index += 1;
-    }
-    output
-}
-
-pub(crate) const E3_THREAD_STACK_COUNT: usize =
-    parse_decimal_u64(env!("DEEPWYRM_E3_THREAD_STACK_COUNT")) as usize;
-pub(crate) const E3_THREAD_STACK_SIZE: u64 =
-    parse_decimal_u64(env!("DEEPWYRM_E3_THREAD_STACK_SIZE"));
-pub(crate) const E3_THREAD_STACK_GUARD_SIZE: u64 =
-    parse_decimal_u64(env!("DEEPWYRM_E3_THREAD_STACK_GUARD_SIZE"));
-pub(crate) const E3_THREAD_STACK_ALIGNMENT: u64 =
-    parse_decimal_u64(env!("DEEPWYRM_E3_THREAD_STACK_ALIGNMENT"));
-pub(crate) const E3_THREAD_STACK_STRIDE: u64 = E3_THREAD_STACK_GUARD_SIZE + E3_THREAD_STACK_SIZE;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+use crate::memory::kernel_stack::E3_THREAD_STACK_COUNT;
+use crate::memory::kernel_stack::{KernelStackBounds, KernelStackLayoutError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExecutionResourceError {
@@ -114,44 +91,6 @@ impl SavedThreadContext {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct KernelStackBounds {
-    pub(crate) guard_page: u64,
-    pub(crate) bottom: u64,
-    pub(crate) top: u64,
-}
-
-impl KernelStackBounds {
-    pub(crate) const fn new(
-        guard_page: u64,
-        bottom: u64,
-        top: u64,
-    ) -> Result<Self, ExecutionResourceError> {
-        let Some(expected_bottom) = guard_page.checked_add(E3_BASE_PAGE_SIZE) else {
-            return Err(ExecutionResourceError::InvalidLayout);
-        };
-        if guard_page == 0
-            || !guard_page.is_multiple_of(E3_BASE_PAGE_SIZE)
-            || bottom != expected_bottom
-            || !bottom.is_multiple_of(E3_BASE_PAGE_SIZE)
-            || top <= bottom
-            || !top.is_multiple_of(E3_BASE_PAGE_SIZE)
-            || !top.is_multiple_of(16)
-        {
-            return Err(ExecutionResourceError::InvalidLayout);
-        }
-        Ok(Self {
-            guard_page,
-            bottom,
-            top,
-        })
-    }
-
-    pub(crate) const fn byte_len(self) -> u64 {
-        self.top - self.bottom
-    }
-}
-
 #[derive(Clone, Copy)]
 struct ResourceSlot<T: Copy> {
     generation: u32,
@@ -196,7 +135,9 @@ impl<const CAPACITY: usize> KernelStackPool<CAPACITY> {
         bounds: [KernelStackBounds; CAPACITY],
     ) -> Result<Self, ExecutionResourceError> {
         for (index, candidate) in bounds.iter().copied().enumerate() {
-            KernelStackBounds::new(candidate.guard_page, candidate.bottom, candidate.top)?;
+            KernelStackBounds::new(candidate.guard_page, candidate.bottom, candidate.top).map_err(
+                |KernelStackLayoutError::InvalidLayout| ExecutionResourceError::InvalidLayout,
+            )?;
             if bounds[..index]
                 .iter()
                 .copied()

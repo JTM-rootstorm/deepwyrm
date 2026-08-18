@@ -660,23 +660,25 @@ fn e3_thread_stack_layout_rejects_overlap_size_and_scratch_conflicts() {
         },
         KernelSegment {
             start: writable_start,
-            end: writable_start + 3 * crate::task::E3_THREAD_STACK_STRIDE,
+            end: writable_start + 3 * crate::memory::kernel_stack::E3_THREAD_STACK_STRIDE,
             kind: SegmentKind::Writable,
         },
     ];
-    let first = crate::task::KernelStackBounds::new(
+    let first = crate::memory::kernel_stack::KernelStackBounds::new(
         writable_start,
-        writable_start + crate::task::E3_THREAD_STACK_GUARD_SIZE,
+        writable_start + crate::memory::kernel_stack::E3_THREAD_STACK_GUARD_SIZE,
         writable_start
-            + crate::task::E3_THREAD_STACK_GUARD_SIZE
-            + crate::task::E3_THREAD_STACK_SIZE,
+            + crate::memory::kernel_stack::E3_THREAD_STACK_GUARD_SIZE
+            + crate::memory::kernel_stack::E3_THREAD_STACK_SIZE,
     )
     .unwrap();
-    let second_guard = writable_start + crate::task::E3_THREAD_STACK_STRIDE;
-    let second = crate::task::KernelStackBounds::new(
+    let second_guard = writable_start + crate::memory::kernel_stack::E3_THREAD_STACK_STRIDE;
+    let second = crate::memory::kernel_stack::KernelStackBounds::new(
         second_guard,
-        second_guard + crate::task::E3_THREAD_STACK_GUARD_SIZE,
-        second_guard + crate::task::E3_THREAD_STACK_GUARD_SIZE + crate::task::E3_THREAD_STACK_SIZE,
+        second_guard + crate::memory::kernel_stack::E3_THREAD_STACK_GUARD_SIZE,
+        second_guard
+            + crate::memory::kernel_stack::E3_THREAD_STACK_GUARD_SIZE
+            + crate::memory::kernel_stack::E3_THREAD_STACK_SIZE,
     )
     .unwrap();
     assert_eq!(
@@ -690,7 +692,7 @@ fn e3_thread_stack_layout_rejects_overlap_size_and_scratch_conflicts() {
     );
     assert!(is_thread_stack_guard(&[first, second], first.guard_page));
     assert!(is_kernel_guard(
-        test_ist_layout(writable_start + 2 * crate::task::E3_THREAD_STACK_STRIDE),
+        test_ist_layout(writable_start + 2 * crate::memory::kernel_stack::E3_THREAD_STACK_STRIDE),
         &[first, second],
         second.guard_page
     ));
@@ -704,10 +706,10 @@ fn e3_thread_stack_layout_rejects_overlap_size_and_scratch_conflicts() {
         ),
         Err(InactiveGraphError::InvalidSegmentLayout)
     );
-    let short = crate::task::KernelStackBounds::new(
+    let short = crate::memory::kernel_stack::KernelStackBounds::new(
         second_guard,
         second_guard + PAGE_SIZE,
-        second_guard + PAGE_SIZE + crate::task::E3_THREAD_STACK_SIZE - PAGE_SIZE,
+        second_guard + PAGE_SIZE + crate::memory::kernel_stack::E3_THREAD_STACK_SIZE - PAGE_SIZE,
     )
     .unwrap();
     assert_eq!(
