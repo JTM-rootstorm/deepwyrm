@@ -1,0 +1,141 @@
+use super::*;
+
+pub(super) fn symbols(llvm_nm: &Path, artifact: &Path) -> String {
+    let mut command = helper_command(llvm_nm);
+    let output = run_output(
+        command.args(["--defined-only", "--demangle"]).arg(artifact),
+        "llvm-nm",
+    );
+    String::from_utf8(output.stdout).expect("llvm-nm output is UTF-8")
+}
+
+pub(super) fn disassembly(llvm_objdump: &Path, artifact: &Path) -> String {
+    let mut command = helper_command(llvm_objdump);
+    let output = run_output(
+        command
+            .args(["--disassemble", "--demangle", "--x86-asm-syntax=intel"])
+            .arg(artifact),
+        "llvm-objdump",
+    );
+    String::from_utf8(output.stdout).expect("llvm-objdump output is UTF-8")
+}
+
+pub(super) fn text_disassembly(disassembly: &str) -> &str {
+    disassembly
+        .split_once("Disassembly of section .text:")
+        .map(|(_, text)| text)
+        .unwrap_or_else(|| panic!("target artifact omitted .text disassembly"))
+}
+
+pub(super) fn validate_entry_normalization(disassembly: &str) {
+    let normalizer = function_body(disassembly, "normalize_dw0_c_cpu_state");
+    assert_eq!(normalizer.matches("pushfq").count(), 1);
+    assert_eq!(normalizer.matches("popfq").count(), 1);
+    assert_eq!(normalizer.matches("cr4").count(), 2);
+    assert_eq!(normalizer.matches("mov\tcr4,").count(), 1);
+    assert_eq!(normalizer.matches("btr\trax, 0x15").count(), 1);
+    assert_eq!(normalizer.matches("btr\tqword ptr [rsp], 0x12").count(), 1);
+    assert_eq!(disassembly.matches("mov\tcr4,").count(), 1);
+
+    let entry = function_body(disassembly, "dw_kernel_rust_entry");
+    let normalize_call = entry
+        .find("normalize_dw0_c_cpu_state")
+        .expect("target entry calls CPU normalizer");
+    let kernel_main_call = entry
+        .find("deepwyrm_kernel::kernel_main")
+        .expect("target entry calls kernel_main");
+    assert!(normalize_call < kernel_main_call);
+}
+
+pub(super) fn function_body<'a>(disassembly: &'a str, symbol: &str) -> &'a str {
+    let start = disassembly
+        .lines()
+        .position(|line| line.contains(symbol) && line.trim_end().ends_with(" >:".trim()))
+        .unwrap_or_else(|| panic!("disassembly omitted {symbol}"));
+    let mut offset = 0;
+    let mut lines = disassembly.lines();
+    for _ in 0..=start {
+        let line = lines.next().expect("symbol line exists");
+        offset += line.len() + 1;
+    }
+    let tail = &disassembly[offset..];
+    let end = tail
+        .lines()
+        .scan(0, |offset, line| {
+            let current = *offset;
+            *offset += line.len() + 1;
+            Some((current, line))
+        })
+        .find_map(|(offset, line)| {
+            (line.contains('<') && line.trim_end().ends_with(" >:".trim())).then_some(offset)
+        })
+        .unwrap_or(tail.len());
+    &tail[..end]
+}
+
+pub(super) fn fixed_x86_64_stack_frame(disassembly: &str, symbol: &str) -> usize {
+    let body = function_body(disassembly, symbol);
+    assert!(
+        !body.contains("\tand\trsp") && !body.contains("\tlea\trsp"),
+        "{symbol} uses dynamic stack adjustment"
+    );
+    let pushes = body
+        .lines()
+        .filter(|line| line.contains("\tpush\t"))
+        .count();
+    let adjustments = body
+        .lines()
+        .filter_map(|line| {
+            let immediate = line.split_once("\tsub\trsp, 0x")?.1;
+            let digits = immediate.bytes().take_while(u8::is_ascii_hexdigit).count();
+            usize::from_str_radix(&immediate[..digits], 16).ok()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        adjustments.len() <= 1,
+        "{symbol} has multiple fixed stack adjustments"
+    );
+    pushes * size_of::<u64>() + adjustments.first().copied().unwrap_or(0)
+}
+
+pub(super) fn sha256(artifact: &Path) -> String {
+    let mut command = helper_command("/usr/bin/sha256sum");
+    digest_from_output(run_output(command.arg(artifact), "sha256sum"))
+}
+
+pub(super) fn helper_command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .env("SOURCE_DATE_EPOCH", "0");
+    command
+}
+
+pub(super) fn digest_from_output(output: Output) -> String {
+    String::from_utf8(output.stdout)
+        .expect("sha256sum output is UTF-8")
+        .split_ascii_whitespace()
+        .next()
+        .expect("sha256sum emitted a digest")
+        .to_owned()
+}
+
+pub(super) fn run_success(command: &mut Command, label: &str) {
+    let output = run_output(command, label);
+    assert!(
+        output.status.success(),
+        "{label} failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+pub(super) fn run_output(command: &mut Command, label: &str) -> Output {
+    command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {label}: {error}"))
+}
