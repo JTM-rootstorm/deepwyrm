@@ -66,7 +66,7 @@ fn physical_ownership_compile_fail_contracts() {
         },
         CompileFailCase {
             fixture: "safe_frame_role_manager_init.rs",
-            expected_error: "error[E0133]: call to unsafe function `FrameRoleManager::<RANGE_CAPACITY, ROLE_CAPACITY>::from_boot_map` is unsafe and requires unsafe block",
+            expected_error: "error[E0133]: call to unsafe function `manager::<impl frame_roles::FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>>::from_boot_map` is unsafe and requires unsafe block",
         },
         CompileFailCase {
             fixture: "private_frame_role_manager_new.rs",
@@ -78,23 +78,23 @@ fn physical_ownership_compile_fail_contracts() {
         },
         CompileFailCase {
             fixture: "allocation_grant_clone.rs",
-            expected_error: "error[E0277]: the trait bound `AllocationGrant: Clone` is not satisfied",
+            expected_error: "error[E0277]: the trait bound `frame_roles::AllocationGrant: Clone` is not satisfied",
         },
         CompileFailCase {
             fixture: "zeroed_grant_clone.rs",
-            expected_error: "error[E0277]: the trait bound `ZeroedGrant: Clone` is not satisfied",
+            expected_error: "error[E0277]: the trait bound `frame_roles::ZeroedGrant: Clone` is not satisfied",
         },
         CompileFailCase {
             fixture: "object_backing_grant_clone.rs",
-            expected_error: "error[E0277]: the trait bound `ObjectBackingGrant: Clone` is not satisfied",
+            expected_error: "error[E0277]: the trait bound `frame_roles::ObjectBackingGrant: Clone` is not satisfied",
         },
         CompileFailCase {
             fixture: "table_candidate_grant_clone.rs",
-            expected_error: "error[E0277]: the trait bound `TableCandidateGrant: Clone` is not satisfied",
+            expected_error: "error[E0277]: the trait bound `frame_roles::TableCandidateGrant: Clone` is not satisfied",
         },
         CompileFailCase {
             fixture: "staged_table_commit_clone.rs",
-            expected_error: "error[E0277]: the trait bound `StagedTableCommit: Clone` is not satisfied",
+            expected_error: "error[E0277]: the trait bound `frame_roles::StagedTableCommit: Clone` is not satisfied",
         },
         CompileFailCase {
             fixture: "safe_x86_address_space_publisher_new.rs",
