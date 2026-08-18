@@ -33,6 +33,11 @@ pub(crate) mod service;
     reason = "DW0-E1 syscall decoding precedes E4 architecture entry and E5 handler integration"
 )]
 pub(crate) mod syscall;
+#[allow(
+    dead_code,
+    reason = "DW0-E2 task payload authority precedes E3 scheduling and E5 syscall consumers"
+)]
+pub(crate) mod task;
 
 #[cfg(feature = "test-support")]
 pub mod test_support;

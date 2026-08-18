@@ -1,4 +1,17 @@
 # Task boundary
 
-Reserved for task groups, processes, threads, and scheduling. No task or
-scheduler behavior is implemented here.
+The task subsystem owns typed `TaskGroup`, `Process`, and `Thread` payload state.
+Generic strong liveness remains owned exclusively by `ObjectRegistry`; task
+payloads hold move-only parent and execution references rather than a second
+reference count.
+
+The lifetime graph is intentionally acyclic: child task groups retain parents,
+processes retain task groups, and threads retain processes. Parent payloads keep
+only child identities for traversal. A process owns its caller-local handle
+table by value and task teardown returns handle finalizers/execution pins for
+release outside task mutation.
+
+Scheduling policy, kernel stacks, architecture context switching, syscall entry,
+and blocking/wakeup behavior are separate boundaries layered on this payload
+authority. Native task state remains capability-controlled and does not encode
+POSIX process, signal, or file-descriptor semantics.

@@ -281,6 +281,22 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
         Ok(BoundCreation { reference })
     }
 
+    pub(crate) fn retain_handle_from_bound(
+        &mut self,
+        bound: &BoundCreation,
+    ) -> Result<HandleRef, ObjectRegistryError> {
+        self.retain_reference(
+            bound.reference.id,
+            bound.reference.object_type,
+            ReferenceKind::Internal,
+            ReferenceKind::Handle,
+        )?;
+        Ok(HandleRef {
+            id: bound.reference.id,
+            object_type: bound.reference.object_type,
+        })
+    }
+
     pub(crate) fn bound_into_handle(
         &mut self,
         bound: BoundCreation,
@@ -403,6 +419,23 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
             id: source.id,
             object_type: source.object_type,
         })
+    }
+
+    pub(crate) fn cancel_creation(
+        &mut self,
+        reference: CreationRef,
+    ) -> Result<(), ReferenceError<CreationRef>> {
+        let id = reference.id;
+        let object_type = reference.object_type;
+        let final_release = match self.release_reference(id, object_type, ReferenceKind::Internal) {
+            Ok(Some(final_release)) => final_release,
+            Ok(None) => unreachable!("unpublished creation owns exactly one internal reference"),
+            Err(error) => return Err(ReferenceError { error, reference }),
+        };
+        if let Err(error) = self.complete_finalization_inner(&final_release) {
+            panic!("unbound creation cancellation failed after final release: {error:?}");
+        }
+        Ok(())
     }
 
     pub(crate) fn release_creation(
@@ -636,6 +669,24 @@ impl payload_cleanup_seal::Sealed for crate::memory::object::MemoryObjectCleanup
 }
 #[cfg(deepwyrm_integrated)]
 impl PayloadCleanupProof for crate::memory::object::MemoryObjectCleanup {}
+
+#[cfg(deepwyrm_integrated)]
+impl payload_binding_seal::Sealed for crate::task::TaskPayloadBinding {
+    fn into_creation(self) -> CreationRef {
+        self.into_creation()
+    }
+}
+#[cfg(deepwyrm_integrated)]
+impl PayloadBindingProof for crate::task::TaskPayloadBinding {}
+
+#[cfg(deepwyrm_integrated)]
+impl payload_cleanup_seal::Sealed for crate::task::TaskPayloadCleanup {
+    fn into_final_release(self) -> FinalRelease {
+        self.into_final_release()
+    }
+}
+#[cfg(deepwyrm_integrated)]
+impl PayloadCleanupProof for crate::task::TaskPayloadCleanup {}
 
 fn next_generation(generation: u32) -> Option<u32> {
     generation.checked_add(1).filter(|next| *next != 0)
