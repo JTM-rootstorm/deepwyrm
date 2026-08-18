@@ -10,6 +10,11 @@
 pub mod arch;
 pub mod boot;
 pub mod debug;
+#[allow(
+    dead_code,
+    reason = "DW0-D3 lands the standalone handle table before DW0-D4/D5 consumers"
+)]
+pub(crate) mod handle;
 pub mod interrupt;
 pub mod memory;
 #[allow(
