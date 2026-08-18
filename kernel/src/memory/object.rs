@@ -172,6 +172,7 @@ impl MemoryObjectCleanup {
     }
 }
 
+#[cfg(deepwyrm_integrated)]
 pub(crate) fn complete_memory_finalization<
     const REGISTRY_OBJECTS: usize,
     const RANGE_CAPACITY: usize,

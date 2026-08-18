@@ -30,6 +30,8 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=DEEPWYRM_GUEST_TEST_SELECTOR");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_GUEST_TEST_ID");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_c3_one_shot_ui)");
+    println!("cargo:rustc-check-cfg=cfg(deepwyrm_integrated)");
+    println!("cargo:rustc-cfg=deepwyrm_integrated");
 
     let layout_source = fs::read_to_string(&layout_path)
         .map_err(|error| format!("{}: {error}", layout_path.display()))?;

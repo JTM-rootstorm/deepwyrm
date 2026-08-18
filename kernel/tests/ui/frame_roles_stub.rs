@@ -51,11 +51,3 @@ pub(crate) mod frame_roles {
         }
     }
 }
-
-// The production object registry seals MemoryObject payload proofs through the
-// canonical `crate::memory::object` path. Memory-authority UI fixtures embed the
-// VM facade as `crate::vm`, so provide only a path alias; this does not widen
-// either proof type or its constructors.
-pub(crate) mod object {
-    pub(crate) use crate::vm::object::{MemoryObjectBinding, MemoryObjectCleanup};
-}

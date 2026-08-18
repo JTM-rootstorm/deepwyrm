@@ -619,18 +619,22 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
     }
 }
 
+#[cfg(deepwyrm_integrated)]
 impl payload_binding_seal::Sealed for crate::memory::object::MemoryObjectBinding {
     fn into_creation(self) -> CreationRef {
         self.into_creation()
     }
 }
+#[cfg(deepwyrm_integrated)]
 impl PayloadBindingProof for crate::memory::object::MemoryObjectBinding {}
 
+#[cfg(deepwyrm_integrated)]
 impl payload_cleanup_seal::Sealed for crate::memory::object::MemoryObjectCleanup {
     fn into_final_release(self) -> FinalRelease {
         self.into_final_release()
     }
 }
+#[cfg(deepwyrm_integrated)]
 impl PayloadCleanupProof for crate::memory::object::MemoryObjectCleanup {}
 
 fn next_generation(generation: u32) -> Option<u32> {

@@ -1,6 +1,4 @@
 extern crate deepwyrm_abi;
-#[path = "object_payload_stubs.rs"]
-mod memory;
 #[path = "../../src/object/mod.rs"]
 mod object;
 use deepwyrm_abi::DW_OBJECT_TYPE_PROCESS;
