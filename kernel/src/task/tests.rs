@@ -15,7 +15,7 @@ fn release_pins(
     registry: &mut ObjectRegistry<OBJECTS>,
     pins: ExitPins<8>,
 ) -> [Option<FinalRelease>; 9] {
-    let (process, threads) = pins.into_parts();
+    let (process, threads, _resources) = pins.into_parts();
     let mut out = core::array::from_fn(|_| None);
     let mut next = 0;
     for pin in threads.into_iter().flatten().chain(process) {
@@ -47,6 +47,26 @@ fn release_nonfinal_pin(registry: &mut ObjectRegistry<OBJECTS>, pin: InternalRef
     assert!(registry.release_internal(pin).unwrap().is_none());
 }
 
+fn prepare_thread(tasks: &mut Tasks, thread: ThreadKey, seed: u64) {
+    let start = ThreadStartState::from_validated_user_state(
+        0x0000_0000_4000_0000 + seed * 0x1000,
+        0x0000_0000_5000_0000 + seed * 0x1000,
+        seed,
+        seed ^ 0x55aa,
+    );
+    tasks.configure_thread_start(thread, start).unwrap();
+    tasks
+        .attach_thread_execution_resources(
+            thread,
+            ThreadExecutionResources {
+                kernel_stack: KernelStackId::new(seed + 1).unwrap(),
+                context: ThreadContextId::new(seed + 0x100).unwrap(),
+            },
+        )
+        .unwrap();
+    assert_eq!(tasks.thread_start_state(thread), Ok(Some(start)));
+}
+
 #[test]
 fn child_to_parent_lifetime_chain_finalizes_without_cycles() {
     let mut registry = ObjectRegistry::<OBJECTS>::new();
@@ -68,6 +88,8 @@ fn child_to_parent_lifetime_chain_finalizes_without_cycles() {
         tasks.thread_info(thread).unwrap().state,
         DW_TASK_STATE_CREATED
     );
+    assert_eq!(tasks.start_thread(thread), Err(TaskError::BadState));
+    prepare_thread(&mut tasks, thread, 1);
     tasks.start_thread(thread).unwrap();
     assert_eq!(
         tasks.process_info(process).unwrap().state,
@@ -126,6 +148,8 @@ fn process_exit_drains_handles_and_records_per_thread_reason() {
         .create_thread(&mut registry, &temporary_process_pin)
         .unwrap();
     release_nonfinal_pin(&mut registry, temporary_process_pin);
+    prepare_thread(&mut tasks, thread0, 2);
+    prepare_thread(&mut tasks, thread1, 3);
     tasks.start_thread(thread0).unwrap();
     tasks.start_thread(thread1).unwrap();
 
@@ -203,6 +227,8 @@ fn userspace_exception_is_process_fatal_and_siblings_do_not_claim_fault() {
         .create_thread(&mut registry, &temporary_process_pin)
         .unwrap();
     release_nonfinal_pin(&mut registry, temporary_process_pin);
+    prepare_thread(&mut tasks, faulting, 4);
+    prepare_thread(&mut tasks, sibling, 5);
     tasks.start_thread(faulting).unwrap();
     tasks.start_thread(sibling).unwrap();
 
@@ -263,6 +289,7 @@ fn task_group_teardown_is_iterative_and_marks_all_live_descendants() {
     let process_owner = process_parent_pin(&mut registry, &process_handle);
     let (thread, thread_handle) = tasks.create_thread(&mut registry, &process_owner).unwrap();
     release_nonfinal_pin(&mut registry, process_owner);
+    prepare_thread(&mut tasks, thread, 6);
     tasks.start_thread(thread).unwrap();
 
     let effects = tasks.terminate_group(&mut registry, root).unwrap();
@@ -324,4 +351,49 @@ fn failed_child_creation_rolls_back_generic_slot_and_parent_pin() {
     let root_final = registry.release_internal(root_owner).unwrap().unwrap();
     let finalization = tasks.take_finalization(root_final).unwrap();
     assert!(complete_task_finalization(&mut registry, finalization).is_none());
+}
+
+#[test]
+fn explicit_thread_termination_returns_execution_resources_and_closes_final_thread_process() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (process, process_handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let process_owner = process_parent_pin(&mut registry, &process_handle);
+    let (thread, thread_handle) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    release_nonfinal_pin(&mut registry, process_owner);
+    prepare_thread(&mut tasks, thread, 9);
+    tasks.start_thread(thread).unwrap();
+
+    let pins = tasks.terminate_thread_authorized(thread, 0x88).unwrap();
+    let (process_pin, thread_pins, resources) = pins.into_parts();
+    let thread_pin = thread_pins.into_iter().flatten().next().unwrap();
+    let resource = resources.into_iter().flatten().next().unwrap();
+    assert_eq!(resource.kernel_stack, KernelStackId::new(10).unwrap());
+    assert_eq!(resource.context, ThreadContextId::new(0x109).unwrap());
+    assert!(registry.release_internal(thread_pin).unwrap().is_none());
+    assert!(
+        registry
+            .release_internal(process_pin.unwrap())
+            .unwrap()
+            .is_none()
+    );
+
+    let thread_info = tasks.thread_info(thread).unwrap();
+    assert_eq!(thread_info.reason, DW_TERMINATION_AUTHORIZED);
+    assert_eq!(thread_info.detail, 0x88);
+    let process_info = tasks.process_info(process).unwrap();
+    assert_eq!(process_info.reason, DW_TERMINATION_AUTHORIZED);
+    assert_eq!(process_info.detail, 0x88);
+    assert!(matches!(
+        tasks.terminate_thread_authorized(thread, 1),
+        Err(TaskError::BadState)
+    ));
+
+    let thread_final = registry.release_handle(thread_handle).unwrap().unwrap();
+    finish_task_release(&mut tasks, &mut registry, thread_final);
+    let process_final = registry.release_handle(process_handle).unwrap().unwrap();
+    finish_task_release(&mut tasks, &mut registry, process_final);
+    let root_final = registry.release_internal(root_owner).unwrap().unwrap();
+    finish_task_release(&mut tasks, &mut registry, root_final);
 }

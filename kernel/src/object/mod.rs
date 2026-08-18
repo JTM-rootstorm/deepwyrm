@@ -5,6 +5,15 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(deepwyrm_integrated)]
+mod finalizer;
+#[cfg(deepwyrm_integrated)]
+#[allow(
+    unused_imports,
+    reason = "DW0-E2 exports the typed finalizer router ahead of E5 close/teardown consumers"
+)]
+pub(crate) use finalizer::PayloadFinalizer;
+
 use deepwyrm_abi::{DwObjectType, dw_object_compatible_rights};
 
 static NEXT_REGISTRY_DOMAIN: AtomicU64 = AtomicU64::new(1);

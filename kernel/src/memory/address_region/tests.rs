@@ -880,8 +880,9 @@ fn root_region_handle_close_preserves_address_space_until_process_exit() {
         .terminate_process_authorized(&mut registry, process, 0x77)
         .unwrap();
     assert_eq!(effects.drained.final_release_count(), 0);
-    let (process_pin, thread_pins) = effects.pins.into_parts();
+    let (process_pin, thread_pins, resources) = effects.pins.into_parts();
     assert!(thread_pins.into_iter().flatten().next().is_none());
+    assert!(resources.into_iter().flatten().next().is_none());
     assert!(
         registry
             .release_internal(process_pin.unwrap())

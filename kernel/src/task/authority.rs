@@ -172,6 +172,9 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             parent,
             state: TaskStateRecord::created(),
             execution_pin: None,
+            start: None,
+            kernel_stack: None,
+            context: None,
         });
         Ok(TaskPayloadBinding::Thread { creation, key })
     }
@@ -291,6 +294,43 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             .state)
     }
 
+    pub(crate) fn configure_thread_start(
+        &mut self,
+        key: ThreadKey,
+        start: ThreadStartState,
+    ) -> Result<(), TaskError> {
+        let thread = self.thread_mut(key)?;
+        if thread.state.state != DW_TASK_STATE_CREATED || thread.start.is_some() {
+            return Err(TaskError::BadState);
+        }
+        thread.start = Some(start);
+        Ok(())
+    }
+
+    pub(crate) fn attach_thread_execution_resources(
+        &mut self,
+        key: ThreadKey,
+        resources: ThreadExecutionResources,
+    ) -> Result<(), TaskError> {
+        let thread = self.thread_mut(key)?;
+        if thread.state.state != DW_TASK_STATE_CREATED
+            || thread.kernel_stack.is_some()
+            || thread.context.is_some()
+        {
+            return Err(TaskError::BadState);
+        }
+        thread.kernel_stack = Some(resources.kernel_stack);
+        thread.context = Some(resources.context);
+        Ok(())
+    }
+
+    pub(crate) fn thread_start_state(
+        &self,
+        key: ThreadKey,
+    ) -> Result<Option<ThreadStartState>, TaskError> {
+        Ok(self.thread(key)?.start)
+    }
+
     pub(crate) fn start_thread(&mut self, key: ThreadKey) -> Result<(), TaskError> {
         let thread_slot = self.thread_slot(key)?;
         let process_key = ProcessKey(
@@ -310,11 +350,13 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         {
             return Err(TaskError::BadState);
         }
-        self.threads[thread_slot]
+        let thread = self.threads[thread_slot]
             .as_mut()
-            .expect("validated thread slot")
-            .state
-            .mark_running()?;
+            .expect("validated thread slot");
+        if thread.start.is_none() || thread.kernel_stack.is_none() || thread.context.is_none() {
+            return Err(TaskError::BadState);
+        }
+        thread.state.mark_running()?;
         let process = self.processes[process_slot]
             .as_mut()
             .expect("validated process slot");
@@ -351,8 +393,14 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             .expect("validated thread slot");
         thread.state.terminate(TerminationRecord::normal(code))?;
         let mut pins = ExitPins::empty();
+        let resources = take_thread_execution_resources(thread);
         if let Some(pin) = thread.execution_pin.take() {
-            pins.push_thread(pin);
+            pins.push_thread(pin, resources);
+        } else {
+            assert!(
+                resources.is_none(),
+                "Thread lost its execution pin before resource retirement"
+            );
         }
 
         if !self.process_has_live_threads(process_key)? {
@@ -383,8 +431,14 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             .state
             .terminate(TerminationRecord::authorized(detail))?;
         let mut pins = ExitPins::empty();
+        let resources = take_thread_execution_resources(thread);
         if let Some(pin) = thread.execution_pin.take() {
-            pins.push_thread(pin);
+            pins.push_thread(pin, resources);
+        } else {
+            assert!(
+                resources.is_none(),
+                "Thread lost its execution pin before resource retirement"
+            );
         }
         if !self.process_has_live_threads(process_key)? {
             let process = self.process_mut(process_key)?;
@@ -492,8 +546,14 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
                 _ => sibling_termination,
             };
             thread.state.terminate(termination)?;
+            let resources = take_thread_execution_resources(thread);
             if let Some(pin) = thread.execution_pin.take() {
-                pins.push_thread(pin);
+                pins.push_thread(pin, resources);
+            } else {
+                assert!(
+                    resources.is_none(),
+                    "Thread lost its execution pin before resource retirement"
+                );
             }
         }
         let process = self.processes[process_slot]
@@ -590,6 +650,10 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             record.execution_pin.is_none(),
             "finalizing Thread still owns execution authority"
         );
+        assert!(
+            record.kernel_stack.is_none() && record.context.is_none(),
+            "finalizing Thread still owns execution resources"
+        );
         let parent_slot = self.process_slot(ProcessKey(record.parent.id()))?;
         let parent = self.processes[parent_slot]
             .as_mut()
@@ -649,6 +713,17 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             }
         }
         Ok(false)
+    }
+}
+
+fn take_thread_execution_resources(thread: &mut ThreadRecord) -> Option<ThreadExecutionResources> {
+    match (thread.kernel_stack.take(), thread.context.take()) {
+        (Some(kernel_stack), Some(context)) => Some(ThreadExecutionResources {
+            kernel_stack,
+            context,
+        }),
+        (None, None) => None,
+        _ => panic!("Thread kernel-stack/context ownership diverged"),
     }
 }
 

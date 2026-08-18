@@ -64,6 +64,52 @@ impl ThreadKey {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct KernelStackId(u64);
+impl KernelStackId {
+    pub(crate) const fn new(raw: u64) -> Option<Self> {
+        if raw == 0 { None } else { Some(Self(raw)) }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ThreadContextId(u64);
+impl ThreadContextId {
+    pub(crate) const fn new(raw: u64) -> Option<Self> {
+        if raw == 0 { None } else { Some(Self(raw)) }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ThreadStartState {
+    entry: u64,
+    stack_pointer: u64,
+    argument0: u64,
+    argument1: u64,
+}
+
+impl ThreadStartState {
+    pub(crate) const fn from_validated_user_state(
+        entry: u64,
+        stack_pointer: u64,
+        argument0: u64,
+        argument1: u64,
+    ) -> Self {
+        Self {
+            entry,
+            stack_pointer,
+            argument0,
+            argument1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ThreadExecutionResources {
+    pub(crate) kernel_stack: KernelStackId,
+    pub(crate) context: ThreadContextId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TerminationRecord {
     reason: DwTerminationReason,
     application_code: u32,
@@ -181,6 +227,9 @@ struct ThreadRecord {
     parent: InternalRef,
     state: TaskStateRecord,
     execution_pin: Option<InternalRef>,
+    start: Option<ThreadStartState>,
+    kernel_stack: Option<KernelStackId>,
+    context: Option<ThreadContextId>,
 }
 
 #[must_use = "task payload bindings must be sealed by ObjectRegistry before first publication"]
@@ -246,6 +295,7 @@ pub(crate) struct TaskFinalization {
 pub(crate) struct ExitPins<const THREADS: usize> {
     process: Option<InternalRef>,
     threads: [Option<InternalRef>; THREADS],
+    resources: [Option<ThreadExecutionResources>; THREADS],
     count: usize,
 }
 
@@ -254,16 +304,24 @@ impl<const THREADS: usize> ExitPins<THREADS> {
         Self {
             process: None,
             threads: core::array::from_fn(|_| None),
+            resources: [None; THREADS],
             count: 0,
         }
     }
-    fn push_thread(&mut self, pin: InternalRef) {
+    fn push_thread(&mut self, pin: InternalRef, resources: Option<ThreadExecutionResources>) {
         assert!(self.count < THREADS, "terminal thread pin batch overflow");
         self.threads[self.count] = Some(pin);
+        self.resources[self.count] = resources;
         self.count += 1;
     }
-    pub(crate) fn into_parts(self) -> (Option<InternalRef>, [Option<InternalRef>; THREADS]) {
-        (self.process, self.threads)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Option<InternalRef>,
+        [Option<InternalRef>; THREADS],
+        [Option<ThreadExecutionResources>; THREADS],
+    ) {
+        (self.process, self.threads, self.resources)
     }
 }
 

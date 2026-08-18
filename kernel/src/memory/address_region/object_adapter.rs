@@ -179,6 +179,28 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
         Ok((record.parent, record.region))
     }
 
+    pub(crate) fn region_mut_for_teardown<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &mut self,
+        tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        key: AddressRegionObjectKey,
+    ) -> Result<&mut AddressRegion<SLOTS>, AddressRegionObjectError> {
+        let process = ProcessKey::from_object_id(self.record(key)?.process);
+        if tasks
+            .process_info(process)
+            .map_err(AddressRegionObjectError::Task)?
+            .state
+            != DW_TASK_STATE_EXITED
+        {
+            return Err(AddressRegionObjectError::Task(TaskError::BadState));
+        }
+        Ok(&mut self.record_mut(key)?.region)
+    }
+
     pub(crate) fn retire_exited_root<
         const GROUPS: usize,
         const PROCESSES: usize,
@@ -210,6 +232,16 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
             .as_ref()
             .expect("located root region")
             .object;
+        if self.records[slot]
+            .as_ref()
+            .expect("located root region")
+            .region
+            .mappings()
+            .iter()
+            .any(Option::is_some)
+        {
+            return Err(AddressRegionObjectError::LiveMappings);
+        }
         if tasks
             .root_region(process)
             .map_err(AddressRegionObjectError::Task)?
