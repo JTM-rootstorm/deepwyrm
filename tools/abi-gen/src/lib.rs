@@ -2384,6 +2384,26 @@ mod tests {
         let model = Model::load(root.path()).unwrap();
         let outputs = render(&model).unwrap();
         assert_eq!(outputs, render(&model).unwrap());
+        let rust = &outputs["deepwyrm_abi.rs"];
+        let c = &outputs["deepwyrm_abi.h"];
+        assert!(rust.contains(&format!(
+            "pub const DW_RIGHTS_KNOWN_MASK: DwRights = DwRights({});",
+            model.known_rights_mask
+        )));
+        assert!(c.contains(&format!(
+            "#define DW_RIGHTS_KNOWN_MASK ((DwRights)({}))",
+            model.known_rights_mask
+        )));
+        for entry in &model.object_rights {
+            assert!(rust.contains(&format!(
+                "pub const DW_OBJECT_COMPATIBLE_RIGHTS_{}: DwRights = DwRights({});",
+                entry.object, entry.mask
+            )));
+            assert!(c.contains(&format!(
+                "#define DW_OBJECT_COMPATIBLE_RIGHTS_{} ((DwRights)({}))",
+                entry.object, entry.mask
+            )));
+        }
         let documentation = &outputs["ABI.md"];
         for name in [
             "DW_BOOT_BASE_PAGE_SIZE",
@@ -2537,6 +2557,16 @@ mod tests {
         assert!(
             load_error(&root)
                 .contains("sentinel/reserved object `NONE` must not declare compatible rights")
+        );
+
+        let root = TempRoot::copy_schema();
+        root.rewrite("object_rights.toml", |text| {
+            format!("{text}\n[[object_rights]]\nobject = \"INTERRUPT\"\nrights = \"INSPECT\"\n")
+        });
+        assert!(
+            load_error(&root).contains(
+                "sentinel/reserved object `INTERRUPT` must not declare compatible rights"
+            )
         );
 
         let root = TempRoot::copy_schema();
