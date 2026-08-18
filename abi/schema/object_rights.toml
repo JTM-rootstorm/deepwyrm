@@ -1,0 +1,33 @@
+schema_version = 1
+
+[[object_rights]]
+object = "TASK_GROUP"
+rights = "MODIFY,DUPLICATE,TRANSFER,INSPECT"
+
+[[object_rights]]
+object = "PROCESS"
+rights = "WAIT,MODIFY,DUPLICATE,TRANSFER,INSPECT"
+
+[[object_rights]]
+object = "THREAD"
+rights = "EXECUTE,WAIT,MODIFY,DUPLICATE,TRANSFER,INSPECT"
+
+[[object_rights]]
+object = "MEMORY_OBJECT"
+rights = "READ,WRITE,EXECUTE,MAP,DUPLICATE,TRANSFER,INSPECT"
+
+[[object_rights]]
+object = "ADDRESS_REGION"
+rights = "MAP,MODIFY,DUPLICATE,TRANSFER,INSPECT"
+
+[[object_rights]]
+object = "CHANNEL"
+rights = "READ,WRITE,WAIT,DUPLICATE,TRANSFER,INSPECT"
+
+[[object_rights]]
+object = "EVENT"
+rights = "WAIT,SIGNAL,DUPLICATE,TRANSFER,INSPECT"
+
+[[object_rights]]
+object = "TIMER"
+rights = "WAIT,MODIFY,DUPLICATE,TRANSFER,INSPECT"

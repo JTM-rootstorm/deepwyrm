@@ -10,6 +10,7 @@ const SCHEMA_FILES: &[(&str, &[&str])] = &[
     ("status.toml", &["status"]),
     ("rights.toml", &["right"]),
     ("objects.toml", &["object", "signal"]),
+    ("object_rights.toml", &["object_rights"]),
     (
         "boot.toml",
         &[
@@ -335,6 +336,14 @@ struct Syscall {
 }
 
 #[derive(Clone, Debug)]
+struct ObjectRights {
+    object: String,
+    object_value: u32,
+    rights: Vec<String>,
+    mask: u64,
+}
+
+#[derive(Clone, Debug)]
 struct ObjectInfoTopic {
     topic: String,
     accepted_objects: String,
@@ -350,6 +359,8 @@ struct Model {
     value_sets: Vec<ValueSet>,
     constants: Vec<Constant>,
     records: Vec<Record>,
+    object_rights: Vec<ObjectRights>,
+    known_rights_mask: u64,
     object_info_topics: Vec<ObjectInfoTopic>,
     syscalls: Vec<Syscall>,
 }
@@ -529,22 +540,26 @@ impl Model {
         }
         validate_boot_contract_constants(boot_doc, &constants)?;
 
-        let object_names = value_sets
+        let object_set = value_sets
             .iter()
             .find(|set| set.section == "object")
-            .unwrap()
-            .values
-            .iter()
-            .map(|value| value.name.clone())
-            .collect::<BTreeSet<_>>();
-        let right_names = value_sets
+            .unwrap();
+        let right_set = value_sets
             .iter()
             .find(|set| set.section == "right")
-            .unwrap()
+            .unwrap();
+        let object_names = object_set
             .values
             .iter()
             .map(|value| value.name.clone())
             .collect::<BTreeSet<_>>();
+        let right_names = right_set
+            .values
+            .iter()
+            .map(|value| value.name.clone())
+            .collect::<BTreeSet<_>>();
+        let (object_rights, known_rights_mask) =
+            load_object_rights(&documents["object_rights.toml"], object_set, right_set)?;
         let status_names = value_sets
             .iter()
             .find(|set| set.section == "status")
@@ -664,6 +679,7 @@ impl Model {
             });
         }
         syscalls.sort_by_key(|syscall| syscall.number);
+        validate_syscall_object_rights(&syscalls, &object_rights)?;
 
         Ok(Self {
             abi,
@@ -671,6 +687,8 @@ impl Model {
             value_sets,
             constants,
             records,
+            object_rights,
+            known_rights_mask,
             object_info_topics,
             syscalls,
         })
@@ -861,6 +879,151 @@ fn validate_value_sets(sets: &[ValueSet]) -> Result<()> {
         return Err(Error::new(
             "object type zero must be assigned exactly once to NONE",
         ));
+    }
+    Ok(())
+}
+
+fn load_object_rights(
+    document: &Document,
+    objects: &ValueSet,
+    rights: &ValueSet,
+) -> Result<(Vec<ObjectRights>, u64)> {
+    document.top.reject_unknown(&["schema_version"], None)?;
+    require_schema_version(&document.top)?;
+
+    let known_rights_mask = rights.values.iter().try_fold(0_u64, |mask, right| {
+        let value = u64::try_from(right.value)
+            .map_err(|_| Error::new(format!("right `{}` does not fit DwRights", right.name)))?;
+        Ok::<u64, Error>(mask | value)
+    })?;
+    let mut seen_objects = BTreeSet::new();
+    let mut entries = Vec::new();
+
+    for table in tables(document, "object_rights") {
+        table.reject_unknown(&["object", "rights"], None)?;
+        let object = table.text("object")?;
+        let object_def = objects
+            .values
+            .iter()
+            .find(|item| item.name == object)
+            .ok_or_else(|| {
+                Error::new(format!(
+                    "{}: object-rights entry uses unknown object `{object}`",
+                    table.label()
+                ))
+            })?;
+        if object_def.name == "NONE" || matches!(object_def.extra.as_str(), "sentinel" | "reserved")
+        {
+            return Err(Error::new(format!(
+                "{}: sentinel/reserved object `{object}` must not declare compatible rights",
+                table.label()
+            )));
+        }
+        if !seen_objects.insert(object.clone()) {
+            return Err(Error::new(format!(
+                "{}: duplicate object-rights entry for `{object}`",
+                table.label()
+            )));
+        }
+
+        let raw_rights = table.text("rights")?;
+        if raw_rights.trim().is_empty() {
+            return Err(Error::new(format!(
+                "{}: object `{object}` compatible-rights mask must be nonempty",
+                table.label()
+            )));
+        }
+        let mut seen_rights = BTreeSet::new();
+        let mut names = Vec::new();
+        let mut mask = 0_u64;
+        for name in raw_rights.split(',').map(str::trim) {
+            if name.is_empty() {
+                return Err(Error::new(format!(
+                    "{}: object `{object}` contains an empty right name",
+                    table.label()
+                )));
+            }
+            if !seen_rights.insert(name.to_owned()) {
+                return Err(Error::new(format!(
+                    "{}: object `{object}` repeats right `{name}`",
+                    table.label()
+                )));
+            }
+            let right = rights
+                .values
+                .iter()
+                .find(|item| item.name == name)
+                .ok_or_else(|| {
+                    Error::new(format!(
+                        "{}: object `{object}` uses unknown right `{name}`",
+                        table.label()
+                    ))
+                })?;
+            mask |= u64::try_from(right.value).expect("validated DwRights value");
+            names.push(name.to_owned());
+        }
+        if mask == 0 {
+            return Err(Error::new(format!(
+                "{}: object `{object}` compatible-rights mask must be nonempty",
+                table.label()
+            )));
+        }
+        entries.push(ObjectRights {
+            object,
+            object_value: u32::try_from(object_def.value).expect("validated DwObjectType value"),
+            rights: names,
+            mask,
+        });
+    }
+
+    for object in &objects.values {
+        if object.name == "NONE" || matches!(object.extra.as_str(), "sentinel" | "reserved") {
+            continue;
+        }
+        if !seen_objects.contains(&object.name) {
+            return Err(Error::new(format!(
+                "object-rights schema is missing live object `{}`",
+                object.name
+            )));
+        }
+    }
+    entries.sort_by_key(|entry| entry.object_value);
+    Ok((entries, known_rights_mask))
+}
+
+fn validate_syscall_object_rights(
+    syscalls: &[Syscall],
+    object_rights: &[ObjectRights],
+) -> Result<()> {
+    for syscall in syscalls {
+        for argument in &syscall.arguments {
+            if argument.rights.is_empty() {
+                continue;
+            }
+            let accepts = |entry: &ObjectRights| {
+                argument
+                    .rights
+                    .iter()
+                    .all(|right| entry.rights.contains(right))
+            };
+            let valid = match argument.object_type.as_str() {
+                "ANY" => object_rights.iter().any(accepts),
+                "NONE" => false,
+                object => object_rights
+                    .iter()
+                    .find(|entry| entry.object == object)
+                    .is_some_and(accepts),
+            };
+            if !valid {
+                return Err(Error::new(format!(
+                    "syscall `{}` argument `{}` requires rights `{}` incompatible with object `{}`",
+                    syscall.name,
+                    argument.name,
+                    argument.rights.join("+"),
+                    argument.object_type
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -1246,6 +1409,62 @@ fn render_rust(model: &Model) -> Result<String> {
             .unwrap();
         }
     }
+    writeln!(out, "/// Mask of every DwRights bit known to ABI 0.").unwrap();
+    writeln!(
+        out,
+        "pub const DW_RIGHTS_KNOWN_MASK: DwRights = DwRights({});\n",
+        model.known_rights_mask
+    )
+    .unwrap();
+    for entry in &model.object_rights {
+        writeln!(
+            out,
+            "/// Compatible rights for the {} object type.",
+            entry.object
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "pub const DW_OBJECT_COMPATIBLE_RIGHTS_{}: DwRights = DwRights({});\n",
+            entry.object, entry.mask
+        )
+        .unwrap();
+    }
+    writeln!(out, "/// Returns the compatible-rights mask for one object type; sentinel, reserved, and unknown types return zero.").unwrap();
+    writeln!(
+        out,
+        "pub const fn dw_object_compatible_rights(object_type: DwObjectType) -> DwRights {{"
+    )
+    .unwrap();
+    writeln!(out, "    match object_type.0 {{").unwrap();
+    for entry in &model.object_rights {
+        writeln!(
+            out,
+            "        {} => DW_OBJECT_COMPATIBLE_RIGHTS_{},",
+            entry.object_value, entry.object
+        )
+        .unwrap();
+    }
+    writeln!(out, "        _ => DwRights(0),").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}\n").unwrap();
+    writeln!(out, "/// Returns true when a rights value contains only ABI-known bits; zero is structurally known.").unwrap();
+    writeln!(
+        out,
+        "pub const fn dw_rights_are_known(rights: DwRights) -> bool {{"
+    )
+    .unwrap();
+    writeln!(out, "    rights.0 & !DW_RIGHTS_KNOWN_MASK.0 == 0").unwrap();
+    writeln!(out, "}}\n").unwrap();
+    writeln!(out, "/// Returns true when all bits are compatible with the object type; zero is structurally compatible.").unwrap();
+    writeln!(out, "pub const fn dw_rights_are_compatible(object_type: DwObjectType, rights: DwRights) -> bool {{").unwrap();
+    writeln!(
+        out,
+        "    let compatible = dw_object_compatible_rights(object_type);"
+    )
+    .unwrap();
+    writeln!(out, "    rights.0 & !compatible.0 == 0").unwrap();
+    writeln!(out, "}}\n").unwrap();
     for constant in &model.constants {
         writeln!(out, "/// {}", constant.doc).unwrap();
         writeln!(
@@ -1358,6 +1577,46 @@ fn render_rust(model: &Model) -> Result<String> {
             .unwrap();
         }
     }
+    writeln!(
+        out,
+        "        assert_eq!(DW_RIGHTS_KNOWN_MASK.0, {});",
+        model.known_rights_mask
+    )
+    .unwrap();
+    for entry in &model.object_rights {
+        writeln!(
+            out,
+            "        assert_eq!(DW_OBJECT_COMPATIBLE_RIGHTS_{}.0, {});",
+            entry.object, entry.mask
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "        assert_eq!(dw_object_compatible_rights(DW_OBJECT_TYPE_{}).0, {});",
+            entry.object, entry.mask
+        )
+        .unwrap();
+    }
+    writeln!(
+        out,
+        "        assert_eq!(dw_object_compatible_rights(DW_OBJECT_TYPE_NONE).0, 0);"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        assert!(dw_rights_are_known(DW_RIGHTS_KNOWN_MASK));"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        assert!(dw_rights_are_compatible(DW_OBJECT_TYPE_MEMORY_OBJECT, DW_RIGHT_MAP));"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        assert!(!dw_rights_are_compatible(DW_OBJECT_TYPE_TASK_GROUP, DW_RIGHT_READ));"
+    )
+    .unwrap();
     for constant in &model.constants {
         if model
             .newtypes
@@ -1452,6 +1711,64 @@ fn render_c(model: &Model) -> Result<String> {
         }
         out.push('\n');
     }
+    writeln!(out, "/* Mask of every DwRights bit known to ABI 0. */").unwrap();
+    writeln!(
+        out,
+        "#define DW_RIGHTS_KNOWN_MASK ((DwRights)({}))",
+        model.known_rights_mask
+    )
+    .unwrap();
+    for entry in &model.object_rights {
+        writeln!(
+            out,
+            "/* Compatible rights for the {} object type. */",
+            entry.object
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "#define DW_OBJECT_COMPATIBLE_RIGHTS_{} ((DwRights)({}))",
+            entry.object, entry.mask
+        )
+        .unwrap();
+    }
+    out.push('\n');
+    writeln!(
+        out,
+        "static inline DwRights dw_object_compatible_rights(DwObjectType object_type) {{"
+    )
+    .unwrap();
+    writeln!(out, "    switch (object_type) {{").unwrap();
+    for entry in &model.object_rights {
+        writeln!(
+            out,
+            "    case DW_OBJECT_TYPE_{}: return DW_OBJECT_COMPATIBLE_RIGHTS_{};",
+            entry.object, entry.object
+        )
+        .unwrap();
+    }
+    writeln!(out, "    default: return (DwRights)0;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}\n").unwrap();
+    writeln!(
+        out,
+        "static inline int dw_rights_are_known(DwRights rights) {{"
+    )
+    .unwrap();
+    writeln!(out, "    return (rights & ~DW_RIGHTS_KNOWN_MASK) == 0;").unwrap();
+    writeln!(out, "}}\n").unwrap();
+    writeln!(
+        out,
+        "static inline int dw_rights_are_compatible(DwObjectType object_type, DwRights rights) {{"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    DwRights compatible = dw_object_compatible_rights(object_type);"
+    )
+    .unwrap();
+    writeln!(out, "    return (rights & ~compatible) == 0;").unwrap();
+    writeln!(out, "}}\n").unwrap();
     for constant in &model.constants {
         writeln!(out, "/* {} */", constant.doc).unwrap();
         writeln!(
@@ -1700,6 +2017,30 @@ fn render_markdown(model: &Model) -> Result<String> {
         model.abi.rights_input_rule
     )
     .unwrap();
+    writeln!(out, "## Object-right compatibility\n").unwrap();
+    writeln!(out, "`DW_RIGHTS_KNOWN_MASK` is `{}`. Zero is structurally known/compatible; operations that request new authority apply the separate nonzero-rights rule. Sentinel, reserved, and unknown object types have a compatible-rights mask of zero.\n", model.known_rights_mask).unwrap();
+    writeln!(
+        out,
+        "| Object | Generated mask | Rights | Value |\n|---|---|---|---:|"
+    )
+    .unwrap();
+    for entry in &model.object_rights {
+        writeln!(
+            out,
+            "| `DW_OBJECT_TYPE_{}` | `DW_OBJECT_COMPATIBLE_RIGHTS_{}` | `{}` | `{}` |",
+            entry.object,
+            entry.object,
+            entry
+                .rights
+                .iter()
+                .map(|right| format!("DW_RIGHT_{right}"))
+                .collect::<Vec<_>>()
+                .join(" + "),
+            entry.mask
+        )
+        .unwrap();
+    }
+    out.push('\n');
     for set in &model.value_sets {
         writeln!(out, "## {}\n", title(&set.section)).unwrap();
         writeln!(
@@ -2061,6 +2402,8 @@ mod tests {
             "DW_HANDLE_TRANSFER_MOVE",
             "DW_CLOCK_MONOTONIC_ACTIVE",
             "DW_OBJECT_INFO_TASK_STATE_V1",
+            "DW_RIGHTS_KNOWN_MASK",
+            "DW_OBJECT_COMPATIBLE_RIGHTS_MEMORY_OBJECT",
         ] {
             assert!(documentation.contains(name), "ABI.md omitted {name}");
         }
@@ -2158,6 +2501,78 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_object_rights_relations() {
+        let root = TempRoot::copy_schema();
+        root.rewrite("object_rights.toml", |text| {
+            text.replacen("object = \"TASK_GROUP\"", "object = \"BOGUS\"", 1)
+        });
+        assert!(load_error(&root).contains("uses unknown object `BOGUS`"));
+
+        let root = TempRoot::copy_schema();
+        root.rewrite("object_rights.toml", |text| {
+            text.replacen("MODIFY,DUPLICATE", "BOGUS,DUPLICATE", 1)
+        });
+        assert!(load_error(&root).contains("uses unknown right `BOGUS`"));
+
+        let root = TempRoot::copy_schema();
+        root.rewrite("object_rights.toml", |text| {
+            text.replacen("MODIFY,DUPLICATE", "MODIFY,MODIFY", 1)
+        });
+        assert!(load_error(&root).contains("repeats right `MODIFY`"));
+
+        let root = TempRoot::copy_schema();
+        root.rewrite("object_rights.toml", |text| {
+            text.replacen(
+                "rights = \"MODIFY,DUPLICATE,TRANSFER,INSPECT\"",
+                "rights = \"\"",
+                1,
+            )
+        });
+        assert!(load_error(&root).contains("compatible-rights mask must be nonempty"));
+
+        let root = TempRoot::copy_schema();
+        root.rewrite("object_rights.toml", |text| {
+            format!("{text}\n[[object_rights]]\nobject = \"NONE\"\nrights = \"INSPECT\"\n")
+        });
+        assert!(
+            load_error(&root)
+                .contains("sentinel/reserved object `NONE` must not declare compatible rights")
+        );
+
+        let root = TempRoot::copy_schema();
+        root.rewrite("object_rights.toml", |text| {
+            text.replacen(
+                "[[object_rights]]\nobject = \"TIMER\"\nrights = \"WAIT,MODIFY,DUPLICATE,TRANSFER,INSPECT\"\n",
+                "",
+                1,
+            )
+        });
+        assert!(load_error(&root).contains("object-rights schema is missing live object `TIMER`"));
+
+        let root = TempRoot::copy_schema();
+        root.rewrite("object_rights.toml", |text| {
+            format!("{text}\n[[object_rights]]\nobject = \"TASK_GROUP\"\nrights = \"INSPECT\"\n")
+        });
+        assert!(load_error(&root).contains("duplicate object-rights entry for `TASK_GROUP`"));
+    }
+
+    #[test]
+    fn rejects_syscall_rights_incompatible_with_declared_object() {
+        let root = TempRoot::copy_schema();
+        root.rewrite("syscalls.toml", |text| {
+            text.replacen(
+                "arg0 = \"process|DwHandle|in|PROCESS|MODIFY\"",
+                "arg0 = \"process|DwHandle|in|PROCESS|SIGNAL\"",
+                1,
+            )
+        });
+        assert!(
+            load_error(&root)
+                .contains("requires rights `SIGNAL` incompatible with object `PROCESS`")
+        );
+    }
+
+    #[test]
     fn rejects_zero_duplicate_and_overwide_syscall_ids() {
         let root = TempRoot::copy_schema();
         root.rewrite("syscalls.toml", |text| {
@@ -2225,7 +2640,7 @@ mod tests {
         let probe = root.path().join("abi/generated/header_probe.c");
         fs::write(
             &probe,
-            "#include \"deepwyrm_abi.h\"\n_Static_assert(DW_STATUS_BAD_ADDRESS == -16, \"status parity\");\n_Static_assert(DW_RIGHT_MODIFY == 512, \"rights parity\");\n_Static_assert(DW_OBJECT_TYPE_TIMER == 8, \"object parity\");\n_Static_assert(DW_SYSCALL_TIMER_CANCEL == 0x00050012, \"syscall parity\");\n_Static_assert(DW_DEADLINE_INFINITE == UINT64_MAX, \"deadline parity\");\n_Static_assert(DW_BOOT_BASE_PAGE_SIZE == UINT32_C(4096), \"boot page parity\");\n_Static_assert(DW_BOOT_INFO_V1_VERSION == UINT32_C(1), \"boot version parity\");\n_Static_assert(DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1 == 3, \"paging module kind parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_V1_SIZE == UINT32_C(112), \"paging header size parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS == UINT64_C(0xffffff0000000000), \"paging temporary address parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_PML4_INDEX == UINT16_C(510), \"paging PML4 parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_MIN_TABLE_FRAME_COUNT == UINT32_C(4), \"paging minimum frames parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT == UINT32_C(256), \"paging maximum frames parity\");\nint main(void) {\n    DwDeadline deadline = DW_DEADLINE_INFINITE;\n    uint32_t payload = DW_CHANNEL_MAX_PAYLOAD;\n    DwStatus status = DW_STATUS_SUCCESS;\n    return (deadline == 0 || payload == 0 || status != 0);\n}\n",
+            "#include \"deepwyrm_abi.h\"\n_Static_assert(DW_STATUS_BAD_ADDRESS == -16, \"status parity\");\n_Static_assert(DW_RIGHT_MODIFY == 512, \"rights parity\");\n_Static_assert(DW_RIGHTS_KNOWN_MASK == 1023, \"known-rights parity\");\n_Static_assert(DW_OBJECT_COMPATIBLE_RIGHTS_MEMORY_OBJECT == 463, \"object-rights parity\");\n_Static_assert(DW_OBJECT_TYPE_TIMER == 8, \"object parity\");\n_Static_assert(DW_SYSCALL_TIMER_CANCEL == 0x00050012, \"syscall parity\");\n_Static_assert(DW_DEADLINE_INFINITE == UINT64_MAX, \"deadline parity\");\n_Static_assert(DW_BOOT_BASE_PAGE_SIZE == UINT32_C(4096), \"boot page parity\");\n_Static_assert(DW_BOOT_INFO_V1_VERSION == UINT32_C(1), \"boot version parity\");\n_Static_assert(DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1 == 3, \"paging module kind parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_V1_SIZE == UINT32_C(112), \"paging header size parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS == UINT64_C(0xffffff0000000000), \"paging temporary address parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_PML4_INDEX == UINT16_C(510), \"paging PML4 parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_MIN_TABLE_FRAME_COUNT == UINT32_C(4), \"paging minimum frames parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT == UINT32_C(256), \"paging maximum frames parity\");\nint main(void) {\n    DwDeadline deadline = DW_DEADLINE_INFINITE;\n    uint32_t payload = DW_CHANNEL_MAX_PAYLOAD;\n    DwStatus status = DW_STATUS_SUCCESS;\n    return (deadline == 0 || payload == 0 || status != 0 || dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT) != DW_OBJECT_COMPATIBLE_RIGHTS_MEMORY_OBJECT || !dw_rights_are_known(DW_RIGHTS_KNOWN_MASK) || !dw_rights_are_compatible(DW_OBJECT_TYPE_MEMORY_OBJECT, DW_RIGHT_MAP) || dw_rights_are_compatible(DW_OBJECT_TYPE_TASK_GROUP, DW_RIGHT_READ));\n}\n",
         )
         .unwrap();
         let output = Command::new("clang")

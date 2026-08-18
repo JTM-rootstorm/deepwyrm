@@ -343,6 +343,59 @@ pub const DW_BOOT_ENTROPY_SOURCE_MIXED_FIRMWARE: DwBootEntropySource = DwBootEnt
 /// The provider reports that the bytes are conditioned entropy output.
 pub const DW_BOOT_ENTROPY_FLAG_CONDITIONED: DwBootEntropyFlags = DwBootEntropyFlags(1);
 
+/// Mask of every DwRights bit known to ABI 0.
+pub const DW_RIGHTS_KNOWN_MASK: DwRights = DwRights(1023);
+
+/// Compatible rights for the TASK_GROUP object type.
+pub const DW_OBJECT_COMPATIBLE_RIGHTS_TASK_GROUP: DwRights = DwRights(960);
+
+/// Compatible rights for the PROCESS object type.
+pub const DW_OBJECT_COMPATIBLE_RIGHTS_PROCESS: DwRights = DwRights(976);
+
+/// Compatible rights for the THREAD object type.
+pub const DW_OBJECT_COMPATIBLE_RIGHTS_THREAD: DwRights = DwRights(980);
+
+/// Compatible rights for the MEMORY_OBJECT object type.
+pub const DW_OBJECT_COMPATIBLE_RIGHTS_MEMORY_OBJECT: DwRights = DwRights(463);
+
+/// Compatible rights for the ADDRESS_REGION object type.
+pub const DW_OBJECT_COMPATIBLE_RIGHTS_ADDRESS_REGION: DwRights = DwRights(968);
+
+/// Compatible rights for the CHANNEL object type.
+pub const DW_OBJECT_COMPATIBLE_RIGHTS_CHANNEL: DwRights = DwRights(467);
+
+/// Compatible rights for the EVENT object type.
+pub const DW_OBJECT_COMPATIBLE_RIGHTS_EVENT: DwRights = DwRights(496);
+
+/// Compatible rights for the TIMER object type.
+pub const DW_OBJECT_COMPATIBLE_RIGHTS_TIMER: DwRights = DwRights(976);
+
+/// Returns the compatible-rights mask for one object type; sentinel, reserved, and unknown types return zero.
+pub const fn dw_object_compatible_rights(object_type: DwObjectType) -> DwRights {
+    match object_type.0 {
+        1 => DW_OBJECT_COMPATIBLE_RIGHTS_TASK_GROUP,
+        2 => DW_OBJECT_COMPATIBLE_RIGHTS_PROCESS,
+        3 => DW_OBJECT_COMPATIBLE_RIGHTS_THREAD,
+        4 => DW_OBJECT_COMPATIBLE_RIGHTS_MEMORY_OBJECT,
+        5 => DW_OBJECT_COMPATIBLE_RIGHTS_ADDRESS_REGION,
+        6 => DW_OBJECT_COMPATIBLE_RIGHTS_CHANNEL,
+        7 => DW_OBJECT_COMPATIBLE_RIGHTS_EVENT,
+        8 => DW_OBJECT_COMPATIBLE_RIGHTS_TIMER,
+        _ => DwRights(0),
+    }
+}
+
+/// Returns true when a rights value contains only ABI-known bits; zero is structurally known.
+pub const fn dw_rights_are_known(rights: DwRights) -> bool {
+    rights.0 & !DW_RIGHTS_KNOWN_MASK.0 == 0
+}
+
+/// Returns true when all bits are compatible with the object type; zero is structurally compatible.
+pub const fn dw_rights_are_compatible(object_type: DwObjectType, rights: DwRights) -> bool {
+    let compatible = dw_object_compatible_rights(object_type);
+    rights.0 & !compatible.0 == 0
+}
+
 /// DW0 base page size in bytes for BootInfo memory ranges and handoff mappings.
 pub const DW_BOOT_BASE_PAGE_SIZE: u32 = 4096;
 
@@ -1419,6 +1472,27 @@ mod generated_layout_tests {
         assert_eq!(DW_BOOT_ENTROPY_SOURCE_FIRMWARE_PLATFORM.0, 2);
         assert_eq!(DW_BOOT_ENTROPY_SOURCE_MIXED_FIRMWARE.0, 3);
         assert_eq!(DW_BOOT_ENTROPY_FLAG_CONDITIONED.0, 1);
+        assert_eq!(DW_RIGHTS_KNOWN_MASK.0, 1023);
+        assert_eq!(DW_OBJECT_COMPATIBLE_RIGHTS_TASK_GROUP.0, 960);
+        assert_eq!(dw_object_compatible_rights(DW_OBJECT_TYPE_TASK_GROUP).0, 960);
+        assert_eq!(DW_OBJECT_COMPATIBLE_RIGHTS_PROCESS.0, 976);
+        assert_eq!(dw_object_compatible_rights(DW_OBJECT_TYPE_PROCESS).0, 976);
+        assert_eq!(DW_OBJECT_COMPATIBLE_RIGHTS_THREAD.0, 980);
+        assert_eq!(dw_object_compatible_rights(DW_OBJECT_TYPE_THREAD).0, 980);
+        assert_eq!(DW_OBJECT_COMPATIBLE_RIGHTS_MEMORY_OBJECT.0, 463);
+        assert_eq!(dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT).0, 463);
+        assert_eq!(DW_OBJECT_COMPATIBLE_RIGHTS_ADDRESS_REGION.0, 968);
+        assert_eq!(dw_object_compatible_rights(DW_OBJECT_TYPE_ADDRESS_REGION).0, 968);
+        assert_eq!(DW_OBJECT_COMPATIBLE_RIGHTS_CHANNEL.0, 467);
+        assert_eq!(dw_object_compatible_rights(DW_OBJECT_TYPE_CHANNEL).0, 467);
+        assert_eq!(DW_OBJECT_COMPATIBLE_RIGHTS_EVENT.0, 496);
+        assert_eq!(dw_object_compatible_rights(DW_OBJECT_TYPE_EVENT).0, 496);
+        assert_eq!(DW_OBJECT_COMPATIBLE_RIGHTS_TIMER.0, 976);
+        assert_eq!(dw_object_compatible_rights(DW_OBJECT_TYPE_TIMER).0, 976);
+        assert_eq!(dw_object_compatible_rights(DW_OBJECT_TYPE_NONE).0, 0);
+        assert!(dw_rights_are_known(DW_RIGHTS_KNOWN_MASK));
+        assert!(dw_rights_are_compatible(DW_OBJECT_TYPE_MEMORY_OBJECT, DW_RIGHT_MAP));
+        assert!(!dw_rights_are_compatible(DW_OBJECT_TYPE_TASK_GROUP, DW_RIGHT_READ));
         assert_eq!(DW_BOOT_BASE_PAGE_SIZE, 4096);
         assert_eq!(DW_BOOT_MEMORY_RANGE_V1_VERSION, 1);
         assert_eq!(DW_BOOT_MODULE_V1_VERSION, 1);

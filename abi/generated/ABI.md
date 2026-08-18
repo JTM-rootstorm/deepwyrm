@@ -17,6 +17,21 @@ The canonical schema is under `abi/schema`. Numeric namespace values remain repr
 
 Every requested_rights value is nonzero, known, and compatible with the target object type. Duplicate and MOVE transfer requests must be subsets of the named source handle's rights, and the source must carry DUPLICATE or TRANSFER respectively. Creator syscalls mint the requested initial authority for a new object; that authority is bounded by the new object's compatible rights and is authorized by the controlling-handle requirements in syscall metadata, or by the create operation itself when no controlling handle exists. In process_create, MODIFY on the parent task group authorizes minting the returned process and root-region handles, while child_bootstrap_rights may only reduce the transferred Channel handle. Unknown or zero rights are INVALID_ARGUMENT; source-right escalation is ACCESS_DENIED; all failures occur before mutation.
 
+## Object-right compatibility
+
+`DW_RIGHTS_KNOWN_MASK` is `1023`. Zero is structurally known/compatible; operations that request new authority apply the separate nonzero-rights rule. Sentinel, reserved, and unknown object types have a compatible-rights mask of zero.
+
+| Object | Generated mask | Rights | Value |
+|---|---|---|---:|
+| `DW_OBJECT_TYPE_TASK_GROUP` | `DW_OBJECT_COMPATIBLE_RIGHTS_TASK_GROUP` | `DW_RIGHT_MODIFY + DW_RIGHT_DUPLICATE + DW_RIGHT_TRANSFER + DW_RIGHT_INSPECT` | `960` |
+| `DW_OBJECT_TYPE_PROCESS` | `DW_OBJECT_COMPATIBLE_RIGHTS_PROCESS` | `DW_RIGHT_WAIT + DW_RIGHT_MODIFY + DW_RIGHT_DUPLICATE + DW_RIGHT_TRANSFER + DW_RIGHT_INSPECT` | `976` |
+| `DW_OBJECT_TYPE_THREAD` | `DW_OBJECT_COMPATIBLE_RIGHTS_THREAD` | `DW_RIGHT_EXECUTE + DW_RIGHT_WAIT + DW_RIGHT_MODIFY + DW_RIGHT_DUPLICATE + DW_RIGHT_TRANSFER + DW_RIGHT_INSPECT` | `980` |
+| `DW_OBJECT_TYPE_MEMORY_OBJECT` | `DW_OBJECT_COMPATIBLE_RIGHTS_MEMORY_OBJECT` | `DW_RIGHT_READ + DW_RIGHT_WRITE + DW_RIGHT_EXECUTE + DW_RIGHT_MAP + DW_RIGHT_DUPLICATE + DW_RIGHT_TRANSFER + DW_RIGHT_INSPECT` | `463` |
+| `DW_OBJECT_TYPE_ADDRESS_REGION` | `DW_OBJECT_COMPATIBLE_RIGHTS_ADDRESS_REGION` | `DW_RIGHT_MAP + DW_RIGHT_MODIFY + DW_RIGHT_DUPLICATE + DW_RIGHT_TRANSFER + DW_RIGHT_INSPECT` | `968` |
+| `DW_OBJECT_TYPE_CHANNEL` | `DW_OBJECT_COMPATIBLE_RIGHTS_CHANNEL` | `DW_RIGHT_READ + DW_RIGHT_WRITE + DW_RIGHT_WAIT + DW_RIGHT_DUPLICATE + DW_RIGHT_TRANSFER + DW_RIGHT_INSPECT` | `467` |
+| `DW_OBJECT_TYPE_EVENT` | `DW_OBJECT_COMPATIBLE_RIGHTS_EVENT` | `DW_RIGHT_WAIT + DW_RIGHT_SIGNAL + DW_RIGHT_DUPLICATE + DW_RIGHT_TRANSFER + DW_RIGHT_INSPECT` | `496` |
+| `DW_OBJECT_TYPE_TIMER` | `DW_OBJECT_COMPATIBLE_RIGHTS_TIMER` | `DW_RIGHT_WAIT + DW_RIGHT_MODIFY + DW_RIGHT_DUPLICATE + DW_RIGHT_TRANSFER + DW_RIGHT_INSPECT` | `976` |
+
 ## Status
 
 | Name | Value | Meaning | Notes |
