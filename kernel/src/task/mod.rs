@@ -18,6 +18,15 @@ use crate::object::{
 };
 
 mod authority;
+mod scheduler;
+#[allow(
+    unused_imports,
+    reason = "E3 scheduler surface is consumed by the execution coordinator added in this phase"
+)]
+pub(crate) use scheduler::{
+    CooperativeScheduler, ScheduleDecision, SchedulerError, SchedulerReservation,
+    SchedulerReservationFailure, SchedulerThreadState,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TaskError {
@@ -58,6 +67,10 @@ impl ProcessKey {
     }
 }
 impl ThreadKey {
+    pub(crate) const fn from_object_id(object: ObjectId) -> Self {
+        Self(object)
+    }
+
     pub(crate) const fn object_id(self) -> ObjectId {
         self.0
     }

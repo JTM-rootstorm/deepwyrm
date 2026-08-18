@@ -30,6 +30,11 @@ pub(crate) mod object;
 pub(crate) mod service;
 #[allow(
     dead_code,
+    reason = "DW0-E3 synchronization precedes E4/E5 shared execution consumers"
+)]
+pub(crate) mod sync;
+#[allow(
+    dead_code,
     reason = "DW0-E1 syscall decoding precedes E4 architecture entry and E5 handler integration"
 )]
 pub(crate) mod syscall;
