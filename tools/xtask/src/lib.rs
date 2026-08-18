@@ -41,7 +41,7 @@ Commands:
   check                              Run the workspace check
   abi generate                       Generate ABI-owned artifacts
   abi check                          Verify generated ABI artifacts have no drift
-  test host [abi|memory]             Run focused host tests
+  test host [abi|memory|handles]     Run focused host tests
   run --plan --request <path>        Emit the canonical QEMU run plan only
   gdb --plan --request <path>        Emit paused QEMU/GDB command plans only
   test guest <selector> --plan --request <path>
@@ -90,6 +90,7 @@ enum Invocation {
 enum HostTestFilter {
     Abi,
     Memory,
+    Handles,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -324,6 +325,9 @@ fn run_invocation(invocation: Invocation) -> io::Result<u8> {
                 }
                 Some(HostTestFilter::Memory) => {
                     command.args(["--package", "deepwyrm-kernel", "--lib", "--tests"]);
+                }
+                Some(HostTestFilter::Handles) => {
+                    command.args(["--package", "deepwyrm-kernel", "--lib"]);
                 }
                 None => {
                     command.args(["--workspace", "--all-targets"]);
@@ -2196,8 +2200,11 @@ fn parse_test(args: &[String]) -> Action {
                 "memory" => {
                     Action::Command(Invocation::HostTests(Some(HostTestFilter::Memory)))
                 }
+                "handles" => {
+                    Action::Command(Invocation::HostTests(Some(HostTestFilter::Handles)))
+                }
                 _ => Action::UsageError(
-                    "unknown host-test filter; expected `abi` or `memory`".into(),
+                    "unknown host-test filter; expected `abi`, `memory`, or `handles`".into(),
                 ),
             },
             _ => Action::UsageError("`test host` accepts at most one filter".into()),
@@ -2263,7 +2270,7 @@ fn print_help(mut writer: impl Write, command: Option<&str>) -> io::Result<()> {
         ),
         Some("test") => write!(
             writer,
-            "Usage: cargo xtask test <host|guest|integration> ...\n\nHost filters are `abi` and `memory`. `test guest` emits a plan only; guest execution remains coordinator-owned.\n"
+            "Usage: cargo xtask test <host|guest|integration> ...\n\nHost filters are `abi`, `memory`, and `handles`. `test guest` emits a plan only; guest execution remains coordinator-owned.\n"
         ),
         Some(command @ ("run" | "gdb")) => write!(
             writer,
@@ -2357,6 +2364,10 @@ mod tests {
             (
                 &["test", "host", "memory"][..],
                 Action::Command(Invocation::HostTests(Some(HostTestFilter::Memory))),
+            ),
+            (
+                &["test", "host", "handles"][..],
+                Action::Command(Invocation::HostTests(Some(HostTestFilter::Handles))),
             ),
             (
                 &["run", "--plan", "--request", "request.toml"][..],

@@ -20,6 +20,7 @@ fn help_distinguishes_available_dw0a_tooling_from_deferred_operations() {
         "abi check",
         "test host",
         "memory",
+        "handles",
         "run --plan",
         "gdb --plan",
         "guest-result",
