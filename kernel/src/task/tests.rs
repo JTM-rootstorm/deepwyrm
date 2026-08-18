@@ -59,8 +59,8 @@ fn prepare_thread(tasks: &mut Tasks, thread: ThreadKey, seed: u64) {
         .attach_thread_execution_resources(
             thread,
             ThreadExecutionResources {
-                kernel_stack: KernelStackId::new(seed + 1).unwrap(),
-                context: ThreadContextId::new(seed + 0x100).unwrap(),
+                kernel_stack: KernelStackId::from_raw(seed + 1).unwrap(),
+                context: ThreadContextId::from_raw(seed + 0x100).unwrap(),
             },
         )
         .unwrap();
@@ -369,8 +369,8 @@ fn explicit_thread_termination_returns_execution_resources_and_closes_final_thre
     let (process_pin, thread_pins, resources) = pins.into_parts();
     let thread_pin = thread_pins.into_iter().flatten().next().unwrap();
     let resource = resources.into_iter().flatten().next().unwrap();
-    assert_eq!(resource.kernel_stack, KernelStackId::new(10).unwrap());
-    assert_eq!(resource.context, ThreadContextId::new(0x109).unwrap());
+    assert_eq!(resource.kernel_stack, KernelStackId::from_raw(10).unwrap());
+    assert_eq!(resource.context, ThreadContextId::from_raw(0x109).unwrap());
     assert!(registry.release_internal(thread_pin).unwrap().is_none());
     assert!(
         registry

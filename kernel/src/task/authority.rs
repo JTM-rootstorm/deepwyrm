@@ -294,6 +294,7 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             .state)
     }
 
+    #[cfg(test)]
     pub(crate) fn configure_thread_start(
         &mut self,
         key: ThreadKey,
@@ -307,6 +308,7 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn attach_thread_execution_resources(
         &mut self,
         key: ThreadKey,
@@ -329,6 +331,70 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         key: ThreadKey,
     ) -> Result<Option<ThreadStartState>, TaskError> {
         Ok(self.thread(key)?.start)
+    }
+
+    pub(crate) fn thread_execution_resources(
+        &self,
+        key: ThreadKey,
+    ) -> Result<Option<(KernelStackId, ThreadContextId)>, TaskError> {
+        let thread = self.thread(key)?;
+        match (thread.kernel_stack, thread.context) {
+            (Some(kernel_stack), Some(context)) => Ok(Some((kernel_stack, context))),
+            (None, None) => Ok(None),
+            _ => panic!("Thread payload contains a partial execution-resource identity"),
+        }
+    }
+    pub(crate) fn prepare_thread_execution(
+        &mut self,
+        key: ThreadKey,
+        start: ThreadStartState,
+        resources: ThreadExecutionResources,
+    ) -> Result<(), TaskError> {
+        let thread_slot = self.thread_slot(key)?;
+        let process_key = ProcessKey(
+            self.threads[thread_slot]
+                .as_ref()
+                .expect("validated thread slot")
+                .parent
+                .id(),
+        );
+        if self.process(process_key)?.state.state == DW_TASK_STATE_EXITED {
+            return Err(TaskError::BadState);
+        }
+        let thread = self.threads[thread_slot]
+            .as_mut()
+            .expect("validated thread slot");
+        if thread.state.state != DW_TASK_STATE_CREATED
+            || thread.start.is_some()
+            || thread.kernel_stack.is_some()
+            || thread.context.is_some()
+        {
+            return Err(TaskError::BadState);
+        }
+        thread.start = Some(start);
+        thread.kernel_stack = Some(resources.kernel_stack());
+        thread.context = Some(resources.context());
+        Ok(())
+    }
+
+    pub(crate) fn rollback_thread_execution(
+        &mut self,
+        key: ThreadKey,
+    ) -> Result<ThreadExecutionResources, TaskError> {
+        let thread = self.thread_mut(key)?;
+        if thread.state.state != DW_TASK_STATE_CREATED || thread.start.is_none() {
+            return Err(TaskError::BadState);
+        }
+        let (Some(kernel_stack), Some(context)) =
+            (thread.kernel_stack.take(), thread.context.take())
+        else {
+            panic!("prepared Thread lost one execution-resource identity")
+        };
+        thread.start = None;
+        Ok(ThreadExecutionResources {
+            kernel_stack,
+            context,
+        })
     }
 
     pub(crate) fn start_thread(&mut self, key: ThreadKey) -> Result<(), TaskError> {

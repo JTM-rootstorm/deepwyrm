@@ -18,7 +18,17 @@ use crate::object::{
 };
 
 mod authority;
+mod execution;
 mod scheduler;
+#[allow(
+    unused_imports,
+    reason = "E3 execution resources are consumed by E4 context entry and E5 task syscall integration"
+)]
+pub(crate) use execution::{
+    E3_INITIAL_USER_RFLAGS, ExecutionDomain, ExecutionResourceError, FpSimdPolicy,
+    GeneralPurposeRegisters, KernelStackBounds, RetiredExitPins, SavedThreadContext,
+    StartThreadError, UserTlsPolicy,
+};
 #[allow(
     unused_imports,
     reason = "E3 scheduler surface is consumed by the execution coordinator added in this phase"
@@ -79,16 +89,24 @@ impl ThreadKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct KernelStackId(u64);
 impl KernelStackId {
-    pub(crate) const fn new(raw: u64) -> Option<Self> {
+    pub(in crate::task) const fn from_raw(raw: u64) -> Option<Self> {
         if raw == 0 { None } else { Some(Self(raw)) }
+    }
+
+    pub(in crate::task) const fn raw(self) -> u64 {
+        self.0
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ThreadContextId(u64);
 impl ThreadContextId {
-    pub(crate) const fn new(raw: u64) -> Option<Self> {
+    pub(in crate::task) const fn from_raw(raw: u64) -> Option<Self> {
         if raw == 0 { None } else { Some(Self(raw)) }
+    }
+
+    pub(in crate::task) const fn raw(self) -> u64 {
+        self.0
     }
 }
 
@@ -114,12 +132,34 @@ impl ThreadStartState {
             argument1,
         }
     }
+
+    pub(crate) const fn entry(self) -> u64 {
+        self.entry
+    }
+    pub(crate) const fn stack_pointer(self) -> u64 {
+        self.stack_pointer
+    }
+    pub(crate) const fn argument0(self) -> u64 {
+        self.argument0
+    }
+    pub(crate) const fn argument1(self) -> u64 {
+        self.argument1
+    }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ThreadExecutionResources {
-    pub(crate) kernel_stack: KernelStackId,
-    pub(crate) context: ThreadContextId,
+    pub(in crate::task) kernel_stack: KernelStackId,
+    pub(in crate::task) context: ThreadContextId,
+}
+
+impl ThreadExecutionResources {
+    pub(crate) const fn kernel_stack(&self) -> KernelStackId {
+        self.kernel_stack
+    }
+    pub(crate) const fn context(&self) -> ThreadContextId {
+        self.context
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -317,7 +357,7 @@ impl<const THREADS: usize> ExitPins<THREADS> {
         Self {
             process: None,
             threads: core::array::from_fn(|_| None),
-            resources: [None; THREADS],
+            resources: core::array::from_fn(|_| None),
             count: 0,
         }
     }
