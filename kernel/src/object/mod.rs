@@ -624,6 +624,14 @@ mod tests {
         let old_id = creation.id();
         let handle = registry.creation_into_handle(creation).unwrap();
         let final_release = registry.release_handle(handle).unwrap().unwrap();
+        let stale = HandleRef {
+            id: old_id,
+            object_type: DW_OBJECT_TYPE_PROCESS,
+        };
+        assert_eq!(
+            registry.retain_handle(&stale),
+            Err(ObjectRegistryError::StaleReference)
+        );
 
         assert_eq!(
             registry.create(DW_OBJECT_TYPE_PROCESS),
@@ -779,6 +787,17 @@ mod tests {
         let error = registry.complete_finalization(duplicate).unwrap_err();
         assert_eq!(error.error(), ObjectRegistryError::NotFinalizing);
         let _ = error.into_reference();
+    }
+
+    #[test]
+    fn creation_can_become_an_explicit_internal_owner() {
+        let mut registry = ObjectRegistry::<1>::new();
+        let creation = registry.create(DW_OBJECT_TYPE_PROCESS).unwrap();
+        let id = creation.id();
+        let internal = registry.creation_into_internal(creation).unwrap();
+        assert_eq!(counts(&registry, id), (0, 1));
+        let final_release = registry.release_internal(internal).unwrap().unwrap();
+        finish(&mut registry, final_release);
     }
 
     #[test]
