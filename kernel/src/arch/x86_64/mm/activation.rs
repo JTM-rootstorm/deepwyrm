@@ -1018,6 +1018,8 @@ unsafe impl<'a, 'handoff, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
         let segments = live_kernel_segments()?;
         let ist = crate::arch::x86_64::linked_ist_stack_layout()
             .map_err(|_| LiveActivationError::InvalidKernelLayout)?;
+        let thread_stacks = crate::arch::x86_64::linked_thread_kernel_stack_layout()
+            .map_err(|_| LiveActivationError::InvalidKernelLayout)?;
         let carrier_cpu = unsafe { observe_activation_cpu(handoff.capabilities()) }?;
         validate_live_observation(carrier_cpu, handoff)?;
         validate_execution_carriers(carrier_cpu, &segments)?;
@@ -1034,6 +1036,7 @@ unsafe impl<'a, 'handoff, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
             self.scratch,
             &segments,
             ist,
+            &thread_stacks,
             capabilities,
             graph_pending,
             graph_visited,

@@ -93,7 +93,7 @@ fn production_and_six_memory_selector_artifacts_are_separated() {
         None,
     );
     let production_symbols = symbols(&llvm_nm, &production);
-    validate_ist_artifact_geometry(&production_symbols);
+    validate_kernel_stack_artifact_geometry(&production_symbols);
     let production_disassembly = disassembly(&llvm_objdump, &production);
     validate_entry_normalization(&production_disassembly);
     let production_stack_artifact = build_stack_kernel(

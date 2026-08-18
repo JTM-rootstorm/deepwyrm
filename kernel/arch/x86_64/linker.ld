@@ -10,6 +10,14 @@ ASSERT(DEFINED(DW_KERNEL_BOOT_STACK_SIZE),
        "DW_KERNEL_BOOT_STACK_SIZE must come from layout.toml")
 ASSERT(DEFINED(DW_KERNEL_BOOT_STACK_ALIGNMENT),
        "DW_KERNEL_BOOT_STACK_ALIGNMENT must come from layout.toml")
+ASSERT(DEFINED(DW_KERNEL_THREAD_STACK_COUNT),
+       "DW_KERNEL_THREAD_STACK_COUNT must come from task_layout.toml")
+ASSERT(DEFINED(DW_KERNEL_THREAD_STACK_SIZE),
+       "DW_KERNEL_THREAD_STACK_SIZE must come from task_layout.toml")
+ASSERT(DEFINED(DW_KERNEL_THREAD_STACK_GUARD_SIZE),
+       "DW_KERNEL_THREAD_STACK_GUARD_SIZE must come from task_layout.toml")
+ASSERT(DEFINED(DW_KERNEL_THREAD_STACK_ALIGNMENT),
+       "DW_KERNEL_THREAD_STACK_ALIGNMENT must come from task_layout.toml")
 
 PHDRS
 {
@@ -83,6 +91,19 @@ SECTIONS
         __dw_machine_check_ist_top = .;
 
         __dw_ist_region_end = .;
+
+        /*
+         * E3 reserves one guard page followed by one fixed-size supervisor
+         * RW/NX kernel stack for each schedulable userspace Thread. The loader
+         * transition mapping covers the complete writable PT_LOAD; Deepwyrm's
+         * first owned root deliberately omits each formula-derived guard leaf.
+         */
+        . = ALIGN(DW_KERNEL_THREAD_STACK_ALIGNMENT);
+        __dw_thread_kernel_stack_region_start = .;
+        . += DW_KERNEL_THREAD_STACK_COUNT *
+             (DW_KERNEL_THREAD_STACK_GUARD_SIZE + DW_KERNEL_THREAD_STACK_SIZE);
+        __dw_thread_kernel_stack_region_end = .;
+
         *(.bss .bss.*)
         *(.sbss .sbss.*)
         *(COMMON)
@@ -127,3 +148,18 @@ ASSERT((__dw_machine_check_ist_top - __dw_machine_check_ist_bottom) == 4 * DW_KE
        "machine-check IST usable stack must be exactly 16 KiB")
 ASSERT((__dw_ist_region_end - __dw_ist_region_start) == 15 * DW_KERNEL_BASE_PAGE_SIZE,
        "IST region must contain exactly three guards and three four-page stacks")
+
+ASSERT((__dw_thread_kernel_stack_region_start & (DW_KERNEL_THREAD_STACK_ALIGNMENT - 1)) == 0,
+       "thread kernel-stack region must satisfy its configured alignment")
+ASSERT(DW_KERNEL_THREAD_STACK_COUNT == 16,
+       "DW0-E3 thread kernel-stack count must remain 16")
+ASSERT(DW_KERNEL_THREAD_STACK_SIZE == 65536,
+       "DW0-E3 thread kernel-stack size must remain 64 KiB")
+ASSERT(DW_KERNEL_THREAD_STACK_GUARD_SIZE == DW_KERNEL_BASE_PAGE_SIZE,
+       "each E3 thread kernel stack must have exactly one base-page guard")
+ASSERT(DW_KERNEL_THREAD_STACK_ALIGNMENT == DW_KERNEL_BASE_PAGE_SIZE,
+       "E3 thread kernel-stack alignment must equal the base page size")
+ASSERT((__dw_thread_kernel_stack_region_end - __dw_thread_kernel_stack_region_start) ==
+       DW_KERNEL_THREAD_STACK_COUNT *
+       (DW_KERNEL_THREAD_STACK_GUARD_SIZE + DW_KERNEL_THREAD_STACK_SIZE),
+       "E3 thread kernel-stack arena geometry does not match task_layout.toml")

@@ -15,12 +15,14 @@ fn main() {
 fn run() -> Result<(), String> {
     let manifest_dir = PathBuf::from(required_env("CARGO_MANIFEST_DIR")?);
     let layout_path = manifest_dir.join("arch/x86_64/layout.toml");
+    let task_layout_path = manifest_dir.join("arch/x86_64/task_layout.toml");
     let linker_path = manifest_dir.join("arch/x86_64/linker.ld");
     let entry_path = manifest_dir.join("src/arch/x86_64/entry.S");
     let exceptions_path = manifest_dir.join("src/arch/x86_64/exceptions.S");
     let guest_harness_path = manifest_dir.join("../tooling/guest-harness.toml");
 
     println!("cargo:rerun-if-changed={}", layout_path.display());
+    println!("cargo:rerun-if-changed={}", task_layout_path.display());
     println!("cargo:rerun-if-changed={}", linker_path.display());
     println!("cargo:rerun-if-changed={}", entry_path.display());
     println!("cargo:rerun-if-changed={}", exceptions_path.display());
@@ -37,6 +39,11 @@ fn run() -> Result<(), String> {
         .map_err(|error| format!("{}: {error}", layout_path.display()))?;
     let layout = Layout::parse(&layout_source)
         .map_err(|error| format!("{}: {error}", layout_path.display()))?;
+    let task_layout_source = fs::read_to_string(&task_layout_path)
+        .map_err(|error| format!("{}: {error}", task_layout_path.display()))?;
+    let task_layout = TaskLayout::parse(&task_layout_source)
+        .map_err(|error| format!("{}: {error}", task_layout_path.display()))?;
+    emit_task_layout_env(task_layout);
 
     configure_guest_test(&guest_harness_path)?;
 
@@ -52,6 +59,7 @@ fn run() -> Result<(), String> {
 
     for argument in linker_arguments(
         layout,
+        task_layout,
         &linker_path,
         &[entry_object.as_path(), exceptions_object.as_path()],
     ) {
@@ -121,8 +129,28 @@ pub(crate) fn select_guest_test(
         .ok_or_else(|| format!("unknown guest-test selector `{selector}`"))
 }
 
+fn emit_task_layout_env(layout: TaskLayout) {
+    println!(
+        "cargo:rustc-env=DEEPWYRM_E3_THREAD_STACK_COUNT={}",
+        layout.thread_kernel_stack_count
+    );
+    println!(
+        "cargo:rustc-env=DEEPWYRM_E3_THREAD_STACK_SIZE={}",
+        layout.thread_kernel_stack_size
+    );
+    println!(
+        "cargo:rustc-env=DEEPWYRM_E3_THREAD_STACK_GUARD_SIZE={}",
+        layout.thread_kernel_stack_guard_size
+    );
+    println!(
+        "cargo:rustc-env=DEEPWYRM_E3_THREAD_STACK_ALIGNMENT={}",
+        layout.thread_kernel_stack_alignment
+    );
+}
+
 pub(crate) fn linker_arguments(
     layout: Layout,
+    task_layout: TaskLayout,
     linker_path: &Path,
     objects: &[&Path],
 ) -> Vec<String> {
@@ -148,6 +176,22 @@ pub(crate) fn linker_arguments(
         format!(
             "--defsym=DW_KERNEL_BOOT_STACK_ALIGNMENT={}",
             layout.kernel_boot_stack_alignment
+        ),
+        format!(
+            "--defsym=DW_KERNEL_THREAD_STACK_COUNT={}",
+            task_layout.thread_kernel_stack_count
+        ),
+        format!(
+            "--defsym=DW_KERNEL_THREAD_STACK_SIZE={}",
+            task_layout.thread_kernel_stack_size
+        ),
+        format!(
+            "--defsym=DW_KERNEL_THREAD_STACK_GUARD_SIZE={}",
+            task_layout.thread_kernel_stack_guard_size
+        ),
+        format!(
+            "--defsym=DW_KERNEL_THREAD_STACK_ALIGNMENT={}",
+            task_layout.thread_kernel_stack_alignment
         ),
         format!("-T{}", linker_path.display()),
     ];
@@ -373,6 +417,62 @@ pub(crate) fn assemble_source(source: &Path, output: &Path, layout: Layout) -> R
 
 fn required_env(name: &str) -> Result<String, String> {
     env::var(name).map_err(|error| format!("missing build environment {name}: {error}"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TaskLayout {
+    pub(crate) thread_kernel_stack_count: u64,
+    pub(crate) thread_kernel_stack_size: u64,
+    pub(crate) thread_kernel_stack_guard_size: u64,
+    pub(crate) thread_kernel_stack_alignment: u64,
+}
+
+impl TaskLayout {
+    pub(crate) fn parse(source: &str) -> Result<Self, String> {
+        let values = parse_flat_toml(source)?;
+        let expected = [
+            "schema",
+            "version",
+            "thread_kernel_stack_count",
+            "thread_kernel_stack_size",
+            "thread_kernel_stack_guard_size",
+            "thread_kernel_stack_alignment",
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        let actual = values.keys().map(String::as_str).collect::<BTreeSet<_>>();
+        if actual != expected {
+            let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
+            let unknown = actual.difference(&expected).copied().collect::<Vec<_>>();
+            return Err(format!(
+                "task-layout keys do not match contract; missing={missing:?}, unknown={unknown:?}"
+            ));
+        }
+        expect_string(&values, "schema", "deepwyrm-x86_64-task-layout")?;
+        expect_u64(&values, "version", 1)?;
+        let count = parse_u64(required_value(&values, "thread_kernel_stack_count")?)?;
+        let size = parse_u64(required_value(&values, "thread_kernel_stack_size")?)?;
+        let guard = parse_u64(required_value(&values, "thread_kernel_stack_guard_size")?)?;
+        let alignment = parse_u64(required_value(&values, "thread_kernel_stack_alignment")?)?;
+        if count != 16
+            || size != 65_536
+            || guard != 4_096
+            || alignment != 4_096
+            || !size.is_multiple_of(alignment)
+            || !guard.is_multiple_of(alignment)
+        {
+            return Err(
+                "DW0-E3 thread stack pool must be 16 guarded 65536-byte stacks on 4096-byte boundaries"
+                    .into(),
+            );
+        }
+        Ok(Self {
+            thread_kernel_stack_count: count,
+            thread_kernel_stack_size: size,
+            thread_kernel_stack_guard_size: guard,
+            thread_kernel_stack_alignment: alignment,
+        })
+    }
 }
 
 #[derive(Clone, Copy)]

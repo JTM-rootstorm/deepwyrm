@@ -167,9 +167,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok(entry == 0)
     }
 
-    fn validate_live_ist_guard_layout(&mut self) -> Result<(), u32> {
+    fn validate_live_kernel_guard_layout(&mut self) -> Result<(), u32> {
         let ist = crate::arch::x86_64::linked_ist_stack_layout().map_err(|_| 0x00e0_u32)?;
-        let mut payload_pages = 0_u8;
+        let mut payload_pages = 0_usize;
         for stack in ist.stacks() {
             if !self.guard_leaf_is_exact_zero(stack.guard_page)? {
                 return Err(0x00e1);
@@ -200,8 +200,47 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 page = page.checked_add(PAGE_SIZE).ok_or(0x00e6_u32)?;
             }
         }
-        if payload_pages != 12 {
-            return Err(0x00e7);
+        let thread_stacks =
+            crate::arch::x86_64::linked_thread_kernel_stack_layout().map_err(|_| 0x00e7_u32)?;
+        for stack in thread_stacks {
+            if !self.guard_leaf_is_exact_zero(stack.guard_page)? {
+                return Err(0x00e8);
+            }
+            let first = self.walk_leaf(stack.bottom)?;
+            let mut page = stack.bottom;
+            while page < stack.top {
+                let walk = self.walk_leaf(page)?;
+                let offset = page.checked_sub(stack.bottom).ok_or(0x00e9_u32)?;
+                if walk.physical_start
+                    != first.physical_start.checked_add(offset).ok_or(0x00ea_u32)?
+                    || walk.user
+                    || !walk.writable
+                    || walk.executable
+                    || walk.entry & !physical_mask(self.root.capabilities) & !HARDWARE_MUTABLE
+                        != PRESENT | WRITABLE | NO_EXECUTE
+                    || self
+                        .roles
+                        .validate_kernel_image_page(
+                            walk.physical_start,
+                            KernelImageSegment::WritableData,
+                        )
+                        .is_err()
+                {
+                    return Err(0x00eb);
+                }
+                payload_pages = payload_pages.checked_add(1).ok_or(0x00ec_u32)?;
+                page = page.checked_add(PAGE_SIZE).ok_or(0x00ed_u32)?;
+            }
+        }
+        let expected_pages = 12_usize
+            .checked_add(
+                crate::task::E3_THREAD_STACK_COUNT
+                    * usize::try_from(crate::task::E3_THREAD_STACK_SIZE / PAGE_SIZE)
+                        .map_err(|_| 0x00ee_u32)?,
+            )
+            .ok_or(0x00ef_u32)?;
+        if payload_pages != expected_pages {
+            return Err(0x00f0);
         }
         Ok(())
     }
@@ -1266,7 +1305,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             scratch: &mut self.target.scratch,
             _not_send_sync: core::marker::PhantomData,
         };
-        if let Err(detail) = authority.validate_live_ist_guard_layout() {
+        if let Err(detail) = authority.validate_live_kernel_guard_layout() {
             crate::test_support::complete_fail(detail)
         }
         match test {

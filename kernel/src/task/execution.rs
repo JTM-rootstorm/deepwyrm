@@ -8,6 +8,32 @@ use super::{
 pub(crate) const E3_INITIAL_USER_RFLAGS: u64 = 0x202;
 pub(crate) const E3_BASE_PAGE_SIZE: u64 = 4096;
 
+const fn parse_decimal_u64(value: &str) -> u64 {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    let mut output = 0_u64;
+    while index < bytes.len() {
+        let digit = bytes[index];
+        assert!(
+            digit >= b'0' && digit <= b'9',
+            "build-generated E3 layout value is not decimal"
+        );
+        output = output * 10 + (digit - b'0') as u64;
+        index += 1;
+    }
+    output
+}
+
+pub(crate) const E3_THREAD_STACK_COUNT: usize =
+    parse_decimal_u64(env!("DEEPWYRM_E3_THREAD_STACK_COUNT")) as usize;
+pub(crate) const E3_THREAD_STACK_SIZE: u64 =
+    parse_decimal_u64(env!("DEEPWYRM_E3_THREAD_STACK_SIZE"));
+pub(crate) const E3_THREAD_STACK_GUARD_SIZE: u64 =
+    parse_decimal_u64(env!("DEEPWYRM_E3_THREAD_STACK_GUARD_SIZE"));
+pub(crate) const E3_THREAD_STACK_ALIGNMENT: u64 =
+    parse_decimal_u64(env!("DEEPWYRM_E3_THREAD_STACK_ALIGNMENT"));
+pub(crate) const E3_THREAD_STACK_STRIDE: u64 = E3_THREAD_STACK_GUARD_SIZE + E3_THREAD_STACK_SIZE;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExecutionResourceError {
     Capacity,
@@ -569,6 +595,16 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
 
     pub(crate) fn scheduler_state(&self, thread: ThreadKey) -> Option<super::SchedulerThreadState> {
         self.scheduler.state(thread)
+    }
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+impl ExecutionDomain<E3_THREAD_STACK_COUNT> {
+    /// Binds the E3 allocator to the linker-owned supervisor stack carriers.
+    pub(crate) fn from_linked_x86_64_stacks() -> Result<Self, ExecutionResourceError> {
+        let bounds = crate::arch::x86_64::linked_thread_kernel_stack_layout()
+            .map_err(|_| ExecutionResourceError::InvalidLayout)?;
+        Self::new(bounds)
     }
 }
 

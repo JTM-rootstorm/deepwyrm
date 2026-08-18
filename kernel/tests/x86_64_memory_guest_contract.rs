@@ -37,29 +37,32 @@ fn c3_memory_dispatch_occurs_only_after_the_deep_root_is_active() {
 }
 
 #[test]
-fn c3_live_root_rechecks_exact_ist_guards_before_selector_work() {
+fn c3_live_root_rechecks_exact_kernel_guards_before_selector_work() {
     let activation = activation_test_support();
     let guard_walk = activation
         .split_once("fn guard_leaf_is_exact_zero(&mut self")
         .expect("exact active guard walk")
         .1
-        .split_once("fn validate_live_ist_guard_layout")
+        .split_once("fn validate_live_kernel_guard_layout")
         .expect("exact guard walk terminator")
         .0;
     assert!(guard_walk.contains("!= PRESENT | WRITABLE"));
     assert!(guard_walk.contains("validate_table_child(current, child)"));
     assert!(guard_walk.contains("Ok(entry == 0)"));
     let validator = activation
-        .split_once("fn validate_live_ist_guard_layout(&mut self)")
-        .expect("post-C2 IST guard validator")
+        .split_once("fn validate_live_kernel_guard_layout(&mut self)")
+        .expect("post-C2 kernel guard validator")
         .1
         .split_once("fn allocate_zeroed")
-        .expect("IST validator terminator")
+        .expect("kernel guard validator terminator")
         .0;
     assert!(validator.contains("for stack in ist.stacks()"));
+    assert!(validator.contains("linked_thread_kernel_stack_layout()"));
+    assert!(validator.contains("for stack in thread_stacks"));
     assert!(validator.contains("self.guard_leaf_is_exact_zero(stack.guard_page)?"));
     assert!(validator.contains("while page < stack.top"));
-    assert!(validator.contains("payload_pages != 12"));
+    assert!(validator.contains("E3_THREAD_STACK_COUNT"));
+    assert!(validator.contains("E3_THREAD_STACK_SIZE"));
     assert!(validator.contains("KernelImageSegment::WritableData"));
     assert!(validator.contains("PRESENT | WRITABLE | NO_EXECUTE"));
 
@@ -68,7 +71,7 @@ fn c3_live_root_rechecks_exact_ist_guards_before_selector_work() {
         .expect("consuming live-root runner")
         .1;
     let guard_check = runner
-        .find("authority.validate_live_ist_guard_layout()")
+        .find("authority.validate_live_kernel_guard_layout()")
         .expect("post-C2 live guard check");
     let selector_dispatch = runner.find("match test").expect("selector dispatch");
     assert!(guard_check < selector_dispatch);

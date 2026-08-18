@@ -645,6 +645,87 @@ fn ist_layout_rejects_malformed_or_conflicting_ranges() {
 }
 
 #[test]
+fn e3_thread_stack_layout_rejects_overlap_size_and_scratch_conflicts() {
+    let writable_start = 0xffff_8000_0100_0000;
+    let segments = [
+        KernelSegment {
+            start: writable_start - 2 * PAGE_SIZE,
+            end: writable_start - PAGE_SIZE,
+            kind: SegmentKind::Text,
+        },
+        KernelSegment {
+            start: writable_start - PAGE_SIZE,
+            end: writable_start,
+            kind: SegmentKind::ReadOnly,
+        },
+        KernelSegment {
+            start: writable_start,
+            end: writable_start + 3 * crate::task::E3_THREAD_STACK_STRIDE,
+            kind: SegmentKind::Writable,
+        },
+    ];
+    let first = crate::task::KernelStackBounds::new(
+        writable_start,
+        writable_start + crate::task::E3_THREAD_STACK_GUARD_SIZE,
+        writable_start
+            + crate::task::E3_THREAD_STACK_GUARD_SIZE
+            + crate::task::E3_THREAD_STACK_SIZE,
+    )
+    .unwrap();
+    let second_guard = writable_start + crate::task::E3_THREAD_STACK_STRIDE;
+    let second = crate::task::KernelStackBounds::new(
+        second_guard,
+        second_guard + crate::task::E3_THREAD_STACK_GUARD_SIZE,
+        second_guard + crate::task::E3_THREAD_STACK_GUARD_SIZE + crate::task::E3_THREAD_STACK_SIZE,
+    )
+    .unwrap();
+    assert_eq!(
+        validate_thread_stack_layout(
+            &segments,
+            FIXTURE_SCRATCH,
+            FIXTURE_SCRATCH + PAGE_SIZE,
+            &[first, second],
+        ),
+        Ok(())
+    );
+    assert!(is_thread_stack_guard(&[first, second], first.guard_page));
+    assert!(is_kernel_guard(
+        test_ist_layout(writable_start + 2 * crate::task::E3_THREAD_STACK_STRIDE),
+        &[first, second],
+        second.guard_page
+    ));
+
+    assert_eq!(
+        validate_thread_stack_layout(
+            &segments,
+            FIXTURE_SCRATCH,
+            FIXTURE_SCRATCH + PAGE_SIZE,
+            &[first, first],
+        ),
+        Err(InactiveGraphError::InvalidSegmentLayout)
+    );
+    let short = crate::task::KernelStackBounds::new(
+        second_guard,
+        second_guard + PAGE_SIZE,
+        second_guard + PAGE_SIZE + crate::task::E3_THREAD_STACK_SIZE - PAGE_SIZE,
+    )
+    .unwrap();
+    assert_eq!(
+        validate_thread_stack_layout(
+            &segments,
+            FIXTURE_SCRATCH,
+            FIXTURE_SCRATCH + PAGE_SIZE,
+            &[short],
+        ),
+        Err(InactiveGraphError::InvalidSegmentLayout)
+    );
+    assert_eq!(
+        validate_thread_stack_layout(&segments, first.bottom, FIXTURE_SCRATCH, &[first],),
+        Err(InactiveGraphError::InvalidSegmentLayout)
+    );
+}
+
+#[test]
 fn guard_leaf_absence_rejects_a_missing_parent_path() {
     let fixture = graph_fixture();
     let mut access = FakeGraphAccess::default();

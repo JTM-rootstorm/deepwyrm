@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn validate_ist_artifact_geometry(symbols: &str) {
+pub(crate) fn validate_kernel_stack_artifact_geometry(symbols: &str) {
     let addresses = symbols
         .lines()
         .filter_map(|line| {
@@ -57,5 +57,13 @@ pub(crate) fn validate_ist_artifact_geometry(symbols: &str) {
         address("__dw_data_start") <= address("__dw_ist_region_start")
             && address("__dw_ist_region_end") <= address("__dw_data_end"),
         "linked IST arena escapes the writable data PT_LOAD bounds"
+    );
+    let thread_start = address("__dw_thread_kernel_stack_region_start");
+    let thread_end = address("__dw_thread_kernel_stack_region_end");
+    assert_eq!(thread_start & 0xfff, 0, "thread stack arena alignment");
+    assert_eq!(thread_end - thread_start, 16 * (4096 + 65536));
+    assert!(
+        address("__dw_ist_region_end") <= thread_start && thread_end <= address("__dw_data_end"),
+        "linked E3 thread stack arena escapes the writable data PT_LOAD bounds"
     );
 }

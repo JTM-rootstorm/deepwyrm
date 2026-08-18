@@ -126,6 +126,34 @@ fn layout_manifest_is_exact_and_fails_closed_on_drift() {
 }
 
 #[test]
+fn task_layout_manifest_is_kernel_private_exact_and_fails_closed_on_drift() {
+    let source = fs::read_to_string(task_layout_path()).expect("read E3 task layout manifest");
+    let layout = kernel_build::TaskLayout::parse(&source).expect("parse E3 task layout manifest");
+    assert_eq!(layout.thread_kernel_stack_count, 16);
+    assert_eq!(layout.thread_kernel_stack_size, 65_536);
+    assert_eq!(layout.thread_kernel_stack_guard_size, 4_096);
+    assert_eq!(layout.thread_kernel_stack_alignment, 4_096);
+    for malformed in [
+        format!("{source}\nunknown_task_layout_key = 1\n"),
+        source.replace("version = 1", "version = 2"),
+        source.replace(
+            "thread_kernel_stack_count = 16",
+            "thread_kernel_stack_count = 8",
+        ),
+        source.replace(
+            "thread_kernel_stack_size = 65536",
+            "thread_kernel_stack_size = 32768",
+        ),
+        source.replace(
+            "thread_kernel_stack_guard_size = 4096",
+            "thread_kernel_stack_guard_size = 8192",
+        ),
+    ] {
+        assert!(kernel_build::TaskLayout::parse(&malformed).is_err());
+    }
+}
+
+#[test]
 fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
     let harness = fs::read_to_string(guest_harness_path()).expect("read guest harness manifest");
     for (selector, id) in [
@@ -271,6 +299,9 @@ fn linked_entry_and_rust_boundary_match_the_canonical_elf_policy() {
 
     let source = fs::read_to_string(layout_path()).expect("read canonical layout manifest");
     let layout = kernel_build::Layout::parse(&source).expect("parse canonical layout manifest");
+    let task_source = fs::read_to_string(task_layout_path()).expect("read E3 task layout manifest");
+    let task_layout =
+        kernel_build::TaskLayout::parse(&task_source).expect("parse E3 task layout manifest");
     let temporary = TemporaryDirectory::new("deepwyrm-x86_64-entry-contract");
     let entry_object = temporary.path.join("entry.o");
     let exceptions_object = temporary.path.join("exceptions.o");
@@ -373,6 +404,7 @@ dw_test_bss_probe:
 
     let link_arguments = kernel_build::linker_arguments(
         layout,
+        task_layout,
         &linker_path(),
         &[entry_object.as_path(), exceptions_object.as_path()],
     );
@@ -414,6 +446,8 @@ dw_test_bss_probe:
         "dw_x86_64_terminal_interrupt_dispatch",
         "__dw_ist_region_start",
         "__dw_ist_region_end",
+        "__dw_thread_kernel_stack_region_start",
+        "__dw_thread_kernel_stack_region_end",
         "__dw_double_fault_ist_guard",
         "__dw_double_fault_ist_bottom",
         "__dw_double_fault_ist_top",
@@ -600,6 +634,10 @@ fn kernel_root() -> PathBuf {
 
 fn layout_path() -> PathBuf {
     kernel_root().join("arch/x86_64/layout.toml")
+}
+
+fn task_layout_path() -> PathBuf {
+    kernel_root().join("arch/x86_64/task_layout.toml")
 }
 
 fn linker_path() -> PathBuf {

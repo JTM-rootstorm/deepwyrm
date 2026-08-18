@@ -161,6 +161,21 @@ pub(super) fn is_ist_guard(ist: IstStackLayout, page: u64) -> bool {
     ist.stacks().iter().any(|stack| stack.guard_page == page)
 }
 
+pub(super) fn is_thread_stack_guard(
+    thread_stacks: &[crate::task::KernelStackBounds],
+    page: u64,
+) -> bool {
+    thread_stacks.iter().any(|stack| stack.guard_page == page)
+}
+
+pub(super) fn is_kernel_guard(
+    ist: IstStackLayout,
+    thread_stacks: &[crate::task::KernelStackBounds],
+    page: u64,
+) -> bool {
+    is_ist_guard(ist, page) || is_thread_stack_guard(thread_stacks, page)
+}
+
 pub(super) fn validate_ist_layout(
     segments: &[KernelSegment; 3],
     scratch_window_page: u64,
@@ -189,6 +204,40 @@ pub(super) fn validate_ist_layout(
     Ok(())
 }
 
+pub(super) fn validate_thread_stack_layout(
+    segments: &[KernelSegment; 3],
+    scratch_window_page: u64,
+    scratch_control_page: u64,
+    thread_stacks: &[crate::task::KernelStackBounds],
+) -> Result<(), InactiveGraphError<core::convert::Infallible>> {
+    let Some(writable) = segments
+        .iter()
+        .copied()
+        .find(|segment| segment.kind == SegmentKind::Writable)
+    else {
+        return Err(InactiveGraphError::InvalidSegmentLayout);
+    };
+    for (index, stack) in thread_stacks.iter().copied().enumerate() {
+        if stack.bottom.checked_sub(stack.guard_page)
+            != Some(crate::task::E3_THREAD_STACK_GUARD_SIZE)
+            || stack.byte_len() != crate::task::E3_THREAD_STACK_SIZE
+            || !stack
+                .guard_page
+                .is_multiple_of(crate::task::E3_THREAD_STACK_ALIGNMENT)
+            || !writable.contains(stack.guard_page)
+            || stack.top > writable.end
+            || (scratch_window_page >= stack.guard_page && scratch_window_page < stack.top)
+            || (scratch_control_page >= stack.guard_page && scratch_control_page < stack.top)
+            || thread_stacks[..index]
+                .iter()
+                .any(|prior| stack.guard_page < prior.top && prior.guard_page < stack.top)
+        {
+            return Err(InactiveGraphError::InvalidSegmentLayout);
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn subtree_is_required(
     virtual_prefix: u64,
     child_level: u8,
@@ -209,6 +258,7 @@ pub(super) fn validate_segment_layout(
     segments: &[KernelSegment; 3],
     scratch: DeepScratchBinding,
     ist: IstStackLayout,
+    thread_stacks: &[crate::task::KernelStackBounds],
 ) -> Result<(), InactiveGraphError<core::convert::Infallible>> {
     let scratch_page = scratch.window_page;
     if scratch_page & ADDRESS_OFFSET_MASK != 0
@@ -228,7 +278,13 @@ pub(super) fn validate_segment_layout(
     {
         return Err(InactiveGraphError::InvalidSegmentLayout);
     }
-    validate_ist_layout(segments, scratch.window_page, scratch.control_page, ist)
+    validate_ist_layout(segments, scratch.window_page, scratch.control_page, ist)?;
+    validate_thread_stack_layout(
+        segments,
+        scratch.window_page,
+        scratch.control_page,
+        thread_stacks,
+    )
 }
 
 pub(super) fn read_entry<A: ActivationGraphAccess>(
@@ -373,14 +429,17 @@ pub(super) fn validate_inactive_graph_with_workspace<
     scratch: DeepScratchBinding,
     segments: &[KernelSegment; 3],
     ist: IstStackLayout,
+    thread_stacks: &[crate::task::KernelStackBounds],
     capabilities: PagingCapabilities,
     pending: &mut [Option<PendingTable>; MAX_DEEP_TABLE_FRAMES],
     visited: &mut [u64; MAX_DEEP_TABLE_FRAMES],
 ) -> Result<(), InactiveGraphError<A::Error>> {
-    validate_segment_layout(segments, scratch, ist).map_err(|error| match error {
-        InactiveGraphError::InvalidSegmentLayout => InactiveGraphError::InvalidSegmentLayout,
-        _ => unreachable!("layout validation has one error"),
-    })?;
+    validate_segment_layout(segments, scratch, ist, thread_stacks).map_err(
+        |error| match error {
+            InactiveGraphError::InvalidSegmentLayout => InactiveGraphError::InvalidSegmentLayout,
+            _ => unreachable!("layout validation has one error"),
+        },
+    )?;
     let owner = root.owner();
     pending.fill(None);
     visited.fill(0);
@@ -431,7 +490,7 @@ pub(super) fn validate_inactive_graph_with_workspace<
                         return Err(InactiveGraphError::InvalidScratchPath);
                     }
                 } else {
-                    if is_ist_guard(ist, virtual_page) {
+                    if is_kernel_guard(ist, thread_stacks, virtual_page) {
                         return Err(InactiveGraphError::MappedGuardPage);
                     }
                     let segment = segment_for_page(segments, virtual_page)
@@ -494,7 +553,7 @@ pub(super) fn validate_inactive_graph_with_workspace<
                 page,
                 capabilities,
             )?;
-            if is_ist_guard(ist, page) {
+            if is_kernel_guard(ist, thread_stacks, page) {
                 if inactive.is_some() {
                     return Err(InactiveGraphError::MappedGuardPage);
                 }
@@ -544,6 +603,7 @@ pub(super) fn validate_inactive_graph<
         scratch,
         segments,
         ist,
+        &[],
         capabilities,
         &mut pending,
         &mut visited,

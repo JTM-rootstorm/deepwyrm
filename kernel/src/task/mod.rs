@@ -25,9 +25,10 @@ mod scheduler;
     reason = "E3 execution resources are consumed by E4 context entry and E5 task syscall integration"
 )]
 pub(crate) use execution::{
-    E3_INITIAL_USER_RFLAGS, ExecutionDomain, ExecutionResourceError, FpSimdPolicy,
-    GeneralPurposeRegisters, KernelStackBounds, RetiredExitPins, SavedThreadContext,
-    StartThreadError, UserTlsPolicy,
+    E3_BASE_PAGE_SIZE, E3_INITIAL_USER_RFLAGS, E3_THREAD_STACK_ALIGNMENT, E3_THREAD_STACK_COUNT,
+    E3_THREAD_STACK_GUARD_SIZE, E3_THREAD_STACK_SIZE, E3_THREAD_STACK_STRIDE, ExecutionDomain,
+    ExecutionResourceError, FpSimdPolicy, GeneralPurposeRegisters, KernelStackBounds,
+    RetiredExitPins, SavedThreadContext, StartThreadError, UserTlsPolicy,
 };
 #[allow(
     unused_imports,
