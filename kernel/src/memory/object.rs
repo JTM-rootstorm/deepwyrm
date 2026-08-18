@@ -7,15 +7,18 @@
 
 #![allow(
     dead_code,
-    reason = "DW0-C establishes this authority model before the later page-table and syscall integration supplies production callers"
+    reason = "DW0-C/D4 expose memory-object and lease authority ahead of DW0-D5/E service and syscall consumers"
 )]
 
 use super::address_region::{AddressSpaceKey, RegionKey, mint_authority_domain};
+use crate::handle::ResolvedHandle;
 use crate::memory::frame_roles::{
     BackingIdentity, FrameRoleManager, ObjectBackingGrant, ObjectBackingKind,
 };
 use crate::object::{CreationRef, FinalRelease, InternalRef, ObjectId, ObjectRegistry};
-use deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT;
+use deepwyrm_abi::{
+    DW_OBJECT_TYPE_MEMORY_OBJECT, DW_RIGHT_EXECUTE, DW_RIGHT_MAP, DW_RIGHT_READ, DW_RIGHT_WRITE,
+};
 
 /// The DW0 base page size.
 pub(crate) const PAGE_SIZE: u64 = 4096;
@@ -41,6 +44,7 @@ pub(crate) enum MemoryObjectError {
     ObjectIdentity,
     FinalizationMismatch,
     ObjectReference,
+    InsufficientRights,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -56,6 +60,34 @@ impl MemoryObjectCreateError {
 
     pub(crate) fn into_backing(self) -> ObjectBackingGrant {
         self.backing
+    }
+}
+
+#[must_use = "authorization failure returns a live lookup pin that must be released or reused"]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct MapAuthorizationCreateError {
+    error: MemoryObjectError,
+    resolved: ResolvedHandle,
+}
+
+impl MapAuthorizationCreateError {
+    pub(crate) const fn error(&self) -> MemoryObjectError {
+        self.error
+    }
+
+    pub(crate) fn into_resolved(self) -> ResolvedHandle {
+        self.resolved
+    }
+
+    pub(crate) fn release<const REGISTRY_OBJECTS: usize>(
+        self,
+        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
+    ) -> (MemoryObjectError, MappingFinalReleases<REGISTRY_OBJECTS>) {
+        let error = self.error;
+        let pin = self.resolved.into_internal();
+        let mut final_releases = MappingFinalReleases::empty();
+        release_internal_pin(registry, pin, &mut final_releases);
+        (error, final_releases)
     }
 }
 
@@ -215,8 +247,8 @@ impl MappingLease {
     pub(super) const EMPTY: Self = Self { domain: 0, raw: 0 };
 }
 
-/// Opaque proof that the future handle-rights seam validated MAP + READ and
-/// any requested WRITE/EXECUTE authority for exactly one MemoryObject.
+/// Opaque one-shot proof produced by consuming a D3-resolved MemoryObject
+/// handle with MAP + READ and any requested WRITE/EXECUTE authority.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct MapAuthorization {
     object: MemoryObjectKey,
@@ -722,45 +754,64 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         })
     }
 
-    /// Issues an opaque mapping authority after the future handle layer has
-    /// validated the exact native rights for `object`.
+    /// Consumes one D3 lookup pin into a region-bound mapping authorization.
     ///
-    /// # Safety
-    ///
-    /// The caller must have validated MAP + READ for `object`, plus WRITE
-    /// and/or EXECUTE exactly when present in `ceiling`, from a live
-    /// rights-bearing handle. DW0-C has no handle table yet, so this narrow
-    /// seam is the only construction path and deliberately remains unsafe.
-    #[allow(
-        unsafe_code,
-        reason = "the future rights-validation seam is the sole authority source until DW0-D handles exist"
-    )]
-    pub(super) unsafe fn issue_map_authorization<const REGISTRY_OBJECTS: usize>(
+    /// The resolved handle itself is the pre-publication strong reference. No
+    /// second retain occurs here: successful validation moves that exact pin
+    /// into `MapAuthorization`, while every failure returns the still-live
+    /// `ResolvedHandle` unchanged to its caller.
+    pub(crate) fn issue_map_authorization(
         &self,
-        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
-        source: &InternalRef,
-        object: MemoryObjectKey,
+        resolved: ResolvedHandle,
         address_space: AddressSpaceKey,
         region: RegionKey,
         ceiling: MemoryProtection,
-    ) -> Result<MapAuthorization, MemoryObjectError> {
-        let record = self.object_record(object)?;
-        if source.object_type() != DW_OBJECT_TYPE_MEMORY_OBJECT
-            || object.object_id() != Some(source.id())
-            || record.object != source.id()
-        {
-            return Err(MemoryObjectError::ObjectReference);
+    ) -> Result<MapAuthorization, MapAuthorizationCreateError> {
+        if let Err(error) = MemoryProtection::ceiling(ceiling.bits()) {
+            return Err(MapAuthorizationCreateError { error, resolved });
         }
-        MemoryProtection::ceiling(ceiling.bits())?;
+        if resolved.object_type() != DW_OBJECT_TYPE_MEMORY_OBJECT {
+            return Err(MapAuthorizationCreateError {
+                error: MemoryObjectError::ObjectReference,
+                resolved,
+            });
+        }
+
+        let mut required = DW_RIGHT_MAP.0 | DW_RIGHT_READ.0;
+        if ceiling.writable() {
+            required |= DW_RIGHT_WRITE.0;
+        }
+        if ceiling.executable() {
+            required |= DW_RIGHT_EXECUTE.0;
+        }
+        if resolved.rights().0 & required != required {
+            return Err(MapAuthorizationCreateError {
+                error: MemoryObjectError::InsufficientRights,
+                resolved,
+            });
+        }
+
+        let object = MemoryObjectKey {
+            object: Some(resolved.object_id()),
+        };
+        let record = match self.object_record(object) {
+            Ok(record) => record,
+            Err(error) => return Err(MapAuthorizationCreateError { error, resolved }),
+        };
         if !record.protection_ceiling.contains(ceiling) {
-            return Err(MemoryObjectError::ProtectionCeiling);
+            return Err(MapAuthorizationCreateError {
+                error: MemoryObjectError::ProtectionCeiling,
+                resolved,
+            });
         }
         if !address_space.same_domain(region) {
-            return Err(MemoryObjectError::ForeignLease);
+            return Err(MapAuthorizationCreateError {
+                error: MemoryObjectError::ForeignLease,
+                resolved,
+            });
         }
-        let pin = registry
-            .retain_internal(source)
-            .map_err(|_| MemoryObjectError::ObjectReference)?;
+
+        let pin = resolved.into_internal();
         Ok(MapAuthorization {
             object,
             address_space,
@@ -1282,7 +1333,9 @@ mod tests {
 
     use super::super::address_region::AddressSpaceAuthority;
     use super::*;
+    use crate::handle::{AcceptedObjectTypes, HandleTable, HandleTableError};
     use crate::object::ObjectRegistry;
+    use deepwyrm_abi::{DwHandle, DwRights};
     use std::boxed::Box;
 
     fn grant<const OBJECTS: usize, const LEASES: usize>(
@@ -1306,10 +1359,6 @@ mod tests {
         (key, owner)
     }
 
-    #[allow(
-        unsafe_code,
-        reason = "tests stand in for the future handle-rights validation seam"
-    )]
     fn mapping<const OBJECTS: usize, const LEASES: usize>(
         authority: &MemoryObjectAuthority<OBJECTS, LEASES>,
         registry: &mut ObjectRegistry<OBJECTS>,
@@ -1319,11 +1368,15 @@ mod tests {
         region: RegionKey,
         ceiling: MemoryProtection,
     ) -> (CapturedMappingAuthority, MapAuthorization) {
-        let authorization = unsafe {
-            authority
-                .issue_map_authorization(registry, owner, object, address_space, region, ceiling)
-                .unwrap()
-        };
+        assert_eq!(object.object_id(), Some(owner.id()));
+        let resolved = crate::handle::resolve_test_internal_owner(
+            registry,
+            owner,
+            deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT),
+        );
+        let authorization = authority
+            .issue_map_authorization(resolved, address_space, region, ceiling)
+            .unwrap();
         let captured = authorization.capture(address_space, region).unwrap();
         (captured, authorization)
     }
@@ -1351,6 +1404,208 @@ mod tests {
             .create_region::<1>(space, PAGE_SIZE, PAGE_SIZE)
             .unwrap();
         (space, region.region_key())
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "the synthetic manager helper attests complete zeroing before typed backing assignment"
+    )]
+    fn handled_object<const HANDLES: usize>(
+        rights: DwRights,
+        ceiling: MemoryProtection,
+    ) -> (
+        crate::memory::frame_roles::FrameRoleManager<1, 8>,
+        ObjectRegistry<2>,
+        MemoryObjectAuthority<1, 4>,
+        HandleTable<HANDLES>,
+        MemoryObjectKey,
+        DwHandle,
+        u64,
+    ) {
+        let mut roles =
+            crate::memory::frame_roles::synthetic_frame_role_manager::<1, 8>(0x10_000, 4);
+        let allocation = roles.allocate(1).unwrap();
+        let physical_start = allocation.physical_start();
+        let zeroed = unsafe { roles.assume_zeroed(allocation) }.unwrap();
+        let backing = roles.assign_object_backing(zeroed).unwrap();
+
+        let mut registry = ObjectRegistry::<2>::new();
+        let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+        let mut authority = MemoryObjectAuthority::<1, 4>::new();
+        let key = authority
+            .grant_backing(
+                &creation,
+                backing,
+                PAGE_SIZE,
+                MemoryObjectKind::PageBacked,
+                ceiling,
+            )
+            .unwrap();
+        let handle_ref = registry.creation_into_handle(creation).unwrap();
+        let mut table = HandleTable::<HANDLES>::new();
+        let handle = table.install(handle_ref, rights).unwrap();
+        (
+            roles,
+            registry,
+            authority,
+            table,
+            key,
+            handle,
+            physical_start,
+        )
+    }
+
+    fn complete_memory_release(
+        registry: &mut ObjectRegistry<2>,
+        authority: &mut MemoryObjectAuthority<1, 4>,
+        roles: &mut crate::memory::frame_roles::FrameRoleManager<1, 8>,
+        final_release: FinalRelease,
+    ) {
+        let finalization = authority.take_finalization(final_release).unwrap();
+        complete_memory_finalization(registry, roles, finalization);
+    }
+
+    #[test]
+    fn reduced_duplicate_cannot_widen_mapping_rights() {
+        let full = deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT);
+        let (mut roles, mut registry, mut authority, mut table, _key, source, physical_start) =
+            handled_object::<2>(full, MemoryProtection::READ_WRITE_EXECUTE);
+        let (space, region) = ids();
+
+        let read_only = table
+            .duplicate(&mut registry, source, DW_RIGHT_READ)
+            .unwrap();
+        let resolved = table
+            .lookup(
+                &mut registry,
+                read_only,
+                AcceptedObjectTypes::One(DW_OBJECT_TYPE_MEMORY_OBJECT),
+                DwRights(0),
+            )
+            .unwrap();
+        let failure = authority
+            .issue_map_authorization(resolved, space, region, MemoryProtection::READ)
+            .err()
+            .expect("READ without MAP cannot authorize a mapping");
+        assert_eq!(failure.error(), MemoryObjectError::InsufficientRights);
+        let (error, releases) = failure.release(&mut registry);
+        assert_eq!(error, MemoryObjectError::InsufficientRights);
+        assert!(releases.is_empty());
+        assert!(table.close(&mut registry, read_only).unwrap().is_none());
+
+        let map_read = DwRights(DW_RIGHT_READ.0 | DW_RIGHT_MAP.0);
+        let reduced = table.duplicate(&mut registry, source, map_read).unwrap();
+        let resolved = table
+            .lookup(
+                &mut registry,
+                reduced,
+                AcceptedObjectTypes::One(DW_OBJECT_TYPE_MEMORY_OBJECT),
+                DwRights(0),
+            )
+            .unwrap();
+        let authorization = authority
+            .issue_map_authorization(resolved, space, region, MemoryProtection::READ)
+            .unwrap();
+        assert!(authorization.release(&mut registry).is_empty());
+
+        for ceiling in [MemoryProtection::READ_WRITE, MemoryProtection::READ_EXECUTE] {
+            let resolved = table
+                .lookup(
+                    &mut registry,
+                    reduced,
+                    AcceptedObjectTypes::One(DW_OBJECT_TYPE_MEMORY_OBJECT),
+                    DwRights(0),
+                )
+                .unwrap();
+            let failure = authority
+                .issue_map_authorization(resolved, space, region, ceiling)
+                .err()
+                .expect("reduced handle cannot widen mapping authority");
+            assert_eq!(failure.error(), MemoryObjectError::InsufficientRights);
+            let (_, releases) = failure.release(&mut registry);
+            assert!(releases.is_empty());
+        }
+        assert!(table.close(&mut registry, reduced).unwrap().is_none());
+        let final_release = table.close(&mut registry, source).unwrap().unwrap();
+        complete_memory_release(&mut registry, &mut authority, &mut roles, final_release);
+        assert_eq!(roles.allocate(1).unwrap().physical_start(), physical_start);
+    }
+
+    #[test]
+    fn resolved_lookup_survives_source_close_and_closed_handle_cannot_reauthorize() {
+        let full = deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT);
+        let (mut roles, mut registry, mut authority, mut table, _key, source, physical_start) =
+            handled_object::<1>(full, MemoryProtection::READ_WRITE_EXECUTE);
+        let (space, region) = ids();
+        let resolved = table
+            .lookup(
+                &mut registry,
+                source,
+                AcceptedObjectTypes::One(DW_OBJECT_TYPE_MEMORY_OBJECT),
+                DwRights(0),
+            )
+            .unwrap();
+        assert!(table.close(&mut registry, source).unwrap().is_none());
+        assert_eq!(
+            table.lookup(&mut registry, source, AcceptedObjectTypes::Any, DwRights(0),),
+            Err(HandleTableError::InvalidHandle)
+        );
+        let authorization = authority
+            .issue_map_authorization(resolved, space, region, MemoryProtection::READ)
+            .unwrap();
+        let final_release = only_final(authorization.release(&mut registry));
+        complete_memory_release(&mut registry, &mut authority, &mut roles, final_release);
+        assert_eq!(roles.allocate(1).unwrap().physical_start(), physical_start);
+    }
+
+    #[test]
+    fn payload_ceiling_remains_below_broad_handle_rights() {
+        let full = deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT);
+        let (mut roles, mut registry, mut authority, mut table, _key, source, _) =
+            handled_object::<1>(full, MemoryProtection::READ);
+        let (space, region) = ids();
+        let resolved = table
+            .lookup(
+                &mut registry,
+                source,
+                AcceptedObjectTypes::One(DW_OBJECT_TYPE_MEMORY_OBJECT),
+                DwRights(0),
+            )
+            .unwrap();
+        let failure = authority
+            .issue_map_authorization(resolved, space, region, MemoryProtection::READ_WRITE)
+            .err()
+            .expect("payload ceiling must reject writable authorization");
+        assert_eq!(failure.error(), MemoryObjectError::ProtectionCeiling);
+        let (_, releases) = failure.release(&mut registry);
+        assert!(releases.is_empty());
+        let final_release = table.close(&mut registry, source).unwrap().unwrap();
+        complete_memory_release(&mut registry, &mut authority, &mut roles, final_release);
+    }
+
+    #[test]
+    fn wrong_object_type_returns_resolved_pin_for_exact_release() {
+        let mut registry = ObjectRegistry::<1>::new();
+        let creation = registry.create(deepwyrm_abi::DW_OBJECT_TYPE_EVENT).unwrap();
+        let handle_ref = registry.creation_into_handle(creation).unwrap();
+        let mut table = HandleTable::<1>::new();
+        let event_rights =
+            deepwyrm_abi::dw_object_compatible_rights(deepwyrm_abi::DW_OBJECT_TYPE_EVENT);
+        let handle = table.install(handle_ref, event_rights).unwrap();
+        let resolved = table
+            .lookup(&mut registry, handle, AcceptedObjectTypes::Any, DwRights(0))
+            .unwrap();
+        let authority = MemoryObjectAuthority::<1, 1>::new();
+        let (space, region) = ids();
+        let failure = authority
+            .issue_map_authorization(resolved, space, region, MemoryProtection::READ)
+            .err()
+            .expect("non-MemoryObject lookup cannot authorize a mapping");
+        assert_eq!(failure.error(), MemoryObjectError::ObjectReference);
+        let (_, releases) = failure.release(&mut registry);
+        assert!(releases.is_empty());
+        let final_release = table.close(&mut registry, handle).unwrap().unwrap();
+        registry.complete_finalization(final_release).unwrap();
     }
 
     #[test]
@@ -1640,7 +1895,7 @@ mod tests {
     #[test]
     #[allow(
         unsafe_code,
-        reason = "the test exercises the temporary rights-validation seam while proving D4 lifetime transfer"
+        reason = "the synthetic manager test attests complete zeroing before typed backing assignment"
     )]
     fn authorization_pin_transfers_to_lease_and_final_unmap_reclaims_backing() {
         let mut roles =
@@ -1664,19 +1919,15 @@ mod tests {
             .unwrap();
         let owner = registry.creation_into_internal(creation).unwrap();
         let (space, region) = ids();
-        let authorization = unsafe {
-            authority
-                .issue_map_authorization(
-                    &mut registry,
-                    &owner,
-                    key,
-                    space,
-                    region,
-                    MemoryProtection::READ_WRITE,
-                )
-                .unwrap()
-        };
-        let captured = authorization.capture(space, region).unwrap();
+        let (captured, authorization) = mapping(
+            &authority,
+            &mut registry,
+            &owner,
+            key,
+            space,
+            region,
+            MemoryProtection::READ_WRITE,
+        );
         let prepared = authority
             .prepare_replace::<1, 1>(
                 &mut registry,
@@ -1712,7 +1963,7 @@ mod tests {
     #[test]
     #[allow(
         unsafe_code,
-        reason = "the test exercises the temporary rights-validation seam while proving failed authorization rollback"
+        reason = "the synthetic manager test attests complete zeroing before typed backing assignment"
     )]
     fn failed_mapping_preparation_drops_last_authorization_pin() {
         let mut roles =
@@ -1735,19 +1986,15 @@ mod tests {
             .unwrap();
         let owner = registry.creation_into_internal(creation).unwrap();
         let (space, region) = ids();
-        let authorization = unsafe {
-            authority
-                .issue_map_authorization(
-                    &mut registry,
-                    &owner,
-                    key,
-                    space,
-                    region,
-                    MemoryProtection::READ_WRITE,
-                )
-                .unwrap()
-        };
-        let captured = authorization.capture(space, region).unwrap();
+        let (captured, authorization) = mapping(
+            &authority,
+            &mut registry,
+            &owner,
+            key,
+            space,
+            region,
+            MemoryProtection::READ_WRITE,
+        );
         assert!(registry.release_internal(owner).unwrap().is_none());
 
         let error = authority
@@ -1779,7 +2026,7 @@ mod tests {
     #[test]
     #[allow(
         unsafe_code,
-        reason = "the test exercises the temporary rights-validation seam while proving split-delta rollback and commit"
+        reason = "the synthetic manager test attests complete zeroing before typed backing assignment"
     )]
     fn mapping_split_retains_positive_delta_and_rollback_is_exact() {
         let mut roles =
@@ -1801,19 +2048,15 @@ mod tests {
             .unwrap();
         let owner = registry.creation_into_internal(creation).unwrap();
         let (space, region) = ids();
-        let authorization = unsafe {
-            authority
-                .issue_map_authorization(
-                    &mut registry,
-                    &owner,
-                    key,
-                    space,
-                    region,
-                    MemoryProtection::READ_WRITE,
-                )
-                .unwrap()
-        };
-        let captured = authorization.capture(space, region).unwrap();
+        let (captured, authorization) = mapping(
+            &authority,
+            &mut registry,
+            &owner,
+            key,
+            space,
+            region,
+            MemoryProtection::READ_WRITE,
+        );
         let prepared = authority
             .prepare_replace::<2, 1>(
                 &mut registry,

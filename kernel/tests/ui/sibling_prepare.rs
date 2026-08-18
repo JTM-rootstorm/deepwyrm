@@ -4,6 +4,8 @@
 mod memory;
 #[path = "../../src/object/mod.rs"]
 mod object;
+#[path = "../../src/handle/mod.rs"]
+mod handle;
 #[path = "../../src/memory/vm.rs"]
 mod vm;
 

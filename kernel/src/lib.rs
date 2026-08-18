@@ -12,14 +12,14 @@ pub mod boot;
 pub mod debug;
 #[allow(
     dead_code,
-    reason = "DW0-D3 lands the standalone handle table before DW0-D4/D5 consumers"
+    reason = "DW0-D3/D4 expose handle proof mechanics ahead of DW0-D5 service-layer consumers"
 )]
 pub(crate) mod handle;
 pub mod interrupt;
 pub mod memory;
 #[allow(
     dead_code,
-    reason = "DW0-D2 lands the generic object core before DW0-D3 handle consumers"
+    reason = "DW0-D2/D4 expose generic lifetime primitives ahead of DW0-D5 service-layer consumers"
 )]
 pub(crate) mod object;
 

@@ -2,7 +2,9 @@ use deepwyrm_abi::{
     DW_HANDLE_INVALID, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DwHandle, DwObjectType, DwRights,
 };
 
-use crate::object::{FinalRelease, HandleRef, InternalRef, ObjectRegistry, ObjectRegistryError};
+use crate::object::{
+    FinalRelease, HandleRef, InternalRef, ObjectId, ObjectRegistry, ObjectRegistryError,
+};
 
 use super::rights::{
     RightsValidationError, require_held, require_subset, validate_compatible,
@@ -51,6 +53,10 @@ pub(crate) struct ResolvedHandle {
 impl ResolvedHandle {
     pub(crate) const fn object_type(&self) -> DwObjectType {
         self.reference.object_type()
+    }
+
+    pub(crate) const fn object_id(&self) -> ObjectId {
+        self.reference.id()
     }
 
     pub(crate) const fn rights(&self) -> DwRights {

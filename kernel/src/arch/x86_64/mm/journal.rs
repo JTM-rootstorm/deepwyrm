@@ -1946,6 +1946,7 @@ mod tests {
             )
             .unwrap();
         let object_owner = registry.creation_into_internal(creation).unwrap();
+        assert_eq!(object.object_id(), Some(object_owner.id()));
 
         let mut spaces = unsafe { AddressSpaceAuthority::<1, 1>::new() };
         let address_space = spaces.create_address_space().unwrap();
@@ -1966,17 +1967,14 @@ mod tests {
                 )
             }
             .unwrap();
-            let authorization = unsafe {
-                region
-                    .authorize_map(
-                        &objects,
-                        &mut registry,
-                        &object_owner,
-                        object,
-                        Protection::READ_WRITE_EXECUTE,
-                    )
-                    .unwrap()
-            };
+            let resolved = crate::handle::resolve_test_internal_owner(
+                &mut registry,
+                &object_owner,
+                deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT),
+            );
+            let authorization = region
+                .authorize_map(&objects, resolved, Protection::READ_WRITE_EXECUTE)
+                .unwrap();
             let failure = region
                 .map(
                     &mut objects,
@@ -2016,17 +2014,14 @@ mod tests {
             }
             .unwrap();
 
-            let authorization = unsafe {
-                region
-                    .authorize_map(
-                        &objects,
-                        &mut registry,
-                        &object_owner,
-                        object,
-                        Protection::READ_WRITE_EXECUTE,
-                    )
-                    .unwrap()
-            };
+            let resolved = crate::handle::resolve_test_internal_owner(
+                &mut registry,
+                &object_owner,
+                deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT),
+            );
+            let authorization = region
+                .authorize_map(&objects, resolved, Protection::READ_WRITE_EXECUTE)
+                .unwrap();
             assert!(
                 region
                     .map(
@@ -2071,17 +2066,14 @@ mod tests {
             assert_eq!(objects.active_lease_count(), 1);
 
             publisher.target.fail_apply = true;
-            let authorization = unsafe {
-                region
-                    .authorize_map(
-                        &objects,
-                        &mut registry,
-                        &object_owner,
-                        object,
-                        Protection::READ_EXECUTE,
-                    )
-                    .unwrap()
-            };
+            let resolved = crate::handle::resolve_test_internal_owner(
+                &mut registry,
+                &object_owner,
+                deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT),
+            );
+            let authorization = region
+                .authorize_map(&objects, resolved, Protection::READ_EXECUTE)
+                .unwrap();
             let failure = region
                 .map(
                     &mut objects,
@@ -2105,17 +2097,14 @@ mod tests {
             assert_eq!(objects.active_lease_count(), 1);
 
             publisher.target.fail_apply = false;
-            let authorization = unsafe {
-                region
-                    .authorize_map(
-                        &objects,
-                        &mut registry,
-                        &object_owner,
-                        object,
-                        Protection::READ_EXECUTE,
-                    )
-                    .unwrap()
-            };
+            let resolved = crate::handle::resolve_test_internal_owner(
+                &mut registry,
+                &object_owner,
+                deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT),
+            );
+            let authorization = region
+                .authorize_map(&objects, resolved, Protection::READ_EXECUTE)
+                .unwrap();
             assert!(
                 region
                     .map(

@@ -4,6 +4,8 @@
 mod boot;
 #[path = "../../src/object/mod.rs"]
 mod object;
+#[path = "../../src/handle/mod.rs"]
+mod handle;
 #[path = "../../src/memory/mod.rs"]
 mod memory;
 

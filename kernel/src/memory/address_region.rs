@@ -5,15 +5,16 @@
 
 #![allow(
     dead_code,
-    reason = "DW0-C exposes this model to the architecture publisher before page-table integration wires its production callers"
+    reason = "DW0-C/D4 expose the atomic region model ahead of later process/syscall production consumers"
 )]
 
 use super::object::{
-    CapturedMappingAuthority, LeaseRequest, MapAuthorization, MappingFinalReleases, MappingLease,
-    MemoryObjectAuthority, MemoryObjectError, MemoryObjectKey, MemoryObjectRange, MemoryProtection,
-    PAGE_SIZE,
+    CapturedMappingAuthority, LeaseRequest, MapAuthorization, MapAuthorizationCreateError,
+    MappingFinalReleases, MappingLease, MemoryObjectAuthority, MemoryObjectError, MemoryObjectKey,
+    MemoryObjectRange, MemoryProtection, PAGE_SIZE,
 };
-use crate::object::{InternalRef, ObjectRegistry};
+use crate::handle::ResolvedHandle;
+use crate::object::ObjectRegistry;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 const USER_CANONICAL_END: u64 = 0x0000_8000_0000_0000;
@@ -486,43 +487,16 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         &self.mappings
     }
 
-    /// Issues a one-shot map authorization bound to this exact region.
-    ///
-    /// # Safety
-    ///
-    /// The caller must have validated MAP + READ for `object`, plus WRITE
-    /// and/or EXECUTE exactly when present in `ceiling`, from a currently live
-    /// rights-bearing handle. The authorization is consumed by one map
-    /// attempt; only a successfully committed mapping retains its private
-    /// captured ceiling after the source handle closes.
-    #[allow(
-        unsafe_code,
-        reason = "this is the narrow future handle-rights validation seam for region-bound map authority"
-    )]
-    pub(crate) unsafe fn authorize_map<
-        const OBJECTS: usize,
-        const LEASES: usize,
-        const REGISTRY_OBJECTS: usize,
-    >(
+    /// Consumes one D3-resolved handle into a one-shot authorization bound to
+    /// this exact region. The lookup pin becomes the mapping pre-publication
+    /// lifetime owner; validation failure returns the resolved handle intact.
+    pub(crate) fn authorize_map<const OBJECTS: usize, const LEASES: usize>(
         &self,
         authority: &MemoryObjectAuthority<OBJECTS, LEASES>,
-        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
-        source: &InternalRef,
-        object: MemoryObjectKey,
+        resolved: ResolvedHandle,
         ceiling: Protection,
-    ) -> Result<MapAuthorization, MemoryObjectError> {
-        // SAFETY: this function carries the same live-handle rights contract
-        // while supplying the region identities callers cannot forge.
-        unsafe {
-            authority.issue_map_authorization(
-                registry,
-                source,
-                object,
-                self.address_space,
-                self.region,
-                ceiling,
-            )
-        }
+    ) -> Result<MapAuthorization, MapAuthorizationCreateError> {
+        authority.issue_map_authorization(resolved, self.address_space, self.region, ceiling)
     }
 
     #[allow(
@@ -1166,10 +1140,6 @@ mod tests {
         key
     }
 
-    #[allow(
-        unsafe_code,
-        reason = "tests stand in for the future handle-rights validation seam"
-    )]
     fn authorization<const OBJECTS: usize, const LEASES: usize, const SLOTS: usize>(
         objects: &mut TestObjects<OBJECTS, LEASES>,
         object: MemoryObjectKey,
@@ -1188,12 +1158,12 @@ mod tests {
             owners,
         } = objects;
         let owner = owners[owner_slot].as_ref().unwrap();
-        // SAFETY: each test explicitly selects the exercised MAP+READ/W/X authority.
-        unsafe {
-            region
-                .authorize_map(authority, registry, owner, object, ceiling)
-                .unwrap()
-        }
+        let resolved = crate::handle::resolve_test_internal_owner(
+            registry,
+            owner,
+            deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT),
+        );
+        region.authorize_map(authority, resolved, ceiling).unwrap()
     }
 
     #[allow(
@@ -1794,10 +1764,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(
-        unsafe_code,
-        reason = "the replay test explicitly exercises the temporary handle-rights authorization seam across payload authorities"
-    )]
     fn object_authorizations_cannot_replay_across_authority_domains() {
         let mut spaces = space_authority::<1, 1>();
         let space = spaces.create_address_space().unwrap();
@@ -1818,17 +1784,15 @@ mod tests {
             )
             .unwrap();
         let first_owner = registry.creation_into_internal(first_creation).unwrap();
-        let authorization = unsafe {
-            region
-                .authorize_map(
-                    &first,
-                    &mut registry,
-                    &first_owner,
-                    first_object,
-                    Protection::READ,
-                )
-                .unwrap()
-        };
+        assert_eq!(first_object.object_id(), Some(first_owner.id()));
+        let resolved = crate::handle::resolve_test_internal_owner(
+            &mut registry,
+            &first_owner,
+            deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT),
+        );
+        let authorization = region
+            .authorize_map(&first, resolved, Protection::READ)
+            .unwrap();
 
         let second_creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
         let mut second = MemoryObjectAuthority::<1, 1>::new();

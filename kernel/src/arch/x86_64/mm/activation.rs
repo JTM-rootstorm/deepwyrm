@@ -2391,7 +2391,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     #[allow(
         unsafe_code,
-        reason = "the test-only authority locally supplies the future handle-rights proof and binds opaque model keys to this exact active root"
+        reason = "the target-only guest fixture uniquely owns its synthetic AddressSpaceAuthority root"
     )]
     fn run_mapped_case(&mut self, test: crate::test_support::BuildGuestTest) -> ! {
         use crate::memory::address_region::{
@@ -2448,6 +2448,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let object_owner = registry
             .creation_into_internal(creation)
             .unwrap_or_else(|_| crate::test_support::complete_fail(0x0402));
+        if object.object_id() != Some(object_owner.id()) {
+            crate::test_support::complete_fail(0x0402);
+        }
 
         let mut candidates = [
             Some(
@@ -2480,16 +2483,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         // owners cannot be dropped while any published test mapping survives:
         // both completion paths below diverge before this scope can unwind.
         let result = (|| -> Result<(), u32> {
-            let authorization = unsafe {
-                region.authorize_map(
-                    &objects,
-                    &mut registry,
-                    &object_owner,
-                    object,
-                    MemoryProtection::READ_WRITE_EXECUTE,
-                )
-            }
-            .map_err(|_| 0x0406_u32)?;
+            let resolved = crate::handle::resolve_test_internal_owner(
+                &mut registry,
+                &object_owner,
+                deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT),
+            );
+            let authorization = region
+                .authorize_map(&objects, resolved, MemoryProtection::READ_WRITE_EXECUTE)
+                .map_err(|_| 0x0406_u32)?;
             {
                 let mut publisher =
                     self.bind_test_publisher(address_space, region.region_key(), &mut candidates)?;
@@ -2949,16 +2950,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         if backing_physical == second {
                             return Err(0x0478);
                         }
-                        let authorization = unsafe {
-                            region.authorize_map(
-                                &objects,
-                                &mut registry,
-                                &object_owner,
-                                object,
-                                MemoryProtection::READ_WRITE_EXECUTE,
-                            )
-                        }
-                        .map_err(|_| 0x0479_u32)?;
+                        let resolved = crate::handle::resolve_test_internal_owner(
+                            &mut registry,
+                            &object_owner,
+                            deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT),
+                        );
+                        let authorization = region
+                            .authorize_map(&objects, resolved, MemoryProtection::READ_WRITE_EXECUTE)
+                            .map_err(|_| 0x0479_u32)?;
                         {
                             let mut publisher = self.bind_test_publisher(
                                 address_space,
@@ -3080,16 +3079,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         let mappings_before = *region.mappings();
                         let leases_before = objects.active_lease_count();
                         let first_before = self.walk_leaf(first)?.entry;
-                        let authorization = unsafe {
-                            region.authorize_map(
-                                &objects,
-                                &mut registry,
-                                &object_owner,
-                                object,
-                                MemoryProtection::READ_WRITE_EXECUTE,
-                            )
-                        }
-                        .map_err(|_| 0x0445_u32)?;
+                        let resolved = crate::handle::resolve_test_internal_owner(
+                            &mut registry,
+                            &object_owner,
+                            deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT),
+                        );
+                        let authorization = region
+                            .authorize_map(&objects, resolved, MemoryProtection::READ_WRITE_EXECUTE)
+                            .map_err(|_| 0x0445_u32)?;
                         let rejected = {
                             let mut publisher = self.bind_test_publisher(
                                 address_space,
@@ -3139,16 +3136,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         if backing_physical == second {
                             return Err(0x044f);
                         }
-                        let authorization = unsafe {
-                            region.authorize_map(
-                                &objects,
-                                &mut registry,
-                                &object_owner,
-                                object,
-                                MemoryProtection::READ_WRITE_EXECUTE,
-                            )
-                        }
-                        .map_err(|_| 0x0450_u32)?;
+                        let resolved = crate::handle::resolve_test_internal_owner(
+                            &mut registry,
+                            &object_owner,
+                            deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT),
+                        );
+                        let authorization = region
+                            .authorize_map(&objects, resolved, MemoryProtection::READ_WRITE_EXECUTE)
+                            .map_err(|_| 0x0450_u32)?;
                         {
                             let mut publisher = self.bind_test_publisher(
                                 address_space,
