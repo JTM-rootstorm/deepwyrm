@@ -134,6 +134,65 @@ fn complete_memory_release(
 }
 
 #[test]
+fn production_binding_consumes_creation_before_first_publication() {
+    let mut registry = ObjectRegistry::<1>::new();
+    let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+    let id = creation.id();
+    let backing = crate::memory::frame_roles::synthetic_allocator_backing(0x30_000, 2);
+    let mut authority = MemoryObjectAuthority::<1, 1>::new();
+
+    let binding = authority
+        .bind_backing(
+            creation,
+            backing,
+            PAGE_SIZE,
+            MemoryObjectKind::PageBacked,
+            MemoryProtection::READ_WRITE,
+        )
+        .unwrap();
+    assert_eq!(binding.key().object_id(), Some(id));
+
+    let bound = registry.finish_payload_binding(binding).unwrap();
+    assert_eq!(bound.id(), id);
+    assert_eq!(bound.object_type(), DW_OBJECT_TYPE_MEMORY_OBJECT);
+    let handle = registry.bound_into_handle(bound).unwrap();
+    let final_release = registry.release_handle(handle).unwrap().unwrap();
+
+    let finalization = authority.take_finalization(final_release).unwrap();
+    let mut roles = crate::memory::frame_roles::synthetic_frame_role_manager::<1, 8>(0x40_000, 2);
+    // The synthetic backing above is not owned by this manager, so only prove
+    // the typed payload extraction here; manager-backed cleanup is covered by
+    // the existing finalization tests.
+    let (release, _backing) = finalization.into_parts();
+    registry.complete_finalization(release).unwrap();
+    let _ = &mut roles;
+}
+
+#[test]
+fn failed_production_binding_returns_creation_and_backing_for_rollback() {
+    let mut registry = ObjectRegistry::<1>::new();
+    let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+    let id = creation.id();
+    let backing = crate::memory::frame_roles::synthetic_allocator_backing(0x50_000, 1);
+    let mut authority = MemoryObjectAuthority::<1, 1>::new();
+
+    let failure = authority
+        .bind_backing(
+            creation,
+            backing,
+            PAGE_SIZE * 2,
+            MemoryObjectKind::PageBacked,
+            MemoryProtection::READ,
+        )
+        .unwrap_err();
+    assert_eq!(failure.error(), MemoryObjectError::BackingTooSmall);
+    let (creation, _backing) = failure.into_parts();
+    assert_eq!(creation.id(), id);
+    let final_release = registry.release_creation(creation).unwrap().unwrap();
+    registry.complete_finalization(final_release).unwrap();
+}
+
+#[test]
 fn reduced_duplicate_cannot_widen_mapping_rights() {
     let full = deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT);
     let (mut roles, mut registry, mut authority, mut table, _key, source, physical_start) =

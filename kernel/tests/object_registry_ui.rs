@@ -51,6 +51,14 @@ fn object_registry_compile_fail_contracts() {
             fixture: "object_id_retain.rs",
             expected_error: "error[E0308]: mismatched types",
         },
+        CompileFailCase {
+            fixture: "object_creation_direct_publish.rs",
+            expected_error: "error[E0599]: no method named `creation_into_handle` found for struct `ObjectRegistry<CAPACITY>` in the current scope",
+        },
+        CompileFailCase {
+            fixture: "object_finalization_direct_complete.rs",
+            expected_error: "error[E0599]: no method named `complete_finalization` found for struct `ObjectRegistry<CAPACITY>` in the current scope",
+        },
     ];
 
     for case in cases {

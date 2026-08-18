@@ -62,6 +62,39 @@ impl CreationRef {
     }
 }
 
+#[must_use = "bound creations must become a first handle/internal owner or be rolled back through typed payload cleanup"]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct BoundCreation {
+    reference: CreationRef,
+}
+
+impl BoundCreation {
+    pub(crate) const fn id(&self) -> ObjectId {
+        self.reference.id()
+    }
+    pub(crate) const fn object_type(&self) -> DwObjectType {
+        self.reference.object_type()
+    }
+}
+
+mod payload_binding_seal {
+    use super::CreationRef;
+    pub trait Sealed {
+        fn into_creation(self) -> CreationRef;
+    }
+}
+
+pub(crate) trait PayloadBindingProof: payload_binding_seal::Sealed {}
+
+mod payload_cleanup_seal {
+    use super::FinalRelease;
+    pub trait Sealed {
+        fn into_final_release(self) -> FinalRelease;
+    }
+}
+
+pub(crate) trait PayloadCleanupProof: payload_cleanup_seal::Sealed {}
+
 #[must_use = "handle references own one generic object lifetime reference"]
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct HandleRef {
@@ -200,6 +233,7 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
 
         Err(ObjectRegistryError::Capacity)
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn creation_into_handle(
         &mut self,
         reference: CreationRef,
@@ -218,6 +252,7 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn creation_into_internal(
         &self,
         reference: CreationRef,
@@ -226,6 +261,60 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
             self.validate_reference(reference.id, reference.object_type, ReferenceKind::Internal)
         {
             return Err(ReferenceError { error, reference });
+        }
+        Ok(InternalRef {
+            id: reference.id,
+            object_type: reference.object_type,
+        })
+    }
+
+    pub(crate) fn finish_payload_binding<P: PayloadBindingProof>(
+        &self,
+        proof: P,
+    ) -> Result<BoundCreation, ReferenceError<CreationRef>> {
+        let reference = payload_binding_seal::Sealed::into_creation(proof);
+        if let Err(error) =
+            self.validate_reference(reference.id, reference.object_type, ReferenceKind::Internal)
+        {
+            return Err(ReferenceError { error, reference });
+        }
+        Ok(BoundCreation { reference })
+    }
+
+    pub(crate) fn bound_into_handle(
+        &mut self,
+        bound: BoundCreation,
+    ) -> Result<HandleRef, ReferenceError<BoundCreation>> {
+        let BoundCreation { reference } = bound;
+        if let Err(error) = self.transition_reference(
+            reference.id,
+            reference.object_type,
+            ReferenceKind::Internal,
+            ReferenceKind::Handle,
+        ) {
+            return Err(ReferenceError {
+                error,
+                reference: BoundCreation { reference },
+            });
+        }
+        Ok(HandleRef {
+            id: reference.id,
+            object_type: reference.object_type,
+        })
+    }
+
+    pub(crate) fn bound_into_internal(
+        &self,
+        bound: BoundCreation,
+    ) -> Result<InternalRef, ReferenceError<BoundCreation>> {
+        let BoundCreation { reference } = bound;
+        if let Err(error) =
+            self.validate_reference(reference.id, reference.object_type, ReferenceKind::Internal)
+        {
+            return Err(ReferenceError {
+                error,
+                reference: BoundCreation { reference },
+            });
         }
         Ok(InternalRef {
             id: reference.id,
@@ -346,6 +435,21 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
         }
     }
 
+    pub(crate) fn complete_payload_finalization<P: PayloadCleanupProof>(
+        &mut self,
+        proof: P,
+    ) -> Result<(), ReferenceError<FinalRelease>> {
+        let final_release = payload_cleanup_seal::Sealed::into_final_release(proof);
+        if let Err(error) = self.complete_finalization_inner(&final_release) {
+            return Err(ReferenceError {
+                error,
+                reference: final_release,
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn complete_finalization(
         &mut self,
         final_release: FinalRelease,
@@ -514,6 +618,20 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
             .ok_or(ObjectRegistryError::StaleReference)
     }
 }
+
+impl payload_binding_seal::Sealed for crate::memory::object::MemoryObjectBinding {
+    fn into_creation(self) -> CreationRef {
+        self.into_creation()
+    }
+}
+impl PayloadBindingProof for crate::memory::object::MemoryObjectBinding {}
+
+impl payload_cleanup_seal::Sealed for crate::memory::object::MemoryObjectCleanup {
+    fn into_final_release(self) -> FinalRelease {
+        self.into_final_release()
+    }
+}
+impl PayloadCleanupProof for crate::memory::object::MemoryObjectCleanup {}
 
 fn next_generation(generation: u32) -> Option<u32> {
     generation.checked_add(1).filter(|next| *next != 0)

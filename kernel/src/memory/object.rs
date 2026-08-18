@@ -66,6 +66,38 @@ impl MemoryObjectCreateError {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct MemoryObjectBindError {
+    error: MemoryObjectError,
+    creation: CreationRef,
+    backing: ObjectBackingGrant,
+}
+
+impl MemoryObjectBindError {
+    pub(crate) const fn error(&self) -> MemoryObjectError {
+        self.error
+    }
+    pub(crate) fn into_parts(self) -> (CreationRef, ObjectBackingGrant) {
+        (self.creation, self.backing)
+    }
+}
+
+#[must_use = "a bound MemoryObject payload must be sealed by ObjectRegistry before publication"]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct MemoryObjectBinding {
+    creation: CreationRef,
+    key: MemoryObjectKey,
+}
+
+impl MemoryObjectBinding {
+    pub(crate) const fn key(&self) -> MemoryObjectKey {
+        self.key
+    }
+    pub(crate) fn into_creation(self) -> CreationRef {
+        self.creation
+    }
+}
+
 #[must_use = "authorization failure returns a live lookup pin that must be released or reused"]
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct MapAuthorizationCreateError {
@@ -128,6 +160,18 @@ impl MemoryObjectFinalization {
     }
 }
 
+#[must_use = "typed MemoryObject cleanup must be consumed by the generic object registry"]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct MemoryObjectCleanup {
+    final_release: FinalRelease,
+}
+
+impl MemoryObjectCleanup {
+    pub(crate) fn into_final_release(self) -> FinalRelease {
+        self.final_release
+    }
+}
+
 pub(crate) fn complete_memory_finalization<
     const REGISTRY_OBJECTS: usize,
     const RANGE_CAPACITY: usize,
@@ -155,8 +199,11 @@ pub(crate) fn complete_memory_finalization<
         }
         _ => panic!("MemoryObject payload/backing kind diverged before finalization"),
     }
-    if let Err(error) = registry.complete_finalization(final_release) {
-        panic!("generic MemoryObject finalization became invalid after backing cleanup: {error:?}");
+    let cleanup = MemoryObjectCleanup { final_release };
+    if let Err(error) = registry.complete_payload_finalization(cleanup) {
+        panic!(
+            "generic MemoryObject finalization became invalid after typed backing cleanup: {error:?}"
+        );
     }
 }
 
@@ -609,8 +656,49 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         }
     }
 
-    /// Consumes a frame-role grant, binding its exclusive backing identity to
-    /// one object. A failed creation returns the grant for caller rollback.
+    /// Production binding path. Consumes the sole unpublished generic creation
+    /// authority and typed backing, then returns the only proof from which the
+    /// generic registry may publish a first owner.
+    pub(crate) fn bind_backing(
+        &mut self,
+        creation: CreationRef,
+        backing: ObjectBackingGrant,
+        logical_byte_len: u64,
+        kind: MemoryObjectKind,
+        protection_ceiling: MemoryProtection,
+    ) -> Result<MemoryObjectBinding, MemoryObjectBindError> {
+        let validated = self.validate_backing(
+            &creation,
+            &backing,
+            logical_byte_len,
+            kind,
+            protection_ceiling,
+        );
+        let (slot, rounded_byte_len) = match validated {
+            Ok(validated) => validated,
+            Err(error) => {
+                return Err(MemoryObjectBindError {
+                    error,
+                    creation,
+                    backing,
+                });
+            }
+        };
+        let key = self.install_backing(
+            slot,
+            creation.id(),
+            backing,
+            logical_byte_len,
+            rounded_byte_len,
+            kind,
+            protection_ceiling,
+        );
+        Ok(MemoryObjectBinding { creation, key })
+    }
+
+    /// Test-support compatibility path. Production payload-bearing construction
+    /// must use `bind_backing`, which consumes CreationRef.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn grant_backing(
         &mut self,
         reference: &CreationRef,
@@ -630,8 +718,32 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             Ok(validated) => validated,
             Err(error) => return Err(MemoryObjectCreateError { error, backing }),
         };
+        Ok(self.install_backing(
+            slot,
+            reference.id(),
+            backing,
+            logical_byte_len,
+            rounded_byte_len,
+            kind,
+            protection_ceiling,
+        ))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "typed backing installation keeps object identity, exact/rounded extent, kind, and protection ceiling explicit"
+    )]
+    fn install_backing(
+        &mut self,
+        slot: usize,
+        object: ObjectId,
+        backing: ObjectBackingGrant,
+        logical_byte_len: u64,
+        rounded_byte_len: u64,
+        kind: MemoryObjectKind,
+        protection_ceiling: MemoryProtection,
+    ) -> MemoryObjectKey {
         let physical_start = backing.physical_start();
-        let object = reference.id();
         self.objects[slot] = ObjectSlot {
             record: Some(ObjectRecord {
                 object,
@@ -644,9 +756,9 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             }),
         };
         self.backings[slot] = Some(backing);
-        Ok(MemoryObjectKey {
+        MemoryObjectKey {
             object: Some(object),
-        })
+        }
     }
 
     fn validate_backing(
