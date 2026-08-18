@@ -64,10 +64,21 @@ completed-phase acceptance. No physical-hardware acceptance claim is made;
 VM execution cannot establish one. This DW0-C record also does not close the
 earlier pending DW0-B loader/guest execution gate.
 
-The repository still does not provide DW0-D handles, DW0-E tasks/syscalls,
-later IPC/synchronization/time behavior, a primordial Wyrmroot process, or a
-completed DW0 release-candidate end-to-end gate. No source or artifact result
-in these records establishes VM behavior that was not actually tested.
+DW0-D now provides the kernel object/handle core, generated rights policy,
+MemoryObject lifetime integration, mapping authorization pins, and
+syscall-independent close/duplicate/object-info services. Its fresh D8
+host/core and accepted-toolchain artifact gates pass at clean revision
+`db09ce173adfb6850765fe2a4547d50a1050ac10`. The implementation candidate
+`fa4be89efc14aff1301b4a5ea6a9f4af9d11e29e` has a manual D7 security SOFT
+ACCEPT; proper Daybreak Blue / Dawnbreak scanning remains pending. See
+[`DW0_D_VALIDATION.md`](DW0_D_VALIDATION.md) and
+[`DW0_D_SECURITY_REVIEW.md`](../security/DW0_D_SECURITY_REVIEW.md).
+
+The repository still does not provide DW0-E tasks/syscalls, later
+IPC/synchronization/time behavior, a primordial Wyrmroot process, or a completed
+DW0 release-candidate end-to-end gate. DW0-D has no guest/VM gate and does not
+close the inherited DW0-B/C Wyrmroot/Q35 execution debt. No source or artifact
+result in these records establishes VM behavior that was not actually tested.
 
 ## Authority
 
