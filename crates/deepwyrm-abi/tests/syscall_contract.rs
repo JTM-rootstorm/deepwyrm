@@ -1,6 +1,8 @@
 use deepwyrm_abi::{
-    DW_SYSCALL_HANDLE_CLOSE, DW_SYSCALL_PROCESS_CREATE, DW_SYSCALL_TASK_GROUP_CREATE,
-    DW_SYSCALL_THREAD_START, DwKnownSyscall, DwSyscallId, DwSyscallImplementationPhase,
+    DW_SYSCALL_HANDLE_CLOSE, DW_SYSCALL_PROCESS_CREATE, DW_SYSCALL_PROCESS_EXIT,
+    DW_SYSCALL_PROCESS_TERMINATE, DW_SYSCALL_TASK_GROUP_CREATE, DW_SYSCALL_TASK_GROUP_TERMINATE,
+    DW_SYSCALL_THREAD_CREATE, DW_SYSCALL_THREAD_EXIT, DW_SYSCALL_THREAD_START,
+    DW_SYSCALL_THREAD_TERMINATE, DwKnownSyscall, DwSyscallId, DwSyscallImplementationPhase,
 };
 
 #[allow(dead_code)]
@@ -67,4 +69,29 @@ fn wrapper_metadata_locks_e_argument_registers_and_authority() {
     assert_eq!(start_size.index, 1);
     assert_eq!(start_size.register, "RSI");
     assert_eq!(start_size.abi_type, "u64");
+}
+
+#[test]
+fn e_task_syscall_numbers_remain_canonical() {
+    for (actual, expected) in [
+        (DW_SYSCALL_TASK_GROUP_CREATE.0, 0x0001_0001),
+        (DW_SYSCALL_TASK_GROUP_TERMINATE.0, 0x0001_0002),
+        (DW_SYSCALL_PROCESS_CREATE.0, 0x0001_0010),
+        (DW_SYSCALL_PROCESS_EXIT.0, 0x0001_0011),
+        (DW_SYSCALL_PROCESS_TERMINATE.0, 0x0001_0012),
+        (DW_SYSCALL_THREAD_CREATE.0, 0x0001_0020),
+        (DW_SYSCALL_THREAD_START.0, 0x0001_0021),
+        (DW_SYSCALL_THREAD_EXIT.0, 0x0001_0022),
+        (DW_SYSCALL_THREAD_TERMINATE.0, 0x0001_0023),
+    ] {
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn no_std_boundary_includes_only_string_free_dispatch_material() {
+    let crate_source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+    assert!(crate_source.contains("syscall_kernel.rs"));
+    assert!(!crate_source.contains("syscall_dispatch.rs"));
+    assert!(!crate_source.contains("syscall_wrappers.rs"));
 }
