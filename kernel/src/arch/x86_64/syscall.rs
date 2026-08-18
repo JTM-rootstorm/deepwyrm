@@ -22,6 +22,14 @@ pub(crate) use msr::{E4_FMASK, SyscallMsrPlan, normalize_cr4_for_e4};
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[allow(
     unused_imports,
+    reason = "E4 exception-runtime binding is consumed by the later primordial/task runtime"
+)]
+pub(crate) use super::exceptions::{
+    UserExceptionBindError, UserExceptionBinding, UserExceptionHandler, bind_user_exception_handler,
+};
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unused_imports,
     reason = "E4 target entry is wired into primordial runtime and E5 syscall adapters in later E work"
 )]
 pub(crate) use live::{

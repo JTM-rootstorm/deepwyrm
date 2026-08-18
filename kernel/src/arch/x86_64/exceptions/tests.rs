@@ -75,22 +75,38 @@ fn native_mapping_is_classification_not_delivery() {
 }
 
 #[test]
-fn raw_context_has_the_assembly_defined_layout() {
-    assert_eq!(core::mem::size_of::<RawExceptionContext>(), 168);
+fn raw_context_has_the_e4_fixed_assembly_layout() {
+    assert_eq!(core::mem::size_of::<RawExceptionContext>(), 184);
     assert_eq!(core::mem::align_of::<RawExceptionContext>(), 8);
     assert_eq!(core::mem::offset_of!(RawExceptionContext, rbx), 0);
     assert_eq!(core::mem::offset_of!(RawExceptionContext, cr2), 112);
-    assert_eq!(core::mem::offset_of!(RawExceptionContext, rax), 120);
-    assert_eq!(core::mem::offset_of!(RawExceptionContext, vector), 128);
+    assert_eq!(
+        core::mem::offset_of!(RawExceptionContext, stack_pointer),
+        120
+    );
+    assert_eq!(
+        core::mem::offset_of!(RawExceptionContext, stack_segment),
+        128
+    );
+    assert_eq!(core::mem::offset_of!(RawExceptionContext, rax), 136);
+    assert_eq!(core::mem::offset_of!(RawExceptionContext, vector), 144);
+    assert_eq!(
+        core::mem::offset_of!(RawExceptionContext, raw_error_code),
+        152
+    );
     assert_eq!(
         core::mem::offset_of!(RawExceptionContext, instruction_pointer),
-        144
+        160
     );
+    assert_eq!(
+        core::mem::offset_of!(RawExceptionContext, code_segment),
+        168
+    );
+    assert_eq!(core::mem::offset_of!(RawExceptionContext, rflags), 176);
 }
 
-#[test]
-fn raw_context_validation_rejects_non_kernel_exception_state() {
-    let valid = RawExceptionContext {
+fn raw_kernel(vector: u64) -> RawExceptionContext {
+    RawExceptionContext {
         rbx: 0,
         rcx: 0,
         rdx: 0,
@@ -106,16 +122,38 @@ fn raw_context_validation_rejects_non_kernel_exception_state() {
         r14: 0,
         r15: 0,
         cr2: 0,
+        stack_pointer: 0,
+        stack_segment: 0,
         rax: 0,
-        vector: 14,
+        vector,
         raw_error_code: 0,
         instruction_pointer: 0xffff_ffff_8000_1000,
         code_segment: 0x08,
         rflags: 0x202,
-    };
+    }
+}
+
+fn raw_user(vector: u64) -> RawExceptionContext {
+    RawExceptionContext {
+        instruction_pointer: 0x0000_0000_4000_1000,
+        code_segment: 0x33,
+        stack_pointer: 0x0000_0000_5000_2000,
+        stack_segment: 0x2b,
+        ..raw_kernel(vector)
+    }
+}
+
+#[test]
+fn raw_context_origin_validation_is_exact() {
+    let valid = raw_kernel(14);
     assert!(valid.validates_architecture());
+    assert_eq!(valid.origin(), Some(ExceptionOrigin::Kernel));
+
     let mut invalid = valid;
     invalid.code_segment = 0x1b;
+    assert!(!invalid.validates_architecture());
+    invalid = valid;
+    invalid.stack_pointer = 1;
     assert!(!invalid.validates_architecture());
     invalid = valid;
     invalid.instruction_pointer = 0x0001_0000_0000_0000;
@@ -123,4 +161,58 @@ fn raw_context_validation_rejects_non_kernel_exception_state() {
     invalid = valid;
     invalid.rflags = 0;
     assert!(!invalid.validates_architecture());
+
+    let mut user = raw_user(14);
+    assert!(user.validates_architecture());
+    assert_eq!(user.origin(), Some(ExceptionOrigin::User));
+    user.stack_segment = 0x23;
+    assert!(!user.validates_architecture());
+}
+
+#[test]
+fn user_page_fault_becomes_structured_process_fatal_record() {
+    let mut raw = raw_user(14);
+    raw.raw_error_code = 0x806f;
+    raw.cr2 = 0xdead_beef;
+    let ExceptionDisposition::UserFatal(record) = classify_raw_exception(raw).unwrap() else {
+        panic!("CPL3 page fault was not classified as user-fatal");
+    };
+    assert_eq!(record.exception_type, DW_EXCEPTION_PAGE_FAULT);
+    assert_eq!(record.vector, 14);
+    assert_eq!(record.detail, 0x806f);
+    assert_eq!(record.fault_address, 0xdead_beef);
+    assert_eq!(record.instruction_pointer, 0x4000_1000);
+    assert_eq!(record.stack_pointer, 0x5000_2000);
+    let task = record.task_exception();
+    assert_eq!(task.exception_type, DW_EXCEPTION_PAGE_FAULT);
+    assert_eq!(task.detail, 0x806f);
+    assert_eq!(task.fault_address, 0xdead_beef);
+}
+
+#[test]
+fn unnumbered_user_exception_uses_none_plus_raw_vector_detail() {
+    let raw = raw_user(7);
+    let ExceptionDisposition::UserFatal(record) = classify_raw_exception(raw).unwrap() else {
+        panic!("CPL3 #NM was not classified as user-fatal");
+    };
+    assert_eq!(record.exception_type, DW_EXCEPTION_NONE);
+    assert_eq!(record.vector, 7);
+    assert_eq!(record.detail, 7);
+    assert_eq!(record.fault_address, 0);
+}
+
+#[test]
+fn nmi_double_fault_and_machine_check_remain_architecture_terminal() {
+    for vector in [2, 8, 18] {
+        let mut raw = raw_user(vector);
+        if vector == 8 {
+            raw.raw_error_code = 0;
+        }
+        let ExceptionDisposition::KernelTerminal(exception) = classify_raw_exception(raw).unwrap()
+        else {
+            panic!("terminal vector {vector} became task-recoverable");
+        };
+        assert!(exception.vector.is_always_terminal());
+        assert_eq!(exception.frame.stack_segment, Some(0x2b));
+    }
 }

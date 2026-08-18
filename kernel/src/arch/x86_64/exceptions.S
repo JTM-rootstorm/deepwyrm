@@ -3,10 +3,10 @@
 
 /*
  * Every exception stub enters .Lexception_common with exactly two private
- * words above the processor frame: vector, then error code. Hardware supplies
- * the error-code word only for the vectors emitted through ERROR; NO_ERROR
- * supplies a zero placeholder. The common path is terminal and therefore
- * does not attempt to reconstruct an iret frame.
+ * words above the processor frame: vector, then error code. E4 additionally
+ * copies old RSP/SS into fixed normalized fields when saved CS has RPL3, and
+ * writes zero copies for kernel-origin entries. The original hardware frame
+ * remains untouched below the normalized snapshot.
  */
 .macro NO_ERROR vector
     .p2align 4
@@ -66,7 +66,20 @@ NO_ERROR 31
 .Lexception_common:
     cli
     cld
+    /* Preserve RAX before using it to normalize the optional old-stack tail. */
     pushq %rax
+    movq 32(%rsp), %rax
+    testb $3, %al
+    jz .Lexception_kernel_origin
+    movq 56(%rsp), %rax
+    pushq %rax                    /* copied old SS */
+    movq 56(%rsp), %rax
+    pushq %rax                    /* copied old RSP */
+    jmp .Lexception_stack_normalized
+.Lexception_kernel_origin:
+    pushq $0                      /* copied old SS */
+    pushq $0                      /* copied old RSP */
+.Lexception_stack_normalized:
     movq %cr2, %rax
     pushq %rax
     pushq %r15
@@ -111,6 +124,18 @@ dw_x86_64_apic_spurious_entry:
     cli
     cld
     pushq %rax
+    movq 32(%rsp), %rax
+    testb $3, %al
+    jz .Lterminal_kernel_origin
+    movq 56(%rsp), %rax
+    pushq %rax                    /* copied old SS */
+    movq 56(%rsp), %rax
+    pushq %rax                    /* copied old RSP */
+    jmp .Lterminal_stack_normalized
+.Lterminal_kernel_origin:
+    pushq $0
+    pushq $0
+.Lterminal_stack_normalized:
     movq %cr2, %rax
     pushq %rax
     pushq %r15

@@ -330,6 +330,12 @@ impl<const THREADS: usize> RetiredExitPins<THREADS> {
     }
 }
 
+#[must_use = "exception termination drains handles and returns generic pins for typed finalization"]
+pub(crate) struct RetiredProcessException<const HANDLES: usize, const THREADS: usize> {
+    pub(crate) drained: super::DrainResult<HANDLES>,
+    pub(crate) pins: RetiredExitPins<THREADS>,
+}
+
 /// E3 owner for the run queue and exact per-thread execution resources.
 ///
 /// Its three internal locks are never nested. Task state remains a caller-owned
@@ -493,6 +499,35 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
             process,
             threads: retired_threads,
         }
+    }
+
+    pub(crate) fn terminate_process_exception<
+        const OBJECTS: usize,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &self,
+        tasks: &mut super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        registry: &mut crate::object::ObjectRegistry<OBJECTS>,
+        process: super::ProcessKey,
+        faulting_thread: ThreadKey,
+        exception: super::TaskExceptionRecord,
+    ) -> Result<RetiredProcessException<HANDLES, THREADS>, super::TaskError> {
+        let effects = tasks.terminate_process_exception(
+            registry,
+            process,
+            faulting_thread,
+            exception.exception_type,
+            exception.detail,
+            exception.fault_address,
+        )?;
+        let pins = self.retire_exit_pins(effects.pins);
+        Ok(RetiredProcessException {
+            drained: effects.drained,
+            pins,
+        })
     }
 
     fn reclaim_resources(&self, resources: ThreadExecutionResources) {

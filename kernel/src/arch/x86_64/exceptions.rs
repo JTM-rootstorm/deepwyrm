@@ -1,16 +1,16 @@
-//! Structured x86_64 early-exception state.
+//! Structured x86_64 exception-entry state.
 //!
-//! This module describes data delivered by the exception-entry assembly
-//! boundary. It deliberately does not prescribe recovery, scheduling, or
-//! userspace exception delivery: before those facilities exist, an exception
-//! reporter must fail stopped after recording the context.
+//! Kernel-origin and explicitly terminal architecture paths remain fail-stop.
+//! DW0-E4 additionally normalizes CPL3 old-stack state and hands ordinary user
+//! exceptions to a mandatory process-fatal task-runtime binding.
 
 use deepwyrm_abi::{
     DW_EXCEPTION_BREAKPOINT, DW_EXCEPTION_DEBUG_TRAP, DW_EXCEPTION_DIVIDE_ERROR,
-    DW_EXCEPTION_GENERAL_PROTECTION, DW_EXCEPTION_ILLEGAL_INSTRUCTION, DW_EXCEPTION_PAGE_FAULT,
-    DwExceptionType,
+    DW_EXCEPTION_GENERAL_PROTECTION, DW_EXCEPTION_ILLEGAL_INSTRUCTION, DW_EXCEPTION_NONE,
+    DW_EXCEPTION_PAGE_FAULT, DwExceptionType,
 };
 
+use crate::arch::x86_64::gdt::{KERNEL_CODE_SELECTOR, USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 use crate::interrupt::{VectorClass, classify_vector};
 
 /// Number of architecturally allocated exception gates in the shared vector
@@ -150,6 +150,15 @@ impl ExceptionVector {
             _ => None,
         }
     }
+
+    /// Architecture paths that remain kernel-terminal even if interrupted CPL3.
+    #[must_use]
+    pub const fn is_always_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::NonMaskableInterrupt | Self::DoubleFault | Self::MachineCheck
+        )
+    }
 }
 
 /// Rejection of a vector not owned by the exception portion of the IDT.
@@ -158,11 +167,16 @@ pub enum ExceptionVectorError {
     OutsideExceptionRange(u8),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExceptionOrigin {
+    Kernel,
+    User,
+}
+
 /// Architectural frame normalized by exception-entry assembly.
 ///
-/// DW0-B's terminal stubs deliberately do not consume optional old-stack
-/// words: the emergency IDT has no IST while the final IDT does. Those tails
-/// remain deferred until a distinct, table-specific frame contract exists.
+/// E4 assembly copies the optional old-stack pair into fixed fields. Kernel
+/// origins expose `None`; CPL3 origins expose the exact hardware old RSP/SS.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExceptionFrame {
     pub instruction_pointer: u64,
@@ -221,6 +235,105 @@ impl EarlyException {
             _ => None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(any(test, target_os = "none")),
+    allow(
+        dead_code,
+        reason = "E4 user exception state is host-tested before target/runtime consumption"
+    )
+)]
+pub(crate) struct UserExceptionRecord {
+    pub(crate) exception_type: DwExceptionType,
+    pub(crate) vector: u32,
+    pub(crate) detail: u32,
+    pub(crate) reserved: u32,
+    pub(crate) fault_address: u64,
+    pub(crate) instruction_pointer: u64,
+    pub(crate) stack_pointer: u64,
+}
+
+impl UserExceptionRecord {
+    #[allow(
+        dead_code,
+        reason = "E4 exposes the architecture-neutral task handoff before the primordial runtime binds its handler"
+    )]
+    pub(crate) const fn task_exception(self) -> crate::task::TaskExceptionRecord {
+        crate::task::TaskExceptionRecord::new(self.exception_type, self.detail, self.fault_address)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(any(test, target_os = "none")),
+    allow(
+        dead_code,
+        reason = "E4 user exception state is host-tested before target/runtime consumption"
+    )
+)]
+pub(crate) enum ExceptionDisposition {
+    KernelTerminal(EarlyException),
+    UserFatal(UserExceptionRecord),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(any(test, target_os = "none")),
+    allow(
+        dead_code,
+        reason = "E4 user exception state is host-tested before target/runtime consumption"
+    )
+)]
+pub(crate) enum ExceptionDispositionError {
+    RawFrame,
+    Vector,
+    NormalizedFrame,
+}
+
+#[cfg_attr(
+    not(any(test, target_os = "none")),
+    allow(
+        dead_code,
+        reason = "E4 user exception state is host-tested before target/runtime consumption"
+    )
+)]
+pub(crate) fn classify_raw_exception(
+    raw: RawExceptionContext,
+) -> Result<ExceptionDisposition, ExceptionDispositionError> {
+    if !raw.validates_architecture() {
+        return Err(ExceptionDispositionError::RawFrame);
+    }
+    let vector_number = u8::try_from(raw.vector).map_err(|_| ExceptionDispositionError::Vector)?;
+    let vector = ExceptionVector::from_vector(vector_number)
+        .map_err(|_| ExceptionDispositionError::Vector)?;
+    if raw.origin() == Some(ExceptionOrigin::User) && !vector.is_always_terminal() {
+        let detail = if vector.pushes_error_code() {
+            raw.raw_error_code as u32
+        } else {
+            u32::from(vector_number)
+        };
+        return Ok(ExceptionDisposition::UserFatal(UserExceptionRecord {
+            exception_type: vector.native_exception_type().unwrap_or(DW_EXCEPTION_NONE),
+            vector: u32::from(vector_number),
+            detail,
+            reserved: 0,
+            fault_address: if matches!(vector, ExceptionVector::PageFault) {
+                raw.cr2
+            } else {
+                0
+            },
+            instruction_pointer: raw.instruction_pointer,
+            stack_pointer: raw.stack_pointer,
+        }));
+    }
+    let frame = raw.frame().ok_or(ExceptionDispositionError::RawFrame)?;
+    let error_code = vector.pushes_error_code().then_some(raw.raw_error_code);
+    let fault_address = matches!(vector, ExceptionVector::PageFault).then_some(raw.cr2);
+    let exception = EarlyException::new(vector, error_code, frame, fault_address)
+        .map_err(|_| ExceptionDispositionError::NormalizedFrame)?;
+    Ok(ExceptionDisposition::KernelTerminal(exception))
 }
 
 const fn stack_pair_is_incomplete(frame: ExceptionFrame) -> bool {
@@ -330,6 +443,8 @@ pub(crate) struct RawExceptionContext {
     r14: u64,
     r15: u64,
     cr2: u64,
+    stack_pointer: u64,
+    stack_segment: u64,
     rax: u64,
     vector: u64,
     raw_error_code: u64,
@@ -340,12 +455,56 @@ pub(crate) struct RawExceptionContext {
 
 #[cfg_attr(not(any(test, target_os = "none")), allow(dead_code))]
 impl RawExceptionContext {
-    fn validates_architecture(&self) -> bool {
-        self.vector <= u64::from(u8::MAX)
-            && self.code_segment & 3 == 0
-            && is_canonical_4_level(self.instruction_pointer)
-            && self.rflags & (1 << 1) != 0
+    fn origin(&self) -> Option<ExceptionOrigin> {
+        if self.code_segment == u64::from(KERNEL_CODE_SELECTOR.bits()) {
+            Some(ExceptionOrigin::Kernel)
+        } else if self.code_segment == u64::from(USER_CODE_SELECTOR.bits()) {
+            Some(ExceptionOrigin::User)
+        } else {
+            None
+        }
     }
+
+    fn validates_architecture(&self) -> bool {
+        if self.vector > u64::from(u8::MAX)
+            || !is_canonical_4_level(self.instruction_pointer)
+            || self.rflags & (1 << 1) == 0
+        {
+            return false;
+        }
+        match self.origin() {
+            Some(ExceptionOrigin::Kernel) => self.stack_pointer == 0 && self.stack_segment == 0,
+            Some(ExceptionOrigin::User) => {
+                self.stack_segment == u64::from(USER_DATA_SELECTOR.bits())
+                    && is_lower_canonical_user(self.instruction_pointer)
+            }
+            None => false,
+        }
+    }
+
+    fn frame(&self) -> Option<ExceptionFrame> {
+        match self.origin()? {
+            ExceptionOrigin::Kernel => Some(ExceptionFrame {
+                instruction_pointer: self.instruction_pointer,
+                code_segment: self.code_segment,
+                rflags: self.rflags,
+                stack_pointer: None,
+                stack_segment: None,
+            }),
+            ExceptionOrigin::User => Some(ExceptionFrame {
+                instruction_pointer: self.instruction_pointer,
+                code_segment: self.code_segment,
+                rflags: self.rflags,
+                stack_pointer: Some(self.stack_pointer),
+                stack_segment: Some(self.stack_segment),
+            }),
+        }
+    }
+}
+
+#[cfg_attr(not(any(test, target_os = "none")), allow(dead_code))]
+const fn is_lower_canonical_user(address: u64) -> bool {
+    address != 0 && address < 0x0000_8000_0000_0000
 }
 
 #[cfg_attr(not(any(test, target_os = "none")), allow(dead_code))]
@@ -405,14 +564,80 @@ const fn exception_reason(vector: ExceptionVector) -> &'static str {
     }
 }
 
-/// Terminal dispatch target called only by the audited `exceptions.S` common
-/// entry. It has an explicit System V signature; it never treats an arbitrary
-/// stack pointer as a Rust ABI argument and it never returns to an `iretq`.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) type UserExceptionHandler = fn(UserExceptionRecord) -> !;
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[must_use = "CPL3 entry requires a live E4 user-exception runtime binding"]
+pub(crate) struct UserExceptionBinding {
+    handler_address: usize,
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserExceptionBindError {
+    AlreadyBound,
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+static USER_EXCEPTION_HANDLER: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn bind_user_exception_handler(
+    handler: UserExceptionHandler,
+) -> Result<UserExceptionBinding, UserExceptionBindError> {
+    let address = handler as usize;
+    USER_EXCEPTION_HANDLER
+        .compare_exchange(
+            0,
+            address,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .map_err(|_| UserExceptionBindError::AlreadyBound)?;
+    Ok(UserExceptionBinding {
+        handler_address: address,
+    })
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn user_exception_binding_is_current(binding: &UserExceptionBinding) -> bool {
+    binding.handler_address != 0
+        && USER_EXCEPTION_HANDLER.load(core::sync::atomic::Ordering::Acquire)
+            == binding.handler_address
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "the one-shot atomic stores only a validated Rust function pointer supplied by bind_user_exception_handler"
+)]
+fn dispatch_bound_user_exception(record: UserExceptionRecord) -> ! {
+    let address = USER_EXCEPTION_HANDLER.load(core::sync::atomic::Ordering::Acquire);
+    if address == 0 {
+        halt_forever();
+    }
+    assert_eq!(
+        core::mem::size_of::<UserExceptionHandler>(),
+        core::mem::size_of::<usize>(),
+        "E4 user exception handler pointer width changed"
+    );
+    // SAFETY: the atomic is written only from an actual UserExceptionHandler
+    // function pointer and never mutated after a successful bind.
+    let handler: UserExceptionHandler = unsafe { core::mem::transmute(address) };
+    handler(record)
+}
+
+/// Origin-aware exception dispatch target called by the audited E4 common
+/// entry. Kernel-origin and architecturally terminal vectors preserve the
+/// fail-stop reporter. Ordinary CPL3 exceptions become one structured record
+/// handed to the bound task runtime and never resume the faulting context.
 ///
 /// # Safety
 ///
 /// Callers must supply a live, eight-byte-aligned `RawExceptionContext` built
-/// exactly by the terminal x86 exception assembly boundary.
+/// exactly by the x86 exception assembly boundary.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[allow(
     unsafe_code,
@@ -426,35 +651,16 @@ pub(crate) unsafe extern "sysv64" fn dw_x86_64_exception_dispatch(
         halt_forever();
     }
 
-    // SAFETY: `exceptions.S` saves every GPR plus CR2, vector/error words, and
-    // the three mandatory processor-frame words before this explicit SysV
-    // call. The exception path is terminal, so no asynchronous caller can
-    // revoke the stack snapshot.
+    // SAFETY: exceptions.S constructs the exact fixed-width snapshot before
+    // this call. The entry has IF clear and this function never resumes it.
     let raw_context = unsafe { raw_context.read() };
-    if !raw_context.validates_architecture() {
-        halt_forever();
+    match classify_raw_exception(raw_context) {
+        Ok(ExceptionDisposition::KernelTerminal(exception)) => {
+            report_early_exception(&mut SerialEarlyExceptionReporter, exception)
+        }
+        Ok(ExceptionDisposition::UserFatal(record)) => dispatch_bound_user_exception(record),
+        Err(_) => halt_forever(),
     }
-    let Ok(vector_number) = u8::try_from(raw_context.vector) else {
-        halt_forever();
-    };
-    let Ok(vector) = ExceptionVector::from_vector(vector_number) else {
-        halt_forever();
-    };
-    let frame = ExceptionFrame {
-        instruction_pointer: raw_context.instruction_pointer,
-        code_segment: raw_context.code_segment,
-        rflags: raw_context.rflags,
-        stack_pointer: None,
-        stack_segment: None,
-    };
-    let error_code = vector
-        .pushes_error_code()
-        .then_some(raw_context.raw_error_code);
-    let fault_address = matches!(vector, ExceptionVector::PageFault).then_some(raw_context.cr2);
-    let Ok(exception) = EarlyException::new(vector, error_code, frame, fault_address) else {
-        halt_forever();
-    };
-    report_early_exception(&mut SerialEarlyExceptionReporter, exception)
 }
 
 /// Terminal handler for the APIC error and spurious vectors. These vectors do

@@ -368,8 +368,12 @@ pub(crate) fn current_binding_generation() -> u64 {
 pub(crate) unsafe fn enter_validated_user(
     state: &ValidatedUserReturn,
     stack: KernelStackBounds,
+    exception_binding: &crate::arch::x86_64::exceptions::UserExceptionBinding,
 ) -> ! {
     validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
+    if !crate::arch::x86_64::exceptions::user_exception_binding_is_current(exception_binding) {
+        halt_forever();
+    }
     unsafe { bind_current_thread_stack(stack) }.unwrap_or_else(|_| halt_forever());
     unsafe extern "sysv64" {
         fn dw_x86_64_iret_to_user(state: *const super::frame::RawUserReturnContext) -> !;

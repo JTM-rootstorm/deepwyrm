@@ -26,7 +26,7 @@ mod scheduler;
 )]
 pub(crate) use execution::{
     ExecutionDomain, ExecutionResourceError, FpSimdPolicy, GeneralPurposeRegisters,
-    RetiredExitPins, SavedThreadContext, StartThreadError, UserTlsPolicy,
+    RetiredExitPins, RetiredProcessException, SavedThreadContext, StartThreadError, UserTlsPolicy,
 };
 #[allow(
     unused_imports,
@@ -36,6 +36,27 @@ pub(crate) use scheduler::{
     CooperativeScheduler, ScheduleDecision, SchedulerError, SchedulerReservation,
     SchedulerReservationFailure, SchedulerThreadState,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TaskExceptionRecord {
+    pub(crate) exception_type: DwExceptionType,
+    pub(crate) detail: u32,
+    pub(crate) fault_address: u64,
+}
+
+impl TaskExceptionRecord {
+    pub(crate) const fn new(
+        exception_type: DwExceptionType,
+        detail: u32,
+        fault_address: u64,
+    ) -> Self {
+        Self {
+            exception_type,
+            detail,
+            fault_address,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TaskError {

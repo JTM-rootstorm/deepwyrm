@@ -35,7 +35,15 @@ pub(super) fn validate_entry_normalization(disassembly: &str) {
     assert_eq!(normalizer.matches("mov\tcr4,").count(), 1);
     assert_eq!(normalizer.matches("btr\trax, 0x15").count(), 1);
     assert_eq!(normalizer.matches("btr\tqword ptr [rsp], 0x12").count(), 1);
-    assert_eq!(disassembly.matches("mov\tcr4,").count(), 1);
+
+    let e4_policy = function_body(disassembly, "normalize_cr4_for_e4");
+    assert_eq!(e4_policy.matches("and\trax, -0x10001").count(), 1);
+    let e4_live = function_body(disassembly, "normalize_live_cr4");
+    assert_eq!(e4_live.matches("mov\trax, cr4").count(), 2);
+    assert_eq!(e4_live.matches("mov\tcr4, rax").count(), 1);
+    assert_eq!(e4_live.matches("normalize_cr4_for_e4").count(), 1);
+    assert_eq!(e4_live.matches("and\trax, 0x10000").count(), 1);
+    assert_eq!(disassembly.matches("mov\tcr4,").count(), 2);
 
     let entry = function_body(disassembly, "dw_kernel_rust_entry");
     let normalize_call = entry

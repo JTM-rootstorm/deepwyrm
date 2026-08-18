@@ -9,7 +9,7 @@ pub(super) fn validate_ist_stack_margin(selector: &str, sizes: &[StackSize], dis
     // and the explicit assembly-to-Rust call pushes one return address. Rust
     // call return addresses are derived below from the deepest enumerated
     // non-inlined path rather than represented by a fixed allowance.
-    const IST_ENTRY_BYTES: usize = (5 + 2 + 16) * size_of::<u64>() + 15 + size_of::<u64>();
+    const IST_ENTRY_BYTES: usize = (5 + 2 + 18) * size_of::<u64>() + 15 + size_of::<u64>();
 
     let exact = |name: &str| one_stack_size(sizes, name, |symbol| symbol == name);
     let contains_plain = |description: &str, needle: &str| {

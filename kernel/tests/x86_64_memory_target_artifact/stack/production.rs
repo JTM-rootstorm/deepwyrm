@@ -3,7 +3,7 @@ use super::*;
 pub(crate) fn validate_production_ist_stack_margin(sizes: &[StackSize], disassembly: &str) {
     const IST_STACK_BYTES: usize = 16 * 1024;
     const REQUIRED_SPARE_BYTES: usize = 4 * 1024;
-    const IST_ENTRY_BYTES: usize = (5 + 2 + 16) * size_of::<u64>() + 15 + size_of::<u64>();
+    const IST_ENTRY_BYTES: usize = (5 + 2 + 18) * size_of::<u64>() + 15 + size_of::<u64>();
 
     let exact = |name: &str| one_stack_size(sizes, name, |symbol| symbol == name);
     let contains_plain = |description: &str, needle: &str| {

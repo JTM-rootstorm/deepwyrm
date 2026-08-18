@@ -12,10 +12,11 @@ pub(crate) fn validate_selector_stack_margin(
     const RETURN_ADDRESS_COUNT: usize = 32;
     const RETURN_ADDRESS_BYTES: usize = RETURN_ADDRESS_COUNT * size_of::<u64>();
     // Page-fault hardware pushes RIP, CS, RFLAGS, and the error word. The
-    // vector stub and common entry then retain 16 GPR/CR2 words and may discard
-    // one alignment word before calling Rust. Function-call return addresses
+    // vector stub and E4 common entry then retain 18 normalized words: saved
+    // RAX, copied old RSP/SS, CR2, and the remaining GPRs. It may discard one
+    // alignment word before calling Rust. Function-call return addresses
     // remain covered by RETURN_ADDRESS_BYTES above.
-    const PAGE_FAULT_ENTRY_BYTES: usize = (4 + 1 + 16 + 1) * size_of::<u64>();
+    const PAGE_FAULT_ENTRY_BYTES: usize = (4 + 1 + 18 + 1) * size_of::<u64>();
 
     let exact = |name: &str| one_stack_size(sizes, name, |symbol| symbol == name);
     let contains_plain = |description: &str, needle: &str| {

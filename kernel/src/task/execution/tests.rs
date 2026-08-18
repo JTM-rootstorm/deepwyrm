@@ -223,18 +223,21 @@ fn process_fatal_exception_retires_running_and_runnable_execution_ownership() {
     let (fault_stack, fault_context) = tasks.thread_execution_resources(faulting).unwrap().unwrap();
     let (sibling_stack, sibling_context) =
         tasks.thread_execution_resources(sibling).unwrap().unwrap();
-    let effects = tasks
+    let effects = domain
         .terminate_process_exception(
+            &mut tasks,
             &mut registry,
             process,
             faulting,
-            deepwyrm_abi::DW_EXCEPTION_PAGE_FAULT,
-            0x44,
-            0x5555,
+            super::super::TaskExceptionRecord::new(
+                deepwyrm_abi::DW_EXCEPTION_PAGE_FAULT,
+                0x44,
+                0x5555,
+            ),
         )
         .unwrap();
     let _drained = effects.drained;
-    let retired = domain.retire_exit_pins(effects.pins);
+    let retired = effects.pins;
 
     assert_eq!(domain.scheduler_state(faulting), None);
     assert_eq!(domain.scheduler_state(sibling), None);
