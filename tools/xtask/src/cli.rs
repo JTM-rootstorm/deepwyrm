@@ -99,8 +99,11 @@ pub(super) fn parse_test(args: &[String]) -> Action {
                 "handles" => {
                     Action::Command(Invocation::HostTests(Some(HostTestFilter::Handles)))
                 }
+                "tasks" => {
+                    Action::Command(Invocation::HostTests(Some(HostTestFilter::Tasks)))
+                }
                 _ => Action::UsageError(
-                    "unknown host-test filter; expected `abi`, `memory`, or `handles`".into(),
+                    "unknown host-test filter; expected `abi`, `memory`, `handles`, or `tasks`".into(),
                 ),
             },
             _ => Action::UsageError("`test host` accepts at most one filter".into()),

@@ -179,3 +179,79 @@ fn failed_task_preparation_rolls_back_scheduler_stack_and_context_capacity() {
         Some(super::super::SchedulerThreadState::Runnable)
     );
 }
+
+#[test]
+fn e3_execution_owners_are_send_sync_without_exporting_lock_guards() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<CooperativeScheduler<4>>();
+    assert_send_sync::<KernelStackPool<4>>();
+    assert_send_sync::<ThreadContextPool<4>>();
+    assert_send_sync::<ExecutionDomain<4>>();
+
+    let sync_surface = include_str!("../../sync/mod.rs");
+    assert!(!sync_surface.contains("SpinMutexGuard"));
+}
+
+#[test]
+fn process_fatal_exception_retires_running_and_runnable_execution_ownership() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (process, process_handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let process_owner = registry
+        .retain_internal_from_handle(&process_handle)
+        .unwrap();
+    let (faulting, faulting_handle) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    let (sibling, sibling_handle) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    assert!(registry.release_internal(process_owner).unwrap().is_none());
+    assert!(registry.release_internal(root_owner).unwrap().is_none());
+    let _ = (root, process_handle, faulting_handle, sibling_handle);
+
+    let domain = ExecutionDomain::<2>::new(stack_bounds::<2>()).unwrap();
+    domain
+        .start_thread(&mut tasks, faulting, start_state(10))
+        .unwrap();
+    domain
+        .start_thread(&mut tasks, sibling, start_state(11))
+        .unwrap();
+    assert_eq!(domain.schedule_next().unwrap().current, Some(faulting));
+    assert_eq!(
+        domain.scheduler_state(sibling),
+        Some(super::super::SchedulerThreadState::Runnable)
+    );
+
+    let (fault_stack, fault_context) = tasks.thread_execution_resources(faulting).unwrap().unwrap();
+    let (sibling_stack, sibling_context) =
+        tasks.thread_execution_resources(sibling).unwrap().unwrap();
+    let effects = tasks
+        .terminate_process_exception(
+            &mut registry,
+            process,
+            faulting,
+            deepwyrm_abi::DW_EXCEPTION_PAGE_FAULT,
+            0x44,
+            0x5555,
+        )
+        .unwrap();
+    let _drained = effects.drained;
+    let retired = domain.retire_exit_pins(effects.pins);
+
+    assert_eq!(domain.scheduler_state(faulting), None);
+    assert_eq!(domain.scheduler_state(sibling), None);
+    for stack in [fault_stack, sibling_stack] {
+        assert_eq!(
+            domain.stack_bounds(stack),
+            Err(ExecutionResourceError::StaleId)
+        );
+    }
+    for context in [fault_context, sibling_context] {
+        assert_eq!(
+            domain.load_context(context),
+            Err(ExecutionResourceError::StaleId)
+        );
+    }
+    let (process_pin, thread_pins) = retired.into_parts();
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        assert!(registry.release_internal(pin).unwrap().is_none());
+    }
+}

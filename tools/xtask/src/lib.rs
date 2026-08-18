@@ -42,6 +42,21 @@ const HANDLE_HOST_INTEGRATION_TESTS: &[&str] = &[
     "memory_authority_ui",
     "physical_ownership_ui",
 ];
+const TASK_HOST_TEST_FILTERS: &[&str] = &[
+    "sync::tests::",
+    "task::tests::",
+    "task::scheduler::tests::",
+    "task::execution::tests::",
+    "object::finalizer::tests::",
+    "object::finalizer::memory_route_tests::",
+    "root_region_handle_close_preserves_address_space_until_process_exit",
+];
+const TASK_HOST_INTEGRATION_TESTS: &[&str] = &[
+    "task_authority_ui",
+    "x86_64_activation_contract",
+    "x86_64_entry_contract",
+    "x86_64_memory_guest_contract",
+];
 const HARNESS_CONFIG: &str = "tooling/guest-harness.toml";
 const TRUSTED_TOOLCHAIN_CONFIG: &str = "tooling/rust-toolchain.toml";
 const BUILD_TOOLS_CONFIG: &str = "tooling/build-tools.toml";
@@ -61,7 +76,7 @@ Commands:
   check                              Run the workspace check
   abi generate                       Generate ABI-owned artifacts
   abi check                          Verify generated ABI artifacts have no drift
-  test host [abi|memory|handles]     Run focused host tests
+  test host [abi|memory|handles|tasks] Run focused host tests
   run --plan --request <path>        Emit the canonical QEMU run plan only
   gdb --plan --request <path>        Emit paused QEMU/GDB command plans only
   test guest <selector> --plan --request <path>
@@ -111,6 +126,7 @@ enum HostTestFilter {
     Abi,
     Memory,
     Handles,
+    Tasks,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -349,6 +365,9 @@ fn run_invocation(invocation: Invocation) -> io::Result<u8> {
                 Some(HostTestFilter::Handles) => {
                     return run_handle_host_tests();
                 }
+                Some(HostTestFilter::Tasks) => {
+                    return run_task_host_tests();
+                }
                 None => {
                     command.args(["--workspace", "--all-targets"]);
                 }
@@ -381,6 +400,42 @@ fn run_handle_host_tests() -> io::Result<u8> {
         }
     }
     for integration_test in HANDLE_HOST_INTEGRATION_TESTS {
+        let status = Command::new("cargo")
+            .current_dir(workspace_root())
+            .args([
+                "test",
+                "--locked",
+                "--package",
+                "deepwyrm-kernel",
+                "--test",
+                integration_test,
+            ])
+            .status()?;
+        if !status.success() {
+            return Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8);
+        }
+    }
+    Ok(0)
+}
+
+fn run_task_host_tests() -> io::Result<u8> {
+    for filter in TASK_HOST_TEST_FILTERS {
+        let status = Command::new("cargo")
+            .current_dir(workspace_root())
+            .args([
+                "test",
+                "--locked",
+                "--package",
+                "deepwyrm-kernel",
+                "--lib",
+                filter,
+            ])
+            .status()?;
+        if !status.success() {
+            return Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8);
+        }
+    }
+    for integration_test in TASK_HOST_INTEGRATION_TESTS {
         let status = Command::new("cargo")
             .current_dir(workspace_root())
             .args([

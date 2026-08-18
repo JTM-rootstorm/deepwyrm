@@ -71,6 +71,10 @@ fn available_commands_have_explicit_actions() {
             Action::Command(Invocation::HostTests(Some(HostTestFilter::Handles))),
         ),
         (
+            &["test", "host", "tasks"][..],
+            Action::Command(Invocation::HostTests(Some(HostTestFilter::Tasks))),
+        ),
+        (
             &["run", "--plan", "--request", "request.toml"][..],
             Action::Command(Invocation::HarnessPlan(
                 HarnessKind::Run,
@@ -129,6 +133,29 @@ fn handle_host_gate_covers_lifetime_and_authority_boundaries() {
             "object_registry_ui",
             "memory_authority_ui",
             "physical_ownership_ui"
+        ]
+    );
+}
+
+#[test]
+fn task_host_gate_covers_scheduler_resources_and_target_guard_contracts() {
+    for filter in [
+        "sync::tests::",
+        "task::tests::",
+        "task::scheduler::tests::",
+        "task::execution::tests::",
+        "object::finalizer::tests::",
+        "root_region_handle_close_preserves_address_space_until_process_exit",
+    ] {
+        assert!(TASK_HOST_TEST_FILTERS.contains(&filter));
+    }
+    assert_eq!(
+        TASK_HOST_INTEGRATION_TESTS,
+        &[
+            "task_authority_ui",
+            "x86_64_activation_contract",
+            "x86_64_entry_contract",
+            "x86_64_memory_guest_contract",
         ]
     );
 }
