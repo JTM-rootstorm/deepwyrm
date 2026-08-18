@@ -719,6 +719,18 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         })
     }
 
+    pub(crate) fn object_info_for_resolved(
+        &self,
+        resolved: &ResolvedHandle,
+    ) -> Result<MemoryObjectInfo, MemoryObjectError> {
+        if resolved.object_type() != DW_OBJECT_TYPE_MEMORY_OBJECT {
+            return Err(MemoryObjectError::ObjectReference);
+        }
+        self.object_info(MemoryObjectKey {
+            object: Some(resolved.object_id()),
+        })
+    }
+
     pub(crate) fn take_finalization(
         &mut self,
         final_release: FinalRelease,

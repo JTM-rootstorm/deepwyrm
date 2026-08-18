@@ -12,14 +12,14 @@ pub mod boot;
 pub mod debug;
 #[allow(
     dead_code,
-    reason = "DW0-D3/D4 expose handle proof mechanics ahead of DW0-D5 service-layer consumers"
+    reason = "DW0-D5 exposes handle/object services ahead of DW0-E syscall consumers"
 )]
 pub(crate) mod handle;
 pub mod interrupt;
 pub mod memory;
 #[allow(
     dead_code,
-    reason = "DW0-D2/D4 expose generic lifetime primitives ahead of DW0-D5 service-layer consumers"
+    reason = "DW0-D5 consumes generic lifetime primitives ahead of DW0-E process/syscall ownership"
 )]
 pub(crate) mod object;
 
