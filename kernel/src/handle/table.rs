@@ -367,7 +367,7 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
 impl<const CAPACITY: usize> Drop for HandleTable<CAPACITY> {
     fn drop(&mut self) {
         assert!(
-            self.live_count == 0,
+            self.live_count == 0 && self.slots.iter().all(|slot| slot.entry.is_none()),
             "live HandleTable dropped without explicit close/drain"
         );
     }
@@ -851,6 +851,44 @@ mod tests {
             Err(HandleTableError::InvalidHandle)
         );
         let final_release = table.close(&mut registry, second).unwrap();
+        assert!(final_release.is_some());
+        complete(&mut registry, final_release);
+    }
+
+    #[test]
+    #[should_panic(expected = "live HandleTable dropped without explicit close/drain")]
+    fn dropping_live_table_fails_stop() {
+        let mut registry = ObjectRegistry::<1>::new();
+        let mut table = HandleTable::<1>::new();
+        let _handle = install_object(
+            &mut registry,
+            &mut table,
+            DW_OBJECT_TYPE_EVENT,
+            dw_object_compatible_rights(DW_OBJECT_TYPE_EVENT),
+        );
+    }
+
+    #[test]
+    fn drain_preserves_object_while_lookup_pin_is_live() {
+        let mut registry = ObjectRegistry::<1>::new();
+        let mut table = HandleTable::<1>::new();
+        let handle = install_object(
+            &mut registry,
+            &mut table,
+            DW_OBJECT_TYPE_MEMORY_OBJECT,
+            rights(&[DW_RIGHT_READ, DW_RIGHT_INSPECT]),
+        );
+        let resolved = table
+            .lookup(
+                &mut registry,
+                handle,
+                AcceptedObjectTypes::Any,
+                DW_RIGHT_READ,
+            )
+            .unwrap();
+        let drained = table.drain(&mut registry);
+        assert_eq!(drained.final_release_count(), 0);
+        let final_release = release_lookup(&mut registry, resolved);
         assert!(final_release.is_some());
         complete(&mut registry, final_release);
     }
