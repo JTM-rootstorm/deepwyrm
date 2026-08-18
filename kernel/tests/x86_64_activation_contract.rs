@@ -85,8 +85,12 @@ fn c2_large_bootstrap_state_is_not_stack_owned() {
         .expect("read live kernel bootstrap source");
     let activation = fs::read_to_string(manifest_dir.join("src/arch/x86_64/mm/activation.rs"))
         .expect("read live activation source");
-    let transition = fs::read_to_string(manifest_dir.join("src/arch/x86_64/mm/transition.rs"))
-        .expect("read live transition source");
+    let activation_graph =
+        fs::read_to_string(manifest_dir.join("src/arch/x86_64/mm/activation/graph.rs"))
+            .expect("read inactive graph validation source");
+    let transition =
+        fs::read_to_string(manifest_dir.join("src/arch/x86_64/mm/transition/private.rs"))
+            .expect("read live transition mapper source");
     let physical = fs::read_to_string(manifest_dir.join("src/memory/physical.rs"))
         .expect("read live physical allocator source");
     let layout = fs::read_to_string(manifest_dir.join("arch/x86_64/layout.toml"))
@@ -103,15 +107,15 @@ fn c2_large_bootstrap_state_is_not_stack_owned() {
             "missing static bootstrap storage: {storage}"
         );
     }
-    for storage in [
-        "static BUILD_WORKSPACE",
-        "static GRAPH_VALIDATION_WORKSPACE",
-    ] {
-        assert!(
-            activation.contains(storage),
-            "missing static activation workspace: {storage}"
-        );
-    }
+    assert!(
+        activation.contains("static BUILD_WORKSPACE"),
+        "missing static inactive-root build workspace"
+    );
+    assert!(
+        activation_graph.contains("static GRAPH_VALIDATION_WORKSPACE"),
+        "missing static graph-validation workspace"
+    );
+    assert!(activation.contains("#[path = \"activation/graph.rs\"]"));
     assert!(
         !kernel.contains("let mut roles ="),
         "the large role registry must never be a kernel_main stack local"
