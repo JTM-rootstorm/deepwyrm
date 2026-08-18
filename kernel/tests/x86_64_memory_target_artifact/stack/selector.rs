@@ -35,7 +35,7 @@ pub(crate) fn validate_selector_stack_margin(
     );
     let memory_foundation_runner =
         contains_plain("memory foundation runner", ">::run_memory_foundation_test");
-    let mapped_case_runner = contains_plain("mapped-case runner", ">::run_mapped_case");
+    let mapped_case_runner = suffix("mapped-case runner", ">::run_mapped_case");
     let retained_runner = [
         AuditedStackFrame {
             name: "kernel-main",
@@ -56,7 +56,7 @@ pub(crate) fn validate_selector_stack_margin(
     ];
     let mapped_case_closure = suffix(
         "mapped-case common closure",
-        ">::run_mapped_case::{closure#8}",
+        ">::run_mapped_case::{closure#10}",
     );
     let mapped_case_common = [AuditedStackFrame {
         name: "mapped-case-common",
@@ -68,42 +68,42 @@ pub(crate) fn validate_selector_stack_margin(
             "mapping-selector",
             suffix(
                 "mapping selector closure",
-                ">::run_mapped_case::{closure#8}::{closure#2}",
+                ">::run_mapped_case::{closure#10}::{closure#1}",
             ),
         ),
         "memory-unmapping" => (
             "unmapping-selector",
             suffix(
                 "unmapping selector closure",
-                ">::run_mapped_case::{closure#8}::{closure#3}",
+                ">::run_mapped_case::{closure#10}::{closure#2}",
             ),
         ),
         "memory-permissions" => (
             "permissions-selector",
             suffix(
                 "permissions selector closure",
-                ">::run_mapped_case::{closure#8}::{closure#4}",
+                ">::run_mapped_case::{closure#10}::{closure#3}",
             ),
         ),
         "memory-invalid-pointer" => (
             "invalid-pointer-selector",
             suffix(
                 "invalid-pointer selector closure",
-                ">::run_mapped_case::{closure#8}::{closure#5}",
+                ">::run_mapped_case::{closure#10}::{closure#4}",
             ),
         ),
         "memory-user-kernel-isolation" => (
             "isolation-selector",
             suffix(
                 "isolation selector closure",
-                ">::run_mapped_case::{closure#8}::{closure#6}",
+                ">::run_mapped_case::{closure#10}::{closure#5}",
             ),
         ),
         "memory-shared-memory-object" => (
             "shared-object-selector",
             suffix(
                 "shared-object selector closure",
-                ">::run_mapped_case::{closure#8}::{closure#7}",
+                ">::run_mapped_case::{closure#10}::{closure#6}",
             ),
         ),
         _ => panic!("unknown memory selector {selector}"),
@@ -129,7 +129,7 @@ pub(crate) fn validate_selector_stack_margin(
     );
     let prepare_replace = contains_plain(
         "MemoryObjectAuthority::prepare_replace",
-        "MemoryObjectAuthority<1, 2>>::prepare_replace::<2>",
+        "MemoryObjectAuthority<1, 2>>::prepare_replace::<2, 1>",
     );
     let prepare_object_slot = contains_plain(
         "MemoryObjectAuthority::object_slot",
@@ -143,11 +143,11 @@ pub(crate) fn validate_selector_stack_margin(
     let prepare_next_generation = exact("deepwyrm_kernel::memory::vm::object::next_generation");
     let prepared_tickets = contains_plain(
         "PreparedReplace::tickets",
-        "PreparedReplace<1, 2, 2>>::tickets",
+        "PreparedReplace<1, 2, 2, 1>>::tickets",
     );
     let prepared_commit = contains_plain(
         "PreparedReplace::commit",
-        "PreparedReplace<1, 2, 2>>::commit",
+        "PreparedReplace<1, 2, 2, 1>>::commit",
     );
     let publish_replace = suffix(
         "AddressSpacePublisher::publish_replace",
@@ -157,7 +157,10 @@ pub(crate) fn validate_selector_stack_margin(
         "X86AddressSpacePublisher::publish_pages",
         ">::publish_pages",
     );
-    let publish_page = contains_plain("journal publish_page", "journal::publish_page::<");
+    let publish_page = contains_plain(
+        "journal publish_page",
+        "journal::publisher::publish_page::<",
+    );
     let map_page = contains_plain("PageTableRoot::map_page", "PageTableRoot>::map_page::<");
     let mm_commit = contains_plain(
         "page-table commit bridge",

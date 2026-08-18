@@ -313,7 +313,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         region: crate::memory::address_region::RegionKey,
         candidates: &'borrow mut [Option<crate::memory::frame_roles::TableCandidateGrant>; 3],
     ) -> Result<
-        super::super::journal::X86AddressSpacePublisher<
+        super::super::super::journal::X86AddressSpacePublisher<
             'borrow,
             ActiveScratchTarget<LiveActiveScratchIo>,
             RANGE_CAPACITY,
@@ -325,7 +325,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         u32,
     > {
         unsafe {
-            super::super::journal::X86AddressSpacePublisher::new(
+            super::super::super::journal::X86AddressSpacePublisher::new(
                 address_space,
                 region,
                 self.root,
