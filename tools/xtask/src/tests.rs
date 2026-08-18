@@ -121,6 +121,19 @@ fn available_commands_have_explicit_actions() {
 }
 
 #[test]
+fn handle_host_gate_covers_lifetime_and_authority_boundaries() {
+    assert!(HANDLE_HOST_TEST_FILTERS.contains(&"memory::vm::object::tests::"));
+    assert_eq!(
+        HANDLE_HOST_INTEGRATION_TESTS,
+        &[
+            "object_registry_ui",
+            "memory_authority_ui",
+            "physical_ownership_ui"
+        ]
+    );
+}
+
+#[test]
 fn harness_request_requires_paired_identity_and_no_host_share() {
     let path = temp_file(&request("guest-test", "arch.entry"));
     let parsed = load_harness_request(&path).unwrap();

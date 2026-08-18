@@ -34,7 +34,13 @@ const HANDLE_HOST_TEST_FILTERS: &[&str] = &[
     "handle::",
     "service::",
     "object::tests::",
+    "memory::vm::object::tests::",
     "memory::vm::address_region::tests::",
+];
+const HANDLE_HOST_INTEGRATION_TESTS: &[&str] = &[
+    "object_registry_ui",
+    "memory_authority_ui",
+    "physical_ownership_ui",
 ];
 const HARNESS_CONFIG: &str = "tooling/guest-harness.toml";
 const TRUSTED_TOOLCHAIN_CONFIG: &str = "tooling/rust-toolchain.toml";
@@ -368,6 +374,22 @@ fn run_handle_host_tests() -> io::Result<u8> {
                 "deepwyrm-kernel",
                 "--lib",
                 filter,
+            ])
+            .status()?;
+        if !status.success() {
+            return Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8);
+        }
+    }
+    for integration_test in HANDLE_HOST_INTEGRATION_TESTS {
+        let status = Command::new("cargo")
+            .current_dir(workspace_root())
+            .args([
+                "test",
+                "--locked",
+                "--package",
+                "deepwyrm-kernel",
+                "--test",
+                integration_test,
             ])
             .status()?;
         if !status.success() {
