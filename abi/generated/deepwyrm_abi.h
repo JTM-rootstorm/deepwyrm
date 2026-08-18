@@ -500,13 +500,13 @@ static inline int dw_rights_are_compatible(DwObjectType object_type, DwRights ri
 #define DW_SYSCALL_OBJECT_GET_INFO_V1 ((DwSyscallId)(UINT32_C(0x00000012)))
 /* Create a child task group with nonzero, known, object-compatible requested rights. */
 #define DW_SYSCALL_TASK_GROUP_CREATE ((DwSyscallId)(UINT32_C(0x00010001)))
-/* Recursively terminate a task group and its descendants. */
+/* Recursively terminate a task group and its descendants. In DW0-E callers must supply DW_TERMINATION_AUTHORIZED; descendants record DW_TERMINATION_TASK_GROUP_TEARDOWN. */
 #define DW_SYSCALL_TASK_GROUP_TERMINATE ((DwSyscallId)(UINT32_C(0x00010002)))
-/* Create a process using DwProcessCreateArgsV1 and atomically install its bootstrap channel. */
+/* DW0-F activation: create a process using DwProcessCreateArgsV1 and atomically install its bootstrap Channel; DW0-E implements only the reusable internal process-construction core. */
 #define DW_SYSCALL_PROCESS_CREATE ((DwSyscallId)(UINT32_C(0x00010010)))
 /* Exit the calling process normally with a 32-bit application code. */
 #define DW_SYSCALL_PROCESS_EXIT ((DwSyscallId)(UINT32_C(0x00010011)))
-/* Explicitly terminate a process with structured reason metadata. */
+/* Explicitly terminate a process. In DW0-E reason must be DW_TERMINATION_AUTHORIZED and code is recorded as termination detail, not application exit code. */
 #define DW_SYSCALL_PROCESS_TERMINATE ((DwSyscallId)(UINT32_C(0x00010012)))
 /* Create a thread in CREATED state with nonzero, known, object-compatible requested rights. */
 #define DW_SYSCALL_THREAD_CREATE ((DwSyscallId)(UINT32_C(0x00010020)))
@@ -514,7 +514,7 @@ static inline int dw_rights_are_compatible(DwObjectType object_type, DwRights ri
 #define DW_SYSCALL_THREAD_START ((DwSyscallId)(UINT32_C(0x00010021)))
 /* Exit the calling thread normally with a 32-bit code. */
 #define DW_SYSCALL_THREAD_EXIT ((DwSyscallId)(UINT32_C(0x00010022)))
-/* Explicitly terminate a thread. */
+/* Explicitly terminate a thread. In DW0-E reason must be DW_TERMINATION_AUTHORIZED and code is recorded as termination detail, not application exit code. */
 #define DW_SYSCALL_THREAD_TERMINATE ((DwSyscallId)(UINT32_C(0x00010023)))
 /* Create a zero-filled page-backed MemoryObject with an immutable size. Zero, unaligned, or overflowing byte_len and any nonzero flags are INVALID_ARGUMENT; inaccessible output storage is BAD_ADDRESS; backing exhaustion is NO_MEMORY. Requested rights must be nonzero, known, and object-compatible, and failure publishes no handle. */
 #define DW_SYSCALL_MEMORY_OBJECT_CREATE ((DwSyscallId)(UINT32_C(0x00020001)))

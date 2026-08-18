@@ -441,15 +441,15 @@ arg2 = "out_handle|DwUserAddress|out|NONE|NONE"
 name = "task_group_terminate"
 number = 0x00010002
 phase = "DW0-E"
-doc = "Recursively terminate a task group and its descendants."
+doc = "Recursively terminate a task group and its descendants. In DW0-E callers must supply DW_TERMINATION_AUTHORIZED; descendants record DW_TERMINATION_TASK_GROUP_TEARDOWN."
 arg0 = "task_group|DwHandle|in|TASK_GROUP|MODIFY"
-arg1 = "reason|u32|in|NONE|NONE"
+arg1 = "reason|DwTerminationReason|in|NONE|NONE"
 
 [[syscall]]
 name = "process_create"
 number = 0x00010010
-phase = "DW0-E"
-doc = "Create a process using DwProcessCreateArgsV1 and atomically install its bootstrap channel."
+phase = "DW0-F"
+doc = "DW0-F activation: create a process using DwProcessCreateArgsV1 and atomically install its bootstrap Channel; DW0-E implements only the reusable internal process-construction core."
 arg0 = "args|DwUserAddress|in|NONE|NONE"
 arg1 = "args_size|u64|in|NONE|NONE"
 arg2 = "out_result|DwUserAddress|out|NONE|NONE"
@@ -466,9 +466,9 @@ arg0 = "exit_code|u32|in|NONE|NONE"
 name = "process_terminate"
 number = 0x00010012
 phase = "DW0-E"
-doc = "Explicitly terminate a process with structured reason metadata."
+doc = "Explicitly terminate a process. In DW0-E reason must be DW_TERMINATION_AUTHORIZED and code is recorded as termination detail, not application exit code."
 arg0 = "process|DwHandle|in|PROCESS|MODIFY"
-arg1 = "reason|u32|in|NONE|NONE"
+arg1 = "reason|DwTerminationReason|in|NONE|NONE"
 arg2 = "code|u32|in|NONE|NONE"
 
 [[syscall]]
@@ -499,9 +499,9 @@ arg0 = "exit_code|u32|in|NONE|NONE"
 name = "thread_terminate"
 number = 0x00010023
 phase = "DW0-E"
-doc = "Explicitly terminate a thread."
+doc = "Explicitly terminate a thread. In DW0-E reason must be DW_TERMINATION_AUTHORIZED and code is recorded as termination detail, not application exit code."
 arg0 = "thread|DwHandle|in|THREAD|MODIFY"
-arg1 = "reason|u32|in|NONE|NONE"
+arg1 = "reason|DwTerminationReason|in|NONE|NONE"
 arg2 = "code|u32|in|NONE|NONE"
 
 [[syscall]]

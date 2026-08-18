@@ -585,16 +585,16 @@ Create a child task group with nonzero, known, object-compatible requested right
 
 ### `0x00010002` `task_group_terminate` (DW0-E)
 
-Recursively terminate a task group and its descendants.
+Recursively terminate a task group and its descendants. In DW0-E callers must supply DW_TERMINATION_AUTHORIZED; descendants record DW_TERMINATION_TASK_GROUP_TEARDOWN.
 
 | Register | Argument | Type | Direction | Object | Rights |
 |---|---|---|---|---|---|
 | `RDI` | `task_group` | `DwHandle` | in | TASK_GROUP | MODIFY |
-| `RSI` | `reason` | `u32` | in | NONE | NONE |
+| `RSI` | `reason` | `DwTerminationReason` | in | NONE | NONE |
 
-### `0x00010010` `process_create` (DW0-E)
+### `0x00010010` `process_create` (DW0-F)
 
-Create a process using DwProcessCreateArgsV1 and atomically install its bootstrap channel.
+DW0-F activation: create a process using DwProcessCreateArgsV1 and atomically install its bootstrap Channel; DW0-E implements only the reusable internal process-construction core.
 
 | Register | Argument | Type | Direction | Object | Rights |
 |---|---|---|---|---|---|
@@ -613,12 +613,12 @@ Exit the calling process normally with a 32-bit application code.
 
 ### `0x00010012` `process_terminate` (DW0-E)
 
-Explicitly terminate a process with structured reason metadata.
+Explicitly terminate a process. In DW0-E reason must be DW_TERMINATION_AUTHORIZED and code is recorded as termination detail, not application exit code.
 
 | Register | Argument | Type | Direction | Object | Rights |
 |---|---|---|---|---|---|
 | `RDI` | `process` | `DwHandle` | in | PROCESS | MODIFY |
-| `RSI` | `reason` | `u32` | in | NONE | NONE |
+| `RSI` | `reason` | `DwTerminationReason` | in | NONE | NONE |
 | `RDX` | `code` | `u32` | in | NONE | NONE |
 
 ### `0x00010020` `thread_create` (DW0-E)
@@ -650,12 +650,12 @@ Exit the calling thread normally with a 32-bit code.
 
 ### `0x00010023` `thread_terminate` (DW0-E)
 
-Explicitly terminate a thread.
+Explicitly terminate a thread. In DW0-E reason must be DW_TERMINATION_AUTHORIZED and code is recorded as termination detail, not application exit code.
 
 | Register | Argument | Type | Direction | Object | Rights |
 |---|---|---|---|---|---|
 | `RDI` | `thread` | `DwHandle` | in | THREAD | MODIFY |
-| `RSI` | `reason` | `u32` | in | NONE | NONE |
+| `RSI` | `reason` | `DwTerminationReason` | in | NONE | NONE |
 | `RDX` | `code` | `u32` | in | NONE | NONE |
 
 ### `0x00020001` `memory_object_create` (DW0-C)

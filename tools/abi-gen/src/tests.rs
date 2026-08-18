@@ -263,6 +263,36 @@ fn rejects_syscall_rights_incompatible_with_declared_object() {
 }
 
 #[test]
+fn canonical_e0_task_syscall_contract_is_typed_and_staged() {
+    let root = TempRoot::copy_schema();
+    let model = Model::load(root.path()).unwrap();
+    let process_create = model
+        .syscalls
+        .iter()
+        .find(|syscall| syscall.name == "process_create")
+        .unwrap();
+    assert_eq!(process_create.phase, "DW0-F");
+
+    for name in [
+        "task_group_terminate",
+        "process_terminate",
+        "thread_terminate",
+    ] {
+        let syscall = model
+            .syscalls
+            .iter()
+            .find(|syscall| syscall.name == name)
+            .unwrap();
+        let reason = syscall
+            .arguments
+            .iter()
+            .find(|argument| argument.name == "reason")
+            .unwrap();
+        assert_eq!(reason.ty, "DwTerminationReason");
+    }
+}
+
+#[test]
 fn rejects_zero_duplicate_and_overwide_syscall_ids() {
     let root = TempRoot::copy_schema();
     root.rewrite("syscalls.toml", |text| {
