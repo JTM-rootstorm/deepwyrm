@@ -1,4 +1,3 @@
-
 use super::*;
 
 const ENTRY_COUNT: usize = 512;

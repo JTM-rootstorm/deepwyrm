@@ -6,6 +6,10 @@ fn source(name: &str) -> String {
     fs::read_to_string(manifest.join(name)).unwrap_or_else(|error| panic!("read {name}: {error}"))
 }
 
+fn activation_test_support() -> String {
+    source("src/arch/x86_64/mm/activation/test_support.rs")
+}
+
 #[test]
 fn c3_memory_dispatch_occurs_only_after_the_deep_root_is_active() {
     let kernel = source("src/lib.rs");
@@ -34,7 +38,7 @@ fn c3_memory_dispatch_occurs_only_after_the_deep_root_is_active() {
 
 #[test]
 fn c3_live_root_rechecks_exact_ist_guards_before_selector_work() {
-    let activation = source("src/arch/x86_64/mm/activation.rs");
+    let activation = activation_test_support();
     let guard_walk = activation
         .split_once("fn guard_leaf_is_exact_zero(&mut self")
         .expect("exact active guard walk")
@@ -72,10 +76,14 @@ fn c3_live_root_rechecks_exact_ist_guards_before_selector_work() {
 
 #[test]
 fn c3_test_authority_is_target_only_linear_and_nonescaping() {
-    let activation = source("src/arch/x86_64/mm/activation.rs");
+    let activation = activation_test_support();
+    let activation_facade = source("src/arch/x86_64/mm/activation.rs");
     let module = source("src/test_support/mod.rs");
     let runner = source("src/test_support/memory.rs");
 
+    assert!(activation_facade.contains("#[path = \"activation/test_support.rs\"]"));
+    assert!(activation_facade.contains("mod test_support;"));
+    assert!(!activation_facade.contains("struct ActiveRootTestAuthority<"));
     assert!(module.contains("mod memory;"));
     assert!(module.contains("target_arch = \"x86_64\", target_os = \"none\""));
     assert!(activation.contains("struct ActiveRootTestAuthority<"));
@@ -168,7 +176,7 @@ fn c2_cpu_profile_excludes_an_untested_smap_access_override() {
 
 #[test]
 fn c3_guest_mappings_are_nonidentity_and_cross_page_write_is_atomic() {
-    let activation = source("src/arch/x86_64/mm/activation.rs");
+    let activation = activation_test_support();
     assert_eq!(
         activation.matches("if backing_physical == first").count(),
         1
@@ -201,7 +209,7 @@ fn c3_guest_mappings_are_nonidentity_and_cross_page_write_is_atomic() {
 
 #[test]
 fn permission_transitions_retain_the_exact_backing_frame() {
-    let activation = source("src/arch/x86_64/mm/activation.rs");
+    let activation = activation_test_support();
     let permissions = activation
         .split_once("BuildGuestTest::MemoryPermissions => {")
         .expect("permissions guest body")
