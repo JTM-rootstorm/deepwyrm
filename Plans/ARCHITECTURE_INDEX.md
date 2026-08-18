@@ -36,3 +36,7 @@ Do not add speculative kernel architecture merely because a distant subsystem wi
 4. implementation evidence shows an ABI-0 choice should be revised before ABI stabilization.
 
 The purpose of ABI 0 is to learn from real code, tests, and hardware rather than preserve speculative mistakes.
+
+## Reached subsystem contracts
+
+- [`DW0_D0_OBJECT_HANDLE_CONTRACT.md`](DW0_D0_OBJECT_HANDLE_CONTRACT.md) defines the locked DW0-D object/handle rights, liveness, reclamation, mapping-pin, transaction, and downstream-preservation contract. Read it before DW0-D implementation.
