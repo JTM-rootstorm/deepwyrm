@@ -12,11 +12,11 @@ struct Mapping {
 }
 
 impl UserReturnMappingValidation for Mapping {
-    fn executable_at(&self, _instruction_pointer: u64) -> bool {
+    fn executable_at(&mut self, _instruction_pointer: u64) -> bool {
         self.executable
     }
 
-    fn writable_byte_below(&self, _stack_pointer: u64) -> bool {
+    fn writable_byte_below(&mut self, _stack_pointer: u64) -> bool {
         self.writable_stack
     }
 }
@@ -64,14 +64,11 @@ fn initial_user_return_uses_sysv_startup_registers() {
     let start =
         ThreadStartState::from_validated_user_state(0x4000_1000, 0x5000_2000, 0x1111, 0x2222);
     let context = SavedThreadContext::initial(start);
-    let validated = ValidatedUserReturn::initial(
-        context,
-        &Mapping {
-            executable: true,
-            writable_stack: true,
-        },
-    )
-    .unwrap();
+    let mut mappings = Mapping {
+        executable: true,
+        writable_stack: true,
+    };
+    let validated = ValidatedUserReturn::initial(context, &mut mappings).unwrap();
     let raw = validated.raw();
     assert_eq!(raw.rdi, 0x1111);
     assert_eq!(raw.rsi, 0x2222);
@@ -84,24 +81,20 @@ fn initial_user_return_uses_sysv_startup_registers() {
 fn return_validation_requires_both_mapping_facts() {
     let start = ThreadStartState::from_validated_user_state(0x4000, 0x8000, 0, 0);
     let context = SavedThreadContext::initial(start);
+    let mut no_execute = Mapping {
+        executable: false,
+        writable_stack: true,
+    };
     assert_eq!(
-        ValidatedUserReturn::initial(
-            context,
-            &Mapping {
-                executable: false,
-                writable_stack: true,
-            },
-        ),
+        ValidatedUserReturn::initial(context, &mut no_execute),
         Err(UserReturnError::InstructionNotExecutable)
     );
+    let mut no_stack = Mapping {
+        executable: true,
+        writable_stack: false,
+    };
     assert_eq!(
-        ValidatedUserReturn::initial(
-            context,
-            &Mapping {
-                executable: true,
-                writable_stack: false,
-            },
-        ),
+        ValidatedUserReturn::initial(context, &mut no_stack),
         Err(UserReturnError::StackNotWritable)
     );
 }
@@ -119,15 +112,15 @@ fn raw_syscall_extracts_deepwyrm_register_order() {
 #[test]
 fn syscall_return_stays_unapproved_until_mapping_and_generation_match() {
     let mut frame = RawSyscallFrame::synthetic(1, [0; 6], 0x4000, 0x8000, u64::MAX, 9);
-    let mappings = Mapping {
+    let mut mappings = Mapping {
         executable: true,
         writable_stack: true,
     };
     assert_eq!(
-        frame.authorize_return(8, &mappings),
+        frame.authorize_return(8, &mut mappings),
         Err(UserReturnError::BindingChanged)
     );
-    assert!(frame.authorize_return(9, &mappings).is_ok());
+    assert!(frame.authorize_return(9, &mut mappings).is_ok());
     assert_eq!(frame.user_rflags, sanitize_user_rflags(u64::MAX));
     assert_eq!(frame.return_authorized, SYSCALL_RETURN_AUTHORIZED);
 }
@@ -196,14 +189,12 @@ fn e4_cr4_normalization_clears_only_fsgsbase() {
 fn hostile_user_rsp_is_entry_data_not_a_kernel_invariant_failure() {
     let mut frame = RawSyscallFrame::synthetic(1, [0; 6], 0x4000, u64::MAX, 0x202, 4);
     assert!(frame.validates_entry());
+    let mut mappings = Mapping {
+        executable: true,
+        writable_stack: true,
+    };
     assert_eq!(
-        frame.authorize_return(
-            4,
-            &Mapping {
-                executable: true,
-                writable_stack: true,
-            },
-        ),
+        frame.authorize_return(4, &mut mappings),
         Err(UserReturnError::NonCanonicalUserAddress)
     );
 }

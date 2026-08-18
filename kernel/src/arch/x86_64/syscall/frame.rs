@@ -45,8 +45,8 @@ impl PerCpuEntryState {
 }
 
 pub(crate) trait UserReturnMappingValidation {
-    fn executable_at(&self, instruction_pointer: u64) -> bool;
-    fn writable_byte_below(&self, stack_pointer: u64) -> bool;
+    fn executable_at(&mut self, instruction_pointer: u64) -> bool;
+    fn writable_byte_below(&mut self, stack_pointer: u64) -> bool;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,7 +96,7 @@ pub(crate) struct ValidatedUserReturn(RawUserReturnContext);
 impl ValidatedUserReturn {
     pub(crate) fn initial<M: UserReturnMappingValidation>(
         context: SavedThreadContext,
-        mappings: &M,
+        mappings: &mut M,
     ) -> Result<Self, UserReturnError> {
         validate_policies(context)?;
         validate_return_mapping(context.user_rip, context.user_rsp, mappings)?;
@@ -129,7 +129,7 @@ fn validate_policies(context: SavedThreadContext) -> Result<(), UserReturnError>
 fn validate_return_mapping<M: UserReturnMappingValidation>(
     instruction_pointer: u64,
     stack_pointer: u64,
-    mappings: &M,
+    mappings: &mut M,
 ) -> Result<(), UserReturnError> {
     if !is_lower_canonical_user_address(instruction_pointer)
         || !is_lower_canonical_user_address(stack_pointer)
@@ -226,7 +226,7 @@ impl RawSyscallFrame {
     pub(crate) fn authorize_return<M: UserReturnMappingValidation>(
         &mut self,
         current_binding_generation: u64,
-        mappings: &M,
+        mappings: &mut M,
     ) -> Result<(), UserReturnError> {
         if current_binding_generation == 0 || self.binding_generation != current_binding_generation
         {

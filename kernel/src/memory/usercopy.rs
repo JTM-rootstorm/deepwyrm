@@ -49,6 +49,51 @@ pub(crate) trait PinnedUserPages {
     fn write_exact(&mut self, range: UserRange, source: &[u8]);
 }
 
+#[must_use = "preflighted output must be committed or deliberately discarded before its mapping pin is released"]
+pub(crate) struct PinnedUserOutput<P: PinnedUserPages> {
+    pinned: P,
+    range: UserRange,
+    byte_len: usize,
+}
+
+impl<P: PinnedUserPages> PinnedUserOutput<P> {
+    /// Commits bytes after successful full-range preflight. Length mismatch is
+    /// an internal kernel bug rather than a recoverable userspace failure.
+    pub(crate) fn commit(mut self, source: &[u8]) {
+        assert_eq!(
+            source.len(),
+            self.byte_len,
+            "preflighted output length drift"
+        );
+        self.pinned.write_exact(self.range, source);
+    }
+}
+
+/// Pins and preflights one complete userspace output before kernel business
+/// mutation. Once this returns, [`PinnedUserOutput::commit`] has no recoverable
+/// BAD_ADDRESS path.
+pub(crate) fn preflight_user_output<'a, A: UserPageAccess>(
+    access: &'a mut A,
+    range: UserRange,
+    byte_len: usize,
+) -> Result<PinnedUserOutput<A::Pinned<'a>>, UserCopyError<A::Error>> {
+    if !range.access().includes(UserAccess::WRITE) {
+        return Err(UserCopyError::AccessIntent);
+    }
+    let range_len =
+        usize::try_from(range.byte_len()).map_err(|_| UserCopyError::LengthDoesNotFitHost)?;
+    if range_len != byte_len {
+        return Err(UserCopyError::LengthMismatch);
+    }
+    let mut pinned = access.pin(range).map_err(UserCopyError::Access)?;
+    preflight_all(&mut pinned, range)?;
+    Ok(PinnedUserOutput {
+        pinned,
+        range,
+        byte_len,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UserCopyError<E> {
     AccessIntent,
@@ -234,6 +279,48 @@ mod tests {
         assert_eq!(destination, before);
         assert_eq!(backend.preflight_count, 2);
         assert_eq!(backend.read_count, 0);
+    }
+
+    #[test]
+    fn preflighted_output_is_exclusive_and_commit_is_exact() {
+        let original = *b"abcdefghijklmnop";
+        let mut backend = FakeAccess::new(original);
+        {
+            let output =
+                preflight_user_output(&mut backend, range(UserAccess::WRITE).unwrap(), 8).unwrap();
+            // The live output owns the mutable backend borrow here; safe Rust
+            // cannot inspect or mutate the mapping until the pin is consumed.
+            output.commit(b"12345678");
+        }
+        assert_eq!(&backend.user[..8], b"12345678");
+        assert_eq!(backend.preflight_count, 2);
+        assert_eq!(backend.write_count, 1);
+    }
+
+    #[test]
+    fn dropping_preflighted_output_without_commit_changes_nothing() {
+        let original = *b"abcdefghijklmnop";
+        let mut backend = FakeAccess::new(original);
+        {
+            let output =
+                preflight_user_output(&mut backend, range(UserAccess::WRITE).unwrap(), 8).unwrap();
+            drop(output);
+        }
+        assert_eq!(backend.user, original);
+        assert_eq!(backend.preflight_count, 2);
+        assert_eq!(backend.write_count, 0);
+    }
+
+    #[test]
+    fn preflighted_output_failure_never_returns_a_commit_authority() {
+        let original = *b"abcdefghijklmnop";
+        let mut backend = FakeAccess::new(original);
+        backend.fail_page = Some(PAGE_SIZE * 2);
+        assert!(
+            preflight_user_output(&mut backend, range(UserAccess::WRITE).unwrap(), 8,).is_err()
+        );
+        assert_eq!(backend.user, original);
+        assert_eq!(backend.write_count, 0);
     }
 
     #[test]

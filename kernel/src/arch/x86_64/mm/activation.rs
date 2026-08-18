@@ -27,7 +27,12 @@ use super::super::{
 };
 #[path = "activation/graph.rs"]
 mod graph;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[path = "activation/user_access.rs"]
+mod user_access;
 use graph::*;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) use user_access::LiveProcessAddressSpace;
 #[path = "activation/build.rs"]
 mod build;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -420,7 +425,7 @@ pub(crate) struct LiveActivePagingTarget<
     _not_send_sync: core::marker::PhantomData<*mut ()>,
 }
 
-struct ActiveScratchTarget<I> {
+pub(crate) struct ActiveScratchTarget<I> {
     scratch: DeepScratchBinding,
     io: I,
     poisoned: bool,
@@ -434,7 +439,7 @@ pub(crate) enum LiveActiveTargetError {
     ReservedScratchEntry,
 }
 
-trait ActiveScratchIo {
+pub(crate) trait ActiveScratchIo {
     fn load(&mut self, address: u64) -> u64;
     fn store(&mut self, address: u64, value: u64);
     fn compare_exchange(&mut self, address: u64, current: u64, new: u64) -> Result<(), u64>;
@@ -442,7 +447,7 @@ trait ActiveScratchIo {
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-struct LiveActiveScratchIo;
+pub(crate) struct LiveActiveScratchIo;
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> target_seal::Sealed
@@ -563,7 +568,7 @@ impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
         Ok(result)
     }
 
-    #[cfg(all(feature = "test-support", target_os = "none", target_arch = "x86_64"))]
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
     fn zero_allocator_frame(&mut self, frame: FrameAddress) -> Result<(), LiveActiveTargetError> {
         assert!(!self.poisoned, "active Deep scratch mapper is poisoned");
         if frame.address() == self.scratch.pt.physical_start() {
@@ -1118,6 +1123,24 @@ unsafe impl<'a, 'handoff, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
                 _not_send_sync: core::marker::PhantomData,
             },
             _not_send_sync: core::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    ActiveDeepPaging<LiveActivePagingTarget<'root, RANGE_CAPACITY, ROLE_CAPACITY>>
+{
+    pub(crate) fn current_process_address_space(
+        &mut self,
+    ) -> LiveProcessAddressSpace<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
+        let target = &mut self.target;
+        LiveProcessAddressSpace {
+            root: &self.root,
+            identity: self.identity,
+            roles: target.roles,
+            scratch: &mut target.scratch,
+            _root: core::marker::PhantomData,
         }
     }
 }
