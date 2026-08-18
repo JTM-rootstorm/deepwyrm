@@ -2394,10 +2394,31 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         reason = "the test-only authority locally supplies the future handle-rights proof and binds opaque model keys to this exact active root"
     )]
     fn run_mapped_case(&mut self, test: crate::test_support::BuildGuestTest) -> ! {
-        use crate::memory::address_region::AddressSpaceAuthority;
-        use crate::memory::object::{MemoryObjectAuthority, MemoryObjectKind, MemoryProtection};
+        use crate::memory::address_region::{
+            AddressSpaceAuthority, AddressSpaceTransactionFailure,
+        };
+        use crate::memory::object::{
+            MappingFinalReleases, MemoryObjectAuthority, MemoryObjectKind, MemoryProtection,
+        };
         use crate::object::ObjectRegistry;
         use deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT;
+
+        fn require_clean_mapping<E, const FINALIZERS: usize>(
+            result: Result<
+                MappingFinalReleases<FINALIZERS>,
+                AddressSpaceTransactionFailure<E, FINALIZERS>,
+            >,
+            detail: u32,
+        ) -> Result<(), u32> {
+            match result {
+                Ok(releases) if releases.is_empty() => Ok(()),
+                Ok(_) => Err(detail),
+                Err(failure) => {
+                    let _clean = failure.into_final_releases().is_empty();
+                    Err(detail)
+                }
+            }
+        }
 
         let first = Self::TEST_REGION_START;
         let (allocation, backing_physical) = self
@@ -2424,7 +2445,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 MemoryProtection::READ_WRITE_EXECUTE,
             )
             .unwrap_or_else(|_| crate::test_support::complete_fail(0x0402));
-        let _object_owner = registry
+        let object_owner = registry
             .creation_into_internal(creation)
             .unwrap_or_else(|_| crate::test_support::complete_fail(0x0402));
 
@@ -2460,23 +2481,31 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         // both completion paths below diverge before this scope can unwind.
         let result = (|| -> Result<(), u32> {
             let authorization = unsafe {
-                region.authorize_map(&objects, object, MemoryProtection::READ_WRITE_EXECUTE)
+                region.authorize_map(
+                    &objects,
+                    &mut registry,
+                    &object_owner,
+                    object,
+                    MemoryProtection::READ_WRITE_EXECUTE,
+                )
             }
             .map_err(|_| 0x0406_u32)?;
             {
                 let mut publisher =
                     self.bind_test_publisher(address_space, region.region_key(), &mut candidates)?;
-                region
-                    .map(
+                require_clean_mapping(
+                    region.map(
                         &mut objects,
+                        &mut registry,
                         &mut publisher,
                         first,
                         authorization,
                         0,
                         PAGE_SIZE,
                         MemoryProtection::READ_WRITE,
-                    )
-                    .map_err(|_| 0x0407_u32)?;
+                    ),
+                    0x0407_u32,
+                )?;
             }
 
             match test {
@@ -2508,9 +2537,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                             region.region_key(),
                             &mut candidates,
                         )?;
-                        region
-                            .unmap(&mut objects, &mut publisher, first, PAGE_SIZE)
-                            .map_err(|_| 0x0420_u32)?;
+                        require_clean_mapping(
+                            region.unmap(
+                                &mut objects,
+                                &mut registry,
+                                &mut publisher,
+                                first,
+                                PAGE_SIZE,
+                            ),
+                            0x0420_u32,
+                        )?;
                     }
                     if self.walk_leaf(first).is_ok()
                         || !region.mappings().iter().all(Option::is_none)
@@ -2544,15 +2580,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 region.region_key(),
                                 &mut candidates,
                             )?;
-                            region
-                                .protect(
+                            require_clean_mapping(
+                                region.protect(
                                     &mut objects,
+                                    &mut registry,
                                     &mut publisher,
                                     first,
                                     PAGE_SIZE,
                                     MemoryProtection::READ,
-                                )
-                                .map_err(|_| 0x0430_u32)?;
+                                ),
+                                0x0430_u32,
+                            )?;
                         }
                         let read_only = self.walk_leaf(first)?;
                         if !read_only.user
@@ -2575,15 +2613,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 region.region_key(),
                                 &mut candidates,
                             )?;
-                            region
-                                .protect(
+                            require_clean_mapping(
+                                region.protect(
                                     &mut objects,
+                                    &mut registry,
                                     &mut publisher,
                                     first,
                                     PAGE_SIZE,
                                     MemoryProtection::READ_EXECUTE,
-                                )
-                                .map_err(|_| 0x0432_u32)?;
+                                ),
+                                0x0432_u32,
+                            )?;
                         }
                         let executable = self.walk_leaf(first)?;
                         if !executable.user
@@ -2609,14 +2649,22 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                             )?;
                             region.protect(
                                 &mut objects,
+                                &mut registry,
                                 &mut publisher,
                                 first,
                                 PAGE_SIZE,
                                 MemoryProtection::READ_WRITE_EXECUTE,
                             )
                         };
+                        let rejected_clean = match rejected {
+                            Err(failure) => failure.into_final_releases().is_empty(),
+                            Ok(releases) => {
+                                let _clean = releases.is_empty();
+                                false
+                            }
+                        };
                         let after_rejected = self.walk_leaf(first)?;
-                        if rejected.is_ok()
+                        if !rejected_clean
                             || after_rejected.entry != before
                             || after_rejected.physical_start != backing_physical
                             || !Self::model_has_exact_single_mapping(
@@ -2635,15 +2683,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 region.region_key(),
                                 &mut candidates,
                             )?;
-                            region
-                                .protect(
+                            require_clean_mapping(
+                                region.protect(
                                     &mut objects,
+                                    &mut registry,
                                     &mut publisher,
                                     first,
                                     PAGE_SIZE,
                                     MemoryProtection::READ,
-                                )
-                                .map_err(|_| 0x0435_u32)?;
+                                ),
+                                0x0435_u32,
+                            )?;
                         }
                         let read_only = self.walk_leaf(first)?;
                         if !read_only.user
@@ -2788,15 +2838,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 region.region_key(),
                                 &mut candidates,
                             )?;
-                            region
-                                .protect(
+                            require_clean_mapping(
+                                region.protect(
                                     &mut objects,
+                                    &mut registry,
                                     &mut publisher,
                                     first,
                                     PAGE_SIZE,
                                     MemoryProtection::READ,
-                                )
-                                .map_err(|_| 0x043f_u32)?;
+                                ),
+                                0x043f_u32,
+                            )?;
                         }
                         let read_only = self.walk_leaf(first)?;
                         if !read_only.user || read_only.writable || read_only.executable {
@@ -2881,15 +2933,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 region.region_key(),
                                 &mut candidates,
                             )?;
-                            region
-                                .protect(
+                            require_clean_mapping(
+                                region.protect(
                                     &mut objects,
+                                    &mut registry,
                                     &mut publisher,
                                     first,
                                     PAGE_SIZE,
                                     MemoryProtection::READ_WRITE,
-                                )
-                                .map_err(|_| 0x0477_u32)?;
+                                ),
+                                0x0477_u32,
+                            )?;
                         }
                         let second = first + PAGE_SIZE;
                         if backing_physical == second {
@@ -2898,6 +2952,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         let authorization = unsafe {
                             region.authorize_map(
                                 &objects,
+                                &mut registry,
+                                &object_owner,
                                 object,
                                 MemoryProtection::READ_WRITE_EXECUTE,
                             )
@@ -2909,17 +2965,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 region.region_key(),
                                 &mut candidates,
                             )?;
-                            region
-                                .map(
+                            require_clean_mapping(
+                                region.map(
                                     &mut objects,
+                                    &mut registry,
                                     &mut publisher,
                                     second,
                                     authorization,
                                     0,
                                     PAGE_SIZE,
                                     MemoryProtection::READ_WRITE,
-                                )
-                                .map_err(|_| 0x047a_u32)?;
+                                ),
+                                0x047a_u32,
+                            )?;
                         }
                         self.write_then_read_alias(second, second)?;
                         {
@@ -2928,15 +2986,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 region.region_key(),
                                 &mut candidates,
                             )?;
-                            region
-                                .protect(
+                            require_clean_mapping(
+                                region.protect(
                                     &mut objects,
+                                    &mut registry,
                                     &mut publisher,
                                     second,
                                     PAGE_SIZE,
                                     MemoryProtection::READ,
-                                )
-                                .map_err(|_| 0x047b_u32)?;
+                                ),
+                                0x047b_u32,
+                            )?;
                         }
                         let first_walk = self.walk_leaf(first)?;
                         let second_walk = self.walk_leaf(second)?;
@@ -3023,6 +3083,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         let authorization = unsafe {
                             region.authorize_map(
                                 &objects,
+                                &mut registry,
+                                &object_owner,
                                 object,
                                 MemoryProtection::READ_WRITE_EXECUTE,
                             )
@@ -3036,6 +3098,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                             )?;
                             region.map(
                                 &mut objects,
+                                &mut registry,
                                 &mut publisher,
                                 0,
                                 authorization,
@@ -3044,11 +3107,22 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 MemoryProtection::READ_WRITE,
                             )
                         };
+                        let rejected = match rejected {
+                            Err(failure) => {
+                                let (error, final_releases) = failure.into_parts();
+                                if !final_releases.is_empty() {
+                                    return Err(0x0446);
+                                }
+                                error
+                            }
+                            Ok(releases) => {
+                                let _clean = releases.is_empty();
+                                return Err(0x0446);
+                            }
+                        };
                         if !matches!(
                             rejected,
-                            Err(AddressSpaceTransactionError::Model(
-                                AddressRegionError::PageZero
-                            ))
+                            AddressSpaceTransactionError::Model(AddressRegionError::PageZero)
                         ) || self.walk_leaf(0).is_ok()
                             || self.walk_leaf(first)?.entry != first_before
                             || *region.mappings() != mappings_before
@@ -3068,6 +3142,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         let authorization = unsafe {
                             region.authorize_map(
                                 &objects,
+                                &mut registry,
+                                &object_owner,
                                 object,
                                 MemoryProtection::READ_WRITE_EXECUTE,
                             )
@@ -3079,17 +3155,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 region.region_key(),
                                 &mut candidates,
                             )?;
-                            region
-                                .map(
+                            require_clean_mapping(
+                                region.map(
                                     &mut objects,
+                                    &mut registry,
                                     &mut publisher,
                                     second,
                                     authorization,
                                     0,
                                     PAGE_SIZE,
                                     MemoryProtection::READ_WRITE,
-                                )
-                                .map_err(|_| 0x0451_u32)?;
+                                ),
+                                0x0451_u32,
+                            )?;
                         }
                         let first_walk = self.walk_leaf(first)?;
                         let second_walk = self.walk_leaf(second)?;
@@ -3112,9 +3190,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 region.region_key(),
                                 &mut candidates,
                             )?;
-                            region
-                                .unmap(&mut objects, &mut publisher, first, PAGE_SIZE)
-                                .map_err(|_| 0x0453_u32)?;
+                            require_clean_mapping(
+                                region.unmap(
+                                    &mut objects,
+                                    &mut registry,
+                                    &mut publisher,
+                                    first,
+                                    PAGE_SIZE,
+                                ),
+                                0x0453_u32,
+                            )?;
                         }
                         let retained = self.walk_leaf(second)?;
                         if self.walk_leaf(first).is_ok()

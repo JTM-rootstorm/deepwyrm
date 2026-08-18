@@ -9,9 +9,11 @@
 )]
 
 use super::object::{
-    CapturedMappingAuthority, LeaseRequest, MapAuthorization, MappingLease, MemoryObjectAuthority,
-    MemoryObjectError, MemoryObjectKey, MemoryObjectRange, MemoryProtection, PAGE_SIZE,
+    CapturedMappingAuthority, LeaseRequest, MapAuthorization, MappingFinalReleases, MappingLease,
+    MemoryObjectAuthority, MemoryObjectError, MemoryObjectKey, MemoryObjectRange, MemoryProtection,
+    PAGE_SIZE,
 };
+use crate::object::{InternalRef, ObjectRegistry};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 const USER_CANONICAL_END: u64 = 0x0000_8000_0000_0000;
@@ -75,6 +77,31 @@ pub(crate) enum AddressRegionError {
 pub(crate) enum AddressSpaceTransactionError<E> {
     Model(AddressRegionError),
     Publish(E),
+}
+
+#[derive(Debug)]
+pub(crate) struct AddressSpaceTransactionFailure<E, const FINALIZERS: usize> {
+    error: AddressSpaceTransactionError<E>,
+    final_releases: MappingFinalReleases<FINALIZERS>,
+}
+
+impl<E, const FINALIZERS: usize> AddressSpaceTransactionFailure<E, FINALIZERS> {
+    pub(crate) const fn error(&self) -> &AddressSpaceTransactionError<E> {
+        &self.error
+    }
+
+    pub(crate) fn into_final_releases(self) -> MappingFinalReleases<FINALIZERS> {
+        self.final_releases
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        AddressSpaceTransactionError<E>,
+        MappingFinalReleases<FINALIZERS>,
+    ) {
+        (self.error, self.final_releases)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -472,16 +499,29 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         unsafe_code,
         reason = "this is the narrow future handle-rights validation seam for region-bound map authority"
     )]
-    pub(crate) unsafe fn authorize_map<const OBJECTS: usize, const LEASES: usize>(
+    pub(crate) unsafe fn authorize_map<
+        const OBJECTS: usize,
+        const LEASES: usize,
+        const REGISTRY_OBJECTS: usize,
+    >(
         &self,
         authority: &MemoryObjectAuthority<OBJECTS, LEASES>,
+        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
+        source: &InternalRef,
         object: MemoryObjectKey,
         ceiling: Protection,
     ) -> Result<MapAuthorization, MemoryObjectError> {
         // SAFETY: this function carries the same live-handle rights contract
         // while supplying the region identities callers cannot forge.
         unsafe {
-            authority.issue_map_authorization(object, self.address_space, self.region, ceiling)
+            authority.issue_map_authorization(
+                registry,
+                source,
+                object,
+                self.address_space,
+                self.region,
+                ceiling,
+            )
         }
     }
 
@@ -489,29 +529,51 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         clippy::too_many_arguments,
         reason = "the mapping contract keeps virtual address, backing range, effective protection, and captured source ceiling explicit at the authority boundary"
     )]
-    pub(crate) fn map<const OBJECTS: usize, const LEASES: usize, P: AddressSpacePublisher>(
+    pub(crate) fn map<
+        const OBJECTS: usize,
+        const LEASES: usize,
+        const REGISTRY_OBJECTS: usize,
+        P: AddressSpacePublisher,
+    >(
         &mut self,
         authority: &mut MemoryObjectAuthority<OBJECTS, LEASES>,
+        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
         publisher: &mut P,
         virtual_start: u64,
         authorization: MapAuthorization,
         object_offset: u64,
         byte_len: u64,
         protection: Protection,
-    ) -> Result<(), AddressSpaceTransactionError<P::Error>> {
-        let mapping_authority = authorization
-            .capture(self.address_space, self.region)
-            .map_err(|error| {
-                AddressSpaceTransactionError::Model(AddressRegionError::Object(error))
-            })?;
-        self.validate_interval(virtual_start, byte_len)
-            .map_err(AddressSpaceTransactionError::Model)?;
-        MemoryProtection::mapping(protection.bits())
-            .map_err(|error| AddressSpaceTransactionError::Model(protection_error(error)))?;
+    ) -> Result<
+        MappingFinalReleases<REGISTRY_OBJECTS>,
+        AddressSpaceTransactionFailure<P::Error, REGISTRY_OBJECTS>,
+    > {
+        let mapping_authority = match authorization.capture(self.address_space, self.region) {
+            Ok(authority) => authority,
+            Err(error) => {
+                return Err(authorization_failure(
+                    registry,
+                    authorization,
+                    AddressRegionError::Object(error),
+                ));
+            }
+        };
+        if let Err(error) = self.validate_interval(virtual_start, byte_len) {
+            return Err(authorization_failure(registry, authorization, error));
+        }
+        if let Err(error) = MemoryProtection::mapping(protection.bits()) {
+            return Err(authorization_failure(
+                registry,
+                authorization,
+                protection_error(error),
+            ));
+        }
         let mut staged = self.current_specs();
         let length = self.mapping_count();
         if length == SLOTS {
-            return Err(AddressSpaceTransactionError::Model(
+            return Err(authorization_failure(
+                registry,
+                authorization,
                 AddressRegionError::Capacity,
             ));
         }
@@ -530,12 +592,21 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
             .flatten()
             .any(|current| intersects_specs(*current, candidate))
         {
-            return Err(AddressSpaceTransactionError::Model(
+            return Err(authorization_failure(
+                registry,
+                authorization,
                 AddressRegionError::Overlap,
             ));
         }
         staged[length] = Some(candidate);
-        self.commit_specs(authority, publisher, &staged, length + 1)
+        self.commit_specs(
+            authority,
+            registry,
+            publisher,
+            &staged,
+            length + 1,
+            Some(authorization),
+        )
     }
 
     /// Maps at the lowest available page-aligned address in this region.
@@ -550,45 +621,68 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
     pub(crate) fn map_anywhere<
         const OBJECTS: usize,
         const LEASES: usize,
+        const REGISTRY_OBJECTS: usize,
         P: AddressSpacePublisher,
     >(
         &mut self,
         authority: &mut MemoryObjectAuthority<OBJECTS, LEASES>,
+        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
         publisher: &mut P,
         authorization: MapAuthorization,
         object_offset: u64,
         byte_len: u64,
         protection: Protection,
-    ) -> Result<u64, AddressSpaceTransactionError<P::Error>> {
+    ) -> Result<
+        (u64, MappingFinalReleases<REGISTRY_OBJECTS>),
+        AddressSpaceTransactionFailure<P::Error, REGISTRY_OBJECTS>,
+    > {
         if byte_len == 0 {
-            return Err(AddressSpaceTransactionError::Model(
+            return Err(authorization_failure(
+                registry,
+                authorization,
                 AddressRegionError::Empty,
             ));
         }
         if !byte_len.is_multiple_of(PAGE_SIZE) {
-            return Err(AddressSpaceTransactionError::Model(
+            return Err(authorization_failure(
+                registry,
+                authorization,
                 AddressRegionError::Unaligned,
             ));
         }
-        MemoryProtection::mapping(protection.bits())
-            .map_err(|error| AddressSpaceTransactionError::Model(protection_error(error)))?;
-
-        let region_end =
-            self.start
-                .checked_add(self.byte_len)
-                .ok_or(AddressSpaceTransactionError::Model(
+        if let Err(error) = MemoryProtection::mapping(protection.bits()) {
+            return Err(authorization_failure(
+                registry,
+                authorization,
+                protection_error(error),
+            ));
+        }
+        let region_end = match self.start.checked_add(self.byte_len) {
+            Some(end) => end,
+            None => {
+                return Err(authorization_failure(
+                    registry,
+                    authorization,
                     AddressRegionError::Overflow,
-                ))?;
+                ));
+            }
+        };
         let mut candidate = self.start;
         for _ in 0..SLOTS {
-            let candidate_end =
-                candidate
-                    .checked_add(byte_len)
-                    .ok_or(AddressSpaceTransactionError::Model(
+            let candidate_end = match candidate.checked_add(byte_len) {
+                Some(end) => end,
+                None => {
+                    return Err(authorization_failure(
+                        registry,
+                        authorization,
                         AddressRegionError::NoSpace,
-                    ))?;
+                    ));
+                }
+            };
             if candidate_end > region_end {
-                return Err(AddressSpaceTransactionError::Model(
+                return Err(authorization_failure(
+                    registry,
+                    authorization,
                     AddressRegionError::NoSpace,
                 ));
             }
@@ -600,8 +694,9 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
                 }
             }
             if next_candidate == candidate {
-                self.map(
+                let final_releases = self.map(
                     authority,
+                    registry,
                     publisher,
                     candidate,
                     authorization,
@@ -609,109 +704,136 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
                     byte_len,
                     protection,
                 )?;
-                return Ok(candidate);
+                return Ok((candidate, final_releases));
             }
             candidate = next_candidate;
         }
-        Err(AddressSpaceTransactionError::Model(
+        Err(authorization_failure(
+            registry,
+            authorization,
             AddressRegionError::NoSpace,
         ))
     }
 
-    pub(crate) fn unmap<const OBJECTS: usize, const LEASES: usize, P: AddressSpacePublisher>(
+    pub(crate) fn unmap<
+        const OBJECTS: usize,
+        const LEASES: usize,
+        const REGISTRY_OBJECTS: usize,
+        P: AddressSpacePublisher,
+    >(
         &mut self,
         authority: &mut MemoryObjectAuthority<OBJECTS, LEASES>,
+        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
         publisher: &mut P,
         start: u64,
         byte_len: u64,
-    ) -> Result<(), AddressSpaceTransactionError<P::Error>> {
+    ) -> Result<
+        MappingFinalReleases<REGISTRY_OBJECTS>,
+        AddressSpaceTransactionFailure<P::Error, REGISTRY_OBJECTS>,
+    > {
         let end = self
             .checked_interval_end(start, byte_len)
-            .map_err(AddressSpaceTransactionError::Model)?;
-        self.require_covered(start, end)
-            .map_err(AddressSpaceTransactionError::Model)?;
-        self.rebuild(authority, publisher, start, end, None)
+            .map_err(model_failure)?;
+        self.require_covered(start, end).map_err(model_failure)?;
+        self.rebuild(authority, registry, publisher, start, end, None)
     }
 
-    pub(crate) fn protect<const OBJECTS: usize, const LEASES: usize, P: AddressSpacePublisher>(
+    pub(crate) fn protect<
+        const OBJECTS: usize,
+        const LEASES: usize,
+        const REGISTRY_OBJECTS: usize,
+        P: AddressSpacePublisher,
+    >(
         &mut self,
         authority: &mut MemoryObjectAuthority<OBJECTS, LEASES>,
+        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
         publisher: &mut P,
         start: u64,
         byte_len: u64,
         protection: Protection,
-    ) -> Result<(), AddressSpaceTransactionError<P::Error>> {
+    ) -> Result<
+        MappingFinalReleases<REGISTRY_OBJECTS>,
+        AddressSpaceTransactionFailure<P::Error, REGISTRY_OBJECTS>,
+    > {
         MemoryProtection::mapping(protection.bits())
-            .map_err(|error| AddressSpaceTransactionError::Model(protection_error(error)))?;
+            .map_err(|error| model_failure(protection_error(error)))?;
         let end = self
             .checked_interval_end(start, byte_len)
-            .map_err(AddressSpaceTransactionError::Model)?;
-        self.require_covered(start, end)
-            .map_err(AddressSpaceTransactionError::Model)?;
-        self.rebuild(authority, publisher, start, end, Some(protection))
+            .map_err(model_failure)?;
+        self.require_covered(start, end).map_err(model_failure)?;
+        self.rebuild(authority, registry, publisher, start, end, Some(protection))
     }
 
-    fn rebuild<const OBJECTS: usize, const LEASES: usize, P: AddressSpacePublisher>(
+    fn rebuild<
+        const OBJECTS: usize,
+        const LEASES: usize,
+        const REGISTRY_OBJECTS: usize,
+        P: AddressSpacePublisher,
+    >(
         &mut self,
         authority: &mut MemoryObjectAuthority<OBJECTS, LEASES>,
+        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
         publisher: &mut P,
         start: u64,
         end: u64,
         replacement_protection: Option<Protection>,
-    ) -> Result<(), AddressSpaceTransactionError<P::Error>> {
+    ) -> Result<
+        MappingFinalReleases<REGISTRY_OBJECTS>,
+        AddressSpaceTransactionFailure<P::Error, REGISTRY_OBJECTS>,
+    > {
         let mut staged = [None; SLOTS];
         let mut staged_len = 0;
         for mapping in self.mappings.iter().flatten().copied() {
             let spec = mapping.spec();
             if spec.end() <= start || spec.virtual_start >= end {
-                push_spec(&mut staged, &mut staged_len, spec)
-                    .map_err(AddressSpaceTransactionError::Model)?;
+                push_spec(&mut staged, &mut staged_len, spec).map_err(model_failure)?;
                 continue;
             }
             if spec.virtual_start < start {
-                push_spec(
-                    &mut staged,
-                    &mut staged_len,
-                    spec.slice(
+                let slice = spec
+                    .slice(
                         spec.virtual_start,
                         start - spec.virtual_start,
                         spec.protection,
                     )
-                    .map_err(AddressSpaceTransactionError::Model)?,
-                )
-                .map_err(AddressSpaceTransactionError::Model)?;
+                    .map_err(model_failure)?;
+                push_spec(&mut staged, &mut staged_len, slice).map_err(model_failure)?;
             }
             let overlap_start = spec.virtual_start.max(start);
             let overlap_end = spec.end().min(end);
             if let Some(protection) = replacement_protection {
-                push_spec(
-                    &mut staged,
-                    &mut staged_len,
-                    spec.slice(overlap_start, overlap_end - overlap_start, protection)
-                        .map_err(AddressSpaceTransactionError::Model)?,
-                )
-                .map_err(AddressSpaceTransactionError::Model)?;
+                let slice = spec
+                    .slice(overlap_start, overlap_end - overlap_start, protection)
+                    .map_err(model_failure)?;
+                push_spec(&mut staged, &mut staged_len, slice).map_err(model_failure)?;
             }
             if spec.end() > end {
-                push_spec(
-                    &mut staged,
-                    &mut staged_len,
-                    spec.slice(end, spec.end() - end, spec.protection)
-                        .map_err(AddressSpaceTransactionError::Model)?,
-                )
-                .map_err(AddressSpaceTransactionError::Model)?;
+                let slice = spec
+                    .slice(end, spec.end() - end, spec.protection)
+                    .map_err(model_failure)?;
+                push_spec(&mut staged, &mut staged_len, slice).map_err(model_failure)?;
             }
         }
-        self.commit_specs(authority, publisher, &staged, staged_len)
+        self.commit_specs(authority, registry, publisher, &staged, staged_len, None)
     }
 
-    fn commit_specs<const OBJECTS: usize, const LEASES: usize, P: AddressSpacePublisher>(
+    fn commit_specs<
+        const OBJECTS: usize,
+        const LEASES: usize,
+        const REGISTRY_OBJECTS: usize,
+        P: AddressSpacePublisher,
+    >(
         &mut self,
         authority: &mut MemoryObjectAuthority<OBJECTS, LEASES>,
+        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
         publisher: &mut P,
         specs: &[Option<MappingSpec>; SLOTS],
         spec_len: usize,
-    ) -> Result<(), AddressSpaceTransactionError<P::Error>> {
+        authorization: Option<MapAuthorization>,
+    ) -> Result<
+        MappingFinalReleases<REGISTRY_OBJECTS>,
+        AddressSpaceTransactionFailure<P::Error, REGISTRY_OBJECTS>,
+    > {
         let old_len = self.mapping_count();
         let mut released = [EMPTY_LEASE; SLOTS];
         let mut old = [EMPTY_MAPPING; SLOTS];
@@ -730,17 +852,25 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
                 spec.protection,
             );
         }
-
-        let prepared = authority
-            .prepare_replace::<SLOTS>(
-                self.address_space,
-                self.region,
-                &released[..old_len],
-                &requests[..spec_len],
-            )
-            .map_err(|error| {
-                AddressSpaceTransactionError::Model(AddressRegionError::Object(error))
-            })?;
+        let prepared = match authority.prepare_replace::<SLOTS, REGISTRY_OBJECTS>(
+            registry,
+            self.address_space,
+            self.region,
+            &released[..old_len],
+            &requests[..spec_len],
+            authorization,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let model_error = error.error();
+                return Err(AddressSpaceTransactionFailure {
+                    error: AddressSpaceTransactionError::Model(AddressRegionError::Object(
+                        model_error,
+                    )),
+                    final_releases: error.into_final_releases(),
+                });
+            }
+        };
         let mut next_dense = [EMPTY_MAPPING; SLOTS];
         let mut next = [None; SLOTS];
         for (index, (spec, ticket)) in specs[..spec_len]
@@ -765,25 +895,29 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
             next[index] = Some(mapping);
         }
         if publisher.address_space_key() != self.address_space {
-            return Err(AddressSpaceTransactionError::Model(
-                AddressRegionError::PublisherIdentity,
-            ));
+            let final_releases = prepared.rollback();
+            return Err(AddressSpaceTransactionFailure {
+                error: AddressSpaceTransactionError::Model(AddressRegionError::PublisherIdentity),
+                final_releases,
+            });
         }
-        publisher
-            .publish_replace(
-                self.address_space,
-                self.region,
-                &old[..old_len],
-                &next_dense[..spec_len],
-            )
-            .map_err(AddressSpaceTransactionError::Publish)?;
+        if let Err(error) = publisher.publish_replace(
+            self.address_space,
+            self.region,
+            &old[..old_len],
+            &next_dense[..spec_len],
+        ) {
+            let final_releases = prepared.rollback();
+            return Err(AddressSpaceTransactionFailure {
+                error: AddressSpaceTransactionError::Publish(error),
+                final_releases,
+            });
+        }
 
-        // Both writes are infallible and happen while `self` and `authority`
-        // are exclusively borrowed; a publisher error above has returned with
-        // all three layers unchanged.
+        // Publication succeeded. From this point the reference transaction is
+        // infallible except for fail-stop invariant corruption.
         self.mappings = next;
-        prepared.commit();
-        Ok(())
+        Ok(prepared.commit())
     }
 
     fn mapping_count(&self) -> usize {
@@ -860,6 +994,26 @@ const fn intersects_specs(left: MappingSpec, right: MappingSpec) -> bool {
     left.virtual_start < right.end() && right.virtual_start < left.end()
 }
 
+fn model_failure<E, const FINALIZERS: usize>(
+    error: AddressRegionError,
+) -> AddressSpaceTransactionFailure<E, FINALIZERS> {
+    AddressSpaceTransactionFailure {
+        error: AddressSpaceTransactionError::Model(error),
+        final_releases: MappingFinalReleases::empty(),
+    }
+}
+
+fn authorization_failure<E, const REGISTRY_OBJECTS: usize>(
+    registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
+    authorization: MapAuthorization,
+    error: AddressRegionError,
+) -> AddressSpaceTransactionFailure<E, REGISTRY_OBJECTS> {
+    AddressSpaceTransactionFailure {
+        error: AddressSpaceTransactionError::Model(error),
+        final_releases: authorization.release(registry),
+    }
+}
+
 const fn protection_error(error: MemoryObjectError) -> AddressRegionError {
     match error {
         MemoryObjectError::UnsupportedProtection => AddressRegionError::UnsupportedProtection,
@@ -868,6 +1022,10 @@ const fn protection_error(error: MemoryObjectError) -> AddressRegionError {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::err_expect,
+    reason = "prepared mapping transactions intentionally omit Debug; negative tests must consume errors without widening that authority surface"
+)]
 mod tests {
     extern crate std;
 
@@ -951,6 +1109,15 @@ mod tests {
                 .expect("test object owner capacity matches payload capacity");
             self.owners[slot] = Some(owner);
         }
+
+        fn split_mut(
+            &mut self,
+        ) -> (
+            &mut MemoryObjectAuthority<OBJECTS, LEASES>,
+            &mut ObjectRegistry<OBJECTS>,
+        ) {
+            (&mut self.authority, &mut self.registry)
+        }
     }
 
     impl<const OBJECTS: usize, const LEASES: usize> Deref for TestObjects<OBJECTS, LEASES> {
@@ -1004,13 +1171,156 @@ mod tests {
         reason = "tests stand in for the future handle-rights validation seam"
     )]
     fn authorization<const OBJECTS: usize, const LEASES: usize, const SLOTS: usize>(
-        authority: &MemoryObjectAuthority<OBJECTS, LEASES>,
+        objects: &mut TestObjects<OBJECTS, LEASES>,
         object: MemoryObjectKey,
         region: &AddressRegion<SLOTS>,
         ceiling: Protection,
     ) -> MapAuthorization {
+        let object_id = object.object_id().expect("test MemoryObject key is live");
+        let owner_slot = objects
+            .owners
+            .iter()
+            .position(|owner| owner.as_ref().is_some_and(|owner| owner.id() == object_id))
+            .expect("test MemoryObject has a generic owner");
+        let TestObjects {
+            registry,
+            authority,
+            owners,
+        } = objects;
+        let owner = owners[owner_slot].as_ref().unwrap();
         // SAFETY: each test explicitly selects the exercised MAP+READ/W/X authority.
-        unsafe { region.authorize_map(authority, object, ceiling).unwrap() }
+        unsafe {
+            region
+                .authorize_map(authority, registry, owner, object, ceiling)
+                .unwrap()
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the test adapter mirrors the explicit production map authority boundary while asserting no finalizer is discarded"
+    )]
+    fn test_map<
+        const OBJECTS: usize,
+        const LEASES: usize,
+        const SLOTS: usize,
+        P: AddressSpacePublisher,
+    >(
+        region: &mut AddressRegion<SLOTS>,
+        objects: &mut TestObjects<OBJECTS, LEASES>,
+        publisher: &mut P,
+        virtual_start: u64,
+        authorization: MapAuthorization,
+        object_offset: u64,
+        byte_len: u64,
+        protection: Protection,
+    ) -> Result<(), AddressSpaceTransactionError<P::Error>> {
+        let (authority, registry) = objects.split_mut();
+        match region.map(
+            authority,
+            registry,
+            publisher,
+            virtual_start,
+            authorization,
+            object_offset,
+            byte_len,
+            protection,
+        ) {
+            Ok(final_releases) => {
+                assert!(final_releases.is_empty());
+                Ok(())
+            }
+            Err(failure) => {
+                assert!(failure.final_releases.is_empty());
+                Err(failure.error)
+            }
+        }
+    }
+
+    fn test_map_anywhere<
+        const OBJECTS: usize,
+        const LEASES: usize,
+        const SLOTS: usize,
+        P: AddressSpacePublisher,
+    >(
+        region: &mut AddressRegion<SLOTS>,
+        objects: &mut TestObjects<OBJECTS, LEASES>,
+        publisher: &mut P,
+        authorization: MapAuthorization,
+        object_offset: u64,
+        byte_len: u64,
+        protection: Protection,
+    ) -> Result<u64, AddressSpaceTransactionError<P::Error>> {
+        let (authority, registry) = objects.split_mut();
+        match region.map_anywhere(
+            authority,
+            registry,
+            publisher,
+            authorization,
+            object_offset,
+            byte_len,
+            protection,
+        ) {
+            Ok((address, final_releases)) => {
+                assert!(final_releases.is_empty());
+                Ok(address)
+            }
+            Err(failure) => {
+                assert!(failure.final_releases.is_empty());
+                Err(failure.error)
+            }
+        }
+    }
+
+    fn test_unmap<
+        const OBJECTS: usize,
+        const LEASES: usize,
+        const SLOTS: usize,
+        P: AddressSpacePublisher,
+    >(
+        region: &mut AddressRegion<SLOTS>,
+        objects: &mut TestObjects<OBJECTS, LEASES>,
+        publisher: &mut P,
+        start: u64,
+        byte_len: u64,
+    ) -> Result<(), AddressSpaceTransactionError<P::Error>> {
+        let (authority, registry) = objects.split_mut();
+        match region.unmap(authority, registry, publisher, start, byte_len) {
+            Ok(final_releases) => {
+                assert!(final_releases.is_empty());
+                Ok(())
+            }
+            Err(failure) => {
+                assert!(failure.final_releases.is_empty());
+                Err(failure.error)
+            }
+        }
+    }
+
+    fn test_protect<
+        const OBJECTS: usize,
+        const LEASES: usize,
+        const SLOTS: usize,
+        P: AddressSpacePublisher,
+    >(
+        region: &mut AddressRegion<SLOTS>,
+        objects: &mut TestObjects<OBJECTS, LEASES>,
+        publisher: &mut P,
+        start: u64,
+        byte_len: u64,
+        protection: Protection,
+    ) -> Result<(), AddressSpaceTransactionError<P::Error>> {
+        let (authority, registry) = objects.split_mut();
+        match region.protect(authority, registry, publisher, start, byte_len, protection) {
+            Ok(final_releases) => {
+                assert!(final_releases.is_empty());
+                Ok(())
+            }
+            Err(failure) => {
+                assert!(failure.final_releases.is_empty());
+                Err(failure.error)
+            }
+        }
     }
 
     #[allow(
@@ -1058,31 +1368,36 @@ mod tests {
         let mut authority = TestObjects::<2, 8>::new();
         let object = object(&mut authority, Protection::READ_WRITE_EXECUTE);
         let mut region = region::<4>(PAGE_SIZE, PAGE_SIZE * 8);
-        let token = authorization(&authority, object, &region, Protection::READ_WRITE_EXECUTE);
+        let token = authorization(
+            &mut authority,
+            object,
+            &region,
+            Protection::READ_WRITE_EXECUTE,
+        );
         let mut publisher = FakePublisher::for_region(&region);
-        region
-            .map(
-                &mut authority,
-                &mut publisher,
-                PAGE_SIZE,
-                token,
-                0,
-                PAGE_SIZE * 2,
-                Protection::READ_WRITE,
-            )
-            .unwrap();
+        test_map(
+            &mut region,
+            &mut authority,
+            &mut publisher,
+            PAGE_SIZE,
+            token,
+            0,
+            PAGE_SIZE * 2,
+            Protection::READ_WRITE,
+        )
+        .unwrap();
         assert_eq!(publisher.last_before, 0);
         assert_eq!(publisher.last_after, 1);
         assert_eq!(authority.active_lease_count(), 1);
-        region
-            .protect(
-                &mut authority,
-                &mut publisher,
-                PAGE_SIZE,
-                PAGE_SIZE * 2,
-                Protection::READ_EXECUTE,
-            )
-            .unwrap();
+        test_protect(
+            &mut region,
+            &mut authority,
+            &mut publisher,
+            PAGE_SIZE,
+            PAGE_SIZE * 2,
+            Protection::READ_EXECUTE,
+        )
+        .unwrap();
         assert_eq!(
             region.mappings()[0].unwrap().protection(),
             Protection::READ_EXECUTE
@@ -1095,22 +1410,23 @@ mod tests {
         let mut authority = TestObjects::<2, 8>::new();
         let object = object(&mut authority, Protection::READ_WRITE_EXECUTE);
         let mut region = region::<4>(PAGE_SIZE, PAGE_SIZE * 8);
-        let read = authorization(&authority, object, &region, Protection::READ);
+        let read = authorization(&mut authority, object, &region, Protection::READ);
         let mut publisher = FakePublisher::for_region(&region);
 
-        region
-            .map(
-                &mut authority,
-                &mut publisher,
-                PAGE_SIZE,
-                read,
-                0,
-                PAGE_SIZE,
-                Protection::READ,
-            )
-            .unwrap();
+        test_map(
+            &mut region,
+            &mut authority,
+            &mut publisher,
+            PAGE_SIZE,
+            read,
+            0,
+            PAGE_SIZE,
+            Protection::READ,
+        )
+        .unwrap();
         assert!(matches!(
-            region.protect(
+            test_protect(
+                &mut region,
                 &mut authority,
                 &mut publisher,
                 PAGE_SIZE,
@@ -1121,56 +1437,66 @@ mod tests {
                 AddressRegionError::Object(MemoryObjectError::ProtectionCeiling)
             ))
         ));
-        region
-            .unmap(&mut authority, &mut publisher, PAGE_SIZE, PAGE_SIZE)
-            .unwrap();
+        test_unmap(
+            &mut region,
+            &mut authority,
+            &mut publisher,
+            PAGE_SIZE,
+            PAGE_SIZE,
+        )
+        .unwrap();
 
-        let read_write = authorization(&authority, object, &region, Protection::READ_WRITE);
-        region
-            .map(
-                &mut authority,
-                &mut publisher,
-                PAGE_SIZE,
-                read_write,
-                0,
-                PAGE_SIZE,
-                Protection::READ,
-            )
-            .unwrap();
-        let read_execute = authorization(&authority, object, &region, Protection::READ_EXECUTE);
-        region
-            .protect(
-                &mut authority,
-                &mut publisher,
-                PAGE_SIZE,
-                PAGE_SIZE,
-                Protection::READ_WRITE,
-            )
-            .unwrap();
-        region
-            .unmap(&mut authority, &mut publisher, PAGE_SIZE, PAGE_SIZE)
-            .unwrap();
+        let read_write = authorization(&mut authority, object, &region, Protection::READ_WRITE);
+        test_map(
+            &mut region,
+            &mut authority,
+            &mut publisher,
+            PAGE_SIZE,
+            read_write,
+            0,
+            PAGE_SIZE,
+            Protection::READ,
+        )
+        .unwrap();
+        let read_execute = authorization(&mut authority, object, &region, Protection::READ_EXECUTE);
+        test_protect(
+            &mut region,
+            &mut authority,
+            &mut publisher,
+            PAGE_SIZE,
+            PAGE_SIZE,
+            Protection::READ_WRITE,
+        )
+        .unwrap();
+        test_unmap(
+            &mut region,
+            &mut authority,
+            &mut publisher,
+            PAGE_SIZE,
+            PAGE_SIZE,
+        )
+        .unwrap();
 
-        region
-            .map(
-                &mut authority,
-                &mut publisher,
-                PAGE_SIZE,
-                read_execute,
-                0,
-                PAGE_SIZE,
-                Protection::READ,
-            )
-            .unwrap();
-        region
-            .protect(
-                &mut authority,
-                &mut publisher,
-                PAGE_SIZE,
-                PAGE_SIZE,
-                Protection::READ_EXECUTE,
-            )
-            .unwrap();
+        test_map(
+            &mut region,
+            &mut authority,
+            &mut publisher,
+            PAGE_SIZE,
+            read_execute,
+            0,
+            PAGE_SIZE,
+            Protection::READ,
+        )
+        .unwrap();
+        test_protect(
+            &mut region,
+            &mut authority,
+            &mut publisher,
+            PAGE_SIZE,
+            PAGE_SIZE,
+            Protection::READ_EXECUTE,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1178,24 +1504,25 @@ mod tests {
         let mut authority = TestObjects::<2, 8>::new();
         let object = object(&mut authority, Protection::READ_WRITE_EXECUTE);
         let mut first = region::<2>(PAGE_SIZE, PAGE_SIZE * 4);
-        let read_write = authorization(&authority, object, &first, Protection::READ_WRITE);
+        let read_write = authorization(&mut authority, object, &first, Protection::READ_WRITE);
         let mut publisher = FakePublisher::for_region(&first);
-        first
-            .map(
-                &mut authority,
-                &mut publisher,
-                PAGE_SIZE,
-                read_write,
-                0,
-                PAGE_SIZE,
-                Protection::READ_WRITE,
-            )
-            .unwrap();
+        test_map(
+            &mut first,
+            &mut authority,
+            &mut publisher,
+            PAGE_SIZE,
+            read_write,
+            0,
+            PAGE_SIZE,
+            Protection::READ_WRITE,
+        )
+        .unwrap();
         let mut second = region::<2>(PAGE_SIZE * 5, PAGE_SIZE * 2);
-        let read_execute = authorization(&authority, object, &second, Protection::READ_EXECUTE);
+        let read_execute = authorization(&mut authority, object, &second, Protection::READ_EXECUTE);
         let mut second_publisher = FakePublisher::for_region(&second);
         assert!(matches!(
-            second.map(
+            test_map(
+                &mut second,
                 &mut authority,
                 &mut second_publisher,
                 PAGE_SIZE * 5,
@@ -1211,12 +1538,17 @@ mod tests {
         assert_eq!(authority.active_lease_count(), 1);
 
         let mut failed = region::<2>(PAGE_SIZE * 8, PAGE_SIZE * 2);
-        let read_write_execute =
-            authorization(&authority, object, &failed, Protection::READ_WRITE_EXECUTE);
+        let read_write_execute = authorization(
+            &mut authority,
+            object,
+            &failed,
+            Protection::READ_WRITE_EXECUTE,
+        );
         let mut failed_publisher = FakePublisher::for_region(&failed);
         failed_publisher.fail = true;
         assert_eq!(
-            failed.map(
+            test_map(
+                &mut failed,
                 &mut authority,
                 &mut failed_publisher,
                 PAGE_SIZE * 8,
@@ -1230,19 +1562,24 @@ mod tests {
         assert!(failed.mappings().iter().all(Option::is_none));
         assert_eq!(authority.active_lease_count(), 1);
 
-        let retry = authorization(&authority, object, &failed, Protection::READ_WRITE_EXECUTE);
+        let retry = authorization(
+            &mut authority,
+            object,
+            &failed,
+            Protection::READ_WRITE_EXECUTE,
+        );
         failed_publisher.fail = false;
-        failed
-            .map(
-                &mut authority,
-                &mut failed_publisher,
-                PAGE_SIZE * 8,
-                retry,
-                PAGE_SIZE * 2,
-                PAGE_SIZE,
-                Protection::READ,
-            )
-            .unwrap();
+        test_map(
+            &mut failed,
+            &mut authority,
+            &mut failed_publisher,
+            PAGE_SIZE * 8,
+            retry,
+            PAGE_SIZE * 2,
+            PAGE_SIZE,
+            Protection::READ,
+        )
+        .unwrap();
         assert_eq!(failed_publisher.calls, 2);
         assert_eq!(failed.mappings().iter().flatten().count(), 1);
         assert_eq!(authority.active_lease_count(), 2);
@@ -1253,22 +1590,28 @@ mod tests {
         let mut authority = TestObjects::<2, 4>::new();
         let object = object(&mut authority, Protection::READ_WRITE);
         let mut region = region::<1>(PAGE_SIZE, PAGE_SIZE * 4);
-        let read_write = authorization(&authority, object, &region, Protection::READ_WRITE);
+        let read_write = authorization(&mut authority, object, &region, Protection::READ_WRITE);
         let mut publisher = FakePublisher::for_region(&region);
-        region
-            .map(
-                &mut authority,
-                &mut publisher,
-                PAGE_SIZE,
-                read_write,
-                0,
-                PAGE_SIZE * 3,
-                Protection::READ,
-            )
-            .unwrap();
+        test_map(
+            &mut region,
+            &mut authority,
+            &mut publisher,
+            PAGE_SIZE,
+            read_write,
+            0,
+            PAGE_SIZE * 3,
+            Protection::READ,
+        )
+        .unwrap();
         let calls_before = publisher.calls;
         assert_eq!(
-            region.unmap(&mut authority, &mut publisher, PAGE_SIZE * 2, PAGE_SIZE),
+            test_unmap(
+                &mut region,
+                &mut authority,
+                &mut publisher,
+                PAGE_SIZE * 2,
+                PAGE_SIZE
+            ),
             Err(AddressSpaceTransactionError::Model(
                 AddressRegionError::Capacity
             ))
@@ -1286,48 +1629,49 @@ mod tests {
         let mut publisher = FakePublisher::for_region(&region);
 
         for virtual_start in [PAGE_SIZE, PAGE_SIZE * 3] {
-            let read_write = authorization(&authority, object, &region, Protection::READ_WRITE);
-            region
-                .map(
-                    &mut authority,
-                    &mut publisher,
-                    virtual_start,
-                    read_write,
-                    0,
-                    PAGE_SIZE,
-                    Protection::READ,
-                )
-                .unwrap();
-        }
-        let anywhere = authorization(&authority, object, &region, Protection::READ_WRITE);
-        assert_eq!(
-            region
-                .map_anywhere(
-                    &mut authority,
-                    &mut publisher,
-                    anywhere,
-                    0,
-                    PAGE_SIZE,
-                    Protection::READ,
-                )
-                .unwrap(),
-            PAGE_SIZE * 2
-        );
-        let last_fixed = authorization(&authority, object, &region, Protection::READ_WRITE);
-        region
-            .map(
+            let read_write = authorization(&mut authority, object, &region, Protection::READ_WRITE);
+            test_map(
+                &mut region,
                 &mut authority,
                 &mut publisher,
-                PAGE_SIZE * 4,
-                last_fixed,
+                virtual_start,
+                read_write,
                 0,
                 PAGE_SIZE,
                 Protection::READ,
             )
             .unwrap();
-        let exhausted = authorization(&authority, object, &region, Protection::READ_WRITE);
+        }
+        let anywhere = authorization(&mut authority, object, &region, Protection::READ_WRITE);
+        assert_eq!(
+            test_map_anywhere(
+                &mut region,
+                &mut authority,
+                &mut publisher,
+                anywhere,
+                0,
+                PAGE_SIZE,
+                Protection::READ,
+            )
+            .unwrap(),
+            PAGE_SIZE * 2
+        );
+        let last_fixed = authorization(&mut authority, object, &region, Protection::READ_WRITE);
+        test_map(
+            &mut region,
+            &mut authority,
+            &mut publisher,
+            PAGE_SIZE * 4,
+            last_fixed,
+            0,
+            PAGE_SIZE,
+            Protection::READ,
+        )
+        .unwrap();
+        let exhausted = authorization(&mut authority, object, &region, Protection::READ_WRITE);
         assert!(matches!(
-            region.map_anywhere(
+            test_map_anywhere(
+                &mut region,
                 &mut authority,
                 &mut publisher,
                 exhausted,
@@ -1367,7 +1711,7 @@ mod tests {
 
         let mut objects = TestObjects::<1, 4>::new();
         let object = object(&mut objects, Protection::READ_WRITE_EXECUTE);
-        let read = authorization(&objects, object, &first, Protection::READ);
+        let read = authorization(&mut objects, object, &first, Protection::READ);
         let mut swapped_publisher = FakePublisher {
             address_space: second_space,
             calls: 0,
@@ -1376,7 +1720,8 @@ mod tests {
             last_after: 0,
         };
         assert!(matches!(
-            first.map(
+            test_map(
+                &mut first,
                 &mut objects,
                 &mut swapped_publisher,
                 PAGE_SIZE,
@@ -1392,66 +1737,134 @@ mod tests {
         assert_eq!(swapped_publisher.calls, 0);
 
         let mut publisher = FakePublisher::for_region(&first);
-        let read = authorization(&objects, object, &first, Protection::READ);
-        first
-            .map(
-                &mut objects,
-                &mut publisher,
-                PAGE_SIZE,
-                read,
-                0,
-                PAGE_SIZE,
-                Protection::READ,
-            )
-            .unwrap();
+        let read = authorization(&mut objects, object, &first, Protection::READ);
+        test_map(
+            &mut first,
+            &mut objects,
+            &mut publisher,
+            PAGE_SIZE,
+            read,
+            0,
+            PAGE_SIZE,
+            Protection::READ,
+        )
+        .unwrap();
         let stale_lease = first.mappings()[0].unwrap().lease();
-        assert!(matches!(
-            objects.prepare_replace::<2>(first_space, second.region, &[stale_lease], &[]),
-            Err(MemoryObjectError::ForeignLease)
-        ));
-        first
-            .protect(
-                &mut objects,
-                &mut publisher,
-                PAGE_SIZE,
-                PAGE_SIZE,
-                Protection::READ,
-            )
-            .unwrap();
-        assert!(matches!(
-            objects.prepare_replace::<2>(first_space, first.region, &[stale_lease], &[]),
-            Err(MemoryObjectError::InvalidLease)
-        ));
+        let error = {
+            let (authority, registry) = objects.split_mut();
+            authority
+                .prepare_replace::<2, 1>(
+                    registry,
+                    first_space,
+                    second.region,
+                    &[stale_lease],
+                    &[],
+                    None,
+                )
+                .err()
+                .expect("foreign-region lease replacement must fail")
+        };
+        assert_eq!(error.error(), MemoryObjectError::ForeignLease);
+        assert!(error.into_final_releases().is_empty());
+        test_protect(
+            &mut first,
+            &mut objects,
+            &mut publisher,
+            PAGE_SIZE,
+            PAGE_SIZE,
+            Protection::READ,
+        )
+        .unwrap();
+        let error = {
+            let (authority, registry) = objects.split_mut();
+            authority
+                .prepare_replace::<2, 1>(
+                    registry,
+                    first_space,
+                    first.region,
+                    &[stale_lease],
+                    &[],
+                    None,
+                )
+                .err()
+                .expect("stale lease replacement must fail")
+        };
+        assert_eq!(error.error(), MemoryObjectError::InvalidLease);
+        assert!(error.into_final_releases().is_empty());
     }
 
     #[test]
+    #[allow(
+        unsafe_code,
+        reason = "the replay test explicitly exercises the temporary handle-rights authorization seam across payload authorities"
+    )]
     fn object_authorizations_cannot_replay_across_authority_domains() {
         let mut spaces = space_authority::<1, 1>();
         let space = spaces.create_address_space().unwrap();
         let mut region: AddressRegion<1> =
             spaces.create_region(space, PAGE_SIZE, PAGE_SIZE).unwrap();
-        let mut first = TestObjects::<1, 1>::new();
-        let first_object = object_at(&mut first, 0x20_000, Protection::READ);
-        let authorization = authorization(&first, first_object, &region, Protection::READ);
 
-        let mut second = TestObjects::<1, 1>::new();
-        let second_object = object_at(&mut second, 0x40_000, Protection::READ);
+        let mut registry = ObjectRegistry::<2>::new();
+        let first_creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+        let mut first = MemoryObjectAuthority::<1, 1>::new();
+        let first_backing = crate::memory::frame_roles::synthetic_allocator_backing(0x20_000, 1);
+        let first_object = first
+            .grant_backing(
+                &first_creation,
+                first_backing,
+                PAGE_SIZE,
+                MemoryObjectKind::PageBacked,
+                Protection::READ,
+            )
+            .unwrap();
+        let first_owner = registry.creation_into_internal(first_creation).unwrap();
+        let authorization = unsafe {
+            region
+                .authorize_map(
+                    &first,
+                    &mut registry,
+                    &first_owner,
+                    first_object,
+                    Protection::READ,
+                )
+                .unwrap()
+        };
+
+        let second_creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+        let mut second = MemoryObjectAuthority::<1, 1>::new();
+        let second_backing = crate::memory::frame_roles::synthetic_allocator_backing(0x40_000, 1);
+        let second_object = second
+            .grant_backing(
+                &second_creation,
+                second_backing,
+                PAGE_SIZE,
+                MemoryObjectKind::PageBacked,
+                Protection::READ,
+            )
+            .unwrap();
+        let _second_owner = registry.creation_into_internal(second_creation).unwrap();
         assert_ne!(first_object, second_object);
+
         let mut publisher = FakePublisher::for_region(&region);
-        assert!(matches!(
-            region.map(
+        let failure = region
+            .map(
                 &mut second,
+                &mut registry,
                 &mut publisher,
                 PAGE_SIZE,
                 authorization,
                 0,
                 PAGE_SIZE,
                 Protection::READ,
-            ),
-            Err(AddressSpaceTransactionError::Model(
-                AddressRegionError::Object(MemoryObjectError::InvalidObjectKey)
+            )
+            .unwrap_err();
+        assert!(matches!(
+            failure.error(),
+            AddressSpaceTransactionError::Model(AddressRegionError::Object(
+                MemoryObjectError::InvalidObjectKey
             ))
         ));
+        assert!(failure.into_final_releases().is_empty());
         assert_eq!(publisher.calls, 0);
         assert_eq!(second.active_lease_count(), 0);
     }

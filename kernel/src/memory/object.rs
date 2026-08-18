@@ -14,7 +14,7 @@ use super::address_region::{AddressSpaceKey, RegionKey, mint_authority_domain};
 use crate::memory::frame_roles::{
     BackingIdentity, FrameRoleManager, ObjectBackingGrant, ObjectBackingKind,
 };
-use crate::object::{CreationRef, FinalRelease, ObjectId, ObjectRegistry};
+use crate::object::{CreationRef, FinalRelease, InternalRef, ObjectId, ObjectRegistry};
 use deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT;
 
 /// The DW0 base page size.
@@ -40,6 +40,7 @@ pub(crate) enum MemoryObjectError {
     BackingKind,
     ObjectIdentity,
     FinalizationMismatch,
+    ObjectReference,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -222,11 +223,12 @@ pub(crate) struct MapAuthorization {
     address_space: AddressSpaceKey,
     region: RegionKey,
     ceiling: MemoryProtection,
+    pin: InternalRef,
 }
 
 impl MapAuthorization {
     pub(super) fn capture(
-        self,
+        &self,
         address_space: AddressSpaceKey,
         region: RegionKey,
     ) -> Result<CapturedMappingAuthority, MemoryObjectError> {
@@ -237,6 +239,19 @@ impl MapAuthorization {
             object: self.object,
             ceiling: self.ceiling,
         })
+    }
+
+    fn object_id(&self) -> ObjectId {
+        self.pin.id()
+    }
+
+    pub(super) fn release<const REGISTRY_OBJECTS: usize>(
+        self,
+        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
+    ) -> MappingFinalReleases<REGISTRY_OBJECTS> {
+        let mut final_releases = MappingFinalReleases::empty();
+        release_map_authorization(registry, self, &mut final_releases);
+        final_releases
     }
 }
 
@@ -256,6 +271,59 @@ impl CapturedMappingAuthority {
     }
     const fn ceiling(self) -> MemoryProtection {
         self.ceiling
+    }
+}
+
+#[must_use = "mapping reference releases may contain final MemoryObject cleanup authority"]
+#[derive(Debug)]
+pub(crate) struct MappingFinalReleases<const CAPACITY: usize> {
+    items: [Option<FinalRelease>; CAPACITY],
+    count: usize,
+}
+
+impl<const CAPACITY: usize> MappingFinalReleases<CAPACITY> {
+    pub(crate) fn empty() -> Self {
+        Self {
+            items: core::array::from_fn(|_| None),
+            count: 0,
+        }
+    }
+
+    fn push(&mut self, release: FinalRelease) {
+        assert!(
+            self.count < CAPACITY,
+            "mapping final-release batch overflow"
+        );
+        self.items[self.count] = Some(release);
+        self.count += 1;
+    }
+
+    pub(crate) const fn len(&self) -> usize {
+        self.count
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    pub(crate) fn into_items(self) -> [Option<FinalRelease>; CAPACITY] {
+        self.items
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct PrepareReplaceError<const CAPACITY: usize> {
+    error: MemoryObjectError,
+    final_releases: MappingFinalReleases<CAPACITY>,
+}
+
+impl<const CAPACITY: usize> PrepareReplaceError<CAPACITY> {
+    pub(super) const fn error(&self) -> MemoryObjectError {
+        self.error
+    }
+
+    pub(super) fn into_final_releases(self) -> MappingFinalReleases<CAPACITY> {
+        self.final_releases
     }
 }
 
@@ -423,7 +491,7 @@ struct ObjectSlot {
 const EMPTY_OBJECT_SLOT: ObjectSlot = ObjectSlot { record: None };
 
 #[derive(Clone, Copy)]
-struct LeaseRecord {
+struct LeaseMetadata {
     address_space: AddressSpaceKey,
     region: RegionKey,
     object_slot: usize,
@@ -440,41 +508,46 @@ struct LeaseRecord {
     mapping_authority: CapturedMappingAuthority,
 }
 
-#[derive(Clone, Copy)]
+struct LeaseRecord {
+    metadata: LeaseMetadata,
+    pin: InternalRef,
+}
+
 struct LeaseSlot {
     generation: u32,
     record: Option<LeaseRecord>,
 }
 
-const EMPTY_LEASE_SLOT: LeaseSlot = LeaseSlot {
-    generation: 0,
-    record: None,
-};
+#[derive(Clone, Copy)]
+enum ExistingPinSource {
+    Released(usize),
+    Authorization,
+}
+
+#[derive(Clone, Copy)]
+enum PendingPinSource {
+    Released(usize),
+    Authorization,
+    Extra(usize),
+}
 
 #[derive(Clone, Copy)]
 struct PendingLease {
     slot: usize,
     generation: u32,
-    record: LeaseRecord,
+    metadata: LeaseMetadata,
+    pin_source: PendingPinSource,
 }
 
-const EMPTY_PENDING: PendingLease = PendingLease {
-    slot: 0,
-    generation: 0,
-    record: LeaseRecord {
-        address_space: AddressSpaceKey::EMPTY,
-        region: RegionKey::EMPTY,
-        object_slot: 0,
-        range: MemoryObjectRange {
-            backing: BackingIdentity::EMPTY,
-            physical_start: 0,
-            object_offset: 0,
-            byte_len: 0,
-        },
-        protection: MemoryProtection::READ,
-        mapping_authority: CapturedMappingAuthority::EMPTY,
-    },
-};
+struct ReplacePlan<const BATCH: usize> {
+    released: [usize; BATCH],
+    released_len: usize,
+    pending: [Option<PendingLease>; BATCH],
+    pending_len: usize,
+    tickets: [Option<LeaseTicket>; BATCH],
+    extra_sources: [Option<ExistingPinSource>; BATCH],
+    extra_len: usize,
+}
 
 /// Fixed-capacity authority over objects and their active mapping leases.
 ///
@@ -494,7 +567,10 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             domain: mint_authority_domain(),
             objects: [EMPTY_OBJECT_SLOT; OBJECTS],
             backings: core::array::from_fn(|_| None),
-            leases: [EMPTY_LEASE_SLOT; LEASES],
+            leases: core::array::from_fn(|_| LeaseSlot {
+                generation: 0,
+                record: None,
+            }),
         }
     }
 
@@ -659,14 +735,22 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         unsafe_code,
         reason = "the future rights-validation seam is the sole authority source until DW0-D handles exist"
     )]
-    pub(super) unsafe fn issue_map_authorization(
+    pub(super) unsafe fn issue_map_authorization<const REGISTRY_OBJECTS: usize>(
         &self,
+        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
+        source: &InternalRef,
         object: MemoryObjectKey,
         address_space: AddressSpaceKey,
         region: RegionKey,
         ceiling: MemoryProtection,
     ) -> Result<MapAuthorization, MemoryObjectError> {
         let record = self.object_record(object)?;
+        if source.object_type() != DW_OBJECT_TYPE_MEMORY_OBJECT
+            || object.object_id() != Some(source.id())
+            || record.object != source.id()
+        {
+            return Err(MemoryObjectError::ObjectReference);
+        }
         MemoryProtection::ceiling(ceiling.bits())?;
         if !record.protection_ceiling.contains(ceiling) {
             return Err(MemoryObjectError::ProtectionCeiling);
@@ -674,11 +758,15 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         if !address_space.same_domain(region) {
             return Err(MemoryObjectError::ForeignLease);
         }
+        let pin = registry
+            .retain_internal(source)
+            .map_err(|_| MemoryObjectError::ObjectReference)?;
         Ok(MapAuthorization {
             object,
             address_space,
             region,
             ceiling,
+            pin,
         })
     }
 
@@ -694,16 +782,98 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         count
     }
 
-    /// Validates a complete replacement while retaining mutable authority.
-    /// Dropping the returned batch releases no resource; `commit` is the only
-    /// mutation point and is intentionally infallible after publication.
-    pub(super) fn prepare_replace<const BATCH: usize>(
-        &mut self,
+    /// Prepares one mapping replacement without changing committed leases.
+    ///
+    /// Existing released-lease pins remain installed until publication succeeds.
+    /// The optional authorization contributes exactly one already-retained pin;
+    /// only positive per-object lease-count deltas retain additional pins.
+    pub(super) fn prepare_replace<'a, const BATCH: usize, const REGISTRY_OBJECTS: usize>(
+        &'a mut self,
+        registry: &'a mut ObjectRegistry<REGISTRY_OBJECTS>,
         address_space: AddressSpaceKey,
         region: RegionKey,
         released: &[MappingLease],
         requested: &[LeaseRequest],
-    ) -> Result<PreparedReplace<'_, OBJECTS, LEASES, BATCH>, MemoryObjectError> {
+        authorization: Option<MapAuthorization>,
+    ) -> Result<
+        PreparedReplace<'a, OBJECTS, LEASES, BATCH, REGISTRY_OBJECTS>,
+        PrepareReplaceError<REGISTRY_OBJECTS>,
+    > {
+        let plan = match self.plan_replace(
+            address_space,
+            region,
+            released,
+            requested,
+            authorization.as_ref(),
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                let mut final_releases = MappingFinalReleases::empty();
+                if let Some(authorization) = authorization {
+                    release_map_authorization(registry, authorization, &mut final_releases);
+                }
+                return Err(PrepareReplaceError {
+                    error,
+                    final_releases,
+                });
+            }
+        };
+
+        let mut extra_pins: [Option<InternalRef>; BATCH] = core::array::from_fn(|_| None);
+        for extra_index in 0..plan.extra_len {
+            let source =
+                match plan.extra_sources[extra_index].expect("planned extra pin has a source") {
+                    ExistingPinSource::Released(position) => {
+                        let slot = plan.released[position];
+                        &self.leases[slot]
+                            .record
+                            .as_ref()
+                            .expect("validated released lease still exists")
+                            .pin
+                    }
+                    ExistingPinSource::Authorization => {
+                        &authorization
+                            .as_ref()
+                            .expect("planned authorization source remains present")
+                            .pin
+                    }
+                };
+            match registry.retain_internal(source) {
+                Ok(pin) => extra_pins[extra_index] = Some(pin),
+                Err(_) => {
+                    let mut final_releases = MappingFinalReleases::empty();
+                    for pin in extra_pins.iter_mut().filter_map(Option::take) {
+                        release_internal_pin(registry, pin, &mut final_releases);
+                    }
+                    if let Some(authorization) = authorization {
+                        release_map_authorization(registry, authorization, &mut final_releases);
+                    }
+                    return Err(PrepareReplaceError {
+                        error: MemoryObjectError::ObjectReference,
+                        final_releases,
+                    });
+                }
+            }
+        }
+
+        Ok(PreparedReplace {
+            authority: self,
+            registry,
+            plan,
+            extra_pins,
+            authorization,
+            finished: false,
+        })
+    }
+
+    fn plan_replace<const BATCH: usize>(
+        &self,
+        address_space: AddressSpaceKey,
+        region: RegionKey,
+        released: &[MappingLease],
+        requested: &[LeaseRequest],
+        authorization: Option<&MapAuthorization>,
+    ) -> Result<ReplacePlan<BATCH>, MemoryObjectError> {
         if !address_space.same_domain(region) {
             return Err(MemoryObjectError::ForeignLease);
         }
@@ -713,13 +883,15 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         if released.len() > BATCH || requested.len() > BATCH {
             return Err(MemoryObjectError::LeaseCapacity);
         }
+
         let mut release_slots = [usize::MAX; BATCH];
         for (position, lease) in released.iter().copied().enumerate() {
             let slot = self.lease_slot(lease)?;
             let record = self.leases[slot]
                 .record
+                .as_ref()
                 .expect("validated lease slot has a record");
-            if record.address_space != address_space || record.region != region {
+            if record.metadata.address_space != address_space || record.metadata.region != region {
                 return Err(MemoryObjectError::ForeignLease);
             }
             if release_slots[..position].contains(&slot) {
@@ -731,14 +903,14 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         let mut writable = [false; OBJECTS];
         let mut executable = [false; OBJECTS];
         for (slot, lease) in self.leases.iter().enumerate() {
-            let Some(record) = lease.record else {
+            let Some(record) = lease.record.as_ref() else {
                 continue;
             };
             if release_slots[..released.len()].contains(&slot) {
                 continue;
             }
-            writable[record.object_slot] |= record.protection.writable();
-            executable[record.object_slot] |= record.protection.executable();
+            writable[record.metadata.object_slot] |= record.metadata.protection.writable();
+            executable[record.metadata.object_slot] |= record.metadata.protection.executable();
         }
 
         let reusable_slots = self
@@ -753,9 +925,14 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             return Err(MemoryObjectError::LeaseCapacity);
         }
 
-        let mut pending = [EMPTY_PENDING; BATCH];
+        let mut pending: [Option<PendingLease>; BATCH] = core::array::from_fn(|_| None);
         let mut tickets = [None; BATCH];
+        let mut extra_sources: [Option<ExistingPinSource>; BATCH] = core::array::from_fn(|_| None);
+        let mut extra_len = 0;
+        let mut released_used = [false; BATCH];
+        let mut authorization_used = false;
         let mut candidate_cursor = 0;
+
         for (position, request) in requested.iter().copied().enumerate() {
             if request.address_space != address_space || request.region != region {
                 return Err(MemoryObjectError::ForeignLease);
@@ -791,6 +968,45 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             writable[object_slot] |= request.protection.writable();
             executable[object_slot] |= request.protection.executable();
 
+            let object_id = object.object;
+            let released_source = (0..released.len()).find(|released_position| {
+                !released_used[*released_position]
+                    && self.leases[release_slots[*released_position]]
+                        .record
+                        .as_ref()
+                        .is_some_and(|record| record.pin.id() == object_id)
+            });
+            let pin_source = if let Some(released_position) = released_source {
+                released_used[released_position] = true;
+                PendingPinSource::Released(released_position)
+            } else if !authorization_used
+                && authorization.is_some_and(|authorization| authorization.object_id() == object_id)
+            {
+                authorization_used = true;
+                PendingPinSource::Authorization
+            } else {
+                let source = (0..released.len())
+                    .find(|released_position| {
+                        self.leases[release_slots[*released_position]]
+                            .record
+                            .as_ref()
+                            .is_some_and(|record| record.pin.id() == object_id)
+                    })
+                    .map(ExistingPinSource::Released)
+                    .or_else(|| {
+                        authorization
+                            .filter(|authorization| authorization.object_id() == object_id)
+                            .map(|_| ExistingPinSource::Authorization)
+                    })
+                    .ok_or(MemoryObjectError::ObjectReference)?;
+                if extra_len == BATCH {
+                    return Err(MemoryObjectError::LeaseCapacity);
+                }
+                extra_sources[extra_len] = Some(source);
+                let source_index = extra_len;
+                extra_len += 1;
+                PendingPinSource::Extra(source_index)
+            };
             let slot = loop {
                 let slot = candidate_cursor;
                 candidate_cursor += 1;
@@ -805,7 +1021,7 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
                 domain: self.domain,
                 raw: encode_raw_key(slot, generation),
             };
-            let record = LeaseRecord {
+            let metadata = LeaseMetadata {
                 address_space,
                 region,
                 object_slot,
@@ -813,11 +1029,12 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
                 protection: request.protection,
                 mapping_authority: request.mapping_authority,
             };
-            pending[position] = PendingLease {
+            pending[position] = Some(PendingLease {
                 slot,
                 generation,
-                record,
-            };
+                metadata,
+                pin_source,
+            });
             tickets[position] = Some(LeaseTicket {
                 lease,
                 object: object_key,
@@ -826,13 +1043,19 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
                 mapping_authority: request.mapping_authority,
             });
         }
-        Ok(PreparedReplace {
-            authority: self,
+
+        if authorization.is_some() && !authorization_used {
+            return Err(MemoryObjectError::ObjectReference);
+        }
+
+        Ok(ReplacePlan {
             released: release_slots,
             released_len: released.len(),
             pending,
             pending_len: requested.len(),
             tickets,
+            extra_sources,
+            extra_len,
         })
     }
 
@@ -868,39 +1091,131 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
     }
 }
 
-/// A validated replacement batch held under an exclusive authority borrow.
-pub(super) struct PreparedReplace<'a, const OBJECTS: usize, const LEASES: usize, const BATCH: usize>
-{
-    authority: &'a mut MemoryObjectAuthority<OBJECTS, LEASES>,
-    released: [usize; BATCH],
-    released_len: usize,
-    pending: [PendingLease; BATCH],
-    pending_len: usize,
-    tickets: [Option<LeaseTicket>; BATCH],
+fn release_internal_pin<const REGISTRY_OBJECTS: usize>(
+    registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
+    pin: InternalRef,
+    final_releases: &mut MappingFinalReleases<REGISTRY_OBJECTS>,
+) {
+    match registry.release_internal(pin) {
+        Ok(Some(final_release)) => final_releases.push(final_release),
+        Ok(None) => {}
+        Err(error) => panic!("mapping pin release violated generic object invariants: {error:?}"),
+    }
 }
 
-impl<const OBJECTS: usize, const LEASES: usize, const BATCH: usize>
-    PreparedReplace<'_, OBJECTS, LEASES, BATCH>
+fn release_map_authorization<const REGISTRY_OBJECTS: usize>(
+    registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
+    authorization: MapAuthorization,
+    final_releases: &mut MappingFinalReleases<REGISTRY_OBJECTS>,
+) {
+    release_internal_pin(registry, authorization.pin, final_releases);
+}
+
+/// A validated replacement batch held under exclusive memory/registry borrows.
+pub(super) struct PreparedReplace<
+    'a,
+    const OBJECTS: usize,
+    const LEASES: usize,
+    const BATCH: usize,
+    const REGISTRY_OBJECTS: usize,
+> {
+    authority: &'a mut MemoryObjectAuthority<OBJECTS, LEASES>,
+    registry: &'a mut ObjectRegistry<REGISTRY_OBJECTS>,
+    plan: ReplacePlan<BATCH>,
+    extra_pins: [Option<InternalRef>; BATCH],
+    authorization: Option<MapAuthorization>,
+    finished: bool,
+}
+
+impl<const OBJECTS: usize, const LEASES: usize, const BATCH: usize, const REGISTRY_OBJECTS: usize>
+    PreparedReplace<'_, OBJECTS, LEASES, BATCH, REGISTRY_OBJECTS>
 {
     pub(super) fn tickets(&self) -> &[Option<LeaseTicket>] {
-        &self.tickets[..self.pending_len]
+        &self.plan.tickets[..self.plan.pending_len]
     }
 
-    /// Commits only after the caller's address-space publisher has atomically
-    /// accepted the corresponding PTE replacement. This has no fallible work:
-    /// it clears released leases and installs the already-validated tickets.
-    pub(super) fn commit(mut self) {
-        for slot in self.released[..self.released_len].iter().copied() {
-            self.authority.leases[slot].record = None;
+    /// Finalizes reference ownership only after page-table publication.
+    /// Existing pins transfer where possible; surplus pins are released only
+    /// after every replacement lease has acquired its exact lifetime owner.
+    pub(super) fn commit(mut self) -> MappingFinalReleases<REGISTRY_OBJECTS> {
+        let mut released_records: [Option<LeaseRecord>; BATCH] = core::array::from_fn(|_| None);
+        for (position, record) in released_records
+            .iter_mut()
+            .enumerate()
+            .take(self.plan.released_len)
+        {
+            let slot = self.plan.released[position];
+            *record = self.authority.leases[slot].record.take();
         }
-        for pending in self.pending[..self.pending_len].iter().copied() {
+
+        for position in 0..self.plan.pending_len {
+            let pending = self.plan.pending[position]
+                .take()
+                .expect("planned mapping lease is present");
+            let pin = match pending.pin_source {
+                PendingPinSource::Released(released_position) => {
+                    released_records[released_position]
+                        .take()
+                        .expect("reused released lease pin remains available")
+                        .pin
+                }
+                PendingPinSource::Authorization => {
+                    self.authorization
+                        .take()
+                        .expect("planned authorization pin remains available")
+                        .pin
+                }
+                PendingPinSource::Extra(extra_index) => self.extra_pins[extra_index]
+                    .take()
+                    .expect("planned extra mapping pin remains available"),
+            };
             self.authority.leases[pending.slot] = LeaseSlot {
                 generation: pending.generation,
-                record: Some(pending.record),
+                record: Some(LeaseRecord {
+                    metadata: pending.metadata,
+                    pin,
+                }),
             };
         }
-        self.released_len = 0;
-        self.pending_len = 0;
+
+        let mut final_releases = MappingFinalReleases::empty();
+        for record in released_records.into_iter().flatten() {
+            release_internal_pin(self.registry, record.pin, &mut final_releases);
+        }
+        if let Some(authorization) = self.authorization.take() {
+            release_map_authorization(self.registry, authorization, &mut final_releases);
+        }
+        for pin in self.extra_pins.iter_mut().filter_map(Option::take) {
+            release_internal_pin(self.registry, pin, &mut final_releases);
+        }
+        self.finished = true;
+        final_releases
+    }
+
+    /// Aborts a prepared replacement before page-table publication.
+    /// Committed old leases remain untouched; only speculative extra and
+    /// authorization pins are released.
+    pub(super) fn rollback(mut self) -> MappingFinalReleases<REGISTRY_OBJECTS> {
+        let mut final_releases = MappingFinalReleases::empty();
+        for pin in self.extra_pins.iter_mut().filter_map(Option::take) {
+            release_internal_pin(self.registry, pin, &mut final_releases);
+        }
+        if let Some(authorization) = self.authorization.take() {
+            release_map_authorization(self.registry, authorization, &mut final_releases);
+        }
+        self.finished = true;
+        final_releases
+    }
+}
+
+impl<const OBJECTS: usize, const LEASES: usize, const BATCH: usize, const REGISTRY_OBJECTS: usize>
+    Drop for PreparedReplace<'_, OBJECTS, LEASES, BATCH, REGISTRY_OBJECTS>
+{
+    fn drop(&mut self) {
+        assert!(
+            self.finished,
+            "prepared mapping reference transaction dropped without commit/rollback"
+        );
     }
 }
 
@@ -958,6 +1273,10 @@ fn decode_raw_key(raw: u64) -> Option<(usize, u32)> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::err_expect,
+    reason = "prepared mapping transactions intentionally omit Debug; negative tests must consume errors without widening that authority surface"
+)]
 mod tests {
     extern crate std;
 
@@ -971,7 +1290,7 @@ mod tests {
         registry: &mut ObjectRegistry<OBJECTS>,
         logical_byte_len: u64,
         ceiling: MemoryProtection,
-    ) -> (MemoryObjectKey, CreationRef) {
+    ) -> (MemoryObjectKey, InternalRef) {
         let backing = crate::memory::frame_roles::synthetic_allocator_backing(0x20_000, 4);
         let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
         let key = authority
@@ -983,7 +1302,8 @@ mod tests {
                 ceiling,
             )
             .unwrap();
-        (key, creation)
+        let owner = registry.creation_into_internal(creation).unwrap();
+        (key, owner)
     }
 
     #[allow(
@@ -992,11 +1312,30 @@ mod tests {
     )]
     fn mapping<const OBJECTS: usize, const LEASES: usize>(
         authority: &MemoryObjectAuthority<OBJECTS, LEASES>,
+        registry: &mut ObjectRegistry<OBJECTS>,
+        owner: &InternalRef,
         object: MemoryObjectKey,
+        address_space: AddressSpaceKey,
+        region: RegionKey,
         ceiling: MemoryProtection,
-    ) -> CapturedMappingAuthority {
-        let _ = authority;
-        CapturedMappingAuthority { object, ceiling }
+    ) -> (CapturedMappingAuthority, MapAuthorization) {
+        let authorization = unsafe {
+            authority
+                .issue_map_authorization(registry, owner, object, address_space, region, ceiling)
+                .unwrap()
+        };
+        let captured = authorization.capture(address_space, region).unwrap();
+        (captured, authorization)
+    }
+
+    fn only_final<const CAPACITY: usize>(releases: MappingFinalReleases<CAPACITY>) -> FinalRelease {
+        assert_eq!(releases.len(), 1);
+        releases
+            .into_items()
+            .into_iter()
+            .flatten()
+            .next()
+            .expect("one final release was reported")
     }
 
     #[allow(
@@ -1018,7 +1357,7 @@ mod tests {
     fn allocator_grant_preserves_exact_and_rounded_lengths() {
         let mut registry = ObjectRegistry::<2>::new();
         let mut authority = MemoryObjectAuthority::<2, 4>::new();
-        let (key, _creation) = grant(
+        let (key, _owner) = grant(
             &mut authority,
             &mut registry,
             PAGE_SIZE + 1,
@@ -1114,7 +1453,7 @@ mod tests {
         let (space, region) = ids();
         let mut registry = ObjectRegistry::<2>::new();
         let mut authority = MemoryObjectAuthority::<2, 4>::new();
-        let (key, _creation) = grant(
+        let (key, owner) = grant(
             &mut authority,
             &mut registry,
             PAGE_SIZE + 1,
@@ -1123,9 +1462,18 @@ mod tests {
         let info = authority.object_info(key).unwrap();
         assert_eq!(info.logical_byte_len(), PAGE_SIZE + 1);
         assert_eq!(info.rounded_byte_len(), PAGE_SIZE * 2);
-        let token = mapping(&authority, key, MemoryProtection::READ_WRITE);
-        authority
-            .prepare_replace::<1>(
+        let (token, authorization) = mapping(
+            &authority,
+            &mut registry,
+            &owner,
+            key,
+            space,
+            region,
+            MemoryProtection::READ_WRITE,
+        );
+        let prepared = authority
+            .prepare_replace::<1, 2>(
+                &mut registry,
                 space,
                 region,
                 &[],
@@ -1137,9 +1485,10 @@ mod tests {
                     PAGE_SIZE,
                     MemoryProtection::READ,
                 )],
+                Some(authorization),
             )
-            .unwrap()
-            .commit();
+            .unwrap();
+        assert!(prepared.commit().is_empty());
         assert_eq!(authority.active_lease_count(), 1);
     }
 
@@ -1148,17 +1497,25 @@ mod tests {
         let (space, region) = ids();
         let mut registry = ObjectRegistry::<2>::new();
         let mut authority = MemoryObjectAuthority::<2, 4>::new();
-        let (key, _creation) = grant(
+        let (key, owner) = grant(
             &mut authority,
             &mut registry,
             PAGE_SIZE * 2,
             MemoryProtection::READ_WRITE_EXECUTE,
         );
-        let read = mapping(&authority, key, MemoryProtection::READ);
-        let read_write = mapping(&authority, key, MemoryProtection::READ_WRITE);
-        let read_write_execute = mapping(&authority, key, MemoryProtection::READ_WRITE_EXECUTE);
-        assert!(matches!(
-            authority.prepare_replace::<2>(
+
+        let (read, authorization) = mapping(
+            &authority,
+            &mut registry,
+            &owner,
+            key,
+            space,
+            region,
+            MemoryProtection::READ,
+        );
+        let error = authority
+            .prepare_replace::<2, 2>(
+                &mut registry,
                 space,
                 region,
                 &[],
@@ -1170,11 +1527,25 @@ mod tests {
                     PAGE_SIZE,
                     MemoryProtection::READ,
                 )],
-            ),
-            Err(MemoryObjectError::Unaligned)
-        ));
+                Some(authorization),
+            )
+            .err()
+            .expect("mapping preparation must fail");
+        assert_eq!(error.error(), MemoryObjectError::Unaligned);
+        assert!(error.into_final_releases().is_empty());
+
+        let (read_write, authorization) = mapping(
+            &authority,
+            &mut registry,
+            &owner,
+            key,
+            space,
+            region,
+            MemoryProtection::READ_WRITE,
+        );
         let prepared = authority
-            .prepare_replace::<2>(
+            .prepare_replace::<2, 2>(
+                &mut registry,
                 space,
                 region,
                 &[],
@@ -1186,26 +1557,41 @@ mod tests {
                     PAGE_SIZE,
                     MemoryProtection::READ_WRITE,
                 )],
+                Some(authorization),
             )
             .unwrap();
-        prepared.commit();
+        assert!(prepared.commit().is_empty());
         assert_eq!(authority.active_lease_count(), 1);
-        assert!(matches!(
-            authority.prepare_replace::<2>(
+
+        let (read_execute, authorization) = mapping(
+            &authority,
+            &mut registry,
+            &owner,
+            key,
+            space,
+            region,
+            MemoryProtection::READ_WRITE_EXECUTE,
+        );
+        let error = authority
+            .prepare_replace::<2, 2>(
+                &mut registry,
                 space,
                 region,
                 &[],
                 &[LeaseRequest::new(
                     space,
                     region,
-                    read_write_execute,
+                    read_execute,
                     PAGE_SIZE,
                     PAGE_SIZE,
                     MemoryProtection::READ_EXECUTE,
                 )],
-            ),
-            Err(MemoryObjectError::WritableExecutableAlias)
-        ));
+                Some(authorization),
+            )
+            .err()
+            .expect("mapping preparation must fail");
+        assert_eq!(error.error(), MemoryObjectError::WritableExecutableAlias);
+        assert!(error.into_final_releases().is_empty());
         assert_eq!(authority.active_lease_count(), 1);
     }
 
@@ -1214,15 +1600,24 @@ mod tests {
         let (space, region) = ids();
         let mut registry = ObjectRegistry::<2>::new();
         let mut authority = MemoryObjectAuthority::<2, 2>::new();
-        let (key, _creation) = grant(
+        let (key, owner) = grant(
             &mut authority,
             &mut registry,
             PAGE_SIZE,
             MemoryProtection::READ_WRITE,
         );
-        let read_write = mapping(&authority, key, MemoryProtection::READ_WRITE);
-        assert!(matches!(
-            authority.prepare_replace::<1>(
+        let (read_write, authorization) = mapping(
+            &authority,
+            &mut registry,
+            &owner,
+            key,
+            space,
+            region,
+            MemoryProtection::READ_WRITE,
+        );
+        let error = authority
+            .prepare_replace::<1, 2>(
+                &mut registry,
                 space,
                 region,
                 &[],
@@ -1234,9 +1629,274 @@ mod tests {
                     PAGE_SIZE,
                     MemoryProtection::READ_EXECUTE,
                 )],
+                Some(authorization),
+            )
+            .err()
+            .expect("mapping preparation must fail");
+        assert_eq!(error.error(), MemoryObjectError::ProtectionCeiling);
+        assert!(error.into_final_releases().is_empty());
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "the test exercises the temporary rights-validation seam while proving D4 lifetime transfer"
+    )]
+    fn authorization_pin_transfers_to_lease_and_final_unmap_reclaims_backing() {
+        let mut roles =
+            crate::memory::frame_roles::synthetic_frame_role_manager::<1, 8>(0x10_000, 4);
+        let allocation = roles.allocate(1).unwrap();
+        let physical_start = allocation.physical_start();
+        let zeroed = unsafe { roles.assume_zeroed(allocation) }.unwrap();
+        let backing = roles.assign_object_backing(zeroed).unwrap();
+
+        let mut registry = ObjectRegistry::<1>::new();
+        let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+        let mut authority = MemoryObjectAuthority::<1, 2>::new();
+        let key = authority
+            .grant_backing(
+                &creation,
+                backing,
+                PAGE_SIZE,
+                MemoryObjectKind::PageBacked,
+                MemoryProtection::READ_WRITE,
+            )
+            .unwrap();
+        let owner = registry.creation_into_internal(creation).unwrap();
+        let (space, region) = ids();
+        let authorization = unsafe {
+            authority
+                .issue_map_authorization(
+                    &mut registry,
+                    &owner,
+                    key,
+                    space,
+                    region,
+                    MemoryProtection::READ_WRITE,
+                )
+                .unwrap()
+        };
+        let captured = authorization.capture(space, region).unwrap();
+        let prepared = authority
+            .prepare_replace::<1, 1>(
+                &mut registry,
+                space,
+                region,
+                &[],
+                &[LeaseRequest::new(
+                    space,
+                    region,
+                    captured,
+                    0,
+                    PAGE_SIZE,
+                    MemoryProtection::READ,
+                )],
+                Some(authorization),
+            )
+            .unwrap();
+        let lease = prepared.tickets()[0].unwrap().lease();
+        assert!(prepared.commit().is_empty());
+        assert_eq!(authority.active_lease_count(), 1);
+
+        assert!(registry.release_internal(owner).unwrap().is_none());
+        let prepared = authority
+            .prepare_replace::<1, 1>(&mut registry, space, region, &[lease], &[], None)
+            .unwrap();
+        let final_release = only_final(prepared.commit());
+        let finalization = authority.take_finalization(final_release).unwrap();
+        complete_memory_finalization(&mut registry, &mut roles, finalization);
+        let recycled = roles.allocate(1).unwrap();
+        assert_eq!(recycled.physical_start(), physical_start);
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "the test exercises the temporary rights-validation seam while proving failed authorization rollback"
+    )]
+    fn failed_mapping_preparation_drops_last_authorization_pin() {
+        let mut roles =
+            crate::memory::frame_roles::synthetic_frame_role_manager::<1, 8>(0x10_000, 4);
+        let allocation = roles.allocate(1).unwrap();
+        let physical_start = allocation.physical_start();
+        let zeroed = unsafe { roles.assume_zeroed(allocation) }.unwrap();
+        let backing = roles.assign_object_backing(zeroed).unwrap();
+        let mut registry = ObjectRegistry::<1>::new();
+        let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+        let mut authority = MemoryObjectAuthority::<1, 1>::new();
+        let key = authority
+            .grant_backing(
+                &creation,
+                backing,
+                PAGE_SIZE,
+                MemoryObjectKind::PageBacked,
+                MemoryProtection::READ_WRITE,
+            )
+            .unwrap();
+        let owner = registry.creation_into_internal(creation).unwrap();
+        let (space, region) = ids();
+        let authorization = unsafe {
+            authority
+                .issue_map_authorization(
+                    &mut registry,
+                    &owner,
+                    key,
+                    space,
+                    region,
+                    MemoryProtection::READ_WRITE,
+                )
+                .unwrap()
+        };
+        let captured = authorization.capture(space, region).unwrap();
+        assert!(registry.release_internal(owner).unwrap().is_none());
+
+        let error = authority
+            .prepare_replace::<1, 1>(
+                &mut registry,
+                space,
+                region,
+                &[],
+                &[LeaseRequest::new(
+                    space,
+                    region,
+                    captured,
+                    1,
+                    PAGE_SIZE,
+                    MemoryProtection::READ,
+                )],
+                Some(authorization),
+            )
+            .err()
+            .expect("unaligned mapping preparation must fail");
+        assert_eq!(error.error(), MemoryObjectError::Unaligned);
+        let final_release = only_final(error.into_final_releases());
+        let finalization = authority.take_finalization(final_release).unwrap();
+        complete_memory_finalization(&mut registry, &mut roles, finalization);
+        let recycled = roles.allocate(1).unwrap();
+        assert_eq!(recycled.physical_start(), physical_start);
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "the test exercises the temporary rights-validation seam while proving split-delta rollback and commit"
+    )]
+    fn mapping_split_retains_positive_delta_and_rollback_is_exact() {
+        let mut roles =
+            crate::memory::frame_roles::synthetic_frame_role_manager::<1, 8>(0x10_000, 4);
+        let allocation = roles.allocate(2).unwrap();
+        let zeroed = unsafe { roles.assume_zeroed(allocation) }.unwrap();
+        let backing = roles.assign_object_backing(zeroed).unwrap();
+        let mut registry = ObjectRegistry::<1>::new();
+        let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+        let mut authority = MemoryObjectAuthority::<1, 4>::new();
+        let key = authority
+            .grant_backing(
+                &creation,
+                backing,
+                PAGE_SIZE * 2,
+                MemoryObjectKind::PageBacked,
+                MemoryProtection::READ_WRITE,
+            )
+            .unwrap();
+        let owner = registry.creation_into_internal(creation).unwrap();
+        let (space, region) = ids();
+        let authorization = unsafe {
+            authority
+                .issue_map_authorization(
+                    &mut registry,
+                    &owner,
+                    key,
+                    space,
+                    region,
+                    MemoryProtection::READ_WRITE,
+                )
+                .unwrap()
+        };
+        let captured = authorization.capture(space, region).unwrap();
+        let prepared = authority
+            .prepare_replace::<2, 1>(
+                &mut registry,
+                space,
+                region,
+                &[],
+                &[LeaseRequest::new(
+                    space,
+                    region,
+                    captured,
+                    0,
+                    PAGE_SIZE * 2,
+                    MemoryProtection::READ,
+                )],
+                Some(authorization),
+            )
+            .unwrap();
+        let whole_lease = prepared.tickets()[0].unwrap().lease();
+        assert!(prepared.commit().is_empty());
+        assert_eq!(authority.active_lease_count(), 1);
+
+        let split_requests = [
+            LeaseRequest::new(
+                space,
+                region,
+                captured,
+                0,
+                PAGE_SIZE,
+                MemoryProtection::READ,
             ),
-            Err(MemoryObjectError::ProtectionCeiling)
-        ));
+            LeaseRequest::new(
+                space,
+                region,
+                captured,
+                PAGE_SIZE,
+                PAGE_SIZE,
+                MemoryProtection::READ,
+            ),
+        ];
+        let prepared = authority
+            .prepare_replace::<2, 1>(
+                &mut registry,
+                space,
+                region,
+                &[whole_lease],
+                &split_requests,
+                None,
+            )
+            .unwrap();
+        assert!(prepared.rollback().is_empty());
+        assert_eq!(authority.active_lease_count(), 1);
+
+        assert!(registry.release_internal(owner).unwrap().is_none());
+        let prepared = authority
+            .prepare_replace::<2, 1>(
+                &mut registry,
+                space,
+                region,
+                &[whole_lease],
+                &split_requests,
+                None,
+            )
+            .unwrap();
+        let first_split = prepared.tickets()[0].unwrap().lease();
+        let second_split = prepared.tickets()[1].unwrap().lease();
+        assert!(prepared.commit().is_empty());
+        assert_eq!(authority.active_lease_count(), 2);
+
+        let prepared = authority
+            .prepare_replace::<2, 1>(
+                &mut registry,
+                space,
+                region,
+                &[first_split, second_split],
+                &[],
+                None,
+            )
+            .unwrap();
+        let final_release = only_final(prepared.commit());
+        assert_eq!(authority.active_lease_count(), 0);
+        let finalization = authority.take_finalization(final_release).unwrap();
+        complete_memory_finalization(&mut registry, &mut roles, finalization);
+        assert!(registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).is_ok());
     }
 
     #[test]
@@ -1321,7 +1981,10 @@ mod tests {
             )
             .unwrap();
         let event_final = registry.release_creation(event).unwrap().unwrap();
-        let error = authority.take_finalization(event_final).unwrap_err();
+        let error = authority
+            .take_finalization(event_final)
+            .err()
+            .expect("mapping preparation must fail");
         assert_eq!(error.error(), MemoryObjectError::FinalizationMismatch);
         let event_final = error.into_final_release();
         registry.complete_finalization(event_final).unwrap();
@@ -1331,19 +1994,43 @@ mod tests {
     #[test]
     fn empty_replacements_and_sentinels_never_enter_lease_transitions() {
         let (space, region) = ids();
+        let mut registry = ObjectRegistry::<1>::new();
         let mut authority = MemoryObjectAuthority::<1, 1>::new();
-        assert!(matches!(
-            authority.prepare_replace::<1>(space, region, &[], &[]),
-            Err(MemoryObjectError::Empty)
-        ));
-        assert!(matches!(
-            authority.prepare_replace::<1>(space, region, &[], &[LeaseRequest::EMPTY]),
-            Err(MemoryObjectError::ForeignLease)
-        ));
-        assert!(matches!(
-            authority.prepare_replace::<1>(AddressSpaceKey::EMPTY, RegionKey::EMPTY, &[], &[],),
-            Err(MemoryObjectError::ForeignLease)
-        ));
+
+        let error = authority
+            .prepare_replace::<1, 1>(&mut registry, space, region, &[], &[], None)
+            .err()
+            .expect("mapping preparation must fail");
+        assert_eq!(error.error(), MemoryObjectError::Empty);
+        assert!(error.into_final_releases().is_empty());
+
+        let error = authority
+            .prepare_replace::<1, 1>(
+                &mut registry,
+                space,
+                region,
+                &[],
+                &[LeaseRequest::EMPTY],
+                None,
+            )
+            .err()
+            .expect("mapping preparation must fail");
+        assert_eq!(error.error(), MemoryObjectError::ForeignLease);
+        assert!(error.into_final_releases().is_empty());
+
+        let error = authority
+            .prepare_replace::<1, 1>(
+                &mut registry,
+                AddressSpaceKey::EMPTY,
+                RegionKey::EMPTY,
+                &[],
+                &[],
+                None,
+            )
+            .err()
+            .expect("mapping preparation must fail");
+        assert_eq!(error.error(), MemoryObjectError::ForeignLease);
+        assert!(error.into_final_releases().is_empty());
         assert_eq!(authority.active_lease_count(), 0);
     }
 }

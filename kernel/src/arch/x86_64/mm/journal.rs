@@ -1945,7 +1945,7 @@ mod tests {
                 Protection::READ_WRITE_EXECUTE,
             )
             .unwrap();
-        let _object_owner = registry.creation_into_internal(creation).unwrap();
+        let object_owner = registry.creation_into_internal(creation).unwrap();
 
         let mut spaces = unsafe { AddressSpaceAuthority::<1, 1>::new() };
         let address_space = spaces.create_address_space().unwrap();
@@ -1968,25 +1968,34 @@ mod tests {
             .unwrap();
             let authorization = unsafe {
                 region
-                    .authorize_map(&objects, object, Protection::READ_WRITE_EXECUTE)
+                    .authorize_map(
+                        &objects,
+                        &mut registry,
+                        &object_owner,
+                        object,
+                        Protection::READ_WRITE_EXECUTE,
+                    )
                     .unwrap()
             };
-            assert!(matches!(
-                region.map(
+            let failure = region
+                .map(
                     &mut objects,
+                    &mut registry,
                     &mut limited,
                     0x4000,
                     authorization,
                     0,
                     BASE_PAGE_SIZE * 2,
                     Protection::READ_WRITE,
-                ),
-                Err(
-                    crate::memory::address_region::AddressSpaceTransactionError::Publish(
-                        X86AddressSpacePublishError::Capacity
-                    )
+                )
+                .unwrap_err();
+            assert!(matches!(
+                failure.error(),
+                crate::memory::address_region::AddressSpaceTransactionError::Publish(
+                    X86AddressSpacePublishError::Capacity
                 )
             ));
+            assert!(failure.into_final_releases().is_empty());
         }
         assert!(region.mappings().iter().all(Option::is_none));
         assert_eq!(objects.active_lease_count(), 0);
@@ -2009,79 +2018,119 @@ mod tests {
 
             let authorization = unsafe {
                 region
-                    .authorize_map(&objects, object, Protection::READ_WRITE_EXECUTE)
+                    .authorize_map(
+                        &objects,
+                        &mut registry,
+                        &object_owner,
+                        object,
+                        Protection::READ_WRITE_EXECUTE,
+                    )
                     .unwrap()
             };
-            region
-                .map(
-                    &mut objects,
-                    &mut publisher,
-                    0x4000,
-                    authorization,
-                    0,
-                    BASE_PAGE_SIZE * 2,
-                    Protection::READ_WRITE,
-                )
-                .unwrap();
-            region
-                .unmap(&mut objects, &mut publisher, 0x4000, BASE_PAGE_SIZE)
-                .unwrap();
-            region
-                .protect(
-                    &mut objects,
-                    &mut publisher,
-                    0x5000,
-                    BASE_PAGE_SIZE,
-                    Protection::READ_EXECUTE,
-                )
-                .unwrap();
+            assert!(
+                region
+                    .map(
+                        &mut objects,
+                        &mut registry,
+                        &mut publisher,
+                        0x4000,
+                        authorization,
+                        0,
+                        BASE_PAGE_SIZE * 2,
+                        Protection::READ_WRITE,
+                    )
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                region
+                    .unmap(
+                        &mut objects,
+                        &mut registry,
+                        &mut publisher,
+                        0x4000,
+                        BASE_PAGE_SIZE,
+                    )
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                region
+                    .protect(
+                        &mut objects,
+                        &mut registry,
+                        &mut publisher,
+                        0x5000,
+                        BASE_PAGE_SIZE,
+                        Protection::READ_EXECUTE,
+                    )
+                    .unwrap()
+                    .is_empty()
+            );
             assert_eq!(region.mappings().iter().flatten().count(), 1);
             assert_eq!(objects.active_lease_count(), 1);
 
             publisher.target.fail_apply = true;
             let authorization = unsafe {
                 region
-                    .authorize_map(&objects, object, Protection::READ_EXECUTE)
+                    .authorize_map(
+                        &objects,
+                        &mut registry,
+                        &object_owner,
+                        object,
+                        Protection::READ_EXECUTE,
+                    )
                     .unwrap()
             };
-            assert!(matches!(
-                region.map(
+            let failure = region
+                .map(
                     &mut objects,
+                    &mut registry,
                     &mut publisher,
                     0x4000,
                     authorization,
                     0,
                     BASE_PAGE_SIZE,
                     Protection::READ_EXECUTE,
-                ),
-                Err(
-                    crate::memory::address_region::AddressSpaceTransactionError::Publish(
-                        X86AddressSpacePublishError::Journal(
-                            OwnedPageTableJournalError::Target(())
-                        )
-                    )
+                )
+                .unwrap_err();
+            assert!(matches!(
+                failure.error(),
+                crate::memory::address_region::AddressSpaceTransactionError::Publish(
+                    X86AddressSpacePublishError::Journal(OwnedPageTableJournalError::Target(()))
                 )
             ));
+            assert!(failure.into_final_releases().is_empty());
             assert_eq!(region.mappings().iter().flatten().count(), 1);
             assert_eq!(objects.active_lease_count(), 1);
 
             publisher.target.fail_apply = false;
             let authorization = unsafe {
                 region
-                    .authorize_map(&objects, object, Protection::READ_EXECUTE)
+                    .authorize_map(
+                        &objects,
+                        &mut registry,
+                        &object_owner,
+                        object,
+                        Protection::READ_EXECUTE,
+                    )
                     .unwrap()
             };
-            region
-                .map(
-                    &mut objects,
-                    &mut publisher,
-                    0x4000,
-                    authorization,
-                    0,
-                    BASE_PAGE_SIZE,
-                    Protection::READ_EXECUTE,
-                )
-                .unwrap();
+            assert!(
+                region
+                    .map(
+                        &mut objects,
+                        &mut registry,
+                        &mut publisher,
+                        0x4000,
+                        authorization,
+                        0,
+                        BASE_PAGE_SIZE,
+                        Protection::READ_EXECUTE,
+                    )
+                    .unwrap()
+                    .is_empty()
+            );
         }
 
         let slot_zero = region.mappings()[0].expect("first mapping slot remains published");

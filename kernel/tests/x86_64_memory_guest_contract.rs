@@ -92,11 +92,9 @@ fn c3_test_authority_is_target_only_linear_and_nonescaping() {
     assert!(activation.contains("pub(crate) fn run_memory_foundation_test(\n        mut self,"));
     assert!(activation.contains(") -> ! {\n        let authority = &mut ActiveRootTestAuthority"));
     assert!(activation.contains("fn run_mapped_case(&mut self, test:"));
-    assert!(
-        activation.contains(
-            ") -> ! {\n        use crate::memory::address_region::AddressSpaceAuthority;"
-        )
-    );
+    assert!(activation.contains(
+        "use crate::memory::address_region::{\n            AddressSpaceAuthority, AddressSpaceTransactionFailure,"
+    ));
     assert!(activation.contains("let result = (|| -> Result<(), u32> {"));
     assert!(activation.contains("Ok(()) => crate::test_support::complete_pass(0)"));
     assert!(activation.contains("Err(detail) => crate::test_support::complete_fail(detail)"));
