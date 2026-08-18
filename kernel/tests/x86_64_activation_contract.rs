@@ -136,10 +136,13 @@ fn c2_kernel_image_exclusion_precedes_first_table_allocation() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let activation = fs::read_to_string(manifest_dir.join("src/arch/x86_64/mm/activation.rs"))
         .expect("read live activation source");
-    let builder_start = activation
+    let builder = fs::read_to_string(manifest_dir.join("src/arch/x86_64/mm/activation/build.rs"))
+        .expect("read production inactive-root builder");
+    assert!(activation.contains("#[path = \"activation/build.rs\"]"));
+    let builder_start = builder
         .find("fn build_and_bind_deep_root<")
         .expect("production inactive-root builder");
-    let builder = &activation[builder_start..];
+    let builder = &builder[builder_start..];
     let boundary = builder
         .find("validate_kernel_boot_boundary(memory_witness, &declarations)")
         .expect("normalized RESERVED and bootstrap-reservation witness validation");
