@@ -61,7 +61,7 @@ fn memory_authority_compile_fail_contracts() {
         },
         CompileFailCase {
             fixture: "map_authorization_clone.rs",
-            expected_error: "error[E0277]: the trait bound `MapAuthorization: Clone` is not satisfied",
+            expected_error: "error[E0277]: the trait bound `vm::object::MapAuthorization: Clone` is not satisfied",
         },
     ];
 
