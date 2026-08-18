@@ -15,7 +15,7 @@ use deepwyrm_abi::{
 use crate::memory::object::MemoryObjectAuthority;
 use crate::object::{FinalRelease, ObjectRegistry};
 
-use super::{AcceptedObjectTypes, HandleTable, HandleTableError, ResolvedHandle};
+use crate::handle::{AcceptedObjectTypes, HandleTable, HandleTableError, ResolvedHandle};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ObjectInfoResult {

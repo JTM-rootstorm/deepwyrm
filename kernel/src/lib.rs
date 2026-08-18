@@ -22,6 +22,12 @@ pub mod memory;
     reason = "DW0-D5 consumes generic lifetime primitives ahead of DW0-E process/syscall ownership"
 )]
 pub(crate) mod object;
+#[path = "handle/service.rs"]
+#[allow(
+    dead_code,
+    reason = "DW0-D5 services precede their DW0-E syscall adapters"
+)]
+pub(crate) mod service;
 
 #[cfg(feature = "test-support")]
 pub mod test_support;

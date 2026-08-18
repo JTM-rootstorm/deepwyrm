@@ -1,14 +1,8 @@
 //! Caller-local DW0-D handle table and generated-rights validation.
 
 mod rights;
-mod service;
 mod table;
 
-#[allow(
-    unused_imports,
-    reason = "DW0-D5 services precede their DW0-E syscall adapters"
-)]
-pub(crate) use service::{ObjectInfoResult, handle_close, handle_duplicate, object_get_info_v1};
 #[allow(
     unused_imports,
     reason = "DW0-D4/D5 consume core table types while process ownership arrives in DW0-E"
