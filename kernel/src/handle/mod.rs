@@ -3,6 +3,9 @@
 mod rights;
 mod table;
 
+#[cfg(test)]
+mod model_tests;
+
 #[allow(
     unused_imports,
     reason = "DW0-D4/D5 consume core table types while process ownership arrives in DW0-E"

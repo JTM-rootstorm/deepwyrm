@@ -2155,6 +2155,68 @@ mod tests {
     }
 
     #[test]
+    fn d6_handle_close_and_mapping_commit_interleavings_preserve_backing() {
+        let full = deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT);
+
+        for close_before_authorization in [false, true] {
+            let (mut roles, mut registry, mut authority, mut table, _key, source, physical_start) =
+                handled_object::<1>(full, MemoryProtection::READ_WRITE);
+            let (space, region) = ids();
+            let resolved = table
+                .lookup(
+                    &mut registry,
+                    source,
+                    AcceptedObjectTypes::One(DW_OBJECT_TYPE_MEMORY_OBJECT),
+                    DwRights(0),
+                )
+                .unwrap();
+
+            if close_before_authorization {
+                assert!(table.close(&mut registry, source).unwrap().is_none());
+            }
+            let authorization = authority
+                .issue_map_authorization(resolved, space, region, MemoryProtection::READ)
+                .unwrap();
+            let captured = authorization.capture(space, region).unwrap();
+            let prepared = authority
+                .prepare_replace::<1, 2>(
+                    &mut registry,
+                    space,
+                    region,
+                    &[],
+                    &[LeaseRequest::new(
+                        space,
+                        region,
+                        captured,
+                        0,
+                        PAGE_SIZE,
+                        MemoryProtection::READ,
+                    )],
+                    Some(authorization),
+                )
+                .unwrap();
+            let lease = prepared.tickets()[0].unwrap().lease();
+            assert!(prepared.commit().is_empty());
+            assert_eq!(authority.active_lease_count(), 1);
+
+            if !close_before_authorization {
+                assert!(table.close(&mut registry, source).unwrap().is_none());
+            }
+            assert_eq!(
+                table.lookup(&mut registry, source, AcceptedObjectTypes::Any, DwRights(0)),
+                Err(HandleTableError::InvalidHandle)
+            );
+
+            let prepared = authority
+                .prepare_replace::<1, 2>(&mut registry, space, region, &[lease], &[], None)
+                .unwrap();
+            let final_release = only_final(prepared.commit());
+            complete_memory_release(&mut registry, &mut authority, &mut roles, final_release);
+            assert_eq!(roles.allocate(1).unwrap().physical_start(), physical_start);
+        }
+    }
+
+    #[test]
     #[allow(
         unsafe_code,
         reason = "test manager models complete physical zeroing before typed backing assignment"
