@@ -47,6 +47,8 @@ const TASK_HOST_TEST_FILTERS: &[&str] = &[
     "task::tests::",
     "task::scheduler::tests::",
     "task::execution::tests::",
+    "arch::x86_64::syscall::tests::",
+    "arch::x86_64::exceptions::tests::",
     "object::finalizer::tests::",
     "object::finalizer::memory_route_tests::",
     "root_region_handle_close_preserves_address_space_until_process_exit",
@@ -55,6 +57,8 @@ const TASK_HOST_INTEGRATION_TESTS: &[&str] = &[
     "task_authority_ui",
     "x86_64_activation_contract",
     "x86_64_entry_contract",
+    "x86_64_syscall_contract",
+    "x86_64_exception_contract",
     "x86_64_memory_guest_contract",
 ];
 const HARNESS_CONFIG: &str = "tooling/guest-harness.toml";

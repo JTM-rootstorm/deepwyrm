@@ -144,6 +144,8 @@ fn task_host_gate_covers_scheduler_resources_and_target_guard_contracts() {
         "task::tests::",
         "task::scheduler::tests::",
         "task::execution::tests::",
+        "arch::x86_64::syscall::tests::",
+        "arch::x86_64::exceptions::tests::",
         "object::finalizer::tests::",
         "root_region_handle_close_preserves_address_space_until_process_exit",
     ] {
@@ -155,6 +157,8 @@ fn task_host_gate_covers_scheduler_resources_and_target_guard_contracts() {
             "task_authority_ui",
             "x86_64_activation_contract",
             "x86_64_entry_contract",
+            "x86_64_syscall_contract",
+            "x86_64_exception_contract",
             "x86_64_memory_guest_contract",
         ]
     );
