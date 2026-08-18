@@ -28,6 +28,11 @@ pub(crate) mod object;
     reason = "DW0-D5 services precede their DW0-E syscall adapters"
 )]
 pub(crate) mod service;
+#[allow(
+    dead_code,
+    reason = "DW0-E1 syscall decoding precedes E4 architecture entry and E5 handler integration"
+)]
+pub(crate) mod syscall;
 
 #[cfg(feature = "test-support")]
 pub mod test_support;
