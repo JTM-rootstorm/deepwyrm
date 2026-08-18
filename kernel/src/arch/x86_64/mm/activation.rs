@@ -858,6 +858,9 @@ fn validate_execution_carriers(
         task_register: crate::arch::x86_64::gdt::KERNEL_TSS_SELECTOR.bits(),
         ist: descriptors.ist,
         installed_ist_tops: descriptors.installed_ist_tops,
+        privilege_entry: crate::arch::x86_64::linked_privilege_entry_stack_layout()
+            .map_err(|_| LiveActivationError::InvalidKernelLayout)?,
+        installed_privilege_stack0: descriptors.privilege_stack0,
     };
     if !execution_carriers_match(cpu, segments, facts) {
         return Err(LiveActivationError::WrongControlState);
@@ -932,10 +935,20 @@ fn execution_carriers_match(
             && stack.bottom < stack.top
             && range_avoids_ist_guards(facts.ist, stack.bottom, stack.top)
     });
+    let privilege_entry_retained = facts.privilege_entry.bottom >= writable.start
+        && facts.privilege_entry.top <= writable.end
+        && facts.privilege_entry.bottom < facts.privilege_entry.top
+        && facts.installed_privilege_stack0 == facts.privilege_entry.top
+        && range_avoids_ist_guards(
+            facts.ist,
+            facts.privilege_entry.bottom,
+            facts.privilege_entry.top,
+        );
     stack_has_headroom
         && facts.ist.has_exact_shape()
         && ist_tops_match
         && ist_stacks_retained
+        && privilege_entry_retained
         && cpu.code_selector == facts.code_selector
         && cpu.gdt_base == facts.gdt_base
         && cpu.gdt_limit == facts.gdt_limit
@@ -1020,6 +1033,8 @@ unsafe impl<'a, 'handoff, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
             .map_err(|_| LiveActivationError::InvalidKernelLayout)?;
         let thread_stacks = crate::arch::x86_64::linked_thread_kernel_stack_layout()
             .map_err(|_| LiveActivationError::InvalidKernelLayout)?;
+        let privilege_entry = crate::arch::x86_64::linked_privilege_entry_stack_layout()
+            .map_err(|_| LiveActivationError::InvalidKernelLayout)?;
         let carrier_cpu = unsafe { observe_activation_cpu(handoff.capabilities()) }?;
         validate_live_observation(carrier_cpu, handoff)?;
         validate_execution_carriers(carrier_cpu, &segments)?;
@@ -1037,6 +1052,7 @@ unsafe impl<'a, 'handoff, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
             &segments,
             ist,
             &thread_stacks,
+            privilege_entry,
             capabilities,
             graph_pending,
             graph_visited,

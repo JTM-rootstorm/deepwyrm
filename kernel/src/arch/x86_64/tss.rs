@@ -53,6 +53,25 @@ impl TaskStateSegment {
         Ok(())
     }
 
+    /// Reads the installed CPL3-to-CPL0 privilege stack top.
+    #[must_use]
+    #[cfg_attr(
+        not(any(test, all(target_os = "none", target_arch = "x86_64"))),
+        allow(
+            dead_code,
+            reason = "RSP0 is consumed only by target privilege-entry validation"
+        )
+    )]
+    #[allow(
+        unsafe_code,
+        reason = "the packed hardware TSS requires an unaligned value read without forming a reference"
+    )]
+    pub(crate) fn privilege_stack0(&self) -> u64 {
+        let table = core::ptr::addr_of!(self.privilege_stack_table).cast::<u64>();
+        // SAFETY: slot zero exists in the packed TSS and this is a value-only read.
+        unsafe { table.read_unaligned() }
+    }
+
     /// Configures one architecturally numbered interrupt stack table entry.
     ///
     /// x86_64 IST entries are numbered one through seven in IDT gates.
@@ -154,6 +173,7 @@ mod tests {
             Err(StackConfigurationError::InvalidStackTop)
         );
         assert_eq!(tss.set_privilege_stack0(0x2000), Ok(()));
+        assert_eq!(tss.privilege_stack0(), 0x2000);
         assert_eq!(
             tss.set_interrupt_stack(InterruptStackIndex::Seven, 0x3000),
             Ok(())

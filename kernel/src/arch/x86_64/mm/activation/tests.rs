@@ -290,6 +290,7 @@ struct GraphFixture {
     capabilities: PagingCapabilities,
     segments: [KernelSegment; 3],
     ist: IstStackLayout,
+    privilege_entry: crate::memory::kernel_stack::KernelStackBounds,
 }
 
 impl GraphFixture {
@@ -311,6 +312,7 @@ impl GraphFixture {
             },
             &self.segments,
             self.ist,
+            self.privilege_entry,
             self.capabilities,
         )
     }
@@ -322,6 +324,12 @@ impl GraphFixture {
 )]
 fn graph_fixture() -> GraphFixture {
     let ist = test_ist_layout(FIXTURE_DATA + PAGE_SIZE);
+    let privilege_entry = crate::memory::kernel_stack::KernelStackBounds::new(
+        FIXTURE_DATA + 16 * PAGE_SIZE,
+        FIXTURE_DATA + 17 * PAGE_SIZE,
+        FIXTURE_DATA + 21 * PAGE_SIZE,
+    )
+    .unwrap();
     let segments = [
         KernelSegment {
             start: FIXTURE_TEXT,
@@ -335,7 +343,7 @@ fn graph_fixture() -> GraphFixture {
         },
         KernelSegment {
             start: FIXTURE_DATA,
-            end: FIXTURE_DATA + 16 * PAGE_SIZE,
+            end: FIXTURE_DATA + 21 * PAGE_SIZE,
             kind: SegmentKind::Writable,
         },
     ];
@@ -376,7 +384,7 @@ fn graph_fixture() -> GraphFixture {
         );
         add_path(&mut access.inactive, page, kernel_tables, physical | flags);
     }
-    for offset in 0..16 {
+    for offset in 0..21 {
         let page = FIXTURE_DATA + offset * PAGE_SIZE;
         let physical = 0x22_0000 + offset * PAGE_SIZE;
         let flags = PRESENT | WRITABLE | NO_EXECUTE;
@@ -386,7 +394,7 @@ fn graph_fixture() -> GraphFixture {
             transition_tables,
             physical | flags,
         );
-        if !is_ist_guard(ist, page) {
+        if !is_kernel_guard(ist, &[], privilege_entry, page) {
             add_path(&mut access.inactive, page, kernel_tables, physical | flags);
         }
     }
@@ -409,7 +417,7 @@ fn graph_fixture() -> GraphFixture {
                 KernelImageSegment::ReadOnlyData,
             ),
             (
-                PhysicalRange::new(0x22_0000, 16 * PAGE_SIZE).unwrap(),
+                PhysicalRange::new(0x22_0000, 21 * PAGE_SIZE).unwrap(),
                 KernelImageSegment::WritableData,
             ),
         ])
@@ -428,6 +436,7 @@ fn graph_fixture() -> GraphFixture {
         capabilities,
         segments,
         ist,
+        privilege_entry,
     }
 }
 
@@ -694,6 +703,15 @@ fn e3_thread_stack_layout_rejects_overlap_size_and_scratch_conflicts() {
     assert!(is_kernel_guard(
         test_ist_layout(writable_start + 2 * crate::memory::kernel_stack::E3_THREAD_STACK_STRIDE),
         &[first, second],
+        crate::memory::kernel_stack::KernelStackBounds::new(
+            writable_start + 3 * crate::memory::kernel_stack::E3_THREAD_STACK_STRIDE,
+            writable_start + 3 * crate::memory::kernel_stack::E3_THREAD_STACK_STRIDE + PAGE_SIZE,
+            writable_start
+                + 3 * crate::memory::kernel_stack::E3_THREAD_STACK_STRIDE
+                + PAGE_SIZE
+                + crate::memory::kernel_stack::E4_PRIVILEGE_ENTRY_STACK_SIZE
+        )
+        .unwrap(),
         second.guard_page
     ));
 
@@ -939,6 +957,12 @@ fn graph_capacity_rejects_before_any_leaf_or_scratch_access() {
             },
             &segments,
             test_ist_layout(MID_TWO),
+            crate::memory::kernel_stack::KernelStackBounds::new(
+                MID_TWO + 15 * PAGE_SIZE,
+                MID_TWO + 16 * PAGE_SIZE,
+                MID_TWO + 20 * PAGE_SIZE
+            )
+            .unwrap(),
             capabilities,
         ),
         Err(InactiveGraphError::Capacity)
@@ -1112,7 +1136,7 @@ fn stack_and_descriptor_carriers_reject_drift() {
         stack_pointer: 0xffff_8000_0000_5800,
         code_selector: 0x08,
         gdt_base: 0xffff_8000_0000_2100,
-        gdt_limit: 39,
+        gdt_limit: 55,
         idt_base: 0xffff_8000_0000_2200,
         idt_limit: 0x0fff,
         task_register: 0x18,
@@ -1149,6 +1173,13 @@ fn stack_and_descriptor_carriers_reject_drift() {
         task_register: 0x18,
         ist,
         installed_ist_tops: [ist_stacks[0].top, ist_stacks[1].top, ist_stacks[2].top],
+        privilege_entry: crate::memory::kernel_stack::KernelStackBounds::new(
+            0xffff_8000_0001_7000,
+            0xffff_8000_0001_8000,
+            0xffff_8000_0001_c000,
+        )
+        .unwrap(),
+        installed_privilege_stack0: 0xffff_8000_0001_c000,
     };
     assert!(execution_carriers_match(cpu, &segments, facts));
 
@@ -1180,6 +1211,11 @@ fn stack_and_descriptor_carriers_reject_drift() {
         ..facts
     };
     assert!(!execution_carriers_match(cpu, &segments, wrong_ist_top));
+    let wrong_rsp0 = ExecutionCarrierFacts {
+        installed_privilege_stack0: facts.privilege_entry.top - 16,
+        ..facts
+    };
+    assert!(!execution_carriers_match(cpu, &segments, wrong_rsp0));
     let crossing_idt = ExecutionCarrierFacts {
         idt_base: ist.double_fault.guard_page,
         ..facts

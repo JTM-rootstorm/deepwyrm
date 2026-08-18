@@ -232,17 +232,54 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 page = page.checked_add(PAGE_SIZE).ok_or(0x00ed_u32)?;
             }
         }
+        let privilege_entry =
+            crate::arch::x86_64::linked_privilege_entry_stack_layout().map_err(|_| 0x00ee_u32)?;
+        if !self.guard_leaf_is_exact_zero(privilege_entry.guard_page)? {
+            return Err(0x00ef);
+        }
+        let first = self.walk_leaf(privilege_entry.bottom)?;
+        let mut page = privilege_entry.bottom;
+        while page < privilege_entry.top {
+            let walk = self.walk_leaf(page)?;
+            let offset = page.checked_sub(privilege_entry.bottom).ok_or(0x00f0_u32)?;
+            if walk.physical_start != first.physical_start.checked_add(offset).ok_or(0x00f1_u32)?
+                || walk.user
+                || !walk.writable
+                || walk.executable
+                || walk.entry & !physical_mask(self.root.capabilities) & !HARDWARE_MUTABLE
+                    != PRESENT | WRITABLE | NO_EXECUTE
+                || self
+                    .roles
+                    .validate_kernel_image_page(
+                        walk.physical_start,
+                        KernelImageSegment::WritableData,
+                    )
+                    .is_err()
+            {
+                return Err(0x00f2);
+            }
+            payload_pages = payload_pages.checked_add(1).ok_or(0x00f3_u32)?;
+            page = page.checked_add(PAGE_SIZE).ok_or(0x00f4_u32)?;
+        }
         let expected_pages = 12_usize
             .checked_add(
                 crate::memory::kernel_stack::E3_THREAD_STACK_COUNT
                     * usize::try_from(
                         crate::memory::kernel_stack::E3_THREAD_STACK_SIZE / PAGE_SIZE,
                     )
-                    .map_err(|_| 0x00ee_u32)?,
+                    .map_err(|_| 0x00f5_u32)?,
             )
-            .ok_or(0x00ef_u32)?;
+            .and_then(|pages| {
+                pages.checked_add(
+                    usize::try_from(
+                        crate::memory::kernel_stack::E4_PRIVILEGE_ENTRY_STACK_SIZE / PAGE_SIZE,
+                    )
+                    .ok()?,
+                )
+            })
+            .ok_or(0x00f6_u32)?;
         if payload_pages != expected_pages {
-            return Err(0x00f0);
+            return Err(0x00f7);
         }
         Ok(())
     }

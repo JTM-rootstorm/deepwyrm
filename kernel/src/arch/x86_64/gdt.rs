@@ -15,6 +15,11 @@ pub const KERNEL_CODE_SELECTOR: SegmentSelector = SegmentSelector(0x08);
 pub const KERNEL_DATA_SELECTOR: SegmentSelector = SegmentSelector(0x10);
 /// Deepwyrm's available 64-bit TSS selector.
 pub const KERNEL_TSS_SELECTOR: SegmentSelector = SegmentSelector(0x18);
+/// DW0-E user writable-data selector (GDT index 5, RPL3).
+pub const USER_DATA_SELECTOR: SegmentSelector = SegmentSelector(0x2b);
+/// DW0-E user long-mode code selector (GDT index 6, RPL3).
+pub const USER_CODE_SELECTOR: SegmentSelector = SegmentSelector(0x33);
+pub(crate) const GDT_HARDWARE_LIMIT: u16 = (7 * size_of::<u64>() - 1) as u16;
 
 /// A selector in Deepwyrm's private GDT.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,10 +36,10 @@ impl SegmentSelector {
     }
 }
 
-/// Global descriptor table containing null, kernel code/data, and one TSS.
+/// Global descriptor table containing null, kernel code/data, one TSS, and DW0-E user data/code.
 #[repr(C, align(16))]
 pub struct GlobalDescriptorTable {
-    entries: [u64; 5],
+    entries: [u64; 7],
 }
 
 impl GlobalDescriptorTable {
@@ -49,13 +54,15 @@ impl GlobalDescriptorTable {
                 kernel_data_descriptor(),
                 tss_low,
                 tss_high,
+                user_data_descriptor(),
+                user_code_descriptor(),
             ],
         }
     }
 
     fn pointer(&self) -> DescriptorTablePointer {
         DescriptorTablePointer {
-            limit: (size_of::<Self>() - 1) as u16,
+            limit: GDT_HARDWARE_LIMIT,
             base: (self as *const Self).cast::<()>() as usize as u64,
         }
     }
@@ -120,6 +127,16 @@ const fn kernel_code_descriptor() -> u64 {
     0x00af_9a00_0000_ffff
 }
 
+const fn user_data_descriptor() -> u64 {
+    // Present, ring 3, writable data. RPL is supplied by the selector.
+    0x00cf_f200_0000_ffff
+}
+
+const fn user_code_descriptor() -> u64 {
+    // Present, ring 3, executable/readable 64-bit code.
+    0x00af_fa00_0000_ffff
+}
+
 const fn kernel_data_descriptor() -> u64 {
     // Present, ring 0, writable data. L is reserved for data descriptors;
     // D/B is set for conventional compatibility-mode behavior.
@@ -150,6 +167,20 @@ mod tests {
         assert_eq!(KERNEL_CODE_SELECTOR.bits(), 0x08);
         assert_eq!(KERNEL_DATA_SELECTOR.bits(), 0x10);
         assert_eq!(KERNEL_TSS_SELECTOR.bits(), 0x18);
+        assert_eq!(USER_DATA_SELECTOR.bits(), 0x2b);
+        assert_eq!(USER_CODE_SELECTOR.bits(), 0x33);
+    }
+
+    #[test]
+    fn user_descriptors_are_exact_dpl3_long_mode_contract() {
+        let tss = TaskStateSegment::empty();
+        let gdt = GlobalDescriptorTable::new(&tss);
+        assert_eq!(gdt.entries[5], 0x00cf_f200_0000_ffff);
+        assert_eq!(gdt.entries[6], 0x00af_fa00_0000_ffff);
+        let pointer = gdt.pointer();
+        let limit = pointer.limit;
+        assert_eq!(limit, GDT_HARDWARE_LIMIT);
+        assert_eq!(GDT_HARDWARE_LIMIT, 55);
     }
 
     #[test]

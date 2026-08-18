@@ -127,15 +127,19 @@ fn layout_manifest_is_exact_and_fails_closed_on_drift() {
 
 #[test]
 fn task_layout_manifest_is_kernel_private_exact_and_fails_closed_on_drift() {
-    let source = fs::read_to_string(task_layout_path()).expect("read E3 task layout manifest");
-    let layout = kernel_build::TaskLayout::parse(&source).expect("parse E3 task layout manifest");
+    let source = fs::read_to_string(task_layout_path()).expect("read E4 task layout manifest");
+    let layout = kernel_build::TaskLayout::parse(&source).expect("parse E4 task layout manifest");
     assert_eq!(layout.thread_kernel_stack_count, 16);
     assert_eq!(layout.thread_kernel_stack_size, 65_536);
     assert_eq!(layout.thread_kernel_stack_guard_size, 4_096);
     assert_eq!(layout.thread_kernel_stack_alignment, 4_096);
+    assert_eq!(layout.privilege_entry_stack_count, 1);
+    assert_eq!(layout.privilege_entry_stack_size, 16_384);
+    assert_eq!(layout.privilege_entry_stack_guard_size, 4_096);
+    assert_eq!(layout.privilege_entry_stack_alignment, 4_096);
     for malformed in [
         format!("{source}\nunknown_task_layout_key = 1\n"),
-        source.replace("version = 1", "version = 2"),
+        source.replace("version = 2", "version = 1"),
         source.replace(
             "thread_kernel_stack_count = 16",
             "thread_kernel_stack_count = 8",
@@ -148,9 +152,37 @@ fn task_layout_manifest_is_kernel_private_exact_and_fails_closed_on_drift() {
             "thread_kernel_stack_guard_size = 4096",
             "thread_kernel_stack_guard_size = 8192",
         ),
+        source.replace(
+            "privilege_entry_stack_count = 1",
+            "privilege_entry_stack_count = 2",
+        ),
+        source.replace(
+            "privilege_entry_stack_size = 16384",
+            "privilege_entry_stack_size = 8192",
+        ),
     ] {
         assert!(kernel_build::TaskLayout::parse(&malformed).is_err());
     }
+}
+
+#[test]
+fn e4_user_descriptors_and_rsp0_match_the_locked_contract() {
+    let root = kernel_root();
+    let gdt = fs::read_to_string(root.join("src/arch/x86_64/gdt.rs")).expect("read GDT source");
+    let tss = fs::read_to_string(root.join("src/arch/x86_64/tss.rs")).expect("read TSS source");
+    let x86 = fs::read_to_string(root.join("src/arch/x86_64/mod.rs")).expect("read x86 installer");
+    let linker = fs::read_to_string(root.join("arch/x86_64/linker.ld")).expect("read linker");
+    assert!(gdt.contains("SegmentSelector(0x2b)"));
+    assert!(gdt.contains("SegmentSelector(0x33)"));
+    assert!(gdt.contains("entries: [u64; 7]"));
+    assert!(gdt.contains("0x00cf_f200_0000_ffff"));
+    assert!(gdt.contains("0x00af_fa00_0000_ffff"));
+    assert!(gdt.contains("GDT_HARDWARE_LIMIT"));
+    assert!(tss.contains("io_map_base: size_of::<Self>() as u16"));
+    assert!(x86.contains("tss.set_privilege_stack0(privilege_entry.top)"));
+    assert!(x86.contains("linked_privilege_entry_stack_layout()"));
+    assert!(linker.contains("__dw_privilege_entry_stack_guard = .;"));
+    assert!(linker.contains("__dw_privilege_entry_stack_top = .;"));
 }
 
 #[test]
@@ -299,9 +331,9 @@ fn linked_entry_and_rust_boundary_match_the_canonical_elf_policy() {
 
     let source = fs::read_to_string(layout_path()).expect("read canonical layout manifest");
     let layout = kernel_build::Layout::parse(&source).expect("parse canonical layout manifest");
-    let task_source = fs::read_to_string(task_layout_path()).expect("read E3 task layout manifest");
+    let task_source = fs::read_to_string(task_layout_path()).expect("read E4 task layout manifest");
     let task_layout =
-        kernel_build::TaskLayout::parse(&task_source).expect("parse E3 task layout manifest");
+        kernel_build::TaskLayout::parse(&task_source).expect("parse E4 task layout manifest");
     let temporary = TemporaryDirectory::new("deepwyrm-x86_64-entry-contract");
     let entry_object = temporary.path.join("entry.o");
     let exceptions_object = temporary.path.join("exceptions.o");
@@ -448,6 +480,9 @@ dw_test_bss_probe:
         "__dw_ist_region_end",
         "__dw_thread_kernel_stack_region_start",
         "__dw_thread_kernel_stack_region_end",
+        "__dw_privilege_entry_stack_guard",
+        "__dw_privilege_entry_stack_bottom",
+        "__dw_privilege_entry_stack_top",
         "__dw_double_fault_ist_guard",
         "__dw_double_fault_ist_bottom",
         "__dw_double_fault_ist_top",

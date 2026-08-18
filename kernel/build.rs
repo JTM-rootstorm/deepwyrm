@@ -146,6 +146,22 @@ fn emit_task_layout_env(layout: TaskLayout) {
         "cargo:rustc-env=DEEPWYRM_E3_THREAD_STACK_ALIGNMENT={}",
         layout.thread_kernel_stack_alignment
     );
+    println!(
+        "cargo:rustc-env=DEEPWYRM_E4_PRIVILEGE_ENTRY_STACK_COUNT={}",
+        layout.privilege_entry_stack_count
+    );
+    println!(
+        "cargo:rustc-env=DEEPWYRM_E4_PRIVILEGE_ENTRY_STACK_SIZE={}",
+        layout.privilege_entry_stack_size
+    );
+    println!(
+        "cargo:rustc-env=DEEPWYRM_E4_PRIVILEGE_ENTRY_STACK_GUARD_SIZE={}",
+        layout.privilege_entry_stack_guard_size
+    );
+    println!(
+        "cargo:rustc-env=DEEPWYRM_E4_PRIVILEGE_ENTRY_STACK_ALIGNMENT={}",
+        layout.privilege_entry_stack_alignment
+    );
 }
 
 pub(crate) fn linker_arguments(
@@ -192,6 +208,22 @@ pub(crate) fn linker_arguments(
         format!(
             "--defsym=DW_KERNEL_THREAD_STACK_ALIGNMENT={}",
             task_layout.thread_kernel_stack_alignment
+        ),
+        format!(
+            "--defsym=DW_KERNEL_PRIVILEGE_ENTRY_STACK_COUNT={}",
+            task_layout.privilege_entry_stack_count
+        ),
+        format!(
+            "--defsym=DW_KERNEL_PRIVILEGE_ENTRY_STACK_SIZE={}",
+            task_layout.privilege_entry_stack_size
+        ),
+        format!(
+            "--defsym=DW_KERNEL_PRIVILEGE_ENTRY_STACK_GUARD_SIZE={}",
+            task_layout.privilege_entry_stack_guard_size
+        ),
+        format!(
+            "--defsym=DW_KERNEL_PRIVILEGE_ENTRY_STACK_ALIGNMENT={}",
+            task_layout.privilege_entry_stack_alignment
         ),
         format!("-T{}", linker_path.display()),
     ];
@@ -425,6 +457,10 @@ pub(crate) struct TaskLayout {
     pub(crate) thread_kernel_stack_size: u64,
     pub(crate) thread_kernel_stack_guard_size: u64,
     pub(crate) thread_kernel_stack_alignment: u64,
+    pub(crate) privilege_entry_stack_count: u64,
+    pub(crate) privilege_entry_stack_size: u64,
+    pub(crate) privilege_entry_stack_guard_size: u64,
+    pub(crate) privilege_entry_stack_alignment: u64,
 }
 
 impl TaskLayout {
@@ -437,6 +473,10 @@ impl TaskLayout {
             "thread_kernel_stack_size",
             "thread_kernel_stack_guard_size",
             "thread_kernel_stack_alignment",
+            "privilege_entry_stack_count",
+            "privilege_entry_stack_size",
+            "privilege_entry_stack_guard_size",
+            "privilege_entry_stack_alignment",
         ]
         .into_iter()
         .collect::<BTreeSet<_>>();
@@ -449,11 +489,17 @@ impl TaskLayout {
             ));
         }
         expect_string(&values, "schema", "deepwyrm-x86_64-task-layout")?;
-        expect_u64(&values, "version", 1)?;
+        expect_u64(&values, "version", 2)?;
         let count = parse_u64(required_value(&values, "thread_kernel_stack_count")?)?;
         let size = parse_u64(required_value(&values, "thread_kernel_stack_size")?)?;
         let guard = parse_u64(required_value(&values, "thread_kernel_stack_guard_size")?)?;
         let alignment = parse_u64(required_value(&values, "thread_kernel_stack_alignment")?)?;
+        let privilege_count = parse_u64(required_value(&values, "privilege_entry_stack_count")?)?;
+        let privilege_size = parse_u64(required_value(&values, "privilege_entry_stack_size")?)?;
+        let privilege_guard =
+            parse_u64(required_value(&values, "privilege_entry_stack_guard_size")?)?;
+        let privilege_alignment =
+            parse_u64(required_value(&values, "privilege_entry_stack_alignment")?)?;
         if count != 16
             || size != 65_536
             || guard != 4_096
@@ -466,11 +512,24 @@ impl TaskLayout {
                     .into(),
             );
         }
+        if privilege_count != 1
+            || privilege_size != 16_384
+            || privilege_guard != 4_096
+            || privilege_alignment != 4_096
+            || !privilege_size.is_multiple_of(privilege_alignment)
+            || !privilege_guard.is_multiple_of(privilege_alignment)
+        {
+            return Err("DW0-E4 BSP privilege-entry stack must be one guarded 16384-byte stack on a 4096-byte boundary".into());
+        }
         Ok(Self {
             thread_kernel_stack_count: count,
             thread_kernel_stack_size: size,
             thread_kernel_stack_guard_size: guard,
             thread_kernel_stack_alignment: alignment,
+            privilege_entry_stack_count: privilege_count,
+            privilege_entry_stack_size: privilege_size,
+            privilege_entry_stack_guard_size: privilege_guard,
+            privilege_entry_stack_alignment: privilege_alignment,
         })
     }
 }

@@ -116,6 +116,7 @@ pub(crate) struct EarlyDescriptorAddresses {
     pub(crate) tss_limit: u16,
     pub(crate) ist: IstStackLayout,
     pub(crate) installed_ist_tops: [u64; 3],
+    pub(crate) privilege_stack0: u64,
 }
 
 /// Returns the installed one-shot descriptor object addresses without
@@ -140,7 +141,7 @@ pub(crate) fn early_descriptor_addresses() -> Option<EarlyDescriptorAddresses> {
     }
     Some(EarlyDescriptorAddresses {
         gdt: GDT.value.get() as u64,
-        gdt_limit: (core::mem::size_of::<GlobalDescriptorTable>() - 1) as u16,
+        gdt_limit: gdt::GDT_HARDWARE_LIMIT,
         idt: FINAL_IDT.value.get() as u64,
         idt_limit: (core::mem::size_of::<InterruptDescriptorTable>() - 1) as u16,
         tss: TSS.value.get() as u64,
@@ -151,6 +152,7 @@ pub(crate) fn early_descriptor_addresses() -> Option<EarlyDescriptorAddresses> {
             tss.interrupt_stack(InterruptStackIndex::Two),
             tss.interrupt_stack(InterruptStackIndex::Three),
         ],
+        privilege_stack0: tss.privilege_stack0(),
     })
 }
 
@@ -266,6 +268,40 @@ pub(crate) fn linked_thread_kernel_stack_layout() -> Result<
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PrivilegeEntryStackLayoutError {
+    InvalidGeometry,
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "linker-defined E4 privilege-entry stack bounds are immutable kernel-layout facts"
+)]
+pub(crate) fn linked_privilege_entry_stack_layout()
+-> Result<crate::memory::kernel_stack::KernelStackBounds, PrivilegeEntryStackLayoutError> {
+    unsafe extern "C" {
+        static __dw_privilege_entry_stack_guard: u8;
+        static __dw_privilege_entry_stack_bottom: u8;
+        static __dw_privilege_entry_stack_top: u8;
+    }
+    let guard = core::ptr::addr_of!(__dw_privilege_entry_stack_guard) as u64;
+    let bottom = core::ptr::addr_of!(__dw_privilege_entry_stack_bottom) as u64;
+    let top = core::ptr::addr_of!(__dw_privilege_entry_stack_top) as u64;
+    let bounds = crate::memory::kernel_stack::KernelStackBounds::new(guard, bottom, top)
+        .map_err(|_| PrivilegeEntryStackLayoutError::InvalidGeometry)?;
+    if crate::memory::kernel_stack::E4_PRIVILEGE_ENTRY_STACK_COUNT != 1
+        || bounds.byte_len() != crate::memory::kernel_stack::E4_PRIVILEGE_ENTRY_STACK_SIZE
+        || bottom.checked_sub(guard)
+            != Some(crate::memory::kernel_stack::E4_PRIVILEGE_ENTRY_STACK_GUARD_SIZE)
+        || !guard.is_multiple_of(crate::memory::kernel_stack::E4_PRIVILEGE_ENTRY_STACK_ALIGNMENT)
+    {
+        return Err(PrivilegeEntryStackLayoutError::InvalidGeometry);
+    }
+    Ok(bounds)
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[allow(
     unsafe_code,
     reason = "linker-owned exception symbols are read only by the one-shot x86 descriptor installer"
@@ -283,6 +319,7 @@ pub enum EarlyDescriptorInstallError {
     AlreadyInstallingOrInstalled,
     InvalidHandlerAddress(u64),
     InvalidEmergencyStack,
+    InvalidPrivilegeEntryStack,
 }
 
 /// Disables maskable interrupts, initializes fixed COM1 diagnostics, then
@@ -348,7 +385,11 @@ unsafe fn initialize_and_activate() -> Result<(), EarlyDescriptorInstallError> {
     unsafe { idt::activate(emergency_idt) };
 
     let ist = linked_ist_stack_layout()?;
+    let privilege_entry = linked_privilege_entry_stack_layout()
+        .map_err(|_| EarlyDescriptorInstallError::InvalidPrivilegeEntryStack)?;
     let mut tss = TaskStateSegment::empty();
+    tss.set_privilege_stack0(privilege_entry.top)
+        .map_err(|_| EarlyDescriptorInstallError::InvalidPrivilegeEntryStack)?;
     tss.set_interrupt_stack(InterruptStackIndex::One, ist.double_fault.top)
         .map_err(|_| EarlyDescriptorInstallError::InvalidEmergencyStack)?;
     tss.set_interrupt_stack(InterruptStackIndex::Two, ist.non_maskable_interrupt.top)

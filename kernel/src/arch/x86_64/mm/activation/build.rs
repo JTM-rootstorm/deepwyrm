@@ -200,6 +200,8 @@ pub(super) fn build_and_bind_deep_root<
             .map_err(|_| DeepRootBuildError::InvalidKernelLayout)?;
         let thread_stacks = crate::arch::x86_64::linked_thread_kernel_stack_layout()
             .map_err(|_| DeepRootBuildError::InvalidKernelLayout)?;
+        let privilege_entry = crate::arch::x86_64::linked_privilege_entry_stack_layout()
+            .map_err(|_| DeepRootBuildError::InvalidKernelLayout)?;
         let capabilities = mapper.capabilities();
         let window_page = mapper.temporary_virtual_address();
         let control_page = window_page
@@ -211,6 +213,15 @@ pub(super) fn build_and_bind_deep_root<
             || validate_ist_layout(&segments, window_page, control_page, ist).is_err()
             || validate_thread_stack_layout(&segments, window_page, control_page, &thread_stacks)
                 .is_err()
+            || validate_privilege_entry_stack_layout(
+                &segments,
+                window_page,
+                control_page,
+                ist,
+                privilege_entry,
+                &thread_stacks,
+            )
+            .is_err()
         {
             return Err(DeepRootBuildError::InvalidKernelLayout);
         }
@@ -239,7 +250,7 @@ pub(super) fn build_and_bind_deep_root<
         for segment in segments {
             let mut page = segment.start;
             while page < segment.end {
-                if is_kernel_guard(ist, &thread_stacks, page) {
+                if is_kernel_guard(ist, &thread_stacks, privilege_entry, page) {
                     let guard_pt = ensure_leaf_table(
                         &mut mapper,
                         roles,

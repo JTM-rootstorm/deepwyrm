@@ -1,4 +1,4 @@
-//! Architecture-neutral geometry for the bounded DW0-E3 kernel stack pool.
+//! Architecture-neutral geometry for bounded DW0-E kernel stack carriers.
 
 pub(crate) const E3_BASE_PAGE_SIZE: u64 = 4096;
 pub(crate) const E3_THREAD_STACK_COUNT: usize = 16;
@@ -10,6 +10,11 @@ pub(crate) const E3_THREAD_STACK_ALIGNMENT: u64 = E3_BASE_PAGE_SIZE;
     reason = "the stride is consumed by target linker-layout validation and host geometry tests"
 )]
 pub(crate) const E3_THREAD_STACK_STRIDE: u64 = E3_THREAD_STACK_GUARD_SIZE + E3_THREAD_STACK_SIZE;
+
+pub(crate) const E4_PRIVILEGE_ENTRY_STACK_COUNT: usize = 1;
+pub(crate) const E4_PRIVILEGE_ENTRY_STACK_SIZE: u64 = 16_384;
+pub(crate) const E4_PRIVILEGE_ENTRY_STACK_GUARD_SIZE: u64 = E3_BASE_PAGE_SIZE;
+pub(crate) const E4_PRIVILEGE_ENTRY_STACK_ALIGNMENT: u64 = E3_BASE_PAGE_SIZE;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct KernelStackBounds {
@@ -83,5 +88,21 @@ const _: () = {
     );
     assert!(
         parse_decimal_u64(env!("DEEPWYRM_E3_THREAD_STACK_ALIGNMENT")) == E3_THREAD_STACK_ALIGNMENT
+    );
+    assert!(
+        parse_decimal_u64(env!("DEEPWYRM_E4_PRIVILEGE_ENTRY_STACK_COUNT"))
+            == E4_PRIVILEGE_ENTRY_STACK_COUNT as u64
+    );
+    assert!(
+        parse_decimal_u64(env!("DEEPWYRM_E4_PRIVILEGE_ENTRY_STACK_SIZE"))
+            == E4_PRIVILEGE_ENTRY_STACK_SIZE
+    );
+    assert!(
+        parse_decimal_u64(env!("DEEPWYRM_E4_PRIVILEGE_ENTRY_STACK_GUARD_SIZE"))
+            == E4_PRIVILEGE_ENTRY_STACK_GUARD_SIZE
+    );
+    assert!(
+        parse_decimal_u64(env!("DEEPWYRM_E4_PRIVILEGE_ENTRY_STACK_ALIGNMENT"))
+            == E4_PRIVILEGE_ENTRY_STACK_ALIGNMENT
     );
 };

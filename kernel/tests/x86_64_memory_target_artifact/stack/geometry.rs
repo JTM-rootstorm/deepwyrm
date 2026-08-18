@@ -13,7 +13,7 @@ pub(crate) fn validate_kernel_stack_artifact_geometry(symbols: &str) {
     let address = |name: &str| {
         *addresses
             .get(name)
-            .unwrap_or_else(|| panic!("production artifact omitted IST symbol {name}"))
+            .unwrap_or_else(|| panic!("production artifact omitted kernel-stack symbol {name}"))
     };
     let stacks = [
         (
@@ -65,5 +65,19 @@ pub(crate) fn validate_kernel_stack_artifact_geometry(symbols: &str) {
     assert!(
         address("__dw_ist_region_end") <= thread_start && thread_end <= address("__dw_data_end"),
         "linked E3 thread stack arena escapes the writable data PT_LOAD bounds"
+    );
+    let privilege_guard = address("__dw_privilege_entry_stack_guard");
+    let privilege_bottom = address("__dw_privilege_entry_stack_bottom");
+    let privilege_top = address("__dw_privilege_entry_stack_top");
+    assert_eq!(
+        privilege_guard & 0xfff,
+        0,
+        "privilege-entry guard alignment"
+    );
+    assert_eq!(privilege_bottom - privilege_guard, 4096);
+    assert_eq!(privilege_top - privilege_bottom, 16 * 1024);
+    assert!(
+        thread_end <= privilege_guard && privilege_top <= address("__dw_data_end"),
+        "linked E4 privilege-entry stack escapes the writable data PT_LOAD bounds"
     );
 }

@@ -1,5 +1,5 @@
 schema = "deepwyrm-x86_64-task-layout"
-version = 1
+version = 2
 
 # Kernel-private DW0-E3 execution-resource budget. This is not a userspace ABI
 # and is intentionally separate from the Wyrmroot-consumed layout.toml.
@@ -7,3 +7,10 @@ thread_kernel_stack_count = 16
 thread_kernel_stack_size = 65536
 thread_kernel_stack_guard_size = 4096
 thread_kernel_stack_alignment = 4096
+
+# BSP-only DW0-E4 privilege-entry landing stack. SMP bring-up must allocate one
+# equivalent guarded carrier per CPU before bringing that CPU online.
+privilege_entry_stack_count = 1
+privilege_entry_stack_size = 16384
+privilege_entry_stack_guard_size = 4096
+privilege_entry_stack_alignment = 4096

@@ -28,6 +28,8 @@ pub(super) struct ExecutionCarrierFacts {
     pub(super) task_register: u16,
     pub(super) ist: IstStackLayout,
     pub(super) installed_ist_tops: [u64; 3],
+    pub(super) privilege_entry: crate::memory::kernel_stack::KernelStackBounds,
+    pub(super) installed_privilege_stack0: u64,
 }
 
 impl KernelSegment {
@@ -171,9 +173,12 @@ pub(super) fn is_thread_stack_guard(
 pub(super) fn is_kernel_guard(
     ist: IstStackLayout,
     thread_stacks: &[crate::memory::kernel_stack::KernelStackBounds],
+    privilege_entry: crate::memory::kernel_stack::KernelStackBounds,
     page: u64,
 ) -> bool {
-    is_ist_guard(ist, page) || is_thread_stack_guard(thread_stacks, page)
+    is_ist_guard(ist, page)
+        || is_thread_stack_guard(thread_stacks, page)
+        || privilege_entry.guard_page == page
 }
 
 pub(super) fn validate_ist_layout(
@@ -238,6 +243,49 @@ pub(super) fn validate_thread_stack_layout(
     Ok(())
 }
 
+pub(super) fn validate_privilege_entry_stack_layout(
+    segments: &[KernelSegment; 3],
+    scratch_window_page: u64,
+    scratch_control_page: u64,
+    ist: IstStackLayout,
+    privilege_entry: crate::memory::kernel_stack::KernelStackBounds,
+    thread_stacks: &[crate::memory::kernel_stack::KernelStackBounds],
+) -> Result<(), InactiveGraphError<core::convert::Infallible>> {
+    let Some(writable) = segments
+        .iter()
+        .copied()
+        .find(|segment| segment.kind == SegmentKind::Writable)
+    else {
+        return Err(InactiveGraphError::InvalidSegmentLayout);
+    };
+    let overlaps_thread = thread_stacks.iter().any(|stack| {
+        privilege_entry.guard_page < stack.top && stack.guard_page < privilege_entry.top
+    });
+    let overlaps_ist = ist.stacks().iter().any(|stack| {
+        privilege_entry.guard_page < stack.top && stack.guard_page < privilege_entry.top
+    });
+    if privilege_entry
+        .bottom
+        .checked_sub(privilege_entry.guard_page)
+        != Some(crate::memory::kernel_stack::E4_PRIVILEGE_ENTRY_STACK_GUARD_SIZE)
+        || privilege_entry.byte_len() != crate::memory::kernel_stack::E4_PRIVILEGE_ENTRY_STACK_SIZE
+        || !privilege_entry
+            .guard_page
+            .is_multiple_of(crate::memory::kernel_stack::E4_PRIVILEGE_ENTRY_STACK_ALIGNMENT)
+        || !writable.contains(privilege_entry.guard_page)
+        || privilege_entry.top > writable.end
+        || (scratch_window_page >= privilege_entry.guard_page
+            && scratch_window_page < privilege_entry.top)
+        || (scratch_control_page >= privilege_entry.guard_page
+            && scratch_control_page < privilege_entry.top)
+        || overlaps_thread
+        || overlaps_ist
+    {
+        return Err(InactiveGraphError::InvalidSegmentLayout);
+    }
+    Ok(())
+}
+
 pub(super) fn subtree_is_required(
     virtual_prefix: u64,
     child_level: u8,
@@ -259,6 +307,7 @@ pub(super) fn validate_segment_layout(
     scratch: DeepScratchBinding,
     ist: IstStackLayout,
     thread_stacks: &[crate::memory::kernel_stack::KernelStackBounds],
+    privilege_entry: crate::memory::kernel_stack::KernelStackBounds,
 ) -> Result<(), InactiveGraphError<core::convert::Infallible>> {
     let scratch_page = scratch.window_page;
     if scratch_page & ADDRESS_OFFSET_MASK != 0
@@ -283,6 +332,14 @@ pub(super) fn validate_segment_layout(
         segments,
         scratch.window_page,
         scratch.control_page,
+        thread_stacks,
+    )?;
+    validate_privilege_entry_stack_layout(
+        segments,
+        scratch.window_page,
+        scratch.control_page,
+        ist,
+        privilege_entry,
         thread_stacks,
     )
 }
@@ -430,11 +487,12 @@ pub(super) fn validate_inactive_graph_with_workspace<
     segments: &[KernelSegment; 3],
     ist: IstStackLayout,
     thread_stacks: &[crate::memory::kernel_stack::KernelStackBounds],
+    privilege_entry: crate::memory::kernel_stack::KernelStackBounds,
     capabilities: PagingCapabilities,
     pending: &mut [Option<PendingTable>; MAX_DEEP_TABLE_FRAMES],
     visited: &mut [u64; MAX_DEEP_TABLE_FRAMES],
 ) -> Result<(), InactiveGraphError<A::Error>> {
-    validate_segment_layout(segments, scratch, ist, thread_stacks).map_err(
+    validate_segment_layout(segments, scratch, ist, thread_stacks, privilege_entry).map_err(
         |error| match error {
             InactiveGraphError::InvalidSegmentLayout => InactiveGraphError::InvalidSegmentLayout,
             _ => unreachable!("layout validation has one error"),
@@ -490,7 +548,7 @@ pub(super) fn validate_inactive_graph_with_workspace<
                         return Err(InactiveGraphError::InvalidScratchPath);
                     }
                 } else {
-                    if is_kernel_guard(ist, thread_stacks, virtual_page) {
+                    if is_kernel_guard(ist, thread_stacks, privilege_entry, virtual_page) {
                         return Err(InactiveGraphError::MappedGuardPage);
                     }
                     let segment = segment_for_page(segments, virtual_page)
@@ -553,7 +611,7 @@ pub(super) fn validate_inactive_graph_with_workspace<
                 page,
                 capabilities,
             )?;
-            if is_kernel_guard(ist, thread_stacks, page) {
+            if is_kernel_guard(ist, thread_stacks, privilege_entry, page) {
                 if inactive.is_some() {
                     return Err(InactiveGraphError::MappedGuardPage);
                 }
@@ -590,6 +648,7 @@ pub(super) fn validate_inactive_graph<
     scratch: DeepScratchBinding,
     segments: &[KernelSegment; 3],
     ist: IstStackLayout,
+    privilege_entry: crate::memory::kernel_stack::KernelStackBounds,
     capabilities: PagingCapabilities,
 ) -> Result<(), InactiveGraphError<A::Error>> {
     let mut pending = [None; MAX_DEEP_TABLE_FRAMES];
@@ -604,6 +663,7 @@ pub(super) fn validate_inactive_graph<
         segments,
         ist,
         &[],
+        privilege_entry,
         capabilities,
         &mut pending,
         &mut visited,

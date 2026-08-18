@@ -18,6 +18,14 @@ ASSERT(DEFINED(DW_KERNEL_THREAD_STACK_GUARD_SIZE),
        "DW_KERNEL_THREAD_STACK_GUARD_SIZE must come from task_layout.toml")
 ASSERT(DEFINED(DW_KERNEL_THREAD_STACK_ALIGNMENT),
        "DW_KERNEL_THREAD_STACK_ALIGNMENT must come from task_layout.toml")
+ASSERT(DEFINED(DW_KERNEL_PRIVILEGE_ENTRY_STACK_COUNT),
+       "DW_KERNEL_PRIVILEGE_ENTRY_STACK_COUNT must come from task_layout.toml")
+ASSERT(DEFINED(DW_KERNEL_PRIVILEGE_ENTRY_STACK_SIZE),
+       "DW_KERNEL_PRIVILEGE_ENTRY_STACK_SIZE must come from task_layout.toml")
+ASSERT(DEFINED(DW_KERNEL_PRIVILEGE_ENTRY_STACK_GUARD_SIZE),
+       "DW_KERNEL_PRIVILEGE_ENTRY_STACK_GUARD_SIZE must come from task_layout.toml")
+ASSERT(DEFINED(DW_KERNEL_PRIVILEGE_ENTRY_STACK_ALIGNMENT),
+       "DW_KERNEL_PRIVILEGE_ENTRY_STACK_ALIGNMENT must come from task_layout.toml")
 
 PHDRS
 {
@@ -104,6 +112,14 @@ SECTIONS
              (DW_KERNEL_THREAD_STACK_GUARD_SIZE + DW_KERNEL_THREAD_STACK_SIZE);
         __dw_thread_kernel_stack_region_end = .;
 
+        /* E4 BSP SYSCALL/CPL3 landing stack: one nonpresent guard + RW/NX payload. */
+        . = ALIGN(DW_KERNEL_PRIVILEGE_ENTRY_STACK_ALIGNMENT);
+        __dw_privilege_entry_stack_guard = .;
+        . += DW_KERNEL_PRIVILEGE_ENTRY_STACK_GUARD_SIZE;
+        __dw_privilege_entry_stack_bottom = .;
+        . += DW_KERNEL_PRIVILEGE_ENTRY_STACK_SIZE;
+        __dw_privilege_entry_stack_top = .;
+
         *(.bss .bss.*)
         *(.sbss .sbss.*)
         *(COMMON)
@@ -163,3 +179,18 @@ ASSERT((__dw_thread_kernel_stack_region_end - __dw_thread_kernel_stack_region_st
        DW_KERNEL_THREAD_STACK_COUNT *
        (DW_KERNEL_THREAD_STACK_GUARD_SIZE + DW_KERNEL_THREAD_STACK_SIZE),
        "E3 thread kernel-stack arena geometry does not match task_layout.toml")
+
+ASSERT(DW_KERNEL_PRIVILEGE_ENTRY_STACK_COUNT == 1,
+       "DW0-E4 BSP privilege-entry stack count must remain one")
+ASSERT(DW_KERNEL_PRIVILEGE_ENTRY_STACK_SIZE == 16384,
+       "DW0-E4 BSP privilege-entry stack must remain 16 KiB")
+ASSERT(DW_KERNEL_PRIVILEGE_ENTRY_STACK_GUARD_SIZE == DW_KERNEL_BASE_PAGE_SIZE,
+       "DW0-E4 privilege-entry stack must have one base-page guard")
+ASSERT(DW_KERNEL_PRIVILEGE_ENTRY_STACK_ALIGNMENT == DW_KERNEL_BASE_PAGE_SIZE,
+       "DW0-E4 privilege-entry stack alignment must remain one base page")
+ASSERT((__dw_privilege_entry_stack_bottom - __dw_privilege_entry_stack_guard) ==
+       DW_KERNEL_PRIVILEGE_ENTRY_STACK_GUARD_SIZE,
+       "privilege-entry guard geometry drifted")
+ASSERT((__dw_privilege_entry_stack_top - __dw_privilege_entry_stack_bottom) ==
+       DW_KERNEL_PRIVILEGE_ENTRY_STACK_SIZE,
+       "privilege-entry stack extent drifted")

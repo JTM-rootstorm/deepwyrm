@@ -162,12 +162,12 @@ fn c2_kernel_image_exclusion_precedes_first_table_allocation() {
 }
 
 #[test]
-fn e3_thread_kernel_stacks_are_private_linker_carriers_with_first_root_guards() {
+fn e3_e4_kernel_stacks_are_private_linker_carriers_with_first_root_guards() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let shared_layout = fs::read_to_string(root.join("arch/x86_64/layout.toml"))
         .expect("read Wyrmroot-consumed layout");
     let task_layout = fs::read_to_string(root.join("arch/x86_64/task_layout.toml"))
-        .expect("read kernel-private E3 task layout");
+        .expect("read kernel-private E4 task layout");
     let linker =
         fs::read_to_string(root.join("arch/x86_64/linker.ld")).expect("read linker script");
     let builder = fs::read_to_string(root.join("src/arch/x86_64/mm/activation/build.rs"))
@@ -188,19 +188,27 @@ fn e3_thread_kernel_stacks_are_private_linker_carriers_with_first_root_guards() 
         "thread_kernel_stack_size = 65536",
         "thread_kernel_stack_guard_size = 4096",
         "thread_kernel_stack_alignment = 4096",
+        "privilege_entry_stack_count = 1",
+        "privilege_entry_stack_size = 16384",
+        "privilege_entry_stack_guard_size = 4096",
+        "privilege_entry_stack_alignment = 4096",
     ] {
         assert!(
             task_layout.contains(marker),
-            "missing private E3 layout marker {marker}"
+            "missing private E3/E4 layout marker {marker}"
         );
     }
     assert!(linker.contains("__dw_thread_kernel_stack_region_start = .;"));
     assert!(linker.contains("__dw_thread_kernel_stack_region_end = .;"));
+    assert!(linker.contains("__dw_privilege_entry_stack_guard = .;"));
+    assert!(linker.contains("__dw_privilege_entry_stack_top = .;"));
     assert!(builder.contains("linked_thread_kernel_stack_layout()"));
-    assert!(builder.contains("is_kernel_guard(ist, &thread_stacks, page)"));
+    assert!(builder.contains("is_kernel_guard(ist, &thread_stacks, privilege_entry, page)"));
     assert!(graph.contains("fn is_thread_stack_guard("));
     assert!(graph.contains("validate_thread_stack_layout("));
+    assert!(graph.contains("validate_privilege_entry_stack_layout("));
     assert!(activation.contains("&thread_stacks,"));
     assert!(test_support.contains("for stack in thread_stacks"));
+    assert!(test_support.contains("linked_privilege_entry_stack_layout()"));
     assert!(execution.contains("fn from_linked_x86_64_stacks()"));
 }
