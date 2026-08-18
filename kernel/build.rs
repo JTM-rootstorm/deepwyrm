@@ -19,6 +19,7 @@ fn run() -> Result<(), String> {
     let linker_path = manifest_dir.join("arch/x86_64/linker.ld");
     let entry_path = manifest_dir.join("src/arch/x86_64/entry.S");
     let exceptions_path = manifest_dir.join("src/arch/x86_64/exceptions.S");
+    let syscall_path = manifest_dir.join("src/arch/x86_64/syscall_entry.S");
     let guest_harness_path = manifest_dir.join("../tooling/guest-harness.toml");
 
     println!("cargo:rerun-if-changed={}", layout_path.display());
@@ -26,6 +27,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-changed={}", linker_path.display());
     println!("cargo:rerun-if-changed={}", entry_path.display());
     println!("cargo:rerun-if-changed={}", exceptions_path.display());
+    println!("cargo:rerun-if-changed={}", syscall_path.display());
     println!("cargo:rerun-if-changed={}", guest_harness_path.display());
     println!("cargo:rerun-if-env-changed=DEEPWYRM_CLANG");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_TEST_SUPPORT");
@@ -54,14 +56,20 @@ fn run() -> Result<(), String> {
     let out_dir = PathBuf::from(required_env("OUT_DIR")?);
     let entry_object = out_dir.join("deepwyrm-x86_64-entry.o");
     let exceptions_object = out_dir.join("deepwyrm-x86_64-exceptions.o");
+    let syscall_object = out_dir.join("deepwyrm-x86_64-syscall.o");
     assemble_source(&entry_path, &entry_object, layout)?;
     assemble_source(&exceptions_path, &exceptions_object, layout)?;
+    assemble_source(&syscall_path, &syscall_object, layout)?;
 
     for argument in linker_arguments(
         layout,
         task_layout,
         &linker_path,
-        &[entry_object.as_path(), exceptions_object.as_path()],
+        &[
+            entry_object.as_path(),
+            exceptions_object.as_path(),
+            syscall_object.as_path(),
+        ],
     ) {
         println!("cargo:rustc-link-arg={argument}");
     }

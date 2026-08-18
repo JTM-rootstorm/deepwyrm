@@ -44,6 +44,7 @@ SECTIONS
     {
         KEEP(*(.text.entry))
         KEEP(*(.text.exceptions))
+        KEEP(*(.text.syscall))
         *(.text .text.*)
     } :text
     __dw_text_end = .;

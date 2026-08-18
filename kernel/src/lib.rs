@@ -187,6 +187,11 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             )
         }
         .unwrap_or_else(|error| panic!("failed to activate Deep-owned paging: {error:?}"));
+        // SAFETY: the final Deep-owned root is active, the BSP remains at CPL0
+        // with IF clear, and the finalized GDT/TSS already carries the guarded
+        // E4 privilege-entry stack. No CPL3 execution exists before this point.
+        unsafe { arch::x86_64::syscall::install_syscall_boundary() }
+            .unwrap_or_else(|error| panic!("failed to install E4 SYSCALL boundary: {error:?}"));
         #[cfg(not(feature = "test-support"))]
         let _ = debug::emit_early_record(
             debug::DiagnosticLevel::Info,
