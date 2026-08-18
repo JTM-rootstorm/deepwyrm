@@ -1388,6 +1388,8 @@ mod tests {
     use crate::memory::frame_roles::synthetic_frame_role_manager;
     use crate::memory::object::{MemoryObjectAuthority, MemoryObjectKind};
     use crate::memory::physical::{PhysicalAddressLimit, PhysicalRange};
+    use crate::object::ObjectRegistry;
+    use deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT;
     use std::collections::BTreeMap;
     use std::vec::Vec;
 
@@ -1931,15 +1933,19 @@ mod tests {
         let backing = unsafe { roles.assume_zeroed(allocation) }.unwrap();
         let backing = roles.assign_object_backing(backing).unwrap();
         let backing_start = backing.physical_start();
+        let mut registry = ObjectRegistry::<1>::new();
+        let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
         let mut objects = MemoryObjectAuthority::<1, 8>::new();
         let object = objects
             .grant_backing(
+                &creation,
                 backing,
                 BASE_PAGE_SIZE * 2,
                 MemoryObjectKind::PageBacked,
                 Protection::READ_WRITE_EXECUTE,
             )
             .unwrap();
+        let _object_owner = registry.creation_into_internal(creation).unwrap();
 
         let mut spaces = unsafe { AddressSpaceAuthority::<1, 1>::new() };
         let address_space = spaces.create_address_space().unwrap();

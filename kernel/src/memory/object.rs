@@ -11,7 +11,11 @@
 )]
 
 use super::address_region::{AddressSpaceKey, RegionKey, mint_authority_domain};
-use crate::memory::frame_roles::{BackingIdentity, ObjectBackingGrant, ObjectBackingKind};
+use crate::memory::frame_roles::{
+    BackingIdentity, FrameRoleManager, ObjectBackingGrant, ObjectBackingKind,
+};
+use crate::object::{CreationRef, FinalRelease, ObjectId, ObjectRegistry};
+use deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT;
 
 /// The DW0 base page size.
 pub(crate) const PAGE_SIZE: u64 = 4096;
@@ -34,6 +38,8 @@ pub(crate) enum MemoryObjectError {
     ProtectionCeiling,
     WritableExecutableAlias,
     BackingKind,
+    ObjectIdentity,
+    FinalizationMismatch,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -49,6 +55,72 @@ impl MemoryObjectCreateError {
 
     pub(crate) fn into_backing(self) -> ObjectBackingGrant {
         self.backing
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct MemoryObjectFinalizationError {
+    error: MemoryObjectError,
+    final_release: FinalRelease,
+}
+
+impl MemoryObjectFinalizationError {
+    pub(crate) const fn error(&self) -> MemoryObjectError {
+        self.error
+    }
+
+    pub(crate) fn into_final_release(self) -> FinalRelease {
+        self.final_release
+    }
+}
+
+#[must_use = "memory finalization must reclaim or deliberately retire its typed backing"]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct MemoryObjectFinalization {
+    final_release: FinalRelease,
+    backing: ObjectBackingGrant,
+    kind: MemoryObjectKind,
+}
+
+impl MemoryObjectFinalization {
+    pub(crate) const fn kind(&self) -> MemoryObjectKind {
+        self.kind
+    }
+
+    pub(crate) fn into_parts(self) -> (FinalRelease, ObjectBackingGrant) {
+        (self.final_release, self.backing)
+    }
+}
+
+pub(crate) fn complete_memory_finalization<
+    const REGISTRY_OBJECTS: usize,
+    const RANGE_CAPACITY: usize,
+    const ROLE_CAPACITY: usize,
+>(
+    registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
+    roles: &mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
+    finalization: MemoryObjectFinalization,
+) {
+    let kind = finalization.kind;
+    let (final_release, backing) = finalization.into_parts();
+    match (kind, backing.kind()) {
+        (MemoryObjectKind::PageBacked, ObjectBackingKind::AllocatorOwned) => {
+            if let Err(error) = roles.cancel_object_backing(backing) {
+                panic!(
+                    "allocator-backed MemoryObject finalization lost typed backing authority: {error:?}"
+                );
+            }
+        }
+        (MemoryObjectKind::ImmutableBootModule, ObjectBackingKind::ImmutableModule { .. }) => {
+            // External immutable module pages are deliberately not returned to
+            // the dynamic allocator. Consuming the typed grant retires only
+            // the logical MemoryObject payload.
+            let _retired_immutable_backing = backing;
+        }
+        _ => panic!("MemoryObject payload/backing kind diverged before finalization"),
+    }
+    if let Err(error) = registry.complete_finalization(final_release) {
+        panic!("generic MemoryObject finalization became invalid after backing cleanup: {error:?}");
     }
 }
 
@@ -120,12 +192,15 @@ pub(crate) enum MemoryObjectKind {
 /// Opaque authority-issued identity for one page-backed object.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MemoryObjectKey {
-    domain: u64,
-    raw: u64,
+    object: Option<ObjectId>,
 }
 
 impl MemoryObjectKey {
-    pub(super) const EMPTY: Self = Self { domain: 0, raw: 0 };
+    pub(super) const EMPTY: Self = Self { object: None };
+
+    pub(crate) const fn object_id(self) -> Option<ObjectId> {
+        self.object
+    }
 }
 
 /// Opaque authority-issued identity for one committed mapping lease.
@@ -331,6 +406,7 @@ impl LeaseTicket {
 
 #[derive(Clone, Copy)]
 struct ObjectRecord {
+    object: ObjectId,
     backing: BackingIdentity,
     physical_start: u64,
     logical_byte_len: u64,
@@ -341,14 +417,10 @@ struct ObjectRecord {
 
 #[derive(Clone, Copy)]
 struct ObjectSlot {
-    generation: u32,
     record: Option<ObjectRecord>,
 }
 
-const EMPTY_OBJECT_SLOT: ObjectSlot = ObjectSlot {
-    generation: 0,
-    record: None,
-};
+const EMPTY_OBJECT_SLOT: ObjectSlot = ObjectSlot { record: None };
 
 #[derive(Clone, Copy)]
 struct LeaseRecord {
@@ -412,6 +484,7 @@ const EMPTY_PENDING: PendingLease = PendingLease {
 pub(crate) struct MemoryObjectAuthority<const OBJECTS: usize, const LEASES: usize> {
     domain: u64,
     objects: [ObjectSlot; OBJECTS],
+    backings: [Option<ObjectBackingGrant>; OBJECTS],
     leases: [LeaseSlot; LEASES],
 }
 
@@ -420,6 +493,7 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         Self {
             domain: mint_authority_domain(),
             objects: [EMPTY_OBJECT_SLOT; OBJECTS],
+            backings: core::array::from_fn(|_| None),
             leases: [EMPTY_LEASE_SLOT; LEASES],
         }
     }
@@ -428,20 +502,28 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
     /// one object. A failed creation returns the grant for caller rollback.
     pub(crate) fn grant_backing(
         &mut self,
+        reference: &CreationRef,
         backing: ObjectBackingGrant,
         logical_byte_len: u64,
         kind: MemoryObjectKind,
         protection_ceiling: MemoryProtection,
     ) -> Result<MemoryObjectKey, MemoryObjectCreateError> {
-        let validated = self.validate_backing(&backing, logical_byte_len, kind, protection_ceiling);
-        let (slot, generation, rounded_byte_len) = match validated {
+        let validated = self.validate_backing(
+            reference,
+            &backing,
+            logical_byte_len,
+            kind,
+            protection_ceiling,
+        );
+        let (slot, rounded_byte_len) = match validated {
             Ok(validated) => validated,
             Err(error) => return Err(MemoryObjectCreateError { error, backing }),
         };
         let physical_start = backing.physical_start();
+        let object = reference.id();
         self.objects[slot] = ObjectSlot {
-            generation,
             record: Some(ObjectRecord {
+                object,
                 backing: backing.identity(),
                 physical_start,
                 logical_byte_len,
@@ -450,19 +532,32 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
                 protection_ceiling,
             }),
         };
+        self.backings[slot] = Some(backing);
         Ok(MemoryObjectKey {
-            domain: self.domain,
-            raw: encode_raw_key(slot, generation),
+            object: Some(object),
         })
     }
 
     fn validate_backing(
         &self,
+        reference: &CreationRef,
         backing: &ObjectBackingGrant,
         logical_byte_len: u64,
         kind: MemoryObjectKind,
         protection_ceiling: MemoryProtection,
-    ) -> Result<(usize, u32, u64), MemoryObjectError> {
+    ) -> Result<(usize, u64), MemoryObjectError> {
+        if reference.object_type() != DW_OBJECT_TYPE_MEMORY_OBJECT {
+            return Err(MemoryObjectError::ObjectIdentity);
+        }
+        let object = reference.id();
+        if self
+            .objects
+            .iter()
+            .filter_map(|slot| slot.record)
+            .any(|record| record.object == object)
+        {
+            return Err(MemoryObjectError::ObjectIdentity);
+        }
         let physical_start = backing.physical_start();
         let backing_len = backing.byte_len();
         if backing_len == 0 || logical_byte_len == 0 {
@@ -497,10 +592,10 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         let slot = self
             .objects
             .iter()
-            .position(|slot| slot.record.is_none())
+            .zip(self.backings.iter())
+            .position(|(slot, backing)| slot.record.is_none() && backing.is_none())
             .ok_or(MemoryObjectError::Capacity)?;
-        let generation = next_generation(self.objects[slot].generation)?;
-        Ok((slot, generation, rounded_byte_len))
+        Ok((slot, rounded_byte_len))
     }
 
     pub(crate) fn object_info(
@@ -513,6 +608,41 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             rounded_byte_len: record.rounded_byte_len,
             kind: record.kind,
             protection_ceiling: record.protection_ceiling,
+        })
+    }
+
+    pub(crate) fn take_finalization(
+        &mut self,
+        final_release: FinalRelease,
+    ) -> Result<MemoryObjectFinalization, MemoryObjectFinalizationError> {
+        if final_release.object_type() != DW_OBJECT_TYPE_MEMORY_OBJECT {
+            return Err(MemoryObjectFinalizationError {
+                error: MemoryObjectError::FinalizationMismatch,
+                final_release,
+            });
+        }
+        let object = final_release.id();
+        let Some(slot) = self
+            .objects
+            .iter()
+            .position(|slot| slot.record.is_some_and(|record| record.object == object))
+        else {
+            return Err(MemoryObjectFinalizationError {
+                error: MemoryObjectError::FinalizationMismatch,
+                final_release,
+            });
+        };
+        let record = self.objects[slot]
+            .record
+            .take()
+            .expect("finalization lookup found a payload record");
+        let backing = self.backings[slot]
+            .take()
+            .expect("memory payload lost its typed backing authority");
+        Ok(MemoryObjectFinalization {
+            final_release,
+            backing,
+            kind: record.kind,
         })
     }
 
@@ -707,19 +837,11 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
     }
 
     fn object_slot(&self, object: MemoryObjectKey) -> Result<usize, MemoryObjectError> {
-        if object.domain != self.domain {
-            return Err(MemoryObjectError::InvalidObjectKey);
-        }
-        let (slot, generation) =
-            decode_raw_key(object.raw).ok_or(MemoryObjectError::InvalidObjectKey)?;
-        let entry = self
-            .objects
-            .get(slot)
-            .ok_or(MemoryObjectError::InvalidObjectKey)?;
-        if entry.generation != generation || entry.record.is_none() {
-            return Err(MemoryObjectError::InvalidObjectKey);
-        }
-        Ok(slot)
+        let object = object.object.ok_or(MemoryObjectError::InvalidObjectKey)?;
+        self.objects
+            .iter()
+            .position(|slot| slot.record.is_some_and(|record| record.object == object))
+            .ok_or(MemoryObjectError::InvalidObjectKey)
     }
 
     fn object_record(&self, object: MemoryObjectKey) -> Result<ObjectRecord, MemoryObjectError> {
@@ -841,22 +963,27 @@ mod tests {
 
     use super::super::address_region::AddressSpaceAuthority;
     use super::*;
+    use crate::object::ObjectRegistry;
     use std::boxed::Box;
 
     fn grant<const OBJECTS: usize, const LEASES: usize>(
         authority: &mut MemoryObjectAuthority<OBJECTS, LEASES>,
+        registry: &mut ObjectRegistry<OBJECTS>,
         logical_byte_len: u64,
         ceiling: MemoryProtection,
-    ) -> MemoryObjectKey {
+    ) -> (MemoryObjectKey, CreationRef) {
         let backing = crate::memory::frame_roles::synthetic_allocator_backing(0x20_000, 4);
-        authority
+        let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+        let key = authority
             .grant_backing(
+                &creation,
                 backing,
                 logical_byte_len,
                 MemoryObjectKind::PageBacked,
                 ceiling,
             )
-            .unwrap()
+            .unwrap();
+        (key, creation)
     }
 
     #[allow(
@@ -889,9 +1016,11 @@ mod tests {
 
     #[test]
     fn allocator_grant_preserves_exact_and_rounded_lengths() {
+        let mut registry = ObjectRegistry::<2>::new();
         let mut authority = MemoryObjectAuthority::<2, 4>::new();
-        let key = grant(
+        let (key, _creation) = grant(
             &mut authority,
+            &mut registry,
             PAGE_SIZE + 1,
             MemoryProtection::READ_WRITE_EXECUTE,
         );
@@ -903,11 +1032,14 @@ mod tests {
 
     #[test]
     fn typed_backing_identity_is_retained_and_failed_creation_returns_the_grant() {
+        let mut registry = ObjectRegistry::<2>::new();
+        let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
         let mut authority = MemoryObjectAuthority::<2, 2>::new();
         let backing = crate::memory::frame_roles::synthetic_allocator_backing(0x20_000, 1);
         let expected_identity = backing.identity();
         let error = authority
             .grant_backing(
+                &creation,
                 backing,
                 PAGE_SIZE * 2,
                 MemoryObjectKind::PageBacked,
@@ -920,6 +1052,7 @@ mod tests {
         assert_eq!(backing.identity(), expected_identity);
         let key = authority
             .grant_backing(
+                &creation,
                 backing,
                 PAGE_SIZE,
                 MemoryObjectKind::PageBacked,
@@ -934,11 +1067,14 @@ mod tests {
 
     #[test]
     fn immutable_module_grant_rejects_role_confusion_and_writable_ceiling() {
+        let mut registry = ObjectRegistry::<2>::new();
+        let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
         let mut authority = MemoryObjectAuthority::<2, 2>::new();
         let backing =
             crate::memory::frame_roles::synthetic_immutable_module_backing(0x30_000, 1, 9);
         let error = authority
             .grant_backing(
+                &creation,
                 backing,
                 PAGE_SIZE,
                 MemoryObjectKind::PageBacked,
@@ -949,6 +1085,7 @@ mod tests {
 
         let error = authority
             .grant_backing(
+                &creation,
                 error.into_backing(),
                 PAGE_SIZE,
                 MemoryObjectKind::ImmutableBootModule,
@@ -959,6 +1096,7 @@ mod tests {
 
         let key = authority
             .grant_backing(
+                &creation,
                 error.into_backing(),
                 PAGE_SIZE,
                 MemoryObjectKind::ImmutableBootModule,
@@ -974,8 +1112,14 @@ mod tests {
     #[test]
     fn final_page_tail_is_mapping_capacity_but_not_logical_object_size() {
         let (space, region) = ids();
+        let mut registry = ObjectRegistry::<2>::new();
         let mut authority = MemoryObjectAuthority::<2, 4>::new();
-        let key = grant(&mut authority, PAGE_SIZE + 1, MemoryProtection::READ_WRITE);
+        let (key, _creation) = grant(
+            &mut authority,
+            &mut registry,
+            PAGE_SIZE + 1,
+            MemoryProtection::READ_WRITE,
+        );
         let info = authority.object_info(key).unwrap();
         assert_eq!(info.logical_byte_len(), PAGE_SIZE + 1);
         assert_eq!(info.rounded_byte_len(), PAGE_SIZE * 2);
@@ -1002,9 +1146,11 @@ mod tests {
     #[test]
     fn replacement_rejects_bad_ranges_and_wx_aliases_without_commit() {
         let (space, region) = ids();
+        let mut registry = ObjectRegistry::<2>::new();
         let mut authority = MemoryObjectAuthority::<2, 4>::new();
-        let key = grant(
+        let (key, _creation) = grant(
             &mut authority,
+            &mut registry,
             PAGE_SIZE * 2,
             MemoryProtection::READ_WRITE_EXECUTE,
         );
@@ -1066,8 +1212,14 @@ mod tests {
     #[test]
     fn protection_ceiling_is_captured_per_object() {
         let (space, region) = ids();
+        let mut registry = ObjectRegistry::<2>::new();
         let mut authority = MemoryObjectAuthority::<2, 2>::new();
-        let key = grant(&mut authority, PAGE_SIZE, MemoryProtection::READ_WRITE);
+        let (key, _creation) = grant(
+            &mut authority,
+            &mut registry,
+            PAGE_SIZE,
+            MemoryProtection::READ_WRITE,
+        );
         let read_write = mapping(&authority, key, MemoryProtection::READ_WRITE);
         assert!(matches!(
             authority.prepare_replace::<1>(
@@ -1085,6 +1237,95 @@ mod tests {
             ),
             Err(MemoryObjectError::ProtectionCeiling)
         ));
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "test manager models complete physical zeroing before typed backing assignment"
+    )]
+    fn allocator_backing_is_reclaimed_only_through_typed_finalization() {
+        let mut roles =
+            crate::memory::frame_roles::synthetic_frame_role_manager::<1, 8>(0x10_000, 4);
+        let allocation = roles.allocate(1).unwrap();
+        let physical_start = allocation.physical_start();
+        let zeroed = unsafe { roles.assume_zeroed(allocation) }.unwrap();
+        let backing = roles.assign_object_backing(zeroed).unwrap();
+
+        let mut registry = ObjectRegistry::<1>::new();
+        let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+        let mut authority = MemoryObjectAuthority::<1, 1>::new();
+        let key = authority
+            .grant_backing(
+                &creation,
+                backing,
+                PAGE_SIZE,
+                MemoryObjectKind::PageBacked,
+                MemoryProtection::READ_WRITE,
+            )
+            .unwrap();
+        let final_release = registry.release_creation(creation).unwrap().unwrap();
+        let finalization = authority.take_finalization(final_release).unwrap();
+        assert_eq!(
+            authority.object_info(key),
+            Err(MemoryObjectError::InvalidObjectKey)
+        );
+        complete_memory_finalization(&mut registry, &mut roles, finalization);
+
+        let recycled = roles.allocate(1).unwrap();
+        assert_eq!(recycled.physical_start(), physical_start);
+    }
+
+    #[test]
+    fn immutable_backing_retires_logically_without_allocator_reclamation() {
+        let mut roles =
+            crate::memory::frame_roles::synthetic_frame_role_manager::<1, 8>(0x10_000, 2);
+        let backing =
+            crate::memory::frame_roles::synthetic_immutable_module_backing(0x80_000, 1, 7);
+        let mut registry = ObjectRegistry::<1>::new();
+        let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+        let mut authority = MemoryObjectAuthority::<1, 1>::new();
+        authority
+            .grant_backing(
+                &creation,
+                backing,
+                PAGE_SIZE,
+                MemoryObjectKind::ImmutableBootModule,
+                MemoryProtection::READ,
+            )
+            .unwrap();
+        let final_release = registry.release_creation(creation).unwrap().unwrap();
+        let finalization = authority.take_finalization(final_release).unwrap();
+        complete_memory_finalization(&mut registry, &mut roles, finalization);
+
+        assert!(registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).is_ok());
+        assert_eq!(roles.allocate(2).unwrap().byte_len(), PAGE_SIZE * 2);
+    }
+
+    #[test]
+    fn wrong_final_release_cannot_consume_memory_payload() {
+        use deepwyrm_abi::DW_OBJECT_TYPE_EVENT;
+
+        let mut registry = ObjectRegistry::<2>::new();
+        let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+        let event = registry.create(DW_OBJECT_TYPE_EVENT).unwrap();
+        let mut authority = MemoryObjectAuthority::<1, 1>::new();
+        let backing = crate::memory::frame_roles::synthetic_allocator_backing(0x20_000, 1);
+        let key = authority
+            .grant_backing(
+                &creation,
+                backing,
+                PAGE_SIZE,
+                MemoryObjectKind::PageBacked,
+                MemoryProtection::READ,
+            )
+            .unwrap();
+        let event_final = registry.release_creation(event).unwrap().unwrap();
+        let error = authority.take_finalization(event_final).unwrap_err();
+        assert_eq!(error.error(), MemoryObjectError::FinalizationMismatch);
+        let event_final = error.into_final_release();
+        registry.complete_finalization(event_final).unwrap();
+        assert!(authority.object_info(key).is_ok());
     }
 
     #[test]

@@ -2396,6 +2396,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     fn run_mapped_case(&mut self, test: crate::test_support::BuildGuestTest) -> ! {
         use crate::memory::address_region::AddressSpaceAuthority;
         use crate::memory::object::{MemoryObjectAuthority, MemoryObjectKind, MemoryProtection};
+        use crate::object::ObjectRegistry;
+        use deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT;
 
         let first = Self::TEST_REGION_START;
         let (allocation, backing_physical) = self
@@ -2408,14 +2410,22 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .roles
             .assign_object_backing(allocation)
             .unwrap_or_else(|_| crate::test_support::complete_fail(0x0401));
+        let mut registry = ObjectRegistry::<1>::new();
+        let creation = registry
+            .create(DW_OBJECT_TYPE_MEMORY_OBJECT)
+            .unwrap_or_else(|_| crate::test_support::complete_fail(0x0402));
         let mut objects = MemoryObjectAuthority::<1, 2>::new();
         let object = objects
             .grant_backing(
+                &creation,
                 backing,
                 PAGE_SIZE,
                 MemoryObjectKind::PageBacked,
                 MemoryProtection::READ_WRITE_EXECUTE,
             )
+            .unwrap_or_else(|_| crate::test_support::complete_fail(0x0402));
+        let _object_owner = registry
+            .creation_into_internal(creation)
             .unwrap_or_else(|_| crate::test_support::complete_fail(0x0402));
 
         let mut candidates = [

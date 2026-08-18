@@ -34,4 +34,20 @@ pub(crate) mod frame_roles {
             ObjectBackingKind::AllocatorOwned
         }
     }
+
+    #[derive(Debug)]
+    pub(crate) struct GrantTransitionError<G>(pub(crate) G);
+
+    pub(crate) struct FrameRoleManager<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>;
+
+    impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+        FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>
+    {
+        pub(crate) fn cancel_object_backing(
+            &mut self,
+            _grant: ObjectBackingGrant,
+        ) -> Result<(), GrantTransitionError<ObjectBackingGrant>> {
+            Ok(())
+        }
+    }
 }

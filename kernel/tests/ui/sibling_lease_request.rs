@@ -2,6 +2,8 @@
 
 #[path = "frame_roles_stub.rs"]
 mod memory;
+#[path = "../../src/object/mod.rs"]
+mod object;
 #[path = "../../src/memory/vm.rs"]
 mod vm;
 

@@ -4,6 +4,8 @@
 mod boot;
 #[path = "../../src/arch/x86_64/mm/mod.rs"]
 mod mm;
+#[path = "../../src/object/mod.rs"]
+mod object;
 #[path = "../../src/memory/mod.rs"]
 mod memory;
 

@@ -873,7 +873,10 @@ mod tests {
 
     use super::super::object::MemoryObjectKind;
     use super::*;
+    use crate::object::{InternalRef, ObjectRegistry};
+    use deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT;
     use std::boxed::Box;
+    use std::ops::{Deref, DerefMut};
 
     struct FakePublisher {
         address_space: AddressSpaceKey,
@@ -925,27 +928,75 @@ mod tests {
         }
     }
 
+    struct TestObjects<const OBJECTS: usize, const LEASES: usize> {
+        registry: ObjectRegistry<OBJECTS>,
+        authority: MemoryObjectAuthority<OBJECTS, LEASES>,
+        owners: [Option<InternalRef>; OBJECTS],
+    }
+
+    impl<const OBJECTS: usize, const LEASES: usize> TestObjects<OBJECTS, LEASES> {
+        fn new() -> Self {
+            Self {
+                registry: ObjectRegistry::new(),
+                authority: MemoryObjectAuthority::new(),
+                owners: core::array::from_fn(|_| None),
+            }
+        }
+
+        fn insert_owner(&mut self, owner: InternalRef) {
+            let slot = self
+                .owners
+                .iter()
+                .position(Option::is_none)
+                .expect("test object owner capacity matches payload capacity");
+            self.owners[slot] = Some(owner);
+        }
+    }
+
+    impl<const OBJECTS: usize, const LEASES: usize> Deref for TestObjects<OBJECTS, LEASES> {
+        type Target = MemoryObjectAuthority<OBJECTS, LEASES>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.authority
+        }
+    }
+
+    impl<const OBJECTS: usize, const LEASES: usize> DerefMut for TestObjects<OBJECTS, LEASES> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.authority
+        }
+    }
+
     fn object<const OBJECTS: usize, const LEASES: usize>(
-        authority: &mut MemoryObjectAuthority<OBJECTS, LEASES>,
+        authority: &mut TestObjects<OBJECTS, LEASES>,
         ceiling: Protection,
     ) -> MemoryObjectKey {
         object_at(authority, 0x20_000, ceiling)
     }
 
     fn object_at<const OBJECTS: usize, const LEASES: usize>(
-        authority: &mut MemoryObjectAuthority<OBJECTS, LEASES>,
+        authority: &mut TestObjects<OBJECTS, LEASES>,
         physical_start: u64,
         ceiling: Protection,
     ) -> MemoryObjectKey {
         let backing = crate::memory::frame_roles::synthetic_allocator_backing(physical_start, 8);
-        authority
+        let creation = authority
+            .registry
+            .create(DW_OBJECT_TYPE_MEMORY_OBJECT)
+            .unwrap();
+        let key = authority
+            .authority
             .grant_backing(
+                &creation,
                 backing,
                 PAGE_SIZE * 8,
                 MemoryObjectKind::PageBacked,
                 ceiling,
             )
-            .unwrap()
+            .unwrap();
+        let owner = authority.registry.creation_into_internal(creation).unwrap();
+        authority.insert_owner(owner);
+        key
     }
 
     #[allow(
@@ -1004,7 +1055,7 @@ mod tests {
 
     #[test]
     fn replacement_publishes_model_and_lease_together() {
-        let mut authority = MemoryObjectAuthority::<2, 8>::new();
+        let mut authority = TestObjects::<2, 8>::new();
         let object = object(&mut authority, Protection::READ_WRITE_EXECUTE);
         let mut region = region::<4>(PAGE_SIZE, PAGE_SIZE * 8);
         let token = authorization(&authority, object, &region, Protection::READ_WRITE_EXECUTE);
@@ -1041,7 +1092,7 @@ mod tests {
 
     #[test]
     fn mapping_authority_is_captured_across_protect_and_split_replacements() {
-        let mut authority = MemoryObjectAuthority::<2, 8>::new();
+        let mut authority = TestObjects::<2, 8>::new();
         let object = object(&mut authority, Protection::READ_WRITE_EXECUTE);
         let mut region = region::<4>(PAGE_SIZE, PAGE_SIZE * 8);
         let read = authorization(&authority, object, &region, Protection::READ);
@@ -1124,7 +1175,7 @@ mod tests {
 
     #[test]
     fn object_wide_wx_aliases_and_publisher_failures_are_rejected_without_mutation() {
-        let mut authority = MemoryObjectAuthority::<2, 8>::new();
+        let mut authority = TestObjects::<2, 8>::new();
         let object = object(&mut authority, Protection::READ_WRITE_EXECUTE);
         let mut first = region::<2>(PAGE_SIZE, PAGE_SIZE * 4);
         let read_write = authorization(&authority, object, &first, Protection::READ_WRITE);
@@ -1199,7 +1250,7 @@ mod tests {
 
     #[test]
     fn partial_unmap_needs_split_capacity_and_rolls_back_before_publication() {
-        let mut authority = MemoryObjectAuthority::<2, 4>::new();
+        let mut authority = TestObjects::<2, 4>::new();
         let object = object(&mut authority, Protection::READ_WRITE);
         let mut region = region::<1>(PAGE_SIZE, PAGE_SIZE * 4);
         let read_write = authorization(&authority, object, &region, Protection::READ_WRITE);
@@ -1229,7 +1280,7 @@ mod tests {
 
     #[test]
     fn map_anywhere_uses_first_fit_and_reports_fragmented_exhaustion() {
-        let mut authority = MemoryObjectAuthority::<2, 8>::new();
+        let mut authority = TestObjects::<2, 8>::new();
         let object = object(&mut authority, Protection::READ_WRITE);
         let mut region = region::<4>(PAGE_SIZE, PAGE_SIZE * 4);
         let mut publisher = FakePublisher::for_region(&region);
@@ -1314,7 +1365,7 @@ mod tests {
             .create_region(first_space, PAGE_SIZE * 4, PAGE_SIZE * 2)
             .unwrap();
 
-        let mut objects = MemoryObjectAuthority::<1, 4>::new();
+        let mut objects = TestObjects::<1, 4>::new();
         let object = object(&mut objects, Protection::READ_WRITE_EXECUTE);
         let read = authorization(&objects, object, &first, Protection::READ);
         let mut swapped_publisher = FakePublisher {
@@ -1379,11 +1430,11 @@ mod tests {
         let space = spaces.create_address_space().unwrap();
         let mut region: AddressRegion<1> =
             spaces.create_region(space, PAGE_SIZE, PAGE_SIZE).unwrap();
-        let mut first = MemoryObjectAuthority::<1, 1>::new();
+        let mut first = TestObjects::<1, 1>::new();
         let first_object = object_at(&mut first, 0x20_000, Protection::READ);
         let authorization = authorization(&first, first_object, &region, Protection::READ);
 
-        let mut second = MemoryObjectAuthority::<1, 1>::new();
+        let mut second = TestObjects::<1, 1>::new();
         let second_object = object_at(&mut second, 0x40_000, Protection::READ);
         assert_ne!(first_object, second_object);
         let mut publisher = FakePublisher::for_region(&region);

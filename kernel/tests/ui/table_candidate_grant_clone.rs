@@ -2,6 +2,8 @@
 
 #[path = "../../src/boot/mod.rs"]
 mod boot;
+#[path = "../../src/object/mod.rs"]
+mod object;
 #[path = "../../src/memory/mod.rs"]
 mod memory;
 
