@@ -22,6 +22,12 @@ const COMMANDS: &[&str] = &[
     "toolchain",
 ];
 const TEST_TIERS: &[&str] = &["host", "guest", "integration"];
+const HANDLE_HOST_TEST_FILTERS: &[&str] = &[
+    "handle::",
+    "service::",
+    "object::tests::",
+    "memory::vm::address_region::tests::",
+];
 const HARNESS_CONFIG: &str = "tooling/guest-harness.toml";
 const TRUSTED_TOOLCHAIN_CONFIG: &str = "tooling/rust-toolchain.toml";
 const BUILD_TOOLS_CONFIG: &str = "tooling/build-tools.toml";
@@ -30,7 +36,7 @@ const MAX_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_SERIAL_BYTES: usize = 4 * 1024 * 1024;
 const HELP: &str = r#"Deepwyrm project tasks
 
-Status: DW0-A host tooling and DW0-B dry-run harness planning are available.
+Status: host tooling plus DW0-B/C/D6 focused test and dry-run planning surfaces are available.
 Build, image, and integration operations remain planned and are not implemented.
 
 Usage:
@@ -327,7 +333,7 @@ fn run_invocation(invocation: Invocation) -> io::Result<u8> {
                     command.args(["--package", "deepwyrm-kernel", "--lib", "--tests"]);
                 }
                 Some(HostTestFilter::Handles) => {
-                    command.args(["--package", "deepwyrm-kernel", "--lib"]);
+                    return run_handle_host_tests();
                 }
                 None => {
                     command.args(["--workspace", "--all-targets"]);
@@ -341,6 +347,26 @@ fn run_invocation(invocation: Invocation) -> io::Result<u8> {
 
     let status = command.status()?;
     Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8)
+}
+
+fn run_handle_host_tests() -> io::Result<u8> {
+    for filter in HANDLE_HOST_TEST_FILTERS {
+        let status = Command::new("cargo")
+            .current_dir(workspace_root())
+            .args([
+                "test",
+                "--locked",
+                "--package",
+                "deepwyrm-kernel",
+                "--lib",
+                filter,
+            ])
+            .status()?;
+        if !status.success() {
+            return Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8);
+        }
+    }
+    Ok(0)
 }
 
 fn emit_harness_plan(
@@ -2352,7 +2378,7 @@ mod tests {
     }
 
     #[test]
-    fn dw0a_and_dw0b_commands_have_explicit_actions() {
+    fn available_commands_have_explicit_actions() {
         for (args, expected) in [
             (&["format"][..], Action::Command(Invocation::Format)),
             (&["check"][..], Action::Command(Invocation::Check)),

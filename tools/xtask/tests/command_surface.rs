@@ -8,7 +8,7 @@ fn xtask(args: &[&str]) -> Output {
 }
 
 #[test]
-fn help_distinguishes_available_dw0a_tooling_from_deferred_operations() {
+fn help_distinguishes_available_host_tooling_from_deferred_operations() {
     let output = xtask(&["help"]);
 
     assert!(output.status.success());
