@@ -177,6 +177,15 @@ fn e4_msr_programming_enables_sce_last_and_verifies_readback() {
 }
 
 #[test]
+fn e5_cr0_normalization_sets_only_task_switched() {
+    for value in [0, u64::MAX, 0x1234_5678_9abc_def0, CR0_TASK_SWITCHED] {
+        let normalized = normalize_cr0_for_e5(value);
+        assert_ne!(normalized & CR0_TASK_SWITCHED, 0);
+        assert_eq!(normalized & !CR0_TASK_SWITCHED, value & !CR0_TASK_SWITCHED);
+    }
+}
+
+#[test]
 fn e4_cr4_normalization_clears_only_fsgsbase() {
     for value in [0, u64::MAX, 0x1234_5678_9abc_def0, CR4_FSGSBASE] {
         let normalized = normalize_cr4_for_e4(value);

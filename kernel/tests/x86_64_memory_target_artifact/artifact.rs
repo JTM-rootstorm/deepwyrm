@@ -36,6 +36,13 @@ pub(super) fn validate_entry_normalization(disassembly: &str) {
     assert_eq!(normalizer.matches("btr\trax, 0x15").count(), 1);
     assert_eq!(normalizer.matches("btr\tqword ptr [rsp], 0x12").count(), 1);
 
+    let e5_fp_policy = function_body(disassembly, "normalize_cr0_for_e5");
+    assert_eq!(e5_fp_policy.matches("or\trax, 0x8").count(), 1);
+    let e5_fp_live = function_body(disassembly, "enforce_live_fp_simd_unavailable");
+    assert_eq!(e5_fp_live.matches(", cr0").count(), 2);
+    assert_eq!(e5_fp_live.matches("mov\tcr0,").count(), 1);
+    assert_eq!(e5_fp_live.matches("normalize_cr0_for_e5").count(), 1);
+
     let e4_policy = function_body(disassembly, "normalize_cr4_for_e4");
     assert_eq!(e4_policy.matches("and\trax, -0x10001").count(), 1);
     let e4_live = function_body(disassembly, "normalize_live_cr4");
@@ -53,6 +60,42 @@ pub(super) fn validate_entry_normalization(disassembly: &str) {
         .find("deepwyrm_kernel::kernel_main")
         .expect("target entry calls kernel_main");
     assert!(normalize_call < kernel_main_call);
+}
+
+pub(super) fn validate_fp_simd_unavailable(disassembly: &str) {
+    const FORBIDDEN_MNEMONICS: &[&str] = &[
+        "emms", "f2xm1", "fabs", "fadd", "fbld", "fbstp", "fchs", "fclex", "fcmov", "fcom", "fcos",
+        "fdecstp", "fdiv", "ffree", "fiadd", "ficom", "fidiv", "fild", "fimul", "fincstp", "finit",
+        "fist", "fisub", "fld", "fmul", "fnclex", "fninit", "fnop", "fnsave", "fnst", "fpatan",
+        "fprem", "fptan", "frndint", "frstor", "fsave", "fscale", "fsin", "fsincos", "fsqrt",
+        "fst", "fsub", "ftst", "fucom", "fwait", "fxam", "fxch", "fxrstor", "fxsave", "fxtract",
+        "fyl2x", "ldmxcsr", "stmxcsr", "xrstor", "xsave",
+    ];
+    for line in text_disassembly(disassembly).lines() {
+        let instruction = line
+            .rsplit('\t')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let mnemonic = instruction.split_whitespace().next().unwrap_or("");
+        assert!(
+            !["xmm", "ymm", "zmm"]
+                .iter()
+                .any(|register| instruction.contains(register)),
+            "E5 kernel text uses FP/SIMD register state while policy is unavailable: {line}"
+        );
+        assert!(
+            !(0..8).any(|index| instruction.contains(&format!("mm{index}"))),
+            "E5 kernel text uses MMX register state while policy is unavailable: {line}"
+        );
+        assert!(
+            !FORBIDDEN_MNEMONICS
+                .iter()
+                .any(|prefix| mnemonic.starts_with(prefix)),
+            "E5 kernel text uses FP/SIMD state while policy is unavailable: {line}"
+        );
+    }
 }
 
 pub(super) fn function_body<'a>(disassembly: &'a str, symbol: &str) -> &'a str {

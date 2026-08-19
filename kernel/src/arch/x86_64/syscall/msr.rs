@@ -20,6 +20,7 @@ pub(crate) const IA32_KERNEL_GS_BASE: u32 = 0xc000_0102;
 
 pub(crate) const EFER_SCE: u64 = 1;
 pub(crate) const E4_FMASK: u64 = 0x001f_7700;
+pub(crate) const CR0_TASK_SWITCHED: u64 = 1 << 3;
 pub(crate) const CR4_FSGSBASE: u64 = 1 << 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,6 +38,10 @@ pub(crate) struct SyscallMsrPlan {
 pub(crate) enum SyscallMsrPlanError {
     NonCanonicalKernelAddress,
     ZeroKernelAddress,
+}
+
+pub(crate) const fn normalize_cr0_for_e5(cr0: u64) -> u64 {
+    cr0 | CR0_TASK_SWITCHED
 }
 
 pub(crate) const fn normalize_cr4_for_e4(cr4: u64) -> u64 {

@@ -18,7 +18,7 @@ pub(crate) use frame::{
     unused_imports,
     reason = "E4 MSR constants remain visible to target/source contract checks"
 )]
-pub(crate) use msr::{E4_FMASK, SyscallMsrPlan, normalize_cr4_for_e4};
+pub(crate) use msr::{E4_FMASK, SyscallMsrPlan, normalize_cr0_for_e5, normalize_cr4_for_e4};
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[allow(

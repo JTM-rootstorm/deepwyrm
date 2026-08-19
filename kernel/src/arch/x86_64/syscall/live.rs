@@ -9,8 +9,9 @@ use crate::memory::kernel_stack::KernelStackBounds;
 
 use super::frame::{PerCpuEntryState, RawSyscallFrame, ValidatedUserReturn};
 use super::msr::{
-    CR4_FSGSBASE, IA32_EFER, SyscallMsrAccess, SyscallMsrPlan, SyscallMsrPlanError,
-    SyscallMsrProgramError, normalize_cr4_for_e4, program_and_verify, verify,
+    CR0_TASK_SWITCHED, CR4_FSGSBASE, IA32_EFER, SyscallMsrAccess, SyscallMsrPlan,
+    SyscallMsrPlanError, SyscallMsrProgramError, normalize_cr0_for_e5, normalize_cr4_for_e4,
+    program_and_verify, verify,
 };
 
 const INSTALL_UNSTARTED: u8 = 0;
@@ -100,6 +101,7 @@ pub(crate) enum SyscallInstallError {
     UnsupportedCpu,
     InterruptsEnabled,
     FsgsbaseNotCleared,
+    FpSimdPolicyNotEnforced,
     InvalidMsrPlan(SyscallMsrPlanError),
     MsrReadback,
 }
@@ -163,6 +165,59 @@ unsafe fn write_msr(msr: u32, value: u64) {
             options(nostack, preserves_flags)
         );
     }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "CR0.TS makes the E3 unavailable FP/SIMD policy architectural before any CPL3 execution"
+)]
+unsafe fn enforce_live_fp_simd_unavailable() -> Result<(), SyscallInstallError> {
+    let before: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, cr0",
+            out(reg) before,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    let expected = normalize_cr0_for_e5(before);
+    if before != expected {
+        unsafe {
+            core::arch::asm!(
+                "mov cr0, {}",
+                in(reg) expected,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+    }
+    let observed: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, cr0",
+            out(reg) observed,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    if observed != expected || observed & CR0_TASK_SWITCHED == 0 {
+        return Err(SyscallInstallError::FpSimdPolicyNotEnforced);
+    }
+    Ok(())
+}
+
+#[allow(
+    unsafe_code,
+    reason = "IF-clear syscall entry checks that user FP/SIMD remains trapped before and after runtime dispatch"
+)]
+fn live_fp_simd_unavailable_is_enforced() -> bool {
+    let cr0: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, cr0",
+            out(reg) cr0,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    cr0 & CR0_TASK_SWITCHED != 0
 }
 
 #[allow(
@@ -310,6 +365,7 @@ pub(crate) unsafe fn install_syscall_boundary() -> Result<(), SyscallInstallErro
         if !cpu_supports_syscall() {
             return Err(SyscallInstallError::UnsupportedCpu);
         }
+        unsafe { enforce_live_fp_simd_unavailable()? };
         unsafe { normalize_live_cr4()? };
         unsafe { initialize_entry_state(privilege.top) };
 
@@ -356,6 +412,9 @@ pub(crate) fn validate_live_syscall_boundary() -> Result<(), SyscallInstallError
     }
     if cr4 & CR4_FSGSBASE != 0 {
         return Err(SyscallInstallError::FsgsbaseNotCleared);
+    }
+    if !live_fp_simd_unavailable_is_enforced() {
+        return Err(SyscallInstallError::FpSimdPolicyNotEnforced);
     }
     let plan = unsafe { expected_plan() };
     verify(&mut LiveMsrAccess, plan).map_err(map_program_error)
@@ -532,10 +591,16 @@ pub(crate) unsafe extern "sysv64" fn dw_x86_64_syscall_dispatch(frame: *mut RawS
         halt_forever();
     }
     let frame = unsafe { &mut *frame };
-    if !frame.validates_entry() || frame.binding_generation() != current_binding_generation() {
+    if !frame.validates_entry()
+        || frame.binding_generation() != current_binding_generation()
+        || !live_fp_simd_unavailable_is_enforced()
+    {
         halt_forever();
     }
     unsafe { dispatch_bound_runtime(frame) };
+    if !live_fp_simd_unavailable_is_enforced() {
+        halt_forever();
+    }
     // A returning runtime handler must have authorized this exact frame after
     // current-Process mapping validation. Assembly fails stopped otherwise.
 }

@@ -96,6 +96,7 @@ fn production_and_six_memory_selector_artifacts_are_separated() {
     validate_kernel_stack_artifact_geometry(&production_symbols);
     let production_disassembly = disassembly(&llvm_objdump, &production);
     validate_entry_normalization(&production_disassembly);
+    validate_fp_simd_unavailable(&production_disassembly);
     let production_stack_artifact = build_stack_kernel(
         &workspace,
         &output_root.path().join("production-stack-sizes"),

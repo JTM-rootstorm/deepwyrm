@@ -84,6 +84,25 @@ fn msr_policy_matches_e0_and_return_requires_explicit_authorization() {
 }
 
 #[test]
+fn e5_fp_simd_unavailable_policy_is_enforced_at_every_user_boundary() {
+    let live = source("src/arch/x86_64/syscall/live.rs");
+    let msr = source("src/arch/x86_64/syscall/msr.rs");
+    let exceptions = source("src/arch/x86_64/exceptions.rs");
+
+    assert!(msr.contains("CR0_TASK_SWITCHED"));
+    assert!(msr.contains("cr0 | CR0_TASK_SWITCHED"));
+    assert!(live.contains("enforce_live_fp_simd_unavailable()?"));
+    assert!(live.contains("live_fp_simd_unavailable_is_enforced()"));
+    assert!(
+        live.match_indices("!live_fp_simd_unavailable_is_enforced()")
+            .count()
+            >= 3
+    );
+    assert!(exceptions.contains("ExceptionVector::DeviceNotAvailable"));
+    assert!(exceptions.contains("ExceptionDisposition::UserFatal"));
+}
+
+#[test]
 fn syscall_assembly_is_freestanding_and_calls_only_the_rust_dispatch() {
     let clang = "/usr/lib/llvm/22/bin/clang-22";
     if Command::new(clang).arg("--version").output().is_err() {
