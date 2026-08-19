@@ -603,7 +603,20 @@ fn enter_smoke<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
             .active
             .current_process_address_space(runtime.process);
         crate::arch::x86_64::syscall::ValidatedUserReturn::initial(context, &mut mappings)
-            .unwrap_or_else(|_| fail(0xb5))
+            .unwrap_or_else(|error| match error {
+                crate::arch::x86_64::syscall::UserReturnError::NonCanonicalUserAddress => {
+                    fail(0xb5)
+                }
+                crate::arch::x86_64::syscall::UserReturnError::InstructionNotExecutable => {
+                    fail(0xb6)
+                }
+                crate::arch::x86_64::syscall::UserReturnError::StackNotWritable => fail(0xb7),
+                crate::arch::x86_64::syscall::UserReturnError::UnsupportedTlsPolicy => fail(0xb8),
+                crate::arch::x86_64::syscall::UserReturnError::UnsupportedFpSimdPolicy => {
+                    fail(0xb9)
+                }
+                crate::arch::x86_64::syscall::UserReturnError::BindingChanged => fail(0xba),
+            })
     };
     unsafe {
         crate::arch::x86_64::syscall::enter_validated_user(
