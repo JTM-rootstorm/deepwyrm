@@ -851,6 +851,24 @@ fn thread_start_validates_the_target_process_address_space() {
         execution.scheduler_state(thread),
         Some(SchedulerThreadState::Runnable)
     );
+    assert_eq!(
+        thread_start(
+            &mut user,
+            &mut correct,
+            &mut registry,
+            &mut tasks,
+            &execution,
+            caller,
+            DwUserAddress(BASE + 0x280),
+            THREAD_START_BYTES as u64,
+            &mut cleanup,
+        ),
+        DW_STATUS_BAD_STATE
+    );
+    assert_eq!(
+        execution.scheduler_state(thread),
+        Some(SchedulerThreadState::Runnable)
+    );
     assert_eq!(execution.schedule_next().unwrap().current, Some(thread));
     let pins = tasks.exit_thread(thread, 0).unwrap();
     let retired = execution.retire_exit_pins(pins);

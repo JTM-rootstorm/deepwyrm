@@ -296,6 +296,25 @@ fn entry_shim_switches_stacks_before_its_first_push() {
 }
 
 #[test]
+fn production_entry_keeps_guest_completion_hooks_feature_gated() {
+    let kernel = fs::read_to_string(kernel_root().join("src/lib.rs")).expect("read kernel root");
+    assert!(kernel.contains("#[cfg(feature = \"test-support\")]\npub mod test_support;"));
+
+    for marker in [
+        "match test_support::BUILD_GUEST_TEST",
+        "test_support::run_memory_guest_test(active_paging)",
+    ] {
+        let position = kernel.find(marker).expect("test-support hook exists");
+        let prefix = &kernel[position.saturating_sub(160)..position];
+        assert!(
+            prefix.contains("#[cfg(feature = \"test-support\")]"),
+            "production-visible guest hook lacked a local test-support gate: {marker}"
+        );
+    }
+    assert!(kernel.contains("#[cfg(not(feature = \"test-support\"))]\n        loop {"));
+}
+
+#[test]
 fn kernel_assembler_disables_clang_default_configuration_discovery() {
     let build_script =
         fs::read_to_string(kernel_root().join("build.rs")).expect("read kernel build script");
