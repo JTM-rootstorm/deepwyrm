@@ -84,6 +84,10 @@ pub(crate) struct ProcessKey(ObjectId);
 pub(crate) struct ThreadKey(ObjectId);
 
 impl TaskGroupKey {
+    pub(crate) const fn from_object_id(object: ObjectId) -> Self {
+        Self(object)
+    }
+
     pub(crate) const fn object_id(self) -> ObjectId {
         self.0
     }

@@ -211,6 +211,13 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         Ok(())
     }
 
+    pub(crate) fn process_handles(
+        &self,
+        key: ProcessKey,
+    ) -> Result<&HandleTable<HANDLES>, TaskError> {
+        Ok(&self.process(key)?.handles)
+    }
+
     pub(crate) fn process_handles_mut(
         &mut self,
         key: ProcessKey,
@@ -224,6 +231,21 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
 
     pub(crate) fn process_handle_count(&self, key: ProcessKey) -> Result<usize, TaskError> {
         Ok(self.process(key)?.handles.len())
+    }
+
+    pub(crate) fn thread_process(&self, key: ThreadKey) -> Result<ProcessKey, TaskError> {
+        Ok(ProcessKey(self.thread(key)?.parent.id()))
+    }
+
+    pub(crate) fn drain_exited_process_handles<const OBJECTS: usize>(
+        &mut self,
+        registry: &mut ObjectRegistry<OBJECTS>,
+        key: ProcessKey,
+    ) -> Result<DrainResult<HANDLES>, TaskError> {
+        if self.process(key)?.state.state != DW_TASK_STATE_EXITED {
+            return Err(TaskError::BadState);
+        }
+        self.drain_process_handles(registry, key)
     }
 
     fn drain_process_handles<const OBJECTS: usize>(

@@ -5,6 +5,9 @@
 //! dispatch, usercopy, task ownership, and architecture register handling stay
 //! in later E phases.
 
+mod abi_bytes;
+mod adapters;
+
 use deepwyrm_abi::{
     DW_STATUS_NOT_SUPPORTED, DwKnownSyscall, DwStatus, DwSyscallId, DwSyscallImplementationPhase,
 };
