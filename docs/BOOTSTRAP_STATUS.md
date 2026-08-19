@@ -64,21 +64,33 @@ completed-phase acceptance. No physical-hardware acceptance claim is made;
 VM execution cannot establish one. This DW0-C record also does not close the
 earlier pending DW0-B loader/guest execution gate.
 
-DW0-D now provides the kernel object/handle core, generated rights policy,
+DW0-D provides the kernel object/handle core, generated rights policy,
 MemoryObject lifetime integration, mapping authorization pins, and
-syscall-independent close/duplicate/object-info services. Its fresh D8
-host/core and accepted-toolchain artifact gates pass at clean revision
-`db09ce173adfb6850765fe2a4547d50a1050ac10`. The implementation candidate
-`fa4be89efc14aff1301b4a5ea6a9f4af9d11e29e` has a manual D7 security SOFT
-ACCEPT; proper Daybreak Blue / Dawnbreak scanning remains pending. See
-[`DW0_D_VALIDATION.md`](DW0_D_VALIDATION.md) and
-[`DW0_D_SECURITY_REVIEW.md`](../security/DW0_D_SECURITY_REVIEW.md).
+syscall-independent close/duplicate/object-info services. Its D8 host/core and
+accepted-toolchain artifact gates pass at revision
+`db09ce173adfb6850765fe2a4547d50a1050ac10`. D remains SOFT ACCEPTED for phase
+progression; formal Daybreak scanning of candidate
+`fa4be89efc14aff1301b4a5ea6a9f4af9d11e29e` remains explicit security debt.
 
-The repository still does not provide DW0-E tasks/syscalls, later
-IPC/synchronization/time behavior, a primordial Wyrmroot process, or a completed
-DW0 release-candidate end-to-end gate. DW0-D has no guest/VM gate and does not
-close the inherited DW0-B/C Wyrmroot/Q35 execution debt. No source or artifact
-result in these records establishes VM behavior that was not actually tested.
+DW0-E now provides the root task hierarchy, process-local handle ownership,
+cooperative scheduler, ring-3 x86_64 entry/return, generated native syscall
+dispatch, pinned usercopy, task lifecycle/control, and the freestanding
+`task-syscall-smoke` process. E9 host and accepted-target gates pass at clean
+revision `e8394d6e6d160d9e4d04769943c2500cfd562c10`; the behavior candidate is
+`579e12074e1fe9ec89507e033381fed66676c12c`. The canonical Wyrmroot-paired VM
+path passed selector 10 and includes the hostile-GS SWAPGS regression.
+
+E is likewise SOFT ACCEPTED for progression to DW0-F. Formal
+`gpt-daybreak-blue-latest` review remains pending and is not represented as a
+hard security PASS. See [`DW0_E_VALIDATION.md`](DW0_E_VALIDATION.md) and
+[`DW0_E_SECURITY_REVIEW.md`](../security/DW0_E_SECURITY_REVIEW.md).
+
+The repository still does not provide DW0-F IPC/waits/timers, DW0-G primordial
+ELF/bootstrap launch, DW0-H SMP closure, or a completed DW0 release-candidate
+security gate. The D and E Daybreak debts must be revisited before final DW0
+security acceptance. Existing inherited DW0-B/C claim boundaries remain as
+recorded in their validation documents; no new physical-hardware acceptance is
+claimed here.
 
 ## Authority
 

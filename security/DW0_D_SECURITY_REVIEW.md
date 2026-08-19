@@ -104,4 +104,5 @@ DW0-F/H must separately review transfer, rollback, synchronization, teardown,
 and SMP-visible behavior when those surfaces exist.
 
 No security blocker remains inside DW0-D beyond the explicitly accepted
-residuals and pending proper Dawnbreak review above.
+residuals and pending proper Dawnbreak review above. The deferred formal review
+is also indexed in [`DW0_DEFERRED_DAYBREAK_REVIEWS.md`](DW0_DEFERRED_DAYBREAK_REVIEWS.md).
