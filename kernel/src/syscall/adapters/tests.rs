@@ -727,3 +727,158 @@ fn self_thread_termination_with_live_sibling_never_returns_to_reclaimed_context(
     assert_eq!(tasks.process_handle_count(process).unwrap(), 0);
     finish_task_cleanup(&mut registry, &mut tasks, cleanup);
 }
+
+struct ProcessBoundMappings {
+    process: ProcessKey,
+    executable: bool,
+    writable_stack: bool,
+}
+
+impl crate::arch::x86_64::syscall::UserReturnMappingValidation for ProcessBoundMappings {
+    fn executable_at(&mut self, _instruction_pointer: u64) -> bool {
+        self.executable
+    }
+
+    fn writable_byte_below(&mut self, _stack_pointer: u64) -> bool {
+        self.writable_stack
+    }
+}
+
+impl crate::arch::x86_64::syscall::ProcessUserReturnMappingValidation for ProcessBoundMappings {
+    fn process_key(&self) -> ProcessKey {
+        self.process
+    }
+}
+
+fn write_thread_start_args(
+    memory: &mut FakeUserMemory,
+    address: u64,
+    thread: DwHandle,
+    entry: u64,
+    stack_pointer: u64,
+) {
+    let offset = FakeUserMemory::offset(address, THREAD_START_BYTES);
+    let bytes = &mut memory.bytes[offset..offset + THREAD_START_BYTES];
+    bytes.fill(0);
+    bytes[0..4].copy_from_slice(&(THREAD_START_BYTES as u32).to_le_bytes());
+    bytes[4..8].copy_from_slice(&1_u32.to_le_bytes());
+    bytes[8..16].copy_from_slice(&thread.0.to_le_bytes());
+    bytes[16..24].copy_from_slice(&entry.to_le_bytes());
+    bytes[24..32].copy_from_slice(&stack_pointer.to_le_bytes());
+}
+
+#[test]
+fn thread_start_validates_the_target_process_address_space() {
+    use deepwyrm_abi::DW_RIGHT_EXECUTE;
+
+    let mut registry = ObjectRegistry::<24>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (caller, caller_ref) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let (target, target_ref) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let target_owner = registry.retain_internal_from_handle(&target_ref).unwrap();
+    let (thread, thread_ref) = tasks.create_thread(&mut registry, &target_owner).unwrap();
+    assert!(registry.release_internal(target_owner).unwrap().is_none());
+    assert!(registry.release_internal(root_owner).unwrap().is_none());
+    assert!(registry.release_handle(target_ref).unwrap().is_none());
+
+    let caller_handle = tasks
+        .process_handles_mut(caller)
+        .unwrap()
+        .install(caller_ref, DW_RIGHT_MODIFY)
+        .unwrap();
+    let thread_handle = tasks
+        .process_handles_mut(caller)
+        .unwrap()
+        .install(thread_ref, DW_RIGHT_EXECUTE)
+        .unwrap();
+    let mut user = FakeUserMemory::new();
+    write_thread_start_args(
+        &mut user,
+        BASE + 0x280,
+        thread_handle,
+        0x4000_1000,
+        0x5000_2000,
+    );
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let mut cleanup = CleanupQueue::<24>::new();
+
+    let mut wrong = ProcessBoundMappings {
+        process: caller,
+        executable: true,
+        writable_stack: true,
+    };
+    assert_eq!(
+        thread_start(
+            &mut user,
+            &mut wrong,
+            &mut registry,
+            &mut tasks,
+            &execution,
+            caller,
+            DwUserAddress(BASE + 0x280),
+            THREAD_START_BYTES as u64,
+            &mut cleanup,
+        ),
+        DW_STATUS_BAD_STATE
+    );
+    assert_eq!(execution.scheduler_state(thread), None);
+    assert_eq!(
+        tasks.thread_info(thread).unwrap().state,
+        deepwyrm_abi::DW_TASK_STATE_CREATED
+    );
+
+    let mut correct = ProcessBoundMappings {
+        process: target,
+        executable: true,
+        writable_stack: true,
+    };
+    assert_eq!(
+        thread_start(
+            &mut user,
+            &mut correct,
+            &mut registry,
+            &mut tasks,
+            &execution,
+            caller,
+            DwUserAddress(BASE + 0x280),
+            THREAD_START_BYTES as u64,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(
+        execution.scheduler_state(thread),
+        Some(SchedulerThreadState::Runnable)
+    );
+    assert_eq!(execution.schedule_next().unwrap().current, Some(thread));
+    let pins = tasks.exit_thread(thread, 0).unwrap();
+    let retired = execution.retire_exit_pins(pins);
+    let (process_pin, thread_pins) = retired.into_parts();
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        cleanup.push_optional(registry.release_internal(pin).unwrap());
+    }
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            caller,
+            thread_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            caller,
+            caller_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+    assert_eq!(tasks.process_handle_count(caller).unwrap(), 0);
+    assert_eq!(tasks.thread_process(thread), Err(TaskError::InvalidTask));
+}

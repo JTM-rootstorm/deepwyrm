@@ -941,7 +941,7 @@ fn user_return_status(error: crate::arch::x86_64::syscall::UserReturnError) -> D
 
 pub(crate) fn thread_start<
     U: UserPageAccess,
-    M: crate::arch::x86_64::syscall::UserReturnMappingValidation,
+    M: crate::arch::x86_64::syscall::ProcessUserReturnMappingValidation,
     const OBJECTS: usize,
     const GROUPS: usize,
     const PROCESSES: usize,
@@ -986,6 +986,17 @@ pub(crate) fn thread_start<
         Err(status) => return status,
     };
     let thread = ThreadKey::from_object_id(pin.id());
+    let target_process = match tasks.thread_process(thread) {
+        Ok(process) => process,
+        Err(error) => {
+            release_lookup_pin(registry, pin, cleanup);
+            return task_status(error);
+        }
+    };
+    if mappings.process_key() != target_process {
+        release_lookup_pin(registry, pin, cleanup);
+        return DW_STATUS_BAD_STATE;
+    }
     let start = ThreadStartState::from_validated_user_state(
         args.entry.0,
         args.stack_pointer.0,

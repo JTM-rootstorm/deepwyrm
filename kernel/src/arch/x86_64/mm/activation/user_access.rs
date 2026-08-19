@@ -96,6 +96,7 @@ pub(crate) struct LiveProcessAddressSpace<
 > {
     pub(super) root: &'borrow PageTableRoot,
     pub(super) identity: TableIdentity,
+    pub(super) process: crate::task::ProcessKey,
     pub(super) roles: &'borrow mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
     pub(super) target: TrackedActiveTarget<'borrow>,
     pub(super) _root: core::marker::PhantomData<&'root mut ()>,
@@ -350,5 +351,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.walk_leaf(address)
                 .is_ok_and(|walk| walk.user && walk.writable)
         })
+    }
+}
+
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    crate::arch::x86_64::syscall::ProcessUserReturnMappingValidation
+    for LiveProcessAddressSpace<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn process_key(&self) -> crate::task::ProcessKey {
+        self.process
     }
 }

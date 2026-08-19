@@ -134,3 +134,17 @@ fn e5_live_user_pins_guard_actual_atomic_write_batches() {
         .expect("atomic live target apply");
     assert!(reserve < apply);
 }
+
+#[test]
+fn e5_user_return_validation_is_bound_to_the_target_process() {
+    let activation = source("src/arch/x86_64/mm/activation.rs");
+    let access = source("src/arch/x86_64/mm/activation/user_access.rs");
+    let adapters = source("src/syscall/adapters.rs");
+
+    assert!(activation.contains("process: crate::task::ProcessKey"));
+    assert!(activation.contains("process,"));
+    assert!(access.contains("pub(super) process: crate::task::ProcessKey"));
+    assert!(access.contains("ProcessUserReturnMappingValidation"));
+    assert!(access.contains("self.process"));
+    assert!(adapters.contains("mappings.process_key() != target_process"));
+}

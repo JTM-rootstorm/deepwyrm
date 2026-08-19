@@ -49,6 +49,13 @@ pub(crate) trait UserReturnMappingValidation {
     fn writable_byte_below(&mut self, stack_pointer: u64) -> bool;
 }
 
+/// Mapping validator bound to the exact Process whose user context is being
+/// created. Cross-process Thread handles must not validate RIP/RSP against the
+/// caller's active address space by accident.
+pub(crate) trait ProcessUserReturnMappingValidation: UserReturnMappingValidation {
+    fn process_key(&self) -> crate::task::ProcessKey;
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UserReturnError {
     NonCanonicalUserAddress,

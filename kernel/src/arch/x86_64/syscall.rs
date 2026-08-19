@@ -10,8 +10,9 @@ mod msr;
     reason = "E4 return validation is consumed by E5 mapping-aware syscall adapters and E7 userspace entry"
 )]
 pub(crate) use frame::{
-    RawSyscallFrame, RawUserReturnContext, UserReturnError, UserReturnMappingValidation,
-    ValidatedUserReturn, is_lower_canonical_user_address, sanitize_user_rflags,
+    ProcessUserReturnMappingValidation, RawSyscallFrame, RawUserReturnContext, UserReturnError,
+    UserReturnMappingValidation, ValidatedUserReturn, is_lower_canonical_user_address,
+    sanitize_user_rflags,
 };
 #[allow(
     unused_imports,

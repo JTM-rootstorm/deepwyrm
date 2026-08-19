@@ -1136,11 +1136,13 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 {
     pub(crate) fn current_process_address_space(
         &mut self,
+        process: crate::task::ProcessKey,
     ) -> LiveProcessAddressSpace<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
         let target = &mut self.target;
         LiveProcessAddressSpace {
             root: &self.root,
             identity: self.identity,
+            process,
             roles: target.roles,
             target: user_access::TrackedActiveTarget {
                 scratch: &mut target.scratch,
