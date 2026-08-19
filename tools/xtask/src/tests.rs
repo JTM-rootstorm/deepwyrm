@@ -146,11 +146,15 @@ fn task_host_gate_covers_scheduler_resources_and_target_guard_contracts() {
         "task::execution::tests::",
         "arch::x86_64::syscall::tests::",
         "arch::x86_64::exceptions::tests::",
+        "memory::user_range::tests::",
         "memory::usercopy::tests::",
         "syscall::abi_bytes::tests::",
         "syscall::adapters::tests::",
         "syscall::native::tests::",
+        "service::tests::e_task_state_query_reuses_inspect_gated_service_lookup",
         "object::finalizer::tests::",
+        "object::finalizer::memory_route_tests::",
+        "memory::vm::object::tests::production_binding_consumes_creation_before_first_publication",
         "root_region_handle_close_preserves_address_space_until_process_exit",
     ] {
         assert!(TASK_HOST_TEST_FILTERS.contains(&filter));
@@ -158,6 +162,8 @@ fn task_host_gate_covers_scheduler_resources_and_target_guard_contracts() {
     assert_eq!(
         TASK_HOST_INTEGRATION_TESTS,
         &[
+            "object_registry_ui",
+            "memory_authority_ui",
             "task_authority_ui",
             "x86_64_activation_contract",
             "x86_64_entry_contract",
