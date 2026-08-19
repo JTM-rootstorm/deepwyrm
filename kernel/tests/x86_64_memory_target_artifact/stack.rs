@@ -204,6 +204,8 @@ pub(super) fn one_stack_size(
     matches[0].bytes
 }
 
+#[path = "stack/e7.rs"]
+mod e7;
 #[path = "stack/geometry.rs"]
 mod geometry;
 #[path = "stack/ist.rs"]
@@ -213,6 +215,7 @@ mod production;
 #[path = "stack/selector.rs"]
 mod selector;
 
+pub(super) use e7::validate_e7_stack_margin;
 pub(super) use geometry::validate_kernel_stack_artifact_geometry;
 pub(super) use production::validate_production_ist_stack_margin;
 pub(super) use selector::validate_selector_stack_margin;

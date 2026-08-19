@@ -189,7 +189,8 @@ pub(crate) fn build_e7_user_artifact(
     assemble_source(composite_source, object, layout)?;
 
     let rust_lld = env::var_os("DEEPWYRM_ACCEPTED_RUST_LLD")
-        .ok_or_else(|| "E7 target builds require DEEPWYRM_ACCEPTED_RUST_LLD".to_owned())?;
+        .or_else(|| env::var_os("CARGO_TARGET_X86_64_UNKNOWN_NONE_LINKER"))
+        .ok_or_else(|| "E7 target builds require the accepted Rust LLD path".to_owned())?;
     let status = Command::new(&rust_lld)
         .args([
             "-flavor",

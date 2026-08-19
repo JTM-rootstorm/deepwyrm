@@ -113,3 +113,26 @@ pub(super) fn build_stack_kernel(
     );
     artifact
 }
+
+pub(super) fn find_e7_user_artifact(target_dir: &Path) -> PathBuf {
+    let build_dir = target_dir.join("x86_64-unknown-none/debug/build");
+    let mut matches = Vec::new();
+    for entry in fs::read_dir(&build_dir).expect("read E7 build directory") {
+        let entry = entry.expect("read E7 build entry");
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("deepwyrm-kernel-") {
+            continue;
+        }
+        let artifact = entry.path().join("out/deepwyrm-e7-user.elf");
+        if artifact.is_file() {
+            matches.push(artifact);
+        }
+    }
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected one E7 userspace artifact under {}: {matches:?}",
+        target_dir.display()
+    );
+    matches.pop().unwrap()
+}
