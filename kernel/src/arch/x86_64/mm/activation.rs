@@ -388,6 +388,7 @@ pub(crate) struct ActiveDeepPaging<A> {
     target: A,
     root: PageTableRoot,
     identity: TableIdentity,
+    #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
     user_pins: crate::memory::usercopy::UserPinTracker<E5_USER_PIN_CAPACITY>,
 }
 
@@ -1185,6 +1186,7 @@ impl<H, T: Cr3ActivationTarget<H>> PreparedActivation<H, T> {
             target,
             root,
             identity,
+            #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
             user_pins: crate::memory::usercopy::UserPinTracker::new(),
         }
     }
