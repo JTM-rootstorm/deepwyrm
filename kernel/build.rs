@@ -6,6 +6,20 @@ use std::process::Command;
 
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
 
+pub(crate) const E7_USER_ENTRY: u64 = 0x0000_0000_4000_0000;
+pub(crate) const E7_USER_DATA: u64 = 0x0000_0000_4000_1000;
+pub(crate) const E7_USER_INFO: u64 = E7_USER_DATA;
+pub(crate) const E7_USER_REQUIRED: u64 = E7_USER_DATA + 0x80;
+pub(crate) const E7_USER_STACK_BOTTOM: u64 = 0x0000_0000_5000_0000;
+pub(crate) const E7_USER_STACK_TOP: u64 = E7_USER_STACK_BOTTOM + 4096;
+pub(crate) const E7_SYSCALL_ABI_GET_INFO: u32 = 0x0000_0001;
+pub(crate) const E7_SYSCALL_PROCESS_EXIT: u32 = 0x0001_0011;
+pub(crate) const E7_UNKNOWN_SYSCALL: u32 = 0xffff_fffe;
+pub(crate) const E7_STATUS_NOT_SUPPORTED: i32 = -14;
+pub(crate) const E7_ABI_INFO_SIZE: u32 = 64;
+pub(crate) const E7_ABI_VERSION: u32 = 0;
+pub(crate) const E7_PAGE_SIZE: u32 = 4096;
+
 fn main() {
     if let Err(error) = run() {
         panic!("x86_64 entry build failed: {error}");
@@ -21,6 +35,9 @@ fn run() -> Result<(), String> {
     let exceptions_path = manifest_dir.join("src/arch/x86_64/exceptions.S");
     let syscall_path = manifest_dir.join("src/arch/x86_64/syscall_entry.S");
     let guest_harness_path = manifest_dir.join("../tooling/guest-harness.toml");
+    let e7_user_source = manifest_dir.join("tests/userspace/e7_task_smoke.S");
+    let e7_user_linker = manifest_dir.join("tests/userspace/e7_user.ld");
+    let syscall_veneer = manifest_dir.join("../abi/generated/syscall_veneer_x86_64.S");
 
     println!("cargo:rerun-if-changed={}", layout_path.display());
     println!("cargo:rerun-if-changed={}", task_layout_path.display());
@@ -29,6 +46,10 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-changed={}", exceptions_path.display());
     println!("cargo:rerun-if-changed={}", syscall_path.display());
     println!("cargo:rerun-if-changed={}", guest_harness_path.display());
+    println!("cargo:rerun-if-changed={}", e7_user_source.display());
+    println!("cargo:rerun-if-changed={}", e7_user_linker.display());
+    println!("cargo:rerun-if-changed={}", syscall_veneer.display());
+    println!("cargo:rerun-if-env-changed=DEEPWYRM_ACCEPTED_RUST_LLD");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_CLANG");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_TEST_SUPPORT");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_GUEST_TEST_SELECTOR");
@@ -61,20 +82,143 @@ fn run() -> Result<(), String> {
     assemble_source(&exceptions_path, &exceptions_object, layout)?;
     assemble_source(&syscall_path, &syscall_object, layout)?;
 
-    for argument in linker_arguments(
-        layout,
-        task_layout,
-        &linker_path,
-        &[
-            entry_object.as_path(),
-            exceptions_object.as_path(),
-            syscall_object.as_path(),
-        ],
-    ) {
+    let mut link_objects = vec![
+        entry_object.as_path(),
+        exceptions_object.as_path(),
+        syscall_object.as_path(),
+    ];
+    let e7_user_object = out_dir.join("deepwyrm-e7-user.o");
+    let selector = env::var("DEEPWYRM_GUEST_TEST_SELECTOR").ok();
+    if selector.as_deref().is_some_and(is_e7_userspace_selector) {
+        let composite = out_dir.join("deepwyrm-e7-user.S");
+        let elf = out_dir.join("deepwyrm-e7-user.elf");
+        build_e7_user_artifact(
+            &e7_user_source,
+            &syscall_veneer,
+            &e7_user_linker,
+            &composite,
+            &e7_user_object,
+            &elf,
+            layout,
+        )?;
+        emit_e7_user_env(&elf);
+        link_objects.push(e7_user_object.as_path());
+    }
+
+    for argument in linker_arguments(layout, task_layout, &linker_path, &link_objects) {
         println!("cargo:rustc-link-arg={argument}");
     }
 
     Ok(())
+}
+
+fn is_e7_userspace_selector(selector: &str) -> bool {
+    matches!(
+        selector,
+        "task-syscall-smoke" | "task-syscall-sanitize" | "task-user-exception"
+    )
+}
+
+fn emit_e7_user_env(elf: &Path) {
+    for (name, value) in [
+        ("DEEPWYRM_E7_USER_ENTRY", E7_USER_ENTRY),
+        ("DEEPWYRM_E7_USER_DATA", E7_USER_DATA),
+        ("DEEPWYRM_E7_USER_INFO", E7_USER_INFO),
+        ("DEEPWYRM_E7_USER_REQUIRED", E7_USER_REQUIRED),
+        ("DEEPWYRM_E7_USER_STACK_BOTTOM", E7_USER_STACK_BOTTOM),
+        ("DEEPWYRM_E7_USER_STACK_TOP", E7_USER_STACK_TOP),
+    ] {
+        println!("cargo:rustc-env={name}={value}");
+    }
+    println!("cargo:rustc-env=DEEPWYRM_E7_USER_ELF={}", elf.display());
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the E7 artifact builder keeps every source/output/tool boundary explicit"
+)]
+pub(crate) fn build_e7_user_artifact(
+    user_source: &Path,
+    generated_veneer: &Path,
+    linker_script: &Path,
+    composite_source: &Path,
+    object: &Path,
+    elf: &Path,
+    layout: Layout,
+) -> Result<(), String> {
+    let body = fs::read_to_string(user_source)
+        .map_err(|error| format!("{}: {error}", user_source.display()))?;
+    let veneer = fs::read_to_string(generated_veneer)
+        .map_err(|error| format!("{}: {error}", generated_veneer.display()))?;
+    if !veneer.contains(".globl dw_syscall6") || !veneer.contains("syscall") {
+        return Err("generated x86_64 syscall veneer lost dw_syscall6".into());
+    }
+    let mut composite = String::from(
+        ".section .text.deepwyrm_test_e7_user,\"ax\",@progbits\n\
+         .p2align 4\n\
+         .globl __dw_test_e7_user_blob_start\n\
+         __dw_test_e7_user_blob_start:\n",
+    );
+    for line in e7_assembler_constants() {
+        composite.push_str(&line);
+        composite.push('\n');
+    }
+    composite.push_str(&body);
+    if !body.ends_with('\n') {
+        composite.push('\n');
+    }
+    for line in veneer.lines() {
+        if line.trim() == ".text" || line.trim().starts_with(".section .note.GNU-stack") {
+            continue;
+        }
+        composite.push_str(line);
+        composite.push('\n');
+    }
+    composite
+        .push_str(".p2align 4\n.globl __dw_test_e7_user_blob_end\n__dw_test_e7_user_blob_end:\n");
+    fs::write(composite_source, composite)
+        .map_err(|error| format!("{}: {error}", composite_source.display()))?;
+    assemble_source(composite_source, object, layout)?;
+
+    let rust_lld = env::var_os("DEEPWYRM_ACCEPTED_RUST_LLD")
+        .ok_or_else(|| "E7 target builds require DEEPWYRM_ACCEPTED_RUST_LLD".to_owned())?;
+    let status = Command::new(&rust_lld)
+        .args([
+            "-flavor",
+            "gnu",
+            "-static",
+            "--no-dynamic-linker",
+            "--build-id=none",
+            "--gc-sections",
+            "-z",
+            "noexecstack",
+            "-z",
+            "max-page-size=4096",
+        ])
+        .arg(format!("-T{}", linker_script.display()))
+        .arg(object)
+        .arg("-o")
+        .arg(elf)
+        .status()
+        .map_err(|error| format!("could not execute {:?}: {error}", rust_lld))?;
+    if !status.success() {
+        return Err(format!("E7 userspace link failed with {status}"));
+    }
+    Ok(())
+}
+
+fn e7_assembler_constants() -> Vec<String> {
+    vec![
+        format!(".equ DW_E7_USER_INFO_ADDRESS, {E7_USER_INFO:#x}"),
+        format!(".equ DW_E7_USER_REQUIRED_ADDRESS, {E7_USER_REQUIRED:#x}"),
+        format!(".equ DW_E7_SYSCALL_ABI_GET_INFO, {E7_SYSCALL_ABI_GET_INFO:#x}"),
+        format!(".equ DW_E7_SYSCALL_PROCESS_EXIT, {E7_SYSCALL_PROCESS_EXIT:#x}"),
+        format!(".equ DW_E7_UNKNOWN_SYSCALL, {E7_UNKNOWN_SYSCALL:#x}"),
+        format!(".equ DW_E7_STATUS_NOT_SUPPORTED, {E7_STATUS_NOT_SUPPORTED}"),
+        format!(".equ DW_E7_ABI_INFO_SIZE, {E7_ABI_INFO_SIZE}"),
+        format!(".equ DW_E7_ABI_VERSION, {E7_ABI_VERSION}"),
+        format!(".equ DW_E7_PAGE_SIZE, {E7_PAGE_SIZE}"),
+    ]
 }
 
 fn configure_guest_test(harness_path: &Path) -> Result<(), String> {

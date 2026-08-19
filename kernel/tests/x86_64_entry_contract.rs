@@ -315,6 +315,52 @@ fn production_entry_keeps_guest_completion_hooks_feature_gated() {
 }
 
 #[test]
+fn e7_user_contract_uses_generated_syscall_veneer_and_generated_abi_values() {
+    let source = fs::read_to_string(kernel_root().join("tests/userspace/e7_task_smoke.S"))
+        .expect("read E7 userspace source");
+    let veneer = fs::read_to_string(kernel_root().join("../abi/generated/syscall_veneer_x86_64.S"))
+        .expect("read generated syscall veneer");
+    let linker = fs::read_to_string(kernel_root().join("tests/userspace/e7_user.ld"))
+        .expect("read E7 userspace linker script");
+
+    assert!(source.contains("callq dw_syscall6"));
+    assert!(
+        !source
+            .lines()
+            .any(|line| line.trim_start().starts_with("syscall"))
+    );
+    assert!(veneer.contains(".globl dw_syscall6"));
+    assert!(veneer.lines().any(|line| line.trim() == "syscall"));
+    assert!(linker.contains("ENTRY(_start)"));
+    assert!(linker.contains("FLAGS(5)"));
+    assert!(!linker.contains("FLAGS(7)"));
+    assert!(linker.contains("SIZEOF(.text) <= 4096"));
+
+    assert_eq!(kernel_build::E7_USER_ENTRY, 0x4000_0000);
+    assert_eq!(kernel_build::E7_USER_DATA, 0x4000_1000);
+    assert_eq!(kernel_build::E7_USER_STACK_BOTTOM, 0x5000_0000);
+    assert_eq!(kernel_build::E7_USER_STACK_TOP, 0x5000_1000);
+    assert_eq!(
+        kernel_build::E7_SYSCALL_ABI_GET_INFO,
+        deepwyrm_abi::DW_SYSCALL_ABI_GET_INFO.0
+    );
+    assert_eq!(
+        kernel_build::E7_SYSCALL_PROCESS_EXIT,
+        deepwyrm_abi::DW_SYSCALL_PROCESS_EXIT.0
+    );
+    assert_eq!(
+        kernel_build::E7_STATUS_NOT_SUPPORTED,
+        deepwyrm_abi::DW_STATUS_NOT_SUPPORTED.0
+    );
+    assert_eq!(
+        kernel_build::E7_ABI_INFO_SIZE,
+        deepwyrm_abi::DW_ABI_INFO_V1_SIZE
+    );
+    assert_eq!(kernel_build::E7_ABI_VERSION, deepwyrm_abi::DW_ABI_VERSION);
+    assert_eq!(kernel_build::E7_PAGE_SIZE, deepwyrm_abi::DW_BASE_PAGE_SIZE);
+}
+
+#[test]
 fn kernel_assembler_disables_clang_default_configuration_discovery() {
     let build_script =
         fs::read_to_string(kernel_root().join("build.rs")).expect("read kernel build script");

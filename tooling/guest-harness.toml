@@ -62,3 +62,14 @@ id = 8
 
 [guest_test.memory-shared-memory-object]
 id = 9
+
+# DW0-E7 synthetic CPL3/native-syscall gates. IDs are centralized here; the
+# test kernel embeds only the selected identity and production embeds none.
+[guest_test.task-syscall-smoke]
+id = 10
+
+[guest_test.task-syscall-sanitize]
+id = 11
+
+[guest_test.task-user-exception]
+id = 12

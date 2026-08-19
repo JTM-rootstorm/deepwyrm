@@ -23,6 +23,9 @@ pub(crate) enum BuildGuestTest {
     MemoryInvalidPointer,
     MemoryUserKernelIsolation,
     MemorySharedMemoryObject,
+    TaskSyscallSmoke,
+    TaskSyscallSanitize,
+    TaskUserException,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,7 +77,17 @@ impl BuildGuestTest {
             Self::MemoryInvalidPointer => 7,
             Self::MemoryUserKernelIsolation => 8,
             Self::MemorySharedMemoryObject => 9,
+            Self::TaskSyscallSmoke => 10,
+            Self::TaskSyscallSanitize => 11,
+            Self::TaskUserException => 12,
         }
+    }
+
+    pub(crate) const fn is_task_userspace(self) -> bool {
+        matches!(
+            self,
+            Self::TaskSyscallSmoke | Self::TaskSyscallSanitize | Self::TaskUserException
+        )
     }
 
     pub(crate) const fn is_memory_foundation(self) -> bool {
@@ -157,6 +170,12 @@ const fn parse_known_selector(value: &str) -> BuildGuestTest {
         BuildGuestTest::MemoryUserKernelIsolation
     } else if string_equals(value, "memory-shared-memory-object") {
         BuildGuestTest::MemorySharedMemoryObject
+    } else if string_equals(value, "task-syscall-smoke") {
+        BuildGuestTest::TaskSyscallSmoke
+    } else if string_equals(value, "task-syscall-sanitize") {
+        BuildGuestTest::TaskSyscallSanitize
+    } else if string_equals(value, "task-user-exception") {
+        BuildGuestTest::TaskUserException
     } else {
         panic!("unknown build-selected guest test")
     }

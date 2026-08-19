@@ -25,7 +25,7 @@ fn embedded_identity_is_nonzero_and_panic_mapping_is_stable() {
 }
 
 #[test]
-fn all_nine_central_selectors_have_exact_kernel_identities() {
+fn all_twelve_central_selectors_have_exact_kernel_identities() {
     let cases = [
         ("boot-handoff-pass", BuildGuestTest::BootHandoffPass, 1),
         ("exception-fail-path", BuildGuestTest::ExceptionFailPath, 2),
@@ -48,6 +48,13 @@ fn all_nine_central_selectors_have_exact_kernel_identities() {
             BuildGuestTest::MemorySharedMemoryObject,
             9,
         ),
+        ("task-syscall-smoke", BuildGuestTest::TaskSyscallSmoke, 10),
+        (
+            "task-syscall-sanitize",
+            BuildGuestTest::TaskSyscallSanitize,
+            11,
+        ),
+        ("task-user-exception", BuildGuestTest::TaskUserException, 12),
     ];
     for (selector, identity, id) in cases {
         assert_eq!(parse_known_selector(selector), identity);
@@ -77,6 +84,9 @@ fn only_expected_invalid_opcode_is_classified_as_fail() {
         (BuildGuestTest::MemoryInvalidPointer, 6),
         (BuildGuestTest::MemoryUserKernelIsolation, 6),
         (BuildGuestTest::MemorySharedMemoryObject, 6),
+        (BuildGuestTest::TaskSyscallSmoke, 6),
+        (BuildGuestTest::TaskSyscallSanitize, 6),
+        (BuildGuestTest::TaskUserException, 6),
     ] {
         assert_eq!(
             exception_outcome_for(test, vector),
@@ -103,7 +113,7 @@ fn invalid_opcode_trigger_is_gated_to_the_negative_test_selector() {
 }
 
 #[test]
-fn only_memory_selectors_enter_the_post_activation_dispatch() {
+fn memory_and_task_selectors_have_distinct_post_activation_dispatch() {
     for test in [
         BuildGuestTest::MemoryMapping,
         BuildGuestTest::MemoryUnmapping,
@@ -115,11 +125,20 @@ fn only_memory_selectors_enter_the_post_activation_dispatch() {
         assert!(test.is_memory_foundation());
     }
     for test in [
+        BuildGuestTest::TaskSyscallSmoke,
+        BuildGuestTest::TaskSyscallSanitize,
+        BuildGuestTest::TaskUserException,
+    ] {
+        assert!(!test.is_memory_foundation());
+        assert!(test.is_task_userspace());
+    }
+    for test in [
         BuildGuestTest::BootHandoffPass,
         BuildGuestTest::ExceptionFailPath,
         BuildGuestTest::PanicPath,
     ] {
         assert!(!test.is_memory_foundation());
+        assert!(!test.is_task_userspace());
     }
 }
 
