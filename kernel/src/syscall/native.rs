@@ -337,7 +337,8 @@ mod tests;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SyscallControl {
     ReturnToCaller,
-    Reschedule,
+    TerminateCurrent,
+    SuspendCurrent,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -731,25 +732,30 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
 
     fn invalid_return(&mut self, error: crate::arch::x86_64::syscall::UserReturnError) -> !;
 
-    fn reschedule(&mut self) -> !;
+    fn terminate_current(&mut self) -> !;
+
+    fn prepare_suspend(
+        &mut self,
+        frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> crate::arch::x86_64::context::KernelSwitchPlan;
+
+    fn resume_suspended(&mut self, frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame);
 }
 
 pub(crate) fn dispatch_frame<R: NativeSyscallFrameRuntime>(
     runtime: &mut R,
     frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     current_binding_generation: u64,
-) {
+) -> SyscallControl {
     let result = match frame.request() {
         Some((id, arguments)) => dispatch_native(runtime, id, arguments),
         None => NativeSyscallResult::returning(DW_STATUS_INVALID_ARGUMENT),
     };
     frame.set_status(result.status);
-    match result.control {
-        SyscallControl::ReturnToCaller => {
-            if let Err(error) = runtime.authorize_return(frame, current_binding_generation) {
-                runtime.invalid_return(error);
-            }
+    if result.control == SyscallControl::ReturnToCaller {
+        if let Err(error) = runtime.authorize_return(frame, current_binding_generation) {
+            runtime.invalid_return(error);
         }
-        SyscallControl::Reschedule => runtime.reschedule(),
     }
+    result.control
 }

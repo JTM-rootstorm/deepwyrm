@@ -6,6 +6,7 @@
 //! `IF=0` and does not rely on loader descriptor or TLS state.
 
 pub mod apic;
+pub(crate) mod context;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod entry;
 pub mod exceptions;

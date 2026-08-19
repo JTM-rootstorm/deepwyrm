@@ -230,6 +230,17 @@ impl RawSyscallFrame {
         self.rax = i64::from(status.0) as u64;
     }
 
+    pub(crate) fn rebind_after_kernel_resume(
+        &mut self,
+        current_binding_generation: u64,
+    ) -> Result<(), UserReturnError> {
+        if current_binding_generation == 0 || self.return_authorized != 0 {
+            return Err(UserReturnError::BindingChanged);
+        }
+        self.binding_generation = current_binding_generation;
+        Ok(())
+    }
+
     pub(crate) fn authorize_return<M: UserReturnMappingValidation>(
         &mut self,
         current_binding_generation: u64,

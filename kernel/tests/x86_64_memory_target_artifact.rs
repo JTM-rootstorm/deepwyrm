@@ -72,6 +72,13 @@ fn production_and_six_memory_selector_artifacts_are_separated() {
     );
     let output_root = ArtifactRoot::create();
     let build_environment = BuildEnvironment::create(output_root.path());
+    validate_f2_kernel_context_object(
+        &clang,
+        &llvm_nm,
+        &llvm_objdump,
+        &workspace,
+        &output_root.path().join("f2-kernel-context.o"),
+    );
     let build_environment_hash = normalized_build_environment_sha256(
         &cargo,
         &rustc,
@@ -279,6 +286,13 @@ fn e7_task_smoke_artifact_is_freestanding_and_separated() {
     );
     let output_root = ArtifactRoot::create();
     let environment = BuildEnvironment::create(output_root.path());
+    validate_f2_kernel_context_object(
+        &clang,
+        &llvm_nm,
+        &llvm_objdump,
+        &workspace,
+        &output_root.path().join("f2-kernel-context.o"),
+    );
     let build_input_before = build_input_manifest_sha256(&workspace);
 
     let production_target = output_root.path().join("e7-production");

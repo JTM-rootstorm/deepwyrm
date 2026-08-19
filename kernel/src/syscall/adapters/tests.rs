@@ -697,7 +697,7 @@ fn self_thread_termination_with_live_sibling_never_returns_to_reclaimed_context(
             0x51,
             &mut cleanup,
         ),
-        (DW_STATUS_SUCCESS, SyscallControl::Reschedule)
+        (DW_STATUS_SUCCESS, SyscallControl::TerminateCurrent)
     );
     assert_eq!(execution.scheduler_state(current), None);
     assert_eq!(
@@ -721,7 +721,7 @@ fn self_thread_termination_with_live_sibling_never_returns_to_reclaimed_context(
             0x52,
             &mut cleanup,
         ),
-        (DW_STATUS_SUCCESS, SyscallControl::Reschedule)
+        (DW_STATUS_SUCCESS, SyscallControl::TerminateCurrent)
     );
     assert_eq!(execution.scheduler_state(sibling), None);
     assert_eq!(tasks.process_handle_count(process).unwrap(), 0);
@@ -1107,7 +1107,7 @@ fn termination_rejects_reason_type_and_rights_before_target_mutation() {
             0x55,
             &mut cleanup,
         ),
-        (DW_STATUS_SUCCESS, SyscallControl::Reschedule)
+        (DW_STATUS_SUCCESS, SyscallControl::TerminateCurrent)
     );
     assert_eq!(execution.scheduler_state(current), None);
     let _ = current_handle;

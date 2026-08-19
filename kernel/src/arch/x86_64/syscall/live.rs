@@ -2,7 +2,9 @@
 
 use core::cell::UnsafeCell;
 use core::convert::Infallible;
+use core::marker::PhantomData;
 use core::mem::MaybeUninit;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::memory::kernel_stack::KernelStackBounds;
@@ -82,10 +84,11 @@ unsafe impl Sync for RuntimeStorage {}
 static RUNTIME_STATE: AtomicU8 = AtomicU8::new(RUNTIME_UNBOUND);
 static RUNTIME: RuntimeStorage = RuntimeStorage::uninit();
 
-#[must_use = "CPL3 entry requires the exact one-shot E5 syscall runtime binding"]
-pub(crate) struct SyscallRuntimeBinding {
+#[must_use = "CPL3 entry requires the exact one-shot pinned syscall runtime binding"]
+pub(crate) struct SyscallRuntimeBinding<'runtime> {
     context: usize,
     handler: usize,
+    _runtime: PhantomData<&'runtime mut ()>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -454,22 +457,20 @@ pub(crate) fn current_binding_generation() -> u64 {
     unsafe { (*ENTRY_STATE.0.get()).binding_generation }
 }
 
-/// Publishes the single BSP syscall runtime used by the E4 assembly boundary.
+/// Publishes the single BSP syscall runtime identity used by the assembly boundary.
 ///
 /// # Safety
 ///
-/// `context` must remain valid and exclusively owned by `handler` for every
-/// subsequent CPL3 syscall until shutdown. The runtime may not move after this
-/// call. The caller must bind before entering userspace and must serialize all
-/// access according to the current one-BSP E contract.
+/// The caller must keep `context` stationary and exclusively borrowed for the
+/// lifetime represented by the returned higher-level binding.
 #[allow(
     unsafe_code,
-    reason = "one-shot runtime publication stores an opaque caller-proven context pointer and typed Rust handler"
+    reason = "one-shot publication stores the pinned runtime address plus its monomorphized dispatcher"
 )]
-pub(crate) unsafe fn bind_syscall_runtime(
+unsafe fn publish_syscall_runtime(
     context: *mut (),
     handler: SyscallRuntimeHandler,
-) -> Result<SyscallRuntimeBinding, SyscallRuntimeBindError> {
+) -> Result<(usize, usize), SyscallRuntimeBindError> {
     if context.is_null() {
         return Err(SyscallRuntimeBindError::NullContext);
     }
@@ -488,10 +489,7 @@ pub(crate) unsafe fn bind_syscall_runtime(
         (*RUNTIME.0.get()).write(RuntimeBindingState { context, handler });
     }
     RUNTIME_STATE.store(RUNTIME_BOUND, Ordering::Release);
-    Ok(SyscallRuntimeBinding {
-        context: context as usize,
-        handler: handler as usize,
-    })
+    Ok((context as usize, handler as usize))
 }
 
 #[allow(
@@ -505,7 +503,7 @@ fn runtime_binding() -> Option<RuntimeBindingState> {
     Some(unsafe { (*RUNTIME.0.get()).assume_init() })
 }
 
-pub(crate) fn syscall_runtime_binding_is_current(binding: &SyscallRuntimeBinding) -> bool {
+pub(crate) fn syscall_runtime_binding_is_current(binding: &SyscallRuntimeBinding<'_>) -> bool {
     runtime_binding().is_some_and(|current| {
         current.context as usize == binding.context && current.handler as usize == binding.handler
     })
@@ -513,37 +511,97 @@ pub(crate) fn syscall_runtime_binding_is_current(binding: &SyscallRuntimeBinding
 
 #[allow(
     unsafe_code,
-    reason = "the generic E5 trampoline reconstructs only the exact runtime type used by its one-shot binding"
+    reason = "the branded one-shot binding guarantees the erased runtime pointer remains pinned and exclusive for this short reborrow"
+)]
+fn invalid_bound_return<R: crate::syscall::native::NativeSyscallFrameRuntime>(
+    context: *mut (),
+    error: super::frame::UserReturnError,
+) -> ! {
+    // SAFETY: each borrow is short-lived on the one-BSP runtime. No borrow of
+    // `R` survives a kernel-context switch.
+    let runtime = unsafe { &mut *context.cast::<R>() };
+    runtime.invalid_return(error)
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the pinned one-BSP runtime is reborrowed only in bounded regions that do not span a kernel-context switch"
 )]
 unsafe fn native_runtime_trampoline<R: crate::syscall::native::NativeSyscallFrameRuntime>(
     context: *mut (),
     frame: &mut RawSyscallFrame,
 ) {
-    let runtime = unsafe { &mut *context.cast::<R>() };
-    crate::syscall::native::dispatch_frame(runtime, frame, current_binding_generation());
+    let control = {
+        let runtime = unsafe { &mut *context.cast::<R>() };
+        crate::syscall::native::dispatch_frame(runtime, frame, current_binding_generation())
+    };
+    match control {
+        crate::syscall::native::SyscallControl::ReturnToCaller => {}
+        crate::syscall::native::SyscallControl::TerminateCurrent => {
+            let runtime = unsafe { &mut *context.cast::<R>() };
+            runtime.terminate_current()
+        }
+        crate::syscall::native::SyscallControl::SuspendCurrent => {
+            let plan = {
+                let runtime = unsafe { &mut *context.cast::<R>() };
+                runtime.prepare_suspend(frame)
+            };
+            unsafe { bind_current_thread_stack(plan.next_stack()) }
+                .unwrap_or_else(|_| halt_forever());
+            if !live_fp_simd_unavailable_is_enforced() {
+                halt_forever();
+            }
+            unsafe { crate::arch::x86_64::context::execute_kernel_switch(plan) };
+            if !live_fp_simd_unavailable_is_enforced() {
+                halt_forever();
+            }
+            let generation = current_binding_generation();
+            if let Err(error) = frame.rebind_after_kernel_resume(generation) {
+                invalid_bound_return::<R>(context, error);
+            }
+            let result = {
+                let runtime = unsafe { &mut *context.cast::<R>() };
+                runtime.resume_suspended(frame);
+                runtime.authorize_return(frame, generation)
+            };
+            if let Err(error) = result {
+                invalid_bound_return::<R>(context, error);
+            }
+        }
+    }
 }
 
-/// Binds one stationary typed E5 runtime to the raw x86 syscall entry.
+/// Binds one stationary typed runtime to the raw x86 syscall entry.
 ///
-/// # Safety
-///
-/// `runtime` must remain alive, stationary, and exclusively reachable through
-/// this binding for all subsequent CPL3 syscall execution.
+/// The returned lifetime brands the global raw pointer with the caller's
+/// exclusive pinned borrow. Safe Rust cannot access or move the runtime again
+/// while the binding remains live. `enter_validated_user` consumes that binding
+/// and never returns, so the target runtime stays pinned for all later syscalls.
 #[allow(
     unsafe_code,
-    reason = "the typed runtime pointer is erased only together with its monomorphized restoring trampoline"
+    reason = "Pin supplies the stable runtime address and the returned lifetime-branded binding retains the exclusive borrow for divergent CPL3 execution"
 )]
-pub(crate) unsafe fn bind_native_syscall_runtime<
+pub(crate) fn bind_native_syscall_runtime<
+    'runtime,
     R: crate::syscall::native::NativeSyscallFrameRuntime,
 >(
-    runtime: *mut R,
-) -> Result<SyscallRuntimeBinding, SyscallRuntimeBindError> {
-    unsafe { bind_syscall_runtime(runtime.cast::<()>(), native_runtime_trampoline::<R>) }
+    runtime: Pin<&'runtime mut R>,
+) -> Result<SyscallRuntimeBinding<'runtime>, SyscallRuntimeBindError> {
+    // SAFETY: Pin guarantees the pointee cannot move for `'runtime`; the
+    // returned binding carries the exclusive borrow for the same lifetime.
+    let context = unsafe { Pin::get_unchecked_mut(runtime) as *mut R };
+    let (context_identity, handler_identity) =
+        unsafe { publish_syscall_runtime(context.cast::<()>(), native_runtime_trampoline::<R>) }?;
+    Ok(SyscallRuntimeBinding {
+        context: context_identity,
+        handler: handler_identity,
+        _runtime: PhantomData,
+    })
 }
 
 #[allow(
     unsafe_code,
-    reason = "the one-shot binding guarantees the stored context/function pair remains valid for syscall dispatch"
+    reason = "the one-shot pinned binding guarantees the stored context/function pair remains valid for syscall dispatch"
 )]
 unsafe fn dispatch_bound_runtime(frame: &mut RawSyscallFrame) {
     let Some(binding) = runtime_binding() else {
@@ -565,13 +623,13 @@ pub(crate) unsafe fn enter_validated_user(
     state: &ValidatedUserReturn,
     stack: KernelStackBounds,
     exception_binding: &crate::arch::x86_64::exceptions::UserExceptionBinding,
-    syscall_binding: &SyscallRuntimeBinding,
+    syscall_binding: SyscallRuntimeBinding<'_>,
 ) -> ! {
     validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
     if !crate::arch::x86_64::exceptions::user_exception_binding_is_current(exception_binding) {
         halt_forever();
     }
-    if !syscall_runtime_binding_is_current(syscall_binding) {
+    if !syscall_runtime_binding_is_current(&syscall_binding) {
         halt_forever();
     }
     unsafe { bind_current_thread_stack(stack) }.unwrap_or_else(|_| halt_forever());

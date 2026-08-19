@@ -457,7 +457,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     exit_code,
                     &mut self.cleanup,
                 );
-                if status == DW_STATUS_SUCCESS && control == SyscallControl::Reschedule {
+                if status == DW_STATUS_SUCCESS && control == SyscallControl::TerminateCurrent {
                     self.exit_seen = true;
                 }
                 NativeSyscallResult { status, control }
@@ -488,7 +488,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         fail(0x90)
     }
 
-    fn reschedule(&mut self) -> ! {
+    fn terminate_current(&mut self) -> ! {
         if !self.abi_seen || !self.exit_seen {
             fail(0x91);
         }
@@ -529,6 +529,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         }
         self.finalize_task_refs();
         crate::test_support::complete_pass(0)
+    }
+
+    fn prepare_suspend(
+        &mut self,
+        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> crate::arch::x86_64::context::KernelSwitchPlan {
+        fail(0xa2)
+    }
+
+    fn resume_suspended(&mut self, _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame) {
+        fail(0xa3)
     }
 }
 
@@ -587,9 +598,6 @@ fn enter_smoke<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     let exception_binding =
         crate::arch::x86_64::syscall::bind_user_exception_handler(unexpected_user_exception)
             .unwrap_or_else(|_| fail(0xb1));
-    let syscall_binding =
-        unsafe { crate::arch::x86_64::syscall::bind_native_syscall_runtime(&raw mut runtime) }
-            .unwrap_or_else(|_| fail(0xb2));
     let context = runtime
         .execution
         .load_context(runtime.context_id)
@@ -618,12 +626,16 @@ fn enter_smoke<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
                 crate::arch::x86_64::syscall::UserReturnError::BindingChanged => fail(0xba),
             })
     };
+    let mut runtime = core::pin::pin!(runtime);
+    let syscall_binding =
+        crate::arch::x86_64::syscall::bind_native_syscall_runtime(runtime.as_mut())
+            .unwrap_or_else(|_| fail(0xb2));
     unsafe {
         crate::arch::x86_64::syscall::enter_validated_user(
             &state,
             stack,
             &exception_binding,
-            &syscall_binding,
+            syscall_binding,
         )
     }
 }

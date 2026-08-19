@@ -208,8 +208,19 @@ impl NativeSyscallFrameRuntime for FrameRuntime {
         panic!("invalid synthetic return: {error:?}")
     }
 
-    fn reschedule(&mut self) -> ! {
-        panic!("unexpected synthetic reschedule")
+    fn terminate_current(&mut self) -> ! {
+        panic!("unexpected synthetic termination")
+    }
+
+    fn prepare_suspend(
+        &mut self,
+        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> crate::arch::x86_64::context::KernelSwitchPlan {
+        panic!("unexpected synthetic suspension")
+    }
+
+    fn resume_suspended(&mut self, _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame) {
+        panic!("unexpected synthetic resume")
     }
 }
 
@@ -228,7 +239,10 @@ fn frame_dispatch_sets_status_then_authorizes_exact_return() {
         u64::MAX,
         9,
     );
-    dispatch_frame(&mut runtime, &mut frame, 9);
+    assert_eq!(
+        dispatch_frame(&mut runtime, &mut frame, 9),
+        SyscallControl::ReturnToCaller
+    );
     assert_eq!(runtime.handled, 1);
     assert_eq!(frame.test_status_bits(), 0);
     assert_eq!(frame.test_return_authorized(), 1);
@@ -254,5 +268,64 @@ fn frame_dispatch_fails_stopped_when_binding_generation_changes() {
     }));
     assert!(failed.is_err());
     assert_eq!(runtime.handled, 1);
+    assert_eq!(frame.test_return_authorized(), 0);
+}
+
+struct SuspendingRuntime;
+
+impl NativeSyscallHandler for SuspendingRuntime {
+    fn handle(&mut self, _request: NativeSyscallRequest) -> NativeSyscallResult {
+        NativeSyscallResult {
+            status: deepwyrm_abi::DW_STATUS_SUCCESS,
+            control: SyscallControl::SuspendCurrent,
+        }
+    }
+}
+
+impl NativeSyscallFrameRuntime for SuspendingRuntime {
+    fn authorize_return(
+        &mut self,
+        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+        _current_binding_generation: u64,
+    ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
+        panic!("suspended dispatch must not authorize before resume")
+    }
+
+    fn invalid_return(&mut self, error: crate::arch::x86_64::syscall::UserReturnError) -> ! {
+        panic!("unexpected invalid suspended return: {error:?}")
+    }
+
+    fn terminate_current(&mut self) -> ! {
+        panic!("suspended dispatch must not terminate")
+    }
+
+    fn prepare_suspend(
+        &mut self,
+        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> crate::arch::x86_64::context::KernelSwitchPlan {
+        panic!("direct dispatch test stops before trampoline suspension")
+    }
+
+    fn resume_suspended(&mut self, _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame) {
+        panic!("direct dispatch test never resumes")
+    }
+}
+
+#[test]
+fn suspended_dispatch_returns_control_without_authorizing_the_user_frame() {
+    let mut runtime = SuspendingRuntime;
+    let mut frame = crate::arch::x86_64::syscall::RawSyscallFrame::synthetic(
+        u64::from(DwKnownSyscall::HandleClose.id().0),
+        [0x55, 0, 0, 0, 0, 0],
+        0x4000,
+        0x8000,
+        0x202,
+        3,
+    );
+    assert_eq!(
+        dispatch_frame(&mut runtime, &mut frame, 3),
+        SyscallControl::SuspendCurrent
+    );
+    assert_eq!(frame.test_status_bits(), 0);
     assert_eq!(frame.test_return_authorized(), 0);
 }

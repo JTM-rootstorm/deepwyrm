@@ -289,8 +289,11 @@ pub(crate) fn validate_e7_stack_margin(sizes: &[StackSize]) {
     ];
     let reschedule_branch = [
         frame(
-            "e7-reschedule",
-            plain("E7 reschedule", "NativeSyscallFrameRuntime>::reschedule"),
+            "e7-terminate-current",
+            plain(
+                "E7 terminate current",
+                "NativeSyscallFrameRuntime>::terminate_current",
+            ),
         ),
         frame(
             "e7-finalize-refs",
@@ -327,7 +330,7 @@ pub(crate) fn validate_e7_stack_margin(sizes: &[StackSize]) {
     let exit = audited_stack_path(&[&syscall_common, &exit_branch])
         .expect("E7 exit syscall stack manifest is unique");
     let reschedule = audited_stack_path(&[&syscall_common, &reschedule_branch])
-        .expect("E7 reschedule stack manifest is unique");
+        .expect("E7 terminal-control stack manifest is unique");
     let thread = audited_stack_upper_bound(&[abi, exit, reschedule]);
     let thread_total = thread
         .bytes

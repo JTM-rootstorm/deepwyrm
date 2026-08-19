@@ -62,6 +62,70 @@ pub(super) fn validate_entry_normalization(disassembly: &str) {
     assert!(normalize_call < kernel_main_call);
 }
 
+pub(super) fn validate_f2_kernel_context_object(
+    clang: &Path,
+    llvm_nm: &Path,
+    llvm_objdump: &Path,
+    workspace: &Path,
+    output: &Path,
+) {
+    let mut command = helper_command(clang);
+    run_success(
+        command
+            .args([
+                "--no-default-config",
+                "--target=x86_64-unknown-none",
+                "-ffreestanding",
+                "-fno-pic",
+                "-mno-red-zone",
+                "-c",
+            ])
+            .arg(workspace.join("kernel/src/arch/x86_64/kernel_context.S"))
+            .arg("-o")
+            .arg(output),
+        "F2 kernel-context assembly",
+    );
+    let object_symbols = symbols(llvm_nm, output);
+    assert!(object_symbols.contains("dw_x86_64_switch_kernel_context"));
+    validate_f2_kernel_context_switch(&disassembly(llvm_objdump, output));
+}
+
+pub(super) fn validate_f2_kernel_context_switch(disassembly: &str) {
+    let body = function_body(disassembly, "dw_x86_64_switch_kernel_context");
+    let required = [
+        "pushfq",
+        "push\trbx",
+        "push\trbp",
+        "push\tr12",
+        "push\tr13",
+        "push\tr14",
+        "push\tr15",
+        "mov\tqword ptr [rdi], rsp",
+        "mov\trsp, rsi",
+        "pop\tr15",
+        "pop\tr14",
+        "pop\tr13",
+        "pop\tr12",
+        "pop\trbp",
+        "pop\trbx",
+        "popfq",
+        "ret",
+    ];
+    let mut cursor = 0;
+    for marker in required {
+        let offset = body[cursor..]
+            .find(marker)
+            .unwrap_or_else(|| panic!("F2 kernel switch omitted `{marker}`: {body}"));
+        cursor += offset + marker.len();
+    }
+    for forbidden in ["iret", "sysret", "swapgs", "wrmsr", "rdmsr"] {
+        assert!(
+            !body.contains(forbidden),
+            "F2 kernel switch contains user/privilege transition instruction `{forbidden}`"
+        );
+    }
+}
+
 pub(super) fn validate_fp_simd_unavailable(disassembly: &str) {
     const FORBIDDEN_MNEMONICS: &[&str] = &[
         "emms", "f2xm1", "fabs", "fadd", "fbld", "fbstp", "fchs", "fclex", "fcmov", "fcom", "fcos",

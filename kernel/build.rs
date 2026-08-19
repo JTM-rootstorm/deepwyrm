@@ -34,6 +34,7 @@ fn run() -> Result<(), String> {
     let entry_path = manifest_dir.join("src/arch/x86_64/entry.S");
     let exceptions_path = manifest_dir.join("src/arch/x86_64/exceptions.S");
     let syscall_path = manifest_dir.join("src/arch/x86_64/syscall_entry.S");
+    let kernel_context_path = manifest_dir.join("src/arch/x86_64/kernel_context.S");
     let guest_harness_path = manifest_dir.join("../tooling/guest-harness.toml");
     let e7_user_source = manifest_dir.join("tests/userspace/e7_task_smoke.S");
     let e7_user_linker = manifest_dir.join("tests/userspace/e7_user.ld");
@@ -45,6 +46,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-changed={}", entry_path.display());
     println!("cargo:rerun-if-changed={}", exceptions_path.display());
     println!("cargo:rerun-if-changed={}", syscall_path.display());
+    println!("cargo:rerun-if-changed={}", kernel_context_path.display());
     println!("cargo:rerun-if-changed={}", guest_harness_path.display());
     println!("cargo:rerun-if-changed={}", e7_user_source.display());
     println!("cargo:rerun-if-changed={}", e7_user_linker.display());
@@ -86,14 +88,17 @@ fn run() -> Result<(), String> {
     let entry_object = out_dir.join("deepwyrm-x86_64-entry.o");
     let exceptions_object = out_dir.join("deepwyrm-x86_64-exceptions.o");
     let syscall_object = out_dir.join("deepwyrm-x86_64-syscall.o");
+    let kernel_context_object = out_dir.join("deepwyrm-x86_64-kernel-context.o");
     assemble_source(&entry_path, &entry_object, layout)?;
     assemble_source(&exceptions_path, &exceptions_object, layout)?;
     assemble_source(&syscall_path, &syscall_object, layout)?;
+    assemble_source(&kernel_context_path, &kernel_context_object, layout)?;
 
     let mut link_objects = vec![
         entry_object.as_path(),
         exceptions_object.as_path(),
         syscall_object.as_path(),
+        kernel_context_object.as_path(),
     ];
     let e7_user_object = out_dir.join("deepwyrm-e7-user.o");
     let selector = env::var("DEEPWYRM_GUEST_TEST_SELECTOR").ok();

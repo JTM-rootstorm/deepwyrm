@@ -214,3 +214,23 @@ fn dwstatus_is_sign_extended_into_rax() {
     frame.set_status(deepwyrm_abi::DW_STATUS_NOT_SUPPORTED);
     assert_eq!(frame.rax, (-14_i64) as u64);
 }
+
+#[test]
+fn suspended_frame_rebinds_only_before_return_authorization() {
+    let mut frame = RawSyscallFrame::synthetic(1, [0; 6], 0x4000, 0x8000, 0x202, 9);
+    let mut mappings = Mapping {
+        executable: true,
+        writable_stack: true,
+    };
+    assert_eq!(
+        frame.rebind_after_kernel_resume(0),
+        Err(UserReturnError::BindingChanged)
+    );
+    assert!(frame.rebind_after_kernel_resume(10).is_ok());
+    assert_eq!(frame.binding_generation(), 10);
+    assert!(frame.authorize_return(10, &mut mappings).is_ok());
+    assert_eq!(
+        frame.rebind_after_kernel_resume(11),
+        Err(UserReturnError::BindingChanged)
+    );
+}

@@ -99,10 +99,21 @@ dw_x86_64_syscall_entry:
     movq %r12, E4_SC_BINDING_GENERATION(%rsp)
     movq $0, E4_SC_RETURN_AUTHORIZED(%rsp)
 
-    movq %rsp, %r12
+    /*
+     * The per-CPU entry stack may be reused by the next SYSCALL. Copy the
+     * complete validated entry image onto the current Thread's owned kernel
+     * stack before Rust can block or context-switch away.
+     */
+    movq %rsp, %rsi
     movq %gs:E4_GS_CURRENT_STACK_TOP, %rsp
     testq %rsp, %rsp
     jz .Le4_entry_fail
+    subq $E4_SC_FRAME_SIZE, %rsp
+    movq %rsp, %rdi
+    movl $(E4_SC_FRAME_SIZE / 8), %ecx
+    cld
+    rep movsq
+    movq %rsp, %r12
     movq %r12, %rdi
     callq dw_x86_64_syscall_dispatch
 

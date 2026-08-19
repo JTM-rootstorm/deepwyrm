@@ -661,9 +661,9 @@ fn control_after_process_state<
     current_process: ProcessKey,
 ) -> SyscallControl {
     match tasks.process_info(current_process) {
-        Ok(info) if info.state == DW_TASK_STATE_EXITED => SyscallControl::Reschedule,
+        Ok(info) if info.state == DW_TASK_STATE_EXITED => SyscallControl::TerminateCurrent,
         Ok(_) => SyscallControl::ReturnToCaller,
-        Err(_) => SyscallControl::Reschedule,
+        Err(_) => SyscallControl::TerminateCurrent,
     }
 }
 
@@ -743,7 +743,7 @@ pub(crate) fn process_exit<
         Err(error) => return (task_status(error), SyscallControl::ReturnToCaller),
     };
     collect_process_effects(registry, execution, effects, cleanup);
-    (DW_STATUS_SUCCESS, SyscallControl::Reschedule)
+    (DW_STATUS_SUCCESS, SyscallControl::TerminateCurrent)
 }
 
 pub(crate) fn process_terminate<
@@ -837,7 +837,7 @@ pub(crate) fn thread_exit<
         }
     }
     collect_retired_pins(registry, execution.retire_exit_pins(pins), cleanup);
-    (DW_STATUS_SUCCESS, SyscallControl::Reschedule)
+    (DW_STATUS_SUCCESS, SyscallControl::TerminateCurrent)
 }
 
 pub(crate) fn thread_terminate<
@@ -909,7 +909,7 @@ pub(crate) fn thread_terminate<
     collect_retired_pins(registry, execution.retire_exit_pins(pins), cleanup);
     release_lookup_pin(registry, pin, cleanup);
     let control = if target == current_thread {
-        SyscallControl::Reschedule
+        SyscallControl::TerminateCurrent
     } else {
         control_after_process_state(tasks, current_process)
     };

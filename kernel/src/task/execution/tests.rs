@@ -316,3 +316,77 @@ fn blocked_thread_retains_resources_until_terminal_retirement() {
         assert!(registry.release_internal(pin).unwrap().is_none());
     }
 }
+
+#[test]
+fn continuation_seed_rejects_foreign_geometry_and_double_publication() {
+    let (mut registry, mut tasks, thread, _thread_handle) = one_thread_fixture();
+    let domain = ExecutionDomain::<1>::new(stack_bounds::<1>()).unwrap();
+    domain
+        .start_thread(&mut tasks, thread, start_state(30))
+        .unwrap();
+    let (stack, context) = tasks.thread_execution_resources(thread).unwrap().unwrap();
+    let bounds = domain.stack_bounds(stack).unwrap();
+
+    assert_eq!(
+        domain.seed_kernel_continuation(stack, context, bounds.top - 56),
+        Err(ExecutionResourceError::ContinuationOutsideStack)
+    );
+    assert_eq!(
+        domain.seed_kernel_continuation(stack, context, bounds.bottom - 16),
+        Err(ExecutionResourceError::ContinuationOutsideStack)
+    );
+    let saved_rsp = bounds.top - crate::arch::x86_64::context::KERNEL_CONTEXT_FRAME_BYTES;
+    domain
+        .seed_kernel_continuation(stack, context, saved_rsp)
+        .unwrap();
+    assert_eq!(domain.kernel_continuation_rsp(context), Ok(saved_rsp));
+    assert_eq!(
+        domain.seed_kernel_continuation(stack, context, saved_rsp),
+        Err(ExecutionResourceError::ContinuationAlreadyInitialized)
+    );
+    let _ = &mut registry;
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the test keeps the execution domain stationary while each switch plan is inspected and dropped"
+)]
+fn switch_plan_requires_live_seeded_destination_continuation() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (_process, process_handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let process_owner = registry
+        .retain_internal_from_handle(&process_handle)
+        .unwrap();
+    let (first, _first_handle) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    let (second, _second_handle) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    assert!(registry.release_internal(process_owner).unwrap().is_none());
+    assert!(registry.release_internal(root_owner).unwrap().is_none());
+
+    let domain = ExecutionDomain::<2>::new(stack_bounds::<2>()).unwrap();
+    domain
+        .start_thread(&mut tasks, first, start_state(31))
+        .unwrap();
+    domain
+        .start_thread(&mut tasks, second, start_state(32))
+        .unwrap();
+    assert_eq!(domain.schedule_next().unwrap().current, Some(first));
+    let (second_stack, second_context) = tasks.thread_execution_resources(second).unwrap().unwrap();
+    let (_blocked, decision) = domain.block_current(first).unwrap();
+    assert_eq!(decision.current, Some(second));
+    assert_eq!(
+        unsafe { domain.prepare_kernel_switch(&tasks, decision) }.unwrap_err(),
+        ExecutionSwitchError::Resource(ExecutionResourceError::ContinuationUnavailable)
+    );
+
+    let next_bounds = domain.stack_bounds(second_stack).unwrap();
+    let next_rsp = next_bounds.top - crate::arch::x86_64::context::KERNEL_CONTEXT_FRAME_BYTES;
+    domain
+        .seed_kernel_continuation(second_stack, second_context, next_rsp)
+        .unwrap();
+    let plan = unsafe { domain.prepare_kernel_switch(&tasks, decision) }.unwrap();
+    assert_eq!(plan.next_rsp(), next_rsp);
+    assert_eq!(plan.next_stack(), next_bounds);
+}

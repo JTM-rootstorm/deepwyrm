@@ -78,12 +78,14 @@ fn msr_policy_matches_e0_and_return_requires_explicit_authorization() {
     assert!(msr.contains("kernel_gs_base: 0"));
     assert!(msr.contains("CR4_FSGSBASE"));
     assert!(live.contains("CPUID_SYSCALL_SYSRET: u32 = 1 << 11"));
-    assert!(live.contains("pub(crate) unsafe fn bind_syscall_runtime"));
-    assert!(live.contains("pub(crate) unsafe fn bind_native_syscall_runtime"));
+    assert!(live.contains("unsafe fn publish_syscall_runtime"));
+    assert!(!live.contains("pub(crate) unsafe fn bind_syscall_runtime"));
+    assert!(live.contains("Pin<&'runtime mut R>"));
+    assert!(live.contains("pub(crate) fn bind_native_syscall_runtime"));
     assert!(live.contains("unsafe { dispatch_bound_runtime(frame) }"));
-    assert!(live.contains("syscall_runtime_binding_is_current(syscall_binding)"));
+    assert!(live.contains("syscall_runtime_binding_is_current(&syscall_binding)"));
     assert!(!live.contains("frame.set_status(DW_STATUS_NOT_SUPPORTED)"));
-    assert!(!live.contains("authorize_return("));
+    assert!(!live.contains("frame.authorize_return("));
     assert!(native.contains("pub(crate) fn dispatch_frame"));
     assert!(native.contains("runtime.authorize_return("));
     assert!(frame.contains("pub(crate) fn authorize_return"));
@@ -205,7 +207,8 @@ fn e7_smoke_runtime_uses_live_e5_syscall_and_return_authority() {
         "crate::syscall::process_exit(",
         "Some(SchedulerThreadState::Running)",
         "frame.authorize_return(current_binding_generation, &mut mappings)",
-        "bind_native_syscall_runtime(&raw mut runtime)",
+        "core::pin::pin!(runtime)",
+        "bind_native_syscall_runtime(runtime.as_mut())",
         "ValidatedUserReturn::initial(context, &mut mappings)",
         "enter_validated_user(",
         "self.finish_task_release(thread_final)",
@@ -223,4 +226,81 @@ fn e7_smoke_runtime_uses_live_e5_syscall_and_return_authority() {
         .expect("E7 post-activation dispatch");
     assert!(activation < task_dispatch);
     assert!(build.contains("cargo:rustc-cfg=deepwyrm_e7_guest"));
+}
+
+#[test]
+fn f2_syscall_frame_moves_to_thread_stack_before_rust_dispatch() {
+    let assembly = source("src/arch/x86_64/syscall_entry.S");
+    let entry = assembly
+        .split_once("dw_x86_64_syscall_entry:")
+        .expect("syscall entry symbol")
+        .1;
+    let thread_stack = entry
+        .find("movq %gs:E4_GS_CURRENT_STACK_TOP, %rsp")
+        .expect("current Thread stack switch");
+    let reserve = entry[thread_stack..]
+        .find("subq $E4_SC_FRAME_SIZE, %rsp")
+        .map(|offset| thread_stack + offset)
+        .expect("Thread-owned syscall-frame reservation");
+    let copy = entry.find("rep movsq").expect("entry-frame copy");
+    let dispatch = entry
+        .find("callq dw_x86_64_syscall_dispatch")
+        .expect("Rust syscall dispatch");
+    assert!(thread_stack < reserve && reserve < copy && copy < dispatch);
+    assert!(entry[..dispatch].contains("movl $(E4_SC_FRAME_SIZE / 8), %ecx"));
+    assert!(entry[..dispatch].contains("movq %rsp, %r12"));
+}
+
+#[test]
+fn f2_kernel_context_switch_is_sysv_only_and_separate_from_user_return() {
+    let assembly = source("src/arch/x86_64/kernel_context.S");
+    for marker in [
+        "pushfq",
+        "pushq %rbx",
+        "pushq %rbp",
+        "pushq %r12",
+        "pushq %r13",
+        "pushq %r14",
+        "pushq %r15",
+        "movq %rsp, (%rdi)",
+        "movq %rsi, %rsp",
+        "popq %r15",
+        "popq %rbx",
+        "popfq",
+        "retq",
+    ] {
+        assert!(assembly.contains(marker), "kernel switch omitted {marker}");
+    }
+    let lowered = assembly.to_ascii_lowercase();
+    for forbidden in [
+        "    iretq",
+        "    sysret",
+        "    swapgs",
+        "    wrmsr",
+        "    rdmsr",
+    ] {
+        assert!(
+            !lowered.contains(forbidden),
+            "kernel switch contains {forbidden}"
+        );
+    }
+    let build = source("build.rs");
+    assert!(build.contains("src/arch/x86_64/kernel_context.S"));
+    assert!(build.contains("deepwyrm-x86_64-kernel-context.o"));
+}
+
+#[test]
+fn f2_runtime_binding_is_pinned_and_suspension_drops_the_runtime_borrow() {
+    let live = source("src/arch/x86_64/syscall/live.rs");
+    let native = source("src/syscall/native.rs");
+    assert!(live.contains("SyscallRuntimeBinding<'runtime>"));
+    assert!(live.contains("Pin<&'runtime mut R>"));
+    assert!(live.contains("let control = {"));
+    assert!(live.contains("runtime.prepare_suspend(frame)"));
+    assert!(live.contains("execute_kernel_switch(plan)"));
+    assert!(live.contains("frame.rebind_after_kernel_resume(generation)"));
+    assert!(live.contains("runtime.resume_suspended(frame)"));
+    assert!(native.contains("SuspendCurrent"));
+    assert!(native.contains(") -> SyscallControl"));
+    assert!(!native.contains("runtime.reschedule()"));
 }

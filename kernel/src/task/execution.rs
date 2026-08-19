@@ -1,3 +1,5 @@
+use core::cell::UnsafeCell;
+
 use crate::sync::SpinMutex;
 
 use super::{
@@ -19,6 +21,9 @@ pub(crate) enum ExecutionResourceError {
     InvalidId,
     StaleId,
     AlreadyAllocated,
+    ContinuationUnavailable,
+    ContinuationAlreadyInitialized,
+    ContinuationOutsideStack,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -306,11 +311,95 @@ impl<const CAPACITY: usize> ThreadContextPool<CAPACITY> {
     }
 }
 
+struct KernelContinuationSlot(UnsafeCell<u64>);
+
+impl KernelContinuationSlot {
+    fn new() -> Self {
+        Self(UnsafeCell::new(0))
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "F2 uses one scheduler-owned writer/reader per Thread on the single BSP; DW0-H re-reviews publication for SMP"
+)]
+unsafe impl Sync for KernelContinuationSlot {}
+
+struct KernelContinuationPool<const CAPACITY: usize> {
+    slots: [KernelContinuationSlot; CAPACITY],
+}
+
+impl<const CAPACITY: usize> KernelContinuationPool<CAPACITY> {
+    fn new() -> Self {
+        Self {
+            slots: core::array::from_fn(|_| KernelContinuationSlot::new()),
+        }
+    }
+
+    fn slot(
+        &self,
+        context: ThreadContextId,
+    ) -> Result<&KernelContinuationSlot, ExecutionResourceError> {
+        let (slot, _) =
+            decode_resource_id(context.raw()).ok_or(ExecutionResourceError::InvalidId)?;
+        self.slots
+            .get(slot)
+            .ok_or(ExecutionResourceError::InvalidId)
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "the scheduler/execution owner guarantees no concurrent access to one continuation slot on the F2 BSP"
+    )]
+    fn load(&self, context: ThreadContextId) -> Result<u64, ExecutionResourceError> {
+        let slot = self.slot(context)?;
+        Ok(unsafe { core::ptr::read_volatile(slot.0.get()) })
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "slot reset occurs only while the owning context is unpublished or being terminally reclaimed"
+    )]
+    fn reset(&self, context: ThreadContextId) -> Result<(), ExecutionResourceError> {
+        let slot = self.slot(context)?;
+        unsafe { core::ptr::write_volatile(slot.0.get(), 0) };
+        Ok(())
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "F2 seed publication is serialized by the execution owner before a continuation becomes runnable"
+    )]
+    fn seed(&self, context: ThreadContextId, rsp: u64) -> Result<(), ExecutionResourceError> {
+        let slot = self.slot(context)?;
+        let current = unsafe { core::ptr::read_volatile(slot.0.get()) };
+        if current != 0 {
+            return Err(ExecutionResourceError::ContinuationAlreadyInitialized);
+        }
+        unsafe { core::ptr::write_volatile(slot.0.get(), rsp) };
+        Ok(())
+    }
+
+    fn save_ptr(&self, context: ThreadContextId) -> Result<*mut u64, ExecutionResourceError> {
+        Ok(self.slot(context)?.0.get())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StartThreadError {
     Scheduler(SchedulerError),
     Resource(ExecutionResourceError),
     Task(super::TaskError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExecutionSwitchError {
+    MissingPrevious,
+    MissingNext,
+    WrongSchedulerState,
+    Task(super::TaskError),
+    Resource(ExecutionResourceError),
+    Context(crate::arch::x86_64::context::KernelContextPlanError),
 }
 
 #[must_use = "retired task pins must be released through ObjectRegistry after E3 resources are reclaimed"]
@@ -344,6 +433,7 @@ pub(crate) struct ExecutionDomain<const CAPACITY: usize> {
     scheduler: CooperativeScheduler<CAPACITY>,
     stacks: KernelStackPool<CAPACITY>,
     contexts: ThreadContextPool<CAPACITY>,
+    continuations: KernelContinuationPool<CAPACITY>,
 }
 
 impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
@@ -354,6 +444,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
             scheduler: CooperativeScheduler::new(),
             stacks: KernelStackPool::new(stack_bounds)?,
             contexts: ThreadContextPool::new(),
+            continuations: KernelContinuationPool::new(),
         })
     }
 
@@ -403,6 +494,9 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                 return Err(StartThreadError::Resource(error));
             }
         };
+        self.continuations.reset(context).unwrap_or_else(|error| {
+            panic!("fresh Thread continuation slot reset failed: {error:?}")
+        });
         let resources = ThreadExecutionResources {
             kernel_stack: stack,
             context,
@@ -550,12 +644,112 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         self.stacks.bounds(stack).unwrap_or_else(|error| {
             panic!("terminal Thread lost its kernel stack before reclaim: {error:?}")
         });
+        self.continuations.reset(context).unwrap_or_else(|error| {
+            panic!("terminal Thread continuation reset violated F2 ownership: {error:?}")
+        });
         self.contexts.reclaim(context).unwrap_or_else(|error| {
             panic!("terminal Thread context reclaim violated E3 ownership: {error:?}")
         });
         self.stacks.reclaim(stack).unwrap_or_else(|error| {
             panic!("terminal Thread stack reclaim violated E3 ownership: {error:?}")
         });
+    }
+
+    pub(crate) fn seed_kernel_continuation(
+        &self,
+        stack: KernelStackId,
+        context: ThreadContextId,
+        rsp: u64,
+    ) -> Result<(), ExecutionResourceError> {
+        self.contexts.load(context)?;
+        let bounds = self.stacks.bounds(stack)?;
+        if !crate::arch::x86_64::context::saved_rsp_is_within_stack(bounds, rsp) {
+            return Err(ExecutionResourceError::ContinuationOutsideStack);
+        }
+        self.continuations.seed(context, rsp)
+    }
+
+    pub(crate) fn kernel_continuation_rsp(
+        &self,
+        context: ThreadContextId,
+    ) -> Result<u64, ExecutionResourceError> {
+        self.contexts.load(context)?;
+        self.continuations.load(context)
+    }
+
+    /// Builds one exact kernel-context switch plan from scheduler-owned Thread state.
+    ///
+    /// # Safety
+    ///
+    /// `self` and its continuation storage must remain stationary until the returned
+    /// plan is consumed by the architecture switch. The pinned syscall runtime is
+    /// the production owner that supplies this guarantee.
+    #[allow(
+        unsafe_code,
+        reason = "the caller proves the execution owner remains stationary while this raw continuation save-slot plan is live"
+    )]
+    pub(crate) unsafe fn prepare_kernel_switch<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &self,
+        tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        decision: super::ScheduleDecision,
+    ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan, ExecutionSwitchError> {
+        let previous = decision
+            .previous
+            .ok_or(ExecutionSwitchError::MissingPrevious)?;
+        let next = decision.current.ok_or(ExecutionSwitchError::MissingNext)?;
+        if self.scheduler.state(previous) != Some(super::SchedulerThreadState::Blocked)
+            || self.scheduler.state(next) != Some(super::SchedulerThreadState::Running)
+        {
+            return Err(ExecutionSwitchError::WrongSchedulerState);
+        }
+        let (_, previous_context) = tasks
+            .thread_execution_resources(previous)
+            .map_err(ExecutionSwitchError::Task)?
+            .ok_or(ExecutionSwitchError::Resource(
+                ExecutionResourceError::StaleId,
+            ))?;
+        let (next_stack_id, next_context) = tasks
+            .thread_execution_resources(next)
+            .map_err(ExecutionSwitchError::Task)?
+            .ok_or(ExecutionSwitchError::Resource(
+                ExecutionResourceError::StaleId,
+            ))?;
+        self.contexts
+            .load(previous_context)
+            .map_err(ExecutionSwitchError::Resource)?;
+        self.contexts
+            .load(next_context)
+            .map_err(ExecutionSwitchError::Resource)?;
+        let current_rsp_out = self
+            .continuations
+            .save_ptr(previous_context)
+            .map_err(ExecutionSwitchError::Resource)?;
+        let next_rsp = self
+            .continuations
+            .load(next_context)
+            .map_err(ExecutionSwitchError::Resource)?;
+        if next_rsp == 0 {
+            return Err(ExecutionSwitchError::Resource(
+                ExecutionResourceError::ContinuationUnavailable,
+            ));
+        }
+        let next_stack = self
+            .stacks
+            .bounds(next_stack_id)
+            .map_err(ExecutionSwitchError::Resource)?;
+        unsafe {
+            crate::arch::x86_64::context::KernelSwitchPlan::new(
+                current_rsp_out,
+                next_rsp,
+                next_stack,
+            )
+        }
+        .map_err(ExecutionSwitchError::Context)
     }
 
     pub(crate) fn stack_bounds(
