@@ -250,6 +250,16 @@ impl RawSyscallFrame {
     }
 
     #[cfg(test)]
+    pub(crate) const fn test_status_bits(&self) -> u64 {
+        self.rax
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn test_return_authorized(&self) -> u64 {
+        self.return_authorized
+    }
+
+    #[cfg(test)]
     pub(crate) fn synthetic(
         number: u64,
         arguments: [u64; 6],

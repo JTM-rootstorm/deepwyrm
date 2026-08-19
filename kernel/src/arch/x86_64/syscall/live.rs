@@ -5,8 +5,6 @@ use core::convert::Infallible;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use deepwyrm_abi::DW_STATUS_NOT_SUPPORTED;
-
 use crate::memory::kernel_stack::KernelStackBounds;
 
 use super::frame::{PerCpuEntryState, RawSyscallFrame, ValidatedUserReturn};
@@ -53,6 +51,47 @@ unsafe impl Sync for PlanStorage {}
 static INSTALL_STATE: AtomicU8 = AtomicU8::new(INSTALL_UNSTARTED);
 static ENTRY_STATE: EntryStateStorage = EntryStateStorage::new();
 static EXPECTED_PLAN: PlanStorage = PlanStorage::uninit();
+
+const RUNTIME_UNBOUND: u8 = 0;
+const RUNTIME_BINDING: u8 = 1;
+const RUNTIME_BOUND: u8 = 2;
+
+pub(crate) type SyscallRuntimeHandler = unsafe fn(*mut (), &mut RawSyscallFrame);
+
+#[derive(Clone, Copy)]
+struct RuntimeBindingState {
+    context: *mut (),
+    handler: SyscallRuntimeHandler,
+}
+
+struct RuntimeStorage(UnsafeCell<MaybeUninit<RuntimeBindingState>>);
+
+impl RuntimeStorage {
+    const fn uninit() -> Self {
+        Self(UnsafeCell::new(MaybeUninit::uninit()))
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the BSP publishes one immutable runtime pointer/function pair before any CPL3 entry and IF-clear syscall dispatch only reads it"
+)]
+unsafe impl Sync for RuntimeStorage {}
+
+static RUNTIME_STATE: AtomicU8 = AtomicU8::new(RUNTIME_UNBOUND);
+static RUNTIME: RuntimeStorage = RuntimeStorage::uninit();
+
+#[must_use = "CPL3 entry requires the exact one-shot E5 syscall runtime binding"]
+pub(crate) struct SyscallRuntimeBinding {
+    context: usize,
+    handler: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SyscallRuntimeBindError {
+    AlreadyBound,
+    NullContext,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SyscallInstallError {
@@ -356,6 +395,104 @@ pub(crate) fn current_binding_generation() -> u64 {
     unsafe { (*ENTRY_STATE.0.get()).binding_generation }
 }
 
+/// Publishes the single BSP syscall runtime used by the E4 assembly boundary.
+///
+/// # Safety
+///
+/// `context` must remain valid and exclusively owned by `handler` for every
+/// subsequent CPL3 syscall until shutdown. The runtime may not move after this
+/// call. The caller must bind before entering userspace and must serialize all
+/// access according to the current one-BSP E contract.
+#[allow(
+    unsafe_code,
+    reason = "one-shot runtime publication stores an opaque caller-proven context pointer and typed Rust handler"
+)]
+pub(crate) unsafe fn bind_syscall_runtime(
+    context: *mut (),
+    handler: SyscallRuntimeHandler,
+) -> Result<SyscallRuntimeBinding, SyscallRuntimeBindError> {
+    if context.is_null() {
+        return Err(SyscallRuntimeBindError::NullContext);
+    }
+    if RUNTIME_STATE
+        .compare_exchange(
+            RUNTIME_UNBOUND,
+            RUNTIME_BINDING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return Err(SyscallRuntimeBindError::AlreadyBound);
+    }
+    unsafe {
+        (*RUNTIME.0.get()).write(RuntimeBindingState { context, handler });
+    }
+    RUNTIME_STATE.store(RUNTIME_BOUND, Ordering::Release);
+    Ok(SyscallRuntimeBinding {
+        context: context as usize,
+        handler: handler as usize,
+    })
+}
+
+#[allow(
+    unsafe_code,
+    reason = "Acquire observes the immutable one-shot runtime binding published before CPL3 entry"
+)]
+fn runtime_binding() -> Option<RuntimeBindingState> {
+    if RUNTIME_STATE.load(Ordering::Acquire) != RUNTIME_BOUND {
+        return None;
+    }
+    Some(unsafe { (*RUNTIME.0.get()).assume_init() })
+}
+
+pub(crate) fn syscall_runtime_binding_is_current(binding: &SyscallRuntimeBinding) -> bool {
+    runtime_binding().is_some_and(|current| {
+        current.context as usize == binding.context && current.handler as usize == binding.handler
+    })
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the generic E5 trampoline reconstructs only the exact runtime type used by its one-shot binding"
+)]
+unsafe fn native_runtime_trampoline<R: crate::syscall::native::NativeSyscallFrameRuntime>(
+    context: *mut (),
+    frame: &mut RawSyscallFrame,
+) {
+    let runtime = unsafe { &mut *context.cast::<R>() };
+    crate::syscall::native::dispatch_frame(runtime, frame, current_binding_generation());
+}
+
+/// Binds one stationary typed E5 runtime to the raw x86 syscall entry.
+///
+/// # Safety
+///
+/// `runtime` must remain alive, stationary, and exclusively reachable through
+/// this binding for all subsequent CPL3 syscall execution.
+#[allow(
+    unsafe_code,
+    reason = "the typed runtime pointer is erased only together with its monomorphized restoring trampoline"
+)]
+pub(crate) unsafe fn bind_native_syscall_runtime<
+    R: crate::syscall::native::NativeSyscallFrameRuntime,
+>(
+    runtime: *mut R,
+) -> Result<SyscallRuntimeBinding, SyscallRuntimeBindError> {
+    unsafe { bind_syscall_runtime(runtime.cast::<()>(), native_runtime_trampoline::<R>) }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the one-shot binding guarantees the stored context/function pair remains valid for syscall dispatch"
+)]
+unsafe fn dispatch_bound_runtime(frame: &mut RawSyscallFrame) {
+    let Some(binding) = runtime_binding() else {
+        halt_forever();
+    };
+    unsafe { (binding.handler)(binding.context, frame) };
+}
+
 /// Enters CPL3 through the separately validated IRETQ helper.
 ///
 /// # Safety
@@ -369,9 +506,13 @@ pub(crate) unsafe fn enter_validated_user(
     state: &ValidatedUserReturn,
     stack: KernelStackBounds,
     exception_binding: &crate::arch::x86_64::exceptions::UserExceptionBinding,
+    syscall_binding: &SyscallRuntimeBinding,
 ) -> ! {
     validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
     if !crate::arch::x86_64::exceptions::user_exception_binding_is_current(exception_binding) {
+        halt_forever();
+    }
+    if !syscall_runtime_binding_is_current(syscall_binding) {
         halt_forever();
     }
     unsafe { bind_current_thread_stack(stack) }.unwrap_or_else(|_| halt_forever());
@@ -394,12 +535,9 @@ pub(crate) unsafe extern "sysv64" fn dw_x86_64_syscall_dispatch(frame: *mut RawS
     if !frame.validates_entry() || frame.binding_generation() != current_binding_generation() {
         halt_forever();
     }
-    if let Some((number, arguments)) = frame.request() {
-        let _ = crate::syscall::decode(number, arguments);
-    }
-    frame.set_status(DW_STATUS_NOT_SUPPORTED);
-    // E4 deliberately leaves return_authorized clear. E5 must validate the
-    // current Process mappings and explicitly authorize this exact frame.
+    unsafe { dispatch_bound_runtime(frame) };
+    // A returning runtime handler must have authorized this exact frame after
+    // current-Process mapping validation. Assembly fails stopped otherwise.
 }
 
 #[allow(

@@ -33,16 +33,12 @@ use crate::task::{
     TaskGroupTerminationEffects, ThreadKey, ThreadStartState,
 };
 
+use super::native::SyscallControl;
+
 use super::abi_bytes::{
     THREAD_START_BYTES, decode_thread_start, encode_abi_info, encode_handle, encode_object_info,
     encode_u64,
 };
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SyscallControl {
-    ReturnToCaller,
-    Reschedule,
-}
 
 #[must_use = "typed final releases must be routed after syscall pins/locks are dropped"]
 pub(crate) struct CleanupQueue<const CAPACITY: usize> {

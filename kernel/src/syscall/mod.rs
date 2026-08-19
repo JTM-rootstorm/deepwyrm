@@ -5,6 +5,8 @@
 //! dispatch, usercopy, task ownership, and architecture register handling stay
 //! in later E phases.
 
+pub(crate) mod native;
+
 mod abi_bytes;
 mod adapters;
 

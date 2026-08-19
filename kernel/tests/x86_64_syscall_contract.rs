@@ -66,13 +66,20 @@ fn msr_policy_matches_e0_and_return_requires_explicit_authorization() {
     let msr = source("src/arch/x86_64/syscall/msr.rs");
     let live = source("src/arch/x86_64/syscall/live.rs");
     let frame = source("src/arch/x86_64/syscall/frame.rs");
+    let native = source("src/syscall/native.rs");
     assert!(msr.contains("pub(crate) const E4_FMASK: u64 = 0x001f_7700"));
     assert!(msr.contains("star: u64::from(KERNEL_CODE_SELECTOR.bits()) << 32"));
     assert!(msr.contains("kernel_gs_base: 0"));
     assert!(msr.contains("CR4_FSGSBASE"));
     assert!(live.contains("CPUID_SYSCALL_SYSRET: u32 = 1 << 11"));
-    assert!(live.contains("frame.set_status(DW_STATUS_NOT_SUPPORTED)"));
+    assert!(live.contains("pub(crate) unsafe fn bind_syscall_runtime"));
+    assert!(live.contains("pub(crate) unsafe fn bind_native_syscall_runtime"));
+    assert!(live.contains("unsafe { dispatch_bound_runtime(frame) }"));
+    assert!(live.contains("syscall_runtime_binding_is_current(syscall_binding)"));
+    assert!(!live.contains("frame.set_status(DW_STATUS_NOT_SUPPORTED)"));
     assert!(!live.contains("authorize_return("));
+    assert!(native.contains("pub(crate) fn dispatch_frame"));
+    assert!(native.contains("runtime.authorize_return("));
     assert!(frame.contains("pub(crate) fn authorize_return"));
 }
 
