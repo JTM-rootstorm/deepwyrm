@@ -118,3 +118,74 @@ fn concurrent_distinct_reservations_preserve_scheduler_invariants() {
     }
     assert_eq!(scheduler.check_invariants(), Ok(()));
 }
+
+#[test]
+fn block_wake_generation_is_exact_and_fifo_is_preserved() {
+    let scheduler = CooperativeScheduler::<3>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let a = thread_key(&mut registry);
+    let b = thread_key(&mut registry);
+    let c = thread_key(&mut registry);
+    for key in [a, b, c] {
+        let reservation = scheduler.reserve(key).unwrap();
+        scheduler.commit(reservation).unwrap();
+    }
+    assert_eq!(scheduler.schedule_next().unwrap().current, Some(a));
+    let (blocked, decision) = scheduler.block_current(a).unwrap();
+    assert_eq!(decision.previous, Some(a));
+    assert_eq!(decision.current, Some(b));
+    assert_eq!(scheduler.state(a), Some(SchedulerThreadState::Blocked));
+    let wake = blocked.wake_key();
+    scheduler.wake(wake).unwrap();
+    assert_eq!(scheduler.state(a), Some(SchedulerThreadState::Runnable));
+    assert_eq!(scheduler.wake(wake), Err(SchedulerError::StaleBlockToken));
+    assert_eq!(scheduler.yield_current(b).unwrap().current, Some(c));
+    assert_eq!(scheduler.yield_current(c).unwrap().current, Some(a));
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn blocked_thread_can_be_retired_and_stale_wake_cannot_revive_it() {
+    let scheduler = CooperativeScheduler::<1>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let thread = thread_key(&mut registry);
+    let reservation = scheduler.reserve(thread).unwrap();
+    scheduler.commit(reservation).unwrap();
+    scheduler.schedule_next().unwrap();
+    let (blocked, decision) = scheduler.block_current(thread).unwrap();
+    assert_eq!(decision.current, None);
+    let wake = blocked.into_wake_key();
+    assert_eq!(scheduler.retire(thread).unwrap().current, None);
+    assert_eq!(scheduler.state(thread), None);
+    assert_eq!(scheduler.wake(wake), Err(SchedulerError::StaleBlockToken));
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn foreign_and_competing_wakes_fail_closed() {
+    let first = Arc::new(CooperativeScheduler::<1>::new());
+    let second = CooperativeScheduler::<1>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let thread = thread_key(&mut registry);
+    let reservation = first.reserve(thread).unwrap();
+    first.commit(reservation).unwrap();
+    first.schedule_next().unwrap();
+    let (blocked, _) = first.block_current(thread).unwrap();
+    let wake = blocked.into_wake_key();
+    assert_eq!(second.wake(wake), Err(SchedulerError::ForeignBlockToken));
+
+    let a = Arc::clone(&first);
+    let b = Arc::clone(&first);
+    let left = thread::spawn(move || a.wake(wake));
+    let right = thread::spawn(move || b.wake(wake));
+    let results = [left.join().unwrap(), right.join().unwrap()];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| **result == Err(SchedulerError::StaleBlockToken))
+            .count(),
+        1
+    );
+    assert_eq!(first.schedule_next().unwrap().current, Some(thread));
+}

@@ -258,3 +258,61 @@ fn process_fatal_exception_retires_running_and_runnable_execution_ownership() {
         assert!(registry.release_internal(pin).unwrap().is_none());
     }
 }
+
+#[test]
+fn blocked_thread_retains_resources_until_terminal_retirement() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (_process, process_handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let process_owner = registry
+        .retain_internal_from_handle(&process_handle)
+        .unwrap();
+    let (blocked_thread, _blocked_handle) =
+        tasks.create_thread(&mut registry, &process_owner).unwrap();
+    let (sibling, _sibling_handle) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    assert!(registry.release_internal(process_owner).unwrap().is_none());
+    assert!(registry.release_internal(root_owner).unwrap().is_none());
+
+    let domain = ExecutionDomain::<2>::new(stack_bounds::<2>()).unwrap();
+    domain
+        .start_thread(&mut tasks, blocked_thread, start_state(20))
+        .unwrap();
+    domain
+        .start_thread(&mut tasks, sibling, start_state(21))
+        .unwrap();
+    assert_eq!(
+        domain.schedule_next().unwrap().current,
+        Some(blocked_thread)
+    );
+    let (stack, context) = tasks
+        .thread_execution_resources(blocked_thread)
+        .unwrap()
+        .unwrap();
+    let saved = domain.load_context(context).unwrap();
+    let (token, decision) = domain.block_current(blocked_thread).unwrap();
+    assert_eq!(decision.current, Some(sibling));
+    assert_eq!(
+        domain.scheduler_state(blocked_thread),
+        Some(super::super::SchedulerThreadState::Blocked)
+    );
+    assert_eq!(domain.stack_bounds(stack).unwrap(), stack_bounds::<2>()[0]);
+    assert_eq!(domain.load_context(context).unwrap(), saved);
+
+    let wake = token.into_wake_key();
+    let pins = tasks.exit_thread(blocked_thread, 7).unwrap();
+    let retired = domain.retire_exit_pins(pins);
+    assert_eq!(domain.wake(wake), Err(SchedulerError::StaleBlockToken));
+    assert_eq!(
+        domain.stack_bounds(stack),
+        Err(ExecutionResourceError::StaleId)
+    );
+    assert_eq!(
+        domain.load_context(context),
+        Err(ExecutionResourceError::StaleId)
+    );
+    let (process_pin, thread_pins) = retired.into_parts();
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        assert!(registry.release_internal(pin).unwrap().is_none());
+    }
+}

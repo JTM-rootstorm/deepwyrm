@@ -1,8 +1,8 @@
 use crate::sync::SpinMutex;
 
 use super::{
-    CooperativeScheduler, ExitPins, KernelStackId, SchedulerError, ThreadContextId,
-    ThreadExecutionResources, ThreadKey, ThreadStartState,
+    BlockToken, BlockWakeKey, CooperativeScheduler, ExitPins, KernelStackId, SchedulerError,
+    ThreadContextId, ThreadExecutionResources, ThreadKey, ThreadStartState,
 };
 
 pub(crate) const E3_INITIAL_USER_RFLAGS: u64 = 0x202;
@@ -462,6 +462,17 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         thread: ThreadKey,
     ) -> Result<super::ScheduleDecision, SchedulerError> {
         self.scheduler.yield_current(thread)
+    }
+
+    pub(crate) fn block_current(
+        &self,
+        thread: ThreadKey,
+    ) -> Result<(BlockToken, super::ScheduleDecision), SchedulerError> {
+        self.scheduler.block_current(thread)
+    }
+
+    pub(crate) fn wake(&self, key: BlockWakeKey) -> Result<(), SchedulerError> {
+        self.scheduler.wake(key)
     }
 
     pub(crate) fn retire_exit_pins<const THREADS: usize>(

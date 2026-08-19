@@ -20,6 +20,8 @@ pub(crate) enum SchedulerError {
     DuplicateThread,
     ForeignReservation,
     StaleReservation,
+    ForeignBlockToken,
+    StaleBlockToken,
     CurrentThreadRunning,
     NotScheduled,
     NotRunning,
@@ -31,6 +33,30 @@ pub(crate) enum SchedulerThreadState {
     Reserved,
     Runnable,
     Running,
+    Blocked,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BlockWakeKey {
+    domain: u64,
+    token: u64,
+    thread: ThreadKey,
+}
+
+#[must_use = "blocked scheduler ownership must be transferred to a waiter registration or explicitly woken"]
+#[derive(Debug)]
+pub(crate) struct BlockToken {
+    key: BlockWakeKey,
+}
+
+impl BlockToken {
+    pub(crate) const fn wake_key(&self) -> BlockWakeKey {
+        self.key
+    }
+
+    pub(crate) const fn into_wake_key(self) -> BlockWakeKey {
+        self.key
+    }
 }
 
 #[must_use = "scheduler reservations must be committed or cancelled"]
@@ -133,6 +159,16 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             let Some(entry) = entry else {
                 return Err(SchedulerError::NotScheduled);
             };
+            if matches!(
+                entry.state,
+                SchedulerThreadState::Reserved | SchedulerThreadState::Blocked
+            ) && entry.token == 0
+            {
+                return Err(SchedulerError::StaleReservation);
+            }
+            if entry.state == SchedulerThreadState::Runnable && entry.token != 0 {
+                return Err(SchedulerError::StaleReservation);
+            }
             if self.current == Some(entry.thread)
                 || self.queue[..index]
                     .iter()
@@ -222,6 +258,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             });
         }
         entry.state = SchedulerThreadState::Runnable;
+        entry.token = 0;
         debug_assert_eq!(state.check_invariants(), Ok(()));
         Ok(())
     }
@@ -293,6 +330,64 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             previous: Some(thread),
             current: Some(next),
         })
+    }
+
+    pub(crate) fn block_current(
+        &self,
+        thread: ThreadKey,
+    ) -> Result<(BlockToken, ScheduleDecision), SchedulerError> {
+        let mut state = self.state.lock();
+        if state.current != Some(thread) {
+            return Err(SchedulerError::NotRunning);
+        }
+        let token = state.next_token;
+        state.next_token = state
+            .next_token
+            .checked_add(1)
+            .filter(|next| *next != 0)
+            .ok_or(SchedulerError::TokenExhausted)?;
+        let domain = state.domain;
+        state.push(QueueEntry {
+            thread,
+            state: SchedulerThreadState::Blocked,
+            token,
+        })?;
+        state.current = None;
+        let current = state.pop_first_runnable();
+        state.current = current;
+        debug_assert_eq!(state.check_invariants(), Ok(()));
+        Ok((
+            BlockToken {
+                key: BlockWakeKey {
+                    domain,
+                    token,
+                    thread,
+                },
+            },
+            ScheduleDecision {
+                previous: Some(thread),
+                current,
+            },
+        ))
+    }
+
+    pub(crate) fn wake(&self, key: BlockWakeKey) -> Result<(), SchedulerError> {
+        let mut state = self.state.lock();
+        if key.domain != state.domain {
+            return Err(SchedulerError::ForeignBlockToken);
+        }
+        let len = state.len;
+        let Some(entry) = state.queue[..len].iter_mut().flatten().find(|entry| {
+            entry.thread == key.thread
+                && entry.token == key.token
+                && entry.state == SchedulerThreadState::Blocked
+        }) else {
+            return Err(SchedulerError::StaleBlockToken);
+        };
+        entry.state = SchedulerThreadState::Runnable;
+        entry.token = 0;
+        debug_assert_eq!(state.check_invariants(), Ok(()));
+        Ok(())
     }
 
     pub(crate) fn retire(&self, thread: ThreadKey) -> Result<ScheduleDecision, SchedulerError> {

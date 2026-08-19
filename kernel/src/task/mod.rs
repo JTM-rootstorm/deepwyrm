@@ -33,8 +33,8 @@ pub(crate) use execution::{
     reason = "E3 scheduler surface is consumed by the execution coordinator added in this phase"
 )]
 pub(crate) use scheduler::{
-    CooperativeScheduler, ScheduleDecision, SchedulerError, SchedulerReservation,
-    SchedulerReservationFailure, SchedulerThreadState,
+    BlockToken, BlockWakeKey, CooperativeScheduler, ScheduleDecision, SchedulerError,
+    SchedulerReservation, SchedulerReservationFailure, SchedulerThreadState,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
