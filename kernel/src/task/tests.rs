@@ -397,3 +397,214 @@ fn explicit_thread_termination_returns_execution_resources_and_closes_final_thre
     let root_final = registry.release_internal(root_owner).unwrap().unwrap();
     finish_task_release(&mut tasks, &mut registry, root_final);
 }
+
+#[test]
+fn process_owned_handle_tables_isolate_colliding_raw_handles() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (process0, process0_handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let (process1, process1_handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
+
+    let event0_creation = registry.create(DW_OBJECT_TYPE_EVENT).unwrap();
+    let event0_id = event0_creation.id();
+    let event0_ref = registry.creation_into_handle(event0_creation).unwrap();
+    let event1_creation = registry.create(DW_OBJECT_TYPE_EVENT).unwrap();
+    let event1_id = event1_creation.id();
+    let event1_ref = registry.creation_into_handle(event1_creation).unwrap();
+    let handle0 = tasks
+        .process_handles_mut(process0)
+        .unwrap()
+        .install(event0_ref, DW_RIGHT_INSPECT)
+        .unwrap();
+    let handle1 = tasks
+        .process_handles_mut(process1)
+        .unwrap()
+        .install(event1_ref, DW_RIGHT_INSPECT)
+        .unwrap();
+    assert_eq!(handle0, handle1, "raw handles are process-local identities");
+
+    let resolved0 = tasks
+        .process_handles(process0)
+        .unwrap()
+        .lookup(
+            &mut registry,
+            handle0,
+            crate::handle::AcceptedObjectTypes::One(DW_OBJECT_TYPE_EVENT),
+            DW_RIGHT_INSPECT,
+        )
+        .unwrap();
+    let resolved1 = tasks
+        .process_handles(process1)
+        .unwrap()
+        .lookup(
+            &mut registry,
+            handle1,
+            crate::handle::AcceptedObjectTypes::One(DW_OBJECT_TYPE_EVENT),
+            DW_RIGHT_INSPECT,
+        )
+        .unwrap();
+    assert_eq!(resolved0.object_id(), event0_id);
+    assert_eq!(resolved1.object_id(), event1_id);
+    assert_ne!(resolved0.object_id(), resolved1.object_id());
+    release_nonfinal_pin(&mut registry, resolved0.into_internal());
+    release_nonfinal_pin(&mut registry, resolved1.into_internal());
+
+    let event0_final = tasks
+        .process_handles_mut(process0)
+        .unwrap()
+        .close(&mut registry, handle0)
+        .unwrap()
+        .unwrap();
+    registry.complete_finalization(event0_final).unwrap();
+    let still_live = tasks
+        .process_handles(process1)
+        .unwrap()
+        .lookup(
+            &mut registry,
+            handle1,
+            crate::handle::AcceptedObjectTypes::One(DW_OBJECT_TYPE_EVENT),
+            DW_RIGHT_INSPECT,
+        )
+        .unwrap();
+    assert_eq!(still_live.object_id(), event1_id);
+    release_nonfinal_pin(&mut registry, still_live.into_internal());
+    let event1_final = tasks
+        .process_handles_mut(process1)
+        .unwrap()
+        .close(&mut registry, handle1)
+        .unwrap()
+        .unwrap();
+    registry.complete_finalization(event1_final).unwrap();
+
+    for process in [process0, process1] {
+        let effects = tasks
+            .terminate_process_authorized(&mut registry, process, 0x61)
+            .unwrap();
+        assert_eq!(effects.drained.final_release_count(), 0);
+        assert!(
+            release_pins(&mut registry, effects.pins)
+                .into_iter()
+                .flatten()
+                .next()
+                .is_none()
+        );
+    }
+    for handle in [process0_handle, process1_handle] {
+        let final_release = registry.release_handle(handle).unwrap().unwrap();
+        finish_task_release(&mut tasks, &mut registry, final_release);
+    }
+    let root_final = registry.release_internal(root_owner).unwrap().unwrap();
+    finish_task_release(&mut tasks, &mut registry, root_final);
+}
+
+#[test]
+fn task_group_teardown_at_process_capacity_is_bounded() {
+    type CapacityTasks = TaskAuthority<1, 4, 0, 1>;
+    let mut registry = ObjectRegistry::<8>::new();
+    let mut tasks = CapacityTasks::new();
+    let (root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let mut processes = std::vec::Vec::new();
+    let mut handles = std::vec::Vec::new();
+    for _ in 0..4 {
+        let (process, handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
+        processes.push(process);
+        handles.push(handle);
+    }
+    assert!(matches!(
+        tasks.create_process(&mut registry, &root_owner),
+        Err(TaskCreateError::Task(TaskError::Capacity))
+    ));
+
+    let effects = tasks.terminate_group(&mut registry, root).unwrap();
+    assert_eq!(effects.len(), 4);
+    for effect in effects.into_processes().into_iter().flatten() {
+        assert_eq!(effect.drained.final_release_count(), 0);
+        let (process_pin, thread_pins, resources) = effect.pins.into_parts();
+        assert!(thread_pins.into_iter().next().is_none());
+        assert!(resources.into_iter().next().is_none());
+        assert!(
+            registry
+                .release_internal(process_pin.unwrap())
+                .unwrap()
+                .is_none()
+        );
+    }
+    for process in processes {
+        let info = tasks.process_info(process).unwrap();
+        assert_eq!(info.state, DW_TASK_STATE_EXITED);
+        assert_eq!(info.reason, DW_TERMINATION_TASK_GROUP_TEARDOWN);
+    }
+    for handle in handles {
+        let final_release = registry.release_handle(handle).unwrap().unwrap();
+        let finalization = tasks.take_finalization(final_release).unwrap();
+        assert!(complete_task_finalization(&mut registry, finalization).is_none());
+    }
+    let root_final = registry.release_internal(root_owner).unwrap().unwrap();
+    let finalization = tasks.take_finalization(root_final).unwrap();
+    assert!(complete_task_finalization(&mut registry, finalization).is_none());
+}
+
+#[test]
+fn deterministic_start_close_terminate_finalize_interleavings_preserve_lifetime() {
+    for close_before_start in [true, false] {
+        let mut registry = ObjectRegistry::<OBJECTS>::new();
+        let mut tasks = Tasks::new();
+        let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+        let (process, process_handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
+        let process_owner = process_parent_pin(&mut registry, &process_handle);
+        let (thread, thread_ref) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+        release_nonfinal_pin(&mut registry, process_owner);
+        let thread_handle = tasks
+            .process_handles_mut(process)
+            .unwrap()
+            .install(thread_ref, DW_RIGHT_INSPECT)
+            .unwrap();
+
+        if close_before_start {
+            assert!(
+                tasks
+                    .process_handles_mut(process)
+                    .unwrap()
+                    .close(&mut registry, thread_handle)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        prepare_thread(&mut tasks, thread, 0x30 + u64::from(close_before_start));
+        tasks.start_thread(thread).unwrap();
+        if !close_before_start {
+            assert!(
+                tasks
+                    .process_handles_mut(process)
+                    .unwrap()
+                    .close(&mut registry, thread_handle)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        let pins = tasks.terminate_thread_authorized(thread, 0x77).unwrap();
+        let releases: std::vec::Vec<_> = release_pins(&mut registry, pins)
+            .into_iter()
+            .flatten()
+            .collect();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(
+            releases[0].object_type(),
+            deepwyrm_abi::DW_OBJECT_TYPE_THREAD
+        );
+        finish_task_release(
+            &mut tasks,
+            &mut registry,
+            releases.into_iter().next().unwrap(),
+        );
+        assert_eq!(tasks.thread_info(thread), Err(TaskError::InvalidTask));
+        assert_eq!(tasks.start_thread(thread), Err(TaskError::InvalidTask));
+
+        let process_final = registry.release_handle(process_handle).unwrap().unwrap();
+        finish_task_release(&mut tasks, &mut registry, process_final);
+        let root_final = registry.release_internal(root_owner).unwrap().unwrap();
+        finish_task_release(&mut tasks, &mut registry, root_final);
+    }
+}
