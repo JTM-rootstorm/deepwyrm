@@ -73,3 +73,20 @@ id = 11
 
 [guest_test.task-user-exception]
 id = 12
+
+# DW0-F reserved IPC/blocking identities. F0 reserves these IDs only; target
+# dispatch is added later when each selector has a real guest body.
+[guest_test.ipc-blocking-smoke]
+id = 13
+
+[guest_test.ipc-transfer-rollback]
+id = 14
+
+[guest_test.wait-deadline-timer]
+id = 15
+
+[guest_test.atomic-wait-wake]
+id = 16
+
+[guest_test.process-create-bootstrap]
+id = 17

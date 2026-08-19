@@ -287,6 +287,33 @@ fn dw0e_task_selectors_have_stable_build_owned_ids() {
 }
 
 #[test]
+fn dw0f_reserved_selectors_have_stable_build_owned_ids() {
+    let config = workspace_root().join(HARNESS_CONFIG);
+    for (selector, test_id) in [
+        ("ipc-blocking-smoke", 13),
+        ("ipc-transfer-rollback", 14),
+        ("wait-deadline-timer", 15),
+        ("atomic-wait-wake", 16),
+        ("process-create-bootstrap", 17),
+    ] {
+        let request_path = temp_file(
+            &request("guest-test", selector)
+                .replace("test_id = 1", &format!("test_id = {test_id}")),
+        );
+        let parsed = load_harness_request(&request_path).unwrap();
+        validate_guest_selector_metadata(&config, &parsed).unwrap();
+        assert_eq!(
+            guest_build_selection(HarnessKind::GuestTest, &parsed),
+            Some(GuestBuildSelection {
+                selector: selector.into(),
+                expected_test_id: test_id,
+            })
+        );
+        fs::remove_file(request_path).unwrap();
+    }
+}
+
+#[test]
 fn build_tools_identity_is_host_neutral_and_fixed() {
     let identity = load_build_tools_identity(&workspace_root().join(BUILD_TOOLS_CONFIG)).unwrap();
     assert_eq!(identity.clang_version, "22.1.8");
