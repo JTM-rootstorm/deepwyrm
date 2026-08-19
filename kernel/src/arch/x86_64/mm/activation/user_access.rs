@@ -129,6 +129,20 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> Us
     }
 }
 
+impl PinnedLiveUserPages<'_> {
+    fn assert_exact_copy_range(&self, range: UserRange, byte_len: usize) {
+        assert_eq!(
+            range, self.range,
+            "pinned live usercopy range drifted after preflight"
+        );
+        assert_eq!(
+            u64::try_from(byte_len).ok(),
+            Some(range.byte_len()),
+            "pinned live usercopy byte length drifted after preflight"
+        );
+    }
+}
+
 impl PinnedUserPages for PinnedLiveUserPages<'_> {
     type Error = LiveUserAccessError;
 
@@ -151,6 +165,7 @@ impl PinnedUserPages for PinnedLiveUserPages<'_> {
         reason = "the range pin remains active and live-root preflight proved every source page readable before exact copy"
     )]
     fn read_exact(&mut self, range: UserRange, destination: &mut [u8]) {
+        self.assert_exact_copy_range(range, destination.len());
         unsafe {
             core::ptr::copy_nonoverlapping(
                 range.start() as *const u8,
@@ -165,6 +180,7 @@ impl PinnedUserPages for PinnedLiveUserPages<'_> {
         reason = "the range pin remains active and live-root preflight proved every destination page writable before exact copy"
     )]
     fn write_exact(&mut self, range: UserRange, source: &[u8]) {
+        self.assert_exact_copy_range(range, source.len());
         unsafe {
             core::ptr::copy_nonoverlapping(source.as_ptr(), range.start() as *mut u8, source.len());
         }

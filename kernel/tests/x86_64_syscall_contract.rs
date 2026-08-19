@@ -155,6 +155,21 @@ fn e5_live_user_pins_guard_actual_atomic_write_batches() {
 }
 
 #[test]
+fn e5_live_usercopy_exact_copy_is_bound_to_the_pinned_range() {
+    let access = source("src/arch/x86_64/mm/activation/user_access.rs");
+
+    assert!(access.contains("fn assert_exact_copy_range"));
+    assert_eq!(
+        access
+            .match_indices("self.assert_exact_copy_range(range,")
+            .count(),
+        2
+    );
+    assert!(access.contains("range, self.range"));
+    assert!(access.contains("Some(range.byte_len())"));
+}
+
+#[test]
 fn e5_user_return_validation_is_bound_to_the_target_process() {
     let activation = source("src/arch/x86_64/mm/activation.rs");
     let access = source("src/arch/x86_64/mm/activation/user_access.rs");
