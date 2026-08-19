@@ -124,6 +124,7 @@ fn map_page<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     region: &mut E7Region,
     owner: &InternalRef,
     address: u64,
+    authorization_ceiling: MemoryProtection,
     protection: MemoryProtection,
     candidates: &mut [Option<crate::memory::frame_roles::TableCandidateGrant>; 3],
     detail: u32,
@@ -138,7 +139,7 @@ fn map_page<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
             resolved,
             region.address_space_key(),
             region.region_key(),
-            protection,
+            authorization_ceiling,
         )
         .unwrap_or_else(|_| fail(detail));
     let mut publisher = setup
@@ -325,6 +326,7 @@ fn build_smoke_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY:
         &mut region,
         &code_owner,
         crate::test_support::e7_user_entry(),
+        MemoryProtection::READ_WRITE_EXECUTE,
         MemoryProtection::READ_WRITE,
         &mut candidates,
         0x70,
@@ -336,6 +338,7 @@ fn build_smoke_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY:
         &mut region,
         &data_owner,
         crate::test_support::e7_user_data(),
+        MemoryProtection::READ_WRITE,
         MemoryProtection::READ_WRITE,
         &mut candidates,
         0x74,
@@ -355,6 +358,7 @@ fn build_smoke_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY:
         &mut region,
         &stack_owner,
         crate::test_support::e7_user_stack_bottom(),
+        MemoryProtection::READ_WRITE,
         MemoryProtection::READ_WRITE,
         &mut candidates,
         0x7a,
