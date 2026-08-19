@@ -54,6 +54,15 @@
 .type dw_x86_64_syscall_entry,@function
 dw_x86_64_syscall_entry:
     /*
+     * CPL3 may legally reload GS and thereby replace its effective base with
+     * a DPL3 descriptor base. Recover the kernel-owned entry-state base before
+     * the first GS-relative access. NMI/#DF/#MC use dedicated IST stacks and
+     * the exception entry path does not consume GS, so this unconditional
+     * SWAPGS has no conditional-entry ambiguity.
+     */
+    swapgs
+
+    /*
      * SYSCALL leaves the user RSP live. The only permitted writes before the
      * stack switch are to supervisor-only GS scratch fixed by E0.
      */
@@ -122,6 +131,8 @@ dw_x86_64_syscall_entry:
     xorl %ecx, %ecx
     xorl %r11d, %r11d
     movq E4_SC_R12(%r12), %r12
+    /* Restore the CPL3 GS base captured by entry SWAPGS. */
+    swapgs
     iretq
 .size dw_x86_64_syscall_entry, .-dw_x86_64_syscall_entry
 
@@ -156,6 +167,8 @@ dw_x86_64_iret_to_user:
     movq E4_UR_RCX(%r12), %rcx
     movq E4_UR_R11(%r12), %r11
     movq E4_UR_R12(%r12), %r12
+    /* First CPL3 entry moves the kernel entry-state base behind KERNEL_GS_BASE. */
+    swapgs
     iretq
 .size dw_x86_64_iret_to_user, .-dw_x86_64_iret_to_user
 

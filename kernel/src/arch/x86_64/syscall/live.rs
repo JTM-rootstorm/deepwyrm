@@ -293,7 +293,7 @@ fn entry_state_address() -> u64 {
 
 #[allow(
     unsafe_code,
-    reason = "one-shot BSP initialization writes the supervisor-only GS entry record before publishing MSRs"
+    reason = "one-shot BSP initialization writes the supervisor-only GS entry record before publishing the swapgs MSR pair"
 )]
 unsafe fn initialize_entry_state(entry_stack_top: u64) {
     unsafe {
@@ -337,7 +337,7 @@ fn syscall_entry_address() -> u64 {
 /// Must run at CPL0 on the BSP with IF clear after the final GDT/TSS is active.
 #[allow(
     unsafe_code,
-    reason = "E4 programs CR4 and architectural MSRs and publishes the GS entry-state base"
+    reason = "E4 programs CR4 and architectural MSRs and publishes the swapgs-protected GS entry-state base"
 )]
 pub(crate) unsafe fn install_syscall_boundary() -> Result<(), SyscallInstallError> {
     if INSTALL_STATE

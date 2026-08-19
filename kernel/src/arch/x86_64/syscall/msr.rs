@@ -52,12 +52,12 @@ impl SyscallMsrPlan {
     pub(crate) fn new(
         current_efer: u64,
         lstar: u64,
-        gs_base: u64,
+        entry_state_base: u64,
     ) -> Result<Self, SyscallMsrPlanError> {
-        if lstar == 0 || gs_base == 0 {
+        if lstar == 0 || entry_state_base == 0 {
             return Err(SyscallMsrPlanError::ZeroKernelAddress);
         }
-        if !is_upper_canonical(lstar) || !is_upper_canonical(gs_base) {
+        if !is_upper_canonical(lstar) || !is_upper_canonical(entry_state_base) {
             return Err(SyscallMsrPlanError::NonCanonicalKernelAddress);
         }
         Ok(Self {
@@ -66,7 +66,10 @@ impl SyscallMsrPlan {
             lstar,
             fmask: E4_FMASK,
             fs_base: 0,
-            gs_base,
+            // Installation runs in CPL0. Keep the kernel entry-state base active
+            // until the first IRET helper swaps it behind IA32_KERNEL_GS_BASE.
+            // Every later SYSCALL begins with SWAPGS before consuming GS.
+            gs_base: entry_state_base,
             kernel_gs_base: 0,
         })
     }

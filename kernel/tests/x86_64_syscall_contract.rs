@@ -12,28 +12,33 @@ fn source(relative: &str) -> String {
 }
 
 #[test]
-fn syscall_entry_switches_from_user_rsp_before_stack_memory() {
+fn syscall_entry_swaps_to_kernel_gs_before_touching_user_rsp_or_gs_state() {
     let assembly = source("src/arch/x86_64/syscall_entry.S");
     let entry = assembly
         .split_once("dw_x86_64_syscall_entry:")
         .expect("syscall entry symbol")
         .1;
+    let swap = entry.find("    swapgs").expect("entry SWAPGS");
+    let first_gs = entry
+        .find("movq %rsp, %gs:E4_GS_STAGED_USER_RSP")
+        .expect("first trusted GS access");
     let switch = entry
         .find("movq %gs:E4_GS_ENTRY_STACK_TOP, %rsp")
         .expect("trusted GS stack switch");
+    assert!(swap < first_gs && first_gs < switch);
     let before = &entry[..switch];
-    assert!(before.contains("movq %rsp, %gs:E4_GS_STAGED_USER_RSP"));
     assert!(before.contains("movq %rcx, %gs:E4_GS_STAGED_USER_RIP"));
     assert!(before.contains("movq %r11, %gs:E4_GS_STAGED_USER_RFLAGS"));
     assert!(!before.contains("pushq") && !before.contains("(%rsp)"));
 }
 
 #[test]
-fn syscall_entry_uses_iretq_without_swapgs_or_sysret() {
+fn syscall_entry_uses_iretq_with_balanced_swapgs_and_no_sysret() {
     let assembly = source("src/arch/x86_64/syscall_entry.S");
     let lowered = assembly.to_ascii_lowercase();
-    assert!(!lowered.contains("swapgs"));
     assert!(!lowered.contains("sysret"));
+    assert_eq!(assembly.match_indices("    swapgs").count(), 3);
+    assert_eq!(assembly.match_indices("    swapgs\n    iretq").count(), 2);
     assert!(assembly.match_indices("iretq").count() >= 2);
     assert!(assembly.contains("pushq $0x2b"));
     assert!(assembly.contains("pushq $0x33"));
@@ -69,6 +74,7 @@ fn msr_policy_matches_e0_and_return_requires_explicit_authorization() {
     let native = source("src/syscall/native.rs");
     assert!(msr.contains("pub(crate) const E4_FMASK: u64 = 0x001f_7700"));
     assert!(msr.contains("star: u64::from(KERNEL_CODE_SELECTOR.bits()) << 32"));
+    assert!(msr.contains("gs_base: entry_state_base"));
     assert!(msr.contains("kernel_gs_base: 0"));
     assert!(msr.contains("CR4_FSGSBASE"));
     assert!(live.contains("CPUID_SYSCALL_SYSRET: u32 = 1 << 11"));
@@ -188,6 +194,10 @@ fn e7_smoke_runtime_uses_live_e5_syscall_and_return_authority() {
     let runtime = source("src/arch/x86_64/mm/activation/test_support/e7.rs");
     let kernel = source("src/lib.rs");
     let build = source("build.rs");
+
+    let user = source("tests/userspace/e7_task_smoke.S");
+    assert!(user.contains("movw $0x2b, %ax"));
+    assert!(user.contains("movw %ax, %gs"));
 
     for marker in [
         "current_process_address_space(self.process)",

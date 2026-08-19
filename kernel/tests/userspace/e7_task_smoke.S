@@ -7,6 +7,15 @@
 .globl _start
 .type _start,@function
 _start:
+    /*
+     * E8 regression: CPL3 may legally reload the DPL3 data selector into GS,
+     * replacing the effective GS base with this descriptor's zero base. The
+     * SYSCALL entry must recover its kernel entry-state base before any %gs
+     * access rather than trusting the user-resident base.
+     */
+    movw $0x2b, %ax
+    movw %ax, %gs
+
     movl $DW_E7_SYSCALL_ABI_GET_INFO, %edi
     movabsq $DW_E7_USER_INFO_ADDRESS, %rsi
     movl $DW_E7_ABI_INFO_SIZE, %edx
