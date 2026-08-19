@@ -29,8 +29,8 @@ use crate::memory::usercopy::{
 use crate::object::{FinalRelease, HandleRef, InternalRef, ObjectRegistry, ObjectRegistryError};
 use crate::task::{
     ExecutionDomain, ExecutionResourceError, ProcessExitEffects, ProcessKey, RetiredExitPins,
-    SchedulerError, StartThreadError, TaskAuthority, TaskCreateError, TaskError, TaskGroupKey,
-    TaskGroupTerminationEffects, ThreadKey, ThreadStartState,
+    SchedulerError, SchedulerThreadState, StartThreadError, TaskAuthority, TaskCreateError,
+    TaskError, TaskGroupKey, TaskGroupTerminationEffects, ThreadKey, ThreadStartState,
 };
 
 use super::native::SyscallControl;
@@ -199,6 +199,39 @@ fn task_create_status(error: TaskCreateError) -> DwStatus {
         TaskCreateError::Registry(_) => DW_STATUS_BAD_STATE,
         TaskCreateError::Task(error) => task_status(error),
     }
+}
+
+fn validate_created_handle_rights(
+    object_type: deepwyrm_abi::DwObjectType,
+    rights: DwRights,
+) -> Result<(), DwStatus> {
+    if rights.0 == 0
+        || !deepwyrm_abi::dw_rights_are_known(rights)
+        || !deepwyrm_abi::dw_rights_are_compatible(object_type, rights)
+    {
+        return Err(DW_STATUS_INVALID_ARGUMENT);
+    }
+    Ok(())
+}
+
+fn validate_running_caller<
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EXECUTION: usize,
+>(
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    current_process: ProcessKey,
+    current_thread: ThreadKey,
+) -> Result<(), DwStatus> {
+    if tasks.thread_process(current_thread).map_err(task_status)? != current_process
+        || execution.scheduler_state(current_thread) != Some(SchedulerThreadState::Running)
+    {
+        return Err(DW_STATUS_BAD_STATE);
+    }
+    Ok(())
 }
 
 pub(crate) fn handle_close<
@@ -474,6 +507,11 @@ pub(crate) fn task_group_create<
     out_handle: DwUserAddress,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> DwStatus {
+    if let Err(status) =
+        validate_created_handle_rights(deepwyrm_abi::DW_OBJECT_TYPE_TASK_GROUP, requested_rights)
+    {
+        return status;
+    }
     let output = match preflight_output(user, out_handle, 8, 8) {
         Ok(output) => output,
         Err(status) => return status,
@@ -537,6 +575,11 @@ pub(crate) fn thread_create<
     out_thread: DwUserAddress,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> DwStatus {
+    if let Err(status) =
+        validate_created_handle_rights(deepwyrm_abi::DW_OBJECT_TYPE_THREAD, requested_rights)
+    {
+        return status;
+    }
     let output = match preflight_output(user, out_thread, 8, 8) {
         Ok(output) => output,
         Err(status) => return status,
@@ -636,11 +679,16 @@ pub(crate) fn task_group_terminate<
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
     current_process: ProcessKey,
+    current_thread: ThreadKey,
     task_group: DwHandle,
     reason: DwTerminationReason,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> (DwStatus, SyscallControl) {
     if let Err(status) = authorized_reason(reason) {
+        return (status, SyscallControl::ReturnToCaller);
+    }
+    if let Err(status) = validate_running_caller(tasks, execution, current_process, current_thread)
+    {
         return (status, SyscallControl::ReturnToCaller);
     }
     let pin = match resolve_current_handle(
@@ -686,6 +734,10 @@ pub(crate) fn process_exit<
     code: u32,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> (DwStatus, SyscallControl) {
+    if let Err(status) = validate_running_caller(tasks, execution, current_process, current_thread)
+    {
+        return (status, SyscallControl::ReturnToCaller);
+    }
     let effects = match tasks.exit_process(registry, current_process, current_thread, code) {
         Ok(effects) => effects,
         Err(error) => return (task_status(error), SyscallControl::ReturnToCaller),
@@ -706,12 +758,17 @@ pub(crate) fn process_terminate<
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
     current_process: ProcessKey,
+    current_thread: ThreadKey,
     process: DwHandle,
     reason: DwTerminationReason,
     detail: u32,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> (DwStatus, SyscallControl) {
     if let Err(status) = authorized_reason(reason) {
+        return (status, SyscallControl::ReturnToCaller);
+    }
+    if let Err(status) = validate_running_caller(tasks, execution, current_process, current_thread)
+    {
         return (status, SyscallControl::ReturnToCaller);
     }
     let pin = match resolve_current_handle(
@@ -752,14 +809,16 @@ pub(crate) fn thread_exit<
     registry: &mut ObjectRegistry<OBJECTS>,
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
+    current_process: ProcessKey,
     current_thread: ThreadKey,
     code: u32,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> (DwStatus, SyscallControl) {
-    let process = match tasks.thread_process(current_thread) {
-        Ok(process) => process,
-        Err(error) => return (task_status(error), SyscallControl::ReturnToCaller),
-    };
+    if let Err(status) = validate_running_caller(tasks, execution, current_process, current_thread)
+    {
+        return (status, SyscallControl::ReturnToCaller);
+    }
+    let process = current_process;
     let pins = match tasks.exit_thread(current_thread, code) {
         Ok(pins) => pins,
         Err(error) => return (task_status(error), SyscallControl::ReturnToCaller),
@@ -793,12 +852,17 @@ pub(crate) fn thread_terminate<
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
     current_process: ProcessKey,
+    current_thread: ThreadKey,
     thread: DwHandle,
     reason: DwTerminationReason,
     detail: u32,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> (DwStatus, SyscallControl) {
     if let Err(status) = authorized_reason(reason) {
+        return (status, SyscallControl::ReturnToCaller);
+    }
+    if let Err(status) = validate_running_caller(tasks, execution, current_process, current_thread)
+    {
         return (status, SyscallControl::ReturnToCaller);
     }
     let pin = match resolve_current_handle(
@@ -844,10 +908,12 @@ pub(crate) fn thread_terminate<
     }
     collect_retired_pins(registry, execution.retire_exit_pins(pins), cleanup);
     release_lookup_pin(registry, pin, cleanup);
-    (
-        DW_STATUS_SUCCESS,
-        control_after_process_state(tasks, current_process),
-    )
+    let control = if target == current_thread {
+        SyscallControl::Reschedule
+    } else {
+        control_after_process_state(tasks, current_process)
+    };
+    (DW_STATUS_SUCCESS, control)
 }
 
 fn start_thread_status(error: StartThreadError) -> DwStatus {

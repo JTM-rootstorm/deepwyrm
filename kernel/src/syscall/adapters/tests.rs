@@ -580,3 +580,150 @@ fn address_region_map_preflights_copyout_and_preserves_mapping_leases() {
     );
     assert_eq!(tasks.process_handle_count(process).unwrap(), 0);
 }
+
+fn test_stack_bounds<const N: usize>() -> [crate::memory::kernel_stack::KernelStackBounds; N] {
+    core::array::from_fn(|index| {
+        let stride = 0x11_000_u64;
+        let guard = 0xffff_9100_0000_0000 + u64::try_from(index).unwrap() * stride;
+        crate::memory::kernel_stack::KernelStackBounds::new(guard, guard + 0x1000, guard + stride)
+            .unwrap()
+    })
+}
+
+fn test_start(seed: u64) -> ThreadStartState {
+    ThreadStartState::from_validated_user_state(
+        0x0000_0000_4000_0000 + seed * 0x1000,
+        0x0000_0000_5000_0000 + seed * 0x1000,
+        seed,
+        seed + 1,
+    )
+}
+
+fn finish_task_cleanup<const OBJECTS: usize>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut Tasks,
+    cleanup: CleanupQueue<OBJECTS>,
+) {
+    for release in cleanup.into_releases().into_iter().flatten() {
+        let mut pending = Some(release);
+        while let Some(release) = pending.take() {
+            let finalization = tasks.take_finalization(release).unwrap();
+            pending = crate::task::complete_task_finalization(registry, finalization);
+        }
+    }
+}
+
+#[test]
+fn invalid_task_creation_rights_do_not_burn_object_generations() {
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let mut user = FakeUserMemory::new();
+    let before = registry.test_slot_generations();
+    let mut cleanup = CleanupQueue::<16>::new();
+
+    assert_eq!(
+        thread_create(
+            &mut user,
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            DwRights(0),
+            DwUserAddress(BASE + 0x180),
+            &mut cleanup,
+        ),
+        DW_STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(registry.test_slot_generations(), before);
+    assert_eq!(tasks.process_handle_count(process).unwrap(), 1);
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+}
+
+#[test]
+fn self_thread_termination_with_live_sibling_never_returns_to_reclaimed_context() {
+    use deepwyrm_abi::{DW_OBJECT_TYPE_PROCESS, DW_RIGHT_MODIFY, DW_TERMINATION_AUTHORIZED};
+
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let execution = ExecutionDomain::<2>::new(test_stack_bounds::<2>()).unwrap();
+    let mut cleanup = CleanupQueue::<16>::new();
+    let process_pin = resolve_current_handle(
+        &tasks,
+        &mut registry,
+        process,
+        process_handle,
+        DW_OBJECT_TYPE_PROCESS,
+        DW_RIGHT_MODIFY,
+    )
+    .unwrap();
+    let (current, current_ref) = tasks.create_thread(&mut registry, &process_pin).unwrap();
+    let (sibling, sibling_ref) = tasks.create_thread(&mut registry, &process_pin).unwrap();
+    release_lookup_pin(&mut registry, process_pin, &mut cleanup);
+    let current_handle = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(current_ref, DW_RIGHT_MODIFY)
+        .unwrap();
+    let sibling_handle = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(sibling_ref, DW_RIGHT_MODIFY)
+        .unwrap();
+
+    execution
+        .start_thread(&mut tasks, current, test_start(1))
+        .unwrap();
+    execution
+        .start_thread(&mut tasks, sibling, test_start(2))
+        .unwrap();
+    assert_eq!(execution.schedule_next().unwrap().current, Some(current));
+
+    assert_eq!(
+        thread_terminate(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            process,
+            current,
+            current_handle,
+            DW_TERMINATION_AUTHORIZED,
+            0x51,
+            &mut cleanup,
+        ),
+        (DW_STATUS_SUCCESS, SyscallControl::Reschedule)
+    );
+    assert_eq!(execution.scheduler_state(current), None);
+    assert_eq!(
+        execution.scheduler_state(sibling),
+        Some(SchedulerThreadState::Running)
+    );
+    assert_ne!(
+        tasks.process_info(process).unwrap().state,
+        deepwyrm_abi::DW_TASK_STATE_EXITED
+    );
+
+    assert_eq!(
+        thread_terminate(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            process,
+            sibling,
+            sibling_handle,
+            DW_TERMINATION_AUTHORIZED,
+            0x52,
+            &mut cleanup,
+        ),
+        (DW_STATUS_SUCCESS, SyscallControl::Reschedule)
+    );
+    assert_eq!(execution.scheduler_state(sibling), None);
+    assert_eq!(tasks.process_handle_count(process).unwrap(), 0);
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}

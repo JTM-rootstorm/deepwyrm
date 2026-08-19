@@ -206,6 +206,11 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_slot_generations(&self) -> [u32; CAPACITY] {
+        core::array::from_fn(|slot| self.slots[slot].generation)
+    }
+
     pub(crate) fn create(
         &mut self,
         object_type: DwObjectType,
