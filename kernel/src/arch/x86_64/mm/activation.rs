@@ -46,6 +46,7 @@ use super::private::{
 };
 
 const ENTRY_COUNT: usize = 512;
+const E5_USER_PIN_CAPACITY: usize = 8;
 const MAX_DEEP_TABLE_FRAMES: usize = 256;
 const ADDRESS_OFFSET_MASK: u64 = PAGE_SIZE - 1;
 const HARDWARE_MUTABLE: u64 = ACCESSED | DIRTY;
@@ -387,6 +388,7 @@ pub(crate) struct ActiveDeepPaging<A> {
     target: A,
     root: PageTableRoot,
     identity: TableIdentity,
+    user_pins: crate::memory::usercopy::UserPinTracker<E5_USER_PIN_CAPACITY>,
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -1139,7 +1141,10 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             root: &self.root,
             identity: self.identity,
             roles: target.roles,
-            scratch: &mut target.scratch,
+            target: user_access::TrackedActiveTarget {
+                scratch: &mut target.scratch,
+                pins: &self.user_pins,
+            },
             _root: core::marker::PhantomData,
         }
     }
@@ -1180,6 +1185,7 @@ impl<H, T: Cr3ActivationTarget<H>> PreparedActivation<H, T> {
             target,
             root,
             identity,
+            user_pins: crate::memory::usercopy::UserPinTracker::new(),
         }
     }
 }

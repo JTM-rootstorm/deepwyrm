@@ -19,7 +19,7 @@ use deepwyrm_abi::{
     DwRights, DwStatus, DwTerminationReason, DwUserAddress,
 };
 
-use crate::handle::{AcceptedObjectTypes, HandleTableError};
+use crate::handle::{AcceptedObjectTypes, HandleTableError, ResolvedHandle};
 use crate::memory::object::MemoryObjectAuthority;
 use crate::memory::user_range::{EmptyAddressRule, UserAccess, UserAddressSpace, UserRange};
 use crate::memory::usercopy::{
@@ -338,6 +338,33 @@ pub(crate) const fn object_info_required_size(topic: u32) -> Option<u64> {
     }
 }
 
+fn resolve_current<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    current_process: ProcessKey,
+    handle: DwHandle,
+    object_type: deepwyrm_abi::DwObjectType,
+    rights: DwRights,
+) -> Result<ResolvedHandle, DwStatus> {
+    let table = tasks
+        .process_handles(current_process)
+        .map_err(task_status)?;
+    table
+        .lookup(
+            registry,
+            handle,
+            AcceptedObjectTypes::One(object_type),
+            rights,
+        )
+        .map_err(handle_status)
+}
+
 fn resolve_current_handle<
     const OBJECTS: usize,
     const GROUPS: usize,
@@ -352,18 +379,15 @@ fn resolve_current_handle<
     object_type: deepwyrm_abi::DwObjectType,
     rights: DwRights,
 ) -> Result<InternalRef, DwStatus> {
-    let table = tasks
-        .process_handles(current_process)
-        .map_err(task_status)?;
-    table
-        .lookup(
-            registry,
-            handle,
-            AcceptedObjectTypes::One(object_type),
-            rights,
-        )
-        .map(|resolved| resolved.into_internal())
-        .map_err(handle_status)
+    resolve_current(
+        tasks,
+        registry,
+        current_process,
+        handle,
+        object_type,
+        rights,
+    )
+    .map(ResolvedHandle::into_internal)
 }
 
 fn release_lookup_pin<const OBJECTS: usize>(
@@ -1081,4 +1105,442 @@ pub(crate) fn memory_object_create<
     };
     output.commit(&encode_handle(handle));
     DW_STATUS_SUCCESS
+}
+
+fn queue_mapping_releases<const OBJECTS: usize>(
+    cleanup: &mut CleanupQueue<OBJECTS>,
+    releases: crate::memory::object::MappingFinalReleases<OBJECTS>,
+) {
+    for release in releases.into_items().into_iter().flatten() {
+        cleanup.push(release);
+    }
+}
+
+fn address_region_status(error: crate::memory::address_region::AddressRegionError) -> DwStatus {
+    use crate::memory::address_region::AddressRegionError;
+    use crate::memory::object::MemoryObjectError;
+    match error {
+        AddressRegionError::Empty
+        | AddressRegionError::Unaligned
+        | AddressRegionError::Overflow
+        | AddressRegionError::InvalidProtection => DW_STATUS_INVALID_ARGUMENT,
+        AddressRegionError::PageZero | AddressRegionError::OutsideRegion => DW_STATUS_BAD_ADDRESS,
+        AddressRegionError::Overlap => deepwyrm_abi::DW_STATUS_ALREADY_EXISTS,
+        AddressRegionError::Unmapped => deepwyrm_abi::DW_STATUS_NOT_FOUND,
+        AddressRegionError::NoSpace => deepwyrm_abi::DW_STATUS_NO_MEMORY,
+        AddressRegionError::Capacity => DW_STATUS_NO_RESOURCES,
+        AddressRegionError::UnsupportedProtection => DW_STATUS_NOT_SUPPORTED,
+        AddressRegionError::Object(MemoryObjectError::InsufficientRights)
+        | AddressRegionError::Object(MemoryObjectError::ProtectionCeiling) => {
+            DW_STATUS_ACCESS_DENIED
+        }
+        AddressRegionError::Object(MemoryObjectError::BackingTooSmall)
+        | AddressRegionError::Object(MemoryObjectError::Empty)
+        | AddressRegionError::Object(MemoryObjectError::Unaligned)
+        | AddressRegionError::Object(MemoryObjectError::Overflow)
+        | AddressRegionError::Object(MemoryObjectError::InvalidProtection)
+        | AddressRegionError::Object(MemoryObjectError::WritableExecutableAlias) => {
+            DW_STATUS_INVALID_ARGUMENT
+        }
+        AddressRegionError::Object(MemoryObjectError::UnsupportedProtection) => {
+            DW_STATUS_NOT_SUPPORTED
+        }
+        AddressRegionError::LiveMappings
+        | AddressRegionError::LiveRegions
+        | AddressRegionError::PublisherIdentity
+        | AddressRegionError::Object(_) => DW_STATUS_BAD_STATE,
+    }
+}
+
+fn address_transaction_status<E>(
+    error: &crate::memory::address_region::AddressSpaceTransactionError<E>,
+) -> DwStatus {
+    match error {
+        crate::memory::address_region::AddressSpaceTransactionError::Model(error) => {
+            address_region_status(*error)
+        }
+        crate::memory::address_region::AddressSpaceTransactionError::Publish(_) => {
+            DW_STATUS_BAD_STATE
+        }
+    }
+}
+fn address_region_object_status(
+    error: crate::memory::address_region::AddressRegionObjectError,
+) -> DwStatus {
+    use crate::memory::address_region::AddressRegionObjectError;
+    match error {
+        AddressRegionObjectError::Capacity => DW_STATUS_NO_RESOURCES,
+        AddressRegionObjectError::WrongObjectType => DW_STATUS_WRONG_OBJECT_TYPE,
+        AddressRegionObjectError::WrongProcess => DW_STATUS_BAD_HANDLE,
+        AddressRegionObjectError::RuntimePin | AddressRegionObjectError::LiveMappings => {
+            DW_STATUS_BAD_STATE
+        }
+        AddressRegionObjectError::Task(error) => task_status(error),
+        AddressRegionObjectError::Model(error) => address_region_status(error),
+        AddressRegionObjectError::Registry(ObjectRegistryError::Capacity)
+        | AddressRegionObjectError::Registry(ObjectRegistryError::ReferenceCountExhausted) => {
+            DW_STATUS_NO_RESOURCES
+        }
+        AddressRegionObjectError::Registry(_) => DW_STATUS_BAD_STATE,
+    }
+}
+
+fn decode_map_args<U: UserPageAccess>(
+    user: &mut U,
+    args_address: DwUserAddress,
+    args_size: u64,
+) -> Result<deepwyrm_abi::DwAddressRegionMapArgsV1, DwStatus> {
+    if args_size != u64::from(deepwyrm_abi::DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE) {
+        return Err(DW_STATUS_INVALID_ARGUMENT);
+    }
+    let bytes =
+        copy_input::<U, { super::abi_bytes::ADDRESS_REGION_MAP_BYTES }>(user, args_address, 8)?;
+    let args = super::abi_bytes::decode_address_region_map(&bytes);
+    if args.size != deepwyrm_abi::DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE
+        || args.version != 1
+        || args.reserved != [0; 4]
+        || args.flags.0 & !deepwyrm_abi::DW_ADDRESS_REGION_MAP_FLAGS_SUPPORTED_MASK.0 != 0
+        || args.protections.0 & !deepwyrm_abi::DW_MEMORY_PROTECTION_SUPPORTED_MASK.0 != 0
+    {
+        return Err(DW_STATUS_INVALID_ARGUMENT);
+    }
+    let fixed = args.flags.0 == deepwyrm_abi::DW_ADDRESS_REGION_MAP_FLAG_FIXED.0;
+    if (!fixed && args.requested_address.0 != 0) || (fixed && args.requested_address.0 == 0) {
+        return Err(DW_STATUS_INVALID_ARGUMENT);
+    }
+    Ok(args)
+}
+
+fn map_required_rights(protection: crate::memory::address_region::Protection) -> DwRights {
+    let mut bits = deepwyrm_abi::DW_RIGHT_MAP.0 | deepwyrm_abi::DW_RIGHT_READ.0;
+    if protection.writable() {
+        bits |= deepwyrm_abi::DW_RIGHT_WRITE.0;
+    }
+    if protection.executable() {
+        bits |= deepwyrm_abi::DW_RIGHT_EXECUTE.0;
+    }
+    DwRights(bits)
+}
+pub(crate) fn address_region_map<
+    U: UserPageAccess,
+    P: crate::memory::address_region::AddressSpacePublisher,
+    const OBJECTS: usize,
+    const MEMORY_OBJECTS: usize,
+    const LEASES: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const REGION_OBJECTS: usize,
+    const REGION_SLOTS: usize,
+>(
+    user: &mut U,
+    publisher: &mut P,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    memory: &mut MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    regions: &mut crate::memory::address_region::AddressRegionObjectAuthority<
+        REGION_OBJECTS,
+        REGION_SLOTS,
+    >,
+    current_process: ProcessKey,
+    address_region: DwHandle,
+    memory_object: DwHandle,
+    args_address: DwUserAddress,
+    args_size: u64,
+    out_address: DwUserAddress,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
+    let args = match decode_map_args(user, args_address, args_size) {
+        Ok(args) => args,
+        Err(status) => return status,
+    };
+    let protection =
+        match crate::memory::object::MemoryProtection::mapping(args.protections.0 as u8) {
+            Ok(protection) => protection,
+            Err(crate::memory::object::MemoryObjectError::UnsupportedProtection) => {
+                return DW_STATUS_NOT_SUPPORTED;
+            }
+            Err(_) => return DW_STATUS_INVALID_ARGUMENT,
+        };
+    let output = match preflight_output(user, out_address, 8, 8) {
+        Ok(output) => output,
+        Err(status) => return status,
+    };
+    address_region_map_preflighted(
+        output,
+        publisher,
+        registry,
+        memory,
+        tasks,
+        regions,
+        current_process,
+        address_region,
+        memory_object,
+        args,
+        protection,
+        cleanup,
+    )
+}
+
+fn address_region_map_preflighted<
+    PIN: crate::memory::usercopy::PinnedUserPages,
+    P: crate::memory::address_region::AddressSpacePublisher,
+    const OBJECTS: usize,
+    const MEMORY_OBJECTS: usize,
+    const LEASES: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const REGION_OBJECTS: usize,
+    const REGION_SLOTS: usize,
+>(
+    output: PinnedUserOutput<PIN>,
+    publisher: &mut P,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    memory: &mut MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    regions: &mut crate::memory::address_region::AddressRegionObjectAuthority<
+        REGION_OBJECTS,
+        REGION_SLOTS,
+    >,
+    current_process: ProcessKey,
+    address_region: DwHandle,
+    memory_object: DwHandle,
+    args: deepwyrm_abi::DwAddressRegionMapArgsV1,
+    protection: crate::memory::address_region::Protection,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
+    let region_resolved = match resolve_current(
+        tasks,
+        registry,
+        current_process,
+        address_region,
+        deepwyrm_abi::DW_OBJECT_TYPE_ADDRESS_REGION,
+        DwRights(deepwyrm_abi::DW_RIGHT_MAP.0 | deepwyrm_abi::DW_RIGHT_MODIFY.0),
+    ) {
+        Ok(resolved) => resolved,
+        Err(status) => return status,
+    };
+    let region_key = crate::memory::address_region::AddressRegionObjectKey::from_object_id(
+        region_resolved.object_id(),
+    );
+    let memory_resolved = match resolve_current(
+        tasks,
+        registry,
+        current_process,
+        memory_object,
+        deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT,
+        map_required_rights(protection),
+    ) {
+        Ok(resolved) => resolved,
+        Err(status) => {
+            release_lookup_pin(registry, region_resolved.into_internal(), cleanup);
+            return status;
+        }
+    };
+    let region = match regions.region_mut_for_live_process(tasks, region_key) {
+        Ok(region) => region,
+        Err(error) => {
+            release_lookup_pin(registry, memory_resolved.into_internal(), cleanup);
+            release_lookup_pin(registry, region_resolved.into_internal(), cleanup);
+            return address_region_object_status(error);
+        }
+    };
+    let authorization = match region.authorize_map(memory, memory_resolved, protection) {
+        Ok(authorization) => authorization,
+        Err(error) => {
+            let (memory_error, releases) = error.release(registry);
+            queue_mapping_releases(cleanup, releases);
+            release_lookup_pin(registry, region_resolved.into_internal(), cleanup);
+            return match memory_error {
+                crate::memory::object::MemoryObjectError::InsufficientRights
+                | crate::memory::object::MemoryObjectError::ProtectionCeiling => {
+                    DW_STATUS_ACCESS_DENIED
+                }
+                crate::memory::object::MemoryObjectError::UnsupportedProtection => {
+                    DW_STATUS_NOT_SUPPORTED
+                }
+                crate::memory::object::MemoryObjectError::BackingTooSmall
+                | crate::memory::object::MemoryObjectError::Empty
+                | crate::memory::object::MemoryObjectError::Unaligned
+                | crate::memory::object::MemoryObjectError::Overflow
+                | crate::memory::object::MemoryObjectError::InvalidProtection
+                | crate::memory::object::MemoryObjectError::WritableExecutableAlias => {
+                    DW_STATUS_INVALID_ARGUMENT
+                }
+                _ => DW_STATUS_BAD_STATE,
+            };
+        }
+    };
+    let fixed = args.flags.0 == deepwyrm_abi::DW_ADDRESS_REGION_MAP_FLAG_FIXED.0;
+    let result = if fixed {
+        region
+            .map(
+                memory,
+                registry,
+                publisher,
+                args.requested_address.0,
+                authorization,
+                args.memory_object_offset.0,
+                args.byte_len.0,
+                protection,
+            )
+            .map(|releases| (args.requested_address.0, releases))
+    } else {
+        region.map_anywhere(
+            memory,
+            registry,
+            publisher,
+            authorization,
+            args.memory_object_offset.0,
+            args.byte_len.0,
+            protection,
+        )
+    };
+    release_lookup_pin(registry, region_resolved.into_internal(), cleanup);
+    match result {
+        Ok((address, releases)) => {
+            queue_mapping_releases(cleanup, releases);
+            output.commit(&encode_u64(address));
+            DW_STATUS_SUCCESS
+        }
+        Err(failure) => {
+            let (error, releases) = failure.into_parts();
+            queue_mapping_releases(cleanup, releases);
+            address_transaction_status(&error)
+        }
+    }
+}
+pub(crate) fn address_region_unmap<
+    P: crate::memory::address_region::AddressSpacePublisher,
+    const OBJECTS: usize,
+    const MEMORY_OBJECTS: usize,
+    const LEASES: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const REGION_OBJECTS: usize,
+    const REGION_SLOTS: usize,
+>(
+    publisher: &mut P,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    memory: &mut MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    regions: &mut crate::memory::address_region::AddressRegionObjectAuthority<
+        REGION_OBJECTS,
+        REGION_SLOTS,
+    >,
+    current_process: ProcessKey,
+    address_region: DwHandle,
+    address: DwUserAddress,
+    byte_len: u64,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
+    let resolved = match resolve_current(
+        tasks,
+        registry,
+        current_process,
+        address_region,
+        deepwyrm_abi::DW_OBJECT_TYPE_ADDRESS_REGION,
+        DW_RIGHT_MODIFY,
+    ) {
+        Ok(resolved) => resolved,
+        Err(status) => return status,
+    };
+    let key =
+        crate::memory::address_region::AddressRegionObjectKey::from_object_id(resolved.object_id());
+    let region = match regions.region_mut_for_live_process(tasks, key) {
+        Ok(region) => region,
+        Err(error) => {
+            release_lookup_pin(registry, resolved.into_internal(), cleanup);
+            return address_region_object_status(error);
+        }
+    };
+    let result = region.unmap(memory, registry, publisher, address.0, byte_len);
+    release_lookup_pin(registry, resolved.into_internal(), cleanup);
+    match result {
+        Ok(releases) => {
+            queue_mapping_releases(cleanup, releases);
+            DW_STATUS_SUCCESS
+        }
+        Err(failure) => {
+            let (error, releases) = failure.into_parts();
+            queue_mapping_releases(cleanup, releases);
+            address_transaction_status(&error)
+        }
+    }
+}
+pub(crate) fn address_region_protect<
+    P: crate::memory::address_region::AddressSpacePublisher,
+    const OBJECTS: usize,
+    const MEMORY_OBJECTS: usize,
+    const LEASES: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const REGION_OBJECTS: usize,
+    const REGION_SLOTS: usize,
+>(
+    publisher: &mut P,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    memory: &mut MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    regions: &mut crate::memory::address_region::AddressRegionObjectAuthority<
+        REGION_OBJECTS,
+        REGION_SLOTS,
+    >,
+    current_process: ProcessKey,
+    address_region: DwHandle,
+    address: DwUserAddress,
+    byte_len: u64,
+    protections: u32,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
+    if protections & !deepwyrm_abi::DW_MEMORY_PROTECTION_SUPPORTED_MASK.0 != 0 {
+        return DW_STATUS_INVALID_ARGUMENT;
+    }
+    let protection = match crate::memory::object::MemoryProtection::mapping(protections as u8) {
+        Ok(protection) => protection,
+        Err(crate::memory::object::MemoryObjectError::UnsupportedProtection) => {
+            return DW_STATUS_NOT_SUPPORTED;
+        }
+        Err(_) => return DW_STATUS_INVALID_ARGUMENT,
+    };
+    let resolved = match resolve_current(
+        tasks,
+        registry,
+        current_process,
+        address_region,
+        deepwyrm_abi::DW_OBJECT_TYPE_ADDRESS_REGION,
+        DW_RIGHT_MODIFY,
+    ) {
+        Ok(resolved) => resolved,
+        Err(status) => return status,
+    };
+    let key =
+        crate::memory::address_region::AddressRegionObjectKey::from_object_id(resolved.object_id());
+    let region = match regions.region_mut_for_live_process(tasks, key) {
+        Ok(region) => region,
+        Err(error) => {
+            release_lookup_pin(registry, resolved.into_internal(), cleanup);
+            return address_region_object_status(error);
+        }
+    };
+    let result = region.protect(memory, registry, publisher, address.0, byte_len, protection);
+    release_lookup_pin(registry, resolved.into_internal(), cleanup);
+    match result {
+        Ok(releases) => {
+            queue_mapping_releases(cleanup, releases);
+            DW_STATUS_SUCCESS
+        }
+        Err(failure) => {
+            let (error, releases) = failure.into_parts();
+            queue_mapping_releases(cleanup, releases);
+            address_transaction_status(&error)
+        }
+    }
 }

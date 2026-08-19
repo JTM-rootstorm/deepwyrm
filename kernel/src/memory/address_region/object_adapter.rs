@@ -14,6 +14,10 @@ use crate::task::{ProcessKey, TaskAuthority, TaskError};
 pub(crate) struct AddressRegionObjectKey(ObjectId);
 
 impl AddressRegionObjectKey {
+    pub(crate) const fn from_object_id(object: ObjectId) -> Self {
+        Self(object)
+    }
+
     pub(crate) const fn object_id(self) -> ObjectId {
         self.0
     }

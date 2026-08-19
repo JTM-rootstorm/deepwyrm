@@ -13,6 +13,7 @@
 )]
 
 use super::user_range::{UserAccess, UserPageChunk, UserRange};
+use crate::sync::SpinMutex;
 
 /// Acquires a stable view of a user range for preflight and exact copy.
 ///
@@ -25,6 +26,156 @@ pub(crate) trait UserPageAccess {
         Self: 'a;
 
     fn pin(&mut self, range: UserRange) -> Result<Self::Pinned<'_>, Self::Error>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserPinError {
+    Capacity,
+    Conflict,
+    InvalidMutationRange,
+}
+
+#[derive(Clone, Copy)]
+struct PinnedRange {
+    start: u64,
+    end_exclusive: u64,
+}
+
+impl PinnedRange {
+    const fn from_user_range(range: UserRange) -> Option<Self> {
+        if range.is_empty() {
+            None
+        } else {
+            Some(Self {
+                start: range.start(),
+                end_exclusive: range.end_exclusive(),
+            })
+        }
+    }
+
+    const fn overlaps(self, other: Self) -> bool {
+        self.start < other.end_exclusive && other.start < self.end_exclusive
+    }
+}
+
+struct UserPinState<const CAPACITY: usize> {
+    pins: [Option<PinnedRange>; CAPACITY],
+    mutation: Option<PinnedRange>,
+}
+
+/// Range-scoped user-mapping stability authority.
+///
+/// Pins and mapping mutations reserve non-overlapping ranges through one short
+/// spin-locked linearization point. The lock is never held across usercopy or
+/// page-table publication; move-only permits keep the reservation live instead.
+pub(crate) struct UserPinTracker<const CAPACITY: usize> {
+    state: SpinMutex<UserPinState<CAPACITY>>,
+}
+
+impl<const CAPACITY: usize> UserPinTracker<CAPACITY> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            state: SpinMutex::new(UserPinState {
+                pins: [None; CAPACITY],
+                mutation: None,
+            }),
+        }
+    }
+
+    pub(crate) fn pin(&self, range: UserRange) -> Result<UserRangePin<'_, CAPACITY>, UserPinError> {
+        let range =
+            PinnedRange::from_user_range(range).ok_or(UserPinError::InvalidMutationRange)?;
+        let mut state = self.state.lock();
+        if state
+            .mutation
+            .is_some_and(|mutation| mutation.overlaps(range))
+        {
+            return Err(UserPinError::Conflict);
+        }
+        let slot = state
+            .pins
+            .iter()
+            .position(Option::is_none)
+            .ok_or(UserPinError::Capacity)?;
+        state.pins[slot] = Some(range);
+        Ok(UserRangePin {
+            tracker: self,
+            slot,
+            range,
+        })
+    }
+
+    pub(crate) fn begin_mutation(
+        &self,
+        start: u64,
+        byte_len: u64,
+    ) -> Result<UserMutationPermit<'_, CAPACITY>, UserPinError> {
+        if byte_len == 0 {
+            return Err(UserPinError::InvalidMutationRange);
+        }
+        let end_exclusive = start
+            .checked_add(byte_len)
+            .ok_or(UserPinError::InvalidMutationRange)?;
+        let mutation = PinnedRange {
+            start,
+            end_exclusive,
+        };
+        let mut state = self.state.lock();
+        if state.mutation.is_some()
+            || state
+                .pins
+                .iter()
+                .flatten()
+                .copied()
+                .any(|pin| pin.overlaps(mutation))
+        {
+            return Err(UserPinError::Conflict);
+        }
+        state.mutation = Some(mutation);
+        Ok(UserMutationPermit {
+            tracker: self,
+            range: mutation,
+        })
+    }
+}
+
+#[must_use = "user mapping pins must remain live through exact copy or deliberate discard"]
+pub(crate) struct UserRangePin<'a, const CAPACITY: usize> {
+    tracker: &'a UserPinTracker<CAPACITY>,
+    slot: usize,
+    range: PinnedRange,
+}
+
+impl<const CAPACITY: usize> Drop for UserRangePin<'_, CAPACITY> {
+    fn drop(&mut self) {
+        let mut state = self.tracker.state.lock();
+        assert_eq!(
+            state.pins[self.slot].map(|range| (range.start, range.end_exclusive)),
+            Some((self.range.start, self.range.end_exclusive)),
+            "user pin tracker slot drift"
+        );
+        state.pins[self.slot] = None;
+    }
+}
+
+#[must_use = "mapping mutation permits must span the complete page-table publication"]
+pub(crate) struct UserMutationPermit<'a, const CAPACITY: usize> {
+    tracker: &'a UserPinTracker<CAPACITY>,
+    range: PinnedRange,
+}
+
+impl<const CAPACITY: usize> Drop for UserMutationPermit<'_, CAPACITY> {
+    fn drop(&mut self) {
+        let mut state = self.tracker.state.lock();
+        assert_eq!(
+            state
+                .mutation
+                .map(|range| (range.start, range.end_exclusive)),
+            Some((self.range.start, self.range.end_exclusive)),
+            "user mutation tracker drift"
+        );
+        state.mutation = None;
+    }
 }
 
 /// Mapping-stable page access held across full preflight and exact copy.
@@ -398,6 +549,46 @@ mod tests {
         assert_eq!(backend.preflight_count, 0);
         assert_eq!(backend.read_count, 0);
         assert_eq!(backend.write_count, 0);
+    }
+
+    fn range_at(start: u64, byte_len: u64, access: UserAccess) -> UserRange {
+        let space = UserAddressSpace::x86_64_four_level(PAGE_SIZE).unwrap();
+        UserRange::new(space, start, byte_len, 1, access, EmptyAddressRule::Reject).unwrap()
+    }
+
+    #[test]
+    fn range_tracker_blocks_only_overlapping_mutations() {
+        let tracker = UserPinTracker::<2>::new();
+        let pin = tracker
+            .pin(range_at(PAGE_SIZE * 4 + 32, 64, UserAccess::WRITE))
+            .unwrap();
+        assert!(matches!(
+            tracker.begin_mutation(PAGE_SIZE * 4, PAGE_SIZE),
+            Err(UserPinError::Conflict)
+        ));
+        let disjoint = tracker.begin_mutation(PAGE_SIZE * 8, PAGE_SIZE).unwrap();
+        drop(disjoint);
+        drop(pin);
+        let overlap_after_drop = tracker.begin_mutation(PAGE_SIZE * 4, PAGE_SIZE).unwrap();
+        drop(overlap_after_drop);
+    }
+
+    #[test]
+    fn active_mutation_rejects_new_overlapping_pin() {
+        let tracker = UserPinTracker::<2>::new();
+        let mutation = tracker
+            .begin_mutation(PAGE_SIZE * 4, PAGE_SIZE * 2)
+            .unwrap();
+        assert!(matches!(
+            tracker.pin(range_at(PAGE_SIZE * 5, 8, UserAccess::READ)),
+            Err(UserPinError::Conflict)
+        ));
+        assert!(
+            tracker
+                .pin(range_at(PAGE_SIZE * 9, 8, UserAccess::READ))
+                .is_ok()
+        );
+        drop(mutation);
     }
 
     #[test]
