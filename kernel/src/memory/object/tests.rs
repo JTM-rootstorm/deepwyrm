@@ -690,6 +690,64 @@ fn authorization_pin_transfers_to_lease_and_final_unmap_reclaims_backing() {
     unsafe_code,
     reason = "the synthetic manager test attests complete zeroing before typed backing assignment"
 )]
+fn exhausted_lease_slot_is_skipped_when_later_capacity_exists() {
+    let mut roles = crate::memory::frame_roles::synthetic_frame_role_manager::<1, 8>(0x10_000, 4);
+    let allocation = roles.allocate(1).unwrap();
+    let zeroed = unsafe { roles.assume_zeroed(allocation) }.unwrap();
+    let backing = roles.assign_object_backing(zeroed).unwrap();
+    let mut registry = ObjectRegistry::<1>::new();
+    let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+    let mut authority = MemoryObjectAuthority::<1, 2>::new();
+    authority.leases[0].generation = u32::MAX;
+    let key = authority
+        .grant_backing(
+            &creation,
+            backing,
+            PAGE_SIZE,
+            MemoryObjectKind::PageBacked,
+            MemoryProtection::READ_WRITE,
+        )
+        .unwrap();
+    let owner = registry.creation_into_internal(creation).unwrap();
+    let (space, region) = ids();
+    let (captured, authorization) = mapping(
+        &authority,
+        &mut registry,
+        &owner,
+        key,
+        space,
+        region,
+        MemoryProtection::READ_WRITE,
+    );
+
+    let prepared = authority
+        .prepare_replace::<1, 1>(
+            &mut registry,
+            space,
+            region,
+            &[],
+            &[LeaseRequest::new(
+                space,
+                region,
+                captured,
+                0,
+                PAGE_SIZE,
+                MemoryProtection::READ,
+            )],
+            Some(authorization),
+        )
+        .unwrap();
+    let lease = prepared.tickets()[0].unwrap().lease();
+    assert_eq!(decode_raw_key(lease.raw).unwrap().0, 1);
+    assert!(prepared.commit().is_empty());
+    assert_eq!(authority.active_lease_count(), 1);
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the synthetic manager test attests complete zeroing before typed backing assignment"
+)]
 fn failed_mapping_preparation_drops_last_authorization_pin() {
     let mut roles = crate::memory::frame_roles::synthetic_frame_role_manager::<1, 8>(0x10_000, 4);
     let allocation = roles.allocate(1).unwrap();

@@ -136,7 +136,8 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             .iter()
             .enumerate()
             .filter(|(slot, lease)| {
-                lease.record.is_none() || release_slots[..released.len()].contains(slot)
+                (lease.record.is_none() || release_slots[..released.len()].contains(slot))
+                    && next_generation(lease.generation).is_ok()
             })
             .count();
         if requested.len() > reusable_slots {
@@ -226,15 +227,20 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
                 PendingPinSource::Extra(source_index)
             };
             let slot = loop {
+                if candidate_cursor == LEASES {
+                    return Err(MemoryObjectError::LeaseCapacity);
+                }
                 let slot = candidate_cursor;
                 candidate_cursor += 1;
-                if self.leases[slot].record.is_none()
-                    || release_slots[..released.len()].contains(&slot)
+                if (self.leases[slot].record.is_none()
+                    || release_slots[..released.len()].contains(&slot))
+                    && next_generation(self.leases[slot].generation).is_ok()
                 {
                     break slot;
                 }
             };
-            let generation = next_generation(self.leases[slot].generation)?;
+            let generation = next_generation(self.leases[slot].generation)
+                .expect("candidate lease generation was prevalidated");
             let lease = MappingLease {
                 domain: self.domain,
                 raw: encode_raw_key(slot, generation),
