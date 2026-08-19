@@ -24,8 +24,9 @@ fn c3_memory_dispatch_occurs_only_after_the_deep_root_is_active() {
         "memory tests must consume the active C2 session"
     );
     assert!(
-        kernel[..activation].contains("test if test.is_memory_foundation() => {}"),
-        "memory selectors must pass through the early terminal-test dispatch"
+        kernel[..activation]
+            .contains("test if test.is_memory_foundation() || test.is_task_userspace() => {}"),
+        "memory selectors must remain deferred through the early terminal-test dispatch"
     );
     assert_eq!(
         kernel
