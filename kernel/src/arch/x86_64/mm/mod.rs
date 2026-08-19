@@ -113,6 +113,13 @@ impl VirtualPage {
         Ok(Self(address))
     }
 
+    pub const fn containing(address: u64) -> Result<Self, AddressError> {
+        if !is_canonical(address) {
+            return Err(AddressError::InvalidVirtualPage(address));
+        }
+        Ok(Self(address & !(PAGE_SIZE - 1)))
+    }
+
     pub const fn address(self) -> u64 {
         self.0
     }

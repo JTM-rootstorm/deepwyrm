@@ -191,8 +191,8 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     LiveProcessAddressSpace<'borrow, 'root, RANGE_CAPACITY, ROLE_CAPACITY>
 {
     fn walk_leaf(&mut self, virtual_address: u64) -> Result<LiveUserWalk, LiveUserAccessError> {
-        let page =
-            VirtualPage::new(virtual_address).map_err(|_| LiveUserAccessError::MissingOrInvalid)?;
+        let page = VirtualPage::containing(virtual_address)
+            .map_err(|_| LiveUserAccessError::MissingOrInvalid)?;
         if !page.is_user_half() {
             return Err(LiveUserAccessError::Permission);
         }

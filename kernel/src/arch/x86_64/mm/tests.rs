@@ -281,6 +281,21 @@ fn rejects_table_leaf_alias_and_never_trusts_a_cached_leaf_path() {
 }
 
 #[test]
+fn containing_page_accepts_byte_addresses_without_weakening_exact_page_construction() {
+    assert_eq!(VirtualPage::containing(0x4fff).unwrap().address(), 0x4000);
+    assert_eq!(
+        VirtualPage::new(0x4fff),
+        Err(AddressError::InvalidVirtualPage(0x4fff))
+    );
+    for address in [0x0000_8000_0000_0001, 0xffff_7fff_ffff_ffff] {
+        assert_eq!(
+            VirtualPage::containing(address),
+            Err(AddressError::InvalidVirtualPage(address))
+        );
+    }
+}
+
+#[test]
 fn rejects_noncanonical_aliases_and_cyclic_ancestor_paths() {
     for address in [
         0x0000_8000_0000_0000,
