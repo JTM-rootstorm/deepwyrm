@@ -594,6 +594,9 @@ fn unexpected_user_exception(record: crate::arch::x86_64::exceptions::UserExcept
 fn enter_smoke<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     active: ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
 ) -> ! {
+    if !crate::arch::x86_64::context::validate_target_continuation_roundtrip() {
+        fail(0xbb);
+    }
     let mut runtime = build_smoke_runtime(active);
     let exception_binding =
         crate::arch::x86_64::syscall::bind_user_exception_handler(unexpected_user_exception)

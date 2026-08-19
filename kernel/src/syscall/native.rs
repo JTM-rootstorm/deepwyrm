@@ -752,10 +752,10 @@ pub(crate) fn dispatch_frame<R: NativeSyscallFrameRuntime>(
         None => NativeSyscallResult::returning(DW_STATUS_INVALID_ARGUMENT),
     };
     frame.set_status(result.status);
-    if result.control == SyscallControl::ReturnToCaller {
-        if let Err(error) = runtime.authorize_return(frame, current_binding_generation) {
-            runtime.invalid_return(error);
-        }
+    if result.control == SyscallControl::ReturnToCaller
+        && let Err(error) = runtime.authorize_return(frame, current_binding_generation)
+    {
+        runtime.invalid_return(error);
     }
     result.control
 }

@@ -207,6 +207,7 @@ fn e7_smoke_runtime_uses_live_e5_syscall_and_return_authority() {
         "crate::syscall::process_exit(",
         "Some(SchedulerThreadState::Running)",
         "frame.authorize_return(current_binding_generation, &mut mappings)",
+        "validate_target_continuation_roundtrip()",
         "core::pin::pin!(runtime)",
         "bind_native_syscall_runtime(runtime.as_mut())",
         "ValidatedUserReturn::initial(context, &mut mappings)",

@@ -6,6 +6,8 @@ pub(crate) fn validate_e7_stack_margin(sizes: &[StackSize]) {
     const REQUIRED_SPARE_BYTES: usize = 32 * 1024;
     const ARCHITECTURAL_HEADROOM_BYTES: usize = 4 * 1024;
     const RETURN_ADDRESS_BYTES: usize = 64 * size_of::<u64>();
+    const F2_PROBE_STACK_BYTES: usize = 16 * 1024;
+    const F2_SWITCH_FRAME_BYTES: usize = 7 * size_of::<u64>();
 
     let exact = |name: &str| one_stack_size(sizes, name, |symbol| symbol == name);
     let plain = |description: &str, needle: &str| {
@@ -14,6 +16,24 @@ pub(crate) fn validate_e7_stack_margin(sizes: &[StackSize]) {
         })
     };
     let frame = |name: &'static str, bytes: usize| AuditedStackFrame { name, bytes };
+
+    let f2_probe_wrapper = plain(
+        "F2 target continuation wrapper",
+        "context::validate_target_continuation_roundtrip",
+    );
+    let f2_probe_run = plain("F2 target continuation run", "context::target_probe::run");
+    let f2_probe_alternate = plain(
+        "F2 target continuation alternate",
+        "context::target_probe::alternate_entry",
+    );
+    let f2_alternate_total = f2_probe_alternate
+        .checked_add(F2_SWITCH_FRAME_BYTES)
+        .and_then(|bytes| bytes.checked_add(ARCHITECTURAL_HEADROOM_BYTES))
+        .expect("F2 target probe stack bound fits usize");
+    assert!(
+        f2_alternate_total <= F2_PROBE_STACK_BYTES,
+        "F2 alternate probe stack too small: used={f2_alternate_total} capacity={F2_PROBE_STACK_BYTES}"
+    );
 
     let boot_retained = [
         frame("e7-kernel-main", exact("deepwyrm_kernel::kernel_main")),
@@ -161,7 +181,14 @@ pub(crate) fn validate_e7_stack_margin(sizes: &[StackSize]) {
         .expect("E7 bootstrap prepare stack manifest is unique");
     let boot_publish = audited_stack_path(&[&boot_retained, &protect_prefix, &publish_branch])
         .expect("E7 bootstrap publish stack manifest is unique");
-    let boot = audited_stack_upper_bound(&[boot_prepare, boot_publish]);
+    let f2_probe_branch = [
+        frame("f2-probe-wrapper", f2_probe_wrapper),
+        frame("f2-probe-run", f2_probe_run),
+        frame("f2-switch-frame", F2_SWITCH_FRAME_BYTES),
+    ];
+    let boot_probe = audited_stack_path(&[&boot_retained, &f2_probe_branch])
+        .expect("F2 target probe bootstrap stack manifest is unique");
+    let boot = audited_stack_upper_bound(&[boot_prepare, boot_publish, boot_probe]);
     let boot_total = boot
         .bytes
         .checked_add(RETURN_ADDRESS_BYTES)

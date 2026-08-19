@@ -37,9 +37,9 @@ pub(crate) const fn saved_rsp_is_within_stack(bounds: KernelStackBounds, rsp: u6
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum KernelContextPlanError {
-    NullSavePointer,
-    MisalignedSavePointer,
-    InvalidNextStackPointer,
+    NullSaveSlot,
+    MisalignedSaveSlot,
+    InvalidNextStack,
 }
 
 #[derive(Debug)]
@@ -65,13 +65,13 @@ impl KernelSwitchPlan {
         next_stack: KernelStackBounds,
     ) -> Result<Self, KernelContextPlanError> {
         if current_rsp_out.is_null() {
-            return Err(KernelContextPlanError::NullSavePointer);
+            return Err(KernelContextPlanError::NullSaveSlot);
         }
         if (current_rsp_out as usize) & 7 != 0 {
-            return Err(KernelContextPlanError::MisalignedSavePointer);
+            return Err(KernelContextPlanError::MisalignedSaveSlot);
         }
         if !saved_rsp_is_within_stack(next_stack, next_rsp) {
-            return Err(KernelContextPlanError::InvalidNextStackPointer);
+            return Err(KernelContextPlanError::InvalidNextStack);
         }
         Ok(Self {
             current_rsp_out,
@@ -257,4 +257,113 @@ mod tests {
             }
         }
     }
+}
+
+#[cfg(all(deepwyrm_e7_guest, target_os = "none", target_arch = "x86_64"))]
+mod target_probe {
+    use core::cell::UnsafeCell;
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    use super::switch_kernel_context;
+
+    const STACK_BYTES: usize = 16 * 1024;
+
+    struct SharedU64(UnsafeCell<u64>);
+    #[allow(
+        unsafe_code,
+        reason = "the F2 selector probe is single-BSP and serializes every raw switch-slot access"
+    )]
+    unsafe impl Sync for SharedU64 {}
+
+    impl SharedU64 {
+        const fn new() -> Self {
+            Self(UnsafeCell::new(0))
+        }
+        const fn ptr(&self) -> *mut u64 {
+            self.0.get()
+        }
+    }
+
+    #[repr(align(16))]
+    struct ProbeStack(UnsafeCell<[u8; STACK_BYTES]>);
+    #[allow(
+        unsafe_code,
+        reason = "the one-shot F2 selector probe exclusively owns its static alternate stack"
+    )]
+    unsafe impl Sync for ProbeStack {}
+
+    static STACK: ProbeStack = ProbeStack(UnsafeCell::new([0; STACK_BYTES]));
+    static MAIN_RSP: SharedU64 = SharedU64::new();
+    static ALTERNATE_RSP: SharedU64 = SharedU64::new();
+    static MARK: AtomicU8 = AtomicU8::new(0);
+
+    #[allow(
+        unsafe_code,
+        reason = "the target probe deliberately resumes the exact audited kernel context on its owned alternate stack"
+    )]
+    unsafe extern "sysv64" fn alternate_entry() -> ! {
+        MARK.store(1, Ordering::SeqCst);
+        let main = unsafe { core::ptr::read_volatile(MAIN_RSP.ptr()) };
+        unsafe { switch_kernel_context(ALTERNATE_RSP.ptr(), main) };
+
+        MARK.store(2, Ordering::SeqCst);
+        let main = unsafe { core::ptr::read_volatile(MAIN_RSP.ptr()) };
+        unsafe { switch_kernel_context(ALTERNATE_RSP.ptr(), main) };
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "the target-only probe constructs one synthetic initial SysV return frame, then validates two real suspended-continuation resumes"
+    )]
+    #[inline(never)]
+    pub(super) fn run() -> bool {
+        MARK.store(0, Ordering::SeqCst);
+        unsafe {
+            core::ptr::write_volatile(MAIN_RSP.ptr(), 0);
+            core::ptr::write_volatile(ALTERNATE_RSP.ptr(), 0);
+        }
+        let base = STACK.0.get().cast::<u8>();
+        let top = unsafe { base.add(STACK_BYTES) } as usize;
+        if top & 0xf != 0 {
+            return false;
+        }
+        let saved = top - 72;
+        let frame = saved as *mut u64;
+        unsafe {
+            for index in 0..6 {
+                frame.add(index).write(0);
+            }
+            frame.add(6).write(0x2);
+            frame
+                .add(7)
+                .write(alternate_entry as *const () as usize as u64);
+            frame.add(8).write(0);
+            switch_kernel_context(MAIN_RSP.ptr(), saved as u64);
+        }
+        if MARK.load(Ordering::SeqCst) != 1 {
+            return false;
+        }
+        let alternate = unsafe { core::ptr::read_volatile(ALTERNATE_RSP.ptr()) };
+        if alternate == 0 || alternate & 0xf != 0 {
+            return false;
+        }
+        unsafe {
+            switch_kernel_context(MAIN_RSP.ptr(), alternate);
+        }
+        let passed = MARK.load(Ordering::SeqCst) == 2;
+        unsafe {
+            core::ptr::write_volatile(MAIN_RSP.ptr(), 0);
+            core::ptr::write_volatile(ALTERNATE_RSP.ptr(), 0);
+        }
+        passed
+    }
+}
+
+#[cfg(all(deepwyrm_e7_guest, target_os = "none", target_arch = "x86_64"))]
+#[inline(never)]
+pub(crate) fn validate_target_continuation_roundtrip() -> bool {
+    target_probe::run()
 }
