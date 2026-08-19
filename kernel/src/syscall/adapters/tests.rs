@@ -882,3 +882,216 @@ fn thread_start_validates_the_target_process_address_space() {
     assert_eq!(tasks.process_handle_count(caller).unwrap(), 0);
     assert_eq!(tasks.thread_process(thread), Err(TaskError::InvalidTask));
 }
+
+#[test]
+fn task_create_output_preflight_precedes_generation_and_handle_mutation() {
+    let mut registry = ObjectRegistry::<16>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let root_handle_owner = registry.retain_internal(&root_owner).unwrap();
+    let root_handle_ref = registry.internal_into_handle(root_handle_owner).unwrap();
+    let (process, process_ref) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let root_handle = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(root_handle_ref, DW_RIGHT_MODIFY)
+        .unwrap();
+    let process_handle = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(process_ref, DW_RIGHT_MODIFY)
+        .unwrap();
+    let before_generations = registry.test_slot_generations();
+    let before_handles = tasks.process_handle_count(process).unwrap();
+    let mut user = FakeUserMemory::new();
+    user.deny_write = true;
+    let mut cleanup = CleanupQueue::<16>::new();
+
+    assert_eq!(
+        task_group_create(
+            &mut user,
+            &mut registry,
+            &mut tasks,
+            process,
+            root_handle,
+            DW_RIGHT_INSPECT,
+            DwUserAddress(BASE + 0x100),
+            &mut cleanup,
+        ),
+        DW_STATUS_BAD_ADDRESS
+    );
+    assert_eq!(
+        thread_create(
+            &mut user,
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            DW_RIGHT_INSPECT,
+            DwUserAddress(BASE + 0x180),
+            &mut cleanup,
+        ),
+        DW_STATUS_BAD_ADDRESS
+    );
+    assert_eq!(registry.test_slot_generations(), before_generations);
+    assert_eq!(tasks.process_handle_count(process).unwrap(), before_handles);
+
+    for handle in [root_handle, process_handle] {
+        assert_eq!(
+            handle_close(&mut registry, &mut tasks, process, handle, &mut cleanup),
+            DW_STATUS_SUCCESS
+        );
+    }
+    let effects = tasks
+        .terminate_process_authorized(&mut registry, process, 0x40)
+        .unwrap();
+    assert_eq!(effects.drained.final_release_count(), 0);
+    let (process_pin, thread_pins, resources) = effects.pins.into_parts();
+    assert!(thread_pins.into_iter().flatten().next().is_none());
+    assert!(resources.into_iter().flatten().next().is_none());
+    cleanup.push_optional(registry.release_internal(process_pin.unwrap()).unwrap());
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+    let root_final = registry.release_internal(root_owner).unwrap().unwrap();
+    let mut root_cleanup = CleanupQueue::<16>::new();
+    root_cleanup.push(root_final);
+    finish_task_cleanup(&mut registry, &mut tasks, root_cleanup);
+}
+
+#[test]
+fn termination_rejects_reason_type_and_rights_before_target_mutation() {
+    use deepwyrm_abi::{DW_OBJECT_TYPE_PROCESS, DW_TERMINATION_AUTHORIZED};
+
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let mut cleanup = CleanupQueue::<16>::new();
+    let process_pin = resolve_current_handle(
+        &tasks,
+        &mut registry,
+        process,
+        process_handle,
+        DW_OBJECT_TYPE_PROCESS,
+        DW_RIGHT_MODIFY,
+    )
+    .unwrap();
+    let (current, current_ref) = tasks.create_thread(&mut registry, &process_pin).unwrap();
+    let (target, target_ref) = tasks.create_thread(&mut registry, &process_pin).unwrap();
+    release_lookup_pin(&mut registry, process_pin, &mut cleanup);
+    let current_handle = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(current_ref, DW_RIGHT_MODIFY)
+        .unwrap();
+    let target_full = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(
+            target_ref,
+            DwRights(DW_RIGHT_DUPLICATE.0 | DW_RIGHT_INSPECT.0 | DW_RIGHT_MODIFY.0),
+        )
+        .unwrap();
+    let target_inspect = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .duplicate(&mut registry, target_full, DW_RIGHT_INSPECT)
+        .unwrap();
+
+    execution
+        .start_thread(&mut tasks, current, test_start(0x41))
+        .unwrap();
+    assert_eq!(execution.schedule_next().unwrap().current, Some(current));
+
+    assert_eq!(
+        thread_terminate(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            process,
+            current,
+            target_full,
+            deepwyrm_abi::DwTerminationReason(u32::MAX),
+            1,
+            &mut cleanup,
+        ),
+        (DW_STATUS_INVALID_ARGUMENT, SyscallControl::ReturnToCaller)
+    );
+    assert_eq!(
+        tasks.thread_info(target).unwrap().state,
+        deepwyrm_abi::DW_TASK_STATE_CREATED
+    );
+    assert_eq!(
+        thread_terminate(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            process,
+            current,
+            process_handle,
+            DW_TERMINATION_AUTHORIZED,
+            2,
+            &mut cleanup,
+        ),
+        (DW_STATUS_WRONG_OBJECT_TYPE, SyscallControl::ReturnToCaller)
+    );
+    assert_eq!(
+        thread_terminate(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            process,
+            current,
+            target_inspect,
+            DW_TERMINATION_AUTHORIZED,
+            3,
+            &mut cleanup,
+        ),
+        (DW_STATUS_ACCESS_DENIED, SyscallControl::ReturnToCaller)
+    );
+    assert_eq!(
+        tasks.thread_info(target).unwrap().state,
+        deepwyrm_abi::DW_TASK_STATE_CREATED
+    );
+    assert_eq!(
+        thread_terminate(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            process,
+            current,
+            target_full,
+            DW_TERMINATION_AUTHORIZED,
+            0x44,
+            &mut cleanup,
+        ),
+        (DW_STATUS_SUCCESS, SyscallControl::ReturnToCaller)
+    );
+    let target_info = tasks.thread_info(target).unwrap();
+    assert_eq!(target_info.state, deepwyrm_abi::DW_TASK_STATE_EXITED);
+    assert_eq!(target_info.reason, DW_TERMINATION_AUTHORIZED);
+    assert_eq!(target_info.detail, 0x44);
+    assert_eq!(
+        execution.scheduler_state(current),
+        Some(SchedulerThreadState::Running)
+    );
+
+    for handle in [target_full, target_inspect] {
+        assert_eq!(
+            handle_close(&mut registry, &mut tasks, process, handle, &mut cleanup),
+            DW_STATUS_SUCCESS
+        );
+    }
+    assert_eq!(
+        thread_exit(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            process,
+            current,
+            0x55,
+            &mut cleanup,
+        ),
+        (DW_STATUS_SUCCESS, SyscallControl::Reschedule)
+    );
+    assert_eq!(execution.scheduler_state(current), None);
+    let _ = current_handle;
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
