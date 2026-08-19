@@ -51,19 +51,37 @@ fn fail(detail: u32) -> ! {
     crate::test_support::complete_fail(E7_DETAIL_BASE | detail)
 }
 
-fn require_clean_mapping<E>(
+fn require_clean_mapping(
     result: Result<
         crate::memory::object::MappingFinalReleases<REGISTRY_OBJECTS>,
-        crate::memory::address_region::AddressSpaceTransactionFailure<E, REGISTRY_OBJECTS>,
+        crate::memory::address_region::AddressSpaceTransactionFailure<
+            crate::arch::x86_64::mm::journal::X86AddressSpacePublishError<LiveActiveTargetError>,
+            REGISTRY_OBJECTS,
+        >,
     >,
     detail: u32,
 ) {
     match result {
         Ok(releases) if releases.is_empty() => {}
-        Ok(_) => fail(detail),
+        Ok(_) => fail(detail + 7),
         Err(failure) => {
-            let _ = failure.into_final_releases();
-            fail(detail);
+            let (error, _releases) = failure.into_parts();
+            match error {
+                crate::memory::address_region::AddressSpaceTransactionError::Model(_) => {
+                    fail(detail)
+                }
+                crate::memory::address_region::AddressSpaceTransactionError::Publish(error) => {
+                    use crate::arch::x86_64::mm::journal::X86AddressSpacePublishError;
+                    match error {
+                        X86AddressSpacePublishError::Identity => fail(detail + 1),
+                        X86AddressSpacePublishError::InvalidMapping => fail(detail + 2),
+                        X86AddressSpacePublishError::Capacity => fail(detail + 3),
+                        X86AddressSpacePublishError::FrameRole(_) => fail(detail + 4),
+                        X86AddressSpacePublishError::Map(_) => fail(detail + 5),
+                        X86AddressSpacePublishError::Journal(_) => fail(detail + 6),
+                    }
+                }
+            }
         }
     }
 }
