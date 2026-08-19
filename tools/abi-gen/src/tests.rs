@@ -58,6 +58,14 @@ fn canonical_schema_renders_deterministically() {
         "#define DW_RIGHTS_KNOWN_MASK ((DwRights)({}))",
         model.known_rights_mask
     )));
+    assert!(rust.contains(&format!(
+        "pub const DW_SIGNALS_KNOWN_MASK: DwSignals = DwSignals({});",
+        model.known_signals_mask
+    )));
+    assert!(c.contains(&format!(
+        "#define DW_SIGNALS_KNOWN_MASK ((DwSignals)({}))",
+        model.known_signals_mask
+    )));
     for entry in &model.object_rights {
         assert!(rust.contains(&format!(
             "pub const DW_OBJECT_COMPATIBLE_RIGHTS_{}: DwRights = DwRights({});",
@@ -65,6 +73,16 @@ fn canonical_schema_renders_deterministically() {
         )));
         assert!(c.contains(&format!(
             "#define DW_OBJECT_COMPATIBLE_RIGHTS_{} ((DwRights)({}))",
+            entry.object, entry.mask
+        )));
+    }
+    for entry in &model.object_signals {
+        assert!(rust.contains(&format!(
+            "pub const DW_OBJECT_COMPATIBLE_SIGNALS_{}: DwSignals = DwSignals({});",
+            entry.object, entry.mask
+        )));
+        assert!(c.contains(&format!(
+            "#define DW_OBJECT_COMPATIBLE_SIGNALS_{} ((DwSignals)({}))",
             entry.object, entry.mask
         )));
     }
@@ -88,6 +106,9 @@ fn canonical_schema_renders_deterministically() {
         "DW_OBJECT_INFO_TASK_STATE_V1",
         "DW_RIGHTS_KNOWN_MASK",
         "DW_OBJECT_COMPATIBLE_RIGHTS_MEMORY_OBJECT",
+        "DW_SIGNALS_KNOWN_MASK",
+        "DW_OBJECT_COMPATIBLE_SIGNALS_CHANNEL",
+        "DW_OBJECT_COMPATIBLE_SIGNALS_TIMER",
     ] {
         assert!(documentation.contains(name), "ABI.md omitted {name}");
     }
@@ -180,6 +201,60 @@ fn rejects_composite_right_and_invalid_object_zero() {
         )
     });
     assert!(load_error(&root).contains("duplicate object value 0"));
+}
+
+#[test]
+fn rejects_invalid_signal_applicability() {
+    let root = TempRoot::copy_schema();
+    root.rewrite("objects.toml", |text| {
+        text.replacen("applies_to = \"CHANNEL\"", "applies_to = \"BOGUS\"", 1)
+    });
+    assert!(load_error(&root).contains("applies to unknown object `BOGUS`"));
+
+    let root = TempRoot::copy_schema();
+    root.rewrite("objects.toml", |text| {
+        text.replacen(
+            "applies_to = \"CHANNEL\"",
+            "applies_to = \"CHANNEL,CHANNEL\"",
+            1,
+        )
+    });
+    assert!(load_error(&root).contains("invalid or duplicate applies_to object `CHANNEL`"));
+
+    let root = TempRoot::copy_schema();
+    root.rewrite("objects.toml", |text| {
+        text.replacen("applies_to = \"CHANNEL\"", "applies_to = \"NONE\"", 1)
+    });
+    assert!(load_error(&root).contains("applies to sentinel/reserved object `NONE`"));
+}
+
+#[test]
+fn wait_right_and_signal_applicability_must_agree() {
+    let root = TempRoot::copy_schema();
+    root.rewrite("object_rights.toml", |text| {
+        text.replacen(
+            "WAIT,SIGNAL,DUPLICATE,TRANSFER,INSPECT",
+            "SIGNAL,DUPLICATE,TRANSFER,INSPECT",
+            1,
+        )
+    });
+    assert!(
+        load_error(&root)
+            .contains("object `EVENT` must carry WAIT iff it has applicable wait signals")
+    );
+
+    let root = TempRoot::copy_schema();
+    root.rewrite("object_rights.toml", |text| {
+        text.replacen(
+            "MODIFY,DUPLICATE,TRANSFER,INSPECT",
+            "WAIT,MODIFY,DUPLICATE,TRANSFER,INSPECT",
+            1,
+        )
+    });
+    assert!(
+        load_error(&root)
+            .contains("object `TASK_GROUP` must carry WAIT iff it has applicable wait signals")
+    );
 }
 
 #[test]

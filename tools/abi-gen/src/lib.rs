@@ -245,6 +245,14 @@ struct ObjectRights {
 }
 
 #[derive(Clone, Debug)]
+struct ObjectSignals {
+    object: String,
+    object_value: u32,
+    signals: Vec<String>,
+    mask: u64,
+}
+
+#[derive(Clone, Debug)]
 struct ObjectInfoTopic {
     topic: String,
     accepted_objects: String,
@@ -262,6 +270,8 @@ struct Model {
     records: Vec<Record>,
     object_rights: Vec<ObjectRights>,
     known_rights_mask: u64,
+    object_signals: Vec<ObjectSignals>,
+    known_signals_mask: u64,
     object_info_topics: Vec<ObjectInfoTopic>,
     syscalls: Vec<Syscall>,
 }
@@ -466,6 +476,12 @@ impl Model {
             .collect::<BTreeSet<_>>();
         let (object_rights, known_rights_mask) =
             load_object_rights(&documents["object_rights.toml"], object_set, right_set)?;
+        let signal_set = value_sets
+            .iter()
+            .find(|set| set.section == "signal")
+            .expect("signal value set exists");
+        let (object_signals, known_signals_mask) = load_object_signals(object_set, signal_set)?;
+        validate_wait_signal_rights(&object_rights, &object_signals)?;
         let status_names = value_sets
             .iter()
             .find(|set| set.section == "status")
@@ -605,6 +621,8 @@ impl Model {
             records,
             object_rights,
             known_rights_mask,
+            object_signals,
+            known_signals_mask,
             object_info_topics,
             syscalls,
         })

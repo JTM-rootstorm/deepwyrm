@@ -369,6 +369,48 @@ static inline int dw_rights_are_compatible(DwObjectType object_type, DwRights ri
     return (rights & ~compatible) == 0;
 }
 
+/* Mask of every DwSignals bit known to ABI 0. */
+#define DW_SIGNALS_KNOWN_MASK ((DwSignals)(31))
+/* Applicable wait signals for the TASK_GROUP object type. */
+#define DW_OBJECT_COMPATIBLE_SIGNALS_TASK_GROUP ((DwSignals)(0))
+/* Applicable wait signals for the PROCESS object type. */
+#define DW_OBJECT_COMPATIBLE_SIGNALS_PROCESS ((DwSignals)(8))
+/* Applicable wait signals for the THREAD object type. */
+#define DW_OBJECT_COMPATIBLE_SIGNALS_THREAD ((DwSignals)(8))
+/* Applicable wait signals for the MEMORY_OBJECT object type. */
+#define DW_OBJECT_COMPATIBLE_SIGNALS_MEMORY_OBJECT ((DwSignals)(0))
+/* Applicable wait signals for the ADDRESS_REGION object type. */
+#define DW_OBJECT_COMPATIBLE_SIGNALS_ADDRESS_REGION ((DwSignals)(0))
+/* Applicable wait signals for the CHANNEL object type. */
+#define DW_OBJECT_COMPATIBLE_SIGNALS_CHANNEL ((DwSignals)(7))
+/* Applicable wait signals for the EVENT object type. */
+#define DW_OBJECT_COMPATIBLE_SIGNALS_EVENT ((DwSignals)(16))
+/* Applicable wait signals for the TIMER object type. */
+#define DW_OBJECT_COMPATIBLE_SIGNALS_TIMER ((DwSignals)(16))
+
+static inline DwSignals dw_object_compatible_signals(DwObjectType object_type) {
+    switch (object_type) {
+    case DW_OBJECT_TYPE_TASK_GROUP: return DW_OBJECT_COMPATIBLE_SIGNALS_TASK_GROUP;
+    case DW_OBJECT_TYPE_PROCESS: return DW_OBJECT_COMPATIBLE_SIGNALS_PROCESS;
+    case DW_OBJECT_TYPE_THREAD: return DW_OBJECT_COMPATIBLE_SIGNALS_THREAD;
+    case DW_OBJECT_TYPE_MEMORY_OBJECT: return DW_OBJECT_COMPATIBLE_SIGNALS_MEMORY_OBJECT;
+    case DW_OBJECT_TYPE_ADDRESS_REGION: return DW_OBJECT_COMPATIBLE_SIGNALS_ADDRESS_REGION;
+    case DW_OBJECT_TYPE_CHANNEL: return DW_OBJECT_COMPATIBLE_SIGNALS_CHANNEL;
+    case DW_OBJECT_TYPE_EVENT: return DW_OBJECT_COMPATIBLE_SIGNALS_EVENT;
+    case DW_OBJECT_TYPE_TIMER: return DW_OBJECT_COMPATIBLE_SIGNALS_TIMER;
+    default: return (DwSignals)0;
+    }
+}
+
+static inline int dw_signals_are_known(DwSignals signals) {
+    return (signals & ~DW_SIGNALS_KNOWN_MASK) == 0;
+}
+
+static inline int dw_signals_are_compatible(DwObjectType object_type, DwSignals signals) {
+    DwSignals compatible = dw_object_compatible_signals(object_type);
+    return (signals & ~compatible) == 0;
+}
+
 /* DW0 base page size in bytes for BootInfo memory ranges and handoff mappings. */
 #define DW_BOOT_BASE_PAGE_SIZE ((uint32_t)(4096))
 /* Required version value for DwBootMemoryRangeV1 records. */

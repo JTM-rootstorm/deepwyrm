@@ -123,6 +123,62 @@ pub(super) fn render_rust(model: &Model) -> Result<String> {
     .unwrap();
     writeln!(out, "    rights.0 & !compatible.0 == 0").unwrap();
     writeln!(out, "}}\n").unwrap();
+    writeln!(out, "/// Mask of every DwSignals bit known to ABI 0.").unwrap();
+    writeln!(
+        out,
+        "pub const DW_SIGNALS_KNOWN_MASK: DwSignals = DwSignals({});\n",
+        model.known_signals_mask
+    )
+    .unwrap();
+    for entry in &model.object_signals {
+        writeln!(
+            out,
+            "/// Applicable wait signals for the {} object type.",
+            entry.object
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "pub const DW_OBJECT_COMPATIBLE_SIGNALS_{}: DwSignals = DwSignals({});\n",
+            entry.object, entry.mask
+        )
+        .unwrap();
+    }
+    writeln!(out, "/// Returns the applicable wait-signal mask for one object type; sentinel, reserved, and unknown types return zero.").unwrap();
+    writeln!(
+        out,
+        "pub const fn dw_object_compatible_signals(object_type: DwObjectType) -> DwSignals {{"
+    )
+    .unwrap();
+    writeln!(out, "    match object_type.0 {{").unwrap();
+    for entry in &model.object_signals {
+        writeln!(
+            out,
+            "        {} => DW_OBJECT_COMPATIBLE_SIGNALS_{},",
+            entry.object_value, entry.object
+        )
+        .unwrap();
+    }
+    writeln!(out, "        _ => DwSignals(0),").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}\n").unwrap();
+    writeln!(out, "/// Returns true when a signal mask contains only ABI-known bits; zero is structurally known.").unwrap();
+    writeln!(
+        out,
+        "pub const fn dw_signals_are_known(signals: DwSignals) -> bool {{"
+    )
+    .unwrap();
+    writeln!(out, "    signals.0 & !DW_SIGNALS_KNOWN_MASK.0 == 0").unwrap();
+    writeln!(out, "}}\n").unwrap();
+    writeln!(out, "/// Returns true when every requested signal applies to the object type; zero is structurally compatible.").unwrap();
+    writeln!(out, "pub const fn dw_signals_are_compatible(object_type: DwObjectType, signals: DwSignals) -> bool {{").unwrap();
+    writeln!(
+        out,
+        "    let compatible = dw_object_compatible_signals(object_type);"
+    )
+    .unwrap();
+    writeln!(out, "    signals.0 & !compatible.0 == 0").unwrap();
+    writeln!(out, "}}\n").unwrap();
     for constant in &model.constants {
         writeln!(out, "/// {}", constant.doc).unwrap();
         writeln!(
@@ -273,6 +329,46 @@ pub(super) fn render_rust(model: &Model) -> Result<String> {
     writeln!(
         out,
         "        assert!(!dw_rights_are_compatible(DW_OBJECT_TYPE_TASK_GROUP, DW_RIGHT_READ));"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        assert_eq!(DW_SIGNALS_KNOWN_MASK.0, {});",
+        model.known_signals_mask
+    )
+    .unwrap();
+    for entry in &model.object_signals {
+        writeln!(
+            out,
+            "        assert_eq!(DW_OBJECT_COMPATIBLE_SIGNALS_{}.0, {});",
+            entry.object, entry.mask
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "        assert_eq!(dw_object_compatible_signals(DW_OBJECT_TYPE_{}).0, {});",
+            entry.object, entry.mask
+        )
+        .unwrap();
+    }
+    writeln!(
+        out,
+        "        assert_eq!(dw_object_compatible_signals(DW_OBJECT_TYPE_NONE).0, 0);"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        assert!(dw_signals_are_known(DW_SIGNALS_KNOWN_MASK));"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        assert!(dw_signals_are_compatible(DW_OBJECT_TYPE_CHANNEL, DW_SIGNAL_READABLE));"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        assert!(!dw_signals_are_compatible(DW_OBJECT_TYPE_EVENT, DW_SIGNAL_READABLE));"
     )
     .unwrap();
     for constant in &model.constants {
@@ -426,6 +522,60 @@ pub(super) fn render_c(model: &Model) -> Result<String> {
     )
     .unwrap();
     writeln!(out, "    return (rights & ~compatible) == 0;").unwrap();
+    writeln!(out, "}}\n").unwrap();
+    writeln!(out, "/* Mask of every DwSignals bit known to ABI 0. */").unwrap();
+    writeln!(
+        out,
+        "#define DW_SIGNALS_KNOWN_MASK ((DwSignals)({}))",
+        model.known_signals_mask
+    )
+    .unwrap();
+    for entry in &model.object_signals {
+        writeln!(
+            out,
+            "/* Applicable wait signals for the {} object type. */",
+            entry.object
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "#define DW_OBJECT_COMPATIBLE_SIGNALS_{} ((DwSignals)({}))",
+            entry.object, entry.mask
+        )
+        .unwrap();
+    }
+    out.push('\n');
+    writeln!(
+        out,
+        "static inline DwSignals dw_object_compatible_signals(DwObjectType object_type) {{"
+    )
+    .unwrap();
+    writeln!(out, "    switch (object_type) {{").unwrap();
+    for entry in &model.object_signals {
+        writeln!(
+            out,
+            "    case DW_OBJECT_TYPE_{}: return DW_OBJECT_COMPATIBLE_SIGNALS_{};",
+            entry.object, entry.object
+        )
+        .unwrap();
+    }
+    writeln!(out, "    default: return (DwSignals)0;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}\n").unwrap();
+    writeln!(
+        out,
+        "static inline int dw_signals_are_known(DwSignals signals) {{"
+    )
+    .unwrap();
+    writeln!(out, "    return (signals & ~DW_SIGNALS_KNOWN_MASK) == 0;").unwrap();
+    writeln!(out, "}}\n").unwrap();
+    writeln!(out, "static inline int dw_signals_are_compatible(DwObjectType object_type, DwSignals signals) {{").unwrap();
+    writeln!(
+        out,
+        "    DwSignals compatible = dw_object_compatible_signals(object_type);"
+    )
+    .unwrap();
+    writeln!(out, "    return (signals & ~compatible) == 0;").unwrap();
     writeln!(out, "}}\n").unwrap();
     for constant in &model.constants {
         writeln!(out, "/* {} */", constant.doc).unwrap();
@@ -870,6 +1020,32 @@ pub(super) fn render_markdown(model: &Model) -> Result<String> {
                 .collect::<Vec<_>>()
                 .join(" + "),
             entry.mask
+        )
+        .unwrap();
+    }
+    out.push('\n');
+    writeln!(out, "## Object-signal compatibility\n").unwrap();
+    writeln!(out, "`DW_SIGNALS_KNOWN_MASK` is `{}`. Applicability is generated from each signal's `applies_to` schema field; zero is structurally compatible but wait operations separately require nonzero desired signals.\n", model.known_signals_mask).unwrap();
+    writeln!(
+        out,
+        "| Object | Generated mask | Signals | Value |\n|---|---|---|---:|"
+    )
+    .unwrap();
+    for entry in &model.object_signals {
+        let names = if entry.signals.is_empty() {
+            "NONE".to_owned()
+        } else {
+            entry
+                .signals
+                .iter()
+                .map(|signal| format!("DW_SIGNAL_{signal}"))
+                .collect::<Vec<_>>()
+                .join(" + ")
+        };
+        writeln!(
+            out,
+            "| `DW_OBJECT_TYPE_{}` | `DW_OBJECT_COMPATIBLE_SIGNALS_{}` | `{}` | `{}` |",
+            entry.object, entry.object, names, entry.mask
         )
         .unwrap();
     }

@@ -7,7 +7,7 @@ fn args(values: [u64; 6]) -> RawSyscallArguments {
 }
 
 #[test]
-fn every_schema_active_through_e_has_a_typed_request() {
+fn every_schema_active_through_f_has_a_typed_request() {
     let active = [
         DwKnownSyscall::AbiGetInfo,
         DwKnownSyscall::HandleClose,
@@ -25,21 +25,31 @@ fn every_schema_active_through_e_has_a_typed_request() {
         DwKnownSyscall::AddressRegionMap,
         DwKnownSyscall::AddressRegionUnmap,
         DwKnownSyscall::AddressRegionProtect,
+        DwKnownSyscall::ProcessCreate,
+        DwKnownSyscall::ChannelCreate,
+        DwKnownSyscall::ChannelSend,
+        DwKnownSyscall::ChannelReceive,
+        DwKnownSyscall::WaitOne,
+        DwKnownSyscall::WaitMany,
+        DwKnownSyscall::EventCreate,
+        DwKnownSyscall::EventSignal,
+        DwKnownSyscall::AtomicWait32,
+        DwKnownSyscall::AtomicWake,
+        DwKnownSyscall::ClockGet,
+        DwKnownSyscall::TimerCreate,
+        DwKnownSyscall::TimerSet,
+        DwKnownSyscall::TimerCancel,
     ];
     for syscall in active {
         assert!(
             decode_native(syscall.id(), args([0; 6])).is_ok(),
-            "missing typed E request for {syscall:?}"
+            "missing typed F request for {syscall:?}"
         );
     }
 }
 
 #[test]
-fn f_and_unknown_syscalls_remain_not_supported() {
-    assert_eq!(
-        decode_native(DwKnownSyscall::ProcessCreate.id(), args([0; 6])),
-        Err(DW_STATUS_NOT_SUPPORTED)
-    );
+fn unknown_syscalls_remain_not_supported() {
     assert_eq!(
         decode_native(DwSyscallId(0xffff_fffe), args([0; 6])),
         Err(DW_STATUS_NOT_SUPPORTED)
@@ -72,6 +82,61 @@ fn typed_requests_preserve_raw_register_order() {
     );
 }
 
+#[test]
+fn f_typed_requests_preserve_register_widths_and_order() {
+    assert_eq!(
+        decode_native(
+            DwKnownSyscall::ChannelSend.id(),
+            args([11, 22, 33, 44, 5, 66]),
+        ),
+        Ok(NativeSyscallRequest::ChannelSend {
+            channel: DwHandle(11),
+            bytes: DwUserAddress(22),
+            byte_len: 33,
+            transfers: DwUserAddress(44),
+            transfer_count: 5,
+            flags: 66,
+        })
+    );
+    assert_eq!(
+        decode_native(
+            DwKnownSyscall::WaitMany.id(),
+            args([0x1000, 7, 0, 99, 0x2000, 0]),
+        ),
+        Ok(NativeSyscallRequest::WaitMany {
+            items: DwUserAddress(0x1000),
+            item_count: 7,
+            mode: 0,
+            deadline: DwDeadline(99),
+            out_result: DwUserAddress(0x2000),
+        })
+    );
+    assert_eq!(
+        decode_native(DwKnownSyscall::ClockGet.id(), args([3, 0x3000, 0, 0, 0, 0]),),
+        Ok(NativeSyscallRequest::ClockGet {
+            clock_id: DwClockId(3),
+            out_nanoseconds: DwUserAddress(0x3000),
+        })
+    );
+}
+
+#[test]
+fn f_narrow_scalars_reject_upper_bits_before_handler_dispatch() {
+    let over = u64::from(u32::MAX) + 1;
+    for (syscall, arguments) in [
+        (DwKnownSyscall::ChannelSend, [1, 2, over, 4, 0, 0]),
+        (DwKnownSyscall::WaitMany, [1, over, 0, 0, 0, 0]),
+        (DwKnownSyscall::AtomicWake, [1, over, 0, 0, 0, 0]),
+        (DwKnownSyscall::ClockGet, [over, 0, 0, 0, 0, 0]),
+    ] {
+        assert_eq!(
+            decode_native(syscall.id(), args(arguments)),
+            Err(DW_STATUS_INVALID_ARGUMENT),
+            "{syscall:?} accepted non-u32 scalar bits"
+        );
+    }
+}
+
 struct RecordingHandler {
     last: Option<NativeSyscallRequest>,
 }
@@ -102,11 +167,7 @@ fn dispatch_routes_typed_requests_and_handles_decode_failures_locally() {
         })
     );
     handler.last = None;
-    let rejected = dispatch_native(
-        &mut handler,
-        DwKnownSyscall::ProcessCreate.id(),
-        args([0; 6]),
-    );
+    let rejected = dispatch_native(&mut handler, DwSyscallId(0xffff_fffe), args([0; 6]));
     assert_eq!(rejected.status, DW_STATUS_NOT_SUPPORTED);
     assert_eq!(rejected.control, SyscallControl::ReturnToCaller);
     assert_eq!(handler.last, None);

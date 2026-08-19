@@ -1,6 +1,6 @@
 use deepwyrm_abi::{
-    DW_STATUS_INVALID_ARGUMENT, DW_STATUS_NOT_SUPPORTED, DwHandle, DwKnownSyscall, DwRights,
-    DwStatus, DwSyscallId, DwTerminationReason, DwUserAddress,
+    DW_STATUS_INVALID_ARGUMENT, DW_STATUS_NOT_SUPPORTED, DwClockId, DwDeadline, DwHandle,
+    DwKnownSyscall, DwRights, DwSignals, DwStatus, DwSyscallId, DwTerminationReason, DwUserAddress,
 };
 
 use super::{DecodedSyscall, RawSyscallArguments, decode};
@@ -35,6 +35,12 @@ pub(crate) enum NativeSyscallRequest {
     TaskGroupTerminate {
         task_group: DwHandle,
         reason: DwTerminationReason,
+    },
+    ProcessCreate {
+        args: DwUserAddress,
+        args_size: u64,
+        out_result: DwUserAddress,
+        result_size: u64,
     },
     ProcessExit {
         exit_code: u32,
@@ -84,6 +90,74 @@ pub(crate) enum NativeSyscallRequest {
         address: DwUserAddress,
         byte_len: u64,
         protections: u32,
+    },
+    ChannelCreate {
+        requested_rights: DwRights,
+        out_endpoint0: DwUserAddress,
+        out_endpoint1: DwUserAddress,
+    },
+    ChannelSend {
+        channel: DwHandle,
+        bytes: DwUserAddress,
+        byte_len: u32,
+        transfers: DwUserAddress,
+        transfer_count: u32,
+        flags: u64,
+    },
+    ChannelReceive {
+        channel: DwHandle,
+        out_bytes: DwUserAddress,
+        byte_capacity: u32,
+        out_handles: DwUserAddress,
+        handle_capacity: u32,
+        out_result: DwUserAddress,
+    },
+    WaitOne {
+        handle: DwHandle,
+        signals: DwSignals,
+        deadline: DwDeadline,
+        out_result: DwUserAddress,
+    },
+    WaitMany {
+        items: DwUserAddress,
+        item_count: u32,
+        mode: u32,
+        deadline: DwDeadline,
+        out_result: DwUserAddress,
+    },
+    EventCreate {
+        requested_rights: DwRights,
+        out_event: DwUserAddress,
+    },
+    EventSignal {
+        event: DwHandle,
+        clear_mask: DwSignals,
+        set_mask: DwSignals,
+    },
+    AtomicWait32 {
+        address: DwUserAddress,
+        expected: u32,
+        deadline: DwDeadline,
+    },
+    AtomicWake {
+        address: DwUserAddress,
+        count: u32,
+        out_woken: DwUserAddress,
+    },
+    ClockGet {
+        clock_id: DwClockId,
+        out_nanoseconds: DwUserAddress,
+    },
+    TimerCreate {
+        requested_rights: DwRights,
+        out_timer: DwUserAddress,
+    },
+    TimerSet {
+        timer: DwHandle,
+        deadline: DwDeadline,
+    },
+    TimerCancel {
+        timer: DwHandle,
     },
 }
 
@@ -179,20 +253,80 @@ fn decode_decoded(decoded: DecodedSyscall) -> Result<NativeSyscallRequest, DwSta
             byte_len: a[2],
             protections: u32_arg(a[3])?,
         },
-        DwKnownSyscall::ProcessCreate
-        | DwKnownSyscall::ChannelCreate
-        | DwKnownSyscall::ChannelSend
-        | DwKnownSyscall::ChannelReceive
-        | DwKnownSyscall::WaitOne
-        | DwKnownSyscall::WaitMany
-        | DwKnownSyscall::EventCreate
-        | DwKnownSyscall::EventSignal
-        | DwKnownSyscall::AtomicWait32
-        | DwKnownSyscall::AtomicWake
-        | DwKnownSyscall::ClockGet
-        | DwKnownSyscall::TimerCreate
-        | DwKnownSyscall::TimerSet
-        | DwKnownSyscall::TimerCancel => return Err(DW_STATUS_NOT_SUPPORTED),
+        DwKnownSyscall::ProcessCreate => NativeSyscallRequest::ProcessCreate {
+            args: DwUserAddress(a[0]),
+            args_size: a[1],
+            out_result: DwUserAddress(a[2]),
+            result_size: a[3],
+        },
+        DwKnownSyscall::ChannelCreate => NativeSyscallRequest::ChannelCreate {
+            requested_rights: DwRights(a[0]),
+            out_endpoint0: DwUserAddress(a[1]),
+            out_endpoint1: DwUserAddress(a[2]),
+        },
+        DwKnownSyscall::ChannelSend => NativeSyscallRequest::ChannelSend {
+            channel: DwHandle(a[0]),
+            bytes: DwUserAddress(a[1]),
+            byte_len: u32_arg(a[2])?,
+            transfers: DwUserAddress(a[3]),
+            transfer_count: u32_arg(a[4])?,
+            flags: a[5],
+        },
+        DwKnownSyscall::ChannelReceive => NativeSyscallRequest::ChannelReceive {
+            channel: DwHandle(a[0]),
+            out_bytes: DwUserAddress(a[1]),
+            byte_capacity: u32_arg(a[2])?,
+            out_handles: DwUserAddress(a[3]),
+            handle_capacity: u32_arg(a[4])?,
+            out_result: DwUserAddress(a[5]),
+        },
+        DwKnownSyscall::WaitOne => NativeSyscallRequest::WaitOne {
+            handle: DwHandle(a[0]),
+            signals: DwSignals(a[1]),
+            deadline: DwDeadline(a[2]),
+            out_result: DwUserAddress(a[3]),
+        },
+        DwKnownSyscall::WaitMany => NativeSyscallRequest::WaitMany {
+            items: DwUserAddress(a[0]),
+            item_count: u32_arg(a[1])?,
+            mode: u32_arg(a[2])?,
+            deadline: DwDeadline(a[3]),
+            out_result: DwUserAddress(a[4]),
+        },
+        DwKnownSyscall::EventCreate => NativeSyscallRequest::EventCreate {
+            requested_rights: DwRights(a[0]),
+            out_event: DwUserAddress(a[1]),
+        },
+        DwKnownSyscall::EventSignal => NativeSyscallRequest::EventSignal {
+            event: DwHandle(a[0]),
+            clear_mask: DwSignals(a[1]),
+            set_mask: DwSignals(a[2]),
+        },
+        DwKnownSyscall::AtomicWait32 => NativeSyscallRequest::AtomicWait32 {
+            address: DwUserAddress(a[0]),
+            expected: u32_arg(a[1])?,
+            deadline: DwDeadline(a[2]),
+        },
+        DwKnownSyscall::AtomicWake => NativeSyscallRequest::AtomicWake {
+            address: DwUserAddress(a[0]),
+            count: u32_arg(a[1])?,
+            out_woken: DwUserAddress(a[2]),
+        },
+        DwKnownSyscall::ClockGet => NativeSyscallRequest::ClockGet {
+            clock_id: DwClockId(u32_arg(a[0])?),
+            out_nanoseconds: DwUserAddress(a[1]),
+        },
+        DwKnownSyscall::TimerCreate => NativeSyscallRequest::TimerCreate {
+            requested_rights: DwRights(a[0]),
+            out_timer: DwUserAddress(a[1]),
+        },
+        DwKnownSyscall::TimerSet => NativeSyscallRequest::TimerSet {
+            timer: DwHandle(a[0]),
+            deadline: DwDeadline(a[1]),
+        },
+        DwKnownSyscall::TimerCancel => NativeSyscallRequest::TimerCancel {
+            timer: DwHandle(a[0]),
+        },
     };
     Ok(request)
 }
@@ -318,6 +452,119 @@ pub(crate) trait NativeSyscallServices {
         byte_len: u64,
         protections: u32,
     ) -> NativeSyscallResult;
+    fn process_create(
+        &mut self,
+        _args: DwUserAddress,
+        _args_size: u64,
+        _out_result: DwUserAddress,
+        _result_size: u64,
+    ) -> NativeSyscallResult {
+        unsupported_f()
+    }
+    fn channel_create(
+        &mut self,
+        _requested_rights: DwRights,
+        _out_endpoint0: DwUserAddress,
+        _out_endpoint1: DwUserAddress,
+    ) -> NativeSyscallResult {
+        unsupported_f()
+    }
+    fn channel_send(
+        &mut self,
+        _channel: DwHandle,
+        _bytes: DwUserAddress,
+        _byte_len: u32,
+        _transfers: DwUserAddress,
+        _transfer_count: u32,
+        _flags: u64,
+    ) -> NativeSyscallResult {
+        unsupported_f()
+    }
+    fn channel_receive(
+        &mut self,
+        _channel: DwHandle,
+        _out_bytes: DwUserAddress,
+        _byte_capacity: u32,
+        _out_handles: DwUserAddress,
+        _handle_capacity: u32,
+        _out_result: DwUserAddress,
+    ) -> NativeSyscallResult {
+        unsupported_f()
+    }
+    fn wait_one(
+        &mut self,
+        _handle: DwHandle,
+        _signals: DwSignals,
+        _deadline: DwDeadline,
+        _out_result: DwUserAddress,
+    ) -> NativeSyscallResult {
+        unsupported_f()
+    }
+    fn wait_many(
+        &mut self,
+        _items: DwUserAddress,
+        _item_count: u32,
+        _mode: u32,
+        _deadline: DwDeadline,
+        _out_result: DwUserAddress,
+    ) -> NativeSyscallResult {
+        unsupported_f()
+    }
+    fn event_create(
+        &mut self,
+        _requested_rights: DwRights,
+        _out_event: DwUserAddress,
+    ) -> NativeSyscallResult {
+        unsupported_f()
+    }
+    fn event_signal(
+        &mut self,
+        _event: DwHandle,
+        _clear_mask: DwSignals,
+        _set_mask: DwSignals,
+    ) -> NativeSyscallResult {
+        unsupported_f()
+    }
+    fn atomic_wait32(
+        &mut self,
+        _address: DwUserAddress,
+        _expected: u32,
+        _deadline: DwDeadline,
+    ) -> NativeSyscallResult {
+        unsupported_f()
+    }
+    fn atomic_wake(
+        &mut self,
+        _address: DwUserAddress,
+        _count: u32,
+        _out_woken: DwUserAddress,
+    ) -> NativeSyscallResult {
+        unsupported_f()
+    }
+    fn clock_get(
+        &mut self,
+        _clock_id: DwClockId,
+        _out_nanoseconds: DwUserAddress,
+    ) -> NativeSyscallResult {
+        unsupported_f()
+    }
+    fn timer_create(
+        &mut self,
+        _requested_rights: DwRights,
+        _out_timer: DwUserAddress,
+    ) -> NativeSyscallResult {
+        unsupported_f()
+    }
+    fn timer_set(&mut self, _timer: DwHandle, _deadline: DwDeadline) -> NativeSyscallResult {
+        unsupported_f()
+    }
+    fn timer_cancel(&mut self, _timer: DwHandle) -> NativeSyscallResult {
+        unsupported_f()
+    }
+}
+
+const fn unsupported_f() -> NativeSyscallResult {
+    NativeSyscallResult::returning(DW_STATUS_NOT_SUPPORTED)
 }
 
 impl<T: NativeSyscallServices> NativeSyscallHandler for T {
@@ -395,6 +642,82 @@ impl<T: NativeSyscallServices> NativeSyscallHandler for T {
                 byte_len,
                 protections,
             } => self.address_region_protect(address_region, address, byte_len, protections),
+            NativeSyscallRequest::ProcessCreate {
+                args,
+                args_size,
+                out_result,
+                result_size,
+            } => self.process_create(args, args_size, out_result, result_size),
+            NativeSyscallRequest::ChannelCreate {
+                requested_rights,
+                out_endpoint0,
+                out_endpoint1,
+            } => self.channel_create(requested_rights, out_endpoint0, out_endpoint1),
+            NativeSyscallRequest::ChannelSend {
+                channel,
+                bytes,
+                byte_len,
+                transfers,
+                transfer_count,
+                flags,
+            } => self.channel_send(channel, bytes, byte_len, transfers, transfer_count, flags),
+            NativeSyscallRequest::ChannelReceive {
+                channel,
+                out_bytes,
+                byte_capacity,
+                out_handles,
+                handle_capacity,
+                out_result,
+            } => self.channel_receive(
+                channel,
+                out_bytes,
+                byte_capacity,
+                out_handles,
+                handle_capacity,
+                out_result,
+            ),
+            NativeSyscallRequest::WaitOne {
+                handle,
+                signals,
+                deadline,
+                out_result,
+            } => self.wait_one(handle, signals, deadline, out_result),
+            NativeSyscallRequest::WaitMany {
+                items,
+                item_count,
+                mode,
+                deadline,
+                out_result,
+            } => self.wait_many(items, item_count, mode, deadline, out_result),
+            NativeSyscallRequest::EventCreate {
+                requested_rights,
+                out_event,
+            } => self.event_create(requested_rights, out_event),
+            NativeSyscallRequest::EventSignal {
+                event,
+                clear_mask,
+                set_mask,
+            } => self.event_signal(event, clear_mask, set_mask),
+            NativeSyscallRequest::AtomicWait32 {
+                address,
+                expected,
+                deadline,
+            } => self.atomic_wait32(address, expected, deadline),
+            NativeSyscallRequest::AtomicWake {
+                address,
+                count,
+                out_woken,
+            } => self.atomic_wake(address, count, out_woken),
+            NativeSyscallRequest::ClockGet {
+                clock_id,
+                out_nanoseconds,
+            } => self.clock_get(clock_id, out_nanoseconds),
+            NativeSyscallRequest::TimerCreate {
+                requested_rights,
+                out_timer,
+            } => self.timer_create(requested_rights, out_timer),
+            NativeSyscallRequest::TimerSet { timer, deadline } => self.timer_set(timer, deadline),
+            NativeSyscallRequest::TimerCancel { timer } => self.timer_cancel(timer),
         }
     }
 }

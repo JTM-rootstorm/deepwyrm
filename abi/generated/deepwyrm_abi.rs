@@ -396,6 +396,59 @@ pub const fn dw_rights_are_compatible(object_type: DwObjectType, rights: DwRight
     rights.0 & !compatible.0 == 0
 }
 
+/// Mask of every DwSignals bit known to ABI 0.
+pub const DW_SIGNALS_KNOWN_MASK: DwSignals = DwSignals(31);
+
+/// Applicable wait signals for the TASK_GROUP object type.
+pub const DW_OBJECT_COMPATIBLE_SIGNALS_TASK_GROUP: DwSignals = DwSignals(0);
+
+/// Applicable wait signals for the PROCESS object type.
+pub const DW_OBJECT_COMPATIBLE_SIGNALS_PROCESS: DwSignals = DwSignals(8);
+
+/// Applicable wait signals for the THREAD object type.
+pub const DW_OBJECT_COMPATIBLE_SIGNALS_THREAD: DwSignals = DwSignals(8);
+
+/// Applicable wait signals for the MEMORY_OBJECT object type.
+pub const DW_OBJECT_COMPATIBLE_SIGNALS_MEMORY_OBJECT: DwSignals = DwSignals(0);
+
+/// Applicable wait signals for the ADDRESS_REGION object type.
+pub const DW_OBJECT_COMPATIBLE_SIGNALS_ADDRESS_REGION: DwSignals = DwSignals(0);
+
+/// Applicable wait signals for the CHANNEL object type.
+pub const DW_OBJECT_COMPATIBLE_SIGNALS_CHANNEL: DwSignals = DwSignals(7);
+
+/// Applicable wait signals for the EVENT object type.
+pub const DW_OBJECT_COMPATIBLE_SIGNALS_EVENT: DwSignals = DwSignals(16);
+
+/// Applicable wait signals for the TIMER object type.
+pub const DW_OBJECT_COMPATIBLE_SIGNALS_TIMER: DwSignals = DwSignals(16);
+
+/// Returns the applicable wait-signal mask for one object type; sentinel, reserved, and unknown types return zero.
+pub const fn dw_object_compatible_signals(object_type: DwObjectType) -> DwSignals {
+    match object_type.0 {
+        1 => DW_OBJECT_COMPATIBLE_SIGNALS_TASK_GROUP,
+        2 => DW_OBJECT_COMPATIBLE_SIGNALS_PROCESS,
+        3 => DW_OBJECT_COMPATIBLE_SIGNALS_THREAD,
+        4 => DW_OBJECT_COMPATIBLE_SIGNALS_MEMORY_OBJECT,
+        5 => DW_OBJECT_COMPATIBLE_SIGNALS_ADDRESS_REGION,
+        6 => DW_OBJECT_COMPATIBLE_SIGNALS_CHANNEL,
+        7 => DW_OBJECT_COMPATIBLE_SIGNALS_EVENT,
+        8 => DW_OBJECT_COMPATIBLE_SIGNALS_TIMER,
+        _ => DwSignals(0),
+    }
+}
+
+/// Returns true when a signal mask contains only ABI-known bits; zero is structurally known.
+pub const fn dw_signals_are_known(signals: DwSignals) -> bool {
+    signals.0 & !DW_SIGNALS_KNOWN_MASK.0 == 0
+}
+
+/// Returns true when every requested signal applies to the object type; zero is structurally compatible.
+pub const fn dw_signals_are_compatible(object_type: DwObjectType, signals: DwSignals) -> bool {
+    let compatible = dw_object_compatible_signals(object_type);
+    signals.0 & !compatible.0 == 0
+}
+
 /// DW0 base page size in bytes for BootInfo memory ranges and handoff mappings.
 pub const DW_BOOT_BASE_PAGE_SIZE: u32 = 4096;
 
@@ -1493,6 +1546,27 @@ mod generated_layout_tests {
         assert!(dw_rights_are_known(DW_RIGHTS_KNOWN_MASK));
         assert!(dw_rights_are_compatible(DW_OBJECT_TYPE_MEMORY_OBJECT, DW_RIGHT_MAP));
         assert!(!dw_rights_are_compatible(DW_OBJECT_TYPE_TASK_GROUP, DW_RIGHT_READ));
+        assert_eq!(DW_SIGNALS_KNOWN_MASK.0, 31);
+        assert_eq!(DW_OBJECT_COMPATIBLE_SIGNALS_TASK_GROUP.0, 0);
+        assert_eq!(dw_object_compatible_signals(DW_OBJECT_TYPE_TASK_GROUP).0, 0);
+        assert_eq!(DW_OBJECT_COMPATIBLE_SIGNALS_PROCESS.0, 8);
+        assert_eq!(dw_object_compatible_signals(DW_OBJECT_TYPE_PROCESS).0, 8);
+        assert_eq!(DW_OBJECT_COMPATIBLE_SIGNALS_THREAD.0, 8);
+        assert_eq!(dw_object_compatible_signals(DW_OBJECT_TYPE_THREAD).0, 8);
+        assert_eq!(DW_OBJECT_COMPATIBLE_SIGNALS_MEMORY_OBJECT.0, 0);
+        assert_eq!(dw_object_compatible_signals(DW_OBJECT_TYPE_MEMORY_OBJECT).0, 0);
+        assert_eq!(DW_OBJECT_COMPATIBLE_SIGNALS_ADDRESS_REGION.0, 0);
+        assert_eq!(dw_object_compatible_signals(DW_OBJECT_TYPE_ADDRESS_REGION).0, 0);
+        assert_eq!(DW_OBJECT_COMPATIBLE_SIGNALS_CHANNEL.0, 7);
+        assert_eq!(dw_object_compatible_signals(DW_OBJECT_TYPE_CHANNEL).0, 7);
+        assert_eq!(DW_OBJECT_COMPATIBLE_SIGNALS_EVENT.0, 16);
+        assert_eq!(dw_object_compatible_signals(DW_OBJECT_TYPE_EVENT).0, 16);
+        assert_eq!(DW_OBJECT_COMPATIBLE_SIGNALS_TIMER.0, 16);
+        assert_eq!(dw_object_compatible_signals(DW_OBJECT_TYPE_TIMER).0, 16);
+        assert_eq!(dw_object_compatible_signals(DW_OBJECT_TYPE_NONE).0, 0);
+        assert!(dw_signals_are_known(DW_SIGNALS_KNOWN_MASK));
+        assert!(dw_signals_are_compatible(DW_OBJECT_TYPE_CHANNEL, DW_SIGNAL_READABLE));
+        assert!(!dw_signals_are_compatible(DW_OBJECT_TYPE_EVENT, DW_SIGNAL_READABLE));
         assert_eq!(DW_BOOT_BASE_PAGE_SIZE, 4096);
         assert_eq!(DW_BOOT_MEMORY_RANGE_V1_VERSION, 1);
         assert_eq!(DW_BOOT_MODULE_V1_VERSION, 1);

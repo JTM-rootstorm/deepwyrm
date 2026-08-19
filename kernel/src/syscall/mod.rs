@@ -1,9 +1,9 @@
 //! Phase-aware native syscall routing below the architecture entry boundary.
 //!
-//! DW0-E1 accepts a raw ABI syscall ID plus six already-captured scalar slots
-//! and resolves only schema-known operations active through DW0-E. Handler
-//! dispatch, usercopy, task ownership, and architecture register handling stay
-//! in later E phases.
+//! DW0-F1 accepts a raw ABI syscall ID plus six already-captured scalar slots
+//! and resolves schema-known operations active through DW0-F. F1 only exposes
+//! typed requests for the new phase; subsystem handlers remain NOT_SUPPORTED
+//! until their owning F implementation phase lands.
 
 pub(crate) mod native;
 
@@ -17,7 +17,7 @@ use deepwyrm_abi::{
     DW_STATUS_NOT_SUPPORTED, DwKnownSyscall, DwStatus, DwSyscallId, DwSyscallImplementationPhase,
 };
 
-const ACTIVE_PHASE: DwSyscallImplementationPhase = DwSyscallImplementationPhase::Dw0E;
+const ACTIVE_PHASE: DwSyscallImplementationPhase = DwSyscallImplementationPhase::Dw0F;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RawSyscallArguments([u64; 6]);

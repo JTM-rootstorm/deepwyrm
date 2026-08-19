@@ -191,6 +191,93 @@ pub(super) fn validate_value_sets(sets: &[ValueSet]) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn load_object_signals(
+    objects: &ValueSet,
+    signals: &ValueSet,
+) -> Result<(Vec<ObjectSignals>, u64)> {
+    let known_signals_mask = signals.values.iter().try_fold(0_u64, |mask, signal| {
+        let value = u64::try_from(signal.value)
+            .map_err(|_| Error::new(format!("signal `{}` does not fit DwSignals", signal.name)))?;
+        Ok::<u64, Error>(mask | value)
+    })?;
+
+    let mut entries = Vec::new();
+    for object in &objects.values {
+        if object.name == "NONE" || matches!(object.extra.as_str(), "sentinel" | "reserved") {
+            continue;
+        }
+        entries.push(ObjectSignals {
+            object: object.name.clone(),
+            object_value: u32::try_from(object.value).expect("validated DwObjectType value"),
+            signals: Vec::new(),
+            mask: 0,
+        });
+    }
+
+    for signal in &signals.values {
+        if signal.extra.trim().is_empty() {
+            return Err(Error::new(format!(
+                "signal `{}` has an empty applies_to set",
+                signal.name
+            )));
+        }
+        let mut seen = BTreeSet::new();
+        for object_name in signal.extra.split(',').map(str::trim) {
+            if object_name.is_empty() || !seen.insert(object_name.to_owned()) {
+                return Err(Error::new(format!(
+                    "signal `{}` has an invalid or duplicate applies_to object `{object_name}`",
+                    signal.name
+                )));
+            }
+            let object = objects
+                .values
+                .iter()
+                .find(|item| item.name == object_name)
+                .ok_or_else(|| {
+                    Error::new(format!(
+                        "signal `{}` applies to unknown object `{object_name}`",
+                        signal.name
+                    ))
+                })?;
+            if object.name == "NONE" || matches!(object.extra.as_str(), "sentinel" | "reserved") {
+                return Err(Error::new(format!(
+                    "signal `{}` applies to sentinel/reserved object `{object_name}`",
+                    signal.name
+                )));
+            }
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.object == object_name)
+                .expect("live object has signal compatibility entry");
+            entry.mask |= u64::try_from(signal.value).expect("validated DwSignals value");
+            entry.signals.push(signal.name.clone());
+        }
+    }
+    entries.sort_by_key(|entry| entry.object_value);
+    Ok((entries, known_signals_mask))
+}
+
+pub(super) fn validate_wait_signal_rights(
+    rights: &[ObjectRights],
+    signals: &[ObjectSignals],
+) -> Result<()> {
+    for signal_entry in signals {
+        let rights_entry = rights
+            .iter()
+            .find(|entry| entry.object == signal_entry.object)
+            .expect("every live object has rights metadata");
+        let has_wait = rights_entry.rights.iter().any(|right| right == "WAIT");
+        let has_signals = signal_entry.mask != 0;
+        if has_wait != has_signals {
+            return Err(Error::new(format!(
+                "object `{}` must carry WAIT iff it has applicable wait signals",
+                signal_entry.object
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn load_object_rights(
     document: &Document,
     objects: &ValueSet,
