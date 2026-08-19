@@ -125,7 +125,7 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             test_support::trigger_expected_invalid_opcode()
         }
         test_support::BuildGuestTest::PanicPath => panic!("DW0-B panic-path guest test"),
-        test if test.is_memory_foundation() => {}
+        test if test.is_memory_foundation() || test.is_task_userspace() => {}
         _ => unreachable!("all build-selected guest tests have explicit dispatch"),
     }
 
@@ -203,7 +203,9 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             test if test.is_memory_foundation() => {
                 test_support::run_memory_guest_test(active_paging)
             }
-            _ => unreachable!("DW0-B terminal selectors cannot pass the early dispatch"),
+            #[cfg(deepwyrm_e7_guest)]
+            test if test.is_task_userspace() => test_support::run_task_guest_test(active_paging),
+            _ => unreachable!("post-activation selector lacks an explicit runtime"),
         }
         #[cfg(not(feature = "test-support"))]
         loop {

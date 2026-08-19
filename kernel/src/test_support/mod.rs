@@ -10,6 +10,8 @@ mod identity;
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 mod memory;
 mod protocol;
+#[cfg(all(deepwyrm_e7_guest, target_arch = "x86_64", target_os = "none"))]
+mod task;
 mod transport;
 
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
@@ -34,6 +36,11 @@ pub(crate) use identity::ExpectedPageFaultKind;
 
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 pub(crate) use memory::run_memory_guest_test;
+
+#[cfg(all(deepwyrm_e7_guest, target_arch = "x86_64", target_os = "none"))]
+pub(crate) use task::{
+    e7_user_data, e7_user_entry, e7_user_stack_bottom, e7_user_stack_top, run_task_guest_test,
+};
 
 #[cfg(target_os = "none")]
 pub(crate) use identity::{BUILD_GUEST_TEST, BuildGuestTest};

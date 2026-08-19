@@ -182,3 +182,35 @@ fn e5_user_return_validation_is_bound_to_the_target_process() {
     assert!(access.contains("self.process"));
     assert!(adapters.contains("mappings.process_key() != target_process"));
 }
+
+#[test]
+fn e7_smoke_runtime_uses_live_e5_syscall_and_return_authority() {
+    let runtime = source("src/arch/x86_64/mm/activation/test_support/e7.rs");
+    let kernel = source("src/lib.rs");
+    let build = source("build.rs");
+
+    for marker in [
+        "current_process_address_space(self.process)",
+        "crate::syscall::abi_get_info(",
+        "crate::syscall::process_exit(",
+        "Some(SchedulerThreadState::Running)",
+        "frame.authorize_return(current_binding_generation, &mut mappings)",
+        "bind_native_syscall_runtime(&raw mut runtime)",
+        "ValidatedUserReturn::initial(context, &mut mappings)",
+        "enter_validated_user(",
+        "self.finish_task_release(thread_final)",
+        "self.finish_task_release(process_final)",
+        "self.finish_task_release(root_final)",
+    ] {
+        assert!(runtime.contains(marker), "E7 runtime omitted `{marker}`");
+    }
+    assert!(kernel.contains("test if test.is_task_userspace()"));
+    let activation = kernel
+        .find("activate_bootstrap_deep_paging(")
+        .expect("Deep-owned paging activation");
+    let task_dispatch = kernel
+        .find("run_task_guest_test(active_paging)")
+        .expect("E7 post-activation dispatch");
+    assert!(activation < task_dispatch);
+    assert!(build.contains("cargo:rustc-cfg=deepwyrm_e7_guest"));
+}

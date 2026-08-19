@@ -35,8 +35,9 @@ pub(crate) use super::exceptions::{
 )]
 pub(crate) use live::{
     SyscallRuntimeBindError, SyscallRuntimeBinding, SyscallRuntimeHandler,
-    bind_current_thread_stack, bind_syscall_runtime, current_binding_generation,
-    enter_validated_user, install_syscall_boundary, validate_live_syscall_boundary,
+    bind_current_thread_stack, bind_native_syscall_runtime, bind_syscall_runtime,
+    current_binding_generation, enter_validated_user, install_syscall_boundary,
+    validate_live_syscall_boundary,
 };
 
 #[cfg(test)]

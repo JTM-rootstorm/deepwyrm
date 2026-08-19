@@ -55,6 +55,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=DEEPWYRM_GUEST_TEST_SELECTOR");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_GUEST_TEST_ID");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_c3_one_shot_ui)");
+    println!("cargo:rustc-check-cfg=cfg(deepwyrm_e7_guest)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_integrated)");
     println!("cargo:rustc-cfg=deepwyrm_integrated");
 
@@ -69,6 +70,13 @@ fn run() -> Result<(), String> {
     emit_task_layout_env(task_layout);
 
     configure_guest_test(&guest_harness_path)?;
+    if env::var("DEEPWYRM_GUEST_TEST_SELECTOR")
+        .ok()
+        .as_deref()
+        .is_some_and(is_e7_userspace_selector)
+    {
+        println!("cargo:rustc-cfg=deepwyrm_e7_guest");
+    }
 
     if required_env("TARGET")? != KERNEL_TARGET {
         return Ok(());
