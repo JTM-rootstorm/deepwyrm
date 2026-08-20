@@ -1278,9 +1278,9 @@ fn address_region_object_status(
         AddressRegionObjectError::Capacity => DW_STATUS_NO_RESOURCES,
         AddressRegionObjectError::WrongObjectType => DW_STATUS_WRONG_OBJECT_TYPE,
         AddressRegionObjectError::WrongProcess => DW_STATUS_BAD_HANDLE,
-        AddressRegionObjectError::RuntimePin | AddressRegionObjectError::LiveMappings => {
-            DW_STATUS_BAD_STATE
-        }
+        AddressRegionObjectError::RuntimePin
+        | AddressRegionObjectError::LiveMappings
+        | AddressRegionObjectError::BlockedOperation(_) => DW_STATUS_BAD_STATE,
         AddressRegionObjectError::Task(error) => task_status(error),
         AddressRegionObjectError::Model(error) => address_region_status(error),
         AddressRegionObjectError::Registry(ObjectRegistryError::Capacity)

@@ -4,6 +4,7 @@
 //! contend on the underlying SMP-safe spin lock. Releasing restores exactly
 //! the prior local IF state. NMI/#DF/#MC paths must never acquire this lock.
 
+use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 
 use super::spin::{SpinMutex, SpinMutexGuard};
@@ -25,6 +26,7 @@ impl<T> IrqSpinMutex<T> {
         IrqSpinMutexGuard {
             inner: Some(inner),
             interrupts_were_enabled,
+            _cpu_local: PhantomData,
         }
     }
 }
@@ -33,6 +35,10 @@ impl<T> IrqSpinMutex<T> {
 pub(crate) struct IrqSpinMutexGuard<'a, T> {
     inner: Option<SpinMutexGuard<'a, T>>,
     interrupts_were_enabled: bool,
+    // Raw-pointer ownership marker is intentionally !Send + !Sync. The guard
+    // restores CPU-local IF state and therefore must be dropped on the CPU and
+    // execution context that acquired it.
+    _cpu_local: PhantomData<*mut ()>,
 }
 
 impl<T> Deref for IrqSpinMutexGuard<'_, T> {

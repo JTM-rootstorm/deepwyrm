@@ -18,8 +18,17 @@ use crate::object::{
 };
 
 mod authority;
+mod blocked_operation;
 mod execution;
 mod scheduler;
+#[allow(
+    unused_imports,
+    reason = "Daybreak DB-04 blocked-operation ownership is consumed by F4/F7/F9 before live blocking publication"
+)]
+pub(crate) use blocked_operation::{
+    BlockedOperation, BlockedOperationError, BlockedOperationRegistry, BlockedOperationWinner,
+    BlockedOperationsDrained,
+};
 #[allow(
     unused_imports,
     reason = "E3 execution state is consumed by E4 architecture entry and later task syscall adapters"

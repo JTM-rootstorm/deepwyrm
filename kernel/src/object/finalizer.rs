@@ -196,7 +196,11 @@ mod tests {
         );
         assert!(registry.release_handle(process_handle).unwrap().is_none());
 
-        let region_pin = regions.retire_exited_root(&mut tasks, process).unwrap();
+        let blocked = crate::task::BlockedOperationRegistry::<2>::new();
+        let drained = blocked.drained(process).unwrap();
+        let region_pin = regions
+            .retire_exited_root(&mut tasks, process, &blocked, drained)
+            .unwrap();
         let region_final = registry.release_internal(region_pin).unwrap().unwrap();
         {
             let mut finalizer = PayloadFinalizer::new(

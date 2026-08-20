@@ -894,7 +894,11 @@ fn root_region_handle_close_preserves_address_space_until_process_exit() {
         Err(AddressRegionObjectError::Task(TaskError::BadState))
     ));
 
-    let runtime_pin = regions.retire_exited_root(&mut tasks, process).unwrap();
+    let blocked = crate::task::BlockedOperationRegistry::<2>::new();
+    let drained = blocked.drained(process).unwrap();
+    let runtime_pin = regions
+        .retire_exited_root(&mut tasks, process, &blocked, drained)
+        .unwrap();
     let region_final = registry.release_internal(runtime_pin).unwrap().unwrap();
     let finalization = regions
         .take_finalization(&mut spaces, region_final)

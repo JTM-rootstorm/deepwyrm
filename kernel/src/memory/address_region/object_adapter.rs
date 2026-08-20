@@ -8,7 +8,10 @@ use crate::object::{
     CreationRef, FinalRelease, HandleRef, InternalRef, ObjectId, ObjectRegistry,
     ObjectRegistryError,
 };
-use crate::task::{ProcessKey, TaskAuthority, TaskError};
+use crate::task::{
+    BlockedOperationError, BlockedOperationRegistry, BlockedOperationsDrained, ProcessKey,
+    TaskAuthority, TaskError,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AddressRegionObjectKey(ObjectId);
@@ -30,6 +33,7 @@ pub(crate) enum AddressRegionObjectError {
     WrongProcess,
     RuntimePin,
     LiveMappings,
+    BlockedOperation(BlockedOperationError),
     Task(TaskError),
     Model(AddressRegionError),
     Registry(ObjectRegistryError),
@@ -210,11 +214,17 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
         const PROCESSES: usize,
         const THREADS: usize,
         const HANDLES: usize,
+        const BLOCKED: usize,
     >(
         &mut self,
         tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         process: ProcessKey,
+        blocked: &BlockedOperationRegistry<BLOCKED>,
+        drained: BlockedOperationsDrained,
     ) -> Result<InternalRef, AddressRegionObjectError> {
+        blocked
+            .validate_drained(&drained, process)
+            .map_err(AddressRegionObjectError::BlockedOperation)?;
         if tasks
             .process_info(process)
             .map_err(AddressRegionObjectError::Task)?

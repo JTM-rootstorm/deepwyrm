@@ -305,3 +305,14 @@ fn f2_runtime_binding_is_pinned_and_suspension_drops_the_runtime_borrow() {
     assert!(native.contains(") -> SyscallControl"));
     assert!(!native.contains("runtime.reschedule()"));
 }
+
+#[test]
+fn daybreak_production_execution_exposes_no_raw_safe_continuation_seed() {
+    let execution = source("src/task/execution.rs");
+    assert!(!execution.contains("pub(crate) fn seed_kernel_continuation("));
+    assert!(execution.contains("#[cfg(test)]"));
+    assert!(execution.contains("pub(crate) fn seed_test_kernel_continuation("));
+    let context = source("src/arch/x86_64/context.rs");
+    assert!(context.contains("validate_initial_kernel_continuation_frame"));
+    assert!(context.contains("INITIAL_KERNEL_CONTINUATION_RFLAGS"));
+}

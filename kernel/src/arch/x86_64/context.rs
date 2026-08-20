@@ -25,6 +25,37 @@ pub(crate) const KERNEL_CONTEXT_RFLAGS_OFFSET: u64 = 48;
 pub(crate) const KERNEL_CONTEXT_RETURN_RIP_OFFSET: u64 = 56;
 pub(crate) const KERNEL_CONTEXT_FRAME_BYTES: u64 = 64;
 
+pub(crate) const INITIAL_KERNEL_CONTINUATION_RFLAGS: u64 = 1 << 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InitialKernelContinuationError {
+    StackGeometry,
+    RflagsPolicy,
+    EntryRipPolicy,
+}
+
+pub(crate) const fn validate_initial_kernel_continuation_frame(
+    bounds: KernelStackBounds,
+    rsp: u64,
+    rflags: u64,
+    return_rip: u64,
+    trusted_entry_rip: u64,
+) -> Result<(), InitialKernelContinuationError> {
+    if !saved_rsp_is_within_stack(bounds, rsp) {
+        return Err(InitialKernelContinuationError::StackGeometry);
+    }
+    if rflags != INITIAL_KERNEL_CONTINUATION_RFLAGS {
+        return Err(InitialKernelContinuationError::RflagsPolicy);
+    }
+    if return_rip != trusted_entry_rip
+        || return_rip < 0xffff_8000_0000_0000
+        || trusted_entry_rip < 0xffff_8000_0000_0000
+    {
+        return Err(InitialKernelContinuationError::EntryRipPolicy);
+    }
+    Ok(())
+}
+
 pub(crate) const fn saved_rsp_is_within_stack(bounds: KernelStackBounds, rsp: u64) -> bool {
     if rsp == 0 || rsp & 0xf != 0 || rsp < bounds.bottom {
         return false;
@@ -132,6 +163,65 @@ mod tests {
         assert!(!saved_rsp_is_within_stack(bounds, 0x2ff8));
         assert!(!saved_rsp_is_within_stack(bounds, bounds.bottom - 16));
         assert!(!saved_rsp_is_within_stack(bounds, bounds.top - 48));
+    }
+
+    #[test]
+    fn synthetic_initial_frame_policy_rejects_hostile_rip_and_privileged_rflags() {
+        let bounds = KernelStackBounds::new(0x1000, 0x2000, 0x12000).unwrap();
+        let rsp = 0x3000;
+        let entry = 0xffff_8000_0010_0000;
+        assert_eq!(
+            validate_initial_kernel_continuation_frame(
+                bounds,
+                rsp,
+                INITIAL_KERNEL_CONTINUATION_RFLAGS,
+                entry,
+                entry,
+            ),
+            Ok(())
+        );
+        for hostile in [1 << 9, 1 << 10, 1 << 12, 1 << 13, 1 << 14, 1 << 18] {
+            assert_eq!(
+                validate_initial_kernel_continuation_frame(
+                    bounds,
+                    rsp,
+                    INITIAL_KERNEL_CONTINUATION_RFLAGS | hostile,
+                    entry,
+                    entry,
+                ),
+                Err(InitialKernelContinuationError::RflagsPolicy)
+            );
+        }
+        assert_eq!(
+            validate_initial_kernel_continuation_frame(
+                bounds,
+                rsp,
+                INITIAL_KERNEL_CONTINUATION_RFLAGS,
+                entry + 16,
+                entry,
+            ),
+            Err(InitialKernelContinuationError::EntryRipPolicy)
+        );
+        assert_eq!(
+            validate_initial_kernel_continuation_frame(
+                bounds,
+                rsp,
+                INITIAL_KERNEL_CONTINUATION_RFLAGS,
+                0x1000,
+                0x1000,
+            ),
+            Err(InitialKernelContinuationError::EntryRipPolicy)
+        );
+        assert_eq!(
+            validate_initial_kernel_continuation_frame(
+                bounds,
+                bounds.top - 48,
+                INITIAL_KERNEL_CONTINUATION_RFLAGS,
+                entry,
+                entry,
+            ),
+            Err(InitialKernelContinuationError::StackGeometry)
+        );
     }
 
     #[cfg(all(target_arch = "x86_64", not(target_os = "none")))]

@@ -328,20 +328,20 @@ fn continuation_seed_rejects_foreign_geometry_and_double_publication() {
     let bounds = domain.stack_bounds(stack).unwrap();
 
     assert_eq!(
-        domain.seed_kernel_continuation(stack, context, bounds.top - 56),
+        domain.seed_test_kernel_continuation(stack, context, bounds.top - 56),
         Err(ExecutionResourceError::ContinuationOutsideStack)
     );
     assert_eq!(
-        domain.seed_kernel_continuation(stack, context, bounds.bottom - 16),
+        domain.seed_test_kernel_continuation(stack, context, bounds.bottom - 16),
         Err(ExecutionResourceError::ContinuationOutsideStack)
     );
     let saved_rsp = bounds.top - crate::arch::x86_64::context::KERNEL_CONTEXT_FRAME_BYTES;
     domain
-        .seed_kernel_continuation(stack, context, saved_rsp)
+        .seed_test_kernel_continuation(stack, context, saved_rsp)
         .unwrap();
     assert_eq!(domain.kernel_continuation_rsp(context), Ok(saved_rsp));
     assert_eq!(
-        domain.seed_kernel_continuation(stack, context, saved_rsp),
+        domain.seed_test_kernel_continuation(stack, context, saved_rsp),
         Err(ExecutionResourceError::ContinuationAlreadyInitialized)
     );
     let _ = &mut registry;
@@ -384,7 +384,7 @@ fn switch_plan_requires_live_seeded_destination_continuation() {
     let next_bounds = domain.stack_bounds(second_stack).unwrap();
     let next_rsp = next_bounds.top - crate::arch::x86_64::context::KERNEL_CONTEXT_FRAME_BYTES;
     domain
-        .seed_kernel_continuation(second_stack, second_context, next_rsp)
+        .seed_test_kernel_continuation(second_stack, second_context, next_rsp)
         .unwrap();
     let plan = unsafe { domain.prepare_kernel_switch(&tasks, decision) }.unwrap();
     assert_eq!(plan.next_rsp(), next_rsp);

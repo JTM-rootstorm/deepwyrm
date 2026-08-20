@@ -3,8 +3,9 @@ use core::cell::UnsafeCell;
 use crate::sync::SpinMutex;
 
 use super::{
-    BlockToken, BlockWakeKey, CooperativeScheduler, ExitPins, KernelStackId, SchedulerError,
-    ThreadContextId, ThreadExecutionResources, ThreadKey, ThreadStartState,
+    BlockToken, BlockWakeKey, BlockedOperationRegistry, BlockedOperationsDrained,
+    CooperativeScheduler, ExitPins, KernelStackId, ProcessKey, SchedulerError, ThreadContextId,
+    ThreadExecutionResources, ThreadKey, ThreadStartState,
 };
 
 pub(crate) const E3_INITIAL_USER_RFLAGS: u64 = 0x202;
@@ -434,6 +435,7 @@ pub(crate) struct ExecutionDomain<const CAPACITY: usize> {
     stacks: KernelStackPool<CAPACITY>,
     contexts: ThreadContextPool<CAPACITY>,
     continuations: KernelContinuationPool<CAPACITY>,
+    blocked_operations: BlockedOperationRegistry<CAPACITY>,
 }
 
 impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
@@ -445,6 +447,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
             stacks: KernelStackPool::new(stack_bounds)?,
             contexts: ThreadContextPool::new(),
             continuations: KernelContinuationPool::new(),
+            blocked_operations: BlockedOperationRegistry::new(),
         })
     }
 
@@ -569,6 +572,17 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         self.scheduler.wake(key)
     }
 
+    pub(crate) fn blocked_operations(&self) -> &BlockedOperationRegistry<CAPACITY> {
+        &self.blocked_operations
+    }
+
+    pub(crate) fn blocked_operations_drained(
+        &self,
+        process: ProcessKey,
+    ) -> Result<BlockedOperationsDrained, super::BlockedOperationError> {
+        self.blocked_operations.drained(process)
+    }
+
     pub(crate) fn retire_exit_pins<const THREADS: usize>(
         &self,
         pins: ExitPins<THREADS>,
@@ -584,6 +598,10 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                 continue;
             };
             let thread = ThreadKey::from_object_id(pin.id());
+            assert!(
+                !self.blocked_operations.has_thread(thread),
+                "terminal Thread still owns a blocked operation at execution-resource reclaim",
+            );
             let scheduled = self.scheduler.state(thread).is_some();
             assert_eq!(
                 scheduled,
@@ -655,7 +673,8 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         });
     }
 
-    pub(crate) fn seed_kernel_continuation(
+    #[cfg(test)]
+    pub(crate) fn seed_test_kernel_continuation(
         &self,
         stack: KernelStackId,
         context: ThreadContextId,
