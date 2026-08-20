@@ -710,5 +710,7 @@ pub(crate) struct EventWaitFailure {
     pub(crate) pin: InternalRef,
 }
 
+pub(crate) mod engine;
+pub(crate) mod operation;
 #[cfg(test)]
 mod tests;

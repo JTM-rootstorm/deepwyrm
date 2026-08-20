@@ -79,6 +79,19 @@ impl ResolvedHandle {
         self.reference
     }
 
+    pub(crate) fn retain<const OBJECTS: usize>(
+        &self,
+        registry: &mut ObjectRegistry<OBJECTS>,
+    ) -> Result<Self, HandleTableError> {
+        let reference = registry
+            .retain_internal(&self.reference)
+            .map_err(retain_error)?;
+        Ok(Self {
+            reference,
+            rights: self.rights,
+        })
+    }
+
     pub(crate) const fn basic_info(&self) -> BasicHandleInfo {
         BasicHandleInfo {
             object_type: self.reference.object_type(),
