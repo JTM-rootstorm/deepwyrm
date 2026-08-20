@@ -1,6 +1,6 @@
 # DW0-F3 Validation Record
 
-Status: **CLOSED — functional F3 gate passed**  
+Status: **FUNCTIONALLY CLOSED — SECURITY OPEN under Daybreak remediation**
 F3 implementation/evidence candidate: `635efab449234beecd5ef3d667efba7b8f3471b3`  
 F2 baseline: `d8c226ccefe53ccb19a42e08b47924485103cf79`  
 Wyrmroot paired revision: `bd2f0629206de3a47f5a20cb0842a4e76ec88aaf`
@@ -8,6 +8,12 @@ Wyrmroot paired revision: `bd2f0629206de3a47f5a20cb0842a4e76ec88aaf`
 This record closes only DW0-F3: the monotonic clock, finite-deadline engine,
 IRQ-safe timer foundation, and live `clock_get(DW_CLOCK_MONOTONIC_ACTIVE)` path.
 It is not an F-wide security or completion record.
+
+**Security supersession note (2026-08-19):** the current-tree Daybreak Blue review at
+`797d8561d59fdbe6c55d25fa1620110f4f85acee` identified DB-01 (High) in the
+exact-half-wrap PM maintenance policy. The functional VM evidence below remains
+historical provenance, but its half-wrap liveness claim is security-invalid until
+the DB-01 remediation and replacement long-idle evidence land.
 
 ## 1. Implemented F3 surface
 
