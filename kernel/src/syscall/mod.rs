@@ -10,10 +10,17 @@ pub(crate) mod native;
 mod abi_bytes;
 mod adapters;
 
-#[cfg(deepwyrm_e7_guest)]
+#[allow(
+    unused_imports,
+    reason = "F7 native wait runtime ownership is consumed by the later freestanding F guest runtime"
+)]
 pub(crate) use adapters::{
-    CleanupQueue, NoTerminalWaitCleanup, abi_get_info, clock_get, process_exit,
+    CleanupQueue, NativeWaitControl, TerminalWaitCleanup, WaitSuspendError, WaitSyscallAction,
+    WaitTerminalCleanup, resume_wait_thread_syscall, wait_many_syscall, wait_one_syscall,
 };
+
+#[cfg(deepwyrm_e7_guest)]
+pub(crate) use adapters::{NoTerminalWaitCleanup, abi_get_info, clock_get, process_exit};
 
 use deepwyrm_abi::{
     DW_STATUS_NOT_SUPPORTED, DwKnownSyscall, DwStatus, DwSyscallId, DwSyscallImplementationPhase,

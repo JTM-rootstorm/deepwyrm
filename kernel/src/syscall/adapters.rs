@@ -1921,6 +1921,9 @@ pub(crate) fn wait_one_syscall<
     deadline: DwDeadline,
     out_result: DwUserAddress,
 ) -> WaitSyscallAction {
+    if signals.0 == 0 || !deepwyrm_abi::dw_signals_are_known(signals) {
+        return WaitSyscallAction::Returning(DW_STATUS_INVALID_ARGUMENT);
+    }
     let output = match preflight_owned_wait_output(user, out_result) {
         Ok(output) => output,
         Err(status) => return WaitSyscallAction::Returning(status),

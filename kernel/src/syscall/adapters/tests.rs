@@ -2973,6 +2973,131 @@ impl<const N: usize> crate::wait::engine::WaitDeadlineAuthority for AdapterDeadl
 }
 
 #[test]
+fn signal_timeout_race_has_exactly_one_winner_in_both_orders() {
+    use deepwyrm_abi::{DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED};
+
+    fn run(timeout_first: bool) {
+        let (mut registry, mut tasks, execution, process, thread, process_handle) =
+            wait_running_fixture();
+        let events = EventAuthority::<1>::new();
+        let channels = ChannelAuthority::<1, 2>::new();
+        let waits = WaitRegistry::<8>::new();
+        let mut user = FakeUserMemory::new();
+        let (event_key, reference) = events.create_event(&mut registry).unwrap();
+        let event = tasks
+            .process_handles_mut(process)
+            .unwrap()
+            .install(reference, DW_RIGHT_WAIT)
+            .unwrap();
+        let mut operations = WaitOperationRegistry::<FakeOwnedOutput, 1>::new();
+        let mut deadlines = AdapterDeadline::<2>::new();
+        let out = BASE + 0x980;
+        let state = match wait_one_syscall(
+            &mut user,
+            &mut registry,
+            &tasks,
+            &events,
+            &channels,
+            &waits,
+            &execution,
+            &mut operations,
+            Some(&mut deadlines),
+            process,
+            thread,
+            event,
+            DW_SIGNAL_SIGNALED,
+            deepwyrm_abi::DwDeadline(50),
+            DwUserAddress(out),
+        ) {
+            WaitSyscallAction::Suspended(state) => state,
+            other => panic!("finite race wait did not suspend: {other:?}"),
+        };
+        assert_eq!(user.owned_outputs, 1);
+        assert_eq!(waits.len(), 1);
+
+        let mut expired = [None; 2];
+        let mut cleanup = CleanupQueue::<16>::new();
+        if timeout_first {
+            assert_eq!(deadlines.queue.expire(50, &mut expired), 1);
+            assert_eq!(expired[0], Some(state.wake_key()));
+            assert!(
+                crate::wait::engine::claim_timeout_and_wake(&execution, state.wake_key()).unwrap()
+            );
+            let wakes = events
+                .signal(
+                    event_key,
+                    deepwyrm_abi::DwSignals(0),
+                    DW_SIGNAL_SIGNALED,
+                    &waits,
+                )
+                .unwrap();
+            complete_wait_wakes(&mut registry, &execution, wakes, &mut cleanup);
+        } else {
+            let wakes = events
+                .signal(
+                    event_key,
+                    deepwyrm_abi::DwSignals(0),
+                    DW_SIGNAL_SIGNALED,
+                    &waits,
+                )
+                .unwrap();
+            complete_wait_wakes(&mut registry, &execution, wakes, &mut cleanup);
+            assert_eq!(deadlines.queue.expire(50, &mut expired), 1);
+            assert_eq!(expired[0], Some(state.wake_key()));
+            assert!(
+                !crate::wait::engine::claim_timeout_and_wake(&execution, state.wake_key()).unwrap()
+            );
+        }
+
+        assert_eq!(waits.len(), 0);
+        assert_eq!(
+            execution.scheduler_state(thread),
+            Some(SchedulerThreadState::Runnable)
+        );
+        assert!(matches!(
+            poll_wait_idle_suspend(&tasks, &execution, state, 0xffff_8000_0012_3000).unwrap(),
+            crate::syscall::native::NativeIdleSuspendPoll::ResumeCurrent
+        ));
+        let status = resume_wait_thread_syscall(
+            &mut user,
+            &mut registry,
+            &waits,
+            &execution,
+            &mut operations,
+            Some(&mut deadlines),
+            thread,
+            &mut cleanup,
+        )
+        .unwrap();
+        assert_eq!(user.owned_outputs, 0);
+        assert!(!operations.contains_thread(thread));
+        if timeout_first {
+            assert_eq!(status, DW_STATUS_TIMED_OUT);
+            assert_eq!(u32_at(&user, out), 0);
+        } else {
+            assert_eq!(status, DW_STATUS_SUCCESS);
+            assert_eq!(u32_at(&user, out + 8), 0);
+            assert_eq!(u64_at(&user, out + 16), DW_SIGNAL_SIGNALED.0);
+        }
+
+        close_event_for_test(&mut registry, &mut tasks, process, &events, event);
+        assert_eq!(
+            handle_close(
+                &mut registry,
+                &mut tasks,
+                process,
+                process_handle,
+                &mut cleanup,
+            ),
+            DW_STATUS_SUCCESS
+        );
+    }
+
+    run(false);
+    run(true);
+}
+
+#[test]
 fn public_finite_wait_idles_then_timeout_resumes_in_place_and_discards_output() {
     use deepwyrm_abi::{DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED};
 
@@ -3304,6 +3429,26 @@ fn public_wait_one_preflights_owned_output_before_handle_resolution_and_commits_
     let out = BASE + 0x900;
 
     user.deny_write = true;
+    assert_eq!(
+        wait_one_syscall(
+            &mut user,
+            &mut registry,
+            &tasks,
+            &events,
+            &channels,
+            &waits,
+            &execution,
+            &mut operations,
+            None,
+            process,
+            thread,
+            DwHandle(u64::MAX),
+            deepwyrm_abi::DwSignals(0),
+            DW_DEADLINE_NOW,
+            DwUserAddress(out),
+        ),
+        WaitSyscallAction::Returning(DW_STATUS_INVALID_ARGUMENT)
+    );
     assert_eq!(
         wait_one_syscall(
             &mut user,
