@@ -415,3 +415,50 @@ fn signal_wins_once_per_block_generation_and_consumes_sibling_registrations() {
         complete_event_finalization(&mut registry, finalization);
     }
 }
+
+#[test]
+fn cancelling_block_generation_removes_all_siblings_without_wake() {
+    let mut registry = ObjectRegistry::<8>::new();
+    let events = EventAuthority::<1>::new();
+    let waits = WaitRegistry::<4>::new();
+    let (_event, handle_ref) = events.create_event(&mut registry).unwrap();
+    let mut table = HandleTable::<1>::new();
+    let handle = table
+        .install(
+            handle_ref,
+            deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_EVENT),
+        )
+        .unwrap();
+    let scheduler = CooperativeScheduler::<2>::new();
+    let (thread, wake) = blocked_key(&mut registry, &scheduler);
+    for item_index in 0..2 {
+        let target = table
+            .lookup(
+                &mut registry,
+                handle,
+                AcceptedObjectTypes::One(DW_OBJECT_TYPE_EVENT),
+                DW_RIGHT_WAIT,
+            )
+            .unwrap();
+        assert!(matches!(
+            events
+                .register_wait(&waits, target, DW_SIGNAL_SIGNALED, item_index, thread, wake,)
+                .unwrap(),
+            EventWaitOutcome::Registered(_)
+        ));
+    }
+    assert_eq!(waits.len(), 2);
+    let cancelled = waits.cancel_generation(wake);
+    assert_eq!(cancelled.len(), 0);
+    assert_eq!(cancelled.pin_len(), 2);
+    assert_eq!(waits.len(), 0);
+    let (_, pins) = cancelled.into_parts();
+    for pin in pins.into_iter().flatten() {
+        assert!(registry.release_internal(pin).unwrap().is_none());
+    }
+    let final_release = table.close(&mut registry, handle).unwrap().unwrap();
+    complete_event_finalization(
+        &mut registry,
+        events.take_finalization(final_release).unwrap(),
+    );
+}

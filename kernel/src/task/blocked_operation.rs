@@ -1,6 +1,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sync::SpinMutex;
+use deepwyrm_abi::DwSignals;
 
 use super::{BlockWakeKey, ProcessKey, ThreadKey};
 
@@ -21,6 +22,7 @@ pub(crate) enum BlockedOperationError {
     ForeignReservation,
     StaleReservation,
     ProcessStillBlocked,
+    WinnerMismatch,
 }
 
 #[derive(Clone, Copy)]
@@ -34,6 +36,7 @@ struct Entry {
     process: ProcessKey,
     thread: ThreadKey,
     wake: BlockWakeKey,
+    winner: Option<BlockedOperationWinner>,
 }
 
 const EMPTY_SLOT: Slot = Slot {
@@ -59,7 +62,10 @@ pub(crate) struct BlockedOperationsDrained {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BlockedOperationWinner {
-    Signal,
+    Signal {
+        item_index: u32,
+        observed: DwSignals,
+    },
     Timeout,
     Cancelled,
     Terminal,
@@ -106,6 +112,7 @@ impl<const CAPACITY: usize> BlockedOperationRegistry<CAPACITY> {
             process,
             thread,
             wake,
+            winner: None,
         });
         Ok(BlockedOperationReservation {
             domain: self.domain,
@@ -139,6 +146,42 @@ impl<const CAPACITY: usize> BlockedOperationRegistry<CAPACITY> {
         }
         slot.entry = None;
         Ok(())
+    }
+
+    /// Claims one terminal outcome for an exact scheduler block generation.
+    ///
+    /// Signal, timeout, cancellation, and terminal retirement all contend on
+    /// this single ledger. The first claim wins; later contenders observe
+    /// `Ok(false)` and must not wake the scheduler again.
+    pub(crate) fn try_claim_winner(
+        &self,
+        wake: BlockWakeKey,
+        winner: BlockedOperationWinner,
+    ) -> Result<bool, BlockedOperationError> {
+        let mut slots = self.slots.lock();
+        let entry = slots
+            .iter_mut()
+            .filter_map(|slot| slot.entry.as_mut())
+            .find(|entry| entry.wake == wake)
+            .ok_or(BlockedOperationError::StaleReservation)?;
+        if entry.winner.is_some() {
+            return Ok(false);
+        }
+        entry.winner = Some(winner);
+        Ok(true)
+    }
+
+    pub(crate) fn winner(
+        &self,
+        wake: BlockWakeKey,
+    ) -> Result<Option<BlockedOperationWinner>, BlockedOperationError> {
+        self.slots
+            .lock()
+            .iter()
+            .filter_map(|slot| slot.entry.as_ref())
+            .find(|entry| entry.wake == wake)
+            .map(|entry| entry.winner)
+            .ok_or(BlockedOperationError::StaleReservation)
     }
 
     pub(crate) fn has_thread(&self, thread: ThreadKey) -> bool {
@@ -228,6 +271,14 @@ impl<RESOURCES> BlockedOperation<RESOURCES> {
         _winner: BlockedOperationWinner,
         cleanup: impl FnOnce(RESOURCES) -> RESULT,
     ) -> Result<RESULT, BlockedOperationError> {
+        let reservation = self
+            .reservation
+            .as_ref()
+            .expect("blocked operation reservation is live");
+        let claimed = registry.try_claim_winner(reservation.wake, _winner)?;
+        if !claimed && registry.winner(reservation.wake)? != Some(_winner) {
+            return Err(BlockedOperationError::WinnerMismatch);
+        }
         let resources = self
             .resources
             .take()
@@ -298,7 +349,10 @@ mod tests {
     #[test]
     fn signal_timeout_and_cancel_completion_each_release_the_exact_generation() {
         for winner in [
-            BlockedOperationWinner::Signal,
+            BlockedOperationWinner::Signal {
+                item_index: 0,
+                observed: DwSignals(1),
+            },
             BlockedOperationWinner::Timeout,
             BlockedOperationWinner::Cancelled,
         ] {
@@ -368,5 +422,40 @@ mod tests {
             .complete_with(&registry, BlockedOperationWinner::Terminal, |_| ())
             .unwrap();
         assert!(registry.drained(process).is_ok());
+    }
+
+    #[test]
+    fn exact_block_generation_accepts_only_one_winner() {
+        let (process, thread, wake) = keys();
+        let registry = BlockedOperationRegistry::<1>::new();
+        let operation = BlockedOperation::publish(&registry, process, thread, wake, ()).unwrap();
+        let signal = BlockedOperationWinner::Signal {
+            item_index: 3,
+            observed: DwSignals(0x55),
+        };
+        assert_eq!(registry.try_claim_winner(wake, signal), Ok(true));
+        assert_eq!(registry.winner(wake), Ok(Some(signal)));
+        assert_eq!(
+            registry.try_claim_winner(wake, BlockedOperationWinner::Timeout),
+            Ok(false)
+        );
+        assert_eq!(operation.complete_with(&registry, signal, |_| ()), Ok(()));
+    }
+
+    #[test]
+    fn preclaimed_signal_completes_with_exact_observation() {
+        let (process, thread, wake) = keys();
+        let registry = BlockedOperationRegistry::<1>::new();
+        let operation = BlockedOperation::publish(&registry, process, thread, wake, 9_u32).unwrap();
+        let winner = BlockedOperationWinner::Signal {
+            item_index: 1,
+            observed: DwSignals(0x20),
+        };
+        assert_eq!(registry.try_claim_winner(wake, winner), Ok(true));
+        assert_eq!(
+            operation.complete_with(&registry, winner, |value| value + 1),
+            Ok(10)
+        );
+        assert!(!registry.has_thread(thread));
     }
 }

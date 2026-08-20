@@ -605,6 +605,31 @@ impl<const CAPACITY: usize> WaitRegistry<CAPACITY> {
             .pin)
     }
 
+    /// Removes every registration owned by one exact block generation.
+    ///
+    /// Timeout and terminal retirement use this after they win arbitration so
+    /// no sibling registration can later attempt a stale scheduler wake. Pins
+    /// are returned for deferred ObjectRegistry release outside the wait lock.
+    pub(crate) fn cancel_generation(&self, wake: BlockWakeKey) -> WakeBatch<CAPACITY> {
+        let mut slots = self.slots.lock();
+        let mut batch = WakeBatch::empty();
+        for slot in slots.iter_mut() {
+            if !slot
+                .entry
+                .as_ref()
+                .is_some_and(|entry| entry.identity.wake == wake)
+            {
+                continue;
+            }
+            let entry = slot
+                .entry
+                .take()
+                .expect("matching wait generation entry remains present");
+            batch.push_pin(entry.pin);
+        }
+        batch
+    }
+
     /// Claims signal wins by block generation, not by individual registration.
     ///
     /// A `wait_many` operation may own several registrations with one exact
