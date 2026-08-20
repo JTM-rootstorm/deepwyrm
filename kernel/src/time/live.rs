@@ -15,7 +15,7 @@ use crate::task::BlockWakeKey;
 
 use super::{
     DEADLINE_QUEUE_CAPACITY, DeadlineQueue, DeadlineRegistration, MonotonicSample,
-    PmTimerDescriptor, PmTimerState, apic_one_shot_for_delta,
+    PmTimerDescriptor, PmTimerState, PmTimerWidth, apic_one_shot_for_delta,
 };
 
 const UNINITIALIZED: u8 = 0;
@@ -588,10 +588,34 @@ pub(crate) fn run_target_deadline_probe() -> Result<F3TargetProbe, LiveTimeError
     {
         return Err(LiveTimeError::Deadline);
     }
-    let after_ns = monotonic_now()?;
-    if after_ns < deadline_ns {
+    let deadline_wake_ns = monotonic_now()?;
+    if deadline_wake_ns < deadline_ns {
         return Err(LiveTimeError::Deadline);
     }
+
+    // DB-01 regression: remain genuinely idle for at least two complete 24-bit
+    // PM-timer wrap intervals. Quarter-wrap maintenance IRQs must keep extending
+    // the same monotonic domain without clock_get/user-deadline traffic driving it.
+    let long_idle_ns = super::ticks_to_nanoseconds(PmTimerWidth::Bits24.modulus())
+        .map_err(|_| LiveTimeError::Clock)?
+        .checked_mul(2)
+        .ok_or(LiveTimeError::Clock)?;
+    let long_idle_target = deadline_wake_ns
+        .checked_add(long_idle_ns)
+        .filter(|value| *value < deepwyrm_abi::DW_DEADLINE_INFINITE.0)
+        .ok_or(LiveTimeError::Clock)?;
+    let mut after_ns = deadline_wake_ns;
+    for _ in 0..32 {
+        if after_ns >= long_idle_target {
+            break;
+        }
+        wait_for_interrupt();
+        after_ns = monotonic_now()?;
+    }
+    if after_ns < long_idle_target {
+        return Err(LiveTimeError::Clock);
+    }
+
     Ok(F3TargetProbe {
         before_ns,
         after_ns,

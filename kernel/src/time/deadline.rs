@@ -245,4 +245,21 @@ mod tests {
         assert_eq!(long.initial_count, u32::MAX);
         assert!(!long.reaches_deadline);
     }
+
+    #[test]
+    fn outward_apic_rounding_cannot_consume_quarter_wrap_delivery_slack() {
+        let descriptor =
+            crate::time::PmTimerDescriptor::new(0x608, crate::time::PmTimerWidth::Bits24).unwrap();
+        let arm_ns = descriptor.maintenance_arm_nanoseconds().unwrap();
+        let maximum_ns = descriptor.maximum_unambiguous_gap_nanoseconds().unwrap();
+        let slack_ns = maximum_ns - arm_ns;
+        // Live calibration rejects rates below 1 kHz. Outward rounding adds at
+        // most one timer tick, which therefore cannot consume the reserved slack.
+        let slowest_hz = 1_000_u64;
+        let shot = apic_one_shot_for_delta(arm_ns, slowest_hz).unwrap();
+        let delivered_ns =
+            (u128::from(shot.initial_count) * NANOS_PER_SECOND).div_ceil(u128::from(slowest_hz));
+        assert!(delivered_ns - u128::from(arm_ns) < u128::from(slack_ns));
+        assert!(delivered_ns < u128::from(maximum_ns));
+    }
 }

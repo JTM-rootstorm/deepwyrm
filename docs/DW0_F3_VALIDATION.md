@@ -24,7 +24,7 @@ F3 now supplies one reference time domain for later waits and Timer objects:
 - explicit rejection of malformed/checksum-invalid, hardware-reduced, or missing PM timers;
 - 24-bit and 32-bit PM-counter support at the ACPI fixed 3,579,545 Hz rate;
 - checked counter extension and tick-to-nanosecond conversion;
-- a half-wrap maintenance deadline so the reference configuration samples often enough to avoid ambiguous wrap extension;
+- a quarter-wrap maintenance arm with a separate half-wrap maximum-unambiguous-gap bound, reserving one quarter wrap for programming and interrupt-delivery slack;
 - a bounded 64-entry generation-protected finite-deadline queue;
 - outward-rounded Local APIC one-shot programming;
 - Local APIC timer calibration against the validated PM counter;
@@ -98,8 +98,8 @@ Log:
 SHA-256:
 `1c7f104f59f62e459f9414b7fc403b4d40541ee6a1bd55c8100964e89dd991eb`
 
-Focused F3 coverage includes PM conversion overflow/sentinel exclusion, 24-bit wrap
-extension, missed-half-wrap rejection, NOW/finite/INFINITE classification, deadline
+Focused F3 coverage includes PM conversion overflow/sentinel exclusion, 24/32-bit gap
+models, quarter-wrap maintenance slack, missed-half-wrap rejection, NOW/finite/INFINITE classification, deadline
 ordering/cancel/stale generations, outward APIC rounding, FADT/GAS validation,
 IRQ-lock ordering, timer/spurious entry contracts, UC/NX LAPIC publication, and
 `clock_get` output/domain validation.

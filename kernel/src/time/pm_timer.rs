@@ -21,8 +21,12 @@ impl PmTimerWidth {
         self.mask() as u64 + 1
     }
 
-    pub(crate) const fn half_wrap_ticks(self) -> u64 {
+    pub(crate) const fn maximum_unambiguous_gap_ticks(self) -> u64 {
         self.modulus() / 2
+    }
+
+    pub(crate) const fn maintenance_arm_ticks(self) -> u64 {
+        self.modulus() / 4
     }
 }
 
@@ -48,8 +52,16 @@ impl PmTimerDescriptor {
         self.width
     }
 
-    pub(crate) fn half_wrap_nanoseconds(self) -> Result<u64, PmTimerError> {
-        ticks_to_nanoseconds(self.width.half_wrap_ticks())
+    pub(crate) fn maximum_unambiguous_gap_nanoseconds(self) -> Result<u64, PmTimerError> {
+        ticks_to_nanoseconds(self.width.maximum_unambiguous_gap_ticks())
+    }
+
+    pub(crate) fn maintenance_arm_nanoseconds(self) -> Result<u64, PmTimerError> {
+        ticks_to_nanoseconds(self.width.maintenance_arm_ticks())
+    }
+
+    pub(crate) fn full_wrap_nanoseconds(self) -> Result<u64, PmTimerError> {
+        ticks_to_nanoseconds(self.width.modulus())
     }
 }
 
@@ -92,7 +104,7 @@ impl PmTimerState {
         let mask = self.descriptor.width.mask();
         let current = raw & mask;
         let delta = u64::from(current.wrapping_sub(self.last_raw) & mask);
-        if delta > self.descriptor.width.half_wrap_ticks() {
+        if delta > self.descriptor.width.maximum_unambiguous_gap_ticks() {
             return Err(PmTimerError::SampleGapTooLarge);
         }
         let extended_ticks = self
@@ -100,7 +112,7 @@ impl PmTimerState {
             .checked_add(delta)
             .ok_or(PmTimerError::TickOverflow)?;
         let nanoseconds = ticks_to_nanoseconds(extended_ticks)?;
-        let maintenance_delta = self.descriptor.half_wrap_nanoseconds()?;
+        let maintenance_delta = self.descriptor.maintenance_arm_nanoseconds()?;
         let maintenance_deadline = nanoseconds
             .checked_add(maintenance_delta)
             .filter(|value| *value < DW_DEADLINE_INFINITE.0)
@@ -145,7 +157,63 @@ mod tests {
         let sample = state.sample(0x0000_0010).unwrap();
         assert_eq!(state.extended_ticks, 0x20);
         assert_eq!(sample.nanoseconds, ticks_to_nanoseconds(0x20).unwrap());
-        assert!(sample.maintenance_deadline > sample.nanoseconds);
+        assert_eq!(
+            sample.maintenance_deadline - sample.nanoseconds,
+            descriptor.maintenance_arm_nanoseconds().unwrap()
+        );
+    }
+
+    #[test]
+    fn maintenance_arm_reserves_half_of_the_unambiguous_gap_as_delivery_slack() {
+        for width in [PmTimerWidth::Bits24, PmTimerWidth::Bits32] {
+            assert_eq!(
+                width.maintenance_arm_ticks() * 2,
+                width.maximum_unambiguous_gap_ticks()
+            );
+            let descriptor = PmTimerDescriptor::new(0x608, width).unwrap();
+            assert!(
+                descriptor.maintenance_arm_nanoseconds().unwrap()
+                    < descriptor.maximum_unambiguous_gap_nanoseconds().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn delayed_maintenance_samples_remain_unambiguous_until_the_half_wrap_boundary() {
+        for width in [PmTimerWidth::Bits24, PmTimerWidth::Bits32] {
+            let descriptor = PmTimerDescriptor::new(0x608, width).unwrap();
+            let arm = width.maintenance_arm_ticks();
+            let maximum = width.maximum_unambiguous_gap_ticks();
+            let mut state = PmTimerState::new(descriptor, 0);
+            state.sample(arm as u32).unwrap();
+
+            let mut state = PmTimerState::new(descriptor, 0);
+            state.sample((maximum - 1) as u32).unwrap();
+            let mut state = PmTimerState::new(descriptor, 0);
+            state.sample(maximum as u32).unwrap();
+            let mut state = PmTimerState::new(descriptor, 0);
+            assert_eq!(
+                state.sample((maximum + 1) as u32),
+                Err(PmTimerError::SampleGapTooLarge)
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_quarter_wrap_maintenance_extends_across_multiple_full_wraps() {
+        let descriptor = PmTimerDescriptor::new(0x608, PmTimerWidth::Bits24).unwrap();
+        let mut state = PmTimerState::new(descriptor, 0);
+        let step = PmTimerWidth::Bits24.maintenance_arm_ticks();
+        let mask = PmTimerWidth::Bits24.mask() as u64;
+        let mut raw = 0_u64;
+        let mut previous = 0_u64;
+        for _ in 0..12 {
+            raw = (raw + step) & mask;
+            let sample = state.sample(raw as u32).unwrap();
+            assert!(sample.nanoseconds > previous);
+            previous = sample.nanoseconds;
+        }
+        assert!(state.extended_ticks >= PmTimerWidth::Bits24.modulus() * 3);
     }
 
     #[test]
@@ -153,7 +221,7 @@ mod tests {
         let descriptor = PmTimerDescriptor::new(0x608, PmTimerWidth::Bits24).unwrap();
         let mut state = PmTimerState::new(descriptor, 0);
         assert_eq!(
-            state.sample((1 << 23) + 1),
+            state.sample((PmTimerWidth::Bits24.maximum_unambiguous_gap_ticks() + 1) as u32),
             Err(PmTimerError::SampleGapTooLarge)
         );
     }

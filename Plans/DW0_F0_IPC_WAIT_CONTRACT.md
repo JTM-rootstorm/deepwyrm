@@ -328,12 +328,19 @@ publishing the clock backend. If the designated q35 profile does not expose a
 usable PM Timer, F3 stops and requests an F0 architecture revision; it must not
 silently substitute an unreviewed TSC/HPET/PIT clock.
 
-The PM counter is extended across wraps in kernel state. The timer service must
-sample it often enough that at most one hardware wrap can occur between extension
-updates; the implementation should schedule an internal maintenance deadline no
-later than half the hardware wrap interval when no earlier user deadline exists.
-Tick-to-nanosecond conversion uses checked wide arithmetic and never emits the
-`DW_DEADLINE_INFINITE` sentinel as a real clock value.
+The PM counter is extended across wraps in kernel state. The live timer service must
+sample it within a mathematically bounded *maximum unambiguous gap* of one half
+hardware wrap. The maintenance wake is deliberately armed earlier, at one quarter
+wrap, reserving the remaining quarter wrap as programming/interrupt-disabled/delivery
+slack. Outward Local APIC rounding must remain strictly inside that slack. An earlier
+already-armed maintenance event may be retained after a clock sample because firing
+earlier cannot weaken this bound. Tick-to-nanosecond conversion uses checked wide
+arithmetic and never emits the `DW_DEADLINE_INFINITE` sentinel as a real clock value.
+
+A VM pause/suspend or other interruption longer than the proven ambiguity bound is a
+continuity break for the PM-only reference clock. Without an independent counter
+cross-check the kernel must not claim pause-resistant monotonic continuity from that
+case; later hardware profiles may add such a cross-check explicitly.
 
 The Local APIC timer is calibrated against the validated monotonic counter and is
 programmed one-shot for the earliest of user/kernel deadline and PM-counter wrap
