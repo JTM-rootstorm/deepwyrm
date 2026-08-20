@@ -76,6 +76,26 @@ impl<OUTPUT> WaitOperation<OUTPUT> {
         blocked.complete_with(blocked_registry, winner, |()| ())?;
         Ok((output, deadline))
     }
+
+    /// Terminal teardown consumes the durable wait owner even if signal or
+    /// timeout already won but the suspended syscall has not resumed yet.
+    pub(crate) fn complete_terminal<const CAPACITY: usize>(
+        self,
+        blocked_registry: &BlockedOperationRegistry<CAPACITY>,
+    ) -> Result<(OUTPUT, Option<DeadlineRegistration>), BlockedOperationError> {
+        let wake = self.wake_key();
+        let winner = match blocked_registry.winner(wake)? {
+            Some(winner) => winner,
+            None => {
+                assert!(
+                    blocked_registry.try_claim_winner(wake, BlockedOperationWinner::Terminal)?,
+                    "fresh terminal wait claim unexpectedly lost"
+                );
+                BlockedOperationWinner::Terminal
+            }
+        };
+        self.complete(blocked_registry, winner)
+    }
 }
 
 /// Thread-context owner for resources that must survive a blocked syscall.
@@ -252,5 +272,20 @@ mod tests {
             .unwrap();
         assert_eq!(output, 11);
         assert!(deadline.is_none());
+    }
+
+    #[test]
+    fn terminal_cleanup_accepts_a_preexisting_signal_winner() {
+        let (process, thread, wake, blocked, blocked_registry) = keys();
+        let operation = WaitOperation::new(process, thread, blocked, 0x33_u32, None);
+        let winner = BlockedOperationWinner::Signal {
+            item_index: 2,
+            observed: deepwyrm_abi::DwSignals(0x40),
+        };
+        assert!(blocked_registry.try_claim_winner(wake, winner).unwrap());
+        let (output, deadline) = operation.complete_terminal(&blocked_registry).unwrap();
+        assert_eq!(output, 0x33);
+        assert!(deadline.is_none());
+        assert!(!blocked_registry.has_thread(thread));
     }
 }

@@ -883,6 +883,31 @@ pub(crate) fn claim_timeout_and_wake<const EXECUTION: usize>(
     }
 }
 
+pub(crate) fn finish_terminal_wait<
+    OUTPUT,
+    const OBJECTS: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    waits: &WaitRegistry<WAITERS>,
+    execution: &ExecutionDomain<EXECUTION>,
+    operations: &mut WaitOperationRegistry<OUTPUT, EXECUTION>,
+    mut deadline_authority: Option<&mut dyn WaitDeadlineAuthority>,
+    thread: ThreadKey,
+) -> Result<Option<OUTPUT>, WaitFinishError> {
+    let Some(operation) = operations.take_thread(thread) else {
+        return Ok(None);
+    };
+    let wake = operation.wake_key();
+    release_cancelled_generation(registry, waits.cancel_generation(wake));
+    let (output, deadline) = operation
+        .complete_terminal(execution.blocked_operations())
+        .map_err(WaitFinishError::Blocked)?;
+    cancel_deadline_exact(&mut deadline_authority, deadline).map_err(WaitFinishError::Deadline)?;
+    Ok(Some(output))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
