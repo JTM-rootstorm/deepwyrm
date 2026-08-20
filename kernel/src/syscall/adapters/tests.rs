@@ -2598,3 +2598,127 @@ fn channel_receive_handle_capacity_failure_preserves_queued_datagram() {
         DW_STATUS_SUCCESS
     );
 }
+
+#[test]
+fn wait_wake_completion_claims_signal_before_scheduler_wake() {
+    use deepwyrm_abi::{DW_OBJECT_TYPE_EVENT, DW_RIGHT_MODIFY, DW_RIGHT_SIGNAL, DW_RIGHT_WAIT};
+
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let mut cleanup = CleanupQueue::<16>::new();
+    let process_pin = resolve_current_handle(
+        &tasks,
+        &mut registry,
+        process,
+        process_handle,
+        deepwyrm_abi::DW_OBJECT_TYPE_PROCESS,
+        DW_RIGHT_MODIFY,
+    )
+    .unwrap();
+    let (thread, thread_ref) = tasks.create_thread(&mut registry, &process_pin).unwrap();
+    release_lookup_pin(&mut registry, process_pin, &mut cleanup);
+    execution
+        .start_thread(&mut tasks, thread, test_start(0x71))
+        .unwrap();
+    assert_eq!(execution.schedule_next().unwrap().current, Some(thread));
+
+    let events = EventAuthority::<1>::new();
+    let waits = WaitRegistry::<2>::new();
+    let (event_key, event_ref) = events.create_event(&mut registry).unwrap();
+    let event_handle = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(event_ref, DwRights(DW_RIGHT_WAIT.0 | DW_RIGHT_SIGNAL.0))
+        .unwrap();
+
+    let block = execution.prepare_block_current(thread).unwrap();
+    let wake = block.wake_key();
+    let operation = crate::task::BlockedOperation::publish(
+        execution.blocked_operations(),
+        process,
+        thread,
+        wake,
+        (),
+    )
+    .unwrap();
+    let target = tasks
+        .process_handles(process)
+        .unwrap()
+        .lookup(
+            &mut registry,
+            event_handle,
+            AcceptedObjectTypes::One(DW_OBJECT_TYPE_EVENT),
+            DW_RIGHT_WAIT,
+        )
+        .unwrap();
+    assert!(matches!(
+        events
+            .register_wait(
+                &waits,
+                target,
+                deepwyrm_abi::DW_SIGNAL_SIGNALED,
+                0,
+                thread,
+                wake
+            )
+            .unwrap(),
+        crate::wait::EventWaitOutcome::Registered(_)
+    ));
+    execution.commit_block(block).unwrap();
+    assert_eq!(
+        execution.scheduler_state(thread),
+        Some(SchedulerThreadState::Blocked)
+    );
+
+    let wakes = events
+        .signal(
+            event_key,
+            deepwyrm_abi::DwSignals(0),
+            deepwyrm_abi::DW_SIGNAL_SIGNALED,
+            &waits,
+        )
+        .unwrap();
+    complete_wait_wakes(&mut registry, &execution, wakes, &mut cleanup);
+    let winner = crate::task::BlockedOperationWinner::Signal {
+        item_index: 0,
+        observed: deepwyrm_abi::DW_SIGNAL_SIGNALED,
+    };
+    assert_eq!(
+        execution.blocked_operations().winner(wake),
+        Ok(Some(winner))
+    );
+    assert_eq!(
+        execution
+            .blocked_operations()
+            .try_claim_winner(wake, crate::task::BlockedOperationWinner::Timeout),
+        Ok(false)
+    );
+    assert_eq!(
+        execution.scheduler_state(thread),
+        Some(SchedulerThreadState::Runnable)
+    );
+    assert_eq!(
+        operation.complete_with(execution.blocked_operations(), winner, |_| ()),
+        Ok(())
+    );
+
+    let event_final = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .close(&mut registry, event_handle)
+        .unwrap()
+        .unwrap();
+    crate::wait::complete_event_finalization(
+        &mut registry,
+        events.take_finalization(event_final).unwrap(),
+    );
+    assert!(
+        tasks
+            .process_handles_mut(process)
+            .unwrap()
+            .close(&mut registry, process_handle)
+            .unwrap()
+            .is_none()
+    );
+    assert!(registry.release_handle(thread_ref).unwrap().is_none());
+}

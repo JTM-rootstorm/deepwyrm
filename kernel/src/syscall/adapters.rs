@@ -1171,9 +1171,27 @@ fn complete_wait_wakes<const OBJECTS: usize, const WAITERS: usize, const EXECUTI
 ) {
     let (wake_intents, wait_pins) = wakes.into_parts();
     for wake in wake_intents.into_iter().flatten() {
-        execution.wake(wake.wake_key()).unwrap_or_else(|error| {
-            panic!("waiter lost exact scheduler block generation: {error:?}")
-        });
+        let winner = crate::task::BlockedOperationWinner::Signal {
+            item_index: wake.item_index(),
+            observed: wake.observed(),
+        };
+        match execution
+            .blocked_operations()
+            .try_claim_winner(wake.wake_key(), winner)
+        {
+            Ok(true) => execution.wake(wake.wake_key()).unwrap_or_else(|error| {
+                panic!("waiter lost exact scheduler block generation: {error:?}")
+            }),
+            Ok(false) => {
+                // A timeout/terminal path already won this exact block
+                // generation. `take_ready` still consumed the registrations,
+                // so only their pins need deferred release below.
+            }
+            Err(crate::task::BlockedOperationError::StaleReservation) => {
+                panic!("published wait registration has no blocked-operation owner")
+            }
+            Err(error) => panic!("blocked wait winner arbitration failed: {error:?}"),
+        }
     }
     for pin in wait_pins.into_iter().flatten() {
         release_lookup_pin(registry, pin, cleanup);
