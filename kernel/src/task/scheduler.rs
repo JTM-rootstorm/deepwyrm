@@ -102,6 +102,13 @@ pub(crate) struct ScheduleDecision {
     pub(crate) current: Option<ThreadKey>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IdleScheduleDecision {
+    ContinueIdle,
+    ResumeCurrent,
+    Switch(ScheduleDecision),
+}
+
 #[derive(Debug)]
 pub(crate) struct SchedulerReservationFailure {
     error: SchedulerError,
@@ -486,6 +493,45 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         entry.token = 0;
         debug_assert_eq!(state.check_invariants(), Ok(()));
         Ok(())
+    }
+
+    /// Selects work after an IRQ while the CPU is physically executing a
+    /// blocked syscall continuation on `suspended`'s kernel stack.
+    ///
+    /// The logical scheduler has no current Thread in this state. If the
+    /// suspended Thread itself is selected, the caller may resume in place. If
+    /// another Runnable Thread wins FIFO order, the returned decision names the
+    /// physically-active suspended continuation as `previous` so the execution
+    /// owner can save it before switching away.
+    pub(crate) fn schedule_from_idle(
+        &self,
+        suspended: ThreadKey,
+    ) -> Result<IdleScheduleDecision, SchedulerError> {
+        let mut state = self.state.lock();
+        if state.current.is_some() {
+            return Err(SchedulerError::CurrentThreadRunning);
+        }
+        let suspended_present = state.queue[..state.len]
+            .iter()
+            .flatten()
+            .any(|entry| entry.thread == suspended);
+        if !suspended_present {
+            return Err(SchedulerError::NotScheduled);
+        }
+        let Some(next) = state.pop_first_runnable() else {
+            debug_assert_eq!(state.check_invariants(), Ok(()));
+            return Ok(IdleScheduleDecision::ContinueIdle);
+        };
+        state.current = Some(next);
+        debug_assert_eq!(state.check_invariants(), Ok(()));
+        if next == suspended {
+            Ok(IdleScheduleDecision::ResumeCurrent)
+        } else {
+            Ok(IdleScheduleDecision::Switch(ScheduleDecision {
+                previous: Some(suspended),
+                current: Some(next),
+            }))
+        }
     }
 
     pub(crate) fn retire(&self, thread: ThreadKey) -> Result<ScheduleDecision, SchedulerError> {

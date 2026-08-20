@@ -390,3 +390,61 @@ fn switch_plan_requires_live_seeded_destination_continuation() {
     assert_eq!(plan.next_rsp(), next_rsp);
     assert_eq!(plan.next_stack(), next_bounds);
 }
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the test keeps the execution domain stationary while inspecting the idle switch plan"
+)]
+fn idle_switch_plan_can_save_a_woken_waiter_behind_an_earlier_fifo_winner() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (_process, process_handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let process_owner = registry
+        .retain_internal_from_handle(&process_handle)
+        .unwrap();
+    let (first, _first_handle) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    let (waiter, _waiter_handle) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    assert!(registry.release_internal(process_owner).unwrap().is_none());
+    assert!(registry.release_internal(root_owner).unwrap().is_none());
+
+    let domain = ExecutionDomain::<2>::new(stack_bounds::<2>()).unwrap();
+    domain
+        .start_thread(&mut tasks, first, start_state(41))
+        .unwrap();
+    domain
+        .start_thread(&mut tasks, waiter, start_state(42))
+        .unwrap();
+    assert_eq!(domain.schedule_next().unwrap().current, Some(first));
+    let (first_block, first_decision) = domain.block_current(first).unwrap();
+    assert_eq!(first_decision.current, Some(waiter));
+    let (waiter_block, waiter_decision) = domain.block_current(waiter).unwrap();
+    assert_eq!(waiter_decision.current, None);
+
+    // Both become Runnable while the CPU is still physically on waiter's
+    // suspended kernel continuation; FIFO keeps `first` ahead of `waiter`.
+    domain.wake(first_block.into_wake_key()).unwrap();
+    domain.wake(waiter_block.into_wake_key()).unwrap();
+    let idle = domain.schedule_from_idle(waiter).unwrap();
+    let decision = match idle {
+        crate::task::IdleScheduleDecision::Switch(decision) => decision,
+        other => panic!("expected FIFO idle switch, got {other:?}"),
+    };
+    assert_eq!(decision.previous, Some(waiter));
+    assert_eq!(decision.current, Some(first));
+    assert_eq!(
+        domain.scheduler_state(waiter),
+        Some(crate::task::SchedulerThreadState::Runnable)
+    );
+
+    let (first_stack, first_context) = tasks.thread_execution_resources(first).unwrap().unwrap();
+    let first_bounds = domain.stack_bounds(first_stack).unwrap();
+    let first_rsp = first_bounds.top - crate::arch::x86_64::context::KERNEL_CONTEXT_FRAME_BYTES;
+    domain
+        .seed_test_kernel_continuation(first_stack, first_context, first_rsp)
+        .unwrap();
+    let plan = unsafe { domain.prepare_idle_kernel_switch(&tasks, decision) }.unwrap();
+    assert_eq!(plan.next_stack(), first_bounds);
+    assert_eq!(plan.next_rsp(), first_rsp);
+}

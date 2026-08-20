@@ -561,6 +561,13 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         self.scheduler.yield_current(thread)
     }
 
+    pub(crate) fn schedule_from_idle(
+        &self,
+        suspended: ThreadKey,
+    ) -> Result<super::IdleScheduleDecision, SchedulerError> {
+        self.scheduler.schedule_from_idle(suspended)
+    }
+
     pub(crate) fn prepare_block_current(
         &self,
         thread: ThreadKey,
@@ -738,11 +745,60 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         decision: super::ScheduleDecision,
     ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan, ExecutionSwitchError> {
+        unsafe { self.prepare_kernel_switch_inner(tasks, decision, false) }
+    }
+
+    /// Builds a kernel switch plan while the CPU is physically executing an
+    /// idle suspended syscall continuation. Unlike the ordinary blocked switch,
+    /// the previous Thread may already be Runnable if its wake raced another
+    /// FIFO winner after the CPU entered idle.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prove `decision.previous` is the kernel stack currently
+    /// executing this function and keep the execution owner stationary until the
+    /// returned plan is consumed.
+    #[allow(
+        unsafe_code,
+        reason = "F7 idle suspension can logically wake the physically-active continuation before FIFO selects another destination Thread"
+    )]
+    pub(crate) unsafe fn prepare_idle_kernel_switch<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &self,
+        tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        decision: super::ScheduleDecision,
+    ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan, ExecutionSwitchError> {
+        unsafe { self.prepare_kernel_switch_inner(tasks, decision, true) }
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "shared switch-plan constructor is called only by audited ordinary-block and idle-block wrappers that prove the active continuation identity"
+    )]
+    unsafe fn prepare_kernel_switch_inner<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &self,
+        tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        decision: super::ScheduleDecision,
+        allow_runnable_previous: bool,
+    ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan, ExecutionSwitchError> {
         let previous = decision
             .previous
             .ok_or(ExecutionSwitchError::MissingPrevious)?;
         let next = decision.current.ok_or(ExecutionSwitchError::MissingNext)?;
-        if self.scheduler.state(previous) != Some(super::SchedulerThreadState::Blocked)
+        let previous_state = self.scheduler.state(previous);
+        let previous_valid = previous_state == Some(super::SchedulerThreadState::Blocked)
+            || (allow_runnable_previous
+                && previous_state == Some(super::SchedulerThreadState::Runnable));
+        if !previous_valid
             || self.scheduler.state(next) != Some(super::SchedulerThreadState::Running)
         {
             return Err(ExecutionSwitchError::WrongSchedulerState);

@@ -238,3 +238,59 @@ fn pending_block_preparation_is_retired_with_running_thread() {
     assert_eq!(scheduler.state(thread), None);
     assert_eq!(scheduler.wake(wake), Err(SchedulerError::StaleBlockToken));
 }
+
+#[test]
+fn idle_scheduler_continues_then_resumes_exact_woken_waiter() {
+    let scheduler = CooperativeScheduler::<1>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let waiter = thread_key(&mut registry);
+    let reservation = scheduler.reserve(waiter).unwrap();
+    scheduler.commit(reservation).unwrap();
+    scheduler.schedule_next().unwrap();
+    let (blocked, decision) = scheduler.block_current(waiter).unwrap();
+    assert_eq!(decision.current, None);
+    assert_eq!(
+        scheduler.schedule_from_idle(waiter).unwrap(),
+        IdleScheduleDecision::ContinueIdle
+    );
+    scheduler.wake(blocked.into_wake_key()).unwrap();
+    assert_eq!(
+        scheduler.schedule_from_idle(waiter).unwrap(),
+        IdleScheduleDecision::ResumeCurrent
+    );
+    assert_eq!(scheduler.state(waiter), Some(SchedulerThreadState::Running));
+}
+
+#[test]
+fn idle_scheduler_preserves_fifo_when_other_work_wakes_first() {
+    let scheduler = CooperativeScheduler::<2>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let first = thread_key(&mut registry);
+    let suspended = thread_key(&mut registry);
+    for thread in [first, suspended] {
+        let reservation = scheduler.reserve(thread).unwrap();
+        scheduler.commit(reservation).unwrap();
+    }
+    scheduler.schedule_next().unwrap();
+    let (first_block, decision) = scheduler.block_current(first).unwrap();
+    assert_eq!(decision.current, Some(suspended));
+    let (suspended_block, decision) = scheduler.block_current(suspended).unwrap();
+    assert_eq!(decision.current, None);
+
+    // Wake the first Thread before the physically-active suspended waiter.
+    scheduler.wake(first_block.into_wake_key()).unwrap();
+    assert_eq!(
+        scheduler.schedule_from_idle(suspended).unwrap(),
+        IdleScheduleDecision::Switch(ScheduleDecision {
+            previous: Some(suspended),
+            current: Some(first),
+        })
+    );
+    assert_eq!(scheduler.state(first), Some(SchedulerThreadState::Running));
+    assert_eq!(
+        scheduler.state(suspended),
+        Some(SchedulerThreadState::Blocked)
+    );
+    // Keep the token live in the model: it remains the exact later wake.
+    assert!(suspended_block.wake_key().token != 0);
+}

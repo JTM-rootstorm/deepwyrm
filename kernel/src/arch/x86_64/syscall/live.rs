@@ -546,14 +546,26 @@ unsafe fn native_runtime_trampoline<R: crate::syscall::native::NativeSyscallFram
                 let runtime = unsafe { &mut *context.cast::<R>() };
                 runtime.prepare_suspend(frame)
             };
-            unsafe { bind_current_thread_stack(plan.next_stack()) }
-                .unwrap_or_else(|_| halt_forever());
-            if !live_fp_simd_unavailable_is_enforced() {
-                halt_forever();
-            }
-            unsafe { crate::arch::x86_64::context::execute_kernel_switch(plan) };
-            if !live_fp_simd_unavailable_is_enforced() {
-                halt_forever();
+            match plan {
+                crate::syscall::native::NativeSuspendPlan::Switch(plan) => {
+                    switch_kernel_context(plan);
+                }
+                crate::syscall::native::NativeSuspendPlan::IdleCurrent => loop {
+                    let poll = {
+                        let runtime = unsafe { &mut *context.cast::<R>() };
+                        runtime.poll_idle_suspend(frame)
+                    };
+                    match poll {
+                        crate::syscall::native::NativeIdleSuspendPoll::Continue => {
+                            wait_for_suspend_interrupt();
+                        }
+                        crate::syscall::native::NativeIdleSuspendPoll::ResumeCurrent => break,
+                        crate::syscall::native::NativeIdleSuspendPoll::Switch(plan) => {
+                            switch_kernel_context(plan);
+                            break;
+                        }
+                    }
+                },
             }
             let generation = current_binding_generation();
             if let Err(error) = frame.rebind_after_kernel_resume(generation) {
@@ -569,6 +581,29 @@ unsafe fn native_runtime_trampoline<R: crate::syscall::native::NativeSyscallFram
             }
         }
     }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the validated switch plan names stationary execution-owner save storage and an authenticated destination kernel stack"
+)]
+fn switch_kernel_context(plan: crate::arch::x86_64::context::KernelSwitchPlan) {
+    unsafe { bind_current_thread_stack(plan.next_stack()) }.unwrap_or_else(|_| halt_forever());
+    if !live_fp_simd_unavailable_is_enforced() {
+        halt_forever();
+    }
+    unsafe { crate::arch::x86_64::context::execute_kernel_switch(plan) };
+    if !live_fp_simd_unavailable_is_enforced() {
+        halt_forever();
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "STI immediately followed by HLT is the race-free x86 idle sequence; CLI restores the IF-clear syscall runtime before polling kernel state"
+)]
+fn wait_for_suspend_interrupt() {
+    unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)) };
 }
 
 /// Binds one stationary typed runtime to the raw x86 syscall entry.

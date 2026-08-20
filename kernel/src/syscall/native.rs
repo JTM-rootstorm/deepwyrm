@@ -723,6 +723,19 @@ impl<T: NativeSyscallServices> NativeSyscallHandler for T {
     }
 }
 
+#[must_use = "suspend plans must be consumed by the raw syscall runtime"]
+pub(crate) enum NativeSuspendPlan {
+    Switch(crate::arch::x86_64::context::KernelSwitchPlan),
+    IdleCurrent,
+}
+
+#[must_use = "idle suspension polls must either continue idling, resume the waiter, or switch to newly runnable work"]
+pub(crate) enum NativeIdleSuspendPoll {
+    Continue,
+    ResumeCurrent,
+    Switch(crate::arch::x86_64::context::KernelSwitchPlan),
+}
+
 pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
     fn authorize_return(
         &mut self,
@@ -737,7 +750,12 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
     fn prepare_suspend(
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
-    ) -> crate::arch::x86_64::context::KernelSwitchPlan;
+    ) -> NativeSuspendPlan;
+
+    fn poll_idle_suspend(
+        &mut self,
+        frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> NativeIdleSuspendPoll;
 
     fn resume_suspended(&mut self, frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame);
 }

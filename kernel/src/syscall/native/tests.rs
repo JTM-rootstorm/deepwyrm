@@ -215,8 +215,15 @@ impl NativeSyscallFrameRuntime for FrameRuntime {
     fn prepare_suspend(
         &mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
-    ) -> crate::arch::x86_64::context::KernelSwitchPlan {
+    ) -> NativeSuspendPlan {
         panic!("unexpected synthetic suspension")
+    }
+
+    fn poll_idle_suspend(
+        &mut self,
+        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> NativeIdleSuspendPoll {
+        panic!("unexpected synthetic idle suspension")
     }
 
     fn resume_suspended(&mut self, _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame) {
@@ -302,8 +309,15 @@ impl NativeSyscallFrameRuntime for SuspendingRuntime {
     fn prepare_suspend(
         &mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
-    ) -> crate::arch::x86_64::context::KernelSwitchPlan {
+    ) -> NativeSuspendPlan {
         panic!("direct dispatch test stops before trampoline suspension")
+    }
+
+    fn poll_idle_suspend(
+        &mut self,
+        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> NativeIdleSuspendPoll {
+        panic!("direct dispatch test never enters idle suspension")
     }
 
     fn resume_suspended(&mut self, _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame) {

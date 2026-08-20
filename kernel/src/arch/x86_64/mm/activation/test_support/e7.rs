@@ -553,8 +553,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     fn prepare_suspend(
         &mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
-    ) -> crate::arch::x86_64::context::KernelSwitchPlan {
+    ) -> crate::syscall::native::NativeSuspendPlan {
         fail(0xa2)
+    }
+
+    fn poll_idle_suspend(
+        &mut self,
+        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> crate::syscall::native::NativeIdleSuspendPoll {
+        fail(0xa4)
     }
 
     fn resume_suspended(&mut self, _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame) {
