@@ -1,6 +1,6 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::sync::SpinMutex;
+use crate::sync::IrqSpinMutex;
 use deepwyrm_abi::DwSignals;
 
 use super::{BlockWakeKey, ProcessKey, ThreadKey};
@@ -73,14 +73,14 @@ pub(crate) enum BlockedOperationWinner {
 
 pub(crate) struct BlockedOperationRegistry<const CAPACITY: usize> {
     domain: u64,
-    slots: SpinMutex<[Slot; CAPACITY]>,
+    slots: IrqSpinMutex<[Slot; CAPACITY]>,
 }
 
 impl<const CAPACITY: usize> BlockedOperationRegistry<CAPACITY> {
     pub(crate) fn new() -> Self {
         Self {
             domain: mint_domain(),
-            slots: SpinMutex::new([EMPTY_SLOT; CAPACITY]),
+            slots: IrqSpinMutex::new([EMPTY_SLOT; CAPACITY]),
         }
     }
 
