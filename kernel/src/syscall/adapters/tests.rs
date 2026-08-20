@@ -1361,6 +1361,7 @@ fn self_thread_termination_with_live_sibling_never_returns_to_reclaimed_context(
     let (mut registry, mut tasks, process, process_handle) = process_fixture();
     let execution = ExecutionDomain::<2>::new(test_stack_bounds::<2>()).unwrap();
     let waits = WaitRegistry::<8>::new();
+    let mut terminal_waits = NoTerminalWaitCleanup;
     let mut cleanup = CleanupQueue::<16>::new();
     let process_pin = resolve_current_handle(
         &tasks,
@@ -1425,6 +1426,7 @@ fn self_thread_termination_with_live_sibling_never_returns_to_reclaimed_context(
             &mut tasks,
             &execution,
             &waits,
+            &mut terminal_waits,
             process,
             current,
             current_handle,
@@ -1467,6 +1469,7 @@ fn self_thread_termination_with_live_sibling_never_returns_to_reclaimed_context(
             &mut tasks,
             &execution,
             &waits,
+            &mut terminal_waits,
             process,
             sibling,
             sibling_handle,
@@ -1735,6 +1738,7 @@ fn termination_rejects_reason_type_and_rights_before_target_mutation() {
     let (mut registry, mut tasks, process, process_handle) = process_fixture();
     let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
     let waits = WaitRegistry::<8>::new();
+    let mut terminal_waits = NoTerminalWaitCleanup;
     let mut cleanup = CleanupQueue::<16>::new();
     let process_pin = resolve_current_handle(
         &tasks,
@@ -1778,6 +1782,7 @@ fn termination_rejects_reason_type_and_rights_before_target_mutation() {
             &mut tasks,
             &execution,
             &waits,
+            &mut terminal_waits,
             process,
             current,
             target_full,
@@ -1797,6 +1802,7 @@ fn termination_rejects_reason_type_and_rights_before_target_mutation() {
             &mut tasks,
             &execution,
             &waits,
+            &mut terminal_waits,
             process,
             current,
             process_handle,
@@ -1812,6 +1818,7 @@ fn termination_rejects_reason_type_and_rights_before_target_mutation() {
             &mut tasks,
             &execution,
             &waits,
+            &mut terminal_waits,
             process,
             current,
             target_inspect,
@@ -1831,6 +1838,7 @@ fn termination_rejects_reason_type_and_rights_before_target_mutation() {
             &mut tasks,
             &execution,
             &waits,
+            &mut terminal_waits,
             process,
             current,
             target_full,
@@ -3161,4 +3169,146 @@ fn wait_one_suspend_transfers_output_owner_until_signal_resume() {
         ),
         DW_STATUS_SUCCESS
     );
+}
+
+#[test]
+fn terminating_blocked_waiter_consumes_wait_without_userspace_resume() {
+    use deepwyrm_abi::{
+        DW_DEADLINE_INFINITE, DW_RIGHT_MODIFY, DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED,
+        DW_TERMINATION_AUTHORIZED,
+    };
+
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let events = EventAuthority::<2>::new();
+    let channels = ChannelAuthority::<2, 4>::new();
+    let waits = WaitRegistry::<8>::new();
+    let execution = ExecutionDomain::<2>::new(test_stack_bounds::<2>()).unwrap();
+    let event = install_event_for_test(&mut registry, &mut tasks, process, &events, DW_RIGHT_WAIT);
+    let process_pin = resolve_current_handle(
+        &tasks,
+        &mut registry,
+        process,
+        process_handle,
+        deepwyrm_abi::DW_OBJECT_TYPE_PROCESS,
+        DW_RIGHT_MODIFY,
+    )
+    .unwrap();
+    let (target, target_ref) = tasks.create_thread(&mut registry, &process_pin).unwrap();
+    let (killer, killer_ref) = tasks.create_thread(&mut registry, &process_pin).unwrap();
+    let mut cleanup = CleanupQueue::<16>::new();
+    release_lookup_pin(&mut registry, process_pin, &mut cleanup);
+    let target_handle = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(target_ref, DW_RIGHT_MODIFY)
+        .unwrap();
+    // Keep the killer's public reference out of the Process table; its execution
+    // pin is sufficient for this kernel-model test and the reference is released
+    // after its execution resources retire.
+    assert!(registry.release_handle(killer_ref).unwrap().is_none());
+
+    execution
+        .start_thread(&mut tasks, target, test_start(0xd1))
+        .unwrap();
+    execution
+        .start_thread(&mut tasks, killer, test_start(0xd2))
+        .unwrap();
+    assert_eq!(execution.schedule_next().unwrap().current, Some(target));
+
+    let mut operations = WaitOperationRegistry::<u32, 2>::new();
+    let wake = match wait_one_begin(
+        0xfeed_u32,
+        &mut registry,
+        &tasks,
+        &events,
+        &channels,
+        &waits,
+        &execution,
+        &mut operations,
+        None,
+        process,
+        target,
+        event,
+        DW_SIGNAL_SIGNALED,
+        DW_DEADLINE_INFINITE,
+    ) {
+        WaitSyscallBegin::Suspended { wake, decision } => {
+            assert_eq!(decision.previous, Some(target));
+            assert_eq!(decision.current, Some(killer));
+            wake
+        }
+        _ => panic!("unsignaled target wait did not suspend"),
+    };
+    assert_eq!(
+        execution.scheduler_state(target),
+        Some(SchedulerThreadState::Blocked)
+    );
+    assert_eq!(
+        execution.scheduler_state(killer),
+        Some(SchedulerThreadState::Running)
+    );
+    assert!(operations.contains_thread(target));
+    assert_eq!(waits.len(), 1);
+
+    let mut discarded = None;
+    {
+        let mut terminal_waits = WaitTerminalCleanup::new(&mut operations, None, |output| {
+            discarded = Some(output);
+        });
+        assert_eq!(
+            thread_terminate(
+                &mut registry,
+                &mut tasks,
+                &execution,
+                &waits,
+                &mut terminal_waits,
+                process,
+                killer,
+                target_handle,
+                DW_TERMINATION_AUTHORIZED,
+                0xd3,
+                &mut cleanup,
+            ),
+            (DW_STATUS_SUCCESS, SyscallControl::ReturnToCaller)
+        );
+    }
+    assert_eq!(discarded, Some(0xfeed));
+    assert!(!operations.contains_thread(target));
+    assert_eq!(waits.len(), 0);
+    assert!(!execution.blocked_operations().has_thread(target));
+    assert_eq!(execution.scheduler_state(target), None);
+    assert_eq!(
+        execution.scheduler_state(killer),
+        Some(SchedulerThreadState::Running)
+    );
+    assert_eq!(
+        execution.blocked_operations().winner(wake),
+        Err(crate::task::BlockedOperationError::StaleReservation)
+    );
+
+    close_event_for_test(&mut registry, &mut tasks, process, &events, event);
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            target_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(
+        thread_exit(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            process,
+            killer,
+            0,
+            &mut cleanup,
+        ),
+        (DW_STATUS_SUCCESS, SyscallControl::TerminateCurrent)
+    );
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
 }

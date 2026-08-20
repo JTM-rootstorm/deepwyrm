@@ -401,6 +401,14 @@ impl<const THREADS: usize> ExitPins<THREADS> {
         self.resources[self.count] = resources;
         self.count += 1;
     }
+    pub(crate) fn thread_keys(&self) -> [Option<ThreadKey>; THREADS] {
+        core::array::from_fn(|index| {
+            self.threads[index]
+                .as_ref()
+                .map(|pin| ThreadKey::from_object_id(pin.id()))
+        })
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (

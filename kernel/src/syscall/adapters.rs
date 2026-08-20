@@ -97,6 +97,104 @@ impl<const CAPACITY: usize> CleanupQueue<CAPACITY> {
     }
 }
 
+pub(crate) trait TerminalWaitCleanup<
+    const OBJECTS: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>
+{
+    fn cleanup_terminal_wait(
+        &mut self,
+        registry: &mut ObjectRegistry<OBJECTS>,
+        waits: &WaitRegistry<WAITERS>,
+        execution: &ExecutionDomain<EXECUTION>,
+        thread: ThreadKey,
+        cleanup: &mut CleanupQueue<OBJECTS>,
+    );
+}
+
+pub(crate) struct NoTerminalWaitCleanup;
+
+impl<const OBJECTS: usize, const WAITERS: usize, const EXECUTION: usize>
+    TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION> for NoTerminalWaitCleanup
+{
+    fn cleanup_terminal_wait(
+        &mut self,
+        _registry: &mut ObjectRegistry<OBJECTS>,
+        _waits: &WaitRegistry<WAITERS>,
+        execution: &ExecutionDomain<EXECUTION>,
+        thread: ThreadKey,
+        _cleanup: &mut CleanupQueue<OBJECTS>,
+    ) {
+        assert!(
+            !execution.blocked_operations().has_thread(thread),
+            "blocked terminal Thread requires an explicit F7 wait cleanup owner"
+        );
+    }
+}
+
+pub(crate) struct WaitTerminalCleanup<'a, OUTPUT, DISCARD, const EXECUTION: usize> {
+    operations: &'a mut WaitOperationRegistry<OUTPUT, EXECUTION>,
+    deadline_authority: Option<&'a mut dyn WaitDeadlineAuthority>,
+    discard: DISCARD,
+}
+
+impl<'a, OUTPUT, DISCARD, const EXECUTION: usize>
+    WaitTerminalCleanup<'a, OUTPUT, DISCARD, EXECUTION>
+{
+    pub(crate) fn new(
+        operations: &'a mut WaitOperationRegistry<OUTPUT, EXECUTION>,
+        deadline_authority: Option<&'a mut dyn WaitDeadlineAuthority>,
+        discard: DISCARD,
+    ) -> Self {
+        Self {
+            operations,
+            deadline_authority,
+            discard,
+        }
+    }
+}
+
+impl<
+    OUTPUT,
+    DISCARD: FnMut(OUTPUT),
+    const OBJECTS: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+> TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>
+    for WaitTerminalCleanup<'_, OUTPUT, DISCARD, EXECUTION>
+{
+    fn cleanup_terminal_wait(
+        &mut self,
+        registry: &mut ObjectRegistry<OBJECTS>,
+        waits: &WaitRegistry<WAITERS>,
+        execution: &ExecutionDomain<EXECUTION>,
+        thread: ThreadKey,
+        cleanup: &mut CleanupQueue<OBJECTS>,
+    ) {
+        let deadline_authority = self
+            .deadline_authority
+            .as_mut()
+            .map(|authority| &mut **authority as &mut dyn WaitDeadlineAuthority);
+        let result = crate::wait::engine::finish_terminal_wait(
+            registry,
+            waits,
+            execution,
+            self.operations,
+            deadline_authority,
+            thread,
+        )
+        .unwrap_or_else(|error| panic!("terminal wait cleanup drifted: {error:?}"));
+        let Some((output, releases)) = result else {
+            return;
+        };
+        for release in releases.into_releases().into_iter().flatten() {
+            cleanup.push(release);
+        }
+        (self.discard)(output);
+    }
+}
+
 fn user_address_space() -> UserAddressSpace {
     UserAddressSpace::x86_64_four_level(u64::from(DW_BASE_PAGE_SIZE))
         .expect("generated ABI page size satisfies the locked x86_64 user split")
@@ -627,6 +725,7 @@ fn collect_retired_pins<
 }
 
 fn collect_process_effects<
+    C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
     const OBJECTS: usize,
     const HANDLES: usize,
     const THREADS: usize,
@@ -637,10 +736,14 @@ fn collect_process_effects<
     execution: &ExecutionDomain<EXECUTION>,
     waits: &WaitRegistry<WAITERS>,
     effects: ProcessExitEffects<HANDLES, THREADS>,
+    terminal_waits: &mut C,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) {
     for release in effects.drained.into_final_releases().into_iter().flatten() {
         cleanup.push(release);
+    }
+    for thread in effects.pins.thread_keys().into_iter().flatten() {
+        terminal_waits.cleanup_terminal_wait(registry, waits, execution, thread, cleanup);
     }
     collect_retired_pins(
         registry,
@@ -1685,6 +1788,7 @@ pub(crate) fn thread_create<
 }
 
 fn collect_group_effects<
+    C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
     const OBJECTS: usize,
     const PROCESSES: usize,
     const HANDLES: usize,
@@ -1696,10 +1800,11 @@ fn collect_group_effects<
     execution: &ExecutionDomain<EXECUTION>,
     waits: &WaitRegistry<WAITERS>,
     effects: TaskGroupTerminationEffects<PROCESSES, HANDLES, THREADS>,
+    terminal_waits: &mut C,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) {
     for process in effects.into_processes().into_iter().flatten() {
-        collect_process_effects(registry, execution, waits, process, cleanup);
+        collect_process_effects(registry, execution, waits, process, terminal_waits, cleanup);
     }
 }
 
@@ -1728,6 +1833,7 @@ fn control_after_process_state<
 }
 
 pub(crate) fn task_group_terminate<
+    C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
     const OBJECTS: usize,
     const GROUPS: usize,
     const PROCESSES: usize,
@@ -1740,6 +1846,7 @@ pub(crate) fn task_group_terminate<
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
     waits: &WaitRegistry<WAITERS>,
+    terminal_waits: &mut C,
     current_process: ProcessKey,
     current_thread: ThreadKey,
     task_group: DwHandle,
@@ -1772,7 +1879,7 @@ pub(crate) fn task_group_terminate<
             return (task_status(error), SyscallControl::ReturnToCaller);
         }
     };
-    collect_group_effects(registry, execution, waits, effects, cleanup);
+    collect_group_effects(registry, execution, waits, effects, terminal_waits, cleanup);
     release_lookup_pin(registry, pin, cleanup);
     (
         DW_STATUS_SUCCESS,
@@ -1781,6 +1888,7 @@ pub(crate) fn task_group_terminate<
 }
 
 pub(crate) fn process_exit<
+    C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
     const OBJECTS: usize,
     const GROUPS: usize,
     const PROCESSES: usize,
@@ -1793,6 +1901,7 @@ pub(crate) fn process_exit<
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
     waits: &WaitRegistry<WAITERS>,
+    terminal_waits: &mut C,
     current_process: ProcessKey,
     current_thread: ThreadKey,
     code: u32,
@@ -1806,11 +1915,12 @@ pub(crate) fn process_exit<
         Ok(effects) => effects,
         Err(error) => return (task_status(error), SyscallControl::ReturnToCaller),
     };
-    collect_process_effects(registry, execution, waits, effects, cleanup);
+    collect_process_effects(registry, execution, waits, effects, terminal_waits, cleanup);
     (DW_STATUS_SUCCESS, SyscallControl::TerminateCurrent)
 }
 
 pub(crate) fn process_terminate<
+    C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
     const OBJECTS: usize,
     const GROUPS: usize,
     const PROCESSES: usize,
@@ -1823,6 +1933,7 @@ pub(crate) fn process_terminate<
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
     waits: &WaitRegistry<WAITERS>,
+    terminal_waits: &mut C,
     current_process: ProcessKey,
     current_thread: ThreadKey,
     process: DwHandle,
@@ -1856,7 +1967,7 @@ pub(crate) fn process_terminate<
             return (task_status(error), SyscallControl::ReturnToCaller);
         }
     };
-    collect_process_effects(registry, execution, waits, effects, cleanup);
+    collect_process_effects(registry, execution, waits, effects, terminal_waits, cleanup);
     release_lookup_pin(registry, pin, cleanup);
     (
         DW_STATUS_SUCCESS,
@@ -1915,6 +2026,7 @@ pub(crate) fn thread_exit<
 }
 
 pub(crate) fn thread_terminate<
+    C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
     const OBJECTS: usize,
     const GROUPS: usize,
     const PROCESSES: usize,
@@ -1927,6 +2039,7 @@ pub(crate) fn thread_terminate<
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
     waits: &WaitRegistry<WAITERS>,
+    terminal_waits: &mut C,
     current_process: ProcessKey,
     current_thread: ThreadKey,
     thread: DwHandle,
@@ -1981,6 +2094,9 @@ pub(crate) fn thread_terminate<
         for release in drained.into_final_releases().into_iter().flatten() {
             cleanup.push(release);
         }
+    }
+    for terminal_thread in pins.thread_keys().into_iter().flatten() {
+        terminal_waits.cleanup_terminal_wait(registry, waits, execution, terminal_thread, cleanup);
     }
     collect_retired_pins(
         registry,
