@@ -448,3 +448,70 @@ fn idle_switch_plan_can_save_a_woken_waiter_behind_an_earlier_fifo_winner() {
     assert_eq!(plan.next_stack(), first_bounds);
     assert_eq!(plan.next_rsp(), first_rsp);
 }
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the test gives the F7 fresh-thread planner two process-owned aligned stack carriers and inspects the exact destination first-run frame"
+)]
+fn blocking_switch_prepares_fresh_destination_without_seeding_suspended_slot() {
+    extern crate std;
+    #[repr(align(4096))]
+    struct Region([u8; 0x12_000]);
+
+    fn owned_bounds(region: &mut Region) -> KernelStackBounds {
+        let guard = region.0.as_mut_ptr() as u64;
+        KernelStackBounds::new(guard, guard + 0x1000, guard + 0x11_000).unwrap()
+    }
+
+    let mut first_region = std::boxed::Box::new(Region([0; 0x12_000]));
+    let mut second_region = std::boxed::Box::new(Region([0; 0x12_000]));
+    let first_bounds = owned_bounds(&mut first_region);
+    let second_bounds = owned_bounds(&mut second_region);
+
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (_process, process_handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let process_owner = registry
+        .retain_internal_from_handle(&process_handle)
+        .unwrap();
+    let (first, _first_handle) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    let (second, _second_handle) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    assert!(registry.release_internal(process_owner).unwrap().is_none());
+    assert!(registry.release_internal(root_owner).unwrap().is_none());
+
+    let domain = ExecutionDomain::<2>::new([first_bounds, second_bounds]).unwrap();
+    domain
+        .start_thread(&mut tasks, first, start_state(51))
+        .unwrap();
+    domain
+        .start_thread(&mut tasks, second, start_state(52))
+        .unwrap();
+    assert_eq!(domain.schedule_next().unwrap().current, Some(first));
+    let (_second_stack, second_context) =
+        tasks.thread_execution_resources(second).unwrap().unwrap();
+    assert_eq!(domain.kernel_continuation_rsp(second_context), Ok(0));
+
+    let (_blocked, decision) = domain.block_current(first).unwrap();
+    assert_eq!(decision.current, Some(second));
+    let trusted_entry = 0xffff_8000_0012_3000;
+    let plan = unsafe {
+        domain.prepare_blocking_kernel_switch(&tasks, decision, trusted_entry)
+    }
+    .unwrap();
+    assert_eq!(plan.next_stack(), second_bounds);
+    assert_eq!(plan.next_rsp() & 0xf, 8);
+    assert!(crate::arch::x86_64::context::initial_saved_rsp_is_within_stack(
+        second_bounds,
+        plan.next_rsp()
+    ));
+    assert_eq!(domain.kernel_continuation_rsp(second_context), Ok(0));
+
+    let frame = plan.next_rsp() as *const u64;
+    unsafe {
+        assert_eq!(frame.add(6).read(), crate::arch::x86_64::context::INITIAL_KERNEL_CONTINUATION_RFLAGS);
+        assert_eq!(frame.add(7).read(), trusted_entry);
+        assert_eq!(frame.add(8).read(), 0);
+    }
+}

@@ -401,6 +401,7 @@ pub(crate) enum ExecutionSwitchError {
     Task(super::TaskError),
     Resource(ExecutionResourceError),
     Context(crate::arch::x86_64::context::KernelContextPlanError),
+    InitialContext(crate::arch::x86_64::context::InitialKernelContinuationError),
 }
 
 #[must_use = "retired task pins must be released through ObjectRegistry after E3 resources are reclaimed"]
@@ -745,7 +746,43 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         decision: super::ScheduleDecision,
     ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan, ExecutionSwitchError> {
-        unsafe { self.prepare_kernel_switch_inner(tasks, decision, false) }
+        unsafe { self.prepare_kernel_switch_inner(tasks, decision, false, None) }
+    }
+
+    /// Builds a blocking switch plan whose destination may be either a genuine
+    /// suspended kernel continuation or a never-run Thread. A fresh destination
+    /// receives the audited synthetic first-run frame at the instant it is
+    /// selected, while its continuation slot remains zero until it later blocks
+    /// and the switch assembly saves a real kernel continuation there.
+    ///
+    /// # Safety
+    ///
+    /// The execution owner must remain stationary until the returned plan is
+    /// consumed. `trusted_first_run_entry` must be the fixed kernel entry used to
+    /// launch the scheduler-selected fresh Thread and remain executable.
+    #[allow(
+        unsafe_code,
+        reason = "F7 may select a never-run Runnable Thread and must construct its audited first-run frame on the exclusively owned destination kernel stack"
+    )]
+    pub(crate) unsafe fn prepare_blocking_kernel_switch<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &self,
+        tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        decision: super::ScheduleDecision,
+        trusted_first_run_entry: u64,
+    ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan, ExecutionSwitchError> {
+        unsafe {
+            self.prepare_kernel_switch_inner(
+                tasks,
+                decision,
+                false,
+                Some(trusted_first_run_entry),
+            )
+        }
     }
 
     /// Builds a kernel switch plan while the CPU is physically executing an
@@ -772,7 +809,41 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         decision: super::ScheduleDecision,
     ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan, ExecutionSwitchError> {
-        unsafe { self.prepare_kernel_switch_inner(tasks, decision, true) }
+        unsafe { self.prepare_kernel_switch_inner(tasks, decision, true, None) }
+    }
+
+    /// Idle-suspend counterpart of [`Self::prepare_blocking_kernel_switch`].
+    /// The physically active waiter may already be Runnable when FIFO selects a
+    /// different destination, and that destination may itself be never-run.
+    ///
+    /// # Safety
+    ///
+    /// `decision.previous` must name the kernel stack physically executing the
+    /// idle continuation. The execution owner and trusted entry obey the same
+    /// lifetime requirements as the ordinary blocking fresh-thread planner.
+    #[allow(
+        unsafe_code,
+        reason = "F7 idle suspension may switch from a physically active waiter to a fresh scheduler-selected Runnable Thread"
+    )]
+    pub(crate) unsafe fn prepare_idle_blocking_kernel_switch<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &self,
+        tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        decision: super::ScheduleDecision,
+        trusted_first_run_entry: u64,
+    ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan, ExecutionSwitchError> {
+        unsafe {
+            self.prepare_kernel_switch_inner(
+                tasks,
+                decision,
+                true,
+                Some(trusted_first_run_entry),
+            )
+        }
     }
 
     #[allow(
@@ -789,6 +860,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         decision: super::ScheduleDecision,
         allow_runnable_previous: bool,
+        trusted_first_run_entry: Option<u64>,
     ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan, ExecutionSwitchError> {
         let previous = decision
             .previous
@@ -829,23 +901,32 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
             .continuations
             .load(next_context)
             .map_err(ExecutionSwitchError::Resource)?;
-        if next_rsp == 0 {
-            return Err(ExecutionSwitchError::Resource(
-                ExecutionResourceError::ContinuationUnavailable,
-            ));
-        }
         let next_stack = self
             .stacks
             .bounds(next_stack_id)
             .map_err(ExecutionSwitchError::Resource)?;
-        unsafe {
-            crate::arch::x86_64::context::KernelSwitchPlan::new(
-                current_rsp_out,
-                next_rsp,
+        if next_rsp != 0 {
+            return unsafe {
+                crate::arch::x86_64::context::KernelSwitchPlan::new(
+                    current_rsp_out,
+                    next_rsp,
+                    next_stack,
+                )
+            }
+            .map_err(ExecutionSwitchError::Context);
+        }
+        let trusted_first_run_entry = trusted_first_run_entry.ok_or(
+            ExecutionSwitchError::Resource(ExecutionResourceError::ContinuationUnavailable),
+        )?;
+        let initial = unsafe {
+            crate::arch::x86_64::context::prepare_initial_kernel_continuation(
                 next_stack,
+                trusted_first_run_entry,
             )
         }
-        .map_err(ExecutionSwitchError::Context)
+        .map_err(ExecutionSwitchError::InitialContext)?;
+        unsafe { crate::arch::x86_64::context::KernelSwitchPlan::new_initial(current_rsp_out, initial) }
+            .map_err(ExecutionSwitchError::Context)
     }
 
     pub(crate) fn stack_bounds(
