@@ -164,6 +164,32 @@ impl<const CAPACITY: usize> DeadlineQueue<CAPACITY> {
             .ok_or(DeadlineQueueError::StaleRegistration)
     }
 
+    /// Cancels a deadline if this exact registration is still queued.
+    ///
+    /// `Ok(None)` means the exact generation was already consumed by expiry,
+    /// or the slot has since advanced beyond it. This is the normal cleanup
+    /// case when a signal and timer interrupt race and signal wins the separate
+    /// blocked-operation winner ledger. Foreign authority still fails closed.
+    pub(crate) fn cancel_if_live(
+        &mut self,
+        registration: DeadlineRegistration,
+    ) -> Result<Option<BlockWakeKey>, DeadlineQueueError> {
+        if registration.domain != self.domain {
+            return Err(DeadlineQueueError::ForeignRegistration);
+        }
+        let slot = self
+            .slots
+            .get_mut(usize::from(registration.slot))
+            .ok_or(DeadlineQueueError::StaleRegistration)?;
+        if slot.generation < registration.generation {
+            return Err(DeadlineQueueError::StaleRegistration);
+        }
+        if slot.generation > registration.generation {
+            return Ok(None);
+        }
+        Ok(slot.entry.take().map(|entry| entry.wake))
+    }
+
     pub(crate) fn earliest(&self) -> Option<u64> {
         self.slots
             .iter()
@@ -232,6 +258,22 @@ mod tests {
         assert_eq!(queue.expire(20, &mut expired), 2);
         assert_eq!(queue.earliest(), Some(40));
         assert!(queue.cancel(replacement).is_ok());
+    }
+
+    #[test]
+    fn cancel_if_live_distinguishes_foreign_authority_from_consumed_generation() {
+        let mut queue = DeadlineQueue::<1>::new();
+        let registration = queue.register(10, wake_key()).unwrap();
+        let mut expired = [None; 1];
+        assert_eq!(queue.expire(10, &mut expired), 1);
+
+        let replacement_wake = wake_key();
+        let replacement = queue.register(20, replacement_wake).unwrap();
+        assert_eq!(queue.cancel_if_live(registration).unwrap(), None);
+        assert_eq!(
+            queue.cancel_if_live(replacement).unwrap(),
+            Some(replacement_wake)
+        );
     }
 
     #[test]

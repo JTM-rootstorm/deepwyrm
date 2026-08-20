@@ -21,6 +21,37 @@ use super::{
 pub(crate) const WAIT_SET_LIMIT: usize = DW_WAIT_MANY_MAX_ITEMS as usize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WaitDeadline {
+    Now,
+    Finite(u64),
+    Infinite,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WaitDeadlineError {
+    Expired,
+    Capacity,
+    Fault,
+}
+
+/// Minimal deadline surface needed by the generic F7 wait transaction.
+///
+/// The target implementation is backed by F3's IRQ-safe live time service;
+/// host/model tests use a deterministic `DeadlineQueue` wrapper.
+pub(crate) trait WaitDeadlineAuthority {
+    fn register_wait_deadline(
+        &mut self,
+        deadline_ns: u64,
+        wake: BlockWakeKey,
+    ) -> Result<DeadlineRegistration, WaitDeadlineError>;
+
+    fn cancel_wait_deadline(
+        &mut self,
+        registration: DeadlineRegistration,
+    ) -> Result<(), WaitDeadlineError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WaitSelection {
     pub(crate) index: u32,
     pub(crate) observed: DwSignals,
@@ -356,13 +387,16 @@ pub(crate) enum WaitBeginError {
     Scheduler(SchedulerError),
     Blocked(BlockedOperationError),
     Operation(WaitOperationError),
+    Deadline(WaitDeadlineError),
 }
 
 pub(crate) enum WaitBeginOutcome<OUTPUT> {
     Ready {
         output: OUTPUT,
-        deadline: Option<DeadlineRegistration>,
         selection: WaitSelection,
+    },
+    TimedOut {
+        output: OUTPUT,
     },
     Suspended {
         wake: BlockWakeKey,
@@ -373,7 +407,6 @@ pub(crate) enum WaitBeginOutcome<OUTPUT> {
 pub(crate) struct WaitBeginFailure<OUTPUT> {
     pub(crate) error: WaitBeginError,
     pub(crate) output: OUTPUT,
-    pub(crate) deadline: Option<DeadlineRegistration>,
 }
 
 pub(crate) struct WaitBeginContext<
@@ -404,6 +437,7 @@ pub(crate) struct WaitBeginContext<
     >,
     pub(crate) execution: &'a ExecutionDomain<EXECUTION>,
     pub(crate) operations: &'a mut WaitOperationRegistry<OUTPUT, EXECUTION>,
+    pub(crate) deadline_authority: Option<&'a mut dyn WaitDeadlineAuthority>,
     pub(crate) process: ProcessKey,
     pub(crate) thread: ThreadKey,
 }
@@ -423,7 +457,7 @@ pub(crate) fn begin_registered_wait<
 >(
     set: ResolvedWaitSet,
     output: OUTPUT,
-    deadline: Option<DeadlineRegistration>,
+    deadline: WaitDeadline,
     context: WaitBeginContext<
         '_,
         OUTPUT,
@@ -444,9 +478,30 @@ pub(crate) fn begin_registered_wait<
         sources,
         execution,
         operations,
+        mut deadline_authority,
         process,
         thread,
     } = context;
+
+    match set.select_ready(&sources) {
+        Ok(Some(selection)) => {
+            set.release(registry);
+            return Ok(WaitBeginOutcome::Ready { output, selection });
+        }
+        Ok(None) => {}
+        Err(error) => {
+            set.release(registry);
+            return Err(WaitBeginFailure {
+                error: WaitBeginError::Set(error),
+                output,
+            });
+        }
+    }
+    if deadline == WaitDeadline::Now {
+        set.release(registry);
+        return Ok(WaitBeginOutcome::TimedOut { output });
+    }
+
     let block = match execution.prepare_block_current(thread) {
         Ok(block) => block,
         Err(error) => {
@@ -454,7 +509,6 @@ pub(crate) fn begin_registered_wait<
             return Err(WaitBeginFailure {
                 error: WaitBeginError::Scheduler(error),
                 output,
-                deadline,
             });
         }
     };
@@ -478,12 +532,89 @@ pub(crate) fn begin_registered_wait<
             return Err(WaitBeginFailure {
                 error: WaitBeginError::Blocked(error),
                 output,
-                deadline,
             });
         }
     };
+
+    let deadline_registration = match deadline {
+        WaitDeadline::Now => unreachable!("NOW wait returned before block preparation"),
+        WaitDeadline::Infinite => None,
+        WaitDeadline::Finite(deadline_ns) => {
+            let Some(authority) = deadline_authority.as_mut() else {
+                blocked
+                    .complete_with(
+                        execution.blocked_operations(),
+                        BlockedOperationWinner::Cancelled,
+                        |()| (),
+                    )
+                    .unwrap_or_else(|failure| {
+                        panic!("F7 missing deadline authority cleanup drifted: {failure:?}")
+                    });
+                execution.cancel_block(block).unwrap_or_else(|failure| {
+                    panic!(
+                        "F7 missing deadline authority block rollback drifted: {:?}",
+                        failure.error()
+                    )
+                });
+                set.release(registry);
+                return Err(WaitBeginFailure {
+                    error: WaitBeginError::Deadline(WaitDeadlineError::Fault),
+                    output,
+                });
+            };
+            match (**authority).register_wait_deadline(deadline_ns, wake) {
+                Ok(registration) => Some(registration),
+                Err(WaitDeadlineError::Expired) => {
+                    blocked
+                        .complete_with(
+                            execution.blocked_operations(),
+                            BlockedOperationWinner::Timeout,
+                            |()| (),
+                        )
+                        .unwrap_or_else(|failure| {
+                            panic!("F7 expired deadline completion drifted: {failure:?}")
+                        });
+                    execution.cancel_block(block).unwrap_or_else(|failure| {
+                        panic!(
+                            "F7 expired deadline block rollback drifted: {:?}",
+                            failure.error()
+                        )
+                    });
+                    set.release(registry);
+                    return Ok(WaitBeginOutcome::TimedOut { output });
+                }
+                Err(error) => {
+                    blocked
+                        .complete_with(
+                            execution.blocked_operations(),
+                            BlockedOperationWinner::Cancelled,
+                            |()| (),
+                        )
+                        .unwrap_or_else(|failure| {
+                            panic!("F7 deadline-registration cleanup drifted: {failure:?}")
+                        });
+                    execution.cancel_block(block).unwrap_or_else(|failure| {
+                        panic!(
+                            "F7 deadline failure block rollback drifted: {:?}",
+                            failure.error()
+                        )
+                    });
+                    set.release(registry);
+                    return Err(WaitBeginFailure {
+                        error: WaitBeginError::Deadline(error),
+                        output,
+                    });
+                }
+            }
+        }
+    };
+
     let mut operation = Some(WaitOperation::new(
-        process, thread, blocked, output, deadline,
+        process,
+        thread,
+        blocked,
+        output,
+        deadline_registration,
     ));
     if let Err(error) = operations.publish(&mut operation) {
         let operation = operation
@@ -497,6 +628,9 @@ pub(crate) fn begin_registered_wait<
             .unwrap_or_else(|failure| {
                 panic!("unpublished F7 operation cleanup drifted: {failure:?}")
             });
+        cancel_deadline_exact(&mut deadline_authority, deadline).unwrap_or_else(|failure| {
+            panic!("F7 unpublished deadline cleanup drifted: {failure:?}")
+        });
         execution.cancel_block(block).unwrap_or_else(|failure| {
             panic!(
                 "fresh F7 block preparation failed rollback: {:?}",
@@ -507,7 +641,6 @@ pub(crate) fn begin_registered_wait<
         return Err(WaitBeginFailure {
             error: WaitBeginError::Operation(error),
             output,
-            deadline,
         });
     }
     debug_assert!(operation.is_none());
@@ -525,6 +658,8 @@ pub(crate) fn begin_registered_wait<
                 .unwrap_or_else(|failure| {
                     panic!("F7 ready rollback completion drifted: {failure:?}")
                 });
+            cancel_deadline_exact(&mut deadline_authority, deadline)
+                .unwrap_or_else(|failure| panic!("F7 ready deadline cleanup drifted: {failure:?}"));
             execution.cancel_block(block).unwrap_or_else(|failure| {
                 panic!(
                     "F7 ready rollback block cancellation drifted: {:?}",
@@ -532,18 +667,85 @@ pub(crate) fn begin_registered_wait<
                 )
             });
             set.release(registry);
-            Ok(WaitBeginOutcome::Ready {
-                output,
-                deadline,
-                selection,
-            })
+            Ok(WaitBeginOutcome::Ready { output, selection })
         }
         Ok(None) => {
-            set.release(registry);
-            let decision = execution.commit_block(block).unwrap_or_else(|failure| {
-                panic!("F7 registered block commit drifted: {:?}", failure.error())
-            });
-            Ok(WaitBeginOutcome::Suspended { wake, decision })
+            // A finite deadline may expire in IRQ context after registration but
+            // before the scheduler transition. The winner ledger closes that
+            // window: observe it before committing Blocked.
+            match execution.blocked_operations().winner(wake) {
+                Ok(Some(BlockedOperationWinner::Timeout)) => {
+                    release_cancelled_generation(registry, sources.waits.cancel_generation(wake));
+                    let operation = operations
+                        .take_wake(wake)
+                        .expect("pre-block timeout retains its wait operation");
+                    let (output, deadline) = operation
+                        .complete(
+                            execution.blocked_operations(),
+                            BlockedOperationWinner::Timeout,
+                        )
+                        .unwrap_or_else(|failure| {
+                            panic!("F7 pre-block timeout completion drifted: {failure:?}")
+                        });
+                    cancel_deadline_exact(&mut deadline_authority, deadline).unwrap_or_else(
+                        |failure| panic!("F7 pre-block deadline cleanup drifted: {failure:?}"),
+                    );
+                    execution.cancel_block(block).unwrap_or_else(|failure| {
+                        panic!(
+                            "F7 pre-block timeout cancellation drifted: {:?}",
+                            failure.error()
+                        )
+                    });
+                    set.release(registry);
+                    Ok(WaitBeginOutcome::TimedOut { output })
+                }
+                Ok(Some(BlockedOperationWinner::Signal {
+                    item_index,
+                    observed,
+                })) => {
+                    release_cancelled_generation(registry, sources.waits.cancel_generation(wake));
+                    let operation = operations
+                        .take_wake(wake)
+                        .expect("pre-block signal retains its wait operation");
+                    let winner = BlockedOperationWinner::Signal {
+                        item_index,
+                        observed,
+                    };
+                    let (output, deadline) = operation
+                        .complete(execution.blocked_operations(), winner)
+                        .unwrap_or_else(|failure| {
+                            panic!("F7 pre-block signal completion drifted: {failure:?}")
+                        });
+                    cancel_deadline_exact(&mut deadline_authority, deadline).unwrap_or_else(
+                        |failure| {
+                            panic!("F7 pre-block signal deadline cleanup drifted: {failure:?}")
+                        },
+                    );
+                    execution.cancel_block(block).unwrap_or_else(|failure| {
+                        panic!(
+                            "F7 pre-block signal cancellation drifted: {:?}",
+                            failure.error()
+                        )
+                    });
+                    set.release(registry);
+                    Ok(WaitBeginOutcome::Ready {
+                        output,
+                        selection: WaitSelection {
+                            index: item_index,
+                            observed,
+                        },
+                    })
+                }
+                Ok(Some(other)) => panic!("unexpected F7 winner before block commit: {other:?}"),
+                Ok(None) => {
+                    set.release(registry);
+                    let decision = execution.commit_block(block).unwrap_or_else(|failure| {
+                        panic!("F7 registered block commit drifted: {:?}", failure.error())
+                    });
+                    Ok(WaitBeginOutcome::Suspended { wake, decision })
+                }
+                Err(error) => panic!("fresh F7 winner ledger disappeared: {error:?}"),
+            }
         }
         Err(error) => {
             let operation = operations
@@ -557,6 +759,9 @@ pub(crate) fn begin_registered_wait<
                 .unwrap_or_else(|failure| {
                     panic!("F7 failed publication cleanup drifted: {failure:?}")
                 });
+            cancel_deadline_exact(&mut deadline_authority, deadline).unwrap_or_else(|failure| {
+                panic!("F7 failed deadline cleanup drifted: {failure:?}")
+            });
             execution.cancel_block(block).unwrap_or_else(|failure| {
                 panic!(
                     "F7 failed publication block cancellation drifted: {:?}",
@@ -567,9 +772,73 @@ pub(crate) fn begin_registered_wait<
             Err(WaitBeginFailure {
                 error: WaitBeginError::Set(error),
                 output,
-                deadline,
             })
         }
+    }
+}
+
+fn cancel_deadline_exact(
+    authority: &mut Option<&mut dyn WaitDeadlineAuthority>,
+    registration: Option<DeadlineRegistration>,
+) -> Result<(), WaitDeadlineError> {
+    let Some(registration) = registration else {
+        return Ok(());
+    };
+    let Some(authority) = authority.as_mut() else {
+        return Err(WaitDeadlineError::Fault);
+    };
+    (**authority).cancel_wait_deadline(registration)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WaitFinishError {
+    MissingWinner,
+    Blocked(BlockedOperationError),
+    Operation(WaitOperationError),
+    Deadline(WaitDeadlineError),
+}
+
+pub(crate) fn finish_wait_operation<
+    OUTPUT,
+    const OBJECTS: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    waits: &WaitRegistry<WAITERS>,
+    execution: &ExecutionDomain<EXECUTION>,
+    operations: &mut WaitOperationRegistry<OUTPUT, EXECUTION>,
+    mut deadline_authority: Option<&mut dyn WaitDeadlineAuthority>,
+    wake: BlockWakeKey,
+) -> Result<(OUTPUT, BlockedOperationWinner), WaitFinishError> {
+    let operation = operations
+        .take_wake(wake)
+        .map_err(WaitFinishError::Operation)?;
+    let winner = operation
+        .winner(execution.blocked_operations())
+        .map_err(WaitFinishError::Blocked)?
+        .ok_or(WaitFinishError::MissingWinner)?;
+    release_cancelled_generation(registry, waits.cancel_generation(wake));
+    let (output, deadline) = operation
+        .complete(execution.blocked_operations(), winner)
+        .map_err(WaitFinishError::Blocked)?;
+    cancel_deadline_exact(&mut deadline_authority, deadline).map_err(WaitFinishError::Deadline)?;
+    Ok((output, winner))
+}
+
+pub(crate) fn claim_timeout_and_wake<const EXECUTION: usize>(
+    execution: &ExecutionDomain<EXECUTION>,
+    wake: BlockWakeKey,
+) -> Result<bool, BlockedOperationError> {
+    if !execution
+        .blocked_operations()
+        .try_claim_winner(wake, BlockedOperationWinner::Timeout)?
+    {
+        return Ok(false);
+    }
+    match execution.wake(wake) {
+        Ok(()) | Err(SchedulerError::StaleBlockToken) => Ok(true),
+        Err(error) => panic!("F7 timeout wake violated scheduler ownership: {error:?}"),
     }
 }
 
@@ -746,7 +1015,7 @@ mod tests {
         match begin_registered_wait(
             set,
             0x55,
-            None,
+            WaitDeadline::Infinite,
             WaitBeginContext {
                 registry: &mut registry,
                 sources: WaitSources {
@@ -757,23 +1026,20 @@ mod tests {
                 },
                 execution: &execution,
                 operations: &mut operations,
+                deadline_authority: None,
                 process,
                 thread,
             },
         )
         .unwrap_or_else(|failure| panic!("wait begin failed: {:?}", failure.error))
         {
-            WaitBeginOutcome::Ready {
-                output,
-                deadline,
-                selection,
-            } => {
+            WaitBeginOutcome::Ready { output, selection } => {
                 assert_eq!(output, 0x55);
-                assert!(deadline.is_none());
                 assert_eq!(selection.index, 0);
                 assert_eq!(selection.observed, DW_SIGNAL_SIGNALED);
             }
             WaitBeginOutcome::Suspended { .. } => panic!("ready registration barrier blocked"),
+            WaitBeginOutcome::TimedOut { .. } => panic!("infinite ready wait timed out"),
         }
         assert_eq!(
             execution.scheduler_state(thread),
@@ -810,7 +1076,7 @@ mod tests {
         let wake = match begin_registered_wait(
             set,
             0x77,
-            None,
+            WaitDeadline::Infinite,
             WaitBeginContext {
                 registry: &mut registry,
                 sources: WaitSources {
@@ -821,6 +1087,7 @@ mod tests {
                 },
                 execution: &execution,
                 operations: &mut operations,
+                deadline_authority: None,
                 process,
                 thread,
             },
@@ -833,6 +1100,7 @@ mod tests {
                 wake
             }
             WaitBeginOutcome::Ready { .. } => panic!("unsignaled Event did not block"),
+            WaitBeginOutcome::TimedOut { .. } => panic!("infinite Event wait timed out"),
         };
         assert_eq!(
             execution.scheduler_state(thread),
@@ -880,6 +1148,282 @@ mod tests {
         assert!(deadline.is_none());
         assert_eq!(operations.len(), 0);
         assert_eq!(execution.schedule_next().unwrap().current, Some(thread));
+        close_event(&mut registry, &mut tasks, &events, process, event);
+    }
+
+    struct HostDeadline<const N: usize> {
+        queue: crate::time::DeadlineQueue<N>,
+    }
+
+    impl<const N: usize> HostDeadline<N> {
+        fn new() -> Self {
+            Self {
+                queue: crate::time::DeadlineQueue::new(),
+            }
+        }
+    }
+
+    impl<const N: usize> WaitDeadlineAuthority for HostDeadline<N> {
+        fn register_wait_deadline(
+            &mut self,
+            deadline_ns: u64,
+            wake: BlockWakeKey,
+        ) -> Result<DeadlineRegistration, WaitDeadlineError> {
+            self.queue
+                .register(deadline_ns, wake)
+                .map_err(|error| match error {
+                    crate::time::DeadlineQueueError::Capacity => WaitDeadlineError::Capacity,
+                    _ => WaitDeadlineError::Fault,
+                })
+        }
+
+        fn cancel_wait_deadline(
+            &mut self,
+            registration: DeadlineRegistration,
+        ) -> Result<(), WaitDeadlineError> {
+            self.queue
+                .cancel_if_live(registration)
+                .map(|_| ())
+                .map_err(|_| WaitDeadlineError::Fault)
+        }
+    }
+
+    struct PreclaimDeadline<'a> {
+        queue: crate::time::DeadlineQueue<1>,
+        ledger: &'a crate::task::BlockedOperationRegistry<1>,
+    }
+
+    impl WaitDeadlineAuthority for PreclaimDeadline<'_> {
+        fn register_wait_deadline(
+            &mut self,
+            deadline_ns: u64,
+            wake: BlockWakeKey,
+        ) -> Result<DeadlineRegistration, WaitDeadlineError> {
+            let registration = self
+                .queue
+                .register(deadline_ns, wake)
+                .map_err(|_| WaitDeadlineError::Fault)?;
+            assert!(
+                self.ledger
+                    .try_claim_winner(wake, BlockedOperationWinner::Timeout)
+                    .unwrap()
+            );
+            Ok(registration)
+        }
+
+        fn cancel_wait_deadline(
+            &mut self,
+            registration: DeadlineRegistration,
+        ) -> Result<(), WaitDeadlineError> {
+            self.queue
+                .cancel_if_live(registration)
+                .map(|_| ())
+                .map_err(|_| WaitDeadlineError::Fault)
+        }
+    }
+
+    #[test]
+    fn now_deadline_preserves_ready_before_timeout_order() {
+        let (mut registry, mut tasks, execution, process, thread) = running_fixture();
+        let events = Events::new();
+        let channels = Channels::new();
+        let waits = Waits::new();
+        let (event_key, event) = install_event(&mut registry, &mut tasks, &events, process);
+        let request = [DwWaitItemV1 {
+            handle: event,
+            signals: DW_SIGNAL_SIGNALED,
+        }];
+        assert_eq!(
+            events
+                .signal(event_key, DwSignals(0), DW_SIGNAL_SIGNALED, &waits)
+                .unwrap()
+                .len(),
+            0
+        );
+        let set = ResolvedWaitSet::resolve(&tasks, &mut registry, process, &request).unwrap();
+        let mut operations = WaitOperationRegistry::<u32, 1>::new();
+        match begin_registered_wait(
+            set,
+            0x91,
+            WaitDeadline::Now,
+            WaitBeginContext {
+                registry: &mut registry,
+                sources: WaitSources {
+                    tasks: &tasks,
+                    events: &events,
+                    channels: &channels,
+                    waits: &waits,
+                },
+                execution: &execution,
+                operations: &mut operations,
+                deadline_authority: None,
+                process,
+                thread,
+            },
+        )
+        .unwrap_or_else(|failure| panic!("ready NOW wait failed: {:?}", failure.error))
+        {
+            WaitBeginOutcome::Ready { output, selection } => {
+                assert_eq!(output, 0x91);
+                assert_eq!(selection.index, 0);
+                assert_eq!(selection.observed, DW_SIGNAL_SIGNALED);
+            }
+            _ => panic!("ready signal must beat NOW deadline"),
+        }
+        let cleared = events
+            .signal(event_key, DW_SIGNAL_SIGNALED, DwSignals(0), &waits)
+            .unwrap();
+        assert_eq!(cleared.len(), 0);
+        let set = ResolvedWaitSet::resolve(&tasks, &mut registry, process, &request).unwrap();
+        match begin_registered_wait(
+            set,
+            0x92,
+            WaitDeadline::Now,
+            WaitBeginContext {
+                registry: &mut registry,
+                sources: WaitSources {
+                    tasks: &tasks,
+                    events: &events,
+                    channels: &channels,
+                    waits: &waits,
+                },
+                execution: &execution,
+                operations: &mut operations,
+                deadline_authority: None,
+                process,
+                thread,
+            },
+        )
+        .unwrap_or_else(|failure| panic!("NOW timeout failed: {:?}", failure.error))
+        {
+            WaitBeginOutcome::TimedOut { output } => assert_eq!(output, 0x92),
+            _ => panic!("unsignaled NOW wait must time out"),
+        }
+        assert_eq!(
+            execution.scheduler_state(thread),
+            Some(SchedulerThreadState::Running)
+        );
+        assert_eq!(waits.len(), 0);
+        assert_eq!(operations.len(), 0);
+        close_event(&mut registry, &mut tasks, &events, process, event);
+    }
+
+    #[test]
+    fn finite_deadline_wakes_blocked_generation_and_resume_consumes_expired_token() {
+        let (mut registry, mut tasks, execution, process, thread) = running_fixture();
+        let events = Events::new();
+        let channels = Channels::new();
+        let waits = Waits::new();
+        let (_event_key, event) = install_event(&mut registry, &mut tasks, &events, process);
+        let request = [DwWaitItemV1 {
+            handle: event,
+            signals: DW_SIGNAL_SIGNALED,
+        }];
+        let set = ResolvedWaitSet::resolve(&tasks, &mut registry, process, &request).unwrap();
+        let mut operations = WaitOperationRegistry::<u32, 1>::new();
+        let mut deadlines = HostDeadline::<2>::new();
+        let wake = match begin_registered_wait(
+            set,
+            0xa1,
+            WaitDeadline::Finite(50),
+            WaitBeginContext {
+                registry: &mut registry,
+                sources: WaitSources {
+                    tasks: &tasks,
+                    events: &events,
+                    channels: &channels,
+                    waits: &waits,
+                },
+                execution: &execution,
+                operations: &mut operations,
+                deadline_authority: Some(&mut deadlines),
+                process,
+                thread,
+            },
+        )
+        .unwrap_or_else(|failure| panic!("finite wait begin failed: {:?}", failure.error))
+        {
+            WaitBeginOutcome::Suspended { wake, .. } => wake,
+            _ => panic!("finite unsignaled wait must suspend"),
+        };
+        assert_eq!(
+            execution.scheduler_state(thread),
+            Some(SchedulerThreadState::Blocked)
+        );
+        assert_eq!(deadlines.queue.earliest(), Some(50));
+        let mut expired = [None; 2];
+        assert_eq!(deadlines.queue.expire(50, &mut expired), 1);
+        assert_eq!(expired[0], Some(wake));
+        assert!(claim_timeout_and_wake(&execution, wake).unwrap());
+        assert_eq!(
+            execution.scheduler_state(thread),
+            Some(SchedulerThreadState::Runnable)
+        );
+        let (output, winner) = finish_wait_operation(
+            &mut registry,
+            &waits,
+            &execution,
+            &mut operations,
+            Some(&mut deadlines),
+            wake,
+        )
+        .unwrap();
+        assert_eq!(output, 0xa1);
+        assert_eq!(winner, BlockedOperationWinner::Timeout);
+        assert_eq!(waits.len(), 0);
+        assert_eq!(operations.len(), 0);
+        assert_eq!(execution.schedule_next().unwrap().current, Some(thread));
+        close_event(&mut registry, &mut tasks, &events, process, event);
+    }
+
+    #[test]
+    fn timeout_claim_between_registration_and_block_commit_returns_without_blocking() {
+        let (mut registry, mut tasks, execution, process, thread) = running_fixture();
+        let events = Events::new();
+        let channels = Channels::new();
+        let waits = Waits::new();
+        let (_event_key, event) = install_event(&mut registry, &mut tasks, &events, process);
+        let request = [DwWaitItemV1 {
+            handle: event,
+            signals: DW_SIGNAL_SIGNALED,
+        }];
+        let set = ResolvedWaitSet::resolve(&tasks, &mut registry, process, &request).unwrap();
+        let mut operations = WaitOperationRegistry::<u32, 1>::new();
+        let mut deadlines = PreclaimDeadline {
+            queue: crate::time::DeadlineQueue::new(),
+            ledger: execution.blocked_operations(),
+        };
+        match begin_registered_wait(
+            set,
+            0xb1,
+            WaitDeadline::Finite(70),
+            WaitBeginContext {
+                registry: &mut registry,
+                sources: WaitSources {
+                    tasks: &tasks,
+                    events: &events,
+                    channels: &channels,
+                    waits: &waits,
+                },
+                execution: &execution,
+                operations: &mut operations,
+                deadline_authority: Some(&mut deadlines),
+                process,
+                thread,
+            },
+        )
+        .unwrap_or_else(|failure| panic!("pre-block timeout failed: {:?}", failure.error))
+        {
+            WaitBeginOutcome::TimedOut { output } => assert_eq!(output, 0xb1),
+            _ => panic!("pre-block timeout winner must avoid entering Blocked"),
+        }
+        assert_eq!(
+            execution.scheduler_state(thread),
+            Some(SchedulerThreadState::Running)
+        );
+        assert_eq!(waits.len(), 0);
+        assert_eq!(operations.len(), 0);
+        assert_eq!(deadlines.queue.earliest(), None);
         close_event(&mut registry, &mut tasks, &events, process, event);
     }
 }
