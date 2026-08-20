@@ -8,8 +8,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use deepwyrm_abi::{
     DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_EVENT, DW_OBJECT_TYPE_PROCESS, DW_OBJECT_TYPE_THREAD,
-    DW_RIGHT_WAIT, DW_SIGNAL_EXITED, DW_SIGNAL_SIGNALED, DW_TASK_STATE_EXITED, DwSignals,
-    dw_signals_are_compatible,
+    DW_OBJECT_TYPE_TIMER, DW_RIGHT_WAIT, DW_SIGNAL_EXITED, DW_SIGNAL_SIGNALED,
+    DW_TASK_STATE_EXITED, DwSignals, dw_signals_are_compatible,
 };
 
 use crate::handle::ResolvedHandle;
@@ -18,8 +18,12 @@ use crate::object::{
     CreationRef, FinalRelease, HandleRef, InternalRef, ObjectId, ObjectRegistry,
     ObjectRegistryError,
 };
-use crate::sync::SpinMutex;
-use crate::task::{BlockWakeKey, ProcessKey, TaskAuthority, ThreadKey};
+use crate::sync::{IrqSpinMutex, SpinMutex};
+use crate::task::{
+    BlockWakeKey, BlockedOperationError, BlockedOperationWinner, ExecutionDomain, ProcessKey,
+    SchedulerError, TaskAuthority, ThreadKey,
+};
+use crate::time::{TimerAuthority, TimerKey};
 
 static NEXT_WAIT_DOMAIN: AtomicU64 = AtomicU64::new(1);
 
@@ -345,11 +349,13 @@ pub(crate) fn current_signals_for<
     const THREADS: usize,
     const HANDLES: usize,
     const EVENTS: usize,
+    const TIMERS: usize,
     const CHANNEL_PAIRS: usize,
     const CHANNEL_DEPTH: usize,
 >(
     tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     events: &EventAuthority<EVENTS>,
+    timers: &TimerAuthority<TIMERS>,
     channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
     target: &ResolvedHandle,
 ) -> Result<DwSignals, WaitError> {
@@ -377,6 +383,9 @@ pub(crate) fn current_signals_for<
         DW_OBJECT_TYPE_EVENT => {
             events.current_signals(EventKey::from_object_id(target.object_id()))
         }
+        DW_OBJECT_TYPE_TIMER => timers
+            .current_signals(TimerKey::from_object_id(target.object_id()))
+            .map_err(|_| WaitError::InvalidObject),
         DW_OBJECT_TYPE_CHANNEL => channels
             .current_signals(ChannelEndpointKey::from_object_id(target.object_id()))
             .map_err(|_| WaitError::InvalidObject),
@@ -511,16 +520,53 @@ impl<const CAPACITY: usize> WakeBatch<CAPACITY> {
     }
 }
 
+/// Completes signal wake intents from IRQ context without touching ObjectRegistry.
+///
+/// Timer expiry uses `ready_wakes`, which deliberately leaves registrations and
+/// their generic pins owned by the blocked syscall. Resume or terminal cleanup
+/// later consumes those resources. Any pin in this batch is therefore a kernel bug.
+pub(crate) fn complete_irq_signal_wakes<const WAITERS: usize, const EXECUTION: usize>(
+    execution: &ExecutionDomain<EXECUTION>,
+    wakes: WakeBatch<WAITERS>,
+) {
+    let (wake_intents, pins) = wakes.into_parts();
+    assert!(
+        pins.into_iter().flatten().next().is_none(),
+        "IRQ Timer readiness must not consume wait-registration pins"
+    );
+    for wake in wake_intents.into_iter().flatten() {
+        let winner = BlockedOperationWinner::Signal {
+            item_index: wake.item_index(),
+            observed: wake.observed(),
+        };
+        match execution
+            .blocked_operations()
+            .try_claim_winner(wake.wake_key(), winner)
+        {
+            Ok(true) => match execution.wake(wake.wake_key()) {
+                Ok(()) | Err(SchedulerError::StaleBlockToken) => {}
+                Err(error) => {
+                    panic!("IRQ Timer wake violated scheduler ownership: {error:?}")
+                }
+            },
+            Ok(false) | Err(BlockedOperationError::StaleReservation) => {
+                // Timeout/terminal cleanup may have won after the readiness scan.
+            }
+            Err(error) => panic!("IRQ Timer winner arbitration failed: {error:?}"),
+        }
+    }
+}
+
 pub(crate) struct WaitRegistry<const CAPACITY: usize> {
     domain: u64,
-    slots: SpinMutex<[WaitSlot; CAPACITY]>,
+    slots: IrqSpinMutex<[WaitSlot; CAPACITY]>,
 }
 
 impl<const CAPACITY: usize> WaitRegistry<CAPACITY> {
     pub(crate) fn new() -> Self {
         Self {
             domain: mint_wait_domain(),
-            slots: SpinMutex::new(core::array::from_fn(|_| WaitSlot {
+            slots: IrqSpinMutex::new(core::array::from_fn(|_| WaitSlot {
                 generation: 0,
                 entry: None,
             })),
@@ -626,6 +672,48 @@ impl<const CAPACITY: usize> WaitRegistry<CAPACITY> {
                 .take()
                 .expect("matching wait generation entry remains present");
             batch.push_pin(entry.pin);
+        }
+        batch
+    }
+
+    /// Returns eligible signal wake intents without consuming registrations.
+    ///
+    /// Timer expiry uses this IRQ-safe snapshot after committing `SIGNALED`.
+    /// The blocked Thread still owns every registration pin; resume or terminal
+    /// cleanup later cancels the exact block generation and releases those pins
+    /// outside interrupt context. One intent is returned per block generation,
+    /// with the lowest matching duplicate item index selected deterministically.
+    pub(crate) fn ready_wakes(&self, object: ObjectId, observed: DwSignals) -> WakeBatch<CAPACITY> {
+        let slots = self.slots.lock();
+        let mut batch = WakeBatch::empty();
+        for candidate in slots.iter().filter_map(|slot| slot.entry.as_ref()) {
+            if candidate.identity.object != object || candidate.desired.0 & observed.0 == 0 {
+                continue;
+            }
+            let wake = candidate.identity.wake;
+            if batch.wakes[..batch.wake_len]
+                .iter()
+                .flatten()
+                .any(|intent| intent.wake == wake)
+            {
+                continue;
+            }
+            let winning_index = slots
+                .iter()
+                .filter_map(|slot| slot.entry.as_ref())
+                .filter(|entry| {
+                    entry.identity.wake == wake
+                        && entry.identity.object == object
+                        && entry.desired.0 & observed.0 != 0
+                })
+                .map(|entry| entry.item_index)
+                .min()
+                .expect("ready wait generation has at least one matching registration");
+            batch.push_wake(WakeIntent {
+                wake,
+                observed,
+                item_index: winning_index,
+            });
         }
         batch
     }

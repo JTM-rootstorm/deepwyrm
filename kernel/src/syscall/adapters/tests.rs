@@ -788,6 +788,377 @@ fn channel_send_reports_peer_closed_after_peer_finalization() {
 }
 
 #[test]
+fn timer_syscalls_preserve_validation_rights_and_level_state() {
+    use deepwyrm_abi::{
+        DW_DEADLINE_INFINITE, DW_OBJECT_TYPE_TIMER, DW_RIGHT_MODIFY, DW_RIGHT_WAIT,
+        DW_SIGNAL_SIGNALED, DwRights,
+    };
+
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let timers = TimerAuthority::<2>::new();
+    let waits = WaitRegistry::<2>::new();
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let mut deadlines = AdapterTimerDeadline::<2>::new(10);
+    let mut user = FakeUserMemory::new();
+    let mut cleanup = CleanupQueue::<16>::new();
+    let out = DwUserAddress(BASE + 0x1c0);
+    let generations = registry.test_slot_generations();
+
+    user.deny_write = true;
+    assert_eq!(
+        timer_create(
+            &mut user,
+            &mut registry,
+            &timers,
+            &mut tasks,
+            process,
+            DwRights(0),
+            out,
+            &mut cleanup,
+        ),
+        DW_STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(registry.test_slot_generations(), generations);
+
+    let full_rights = DwRights(DW_RIGHT_WAIT.0 | DW_RIGHT_MODIFY.0);
+    assert_eq!(
+        timer_create(
+            &mut user,
+            &mut registry,
+            &timers,
+            &mut tasks,
+            process,
+            full_rights,
+            out,
+            &mut cleanup,
+        ),
+        DW_STATUS_BAD_ADDRESS
+    );
+    assert_eq!(registry.test_slot_generations(), generations);
+
+    user.deny_write = false;
+    assert_eq!(
+        timer_create(
+            &mut user,
+            &mut registry,
+            &timers,
+            &mut tasks,
+            process,
+            full_rights,
+            out,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let timer = DwHandle(u64_at(&user, out.0));
+    let timer_pin = tasks
+        .process_handles(process)
+        .unwrap()
+        .lookup(
+            &mut registry,
+            timer,
+            AcceptedObjectTypes::One(DW_OBJECT_TYPE_TIMER),
+            DW_RIGHT_WAIT,
+        )
+        .unwrap();
+    let timer_key = TimerKey::from_object_id(timer_pin.object_id());
+    release_lookup_pin(&mut registry, timer_pin.into_internal(), &mut cleanup);
+    assert_eq!(
+        timers.current_signals(timer_key).unwrap(),
+        deepwyrm_abi::DwSignals(0)
+    );
+
+    assert_eq!(
+        timer_set(
+            &mut registry,
+            &timers,
+            &mut deadlines,
+            &waits,
+            &tasks,
+            &execution,
+            process,
+            DwHandle(u64::MAX),
+            DW_DEADLINE_INFINITE,
+            &mut cleanup,
+        ),
+        DW_STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        timer_set(
+            &mut registry,
+            &timers,
+            &mut deadlines,
+            &waits,
+            &tasks,
+            &execution,
+            process,
+            process_handle,
+            deepwyrm_abi::DwDeadline(100),
+            &mut cleanup,
+        ),
+        DW_STATUS_WRONG_OBJECT_TYPE
+    );
+    assert_eq!(
+        timer_set(
+            &mut registry,
+            &timers,
+            &mut deadlines,
+            &waits,
+            &tasks,
+            &execution,
+            process,
+            timer,
+            deepwyrm_abi::DwDeadline(100),
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(
+        timers.current_signals(timer_key).unwrap(),
+        deepwyrm_abi::DwSignals(0)
+    );
+    assert_eq!(deadlines.queue.earliest(), Some(100));
+
+    assert_eq!(
+        timer_set(
+            &mut registry,
+            &timers,
+            &mut deadlines,
+            &waits,
+            &tasks,
+            &execution,
+            process,
+            timer,
+            deepwyrm_abi::DwDeadline(10),
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(
+        timers.current_signals(timer_key).unwrap(),
+        DW_SIGNAL_SIGNALED
+    );
+    assert_eq!(deadlines.queue.earliest(), None);
+    assert_eq!(
+        timer_cancel(
+            &mut registry,
+            &timers,
+            &mut deadlines,
+            &tasks,
+            process,
+            timer,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(
+        timers.current_signals(timer_key).unwrap(),
+        deepwyrm_abi::DwSignals(0)
+    );
+
+    let second_out = DwUserAddress(BASE + 0x1d0);
+    assert_eq!(
+        timer_create(
+            &mut user,
+            &mut registry,
+            &timers,
+            &mut tasks,
+            process,
+            DW_RIGHT_WAIT,
+            second_out,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let wait_only = DwHandle(u64_at(&user, second_out.0));
+    assert_eq!(
+        timer_set(
+            &mut registry,
+            &timers,
+            &mut deadlines,
+            &waits,
+            &tasks,
+            &execution,
+            process,
+            wait_only,
+            deepwyrm_abi::DwDeadline(200),
+            &mut cleanup,
+        ),
+        DW_STATUS_ACCESS_DENIED
+    );
+
+    for handle in [timer, wait_only] {
+        let release = tasks
+            .process_handles_mut(process)
+            .unwrap()
+            .close(&mut registry, handle)
+            .unwrap()
+            .expect("unarmed Timer handle is final");
+        let finalization = timers.take_finalization(release, &mut deadlines).unwrap();
+        crate::time::complete_timer_finalization(&mut registry, finalization);
+    }
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+}
+
+struct NativeTimerHarness<'a> {
+    user: &'a mut FakeUserMemory,
+    registry: &'a mut ObjectRegistry<16>,
+    timers: &'a TimerAuthority<2>,
+    deadlines: &'a mut AdapterTimerDeadline<2>,
+    waits: &'a WaitRegistry<2>,
+    tasks: &'a mut Tasks,
+    execution: &'a ExecutionDomain<1>,
+    process: ProcessKey,
+    cleanup: &'a mut CleanupQueue<16>,
+}
+
+impl crate::syscall::native::NativeSyscallHandler for NativeTimerHarness<'_> {
+    fn handle(
+        &mut self,
+        request: crate::syscall::native::NativeSyscallRequest,
+    ) -> crate::syscall::native::NativeSyscallResult {
+        let status = match request {
+            crate::syscall::native::NativeSyscallRequest::TimerCreate {
+                requested_rights,
+                out_timer,
+            } => timer_create(
+                self.user,
+                self.registry,
+                self.timers,
+                self.tasks,
+                self.process,
+                requested_rights,
+                out_timer,
+                self.cleanup,
+            ),
+            crate::syscall::native::NativeSyscallRequest::TimerSet { timer, deadline } => {
+                timer_set(
+                    self.registry,
+                    self.timers,
+                    self.deadlines,
+                    self.waits,
+                    self.tasks,
+                    self.execution,
+                    self.process,
+                    timer,
+                    deadline,
+                    self.cleanup,
+                )
+            }
+            crate::syscall::native::NativeSyscallRequest::TimerCancel { timer } => timer_cancel(
+                self.registry,
+                self.timers,
+                self.deadlines,
+                self.tasks,
+                self.process,
+                timer,
+                self.cleanup,
+            ),
+            _ => panic!("native F8 harness received a non-Timer request"),
+        };
+        crate::syscall::native::NativeSyscallResult::returning(status)
+    }
+}
+
+#[test]
+fn native_timer_ids_route_through_real_timer_transactions() {
+    use deepwyrm_abi::{DW_RIGHT_MODIFY, DW_RIGHT_WAIT, DwKnownSyscall, DwRights};
+
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let timers = TimerAuthority::<2>::new();
+    let waits = WaitRegistry::<2>::new();
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let mut deadlines = AdapterTimerDeadline::<2>::new(10);
+    let mut user = FakeUserMemory::new();
+    let mut cleanup = CleanupQueue::<16>::new();
+    let out = BASE + 0x1e0;
+
+    {
+        let mut harness = NativeTimerHarness {
+            user: &mut user,
+            registry: &mut registry,
+            timers: &timers,
+            deadlines: &mut deadlines,
+            waits: &waits,
+            tasks: &mut tasks,
+            execution: &execution,
+            process,
+            cleanup: &mut cleanup,
+        };
+        let create = crate::syscall::native::dispatch_native(
+            &mut harness,
+            DwKnownSyscall::TimerCreate.id(),
+            crate::syscall::RawSyscallArguments::new([
+                DwRights(DW_RIGHT_WAIT.0 | DW_RIGHT_MODIFY.0).0,
+                out,
+                0,
+                0,
+                0,
+                0,
+            ]),
+        );
+        assert_eq!(create.status, DW_STATUS_SUCCESS);
+        assert_eq!(create.control, SyscallControl::ReturnToCaller);
+    }
+    let timer = DwHandle(u64_at(&user, out));
+
+    {
+        let mut harness = NativeTimerHarness {
+            user: &mut user,
+            registry: &mut registry,
+            timers: &timers,
+            deadlines: &mut deadlines,
+            waits: &waits,
+            tasks: &mut tasks,
+            execution: &execution,
+            process,
+            cleanup: &mut cleanup,
+        };
+        for (syscall, arguments) in [
+            (DwKnownSyscall::TimerSet, [timer.0, 100, 0, 0, 0, 0]),
+            (DwKnownSyscall::TimerSet, [timer.0, 10, 0, 0, 0, 0]),
+            (DwKnownSyscall::TimerCancel, [timer.0, 0, 0, 0, 0, 0]),
+        ] {
+            let result = crate::syscall::native::dispatch_native(
+                &mut harness,
+                syscall.id(),
+                crate::syscall::RawSyscallArguments::new(arguments),
+            );
+            assert_eq!(result.status, DW_STATUS_SUCCESS, "{syscall:?}");
+            assert_eq!(result.control, SyscallControl::ReturnToCaller);
+        }
+    }
+
+    let release = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .close(&mut registry, timer)
+        .unwrap()
+        .expect("native Timer handle is final");
+    let finalization = timers.take_finalization(release, &mut deadlines).unwrap();
+    crate::time::complete_timer_finalization(&mut registry, finalization);
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+}
+
+#[test]
 fn event_signal_rejects_invalid_masks_and_missing_signal_right_before_mutation() {
     use deepwyrm_abi::{DW_OBJECT_TYPE_EVENT, DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED};
 
@@ -2945,6 +3316,77 @@ impl<const N: usize> AdapterDeadline<N> {
     }
 }
 
+struct AdapterTimerDeadline<const N: usize> {
+    now_ns: u64,
+    queue: crate::time::DeadlineQueue<N, crate::time::TimerExpiryToken>,
+}
+
+impl<const N: usize> AdapterTimerDeadline<N> {
+    fn new(now_ns: u64) -> Self {
+        Self {
+            now_ns,
+            queue: crate::time::DeadlineQueue::new(),
+        }
+    }
+
+    fn expire_at(&mut self, now_ns: u64) -> [Option<crate::time::TimerExpiryToken>; N] {
+        self.now_ns = now_ns;
+        let mut expired = core::array::from_fn(|_| None);
+        self.queue.expire(now_ns, &mut expired);
+        expired
+    }
+}
+
+impl<const N: usize> crate::time::TimerDeadlineAuthority for AdapterTimerDeadline<N> {
+    fn replace_timer_deadline(
+        &mut self,
+        old: Option<&crate::time::DeadlineRegistration>,
+        deadline_ns: u64,
+        token: crate::time::TimerExpiryToken,
+    ) -> Result<Option<crate::time::DeadlineRegistration>, crate::time::TimerDeadlineError> {
+        if deadline_ns <= self.now_ns {
+            if let Some(old) = old {
+                self.queue
+                    .cancel_if_live_ref(old)
+                    .map_err(|_| crate::time::TimerDeadlineError::Fault)?;
+            }
+            return Ok(None);
+        }
+        if let Some(old) = old
+            && let Some(registration) = self
+                .queue
+                .replace_if_live(old, deadline_ns, token)
+                .map_err(|error| match error {
+                    crate::time::DeadlineQueueError::Capacity => {
+                        crate::time::TimerDeadlineError::Capacity
+                    }
+                    _ => crate::time::TimerDeadlineError::Fault,
+                })?
+        {
+            return Ok(Some(registration));
+        }
+        self.queue
+            .register(deadline_ns, token)
+            .map(Some)
+            .map_err(|error| match error {
+                crate::time::DeadlineQueueError::Capacity => {
+                    crate::time::TimerDeadlineError::Capacity
+                }
+                _ => crate::time::TimerDeadlineError::Fault,
+            })
+    }
+
+    fn cancel_timer_deadline(
+        &mut self,
+        registration: crate::time::DeadlineRegistration,
+    ) -> Result<(), crate::time::TimerDeadlineError> {
+        self.queue
+            .cancel_if_live(registration)
+            .map(|_| ())
+            .map_err(|_| crate::time::TimerDeadlineError::Fault)
+    }
+}
+
 impl<const N: usize> crate::wait::engine::WaitDeadlineAuthority for AdapterDeadline<N> {
     fn register_wait_deadline(
         &mut self,
@@ -2980,6 +3422,7 @@ fn signal_timeout_race_has_exactly_one_winner_in_both_orders() {
         let (mut registry, mut tasks, execution, process, thread, process_handle) =
             wait_running_fixture();
         let events = EventAuthority::<1>::new();
+        let timers = TimerAuthority::<1>::new();
         let channels = ChannelAuthority::<1, 2>::new();
         let waits = WaitRegistry::<8>::new();
         let mut user = FakeUserMemory::new();
@@ -2997,6 +3440,7 @@ fn signal_timeout_race_has_exactly_one_winner_in_both_orders() {
             &mut registry,
             &tasks,
             &events,
+            &timers,
             &channels,
             &waits,
             &execution,
@@ -3104,6 +3548,7 @@ fn public_finite_wait_idles_then_timeout_resumes_in_place_and_discards_output() 
     let (mut registry, mut tasks, execution, process, thread, process_handle) =
         wait_running_fixture();
     let events = EventAuthority::<1>::new();
+    let timers = TimerAuthority::<1>::new();
     let channels = ChannelAuthority::<1, 2>::new();
     let waits = WaitRegistry::<8>::new();
     let mut user = FakeUserMemory::new();
@@ -3122,6 +3567,7 @@ fn public_finite_wait_idles_then_timeout_resumes_in_place_and_discards_output() 
         &mut registry,
         &tasks,
         &events,
+        &timers,
         &channels,
         &waits,
         &execution,
@@ -3199,6 +3645,7 @@ struct NativeWaitHarness<'a> {
     registry: &'a mut ObjectRegistry<16>,
     tasks: &'a Tasks,
     events: &'a EventAuthority<1>,
+    timers: &'a TimerAuthority<1>,
     channels: &'a ChannelAuthority<1, 2>,
     waits: &'a WaitRegistry<8>,
     execution: &'a ExecutionDomain<1>,
@@ -3224,6 +3671,7 @@ impl crate::syscall::native::NativeSyscallHandler for NativeWaitHarness<'_> {
                 self.registry,
                 self.tasks,
                 self.events,
+                self.timers,
                 self.channels,
                 self.waits,
                 self.execution,
@@ -3247,6 +3695,7 @@ impl crate::syscall::native::NativeSyscallHandler for NativeWaitHarness<'_> {
                 self.registry,
                 self.tasks,
                 self.events,
+                self.timers,
                 self.channels,
                 self.waits,
                 self.execution,
@@ -3276,6 +3725,7 @@ fn native_wait_ids_route_through_real_wait_transactions_and_resume_control() {
     let (mut registry, mut tasks, execution, process, thread, process_handle) =
         wait_running_fixture();
     let events = EventAuthority::<1>::new();
+    let timers = TimerAuthority::<1>::new();
     let channels = ChannelAuthority::<1, 2>::new();
     let waits = WaitRegistry::<8>::new();
     let mut user = FakeUserMemory::new();
@@ -3294,6 +3744,7 @@ fn native_wait_ids_route_through_real_wait_transactions_and_resume_control() {
             registry: &mut registry,
             tasks: &tasks,
             events: &events,
+            timers: &timers,
             channels: &channels,
             waits: &waits,
             execution: &execution,
@@ -3368,6 +3819,7 @@ fn native_wait_ids_route_through_real_wait_transactions_and_resume_control() {
             registry: &mut registry,
             tasks: &tasks,
             events: &events,
+            timers: &timers,
             channels: &channels,
             waits: &waits,
             execution: &execution,
@@ -3416,6 +3868,7 @@ fn public_wait_one_preflights_owned_output_before_handle_resolution_and_commits_
     let (mut registry, mut tasks, execution, process, thread, process_handle) =
         wait_running_fixture();
     let events = EventAuthority::<1>::new();
+    let timers = TimerAuthority::<1>::new();
     let channels = ChannelAuthority::<1, 2>::new();
     let waits = WaitRegistry::<8>::new();
     let mut user = FakeUserMemory::new();
@@ -3435,6 +3888,7 @@ fn public_wait_one_preflights_owned_output_before_handle_resolution_and_commits_
             &mut registry,
             &tasks,
             &events,
+            &timers,
             &channels,
             &waits,
             &execution,
@@ -3455,6 +3909,7 @@ fn public_wait_one_preflights_owned_output_before_handle_resolution_and_commits_
             &mut registry,
             &tasks,
             &events,
+            &timers,
             &channels,
             &waits,
             &execution,
@@ -3490,6 +3945,7 @@ fn public_wait_one_preflights_owned_output_before_handle_resolution_and_commits_
             &mut registry,
             &tasks,
             &events,
+            &timers,
             &channels,
             &waits,
             &execution,
@@ -3523,12 +3979,159 @@ fn public_wait_one_preflights_owned_output_before_handle_resolution_and_commits_
 }
 
 #[test]
+fn public_timer_wait_handles_level_ready_and_irq_expiry_resume() {
+    use deepwyrm_abi::{
+        DW_DEADLINE_INFINITE, DW_DEADLINE_NOW, DW_RIGHT_MODIFY, DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED,
+        DwRights,
+    };
+
+    let (mut registry, mut tasks, execution, process, thread, process_handle) =
+        wait_running_fixture();
+    let events = EventAuthority::<1>::new();
+    let timers = TimerAuthority::<1>::new();
+    let channels = ChannelAuthority::<1, 2>::new();
+    let waits = WaitRegistry::<8>::new();
+    let mut user = FakeUserMemory::new();
+    let mut deadlines = AdapterTimerDeadline::<2>::new(10);
+    let (timer_key, reference) = timers.create_timer(&mut registry).unwrap();
+    let timer = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(reference, DwRights(DW_RIGHT_WAIT.0 | DW_RIGHT_MODIFY.0))
+        .unwrap();
+    let mut operations = WaitOperationRegistry::<FakeOwnedOutput, 1>::new();
+
+    let immediate = timers
+        .set(
+            timer_key,
+            deepwyrm_abi::DwDeadline(10),
+            &mut deadlines,
+            &waits,
+        )
+        .unwrap();
+    assert_eq!(immediate.len(), 0);
+    let (wakes, pins) = immediate.into_parts();
+    assert!(wakes.into_iter().flatten().next().is_none());
+    assert!(pins.into_iter().flatten().next().is_none());
+
+    let ready_out = BASE + 0xc00;
+    assert_eq!(
+        wait_one_syscall(
+            &mut user,
+            &mut registry,
+            &tasks,
+            &events,
+            &timers,
+            &channels,
+            &waits,
+            &execution,
+            &mut operations,
+            None,
+            process,
+            thread,
+            timer,
+            DW_SIGNAL_SIGNALED,
+            DW_DEADLINE_NOW,
+            DwUserAddress(ready_out),
+        ),
+        WaitSyscallAction::Returning(DW_STATUS_SUCCESS)
+    );
+    assert_eq!(u64_at(&user, ready_out + 16), DW_SIGNAL_SIGNALED.0);
+
+    let reset = timers
+        .set(
+            timer_key,
+            deepwyrm_abi::DwDeadline(50),
+            &mut deadlines,
+            &waits,
+        )
+        .unwrap();
+    assert_eq!(reset.len(), 0);
+    let (wakes, pins) = reset.into_parts();
+    assert!(wakes.into_iter().flatten().next().is_none());
+    assert!(pins.into_iter().flatten().next().is_none());
+
+    let blocked_out = BASE + 0xc80;
+    let suspended = match wait_one_syscall(
+        &mut user,
+        &mut registry,
+        &tasks,
+        &events,
+        &timers,
+        &channels,
+        &waits,
+        &execution,
+        &mut operations,
+        None,
+        process,
+        thread,
+        timer,
+        DW_SIGNAL_SIGNALED,
+        DW_DEADLINE_INFINITE,
+        DwUserAddress(blocked_out),
+    ) {
+        WaitSyscallAction::Suspended(state) => state,
+        other => panic!("armed Timer wait did not suspend: {other:?}"),
+    };
+    assert_eq!(user.owned_outputs, 1);
+    assert_eq!(waits.len(), 1);
+
+    let mut expired = deadlines.expire_at(50).into_iter().flatten();
+    let token = expired.next().expect("future Timer arm expires once");
+    assert!(expired.next().is_none());
+    let wakes = timers.expire(token, &waits).unwrap();
+    assert_eq!(wakes.len(), 1);
+    assert_eq!(wakes.pin_len(), 0);
+    let mut cleanup = CleanupQueue::<16>::new();
+    crate::wait::complete_irq_signal_wakes(&execution, wakes);
+    assert_eq!(
+        resume_wait_syscall(
+            &mut user,
+            &mut registry,
+            &waits,
+            &execution,
+            &mut operations,
+            None,
+            suspended.wake_key(),
+            &mut cleanup,
+        )
+        .unwrap(),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(user.owned_outputs, 0);
+    assert_eq!(waits.len(), 0);
+    assert_eq!(u64_at(&user, blocked_out + 16), DW_SIGNAL_SIGNALED.0);
+
+    let final_release = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .close(&mut registry, timer)
+        .unwrap()
+        .expect("Timer handle is final after wait cleanup");
+    let finalization = timers
+        .take_finalization(final_release, &mut deadlines)
+        .unwrap();
+    crate::time::complete_timer_finalization(&mut registry, finalization);
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+}
+
+#[test]
 fn public_wait_one_suspend_keeps_owned_output_until_exact_resume() {
     use deepwyrm_abi::{DW_DEADLINE_INFINITE, DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED};
 
     let (mut registry, mut tasks, execution, process, thread, process_handle) =
         wait_running_fixture();
     let events = EventAuthority::<1>::new();
+    let timers = TimerAuthority::<1>::new();
     let channels = ChannelAuthority::<1, 2>::new();
     let waits = WaitRegistry::<8>::new();
     let mut user = FakeUserMemory::new();
@@ -3546,6 +4149,7 @@ fn public_wait_one_suspend_keeps_owned_output_until_exact_resume() {
         &mut registry,
         &tasks,
         &events,
+        &timers,
         &channels,
         &waits,
         &execution,
@@ -3616,6 +4220,7 @@ fn public_wait_one_observes_channel_writable_and_peer_closed() {
     let (mut registry, mut tasks, execution, process, thread, process_handle) =
         wait_running_fixture();
     let events = EventAuthority::<1>::new();
+    let timers = TimerAuthority::<1>::new();
     let channels = ChannelAuthority::<2, 4>::new();
     let waits = WaitRegistry::<8>::new();
     let mut user = FakeUserMemory::new();
@@ -3639,6 +4244,7 @@ fn public_wait_one_observes_channel_writable_and_peer_closed() {
             &mut registry,
             &tasks,
             &events,
+            &timers,
             &channels,
             &waits,
             &execution,
@@ -3669,6 +4275,7 @@ fn public_wait_one_observes_channel_writable_and_peer_closed() {
             &mut registry,
             &tasks,
             &events,
+            &timers,
             &channels,
             &waits,
             &execution,
@@ -3707,6 +4314,7 @@ fn repeated_duplicate_wait_many_signal_trace_selects_index_zero_once() {
     let (mut registry, mut tasks, execution, process, thread, process_handle) =
         wait_running_fixture();
     let events = EventAuthority::<1>::new();
+    let timers = TimerAuthority::<1>::new();
     let channels = ChannelAuthority::<1, 2>::new();
     let waits = WaitRegistry::<8>::new();
     let mut user = FakeUserMemory::new();
@@ -3729,6 +4337,7 @@ fn repeated_duplicate_wait_many_signal_trace_selects_index_zero_once() {
             &mut registry,
             &tasks,
             &events,
+            &timers,
             &channels,
             &waits,
             &execution,
@@ -3813,6 +4422,7 @@ fn public_wait_many_obeys_scalar_snapshot_output_then_handle_failure_order() {
     let (mut registry, mut tasks, execution, process, thread, process_handle) =
         wait_running_fixture();
     let events = EventAuthority::<1>::new();
+    let timers = TimerAuthority::<1>::new();
     let channels = ChannelAuthority::<1, 2>::new();
     let waits = WaitRegistry::<8>::new();
     let mut operations = WaitOperationRegistry::<FakeOwnedOutput, 1>::new();
@@ -3827,6 +4437,7 @@ fn public_wait_many_obeys_scalar_snapshot_output_then_handle_failure_order() {
             &mut registry,
             &tasks,
             &events,
+            &timers,
             &channels,
             &waits,
             &execution,
@@ -3850,6 +4461,7 @@ fn public_wait_many_obeys_scalar_snapshot_output_then_handle_failure_order() {
             &mut registry,
             &tasks,
             &events,
+            &timers,
             &channels,
             &waits,
             &execution,
@@ -3880,6 +4492,7 @@ fn public_wait_many_obeys_scalar_snapshot_output_then_handle_failure_order() {
             &mut registry,
             &tasks,
             &events,
+            &timers,
             &channels,
             &waits,
             &execution,
@@ -3904,6 +4517,7 @@ fn public_wait_many_obeys_scalar_snapshot_output_then_handle_failure_order() {
             &mut registry,
             &tasks,
             &events,
+            &timers,
             &channels,
             &waits,
             &execution,
@@ -3928,6 +4542,7 @@ fn public_wait_many_obeys_scalar_snapshot_output_then_handle_failure_order() {
             &mut registry,
             &tasks,
             &events,
+            &timers,
             &channels,
             &waits,
             &execution,
@@ -3965,6 +4580,7 @@ fn wait_one_ready_beats_now_and_unsignaled_now_times_out() {
     let (mut registry, mut tasks, execution, process, thread, process_handle) =
         wait_running_fixture();
     let events = EventAuthority::<1>::new();
+    let timers = TimerAuthority::<1>::new();
     let channels = ChannelAuthority::<1, 2>::new();
     let waits = WaitRegistry::<8>::new();
     let (event_key, reference) = events.create_event(&mut registry).unwrap();
@@ -3989,6 +4605,7 @@ fn wait_one_ready_beats_now_and_unsignaled_now_times_out() {
         &mut registry,
         &tasks,
         &events,
+        &timers,
         &channels,
         &waits,
         &execution,
@@ -4030,6 +4647,7 @@ fn wait_one_ready_beats_now_and_unsignaled_now_times_out() {
         &mut registry,
         &tasks,
         &events,
+        &timers,
         &channels,
         &waits,
         &execution,
@@ -4076,6 +4694,7 @@ fn wait_many_validates_full_array_and_selects_lowest_ready_index() {
     let (mut registry, mut tasks, execution, process, thread, process_handle) =
         wait_running_fixture();
     let events = EventAuthority::<2>::new();
+    let timers = TimerAuthority::<1>::new();
     let channels = ChannelAuthority::<1, 2>::new();
     let waits = WaitRegistry::<8>::new();
     let mut user = FakeUserMemory::new();
@@ -4137,6 +4756,7 @@ fn wait_many_validates_full_array_and_selects_lowest_ready_index() {
             &mut registry,
             &tasks,
             &events,
+            &timers,
             &channels,
             &waits,
             &execution,
@@ -4161,6 +4781,7 @@ fn wait_many_validates_full_array_and_selects_lowest_ready_index() {
         &mut registry,
         &tasks,
         &events,
+        &timers,
         &channels,
         &waits,
         &execution,
@@ -4184,6 +4805,7 @@ fn wait_many_validates_full_array_and_selects_lowest_ready_index() {
         &mut registry,
         &tasks,
         &events,
+        &timers,
         &channels,
         &waits,
         &execution,
@@ -4228,6 +4850,7 @@ fn wait_one_suspend_transfers_output_owner_until_signal_resume() {
     let (mut registry, mut tasks, execution, process, thread, process_handle) =
         wait_running_fixture();
     let events = EventAuthority::<1>::new();
+    let timers = TimerAuthority::<1>::new();
     let channels = ChannelAuthority::<1, 2>::new();
     let waits = WaitRegistry::<8>::new();
     let (event_key, reference) = events.create_event(&mut registry).unwrap();
@@ -4242,6 +4865,7 @@ fn wait_one_suspend_transfers_output_owner_until_signal_resume() {
         &mut registry,
         &tasks,
         &events,
+        &timers,
         &channels,
         &waits,
         &execution,
@@ -4308,6 +4932,7 @@ fn terminating_blocked_waiter_consumes_wait_without_userspace_resume() {
 
     let (mut registry, mut tasks, process, process_handle) = process_fixture();
     let events = EventAuthority::<2>::new();
+    let timers = TimerAuthority::<1>::new();
     let channels = ChannelAuthority::<2, 4>::new();
     let waits = WaitRegistry::<8>::new();
     let execution = ExecutionDomain::<2>::new(test_stack_bounds::<2>()).unwrap();
@@ -4349,6 +4974,7 @@ fn terminating_blocked_waiter_consumes_wait_without_userspace_resume() {
         &mut registry,
         &tasks,
         &events,
+        &timers,
         &channels,
         &waits,
         &execution,

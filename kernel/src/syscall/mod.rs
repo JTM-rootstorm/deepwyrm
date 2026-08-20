@@ -16,7 +16,8 @@ mod adapters;
 )]
 pub(crate) use adapters::{
     CleanupQueue, NativeWaitControl, TerminalWaitCleanup, WaitSuspendError, WaitSyscallAction,
-    WaitTerminalCleanup, resume_wait_thread_syscall, wait_many_syscall, wait_one_syscall,
+    WaitTerminalCleanup, resume_wait_thread_syscall, timer_cancel, timer_create, timer_set,
+    wait_many_syscall, wait_one_syscall,
 };
 
 #[cfg(deepwyrm_e7_guest)]

@@ -285,6 +285,7 @@ fn handle_resolution_enforces_wait_signal_rights_and_object_type() {
 fn process_and_thread_exited_signals_are_observed_from_task_authority() {
     let mut registry = ObjectRegistry::<12>::new();
     let events = EventAuthority::<1>::new();
+    let timers = crate::time::TimerAuthority::<1>::new();
     let channels = crate::ipc::ChannelAuthority::<1, 2>::new();
     let mut tasks = TaskAuthority::<1, 1, 1, 2>::new();
     let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
@@ -312,21 +313,21 @@ fn process_and_thread_exited_signals_are_observed_from_task_authority() {
         deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_THREAD),
     );
     assert_eq!(
-        current_signals_for(&tasks, &events, &channels, &process_target).unwrap(),
+        current_signals_for(&tasks, &events, &timers, &channels, &process_target).unwrap(),
         DwSignals(0)
     );
     assert_eq!(
-        current_signals_for(&tasks, &events, &channels, &thread_target).unwrap(),
+        current_signals_for(&tasks, &events, &timers, &channels, &thread_target).unwrap(),
         DwSignals(0)
     );
 
     let exit_pins = tasks.terminate_thread_authorized(thread, 0x44).unwrap();
     assert_eq!(
-        current_signals_for(&tasks, &events, &channels, &process_target).unwrap(),
+        current_signals_for(&tasks, &events, &timers, &channels, &process_target).unwrap(),
         DW_SIGNAL_EXITED
     );
     assert_eq!(
-        current_signals_for(&tasks, &events, &channels, &thread_target).unwrap(),
+        current_signals_for(&tasks, &events, &timers, &channels, &thread_target).unwrap(),
         DW_SIGNAL_EXITED
     );
     assert_eq!(process_target.object_id(), process.object_id());

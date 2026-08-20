@@ -45,6 +45,7 @@ use crate::task::{
     SchedulerError, SchedulerThreadState, StartThreadError, TaskAuthority, TaskCreateError,
     TaskError, TaskGroupKey, TaskGroupTerminationEffects, ThreadKey, ThreadStartState,
 };
+use crate::time::{TimerAuthority, TimerCreateError, TimerDeadlineAuthority, TimerError, TimerKey};
 use crate::wait::{
     EventAuthority, EventCreateError, EventKey, WaitError, WaitRegistry, WakeBatch,
     engine::{
@@ -417,6 +418,22 @@ fn event_create_status(error: EventCreateError) -> DwStatus {
     }
 }
 
+fn timer_status(error: TimerError) -> DwStatus {
+    match error {
+        TimerError::Capacity | TimerError::Deadline(crate::time::TimerDeadlineError::Capacity) => {
+            DW_STATUS_NO_RESOURCES
+        }
+        TimerError::InvalidDeadline | TimerError::InvalidSignals => DW_STATUS_INVALID_ARGUMENT,
+        TimerError::AccessDenied => DW_STATUS_ACCESS_DENIED,
+        TimerError::InvalidObject
+        | TimerError::GenerationExhausted
+        | TimerError::ForeignExpiry
+        | TimerError::Deadline(_)
+        | TimerError::FinalizationMismatch
+        | TimerError::Reference => DW_STATUS_BAD_STATE,
+    }
+}
+
 fn channel_status(error: ChannelError) -> DwStatus {
     match error {
         ChannelError::Capacity => DW_STATUS_NO_RESOURCES,
@@ -428,6 +445,17 @@ fn channel_status(error: ChannelError) -> DwStatus {
         ChannelError::InvalidEndpoint
         | ChannelError::StalePair
         | ChannelError::FinalizationMismatch => DW_STATUS_BAD_STATE,
+    }
+}
+
+fn timer_create_status(error: TimerCreateError) -> DwStatus {
+    match error {
+        TimerCreateError::Registry(ObjectRegistryError::Capacity)
+        | TimerCreateError::Registry(ObjectRegistryError::ReferenceCountExhausted) => {
+            DW_STATUS_NO_RESOURCES
+        }
+        TimerCreateError::Registry(_) => DW_STATUS_BAD_STATE,
+        TimerCreateError::Timer(error) => timer_status(error),
     }
 }
 
@@ -1556,6 +1584,7 @@ fn wait_set_status(error: WaitSetError) -> DwStatus {
         WaitSetError::Wait(WaitError::UnsupportedSource) => DW_STATUS_NOT_SUPPORTED,
         WaitSetError::Wait(_) | WaitSetError::StateDrift => DW_STATUS_BAD_STATE,
         WaitSetError::Channel(error) => channel_status(error),
+        WaitSetError::Timer(error) => timer_status(error),
     }
 }
 
@@ -1593,6 +1622,7 @@ fn begin_wait_set<
     const THREADS: usize,
     const HANDLES: usize,
     const EVENTS: usize,
+    const TIMERS: usize,
     const CHANNEL_PAIRS: usize,
     const CHANNEL_DEPTH: usize,
     const WAITERS: usize,
@@ -1604,6 +1634,7 @@ fn begin_wait_set<
     registry: &mut ObjectRegistry<OBJECTS>,
     tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     events: &EventAuthority<EVENTS>,
+    timers: &TimerAuthority<TIMERS>,
     channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
     waits: &WaitRegistry<WAITERS>,
     execution: &ExecutionDomain<EXECUTION>,
@@ -1621,6 +1652,7 @@ fn begin_wait_set<
             sources: WaitSources {
                 tasks,
                 events,
+                timers,
                 channels,
                 waits,
             },
@@ -1660,6 +1692,7 @@ pub(crate) fn wait_one_begin<
     const THREADS: usize,
     const HANDLES: usize,
     const EVENTS: usize,
+    const TIMERS: usize,
     const CHANNEL_PAIRS: usize,
     const CHANNEL_DEPTH: usize,
     const WAITERS: usize,
@@ -1669,6 +1702,7 @@ pub(crate) fn wait_one_begin<
     registry: &mut ObjectRegistry<OBJECTS>,
     tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     events: &EventAuthority<EVENTS>,
+    timers: &TimerAuthority<TIMERS>,
     channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
     waits: &WaitRegistry<WAITERS>,
     execution: &ExecutionDomain<EXECUTION>,
@@ -1689,6 +1723,7 @@ pub(crate) fn wait_one_begin<
             registry,
             tasks,
             events,
+            timers,
             channels,
             waits,
             execution,
@@ -1752,6 +1787,7 @@ fn wait_many_requests_begin<
     const THREADS: usize,
     const HANDLES: usize,
     const EVENTS: usize,
+    const TIMERS: usize,
     const CHANNEL_PAIRS: usize,
     const CHANNEL_DEPTH: usize,
     const WAITERS: usize,
@@ -1761,6 +1797,7 @@ fn wait_many_requests_begin<
     registry: &mut ObjectRegistry<OBJECTS>,
     tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     events: &EventAuthority<EVENTS>,
+    timers: &TimerAuthority<TIMERS>,
     channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
     waits: &WaitRegistry<WAITERS>,
     execution: &ExecutionDomain<EXECUTION>,
@@ -1779,6 +1816,7 @@ fn wait_many_requests_begin<
             registry,
             tasks,
             events,
+            timers,
             channels,
             waits,
             execution,
@@ -1804,6 +1842,7 @@ pub(crate) fn wait_many_begin<
     const THREADS: usize,
     const HANDLES: usize,
     const EVENTS: usize,
+    const TIMERS: usize,
     const CHANNEL_PAIRS: usize,
     const CHANNEL_DEPTH: usize,
     const WAITERS: usize,
@@ -1814,6 +1853,7 @@ pub(crate) fn wait_many_begin<
     registry: &mut ObjectRegistry<OBJECTS>,
     tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     events: &EventAuthority<EVENTS>,
+    timers: &TimerAuthority<TIMERS>,
     channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
     waits: &WaitRegistry<WAITERS>,
     execution: &ExecutionDomain<EXECUTION>,
@@ -1841,6 +1881,7 @@ pub(crate) fn wait_many_begin<
         registry,
         tasks,
         events,
+        timers,
         channels,
         waits,
         execution,
@@ -1900,6 +1941,7 @@ pub(crate) fn wait_one_syscall<
     const THREADS: usize,
     const HANDLES: usize,
     const EVENTS: usize,
+    const TIMERS: usize,
     const CHANNEL_PAIRS: usize,
     const CHANNEL_DEPTH: usize,
     const WAITERS: usize,
@@ -1909,6 +1951,7 @@ pub(crate) fn wait_one_syscall<
     registry: &mut ObjectRegistry<OBJECTS>,
     tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     events: &EventAuthority<EVENTS>,
+    timers: &TimerAuthority<TIMERS>,
     channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
     waits: &WaitRegistry<WAITERS>,
     execution: &ExecutionDomain<EXECUTION>,
@@ -1935,6 +1978,7 @@ pub(crate) fn wait_one_syscall<
             registry,
             tasks,
             events,
+            timers,
             channels,
             waits,
             execution,
@@ -1957,6 +2001,7 @@ pub(crate) fn wait_many_syscall<
     const THREADS: usize,
     const HANDLES: usize,
     const EVENTS: usize,
+    const TIMERS: usize,
     const CHANNEL_PAIRS: usize,
     const CHANNEL_DEPTH: usize,
     const WAITERS: usize,
@@ -1966,6 +2011,7 @@ pub(crate) fn wait_many_syscall<
     registry: &mut ObjectRegistry<OBJECTS>,
     tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     events: &EventAuthority<EVENTS>,
+    timers: &TimerAuthority<TIMERS>,
     channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
     waits: &WaitRegistry<WAITERS>,
     execution: &ExecutionDomain<EXECUTION>,
@@ -1992,6 +2038,7 @@ pub(crate) fn wait_many_syscall<
         registry,
         tasks,
         events,
+        timers,
         channels,
         waits,
         execution,
@@ -2186,6 +2233,146 @@ pub(crate) fn event_signal<
     release_lookup_pin(registry, pin, cleanup);
     complete_wait_wakes(registry, execution, wakes, cleanup);
     DW_STATUS_SUCCESS
+}
+
+pub(crate) fn timer_create<
+    U: UserPageAccess,
+    const OBJECTS: usize,
+    const TIMERS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    user: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    timers: &TimerAuthority<TIMERS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    current_process: ProcessKey,
+    requested_rights: DwRights,
+    out_timer: DwUserAddress,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
+    if let Err(status) =
+        validate_created_handle_rights(deepwyrm_abi::DW_OBJECT_TYPE_TIMER, requested_rights)
+    {
+        return status;
+    }
+    let output = match preflight_output(user, out_timer, 8, 8) {
+        Ok(output) => output,
+        Err(status) => return status,
+    };
+    let (_key, reference) = match timers.create_timer(registry) {
+        Ok(created) => created,
+        Err(error) => return timer_create_status(error),
+    };
+    let handle = match tasks.process_handles_mut(current_process) {
+        Ok(table) => {
+            match install_created_handle(table, registry, reference, requested_rights, cleanup) {
+                Ok(handle) => handle,
+                Err(status) => return status,
+            }
+        }
+        Err(error) => {
+            cleanup.push_optional(
+                registry
+                    .release_handle(reference)
+                    .unwrap_or_else(|failure| {
+                        panic!(
+                            "F8 Timer publication rollback drifted: {:?}",
+                            failure.error()
+                        )
+                    }),
+            );
+            return task_status(error);
+        }
+    };
+    output.commit(&encode_handle(handle));
+    DW_STATUS_SUCCESS
+}
+
+pub(crate) fn timer_set<
+    const OBJECTS: usize,
+    const TIMERS: usize,
+    const WAITERS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    timers: &TimerAuthority<TIMERS>,
+    deadlines: &mut dyn TimerDeadlineAuthority,
+    waits: &WaitRegistry<WAITERS>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    current_process: ProcessKey,
+    timer: DwHandle,
+    deadline: DwDeadline,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
+    if deadline.0 == deepwyrm_abi::DW_DEADLINE_INFINITE.0 {
+        return DW_STATUS_INVALID_ARGUMENT;
+    }
+    let pin = match resolve_current_handle(
+        tasks,
+        registry,
+        current_process,
+        timer,
+        deepwyrm_abi::DW_OBJECT_TYPE_TIMER,
+        DW_RIGHT_MODIFY,
+    ) {
+        Ok(pin) => pin,
+        Err(status) => return status,
+    };
+    let key = TimerKey::from_object_id(pin.id());
+    let wakes = match timers.set(key, deadline, deadlines, waits) {
+        Ok(wakes) => wakes,
+        Err(error) => {
+            release_lookup_pin(registry, pin, cleanup);
+            return timer_status(error);
+        }
+    };
+    release_lookup_pin(registry, pin, cleanup);
+    complete_wait_wakes(registry, execution, wakes, cleanup);
+    DW_STATUS_SUCCESS
+}
+
+pub(crate) fn timer_cancel<
+    const OBJECTS: usize,
+    const TIMERS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    timers: &TimerAuthority<TIMERS>,
+    deadlines: &mut dyn TimerDeadlineAuthority,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    current_process: ProcessKey,
+    timer: DwHandle,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
+    let pin = match resolve_current_handle(
+        tasks,
+        registry,
+        current_process,
+        timer,
+        deepwyrm_abi::DW_OBJECT_TYPE_TIMER,
+        DW_RIGHT_MODIFY,
+    ) {
+        Ok(pin) => pin,
+        Err(status) => return status,
+    };
+    let key = TimerKey::from_object_id(pin.id());
+    let status = match timers.cancel(key, deadlines) {
+        Ok(()) => DW_STATUS_SUCCESS,
+        Err(error) => timer_status(error),
+    };
+    release_lookup_pin(registry, pin, cleanup);
+    status
 }
 
 pub(crate) fn thread_create<

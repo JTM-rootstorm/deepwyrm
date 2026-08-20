@@ -15,7 +15,8 @@ use crate::task::BlockWakeKey;
 
 use super::{
     DEADLINE_QUEUE_CAPACITY, DeadlineQueue, DeadlineRegistration, MonotonicSample,
-    PmTimerDescriptor, PmTimerState, PmTimerWidth, TimeInitState, apic_one_shot_for_delta,
+    PmTimerDescriptor, PmTimerState, PmTimerWidth, TimeInitState, TimerDeadlineAuthority,
+    TimerDeadlineError, TimerExpiryToken, apic_one_shot_for_delta,
 };
 
 const UNINITIALIZED: u8 = 0;
@@ -134,10 +135,90 @@ fn wake_binding() -> Option<WakeBinding> {
     Some(unsafe { (*WAKE_STORAGE.0.get()).assume_init() })
 }
 
+pub(crate) trait TimerExpiryTarget: Sync {
+    fn expire_timer(&self, token: TimerExpiryToken);
+}
+
+#[derive(Clone, Copy)]
+struct TimerExpiryBinding {
+    context: *const (),
+    handler: unsafe fn(*const (), TimerExpiryToken),
+}
+
+struct TimerExpiryStorage(UnsafeCell<MaybeUninit<TimerExpiryBinding>>);
+
+impl TimerExpiryStorage {
+    const fn new() -> Self {
+        Self(UnsafeCell::new(MaybeUninit::uninit()))
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "one-shot F8 Timer expiry publication stores an immutable static shared target before Timer deadlines are armed"
+)]
+unsafe impl Sync for TimerExpiryStorage {}
+
+static TIMER_EXPIRY_STATE: AtomicU8 = AtomicU8::new(UNINITIALIZED);
+static TIMER_EXPIRY_STORAGE: TimerExpiryStorage = TimerExpiryStorage::new();
+
+pub(crate) fn bind_timer_expiry_target<T: TimerExpiryTarget + 'static>(
+    target: &'static T,
+) -> Result<(), LiveTimeError> {
+    if TIMER_EXPIRY_STATE
+        .compare_exchange(
+            UNINITIALIZED,
+            INITIALIZING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return Err(LiveTimeError::AlreadyInitialized);
+    }
+    #[allow(
+        unsafe_code,
+        reason = "the static Timer expiry target is erased together with its monomorphized shared-reference trampoline"
+    )]
+    unsafe {
+        (*TIMER_EXPIRY_STORAGE.0.get()).write(TimerExpiryBinding {
+            context: core::ptr::from_ref(target).cast::<()>(),
+            handler: timer_expiry_trampoline::<T>,
+        });
+    }
+    TIMER_EXPIRY_STATE.store(INITIALIZED, Ordering::Release);
+    Ok(())
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the stored Timer expiry context originated from the matching static typed target reference"
+)]
+unsafe fn timer_expiry_trampoline<T: TimerExpiryTarget>(
+    context: *const (),
+    token: TimerExpiryToken,
+) {
+    let target = unsafe { &*context.cast::<T>() };
+    target.expire_timer(token);
+}
+
+fn timer_expiry_binding() -> Option<TimerExpiryBinding> {
+    if TIMER_EXPIRY_STATE.load(Ordering::Acquire) != INITIALIZED {
+        return None;
+    }
+    #[allow(
+        unsafe_code,
+        reason = "Acquire observes the immutable Timer expiry binding published before INITIALIZED"
+    )]
+    Some(unsafe { (*TIMER_EXPIRY_STORAGE.0.get()).assume_init() })
+}
+
 #[derive(Clone, Copy)]
 struct InterruptOutcome {
     wakes: [Option<BlockWakeKey>; DEADLINE_QUEUE_CAPACITY],
     wake_count: usize,
+    timer_expiries: [Option<TimerExpiryToken>; DEADLINE_QUEUE_CAPACITY],
+    timer_expiry_count: usize,
 }
 
 struct LiveTimeState {
@@ -146,6 +227,7 @@ struct LiveTimeState {
     registers: LiveXApicMmio,
     apic_timer_hz: u64,
     deadlines: DeadlineQueue,
+    timer_deadlines: DeadlineQueue<DEADLINE_QUEUE_CAPACITY, TimerExpiryToken>,
     last_sample: MonotonicSample,
 }
 
@@ -158,11 +240,15 @@ impl LiveTimeState {
     }
 
     fn next_deadline(&self, sample: MonotonicSample) -> u64 {
-        self.deadlines
-            .earliest()
-            .map_or(sample.maintenance_deadline, |user| {
-                user.min(sample.maintenance_deadline)
-            })
+        let user = match (self.deadlines.earliest(), self.timer_deadlines.earliest()) {
+            (Some(wait), Some(timer)) => Some(wait.min(timer)),
+            (Some(wait), None) => Some(wait),
+            (None, Some(timer)) => Some(timer),
+            (None, None) => None,
+        };
+        user.map_or(sample.maintenance_deadline, |deadline| {
+            deadline.min(sample.maintenance_deadline)
+        })
     }
 
     fn reprogram(&mut self, sample: MonotonicSample) -> Result<(), LiveTimeError> {
@@ -179,11 +265,20 @@ impl LiveTimeState {
         let sample = self.sample_now()?;
         let mut wakes = [None; DEADLINE_QUEUE_CAPACITY];
         let wake_count = self.deadlines.expire(sample.nanoseconds, &mut wakes);
+        let mut timer_expiries = [None; DEADLINE_QUEUE_CAPACITY];
+        let timer_expiry_count = self
+            .timer_deadlines
+            .expire(sample.nanoseconds, &mut timer_expiries);
         self.reprogram(sample)?;
         self.apic
             .end_of_interrupt(&mut self.registers)
             .map_err(|_| LiveTimeError::ApicAccess)?;
-        Ok(InterruptOutcome { wakes, wake_count })
+        Ok(InterruptOutcome {
+            wakes,
+            wake_count,
+            timer_expiries,
+            timer_expiry_count,
+        })
     }
 
     fn register_deadline(
@@ -217,6 +312,62 @@ impl LiveTimeState {
             .cancel_if_live(registration)
             .map_err(|_| LiveTimeError::Deadline)?;
         self.reprogram(sample)
+    }
+
+    fn replace_timer_deadline(
+        &mut self,
+        old: Option<&DeadlineRegistration>,
+        deadline_ns: u64,
+        token: TimerExpiryToken,
+    ) -> Result<Option<DeadlineRegistration>, TimerDeadlineError> {
+        let sample = self.sample_now().map_err(|_| TimerDeadlineError::Fault)?;
+        if deadline_ns <= sample.nanoseconds {
+            if let Some(old) = old {
+                self.timer_deadlines
+                    .cancel_if_live_ref(old)
+                    .map_err(|_| TimerDeadlineError::Fault)?;
+            }
+            if self.reprogram(sample).is_err() {
+                halt_forever();
+            }
+            return Ok(None);
+        }
+
+        let registration = if let Some(old) = old {
+            match self
+                .timer_deadlines
+                .replace_if_live(old, deadline_ns, token)
+                .map_err(map_timer_queue_error)?
+            {
+                Some(registration) => registration,
+                None => self
+                    .timer_deadlines
+                    .register(deadline_ns, token)
+                    .map_err(map_timer_queue_error)?,
+            }
+        } else {
+            self.timer_deadlines
+                .register(deadline_ns, token)
+                .map_err(map_timer_queue_error)?
+        };
+        if self.reprogram(sample).is_err() {
+            halt_forever();
+        }
+        Ok(Some(registration))
+    }
+
+    fn cancel_timer_deadline(
+        &mut self,
+        registration: DeadlineRegistration,
+    ) -> Result<(), TimerDeadlineError> {
+        let sample = self.sample_now().map_err(|_| TimerDeadlineError::Fault)?;
+        self.timer_deadlines
+            .cancel_if_live(registration)
+            .map_err(|_| TimerDeadlineError::Fault)?;
+        if self.reprogram(sample).is_err() {
+            halt_forever();
+        }
+        Ok(())
     }
 }
 
@@ -352,6 +503,7 @@ fn commit_initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         registers,
         apic_timer_hz,
         deadlines: DeadlineQueue::new(),
+        timer_deadlines: DeadlineQueue::new(),
         last_sample: final_sample,
     };
     state.reprogram(final_sample)?;
@@ -402,6 +554,40 @@ fn calibrate_apic_timer(
     Ok(frequency)
 }
 
+fn map_timer_queue_error(error: super::DeadlineQueueError) -> TimerDeadlineError {
+    match error {
+        super::DeadlineQueueError::Capacity | super::DeadlineQueueError::GenerationExhausted => {
+            TimerDeadlineError::Capacity
+        }
+        _ => TimerDeadlineError::Fault,
+    }
+}
+
+pub(crate) struct LiveTimerDeadlineAuthority;
+
+impl TimerDeadlineAuthority for LiveTimerDeadlineAuthority {
+    fn replace_timer_deadline(
+        &mut self,
+        old: Option<&DeadlineRegistration>,
+        deadline_ns: u64,
+        token: TimerExpiryToken,
+    ) -> Result<Option<DeadlineRegistration>, TimerDeadlineError> {
+        if timer_expiry_binding().is_none() {
+            return Err(TimerDeadlineError::Fault);
+        }
+        let state = live_state().ok_or(TimerDeadlineError::Fault)?;
+        state.lock().replace_timer_deadline(old, deadline_ns, token)
+    }
+
+    fn cancel_timer_deadline(
+        &mut self,
+        registration: DeadlineRegistration,
+    ) -> Result<(), TimerDeadlineError> {
+        let state = live_state().ok_or(TimerDeadlineError::Fault)?;
+        state.lock().cancel_timer_deadline(registration)
+    }
+}
+
 pub(crate) fn monotonic_now() -> Result<u64, LiveTimeError> {
     let state = live_state().ok_or(LiveTimeError::Clock)?;
     let mut state = state.lock();
@@ -441,19 +627,37 @@ pub(crate) extern "sysv64" fn dw_x86_64_timer_interrupt_dispatch() {
         let mut state = state.lock();
         state.interrupt().unwrap_or_else(|_| halt_forever())
     };
-    if outcome.wake_count == 0 {
-        return;
+    if outcome.wake_count != 0 {
+        let Some(binding) = wake_binding() else {
+            halt_forever();
+        };
+        for key in outcome.wakes.into_iter().take(outcome.wake_count).flatten() {
+            #[allow(
+                unsafe_code,
+                reason = "the immutable static wake binding is invoked only after the IRQ-safe time lock has been released"
+            )]
+            unsafe {
+                (binding.handler)(binding.context, key);
+            }
+        }
     }
-    let Some(binding) = wake_binding() else {
-        halt_forever();
-    };
-    for key in outcome.wakes.into_iter().take(outcome.wake_count).flatten() {
-        #[allow(
-            unsafe_code,
-            reason = "the immutable static wake binding is invoked only after the IRQ-safe time lock has been released"
-        )]
-        unsafe {
-            (binding.handler)(binding.context, key);
+    if outcome.timer_expiry_count != 0 {
+        let Some(binding) = timer_expiry_binding() else {
+            halt_forever();
+        };
+        for token in outcome
+            .timer_expiries
+            .into_iter()
+            .take(outcome.timer_expiry_count)
+            .flatten()
+        {
+            #[allow(
+                unsafe_code,
+                reason = "the immutable static Timer expiry binding is invoked only after the IRQ-safe time lock has been released"
+            )]
+            unsafe {
+                (binding.handler)(binding.context, token);
+            }
         }
     }
 }
@@ -661,6 +865,164 @@ pub(crate) fn run_target_deadline_probe() -> Result<F3TargetProbe, LiveTimeError
         before_ns,
         after_ns,
         apic_timer_hz: calibrated_apic_timer_hz().ok_or(LiveTimeError::Calibration)?,
+    })
+}
+
+#[cfg(feature = "test-support")]
+struct TimerProbeTarget {
+    timers: super::TimerAuthority<1>,
+    waits: crate::wait::WaitRegistry<1>,
+    fired: AtomicU8,
+    failed: AtomicU8,
+}
+
+#[cfg(feature = "test-support")]
+impl TimerExpiryTarget for TimerProbeTarget {
+    fn expire_timer(&self, token: TimerExpiryToken) {
+        match self.timers.expire(token, &self.waits) {
+            Ok(wakes) => {
+                let (wake_intents, pins) = wakes.into_parts();
+                if wake_intents.into_iter().flatten().next().is_some()
+                    || pins.into_iter().flatten().next().is_some()
+                {
+                    self.failed.store(1, Ordering::Release);
+                    return;
+                }
+                self.fired.store(1, Ordering::Release);
+            }
+            Err(_) => self.failed.store(1, Ordering::Release),
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+struct TimerProbeStorage(UnsafeCell<MaybeUninit<TimerProbeTarget>>);
+
+#[cfg(feature = "test-support")]
+impl TimerProbeStorage {
+    const fn new() -> Self {
+        Self(UnsafeCell::new(MaybeUninit::uninit()))
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[allow(
+    unsafe_code,
+    reason = "the one-shot F8 target probe publishes stationary Timer/wait state before IRQ delivery"
+)]
+unsafe impl Sync for TimerProbeStorage {}
+
+#[cfg(feature = "test-support")]
+static TIMER_PROBE_STATE: AtomicU8 = AtomicU8::new(UNINITIALIZED);
+#[cfg(feature = "test-support")]
+static TIMER_PROBE_STORAGE: TimerProbeStorage = TimerProbeStorage::new();
+
+#[cfg(feature = "test-support")]
+fn timer_probe_target() -> Result<&'static TimerProbeTarget, LiveTimeError> {
+    if TIMER_PROBE_STATE
+        .compare_exchange(
+            UNINITIALIZED,
+            INITIALIZING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return Err(LiveTimeError::AlreadyInitialized);
+    }
+    #[allow(
+        unsafe_code,
+        reason = "the target probe has one-shot BSP ownership before the Timer authority becomes interrupt-visible"
+    )]
+    unsafe {
+        (*TIMER_PROBE_STORAGE.0.get()).write(TimerProbeTarget {
+            timers: super::TimerAuthority::new(),
+            waits: crate::wait::WaitRegistry::new(),
+            fired: AtomicU8::new(0),
+            failed: AtomicU8::new(0),
+        });
+    }
+    TIMER_PROBE_STATE.store(INITIALIZED, Ordering::Release);
+    #[allow(
+        unsafe_code,
+        reason = "the published F8 Timer probe target remains stationary for the rest of the test boot"
+    )]
+    Ok(unsafe { &*(*TIMER_PROBE_STORAGE.0.get()).as_ptr() })
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct F8TargetTimerProbe {
+    pub(crate) before_ns: u64,
+    pub(crate) deadline_ns: u64,
+    pub(crate) after_ns: u64,
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn run_target_timer_probe() -> Result<F8TargetTimerProbe, LiveTimeError> {
+    let target = timer_probe_target()?;
+    bind_timer_expiry_target(target)?;
+
+    let mut registry = crate::object::ObjectRegistry::<1>::new();
+    let (key, handle) = target
+        .timers
+        .create_timer(&mut registry)
+        .map_err(|_| LiveTimeError::Deadline)?;
+    let before_ns = monotonic_now()?;
+    let deadline_ns = before_ns
+        .checked_add(20_000_000)
+        .filter(|deadline| *deadline < deepwyrm_abi::DW_DEADLINE_INFINITE.0)
+        .ok_or(LiveTimeError::Deadline)?;
+    let mut deadlines = LiveTimerDeadlineAuthority;
+    let wakes = target
+        .timers
+        .set(
+            key,
+            deepwyrm_abi::DwDeadline(deadline_ns),
+            &mut deadlines,
+            &target.waits,
+        )
+        .map_err(|_| LiveTimeError::Deadline)?;
+    let (wake_intents, pins) = wakes.into_parts();
+    if wake_intents.into_iter().flatten().next().is_some()
+        || pins.into_iter().flatten().next().is_some()
+    {
+        return Err(LiveTimeError::Deadline);
+    }
+
+    for _ in 0..8 {
+        if target.fired.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        wait_for_interrupt();
+    }
+    let after_ns = monotonic_now()?;
+    if target.failed.load(Ordering::Acquire) != 0
+        || target.fired.load(Ordering::Acquire) == 0
+        || after_ns < deadline_ns
+        || target
+            .timers
+            .current_signals(key)
+            .map_err(|_| LiveTimeError::Deadline)?
+            != deepwyrm_abi::DW_SIGNAL_SIGNALED
+    {
+        return Err(LiveTimeError::Deadline);
+    }
+
+    let final_release = registry
+        .release_handle(handle)
+        .map_err(|_| LiveTimeError::Deadline)?
+        .ok_or(LiveTimeError::Deadline)?;
+    let finalization = target
+        .timers
+        .take_finalization(final_release, &mut deadlines)
+        .map_err(|_| LiveTimeError::Deadline)?;
+    super::complete_timer_finalization(&mut registry, finalization);
+
+    Ok(F8TargetTimerProbe {
+        before_ns,
+        deadline_ns,
+        after_ns,
     })
 }
 

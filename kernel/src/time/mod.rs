@@ -6,9 +6,20 @@
 
 mod deadline;
 mod init_state;
+#[allow(
+    unused_imports,
+    reason = "F8 Timer primitives are staged together before syscall/wait consumers are wired"
+)]
+pub(crate) use timer::{
+    TimerAuthority, TimerCreateError, TimerDeadlineAuthority, TimerDeadlineError, TimerError,
+    TimerExpiryToken, TimerKey, TimerPayloadBinding, TimerPayloadCleanup, TimerWaitFailure,
+    TimerWaitOutcome, complete_timer_finalization,
+};
+
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod live;
 mod pm_timer;
+mod timer;
 
 #[allow(
     unused_imports,
@@ -38,12 +49,16 @@ pub(crate) use pm_timer::{
     reason = "F3 wake registration APIs are consumed by later wait/timer phases after the live backend is installed"
 )]
 pub(crate) use live::{
-    DeadlineRegistrationFailure, DeadlineWakeTarget, LiveTimeError, bind_deadline_wake_target,
-    cancel_deadline, initialize, monotonic_now, register_deadline,
+    DeadlineRegistrationFailure, DeadlineWakeTarget, LiveTimeError, LiveTimerDeadlineAuthority,
+    TimerExpiryTarget, bind_deadline_wake_target, bind_timer_expiry_target, cancel_deadline,
+    initialize, monotonic_now, register_deadline,
 };
 #[cfg(all(feature = "test-support", target_os = "none", target_arch = "x86_64"))]
 #[allow(
     unused_imports,
     reason = "F3 target probe result is consumed only by the selected guest evidence path"
 )]
-pub(crate) use live::{F3TargetProbe, calibrated_apic_timer_hz, run_target_deadline_probe};
+pub(crate) use live::{
+    F3TargetProbe, F8TargetTimerProbe, calibrated_apic_timer_hz, run_target_deadline_probe,
+    run_target_timer_probe,
+};

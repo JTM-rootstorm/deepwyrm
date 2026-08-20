@@ -633,6 +633,10 @@ fn enter_smoke<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     if f3.after_ns <= f3.before_ns || f3.apic_timer_hz == 0 {
         fail(0xbd);
     }
+    let f8 = crate::time::run_target_timer_probe().unwrap_or_else(|_| fail(0xbe));
+    if f8.after_ns < f8.deadline_ns || f8.deadline_ns <= f8.before_ns {
+        fail(0xbf);
+    }
     let mut runtime = build_smoke_runtime(active);
     let exception_binding =
         crate::arch::x86_64::syscall::bind_user_exception_handler(unexpected_user_exception)

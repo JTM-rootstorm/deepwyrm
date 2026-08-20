@@ -1,6 +1,6 @@
 use deepwyrm_abi::{
     DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_EVENT, DW_OBJECT_TYPE_PROCESS, DW_OBJECT_TYPE_THREAD,
-    DW_RIGHT_WAIT, DW_WAIT_MANY_MAX_ITEMS, DwSignals, DwWaitItemV1,
+    DW_OBJECT_TYPE_TIMER, DW_RIGHT_WAIT, DW_WAIT_MANY_MAX_ITEMS, DwSignals, DwWaitItemV1,
 };
 
 use crate::handle::{AcceptedObjectTypes, HandleTableError, ResolvedHandle};
@@ -10,7 +10,7 @@ use crate::task::{
     BlockWakeKey, BlockedOperation, BlockedOperationError, BlockedOperationWinner, ExecutionDomain,
     ProcessKey, ScheduleDecision, SchedulerError, TaskAuthority, TaskError, ThreadKey,
 };
-use crate::time::DeadlineRegistration;
+use crate::time::{DeadlineRegistration, TimerAuthority, TimerError, TimerWaitOutcome};
 
 use super::operation::{WaitOperation, WaitOperationError, WaitOperationRegistry};
 use super::{
@@ -140,6 +140,7 @@ pub(crate) enum WaitSetError {
     Handle(HandleTableError),
     Wait(WaitError),
     Channel(ChannelError),
+    Timer(TimerError),
     StateDrift,
 }
 
@@ -150,12 +151,14 @@ pub(crate) struct WaitSources<
     const THREADS: usize,
     const HANDLES: usize,
     const EVENTS: usize,
+    const TIMERS: usize,
     const CHANNEL_PAIRS: usize,
     const CHANNEL_DEPTH: usize,
     const WAITERS: usize,
 > {
     pub(crate) tasks: &'a TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     pub(crate) events: &'a EventAuthority<EVENTS>,
+    pub(crate) timers: &'a TimerAuthority<TIMERS>,
     pub(crate) channels: &'a ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
     pub(crate) waits: &'a WaitRegistry<WAITERS>,
 }
@@ -227,6 +230,7 @@ impl ResolvedWaitSet {
         const THREADS: usize,
         const HANDLES: usize,
         const EVENTS: usize,
+        const TIMERS: usize,
         const CHANNEL_PAIRS: usize,
         const CHANNEL_DEPTH: usize,
         const WAITERS: usize,
@@ -239,6 +243,7 @@ impl ResolvedWaitSet {
             THREADS,
             HANDLES,
             EVENTS,
+            TIMERS,
             CHANNEL_PAIRS,
             CHANNEL_DEPTH,
             WAITERS,
@@ -248,6 +253,7 @@ impl ResolvedWaitSet {
             let observed = current_signals_for(
                 sources.tasks,
                 sources.events,
+                sources.timers,
                 sources.channels,
                 &item.target,
             )
@@ -269,6 +275,7 @@ impl ResolvedWaitSet {
         const THREADS: usize,
         const HANDLES: usize,
         const EVENTS: usize,
+        const TIMERS: usize,
         const CHANNEL_PAIRS: usize,
         const CHANNEL_DEPTH: usize,
         const WAITERS: usize,
@@ -282,6 +289,7 @@ impl ResolvedWaitSet {
             THREADS,
             HANDLES,
             EVENTS,
+            TIMERS,
             CHANNEL_PAIRS,
             CHANNEL_DEPTH,
             WAITERS,
@@ -363,6 +371,7 @@ fn register_one<
     const THREADS: usize,
     const HANDLES: usize,
     const EVENTS: usize,
+    const TIMERS: usize,
     const CHANNEL_PAIRS: usize,
     const CHANNEL_DEPTH: usize,
     const WAITERS: usize,
@@ -374,6 +383,7 @@ fn register_one<
         THREADS,
         HANDLES,
         EVENTS,
+        TIMERS,
         CHANNEL_PAIRS,
         CHANNEL_DEPTH,
         WAITERS,
@@ -397,6 +407,18 @@ fn register_one<
             Ok(EventWaitOutcome::Registered(_registration)) => Ok(RegisterOutcome::Registered),
             Err(failure) => Err((WaitSetError::Wait(failure.error), failure.pin)),
         },
+        DW_OBJECT_TYPE_TIMER => match sources.timers.register_wait(
+            sources.waits,
+            target,
+            desired,
+            item_index,
+            thread,
+            wake,
+        ) {
+            Ok(TimerWaitOutcome::Ready { pin, .. }) => Ok(RegisterOutcome::Ready(pin)),
+            Ok(TimerWaitOutcome::Registered(_registration)) => Ok(RegisterOutcome::Registered),
+            Err(failure) => Err((WaitSetError::Timer(failure.error), failure.pin)),
+        },
         DW_OBJECT_TYPE_CHANNEL => match sources.channels.register_wait(
             sources.waits,
             target,
@@ -410,14 +432,18 @@ fn register_one<
             Err(failure) => Err((WaitSetError::Channel(failure.error), failure.pin)),
         },
         DW_OBJECT_TYPE_PROCESS | DW_OBJECT_TYPE_THREAD => {
-            let observed =
-                match current_signals_for(sources.tasks, sources.events, sources.channels, &target)
-                {
-                    Ok(observed) => observed,
-                    Err(error) => {
-                        return Err((WaitSetError::Wait(error), target.into_internal()));
-                    }
-                };
+            let observed = match current_signals_for(
+                sources.tasks,
+                sources.events,
+                sources.timers,
+                sources.channels,
+                &target,
+            ) {
+                Ok(observed) => observed,
+                Err(error) => {
+                    return Err((WaitSetError::Wait(error), target.into_internal()));
+                }
+            };
             if observed.0 & desired.0 != 0 {
                 return Ok(RegisterOutcome::Ready(target.into_internal()));
             }
@@ -513,6 +539,7 @@ pub(crate) struct WaitBeginContext<
     const THREADS: usize,
     const HANDLES: usize,
     const EVENTS: usize,
+    const TIMERS: usize,
     const CHANNEL_PAIRS: usize,
     const CHANNEL_DEPTH: usize,
     const WAITERS: usize,
@@ -526,6 +553,7 @@ pub(crate) struct WaitBeginContext<
         THREADS,
         HANDLES,
         EVENTS,
+        TIMERS,
         CHANNEL_PAIRS,
         CHANNEL_DEPTH,
         WAITERS,
@@ -544,6 +572,7 @@ pub(crate) fn begin_registered_wait<
     const THREADS: usize,
     const HANDLES: usize,
     const EVENTS: usize,
+    const TIMERS: usize,
     const CHANNEL_PAIRS: usize,
     const CHANNEL_DEPTH: usize,
     const WAITERS: usize,
@@ -561,6 +590,7 @@ pub(crate) fn begin_registered_wait<
         THREADS,
         HANDLES,
         EVENTS,
+        TIMERS,
         CHANNEL_PAIRS,
         CHANNEL_DEPTH,
         WAITERS,
@@ -979,6 +1009,7 @@ mod tests {
     type Registry = ObjectRegistry<16>;
     type Tasks = TaskAuthority<1, 1, 1, 8>;
     type Events = EventAuthority<4>;
+    type Timers = TimerAuthority<4>;
     type Channels = ChannelAuthority<1, 2>;
     type Waits = WaitRegistry<8>;
     type Execution = ExecutionDomain<1>;
@@ -1056,6 +1087,7 @@ mod tests {
     fn ready_scan_chooses_lowest_input_index_deterministically() {
         let (mut registry, mut tasks, _execution, process, _thread) = running_fixture();
         let events = Events::new();
+        let timers = Timers::new();
         let channels = Channels::new();
         let waits = Waits::new();
         let (first_key, first) = install_event(&mut registry, &mut tasks, &events, process);
@@ -1090,6 +1122,7 @@ mod tests {
             set.select_ready(&WaitSources {
                 tasks: &tasks,
                 events: &events,
+                timers: &timers,
                 channels: &channels,
                 waits: &waits
             })
@@ -1108,6 +1141,7 @@ mod tests {
     fn registration_barrier_returns_ready_without_blocking_if_source_flips() {
         let (mut registry, mut tasks, execution, process, thread) = running_fixture();
         let events = Events::new();
+        let timers = Timers::new();
         let channels = Channels::new();
         let waits = Waits::new();
         let (event_key, event) = install_event(&mut registry, &mut tasks, &events, process);
@@ -1120,6 +1154,7 @@ mod tests {
             set.select_ready(&WaitSources {
                 tasks: &tasks,
                 events: &events,
+                timers: &timers,
                 channels: &channels,
                 waits: &waits
             })
@@ -1146,6 +1181,7 @@ mod tests {
                 sources: WaitSources {
                     tasks: &tasks,
                     events: &events,
+                    timers: &timers,
                     channels: &channels,
                     waits: &waits,
                 },
@@ -1179,6 +1215,7 @@ mod tests {
     fn registered_wait_commits_block_then_signal_completes_exact_generation() {
         let (mut registry, mut tasks, execution, process, thread) = running_fixture();
         let events = Events::new();
+        let timers = Timers::new();
         let channels = Channels::new();
         let waits = Waits::new();
         let (event_key, event) = install_event(&mut registry, &mut tasks, &events, process);
@@ -1191,6 +1228,7 @@ mod tests {
             set.select_ready(&WaitSources {
                 tasks: &tasks,
                 events: &events,
+                timers: &timers,
                 channels: &channels,
                 waits: &waits
             })
@@ -1207,6 +1245,7 @@ mod tests {
                 sources: WaitSources {
                     tasks: &tasks,
                     events: &events,
+                    timers: &timers,
                     channels: &channels,
                     waits: &waits,
                 },
@@ -1351,6 +1390,7 @@ mod tests {
     fn now_deadline_preserves_ready_before_timeout_order() {
         let (mut registry, mut tasks, execution, process, thread) = running_fixture();
         let events = Events::new();
+        let timers = Timers::new();
         let channels = Channels::new();
         let waits = Waits::new();
         let (event_key, event) = install_event(&mut registry, &mut tasks, &events, process);
@@ -1376,6 +1416,7 @@ mod tests {
                 sources: WaitSources {
                     tasks: &tasks,
                     events: &events,
+                    timers: &timers,
                     channels: &channels,
                     waits: &waits,
                 },
@@ -1409,6 +1450,7 @@ mod tests {
                 sources: WaitSources {
                     tasks: &tasks,
                     events: &events,
+                    timers: &timers,
                     channels: &channels,
                     waits: &waits,
                 },
@@ -1437,6 +1479,7 @@ mod tests {
     fn finite_deadline_wakes_blocked_generation_and_resume_consumes_expired_token() {
         let (mut registry, mut tasks, execution, process, thread) = running_fixture();
         let events = Events::new();
+        let timers = Timers::new();
         let channels = Channels::new();
         let waits = Waits::new();
         let (_event_key, event) = install_event(&mut registry, &mut tasks, &events, process);
@@ -1456,6 +1499,7 @@ mod tests {
                 sources: WaitSources {
                     tasks: &tasks,
                     events: &events,
+                    timers: &timers,
                     channels: &channels,
                     waits: &waits,
                 },
@@ -1506,6 +1550,7 @@ mod tests {
     fn closing_final_handle_while_waiting_defers_typed_finalization_until_timeout_cleanup() {
         let (mut registry, mut tasks, execution, process, thread) = running_fixture();
         let events = Events::new();
+        let timers = Timers::new();
         let channels = Channels::new();
         let waits = Waits::new();
         let (_event_key, event) = install_event(&mut registry, &mut tasks, &events, process);
@@ -1525,6 +1570,7 @@ mod tests {
                 sources: WaitSources {
                     tasks: &tasks,
                     events: &events,
+                    timers: &timers,
                     channels: &channels,
                     waits: &waits,
                 },
@@ -1584,6 +1630,7 @@ mod tests {
     fn timeout_claim_between_registration_and_block_commit_returns_without_blocking() {
         let (mut registry, mut tasks, execution, process, thread) = running_fixture();
         let events = Events::new();
+        let timers = Timers::new();
         let channels = Channels::new();
         let waits = Waits::new();
         let (_event_key, event) = install_event(&mut registry, &mut tasks, &events, process);
@@ -1606,6 +1653,7 @@ mod tests {
                 sources: WaitSources {
                     tasks: &tasks,
                     events: &events,
+                    timers: &timers,
                     channels: &channels,
                     waits: &waits,
                 },

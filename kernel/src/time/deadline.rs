@@ -67,21 +67,23 @@ pub(crate) fn apic_one_shot_for_delta(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DeadlineEntry {
+struct DeadlineEntry<T: Copy> {
     deadline_ns: u64,
-    wake: BlockWakeKey,
+    payload: T,
 }
 
 #[derive(Clone, Copy)]
-struct DeadlineSlot {
+struct DeadlineSlot<T: Copy> {
     generation: u32,
-    entry: Option<DeadlineEntry>,
+    entry: Option<DeadlineEntry<T>>,
 }
 
-const EMPTY_SLOT: DeadlineSlot = DeadlineSlot {
-    generation: 0,
-    entry: None,
-};
+const fn empty_slot<T: Copy>() -> DeadlineSlot<T> {
+    DeadlineSlot {
+        generation: 0,
+        entry: None,
+    }
+}
 
 #[must_use = "deadline registrations must be cancelled or consumed by expiry"]
 #[derive(Debug)]
@@ -102,23 +104,26 @@ pub(crate) enum DeadlineQueueError {
     ArithmeticOverflow,
 }
 
-pub(crate) struct DeadlineQueue<const CAPACITY: usize = DEADLINE_QUEUE_CAPACITY> {
+pub(crate) struct DeadlineQueue<
+    const CAPACITY: usize = DEADLINE_QUEUE_CAPACITY,
+    T: Copy = BlockWakeKey,
+> {
     domain: u64,
-    slots: [DeadlineSlot; CAPACITY],
+    slots: [DeadlineSlot<T>; CAPACITY],
 }
 
-impl<const CAPACITY: usize> DeadlineQueue<CAPACITY> {
+impl<const CAPACITY: usize, T: Copy> DeadlineQueue<CAPACITY, T> {
     pub(crate) fn new() -> Self {
         Self {
             domain: mint_domain(),
-            slots: [EMPTY_SLOT; CAPACITY],
+            slots: [empty_slot(); CAPACITY],
         }
     }
 
     pub(crate) fn register(
         &mut self,
         deadline_ns: u64,
-        wake: BlockWakeKey,
+        payload: T,
     ) -> Result<DeadlineRegistration, DeadlineQueueError> {
         if deadline_ns == DW_DEADLINE_NOW.0 || deadline_ns == DW_DEADLINE_INFINITE.0 {
             return Err(DeadlineQueueError::InvalidDeadline);
@@ -136,7 +141,10 @@ impl<const CAPACITY: usize> DeadlineQueue<CAPACITY> {
             .filter(|value| *value != 0)
             .ok_or(DeadlineQueueError::GenerationExhausted)?;
         entry.generation = generation;
-        entry.entry = Some(DeadlineEntry { deadline_ns, wake });
+        entry.entry = Some(DeadlineEntry {
+            deadline_ns,
+            payload,
+        });
         Ok(DeadlineRegistration {
             domain: self.domain,
             slot,
@@ -147,7 +155,7 @@ impl<const CAPACITY: usize> DeadlineQueue<CAPACITY> {
     pub(crate) fn cancel(
         &mut self,
         registration: DeadlineRegistration,
-    ) -> Result<BlockWakeKey, DeadlineQueueError> {
+    ) -> Result<T, DeadlineQueueError> {
         if registration.domain != self.domain {
             return Err(DeadlineQueueError::ForeignRegistration);
         }
@@ -160,20 +168,53 @@ impl<const CAPACITY: usize> DeadlineQueue<CAPACITY> {
         }
         slot.entry
             .take()
-            .map(|entry| entry.wake)
+            .map(|entry| entry.payload)
             .ok_or(DeadlineQueueError::StaleRegistration)
     }
 
-    /// Cancels a deadline if this exact registration is still queued.
-    ///
-    /// `Ok(None)` means the exact generation was already consumed by expiry,
-    /// or the slot has since advanced beyond it. This is the normal cleanup
-    /// case when a signal and timer interrupt race and signal wins the separate
-    /// blocked-operation winner ledger. Foreign authority still fails closed.
-    pub(crate) fn cancel_if_live(
+    pub(crate) fn replace_if_live(
         &mut self,
-        registration: DeadlineRegistration,
-    ) -> Result<Option<BlockWakeKey>, DeadlineQueueError> {
+        registration: &DeadlineRegistration,
+        deadline_ns: u64,
+        payload: T,
+    ) -> Result<Option<DeadlineRegistration>, DeadlineQueueError> {
+        if deadline_ns == DW_DEADLINE_NOW.0 || deadline_ns == DW_DEADLINE_INFINITE.0 {
+            return Err(DeadlineQueueError::InvalidDeadline);
+        }
+        if registration.domain != self.domain {
+            return Err(DeadlineQueueError::ForeignRegistration);
+        }
+        let slot = self
+            .slots
+            .get_mut(usize::from(registration.slot))
+            .ok_or(DeadlineQueueError::StaleRegistration)?;
+        if slot.generation < registration.generation {
+            return Err(DeadlineQueueError::StaleRegistration);
+        }
+        if slot.generation > registration.generation || slot.entry.is_none() {
+            return Ok(None);
+        }
+        let generation = slot
+            .generation
+            .checked_add(1)
+            .filter(|value| *value != 0)
+            .ok_or(DeadlineQueueError::GenerationExhausted)?;
+        slot.generation = generation;
+        slot.entry = Some(DeadlineEntry {
+            deadline_ns,
+            payload,
+        });
+        Ok(Some(DeadlineRegistration {
+            domain: self.domain,
+            slot: registration.slot,
+            generation,
+        }))
+    }
+
+    pub(crate) fn cancel_if_live_ref(
+        &mut self,
+        registration: &DeadlineRegistration,
+    ) -> Result<Option<T>, DeadlineQueueError> {
         if registration.domain != self.domain {
             return Err(DeadlineQueueError::ForeignRegistration);
         }
@@ -187,7 +228,20 @@ impl<const CAPACITY: usize> DeadlineQueue<CAPACITY> {
         if slot.generation > registration.generation {
             return Ok(None);
         }
-        Ok(slot.entry.take().map(|entry| entry.wake))
+        Ok(slot.entry.take().map(|entry| entry.payload))
+    }
+
+    /// Cancels a deadline if this exact registration is still queued.
+    ///
+    /// `Ok(None)` means the exact generation was already consumed by expiry,
+    /// or the slot has since advanced beyond it. This is the normal cleanup
+    /// case when a signal and timer interrupt race and signal wins the separate
+    /// blocked-operation winner ledger. Foreign authority still fails closed.
+    pub(crate) fn cancel_if_live(
+        &mut self,
+        registration: DeadlineRegistration,
+    ) -> Result<Option<T>, DeadlineQueueError> {
+        self.cancel_if_live_ref(&registration)
     }
 
     pub(crate) fn earliest(&self) -> Option<u64> {
@@ -197,17 +251,13 @@ impl<const CAPACITY: usize> DeadlineQueue<CAPACITY> {
             .min()
     }
 
-    pub(crate) fn expire(
-        &mut self,
-        now_ns: u64,
-        output: &mut [Option<BlockWakeKey>; CAPACITY],
-    ) -> usize {
+    pub(crate) fn expire(&mut self, now_ns: u64, output: &mut [Option<T>; CAPACITY]) -> usize {
         output.fill(None);
         let mut count = 0;
         for slot in &mut self.slots {
             if slot.entry.is_some_and(|entry| entry.deadline_ns <= now_ns) {
                 let entry = slot.entry.take().expect("deadline entry was observed live");
-                output[count] = Some(entry.wake);
+                output[count] = Some(entry.payload);
                 count += 1;
             }
         }
@@ -242,6 +292,22 @@ mod tests {
             DeadlineClass::Infinite
         );
         assert_eq!(classify_deadline(DwDeadline(9)), DeadlineClass::Finite(9));
+    }
+
+    #[test]
+    fn live_replacement_reuses_exact_slot_and_stales_old_registration() {
+        let mut queue = DeadlineQueue::<1, u32>::new();
+        let old = queue.register(100, 1).unwrap();
+        let new = queue
+            .replace_if_live(&old, 200, 2)
+            .unwrap()
+            .expect("live deadline is replaced in its exact slot");
+        assert_eq!(queue.earliest(), Some(200));
+        assert_eq!(queue.cancel_if_live(old).unwrap(), None);
+        let mut expired = [None; 1];
+        assert_eq!(queue.expire(200, &mut expired), 1);
+        assert_eq!(expired[0], Some(2));
+        assert_eq!(queue.cancel_if_live(new).unwrap(), None);
     }
 
     #[test]

@@ -6,7 +6,7 @@
 use deepwyrm_abi::{
     DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_EVENT,
     DW_OBJECT_TYPE_MEMORY_OBJECT, DW_OBJECT_TYPE_PROCESS, DW_OBJECT_TYPE_TASK_GROUP,
-    DW_OBJECT_TYPE_THREAD,
+    DW_OBJECT_TYPE_THREAD, DW_OBJECT_TYPE_TIMER,
 };
 
 use crate::ipc::{ChannelAuthority, complete_channel_finalization};
@@ -16,6 +16,7 @@ use crate::memory::address_region::{
 use crate::memory::frame_roles::FrameRoleManager;
 use crate::memory::object::{MemoryObjectAuthority, complete_memory_finalization};
 use crate::task::{TaskAuthority, complete_task_finalization};
+use crate::time::{TimerAuthority, TimerDeadlineAuthority, complete_timer_finalization};
 use crate::wait::{EventAuthority, WaitRegistry, WakeBatch, complete_event_finalization};
 
 use super::{FinalRelease, ObjectRegistry};
@@ -30,6 +31,7 @@ pub(crate) struct PayloadFinalizer<
     const MEMORY_OBJECTS: usize,
     const LEASES: usize,
     const EVENTS: usize,
+    const TIMERS: usize,
     const CHANNEL_PAIRS: usize,
     const CHANNEL_DEPTH: usize,
     const WAITERS: usize,
@@ -46,6 +48,8 @@ pub(crate) struct PayloadFinalizer<
     roles: &'a mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
     memory: &'a mut MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
     events: &'a EventAuthority<EVENTS>,
+    timers: &'a TimerAuthority<TIMERS>,
+    timer_deadlines: &'a mut dyn TimerDeadlineAuthority,
     channels: &'a ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
     waits: &'a WaitRegistry<WAITERS>,
     tasks: &'a mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
@@ -61,6 +65,7 @@ impl<
     const MEMORY_OBJECTS: usize,
     const LEASES: usize,
     const EVENTS: usize,
+    const TIMERS: usize,
     const CHANNEL_PAIRS: usize,
     const CHANNEL_DEPTH: usize,
     const WAITERS: usize,
@@ -81,6 +86,7 @@ impl<
         MEMORY_OBJECTS,
         LEASES,
         EVENTS,
+        TIMERS,
         CHANNEL_PAIRS,
         CHANNEL_DEPTH,
         WAITERS,
@@ -103,6 +109,8 @@ impl<
         roles: &'a mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
         memory: &'a mut MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
         events: &'a EventAuthority<EVENTS>,
+        timers: &'a TimerAuthority<TIMERS>,
+        timer_deadlines: &'a mut dyn TimerDeadlineAuthority,
         channels: &'a ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
         waits: &'a WaitRegistry<WAITERS>,
         tasks: &'a mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
@@ -114,6 +122,8 @@ impl<
             roles,
             memory,
             events,
+            timers,
+            timer_deadlines,
             channels,
             waits,
             tasks,
@@ -186,6 +196,16 @@ impl<
                 complete_event_finalization(self.registry, finalization);
                 WakeBatch::empty()
             }
+            DW_OBJECT_TYPE_TIMER => {
+                let finalization = self
+                    .timers
+                    .take_finalization(final_release, self.timer_deadlines)
+                    .unwrap_or_else(|(error, _)| {
+                        panic!("Timer final release bypassed its typed payload: {error:?}")
+                    });
+                complete_timer_finalization(self.registry, finalization);
+                WakeBatch::empty()
+            }
             DW_OBJECT_TYPE_CHANNEL => {
                 let finalization = self
                     .channels
@@ -242,6 +262,68 @@ fn push_pending<const CAPACITY: usize>(
 }
 
 #[cfg(test)]
+struct TestTimerDeadlines<const N: usize> {
+    now: u64,
+    queue: crate::time::DeadlineQueue<N, crate::time::TimerExpiryToken>,
+}
+
+#[cfg(test)]
+impl<const N: usize> TestTimerDeadlines<N> {
+    fn new(now: u64) -> Self {
+        Self {
+            now,
+            queue: crate::time::DeadlineQueue::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl<const N: usize> TimerDeadlineAuthority for TestTimerDeadlines<N> {
+    fn replace_timer_deadline(
+        &mut self,
+        old: Option<&crate::time::DeadlineRegistration>,
+        deadline_ns: u64,
+        token: crate::time::TimerExpiryToken,
+    ) -> Result<Option<crate::time::DeadlineRegistration>, crate::time::TimerDeadlineError> {
+        if deadline_ns <= self.now {
+            if let Some(old) = old {
+                self.queue
+                    .cancel_if_live_ref(old)
+                    .map_err(|_| crate::time::TimerDeadlineError::Fault)?;
+            }
+            return Ok(None);
+        }
+        if let Some(old) = old
+            && let Some(registration) = self
+                .queue
+                .replace_if_live(old, deadline_ns, token)
+                .map_err(|_| crate::time::TimerDeadlineError::Fault)?
+        {
+            return Ok(Some(registration));
+        }
+        self.queue
+            .register(deadline_ns, token)
+            .map(Some)
+            .map_err(|error| match error {
+                crate::time::DeadlineQueueError::Capacity => {
+                    crate::time::TimerDeadlineError::Capacity
+                }
+                _ => crate::time::TimerDeadlineError::Fault,
+            })
+    }
+
+    fn cancel_timer_deadline(
+        &mut self,
+        registration: crate::time::DeadlineRegistration,
+    ) -> Result<(), crate::time::TimerDeadlineError> {
+        self.queue
+            .cancel_if_live(registration)
+            .map(|_| ())
+            .map_err(|_| crate::time::TimerDeadlineError::Fault)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::memory::address_region::{AddressRegionObjectAuthority, AddressSpaceAuthority};
@@ -257,6 +339,8 @@ mod tests {
         let mut roles = synthetic_frame_role_manager::<1, 8>(0x30_000, 4);
         let mut memory = MemoryObjectAuthority::<1, 1>::new();
         let events = EventAuthority::<1>::new();
+        let timers = TimerAuthority::<1>::new();
+        let mut timer_deadlines = TestTimerDeadlines::<2>::new(0);
         let channels = ChannelAuthority::<1, 2>::new();
         let waits = WaitRegistry::<4>::new();
         let mut tasks = TaskAuthority::<1, 1, 1, 1>::new();
@@ -272,6 +356,8 @@ mod tests {
                 &mut roles,
                 &mut memory,
                 &events,
+                &timers,
+                &mut timer_deadlines,
                 &channels,
                 &waits,
                 &mut tasks,
@@ -291,6 +377,8 @@ mod tests {
             &mut roles,
             &mut memory,
             &events,
+            &timers,
+            &mut timer_deadlines,
             &channels,
             &waits,
             &mut tasks,
@@ -310,6 +398,8 @@ mod tests {
         let mut roles = synthetic_frame_role_manager::<1, 8>(0x10_000, 4);
         let mut memory = MemoryObjectAuthority::<1, 1>::new();
         let events = EventAuthority::<1>::new();
+        let timers = TimerAuthority::<1>::new();
+        let mut timer_deadlines = TestTimerDeadlines::<2>::new(0);
         let channels = ChannelAuthority::<1, 2>::new();
         let waits = WaitRegistry::<4>::new();
         let mut tasks = TaskAuthority::<2, 2, 2, 2>::new();
@@ -356,6 +446,8 @@ mod tests {
                 &mut roles,
                 &mut memory,
                 &events,
+                &timers,
+                &mut timer_deadlines,
                 &channels,
                 &waits,
                 &mut tasks,
@@ -371,6 +463,8 @@ mod tests {
             &mut roles,
             &mut memory,
             &events,
+            &timers,
+            &mut timer_deadlines,
             &channels,
             &waits,
             &mut tasks,
@@ -393,6 +487,8 @@ mod tests {
         let mut roles = synthetic_frame_role_manager::<1, 8>(0x34_000, 4);
         let mut memory = MemoryObjectAuthority::<1, 1>::new();
         let events = EventAuthority::<1>::new();
+        let timers = TimerAuthority::<1>::new();
+        let mut timer_deadlines = TestTimerDeadlines::<2>::new(0);
         let channels = ChannelAuthority::<1, 2>::new();
         let waits = WaitRegistry::<4>::new();
         let mut tasks = TaskAuthority::<1, 1, 1, 1>::new();
@@ -432,6 +528,8 @@ mod tests {
                 &mut roles,
                 &mut memory,
                 &events,
+                &timers,
+                &mut timer_deadlines,
                 &channels,
                 &waits,
                 &mut tasks,
@@ -451,6 +549,8 @@ mod tests {
                 &mut roles,
                 &mut memory,
                 &events,
+                &timers,
+                &mut timer_deadlines,
                 &channels,
                 &waits,
                 &mut tasks,
@@ -465,6 +565,79 @@ mod tests {
             &mut roles,
             &mut memory,
             &events,
+            &timers,
+            &mut timer_deadlines,
+            &channels,
+            &waits,
+            &mut tasks,
+            &mut spaces,
+            &mut regions,
+        );
+        assert_eq!(finalizer.finalize_chain(replacement_final).len(), 0);
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "test-local AddressSpaceAuthority uniquely owns its synthetic root identities"
+    )]
+    fn armed_timer_finalization_cancels_deadline_before_generic_release() {
+        let mut registry = ObjectRegistry::<4>::new();
+        let mut roles = synthetic_frame_role_manager::<1, 8>(0x40_000, 4);
+        let mut memory = MemoryObjectAuthority::<1, 1>::new();
+        let events = EventAuthority::<1>::new();
+        let timers = TimerAuthority::<1>::new();
+        let mut timer_deadlines = TestTimerDeadlines::<1>::new(10);
+        let channels = ChannelAuthority::<1, 2>::new();
+        let waits = WaitRegistry::<2>::new();
+        let mut tasks = TaskAuthority::<1, 1, 1, 1>::new();
+        let mut spaces = unsafe { AddressSpaceAuthority::<1, 1>::new() };
+        let mut regions = AddressRegionObjectAuthority::<1, 1>::new();
+
+        let (key, handle) = timers.create_timer(&mut registry).unwrap();
+        let wakes = timers
+            .set(
+                key,
+                deepwyrm_abi::DwDeadline(100),
+                &mut timer_deadlines,
+                &waits,
+            )
+            .unwrap();
+        assert_eq!(wakes.len(), 0);
+        let (wake_intents, pins) = wakes.into_parts();
+        assert!(wake_intents.into_iter().flatten().next().is_none());
+        assert!(pins.into_iter().flatten().next().is_none());
+        assert_eq!(timer_deadlines.queue.earliest(), Some(100));
+
+        let final_release = registry.release_handle(handle).unwrap().unwrap();
+        {
+            let mut finalizer = PayloadFinalizer::new(
+                &mut registry,
+                &mut roles,
+                &mut memory,
+                &events,
+                &timers,
+                &mut timer_deadlines,
+                &channels,
+                &waits,
+                &mut tasks,
+                &mut spaces,
+                &mut regions,
+            );
+            assert_eq!(finalizer.finalize_chain(final_release).len(), 0);
+        }
+        assert_eq!(timer_deadlines.queue.earliest(), None);
+        assert!(timers.current_signals(key).is_err());
+
+        let (_replacement_key, replacement) = timers.create_timer(&mut registry).unwrap();
+        let replacement_final = registry.release_handle(replacement).unwrap().unwrap();
+        let mut finalizer = PayloadFinalizer::new(
+            &mut registry,
+            &mut roles,
+            &mut memory,
+            &events,
+            &timers,
+            &mut timer_deadlines,
             &channels,
             &waits,
             &mut tasks,
@@ -498,6 +671,8 @@ mod memory_route_tests {
         let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
         let mut memory = MemoryObjectAuthority::<1, 1>::new();
         let events = EventAuthority::<1>::new();
+        let timers = TimerAuthority::<1>::new();
+        let mut timer_deadlines = TestTimerDeadlines::<2>::new(0);
         let channels = ChannelAuthority::<1, 2>::new();
         let waits = WaitRegistry::<4>::new();
         let binding = memory
@@ -522,6 +697,8 @@ mod memory_route_tests {
                 &mut roles,
                 &mut memory,
                 &events,
+                &timers,
+                &mut timer_deadlines,
                 &channels,
                 &waits,
                 &mut tasks,
