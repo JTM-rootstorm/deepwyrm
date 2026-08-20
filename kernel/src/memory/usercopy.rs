@@ -44,6 +44,26 @@ pub(crate) trait UserPageBatchAccess: UserPageAccess {
     ) -> Result<Self::PinnedBatch<'_>, Self::Error>;
 }
 
+/// Acquires a writable userspace output whose mapping-stability authority can
+/// outlive the short Rust borrow used to preflight it. Blocking syscalls use
+/// this surface so no borrow-shaped usercopy guard crosses a context switch.
+///
+/// After successful preflight, commit/discard are infallible kernel invariants:
+/// a recoverable userspace fault must have been detected before the owner was
+/// detached. Implementations fail stopped if the owned token later drifts.
+pub(crate) trait OwnedUserOutputAccess: UserPageAccess {
+    type OwnedOutput;
+
+    fn preflight_owned_output(
+        &mut self,
+        range: UserRange,
+    ) -> Result<Self::OwnedOutput, Self::Error>;
+
+    fn commit_owned_output(&mut self, output: Self::OwnedOutput, source: &[u8]);
+
+    fn discard_owned_output(&mut self, output: Self::OwnedOutput);
+}
+
 pub(crate) trait PinnedUserBatchPages {
     type Error;
 

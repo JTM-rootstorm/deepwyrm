@@ -32,7 +32,7 @@ mod graph;
 mod user_access;
 use graph::*;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub(crate) use user_access::LiveProcessAddressSpace;
+pub(crate) use user_access::{LiveProcessAddressSpace, OwnedLiveUserOutput};
 #[path = "activation/build.rs"]
 mod build;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]

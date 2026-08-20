@@ -3,8 +3,8 @@ use super::*;
 use crate::memory::frame_roles::{ObjectBackingGrant, TableCandidateGrant};
 use crate::memory::user_range::{UserAccess, UserPageChunk, UserRange};
 use crate::memory::usercopy::{
-    PinnedUserBatchPages, PinnedUserPages, UserPageAccess, UserPageBatchAccess, UserPinError,
-    UserPinTracker, UserRangePin, UserRangePinToken,
+    OwnedUserOutputAccess, PinnedUserBatchPages, PinnedUserPages, UserPageAccess,
+    UserPageBatchAccess, UserPinError, UserPinTracker, UserRangePin, UserRangePinToken,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,6 +110,12 @@ pub(crate) struct OwnedLiveUserOutput {
     token: UserRangePinToken,
 }
 
+impl OwnedLiveUserOutput {
+    pub(crate) const fn process(&self) -> crate::task::ProcessKey {
+        self.process
+    }
+}
+
 pub(crate) struct PinnedLiveUserPages<'tracker> {
     _pin: UserRangePin<'tracker, E5_USER_PIN_CAPACITY>,
     range: UserRange,
@@ -174,6 +180,29 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> Us
             _pins: pins,
             ranges,
         })
+    }
+}
+
+impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> OwnedUserOutputAccess
+    for LiveProcessAddressSpace<'borrow, 'root, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    type OwnedOutput = OwnedLiveUserOutput;
+
+    fn preflight_owned_output(
+        &mut self,
+        range: UserRange,
+    ) -> Result<Self::OwnedOutput, Self::Error> {
+        LiveProcessAddressSpace::preflight_owned_output(self, range)
+    }
+
+    fn commit_owned_output(&mut self, output: Self::OwnedOutput, source: &[u8]) {
+        LiveProcessAddressSpace::commit_owned_output(self, output, source)
+            .unwrap_or_else(|error| panic!("owned wait output commit drifted: {error:?}"));
+    }
+
+    fn discard_owned_output(&mut self, output: Self::OwnedOutput) {
+        LiveProcessAddressSpace::discard_owned_output(self, output)
+            .unwrap_or_else(|error| panic!("owned wait output discard drifted: {error:?}"));
     }
 }
 

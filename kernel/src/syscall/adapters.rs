@@ -34,28 +34,29 @@ use crate::ipc::{ChannelAuthority, ChannelCreateError, ChannelEndpointKey, Chann
 use crate::memory::object::MemoryObjectAuthority;
 use crate::memory::user_range::{EmptyAddressRule, UserAccess, UserAddressSpace, UserRange};
 use crate::memory::usercopy::{
-    PinnedUserOutput, PinnedUserOutputs, UserCopyError, UserPageAccess, UserPageBatchAccess,
-    copy_from_user, copy_to_user, preflight_user_output, preflight_user_outputs,
-    snapshot_from_user,
+    OwnedUserOutputAccess, PinnedUserOutput, PinnedUserOutputs, UserCopyError, UserPageAccess,
+    UserPageBatchAccess, copy_from_user, copy_to_user, preflight_user_output,
+    preflight_user_outputs, snapshot_from_user,
 };
 use crate::object::{FinalRelease, HandleRef, InternalRef, ObjectRegistry, ObjectRegistryError};
 use crate::task::{
-    BlockWakeKey, ExecutionDomain, ExecutionResourceError, ProcessExitEffects, ProcessKey,
-    RetiredExitPins, ScheduleDecision, SchedulerError, SchedulerThreadState, StartThreadError,
-    TaskAuthority, TaskCreateError, TaskError, TaskGroupKey, TaskGroupTerminationEffects,
-    ThreadKey, ThreadStartState,
+    BlockWakeKey, ExecutionDomain, ExecutionResourceError, ExecutionSwitchError,
+    IdleScheduleDecision, ProcessExitEffects, ProcessKey, RetiredExitPins, ScheduleDecision,
+    SchedulerError, SchedulerThreadState, StartThreadError, TaskAuthority, TaskCreateError,
+    TaskError, TaskGroupKey, TaskGroupTerminationEffects, ThreadKey, ThreadStartState,
 };
 use crate::wait::{
     EventAuthority, EventCreateError, EventKey, WaitError, WaitRegistry, WakeBatch,
     engine::{
         ResolvedWaitSet, WaitBeginContext, WaitBeginError, WaitBeginOutcome, WaitDeadline,
-        WaitDeadlineAuthority, WaitSetError, WaitSources, begin_registered_wait,
+        WaitDeadlineAuthority, WaitFinishError, WaitSetError, WaitSources, begin_registered_wait,
+        finish_wait_operation,
     },
     operation::WaitOperationRegistry,
     validate_event_signal_masks,
 };
 
-use super::native::SyscallControl;
+use super::native::{NativeIdleSuspendPoll, NativeSuspendPlan, SyscallControl};
 
 use super::abi_bytes::{
     HANDLE_TRANSFER_BYTES, THREAD_START_BYTES, WAIT_ITEM_BYTES, decode_handle_transfer,
@@ -1330,6 +1331,106 @@ fn complete_wait_wakes<const OBJECTS: usize, const WAITERS: usize, const EXECUTI
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WaitSuspendState {
+    wake: BlockWakeKey,
+    decision: ScheduleDecision,
+}
+
+impl WaitSuspendState {
+    pub(crate) const fn wake_key(self) -> BlockWakeKey {
+        self.wake
+    }
+
+    pub(crate) const fn decision(self) -> ScheduleDecision {
+        self.decision
+    }
+}
+
+#[must_use = "native wait dispatch must either return to userspace or consume the suspension state"]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WaitSyscallAction {
+    Returning(DwStatus),
+    Suspended(WaitSuspendState),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WaitSuspendError {
+    InvalidDecision,
+    Scheduler(SchedulerError),
+    Switch(ExecutionSwitchError),
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the runtime supplies a stationary execution owner and consumes the validated switch plan immediately at the F7 suspension boundary"
+)]
+pub(crate) fn prepare_wait_suspend_plan<
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EXECUTION: usize,
+>(
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    state: WaitSuspendState,
+    trusted_first_run_entry: u64,
+) -> Result<NativeSuspendPlan, WaitSuspendError> {
+    let decision = state.decision();
+    if decision.previous.is_none() {
+        return Err(WaitSuspendError::InvalidDecision);
+    }
+    if decision.current.is_none() {
+        return Ok(NativeSuspendPlan::IdleCurrent);
+    }
+    let plan = unsafe {
+        execution.prepare_blocking_kernel_switch(tasks, decision, trusted_first_run_entry)
+    }
+    .map_err(WaitSuspendError::Switch)?;
+    Ok(NativeSuspendPlan::Switch(plan))
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the idle syscall continuation remains physically active while FIFO scheduling selects and immediately consumes the audited switch plan"
+)]
+pub(crate) fn poll_wait_idle_suspend<
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EXECUTION: usize,
+>(
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    state: WaitSuspendState,
+    trusted_first_run_entry: u64,
+) -> Result<NativeIdleSuspendPoll, WaitSuspendError> {
+    let suspended = state
+        .decision()
+        .previous
+        .ok_or(WaitSuspendError::InvalidDecision)?;
+    match execution
+        .schedule_from_idle(suspended)
+        .map_err(WaitSuspendError::Scheduler)?
+    {
+        IdleScheduleDecision::ContinueIdle => Ok(NativeIdleSuspendPoll::Continue),
+        IdleScheduleDecision::ResumeCurrent => Ok(NativeIdleSuspendPoll::ResumeCurrent),
+        IdleScheduleDecision::Switch(decision) => {
+            let plan = unsafe {
+                execution.prepare_idle_blocking_kernel_switch(
+                    tasks,
+                    decision,
+                    trusted_first_run_entry,
+                )
+            }
+            .map_err(WaitSuspendError::Switch)?;
+            Ok(NativeIdleSuspendPoll::Switch(plan))
+        }
+    }
+}
+
 #[must_use = "wait begin outcomes either return the output authority or transfer it to a suspended operation"]
 pub(crate) enum WaitSyscallBegin<OUTPUT> {
     Returning {
@@ -1511,6 +1612,96 @@ pub(crate) fn wait_one_begin<
     }
 }
 
+fn validate_wait_many_shape(item_count: u32, mode: u32) -> Result<usize, DwStatus> {
+    if item_count == 0 || item_count > DW_WAIT_MANY_MAX_ITEMS {
+        return Err(DW_STATUS_INVALID_ARGUMENT);
+    }
+    if mode == DW_WAIT_MODE_ALL {
+        return Err(DW_STATUS_NOT_SUPPORTED);
+    }
+    if mode != DW_WAIT_MODE_ANY {
+        return Err(DW_STATUS_INVALID_ARGUMENT);
+    }
+    Ok(item_count as usize)
+}
+
+fn snapshot_wait_many_requests<U: UserPageAccess>(
+    user: &mut U,
+    items: DwUserAddress,
+    item_count: u32,
+    mode: u32,
+) -> Result<([DwWaitItemV1; DW_WAIT_MANY_MAX_ITEMS as usize], usize), DwStatus> {
+    let count = validate_wait_many_shape(item_count, mode)?;
+    let byte_len = count * WAIT_ITEM_BYTES;
+    let range = user_range(items, byte_len, 8, UserAccess::READ)?;
+    let mut bytes = [0_u8; DW_WAIT_MANY_MAX_ITEMS as usize * WAIT_ITEM_BYTES];
+    snapshot_from_user(user, range, &mut bytes[..byte_len]).map_err(usercopy_status)?;
+
+    let mut requests = [DwWaitItemV1::default(); DW_WAIT_MANY_MAX_ITEMS as usize];
+    for (index, request) in requests[..count].iter_mut().enumerate() {
+        let start = index * WAIT_ITEM_BYTES;
+        let record: &[u8; WAIT_ITEM_BYTES] = bytes[start..start + WAIT_ITEM_BYTES]
+            .try_into()
+            .expect("wait item staging follows generated fixed width");
+        *request = decode_wait_item(record);
+        if request.signals.0 == 0 || !deepwyrm_abi::dw_signals_are_known(request.signals) {
+            return Err(DW_STATUS_INVALID_ARGUMENT);
+        }
+    }
+    Ok((requests, count))
+}
+
+fn wait_many_requests_begin<
+    OUTPUT,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EVENTS: usize,
+    const CHANNEL_PAIRS: usize,
+    const CHANNEL_DEPTH: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    output: OUTPUT,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    events: &EventAuthority<EVENTS>,
+    channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
+    waits: &WaitRegistry<WAITERS>,
+    execution: &ExecutionDomain<EXECUTION>,
+    operations: &mut WaitOperationRegistry<OUTPUT, EXECUTION>,
+    deadline_authority: Option<&mut dyn WaitDeadlineAuthority>,
+    process: ProcessKey,
+    thread: ThreadKey,
+    requests: &[DwWaitItemV1],
+    deadline: DwDeadline,
+) -> WaitSyscallBegin<OUTPUT> {
+    match ResolvedWaitSet::resolve(tasks, registry, process, requests) {
+        Ok(set) => begin_wait_set(
+            set,
+            output,
+            deadline,
+            registry,
+            tasks,
+            events,
+            channels,
+            waits,
+            execution,
+            operations,
+            deadline_authority,
+            process,
+            thread,
+        ),
+        Err(error) => WaitSyscallBegin::Returning {
+            status: wait_set_status(error),
+            output,
+            result: None,
+        },
+    }
+}
+
 pub(crate) fn wait_many_begin<
     U: UserPageAccess,
     OUTPUT,
@@ -1542,31 +1733,8 @@ pub(crate) fn wait_many_begin<
     mode: u32,
     deadline: DwDeadline,
 ) -> WaitSyscallBegin<OUTPUT> {
-    if item_count == 0 || item_count > DW_WAIT_MANY_MAX_ITEMS {
-        return WaitSyscallBegin::Returning {
-            status: DW_STATUS_INVALID_ARGUMENT,
-            output,
-            result: None,
-        };
-    }
-    if mode == DW_WAIT_MODE_ALL {
-        return WaitSyscallBegin::Returning {
-            status: DW_STATUS_NOT_SUPPORTED,
-            output,
-            result: None,
-        };
-    }
-    if mode != DW_WAIT_MODE_ANY {
-        return WaitSyscallBegin::Returning {
-            status: DW_STATUS_INVALID_ARGUMENT,
-            output,
-            result: None,
-        };
-    }
-    let count = item_count as usize;
-    let byte_len = count * WAIT_ITEM_BYTES;
-    let range = match user_range(items, byte_len, 8, UserAccess::READ) {
-        Ok(range) => range,
+    let (requests, count) = match snapshot_wait_many_requests(user, items, item_count, mode) {
+        Ok(requests) => requests,
         Err(status) => {
             return WaitSyscallBegin::Returning {
                 status,
@@ -1575,27 +1743,99 @@ pub(crate) fn wait_many_begin<
             };
         }
     };
-    let mut bytes = [0_u8; DW_WAIT_MANY_MAX_ITEMS as usize * WAIT_ITEM_BYTES];
-    if let Err(error) = snapshot_from_user(user, range, &mut bytes[..byte_len]) {
-        return WaitSyscallBegin::Returning {
-            status: usercopy_status(error),
+    wait_many_requests_begin(
+        output,
+        registry,
+        tasks,
+        events,
+        channels,
+        waits,
+        execution,
+        operations,
+        deadline_authority,
+        process,
+        thread,
+        &requests[..count],
+        deadline,
+    )
+}
+
+fn preflight_owned_wait_output<U: OwnedUserOutputAccess>(
+    user: &mut U,
+    out_result: DwUserAddress,
+) -> Result<U::OwnedOutput, DwStatus> {
+    let range = user_range(
+        out_result,
+        DW_WAIT_RESULT_V1_SIZE as usize,
+        8,
+        UserAccess::WRITE,
+    )?;
+    user.preflight_owned_output(range)
+        .map_err(|_| DW_STATUS_BAD_ADDRESS)
+}
+
+fn finish_wait_begin<U: OwnedUserOutputAccess>(
+    user: &mut U,
+    begin: WaitSyscallBegin<U::OwnedOutput>,
+) -> WaitSyscallAction {
+    match begin {
+        WaitSyscallBegin::Returning {
+            status,
             output,
-            result: None,
-        };
+            result,
+        } => {
+            match result {
+                Some(result) => {
+                    assert_eq!(status, DW_STATUS_SUCCESS);
+                    user.commit_owned_output(output, &result);
+                }
+                None => user.discard_owned_output(output),
+            }
+            WaitSyscallAction::Returning(status)
+        }
+        WaitSyscallBegin::Suspended { wake, decision } => {
+            WaitSyscallAction::Suspended(WaitSuspendState { wake, decision })
+        }
     }
-    let mut requests = [DwWaitItemV1::default(); DW_WAIT_MANY_MAX_ITEMS as usize];
-    for (index, request) in requests[..count].iter_mut().enumerate() {
-        let start = index * WAIT_ITEM_BYTES;
-        let record: &[u8; WAIT_ITEM_BYTES] = bytes[start..start + WAIT_ITEM_BYTES]
-            .try_into()
-            .expect("wait item staging follows generated fixed width");
-        *request = decode_wait_item(record);
-    }
-    match ResolvedWaitSet::resolve(tasks, registry, process, &requests[..count]) {
-        Ok(set) => begin_wait_set(
-            set,
+}
+
+pub(crate) fn wait_one_syscall<
+    U: OwnedUserOutputAccess,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EVENTS: usize,
+    const CHANNEL_PAIRS: usize,
+    const CHANNEL_DEPTH: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    user: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    events: &EventAuthority<EVENTS>,
+    channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
+    waits: &WaitRegistry<WAITERS>,
+    execution: &ExecutionDomain<EXECUTION>,
+    operations: &mut WaitOperationRegistry<U::OwnedOutput, EXECUTION>,
+    deadline_authority: Option<&mut dyn WaitDeadlineAuthority>,
+    process: ProcessKey,
+    thread: ThreadKey,
+    handle: DwHandle,
+    signals: DwSignals,
+    deadline: DwDeadline,
+    out_result: DwUserAddress,
+) -> WaitSyscallAction {
+    let output = match preflight_owned_wait_output(user, out_result) {
+        Ok(output) => output,
+        Err(status) => return WaitSyscallAction::Returning(status),
+    };
+    finish_wait_begin(
+        user,
+        wait_one_begin(
             output,
-            deadline,
             registry,
             tasks,
             events,
@@ -1606,12 +1846,113 @@ pub(crate) fn wait_many_begin<
             deadline_authority,
             process,
             thread,
+            handle,
+            signals,
+            deadline,
         ),
-        Err(error) => WaitSyscallBegin::Returning {
-            status: wait_set_status(error),
-            output,
-            result: None,
-        },
+    )
+}
+
+pub(crate) fn wait_many_syscall<
+    U: OwnedUserOutputAccess,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EVENTS: usize,
+    const CHANNEL_PAIRS: usize,
+    const CHANNEL_DEPTH: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    user: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    events: &EventAuthority<EVENTS>,
+    channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
+    waits: &WaitRegistry<WAITERS>,
+    execution: &ExecutionDomain<EXECUTION>,
+    operations: &mut WaitOperationRegistry<U::OwnedOutput, EXECUTION>,
+    deadline_authority: Option<&mut dyn WaitDeadlineAuthority>,
+    process: ProcessKey,
+    thread: ThreadKey,
+    items: DwUserAddress,
+    item_count: u32,
+    mode: u32,
+    deadline: DwDeadline,
+    out_result: DwUserAddress,
+) -> WaitSyscallAction {
+    let (requests, count) = match snapshot_wait_many_requests(user, items, item_count, mode) {
+        Ok(requests) => requests,
+        Err(status) => return WaitSyscallAction::Returning(status),
+    };
+    let output = match preflight_owned_wait_output(user, out_result) {
+        Ok(output) => output,
+        Err(status) => return WaitSyscallAction::Returning(status),
+    };
+    let begin = wait_many_requests_begin(
+        output,
+        registry,
+        tasks,
+        events,
+        channels,
+        waits,
+        execution,
+        operations,
+        deadline_authority,
+        process,
+        thread,
+        &requests[..count],
+        deadline,
+    );
+    finish_wait_begin(user, begin)
+}
+
+pub(crate) fn resume_wait_syscall<
+    U: OwnedUserOutputAccess,
+    const OBJECTS: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    user: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    waits: &WaitRegistry<WAITERS>,
+    execution: &ExecutionDomain<EXECUTION>,
+    operations: &mut WaitOperationRegistry<U::OwnedOutput, EXECUTION>,
+    deadline_authority: Option<&mut dyn WaitDeadlineAuthority>,
+    wake: BlockWakeKey,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> Result<DwStatus, WaitFinishError> {
+    let (output, winner, releases) = finish_wait_operation(
+        registry,
+        waits,
+        execution,
+        operations,
+        deadline_authority,
+        wake,
+    )?;
+    for release in releases.into_releases().into_iter().flatten() {
+        cleanup.push(release);
+    }
+    match winner {
+        crate::task::BlockedOperationWinner::Signal {
+            item_index,
+            observed,
+        } => {
+            let result = wait_result(item_index, observed);
+            user.commit_owned_output(output, &result);
+            Ok(DW_STATUS_SUCCESS)
+        }
+        crate::task::BlockedOperationWinner::Timeout => {
+            user.discard_owned_output(output);
+            Ok(DW_STATUS_TIMED_OUT)
+        }
+        crate::task::BlockedOperationWinner::Cancelled
+        | crate::task::BlockedOperationWinner::Terminal => {
+            user.discard_owned_output(output);
+            panic!("non-returning F7 wait winner reached syscall resume")
+        }
     }
 }
 

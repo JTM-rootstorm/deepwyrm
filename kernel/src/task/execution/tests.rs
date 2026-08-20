@@ -496,21 +496,24 @@ fn blocking_switch_prepares_fresh_destination_without_seeding_suspended_slot() {
     let (_blocked, decision) = domain.block_current(first).unwrap();
     assert_eq!(decision.current, Some(second));
     let trusted_entry = 0xffff_8000_0012_3000;
-    let plan = unsafe {
-        domain.prepare_blocking_kernel_switch(&tasks, decision, trusted_entry)
-    }
-    .unwrap();
+    let plan =
+        unsafe { domain.prepare_blocking_kernel_switch(&tasks, decision, trusted_entry) }.unwrap();
     assert_eq!(plan.next_stack(), second_bounds);
     assert_eq!(plan.next_rsp() & 0xf, 8);
-    assert!(crate::arch::x86_64::context::initial_saved_rsp_is_within_stack(
-        second_bounds,
-        plan.next_rsp()
-    ));
+    assert!(
+        crate::arch::x86_64::context::initial_saved_rsp_is_within_stack(
+            second_bounds,
+            plan.next_rsp()
+        )
+    );
     assert_eq!(domain.kernel_continuation_rsp(second_context), Ok(0));
 
     let frame = plan.next_rsp() as *const u64;
     unsafe {
-        assert_eq!(frame.add(6).read(), crate::arch::x86_64::context::INITIAL_KERNEL_CONTINUATION_RFLAGS);
+        assert_eq!(
+            frame.add(6).read(),
+            crate::arch::x86_64::context::INITIAL_KERNEL_CONTINUATION_RFLAGS
+        );
         assert_eq!(frame.add(7).read(), trusted_entry);
         assert_eq!(frame.add(8).read(), 0);
     }

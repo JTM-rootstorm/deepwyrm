@@ -13,6 +13,11 @@ const BYTES: usize = 4096;
 struct FakeUserMemory {
     bytes: [u8; BYTES],
     deny_write: bool,
+    owned_outputs: usize,
+}
+
+struct FakeOwnedOutput {
+    range: UserRange,
 }
 
 struct FakePinned<'a> {
@@ -29,6 +34,7 @@ impl FakeUserMemory {
         Self {
             bytes: [0; BYTES],
             deny_write: false,
+            owned_outputs: 0,
         }
     }
 
@@ -48,6 +54,43 @@ impl UserPageAccess for FakeUserMemory {
 
     fn pin(&mut self, _range: UserRange) -> Result<Self::Pinned<'_>, Self::Error> {
         Ok(FakePinned { memory: self })
+    }
+}
+
+impl OwnedUserOutputAccess for FakeUserMemory {
+    type OwnedOutput = FakeOwnedOutput;
+
+    fn preflight_owned_output(
+        &mut self,
+        range: UserRange,
+    ) -> Result<Self::OwnedOutput, Self::Error> {
+        if !range.access().includes(UserAccess::WRITE) || self.deny_write {
+            return Err(());
+        }
+        let len = usize::try_from(range.byte_len()).map_err(|_| ())?;
+        let _ = Self::offset(range.start(), len);
+        self.owned_outputs += 1;
+        Ok(FakeOwnedOutput { range })
+    }
+
+    fn commit_owned_output(&mut self, output: Self::OwnedOutput, source: &[u8]) {
+        assert_eq!(
+            usize::try_from(output.range.byte_len()).unwrap(),
+            source.len()
+        );
+        let offset = Self::offset(output.range.start(), source.len());
+        self.bytes[offset..offset + source.len()].copy_from_slice(source);
+        self.owned_outputs = self
+            .owned_outputs
+            .checked_sub(1)
+            .expect("owned fake output commit underflow");
+    }
+
+    fn discard_owned_output(&mut self, _output: Self::OwnedOutput) {
+        self.owned_outputs = self
+            .owned_outputs
+            .checked_sub(1)
+            .expect("owned fake output discard underflow");
     }
 }
 
@@ -2828,6 +2871,731 @@ fn write_wait_item(
         FakeUserMemory::offset(address, (index + 1) * WAIT_ITEM_BYTES) + index * WAIT_ITEM_BYTES;
     user.bytes[start..start + 8].copy_from_slice(&handle.0.to_le_bytes());
     user.bytes[start + 8..start + 16].copy_from_slice(&signals.0.to_le_bytes());
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the test gives the F7 suspend coordinator process-owned aligned stack carriers and inspects the fresh destination plan"
+)]
+fn wait_suspend_plan_switches_to_fresh_runnable_sibling() {
+    extern crate std;
+    #[repr(align(4096))]
+    struct Region([u8; 0x12_000]);
+
+    fn owned_bounds(region: &mut Region) -> crate::memory::kernel_stack::KernelStackBounds {
+        let guard = region.0.as_mut_ptr() as u64;
+        crate::memory::kernel_stack::KernelStackBounds::new(guard, guard + 0x1000, guard + 0x11_000)
+            .unwrap()
+    }
+
+    let mut first_region = std::boxed::Box::new(Region([0; 0x12_000]));
+    let mut second_region = std::boxed::Box::new(Region([0; 0x12_000]));
+    let first_bounds = owned_bounds(&mut first_region);
+    let second_bounds = owned_bounds(&mut second_region);
+
+    let mut registry = ObjectRegistry::<16>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (_process, process_ref) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let process_owner = registry.retain_internal_from_handle(&process_ref).unwrap();
+    let (first, _first_ref) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    let (second, _second_ref) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    assert!(registry.release_internal(process_owner).unwrap().is_none());
+    assert!(registry.release_internal(root_owner).unwrap().is_none());
+
+    let execution = ExecutionDomain::<2>::new([first_bounds, second_bounds]).unwrap();
+    execution
+        .start_thread(&mut tasks, first, test_start(0xe1))
+        .unwrap();
+    execution
+        .start_thread(&mut tasks, second, test_start(0xe2))
+        .unwrap();
+    assert_eq!(execution.schedule_next().unwrap().current, Some(first));
+    let (_second_stack, second_context) =
+        tasks.thread_execution_resources(second).unwrap().unwrap();
+    assert_eq!(execution.kernel_continuation_rsp(second_context), Ok(0));
+
+    let (blocked, decision) = execution.block_current(first).unwrap();
+    let state = WaitSuspendState {
+        wake: blocked.into_wake_key(),
+        decision,
+    };
+    let trusted_entry = 0xffff_8000_0012_3000;
+    let plan = match prepare_wait_suspend_plan(&tasks, &execution, state, trusted_entry).unwrap() {
+        crate::syscall::native::NativeSuspendPlan::Switch(plan) => plan,
+        crate::syscall::native::NativeSuspendPlan::IdleCurrent => {
+            panic!("fresh runnable sibling must be selected instead of idle")
+        }
+    };
+    assert_eq!(plan.next_stack(), second_bounds);
+    assert_eq!(plan.next_rsp() & 0xf, 8);
+    assert_eq!(execution.kernel_continuation_rsp(second_context), Ok(0));
+}
+
+struct AdapterDeadline<const N: usize> {
+    queue: crate::time::DeadlineQueue<N>,
+}
+
+impl<const N: usize> AdapterDeadline<N> {
+    fn new() -> Self {
+        Self {
+            queue: crate::time::DeadlineQueue::new(),
+        }
+    }
+}
+
+impl<const N: usize> crate::wait::engine::WaitDeadlineAuthority for AdapterDeadline<N> {
+    fn register_wait_deadline(
+        &mut self,
+        deadline_ns: u64,
+        wake: crate::task::BlockWakeKey,
+    ) -> Result<crate::time::DeadlineRegistration, crate::wait::engine::WaitDeadlineError> {
+        self.queue
+            .register(deadline_ns, wake)
+            .map_err(|error| match error {
+                crate::time::DeadlineQueueError::Capacity => {
+                    crate::wait::engine::WaitDeadlineError::Capacity
+                }
+                _ => crate::wait::engine::WaitDeadlineError::Fault,
+            })
+    }
+
+    fn cancel_wait_deadline(
+        &mut self,
+        registration: crate::time::DeadlineRegistration,
+    ) -> Result<(), crate::wait::engine::WaitDeadlineError> {
+        self.queue
+            .cancel_if_live(registration)
+            .map(|_| ())
+            .map_err(|_| crate::wait::engine::WaitDeadlineError::Fault)
+    }
+}
+
+#[test]
+fn public_finite_wait_idles_then_timeout_resumes_in_place_and_discards_output() {
+    use deepwyrm_abi::{DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED};
+
+    let (mut registry, mut tasks, execution, process, thread, process_handle) =
+        wait_running_fixture();
+    let events = EventAuthority::<1>::new();
+    let channels = ChannelAuthority::<1, 2>::new();
+    let waits = WaitRegistry::<8>::new();
+    let mut user = FakeUserMemory::new();
+    let (_event_key, reference) = events.create_event(&mut registry).unwrap();
+    let event = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(reference, DW_RIGHT_WAIT)
+        .unwrap();
+    let mut operations = WaitOperationRegistry::<FakeOwnedOutput, 1>::new();
+    let mut deadlines = AdapterDeadline::<2>::new();
+    let out = BASE + 0x980;
+
+    let suspended = match wait_one_syscall(
+        &mut user,
+        &mut registry,
+        &tasks,
+        &events,
+        &channels,
+        &waits,
+        &execution,
+        &mut operations,
+        Some(&mut deadlines),
+        process,
+        thread,
+        event,
+        DW_SIGNAL_SIGNALED,
+        DwDeadline(50),
+        DwUserAddress(out),
+    ) {
+        WaitSyscallAction::Suspended(state) => state,
+        other => panic!("finite public wait did not suspend: {other:?}"),
+    };
+    assert_eq!(user.owned_outputs, 1);
+    assert_eq!(
+        execution.scheduler_state(thread),
+        Some(SchedulerThreadState::Blocked)
+    );
+    assert!(matches!(
+        prepare_wait_suspend_plan(&tasks, &execution, suspended, 0xffff_8000_0012_3000),
+        Ok(crate::syscall::native::NativeSuspendPlan::IdleCurrent)
+    ));
+
+    let mut expired = [None; 2];
+    assert_eq!(deadlines.queue.expire(50, &mut expired), 1);
+    assert_eq!(expired[0], Some(suspended.wake_key()));
+    assert!(crate::wait::engine::claim_timeout_and_wake(&execution, suspended.wake_key()).unwrap());
+    assert!(matches!(
+        poll_wait_idle_suspend(&tasks, &execution, suspended, 0xffff_8000_0012_3000).unwrap(),
+        crate::syscall::native::NativeIdleSuspendPoll::ResumeCurrent
+    ));
+    assert_eq!(
+        execution.scheduler_state(thread),
+        Some(SchedulerThreadState::Running)
+    );
+
+    let mut cleanup = CleanupQueue::<16>::new();
+    assert_eq!(
+        resume_wait_syscall(
+            &mut user,
+            &mut registry,
+            &waits,
+            &execution,
+            &mut operations,
+            Some(&mut deadlines),
+            suspended.wake_key(),
+            &mut cleanup,
+        )
+        .unwrap(),
+        DW_STATUS_TIMED_OUT
+    );
+    assert_eq!(user.owned_outputs, 0);
+    assert_eq!(
+        &user.bytes[0x980..0x980 + DW_WAIT_RESULT_V1_SIZE as usize],
+        &[0; DW_WAIT_RESULT_V1_SIZE as usize]
+    );
+    assert!(!operations.contains_thread(thread));
+    close_event_for_test(&mut registry, &mut tasks, process, &events, event);
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+}
+
+#[test]
+fn public_wait_one_preflights_owned_output_before_handle_resolution_and_commits_ready() {
+    use deepwyrm_abi::{DW_DEADLINE_NOW, DW_RIGHT_SIGNAL, DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED};
+
+    let (mut registry, mut tasks, execution, process, thread, process_handle) =
+        wait_running_fixture();
+    let events = EventAuthority::<1>::new();
+    let channels = ChannelAuthority::<1, 2>::new();
+    let waits = WaitRegistry::<8>::new();
+    let mut user = FakeUserMemory::new();
+    let (event_key, reference) = events.create_event(&mut registry).unwrap();
+    let event = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(reference, DwRights(DW_RIGHT_WAIT.0 | DW_RIGHT_SIGNAL.0))
+        .unwrap();
+    let mut operations = WaitOperationRegistry::<FakeOwnedOutput, 1>::new();
+    let out = BASE + 0x900;
+
+    user.deny_write = true;
+    assert_eq!(
+        wait_one_syscall(
+            &mut user,
+            &mut registry,
+            &tasks,
+            &events,
+            &channels,
+            &waits,
+            &execution,
+            &mut operations,
+            None,
+            process,
+            thread,
+            DwHandle(u64::MAX),
+            DW_SIGNAL_SIGNALED,
+            DW_DEADLINE_NOW,
+            DwUserAddress(out),
+        ),
+        WaitSyscallAction::Returning(DW_STATUS_BAD_ADDRESS)
+    );
+    assert_eq!(user.owned_outputs, 0);
+
+    user.deny_write = false;
+    assert_eq!(
+        events
+            .signal(
+                event_key,
+                deepwyrm_abi::DwSignals(0),
+                DW_SIGNAL_SIGNALED,
+                &waits,
+            )
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        wait_one_syscall(
+            &mut user,
+            &mut registry,
+            &tasks,
+            &events,
+            &channels,
+            &waits,
+            &execution,
+            &mut operations,
+            None,
+            process,
+            thread,
+            event,
+            DW_SIGNAL_SIGNALED,
+            DW_DEADLINE_NOW,
+            DwUserAddress(out),
+        ),
+        WaitSyscallAction::Returning(DW_STATUS_SUCCESS)
+    );
+    assert_eq!(user.owned_outputs, 0);
+    assert_eq!(u32_at(&user, out), DW_WAIT_RESULT_V1_SIZE);
+    assert_eq!(u32_at(&user, out + 8), 0);
+    assert_eq!(u64_at(&user, out + 16), DW_SIGNAL_SIGNALED.0);
+    close_event_for_test(&mut registry, &mut tasks, process, &events, event);
+    let mut cleanup = CleanupQueue::<16>::new();
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+}
+
+#[test]
+fn public_wait_one_suspend_keeps_owned_output_until_exact_resume() {
+    use deepwyrm_abi::{DW_DEADLINE_INFINITE, DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED};
+
+    let (mut registry, mut tasks, execution, process, thread, process_handle) =
+        wait_running_fixture();
+    let events = EventAuthority::<1>::new();
+    let channels = ChannelAuthority::<1, 2>::new();
+    let waits = WaitRegistry::<8>::new();
+    let mut user = FakeUserMemory::new();
+    let (event_key, reference) = events.create_event(&mut registry).unwrap();
+    let event = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(reference, DW_RIGHT_WAIT)
+        .unwrap();
+    let mut operations = WaitOperationRegistry::<FakeOwnedOutput, 1>::new();
+    let out = BASE + 0x980;
+
+    let suspended = match wait_one_syscall(
+        &mut user,
+        &mut registry,
+        &tasks,
+        &events,
+        &channels,
+        &waits,
+        &execution,
+        &mut operations,
+        None,
+        process,
+        thread,
+        event,
+        DW_SIGNAL_SIGNALED,
+        DW_DEADLINE_INFINITE,
+        DwUserAddress(out),
+    ) {
+        WaitSyscallAction::Suspended(state) => state,
+        other => panic!("unsignaled public wait did not suspend: {other:?}"),
+    };
+    assert_eq!(user.owned_outputs, 1);
+    assert!(operations.contains_thread(thread));
+    assert_eq!(
+        execution.scheduler_state(thread),
+        Some(SchedulerThreadState::Blocked)
+    );
+
+    let wakes = events
+        .signal(
+            event_key,
+            deepwyrm_abi::DwSignals(0),
+            DW_SIGNAL_SIGNALED,
+            &waits,
+        )
+        .unwrap();
+    let mut cleanup = CleanupQueue::<16>::new();
+    complete_wait_wakes(&mut registry, &execution, wakes, &mut cleanup);
+    assert_eq!(
+        resume_wait_syscall(
+            &mut user,
+            &mut registry,
+            &waits,
+            &execution,
+            &mut operations,
+            None,
+            suspended.wake_key(),
+            &mut cleanup,
+        )
+        .unwrap(),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(user.owned_outputs, 0);
+    assert!(!operations.contains_thread(thread));
+    assert_eq!(u32_at(&user, out + 8), 0);
+    assert_eq!(u64_at(&user, out + 16), DW_SIGNAL_SIGNALED.0);
+    close_event_for_test(&mut registry, &mut tasks, process, &events, event);
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+}
+
+#[test]
+fn public_wait_one_observes_channel_writable_and_peer_closed() {
+    use deepwyrm_abi::{DW_DEADLINE_NOW, DW_RIGHT_WAIT, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_WRITABLE};
+
+    let (mut registry, mut tasks, execution, process, thread, process_handle) =
+        wait_running_fixture();
+    let events = EventAuthority::<1>::new();
+    let channels = ChannelAuthority::<2, 4>::new();
+    let waits = WaitRegistry::<8>::new();
+    let mut user = FakeUserMemory::new();
+    let (_keys, [first_ref, second_ref]) = channels.create_pair(&mut registry).unwrap();
+    let first = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(first_ref, DW_RIGHT_WAIT)
+        .unwrap();
+    let second = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(second_ref, DW_RIGHT_WAIT)
+        .unwrap();
+    let mut operations = WaitOperationRegistry::<FakeOwnedOutput, 1>::new();
+    let out = BASE + 0x900;
+
+    assert_eq!(
+        wait_one_syscall(
+            &mut user,
+            &mut registry,
+            &tasks,
+            &events,
+            &channels,
+            &waits,
+            &execution,
+            &mut operations,
+            None,
+            process,
+            thread,
+            first,
+            DW_SIGNAL_WRITABLE,
+            DW_DEADLINE_NOW,
+            DwUserAddress(out),
+        ),
+        WaitSyscallAction::Returning(DW_STATUS_SUCCESS)
+    );
+    assert_ne!(u64_at(&user, out + 16) & DW_SIGNAL_WRITABLE.0, 0);
+
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        second,
+    );
+    assert_eq!(
+        wait_one_syscall(
+            &mut user,
+            &mut registry,
+            &tasks,
+            &events,
+            &channels,
+            &waits,
+            &execution,
+            &mut operations,
+            None,
+            process,
+            thread,
+            first,
+            DW_SIGNAL_PEER_CLOSED,
+            DW_DEADLINE_NOW,
+            DwUserAddress(out),
+        ),
+        WaitSyscallAction::Returning(DW_STATUS_SUCCESS)
+    );
+    assert_ne!(u64_at(&user, out + 16) & DW_SIGNAL_PEER_CLOSED.0, 0);
+    assert_eq!(user.owned_outputs, 0);
+
+    close_channel_for_test(&mut registry, &mut tasks, process, &channels, &waits, first);
+    let mut cleanup = CleanupQueue::<16>::new();
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+}
+
+#[test]
+fn repeated_duplicate_wait_many_signal_trace_selects_index_zero_once() {
+    use deepwyrm_abi::{DW_DEADLINE_INFINITE, DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED, DW_WAIT_MODE_ANY};
+
+    let (mut registry, mut tasks, execution, process, thread, process_handle) =
+        wait_running_fixture();
+    let events = EventAuthority::<1>::new();
+    let channels = ChannelAuthority::<1, 2>::new();
+    let waits = WaitRegistry::<8>::new();
+    let mut user = FakeUserMemory::new();
+    let (event_key, reference) = events.create_event(&mut registry).unwrap();
+    let event = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(reference, DW_RIGHT_WAIT)
+        .unwrap();
+    let items = BASE + 0x700;
+    let out = BASE + 0x900;
+    write_wait_item(&mut user, items, 0, event, DW_SIGNAL_SIGNALED);
+    write_wait_item(&mut user, items, 1, event, DW_SIGNAL_SIGNALED);
+    let mut operations = WaitOperationRegistry::<FakeOwnedOutput, 1>::new();
+    let mut cleanup = CleanupQueue::<16>::new();
+
+    for _ in 0..64 {
+        let suspended = match wait_many_syscall(
+            &mut user,
+            &mut registry,
+            &tasks,
+            &events,
+            &channels,
+            &waits,
+            &execution,
+            &mut operations,
+            None,
+            process,
+            thread,
+            DwUserAddress(items),
+            2,
+            DW_WAIT_MODE_ANY,
+            DW_DEADLINE_INFINITE,
+            DwUserAddress(out),
+        ) {
+            WaitSyscallAction::Suspended(state) => state,
+            other => panic!("duplicate wait_many did not suspend: {other:?}"),
+        };
+        assert_eq!(user.owned_outputs, 1);
+        assert_eq!(waits.len(), 2);
+
+        let wakes = events
+            .signal(
+                event_key,
+                deepwyrm_abi::DwSignals(0),
+                DW_SIGNAL_SIGNALED,
+                &waits,
+            )
+            .unwrap();
+        assert_eq!(wakes.len(), 1);
+        assert_eq!(wakes.pin_len(), 2);
+        complete_wait_wakes(&mut registry, &execution, wakes, &mut cleanup);
+        assert!(matches!(
+            poll_wait_idle_suspend(&tasks, &execution, suspended, 0xffff_8000_0012_3000).unwrap(),
+            crate::syscall::native::NativeIdleSuspendPoll::ResumeCurrent
+        ));
+        assert_eq!(
+            resume_wait_syscall(
+                &mut user,
+                &mut registry,
+                &waits,
+                &execution,
+                &mut operations,
+                None,
+                suspended.wake_key(),
+                &mut cleanup,
+            )
+            .unwrap(),
+            DW_STATUS_SUCCESS
+        );
+        assert_eq!(u32_at(&user, out + 8), 0);
+        assert_eq!(user.owned_outputs, 0);
+        assert_eq!(waits.len(), 0);
+        assert!(!operations.contains_thread(thread));
+
+        let reset = events
+            .signal(
+                event_key,
+                DW_SIGNAL_SIGNALED,
+                deepwyrm_abi::DwSignals(0),
+                &waits,
+            )
+            .unwrap();
+        assert_eq!(reset.len(), 0);
+    }
+
+    close_event_for_test(&mut registry, &mut tasks, process, &events, event);
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+}
+
+#[test]
+fn public_wait_many_obeys_scalar_snapshot_output_then_handle_failure_order() {
+    use deepwyrm_abi::{DW_DEADLINE_NOW, DW_SIGNAL_SIGNALED, DW_WAIT_MODE_ALL, DW_WAIT_MODE_ANY};
+
+    let (mut registry, mut tasks, execution, process, thread, process_handle) =
+        wait_running_fixture();
+    let events = EventAuthority::<1>::new();
+    let channels = ChannelAuthority::<1, 2>::new();
+    let waits = WaitRegistry::<8>::new();
+    let mut operations = WaitOperationRegistry::<FakeOwnedOutput, 1>::new();
+    let mut user = FakeUserMemory::new();
+    let items = BASE + 0x700;
+    let out = BASE + 0x900;
+
+    user.deny_write = true;
+    assert_eq!(
+        wait_many_syscall(
+            &mut user,
+            &mut registry,
+            &tasks,
+            &events,
+            &channels,
+            &waits,
+            &execution,
+            &mut operations,
+            None,
+            process,
+            thread,
+            DwUserAddress(items),
+            0,
+            DW_WAIT_MODE_ANY,
+            DW_DEADLINE_NOW,
+            DwUserAddress(out),
+        ),
+        WaitSyscallAction::Returning(DW_STATUS_INVALID_ARGUMENT)
+    );
+    assert_eq!(user.owned_outputs, 0);
+
+    assert_eq!(
+        wait_many_syscall(
+            &mut user,
+            &mut registry,
+            &tasks,
+            &events,
+            &channels,
+            &waits,
+            &execution,
+            &mut operations,
+            None,
+            process,
+            thread,
+            DwUserAddress(items),
+            1,
+            DW_WAIT_MODE_ALL,
+            DW_DEADLINE_NOW,
+            DwUserAddress(out),
+        ),
+        WaitSyscallAction::Returning(DW_STATUS_NOT_SUPPORTED)
+    );
+    assert_eq!(user.owned_outputs, 0);
+
+    write_wait_item(
+        &mut user,
+        items,
+        0,
+        DwHandle(u64::MAX),
+        deepwyrm_abi::DwSignals(0),
+    );
+    assert_eq!(
+        wait_many_syscall(
+            &mut user,
+            &mut registry,
+            &tasks,
+            &events,
+            &channels,
+            &waits,
+            &execution,
+            &mut operations,
+            None,
+            process,
+            thread,
+            DwUserAddress(items),
+            1,
+            DW_WAIT_MODE_ANY,
+            DW_DEADLINE_NOW,
+            DwUserAddress(out),
+        ),
+        WaitSyscallAction::Returning(DW_STATUS_INVALID_ARGUMENT)
+    );
+    assert_eq!(user.owned_outputs, 0);
+
+    write_wait_item(&mut user, items, 0, DwHandle(u64::MAX), DW_SIGNAL_SIGNALED);
+    assert_eq!(
+        wait_many_syscall(
+            &mut user,
+            &mut registry,
+            &tasks,
+            &events,
+            &channels,
+            &waits,
+            &execution,
+            &mut operations,
+            None,
+            process,
+            thread,
+            DwUserAddress(items),
+            1,
+            DW_WAIT_MODE_ANY,
+            DW_DEADLINE_NOW,
+            DwUserAddress(out),
+        ),
+        WaitSyscallAction::Returning(DW_STATUS_BAD_ADDRESS)
+    );
+    assert_eq!(user.owned_outputs, 0);
+
+    user.deny_write = false;
+    assert_eq!(
+        wait_many_syscall(
+            &mut user,
+            &mut registry,
+            &tasks,
+            &events,
+            &channels,
+            &waits,
+            &execution,
+            &mut operations,
+            None,
+            process,
+            thread,
+            DwUserAddress(items),
+            1,
+            DW_WAIT_MODE_ANY,
+            DW_DEADLINE_NOW,
+            DwUserAddress(out),
+        ),
+        WaitSyscallAction::Returning(DW_STATUS_BAD_HANDLE)
+    );
+    assert_eq!(user.owned_outputs, 0);
+
+    let mut cleanup = CleanupQueue::<16>::new();
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
 }
 
 #[test]

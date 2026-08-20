@@ -776,12 +776,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         trusted_first_run_entry: u64,
     ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan, ExecutionSwitchError> {
         unsafe {
-            self.prepare_kernel_switch_inner(
-                tasks,
-                decision,
-                false,
-                Some(trusted_first_run_entry),
-            )
+            self.prepare_kernel_switch_inner(tasks, decision, false, Some(trusted_first_run_entry))
         }
     }
 
@@ -837,12 +832,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         trusted_first_run_entry: u64,
     ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan, ExecutionSwitchError> {
         unsafe {
-            self.prepare_kernel_switch_inner(
-                tasks,
-                decision,
-                true,
-                Some(trusted_first_run_entry),
-            )
+            self.prepare_kernel_switch_inner(tasks, decision, true, Some(trusted_first_run_entry))
         }
     }
 
@@ -925,8 +915,10 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
             )
         }
         .map_err(ExecutionSwitchError::InitialContext)?;
-        unsafe { crate::arch::x86_64::context::KernelSwitchPlan::new_initial(current_rsp_out, initial) }
-            .map_err(ExecutionSwitchError::Context)
+        unsafe {
+            crate::arch::x86_64::context::KernelSwitchPlan::new_initial(current_rsp_out, initial)
+        }
+        .map_err(ExecutionSwitchError::Context)
     }
 
     pub(crate) fn stack_bounds(
