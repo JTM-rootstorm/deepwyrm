@@ -552,6 +552,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         crate::test_support::complete_pass(0)
     }
 
+    fn enter_scheduled_fresh_thread(&mut self) -> ! {
+        fail(0xa5)
+    }
+
     fn prepare_suspend(
         &mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,

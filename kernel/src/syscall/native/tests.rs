@@ -212,6 +212,10 @@ impl NativeSyscallFrameRuntime for FrameRuntime {
         panic!("unexpected synthetic termination")
     }
 
+    fn enter_scheduled_fresh_thread(&mut self) -> ! {
+        panic!("unexpected synthetic fresh-thread entry")
+    }
+
     fn prepare_suspend(
         &mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
@@ -304,6 +308,10 @@ impl NativeSyscallFrameRuntime for SuspendingRuntime {
 
     fn terminate_current(&mut self) -> ! {
         panic!("suspended dispatch must not terminate")
+    }
+
+    fn enter_scheduled_fresh_thread(&mut self) -> ! {
+        panic!("direct dispatch test never launches a fresh Thread")
     }
 
     fn prepare_suspend(

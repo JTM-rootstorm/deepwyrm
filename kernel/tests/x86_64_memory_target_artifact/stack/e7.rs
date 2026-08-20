@@ -271,7 +271,7 @@ pub(crate) fn validate_e7_stack_margin(sizes: &[StackSize]) {
             "e7-process-exit-adapter",
             plain(
                 "E7 process_exit adapter",
-                "syscall::adapters::process_exit::<8, 1, 1, 1, 1, 1>",
+                "syscall::adapters::process_exit::<deepwyrm_kernel::syscall::adapters::NoTerminalWaitCleanup, 8, 1, 1, 1, 1, 4, 1>",
             ),
         ),
         frame(
@@ -296,14 +296,14 @@ pub(crate) fn validate_e7_stack_margin(sizes: &[StackSize]) {
             "e7-collect-effects",
             plain(
                 "E7 collect effects",
-                "syscall::adapters::collect_process_effects::<8, 1, 1, 1>",
+                "syscall::adapters::collect_process_effects::<deepwyrm_kernel::syscall::adapters::NoTerminalWaitCleanup, 8, 1, 1, 4, 1>",
             ),
         ),
         frame(
             "e7-collect-pins",
             plain(
                 "E7 collect pins",
-                "syscall::adapters::collect_retired_pins::<8, 1>",
+                "syscall::adapters::collect_retired_pins::<8, 1, 4, 1>",
             ),
         ),
         frame(

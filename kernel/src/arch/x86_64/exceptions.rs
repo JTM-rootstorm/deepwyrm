@@ -609,6 +609,11 @@ pub(crate) fn user_exception_binding_is_current(binding: &UserExceptionBinding) 
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn user_exception_runtime_is_bound() -> bool {
+    USER_EXCEPTION_HANDLER.load(core::sync::atomic::Ordering::Acquire) != 0
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[allow(
     unsafe_code,
     reason = "the one-shot atomic stores only a validated Rust function pointer supplied by bind_user_exception_handler"

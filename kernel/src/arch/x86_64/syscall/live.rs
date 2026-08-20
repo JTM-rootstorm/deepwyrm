@@ -60,11 +60,13 @@ const RUNTIME_BINDING: u8 = 1;
 const RUNTIME_BOUND: u8 = 2;
 
 pub(crate) type SyscallRuntimeHandler = unsafe fn(*mut (), &mut RawSyscallFrame);
+type FreshThreadRuntimeHandler = unsafe fn(*mut ()) -> !;
 
 #[derive(Clone, Copy)]
 struct RuntimeBindingState {
     context: *mut (),
     handler: SyscallRuntimeHandler,
+    fresh_thread_handler: FreshThreadRuntimeHandler,
 }
 
 struct RuntimeStorage(UnsafeCell<MaybeUninit<RuntimeBindingState>>);
@@ -88,6 +90,7 @@ static RUNTIME: RuntimeStorage = RuntimeStorage::uninit();
 pub(crate) struct SyscallRuntimeBinding<'runtime> {
     context: usize,
     handler: usize,
+    fresh_thread_handler: usize,
     _runtime: PhantomData<&'runtime mut ()>,
 }
 
@@ -470,7 +473,8 @@ pub(crate) fn current_binding_generation() -> u64 {
 unsafe fn publish_syscall_runtime(
     context: *mut (),
     handler: SyscallRuntimeHandler,
-) -> Result<(usize, usize), SyscallRuntimeBindError> {
+    fresh_thread_handler: FreshThreadRuntimeHandler,
+) -> Result<(usize, usize, usize), SyscallRuntimeBindError> {
     if context.is_null() {
         return Err(SyscallRuntimeBindError::NullContext);
     }
@@ -486,10 +490,18 @@ unsafe fn publish_syscall_runtime(
         return Err(SyscallRuntimeBindError::AlreadyBound);
     }
     unsafe {
-        (*RUNTIME.0.get()).write(RuntimeBindingState { context, handler });
+        (*RUNTIME.0.get()).write(RuntimeBindingState {
+            context,
+            handler,
+            fresh_thread_handler,
+        });
     }
     RUNTIME_STATE.store(RUNTIME_BOUND, Ordering::Release);
-    Ok((context as usize, handler as usize))
+    Ok((
+        context as usize,
+        handler as usize,
+        fresh_thread_handler as usize,
+    ))
 }
 
 #[allow(
@@ -505,7 +517,9 @@ fn runtime_binding() -> Option<RuntimeBindingState> {
 
 pub(crate) fn syscall_runtime_binding_is_current(binding: &SyscallRuntimeBinding<'_>) -> bool {
     runtime_binding().is_some_and(|current| {
-        current.context as usize == binding.context && current.handler as usize == binding.handler
+        current.context as usize == binding.context
+            && current.handler as usize == binding.handler
+            && current.fresh_thread_handler as usize == binding.fresh_thread_handler
     })
 }
 
@@ -521,6 +535,17 @@ fn invalid_bound_return<R: crate::syscall::native::NativeSyscallFrameRuntime>(
     // `R` survives a kernel-context switch.
     let runtime = unsafe { &mut *context.cast::<R>() };
     runtime.invalid_return(error)
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the fixed first-run entry reborrows the same one-shot pinned runtime for one divergent fresh-Thread launch"
+)]
+unsafe fn native_runtime_fresh_thread<R: crate::syscall::native::NativeSyscallFrameRuntime>(
+    context: *mut (),
+) -> ! {
+    let runtime = unsafe { &mut *context.cast::<R>() };
+    runtime.enter_scheduled_fresh_thread()
 }
 
 #[allow(
@@ -606,6 +631,31 @@ fn wait_for_suspend_interrupt() {
     unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)) };
 }
 
+/// Fixed trusted return target used by F7 synthetic first-run kernel frames.
+/// The frame contains no erased runtime pointer; this symbol re-reads the one-shot
+/// immutable binding and dispatches through its monomorphized fresh-thread handler.
+#[allow(
+    unsafe_code,
+    reason = "the one-shot runtime binding authenticates the erased context and fresh-thread function pointer before the divergent launch"
+)]
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "sysv64" fn dw_x86_64_first_run_thread_entry() -> ! {
+    validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
+    if !crate::arch::x86_64::exceptions::user_exception_runtime_is_bound()
+        || !live_fp_simd_unavailable_is_enforced()
+    {
+        halt_forever();
+    }
+    let Some(binding) = runtime_binding() else {
+        halt_forever();
+    };
+    unsafe { (binding.fresh_thread_handler)(binding.context) }
+}
+
+pub(crate) fn first_run_thread_entry_rip() -> u64 {
+    dw_x86_64_first_run_thread_entry as *const () as usize as u64
+}
+
 /// Binds one stationary typed runtime to the raw x86 syscall entry.
 ///
 /// The returned lifetime brands the global raw pointer with the caller's
@@ -625,11 +675,17 @@ pub(crate) fn bind_native_syscall_runtime<
     // SAFETY: Pin guarantees the pointee cannot move for `'runtime`; the
     // returned binding carries the exclusive borrow for the same lifetime.
     let context = unsafe { Pin::get_unchecked_mut(runtime) as *mut R };
-    let (context_identity, handler_identity) =
-        unsafe { publish_syscall_runtime(context.cast::<()>(), native_runtime_trampoline::<R>) }?;
+    let (context_identity, handler_identity, fresh_thread_handler_identity) = unsafe {
+        publish_syscall_runtime(
+            context.cast::<()>(),
+            native_runtime_trampoline::<R>,
+            native_runtime_fresh_thread::<R>,
+        )
+    }?;
     Ok(SyscallRuntimeBinding {
         context: context_identity,
         handler: handler_identity,
+        fresh_thread_handler: fresh_thread_handler_identity,
         _runtime: PhantomData,
     })
 }
@@ -643,6 +699,43 @@ unsafe fn dispatch_bound_runtime(frame: &mut RawSyscallFrame) {
         halt_forever();
     };
     unsafe { (binding.handler)(binding.context, frame) };
+}
+
+#[allow(
+    unsafe_code,
+    reason = "F7 first-run entry checks the IF-clear BSP entry-state stack identity established by the context-switch boundary"
+)]
+fn current_kernel_stack_is(stack: KernelStackBounds) -> bool {
+    unsafe { (*ENTRY_STATE.0.get()).current_kernel_stack_top == stack.top }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "F7 fresh-Thread launch reuses the already-installed exception/syscall runtimes and the stack binding established by the kernel context switch"
+)]
+pub(crate) unsafe fn enter_bound_validated_user(
+    state: &ValidatedUserReturn,
+    stack: KernelStackBounds,
+) -> ! {
+    validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
+    if runtime_binding().is_none()
+        || !crate::arch::x86_64::exceptions::user_exception_runtime_is_bound()
+        || !current_kernel_stack_is(stack)
+    {
+        halt_forever();
+    }
+    unsafe { iret_validated_user(state) }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the caller has already validated user state and established the exact current kernel-stack/runtime ownership"
+)]
+unsafe fn iret_validated_user(state: &ValidatedUserReturn) -> ! {
+    unsafe extern "sysv64" {
+        fn dw_x86_64_iret_to_user(state: *const super::frame::RawUserReturnContext) -> !;
+    }
+    unsafe { dw_x86_64_iret_to_user(state.raw()) }
 }
 
 /// Enters CPL3 through the separately validated IRETQ helper.
@@ -668,10 +761,7 @@ pub(crate) unsafe fn enter_validated_user(
         halt_forever();
     }
     unsafe { bind_current_thread_stack(stack) }.unwrap_or_else(|_| halt_forever());
-    unsafe extern "sysv64" {
-        fn dw_x86_64_iret_to_user(state: *const super::frame::RawUserReturnContext) -> !;
-    }
-    unsafe { dw_x86_64_iret_to_user(state.raw()) }
+    unsafe { iret_validated_user(state) }
 }
 
 #[allow(

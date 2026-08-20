@@ -747,6 +747,12 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
 
     fn terminate_current(&mut self) -> !;
 
+    /// Enters userspace for the scheduler-selected Thread whose kernel
+    /// continuation slot is still zero. Called only from the fixed trusted
+    /// first-run kernel continuation after the context-switch boundary has
+    /// already bound that Thread's owned kernel stack.
+    fn enter_scheduled_fresh_thread(&mut self) -> !;
+
     fn prepare_suspend(
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
