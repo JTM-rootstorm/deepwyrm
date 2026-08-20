@@ -4,7 +4,7 @@ use crate::memory::frame_roles::{ObjectBackingGrant, TableCandidateGrant};
 use crate::memory::user_range::{UserAccess, UserPageChunk, UserRange};
 use crate::memory::usercopy::{
     PinnedUserBatchPages, PinnedUserPages, UserPageAccess, UserPageBatchAccess, UserPinError,
-    UserPinTracker, UserRangePin,
+    UserPinTracker, UserRangePin, UserRangePinToken,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,6 +101,13 @@ pub(crate) struct LiveProcessAddressSpace<
     pub(super) roles: &'borrow mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
     pub(super) target: TrackedActiveTarget<'borrow>,
     pub(super) _root: core::marker::PhantomData<&'root mut ()>,
+}
+
+#[must_use = "owned live user outputs must be committed or discarded through the originating process address space"]
+pub(crate) struct OwnedLiveUserOutput {
+    process: crate::task::ProcessKey,
+    range: UserRange,
+    token: UserRangePinToken,
 }
 
 pub(crate) struct PinnedLiveUserPages<'tracker> {
@@ -275,6 +282,84 @@ impl PinnedUserBatchPages for PinnedLiveUserBatch<'_> {
 impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     LiveProcessAddressSpace<'borrow, 'root, RANGE_CAPACITY, ROLE_CAPACITY>
 {
+    /// Preflights a writable range and detaches its mapping-stability pin from
+    /// this short address-space borrow so a blocked syscall may retain it.
+    pub(crate) fn preflight_owned_output(
+        &mut self,
+        range: UserRange,
+    ) -> Result<OwnedLiveUserOutput, LiveUserAccessError> {
+        if !range.access().includes(UserAccess::WRITE) || range.is_empty() {
+            return Err(LiveUserAccessError::Permission);
+        }
+        let token = self
+            .target
+            .pins
+            .pin_owned(range)
+            .map_err(LiveUserAccessError::Pin)?;
+        for chunk in range.page_chunks() {
+            if let Err(error) = self.preflight(chunk) {
+                self.target
+                    .pins
+                    .release_owned(token)
+                    .expect("fresh owned user pin remains releasable after failed preflight");
+                return Err(error);
+            }
+        }
+        Ok(OwnedLiveUserOutput {
+            process: self.process,
+            range,
+            token,
+        })
+    }
+
+    pub(crate) fn discard_owned_output(
+        &mut self,
+        output: OwnedLiveUserOutput,
+    ) -> Result<(), LiveUserAccessError> {
+        if output.process != self.process {
+            return Err(LiveUserAccessError::Permission);
+        }
+        self.target
+            .pins
+            .release_owned(output.token)
+            .map_err(LiveUserAccessError::Pin)
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "the detached tracker token keeps the fully preflighted destination mapping stable across syscall suspension"
+    )]
+    pub(crate) fn commit_owned_output(
+        &mut self,
+        output: OwnedLiveUserOutput,
+        source: &[u8],
+    ) -> Result<(), LiveUserAccessError> {
+        if output.process != self.process {
+            return Err(LiveUserAccessError::Permission);
+        }
+        assert_eq!(
+            u64::try_from(source.len()).ok(),
+            Some(output.range.byte_len()),
+            "owned live output length drift"
+        );
+        let (start, end_exclusive) = self
+            .target
+            .pins
+            .validate_owned(&output.token)
+            .map_err(LiveUserAccessError::Pin)?;
+        assert_eq!(start, output.range.start());
+        assert_eq!(end_exclusive, output.range.end_exclusive());
+        assert_eq!(start, output.token.start());
+        assert_eq!(end_exclusive, output.token.end_exclusive());
+        unsafe {
+            core::ptr::copy_nonoverlapping(source.as_ptr(), start as *mut u8, source.len());
+        }
+        self.target
+            .pins
+            .release_owned(output.token)
+            .map_err(LiveUserAccessError::Pin)
+    }
+
     fn walk_leaf(&mut self, virtual_address: u64) -> Result<LiveUserWalk, LiveUserAccessError> {
         let page = VirtualPage::containing(virtual_address)
             .map_err(|_| LiveUserAccessError::MissingOrInvalid)?;

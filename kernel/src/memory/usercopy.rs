@@ -54,16 +54,30 @@ pub(crate) trait PinnedUserBatchPages {
 
 #[cfg(any(test, deepwyrm_integrated))]
 mod pin_tracker {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
     use super::UserRange;
+
+    static NEXT_USER_PIN_DOMAIN: AtomicU64 = AtomicU64::new(1);
+
+    fn mint_domain() -> u64 {
+        NEXT_USER_PIN_DOMAIN
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1).filter(|next| *next != 0)
+            })
+            .expect("user-pin tracker domain space exhausted")
+    }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) enum UserPinError {
         Capacity,
         Conflict,
         InvalidMutationRange,
+        ForeignToken,
+        StaleToken,
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct PinnedRange {
         start: u64,
         end_exclusive: u64,
@@ -86,9 +100,46 @@ mod pin_tracker {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct PinSlot {
+        generation: u32,
+        range: Option<PinnedRange>,
+    }
+
+    const EMPTY_PIN_SLOT: PinSlot = PinSlot {
+        generation: 0,
+        range: None,
+    };
+
     struct UserPinState<const CAPACITY: usize> {
-        pins: [Option<PinnedRange>; CAPACITY],
+        pins: [PinSlot; CAPACITY],
         mutation: Option<PinnedRange>,
+    }
+
+    /// Detached mapping-stability ownership suitable for blocked operations.
+    ///
+    /// Tokens are tracker-domain and slot-generation checked. They carry no
+    /// Rust borrow, so the owner must explicitly validate and release them
+    /// through the originating tracker before teardown.
+    #[must_use = "owned user mapping pins must be released through their originating tracker"]
+    #[derive(Debug, Eq, PartialEq)]
+    pub(crate) struct UserRangePinToken {
+        domain: u64,
+        slot: u16,
+        generation: u32,
+        range: PinnedRange,
+    }
+
+    impl UserRangePinToken {
+        #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+        pub(crate) const fn start(&self) -> u64 {
+            self.range.start
+        }
+
+        #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+        pub(crate) const fn end_exclusive(&self) -> u64 {
+            self.range.end_exclusive
+        }
     }
 
     /// Range-scoped user-mapping stability authority.
@@ -97,23 +148,22 @@ mod pin_tracker {
     /// spin-locked linearization point. The lock is never held across usercopy or
     /// page-table publication; move-only permits keep the reservation live instead.
     pub(crate) struct UserPinTracker<const CAPACITY: usize> {
+        domain: u64,
         state: crate::sync::SpinMutex<UserPinState<CAPACITY>>,
     }
 
     impl<const CAPACITY: usize> UserPinTracker<CAPACITY> {
-        pub(crate) const fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
+                domain: mint_domain(),
                 state: crate::sync::SpinMutex::new(UserPinState {
-                    pins: [None; CAPACITY],
+                    pins: [EMPTY_PIN_SLOT; CAPACITY],
                     mutation: None,
                 }),
             }
         }
 
-        pub(crate) fn pin(
-            &self,
-            range: UserRange,
-        ) -> Result<UserRangePin<'_, CAPACITY>, UserPinError> {
+        fn reserve_token(&self, range: UserRange) -> Result<UserRangePinToken, UserPinError> {
             let range =
                 PinnedRange::from_user_range(range).ok_or(UserPinError::InvalidMutationRange)?;
             let mut state = self.state.lock();
@@ -123,17 +173,76 @@ mod pin_tracker {
             {
                 return Err(UserPinError::Conflict);
             }
-            let slot = state
-                .pins
-                .iter()
-                .position(Option::is_none)
-                .ok_or(UserPinError::Capacity)?;
-            state.pins[slot] = Some(range);
+            for (index, slot) in state.pins.iter_mut().enumerate() {
+                if slot.range.is_some() {
+                    continue;
+                }
+                let Some(generation) = slot.generation.checked_add(1).filter(|value| *value != 0)
+                else {
+                    continue;
+                };
+                let slot_index = u16::try_from(index).map_err(|_| UserPinError::Capacity)?;
+                slot.generation = generation;
+                slot.range = Some(range);
+                return Ok(UserRangePinToken {
+                    domain: self.domain,
+                    slot: slot_index,
+                    generation,
+                    range,
+                });
+            }
+            Err(UserPinError::Capacity)
+        }
+
+        pub(crate) fn pin(
+            &self,
+            range: UserRange,
+        ) -> Result<UserRangePin<'_, CAPACITY>, UserPinError> {
             Ok(UserRangePin {
                 tracker: self,
-                slot,
-                range,
+                token: Some(self.reserve_token(range)?),
             })
+        }
+
+        pub(crate) fn pin_owned(
+            &self,
+            range: UserRange,
+        ) -> Result<UserRangePinToken, UserPinError> {
+            self.reserve_token(range)
+        }
+
+        pub(crate) fn validate_owned(
+            &self,
+            token: &UserRangePinToken,
+        ) -> Result<(u64, u64), UserPinError> {
+            if token.domain != self.domain {
+                return Err(UserPinError::ForeignToken);
+            }
+            let state = self.state.lock();
+            let slot = state
+                .pins
+                .get(usize::from(token.slot))
+                .ok_or(UserPinError::StaleToken)?;
+            if slot.generation != token.generation || slot.range != Some(token.range) {
+                return Err(UserPinError::StaleToken);
+            }
+            Ok((token.range.start, token.range.end_exclusive))
+        }
+
+        pub(crate) fn release_owned(&self, token: UserRangePinToken) -> Result<(), UserPinError> {
+            if token.domain != self.domain {
+                return Err(UserPinError::ForeignToken);
+            }
+            let mut state = self.state.lock();
+            let slot = state
+                .pins
+                .get_mut(usize::from(token.slot))
+                .ok_or(UserPinError::StaleToken)?;
+            if slot.generation != token.generation || slot.range != Some(token.range) {
+                return Err(UserPinError::StaleToken);
+            }
+            slot.range = None;
+            Ok(())
         }
 
         pub(crate) fn begin_mutation(
@@ -156,8 +265,7 @@ mod pin_tracker {
                 || state
                     .pins
                     .iter()
-                    .flatten()
-                    .copied()
+                    .filter_map(|slot| slot.range)
                     .any(|pin| pin.overlaps(mutation))
             {
                 return Err(UserPinError::Conflict);
@@ -173,19 +281,25 @@ mod pin_tracker {
     #[must_use = "user mapping pins must remain live through exact copy or deliberate discard"]
     pub(crate) struct UserRangePin<'a, const CAPACITY: usize> {
         tracker: &'a UserPinTracker<CAPACITY>,
-        slot: usize,
-        range: PinnedRange,
+        token: Option<UserRangePinToken>,
+    }
+
+    impl<const CAPACITY: usize> UserRangePin<'_, CAPACITY> {
+        pub(crate) fn into_owned(mut self) -> UserRangePinToken {
+            self.token
+                .take()
+                .expect("borrowed user pin retains its owned token")
+        }
     }
 
     impl<const CAPACITY: usize> Drop for UserRangePin<'_, CAPACITY> {
         fn drop(&mut self) {
-            let mut state = self.tracker.state.lock();
-            assert_eq!(
-                state.pins[self.slot].map(|range| (range.start, range.end_exclusive)),
-                Some((self.range.start, self.range.end_exclusive)),
-                "user pin tracker slot drift"
-            );
-            state.pins[self.slot] = None;
+            let Some(token) = self.token.take() else {
+                return;
+            };
+            self.tracker
+                .release_owned(token)
+                .expect("borrowed user pin tracker slot drift");
         }
     }
 
@@ -213,7 +327,7 @@ mod pin_tracker {
 #[cfg(test)]
 pub(crate) use pin_tracker::{UserPinError, UserPinTracker};
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
-pub(crate) use pin_tracker::{UserPinError, UserPinTracker, UserRangePin};
+pub(crate) use pin_tracker::{UserPinError, UserPinTracker, UserRangePin, UserRangePinToken};
 
 /// Mapping-stable page access held across full preflight and exact copy.
 pub(crate) trait PinnedUserPages {
@@ -761,5 +875,47 @@ mod tests {
         assert_eq!(backend.preflight_count, 0);
         assert_eq!(backend.read_count, 0);
         assert_eq!(backend.write_count, 0);
+    }
+
+    #[test]
+    fn owned_pin_tokens_are_domain_and_generation_exact() {
+        let first = UserPinTracker::<1>::new();
+        let second = UserPinTracker::<1>::new();
+        let range = range_at(PAGE_SIZE * 6, 64, UserAccess::WRITE);
+        let token = first.pin_owned(range).unwrap();
+        assert_eq!(
+            first.validate_owned(&token),
+            Ok((range.start(), range.end_exclusive()))
+        );
+        assert_eq!(
+            second.validate_owned(&token),
+            Err(UserPinError::ForeignToken)
+        );
+        assert!(matches!(
+            first.begin_mutation(PAGE_SIZE * 6, PAGE_SIZE),
+            Err(UserPinError::Conflict)
+        ));
+        first.release_owned(token).unwrap();
+        let replacement = first.pin_owned(range).unwrap();
+        assert_eq!(
+            first.validate_owned(&replacement),
+            Ok((range.start(), range.end_exclusive()))
+        );
+        first.release_owned(replacement).unwrap();
+    }
+
+    #[test]
+    fn borrowed_pin_can_detach_into_owned_token_without_unpinning() {
+        let tracker = UserPinTracker::<1>::new();
+        let range = range_at(PAGE_SIZE * 7, 32, UserAccess::READ);
+        let borrowed = tracker.pin(range).unwrap();
+        let token = borrowed.into_owned();
+        assert!(matches!(
+            tracker.begin_mutation(PAGE_SIZE * 7, PAGE_SIZE),
+            Err(UserPinError::Conflict)
+        ));
+        tracker.release_owned(token).unwrap();
+        let permit = tracker.begin_mutation(PAGE_SIZE * 7, PAGE_SIZE).unwrap();
+        drop(permit);
     }
 }
