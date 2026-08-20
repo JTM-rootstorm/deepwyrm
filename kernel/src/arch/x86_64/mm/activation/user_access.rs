@@ -3,7 +3,8 @@ use super::*;
 use crate::memory::frame_roles::{ObjectBackingGrant, TableCandidateGrant};
 use crate::memory::user_range::{UserAccess, UserPageChunk, UserRange};
 use crate::memory::usercopy::{
-    PinnedUserPages, UserPageAccess, UserPinError, UserPinTracker, UserRangePin,
+    PinnedUserBatchPages, PinnedUserPages, UserPageAccess, UserPageBatchAccess, UserPinError,
+    UserPinTracker, UserRangePin,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,6 +108,11 @@ pub(crate) struct PinnedLiveUserPages<'tracker> {
     range: UserRange,
 }
 
+pub(crate) struct PinnedLiveUserBatch<'tracker> {
+    _pins: [Option<UserRangePin<'tracker, E5_USER_PIN_CAPACITY>>; 3],
+    ranges: [Option<UserRange>; 3],
+}
+
 impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> UserPageAccess
     for LiveProcessAddressSpace<'borrow, 'root, RANGE_CAPACITY, ROLE_CAPACITY>
 {
@@ -126,6 +132,41 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> Us
             }
         }
         Ok(PinnedLiveUserPages { _pin: pin, range })
+    }
+}
+
+impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> UserPageBatchAccess
+    for LiveProcessAddressSpace<'borrow, 'root, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    type PinnedBatch<'a>
+        = PinnedLiveUserBatch<'borrow>
+    where
+        Self: 'a;
+
+    fn pin_batch(
+        &mut self,
+        ranges: [Option<UserRange>; 3],
+    ) -> Result<Self::PinnedBatch<'_>, Self::Error> {
+        let tracker = self.target.pins;
+        let mut pins = [None, None, None];
+        for (index, range) in ranges.into_iter().enumerate() {
+            let Some(range) = range else {
+                continue;
+            };
+            if range.is_empty() {
+                continue;
+            }
+            pins[index] = Some(tracker.pin(range).map_err(LiveUserAccessError::Pin)?);
+        }
+        for range in ranges.into_iter().flatten() {
+            for chunk in range.page_chunks() {
+                self.preflight(chunk)?;
+            }
+        }
+        Ok(PinnedLiveUserBatch {
+            _pins: pins,
+            ranges,
+        })
     }
 }
 
@@ -181,6 +222,50 @@ impl PinnedUserPages for PinnedLiveUserPages<'_> {
     )]
     fn write_exact(&mut self, range: UserRange, source: &[u8]) {
         self.assert_exact_copy_range(range, source.len());
+        unsafe {
+            core::ptr::copy_nonoverlapping(source.as_ptr(), range.start() as *mut u8, source.len());
+        }
+    }
+}
+
+impl PinnedUserBatchPages for PinnedLiveUserBatch<'_> {
+    type Error = LiveUserAccessError;
+
+    fn preflight(&mut self, index: usize, chunk: UserPageChunk) -> Result<(), Self::Error> {
+        let range = self
+            .ranges
+            .get(index)
+            .copied()
+            .flatten()
+            .ok_or(LiveUserAccessError::Permission)?;
+        let chunk_end = chunk
+            .address()
+            .checked_add(chunk.byte_len())
+            .ok_or(LiveUserAccessError::MissingOrInvalid)?;
+        if chunk.address() < range.start()
+            || chunk_end > range.end_exclusive()
+            || chunk.access() != range.access()
+        {
+            return Err(LiveUserAccessError::Permission);
+        }
+        Ok(())
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "all batch ranges remain pinned and live-root preflight proved every destination page writable before exact copy"
+    )]
+    fn write_exact(&mut self, index: usize, range: UserRange, source: &[u8]) {
+        let allowed = self
+            .ranges
+            .get(index)
+            .copied()
+            .flatten()
+            .expect("batch output index remains present");
+        assert_eq!(range.start(), allowed.start());
+        assert!(range.end_exclusive() <= allowed.end_exclusive());
+        assert_eq!(range.access(), allowed.access());
+        assert_eq!(u64::try_from(source.len()).ok(), Some(range.byte_len()));
         unsafe {
             core::ptr::copy_nonoverlapping(source.as_ptr(), range.start() as *mut u8, source.len());
         }

@@ -1,0 +1,609 @@
+extern crate std;
+
+use super::*;
+
+use deepwyrm_abi::{
+    DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_WAIT, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE,
+    DW_SIGNAL_WRITABLE,
+};
+
+use crate::handle::{AcceptedObjectTypes, HandleTable};
+use crate::task::CooperativeScheduler;
+
+const BYTES: usize = DW_CHANNEL_MAX_PAYLOAD as usize;
+type Channels = ChannelAuthority<1, 2>;
+type Registry = ObjectRegistry<8>;
+
+fn pair() -> (
+    Registry,
+    Channels,
+    WaitRegistry<4>,
+    [ChannelEndpointKey; 2],
+    [HandleRef; 2],
+) {
+    let mut registry = Registry::new();
+    let channels = Channels::new();
+    let waits = WaitRegistry::new();
+    let (keys, handles) = channels.create_pair(&mut registry).unwrap();
+    (registry, channels, waits, keys, handles)
+}
+
+fn complete_no_transfer_finalization<
+    const OBJECTS: usize,
+    const DEPTH: usize,
+    const WAITERS: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    finalization: ChannelFinalization<DEPTH, WAITERS>,
+) -> WakeBatch<WAITERS> {
+    let completion = complete_channel_finalization(registry, finalization);
+    let (wakes, releases) = completion.into_parts();
+    assert!(releases.into_iter().flatten().next().is_none());
+    wakes
+}
+
+fn finalize(
+    registry: &mut Registry,
+    channels: &Channels,
+    waits: &WaitRegistry<4>,
+    handle: HandleRef,
+) -> WakeBatch<4> {
+    let release = registry.release_handle(handle).unwrap().unwrap();
+    let finalization = channels.take_finalization(release, waits).unwrap();
+    complete_no_transfer_finalization(registry, finalization)
+}
+
+fn make_thread_key(registry: &mut Registry) -> ThreadKey {
+    let creation = registry
+        .create(deepwyrm_abi::DW_OBJECT_TYPE_THREAD)
+        .unwrap();
+    let key = ThreadKey::from_object_id(creation.id());
+    registry.cancel_creation(creation).unwrap();
+    key
+}
+
+fn block_thread(
+    registry: &mut Registry,
+    scheduler: &CooperativeScheduler<2>,
+) -> (ThreadKey, BlockWakeKey) {
+    let thread = make_thread_key(registry);
+    let reservation = scheduler.reserve(thread).unwrap();
+    scheduler.commit(reservation).unwrap();
+    scheduler.schedule_next().unwrap();
+    let (token, _) = scheduler.block_current(thread).unwrap();
+    (thread, token.into_wake_key())
+}
+
+fn consume_wakes(
+    registry: &mut Registry,
+    scheduler: &CooperativeScheduler<2>,
+    batch: WakeBatch<4>,
+) -> [Option<crate::wait::WakeIntent>; 4] {
+    let (wakes, pins) = batch.into_parts();
+    for wake in wakes.iter().flatten() {
+        scheduler.wake(wake.wake_key()).unwrap();
+    }
+    for pin in pins.into_iter().flatten() {
+        assert!(registry.release_internal(pin).unwrap().is_none());
+    }
+    wakes
+}
+
+#[test]
+fn ordered_zero_and_nonzero_datagrams_round_trip() {
+    let (mut registry, channels, waits, keys, handles) = pair();
+    let [handle0, handle1] = handles;
+    assert_eq!(
+        channels.current_signals(keys[0]).unwrap(),
+        DW_SIGNAL_WRITABLE
+    );
+    assert_eq!(
+        channels.current_signals(keys[1]).unwrap(),
+        DW_SIGNAL_WRITABLE
+    );
+    assert_eq!(channels.send(keys[0], &[], &waits).unwrap().len(), 0);
+    assert_eq!(channels.send(keys[0], b"wyrm", &waits).unwrap().len(), 0);
+    assert_eq!(
+        channels.current_signals(keys[1]).unwrap().0,
+        DW_SIGNAL_READABLE.0 | DW_SIGNAL_WRITABLE.0
+    );
+    let mut output = [0_u8; 8];
+    let (first, _) = channels.receive_into(keys[1], &mut output, &waits).unwrap();
+    assert_eq!(first, 0);
+    let (second, _) = channels.receive_into(keys[1], &mut output, &waits).unwrap();
+    assert_eq!(second, 4);
+    assert_eq!(&output[..4], b"wyrm");
+    let _ = finalize(&mut registry, &channels, &waits, handle0);
+    let _ = finalize(&mut registry, &channels, &waits, handle1);
+}
+
+#[test]
+fn descriptor_backpressure_drives_writable_level() {
+    let (mut registry, channels, waits, keys, handles) = pair();
+    let [handle0, handle1] = handles;
+    assert_eq!(channels.send(keys[0], &[], &waits).unwrap().len(), 0);
+    assert_eq!(channels.send(keys[0], &[], &waits).unwrap().len(), 0);
+    assert_eq!(
+        channels.current_signals(keys[0]).unwrap().0 & DW_SIGNAL_WRITABLE.0,
+        0
+    );
+    assert_eq!(
+        channels.send(keys[0], &[], &waits).unwrap_err(),
+        ChannelError::WouldBlock
+    );
+    let mut empty = [];
+    let (_, wakes) = channels.receive_into(keys[1], &mut empty, &waits).unwrap();
+    assert_eq!(wakes.len(), 0);
+    assert_ne!(
+        channels.current_signals(keys[0]).unwrap().0 & DW_SIGNAL_WRITABLE.0,
+        0
+    );
+    let _ = finalize(&mut registry, &channels, &waits, handle0);
+    let _ = finalize(&mut registry, &channels, &waits, handle1);
+}
+
+#[test]
+fn buffer_too_small_does_not_consume_head() {
+    let (mut registry, channels, waits, keys, handles) = pair();
+    let [handle0, handle1] = handles;
+    assert_eq!(channels.send(keys[0], b"abcdef", &waits).unwrap().len(), 0);
+    assert_eq!(channels.peek_receive(keys[1]).unwrap().required_bytes, 6);
+    let mut tiny = [0_u8; 5];
+    assert_eq!(
+        channels
+            .receive_into(keys[1], &mut tiny, &waits)
+            .unwrap_err(),
+        ChannelError::BufferTooSmall
+    );
+    assert_eq!(channels.peek_receive(keys[1]).unwrap().required_bytes, 6);
+    let mut exact = [0_u8; 6];
+    let (_, wakes) = channels.receive_into(keys[1], &mut exact, &waits).unwrap();
+    assert_eq!(wakes.len(), 0);
+    assert_eq!(&exact, b"abcdef");
+    let _ = finalize(&mut registry, &channels, &waits, handle0);
+    let _ = finalize(&mut registry, &channels, &waits, handle1);
+}
+
+#[test]
+fn peer_close_preserves_committed_inbound_message() {
+    let (mut registry, channels, waits, keys, handles) = pair();
+    let [handle0, handle1] = handles;
+    assert_eq!(
+        channels.send(keys[0], b"committed", &waits).unwrap().len(),
+        0
+    );
+    let _ = finalize(&mut registry, &channels, &waits, handle0);
+    assert_eq!(
+        channels.current_signals(keys[1]).unwrap().0,
+        DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0
+    );
+    assert_eq!(
+        channels.send(keys[1], b"no peer", &waits).unwrap_err(),
+        ChannelError::PeerClosed
+    );
+    let mut output = [0_u8; 9];
+    let (_, wakes) = channels.receive_into(keys[1], &mut output, &waits).unwrap();
+    assert_eq!(wakes.len(), 0);
+    assert_eq!(&output, b"committed");
+    assert_eq!(
+        channels.peek_receive(keys[1]).unwrap_err(),
+        ChannelError::PeerClosed
+    );
+    let _ = finalize(&mut registry, &channels, &waits, handle1);
+}
+
+#[test]
+fn stale_pair_generation_cannot_alias_reused_slot() {
+    let (mut registry, channels, waits, keys, handles) = pair();
+    let [handle0, handle1] = handles;
+    let old_pair = channels.test_pair_key(keys[0]).unwrap();
+    let _ = finalize(&mut registry, &channels, &waits, handle0);
+    let _ = finalize(&mut registry, &channels, &waits, handle1);
+    assert!(!channels.test_pair_key_is_live(old_pair));
+    let (next_keys, next_handles) = channels.create_pair(&mut registry).unwrap();
+    let [next_handle0, next_handle1] = next_handles;
+    let next_pair = channels.test_pair_key(next_keys[0]).unwrap();
+    assert_eq!(old_pair.slot, next_pair.slot);
+    assert_ne!(old_pair.generation, next_pair.generation);
+    assert!(!channels.test_pair_key_is_live(old_pair));
+    let _ = finalize(&mut registry, &channels, &waits, next_handle0);
+    let _ = finalize(&mut registry, &channels, &waits, next_handle1);
+}
+
+#[test]
+fn readiness_waiters_wake_on_send_receive_and_peer_close() {
+    let (mut registry, channels, waits, keys, handles) = pair();
+    let [handle0, handle1] = handles;
+    let mut table = HandleTable::<2>::new();
+    let endpoint0 = table
+        .install(
+            handle0,
+            deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_CHANNEL),
+        )
+        .unwrap();
+    let endpoint1 = table
+        .install(
+            handle1,
+            deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_CHANNEL),
+        )
+        .unwrap();
+    let scheduler = CooperativeScheduler::<2>::new();
+
+    let (read_thread, read_wake) = block_thread(&mut registry, &scheduler);
+    let read_target = table
+        .lookup(
+            &mut registry,
+            endpoint1,
+            AcceptedObjectTypes::One(DW_OBJECT_TYPE_CHANNEL),
+            DW_RIGHT_WAIT,
+        )
+        .unwrap();
+    assert!(matches!(
+        channels
+            .register_wait(
+                &waits,
+                read_target,
+                DW_SIGNAL_READABLE,
+                7,
+                read_thread,
+                read_wake,
+            )
+            .unwrap(),
+        ChannelWaitOutcome::Registered(_)
+    ));
+    let wakes = consume_wakes(
+        &mut registry,
+        &scheduler,
+        channels.send(keys[0], b"x", &waits).unwrap(),
+    );
+    let wake = wakes.into_iter().flatten().next().unwrap();
+    assert_eq!(wake.item_index(), 7);
+    assert_ne!(wake.observed().0 & DW_SIGNAL_READABLE.0, 0);
+    assert_ne!(wake.observed().0 & DW_SIGNAL_WRITABLE.0, 0);
+
+    assert_eq!(channels.send(keys[0], &[], &waits).unwrap().len(), 0);
+    assert_eq!(
+        channels.current_signals(keys[0]).unwrap().0 & DW_SIGNAL_WRITABLE.0,
+        0
+    );
+    scheduler.schedule_next().unwrap();
+    let (write_token, _) = scheduler.block_current(read_thread).unwrap();
+    let write_target = table
+        .lookup(
+            &mut registry,
+            endpoint0,
+            AcceptedObjectTypes::One(DW_OBJECT_TYPE_CHANNEL),
+            DW_RIGHT_WAIT,
+        )
+        .unwrap();
+    assert!(matches!(
+        channels
+            .register_wait(
+                &waits,
+                write_target,
+                DW_SIGNAL_WRITABLE,
+                3,
+                read_thread,
+                write_token.into_wake_key(),
+            )
+            .unwrap(),
+        ChannelWaitOutcome::Registered(_)
+    ));
+    let mut one = [0_u8; 1];
+    let (_, write_wakes) = channels.receive_into(keys[1], &mut one, &waits).unwrap();
+    let wakes = consume_wakes(&mut registry, &scheduler, write_wakes);
+    let wake = wakes.into_iter().flatten().next().unwrap();
+    assert_eq!(wake.item_index(), 3);
+    assert_ne!(wake.observed().0 & DW_SIGNAL_WRITABLE.0, 0);
+
+    scheduler.schedule_next().unwrap();
+    let (close_token, _) = scheduler.block_current(read_thread).unwrap();
+    let close_target = table
+        .lookup(
+            &mut registry,
+            endpoint1,
+            AcceptedObjectTypes::One(DW_OBJECT_TYPE_CHANNEL),
+            DW_RIGHT_WAIT,
+        )
+        .unwrap();
+    assert!(matches!(
+        channels
+            .register_wait(
+                &waits,
+                close_target,
+                DW_SIGNAL_PEER_CLOSED,
+                5,
+                read_thread,
+                close_token.into_wake_key(),
+            )
+            .unwrap(),
+        ChannelWaitOutcome::Registered(_)
+    ));
+    let release0 = table.close(&mut registry, endpoint0).unwrap().unwrap();
+    let finalization = channels.take_finalization(release0, &waits).unwrap();
+    let close_wakes = complete_no_transfer_finalization(&mut registry, finalization);
+    let wakes = consume_wakes(&mut registry, &scheduler, close_wakes);
+    let wake = wakes.into_iter().flatten().next().unwrap();
+    assert_eq!(wake.item_index(), 5);
+    assert_ne!(wake.observed().0 & DW_SIGNAL_PEER_CLOSED.0, 0);
+
+    let release1 = table.close(&mut registry, endpoint1).unwrap().unwrap();
+    let finalization = channels.take_finalization(release1, &waits).unwrap();
+    assert_eq!(
+        complete_no_transfer_finalization(&mut registry, finalization).len(),
+        0
+    );
+}
+
+#[test]
+fn oversized_payload_is_rejected_without_queue_mutation() {
+    let (mut registry, channels, waits, keys, handles) = pair();
+    let [handle0, handle1] = handles;
+    let payload = std::vec![0x7b_u8; BYTES + 1];
+    assert_eq!(
+        channels.send(keys[0], &payload, &waits).unwrap_err(),
+        ChannelError::InvalidArgument
+    );
+    assert_eq!(
+        channels.peek_receive(keys[1]).unwrap_err(),
+        ChannelError::WouldBlock
+    );
+    assert_eq!(
+        channels.current_signals(keys[0]).unwrap(),
+        DW_SIGNAL_WRITABLE
+    );
+    let _ = finalize(&mut registry, &channels, &waits, handle1);
+    let _ = finalize(&mut registry, &channels, &waits, handle0);
+}
+
+#[test]
+fn receive_reservation_stabilizes_head_and_cancels_without_consumption() {
+    let (mut registry, channels, waits, keys, handles) = pair();
+    let [handle0, handle1] = handles;
+    let _ = channels.send(keys[0], b"first", &waits).unwrap();
+    let _ = channels.send(keys[0], b"second", &waits).unwrap();
+
+    let reservation = channels.reserve_receive(keys[1]).unwrap();
+    assert_eq!(reservation.info().required_bytes, 5);
+    assert_eq!(
+        channels.reserve_receive(keys[1]).unwrap_err(),
+        ChannelError::WouldBlock
+    );
+    channels.cancel_receive(reservation).unwrap();
+
+    let retry = channels.reserve_receive(keys[1]).unwrap();
+    let mut too_small = [0_u8; 4];
+    assert!(matches!(
+        channels.receive_reserved(retry, &mut too_small, &waits),
+        Err(ChannelError::BufferTooSmall)
+    ));
+    assert_eq!(channels.peek_receive(keys[1]).unwrap().required_bytes, 5);
+
+    let mut output = [0_u8; 6];
+    let (first, _) = channels.receive_into(keys[1], &mut output, &waits).unwrap();
+    assert_eq!(&output[..first], b"first");
+    let (second, _) = channels.receive_into(keys[1], &mut output, &waits).unwrap();
+    assert_eq!(&output[..second], b"second");
+
+    let _ = finalize(&mut registry, &channels, &waits, handle0);
+    assert_eq!(
+        channels.current_signals(keys[1]).unwrap(),
+        DW_SIGNAL_PEER_CLOSED
+    );
+    let _ = finalize(&mut registry, &channels, &waits, handle1);
+}
+
+#[test]
+fn endpoint_close_order_is_symmetric_for_empty_queues() {
+    for close_first in [0_usize, 1_usize] {
+        let (mut registry, channels, waits, keys, handles) = pair();
+        let [handle0, handle1] = handles;
+        let (first, second, peer_key) = if close_first == 0 {
+            (handle0, handle1, keys[1])
+        } else {
+            (handle1, handle0, keys[0])
+        };
+        let _ = finalize(&mut registry, &channels, &waits, first);
+        assert_eq!(
+            channels.current_signals(peer_key).unwrap(),
+            DW_SIGNAL_PEER_CLOSED
+        );
+        assert_eq!(
+            channels.peek_receive(peer_key).unwrap_err(),
+            ChannelError::PeerClosed
+        );
+        let _ = finalize(&mut registry, &channels, &waits, second);
+    }
+}
+
+#[test]
+fn maximum_payload_fits_one_empty_queue() {
+    let (mut registry, channels, waits, keys, handles) = pair();
+    let [handle0, handle1] = handles;
+    let payload = std::boxed::Box::new([0x5a_u8; BYTES]);
+    assert_eq!(
+        channels.send(keys[0], &payload[..], &waits).unwrap().len(),
+        0
+    );
+    assert_eq!(
+        channels.peek_receive(keys[1]).unwrap().required_bytes,
+        DW_CHANNEL_MAX_PAYLOAD
+    );
+    let mut output = std::boxed::Box::new([0_u8; BYTES]);
+    let (actual, _) = channels
+        .receive_into(keys[1], &mut output[..], &waits)
+        .unwrap();
+    assert_eq!(actual, BYTES);
+    assert_eq!(output[0], 0x5a);
+    assert_eq!(output[BYTES - 1], 0x5a);
+    let _ = finalize(&mut registry, &channels, &waits, handle0);
+    let _ = finalize(&mut registry, &channels, &waits, handle1);
+}
+
+#[test]
+fn concurrent_send_receive_close_trace_preserves_fifo_and_committed_messages() {
+    use std::sync::atomic::{AtomicUsize, Ordering as StdOrdering};
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
+
+    let mut registry = ObjectRegistry::<8>::new();
+    let channels = Arc::new(ChannelAuthority::<1, 4>::new());
+    let waits = Arc::new(WaitRegistry::<8>::new());
+    let (keys, handles) = channels.create_pair(&mut registry).unwrap();
+    let [handle0, handle1] = handles;
+    let registry = Arc::new(Mutex::new(registry));
+    let sent = Arc::new(Mutex::new(std::vec::Vec::<u8>::new()));
+    let received = Arc::new(Mutex::new(std::vec::Vec::<u8>::new()));
+    let successful = Arc::new(AtomicUsize::new(0));
+    let start = Arc::new(Barrier::new(4));
+
+    let sender = {
+        let channels = Arc::clone(&channels);
+        let waits = Arc::clone(&waits);
+        let sent = Arc::clone(&sent);
+        let successful = Arc::clone(&successful);
+        let start = Arc::clone(&start);
+        thread::spawn(move || {
+            start.wait();
+            for value in 0_u8..64 {
+                loop {
+                    match channels.send(keys[0], &[value], &waits) {
+                        Ok(wakes) => {
+                            assert_eq!(wakes.len(), 0);
+                            sent.lock().unwrap().push(value);
+                            successful.fetch_add(1, StdOrdering::Release);
+                            break;
+                        }
+                        Err(ChannelError::WouldBlock) => thread::yield_now(),
+                        Err(ChannelError::PeerClosed | ChannelError::InvalidEndpoint) => return,
+                        Err(error) => panic!("unexpected concurrent Channel send error: {error:?}"),
+                    }
+                }
+            }
+        })
+    };
+
+    let receiver = {
+        let channels = Arc::clone(&channels);
+        let waits = Arc::clone(&waits);
+        let received = Arc::clone(&received);
+        let start = Arc::clone(&start);
+        thread::spawn(move || {
+            start.wait();
+            loop {
+                let mut byte = [0_u8; 1];
+                match channels.receive_into(keys[1], &mut byte, &waits) {
+                    Ok((1, wakes)) => {
+                        assert_eq!(wakes.len(), 0);
+                        received.lock().unwrap().push(byte[0]);
+                    }
+                    Ok((other, _)) => panic!("unexpected concurrent receive size {other}"),
+                    Err(ChannelError::WouldBlock) => thread::yield_now(),
+                    Err(ChannelError::PeerClosed) => break,
+                    Err(error) => panic!("unexpected concurrent Channel receive error: {error:?}"),
+                }
+            }
+        })
+    };
+
+    let closer = {
+        let channels = Arc::clone(&channels);
+        let waits = Arc::clone(&waits);
+        let registry = Arc::clone(&registry);
+        let successful = Arc::clone(&successful);
+        let start = Arc::clone(&start);
+        thread::spawn(move || {
+            start.wait();
+            while successful.load(StdOrdering::Acquire) < 16 {
+                thread::yield_now();
+            }
+            let release = registry
+                .lock()
+                .unwrap()
+                .release_handle(handle0)
+                .unwrap()
+                .unwrap();
+            let finalization = channels.take_finalization(release, &waits).unwrap();
+            let wakes = {
+                let mut registry = registry.lock().unwrap();
+                complete_no_transfer_finalization(&mut registry, finalization)
+            };
+            assert_eq!(wakes.len(), 0);
+        })
+    };
+
+    start.wait();
+    sender.join().unwrap();
+    closer.join().unwrap();
+    receiver.join().unwrap();
+
+    let sent = sent.lock().unwrap().clone();
+    let received = received.lock().unwrap().clone();
+    assert!(sent.len() >= 16);
+    assert_eq!(
+        received, sent,
+        "committed Channel datagrams must remain FIFO across peer close"
+    );
+
+    let release = registry
+        .lock()
+        .unwrap()
+        .release_handle(handle1)
+        .unwrap()
+        .unwrap();
+    let finalization = channels.take_finalization(release, &waits).unwrap();
+    let wakes = {
+        let mut registry = registry.lock().unwrap();
+        complete_no_transfer_finalization(&mut registry, finalization)
+    };
+    assert_eq!(wakes.len(), 0);
+}
+
+#[test]
+fn peer_close_after_transfer_extraction_rolls_back_source_handle_exactly() {
+    use crate::handle::HandleMoveRequest;
+    use deepwyrm_abi::{
+        DW_OBJECT_TYPE_MEMORY_OBJECT, DW_RIGHT_INSPECT, DW_RIGHT_MAP, DW_RIGHT_READ,
+        DW_RIGHT_TRANSFER,
+    };
+
+    let (mut registry, channels, waits, keys, handles) = pair();
+    let [handle0, handle1] = handles;
+    let mut table = HandleTable::<1>::new();
+    let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+    let reference = registry.creation_into_handle(creation).unwrap();
+    let held = deepwyrm_abi::DwRights(
+        DW_RIGHT_READ.0 | DW_RIGHT_MAP.0 | DW_RIGHT_TRANSFER.0 | DW_RIGHT_INSPECT.0,
+    );
+    let source = table.install(reference, held).unwrap();
+    let prepared = table
+        .prepare_move_batch(&[HandleMoveRequest {
+            handle: source,
+            requested_rights: deepwyrm_abi::DwRights(DW_RIGHT_READ.0 | DW_RIGHT_MAP.0),
+        }])
+        .unwrap();
+    let send = channels.reserve_send(keys[0], b"race").unwrap();
+    let (rollback, transfers) = prepared.extract();
+    let peer_release = registry.release_handle(handle1).unwrap().unwrap();
+    let peer_finalization = channels.take_finalization(peer_release, &waits).unwrap();
+    let completion = complete_channel_finalization(&mut registry, peer_finalization);
+    let (wakes, releases) = completion.into_parts();
+    assert_eq!(wakes.len(), 0);
+    assert!(releases.into_iter().flatten().next().is_none());
+
+    let (error, transfers) = channels.commit_send(send, transfers, &waits).unwrap_err();
+    assert_eq!(error, ChannelError::PeerClosed);
+    rollback.rollback(transfers);
+    assert_eq!(table.inspect_basic(source).unwrap().rights, held);
+
+    let source_final = table.close(&mut registry, source).unwrap().unwrap();
+    registry.complete_finalization(source_final).unwrap();
+    let endpoint_release = registry.release_handle(handle0).unwrap().unwrap();
+    let endpoint_finalization = channels
+        .take_finalization(endpoint_release, &waits)
+        .unwrap();
+    let completion = complete_channel_finalization(&mut registry, endpoint_finalization);
+    let (wakes, releases) = completion.into_parts();
+    assert_eq!(wakes.len(), 0);
+    assert!(releases.into_iter().flatten().next().is_none());
+}

@@ -10,22 +10,31 @@
 )]
 
 use deepwyrm_abi::{
-    DW_ABI_INFO_V1_SIZE, DW_BASE_PAGE_SIZE, DW_CLOCK_MONOTONIC_ACTIVE,
-    DW_MEMORY_OBJECT_INFO_V1_SIZE, DW_OBJECT_INFO_BASIC_V1, DW_OBJECT_INFO_MEMORY_OBJECT_V1,
-    DW_OBJECT_INFO_TASK_STATE_V1, DW_OBJECT_INFO_V1_SIZE, DW_RIGHT_EXECUTE, DW_RIGHT_MODIFY,
-    DW_STATUS_ACCESS_DENIED, DW_STATUS_BAD_ADDRESS, DW_STATUS_BAD_HANDLE, DW_STATUS_BAD_STATE,
-    DW_STATUS_BUFFER_TOO_SMALL, DW_STATUS_INVALID_ARGUMENT, DW_STATUS_NO_RESOURCES,
-    DW_STATUS_NOT_SUPPORTED, DW_STATUS_SUCCESS, DW_STATUS_WRONG_OBJECT_TYPE, DW_TASK_STATE_EXITED,
-    DW_TERMINATION_AUTHORIZED, DwClockId, DwHandle, DwRights, DwStatus, DwTerminationReason,
+    DW_ABI_INFO_V1_SIZE, DW_BASE_PAGE_SIZE, DW_CHANNEL_MAX_HANDLES, DW_CHANNEL_MAX_PAYLOAD,
+    DW_CHANNEL_RECEIVE_RESULT_V1_SIZE, DW_CLOCK_MONOTONIC_ACTIVE, DW_HANDLE_TRANSFER_MOVE,
+    DW_HANDLE_TRANSFER_V1_SIZE, DW_MEMORY_OBJECT_INFO_V1_SIZE, DW_OBJECT_INFO_BASIC_V1,
+    DW_OBJECT_INFO_MEMORY_OBJECT_V1, DW_OBJECT_INFO_TASK_STATE_V1, DW_OBJECT_INFO_V1_SIZE,
+    DW_OBJECT_TYPE_CHANNEL, DW_RECEIVED_HANDLE_INFO_V1_SIZE, DW_RIGHT_EXECUTE, DW_RIGHT_MODIFY,
+    DW_RIGHT_READ, DW_RIGHT_SIGNAL, DW_RIGHT_WRITE, DW_STATUS_ACCESS_DENIED, DW_STATUS_BAD_ADDRESS,
+    DW_STATUS_BAD_HANDLE, DW_STATUS_BAD_STATE, DW_STATUS_BUFFER_TOO_SMALL,
+    DW_STATUS_INVALID_ARGUMENT, DW_STATUS_NO_RESOURCES, DW_STATUS_NOT_SUPPORTED,
+    DW_STATUS_PEER_CLOSED, DW_STATUS_SUCCESS, DW_STATUS_WOULD_BLOCK, DW_STATUS_WRONG_OBJECT_TYPE,
+    DW_TASK_STATE_EXITED, DW_TERMINATION_AUTHORIZED, DwChannelReceiveResultV1, DwClockId, DwHandle,
+    DwHandleTransferV1, DwReceivedHandleInfoV1, DwRights, DwStatus, DwTerminationReason,
     DwUserAddress,
 };
 
-use crate::handle::{AcceptedObjectTypes, HandleTableError, ResolvedHandle};
+use crate::handle::{
+    AcceptedObjectTypes, HANDLE_TRANSFER_LIMIT, HandleMovePrepareError, HandleMoveRequest,
+    HandleTableError, ResolvedHandle,
+};
+use crate::ipc::{ChannelAuthority, ChannelCreateError, ChannelEndpointKey, ChannelError};
 use crate::memory::object::MemoryObjectAuthority;
 use crate::memory::user_range::{EmptyAddressRule, UserAccess, UserAddressSpace, UserRange};
 use crate::memory::usercopy::{
-    PinnedUserOutput, UserCopyError, UserPageAccess, copy_from_user, copy_to_user,
-    preflight_user_output,
+    PinnedUserOutput, PinnedUserOutputs, UserCopyError, UserPageAccess, UserPageBatchAccess,
+    copy_from_user, copy_to_user, preflight_user_output, preflight_user_outputs,
+    snapshot_from_user,
 };
 use crate::object::{FinalRelease, HandleRef, InternalRef, ObjectRegistry, ObjectRegistryError};
 use crate::task::{
@@ -33,12 +42,17 @@ use crate::task::{
     SchedulerError, SchedulerThreadState, StartThreadError, TaskAuthority, TaskCreateError,
     TaskError, TaskGroupKey, TaskGroupTerminationEffects, ThreadKey, ThreadStartState,
 };
+use crate::wait::{
+    EventAuthority, EventCreateError, EventKey, WaitError, WaitRegistry, WakeBatch,
+    validate_event_signal_masks,
+};
 
 use super::native::SyscallControl;
 
 use super::abi_bytes::{
-    THREAD_START_BYTES, decode_thread_start, encode_abi_info, encode_handle, encode_object_info,
-    encode_u64,
+    HANDLE_TRANSFER_BYTES, THREAD_START_BYTES, decode_handle_transfer, decode_thread_start,
+    encode_abi_info, encode_channel_receive_result, encode_handle, encode_object_info,
+    encode_received_handle_info, encode_u64,
 };
 
 #[must_use = "typed final releases must be routed after syscall pins/locks are dropped"]
@@ -117,6 +131,34 @@ fn preflight_output<'a, U: UserPageAccess>(
 ) -> Result<PinnedUserOutput<U::Pinned<'a>>, DwStatus> {
     let range = user_range(address, byte_len, alignment, UserAccess::WRITE)?;
     preflight_user_output(user, range, byte_len).map_err(usercopy_status)
+}
+
+fn preflight_outputs<'a, U: UserPageBatchAccess>(
+    user: &'a mut U,
+    outputs: [Option<(UserRange, usize)>; 3],
+) -> Result<PinnedUserOutputs<U::PinnedBatch<'a>>, DwStatus> {
+    preflight_user_outputs(user, outputs).map_err(usercopy_status)
+}
+
+fn channel_buffer_range(
+    address: DwUserAddress,
+    byte_len: usize,
+    alignment: u64,
+    access: UserAccess,
+) -> Result<UserRange, DwStatus> {
+    UserRange::new(
+        user_address_space(),
+        address.0,
+        byte_len as u64,
+        alignment,
+        access,
+        if byte_len == 0 {
+            EmptyAddressRule::NullOrUser
+        } else {
+            EmptyAddressRule::Reject
+        },
+    )
+    .map_err(|_| DW_STATUS_BAD_ADDRESS)
 }
 
 fn copy_input<U: UserPageAccess, const N: usize>(
@@ -212,6 +254,13 @@ fn handle_status(error: HandleTableError) -> DwStatus {
     }
 }
 
+fn handle_move_status(error: HandleMovePrepareError) -> DwStatus {
+    match error {
+        HandleMovePrepareError::DuplicateSource => DW_STATUS_INVALID_ARGUMENT,
+        HandleMovePrepareError::Table(error) => handle_status(error),
+    }
+}
+
 fn task_status(error: TaskError) -> DwStatus {
     match error {
         TaskError::Capacity => DW_STATUS_NO_RESOURCES,
@@ -231,6 +280,56 @@ fn task_create_status(error: TaskCreateError) -> DwStatus {
         }
         TaskCreateError::Registry(_) => DW_STATUS_BAD_STATE,
         TaskCreateError::Task(error) => task_status(error),
+    }
+}
+
+fn wait_status(error: WaitError) -> DwStatus {
+    match error {
+        WaitError::Capacity => DW_STATUS_NO_RESOURCES,
+        WaitError::InvalidSignals => DW_STATUS_INVALID_ARGUMENT,
+        WaitError::AccessDenied => DW_STATUS_ACCESS_DENIED,
+        WaitError::UnsupportedSource => DW_STATUS_NOT_SUPPORTED,
+        WaitError::InvalidObject => DW_STATUS_WRONG_OBJECT_TYPE,
+        WaitError::ForeignRegistration
+        | WaitError::StaleRegistration
+        | WaitError::EventFinalizationMismatch
+        | WaitError::EventReference => DW_STATUS_BAD_STATE,
+    }
+}
+
+fn event_create_status(error: EventCreateError) -> DwStatus {
+    match error {
+        EventCreateError::Registry(ObjectRegistryError::Capacity)
+        | EventCreateError::Registry(ObjectRegistryError::ReferenceCountExhausted) => {
+            DW_STATUS_NO_RESOURCES
+        }
+        EventCreateError::Registry(_) => DW_STATUS_BAD_STATE,
+        EventCreateError::Wait(error) => wait_status(error),
+    }
+}
+
+fn channel_status(error: ChannelError) -> DwStatus {
+    match error {
+        ChannelError::Capacity => DW_STATUS_NO_RESOURCES,
+        ChannelError::InvalidArgument => DW_STATUS_INVALID_ARGUMENT,
+        ChannelError::WouldBlock => DW_STATUS_WOULD_BLOCK,
+        ChannelError::PeerClosed => DW_STATUS_PEER_CLOSED,
+        ChannelError::BufferTooSmall => DW_STATUS_BUFFER_TOO_SMALL,
+        ChannelError::AccessDenied => DW_STATUS_ACCESS_DENIED,
+        ChannelError::InvalidEndpoint
+        | ChannelError::StalePair
+        | ChannelError::FinalizationMismatch => DW_STATUS_BAD_STATE,
+    }
+}
+
+fn channel_create_status(error: ChannelCreateError) -> DwStatus {
+    match error {
+        ChannelCreateError::Registry(ObjectRegistryError::Capacity)
+        | ChannelCreateError::Registry(ObjectRegistryError::ReferenceCountExhausted) => {
+            DW_STATUS_NO_RESOURCES
+        }
+        ChannelCreateError::Registry(_) => DW_STATUS_BAD_STATE,
+        ChannelCreateError::Channel(error) => channel_status(error),
     }
 }
 
@@ -588,6 +687,600 @@ pub(crate) fn task_group_create<
         }
     };
     output.commit(&encode_handle(handle));
+    DW_STATUS_SUCCESS
+}
+
+pub(crate) fn channel_create<
+    U: UserPageBatchAccess,
+    const OBJECTS: usize,
+    const PAIRS: usize,
+    const DEPTH: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    user: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    channels: &ChannelAuthority<PAIRS, DEPTH>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    current_process: ProcessKey,
+    requested_rights: DwRights,
+    out_endpoint0: DwUserAddress,
+    out_endpoint1: DwUserAddress,
+) -> DwStatus {
+    if let Err(status) = validate_created_handle_rights(DW_OBJECT_TYPE_CHANNEL, requested_rights) {
+        return status;
+    }
+    let first_range = match user_range(out_endpoint0, 8, 8, UserAccess::WRITE) {
+        Ok(range) => range,
+        Err(status) => return status,
+    };
+    let second_range = match user_range(out_endpoint1, 8, 8, UserAccess::WRITE) {
+        Ok(range) => range,
+        Err(status) => return status,
+    };
+    let outputs = match preflight_outputs(
+        user,
+        [Some((first_range, 8)), Some((second_range, 8)), None],
+    ) {
+        Ok(outputs) => outputs,
+        Err(status) => return status,
+    };
+    let reservation = match tasks.process_handles_mut(current_process) {
+        Ok(table) => match table.reserve_pair(DW_OBJECT_TYPE_CHANNEL, requested_rights) {
+            Ok(reservation) => reservation,
+            Err(error) => return handle_status(error),
+        },
+        Err(error) => return task_status(error),
+    };
+    let (_keys, references) = match channels.create_pair(registry) {
+        Ok(pair) => pair,
+        Err(error) => return channel_create_status(error),
+    };
+    let [first_reference, second_reference] = references;
+    let handles = tasks
+        .process_handles_mut(current_process)
+        .unwrap_or_else(|error| {
+            panic!("F5 Channel caller changed during reserved creation: {error:?}")
+        })
+        .publish_reserved_pair(reservation, first_reference, second_reference);
+    let first_bytes = encode_handle(handles[0]);
+    let second_bytes = encode_handle(handles[1]);
+    outputs.commit([Some(&first_bytes), Some(&second_bytes), None]);
+    DW_STATUS_SUCCESS
+}
+
+pub(crate) fn channel_send<
+    U: UserPageAccess,
+    const OBJECTS: usize,
+    const PAIRS: usize,
+    const DEPTH: usize,
+    const WAITERS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EXECUTION: usize,
+>(
+    user: &mut U,
+    staging: &mut [u8],
+    registry: &mut ObjectRegistry<OBJECTS>,
+    channels: &ChannelAuthority<PAIRS, DEPTH>,
+    waits: &WaitRegistry<WAITERS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    current_process: ProcessKey,
+    channel: DwHandle,
+    bytes: DwUserAddress,
+    byte_len: u32,
+    transfers: DwUserAddress,
+    transfer_count: u32,
+    flags: u64,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
+    if byte_len > DW_CHANNEL_MAX_PAYLOAD || transfer_count > DW_CHANNEL_MAX_HANDLES || flags != 0 {
+        return DW_STATUS_INVALID_ARGUMENT;
+    }
+
+    let transfer_count = transfer_count as usize;
+    let transfer_byte_len = transfer_count
+        .checked_mul(DW_HANDLE_TRANSFER_V1_SIZE as usize)
+        .expect("generated Channel transfer count fits usize");
+    let transfer_range =
+        match channel_buffer_range(transfers, transfer_byte_len, 8, UserAccess::READ) {
+            Ok(range) => range,
+            Err(status) => return status,
+        };
+    let mut transfer_staging = [0_u8; HANDLE_TRANSFER_LIMIT * HANDLE_TRANSFER_BYTES];
+    if let Err(error) = snapshot_from_user(
+        user,
+        transfer_range,
+        &mut transfer_staging[..transfer_byte_len],
+    ) {
+        return usercopy_status(error);
+    }
+    let mut decoded = [DwHandleTransferV1::default(); HANDLE_TRANSFER_LIMIT];
+    for (index, record) in decoded[..transfer_count].iter_mut().enumerate() {
+        let start = index * HANDLE_TRANSFER_BYTES;
+        let bytes: &[u8; HANDLE_TRANSFER_BYTES] = transfer_staging
+            [start..start + HANDLE_TRANSFER_BYTES]
+            .try_into()
+            .expect("transfer staging record has generated fixed width");
+        *record = decode_handle_transfer(bytes);
+        if record.reserved0 != 0 || record.reserved.iter().any(|value| *value != 0) {
+            return DW_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    for left in 0..transfer_count {
+        for right in left + 1..transfer_count {
+            if decoded[left].handle == decoded[right].handle {
+                return DW_STATUS_INVALID_ARGUMENT;
+            }
+        }
+    }
+    if decoded[..transfer_count]
+        .iter()
+        .any(|record| record.operation != DW_HANDLE_TRANSFER_MOVE)
+    {
+        return DW_STATUS_INVALID_ARGUMENT;
+    }
+
+    let byte_len = byte_len as usize;
+    assert!(
+        staging.len() >= DW_CHANNEL_MAX_PAYLOAD as usize,
+        "F6 Channel staging must hold one ABI-maximum payload"
+    );
+    let range = match channel_buffer_range(bytes, byte_len, 1, UserAccess::READ) {
+        Ok(range) => range,
+        Err(status) => return status,
+    };
+    if let Err(error) = snapshot_from_user(user, range, &mut staging[..byte_len]) {
+        return usercopy_status(error);
+    }
+
+    let pin = match resolve_current_handle(
+        tasks,
+        registry,
+        current_process,
+        channel,
+        DW_OBJECT_TYPE_CHANNEL,
+        DW_RIGHT_WRITE,
+    ) {
+        Ok(pin) => pin,
+        Err(status) => return status,
+    };
+    let endpoint = ChannelEndpointKey::from_object_id(pin.id());
+    let mut move_requests = [HandleMoveRequest {
+        handle: DwHandle(0),
+        requested_rights: DwRights(0),
+    }; HANDLE_TRANSFER_LIMIT];
+    for index in 0..transfer_count {
+        move_requests[index] = HandleMoveRequest {
+            handle: decoded[index].handle,
+            requested_rights: decoded[index].requested_rights,
+        };
+    }
+
+    let table = match tasks.process_handles_mut(current_process) {
+        Ok(table) => table,
+        Err(error) => {
+            release_lookup_pin(registry, pin, cleanup);
+            return task_status(error);
+        }
+    };
+    let prepared = match table.prepare_move_batch(&move_requests[..transfer_count]) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            release_lookup_pin(registry, pin, cleanup);
+            return handle_move_status(error);
+        }
+    };
+    let peer_object = match channels.peer_object(endpoint) {
+        Ok(peer) => peer,
+        Err(error) => {
+            drop(prepared);
+            release_lookup_pin(registry, pin, cleanup);
+            return channel_status(error);
+        }
+    };
+    if prepared.contains_object(peer_object) {
+        drop(prepared);
+        release_lookup_pin(registry, pin, cleanup);
+        return DW_STATUS_INVALID_ARGUMENT;
+    }
+    let send_reservation = match channels.reserve_send(endpoint, &staging[..byte_len]) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            drop(prepared);
+            release_lookup_pin(registry, pin, cleanup);
+            return channel_status(error);
+        }
+    };
+    let (rollback, transfer_batch) = prepared.extract();
+    match channels.commit_send(send_reservation, transfer_batch, waits) {
+        Ok(wakes) => {
+            rollback.finish();
+            release_lookup_pin(registry, pin, cleanup);
+            complete_wait_wakes(registry, execution, wakes, cleanup);
+            DW_STATUS_SUCCESS
+        }
+        Err((error, transfer_batch)) => {
+            rollback.rollback(transfer_batch);
+            release_lookup_pin(registry, pin, cleanup);
+            channel_status(error)
+        }
+    }
+}
+
+fn channel_receive_result(
+    required_bytes: u32,
+    actual_bytes: u32,
+    required_handles: u32,
+    actual_handles: u32,
+) -> DwChannelReceiveResultV1 {
+    DwChannelReceiveResultV1 {
+        size: DW_CHANNEL_RECEIVE_RESULT_V1_SIZE,
+        version: 1,
+        actual_bytes,
+        actual_handles,
+        required_bytes,
+        required_handles,
+        reserved: [0; 4],
+    }
+}
+
+pub(crate) fn channel_receive<
+    U: UserPageBatchAccess,
+    const OBJECTS: usize,
+    const PAIRS: usize,
+    const DEPTH: usize,
+    const WAITERS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EXECUTION: usize,
+>(
+    user: &mut U,
+    staging: &mut [u8],
+    registry: &mut ObjectRegistry<OBJECTS>,
+    channels: &ChannelAuthority<PAIRS, DEPTH>,
+    waits: &WaitRegistry<WAITERS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    current_process: ProcessKey,
+    channel: DwHandle,
+    out_bytes: DwUserAddress,
+    byte_capacity: u32,
+    out_handles: DwUserAddress,
+    handle_capacity: u32,
+    out_result: DwUserAddress,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
+    if byte_capacity > DW_CHANNEL_MAX_PAYLOAD || handle_capacity > DW_CHANNEL_MAX_HANDLES {
+        return DW_STATUS_INVALID_ARGUMENT;
+    }
+    let result_probe = match preflight_output(
+        user,
+        out_result,
+        DW_CHANNEL_RECEIVE_RESULT_V1_SIZE as usize,
+        8,
+    ) {
+        Ok(output) => output,
+        Err(status) => return status,
+    };
+    drop(result_probe);
+
+    let pin = match resolve_current_handle(
+        tasks,
+        registry,
+        current_process,
+        channel,
+        DW_OBJECT_TYPE_CHANNEL,
+        DW_RIGHT_READ,
+    ) {
+        Ok(pin) => pin,
+        Err(status) => return status,
+    };
+    let endpoint = ChannelEndpointKey::from_object_id(pin.id());
+    let reservation = match channels.reserve_receive(endpoint) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            release_lookup_pin(registry, pin, cleanup);
+            return channel_status(error);
+        }
+    };
+    let info = reservation.info();
+
+    if info.required_bytes > byte_capacity || info.required_handles > handle_capacity {
+        let output = match preflight_output(
+            user,
+            out_result,
+            DW_CHANNEL_RECEIVE_RESULT_V1_SIZE as usize,
+            8,
+        ) {
+            Ok(output) => output,
+            Err(status) => {
+                channels
+                    .cancel_receive(reservation)
+                    .unwrap_or_else(|error| {
+                        panic!("F6 receive reservation cancellation drifted: {error:?}")
+                    });
+                release_lookup_pin(registry, pin, cleanup);
+                return status;
+            }
+        };
+        let result = channel_receive_result(info.required_bytes, 0, info.required_handles, 0);
+        output.commit(&encode_channel_receive_result(result));
+        channels
+            .cancel_receive(reservation)
+            .unwrap_or_else(|error| {
+                panic!("F6 receive reservation cancellation drifted: {error:?}")
+            });
+        release_lookup_pin(registry, pin, cleanup);
+        return DW_STATUS_BUFFER_TOO_SMALL;
+    }
+
+    let byte_bytes = info.required_bytes as usize;
+    let handle_count = info.required_handles as usize;
+    let handle_bytes = handle_count
+        .checked_mul(DW_RECEIVED_HANDLE_INFO_V1_SIZE as usize)
+        .expect("generated Channel handle capacity fits usize");
+    let byte_range = match channel_buffer_range(out_bytes, byte_bytes, 1, UserAccess::WRITE) {
+        Ok(range) => range,
+        Err(status) => {
+            channels
+                .cancel_receive(reservation)
+                .unwrap_or_else(|error| {
+                    panic!("F6 receive reservation cancellation drifted: {error:?}")
+                });
+            release_lookup_pin(registry, pin, cleanup);
+            return status;
+        }
+    };
+    let handle_range = match channel_buffer_range(out_handles, handle_bytes, 8, UserAccess::WRITE) {
+        Ok(range) => range,
+        Err(status) => {
+            channels
+                .cancel_receive(reservation)
+                .unwrap_or_else(|error| {
+                    panic!("F6 receive reservation cancellation drifted: {error:?}")
+                });
+            release_lookup_pin(registry, pin, cleanup);
+            return status;
+        }
+    };
+    let result_range = match user_range(
+        out_result,
+        DW_CHANNEL_RECEIVE_RESULT_V1_SIZE as usize,
+        8,
+        UserAccess::WRITE,
+    ) {
+        Ok(range) => range,
+        Err(status) => {
+            channels
+                .cancel_receive(reservation)
+                .unwrap_or_else(|error| {
+                    panic!("F6 receive reservation cancellation drifted: {error:?}")
+                });
+            release_lookup_pin(registry, pin, cleanup);
+            return status;
+        }
+    };
+    let outputs = match preflight_outputs(
+        user,
+        [
+            Some((byte_range, byte_bytes)),
+            Some((handle_range, handle_bytes)),
+            Some((result_range, DW_CHANNEL_RECEIVE_RESULT_V1_SIZE as usize)),
+        ],
+    ) {
+        Ok(outputs) => outputs,
+        Err(status) => {
+            channels
+                .cancel_receive(reservation)
+                .unwrap_or_else(|error| {
+                    panic!("F6 receive reservation cancellation drifted: {error:?}")
+                });
+            release_lookup_pin(registry, pin, cleanup);
+            return status;
+        }
+    };
+    assert!(
+        staging.len() >= DW_CHANNEL_MAX_PAYLOAD as usize,
+        "F6 Channel staging must hold one ABI-maximum payload"
+    );
+
+    let table = match tasks.process_handles_mut(current_process) {
+        Ok(table) => table,
+        Err(error) => {
+            drop(outputs);
+            channels
+                .cancel_receive(reservation)
+                .unwrap_or_else(|channel_error| {
+                    panic!("F6 receive reservation cancellation drifted: {channel_error:?}")
+                });
+            release_lookup_pin(registry, pin, cleanup);
+            return task_status(error);
+        }
+    };
+    let destination = match table.reserve_transfer_batch(handle_count) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            drop(outputs);
+            channels
+                .cancel_receive(reservation)
+                .unwrap_or_else(|channel_error| {
+                    panic!("F6 receive reservation cancellation drifted: {channel_error:?}")
+                });
+            release_lookup_pin(registry, pin, cleanup);
+            return handle_status(error);
+        }
+    };
+    let received = match channels.receive_reserved(reservation, &mut staging[..byte_bytes], waits) {
+        Ok(received) => received,
+        Err(error) => {
+            drop(destination);
+            drop(outputs);
+            release_lookup_pin(registry, pin, cleanup);
+            return channel_status(error);
+        }
+    };
+    let (actual, transfer_batch, wakes) = received.into_parts();
+    let published = destination.publish(transfer_batch);
+
+    let mut received_handle_bytes =
+        [0_u8; HANDLE_TRANSFER_LIMIT * DW_RECEIVED_HANDLE_INFO_V1_SIZE as usize];
+    for (index, info) in published[..handle_count]
+        .iter()
+        .flatten()
+        .copied()
+        .enumerate()
+    {
+        let encoded = encode_received_handle_info(DwReceivedHandleInfoV1 {
+            handle: info.handle,
+            rights: info.rights,
+            object_type: info.object_type,
+            reserved0: 0,
+            reserved: [0; 2],
+        });
+        let start = index * DW_RECEIVED_HANDLE_INFO_V1_SIZE as usize;
+        received_handle_bytes[start..start + DW_RECEIVED_HANDLE_INFO_V1_SIZE as usize]
+            .copy_from_slice(&encoded);
+    }
+    let actual_u32 = u32::try_from(actual).expect("Channel receive length fits generated u32");
+    let actual_handles = u32::try_from(handle_count).expect("Channel transfer count fits u32");
+    let result = channel_receive_result(actual_u32, actual_u32, actual_handles, actual_handles);
+    let result_bytes = encode_channel_receive_result(result);
+    outputs.commit_prefixes([
+        Some(&staging[..actual]),
+        Some(&received_handle_bytes[..handle_bytes]),
+        Some(&result_bytes),
+    ]);
+    release_lookup_pin(registry, pin, cleanup);
+    complete_wait_wakes(registry, execution, wakes, cleanup);
+    DW_STATUS_SUCCESS
+}
+
+fn complete_wait_wakes<const OBJECTS: usize, const WAITERS: usize, const EXECUTION: usize>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    execution: &ExecutionDomain<EXECUTION>,
+    wakes: WakeBatch<WAITERS>,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) {
+    let (wake_intents, wait_pins) = wakes.into_parts();
+    for wake in wake_intents.into_iter().flatten() {
+        execution.wake(wake.wake_key()).unwrap_or_else(|error| {
+            panic!("waiter lost exact scheduler block generation: {error:?}")
+        });
+    }
+    for pin in wait_pins.into_iter().flatten() {
+        release_lookup_pin(registry, pin, cleanup);
+    }
+}
+
+pub(crate) fn event_create<
+    U: UserPageAccess,
+    const OBJECTS: usize,
+    const EVENTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    user: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    events: &EventAuthority<EVENTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    current_process: ProcessKey,
+    requested_rights: DwRights,
+    out_event: DwUserAddress,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
+    if let Err(status) =
+        validate_created_handle_rights(deepwyrm_abi::DW_OBJECT_TYPE_EVENT, requested_rights)
+    {
+        return status;
+    }
+    let output = match preflight_output(user, out_event, 8, 8) {
+        Ok(output) => output,
+        Err(status) => return status,
+    };
+    let (_key, reference) = match events.create_event(registry) {
+        Ok(created) => created,
+        Err(error) => return event_create_status(error),
+    };
+    let handle = match tasks.process_handles_mut(current_process) {
+        Ok(table) => {
+            match install_created_handle(table, registry, reference, requested_rights, cleanup) {
+                Ok(handle) => handle,
+                Err(status) => return status,
+            }
+        }
+        Err(error) => {
+            cleanup.push_optional(
+                registry
+                    .release_handle(reference)
+                    .unwrap_or_else(|failure| {
+                        panic!(
+                            "F4 Event publication rollback drifted: {:?}",
+                            failure.error()
+                        )
+                    }),
+            );
+            return task_status(error);
+        }
+    };
+    output.commit(&encode_handle(handle));
+    DW_STATUS_SUCCESS
+}
+
+pub(crate) fn event_signal<
+    const OBJECTS: usize,
+    const EVENTS: usize,
+    const WAITERS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    events: &EventAuthority<EVENTS>,
+    waits: &WaitRegistry<WAITERS>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    current_process: ProcessKey,
+    event: DwHandle,
+    clear_mask: deepwyrm_abi::DwSignals,
+    set_mask: deepwyrm_abi::DwSignals,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
+    if let Err(error) = validate_event_signal_masks(clear_mask, set_mask) {
+        return wait_status(error);
+    }
+    let pin = match resolve_current_handle(
+        tasks,
+        registry,
+        current_process,
+        event,
+        deepwyrm_abi::DW_OBJECT_TYPE_EVENT,
+        DW_RIGHT_SIGNAL,
+    ) {
+        Ok(pin) => pin,
+        Err(status) => return status,
+    };
+    let key = EventKey::from_object_id(pin.id());
+    let wakes = match events.signal(key, clear_mask, set_mask, waits) {
+        Ok(wakes) => wakes,
+        Err(error) => {
+            release_lookup_pin(registry, pin, cleanup);
+            return wait_status(error);
+        }
+    };
+    release_lookup_pin(registry, pin, cleanup);
+    complete_wait_wakes(registry, execution, wakes, cleanup);
     DW_STATUS_SUCCESS
 }
 

@@ -1,6 +1,8 @@
+extern crate std;
+
 use super::*;
 use crate::memory::user_range::UserPageChunk;
-use crate::memory::usercopy::PinnedUserPages;
+use crate::memory::usercopy::{PinnedUserBatchPages, PinnedUserPages, UserPageBatchAccess};
 use crate::object::ObjectRegistry;
 use crate::task::TaskAuthority;
 use deepwyrm_abi::{DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_MODIFY};
@@ -15,6 +17,11 @@ struct FakeUserMemory {
 
 struct FakePinned<'a> {
     memory: &'a mut FakeUserMemory,
+}
+
+struct FakePinnedBatch<'a> {
+    memory: &'a mut FakeUserMemory,
+    ranges: [Option<UserRange>; 3],
 }
 
 impl FakeUserMemory {
@@ -44,6 +51,41 @@ impl UserPageAccess for FakeUserMemory {
     }
 }
 
+impl UserPageBatchAccess for FakeUserMemory {
+    type PinnedBatch<'a>
+        = FakePinnedBatch<'a>
+    where
+        Self: 'a;
+
+    fn pin_batch(
+        &mut self,
+        ranges: [Option<UserRange>; 3],
+    ) -> Result<Self::PinnedBatch<'_>, Self::Error> {
+        for left in 0..ranges.len() {
+            let Some(left_range) = ranges[left] else {
+                continue;
+            };
+            if left_range.is_empty() {
+                continue;
+            }
+            for right_range in ranges[left + 1..].iter().flatten().copied() {
+                if right_range.is_empty() {
+                    continue;
+                }
+                if left_range.start() < right_range.end_exclusive()
+                    && right_range.start() < left_range.end_exclusive()
+                {
+                    return Err(());
+                }
+            }
+        }
+        Ok(FakePinnedBatch {
+            memory: self,
+            ranges,
+        })
+    }
+}
+
 impl PinnedUserPages for FakePinned<'_> {
     type Error = ();
 
@@ -66,9 +108,53 @@ impl PinnedUserPages for FakePinned<'_> {
     }
 }
 
+impl PinnedUserBatchPages for FakePinnedBatch<'_> {
+    type Error = ();
+
+    fn preflight(&mut self, index: usize, chunk: UserPageChunk) -> Result<(), Self::Error> {
+        let range = self.ranges.get(index).copied().flatten().ok_or(())?;
+        if self.memory.deny_write && chunk.access().includes(UserAccess::WRITE) {
+            return Err(());
+        }
+        let end = chunk.address().checked_add(chunk.byte_len()).ok_or(())?;
+        if chunk.address() < range.start() || end > range.end_exclusive() {
+            return Err(());
+        }
+        let _ = FakeUserMemory::offset(chunk.address(), usize::try_from(chunk.byte_len()).unwrap());
+        Ok(())
+    }
+
+    fn write_exact(&mut self, index: usize, range: UserRange, source: &[u8]) {
+        let allowed = self.ranges.get(index).copied().flatten().unwrap();
+        assert_eq!(range.start(), allowed.start());
+        assert!(range.end_exclusive() <= allowed.end_exclusive());
+        let offset = FakeUserMemory::offset(range.start(), source.len());
+        self.memory.bytes[offset..offset + source.len()].copy_from_slice(source);
+    }
+}
+
 fn u64_at(memory: &FakeUserMemory, address: u64) -> u64 {
     let offset = FakeUserMemory::offset(address, 8);
     u64::from_le_bytes(memory.bytes[offset..offset + 8].try_into().unwrap())
+}
+
+fn u32_at(memory: &FakeUserMemory, address: u64) -> u32 {
+    let offset = FakeUserMemory::offset(address, 4);
+    u32::from_le_bytes(memory.bytes[offset..offset + 4].try_into().unwrap())
+}
+
+fn write_handle_transfer(
+    memory: &mut FakeUserMemory,
+    address: u64,
+    record: deepwyrm_abi::DwHandleTransferV1,
+) {
+    let offset = FakeUserMemory::offset(address, deepwyrm_abi::DW_HANDLE_TRANSFER_V1_SIZE as usize);
+    memory.bytes[offset..offset + 8].copy_from_slice(&record.handle.0.to_le_bytes());
+    memory.bytes[offset + 8..offset + 16].copy_from_slice(&record.requested_rights.0.to_le_bytes());
+    memory.bytes[offset + 16..offset + 20].copy_from_slice(&record.operation.0.to_le_bytes());
+    memory.bytes[offset + 20..offset + 24].copy_from_slice(&record.reserved0.to_le_bytes());
+    memory.bytes[offset + 24..offset + 32].copy_from_slice(&record.reserved[0].to_le_bytes());
+    memory.bytes[offset + 32..offset + 40].copy_from_slice(&record.reserved[1].to_le_bytes());
 }
 
 #[test]
@@ -160,6 +246,579 @@ fn process_fixture() -> (ObjectRegistry<16>, Tasks, ProcessKey, DwHandle) {
         .install(process_ref, rights)
         .unwrap();
     (registry, tasks, process, handle)
+}
+
+#[test]
+fn event_create_preflights_output_before_object_and_handle_publication() {
+    use deepwyrm_abi::{DW_OBJECT_TYPE_EVENT, DW_RIGHT_SIGNAL, DW_RIGHT_WAIT};
+
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let events = EventAuthority::<2>::new();
+    let mut user = FakeUserMemory::new();
+    let mut cleanup = CleanupQueue::<16>::new();
+    let requested = DwRights(DW_RIGHT_WAIT.0 | DW_RIGHT_SIGNAL.0);
+    let generations = registry.test_slot_generations();
+    let handle_count = tasks.process_handle_count(process).unwrap();
+
+    user.deny_write = true;
+    assert_eq!(
+        event_create(
+            &mut user,
+            &mut registry,
+            &events,
+            &mut tasks,
+            process,
+            requested,
+            DwUserAddress(BASE + 0x180),
+            &mut cleanup,
+        ),
+        DW_STATUS_BAD_ADDRESS
+    );
+    assert_eq!(registry.test_slot_generations(), generations);
+    assert_eq!(tasks.process_handle_count(process).unwrap(), handle_count);
+
+    user.deny_write = false;
+    assert_eq!(
+        event_create(
+            &mut user,
+            &mut registry,
+            &events,
+            &mut tasks,
+            process,
+            requested,
+            DwUserAddress(BASE + 0x180),
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let event = DwHandle(u64_at(&user, BASE + 0x180));
+    assert_ne!(event.0, 0);
+    assert_eq!(
+        tasks.process_handle_count(process).unwrap(),
+        handle_count + 1
+    );
+
+    let waits = WaitRegistry::<2>::new();
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    assert_eq!(
+        event_signal(
+            &mut registry,
+            &events,
+            &waits,
+            &tasks,
+            &execution,
+            process,
+            event,
+            deepwyrm_abi::DwSignals(0),
+            deepwyrm_abi::DW_SIGNAL_SIGNALED,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let pin = resolve_current_handle(
+        &tasks,
+        &mut registry,
+        process,
+        event,
+        DW_OBJECT_TYPE_EVENT,
+        DW_RIGHT_SIGNAL,
+    )
+    .unwrap();
+    let key = EventKey::from_object_id(pin.id());
+    assert_eq!(
+        events.current_signals(key).unwrap(),
+        deepwyrm_abi::DW_SIGNAL_SIGNALED
+    );
+    release_lookup_pin(&mut registry, pin, &mut cleanup);
+
+    assert_eq!(
+        event_signal(
+            &mut registry,
+            &events,
+            &waits,
+            &tasks,
+            &execution,
+            process,
+            event,
+            deepwyrm_abi::DW_SIGNAL_SIGNALED,
+            deepwyrm_abi::DwSignals(0),
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let pin = resolve_current_handle(
+        &tasks,
+        &mut registry,
+        process,
+        event,
+        DW_OBJECT_TYPE_EVENT,
+        DW_RIGHT_SIGNAL,
+    )
+    .unwrap();
+    let key = EventKey::from_object_id(pin.id());
+    assert_eq!(
+        events.current_signals(key).unwrap(),
+        deepwyrm_abi::DwSignals(0)
+    );
+    release_lookup_pin(&mut registry, pin, &mut cleanup);
+
+    assert_eq!(
+        handle_close(&mut registry, &mut tasks, process, event, &mut cleanup),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    for release in cleanup.into_releases().into_iter().flatten() {
+        assert_eq!(release.object_type(), DW_OBJECT_TYPE_EVENT);
+        let finalization = events.take_finalization(release).unwrap();
+        crate::wait::complete_event_finalization(&mut registry, finalization);
+    }
+}
+
+fn install_event_for_test<const EVENTS: usize>(
+    registry: &mut ObjectRegistry<16>,
+    tasks: &mut Tasks,
+    process: ProcessKey,
+    events: &EventAuthority<EVENTS>,
+    rights: DwRights,
+) -> DwHandle {
+    let (_key, reference) = events.create_event(registry).unwrap();
+    tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(reference, rights)
+        .unwrap()
+}
+
+fn close_event_for_test<const EVENTS: usize>(
+    registry: &mut ObjectRegistry<16>,
+    tasks: &mut Tasks,
+    process: ProcessKey,
+    events: &EventAuthority<EVENTS>,
+    handle: DwHandle,
+) {
+    let release = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .close(registry, handle)
+        .unwrap()
+        .unwrap();
+    let finalization = events.take_finalization(release).unwrap();
+    crate::wait::complete_event_finalization(registry, finalization);
+}
+
+fn close_channel_for_test(
+    registry: &mut ObjectRegistry<16>,
+    tasks: &mut Tasks,
+    process: ProcessKey,
+    channels: &ChannelAuthority<2, 4>,
+    waits: &WaitRegistry<8>,
+    handle: DwHandle,
+) {
+    let release = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .close(registry, handle)
+        .unwrap()
+        .unwrap();
+    let finalization = channels.take_finalization(release, waits).unwrap();
+    let completion = crate::ipc::complete_channel_finalization(registry, finalization);
+    let (wakes, releases) = completion.into_parts();
+    assert_eq!(wakes.len(), 0);
+    assert!(releases.into_iter().flatten().next().is_none());
+}
+
+#[test]
+fn channel_create_preflights_both_outputs_before_pair_publication() {
+    use deepwyrm_abi::{DW_RIGHT_READ, DW_RIGHT_WRITE};
+
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let channels = ChannelAuthority::<2, 4>::new();
+    let waits = WaitRegistry::<8>::new();
+    let mut user = FakeUserMemory::new();
+    let requested = DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0);
+    let generations = registry.test_slot_generations();
+    let before = tasks.process_handle_count(process).unwrap();
+
+    user.deny_write = true;
+    assert_eq!(
+        channel_create(
+            &mut user,
+            &mut registry,
+            &channels,
+            &mut tasks,
+            process,
+            requested,
+            DwUserAddress(BASE + 0x180),
+            DwUserAddress(BASE + 0x188),
+        ),
+        DW_STATUS_BAD_ADDRESS
+    );
+    assert_eq!(registry.test_slot_generations(), generations);
+    assert_eq!(tasks.process_handle_count(process).unwrap(), before);
+
+    user.deny_write = false;
+    assert_eq!(
+        channel_create(
+            &mut user,
+            &mut registry,
+            &channels,
+            &mut tasks,
+            process,
+            requested,
+            DwUserAddress(BASE + 0x180),
+            DwUserAddress(BASE + 0x180),
+        ),
+        DW_STATUS_BAD_ADDRESS
+    );
+    assert_eq!(registry.test_slot_generations(), generations);
+    assert_eq!(tasks.process_handle_count(process).unwrap(), before);
+
+    assert_eq!(
+        channel_create(
+            &mut user,
+            &mut registry,
+            &channels,
+            &mut tasks,
+            process,
+            requested,
+            DwUserAddress(BASE + 0x180),
+            DwUserAddress(BASE + 0x188),
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let endpoint0 = DwHandle(u64_at(&user, BASE + 0x180));
+    let endpoint1 = DwHandle(u64_at(&user, BASE + 0x188));
+    assert_ne!(endpoint0, endpoint1);
+    assert_eq!(tasks.process_handle_count(process).unwrap(), before + 2);
+
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        endpoint0,
+    );
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        endpoint1,
+    );
+    let mut cleanup = CleanupQueue::<16>::new();
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert!(
+        cleanup
+            .into_releases()
+            .into_iter()
+            .flatten()
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn channel_send_receive_and_buffer_too_small_are_transactional() {
+    use deepwyrm_abi::{DW_RIGHT_READ, DW_RIGHT_WRITE};
+
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let channels = ChannelAuthority::<2, 4>::new();
+    let waits = WaitRegistry::<8>::new();
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let mut user = FakeUserMemory::new();
+    let mut cleanup = CleanupQueue::<16>::new();
+    let requested = DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0);
+    assert_eq!(
+        channel_create(
+            &mut user,
+            &mut registry,
+            &channels,
+            &mut tasks,
+            process,
+            requested,
+            DwUserAddress(BASE + 0x180),
+            DwUserAddress(BASE + 0x188),
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let endpoint0 = DwHandle(u64_at(&user, BASE + 0x180));
+    let endpoint1 = DwHandle(u64_at(&user, BASE + 0x188));
+    let input = FakeUserMemory::offset(BASE + 0x300, 6);
+    user.bytes[input..input + 6].copy_from_slice(b"dragon");
+    let mut staging = std::vec![0_u8; DW_CHANNEL_MAX_PAYLOAD as usize];
+
+    assert_eq!(
+        channel_send(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            endpoint0,
+            DwUserAddress(BASE + 0x300),
+            6,
+            DwUserAddress(0),
+            0,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+
+    assert_eq!(
+        channel_receive(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            endpoint1,
+            DwUserAddress(0),
+            4,
+            DwUserAddress(0),
+            0,
+            DwUserAddress(BASE + 0x500),
+            &mut cleanup,
+        ),
+        DW_STATUS_BUFFER_TOO_SMALL
+    );
+    assert_eq!(u32_at(&user, BASE + 0x500 + 8), 0);
+    assert_eq!(u32_at(&user, BASE + 0x500 + 16), 6);
+
+    assert_eq!(
+        channel_receive(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            endpoint1,
+            // Only the six bytes in the reserved head need to be pinned. The
+            // caller-declared capacity extends beyond FakeUserMemory and would
+            // fail if receive incorrectly preflighted the whole capacity.
+            DwUserAddress(BASE + BYTES as u64 - 6),
+            8,
+            DwUserAddress(0),
+            0,
+            DwUserAddress(BASE + 0x500),
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let output = FakeUserMemory::offset(BASE + BYTES as u64 - 6, 6);
+    assert_eq!(&user.bytes[output..output + 6], b"dragon");
+    assert_eq!(u32_at(&user, BASE + 0x500 + 8), 6);
+    assert_eq!(u32_at(&user, BASE + 0x500 + 16), 6);
+
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        endpoint0,
+    );
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        endpoint1,
+    );
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+}
+
+#[test]
+fn channel_send_reports_peer_closed_after_peer_finalization() {
+    use deepwyrm_abi::{DW_RIGHT_READ, DW_RIGHT_WRITE};
+
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let channels = ChannelAuthority::<2, 4>::new();
+    let waits = WaitRegistry::<8>::new();
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let mut user = FakeUserMemory::new();
+    let mut cleanup = CleanupQueue::<16>::new();
+    let requested = DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0);
+    assert_eq!(
+        channel_create(
+            &mut user,
+            &mut registry,
+            &channels,
+            &mut tasks,
+            process,
+            requested,
+            DwUserAddress(BASE + 0x180),
+            DwUserAddress(BASE + 0x188),
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let endpoint0 = DwHandle(u64_at(&user, BASE + 0x180));
+    let endpoint1 = DwHandle(u64_at(&user, BASE + 0x188));
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        endpoint1,
+    );
+    let mut staging = std::vec![0_u8; DW_CHANNEL_MAX_PAYLOAD as usize];
+    let input = FakeUserMemory::offset(BASE + 0x300, 1);
+    user.bytes[input] = 0x5a;
+    assert_eq!(
+        channel_send(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            endpoint0,
+            DwUserAddress(BASE + 0x300),
+            1,
+            DwUserAddress(0),
+            0,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_PEER_CLOSED
+    );
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        endpoint0,
+    );
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+}
+
+#[test]
+fn event_signal_rejects_invalid_masks_and_missing_signal_right_before_mutation() {
+    use deepwyrm_abi::{DW_OBJECT_TYPE_EVENT, DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED};
+
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let events = EventAuthority::<1>::new();
+    let waits = WaitRegistry::<1>::new();
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let (key, reference) = events.create_event(&mut registry).unwrap();
+    let event = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(reference, DW_RIGHT_WAIT)
+        .unwrap();
+    let mut cleanup = CleanupQueue::<16>::new();
+
+    assert_eq!(
+        event_signal(
+            &mut registry,
+            &events,
+            &waits,
+            &tasks,
+            &execution,
+            process,
+            DwHandle(u64::MAX),
+            deepwyrm_abi::DwSignals(0),
+            deepwyrm_abi::DwSignals(0),
+            &mut cleanup,
+        ),
+        DW_STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        events.current_signals(key).unwrap(),
+        deepwyrm_abi::DwSignals(0)
+    );
+
+    assert_eq!(
+        event_signal(
+            &mut registry,
+            &events,
+            &waits,
+            &tasks,
+            &execution,
+            process,
+            event,
+            deepwyrm_abi::DwSignals(0),
+            DW_SIGNAL_SIGNALED,
+            &mut cleanup,
+        ),
+        DW_STATUS_ACCESS_DENIED
+    );
+    assert_eq!(
+        events.current_signals(key).unwrap(),
+        deepwyrm_abi::DwSignals(0)
+    );
+
+    assert_eq!(
+        handle_close(&mut registry, &mut tasks, process, event, &mut cleanup),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    for release in cleanup.into_releases().into_iter().flatten() {
+        assert_eq!(release.object_type(), DW_OBJECT_TYPE_EVENT);
+        let finalization = events.take_finalization(release).unwrap();
+        crate::wait::complete_event_finalization(&mut registry, finalization);
+    }
 }
 
 #[test]
@@ -1157,4 +1816,785 @@ fn termination_rejects_reason_type_and_rights_before_target_mutation() {
     assert_eq!(execution.scheduler_state(current), None);
     let _ = current_handle;
     finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+#[test]
+fn channel_transfer_moves_event_and_publishes_reduced_receiver_rights() {
+    use deepwyrm_abi::{
+        DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_EVENT, DW_RIGHT_INSPECT, DW_RIGHT_READ,
+        DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE,
+    };
+
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let channels = ChannelAuthority::<2, 4>::new();
+    let waits = WaitRegistry::<8>::new();
+    let events = EventAuthority::<2>::new();
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let mut user = FakeUserMemory::new();
+    let mut cleanup = CleanupQueue::<16>::new();
+    let channel_rights = DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_TRANSFER.0);
+    assert_eq!(
+        channel_create(
+            &mut user,
+            &mut registry,
+            &channels,
+            &mut tasks,
+            process,
+            channel_rights,
+            DwUserAddress(BASE + 0x180),
+            DwUserAddress(BASE + 0x188),
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let endpoint0 = DwHandle(u64_at(&user, BASE + 0x180));
+    let endpoint1 = DwHandle(u64_at(&user, BASE + 0x188));
+    let source = install_event_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &events,
+        DwRights(DW_RIGHT_WAIT.0 | DW_RIGHT_TRANSFER.0 | DW_RIGHT_INSPECT.0),
+    );
+    write_handle_transfer(
+        &mut user,
+        BASE + 0x300,
+        deepwyrm_abi::DwHandleTransferV1 {
+            handle: source,
+            requested_rights: DW_RIGHT_WAIT,
+            operation: DW_HANDLE_TRANSFER_MOVE,
+            reserved0: 0,
+            reserved: [0; 2],
+        },
+    );
+    user.bytes[FakeUserMemory::offset(BASE + 0x380, 1)] = 0x6b;
+    let mut staging = std::vec![0_u8; DW_CHANNEL_MAX_PAYLOAD as usize];
+
+    assert_eq!(
+        channel_send(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            endpoint0,
+            DwUserAddress(BASE + 0x380),
+            1,
+            DwUserAddress(BASE + 0x300),
+            1,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(
+        tasks
+            .process_handles(process)
+            .unwrap()
+            .inspect_basic(source),
+        Err(HandleTableError::InvalidHandle)
+    );
+
+    assert_eq!(
+        channel_receive(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            endpoint1,
+            DwUserAddress(BASE + 0x400),
+            1,
+            DwUserAddress(BASE + 0x480),
+            1,
+            DwUserAddress(BASE + 0x500),
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(user.bytes[FakeUserMemory::offset(BASE + 0x400, 1)], 0x6b);
+    let received = DwHandle(u64_at(&user, BASE + 0x480));
+    assert_ne!(received, source);
+    assert_eq!(u64_at(&user, BASE + 0x488), DW_RIGHT_WAIT.0);
+    assert_eq!(u32_at(&user, BASE + 0x490), DW_OBJECT_TYPE_EVENT.0);
+    assert_eq!(u32_at(&user, BASE + 0x500 + 12), 1);
+    assert_eq!(u32_at(&user, BASE + 0x500 + 20), 1);
+    let resolved = tasks
+        .process_handles(process)
+        .unwrap()
+        .lookup(
+            &mut registry,
+            received,
+            AcceptedObjectTypes::One(DW_OBJECT_TYPE_EVENT),
+            DW_RIGHT_WAIT,
+        )
+        .unwrap();
+    assert_eq!(resolved.rights(), DW_RIGHT_WAIT);
+    assert!(
+        registry
+            .release_internal(resolved.into_internal())
+            .unwrap()
+            .is_none()
+    );
+
+    close_event_for_test(&mut registry, &mut tasks, process, &events, received);
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        endpoint0,
+    );
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        endpoint1,
+    );
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+}
+
+#[test]
+fn channel_transfer_descriptor_validation_precedes_source_mutation() {
+    use deepwyrm_abi::{
+        DW_HANDLE_TRANSFER_MOVE, DW_RIGHT_INSPECT, DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_WAIT,
+        DW_RIGHT_WRITE, DwHandleTransferOperation,
+    };
+
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let channels = ChannelAuthority::<2, 4>::new();
+    let waits = WaitRegistry::<8>::new();
+    let events = EventAuthority::<2>::new();
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let mut user = FakeUserMemory::new();
+    let mut cleanup = CleanupQueue::<16>::new();
+    assert_eq!(
+        channel_create(
+            &mut user,
+            &mut registry,
+            &channels,
+            &mut tasks,
+            process,
+            DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0),
+            DwUserAddress(BASE + 0x180),
+            DwUserAddress(BASE + 0x188),
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let endpoint0 = DwHandle(u64_at(&user, BASE + 0x180));
+    let endpoint1 = DwHandle(u64_at(&user, BASE + 0x188));
+    let source_rights = DwRights(DW_RIGHT_WAIT.0 | DW_RIGHT_TRANSFER.0 | DW_RIGHT_INSPECT.0);
+    let source = install_event_for_test(&mut registry, &mut tasks, process, &events, source_rights);
+    let mut staging = std::vec![0_u8; DW_CHANNEL_MAX_PAYLOAD as usize];
+
+    write_handle_transfer(
+        &mut user,
+        BASE + 0x300,
+        deepwyrm_abi::DwHandleTransferV1 {
+            handle: DwHandle(u64::MAX),
+            requested_rights: DW_RIGHT_WAIT,
+            operation: DW_HANDLE_TRANSFER_MOVE,
+            reserved0: 1,
+            reserved: [0; 2],
+        },
+    );
+    assert_eq!(
+        channel_send(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            endpoint0,
+            DwUserAddress(0),
+            0,
+            DwUserAddress(BASE + 0x300),
+            1,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_INVALID_ARGUMENT
+    );
+
+    write_handle_transfer(
+        &mut user,
+        BASE + 0x300,
+        deepwyrm_abi::DwHandleTransferV1 {
+            handle: source,
+            requested_rights: DW_RIGHT_WAIT,
+            operation: DwHandleTransferOperation(99),
+            reserved0: 0,
+            reserved: [0; 2],
+        },
+    );
+    assert_eq!(
+        channel_send(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            endpoint0,
+            DwUserAddress(0),
+            0,
+            DwUserAddress(BASE + 0x300),
+            1,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_INVALID_ARGUMENT
+    );
+
+    for address in [BASE + 0x300, BASE + 0x328] {
+        write_handle_transfer(
+            &mut user,
+            address,
+            deepwyrm_abi::DwHandleTransferV1 {
+                handle: source,
+                requested_rights: DW_RIGHT_WAIT,
+                operation: DW_HANDLE_TRANSFER_MOVE,
+                reserved0: 0,
+                reserved: [0; 2],
+            },
+        );
+    }
+    assert_eq!(
+        channel_send(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            endpoint0,
+            DwUserAddress(0),
+            0,
+            DwUserAddress(BASE + 0x300),
+            2,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        tasks
+            .process_handles(process)
+            .unwrap()
+            .inspect_basic(source)
+            .unwrap()
+            .rights,
+        source_rights
+    );
+
+    close_event_for_test(&mut registry, &mut tasks, process, &events, source);
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        endpoint0,
+    );
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        endpoint1,
+    );
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup
+        ),
+        DW_STATUS_SUCCESS
+    );
+}
+
+#[test]
+fn channel_queue_full_preserves_transfer_source_authority() {
+    use deepwyrm_abi::{
+        DW_HANDLE_TRANSFER_MOVE, DW_RIGHT_INSPECT, DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_WAIT,
+        DW_RIGHT_WRITE,
+    };
+
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let channels = ChannelAuthority::<2, 4>::new();
+    let waits = WaitRegistry::<8>::new();
+    let events = EventAuthority::<2>::new();
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let mut user = FakeUserMemory::new();
+    let mut cleanup = CleanupQueue::<16>::new();
+    assert_eq!(
+        channel_create(
+            &mut user,
+            &mut registry,
+            &channels,
+            &mut tasks,
+            process,
+            DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0),
+            DwUserAddress(BASE + 0x180),
+            DwUserAddress(BASE + 0x188),
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let endpoint0 = DwHandle(u64_at(&user, BASE + 0x180));
+    let endpoint1 = DwHandle(u64_at(&user, BASE + 0x188));
+    let source_rights = DwRights(DW_RIGHT_WAIT.0 | DW_RIGHT_TRANSFER.0 | DW_RIGHT_INSPECT.0);
+    let source = install_event_for_test(&mut registry, &mut tasks, process, &events, source_rights);
+    let mut staging = std::vec![0_u8; DW_CHANNEL_MAX_PAYLOAD as usize];
+    for _ in 0..4 {
+        assert_eq!(
+            channel_send(
+                &mut user,
+                &mut staging,
+                &mut registry,
+                &channels,
+                &waits,
+                &mut tasks,
+                &execution,
+                process,
+                endpoint0,
+                DwUserAddress(0),
+                0,
+                DwUserAddress(0),
+                0,
+                0,
+                &mut cleanup,
+            ),
+            DW_STATUS_SUCCESS
+        );
+    }
+    write_handle_transfer(
+        &mut user,
+        BASE + 0x300,
+        deepwyrm_abi::DwHandleTransferV1 {
+            handle: source,
+            requested_rights: DW_RIGHT_WAIT,
+            operation: DW_HANDLE_TRANSFER_MOVE,
+            reserved0: 0,
+            reserved: [0; 2],
+        },
+    );
+    assert_eq!(
+        channel_send(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            endpoint0,
+            DwUserAddress(0),
+            0,
+            DwUserAddress(BASE + 0x300),
+            1,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_WOULD_BLOCK
+    );
+    assert_eq!(
+        tasks
+            .process_handles(process)
+            .unwrap()
+            .inspect_basic(source)
+            .unwrap()
+            .rights,
+        source_rights
+    );
+
+    close_event_for_test(&mut registry, &mut tasks, process, &events, source);
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        endpoint0,
+    );
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        endpoint1,
+    );
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup
+        ),
+        DW_STATUS_SUCCESS
+    );
+}
+
+#[test]
+fn channel_peer_self_reference_is_rejected_but_sending_endpoint_move_succeeds() {
+    use deepwyrm_abi::{
+        DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_READ, DW_RIGHT_TRANSFER,
+        DW_RIGHT_WRITE,
+    };
+
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let channels = ChannelAuthority::<2, 4>::new();
+    let waits = WaitRegistry::<8>::new();
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let mut user = FakeUserMemory::new();
+    let mut cleanup = CleanupQueue::<16>::new();
+    let channel_rights = DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_TRANSFER.0);
+    assert_eq!(
+        channel_create(
+            &mut user,
+            &mut registry,
+            &channels,
+            &mut tasks,
+            process,
+            channel_rights,
+            DwUserAddress(BASE + 0x180),
+            DwUserAddress(BASE + 0x188),
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let endpoint0 = DwHandle(u64_at(&user, BASE + 0x180));
+    let endpoint1 = DwHandle(u64_at(&user, BASE + 0x188));
+    let mut staging = std::vec![0_u8; DW_CHANNEL_MAX_PAYLOAD as usize];
+
+    write_handle_transfer(
+        &mut user,
+        BASE + 0x300,
+        deepwyrm_abi::DwHandleTransferV1 {
+            handle: endpoint1,
+            requested_rights: DW_RIGHT_READ,
+            operation: DW_HANDLE_TRANSFER_MOVE,
+            reserved0: 0,
+            reserved: [0; 2],
+        },
+    );
+    assert_eq!(
+        channel_send(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            endpoint0,
+            DwUserAddress(0),
+            0,
+            DwUserAddress(BASE + 0x300),
+            1,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_INVALID_ARGUMENT
+    );
+    let peer_pin = tasks
+        .process_handles(process)
+        .unwrap()
+        .lookup(
+            &mut registry,
+            endpoint1,
+            AcceptedObjectTypes::One(DW_OBJECT_TYPE_CHANNEL),
+            DW_RIGHT_READ,
+        )
+        .unwrap();
+    assert!(
+        registry
+            .release_internal(peer_pin.into_internal())
+            .unwrap()
+            .is_none()
+    );
+
+    write_handle_transfer(
+        &mut user,
+        BASE + 0x300,
+        deepwyrm_abi::DwHandleTransferV1 {
+            handle: endpoint0,
+            requested_rights: DW_RIGHT_WRITE,
+            operation: DW_HANDLE_TRANSFER_MOVE,
+            reserved0: 0,
+            reserved: [0; 2],
+        },
+    );
+    assert_eq!(
+        channel_send(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            endpoint0,
+            DwUserAddress(0),
+            0,
+            DwUserAddress(BASE + 0x300),
+            1,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(
+        tasks
+            .process_handles(process)
+            .unwrap()
+            .inspect_basic(endpoint0),
+        Err(HandleTableError::InvalidHandle)
+    );
+    assert_eq!(
+        channel_receive(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            endpoint1,
+            DwUserAddress(0),
+            0,
+            DwUserAddress(BASE + 0x480),
+            1,
+            DwUserAddress(BASE + 0x500),
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let moved_endpoint0 = DwHandle(u64_at(&user, BASE + 0x480));
+    assert_ne!(moved_endpoint0, endpoint0);
+    assert_eq!(u64_at(&user, BASE + 0x488), DW_RIGHT_WRITE.0);
+    assert_eq!(u32_at(&user, BASE + 0x490), DW_OBJECT_TYPE_CHANNEL.0);
+
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        moved_endpoint0,
+    );
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        endpoint1,
+    );
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup
+        ),
+        DW_STATUS_SUCCESS
+    );
+}
+
+#[test]
+fn channel_receive_handle_capacity_failure_preserves_queued_datagram() {
+    use deepwyrm_abi::{
+        DW_HANDLE_TRANSFER_MOVE, DW_RIGHT_INSPECT, DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_WAIT,
+        DW_RIGHT_WRITE,
+    };
+
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let channels = ChannelAuthority::<2, 4>::new();
+    let waits = WaitRegistry::<8>::new();
+    let events = EventAuthority::<8>::new();
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let mut user = FakeUserMemory::new();
+    let mut cleanup = CleanupQueue::<16>::new();
+    assert_eq!(
+        channel_create(
+            &mut user,
+            &mut registry,
+            &channels,
+            &mut tasks,
+            process,
+            DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0),
+            DwUserAddress(BASE + 0x180),
+            DwUserAddress(BASE + 0x188),
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let endpoint0 = DwHandle(u64_at(&user, BASE + 0x180));
+    let endpoint1 = DwHandle(u64_at(&user, BASE + 0x188));
+    let source = install_event_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &events,
+        DwRights(DW_RIGHT_WAIT.0 | DW_RIGHT_TRANSFER.0 | DW_RIGHT_INSPECT.0),
+    );
+    write_handle_transfer(
+        &mut user,
+        BASE + 0x300,
+        deepwyrm_abi::DwHandleTransferV1 {
+            handle: source,
+            requested_rights: DW_RIGHT_WAIT,
+            operation: DW_HANDLE_TRANSFER_MOVE,
+            reserved0: 0,
+            reserved: [0; 2],
+        },
+    );
+    let mut staging = std::vec![0_u8; DW_CHANNEL_MAX_PAYLOAD as usize];
+    assert_eq!(
+        channel_send(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            endpoint0,
+            DwUserAddress(0),
+            0,
+            DwUserAddress(BASE + 0x300),
+            1,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+
+    let mut fillers = [DwHandle(0); 5];
+    for filler in &mut fillers {
+        *filler =
+            install_event_for_test(&mut registry, &mut tasks, process, &events, DW_RIGHT_WAIT);
+    }
+    assert_eq!(tasks.process_handle_count(process).unwrap(), 8);
+    let result_offset =
+        FakeUserMemory::offset(BASE + 0x700, DW_CHANNEL_RECEIVE_RESULT_V1_SIZE as usize);
+    user.bytes[result_offset..result_offset + DW_CHANNEL_RECEIVE_RESULT_V1_SIZE as usize]
+        .fill(0xa5);
+    assert_eq!(
+        channel_receive(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            endpoint1,
+            DwUserAddress(0),
+            0,
+            DwUserAddress(BASE + 0x600),
+            1,
+            DwUserAddress(BASE + 0x700),
+            &mut cleanup,
+        ),
+        DW_STATUS_NO_RESOURCES
+    );
+    assert!(
+        user.bytes[result_offset..result_offset + DW_CHANNEL_RECEIVE_RESULT_V1_SIZE as usize]
+            .iter()
+            .all(|byte| *byte == 0xa5)
+    );
+    assert_eq!(tasks.process_handle_count(process).unwrap(), 8);
+
+    close_event_for_test(&mut registry, &mut tasks, process, &events, fillers[0]);
+    assert_eq!(tasks.process_handle_count(process).unwrap(), 7);
+    assert_eq!(
+        channel_receive(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            endpoint1,
+            DwUserAddress(0),
+            0,
+            DwUserAddress(BASE + 0x600),
+            1,
+            DwUserAddress(BASE + 0x700),
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let received = DwHandle(u64_at(&user, BASE + 0x600));
+    assert_eq!(u32_at(&user, BASE + 0x700 + 12), 1);
+    assert_eq!(u32_at(&user, BASE + 0x700 + 20), 1);
+    assert_eq!(tasks.process_handle_count(process).unwrap(), 8);
+
+    close_event_for_test(&mut registry, &mut tasks, process, &events, received);
+    for filler in fillers.into_iter().skip(1) {
+        close_event_for_test(&mut registry, &mut tasks, process, &events, filler);
+    }
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        endpoint0,
+    );
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        endpoint1,
+    );
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup
+        ),
+        DW_STATUS_SUCCESS
+    );
 }

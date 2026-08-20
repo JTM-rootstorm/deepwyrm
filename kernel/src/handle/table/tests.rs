@@ -519,3 +519,239 @@ fn drain_releases_each_entry_once_and_returns_finalizers() {
     }
     assert_eq!(completed, 2);
 }
+
+#[test]
+fn prepared_move_validation_and_rollback_preserve_source_authority() {
+    let mut registry = ObjectRegistry::<2>::new();
+    let mut table = HandleTable::<3>::new();
+    let stale = install_object(
+        &mut registry,
+        &mut table,
+        DW_OBJECT_TYPE_EVENT,
+        dw_object_compatible_rights(DW_OBJECT_TYPE_EVENT),
+    );
+    let stale_final = table.close(&mut registry, stale).unwrap();
+    complete(&mut registry, stale_final);
+    for invalid in [stale, DwHandle(u64::MAX)] {
+        assert!(matches!(
+            table.prepare_move_batch(&[HandleMoveRequest {
+                handle: invalid,
+                requested_rights: DW_RIGHT_WAIT,
+            }]),
+            Err(HandleMovePrepareError::Table(
+                HandleTableError::InvalidHandle
+            ))
+        ));
+    }
+
+    let held = rights(&[
+        DW_RIGHT_READ,
+        DW_RIGHT_MAP,
+        DW_RIGHT_TRANSFER,
+        DW_RIGHT_INSPECT,
+    ]);
+    let source = install_object(
+        &mut registry,
+        &mut table,
+        DW_OBJECT_TYPE_MEMORY_OBJECT,
+        held,
+    );
+    let request = HandleMoveRequest {
+        handle: source,
+        requested_rights: rights(&[DW_RIGHT_READ, DW_RIGHT_MAP]),
+    };
+
+    assert!(matches!(
+        table.prepare_move_batch(&[request, request]),
+        Err(HandleMovePrepareError::DuplicateSource)
+    ));
+    assert_eq!(table.inspect_basic(source).unwrap().rights, held);
+
+    for requested_rights in [
+        DwRights(0),
+        DwRights(1_u64 << 63),
+        DW_RIGHT_WAIT,
+        DW_RIGHT_WRITE,
+    ] {
+        assert!(matches!(
+            table.prepare_move_batch(&[HandleMoveRequest {
+                handle: source,
+                requested_rights,
+            }]),
+            Err(HandleMovePrepareError::Table(_))
+        ));
+        assert_eq!(table.inspect_basic(source).unwrap().rights, held);
+    }
+
+    let prepared = table.prepare_move_batch(&[request]).unwrap();
+    assert_eq!(prepared.len(), 1);
+    let (rollback, transfers) = prepared.extract();
+    rollback.rollback(transfers);
+    assert_eq!(table.inspect_basic(source).unwrap().rights, held);
+    let final_release = table.close(&mut registry, source).unwrap();
+    complete(&mut registry, final_release);
+}
+
+#[test]
+fn move_batch_commits_existing_reference_with_reduced_rights_into_receiver() {
+    let mut registry = ObjectRegistry::<1>::new();
+    let mut sender = HandleTable::<2>::new();
+    let mut receiver = HandleTable::<2>::new();
+    let held = rights(&[
+        DW_RIGHT_READ,
+        DW_RIGHT_MAP,
+        DW_RIGHT_TRANSFER,
+        DW_RIGHT_INSPECT,
+    ]);
+    let reduced = rights(&[DW_RIGHT_READ, DW_RIGHT_MAP]);
+    let source = install_object(
+        &mut registry,
+        &mut sender,
+        DW_OBJECT_TYPE_MEMORY_OBJECT,
+        held,
+    );
+
+    let prepared = sender
+        .prepare_move_batch(&[HandleMoveRequest {
+            handle: source,
+            requested_rights: reduced,
+        }])
+        .unwrap();
+    let (rollback, transfers) = prepared.extract();
+    rollback.finish();
+    assert_eq!(
+        sender.inspect_basic(source),
+        Err(HandleTableError::InvalidHandle)
+    );
+    assert!(sender.is_empty());
+
+    let destination = receiver.reserve_transfer_batch(1).unwrap();
+    let published = destination.publish(transfers);
+    let info = published[0].unwrap();
+    assert_eq!(
+        info.handle, source,
+        "caller-local handle values may collide across independent tables"
+    );
+    assert_eq!(
+        sender.inspect_basic(source),
+        Err(HandleTableError::InvalidHandle),
+        "the colliding receiver value must not restore sender authority"
+    );
+    assert_eq!(info.rights, reduced);
+    assert_eq!(info.object_type, DW_OBJECT_TYPE_MEMORY_OBJECT);
+    let resolved = receiver
+        .lookup(
+            &mut registry,
+            info.handle,
+            AcceptedObjectTypes::One(DW_OBJECT_TYPE_MEMORY_OBJECT),
+            DW_RIGHT_READ,
+        )
+        .unwrap();
+    assert_eq!(resolved.rights(), reduced);
+    assert!(
+        registry
+            .release_internal(resolved.into_internal())
+            .unwrap()
+            .is_none()
+    );
+
+    let final_release = receiver.close(&mut registry, info.handle).unwrap();
+    assert!(final_release.is_some());
+    complete(&mut registry, final_release);
+}
+
+#[test]
+fn missing_transfer_and_destination_capacity_fail_before_move_or_publication() {
+    let mut registry = ObjectRegistry::<2>::new();
+    let mut sender = HandleTable::<2>::new();
+    let mut receiver = HandleTable::<1>::new();
+    let source = install_object(
+        &mut registry,
+        &mut sender,
+        DW_OBJECT_TYPE_MEMORY_OBJECT,
+        rights(&[DW_RIGHT_READ, DW_RIGHT_MAP, DW_RIGHT_INSPECT]),
+    );
+    assert!(matches!(
+        sender.prepare_move_batch(&[HandleMoveRequest {
+            handle: source,
+            requested_rights: DW_RIGHT_READ,
+        }]),
+        Err(HandleMovePrepareError::Table(
+            HandleTableError::AccessDenied
+        ))
+    ));
+    assert_eq!(sender.len(), 1);
+
+    let occupied = install_object(
+        &mut registry,
+        &mut receiver,
+        DW_OBJECT_TYPE_EVENT,
+        dw_object_compatible_rights(DW_OBJECT_TYPE_EVENT),
+    );
+    assert!(matches!(
+        receiver.reserve_transfer_batch(1),
+        Err(HandleTableError::Capacity)
+    ));
+    assert_eq!(receiver.len(), 1);
+
+    let first = sender.close(&mut registry, source).unwrap();
+    let second = receiver.close(&mut registry, occupied).unwrap();
+    complete(&mut registry, first);
+    complete(&mut registry, second);
+}
+
+#[test]
+fn transfer_counts_zero_through_abi_max_preserve_mixed_object_authority() {
+    let object_types = [
+        DW_OBJECT_TYPE_EVENT,
+        DW_OBJECT_TYPE_MEMORY_OBJECT,
+        DW_OBJECT_TYPE_CHANNEL,
+        DW_OBJECT_TYPE_TIMER,
+        DW_OBJECT_TYPE_TASK_GROUP,
+        DW_OBJECT_TYPE_PROCESS,
+        DW_OBJECT_TYPE_THREAD,
+        DW_OBJECT_TYPE_ADDRESS_REGION,
+    ];
+
+    for count in 0..=HANDLE_TRANSFER_LIMIT {
+        let mut registry = ObjectRegistry::<32>::new();
+        let mut sender = HandleTable::<32>::new();
+        let mut receiver = HandleTable::<32>::new();
+        let mut requests = [HandleMoveRequest {
+            handle: DW_HANDLE_INVALID,
+            requested_rights: DW_RIGHT_INSPECT,
+        }; HANDLE_TRANSFER_LIMIT];
+
+        for index in 0..count {
+            let object_type = object_types[index % object_types.len()];
+            let compatible = dw_object_compatible_rights(object_type);
+            assert_ne!(compatible.0 & DW_RIGHT_TRANSFER.0, 0);
+            assert_ne!(compatible.0 & DW_RIGHT_INSPECT.0, 0);
+            let handle = install_object(&mut registry, &mut sender, object_type, compatible);
+            requests[index] = HandleMoveRequest {
+                handle,
+                requested_rights: DW_RIGHT_INSPECT,
+            };
+        }
+
+        let prepared = sender.prepare_move_batch(&requests[..count]).unwrap();
+        assert_eq!(prepared.len(), count);
+        let (rollback, transfers) = prepared.extract();
+        rollback.finish();
+        assert_eq!(sender.len(), 0);
+
+        let destination = receiver.reserve_transfer_batch(count).unwrap();
+        let published = destination.publish(transfers);
+        assert_eq!(receiver.len(), count);
+        for (index, info) in published[..count].iter().flatten().copied().enumerate() {
+            assert_eq!(info.rights, DW_RIGHT_INSPECT);
+            assert_eq!(info.object_type, object_types[index % object_types.len()]);
+        }
+
+        let drained = receiver.drain(&mut registry);
+        assert_eq!(drained.final_release_count(), count);
+        for final_release in drained.into_final_releases().into_iter().flatten() {
+            registry.complete_finalization(final_release).unwrap();
+        }
+    }
+}

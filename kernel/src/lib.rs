@@ -16,6 +16,11 @@ pub mod debug;
 )]
 pub(crate) mod handle;
 pub mod interrupt;
+#[allow(
+    dead_code,
+    reason = "DW0-F5 Channel foundations precede F6 transfer and F7 live wait consumers"
+)]
+pub(crate) mod ipc;
 pub mod memory;
 #[allow(
     dead_code,
@@ -48,6 +53,11 @@ pub(crate) mod task;
     reason = "DW0-F3 time/deadline services precede F4 wait and F8 Timer consumers"
 )]
 pub(crate) mod time;
+#[allow(
+    dead_code,
+    reason = "DW0-F4 wait/Event foundations precede F7 generic wait syscall activation"
+)]
+pub(crate) mod wait;
 
 #[cfg(feature = "test-support")]
 pub mod test_support;

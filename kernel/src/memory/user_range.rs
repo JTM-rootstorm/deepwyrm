@@ -258,6 +258,19 @@ impl UserRange {
         self.start + self.byte_len
     }
 
+    pub(crate) fn prefix(self, byte_len: usize) -> Option<Self> {
+        let byte_len = u64::try_from(byte_len).ok()?;
+        if byte_len > self.byte_len {
+            return None;
+        }
+        Some(Self {
+            address_space: self.address_space,
+            start: self.start,
+            byte_len,
+            access: self.access,
+        })
+    }
+
     pub(crate) const fn page_chunks(self) -> UserPageChunks {
         UserPageChunks {
             range: self,

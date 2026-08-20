@@ -27,6 +27,31 @@ pub(crate) trait UserPageAccess {
     fn pin(&mut self, range: UserRange) -> Result<Self::Pinned<'_>, Self::Error>;
 }
 
+/// Acquires up to three disjoint mapping-stable user ranges in one transaction.
+///
+/// Channel receive needs byte, handle-info, and result outputs to remain pinned
+/// across one queue commit. This separate trait keeps ordinary single-range
+/// callers simple while giving authority-sensitive adapters an all-ranges-first
+/// preflight primitive.
+pub(crate) trait UserPageBatchAccess: UserPageAccess {
+    type PinnedBatch<'a>: PinnedUserBatchPages<Error = Self::Error>
+    where
+        Self: 'a;
+
+    fn pin_batch(
+        &mut self,
+        ranges: [Option<UserRange>; 3],
+    ) -> Result<Self::PinnedBatch<'_>, Self::Error>;
+}
+
+pub(crate) trait PinnedUserBatchPages {
+    type Error;
+
+    fn preflight(&mut self, index: usize, chunk: UserPageChunk) -> Result<(), Self::Error>;
+
+    fn write_exact(&mut self, index: usize, range: UserRange, source: &[u8]);
+}
+
 #[cfg(any(test, deepwyrm_integrated))]
 mod pin_tracker {
     use super::UserRange;
@@ -232,6 +257,55 @@ impl<P: PinnedUserPages> PinnedUserOutput<P> {
     }
 }
 
+#[must_use = "preflighted output batch must be committed or deliberately discarded before its mapping pins are released"]
+pub(crate) struct PinnedUserOutputs<P: PinnedUserBatchPages> {
+    pinned: P,
+    ranges: [Option<UserRange>; 3],
+    byte_lens: [usize; 3],
+}
+
+impl<P: PinnedUserBatchPages> PinnedUserOutputs<P> {
+    pub(crate) fn commit(mut self, sources: [Option<&[u8]>; 3]) {
+        for (index, source) in sources.into_iter().enumerate() {
+            match (self.ranges[index], source) {
+                (None, None) => {}
+                (Some(range), Some(source)) => {
+                    assert_eq!(
+                        source.len(),
+                        self.byte_lens[index],
+                        "preflighted output-batch length drift"
+                    );
+                    if !range.is_empty() {
+                        self.pinned.write_exact(index, range, source);
+                    }
+                }
+                _ => panic!("preflighted output-batch shape drift"),
+            }
+        }
+    }
+
+    pub(crate) fn commit_prefixes(mut self, sources: [Option<&[u8]>; 3]) {
+        for (index, source) in sources.into_iter().enumerate() {
+            match (self.ranges[index], source) {
+                (None, None) => {}
+                (Some(range), Some(source)) => {
+                    assert!(
+                        source.len() <= self.byte_lens[index],
+                        "preflighted output-batch prefix exceeds pinned capacity"
+                    );
+                    if !source.is_empty() {
+                        let prefix = range
+                            .prefix(source.len())
+                            .expect("preflighted output-batch prefix remains in range");
+                        self.pinned.write_exact(index, prefix, source);
+                    }
+                }
+                _ => panic!("preflighted output-batch shape drift"),
+            }
+        }
+    }
+}
+
 /// Pins and preflights one complete userspace output before kernel business
 /// mutation. Once this returns, [`PinnedUserOutput::commit`] has no recoverable
 /// BAD_ADDRESS path.
@@ -255,6 +329,72 @@ pub(crate) fn preflight_user_output<'a, A: UserPageAccess>(
         range,
         byte_len,
     })
+}
+
+/// Pins every present output range before any output is committed. Empty ranges
+/// are retained for pointer-policy validation but require no physical pin.
+pub(crate) fn preflight_user_outputs<'a, A: UserPageBatchAccess>(
+    access: &'a mut A,
+    outputs: [Option<(UserRange, usize)>; 3],
+) -> Result<PinnedUserOutputs<A::PinnedBatch<'a>>, UserCopyError<A::Error>> {
+    let mut ranges = [None; 3];
+    let mut byte_lens = [0_usize; 3];
+    for (index, output) in outputs.into_iter().enumerate() {
+        let Some((range, byte_len)) = output else {
+            continue;
+        };
+        if !range.access().includes(UserAccess::WRITE) {
+            return Err(UserCopyError::AccessIntent);
+        }
+        let range_len =
+            usize::try_from(range.byte_len()).map_err(|_| UserCopyError::LengthDoesNotFitHost)?;
+        if range_len != byte_len {
+            return Err(UserCopyError::LengthMismatch);
+        }
+        ranges[index] = Some(range);
+        byte_lens[index] = byte_len;
+    }
+    let mut pinned = access.pin_batch(ranges).map_err(UserCopyError::Access)?;
+    for (index, range) in ranges.into_iter().enumerate() {
+        let Some(range) = range else {
+            continue;
+        };
+        for chunk in range.page_chunks() {
+            pinned
+                .preflight(index, chunk)
+                .map_err(UserCopyError::Access)?;
+        }
+    }
+    Ok(PinnedUserOutputs {
+        pinned,
+        ranges,
+        byte_lens,
+    })
+}
+
+/// Takes a fully preflighted user snapshot directly into caller-owned staging.
+/// Staging contents are unspecified on failure, so no second kernel scratch
+/// buffer is needed before the caller decides whether to commit business state.
+pub(crate) fn snapshot_from_user<A: UserPageAccess>(
+    access: &mut A,
+    range: UserRange,
+    staging: &mut [u8],
+) -> Result<(), UserCopyError<A::Error>> {
+    if !range.access().includes(UserAccess::READ) {
+        return Err(UserCopyError::AccessIntent);
+    }
+    let byte_len =
+        usize::try_from(range.byte_len()).map_err(|_| UserCopyError::LengthDoesNotFitHost)?;
+    if staging.len() != byte_len {
+        return Err(UserCopyError::LengthMismatch);
+    }
+    if range.is_empty() {
+        return Ok(());
+    }
+    let mut pinned = access.pin(range).map_err(UserCopyError::Access)?;
+    preflight_all(&mut pinned, range)?;
+    pinned.read_exact(range, staging);
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
