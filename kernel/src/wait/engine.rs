@@ -5,7 +5,7 @@ use deepwyrm_abi::{
 
 use crate::handle::{AcceptedObjectTypes, HandleTableError, ResolvedHandle};
 use crate::ipc::{ChannelAuthority, ChannelError, ChannelWaitOutcome};
-use crate::object::ObjectRegistry;
+use crate::object::{FinalRelease, ObjectRegistry};
 use crate::task::{
     BlockWakeKey, BlockedOperation, BlockedOperationError, BlockedOperationWinner, ExecutionDomain,
     ProcessKey, ScheduleDecision, SchedulerError, TaskAuthority, TaskError, ThreadKey,
@@ -19,6 +19,42 @@ use super::{
 };
 
 pub(crate) const WAIT_SET_LIMIT: usize = DW_WAIT_MANY_MAX_ITEMS as usize;
+
+#[must_use = "wait cleanup final releases must be routed through typed payload finalization"]
+pub(crate) struct WaitFinalReleases<const CAPACITY: usize> {
+    releases: [Option<FinalRelease>; CAPACITY],
+    len: usize,
+}
+
+impl<const CAPACITY: usize> WaitFinalReleases<CAPACITY> {
+    fn empty() -> Self {
+        Self {
+            releases: core::array::from_fn(|_| None),
+            len: 0,
+        }
+    }
+
+    fn push_optional(&mut self, release: Option<FinalRelease>) {
+        let Some(release) = release else {
+            return;
+        };
+        assert!(self.len < CAPACITY, "wait final-release batch overflow");
+        self.releases[self.len] = Some(release);
+        self.len += 1;
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub(crate) fn into_releases(self) -> [Option<FinalRelease>; CAPACITY] {
+        self.releases
+    }
+
+    fn expect_empty(self, context: &str) {
+        assert!(self.is_empty(), "{context}");
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WaitDeadline {
@@ -257,7 +293,10 @@ impl ResolvedWaitSet {
             let retained = match item.target.retain(registry) {
                 Ok(retained) => retained,
                 Err(error) => {
-                    release_cancelled_generation(registry, sources.waits.cancel_generation(wake));
+                    release_cancelled_generation(registry, sources.waits.cancel_generation(wake))
+                        .expect_empty(
+                            "pre-publication wait registration unexpectedly became final",
+                        );
                     return Err(WaitSetError::Handle(error));
                 }
             };
@@ -272,7 +311,10 @@ impl ResolvedWaitSet {
                 Ok(RegisterOutcome::Registered) => {}
                 Ok(RegisterOutcome::Ready(pin)) => {
                     release_internal_exact(registry, pin);
-                    release_cancelled_generation(registry, sources.waits.cancel_generation(wake));
+                    release_cancelled_generation(registry, sources.waits.cancel_generation(wake))
+                        .expect_empty(
+                            "pre-publication wait registration unexpectedly became final",
+                        );
                     return self
                         .select_ready(sources)?
                         .ok_or(WaitSetError::StateDrift)
@@ -280,7 +322,10 @@ impl ResolvedWaitSet {
                 }
                 Err((error, pin)) => {
                     release_internal_exact(registry, pin);
-                    release_cancelled_generation(registry, sources.waits.cancel_generation(wake));
+                    release_cancelled_generation(registry, sources.waits.cancel_generation(wake))
+                        .expect_empty(
+                            "pre-publication wait registration unexpectedly became final",
+                        );
                     return Err(error);
                 }
             }
@@ -288,12 +333,14 @@ impl ResolvedWaitSet {
 
         match self.select_ready(sources) {
             Ok(Some(selection)) => {
-                release_cancelled_generation(registry, sources.waits.cancel_generation(wake));
+                release_cancelled_generation(registry, sources.waits.cancel_generation(wake))
+                    .expect_empty("pre-publication wait registration unexpectedly became final");
                 Ok(Some(selection))
             }
             Ok(None) => Ok(None),
             Err(error) => {
-                release_cancelled_generation(registry, sources.waits.cancel_generation(wake));
+                release_cancelled_generation(registry, sources.waits.cancel_generation(wake))
+                    .expect_empty("pre-publication wait registration unexpectedly became final");
                 Err(error)
             }
         }
@@ -414,12 +461,19 @@ fn release_internal_exact<const OBJECTS: usize>(
 fn release_cancelled_generation<const OBJECTS: usize, const WAITERS: usize>(
     registry: &mut ObjectRegistry<OBJECTS>,
     batch: WakeBatch<WAITERS>,
-) {
+) -> WaitFinalReleases<WAITERS> {
     let (wakes, pins) = batch.into_parts();
     assert!(wakes.into_iter().flatten().next().is_none());
+    let mut releases = WaitFinalReleases::empty();
     for pin in pins.into_iter().flatten() {
-        release_internal_exact(registry, pin);
+        releases.push_optional(registry.release_internal(pin).unwrap_or_else(|failure| {
+            panic!(
+                "wait registration pin release drifted: {:?}",
+                failure.error()
+            )
+        }));
     }
+    releases
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -715,7 +769,10 @@ pub(crate) fn begin_registered_wait<
             // window: observe it before committing Blocked.
             match execution.blocked_operations().winner(wake) {
                 Ok(Some(BlockedOperationWinner::Timeout)) => {
-                    release_cancelled_generation(registry, sources.waits.cancel_generation(wake));
+                    release_cancelled_generation(registry, sources.waits.cancel_generation(wake))
+                        .expect_empty(
+                            "pre-publication wait registration unexpectedly became final",
+                        );
                     let operation = operations
                         .take_wake(wake)
                         .expect("pre-block timeout retains its wait operation");
@@ -743,7 +800,10 @@ pub(crate) fn begin_registered_wait<
                     item_index,
                     observed,
                 })) => {
-                    release_cancelled_generation(registry, sources.waits.cancel_generation(wake));
+                    release_cancelled_generation(registry, sources.waits.cancel_generation(wake))
+                        .expect_empty(
+                            "pre-publication wait registration unexpectedly became final",
+                        );
                     let operation = operations
                         .take_wake(wake)
                         .expect("pre-block signal retains its wait operation");
@@ -850,7 +910,7 @@ pub(crate) fn finish_wait_operation<
     operations: &mut WaitOperationRegistry<OUTPUT, EXECUTION>,
     mut deadline_authority: Option<&mut dyn WaitDeadlineAuthority>,
     wake: BlockWakeKey,
-) -> Result<(OUTPUT, BlockedOperationWinner), WaitFinishError> {
+) -> Result<(OUTPUT, BlockedOperationWinner, WaitFinalReleases<WAITERS>), WaitFinishError> {
     let operation = operations
         .take_wake(wake)
         .map_err(WaitFinishError::Operation)?;
@@ -858,12 +918,12 @@ pub(crate) fn finish_wait_operation<
         .winner(execution.blocked_operations())
         .map_err(WaitFinishError::Blocked)?
         .ok_or(WaitFinishError::MissingWinner)?;
-    release_cancelled_generation(registry, waits.cancel_generation(wake));
+    let releases = release_cancelled_generation(registry, waits.cancel_generation(wake));
     let (output, deadline) = operation
         .complete(execution.blocked_operations(), winner)
         .map_err(WaitFinishError::Blocked)?;
     cancel_deadline_exact(&mut deadline_authority, deadline).map_err(WaitFinishError::Deadline)?;
-    Ok((output, winner))
+    Ok((output, winner, releases))
 }
 
 pub(crate) fn claim_timeout_and_wake<const EXECUTION: usize>(
@@ -894,17 +954,17 @@ pub(crate) fn finish_terminal_wait<
     operations: &mut WaitOperationRegistry<OUTPUT, EXECUTION>,
     mut deadline_authority: Option<&mut dyn WaitDeadlineAuthority>,
     thread: ThreadKey,
-) -> Result<Option<OUTPUT>, WaitFinishError> {
+) -> Result<Option<(OUTPUT, WaitFinalReleases<WAITERS>)>, WaitFinishError> {
     let Some(operation) = operations.take_thread(thread) else {
         return Ok(None);
     };
     let wake = operation.wake_key();
-    release_cancelled_generation(registry, waits.cancel_generation(wake));
+    let releases = release_cancelled_generation(registry, waits.cancel_generation(wake));
     let (output, deadline) = operation
         .complete_terminal(execution.blocked_operations())
         .map_err(WaitFinishError::Blocked)?;
     cancel_deadline_exact(&mut deadline_authority, deadline).map_err(WaitFinishError::Deadline)?;
-    Ok(Some(output))
+    Ok(Some((output, releases)))
 }
 
 #[cfg(test)]
@@ -1424,7 +1484,7 @@ mod tests {
             execution.scheduler_state(thread),
             Some(SchedulerThreadState::Runnable)
         );
-        let (output, winner) = finish_wait_operation(
+        let (output, winner, releases) = finish_wait_operation(
             &mut registry,
             &waits,
             &execution,
@@ -1435,10 +1495,89 @@ mod tests {
         .unwrap();
         assert_eq!(output, 0xa1);
         assert_eq!(winner, BlockedOperationWinner::Timeout);
+        assert!(releases.is_empty());
         assert_eq!(waits.len(), 0);
         assert_eq!(operations.len(), 0);
         assert_eq!(execution.schedule_next().unwrap().current, Some(thread));
         close_event(&mut registry, &mut tasks, &events, process, event);
+    }
+
+    #[test]
+    fn closing_final_handle_while_waiting_defers_typed_finalization_until_timeout_cleanup() {
+        let (mut registry, mut tasks, execution, process, thread) = running_fixture();
+        let events = Events::new();
+        let channels = Channels::new();
+        let waits = Waits::new();
+        let (_event_key, event) = install_event(&mut registry, &mut tasks, &events, process);
+        let request = [DwWaitItemV1 {
+            handle: event,
+            signals: DW_SIGNAL_SIGNALED,
+        }];
+        let set = ResolvedWaitSet::resolve(&tasks, &mut registry, process, &request).unwrap();
+        let mut operations = WaitOperationRegistry::<u32, 1>::new();
+        let mut deadlines = HostDeadline::<2>::new();
+        let wake = match begin_registered_wait(
+            set,
+            0xc1,
+            WaitDeadline::Finite(90),
+            WaitBeginContext {
+                registry: &mut registry,
+                sources: WaitSources {
+                    tasks: &tasks,
+                    events: &events,
+                    channels: &channels,
+                    waits: &waits,
+                },
+                execution: &execution,
+                operations: &mut operations,
+                process,
+                thread,
+            },
+            Some(&mut deadlines),
+        )
+        .unwrap_or_else(|failure| panic!("finite wait begin failed: {:?}", failure.error))
+        {
+            WaitBeginOutcome::Suspended { wake, .. } => wake,
+            _ => panic!("unsignaled finite Event wait must suspend"),
+        };
+
+        // The wait registration is now the only authority keeping the Event
+        // payload alive after the caller closes its final handle.
+        assert!(
+            tasks
+                .process_handles_mut(process)
+                .unwrap()
+                .close(&mut registry, event)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut expired = [None; 2];
+        assert_eq!(deadlines.queue.expire(90, &mut expired), 1);
+        assert_eq!(expired[0], Some(wake));
+        assert!(claim_timeout_and_wake(&execution, wake).unwrap());
+        let (output, winner, releases) = finish_wait_operation(
+            &mut registry,
+            &waits,
+            &execution,
+            &mut operations,
+            Some(&mut deadlines),
+            wake,
+        )
+        .unwrap();
+        assert_eq!(output, 0xc1);
+        assert_eq!(winner, BlockedOperationWinner::Timeout);
+        let mut releases = releases.into_releases().into_iter().flatten();
+        let final_release = releases.next().expect("wait pin becomes final Event owner");
+        assert!(releases.next().is_none());
+        let finalization = events.take_finalization(final_release).unwrap();
+        super::super::complete_event_finalization(&mut registry, finalization);
+
+        // Typed cleanup completed exactly once, so the bounded Event payload
+        // slot is immediately reusable after the waited handle was closed.
+        let (_replacement_key, replacement) =
+            install_event(&mut registry, &mut tasks, &events, process);
+        close_event(&mut registry, &mut tasks, &events, process, replacement);
     }
 
     #[test]

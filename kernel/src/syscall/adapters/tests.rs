@@ -3131,7 +3131,7 @@ fn wait_one_suspend_transfers_output_owner_until_signal_resume() {
         .unwrap();
     let mut cleanup = CleanupQueue::<16>::new();
     complete_wait_wakes(&mut registry, &execution, wakes, &mut cleanup);
-    let (output, winner) = crate::wait::engine::finish_wait_operation(
+    let (output, winner, releases) = crate::wait::engine::finish_wait_operation(
         &mut registry,
         &waits,
         &execution,
@@ -3148,6 +3148,7 @@ fn wait_one_suspend_transfers_output_owner_until_signal_resume() {
             observed: DW_SIGNAL_SIGNALED,
         }
     );
+    assert!(releases.is_empty());
     assert_eq!(execution.schedule_next().unwrap().current, Some(thread));
     close_event_for_test(&mut registry, &mut tasks, process, &events, event);
     assert_eq!(
