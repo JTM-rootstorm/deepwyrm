@@ -4,7 +4,7 @@ use super::*;
 use crate::memory::user_range::UserPageChunk;
 use crate::memory::usercopy::{PinnedUserBatchPages, PinnedUserPages, UserPageBatchAccess};
 use crate::object::ObjectRegistry;
-use crate::task::TaskAuthority;
+use crate::task::{BlockedOperation, BlockedOperationWinner, TaskAuthority};
 use deepwyrm_abi::{DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_MODIFY};
 
 const BASE: u64 = 0x4000;
@@ -1353,10 +1353,14 @@ fn invalid_task_creation_rights_do_not_burn_object_generations() {
 
 #[test]
 fn self_thread_termination_with_live_sibling_never_returns_to_reclaimed_context() {
-    use deepwyrm_abi::{DW_OBJECT_TYPE_PROCESS, DW_RIGHT_MODIFY, DW_TERMINATION_AUTHORIZED};
+    use deepwyrm_abi::{
+        DW_OBJECT_TYPE_PROCESS, DW_OBJECT_TYPE_THREAD, DW_RIGHT_MODIFY, DW_RIGHT_WAIT,
+        DW_SIGNAL_EXITED, DW_TERMINATION_AUTHORIZED,
+    };
 
     let (mut registry, mut tasks, process, process_handle) = process_fixture();
     let execution = ExecutionDomain::<2>::new(test_stack_bounds::<2>()).unwrap();
+    let waits = WaitRegistry::<8>::new();
     let mut cleanup = CleanupQueue::<16>::new();
     let process_pin = resolve_current_handle(
         &tasks,
@@ -1373,7 +1377,7 @@ fn self_thread_termination_with_live_sibling_never_returns_to_reclaimed_context(
     let current_handle = tasks
         .process_handles_mut(process)
         .unwrap()
-        .install(current_ref, DW_RIGHT_MODIFY)
+        .install(current_ref, DwRights(DW_RIGHT_MODIFY.0 | DW_RIGHT_WAIT.0))
         .unwrap();
     let sibling_handle = tasks
         .process_handles_mut(process)
@@ -1389,11 +1393,38 @@ fn self_thread_termination_with_live_sibling_never_returns_to_reclaimed_context(
         .unwrap();
     assert_eq!(execution.schedule_next().unwrap().current, Some(current));
 
+    // Let the sibling block on the current Thread's EXITED level signal, then
+    // return execution to current so its terminal transition must wake sibling.
+    assert_eq!(
+        execution.yield_current(current).unwrap().current,
+        Some(sibling)
+    );
+    let target = tasks
+        .process_handles(process)
+        .unwrap()
+        .lookup(
+            &mut registry,
+            current_handle,
+            AcceptedObjectTypes::One(DW_OBJECT_TYPE_THREAD),
+            DW_RIGHT_WAIT,
+        )
+        .unwrap();
+    let (blocked, decision) = execution.block_current(sibling).unwrap();
+    assert_eq!(decision.current, Some(current));
+    let wake = blocked.into_wake_key();
+    let blocked_owner =
+        BlockedOperation::publish(execution.blocked_operations(), process, sibling, wake, ())
+            .unwrap();
+    let _registration = waits
+        .register(target.into_internal(), DW_SIGNAL_EXITED, 0, sibling, wake)
+        .unwrap();
+
     assert_eq!(
         thread_terminate(
             &mut registry,
             &mut tasks,
             &execution,
+            &waits,
             process,
             current,
             current_handle,
@@ -1406,8 +1437,25 @@ fn self_thread_termination_with_live_sibling_never_returns_to_reclaimed_context(
     assert_eq!(execution.scheduler_state(current), None);
     assert_eq!(
         execution.scheduler_state(sibling),
-        Some(SchedulerThreadState::Running)
+        Some(SchedulerThreadState::Runnable)
     );
+    let winner = execution
+        .blocked_operations()
+        .winner(wake)
+        .unwrap()
+        .expect("EXITED transition claimed sibling wait");
+    assert_eq!(
+        winner,
+        BlockedOperationWinner::Signal {
+            item_index: 0,
+            observed: DW_SIGNAL_EXITED,
+        }
+    );
+    blocked_owner
+        .complete_with(execution.blocked_operations(), winner, |()| ())
+        .unwrap();
+    assert_eq!(waits.len(), 0);
+    assert_eq!(execution.schedule_next().unwrap().current, Some(sibling));
     assert_ne!(
         tasks.process_info(process).unwrap().state,
         deepwyrm_abi::DW_TASK_STATE_EXITED
@@ -1418,6 +1466,7 @@ fn self_thread_termination_with_live_sibling_never_returns_to_reclaimed_context(
             &mut registry,
             &mut tasks,
             &execution,
+            &waits,
             process,
             sibling,
             sibling_handle,
@@ -1685,6 +1734,7 @@ fn termination_rejects_reason_type_and_rights_before_target_mutation() {
 
     let (mut registry, mut tasks, process, process_handle) = process_fixture();
     let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let waits = WaitRegistry::<8>::new();
     let mut cleanup = CleanupQueue::<16>::new();
     let process_pin = resolve_current_handle(
         &tasks,
@@ -1727,6 +1777,7 @@ fn termination_rejects_reason_type_and_rights_before_target_mutation() {
             &mut registry,
             &mut tasks,
             &execution,
+            &waits,
             process,
             current,
             target_full,
@@ -1745,6 +1796,7 @@ fn termination_rejects_reason_type_and_rights_before_target_mutation() {
             &mut registry,
             &mut tasks,
             &execution,
+            &waits,
             process,
             current,
             process_handle,
@@ -1759,6 +1811,7 @@ fn termination_rejects_reason_type_and_rights_before_target_mutation() {
             &mut registry,
             &mut tasks,
             &execution,
+            &waits,
             process,
             current,
             target_inspect,
@@ -1777,6 +1830,7 @@ fn termination_rejects_reason_type_and_rights_before_target_mutation() {
             &mut registry,
             &mut tasks,
             &execution,
+            &waits,
             process,
             current,
             target_full,
@@ -1806,6 +1860,7 @@ fn termination_rejects_reason_type_and_rights_before_target_mutation() {
             &mut registry,
             &mut tasks,
             &execution,
+            &waits,
             process,
             current,
             0x55,

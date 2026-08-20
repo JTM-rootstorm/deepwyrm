@@ -10,6 +10,7 @@ use crate::syscall::native::{
     SyscallControl,
 };
 use crate::task::{ExecutionDomain, ProcessKey, SchedulerThreadState, TaskAuthority, ThreadKey};
+use crate::wait::WaitRegistry;
 use deepwyrm_abi::{
     DW_OBJECT_TYPE_MEMORY_OBJECT, DW_STATUS_NOT_SUPPORTED, DW_STATUS_SUCCESS, DW_TASK_STATE_EXITED,
     DW_TERMINATION_NORMAL_EXIT,
@@ -32,6 +33,7 @@ struct E7SmokeRuntime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: 
     memory: E7Memory,
     tasks: E7Tasks,
     execution: ExecutionDomain<1>,
+    waits: WaitRegistry<4>,
     _spaces: E7Spaces,
     _region: E7Region,
     root_owner: Option<InternalRef>,
@@ -413,6 +415,7 @@ fn build_smoke_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY:
         memory,
         tasks,
         execution,
+        waits: WaitRegistry::new(),
         _spaces: spaces,
         _region: region,
         root_owner: Some(root_owner),
@@ -467,6 +470,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     &mut self.registry,
                     &mut self.tasks,
                     &self.execution,
+                    &self.waits,
                     self.process,
                     self.thread,
                     exit_code,

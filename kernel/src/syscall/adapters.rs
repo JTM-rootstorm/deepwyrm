@@ -589,16 +589,29 @@ fn install_created_handle<const HANDLES: usize, const OBJECTS: usize>(
     }
 }
 
-fn collect_retired_pins<const OBJECTS: usize, const THREADS: usize>(
+fn collect_retired_pins<
+    const OBJECTS: usize,
+    const THREADS: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
     registry: &mut ObjectRegistry<OBJECTS>,
+    execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
     pins: RetiredExitPins<THREADS>,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) {
     let (process, threads) = pins.into_parts();
     for pin in threads.into_iter().flatten().chain(process) {
+        complete_wait_wakes(
+            registry,
+            execution,
+            waits.take_ready(pin.id(), deepwyrm_abi::DW_SIGNAL_EXITED),
+            cleanup,
+        );
         cleanup.push_optional(registry.release_internal(pin).unwrap_or_else(|failure| {
             panic!(
-                "E5 terminal execution pin release drifted: {:?}",
+                "F7 terminal execution pin release drifted: {:?}",
                 failure.error()
             )
         }));
@@ -609,17 +622,25 @@ fn collect_process_effects<
     const OBJECTS: usize,
     const HANDLES: usize,
     const THREADS: usize,
+    const WAITERS: usize,
     const EXECUTION: usize,
 >(
     registry: &mut ObjectRegistry<OBJECTS>,
     execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
     effects: ProcessExitEffects<HANDLES, THREADS>,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) {
     for release in effects.drained.into_final_releases().into_iter().flatten() {
         cleanup.push(release);
     }
-    collect_retired_pins(registry, execution.retire_exit_pins(effects.pins), cleanup);
+    collect_retired_pins(
+        registry,
+        execution,
+        waits,
+        execution.retire_exit_pins(effects.pins),
+        cleanup,
+    );
 }
 
 pub(crate) fn task_group_create<
@@ -1375,15 +1396,17 @@ fn collect_group_effects<
     const PROCESSES: usize,
     const HANDLES: usize,
     const THREADS: usize,
+    const WAITERS: usize,
     const EXECUTION: usize,
 >(
     registry: &mut ObjectRegistry<OBJECTS>,
     execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
     effects: TaskGroupTerminationEffects<PROCESSES, HANDLES, THREADS>,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) {
     for process in effects.into_processes().into_iter().flatten() {
-        collect_process_effects(registry, execution, process, cleanup);
+        collect_process_effects(registry, execution, waits, process, cleanup);
     }
 }
 
@@ -1417,11 +1440,13 @@ pub(crate) fn task_group_terminate<
     const PROCESSES: usize,
     const THREADS: usize,
     const HANDLES: usize,
+    const WAITERS: usize,
     const EXECUTION: usize,
 >(
     registry: &mut ObjectRegistry<OBJECTS>,
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
     current_process: ProcessKey,
     current_thread: ThreadKey,
     task_group: DwHandle,
@@ -1454,7 +1479,7 @@ pub(crate) fn task_group_terminate<
             return (task_status(error), SyscallControl::ReturnToCaller);
         }
     };
-    collect_group_effects(registry, execution, effects, cleanup);
+    collect_group_effects(registry, execution, waits, effects, cleanup);
     release_lookup_pin(registry, pin, cleanup);
     (
         DW_STATUS_SUCCESS,
@@ -1468,11 +1493,13 @@ pub(crate) fn process_exit<
     const PROCESSES: usize,
     const THREADS: usize,
     const HANDLES: usize,
+    const WAITERS: usize,
     const EXECUTION: usize,
 >(
     registry: &mut ObjectRegistry<OBJECTS>,
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
     current_process: ProcessKey,
     current_thread: ThreadKey,
     code: u32,
@@ -1486,7 +1513,7 @@ pub(crate) fn process_exit<
         Ok(effects) => effects,
         Err(error) => return (task_status(error), SyscallControl::ReturnToCaller),
     };
-    collect_process_effects(registry, execution, effects, cleanup);
+    collect_process_effects(registry, execution, waits, effects, cleanup);
     (DW_STATUS_SUCCESS, SyscallControl::TerminateCurrent)
 }
 
@@ -1496,11 +1523,13 @@ pub(crate) fn process_terminate<
     const PROCESSES: usize,
     const THREADS: usize,
     const HANDLES: usize,
+    const WAITERS: usize,
     const EXECUTION: usize,
 >(
     registry: &mut ObjectRegistry<OBJECTS>,
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
     current_process: ProcessKey,
     current_thread: ThreadKey,
     process: DwHandle,
@@ -1534,7 +1563,7 @@ pub(crate) fn process_terminate<
             return (task_status(error), SyscallControl::ReturnToCaller);
         }
     };
-    collect_process_effects(registry, execution, effects, cleanup);
+    collect_process_effects(registry, execution, waits, effects, cleanup);
     release_lookup_pin(registry, pin, cleanup);
     (
         DW_STATUS_SUCCESS,
@@ -1548,11 +1577,13 @@ pub(crate) fn thread_exit<
     const PROCESSES: usize,
     const THREADS: usize,
     const HANDLES: usize,
+    const WAITERS: usize,
     const EXECUTION: usize,
 >(
     registry: &mut ObjectRegistry<OBJECTS>,
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
     current_process: ProcessKey,
     current_thread: ThreadKey,
     code: u32,
@@ -1580,7 +1611,13 @@ pub(crate) fn thread_exit<
             cleanup.push(release);
         }
     }
-    collect_retired_pins(registry, execution.retire_exit_pins(pins), cleanup);
+    collect_retired_pins(
+        registry,
+        execution,
+        waits,
+        execution.retire_exit_pins(pins),
+        cleanup,
+    );
     (DW_STATUS_SUCCESS, SyscallControl::TerminateCurrent)
 }
 
@@ -1590,11 +1627,13 @@ pub(crate) fn thread_terminate<
     const PROCESSES: usize,
     const THREADS: usize,
     const HANDLES: usize,
+    const WAITERS: usize,
     const EXECUTION: usize,
 >(
     registry: &mut ObjectRegistry<OBJECTS>,
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
     current_process: ProcessKey,
     current_thread: ThreadKey,
     thread: DwHandle,
@@ -1650,7 +1689,13 @@ pub(crate) fn thread_terminate<
             cleanup.push(release);
         }
     }
-    collect_retired_pins(registry, execution.retire_exit_pins(pins), cleanup);
+    collect_retired_pins(
+        registry,
+        execution,
+        waits,
+        execution.retire_exit_pins(pins),
+        cleanup,
+    );
     release_lookup_pin(registry, pin, cleanup);
     let control = if target == current_thread {
         SyscallControl::TerminateCurrent
