@@ -4,7 +4,7 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use crate::arch::x86_64::apic::{ApicMode, LocalApic};
+use crate::arch::x86_64::apic::{ApicMode, LocalApic, LocalApicDiscovery};
 use crate::arch::x86_64::apic_live::{
     LiveApicBaseMsr, LiveXApicMmio, discover_local_apic, lapic_pat_entry_is_uncacheable,
 };
@@ -15,7 +15,7 @@ use crate::task::BlockWakeKey;
 
 use super::{
     DEADLINE_QUEUE_CAPACITY, DeadlineQueue, DeadlineRegistration, MonotonicSample,
-    PmTimerDescriptor, PmTimerState, PmTimerWidth, apic_one_shot_for_delta,
+    PmTimerDescriptor, PmTimerState, PmTimerWidth, TimeInitState, apic_one_shot_for_delta,
 };
 
 const UNINITIALIZED: u8 = 0;
@@ -35,6 +35,7 @@ pub(crate) enum LiveTimeError {
     Clock,
     Deadline,
     NoWakeRuntime,
+    Faulted,
 }
 
 #[must_use = "a failed deadline registration returns the exact scheduler wake key to its owner"]
@@ -225,11 +226,11 @@ impl TimeStorage {
 )]
 unsafe impl Sync for TimeStorage {}
 
-static TIME_STATE: AtomicU8 = AtomicU8::new(UNINITIALIZED);
+static TIME_STATE: AtomicU8 = AtomicU8::new(TimeInitState::Uninitialized as u8);
 static TIME_STORAGE: TimeStorage = TimeStorage::new();
 
 fn live_state() -> Option<&'static IrqSpinMutex<LiveTimeState>> {
-    if TIME_STATE.load(Ordering::Acquire) != INITIALIZED {
+    if TIME_STATE.load(Ordering::Acquire) != TimeInitState::Initialized as u8 {
         return None;
     }
     #[allow(
@@ -243,22 +244,55 @@ pub(crate) fn initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY
     active: &mut ActiveDeepPaging<LiveActivePagingTarget<'root, RANGE_CAPACITY, ROLE_CAPACITY>>,
     pm_descriptor: PmTimerDescriptor,
 ) -> Result<(), LiveTimeError> {
-    if TIME_STATE
-        .compare_exchange(
-            UNINITIALIZED,
-            INITIALIZING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_err()
-    {
-        return Err(LiveTimeError::AlreadyInitialized);
+    let observed = TIME_STATE.compare_exchange(
+        TimeInitState::Uninitialized as u8,
+        TimeInitState::Preparing as u8,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+    if let Err(observed) = observed {
+        return if TimeInitState::from_u8(observed) == Some(TimeInitState::Faulted) {
+            Err(LiveTimeError::Faulted)
+        } else {
+            Err(LiveTimeError::AlreadyInitialized)
+        };
     }
-    let result = initialize_inner(active, pm_descriptor);
-    if result.is_err() {
-        TIME_STATE.store(UNINITIALIZED, Ordering::Release);
+
+    let plan = match prepare_initialize(active) {
+        Ok(plan) => plan,
+        Err(error) => {
+            TIME_STATE.store(TimeInitState::Uninitialized as u8, Ordering::Release);
+            return Err(error);
+        }
+    };
+
+    // Installing the LAPIC leaf is the first irreversible effect. Publish the
+    // non-retryable state before crossing that boundary; success later replaces it.
+    TIME_STATE.store(TimeInitState::Faulted as u8, Ordering::Release);
+    let state = commit_initialize(active, pm_descriptor, plan)?;
+    publish(state);
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct TimeInitPlan {
+    discovery: LocalApicDiscovery,
+    frame: FrameAddress,
+}
+
+fn prepare_initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
+    active: &ActiveDeepPaging<LiveActivePagingTarget<'root, RANGE_CAPACITY, ROLE_CAPACITY>>,
+) -> Result<TimeInitPlan, LiveTimeError> {
+    let discovery = discover_local_apic().map_err(|_| LiveTimeError::ApicDiscovery)?;
+    if discovery.mode() == ApicMode::X2Apic {
+        return Err(LiveTimeError::ApicMode);
     }
-    result
+    if !lapic_pat_entry_is_uncacheable() {
+        return Err(LiveTimeError::ApicMapping);
+    }
+    let frame = FrameAddress::new(discovery.physical_base(), active.root().physical_limit())
+        .map_err(|_| LiveTimeError::ApicMapping)?;
+    Ok(TimeInitPlan { discovery, frame })
 }
 
 fn publish(state: LiveTimeState) {
@@ -269,24 +303,17 @@ fn publish(state: LiveTimeState) {
     unsafe {
         (*TIME_STORAGE.0.get()).write(IrqSpinMutex::new(state));
     }
-    TIME_STATE.store(INITIALIZED, Ordering::Release);
+    TIME_STATE.store(TimeInitState::Initialized as u8, Ordering::Release);
 }
 
-fn initialize_inner<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
+fn commit_initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     active: &mut ActiveDeepPaging<LiveActivePagingTarget<'root, RANGE_CAPACITY, ROLE_CAPACITY>>,
     pm_descriptor: PmTimerDescriptor,
-) -> Result<(), LiveTimeError> {
-    let discovery = discover_local_apic().map_err(|_| LiveTimeError::ApicDiscovery)?;
-    if discovery.mode() == ApicMode::X2Apic {
-        return Err(LiveTimeError::ApicMode);
-    }
-    if !lapic_pat_entry_is_uncacheable() {
-        return Err(LiveTimeError::ApicMapping);
-    }
-    let frame = FrameAddress::new(discovery.physical_base(), active.root().physical_limit())
-        .map_err(|_| LiveTimeError::ApicMapping)?;
+    plan: TimeInitPlan,
+) -> Result<LiveTimeState, LiveTimeError> {
+    let discovery = plan.discovery;
     let virtual_base = active
-        .install_kernel_mmio_page(frame)
+        .install_kernel_mmio_page(plan.frame)
         .map_err(|_| LiveTimeError::ApicMapping)?;
     let mut apic = LocalApic::discovered(discovery, LocalApicVectors::DW0);
     if discovery.mode() == ApicMode::Disabled {
@@ -320,8 +347,7 @@ fn initialize_inner<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usi
         last_sample: final_sample,
     };
     state.reprogram(final_sample)?;
-    publish(state);
-    Ok(())
+    Ok(state)
 }
 
 fn calibrate_apic_timer(

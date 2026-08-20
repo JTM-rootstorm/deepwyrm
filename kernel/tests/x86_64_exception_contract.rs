@@ -159,3 +159,22 @@ fn f3_lapic_leaf_is_supervisor_rw_nx_and_uncacheable() {
     assert!(apic_live.contains("((pat >> 24) as u8) == PAT_UNCACHEABLE"));
     assert!(time_live.contains("if !lapic_pat_entry_is_uncacheable()"));
 }
+
+#[test]
+fn daybreak_time_init_faults_before_first_irreversible_effect_and_never_advertises_retry() {
+    let live = source("src/time/live.rs");
+    let prepare = live
+        .find("let plan = match prepare_initialize(active)")
+        .unwrap();
+    let fault = live
+        .find("TIME_STATE.store(TimeInitState::Faulted as u8, Ordering::Release);")
+        .unwrap();
+    let commit = live
+        .find("let state = commit_initialize(active, pm_descriptor, plan)?;")
+        .unwrap();
+    assert!(prepare < fault && fault < commit);
+    let commit_body = live.split_once("fn commit_initialize").unwrap().1;
+    assert!(commit_body.contains("install_kernel_mmio_page(plan.frame)"));
+    assert!(!commit_body.contains("TimeInitState::Uninitialized"));
+    assert!(live.contains("TimeInitState::from_u8(observed) == Some(TimeInitState::Faulted)"));
+}

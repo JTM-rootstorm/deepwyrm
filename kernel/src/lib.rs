@@ -103,6 +103,10 @@ static BOOTSTRAP_RESERVATIONS: BootstrapStorage<
 static BOOTSTRAP_SANITIZED_MAP: BootstrapStorage<memory::boot_map::SanitizedBootMap> =
     BootstrapStorage::uninit();
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+static BOOTSTRAP_ACPI_WORKSPACE: BootstrapStorage<arch::x86_64::acpi::AcpiSnapshotWorkspace> =
+    BootstrapStorage::uninit();
+
 /// Transfers from the raw architecture entry into validated DW0-B bring-up.
 ///
 /// This symbol is architecture-internal. The loader enters through
@@ -193,13 +197,25 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
         }
         .unwrap_or_else(|error| panic!("failed to activate Deep-owned paging: {error:?}"));
         let pm_timer = {
+            let workspace = unsafe {
+                let slot = &mut *BOOTSTRAP_ACPI_WORKSPACE.slot();
+                let workspace = slot.as_mut_ptr();
+                // The workspace contains only integer arrays; all-zero is a valid
+                // representation. Initialize the BSS-owned object in place so no
+                // ~70 KiB temporary is materialized on the bootstrap stack.
+                core::ptr::write_bytes(workspace, 0, 1);
+                &mut *workspace
+            };
             let mut acpi =
                 arch::x86_64::acpi::AcpiScratchReader::new(&mut active_paging, &boot_info);
-            arch::x86_64::acpi::discover_pm_timer(
+            let proposal = arch::x86_64::acpi::discover_pm_timer_proposal(
                 &mut acpi,
                 boot_info.header().acpi_rsdp_physical_address,
+                workspace,
             )
-            .unwrap_or_else(|error| panic!("DW0-F3 ACPI PM timer unavailable: {error:?}"))
+            .unwrap_or_else(|error| panic!("DW0-F3 ACPI PM timer unavailable: {error:?}"));
+            arch::x86_64::acpi::authorize_q35_pm_timer(proposal)
+                .unwrap_or_else(|error| panic!("DW0-F3 PM timer port unauthorized: {error:?}"))
         };
         time::initialize(&mut active_paging, pm_timer)
             .unwrap_or_else(|error| panic!("failed to initialize DW0-F3 time service: {error:?}"));

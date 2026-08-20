@@ -5,6 +5,7 @@
 //! source; timer objects and generic wait registration remain later F phases.
 
 mod deadline;
+mod init_state;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod live;
 mod pm_timer;
@@ -17,6 +18,11 @@ pub(crate) use deadline::{
     ApicOneShot, DEADLINE_QUEUE_CAPACITY, DeadlineClass, DeadlineQueue, DeadlineQueueError,
     DeadlineRegistration, apic_one_shot_for_delta, classify_deadline,
 };
+#[allow(
+    unused_imports,
+    reason = "target-only live time initialization consumes this state model"
+)]
+pub(crate) use init_state::TimeInitState;
 #[allow(
     unused_imports,
     reason = "F3 PM timer primitives are split between target service and host arithmetic tests"
