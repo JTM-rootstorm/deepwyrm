@@ -156,6 +156,14 @@ impl<OUTPUT, const CAPACITY: usize> WaitOperationRegistry<OUTPUT, CAPACITY> {
             .and_then(Option::take)
     }
 
+    pub(crate) fn wake_key_for_thread(&self, thread: ThreadKey) -> Option<BlockWakeKey> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|entry| entry.thread == thread)
+            .map(WaitOperation::wake_key)
+    }
+
     pub(crate) fn contains_thread(&self, thread: ThreadKey) -> bool {
         self.entries
             .iter()

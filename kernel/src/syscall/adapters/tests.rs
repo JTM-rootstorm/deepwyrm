@@ -3069,6 +3069,221 @@ fn public_finite_wait_idles_then_timeout_resumes_in_place_and_discards_output() 
     );
 }
 
+struct NativeWaitHarness<'a> {
+    user: &'a mut FakeUserMemory,
+    registry: &'a mut ObjectRegistry<16>,
+    tasks: &'a Tasks,
+    events: &'a EventAuthority<1>,
+    channels: &'a ChannelAuthority<1, 2>,
+    waits: &'a WaitRegistry<8>,
+    execution: &'a ExecutionDomain<1>,
+    operations: &'a mut WaitOperationRegistry<FakeOwnedOutput, 1>,
+    process: ProcessKey,
+    thread: ThreadKey,
+    control: NativeWaitControl,
+}
+
+impl crate::syscall::native::NativeSyscallHandler for NativeWaitHarness<'_> {
+    fn handle(
+        &mut self,
+        request: crate::syscall::native::NativeSyscallRequest,
+    ) -> crate::syscall::native::NativeSyscallResult {
+        let action = match request {
+            crate::syscall::native::NativeSyscallRequest::WaitOne {
+                handle,
+                signals,
+                deadline,
+                out_result,
+            } => wait_one_syscall(
+                self.user,
+                self.registry,
+                self.tasks,
+                self.events,
+                self.channels,
+                self.waits,
+                self.execution,
+                self.operations,
+                None,
+                self.process,
+                self.thread,
+                handle,
+                signals,
+                deadline,
+                out_result,
+            ),
+            crate::syscall::native::NativeSyscallRequest::WaitMany {
+                items,
+                item_count,
+                mode,
+                deadline,
+                out_result,
+            } => wait_many_syscall(
+                self.user,
+                self.registry,
+                self.tasks,
+                self.events,
+                self.channels,
+                self.waits,
+                self.execution,
+                self.operations,
+                None,
+                self.process,
+                self.thread,
+                items,
+                item_count,
+                mode,
+                deadline,
+                out_result,
+            ),
+            _ => panic!("native F7 harness received a non-wait request"),
+        };
+        self.control.accept(action)
+    }
+}
+
+#[test]
+fn native_wait_ids_route_through_real_wait_transactions_and_resume_control() {
+    use deepwyrm_abi::{
+        DW_DEADLINE_INFINITE, DW_DEADLINE_NOW, DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED, DW_WAIT_MODE_ANY,
+        DwKnownSyscall,
+    };
+
+    let (mut registry, mut tasks, execution, process, thread, process_handle) =
+        wait_running_fixture();
+    let events = EventAuthority::<1>::new();
+    let channels = ChannelAuthority::<1, 2>::new();
+    let waits = WaitRegistry::<8>::new();
+    let mut user = FakeUserMemory::new();
+    let (event_key, reference) = events.create_event(&mut registry).unwrap();
+    let event = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(reference, DW_RIGHT_WAIT)
+        .unwrap();
+    let mut operations = WaitOperationRegistry::<FakeOwnedOutput, 1>::new();
+    let out_one = BASE + 0x900;
+
+    let mut control = {
+        let mut harness = NativeWaitHarness {
+            user: &mut user,
+            registry: &mut registry,
+            tasks: &tasks,
+            events: &events,
+            channels: &channels,
+            waits: &waits,
+            execution: &execution,
+            operations: &mut operations,
+            process,
+            thread,
+            control: NativeWaitControl::new(),
+        };
+        let begin = crate::syscall::native::dispatch_native(
+            &mut harness,
+            DwKnownSyscall::WaitOne.id(),
+            crate::syscall::RawSyscallArguments::new([
+                event.0,
+                DW_SIGNAL_SIGNALED.0,
+                DW_DEADLINE_INFINITE.0,
+                out_one,
+                0,
+                0,
+            ]),
+        );
+        assert_eq!(begin.status, DW_STATUS_SUCCESS);
+        assert_eq!(begin.control, SyscallControl::SuspendCurrent);
+        core::mem::replace(&mut harness.control, NativeWaitControl::new())
+    };
+    assert!(matches!(
+        control
+            .prepare_suspend(&tasks, &execution, 0xffff_8000_0012_3000)
+            .unwrap(),
+        crate::syscall::native::NativeSuspendPlan::IdleCurrent
+    ));
+
+    let wakes = events
+        .signal(
+            event_key,
+            deepwyrm_abi::DwSignals(0),
+            DW_SIGNAL_SIGNALED,
+            &waits,
+        )
+        .unwrap();
+    let mut cleanup = CleanupQueue::<16>::new();
+    complete_wait_wakes(&mut registry, &execution, wakes, &mut cleanup);
+    assert!(matches!(
+        control
+            .poll_idle(&tasks, &execution, 0xffff_8000_0012_3000)
+            .unwrap(),
+        crate::syscall::native::NativeIdleSuspendPoll::ResumeCurrent
+    ));
+    assert!(control.is_clear());
+    assert_eq!(
+        resume_wait_thread_syscall(
+            &mut user,
+            &mut registry,
+            &waits,
+            &execution,
+            &mut operations,
+            None,
+            thread,
+            &mut cleanup,
+        )
+        .unwrap(),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(u32_at(&user, out_one + 8), 0);
+    assert_eq!(u64_at(&user, out_one + 16), DW_SIGNAL_SIGNALED.0);
+
+    let items = BASE + 0xa00;
+    let out_many = BASE + 0xb00;
+    write_wait_item(&mut user, items, 0, event, DW_SIGNAL_SIGNALED);
+    let immediate = {
+        let mut harness = NativeWaitHarness {
+            user: &mut user,
+            registry: &mut registry,
+            tasks: &tasks,
+            events: &events,
+            channels: &channels,
+            waits: &waits,
+            execution: &execution,
+            operations: &mut operations,
+            process,
+            thread,
+            control,
+        };
+        let immediate = crate::syscall::native::dispatch_native(
+            &mut harness,
+            DwKnownSyscall::WaitMany.id(),
+            crate::syscall::RawSyscallArguments::new([
+                items,
+                1,
+                u64::from(DW_WAIT_MODE_ANY),
+                DW_DEADLINE_NOW.0,
+                out_many,
+                0,
+            ]),
+        );
+        assert!(harness.control.is_clear());
+        immediate
+    };
+    assert_eq!(immediate.status, DW_STATUS_SUCCESS);
+    assert_eq!(immediate.control, SyscallControl::ReturnToCaller);
+    assert_eq!(u32_at(&user, out_many + 8), 0);
+    assert_eq!(u64_at(&user, out_many + 16), DW_SIGNAL_SIGNALED.0);
+
+    close_event_for_test(&mut registry, &mut tasks, process, &events, event);
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+}
+
 #[test]
 fn public_wait_one_preflights_owned_output_before_handle_resolution_and_commits_ready() {
     use deepwyrm_abi::{DW_DEADLINE_NOW, DW_RIGHT_SIGNAL, DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED};

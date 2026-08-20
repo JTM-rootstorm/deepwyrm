@@ -56,7 +56,9 @@ use crate::wait::{
     validate_event_signal_masks,
 };
 
-use super::native::{NativeIdleSuspendPoll, NativeSuspendPlan, SyscallControl};
+use super::native::{
+    NativeIdleSuspendPoll, NativeSuspendPlan, NativeSyscallResult, SyscallControl,
+};
 
 use super::abi_bytes::{
     HANDLE_TRANSFER_BYTES, THREAD_START_BYTES, WAIT_ITEM_BYTES, decode_handle_transfer,
@@ -1361,6 +1363,97 @@ pub(crate) enum WaitSuspendError {
     Switch(ExecutionSwitchError),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeWaitControlState {
+    Clear,
+    Pending(WaitSuspendState),
+    Idle(WaitSuspendState),
+}
+
+/// Ephemeral control-plane state between native wait dispatch and the raw
+/// suspension trampoline. Durable output/deadline/winner ownership remains in
+/// `WaitOperationRegistry`; this owner carries only the current control-flow
+/// decision until it is consumed by `prepare_suspend` or the idle IRQ loop.
+pub(crate) struct NativeWaitControl {
+    state: NativeWaitControlState,
+}
+
+impl NativeWaitControl {
+    pub(crate) const fn new() -> Self {
+        Self {
+            state: NativeWaitControlState::Clear,
+        }
+    }
+
+    pub(crate) fn accept(&mut self, action: WaitSyscallAction) -> NativeSyscallResult {
+        assert_eq!(
+            self.state,
+            NativeWaitControlState::Clear,
+            "native wait control already owns an unconsumed suspension"
+        );
+        match action {
+            WaitSyscallAction::Returning(status) => NativeSyscallResult::returning(status),
+            WaitSyscallAction::Suspended(state) => {
+                self.state = NativeWaitControlState::Pending(state);
+                NativeSyscallResult {
+                    status: DW_STATUS_SUCCESS,
+                    control: SyscallControl::SuspendCurrent,
+                }
+            }
+        }
+    }
+
+    pub(crate) fn prepare_suspend<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+        const EXECUTION: usize,
+    >(
+        &mut self,
+        tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        execution: &ExecutionDomain<EXECUTION>,
+        trusted_first_run_entry: u64,
+    ) -> Result<NativeSuspendPlan, WaitSuspendError> {
+        let NativeWaitControlState::Pending(state) = self.state else {
+            return Err(WaitSuspendError::InvalidDecision);
+        };
+        let plan = prepare_wait_suspend_plan(tasks, execution, state, trusted_first_run_entry)?;
+        self.state = match plan {
+            NativeSuspendPlan::IdleCurrent => NativeWaitControlState::Idle(state),
+            NativeSuspendPlan::Switch(_) => NativeWaitControlState::Clear,
+        };
+        Ok(plan)
+    }
+
+    pub(crate) fn poll_idle<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+        const EXECUTION: usize,
+    >(
+        &mut self,
+        tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        execution: &ExecutionDomain<EXECUTION>,
+        trusted_first_run_entry: u64,
+    ) -> Result<NativeIdleSuspendPoll, WaitSuspendError> {
+        let NativeWaitControlState::Idle(state) = self.state else {
+            return Err(WaitSuspendError::InvalidDecision);
+        };
+        let poll = poll_wait_idle_suspend(tasks, execution, state, trusted_first_run_entry)?;
+        if !matches!(poll, NativeIdleSuspendPoll::Continue) {
+            self.state = NativeWaitControlState::Clear;
+        }
+        Ok(poll)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn is_clear(&self) -> bool {
+        matches!(self.state, NativeWaitControlState::Clear)
+    }
+}
+
 #[allow(
     unsafe_code,
     reason = "the runtime supplies a stationary execution owner and consumes the validated switch plan immediately at the F7 suspension boundary"
@@ -1954,6 +2047,38 @@ pub(crate) fn resume_wait_syscall<
             panic!("non-returning F7 wait winner reached syscall resume")
         }
     }
+}
+
+pub(crate) fn resume_wait_thread_syscall<
+    U: OwnedUserOutputAccess,
+    const OBJECTS: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    user: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    waits: &WaitRegistry<WAITERS>,
+    execution: &ExecutionDomain<EXECUTION>,
+    operations: &mut WaitOperationRegistry<U::OwnedOutput, EXECUTION>,
+    deadline_authority: Option<&mut dyn WaitDeadlineAuthority>,
+    thread: ThreadKey,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> Result<DwStatus, WaitFinishError> {
+    let wake = operations
+        .wake_key_for_thread(thread)
+        .ok_or(WaitFinishError::Operation(
+            crate::wait::operation::WaitOperationError::StaleWake,
+        ))?;
+    resume_wait_syscall(
+        user,
+        registry,
+        waits,
+        execution,
+        operations,
+        deadline_authority,
+        wake,
+        cleanup,
+    )
 }
 
 pub(crate) fn event_create<
