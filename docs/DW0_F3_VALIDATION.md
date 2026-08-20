@@ -1,6 +1,6 @@
 # DW0-F3 Validation Record
 
-Status: **FUNCTIONALLY CLOSED — SECURITY OPEN under Daybreak remediation**
+Status: **FUNCTIONALLY CLOSED — DB-01 REMEDIATED; final F13 Daybreak re-review pending**
 F3 implementation/evidence candidate: `635efab449234beecd5ef3d667efba7b8f3471b3`  
 F2 baseline: `d8c226ccefe53ccb19a42e08b47924485103cf79`  
 Wyrmroot paired revision: `bd2f0629206de3a47f5a20cb0842a4e76ec88aaf`
@@ -9,11 +9,16 @@ This record closes only DW0-F3: the monotonic clock, finite-deadline engine,
 IRQ-safe timer foundation, and live `clock_get(DW_CLOCK_MONOTONIC_ACTIVE)` path.
 It is not an F-wide security or completion record.
 
-**Security supersession note (2026-08-19):** the current-tree Daybreak Blue review at
+**Security supersession note (updated 2026-08-20):** the current-tree Daybreak Blue review at
 `797d8561d59fdbe6c55d25fa1620110f4f85acee` identified DB-01 (High) in the
-exact-half-wrap PM maintenance policy. The functional VM evidence below remains
-historical provenance, but its half-wrap liveness claim is security-invalid until
-the DB-01 remediation and replacement long-idle evidence land.
+exact-half-wrap PM maintenance policy. S1 commit
+`75e28750b0a5c5842923ca4f55dc2c2a206dd17f` replaced that policy with a
+quarter-wrap maintenance arm and separate half-wrap ambiguity bound. The S5
+candidate `ef3abd93aa9d003ca8f576fdf50a696a045c79b8` then passed the replacement
+designated-VM long-idle proof through two complete 24-bit full-wrap intervals.
+The original F3 VM evidence below remains historical provenance; the corrected
+security evidence is recorded in `security/DW0_DAYBREAK_REMEDIATION_S5_CLOSURE.md`.
+Formal cumulative Daybreak re-review of the remediation remains the F13 gate.
 
 ## 1. Implemented F3 surface
 

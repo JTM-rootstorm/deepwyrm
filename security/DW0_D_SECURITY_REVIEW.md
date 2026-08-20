@@ -1,3 +1,11 @@
+# S5 supersession
+
+**2026-08-20:** the historical SOFT ACCEPT in this record is superseded for phase
+accounting by [`DW0_D_DAYBREAK_CLOSURE.md`](DW0_D_DAYBREAK_CLOSURE.md). DW0-D is now FULL ACCEPTED under
+the coordinator-authorized S5 closure policy. The end-of-F F13 cumulative
+`gpt-daybreak-blue-latest` scan remains the final security re-review and may
+reopen this disposition if later work regresses the reviewed surface.
+
 # DW0-D Security Review Record
 
 ## Disposition

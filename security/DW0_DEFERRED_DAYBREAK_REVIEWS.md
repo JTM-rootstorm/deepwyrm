@@ -1,52 +1,83 @@
-# DW0 Deferred Daybreak Review Register
+# DW0 D/E Daybreak Historical Review Register
 
 ## Purpose
 
-This register tracks coordinator-authorized security-review debt that is allowed
-to coexist with forward DW0 development but must not be mistaken for formal
-security closure.
+This register preserves the former coordinator-authorized D/E soft-accept debt
+and its closure history. It must not be deleted merely because the entries are
+now closed; later F/H work can reopen a phase if it materially regresses these
+surfaces.
 
-DW0-D and DW0-E are both SOFT ACCEPTED for phase progression. Neither phase has
-yet received its required exact-candidate `gpt-daybreak-blue-latest` review.
-Later implementation does not erase this debt.
+As of 2026-08-20, **DW0-D and DW0-E are FULL ACCEPTED for phase accounting**
+under Mike's S5 closure direction. The 2026-08-19 current-tree Daybreak review
+used exact model `gpt-daybreak-blue-latest` at High reasoning and explicitly
+compared the historical D and E surfaces to current revision
+`797d8561d59fdbe6c55d25fa1620110f4f85acee`. Sol then implemented the
+Daybreak-authored DB-01 through DB-07 plan through cumulative candidate
+`ef3abd93aa9d003ca8f576fdf50a696a045c79b8`, with full S5 regression evidence.
 
-## DW0-D
+This is not a claim that Daybreak re-reviewed `ef3abd93`. Mike explicitly
+deferred the next cumulative Daybreak re-review to the end-of-F F13 gate.
 
-- frozen review candidate:
+## DW0-D — CLOSED
+
+- historical frozen candidate:
   `fa4be89efc14aff1301b4a5ea6a9f4af9d11e29e`;
-- validated documentation descendant:
+- historical validation descendant:
   `db09ce173adfb6850765fe2a4547d50a1050ac10`;
-- current record: [`DW0_D_SECURITY_REVIEW.md`](DW0_D_SECURITY_REVIEW.md);
-- detailed manual note:
+- original record: [`DW0_D_SECURITY_REVIEW.md`](DW0_D_SECURITY_REVIEW.md);
+- historical manual note:
   [`DW0_D7_SECURITY_REVIEW_NOTE.md`](DW0_D7_SECURITY_REVIEW_NOTE.md);
-- formal status: **PENDING DAYBREAK**.
+- dedicated Daybreak closure:
+  [`DW0_D_DAYBREAK_CLOSURE.md`](DW0_D_DAYBREAK_CLOSURE.md);
+- formal phase-accounting status: **FULL ACCEPT / HISTORICAL DEBT CLOSED**.
 
-The delayed review should explicitly revisit D7-R1 typed/generic finalizer
-routing and D7-R2 construction/publication sequencing, while rechecking the full
-D rights, lifetime, stale-handle, mapping-pin, and rollback surfaces.
-## DW0-E
+The Daybreak current-tree review explicitly disposed D7-R1 typed/generic
+finalizer routing and D7-R2 construction/publication sequencing and rechecked
+rights, stale generations, mapping pins, W^X accounting, and rollback without a
+new D vulnerability. D7-R3/R4 remain Low engineering debt.
 
-- frozen review/remediation candidate:
+## DW0-E — CLOSED
+
+- historical remediation candidate:
   `579e12074e1fe9ec89507e033381fed66676c12c`;
-- E9 validation/documentation candidate:
+- historical E9 validation candidate:
   `e8394d6e6d160d9e4d04769943c2500cfd562c10`;
-- current record: [`DW0_E_SECURITY_REVIEW.md`](DW0_E_SECURITY_REVIEW.md);
-- detailed provisional note:
+- original record: [`DW0_E_SECURITY_REVIEW.md`](DW0_E_SECURITY_REVIEW.md);
+- historical provisional note:
   [`DW0_E8_SOFT_SECURITY_REVIEW_NOTE.md`](DW0_E8_SOFT_SECURITY_REVIEW_NOTE.md);
-- formal status: **PENDING DAYBREAK**.
+- dedicated Daybreak/S5 closure:
+  [`DW0_E_DAYBREAK_CLOSURE.md`](DW0_E_DAYBREAK_CLOSURE.md);
+- formal phase-accounting status: **FULL ACCEPT / HISTORICAL DEBT CLOSED**.
 
-The delayed review must independently revisit E8-F1/SWAPGS, hostile
-GS/RCX/R11/RSP/RIP state, exception-origin GS normalization, pinned usercopy,
-typed finalization/construction, teardown ordering, runtime-binding lifetime,
-and the single-BSP assumptions captured by E8-R1 through E8-R5.
+The Daybreak current-tree review independently confirmed E8-F1/SWAPGS remained
+fixed and found no new E Critical/High defect. E8-R3 address-space retirement
+was carried into DB-04 and remediated by S3's move-only blocked-operation/root
+retirement proof. Mike explicitly deferred DB-04's intermediate targeted
+Daybreak re-review to the final F13 cumulative scan.
 
-## Debt exit rule
+E8-R1 nonterminal-exception GS state, E8-R2 per-CPU/runtime ownership, and
+E8-R5 SMP assumptions remain phase-bounded H/future-path Medium gates rather
+than historical E acceptance blockers. E8-R4 remains Low fail-closed
+availability debt.
 
-For each phase, run the exact required model and record model identity, review
-date/reasoning level, exact candidate/diff, findings, dispositions, and tests.
-Any substantive fix must be applied to the then-current development branch and
-receive targeted regression plus affected host/freestanding/VM revalidation.
+## Closure evidence
 
-DW0-H may perform a broader release-candidate review, but it may not silently
-substitute that review for these historical D/E exact-surface obligations.
-Final DW0 security acceptance remains blocked until both entries are resolved.
+Cumulative remediation candidate:
+`ef3abd93aa9d003ca8f576fdf50a696a045c79b8`.
+
+S5 implementation/regression record:
+[`DW0_DAYBREAK_REMEDIATION_S5_CLOSURE.md`](DW0_DAYBREAK_REMEDIATION_S5_CLOSURE.md).
+
+S5 artifact manifest SHA-256:
+`4e12b1a0ac8cd77b8f6a19cc5066dd90fdc02a541633aadb78e99181de1c3253`.
+
+The designated VM passed selector 10 after 10.937 seconds of wall time, covering
+two complete 24-bit PM-timer full-wrap intervals, and restored the original
+OS-Project domain definition byte-identically.
+
+## Reopen rule
+
+F13 must recheck that F did not regress D/E surfaces and must run the planned
+`gpt-daybreak-blue-latest` cumulative scan. A substantive F13 finding affecting
+D or E reopens the corresponding entry. DW0-H must separately re-review SMP and
+per-CPU assumptions; that review does not erase this historical record.
