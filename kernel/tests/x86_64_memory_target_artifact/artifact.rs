@@ -1,7 +1,7 @@
 use super::*;
 
-pub(super) fn symbols(llvm_nm: &Path, artifact: &Path) -> String {
-    let mut command = helper_command(llvm_nm);
+pub(super) fn symbols(llvm_nm: &VerifiedExecutable, artifact: &Path) -> String {
+    let mut command = verified_helper_command(llvm_nm);
     let output = run_output(
         command.args(["--defined-only", "--demangle"]).arg(artifact),
         "llvm-nm",
@@ -9,8 +9,8 @@ pub(super) fn symbols(llvm_nm: &Path, artifact: &Path) -> String {
     String::from_utf8(output.stdout).expect("llvm-nm output is UTF-8")
 }
 
-pub(super) fn disassembly(llvm_objdump: &Path, artifact: &Path) -> String {
-    let mut command = helper_command(llvm_objdump);
+pub(super) fn disassembly(llvm_objdump: &VerifiedExecutable, artifact: &Path) -> String {
+    let mut command = verified_helper_command(llvm_objdump);
     let output = run_output(
         command
             .args(["--disassemble", "--demangle", "--x86-asm-syntax=intel"])
@@ -63,13 +63,13 @@ pub(super) fn validate_entry_normalization(disassembly: &str) {
 }
 
 pub(super) fn validate_f2_kernel_context_object(
-    clang: &Path,
-    llvm_nm: &Path,
-    llvm_objdump: &Path,
+    clang: &VerifiedExecutable,
+    llvm_nm: &VerifiedExecutable,
+    llvm_objdump: &VerifiedExecutable,
     workspace: &Path,
     output: &Path,
 ) {
-    let mut command = helper_command(clang);
+    let mut command = verified_helper_command(clang);
     run_success(
         command
             .args([
@@ -216,6 +216,30 @@ pub(super) fn fixed_x86_64_stack_frame(disassembly: &str, symbol: &str) -> usize
 pub(super) fn sha256(artifact: &Path) -> String {
     let mut command = helper_command("/usr/bin/sha256sum");
     digest_from_output(run_output(command.arg(artifact), "sha256sum"))
+}
+
+pub(super) fn verified_helper_command(program: &VerifiedExecutable) -> Command {
+    let mut command = program.command();
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .env("SOURCE_DATE_EPOCH", "0");
+    command
+}
+
+pub(super) fn verified_helper_command_as(program: &VerifiedExecutable, argv0: &str) -> Command {
+    let mut command = program.command_with_argv0(argv0);
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .env("SOURCE_DATE_EPOCH", "0");
+    command
 }
 
 pub(super) fn helper_command(program: impl AsRef<OsStr>) -> Command {

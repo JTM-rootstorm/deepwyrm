@@ -45,19 +45,13 @@ fn production_and_six_memory_selector_artifacts_are_separated() {
         .expect("kernel manifest has workspace parent")
         .to_path_buf();
     reject_ambient_build_overrides(&workspace);
-    let cargo = required_path("DEEPWYRM_ACCEPTED_CARGO");
-    let rustc = required_path("DEEPWYRM_ACCEPTED_RUSTC");
-    let rust_lld = required_path("DEEPWYRM_ACCEPTED_RUST_LLD");
-    let clang = required_path("DEEPWYRM_CLANG");
-    let llvm_nm = required_path("DEEPWYRM_LLVM_NM");
-    let llvm_objdump = required_path("DEEPWYRM_LLVM_OBJDUMP");
-    let llvm_readelf = required_path("DEEPWYRM_LLVM_READELF");
-    let build_tools = BuildTools {
-        cargo: &cargo,
-        rustc: &rustc,
-        rust_lld: &rust_lld,
-        clang: &clang,
-    };
+    let cargo_path = required_path("DEEPWYRM_ACCEPTED_CARGO");
+    let rustc_path = required_path("DEEPWYRM_ACCEPTED_RUSTC");
+    let rust_lld_path = required_path("DEEPWYRM_ACCEPTED_RUST_LLD");
+    let clang_path = required_path("DEEPWYRM_CLANG");
+    let llvm_nm_path = required_path("DEEPWYRM_LLVM_NM");
+    let llvm_objdump_path = required_path("DEEPWYRM_LLVM_OBJDUMP");
+    let llvm_readelf_path = required_path("DEEPWYRM_LLVM_READELF");
     let toolchain_identity = fs::read_to_string(workspace.join("tooling/rust-toolchain.toml"))
         .expect("read trusted toolchain identity");
     let build_tools_identity = fs::read_to_string(workspace.join("tooling/build-tools.toml"))
@@ -65,11 +59,59 @@ fn production_and_six_memory_selector_artifacts_are_separated() {
     validate_accepted_identities(
         &toolchain_identity,
         &build_tools_identity,
-        &cargo,
-        &rustc,
-        &rust_lld,
-        &clang,
+        AcceptedToolPaths {
+            cargo: &cargo_path,
+            rustc: &rustc_path,
+            rust_lld: &rust_lld_path,
+            clang: &clang_path,
+            llvm_nm: &llvm_nm_path,
+            llvm_objdump: &llvm_objdump_path,
+            llvm_readelf: &llvm_readelf_path,
+        },
     );
+    let runtime_artifacts = accepted_runtime_artifacts(&toolchain_identity, &cargo_path);
+    let cargo = VerifiedExecutable::open(
+        &cargo_path,
+        manifest_value(&toolchain_identity, "cargo_sha256"),
+        "cargo",
+    );
+    let rustc = VerifiedExecutable::open(
+        &rustc_path,
+        manifest_value(&toolchain_identity, "rustc_sha256"),
+        "rustc",
+    );
+    let rust_lld = VerifiedExecutable::open(
+        &rust_lld_path,
+        manifest_value(&toolchain_identity, "rust_lld_sha256"),
+        "rust-lld",
+    );
+    let clang = VerifiedExecutable::open(
+        &clang_path,
+        manifest_value(&build_tools_identity, "clang_sha256"),
+        "clang",
+    );
+    let llvm_nm = VerifiedExecutable::open(
+        &llvm_nm_path,
+        manifest_value(&build_tools_identity, "llvm_nm_sha256"),
+        "llvm-nm",
+    );
+    let llvm_objdump = VerifiedExecutable::open(
+        &llvm_objdump_path,
+        manifest_value(&build_tools_identity, "llvm_objdump_sha256"),
+        "llvm-objdump",
+    );
+    let llvm_readelf = VerifiedExecutable::open(
+        &llvm_readelf_path,
+        manifest_value(&build_tools_identity, "llvm_readelf_sha256"),
+        "llvm-readelf/readobj",
+    );
+    let build_tools = BuildTools {
+        cargo: &cargo,
+        rustc: &rustc,
+        rust_lld: &rust_lld,
+        clang: &clang,
+        runtime_artifacts: &runtime_artifacts,
+    };
     let output_root = ArtifactRoot::create();
     let build_environment = BuildEnvironment::create(output_root.path());
     validate_f2_kernel_context_object(
@@ -226,10 +268,15 @@ fn production_and_six_memory_selector_artifacts_are_separated() {
     validate_accepted_identities(
         &toolchain_identity,
         &build_tools_identity,
-        &cargo,
-        &rustc,
-        &rust_lld,
-        &clang,
+        AcceptedToolPaths {
+            cargo: cargo.source_path(),
+            rustc: rustc.source_path(),
+            rust_lld: rust_lld.source_path(),
+            clang: clang.source_path(),
+            llvm_nm: llvm_nm.source_path(),
+            llvm_objdump: llvm_objdump.source_path(),
+            llvm_readelf: llvm_readelf.source_path(),
+        },
     );
     let build_environment_after = normalized_build_environment_sha256(
         &cargo,
@@ -259,19 +306,13 @@ fn e7_task_smoke_artifact_is_freestanding_and_separated() {
         .expect("kernel manifest has workspace parent")
         .to_path_buf();
     reject_ambient_build_overrides(&workspace);
-    let cargo = required_path("DEEPWYRM_ACCEPTED_CARGO");
-    let rustc = required_path("DEEPWYRM_ACCEPTED_RUSTC");
-    let rust_lld = required_path("DEEPWYRM_ACCEPTED_RUST_LLD");
-    let clang = required_path("DEEPWYRM_CLANG");
-    let llvm_nm = required_path("DEEPWYRM_LLVM_NM");
-    let llvm_objdump = required_path("DEEPWYRM_LLVM_OBJDUMP");
-    let llvm_readelf = required_path("DEEPWYRM_LLVM_READELF");
-    let tools = BuildTools {
-        cargo: &cargo,
-        rustc: &rustc,
-        rust_lld: &rust_lld,
-        clang: &clang,
-    };
+    let cargo_path = required_path("DEEPWYRM_ACCEPTED_CARGO");
+    let rustc_path = required_path("DEEPWYRM_ACCEPTED_RUSTC");
+    let rust_lld_path = required_path("DEEPWYRM_ACCEPTED_RUST_LLD");
+    let clang_path = required_path("DEEPWYRM_CLANG");
+    let llvm_nm_path = required_path("DEEPWYRM_LLVM_NM");
+    let llvm_objdump_path = required_path("DEEPWYRM_LLVM_OBJDUMP");
+    let llvm_readelf_path = required_path("DEEPWYRM_LLVM_READELF");
     let toolchain_identity = fs::read_to_string(workspace.join("tooling/rust-toolchain.toml"))
         .expect("read trusted toolchain identity");
     let build_tools_identity = fs::read_to_string(workspace.join("tooling/build-tools.toml"))
@@ -279,11 +320,59 @@ fn e7_task_smoke_artifact_is_freestanding_and_separated() {
     validate_accepted_identities(
         &toolchain_identity,
         &build_tools_identity,
-        &cargo,
-        &rustc,
-        &rust_lld,
-        &clang,
+        AcceptedToolPaths {
+            cargo: &cargo_path,
+            rustc: &rustc_path,
+            rust_lld: &rust_lld_path,
+            clang: &clang_path,
+            llvm_nm: &llvm_nm_path,
+            llvm_objdump: &llvm_objdump_path,
+            llvm_readelf: &llvm_readelf_path,
+        },
     );
+    let runtime_artifacts = accepted_runtime_artifacts(&toolchain_identity, &cargo_path);
+    let cargo = VerifiedExecutable::open(
+        &cargo_path,
+        manifest_value(&toolchain_identity, "cargo_sha256"),
+        "cargo",
+    );
+    let rustc = VerifiedExecutable::open(
+        &rustc_path,
+        manifest_value(&toolchain_identity, "rustc_sha256"),
+        "rustc",
+    );
+    let rust_lld = VerifiedExecutable::open(
+        &rust_lld_path,
+        manifest_value(&toolchain_identity, "rust_lld_sha256"),
+        "rust-lld",
+    );
+    let clang = VerifiedExecutable::open(
+        &clang_path,
+        manifest_value(&build_tools_identity, "clang_sha256"),
+        "clang",
+    );
+    let llvm_nm = VerifiedExecutable::open(
+        &llvm_nm_path,
+        manifest_value(&build_tools_identity, "llvm_nm_sha256"),
+        "llvm-nm",
+    );
+    let llvm_objdump = VerifiedExecutable::open(
+        &llvm_objdump_path,
+        manifest_value(&build_tools_identity, "llvm_objdump_sha256"),
+        "llvm-objdump",
+    );
+    let llvm_readelf = VerifiedExecutable::open(
+        &llvm_readelf_path,
+        manifest_value(&build_tools_identity, "llvm_readelf_sha256"),
+        "llvm-readelf/readobj",
+    );
+    let tools = BuildTools {
+        cargo: &cargo,
+        rustc: &rustc,
+        rust_lld: &rust_lld,
+        clang: &clang,
+        runtime_artifacts: &runtime_artifacts,
+    };
     let output_root = ArtifactRoot::create();
     let environment = BuildEnvironment::create(output_root.path());
     validate_f2_kernel_context_object(
@@ -340,7 +429,7 @@ fn e7_task_smoke_artifact_is_freestanding_and_separated() {
     let user_symbols = symbols(&llvm_nm, &user);
     assert!(user_symbols.contains("_start"));
     assert!(user_symbols.contains("dw_syscall6"));
-    let mut readelf = helper_command(&llvm_readelf);
+    let mut readelf = verified_helper_command_as(&llvm_readelf, "llvm-readelf");
     let headers = run_output(
         readelf.args(["-h", "-l"]).arg(&user),
         "E7 userspace ELF headers",
@@ -411,10 +500,15 @@ fn e7_task_smoke_artifact_is_freestanding_and_separated() {
     validate_accepted_identities(
         &toolchain_identity,
         &build_tools_identity,
-        &cargo,
-        &rustc,
-        &rust_lld,
-        &clang,
+        AcceptedToolPaths {
+            cargo: cargo.source_path(),
+            rustc: rustc.source_path(),
+            rust_lld: rust_lld.source_path(),
+            clang: clang.source_path(),
+            llvm_nm: llvm_nm.source_path(),
+            llvm_objdump: llvm_objdump.source_path(),
+            llvm_readelf: llvm_readelf.source_path(),
+        },
     );
     let build_environment_hash = normalized_build_environment_sha256(
         &cargo,

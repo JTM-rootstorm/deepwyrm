@@ -256,6 +256,16 @@ struct BuildToolsIdentity {
     host_llvm: String,
     host_llvm_sha256: String,
     clang_config_sha256: String,
+    llvm_nm_binary: String,
+    llvm_nm_sha256: String,
+    llvm_objdump_binary: String,
+    llvm_objdump_sha256: String,
+    llvm_readelf_binary: String,
+    llvm_readelf_sha256: String,
+    system_tar_binary: String,
+    system_tar_sha256: String,
+    system_sha256sum_binary: String,
+    system_sha256sum_sha256: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

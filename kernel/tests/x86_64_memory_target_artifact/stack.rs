@@ -156,8 +156,8 @@ pub(super) fn ist_padding_branch_participates_in_the_maximum_stack_bound() {
     assert_eq!(audited_stack_upper_bound(&[ordinary, padding]), padding);
 }
 
-pub(super) fn stack_sizes(llvm_readelf: &Path, artifact: &Path) -> Vec<StackSize> {
-    let mut command = helper_command(llvm_readelf);
+pub(super) fn stack_sizes(llvm_readelf: &VerifiedExecutable, artifact: &Path) -> Vec<StackSize> {
+    let mut command = verified_helper_command_as(llvm_readelf, "llvm-readelf");
     let output = run_output(
         command.args(["--demangle", "--stack-sizes"]).arg(artifact),
         "llvm-readelf stack sizes",

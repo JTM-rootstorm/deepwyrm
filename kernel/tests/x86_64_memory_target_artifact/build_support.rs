@@ -7,7 +7,7 @@ pub(super) fn build_kernel(
     tools: BuildTools<'_>,
     selector: Option<&str>,
 ) -> PathBuf {
-    let mut command = Command::new(tools.cargo);
+    let mut command = tools.cargo.command();
     environment.apply(&mut command, tools, target_dir);
     command.current_dir(workspace).args([
         "build",
@@ -40,7 +40,7 @@ pub(super) fn validate_one_shot_ui(
     environment: &BuildEnvironment,
     tools: BuildTools<'_>,
 ) {
-    let mut command = Command::new(tools.cargo);
+    let mut command = tools.cargo.command();
     environment.apply(&mut command, tools, target_dir);
     let output = command
         .current_dir(workspace)
@@ -82,7 +82,7 @@ pub(super) fn build_stack_kernel(
     tools: BuildTools<'_>,
     selector: Option<&str>,
 ) -> PathBuf {
-    let mut command = Command::new(tools.cargo);
+    let mut command = tools.cargo.command();
     environment.apply(&mut command, tools, target_dir);
     command
         .current_dir(workspace)
