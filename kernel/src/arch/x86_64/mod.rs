@@ -5,7 +5,10 @@
 //! the emergency IDT before any BootInfo parsing. It intentionally preserves
 //! `IF=0` and does not rely on loader descriptor or TLS state.
 
+pub(crate) mod acpi;
 pub mod apic;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) mod apic_live;
 pub(crate) mod context;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod entry;
@@ -310,6 +313,7 @@ pub(crate) fn linked_privilege_entry_stack_layout()
 )]
 unsafe extern "C" {
     static dw_x86_64_exception_handler_table: [u64; EXCEPTION_HANDLER_COUNT];
+    static dw_x86_64_apic_timer_entry: u8;
     static dw_x86_64_apic_error_entry: u8;
     static dw_x86_64_apic_spurious_entry: u8;
 }
@@ -455,10 +459,13 @@ unsafe fn load_handler_addresses() -> Result<EarlyIdtHandlers, EarlyDescriptorIn
     }
     // SAFETY: both symbols name sixteen-byte-aligned entry labels retained by
     // the same linked exception object.
+    let apic_timer = &raw const dw_x86_64_apic_timer_entry as *const u8 as u64;
     let apic_error = &raw const dw_x86_64_apic_error_entry as *const u8 as u64;
     let apic_spurious = &raw const dw_x86_64_apic_spurious_entry as *const u8 as u64;
     Ok(EarlyIdtHandlers {
         exceptions: ExceptionHandlerTable::new(handlers),
+        local_apic_timer: HandlerAddress::new(apic_timer)
+            .map_err(|_| EarlyDescriptorInstallError::InvalidHandlerAddress(apic_timer))?,
         local_apic_error: HandlerAddress::new(apic_error)
             .map_err(|_| EarlyDescriptorInstallError::InvalidHandlerAddress(apic_error))?,
         local_apic_spurious: HandlerAddress::new(apic_spurious)

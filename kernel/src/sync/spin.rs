@@ -7,7 +7,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 ///
 /// E3 callers must not hold this lock across subsystem finalization, usercopy,
 /// page-table publication, or any operation that may later block. Interrupt
-/// handlers do not acquire E3 spin locks; an IRQ-safe wrapper is future work.
+/// interrupt-shared F3 state must use `IrqSpinMutex` rather than acquiring
+/// this plain lock from an interrupt handler.
 pub(crate) struct SpinMutex<T> {
     locked: AtomicBool,
     value: UnsafeCell<T>,

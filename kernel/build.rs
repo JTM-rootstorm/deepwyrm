@@ -10,15 +10,18 @@ pub(crate) const E7_USER_ENTRY: u64 = 0x0000_0000_4000_0000;
 pub(crate) const E7_USER_DATA: u64 = 0x0000_0000_4000_1000;
 pub(crate) const E7_USER_INFO: u64 = E7_USER_DATA;
 pub(crate) const E7_USER_REQUIRED: u64 = E7_USER_DATA + 0x80;
+pub(crate) const E7_USER_CLOCK: u64 = E7_USER_DATA + 0x100;
 pub(crate) const E7_USER_STACK_BOTTOM: u64 = 0x0000_0000_5000_0000;
 pub(crate) const E7_USER_STACK_TOP: u64 = E7_USER_STACK_BOTTOM + 4096;
 pub(crate) const E7_SYSCALL_ABI_GET_INFO: u32 = 0x0000_0001;
 pub(crate) const E7_SYSCALL_PROCESS_EXIT: u32 = 0x0001_0011;
+pub(crate) const E7_SYSCALL_CLOCK_GET: u32 = 0x0005_0001;
 pub(crate) const E7_UNKNOWN_SYSCALL: u32 = 0xffff_fffe;
 pub(crate) const E7_STATUS_NOT_SUPPORTED: i32 = -14;
 pub(crate) const E7_ABI_INFO_SIZE: u32 = 64;
 pub(crate) const E7_ABI_VERSION: u32 = 0;
 pub(crate) const E7_PAGE_SIZE: u32 = 4096;
+pub(crate) const E7_CLOCK_MONOTONIC_ACTIVE: u32 = 0;
 
 fn main() {
     if let Err(error) = run() {
@@ -138,6 +141,7 @@ fn emit_e7_user_env(elf: &Path) {
         ("DEEPWYRM_E7_USER_DATA", E7_USER_DATA),
         ("DEEPWYRM_E7_USER_INFO", E7_USER_INFO),
         ("DEEPWYRM_E7_USER_REQUIRED", E7_USER_REQUIRED),
+        ("DEEPWYRM_E7_USER_CLOCK", E7_USER_CLOCK),
         ("DEEPWYRM_E7_USER_STACK_BOTTOM", E7_USER_STACK_BOTTOM),
         ("DEEPWYRM_E7_USER_STACK_TOP", E7_USER_STACK_TOP),
     ] {
@@ -225,13 +229,16 @@ fn e7_assembler_constants() -> Vec<String> {
     vec![
         format!(".equ DW_E7_USER_INFO_ADDRESS, {E7_USER_INFO:#x}"),
         format!(".equ DW_E7_USER_REQUIRED_ADDRESS, {E7_USER_REQUIRED:#x}"),
+        format!(".equ DW_E7_USER_CLOCK_ADDRESS, {E7_USER_CLOCK:#x}"),
         format!(".equ DW_E7_SYSCALL_ABI_GET_INFO, {E7_SYSCALL_ABI_GET_INFO:#x}"),
         format!(".equ DW_E7_SYSCALL_PROCESS_EXIT, {E7_SYSCALL_PROCESS_EXIT:#x}"),
+        format!(".equ DW_E7_SYSCALL_CLOCK_GET, {E7_SYSCALL_CLOCK_GET:#x}"),
         format!(".equ DW_E7_UNKNOWN_SYSCALL, {E7_UNKNOWN_SYSCALL:#x}"),
         format!(".equ DW_E7_STATUS_NOT_SUPPORTED, {E7_STATUS_NOT_SUPPORTED}"),
         format!(".equ DW_E7_ABI_INFO_SIZE, {E7_ABI_INFO_SIZE}"),
         format!(".equ DW_E7_ABI_VERSION, {E7_ABI_VERSION}"),
         format!(".equ DW_E7_PAGE_SIZE, {E7_PAGE_SIZE}"),
+        format!(".equ DW_E7_CLOCK_MONOTONIC_ACTIVE, {E7_CLOCK_MONOTONIC_ACTIVE}"),
     ]
 }
 

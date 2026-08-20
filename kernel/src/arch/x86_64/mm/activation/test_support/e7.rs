@@ -44,6 +44,7 @@ struct E7SmokeRuntime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: 
     context_id: crate::task::ThreadContextId,
     cleanup: CleanupQueue<REGISTRY_OBJECTS>,
     abi_seen: bool,
+    clock_seen: bool,
     exit_seen: bool,
 }
 
@@ -424,6 +425,7 @@ fn build_smoke_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY:
         context_id,
         cleanup: CleanupQueue::new(),
         abi_seen: false,
+        clock_seen: false,
         exit_seen: false,
     }
 }
@@ -444,6 +446,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                 };
                 if status == DW_STATUS_SUCCESS {
                     self.abi_seen = true;
+                }
+                NativeSyscallResult::returning(status)
+            }
+            NativeSyscallRequest::ClockGet {
+                clock_id,
+                out_nanoseconds,
+            } => {
+                let status = {
+                    let mut user = self.active.current_process_address_space(self.process);
+                    crate::syscall::clock_get(&mut user, clock_id, out_nanoseconds)
+                };
+                if status == DW_STATUS_SUCCESS {
+                    self.clock_seen = true;
                 }
                 NativeSyscallResult::returning(status)
             }
@@ -489,7 +504,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 
     fn terminate_current(&mut self) -> ! {
-        if !self.abi_seen || !self.exit_seen {
+        if !self.abi_seen || !self.clock_seen || !self.exit_seen {
             fail(0x91);
         }
         let process = self
@@ -596,6 +611,10 @@ fn enter_smoke<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
 ) -> ! {
     if !crate::arch::x86_64::context::validate_target_continuation_roundtrip() {
         fail(0xbb);
+    }
+    let f3 = crate::time::run_target_deadline_probe().unwrap_or_else(|_| fail(0xbc));
+    if f3.after_ns <= f3.before_ns || f3.apic_timer_hz == 0 {
+        fail(0xbd);
     }
     let mut runtime = build_smoke_runtime(active);
     let exception_binding =

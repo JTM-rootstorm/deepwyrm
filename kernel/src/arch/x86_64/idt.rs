@@ -1,15 +1,15 @@
 //! x86_64 interrupt-descriptor-table construction and activation.
 //!
-//! The table installs only DW0-B exception and local-APIC terminal handlers.
-//! PIC, external, and future internal vectors remain absent until their
-//! owning subsystems supply an entry convention and a handler.
+//! The table installs DW0-B exception/APIC terminal handlers plus the F3
+//! returning local-APIC timer gate. PIC, external, and unowned internal
+//! vectors remain absent until their subsystems define entry semantics.
 
 use core::arch::asm;
 use core::mem::size_of;
 
 use crate::interrupt::{
-    EXCEPTION_VECTOR_RANGE, LOCAL_APIC_ERROR_VECTOR, LOCAL_APIC_SPURIOUS_VECTOR, VectorClass,
-    classify_vector,
+    EXCEPTION_VECTOR_RANGE, LOCAL_APIC_ERROR_VECTOR, LOCAL_APIC_SPURIOUS_VECTOR,
+    LOCAL_APIC_TIMER_VECTOR, VectorClass, classify_vector,
 };
 
 use super::exceptions::EXCEPTION_HANDLER_COUNT;
@@ -60,6 +60,7 @@ impl ExceptionHandlerTable {
 #[derive(Clone, Copy)]
 pub struct EarlyIdtHandlers {
     pub exceptions: ExceptionHandlerTable,
+    pub local_apic_timer: HandlerAddress,
     pub local_apic_error: HandlerAddress,
     pub local_apic_spurious: HandlerAddress,
 }
@@ -109,6 +110,8 @@ impl InterruptDescriptorTable {
                 selector,
             );
         }
+        entries[usize::from(LOCAL_APIC_TIMER_VECTOR)] =
+            InterruptGate::kernel_interrupt(handlers.local_apic_timer, None, selector);
         entries[usize::from(LOCAL_APIC_ERROR_VECTOR)] =
             InterruptGate::kernel_interrupt(handlers.local_apic_error, None, selector);
         entries[usize::from(LOCAL_APIC_SPURIOUS_VECTOR)] =
@@ -251,7 +254,10 @@ const fn is_kernel_handler_address(address: u64) -> bool {
 mod tests {
     use super::super::gdt::SegmentSelector;
     use super::*;
-    use crate::interrupt::{EXTERNAL_VECTOR_RANGE, INTERNAL_VECTOR_RANGE, LEGACY_PIC_VECTOR_RANGE};
+    use crate::interrupt::{
+        EXTERNAL_VECTOR_RANGE, INTERNAL_VECTOR_RANGE, LEGACY_PIC_VECTOR_RANGE,
+        LOCAL_APIC_TIMER_VECTOR,
+    };
 
     const HANDLER: HandlerAddress = match HandlerAddress::new(0xffff_ffff_8000_0100) {
         Ok(address) => address,
@@ -261,6 +267,7 @@ mod tests {
     fn handlers() -> EarlyIdtHandlers {
         EarlyIdtHandlers {
             exceptions: ExceptionHandlerTable::new([HANDLER; EXCEPTION_HANDLER_COUNT]),
+            local_apic_timer: HANDLER,
             local_apic_error: HANDLER,
             local_apic_spurious: HANDLER,
         }
@@ -280,6 +287,7 @@ mod tests {
         for vector in EXCEPTION_VECTOR_RANGE {
             assert!(idt.is_present(vector));
         }
+        assert!(idt.is_present(LOCAL_APIC_TIMER_VECTOR));
         assert!(idt.is_present(LOCAL_APIC_ERROR_VECTOR));
         assert!(idt.is_present(LOCAL_APIC_SPURIOUS_VECTOR));
         for vector in LEGACY_PIC_VECTOR_RANGE {
@@ -289,7 +297,7 @@ mod tests {
             assert!(!idt.is_present(vector));
         }
         for vector in INTERNAL_VECTOR_RANGE {
-            assert!(!idt.is_present(vector));
+            assert_eq!(idt.is_present(vector), vector == LOCAL_APIC_TIMER_VECTOR);
         }
     }
 

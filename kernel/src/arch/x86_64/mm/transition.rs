@@ -31,7 +31,7 @@ mod private;
 #[path = "activation.rs"]
 mod activation;
 
-#[cfg(all(feature = "test-support", target_os = "none", target_arch = "x86_64"))]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) use activation::LiveActivePagingTarget;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) use activation::activate_bootstrap_deep_paging;

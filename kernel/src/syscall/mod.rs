@@ -11,7 +11,7 @@ mod abi_bytes;
 mod adapters;
 
 #[cfg(deepwyrm_e7_guest)]
-pub(crate) use adapters::{CleanupQueue, abi_get_info, process_exit};
+pub(crate) use adapters::{CleanupQueue, abi_get_info, clock_get, process_exit};
 
 use deepwyrm_abi::{
     DW_STATUS_NOT_SUPPORTED, DwKnownSyscall, DwStatus, DwSyscallId, DwSyscallImplementationPhase,

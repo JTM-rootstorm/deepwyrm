@@ -43,6 +43,11 @@ pub(crate) mod syscall;
     reason = "DW0-E2 task payload authority precedes E3 scheduling and E5 syscall consumers"
 )]
 pub(crate) mod task;
+#[allow(
+    dead_code,
+    reason = "DW0-F3 time/deadline services precede F4 wait and F8 Timer consumers"
+)]
+pub(crate) mod time;
 
 #[cfg(feature = "test-support")]
 pub mod test_support;
@@ -179,7 +184,7 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
         // SAFETY: the raw entry and descriptor installer establish the sole-BSP,
         // CPL0, IF-clear, stationary stack/descriptor contract. No AP or other
         // mapper can run during this complete consuming activation session.
-        let active_paging = unsafe {
+        let mut active_paging = unsafe {
             arch::x86_64::mm::activate_bootstrap_deep_paging(
                 boot_info.paging_handoff(),
                 roles,
@@ -187,6 +192,17 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             )
         }
         .unwrap_or_else(|error| panic!("failed to activate Deep-owned paging: {error:?}"));
+        let pm_timer = {
+            let mut acpi =
+                arch::x86_64::acpi::AcpiScratchReader::new(&mut active_paging, &boot_info);
+            arch::x86_64::acpi::discover_pm_timer(
+                &mut acpi,
+                boot_info.header().acpi_rsdp_physical_address,
+            )
+            .unwrap_or_else(|error| panic!("DW0-F3 ACPI PM timer unavailable: {error:?}"))
+        };
+        time::initialize(&mut active_paging, pm_timer)
+            .unwrap_or_else(|error| panic!("failed to initialize DW0-F3 time service: {error:?}"));
         // SAFETY: the final Deep-owned root is active, the BSP remains at CPL0
         // with IF clear, and the finalized GDT/TSS already carries the guarded
         // E4 privilege-entry stack. No CPL3 execution exists before this point.
@@ -213,7 +229,7 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             // SAFETY: the active session remains owned on this stack, APs are
             // offline, and DW0-C2 has no scheduler or later phase to resume.
             unsafe {
-                core::arch::asm!("cli; hlt", options(nomem, nostack));
+                core::arch::asm!("sti", "hlt", options(nomem, nostack));
             }
         }
     }

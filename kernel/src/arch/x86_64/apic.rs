@@ -1,4 +1,4 @@
-//! x86_64 local-APIC discovery and bounded DW0-B bring-up.
+//! x86_64 local-APIC discovery, bounded DW0-B bring-up, and F3 one-shot timer control.
 //!
 //! This module never executes `CPUID`, `RDMSR`, `WRMSR`, or MMIO itself.
 //! Architecture entry code supplies captured register values and an access
@@ -32,9 +32,13 @@ const APIC_LVT_PERFORMANCE: u32 = 0x340;
 const APIC_LVT_LINT0: u32 = 0x350;
 const APIC_LVT_LINT1: u32 = 0x360;
 const APIC_LVT_ERROR: u32 = 0x370;
+const APIC_TIMER_INITIAL_COUNT: u32 = 0x380;
+const APIC_TIMER_CURRENT_COUNT: u32 = 0x390;
+const APIC_TIMER_DIVIDE_CONFIG: u32 = 0x3e0;
 
 const APIC_LVT_MASKED: u32 = 1 << 16;
 const APIC_SOFTWARE_ENABLE: u32 = 1 << 8;
+const APIC_TIMER_DIVIDE_BY_16: u32 = 0x3;
 const MINIMUM_DW0_LVT_MAX_ENTRY: u8 = 5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -211,6 +215,7 @@ pub enum LocalApicError<E> {
     X2ApicModeUnsupported,
     ApicBaseEnableNotLatched { observed: u64 },
     InsufficientLvtEntries { observed: u8, required: u8 },
+    ZeroTimerCount,
     Access(E),
 }
 
@@ -337,8 +342,13 @@ impl LocalApic {
         registers
             .write(APIC_TASK_PRIORITY, 0)
             .map_err(LocalApicError::Access)?;
+        registers
+            .write(
+                APIC_LVT_TIMER,
+                APIC_LVT_MASKED | u32::from(self.vectors.timer()),
+            )
+            .map_err(LocalApicError::Access)?;
         for offset in [
-            APIC_LVT_TIMER,
             APIC_LVT_THERMAL,
             APIC_LVT_PERFORMANCE,
             APIC_LVT_LINT0,
@@ -403,6 +413,91 @@ impl LocalApic {
         self.state
             .mark_online()
             .map_err(LocalApicError::InvalidState)
+    }
+
+    /// Configure the local APIC timer for masked one-shot counting at divide-by-16.
+    pub fn configure_one_shot_timer<R: XApicRegisterAccess>(
+        &mut self,
+        registers: &mut R,
+    ) -> Result<(), LocalApicError<R::Error>> {
+        self.require_state(ControllerState::Online)?;
+        registers
+            .write(APIC_TIMER_DIVIDE_CONFIG, APIC_TIMER_DIVIDE_BY_16)
+            .map_err(LocalApicError::Access)?;
+        registers
+            .write(
+                APIC_LVT_TIMER,
+                APIC_LVT_MASKED | u32::from(self.vectors.timer()),
+            )
+            .map_err(LocalApicError::Access)?;
+        registers
+            .write(APIC_TIMER_INITIAL_COUNT, 0)
+            .map_err(LocalApicError::Access)
+    }
+
+    /// Start a masked count for calibration; no timer interrupt is delivered.
+    pub fn start_timer_calibration<R: XApicRegisterAccess>(
+        &mut self,
+        registers: &mut R,
+        count: u32,
+    ) -> Result<(), LocalApicError<R::Error>> {
+        self.require_state(ControllerState::Online)?;
+        if count == 0 {
+            return Err(LocalApicError::ZeroTimerCount);
+        }
+        registers
+            .write(
+                APIC_LVT_TIMER,
+                APIC_LVT_MASKED | u32::from(self.vectors.timer()),
+            )
+            .map_err(LocalApicError::Access)?;
+        registers
+            .write(APIC_TIMER_INITIAL_COUNT, count)
+            .map_err(LocalApicError::Access)
+    }
+
+    pub fn timer_current_count<R: XApicRegisterAccess>(
+        &mut self,
+        registers: &mut R,
+    ) -> Result<u32, LocalApicError<R::Error>> {
+        self.require_state(ControllerState::Online)?;
+        registers
+            .read(APIC_TIMER_CURRENT_COUNT)
+            .map_err(LocalApicError::Access)
+    }
+
+    /// Arm an interrupting one-shot count. Count zero is rejected.
+    pub fn program_one_shot_timer<R: XApicRegisterAccess>(
+        &mut self,
+        registers: &mut R,
+        count: u32,
+    ) -> Result<(), LocalApicError<R::Error>> {
+        self.require_state(ControllerState::Online)?;
+        if count == 0 {
+            return Err(LocalApicError::ZeroTimerCount);
+        }
+        registers
+            .write(APIC_LVT_TIMER, u32::from(self.vectors.timer()))
+            .map_err(LocalApicError::Access)?;
+        registers
+            .write(APIC_TIMER_INITIAL_COUNT, count)
+            .map_err(LocalApicError::Access)
+    }
+
+    pub fn stop_timer<R: XApicRegisterAccess>(
+        &mut self,
+        registers: &mut R,
+    ) -> Result<(), LocalApicError<R::Error>> {
+        self.require_state(ControllerState::Online)?;
+        registers
+            .write(
+                APIC_LVT_TIMER,
+                APIC_LVT_MASKED | u32::from(self.vectors.timer()),
+            )
+            .map_err(LocalApicError::Access)?;
+        registers
+            .write(APIC_TIMER_INITIAL_COUNT, 0)
+            .map_err(LocalApicError::Access)
     }
 
     /// Signal end-of-interrupt after dispatch has completed.

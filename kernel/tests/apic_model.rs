@@ -31,6 +31,9 @@ const APIC_LVT_PERFORMANCE: u32 = 0x340;
 const APIC_LVT_LINT0: u32 = 0x350;
 const APIC_LVT_LINT1: u32 = 0x360;
 const APIC_LVT_ERROR: u32 = 0x370;
+const APIC_TIMER_INITIAL_COUNT: u32 = 0x380;
+const APIC_TIMER_CURRENT_COUNT: u32 = 0x390;
+const APIC_TIMER_DIVIDE_CONFIG: u32 = 0x3e0;
 const LVT_MASKED: u32 = 1 << 16;
 
 #[test]
@@ -47,7 +50,7 @@ fn vector_policy_covers_the_entire_idt_without_overlap() {
         (0x2f, VectorClass::LegacyPicReserved),
         (0x30, VectorClass::ExternalUnallocated),
         (0xdf, VectorClass::ExternalUnallocated),
-        (0xe0, VectorClass::InternalReserved),
+        (0xe0, VectorClass::LocalApicTimer),
         (0xfd, VectorClass::InternalReserved),
         (0xfe, VectorClass::LocalApicError),
         (0xff, VectorClass::LocalApicSpurious),
@@ -57,18 +60,21 @@ fn vector_policy_covers_the_entire_idt_without_overlap() {
     }
 
     assert_eq!(
-        LocalApicVectors::new(0xfd, 0xff),
+        LocalApicVectors::new(0xe0, 0xfd, 0xff),
         Err(VectorLayoutError::ErrorVectorOutsidePolicy)
     );
     assert_eq!(
-        LocalApicVectors::new(0xfe, 0xfd),
+        LocalApicVectors::new(0xe0, 0xfe, 0xfd),
         Err(VectorLayoutError::SpuriousVectorOutsidePolicy)
     );
     assert_eq!(
-        LocalApicVectors::new(0xff, 0xff),
+        LocalApicVectors::new(0xe0, 0xff, 0xff),
         Err(VectorLayoutError::DuplicateLocalApicVector)
     );
-    assert_eq!(LocalApicVectors::new(0xfe, 0xff), Ok(LocalApicVectors::DW0));
+    assert_eq!(
+        LocalApicVectors::new(0xe0, 0xfe, 0xff),
+        Ok(LocalApicVectors::DW0)
+    );
 }
 
 #[test]
@@ -153,8 +159,8 @@ fn prepare_masks_every_dw0_b_source_before_online_transition() {
     assert_eq!(apic.apic_id(), Some(0x2a));
     assert_eq!(apic.version().expect("version").maximum_lvt_entry, 5);
     assert_eq!(registers.value(APIC_TASK_PRIORITY), Some(0));
+    assert_eq!(registers.value(APIC_LVT_TIMER), Some(LVT_MASKED | 0xe0));
     for offset in [
-        APIC_LVT_TIMER,
         APIC_LVT_THERMAL,
         APIC_LVT_PERFORMANCE,
         APIC_LVT_LINT0,
@@ -178,8 +184,8 @@ fn online_transition_enables_only_error_and_spurious_vectors() {
     assert_eq!(apic.state(), ControllerState::Online);
     assert_eq!(registers.value(APIC_LVT_ERROR), Some(0xfe));
     assert_eq!(registers.value(APIC_SPURIOUS), Some((1 << 8) | 0xff));
+    assert_eq!(registers.value(APIC_LVT_TIMER), Some(LVT_MASKED | 0xe0));
     for offset in [
-        APIC_LVT_TIMER,
         APIC_LVT_THERMAL,
         APIC_LVT_PERFORMANCE,
         APIC_LVT_LINT0,
@@ -190,6 +196,37 @@ fn online_transition_enables_only_error_and_spurious_vectors() {
 
     apic.end_of_interrupt(&mut registers).expect("EOI online");
     assert_eq!(registers.value(APIC_EOI), Some(0));
+}
+
+#[test]
+fn one_shot_timer_programming_keeps_calibration_masked_and_rejects_zero() {
+    let mut apic = LocalApic::discovered(discovery(ApicMode::XApic), LocalApicVectors::DW0);
+    let mut registers = FakeRegisters::new();
+    apic.prepare(&mut registers).unwrap();
+    apic.bring_online(&mut registers).unwrap();
+    apic.configure_one_shot_timer(&mut registers).unwrap();
+    assert_eq!(registers.value(APIC_TIMER_DIVIDE_CONFIG), Some(0x3));
+    assert_eq!(registers.value(APIC_LVT_TIMER), Some(LVT_MASKED | 0xe0));
+    assert_eq!(registers.value(APIC_TIMER_INITIAL_COUNT), Some(0));
+    assert_eq!(
+        apic.start_timer_calibration(&mut registers, 0),
+        Err(LocalApicError::ZeroTimerCount)
+    );
+    apic.start_timer_calibration(&mut registers, u32::MAX)
+        .unwrap();
+    assert_eq!(registers.value(APIC_LVT_TIMER), Some(LVT_MASKED | 0xe0));
+    registers
+        .values
+        .insert(APIC_TIMER_CURRENT_COUNT, 0xf000_0000);
+    assert_eq!(
+        apic.timer_current_count(&mut registers).unwrap(),
+        0xf000_0000
+    );
+    apic.program_one_shot_timer(&mut registers, 1234).unwrap();
+    assert_eq!(registers.value(APIC_LVT_TIMER), Some(0xe0));
+    assert_eq!(registers.value(APIC_TIMER_INITIAL_COUNT), Some(1234));
+    apic.stop_timer(&mut registers).unwrap();
+    assert_eq!(registers.value(APIC_LVT_TIMER), Some(LVT_MASKED | 0xe0));
 }
 
 #[test]

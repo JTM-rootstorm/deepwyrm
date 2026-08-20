@@ -511,6 +511,14 @@ impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
         ((self.scratch.control_page >> 12) & 0x1ff) as usize
     }
 
+    fn mmio_page(&self) -> u64 {
+        self.scratch.control_page + PAGE_SIZE
+    }
+
+    fn mmio_leaf_index(&self) -> usize {
+        ((self.mmio_page() >> 12) & 0x1ff) as usize
+    }
+
     fn scratch_leaf_address(&self) -> u64 {
         self.scratch.control_page + (self.scratch_leaf_index() as u64) * 8
     }
@@ -591,6 +599,60 @@ impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
         Ok(())
     }
 
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    #[allow(
+        unsafe_code,
+        reason = "F3 reads bounded firmware table bytes through the authenticated transient Deep scratch leaf"
+    )]
+    fn read_physical_bytes(
+        &mut self,
+        frame: FrameAddress,
+        offset: usize,
+        destination: &mut [u8],
+    ) -> Result<(), LiveActiveTargetError> {
+        assert!(!self.poisoned, "active Deep scratch mapper is poisoned");
+        if frame.address() == self.scratch.pt.physical_start()
+            || offset
+                .checked_add(destination.len())
+                .is_none_or(|end| end > PAGE_SIZE as usize)
+        {
+            return Err(LiveActiveTargetError::ReservedScratchEntry);
+        }
+        if destination.is_empty() {
+            return Ok(());
+        }
+        let installed = frame.address() | PRESENT | NO_EXECUTE;
+        let leaf = self.scratch_leaf_address();
+        if self.io.compare_exchange(leaf, 0, installed).is_err() {
+            return Err(LiveActiveTargetError::Busy);
+        }
+        self.io.invalidate(self.scratch.window_page);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (self.scratch.window_page as usize + offset) as *const u8,
+                destination.as_mut_ptr(),
+                destination.len(),
+            );
+        }
+        self.restore_scratch_mapping(installed);
+        Ok(())
+    }
+
+    fn install_mmio_frame(&mut self, frame: FrameAddress) -> Result<u64, LiveActiveTargetError> {
+        assert!(!self.poisoned, "active Deep scratch mapper is poisoned");
+        if frame.address() == self.scratch.pt.physical_start() {
+            return Err(LiveActiveTargetError::ReservedScratchEntry);
+        }
+        let leaf = self.scratch.control_page + (self.mmio_leaf_index() as u64) * 8;
+        let installed =
+            frame.address() | PRESENT | WRITABLE | WRITE_THROUGH | CACHE_DISABLE | NO_EXECUTE;
+        if self.io.compare_exchange(leaf, 0, installed).is_err() {
+            return Err(LiveActiveTargetError::Busy);
+        }
+        self.io.invalidate(self.mmio_page());
+        Ok(self.mmio_page())
+    }
+
     fn validate_location(
         &self,
         table: FrameAddress,
@@ -600,7 +662,9 @@ impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
             return Err(LiveActiveTargetError::InvalidIndex);
         }
         if table.address() == self.scratch.pt.physical_start()
-            && (index == self.scratch_leaf_index() || index == self.scratch_control_index())
+            && (index == self.scratch_leaf_index()
+                || index == self.scratch_control_index()
+                || index == self.mmio_leaf_index())
         {
             return Err(LiveActiveTargetError::ReservedScratchEntry);
         }
@@ -1134,6 +1198,40 @@ unsafe impl<'a, 'handoff, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
 impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ActiveDeepPaging<LiveActivePagingTarget<'root, RANGE_CAPACITY, ROLE_CAPACITY>>
 {
+    pub(crate) fn read_physical_bytes(
+        &mut self,
+        physical_start: u64,
+        destination: &mut [u8],
+    ) -> Result<(), LiveActiveTargetError> {
+        let mut physical = physical_start;
+        let mut copied = 0_usize;
+        while copied < destination.len() {
+            let page = physical & !(PAGE_SIZE - 1);
+            let offset = usize::try_from(physical & (PAGE_SIZE - 1))
+                .map_err(|_| LiveActiveTargetError::InvalidIndex)?;
+            let take = (PAGE_SIZE as usize - offset).min(destination.len() - copied);
+            let frame = FrameAddress::new(page, self.root.physical_limit())
+                .map_err(|_| LiveActiveTargetError::InvalidIndex)?;
+            self.target.scratch.read_physical_bytes(
+                frame,
+                offset,
+                &mut destination[copied..copied + take],
+            )?;
+            physical = physical
+                .checked_add(take as u64)
+                .ok_or(LiveActiveTargetError::InvalidIndex)?;
+            copied += take;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn install_kernel_mmio_page(
+        &mut self,
+        frame: FrameAddress,
+    ) -> Result<u64, LiveActiveTargetError> {
+        self.target.scratch.install_mmio_frame(frame)
+    }
+
     pub(crate) fn current_process_address_space(
         &mut self,
         process: crate::task::ProcessKey,

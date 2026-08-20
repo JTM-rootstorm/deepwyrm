@@ -10,13 +10,14 @@
 )]
 
 use deepwyrm_abi::{
-    DW_ABI_INFO_V1_SIZE, DW_BASE_PAGE_SIZE, DW_MEMORY_OBJECT_INFO_V1_SIZE, DW_OBJECT_INFO_BASIC_V1,
-    DW_OBJECT_INFO_MEMORY_OBJECT_V1, DW_OBJECT_INFO_TASK_STATE_V1, DW_OBJECT_INFO_V1_SIZE,
-    DW_RIGHT_EXECUTE, DW_RIGHT_MODIFY, DW_STATUS_ACCESS_DENIED, DW_STATUS_BAD_ADDRESS,
-    DW_STATUS_BAD_HANDLE, DW_STATUS_BAD_STATE, DW_STATUS_BUFFER_TOO_SMALL,
-    DW_STATUS_INVALID_ARGUMENT, DW_STATUS_NO_RESOURCES, DW_STATUS_NOT_SUPPORTED, DW_STATUS_SUCCESS,
-    DW_STATUS_WRONG_OBJECT_TYPE, DW_TASK_STATE_EXITED, DW_TERMINATION_AUTHORIZED, DwHandle,
-    DwRights, DwStatus, DwTerminationReason, DwUserAddress,
+    DW_ABI_INFO_V1_SIZE, DW_BASE_PAGE_SIZE, DW_CLOCK_MONOTONIC_ACTIVE,
+    DW_MEMORY_OBJECT_INFO_V1_SIZE, DW_OBJECT_INFO_BASIC_V1, DW_OBJECT_INFO_MEMORY_OBJECT_V1,
+    DW_OBJECT_INFO_TASK_STATE_V1, DW_OBJECT_INFO_V1_SIZE, DW_RIGHT_EXECUTE, DW_RIGHT_MODIFY,
+    DW_STATUS_ACCESS_DENIED, DW_STATUS_BAD_ADDRESS, DW_STATUS_BAD_HANDLE, DW_STATUS_BAD_STATE,
+    DW_STATUS_BUFFER_TOO_SMALL, DW_STATUS_INVALID_ARGUMENT, DW_STATUS_NO_RESOURCES,
+    DW_STATUS_NOT_SUPPORTED, DW_STATUS_SUCCESS, DW_STATUS_WRONG_OBJECT_TYPE, DW_TASK_STATE_EXITED,
+    DW_TERMINATION_AUTHORIZED, DwClockId, DwHandle, DwRights, DwStatus, DwTerminationReason,
+    DwUserAddress,
 };
 
 use crate::handle::{AcceptedObjectTypes, HandleTableError, ResolvedHandle};
@@ -167,6 +168,38 @@ pub(crate) fn abi_get_info<U: UserPageAccess>(
         Ok(()) => DW_STATUS_SUCCESS,
         Err(error) => usercopy_status(error),
     }
+}
+
+pub(crate) fn clock_get_with<U: UserPageAccess>(
+    user: &mut U,
+    clock_id: DwClockId,
+    out_nanoseconds: DwUserAddress,
+    read_clock: impl FnOnce() -> Result<u64, DwStatus>,
+) -> DwStatus {
+    if clock_id != DW_CLOCK_MONOTONIC_ACTIVE {
+        return DW_STATUS_NOT_SUPPORTED;
+    }
+    let output = match preflight_output(user, out_nanoseconds, 8, 8) {
+        Ok(output) => output,
+        Err(status) => return status,
+    };
+    let nanoseconds = match read_clock() {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    output.commit(&encode_u64(nanoseconds));
+    DW_STATUS_SUCCESS
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn clock_get<U: UserPageAccess>(
+    user: &mut U,
+    clock_id: DwClockId,
+    out_nanoseconds: DwUserAddress,
+) -> DwStatus {
+    clock_get_with(user, clock_id, out_nanoseconds, || {
+        crate::time::monotonic_now().map_err(|_| DW_STATUS_BAD_STATE)
+    })
 }
 
 fn handle_status(error: HandleTableError) -> DwStatus {

@@ -43,6 +43,23 @@ _start:
     cmpq $DW_E7_ABI_INFO_SIZE, (%r10)
     jne .Le7_fail
 
+    /* F3 regression: the active monotonic clock is available from real CPL3. */
+    movl $DW_E7_SYSCALL_CLOCK_GET, %edi
+    movl $DW_E7_CLOCK_MONOTONIC_ACTIVE, %esi
+    movabsq $DW_E7_USER_CLOCK_ADDRESS, %rdx
+    xorl %ecx, %ecx
+    xorl %r8d, %r8d
+    xorl %r9d, %r9d
+    subq $16, %rsp
+    movq $0, (%rsp)
+    callq dw_syscall6
+    addq $16, %rsp
+    testl %eax, %eax
+    jne .Le7_fail
+    movabsq $DW_E7_USER_CLOCK_ADDRESS, %r10
+    cmpq $0, (%r10)
+    je .Le7_fail
+
     /* Unknown numeric dispatch must return NOT_SUPPORTED and preserve return. */
     movl $DW_E7_UNKNOWN_SYSCALL, %edi
     xorl %esi, %esi

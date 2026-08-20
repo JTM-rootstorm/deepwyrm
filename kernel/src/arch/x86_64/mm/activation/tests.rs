@@ -499,7 +499,7 @@ fn active_scratch_error_restores_private_leaf_without_owned_write_or_requested_i
 }
 
 #[test]
-fn active_scratch_reserves_window_and_control_entries_without_io() {
+fn active_scratch_reserves_window_control_and_mmio_entries_without_io() {
     let fixture = graph_fixture();
     let mut target = fake_active_scratch(fixture.scratch_pt, None);
     let table = FrameAddress::new(
@@ -507,13 +507,40 @@ fn active_scratch_reserves_window_and_control_entries_without_io() {
         fixture.capabilities.physical_limit(),
     )
     .unwrap();
-    for index in [target.scratch_leaf_index(), target.scratch_control_index()] {
+    for index in [
+        target.scratch_leaf_index(),
+        target.scratch_control_index(),
+        target.mmio_leaf_index(),
+    ] {
         assert_eq!(
             target.read_entry(table, index),
             Err(LiveActiveTargetError::ReservedScratchEntry)
         );
     }
     assert!(target.io.events.is_empty());
+}
+
+#[test]
+fn active_scratch_installs_one_uc_nx_mmio_leaf_without_consuming_window() {
+    let fixture = graph_fixture();
+    let mut target = fake_active_scratch(fixture.scratch_pt, None);
+    let frame = FrameAddress::new(0xfee0_0000, fixture.capabilities.physical_limit()).unwrap();
+    let page = target.install_mmio_frame(frame).unwrap();
+    assert_eq!(page, FIXTURE_SCRATCH + 2 * PAGE_SIZE);
+    let leaf = target.scratch.control_page + (target.mmio_leaf_index() as u64) * 8;
+    assert_eq!(
+        target.io.memory.get(&leaf).copied(),
+        Some(0xfee0_0000 | PRESENT | WRITABLE | WRITE_THROUGH | CACHE_DISABLE | NO_EXECUTE)
+    );
+    assert!(
+        target.io.events.iter().any(|event| {
+            matches!(event, ScratchIoEvent::Invalidate(address) if *address == page)
+        })
+    );
+    assert_eq!(
+        target.install_mmio_frame(frame),
+        Err(LiveActiveTargetError::Busy)
+    );
 }
 
 #[test]

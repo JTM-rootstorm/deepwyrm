@@ -432,7 +432,11 @@ extern "sysv64" fn dw_x86_64_exception_dispatch(
     loop {{ core::hint::spin_loop(); }}
 }}
 
-#[allow(unsafe_code, reason = "fixed symbol required by the audited APIC assembly boundary")]
+#[allow(unsafe_code, reason = "fixed symbol required by the audited returning timer assembly boundary")]
+#[unsafe(no_mangle)]
+extern "sysv64" fn dw_x86_64_timer_interrupt_dispatch() {{}}
+
+#[allow(unsafe_code, reason = "fixed symbol required by the audited terminal APIC assembly boundary")]
 #[unsafe(no_mangle)]
 extern "sysv64" fn dw_x86_64_terminal_interrupt_dispatch(_vector: u64) -> ! {{
     loop {{ core::hint::spin_loop(); }}
@@ -537,9 +541,11 @@ dw_test_bss_probe:
         "dw_x86_64_exception_handler_table",
         "dw_x86_64_exception_vector_0",
         "dw_x86_64_exception_vector_31",
+        "dw_x86_64_apic_timer_entry",
         "dw_x86_64_apic_error_entry",
         "dw_x86_64_apic_spurious_entry",
         "dw_x86_64_exception_dispatch",
+        "dw_x86_64_timer_interrupt_dispatch",
         "dw_x86_64_terminal_interrupt_dispatch",
         "__dw_ist_region_start",
         "__dw_ist_region_end",

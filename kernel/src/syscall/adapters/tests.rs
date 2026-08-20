@@ -100,6 +100,51 @@ fn abi_get_info_reports_size_and_writes_only_after_pointer_validation() {
     assert_eq!(user.bytes, before);
 }
 
+#[test]
+fn clock_get_validates_domain_and_output_before_reading_clock() {
+    let mut user = FakeUserMemory::new();
+    let mut called = false;
+    assert_eq!(
+        clock_get_with(
+            &mut user,
+            deepwyrm_abi::DW_CLOCK_BOOTTIME,
+            DwUserAddress(BASE + 0x40),
+            || {
+                called = true;
+                Ok(1)
+            },
+        ),
+        DW_STATUS_NOT_SUPPORTED
+    );
+    assert!(!called);
+
+    user.deny_write = true;
+    assert_eq!(
+        clock_get_with(
+            &mut user,
+            deepwyrm_abi::DW_CLOCK_MONOTONIC_ACTIVE,
+            DwUserAddress(BASE + 0x40),
+            || {
+                called = true;
+                Ok(2)
+            },
+        ),
+        DW_STATUS_BAD_ADDRESS
+    );
+    assert!(!called);
+    user.deny_write = false;
+    assert_eq!(
+        clock_get_with(
+            &mut user,
+            deepwyrm_abi::DW_CLOCK_MONOTONIC_ACTIVE,
+            DwUserAddress(BASE + 0x40),
+            || Ok(0x1122_3344_5566_7788),
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(u64_at(&user, BASE + 0x40), 0x1122_3344_5566_7788);
+}
+
 type Tasks = TaskAuthority<2, 2, 2, 8>;
 
 fn process_fixture() -> (ObjectRegistry<16>, Tasks, ProcessKey, DwHandle) {

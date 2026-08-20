@@ -102,6 +102,62 @@ NO_ERROR 31
     ud2
 
 .p2align 4
+.globl dw_x86_64_apic_timer_entry
+.type dw_x86_64_apic_timer_entry,@function
+dw_x86_64_apic_timer_entry:
+    /* Interrupt gates enter with IF clear. Preserve the complete interrupted GPR set. */
+    cld
+    pushq %rax
+    pushq %rbx
+    pushq %rcx
+    pushq %rdx
+    pushq %rsi
+    pushq %rdi
+    pushq %rbp
+    pushq %r8
+    pushq %r9
+    pushq %r10
+    pushq %r11
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    /* Saved CS follows RIP after the 15 private register words. */
+    movq 128(%rsp), %rax
+    testb $3, %al
+    jz .Lapic_timer_kernel_origin
+    swapgs
+    movq %rsp, %r12
+    andq $-16, %rsp
+    callq dw_x86_64_timer_interrupt_dispatch
+    movq %r12, %rsp
+    swapgs
+    jmp .Lapic_timer_restore
+.Lapic_timer_kernel_origin:
+    movq %rsp, %r12
+    andq $-16, %rsp
+    callq dw_x86_64_timer_interrupt_dispatch
+    movq %r12, %rsp
+.Lapic_timer_restore:
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %r11
+    popq %r10
+    popq %r9
+    popq %r8
+    popq %rbp
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    popq %rcx
+    popq %rbx
+    popq %rax
+    iretq
+.size dw_x86_64_apic_timer_entry, .-dw_x86_64_apic_timer_entry
+
+.p2align 4
 .globl dw_x86_64_apic_error_entry
 .type dw_x86_64_apic_error_entry,@function
 dw_x86_64_apic_error_entry:
@@ -114,9 +170,8 @@ dw_x86_64_apic_error_entry:
 .globl dw_x86_64_apic_spurious_entry
 .type dw_x86_64_apic_spurious_entry,@function
 dw_x86_64_apic_spurious_entry:
-    pushq $0
-    pushq $0xff
-    jmp .Lterminal_interrupt_common
+    /* APIC spurious delivery has no source to acknowledge and returns directly. */
+    iretq
 .size dw_x86_64_apic_spurious_entry, .-dw_x86_64_apic_spurious_entry
 
 .p2align 4

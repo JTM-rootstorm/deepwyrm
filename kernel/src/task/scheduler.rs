@@ -1,6 +1,6 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::sync::SpinMutex;
+use crate::sync::IrqSpinMutex;
 
 use super::ThreadKey;
 
@@ -187,13 +187,13 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
 /// The private spin lock never escapes a method call. Callers therefore cannot
 /// nest scheduler ownership around task finalization or process handle-table work.
 pub(crate) struct CooperativeScheduler<const CAPACITY: usize> {
-    state: SpinMutex<SchedulerState<CAPACITY>>,
+    state: IrqSpinMutex<SchedulerState<CAPACITY>>,
 }
 
 impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     pub(crate) fn new() -> Self {
         Self {
-            state: SpinMutex::new(SchedulerState::new()),
+            state: IrqSpinMutex::new(SchedulerState::new()),
         }
     }
 

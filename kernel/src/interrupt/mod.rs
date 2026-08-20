@@ -1,8 +1,8 @@
 //! Architecture-neutral interrupt-controller state and vector ownership.
 //!
-//! DW0-B owns only the bring-up model. Interrupt dispatch, scheduler coupling,
-//! timer services, device IRQ allocation, and userspace interrupt objects are
-//! deliberately outside this module.
+//! DW0-B established controller bring-up and vector classes; F3 additionally
+//! reserves the local-APIC timer vector. Timer service state, scheduler coupling,
+//! device IRQ allocation, and userspace interrupt objects remain elsewhere.
 
 /// CPU exception vectors installed by the descriptor-table implementation.
 pub const EXCEPTION_VECTOR_RANGE: core::ops::RangeInclusive<u8> = 0x00..=0x1f;
@@ -13,6 +13,7 @@ pub const EXTERNAL_VECTOR_RANGE: core::ops::RangeInclusive<u8> = 0x30..=0xdf;
 /// Pool reserved for later timer, IPI, and other kernel-internal interrupts.
 pub const INTERNAL_VECTOR_RANGE: core::ops::RangeInclusive<u8> = 0xe0..=0xfd;
 
+pub const LOCAL_APIC_TIMER_VECTOR: u8 = 0xe0;
 pub const LOCAL_APIC_ERROR_VECTOR: u8 = 0xfe;
 pub const LOCAL_APIC_SPURIOUS_VECTOR: u8 = 0xff;
 
@@ -22,6 +23,7 @@ pub enum VectorClass {
     LegacyPicReserved,
     ExternalUnallocated,
     InternalReserved,
+    LocalApicTimer,
     LocalApicError,
     LocalApicSpurious,
 }
@@ -32,7 +34,8 @@ pub const fn classify_vector(vector: u8) -> VectorClass {
         0x00..=0x1f => VectorClass::Exception,
         0x20..=0x2f => VectorClass::LegacyPicReserved,
         0x30..=0xdf => VectorClass::ExternalUnallocated,
-        0xe0..=0xfd => VectorClass::InternalReserved,
+        LOCAL_APIC_TIMER_VECTOR => VectorClass::LocalApicTimer,
+        0xe1..=0xfd => VectorClass::InternalReserved,
         LOCAL_APIC_ERROR_VECTOR => VectorClass::LocalApicError,
         LOCAL_APIC_SPURIOUS_VECTOR => VectorClass::LocalApicSpurious,
     }
@@ -42,25 +45,31 @@ pub const fn classify_vector(vector: u8) -> VectorClass {
 pub enum VectorLayoutError {
     ErrorVectorOutsidePolicy,
     SpuriousVectorOutsidePolicy,
+    TimerVectorOutsidePolicy,
     DuplicateLocalApicVector,
 }
 
 /// Descriptor-table/APIC agreement for vectors owned by the local APIC.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LocalApicVectors {
+    timer: u8,
     error: u8,
     spurious: u8,
 }
 
 impl LocalApicVectors {
     pub const DW0: Self = Self {
+        timer: LOCAL_APIC_TIMER_VECTOR,
         error: LOCAL_APIC_ERROR_VECTOR,
         spurious: LOCAL_APIC_SPURIOUS_VECTOR,
     };
 
-    pub const fn new(error: u8, spurious: u8) -> Result<Self, VectorLayoutError> {
-        if error == spurious {
+    pub const fn new(timer: u8, error: u8, spurious: u8) -> Result<Self, VectorLayoutError> {
+        if timer == error || timer == spurious || error == spurious {
             return Err(VectorLayoutError::DuplicateLocalApicVector);
+        }
+        if timer != LOCAL_APIC_TIMER_VECTOR {
+            return Err(VectorLayoutError::TimerVectorOutsidePolicy);
         }
         if error != LOCAL_APIC_ERROR_VECTOR {
             return Err(VectorLayoutError::ErrorVectorOutsidePolicy);
@@ -68,7 +77,16 @@ impl LocalApicVectors {
         if spurious != LOCAL_APIC_SPURIOUS_VECTOR {
             return Err(VectorLayoutError::SpuriousVectorOutsidePolicy);
         }
-        Ok(Self { error, spurious })
+        Ok(Self {
+            timer,
+            error,
+            spurious,
+        })
+    }
+
+    #[must_use]
+    pub const fn timer(self) -> u8 {
+        self.timer
     }
 
     #[must_use]

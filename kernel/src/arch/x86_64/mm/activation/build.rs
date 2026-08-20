@@ -207,9 +207,13 @@ pub(super) fn build_and_bind_deep_root<
         let control_page = window_page
             .checked_add(PAGE_SIZE)
             .ok_or(DeepRootBuildError::InvalidKernelLayout)?;
+        let mmio_page = control_page
+            .checked_add(PAGE_SIZE)
+            .ok_or(DeepRootBuildError::InvalidKernelLayout)?;
         if window_page & ADDRESS_OFFSET_MASK != 0
-            || ((window_page >> 12) & 0x1ff) == 0x1ff
+            || ((window_page >> 12) & 0x1ff) >= 0x1fe
             || window_page >> 21 != control_page >> 21
+            || window_page >> 21 != mmio_page >> 21
             || validate_ist_layout(&segments, window_page, control_page, ist).is_err()
             || validate_thread_stack_layout(&segments, window_page, control_page, &thread_stacks)
                 .is_err()

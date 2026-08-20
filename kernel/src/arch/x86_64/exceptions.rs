@@ -663,9 +663,9 @@ pub(crate) unsafe extern "sysv64" fn dw_x86_64_exception_dispatch(
     }
 }
 
-/// Terminal handler for the APIC error and spurious vectors. These vectors do
-/// not use the exception frame convention and are never mistaken for native
-/// process exceptions.
+/// Terminal handler for the local-APIC error vector. F3 gives the spurious
+/// vector a direct returning assembly path and the timer vector its own bounded
+/// returning dispatcher, so neither reaches this terminal Rust boundary.
 ///
 /// # Safety
 ///
