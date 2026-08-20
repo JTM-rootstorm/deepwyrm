@@ -39,7 +39,7 @@ pub(crate) use pm_timer::{
 )]
 pub(crate) use live::{
     DeadlineRegistrationFailure, DeadlineWakeTarget, LiveTimeError, bind_deadline_wake_target,
-    initialize, monotonic_now, register_deadline,
+    cancel_deadline, initialize, monotonic_now, register_deadline,
 };
 #[cfg(all(feature = "test-support", target_os = "none", target_arch = "x86_64"))]
 #[allow(

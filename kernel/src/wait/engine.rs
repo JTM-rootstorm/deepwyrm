@@ -51,6 +51,47 @@ pub(crate) trait WaitDeadlineAuthority {
     ) -> Result<(), WaitDeadlineError>;
 }
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) struct LiveWaitDeadlineAuthority;
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+impl WaitDeadlineAuthority for LiveWaitDeadlineAuthority {
+    fn register_wait_deadline(
+        &mut self,
+        deadline_ns: u64,
+        wake: BlockWakeKey,
+    ) -> Result<DeadlineRegistration, WaitDeadlineError> {
+        let before = crate::time::monotonic_now().map_err(|_| WaitDeadlineError::Fault)?;
+        if deadline_ns <= before {
+            return Err(WaitDeadlineError::Expired);
+        }
+        match crate::time::register_deadline(deadline_ns, wake) {
+            Ok(registration) => Ok(registration),
+            Err(failure) => {
+                let (error, _wake) = failure.into_parts();
+                if error == crate::time::LiveTimeError::Deadline {
+                    let after =
+                        crate::time::monotonic_now().map_err(|_| WaitDeadlineError::Fault)?;
+                    if deadline_ns <= after {
+                        Err(WaitDeadlineError::Expired)
+                    } else {
+                        Err(WaitDeadlineError::Capacity)
+                    }
+                } else {
+                    Err(WaitDeadlineError::Fault)
+                }
+            }
+        }
+    }
+
+    fn cancel_wait_deadline(
+        &mut self,
+        registration: DeadlineRegistration,
+    ) -> Result<(), WaitDeadlineError> {
+        crate::time::cancel_deadline(registration).map_err(|_| WaitDeadlineError::Fault)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WaitSelection {
     pub(crate) index: u32,

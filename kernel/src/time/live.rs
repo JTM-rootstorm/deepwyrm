@@ -210,6 +210,14 @@ impl LiveTimeState {
         }
         Ok(registration)
     }
+
+    fn cancel_deadline(&mut self, registration: DeadlineRegistration) -> Result<(), LiveTimeError> {
+        let sample = self.sample_now()?;
+        self.deadlines
+            .cancel_if_live(registration)
+            .map_err(|_| LiveTimeError::Deadline)?;
+        self.reprogram(sample)
+    }
 }
 
 struct TimeStorage(UnsafeCell<MaybeUninit<IrqSpinMutex<LiveTimeState>>>);
@@ -411,6 +419,13 @@ pub(crate) fn register_deadline(
         return Err(registration_failure(LiveTimeError::Clock, wake));
     };
     state.lock().register_deadline(deadline_ns, wake)
+}
+
+pub(crate) fn cancel_deadline(registration: DeadlineRegistration) -> Result<(), LiveTimeError> {
+    let Some(state) = live_state() else {
+        return Err(LiveTimeError::Clock);
+    };
+    state.lock().cancel_deadline(registration)
 }
 
 #[allow(
