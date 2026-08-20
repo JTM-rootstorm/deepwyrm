@@ -478,7 +478,6 @@ pub(crate) struct WaitBeginContext<
     >,
     pub(crate) execution: &'a ExecutionDomain<EXECUTION>,
     pub(crate) operations: &'a mut WaitOperationRegistry<OUTPUT, EXECUTION>,
-    pub(crate) deadline_authority: Option<&'a mut dyn WaitDeadlineAuthority>,
     pub(crate) process: ProcessKey,
     pub(crate) thread: ThreadKey,
 }
@@ -513,13 +512,13 @@ pub(crate) fn begin_registered_wait<
         WAITERS,
         EXECUTION,
     >,
+    mut deadline_authority: Option<&mut dyn WaitDeadlineAuthority>,
 ) -> Result<WaitBeginOutcome<OUTPUT>, WaitBeginFailure<OUTPUT>> {
     let WaitBeginContext {
         registry,
         sources,
         execution,
         operations,
-        mut deadline_authority,
         process,
         thread,
     } = context;
@@ -1092,10 +1091,10 @@ mod tests {
                 },
                 execution: &execution,
                 operations: &mut operations,
-                deadline_authority: None,
                 process,
                 thread,
             },
+            None,
         )
         .unwrap_or_else(|failure| panic!("wait begin failed: {:?}", failure.error))
         {
@@ -1153,10 +1152,10 @@ mod tests {
                 },
                 execution: &execution,
                 operations: &mut operations,
-                deadline_authority: None,
                 process,
                 thread,
             },
+            None,
         )
         .unwrap_or_else(|failure| panic!("wait begin failed: {:?}", failure.error))
         {
@@ -1322,10 +1321,10 @@ mod tests {
                 },
                 execution: &execution,
                 operations: &mut operations,
-                deadline_authority: None,
                 process,
                 thread,
             },
+            None,
         )
         .unwrap_or_else(|failure| panic!("ready NOW wait failed: {:?}", failure.error))
         {
@@ -1355,10 +1354,10 @@ mod tests {
                 },
                 execution: &execution,
                 operations: &mut operations,
-                deadline_authority: None,
                 process,
                 thread,
             },
+            None,
         )
         .unwrap_or_else(|failure| panic!("NOW timeout failed: {:?}", failure.error))
         {
@@ -1402,10 +1401,10 @@ mod tests {
                 },
                 execution: &execution,
                 operations: &mut operations,
-                deadline_authority: Some(&mut deadlines),
                 process,
                 thread,
             },
+            Some(&mut deadlines),
         )
         .unwrap_or_else(|failure| panic!("finite wait begin failed: {:?}", failure.error))
         {
@@ -1473,10 +1472,10 @@ mod tests {
                 },
                 execution: &execution,
                 operations: &mut operations,
-                deadline_authority: Some(&mut deadlines),
                 process,
                 thread,
             },
+            Some(&mut deadlines),
         )
         .unwrap_or_else(|failure| panic!("pre-block timeout failed: {:?}", failure.error))
         {

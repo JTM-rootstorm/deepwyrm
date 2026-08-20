@@ -18,10 +18,12 @@ use deepwyrm_abi::{
     DW_RIGHT_READ, DW_RIGHT_SIGNAL, DW_RIGHT_WRITE, DW_STATUS_ACCESS_DENIED, DW_STATUS_BAD_ADDRESS,
     DW_STATUS_BAD_HANDLE, DW_STATUS_BAD_STATE, DW_STATUS_BUFFER_TOO_SMALL,
     DW_STATUS_INVALID_ARGUMENT, DW_STATUS_NO_RESOURCES, DW_STATUS_NOT_SUPPORTED,
-    DW_STATUS_PEER_CLOSED, DW_STATUS_SUCCESS, DW_STATUS_WOULD_BLOCK, DW_STATUS_WRONG_OBJECT_TYPE,
-    DW_TASK_STATE_EXITED, DW_TERMINATION_AUTHORIZED, DwChannelReceiveResultV1, DwClockId, DwHandle,
-    DwHandleTransferV1, DwReceivedHandleInfoV1, DwRights, DwStatus, DwTerminationReason,
-    DwUserAddress,
+    DW_STATUS_PEER_CLOSED, DW_STATUS_SUCCESS, DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK,
+    DW_STATUS_WRONG_OBJECT_TYPE, DW_TASK_STATE_EXITED, DW_TERMINATION_AUTHORIZED,
+    DW_WAIT_MANY_MAX_ITEMS, DW_WAIT_MODE_ALL, DW_WAIT_MODE_ANY, DW_WAIT_RESULT_V1_SIZE,
+    DwChannelReceiveResultV1, DwClockId, DwDeadline, DwHandle, DwHandleTransferV1,
+    DwReceivedHandleInfoV1, DwRights, DwSignals, DwStatus, DwTerminationReason, DwUserAddress,
+    DwWaitItemV1, DwWaitResultV1,
 };
 
 use crate::handle::{
@@ -38,21 +40,27 @@ use crate::memory::usercopy::{
 };
 use crate::object::{FinalRelease, HandleRef, InternalRef, ObjectRegistry, ObjectRegistryError};
 use crate::task::{
-    ExecutionDomain, ExecutionResourceError, ProcessExitEffects, ProcessKey, RetiredExitPins,
-    SchedulerError, SchedulerThreadState, StartThreadError, TaskAuthority, TaskCreateError,
-    TaskError, TaskGroupKey, TaskGroupTerminationEffects, ThreadKey, ThreadStartState,
+    BlockWakeKey, ExecutionDomain, ExecutionResourceError, ProcessExitEffects, ProcessKey,
+    RetiredExitPins, ScheduleDecision, SchedulerError, SchedulerThreadState, StartThreadError,
+    TaskAuthority, TaskCreateError, TaskError, TaskGroupKey, TaskGroupTerminationEffects,
+    ThreadKey, ThreadStartState,
 };
 use crate::wait::{
     EventAuthority, EventCreateError, EventKey, WaitError, WaitRegistry, WakeBatch,
+    engine::{
+        ResolvedWaitSet, WaitBeginContext, WaitBeginError, WaitBeginOutcome, WaitDeadline,
+        WaitDeadlineAuthority, WaitSetError, WaitSources, begin_registered_wait,
+    },
+    operation::WaitOperationRegistry,
     validate_event_signal_masks,
 };
 
 use super::native::SyscallControl;
 
 use super::abi_bytes::{
-    HANDLE_TRANSFER_BYTES, THREAD_START_BYTES, decode_handle_transfer, decode_thread_start,
-    encode_abi_info, encode_channel_receive_result, encode_handle, encode_object_info,
-    encode_received_handle_info, encode_u64,
+    HANDLE_TRANSFER_BYTES, THREAD_START_BYTES, WAIT_ITEM_BYTES, decode_handle_transfer,
+    decode_thread_start, decode_wait_item, encode_abi_info, encode_channel_receive_result,
+    encode_handle, encode_object_info, encode_received_handle_info, encode_u64, encode_wait_result,
 };
 
 #[must_use = "typed final releases must be routed after syscall pins/locks are dropped"]
@@ -1216,6 +1224,291 @@ fn complete_wait_wakes<const OBJECTS: usize, const WAITERS: usize, const EXECUTI
     }
     for pin in wait_pins.into_iter().flatten() {
         release_lookup_pin(registry, pin, cleanup);
+    }
+}
+
+#[must_use = "wait begin outcomes either return the output authority or transfer it to a suspended operation"]
+pub(crate) enum WaitSyscallBegin<OUTPUT> {
+    Returning {
+        status: DwStatus,
+        output: OUTPUT,
+        result: Option<[u8; DW_WAIT_RESULT_V1_SIZE as usize]>,
+    },
+    Suspended {
+        wake: BlockWakeKey,
+        decision: ScheduleDecision,
+    },
+}
+
+fn wait_result(index: u32, observed: DwSignals) -> [u8; DW_WAIT_RESULT_V1_SIZE as usize] {
+    encode_wait_result(DwWaitResultV1 {
+        size: DW_WAIT_RESULT_V1_SIZE,
+        version: 1,
+        index,
+        reserved0: 0,
+        observed,
+        reserved: [0; 3],
+    })
+}
+
+fn wait_set_status(error: WaitSetError) -> DwStatus {
+    match error {
+        WaitSetError::Task(error) => task_status(error),
+        WaitSetError::Handle(error) => handle_status(error),
+        WaitSetError::Wait(WaitError::InvalidSignals) => DW_STATUS_INVALID_ARGUMENT,
+        WaitSetError::Wait(WaitError::UnsupportedSource) => DW_STATUS_NOT_SUPPORTED,
+        WaitSetError::Wait(_) | WaitSetError::StateDrift => DW_STATUS_BAD_STATE,
+        WaitSetError::Channel(error) => channel_status(error),
+    }
+}
+
+fn wait_begin_status(error: WaitBeginError) -> DwStatus {
+    match error {
+        WaitBeginError::Set(error) => wait_set_status(error),
+        WaitBeginError::Scheduler(SchedulerError::Capacity)
+        | WaitBeginError::Blocked(crate::task::BlockedOperationError::Capacity)
+        | WaitBeginError::Operation(crate::wait::operation::WaitOperationError::Capacity)
+        | WaitBeginError::Deadline(crate::wait::engine::WaitDeadlineError::Capacity) => {
+            DW_STATUS_NO_RESOURCES
+        }
+        WaitBeginError::Deadline(crate::wait::engine::WaitDeadlineError::Expired) => {
+            DW_STATUS_TIMED_OUT
+        }
+        _ => DW_STATUS_BAD_STATE,
+    }
+}
+
+const fn wait_deadline(deadline: DwDeadline) -> WaitDeadline {
+    if deadline.0 == deepwyrm_abi::DW_DEADLINE_NOW.0 {
+        WaitDeadline::Now
+    } else if deadline.0 == deepwyrm_abi::DW_DEADLINE_INFINITE.0 {
+        WaitDeadline::Infinite
+    } else {
+        WaitDeadline::Finite(deadline.0)
+    }
+}
+
+fn begin_wait_set<
+    OUTPUT,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EVENTS: usize,
+    const CHANNEL_PAIRS: usize,
+    const CHANNEL_DEPTH: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    set: ResolvedWaitSet,
+    output: OUTPUT,
+    deadline: DwDeadline,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    events: &EventAuthority<EVENTS>,
+    channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
+    waits: &WaitRegistry<WAITERS>,
+    execution: &ExecutionDomain<EXECUTION>,
+    operations: &mut WaitOperationRegistry<OUTPUT, EXECUTION>,
+    deadline_authority: Option<&mut dyn WaitDeadlineAuthority>,
+    process: ProcessKey,
+    thread: ThreadKey,
+) -> WaitSyscallBegin<OUTPUT> {
+    match begin_registered_wait(
+        set,
+        output,
+        wait_deadline(deadline),
+        WaitBeginContext {
+            registry,
+            sources: WaitSources {
+                tasks,
+                events,
+                channels,
+                waits,
+            },
+            execution,
+            operations,
+            process,
+            thread,
+        },
+        deadline_authority,
+    ) {
+        Ok(WaitBeginOutcome::Ready { output, selection }) => WaitSyscallBegin::Returning {
+            status: DW_STATUS_SUCCESS,
+            output,
+            result: Some(wait_result(selection.index, selection.observed)),
+        },
+        Ok(WaitBeginOutcome::TimedOut { output }) => WaitSyscallBegin::Returning {
+            status: DW_STATUS_TIMED_OUT,
+            output,
+            result: None,
+        },
+        Ok(WaitBeginOutcome::Suspended { wake, decision }) => {
+            WaitSyscallBegin::Suspended { wake, decision }
+        }
+        Err(failure) => WaitSyscallBegin::Returning {
+            status: wait_begin_status(failure.error),
+            output: failure.output,
+            result: None,
+        },
+    }
+}
+
+pub(crate) fn wait_one_begin<
+    OUTPUT,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EVENTS: usize,
+    const CHANNEL_PAIRS: usize,
+    const CHANNEL_DEPTH: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    output: OUTPUT,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    events: &EventAuthority<EVENTS>,
+    channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
+    waits: &WaitRegistry<WAITERS>,
+    execution: &ExecutionDomain<EXECUTION>,
+    operations: &mut WaitOperationRegistry<OUTPUT, EXECUTION>,
+    deadline_authority: Option<&mut dyn WaitDeadlineAuthority>,
+    process: ProcessKey,
+    thread: ThreadKey,
+    handle: DwHandle,
+    signals: DwSignals,
+    deadline: DwDeadline,
+) -> WaitSyscallBegin<OUTPUT> {
+    let request = [DwWaitItemV1 { handle, signals }];
+    match ResolvedWaitSet::resolve(tasks, registry, process, &request) {
+        Ok(set) => begin_wait_set(
+            set,
+            output,
+            deadline,
+            registry,
+            tasks,
+            events,
+            channels,
+            waits,
+            execution,
+            operations,
+            deadline_authority,
+            process,
+            thread,
+        ),
+        Err(error) => WaitSyscallBegin::Returning {
+            status: wait_set_status(error),
+            output,
+            result: None,
+        },
+    }
+}
+
+pub(crate) fn wait_many_begin<
+    U: UserPageAccess,
+    OUTPUT,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EVENTS: usize,
+    const CHANNEL_PAIRS: usize,
+    const CHANNEL_DEPTH: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    user: &mut U,
+    output: OUTPUT,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    events: &EventAuthority<EVENTS>,
+    channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
+    waits: &WaitRegistry<WAITERS>,
+    execution: &ExecutionDomain<EXECUTION>,
+    operations: &mut WaitOperationRegistry<OUTPUT, EXECUTION>,
+    deadline_authority: Option<&mut dyn WaitDeadlineAuthority>,
+    process: ProcessKey,
+    thread: ThreadKey,
+    items: DwUserAddress,
+    item_count: u32,
+    mode: u32,
+    deadline: DwDeadline,
+) -> WaitSyscallBegin<OUTPUT> {
+    if item_count == 0 || item_count > DW_WAIT_MANY_MAX_ITEMS {
+        return WaitSyscallBegin::Returning {
+            status: DW_STATUS_INVALID_ARGUMENT,
+            output,
+            result: None,
+        };
+    }
+    if mode == DW_WAIT_MODE_ALL {
+        return WaitSyscallBegin::Returning {
+            status: DW_STATUS_NOT_SUPPORTED,
+            output,
+            result: None,
+        };
+    }
+    if mode != DW_WAIT_MODE_ANY {
+        return WaitSyscallBegin::Returning {
+            status: DW_STATUS_INVALID_ARGUMENT,
+            output,
+            result: None,
+        };
+    }
+    let count = item_count as usize;
+    let byte_len = count * WAIT_ITEM_BYTES;
+    let range = match user_range(items, byte_len, 8, UserAccess::READ) {
+        Ok(range) => range,
+        Err(status) => {
+            return WaitSyscallBegin::Returning {
+                status,
+                output,
+                result: None,
+            };
+        }
+    };
+    let mut bytes = [0_u8; DW_WAIT_MANY_MAX_ITEMS as usize * WAIT_ITEM_BYTES];
+    if let Err(error) = snapshot_from_user(user, range, &mut bytes[..byte_len]) {
+        return WaitSyscallBegin::Returning {
+            status: usercopy_status(error),
+            output,
+            result: None,
+        };
+    }
+    let mut requests = [DwWaitItemV1::default(); DW_WAIT_MANY_MAX_ITEMS as usize];
+    for (index, request) in requests[..count].iter_mut().enumerate() {
+        let start = index * WAIT_ITEM_BYTES;
+        let record: &[u8; WAIT_ITEM_BYTES] = bytes[start..start + WAIT_ITEM_BYTES]
+            .try_into()
+            .expect("wait item staging follows generated fixed width");
+        *request = decode_wait_item(record);
+    }
+    match ResolvedWaitSet::resolve(tasks, registry, process, &requests[..count]) {
+        Ok(set) => begin_wait_set(
+            set,
+            output,
+            deadline,
+            registry,
+            tasks,
+            events,
+            channels,
+            waits,
+            execution,
+            operations,
+            deadline_authority,
+            process,
+            thread,
+        ),
+        Err(error) => WaitSyscallBegin::Returning {
+            status: wait_set_status(error),
+            output,
+            result: None,
+        },
     }
 }
 
