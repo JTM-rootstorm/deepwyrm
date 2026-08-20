@@ -189,3 +189,52 @@ fn foreign_and_competing_wakes_fail_closed() {
     );
     assert_eq!(first.schedule_next().unwrap().current, Some(thread));
 }
+
+#[test]
+fn prepared_block_keeps_thread_running_until_commit_and_cancel_is_exact() {
+    let scheduler = CooperativeScheduler::<2>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let thread = thread_key(&mut registry);
+    let reservation = scheduler.reserve(thread).unwrap();
+    scheduler.commit(reservation).unwrap();
+    assert_eq!(scheduler.schedule_next().unwrap().current, Some(thread));
+
+    let block = scheduler.prepare_block_current(thread).unwrap();
+    let wake = block.wake_key();
+    assert_eq!(scheduler.state(thread), Some(SchedulerThreadState::Running));
+    assert!(matches!(
+        scheduler.prepare_block_current(thread),
+        Err(SchedulerError::BlockPreparationActive)
+    ));
+    scheduler.cancel_block(block).unwrap();
+    assert_eq!(scheduler.state(thread), Some(SchedulerThreadState::Running));
+    assert_eq!(scheduler.wake(wake), Err(SchedulerError::StaleBlockToken));
+
+    let block = scheduler.prepare_block_current(thread).unwrap();
+    let wake = block.wake_key();
+    let decision = scheduler.commit_block(block).unwrap();
+    assert_eq!(decision.previous, Some(thread));
+    assert_eq!(scheduler.state(thread), Some(SchedulerThreadState::Blocked));
+    scheduler.wake(wake).unwrap();
+    assert_eq!(
+        scheduler.state(thread),
+        Some(SchedulerThreadState::Runnable)
+    );
+}
+
+#[test]
+fn pending_block_preparation_is_retired_with_running_thread() {
+    let scheduler = CooperativeScheduler::<1>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let thread = thread_key(&mut registry);
+    let reservation = scheduler.reserve(thread).unwrap();
+    scheduler.commit(reservation).unwrap();
+    scheduler.schedule_next().unwrap();
+    let block = scheduler.prepare_block_current(thread).unwrap();
+    let wake = block.wake_key();
+    let decision = scheduler.retire(thread).unwrap();
+    assert_eq!(decision.previous, Some(thread));
+    assert_eq!(decision.current, None);
+    assert_eq!(scheduler.state(thread), None);
+    assert_eq!(scheduler.wake(wake), Err(SchedulerError::StaleBlockToken));
+}

@@ -3,9 +3,9 @@ use core::cell::UnsafeCell;
 use crate::sync::SpinMutex;
 
 use super::{
-    BlockToken, BlockWakeKey, BlockedOperationRegistry, BlockedOperationsDrained,
-    CooperativeScheduler, ExitPins, KernelStackId, ProcessKey, SchedulerError, ThreadContextId,
-    ThreadExecutionResources, ThreadKey, ThreadStartState,
+    BlockReservation, BlockReservationFailure, BlockToken, BlockWakeKey, BlockedOperationRegistry,
+    BlockedOperationsDrained, CooperativeScheduler, ExitPins, KernelStackId, ProcessKey,
+    SchedulerError, ThreadContextId, ThreadExecutionResources, ThreadKey, ThreadStartState,
 };
 
 pub(crate) const E3_INITIAL_USER_RFLAGS: u64 = 0x202;
@@ -559,6 +559,27 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         thread: ThreadKey,
     ) -> Result<super::ScheduleDecision, SchedulerError> {
         self.scheduler.yield_current(thread)
+    }
+
+    pub(crate) fn prepare_block_current(
+        &self,
+        thread: ThreadKey,
+    ) -> Result<BlockReservation, SchedulerError> {
+        self.scheduler.prepare_block_current(thread)
+    }
+
+    pub(crate) fn cancel_block(
+        &self,
+        reservation: BlockReservation,
+    ) -> Result<(), BlockReservationFailure> {
+        self.scheduler.cancel_block(reservation)
+    }
+
+    pub(crate) fn commit_block(
+        &self,
+        reservation: BlockReservation,
+    ) -> Result<super::ScheduleDecision, BlockReservationFailure> {
+        self.scheduler.commit_block(reservation)
     }
 
     pub(crate) fn block_current(

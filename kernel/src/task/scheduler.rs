@@ -26,6 +26,7 @@ pub(crate) enum SchedulerError {
     NotScheduled,
     NotRunning,
     TokenExhausted,
+    BlockPreparationActive,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,6 +42,34 @@ pub(crate) struct BlockWakeKey {
     domain: u64,
     token: u64,
     thread: ThreadKey,
+}
+
+#[must_use = "prepared block ownership must be committed only after wait/deadline registration or explicitly cancelled"]
+#[derive(Debug)]
+pub(crate) struct BlockReservation {
+    key: BlockWakeKey,
+}
+
+impl BlockReservation {
+    pub(crate) const fn wake_key(&self) -> BlockWakeKey {
+        self.key
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct BlockReservationFailure {
+    error: SchedulerError,
+    reservation: BlockReservation,
+}
+
+impl BlockReservationFailure {
+    pub(crate) const fn error(&self) -> SchedulerError {
+        self.error
+    }
+
+    pub(crate) fn into_reservation(self) -> BlockReservation {
+        self.reservation
+    }
 }
 
 #[must_use = "blocked scheduler ownership must be transferred to a waiter registration or explicitly woken"]
@@ -102,6 +131,7 @@ struct SchedulerState<const CAPACITY: usize> {
     queue: [Option<QueueEntry>; CAPACITY],
     len: usize,
     current: Option<ThreadKey>,
+    pending_block: Option<BlockWakeKey>,
 }
 
 impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
@@ -112,6 +142,7 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             queue: [None; CAPACITY],
             len: 0,
             current: None,
+            pending_block: None,
         }
     }
 
@@ -154,6 +185,11 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
     fn check_invariants(&self) -> Result<(), SchedulerError> {
         if self.len > CAPACITY || self.queue[self.len..].iter().any(Option::is_some) {
             return Err(SchedulerError::Capacity);
+        }
+        if let Some(pending) = self.pending_block
+            && self.current != Some(pending.thread)
+        {
+            return Err(SchedulerError::StaleBlockToken);
         }
         for (index, entry) in self.queue[..self.len].iter().enumerate() {
             let Some(entry) = entry else {
@@ -313,6 +349,9 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         if state.current != Some(thread) {
             return Err(SchedulerError::NotRunning);
         }
+        if state.pending_block.is_some() {
+            return Err(SchedulerError::BlockPreparationActive);
+        }
         let Some(next) = state.pop_first_runnable() else {
             return Ok(ScheduleDecision {
                 previous: Some(thread),
@@ -332,13 +371,16 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         })
     }
 
-    pub(crate) fn block_current(
+    pub(crate) fn prepare_block_current(
         &self,
         thread: ThreadKey,
-    ) -> Result<(BlockToken, ScheduleDecision), SchedulerError> {
+    ) -> Result<BlockReservation, SchedulerError> {
         let mut state = self.state.lock();
         if state.current != Some(thread) {
             return Err(SchedulerError::NotRunning);
+        }
+        if state.pending_block.is_some() {
+            return Err(SchedulerError::BlockPreparationActive);
         }
         let token = state.next_token;
         state.next_token = state
@@ -346,29 +388,85 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             .checked_add(1)
             .filter(|next| *next != 0)
             .ok_or(SchedulerError::TokenExhausted)?;
-        let domain = state.domain;
-        state.push(QueueEntry {
-            thread,
-            state: SchedulerThreadState::Blocked,
+        let key = BlockWakeKey {
+            domain: state.domain,
             token,
-        })?;
+            thread,
+        };
+        state.pending_block = Some(key);
+        debug_assert_eq!(state.check_invariants(), Ok(()));
+        Ok(BlockReservation { key })
+    }
+
+    pub(crate) fn cancel_block(
+        &self,
+        reservation: BlockReservation,
+    ) -> Result<(), BlockReservationFailure> {
+        let mut state = self.state.lock();
+        if reservation.key.domain != state.domain {
+            return Err(BlockReservationFailure {
+                error: SchedulerError::ForeignBlockToken,
+                reservation,
+            });
+        }
+        if state.pending_block != Some(reservation.key) {
+            return Err(BlockReservationFailure {
+                error: SchedulerError::StaleBlockToken,
+                reservation,
+            });
+        }
+        state.pending_block = None;
+        debug_assert_eq!(state.check_invariants(), Ok(()));
+        Ok(())
+    }
+
+    pub(crate) fn commit_block(
+        &self,
+        reservation: BlockReservation,
+    ) -> Result<ScheduleDecision, BlockReservationFailure> {
+        let mut state = self.state.lock();
+        if reservation.key.domain != state.domain {
+            return Err(BlockReservationFailure {
+                error: SchedulerError::ForeignBlockToken,
+                reservation,
+            });
+        }
+        if state.pending_block != Some(reservation.key)
+            || state.current != Some(reservation.key.thread)
+        {
+            return Err(BlockReservationFailure {
+                error: SchedulerError::StaleBlockToken,
+                reservation,
+            });
+        }
+        state.pending_block = None;
+        state
+            .push(QueueEntry {
+                thread: reservation.key.thread,
+                state: SchedulerThreadState::Blocked,
+                token: reservation.key.token,
+            })
+            .expect("running scheduler member always has queue capacity when it becomes blocked");
         state.current = None;
         let current = state.pop_first_runnable();
         state.current = current;
         debug_assert_eq!(state.check_invariants(), Ok(()));
-        Ok((
-            BlockToken {
-                key: BlockWakeKey {
-                    domain,
-                    token,
-                    thread,
-                },
-            },
-            ScheduleDecision {
-                previous: Some(thread),
-                current,
-            },
-        ))
+        Ok(ScheduleDecision {
+            previous: Some(reservation.key.thread),
+            current,
+        })
+    }
+
+    pub(crate) fn block_current(
+        &self,
+        thread: ThreadKey,
+    ) -> Result<(BlockToken, ScheduleDecision), SchedulerError> {
+        let reservation = self.prepare_block_current(thread)?;
+        let key = reservation.wake_key();
+        match self.commit_block(reservation) {
+            Ok(decision) => Ok((BlockToken { key }, decision)),
+            Err(failure) => Err(failure.error()),
+        }
     }
 
     pub(crate) fn wake(&self, key: BlockWakeKey) -> Result<(), SchedulerError> {
@@ -394,6 +492,12 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         let mut state = self.state.lock();
         let previous = state.current;
         if state.current == Some(thread) {
+            if state
+                .pending_block
+                .is_some_and(|pending| pending.thread == thread)
+            {
+                state.pending_block = None;
+            }
             state.current = state.pop_first_runnable();
             debug_assert_eq!(state.check_invariants(), Ok(()));
             return Ok(ScheduleDecision {
