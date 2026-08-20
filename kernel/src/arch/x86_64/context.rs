@@ -24,6 +24,7 @@ pub(crate) const KERNEL_CONTEXT_RBX_OFFSET: u64 = 40;
 pub(crate) const KERNEL_CONTEXT_RFLAGS_OFFSET: u64 = 48;
 pub(crate) const KERNEL_CONTEXT_RETURN_RIP_OFFSET: u64 = 56;
 pub(crate) const KERNEL_CONTEXT_FRAME_BYTES: u64 = 64;
+pub(crate) const INITIAL_KERNEL_CONTEXT_BYTES: u64 = KERNEL_CONTEXT_FRAME_BYTES + 8;
 
 pub(crate) const INITIAL_KERNEL_CONTINUATION_RFLAGS: u64 = 1 << 1;
 
@@ -34,6 +35,16 @@ pub(crate) enum InitialKernelContinuationError {
     EntryRipPolicy,
 }
 
+pub(crate) const fn initial_saved_rsp_is_within_stack(bounds: KernelStackBounds, rsp: u64) -> bool {
+    if rsp == 0 || rsp & 0xf != 8 || rsp < bounds.bottom {
+        return false;
+    }
+    match rsp.checked_add(INITIAL_KERNEL_CONTEXT_BYTES) {
+        Some(end) => end <= bounds.top,
+        None => false,
+    }
+}
+
 pub(crate) const fn validate_initial_kernel_continuation_frame(
     bounds: KernelStackBounds,
     rsp: u64,
@@ -41,7 +52,7 @@ pub(crate) const fn validate_initial_kernel_continuation_frame(
     return_rip: u64,
     trusted_entry_rip: u64,
 ) -> Result<(), InitialKernelContinuationError> {
-    if !saved_rsp_is_within_stack(bounds, rsp) {
+    if !initial_saved_rsp_is_within_stack(bounds, rsp) {
         return Err(InitialKernelContinuationError::StackGeometry);
     }
     if rflags != INITIAL_KERNEL_CONTINUATION_RFLAGS {
@@ -64,6 +75,64 @@ pub(crate) const fn saved_rsp_is_within_stack(bounds: KernelStackBounds, rsp: u6
         Some(end) => end <= bounds.top,
         None => false,
     }
+}
+
+#[must_use = "a prepared first-run continuation must be consumed by an initial kernel switch"]
+pub(crate) struct InitialKernelContinuation {
+    rsp: u64,
+    stack: KernelStackBounds,
+}
+
+impl InitialKernelContinuation {
+    pub(crate) const fn rsp(&self) -> u64 {
+        self.rsp
+    }
+
+    pub(crate) const fn stack(&self) -> KernelStackBounds {
+        self.stack
+    }
+}
+
+/// Constructs the exact synthetic frame consumed by the F2 switch assembly for
+/// a never-run Thread. After the switch pops the seven saved words and executes
+/// `ret`, RSP is 8 mod 16 as required at SysV function entry.
+///
+/// # Safety
+///
+/// `bounds` must describe writable, exclusively owned kernel-stack memory for
+/// the destination Thread. `trusted_entry_rip` must name the fixed kernel
+/// first-run entry and remain executable for the lifetime of the Thread.
+#[allow(
+    unsafe_code,
+    reason = "F7 first-run setup writes the documented eight-word switch frame plus one ABI stack word into an exclusively owned kernel stack"
+)]
+pub(crate) unsafe fn prepare_initial_kernel_continuation(
+    bounds: KernelStackBounds,
+    trusted_entry_rip: u64,
+) -> Result<InitialKernelContinuation, InitialKernelContinuationError> {
+    let rsp = bounds
+        .top
+        .checked_sub(INITIAL_KERNEL_CONTEXT_BYTES)
+        .ok_or(InitialKernelContinuationError::StackGeometry)?;
+    validate_initial_kernel_continuation_frame(
+        bounds,
+        rsp,
+        INITIAL_KERNEL_CONTINUATION_RFLAGS,
+        trusted_entry_rip,
+        trusted_entry_rip,
+    )?;
+    let frame = rsp as *mut u64;
+    unsafe {
+        for index in 0..6 {
+            frame.add(index).write(0);
+        }
+        frame.add(6).write(INITIAL_KERNEL_CONTINUATION_RFLAGS);
+        frame.add(7).write(trusted_entry_rip);
+        // A never-returning first-run entry still receives the conventional
+        // SysV stack phase and one inert would-be return word.
+        frame.add(8).write(0);
+    }
+    Ok(InitialKernelContinuation { rsp, stack: bounds })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,6 +180,38 @@ impl KernelSwitchPlan {
         })
     }
 
+    /// Builds a switch plan from an already-prepared first-run continuation.
+    ///
+    /// # Safety
+    ///
+    /// `current_rsp_out` follows the same stationary save-slot contract as
+    /// [`Self::new`]. The `initial` token proves the destination stack frame was
+    /// constructed by [`prepare_initial_kernel_continuation`].
+    #[allow(
+        unsafe_code,
+        reason = "the initial-continuation token proves the distinct SysV first-run stack geometry"
+    )]
+    pub(crate) unsafe fn new_initial(
+        current_rsp_out: *mut u64,
+        initial: InitialKernelContinuation,
+    ) -> Result<Self, KernelContextPlanError> {
+        if current_rsp_out.is_null() {
+            return Err(KernelContextPlanError::NullSaveSlot);
+        }
+        if (current_rsp_out as usize) & 7 != 0 {
+            return Err(KernelContextPlanError::MisalignedSaveSlot);
+        }
+        debug_assert!(initial_saved_rsp_is_within_stack(
+            initial.stack,
+            initial.rsp
+        ));
+        Ok(Self {
+            current_rsp_out,
+            next_rsp: initial.rsp,
+            next_stack: initial.stack,
+        })
+    }
+
     pub(crate) const fn next_stack(&self) -> KernelStackBounds {
         self.next_stack
     }
@@ -153,6 +254,8 @@ core::arch::global_asm!(include_str!("kernel_context.S"), options(att_syntax));
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
 
     #[test]
@@ -168,7 +271,7 @@ mod tests {
     #[test]
     fn synthetic_initial_frame_policy_rejects_hostile_rip_and_privileged_rflags() {
         let bounds = KernelStackBounds::new(0x1000, 0x2000, 0x12000).unwrap();
-        let rsp = 0x3000;
+        let rsp = 0x3008;
         let entry = 0xffff_8000_0010_0000;
         assert_eq!(
             validate_initial_kernel_continuation_frame(
@@ -222,6 +325,33 @@ mod tests {
             ),
             Err(InitialKernelContinuationError::StackGeometry)
         );
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "the test gives the first-run builder one page-aligned process-owned byte region and inspects the exact frame it wrote"
+    )]
+    fn initial_builder_uses_sysv_entry_phase_and_trusted_frame_contents() {
+        #[repr(align(4096))]
+        struct Region([u8; 0x12_000]);
+        let mut region = std::boxed::Box::new(Region([0; 0x12_000]));
+        let base = region.0.as_mut_ptr() as u64;
+        let bounds = KernelStackBounds::new(base, base + 0x1000, base + 0x11_000).unwrap();
+        let entry = 0xffff_8000_0010_0000;
+        let initial = unsafe { prepare_initial_kernel_continuation(bounds, entry) }.unwrap();
+        assert_eq!(initial.rsp() & 0xf, 8);
+        assert!(initial_saved_rsp_is_within_stack(bounds, initial.rsp()));
+        assert!(!saved_rsp_is_within_stack(bounds, initial.rsp()));
+        let frame = initial.rsp() as *const u64;
+        unsafe {
+            for index in 0..6 {
+                assert_eq!(frame.add(index).read(), 0);
+            }
+            assert_eq!(frame.add(6).read(), INITIAL_KERNEL_CONTINUATION_RFLAGS);
+            assert_eq!(frame.add(7).read(), entry);
+            assert_eq!(frame.add(8).read(), 0);
+        }
     }
 
     #[cfg(all(target_arch = "x86_64", not(target_os = "none")))]
