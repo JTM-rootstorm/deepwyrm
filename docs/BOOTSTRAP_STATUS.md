@@ -64,33 +64,11 @@ completed-phase acceptance. No physical-hardware acceptance claim is made;
 VM execution cannot establish one. This DW0-C record also does not close the
 earlier pending DW0-B loader/guest execution gate.
 
-DW0-D provides the kernel object/handle core, generated rights policy,
-MemoryObject lifetime integration, mapping authorization pins, and
-syscall-independent close/duplicate/object-info services. Its D8 host/core and
-accepted-toolchain artifact gates pass at revision
-`db09ce173adfb6850765fe2a4547d50a1050ac10`. D remains SOFT ACCEPTED for phase
-progression; formal Daybreak scanning of candidate
-`fa4be89efc14aff1301b4a5ea6a9f4af9d11e29e` remains explicit security debt.
+DW0-D and DW0-E are **FULL ACCEPTED for phase accounting** after the 2026-08-20 S5 exact Daybreak remediation closure. Their historical deferred-review entries remain preserved with explicit reopen rules, but the former soft-accept debt is closed. D retains the object/handle core and generated rights/lifetime model; E retains the root task hierarchy, cooperative scheduler, ring-3 x86_64 entry/return, generated native syscall dispatch, pinned usercopy, and accepted `task-syscall-smoke` VM path. See the D/E validation records and `security/DW0_DAYBREAK_REMEDIATION_S5_CLOSURE.md` plus the D/E closure records.
 
-DW0-E now provides the root task hierarchy, process-local handle ownership,
-cooperative scheduler, ring-3 x86_64 entry/return, generated native syscall
-dispatch, pinned usercopy, task lifecycle/control, and the freestanding
-`task-syscall-smoke` process. E9 host and accepted-target gates pass at clean
-revision `e8394d6e6d160d9e4d04769943c2500cfd562c10`; the behavior candidate is
-`579e12074e1fe9ec89507e033381fed66676c12c`. The canonical Wyrmroot-paired VM
-path passed selector 10 and includes the hostile-GS SWAPGS regression.
+DW0-F is now **FULL ACCEPTED for progression to DW0-G**. The exact F13 Daybreak product candidate is `96fe554c0e4cb21335df4bbf5ebd2de1f9df21c5`; final F14 evidence ran from clean descendant `e599d5b75346d80075fa097cce47a7974888b9fa`, paired with clean Wyrmroot `edc1071f78f4418c05e5bd0762b1c3fb760df094`. Fresh accepted-target reproduction matched the reviewed selector-13 machine code, and the designated q35/UEFI `OS-Project` VM passed `ipc-blocking-smoke` test ID 13 through the real Wyrmroot loader before byte-identical domain restoration. Exact host, artifact, VM, security, and evidence-manifest details are recorded in [`DW0_F_VALIDATION.md`](DW0_F_VALIDATION.md) and [`DW0_F_SECURITY_REVIEW.md`](../security/DW0_F_SECURITY_REVIEW.md).
 
-E is likewise SOFT ACCEPTED for progression to DW0-F. Formal
-`gpt-daybreak-blue-latest` review remains pending and is not represented as a
-hard security PASS. See [`DW0_E_VALIDATION.md`](DW0_E_VALIDATION.md) and
-[`DW0_E_SECURITY_REVIEW.md`](../security/DW0_E_SECURITY_REVIEW.md).
-
-The repository still does not provide DW0-F IPC/waits/timers, DW0-G primordial
-ELF/bootstrap launch, DW0-H SMP closure, or a completed DW0 release-candidate
-security gate. The D and E Daybreak debts must be revisited before final DW0
-security acceptance. Existing inherited DW0-B/C claim boundaries remain as
-recorded in their validation documents; no new physical-hardware acceptance is
-claimed here.
+The repository still does not provide DW0-G primordial ELF/bootstrap launch or DW0-H SMP closure, and no physical-hardware, i386, or complete-DW0 acceptance claim is made by F14. The next implementation phase is DW0-G.
 
 ## Authority
 
