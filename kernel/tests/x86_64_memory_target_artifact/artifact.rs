@@ -102,18 +102,18 @@ fn resolve_read_only_indirect_disassembly(
             pending_slot = None;
             continue;
         }
-        if line.contains("\tcall\trax") {
-            if let Some(slot) = pending_slot.take() {
-                let (target, symbol) = resolve_slot(slot);
-                let prefix = line
-                    .split_once("\tcall\trax")
-                    .map(|(prefix, _)| prefix)
-                    .expect("matched indirect call");
-                resolved.push_str(prefix);
-                resolved.push_str("\tcall\t0x");
-                resolved.push_str(&format!("{target:x} <{symbol}>\n"));
-                continue;
-            }
+        if line.contains("\tcall\trax")
+            && let Some(slot) = pending_slot.take()
+        {
+            let (target, symbol) = resolve_slot(slot);
+            let prefix = line
+                .split_once("\tcall\trax")
+                .map(|(prefix, _)| prefix)
+                .expect("matched indirect call");
+            resolved.push_str(prefix);
+            resolved.push_str("\tcall\t0x");
+            resolved.push_str(&format!("{target:x} <{symbol}>\n"));
+            continue;
         }
         if pending_slot.is_some() && preserves_rax_slot_through_argument_setup(line) {
             resolved.push_str(line);
