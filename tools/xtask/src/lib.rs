@@ -70,6 +70,42 @@ const TASK_HOST_INTEGRATION_TESTS: &[&str] = &[
     "x86_64_exception_contract",
     "x86_64_memory_guest_contract",
 ];
+const IPC_HOST_TEST_FILTERS: &[&str] = &[
+    "handle::table::tests::",
+    "handle::model_tests::",
+    "ipc::tests::",
+    "wait::tests::",
+    "wait::engine::tests::",
+    "wait::operation::tests::",
+    "time::deadline::tests::",
+    "time::pm_timer::tests::",
+    "time::timer::tests::",
+    "atomic_wait::tests::",
+    "task::blocked_operation::tests::",
+    "task::scheduler::tests::",
+    "task::execution::tests::",
+    "object::finalizer::tests::channel_",
+    "object::finalizer::tests::armed_timer_",
+    "syscall::abi_bytes::tests::f1_",
+    "syscall::adapters::tests::event_",
+    "syscall::adapters::tests::channel_",
+    "syscall::adapters::tests::timer_",
+    "syscall::adapters::tests::wait_",
+    "syscall::adapters::tests::public_finite_wait_",
+    "syscall::adapters::tests::public_timer_wait_",
+    "syscall::adapters::tests::public_wait_",
+    "syscall::adapters::tests::native_timer_",
+    "syscall::adapters::tests::native_wait_",
+    "syscall::adapters::tests::native_process_create_",
+    "syscall::adapters::tests::process_create_",
+];
+const IPC_HOST_INTEGRATION_TESTS: &[&str] = &[
+    "object_registry_ui",
+    "task_authority_ui",
+    "x86_64_syscall_contract",
+    "f11_ipc_ui",
+    "f11_ownership_model",
+];
 const HARNESS_CONFIG: &str = "tooling/guest-harness.toml";
 const TRUSTED_TOOLCHAIN_CONFIG: &str = "tooling/rust-toolchain.toml";
 const BUILD_TOOLS_CONFIG: &str = "tooling/build-tools.toml";
@@ -89,7 +125,8 @@ Commands:
   check                              Run the workspace check
   abi generate                       Generate ABI-owned artifacts
   abi check                          Verify generated ABI artifacts have no drift
-  test host [abi|memory|handles|tasks] Run focused host tests
+  test host [abi|memory|handles|tasks|ipc]
+                                     Run focused host tests
   run --plan --request <path>        Emit the canonical QEMU run plan only
   gdb --plan --request <path>        Emit paused QEMU/GDB command plans only
   test guest <selector> --plan --request <path>
@@ -140,6 +177,7 @@ enum HostTestFilter {
     Memory,
     Handles,
     Tasks,
+    Ipc,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -391,6 +429,9 @@ fn run_invocation(invocation: Invocation) -> io::Result<u8> {
                 Some(HostTestFilter::Tasks) => {
                     return run_task_host_tests();
                 }
+                Some(HostTestFilter::Ipc) => {
+                    return run_ipc_host_tests();
+                }
                 None => {
                     command.args(["--workspace", "--all-targets"]);
                 }
@@ -461,6 +502,53 @@ fn run_task_host_tests() -> io::Result<u8> {
     for integration_test in TASK_HOST_INTEGRATION_TESTS {
         let status = Command::new("cargo")
             .current_dir(workspace_root())
+            .args([
+                "test",
+                "--locked",
+                "--package",
+                "deepwyrm-kernel",
+                "--test",
+                integration_test,
+            ])
+            .status()?;
+        if !status.success() {
+            return Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8);
+        }
+    }
+    Ok(0)
+}
+
+fn run_ipc_host_tests() -> io::Result<u8> {
+    let temporary_state = workspace_root()
+        .join(".tmp")
+        .join("xtask-host-ipc")
+        .join(std::process::id().to_string());
+    let target_dir = temporary_state.join("target");
+    fs::create_dir_all(&temporary_state)?;
+
+    for filter in IPC_HOST_TEST_FILTERS {
+        let status = Command::new("cargo")
+            .current_dir(workspace_root())
+            .env("TMPDIR", &temporary_state)
+            .env("CARGO_TARGET_DIR", &target_dir)
+            .args([
+                "test",
+                "--locked",
+                "--package",
+                "deepwyrm-kernel",
+                "--lib",
+                filter,
+            ])
+            .status()?;
+        if !status.success() {
+            return Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8);
+        }
+    }
+    for integration_test in IPC_HOST_INTEGRATION_TESTS {
+        let status = Command::new("cargo")
+            .current_dir(workspace_root())
+            .env("TMPDIR", &temporary_state)
+            .env("CARGO_TARGET_DIR", &target_dir)
             .args([
                 "test",
                 "--locked",

@@ -102,8 +102,10 @@ pub(super) fn parse_test(args: &[String]) -> Action {
                 "tasks" => {
                     Action::Command(Invocation::HostTests(Some(HostTestFilter::Tasks)))
                 }
+                "ipc" => Action::Command(Invocation::HostTests(Some(HostTestFilter::Ipc))),
                 _ => Action::UsageError(
-                    "unknown host-test filter; expected `abi`, `memory`, `handles`, or `tasks`".into(),
+                    "unknown host-test filter; expected `abi`, `memory`, `handles`, `tasks`, or `ipc`"
+                        .into(),
                 ),
             },
             _ => Action::UsageError("`test host` accepts at most one filter".into()),
@@ -169,7 +171,7 @@ pub(super) fn print_help(mut writer: impl Write, command: Option<&str>) -> io::R
         ),
         Some("test") => write!(
             writer,
-            "Usage: cargo xtask test <host|guest|integration> ...\n\nHost filters are `abi`, `memory`, and `handles`. `test guest` emits a plan only; guest execution remains coordinator-owned.\n"
+            "Usage: cargo xtask test <host|guest|integration> ...\n\nHost filters are `abi`, `memory`, `handles`, `tasks`, and `ipc`. `test host ipc` runs the bounded IPC, wait, time, handle-transfer, timer, finalizer, and process-creation host suite. `test guest` emits a plan only; guest execution remains coordinator-owned.\n"
         ),
         Some(command @ ("run" | "gdb")) => write!(
             writer,

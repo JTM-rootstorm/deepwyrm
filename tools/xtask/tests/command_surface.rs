@@ -33,6 +33,19 @@ fn help_distinguishes_available_host_tooling_from_deferred_operations() {
 }
 
 #[test]
+fn ipc_host_command_is_advertised_as_a_focused_f11_suite() {
+    let output = xtask(&["help", "test"]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("help should be UTF-8");
+    assert!(stdout.contains("`ipc`"));
+    assert!(stdout.contains("test host ipc"));
+    assert!(
+        stdout.contains("IPC, wait, time, handle-transfer, timer, finalizer, and process-creation")
+    );
+}
+
+#[test]
 fn deferred_operations_fail_nonzero_without_doing_work() {
     let commands: &[&[&str]] = &[
         &["build"],

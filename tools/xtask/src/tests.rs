@@ -75,6 +75,10 @@ fn available_commands_have_explicit_actions() {
             Action::Command(Invocation::HostTests(Some(HostTestFilter::Tasks))),
         ),
         (
+            &["test", "host", "ipc"][..],
+            Action::Command(Invocation::HostTests(Some(HostTestFilter::Ipc))),
+        ),
+        (
             &["run", "--plan", "--request", "request.toml"][..],
             Action::Command(Invocation::HarnessPlan(
                 HarnessKind::Run,
@@ -172,6 +176,53 @@ fn task_host_gate_covers_scheduler_resources_and_target_guard_contracts() {
             "x86_64_memory_guest_contract",
         ]
     );
+}
+
+#[test]
+fn ipc_host_gate_covers_bounded_focused_f11_contracts() {
+    for filter in [
+        "handle::table::tests::",
+        "handle::model_tests::",
+        "ipc::tests::",
+        "wait::tests::",
+        "wait::engine::tests::",
+        "wait::operation::tests::",
+        "time::deadline::tests::",
+        "time::pm_timer::tests::",
+        "time::timer::tests::",
+        "atomic_wait::tests::",
+        "task::blocked_operation::tests::",
+        "task::scheduler::tests::",
+        "task::execution::tests::",
+        "object::finalizer::tests::channel_",
+        "object::finalizer::tests::armed_timer_",
+        "syscall::abi_bytes::tests::f1_",
+        "syscall::adapters::tests::event_",
+        "syscall::adapters::tests::channel_",
+        "syscall::adapters::tests::timer_",
+        "syscall::adapters::tests::wait_",
+        "syscall::adapters::tests::public_finite_wait_",
+        "syscall::adapters::tests::public_timer_wait_",
+        "syscall::adapters::tests::public_wait_",
+        "syscall::adapters::tests::native_timer_",
+        "syscall::adapters::tests::native_wait_",
+        "syscall::adapters::tests::native_process_create_",
+        "syscall::adapters::tests::process_create_",
+    ] {
+        assert!(IPC_HOST_TEST_FILTERS.contains(&filter));
+    }
+    assert_eq!(
+        IPC_HOST_INTEGRATION_TESTS,
+        &[
+            "object_registry_ui",
+            "task_authority_ui",
+            "x86_64_syscall_contract",
+            "f11_ipc_ui",
+            "f11_ownership_model",
+        ]
+    );
+    assert!(!IPC_HOST_TEST_FILTERS.contains(&"memory::vm::object::tests::"));
+    assert!(!IPC_HOST_TEST_FILTERS.contains(&"arch::x86_64::exceptions::tests::"));
 }
 
 #[test]
