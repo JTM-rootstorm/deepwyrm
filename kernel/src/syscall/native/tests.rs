@@ -86,6 +86,18 @@ fn typed_requests_preserve_raw_register_order() {
 fn f_typed_requests_preserve_register_widths_and_order() {
     assert_eq!(
         decode_native(
+            DwKnownSyscall::ProcessCreate.id(),
+            args([0x11, 88, 0x2200, 64, 0, 0]),
+        ),
+        Ok(NativeSyscallRequest::ProcessCreate {
+            args: DwUserAddress(0x11),
+            args_size: 88,
+            out_result: DwUserAddress(0x2200),
+            result_size: 64,
+        })
+    );
+    assert_eq!(
+        decode_native(
             DwKnownSyscall::ChannelSend.id(),
             args([11, 22, 33, 44, 5, 66]),
         ),

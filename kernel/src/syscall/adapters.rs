@@ -14,23 +14,28 @@ use deepwyrm_abi::{
     DW_CHANNEL_RECEIVE_RESULT_V1_SIZE, DW_CLOCK_MONOTONIC_ACTIVE, DW_HANDLE_TRANSFER_MOVE,
     DW_HANDLE_TRANSFER_V1_SIZE, DW_MEMORY_OBJECT_INFO_V1_SIZE, DW_OBJECT_INFO_BASIC_V1,
     DW_OBJECT_INFO_MEMORY_OBJECT_V1, DW_OBJECT_INFO_TASK_STATE_V1, DW_OBJECT_INFO_V1_SIZE,
-    DW_OBJECT_TYPE_CHANNEL, DW_RECEIVED_HANDLE_INFO_V1_SIZE, DW_RIGHT_EXECUTE, DW_RIGHT_MODIFY,
-    DW_RIGHT_READ, DW_RIGHT_SIGNAL, DW_RIGHT_WRITE, DW_STATUS_ACCESS_DENIED, DW_STATUS_BAD_ADDRESS,
-    DW_STATUS_BAD_HANDLE, DW_STATUS_BAD_STATE, DW_STATUS_BUFFER_TOO_SMALL,
+    DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_PROCESS,
+    DW_OBJECT_TYPE_TASK_GROUP, DW_PROCESS_CREATE_ARGS_V1_SIZE, DW_PROCESS_CREATE_RESULT_V1_SIZE,
+    DW_RECEIVED_HANDLE_INFO_V1_SIZE, DW_RIGHT_EXECUTE, DW_RIGHT_MODIFY, DW_RIGHT_READ,
+    DW_RIGHT_SIGNAL, DW_RIGHT_TRANSFER, DW_RIGHT_WRITE, DW_STATUS_ACCESS_DENIED,
+    DW_STATUS_BAD_ADDRESS, DW_STATUS_BAD_HANDLE, DW_STATUS_BAD_STATE, DW_STATUS_BUFFER_TOO_SMALL,
     DW_STATUS_INVALID_ARGUMENT, DW_STATUS_NO_RESOURCES, DW_STATUS_NOT_SUPPORTED,
     DW_STATUS_PEER_CLOSED, DW_STATUS_SUCCESS, DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK,
     DW_STATUS_WRONG_OBJECT_TYPE, DW_TASK_STATE_EXITED, DW_TERMINATION_AUTHORIZED,
     DW_WAIT_MANY_MAX_ITEMS, DW_WAIT_MODE_ALL, DW_WAIT_MODE_ANY, DW_WAIT_RESULT_V1_SIZE,
     DwChannelReceiveResultV1, DwClockId, DwDeadline, DwHandle, DwHandleTransferV1,
-    DwReceivedHandleInfoV1, DwRights, DwSignals, DwStatus, DwTerminationReason, DwUserAddress,
-    DwWaitItemV1, DwWaitResultV1,
+    DwProcessCreateResultV1, DwReceivedHandleInfoV1, DwRights, DwSignals, DwStatus,
+    DwTerminationReason, DwUserAddress, DwWaitItemV1, DwWaitResultV1,
 };
 
 use crate::handle::{
     AcceptedObjectTypes, HANDLE_TRANSFER_LIMIT, HandleMovePrepareError, HandleMoveRequest,
-    HandleTableError, ResolvedHandle,
+    HandleReservationSpec, HandleTableError, ResolvedHandle,
 };
 use crate::ipc::{ChannelAuthority, ChannelCreateError, ChannelEndpointKey, ChannelError};
+use crate::memory::address_region::{
+    AddressRegionObjectAuthority, AddressSpaceAuthority, PreparedRootRegion,
+};
 use crate::memory::object::MemoryObjectAuthority;
 use crate::memory::user_range::{EmptyAddressRule, UserAccess, UserAddressSpace, UserRange};
 use crate::memory::usercopy::{
@@ -41,9 +46,10 @@ use crate::memory::usercopy::{
 use crate::object::{FinalRelease, HandleRef, InternalRef, ObjectRegistry, ObjectRegistryError};
 use crate::task::{
     BlockWakeKey, ExecutionDomain, ExecutionResourceError, ExecutionSwitchError,
-    IdleScheduleDecision, ProcessExitEffects, ProcessKey, RetiredExitPins, ScheduleDecision,
-    SchedulerError, SchedulerThreadState, StartThreadError, TaskAuthority, TaskCreateError,
-    TaskError, TaskGroupKey, TaskGroupTerminationEffects, ThreadKey, ThreadStartState,
+    IdleScheduleDecision, PreparedProcess, ProcessExitEffects, ProcessKey, RetiredExitPins,
+    ScheduleDecision, SchedulerError, SchedulerThreadState, StartThreadError, TaskAuthority,
+    TaskCreateError, TaskError, TaskGroupKey, TaskGroupTerminationEffects, ThreadKey,
+    ThreadStartState,
 };
 use crate::time::{TimerAuthority, TimerCreateError, TimerDeadlineAuthority, TimerError, TimerKey};
 use crate::wait::{
@@ -62,9 +68,10 @@ use super::native::{
 };
 
 use super::abi_bytes::{
-    HANDLE_TRANSFER_BYTES, THREAD_START_BYTES, WAIT_ITEM_BYTES, decode_handle_transfer,
-    decode_thread_start, decode_wait_item, encode_abi_info, encode_channel_receive_result,
-    encode_handle, encode_object_info, encode_received_handle_info, encode_u64, encode_wait_result,
+    HANDLE_TRANSFER_BYTES, PROCESS_CREATE_ARGS_BYTES, THREAD_START_BYTES, WAIT_ITEM_BYTES,
+    decode_handle_transfer, decode_process_create_args, decode_thread_start, decode_wait_item,
+    encode_abi_info, encode_channel_receive_result, encode_handle, encode_object_info,
+    encode_process_create_result, encode_received_handle_info, encode_u64, encode_wait_result,
 };
 
 #[must_use = "typed final releases must be routed after syscall pins/locks are dropped"]
@@ -851,6 +858,401 @@ pub(crate) fn task_group_create<
     };
     output.commit(&encode_handle(handle));
     DW_STATUS_SUCCESS
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessCreatePreparation {
+    BootstrapMove,
+    ProcessShell,
+    ChildBootstrapSlot,
+    RootRegion,
+    ParentResultSlots,
+}
+
+fn cancel_prepared_process<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    prepared: PreparedProcess,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) {
+    cleanup.push_optional(prepared.cancel(tasks, registry));
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "F10 cancellation keeps task, address-space, typed-region, and generic-finalizer owners explicit"
+)]
+fn cancel_prepared_root_and_process<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const REGION_OBJECTS: usize,
+    const REGION_SLOTS: usize,
+    const SPACES: usize,
+    const REGIONS: usize,
+>(
+    root: PreparedRootRegion<REGION_SLOTS>,
+    process: PreparedProcess,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    regions: &mut AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
+    spaces: &mut AddressSpaceAuthority<SPACES, REGIONS>,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) {
+    root.cancel(registry, tasks, spaces, regions);
+    cancel_prepared_process(process, registry, tasks, cleanup);
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the F10 observation barrier keeps independently-owned usercopy, object, task, HandleTable, and address-space authorities explicit"
+)]
+fn process_create_transaction<
+    U: UserPageAccess,
+    I: FnMut(ProcessCreatePreparation) -> Result<(), DwStatus>,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const REGION_OBJECTS: usize,
+    const REGION_SLOTS: usize,
+    const SPACES: usize,
+    const REGIONS: usize,
+>(
+    user: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    regions: &mut AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
+    spaces: &mut AddressSpaceAuthority<SPACES, REGIONS>,
+    current_process: ProcessKey,
+    args_address: DwUserAddress,
+    args_size: u64,
+    out_result: DwUserAddress,
+    result_size: u64,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+    mut inject: I,
+) -> DwStatus {
+    if args_size != u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE)
+        || result_size != u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE)
+    {
+        return DW_STATUS_INVALID_ARGUMENT;
+    }
+    let bytes = match copy_input::<U, PROCESS_CREATE_ARGS_BYTES>(user, args_address, 8) {
+        Ok(bytes) => bytes,
+        Err(status) => return status,
+    };
+    let args = decode_process_create_args(&bytes);
+    if args.size != DW_PROCESS_CREATE_ARGS_V1_SIZE
+        || args.version != 1
+        || args.flags != 0
+        || args.reserved != [0; 4]
+    {
+        return DW_STATUS_INVALID_ARGUMENT;
+    }
+    for (object_type, rights) in [
+        (DW_OBJECT_TYPE_PROCESS, args.process_rights),
+        (DW_OBJECT_TYPE_ADDRESS_REGION, args.root_region_rights),
+        (DW_OBJECT_TYPE_CHANNEL, args.child_bootstrap_rights),
+    ] {
+        if let Err(status) = validate_created_handle_rights(object_type, rights) {
+            return status;
+        }
+    }
+    let output = match preflight_output(
+        user,
+        out_result,
+        DW_PROCESS_CREATE_RESULT_V1_SIZE as usize,
+        8,
+    ) {
+        Ok(output) => output,
+        Err(status) => return status,
+    };
+
+    let parent_pin = match resolve_current_handle(
+        tasks,
+        registry,
+        current_process,
+        args.task_group,
+        DW_OBJECT_TYPE_TASK_GROUP,
+        DW_RIGHT_MODIFY,
+    ) {
+        Ok(pin) => pin,
+        Err(status) => return status,
+    };
+    let bootstrap_pin = match resolve_current_handle(
+        tasks,
+        registry,
+        current_process,
+        args.bootstrap_channel,
+        DW_OBJECT_TYPE_CHANNEL,
+        DW_RIGHT_TRANSFER,
+    ) {
+        Ok(pin) => pin,
+        Err(status) => {
+            release_lookup_pin(registry, parent_pin, cleanup);
+            return status;
+        }
+    };
+
+    // This function's exclusive mutable authorities are the DW0 single-owner
+    // observation barrier. Owned domain/generation reservations let each
+    // HandleTable and task/address-space owner be borrowed only sequentially.
+    let prepared_move = match tasks.process_handles_mut(current_process) {
+        Ok(table) => table.prepare_move(HandleMoveRequest {
+            handle: args.bootstrap_channel,
+            requested_rights: args.child_bootstrap_rights,
+        }),
+        Err(error) => {
+            release_lookup_pin(registry, bootstrap_pin, cleanup);
+            release_lookup_pin(registry, parent_pin, cleanup);
+            return task_status(error);
+        }
+    };
+    let prepared_move = match prepared_move {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            release_lookup_pin(registry, bootstrap_pin, cleanup);
+            release_lookup_pin(registry, parent_pin, cleanup);
+            return handle_move_status(error);
+        }
+    };
+    if let Err(status) = inject(ProcessCreatePreparation::BootstrapMove) {
+        release_lookup_pin(registry, bootstrap_pin, cleanup);
+        release_lookup_pin(registry, parent_pin, cleanup);
+        return status;
+    }
+
+    let prepared_process = match tasks.prepare_process(registry, &parent_pin) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            release_lookup_pin(registry, bootstrap_pin, cleanup);
+            release_lookup_pin(registry, parent_pin, cleanup);
+            return task_create_status(error);
+        }
+    };
+    if let Err(status) = inject(ProcessCreatePreparation::ProcessShell) {
+        cancel_prepared_process(prepared_process, registry, tasks, cleanup);
+        release_lookup_pin(registry, bootstrap_pin, cleanup);
+        release_lookup_pin(registry, parent_pin, cleanup);
+        return status;
+    }
+
+    let child_reservation = match tasks.process_handles_mut(prepared_process.key()) {
+        Ok(table) => table.reserve_transfer_destination(),
+        Err(error) => {
+            cancel_prepared_process(prepared_process, registry, tasks, cleanup);
+            release_lookup_pin(registry, bootstrap_pin, cleanup);
+            release_lookup_pin(registry, parent_pin, cleanup);
+            return task_status(error);
+        }
+    };
+    let child_reservation = match child_reservation {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            cancel_prepared_process(prepared_process, registry, tasks, cleanup);
+            release_lookup_pin(registry, bootstrap_pin, cleanup);
+            release_lookup_pin(registry, parent_pin, cleanup);
+            return handle_status(error);
+        }
+    };
+    if let Err(status) = inject(ProcessCreatePreparation::ChildBootstrapSlot) {
+        cancel_prepared_process(prepared_process, registry, tasks, cleanup);
+        release_lookup_pin(registry, bootstrap_pin, cleanup);
+        release_lookup_pin(registry, parent_pin, cleanup);
+        return status;
+    }
+
+    let attachment = match prepared_process.reserve_root_region_attachment(tasks) {
+        Ok(attachment) => attachment,
+        Err(error) => {
+            cancel_prepared_process(prepared_process, registry, tasks, cleanup);
+            release_lookup_pin(registry, bootstrap_pin, cleanup);
+            release_lookup_pin(registry, parent_pin, cleanup);
+            return task_status(error);
+        }
+    };
+    let prepared_root = match regions.prepare_root_region(
+        registry,
+        tasks,
+        spaces,
+        prepared_process.key(),
+        prepared_process.handle(),
+        attachment,
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            cancel_prepared_process(prepared_process, registry, tasks, cleanup);
+            release_lookup_pin(registry, bootstrap_pin, cleanup);
+            release_lookup_pin(registry, parent_pin, cleanup);
+            return address_region_object_status(error);
+        }
+    };
+    if let Err(status) = inject(ProcessCreatePreparation::RootRegion) {
+        cancel_prepared_root_and_process(
+            prepared_root,
+            prepared_process,
+            registry,
+            tasks,
+            regions,
+            spaces,
+            cleanup,
+        );
+        release_lookup_pin(registry, bootstrap_pin, cleanup);
+        release_lookup_pin(registry, parent_pin, cleanup);
+        return status;
+    }
+
+    let parent_reservation = match tasks.process_handles_mut(current_process) {
+        Ok(table) => table.reserve_typed_pair([
+            HandleReservationSpec {
+                object_type: DW_OBJECT_TYPE_PROCESS,
+                rights: args.process_rights,
+            },
+            HandleReservationSpec {
+                object_type: DW_OBJECT_TYPE_ADDRESS_REGION,
+                rights: args.root_region_rights,
+            },
+        ]),
+        Err(error) => {
+            cancel_prepared_root_and_process(
+                prepared_root,
+                prepared_process,
+                registry,
+                tasks,
+                regions,
+                spaces,
+                cleanup,
+            );
+            release_lookup_pin(registry, bootstrap_pin, cleanup);
+            release_lookup_pin(registry, parent_pin, cleanup);
+            return task_status(error);
+        }
+    };
+    let parent_reservation = match parent_reservation {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            cancel_prepared_root_and_process(
+                prepared_root,
+                prepared_process,
+                registry,
+                tasks,
+                regions,
+                spaces,
+                cleanup,
+            );
+            release_lookup_pin(registry, bootstrap_pin, cleanup);
+            release_lookup_pin(registry, parent_pin, cleanup);
+            return handle_status(error);
+        }
+    };
+    if let Err(status) = inject(ProcessCreatePreparation::ParentResultSlots) {
+        cancel_prepared_root_and_process(
+            prepared_root,
+            prepared_process,
+            registry,
+            tasks,
+            regions,
+            spaces,
+            cleanup,
+        );
+        release_lookup_pin(registry, bootstrap_pin, cleanup);
+        release_lookup_pin(registry, parent_pin, cleanup);
+        return status;
+    }
+
+    // No recoverable operation remains beyond this point. The source MOVE is
+    // published into the child before typed hierarchy visibility, and parent
+    // result handles appear together only after both typed payloads commit.
+    let (move_rollback, transfer) = prepared_move.extract(
+        tasks
+            .process_handles_mut(current_process)
+            .unwrap_or_else(|error| panic!("F10 source table changed at commit: {error:?}")),
+    );
+    let child_bootstrap = child_reservation.publish(
+        tasks
+            .process_handles_mut(prepared_process.key())
+            .unwrap_or_else(|error| panic!("F10 child table changed at commit: {error:?}")),
+        transfer,
+    );
+    move_rollback.finish(
+        tasks
+            .process_handles_mut(current_process)
+            .unwrap_or_else(|error| panic!("F10 source table changed after extraction: {error:?}")),
+    );
+    let (_root, root_reference) = prepared_root.commit(registry, tasks, regions);
+    let (_process, process_reference) = prepared_process.commit(tasks);
+    let parent_handles = parent_reservation.publish(
+        tasks
+            .process_handles_mut(current_process)
+            .unwrap_or_else(|error| panic!("F10 parent table changed at publication: {error:?}")),
+        [process_reference, root_reference],
+    );
+
+    release_lookup_pin(registry, bootstrap_pin, cleanup);
+    release_lookup_pin(registry, parent_pin, cleanup);
+    let encoded = encode_process_create_result(DwProcessCreateResultV1 {
+        size: DW_PROCESS_CREATE_RESULT_V1_SIZE,
+        version: 1,
+        process: parent_handles[0],
+        root_address_region: parent_handles[1],
+        child_bootstrap_handle: child_bootstrap.handle,
+        reserved: [0; 4],
+    });
+    output.commit(&encoded);
+    DW_STATUS_SUCCESS
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the public F10 adapter preserves explicit transaction authority ownership"
+)]
+pub(crate) fn process_create<
+    U: UserPageAccess,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const REGION_OBJECTS: usize,
+    const REGION_SLOTS: usize,
+    const SPACES: usize,
+    const REGIONS: usize,
+>(
+    user: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    regions: &mut AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
+    spaces: &mut AddressSpaceAuthority<SPACES, REGIONS>,
+    current_process: ProcessKey,
+    args_address: DwUserAddress,
+    args_size: u64,
+    out_result: DwUserAddress,
+    result_size: u64,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
+    process_create_transaction(
+        user,
+        registry,
+        tasks,
+        regions,
+        spaces,
+        current_process,
+        args_address,
+        args_size,
+        out_result,
+        result_size,
+        cleanup,
+        |_| Ok(()),
+    )
 }
 
 pub(crate) fn channel_create<

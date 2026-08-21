@@ -423,7 +423,8 @@ mod object_adapter;
 )]
 pub(crate) use object_adapter::{
     AddressRegionObjectAuthority, AddressRegionObjectError, AddressRegionObjectKey,
-    AddressRegionPayloadBinding, AddressRegionPayloadCleanup, complete_address_region_finalization,
+    AddressRegionPayloadBinding, AddressRegionPayloadCleanup, PreparedRootRegion,
+    complete_address_region_finalization,
 };
 
 #[cfg(test)]

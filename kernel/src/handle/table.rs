@@ -1159,9 +1159,9 @@ impl TypedHandlePairReservation {
             self.domain, table.domain,
             "foreign typed handle-pair reservation"
         );
-        for index in 0..2 {
+        for (index, reference) in references.iter().enumerate() {
             assert_eq!(
-                references[index].object_type(),
+                reference.object_type(),
                 self.specs[index].object_type,
                 "typed reserved handle object type drift"
             );

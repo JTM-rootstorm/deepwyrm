@@ -1,6 +1,9 @@
 extern crate std;
 
 use super::*;
+use crate::memory::address_region::{
+    AddressRegionObjectAuthority, AddressSpaceAuthority, complete_address_region_finalization,
+};
 use crate::memory::user_range::UserPageChunk;
 use crate::memory::usercopy::{PinnedUserBatchPages, PinnedUserPages, UserPageBatchAccess};
 use crate::object::ObjectRegistry;
@@ -12,6 +15,7 @@ const BYTES: usize = 4096;
 
 struct FakeUserMemory {
     bytes: [u8; BYTES],
+    deny_read: bool,
     deny_write: bool,
     owned_outputs: usize,
 }
@@ -33,6 +37,7 @@ impl FakeUserMemory {
     fn new() -> Self {
         Self {
             bytes: [0; BYTES],
+            deny_read: false,
             deny_write: false,
             owned_outputs: 0,
         }
@@ -133,6 +138,9 @@ impl PinnedUserPages for FakePinned<'_> {
     type Error = ();
 
     fn preflight(&mut self, chunk: UserPageChunk) -> Result<(), Self::Error> {
+        if self.memory.deny_read && chunk.access().includes(UserAccess::READ) {
+            return Err(());
+        }
         if self.memory.deny_write && chunk.access().includes(UserAccess::WRITE) {
             return Err(());
         }
@@ -5065,4 +5073,1240 @@ fn terminating_blocked_waiter_consumes_wait_without_userspace_resume() {
         (DW_STATUS_SUCCESS, SyscallControl::TerminateCurrent)
     );
     finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+// F10 uses a separate fixture because the target TaskGroup is intentionally
+// distinct from the caller's parent. This makes the child-table reservation
+// dependency observable without changing the established F5-F9 fixtures.
+type F10Tasks = TaskAuthority<2, 3, 2, 8>;
+
+struct F10Fixture {
+    registry: ObjectRegistry<16>,
+    tasks: F10Tasks,
+    regions: AddressRegionObjectAuthority<2, 4>,
+    spaces: AddressSpaceAuthority<2, 4>,
+    channels: ChannelAuthority<2, 4>,
+    waits: WaitRegistry<8>,
+    user: FakeUserMemory,
+    current: ProcessKey,
+    current_process: DwHandle,
+    parent_group: DwHandle,
+    bootstrap: DwHandle,
+    peer: DwHandle,
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the F10 fixture uniquely owns its synthetic AddressSpaceAuthority identities"
+)]
+fn f10_fixture() -> F10Fixture {
+    f10_fixture_with_rights(
+        DwRights(DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0),
+        DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_TRANSFER.0 | DW_RIGHT_INSPECT.0),
+    )
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the F10 fixture uniquely owns its synthetic AddressSpaceAuthority identities"
+)]
+fn f10_fixture_with_rights(
+    parent_group_rights: DwRights,
+    bootstrap_rights: DwRights,
+) -> F10Fixture {
+    let mut registry = ObjectRegistry::<16>::new();
+    let mut tasks = F10Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (current, current_reference) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let current_process = tasks
+        .process_handles_mut(current)
+        .unwrap()
+        .install(
+            current_reference,
+            DwRights(DW_RIGHT_DUPLICATE.0 | DW_RIGHT_INSPECT.0 | DW_RIGHT_MODIFY.0),
+        )
+        .unwrap();
+    let (_parent, parent_reference) = tasks
+        .create_child_group(&mut registry, &root_owner)
+        .unwrap();
+    let parent_group = tasks
+        .process_handles_mut(current)
+        .unwrap()
+        .install(parent_reference, parent_group_rights)
+        .unwrap();
+    assert!(registry.release_internal(root_owner).unwrap().is_none());
+
+    let channels = ChannelAuthority::<2, 4>::new();
+    let mut user = FakeUserMemory::new();
+    assert_eq!(
+        channel_create(
+            &mut user,
+            &mut registry,
+            &channels,
+            &mut tasks,
+            current,
+            bootstrap_rights,
+            DwUserAddress(BASE + 0x180),
+            DwUserAddress(BASE + 0x188),
+        ),
+        DW_STATUS_SUCCESS
+    );
+
+    F10Fixture {
+        registry,
+        tasks,
+        regions: AddressRegionObjectAuthority::new(),
+        // SAFETY: this test-local authority owns only synthetic identities.
+        spaces: unsafe { AddressSpaceAuthority::new() },
+        channels,
+        waits: WaitRegistry::new(),
+        bootstrap: DwHandle(u64_at(&user, BASE + 0x180)),
+        peer: DwHandle(u64_at(&user, BASE + 0x188)),
+        user,
+        current,
+        current_process,
+        parent_group,
+    }
+}
+
+fn write_process_create_args(
+    user: &mut FakeUserMemory,
+    address: u64,
+    task_group: DwHandle,
+    bootstrap_channel: DwHandle,
+    process_rights: DwRights,
+    root_region_rights: DwRights,
+    child_bootstrap_rights: DwRights,
+) {
+    use deepwyrm_abi::DW_PROCESS_CREATE_ARGS_V1_SIZE;
+
+    let offset = FakeUserMemory::offset(address, DW_PROCESS_CREATE_ARGS_V1_SIZE as usize);
+    let bytes = &mut user.bytes[offset..offset + DW_PROCESS_CREATE_ARGS_V1_SIZE as usize];
+    bytes.fill(0);
+    bytes[0..4].copy_from_slice(&DW_PROCESS_CREATE_ARGS_V1_SIZE.to_le_bytes());
+    bytes[4..8].copy_from_slice(&1_u32.to_le_bytes());
+    bytes[8..16].copy_from_slice(&task_group.0.to_le_bytes());
+    bytes[16..24].copy_from_slice(&bootstrap_channel.0.to_le_bytes());
+    bytes[24..32].copy_from_slice(&process_rights.0.to_le_bytes());
+    bytes[32..40].copy_from_slice(&root_region_rights.0.to_le_bytes());
+    bytes[40..48].copy_from_slice(&child_bootstrap_rights.0.to_le_bytes());
+}
+
+fn f10_rights() -> (DwRights, DwRights, DwRights) {
+    use deepwyrm_abi::{DW_RIGHT_INSPECT, DW_RIGHT_READ};
+    (DW_RIGHT_INSPECT, DW_RIGHT_INSPECT, DW_RIGHT_READ)
+}
+
+fn write_valid_f10_args(fixture: &mut F10Fixture, args_address: u64) {
+    let (process_rights, root_rights, bootstrap_rights) = f10_rights();
+    write_process_create_args(
+        &mut fixture.user,
+        args_address,
+        fixture.parent_group,
+        fixture.bootstrap,
+        process_rights,
+        root_rights,
+        bootstrap_rights,
+    );
+}
+
+fn assert_f10_failure_preserves_caller(
+    fixture: &F10Fixture,
+    output_address: u64,
+    output_before: [u8; 64],
+    caller_handles: usize,
+    bootstrap: crate::handle::BasicHandleInfo,
+) {
+    assert_eq!(fixture.user.owned_outputs, 0);
+    assert_eq!(
+        fixture.tasks.process_handle_count(fixture.current).unwrap(),
+        caller_handles
+    );
+    assert_eq!(
+        fixture
+            .tasks
+            .process_handles(fixture.current)
+            .unwrap()
+            .inspect_basic(fixture.bootstrap)
+            .unwrap(),
+        bootstrap
+    );
+    let offset = FakeUserMemory::offset(output_address, output_before.len());
+    assert_eq!(
+        &fixture.user.bytes[offset..offset + output_before.len()],
+        &output_before
+    );
+}
+
+fn close_f10_channel(fixture: &mut F10Fixture, process: ProcessKey, handle: DwHandle) {
+    let release = fixture
+        .tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .close(&mut fixture.registry, handle)
+        .unwrap()
+        .unwrap();
+    let finalization = fixture
+        .channels
+        .take_finalization(release, &fixture.waits)
+        .unwrap();
+    let completion = crate::ipc::complete_channel_finalization(&mut fixture.registry, finalization);
+    assert_eq!(completion.into_parts().0.len(), 0);
+}
+
+fn close_f10_fixture_with_open_channels(
+    mut fixture: F10Fixture,
+    bootstrap_open: bool,
+    peer_open: bool,
+    parent_group_open: bool,
+) {
+    let mut cleanup = CleanupQueue::<16>::new();
+    let current = fixture.current;
+    let bootstrap = fixture.bootstrap;
+    let peer = fixture.peer;
+    let parent_group = fixture.parent_group;
+    let current_process = fixture.current_process;
+    if bootstrap_open {
+        close_f10_channel(&mut fixture, current, bootstrap);
+    }
+    if peer_open {
+        close_f10_channel(&mut fixture, current, peer);
+    }
+    if parent_group_open {
+        assert_eq!(
+            handle_close(
+                &mut fixture.registry,
+                &mut fixture.tasks,
+                current,
+                parent_group,
+                &mut cleanup,
+            ),
+            DW_STATUS_SUCCESS
+        );
+    }
+    assert_eq!(
+        handle_close(
+            &mut fixture.registry,
+            &mut fixture.tasks,
+            current,
+            current_process,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    finish_f10_task_cleanup(&mut fixture.registry, &mut fixture.tasks, cleanup);
+}
+
+fn close_f10_fixture(fixture: F10Fixture) {
+    close_f10_fixture_with_open_channels(fixture, true, true, true);
+}
+
+fn finish_f10_task_cleanup<const OBJECTS: usize>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut F10Tasks,
+    cleanup: CleanupQueue<OBJECTS>,
+) {
+    for release in cleanup.into_releases().into_iter().flatten() {
+        let mut pending = Some(release);
+        while let Some(release) = pending.take() {
+            let finalization = tasks.take_finalization(release).unwrap();
+            pending = crate::task::complete_task_finalization(registry, finalization);
+        }
+    }
+}
+
+fn retire_f10_created_process(
+    fixture: &mut F10Fixture,
+    child: ProcessKey,
+    result_process: DwHandle,
+    result_root: DwHandle,
+    child_bootstrap: DwHandle,
+    cleanup: &mut CleanupQueue<16>,
+) {
+    close_f10_channel(fixture, child, child_bootstrap);
+    for handle in [result_root, result_process] {
+        assert_eq!(
+            handle_close(
+                &mut fixture.registry,
+                &mut fixture.tasks,
+                fixture.current,
+                handle,
+                cleanup,
+            ),
+            DW_STATUS_SUCCESS
+        );
+    }
+
+    let effects = fixture
+        .tasks
+        .terminate_process_authorized(&mut fixture.registry, child, 0x10)
+        .unwrap();
+    assert_eq!(effects.drained.final_release_count(), 0);
+    let (process_pin, thread_pins, resources) = effects.pins.into_parts();
+    assert!(thread_pins.into_iter().flatten().next().is_none());
+    assert!(resources.into_iter().flatten().next().is_none());
+    cleanup.push_optional(
+        fixture
+            .registry
+            .release_internal(process_pin.unwrap())
+            .unwrap(),
+    );
+
+    let blocked = crate::task::BlockedOperationRegistry::<2>::new();
+    let drained = blocked.drained(child).unwrap();
+    let runtime_pin = fixture
+        .regions
+        .retire_exited_root(&mut fixture.tasks, child, &blocked, drained)
+        .unwrap();
+    let root_final = fixture
+        .registry
+        .release_internal(runtime_pin)
+        .unwrap()
+        .unwrap();
+    let root_finalization = fixture
+        .regions
+        .take_finalization(&mut fixture.spaces, root_final)
+        .unwrap();
+    cleanup.push_optional(complete_address_region_finalization(
+        &mut fixture.registry,
+        root_finalization,
+    ));
+    let completed = core::mem::replace(cleanup, CleanupQueue::new());
+    finish_f10_task_cleanup(&mut fixture.registry, &mut fixture.tasks, completed);
+    assert_eq!(
+        fixture.tasks.process_info(child),
+        Err(crate::task::TaskError::InvalidTask)
+    );
+}
+
+struct NativeProcessCreateHarness<'a> {
+    user: &'a mut FakeUserMemory,
+    registry: &'a mut ObjectRegistry<16>,
+    tasks: &'a mut F10Tasks,
+    regions: &'a mut AddressRegionObjectAuthority<2, 4>,
+    spaces: &'a mut AddressSpaceAuthority<2, 4>,
+    current: ProcessKey,
+    cleanup: &'a mut CleanupQueue<16>,
+}
+
+impl crate::syscall::native::NativeSyscallHandler for NativeProcessCreateHarness<'_> {
+    fn handle(
+        &mut self,
+        request: crate::syscall::native::NativeSyscallRequest,
+    ) -> crate::syscall::native::NativeSyscallResult {
+        let status = match request {
+            crate::syscall::native::NativeSyscallRequest::ProcessCreate {
+                args,
+                args_size,
+                out_result,
+                result_size,
+            } => process_create(
+                self.user,
+                self.registry,
+                self.tasks,
+                self.regions,
+                self.spaces,
+                self.current,
+                args,
+                args_size,
+                out_result,
+                result_size,
+                self.cleanup,
+            ),
+            _ => panic!("native F10 harness received a non-ProcessCreate request"),
+        };
+        crate::syscall::native::NativeSyscallResult::returning(status)
+    }
+}
+
+#[test]
+fn native_process_create_id_routes_through_the_real_transaction() {
+    use crate::syscall::RawSyscallArguments;
+    use crate::syscall::native::dispatch_native;
+    use deepwyrm_abi::{
+        DW_OBJECT_TYPE_PROCESS, DW_PROCESS_CREATE_ARGS_V1_SIZE, DW_PROCESS_CREATE_RESULT_V1_SIZE,
+        DwKnownSyscall,
+    };
+
+    const ARGS: u64 = BASE + 0x600;
+    const OUT: u64 = BASE + 0x700;
+
+    let mut fixture = f10_fixture();
+    write_valid_f10_args(&mut fixture, ARGS);
+    let mut cleanup = CleanupQueue::<16>::new();
+    let result = {
+        let mut harness = NativeProcessCreateHarness {
+            user: &mut fixture.user,
+            registry: &mut fixture.registry,
+            tasks: &mut fixture.tasks,
+            regions: &mut fixture.regions,
+            spaces: &mut fixture.spaces,
+            current: fixture.current,
+            cleanup: &mut cleanup,
+        };
+        dispatch_native(
+            &mut harness,
+            DwKnownSyscall::ProcessCreate.id(),
+            RawSyscallArguments::new([
+                ARGS,
+                u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE),
+                OUT,
+                u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE),
+                0,
+                0,
+            ]),
+        )
+    };
+    assert_eq!(result.status, DW_STATUS_SUCCESS);
+    assert_eq!(result.control, SyscallControl::ReturnToCaller);
+    let result_process = DwHandle(u64_at(&fixture.user, OUT + 8));
+    let result_root = DwHandle(u64_at(&fixture.user, OUT + 16));
+    let child_bootstrap = DwHandle(u64_at(&fixture.user, OUT + 24));
+    let child_pin = resolve_current_handle(
+        &fixture.tasks,
+        &mut fixture.registry,
+        fixture.current,
+        result_process,
+        DW_OBJECT_TYPE_PROCESS,
+        DW_RIGHT_INSPECT,
+    )
+    .unwrap();
+    let child = ProcessKey::from_object_id(child_pin.id());
+    release_lookup_pin(&mut fixture.registry, child_pin, &mut cleanup);
+    retire_f10_created_process(
+        &mut fixture,
+        child,
+        result_process,
+        result_root,
+        child_bootstrap,
+        &mut cleanup,
+    );
+    close_f10_fixture_with_open_channels(fixture, false, true, true);
+
+    let mut fixture = f10_fixture();
+    write_valid_f10_args(&mut fixture, ARGS);
+    fixture.user.bytes[FakeUserMemory::offset(OUT, 64)..FakeUserMemory::offset(OUT, 64) + 64]
+        .fill(0xa5);
+    let handles = fixture.tasks.process_handle_count(fixture.current).unwrap();
+    let source = fixture
+        .tasks
+        .process_handles(fixture.current)
+        .unwrap()
+        .inspect_basic(fixture.bootstrap)
+        .unwrap();
+    fixture.user.deny_write = true;
+    let mut cleanup = CleanupQueue::<16>::new();
+    let result = {
+        let mut harness = NativeProcessCreateHarness {
+            user: &mut fixture.user,
+            registry: &mut fixture.registry,
+            tasks: &mut fixture.tasks,
+            regions: &mut fixture.regions,
+            spaces: &mut fixture.spaces,
+            current: fixture.current,
+            cleanup: &mut cleanup,
+        };
+        dispatch_native(
+            &mut harness,
+            DwKnownSyscall::ProcessCreate.id(),
+            RawSyscallArguments::new([
+                ARGS,
+                u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE),
+                OUT,
+                u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE),
+                0,
+                0,
+            ]),
+        )
+    };
+    assert_eq!(result.status, DW_STATUS_BAD_ADDRESS);
+    assert_eq!(result.control, SyscallControl::ReturnToCaller);
+    assert_f10_failure_preserves_caller(&fixture, OUT, [0xa5; 64], handles, source);
+    fixture.user.deny_write = false;
+    finish_f10_task_cleanup(&mut fixture.registry, &mut fixture.tasks, cleanup);
+    close_f10_fixture(fixture);
+}
+
+#[test]
+fn process_create_validates_record_output_and_handle_order_without_publication() {
+    use deepwyrm_abi::{
+        DW_PROCESS_CREATE_ARGS_V1_SIZE, DW_PROCESS_CREATE_RESULT_V1_SIZE, DW_RIGHT_DUPLICATE,
+    };
+
+    const ARGS: u64 = BASE + 0x600;
+    const OUT: u64 = BASE + 0x700;
+    for case in [
+        (
+            "args-size",
+            DW_STATUS_INVALID_ARGUMENT,
+            0_u64,
+            u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE),
+        ),
+        (
+            "result-size",
+            DW_STATUS_INVALID_ARGUMENT,
+            u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE),
+            0_u64,
+        ),
+    ] {
+        let mut fixture = f10_fixture();
+        write_valid_f10_args(&mut fixture, ARGS);
+        fixture.user.bytes[FakeUserMemory::offset(OUT, 64)..FakeUserMemory::offset(OUT, 64) + 64]
+            .fill(0xa5);
+        let before = [0xa5; 64];
+        let handles = fixture.tasks.process_handle_count(fixture.current).unwrap();
+        let bootstrap = fixture
+            .tasks
+            .process_handles(fixture.current)
+            .unwrap()
+            .inspect_basic(fixture.bootstrap)
+            .unwrap();
+        assert_eq!(
+            process_create(
+                &mut fixture.user,
+                &mut fixture.registry,
+                &mut fixture.tasks,
+                &mut fixture.regions,
+                &mut fixture.spaces,
+                fixture.current,
+                DwUserAddress(ARGS),
+                case.2,
+                DwUserAddress(OUT),
+                case.3,
+                &mut CleanupQueue::new(),
+            ),
+            case.1,
+            "{0}",
+            case.0
+        );
+        assert_f10_failure_preserves_caller(&fixture, OUT, before, handles, bootstrap);
+        close_f10_fixture(fixture);
+    }
+
+    let malformed = [
+        (0_usize, 0_u8), // size
+        (4, 2),          // version
+        (48, 1),         // flags
+        (56, 1),         // reserved
+    ];
+    for (offset, value) in malformed {
+        let mut fixture = f10_fixture();
+        write_valid_f10_args(&mut fixture, ARGS);
+        fixture.user.bytes[FakeUserMemory::offset(ARGS + offset as u64, 1)] = value;
+        let handles = fixture.tasks.process_handle_count(fixture.current).unwrap();
+        let bootstrap = fixture
+            .tasks
+            .process_handles(fixture.current)
+            .unwrap()
+            .inspect_basic(fixture.bootstrap)
+            .unwrap();
+        assert_eq!(
+            process_create(
+                &mut fixture.user,
+                &mut fixture.registry,
+                &mut fixture.tasks,
+                &mut fixture.regions,
+                &mut fixture.spaces,
+                fixture.current,
+                DwUserAddress(ARGS),
+                u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE),
+                DwUserAddress(OUT),
+                u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE),
+                &mut CleanupQueue::new()
+            ),
+            DW_STATUS_INVALID_ARGUMENT
+        );
+        assert_f10_failure_preserves_caller(&fixture, OUT, [0; 64], handles, bootstrap);
+        close_f10_fixture(fixture);
+    }
+
+    for (which, rights, expected) in [
+        (24_u64, DwRights(0), DW_STATUS_INVALID_ARGUMENT),
+        (32, DwRights(1 << 63), DW_STATUS_INVALID_ARGUMENT),
+        (40, DwRights(DW_RIGHT_DUPLICATE.0), DW_STATUS_ACCESS_DENIED),
+    ] {
+        let mut fixture = f10_fixture();
+        write_valid_f10_args(&mut fixture, ARGS);
+        let offset = FakeUserMemory::offset(ARGS + which, 8);
+        fixture.user.bytes[offset..offset + 8].copy_from_slice(&rights.0.to_le_bytes());
+        let handles = fixture.tasks.process_handle_count(fixture.current).unwrap();
+        let bootstrap = fixture
+            .tasks
+            .process_handles(fixture.current)
+            .unwrap()
+            .inspect_basic(fixture.bootstrap)
+            .unwrap();
+        assert_eq!(
+            process_create(
+                &mut fixture.user,
+                &mut fixture.registry,
+                &mut fixture.tasks,
+                &mut fixture.regions,
+                &mut fixture.spaces,
+                fixture.current,
+                DwUserAddress(ARGS),
+                u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE),
+                DwUserAddress(OUT),
+                u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE),
+                &mut CleanupQueue::new()
+            ),
+            expected
+        );
+        assert_f10_failure_preserves_caller(&fixture, OUT, [0; 64], handles, bootstrap);
+        close_f10_fixture(fixture);
+    }
+
+    for (name, deny_read, deny_write) in
+        [("copy-in", true, false), ("output-preflight", false, true)]
+    {
+        let mut fixture = f10_fixture();
+        write_valid_f10_args(&mut fixture, ARGS);
+        fixture.user.bytes[FakeUserMemory::offset(OUT, 64)..FakeUserMemory::offset(OUT, 64) + 64]
+            .fill(0xa5);
+        let generations = fixture.registry.test_slot_generations();
+        let handles = fixture.tasks.process_handle_count(fixture.current).unwrap();
+        let bootstrap = fixture
+            .tasks
+            .process_handles(fixture.current)
+            .unwrap()
+            .inspect_basic(fixture.bootstrap)
+            .unwrap();
+        fixture.user.deny_read = deny_read;
+        fixture.user.deny_write = deny_write;
+        assert_eq!(
+            process_create(
+                &mut fixture.user,
+                &mut fixture.registry,
+                &mut fixture.tasks,
+                &mut fixture.regions,
+                &mut fixture.spaces,
+                fixture.current,
+                DwUserAddress(ARGS),
+                u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE),
+                DwUserAddress(OUT),
+                u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE),
+                &mut CleanupQueue::new()
+            ),
+            DW_STATUS_BAD_ADDRESS,
+            "{name}"
+        );
+        assert_eq!(
+            fixture.registry.test_slot_generations(),
+            generations,
+            "{name}"
+        );
+        assert_f10_failure_preserves_caller(&fixture, OUT, [0xa5; 64], handles, bootstrap);
+        fixture.user.deny_read = false;
+        fixture.user.deny_write = false;
+        close_f10_fixture(fixture);
+    }
+}
+
+#[test]
+fn process_create_resolves_authorities_in_contract_order_without_publication() {
+    use deepwyrm_abi::{DW_PROCESS_CREATE_ARGS_V1_SIZE, DW_PROCESS_CREATE_RESULT_V1_SIZE};
+
+    const ARGS: u64 = BASE + 0x600;
+    const OUT: u64 = BASE + 0x700;
+
+    for (name, task_group, bootstrap_channel) in [
+        ("task-group-wrong-type", "bootstrap", "bootstrap"),
+        ("bootstrap-wrong-type", "parent", "parent"),
+    ] {
+        let mut fixture = f10_fixture();
+        let (process_rights, root_rights, child_rights) = f10_rights();
+        let task_group = if task_group == "bootstrap" {
+            fixture.bootstrap
+        } else {
+            fixture.parent_group
+        };
+        let bootstrap_channel = if bootstrap_channel == "bootstrap" {
+            fixture.bootstrap
+        } else {
+            fixture.parent_group
+        };
+        write_process_create_args(
+            &mut fixture.user,
+            ARGS,
+            task_group,
+            bootstrap_channel,
+            process_rights,
+            root_rights,
+            child_rights,
+        );
+        fixture.user.bytes[FakeUserMemory::offset(OUT, 64)..FakeUserMemory::offset(OUT, 64) + 64]
+            .fill(0xa5);
+        let handles = fixture.tasks.process_handle_count(fixture.current).unwrap();
+        let source = fixture
+            .tasks
+            .process_handles(fixture.current)
+            .unwrap()
+            .inspect_basic(fixture.bootstrap)
+            .unwrap();
+        assert_eq!(
+            process_create(
+                &mut fixture.user,
+                &mut fixture.registry,
+                &mut fixture.tasks,
+                &mut fixture.regions,
+                &mut fixture.spaces,
+                fixture.current,
+                DwUserAddress(ARGS),
+                u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE),
+                DwUserAddress(OUT),
+                u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE),
+                &mut CleanupQueue::new(),
+            ),
+            DW_STATUS_WRONG_OBJECT_TYPE,
+            "{name}"
+        );
+        assert_f10_failure_preserves_caller(&fixture, OUT, [0xa5; 64], handles, source);
+        close_f10_fixture(fixture);
+    }
+
+    for (name, parent_rights, source_rights, expected) in [
+        (
+            "task-group-missing-modify",
+            DwRights(DW_RIGHT_INSPECT.0),
+            DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_TRANSFER.0 | DW_RIGHT_INSPECT.0),
+            DW_STATUS_ACCESS_DENIED,
+        ),
+        (
+            "bootstrap-missing-transfer",
+            DwRights(DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0),
+            DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_INSPECT.0),
+            DW_STATUS_ACCESS_DENIED,
+        ),
+    ] {
+        let mut fixture = f10_fixture_with_rights(parent_rights, source_rights);
+        write_valid_f10_args(&mut fixture, ARGS);
+        fixture.user.bytes[FakeUserMemory::offset(OUT, 64)..FakeUserMemory::offset(OUT, 64) + 64]
+            .fill(0xa5);
+        let handles = fixture.tasks.process_handle_count(fixture.current).unwrap();
+        let source = fixture
+            .tasks
+            .process_handles(fixture.current)
+            .unwrap()
+            .inspect_basic(fixture.bootstrap)
+            .unwrap();
+        assert_eq!(
+            process_create(
+                &mut fixture.user,
+                &mut fixture.registry,
+                &mut fixture.tasks,
+                &mut fixture.regions,
+                &mut fixture.spaces,
+                fixture.current,
+                DwUserAddress(ARGS),
+                u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE),
+                DwUserAddress(OUT),
+                u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE),
+                &mut CleanupQueue::new(),
+            ),
+            expected,
+            "{name}"
+        );
+        assert_f10_failure_preserves_caller(&fixture, OUT, [0xa5; 64], handles, source);
+        close_f10_fixture(fixture);
+    }
+
+    let mut fixture = f10_fixture();
+    write_valid_f10_args(&mut fixture, ARGS);
+    fixture.user.bytes[FakeUserMemory::offset(OUT, 64)..FakeUserMemory::offset(OUT, 64) + 64]
+        .fill(0xa5);
+    let handles = fixture.tasks.process_handle_count(fixture.current).unwrap();
+    let source = fixture
+        .tasks
+        .process_handles(fixture.current)
+        .unwrap()
+        .inspect_basic(fixture.bootstrap)
+        .unwrap();
+    let mut cleanup = CleanupQueue::<16>::new();
+    let parent_pin = resolve_current_handle(
+        &fixture.tasks,
+        &mut fixture.registry,
+        fixture.current,
+        fixture.parent_group,
+        DW_OBJECT_TYPE_TASK_GROUP,
+        DW_RIGHT_INSPECT,
+    )
+    .unwrap();
+    let parent = TaskGroupKey::from_object_id(parent_pin.id());
+    release_lookup_pin(&mut fixture.registry, parent_pin, &mut cleanup);
+    assert_eq!(
+        fixture
+            .tasks
+            .terminate_group(&mut fixture.registry, parent)
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        process_create(
+            &mut fixture.user,
+            &mut fixture.registry,
+            &mut fixture.tasks,
+            &mut fixture.regions,
+            &mut fixture.spaces,
+            fixture.current,
+            DwUserAddress(ARGS),
+            u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE),
+            DwUserAddress(OUT),
+            u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE),
+            &mut cleanup,
+        ),
+        DW_STATUS_BAD_STATE,
+        "terminated task group"
+    );
+    assert_f10_failure_preserves_caller(&fixture, OUT, [0xa5; 64], handles, source);
+    finish_f10_task_cleanup(&mut fixture.registry, &mut fixture.tasks, cleanup);
+    close_f10_fixture(fixture);
+
+    let mut fixture = f10_fixture();
+    write_valid_f10_args(&mut fixture, ARGS);
+    fixture.user.bytes[FakeUserMemory::offset(OUT, 64)..FakeUserMemory::offset(OUT, 64) + 64]
+        .fill(0xa5);
+    let mut cleanup = CleanupQueue::<16>::new();
+    assert_eq!(
+        handle_close(
+            &mut fixture.registry,
+            &mut fixture.tasks,
+            fixture.current,
+            fixture.parent_group,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let handles = fixture.tasks.process_handle_count(fixture.current).unwrap();
+    let source = fixture
+        .tasks
+        .process_handles(fixture.current)
+        .unwrap()
+        .inspect_basic(fixture.bootstrap)
+        .unwrap();
+    assert_eq!(
+        process_create(
+            &mut fixture.user,
+            &mut fixture.registry,
+            &mut fixture.tasks,
+            &mut fixture.regions,
+            &mut fixture.spaces,
+            fixture.current,
+            DwUserAddress(ARGS),
+            u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE),
+            DwUserAddress(OUT),
+            u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE),
+            &mut cleanup,
+        ),
+        DW_STATUS_BAD_HANDLE,
+        "stale task group"
+    );
+    assert_f10_failure_preserves_caller(&fixture, OUT, [0xa5; 64], handles, source);
+    finish_f10_task_cleanup(&mut fixture.registry, &mut fixture.tasks, cleanup);
+    close_f10_fixture_with_open_channels(fixture, true, true, false);
+
+    let mut fixture = f10_fixture();
+    write_valid_f10_args(&mut fixture, ARGS);
+    fixture.user.bytes[FakeUserMemory::offset(OUT, 64)..FakeUserMemory::offset(OUT, 64) + 64]
+        .fill(0xa5);
+    let mut cleanup = CleanupQueue::<16>::new();
+    let current = fixture.current;
+    let bootstrap = fixture.bootstrap;
+    close_f10_channel(&mut fixture, current, bootstrap);
+    let handles = fixture.tasks.process_handle_count(fixture.current).unwrap();
+    assert_eq!(
+        process_create(
+            &mut fixture.user,
+            &mut fixture.registry,
+            &mut fixture.tasks,
+            &mut fixture.regions,
+            &mut fixture.spaces,
+            fixture.current,
+            DwUserAddress(ARGS),
+            u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE),
+            DwUserAddress(OUT),
+            u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE),
+            &mut cleanup,
+        ),
+        DW_STATUS_BAD_HANDLE,
+        "stale bootstrap"
+    );
+    assert_eq!(fixture.user.owned_outputs, 0);
+    assert_eq!(
+        fixture.tasks.process_handle_count(fixture.current).unwrap(),
+        handles
+    );
+    assert_eq!(
+        fixture
+            .tasks
+            .process_handles(fixture.current)
+            .unwrap()
+            .inspect_basic(fixture.bootstrap),
+        Err(crate::handle::HandleTableError::InvalidHandle)
+    );
+    assert_eq!(
+        &fixture.user.bytes[FakeUserMemory::offset(OUT, 64)..FakeUserMemory::offset(OUT, 64) + 64],
+        &[0xa5; 64]
+    );
+    finish_f10_task_cleanup(&mut fixture.registry, &mut fixture.tasks, cleanup);
+    close_f10_fixture_with_open_channels(fixture, false, true, true);
+}
+
+#[test]
+fn process_create_parent_result_capacity_failure_rolls_back_before_source_move() {
+    use deepwyrm_abi::{DW_PROCESS_CREATE_ARGS_V1_SIZE, DW_PROCESS_CREATE_RESULT_V1_SIZE};
+
+    const ARGS: u64 = BASE + 0x600;
+    const OUT: u64 = BASE + 0x700;
+    let mut fixture = f10_fixture();
+    write_valid_f10_args(&mut fixture, ARGS);
+    fixture.user.bytes[FakeUserMemory::offset(OUT, 64)..FakeUserMemory::offset(OUT, 64) + 64]
+        .fill(0xa5);
+    let mut fillers = [DwHandle(0); 3];
+    for (index, filler) in fillers.iter_mut().enumerate() {
+        let output = BASE + 0x300 + u64::try_from(index).unwrap() * 8;
+        assert_eq!(
+            handle_duplicate(
+                &mut fixture.user,
+                &mut fixture.registry,
+                &mut fixture.tasks,
+                fixture.current,
+                fixture.current_process,
+                DW_RIGHT_INSPECT,
+                DwUserAddress(output),
+            ),
+            DW_STATUS_SUCCESS
+        );
+        *filler = DwHandle(u64_at(&fixture.user, output));
+    }
+    assert_eq!(
+        fixture.tasks.process_handle_count(fixture.current).unwrap(),
+        7
+    );
+    let source = fixture
+        .tasks
+        .process_handles(fixture.current)
+        .unwrap()
+        .inspect_basic(fixture.bootstrap)
+        .unwrap();
+    let mut cleanup = CleanupQueue::<16>::new();
+    assert_eq!(
+        process_create(
+            &mut fixture.user,
+            &mut fixture.registry,
+            &mut fixture.tasks,
+            &mut fixture.regions,
+            &mut fixture.spaces,
+            fixture.current,
+            DwUserAddress(ARGS),
+            u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE),
+            DwUserAddress(OUT),
+            u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE),
+            &mut cleanup,
+        ),
+        DW_STATUS_NO_RESOURCES
+    );
+    assert_f10_failure_preserves_caller(&fixture, OUT, [0xa5; 64], 7, source);
+    for filler in fillers {
+        assert_eq!(
+            handle_close(
+                &mut fixture.registry,
+                &mut fixture.tasks,
+                fixture.current,
+                filler,
+                &mut cleanup,
+            ),
+            DW_STATUS_SUCCESS
+        );
+    }
+    finish_f10_task_cleanup(&mut fixture.registry, &mut fixture.tasks, cleanup);
+    close_f10_fixture(fixture);
+}
+
+#[test]
+fn process_create_injected_precommit_boundaries_rollback_every_authority() {
+    use deepwyrm_abi::{DW_PROCESS_CREATE_ARGS_V1_SIZE, DW_PROCESS_CREATE_RESULT_V1_SIZE};
+
+    const ARGS: u64 = BASE + 0x600;
+    const OUT: u64 = BASE + 0x700;
+    for stage in [
+        ProcessCreatePreparation::BootstrapMove,
+        ProcessCreatePreparation::ProcessShell,
+        ProcessCreatePreparation::ChildBootstrapSlot,
+        ProcessCreatePreparation::RootRegion,
+        ProcessCreatePreparation::ParentResultSlots,
+    ] {
+        let mut fixture = f10_fixture();
+        write_valid_f10_args(&mut fixture, ARGS);
+        fixture.user.bytes[FakeUserMemory::offset(OUT, 64)..FakeUserMemory::offset(OUT, 64) + 64]
+            .fill(0xa5);
+        let caller_handles = fixture.tasks.process_handle_count(fixture.current).unwrap();
+        let bootstrap = fixture
+            .tasks
+            .process_handles(fixture.current)
+            .unwrap()
+            .inspect_basic(fixture.bootstrap)
+            .unwrap();
+        let generations = fixture.registry.test_slot_generations();
+
+        // Three retries exercise the two spare Process/root/address-space slots.
+        // A cancelled reservation leak would turn one of these into an early
+        // capacity failure instead of reaching this exact injection boundary.
+        for retry in 0..3 {
+            let mut cleanup = CleanupQueue::<16>::new();
+            let mut observed = false;
+            assert_eq!(
+                process_create_transaction(
+                    &mut fixture.user,
+                    &mut fixture.registry,
+                    &mut fixture.tasks,
+                    &mut fixture.regions,
+                    &mut fixture.spaces,
+                    fixture.current,
+                    DwUserAddress(ARGS),
+                    u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE),
+                    DwUserAddress(OUT),
+                    u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE),
+                    &mut cleanup,
+                    |candidate| {
+                        if candidate == stage {
+                            observed = true;
+                            Err(DW_STATUS_NO_RESOURCES)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                ),
+                DW_STATUS_NO_RESOURCES,
+                "{stage:?} retry {retry}"
+            );
+            assert!(observed, "{stage:?} retry {retry} was not reached");
+            assert_f10_failure_preserves_caller(
+                &fixture,
+                OUT,
+                [0xa5; 64],
+                caller_handles,
+                bootstrap,
+            );
+            finish_f10_task_cleanup(&mut fixture.registry, &mut fixture.tasks, cleanup);
+        }
+        let after_failures = fixture.registry.test_slot_generations();
+        assert!(
+            after_failures
+                .iter()
+                .zip(generations)
+                .all(|(after, before)| after >= &before),
+            "{stage:?} rollback regressed an object generation"
+        );
+
+        // The ordinary success probe proves that cancellation returned every
+        // Process/root/address-space capacity, not merely caller-visible state.
+        let mut cleanup = CleanupQueue::<16>::new();
+        assert_eq!(
+            process_create(
+                &mut fixture.user,
+                &mut fixture.registry,
+                &mut fixture.tasks,
+                &mut fixture.regions,
+                &mut fixture.spaces,
+                fixture.current,
+                DwUserAddress(ARGS),
+                u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE),
+                DwUserAddress(OUT),
+                u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE),
+                &mut cleanup,
+            ),
+            DW_STATUS_SUCCESS,
+            "{stage:?} capacity retry"
+        );
+        let child_pin = resolve_current_handle(
+            &fixture.tasks,
+            &mut fixture.registry,
+            fixture.current,
+            DwHandle(u64_at(&fixture.user, OUT + 8)),
+            DW_OBJECT_TYPE_PROCESS,
+            DW_RIGHT_INSPECT,
+        )
+        .unwrap();
+        let child = ProcessKey::from_object_id(child_pin.id());
+        release_lookup_pin(&mut fixture.registry, child_pin, &mut cleanup);
+        let result_process = DwHandle(u64_at(&fixture.user, OUT + 8));
+        let result_root = DwHandle(u64_at(&fixture.user, OUT + 16));
+        let child_bootstrap = DwHandle(u64_at(&fixture.user, OUT + 24));
+        retire_f10_created_process(
+            &mut fixture,
+            child,
+            result_process,
+            result_root,
+            child_bootstrap,
+            &mut cleanup,
+        );
+        close_f10_fixture_with_open_channels(fixture, false, true, true);
+    }
+}
+
+#[test]
+fn process_create_commits_typed_results_and_child_bootstrap_metadata() {
+    use deepwyrm_abi::{
+        DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_PROCESS, DW_PROCESS_CREATE_ARGS_V1_SIZE,
+        DW_PROCESS_CREATE_RESULT_V1_SIZE, DW_RIGHT_READ, DW_TASK_STATE_CREATED,
+    };
+
+    const ARGS: u64 = BASE + 0x600;
+    const OUT: u64 = BASE + 0x700;
+    let mut fixture = f10_fixture();
+    write_valid_f10_args(&mut fixture, ARGS);
+    let (process_rights, root_rights, bootstrap_rights) = f10_rights();
+    let mut cleanup = CleanupQueue::<16>::new();
+    assert_eq!(
+        process_create(
+            &mut fixture.user,
+            &mut fixture.registry,
+            &mut fixture.tasks,
+            &mut fixture.regions,
+            &mut fixture.spaces,
+            fixture.current,
+            DwUserAddress(ARGS),
+            u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE),
+            DwUserAddress(OUT),
+            u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE),
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(fixture.user.owned_outputs, 0);
+    let result_process = DwHandle(u64_at(&fixture.user, OUT + 8));
+    let result_root = DwHandle(u64_at(&fixture.user, OUT + 16));
+    let child_bootstrap = DwHandle(u64_at(&fixture.user, OUT + 24));
+    assert_eq!(u32_at(&fixture.user, OUT), DW_PROCESS_CREATE_RESULT_V1_SIZE);
+    assert_eq!(u32_at(&fixture.user, OUT + 4), 1);
+    assert_eq!(
+        &fixture.user.bytes
+            [FakeUserMemory::offset(OUT + 32, 32)..FakeUserMemory::offset(OUT + 32, 32) + 32],
+        &[0; 32]
+    );
+
+    let parent_handles = fixture.tasks.process_handles(fixture.current).unwrap();
+    assert_eq!(
+        parent_handles
+            .inspect_basic(result_process)
+            .unwrap()
+            .object_type,
+        DW_OBJECT_TYPE_PROCESS
+    );
+    assert_eq!(
+        parent_handles.inspect_basic(result_process).unwrap().rights,
+        process_rights
+    );
+    assert_eq!(
+        parent_handles
+            .inspect_basic(result_root)
+            .unwrap()
+            .object_type,
+        DW_OBJECT_TYPE_ADDRESS_REGION
+    );
+    assert_eq!(
+        parent_handles.inspect_basic(result_root).unwrap().rights,
+        root_rights
+    );
+    assert_eq!(
+        parent_handles.inspect_basic(fixture.bootstrap),
+        Err(crate::handle::HandleTableError::InvalidHandle)
+    );
+
+    let child_pin = resolve_current_handle(
+        &fixture.tasks,
+        &mut fixture.registry,
+        fixture.current,
+        result_process,
+        DW_OBJECT_TYPE_PROCESS,
+        DW_RIGHT_INSPECT,
+    )
+    .unwrap();
+    let child = ProcessKey::from_object_id(child_pin.id());
+    release_lookup_pin(&mut fixture.registry, child_pin, &mut cleanup);
+    assert_eq!(
+        fixture.tasks.process_info(child).unwrap().state,
+        DW_TASK_STATE_CREATED
+    );
+    assert!(fixture.tasks.root_region(child).unwrap().is_some());
+    let child_bootstrap_pin = fixture
+        .tasks
+        .process_handles(child)
+        .unwrap()
+        .lookup(
+            &mut fixture.registry,
+            child_bootstrap,
+            AcceptedObjectTypes::One(deepwyrm_abi::DW_OBJECT_TYPE_CHANNEL),
+            DW_RIGHT_READ,
+        )
+        .unwrap();
+    assert_eq!(child_bootstrap_pin.rights(), bootstrap_rights);
+    release_lookup_pin(
+        &mut fixture.registry,
+        child_bootstrap_pin.into_internal(),
+        &mut cleanup,
+    );
+
+    // The bootstrap raw value is child-table metadata, not an authority in the
+    // creating table. Only the moved source is required to be stale there.
+    retire_f10_created_process(
+        &mut fixture,
+        child,
+        result_process,
+        result_root,
+        child_bootstrap,
+        &mut cleanup,
+    );
+
+    // Reuse the surviving peer as the second source. This immediately proves
+    // that the terminated child returned both Process and root-region capacity.
+    write_process_create_args(
+        &mut fixture.user,
+        ARGS,
+        fixture.parent_group,
+        fixture.peer,
+        process_rights,
+        root_rights,
+        bootstrap_rights,
+    );
+    assert_eq!(
+        process_create(
+            &mut fixture.user,
+            &mut fixture.registry,
+            &mut fixture.tasks,
+            &mut fixture.regions,
+            &mut fixture.spaces,
+            fixture.current,
+            DwUserAddress(ARGS),
+            u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE),
+            DwUserAddress(OUT),
+            u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE),
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let retry_process = DwHandle(u64_at(&fixture.user, OUT + 8));
+    let retry_root = DwHandle(u64_at(&fixture.user, OUT + 16));
+    let retry_bootstrap = DwHandle(u64_at(&fixture.user, OUT + 24));
+    let retry_pin = resolve_current_handle(
+        &fixture.tasks,
+        &mut fixture.registry,
+        fixture.current,
+        retry_process,
+        DW_OBJECT_TYPE_PROCESS,
+        DW_RIGHT_INSPECT,
+    )
+    .unwrap();
+    let retry_child = ProcessKey::from_object_id(retry_pin.id());
+    release_lookup_pin(&mut fixture.registry, retry_pin, &mut cleanup);
+    retire_f10_created_process(
+        &mut fixture,
+        retry_child,
+        retry_process,
+        retry_root,
+        retry_bootstrap,
+        &mut cleanup,
+    );
+    close_f10_fixture_with_open_channels(fixture, false, false, true);
 }
