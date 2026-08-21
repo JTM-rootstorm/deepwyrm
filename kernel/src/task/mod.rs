@@ -298,6 +298,13 @@ struct TaskGroupRecord<const GROUPS: usize, const PROCESSES: usize> {
     state: TaskGroupState,
     child_groups: [Option<ObjectId>; GROUPS],
     processes: [Option<ObjectId>; PROCESSES],
+    reserved_processes: [Option<ObjectId>; PROCESSES],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessHierarchyState {
+    Reserved(usize),
+    Attached(usize),
 }
 
 struct ProcessRecord<const THREADS: usize, const HANDLES: usize> {
@@ -306,8 +313,61 @@ struct ProcessRecord<const THREADS: usize, const HANDLES: usize> {
     state: TaskStateRecord,
     execution_pin: Option<InternalRef>,
     root_region: Option<ObjectId>,
+    root_region_reserved: bool,
+    hierarchy: ProcessHierarchyState,
     threads: [Option<ObjectId>; THREADS],
     handles: HandleTable<HANDLES>,
+}
+
+/// A fully bound CREATED Process whose parent hierarchy slot is reserved but
+/// not yet discoverable through normal TaskGroup traversal.
+///
+/// The token owns the uninstalled Process handle reference. It must be
+/// committed only after every surrounding F10 preparation succeeds, or
+/// cancelled after any prepared root-region state has been removed.
+#[must_use = "prepared Processes must be committed or cancelled exactly once"]
+pub(crate) struct PreparedProcess {
+    key: ProcessKey,
+    handle: Option<HandleRef>,
+    completed: bool,
+}
+
+impl PreparedProcess {
+    pub(crate) const fn key(&self) -> ProcessKey {
+        self.key
+    }
+
+    pub(crate) fn handle(&self) -> &HandleRef {
+        self.handle
+            .as_ref()
+            .expect("prepared Process retains its unpublished handle")
+    }
+}
+
+/// Reserves the one root-AddressRegion attachment of an unpublished Process
+/// without borrowing its TaskAuthority across F10 HandleTable preparation.
+#[must_use = "prepared root-region attachments must be committed or cancelled exactly once"]
+pub(crate) struct PreparedRootRegionAttachment {
+    process: ProcessKey,
+    completed: bool,
+}
+
+impl Drop for PreparedRootRegionAttachment {
+    fn drop(&mut self) {
+        assert!(
+            self.completed,
+            "prepared root-region attachment dropped without commit or cancellation"
+        );
+    }
+}
+
+impl Drop for PreparedProcess {
+    fn drop(&mut self) {
+        assert!(
+            self.completed,
+            "prepared Process dropped without hierarchy commit or cancellation"
+        );
+    }
 }
 
 struct ThreadRecord {

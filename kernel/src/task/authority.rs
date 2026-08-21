@@ -29,6 +29,7 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             state: TaskGroupState::Active,
             child_groups: [None; GROUPS],
             processes: [None; PROCESSES],
+            reserved_processes: [None; PROCESSES],
         });
         Ok(TaskPayloadBinding::TaskGroup { creation, key })
     }
@@ -80,11 +81,12 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             state: TaskGroupState::Active,
             child_groups: [None; GROUPS],
             processes: [None; PROCESSES],
+            reserved_processes: [None; PROCESSES],
         });
         Ok(TaskPayloadBinding::TaskGroup { creation, key })
     }
 
-    pub(crate) fn bind_process(
+    fn bind_prepared_process(
         &mut self,
         creation: CreationRef,
         parent: InternalRef,
@@ -111,7 +113,14 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             .expect("validated group slot")
             .processes
             .iter()
-            .position(Option::is_none)
+            .zip(
+                self.groups[parent_slot]
+                    .as_ref()
+                    .expect("validated group slot")
+                    .reserved_processes
+                    .iter(),
+            )
+            .position(|(published, reserved)| published.is_none() && reserved.is_none())
         {
             Some(index) => index,
             None => return Err((TaskError::Capacity, creation, parent)),
@@ -124,13 +133,15 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         self.groups[parent_slot]
             .as_mut()
             .expect("validated group slot")
-            .processes[child_index] = Some(creation.id());
+            .reserved_processes[child_index] = Some(creation.id());
         self.processes[slot] = Some(ProcessRecord {
             object: creation.id(),
             parent,
             state: TaskStateRecord::created(),
             execution_pin: None,
             root_region: None,
+            root_region_reserved: false,
+            hierarchy: ProcessHierarchyState::Reserved(child_index),
             threads: [None; THREADS],
             handles: HandleTable::new(),
         });
@@ -193,6 +204,128 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         }
         process.execution_pin = Some(pin);
         Ok(())
+    }
+
+    fn commit_prepared_process(&mut self, key: ProcessKey) {
+        let (parent, reservation) = {
+            let process = self
+                .process(key)
+                .expect("prepared Process record remains live until commit");
+            assert_eq!(
+                process.state.state, DW_TASK_STATE_CREATED,
+                "prepared Process state changed before hierarchy commit"
+            );
+            match process.hierarchy {
+                ProcessHierarchyState::Reserved(slot) => (TaskGroupKey(process.parent.id()), slot),
+                ProcessHierarchyState::Attached(_) => {
+                    panic!("prepared Process hierarchy committed twice")
+                }
+            }
+        };
+        let parent_slot = self
+            .group_slot(parent)
+            .expect("prepared Process parent remains live until commit");
+        let group = self.groups[parent_slot]
+            .as_mut()
+            .expect("prepared Process parent group record remains live");
+        assert_eq!(
+            group.state,
+            TaskGroupState::Active,
+            "prepared Process parent state changed before no-fail commit"
+        );
+        assert_eq!(
+            group.processes[reservation], None,
+            "prepared Process reserved hierarchy slot was published early"
+        );
+        assert_eq!(
+            group.reserved_processes[reservation],
+            Some(key.object_id()),
+            "prepared Process hierarchy reservation identity drifted"
+        );
+        group.reserved_processes[reservation] = None;
+        group.processes[reservation] = Some(key.object_id());
+        self.process_mut(key)
+            .expect("prepared Process record remains live through commit")
+            .hierarchy = ProcessHierarchyState::Attached(reservation);
+    }
+
+    fn take_prepared_process_execution(&mut self, key: ProcessKey) -> InternalRef {
+        let process = self
+            .process_mut(key)
+            .expect("prepared Process record remains live until cancellation");
+        assert_eq!(
+            process.state.state, DW_TASK_STATE_CREATED,
+            "prepared Process state changed before cancellation"
+        );
+        assert!(
+            process.root_region.is_none(),
+            "prepared Process cancellation requires root-region cancellation first"
+        );
+        assert!(
+            process.threads.iter().all(Option::is_none),
+            "prepared Process cancellation cannot retain child Threads"
+        );
+        assert!(
+            process.handles.is_empty(),
+            "prepared Process cancellation cannot retain child Handles"
+        );
+        assert!(
+            matches!(process.hierarchy, ProcessHierarchyState::Reserved(_)),
+            "published Process cannot use prepared cancellation"
+        );
+        process
+            .execution_pin
+            .take()
+            .expect("prepared Process retains its execution pin")
+    }
+
+    pub(crate) fn reserve_root_region_attachment(
+        &mut self,
+        key: ProcessKey,
+    ) -> Result<PreparedRootRegionAttachment, TaskError> {
+        let process = self.process_mut(key)?;
+        if process.state.state != DW_TASK_STATE_CREATED
+            || process.root_region.is_some()
+            || process.root_region_reserved
+        {
+            return Err(TaskError::BadState);
+        }
+        process.root_region_reserved = true;
+        Ok(PreparedRootRegionAttachment {
+            process: key,
+            completed: false,
+        })
+    }
+
+    fn commit_prepared_root_region_attachment(&mut self, key: ProcessKey, object: ObjectId) {
+        let process = self
+            .process_mut(key)
+            .expect("prepared Process record remains live for root attachment");
+        assert_eq!(
+            process.state.state, DW_TASK_STATE_CREATED,
+            "prepared root attachment changed Process state before commit"
+        );
+        assert!(
+            process.root_region.is_none() && process.root_region_reserved,
+            "prepared root attachment reservation drifted before commit"
+        );
+        process.root_region = Some(object);
+        process.root_region_reserved = false;
+    }
+
+    fn cancel_prepared_root_region_attachment(&mut self, key: ProcessKey) {
+        let process = self
+            .process_mut(key)
+            .expect("prepared Process record remains live for root cancellation");
+        assert_eq!(
+            process.state.state, DW_TASK_STATE_CREATED,
+            "prepared root attachment changed Process state before cancellation"
+        );
+        assert!(
+            process.root_region.is_none() && process.root_region_reserved,
+            "prepared root attachment reservation drifted before cancellation"
+        );
+        process.root_region_reserved = false;
     }
 
     pub(crate) fn attach_thread_execution_pin(
@@ -262,7 +395,10 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         object: ObjectId,
     ) -> Result<(), TaskError> {
         let process = self.process_mut(key)?;
-        if process.state.state != DW_TASK_STATE_CREATED || process.root_region.is_some() {
+        if process.state.state != DW_TASK_STATE_CREATED
+            || process.root_region.is_some()
+            || process.root_region_reserved
+        {
             return Err(TaskError::BadState);
         }
         process.root_region = Some(object);
@@ -275,7 +411,10 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         object: ObjectId,
     ) -> Result<(), TaskError> {
         let process = self.process_mut(key)?;
-        if process.state.state != DW_TASK_STATE_CREATED || process.root_region != Some(object) {
+        if process.state.state != DW_TASK_STATE_CREATED
+            || process.root_region != Some(object)
+            || process.root_region_reserved
+        {
             return Err(TaskError::BadState);
         }
         process.root_region = None;
@@ -688,6 +827,10 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             record.processes.iter().all(Option::is_none),
             "finalizing TaskGroup still names processes"
         );
+        assert!(
+            record.reserved_processes.iter().all(Option::is_none),
+            "finalizing TaskGroup still reserves unpublished processes"
+        );
         if let Some(parent) = record.parent.as_ref() {
             let parent_slot = self.group_slot(TaskGroupKey(parent.id()))?;
             let parent_record = self.groups[parent_slot]
@@ -720,11 +863,32 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             record.root_region.is_none(),
             "finalizing Process still names a root AddressRegion"
         );
+        assert!(
+            !record.root_region_reserved,
+            "finalizing Process still reserves a root AddressRegion"
+        );
         let parent_slot = self.group_slot(TaskGroupKey(record.parent.id()))?;
         let parent = self.groups[parent_slot]
             .as_mut()
             .expect("live parent group");
-        remove_child(&mut parent.processes, record.object)?;
+        match record.hierarchy {
+            ProcessHierarchyState::Attached(slot) => {
+                assert_eq!(
+                    parent.processes[slot],
+                    Some(record.object),
+                    "published Process parent hierarchy identity drifted"
+                );
+                parent.processes[slot] = None;
+            }
+            ProcessHierarchyState::Reserved(slot) => {
+                assert_eq!(
+                    parent.reserved_processes[slot],
+                    Some(record.object),
+                    "prepared Process parent reservation identity drifted"
+                );
+                parent.reserved_processes[slot] = None;
+            }
+        }
         Ok(Some(record.parent))
     }
 
@@ -927,11 +1091,11 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         Ok((key, handle))
     }
 
-    pub(crate) fn create_process<const OBJECTS: usize>(
+    pub(crate) fn prepare_process<const OBJECTS: usize>(
         &mut self,
         registry: &mut ObjectRegistry<OBJECTS>,
         parent_owner: &InternalRef,
-    ) -> Result<(ProcessKey, HandleRef), TaskCreateError> {
+    ) -> Result<PreparedProcess, TaskCreateError> {
         let parent = registry
             .retain_internal(parent_owner)
             .map_err(TaskCreateError::Registry)?;
@@ -942,7 +1106,7 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
                 return Err(TaskCreateError::Registry(error));
             }
         };
-        let binding = match self.bind_process(creation, parent) {
+        let binding = match self.bind_prepared_process(creation, parent) {
             Ok(binding) => binding,
             Err((error, creation, parent)) => {
                 registry
@@ -978,7 +1142,23 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             });
         self.attach_process_execution_pin(key, execution)
             .expect("fresh process accepts its execution pin");
-        Ok((key, handle))
+        Ok(PreparedProcess {
+            key,
+            handle: Some(handle),
+            completed: false,
+        })
+    }
+
+    /// Retains the E factory's immediate-publication behavior for existing
+    /// callers. F10 uses `prepare_process` directly to delay hierarchy
+    /// publication until its all-or-nothing commit boundary.
+    pub(crate) fn create_process<const OBJECTS: usize>(
+        &mut self,
+        registry: &mut ObjectRegistry<OBJECTS>,
+        parent_owner: &InternalRef,
+    ) -> Result<(ProcessKey, HandleRef), TaskCreateError> {
+        self.prepare_process(registry, parent_owner)
+            .map(|prepared| prepared.commit(self))
     }
 
     pub(crate) fn create_thread<const OBJECTS: usize>(
@@ -1033,6 +1213,130 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         self.attach_thread_execution_pin(key, execution)
             .expect("fresh thread accepts its execution pin");
         Ok((key, handle))
+    }
+}
+
+impl PreparedProcess {
+    /// Reserves the Process root-region attachment before HandleTable
+    /// reservations are taken, without making a root region discoverable.
+    pub(crate) fn reserve_root_region_attachment<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &self,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    ) -> Result<PreparedRootRegionAttachment, TaskError> {
+        tasks.reserve_root_region_attachment(self.key)
+    }
+
+    /// Publishes the Process into its already-reserved parent hierarchy slot.
+    ///
+    /// This is intentionally infallible: all capacity and state checks belong
+    /// to preparation, before F10 crosses its no-recoverable-failure boundary.
+    pub(crate) fn commit<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        mut self,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    ) -> (ProcessKey, HandleRef) {
+        tasks.commit_prepared_process(self.key);
+        self.completed = true;
+        (
+            self.key,
+            self.handle
+                .take()
+                .expect("prepared Process commit retains its unpublished handle"),
+        )
+    }
+
+    /// Cancels an unpublished Process after every prepared child payload has
+    /// been cancelled. Typed task cleanup happens before generic finalization,
+    /// and the returned parent release remains for the caller's finalizer path.
+    pub(crate) fn cancel<
+        const OBJECTS: usize,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        mut self,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        registry: &mut ObjectRegistry<OBJECTS>,
+    ) -> Option<FinalRelease> {
+        let execution = tasks.take_prepared_process_execution(self.key);
+        assert!(
+            registry
+                .release_internal(execution)
+                .unwrap_or_else(|failure| {
+                    panic!(
+                        "prepared Process execution-pin cancellation lost authority: {:?}",
+                        failure.error()
+                    )
+                })
+                .is_none(),
+            "prepared Process execution pin was unexpectedly final"
+        );
+        let final_release = registry
+            .release_handle(
+                self.handle
+                    .take()
+                    .expect("prepared Process cancellation retains its handle"),
+            )
+            .unwrap_or_else(|failure| {
+                panic!(
+                    "prepared Process handle cancellation lost authority: {:?}",
+                    failure.error()
+                )
+            })
+            .expect("prepared Process handle release must reach typed finalization");
+        let finalization = tasks
+            .take_finalization(final_release)
+            .unwrap_or_else(|failure| {
+                panic!(
+                    "prepared Process typed cancellation diverged: {:?}",
+                    failure.error()
+                )
+            });
+        self.completed = true;
+        complete_task_finalization(registry, finalization)
+    }
+}
+
+impl PreparedRootRegionAttachment {
+    pub(crate) fn process(&self) -> ProcessKey {
+        self.process
+    }
+
+    pub(crate) fn commit<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        mut self,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        object: ObjectId,
+    ) {
+        tasks.commit_prepared_root_region_attachment(self.process, object);
+        self.completed = true;
+    }
+
+    pub(crate) fn cancel<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        mut self,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    ) {
+        tasks.cancel_prepared_root_region_attachment(self.process);
+        self.completed = true;
     }
 }
 
@@ -1105,6 +1409,9 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         let mut process_keys = [None; PROCESSES];
         let mut process_count = 0;
         for record in self.processes.iter().flatten() {
+            if !matches!(record.hierarchy, ProcessHierarchyState::Attached(_)) {
+                continue;
+            }
             let parent_slot = self.group_slot(TaskGroupKey(record.parent.id()))?;
             if selected[parent_slot] {
                 assert!(process_count < PROCESSES, "selected process list overflow");

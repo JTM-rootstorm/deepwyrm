@@ -1,16 +1,13 @@
 use super::*;
-use deepwyrm_abi::{
-    DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_PROCESS, DW_TASK_STATE_CREATED,
-    DW_TASK_STATE_EXITED,
-};
+use deepwyrm_abi::{DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_PROCESS, DW_TASK_STATE_EXITED};
 
 use crate::object::{
     CreationRef, FinalRelease, HandleRef, InternalRef, ObjectId, ObjectRegistry,
     ObjectRegistryError,
 };
 use crate::task::{
-    BlockedOperationError, BlockedOperationRegistry, BlockedOperationsDrained, ProcessKey,
-    TaskAuthority, TaskError,
+    BlockedOperationError, BlockedOperationRegistry, BlockedOperationsDrained,
+    PreparedRootRegionAttachment, ProcessKey, TaskAuthority, TaskError,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,6 +74,25 @@ impl AddressRegionPayloadCleanup {
 pub(crate) struct AddressRegionFinalization {
     final_release: FinalRelease,
     parent: InternalRef,
+}
+
+/// A root AddressRegion payload whose Process attachment is reserved but not
+/// yet published. F10 commits it only after every HandleTable/transfer
+/// reservation has crossed its no-fail boundary.
+#[must_use = "prepared root AddressRegions must be committed or cancelled exactly once"]
+pub(crate) struct PreparedRootRegion<const SLOTS: usize> {
+    binding: Option<AddressRegionPayloadBinding>,
+    attachment: Option<PreparedRootRegionAttachment>,
+    completed: bool,
+}
+
+impl<const SLOTS: usize> Drop for PreparedRootRegion<SLOTS> {
+    fn drop(&mut self) {
+        assert!(
+            self.completed,
+            "prepared root AddressRegion dropped without commit or cancellation"
+        );
+    }
 }
 
 pub(crate) struct AddressRegionObjectAuthority<const OBJECTS: usize, const SLOTS: usize> {
@@ -391,7 +407,7 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
         clippy::too_many_arguments,
         reason = "root-region construction coordinates distinct generic, task, and address-space authorities without hiding ownership in a bag"
     )]
-    pub(crate) fn create_root_region<
+    pub(crate) fn prepare_root_region<
         const REGISTRY_OBJECTS: usize,
         const GROUPS: usize,
         const PROCESSES: usize,
@@ -406,31 +422,31 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
         spaces: &mut AddressSpaceAuthority<SPACES, REGIONS>,
         process: ProcessKey,
         process_handle: &HandleRef,
-    ) -> Result<(AddressRegionObjectKey, HandleRef), AddressRegionObjectError> {
+        attachment: PreparedRootRegionAttachment,
+    ) -> Result<PreparedRootRegion<SLOTS>, AddressRegionObjectError> {
+        if attachment.process() != process {
+            attachment.cancel(tasks);
+            return Err(AddressRegionObjectError::WrongProcess);
+        }
         if process_handle.id() != process.object_id()
             || process_handle.object_type() != DW_OBJECT_TYPE_PROCESS
         {
+            attachment.cancel(tasks);
             return Err(AddressRegionObjectError::WrongProcess);
         }
-        let info = tasks
-            .process_info(process)
-            .map_err(AddressRegionObjectError::Task)?;
-        if info.state != DW_TASK_STATE_CREATED
-            || tasks
-                .root_region(process)
-                .map_err(AddressRegionObjectError::Task)?
-                .is_some()
-        {
-            return Err(AddressRegionObjectError::Task(TaskError::BadState));
-        }
 
-        let parent = registry
-            .retain_internal_from_handle(process_handle)
-            .map_err(AddressRegionObjectError::Registry)?;
+        let parent = match registry.retain_internal_from_handle(process_handle) {
+            Ok(parent) => parent,
+            Err(error) => {
+                attachment.cancel(tasks);
+                return Err(AddressRegionObjectError::Registry(error));
+            }
+        };
         let creation = match registry.create(DW_OBJECT_TYPE_ADDRESS_REGION) {
             Ok(creation) => creation,
             Err(error) => {
                 release_process_parent(registry, parent);
+                attachment.cancel(tasks);
                 return Err(AddressRegionObjectError::Registry(error));
             }
         };
@@ -446,6 +462,7 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
                         )
                     });
                 release_process_parent(registry, parent);
+                attachment.cancel(tasks);
                 return Err(AddressRegionObjectError::Model(error));
             }
         };
@@ -465,6 +482,7 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
                         )
                     });
                 release_process_parent(registry, parent);
+                attachment.cancel(tasks);
                 return Err(AddressRegionObjectError::Model(error));
             }
         };
@@ -486,56 +504,148 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
                         )
                     });
                 release_process_parent(registry, parent);
+                attachment.cancel(tasks);
                 return Err(error);
             }
         };
-        let key = binding.key();
-        if let Err(error) = tasks.attach_root_region(process, key.object_id()) {
-            let (parent, region) = self
-                .rollback_bound(key)
-                .expect("fresh root binding rolls back");
-            spaces
-                .release_region(&region)
-                .expect("unpublished root region identity rolls back");
-            spaces
-                .release_address_space(region.address_space_key())
-                .expect("empty root address space rolls back");
-            registry
-                .cancel_creation(binding.into_creation())
-                .unwrap_or_else(|failure| {
-                    panic!(
-                        "root-region task rollback lost generic creation: {:?}",
-                        failure.error()
-                    )
-                });
-            release_process_parent(registry, parent);
-            return Err(AddressRegionObjectError::Task(error));
-        }
+        Ok(PreparedRootRegion {
+            binding: Some(binding),
+            attachment: Some(attachment),
+            completed: false,
+        })
+    }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the compatibility wrapper preserves the existing root-region factory surface"
+    )]
+    pub(crate) fn create_root_region<
+        const REGISTRY_OBJECTS: usize,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+        const SPACES: usize,
+        const REGIONS: usize,
+    >(
+        &mut self,
+        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        spaces: &mut AddressSpaceAuthority<SPACES, REGIONS>,
+        process: ProcessKey,
+        process_handle: &HandleRef,
+    ) -> Result<(AddressRegionObjectKey, HandleRef), AddressRegionObjectError> {
+        let attachment = tasks
+            .reserve_root_region_attachment(process)
+            .map_err(AddressRegionObjectError::Task)?;
+        self.prepare_root_region(registry, tasks, spaces, process, process_handle, attachment)
+            .map(|prepared| prepared.commit(registry, tasks, self))
+    }
+}
+
+impl<const SLOTS: usize> PreparedRootRegion<SLOTS> {
+    /// Seals the prepared payload, creates its uninstalled parent HandleRef,
+    /// installs the runtime pin, and commits the already-reserved Process
+    /// attachment. Every recoverable operation occurred in preparation.
+    pub(crate) fn commit<
+        const REGISTRY_OBJECTS: usize,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+        const OBJECTS: usize,
+    >(
+        mut self,
+        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        regions: &mut AddressRegionObjectAuthority<OBJECTS, SLOTS>,
+    ) -> (AddressRegionObjectKey, HandleRef) {
+        let binding = self
+            .binding
+            .take()
+            .expect("prepared root AddressRegion retains its payload binding");
+        let key = binding.key();
         let bound = registry
             .finish_payload_binding(binding)
             .unwrap_or_else(|failure| {
                 panic!(
-                    "fresh root AddressRegion binding rejected by registry: {:?}",
+                    "prepared root AddressRegion binding rejected at no-fail commit: {:?}",
                     failure.error()
                 )
             });
         let handle = registry
             .retain_handle_from_bound(&bound)
             .unwrap_or_else(|error| {
-                panic!("fresh root AddressRegion handle retain failed: {error:?}")
+                panic!(
+                    "prepared root AddressRegion handle retain failed at no-fail commit: {error:?}"
+                )
             });
         let runtime_pin = registry
             .bound_into_internal(bound)
             .unwrap_or_else(|failure| {
                 panic!(
-                    "fresh root AddressRegion runtime-pin conversion failed: {:?}",
+                    "prepared root AddressRegion runtime-pin conversion failed at no-fail commit: {:?}",
                     failure.error()
                 )
             });
-        self.attach_runtime_pin(key, runtime_pin)
-            .expect("fresh root AddressRegion accepts its runtime pin");
-        Ok((key, handle))
+        regions
+            .attach_runtime_pin(key, runtime_pin)
+            .expect("prepared root AddressRegion runtime-pin attachment diverged");
+        self.attachment
+            .take()
+            .expect("prepared root AddressRegion retains its Process attachment")
+            .commit(tasks, key.object_id());
+        self.completed = true;
+        (key, handle)
+    }
+
+    /// Cancels the unsealed payload and returns every Process/address-space
+    /// capacity to its pre-prepare state. No generic payload finalizer is
+    /// needed because the creation reference was never sealed.
+    pub(crate) fn cancel<
+        const REGISTRY_OBJECTS: usize,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+        const OBJECTS: usize,
+        const SPACES: usize,
+        const REGIONS: usize,
+    >(
+        mut self,
+        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        spaces: &mut AddressSpaceAuthority<SPACES, REGIONS>,
+        regions: &mut AddressRegionObjectAuthority<OBJECTS, SLOTS>,
+    ) {
+        let binding = self
+            .binding
+            .take()
+            .expect("prepared root AddressRegion cancellation retains its binding");
+        let key = binding.key();
+        let (parent, region) = regions
+            .rollback_bound(key)
+            .expect("prepared root AddressRegion payload rolls back exactly once");
+        spaces
+            .release_region(&region)
+            .expect("prepared root AddressRegion identity rolls back");
+        spaces
+            .release_address_space(region.address_space_key())
+            .expect("prepared root AddressRegion address space rolls back");
+        registry
+            .cancel_creation(binding.into_creation())
+            .unwrap_or_else(|failure| {
+                panic!(
+                    "prepared root AddressRegion generic cancellation lost authority: {:?}",
+                    failure.error()
+                )
+            });
+        release_process_parent(registry, parent);
+        self.attachment
+            .take()
+            .expect("prepared root AddressRegion cancellation retains Process attachment")
+            .cancel(tasks);
+        self.completed = true;
     }
 }
 

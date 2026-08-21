@@ -13,8 +13,9 @@ mod model_tests;
 pub(crate) use table::{
     AcceptedObjectTypes, BasicHandleInfo, DrainResult, HANDLE_TRANSFER_LIMIT,
     HandleBatchReservation, HandleMovePrepareError, HandleMoveRequest, HandlePairReservation,
-    HandleTable, HandleTableError, HandleTransferBatch, InstallError, PublishedHandleInfo,
-    ResolvedHandle,
+    HandleReservationSpec, HandleTable, HandleTableError, HandleTransferBatch,
+    HandleTransferReservation, InstallError, PreparedHandleMove, PreparedHandleMoveRollback,
+    PublishedHandleInfo, ResolvedHandle, TypedHandlePairReservation,
 };
 
 #[cfg(any(test, feature = "test-support"))]

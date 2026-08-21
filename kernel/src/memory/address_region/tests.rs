@@ -969,6 +969,45 @@ fn root_region_handle_close_preserves_address_space_until_process_exit() {
     unsafe_code,
     reason = "test-local AddressSpaceAuthority uniquely owns its synthetic address-space identities"
 )]
+fn prepared_root_region_cancel_restores_process_and_address_space_capacity() {
+    type Tasks = TaskAuthority<2, 2, 2, 2>;
+    let mut registry = ObjectRegistry::<8>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let prepared_process = tasks.prepare_process(&mut registry, &root_owner).unwrap();
+    let attachment = prepared_process
+        .reserve_root_region_attachment(&mut tasks)
+        .unwrap();
+    let mut spaces = unsafe { AddressSpaceAuthority::<1, 1>::new() };
+    let mut regions = AddressRegionObjectAuthority::<1, 4>::new();
+
+    let prepared_region = regions
+        .prepare_root_region(
+            &mut registry,
+            &mut tasks,
+            &mut spaces,
+            prepared_process.key(),
+            prepared_process.handle(),
+            attachment,
+        )
+        .unwrap();
+    assert_eq!(tasks.root_region(prepared_process.key()).unwrap(), None);
+    prepared_region.cancel(&mut registry, &mut tasks, &mut spaces, &mut regions);
+    assert_eq!(tasks.root_region(prepared_process.key()).unwrap(), None);
+
+    let space = spaces.create_address_space().unwrap();
+    spaces.release_address_space(space).unwrap();
+    assert!(prepared_process.cancel(&mut tasks, &mut registry).is_none());
+    let root_final = registry.release_internal(root_owner).unwrap().unwrap();
+    let root_finalization = tasks.take_finalization(root_final).unwrap();
+    assert!(complete_task_finalization(&mut registry, root_finalization).is_none());
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "test-local AddressSpaceAuthority uniquely owns its synthetic address-space identities"
+)]
 fn address_space_identity_release_refuses_live_region_records() {
     let mut spaces = unsafe { AddressSpaceAuthority::<1, 1>::new() };
     let address_space = spaces.create_address_space().unwrap();

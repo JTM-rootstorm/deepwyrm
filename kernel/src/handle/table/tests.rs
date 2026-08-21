@@ -755,3 +755,200 @@ fn transfer_counts_zero_through_abi_max_preserve_mixed_object_authority() {
         }
     }
 }
+
+#[test]
+fn owned_single_move_preparation_releases_table_before_exact_cancel_or_child_publication() {
+    let mut registry = ObjectRegistry::<1>::new();
+    let mut parent = HandleTable::<1>::new();
+    let mut child = HandleTable::<1>::new();
+    let held = dw_object_compatible_rights(DW_OBJECT_TYPE_CHANNEL);
+    let reduced = rights(&[DW_RIGHT_READ, DW_RIGHT_WRITE]);
+    let bootstrap = install_object(&mut registry, &mut parent, DW_OBJECT_TYPE_CHANNEL, held);
+
+    let prepared = parent
+        .prepare_move(HandleMoveRequest {
+            handle: bootstrap,
+            requested_rights: reduced,
+        })
+        .unwrap();
+    let reservation = child.reserve_transfer_destination().unwrap();
+    drop(reservation);
+    assert!(
+        child.is_empty(),
+        "unpublished child reservation must be inert"
+    );
+
+    let (rollback, token) = prepared.extract(&mut parent);
+    assert_eq!(
+        parent.inspect_basic(bootstrap),
+        Err(HandleTableError::InvalidHandle),
+        "the source is hidden only after explicit extraction"
+    );
+    rollback.rollback(&mut parent, token);
+    assert_eq!(parent.inspect_basic(bootstrap).unwrap().rights, held);
+    assert!(child.is_empty());
+
+    let prepared = parent
+        .prepare_move(HandleMoveRequest {
+            handle: bootstrap,
+            requested_rights: reduced,
+        })
+        .unwrap();
+    let destination = child.reserve_transfer_destination().unwrap();
+    let (rollback, token) = prepared.extract(&mut parent);
+    let published = destination.publish(&mut child, token);
+    rollback.finish(&mut parent);
+
+    assert_eq!(
+        parent.inspect_basic(bootstrap),
+        Err(HandleTableError::InvalidHandle)
+    );
+    assert_eq!(published.rights, reduced);
+    assert_eq!(published.object_type, DW_OBJECT_TYPE_CHANNEL);
+    let resolved = child
+        .lookup(
+            &mut registry,
+            published.handle,
+            AcceptedObjectTypes::One(DW_OBJECT_TYPE_CHANNEL),
+            DW_RIGHT_READ,
+        )
+        .unwrap();
+    assert_eq!(resolved.rights(), reduced);
+    assert!(
+        registry
+            .release_internal(resolved.into_internal())
+            .unwrap()
+            .is_none()
+    );
+
+    let final_release = child.close(&mut registry, published.handle).unwrap();
+    complete(&mut registry, final_release);
+}
+
+#[test]
+fn owned_typed_pair_reserves_and_publishes_heterogeneous_parent_results() {
+    let mut registry = ObjectRegistry::<2>::new();
+    let mut table = HandleTable::<2>::new();
+    let process = registry.create(DW_OBJECT_TYPE_PROCESS).unwrap();
+    let process = registry.creation_into_handle(process).unwrap();
+    let region = registry.create(DW_OBJECT_TYPE_ADDRESS_REGION).unwrap();
+    let region = registry.creation_into_handle(region).unwrap();
+    let specs = [
+        HandleReservationSpec {
+            object_type: DW_OBJECT_TYPE_PROCESS,
+            rights: DW_RIGHT_WAIT,
+        },
+        HandleReservationSpec {
+            object_type: DW_OBJECT_TYPE_ADDRESS_REGION,
+            rights: DW_RIGHT_MAP,
+        },
+    ];
+
+    let reservation = table.reserve_typed_pair(specs).unwrap();
+    assert!(
+        table.is_empty(),
+        "reservation must not publish a partial result"
+    );
+    let handles = reservation.publish(&mut table, [process, region]);
+    assert_eq!(table.len(), 2);
+    let process_pin = table
+        .lookup(
+            &mut registry,
+            handles[0],
+            AcceptedObjectTypes::One(DW_OBJECT_TYPE_PROCESS),
+            DW_RIGHT_WAIT,
+        )
+        .unwrap();
+    assert_eq!(process_pin.rights(), DW_RIGHT_WAIT);
+    let region_pin = table
+        .lookup(
+            &mut registry,
+            handles[1],
+            AcceptedObjectTypes::One(DW_OBJECT_TYPE_ADDRESS_REGION),
+            DW_RIGHT_MAP,
+        )
+        .unwrap();
+    assert_eq!(region_pin.rights(), DW_RIGHT_MAP);
+    assert!(
+        registry
+            .release_internal(process_pin.into_internal())
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        registry
+            .release_internal(region_pin.into_internal())
+            .unwrap()
+            .is_none()
+    );
+
+    let drained = table.drain(&mut registry);
+    assert_eq!(drained.final_release_count(), 2);
+    for final_release in drained.into_final_releases().into_iter().flatten() {
+        registry.complete_finalization(final_release).unwrap();
+    }
+}
+
+#[test]
+fn owned_typed_pair_rejects_invalid_specs_and_capacity_without_publication() {
+    let mut table = HandleTable::<1>::new();
+    assert!(matches!(
+        table.reserve_typed_pair([
+            HandleReservationSpec {
+                object_type: DW_OBJECT_TYPE_PROCESS,
+                rights: DwRights(0),
+            },
+            HandleReservationSpec {
+                object_type: DW_OBJECT_TYPE_ADDRESS_REGION,
+                rights: DW_RIGHT_MAP,
+            },
+        ]),
+        Err(HandleTableError::InvalidRights)
+    ));
+    assert!(table.is_empty());
+    assert!(matches!(
+        table.reserve_typed_pair([
+            HandleReservationSpec {
+                object_type: DW_OBJECT_TYPE_PROCESS,
+                rights: DW_RIGHT_WAIT,
+            },
+            HandleReservationSpec {
+                object_type: DW_OBJECT_TYPE_ADDRESS_REGION,
+                rights: DW_RIGHT_MAP,
+            },
+        ]),
+        Err(HandleTableError::Capacity)
+    ));
+    assert!(table.is_empty());
+}
+
+#[test]
+fn owned_typed_pair_rejects_type_drift_before_partial_publication() {
+    let mut registry = ObjectRegistry::<2>::new();
+    let mut table = HandleTable::<2>::new();
+    let process_creation = registry.create(DW_OBJECT_TYPE_PROCESS).unwrap();
+    let process = registry.creation_into_handle(process_creation).unwrap();
+    let region_creation = registry.create(DW_OBJECT_TYPE_ADDRESS_REGION).unwrap();
+    let region = registry.creation_into_handle(region_creation).unwrap();
+    let reservation = table
+        .reserve_typed_pair([
+            HandleReservationSpec {
+                object_type: DW_OBJECT_TYPE_PROCESS,
+                rights: DW_RIGHT_WAIT,
+            },
+            HandleReservationSpec {
+                object_type: DW_OBJECT_TYPE_ADDRESS_REGION,
+                rights: DW_RIGHT_MAP,
+            },
+        ])
+        .unwrap();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = reservation.publish(&mut table, [region, process]);
+    }));
+    assert!(result.is_err());
+    assert!(
+        table.is_empty(),
+        "type validation must run before either reserved slot is published"
+    );
+}

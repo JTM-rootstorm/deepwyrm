@@ -354,6 +354,40 @@ fn failed_child_creation_rolls_back_generic_slot_and_parent_pin() {
 }
 
 #[test]
+fn prepared_process_is_hidden_from_group_teardown_and_cancels_afterwards() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let prepared = tasks.prepare_process(&mut registry, &root_owner).unwrap();
+    let process = prepared.key();
+
+    let root_slot = tasks
+        .groups
+        .iter()
+        .position(|record| {
+            record
+                .as_ref()
+                .is_some_and(|record| record.object == root.object_id())
+        })
+        .unwrap();
+    let root_record = tasks.groups[root_slot].as_ref().unwrap();
+    assert!(root_record.processes.iter().all(Option::is_none));
+    assert!(
+        root_record
+            .reserved_processes
+            .iter()
+            .any(|object| *object == Some(process.object_id()))
+    );
+
+    let effects = tasks.terminate_group(&mut registry, root).unwrap();
+    assert_eq!(effects.len(), 0);
+    assert!(prepared.cancel(&mut tasks, &mut registry).is_none());
+
+    let root_final = registry.release_internal(root_owner).unwrap().unwrap();
+    finish_task_release(&mut tasks, &mut registry, root_final);
+}
+
+#[test]
 fn explicit_thread_termination_returns_execution_resources_and_closes_final_thread_process() {
     let mut registry = ObjectRegistry::<OBJECTS>::new();
     let mut tasks = Tasks::new();
