@@ -450,10 +450,11 @@ impl<const THREADS: usize> RetiredExitPins<THREADS> {
     }
 }
 
-#[must_use = "exception termination drains handles and returns generic pins for typed finalization"]
+#[must_use = "exception termination must reclaim current execution ownership after a divergent handoff"]
 pub(crate) struct RetiredProcessException<const HANDLES: usize, const THREADS: usize> {
     pub(crate) drained: super::DrainResult<HANDLES>,
     pub(crate) pins: RetiredExitPins<THREADS>,
+    pub(crate) deferred_current: DeferredCurrentExecutionResources,
 }
 
 /// E3 owner for the run queue and exact per-thread execution resources.
@@ -649,6 +650,16 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         &self,
         pins: ExitPins<THREADS>,
     ) -> RetiredExitPins<THREADS> {
+        if let Some(current) = self.scheduler.current() {
+            assert!(
+                !pins
+                    .thread_keys()
+                    .into_iter()
+                    .flatten()
+                    .any(|thread| thread == current),
+                "immediate terminal retirement contained the physical current Thread"
+            );
+        }
         self.retire_exit_pins_inner(pins, None).0
     }
 
@@ -664,6 +675,13 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
             self.scheduler.current(),
             Some(current),
             "deferred terminal retirement did not name the physical current Thread"
+        );
+        assert!(
+            pins.thread_keys()
+                .into_iter()
+                .flatten()
+                .any(|thread| thread == current),
+            "deferred terminal retirement batch did not contain the physical current Thread"
         );
         let (pins, deferred) = self.retire_exit_pins_inner(pins, Some(current));
         (
@@ -787,10 +805,12 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
             exception.detail,
             exception.fault_address,
         )?;
-        let pins = self.retire_exit_pins(effects.pins);
+        let (pins, deferred_current) =
+            self.retire_exit_pins_defer_current(effects.pins, faulting_thread);
         Ok(RetiredProcessException {
             drained: effects.drained,
             pins,
+            deferred_current,
         })
     }
 

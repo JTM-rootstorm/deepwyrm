@@ -3018,9 +3018,32 @@ fn collect_group_effects<
     terminal_waits: &mut C,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> Option<DeferredCurrentExecutionResources> {
-    let mut deferred = None;
-    for process in effects.into_processes().into_iter().flatten() {
-        if let Some(current) = collect_process_effects(
+    let mut processes = effects.into_processes();
+    let mut current_process = None;
+    for process in &mut processes {
+        let contains_current = process.as_ref().is_some_and(|effects| {
+            effects
+                .pins
+                .thread_keys()
+                .into_iter()
+                .flatten()
+                .any(|thread| thread == current_thread)
+        });
+        if contains_current {
+            assert!(
+                current_process.is_none(),
+                "group retirement produced duplicate current-Thread process batches"
+            );
+            current_process = process.take();
+        }
+    }
+
+    // Retire every non-current batch first so scheduler.current() continues to
+    // identify the physical Thread whose stack is executing this syscall.  The
+    // current batch must be the final scheduler mutation before architecture
+    // code diverges onto the terminal reaper stack.
+    for process in processes.into_iter().flatten() {
+        let deferred = collect_process_effects(
             registry,
             execution,
             waits,
@@ -3028,14 +3051,25 @@ fn collect_group_effects<
             Some(current_thread),
             terminal_waits,
             cleanup,
-        ) {
-            assert!(
-                deferred.replace(current).is_none(),
-                "group retirement produced duplicate deferred current resources"
-            );
-        }
+        );
+        assert!(
+            deferred.is_none(),
+            "non-current group batch produced deferred current resources"
+        );
     }
-    deferred
+
+    current_process.map(|process| {
+        collect_process_effects(
+            registry,
+            execution,
+            waits,
+            process,
+            Some(current_thread),
+            terminal_waits,
+            cleanup,
+        )
+        .expect("current group batch did not preserve deferred execution ownership")
+    })
 }
 
 fn authorized_reason(reason: DwTerminationReason) -> Result<(), DwStatus> {

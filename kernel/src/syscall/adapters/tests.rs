@@ -2722,8 +2722,13 @@ fn thread_start_validates_the_target_process_address_space() {
     );
     assert_eq!(execution.schedule_next().unwrap().current, Some(thread));
     let pins = tasks.exit_thread(thread, 0).unwrap();
-    let retired = execution.retire_exit_pins(pins);
+    let (retired, deferred) = execution.retire_exit_pins_defer_current(pins, thread);
     let (process_pin, thread_pins) = retired.into_parts();
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        cleanup.push_optional(registry.release_internal(pin).unwrap());
+    }
+    let deferred_pins = execution.reclaim_deferred_current(deferred);
+    let (process_pin, thread_pins) = deferred_pins.into_parts();
     for pin in thread_pins.into_iter().flatten().chain(process_pin) {
         cleanup.push_optional(registry.release_internal(pin).unwrap());
     }
