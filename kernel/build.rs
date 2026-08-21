@@ -1025,8 +1025,8 @@ fn parse_guest_test_mappings(source: &str) -> Result<BTreeMap<String, u32>, Stri
                         "line {line_number}: unsupported or duplicate top-level key `{key}`"
                     ));
                 }
-                if parse_u64(value)? != 1 {
-                    return Err("guest harness schema_version must be 1".into());
+                if parse_u64(value)? != 2 {
+                    return Err("guest harness schema_version must be 2".into());
                 }
                 schema_seen = true;
             }
@@ -1046,7 +1046,7 @@ fn parse_guest_test_mappings(source: &str) -> Result<BTreeMap<String, u32>, Stri
                 }
             }
             Section::GuestTest(selector) => {
-                if key != "id" {
+                if !matches!(key, "id" | "state") {
                     return Err(format!(
                         "line {line_number}: unsupported guest-test key `{key}`"
                     ));
@@ -1056,7 +1056,7 @@ fn parse_guest_test_mappings(source: &str) -> Result<BTreeMap<String, u32>, Stri
                     .expect("current guest test was inserted at section start");
                 if values.insert(key.into(), value.into()).is_some() {
                     return Err(format!(
-                        "line {line_number}: duplicate id for guest-test selector `{selector}`"
+                        "line {line_number}: duplicate `{key}` for guest-test selector `{selector}`"
                     ));
                 }
             }
@@ -1064,7 +1064,7 @@ fn parse_guest_test_mappings(source: &str) -> Result<BTreeMap<String, u32>, Stri
     }
 
     if !schema_seen {
-        return Err("guest harness omits schema_version = 1".into());
+        return Err("guest harness omits schema_version = 2".into());
     }
     for (name, values) in &profiles {
         let actual = values.keys().map(String::as_str).collect::<BTreeSet<_>>();
@@ -1085,9 +1085,9 @@ fn parse_guest_test_mappings(source: &str) -> Result<BTreeMap<String, u32>, Stri
     let mut mappings = BTreeMap::new();
     let mut ids = BTreeSet::new();
     for (selector, values) in guest_tests {
-        if values.len() != 1 {
+        if values.len() != 2 {
             return Err(format!(
-                "guest-test selector `{selector}` must define exactly one id"
+                "guest-test selector `{selector}` must define exactly one id and state"
             ));
         }
         let raw_id = required_value(&values, "id")?;
@@ -1102,7 +1102,17 @@ fn parse_guest_test_mappings(source: &str) -> Result<BTreeMap<String, u32>, Stri
         if !ids.insert(id) {
             return Err(format!("duplicate guest-test id {id}"));
         }
-        mappings.insert(selector, id);
+        match parse_string(required_value(&values, "state")?)? {
+            "implemented" => {
+                mappings.insert(selector, id);
+            }
+            "reserved" => {}
+            state => {
+                return Err(format!(
+                    "guest-test selector `{selector}` has invalid state `{state}`"
+                ));
+            }
+        }
     }
     if mappings.is_empty() {
         return Err("guest harness defines no guest-test selectors".into());

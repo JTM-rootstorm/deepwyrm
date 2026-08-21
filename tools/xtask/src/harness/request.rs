@@ -5,6 +5,7 @@ pub(crate) fn load_profiles(path: &Path) -> io::Result<BTreeMap<String, HarnessP
     let mut profiles = BTreeMap::new();
     let mut values = BTreeMap::<String, BTreeMap<String, String>>::new();
     let mut guest_tests = BTreeMap::<String, Option<u32>>::new();
+    let mut guest_test_states = BTreeMap::<String, Option<String>>::new();
     enum Section {
         Profile(String),
         GuestTest(String),
@@ -16,7 +17,7 @@ pub(crate) fn load_profiles(path: &Path) -> io::Result<BTreeMap<String, HarnessP
         if line.is_empty() {
             continue;
         }
-        if line == "schema_version = 1" {
+        if line == "schema_version = 2" {
             if saw_schema || current.is_some() {
                 return invalid_input(format!(
                     "{}:{}: schema_version must appear once before sections",
@@ -51,6 +52,7 @@ pub(crate) fn load_profiles(path: &Path) -> io::Result<BTreeMap<String, HarnessP
                     line_number + 1
                 ));
             }
+            guest_test_states.insert(selector.into(), None);
             current = Some(Section::GuestTest(selector.into()));
             continue;
         }
@@ -80,37 +82,59 @@ pub(crate) fn load_profiles(path: &Path) -> io::Result<BTreeMap<String, HarnessP
                     ));
                 }
             }
-            Some(Section::GuestTest(selector)) => {
-                if key != "id" {
-                    return invalid_input(format!(
-                        "{}:{}: guest-test `{selector}` only accepts `id`",
-                        path.display(),
-                        line_number + 1
-                    ));
-                }
-                let id = value.parse::<u32>().map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "{}:{}: guest-test id must be an integer",
+            Some(Section::GuestTest(selector)) => match key {
+                "id" => {
+                    let id = value.parse::<u32>().map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "{}:{}: guest-test id must be an integer",
+                                path.display(),
+                                line_number + 1
+                            ),
+                        )
+                    })?;
+                    if id == 0
+                        || guest_tests
+                            .insert(selector.clone(), Some(id))
+                            .flatten()
+                            .is_some()
+                    {
+                        return invalid_input(format!(
+                            "{}:{}: guest-test `{selector}` has an invalid or duplicate id",
                             path.display(),
                             line_number + 1
-                        ),
-                    )
-                })?;
-                if id == 0
-                    || guest_tests
-                        .insert(selector.clone(), Some(id))
+                        ));
+                    }
+                }
+                "state" if matches!(value.as_str(), "implemented" | "reserved") => {
+                    if guest_test_states
+                        .insert(selector.clone(), Some(value))
                         .flatten()
                         .is_some()
-                {
+                    {
+                        return invalid_input(format!(
+                            "{}:{}: guest-test `{selector}` has a duplicate state",
+                            path.display(),
+                            line_number + 1
+                        ));
+                    }
+                }
+                "state" => {
                     return invalid_input(format!(
-                        "{}:{}: guest-test `{selector}` has an invalid or duplicate id",
+                        "{}:{}: guest-test `{selector}` has an invalid state",
                         path.display(),
                         line_number + 1
                     ));
                 }
-            }
+                _ => {
+                    return invalid_input(format!(
+                        "{}:{}: guest-test `{selector}` only accepts `id` and `state`",
+                        path.display(),
+                        line_number + 1
+                    ));
+                }
+            },
             None => {
                 return invalid_input(format!(
                     "{}:{}: value outside a supported section",
@@ -120,9 +144,13 @@ pub(crate) fn load_profiles(path: &Path) -> io::Result<BTreeMap<String, HarnessP
             }
         }
     }
-    if !saw_schema || guest_tests.values().any(Option::is_none) {
+    if !saw_schema
+        || guest_tests.values().any(Option::is_none)
+        || guest_test_states.values().any(Option::is_none)
+    {
         return invalid_input(
-            "guest harness configuration is missing schema or guest-test id".into(),
+            "guest harness configuration is missing schema, guest-test id, or guest-test state"
+                .into(),
         );
     }
     let unique_ids = guest_tests
@@ -258,6 +286,7 @@ pub(crate) fn validate_guest_selector_metadata(
     let text = read_bounded_utf8(path, "guest harness config", MAX_CONFIG_BYTES)?;
     let mut current = None::<String>;
     let mut mappings = BTreeMap::new();
+    let mut states = BTreeMap::new();
     for raw_line in text.lines() {
         let line = raw_line.split('#').next().unwrap_or("").trim();
         if line.starts_with("[guest_test.") && line.ends_with(']') {
@@ -289,6 +318,11 @@ pub(crate) fn validate_guest_selector_metadata(
             if id == 0 || mappings.insert(selector.clone(), id).is_some() {
                 return invalid_input("duplicate or zero guest-test selector mapping".into());
             }
+        } else if key == "state"
+            && (!matches!(value.as_str(), "implemented" | "reserved")
+                || states.insert(selector.clone(), value).is_some())
+        {
+            return invalid_input("invalid or duplicate guest-test selector state".into());
         }
     }
     let expected_id = mappings.get(&request.selector).ok_or_else(|| {
@@ -303,6 +337,20 @@ pub(crate) fn validate_guest_selector_metadata(
         return invalid_input(
             "guest-test request ID does not match a unique centralized selector mapping".into(),
         );
+    }
+    match states.get(&request.selector).map(String::as_str) {
+        Some("implemented") => {}
+        Some("reserved") => {
+            return invalid_input(format!(
+                "guest-test selector `{}` is reserved and has no runnable artifact",
+                request.selector
+            ));
+        }
+        _ => {
+            return invalid_input(
+                "guest-test selector has no explicit implementation state".into(),
+            );
+        }
     }
     Ok(())
 }

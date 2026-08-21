@@ -218,11 +218,26 @@ fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
         ("memory-invalid-pointer", 7),
         ("memory-user-kernel-isolation", 8),
         ("memory-shared-memory-object", 9),
+        ("task-syscall-smoke", 10),
+        ("task-syscall-sanitize", 11),
+        ("task-user-exception", 12),
+        ("ipc-blocking-smoke", 13),
+        ("atomic-wait-wake", 16),
     ] {
         assert_eq!(
             kernel_build::select_guest_test(true, Some(selector), false, &harness),
             Ok(Some(id)),
             "selector {selector} must retain its immutable harness ID"
+        );
+    }
+    for selector in [
+        "ipc-transfer-rollback",
+        "wait-deadline-timer",
+        "process-create-bootstrap",
+    ] {
+        assert!(
+            kernel_build::select_guest_test(true, Some(selector), false, &harness).is_err(),
+            "reserved selector {selector} must not produce a runnable build identity"
         );
     }
     assert!(kernel_build::select_guest_test(true, Some("unknown-test"), false, &harness).is_err());
@@ -238,16 +253,18 @@ fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
 #[test]
 fn guest_test_manifest_rejects_ambiguous_or_reserved_ids() {
     for malformed in [
-        "schema_version = 1\n[guest_test.a]\nid = 1\n[guest_test.a]\nid = 2\n",
-        "schema_version = 1\n[guest_test.a]\nid = 1\n[guest_test.b]\nid = 1\n",
-        "schema_version = 1\n[guest_test.a]\nid = 0\n",
-        "schema_version = 1\n[guest_test.a]\nid = 4294967296\n",
-        "schema_version = 1\n[guest_test.a]\nid = 1\nid = 2\n",
-        "schema_version = 1\n[guest_test.a]\n",
-        "schema_version = 1\n[guest_test.a]\nname = \"a\"\n",
-        "schema_version = 1\n[unknown.a]\nid = 1\n",
-        "schema_version = 2\n[guest_test.a]\nid = 1\n",
-        "schema_version = 1\n[guest_test.INVALID]\nid = 1\n",
+        "schema_version = 2\n[guest_test.a]\nid = 1\nstate = \"implemented\"\n[guest_test.a]\nid = 2\nstate = \"implemented\"\n",
+        "schema_version = 2\n[guest_test.a]\nid = 1\nstate = \"implemented\"\n[guest_test.b]\nid = 1\nstate = \"implemented\"\n",
+        "schema_version = 2\n[guest_test.a]\nid = 0\nstate = \"implemented\"\n",
+        "schema_version = 2\n[guest_test.a]\nid = 4294967296\nstate = \"implemented\"\n",
+        "schema_version = 2\n[guest_test.a]\nid = 1\nid = 2\nstate = \"implemented\"\n",
+        "schema_version = 2\n[guest_test.a]\nid = 1\nstate = \"invalid\"\n",
+        "schema_version = 2\n[guest_test.a]\nid = 1\nstate = \"implemented\"\nstate = \"reserved\"\n",
+        "schema_version = 2\n[guest_test.a]\n",
+        "schema_version = 2\n[guest_test.a]\nname = \"a\"\n",
+        "schema_version = 2\n[unknown.a]\nid = 1\nstate = \"implemented\"\n",
+        "schema_version = 3\n[guest_test.a]\nid = 1\nstate = \"implemented\"\n",
+        "schema_version = 2\n[guest_test.INVALID]\nid = 1\nstate = \"implemented\"\n",
     ] {
         assert!(
             kernel_build::select_guest_test(true, Some("a"), false, malformed).is_err(),

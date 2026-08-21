@@ -278,10 +278,19 @@ fn centralized_harness_config_loads_profiles_and_guest_test_metadata() {
     validate_guest_selector_metadata(&config, &parsed).unwrap();
 
     let invalid = temp_file(
-        "schema_version = 1\n[profile.default]\nmachine = \"q35\"\nvcpu = 1\nmemory_mib = 1\ntimeout_seconds = 1\ngdb_port = 1234\n[guest_test.one]\nid = 1\nunexpected = 2\n",
+        "schema_version = 2\n[profile.default]\nmachine = \"q35\"\nvcpu = 1\nmemory_mib = 1\ntimeout_seconds = 1\ngdb_port = 1234\n[guest_test.one]\nid = 1\nstate = \"implemented\"\nunexpected = 2\n",
     );
     assert!(load_profiles(&invalid).is_err());
     fs::remove_file(invalid).unwrap();
+
+    for malformed in [
+        "schema_version = 2\n[profile.default]\nmachine = \"q35\"\nvcpu = 1\nmemory_mib = 1\ntimeout_seconds = 1\ngdb_port = 1234\n[guest_test.one]\nid = 1\n",
+        "schema_version = 1\n[profile.default]\nmachine = \"q35\"\nvcpu = 1\nmemory_mib = 1\ntimeout_seconds = 1\ngdb_port = 1234\n[guest_test.one]\nid = 1\nstate = \"implemented\"\n",
+    ] {
+        let path = temp_file(malformed);
+        assert!(load_profiles(&path).is_err());
+        fs::remove_file(path).unwrap();
+    }
 }
 
 #[test]
@@ -338,15 +347,9 @@ fn dw0e_task_selectors_have_stable_build_owned_ids() {
 }
 
 #[test]
-fn dw0f_reserved_selectors_have_stable_build_owned_ids() {
+fn dw0f_selectors_distinguish_implemented_and_reserved_identities() {
     let config = workspace_root().join(HARNESS_CONFIG);
-    for (selector, test_id) in [
-        ("ipc-blocking-smoke", 13),
-        ("ipc-transfer-rollback", 14),
-        ("wait-deadline-timer", 15),
-        ("atomic-wait-wake", 16),
-        ("process-create-bootstrap", 17),
-    ] {
+    for (selector, test_id) in [("ipc-blocking-smoke", 13), ("atomic-wait-wake", 16)] {
         let request_path = temp_file(
             &request("guest-test", selector)
                 .replace("test_id = 1", &format!("test_id = {test_id}")),
@@ -360,6 +363,19 @@ fn dw0f_reserved_selectors_have_stable_build_owned_ids() {
                 expected_test_id: test_id,
             })
         );
+        fs::remove_file(request_path).unwrap();
+    }
+    for (selector, test_id) in [
+        ("ipc-transfer-rollback", 14),
+        ("wait-deadline-timer", 15),
+        ("process-create-bootstrap", 17),
+    ] {
+        let request_path = temp_file(
+            &request("guest-test", selector)
+                .replace("test_id = 1", &format!("test_id = {test_id}")),
+        );
+        let parsed = load_harness_request(&request_path).unwrap();
+        assert!(validate_guest_selector_metadata(&config, &parsed).is_err());
         fs::remove_file(request_path).unwrap();
     }
 }
@@ -576,6 +592,141 @@ fn sha256_matches_a_standard_test_vector() {
         sha256_hex(b"abc"),
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     );
+}
+
+#[test]
+fn streaming_sha256_matches_in_memory_hash_across_block_boundaries() {
+    struct ShortReader<'a> {
+        bytes: &'a [u8],
+        offset: usize,
+    }
+
+    impl Read for ShortReader<'_> {
+        fn read(&mut self, destination: &mut [u8]) -> io::Result<usize> {
+            let count = destination
+                .len()
+                .min(7)
+                .min(self.bytes.len().saturating_sub(self.offset));
+            destination[..count].copy_from_slice(&self.bytes[self.offset..self.offset + count]);
+            self.offset += count;
+            Ok(count)
+        }
+    }
+
+    for len in [0, 1, 55, 56, 63, 64, 65, 65_535, 65_536, 65_537] {
+        let bytes = (0..len)
+            .map(|index| (index as u8).wrapping_mul(29).wrapping_add(7))
+            .collect::<Vec<_>>();
+        let mut reader = std::io::Cursor::new(&bytes);
+        assert_eq!(sha256_reader(&mut reader).unwrap(), sha256_hex(&bytes));
+        let mut short = ShortReader {
+            bytes: &bytes,
+            offset: 0,
+        };
+        assert_eq!(sha256_reader(&mut short).unwrap(), sha256_hex(&bytes));
+    }
+}
+
+#[test]
+fn harness_plan_verifies_every_declared_artifact_from_the_request_root() {
+    let directory = temp_path("artifact-root");
+    fs::create_dir(&directory).unwrap();
+    for child in ["images", "firmware", "artifacts", "artifacts/dw0-b"] {
+        fs::create_dir_all(directory.join(child)).unwrap();
+    }
+    let artifact_data = [
+        ("images/wyrmroot-esp.img", b"esp".as_slice()),
+        ("images/wyrmroot-system.qcow2", b"system".as_slice()),
+        ("firmware/OVMF_CODE.fd", b"code".as_slice()),
+        ("firmware/OVMF_VARS.fd", b"vars".as_slice()),
+        ("artifacts/deepwyrm.elf", b"kernel".as_slice()),
+        ("artifacts/deepwyrm.debug", b"symbols".as_slice()),
+    ];
+    for (path, bytes) in artifact_data {
+        fs::write(directory.join(path), bytes).unwrap();
+    }
+    let request_path = directory.join("request.toml");
+    fs::write(&request_path, request("guest-test", "ipc-blocking-smoke")).unwrap();
+    let mut parsed = load_harness_request(&request_path).unwrap();
+    parsed.test_id = 13;
+    parsed.esp_sha256 = sha256_hex(b"esp");
+    parsed.system_disk_sha256 = sha256_hex(b"system");
+    parsed.ovmf_code_sha256 = sha256_hex(b"code");
+    parsed.ovmf_vars_sha256 = sha256_hex(b"vars");
+    parsed.deepwyrm_elf_sha256 = sha256_hex(b"kernel");
+    parsed.deepwyrm_symbols_sha256 = sha256_hex(b"symbols");
+
+    let verified = verify_harness_artifacts(&request_path, &parsed).unwrap();
+    assert_eq!(
+        verified.esp_image,
+        directory.join(parsed.esp_image.as_str())
+    );
+    assert_eq!(
+        verified.deepwyrm_symbols,
+        directory.join(parsed.deepwyrm_symbols.as_str())
+    );
+    for index in 0..6 {
+        let mut mismatched = parsed.clone();
+        match index {
+            0 => mismatched.esp_sha256 = "0".repeat(64),
+            1 => mismatched.system_disk_sha256 = "0".repeat(64),
+            2 => mismatched.ovmf_code_sha256 = "0".repeat(64),
+            3 => mismatched.ovmf_vars_sha256 = "0".repeat(64),
+            4 => mismatched.deepwyrm_elf_sha256 = "0".repeat(64),
+            5 => mismatched.deepwyrm_symbols_sha256 = "0".repeat(64),
+            _ => unreachable!(),
+        }
+        assert!(verify_harness_artifacts(&request_path, &mismatched).is_err());
+    }
+
+    let esp = directory.join(&parsed.esp_image);
+    fs::remove_file(&esp).unwrap();
+    symlink(directory.join(&parsed.system_disk), &esp).unwrap();
+    let mut alias = parsed.clone();
+    alias.esp_sha256 = parsed.system_disk_sha256.clone();
+    assert!(verify_harness_artifacts(&request_path, &alias).is_err());
+    fs::remove_file(&esp).unwrap();
+    fs::create_dir(&esp).unwrap();
+    assert!(verify_harness_artifacts(&request_path, &parsed).is_err());
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn harness_artifact_verification_rejects_deterministic_concurrent_mutation() {
+    let directory = temp_path("mutation-root");
+    fs::create_dir(&directory).unwrap();
+    let artifact = directory.join("artifact.bin");
+    fs::write(&artifact, b"original").unwrap();
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let writer_barrier = barrier.clone();
+    let writer_path = artifact.clone();
+    let writer = std::thread::spawn(move || {
+        writer_barrier.wait();
+        fs::write(writer_path, b"mutated-after-hash").unwrap();
+        writer_barrier.wait();
+    });
+    let result = verify_harness_artifact_with_hook(
+        &directory,
+        "artifact.bin",
+        &sha256_hex(b"original"),
+        "test artifact",
+        || {
+            barrier.wait();
+            barrier.wait();
+        },
+    );
+    writer.join().unwrap();
+    let error = result.expect_err("a file changed after hashing must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("changed during pre-plan verification")
+    );
+
+    fs::remove_file(artifact).unwrap();
+    fs::remove_dir(directory).unwrap();
 }
 
 #[test]
