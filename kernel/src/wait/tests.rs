@@ -188,6 +188,28 @@ fn registration_pin_defers_event_finalization_until_cancelled() {
 }
 
 #[test]
+fn exhausted_empty_registration_slot_is_skipped_without_wedging_capacity() {
+    let mut registry = ObjectRegistry::<8>::new();
+    let events = EventAuthority::<1>::new();
+    let waits = WaitRegistry::<2>::new();
+    waits.slots.lock()[0].generation = u32::MAX;
+    let (_event, handle_ref) = events.create_event(&mut registry).unwrap();
+    let wait_pin = registry.retain_internal_from_handle(&handle_ref).unwrap();
+    let scheduler = CooperativeScheduler::<2>::new();
+    let (thread, wake) = blocked_key(&mut registry, &scheduler);
+
+    let registration = waits
+        .register(wait_pin, DW_SIGNAL_SIGNALED, 0, thread, wake)
+        .unwrap();
+    assert_eq!(registration.slot, 1);
+    let pin = waits.cancel(registration).unwrap();
+    assert!(registry.release_internal(pin).unwrap().is_none());
+    let final_release = registry.release_handle(handle_ref).unwrap().unwrap();
+    let finalization = events.take_finalization(final_release).unwrap();
+    complete_event_finalization(&mut registry, finalization);
+}
+
+#[test]
 fn event_mask_validation_is_exact_and_idempotent() {
     assert_eq!(
         validate_event_signal_masks(DwSignals(0), DwSignals(0)),

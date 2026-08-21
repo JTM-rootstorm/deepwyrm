@@ -1545,6 +1545,22 @@ pub(crate) fn channel_send<
         release_lookup_pin(registry, pin, cleanup);
         return DW_STATUS_INVALID_ARGUMENT;
     }
+    match channels.transfer_would_close_queue_cycle(
+        endpoint,
+        prepared.objects_of_type(DW_OBJECT_TYPE_CHANNEL),
+    ) {
+        Ok(false) => {}
+        Ok(true) => {
+            drop(prepared);
+            release_lookup_pin(registry, pin, cleanup);
+            return DW_STATUS_INVALID_ARGUMENT;
+        }
+        Err(error) => {
+            drop(prepared);
+            release_lookup_pin(registry, pin, cleanup);
+            return channel_status(error);
+        }
+    }
     let send_reservation = match channels.reserve_send(endpoint, &staging[..byte_len]) {
         Ok(reservation) => reservation,
         Err(error) => {
@@ -1827,6 +1843,11 @@ fn complete_wait_wakes<const OBJECTS: usize, const WAITERS: usize, const EXECUTI
 ) {
     let (wake_intents, wait_pins) = wakes.into_parts();
     for wake in wake_intents.into_iter().flatten() {
+        execution
+            .validate_issued_wake_key(wake.wake_key())
+            .unwrap_or_else(|error| {
+                panic!("wait registration carried a foreign or unissued wake key: {error:?}")
+            });
         let winner = crate::task::BlockedOperationWinner::Signal {
             item_index: wake.item_index(),
             observed: wake.observed(),
@@ -1835,16 +1856,19 @@ fn complete_wait_wakes<const OBJECTS: usize, const WAITERS: usize, const EXECUTI
             .blocked_operations()
             .try_claim_winner(wake.wake_key(), winner)
         {
-            Ok(true) => execution.wake(wake.wake_key()).unwrap_or_else(|error| {
-                panic!("waiter lost exact scheduler block generation: {error:?}")
-            }),
-            Ok(false) => {
+            Ok(true) => match execution.wake(wake.wake_key()) {
+                Ok(()) | Err(SchedulerError::StaleBlockToken) => {}
+                Err(error) => {
+                    panic!("waiter wake violated scheduler ownership: {error:?}")
+                }
+            },
+            Ok(false) | Err(crate::task::BlockedOperationError::StaleReservation) => {
                 // A timeout/terminal path already won this exact block
-                // generation. `take_ready` still consumed the registrations,
-                // so only their pins need deferred release below.
-            }
-            Err(crate::task::BlockedOperationError::StaleReservation) => {
-                panic!("published wait registration has no blocked-operation owner")
+                // generation, or its resumed/terminal owner already completed
+                // the ledger. `take_ready` still consumed the registrations,
+                // so only their pins need deferred release below. A signal may
+                // also win before `commit_block`; that path observes the winner
+                // ledger and cancels the still-pending scheduler reservation.
             }
             Err(error) => panic!("blocked wait winner arbitration failed: {error:?}"),
         }

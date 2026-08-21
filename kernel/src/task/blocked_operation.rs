@@ -106,7 +106,7 @@ impl<const CAPACITY: usize> BlockedOperationRegistry<CAPACITY> {
         let (index, slot) = slots
             .iter_mut()
             .enumerate()
-            .find(|(_, slot)| slot.entry.is_none())
+            .find(|(_, slot)| slot.entry.is_none() && slot.generation != u32::MAX)
             .ok_or(BlockedOperationError::Capacity)?;
         let generation = slot
             .generation
@@ -425,6 +425,27 @@ mod tests {
         assert_eq!(resource, 0x22);
         assert!(!registry.has_thread(second_thread));
         first
+            .complete_with(&registry, BlockedOperationWinner::Terminal, |_| ())
+            .unwrap();
+        assert!(registry.drained(process).is_ok());
+    }
+
+    #[test]
+    fn exhausted_empty_slot_is_skipped_without_wedging_remaining_capacity() {
+        let (process, thread, wake) = keys();
+        let registry = BlockedOperationRegistry::<2>::new();
+        registry.slots.lock()[0].generation = u32::MAX;
+
+        let operation = BlockedOperation::publish(&registry, process, thread, wake, ()).unwrap();
+        assert_eq!(
+            operation
+                .reservation
+                .as_ref()
+                .expect("published operation owns a reservation")
+                .slot,
+            1
+        );
+        operation
             .complete_with(&registry, BlockedOperationWinner::Terminal, |_| ())
             .unwrap();
         assert!(registry.drained(process).is_ok());

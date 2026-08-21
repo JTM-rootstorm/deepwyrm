@@ -495,6 +495,34 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         Ok(())
     }
 
+    /// Validates that a deferred wake key belongs to this scheduler and names
+    /// an already-issued generation without changing any scheduling state.
+    ///
+    /// Completed and terminally retired generations deliberately remain valid
+    /// here: their durable wait registrations are the proof that the exact key
+    /// once existed. Any still-live use of the token must retain the same Thread
+    /// association.
+    pub(crate) fn validate_issued_wake_key(&self, key: BlockWakeKey) -> Result<(), SchedulerError> {
+        let state = self.state.lock();
+        if key.domain != state.domain {
+            return Err(SchedulerError::ForeignBlockToken);
+        }
+        if key.token == 0 || key.token >= state.next_token {
+            return Err(SchedulerError::StaleBlockToken);
+        }
+        if state
+            .pending_block
+            .is_some_and(|pending| pending.token == key.token && pending != key)
+            || state.queue[..state.len].iter().flatten().any(|entry| {
+                entry.token == key.token
+                    && (entry.thread != key.thread || entry.state != SchedulerThreadState::Blocked)
+            })
+        {
+            return Err(SchedulerError::StaleBlockToken);
+        }
+        Ok(())
+    }
+
     /// Selects work after an IRQ while the CPU is physically executing a
     /// blocked syscall continuation on `suspended`'s kernel stack.
     ///

@@ -149,7 +149,7 @@ open.
 5. require `TRANSFER` on each source;
 6. validate requested rights as nonzero, known, object-compatible, and a subset
    of the source handle's held rights;
-7. apply the Channel-specific self-reference rule below; and
+7. apply the Channel queued-reference cycle rule below; and
 8. reserve queue/message resources before any source handle is invalidated.
 
 A prepared move set is move-only and generation-bound to the exact source table
@@ -167,15 +167,28 @@ operation pin keeps it valid through commit, after which the queued move referen
 or any other remaining reference determines its lifetime.
 Transfer of the **destination/peer endpoint object into its own inbound queue** is
 rejected with `INVALID_ARGUMENT`, including through a duplicate handle to that
-same endpoint object. Allowing this would let the queue hold the final generic
-reference to the endpoint whose own finalization is required to drain that queue,
-creating an uncollectable self-reference cycle.
+same endpoint object. The same rejection applies to any batch that would create
+a longer cycle of queued Channel references. For this rule, every live Channel
+endpoint is a graph node and every queued Channel token in an endpoint's inbound
+queue is a directed edge from that endpoint to the token's endpoint object. A
+send to destination `D` carrying Channel endpoint `T` is rejected when `T == D`
+or the committed graph already contains a path from `T` to `D`.
+
+Cycle rejection is transactional. Implementations may perform an early check,
+but they must repeat the decisive bounded reachability check while holding the
+same Channel-state lock that linearizes queue publication. Concurrent reciprocal
+sends therefore cannot both commit. A commit-time rejection returns
+`INVALID_ARGUMENT`, cancels the queue/payload reservation, and returns the exact
+move batch to the source HandleTable rollback path; every source handle remains
+valid at the same raw value with its original rights, and previously committed
+messages remain unchanged.
 
 Other object types, including Process, Thread, MemoryObject, AddressRegion, Event,
-Timer, and unrelated Channel endpoints, may be moved when ordinary object/right
-validation succeeds. A moved source may be its object's final external handle;
-the queued reference then owns the transferred liveness until receive or queue
-drain.
+and Timer, may be moved when ordinary object/right validation succeeds.
+Unrelated Channel endpoints may also be moved when adding their queued-reference
+edges preserves graph acyclicity. A moved source may be its object's final
+external handle; the queued reference then owns the transferred liveness until
+receive or queue drain.
 
 The implementation may use bounded reservation structures or a coarse internal
 transaction serializer, but lock acquisition must not define user-visible
@@ -537,6 +550,13 @@ nests, it may only follow the documented direction and must still preserve E0's
 specific prohibition on simultaneous task hierarchy/state and Process HandleTable
 locks. IRQ context uses only the explicitly IRQ-safe subset.
 
+The Channel queued-reference cycle check runs entirely under the Channel-state
+lock. Its pending/visited state and traversal bound derive from the fixed Channel
+pair and queue capacities; it does not allocate and must not acquire the
+ObjectRegistry, WaitRegistry, scheduler, or finalizer locks. Queue publication
+uses that same lock, making the final reachability check and insertion one
+linearized transaction.
+
 Channel finalization, queue drain, wait cancellation, task termination, and Timer
 cancellation may yield generic final-release authorities. Those are accumulated
 into bounded cleanup queues and routed through the existing typed finalizer
@@ -557,6 +577,7 @@ F implementations and model tests must preserve at least these outcomes:
 | Transfer requests rights not held by source | `ACCESS_DENIED`, no mutation |
 | Transfer source lacks `TRANSFER` | `ACCESS_DENIED`, no mutation |
 | Destination endpoint is transferred into its own inbound queue | `INVALID_ARGUMENT`, no mutation |
+| Transfer batch would create a longer queued Channel-reference cycle | `INVALID_ARGUMENT`, exact source rollback and prior queue unchanged |
 | Valid send to closed peer | `PEER_CLOSED`, sources unchanged |
 | Valid send to open peer with no reservation capacity | `WOULD_BLOCK`, sources unchanged |
 | Receive head does not fit supplied capacities | `BUFFER_TOO_SMALL`, head remains queued |
@@ -624,8 +645,8 @@ F1-F10 implementation must treat the following as fixed F0 outputs:
 - no F ABI schema/layout amendment is required to start implementation;
 - Channel pair storage is non-ABI, generation-protected, and cannot own peer
   generic-object liveness;
-- destination-endpoint self-enqueue is the one explicit ABI-0 Channel transfer
-  rejection beyond ordinary rights/type validation;
+- every cycle-forming queued Channel-reference transfer is rejected with
+  `INVALID_ARGUMENT`, while acyclic unrelated Channel transfer remains valid;
 - committed datagrams survive sender-side peer closure while the receiving
   endpoint remains live;
 - handle MOVE and receive publication are batch all-or-nothing transactions;

@@ -630,6 +630,10 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         self.scheduler.wake(key)
     }
 
+    pub(crate) fn validate_issued_wake_key(&self, key: BlockWakeKey) -> Result<(), SchedulerError> {
+        self.scheduler.validate_issued_wake_key(key)
+    }
+
     pub(crate) fn blocked_operations(&self) -> &BlockedOperationRegistry<CAPACITY> {
         &self.blocked_operations
     }

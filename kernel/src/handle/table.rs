@@ -823,6 +823,17 @@ impl<'a, const CAPACITY: usize> PreparedHandleMoveBatch<'a, CAPACITY> {
             .any(|entry| entry.object == object)
     }
 
+    pub(crate) fn objects_of_type(
+        &self,
+        object_type: DwObjectType,
+    ) -> impl Iterator<Item = ObjectId> + '_ {
+        self.entries[..self.len]
+            .iter()
+            .flatten()
+            .filter(move |entry| entry.object_type == object_type)
+            .map(|entry| entry.object)
+    }
+
     pub(crate) fn extract(self) -> (HandleMoveRollback<'a, CAPACITY>, HandleTransferBatch) {
         let Self {
             table,
@@ -1053,6 +1064,17 @@ impl HandleTransferBatch {
 
     pub(crate) const fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    pub(crate) fn objects_of_type(
+        &self,
+        object_type: DwObjectType,
+    ) -> impl Iterator<Item = ObjectId> + '_ {
+        self.entries[..self.len]
+            .iter()
+            .flatten()
+            .filter(move |entry| entry.object_type() == object_type)
+            .map(HandleTransferToken::object_id)
     }
 
     pub(crate) fn release<const OBJECTS: usize>(

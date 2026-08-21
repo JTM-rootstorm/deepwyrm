@@ -593,7 +593,7 @@ impl<const CAPACITY: usize> WaitRegistry<CAPACITY> {
         let Some((index, slot)) = slots
             .iter_mut()
             .enumerate()
-            .find(|(_, slot)| slot.entry.is_none())
+            .find(|(_, slot)| slot.entry.is_none() && slot.generation != u32::MAX)
         else {
             return Err(WaitRegistrationFailure {
                 error: WaitError::Capacity,

@@ -719,12 +719,12 @@ fn close_event_for_test<const EVENTS: usize>(
     crate::wait::complete_event_finalization(registry, finalization);
 }
 
-fn close_channel_for_test(
+fn close_channel_for_test<const PAIRS: usize, const DEPTH: usize, const WAITERS: usize>(
     registry: &mut ObjectRegistry<16>,
     tasks: &mut Tasks,
     process: ProcessKey,
-    channels: &ChannelAuthority<2, 4>,
-    waits: &WaitRegistry<8>,
+    channels: &ChannelAuthority<PAIRS, DEPTH>,
+    waits: &WaitRegistry<WAITERS>,
     handle: DwHandle,
 ) {
     let release = tasks
@@ -738,6 +738,55 @@ fn close_channel_for_test(
     let (wakes, releases) = completion.into_parts();
     assert_eq!(wakes.len(), 0);
     assert!(releases.into_iter().flatten().next().is_none());
+}
+
+fn create_channel_pair_for_test<const PAIRS: usize, const DEPTH: usize>(
+    user: &mut FakeUserMemory,
+    registry: &mut ObjectRegistry<16>,
+    channels: &ChannelAuthority<PAIRS, DEPTH>,
+    tasks: &mut Tasks,
+    process: ProcessKey,
+    rights: DwRights,
+    first_output: u64,
+) -> [DwHandle; 2] {
+    assert_eq!(
+        channel_create(
+            user,
+            registry,
+            channels,
+            tasks,
+            process,
+            rights,
+            DwUserAddress(first_output),
+            DwUserAddress(first_output + 8),
+        ),
+        DW_STATUS_SUCCESS
+    );
+    [
+        DwHandle(u64_at(user, first_output)),
+        DwHandle(u64_at(user, first_output + 8)),
+    ]
+}
+
+fn complete_channel_cleanup_for_test<
+    const PAIRS: usize,
+    const DEPTH: usize,
+    const WAITERS: usize,
+>(
+    registry: &mut ObjectRegistry<16>,
+    channels: &ChannelAuthority<PAIRS, DEPTH>,
+    waits: &WaitRegistry<WAITERS>,
+    cleanup: CleanupQueue<16>,
+) {
+    let mut pending: std::vec::Vec<_> = cleanup.into_releases().into_iter().flatten().collect();
+    while let Some(release) = pending.pop() {
+        assert_eq!(release.object_type(), deepwyrm_abi::DW_OBJECT_TYPE_CHANNEL);
+        let finalization = channels.take_finalization(release, waits).unwrap();
+        let completion = crate::ipc::complete_channel_finalization(registry, finalization);
+        let (wakes, releases) = completion.into_parts();
+        assert_eq!(wakes.len(), 0);
+        pending.extend(releases.into_iter().flatten());
+    }
 }
 
 #[test]
@@ -3574,6 +3623,342 @@ fn channel_peer_self_reference_is_rejected_but_sending_endpoint_move_succeeds() 
 }
 
 #[test]
+fn channel_cross_pair_cycle_is_rejected_and_all_authority_is_recyclable() {
+    use deepwyrm_abi::{
+        DW_HANDLE_TRANSFER_MOVE, DW_RIGHT_INSPECT, DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_WRITE,
+    };
+
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let channels = ChannelAuthority::<2, 4>::new();
+    let waits = WaitRegistry::<8>::new();
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let mut user = FakeUserMemory::new();
+    let mut cleanup = CleanupQueue::<16>::new();
+    let rights =
+        DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_TRANSFER.0 | DW_RIGHT_INSPECT.0);
+    let [a0, a1] = create_channel_pair_for_test(
+        &mut user,
+        &mut registry,
+        &channels,
+        &mut tasks,
+        process,
+        rights,
+        BASE + 0x180,
+    );
+    let [b0, b1] = create_channel_pair_for_test(
+        &mut user,
+        &mut registry,
+        &channels,
+        &mut tasks,
+        process,
+        rights,
+        BASE + 0x1a0,
+    );
+    let mut staging = std::vec![0_u8; DW_CHANNEL_MAX_PAYLOAD as usize];
+
+    write_handle_transfer(
+        &mut user,
+        BASE + 0x300,
+        deepwyrm_abi::DwHandleTransferV1 {
+            handle: b0,
+            requested_rights: DW_RIGHT_READ,
+            operation: DW_HANDLE_TRANSFER_MOVE,
+            reserved0: 0,
+            reserved: [0; 2],
+        },
+    );
+    assert_eq!(
+        channel_send(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            a1,
+            DwUserAddress(0),
+            0,
+            DwUserAddress(BASE + 0x300),
+            1,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(
+        tasks.process_handles(process).unwrap().inspect_basic(b0),
+        Err(HandleTableError::InvalidHandle)
+    );
+
+    write_handle_transfer(
+        &mut user,
+        BASE + 0x300,
+        deepwyrm_abi::DwHandleTransferV1 {
+            handle: a0,
+            requested_rights: DW_RIGHT_READ,
+            operation: DW_HANDLE_TRANSFER_MOVE,
+            reserved0: 0,
+            reserved: [0; 2],
+        },
+    );
+    assert_eq!(
+        channel_send(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            b1,
+            DwUserAddress(0),
+            0,
+            DwUserAddress(BASE + 0x300),
+            1,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        tasks
+            .process_handles(process)
+            .unwrap()
+            .inspect_basic(a0)
+            .unwrap()
+            .rights,
+        rights
+    );
+
+    assert_eq!(
+        handle_close(&mut registry, &mut tasks, process, a0, &mut cleanup),
+        DW_STATUS_SUCCESS
+    );
+    complete_channel_cleanup_for_test(&mut registry, &channels, &waits, cleanup);
+    for handle in [a1, b1] {
+        let mut close_cleanup = CleanupQueue::<16>::new();
+        assert_eq!(
+            handle_close(
+                &mut registry,
+                &mut tasks,
+                process,
+                handle,
+                &mut close_cleanup,
+            ),
+            DW_STATUS_SUCCESS
+        );
+        complete_channel_cleanup_for_test(&mut registry, &channels, &waits, close_cleanup);
+    }
+    assert_eq!(tasks.process_handle_count(process).unwrap(), 1);
+
+    let recycled_a = create_channel_pair_for_test(
+        &mut user,
+        &mut registry,
+        &channels,
+        &mut tasks,
+        process,
+        rights,
+        BASE + 0x1c0,
+    );
+    let recycled_b = create_channel_pair_for_test(
+        &mut user,
+        &mut registry,
+        &channels,
+        &mut tasks,
+        process,
+        rights,
+        BASE + 0x1e0,
+    );
+    for handle in recycled_a.into_iter().chain(recycled_b) {
+        close_channel_for_test(
+            &mut registry,
+            &mut tasks,
+            process,
+            &channels,
+            &waits,
+            handle,
+        );
+    }
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut CleanupQueue::new(),
+        ),
+        DW_STATUS_SUCCESS
+    );
+}
+
+#[test]
+fn channel_long_cycle_in_multi_handle_batch_rolls_back_every_source() {
+    use deepwyrm_abi::{
+        DW_HANDLE_TRANSFER_MOVE, DW_RIGHT_INSPECT, DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_WAIT,
+        DW_RIGHT_WRITE,
+    };
+
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let channels = ChannelAuthority::<3, 4>::new();
+    let waits = WaitRegistry::<8>::new();
+    let events = EventAuthority::<1>::new();
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let mut user = FakeUserMemory::new();
+    let mut cleanup = CleanupQueue::<16>::new();
+    let channel_rights =
+        DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_TRANSFER.0 | DW_RIGHT_INSPECT.0);
+    let [a0, a1] = create_channel_pair_for_test(
+        &mut user,
+        &mut registry,
+        &channels,
+        &mut tasks,
+        process,
+        channel_rights,
+        BASE + 0x180,
+    );
+    let [b0, b1] = create_channel_pair_for_test(
+        &mut user,
+        &mut registry,
+        &channels,
+        &mut tasks,
+        process,
+        channel_rights,
+        BASE + 0x1a0,
+    );
+    let [c0, c1] = create_channel_pair_for_test(
+        &mut user,
+        &mut registry,
+        &channels,
+        &mut tasks,
+        process,
+        channel_rights,
+        BASE + 0x1c0,
+    );
+    let event_rights = DwRights(DW_RIGHT_WAIT.0 | DW_RIGHT_TRANSFER.0 | DW_RIGHT_INSPECT.0);
+    let event = install_event_for_test(&mut registry, &mut tasks, process, &events, event_rights);
+    let mut staging = std::vec![0_u8; DW_CHANNEL_MAX_PAYLOAD as usize];
+
+    for (sender, transferred) in [(a1, b0), (b1, c0)] {
+        write_handle_transfer(
+            &mut user,
+            BASE + 0x300,
+            deepwyrm_abi::DwHandleTransferV1 {
+                handle: transferred,
+                requested_rights: DW_RIGHT_READ,
+                operation: DW_HANDLE_TRANSFER_MOVE,
+                reserved0: 0,
+                reserved: [0; 2],
+            },
+        );
+        assert_eq!(
+            channel_send(
+                &mut user,
+                &mut staging,
+                &mut registry,
+                &channels,
+                &waits,
+                &mut tasks,
+                &execution,
+                process,
+                sender,
+                DwUserAddress(0),
+                0,
+                DwUserAddress(BASE + 0x300),
+                1,
+                0,
+                &mut cleanup,
+            ),
+            DW_STATUS_SUCCESS
+        );
+    }
+
+    for (index, (handle, requested_rights)) in [(event, DW_RIGHT_WAIT), (a0, DW_RIGHT_READ)]
+        .into_iter()
+        .enumerate()
+    {
+        write_handle_transfer(
+            &mut user,
+            BASE + 0x300 + (index as u64 * 40),
+            deepwyrm_abi::DwHandleTransferV1 {
+                handle,
+                requested_rights,
+                operation: DW_HANDLE_TRANSFER_MOVE,
+                reserved0: 0,
+                reserved: [0; 2],
+            },
+        );
+    }
+    assert_eq!(
+        channel_send(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            c1,
+            DwUserAddress(0),
+            0,
+            DwUserAddress(BASE + 0x300),
+            2,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        tasks
+            .process_handles(process)
+            .unwrap()
+            .inspect_basic(event)
+            .unwrap()
+            .rights,
+        event_rights
+    );
+    assert_eq!(
+        tasks
+            .process_handles(process)
+            .unwrap()
+            .inspect_basic(a0)
+            .unwrap()
+            .rights,
+        channel_rights
+    );
+
+    close_event_for_test(&mut registry, &mut tasks, process, &events, event);
+    for handle in [a0, a1, b1, c1] {
+        let mut close_cleanup = CleanupQueue::<16>::new();
+        assert_eq!(
+            handle_close(
+                &mut registry,
+                &mut tasks,
+                process,
+                handle,
+                &mut close_cleanup,
+            ),
+            DW_STATUS_SUCCESS
+        );
+        complete_channel_cleanup_for_test(&mut registry, &channels, &waits, close_cleanup);
+    }
+    assert_eq!(tasks.process_handle_count(process).unwrap(), 1);
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut CleanupQueue::new(),
+        ),
+        DW_STATUS_SUCCESS
+    );
+}
+
+#[test]
 fn channel_receive_denied_outputs_preserve_head_transfer_and_receiver_table() {
     use deepwyrm_abi::{
         DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_EVENT, DW_RIGHT_INSPECT, DW_RIGHT_READ,
@@ -4010,7 +4395,7 @@ fn channel_receive_handle_capacity_failure_preserves_queued_datagram() {
 }
 
 #[test]
-fn wait_wake_completion_claims_signal_before_scheduler_wake() {
+fn deferred_signal_before_block_commit_is_completed_without_a_stale_wake_panic() {
     use deepwyrm_abi::{DW_OBJECT_TYPE_EVENT, DW_RIGHT_MODIFY, DW_RIGHT_SIGNAL, DW_RIGHT_WAIT};
 
     let (mut registry, mut tasks, process, process_handle) = process_fixture();
@@ -4074,12 +4459,6 @@ fn wait_wake_completion_claims_signal_before_scheduler_wake() {
             .unwrap(),
         crate::wait::EventWaitOutcome::Registered(_)
     ));
-    execution.commit_block(block).unwrap();
-    assert_eq!(
-        execution.scheduler_state(thread),
-        Some(SchedulerThreadState::Blocked)
-    );
-
     let wakes = events
         .signal(
             event_key,
@@ -4089,6 +4468,7 @@ fn wait_wake_completion_claims_signal_before_scheduler_wake() {
         )
         .unwrap();
     complete_wait_wakes(&mut registry, &execution, wakes, &mut cleanup);
+    assert_eq!(waits.len(), 0);
     let winner = crate::task::BlockedOperationWinner::Signal {
         item_index: 0,
         observed: deepwyrm_abi::DW_SIGNAL_SIGNALED,
@@ -4105,12 +4485,13 @@ fn wait_wake_completion_claims_signal_before_scheduler_wake() {
     );
     assert_eq!(
         execution.scheduler_state(thread),
-        Some(SchedulerThreadState::Runnable)
+        Some(SchedulerThreadState::Running)
     );
     assert_eq!(
         operation.complete_with(execution.blocked_operations(), winner, |_| ()),
         Ok(())
     );
+    execution.cancel_block(block).unwrap();
 
     let event_final = tasks
         .process_handles_mut(process)
@@ -4131,6 +4512,54 @@ fn wait_wake_completion_claims_signal_before_scheduler_wake() {
             .is_none()
     );
     assert!(registry.release_handle(thread_ref).unwrap().is_none());
+}
+
+#[test]
+#[should_panic(
+    expected = "wait registration carried a foreign or unissued wake key: ForeignBlockToken"
+)]
+fn deferred_signal_routed_to_a_foreign_execution_domain_fails_stopped() {
+    let mut registry = ObjectRegistry::<16>::new();
+    let events = EventAuthority::<1>::new();
+    let waits = WaitRegistry::<1>::new();
+    let (event_key, event_ref) = events.create_event(&mut registry).unwrap();
+    let wait_pin = registry.retain_internal_from_handle(&event_ref).unwrap();
+    let thread_creation = registry
+        .create(deepwyrm_abi::DW_OBJECT_TYPE_THREAD)
+        .unwrap();
+    let thread = ThreadKey::from_object_id(thread_creation.id());
+    registry.cancel_creation(thread_creation).unwrap();
+
+    let foreign_scheduler = crate::task::CooperativeScheduler::<1>::new();
+    let reservation = foreign_scheduler.reserve(thread).unwrap();
+    foreign_scheduler.commit(reservation).unwrap();
+    foreign_scheduler.schedule_next().unwrap();
+    let block = foreign_scheduler.prepare_block_current(thread).unwrap();
+    let _registration = waits
+        .register(
+            wait_pin,
+            deepwyrm_abi::DW_SIGNAL_SIGNALED,
+            0,
+            thread,
+            block.wake_key(),
+        )
+        .unwrap();
+    let wakes = events
+        .signal(
+            event_key,
+            deepwyrm_abi::DwSignals(0),
+            deepwyrm_abi::DW_SIGNAL_SIGNALED,
+            &waits,
+        )
+        .unwrap();
+
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    complete_wait_wakes(
+        &mut registry,
+        &execution,
+        wakes,
+        &mut CleanupQueue::<16>::new(),
+    );
 }
 
 fn wait_running_fixture() -> (
@@ -4472,6 +4901,101 @@ fn signal_timeout_race_has_exactly_one_winner_in_both_orders() {
 
     run(false);
     run(true);
+}
+
+#[test]
+fn deferred_signal_after_timeout_resume_releases_stale_registration_pins() {
+    use deepwyrm_abi::{DW_RIGHT_SIGNAL, DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED};
+
+    let (mut registry, mut tasks, execution, process, thread, process_handle) =
+        wait_running_fixture();
+    let events = EventAuthority::<1>::new();
+    let timers = TimerAuthority::<1>::new();
+    let channels = ChannelAuthority::<1, 2>::new();
+    let waits = WaitRegistry::<8>::new();
+    let mut user = FakeUserMemory::new();
+    let (event_key, reference) = events.create_event(&mut registry).unwrap();
+    let event = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(reference, DwRights(DW_RIGHT_WAIT.0 | DW_RIGHT_SIGNAL.0))
+        .unwrap();
+    let mut operations = WaitOperationRegistry::<FakeOwnedOutput, 1>::new();
+    let mut deadlines = AdapterDeadline::<2>::new();
+    let out = BASE + 0x980;
+    let state = match wait_one_syscall(
+        &mut user,
+        &mut registry,
+        &tasks,
+        &events,
+        &timers,
+        &channels,
+        &waits,
+        &execution,
+        &mut operations,
+        Some(&mut deadlines),
+        process,
+        thread,
+        event,
+        DW_SIGNAL_SIGNALED,
+        deepwyrm_abi::DwDeadline(50),
+        DwUserAddress(out),
+    ) {
+        WaitSyscallAction::Suspended(state) => state,
+        other => panic!("finite stale-ledger wait did not suspend: {other:?}"),
+    };
+
+    let delayed_wakes = events
+        .signal(
+            event_key,
+            deepwyrm_abi::DwSignals(0),
+            DW_SIGNAL_SIGNALED,
+            &waits,
+        )
+        .unwrap();
+    assert_eq!(waits.len(), 0);
+
+    let mut expired = [None; 2];
+    assert_eq!(deadlines.queue.expire(50, &mut expired), 1);
+    assert_eq!(expired[0], Some(state.wake_key()));
+    assert!(crate::wait::engine::claim_timeout_and_wake(&execution, state.wake_key()).unwrap());
+    assert!(matches!(
+        poll_wait_idle_suspend(&tasks, &execution, state, 0xffff_8000_0012_3000).unwrap(),
+        crate::syscall::native::NativeIdleSuspendPoll::ResumeCurrent
+    ));
+
+    let mut cleanup = CleanupQueue::<16>::new();
+    assert_eq!(
+        resume_wait_thread_syscall(
+            &mut user,
+            &mut registry,
+            &waits,
+            &execution,
+            &mut operations,
+            Some(&mut deadlines),
+            thread,
+            &mut cleanup,
+        )
+        .unwrap(),
+        DW_STATUS_TIMED_OUT
+    );
+    assert_eq!(
+        execution.blocked_operations().winner(state.wake_key()),
+        Err(crate::task::BlockedOperationError::StaleReservation)
+    );
+
+    complete_wait_wakes(&mut registry, &execution, delayed_wakes, &mut cleanup);
+    close_event_for_test(&mut registry, &mut tasks, process, &events, event);
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
 }
 
 #[test]
@@ -5857,7 +6381,7 @@ fn wait_one_suspend_transfers_output_owner_until_signal_resume() {
 }
 
 #[test]
-fn terminating_blocked_waiter_consumes_wait_without_userspace_resume() {
+fn terminal_retirement_precedes_deferred_signal_completion_without_resurrection() {
     use deepwyrm_abi::{
         DW_DEADLINE_INFINITE, DW_RIGHT_MODIFY, DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED,
         DW_TERMINATION_AUTHORIZED,
@@ -5869,7 +6393,12 @@ fn terminating_blocked_waiter_consumes_wait_without_userspace_resume() {
     let channels = ChannelAuthority::<2, 4>::new();
     let waits = WaitRegistry::<8>::new();
     let execution = ExecutionDomain::<2>::new(test_stack_bounds::<2>()).unwrap();
-    let event = install_event_for_test(&mut registry, &mut tasks, process, &events, DW_RIGHT_WAIT);
+    let (event_key, event_ref) = events.create_event(&mut registry).unwrap();
+    let event = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(event_ref, DW_RIGHT_WAIT)
+        .unwrap();
     let process_pin = resolve_current_handle(
         &tasks,
         &mut registry,
@@ -5937,6 +6466,16 @@ fn terminating_blocked_waiter_consumes_wait_without_userspace_resume() {
     assert!(operations.contains_thread(target));
     assert_eq!(waits.len(), 1);
 
+    let delayed_wakes = events
+        .signal(
+            event_key,
+            deepwyrm_abi::DwSignals(0),
+            DW_SIGNAL_SIGNALED,
+            &waits,
+        )
+        .unwrap();
+    assert_eq!(waits.len(), 0);
+
     let mut discarded = None;
     {
         let mut terminal_waits = WaitTerminalCleanup::new(&mut operations, None, |output| {
@@ -5976,6 +6515,8 @@ fn terminating_blocked_waiter_consumes_wait_without_userspace_resume() {
         execution.blocked_operations().winner(wake),
         Err(crate::task::BlockedOperationError::StaleReservation)
     );
+    complete_wait_wakes(&mut registry, &execution, delayed_wakes, &mut cleanup);
+    assert_eq!(execution.scheduler_state(target), None);
 
     close_event_for_test(&mut registry, &mut tasks, process, &events, event);
     assert_eq!(

@@ -140,23 +140,26 @@ impl PayloadPool {
             return Ok(None);
         }
         let mut slots = self.slots.lock();
-        let (index, slot) = slots
-            .iter_mut()
-            .enumerate()
-            .find(|(_, slot)| !slot.in_use)
-            .ok_or(ChannelError::WouldBlock)?;
-        let generation = slot
-            .generation
-            .checked_add(1)
-            .filter(|generation| *generation != 0)
-            .ok_or(ChannelError::WouldBlock)?;
-        slot.generation = generation;
-        slot.bytes[..payload.len()].copy_from_slice(payload);
-        slot.in_use = true;
-        Ok(Some(PayloadToken {
-            slot: u8::try_from(index).expect("payload pool fits u8 token"),
-            generation,
-        }))
+        for (index, slot) in slots.iter_mut().enumerate() {
+            if slot.in_use {
+                continue;
+            }
+            let Some(generation) = slot
+                .generation
+                .checked_add(1)
+                .filter(|generation| *generation != 0)
+            else {
+                continue;
+            };
+            slot.generation = generation;
+            slot.bytes[..payload.len()].copy_from_slice(payload);
+            slot.in_use = true;
+            return Ok(Some(PayloadToken {
+                slot: u8::try_from(index).expect("payload pool fits u8 token"),
+                generation,
+            }));
+        }
+        Err(ChannelError::WouldBlock)
     }
 
     fn copy_and_release(&self, token: PayloadToken, byte_len: usize, output: &mut [u8]) {
@@ -486,11 +489,13 @@ impl<const PAIRS: usize, const DEPTH: usize> ChannelAuthority<PAIRS, DEPTH> {
             if slot.pair.is_some() {
                 continue;
             }
-            let generation = slot
+            let Some(generation) = slot
                 .generation
                 .checked_add(1)
                 .filter(|generation| *generation != 0)
-                .ok_or(ChannelError::Capacity)?;
+            else {
+                continue;
+            };
             let slot_index = u16::try_from(index).map_err(|_| ChannelError::Capacity)?;
             slot.generation = generation;
             slot.pair = Some(PairRecord::new());
@@ -727,6 +732,90 @@ impl<const PAIRS: usize, const DEPTH: usize> ChannelAuthority<PAIRS, DEPTH> {
             .ok_or(ChannelError::PeerClosed)
     }
 
+    fn transfer_closes_queue_cycle<I>(
+        &self,
+        slots: &[PairSlot<DEPTH>; PAIRS],
+        destination: ObjectId,
+        transferred_channels: I,
+    ) -> Result<bool, ChannelError>
+    where
+        I: IntoIterator<Item = ObjectId>,
+    {
+        let mut pending = [0_u8; PAIRS];
+        let mut visited = [0_u8; PAIRS];
+        for object in transferred_channels {
+            if object == destination {
+                return Ok(true);
+            }
+            let (slot, side) = self
+                .locate(slots, ChannelEndpointKey(object))
+                .map_err(|_| ChannelError::StalePair)?;
+            pending[slot] |= 1 << side.index();
+        }
+
+        loop {
+            let mut next = None;
+            for slot in 0..PAIRS {
+                for side in [ChannelSide::Zero, ChannelSide::One] {
+                    let side_bit = 1 << side.index();
+                    if pending[slot] & side_bit != 0 {
+                        pending[slot] &= !side_bit;
+                        if visited[slot] & side_bit == 0 {
+                            visited[slot] |= side_bit;
+                            next = Some((slot, side));
+                            break;
+                        }
+                    }
+                }
+                if next.is_some() {
+                    break;
+                }
+            }
+            let Some((slot, side)) = next else {
+                return Ok(false);
+            };
+            let pair = slots[slot].pair.as_ref().ok_or(ChannelError::StalePair)?;
+            let endpoint = pair.endpoints[side.index()]
+                .as_ref()
+                .ok_or(ChannelError::StalePair)?;
+            if endpoint.object == destination {
+                return Ok(true);
+            }
+            for message in pair.inbound[side.index()].descriptors.iter().flatten() {
+                for object in message.transfers.objects_of_type(DW_OBJECT_TYPE_CHANNEL) {
+                    if object == destination {
+                        return Ok(true);
+                    }
+                    let (next_slot, next_side) = self
+                        .locate(slots, ChannelEndpointKey(object))
+                        .map_err(|_| ChannelError::StalePair)?;
+                    let side_bit = 1 << next_side.index();
+                    if visited[next_slot] & side_bit == 0 {
+                        pending[next_slot] |= side_bit;
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn transfer_would_close_queue_cycle<I>(
+        &self,
+        endpoint: ChannelEndpointKey,
+        transferred_channels: I,
+    ) -> Result<bool, ChannelError>
+    where
+        I: IntoIterator<Item = ObjectId>,
+    {
+        let slots = self.pairs.lock();
+        let (slot, side) = self.locate(&slots, endpoint)?;
+        let pair = slots[slot].pair.as_ref().ok_or(ChannelError::StalePair)?;
+        let destination = pair.endpoints[side.peer().index()]
+            .as_ref()
+            .map(|peer| peer.object)
+            .ok_or(ChannelError::PeerClosed)?;
+        self.transfer_closes_queue_cycle(&slots, destination, transferred_channels)
+    }
+
     pub(crate) fn reserve_send(
         &self,
         endpoint: ChannelEndpointKey,
@@ -830,7 +919,8 @@ impl<const PAIRS: usize, const DEPTH: usize> ChannelAuthority<PAIRS, DEPTH> {
             }
             return Err((ChannelError::StalePair, transfers));
         }
-        let Some(slot) = slots.get_mut(usize::from(pair_key.slot)) else {
+        let slot_index = usize::from(pair_key.slot);
+        let Some(slot) = slots.get(slot_index) else {
             if let Some(token) = payload {
                 PAYLOAD_POOL.release(token);
             }
@@ -842,13 +932,17 @@ impl<const PAIRS: usize, const DEPTH: usize> ChannelAuthority<PAIRS, DEPTH> {
             }
             return Err((ChannelError::StalePair, transfers));
         }
-        let Some(pair) = slot.pair.as_mut() else {
+        let Some(pair) = slot.pair.as_ref() else {
             if let Some(token) = payload {
                 PAYLOAD_POOL.release(token);
             }
             return Err((ChannelError::StalePair, transfers));
         };
         if pair.endpoints[side.index()].is_none() {
+            let pair = slots[slot_index]
+                .pair
+                .as_mut()
+                .expect("validated Channel pair remains live");
             let _ = pair.inbound[side.peer().index()].cancel_send(generation);
             if let Some(token) = payload {
                 PAYLOAD_POOL.release(token);
@@ -857,12 +951,53 @@ impl<const PAIRS: usize, const DEPTH: usize> ChannelAuthority<PAIRS, DEPTH> {
         }
         let peer = side.peer();
         if pair.endpoints[peer.index()].is_none() {
+            let pair = slots[slot_index]
+                .pair
+                .as_mut()
+                .expect("validated Channel pair remains live");
             let _ = pair.inbound[peer.index()].cancel_send(generation);
             if let Some(token) = payload {
                 PAYLOAD_POOL.release(token);
             }
             return Err((ChannelError::PeerClosed, transfers));
         }
+        let destination = pair.endpoints[peer.index()]
+            .as_ref()
+            .expect("validated Channel peer remains live")
+            .object;
+        match self.transfer_closes_queue_cycle(
+            &slots,
+            destination,
+            transfers.objects_of_type(DW_OBJECT_TYPE_CHANNEL),
+        ) {
+            Ok(false) => {}
+            Ok(true) => {
+                let pair = slots[slot_index]
+                    .pair
+                    .as_mut()
+                    .expect("validated Channel pair remains live");
+                let _ = pair.inbound[peer.index()].cancel_send(generation);
+                if let Some(token) = payload {
+                    PAYLOAD_POOL.release(token);
+                }
+                return Err((ChannelError::InvalidArgument, transfers));
+            }
+            Err(error) => {
+                let pair = slots[slot_index]
+                    .pair
+                    .as_mut()
+                    .expect("validated Channel pair remains live");
+                let _ = pair.inbound[peer.index()].cancel_send(generation);
+                if let Some(token) = payload {
+                    PAYLOAD_POOL.release(token);
+                }
+                return Err((error, transfers));
+            }
+        }
+        let pair = slots[slot_index]
+            .pair
+            .as_mut()
+            .expect("validated Channel pair remains live");
         pair.inbound[peer.index()].commit_send(
             generation,
             QueuedMessage {
@@ -1175,6 +1310,16 @@ impl<const PAIRS: usize, const DEPTH: usize> ChannelAuthority<PAIRS, DEPTH> {
             .lock()
             .get(usize::from(key.slot))
             .is_some_and(|slot| slot.generation == key.generation && slot.pair.is_some())
+    }
+
+    #[cfg(test)]
+    fn test_set_pair_generation(&self, slot: usize, generation: u32) {
+        let mut slots = self.pairs.lock();
+        let slot = slots
+            .get_mut(slot)
+            .expect("test pair slot remains in range");
+        assert!(slot.pair.is_none(), "test only mutates a vacant pair slot");
+        slot.generation = generation;
     }
 }
 

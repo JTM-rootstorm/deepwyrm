@@ -984,3 +984,87 @@ fn peer_close_after_transfer_extraction_rolls_back_source_handle_exactly() {
     assert_eq!(wakes.len(), 0);
     assert!(releases.into_iter().flatten().next().is_none());
 }
+
+#[test]
+fn reciprocal_transfer_reservations_are_serialized_at_commit() {
+    use crate::handle::HandleMoveRequest;
+    use deepwyrm_abi::{
+        DW_RIGHT_INSPECT, DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_WRITE, DwRights,
+    };
+
+    let mut registry = ObjectRegistry::<8>::new();
+    let channels = ChannelAuthority::<2, 2>::new();
+    let waits = WaitRegistry::<4>::new();
+    let (a_keys, a_refs) = channels.create_pair(&mut registry).unwrap();
+    let (b_keys, b_refs) = channels.create_pair(&mut registry).unwrap();
+    let mut table = HandleTable::<4>::new();
+    let held =
+        DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_TRANSFER.0 | DW_RIGHT_INSPECT.0);
+    let [a0, a1] = a_refs.map(|reference| table.install(reference, held).unwrap());
+    let [b0, b1] = b_refs.map(|reference| table.install(reference, held).unwrap());
+
+    let prepared_b0 = table
+        .prepare_move_batch(&[HandleMoveRequest {
+            handle: b0,
+            requested_rights: DW_RIGHT_READ,
+        }])
+        .unwrap();
+    let a_to_b = channels.reserve_send(a_keys[1], &[]).unwrap();
+    let (b0_rollback, b0_transfer) = prepared_b0.extract();
+    let first_wakes = match channels.commit_send(a_to_b, b0_transfer, &waits) {
+        Ok(wakes) => wakes,
+        Err((error, _)) => panic!("first acyclic transfer was rejected: {error:?}"),
+    };
+    assert_eq!(first_wakes.len(), 0);
+    b0_rollback.finish();
+
+    let prepared_a0 = table
+        .prepare_move_batch(&[HandleMoveRequest {
+            handle: a0,
+            requested_rights: DW_RIGHT_READ,
+        }])
+        .unwrap();
+    let b_to_a = channels.reserve_send(b_keys[1], &[]).unwrap();
+    let (a0_rollback, a0_transfer) = prepared_a0.extract();
+    let (error, a0_transfer) = channels
+        .commit_send(b_to_a, a0_transfer, &waits)
+        .unwrap_err();
+    assert_eq!(error, ChannelError::InvalidArgument);
+    a0_rollback.rollback(a0_transfer);
+    assert_eq!(table.inspect_basic(a0).unwrap().rights, held);
+
+    let receive = channels.reserve_receive(a_keys[0]).unwrap();
+    let destinations = table.reserve_transfer_batch(1).unwrap();
+    let received = channels.receive_reserved(receive, &mut [], &waits).unwrap();
+    let (_, transfers, wakes) = received.into_parts();
+    assert_eq!(wakes.len(), 0);
+    let published = destinations.publish(transfers);
+    let received_b0 = published[0].unwrap().handle;
+
+    for handle in [a0, a1, b1, received_b0] {
+        let release = table.close(&mut registry, handle).unwrap().unwrap();
+        let finalization = channels.take_finalization(release, &waits).unwrap();
+        let completion = complete_channel_finalization(&mut registry, finalization);
+        let (wakes, releases) = completion.into_parts();
+        assert_eq!(wakes.len(), 0);
+        assert!(releases.into_iter().flatten().next().is_none());
+    }
+}
+
+#[test]
+fn exhausted_vacant_pair_slot_does_not_mask_later_slots() {
+    let mut registry = ObjectRegistry::<4>::new();
+    let channels = ChannelAuthority::<2, 1>::new();
+    let waits = WaitRegistry::<1>::new();
+    channels.test_set_pair_generation(0, u32::MAX);
+    let (keys, handles) = channels.create_pair(&mut registry).unwrap();
+    assert_eq!(channels.test_pair_key(keys[0]).unwrap().slot, 1);
+    for handle in handles {
+        let release = registry.release_handle(handle).unwrap().unwrap();
+        let finalization = channels.take_finalization(release, &waits).unwrap();
+        let completion = complete_channel_finalization(&mut registry, finalization);
+        let (wakes, releases) = completion.into_parts();
+        assert_eq!(wakes.len(), 0);
+        assert!(releases.into_iter().flatten().next().is_none());
+    }
+}
