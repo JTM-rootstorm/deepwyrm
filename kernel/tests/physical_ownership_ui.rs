@@ -172,7 +172,7 @@ fn run_compile_fail_case(
         .expect("kernel has workspace parent")
         .join("crates/deepwyrm-abi");
     let manifest = format!(
-        "[package]\nname = {crate_name:?}\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\ndeepwyrm-abi = {{ path = {abi_path:?} }}\n\n[lib]\npath = {fixture:?}\n",
+        "[package]\nname = {crate_name:?}\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[workspace]\n\n[dependencies]\ndeepwyrm-abi = {{ path = {abi_path:?} }}\n\n[lib]\npath = {fixture:?}\n",
     );
     let manifest_path = case_dir.join("Cargo.toml");
     fs::write(&manifest_path, manifest).expect("write ownership UI case manifest");

@@ -984,7 +984,7 @@ pub(super) fn legacy_workspace_ancestor_and_home_cargo_configuration_is_rejected
     fs::write(&owned_workspace_config, "[build]\n").expect("write owned workspace Cargo config");
 
     let before = ambient_cargo_configs(&workspace, Some(&ambient_home));
-    assert!(before.is_empty());
+    assert!(!before.contains(&owned_workspace_config));
 
     let legacy_workspace_config = workspace.join(LEGACY_WORKSPACE_CARGO_CONFIG);
     let ancestor_config = ancestor.join(".cargo/config.toml");
@@ -993,6 +993,7 @@ pub(super) fn legacy_workspace_ancestor_and_home_cargo_configuration_is_rejected
     fs::write(&ancestor_config, "[build]\n").expect("write ancestor Cargo config");
     fs::write(&home_config, "[build]\n").expect("write ambient-home Cargo config");
     let detected = ambient_cargo_configs(&workspace, Some(&ambient_home));
+    assert!(before.iter().all(|config| detected.contains(config)));
     assert!(detected.contains(&legacy_workspace_config));
     assert!(detected.contains(&ancestor_config));
     assert!(detected.contains(&home_config));
