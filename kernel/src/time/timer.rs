@@ -463,6 +463,8 @@ pub(crate) struct TimerWaitFailure {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
     use crate::object::ObjectRegistry;
     use crate::task::{CooperativeScheduler, ThreadKey};
@@ -548,6 +550,230 @@ mod tests {
         let (blocked, decision) = scheduler.block_current(thread).unwrap();
         assert_eq!(decision.current, None);
         (thread, blocked.into_wake_key())
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum TimerTraceAction {
+        ArmFuture { timer: usize, delta: u64 },
+        ArmNow { timer: usize },
+        Cancel { timer: usize },
+        DequeueExpired { advance: u64 },
+        DeliverPending,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct TimerTraceState {
+        generation: u32,
+        armed: bool,
+        queued: bool,
+        deadline: Option<u64>,
+        signaled: bool,
+    }
+
+    impl TimerTraceState {
+        const EMPTY: Self = Self {
+            generation: 0,
+            armed: false,
+            queued: false,
+            deadline: None,
+            signaled: false,
+        };
+    }
+
+    fn next_trace_word(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state
+    }
+
+    #[test]
+    fn fixed_seed_timer_transactions_preserve_generation_capacity_and_copy_tokens() {
+        // Keep this deliberately small: the one-slot deadline authority makes
+        // every replacement, stale delivery, and capacity outcome observable.
+        for seed in [0x14a5_d3e7_91c2_b6f0_u64, 0x7e11_0bad_f00d_cafe] {
+            let mut random = seed;
+            let mut registry = ObjectRegistry::<4>::new();
+            let timers = TimerAuthority::<2>::new();
+            let waits = WaitRegistry::<1>::new();
+            let mut deadlines = HostDeadlines::<1>::new(10);
+            let (first, first_handle) = timers.create_timer(&mut registry).unwrap();
+            let (second, second_handle) = timers.create_timer(&mut registry).unwrap();
+            let keys = [first, second];
+            let mut model = [TimerTraceState::EMPTY; 2];
+            let mut queue_owner = None;
+            let mut pending: Option<(usize, u32, TimerExpiryToken)> = None;
+            let mut saw_stale_delivery = false;
+            let mut saw_capacity = false;
+
+            for step in 0..69 {
+                let action = match step {
+                    // This fixed prefix places an old token between dequeue and
+                    // delivery, then proves a replacement generation wins.
+                    0 => TimerTraceAction::ArmFuture {
+                        timer: 0,
+                        delta: 10,
+                    },
+                    1 => TimerTraceAction::DequeueExpired { advance: 10 },
+                    2 => TimerTraceAction::ArmFuture {
+                        timer: 0,
+                        delta: 20,
+                    },
+                    3 => TimerTraceAction::ArmFuture {
+                        timer: 1,
+                        delta: 30,
+                    },
+                    4 => TimerTraceAction::DeliverPending,
+                    _ => match next_trace_word(&mut random) % 5 {
+                        0 => TimerTraceAction::ArmFuture {
+                            timer: usize::try_from(next_trace_word(&mut random) & 1).unwrap(),
+                            delta: 1 + next_trace_word(&mut random) % 31,
+                        },
+                        1 => TimerTraceAction::ArmNow {
+                            timer: usize::try_from(next_trace_word(&mut random) & 1).unwrap(),
+                        },
+                        2 => TimerTraceAction::Cancel {
+                            timer: usize::try_from(next_trace_word(&mut random) & 1).unwrap(),
+                        },
+                        3 => TimerTraceAction::DequeueExpired {
+                            advance: 1 + next_trace_word(&mut random) % 19,
+                        },
+                        _ => TimerTraceAction::DeliverPending,
+                    },
+                };
+                let context = std::format!("seed={seed:#018x} step={step} action={action:?}");
+
+                match action {
+                    TimerTraceAction::ArmFuture { timer, delta } => {
+                        let deadline = deadlines.now + delta;
+                        let succeeds = queue_owner.is_none() || queue_owner == Some(timer);
+                        let result =
+                            timers.set(keys[timer], DwDeadline(deadline), &mut deadlines, &waits);
+                        if succeeds {
+                            assert_eq!(result.unwrap().len(), 0, "{context}");
+                            model[timer].generation += 1;
+                            model[timer].armed = true;
+                            model[timer].queued = true;
+                            model[timer].deadline = Some(deadline);
+                            model[timer].signaled = false;
+                            queue_owner = Some(timer);
+                        } else {
+                            assert!(
+                                matches!(
+                                    result,
+                                    Err(TimerError::Deadline(TimerDeadlineError::Capacity))
+                                ),
+                                "{context}: a distinct queued timer must consume the sole slot"
+                            );
+                            saw_capacity = true;
+                        }
+                    }
+                    TimerTraceAction::ArmNow { timer } => {
+                        assert_eq!(
+                            timers
+                                .set(
+                                    keys[timer],
+                                    DwDeadline(deadlines.now),
+                                    &mut deadlines,
+                                    &waits
+                                )
+                                .unwrap()
+                                .len(),
+                            0,
+                            "{context}"
+                        );
+                        model[timer].generation += 1;
+                        model[timer].armed = false;
+                        model[timer].queued = false;
+                        model[timer].deadline = None;
+                        model[timer].signaled = true;
+                        if queue_owner == Some(timer) {
+                            queue_owner = None;
+                        }
+                    }
+                    TimerTraceAction::Cancel { timer } => {
+                        timers.cancel(keys[timer], &mut deadlines).unwrap();
+                        if model[timer].armed {
+                            model[timer].generation += 1;
+                        }
+                        model[timer].armed = false;
+                        model[timer].queued = false;
+                        model[timer].deadline = None;
+                        model[timer].signaled = false;
+                        if queue_owner == Some(timer) {
+                            queue_owner = None;
+                        }
+                    }
+                    TimerTraceAction::DequeueExpired { advance } => {
+                        if pending.is_none() {
+                            deadlines.now += advance;
+                            let (expired, count) = deadlines.expire(deadlines.now);
+                            let expected = queue_owner
+                                .and_then(|timer| model[timer].deadline)
+                                .is_some_and(|deadline| deadline <= deadlines.now);
+                            assert_eq!(count, usize::from(expected), "{context}");
+                            if expected {
+                                let timer = queue_owner.take().unwrap();
+                                let token = expired[0].expect("queued Timer has an expiry token");
+                                pending = Some((timer, model[timer].generation, token));
+                                model[timer].queued = false;
+                            }
+                        }
+                    }
+                    TimerTraceAction::DeliverPending => {
+                        if let Some((timer, generation, token)) = pending.take() {
+                            // TimerExpiryToken is intentionally Copy identity,
+                            // not an owning cleanup capability. Both deliveries
+                            // therefore remain safe exact-generation probes.
+                            let copied_token = token;
+                            assert_eq!(copied_token, token, "{context}");
+                            assert_eq!(timers.expire(token, &waits).unwrap().len(), 0, "{context}");
+                            let live = model[timer].armed && model[timer].generation == generation;
+                            if !live {
+                                saw_stale_delivery = true;
+                            } else {
+                                model[timer].armed = false;
+                                model[timer].deadline = None;
+                                model[timer].signaled = true;
+                            }
+                            assert_eq!(
+                                timers.expire(copied_token, &waits).unwrap().len(),
+                                0,
+                                "{context}: repeated Copy-token delivery is idempotent"
+                            );
+                        }
+                    }
+                }
+
+                let expected_deadline = queue_owner.and_then(|timer| model[timer].deadline);
+                assert_eq!(deadlines.queue.earliest(), expected_deadline, "{context}");
+                for timer in 0..2 {
+                    assert_eq!(
+                        timers.current_signals(keys[timer]).unwrap(),
+                        if model[timer].signaled {
+                            DW_SIGNAL_SIGNALED
+                        } else {
+                            DwSignals(0)
+                        },
+                        "{context}: timer={timer}"
+                    );
+                }
+            }
+
+            assert!(
+                saw_stale_delivery,
+                "seed={seed:#018x}: stale token path was not exercised"
+            );
+            assert!(
+                saw_capacity,
+                "seed={seed:#018x}: bounded deadline capacity was not exercised"
+            );
+            for handle in [first_handle, second_handle] {
+                let release = registry.release_handle(handle).unwrap().unwrap();
+                let finalization = timers.take_finalization(release, &mut deadlines).unwrap();
+                complete_timer_finalization(&mut registry, finalization);
+            }
+        }
     }
 
     #[test]

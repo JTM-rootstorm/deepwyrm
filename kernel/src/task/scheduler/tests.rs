@@ -294,3 +294,342 @@ fn idle_scheduler_preserves_fifo_when_other_work_wakes_first() {
     // Keep the token live in the model: it remains the exact later wake.
     assert!(suspended_block.wake_key().token != 0);
 }
+
+#[test]
+fn dw0_f11_fixed_seed_scheduler_transaction_trace_preserves_queue_exclusivity() {
+    const SEED: u64 = 0xd0f1_1000_u64;
+    const CYCLES: usize = 6;
+
+    macro_rules! assert_trace_model {
+        ($scheduler:expr, $threads:expr, $expected:expr, $current:expr, $step:expr, $operation:expr) => {{
+            assert_eq!(
+                $scheduler.check_invariants(),
+                Ok(()),
+                "DW0-F11 seed={SEED:#x} step={} operation={}",
+                $step,
+                $operation,
+            );
+            assert_eq!(
+                $scheduler.current(),
+                $current,
+                "DW0-F11 seed={SEED:#x} step={} operation={}",
+                $step,
+                $operation,
+            );
+            let expected_running = $expected
+                .iter()
+                .filter(|state| **state == Some(SchedulerThreadState::Running))
+                .count();
+            assert_eq!(
+                expected_running,
+                usize::from($current.is_some()),
+                "DW0-F11 seed={SEED:#x} step={} operation={}",
+                $step,
+                $operation,
+            );
+            for (thread, expected_state) in $threads.iter().zip($expected.iter()) {
+                assert_eq!(
+                    $scheduler.state(*thread),
+                    *expected_state,
+                    "DW0-F11 seed={SEED:#x} step={} operation={} thread={thread:?}",
+                    $step,
+                    $operation,
+                );
+            }
+        }};
+    }
+
+    let scheduler = CooperativeScheduler::<3>::new();
+    let foreign_scheduler = CooperativeScheduler::<1>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let threads = core::array::from_fn::<_, 3, _>(|_| thread_key(&mut registry));
+    let foreign_thread = thread_key(&mut registry);
+    let foreign_reservation = foreign_scheduler.reserve(foreign_thread).unwrap();
+    foreign_scheduler.commit(foreign_reservation).unwrap();
+    assert_eq!(
+        foreign_scheduler.schedule_next().unwrap().current,
+        Some(foreign_thread)
+    );
+    let (foreign_block, _) = foreign_scheduler.block_current(foreign_thread).unwrap();
+    let foreign_wake = foreign_block.into_wake_key();
+
+    let mut state = SEED;
+    let mut step = 0;
+    let mut covered = [false; 10];
+    for _ in 0..CYCLES {
+        // This deliberately small PRNG changes the participants each cycle while
+        // retaining a replayable, bounded transition sequence.
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let first = (state as usize) % threads.len();
+        let second = (first + 1 + ((state >> 8) as usize % (threads.len() - 1))) % threads.len();
+        let cancelled = 3 - first - second;
+        let first_thread = threads[first];
+        let second_thread = threads[second];
+        let cancelled_thread = threads[cancelled];
+        let mut expected = [None; 3];
+
+        let cancelled_reservation = scheduler.reserve(cancelled_thread).unwrap();
+        expected[cancelled] = Some(SchedulerThreadState::Reserved);
+        covered[0] = true;
+        assert_trace_model!(
+            scheduler,
+            threads,
+            expected,
+            None::<ThreadKey>,
+            step,
+            "reserve-cancelled"
+        );
+        step += 1;
+
+        scheduler.cancel(cancelled_reservation).unwrap();
+        expected[cancelled] = None;
+        covered[1] = true;
+        assert_trace_model!(
+            scheduler,
+            threads,
+            expected,
+            None::<ThreadKey>,
+            step,
+            "cancel-reservation"
+        );
+        step += 1;
+
+        let first_reservation = scheduler.reserve(first_thread).unwrap();
+        expected[first] = Some(SchedulerThreadState::Reserved);
+        assert_trace_model!(
+            scheduler,
+            threads,
+            expected,
+            None::<ThreadKey>,
+            step,
+            "reserve-first"
+        );
+        step += 1;
+
+        scheduler.commit(first_reservation).unwrap();
+        expected[first] = Some(SchedulerThreadState::Runnable);
+        covered[0] = true;
+        assert_trace_model!(
+            scheduler,
+            threads,
+            expected,
+            None::<ThreadKey>,
+            step,
+            "commit-first"
+        );
+        step += 1;
+
+        let second_reservation = scheduler.reserve(second_thread).unwrap();
+        expected[second] = Some(SchedulerThreadState::Reserved);
+        assert_trace_model!(
+            scheduler,
+            threads,
+            expected,
+            None::<ThreadKey>,
+            step,
+            "reserve-second"
+        );
+        step += 1;
+
+        scheduler.commit(second_reservation).unwrap();
+        expected[second] = Some(SchedulerThreadState::Runnable);
+        assert_trace_model!(
+            scheduler,
+            threads,
+            expected,
+            None::<ThreadKey>,
+            step,
+            "commit-second"
+        );
+        step += 1;
+
+        assert_eq!(
+            scheduler.schedule_next().unwrap(),
+            ScheduleDecision {
+                previous: None,
+                current: Some(first_thread),
+            },
+            "DW0-F11 seed={SEED:#x} step={step} operation=schedule"
+        );
+        expected[first] = Some(SchedulerThreadState::Running);
+        covered[2] = true;
+        assert_trace_model!(
+            scheduler,
+            threads,
+            expected,
+            Some(first_thread),
+            step,
+            "schedule"
+        );
+        step += 1;
+
+        assert_eq!(
+            scheduler.yield_current(first_thread).unwrap(),
+            ScheduleDecision {
+                previous: Some(first_thread),
+                current: Some(second_thread),
+            },
+            "DW0-F11 seed={SEED:#x} step={step} operation=yield"
+        );
+        expected[first] = Some(SchedulerThreadState::Runnable);
+        expected[second] = Some(SchedulerThreadState::Running);
+        covered[3] = true;
+        assert_trace_model!(
+            scheduler,
+            threads,
+            expected,
+            Some(second_thread),
+            step,
+            "yield"
+        );
+        step += 1;
+
+        let cancelled_block = scheduler.prepare_block_current(second_thread).unwrap();
+        assert_trace_model!(
+            scheduler,
+            threads,
+            expected,
+            Some(second_thread),
+            step,
+            "prepare-cancelled-block"
+        );
+        step += 1;
+
+        scheduler.cancel_block(cancelled_block).unwrap();
+        covered[4] = true;
+        assert_trace_model!(
+            scheduler,
+            threads,
+            expected,
+            Some(second_thread),
+            step,
+            "cancel-block"
+        );
+        step += 1;
+
+        let block = scheduler.prepare_block_current(second_thread).unwrap();
+        let wake = block.wake_key();
+        covered[4] = true;
+        assert_trace_model!(
+            scheduler,
+            threads,
+            expected,
+            Some(second_thread),
+            step,
+            "prepare-block"
+        );
+        step += 1;
+
+        assert_eq!(
+            scheduler.commit_block(block).unwrap(),
+            ScheduleDecision {
+                previous: Some(second_thread),
+                current: Some(first_thread),
+            },
+            "DW0-F11 seed={SEED:#x} step={step} operation=commit-block"
+        );
+        expected[first] = Some(SchedulerThreadState::Running);
+        expected[second] = Some(SchedulerThreadState::Blocked);
+        covered[5] = true;
+        assert_trace_model!(
+            scheduler,
+            threads,
+            expected,
+            Some(first_thread),
+            step,
+            "commit-block"
+        );
+        step += 1;
+
+        scheduler.wake(wake).unwrap();
+        expected[second] = Some(SchedulerThreadState::Runnable);
+        covered[6] = true;
+        assert_trace_model!(
+            scheduler,
+            threads,
+            expected,
+            Some(first_thread),
+            step,
+            "exact-wake"
+        );
+        step += 1;
+
+        assert_eq!(
+            scheduler.wake(wake),
+            Err(SchedulerError::StaleBlockToken),
+            "DW0-F11 seed={SEED:#x} step={step} operation=stale-wake"
+        );
+        covered[7] = true;
+        assert_trace_model!(
+            scheduler,
+            threads,
+            expected,
+            Some(first_thread),
+            step,
+            "stale-wake"
+        );
+        step += 1;
+
+        assert_eq!(
+            scheduler.wake(foreign_wake),
+            Err(SchedulerError::ForeignBlockToken),
+            "DW0-F11 seed={SEED:#x} step={step} operation=foreign-wake"
+        );
+        covered[8] = true;
+        assert_trace_model!(
+            scheduler,
+            threads,
+            expected,
+            Some(first_thread),
+            step,
+            "foreign-wake"
+        );
+        step += 1;
+
+        assert_eq!(
+            scheduler.retire(second_thread).unwrap(),
+            ScheduleDecision {
+                previous: Some(first_thread),
+                current: Some(first_thread),
+            },
+            "DW0-F11 seed={SEED:#x} step={step} operation=retire-runnable"
+        );
+        expected[second] = None;
+        covered[9] = true;
+        assert_trace_model!(
+            scheduler,
+            threads,
+            expected,
+            Some(first_thread),
+            step,
+            "retire-runnable"
+        );
+        step += 1;
+
+        assert_eq!(
+            scheduler.retire(first_thread).unwrap(),
+            ScheduleDecision {
+                previous: Some(first_thread),
+                current: None,
+            },
+            "DW0-F11 seed={SEED:#x} step={step} operation=retire-running"
+        );
+        expected[first] = None;
+        assert_trace_model!(
+            scheduler,
+            threads,
+            expected,
+            None::<ThreadKey>,
+            step,
+            "retire-running"
+        );
+        step += 1;
+    }
+
+    assert!(
+        covered.into_iter().all(core::convert::identity),
+        "DW0-F11 seed={SEED:#x} did not cover every scheduler transaction"
+    );
+}

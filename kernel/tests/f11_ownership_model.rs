@@ -104,9 +104,11 @@ fn f11_forbidden_owner_pairs_have_no_nesting_path() {
                 return true;
             }
             if visited.insert(owner) {
-                pending.extend(ALLOWED_NESTING.iter().filter_map(|&(outer, inner)| {
-                    (outer == owner).then_some(inner)
-                }));
+                pending.extend(
+                    ALLOWED_NESTING
+                        .iter()
+                        .filter_map(|&(outer, inner)| (outer == owner).then_some(inner)),
+                );
             }
         }
         false

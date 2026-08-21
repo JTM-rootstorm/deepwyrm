@@ -9,10 +9,34 @@ use deepwyrm_abi::{
 
 use crate::handle::{AcceptedObjectTypes, HandleTable};
 use crate::task::CooperativeScheduler;
+use std::vec::Vec;
 
 const BYTES: usize = DW_CHANNEL_MAX_PAYLOAD as usize;
 type Channels = ChannelAuthority<1, 2>;
 type Registry = ObjectRegistry<8>;
+
+const CHANNEL_TRACE_STEPS: usize = 160;
+const CHANNEL_TRACE_SEEDS: [u64; 4] = [
+    0xf110_0000_0000_0001,
+    0xf110_5eed_cafe_babe,
+    0x4348_414e_4e45_4c01,
+    0x5258_5f52_4553_4552,
+];
+
+fn next_channel_trace_random(state: &mut u64) -> u64 {
+    *state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    *state
+}
+
+fn trace_payload(state: &mut u64, step: usize) -> Vec<u8> {
+    let random = next_channel_trace_random(state);
+    let len = 1 + (random as usize % 3);
+    (0..len)
+        .map(|offset| random.wrapping_add(step as u64).wrapping_add(offset as u64) as u8)
+        .collect()
+}
 
 fn pair() -> (
     Registry,
@@ -438,6 +462,359 @@ fn maximum_payload_fits_one_empty_queue() {
     assert_eq!(output[BYTES - 1], 0x5a);
     let _ = finalize(&mut registry, &channels, &waits, handle0);
     let _ = finalize(&mut registry, &channels, &waits, handle1);
+}
+
+#[test]
+fn deterministic_channel_transaction_traces_match_queue_model() {
+    for seed in CHANNEL_TRACE_SEEDS {
+        let (mut registry, channels, waits, keys, handles) = pair();
+        let [handle0, handle1] = handles;
+        let mut source_handle = Some(handle0);
+        let mut state = seed;
+        let mut model = Vec::<Vec<u8>>::new();
+        let mut pending_send = None;
+        let mut pending_receive = None;
+        let mut peer_closed = false;
+        let mut saw_send_reservation = false;
+        let mut saw_send_cancel = false;
+        let mut saw_send_commit = false;
+        let mut saw_receive_reservation = false;
+        let mut saw_receive_cancel = false;
+        let mut saw_backpressure = false;
+        let mut saw_peer_close = false;
+
+        for step in 0..CHANNEL_TRACE_STEPS {
+            let operation = match step {
+                // This deterministic prefix reaches every transaction state once;
+                // the fixed-seed suffix then varies the interleavings and payloads.
+                0 => 0,
+                1 => 1,
+                2 => 2,
+                3 => 5,
+                4 => 6,
+                5 => 4,
+                6..=8 => 0,
+                9 => 4,
+                10 => 1,
+                11 => 3,
+                close_step if close_step == CHANNEL_TRACE_STEPS / 2 => 7,
+                _ => next_channel_trace_random(&mut state) % 7,
+            };
+
+            match operation {
+                // Direct send.
+                0 => {
+                    let payload = trace_payload(&mut state, step);
+                    let actual = channels.send(keys[0], &payload, &waits);
+                    if peer_closed {
+                        assert!(
+                            matches!(actual, Err(ChannelError::InvalidEndpoint)),
+                            "Channel trace seed=0x{seed:016x} step={step}: closed source accepted send"
+                        );
+                    } else if model.len() + usize::from(pending_send.is_some()) >= 2 {
+                        assert!(
+                            matches!(actual, Err(ChannelError::WouldBlock)),
+                            "Channel trace seed=0x{seed:016x} step={step}: full queue admitted send"
+                        );
+                        saw_backpressure = true;
+                    } else {
+                        assert!(
+                            actual.is_ok(),
+                            "Channel trace seed=0x{seed:016x} step={step}: writable queue rejected send: {actual:?}"
+                        );
+                        model.push(payload);
+                    }
+                }
+                // Send reservation.
+                1 => {
+                    if pending_send.is_none() {
+                        let payload = trace_payload(&mut state, step);
+                        let actual = channels.reserve_send(keys[0], &payload);
+                        if peer_closed {
+                            assert!(
+                                matches!(actual, Err(ChannelError::InvalidEndpoint)),
+                                "Channel trace seed=0x{seed:016x} step={step}: closed source reserved send"
+                            );
+                        } else if model.len() >= 2 {
+                            assert!(
+                                matches!(actual, Err(ChannelError::WouldBlock)),
+                                "Channel trace seed=0x{seed:016x} step={step}: full queue reserved send"
+                            );
+                            saw_backpressure = true;
+                        } else {
+                            let reservation = actual.unwrap_or_else(|error| {
+                                panic!(
+                                    "Channel trace seed=0x{seed:016x} step={step}: writable queue rejected reservation: {error:?}"
+                                )
+                            });
+                            pending_send = Some((reservation, payload));
+                            saw_send_reservation = true;
+                        }
+                    }
+                }
+                // Send cancellation.
+                2 => {
+                    if let Some((reservation, _)) = pending_send.take() {
+                        assert_eq!(
+                            channels.cancel_send(reservation),
+                            Ok(()),
+                            "Channel trace seed=0x{seed:016x} step={step}: fresh send reservation would not cancel"
+                        );
+                        saw_send_cancel = true;
+                    }
+                }
+                // Send commit.
+                3 => {
+                    if let Some((reservation, payload)) = pending_send.take() {
+                        let actual = channels.commit_send(
+                            reservation,
+                            crate::handle::HandleTransferBatch::empty(),
+                            &waits,
+                        );
+                        match actual {
+                            Ok(_) => {}
+                            Err((error, _)) => panic!(
+                                "Channel trace seed=0x{seed:016x} step={step}: fresh send reservation would not commit: {error:?}"
+                            ),
+                        }
+                        model.push(payload);
+                        saw_send_commit = true;
+                    }
+                }
+                // Direct receive, including intentionally short output buffers.
+                4 => {
+                    if pending_receive.is_none() {
+                        let expected = model.first().cloned();
+                        let too_small = expected
+                            .as_ref()
+                            .is_some_and(|_| next_channel_trace_random(&mut state) & 1 == 0);
+                        let output_len = expected.as_ref().map_or(0, |payload| {
+                            if too_small {
+                                payload.len() - 1
+                            } else {
+                                payload.len()
+                            }
+                        });
+                        let mut output = [0_u8; 3];
+                        let actual =
+                            channels.receive_into(keys[1], &mut output[..output_len], &waits);
+                        match expected {
+                            Some(_payload) if too_small => assert!(
+                                matches!(actual, Err(ChannelError::BufferTooSmall)),
+                                "Channel trace seed=0x{seed:016x} step={step}: short receive consumed or succeeded"
+                            ),
+                            Some(payload) => {
+                                let (actual_len, wakes) = actual.unwrap_or_else(|error| {
+                                    panic!(
+                                        "Channel trace seed=0x{seed:016x} step={step}: queued receive failed: {error:?}"
+                                    )
+                                });
+                                assert_eq!(wakes.len(), 0);
+                                assert_eq!(actual_len, payload.len());
+                                assert_eq!(
+                                    &output[..actual_len],
+                                    payload.as_slice(),
+                                    "Channel trace seed=0x{seed:016x} step={step}: FIFO payload diverged"
+                                );
+                                model.remove(0);
+                            }
+                            None if peer_closed => assert!(
+                                matches!(actual, Err(ChannelError::PeerClosed)),
+                                "Channel trace seed=0x{seed:016x} step={step}: empty peer-closed receive did not fail closed"
+                            ),
+                            None => assert!(
+                                matches!(actual, Err(ChannelError::WouldBlock)),
+                                "Channel trace seed=0x{seed:016x} step={step}: empty open receive did not block"
+                            ),
+                        }
+                    }
+                }
+                // Receive reservation.
+                5 => {
+                    if pending_receive.is_none() {
+                        let actual = channels.reserve_receive(keys[1]);
+                        match model.first().cloned() {
+                            Some(payload) => {
+                                let reservation = actual.unwrap_or_else(|error| {
+                                    panic!(
+                                        "Channel trace seed=0x{seed:016x} step={step}: queued receive would not reserve: {error:?}"
+                                    )
+                                });
+                                assert_eq!(
+                                    reservation.info().required_bytes as usize,
+                                    payload.len(),
+                                    "Channel trace seed=0x{seed:016x} step={step}: reservation head length diverged"
+                                );
+                                assert_eq!(reservation.info().required_handles, 0);
+                                pending_receive = Some((reservation, payload));
+                                saw_receive_reservation = true;
+                            }
+                            None if peer_closed => assert!(
+                                matches!(actual, Err(ChannelError::PeerClosed)),
+                                "Channel trace seed=0x{seed:016x} step={step}: peer-closed receive reserved"
+                            ),
+                            None => assert!(
+                                matches!(actual, Err(ChannelError::WouldBlock)),
+                                "Channel trace seed=0x{seed:016x} step={step}: empty receive reserved"
+                            ),
+                        }
+                    }
+                }
+                // Receive cancellation or completion.
+                6 => {
+                    if let Some((reservation, payload)) = pending_receive.take() {
+                        let action = if step == 4 {
+                            0
+                        } else {
+                            next_channel_trace_random(&mut state) % 3
+                        };
+                        if action == 0 {
+                            assert_eq!(
+                                channels.cancel_receive(reservation),
+                                Ok(()),
+                                "Channel trace seed=0x{seed:016x} step={step}: fresh receive reservation would not cancel"
+                            );
+                            saw_receive_cancel = true;
+                        } else {
+                            let output_len = if action == 1 {
+                                payload.len() - 1
+                            } else {
+                                payload.len()
+                            };
+                            let mut output = [0_u8; 3];
+                            let actual = channels.receive_reserved(
+                                reservation,
+                                &mut output[..output_len],
+                                &waits,
+                            );
+                            if action == 1 {
+                                assert!(
+                                    matches!(actual, Err(ChannelError::BufferTooSmall)),
+                                    "Channel trace seed=0x{seed:016x} step={step}: short reserved receive consumed or succeeded"
+                                );
+                                saw_receive_cancel = true;
+                            } else {
+                                let received = actual.unwrap_or_else(|error| {
+                                    panic!(
+                                        "Channel trace seed=0x{seed:016x} step={step}: reserved receive failed: {error:?}"
+                                    )
+                                });
+                                let (actual_len, transfers, wakes) = received.into_parts();
+                                assert!(transfers.is_empty());
+                                assert_eq!(wakes.len(), 0);
+                                assert_eq!(actual_len, payload.len());
+                                assert_eq!(&output[..actual_len], payload.as_slice());
+                                model.remove(0);
+                            }
+                        }
+                    }
+                }
+                // Peer-close transition. It is forced once per trace after the
+                // reservation/backpressure prefix so queued messages can drain.
+                7 => {
+                    if !peer_closed {
+                        if let Some((reservation, _)) = pending_send.take() {
+                            channels.cancel_send(reservation).unwrap();
+                        }
+                        if let Some((reservation, _)) = pending_receive.take() {
+                            channels.cancel_receive(reservation).unwrap();
+                        }
+                        let _ = finalize(
+                            &mut registry,
+                            &channels,
+                            &waits,
+                            source_handle
+                                .take()
+                                .expect("Channel trace source closes once"),
+                        );
+                        peer_closed = true;
+                        saw_peer_close = true;
+                        assert_ne!(
+                            channels.current_signals(keys[1]).unwrap().0 & DW_SIGNAL_PEER_CLOSED.0,
+                            0,
+                            "Channel trace seed=0x{seed:016x} step={step}: peer close signal missing"
+                        );
+                        assert!(
+                            matches!(
+                                channels.send(keys[1], b"closed", &waits),
+                                Err(ChannelError::PeerClosed)
+                            ),
+                            "Channel trace seed=0x{seed:016x} step={step}: peer-closed endpoint admitted send"
+                        );
+                    }
+                }
+                _ => unreachable!("trace operation is reduced modulo seven"),
+            }
+
+            assert!(
+                model.len() <= 2,
+                "Channel trace seed=0x{seed:016x} step={step}: model exceeded descriptor depth"
+            );
+            if !peer_closed {
+                let writable = model.len() + usize::from(pending_send.is_some()) < 2;
+                let signals = channels.current_signals(keys[0]).unwrap();
+                assert_eq!(
+                    signals.0 & DW_SIGNAL_WRITABLE.0 != 0,
+                    writable,
+                    "Channel trace seed=0x{seed:016x} step={step}: writable signal diverged"
+                );
+            }
+        }
+
+        if let Some((reservation, _)) = pending_send.take() {
+            channels.cancel_send(reservation).unwrap();
+        }
+        if let Some((reservation, _)) = pending_receive.take() {
+            channels.cancel_receive(reservation).unwrap();
+        }
+        if let Some(handle0) = source_handle.take() {
+            let _ = finalize(&mut registry, &channels, &waits, handle0);
+        }
+        while let Some(payload) = model.first().cloned() {
+            let mut output = [0_u8; 3];
+            let (actual_len, wakes) = channels
+                .receive_into(keys[1], &mut output[..payload.len()], &waits)
+                .unwrap();
+            assert_eq!(wakes.len(), 0);
+            assert_eq!(actual_len, payload.len());
+            assert_eq!(&output[..actual_len], payload.as_slice());
+            model.remove(0);
+        }
+        assert_eq!(
+            channels.peek_receive(keys[1]),
+            Err(ChannelError::PeerClosed)
+        );
+        let _ = finalize(&mut registry, &channels, &waits, handle1);
+
+        assert!(
+            saw_send_reservation,
+            "Channel trace seed=0x{seed:016x}: no send reservation"
+        );
+        assert!(
+            saw_send_cancel,
+            "Channel trace seed=0x{seed:016x}: no send cancellation"
+        );
+        assert!(
+            saw_send_commit,
+            "Channel trace seed=0x{seed:016x}: no send commit"
+        );
+        assert!(
+            saw_receive_reservation,
+            "Channel trace seed=0x{seed:016x}: no receive reservation"
+        );
+        assert!(
+            saw_receive_cancel,
+            "Channel trace seed=0x{seed:016x}: no receive cancellation"
+        );
+        assert!(
+            saw_backpressure,
+            "Channel trace seed=0x{seed:016x}: no backpressure"
+        );
+        assert!(
+            saw_peer_close,
+            "Channel trace seed=0x{seed:016x}: no peer close"
+        );
+    }
 }
 
 #[test]

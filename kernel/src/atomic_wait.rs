@@ -794,6 +794,8 @@ pub(crate) fn wake_atomic_waiters<const WAITERS: usize, const EXECUTION: usize>(
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
     use crate::memory::kernel_stack::KernelStackBounds;
     use crate::object::ObjectRegistry;
@@ -853,6 +855,339 @@ mod tests {
             .unwrap()
         });
         (process_key, threads, wakes, blocked, blocked_registry, key)
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum AtomicTraceState {
+        Fresh,
+        Mismatch,
+        Registered,
+        Winner(BlockedOperationWinner),
+        Completed,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct AtomicTraceWaiter {
+        state: AtomicTraceState,
+        registration: Option<AtomicWaitRegistration>,
+        sequence: Option<u64>,
+        live: bool,
+    }
+
+    impl AtomicTraceWaiter {
+        const FRESH: Self = Self {
+            state: AtomicTraceState::Fresh,
+            registration: None,
+            sequence: None,
+            live: false,
+        };
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum AtomicTraceAction {
+        Register { waiter: usize, matches: bool },
+        Wake { count: u32 },
+        Timeout { waiter: usize },
+        Terminal { waiter: usize },
+        Complete { waiter: usize },
+    }
+
+    fn next_atomic_trace_word(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(2_862_933_555_777_941_757)
+            .wrapping_add(3_037_000_493);
+        *state
+    }
+
+    #[test]
+    fn fixed_seed_atomic_wait_transactions_preserve_fifo_winners_and_copy_registrations() {
+        const OPERATIONS: usize = 9;
+        const WAIT_SLOTS: usize = 4;
+
+        for seed in [0x3d7c_9a11_44e2_b5f8_u64, 0xca71_6e5d_80f4_2219] {
+            let mut random = seed;
+            let (_process, _threads, wakes, blocked, ledger, key) = keys::<OPERATIONS>();
+            let registry = AtomicWaitRegistry::<WAIT_SLOTS>::new();
+            let mut operations = blocked.map(Some);
+            let mut model = [AtomicTraceWaiter::FRESH; OPERATIONS];
+            let mut next_sequence = 0_u64;
+
+            for step in 0..80 {
+                let action = match step {
+                    // Prefix: timeout wins before a bounded wake, which must
+                    // skip it and wake the next FIFO candidate instead.
+                    0 => AtomicTraceAction::Register {
+                        waiter: 0,
+                        matches: true,
+                    },
+                    1 => AtomicTraceAction::Register {
+                        waiter: 1,
+                        matches: true,
+                    },
+                    2 => AtomicTraceAction::Timeout { waiter: 0 },
+                    3 => AtomicTraceAction::Wake { count: 1 },
+                    // A terminal winner keeps ownership until the exact
+                    // completion path returns its Copy registration.
+                    4 => AtomicTraceAction::Register {
+                        waiter: 2,
+                        matches: true,
+                    },
+                    5 => AtomicTraceAction::Terminal { waiter: 2 },
+                    6 => AtomicTraceAction::Complete { waiter: 2 },
+                    7 => AtomicTraceAction::Wake {
+                        count: DW_ATOMIC_WAKE_ALL,
+                    },
+                    // Predicate recheck mismatch must never publish a slot.
+                    8 => AtomicTraceAction::Register {
+                        waiter: 3,
+                        matches: false,
+                    },
+                    // Fill all bounded slots, demonstrate capacity, then free
+                    // two FIFO registrations and retry the rejected waiter.
+                    9 => AtomicTraceAction::Register {
+                        waiter: 4,
+                        matches: true,
+                    },
+                    10 => AtomicTraceAction::Register {
+                        waiter: 5,
+                        matches: true,
+                    },
+                    11 => AtomicTraceAction::Register {
+                        waiter: 6,
+                        matches: true,
+                    },
+                    12 => AtomicTraceAction::Register {
+                        waiter: 7,
+                        matches: true,
+                    },
+                    13 => AtomicTraceAction::Register {
+                        waiter: 8,
+                        matches: true,
+                    },
+                    14 => AtomicTraceAction::Wake { count: 2 },
+                    15 => AtomicTraceAction::Register {
+                        waiter: 8,
+                        matches: true,
+                    },
+                    _ => match next_atomic_trace_word(&mut random) % 5 {
+                        0 => AtomicTraceAction::Register {
+                            waiter: usize::try_from(
+                                next_atomic_trace_word(&mut random) % OPERATIONS as u64,
+                            )
+                            .unwrap(),
+                            matches: next_atomic_trace_word(&mut random) & 1 == 0,
+                        },
+                        1 => AtomicTraceAction::Wake {
+                            count: match next_atomic_trace_word(&mut random) % 3 {
+                                0 => 0,
+                                1 => 1,
+                                _ => DW_ATOMIC_WAKE_ALL,
+                            },
+                        },
+                        2 => AtomicTraceAction::Timeout {
+                            waiter: usize::try_from(
+                                next_atomic_trace_word(&mut random) % OPERATIONS as u64,
+                            )
+                            .unwrap(),
+                        },
+                        3 => AtomicTraceAction::Terminal {
+                            waiter: usize::try_from(
+                                next_atomic_trace_word(&mut random) % OPERATIONS as u64,
+                            )
+                            .unwrap(),
+                        },
+                        _ => AtomicTraceAction::Complete {
+                            waiter: usize::try_from(
+                                next_atomic_trace_word(&mut random) % OPERATIONS as u64,
+                            )
+                            .unwrap(),
+                        },
+                    },
+                };
+                let context = std::format!("seed={seed:#018x} step={step} action={action:?}");
+
+                match action {
+                    AtomicTraceAction::Register { waiter, matches } => {
+                        if model[waiter].state == AtomicTraceState::Fresh {
+                            assert_eq!(registry.observe(|| 7), 7, "{context}");
+                            let result =
+                                registry.register_if_expected(key, wakes[waiter], 7, || {
+                                    if matches { 7 } else { 8 }
+                                });
+                            match result {
+                                Ok(AtomicWaitRegisterOutcome::Registered(registration)) => {
+                                    assert!(matches, "{context}: mismatched predicate registered");
+                                    assert!(
+                                        model.iter().filter(|waiter| waiter.live).count()
+                                            < WAIT_SLOTS,
+                                        "{context}: registration exceeded bounded capacity"
+                                    );
+                                    // AtomicWaitRegistration is Copy identity
+                                    // only. Cleanup ownership remains in the
+                                    // move-only AtomicWaitOperation below.
+                                    let copied_registration = registration;
+                                    assert_eq!(copied_registration, registration, "{context}");
+                                    model[waiter].state = AtomicTraceState::Registered;
+                                    model[waiter].registration = Some(registration);
+                                    model[waiter].sequence = Some(next_sequence);
+                                    model[waiter].live = true;
+                                    next_sequence += 1;
+                                }
+                                Ok(AtomicWaitRegisterOutcome::Mismatch { observed }) => {
+                                    assert!(!matches, "{context}: matching predicate mismatched");
+                                    assert_eq!(observed, 8, "{context}");
+                                    model[waiter].state = AtomicTraceState::Mismatch;
+                                }
+                                Err(AtomicWaitError::Capacity) => {
+                                    assert!(matches, "{context}: mismatch must precede capacity");
+                                    assert_eq!(
+                                        model.iter().filter(|waiter| waiter.live).count(),
+                                        WAIT_SLOTS,
+                                        "{context}: capacity failure without a full index"
+                                    );
+                                }
+                                other => {
+                                    panic!("{context}: unexpected registration outcome: {other:?}")
+                                }
+                            }
+                        }
+                    }
+                    AtomicTraceAction::Wake { count } => {
+                        let limit = if count == DW_ATOMIC_WAKE_ALL {
+                            WAIT_SLOTS
+                        } else {
+                            usize::try_from(count).unwrap()
+                        };
+                        let mut expected = [None; WAIT_SLOTS];
+                        let mut selected = 0;
+                        while selected < limit {
+                            let candidate = (0..OPERATIONS)
+                                .filter(|&waiter| model[waiter].live)
+                                .min_by_key(|&waiter| model[waiter].sequence.unwrap());
+                            let Some(waiter) = candidate else {
+                                break;
+                            };
+                            match model[waiter].state {
+                                AtomicTraceState::Registered => {
+                                    model[waiter].state = AtomicTraceState::Winner(
+                                        BlockedOperationWinner::AtomicWake,
+                                    );
+                                    model[waiter].live = false;
+                                    expected[selected] = Some(wakes[waiter]);
+                                    selected += 1;
+                                }
+                                AtomicTraceState::Winner(_) => {
+                                    // A timeout/terminal winner is stale index
+                                    // state and must not consume wake budget.
+                                    model[waiter].live = false;
+                                }
+                                state => {
+                                    panic!("{context}: live waiter has invalid state {state:?}")
+                                }
+                            }
+                        }
+                        let batch = registry.claim_wake(key, count, &ledger).unwrap();
+                        assert_eq!(batch.into_wakes(), expected, "{context}");
+                    }
+                    AtomicTraceAction::Timeout { waiter } => {
+                        if model[waiter].state == AtomicTraceState::Registered {
+                            assert!(
+                                ledger
+                                    .try_claim_winner(
+                                        wakes[waiter],
+                                        BlockedOperationWinner::Timeout
+                                    )
+                                    .unwrap(),
+                                "{context}"
+                            );
+                            model[waiter].state =
+                                AtomicTraceState::Winner(BlockedOperationWinner::Timeout);
+                        }
+                    }
+                    AtomicTraceAction::Terminal { waiter } => match model[waiter].state {
+                        AtomicTraceState::Fresh
+                        | AtomicTraceState::Mismatch
+                        | AtomicTraceState::Registered => {
+                            assert!(
+                                ledger
+                                    .try_claim_winner(
+                                        wakes[waiter],
+                                        BlockedOperationWinner::Terminal
+                                    )
+                                    .unwrap(),
+                                "{context}"
+                            );
+                            model[waiter].state =
+                                AtomicTraceState::Winner(BlockedOperationWinner::Terminal);
+                        }
+                        AtomicTraceState::Winner(_) | AtomicTraceState::Completed => {}
+                    },
+                    AtomicTraceAction::Complete { waiter } => {
+                        if let AtomicTraceState::Winner(winner) = model[waiter].state {
+                            if let Some(registration) = model[waiter].registration {
+                                assert_eq!(
+                                    registry.cancel_if_live(registration).unwrap(),
+                                    model[waiter].live,
+                                    "{context}: cleanup must consume exactly its live registration"
+                                );
+                                model[waiter].live = false;
+                            }
+                            operations[waiter]
+                                .take()
+                                .expect("model completion retains its owning operation")
+                                .complete_with(&ledger, winner, |()| ())
+                                .unwrap();
+                            model[waiter].state = AtomicTraceState::Completed;
+                        }
+                    }
+                }
+
+                assert_eq!(
+                    registry.len(),
+                    model.iter().filter(|waiter| waiter.live).count(),
+                    "{context}: registry/model liveness diverged"
+                );
+            }
+
+            for waiter in 0..OPERATIONS {
+                let Some(operation) = operations[waiter].take() else {
+                    assert_eq!(model[waiter].state, AtomicTraceState::Completed);
+                    continue;
+                };
+                let winner = match model[waiter].state {
+                    AtomicTraceState::Winner(winner) => winner,
+                    AtomicTraceState::Fresh
+                    | AtomicTraceState::Mismatch
+                    | AtomicTraceState::Registered => {
+                        assert!(
+                            ledger
+                                .try_claim_winner(wakes[waiter], BlockedOperationWinner::Cancelled)
+                                .unwrap(),
+                            "seed={seed:#018x}: final cleanup lost an unclaimed waiter"
+                        );
+                        BlockedOperationWinner::Cancelled
+                    }
+                    AtomicTraceState::Completed => {
+                        unreachable!("completed operation remained owned")
+                    }
+                };
+                if let Some(registration) = model[waiter].registration {
+                    assert_eq!(
+                        registry.cancel_if_live(registration).unwrap(),
+                        model[waiter].live,
+                        "seed={seed:#018x}: final cleanup registration mismatch for waiter {waiter}"
+                    );
+                    model[waiter].live = false;
+                }
+                operation.complete_with(&ledger, winner, |()| ()).unwrap();
+                model[waiter].state = AtomicTraceState::Completed;
+            }
+            assert_eq!(
+                registry.len(),
+                0,
+                "seed={seed:#018x}: terminal cleanup leaked index state"
+            );
+        }
     }
 
     #[test]

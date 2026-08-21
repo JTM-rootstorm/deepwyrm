@@ -9,7 +9,7 @@ use std::{format, vec::Vec};
 
 use crate::object::ObjectRegistry;
 
-use super::{AcceptedObjectTypes, HandleTable, HandleTableError};
+use super::{AcceptedObjectTypes, HandleMoveRequest, HandleTable, HandleTableError};
 
 const TRACE_CAPACITY: usize = 8;
 const TRACE_STEPS: usize = 4096;
@@ -18,6 +18,14 @@ const TRACE_SEEDS: [u64; 4] = [
     0xd600_5eed_cafe_babe,
     0x4f42_4a45_4354_0001,
     0x4841_4e44_4c45_0001,
+];
+const TRANSFER_TRACE_CAPACITY: usize = 4;
+const TRANSFER_TRACE_STEPS: usize = 192;
+const TRANSFER_TRACE_SEEDS: [u64; 4] = [
+    0xf110_0000_0000_0002,
+    0xf110_5eed_cafe_f00d,
+    0x5452_414e_5346_4552,
+    0x524f_4c4c_4241_434b,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,6 +98,44 @@ fn choose_handle(state: &mut u64, live: &[ModelEntry], stale: &[DwHandle]) -> Dw
         live[(random as usize >> 3) % live.len()].handle
     }
 }
+
+fn install_trace_event<const OBJECTS: usize, const CAPACITY: usize>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    table: &mut HandleTable<CAPACITY>,
+    held: DwRights,
+) -> DwHandle {
+    let creation = registry.create(DW_OBJECT_TYPE_EVENT).unwrap();
+    let reference = registry.creation_into_handle(creation).unwrap();
+    table.install(reference, held).unwrap()
+}
+
+fn transfer_trace_attempt<const CAPACITY: usize>(
+    sender: &mut HandleTable<CAPACITY>,
+    receiver: &mut HandleTable<CAPACITY>,
+    source: DwHandle,
+    requested_rights: DwRights,
+) -> Result<DwHandle, HandleTableError> {
+    let prepared = sender
+        .prepare_move_batch(&[HandleMoveRequest {
+            handle: source,
+            requested_rights,
+        }])
+        .expect("trace source must prepare before extraction");
+    let (rollback, transfers) = prepared.extract();
+    match receiver.reserve_transfer_batch(1) {
+        Ok(destination) => {
+            rollback.finish();
+            Ok(destination.publish(transfers)[0]
+                .expect("one reserved transfer must publish one handle")
+                .handle)
+        }
+        Err(error) => {
+            rollback.rollback(transfers);
+            Err(error)
+        }
+    }
+}
+
 #[test]
 fn deterministic_handle_traces_match_abstract_model() {
     let initial_rights = rights(&[
@@ -311,6 +357,221 @@ fn deterministic_handle_traces_match_abstract_model() {
         if let Some(failure) = failure {
             panic!("deterministic handle trace seed=0x{seed:016x}: {failure}");
         }
+    }
+}
+
+#[test]
+fn deterministic_transfer_transaction_traces_match_authority_model() {
+    let held = rights(&[DW_RIGHT_WAIT, DW_RIGHT_INSPECT, DW_RIGHT_TRANSFER]);
+    let reduced = rights(&[DW_RIGHT_WAIT, DW_RIGHT_INSPECT]);
+
+    for seed in TRANSFER_TRACE_SEEDS {
+        let mut state = seed;
+        let mut registry = ObjectRegistry::<{ TRANSFER_TRACE_CAPACITY + 1 }>::new();
+        let mut sender = HandleTable::<TRANSFER_TRACE_CAPACITY>::new();
+        let mut receiver = HandleTable::<TRANSFER_TRACE_CAPACITY>::new();
+        let mut sender_model = Vec::new();
+        let mut receiver_model = Vec::new();
+        let mut saw_rollback = false;
+        let mut saw_publication = false;
+        let mut saw_capacity = false;
+
+        for _ in 0..TRANSFER_TRACE_CAPACITY {
+            let handle = install_trace_event(&mut registry, &mut sender, held);
+            sender_model.push(ModelEntry {
+                handle,
+                rights: held,
+            });
+        }
+
+        for step in 0..TRANSFER_TRACE_STEPS {
+            let operation = match step {
+                // Force each transaction outcome before the fixed-seed suffix
+                // explores additional sender/receiver occupancy transitions.
+                0 => 0,
+                1..=4 => 1,
+                5 => 3,
+                6 => 4,
+                7 => 2,
+                8 => 1,
+                _ => next_random(&mut state) % 5,
+            };
+
+            match operation {
+                // Extract then rollback: source handle and its full authority
+                // must reappear exactly as it was before the transaction.
+                0 => {
+                    if !sender_model.is_empty() {
+                        let index = (next_random(&mut state) as usize) % sender_model.len();
+                        let source = sender_model[index];
+                        let prepared = sender
+                            .prepare_move_batch(&[HandleMoveRequest {
+                                handle: source.handle,
+                                requested_rights: reduced,
+                            }])
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "transfer trace seed=0x{seed:016x} step={step}: valid source failed prepare: {error:?}"
+                                )
+                            });
+                        let (rollback, transfers) = prepared.extract();
+                        rollback.rollback(transfers);
+                        assert_eq!(
+                            sender.inspect_basic(source.handle).unwrap().rights,
+                            source.rights,
+                            "transfer trace seed=0x{seed:016x} step={step}: rollback changed source authority"
+                        );
+                        saw_rollback = true;
+                    }
+                }
+                // Prepare/extract/finish and publish the reduced authority into
+                // the destination, or roll it back if that table is full.
+                1 => {
+                    if !sender_model.is_empty() {
+                        let index = (next_random(&mut state) as usize) % sender_model.len();
+                        let source = sender_model[index];
+                        match transfer_trace_attempt(
+                            &mut sender,
+                            &mut receiver,
+                            source.handle,
+                            reduced,
+                        ) {
+                            Ok(destination) => {
+                                assert!(
+                                    matches!(
+                                        sender.inspect_basic(source.handle),
+                                        Err(HandleTableError::InvalidHandle)
+                                    ),
+                                    "transfer trace seed=0x{seed:016x} step={step}: committed source remained published"
+                                );
+                                let info = receiver.inspect_basic(destination).unwrap();
+                                assert_eq!(info.object_type, DW_OBJECT_TYPE_EVENT);
+                                assert_eq!(
+                                    info.rights, reduced,
+                                    "transfer trace seed=0x{seed:016x} step={step}: destination gained more than requested authority"
+                                );
+                                sender_model.swap_remove(index);
+                                receiver_model.push(ModelEntry {
+                                    handle: destination,
+                                    rights: reduced,
+                                });
+                                saw_publication = true;
+                            }
+                            Err(HandleTableError::Capacity) => {
+                                assert_eq!(
+                                    sender.inspect_basic(source.handle).unwrap().rights,
+                                    source.rights,
+                                    "transfer trace seed=0x{seed:016x} step={step}: destination capacity failure lost source authority"
+                                );
+                                saw_capacity = true;
+                            }
+                            Err(error) => panic!(
+                                "transfer trace seed=0x{seed:016x} step={step}: unexpected destination result: {error:?}"
+                            ),
+                        }
+                    }
+                }
+                // Closing a receiver entry permits a later source creation;
+                // completed transfers must never regain TRANSFER there.
+                2 => {
+                    if !receiver_model.is_empty() {
+                        let index = (next_random(&mut state) as usize) % receiver_model.len();
+                        let entry = receiver_model.swap_remove(index);
+                        let final_release = receiver
+                            .close(&mut registry, entry.handle)
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "transfer trace seed=0x{seed:016x} step={step}: live destination failed close: {error:?}"
+                                )
+                            })
+                            .expect("destination must be the final object owner");
+                        registry.complete_finalization(final_release).unwrap();
+                    }
+                }
+                // Create only when the abstract ownership model leaves both the
+                // registry and the sender table room for one new object.
+                3 => {
+                    if sender_model.len() < TRANSFER_TRACE_CAPACITY
+                        && sender_model.len() + receiver_model.len() < TRANSFER_TRACE_CAPACITY + 1
+                    {
+                        let handle = install_trace_event(&mut registry, &mut sender, held);
+                        sender_model.push(ModelEntry {
+                            handle,
+                            rights: held,
+                        });
+                    }
+                }
+                // Capacity is an explicit state transition: an extracted source
+                // is rolled back when the destination cannot reserve a slot.
+                4 => {
+                    if receiver_model.len() == TRANSFER_TRACE_CAPACITY && !sender_model.is_empty() {
+                        let source = sender_model[0];
+                        assert_eq!(
+                            transfer_trace_attempt(
+                                &mut sender,
+                                &mut receiver,
+                                source.handle,
+                                reduced,
+                            ),
+                            Err(HandleTableError::Capacity),
+                            "transfer trace seed=0x{seed:016x} step={step}: full destination accepted transfer"
+                        );
+                        assert_eq!(sender.inspect_basic(source.handle).unwrap().rights, held);
+                        saw_capacity = true;
+                    }
+                }
+                _ => unreachable!("transfer trace operation is reduced modulo five"),
+            }
+
+            assert_eq!(
+                sender.len(),
+                sender_model.len(),
+                "transfer trace seed=0x{seed:016x} step={step}: sender cardinality diverged"
+            );
+            assert_eq!(
+                receiver.len(),
+                receiver_model.len(),
+                "transfer trace seed=0x{seed:016x} step={step}: receiver cardinality diverged"
+            );
+            for entry in &sender_model {
+                assert_eq!(
+                    sender.inspect_basic(entry.handle).unwrap().rights,
+                    entry.rights
+                );
+            }
+            for entry in &receiver_model {
+                let info = receiver.inspect_basic(entry.handle).unwrap();
+                assert_eq!(info.object_type, DW_OBJECT_TYPE_EVENT);
+                assert_eq!(info.rights, entry.rights);
+                assert_eq!(info.rights.0 & DW_RIGHT_TRANSFER.0, 0);
+            }
+        }
+
+        let sender_drained = sender.drain(&mut registry);
+        let receiver_drained = receiver.drain(&mut registry);
+        assert_eq!(sender_drained.final_release_count(), sender_model.len());
+        assert_eq!(receiver_drained.final_release_count(), receiver_model.len());
+        for final_release in sender_drained
+            .into_final_releases()
+            .into_iter()
+            .flatten()
+            .chain(receiver_drained.into_final_releases().into_iter().flatten())
+        {
+            registry.complete_finalization(final_release).unwrap();
+        }
+
+        assert!(
+            saw_rollback,
+            "transfer trace seed=0x{seed:016x}: no rollback"
+        );
+        assert!(
+            saw_publication,
+            "transfer trace seed=0x{seed:016x}: no reduced-rights publication"
+        );
+        assert!(
+            saw_capacity,
+            "transfer trace seed=0x{seed:016x}: no destination-capacity rollback"
+        );
     }
 }
 
