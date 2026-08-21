@@ -57,6 +57,7 @@ The primordial process must execute in user mode, make Deepwyrm syscalls through
 7. Rights may be reduced during duplication or transfer. A process may not manufacture greater rights than it already possesses without a separate authority explicitly granting them.
 8. The raw syscall ABI is documented and machine-generated, but normal native code should use generated syscall wrappers rather than inline syscall instructions.
 9. ABI 0 is explicitly unstable. Until `DW_ABI_VERSION` becomes 1, Wyrmroot is expected to be rebuilt with Deepwyrm after ABI changes.
+10. Compatibility requirements do not automatically authorize ABI-0 growth. The workspace cross-personality kernel-mechanism doctrine governs any future Linux/Windows/DOS/POSIX-motivated addition or widening: generalizable or architecture-neutral is not sufficient, generic primitives remain personality-blind, and userspace/personality composition is preferred unless privilege, kernel lifetime, atomicity, or security requires a new mechanism.
 
 ## 2.2 Native executable and calling convention
 
@@ -237,7 +238,7 @@ Do not expose POSIX signals or Linux futex ABI directly.
 7. Exited process/thread objects remain waitable and inspectable while handles remain.
 8. Initial process states are conceptually `CREATED -> RUNNING -> EXITED`.
 
-The design must leave room for later resource policy, accounting, session teardown, sandboxes, containers, and Windows Job-like behavior without adding those policies to DW0.
+The design must leave room for native resource policy, accounting, session teardown, sandboxes, and isolation domains without adding those policies to DW0. Linux cgroup or Windows Job semantics, if later supported, are personality projections over admitted mechanisms and do not themselves define TaskGroup growth.
 
 ## 2.11 Exceptions
 

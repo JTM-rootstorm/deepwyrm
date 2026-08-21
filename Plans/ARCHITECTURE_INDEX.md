@@ -15,6 +15,7 @@ This file defines the minimum architecture reading set for Deepwyrm implementati
 6. [`Plans/DW0_IMPLEMENTATION_PLAN_TOOLCHAIN_ADDENDUM.md`](DW0_IMPLEMENTATION_PLAN_TOOLCHAIN_ADDENDUM.md) - LLVM/Clang/LLD/compiler-rt policy and host GDB/QEMU debugging.
 7. [`Plans/DW0_IMPLEMENTATION_PLAN_NATIVE_CONTROL_SURFACES_ADDENDUM.md`](DW0_IMPLEMENTATION_PLAN_NATIVE_CONTROL_SURFACES_ADDENDUM.md) - typed native control/introspection direction and Linux-compatibility boundaries.
 8. Wyrmroot's corresponding `Plans/WYRMROOT_PLATFORM_CONVENTIONS.md`, WYR0 plan, and addenda for any shared boot/bootstrap/userspace work.
+9. When work touches compatibility personalities, personality hosting, or uses Linux/Windows/DOS/POSIX requirements to justify a native kernel change, the OS-Project coordination doctrine `../personality-plan/CROSS_PERSONALITY_KERNEL_MECHANISM_DOCTRINE.md` and the affected family plan are mandatory reading.
 
 ## Authority rules
 
@@ -23,6 +24,7 @@ This file defines the minimum architecture reading set for Deepwyrm implementati
 - `DEEPWYRM_PRE_PHASE0_INVARIANTS.md` applies to later milestones unless explicitly revised.
 - A milestone may strengthen invariants but may not silently weaken them.
 - ABI 0 remains intentionally revisable; changes must be coordinated through the canonical ABI schema and affected Wyrmroot contracts rather than locally patched around.
+- For **compatibility-motivated admission**, the cross-personality doctrine is a hard overlay on this index: the current ABI/schema defines existing native semantics, but no older Deepwyrm plan/spec may be read as permission to add or widen a primitive merely because multiple foreign APIs can share it, it can be named generically, or another flag would make translation easier. New/widened primitives must be personality-blind and must independently prove a privileged/kernel-lifetime/atomicity/security need that cannot be cleanly composed above the kernel.
 
 ## Phase-0 freeze policy
 

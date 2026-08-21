@@ -8,7 +8,7 @@ Deepwyrm is designed around typed kernel objects, opaque process-local rights-be
 
 Portable kernel code is written in Rust where practical. Architecture-specific, hardware-facing, assembly, C, and unsafe Rust code is kept behind narrow, documented boundaries. Subsystem boundaries are designed to support focused host-side and synthetic testing as well as full-system validation.
 
-Compatibility environments may translate POSIX, Linux, Windows, or retro APIs onto the native object and handle model. Those environments are consumers of the kernel ABI rather than foundations of it.
+Compatibility environments may translate POSIX, Linux, Windows, or retro APIs onto the native object and handle model. Those environments are consumers of the kernel ABI rather than foundations of it. Compatibility needs may expose a genuinely missing privileged mechanism, but similarity across foreign APIs or generic naming does not by itself justify kernel growth; admitted Deepwyrm primitives remain personality-blind and policy-light.
 
 ## Relationship to Wyrmroot
 

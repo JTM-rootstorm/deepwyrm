@@ -269,18 +269,29 @@ Rules:
 
 ---
 
-# 16. Compatibility quirks do not flow backward by default
+# 16. Compatibility requirements pass a strict kernel-admission test
 
-Deepwyrm may adopt a mechanism useful to a compatibility layer only when that mechanism is independently sound as a general kernel primitive.
+Compatibility can reveal a missing native mechanism, but **being independently coherent, reusable, or generically named is necessary at most and not sufficient** for Deepwyrm admission. The OS-Project cross-personality doctrine is authoritative for compatibility-motivated growth.
+
+Before adding or widening a primitive because Linux, Windows, DOS, POSIX, or another personality needs it, require all of the following:
+
+- a genuinely new privileged operation, kernel-managed lifetime/state transition, or atomicity/security guarantee exists rather than merely a different ABI shape, flag set, default, error code, or inheritance rule;
+- existing orthogonal primitives cannot safely express the required observable behavior through personality composition;
+- a restartable personality adapter or shared Wyrmroot/userspace helper is insufficient for a concrete reason;
+- the proposed primitive remains personality-blind and does not branch on Linux/Windows/DOS identity to choose semantics; and
+- the change does not merely add another mode, policy hook, callback, or flag so an existing primitive more closely imitates a foreign API.
 
 Do not add kernel concepts solely because:
 
-- Linux exposes a particular ioctl/procfs file
-- Windows uses a particular legacy syscall name
-- DOS expects a drive-letter or real-mode concept
-- Win9x exposes a VxD behavior
+- Linux exposes a particular ioctl/procfs file or syscall family;
+- Windows exposes a particular HANDLE/object/API shape;
+- two or more foreign systems expose approximately similar concepts;
+- DOS expects a drive-letter, real-mode, or legacy-device concept; or
+- Win9x exposes a VxD behavior.
 
-Compatibility layers map their semantics onto native handles, MemoryObjects, waits, task groups, exceptions, Channels, and userspace services.
+A narrow generic personality/ABI routing token may select which personality component receives a foreign syscall or executable, but it must not alter the semantics of generic Process, VM, wait, VFS, or IPC primitives. Modest duplicated code between personality implementations is explicitly preferable to personality-aware kernel policy or an omnibus "generic" object.
+
+Compatibility layers map their semantics onto admitted native handles, MemoryObjects, waits, task groups, exceptions, Channels, and userspace services. If composition exposes a true missing privileged mechanism, route that mechanism through the full admission test rather than widening the nearest existing object by convenience.
 
 ---
 

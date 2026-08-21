@@ -259,7 +259,7 @@ udev-compatible events/rules where required
 
 These are adapters over the Wyrmroot/Deepwyrm native model.
 
-Do not change Deepwyrm's native object model solely to make one compatibility adapter trivial unless the change is independently sound for the native ABI.
+Do not change Deepwyrm's native object model merely to make one or several compatibility adapters simpler. Being independently coherent for the native ABI is necessary but not sufficient: the change must also pass the cross-personality admission test, remain personality-blind, and prove that composition or a restartable userspace helper cannot safely provide the required privileged operation/atomicity. One-more-flag generalization and compatibility-driven policy hooks are rejected by default.
 
 ---
 
