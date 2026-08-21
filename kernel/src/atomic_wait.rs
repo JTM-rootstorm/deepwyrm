@@ -273,6 +273,10 @@ impl<const CAPACITY: usize> AtomicWaitRegistry<CAPACITY> {
         Ok(batch)
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.slots.lock().iter().all(|slot| slot.entry.is_none())
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.slots
@@ -455,6 +459,10 @@ impl<PIN, const CAPACITY: usize> AtomicWaitOperationRegistry<PIN, CAPACITY> {
             .flatten()
             .find(|entry| entry.thread == thread)
             .map(AtomicWaitOperation::wake_key)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.iter().all(Option::is_none)
     }
 
     #[cfg(test)]

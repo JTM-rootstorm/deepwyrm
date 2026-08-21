@@ -9,6 +9,16 @@ pub(crate) mod native;
 
 mod abi_bytes;
 mod adapters;
+mod f_services;
+
+#[allow(
+    unused_imports,
+    reason = "the shared F12 service composition is consumed by the target runtime lane"
+)]
+pub(crate) use f_services::{
+    FAtomicUserAccess, FServiceDispatch, FServiceOperationOwner, FServiceOwnerError,
+    FServiceResume, FServiceResumeError, FServiceRoute, FServiceState, FServiceTerminalCleanup,
+};
 
 #[cfg(deepwyrm_f9_guest)]
 pub(crate) use adapters::atomic_wake_with;
@@ -22,10 +32,18 @@ pub(crate) use adapters::{
     timer_set, wait_many_syscall, wait_one_syscall,
 };
 
-#[cfg(any(deepwyrm_e7_guest, deepwyrm_f9_guest))]
+#[cfg(all(
+    target_os = "none",
+    target_arch = "x86_64",
+    any(deepwyrm_e7_guest, deepwyrm_f12_guest)
+))]
+pub(crate) use adapters::clock_get;
+#[cfg(any(deepwyrm_e7_guest, deepwyrm_f9_guest, deepwyrm_f12_guest))]
 pub(crate) use adapters::process_exit;
 #[cfg(deepwyrm_e7_guest)]
-pub(crate) use adapters::{NoTerminalWaitCleanup, abi_get_info, clock_get};
+pub(crate) use adapters::{NoTerminalWaitCleanup, abi_get_info};
+#[cfg(deepwyrm_f12_guest)]
+pub(crate) use adapters::{handle_close, handle_duplicate, object_get_info_v1, process_terminate};
 
 use deepwyrm_abi::{
     DW_STATUS_NOT_SUPPORTED, DwKnownSyscall, DwStatus, DwSyscallId, DwSyscallImplementationPhase,

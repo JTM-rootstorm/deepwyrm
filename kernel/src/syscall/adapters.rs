@@ -1947,7 +1947,6 @@ impl NativeWaitControl {
         Ok(poll)
     }
 
-    #[cfg(test)]
     pub(crate) const fn is_clear(&self) -> bool {
         matches!(self.state, NativeWaitControlState::Clear)
     }

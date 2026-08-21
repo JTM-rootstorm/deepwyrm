@@ -171,6 +171,10 @@ impl<OUTPUT, const CAPACITY: usize> WaitOperationRegistry<OUTPUT, CAPACITY> {
             .any(|entry| entry.thread == thread)
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.iter().all(Option::is_none)
+    }
+
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.iter().flatten().count()
