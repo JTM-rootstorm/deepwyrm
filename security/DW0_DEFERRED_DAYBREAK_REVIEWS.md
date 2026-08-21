@@ -60,6 +60,18 @@ E8-R5 SMP assumptions remain phase-bounded H/future-path Medium gates rather
 than historical E acceptance blockers. E8-R4 remains Low fail-closed
 availability debt.
 
+### 2026-08-21 F13 reopen and reclosure
+
+F13 temporarily reopened DW0-E after exact Daybreak review found guest
+selectors 11 and 12 classified as implemented even though the E dispatcher has
+no runnable bodies for them. Deepwyrm commit `68313e5c8bd4f4f005d8347f8646089678089585`
+reclassified both identities as reserved and added tooling/kernel regressions
+that reject them before artifact selection or guest dispatch. The targeted
+`gpt-daybreak-blue-latest` High-reasoning re-review passed on final F13
+candidate `96fe554c0e4cb21335df4bbf5ebd2de1f9df21c5` with no remaining finding.
+DW0-E is therefore CLOSED again; no execution claim is made for selectors 11
+or 12.
+
 ## Closure evidence
 
 Cumulative remediation candidate:
