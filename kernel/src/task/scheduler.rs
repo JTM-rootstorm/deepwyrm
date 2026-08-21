@@ -582,7 +582,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         self.state.lock().check_invariants()
     }
 
-    #[cfg(test)]
     pub(crate) fn current(&self) -> Option<ThreadKey> {
         self.state.lock().current
     }

@@ -44,6 +44,7 @@ struct E7SmokeRuntime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: 
     thread: ThreadKey,
     stack_id: crate::task::KernelStackId,
     context_id: crate::task::ThreadContextId,
+    deferred_current: Option<crate::task::DeferredCurrentExecutionResources>,
     cleanup: CleanupQueue<REGISTRY_OBJECTS>,
     abi_seen: bool,
     clock_seen: bool,
@@ -426,6 +427,7 @@ fn build_smoke_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY:
         thread,
         stack_id,
         context_id,
+        deferred_current: None,
         cleanup: CleanupQueue::new(),
         abi_seen: false,
         clock_seen: false,
@@ -467,7 +469,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
             }
             NativeSyscallRequest::ProcessExit { exit_code } => {
                 let mut terminal_waits = crate::syscall::NoTerminalWaitCleanup;
-                let (status, control) = crate::syscall::process_exit(
+                let (status, control, deferred) = crate::syscall::process_exit(
                     &mut self.registry,
                     &mut self.tasks,
                     &self.execution,
@@ -479,7 +481,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     &mut self.cleanup,
                 );
                 if status == DW_STATUS_SUCCESS && control == SyscallControl::TerminateCurrent {
+                    if self
+                        .deferred_current
+                        .replace(deferred.unwrap_or_else(|| fail(0x8f)))
+                        .is_some()
+                    {
+                        fail(0x8f);
+                    }
                     self.exit_seen = true;
+                } else if deferred.is_some() {
+                    fail(0x8f);
                 }
                 NativeSyscallResult { status, control }
             }
@@ -510,6 +521,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 
     fn terminate_current(&mut self) -> ! {
+        crate::syscall::complete_deferred_current_reclaim(
+            &mut self.registry,
+            &self.execution,
+            &self.waits,
+            self.deferred_current.take().unwrap_or_else(|| fail(0x8f)),
+            &mut self.cleanup,
+        );
         if !self.abi_seen || !self.clock_seen || !self.exit_seen {
             fail(0x91);
         }

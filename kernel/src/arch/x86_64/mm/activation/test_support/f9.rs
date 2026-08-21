@@ -88,6 +88,7 @@ struct F9Runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize
     threads: [ThreadKey; 2],
     stack_ids: [crate::task::KernelStackId; 2],
     context_ids: [crate::task::ThreadContextId; 2],
+    deferred_current: Option<crate::task::DeferredCurrentExecutionResources>,
     cleanup: CleanupQueue<REGISTRY_OBJECTS>,
     control: crate::syscall::NativeWaitControl,
     waiter_wait_seen: bool,
@@ -531,6 +532,7 @@ fn build_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize
         threads: [waiter, waker],
         stack_ids: [waiter_resources.0, waker_resources.0],
         context_ids: [waiter_resources.1, waker_resources.1],
+        deferred_current: None,
         cleanup: CleanupQueue::new(),
         control: crate::syscall::NativeWaitControl::new(),
         waiter_wait_seen: false,
@@ -789,7 +791,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     atomic_operations: &mut self.atomic_operations,
                     process: self.process,
                 };
-                let (status, control) = crate::syscall::process_exit(
+                let (status, control, deferred) = crate::syscall::process_exit(
                     &mut self.registry,
                     &mut self.tasks,
                     &self.execution,
@@ -801,7 +803,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     &mut self.cleanup,
                 );
                 if status == DW_STATUS_SUCCESS && control == SyscallControl::TerminateCurrent {
+                    if self
+                        .deferred_current
+                        .replace(deferred.unwrap_or_else(|| fail(0xae)))
+                        .is_some()
+                    {
+                        fail(0xae);
+                    }
                     self.exit_seen = true;
+                } else if deferred.is_some() {
+                    fail(0xae);
                 }
                 NativeSyscallResult { status, control }
             }
@@ -833,6 +844,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 
     fn terminate_current(&mut self) -> ! {
+        crate::syscall::complete_deferred_current_reclaim(
+            &mut self.registry,
+            &self.execution,
+            &self.waits,
+            self.deferred_current.take().unwrap_or_else(|| fail(0xae)),
+            &mut self.cleanup,
+        );
         if !self.waiter_wait_seen
             || !self.wake_seen
             || !self.waker_wait_seen

@@ -484,6 +484,7 @@ struct F12Runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
     threads: [ThreadKey; EXECUTION_THREADS],
     stack_ids: [crate::task::KernelStackId; EXECUTION_THREADS],
     context_ids: [crate::task::ThreadContextId; EXECUTION_THREADS],
+    deferred_current: Option<crate::task::DeferredCurrentExecutionResources>,
     cleanup: CleanupQueue<REGISTRY_OBJECTS>,
     scenario: F12Scenario,
 }
@@ -717,6 +718,7 @@ fn build_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize
         threads: [service, producer],
         stack_ids: [service_resources.0, producer_resources.0],
         context_ids: [service_resources.1, producer_resources.1],
+        deferred_current: None,
         cleanup: CleanupQueue::new(),
         scenario: F12Scenario::new(),
     }
@@ -1133,7 +1135,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                         |_| fail(0xb6),
                         |_| fail(0xb7),
                     );
-                    let (status, control) = crate::syscall::process_terminate(
+                    let (status, control, deferred) = crate::syscall::process_terminate(
                         &mut self.registry,
                         &mut self.tasks,
                         self.execution,
@@ -1146,6 +1148,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                         code,
                         &mut self.cleanup,
                     );
+                    if deferred.is_some() {
+                        fail(0xb7);
+                    }
                     if status == DW_STATUS_SUCCESS {
                         let info = self
                             .tasks
@@ -1186,7 +1191,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     let mut discarded = None;
                     let mut atomic_pin = None;
                     let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
-                    let (status, control) = {
+                    let (status, control, deferred) = {
                         let mut terminal = self.services.terminal_cleanup(
                             Some(&mut wait_deadlines),
                             |output| {
@@ -1212,6 +1217,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                             &mut self.cleanup,
                         )
                     };
+                    if status == DW_STATUS_SUCCESS && control == SyscallControl::TerminateCurrent {
+                        if self
+                            .deferred_current
+                            .replace(deferred.unwrap_or_else(|| fail(0xc2)))
+                            .is_some()
+                        {
+                            fail(0xc2);
+                        }
+                    } else if deferred.is_some() {
+                        fail(0xc2);
+                    }
                     {
                         let mut user = self.active.current_process_address_space(self.process);
                         if let Some(output) = discarded {
@@ -1514,6 +1530,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 
     fn terminate_current(&mut self) -> ! {
+        crate::syscall::complete_deferred_current_reclaim(
+            &mut self.registry,
+            self.execution,
+            &self.waits,
+            self.deferred_current.take().unwrap_or_else(|| fail(0xf4)),
+            &mut self.cleanup,
+        );
         self.finish_and_pass()
     }
 

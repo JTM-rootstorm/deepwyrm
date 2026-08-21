@@ -307,6 +307,40 @@ pub(crate) fn linked_privilege_entry_stack_layout()
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TerminalReaperStackLayoutError {
+    InvalidGeometry,
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "linker-defined terminal reaper stack bounds are immutable kernel-layout facts"
+)]
+pub(crate) fn linked_terminal_reaper_stack_layout()
+-> Result<crate::memory::kernel_stack::KernelStackBounds, TerminalReaperStackLayoutError> {
+    unsafe extern "C" {
+        static __dw_terminal_reaper_stack_guard: u8;
+        static __dw_terminal_reaper_stack_bottom: u8;
+        static __dw_terminal_reaper_stack_top: u8;
+    }
+    let guard = core::ptr::addr_of!(__dw_terminal_reaper_stack_guard) as u64;
+    let bottom = core::ptr::addr_of!(__dw_terminal_reaper_stack_bottom) as u64;
+    let top = core::ptr::addr_of!(__dw_terminal_reaper_stack_top) as u64;
+    let bounds = crate::memory::kernel_stack::KernelStackBounds::new(guard, bottom, top)
+        .map_err(|_| TerminalReaperStackLayoutError::InvalidGeometry)?;
+    if crate::memory::kernel_stack::TERMINAL_REAPER_STACK_COUNT != 1
+        || bounds.byte_len() != crate::memory::kernel_stack::TERMINAL_REAPER_STACK_SIZE
+        || bottom.checked_sub(guard)
+            != Some(crate::memory::kernel_stack::TERMINAL_REAPER_STACK_GUARD_SIZE)
+        || !guard.is_multiple_of(crate::memory::kernel_stack::TERMINAL_REAPER_STACK_ALIGNMENT)
+    {
+        return Err(TerminalReaperStackLayoutError::InvalidGeometry);
+    }
+    Ok(bounds)
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[allow(
     unsafe_code,
     reason = "linker-owned exception symbols are read only by the one-shot x86 descriptor installer"

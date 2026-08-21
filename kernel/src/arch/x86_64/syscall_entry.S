@@ -183,6 +183,25 @@ dw_x86_64_iret_to_user:
     iretq
 .size dw_x86_64_iret_to_user, .-dw_x86_64_iret_to_user
 
+/*
+ * Divergent terminal handoff.
+ *
+ * RDI retains the pinned runtime context and RSI names a noreturn Rust
+ * callback. IF is forced clear before abandoning the retiring Thread stack.
+ * No return address is ever consumed from that old stack.
+ */
+.p2align 4
+.globl dw_x86_64_terminal_reaper_handoff
+.type dw_x86_64_terminal_reaper_handoff,@function
+dw_x86_64_terminal_reaper_handoff:
+    cli
+    leaq __dw_terminal_reaper_stack_top(%rip), %rsp
+    andq $-16, %rsp
+    xorq %rbp, %rbp
+    callq *%rsi
+    ud2
+.size dw_x86_64_terminal_reaper_handoff, .-dw_x86_64_terminal_reaper_handoff
+
 .p2align 4
 .Le4_entry_fail:
     cli

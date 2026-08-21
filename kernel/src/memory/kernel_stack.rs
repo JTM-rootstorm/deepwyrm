@@ -2,7 +2,7 @@
 
 pub(crate) const E3_BASE_PAGE_SIZE: u64 = 4096;
 pub(crate) const E3_THREAD_STACK_COUNT: usize = 16;
-pub(crate) const E3_THREAD_STACK_SIZE: u64 = 65_536;
+pub(crate) const E3_THREAD_STACK_SIZE: u64 = 131_072;
 pub(crate) const E3_THREAD_STACK_GUARD_SIZE: u64 = E3_BASE_PAGE_SIZE;
 pub(crate) const E3_THREAD_STACK_ALIGNMENT: u64 = E3_BASE_PAGE_SIZE;
 #[allow(
@@ -15,6 +15,11 @@ pub(crate) const E4_PRIVILEGE_ENTRY_STACK_COUNT: usize = 1;
 pub(crate) const E4_PRIVILEGE_ENTRY_STACK_SIZE: u64 = 16_384;
 pub(crate) const E4_PRIVILEGE_ENTRY_STACK_GUARD_SIZE: u64 = E3_BASE_PAGE_SIZE;
 pub(crate) const E4_PRIVILEGE_ENTRY_STACK_ALIGNMENT: u64 = E3_BASE_PAGE_SIZE;
+
+pub(crate) const TERMINAL_REAPER_STACK_COUNT: usize = 1;
+pub(crate) const TERMINAL_REAPER_STACK_SIZE: u64 = 131_072;
+pub(crate) const TERMINAL_REAPER_STACK_GUARD_SIZE: u64 = E3_BASE_PAGE_SIZE;
+pub(crate) const TERMINAL_REAPER_STACK_ALIGNMENT: u64 = E3_BASE_PAGE_SIZE;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct KernelStackBounds {
@@ -104,5 +109,21 @@ const _: () = {
     assert!(
         parse_decimal_u64(env!("DEEPWYRM_E4_PRIVILEGE_ENTRY_STACK_ALIGNMENT"))
             == E4_PRIVILEGE_ENTRY_STACK_ALIGNMENT
+    );
+    assert!(
+        parse_decimal_u64(env!("DEEPWYRM_TERMINAL_REAPER_STACK_COUNT"))
+            == TERMINAL_REAPER_STACK_COUNT as u64
+    );
+    assert!(
+        parse_decimal_u64(env!("DEEPWYRM_TERMINAL_REAPER_STACK_SIZE"))
+            == TERMINAL_REAPER_STACK_SIZE
+    );
+    assert!(
+        parse_decimal_u64(env!("DEEPWYRM_TERMINAL_REAPER_STACK_GUARD_SIZE"))
+            == TERMINAL_REAPER_STACK_GUARD_SIZE
+    );
+    assert!(
+        parse_decimal_u64(env!("DEEPWYRM_TERMINAL_REAPER_STACK_ALIGNMENT"))
+            == TERMINAL_REAPER_STACK_ALIGNMENT
     );
 };

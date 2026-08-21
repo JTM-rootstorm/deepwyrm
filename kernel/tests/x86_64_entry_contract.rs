@@ -130,22 +130,26 @@ fn task_layout_manifest_is_kernel_private_exact_and_fails_closed_on_drift() {
     let source = fs::read_to_string(task_layout_path()).expect("read E4 task layout manifest");
     let layout = kernel_build::TaskLayout::parse(&source).expect("parse E4 task layout manifest");
     assert_eq!(layout.thread_kernel_stack_count, 16);
-    assert_eq!(layout.thread_kernel_stack_size, 65_536);
+    assert_eq!(layout.thread_kernel_stack_size, 131_072);
     assert_eq!(layout.thread_kernel_stack_guard_size, 4_096);
     assert_eq!(layout.thread_kernel_stack_alignment, 4_096);
     assert_eq!(layout.privilege_entry_stack_count, 1);
     assert_eq!(layout.privilege_entry_stack_size, 16_384);
     assert_eq!(layout.privilege_entry_stack_guard_size, 4_096);
     assert_eq!(layout.privilege_entry_stack_alignment, 4_096);
+    assert_eq!(layout.terminal_reaper_stack_count, 1);
+    assert_eq!(layout.terminal_reaper_stack_size, 131_072);
+    assert_eq!(layout.terminal_reaper_stack_guard_size, 4_096);
+    assert_eq!(layout.terminal_reaper_stack_alignment, 4_096);
     for malformed in [
         format!("{source}\nunknown_task_layout_key = 1\n"),
-        source.replace("version = 2", "version = 1"),
+        source.replace("version = 3", "version = 2"),
         source.replace(
             "thread_kernel_stack_count = 16",
             "thread_kernel_stack_count = 8",
         ),
         source.replace(
-            "thread_kernel_stack_size = 65536",
+            "thread_kernel_stack_size = 131072",
             "thread_kernel_stack_size = 32768",
         ),
         source.replace(
@@ -159,6 +163,22 @@ fn task_layout_manifest_is_kernel_private_exact_and_fails_closed_on_drift() {
         source.replace(
             "privilege_entry_stack_size = 16384",
             "privilege_entry_stack_size = 8192",
+        ),
+        source.replace(
+            "terminal_reaper_stack_count = 1",
+            "terminal_reaper_stack_count = 2",
+        ),
+        source.replace(
+            "terminal_reaper_stack_size = 131072",
+            "terminal_reaper_stack_size = 65536",
+        ),
+        source.replace(
+            "terminal_reaper_stack_guard_size = 4096",
+            "terminal_reaper_stack_guard_size = 8192",
+        ),
+        source.replace(
+            "terminal_reaper_stack_alignment = 4096",
+            "terminal_reaper_stack_alignment = 8192",
         ),
     ] {
         assert!(kernel_build::TaskLayout::parse(&malformed).is_err());
@@ -554,6 +574,9 @@ dw_test_bss_probe:
         "__dw_privilege_entry_stack_guard",
         "__dw_privilege_entry_stack_bottom",
         "__dw_privilege_entry_stack_top",
+        "__dw_terminal_reaper_stack_guard",
+        "__dw_terminal_reaper_stack_bottom",
+        "__dw_terminal_reaper_stack_top",
         "__dw_double_fault_ist_guard",
         "__dw_double_fault_ist_bottom",
         "__dw_double_fault_ist_top",

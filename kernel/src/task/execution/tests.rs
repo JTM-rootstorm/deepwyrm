@@ -145,6 +145,96 @@ fn execution_domain_starts_schedules_and_reclaims_exact_thread_resources() {
 }
 
 #[test]
+fn current_terminal_resources_remain_allocated_until_linear_token_is_consumed() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_ref) = tasks.create_root_group(&mut registry).unwrap();
+    let (process, process_ref) = tasks.create_process(&mut registry, &root_ref).unwrap();
+    let process_owner = registry.retain_internal_from_handle(&process_ref).unwrap();
+    let (current, current_ref) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    let (sibling, sibling_ref) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    assert!(registry.release_internal(process_owner).unwrap().is_none());
+    let domain = ExecutionDomain::<2>::new(stack_bounds::<2>()).unwrap();
+    domain
+        .start_thread(&mut tasks, current, start_state(1))
+        .unwrap();
+    domain
+        .start_thread(&mut tasks, sibling, start_state(2))
+        .unwrap();
+    assert_eq!(domain.schedule_next().unwrap().current, Some(current));
+    let (current_stack, current_context) =
+        tasks.thread_execution_resources(current).unwrap().unwrap();
+    let (sibling_stack, sibling_context) =
+        tasks.thread_execution_resources(sibling).unwrap().unwrap();
+
+    let effects = tasks
+        .exit_process(&mut registry, process, current, 0)
+        .unwrap();
+    let (retired, deferred) = domain.retire_exit_pins_defer_current(effects.pins, current);
+
+    assert_eq!(deferred.thread(), current);
+    assert_eq!(domain.scheduler_state(current), None);
+    assert_eq!(domain.scheduler_state(sibling), None);
+    assert!(domain.stack_bounds(current_stack).is_ok());
+    assert!(domain.load_context(current_context).is_ok());
+    assert_eq!(
+        domain.stack_bounds(sibling_stack),
+        Err(ExecutionResourceError::StaleId)
+    );
+    assert_eq!(
+        domain.load_context(sibling_context),
+        Err(ExecutionResourceError::StaleId)
+    );
+    let replacement_stack = domain.stacks.allocate().unwrap();
+    assert_eq!(
+        domain.stacks.allocate(),
+        Err(ExecutionResourceError::Capacity)
+    );
+    let replacement_context = domain
+        .contexts
+        .allocate(SavedThreadContext::initial(start_state(3)))
+        .unwrap();
+    assert_eq!(
+        domain
+            .contexts
+            .allocate(SavedThreadContext::initial(start_state(4))),
+        Err(ExecutionResourceError::Capacity)
+    );
+
+    let deferred_pins = domain.reclaim_deferred_current(deferred);
+    assert_eq!(
+        domain.stack_bounds(current_stack),
+        Err(ExecutionResourceError::StaleId)
+    );
+    let post_reclaim_stack = domain.stacks.allocate().unwrap();
+    let post_reclaim_context = domain
+        .contexts
+        .allocate(SavedThreadContext::initial(start_state(4)))
+        .unwrap();
+    domain.stacks.reclaim(replacement_stack).unwrap();
+    domain.stacks.reclaim(post_reclaim_stack).unwrap();
+    domain.contexts.reclaim(replacement_context).unwrap();
+    domain.contexts.reclaim(post_reclaim_context).unwrap();
+    assert_eq!(
+        domain.load_context(current_context),
+        Err(ExecutionResourceError::StaleId)
+    );
+
+    let (process_pin, thread_pins) = retired.into_parts();
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        let _ = registry.release_internal(pin).unwrap();
+    }
+    let (process_pin, thread_pins) = deferred_pins.into_parts();
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        let _ = registry.release_internal(pin).unwrap();
+    }
+    for reference in [current_ref, sibling_ref, process_ref] {
+        let _ = registry.release_handle(reference).unwrap();
+    }
+    let _ = registry.release_internal(root_ref).unwrap();
+}
+
+#[test]
 fn failed_task_preparation_rolls_back_scheduler_stack_and_context_capacity() {
     let mut registry = ObjectRegistry::<OBJECTS>::new();
     let mut tasks = Tasks::new();

@@ -550,6 +550,40 @@ unsafe fn native_runtime_fresh_thread<R: crate::syscall::native::NativeSyscallFr
 
 #[allow(
     unsafe_code,
+    reason = "the assembly handoff has already abandoned the deferred Thread stack and passes the pinned runtime to one noreturn terminal callback"
+)]
+unsafe extern "sysv64" fn native_runtime_terminal_reaper<
+    R: crate::syscall::native::NativeSyscallFrameRuntime,
+>(
+    context: *mut (),
+) -> ! {
+    let runtime = unsafe { &mut *context.cast::<R>() };
+    runtime.terminate_current()
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the audited assembly boundary clears IF, switches to the guarded linker-owned reaper stack, and never returns to the deferred Thread stack"
+)]
+fn handoff_to_terminal_reaper<R: crate::syscall::native::NativeSyscallFrameRuntime>(
+    context: *mut (),
+) -> ! {
+    unsafe extern "sysv64" {
+        fn dw_x86_64_terminal_reaper_handoff(
+            context: *mut (),
+            callback: unsafe extern "sysv64" fn(*mut ()) -> !,
+        ) -> !;
+    }
+    let bounds = crate::arch::x86_64::linked_terminal_reaper_stack_layout()
+        .unwrap_or_else(|_| halt_forever());
+    if bounds.top == 0 {
+        halt_forever();
+    }
+    unsafe { dw_x86_64_terminal_reaper_handoff(context, native_runtime_terminal_reaper::<R>) }
+}
+
+#[allow(
+    unsafe_code,
     reason = "the pinned one-BSP runtime is reborrowed only in bounded regions that do not span a kernel-context switch"
 )]
 unsafe fn native_runtime_trampoline<R: crate::syscall::native::NativeSyscallFrameRuntime>(
@@ -563,8 +597,7 @@ unsafe fn native_runtime_trampoline<R: crate::syscall::native::NativeSyscallFram
     match control {
         crate::syscall::native::SyscallControl::ReturnToCaller => {}
         crate::syscall::native::SyscallControl::TerminateCurrent => {
-            let runtime = unsafe { &mut *context.cast::<R>() };
-            runtime.terminate_current()
+            handoff_to_terminal_reaper::<R>(context)
         }
         crate::syscall::native::SyscallControl::SuspendCurrent => {
             let plan = {

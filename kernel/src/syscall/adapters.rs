@@ -45,11 +45,11 @@ use crate::memory::usercopy::{
 };
 use crate::object::{FinalRelease, HandleRef, InternalRef, ObjectRegistry, ObjectRegistryError};
 use crate::task::{
-    BlockWakeKey, ExecutionDomain, ExecutionResourceError, ExecutionSwitchError,
-    IdleScheduleDecision, PreparedProcess, ProcessExitEffects, ProcessKey, RetiredExitPins,
-    ScheduleDecision, SchedulerError, SchedulerThreadState, StartThreadError, TaskAuthority,
-    TaskCreateError, TaskError, TaskGroupKey, TaskGroupTerminationEffects, ThreadKey,
-    ThreadStartState,
+    BlockWakeKey, DeferredCurrentExecutionResources, ExecutionDomain, ExecutionResourceError,
+    ExecutionSwitchError, IdleScheduleDecision, PreparedProcess, ProcessExitEffects, ProcessKey,
+    RetiredExitPins, ScheduleDecision, SchedulerError, SchedulerThreadState, StartThreadError,
+    TaskAuthority, TaskCreateError, TaskError, TaskGroupKey, TaskGroupTerminationEffects,
+    ThreadKey, ThreadStartState,
 };
 use crate::time::{TimerAuthority, TimerCreateError, TimerDeadlineAuthority, TimerError, TimerKey};
 use crate::wait::{
@@ -827,6 +827,21 @@ fn collect_retired_pins<
     }
 }
 
+pub(crate) fn complete_deferred_current_reclaim<
+    const OBJECTS: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
+    deferred: DeferredCurrentExecutionResources,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) {
+    let pins = execution.reclaim_deferred_current(deferred);
+    collect_retired_pins(registry, execution, waits, pins, cleanup);
+}
+
 fn collect_process_effects<
     C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
     const OBJECTS: usize,
@@ -839,22 +854,33 @@ fn collect_process_effects<
     execution: &ExecutionDomain<EXECUTION>,
     waits: &WaitRegistry<WAITERS>,
     effects: ProcessExitEffects<HANDLES, THREADS>,
+    defer_current: Option<ThreadKey>,
     terminal_waits: &mut C,
     cleanup: &mut CleanupQueue<OBJECTS>,
-) {
+) -> Option<DeferredCurrentExecutionResources> {
+    let deferred_thread = defer_current.filter(|current| {
+        effects
+            .pins
+            .thread_keys()
+            .into_iter()
+            .flatten()
+            .any(|thread| thread == *current)
+    });
     for release in effects.drained.into_final_releases().into_iter().flatten() {
         cleanup.push(release);
     }
     for thread in effects.pins.thread_keys().into_iter().flatten() {
         terminal_waits.cleanup_terminal_wait(registry, waits, execution, thread, cleanup);
     }
-    collect_retired_pins(
-        registry,
-        execution,
-        waits,
-        execution.retire_exit_pins(effects.pins),
-        cleanup,
-    );
+    let (pins, deferred) = match deferred_thread {
+        Some(current) => {
+            let (pins, deferred) = execution.retire_exit_pins_defer_current(effects.pins, current);
+            (pins, Some(deferred))
+        }
+        None => (execution.retire_exit_pins(effects.pins), None),
+    };
+    collect_retired_pins(registry, execution, waits, pins, cleanup);
+    deferred
 }
 
 pub(crate) fn task_group_create<
@@ -2930,12 +2956,28 @@ fn collect_group_effects<
     execution: &ExecutionDomain<EXECUTION>,
     waits: &WaitRegistry<WAITERS>,
     effects: TaskGroupTerminationEffects<PROCESSES, HANDLES, THREADS>,
+    current_thread: ThreadKey,
     terminal_waits: &mut C,
     cleanup: &mut CleanupQueue<OBJECTS>,
-) {
+) -> Option<DeferredCurrentExecutionResources> {
+    let mut deferred = None;
     for process in effects.into_processes().into_iter().flatten() {
-        collect_process_effects(registry, execution, waits, process, terminal_waits, cleanup);
+        if let Some(current) = collect_process_effects(
+            registry,
+            execution,
+            waits,
+            process,
+            Some(current_thread),
+            terminal_waits,
+            cleanup,
+        ) {
+            assert!(
+                deferred.replace(current).is_none(),
+                "group retirement produced duplicate deferred current resources"
+            );
+        }
     }
+    deferred
 }
 
 fn authorized_reason(reason: DwTerminationReason) -> Result<(), DwStatus> {
@@ -2982,13 +3024,17 @@ pub(crate) fn task_group_terminate<
     task_group: DwHandle,
     reason: DwTerminationReason,
     cleanup: &mut CleanupQueue<OBJECTS>,
-) -> (DwStatus, SyscallControl) {
+) -> (
+    DwStatus,
+    SyscallControl,
+    Option<DeferredCurrentExecutionResources>,
+) {
     if let Err(status) = authorized_reason(reason) {
-        return (status, SyscallControl::ReturnToCaller);
+        return (status, SyscallControl::ReturnToCaller, None);
     }
     if let Err(status) = validate_running_caller(tasks, execution, current_process, current_thread)
     {
-        return (status, SyscallControl::ReturnToCaller);
+        return (status, SyscallControl::ReturnToCaller, None);
     }
     let pin = match resolve_current_handle(
         tasks,
@@ -2999,22 +3045,33 @@ pub(crate) fn task_group_terminate<
         DW_RIGHT_MODIFY,
     ) {
         Ok(pin) => pin,
-        Err(status) => return (status, SyscallControl::ReturnToCaller),
+        Err(status) => return (status, SyscallControl::ReturnToCaller, None),
     };
     let key = TaskGroupKey::from_object_id(pin.id());
     let effects = match tasks.terminate_group(registry, key) {
         Ok(effects) => effects,
         Err(error) => {
             release_lookup_pin(registry, pin, cleanup);
-            return (task_status(error), SyscallControl::ReturnToCaller);
+            return (task_status(error), SyscallControl::ReturnToCaller, None);
         }
     };
-    collect_group_effects(registry, execution, waits, effects, terminal_waits, cleanup);
+    let deferred = collect_group_effects(
+        registry,
+        execution,
+        waits,
+        effects,
+        current_thread,
+        terminal_waits,
+        cleanup,
+    );
     release_lookup_pin(registry, pin, cleanup);
-    (
-        DW_STATUS_SUCCESS,
-        control_after_process_state(tasks, current_process),
-    )
+    let control = control_after_process_state(tasks, current_process);
+    assert_eq!(
+        control == SyscallControl::TerminateCurrent,
+        deferred.is_some(),
+        "group terminal control and deferred current ownership diverged"
+    );
+    (DW_STATUS_SUCCESS, control, deferred)
 }
 
 pub(crate) fn process_exit<
@@ -3036,17 +3093,37 @@ pub(crate) fn process_exit<
     current_thread: ThreadKey,
     code: u32,
     cleanup: &mut CleanupQueue<OBJECTS>,
-) -> (DwStatus, SyscallControl) {
+) -> (
+    DwStatus,
+    SyscallControl,
+    Option<DeferredCurrentExecutionResources>,
+) {
     if let Err(status) = validate_running_caller(tasks, execution, current_process, current_thread)
     {
-        return (status, SyscallControl::ReturnToCaller);
+        return (status, SyscallControl::ReturnToCaller, None);
     }
     let effects = match tasks.exit_process(registry, current_process, current_thread, code) {
         Ok(effects) => effects,
-        Err(error) => return (task_status(error), SyscallControl::ReturnToCaller),
+        Err(error) => return (task_status(error), SyscallControl::ReturnToCaller, None),
     };
-    collect_process_effects(registry, execution, waits, effects, terminal_waits, cleanup);
-    (DW_STATUS_SUCCESS, SyscallControl::TerminateCurrent)
+    let deferred = collect_process_effects(
+        registry,
+        execution,
+        waits,
+        effects,
+        Some(current_thread),
+        terminal_waits,
+        cleanup,
+    );
+    assert!(
+        deferred.is_some(),
+        "process exit did not preserve the physical current execution bundle"
+    );
+    (
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+        deferred,
+    )
 }
 
 pub(crate) fn process_terminate<
@@ -3070,13 +3147,17 @@ pub(crate) fn process_terminate<
     reason: DwTerminationReason,
     detail: u32,
     cleanup: &mut CleanupQueue<OBJECTS>,
-) -> (DwStatus, SyscallControl) {
+) -> (
+    DwStatus,
+    SyscallControl,
+    Option<DeferredCurrentExecutionResources>,
+) {
     if let Err(status) = authorized_reason(reason) {
-        return (status, SyscallControl::ReturnToCaller);
+        return (status, SyscallControl::ReturnToCaller, None);
     }
     if let Err(status) = validate_running_caller(tasks, execution, current_process, current_thread)
     {
-        return (status, SyscallControl::ReturnToCaller);
+        return (status, SyscallControl::ReturnToCaller, None);
     }
     let pin = match resolve_current_handle(
         tasks,
@@ -3087,22 +3168,33 @@ pub(crate) fn process_terminate<
         DW_RIGHT_MODIFY,
     ) {
         Ok(pin) => pin,
-        Err(status) => return (status, SyscallControl::ReturnToCaller),
+        Err(status) => return (status, SyscallControl::ReturnToCaller, None),
     };
     let target = ProcessKey::from_object_id(pin.id());
     let effects = match tasks.terminate_process_authorized(registry, target, detail) {
         Ok(effects) => effects,
         Err(error) => {
             release_lookup_pin(registry, pin, cleanup);
-            return (task_status(error), SyscallControl::ReturnToCaller);
+            return (task_status(error), SyscallControl::ReturnToCaller, None);
         }
     };
-    collect_process_effects(registry, execution, waits, effects, terminal_waits, cleanup);
+    let deferred = collect_process_effects(
+        registry,
+        execution,
+        waits,
+        effects,
+        Some(current_thread),
+        terminal_waits,
+        cleanup,
+    );
     release_lookup_pin(registry, pin, cleanup);
-    (
-        DW_STATUS_SUCCESS,
-        control_after_process_state(tasks, current_process),
-    )
+    let control = control_after_process_state(tasks, current_process);
+    assert_eq!(
+        control == SyscallControl::TerminateCurrent,
+        deferred.is_some(),
+        "Process terminal control and deferred current ownership diverged"
+    );
+    (DW_STATUS_SUCCESS, control, deferred)
 }
 
 pub(crate) fn thread_exit<
@@ -3122,15 +3214,19 @@ pub(crate) fn thread_exit<
     current_thread: ThreadKey,
     code: u32,
     cleanup: &mut CleanupQueue<OBJECTS>,
-) -> (DwStatus, SyscallControl) {
+) -> (
+    DwStatus,
+    SyscallControl,
+    Option<DeferredCurrentExecutionResources>,
+) {
     if let Err(status) = validate_running_caller(tasks, execution, current_process, current_thread)
     {
-        return (status, SyscallControl::ReturnToCaller);
+        return (status, SyscallControl::ReturnToCaller, None);
     }
     let process = current_process;
     let pins = match tasks.exit_thread(current_thread, code) {
         Ok(pins) => pins,
-        Err(error) => return (task_status(error), SyscallControl::ReturnToCaller),
+        Err(error) => return (task_status(error), SyscallControl::ReturnToCaller, None),
     };
     if tasks
         .process_info(process)
@@ -3145,14 +3241,13 @@ pub(crate) fn thread_exit<
             cleanup.push(release);
         }
     }
-    collect_retired_pins(
-        registry,
-        execution,
-        waits,
-        execution.retire_exit_pins(pins),
-        cleanup,
-    );
-    (DW_STATUS_SUCCESS, SyscallControl::TerminateCurrent)
+    let (pins, deferred) = execution.retire_exit_pins_defer_current(pins, current_thread);
+    collect_retired_pins(registry, execution, waits, pins, cleanup);
+    (
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+        Some(deferred),
+    )
 }
 
 pub(crate) fn thread_terminate<
@@ -3176,13 +3271,17 @@ pub(crate) fn thread_terminate<
     reason: DwTerminationReason,
     detail: u32,
     cleanup: &mut CleanupQueue<OBJECTS>,
-) -> (DwStatus, SyscallControl) {
+) -> (
+    DwStatus,
+    SyscallControl,
+    Option<DeferredCurrentExecutionResources>,
+) {
     if let Err(status) = authorized_reason(reason) {
-        return (status, SyscallControl::ReturnToCaller);
+        return (status, SyscallControl::ReturnToCaller, None);
     }
     if let Err(status) = validate_running_caller(tasks, execution, current_process, current_thread)
     {
-        return (status, SyscallControl::ReturnToCaller);
+        return (status, SyscallControl::ReturnToCaller, None);
     }
     let pin = match resolve_current_handle(
         tasks,
@@ -3193,21 +3292,21 @@ pub(crate) fn thread_terminate<
         DW_RIGHT_MODIFY,
     ) {
         Ok(pin) => pin,
-        Err(status) => return (status, SyscallControl::ReturnToCaller),
+        Err(status) => return (status, SyscallControl::ReturnToCaller, None),
     };
     let target = ThreadKey::from_object_id(pin.id());
     let target_process = match tasks.thread_process(target) {
         Ok(process) => process,
         Err(error) => {
             release_lookup_pin(registry, pin, cleanup);
-            return (task_status(error), SyscallControl::ReturnToCaller);
+            return (task_status(error), SyscallControl::ReturnToCaller, None);
         }
     };
     let pins = match tasks.terminate_thread_authorized(target, detail) {
         Ok(pins) => pins,
         Err(error) => {
             release_lookup_pin(registry, pin, cleanup);
-            return (task_status(error), SyscallControl::ReturnToCaller);
+            return (task_status(error), SyscallControl::ReturnToCaller, None);
         }
     };
     if tasks
@@ -3228,20 +3327,25 @@ pub(crate) fn thread_terminate<
     for terminal_thread in pins.thread_keys().into_iter().flatten() {
         terminal_waits.cleanup_terminal_wait(registry, waits, execution, terminal_thread, cleanup);
     }
-    collect_retired_pins(
-        registry,
-        execution,
-        waits,
-        execution.retire_exit_pins(pins),
-        cleanup,
-    );
+    let (pins, deferred) = if target == current_thread {
+        let (pins, deferred) = execution.retire_exit_pins_defer_current(pins, current_thread);
+        (pins, Some(deferred))
+    } else {
+        (execution.retire_exit_pins(pins), None)
+    };
+    collect_retired_pins(registry, execution, waits, pins, cleanup);
     release_lookup_pin(registry, pin, cleanup);
     let control = if target == current_thread {
         SyscallControl::TerminateCurrent
     } else {
         control_after_process_state(tasks, current_process)
     };
-    (DW_STATUS_SUCCESS, control)
+    assert_eq!(
+        control == SyscallControl::TerminateCurrent,
+        deferred.is_some(),
+        "Thread terminal control and deferred current ownership diverged"
+    );
+    (DW_STATUS_SUCCESS, control, deferred)
 }
 
 fn start_thread_status(error: StartThreadError) -> DwStatus {

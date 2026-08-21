@@ -1,10 +1,10 @@
 schema = "deepwyrm-x86_64-task-layout"
-version = 2
+version = 3
 
 # Kernel-private DW0-E3 execution-resource budget. This is not a userspace ABI
 # and is intentionally separate from the Wyrmroot-consumed layout.toml.
 thread_kernel_stack_count = 16
-thread_kernel_stack_size = 65536
+thread_kernel_stack_size = 131072
 thread_kernel_stack_guard_size = 4096
 thread_kernel_stack_alignment = 4096
 
@@ -14,3 +14,11 @@ privilege_entry_stack_count = 1
 privilege_entry_stack_size = 16384
 privilege_entry_stack_guard_size = 4096
 privilege_entry_stack_alignment = 4096
+
+# BSP-only terminal execution carrier. A terminating Thread reaches this stack
+# through a noreturn assembly handoff before its pool-owned stack/context are
+# made reusable.
+terminal_reaper_stack_count = 1
+terminal_reaper_stack_size = 131072
+terminal_reaper_stack_guard_size = 4096
+terminal_reaper_stack_alignment = 4096

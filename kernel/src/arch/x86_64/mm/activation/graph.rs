@@ -170,6 +170,17 @@ pub(super) fn is_thread_stack_guard(
     thread_stacks.iter().any(|stack| stack.guard_page == page)
 }
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn is_terminal_reaper_guard(page: u64) -> bool {
+    crate::arch::x86_64::linked_terminal_reaper_stack_layout()
+        .is_ok_and(|stack| stack.guard_page == page)
+}
+
+#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+const fn is_terminal_reaper_guard(_page: u64) -> bool {
+    false
+}
+
 pub(super) fn is_kernel_guard(
     ist: IstStackLayout,
     thread_stacks: &[crate::memory::kernel_stack::KernelStackBounds],
@@ -179,6 +190,7 @@ pub(super) fn is_kernel_guard(
     is_ist_guard(ist, page)
         || is_thread_stack_guard(thread_stacks, page)
         || privilege_entry.guard_page == page
+        || is_terminal_reaper_guard(page)
 }
 
 pub(super) fn validate_ist_layout(
@@ -294,6 +306,56 @@ pub(super) fn validate_privilege_entry_stack_layout(
     Ok(())
 }
 
+pub(super) fn validate_terminal_reaper_stack_layout(
+    segments: &[KernelSegment; 3],
+    scratch_window_page: u64,
+    scratch_control_page: u64,
+    ist: IstStackLayout,
+    privilege_entry: crate::memory::kernel_stack::KernelStackBounds,
+    thread_stacks: &[crate::memory::kernel_stack::KernelStackBounds],
+    terminal_reaper: crate::memory::kernel_stack::KernelStackBounds,
+) -> Result<(), InactiveGraphError<core::convert::Infallible>> {
+    let Some(writable) = segments
+        .iter()
+        .copied()
+        .find(|segment| segment.kind == SegmentKind::Writable)
+    else {
+        return Err(InactiveGraphError::InvalidSegmentLayout);
+    };
+    let scratch_mmio_page = scratch_control_page.checked_add(PAGE_SIZE).unwrap_or(0);
+    let overlaps_thread = thread_stacks.iter().any(|stack| {
+        terminal_reaper.guard_page < stack.top && stack.guard_page < terminal_reaper.top
+    });
+    let overlaps_ist = ist.stacks().iter().any(|stack| {
+        terminal_reaper.guard_page < stack.top && stack.guard_page < terminal_reaper.top
+    });
+    let overlaps_privilege = terminal_reaper.guard_page < privilege_entry.top
+        && privilege_entry.guard_page < terminal_reaper.top;
+    if terminal_reaper
+        .bottom
+        .checked_sub(terminal_reaper.guard_page)
+        != Some(crate::memory::kernel_stack::TERMINAL_REAPER_STACK_GUARD_SIZE)
+        || terminal_reaper.byte_len() != crate::memory::kernel_stack::TERMINAL_REAPER_STACK_SIZE
+        || !terminal_reaper
+            .guard_page
+            .is_multiple_of(crate::memory::kernel_stack::TERMINAL_REAPER_STACK_ALIGNMENT)
+        || !writable.contains(terminal_reaper.guard_page)
+        || terminal_reaper.top > writable.end
+        || (scratch_window_page >= terminal_reaper.guard_page
+            && scratch_window_page < terminal_reaper.top)
+        || (scratch_control_page >= terminal_reaper.guard_page
+            && scratch_control_page < terminal_reaper.top)
+        || (scratch_mmio_page >= terminal_reaper.guard_page
+            && scratch_mmio_page < terminal_reaper.top)
+        || overlaps_thread
+        || overlaps_ist
+        || overlaps_privilege
+    {
+        return Err(InactiveGraphError::InvalidSegmentLayout);
+    }
+    Ok(())
+}
+
 pub(super) fn subtree_is_required(
     virtual_prefix: u64,
     child_level: u8,
@@ -353,7 +415,19 @@ pub(super) fn validate_segment_layout(
         ist,
         privilege_entry,
         thread_stacks,
-    )
+    )?;
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    validate_terminal_reaper_stack_layout(
+        segments,
+        scratch.window_page,
+        scratch.control_page,
+        ist,
+        privilege_entry,
+        thread_stacks,
+        crate::arch::x86_64::linked_terminal_reaper_stack_layout()
+            .map_err(|_| InactiveGraphError::InvalidSegmentLayout)?,
+    )?;
+    Ok(())
 }
 
 pub(super) fn read_entry<A: ActivationGraphAccess>(

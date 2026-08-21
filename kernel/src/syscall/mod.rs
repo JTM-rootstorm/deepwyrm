@@ -32,16 +32,12 @@ pub(crate) use adapters::{
     timer_set, wait_many_syscall, wait_one_syscall,
 };
 
-#[cfg(all(
-    target_os = "none",
-    target_arch = "x86_64",
-    deepwyrm_e7_guest
-))]
+#[cfg(all(target_os = "none", target_arch = "x86_64", deepwyrm_e7_guest))]
 pub(crate) use adapters::clock_get;
-#[cfg(any(deepwyrm_e7_guest, deepwyrm_f9_guest, deepwyrm_f12_guest))]
-pub(crate) use adapters::process_exit;
 #[cfg(deepwyrm_e7_guest)]
 pub(crate) use adapters::{NoTerminalWaitCleanup, abi_get_info};
+#[cfg(any(deepwyrm_e7_guest, deepwyrm_f9_guest, deepwyrm_f12_guest))]
+pub(crate) use adapters::{complete_deferred_current_reclaim, process_exit};
 #[cfg(deepwyrm_f12_guest)]
 pub(crate) use adapters::{handle_close, handle_duplicate, object_get_info_v1, process_terminate};
 

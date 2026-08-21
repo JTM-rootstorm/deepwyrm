@@ -410,6 +410,35 @@ pub(crate) struct RetiredExitPins<const THREADS: usize> {
     threads: [Option<crate::object::InternalRef>; THREADS],
 }
 
+/// Linear ownership of the execution resources belonging to the Thread whose
+/// terminal syscall is still running on its kernel stack.
+///
+/// Scheduler and task ownership have already been retired.  The stack and
+/// saved context deliberately remain allocated until architecture code has
+/// diverged onto a separately owned terminal stack and consumes this token.
+#[must_use = "current execution resources must be reclaimed after switching to a terminal stack"]
+pub(crate) struct DeferredCurrentExecutionResources {
+    thread: ThreadKey,
+    resources: Option<ThreadExecutionResources>,
+    process_pin: Option<crate::object::InternalRef>,
+    thread_pin: Option<crate::object::InternalRef>,
+}
+
+impl DeferredCurrentExecutionResources {
+    pub(crate) const fn thread(&self) -> ThreadKey {
+        self.thread
+    }
+}
+
+impl Drop for DeferredCurrentExecutionResources {
+    fn drop(&mut self) {
+        assert!(
+            self.resources.is_none() && self.process_pin.is_none() && self.thread_pin.is_none(),
+            "deferred current execution bundle leaked without ordered terminal-stack reclaim"
+        );
+    }
+}
+
 impl<const THREADS: usize> RetiredExitPins<THREADS> {
     pub(crate) fn into_parts(
         self,
@@ -616,8 +645,40 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         &self,
         pins: ExitPins<THREADS>,
     ) -> RetiredExitPins<THREADS> {
-        let (process, thread_pins, resources) = pins.into_parts();
+        self.retire_exit_pins_inner(pins, None).0
+    }
+
+    /// Retires one terminal batch while preserving the named current Thread's
+    /// stack and context until a divergent architecture handoff consumes the
+    /// returned linear token.
+    pub(crate) fn retire_exit_pins_defer_current<const THREADS: usize>(
+        &self,
+        pins: ExitPins<THREADS>,
+        current: ThreadKey,
+    ) -> (RetiredExitPins<THREADS>, DeferredCurrentExecutionResources) {
+        assert_eq!(
+            self.scheduler.current(),
+            Some(current),
+            "deferred terminal retirement did not name the physical current Thread"
+        );
+        let (pins, deferred) = self.retire_exit_pins_inner(pins, Some(current));
+        (
+            pins,
+            deferred.expect("terminal batch did not contain the running current Thread"),
+        )
+    }
+
+    fn retire_exit_pins_inner<const THREADS: usize>(
+        &self,
+        pins: ExitPins<THREADS>,
+        defer_current: Option<ThreadKey>,
+    ) -> (
+        RetiredExitPins<THREADS>,
+        Option<DeferredCurrentExecutionResources>,
+    ) {
+        let (mut process, thread_pins, resources) = pins.into_parts();
         let mut retired_threads = core::array::from_fn(|_| None);
+        let mut deferred = None;
         for (index, (pin, resources)) in thread_pins.into_iter().zip(resources).enumerate() {
             let Some(pin) = pin else {
                 assert!(
@@ -643,13 +704,60 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                 });
             }
             if let Some(resources) = resources {
-                self.reclaim_resources(resources);
+                if defer_current == Some(thread) {
+                    assert!(
+                        deferred.is_none(),
+                        "terminal batch contained duplicate current execution resources"
+                    );
+                    deferred = Some(DeferredCurrentExecutionResources {
+                        thread,
+                        resources: Some(resources),
+                        process_pin: None,
+                        thread_pin: Some(pin),
+                    });
+                } else {
+                    self.reclaim_resources(resources);
+                    retired_threads[index] = Some(pin);
+                }
+            } else {
+                retired_threads[index] = Some(pin);
             }
-            retired_threads[index] = Some(pin);
         }
+        if let Some(deferred) = deferred.as_mut() {
+            deferred.process_pin = process.take();
+        }
+        (
+            RetiredExitPins {
+                process,
+                threads: retired_threads,
+            },
+            deferred,
+        )
+    }
+
+    /// Consumes execution-resource ownership after the caller has irreversibly
+    /// left the deferred Thread's kernel stack.
+    pub(crate) fn reclaim_deferred_current(
+        &self,
+        mut deferred: DeferredCurrentExecutionResources,
+    ) -> RetiredExitPins<1> {
+        assert_eq!(
+            self.scheduler.state(deferred.thread),
+            None,
+            "deferred current Thread became schedulable before resource reclaim"
+        );
+        let resources = deferred
+            .resources
+            .take()
+            .expect("deferred current execution resources were already consumed");
+        self.reclaim_resources(resources);
+        let thread = deferred
+            .thread_pin
+            .take()
+            .expect("deferred current Thread lost its execution pin");
         RetiredExitPins {
-            process,
-            threads: retired_threads,
+            process: deferred.process_pin.take(),
+            threads: [Some(thread)],
         }
     }
 

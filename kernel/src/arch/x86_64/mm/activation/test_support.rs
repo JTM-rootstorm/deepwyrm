@@ -273,6 +273,35 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             payload_pages = payload_pages.checked_add(1).ok_or(0x00f3_u32)?;
             page = page.checked_add(PAGE_SIZE).ok_or(0x00f4_u32)?;
         }
+        let terminal_reaper =
+            crate::arch::x86_64::linked_terminal_reaper_stack_layout().map_err(|_| 0x00f5_u32)?;
+        if !self.guard_leaf_is_exact_zero(terminal_reaper.guard_page)? {
+            return Err(0x00f6);
+        }
+        let first = self.walk_leaf(terminal_reaper.bottom)?;
+        let mut page = terminal_reaper.bottom;
+        while page < terminal_reaper.top {
+            let walk = self.walk_leaf(page)?;
+            let offset = page.checked_sub(terminal_reaper.bottom).ok_or(0x00f7_u32)?;
+            if walk.physical_start != first.physical_start.checked_add(offset).ok_or(0x00f8_u32)?
+                || walk.user
+                || !walk.writable
+                || walk.executable
+                || walk.entry & !physical_mask(self.root.capabilities) & !HARDWARE_MUTABLE
+                    != PRESENT | WRITABLE | NO_EXECUTE
+                || self
+                    .roles
+                    .validate_kernel_image_page(
+                        walk.physical_start,
+                        KernelImageSegment::WritableData,
+                    )
+                    .is_err()
+            {
+                return Err(0x00f9);
+            }
+            payload_pages = payload_pages.checked_add(1).ok_or(0x00fa_u32)?;
+            page = page.checked_add(PAGE_SIZE).ok_or(0x00fb_u32)?;
+        }
         let expected_pages = 12_usize
             .checked_add(
                 crate::memory::kernel_stack::E3_THREAD_STACK_COUNT
@@ -285,6 +314,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 pages.checked_add(
                     usize::try_from(
                         crate::memory::kernel_stack::E4_PRIVILEGE_ENTRY_STACK_SIZE / PAGE_SIZE,
+                    )
+                    .ok()?,
+                )
+            })
+            .and_then(|pages| {
+                pages.checked_add(
+                    usize::try_from(
+                        crate::memory::kernel_stack::TERMINAL_REAPER_STACK_SIZE / PAGE_SIZE,
                     )
                     .ok()?,
                 )

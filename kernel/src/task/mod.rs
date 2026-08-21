@@ -34,9 +34,9 @@ pub(crate) use blocked_operation::{
     reason = "E3 execution state is consumed by E4 architecture entry and later task syscall adapters"
 )]
 pub(crate) use execution::{
-    ExecutionDomain, ExecutionResourceError, ExecutionSwitchError, FpSimdPolicy,
-    GeneralPurposeRegisters, RetiredExitPins, RetiredProcessException, SavedThreadContext,
-    StartThreadError, UserTlsPolicy,
+    DeferredCurrentExecutionResources, ExecutionDomain, ExecutionResourceError,
+    ExecutionSwitchError, FpSimdPolicy, GeneralPurposeRegisters, RetiredExitPins,
+    RetiredProcessException, SavedThreadContext, StartThreadError, UserTlsPolicy,
 };
 #[allow(
     unused_imports,

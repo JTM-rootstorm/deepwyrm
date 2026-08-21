@@ -26,6 +26,14 @@ ASSERT(DEFINED(DW_KERNEL_PRIVILEGE_ENTRY_STACK_GUARD_SIZE),
        "DW_KERNEL_PRIVILEGE_ENTRY_STACK_GUARD_SIZE must come from task_layout.toml")
 ASSERT(DEFINED(DW_KERNEL_PRIVILEGE_ENTRY_STACK_ALIGNMENT),
        "DW_KERNEL_PRIVILEGE_ENTRY_STACK_ALIGNMENT must come from task_layout.toml")
+ASSERT(DEFINED(DW_KERNEL_TERMINAL_REAPER_STACK_COUNT),
+       "DW_KERNEL_TERMINAL_REAPER_STACK_COUNT must come from task_layout.toml")
+ASSERT(DEFINED(DW_KERNEL_TERMINAL_REAPER_STACK_SIZE),
+       "DW_KERNEL_TERMINAL_REAPER_STACK_SIZE must come from task_layout.toml")
+ASSERT(DEFINED(DW_KERNEL_TERMINAL_REAPER_STACK_GUARD_SIZE),
+       "DW_KERNEL_TERMINAL_REAPER_STACK_GUARD_SIZE must come from task_layout.toml")
+ASSERT(DEFINED(DW_KERNEL_TERMINAL_REAPER_STACK_ALIGNMENT),
+       "DW_KERNEL_TERMINAL_REAPER_STACK_ALIGNMENT must come from task_layout.toml")
 
 PHDRS
 {
@@ -121,6 +129,14 @@ SECTIONS
         . += DW_KERNEL_PRIVILEGE_ENTRY_STACK_SIZE;
         __dw_privilege_entry_stack_top = .;
 
+        /* Noreturn terminal handoff carrier: one nonpresent guard + RW/NX payload. */
+        . = ALIGN(DW_KERNEL_TERMINAL_REAPER_STACK_ALIGNMENT);
+        __dw_terminal_reaper_stack_guard = .;
+        . += DW_KERNEL_TERMINAL_REAPER_STACK_GUARD_SIZE;
+        __dw_terminal_reaper_stack_bottom = .;
+        . += DW_KERNEL_TERMINAL_REAPER_STACK_SIZE;
+        __dw_terminal_reaper_stack_top = .;
+
         *(.bss .bss.*)
         *(.sbss .sbss.*)
         *(COMMON)
@@ -170,8 +186,8 @@ ASSERT((__dw_thread_kernel_stack_region_start & (DW_KERNEL_THREAD_STACK_ALIGNMEN
        "thread kernel-stack region must satisfy its configured alignment")
 ASSERT(DW_KERNEL_THREAD_STACK_COUNT == 16,
        "DW0-E3 thread kernel-stack count must remain 16")
-ASSERT(DW_KERNEL_THREAD_STACK_SIZE == 65536,
-       "DW0-E3 thread kernel-stack size must remain 64 KiB")
+ASSERT(DW_KERNEL_THREAD_STACK_SIZE == 131072,
+       "DW0-E3 thread kernel-stack size must remain 128 KiB")
 ASSERT(DW_KERNEL_THREAD_STACK_GUARD_SIZE == DW_KERNEL_BASE_PAGE_SIZE,
        "each E3 thread kernel stack must have exactly one base-page guard")
 ASSERT(DW_KERNEL_THREAD_STACK_ALIGNMENT == DW_KERNEL_BASE_PAGE_SIZE,
@@ -195,3 +211,18 @@ ASSERT((__dw_privilege_entry_stack_bottom - __dw_privilege_entry_stack_guard) ==
 ASSERT((__dw_privilege_entry_stack_top - __dw_privilege_entry_stack_bottom) ==
        DW_KERNEL_PRIVILEGE_ENTRY_STACK_SIZE,
        "privilege-entry stack extent drifted")
+
+ASSERT(DW_KERNEL_TERMINAL_REAPER_STACK_COUNT == 1,
+       "terminal reaper stack count must remain one for the BSP-only runtime")
+ASSERT(DW_KERNEL_TERMINAL_REAPER_STACK_SIZE == 131072,
+       "terminal reaper stack must remain independently bounded at 128 KiB")
+ASSERT(DW_KERNEL_TERMINAL_REAPER_STACK_GUARD_SIZE == DW_KERNEL_BASE_PAGE_SIZE,
+       "terminal reaper stack must have one base-page guard")
+ASSERT(DW_KERNEL_TERMINAL_REAPER_STACK_ALIGNMENT == DW_KERNEL_BASE_PAGE_SIZE,
+       "terminal reaper stack alignment must remain one base page")
+ASSERT((__dw_terminal_reaper_stack_bottom - __dw_terminal_reaper_stack_guard) ==
+       DW_KERNEL_TERMINAL_REAPER_STACK_GUARD_SIZE,
+       "terminal reaper guard geometry drifted")
+ASSERT((__dw_terminal_reaper_stack_top - __dw_terminal_reaper_stack_bottom) ==
+       DW_KERNEL_TERMINAL_REAPER_STACK_SIZE,
+       "terminal reaper stack extent drifted")

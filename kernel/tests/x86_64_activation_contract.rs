@@ -185,13 +185,17 @@ fn e3_e4_kernel_stacks_are_private_linker_carriers_with_first_root_guards() {
     assert!(!shared_layout.contains("thread_kernel_stack_"));
     for marker in [
         "thread_kernel_stack_count = 16",
-        "thread_kernel_stack_size = 65536",
+        "thread_kernel_stack_size = 131072",
         "thread_kernel_stack_guard_size = 4096",
         "thread_kernel_stack_alignment = 4096",
         "privilege_entry_stack_count = 1",
         "privilege_entry_stack_size = 16384",
         "privilege_entry_stack_guard_size = 4096",
         "privilege_entry_stack_alignment = 4096",
+        "terminal_reaper_stack_count = 1",
+        "terminal_reaper_stack_size = 131072",
+        "terminal_reaper_stack_guard_size = 4096",
+        "terminal_reaper_stack_alignment = 4096",
     ] {
         assert!(
             task_layout.contains(marker),
@@ -202,13 +206,22 @@ fn e3_e4_kernel_stacks_are_private_linker_carriers_with_first_root_guards() {
     assert!(linker.contains("__dw_thread_kernel_stack_region_end = .;"));
     assert!(linker.contains("__dw_privilege_entry_stack_guard = .;"));
     assert!(linker.contains("__dw_privilege_entry_stack_top = .;"));
+    assert!(linker.contains("__dw_terminal_reaper_stack_guard = .;"));
+    assert!(linker.contains("__dw_terminal_reaper_stack_top = .;"));
     assert!(builder.contains("linked_thread_kernel_stack_layout()"));
     assert!(builder.contains("is_kernel_guard(ist, &thread_stacks, privilege_entry, page)"));
+    assert!(builder.contains("linked_terminal_reaper_stack_layout()"));
+    assert!(builder.contains("validate_terminal_reaper_stack_layout("));
     assert!(graph.contains("fn is_thread_stack_guard("));
+    assert!(graph.contains("fn is_terminal_reaper_guard("));
     assert!(graph.contains("validate_thread_stack_layout("));
     assert!(graph.contains("validate_privilege_entry_stack_layout("));
+    assert!(graph.contains("validate_terminal_reaper_stack_layout("));
     assert!(activation.contains("&thread_stacks,"));
+    assert!(activation.contains("linked_terminal_reaper_stack_layout()"));
     assert!(test_support.contains("for stack in thread_stacks"));
     assert!(test_support.contains("linked_privilege_entry_stack_layout()"));
+    assert!(test_support.contains("linked_terminal_reaper_stack_layout()"));
+    assert!(test_support.contains("TERMINAL_REAPER_STACK_SIZE / PAGE_SIZE"));
     assert!(execution.contains("fn from_linked_x86_64_stacks()"));
 }

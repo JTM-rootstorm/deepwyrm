@@ -853,6 +853,22 @@ fn emit_task_layout_env(layout: TaskLayout) {
         "cargo:rustc-env=DEEPWYRM_E4_PRIVILEGE_ENTRY_STACK_ALIGNMENT={}",
         layout.privilege_entry_stack_alignment
     );
+    println!(
+        "cargo:rustc-env=DEEPWYRM_TERMINAL_REAPER_STACK_COUNT={}",
+        layout.terminal_reaper_stack_count
+    );
+    println!(
+        "cargo:rustc-env=DEEPWYRM_TERMINAL_REAPER_STACK_SIZE={}",
+        layout.terminal_reaper_stack_size
+    );
+    println!(
+        "cargo:rustc-env=DEEPWYRM_TERMINAL_REAPER_STACK_GUARD_SIZE={}",
+        layout.terminal_reaper_stack_guard_size
+    );
+    println!(
+        "cargo:rustc-env=DEEPWYRM_TERMINAL_REAPER_STACK_ALIGNMENT={}",
+        layout.terminal_reaper_stack_alignment
+    );
 }
 
 pub(crate) fn linker_arguments(
@@ -915,6 +931,22 @@ pub(crate) fn linker_arguments(
         format!(
             "--defsym=DW_KERNEL_PRIVILEGE_ENTRY_STACK_ALIGNMENT={}",
             task_layout.privilege_entry_stack_alignment
+        ),
+        format!(
+            "--defsym=DW_KERNEL_TERMINAL_REAPER_STACK_COUNT={}",
+            task_layout.terminal_reaper_stack_count
+        ),
+        format!(
+            "--defsym=DW_KERNEL_TERMINAL_REAPER_STACK_SIZE={}",
+            task_layout.terminal_reaper_stack_size
+        ),
+        format!(
+            "--defsym=DW_KERNEL_TERMINAL_REAPER_STACK_GUARD_SIZE={}",
+            task_layout.terminal_reaper_stack_guard_size
+        ),
+        format!(
+            "--defsym=DW_KERNEL_TERMINAL_REAPER_STACK_ALIGNMENT={}",
+            task_layout.terminal_reaper_stack_alignment
         ),
         format!("-T{}", linker_path.display()),
     ];
@@ -1152,6 +1184,10 @@ pub(crate) struct TaskLayout {
     pub(crate) privilege_entry_stack_size: u64,
     pub(crate) privilege_entry_stack_guard_size: u64,
     pub(crate) privilege_entry_stack_alignment: u64,
+    pub(crate) terminal_reaper_stack_count: u64,
+    pub(crate) terminal_reaper_stack_size: u64,
+    pub(crate) terminal_reaper_stack_guard_size: u64,
+    pub(crate) terminal_reaper_stack_alignment: u64,
 }
 
 impl TaskLayout {
@@ -1168,6 +1204,10 @@ impl TaskLayout {
             "privilege_entry_stack_size",
             "privilege_entry_stack_guard_size",
             "privilege_entry_stack_alignment",
+            "terminal_reaper_stack_count",
+            "terminal_reaper_stack_size",
+            "terminal_reaper_stack_guard_size",
+            "terminal_reaper_stack_alignment",
         ]
         .into_iter()
         .collect::<BTreeSet<_>>();
@@ -1180,7 +1220,7 @@ impl TaskLayout {
             ));
         }
         expect_string(&values, "schema", "deepwyrm-x86_64-task-layout")?;
-        expect_u64(&values, "version", 2)?;
+        expect_u64(&values, "version", 3)?;
         let count = parse_u64(required_value(&values, "thread_kernel_stack_count")?)?;
         let size = parse_u64(required_value(&values, "thread_kernel_stack_size")?)?;
         let guard = parse_u64(required_value(&values, "thread_kernel_stack_guard_size")?)?;
@@ -1191,15 +1231,21 @@ impl TaskLayout {
             parse_u64(required_value(&values, "privilege_entry_stack_guard_size")?)?;
         let privilege_alignment =
             parse_u64(required_value(&values, "privilege_entry_stack_alignment")?)?;
+        let terminal_count = parse_u64(required_value(&values, "terminal_reaper_stack_count")?)?;
+        let terminal_size = parse_u64(required_value(&values, "terminal_reaper_stack_size")?)?;
+        let terminal_guard =
+            parse_u64(required_value(&values, "terminal_reaper_stack_guard_size")?)?;
+        let terminal_alignment =
+            parse_u64(required_value(&values, "terminal_reaper_stack_alignment")?)?;
         if count != 16
-            || size != 65_536
+            || size != 131_072
             || guard != 4_096
             || alignment != 4_096
             || !size.is_multiple_of(alignment)
             || !guard.is_multiple_of(alignment)
         {
             return Err(
-                "DW0-E3 thread stack pool must be 16 guarded 65536-byte stacks on 4096-byte boundaries"
+                "DW0-E3 thread stack pool must be 16 guarded 131072-byte stacks on 4096-byte boundaries"
                     .into(),
             );
         }
@@ -1212,6 +1258,15 @@ impl TaskLayout {
         {
             return Err("DW0-E4 BSP privilege-entry stack must be one guarded 16384-byte stack on a 4096-byte boundary".into());
         }
+        if terminal_count != 1
+            || terminal_size != 131_072
+            || terminal_guard != 4_096
+            || terminal_alignment != 4_096
+            || !terminal_size.is_multiple_of(terminal_alignment)
+            || !terminal_guard.is_multiple_of(terminal_alignment)
+        {
+            return Err("terminal reaper carrier must be one guarded 131072-byte stack on a 4096-byte boundary".into());
+        }
         Ok(Self {
             thread_kernel_stack_count: count,
             thread_kernel_stack_size: size,
@@ -1221,6 +1276,10 @@ impl TaskLayout {
             privilege_entry_stack_size: privilege_size,
             privilege_entry_stack_guard_size: privilege_guard,
             privilege_entry_stack_alignment: privilege_alignment,
+            terminal_reaper_stack_count: terminal_count,
+            terminal_reaper_stack_size: terminal_size,
+            terminal_reaper_stack_guard_size: terminal_guard,
+            terminal_reaper_stack_alignment: terminal_alignment,
         })
     }
 }

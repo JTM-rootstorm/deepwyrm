@@ -773,6 +773,107 @@ fn e3_thread_stack_layout_rejects_overlap_size_and_scratch_conflicts() {
 }
 
 #[test]
+fn terminal_reaper_layout_is_independent_guarded_and_conflict_free() {
+    let writable_start = 0xffff_8000_0200_0000;
+    let ist = test_ist_layout(writable_start);
+    let thread_guard = writable_start + 15 * PAGE_SIZE;
+    let thread = crate::memory::kernel_stack::KernelStackBounds::new(
+        thread_guard,
+        thread_guard + PAGE_SIZE,
+        thread_guard + PAGE_SIZE + crate::memory::kernel_stack::E3_THREAD_STACK_SIZE,
+    )
+    .unwrap();
+    let privilege_guard = thread.top;
+    let privilege = crate::memory::kernel_stack::KernelStackBounds::new(
+        privilege_guard,
+        privilege_guard + PAGE_SIZE,
+        privilege_guard + PAGE_SIZE + crate::memory::kernel_stack::E4_PRIVILEGE_ENTRY_STACK_SIZE,
+    )
+    .unwrap();
+    let terminal_guard = privilege.top;
+    let terminal = crate::memory::kernel_stack::KernelStackBounds::new(
+        terminal_guard,
+        terminal_guard + PAGE_SIZE,
+        terminal_guard + PAGE_SIZE + crate::memory::kernel_stack::TERMINAL_REAPER_STACK_SIZE,
+    )
+    .unwrap();
+    let segments = [
+        KernelSegment {
+            start: writable_start - 2 * PAGE_SIZE,
+            end: writable_start - PAGE_SIZE,
+            kind: SegmentKind::Text,
+        },
+        KernelSegment {
+            start: writable_start - PAGE_SIZE,
+            end: writable_start,
+            kind: SegmentKind::ReadOnly,
+        },
+        KernelSegment {
+            start: writable_start,
+            end: terminal.top,
+            kind: SegmentKind::Writable,
+        },
+    ];
+    assert_eq!(
+        validate_terminal_reaper_stack_layout(
+            &segments,
+            FIXTURE_SCRATCH,
+            FIXTURE_SCRATCH + PAGE_SIZE,
+            ist,
+            privilege,
+            &[thread],
+            terminal,
+        ),
+        Ok(())
+    );
+
+    for conflicting in [thread, privilege] {
+        assert_eq!(
+            validate_terminal_reaper_stack_layout(
+                &segments,
+                FIXTURE_SCRATCH,
+                FIXTURE_SCRATCH + PAGE_SIZE,
+                ist,
+                privilege,
+                &[thread],
+                conflicting,
+            ),
+            Err(InactiveGraphError::InvalidSegmentLayout)
+        );
+    }
+    assert_eq!(
+        validate_terminal_reaper_stack_layout(
+            &segments,
+            terminal.guard_page,
+            FIXTURE_SCRATCH + PAGE_SIZE,
+            ist,
+            privilege,
+            &[thread],
+            terminal,
+        ),
+        Err(InactiveGraphError::InvalidSegmentLayout)
+    );
+    let short = crate::memory::kernel_stack::KernelStackBounds::new(
+        terminal.guard_page,
+        terminal.bottom,
+        terminal.top - PAGE_SIZE,
+    )
+    .unwrap();
+    assert_eq!(
+        validate_terminal_reaper_stack_layout(
+            &segments,
+            FIXTURE_SCRATCH,
+            FIXTURE_SCRATCH + PAGE_SIZE,
+            ist,
+            privilege,
+            &[thread],
+            short,
+        ),
+        Err(InactiveGraphError::InvalidSegmentLayout)
+    );
+}
+
+#[test]
 fn guard_leaf_absence_rejects_a_missing_parent_path() {
     let fixture = graph_fixture();
     let mut access = FakeGraphAccess::default();

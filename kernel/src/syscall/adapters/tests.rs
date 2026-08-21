@@ -13,6 +13,26 @@ use deepwyrm_abi::{DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_MODIFY};
 const BASE: u64 = 0x4000;
 const BYTES: usize = 4096;
 
+fn terminal_outcome(
+    outcome: (
+        DwStatus,
+        SyscallControl,
+        Option<DeferredCurrentExecutionResources>,
+    ),
+    status: DwStatus,
+    control: SyscallControl,
+) -> Option<DeferredCurrentExecutionResources> {
+    let (actual_status, actual_control, deferred) = outcome;
+    assert_eq!(actual_status, status);
+    assert_eq!(actual_control, control);
+    assert_eq!(
+        deferred.is_some(),
+        control == SyscallControl::TerminateCurrent,
+        "terminal control and deferred current ownership diverged"
+    );
+    deferred
+}
+
 struct FakeUserMemory {
     bytes: [u8; BYTES],
     deny_read: bool,
@@ -1973,6 +1993,345 @@ fn finish_task_cleanup<const OBJECTS: usize>(
 }
 
 #[test]
+fn process_exit_defers_current_execution_bundle_until_reaper_completion() {
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let waits = WaitRegistry::<2>::new();
+    let mut terminal_waits = NoTerminalWaitCleanup;
+    let mut cleanup = CleanupQueue::<16>::new();
+    let process_pin = resolve_current_handle(
+        &tasks,
+        &mut registry,
+        process,
+        process_handle,
+        deepwyrm_abi::DW_OBJECT_TYPE_PROCESS,
+        DW_RIGHT_MODIFY,
+    )
+    .unwrap();
+    let (current, current_ref) = tasks.create_thread(&mut registry, &process_pin).unwrap();
+    release_lookup_pin(&mut registry, process_pin, &mut cleanup);
+    execution
+        .start_thread(&mut tasks, current, test_start(0x10))
+        .unwrap();
+    assert_eq!(execution.schedule_next().unwrap().current, Some(current));
+    let (stack, context) = tasks.thread_execution_resources(current).unwrap().unwrap();
+
+    let deferred = terminal_outcome(
+        process_exit(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut terminal_waits,
+            process,
+            current,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    assert!(execution.stack_bounds(stack).is_ok());
+    assert!(execution.load_context(context).is_ok());
+    complete_deferred_current_reclaim(&mut registry, &execution, &waits, deferred, &mut cleanup);
+    assert!(execution.stack_bounds(stack).is_err());
+    assert!(execution.load_context(context).is_err());
+    cleanup.push_optional(registry.release_handle(current_ref).unwrap());
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+#[test]
+fn current_process_termination_defers_execution_bundle_until_reaper_completion() {
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let waits = WaitRegistry::<2>::new();
+    let mut terminal_waits = NoTerminalWaitCleanup;
+    let mut cleanup = CleanupQueue::<16>::new();
+    let process_pin = resolve_current_handle(
+        &tasks,
+        &mut registry,
+        process,
+        process_handle,
+        deepwyrm_abi::DW_OBJECT_TYPE_PROCESS,
+        DW_RIGHT_MODIFY,
+    )
+    .unwrap();
+    let (current, current_ref) = tasks.create_thread(&mut registry, &process_pin).unwrap();
+    release_lookup_pin(&mut registry, process_pin, &mut cleanup);
+    execution
+        .start_thread(&mut tasks, current, test_start(0x11))
+        .unwrap();
+    assert_eq!(execution.schedule_next().unwrap().current, Some(current));
+    let (stack, context) = tasks.thread_execution_resources(current).unwrap().unwrap();
+
+    let deferred = terminal_outcome(
+        process_terminate(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut terminal_waits,
+            process,
+            current,
+            process_handle,
+            deepwyrm_abi::DW_TERMINATION_AUTHORIZED,
+            0x20,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    assert!(execution.stack_bounds(stack).is_ok());
+    assert!(execution.load_context(context).is_ok());
+    complete_deferred_current_reclaim(&mut registry, &execution, &waits, deferred, &mut cleanup);
+    assert!(execution.stack_bounds(stack).is_err());
+    assert!(execution.load_context(context).is_err());
+    cleanup.push_optional(registry.release_handle(current_ref).unwrap());
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+#[test]
+fn non_current_process_termination_reclaims_only_the_target_batch() {
+    let mut registry = ObjectRegistry::<24>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (current_process, current_process_ref) =
+        tasks.create_process(&mut registry, &root_owner).unwrap();
+    let (_target_process, target_process_ref) =
+        tasks.create_process(&mut registry, &root_owner).unwrap();
+    let current_owner = registry
+        .retain_internal_from_handle(&current_process_ref)
+        .unwrap();
+    let target_owner = registry
+        .retain_internal_from_handle(&target_process_ref)
+        .unwrap();
+    let (current_thread, current_thread_ref) =
+        tasks.create_thread(&mut registry, &current_owner).unwrap();
+    let (target_thread, target_thread_ref) =
+        tasks.create_thread(&mut registry, &target_owner).unwrap();
+    assert!(registry.release_internal(current_owner).unwrap().is_none());
+    assert!(registry.release_internal(target_owner).unwrap().is_none());
+    let target_handle = tasks
+        .process_handles_mut(current_process)
+        .unwrap()
+        .install(target_process_ref, DW_RIGHT_MODIFY)
+        .unwrap();
+    let execution = ExecutionDomain::<2>::new(test_stack_bounds::<2>()).unwrap();
+    let waits = WaitRegistry::<2>::new();
+    let mut terminal_waits = NoTerminalWaitCleanup;
+    let mut cleanup = CleanupQueue::<24>::new();
+    execution
+        .start_thread(&mut tasks, current_thread, test_start(0x13))
+        .unwrap();
+    execution
+        .start_thread(&mut tasks, target_thread, test_start(0x14))
+        .unwrap();
+    assert_eq!(
+        execution.schedule_next().unwrap().current,
+        Some(current_thread)
+    );
+    let (current_stack, current_context) = tasks
+        .thread_execution_resources(current_thread)
+        .unwrap()
+        .unwrap();
+    let (target_stack, target_context) = tasks
+        .thread_execution_resources(target_thread)
+        .unwrap()
+        .unwrap();
+
+    assert!(
+        terminal_outcome(
+            process_terminate(
+                &mut registry,
+                &mut tasks,
+                &execution,
+                &waits,
+                &mut terminal_waits,
+                current_process,
+                current_thread,
+                target_handle,
+                deepwyrm_abi::DW_TERMINATION_AUTHORIZED,
+                0x21,
+                &mut cleanup,
+            ),
+            DW_STATUS_SUCCESS,
+            SyscallControl::ReturnToCaller,
+        )
+        .is_none()
+    );
+    assert!(execution.stack_bounds(current_stack).is_ok());
+    assert!(execution.load_context(current_context).is_ok());
+    assert!(execution.stack_bounds(target_stack).is_err());
+    assert!(execution.load_context(target_context).is_err());
+
+    let deferred = terminal_outcome(
+        process_exit(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut terminal_waits,
+            current_process,
+            current_thread,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    complete_deferred_current_reclaim(&mut registry, &execution, &waits, deferred, &mut cleanup);
+    cleanup.push_optional(registry.release_handle(current_thread_ref).unwrap());
+    cleanup.push_optional(registry.release_handle(target_thread_ref).unwrap());
+    cleanup.push_optional(registry.release_handle(current_process_ref).unwrap());
+    cleanup.push_optional(registry.release_internal(root_owner).unwrap());
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+#[test]
+fn caller_containing_group_termination_defers_execution_bundle_until_reaper_completion() {
+    let mut registry = ObjectRegistry::<16>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let root_handle_owner = registry.retain_internal(&root_owner).unwrap();
+    let root_handle_ref = registry.internal_into_handle(root_handle_owner).unwrap();
+    let (process, process_ref) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let process_owner = registry.retain_internal_from_handle(&process_ref).unwrap();
+    let (current, current_ref) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    assert!(registry.release_internal(process_owner).unwrap().is_none());
+    let group_handle = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(root_handle_ref, DW_RIGHT_MODIFY)
+        .unwrap();
+    let _process_handle = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(process_ref, DW_RIGHT_MODIFY)
+        .unwrap();
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let waits = WaitRegistry::<2>::new();
+    let mut terminal_waits = NoTerminalWaitCleanup;
+    let mut cleanup = CleanupQueue::<16>::new();
+    execution
+        .start_thread(&mut tasks, current, test_start(0x12))
+        .unwrap();
+    assert_eq!(execution.schedule_next().unwrap().current, Some(current));
+    let (stack, context) = tasks.thread_execution_resources(current).unwrap().unwrap();
+
+    let deferred = terminal_outcome(
+        task_group_terminate(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut terminal_waits,
+            process,
+            current,
+            group_handle,
+            deepwyrm_abi::DW_TERMINATION_AUTHORIZED,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    assert!(execution.stack_bounds(stack).is_ok());
+    assert!(execution.load_context(context).is_ok());
+    complete_deferred_current_reclaim(&mut registry, &execution, &waits, deferred, &mut cleanup);
+    assert!(execution.stack_bounds(stack).is_err());
+    assert!(execution.load_context(context).is_err());
+    cleanup.push_optional(registry.release_handle(current_ref).unwrap());
+    cleanup.push_optional(registry.release_internal(root_owner).unwrap());
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+#[test]
+fn mixed_group_termination_defers_only_the_caller_process_batch() {
+    let mut registry = ObjectRegistry::<24>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let root_handle_owner = registry.retain_internal(&root_owner).unwrap();
+    let root_handle_ref = registry.internal_into_handle(root_handle_owner).unwrap();
+    let (current_process, current_process_ref) =
+        tasks.create_process(&mut registry, &root_owner).unwrap();
+    let (_remote_process, remote_process_ref) =
+        tasks.create_process(&mut registry, &root_owner).unwrap();
+    let current_owner = registry
+        .retain_internal_from_handle(&current_process_ref)
+        .unwrap();
+    let remote_owner = registry
+        .retain_internal_from_handle(&remote_process_ref)
+        .unwrap();
+    let (current_thread, current_thread_ref) =
+        tasks.create_thread(&mut registry, &current_owner).unwrap();
+    let (remote_thread, remote_thread_ref) =
+        tasks.create_thread(&mut registry, &remote_owner).unwrap();
+    assert!(registry.release_internal(current_owner).unwrap().is_none());
+    assert!(registry.release_internal(remote_owner).unwrap().is_none());
+    let group_handle = tasks
+        .process_handles_mut(current_process)
+        .unwrap()
+        .install(root_handle_ref, DW_RIGHT_MODIFY)
+        .unwrap();
+    let execution = ExecutionDomain::<2>::new(test_stack_bounds::<2>()).unwrap();
+    let waits = WaitRegistry::<2>::new();
+    let mut terminal_waits = NoTerminalWaitCleanup;
+    let mut cleanup = CleanupQueue::<24>::new();
+    execution
+        .start_thread(&mut tasks, current_thread, test_start(0x15))
+        .unwrap();
+    execution
+        .start_thread(&mut tasks, remote_thread, test_start(0x16))
+        .unwrap();
+    assert_eq!(
+        execution.schedule_next().unwrap().current,
+        Some(current_thread)
+    );
+    let (current_stack, current_context) = tasks
+        .thread_execution_resources(current_thread)
+        .unwrap()
+        .unwrap();
+    let (remote_stack, remote_context) = tasks
+        .thread_execution_resources(remote_thread)
+        .unwrap()
+        .unwrap();
+
+    let deferred = terminal_outcome(
+        task_group_terminate(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut terminal_waits,
+            current_process,
+            current_thread,
+            group_handle,
+            deepwyrm_abi::DW_TERMINATION_AUTHORIZED,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    assert!(execution.stack_bounds(current_stack).is_ok());
+    assert!(execution.load_context(current_context).is_ok());
+    assert!(execution.stack_bounds(remote_stack).is_err());
+    assert!(execution.load_context(remote_context).is_err());
+    complete_deferred_current_reclaim(&mut registry, &execution, &waits, deferred, &mut cleanup);
+    assert!(execution.stack_bounds(current_stack).is_err());
+    assert!(execution.load_context(current_context).is_err());
+    cleanup.push_optional(registry.release_handle(current_thread_ref).unwrap());
+    cleanup.push_optional(registry.release_handle(remote_thread_ref).unwrap());
+    cleanup.push_optional(registry.release_handle(current_process_ref).unwrap());
+    cleanup.push_optional(registry.release_handle(remote_process_ref).unwrap());
+    cleanup.push_optional(registry.release_internal(root_owner).unwrap());
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+#[test]
 fn invalid_task_creation_rights_do_not_burn_object_generations() {
     let (mut registry, mut tasks, process, process_handle) = process_fixture();
     let mut user = FakeUserMemory::new();
@@ -2075,7 +2434,11 @@ fn self_thread_termination_with_live_sibling_never_returns_to_reclaimed_context(
         .register(target.into_internal(), DW_SIGNAL_EXITED, 0, sibling, wake)
         .unwrap();
 
-    assert_eq!(
+    let (current_stack, current_context) =
+        tasks.thread_execution_resources(current).unwrap().unwrap();
+    let (sibling_stack, sibling_context) =
+        tasks.thread_execution_resources(sibling).unwrap().unwrap();
+    let deferred = terminal_outcome(
         thread_terminate(
             &mut registry,
             &mut tasks,
@@ -2089,9 +2452,25 @@ fn self_thread_termination_with_live_sibling_never_returns_to_reclaimed_context(
             0x51,
             &mut cleanup,
         ),
-        (DW_STATUS_SUCCESS, SyscallControl::TerminateCurrent)
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
     );
     assert_eq!(execution.scheduler_state(current), None);
+    assert!(execution.stack_bounds(current_stack).is_ok());
+    assert!(execution.load_context(current_context).is_ok());
+    assert_eq!(
+        execution.scheduler_state(sibling),
+        Some(SchedulerThreadState::Blocked)
+    );
+    complete_deferred_current_reclaim(
+        &mut registry,
+        &execution,
+        &waits,
+        deferred.unwrap(),
+        &mut cleanup,
+    );
+    assert!(execution.stack_bounds(current_stack).is_err());
+    assert!(execution.load_context(current_context).is_err());
     assert_eq!(
         execution.scheduler_state(sibling),
         Some(SchedulerThreadState::Runnable)
@@ -2118,7 +2497,7 @@ fn self_thread_termination_with_live_sibling_never_returns_to_reclaimed_context(
         deepwyrm_abi::DW_TASK_STATE_EXITED
     );
 
-    assert_eq!(
+    let deferred = terminal_outcome(
         thread_terminate(
             &mut registry,
             &mut tasks,
@@ -2132,9 +2511,21 @@ fn self_thread_termination_with_live_sibling_never_returns_to_reclaimed_context(
             0x52,
             &mut cleanup,
         ),
-        (DW_STATUS_SUCCESS, SyscallControl::TerminateCurrent)
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
     );
     assert_eq!(execution.scheduler_state(sibling), None);
+    assert!(execution.stack_bounds(sibling_stack).is_ok());
+    assert!(execution.load_context(sibling_context).is_ok());
+    complete_deferred_current_reclaim(
+        &mut registry,
+        &execution,
+        &waits,
+        deferred.unwrap(),
+        &mut cleanup,
+    );
+    assert!(execution.stack_bounds(sibling_stack).is_err());
+    assert!(execution.load_context(sibling_context).is_err());
     assert_eq!(tasks.process_handle_count(process).unwrap(), 0);
     finish_task_cleanup(&mut registry, &mut tasks, cleanup);
 }
@@ -2431,77 +2822,93 @@ fn termination_rejects_reason_type_and_rights_before_target_mutation() {
         .unwrap();
     assert_eq!(execution.schedule_next().unwrap().current, Some(current));
 
-    assert_eq!(
-        thread_terminate(
-            &mut registry,
-            &mut tasks,
-            &execution,
-            &waits,
-            &mut terminal_waits,
-            process,
-            current,
-            target_full,
-            deepwyrm_abi::DwTerminationReason(u32::MAX),
-            1,
-            &mut cleanup,
-        ),
-        (DW_STATUS_INVALID_ARGUMENT, SyscallControl::ReturnToCaller)
+    assert!(
+        terminal_outcome(
+            thread_terminate(
+                &mut registry,
+                &mut tasks,
+                &execution,
+                &waits,
+                &mut terminal_waits,
+                process,
+                current,
+                target_full,
+                deepwyrm_abi::DwTerminationReason(u32::MAX),
+                1,
+                &mut cleanup,
+            ),
+            DW_STATUS_INVALID_ARGUMENT,
+            SyscallControl::ReturnToCaller,
+        )
+        .is_none()
     );
     assert_eq!(
         tasks.thread_info(target).unwrap().state,
         deepwyrm_abi::DW_TASK_STATE_CREATED
     );
-    assert_eq!(
-        thread_terminate(
-            &mut registry,
-            &mut tasks,
-            &execution,
-            &waits,
-            &mut terminal_waits,
-            process,
-            current,
-            process_handle,
-            DW_TERMINATION_AUTHORIZED,
-            2,
-            &mut cleanup,
-        ),
-        (DW_STATUS_WRONG_OBJECT_TYPE, SyscallControl::ReturnToCaller)
+    assert!(
+        terminal_outcome(
+            thread_terminate(
+                &mut registry,
+                &mut tasks,
+                &execution,
+                &waits,
+                &mut terminal_waits,
+                process,
+                current,
+                process_handle,
+                DW_TERMINATION_AUTHORIZED,
+                2,
+                &mut cleanup,
+            ),
+            DW_STATUS_WRONG_OBJECT_TYPE,
+            SyscallControl::ReturnToCaller,
+        )
+        .is_none()
     );
-    assert_eq!(
-        thread_terminate(
-            &mut registry,
-            &mut tasks,
-            &execution,
-            &waits,
-            &mut terminal_waits,
-            process,
-            current,
-            target_inspect,
-            DW_TERMINATION_AUTHORIZED,
-            3,
-            &mut cleanup,
-        ),
-        (DW_STATUS_ACCESS_DENIED, SyscallControl::ReturnToCaller)
+    assert!(
+        terminal_outcome(
+            thread_terminate(
+                &mut registry,
+                &mut tasks,
+                &execution,
+                &waits,
+                &mut terminal_waits,
+                process,
+                current,
+                target_inspect,
+                DW_TERMINATION_AUTHORIZED,
+                3,
+                &mut cleanup,
+            ),
+            DW_STATUS_ACCESS_DENIED,
+            SyscallControl::ReturnToCaller,
+        )
+        .is_none()
     );
     assert_eq!(
         tasks.thread_info(target).unwrap().state,
         deepwyrm_abi::DW_TASK_STATE_CREATED
     );
-    assert_eq!(
-        thread_terminate(
-            &mut registry,
-            &mut tasks,
-            &execution,
-            &waits,
-            &mut terminal_waits,
-            process,
-            current,
-            target_full,
-            DW_TERMINATION_AUTHORIZED,
-            0x44,
-            &mut cleanup,
-        ),
-        (DW_STATUS_SUCCESS, SyscallControl::ReturnToCaller)
+    assert!(
+        terminal_outcome(
+            thread_terminate(
+                &mut registry,
+                &mut tasks,
+                &execution,
+                &waits,
+                &mut terminal_waits,
+                process,
+                current,
+                target_full,
+                DW_TERMINATION_AUTHORIZED,
+                0x44,
+                &mut cleanup,
+            ),
+            DW_STATUS_SUCCESS,
+            SyscallControl::ReturnToCaller,
+        )
+        .is_none()
     );
     let target_info = tasks.thread_info(target).unwrap();
     assert_eq!(target_info.state, deepwyrm_abi::DW_TASK_STATE_EXITED);
@@ -2518,7 +2925,9 @@ fn termination_rejects_reason_type_and_rights_before_target_mutation() {
             DW_STATUS_SUCCESS
         );
     }
-    assert_eq!(
+    let (current_stack, current_context) =
+        tasks.thread_execution_resources(current).unwrap().unwrap();
+    let deferred = terminal_outcome(
         thread_exit(
             &mut registry,
             &mut tasks,
@@ -2529,9 +2938,21 @@ fn termination_rejects_reason_type_and_rights_before_target_mutation() {
             0x55,
             &mut cleanup,
         ),
-        (DW_STATUS_SUCCESS, SyscallControl::TerminateCurrent)
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
     );
     assert_eq!(execution.scheduler_state(current), None);
+    assert!(execution.stack_bounds(current_stack).is_ok());
+    assert!(execution.load_context(current_context).is_ok());
+    complete_deferred_current_reclaim(
+        &mut registry,
+        &execution,
+        &waits,
+        deferred.unwrap(),
+        &mut cleanup,
+    );
+    assert!(execution.stack_bounds(current_stack).is_err());
+    assert!(execution.load_context(current_context).is_err());
     let _ = current_handle;
     finish_task_cleanup(&mut registry, &mut tasks, cleanup);
 }
@@ -5521,21 +5942,25 @@ fn terminating_blocked_waiter_consumes_wait_without_userspace_resume() {
         let mut terminal_waits = WaitTerminalCleanup::new(&mut operations, None, |output| {
             discarded = Some(output);
         });
-        assert_eq!(
-            thread_terminate(
-                &mut registry,
-                &mut tasks,
-                &execution,
-                &waits,
-                &mut terminal_waits,
-                process,
-                killer,
-                target_handle,
-                DW_TERMINATION_AUTHORIZED,
-                0xd3,
-                &mut cleanup,
-            ),
-            (DW_STATUS_SUCCESS, SyscallControl::ReturnToCaller)
+        assert!(
+            terminal_outcome(
+                thread_terminate(
+                    &mut registry,
+                    &mut tasks,
+                    &execution,
+                    &waits,
+                    &mut terminal_waits,
+                    process,
+                    killer,
+                    target_handle,
+                    DW_TERMINATION_AUTHORIZED,
+                    0xd3,
+                    &mut cleanup,
+                ),
+                DW_STATUS_SUCCESS,
+                SyscallControl::ReturnToCaller,
+            )
+            .is_none()
         );
     }
     assert_eq!(discarded, Some(0xfeed));
@@ -5563,7 +5988,8 @@ fn terminating_blocked_waiter_consumes_wait_without_userspace_resume() {
         ),
         DW_STATUS_SUCCESS
     );
-    assert_eq!(
+    let (killer_stack, killer_context) = tasks.thread_execution_resources(killer).unwrap().unwrap();
+    let deferred = terminal_outcome(
         thread_exit(
             &mut registry,
             &mut tasks,
@@ -5574,8 +6000,20 @@ fn terminating_blocked_waiter_consumes_wait_without_userspace_resume() {
             0,
             &mut cleanup,
         ),
-        (DW_STATUS_SUCCESS, SyscallControl::TerminateCurrent)
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
     );
+    assert!(execution.stack_bounds(killer_stack).is_ok());
+    assert!(execution.load_context(killer_context).is_ok());
+    complete_deferred_current_reclaim(
+        &mut registry,
+        &execution,
+        &waits,
+        deferred.unwrap(),
+        &mut cleanup,
+    );
+    assert!(execution.stack_bounds(killer_stack).is_err());
+    assert!(execution.load_context(killer_context).is_err());
     finish_task_cleanup(&mut registry, &mut tasks, cleanup);
 }
 

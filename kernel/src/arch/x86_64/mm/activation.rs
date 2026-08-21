@@ -1111,6 +1111,8 @@ unsafe impl<'a, 'handoff, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
             .map_err(|_| LiveActivationError::InvalidKernelLayout)?;
         let privilege_entry = crate::arch::x86_64::linked_privilege_entry_stack_layout()
             .map_err(|_| LiveActivationError::InvalidKernelLayout)?;
+        crate::arch::x86_64::linked_terminal_reaper_stack_layout()
+            .map_err(|_| LiveActivationError::InvalidKernelLayout)?;
         let carrier_cpu = unsafe { observe_activation_cpu(handoff.capabilities()) }?;
         validate_live_observation(carrier_cpu, handoff)?;
         validate_execution_carriers(carrier_cpu, &segments)?;

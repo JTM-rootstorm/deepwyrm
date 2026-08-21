@@ -253,6 +253,41 @@ fn f2_syscall_frame_moves_to_thread_stack_before_rust_dispatch() {
 }
 
 #[test]
+fn f12_terminal_control_abandons_the_retiring_stack_before_runtime_reclaim() {
+    let assembly = source("src/arch/x86_64/syscall_entry.S");
+    let handoff = assembly
+        .split_once("dw_x86_64_terminal_reaper_handoff:")
+        .expect("terminal reaper handoff symbol")
+        .1
+        .split_once(".size dw_x86_64_terminal_reaper_handoff")
+        .expect("terminal reaper handoff extent")
+        .0;
+    let clear_if = handoff.find("    cli").expect("terminal CLI");
+    let switch = handoff
+        .find("leaq __dw_terminal_reaper_stack_top(%rip), %rsp")
+        .expect("dedicated terminal stack switch");
+    let align = handoff
+        .find("andq $-16, %rsp")
+        .expect("SysV stack alignment");
+    let callback = handoff.find("callq *%rsi").expect("noreturn Rust callback");
+    let trap = handoff.find("    ud2").expect("callback return trap");
+    assert!(clear_if < switch && switch < align && align < callback && callback < trap);
+    assert!(!handoff.contains("retq"));
+    assert!(!handoff.contains("E4_GS_CURRENT_STACK_TOP"));
+
+    let live = source("src/arch/x86_64/syscall/live.rs");
+    let terminal_arm = live
+        .split_once("SyscallControl::TerminateCurrent =>")
+        .expect("terminal syscall control arm")
+        .1
+        .split_once("SyscallControl::SuspendCurrent =>")
+        .expect("terminal syscall control arm extent")
+        .0;
+    assert!(terminal_arm.contains("handoff_to_terminal_reaper::<R>(context)"));
+    assert!(!terminal_arm.contains("terminate_current()"));
+}
+
+#[test]
 fn f2_kernel_context_switch_is_sysv_only_and_separate_from_user_return() {
     let assembly = source("src/arch/x86_64/kernel_context.S");
     for marker in [
