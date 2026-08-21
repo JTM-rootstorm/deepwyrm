@@ -81,9 +81,12 @@ fn msr_policy_matches_e0_and_return_requires_explicit_authorization() {
     assert!(live.contains("unsafe fn publish_syscall_runtime"));
     assert!(!live.contains("pub(crate) unsafe fn bind_syscall_runtime"));
     assert!(live.contains("Pin<&'runtime mut R>"));
-    assert!(live.contains("pub(crate) fn bind_native_syscall_runtime"));
+    assert!(live.contains("pub(crate) unsafe fn enter_native_syscall_runtime"));
+    assert!(live.contains("struct NativeSyscallRuntimeEntry<"));
+    assert!(!live.contains("struct SyscallRuntimeBinding"));
+    assert!(!live.contains("fn bind_native_syscall_runtime"));
     assert!(live.contains("unsafe { dispatch_bound_runtime(frame) }"));
-    assert!(live.contains("syscall_runtime_binding_is_current(&syscall_binding)"));
+    assert!(!live.contains("syscall_runtime_binding_is_current"));
     assert!(!live.contains("frame.set_status(DW_STATUS_NOT_SUPPORTED)"));
     assert!(!live.contains("frame.authorize_return("));
     assert!(native.contains("pub(crate) fn dispatch_frame"));
@@ -209,9 +212,9 @@ fn e7_smoke_runtime_uses_live_e5_syscall_and_return_authority() {
         "frame.authorize_return(current_binding_generation, &mut mappings)",
         "validate_target_continuation_roundtrip()",
         "core::pin::pin!(runtime)",
-        "bind_native_syscall_runtime(runtime.as_mut())",
+        "enter_native_syscall_runtime(",
+        "runtime.as_mut(),",
         "ValidatedUserReturn::initial(context, &mut mappings)",
-        "enter_validated_user(",
         "self.finish_task_release(thread_final)",
         "self.finish_task_release(process_final)",
         "self.finish_task_release(root_final)",
@@ -326,11 +329,25 @@ fn f2_kernel_context_switch_is_sysv_only_and_separate_from_user_return() {
 }
 
 #[test]
-fn f2_runtime_binding_is_pinned_and_suspension_drops_the_runtime_borrow() {
+fn f2_runtime_binding_is_retained_by_divergent_entry_and_suspension_drops_short_reborrows() {
     let live = source("src/arch/x86_64/syscall/live.rs");
     let native = source("src/syscall/native.rs");
-    assert!(live.contains("SyscallRuntimeBinding<'runtime>"));
+    let divergent_entry_api = live
+        .split_once("pub(crate) unsafe fn enter_native_syscall_runtime")
+        .expect("native runtime entry API")
+        .1
+        .split_once("impl<'runtime")
+        .expect("private divergent entry implementation")
+        .0;
+    assert!(divergent_entry_api.contains(") -> ! {"));
+    assert!(live.contains("NativeSyscallRuntimeEntry<'runtime, R>"));
+    assert!(live.contains("runtime: Pin<&'runtime mut R>"));
     assert!(live.contains("Pin<&'runtime mut R>"));
+    assert!(live.contains("let entry = NativeSyscallRuntimeEntry { runtime };"));
+    assert!(live.contains("unsafe { entry.enter(state, stack, exception_binding) }"));
+    assert!(live.contains("Pin::get_unchecked_mut(self.runtime.as_mut())"));
+    assert!(!live.contains("SyscallRuntimeBinding"));
+    assert!(!live.contains("bind_native_syscall_runtime"));
     assert!(live.contains("let control = {"));
     assert!(live.contains("runtime.prepare_suspend(frame)"));
     assert!(live.contains("execute_kernel_switch(plan)"));

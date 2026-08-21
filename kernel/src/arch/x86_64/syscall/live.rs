@@ -2,7 +2,6 @@
 
 use core::cell::UnsafeCell;
 use core::convert::Infallible;
-use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -86,12 +85,8 @@ unsafe impl Sync for RuntimeStorage {}
 static RUNTIME_STATE: AtomicU8 = AtomicU8::new(RUNTIME_UNBOUND);
 static RUNTIME: RuntimeStorage = RuntimeStorage::uninit();
 
-#[must_use = "CPL3 entry requires the exact one-shot pinned syscall runtime binding"]
-pub(crate) struct SyscallRuntimeBinding<'runtime> {
-    context: usize,
-    handler: usize,
-    fresh_thread_handler: usize,
-    _runtime: PhantomData<&'runtime mut ()>,
+struct NativeSyscallRuntimeEntry<'runtime, R: crate::syscall::native::NativeSyscallFrameRuntime> {
+    runtime: Pin<&'runtime mut R>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -465,7 +460,7 @@ pub(crate) fn current_binding_generation() -> u64 {
 /// # Safety
 ///
 /// The caller must keep `context` stationary and exclusively borrowed for the
-/// lifetime represented by the returned higher-level binding.
+/// full nonreturning lifetime of the private native-runtime entry frame.
 #[allow(
     unsafe_code,
     reason = "one-shot publication stores the pinned runtime address plus its monomorphized dispatcher"
@@ -474,7 +469,7 @@ unsafe fn publish_syscall_runtime(
     context: *mut (),
     handler: SyscallRuntimeHandler,
     fresh_thread_handler: FreshThreadRuntimeHandler,
-) -> Result<(usize, usize, usize), SyscallRuntimeBindError> {
+) -> Result<(), SyscallRuntimeBindError> {
     if context.is_null() {
         return Err(SyscallRuntimeBindError::NullContext);
     }
@@ -497,11 +492,7 @@ unsafe fn publish_syscall_runtime(
         });
     }
     RUNTIME_STATE.store(RUNTIME_BOUND, Ordering::Release);
-    Ok((
-        context as usize,
-        handler as usize,
-        fresh_thread_handler as usize,
-    ))
+    Ok(())
 }
 
 #[allow(
@@ -515,17 +506,9 @@ fn runtime_binding() -> Option<RuntimeBindingState> {
     Some(unsafe { (*RUNTIME.0.get()).assume_init() })
 }
 
-pub(crate) fn syscall_runtime_binding_is_current(binding: &SyscallRuntimeBinding<'_>) -> bool {
-    runtime_binding().is_some_and(|current| {
-        current.context as usize == binding.context
-            && current.handler as usize == binding.handler
-            && current.fresh_thread_handler as usize == binding.fresh_thread_handler
-    })
-}
-
 #[allow(
     unsafe_code,
-    reason = "the branded one-shot binding guarantees the erased runtime pointer remains pinned and exclusive for this short reborrow"
+    reason = "the private divergent entry retains the pinned exclusive runtime owner while this erased pointer is reborrowed briefly"
 )]
 fn invalid_bound_return<R: crate::syscall::native::NativeSyscallFrameRuntime>(
     context: *mut (),
@@ -689,43 +672,9 @@ pub(crate) fn first_run_thread_entry_rip() -> u64 {
     dw_x86_64_first_run_thread_entry as *const () as usize as u64
 }
 
-/// Binds one stationary typed runtime to the raw x86 syscall entry.
-///
-/// The returned lifetime brands the global raw pointer with the caller's
-/// exclusive pinned borrow. Safe Rust cannot access or move the runtime again
-/// while the binding remains live. `enter_validated_user` consumes that binding
-/// and never returns, so the target runtime stays pinned for all later syscalls.
 #[allow(
     unsafe_code,
-    reason = "Pin supplies the stable runtime address and the returned lifetime-branded binding retains the exclusive borrow for divergent CPL3 execution"
-)]
-pub(crate) fn bind_native_syscall_runtime<
-    'runtime,
-    R: crate::syscall::native::NativeSyscallFrameRuntime,
->(
-    runtime: Pin<&'runtime mut R>,
-) -> Result<SyscallRuntimeBinding<'runtime>, SyscallRuntimeBindError> {
-    // SAFETY: Pin guarantees the pointee cannot move for `'runtime`; the
-    // returned binding carries the exclusive borrow for the same lifetime.
-    let context = unsafe { Pin::get_unchecked_mut(runtime) as *mut R };
-    let (context_identity, handler_identity, fresh_thread_handler_identity) = unsafe {
-        publish_syscall_runtime(
-            context.cast::<()>(),
-            native_runtime_trampoline::<R>,
-            native_runtime_fresh_thread::<R>,
-        )
-    }?;
-    Ok(SyscallRuntimeBinding {
-        context: context_identity,
-        handler: handler_identity,
-        fresh_thread_handler: fresh_thread_handler_identity,
-        _runtime: PhantomData,
-    })
-}
-
-#[allow(
-    unsafe_code,
-    reason = "the one-shot pinned binding guarantees the stored context/function pair remains valid for syscall dispatch"
+    reason = "the private divergent entry retains the pinned exclusive runtime owner for every dispatch through the stored context/function pair"
 )]
 unsafe fn dispatch_bound_runtime(frame: &mut RawSyscallFrame) {
     let Some(binding) = runtime_binding() else {
@@ -771,30 +720,60 @@ unsafe fn iret_validated_user(state: &ValidatedUserReturn) -> ! {
     unsafe { dw_x86_64_iret_to_user(state.raw()) }
 }
 
-/// Enters CPL3 through the separately validated IRETQ helper.
+/// Publishes one stationary typed runtime and enters CPL3 through the validated
+/// IRETQ helper without returning the exclusive runtime borrow to safe Rust.
 ///
 /// # Safety
 ///
 /// `stack` is the exact live E3 kernel-stack carrier of the selected Thread.
 #[allow(
     unsafe_code,
-    reason = "final E4 user transition binds the current stack and transfers to audited IRETQ assembly"
+    reason = "the divergent entry frame retains the pinned exclusive runtime borrow after publishing its erased pointer and transfers through audited IRETQ assembly"
 )]
-pub(crate) unsafe fn enter_validated_user(
+pub(crate) unsafe fn enter_native_syscall_runtime<
+    'runtime,
+    R: crate::syscall::native::NativeSyscallFrameRuntime,
+>(
+    runtime: Pin<&'runtime mut R>,
     state: &ValidatedUserReturn,
     stack: KernelStackBounds,
     exception_binding: &crate::arch::x86_64::exceptions::UserExceptionBinding,
-    syscall_binding: SyscallRuntimeBinding<'_>,
 ) -> ! {
-    validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
-    if !crate::arch::x86_64::exceptions::user_exception_binding_is_current(exception_binding) {
-        halt_forever();
+    let entry = NativeSyscallRuntimeEntry { runtime };
+    unsafe { entry.enter(state, stack, exception_binding) }
+}
+
+impl<'runtime, R: crate::syscall::native::NativeSyscallFrameRuntime>
+    NativeSyscallRuntimeEntry<'runtime, R>
+{
+    #[allow(
+        unsafe_code,
+        reason = "the private divergent entry owns the pinned runtime borrow for every path after one-shot raw-pointer publication"
+    )]
+    unsafe fn enter(
+        mut self,
+        state: &ValidatedUserReturn,
+        stack: KernelStackBounds,
+        exception_binding: &crate::arch::x86_64::exceptions::UserExceptionBinding,
+    ) -> ! {
+        validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
+        if !crate::arch::x86_64::exceptions::user_exception_binding_is_current(exception_binding) {
+            halt_forever();
+        }
+        unsafe { bind_current_thread_stack(stack) }.unwrap_or_else(|_| halt_forever());
+        // Reborrow the Pin so `self.runtime` remains owned by this nonreturning
+        // frame after its address is erased into the immutable BSP binding.
+        let context = unsafe { Pin::get_unchecked_mut(self.runtime.as_mut()) as *mut R };
+        unsafe {
+            publish_syscall_runtime(
+                context.cast::<()>(),
+                native_runtime_trampoline::<R>,
+                native_runtime_fresh_thread::<R>,
+            )
+        }
+        .unwrap_or_else(|_| halt_forever());
+        unsafe { iret_validated_user(state) }
     }
-    if !syscall_runtime_binding_is_current(&syscall_binding) {
-        halt_forever();
-    }
-    unsafe { bind_current_thread_stack(stack) }.unwrap_or_else(|_| halt_forever());
-    unsafe { iret_validated_user(state) }
 }
 
 #[allow(

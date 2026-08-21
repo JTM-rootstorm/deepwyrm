@@ -34,9 +34,8 @@ pub(crate) use super::exceptions::{
     reason = "E4 target entry is wired into primordial runtime and E5 syscall adapters in later E work"
 )]
 pub(crate) use live::{
-    SyscallRuntimeBindError, SyscallRuntimeBinding, bind_current_thread_stack,
-    bind_native_syscall_runtime, current_binding_generation, enter_bound_validated_user,
-    enter_validated_user, first_run_thread_entry_rip, install_syscall_boundary,
+    bind_current_thread_stack, current_binding_generation, enter_bound_validated_user,
+    enter_native_syscall_runtime, first_run_thread_entry_rip, install_syscall_boundary,
     validate_live_syscall_boundary,
 };
 

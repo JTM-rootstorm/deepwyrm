@@ -688,15 +688,12 @@ fn enter_smoke<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
             })
     };
     let mut runtime = core::pin::pin!(runtime);
-    let syscall_binding =
-        crate::arch::x86_64::syscall::bind_native_syscall_runtime(runtime.as_mut())
-            .unwrap_or_else(|_| fail(0xb2));
     unsafe {
-        crate::arch::x86_64::syscall::enter_validated_user(
+        crate::arch::x86_64::syscall::enter_native_syscall_runtime(
+            runtime.as_mut(),
             &state,
             stack,
             &exception_binding,
-            syscall_binding,
         )
     }
 }

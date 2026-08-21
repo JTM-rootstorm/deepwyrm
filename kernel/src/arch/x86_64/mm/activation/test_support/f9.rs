@@ -1023,15 +1023,12 @@ fn enter_f9<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
             .unwrap_or_else(|_| fail(0xe4))
     };
     let mut runtime = core::pin::pin!(runtime);
-    let syscall_binding =
-        crate::arch::x86_64::syscall::bind_native_syscall_runtime(runtime.as_mut())
-            .unwrap_or_else(|_| fail(0xe5));
     unsafe {
-        crate::arch::x86_64::syscall::enter_validated_user(
+        crate::arch::x86_64::syscall::enter_native_syscall_runtime(
+            runtime.as_mut(),
             &state,
             stack,
             &exception_binding,
-            syscall_binding,
         )
     }
 }
