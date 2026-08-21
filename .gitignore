@@ -26,3 +26,7 @@ Thumbs.db
 
 # Do not ignore abi/generated/. Generated ABI files may be intentionally
 # versioned and must be checked for schema drift once generation exists.
+
+# Hidden task-owned build/evidence state used by phase tooling
+/.artifacts/
+/.tmp/

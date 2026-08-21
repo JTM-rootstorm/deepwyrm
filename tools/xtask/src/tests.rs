@@ -327,8 +327,7 @@ fn dw0e_task_selectors_distinguish_implemented_and_reserved_identities() {
     let selector = "task-syscall-smoke";
     let test_id = 10;
     let request_path = temp_file(
-        &request("guest-test", selector)
-            .replace("test_id = 1", &format!("test_id = {test_id}")),
+        &request("guest-test", selector).replace("test_id = 1", &format!("test_id = {test_id}")),
     );
     let parsed = load_harness_request(&request_path).unwrap();
     validate_guest_selector_metadata(&config, &parsed).unwrap();
@@ -341,10 +340,7 @@ fn dw0e_task_selectors_distinguish_implemented_and_reserved_identities() {
     );
     fs::remove_file(request_path).unwrap();
 
-    for (selector, test_id) in [
-        ("task-syscall-sanitize", 11),
-        ("task-user-exception", 12),
-    ] {
+    for (selector, test_id) in [("task-syscall-sanitize", 11), ("task-user-exception", 12)] {
         let request_path = temp_file(
             &request("guest-test", selector)
                 .replace("test_id = 1", &format!("test_id = {test_id}")),
