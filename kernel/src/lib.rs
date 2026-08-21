@@ -152,6 +152,8 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
         test if test.is_memory_foundation() || test.is_task_userspace() => {}
         #[cfg(deepwyrm_f9_guest)]
         test if test.is_f9_userspace() => {}
+        #[cfg(deepwyrm_f12_guest)]
+        test if test.is_f12_userspace() => {}
         _ => unreachable!("all build-selected guest tests have explicit dispatch"),
     }
 
@@ -257,6 +259,10 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             #[cfg(deepwyrm_f9_guest)]
             test if test.is_f9_userspace() => {
                 active_paging.run_atomic_wait_userspace_test(test_support::BUILD_GUEST_TEST)
+            }
+            #[cfg(deepwyrm_f12_guest)]
+            test if test.is_f12_userspace() => {
+                active_paging.run_ipc_blocking_userspace_test(test_support::BUILD_GUEST_TEST)
             }
             _ => unreachable!("post-activation selector lacks an explicit runtime"),
         }

@@ -35,7 +35,7 @@ pub(crate) use adapters::{
 #[cfg(all(
     target_os = "none",
     target_arch = "x86_64",
-    any(deepwyrm_e7_guest, deepwyrm_f12_guest)
+    deepwyrm_e7_guest
 ))]
 pub(crate) use adapters::clock_get;
 #[cfg(any(deepwyrm_e7_guest, deepwyrm_f9_guest, deepwyrm_f12_guest))]

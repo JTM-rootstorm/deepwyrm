@@ -8,6 +8,10 @@ mod e7;
 #[path = "test_support/f9.rs"]
 mod f9;
 
+#[cfg(deepwyrm_f12_guest)]
+#[path = "test_support/f12.rs"]
+mod f12;
+
 #[cfg(all(feature = "test-support", target_os = "none", target_arch = "x86_64"))]
 struct ActiveRootTestAuthority<'a, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
     root: &'a PageTableRoot,
@@ -1380,6 +1384,18 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         test: crate::test_support::BuildGuestTest,
     ) -> ! {
         f9::run_atomic_wait_userspace_test(self, test)
+    }
+}
+
+#[cfg(deepwyrm_f12_guest)]
+impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>
+{
+    pub(crate) fn run_ipc_blocking_userspace_test(
+        self,
+        test: crate::test_support::BuildGuestTest,
+    ) -> ! {
+        f12::run_ipc_blocking_userspace_test(self, test)
     }
 }
 
