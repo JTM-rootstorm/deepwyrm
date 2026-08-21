@@ -585,7 +585,11 @@ unsafe fn native_runtime_trampoline<R: crate::syscall::native::NativeSyscallFram
         crate::syscall::native::SyscallControl::SuspendCurrent => {
             let plan = {
                 let runtime = unsafe { &mut *context.cast::<R>() };
-                runtime.prepare_suspend(frame)
+                // SAFETY: the syscall assembly transferred this exact current
+                // Thread frame to its bound kernel stack before entering the
+                // trampoline; the runtime implementation is required to pass
+                // only the fixed architecture-owned first-run entry.
+                unsafe { runtime.prepare_suspend(frame) }
             };
             match plan {
                 crate::syscall::native::NativeSuspendPlan::Switch(plan) => {
@@ -594,7 +598,10 @@ unsafe fn native_runtime_trampoline<R: crate::syscall::native::NativeSyscallFram
                 crate::syscall::native::NativeSuspendPlan::IdleCurrent => loop {
                     let poll = {
                         let runtime = unsafe { &mut *context.cast::<R>() };
-                        runtime.poll_idle_suspend(frame)
+                        // SAFETY: this loop has not left the suspended current
+                        // continuation; IRQ polling may change logical state but
+                        // not the physically active kernel-stack carrier.
+                        unsafe { runtime.poll_idle_suspend(frame) }
                     };
                     match poll {
                         crate::syscall::native::NativeIdleSuspendPoll::Continue => {
@@ -626,9 +633,9 @@ unsafe fn native_runtime_trampoline<R: crate::syscall::native::NativeSyscallFram
 
 #[allow(
     unsafe_code,
-    reason = "the validated switch plan names stationary execution-owner save storage and an authenticated destination kernel stack"
+    reason = "the lifetime-branded switch plan keeps execution-owner save storage stationary through immediate authenticated switch consumption"
 )]
-fn switch_kernel_context(plan: crate::arch::x86_64::context::KernelSwitchPlan) {
+fn switch_kernel_context(plan: crate::arch::x86_64::context::KernelSwitchPlan<'_>) {
     unsafe { bind_current_thread_stack(plan.next_stack()) }.unwrap_or_else(|_| halt_forever());
     if !live_fp_simd_unavailable_is_enforced() {
         halt_forever();

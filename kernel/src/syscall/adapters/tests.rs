@@ -4655,7 +4655,9 @@ fn wait_suspend_plan_switches_to_fresh_runnable_sibling() {
         decision,
     };
     let trusted_entry = 0xffff_8000_0012_3000;
-    let plan = match prepare_wait_suspend_plan(&tasks, &execution, state, trusted_entry).unwrap() {
+    let plan = match unsafe { prepare_wait_suspend_plan(&tasks, &execution, state, trusted_entry) }
+        .unwrap()
+    {
         crate::syscall::native::NativeSuspendPlan::Switch(plan) => plan,
         crate::syscall::native::NativeSuspendPlan::IdleCurrent => {
             panic!("fresh runnable sibling must be selected instead of idle")
@@ -4777,6 +4779,10 @@ impl<const N: usize> crate::wait::engine::WaitDeadlineAuthority for AdapterDeadl
 }
 
 #[test]
+#[allow(
+    unsafe_code,
+    reason = "the fixture retains the blocked Thread's physical idle continuation and fixed synthetic entry"
+)]
 fn signal_timeout_race_has_exactly_one_winner_in_both_orders() {
     use deepwyrm_abi::{DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED};
 
@@ -4861,7 +4867,8 @@ fn signal_timeout_race_has_exactly_one_winner_in_both_orders() {
             Some(SchedulerThreadState::Runnable)
         );
         assert!(matches!(
-            poll_wait_idle_suspend(&tasks, &execution, state, 0xffff_8000_0012_3000).unwrap(),
+            unsafe { poll_wait_idle_suspend(&tasks, &execution, state, 0xffff_8000_0012_3000) }
+                .unwrap(),
             crate::syscall::native::NativeIdleSuspendPoll::ResumeCurrent
         ));
         let status = resume_wait_thread_syscall(
@@ -4904,6 +4911,10 @@ fn signal_timeout_race_has_exactly_one_winner_in_both_orders() {
 }
 
 #[test]
+#[allow(
+    unsafe_code,
+    reason = "the fixture retains the blocked Thread's physical idle continuation and fixed synthetic entry"
+)]
 fn deferred_signal_after_timeout_resume_releases_stale_registration_pins() {
     use deepwyrm_abi::{DW_RIGHT_SIGNAL, DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED};
 
@@ -4960,7 +4971,8 @@ fn deferred_signal_after_timeout_resume_releases_stale_registration_pins() {
     assert_eq!(expired[0], Some(state.wake_key()));
     assert!(crate::wait::engine::claim_timeout_and_wake(&execution, state.wake_key()).unwrap());
     assert!(matches!(
-        poll_wait_idle_suspend(&tasks, &execution, state, 0xffff_8000_0012_3000).unwrap(),
+        unsafe { poll_wait_idle_suspend(&tasks, &execution, state, 0xffff_8000_0012_3000) }
+            .unwrap(),
         crate::syscall::native::NativeIdleSuspendPoll::ResumeCurrent
     ));
 
@@ -4999,6 +5011,10 @@ fn deferred_signal_after_timeout_resume_releases_stale_registration_pins() {
 }
 
 #[test]
+#[allow(
+    unsafe_code,
+    reason = "the fixture retains the blocked Thread's physical idle continuation and fixed synthetic entry"
+)]
 fn public_finite_wait_idles_then_timeout_resumes_in_place_and_discards_output() {
     use deepwyrm_abi::{DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED};
 
@@ -5046,7 +5062,7 @@ fn public_finite_wait_idles_then_timeout_resumes_in_place_and_discards_output() 
         Some(SchedulerThreadState::Blocked)
     );
     assert!(matches!(
-        prepare_wait_suspend_plan(&tasks, &execution, suspended, 0xffff_8000_0012_3000),
+        unsafe { prepare_wait_suspend_plan(&tasks, &execution, suspended, 0xffff_8000_0012_3000) },
         Ok(crate::syscall::native::NativeSuspendPlan::IdleCurrent)
     ));
 
@@ -5055,7 +5071,8 @@ fn public_finite_wait_idles_then_timeout_resumes_in_place_and_discards_output() 
     assert_eq!(expired[0], Some(suspended.wake_key()));
     assert!(crate::wait::engine::claim_timeout_and_wake(&execution, suspended.wake_key()).unwrap());
     assert!(matches!(
-        poll_wait_idle_suspend(&tasks, &execution, suspended, 0xffff_8000_0012_3000).unwrap(),
+        unsafe { poll_wait_idle_suspend(&tasks, &execution, suspended, 0xffff_8000_0012_3000) }
+            .unwrap(),
         crate::syscall::native::NativeIdleSuspendPoll::ResumeCurrent
     ));
     assert_eq!(
@@ -5173,6 +5190,10 @@ impl crate::syscall::native::NativeSyscallHandler for NativeWaitHarness<'_> {
 }
 
 #[test]
+#[allow(
+    unsafe_code,
+    reason = "the fixture retains the blocked Thread's physical idle continuation and fixed synthetic entry"
+)]
 fn native_wait_ids_route_through_real_wait_transactions_and_resume_control() {
     use deepwyrm_abi::{
         DW_DEADLINE_INFINITE, DW_DEADLINE_NOW, DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED, DW_WAIT_MODE_ANY,
@@ -5227,9 +5248,7 @@ fn native_wait_ids_route_through_real_wait_transactions_and_resume_control() {
         core::mem::replace(&mut harness.control, NativeWaitControl::new())
     };
     assert!(matches!(
-        control
-            .prepare_suspend(&tasks, &execution, 0xffff_8000_0012_3000)
-            .unwrap(),
+        unsafe { control.prepare_suspend(&tasks, &execution, 0xffff_8000_0012_3000) }.unwrap(),
         crate::syscall::native::NativeSuspendPlan::IdleCurrent
     ));
 
@@ -5244,9 +5263,7 @@ fn native_wait_ids_route_through_real_wait_transactions_and_resume_control() {
     let mut cleanup = CleanupQueue::<16>::new();
     complete_wait_wakes(&mut registry, &execution, wakes, &mut cleanup);
     assert!(matches!(
-        control
-            .poll_idle(&tasks, &execution, 0xffff_8000_0012_3000)
-            .unwrap(),
+        unsafe { control.poll_idle(&tasks, &execution, 0xffff_8000_0012_3000) }.unwrap(),
         crate::syscall::native::NativeIdleSuspendPoll::ResumeCurrent
     ));
     assert!(control.is_clear());
@@ -5765,6 +5782,10 @@ fn public_wait_one_observes_channel_writable_and_peer_closed() {
 }
 
 #[test]
+#[allow(
+    unsafe_code,
+    reason = "the fixture retains the blocked Thread's physical idle continuation and fixed synthetic entry"
+)]
 fn repeated_duplicate_wait_many_signal_trace_selects_index_zero_once() {
     use deepwyrm_abi::{DW_DEADLINE_INFINITE, DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED, DW_WAIT_MODE_ANY};
 
@@ -5826,7 +5847,8 @@ fn repeated_duplicate_wait_many_signal_trace_selects_index_zero_once() {
         assert_eq!(wakes.pin_len(), 2);
         complete_wait_wakes(&mut registry, &execution, wakes, &mut cleanup);
         assert!(matches!(
-            poll_wait_idle_suspend(&tasks, &execution, suspended, 0xffff_8000_0012_3000).unwrap(),
+            unsafe { poll_wait_idle_suspend(&tasks, &execution, suspended, 0xffff_8000_0012_3000) }
+                .unwrap(),
             crate::syscall::native::NativeIdleSuspendPoll::ResumeCurrent
         ));
         assert_eq!(

@@ -499,6 +499,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
     }
 }
 
+#[allow(
+    unsafe_code,
+    reason = "the target runtime implements the physical-current suspension contract for the raw syscall trampoline"
+)]
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrameRuntime
     for E7SmokeRuntime<'_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
@@ -574,17 +578,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         fail(0xa5)
     }
 
-    fn prepare_suspend(
-        &mut self,
+    unsafe fn prepare_suspend<'owner>(
+        &'owner mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
-    ) -> crate::syscall::native::NativeSuspendPlan {
+    ) -> crate::syscall::native::NativeSuspendPlan<'owner> {
         fail(0xa2)
     }
 
-    fn poll_idle_suspend(
-        &mut self,
+    unsafe fn poll_idle_suspend<'owner>(
+        &'owner mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
-    ) -> crate::syscall::native::NativeIdleSuspendPoll {
+    ) -> crate::syscall::native::NativeIdleSuspendPoll<'owner> {
         fail(0xa4)
     }
 

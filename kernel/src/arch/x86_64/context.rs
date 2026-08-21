@@ -13,6 +13,8 @@
 //! Rust kernel frame is resumed only through the normal SysV callee-saved
 //! register contract plus its exact saved kernel `RSP`.
 
+use core::marker::PhantomData;
+
 use crate::memory::kernel_stack::KernelStackBounds;
 
 pub(crate) const KERNEL_CONTEXT_R15_OFFSET: u64 = 0;
@@ -143,15 +145,17 @@ pub(crate) enum KernelContextPlanError {
 }
 
 #[derive(Debug)]
-pub(crate) struct KernelSwitchPlan {
+pub(crate) struct KernelSwitchPlan<'owner> {
     current_rsp_out: *mut u64,
     next_rsp: u64,
     next_stack: KernelStackBounds,
+    _owner: PhantomData<&'owner ()>,
 }
 
-impl KernelSwitchPlan {
+impl<'owner> KernelSwitchPlan<'owner> {
     /// # Safety
     ///
+    /// `_owner` must borrow the allocation that owns `current_rsp_out`.
     /// `current_rsp_out` must remain writable until the switch has stored the
     /// suspended continuation RSP. Its storage must not be reclaimed while the
     /// corresponding Thread remains blocked.
@@ -159,7 +163,8 @@ impl KernelSwitchPlan {
         unsafe_code,
         reason = "the raw save-slot lifetime is an execution-owner invariant supplied by the scheduler/runtime"
     )]
-    pub(crate) unsafe fn new(
+    pub(crate) unsafe fn new<Owner: ?Sized>(
+        _owner: &'owner Owner,
         current_rsp_out: *mut u64,
         next_rsp: u64,
         next_stack: KernelStackBounds,
@@ -177,6 +182,7 @@ impl KernelSwitchPlan {
             current_rsp_out,
             next_rsp,
             next_stack,
+            _owner: PhantomData,
         })
     }
 
@@ -184,14 +190,15 @@ impl KernelSwitchPlan {
     ///
     /// # Safety
     ///
-    /// `current_rsp_out` follows the same stationary save-slot contract as
-    /// [`Self::new`]. The `initial` token proves the destination stack frame was
-    /// constructed by [`prepare_initial_kernel_continuation`].
+    /// `_owner` and `current_rsp_out` follow the same owner/save-slot contract
+    /// as [`Self::new`]. The `initial` token proves the destination stack frame
+    /// was constructed by [`prepare_initial_kernel_continuation`].
     #[allow(
         unsafe_code,
         reason = "the initial-continuation token proves the distinct SysV first-run stack geometry"
     )]
-    pub(crate) unsafe fn new_initial(
+    pub(crate) unsafe fn new_initial<Owner: ?Sized>(
+        _owner: &'owner Owner,
         current_rsp_out: *mut u64,
         initial: InitialKernelContinuation,
     ) -> Result<Self, KernelContextPlanError> {
@@ -209,6 +216,7 @@ impl KernelSwitchPlan {
             current_rsp_out,
             next_rsp: initial.rsp,
             next_stack: initial.stack,
+            _owner: PhantomData,
         })
     }
 
@@ -220,6 +228,10 @@ impl KernelSwitchPlan {
     }
     pub(crate) const fn current_rsp_out(&self) -> *mut u64 {
         self.current_rsp_out
+    }
+
+    const fn into_switch(self) -> (*mut u64, u64) {
+        (self.current_rsp_out, self.next_rsp)
     }
 }
 
@@ -243,10 +255,11 @@ pub(crate) unsafe fn switch_kernel_context(current_rsp_out: *mut u64, next_rsp: 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[allow(
     unsafe_code,
-    reason = "the plan was validated against exact owned stack bounds and the assembly switch is the audited F2 boundary"
+    reason = "consuming the lifetime-branded plan preserves its stationary owner through the immediate audited F2 assembly boundary"
 )]
-pub(crate) unsafe fn execute_kernel_switch(plan: KernelSwitchPlan) {
-    unsafe { switch_kernel_context(plan.current_rsp_out(), plan.next_rsp()) };
+pub(crate) unsafe fn execute_kernel_switch(plan: KernelSwitchPlan<'_>) {
+    let (current_rsp_out, next_rsp) = plan.into_switch();
+    unsafe { switch_kernel_context(current_rsp_out, next_rsp) };
 }
 
 #[cfg(all(test, target_arch = "x86_64", not(target_os = "none")))]

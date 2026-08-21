@@ -1952,7 +1952,17 @@ impl NativeWaitControl {
         }
     }
 
-    pub(crate) fn prepare_suspend<
+    #[allow(
+        unsafe_code,
+        reason = "the caller must prove the pending scheduler carrier and fixed first-run entry before plan production"
+    )]
+    /// # Safety
+    ///
+    /// The pending decision's previous Thread must own the kernel stack that is
+    /// physically executing this call. `trusted_first_run_entry` must be the
+    /// architecture-owned fixed first-run entry.
+    pub(crate) unsafe fn prepare_suspend<
+        'owner,
         const GROUPS: usize,
         const PROCESSES: usize,
         const THREADS: usize,
@@ -1961,21 +1971,32 @@ impl NativeWaitControl {
     >(
         &mut self,
         tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
-        execution: &ExecutionDomain<EXECUTION>,
+        execution: &'owner ExecutionDomain<EXECUTION>,
         trusted_first_run_entry: u64,
-    ) -> Result<NativeSuspendPlan, WaitSuspendError> {
+    ) -> Result<NativeSuspendPlan<'owner>, WaitSuspendError> {
         let NativeWaitControlState::Pending(state) = self.state else {
             return Err(WaitSuspendError::InvalidDecision);
         };
-        let plan = prepare_wait_suspend_plan(tasks, execution, state, trusted_first_run_entry)?;
-        self.state = match plan {
+        let plan =
+            unsafe { prepare_wait_suspend_plan(tasks, execution, state, trusted_first_run_entry) }?;
+        self.state = match &plan {
             NativeSuspendPlan::IdleCurrent => NativeWaitControlState::Idle(state),
             NativeSuspendPlan::Switch(_) => NativeWaitControlState::Clear,
         };
         Ok(plan)
     }
 
-    pub(crate) fn poll_idle<
+    #[allow(
+        unsafe_code,
+        reason = "the caller must prove the physically active idle carrier and fixed first-run entry before plan production"
+    )]
+    /// # Safety
+    ///
+    /// The idle state's previous Thread must still own the physically active
+    /// suspended continuation. `trusted_first_run_entry` must be the
+    /// architecture-owned fixed first-run entry.
+    pub(crate) unsafe fn poll_idle<
+        'owner,
         const GROUPS: usize,
         const PROCESSES: usize,
         const THREADS: usize,
@@ -1984,13 +2005,14 @@ impl NativeWaitControl {
     >(
         &mut self,
         tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
-        execution: &ExecutionDomain<EXECUTION>,
+        execution: &'owner ExecutionDomain<EXECUTION>,
         trusted_first_run_entry: u64,
-    ) -> Result<NativeIdleSuspendPoll, WaitSuspendError> {
+    ) -> Result<NativeIdleSuspendPoll<'owner>, WaitSuspendError> {
         let NativeWaitControlState::Idle(state) = self.state else {
             return Err(WaitSuspendError::InvalidDecision);
         };
-        let poll = poll_wait_idle_suspend(tasks, execution, state, trusted_first_run_entry)?;
+        let poll =
+            unsafe { poll_wait_idle_suspend(tasks, execution, state, trusted_first_run_entry) }?;
         if !matches!(poll, NativeIdleSuspendPoll::Continue) {
             self.state = NativeWaitControlState::Clear;
         }
@@ -2004,9 +2026,15 @@ impl NativeWaitControl {
 
 #[allow(
     unsafe_code,
-    reason = "the runtime supplies a stationary execution owner and consumes the validated switch plan immediately at the F7 suspension boundary"
+    reason = "the returned lifetime-branded plan carries the execution-owner borrow through every facade to immediate F7 switch consumption"
 )]
-pub(crate) fn prepare_wait_suspend_plan<
+/// # Safety
+///
+/// `state.decision().previous` must name the Thread whose kernel stack is
+/// physically executing this call. `trusted_first_run_entry` must be the fixed
+/// architecture-owned first-run entry for scheduler-selected fresh Threads.
+pub(crate) unsafe fn prepare_wait_suspend_plan<
+    'owner,
     const GROUPS: usize,
     const PROCESSES: usize,
     const THREADS: usize,
@@ -2014,10 +2042,10 @@ pub(crate) fn prepare_wait_suspend_plan<
     const EXECUTION: usize,
 >(
     tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
-    execution: &ExecutionDomain<EXECUTION>,
+    execution: &'owner ExecutionDomain<EXECUTION>,
     state: WaitSuspendState,
     trusted_first_run_entry: u64,
-) -> Result<NativeSuspendPlan, WaitSuspendError> {
+) -> Result<NativeSuspendPlan<'owner>, WaitSuspendError> {
     let decision = state.decision();
     if decision.previous.is_none() {
         return Err(WaitSuspendError::InvalidDecision);
@@ -2034,9 +2062,15 @@ pub(crate) fn prepare_wait_suspend_plan<
 
 #[allow(
     unsafe_code,
-    reason = "the idle syscall continuation remains physically active while FIFO scheduling selects and immediately consumes the audited switch plan"
+    reason = "the idle continuation identity is runtime-proven and the returned plan brands its execution owner through immediate switch consumption"
 )]
-pub(crate) fn poll_wait_idle_suspend<
+/// # Safety
+///
+/// The suspended Thread named by `state` must still own the physically active
+/// idle continuation, even if it became logically runnable. The entry argument
+/// must be the fixed architecture-owned first-run entry.
+pub(crate) unsafe fn poll_wait_idle_suspend<
+    'owner,
     const GROUPS: usize,
     const PROCESSES: usize,
     const THREADS: usize,
@@ -2044,10 +2078,10 @@ pub(crate) fn poll_wait_idle_suspend<
     const EXECUTION: usize,
 >(
     tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
-    execution: &ExecutionDomain<EXECUTION>,
+    execution: &'owner ExecutionDomain<EXECUTION>,
     state: WaitSuspendState,
     trusted_first_run_entry: u64,
-) -> Result<NativeIdleSuspendPoll, WaitSuspendError> {
+) -> Result<NativeIdleSuspendPoll<'owner>, WaitSuspendError> {
     let suspended = state
         .decision()
         .previous

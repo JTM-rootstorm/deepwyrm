@@ -563,7 +563,17 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         )
     }
 
-    pub(crate) fn prepare_suspend<
+    #[allow(
+        unsafe_code,
+        reason = "the caller must prove the pending scheduler carrier and fixed first-run entry through the F-service facade"
+    )]
+    /// # Safety
+    ///
+    /// The pending decision must name the physically active kernel-stack
+    /// carrier, and `trusted_first_run_entry` must be the architecture-owned
+    /// fixed first-run entry.
+    pub(crate) unsafe fn prepare_suspend<
+        'owner,
         const GROUPS: usize,
         const PROCESSES: usize,
         const THREADS: usize,
@@ -571,14 +581,26 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
     >(
         &mut self,
         tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
-        execution: &ExecutionDomain<EXECUTION>,
+        execution: &'owner ExecutionDomain<EXECUTION>,
         trusted_first_run_entry: u64,
-    ) -> Result<NativeSuspendPlan, WaitSuspendError> {
-        self.control
-            .prepare_suspend(tasks, execution, trusted_first_run_entry)
+    ) -> Result<NativeSuspendPlan<'owner>, WaitSuspendError> {
+        unsafe {
+            self.control
+                .prepare_suspend(tasks, execution, trusted_first_run_entry)
+        }
     }
 
-    pub(crate) fn poll_idle_suspend<
+    #[allow(
+        unsafe_code,
+        reason = "the caller must prove the physically active idle carrier and fixed first-run entry through the F-service facade"
+    )]
+    /// # Safety
+    ///
+    /// The idle state must retain the physically active suspended continuation,
+    /// and `trusted_first_run_entry` must be the architecture-owned fixed
+    /// first-run entry.
+    pub(crate) unsafe fn poll_idle_suspend<
+        'owner,
         const GROUPS: usize,
         const PROCESSES: usize,
         const THREADS: usize,
@@ -586,11 +608,13 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
     >(
         &mut self,
         tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
-        execution: &ExecutionDomain<EXECUTION>,
+        execution: &'owner ExecutionDomain<EXECUTION>,
         trusted_first_run_entry: u64,
-    ) -> Result<NativeIdleSuspendPoll, WaitSuspendError> {
-        self.control
-            .poll_idle(tasks, execution, trusted_first_run_entry)
+    ) -> Result<NativeIdleSuspendPoll<'owner>, WaitSuspendError> {
+        unsafe {
+            self.control
+                .poll_idle(tasks, execution, trusted_first_run_entry)
+        }
     }
 
     pub(crate) fn operation_owner(

@@ -1507,6 +1507,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 }
 
+#[allow(
+    unsafe_code,
+    reason = "the target runtime propagates the physical-current carrier and architecture-owned first-run entry"
+)]
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrameRuntime
     for F12Runtime<'_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
@@ -1567,30 +1571,32 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         unsafe { crate::arch::x86_64::syscall::enter_bound_validated_user(&state, stack) }
     }
 
-    fn prepare_suspend(
-        &mut self,
+    unsafe fn prepare_suspend<'owner>(
+        &'owner mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
-    ) -> crate::syscall::native::NativeSuspendPlan {
-        self.services
-            .prepare_suspend(
+    ) -> crate::syscall::native::NativeSuspendPlan<'owner> {
+        unsafe {
+            self.services.prepare_suspend(
                 &self.tasks,
                 self.execution,
                 crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
             )
-            .unwrap_or_else(|_| fail(0xf9))
+        }
+        .unwrap_or_else(|_| fail(0xf9))
     }
 
-    fn poll_idle_suspend(
-        &mut self,
+    unsafe fn poll_idle_suspend<'owner>(
+        &'owner mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
-    ) -> crate::syscall::native::NativeIdleSuspendPoll {
-        self.services
-            .poll_idle_suspend(
+    ) -> crate::syscall::native::NativeIdleSuspendPoll<'owner> {
+        unsafe {
+            self.services.poll_idle_suspend(
                 &self.tasks,
                 self.execution,
                 crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
             )
-            .unwrap_or_else(|_| fail(0xfa))
+        }
+        .unwrap_or_else(|_| fail(0xfa))
     }
 
     fn resume_suspended(&mut self, frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame) {

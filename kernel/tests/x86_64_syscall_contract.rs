@@ -359,6 +359,56 @@ fn f2_runtime_binding_is_retained_by_divergent_entry_and_suspension_drops_short_
 }
 
 #[test]
+fn daybreak_switch_plan_brands_execution_owner_through_every_suspend_facade() {
+    let context = source("src/arch/x86_64/context.rs");
+    let execution = source("src/task/execution.rs");
+    let native = source("src/syscall/native.rs");
+    let adapters = source("src/syscall/adapters.rs");
+    let services = source("src/syscall/f_services.rs");
+    let live = source("src/arch/x86_64/syscall/live.rs");
+
+    assert!(context.contains("pub(crate) struct KernelSwitchPlan<'owner>"));
+    assert!(context.contains("_owner: PhantomData<&'owner ()>"));
+    assert!(context.contains("_owner: &'owner Owner"));
+    assert!(context.contains("fn into_switch(self) -> (*mut u64, u64)"));
+    assert!(context.contains("execute_kernel_switch(plan: KernelSwitchPlan<'_>)"));
+
+    assert!(execution.contains("&'owner self,"));
+    assert!(
+        execution
+            .match_indices("KernelSwitchPlan<'owner>, ExecutionSwitchError")
+            .count()
+            >= 5
+    );
+    assert!(execution.contains("KernelSwitchPlan::new(\n                    self,"));
+    assert!(execution.contains("KernelSwitchPlan::new_initial(\n                self,"));
+
+    assert!(native.contains("pub(crate) enum NativeSuspendPlan<'owner>"));
+    assert!(native.contains("pub(crate) enum NativeIdleSuspendPoll<'owner>"));
+    assert!(native.contains("fn prepare_suspend<'owner>("));
+    assert!(native.contains("unsafe fn prepare_suspend<'owner>("));
+    assert!(native.contains(") -> NativeSuspendPlan<'owner>;"));
+    assert!(native.contains("fn poll_idle_suspend<'owner>("));
+    assert!(native.contains("unsafe fn poll_idle_suspend<'owner>("));
+    assert!(native.contains(") -> NativeIdleSuspendPoll<'owner>;"));
+
+    assert!(adapters.contains("pub(crate) unsafe fn prepare_suspend<"));
+    assert!(adapters.contains("pub(crate) unsafe fn poll_idle<"));
+    assert!(adapters.contains("pub(crate) unsafe fn prepare_wait_suspend_plan<"));
+    assert!(adapters.contains("pub(crate) unsafe fn poll_wait_idle_suspend<"));
+    assert!(adapters.contains("Result<NativeSuspendPlan<'owner>, WaitSuspendError>"));
+    assert!(adapters.contains("Result<NativeIdleSuspendPoll<'owner>, WaitSuspendError>"));
+    assert!(services.contains("pub(crate) unsafe fn prepare_suspend<"));
+    assert!(services.contains("pub(crate) unsafe fn poll_idle_suspend<"));
+    assert!(services.contains("Result<NativeSuspendPlan<'owner>, WaitSuspendError>"));
+    assert!(services.contains("Result<NativeIdleSuspendPoll<'owner>, WaitSuspendError>"));
+    assert!(live.contains("KernelSwitchPlan<'_>)"));
+    assert!(live.contains("unsafe { runtime.prepare_suspend(frame) }"));
+    assert!(live.contains("unsafe { runtime.poll_idle_suspend(frame) }"));
+    assert!(live.contains("execute_kernel_switch(plan)"));
+}
+
+#[test]
 fn daybreak_production_execution_exposes_no_raw_safe_continuation_seed() {
     let execution = source("src/task/execution.rs");
     assert!(!execution.contains("pub(crate) fn seed_kernel_continuation("));

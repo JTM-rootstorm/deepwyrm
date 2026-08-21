@@ -65,7 +65,7 @@ fn f11_move_only_ipc_wait_time_and_architecture_contracts() {
         },
         CompileFailCase {
             fixture: "f11_kernel_switch_plan_clone.rs",
-            expected_error: "error[E0277]: the trait bound `KernelSwitchPlan: Clone` is not satisfied",
+            expected_error: "error[E0277]: the trait bound `KernelSwitchPlan<'_>: Clone` is not satisfied",
         },
         CompileFailCase {
             fixture: "f11_initial_kernel_continuation_clone.rs",
@@ -118,6 +118,18 @@ fn f11_move_only_ipc_wait_time_and_architecture_contracts() {
         CompileFailCase {
             fixture: "f11_timer_payload_binding_clone.rs",
             expected_error: "error[E0277]: the trait bound `TimerPayloadBinding: Clone` is not satisfied",
+        },
+        CompileFailCase {
+            fixture: "f13_execution_owner_move_with_switch_plan.rs",
+            expected_error: "error[E0505]: cannot move out of `execution` because it is borrowed",
+        },
+        CompileFailCase {
+            fixture: "f13_execution_owner_replace_with_switch_plan.rs",
+            expected_error: "error[E0502]: cannot borrow `execution` as mutable because it is also borrowed as immutable",
+        },
+        CompileFailCase {
+            fixture: "f13_safe_suspend_facade_requires_unsafe.rs",
+            expected_error: "error[E0133]: call to unsafe function `NativeWaitControl::prepare_suspend` is unsafe and requires unsafe block",
         },
     ] {
         run_compile_fail_case(

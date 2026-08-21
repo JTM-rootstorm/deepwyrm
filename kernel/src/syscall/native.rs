@@ -724,18 +724,22 @@ impl<T: NativeSyscallServices> NativeSyscallHandler for T {
 }
 
 #[must_use = "suspend plans must be consumed by the raw syscall runtime"]
-pub(crate) enum NativeSuspendPlan {
-    Switch(crate::arch::x86_64::context::KernelSwitchPlan),
+pub(crate) enum NativeSuspendPlan<'owner> {
+    Switch(crate::arch::x86_64::context::KernelSwitchPlan<'owner>),
     IdleCurrent,
 }
 
 #[must_use = "idle suspension polls must either continue idling, resume the waiter, or switch to newly runnable work"]
-pub(crate) enum NativeIdleSuspendPoll {
+pub(crate) enum NativeIdleSuspendPoll<'owner> {
     Continue,
     ResumeCurrent,
-    Switch(crate::arch::x86_64::context::KernelSwitchPlan),
+    Switch(crate::arch::x86_64::context::KernelSwitchPlan<'owner>),
 }
 
+#[allow(
+    unsafe_code,
+    reason = "plan-producing runtime methods carry physical-current and fixed-entry obligations that safe Rust cannot encode"
+)]
 pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
     fn authorize_return(
         &mut self,
@@ -753,15 +757,32 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
     /// already bound that Thread's owned kernel stack.
     fn enter_scheduled_fresh_thread(&mut self) -> !;
 
-    fn prepare_suspend(
-        &mut self,
+    /// Returns a plan branded by the stationary execution owner borrowed from
+    /// this runtime. The raw trampoline must consume it immediately.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the raw syscall trampoline running on the kernel
+    /// stack named by the pending scheduling decision. The implementation must
+    /// pass that physical-current fact and only the architecture-owned fixed
+    /// first-run entry through every lower plan-producing facade.
+    unsafe fn prepare_suspend<'owner>(
+        &'owner mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
-    ) -> NativeSuspendPlan;
+    ) -> NativeSuspendPlan<'owner>;
 
-    fn poll_idle_suspend(
-        &mut self,
+    /// Propagates the same owner brand through the idle IRQ polling facade.
+    ///
+    /// # Safety
+    ///
+    /// The caller must still be running the physically active suspended
+    /// continuation, even if its logical Thread became runnable while idle.
+    /// The implementation must preserve that carrier identity and the fixed
+    /// architecture-owned first-run entry through every lower facade.
+    unsafe fn poll_idle_suspend<'owner>(
+        &'owner mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
-    ) -> NativeIdleSuspendPoll;
+    ) -> NativeIdleSuspendPoll<'owner>;
 
     fn resume_suspended(&mut self, frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame);
 }

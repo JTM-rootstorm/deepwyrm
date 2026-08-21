@@ -777,6 +777,10 @@ fn channel_dispatch_moves_a_reduced_right_event_and_receives_it() {
 }
 
 #[test]
+#[allow(
+    unsafe_code,
+    reason = "the fixture's running Thread is the physical carrier and the synthetic entry is fixed for this suspension test"
+)]
 fn finite_wait_dispatch_idles_times_out_and_resumes_exact_owner() {
     let mut fixture = Fixture::new();
     assert_eq!(
@@ -811,10 +815,14 @@ fn finite_wait_dispatch_idles_times_out_and_resumes_exact_owner() {
         .wake_key_for_thread(fixture.thread)
         .unwrap();
     assert!(matches!(
-        fixture
-            .services
-            .prepare_suspend(&fixture.tasks, &fixture.execution, 0xffff_8000_0012_3000)
-            .unwrap(),
+        unsafe {
+            fixture.services.prepare_suspend(
+                &fixture.tasks,
+                &fixture.execution,
+                0xffff_8000_0012_3000,
+            )
+        }
+        .unwrap(),
         NativeSuspendPlan::IdleCurrent
     ));
     let mut expired = [None; 8];
@@ -822,10 +830,14 @@ fn finite_wait_dispatch_idles_times_out_and_resumes_exact_owner() {
     assert_eq!(expired[0], Some(wake));
     assert!(claim_timeout_and_wake(&fixture.execution, wake).unwrap());
     assert!(matches!(
-        fixture
-            .services
-            .poll_idle_suspend(&fixture.tasks, &fixture.execution, 0xffff_8000_0012_3000)
-            .unwrap(),
+        unsafe {
+            fixture.services.poll_idle_suspend(
+                &fixture.tasks,
+                &fixture.execution,
+                0xffff_8000_0012_3000,
+            )
+        }
+        .unwrap(),
         NativeIdleSuspendPoll::ResumeCurrent
     ));
     let resumed = fixture
@@ -854,6 +866,10 @@ fn finite_wait_dispatch_idles_times_out_and_resumes_exact_owner() {
 }
 
 #[test]
+#[allow(
+    unsafe_code,
+    reason = "the fixture's running Thread is the physical carrier and the synthetic entry is fixed for this suspension test"
+)]
 fn atomic_mismatch_then_suspend_wake_and_resume_has_one_exact_owner() {
     let mut fixture = Fixture::new();
     let key = stable_atomic_key(&mut fixture.registry);
@@ -917,10 +933,14 @@ fn atomic_mismatch_then_suspend_wake_and_resume_has_one_exact_owner() {
     );
     assert!(!fixture.services.is_quiescent());
     assert!(matches!(
-        fixture
-            .services
-            .prepare_suspend(&fixture.tasks, &fixture.execution, 0xffff_8000_0012_3000)
-            .unwrap(),
+        unsafe {
+            fixture.services.prepare_suspend(
+                &fixture.tasks,
+                &fixture.execution,
+                0xffff_8000_0012_3000,
+            )
+        }
+        .unwrap(),
         NativeSuspendPlan::IdleCurrent
     ));
     assert_eq!(
@@ -928,10 +948,14 @@ fn atomic_mismatch_then_suspend_wake_and_resume_has_one_exact_owner() {
         1
     );
     assert!(matches!(
-        fixture
-            .services
-            .poll_idle_suspend(&fixture.tasks, &fixture.execution, 0xffff_8000_0012_3000)
-            .unwrap(),
+        unsafe {
+            fixture.services.poll_idle_suspend(
+                &fixture.tasks,
+                &fixture.execution,
+                0xffff_8000_0012_3000,
+            )
+        }
+        .unwrap(),
         NativeIdleSuspendPoll::ResumeCurrent
     ));
     let resumed = fixture

@@ -207,6 +207,10 @@ impl crate::arch::x86_64::syscall::UserReturnMappingValidation for FrameRuntime 
         self.writable_stack
     }
 }
+#[allow(
+    unsafe_code,
+    reason = "the host fixture implements the runtime suspension boundary without producing a live plan"
+)]
 impl NativeSyscallFrameRuntime for FrameRuntime {
     fn authorize_return(
         &mut self,
@@ -228,17 +232,17 @@ impl NativeSyscallFrameRuntime for FrameRuntime {
         panic!("unexpected synthetic fresh-thread entry")
     }
 
-    fn prepare_suspend(
-        &mut self,
+    unsafe fn prepare_suspend<'owner>(
+        &'owner mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
-    ) -> NativeSuspendPlan {
+    ) -> NativeSuspendPlan<'owner> {
         panic!("unexpected synthetic suspension")
     }
 
-    fn poll_idle_suspend(
-        &mut self,
+    unsafe fn poll_idle_suspend<'owner>(
+        &'owner mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
-    ) -> NativeIdleSuspendPoll {
+    ) -> NativeIdleSuspendPoll<'owner> {
         panic!("unexpected synthetic idle suspension")
     }
 
@@ -305,6 +309,10 @@ impl NativeSyscallHandler for SuspendingRuntime {
     }
 }
 
+#[allow(
+    unsafe_code,
+    reason = "the host fixture implements the runtime suspension boundary without producing a live plan"
+)]
 impl NativeSyscallFrameRuntime for SuspendingRuntime {
     fn authorize_return(
         &mut self,
@@ -326,17 +334,17 @@ impl NativeSyscallFrameRuntime for SuspendingRuntime {
         panic!("direct dispatch test never launches a fresh Thread")
     }
 
-    fn prepare_suspend(
-        &mut self,
+    unsafe fn prepare_suspend<'owner>(
+        &'owner mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
-    ) -> NativeSuspendPlan {
+    ) -> NativeSuspendPlan<'owner> {
         panic!("direct dispatch test stops before trampoline suspension")
     }
 
-    fn poll_idle_suspend(
-        &mut self,
+    unsafe fn poll_idle_suspend<'owner>(
+        &'owner mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
-    ) -> NativeIdleSuspendPoll {
+    ) -> NativeIdleSuspendPoll<'owner> {
         panic!("direct dispatch test never enters idle suspension")
     }
 

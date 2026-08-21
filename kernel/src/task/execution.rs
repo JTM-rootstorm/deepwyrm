@@ -841,23 +841,24 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     ///
     /// # Safety
     ///
-    /// `self` and its continuation storage must remain stationary until the returned
-    /// plan is consumed by the architecture switch. The pinned syscall runtime is
-    /// the production owner that supplies this guarantee.
+    /// `decision.previous` must name the kernel stack currently executing this
+    /// function. The returned plan borrows `self`, preventing safe move or
+    /// replacement of its continuation storage until the plan is consumed.
     #[allow(
         unsafe_code,
-        reason = "the caller proves the execution owner remains stationary while this raw continuation save-slot plan is live"
+        reason = "the lifetime brand makes execution-owner stationarity mechanical while the caller supplies the active continuation identity"
     )]
     pub(crate) unsafe fn prepare_kernel_switch<
+        'owner,
         const GROUPS: usize,
         const PROCESSES: usize,
         const THREADS: usize,
         const HANDLES: usize,
     >(
-        &self,
+        &'owner self,
         tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         decision: super::ScheduleDecision,
-    ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan, ExecutionSwitchError> {
+    ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan<'owner>, ExecutionSwitchError> {
         unsafe { self.prepare_kernel_switch_inner(tasks, decision, false, None) }
     }
 
@@ -869,24 +870,26 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     ///
     /// # Safety
     ///
-    /// The execution owner must remain stationary until the returned plan is
-    /// consumed. `trusted_first_run_entry` must be the fixed kernel entry used to
-    /// launch the scheduler-selected fresh Thread and remain executable.
+    /// `decision.previous` must name the kernel stack currently executing this
+    /// function. `trusted_first_run_entry` must be the fixed executable kernel
+    /// entry for a scheduler-selected fresh Thread. The returned plan borrows
+    /// `self` until immediate switch consumption.
     #[allow(
         unsafe_code,
         reason = "F7 may select a never-run Runnable Thread and must construct its audited first-run frame on the exclusively owned destination kernel stack"
     )]
     pub(crate) unsafe fn prepare_blocking_kernel_switch<
+        'owner,
         const GROUPS: usize,
         const PROCESSES: usize,
         const THREADS: usize,
         const HANDLES: usize,
     >(
-        &self,
+        &'owner self,
         tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         decision: super::ScheduleDecision,
         trusted_first_run_entry: u64,
-    ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan, ExecutionSwitchError> {
+    ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan<'owner>, ExecutionSwitchError> {
         unsafe {
             self.prepare_kernel_switch_inner(tasks, decision, false, Some(trusted_first_run_entry))
         }
@@ -900,22 +903,23 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     /// # Safety
     ///
     /// The caller must prove `decision.previous` is the kernel stack currently
-    /// executing this function and keep the execution owner stationary until the
-    /// returned plan is consumed.
+    /// executing this function. The returned plan mechanically borrows the
+    /// execution owner until immediate switch consumption.
     #[allow(
         unsafe_code,
         reason = "F7 idle suspension can logically wake the physically-active continuation before FIFO selects another destination Thread"
     )]
     pub(crate) unsafe fn prepare_idle_kernel_switch<
+        'owner,
         const GROUPS: usize,
         const PROCESSES: usize,
         const THREADS: usize,
         const HANDLES: usize,
     >(
-        &self,
+        &'owner self,
         tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         decision: super::ScheduleDecision,
-    ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan, ExecutionSwitchError> {
+    ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan<'owner>, ExecutionSwitchError> {
         unsafe { self.prepare_kernel_switch_inner(tasks, decision, true, None) }
     }
 
@@ -926,23 +930,24 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     /// # Safety
     ///
     /// `decision.previous` must name the kernel stack physically executing the
-    /// idle continuation. The execution owner and trusted entry obey the same
-    /// lifetime requirements as the ordinary blocking fresh-thread planner.
+    /// idle continuation. The trusted entry obeys the ordinary blocking
+    /// fresh-thread contract; the returned plan brands the execution owner.
     #[allow(
         unsafe_code,
         reason = "F7 idle suspension may switch from a physically active waiter to a fresh scheduler-selected Runnable Thread"
     )]
     pub(crate) unsafe fn prepare_idle_blocking_kernel_switch<
+        'owner,
         const GROUPS: usize,
         const PROCESSES: usize,
         const THREADS: usize,
         const HANDLES: usize,
     >(
-        &self,
+        &'owner self,
         tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         decision: super::ScheduleDecision,
         trusted_first_run_entry: u64,
-    ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan, ExecutionSwitchError> {
+    ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan<'owner>, ExecutionSwitchError> {
         unsafe {
             self.prepare_kernel_switch_inner(tasks, decision, true, Some(trusted_first_run_entry))
         }
@@ -953,17 +958,18 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         reason = "shared switch-plan constructor is called only by audited ordinary-block and idle-block wrappers that prove the active continuation identity"
     )]
     unsafe fn prepare_kernel_switch_inner<
+        'owner,
         const GROUPS: usize,
         const PROCESSES: usize,
         const THREADS: usize,
         const HANDLES: usize,
     >(
-        &self,
+        &'owner self,
         tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         decision: super::ScheduleDecision,
         allow_runnable_previous: bool,
         trusted_first_run_entry: Option<u64>,
-    ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan, ExecutionSwitchError> {
+    ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan<'owner>, ExecutionSwitchError> {
         let previous = decision
             .previous
             .ok_or(ExecutionSwitchError::MissingPrevious)?;
@@ -1010,6 +1016,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         if next_rsp != 0 {
             return unsafe {
                 crate::arch::x86_64::context::KernelSwitchPlan::new(
+                    self,
                     current_rsp_out,
                     next_rsp,
                     next_stack,
@@ -1028,7 +1035,11 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         }
         .map_err(ExecutionSwitchError::InitialContext)?;
         unsafe {
-            crate::arch::x86_64::context::KernelSwitchPlan::new_initial(current_rsp_out, initial)
+            crate::arch::x86_64::context::KernelSwitchPlan::new_initial(
+                self,
+                current_rsp_out,
+                initial,
+            )
         }
         .map_err(ExecutionSwitchError::Context)
     }

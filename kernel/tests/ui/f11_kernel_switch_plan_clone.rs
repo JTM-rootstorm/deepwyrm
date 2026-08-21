@@ -14,6 +14,6 @@ mod context;
 
 use context::KernelSwitchPlan;
 
-fn clone_switch_plan(plan: &KernelSwitchPlan) {
-    let _ = <KernelSwitchPlan as Clone>::clone(plan);
+fn clone_switch_plan(plan: &KernelSwitchPlan<'_>) {
+    let _ = <KernelSwitchPlan<'_> as Clone>::clone(plan);
 }
