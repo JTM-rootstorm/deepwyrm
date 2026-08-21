@@ -173,6 +173,41 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
         Ok(&mut self.record_mut(key)?.region)
     }
 
+    /// Resolves a pinned current-process virtual word without exposing the
+    /// root-region payload or permitting a handle-selected foreign region.
+    pub(crate) fn resolve_atomic_wait_key_for_live_process<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &self,
+        tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        process: ProcessKey,
+        address: u64,
+    ) -> Result<AtomicWaitKey, AddressRegionObjectError> {
+        if tasks
+            .process_info(process)
+            .map_err(AddressRegionObjectError::Task)?
+            .state
+            == DW_TASK_STATE_EXITED
+        {
+            return Err(AddressRegionObjectError::Task(TaskError::BadState));
+        }
+        let root = tasks
+            .root_region(process)
+            .map_err(AddressRegionObjectError::Task)?
+            .ok_or(AddressRegionObjectError::WrongProcess)?;
+        let record = self.record(AddressRegionObjectKey::from_object_id(root))?;
+        if record.process != process.object_id() || !record.owns_address_space {
+            return Err(AddressRegionObjectError::WrongProcess);
+        }
+        record
+            .region
+            .resolve_atomic_wait_key(address)
+            .map_err(AddressRegionObjectError::Model)
+    }
+
     fn rollback_bound(
         &mut self,
         key: AddressRegionObjectKey,

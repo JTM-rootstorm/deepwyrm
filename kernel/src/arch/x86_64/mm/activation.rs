@@ -32,7 +32,11 @@ mod graph;
 mod user_access;
 use graph::*;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub(crate) use user_access::{LiveProcessAddressSpace, OwnedLiveUserOutput};
+pub(crate) use user_access::LiveProcessAddressSpace;
+#[cfg(deepwyrm_f9_guest)]
+pub(crate) use user_access::OwnedLiveAtomicU32;
+#[cfg(deepwyrm_e7_guest)]
+pub(crate) use user_access::OwnedLiveUserOutput;
 #[path = "activation/build.rs"]
 mod build;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]

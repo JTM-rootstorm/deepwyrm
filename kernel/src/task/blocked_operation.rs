@@ -66,6 +66,12 @@ pub(crate) enum BlockedOperationWinner {
         item_index: u32,
         observed: DwSignals,
     },
+    /// A userspace atomic-wait key was selected by `atomic_wake`.
+    ///
+    /// This is intentionally distinct from object-signal completion: atomic
+    /// waiters return successfully without treating the userspace predicate as
+    /// a kernel-managed signal state.
+    AtomicWake,
     Timeout,
     Cancelled,
     Terminal,

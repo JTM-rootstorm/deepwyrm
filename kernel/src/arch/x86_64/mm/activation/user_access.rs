@@ -1,7 +1,9 @@
 use super::*;
 
 use crate::memory::frame_roles::{ObjectBackingGrant, TableCandidateGrant};
-use crate::memory::user_range::{UserAccess, UserPageChunk, UserRange};
+use crate::memory::user_range::{
+    EmptyAddressRule, UserAccess, UserAddressSpace, UserPageChunk, UserRange,
+};
 use crate::memory::usercopy::{
     OwnedUserOutputAccess, PinnedUserBatchPages, PinnedUserPages, UserPageAccess,
     UserPageBatchAccess, UserPinError, UserPinTracker, UserRangePin, UserRangePinToken,
@@ -108,6 +110,22 @@ pub(crate) struct OwnedLiveUserOutput {
     process: crate::task::ProcessKey,
     range: UserRange,
     token: UserRangePinToken,
+}
+
+/// Detached mapping-stability authority for one aligned readable userspace
+/// atomic word. The originating live address-space session must load or release
+/// it; it is suitable for storage in a blocked-operation resource bundle.
+#[must_use = "owned live atomic-word pins must be released through their originating process address space"]
+pub(crate) struct OwnedLiveAtomicU32 {
+    process: crate::task::ProcessKey,
+    range: UserRange,
+    token: UserRangePinToken,
+}
+
+impl OwnedLiveAtomicU32 {
+    pub(crate) const fn address(&self) -> u64 {
+        self.range.start()
+    }
 }
 
 impl OwnedLiveUserOutput {
@@ -311,6 +329,88 @@ impl PinnedUserBatchPages for PinnedLiveUserBatch<'_> {
 impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     LiveProcessAddressSpace<'borrow, 'root, RANGE_CAPACITY, ROLE_CAPACITY>
 {
+    /// Pins and preflights one aligned readable userspace `u32`, then detaches
+    /// the range reservation so it can survive a blocking syscall.
+    pub(crate) fn pin_atomic_u32(
+        &mut self,
+        address: u64,
+    ) -> Result<OwnedLiveAtomicU32, LiveUserAccessError> {
+        let user = UserAddressSpace::x86_64_four_level(PAGE_SIZE)
+            .expect("live x86_64 user address-space constants remain valid");
+        let range = UserRange::new(
+            user,
+            address,
+            core::mem::size_of::<u32>() as u64,
+            core::mem::align_of::<u32>() as u64,
+            UserAccess::READ,
+            EmptyAddressRule::Reject,
+        )
+        .map_err(|_| LiveUserAccessError::MissingOrInvalid)?;
+        let token = self
+            .target
+            .pins
+            .pin_owned(range)
+            .map_err(LiveUserAccessError::Pin)?;
+        for chunk in range.page_chunks() {
+            if let Err(error) = self.preflight(chunk) {
+                self.target.pins.release_owned(token).expect(
+                    "fresh owned atomic-word pin remains releasable after failed preflight",
+                );
+                return Err(error);
+            }
+        }
+        Ok(OwnedLiveAtomicU32 {
+            process: self.process,
+            range,
+            token,
+        })
+    }
+
+    /// Atomically samples a still-pinned shared userspace `u32` with acquire
+    /// ordering. The pin prevents a recoverable mapping change while this
+    /// pointer-derived atomic reference exists.
+    #[allow(
+        unsafe_code,
+        reason = "the owned pin validates the exact aligned readable word and excludes overlapping page-table publication"
+    )]
+    pub(crate) fn load_atomic_u32_acquire(
+        &mut self,
+        word: &OwnedLiveAtomicU32,
+    ) -> Result<u32, LiveUserAccessError> {
+        if word.process != self.process {
+            return Err(LiveUserAccessError::Permission);
+        }
+        let (start, end_exclusive) = self
+            .target
+            .pins
+            .validate_owned(&word.token)
+            .map_err(LiveUserAccessError::Pin)?;
+        if start != word.range.start()
+            || end_exclusive != word.range.end_exclusive()
+            || word.range.byte_len() != core::mem::size_of::<u32>() as u64
+            || !start.is_multiple_of(core::mem::align_of::<u32>() as u64)
+        {
+            return Err(LiveUserAccessError::Permission);
+        }
+        let atomic = unsafe { core::sync::atomic::AtomicU32::from_ptr(start as *mut u32) };
+        Ok(atomic.load(core::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Releases a detached atomic-word mapping pin after every wait, wake,
+    /// timeout, cancellation, or terminal-teardown path has finished with it.
+    pub(crate) fn release_atomic_u32(
+        &mut self,
+        word: OwnedLiveAtomicU32,
+    ) -> Result<(), LiveUserAccessError> {
+        if word.process != self.process {
+            return Err(LiveUserAccessError::Permission);
+        }
+        self.target
+            .pins
+            .release_owned(word.token)
+            .map_err(LiveUserAccessError::Pin)
+    }
+
     /// Preflights a writable range and detaches its mapping-stability pin from
     /// this short address-space borrow so a blocked syscall may retain it.
     pub(crate) fn preflight_owned_output(

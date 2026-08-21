@@ -115,6 +115,14 @@ pub(super) fn build_stack_kernel(
 }
 
 pub(super) fn find_e7_user_artifact(target_dir: &Path) -> PathBuf {
+    find_user_artifact(target_dir, "deepwyrm-e7-user.elf", "E7")
+}
+
+pub(super) fn find_f9_user_artifact(target_dir: &Path) -> PathBuf {
+    find_user_artifact(target_dir, "deepwyrm-f9-user.elf", "F9")
+}
+
+fn find_user_artifact(target_dir: &Path, artifact_name: &str, phase: &str) -> PathBuf {
     let build_dir = target_dir.join("x86_64-unknown-none/debug/build");
     let mut matches = Vec::new();
     for entry in fs::read_dir(&build_dir).expect("read E7 build directory") {
@@ -123,7 +131,7 @@ pub(super) fn find_e7_user_artifact(target_dir: &Path) -> PathBuf {
         if !name.to_string_lossy().starts_with("deepwyrm-kernel-") {
             continue;
         }
-        let artifact = entry.path().join("out/deepwyrm-e7-user.elf");
+        let artifact = entry.path().join("out").join(artifact_name);
         if artifact.is_file() {
             matches.push(artifact);
         }
@@ -131,7 +139,7 @@ pub(super) fn find_e7_user_artifact(target_dir: &Path) -> PathBuf {
     assert_eq!(
         matches.len(),
         1,
-        "expected one E7 userspace artifact under {}: {matches:?}",
+        "expected one {phase} userspace artifact under {}: {matches:?}",
         target_dir.display()
     );
     matches.pop().unwrap()

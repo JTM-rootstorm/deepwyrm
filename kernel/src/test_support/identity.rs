@@ -26,6 +26,7 @@ pub(crate) enum BuildGuestTest {
     TaskSyscallSmoke,
     TaskSyscallSanitize,
     TaskUserException,
+    AtomicWaitWake,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,6 +81,7 @@ impl BuildGuestTest {
             Self::TaskSyscallSmoke => 10,
             Self::TaskSyscallSanitize => 11,
             Self::TaskUserException => 12,
+            Self::AtomicWaitWake => 16,
         }
     }
 
@@ -88,6 +90,10 @@ impl BuildGuestTest {
             self,
             Self::TaskSyscallSmoke | Self::TaskSyscallSanitize | Self::TaskUserException
         )
+    }
+
+    pub(crate) const fn is_f9_userspace(self) -> bool {
+        matches!(self, Self::AtomicWaitWake)
     }
 
     pub(crate) const fn is_memory_foundation(self) -> bool {
@@ -176,6 +182,8 @@ const fn parse_known_selector(value: &str) -> BuildGuestTest {
         BuildGuestTest::TaskSyscallSanitize
     } else if string_equals(value, "task-user-exception") {
         BuildGuestTest::TaskUserException
+    } else if string_equals(value, "atomic-wait-wake") {
+        BuildGuestTest::AtomicWaitWake
     } else {
         panic!("unknown build-selected guest test")
     }

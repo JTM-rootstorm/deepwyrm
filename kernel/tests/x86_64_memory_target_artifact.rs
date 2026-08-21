@@ -393,6 +393,11 @@ fn e7_task_smoke_artifact_is_freestanding_and_separated() {
         "__dw_test_e7_user_blob_end",
         "E7SmokeRuntime",
         "task-syscall-smoke",
+        "run_atomic_wait_userspace_test",
+        "__dw_test_f9_user_blob_start",
+        "__dw_test_f9_user_blob_end",
+        "F9Runtime",
+        "atomic-wait-wake",
     ] {
         assert!(
             !production_symbols.contains(forbidden),
@@ -476,6 +481,93 @@ fn e7_task_smoke_artifact_is_freestanding_and_separated() {
     );
     assert_eq!(veneer_syscalls, 1, "generated dw_syscall6 must own SYSCALL");
     eprintln!("task-syscall-smoke user {}", sha256(&user));
+
+    let f9_target = output_root.path().join("atomic-wait-wake");
+    let f9 = build_kernel(
+        &workspace,
+        &f9_target,
+        &environment,
+        tools,
+        Some("atomic-wait-wake"),
+    );
+    let f9_symbols = symbols(&llvm_nm, &f9);
+    for required in [
+        "run_atomic_wait_userspace_test",
+        "__dw_test_f9_user_blob_start",
+        "__dw_test_f9_user_blob_end",
+        "F9Runtime",
+        "begin_atomic_wait",
+        "claim_wake",
+        "dw_x86_64_syscall_entry",
+        "dw_x86_64_iret_to_user",
+    ] {
+        assert!(
+            f9_symbols.contains(required),
+            "atomic-wait-wake kernel omitted {required}"
+        );
+    }
+    let f9_disassembly = disassembly(&llvm_objdump, &f9);
+    validate_fp_simd_unavailable(&f9_disassembly);
+    assert_ne!(sha256(&production), sha256(&f9));
+
+    let f9_user = find_f9_user_artifact(&f9_target);
+    let f9_user_symbols = symbols(&llvm_nm, &f9_user);
+    assert!(f9_user_symbols.contains("_start"));
+    assert!(f9_user_symbols.contains("dw_syscall6"));
+    let mut f9_readelf = verified_helper_command_as(&llvm_readelf, "llvm-readelf");
+    let f9_headers = run_output(
+        f9_readelf.args(["-h", "-l"]).arg(&f9_user),
+        "F9 userspace ELF headers",
+    );
+    let f9_headers = String::from_utf8(f9_headers.stdout).expect("llvm-readelf output is UTF-8");
+    assert!(f9_headers.contains("Type:                              EXEC"));
+    assert!(
+        !f9_headers.contains("INTERP"),
+        "F9 userspace gained PT_INTERP"
+    );
+    let f9_loads: Vec<_> = f9_headers
+        .lines()
+        .filter(|line| line.trim_start().starts_with("LOAD"))
+        .collect();
+    assert_eq!(
+        f9_loads.len(),
+        1,
+        "F9 userspace must have one PT_LOAD: {f9_loads:?}"
+    );
+    assert!(
+        f9_loads[0].contains(" R E "),
+        "F9 PT_LOAD is not RX: {}",
+        f9_loads[0]
+    );
+    assert!(!f9_loads[0].contains(" RWE "), "F9 PT_LOAD became W+X");
+
+    let f9_user_disassembly = disassembly(&llvm_objdump, &f9_user);
+    let f9_syscall_count = f9_user_disassembly
+        .lines()
+        .filter(|line| line.split_whitespace().last() == Some("syscall"))
+        .count();
+    assert_eq!(
+        f9_syscall_count, 1,
+        "generated F9 veneer must own the sole SYSCALL"
+    );
+    let f9_start_syscalls = function_body(&f9_user_disassembly, "_start")
+        .lines()
+        .filter(|line| line.split_whitespace().last() == Some("syscall"))
+        .count();
+    let f9_veneer_syscalls = function_body(&f9_user_disassembly, "dw_syscall6")
+        .lines()
+        .filter(|line| line.split_whitespace().last() == Some("syscall"))
+        .count();
+    assert_eq!(
+        f9_start_syscalls, 0,
+        "F9 _start must call the generated veneer"
+    );
+    assert_eq!(
+        f9_veneer_syscalls, 1,
+        "generated F9 dw_syscall6 must own SYSCALL"
+    );
+    eprintln!("atomic-wait-wake user {}", sha256(&f9_user));
+    eprintln!("atomic-wait-wake kernel {}", sha256(&f9));
 
     let smoke_stack = build_stack_kernel(
         &workspace,

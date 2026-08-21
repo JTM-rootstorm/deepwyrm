@@ -1368,6 +1368,10 @@ pub(crate) struct WaitSuspendState {
 }
 
 impl WaitSuspendState {
+    pub(crate) const fn new(wake: BlockWakeKey, decision: ScheduleDecision) -> Self {
+        Self { wake, decision }
+    }
+
     pub(crate) const fn wake_key(self) -> BlockWakeKey {
         self.wake
     }
@@ -2090,6 +2094,10 @@ pub(crate) fn resume_wait_syscall<
         crate::task::BlockedOperationWinner::Timeout => {
             user.discard_owned_output(output);
             Ok(DW_STATUS_TIMED_OUT)
+        }
+        crate::task::BlockedOperationWinner::AtomicWake => {
+            user.discard_owned_output(output);
+            panic!("atomic-wake winner reached generic F7 wait resume")
         }
         crate::task::BlockedOperationWinner::Cancelled
         | crate::task::BlockedOperationWinner::Terminal => {

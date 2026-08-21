@@ -14,7 +14,7 @@ use super::object::{
     MemoryObjectRange, MemoryProtection, PAGE_SIZE,
 };
 use crate::handle::ResolvedHandle;
-use crate::object::ObjectRegistry;
+use crate::object::{ObjectId, ObjectRegistry};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 #[path = "address_region/authority.rs"]
@@ -26,6 +26,34 @@ const USER_CANONICAL_END: u64 = 0x0000_8000_0000_0000;
 const EMPTY_LEASE: MappingLease = MappingLease::EMPTY;
 
 pub(crate) type Protection = MemoryProtection;
+
+/// Stable identity for one four-byte word in a live `MemoryObject` generation.
+///
+/// Construction accepts object identity rather than a virtual address. The
+/// address-region resolver owns the proof that `object_offset` lies in the
+/// pinned, readable mapping selected by the caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AtomicWaitKey {
+    object: ObjectId,
+    object_offset: u64,
+}
+
+impl AtomicWaitKey {
+    pub(crate) const fn new(object: ObjectId, object_offset: u64) -> Self {
+        Self {
+            object,
+            object_offset,
+        }
+    }
+
+    pub(crate) const fn object(self) -> ObjectId {
+        self.object
+    }
+
+    pub(crate) const fn object_offset(self) -> u64 {
+        self.object_offset
+    }
+}
 
 /// Opaque authority-issued identity for one page-table root/address space.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

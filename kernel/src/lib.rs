@@ -8,6 +8,11 @@
 #![deny(unsafe_code)]
 
 pub mod arch;
+#[allow(
+    dead_code,
+    reason = "DW0-F9 atomic wait/wake foundations are consumed by the selector-16 runtime"
+)]
+pub(crate) mod atomic_wait;
 pub mod boot;
 pub mod debug;
 #[allow(
@@ -145,6 +150,8 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
         }
         test_support::BuildGuestTest::PanicPath => panic!("DW0-B panic-path guest test"),
         test if test.is_memory_foundation() || test.is_task_userspace() => {}
+        #[cfg(deepwyrm_f9_guest)]
+        test if test.is_f9_userspace() => {}
         _ => unreachable!("all build-selected guest tests have explicit dispatch"),
     }
 
@@ -247,6 +254,10 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             }
             #[cfg(deepwyrm_e7_guest)]
             test if test.is_task_userspace() => test_support::run_task_guest_test(active_paging),
+            #[cfg(deepwyrm_f9_guest)]
+            test if test.is_f9_userspace() => {
+                active_paging.run_atomic_wait_userspace_test(test_support::BUILD_GUEST_TEST)
+            }
             _ => unreachable!("post-activation selector lacks an explicit runtime"),
         }
         #[cfg(not(feature = "test-support"))]

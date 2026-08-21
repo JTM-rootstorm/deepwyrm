@@ -74,6 +74,10 @@ pub(crate) fn encode_u64(value: u64) -> [u8; 8] {
     value.to_le_bytes()
 }
 
+pub(crate) fn encode_u32(value: u32) -> [u8; 4] {
+    value.to_le_bytes()
+}
+
 pub(crate) fn encode_object_info(result: ObjectInfoResult) -> EncodedObjectInfo {
     let mut bytes = [0; MAX_OBJECT_INFO_BYTES];
     let len = match result {

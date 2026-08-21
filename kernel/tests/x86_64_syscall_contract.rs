@@ -316,3 +316,30 @@ fn daybreak_production_execution_exposes_no_raw_safe_continuation_seed() {
     assert!(context.contains("validate_initial_kernel_continuation_frame"));
     assert!(context.contains("INITIAL_KERNEL_CONTINUATION_RFLAGS"));
 }
+
+#[test]
+fn f9_zero_count_wake_still_validates_address_key_and_output_before_dispatch() {
+    let runtime = source("src/arch/x86_64/mm/activation/test_support/f9.rs");
+    let wake = runtime
+        .split_once("NativeSyscallRequest::AtomicWake {")
+        .expect("F9 AtomicWake handler")
+        .1
+        .split_once("NativeSyscallRequest::ProcessExit")
+        .expect("F9 AtomicWake handler terminator")
+        .0;
+    let address_pin = wake.find(".pin_atomic_u32(address.0)").unwrap();
+    let key = wake.find("self.atomic_key(address.0)").unwrap();
+    let output_range = wake.find("writable_u32_range(out_woken)").unwrap();
+    let output_pin = wake.find(".preflight_owned_output(output_range)").unwrap();
+    let dispatch = wake.find("wake_atomic_waiters(").unwrap();
+    assert!(
+        address_pin < key
+            && key < output_range
+            && output_range < output_pin
+            && output_pin < dispatch
+    );
+    assert!(
+        !wake[..dispatch].contains("count == 0"),
+        "count zero must not bypass address/key/output validation"
+    );
+}

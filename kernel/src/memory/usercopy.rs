@@ -860,6 +860,28 @@ mod tests {
     }
 
     #[test]
+    fn detached_atomic_word_pin_blocks_intersecting_mapping_mutation() {
+        let tracker = UserPinTracker::<1>::new();
+        let word = UserRange::new(
+            UserAddressSpace::x86_64_four_level(PAGE_SIZE).unwrap(),
+            PAGE_SIZE * 6 + 4,
+            4,
+            4,
+            UserAccess::READ,
+            EmptyAddressRule::Reject,
+        )
+        .unwrap();
+        let pin = tracker.pin_owned(word).unwrap();
+        assert!(matches!(
+            tracker.begin_mutation(PAGE_SIZE * 6, PAGE_SIZE),
+            Err(UserPinError::Conflict)
+        ));
+        tracker.release_owned(pin).unwrap();
+        let mutation = tracker.begin_mutation(PAGE_SIZE * 6, PAGE_SIZE).unwrap();
+        drop(mutation);
+    }
+
+    #[test]
     fn active_mutation_rejects_new_overlapping_pin() {
         let tracker = UserPinTracker::<2>::new();
         let mutation = tracker

@@ -25,7 +25,7 @@ fn embedded_identity_is_nonzero_and_panic_mapping_is_stable() {
 }
 
 #[test]
-fn all_twelve_central_selectors_have_exact_kernel_identities() {
+fn implemented_central_selectors_have_exact_kernel_identities() {
     let cases = [
         ("boot-handoff-pass", BuildGuestTest::BootHandoffPass, 1),
         ("exception-fail-path", BuildGuestTest::ExceptionFailPath, 2),
@@ -55,6 +55,7 @@ fn all_twelve_central_selectors_have_exact_kernel_identities() {
             11,
         ),
         ("task-user-exception", BuildGuestTest::TaskUserException, 12),
+        ("atomic-wait-wake", BuildGuestTest::AtomicWaitWake, 16),
     ];
     for (selector, identity, id) in cases {
         assert_eq!(parse_known_selector(selector), identity);
@@ -87,6 +88,7 @@ fn only_expected_invalid_opcode_is_classified_as_fail() {
         (BuildGuestTest::TaskSyscallSmoke, 6),
         (BuildGuestTest::TaskSyscallSanitize, 6),
         (BuildGuestTest::TaskUserException, 6),
+        (BuildGuestTest::AtomicWaitWake, 6),
     ] {
         assert_eq!(
             exception_outcome_for(test, vector),
@@ -132,6 +134,9 @@ fn memory_and_task_selectors_have_distinct_post_activation_dispatch() {
         assert!(!test.is_memory_foundation());
         assert!(test.is_task_userspace());
     }
+    assert!(!BuildGuestTest::AtomicWaitWake.is_memory_foundation());
+    assert!(!BuildGuestTest::AtomicWaitWake.is_task_userspace());
+    assert!(BuildGuestTest::AtomicWaitWake.is_f9_userspace());
     for test in [
         BuildGuestTest::BootHandoffPass,
         BuildGuestTest::ExceptionFailPath,

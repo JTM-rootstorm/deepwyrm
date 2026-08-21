@@ -371,6 +371,56 @@ fn replacement_publishes_model_and_lease_together() {
 }
 
 #[test]
+fn atomic_wait_key_uses_object_identity_and_byte_offset() {
+    let mut authority = TestObjects::<2, 4>::new();
+    let object = object(&mut authority, Protection::READ_WRITE);
+    let mut region = region::<2>(PAGE_SIZE, PAGE_SIZE * 4);
+    let token = authorization(&mut authority, object, &region, Protection::READ_WRITE);
+    let mut publisher = FakePublisher::for_region(&region);
+    test_map(
+        &mut region,
+        &mut authority,
+        &mut publisher,
+        PAGE_SIZE,
+        token,
+        PAGE_SIZE * 2,
+        PAGE_SIZE,
+        Protection::READ_WRITE,
+    )
+    .unwrap();
+    let alias = authorization(&mut authority, object, &region, Protection::READ_WRITE);
+    test_map(
+        &mut region,
+        &mut authority,
+        &mut publisher,
+        PAGE_SIZE * 2,
+        alias,
+        PAGE_SIZE * 2,
+        PAGE_SIZE,
+        Protection::READ_WRITE,
+    )
+    .unwrap();
+
+    let key = region.resolve_atomic_wait_key(PAGE_SIZE + 0x124).unwrap();
+    assert_eq!(key.object(), object.object_id().unwrap());
+    assert_eq!(key.object_offset(), PAGE_SIZE * 2 + 0x124);
+    assert_eq!(
+        region
+            .resolve_atomic_wait_key(PAGE_SIZE * 2 + 0x124)
+            .unwrap(),
+        key
+    );
+    assert_eq!(
+        region.resolve_atomic_wait_key(PAGE_SIZE + PAGE_SIZE - 2),
+        Err(AddressRegionError::Unmapped)
+    );
+    assert_eq!(
+        region.resolve_atomic_wait_key(u64::MAX - 1),
+        Err(AddressRegionError::Overflow)
+    );
+}
+
+#[test]
 fn mapping_authority_is_captured_across_protect_and_split_replacements() {
     let mut authority = TestObjects::<2, 8>::new();
     let object = object(&mut authority, Protection::READ_WRITE_EXECUTE);

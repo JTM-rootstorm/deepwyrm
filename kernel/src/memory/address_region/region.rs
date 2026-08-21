@@ -50,6 +50,44 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         &self.mappings
     }
 
+    /// Resolves one four-byte, readable mapped word to its stable object key.
+    ///
+    /// Callers must first validate and hold a live user-range pin for this
+    /// exact word.  That pin excludes overlapping publication, so the mapping
+    /// and its lease-backed `MemoryObject` remain stable through use of the
+    /// returned identity.
+    pub(crate) fn resolve_atomic_wait_key(
+        &self,
+        virtual_address: u64,
+    ) -> Result<AtomicWaitKey, AddressRegionError> {
+        const ATOMIC_WORD_BYTES: u64 = 4;
+
+        let end = virtual_address
+            .checked_add(ATOMIC_WORD_BYTES)
+            .ok_or(AddressRegionError::Overflow)?;
+        let mapping = self
+            .mappings
+            .iter()
+            .flatten()
+            .find(|mapping| {
+                mapping.virtual_start <= virtual_address
+                    && end <= mapping.end()
+                    && mapping.protection.contains(Protection::READ)
+            })
+            .ok_or(AddressRegionError::Unmapped)?;
+        let offset = virtual_address
+            .checked_sub(mapping.virtual_start)
+            .and_then(|offset| mapping.backing.object_offset().checked_add(offset))
+            .ok_or(AddressRegionError::Overflow)?;
+        let object = mapping
+            .object
+            .object_id()
+            .ok_or(AddressRegionError::Object(
+                MemoryObjectError::InvalidObjectKey,
+            ))?;
+        Ok(AtomicWaitKey::new(object, offset))
+    }
+
     /// Consumes one D3-resolved handle into a one-shot authorization bound to
     /// this exact region. The lookup pin becomes the mapping pre-publication
     /// lifetime owner; validation failure returns the resolved handle intact.

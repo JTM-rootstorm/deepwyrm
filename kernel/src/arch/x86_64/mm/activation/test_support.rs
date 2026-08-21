@@ -4,6 +4,10 @@ use super::*;
 #[path = "test_support/e7.rs"]
 mod e7;
 
+#[cfg(deepwyrm_f9_guest)]
+#[path = "test_support/f9.rs"]
+mod f9;
+
 #[cfg(all(feature = "test-support", target_os = "none", target_arch = "x86_64"))]
 struct ActiveRootTestAuthority<'a, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
     root: &'a PageTableRoot,
@@ -1364,6 +1368,18 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 {
     pub(crate) fn run_task_userspace_test(self, test: crate::test_support::BuildGuestTest) -> ! {
         e7::run_task_userspace_test(self, test)
+    }
+}
+
+#[cfg(deepwyrm_f9_guest)]
+impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>
+{
+    pub(crate) fn run_atomic_wait_userspace_test(
+        self,
+        test: crate::test_support::BuildGuestTest,
+    ) -> ! {
+        f9::run_atomic_wait_userspace_test(self, test)
     }
 }
 
