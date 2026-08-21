@@ -322,10 +322,26 @@ fn dw0c_memory_selectors_have_stable_build_owned_ids() {
 }
 
 #[test]
-fn dw0e_task_selectors_have_stable_build_owned_ids() {
+fn dw0e_task_selectors_distinguish_implemented_and_reserved_identities() {
     let config = workspace_root().join(HARNESS_CONFIG);
+    let selector = "task-syscall-smoke";
+    let test_id = 10;
+    let request_path = temp_file(
+        &request("guest-test", selector)
+            .replace("test_id = 1", &format!("test_id = {test_id}")),
+    );
+    let parsed = load_harness_request(&request_path).unwrap();
+    validate_guest_selector_metadata(&config, &parsed).unwrap();
+    assert_eq!(
+        guest_build_selection(HarnessKind::GuestTest, &parsed),
+        Some(GuestBuildSelection {
+            selector: selector.into(),
+            expected_test_id: test_id,
+        })
+    );
+    fs::remove_file(request_path).unwrap();
+
     for (selector, test_id) in [
-        ("task-syscall-smoke", 10),
         ("task-syscall-sanitize", 11),
         ("task-user-exception", 12),
     ] {
@@ -334,13 +350,12 @@ fn dw0e_task_selectors_have_stable_build_owned_ids() {
                 .replace("test_id = 1", &format!("test_id = {test_id}")),
         );
         let parsed = load_harness_request(&request_path).unwrap();
-        validate_guest_selector_metadata(&config, &parsed).unwrap();
-        assert_eq!(
-            guest_build_selection(HarnessKind::GuestTest, &parsed),
-            Some(GuestBuildSelection {
-                selector: selector.into(),
-                expected_test_id: test_id,
-            })
+        let error = validate_guest_selector_metadata(&config, &parsed)
+            .expect_err("reserved DW0-E selector must not produce a runnable artifact");
+        assert!(
+            error
+                .to_string()
+                .contains("is reserved and has no runnable artifact")
         );
         fs::remove_file(request_path).unwrap();
     }

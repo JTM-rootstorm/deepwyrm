@@ -219,8 +219,6 @@ fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
         ("memory-user-kernel-isolation", 8),
         ("memory-shared-memory-object", 9),
         ("task-syscall-smoke", 10),
-        ("task-syscall-sanitize", 11),
-        ("task-user-exception", 12),
         ("ipc-blocking-smoke", 13),
         ("atomic-wait-wake", 16),
     ] {
@@ -231,6 +229,8 @@ fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
         );
     }
     for selector in [
+        "task-syscall-sanitize",
+        "task-user-exception",
         "ipc-transfer-rollback",
         "wait-deadline-timer",
         "process-create-bootstrap",

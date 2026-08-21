@@ -80,11 +80,11 @@ state = "implemented"
 
 [guest_test.task-syscall-sanitize]
 id = 11
-state = "implemented"
+state = "reserved"
 
 [guest_test.task-user-exception]
 id = 12
-state = "implemented"
+state = "reserved"
 
 # DW0-F reserved IPC/blocking identities. F0 reserves these IDs only; target
 # dispatch is added later when each selector has a real guest body.
