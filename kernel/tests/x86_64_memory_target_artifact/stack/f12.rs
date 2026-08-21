@@ -107,6 +107,9 @@ pub(crate) fn validate_f12_stack_context_evidence(
     let timer_set = symbol("F12 Timer set transaction", &|name| {
         name == "<deepwyrm_kernel::time::timer::TimerAuthority<1>>::set::<4>"
     });
+    let timer_set_locked = symbol("F12 locked Timer set transaction", &|name| {
+        name == "<deepwyrm_kernel::time::timer::TimerAuthority<1>>::set_with_readiness_hook::<4, <deepwyrm_kernel::time::timer::TimerAuthority<1>>::set<4>::{closure#0}>"
+    });
     let timer_cancel = symbol("F12 Timer cancellation transaction", &|name| {
         name == "<deepwyrm_kernel::time::timer::TimerAuthority<1>>::cancel"
     });
@@ -148,11 +151,12 @@ pub(crate) fn validate_f12_stack_context_evidence(
         vec![cancel_live_wait_deadline.clone()],
     );
     runtime_resolutions.insert(cancel_atomic_wait_deadline, vec![cancel_live_wait_deadline]);
-    // The F12 service and central finalizer construct only
-    // `LiveTimerDeadlineAuthority`. These three erased calls cover the public
-    // Timer route and typed Timer cleanup even though selector 13 chooses the
-    // Event branch of the Event-or-Timer scenario.
-    runtime_resolutions.insert(timer_set, vec![replace_live_timer_deadline]);
+    // The accepted artifact loads the locked set helper through an immutable
+    // call slot, which the artifact resolver converts into a direct edge from
+    // the public wrapper. The helper owns the one remaining erased deadline
+    // call. The F12 service constructs only `LiveTimerDeadlineAuthority`, so
+    // that exact indirect owner has the one emitted replacement target.
+    runtime_resolutions.insert(timer_set_locked.clone(), vec![replace_live_timer_deadline]);
     runtime_resolutions.insert(timer_cancel, vec![cancel_live_timer_deadline.clone()]);
     runtime_resolutions.insert(timer_finalization, vec![cancel_live_timer_deadline]);
     // Debug codegen spills these two statically typed guard-method addresses
@@ -165,6 +169,14 @@ pub(crate) fn validate_f12_stack_context_evidence(
         vec![scheduler_guard_deref_mut.clone(); 2],
     );
     let graph = DirectCallGraph::new(sizes, disassembly);
+    assert!(
+        graph.reaches(
+            "F12 Timer set wrapper",
+            |name| name == timer_set,
+            |name| name == timer_set_locked,
+        ),
+        "F12 public Timer set wrapper does not reach its accepted locked helper"
+    );
     let mut runtime_graph = graph.with_resolutions(&runtime_resolutions);
     let fresh = runtime_graph.stack_bound("F12 fresh-thread path", |name| name == first_run);
     let syscall =

@@ -920,6 +920,53 @@ fn direct_call_stack_path_accepts_an_exact_linear_indirect_resolution() {
 }
 
 #[test]
+fn direct_call_stack_path_binds_a_typed_resolution_to_its_exact_indirect_owner() {
+    let sizes = [
+        StackSize {
+            bytes: 16,
+            symbol: "wrapper".to_owned(),
+        },
+        StackSize {
+            bytes: 32,
+            symbol: "locked-helper".to_owned(),
+        },
+        StackSize {
+            bytes: 64,
+            symbol: "typed-target".to_owned(),
+        },
+    ];
+    let disassembly = "Disassembly of section .text:\n\n0000 <wrapper>:\n  0:\tcall\t0x10 <locked-helper>\n\n0010 <locked-helper>:\n 10:\tcall\trax\n\n0020 <typed-target>:\n";
+    let wrong_owner = BTreeMap::from([("wrapper".to_owned(), vec!["typed-target".to_owned()])]);
+    let rejected = std::panic::catch_unwind(|| {
+        direct_call_stack_bound_with_resolutions(
+            &sizes,
+            disassembly,
+            "wrong indirect owner",
+            |symbol| symbol == "wrapper",
+            &wrong_owner,
+        )
+    });
+    assert!(rejected.is_err());
+
+    let exact_owner =
+        BTreeMap::from([("locked-helper".to_owned(), vec!["typed-target".to_owned()])]);
+    assert_eq!(
+        direct_call_stack_bound_with_resolutions(
+            &sizes,
+            disassembly,
+            "exact indirect owner",
+            |symbol| symbol == "wrapper",
+            &exact_owner,
+        ),
+        DirectCallStackBound {
+            bytes: 112,
+            call_count: 2,
+            terminal: "typed-target".to_owned(),
+        }
+    );
+}
+
+#[test]
 fn resolved_terminal_reaper_graph_reuses_bounded_memoized_states() {
     let sizes = [
         StackSize {
