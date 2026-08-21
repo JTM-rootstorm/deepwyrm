@@ -14,9 +14,9 @@ This record closes DW0-F14 and the DW0-F milestone. It does not establish DW0-G 
 
 All mutable host build/test state was directed to project-local task-owned paths. Deepwyrm and Wyrmroot were clean before the paired VM run. Host logs are under `deepwyrm/.artifacts/f14-validation/`; coordinator VM evidence is under workspace `.artifacts/f14-validation/vm-run/`.
 
-The project-local evidence manifest is `.artifacts/f14-validation/F14_EVIDENCE_MANIFEST.txt`, SHA-256 `ea10a6493a397aa48c6f195df963b3183384cf2079363fcdf7f4a76dd1587d07`.
+The project-local evidence manifest is `.artifacts/f14-validation/F14_EVIDENCE_MANIFEST.txt`, SHA-256 `8e757e20db04a2a909665161cf56713b9e8f26ba8a4e196c2176fcc25c9d260e`.
 
-Its standard hash list has SHA-256 `07927cdc511030ac98b9c9c8f936f270ab4fb1399f553fbefd561d6f2e2dbc28`; `sha256sum -c` reproduced every retained entry and its verification log has SHA-256 `57372887381d2e825b3c6bbc5e56379878b5e70e408b3ff134c9bb687a41a9cf`.
+Its standard hash list has SHA-256 `921cbca5727954def20949523c51d4bc9c3ef473f25392a954b0ac3bb0e34c02`; `sha256sum -c` reproduced every retained entry and its verification log has SHA-256 `0c9820def8ae59725653ee0ce30c218450c85486922d297a8e7ad5ffd65f8041`.
 
 The final audited root `DW0_F_IMPLEMENTATION_PLAN.md` has SHA-256 `2b2de0a79efc8087b45693da8a223bf8e956dbeaf2a4fd076dda31d262157b26`. Every F0-F14 checklist item was checked against durable repository/evidence records before standalone-plan retirement.
 
