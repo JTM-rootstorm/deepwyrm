@@ -43,3 +43,5 @@ The purpose of ABI 0 is to learn from real code, tests, and hardware rather than
 
 - [`DW0_D0_OBJECT_HANDLE_CONTRACT.md`](DW0_D0_OBJECT_HANDLE_CONTRACT.md) defines the locked DW0-D object/handle rights, liveness, reclamation, mapping-pin, transaction, and downstream-preservation contract. Read it before DW0-D implementation.
 - [`DW0_E0_TASK_SYSCALL_CONTRACT.md`](DW0_E0_TASK_SYSCALL_CONTRACT.md) defines the locked DW0-E task lifecycle/ownership, typed construction/finalization, public `process_create` staging, and x86_64 CPL3/syscall-entry contract. Read it before DW0-E implementation.
+- [`DW0_F0_IPC_WAIT_CONTRACT.md`](DW0_F0_IPC_WAIT_CONTRACT.md) defines the locked DW0-F Channel, transfer, blocking, wait/time, and public `process_create` transaction contract. Read it before changing F-era IPC/task publication semantics.
+- [`DW0_G0_PRIMORDIAL_STARTUP_CONTRACT.md`](DW0_G0_PRIMORDIAL_STARTUP_CONTRACT.md) defines the paired primordial ELF, startup stack/registers, initial capability set, bootstrap handshake, bootfs lifetime, and rollback contract. Read it before DW0-G implementation.
