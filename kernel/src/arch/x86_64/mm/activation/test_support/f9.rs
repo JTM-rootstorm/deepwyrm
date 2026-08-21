@@ -19,7 +19,7 @@ use crate::wait::WaitRegistry;
 use deepwyrm_abi::{
     DW_STATUS_BAD_ADDRESS, DW_STATUS_BAD_STATE, DW_STATUS_NO_RESOURCES, DW_STATUS_NOT_SUPPORTED,
     DW_STATUS_SUCCESS, DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK, DW_TASK_STATE_EXITED,
-    DW_TERMINATION_AUTHORIZED, DW_TERMINATION_NORMAL_EXIT, DwDeadline, DwStatus, DwUserAddress,
+    DW_TERMINATION_AUTHORIZED, DW_TERMINATION_NORMAL_EXIT, DwDeadline, DwStatus,
 };
 
 const REGISTRY_OBJECTS: usize = 10;
@@ -602,20 +602,6 @@ fn atomic_begin_error_status(error: crate::atomic_wait::AtomicWaitBeginError) ->
     }
 }
 
-fn writable_u32_range(address: DwUserAddress) -> Result<UserRange, DwStatus> {
-    let user = UserAddressSpace::x86_64_four_level(PAGE_SIZE)
-        .expect("live x86_64 user address-space constants remain valid");
-    UserRange::new(
-        user,
-        address.0,
-        core::mem::size_of::<u32>() as u64,
-        core::mem::align_of::<u32>() as u64,
-        UserAccess::WRITE,
-        EmptyAddressRule::Reject,
-    )
-    .map_err(|_| DW_STATUS_BAD_ADDRESS)
-}
-
 struct F9TerminalAtomicCleanup<'a, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 {
     active: &'a mut ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
@@ -746,62 +732,43 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                 if self.current_thread() != self.threads[1] || self.wake_seen {
                     fail(0xa7);
                 }
-                let pin = match self
-                    .active
-                    .current_process_address_space(self.process)
-                    .pin_atomic_u32(address.0)
-                {
-                    Ok(pin) => pin,
-                    Err(_) => return NativeSyscallResult::returning(DW_STATUS_BAD_ADDRESS),
-                };
-                let key = match self.atomic_key(address.0) {
-                    Ok(key) => key,
-                    Err(status) => {
-                        self.release_atomic_pin(pin);
-                        return NativeSyscallResult::returning(status);
-                    }
-                };
-                let output_range = match writable_u32_range(out_woken) {
-                    Ok(range) => range,
-                    Err(status) => {
-                        self.release_atomic_pin(pin);
-                        return NativeSyscallResult::returning(status);
-                    }
-                };
-                let output = match self
-                    .active
-                    .current_process_address_space(self.process)
-                    .preflight_owned_output(output_range)
-                {
-                    Ok(output) => output,
-                    Err(_) => {
-                        self.release_atomic_pin(pin);
-                        return NativeSyscallResult::returning(DW_STATUS_BAD_ADDRESS);
-                    }
-                };
-                let woken = match crate::atomic_wait::wake_atomic_waiters(
-                    &self.atomic_waits,
-                    &self.execution,
-                    key,
+                let process = self.process;
+                let regions = &self.regions;
+                let tasks = &self.tasks;
+                let atomic_waits = &self.atomic_waits;
+                let execution = &self.execution;
+                let mut observed_woken = None;
+                let mut user = self.active.current_process_address_space(process);
+                let status = crate::syscall::atomic_wake_with(
+                    &mut user,
+                    address,
                     count,
-                ) {
-                    Ok(woken) => woken,
-                    Err(error) => {
-                        let status = atomic_begin_error_status(error);
-                        let mut user = self.active.current_process_address_space(self.process);
-                        user.discard_owned_output(output)
-                            .unwrap_or_else(|_| fail(0xa8));
-                        user.release_atomic_u32(pin).unwrap_or_else(|_| fail(0xa9));
-                        return NativeSyscallResult::returning(status);
-                    }
-                };
-                {
-                    let mut user = self.active.current_process_address_space(self.process);
-                    user.release_atomic_u32(pin).unwrap_or_else(|_| fail(0xaa));
-                    user.commit_owned_output(output, &crate::syscall::encode_u32(woken))
-                        .unwrap_or_else(|_| fail(0xab));
+                    out_woken,
+                    |user, address| {
+                        user.pin_atomic_u32(address.0)
+                            .map_err(|_| DW_STATUS_BAD_ADDRESS)
+                    },
+                    |address, _pin| {
+                        regions
+                            .resolve_atomic_wait_key_for_live_process(tasks, process, address.0)
+                            .map_err(|_| DW_STATUS_BAD_ADDRESS)
+                    },
+                    |user, pin| {
+                        user.release_atomic_u32(pin).unwrap_or_else(|_| fail(0xa8));
+                    },
+                    |key, count| {
+                        crate::atomic_wait::wake_atomic_waiters(atomic_waits, execution, key, count)
+                            .map(|woken| {
+                                observed_woken = Some(woken);
+                                woken
+                            })
+                            .map_err(atomic_begin_error_status)
+                    },
+                );
+                if status != DW_STATUS_SUCCESS {
+                    return NativeSyscallResult::returning(status);
                 }
-                if woken != 1 {
+                if observed_woken != Some(1) {
                     fail(0xac);
                 }
                 self.wake_seen = true;

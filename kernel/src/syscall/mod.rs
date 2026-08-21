@@ -11,7 +11,7 @@ mod abi_bytes;
 mod adapters;
 
 #[cfg(deepwyrm_f9_guest)]
-pub(crate) use abi_bytes::encode_u32;
+pub(crate) use adapters::atomic_wake_with;
 #[allow(
     unused_imports,
     reason = "F7 native wait runtime ownership is consumed by the later freestanding F guest runtime"

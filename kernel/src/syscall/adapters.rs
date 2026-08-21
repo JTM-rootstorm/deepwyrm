@@ -71,7 +71,8 @@ use super::abi_bytes::{
     HANDLE_TRANSFER_BYTES, PROCESS_CREATE_ARGS_BYTES, THREAD_START_BYTES, WAIT_ITEM_BYTES,
     decode_handle_transfer, decode_process_create_args, decode_thread_start, decode_wait_item,
     encode_abi_info, encode_channel_receive_result, encode_handle, encode_object_info,
-    encode_process_create_result, encode_received_handle_info, encode_u64, encode_wait_result,
+    encode_process_create_result, encode_received_handle_info, encode_u32, encode_u64,
+    encode_wait_result,
 };
 
 #[must_use = "typed final releases must be routed after syscall pins/locks are dropped"]
@@ -347,6 +348,70 @@ pub(crate) fn clock_get_with<U: UserPageAccess>(
         Err(status) => return status,
     };
     output.commit(&encode_u64(nanoseconds));
+    DW_STATUS_SUCCESS
+}
+
+/// Runs the mutation-sensitive half of `atomic_wake` as one ordered adapter
+/// transaction.
+///
+/// The mapping pin and stable wait key are acquired before the output is
+/// preflighted, preserving the F0 address-identity ordering even for a zero
+/// wake count. The wake authority is not invoked until every recoverable
+/// output fault has been excluded. The live mapping pin is released before
+/// the infallible copyout commit and on every failure after acquisition.
+pub(crate) fn atomic_wake_with<U, PIN, KEY>(
+    user: &mut U,
+    address: DwUserAddress,
+    count: u32,
+    out_woken: DwUserAddress,
+    pin_address: impl FnOnce(&mut U, DwUserAddress) -> Result<PIN, DwStatus>,
+    resolve_key: impl FnOnce(DwUserAddress, &PIN) -> Result<KEY, DwStatus>,
+    release_pin: impl FnOnce(&mut U, PIN),
+    wake: impl FnOnce(KEY, u32) -> Result<u32, DwStatus>,
+) -> DwStatus
+where
+    U: OwnedUserOutputAccess,
+{
+    let pin = match pin_address(user, address) {
+        Ok(pin) => pin,
+        Err(status) => return status,
+    };
+    let key = match resolve_key(address, &pin) {
+        Ok(key) => key,
+        Err(status) => {
+            release_pin(user, pin);
+            return status;
+        }
+    };
+    let output_range = match user_range(
+        out_woken,
+        core::mem::size_of::<u32>(),
+        core::mem::align_of::<u32>() as u64,
+        UserAccess::WRITE,
+    ) {
+        Ok(range) => range,
+        Err(status) => {
+            release_pin(user, pin);
+            return status;
+        }
+    };
+    let output = match user.preflight_owned_output(output_range) {
+        Ok(output) => output,
+        Err(_) => {
+            release_pin(user, pin);
+            return DW_STATUS_BAD_ADDRESS;
+        }
+    };
+    let woken = match wake(key, count) {
+        Ok(woken) => woken,
+        Err(status) => {
+            user.discard_owned_output(output);
+            release_pin(user, pin);
+            return status;
+        }
+    };
+    release_pin(user, pin);
+    user.commit_owned_output(output, &encode_u32(woken));
     DW_STATUS_SUCCESS
 }
 

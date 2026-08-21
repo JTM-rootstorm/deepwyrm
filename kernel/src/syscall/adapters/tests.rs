@@ -17,6 +17,7 @@ struct FakeUserMemory {
     bytes: [u8; BYTES],
     deny_read: bool,
     deny_write: bool,
+    deny_write_at: Option<u64>,
     owned_outputs: usize,
 }
 
@@ -39,6 +40,7 @@ impl FakeUserMemory {
             bytes: [0; BYTES],
             deny_read: false,
             deny_write: false,
+            deny_write_at: None,
             owned_outputs: 0,
         }
     }
@@ -47,6 +49,16 @@ impl FakeUserMemory {
         let offset = usize::try_from(address - BASE).unwrap();
         assert!(offset + len <= BYTES);
         offset
+    }
+
+    fn write_is_denied(&self, address: u64, byte_len: u64) -> bool {
+        self.deny_write
+            || self.deny_write_at.is_some_and(|denied| {
+                let end = address
+                    .checked_add(byte_len)
+                    .expect("fake user write range cannot overflow");
+                address <= denied && denied < end
+            })
     }
 }
 
@@ -69,7 +81,9 @@ impl OwnedUserOutputAccess for FakeUserMemory {
         &mut self,
         range: UserRange,
     ) -> Result<Self::OwnedOutput, Self::Error> {
-        if !range.access().includes(UserAccess::WRITE) || self.deny_write {
+        if !range.access().includes(UserAccess::WRITE)
+            || self.write_is_denied(range.start(), range.byte_len())
+        {
             return Err(());
         }
         let len = usize::try_from(range.byte_len()).map_err(|_| ())?;
@@ -141,7 +155,11 @@ impl PinnedUserPages for FakePinned<'_> {
         if self.memory.deny_read && chunk.access().includes(UserAccess::READ) {
             return Err(());
         }
-        if self.memory.deny_write && chunk.access().includes(UserAccess::WRITE) {
+        if chunk.access().includes(UserAccess::WRITE)
+            && self
+                .memory
+                .write_is_denied(chunk.address(), chunk.byte_len())
+        {
             return Err(());
         }
         let _ = FakeUserMemory::offset(chunk.address(), usize::try_from(chunk.byte_len()).unwrap());
@@ -164,7 +182,11 @@ impl PinnedUserBatchPages for FakePinnedBatch<'_> {
 
     fn preflight(&mut self, index: usize, chunk: UserPageChunk) -> Result<(), Self::Error> {
         let range = self.ranges.get(index).copied().flatten().ok_or(())?;
-        if self.memory.deny_write && chunk.access().includes(UserAccess::WRITE) {
+        if chunk.access().includes(UserAccess::WRITE)
+            && self
+                .memory
+                .write_is_denied(chunk.address(), chunk.byte_len())
+        {
             return Err(());
         }
         let end = chunk.address().checked_add(chunk.byte_len()).ok_or(())?;
@@ -280,6 +302,217 @@ fn clock_get_validates_domain_and_output_before_reading_clock() {
         DW_STATUS_SUCCESS
     );
     assert_eq!(u64_at(&user, BASE + 0x40), 0x1122_3344_5566_7788);
+}
+
+#[test]
+fn atomic_wake_zero_count_preserves_address_key_output_and_dispatch_order() {
+    use std::cell::RefCell;
+
+    let mut user = FakeUserMemory::new();
+    let trace = RefCell::new(std::vec::Vec::new());
+    let out_woken = BASE + 0x80;
+    user.bytes[FakeUserMemory::offset(out_woken, 4)..FakeUserMemory::offset(out_woken, 4) + 4]
+        .fill(0xa5);
+
+    assert_eq!(
+        atomic_wake_with(
+            &mut user,
+            DwUserAddress(BASE + 0x40),
+            0,
+            DwUserAddress(out_woken),
+            |_, address| {
+                trace.borrow_mut().push("pin");
+                assert_eq!(address, DwUserAddress(BASE + 0x40));
+                Ok(0x11_u32)
+            },
+            |address, pin| {
+                trace.borrow_mut().push("key");
+                assert_eq!(address, DwUserAddress(BASE + 0x40));
+                assert_eq!(*pin, 0x11);
+                Ok(0x22_u32)
+            },
+            |_, pin| {
+                trace.borrow_mut().push("release");
+                assert_eq!(pin, 0x11);
+            },
+            |key, count| {
+                trace.borrow_mut().push("wake");
+                assert_eq!(key, 0x22);
+                assert_eq!(count, 0);
+                Ok(0)
+            },
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(&*trace.borrow(), &["pin", "key", "wake", "release"]);
+    assert_eq!(u32_at(&user, out_woken), 0);
+    assert_eq!(user.owned_outputs, 0);
+}
+
+#[test]
+fn atomic_wake_validation_failures_release_pins_without_wake_or_copyout() {
+    use std::cell::RefCell;
+
+    let out_woken = BASE + 0x80;
+
+    let mut user = FakeUserMemory::new();
+    user.bytes[FakeUserMemory::offset(out_woken, 4)..FakeUserMemory::offset(out_woken, 4) + 4]
+        .fill(0xa5);
+    let trace = RefCell::new(std::vec::Vec::new());
+    assert_eq!(
+        atomic_wake_with(
+            &mut user,
+            DwUserAddress(BASE + 0x40),
+            1,
+            DwUserAddress(out_woken),
+            |_, _| {
+                trace.borrow_mut().push("pin");
+                Err::<u32, _>(DW_STATUS_BAD_ADDRESS)
+            },
+            |_, _| {
+                trace.borrow_mut().push("key");
+                Ok(0_u32)
+            },
+            |_, _| trace.borrow_mut().push("release"),
+            |_, _| {
+                trace.borrow_mut().push("wake");
+                Ok(1)
+            },
+        ),
+        DW_STATUS_BAD_ADDRESS
+    );
+    assert_eq!(&*trace.borrow(), &["pin"]);
+    assert_eq!(
+        &user.bytes[FakeUserMemory::offset(out_woken, 4)..][..4],
+        &[0xa5; 4]
+    );
+
+    let trace = RefCell::new(std::vec::Vec::new());
+    assert_eq!(
+        atomic_wake_with(
+            &mut user,
+            DwUserAddress(BASE + 0x40),
+            1,
+            DwUserAddress(out_woken),
+            |_, _| {
+                trace.borrow_mut().push("pin");
+                Ok(0x11_u32)
+            },
+            |_, _| {
+                trace.borrow_mut().push("key");
+                Err::<u32, _>(DW_STATUS_BAD_ADDRESS)
+            },
+            |_, pin| {
+                trace.borrow_mut().push("release");
+                assert_eq!(pin, 0x11);
+            },
+            |_, _| {
+                trace.borrow_mut().push("wake");
+                Ok(1)
+            },
+        ),
+        DW_STATUS_BAD_ADDRESS
+    );
+    assert_eq!(&*trace.borrow(), &["pin", "key", "release"]);
+    assert_eq!(
+        &user.bytes[FakeUserMemory::offset(out_woken, 4)..][..4],
+        &[0xa5; 4]
+    );
+
+    for denied_output in [DwUserAddress(out_woken + 1), DwUserAddress(out_woken)] {
+        user.deny_write_at = (denied_output == DwUserAddress(out_woken)).then_some(out_woken);
+        let trace = RefCell::new(std::vec::Vec::new());
+        assert_eq!(
+            atomic_wake_with(
+                &mut user,
+                DwUserAddress(BASE + 0x40),
+                1,
+                denied_output,
+                |_, _| {
+                    trace.borrow_mut().push("pin");
+                    Ok(0x11_u32)
+                },
+                |_, _| {
+                    trace.borrow_mut().push("key");
+                    Ok(0x22_u32)
+                },
+                |_, pin| {
+                    trace.borrow_mut().push("release");
+                    assert_eq!(pin, 0x11);
+                },
+                |_, _| {
+                    trace.borrow_mut().push("wake");
+                    Ok(1)
+                },
+            ),
+            DW_STATUS_BAD_ADDRESS
+        );
+        assert_eq!(&*trace.borrow(), &["pin", "key", "release"]);
+        assert_eq!(
+            &user.bytes[FakeUserMemory::offset(out_woken, 4)..][..4],
+            &[0xa5; 4]
+        );
+        assert_eq!(user.owned_outputs, 0);
+    }
+}
+
+#[test]
+fn atomic_wake_failure_discards_output_and_success_commits_exact_count() {
+    use std::cell::RefCell;
+
+    let mut user = FakeUserMemory::new();
+    let out_woken = BASE + 0x80;
+    user.bytes[FakeUserMemory::offset(out_woken, 4)..FakeUserMemory::offset(out_woken, 4) + 4]
+        .fill(0xa5);
+    let trace = RefCell::new(std::vec::Vec::new());
+    assert_eq!(
+        atomic_wake_with(
+            &mut user,
+            DwUserAddress(BASE + 0x40),
+            3,
+            DwUserAddress(out_woken),
+            |_, _| {
+                trace.borrow_mut().push("pin");
+                Ok(0x11_u32)
+            },
+            |_, _| {
+                trace.borrow_mut().push("key");
+                Ok(0x22_u32)
+            },
+            |_, _| trace.borrow_mut().push("release"),
+            |key, count| {
+                trace.borrow_mut().push("wake");
+                assert_eq!((key, count), (0x22, 3));
+                Err(DW_STATUS_BAD_STATE)
+            },
+        ),
+        DW_STATUS_BAD_STATE
+    );
+    assert_eq!(&*trace.borrow(), &["pin", "key", "wake", "release"]);
+    assert_eq!(
+        &user.bytes[FakeUserMemory::offset(out_woken, 4)..][..4],
+        &[0xa5; 4]
+    );
+    assert_eq!(user.owned_outputs, 0);
+
+    assert_eq!(
+        atomic_wake_with(
+            &mut user,
+            DwUserAddress(BASE + 0x40),
+            3,
+            DwUserAddress(out_woken),
+            |_, _| Ok(0x11_u32),
+            |_, _| Ok(0x22_u32),
+            |_, pin| assert_eq!(pin, 0x11),
+            |key, count| {
+                assert_eq!((key, count), (0x22, 3));
+                Ok(2)
+            },
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(u32_at(&user, out_woken), 2);
+    assert_eq!(user.owned_outputs, 0);
 }
 
 type Tasks = TaskAuthority<2, 2, 2, 8>;
@@ -2914,6 +3147,277 @@ fn channel_peer_self_reference_is_rejected_but_sending_endpoint_move_succeeds() 
             process,
             process_handle,
             &mut cleanup
+        ),
+        DW_STATUS_SUCCESS
+    );
+}
+
+#[test]
+fn channel_receive_denied_outputs_preserve_head_transfer_and_receiver_table() {
+    use deepwyrm_abi::{
+        DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_EVENT, DW_RIGHT_INSPECT, DW_RIGHT_READ,
+        DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE,
+    };
+
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let channels = ChannelAuthority::<2, 4>::new();
+    let waits = WaitRegistry::<8>::new();
+    let events = EventAuthority::<2>::new();
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let mut user = FakeUserMemory::new();
+    let mut cleanup = CleanupQueue::<16>::new();
+    assert_eq!(
+        channel_create(
+            &mut user,
+            &mut registry,
+            &channels,
+            &mut tasks,
+            process,
+            DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0),
+            DwUserAddress(BASE + 0x180),
+            DwUserAddress(BASE + 0x188),
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let endpoint0 = DwHandle(u64_at(&user, BASE + 0x180));
+    let endpoint1 = DwHandle(u64_at(&user, BASE + 0x188));
+    let receiver_pin = tasks
+        .process_handles(process)
+        .unwrap()
+        .lookup(
+            &mut registry,
+            endpoint1,
+            AcceptedObjectTypes::One(DW_OBJECT_TYPE_CHANNEL),
+            DW_RIGHT_READ,
+        )
+        .unwrap();
+    let receiver_key = ChannelEndpointKey::from_object_id(receiver_pin.object_id());
+
+    let source = install_event_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &events,
+        DwRights(DW_RIGHT_WAIT.0 | DW_RIGHT_TRANSFER.0 | DW_RIGHT_INSPECT.0),
+    );
+    write_handle_transfer(
+        &mut user,
+        BASE + 0x300,
+        deepwyrm_abi::DwHandleTransferV1 {
+            handle: source,
+            requested_rights: DwRights(DW_RIGHT_WAIT.0 | DW_RIGHT_INSPECT.0),
+            operation: DW_HANDLE_TRANSFER_MOVE,
+            reserved0: 0,
+            reserved: [0; 2],
+        },
+    );
+    let head_input = FakeUserMemory::offset(BASE + 0x380, 4);
+    user.bytes[head_input..head_input + 4].copy_from_slice(b"head");
+    let tail_input = FakeUserMemory::offset(BASE + 0x390, 4);
+    user.bytes[tail_input..tail_input + 4].copy_from_slice(b"tail");
+    let mut staging = std::vec![0_u8; DW_CHANNEL_MAX_PAYLOAD as usize];
+    assert_eq!(
+        channel_send(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            endpoint0,
+            DwUserAddress(BASE + 0x380),
+            4,
+            DwUserAddress(BASE + 0x300),
+            1,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(
+        channel_send(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            endpoint0,
+            DwUserAddress(BASE + 0x390),
+            4,
+            DwUserAddress(0),
+            0,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(
+        tasks
+            .process_handles(process)
+            .unwrap()
+            .inspect_basic(source),
+        Err(HandleTableError::InvalidHandle)
+    );
+    let receiver_handle_count = tasks.process_handle_count(process).unwrap();
+
+    let out_bytes = BASE + 0x500;
+    let out_handles = BASE + 0x580;
+    let out_result = BASE + 0x680;
+    let byte_output = FakeUserMemory::offset(out_bytes, 4);
+    let handle_output =
+        FakeUserMemory::offset(out_handles, DW_RECEIVED_HANDLE_INFO_V1_SIZE as usize);
+    let result_output =
+        FakeUserMemory::offset(out_result, DW_CHANNEL_RECEIVE_RESULT_V1_SIZE as usize);
+    for denied in [out_result, out_bytes, out_handles] {
+        user.bytes[byte_output..byte_output + 4].fill(0xa5);
+        user.bytes[handle_output..handle_output + DW_RECEIVED_HANDLE_INFO_V1_SIZE as usize]
+            .fill(0xa5);
+        user.bytes[result_output..result_output + DW_CHANNEL_RECEIVE_RESULT_V1_SIZE as usize]
+            .fill(0xa5);
+        user.deny_write_at = Some(denied);
+        assert_eq!(
+            channel_receive(
+                &mut user,
+                &mut staging,
+                &mut registry,
+                &channels,
+                &waits,
+                &mut tasks,
+                &execution,
+                process,
+                endpoint1,
+                DwUserAddress(out_bytes),
+                4,
+                DwUserAddress(out_handles),
+                1,
+                DwUserAddress(out_result),
+                &mut cleanup,
+            ),
+            DW_STATUS_BAD_ADDRESS
+        );
+        user.deny_write_at = None;
+
+        assert!(
+            user.bytes[byte_output..byte_output + 4]
+                .iter()
+                .all(|byte| *byte == 0xa5)
+        );
+        assert!(
+            user.bytes[handle_output..handle_output + DW_RECEIVED_HANDLE_INFO_V1_SIZE as usize]
+                .iter()
+                .all(|byte| *byte == 0xa5)
+        );
+        assert!(
+            user.bytes[result_output..result_output + DW_CHANNEL_RECEIVE_RESULT_V1_SIZE as usize]
+                .iter()
+                .all(|byte| *byte == 0xa5)
+        );
+        assert_eq!(
+            tasks.process_handle_count(process).unwrap(),
+            receiver_handle_count
+        );
+        let head = channels.peek_receive(receiver_key).unwrap();
+        assert_eq!(head.required_bytes, 4);
+        assert_eq!(head.required_handles, 1);
+    }
+
+    assert_eq!(
+        channel_receive(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            endpoint1,
+            DwUserAddress(out_bytes),
+            4,
+            DwUserAddress(out_handles),
+            1,
+            DwUserAddress(out_result),
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(&user.bytes[byte_output..byte_output + 4], b"head");
+    let received = DwHandle(u64_at(&user, out_handles));
+    assert_eq!(
+        tasks
+            .process_handles(process)
+            .unwrap()
+            .inspect_basic(received)
+            .unwrap()
+            .rights,
+        DwRights(DW_RIGHT_WAIT.0 | DW_RIGHT_INSPECT.0)
+    );
+    assert_eq!(u32_at(&user, out_handles + 16), DW_OBJECT_TYPE_EVENT.0);
+    assert_eq!(
+        tasks.process_handle_count(process).unwrap(),
+        receiver_handle_count + 1
+    );
+    assert_eq!(u32_at(&user, out_result + 8), 4);
+    assert_eq!(u32_at(&user, out_result + 12), 1);
+
+    assert_eq!(
+        channel_receive(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            endpoint1,
+            DwUserAddress(out_bytes),
+            4,
+            DwUserAddress(0),
+            0,
+            DwUserAddress(out_result),
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(&user.bytes[byte_output..byte_output + 4], b"tail");
+    assert_eq!(u32_at(&user, out_result + 12), 0);
+
+    close_event_for_test(&mut registry, &mut tasks, process, &events, received);
+    assert!(
+        registry
+            .release_internal(receiver_pin.into_internal())
+            .unwrap()
+            .is_none()
+    );
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        endpoint0,
+    );
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        endpoint1,
+    );
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup,
         ),
         DW_STATUS_SUCCESS
     );
