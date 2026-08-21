@@ -453,7 +453,7 @@ pub(crate) fn build_f12_user_artifact(
          __dw_test_f12_user_blob_start:\n",
     );
     for line in assembler_constants {
-        composite.push_str(&line);
+        composite.push_str(line);
         composite.push('\n');
     }
     composite.push_str(&body);
