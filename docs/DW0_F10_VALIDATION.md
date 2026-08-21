@@ -113,8 +113,8 @@ cancellation.
 
 ## Validation commands
 
-All mutable build state was kept under project-local `.tmp/` paths. The
-following gates passed:
+All mutable build state was kept under project-local `.tmp/` paths and the
+isolated `target/f10-tests` focused-test path. The following gates passed:
 
 ```text
 cargo fmt --all -- --check
