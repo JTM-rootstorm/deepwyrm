@@ -26,6 +26,7 @@ pub(crate) enum BuildGuestTest {
     TaskSyscallSmoke,
     TaskSyscallSanitize,
     TaskUserException,
+    IpcBlockingSmoke,
     AtomicWaitWake,
 }
 
@@ -81,6 +82,7 @@ impl BuildGuestTest {
             Self::TaskSyscallSmoke => 10,
             Self::TaskSyscallSanitize => 11,
             Self::TaskUserException => 12,
+            Self::IpcBlockingSmoke => 13,
             Self::AtomicWaitWake => 16,
         }
     }
@@ -94,6 +96,10 @@ impl BuildGuestTest {
 
     pub(crate) const fn is_f9_userspace(self) -> bool {
         matches!(self, Self::AtomicWaitWake)
+    }
+
+    pub(crate) const fn is_f12_userspace(self) -> bool {
+        matches!(self, Self::IpcBlockingSmoke)
     }
 
     pub(crate) const fn is_memory_foundation(self) -> bool {
@@ -182,6 +188,8 @@ const fn parse_known_selector(value: &str) -> BuildGuestTest {
         BuildGuestTest::TaskSyscallSanitize
     } else if string_equals(value, "task-user-exception") {
         BuildGuestTest::TaskUserException
+    } else if string_equals(value, "ipc-blocking-smoke") {
+        BuildGuestTest::IpcBlockingSmoke
     } else if string_equals(value, "atomic-wait-wake") {
         BuildGuestTest::AtomicWaitWake
     } else {

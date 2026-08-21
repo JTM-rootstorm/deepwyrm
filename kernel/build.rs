@@ -34,6 +34,13 @@ pub(crate) const F9_SYSCALL_ATOMIC_WAKE: u32 = 0x0004_0021;
 pub(crate) const F9_SYSCALL_PROCESS_EXIT: u32 = E7_SYSCALL_PROCESS_EXIT;
 pub(crate) const F9_STATUS_SUCCESS: i32 = 0;
 
+pub(crate) const F12_USER_ENTRY: u64 = 0x0000_0000_4000_4000;
+pub(crate) const F12_USER_DATA: u64 = 0x0000_0000_4000_5000;
+pub(crate) const F12_USER_STACK_BOTTOM: u64 = 0x0000_0000_5000_2000;
+pub(crate) const F12_USER_STACK_TOP: u64 = F12_USER_STACK_BOTTOM + 4096;
+pub(crate) const F12_USER_SERVICE_STACK_TOP: u64 = F12_USER_STACK_BOTTOM + 2048;
+pub(crate) const F12_USER_PRODUCER_STACK_TOP: u64 = F12_USER_STACK_TOP;
+
 fn main() {
     if let Err(error) = run() {
         panic!("x86_64 entry build failed: {error}");
@@ -54,7 +61,10 @@ fn run() -> Result<(), String> {
     let e7_user_linker = manifest_dir.join("tests/userspace/e7_user.ld");
     let f9_user_source = manifest_dir.join("tests/userspace/f9_atomic_wait_wake.S");
     let f9_user_linker = manifest_dir.join("tests/userspace/f9_user.ld");
+    let f12_user_source = manifest_dir.join("tests/userspace/f12_ipc_blocking_smoke.S");
+    let f12_user_linker = manifest_dir.join("tests/userspace/f12_user.ld");
     let syscall_veneer = manifest_dir.join("../abi/generated/syscall_veneer_x86_64.S");
+    let generated_abi_path = manifest_dir.join("../abi/generated/deepwyrm_abi.rs");
 
     println!("cargo:rerun-if-changed={}", layout_path.display());
     println!("cargo:rerun-if-changed={}", task_layout_path.display());
@@ -68,7 +78,10 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-changed={}", e7_user_linker.display());
     println!("cargo:rerun-if-changed={}", f9_user_source.display());
     println!("cargo:rerun-if-changed={}", f9_user_linker.display());
+    println!("cargo:rerun-if-changed={}", f12_user_source.display());
+    println!("cargo:rerun-if-changed={}", f12_user_linker.display());
     println!("cargo:rerun-if-changed={}", syscall_veneer.display());
+    println!("cargo:rerun-if-changed={}", generated_abi_path.display());
     println!("cargo:rerun-if-env-changed=DEEPWYRM_ACCEPTED_RUST_LLD");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_CLANG");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_TEST_SUPPORT");
@@ -77,6 +90,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_c3_one_shot_ui)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_e7_guest)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_f9_guest)");
+    println!("cargo:rustc-check-cfg=cfg(deepwyrm_f12_guest)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_integrated)");
     println!("cargo:rustc-cfg=deepwyrm_integrated");
 
@@ -105,6 +119,13 @@ fn run() -> Result<(), String> {
     {
         println!("cargo:rustc-cfg=deepwyrm_f9_guest");
     }
+    if env::var("DEEPWYRM_GUEST_TEST_SELECTOR")
+        .ok()
+        .as_deref()
+        .is_some_and(is_f12_userspace_selector)
+    {
+        println!("cargo:rustc-cfg=deepwyrm_f12_guest");
+    }
 
     if required_env("TARGET")? != KERNEL_TARGET {
         return Ok(());
@@ -128,6 +149,7 @@ fn run() -> Result<(), String> {
     ];
     let e7_user_object = out_dir.join("deepwyrm-e7-user.o");
     let f9_user_object = out_dir.join("deepwyrm-f9-user.o");
+    let f12_user_object = out_dir.join("deepwyrm-f12-user.o");
     let selector = env::var("DEEPWYRM_GUEST_TEST_SELECTOR").ok();
     if selector.as_deref().is_some_and(is_e7_userspace_selector) {
         let composite = out_dir.join("deepwyrm-e7-user.S");
@@ -159,6 +181,25 @@ fn run() -> Result<(), String> {
         emit_f9_user_env(&elf);
         link_objects.push(f9_user_object.as_path());
     }
+    if selector.as_deref().is_some_and(is_f12_userspace_selector) {
+        let generated_abi = fs::read_to_string(&generated_abi_path)
+            .map_err(|error| format!("{}: {error}", generated_abi_path.display()))?;
+        let f12_constants = f12_assembler_constants(&generated_abi)?;
+        let composite = out_dir.join("deepwyrm-f12-user.S");
+        let elf = out_dir.join("deepwyrm-f12-user.elf");
+        build_f12_user_artifact(
+            &f12_user_source,
+            &syscall_veneer,
+            &f12_user_linker,
+            &composite,
+            &f12_user_object,
+            &elf,
+            layout,
+            &f12_constants,
+        )?;
+        emit_f12_user_env(&elf);
+        link_objects.push(f12_user_object.as_path());
+    }
 
     for argument in linker_arguments(layout, task_layout, &linker_path, &link_objects) {
         println!("cargo:rustc-link-arg={argument}");
@@ -176,6 +217,10 @@ fn is_e7_userspace_selector(selector: &str) -> bool {
 
 fn is_f9_userspace_selector(selector: &str) -> bool {
     selector == "atomic-wait-wake"
+}
+
+fn is_f12_userspace_selector(selector: &str) -> bool {
+    selector == "ipc-blocking-smoke"
 }
 
 fn emit_e7_user_env(elf: &Path) {
@@ -208,6 +253,26 @@ fn emit_f9_user_env(elf: &Path) {
         println!("cargo:rustc-env={name}={value}");
     }
     println!("cargo:rustc-env=DEEPWYRM_F9_USER_ELF={}", elf.display());
+}
+
+fn emit_f12_user_env(elf: &Path) {
+    for (name, value) in [
+        ("DEEPWYRM_F12_USER_ENTRY", F12_USER_ENTRY),
+        ("DEEPWYRM_F12_USER_DATA", F12_USER_DATA),
+        ("DEEPWYRM_F12_USER_STACK_BOTTOM", F12_USER_STACK_BOTTOM),
+        ("DEEPWYRM_F12_USER_STACK_TOP", F12_USER_STACK_TOP),
+        (
+            "DEEPWYRM_F12_USER_SERVICE_STACK_TOP",
+            F12_USER_SERVICE_STACK_TOP,
+        ),
+        (
+            "DEEPWYRM_F12_USER_PRODUCER_STACK_TOP",
+            F12_USER_PRODUCER_STACK_TOP,
+        ),
+    ] {
+        println!("cargo:rustc-env={name}={value}");
+    }
+    println!("cargo:rustc-env=DEEPWYRM_F12_USER_ELF={}", elf.display());
 }
 
 #[allow(
@@ -360,6 +425,82 @@ pub(crate) fn build_f9_user_artifact(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the F12 artifact builder keeps every source/output/tool boundary explicit"
+)]
+pub(crate) fn build_f12_user_artifact(
+    user_source: &Path,
+    generated_veneer: &Path,
+    linker_script: &Path,
+    composite_source: &Path,
+    object: &Path,
+    elf: &Path,
+    layout: Layout,
+    assembler_constants: &[String],
+) -> Result<(), String> {
+    let body = fs::read_to_string(user_source)
+        .map_err(|error| format!("{}: {error}", user_source.display()))?;
+    let veneer = fs::read_to_string(generated_veneer)
+        .map_err(|error| format!("{}: {error}", generated_veneer.display()))?;
+    if !veneer.contains(".globl dw_syscall6") || !veneer.contains("syscall") {
+        return Err("generated x86_64 syscall veneer lost dw_syscall6".into());
+    }
+    let mut composite = String::from(
+        ".section .text.deepwyrm_test_f12_user,\"ax\",@progbits\n\
+         .p2align 4\n\
+         .globl __dw_test_f12_user_blob_start\n\
+         __dw_test_f12_user_blob_start:\n",
+    );
+    for line in assembler_constants {
+        composite.push_str(&line);
+        composite.push('\n');
+    }
+    composite.push_str(&body);
+    if !body.ends_with('\n') {
+        composite.push('\n');
+    }
+    for line in veneer.lines() {
+        if line.trim() == ".text" || line.trim().starts_with(".section .note.GNU-stack") {
+            continue;
+        }
+        composite.push_str(line);
+        composite.push('\n');
+    }
+    composite
+        .push_str(".p2align 4\n.globl __dw_test_f12_user_blob_end\n__dw_test_f12_user_blob_end:\n");
+    fs::write(composite_source, composite)
+        .map_err(|error| format!("{}: {error}", composite_source.display()))?;
+    assemble_source(composite_source, object, layout)?;
+
+    let rust_lld = env::var_os("DEEPWYRM_ACCEPTED_RUST_LLD")
+        .or_else(|| env::var_os("CARGO_TARGET_X86_64_UNKNOWN_NONE_LINKER"))
+        .ok_or_else(|| "F12 target builds require the accepted Rust LLD path".to_owned())?;
+    let status = Command::new(&rust_lld)
+        .args([
+            "-flavor",
+            "gnu",
+            "-static",
+            "--no-dynamic-linker",
+            "--build-id=none",
+            "--gc-sections",
+            "-z",
+            "noexecstack",
+            "-z",
+            "max-page-size=4096",
+        ])
+        .arg(format!("-T{}", linker_script.display()))
+        .arg(object)
+        .arg("-o")
+        .arg(elf)
+        .status()
+        .map_err(|error| format!("could not execute {:?}: {error}", rust_lld))?;
+    if !status.success() {
+        return Err(format!("F12 userspace link failed with {status}"));
+    }
+    Ok(())
+}
+
 fn e7_assembler_constants() -> Vec<String> {
     vec![
         format!(".equ DW_E7_USER_INFO_ADDRESS, {E7_USER_INFO:#x}"),
@@ -385,6 +526,238 @@ fn f9_assembler_constants() -> Vec<String> {
         format!(".equ DW_F9_SYSCALL_PROCESS_EXIT, {F9_SYSCALL_PROCESS_EXIT:#x}"),
         format!(".equ DW_F9_STATUS_SUCCESS, {F9_STATUS_SUCCESS}"),
     ]
+}
+
+fn f12_assembler_constants(generated_abi: &str) -> Result<Vec<String>, String> {
+    let generated = |name| generated_abi_constant(generated_abi, name);
+    let constants = vec![
+        format!(".equ DW_F12_USER_DATA_ADDRESS, {F12_USER_DATA:#x}"),
+        ".equ DW_F12_TASK_GROUP, 0x00".into(),
+        ".equ DW_F12_MAIN_RX, 0x08".into(),
+        ".equ DW_F12_MAIN_TX, 0x10".into(),
+        ".equ DW_F12_BOOTSTRAP_SOURCE, 0x18".into(),
+        ".equ DW_F12_BOOTSTRAP_PEER, 0x20".into(),
+        ".equ DW_F12_EVENT_SOURCE, 0x28".into(),
+        ".equ DW_F12_EVENT_SIGNALER, 0x30".into(),
+        ".equ DW_F12_MOVED_EVENT_SOURCE, 0x40".into(),
+        ".equ DW_F12_CLOCK_NOW, 0x48".into(),
+        ".equ DW_F12_DEADLINE, 0x50".into(),
+        ".equ DW_F12_SYNC0, 0x58".into(),
+        ".equ DW_F12_SYNC1, 0x5c".into(),
+        ".equ DW_F12_WOKEN, 0x60".into(),
+        ".equ DW_F12_MESSAGE_A, 0x80".into(),
+        ".equ DW_F12_MESSAGE_B, 0x81".into(),
+        ".equ DW_F12_TRANSFER, 0x100".into(),
+        ".equ DW_F12_RECEIVE_BYTES, 0x140".into(),
+        ".equ DW_F12_RECEIVED_HANDLE, 0x160".into(),
+        ".equ DW_F12_RECEIVE_RESULT, 0x190".into(),
+        ".equ DW_F12_WAIT_RESULT, 0x1d0".into(),
+        ".equ DW_F12_PROCESS_ARGS, 0x210".into(),
+        ".equ DW_F12_PROCESS_RESULT, 0x270".into(),
+        ".equ DW_F12_TASK_INFO, 0x2b0".into(),
+        ".equ DW_F12_INFO_REQUIRED, 0x2f0".into(),
+        format!(
+            ".equ DW_F12_SYSCALL_HANDLE_CLOSE, {}",
+            generated("DW_SYSCALL_HANDLE_CLOSE")?
+        ),
+        format!(
+            ".equ DW_F12_SYSCALL_HANDLE_DUPLICATE, {}",
+            generated("DW_SYSCALL_HANDLE_DUPLICATE")?
+        ),
+        format!(
+            ".equ DW_F12_SYSCALL_OBJECT_GET_INFO, {}",
+            generated("DW_SYSCALL_OBJECT_GET_INFO_V1")?
+        ),
+        format!(
+            ".equ DW_F12_SYSCALL_PROCESS_CREATE, {}",
+            generated("DW_SYSCALL_PROCESS_CREATE")?
+        ),
+        format!(
+            ".equ DW_F12_SYSCALL_PROCESS_EXIT, {}",
+            generated("DW_SYSCALL_PROCESS_EXIT")?
+        ),
+        format!(
+            ".equ DW_F12_SYSCALL_PROCESS_TERMINATE, {}",
+            generated("DW_SYSCALL_PROCESS_TERMINATE")?
+        ),
+        format!(
+            ".equ DW_F12_SYSCALL_CHANNEL_CREATE, {}",
+            generated("DW_SYSCALL_CHANNEL_CREATE")?
+        ),
+        format!(
+            ".equ DW_F12_SYSCALL_CHANNEL_SEND, {}",
+            generated("DW_SYSCALL_CHANNEL_SEND")?
+        ),
+        format!(
+            ".equ DW_F12_SYSCALL_CHANNEL_RECEIVE, {}",
+            generated("DW_SYSCALL_CHANNEL_RECEIVE")?
+        ),
+        format!(
+            ".equ DW_F12_SYSCALL_WAIT_ONE, {}",
+            generated("DW_SYSCALL_WAIT_ONE")?
+        ),
+        format!(
+            ".equ DW_F12_SYSCALL_EVENT_CREATE, {}",
+            generated("DW_SYSCALL_EVENT_CREATE")?
+        ),
+        format!(
+            ".equ DW_F12_SYSCALL_EVENT_SIGNAL, {}",
+            generated("DW_SYSCALL_EVENT_SIGNAL")?
+        ),
+        format!(
+            ".equ DW_F12_SYSCALL_ATOMIC_WAIT32, {}",
+            generated("DW_SYSCALL_ATOMIC_WAIT32")?
+        ),
+        format!(
+            ".equ DW_F12_SYSCALL_ATOMIC_WAKE, {}",
+            generated("DW_SYSCALL_ATOMIC_WAKE")?
+        ),
+        format!(
+            ".equ DW_F12_SYSCALL_CLOCK_GET, {}",
+            generated("DW_SYSCALL_CLOCK_GET")?
+        ),
+        format!(
+            ".equ DW_F12_STATUS_SUCCESS, {}",
+            generated("DW_STATUS_SUCCESS")?
+        ),
+        format!(
+            ".equ DW_F12_STATUS_BAD_HANDLE, {}",
+            generated("DW_STATUS_BAD_HANDLE")?
+        ),
+        format!(
+            ".equ DW_F12_RIGHTS_CHANNEL, {}",
+            generated("DW_OBJECT_COMPATIBLE_RIGHTS_CHANNEL")?
+        ),
+        format!(
+            ".equ DW_F12_RIGHTS_EVENT, {}",
+            generated("DW_OBJECT_COMPATIBLE_RIGHTS_EVENT")?
+        ),
+        format!(
+            ".equ DW_F12_RIGHT_SIGNAL, {}",
+            generated("DW_RIGHT_SIGNAL")?
+        ),
+        format!(".equ DW_F12_RIGHT_WAIT, {}", generated("DW_RIGHT_WAIT")?),
+        format!(
+            ".equ DW_F12_RIGHTS_PROCESS, {}",
+            generated("DW_OBJECT_COMPATIBLE_RIGHTS_PROCESS")?
+        ),
+        format!(
+            ".equ DW_F12_RIGHTS_ADDRESS_REGION, {}",
+            generated("DW_OBJECT_COMPATIBLE_RIGHTS_ADDRESS_REGION")?
+        ),
+        format!(".equ DW_F12_RIGHT_READ, {}", generated("DW_RIGHT_READ")?),
+        format!(
+            ".equ DW_F12_SIGNAL_READABLE, {}",
+            generated("DW_SIGNAL_READABLE")?
+        ),
+        format!(
+            ".equ DW_F12_SIGNAL_SIGNALED, {}",
+            generated("DW_SIGNAL_SIGNALED")?
+        ),
+        format!(
+            ".equ DW_F12_DEADLINE_INFINITE, {}",
+            generated("DW_DEADLINE_INFINITE")?
+        ),
+        format!(
+            ".equ DW_F12_TRANSFER_MOVE, {}",
+            generated("DW_HANDLE_TRANSFER_MOVE")?
+        ),
+        format!(
+            ".equ DW_F12_RECEIVE_RESULT_SIZE, {}",
+            generated("DW_CHANNEL_RECEIVE_RESULT_V1_SIZE")?
+        ),
+        format!(
+            ".equ DW_F12_PROCESS_ARGS_SIZE, {}",
+            generated("DW_PROCESS_CREATE_ARGS_V1_SIZE")?
+        ),
+        format!(
+            ".equ DW_F12_PROCESS_RESULT_SIZE, {}",
+            generated("DW_PROCESS_CREATE_RESULT_V1_SIZE")?
+        ),
+        format!(
+            ".equ DW_F12_TASK_INFO_SIZE, {}",
+            generated("DW_TASK_TERMINATION_INFO_V1_SIZE")?
+        ),
+        format!(
+            ".equ DW_F12_OBJECT_INFO_TASK_STATE, {}",
+            generated("DW_OBJECT_INFO_TASK_STATE_V1")?
+        ),
+        format!(
+            ".equ DW_F12_TASK_STATE_CREATED, {}",
+            generated("DW_TASK_STATE_CREATED")?
+        ),
+        format!(
+            ".equ DW_F12_TASK_STATE_EXITED, {}",
+            generated("DW_TASK_STATE_EXITED")?
+        ),
+        format!(
+            ".equ DW_F12_TERMINATION_AUTHORIZED, {}",
+            generated("DW_TERMINATION_AUTHORIZED")?
+        ),
+        format!(
+            ".equ DW_F12_OBJECT_TYPE_EVENT, {}",
+            generated("DW_OBJECT_TYPE_EVENT")?
+        ),
+    ];
+    verify_f12_generated_layout(generated_abi)?;
+    Ok(constants)
+}
+
+fn generated_abi_constant(source: &str, name: &str) -> Result<String, String> {
+    let prefix = format!("pub const {name}:");
+    let line = source
+        .lines()
+        .find(|line| line.starts_with(&prefix))
+        .ok_or_else(|| format!("generated ABI omits `{name}`"))?;
+    let value = line
+        .split_once("= ")
+        .and_then(|(_, value)| value.strip_suffix(';'))
+        .ok_or_else(|| format!("generated ABI constant `{name}` has an unexpected shape"))?;
+    let value = match value.split_once('(') {
+        Some((_, wrapped)) => wrapped.strip_suffix(')').ok_or_else(|| {
+            format!("generated ABI constant `{name}` has an unterminated wrapper")
+        })?,
+        None => value,
+    };
+    Ok(value.to_owned())
+}
+
+fn verify_f12_generated_layout(source: &str) -> Result<(), String> {
+    for assertion in [
+        "pub const DW_HANDLE_TRANSFER_V1_SIZE: u32 = 40;",
+        "pub const DW_RECEIVED_HANDLE_INFO_V1_SIZE: u32 = 40;",
+        "pub const DW_CHANNEL_RECEIVE_RESULT_V1_SIZE: u32 = 56;",
+        "pub const DW_WAIT_RESULT_V1_SIZE: u32 = 48;",
+        "pub const DW_PROCESS_CREATE_ARGS_V1_SIZE: u32 = 88;",
+        "pub const DW_PROCESS_CREATE_RESULT_V1_SIZE: u32 = 64;",
+        "pub const DW_TASK_TERMINATION_INFO_V1_SIZE: u32 = 64;",
+        "assert_eq!(offset_of!(DwHandleTransferV1, handle), 0);",
+        "assert_eq!(offset_of!(DwHandleTransferV1, requested_rights), 8);",
+        "assert_eq!(offset_of!(DwHandleTransferV1, operation), 16);",
+        "assert_eq!(offset_of!(DwHandleTransferV1, reserved0), 20);",
+        "assert_eq!(offset_of!(DwHandleTransferV1, reserved), 24);",
+        "assert_eq!(offset_of!(DwReceivedHandleInfoV1, handle), 0);",
+        "assert_eq!(offset_of!(DwReceivedHandleInfoV1, rights), 8);",
+        "assert_eq!(offset_of!(DwReceivedHandleInfoV1, object_type), 16);",
+        "assert_eq!(offset_of!(DwChannelReceiveResultV1, actual_bytes), 8);",
+        "assert_eq!(offset_of!(DwChannelReceiveResultV1, actual_handles), 12);",
+        "assert_eq!(offset_of!(DwWaitResultV1, observed), 16);",
+        "assert_eq!(offset_of!(DwProcessCreateArgsV1, task_group), 8);",
+        "assert_eq!(offset_of!(DwProcessCreateArgsV1, bootstrap_channel), 16);",
+        "assert_eq!(offset_of!(DwProcessCreateArgsV1, process_rights), 24);",
+        "assert_eq!(offset_of!(DwProcessCreateArgsV1, root_region_rights), 32);",
+        "assert_eq!(offset_of!(DwProcessCreateArgsV1, child_bootstrap_rights), 40);",
+        "assert_eq!(offset_of!(DwProcessCreateResultV1, process), 8);",
+        "assert_eq!(offset_of!(DwProcessCreateResultV1, root_address_region), 16);",
+        "assert_eq!(offset_of!(DwProcessCreateResultV1, child_bootstrap_handle), 24);",
+        "assert_eq!(offset_of!(DwTaskTerminationInfoV1, state), 8);",
+        "assert_eq!(offset_of!(DwTaskTerminationInfoV1, reason), 12);",
+    ] {
+        if !source.contains(assertion) {
+            return Err(format!("generated ABI layout assertion lost `{assertion}`"));
+        }
+    }
+    Ok(())
 }
 
 fn configure_guest_test(harness_path: &Path) -> Result<(), String> {
@@ -1388,5 +1761,71 @@ fn parse_bool(value: &str) -> Result<bool, String> {
         "true" => Ok(true),
         "false" => Ok(false),
         _ => Err(format!("invalid boolean `{value}`")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GENERATED_ABI: &str = include_str!("../abi/generated/deepwyrm_abi.rs");
+
+    #[test]
+    fn f12_assembly_constants_are_derived_from_generated_abi() {
+        let constants = f12_assembler_constants(GENERATED_ABI).unwrap();
+        for expected in [
+            ".equ DW_F12_SYSCALL_CHANNEL_CREATE, 0x00030001",
+            ".equ DW_F12_SYSCALL_CHANNEL_SEND, 0x00030002",
+            ".equ DW_F12_SYSCALL_CHANNEL_RECEIVE, 0x00030003",
+            ".equ DW_F12_SYSCALL_WAIT_ONE, 0x00040001",
+            ".equ DW_F12_SYSCALL_EVENT_CREATE, 0x00040010",
+            ".equ DW_F12_SYSCALL_EVENT_SIGNAL, 0x00040011",
+            ".equ DW_F12_SYSCALL_ATOMIC_WAIT32, 0x00040020",
+            ".equ DW_F12_SYSCALL_ATOMIC_WAKE, 0x00040021",
+            ".equ DW_F12_SYSCALL_PROCESS_CREATE, 0x00010010",
+            ".equ DW_F12_RIGHTS_CHANNEL, 467",
+            ".equ DW_F12_RIGHTS_EVENT, 496",
+            ".equ DW_F12_RECEIVE_RESULT_SIZE, 56",
+            ".equ DW_F12_PROCESS_ARGS_SIZE, 88",
+            ".equ DW_F12_PROCESS_RESULT_SIZE, 64",
+            ".equ DW_F12_TASK_INFO_SIZE, 64",
+        ] {
+            assert!(constants.iter().any(|constant| constant == expected));
+        }
+    }
+
+    #[test]
+    fn f12_shared_data_layout_is_compact_and_disjoint() {
+        let ranges = [
+            (0x00, 8),
+            (0x08, 8),
+            (0x10, 8),
+            (0x18, 8),
+            (0x20, 8),
+            (0x28, 8),
+            (0x30, 8),
+            (0x40, 8),
+            (0x48, 8),
+            (0x50, 8),
+            (0x58, 4),
+            (0x5c, 4),
+            (0x60, 4),
+            (0x80, 2),
+            (0x100, 40),
+            (0x140, 16),
+            (0x160, 40),
+            (0x190, 56),
+            (0x1d0, 48),
+            (0x210, 88),
+            (0x270, 64),
+            (0x2b0, 64),
+            (0x2f0, 8),
+        ];
+        for (index, (start, len)) in ranges.iter().enumerate() {
+            assert!(*start + *len <= 4096);
+            for (other_start, other_len) in ranges.iter().skip(index + 1) {
+                assert!(*start + *len <= *other_start || *other_start + *other_len <= *start);
+            }
+        }
     }
 }

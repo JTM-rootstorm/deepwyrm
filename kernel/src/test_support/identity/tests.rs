@@ -55,6 +55,7 @@ fn implemented_central_selectors_have_exact_kernel_identities() {
             11,
         ),
         ("task-user-exception", BuildGuestTest::TaskUserException, 12),
+        ("ipc-blocking-smoke", BuildGuestTest::IpcBlockingSmoke, 13),
         ("atomic-wait-wake", BuildGuestTest::AtomicWaitWake, 16),
     ];
     for (selector, identity, id) in cases {
@@ -88,6 +89,7 @@ fn only_expected_invalid_opcode_is_classified_as_fail() {
         (BuildGuestTest::TaskSyscallSmoke, 6),
         (BuildGuestTest::TaskSyscallSanitize, 6),
         (BuildGuestTest::TaskUserException, 6),
+        (BuildGuestTest::IpcBlockingSmoke, 6),
         (BuildGuestTest::AtomicWaitWake, 6),
     ] {
         assert_eq!(
@@ -137,6 +139,9 @@ fn memory_and_task_selectors_have_distinct_post_activation_dispatch() {
     assert!(!BuildGuestTest::AtomicWaitWake.is_memory_foundation());
     assert!(!BuildGuestTest::AtomicWaitWake.is_task_userspace());
     assert!(BuildGuestTest::AtomicWaitWake.is_f9_userspace());
+    assert!(!BuildGuestTest::IpcBlockingSmoke.is_memory_foundation());
+    assert!(!BuildGuestTest::IpcBlockingSmoke.is_task_userspace());
+    assert!(BuildGuestTest::IpcBlockingSmoke.is_f12_userspace());
     for test in [
         BuildGuestTest::BootHandoffPass,
         BuildGuestTest::ExceptionFailPath,
