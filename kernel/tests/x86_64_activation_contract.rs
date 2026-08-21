@@ -96,7 +96,7 @@ fn c2_large_bootstrap_state_is_not_stack_owned() {
     let layout = fs::read_to_string(manifest_dir.join("arch/x86_64/layout.toml"))
         .expect("read live architecture layout");
 
-    assert!(layout.contains("kernel_boot_stack_size = 131072"));
+    assert!(layout.contains("kernel_boot_stack_size = 262144"));
     for storage in [
         "static BOOTSTRAP_ROLE_MANAGER",
         "static BOOTSTRAP_RESERVATIONS",
@@ -185,7 +185,7 @@ fn e3_e4_kernel_stacks_are_private_linker_carriers_with_first_root_guards() {
     assert!(!shared_layout.contains("thread_kernel_stack_"));
     for marker in [
         "thread_kernel_stack_count = 16",
-        "thread_kernel_stack_size = 131072",
+        "thread_kernel_stack_size = 262144",
         "thread_kernel_stack_guard_size = 4096",
         "thread_kernel_stack_alignment = 4096",
         "privilege_entry_stack_count = 1",

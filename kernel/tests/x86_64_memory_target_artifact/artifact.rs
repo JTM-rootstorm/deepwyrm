@@ -20,11 +20,433 @@ pub(super) fn disassembly(llvm_objdump: &VerifiedExecutable, artifact: &Path) ->
     String::from_utf8(output.stdout).expect("llvm-objdump output is UTF-8")
 }
 
+pub(super) fn resolved_read_only_indirect_disassembly(
+    llvm_objdump: &VerifiedExecutable,
+    llvm_nm: &VerifiedExecutable,
+    artifact: &Path,
+) -> String {
+    let disassembly = disassembly(llvm_objdump, artifact);
+    let bytes = fs::read(artifact).expect("read target ELF for indirect-call resolution");
+    let named_addresses = named_symbol_addresses(&symbols(llvm_nm, artifact));
+    resolve_read_only_indirect_disassembly(&disassembly, |slot| {
+        let target = read_nonwritable_elf_pointer(&bytes, slot)
+            .unwrap_or_else(|| panic!("indirect control-transfer slot {slot:#x} is not immutable"));
+        let symbol = named_addresses.get(&target).unwrap_or_else(|| {
+            panic!("immutable control-transfer slot names unresolved target {target:#x}")
+        });
+        (target, symbol.clone())
+    })
+}
+
+fn resolve_read_only_indirect_disassembly(
+    disassembly: &str,
+    mut resolve_slot: impl FnMut(u64) -> (u64, String),
+) -> String {
+    let mut pending_slot = None;
+    let mut spilled_slots = BTreeMap::<String, u64>::new();
+    let mut resolved = String::with_capacity(disassembly.len());
+
+    for line in disassembly.lines() {
+        if line.ends_with(">:") && line.contains('<') {
+            pending_slot = None;
+            spilled_slots.clear();
+        }
+        if line.contains("\tmov\trax, qword ptr [rip + ") {
+            pending_slot = line
+                .split_once(" # 0x")
+                .and_then(|(_, address)| address.split_whitespace().next())
+                .and_then(|address| u64::from_str_radix(address, 16).ok());
+            resolved.push_str(line);
+            resolved.push('\n');
+            continue;
+        }
+        if let Some(stack_slot) = stack_slot_loaded_into_rax(line) {
+            pending_slot = spilled_slots.get(stack_slot).copied();
+            resolved.push_str(line);
+            resolved.push('\n');
+            continue;
+        }
+        if let Some(stack_slot) = stack_slot_stored_from_rax(line) {
+            if let Some(slot) = pending_slot {
+                spilled_slots.insert(stack_slot.to_owned(), slot);
+            } else {
+                spilled_slots.remove(stack_slot);
+            }
+            resolved.push_str(line);
+            resolved.push('\n');
+            continue;
+        }
+        spilled_slots.retain(|stack_slot, _| !line.contains(stack_slot.as_str()));
+        if line.contains("\tcall\tqword ptr [rip + ") || line.contains("\tjmp\tqword ptr [rip + ") {
+            let slot = line
+                .split_once(" # 0x")
+                .and_then(|(_, address)| address.split_whitespace().next())
+                .and_then(|address| u64::from_str_radix(address, 16).ok())
+                .expect("RIP-memory control transfer names its pointer slot");
+            let (target, symbol) = resolve_slot(slot);
+            let (prefix, kind) = if let Some((prefix, _)) = line.split_once("\tcall\t") {
+                (prefix, "call")
+            } else {
+                (
+                    line.split_once("\tjmp\t")
+                        .map(|(prefix, _)| prefix)
+                        .expect("matched RIP-memory jump"),
+                    "jmp",
+                )
+            };
+            resolved.push_str(prefix);
+            resolved.push('\t');
+            resolved.push_str(kind);
+            resolved.push_str("\t0x");
+            resolved.push_str(&format!("{target:x} <{symbol}>\n"));
+            pending_slot = None;
+            continue;
+        }
+        if line.contains("\tcall\trax") {
+            if let Some(slot) = pending_slot.take() {
+                let (target, symbol) = resolve_slot(slot);
+                let prefix = line
+                    .split_once("\tcall\trax")
+                    .map(|(prefix, _)| prefix)
+                    .expect("matched indirect call");
+                resolved.push_str(prefix);
+                resolved.push_str("\tcall\t0x");
+                resolved.push_str(&format!("{target:x} <{symbol}>\n"));
+                continue;
+            }
+        }
+        if pending_slot.is_some() && preserves_rax_slot_through_argument_setup(line) {
+            resolved.push_str(line);
+            resolved.push('\n');
+            continue;
+        }
+        // Only the exact adjacent immutable-slot load/call idiom is eligible.
+        // A closed set of argument-register setup instructions may intervene;
+        // every other instruction may replace or transform RAX and must leave
+        // a later indirect transfer unresolved for the graph to reject.
+        if !line.trim().is_empty() {
+            pending_slot = None;
+        }
+        resolved.push_str(line);
+        resolved.push('\n');
+    }
+    resolved
+}
+
+fn stack_slot_loaded_into_rax(line: &str) -> Option<&str> {
+    let (_, operands) = line.split_once("\tmov\t")?;
+    let (destination, source) = operands.split_once(',')?;
+    (destination.trim() == "rax" && is_rsp_stack_slot(source.trim())).then_some(source.trim())
+}
+
+fn stack_slot_stored_from_rax(line: &str) -> Option<&str> {
+    let (_, operands) = line.split_once("\tmov\t")?;
+    let (destination, source) = operands.split_once(',')?;
+    (source.trim() == "rax" && is_rsp_stack_slot(destination.trim())).then_some(destination.trim())
+}
+
+fn is_rsp_stack_slot(operand: &str) -> bool {
+    operand.ends_with(" ptr [rsp]") || operand.contains(" ptr [rsp + ")
+}
+
+fn preserves_rax_slot_through_argument_setup(line: &str) -> bool {
+    let operands = ["\tlea\t", "\tmov\t", "\tmovabs\t", "\txor\t"]
+        .into_iter()
+        .find_map(|mnemonic| line.split_once(mnemonic).map(|(_, operands)| operands));
+    let Some(destination) = operands.and_then(|operands| operands.split_once(',').map(|v| v.0))
+    else {
+        return false;
+    };
+    let destination = destination.trim();
+    matches!(
+        destination,
+        "rdi" | "edi" | "rsi" | "esi" | "rdx" | "edx" | "rcx" | "ecx" | "r8" | "r8d" | "r9" | "r9d"
+    ) || destination.ends_with(" ptr [rsp]")
+        || destination.contains(" ptr [rsp + ")
+}
+
+fn named_symbol_addresses(symbols: &str) -> BTreeMap<u64, String> {
+    symbols
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, char::is_whitespace);
+            let address = u64::from_str_radix(fields.next()?, 16).ok()?;
+            let _kind = fields.next()?;
+            let name = fields.next()?.trim();
+            (!name.is_empty()).then(|| (address, name.to_owned()))
+        })
+        .collect()
+}
+
+fn read_nonwritable_elf_pointer(bytes: &[u8], address: u64) -> Option<u64> {
+    assert_eq!(&bytes[..4], b"\x7fELF", "target artifact is not ELF");
+    assert_eq!(bytes[4], 2, "target artifact is not ELF64");
+    assert_eq!(bytes[5], 1, "target artifact is not little-endian ELF");
+    let program_offset = elf_u64(bytes, 32) as usize;
+    let entry_size = elf_u16(bytes, 54) as usize;
+    let entry_count = elf_u16(bytes, 56) as usize;
+    assert!(entry_size >= 56, "ELF64 program header is truncated");
+    for index in 0..entry_count {
+        let header = program_offset + index * entry_size;
+        assert!(
+            header + entry_size <= bytes.len(),
+            "ELF program header is out of range"
+        );
+        if elf_u32(bytes, header) != 1 {
+            continue;
+        }
+        let flags = elf_u32(bytes, header + 4);
+        let file_offset = elf_u64(bytes, header + 8);
+        let virtual_address = elf_u64(bytes, header + 16);
+        let file_size = elf_u64(bytes, header + 32);
+        if flags & 2 != 0
+            || address < virtual_address
+            || address.checked_add(8)? > virtual_address.checked_add(file_size)?
+        {
+            continue;
+        }
+        let offset = file_offset.checked_add(address - virtual_address)? as usize;
+        return Some(elf_u64(bytes, offset));
+    }
+    None
+}
+
+fn elf_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes(bytes[offset..offset + 2].try_into().expect("ELF u16 field"))
+}
+
+fn elf_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("ELF u32 field"))
+}
+
+fn elf_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("ELF u64 field"))
+}
+
+#[test]
+fn immutable_elf_pointer_resolution_rejects_writable_segments() {
+    let mut elf = vec![0_u8; 512];
+    elf[..4].copy_from_slice(b"\x7fELF");
+    elf[4] = 2;
+    elf[5] = 1;
+    elf[32..40].copy_from_slice(&64_u64.to_le_bytes());
+    elf[54..56].copy_from_slice(&56_u16.to_le_bytes());
+    elf[56..58].copy_from_slice(&1_u16.to_le_bytes());
+    elf[64..68].copy_from_slice(&1_u32.to_le_bytes());
+    elf[68..72].copy_from_slice(&4_u32.to_le_bytes());
+    elf[72..80].copy_from_slice(&256_u64.to_le_bytes());
+    elf[80..88].copy_from_slice(&0x1000_u64.to_le_bytes());
+    elf[96..104].copy_from_slice(&64_u64.to_le_bytes());
+    elf[264..272].copy_from_slice(&0x1234_5678_9abc_def0_u64.to_le_bytes());
+    assert_eq!(
+        read_nonwritable_elf_pointer(&elf, 0x1008),
+        Some(0x1234_5678_9abc_def0)
+    );
+    elf[68..72].copy_from_slice(&6_u32.to_le_bytes());
+    assert_eq!(read_nonwritable_elf_pointer(&elf, 0x1008), None);
+}
+
+#[test]
+fn immutable_indirect_resolution_rejects_an_intervening_rax_overwrite() {
+    let disassembly = "Disassembly of section .text:\n\n0000 <root>:\n  0:\tmov\trax, qword ptr [rip + 0x10] # 0x1000\n  7:\tmov\trax, rdi\n  a:\tcall\trax\n";
+    let resolved = resolve_read_only_indirect_disassembly(disassembly, |slot| {
+        assert_eq!(slot, 0x1000);
+        (0x2000, "typed_target".to_owned())
+    });
+    assert!(resolved.contains("\tcall\trax"));
+    assert!(!resolved.contains("<typed_target>"));
+}
+
+#[test]
+fn immutable_indirect_resolution_allows_only_rax_preserving_argument_setup() {
+    let accepted = "Disassembly of section .text:\n\n0000 <root>:\n  0:\tmov\trax, qword ptr [rip + 0x10] # 0x1000\n  7:\tlea\trdi, [rsp + 0x20]\n  c:\tmov\tqword ptr [rsp + 0x8], rdi\n 11:\tmov\tesi, 0x51\n 16:\tmovabs\trdx, 0x800000000000\n 20:\txor\tedx, edx\n 22:\tcall\trax\n";
+    let resolved = resolve_read_only_indirect_disassembly(accepted, |slot| {
+        assert_eq!(slot, 0x1000);
+        (0x2000, "typed_target".to_owned())
+    });
+    assert!(resolved.contains("\tcall\t0x2000 <typed_target>"));
+
+    let rejected = "Disassembly of section .text:\n\n0000 <root>:\n  0:\tmov\trax, qword ptr [rip + 0x10] # 0x1000\n  7:\tcmp\trdi, 0x1\n  b:\tcall\trax\n";
+    let unresolved = resolve_read_only_indirect_disassembly(rejected, |_| {
+        panic!("unknown intervening instruction must clear the slot")
+    });
+    assert!(unresolved.contains("\tcall\trax"));
+}
+
+#[test]
+fn immutable_indirect_resolution_tracks_exact_caller_local_spills() {
+    let accepted = "Disassembly of section .text:\n\n0000 <root>:\n  0:\tmov\trax, qword ptr [rip + 0x10] # 0x1000\n  7:\tmov\tqword ptr [rsp + 0x28], rax\n  c:\tcall\trax\n  e:\tmov\trdi, qword ptr [rsp + 0x40]\n 13:\tmov\trax, qword ptr [rsp + 0x28]\n 18:\tcall\trax\n";
+    let resolved = resolve_read_only_indirect_disassembly(accepted, |slot| {
+        assert_eq!(slot, 0x1000);
+        (0x2000, "memcpy".to_owned())
+    });
+    assert_eq!(resolved.matches("\tcall\t0x2000 <memcpy>").count(), 2);
+
+    let overwritten = "Disassembly of section .text:\n\n0000 <root>:\n  0:\tmov\trax, qword ptr [rip + 0x10] # 0x1000\n  7:\tmov\tqword ptr [rsp + 0x28], rax\n  c:\tcall\trax\n  e:\tmov\tqword ptr [rsp + 0x28], rdi\n 13:\tmov\trax, qword ptr [rsp + 0x28]\n 18:\tcall\trax\n";
+    let unresolved = resolve_read_only_indirect_disassembly(overwritten, |slot| {
+        assert_eq!(slot, 0x1000);
+        (0x2000, "memcpy".to_owned())
+    });
+    assert_eq!(unresolved.matches("\tcall\t0x2000 <memcpy>").count(), 1);
+    assert!(unresolved.contains("\tcall\trax"));
+}
+
+#[test]
+fn fixed_x86_64_stack_frame_counts_flags_and_gpr_pushes() {
+    let disassembly = "Disassembly of section .text:\n\n0000 <switch>:\n  0:\tpushfq\n  1:\tpush\trbx\n  2:\tpush\trbp\n  3:\tpush\tr12\n  5:\tpush\tr13\n  7:\tpush\tr14\n  9:\tpush\tr15\n";
+    assert_eq!(fixed_x86_64_stack_frame(disassembly, "switch"), 56);
+}
+
 pub(super) fn text_disassembly(disassembly: &str) -> &str {
     disassembly
         .split_once("Disassembly of section .text:")
         .map(|(_, text)| text)
         .unwrap_or_else(|| panic!("target artifact omitted .text disassembly"))
+}
+
+pub(super) fn validate_static_kernel_elf(
+    llvm_readelf: &VerifiedExecutable,
+    artifact: &Path,
+    label: &str,
+) {
+    let mut readelf = verified_helper_command_as(llvm_readelf, "llvm-readelf");
+    let headers = run_output(
+        readelf.args(["-h", "-l", "-d"]).arg(artifact),
+        &format!("{label} ELF headers"),
+    );
+    let headers = String::from_utf8(headers.stdout).expect("llvm-readelf output is UTF-8");
+    for forbidden in ["INTERP", "DYNAMIC", "NEEDED"] {
+        assert!(
+            !headers.contains(forbidden),
+            "{label} kernel gained dynamic runtime evidence {forbidden}"
+        );
+    }
+}
+
+pub(super) fn validate_static_native_user_elf(
+    llvm_nm: &VerifiedExecutable,
+    llvm_objdump: &VerifiedExecutable,
+    llvm_readelf: &VerifiedExecutable,
+    user: &Path,
+    label: &str,
+) {
+    let user_symbols = symbols(llvm_nm, user);
+    for required in ["_start", "dw_syscall6"] {
+        assert!(
+            user_symbols.contains(required),
+            "{label} userspace ELF omitted {required}"
+        );
+    }
+
+    let mut readelf = verified_helper_command_as(llvm_readelf, "llvm-readelf");
+    let headers = run_output(
+        readelf.args(["-h", "-l", "-d"]).arg(user),
+        &format!("{label} userspace ELF headers"),
+    );
+    let headers = String::from_utf8(headers.stdout).expect("llvm-readelf output is UTF-8");
+    assert!(
+        headers.contains("Type:                              EXEC"),
+        "{label} userspace ELF is not executable"
+    );
+    for forbidden in ["INTERP", "DYNAMIC", "NEEDED"] {
+        assert!(
+            !headers.contains(forbidden),
+            "{label} userspace ELF gained dynamic runtime evidence {forbidden}"
+        );
+    }
+    let loads: Vec<_> = headers
+        .lines()
+        .filter(|line| line.trim_start().starts_with("LOAD"))
+        .collect();
+    assert_eq!(
+        loads.len(),
+        1,
+        "{label} userspace ELF must have one PT_LOAD: {loads:?}"
+    );
+    assert!(
+        loads[0].contains(" R E "),
+        "{label} PT_LOAD is not RX: {}",
+        loads[0]
+    );
+    assert!(!loads[0].contains(" RWE "), "{label} PT_LOAD became W+X");
+    let bytes = fs::read(user).expect("read userspace ELF");
+    for forbidden in [b"libc.so".as_slice(), b"GLIBC_", b"musl", b"newlib"] {
+        assert!(
+            !contains_bytes(&bytes, forbidden),
+            "{label} userspace ELF retained libc marker {}",
+            String::from_utf8_lossy(forbidden)
+        );
+    }
+
+    let user_disassembly = disassembly(llvm_objdump, user);
+    let syscall_count = user_disassembly
+        .lines()
+        .filter(|line| line.split_whitespace().last() == Some("syscall"))
+        .count();
+    assert_eq!(
+        syscall_count, 1,
+        "generated {label} veneer must own the sole SYSCALL"
+    );
+    let start_syscalls = function_body(&user_disassembly, "_start")
+        .lines()
+        .filter(|line| line.split_whitespace().last() == Some("syscall"))
+        .count();
+    let veneer_syscalls = function_body(&user_disassembly, "dw_syscall6")
+        .lines()
+        .filter(|line| line.split_whitespace().last() == Some("syscall"))
+        .count();
+    assert_eq!(
+        start_syscalls, 0,
+        "{label} _start must call the generated veneer"
+    );
+    assert_eq!(
+        veneer_syscalls, 1,
+        "generated {label} dw_syscall6 must own SYSCALL"
+    );
+}
+
+pub(super) fn validate_user_stack_consumption(
+    llvm_objdump: &VerifiedExecutable,
+    user: &Path,
+    label: &str,
+    user_stack_slice_bytes: usize,
+) {
+    let disassembly = disassembly(llvm_objdump, user);
+    let entry = function_body(&disassembly, "_start");
+    let mut maximum_outgoing_bytes = 0_usize;
+    for line in entry.lines() {
+        let Some(immediate) = line.split_once("\tsub\trsp, 0x").map(|(_, value)| value) else {
+            continue;
+        };
+        let digits = immediate.bytes().take_while(u8::is_ascii_hexdigit).count();
+        let bytes = usize::from_str_radix(&immediate[..digits], 16)
+            .unwrap_or_else(|error| panic!("parse {label} user stack adjustment: {error}"));
+        maximum_outgoing_bytes = maximum_outgoing_bytes.max(bytes);
+    }
+    assert!(
+        !entry.contains("\tpush\t"),
+        "{label} user entry added an unbudgeted push frame"
+    );
+    assert!(
+        maximum_outgoing_bytes > 0,
+        "{label} user entry omitted the generated-veneer outgoing-call frame"
+    );
+    let maximum_consumption = maximum_outgoing_bytes
+        .checked_add(size_of::<u64>())
+        .expect("user stack consumption fits usize");
+    assert!(
+        maximum_consumption <= user_stack_slice_bytes,
+        "{label} user entry outgoing frame plus call return {maximum_consumption} exceeds its {user_stack_slice_bytes}-byte slice"
+    );
+    let veneer = function_body(&disassembly, "dw_syscall6");
+    assert!(
+        !veneer.contains("\tpush\t") && !veneer.contains("\tsub\trsp"),
+        "generated {label} veneer consumes unbudgeted user stack"
+    );
+    eprintln!(
+        "{label} user-stack outgoing-frame={maximum_outgoing_bytes} call-return={} total={maximum_consumption} slice={user_stack_slice_bytes}",
+        size_of::<u64>(),
+    );
 }
 
 pub(super) fn validate_entry_normalization(disassembly: &str) {
@@ -196,7 +618,7 @@ pub(super) fn fixed_x86_64_stack_frame(disassembly: &str, symbol: &str) -> usize
     );
     let pushes = body
         .lines()
-        .filter(|line| line.contains("\tpush\t"))
+        .filter(|line| line.contains("\tpush\t") || line.contains("\tpushfq"))
         .count();
     let adjustments = body
         .lines()

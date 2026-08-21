@@ -122,6 +122,10 @@ pub(super) fn find_f9_user_artifact(target_dir: &Path) -> PathBuf {
     find_user_artifact(target_dir, "deepwyrm-f9-user.elf", "F9")
 }
 
+pub(super) fn find_f12_user_artifact(target_dir: &Path) -> PathBuf {
+    find_user_artifact(target_dir, "deepwyrm-f12-user.elf", "F12")
+}
+
 fn find_user_artifact(target_dir: &Path, artifact_name: &str, phase: &str) -> PathBuf {
     let build_dir = target_dir.join("x86_64-unknown-none/debug/build");
     let mut matches = Vec::new();

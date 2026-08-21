@@ -2,7 +2,7 @@
 
 pub(crate) const E3_BASE_PAGE_SIZE: u64 = 4096;
 pub(crate) const E3_THREAD_STACK_COUNT: usize = 16;
-pub(crate) const E3_THREAD_STACK_SIZE: u64 = 131_072;
+pub(crate) const E3_THREAD_STACK_SIZE: u64 = 262_144;
 pub(crate) const E3_THREAD_STACK_GUARD_SIZE: u64 = E3_BASE_PAGE_SIZE;
 pub(crate) const E3_THREAD_STACK_ALIGNMENT: u64 = E3_BASE_PAGE_SIZE;
 #[allow(

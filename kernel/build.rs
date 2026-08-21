@@ -1238,14 +1238,14 @@ impl TaskLayout {
         let terminal_alignment =
             parse_u64(required_value(&values, "terminal_reaper_stack_alignment")?)?;
         if count != 16
-            || size != 131_072
+            || size != 262_144
             || guard != 4_096
             || alignment != 4_096
             || !size.is_multiple_of(alignment)
             || !guard.is_multiple_of(alignment)
         {
             return Err(
-                "DW0-E3 thread stack pool must be 16 guarded 131072-byte stacks on 4096-byte boundaries"
+                "DW0-E3 thread stack pool must be 16 guarded 262144-byte stacks on 4096-byte boundaries"
                     .into(),
             );
         }
@@ -1637,10 +1637,10 @@ impl Layout {
         {
             return Err("kernel boot stack alignment must equal the base page size".into());
         }
-        if kernel_boot_stack_size != 131_072
+        if kernel_boot_stack_size != 262_144
             || kernel_boot_stack_size % kernel_boot_stack_alignment != 0
         {
-            return Err("kernel boot stack must be an aligned 131072-byte range".into());
+            return Err("kernel boot stack must be an aligned 262144-byte range".into());
         }
         if max_normalized_memory_map_entries != 128 || max_module_entries != 16 {
             return Err("early intake limits must match the bounded BootInfo snapshots".into());

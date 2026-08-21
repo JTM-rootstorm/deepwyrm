@@ -6,7 +6,7 @@ pub(crate) fn validate_selector_stack_margin(
     sizes: &[StackSize],
     disassembly: &str,
 ) {
-    const BOOT_STACK_BYTES: usize = 128 * 1024;
+    const BOOT_STACK_BYTES: usize = 256 * 1024;
     const REQUIRED_SPARE_BYTES: usize = 32 * 1024;
     const ARCHITECTURAL_HEADROOM_BYTES: usize = 4 * 1024;
     const RETURN_ADDRESS_COUNT: usize = 32;

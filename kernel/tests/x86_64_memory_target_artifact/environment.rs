@@ -429,6 +429,10 @@ pub(super) fn build_input_manifest_sha256(workspace: &Path) -> String {
         "crates/deepwyrm-abi/Cargo.toml",
         "kernel/Cargo.toml",
         "kernel/build.rs",
+        "kernel/tests/userspace/f12_ipc_blocking_smoke.S",
+        "kernel/tests/userspace/f12_user.ld",
+        "kernel/tests/userspace/f9_atomic_wait_wake.S",
+        "kernel/tests/userspace/f9_user.ld",
         "tooling/build-tools.toml",
         "tooling/guest-harness.toml",
         "tooling/rust-toolchain.toml",
@@ -532,10 +536,14 @@ impl ArtifactRoot {
             .duration_since(UNIX_EPOCH)
             .expect("system clock precedes Unix epoch")
             .as_nanos();
-        let path = env::temp_dir().join(format!(
-            "deepwyrm-c3-target-artifacts-{}-{nonce}",
-            std::process::id()
-        ));
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace = manifest_dir
+            .parent()
+            .expect("kernel manifest has workspace parent");
+        let root = workspace.join(".tmp").join("target-artifacts");
+        fs::create_dir_all(&root)
+            .unwrap_or_else(|error| panic!("create project-local target-artifact root: {error}"));
+        let path = root.join(format!("accepted-toolchain-{}-{nonce}", std::process::id()));
         fs::create_dir(&path)
             .unwrap_or_else(|error| panic!("create fresh target-artifact root: {error}"));
         Self(Some(path))

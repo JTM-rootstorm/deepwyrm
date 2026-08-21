@@ -186,8 +186,8 @@ ASSERT((__dw_thread_kernel_stack_region_start & (DW_KERNEL_THREAD_STACK_ALIGNMEN
        "thread kernel-stack region must satisfy its configured alignment")
 ASSERT(DW_KERNEL_THREAD_STACK_COUNT == 16,
        "DW0-E3 thread kernel-stack count must remain 16")
-ASSERT(DW_KERNEL_THREAD_STACK_SIZE == 131072,
-       "DW0-E3 thread kernel-stack size must remain 128 KiB")
+ASSERT(DW_KERNEL_THREAD_STACK_SIZE == 262144,
+       "DW0-E3 thread kernel-stack size must remain 256 KiB")
 ASSERT(DW_KERNEL_THREAD_STACK_GUARD_SIZE == DW_KERNEL_BASE_PAGE_SIZE,
        "each E3 thread kernel stack must have exactly one base-page guard")
 ASSERT(DW_KERNEL_THREAD_STACK_ALIGNMENT == DW_KERNEL_BASE_PAGE_SIZE,
