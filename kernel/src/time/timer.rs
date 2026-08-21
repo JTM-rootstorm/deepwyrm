@@ -230,6 +230,17 @@ impl<const TIMERS: usize> TimerAuthority<TIMERS> {
         deadlines: &mut dyn TimerDeadlineAuthority,
         waits: &WaitRegistry<WAITERS>,
     ) -> Result<WakeBatch<WAITERS>, TimerError> {
+        self.set_with_readiness_hook(key, deadline, deadlines, waits, || {})
+    }
+
+    fn set_with_readiness_hook<const WAITERS: usize>(
+        &self,
+        key: TimerKey,
+        deadline: DwDeadline,
+        deadlines: &mut dyn TimerDeadlineAuthority,
+        waits: &WaitRegistry<WAITERS>,
+        before_readiness: impl FnOnce(),
+    ) -> Result<WakeBatch<WAITERS>, TimerError> {
         if deadline.0 == DW_DEADLINE_INFINITE.0 {
             return Err(TimerError::InvalidDeadline);
         }
@@ -263,13 +274,14 @@ impl<const TIMERS: usize> TimerAuthority<TIMERS> {
         timer.signaled = registration.is_none();
         timer.arm = registration.map(|registration| TimerArm { registration });
         let became_signaled = timer.signaled;
-        drop(timers);
-
-        if became_signaled {
-            Ok(waits.take_ready(key.object_id(), DW_SIGNAL_SIGNALED))
+        let wakes = if became_signaled {
+            before_readiness();
+            waits.take_ready(key.object_id(), DW_SIGNAL_SIGNALED)
         } else {
-            Ok(WakeBatch::empty())
-        }
+            WakeBatch::empty()
+        };
+        drop(timers);
+        Ok(wakes)
     }
 
     pub(crate) fn cancel(
@@ -319,6 +331,15 @@ impl<const TIMERS: usize> TimerAuthority<TIMERS> {
         token: TimerExpiryToken,
         waits: &WaitRegistry<WAITERS>,
     ) -> Result<WakeBatch<WAITERS>, TimerError> {
+        self.expire_with_readiness_hook(token, waits, || {})
+    }
+
+    fn expire_with_readiness_hook<const WAITERS: usize>(
+        &self,
+        token: TimerExpiryToken,
+        waits: &WaitRegistry<WAITERS>,
+        before_readiness: impl FnOnce(),
+    ) -> Result<WakeBatch<WAITERS>, TimerError> {
         if token.domain != self.domain {
             return Err(TimerError::ForeignExpiry);
         }
@@ -336,8 +357,10 @@ impl<const TIMERS: usize> TimerAuthority<TIMERS> {
         timer.arm = None;
         timer.signaled = true;
         let object = timer.object;
+        before_readiness();
+        let wakes = waits.ready_wakes(object, DW_SIGNAL_SIGNALED);
         drop(timers);
-        Ok(waits.ready_wakes(object, DW_SIGNAL_SIGNALED))
+        Ok(wakes)
     }
 
     pub(crate) fn register_wait<const WAITERS: usize>(
@@ -467,9 +490,17 @@ mod tests {
 
     use super::*;
     use crate::object::ObjectRegistry;
-    use crate::task::{CooperativeScheduler, ThreadKey};
+    use crate::task::{
+        BlockedOperation, BlockedOperationRegistry, BlockedOperationWinner, CooperativeScheduler,
+        ProcessKey, ThreadKey,
+    };
     use crate::time::{DeadlineQueue, DeadlineQueueError};
-    use deepwyrm_abi::{DW_OBJECT_TYPE_THREAD, DW_SIGNAL_SIGNALED, dw_object_compatible_rights};
+    use deepwyrm_abi::{
+        DW_OBJECT_TYPE_PROCESS, DW_OBJECT_TYPE_THREAD, DW_SIGNAL_SIGNALED,
+        dw_object_compatible_rights,
+    };
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
 
     struct HostDeadlines<const N: usize> {
         now: u64,
@@ -535,6 +566,29 @@ mod tests {
                 .cancel_if_live(registration)
                 .map(|_| ())
                 .map_err(|_| TimerDeadlineError::Fault)
+        }
+    }
+
+    struct LockedHostDeadlines<'a, const N: usize>(&'a Mutex<HostDeadlines<N>>);
+
+    impl<const N: usize> TimerDeadlineAuthority for LockedHostDeadlines<'_, N> {
+        fn replace_timer_deadline(
+            &mut self,
+            old: Option<&DeadlineRegistration>,
+            deadline_ns: u64,
+            token: TimerExpiryToken,
+        ) -> Result<Option<DeadlineRegistration>, TimerDeadlineError> {
+            self.0
+                .lock()
+                .unwrap()
+                .replace_timer_deadline(old, deadline_ns, token)
+        }
+
+        fn cancel_timer_deadline(
+            &mut self,
+            registration: DeadlineRegistration,
+        ) -> Result<(), TimerDeadlineError> {
+            self.0.lock().unwrap().cancel_timer_deadline(registration)
         }
     }
 
@@ -1058,6 +1112,272 @@ mod tests {
             .release_handle(replacement_handle)
             .unwrap()
             .unwrap();
+        let finalization = timers
+            .take_finalization(final_release, &mut deadlines)
+            .unwrap();
+        complete_timer_finalization(&mut registry, finalization);
+    }
+
+    #[test]
+    fn expiry_captures_readiness_before_rearm_can_publish_a_new_waiter() {
+        let mut registry = ObjectRegistry::<8>::new();
+        let timers = TimerAuthority::<1>::new();
+        let waits = WaitRegistry::<4>::new();
+        let deadlines = Mutex::new(HostDeadlines::<4>::new(10));
+        let (key, handle) = timers.create_timer(&mut registry).unwrap();
+        let old_pin = registry.retain_internal_from_handle(&handle).unwrap();
+        let new_pin = registry.retain_internal_from_handle(&handle).unwrap();
+        let (old_thread, old_wake) = block_wake();
+        let (new_thread, new_wake) = block_wake();
+        let _old_registration = waits
+            .register(old_pin, DW_SIGNAL_SIGNALED, 0, old_thread, old_wake)
+            .unwrap();
+        assert_eq!(
+            timers
+                .set(
+                    key,
+                    DwDeadline(100),
+                    &mut LockedHostDeadlines(&deadlines),
+                    &waits,
+                )
+                .unwrap()
+                .len(),
+            0
+        );
+        let (expired, count) = deadlines.lock().unwrap().expire(100);
+        assert_eq!(count, 1);
+        let token = expired[0].unwrap();
+
+        let batch = std::thread::scope(|scope| {
+            let (committed_tx, committed_rx) = mpsc::channel();
+            let (continue_tx, continue_rx) = mpsc::channel();
+            let timers_ref = &timers;
+            let waits_ref = &waits;
+            let expiry = scope.spawn(move || {
+                timers_ref.expire_with_readiness_hook(token, waits_ref, || {
+                    committed_tx.send(()).unwrap();
+                    continue_rx.recv().unwrap();
+                })
+            });
+            committed_rx.recv().unwrap();
+
+            let (attempting_tx, attempting_rx) = mpsc::channel();
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let timers_ref = &timers;
+            let waits_ref = &waits;
+            let deadlines_ref = &deadlines;
+            let rearm = scope.spawn(move || {
+                attempting_tx.send(()).unwrap();
+                let wakes = timers_ref
+                    .set(
+                        key,
+                        DwDeadline(200),
+                        &mut LockedHostDeadlines(deadlines_ref),
+                        waits_ref,
+                    )
+                    .unwrap();
+                assert_eq!(wakes.len(), 0);
+                let _new_registration = waits_ref
+                    .register(new_pin, DW_SIGNAL_SIGNALED, 1, new_thread, new_wake)
+                    .unwrap();
+                finished_tx.send(()).unwrap();
+            });
+            attempting_rx.recv().unwrap();
+            assert_eq!(
+                finished_rx.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout),
+                "rearm must remain behind the Timer readiness linearization point"
+            );
+            continue_tx.send(()).unwrap();
+            let batch = expiry.join().unwrap().unwrap();
+            rearm.join().unwrap();
+            finished_rx.recv().unwrap();
+            batch
+        });
+
+        let (wake_intents, pins) = batch.into_parts();
+        assert!(pins.into_iter().flatten().next().is_none());
+        let intents: std::vec::Vec<_> = wake_intents.into_iter().flatten().collect();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].wake_key(), old_wake);
+        assert_ne!(intents[0].wake_key(), new_wake);
+        assert_eq!(waits.len(), 2);
+
+        for wake in [old_wake, new_wake] {
+            let (_, pins) = waits.cancel_generation(wake).into_parts();
+            for pin in pins.into_iter().flatten() {
+                assert!(registry.release_internal(pin).unwrap().is_none());
+            }
+        }
+        let final_release = registry.release_handle(handle).unwrap().unwrap();
+        let finalization = timers
+            .take_finalization(final_release, &mut LockedHostDeadlines(&deadlines))
+            .unwrap();
+        complete_timer_finalization(&mut registry, finalization);
+    }
+
+    #[test]
+    fn immediate_set_captures_readiness_before_rearm_can_publish_a_new_waiter() {
+        let mut registry = ObjectRegistry::<8>::new();
+        let timers = TimerAuthority::<1>::new();
+        let waits = WaitRegistry::<4>::new();
+        let deadlines = Mutex::new(HostDeadlines::<4>::new(50));
+        let (key, handle) = timers.create_timer(&mut registry).unwrap();
+        let old_pin = registry.retain_internal_from_handle(&handle).unwrap();
+        let new_pin = registry.retain_internal_from_handle(&handle).unwrap();
+        let (old_thread, old_wake) = block_wake();
+        let (new_thread, new_wake) = block_wake();
+        let _old_registration = waits
+            .register(old_pin, DW_SIGNAL_SIGNALED, 0, old_thread, old_wake)
+            .unwrap();
+
+        let batch = std::thread::scope(|scope| {
+            let (committed_tx, committed_rx) = mpsc::channel();
+            let (continue_tx, continue_rx) = mpsc::channel();
+            let timers_ref = &timers;
+            let waits_ref = &waits;
+            let deadlines_ref = &deadlines;
+            let immediate = scope.spawn(move || {
+                timers_ref.set_with_readiness_hook(
+                    key,
+                    DwDeadline(50),
+                    &mut LockedHostDeadlines(deadlines_ref),
+                    waits_ref,
+                    || {
+                        committed_tx.send(()).unwrap();
+                        continue_rx.recv().unwrap();
+                    },
+                )
+            });
+            committed_rx.recv().unwrap();
+
+            let (attempting_tx, attempting_rx) = mpsc::channel();
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let timers_ref = &timers;
+            let waits_ref = &waits;
+            let deadlines_ref = &deadlines;
+            let rearm = scope.spawn(move || {
+                attempting_tx.send(()).unwrap();
+                let wakes = timers_ref
+                    .set(
+                        key,
+                        DwDeadline(75),
+                        &mut LockedHostDeadlines(deadlines_ref),
+                        waits_ref,
+                    )
+                    .unwrap();
+                assert_eq!(wakes.len(), 0);
+                let _new_registration = waits_ref
+                    .register(new_pin, DW_SIGNAL_SIGNALED, 1, new_thread, new_wake)
+                    .unwrap();
+                finished_tx.send(()).unwrap();
+            });
+            attempting_rx.recv().unwrap();
+            assert_eq!(
+                finished_rx.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout),
+                "rearm must remain behind the immediate-set readiness point"
+            );
+            continue_tx.send(()).unwrap();
+            let batch = immediate.join().unwrap().unwrap();
+            rearm.join().unwrap();
+            finished_rx.recv().unwrap();
+            batch
+        });
+
+        let (wake_intents, pins) = batch.into_parts();
+        let intents: std::vec::Vec<_> = wake_intents.into_iter().flatten().collect();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].wake_key(), old_wake);
+        assert_ne!(intents[0].wake_key(), new_wake);
+        let released: std::vec::Vec<_> = pins.into_iter().flatten().collect();
+        assert_eq!(released.len(), 1);
+        assert!(
+            registry
+                .release_internal(released.into_iter().next().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(waits.len(), 1);
+
+        let (_, pins) = waits.cancel_generation(new_wake).into_parts();
+        for pin in pins.into_iter().flatten() {
+            assert!(registry.release_internal(pin).unwrap().is_none());
+        }
+        let final_release = registry.release_handle(handle).unwrap().unwrap();
+        let finalization = timers
+            .take_finalization(final_release, &mut LockedHostDeadlines(&deadlines))
+            .unwrap();
+        complete_timer_finalization(&mut registry, finalization);
+    }
+
+    #[test]
+    fn cancel_rearm_and_timeout_keep_one_exact_wait_winner() {
+        let mut registry = ObjectRegistry::<8>::new();
+        let timers = TimerAuthority::<1>::new();
+        let waits = WaitRegistry::<2>::new();
+        let mut deadlines = HostDeadlines::<2>::new(10);
+        let (key, handle) = timers.create_timer(&mut registry).unwrap();
+        let pin = registry.retain_internal_from_handle(&handle).unwrap();
+        let (thread, wake) = block_wake();
+        let _registration = waits
+            .register(pin, DW_SIGNAL_SIGNALED, 0, thread, wake)
+            .unwrap();
+
+        let process_creation = registry.create(DW_OBJECT_TYPE_PROCESS).unwrap();
+        let process = ProcessKey::from_object_id(process_creation.id());
+        registry.cancel_creation(process_creation).unwrap();
+        let ledger = BlockedOperationRegistry::<1>::new();
+        let blocked = BlockedOperation::publish(&ledger, process, thread, wake, ()).unwrap();
+
+        assert_eq!(
+            timers
+                .set(key, DwDeadline(100), &mut deadlines, &waits)
+                .unwrap()
+                .len(),
+            0
+        );
+        let (old, count) = deadlines.expire(100);
+        assert_eq!(count, 1);
+        timers.cancel(key, &mut deadlines).unwrap();
+        assert_eq!(
+            timers
+                .set(key, DwDeadline(200), &mut deadlines, &waits)
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(
+            ledger
+                .try_claim_winner(wake, BlockedOperationWinner::Timeout)
+                .unwrap()
+        );
+        assert_eq!(timers.expire(old[0].unwrap(), &waits).unwrap().len(), 0);
+
+        let (current, count) = deadlines.expire(200);
+        assert_eq!(count, 1);
+        let wakes = timers.expire(current[0].unwrap(), &waits).unwrap();
+        let (wake_intents, pins) = wakes.into_parts();
+        assert!(pins.into_iter().flatten().next().is_none());
+        let intent = wake_intents.into_iter().flatten().next().unwrap();
+        let signal = BlockedOperationWinner::Signal {
+            item_index: intent.item_index(),
+            observed: intent.observed(),
+        };
+        assert!(!ledger.try_claim_winner(intent.wake_key(), signal).unwrap());
+        assert_eq!(
+            ledger.winner(wake).unwrap(),
+            Some(BlockedOperationWinner::Timeout)
+        );
+
+        let (_, pins) = waits.cancel_generation(wake).into_parts();
+        for pin in pins.into_iter().flatten() {
+            assert!(registry.release_internal(pin).unwrap().is_none());
+        }
+        blocked
+            .complete_with(&ledger, BlockedOperationWinner::Timeout, |()| ())
+            .unwrap();
+        let final_release = registry.release_handle(handle).unwrap().unwrap();
         let finalization = timers
             .take_finalization(final_release, &mut deadlines)
             .unwrap();

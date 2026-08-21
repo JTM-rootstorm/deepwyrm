@@ -159,15 +159,18 @@ impl<const CAPACITY: usize> AtomicWaitRegistry<CAPACITY> {
         if observed != expected {
             return Ok(AtomicWaitRegisterOutcome::Mismatch { observed });
         }
-        let (index, slot) = slots
-            .iter_mut()
+        let (index, generation) = slots
+            .iter()
             .enumerate()
-            .find(|(_, slot)| slot.entry.is_none())
-            .ok_or(AtomicWaitError::Capacity)?;
-        let generation = slot
-            .generation
-            .checked_add(1)
-            .filter(|value| *value != 0)
+            .find_map(|(index, slot)| {
+                if slot.entry.is_some() {
+                    return None;
+                }
+                slot.generation
+                    .checked_add(1)
+                    .filter(|value| *value != 0)
+                    .map(|generation| (index, generation))
+            })
             .ok_or(AtomicWaitError::Capacity)?;
         let sequence = self
             .next_sequence
@@ -176,6 +179,7 @@ impl<const CAPACITY: usize> AtomicWaitRegistry<CAPACITY> {
             })
             .map_err(|_| AtomicWaitError::Capacity)?;
         let slot_index = u16::try_from(index).map_err(|_| AtomicWaitError::Capacity)?;
+        let slot = &mut slots[index];
         slot.generation = generation;
         slot.entry = Some(AtomicWaitEntry {
             key,
@@ -1196,6 +1200,31 @@ mod tests {
                 "seed={seed:#018x}: terminal cleanup leaked index state"
             );
         }
+    }
+
+    #[test]
+    fn registration_skips_an_empty_slot_with_an_exhausted_generation() {
+        let (_process, _threads, wakes, blocked, ledger, key) = keys::<1>();
+        let registry = AtomicWaitRegistry::<2>::new();
+        registry.slots.lock()[0].generation = u32::MAX;
+
+        let registration = match registry
+            .register_if_expected(key, wakes[0], 0, || 0)
+            .unwrap()
+        {
+            AtomicWaitRegisterOutcome::Registered(registration) => registration,
+            AtomicWaitRegisterOutcome::Mismatch { .. } => panic!("matching word must register"),
+        };
+        assert_eq!(registration.slot, 1);
+        assert_eq!(registration.generation, 1);
+        assert!(registry.cancel_if_live(registration).unwrap());
+
+        blocked
+            .into_iter()
+            .next()
+            .unwrap()
+            .complete_with(&ledger, BlockedOperationWinner::Cancelled, |()| ())
+            .unwrap();
     }
 
     #[test]

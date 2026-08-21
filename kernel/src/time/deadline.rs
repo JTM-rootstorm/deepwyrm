@@ -128,18 +128,28 @@ impl<const CAPACITY: usize, T: Copy> DeadlineQueue<CAPACITY, T> {
         if deadline_ns == DW_DEADLINE_NOW.0 || deadline_ns == DW_DEADLINE_INFINITE.0 {
             return Err(DeadlineQueueError::InvalidDeadline);
         }
-        let (slot, entry) = self
+        let has_empty_slot = self.slots.iter().any(|entry| entry.entry.is_none());
+        let (slot, generation) = self
             .slots
-            .iter_mut()
+            .iter()
             .enumerate()
-            .find(|(_, slot)| slot.entry.is_none())
-            .ok_or(DeadlineQueueError::Capacity)?;
+            .find_map(|(slot, entry)| {
+                if entry.entry.is_some() {
+                    return None;
+                }
+                entry
+                    .generation
+                    .checked_add(1)
+                    .filter(|value| *value != 0)
+                    .map(|generation| (slot, generation))
+            })
+            .ok_or(if has_empty_slot {
+                DeadlineQueueError::GenerationExhausted
+            } else {
+                DeadlineQueueError::Capacity
+            })?;
         let slot = u16::try_from(slot).map_err(|_| DeadlineQueueError::Capacity)?;
-        let generation = entry
-            .generation
-            .checked_add(1)
-            .filter(|value| *value != 0)
-            .ok_or(DeadlineQueueError::GenerationExhausted)?;
+        let entry = &mut self.slots[usize::from(slot)];
         entry.generation = generation;
         entry.entry = Some(DeadlineEntry {
             deadline_ns,
@@ -324,6 +334,23 @@ mod tests {
         assert_eq!(queue.expire(20, &mut expired), 2);
         assert_eq!(queue.earliest(), Some(40));
         assert!(queue.cancel(replacement).is_ok());
+    }
+
+    #[test]
+    fn registration_skips_an_empty_slot_with_an_exhausted_generation() {
+        let mut queue = DeadlineQueue::<2, u32>::new();
+        queue.slots[0].generation = u32::MAX;
+
+        let registration = queue.register(10, 7).unwrap();
+        assert_eq!(registration.slot, 1);
+        assert_eq!(registration.generation, 1);
+        assert_eq!(queue.cancel(registration), Ok(7));
+
+        queue.slots[1].generation = u32::MAX;
+        assert!(matches!(
+            queue.register(20, 8),
+            Err(DeadlineQueueError::GenerationExhausted)
+        ));
     }
 
     #[test]
