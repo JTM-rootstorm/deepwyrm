@@ -203,6 +203,13 @@ fn validates_and_snapshots_the_fixed_width_handoff() {
         boot_info.paging_handoff().table_frame(0).unwrap(),
         PAGING_FRAMES[0]
     );
+    let primordial = boot_info.primordial_modules().expect("primordial modules");
+    assert_eq!(primordial.bootstrap().range().physical_start(), 0x20_0000);
+    assert_eq!(primordial.bootstrap().range().byte_len(), 0x1000);
+    assert_eq!(primordial.bootstrap().page_rounded_byte_len(), 0x1000);
+    assert_eq!(primordial.bootfs().range().physical_start(), 0x30_0000);
+    assert_eq!(primordial.bootfs().range().byte_len(), 0x2000);
+    assert_eq!(primordial.bootfs().page_rounded_byte_len(), 0x2000);
 }
 
 #[test]
@@ -301,6 +308,7 @@ fn rejects_duplicate_and_mutable_boot_modules() {
         MODULES + 64 + 8,
         &DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP.0.to_le_bytes(),
     );
+    fixture.bytes_at(MODULES + 64 + 12, &0_u32.to_le_bytes());
     assert_eq!(
         validate_boot_info(&fixture, BOOT_INFO),
         Err(BootInfoValidationError::DuplicateRequiredModule)
@@ -310,6 +318,13 @@ fn rejects_duplicate_and_mutable_boot_modules() {
     fixture.bytes_at(MODULES + 64 + 12, &0_u32.to_le_bytes());
     assert_eq!(
         validate_boot_info(&fixture, BOOT_INFO),
+        Err(BootInfoValidationError::InvalidModuleFlags)
+    );
+
+    let mut bootstrap_flags = valid_fixture();
+    bootstrap_flags.bytes_at(MODULES + 12, &DW_BOOT_MODULE_FLAG_READ_ONLY.0.to_le_bytes());
+    assert_eq!(
+        validate_boot_info(&bootstrap_flags, BOOT_INFO),
         Err(BootInfoValidationError::InvalidModuleFlags)
     );
 }

@@ -159,6 +159,8 @@ pub struct ValidatedBootInfo {
     paging_handoff: ValidatedPagingHandoff,
 }
 
+pub mod primordial;
+
 /// Owned, one-snapshot structural interpretation of the loader's internal
 /// paging carrier.
 ///
@@ -268,6 +270,18 @@ impl ValidatedBootInfo {
     /// Returns the copied and validated internal x86_64 paging handoff.
     pub const fn paging_handoff(&self) -> &ValidatedPagingHandoff {
         &self.paging_handoff
+    }
+
+    /// Selects the two modules consumed by the DW0-G primordial path.
+    ///
+    /// This view is deliberately narrower than the retained module snapshot:
+    /// the paging-handoff carrier remains kernel-internal, while the bootstrap
+    /// ELF and bootfs retain their distinct logical lengths and page-rounded
+    /// capacities for the later G2 construction transaction.
+    pub fn primordial_modules(
+        &self,
+    ) -> Result<primordial::PrimordialBootModules, primordial::PrimordialModuleError> {
+        primordial::select_primordial_boot_modules(self)
     }
 }
 
@@ -415,6 +429,9 @@ pub fn validate_boot_info_with_limits<R: BootInfoByteReader>(
         };
         match module.kind.0 {
             kind if kind == DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP.0 => {
+                if module.flags.0 != 0 {
+                    return Err(BootInfoValidationError::InvalidModuleFlags);
+                }
                 if bootstrap.replace(range).is_some() {
                     return Err(BootInfoValidationError::DuplicateRequiredModule);
                 }
