@@ -35,8 +35,8 @@ use crate::task::{ExecutionDomain, ProcessKey, SchedulerThreadState, TaskAuthori
 use crate::time::TimerAuthority;
 use crate::wait::{EventAuthority, WaitRegistry};
 use deepwyrm_abi::{
-    DW_CHANNEL_MAX_PAYLOAD, DW_STATUS_NOT_SUPPORTED, DW_STATUS_SUCCESS, DW_TASK_STATE_EXITED,
-    DW_TERMINATION_NORMAL_EXIT,
+    DW_CHANNEL_MAX_PAYLOAD, DW_STATUS_BAD_STATE, DW_STATUS_NO_RESOURCES, DW_STATUS_NOT_SUPPORTED,
+    DW_STATUS_SUCCESS, DW_TASK_STATE_EXITED, DW_TERMINATION_NORMAL_EXIT,
 };
 
 const MAX_BOOTFS_BYTES: usize = 32 * 1024 * 1024;
@@ -170,11 +170,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         let zeroed = unsafe { self.active.target.roles.assume_zeroed(allocation) }
             .unwrap_or_else(|_| panic!("primordial zeroed-backing transition drifted"));
-        self.active
-            .target
-            .roles
-            .assign_object_backing(zeroed)
-            .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)
+        match self.active.target.roles.assign_object_backing(zeroed) {
+            Ok(backing) => Ok(backing),
+            Err(failure) => {
+                self.active
+                    .target
+                    .roles
+                    .cancel_zeroed(failure.into_grant())
+                    .unwrap_or_else(|_| panic!("primordial zeroed-backing rollback drifted"));
+                Err(user_access::LiveUserAccessError::MissingOrInvalid)
+            }
+        }
     }
 
     fn prepare_candidate(
@@ -209,11 +215,22 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         let zeroed = unsafe { self.active.target.roles.assume_zeroed(allocation) }
             .unwrap_or_else(|_| panic!("primordial zeroed-table transition drifted"));
-        self.active
+        match self
+            .active
             .target
             .roles
             .prepare_table(zeroed, self.active.identity.owner(), level)
-            .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)
+        {
+            Ok(candidate) => Ok(candidate),
+            Err(failure) => {
+                self.active
+                    .target
+                    .roles
+                    .cancel_zeroed(failure.into_grant())
+                    .unwrap_or_else(|_| panic!("primordial zeroed-table rollback drifted"));
+                Err(user_access::LiveUserAccessError::MissingOrInvalid)
+            }
+        }
     }
 }
 
@@ -281,28 +298,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
         byte_len: u64,
         protection: Protection,
     ) -> Result<(), Self::Error> {
-        let mut candidates = [
-            Some(self.prepare_candidate(TableLevel::Pdpt)?),
-            Some(self.prepare_candidate(TableLevel::Pd)?),
-            Some(self.prepare_candidate(TableLevel::Pt)?),
-        ];
-        let resolved =
-            crate::handle::ResolvedHandle::from_kernel_reference(registry, object, rights)
-                .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)?;
-        let authorization = match memory.issue_map_authorization(
-            resolved,
-            region.address_space_key(),
-            region.region_key(),
-            protection,
-        ) {
-            Ok(authorization) => authorization,
-            Err(error) => {
-                let (_error, releases) = error.release(registry);
-                assert!(releases.is_empty());
-                return Err(user_access::LiveUserAccessError::MissingOrInvalid);
-            }
-        };
-        let result = {
+        let mut candidates = [None, None, None];
+        let result = (|| {
+            candidates[0] = Some(self.prepare_candidate(TableLevel::Pdpt)?);
+            candidates[1] = Some(self.prepare_candidate(TableLevel::Pd)?);
+            candidates[2] = Some(self.prepare_candidate(TableLevel::Pt)?);
+
             let target = &mut self.active.target;
             let mut tracked = user_access::TrackedActiveTarget {
                 scratch: &mut target.scratch,
@@ -327,7 +328,23 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
                 )
             }
             .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)?;
-            region.map(
+            let resolved =
+                crate::handle::ResolvedHandle::from_kernel_reference(registry, object, rights)
+                    .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)?;
+            let authorization = match memory.issue_map_authorization(
+                resolved,
+                region.address_space_key(),
+                region.region_key(),
+                protection,
+            ) {
+                Ok(authorization) => authorization,
+                Err(error) => {
+                    let (_error, releases) = error.release(registry);
+                    assert!(releases.is_empty());
+                    return Err(user_access::LiveUserAccessError::MissingOrInvalid);
+                }
+            };
+            match region.map(
                 memory,
                 registry,
                 &mut publisher,
@@ -336,8 +353,23 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
                 0,
                 byte_len,
                 protection,
-            )
-        };
+            ) {
+                Ok(releases) => {
+                    assert!(
+                        releases.is_empty(),
+                        "primordial map unexpectedly finalized live backing"
+                    );
+                    Ok(())
+                }
+                Err(failure) => {
+                    assert!(
+                        failure.into_final_releases().is_empty(),
+                        "primordial map rollback unexpectedly finalized live backing"
+                    );
+                    Err(user_access::LiveUserAccessError::MissingOrInvalid)
+                }
+            }
+        })();
         for candidate in candidates.into_iter().flatten() {
             self.active
                 .target
@@ -345,10 +377,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
                 .cancel_table_candidate(candidate)
                 .unwrap_or_else(|_| panic!("primordial unused table rollback drifted"));
         }
-        match result {
-            Ok(releases) if releases.is_empty() => Ok(()),
-            Ok(_) | Err(_) => Err(user_access::LiveUserAccessError::MissingOrInvalid),
-        }
+        result
     }
 
     fn unmap<
@@ -875,24 +904,23 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .unwrap_or_else(|error| panic!("primordial root region unavailable: {error:?}"));
         let address_space_key = region.address_space_key();
         let region_key = region.region_key();
-        let mut candidates = [
-            Some(
+        let mut candidates = [None, None, None];
+        let result = (|| {
+            candidates[0] = Some(
                 user.prepare_table_candidate(TableLevel::Pdpt)
-                    .unwrap_or_else(|_| panic!("primordial map lacks a PDPT candidate")),
-            ),
-            Some(
+                    .map_err(|_| DW_STATUS_NO_RESOURCES)?,
+            );
+            candidates[1] = Some(
                 user.prepare_table_candidate(TableLevel::Pd)
-                    .unwrap_or_else(|_| panic!("primordial map lacks a PD candidate")),
-            ),
-            Some(
+                    .map_err(|_| DW_STATUS_NO_RESOURCES)?,
+            );
+            candidates[2] = Some(
                 user.prepare_table_candidate(TableLevel::Pt)
-                    .unwrap_or_else(|_| panic!("primordial map lacks a PT candidate")),
-            ),
-        ];
-        let result = {
+                    .map_err(|_| DW_STATUS_NO_RESOURCES)?,
+            );
             let mut publisher = user
                 .publisher::<3, 4, 1>(address_space_key, region_key, &mut candidates)
-                .unwrap_or_else(|_| panic!("primordial map publisher unavailable"));
+                .map_err(|_| DW_STATUS_BAD_STATE)?;
             crate::syscall::address_region_map_model(
                 &mut publisher,
                 &mut self.registry,
@@ -906,7 +934,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 protection,
                 &mut self.cleanup,
             )
-        };
+        })();
         for candidate in candidates.into_iter().flatten() {
             user.recycle_table_candidate(candidate);
         }

@@ -355,6 +355,39 @@ fn production_entry_dispatches_primordial_runtime_and_keeps_test_hooks_feature_g
 }
 
 #[test]
+fn g3_primordial_mapping_failures_remain_recoverable_and_rollback_owned_candidates() {
+    let primordial =
+        fs::read_to_string(kernel_root().join("src/arch/x86_64/mm/activation/primordial.rs"))
+            .expect("read G3 primordial runtime source");
+    let user_access =
+        fs::read_to_string(kernel_root().join("src/arch/x86_64/mm/activation/user_access.rs"))
+            .expect("read G3 live user-access source");
+
+    for forbidden in [
+        "primordial map lacks a PDPT candidate",
+        "primordial map lacks a PD candidate",
+        "primordial map lacks a PT candidate",
+        "primordial map publisher unavailable",
+    ] {
+        assert!(
+            !primordial.contains(forbidden),
+            "recoverable G3 map failure regressed to a panic: {forbidden}"
+        );
+    }
+    assert!(primordial.contains(".map_err(|_| DW_STATUS_NO_RESOURCES)?"));
+    assert!(primordial.contains(".map_err(|_| DW_STATUS_BAD_STATE)?"));
+    assert!(
+        primordial
+            .matches("for candidate in candidates.into_iter().flatten()")
+            .count()
+            >= 2,
+        "both primordial construction and syscall mapping paths must recycle unused candidates"
+    );
+    assert!(primordial.contains("cancel_zeroed(failure.into_grant())"));
+    assert!(user_access.contains("cancel_zeroed(failure.into_grant())"));
+}
+
+#[test]
 fn e7_user_contract_uses_generated_syscall_veneer_and_generated_abi_values() {
     let source = fs::read_to_string(kernel_root().join("tests/userspace/e7_task_smoke.S"))
         .expect("read E7 userspace source");

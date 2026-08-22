@@ -630,9 +630,18 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         let zeroed = unsafe { self.roles.assume_zeroed(allocation) }
             .unwrap_or_else(|_| panic!("G3 zeroed table-candidate transition drifted"));
-        self.roles
+        match self
+            .roles
             .prepare_table(zeroed, self.identity.owner(), level)
-            .map_err(|_| LiveUserAccessError::MissingOrInvalid)
+        {
+            Ok(candidate) => Ok(candidate),
+            Err(failure) => {
+                self.roles
+                    .cancel_zeroed(failure.into_grant())
+                    .unwrap_or_else(|_| panic!("G3 zeroed table-candidate rollback drifted"));
+                Err(LiveUserAccessError::MissingOrInvalid)
+            }
+        }
     }
 
     pub(crate) fn recycle_table_candidate(&mut self, candidate: TableCandidateGrant) {
