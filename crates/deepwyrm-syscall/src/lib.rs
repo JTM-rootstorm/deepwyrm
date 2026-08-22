@@ -112,6 +112,28 @@ pub fn handle_close(handle: DwHandle) -> DwStatus {
     unsafe { syscall6(DW_SYSCALL_HANDLE_CLOSE, handle.0, 0, 0, 0, 0, 0) }
 }
 
+/// Duplicate one handle with an explicit nonzero rights subset.
+#[inline]
+pub fn handle_duplicate(
+    handle: DwHandle,
+    requested_rights: DwRights,
+    out_handle: &mut DwHandle,
+) -> DwStatus {
+    // SAFETY: the generated scalar arguments are copied by value and the
+    // output reference remains uniquely borrowed for the complete call.
+    unsafe {
+        syscall6(
+            DW_SYSCALL_HANDLE_DUPLICATE,
+            handle.0,
+            requested_rights.0,
+            output_address(out_handle),
+            0,
+            0,
+            0,
+        )
+    }
+}
+
 #[inline]
 fn object_get_info_v1<T>(
     handle: DwHandle,
@@ -160,6 +182,42 @@ pub fn object_get_memory_object_info_v1(
     )
 }
 
+/// Query generated Process or Thread lifecycle and termination state.
+#[inline]
+pub fn object_get_task_state_v1(
+    handle: DwHandle,
+    out_info: &mut DwTaskTerminationInfoV1,
+    out_required_size: &mut u64,
+) -> DwStatus {
+    object_get_info_v1(
+        handle,
+        DW_OBJECT_INFO_TASK_STATE_V1,
+        out_info,
+        out_required_size,
+    )
+}
+
+/// Transactionally create a child Process and install its bootstrap Channel.
+#[inline]
+pub fn process_create(
+    args: &DwProcessCreateArgsV1,
+    out_result: &mut DwProcessCreateResultV1,
+) -> DwStatus {
+    // SAFETY: both generated records remain borrowed for the complete call and
+    // their exact generated sizes are supplied to the kernel.
+    unsafe {
+        syscall6(
+            DW_SYSCALL_PROCESS_CREATE,
+            input_address(args),
+            u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE),
+            output_address(out_result),
+            u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE),
+            0,
+            0,
+        )
+    }
+}
+
 /// Request normal termination of the calling process with a native exit code.
 #[inline]
 pub fn process_exit(exit_code: u32) -> DwStatus {
@@ -167,11 +225,108 @@ pub fn process_exit(exit_code: u32) -> DwStatus {
     unsafe { syscall6(DW_SYSCALL_PROCESS_EXIT, u64::from(exit_code), 0, 0, 0, 0, 0) }
 }
 
+/// Explicitly terminate one Process through held `MODIFY` authority.
+#[inline]
+pub fn process_terminate(process: DwHandle, reason: DwTerminationReason, code: u32) -> DwStatus {
+    // SAFETY: all arguments are generated scalar ABI values.
+    unsafe {
+        syscall6(
+            DW_SYSCALL_PROCESS_TERMINATE,
+            process.0,
+            u64::from(reason.0),
+            u64::from(code),
+            0,
+            0,
+            0,
+        )
+    }
+}
+
+/// Create one Thread in a child Process in `CREATED` state.
+#[inline]
+pub fn thread_create(
+    process: DwHandle,
+    requested_rights: DwRights,
+    out_thread: &mut DwHandle,
+) -> DwStatus {
+    // SAFETY: generated scalars are copied and the output handle remains
+    // uniquely borrowed for the complete call.
+    unsafe {
+        syscall6(
+            DW_SYSCALL_THREAD_CREATE,
+            process.0,
+            requested_rights.0,
+            output_address(out_thread),
+            0,
+            0,
+            0,
+        )
+    }
+}
+
+/// Start one created Thread with exact generated V1 register state.
+#[inline]
+pub fn thread_start(args: &DwThreadStartArgsV1) -> DwStatus {
+    // SAFETY: the generated record remains immutably borrowed for the call and
+    // its exact generated size is supplied.
+    unsafe {
+        syscall6(
+            DW_SYSCALL_THREAD_START,
+            input_address(args),
+            u64::from(DW_THREAD_START_ARGS_V1_SIZE),
+            0,
+            0,
+            0,
+            0,
+        )
+    }
+}
+
 /// Request normal termination of the calling thread with a native exit code.
 #[inline]
 pub fn thread_exit(exit_code: u32) -> DwStatus {
     // SAFETY: `exit_code` is a generated scalar ABI argument.
     unsafe { syscall6(DW_SYSCALL_THREAD_EXIT, u64::from(exit_code), 0, 0, 0, 0, 0) }
+}
+
+/// Explicitly terminate one Thread through held `MODIFY` authority.
+#[inline]
+pub fn thread_terminate(thread: DwHandle, reason: DwTerminationReason, code: u32) -> DwStatus {
+    // SAFETY: all arguments are generated scalar ABI values.
+    unsafe {
+        syscall6(
+            DW_SYSCALL_THREAD_TERMINATE,
+            thread.0,
+            u64::from(reason.0),
+            u64::from(code),
+            0,
+            0,
+            0,
+        )
+    }
+}
+
+/// Create one zero-filled page-backed MemoryObject.
+#[inline]
+pub fn memory_object_create(
+    byte_len: DwSize,
+    flags: DwMemoryObjectCreateFlags,
+    requested_rights: DwRights,
+    out_handle: &mut DwHandle,
+) -> DwStatus {
+    // SAFETY: generated scalars are copied and the output remains uniquely
+    // borrowed for the complete call.
+    unsafe {
+        syscall6(
+            DW_SYSCALL_MEMORY_OBJECT_CREATE,
+            byte_len.0,
+            u64::from(flags.0),
+            requested_rights.0,
+            output_address(out_handle),
+            0,
+            0,
+        )
+    }
 }
 
 /// Atomically send one native Channel datagram and optional moved handles.
@@ -271,6 +426,99 @@ pub fn address_region_unmap(
             byte_len.0,
             0,
             0,
+            0,
+        )
+    }
+}
+
+/// Change one fully mapped AddressRegion range without exceeding its ceiling.
+#[inline]
+pub fn address_region_protect(
+    address_region: DwHandle,
+    address: DwUserAddress,
+    byte_len: DwSize,
+    protections: DwMemoryProtection,
+) -> DwStatus {
+    // SAFETY: every argument is a generated scalar ABI value.
+    unsafe {
+        syscall6(
+            DW_SYSCALL_ADDRESS_REGION_PROTECT,
+            address_region.0,
+            address.0,
+            byte_len.0,
+            u64::from(protections.0),
+            0,
+            0,
+        )
+    }
+}
+
+/// Create one connected Channel pair with a shared requested rights mask.
+#[inline]
+pub fn channel_create(
+    requested_rights: DwRights,
+    out_endpoint0: &mut DwHandle,
+    out_endpoint1: &mut DwHandle,
+) -> DwStatus {
+    // SAFETY: both output handles remain disjoint and uniquely borrowed for the
+    // complete call.
+    unsafe {
+        syscall6(
+            DW_SYSCALL_CHANNEL_CREATE,
+            requested_rights.0,
+            output_address(out_endpoint0),
+            output_address(out_endpoint1),
+            0,
+            0,
+            0,
+        )
+    }
+}
+
+/// Wait for one generated signal mask on one waitable handle.
+#[inline]
+pub fn wait_one(
+    handle: DwHandle,
+    signals: DwSignals,
+    deadline: DwDeadline,
+    out_result: &mut DwWaitResultV1,
+) -> DwStatus {
+    // SAFETY: generated scalars are copied and the output remains uniquely
+    // borrowed for the complete call.
+    unsafe {
+        syscall6(
+            DW_SYSCALL_WAIT_ONE,
+            handle.0,
+            signals.0,
+            deadline.0,
+            output_address(out_result),
+            0,
+            0,
+        )
+    }
+}
+
+/// Wait-any over a bounded caller-owned generated item slice.
+#[inline]
+pub fn wait_many(
+    items: &[DwWaitItemV1],
+    mode: u32,
+    deadline: DwDeadline,
+    out_result: &mut DwWaitResultV1,
+) -> DwStatus {
+    let Ok(item_count) = u32_len(items.len()) else {
+        return DW_STATUS_INVALID_ARGUMENT;
+    };
+    // SAFETY: the item slice remains immutably borrowed and the output remains
+    // uniquely borrowed for the complete call.
+    unsafe {
+        syscall6(
+            DW_SYSCALL_WAIT_MANY,
+            input_slice_address(items),
+            u64::from(item_count),
+            u64::from(mode),
+            deadline.0,
+            output_address(out_result),
             0,
         )
     }

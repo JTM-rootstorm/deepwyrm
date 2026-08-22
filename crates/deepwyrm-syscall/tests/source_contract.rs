@@ -1,6 +1,7 @@
 use deepwyrm_syscall::{
     DwAddressRegionMapArgsV1, DwChannelReceiveResultV1, DwHandleTransferV1, DwMemoryObjectInfoV1,
-    DwObjectInfoV1,
+    DwObjectInfoV1, DwProcessCreateArgsV1, DwProcessCreateResultV1, DwTaskTerminationInfoV1,
+    DwThreadStartArgsV1, DwWaitItemV1, DwWaitResultV1,
 };
 
 const SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
@@ -10,13 +11,24 @@ const MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.
 fn public_wrappers_use_generated_ids_not_copied_numeric_values() {
     for generated_id in [
         "DW_SYSCALL_HANDLE_CLOSE",
+        "DW_SYSCALL_HANDLE_DUPLICATE",
         "DW_SYSCALL_OBJECT_GET_INFO_V1",
+        "DW_SYSCALL_PROCESS_CREATE",
         "DW_SYSCALL_PROCESS_EXIT",
+        "DW_SYSCALL_PROCESS_TERMINATE",
+        "DW_SYSCALL_THREAD_CREATE",
+        "DW_SYSCALL_THREAD_START",
         "DW_SYSCALL_THREAD_EXIT",
+        "DW_SYSCALL_THREAD_TERMINATE",
+        "DW_SYSCALL_MEMORY_OBJECT_CREATE",
+        "DW_SYSCALL_CHANNEL_CREATE",
         "DW_SYSCALL_CHANNEL_SEND",
         "DW_SYSCALL_CHANNEL_RECEIVE",
         "DW_SYSCALL_ADDRESS_REGION_MAP",
         "DW_SYSCALL_ADDRESS_REGION_UNMAP",
+        "DW_SYSCALL_ADDRESS_REGION_PROTECT",
+        "DW_SYSCALL_WAIT_ONE",
+        "DW_SYSCALL_WAIT_MANY",
     ] {
         assert!(
             SOURCE.contains(generated_id),
@@ -38,6 +50,12 @@ fn public_wrappers_use_generated_records_not_local_abi_redeclarations() {
         "DwReceivedHandleInfoV1",
         "DwChannelReceiveResultV1",
         "DwAddressRegionMapArgsV1",
+        "DwProcessCreateArgsV1",
+        "DwProcessCreateResultV1",
+        "DwTaskTerminationInfoV1",
+        "DwThreadStartArgsV1",
+        "DwWaitItemV1",
+        "DwWaitResultV1",
     ] {
         assert!(SOURCE.contains(generated_record));
     }
@@ -67,4 +85,10 @@ fn typed_guest_surface_is_exactly_generated_abi_material() {
     let _ = core::mem::size_of::<DwHandleTransferV1>();
     let _ = core::mem::size_of::<DwChannelReceiveResultV1>();
     let _ = core::mem::size_of::<DwAddressRegionMapArgsV1>();
+    let _ = core::mem::size_of::<DwProcessCreateArgsV1>();
+    let _ = core::mem::size_of::<DwProcessCreateResultV1>();
+    let _ = core::mem::size_of::<DwTaskTerminationInfoV1>();
+    let _ = core::mem::size_of::<DwThreadStartArgsV1>();
+    let _ = core::mem::size_of::<DwWaitItemV1>();
+    let _ = core::mem::size_of::<DwWaitResultV1>();
 }
