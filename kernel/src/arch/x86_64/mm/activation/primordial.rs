@@ -15,8 +15,8 @@ use crate::boot::primordial::construction::authority::{
     AuthorityPrimordialBackend, AuthorityPrimordialMonitor, PrimordialPlatform,
 };
 use crate::boot::primordial::construction::{
-    PrimordialCompletionBackend, PrimordialExitDisposition, complete_primordial_launch,
-    construct_primordial,
+    PrimordialCompletionBackend, PrimordialExitDisposition, STACK_BYTES,
+    complete_primordial_launch, construct_primordial,
 };
 use crate::ipc::ChannelAuthority;
 use crate::memory::address_region::{
@@ -57,6 +57,11 @@ const REGION_SLOTS: usize = 10;
 const EXECUTION_THREADS: usize = 1;
 const EVENTS: usize = 1;
 const TIMERS: usize = 1;
+const PRIMORDIAL_TABLE_CANDIDATES: usize = 3;
+const PRIMORDIAL_MAX_MAPPING_PAGES: usize = (STACK_BYTES / PAGE_SIZE) as usize;
+const PRIMORDIAL_JOURNAL_ENTRIES: usize =
+    PRIMORDIAL_MAX_MAPPING_PAGES + PRIMORDIAL_TABLE_CANDIDATES;
+const PRIMORDIAL_INVALIDATIONS: usize = PRIMORDIAL_MAX_MAPPING_PAGES;
 
 type Registry = ObjectRegistry<REGISTRY_OBJECTS>;
 type Memory = MemoryObjectAuthority<MEMORY_OBJECTS, MEMORY_LEASES>;
@@ -314,9 +319,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
                     _,
                     RANGE_CAPACITY,
                     ROLE_CAPACITY,
-                    3,
-                    4,
-                    1,
+                    PRIMORDIAL_TABLE_CANDIDATES,
+                    PRIMORDIAL_JOURNAL_ENTRIES,
+                    PRIMORDIAL_INVALIDATIONS,
                 >::new(
                     region.address_space_key(),
                     region.region_key(),
@@ -362,11 +367,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
                     Ok(())
                 }
                 Err(failure) => {
+                    let (error, releases) = failure.into_parts();
                     assert!(
-                        failure.into_final_releases().is_empty(),
+                        releases.is_empty(),
                         "primordial map rollback unexpectedly finalized live backing"
                     );
-                    Err(user_access::LiveUserAccessError::MissingOrInvalid)
+                    match error {
+                        crate::memory::address_region::AddressSpaceTransactionError::Model(
+                            error,
+                        ) => Err(user_access::LiveUserAccessError::MapModel(error)),
+                        crate::memory::address_region::AddressSpaceTransactionError::Publish(_) => {
+                            Err(user_access::LiveUserAccessError::MapPublish)
+                        }
+                    }
                 }
             }
         })();
@@ -405,9 +418,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
                     _,
                     RANGE_CAPACITY,
                     ROLE_CAPACITY,
-                    3,
-                    4,
-                    1,
+                    PRIMORDIAL_TABLE_CANDIDATES,
+                    PRIMORDIAL_JOURNAL_ENTRIES,
+                    PRIMORDIAL_INVALIDATIONS,
                 >::new(
                     region.address_space_key(),
                     region.region_key(),

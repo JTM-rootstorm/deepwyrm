@@ -12,6 +12,8 @@ use crate::memory::usercopy::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LiveUserAccessError {
     MissingOrInvalid,
+    MapModel(crate::memory::address_region::AddressRegionError),
+    MapPublish,
     Permission,
     Pin(UserPinError),
 }

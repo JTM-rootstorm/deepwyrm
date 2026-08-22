@@ -67,6 +67,30 @@ use tss::{InterruptStackIndex, TaskStateSegment};
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 const IST_GUARD_BYTES: u64 = BASE_PAGE_SIZE;
 
+/// Returns one linker-defined boundary without allowing LLVM to infer that
+/// separately declared boundary symbols must have distinct addresses.
+///
+/// The linker intentionally aliases the top of each IST stack with the next
+/// guard boundary. Passing the address through an opaque register operand
+/// preserves that linker-time equality for the runtime geometry checks.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "an empty x86 register barrier preserves linker-defined symbol aliasing"
+)]
+#[inline(always)]
+fn opaque_linker_symbol_address(symbol: *const u8) -> u64 {
+    let mut address = symbol as u64;
+    unsafe {
+        core::arch::asm!(
+            "/* {address} */",
+            address = inout(reg) address,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    address
+}
+
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 const INSTALL_UNSTARTED: u8 = 0;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -180,25 +204,36 @@ pub(crate) fn linked_ist_stack_layout() -> Result<IstStackLayout, EarlyDescripto
         static __dw_machine_check_ist_bottom: u8;
         static __dw_machine_check_ist_top: u8;
     }
+    let double_fault_guard = core::ptr::addr_of!(__dw_double_fault_ist_guard);
+    let double_fault_bottom = core::ptr::addr_of!(__dw_double_fault_ist_bottom);
+    let double_fault_top = core::ptr::addr_of!(__dw_double_fault_ist_top);
+    let nmi_guard = core::ptr::addr_of!(__dw_nmi_ist_guard);
+    let nmi_bottom = core::ptr::addr_of!(__dw_nmi_ist_bottom);
+    let nmi_top = core::ptr::addr_of!(__dw_nmi_ist_top);
+    let machine_check_guard = core::ptr::addr_of!(__dw_machine_check_ist_guard);
+    let machine_check_bottom = core::ptr::addr_of!(__dw_machine_check_ist_bottom);
+    let machine_check_top = core::ptr::addr_of!(__dw_machine_check_ist_top);
     let layout = IstStackLayout {
         double_fault: IstStackBounds {
-            guard_page: core::ptr::addr_of!(__dw_double_fault_ist_guard) as u64,
-            bottom: core::ptr::addr_of!(__dw_double_fault_ist_bottom) as u64,
-            top: core::ptr::addr_of!(__dw_double_fault_ist_top) as u64,
+            guard_page: opaque_linker_symbol_address(double_fault_guard),
+            bottom: opaque_linker_symbol_address(double_fault_bottom),
+            top: opaque_linker_symbol_address(double_fault_top),
         },
         non_maskable_interrupt: IstStackBounds {
-            guard_page: core::ptr::addr_of!(__dw_nmi_ist_guard) as u64,
-            bottom: core::ptr::addr_of!(__dw_nmi_ist_bottom) as u64,
-            top: core::ptr::addr_of!(__dw_nmi_ist_top) as u64,
+            guard_page: opaque_linker_symbol_address(nmi_guard),
+            bottom: opaque_linker_symbol_address(nmi_bottom),
+            top: opaque_linker_symbol_address(nmi_top),
         },
         machine_check: IstStackBounds {
-            guard_page: core::ptr::addr_of!(__dw_machine_check_ist_guard) as u64,
-            bottom: core::ptr::addr_of!(__dw_machine_check_ist_bottom) as u64,
-            top: core::ptr::addr_of!(__dw_machine_check_ist_top) as u64,
+            guard_page: opaque_linker_symbol_address(machine_check_guard),
+            bottom: opaque_linker_symbol_address(machine_check_bottom),
+            top: opaque_linker_symbol_address(machine_check_top),
         },
     };
-    let region_start = core::ptr::addr_of!(__dw_ist_region_start) as u64;
-    let region_end = core::ptr::addr_of!(__dw_ist_region_end) as u64;
+    let region_start_symbol = core::ptr::addr_of!(__dw_ist_region_start);
+    let region_end_symbol = core::ptr::addr_of!(__dw_ist_region_end);
+    let region_start = opaque_linker_symbol_address(region_start_symbol);
+    let region_end = opaque_linker_symbol_address(region_end_symbol);
     let stacks = layout.stacks();
     let valid = layout.has_exact_shape()
         && region_start == stacks[0].guard_page
@@ -232,8 +267,10 @@ pub(crate) fn linked_thread_kernel_stack_layout() -> Result<
         static __dw_thread_kernel_stack_region_start: u8;
         static __dw_thread_kernel_stack_region_end: u8;
     }
-    let region_start = core::ptr::addr_of!(__dw_thread_kernel_stack_region_start) as u64;
-    let region_end = core::ptr::addr_of!(__dw_thread_kernel_stack_region_end) as u64;
+    let region_start_symbol = core::ptr::addr_of!(__dw_thread_kernel_stack_region_start);
+    let region_end_symbol = core::ptr::addr_of!(__dw_thread_kernel_stack_region_end);
+    let region_start = opaque_linker_symbol_address(region_start_symbol);
+    let region_end = opaque_linker_symbol_address(region_end_symbol);
     let expected_bytes = crate::memory::kernel_stack::E3_THREAD_STACK_STRIDE
         .checked_mul(crate::memory::kernel_stack::E3_THREAD_STACK_COUNT as u64)
         .ok_or(ThreadKernelStackLayoutError::InvalidGeometry)?;
@@ -290,9 +327,12 @@ pub(crate) fn linked_privilege_entry_stack_layout()
         static __dw_privilege_entry_stack_bottom: u8;
         static __dw_privilege_entry_stack_top: u8;
     }
-    let guard = core::ptr::addr_of!(__dw_privilege_entry_stack_guard) as u64;
-    let bottom = core::ptr::addr_of!(__dw_privilege_entry_stack_bottom) as u64;
-    let top = core::ptr::addr_of!(__dw_privilege_entry_stack_top) as u64;
+    let guard_symbol = core::ptr::addr_of!(__dw_privilege_entry_stack_guard);
+    let bottom_symbol = core::ptr::addr_of!(__dw_privilege_entry_stack_bottom);
+    let top_symbol = core::ptr::addr_of!(__dw_privilege_entry_stack_top);
+    let guard = opaque_linker_symbol_address(guard_symbol);
+    let bottom = opaque_linker_symbol_address(bottom_symbol);
+    let top = opaque_linker_symbol_address(top_symbol);
     let bounds = crate::memory::kernel_stack::KernelStackBounds::new(guard, bottom, top)
         .map_err(|_| PrivilegeEntryStackLayoutError::InvalidGeometry)?;
     if crate::memory::kernel_stack::E4_PRIVILEGE_ENTRY_STACK_COUNT != 1
@@ -324,9 +364,12 @@ pub(crate) fn linked_terminal_reaper_stack_layout()
         static __dw_terminal_reaper_stack_bottom: u8;
         static __dw_terminal_reaper_stack_top: u8;
     }
-    let guard = core::ptr::addr_of!(__dw_terminal_reaper_stack_guard) as u64;
-    let bottom = core::ptr::addr_of!(__dw_terminal_reaper_stack_bottom) as u64;
-    let top = core::ptr::addr_of!(__dw_terminal_reaper_stack_top) as u64;
+    let guard_symbol = core::ptr::addr_of!(__dw_terminal_reaper_stack_guard);
+    let bottom_symbol = core::ptr::addr_of!(__dw_terminal_reaper_stack_bottom);
+    let top_symbol = core::ptr::addr_of!(__dw_terminal_reaper_stack_top);
+    let guard = opaque_linker_symbol_address(guard_symbol);
+    let bottom = opaque_linker_symbol_address(bottom_symbol);
+    let top = opaque_linker_symbol_address(top_symbol);
     let bounds = crate::memory::kernel_stack::KernelStackBounds::new(guard, bottom, top)
         .map_err(|_| TerminalReaperStackLayoutError::InvalidGeometry)?;
     if crate::memory::kernel_stack::TERMINAL_REAPER_STACK_COUNT != 1

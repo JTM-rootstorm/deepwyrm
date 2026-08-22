@@ -201,6 +201,9 @@ fn e4_user_descriptors_and_rsp0_match_the_locked_contract() {
     assert!(tss.contains("io_map_base: size_of::<Self>() as u16"));
     assert!(x86.contains("tss.set_privilege_stack0(privilege_entry.top)"));
     assert!(x86.contains("linked_privilege_entry_stack_layout()"));
+    assert!(x86.contains("fn opaque_linker_symbol_address(symbol: *const u8) -> u64"));
+    assert!(x86.contains("address = inout(reg) address"));
+    assert!(x86.matches("opaque_linker_symbol_address").count() >= 20);
     assert!(linker.contains("__dw_privilege_entry_stack_guard = .;"));
     assert!(linker.contains("__dw_privilege_entry_stack_top = .;"));
 }
@@ -385,6 +388,11 @@ fn g3_primordial_mapping_failures_remain_recoverable_and_rollback_owned_candidat
     );
     assert!(primordial.contains("cancel_zeroed(failure.into_grant())"));
     assert!(user_access.contains("cancel_zeroed(failure.into_grant())"));
+    assert!(primordial.contains(
+        "const PRIMORDIAL_MAX_MAPPING_PAGES: usize = (STACK_BYTES / PAGE_SIZE) as usize;"
+    ));
+    assert!(primordial.contains("PRIMORDIAL_MAX_MAPPING_PAGES + PRIMORDIAL_TABLE_CANDIDATES"));
+    assert!(primordial.contains("PRIMORDIAL_INVALIDATIONS: usize = PRIMORDIAL_MAX_MAPPING_PAGES"));
 }
 
 #[test]
