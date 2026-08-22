@@ -8,6 +8,7 @@
 
 use crate::interrupt::{
     ControllerState, ControllerStateMachine, InvalidControllerTransition, LocalApicVectors,
+    SMP_RENDEZVOUS_VECTOR, TLB_SHOOTDOWN_VECTOR,
 };
 
 const CPUID_LEAF1_ECX_X2APIC: u32 = 1 << 21;
@@ -26,6 +27,8 @@ const APIC_TASK_PRIORITY: u32 = 0x080;
 const APIC_EOI: u32 = 0x0b0;
 const APIC_SPURIOUS: u32 = 0x0f0;
 const APIC_ERROR_STATUS: u32 = 0x280;
+const APIC_INTERRUPT_COMMAND_LOW: u32 = 0x300;
+const APIC_INTERRUPT_COMMAND_HIGH: u32 = 0x310;
 const APIC_LVT_TIMER: u32 = 0x320;
 const APIC_LVT_THERMAL: u32 = 0x330;
 const APIC_LVT_PERFORMANCE: u32 = 0x340;
@@ -40,6 +43,13 @@ const APIC_LVT_MASKED: u32 = 1 << 16;
 const APIC_SOFTWARE_ENABLE: u32 = 1 << 8;
 const APIC_TIMER_DIVIDE_BY_16: u32 = 0x3;
 const MINIMUM_DW0_LVT_MAX_ENTRY: u8 = 5;
+const APIC_ICR_DELIVERY_STATUS_PENDING: u32 = 1 << 12;
+const APIC_ICR_LEVEL_ASSERT: u32 = 1 << 14;
+const APIC_ICR_TRIGGER_LEVEL: u32 = 1 << 15;
+const APIC_ICR_DELIVERY_MODE_INIT: u32 = 0b101 << 8;
+const APIC_ICR_DELIVERY_MODE_STARTUP: u32 = 0b110 << 8;
+const MAX_ICR_DELIVERY_POLLS: usize = 10_000;
+const X86_STARTUP_WINDOW_END: u64 = 0x10_0000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CpuApicFeatures {
@@ -216,7 +226,19 @@ pub enum LocalApicError<E> {
     ApicBaseEnableNotLatched { observed: u64 },
     InsufficientLvtEntries { observed: u8, required: u8 },
     ZeroTimerCount,
+    InvalidIpiTarget { local: u8, destination: u8 },
+    InvalidIpiVector(u8),
+    InvalidStartupPage(u64),
+    IpiDeliveryBusy,
     Access(E),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IpiOperation {
+    InitAssert,
+    InitDeassert,
+    Startup { trampoline_page: u64 },
+    Fixed { vector: u8 },
 }
 
 /// Per-CPU local-APIC bring-up state.
@@ -500,6 +522,55 @@ impl LocalApic {
             .map_err(LocalApicError::Access)
     }
 
+    /// Sends one bounded physical-destination xAPIC IPI transaction.
+    ///
+    /// The controller must already be online. INIT/SIPI are intended for AP
+    /// startup; fixed delivery is restricted to the two H0-owned SMP vectors.
+    /// The caller owns architectural delays between INIT and SIPI attempts.
+    pub fn send_ipi<R: XApicRegisterAccess>(
+        &mut self,
+        registers: &mut R,
+        destination: u8,
+        operation: IpiOperation,
+    ) -> Result<(), LocalApicError<R::Error>> {
+        self.require_state(ControllerState::Online)?;
+        let local =
+            self.apic_id
+                .ok_or(LocalApicError::InvalidState(InvalidControllerTransition {
+                    from: self.state.state(),
+                    to: ControllerState::Online,
+                }))?;
+        if destination == local {
+            return Err(LocalApicError::InvalidIpiTarget { local, destination });
+        }
+        let command = match operation {
+            IpiOperation::InitAssert => {
+                APIC_ICR_DELIVERY_MODE_INIT | APIC_ICR_LEVEL_ASSERT | APIC_ICR_TRIGGER_LEVEL
+            }
+            IpiOperation::InitDeassert => APIC_ICR_DELIVERY_MODE_INIT | APIC_ICR_TRIGGER_LEVEL,
+            IpiOperation::Startup { trampoline_page } => {
+                let vector = startup_vector(trampoline_page)
+                    .ok_or(LocalApicError::InvalidStartupPage(trampoline_page))?;
+                APIC_ICR_DELIVERY_MODE_STARTUP | u32::from(vector)
+            }
+            IpiOperation::Fixed { vector } => {
+                if !matches!(vector, SMP_RENDEZVOUS_VECTOR | TLB_SHOOTDOWN_VECTOR) {
+                    return Err(LocalApicError::InvalidIpiVector(vector));
+                }
+                u32::from(vector)
+            }
+        };
+
+        wait_for_icr_idle(registers)?;
+        registers
+            .write(APIC_INTERRUPT_COMMAND_HIGH, u32::from(destination) << 24)
+            .map_err(LocalApicError::Access)?;
+        registers
+            .write(APIC_INTERRUPT_COMMAND_LOW, command)
+            .map_err(LocalApicError::Access)?;
+        wait_for_icr_idle(registers)
+    }
+
     /// Signal end-of-interrupt after dispatch has completed.
     pub fn end_of_interrupt<R: XApicRegisterAccess>(
         &mut self,
@@ -523,4 +594,29 @@ impl LocalApic {
             to: expected,
         }))
     }
+}
+
+fn startup_vector(trampoline_page: u64) -> Option<u8> {
+    if trampoline_page == 0
+        || trampoline_page & 0xfff != 0
+        || trampoline_page >= X86_STARTUP_WINDOW_END
+    {
+        return None;
+    }
+    u8::try_from(trampoline_page >> 12).ok()
+}
+
+fn wait_for_icr_idle<R: XApicRegisterAccess>(
+    registers: &mut R,
+) -> Result<(), LocalApicError<R::Error>> {
+    for _ in 0..MAX_ICR_DELIVERY_POLLS {
+        let value = registers
+            .read(APIC_INTERRUPT_COMMAND_LOW)
+            .map_err(LocalApicError::Access)?;
+        if value & APIC_ICR_DELIVERY_STATUS_PENDING == 0 {
+            return Ok(());
+        }
+        core::hint::spin_loop();
+    }
+    Err(LocalApicError::IpiDeliveryBusy)
 }

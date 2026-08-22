@@ -14,6 +14,8 @@ pub const EXTERNAL_VECTOR_RANGE: core::ops::RangeInclusive<u8> = 0x30..=0xdf;
 pub const INTERNAL_VECTOR_RANGE: core::ops::RangeInclusive<u8> = 0xe0..=0xfd;
 
 pub const LOCAL_APIC_TIMER_VECTOR: u8 = 0xe0;
+pub const SMP_RENDEZVOUS_VECTOR: u8 = 0xe1;
+pub const TLB_SHOOTDOWN_VECTOR: u8 = 0xe2;
 pub const LOCAL_APIC_ERROR_VECTOR: u8 = 0xfe;
 pub const LOCAL_APIC_SPURIOUS_VECTOR: u8 = 0xff;
 
@@ -24,6 +26,8 @@ pub enum VectorClass {
     ExternalUnallocated,
     InternalReserved,
     LocalApicTimer,
+    SmpRendezvous,
+    TlbShootdown,
     LocalApicError,
     LocalApicSpurious,
 }
@@ -35,7 +39,9 @@ pub const fn classify_vector(vector: u8) -> VectorClass {
         0x20..=0x2f => VectorClass::LegacyPicReserved,
         0x30..=0xdf => VectorClass::ExternalUnallocated,
         LOCAL_APIC_TIMER_VECTOR => VectorClass::LocalApicTimer,
-        0xe1..=0xfd => VectorClass::InternalReserved,
+        SMP_RENDEZVOUS_VECTOR => VectorClass::SmpRendezvous,
+        TLB_SHOOTDOWN_VECTOR => VectorClass::TlbShootdown,
+        0xe3..=0xfd => VectorClass::InternalReserved,
         LOCAL_APIC_ERROR_VECTOR => VectorClass::LocalApicError,
         LOCAL_APIC_SPURIOUS_VECTOR => VectorClass::LocalApicSpurious,
     }

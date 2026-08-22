@@ -4,12 +4,13 @@ mod apic;
 mod interrupt;
 
 use apic::{
-    ApicBaseMsrAccess, ApicDiscoveryError, ApicMode, CpuApicFeatures, LocalApic,
+    ApicBaseMsrAccess, ApicDiscoveryError, ApicMode, CpuApicFeatures, IpiOperation, LocalApic,
     LocalApicDiscovery, LocalApicError, XApicRegisterAccess,
 };
 use interrupt::{
     ControllerState, EXCEPTION_VECTOR_RANGE, EXTERNAL_VECTOR_RANGE, INTERNAL_VECTOR_RANGE,
-    LEGACY_PIC_VECTOR_RANGE, LocalApicVectors, VectorClass, VectorLayoutError, classify_vector,
+    LEGACY_PIC_VECTOR_RANGE, LocalApicVectors, SMP_RENDEZVOUS_VECTOR, TLB_SHOOTDOWN_VECTOR,
+    VectorClass, VectorLayoutError, classify_vector,
 };
 
 const APIC_PRESENT: u32 = 1 << 9;
@@ -25,6 +26,8 @@ const APIC_TASK_PRIORITY: u32 = 0x080;
 const APIC_EOI: u32 = 0x0b0;
 const APIC_SPURIOUS: u32 = 0x0f0;
 const APIC_ERROR_STATUS: u32 = 0x280;
+const APIC_INTERRUPT_COMMAND_LOW: u32 = 0x300;
+const APIC_INTERRUPT_COMMAND_HIGH: u32 = 0x310;
 const APIC_LVT_TIMER: u32 = 0x320;
 const APIC_LVT_THERMAL: u32 = 0x330;
 const APIC_LVT_PERFORMANCE: u32 = 0x340;
@@ -51,6 +54,8 @@ fn vector_policy_covers_the_entire_idt_without_overlap() {
         (0x30, VectorClass::ExternalUnallocated),
         (0xdf, VectorClass::ExternalUnallocated),
         (0xe0, VectorClass::LocalApicTimer),
+        (0xe1, VectorClass::SmpRendezvous),
+        (0xe2, VectorClass::TlbShootdown),
         (0xfd, VectorClass::InternalReserved),
         (0xfe, VectorClass::LocalApicError),
         (0xff, VectorClass::LocalApicSpurious),
@@ -74,6 +79,85 @@ fn vector_policy_covers_the_entire_idt_without_overlap() {
     assert_eq!(
         LocalApicVectors::new(0xe0, 0xfe, 0xff),
         Ok(LocalApicVectors::DW0)
+    );
+}
+
+#[test]
+fn icr_transactions_encode_init_sipi_and_h0_fixed_vectors() {
+    let mut apic = LocalApic::discovered(discovery(ApicMode::XApic), LocalApicVectors::DW0);
+    let mut registers = FakeRegisters::new();
+    apic.prepare(&mut registers).unwrap();
+    apic.bring_online(&mut registers).unwrap();
+    registers.writes.clear();
+
+    for (operation, command) in [
+        (IpiOperation::InitAssert, 0x0000_c500),
+        (IpiOperation::InitDeassert, 0x0000_8500),
+        (
+            IpiOperation::Startup {
+                trampoline_page: 0x8000,
+            },
+            0x0000_0608,
+        ),
+        (
+            IpiOperation::Fixed {
+                vector: SMP_RENDEZVOUS_VECTOR,
+            },
+            u32::from(SMP_RENDEZVOUS_VECTOR),
+        ),
+        (
+            IpiOperation::Fixed {
+                vector: TLB_SHOOTDOWN_VECTOR,
+            },
+            u32::from(TLB_SHOOTDOWN_VECTOR),
+        ),
+    ] {
+        apic.send_ipi(&mut registers, 7, operation).unwrap();
+        assert_eq!(
+            &registers.writes[registers.writes.len() - 2..],
+            &[
+                (APIC_INTERRUPT_COMMAND_HIGH, 7 << 24),
+                (APIC_INTERRUPT_COMMAND_LOW, command),
+            ]
+        );
+    }
+}
+
+#[test]
+fn icr_transactions_reject_self_invalid_vectors_pages_and_busy_delivery() {
+    let mut apic = LocalApic::discovered(discovery(ApicMode::XApic), LocalApicVectors::DW0);
+    let mut registers = FakeRegisters::new();
+    apic.prepare(&mut registers).unwrap();
+    apic.bring_online(&mut registers).unwrap();
+
+    assert_eq!(
+        apic.send_ipi(&mut registers, 0x2a, IpiOperation::InitAssert),
+        Err(LocalApicError::InvalidIpiTarget {
+            local: 0x2a,
+            destination: 0x2a,
+        })
+    );
+    for page in [0, 0x8001, 0x10_0000] {
+        assert_eq!(
+            apic.send_ipi(
+                &mut registers,
+                7,
+                IpiOperation::Startup {
+                    trampoline_page: page,
+                },
+            ),
+            Err(LocalApicError::InvalidStartupPage(page))
+        );
+    }
+    assert_eq!(
+        apic.send_ipi(&mut registers, 7, IpiOperation::Fixed { vector: 0xe3 },),
+        Err(LocalApicError::InvalidIpiVector(0xe3))
+    );
+
+    registers.icr_pending_reads = usize::MAX;
+    assert_eq!(
+        apic.send_ipi(&mut registers, 7, IpiOperation::InitAssert),
+        Err(LocalApicError::IpiDeliveryBusy)
     );
 }
 
@@ -315,8 +399,10 @@ impl ApicBaseMsrAccess for FakeMsr {
 
 struct FakeRegisters {
     values: std::collections::BTreeMap<u32, u32>,
+    writes: Vec<(u32, u32)>,
     operation_count: usize,
     fail_after: Option<usize>,
+    icr_pending_reads: usize,
 }
 
 impl FakeRegisters {
@@ -327,8 +413,10 @@ impl FakeRegisters {
         values.insert(APIC_ERROR_STATUS, 0);
         Self {
             values,
+            writes: Vec::new(),
             operation_count: 0,
             fail_after: None,
+            icr_pending_reads: 0,
         }
     }
 
@@ -350,11 +438,16 @@ impl XApicRegisterAccess for FakeRegisters {
 
     fn read(&mut self, offset: u32) -> Result<u32, Self::Error> {
         self.before_operation()?;
+        if offset == APIC_INTERRUPT_COMMAND_LOW && self.icr_pending_reads != 0 {
+            self.icr_pending_reads = self.icr_pending_reads.saturating_sub(1);
+            return Ok(1 << 12);
+        }
         Ok(self.values.get(&offset).copied().unwrap_or(0))
     }
 
     fn write(&mut self, offset: u32, value: u32) -> Result<(), Self::Error> {
         self.before_operation()?;
+        self.writes.push((offset, value));
         self.values.insert(offset, value);
         Ok(())
     }
