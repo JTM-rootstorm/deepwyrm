@@ -20,6 +20,18 @@ const MAX_RSDP_BYTES: usize = 4096;
 const SDT_HEADER_BYTES: usize = 36;
 const MAX_ACPI_TABLE_BYTES: usize = 64 * 1024;
 const MAX_ROOT_ENTRIES: usize = 128;
+pub(crate) const MAX_DW0_CPUS: usize = 64;
+const MADT_HEADER_BYTES: usize = SDT_HEADER_BYTES + 8;
+const MADT_LOCAL_APIC_ADDRESS: usize = SDT_HEADER_BYTES;
+const MADT_FLAGS: usize = SDT_HEADER_BYTES + 4;
+const MADT_PCAT_COMPAT: u32 = 1;
+const MADT_ENTRY_PROCESSOR_LOCAL_APIC: u8 = 0;
+const MADT_ENTRY_LOCAL_APIC_ADDRESS_OVERRIDE: u8 = 5;
+const MADT_ENTRY_PROCESSOR_LOCAL_X2APIC: u8 = 9;
+const MADT_PROCESSOR_LOCAL_APIC_BYTES: usize = 8;
+const MADT_LOCAL_APIC_ADDRESS_OVERRIDE_BYTES: usize = 12;
+const MADT_PROCESSOR_LOCAL_X2APIC_BYTES: usize = 16;
+const MADT_PROCESSOR_ENABLED: u32 = 1;
 const FADT_PM_TMR_BLK: usize = 76;
 const FADT_PM_TMR_LEN: usize = 91;
 const FADT_FLAGS: usize = 112;
@@ -51,6 +63,78 @@ pub(crate) enum AcpiTimeError {
 pub(crate) struct PmTimerProposal {
     port: u16,
     width: PmTimerWidth,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CpuTopologyEntry {
+    logical_index: u16,
+    local_apic_id: u8,
+    acpi_processor_uid: u8,
+}
+
+impl CpuTopologyEntry {
+    pub(crate) const fn logical_index(self) -> u16 {
+        self.logical_index
+    }
+
+    pub(crate) const fn local_apic_id(self) -> u8 {
+        self.local_apic_id
+    }
+
+    pub(crate) const fn acpi_processor_uid(self) -> u8 {
+        self.acpi_processor_uid
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CpuTopology {
+    local_apic_physical_address: u64,
+    pc_at_compatible: bool,
+    entries: [Option<CpuTopologyEntry>; MAX_DW0_CPUS],
+    len: usize,
+}
+
+impl CpuTopology {
+    pub(crate) const fn local_apic_physical_address(self) -> u64 {
+        self.local_apic_physical_address
+    }
+
+    pub(crate) const fn pc_at_compatible(self) -> bool {
+        self.pc_at_compatible
+    }
+
+    pub(crate) const fn len(self) -> usize {
+        self.len
+    }
+
+    pub(crate) const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    pub(crate) fn entries(&self) -> impl ExactSizeIterator<Item = CpuTopologyEntry> + '_ {
+        self.entries[..self.len]
+            .iter()
+            .map(|entry| entry.expect("published CPU topology prefix contains an entry"))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CpuTopologyError {
+    ReadFailure,
+    InvalidRsdp,
+    InvalidRootTable,
+    RootEntryLimit,
+    MissingMadt,
+    DuplicateMadt,
+    InvalidMadt,
+    DuplicateLocalApicId(u8),
+    DuplicateProcessorUid(u8),
+    UnsupportedEnabledX2Apic(u32),
+    InvalidLocalApicAddress(u64),
+    DuplicateLocalApicAddressOverride,
+    LiveCpuIsNotBootstrapProcessor,
+    MissingBootstrapProcessor(u8),
+    CpuCapacity { observed: usize, capacity: usize },
 }
 
 impl PmTimerProposal {
@@ -167,6 +251,236 @@ pub(crate) fn discover_pm_timer_proposal<R: AcpiByteReader>(
         proposal = Some(parse_fadt_pm_timer(&workspace.table[..fadt_len])?);
     }
     proposal.ok_or(AcpiTimeError::MissingFadt)
+}
+
+pub(crate) fn discover_cpu_topology<R: AcpiByteReader>(
+    reader: &mut R,
+    rsdp_physical: u64,
+    live_bsp_local_apic_id: u8,
+    live_cpu_is_bsp: bool,
+    workspace: &mut AcpiSnapshotWorkspace,
+) -> Result<CpuTopology, CpuTopologyError> {
+    if !live_cpu_is_bsp {
+        return Err(CpuTopologyError::LiveCpuIsNotBootstrapProcessor);
+    }
+    if rsdp_physical == 0 {
+        return Err(CpuTopologyError::InvalidRsdp);
+    }
+    let root = snapshot_rsdp(reader, rsdp_physical, &mut workspace.rsdp)
+        .map_err(map_topology_acpi_error)?;
+    let (root_physical, entry_bytes, expected_signature) = match root {
+        RootTable::Xsdt(address) => (address, 8_usize, *b"XSDT"),
+        RootTable::Rsdt(address) => (address, 4_usize, *b"RSDT"),
+    };
+    let root_len = snapshot_sdt(
+        reader,
+        root_physical,
+        &mut workspace.table,
+        AcpiTimeError::InvalidRootTable,
+    )
+    .map_err(map_topology_acpi_error)?;
+    let root_bytes = &workspace.table[..root_len];
+    if root_bytes[..4] != expected_signature {
+        return Err(CpuTopologyError::InvalidRootTable);
+    }
+    let payload = root_len
+        .checked_sub(SDT_HEADER_BYTES)
+        .ok_or(CpuTopologyError::InvalidRootTable)?;
+    if payload % entry_bytes != 0 {
+        return Err(CpuTopologyError::InvalidRootTable);
+    }
+    let count = payload / entry_bytes;
+    if count == 0 || count > MAX_ROOT_ENTRIES {
+        return Err(CpuTopologyError::RootEntryLimit);
+    }
+    for index in 0..count {
+        let start = SDT_HEADER_BYTES + index * entry_bytes;
+        workspace.root_entries[index] = if entry_bytes == 8 {
+            u64::from_le_bytes(root_bytes[start..start + 8].try_into().unwrap())
+        } else {
+            u64::from(u32::from_le_bytes(
+                root_bytes[start..start + 4].try_into().unwrap(),
+            ))
+        };
+    }
+
+    let mut topology = None;
+    for index in 0..count {
+        let physical = workspace.root_entries[index];
+        if physical == 0 {
+            continue;
+        }
+        let header_len = snapshot_sdt_header(reader, physical, &mut workspace.table)
+            .map_err(map_topology_acpi_error)?;
+        if workspace.table[..4] != *b"APIC" {
+            continue;
+        }
+        if topology.is_some() {
+            return Err(CpuTopologyError::DuplicateMadt);
+        }
+        let madt_len = finish_sdt_snapshot(
+            reader,
+            physical,
+            header_len,
+            &mut workspace.table,
+            AcpiTimeError::InvalidRootTable,
+        )
+        .map_err(|error| match error {
+            AcpiTimeError::ReadFailure => CpuTopologyError::ReadFailure,
+            _ => CpuTopologyError::InvalidMadt,
+        })?;
+        topology = Some(parse_madt(
+            &workspace.table[..madt_len],
+            live_bsp_local_apic_id,
+        )?);
+    }
+    topology.ok_or(CpuTopologyError::MissingMadt)
+}
+
+fn map_topology_acpi_error(error: AcpiTimeError) -> CpuTopologyError {
+    match error {
+        AcpiTimeError::ReadFailure => CpuTopologyError::ReadFailure,
+        AcpiTimeError::InvalidRsdp => CpuTopologyError::InvalidRsdp,
+        AcpiTimeError::RootEntryLimit => CpuTopologyError::RootEntryLimit,
+        _ => CpuTopologyError::InvalidRootTable,
+    }
+}
+
+fn parse_madt(bytes: &[u8], live_bsp_local_apic_id: u8) -> Result<CpuTopology, CpuTopologyError> {
+    if bytes.len() < MADT_HEADER_BYTES || bytes[..4] != *b"APIC" {
+        return Err(CpuTopologyError::InvalidMadt);
+    }
+    let legacy_address = u64::from(u32::from_le_bytes(
+        bytes[MADT_LOCAL_APIC_ADDRESS..MADT_LOCAL_APIC_ADDRESS + 4]
+            .try_into()
+            .unwrap(),
+    ));
+    validate_local_apic_address(legacy_address)?;
+    let flags = u32::from_le_bytes(bytes[MADT_FLAGS..MADT_FLAGS + 4].try_into().unwrap());
+
+    let mut seen_apic_ids = [false; 256];
+    let mut seen_uids = [false; 256];
+    let mut enabled = [None; MAX_DW0_CPUS];
+    let mut enabled_len = 0_usize;
+    let mut local_apic_address = legacy_address;
+    let mut saw_override = false;
+    let mut cursor = MADT_HEADER_BYTES;
+    while cursor < bytes.len() {
+        let header_end = cursor.checked_add(2).ok_or(CpuTopologyError::InvalidMadt)?;
+        if header_end > bytes.len() {
+            return Err(CpuTopologyError::InvalidMadt);
+        }
+        let entry_type = bytes[cursor];
+        let entry_len = usize::from(bytes[cursor + 1]);
+        if entry_len < 2 {
+            return Err(CpuTopologyError::InvalidMadt);
+        }
+        let end = cursor
+            .checked_add(entry_len)
+            .ok_or(CpuTopologyError::InvalidMadt)?;
+        if end > bytes.len() {
+            return Err(CpuTopologyError::InvalidMadt);
+        }
+        let entry = &bytes[cursor..end];
+        match entry_type {
+            MADT_ENTRY_PROCESSOR_LOCAL_APIC => {
+                if entry_len != MADT_PROCESSOR_LOCAL_APIC_BYTES {
+                    return Err(CpuTopologyError::InvalidMadt);
+                }
+                let uid = entry[2];
+                let apic_id = entry[3];
+                if core::mem::replace(&mut seen_uids[usize::from(uid)], true) {
+                    return Err(CpuTopologyError::DuplicateProcessorUid(uid));
+                }
+                if core::mem::replace(&mut seen_apic_ids[usize::from(apic_id)], true) {
+                    return Err(CpuTopologyError::DuplicateLocalApicId(apic_id));
+                }
+                let processor_flags = u32::from_le_bytes(entry[4..8].try_into().unwrap());
+                if processor_flags & MADT_PROCESSOR_ENABLED != 0 {
+                    if enabled_len == MAX_DW0_CPUS {
+                        return Err(CpuTopologyError::CpuCapacity {
+                            observed: enabled_len + 1,
+                            capacity: MAX_DW0_CPUS,
+                        });
+                    }
+                    enabled[enabled_len] = Some((apic_id, uid));
+                    enabled_len += 1;
+                }
+            }
+            MADT_ENTRY_LOCAL_APIC_ADDRESS_OVERRIDE => {
+                if entry_len != MADT_LOCAL_APIC_ADDRESS_OVERRIDE_BYTES || saw_override {
+                    return if saw_override {
+                        Err(CpuTopologyError::DuplicateLocalApicAddressOverride)
+                    } else {
+                        Err(CpuTopologyError::InvalidMadt)
+                    };
+                }
+                let address = u64::from_le_bytes(entry[4..12].try_into().unwrap());
+                validate_local_apic_address(address)?;
+                local_apic_address = address;
+                saw_override = true;
+            }
+            MADT_ENTRY_PROCESSOR_LOCAL_X2APIC => {
+                if entry_len != MADT_PROCESSOR_LOCAL_X2APIC_BYTES {
+                    return Err(CpuTopologyError::InvalidMadt);
+                }
+                let x2apic_id = u32::from_le_bytes(entry[4..8].try_into().unwrap());
+                let processor_flags = u32::from_le_bytes(entry[8..12].try_into().unwrap());
+                if processor_flags & MADT_PROCESSOR_ENABLED != 0 {
+                    return Err(CpuTopologyError::UnsupportedEnabledX2Apic(x2apic_id));
+                }
+            }
+            _ => {}
+        }
+        cursor = end;
+    }
+
+    if enabled_len == 0 {
+        return Err(CpuTopologyError::MissingBootstrapProcessor(
+            live_bsp_local_apic_id,
+        ));
+    }
+    enabled[..enabled_len]
+        .sort_unstable_by_key(|entry| entry.expect("enabled CPU prefix contains an entry").0);
+    let bsp_position = enabled[..enabled_len]
+        .iter()
+        .position(|entry| entry.is_some_and(|(id, _)| id == live_bsp_local_apic_id))
+        .ok_or(CpuTopologyError::MissingBootstrapProcessor(
+            live_bsp_local_apic_id,
+        ))?;
+    let bsp = enabled[bsp_position].take().unwrap();
+    for index in bsp_position..enabled_len - 1 {
+        enabled[index] = enabled[index + 1].take();
+    }
+    enabled[enabled_len - 1] = None;
+
+    let mut entries = [None; MAX_DW0_CPUS];
+    entries[0] = Some(CpuTopologyEntry {
+        logical_index: 0,
+        local_apic_id: bsp.0,
+        acpi_processor_uid: bsp.1,
+    });
+    for index in 1..enabled_len {
+        let (local_apic_id, acpi_processor_uid) = enabled[index - 1].unwrap();
+        entries[index] = Some(CpuTopologyEntry {
+            logical_index: index as u16,
+            local_apic_id,
+            acpi_processor_uid,
+        });
+    }
+    Ok(CpuTopology {
+        local_apic_physical_address: local_apic_address,
+        pc_at_compatible: flags & MADT_PCAT_COMPAT != 0,
+        entries,
+        len: enabled_len,
+    })
+}
+
+fn validate_local_apic_address(address: u64) -> Result<(), CpuTopologyError> {
+    if address == 0 || address & 0xfff != 0 || address > 0x000f_ffff_ffff_f000 {
+        return Err(CpuTopologyError::InvalidLocalApicAddress(address));
+    }
+    Ok(())
 }
 
 pub(crate) fn authorize_q35_pm_timer(
@@ -436,6 +750,75 @@ mod tests {
         discover_pm_timer_proposal(memory, rsdp, &mut workspace())
     }
 
+    fn topology_fixture(madts: &[Vec<u8>]) -> (Memory, u64) {
+        const RSDP: u64 = 0x1000;
+        const XSDT: u64 = 0x2000;
+        const FIRST_MADT: u64 = 0x3000;
+        let mut memory = Memory::default();
+        let mut xsdt = sdt(*b"XSDT", SDT_HEADER_BYTES + madts.len() * 8);
+        for (index, madt) in madts.iter().enumerate() {
+            let address = FIRST_MADT + index as u64 * 0x1_0000;
+            memory.place(address, madt);
+            let start = SDT_HEADER_BYTES + index * 8;
+            xsdt[start..start + 8].copy_from_slice(&address.to_le_bytes());
+        }
+        fix_checksum(&mut xsdt, 9);
+        memory.place(XSDT, &xsdt);
+
+        let mut rsdp = [0_u8; RSDP_V2_BYTES];
+        rsdp[..8].copy_from_slice(b"RSD PTR ");
+        rsdp[15] = 2;
+        rsdp[20..24].copy_from_slice(&(RSDP_V2_BYTES as u32).to_le_bytes());
+        rsdp[24..32].copy_from_slice(&XSDT.to_le_bytes());
+        fix_checksum(&mut rsdp[..RSDP_V1_BYTES], 8);
+        fix_checksum(&mut rsdp, 32);
+        memory.place(RSDP, &rsdp);
+        (memory, RSDP)
+    }
+
+    fn madt(entries: &[&[u8]]) -> Vec<u8> {
+        let length = MADT_HEADER_BYTES + entries.iter().map(|entry| entry.len()).sum::<usize>();
+        let mut bytes = sdt(*b"APIC", length);
+        bytes[MADT_LOCAL_APIC_ADDRESS..MADT_LOCAL_APIC_ADDRESS + 4]
+            .copy_from_slice(&0xfee0_0000_u32.to_le_bytes());
+        bytes[MADT_FLAGS..MADT_FLAGS + 4].copy_from_slice(&MADT_PCAT_COMPAT.to_le_bytes());
+        let mut cursor = MADT_HEADER_BYTES;
+        for entry in entries {
+            bytes[cursor..cursor + entry.len()].copy_from_slice(entry);
+            cursor += entry.len();
+        }
+        fix_checksum(&mut bytes, 9);
+        bytes
+    }
+
+    fn local_apic(uid: u8, apic_id: u8, flags: u32) -> [u8; MADT_PROCESSOR_LOCAL_APIC_BYTES] {
+        let mut entry = [0_u8; MADT_PROCESSOR_LOCAL_APIC_BYTES];
+        entry[0] = MADT_ENTRY_PROCESSOR_LOCAL_APIC;
+        entry[1] = MADT_PROCESSOR_LOCAL_APIC_BYTES as u8;
+        entry[2] = uid;
+        entry[3] = apic_id;
+        entry[4..8].copy_from_slice(&flags.to_le_bytes());
+        entry
+    }
+
+    fn x2apic(id: u32, flags: u32, uid: u32) -> [u8; MADT_PROCESSOR_LOCAL_X2APIC_BYTES] {
+        let mut entry = [0_u8; MADT_PROCESSOR_LOCAL_X2APIC_BYTES];
+        entry[0] = MADT_ENTRY_PROCESSOR_LOCAL_X2APIC;
+        entry[1] = MADT_PROCESSOR_LOCAL_X2APIC_BYTES as u8;
+        entry[4..8].copy_from_slice(&id.to_le_bytes());
+        entry[8..12].copy_from_slice(&flags.to_le_bytes());
+        entry[12..16].copy_from_slice(&uid.to_le_bytes());
+        entry
+    }
+
+    fn topology(
+        memory: &mut impl AcpiByteReader,
+        rsdp: u64,
+        bsp_id: u8,
+    ) -> Result<CpuTopology, CpuTopologyError> {
+        discover_cpu_topology(memory, rsdp, bsp_id, true, &mut workspace())
+    }
+
     #[test]
     fn q35_extended_timer_is_snapshot_parsed_and_authorized() {
         let (mut memory, rsdp) =
@@ -513,6 +896,131 @@ mod tests {
         assert_eq!(
             proposal(&mut memory, rsdp),
             Err(AcpiTimeError::HardwareReduced)
+        );
+    }
+
+    #[test]
+    fn madt_assigns_bsp_zero_and_sorts_enabled_aps_by_apic_id() {
+        let ap4 = local_apic(4, 4, MADT_PROCESSOR_ENABLED);
+        let bsp = local_apic(2, 2, MADT_PROCESSOR_ENABLED);
+        let disabled = local_apic(1, 1, 1 << 1);
+        let ap0 = local_apic(0, 0, MADT_PROCESSOR_ENABLED);
+        let table = madt(&[&ap4, &bsp, &disabled, &ap0, &[0x7f, 2]]);
+        let (mut memory, rsdp) = topology_fixture(&[table]);
+        let topology = topology(&mut memory, rsdp, 2).unwrap();
+        assert_eq!(topology.local_apic_physical_address(), 0xfee0_0000);
+        assert!(topology.pc_at_compatible());
+        assert_eq!(topology.len(), 3);
+        assert!(!topology.is_empty());
+        let entries = topology.entries().collect::<Vec<_>>();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (
+                    entry.logical_index(),
+                    entry.local_apic_id(),
+                    entry.acpi_processor_uid()
+                ))
+                .collect::<Vec<_>>(),
+            vec![(0, 2, 2), (1, 0, 0), (2, 4, 4)]
+        );
+    }
+
+    #[test]
+    fn madt_rejects_duplicate_ids_uids_and_missing_bsp() {
+        let enabled = local_apic(1, 1, MADT_PROCESSOR_ENABLED);
+        let duplicate_id = local_apic(2, 1, 0);
+        let table = madt(&[&enabled, &duplicate_id]);
+        let (mut memory, rsdp) = topology_fixture(&[table]);
+        assert_eq!(
+            topology(&mut memory, rsdp, 1),
+            Err(CpuTopologyError::DuplicateLocalApicId(1))
+        );
+
+        let duplicate_uid = local_apic(1, 2, MADT_PROCESSOR_ENABLED);
+        let table = madt(&[&enabled, &duplicate_uid]);
+        let (mut memory, rsdp) = topology_fixture(&[table]);
+        assert_eq!(
+            topology(&mut memory, rsdp, 1),
+            Err(CpuTopologyError::DuplicateProcessorUid(1))
+        );
+
+        let only_ap = local_apic(3, 3, MADT_PROCESSOR_ENABLED);
+        let table = madt(&[&only_ap]);
+        let (mut memory, rsdp) = topology_fixture(&[table]);
+        assert_eq!(
+            topology(&mut memory, rsdp, 1),
+            Err(CpuTopologyError::MissingBootstrapProcessor(1))
+        );
+    }
+
+    #[test]
+    fn madt_rejects_malformed_entries_enabled_x2apic_and_duplicate_tables() {
+        let bsp = local_apic(0, 0, MADT_PROCESSOR_ENABLED);
+        let malformed = [MADT_ENTRY_PROCESSOR_LOCAL_APIC, 1];
+        let table = madt(&[&bsp, &malformed]);
+        let (mut memory, rsdp) = topology_fixture(&[table]);
+        assert_eq!(
+            topology(&mut memory, rsdp, 0),
+            Err(CpuTopologyError::InvalidMadt)
+        );
+
+        let x2 = x2apic(0x1234, MADT_PROCESSOR_ENABLED, 9);
+        let table = madt(&[&bsp, &x2]);
+        let (mut memory, rsdp) = topology_fixture(&[table]);
+        assert_eq!(
+            topology(&mut memory, rsdp, 0),
+            Err(CpuTopologyError::UnsupportedEnabledX2Apic(0x1234))
+        );
+
+        let first = madt(&[&bsp]);
+        let second = madt(&[&bsp]);
+        let (mut memory, rsdp) = topology_fixture(&[first, second]);
+        assert_eq!(
+            topology(&mut memory, rsdp, 0),
+            Err(CpuTopologyError::DuplicateMadt)
+        );
+    }
+
+    #[test]
+    fn madt_rejects_capacity_overflow_and_non_bsp_discovery() {
+        let entries = (0..=MAX_DW0_CPUS)
+            .map(|id| local_apic(id as u8, id as u8, MADT_PROCESSOR_ENABLED))
+            .collect::<Vec<_>>();
+        let references = entries.iter().map(<[_; 8]>::as_slice).collect::<Vec<_>>();
+        let table = madt(&references);
+        let (mut memory, rsdp) = topology_fixture(&[table]);
+        assert_eq!(
+            topology(&mut memory, rsdp, 0),
+            Err(CpuTopologyError::CpuCapacity {
+                observed: MAX_DW0_CPUS + 1,
+                capacity: MAX_DW0_CPUS,
+            })
+        );
+
+        let bsp = local_apic(0, 0, MADT_PROCESSOR_ENABLED);
+        let table = madt(&[&bsp]);
+        let (mut memory, rsdp) = topology_fixture(&[table]);
+        assert_eq!(
+            discover_cpu_topology(&mut memory, rsdp, 0, false, &mut workspace()),
+            Err(CpuTopologyError::LiveCpuIsNotBootstrapProcessor)
+        );
+    }
+
+    #[test]
+    fn madt_accepts_one_aligned_xapic_address_override() {
+        let bsp = local_apic(0, 0, MADT_PROCESSOR_ENABLED);
+        let mut override_entry = [0_u8; MADT_LOCAL_APIC_ADDRESS_OVERRIDE_BYTES];
+        override_entry[0] = MADT_ENTRY_LOCAL_APIC_ADDRESS_OVERRIDE;
+        override_entry[1] = MADT_LOCAL_APIC_ADDRESS_OVERRIDE_BYTES as u8;
+        override_entry[4..12].copy_from_slice(&0x0000_0001_fee0_0000_u64.to_le_bytes());
+        let table = madt(&[&bsp, &override_entry]);
+        let (mut memory, rsdp) = topology_fixture(&[table]);
+        assert_eq!(
+            topology(&mut memory, rsdp, 0)
+                .unwrap()
+                .local_apic_physical_address(),
+            0x0000_0001_fee0_0000
         );
     }
 }
