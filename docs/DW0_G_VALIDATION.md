@@ -1,6 +1,6 @@
-# DW0-G5 Validation Record
+# DW0-G Validation Record
 
-**Status:** G5 validation accepted; P0 accounting remains open
+**Status:** DW0-G FULL ACCEPTED for progression to DW0-H; G5 accepted and P0 accounting reconciled
 
 **Date:** 2026-08-22
 
@@ -51,6 +51,8 @@ detached and its device, inode, size, capacity, allocation, and physical-size bo
 The exact `gpt-daybreak-blue-latest` rereviews pass C0/H0/M0/L0 after all findings and the final
 provenance request were remediated. See `security/DW0_G_SECURITY_REVIEW.md`.
 
-This closes G5 only. P0 remains a separate blocking accounting lane, so this record does not claim
-DW0-G full acceptance or progression to DW0-H. It also makes no SMP, preemption, real-time,
-general-exec, physical-hardware, i386, or full-Wyrmroot claim.
+G5 is accepted and the separate P0 accounting lane is closed by the coordinator reconciliation in
+`../../DW0_G_P0_ACCOUNTING_RECONCILIATION.md`, which binds WYR0-B to exact retained F12/F14 loader/VM
+evidence and proves WYR0-C library/contract continuity. **DW0-G is FULL ACCEPTED for progression to
+DW0-H.** This still makes no SMP, preemption, real-time, general-exec, physical-hardware, i386,
+full-WYR0-F, or full-Wyrmroot claim.
