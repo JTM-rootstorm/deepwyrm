@@ -20,6 +20,11 @@ const E7_SELECTORS: [&str; 3] = [
     "task-syscall-sanitize",
     "task-user-exception",
 ];
+const G5_PRIMORDIAL_SELECTORS: [&str; 3] = [
+    "primordial-blocking-cleanup",
+    "primordial-user-exception",
+    "primordial-invalid-return",
+];
 const OWNED_WORKSPACE_CARGO_CONFIG: &str = ".cargo/config.toml";
 const LEGACY_WORKSPACE_CARGO_CONFIG: &str = ".cargo/config";
 
@@ -190,14 +195,19 @@ fn production_and_six_memory_selector_artifacts_are_separated() {
         );
     }
     let production_bytes = fs::read(&production).expect("read production kernel artifact");
-    for forbidden in SELECTORS.into_iter().chain(E7_SELECTORS).chain([
-        "DWTEST1",
-        "dw_test_",
-        "EXPECTED_FAULT",
-        "complete_known_outcome",
-        "QEMU_DEBUG_EXIT_PORT",
-        "isa-debug-exit",
-    ]) {
+    for forbidden in SELECTORS
+        .into_iter()
+        .chain(E7_SELECTORS)
+        .chain(G5_PRIMORDIAL_SELECTORS)
+        .chain([
+            "DWTEST1",
+            "dw_test_",
+            "EXPECTED_FAULT",
+            "complete_known_outcome",
+            "QEMU_DEBUG_EXIT_PORT",
+            "isa-debug-exit",
+        ])
+    {
         assert!(
             !contains_bytes(&production_bytes, forbidden.as_bytes()),
             "production artifact retained test marker {forbidden}"
@@ -520,8 +530,8 @@ fn e7_task_smoke_artifact_is_freestanding_and_separated() {
 }
 
 #[test]
-#[ignore = "explicit accepted-toolchain DW0-F12 target-artifact gate"]
-fn implemented_f_selector_artifacts_are_freestanding_and_separated() {
+#[ignore = "explicit accepted-toolchain DW0-F/G5 target-artifact gate"]
+fn implemented_f_and_g5_selector_artifacts_are_freestanding_and_separated() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("kernel manifest has workspace parent")
@@ -639,6 +649,8 @@ fn implemented_f_selector_artifacts_are_freestanding_and_separated() {
         "F9Runtime",
         "F12Runtime",
         "IpcBlockingSmoke",
+        "G5PrimordialProbe",
+        "G5PrimordialExpectation",
     ] {
         assert!(
             !production_symbols.contains(forbidden),
@@ -646,19 +658,24 @@ fn implemented_f_selector_artifacts_are_freestanding_and_separated() {
         );
     }
     let production_bytes = fs::read(&production).expect("read production kernel artifact");
-    for forbidden in SELECTORS.into_iter().chain(E7_SELECTORS).chain([
-        "ipc-blocking-smoke",
-        "atomic-wait-wake",
-        "DWTEST1",
-        "dw_test_",
-        "test_support",
-        "EXPECTED_FAULT",
-        "complete_known_outcome",
-        "QEMU_DEBUG_EXIT_PORT",
-        "isa-debug-exit",
-        "F9Runtime",
-        "F12Runtime",
-    ]) {
+    for forbidden in SELECTORS
+        .into_iter()
+        .chain(E7_SELECTORS)
+        .chain(G5_PRIMORDIAL_SELECTORS)
+        .chain([
+            "ipc-blocking-smoke",
+            "atomic-wait-wake",
+            "DWTEST1",
+            "dw_test_",
+            "test_support",
+            "EXPECTED_FAULT",
+            "complete_known_outcome",
+            "QEMU_DEBUG_EXIT_PORT",
+            "isa-debug-exit",
+            "F9Runtime",
+            "F12Runtime",
+        ])
+    {
         assert!(
             !contains_bytes(&production_bytes, forbidden.as_bytes()),
             "production kernel retained test marker {forbidden}"
@@ -809,6 +826,68 @@ fn implemented_f_selector_artifacts_are_freestanding_and_separated() {
                 &resolved_stack_disassembly,
             );
         }
+    }
+
+    for selector in G5_PRIMORDIAL_SELECTORS {
+        let target = output_root.path().join(selector);
+        let kernel = build_kernel(&workspace, &target, &environment, tools, Some(selector));
+        validate_static_kernel_elf(&llvm_readelf, &kernel, "G5 primordial");
+        let kernel_symbols = symbols(&llvm_nm, &kernel);
+        validate_kernel_stack_artifact_geometry(&kernel_symbols);
+        for required in [
+            "activate_bootstrap_deep_paging",
+            "dw_x86_64_syscall_entry",
+            "dw_x86_64_terminal_reaper_handoff",
+            "complete_pass",
+            "complete_fail",
+        ] {
+            assert!(
+                kernel_symbols.contains(required),
+                "{selector} kernel omitted {required}"
+            );
+        }
+        for forbidden in [
+            "run_memory_foundation_test",
+            "run_task_userspace_test",
+            "run_atomic_wait_userspace_test",
+            "run_ipc_blocking_userspace_test",
+            "__dw_test_e7_user_blob_start",
+            "__dw_test_f9_user_blob_start",
+            "__dw_test_f12_user_blob_start",
+            "E7SmokeRuntime",
+            "F9Runtime",
+            "F12Runtime",
+        ] {
+            assert!(
+                !kernel_symbols.contains(forbidden),
+                "{selector} kernel retained synthetic-runtime symbol {forbidden}"
+            );
+        }
+        let kernel_disassembly = disassembly(&llvm_objdump, &kernel);
+        validate_entry_normalization(&kernel_disassembly);
+        validate_fp_simd_unavailable(&kernel_disassembly);
+        let kernel_hash = sha256(&kernel);
+        assert!(
+            kernel_hashes.insert(kernel_hash.clone()),
+            "{selector} kernel is byte-identical to production or another implemented selector"
+        );
+        eprintln!("{selector} kernel {kernel_hash}");
+
+        let stack_kernel = build_stack_kernel(
+            &workspace,
+            &output_root.path().join(format!("{selector}-stack-sizes")),
+            &environment,
+            tools,
+            Some(selector),
+        );
+        let stack_symbols = symbols(&llvm_nm, &stack_kernel);
+        validate_kernel_stack_artifact_geometry(&stack_symbols);
+        let stack_disassembly = disassembly(&llvm_objdump, &stack_kernel);
+        assert_eq!(
+            text_disassembly(&stack_disassembly),
+            text_disassembly(&kernel_disassembly),
+            "{selector} stack-size carrier changed the selector machine code"
+        );
     }
 
     let build_input_after = build_input_manifest_sha256(&workspace);

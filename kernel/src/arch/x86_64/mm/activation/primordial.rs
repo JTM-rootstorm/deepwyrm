@@ -26,6 +26,8 @@ use crate::memory::frame_roles::{ObjectBackingGrant, TableLevel};
 use crate::memory::object::{MemoryObjectAuthority, MemoryProtection};
 use crate::memory::user_range::{EmptyAddressRule, UserAccess, UserAddressSpace, UserRange};
 use crate::object::{HandleRef, InternalRef, ObjectRegistry};
+#[cfg(feature = "test-support")]
+use crate::syscall::FServiceOperationOwner;
 use crate::syscall::native::{
     NativeSyscallFrameRuntime, NativeSyscallHandler, NativeSyscallRequest, NativeSyscallResult,
     SyscallControl,
@@ -63,6 +65,203 @@ const PRIMORDIAL_MAX_MAPPING_PAGES: usize = (STACK_BYTES / PAGE_SIZE) as usize;
 const PRIMORDIAL_JOURNAL_ENTRIES: usize =
     PRIMORDIAL_MAX_MAPPING_PAGES + PRIMORDIAL_TABLE_CANDIDATES;
 const PRIMORDIAL_INVALIDATIONS: usize = PRIMORDIAL_MAX_MAPPING_PAGES;
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum G5PrimordialExpectation {
+    Baseline,
+    BlockingCleanup,
+    UserException,
+    InvalidReturn,
+}
+
+#[cfg(feature = "test-support")]
+struct G5PrimordialProbe {
+    expectation: G5PrimordialExpectation,
+    valid: bool,
+    generic_prepared_idle: bool,
+    generic_poll_resumed: bool,
+    generic_resumed_timed_out: bool,
+    atomic_prepared_idle: bool,
+    atomic_poll_resumed: bool,
+    atomic_resumed_timed_out: bool,
+    terminal_oracle_passed: bool,
+}
+
+#[cfg(feature = "test-support")]
+impl G5PrimordialProbe {
+    fn for_build() -> Self {
+        use crate::test_support::BuildGuestTest;
+
+        let expectation = match crate::test_support::BUILD_GUEST_TEST {
+            BuildGuestTest::PrimordialBootstrap => G5PrimordialExpectation::Baseline,
+            BuildGuestTest::PrimordialBlockingCleanup => G5PrimordialExpectation::BlockingCleanup,
+            BuildGuestTest::PrimordialUserException => G5PrimordialExpectation::UserException,
+            BuildGuestTest::PrimordialInvalidReturn => G5PrimordialExpectation::InvalidReturn,
+            _ => unreachable!("primordial runtime requires a primordial selector"),
+        };
+        Self {
+            expectation,
+            valid: true,
+            generic_prepared_idle: false,
+            generic_poll_resumed: false,
+            generic_resumed_timed_out: false,
+            atomic_prepared_idle: false,
+            atomic_poll_resumed: false,
+            atomic_resumed_timed_out: false,
+            terminal_oracle_passed: false,
+        }
+    }
+
+    fn observe_prepare(
+        &mut self,
+        owner: Result<FServiceOperationOwner, crate::syscall::FServiceOwnerError>,
+        idle_current: bool,
+    ) {
+        if self.expectation != G5PrimordialExpectation::BlockingCleanup {
+            return;
+        }
+        match owner {
+            Ok(FServiceOperationOwner::GenericWait) => {
+                let ordered = !self.generic_prepared_idle
+                    && !self.generic_poll_resumed
+                    && !self.generic_resumed_timed_out
+                    && !self.atomic_prepared_idle
+                    && !self.atomic_poll_resumed
+                    && !self.atomic_resumed_timed_out;
+                self.valid &= idle_current && ordered;
+                self.generic_prepared_idle = idle_current && ordered;
+            }
+            Ok(FServiceOperationOwner::AtomicWait) => {
+                let ordered = self.generic_prepared_idle
+                    && self.generic_poll_resumed
+                    && self.generic_resumed_timed_out
+                    && !self.atomic_prepared_idle
+                    && !self.atomic_poll_resumed
+                    && !self.atomic_resumed_timed_out;
+                self.valid &= idle_current && ordered;
+                self.atomic_prepared_idle = idle_current && ordered;
+            }
+            Err(_) => self.valid = false,
+        }
+    }
+
+    fn observe_poll(
+        &mut self,
+        owner: Result<FServiceOperationOwner, crate::syscall::FServiceOwnerError>,
+        resume_current: bool,
+        switched: bool,
+    ) {
+        if self.expectation != G5PrimordialExpectation::BlockingCleanup {
+            return;
+        }
+        match owner {
+            Ok(FServiceOperationOwner::GenericWait) => {
+                let ordered = self.generic_prepared_idle
+                    && !self.generic_poll_resumed
+                    && !self.generic_resumed_timed_out
+                    && !self.atomic_prepared_idle;
+                self.valid &= ordered && !switched;
+                if resume_current && ordered {
+                    self.generic_poll_resumed = true;
+                }
+            }
+            Ok(FServiceOperationOwner::AtomicWait) => {
+                let ordered = self.generic_resumed_timed_out
+                    && self.atomic_prepared_idle
+                    && !self.atomic_poll_resumed
+                    && !self.atomic_resumed_timed_out;
+                self.valid &= ordered && !switched;
+                if resume_current && ordered {
+                    self.atomic_poll_resumed = true;
+                }
+            }
+            Err(_) => self.valid = false,
+        }
+    }
+
+    fn observe_resume(
+        &mut self,
+        owner: Result<FServiceOperationOwner, crate::syscall::FServiceOwnerError>,
+        status: deepwyrm_abi::DwStatus,
+    ) {
+        if self.expectation != G5PrimordialExpectation::BlockingCleanup {
+            return;
+        }
+        match owner {
+            Ok(FServiceOperationOwner::GenericWait) => {
+                let ordered = self.generic_poll_resumed
+                    && !self.generic_resumed_timed_out
+                    && !self.atomic_prepared_idle;
+                self.valid &= ordered && status == deepwyrm_abi::DW_STATUS_TIMED_OUT;
+                self.generic_resumed_timed_out =
+                    ordered && status == deepwyrm_abi::DW_STATUS_TIMED_OUT;
+            }
+            Ok(FServiceOperationOwner::AtomicWait) => {
+                let ordered = self.generic_resumed_timed_out
+                    && self.atomic_poll_resumed
+                    && !self.atomic_resumed_timed_out;
+                self.valid &= ordered && status == deepwyrm_abi::DW_STATUS_TIMED_OUT;
+                self.atomic_resumed_timed_out =
+                    ordered && status == deepwyrm_abi::DW_STATUS_TIMED_OUT;
+            }
+            Err(_) => self.valid = false,
+        }
+    }
+
+    fn observe_terminal(&mut self, info: deepwyrm_abi::DwTaskTerminationInfoV1) {
+        let (exception_type, detail) = match self.expectation {
+            G5PrimordialExpectation::UserException => {
+                (deepwyrm_abi::DW_EXCEPTION_ILLEGAL_INSTRUCTION, 6)
+            }
+            G5PrimordialExpectation::InvalidReturn => {
+                (deepwyrm_abi::DW_EXCEPTION_GENERAL_PROTECTION, 1)
+            }
+            G5PrimordialExpectation::Baseline | G5PrimordialExpectation::BlockingCleanup => return,
+        };
+        self.terminal_oracle_passed = info
+            == deepwyrm_abi::DwTaskTerminationInfoV1 {
+                size: deepwyrm_abi::DW_TASK_TERMINATION_INFO_V1_SIZE,
+                version: 1,
+                state: deepwyrm_abi::DW_TASK_STATE_EXITED,
+                reason: deepwyrm_abi::DW_TERMINATION_UNHANDLED_EXCEPTION,
+                application_code: 0,
+                exception_type,
+                detail,
+                reserved0: 0,
+                fault_address: 0,
+                reserved: [0; 3],
+            };
+    }
+
+    fn accepts_completion(
+        &self,
+        completion: &Result<
+            (),
+            crate::boot::primordial::construction::PrimordialCompletionError<()>,
+        >,
+    ) -> bool {
+        use crate::boot::primordial::construction::PrimordialCompletionError;
+
+        match self.expectation {
+            G5PrimordialExpectation::Baseline => completion == &Ok(()),
+            G5PrimordialExpectation::BlockingCleanup => {
+                self.valid
+                    && self.generic_prepared_idle
+                    && self.generic_poll_resumed
+                    && self.generic_resumed_timed_out
+                    && self.atomic_prepared_idle
+                    && self.atomic_poll_resumed
+                    && self.atomic_resumed_timed_out
+                    && completion == &Ok(())
+            }
+            G5PrimordialExpectation::UserException | G5PrimordialExpectation::InvalidReturn => {
+                self.terminal_oracle_passed
+                    && completion == &Err(PrimordialCompletionError::UnhandledException)
+            }
+        }
+    }
+}
 
 type Registry = ObjectRegistry<REGISTRY_OBJECTS>;
 type Memory = MemoryObjectAuthority<MEMORY_OBJECTS, MEMORY_LEASES>;
@@ -516,6 +715,8 @@ struct Runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> 
     root_owner: Option<InternalRef>,
     deferred_current: Option<crate::task::DeferredCurrentExecutionResources>,
     cleanup: CleanupQueue<REGISTRY_OBJECTS>,
+    #[cfg(feature = "test-support")]
+    g5_probe: G5PrimordialProbe,
 }
 
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
@@ -740,6 +941,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialCompleti
 
     fn observe_exit(&mut self) -> Result<PrimordialExitDisposition, Self::Error> {
         let info = self.tasks.process_info(self.process).map_err(|_| ())?;
+        #[cfg(feature = "test-support")]
+        self.g5_probe.observe_terminal(info);
         if info.state != DW_TASK_STATE_EXITED {
             return Err(());
         }
@@ -802,9 +1005,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         );
         let completion = complete_primordial_launch(self);
         #[cfg(feature = "test-support")]
-        match completion {
-            Ok(()) => crate::test_support::complete_pass(0),
-            Err(_) => crate::test_support::complete_fail(1),
+        if self.g5_probe.accepts_completion(&completion) {
+            crate::test_support::complete_pass(0)
+        } else {
+            crate::test_support::complete_fail(1)
         }
         #[cfg(not(feature = "test-support"))]
         {
@@ -839,31 +1043,59 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         &'owner mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     ) -> crate::syscall::native::NativeSuspendPlan<'owner> {
-        unsafe {
+        #[cfg(feature = "test-support")]
+        let owner = self.services.operation_owner(self.thread);
+        let plan = unsafe {
             self.services.prepare_suspend(
                 &self.tasks,
                 self.execution,
                 crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
             )
         }
-        .unwrap_or_else(|error| panic!("primordial suspend preparation drifted: {error:?}"))
+        .unwrap_or_else(|error| panic!("primordial suspend preparation drifted: {error:?}"));
+        #[cfg(feature = "test-support")]
+        self.g5_probe.observe_prepare(
+            owner,
+            matches!(
+                &plan,
+                crate::syscall::native::NativeSuspendPlan::IdleCurrent
+            ),
+        );
+        plan
     }
 
     unsafe fn poll_idle_suspend<'owner>(
         &'owner mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     ) -> crate::syscall::native::NativeIdleSuspendPoll<'owner> {
-        unsafe {
+        #[cfg(feature = "test-support")]
+        let owner = self.services.operation_owner(self.thread);
+        let poll = unsafe {
             self.services.poll_idle_suspend(
                 &self.tasks,
                 self.execution,
                 crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
             )
         }
-        .unwrap_or_else(|error| panic!("primordial idle-suspend poll drifted: {error:?}"))
+        .unwrap_or_else(|error| panic!("primordial idle-suspend poll drifted: {error:?}"));
+        #[cfg(feature = "test-support")]
+        self.g5_probe.observe_poll(
+            owner,
+            matches!(
+                &poll,
+                crate::syscall::native::NativeIdleSuspendPoll::ResumeCurrent
+            ),
+            matches!(
+                &poll,
+                crate::syscall::native::NativeIdleSuspendPoll::Switch(_)
+            ),
+        );
+        poll
     }
 
     fn resume_suspended(&mut self, frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame) {
+        #[cfg(feature = "test-support")]
+        let owner = self.services.operation_owner(self.thread);
         let resumed = {
             let mut user = self.active.current_process_address_space(self.process);
             let mut deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
@@ -879,6 +1111,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         .unwrap_or_else(|error| panic!("primordial suspended syscall resume drifted: {error:?}"));
         let (status, cleanup) = resumed.into_parts();
         self.merge_cleanup(cleanup);
+        #[cfg(feature = "test-support")]
+        self.g5_probe.observe_resume(owner, status);
         frame.set_status(status);
     }
 }
@@ -1011,6 +1245,8 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         root_owner: Some(root_owner),
         deferred_current: None,
         cleanup: CleanupQueue::new(),
+        #[cfg(feature = "test-support")]
+        g5_probe: G5PrimordialProbe::for_build(),
     };
     let exception_binding =
         crate::arch::x86_64::syscall::bind_native_runtime_user_exception_handler()

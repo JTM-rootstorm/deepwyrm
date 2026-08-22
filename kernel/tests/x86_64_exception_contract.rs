@@ -70,6 +70,43 @@ fn g5_user_faults_and_invalid_returns_share_structured_terminal_reaper_handoff()
 }
 
 #[test]
+fn g5_primordial_selectors_have_exact_post_teardown_oracles() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+
+    for evidence in [
+        "G5PrimordialExpectation::BlockingCleanup",
+        "FServiceOperationOwner::GenericWait",
+        "FServiceOperationOwner::AtomicWait",
+        "NativeSuspendPlan::IdleCurrent",
+        "NativeIdleSuspendPoll::ResumeCurrent",
+        "DW_STATUS_TIMED_OUT",
+        "G5PrimordialExpectation::UserException",
+        "DW_EXCEPTION_ILLEGAL_INSTRUCTION, 6",
+        "G5PrimordialExpectation::InvalidReturn",
+        "DW_EXCEPTION_GENERAL_PROTECTION, 1",
+        "DW_TERMINATION_UNHANDLED_EXCEPTION",
+        "PrimordialCompletionError::UnhandledException",
+    ] {
+        assert!(
+            primordial.contains(evidence),
+            "primordial G5 oracle omitted {evidence}"
+        );
+    }
+
+    let terminate = primordial
+        .split_once("fn terminate_current(&mut self) -> !")
+        .expect("primordial terminal handoff")
+        .1;
+    let completion = terminate
+        .find("let completion = complete_primordial_launch(self);")
+        .expect("structured completion after reaper reclaim");
+    let oracle = terminate
+        .find("self.g5_probe.accepts_completion(&completion)")
+        .expect("G5 post-completion oracle");
+    assert!(completion < oracle);
+}
+
+#[test]
 fn e4_exception_assembly_remains_freestanding() {
     let clang = "/usr/lib/llvm/22/bin/clang-22";
     if Command::new(clang).arg("--version").output().is_err() {

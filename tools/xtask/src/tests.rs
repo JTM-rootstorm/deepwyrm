@@ -392,6 +392,32 @@ fn dw0f_selectors_distinguish_implemented_and_reserved_identities() {
 }
 
 #[test]
+fn dw0g_primordial_selectors_have_stable_runnable_identities() {
+    let config = workspace_root().join(HARNESS_CONFIG);
+    for (selector, test_id) in [
+        ("primordial-bootstrap", 18),
+        ("primordial-blocking-cleanup", 19),
+        ("primordial-user-exception", 20),
+        ("primordial-invalid-return", 21),
+    ] {
+        let request_path = temp_file(
+            &request("guest-test", selector)
+                .replace("test_id = 1", &format!("test_id = {test_id}")),
+        );
+        let parsed = load_harness_request(&request_path).unwrap();
+        validate_guest_selector_metadata(&config, &parsed).unwrap();
+        assert_eq!(
+            guest_build_selection(HarnessKind::GuestTest, &parsed),
+            Some(GuestBuildSelection {
+                selector: selector.into(),
+                expected_test_id: test_id,
+            })
+        );
+        fs::remove_file(request_path).unwrap();
+    }
+}
+
+#[test]
 fn build_tools_identity_is_host_neutral_and_fixed() {
     let identity = load_build_tools_identity(&workspace_root().join(BUILD_TOOLS_CONFIG)).unwrap();
     assert_eq!(identity.clang_version, "22.1.8");

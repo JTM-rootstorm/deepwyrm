@@ -29,6 +29,9 @@ pub(crate) enum BuildGuestTest {
     IpcBlockingSmoke,
     AtomicWaitWake,
     PrimordialBootstrap,
+    PrimordialBlockingCleanup,
+    PrimordialUserException,
+    PrimordialInvalidReturn,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,6 +89,9 @@ impl BuildGuestTest {
             Self::IpcBlockingSmoke => 13,
             Self::AtomicWaitWake => 16,
             Self::PrimordialBootstrap => 18,
+            Self::PrimordialBlockingCleanup => 19,
+            Self::PrimordialUserException => 20,
+            Self::PrimordialInvalidReturn => 21,
         }
     }
 
@@ -113,7 +119,13 @@ impl BuildGuestTest {
     }
 
     pub(crate) const fn is_primordial(self) -> bool {
-        matches!(self, Self::PrimordialBootstrap)
+        matches!(
+            self,
+            Self::PrimordialBootstrap
+                | Self::PrimordialBlockingCleanup
+                | Self::PrimordialUserException
+                | Self::PrimordialInvalidReturn
+        )
     }
 
     pub(crate) const fn is_memory_foundation(self) -> bool {
@@ -208,6 +220,12 @@ const fn parse_known_selector(value: &str) -> BuildGuestTest {
         BuildGuestTest::AtomicWaitWake
     } else if string_equals(value, "primordial-bootstrap") {
         BuildGuestTest::PrimordialBootstrap
+    } else if string_equals(value, "primordial-blocking-cleanup") {
+        BuildGuestTest::PrimordialBlockingCleanup
+    } else if string_equals(value, "primordial-user-exception") {
+        BuildGuestTest::PrimordialUserException
+    } else if string_equals(value, "primordial-invalid-return") {
+        BuildGuestTest::PrimordialInvalidReturn
     } else {
         panic!("unknown build-selected guest test")
     }

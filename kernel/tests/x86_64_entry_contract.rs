@@ -224,6 +224,10 @@ fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
         ("task-syscall-smoke", 10),
         ("ipc-blocking-smoke", 13),
         ("atomic-wait-wake", 16),
+        ("primordial-bootstrap", 18),
+        ("primordial-blocking-cleanup", 19),
+        ("primordial-user-exception", 20),
+        ("primordial-invalid-return", 21),
     ] {
         assert_eq!(
             kernel_build::select_guest_test(true, Some(selector), false, &harness),

@@ -108,8 +108,20 @@ state = "implemented"
 id = 17
 state = "reserved"
 
-# DW0-G production-path test build. Unlike the synthetic F selectors, this
-# consumes the loader-provided bootstrap and bootfs modules.
+# DW0-G production-path test builds. Unlike the synthetic F selectors, these
+# consume the loader-provided bootstrap and bootfs modules.
 [guest_test.primordial-bootstrap]
 id = 18
+state = "implemented"
+
+[guest_test.primordial-blocking-cleanup]
+id = 19
+state = "implemented"
+
+[guest_test.primordial-user-exception]
+id = 20
+state = "implemented"
+
+[guest_test.primordial-invalid-return]
+id = 21
 state = "implemented"
