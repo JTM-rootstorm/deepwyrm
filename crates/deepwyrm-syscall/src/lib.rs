@@ -83,6 +83,24 @@ fn output_address<T: ?Sized>(value: &mut T) -> u64 {
 }
 
 #[inline]
+fn input_slice_address<T>(value: &[T]) -> u64 {
+    if value.is_empty() {
+        0
+    } else {
+        input_address(value)
+    }
+}
+
+#[inline]
+fn output_slice_address<T>(value: &mut [T]) -> u64 {
+    if value.is_empty() {
+        0
+    } else {
+        output_address(value)
+    }
+}
+
+#[inline]
 fn u32_len(length: usize) -> Result<u32, DwStatus> {
     u32::try_from(length).map_err(|_| DW_STATUS_INVALID_ARGUMENT)
 }
@@ -169,9 +187,9 @@ pub fn channel_send(
         syscall6(
             DW_SYSCALL_CHANNEL_SEND,
             channel.0,
-            input_address(bytes),
+            input_slice_address(bytes),
             u64::from(byte_len),
-            input_address(transfers),
+            input_slice_address(transfers),
             u64::from(transfer_count),
             flags,
         )
@@ -198,9 +216,9 @@ pub fn channel_receive(
         syscall6(
             DW_SYSCALL_CHANNEL_RECEIVE,
             channel.0,
-            output_address(out_bytes),
+            output_slice_address(out_bytes),
             u64::from(byte_capacity),
-            output_address(out_handles),
+            output_slice_address(out_handles),
             u64::from(handle_capacity),
             output_address(out_result),
         )
@@ -248,5 +266,37 @@ pub fn address_region_unmap(
             0,
             0,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_channel_slices_use_null_abi_addresses() {
+        assert_eq!(input_slice_address::<u8>(&[]), 0);
+        assert_eq!(input_slice_address::<DwHandleTransferV1>(&[]), 0);
+        assert_eq!(output_slice_address::<u8>(&mut []), 0);
+        assert_eq!(output_slice_address::<DwReceivedHandleInfoV1>(&mut []), 0);
+    }
+
+    #[test]
+    fn nonempty_channel_slices_preserve_data_addresses() {
+        let bytes = [90_u8; 1];
+        let transfers = [DwHandleTransferV1::default(); 1];
+        let mut out_bytes = [0_u8; 1];
+        let mut out_handles = [DwReceivedHandleInfoV1::default(); 1];
+
+        assert_eq!(input_slice_address(&bytes), bytes.as_ptr() as u64);
+        assert_eq!(input_slice_address(&transfers), transfers.as_ptr() as u64);
+        assert_eq!(
+            output_slice_address(&mut out_bytes),
+            out_bytes.as_mut_ptr() as u64
+        );
+        assert_eq!(
+            output_slice_address(&mut out_handles),
+            out_handles.as_mut_ptr() as u64
+        );
     }
 }
