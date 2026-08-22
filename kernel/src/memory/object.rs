@@ -15,7 +15,7 @@ use crate::handle::ResolvedHandle;
 use crate::memory::frame_roles::{
     BackingIdentity, FrameRoleManager, ObjectBackingGrant, ObjectBackingKind,
 };
-use crate::object::{CreationRef, FinalRelease, InternalRef, ObjectId, ObjectRegistry};
+use crate::object::{CreationRef, FinalRelease, HandleRef, InternalRef, ObjectId, ObjectRegistry};
 use deepwyrm_abi::{
     DW_OBJECT_TYPE_MEMORY_OBJECT, DW_RIGHT_EXECUTE, DW_RIGHT_MAP, DW_RIGHT_READ, DW_RIGHT_WRITE,
 };
@@ -302,12 +302,6 @@ impl MemoryObjectKey {
 
     pub(crate) const fn object_id(self) -> Option<ObjectId> {
         self.object
-    }
-
-    pub(crate) const fn from_object_id(object: ObjectId) -> Self {
-        Self {
-            object: Some(object),
-        }
     }
 }
 
@@ -859,19 +853,31 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         })
     }
 
-    /// Returns the exclusive typed backing for kernel population while the
-    /// caller still owns the unpublished creator reference.
+    /// Returns writable page backing for a kernel factory that still owns the
+    /// corresponding HandleRef. This deliberately does not accept an ObjectId
+    /// or synthesize a MemoryObjectKey, preserving the key as authority-issued.
     pub(crate) fn backing_for_population(
         &self,
-        object: MemoryObjectKey,
+        reference: &HandleRef,
     ) -> Result<&ObjectBackingGrant, MemoryObjectError> {
-        let record = self.object_record(object)?;
-        let object_id = record.object;
+        if reference.object_type() != DW_OBJECT_TYPE_MEMORY_OBJECT {
+            return Err(MemoryObjectError::ObjectReference);
+        }
+        let object_id = reference.id();
         let slot = self
             .objects
             .iter()
             .position(|slot| slot.record.is_some_and(|record| record.object == object_id))
             .ok_or(MemoryObjectError::InvalidObjectKey)?;
+        let record = self.objects[slot]
+            .record
+            .ok_or(MemoryObjectError::InvalidObjectKey)?;
+        if record.kind != MemoryObjectKind::PageBacked {
+            return Err(MemoryObjectError::BackingKind);
+        }
+        if !record.protection_ceiling.writable() {
+            return Err(MemoryObjectError::ProtectionCeiling);
+        }
         self.backings[slot]
             .as_ref()
             .ok_or(MemoryObjectError::InvalidObjectKey)

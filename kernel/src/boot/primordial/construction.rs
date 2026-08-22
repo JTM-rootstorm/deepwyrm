@@ -187,6 +187,18 @@ where
         return Err(PrimordialConstructionError::BootfsBytes);
     }
     let layout = stack_layout(plan).ok_or(PrimordialConstructionError::StackPlacement)?;
+    for index in 0..plan.segment_count() {
+        let segment = plan
+            .segment(index)
+            .expect("validated plan segment count remains exact");
+        if initialized_segment_bytes(segment, bootstrap).is_none() {
+            return Err(PrimordialConstructionError::BootstrapBytes);
+        }
+    }
+    let bootfs_len =
+        u64::try_from(bootfs.len()).map_err(|_| PrimordialConstructionError::BootfsBytes)?;
+    let rounded_bootfs =
+        align_up(bootfs_len, PAGE_SIZE).ok_or(PrimordialConstructionError::BootfsBytes)?;
 
     step(
         backend,
@@ -198,16 +210,8 @@ where
         let segment = plan
             .segment(index)
             .expect("validated plan segment count remains exact");
-        let file_start = usize::try_from(segment.file_offset())
-            .map_err(|_| PrimordialConstructionError::BootstrapBytes)?;
-        let file_len = usize::try_from(segment.file_byte_len())
-            .map_err(|_| PrimordialConstructionError::BootstrapBytes)?;
-        let file_end = file_start
-            .checked_add(file_len)
-            .ok_or(PrimordialConstructionError::BootstrapBytes)?;
-        let initialized = bootstrap
-            .get(file_start..file_end)
-            .ok_or(PrimordialConstructionError::BootstrapBytes)?;
+        let initialized = initialized_segment_bytes(segment, bootstrap)
+            .expect("construction inputs were preflighted before resource preparation");
         let initialized_offset = segment.virtual_start() - segment.page_start();
         step(
             backend,
@@ -264,10 +268,6 @@ where
         backend.rollback();
         return Err(PrimordialConstructionError::InvalidBootstrapHandle);
     }
-    let bootfs_len =
-        u64::try_from(bootfs.len()).map_err(|_| PrimordialConstructionError::BootfsBytes)?;
-    let rounded_bootfs =
-        align_up(bootfs_len, PAGE_SIZE).ok_or(PrimordialConstructionError::BootfsBytes)?;
     step(
         backend,
         PrimordialConstructionStage::BootfsObject,
@@ -345,6 +345,13 @@ where
         return Err(PrimordialConstructionError::Injected(stage));
     }
     Ok(value)
+}
+
+fn initialized_segment_bytes(segment: PrimordialLoadSegment, bootstrap: &[u8]) -> Option<&[u8]> {
+    let file_start = usize::try_from(segment.file_offset()).ok()?;
+    let file_len = usize::try_from(segment.file_byte_len()).ok()?;
+    let file_end = file_start.checked_add(file_len)?;
+    bootstrap.get(file_start..file_end)
 }
 
 fn stack_layout(plan: &PrimordialElfLoadPlan) -> Option<PrimordialStackLayout> {

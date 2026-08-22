@@ -169,6 +169,43 @@ fn production_binding_consumes_creation_before_first_publication() {
 }
 
 #[test]
+fn kernel_population_requires_held_writable_page_backed_reference() {
+    for (ceiling, expected) in [
+        (MemoryProtection::READ_WRITE, Ok(())),
+        (
+            MemoryProtection::READ,
+            Err(MemoryObjectError::ProtectionCeiling),
+        ),
+    ] {
+        let mut registry = ObjectRegistry::<1>::new();
+        let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+        let backing = crate::memory::frame_roles::synthetic_allocator_backing(0x48_000, 1);
+        let mut authority = MemoryObjectAuthority::<1, 1>::new();
+        let binding = authority
+            .bind_backing(
+                creation,
+                backing,
+                PAGE_SIZE,
+                MemoryObjectKind::PageBacked,
+                ceiling,
+            )
+            .unwrap();
+        let bound = registry.finish_payload_binding(binding).unwrap();
+        let handle = registry.bound_into_handle(bound).unwrap();
+
+        assert_eq!(
+            authority.backing_for_population(&handle).map(|_| ()),
+            expected
+        );
+
+        let final_release = registry.release_handle(handle).unwrap().unwrap();
+        let finalization = authority.take_finalization(final_release).unwrap();
+        let (release, _backing) = finalization.into_parts();
+        registry.complete_finalization(release).unwrap();
+    }
+}
+
+#[test]
 fn failed_production_binding_returns_creation_and_backing_for_rollback() {
     let mut registry = ObjectRegistry::<1>::new();
     let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();

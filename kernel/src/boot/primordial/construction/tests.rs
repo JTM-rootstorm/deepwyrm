@@ -306,6 +306,30 @@ fn constructs_exact_startup_init_and_capability_contract_before_commit() {
 }
 
 #[test]
+fn mismatched_bootstrap_bytes_fail_before_resource_preparation() {
+    let elf = elf_fixture();
+    let plan = parse_primordial_elf(&elf).unwrap();
+    let first = plan.segment(0).unwrap();
+    let truncated_len = usize::try_from(first.file_offset()).unwrap();
+    let mut backend = HostBackend::new(7);
+
+    assert_eq!(
+        construct_primordial(
+            &plan,
+            &elf[..truncated_len],
+            b"bootfs",
+            &mut backend,
+            |_| false,
+        ),
+        Err(PrimordialConstructionError::BootstrapBytes)
+    );
+    assert!(backend.completed.is_empty());
+    assert_eq!(backend.live_resources, 0);
+    assert!(!backend.committed);
+    assert!(!backend.rolled_back);
+}
+
+#[test]
 fn every_post_boundary_injection_rolls_back_to_zero_resources() {
     let elf = elf_fixture();
     let plan = parse_primordial_elf(&elf).unwrap();

@@ -577,26 +577,13 @@ where
         bytes: &[u8; STARTUP_BLOCK_BYTES],
     ) -> Result<(), Self::Error> {
         let stack = self.stack.as_ref().ok_or(AuthorityPrimordialError::State)?;
-        let object = crate::handle::ResolvedHandle::from_kernel_reference(
-            self.registry,
-            stack,
-            mapping_rights(MemoryProtection::READ_WRITE),
-        )
-        .map_err(|_| AuthorityPrimordialError::Handle)?;
-        let key = crate::memory::object::MemoryObjectKey::from_object_id(object.object_id());
         let backing = self
             .memory
-            .backing_for_population(key)
+            .backing_for_population(stack)
             .map_err(AuthorityPrimordialError::Memory)?;
-        let result = self.platform.write_backing(backing, object_offset, bytes);
-        let pin = object.into_internal();
-        assert!(
-            self.registry
-                .release_internal(pin)
-                .expect("startup population pin release remains valid")
-                .is_none()
-        );
-        result.map_err(AuthorityPrimordialError::Platform)
+        self.platform
+            .write_backing(backing, object_offset, bytes)
+            .map_err(AuthorityPrimordialError::Platform)
     }
 
     fn create_channel_pair(&mut self) -> Result<(), Self::Error> {
