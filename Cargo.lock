@@ -18,5 +18,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "deepwyrm-syscall"
+version = "0.0.0"
+dependencies = [
+ "deepwyrm-abi",
+]
+
+[[package]]
 name = "xtask"
 version = "0.0.0"

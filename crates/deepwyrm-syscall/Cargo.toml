@@ -1,0 +1,12 @@
+[package]
+name = "deepwyrm-syscall"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license.workspace = true
+
+[dependencies]
+deepwyrm-abi = { path = "../deepwyrm-abi" }
+
+[lib]
+path = "src/lib.rs"
