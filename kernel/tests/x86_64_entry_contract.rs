@@ -396,6 +396,51 @@ fn g3_primordial_mapping_failures_remain_recoverable_and_rollback_owned_candidat
 }
 
 #[test]
+fn g5_primordial_blocking_uses_the_f12_idle_suspend_resume_flow() {
+    let primordial =
+        fs::read_to_string(kernel_root().join("src/arch/x86_64/mm/activation/primordial.rs"))
+            .expect("read G5 primordial runtime source");
+
+    assert!(primordial.contains("self.services.prepare_suspend("));
+    assert!(primordial.contains("self.services.poll_idle_suspend("));
+    assert!(primordial.contains("self.services.resume_suspended("));
+    assert!(primordial.contains("bind_deadline_wake_target(target)"));
+    assert!(!primordial.contains("primordial bootstrap blocked despite its prepublished INIT"));
+    assert!(!primordial.contains("primordial bootstrap reached an unexpected idle suspension"));
+    assert!(!primordial.contains("primordial bootstrap unexpectedly resumed a blocked syscall"));
+}
+
+#[test]
+fn g5_terminal_completion_drains_all_primordial_authority_before_capacity_proof() {
+    let primordial =
+        fs::read_to_string(kernel_root().join("src/arch/x86_64/mm/activation/primordial.rs"))
+            .expect("read G5 primordial runtime source");
+    let completion = fs::read_to_string(kernel_root().join("src/boot/primordial/construction.rs"))
+        .expect("read primordial completion source");
+
+    for required in [
+        "unmap_all_userspace()?",
+        "retire_exited_root(",
+        "release_terminal_authority()?",
+        "drain_finalizers()?",
+        "prove_registry_capacity()",
+    ] {
+        assert!(
+            primordial.contains(required),
+            "primordial terminal teardown omitted {required}"
+        );
+    }
+    let observe = completion
+        .find("let exit = backend.observe_exit();")
+        .unwrap();
+    let drain = completion
+        .find("let quiescent = backend.verify_quiescent();")
+        .unwrap();
+    let disposition = completion.find("match disposition").unwrap();
+    assert!(observe < drain && drain < disposition);
+}
+
+#[test]
 fn e7_user_contract_uses_generated_syscall_veneer_and_generated_abi_values() {
     let source = fs::read_to_string(kernel_root().join("tests/userspace/e7_task_smoke.S"))
         .expect("read E7 userspace source");

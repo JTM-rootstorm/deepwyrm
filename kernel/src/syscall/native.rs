@@ -747,7 +747,15 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
         current_binding_generation: u64,
     ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError>;
 
-    fn invalid_return(&mut self, error: crate::arch::x86_64::syscall::UserReturnError) -> !;
+    /// Converts a rejected user return into terminal state for the current
+    /// Process. The raw trampoline performs the divergent reaper-stack handoff
+    /// after this method returns.
+    fn invalid_return(&mut self, error: crate::arch::x86_64::syscall::UserReturnError);
+
+    /// Converts a structured CPL3 exception into terminal state for the
+    /// current Process. The exception trampoline performs the divergent
+    /// reaper-stack handoff after this method returns.
+    fn user_exception(&mut self, record: crate::arch::x86_64::exceptions::UserExceptionRecord);
 
     fn terminate_current(&mut self) -> !;
 
@@ -801,6 +809,7 @@ pub(crate) fn dispatch_frame<R: NativeSyscallFrameRuntime>(
         && let Err(error) = runtime.authorize_return(frame, current_binding_generation)
     {
         runtime.invalid_return(error);
+        return SyscallControl::TerminateCurrent;
     }
     result.control
 }

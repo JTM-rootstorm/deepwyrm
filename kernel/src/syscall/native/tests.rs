@@ -189,6 +189,7 @@ struct FrameRuntime {
     handled: usize,
     executable: bool,
     writable_stack: bool,
+    invalid_return: Option<crate::arch::x86_64::syscall::UserReturnError>,
 }
 
 impl NativeSyscallHandler for FrameRuntime {
@@ -220,8 +221,12 @@ impl NativeSyscallFrameRuntime for FrameRuntime {
         frame.authorize_return(current_binding_generation, self)
     }
 
-    fn invalid_return(&mut self, error: crate::arch::x86_64::syscall::UserReturnError) -> ! {
-        panic!("invalid synthetic return: {error:?}")
+    fn invalid_return(&mut self, error: crate::arch::x86_64::syscall::UserReturnError) {
+        assert!(self.invalid_return.replace(error).is_none());
+    }
+
+    fn user_exception(&mut self, _record: crate::arch::x86_64::exceptions::UserExceptionRecord) {
+        panic!("unexpected synthetic user exception")
     }
 
     fn terminate_current(&mut self) -> ! {
@@ -257,6 +262,7 @@ fn frame_dispatch_sets_status_then_authorizes_exact_return() {
         handled: 0,
         executable: true,
         writable_stack: true,
+        invalid_return: None,
     };
     let mut frame = crate::arch::x86_64::syscall::RawSyscallFrame::synthetic(
         u64::from(DwKnownSyscall::HandleClose.id().0),
@@ -276,11 +282,12 @@ fn frame_dispatch_sets_status_then_authorizes_exact_return() {
 }
 
 #[test]
-fn frame_dispatch_fails_stopped_when_binding_generation_changes() {
+fn frame_dispatch_turns_invalid_return_into_terminal_control_without_panicking() {
     let mut runtime = FrameRuntime {
         handled: 0,
         executable: true,
         writable_stack: true,
+        invalid_return: None,
     };
     let mut frame = crate::arch::x86_64::syscall::RawSyscallFrame::synthetic(
         u64::from(DwKnownSyscall::HandleClose.id().0),
@@ -290,12 +297,16 @@ fn frame_dispatch_fails_stopped_when_binding_generation_changes() {
         0x202,
         9,
     );
-    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        dispatch_frame(&mut runtime, &mut frame, 10);
-    }));
-    assert!(failed.is_err());
+    assert_eq!(
+        dispatch_frame(&mut runtime, &mut frame, 10),
+        SyscallControl::TerminateCurrent
+    );
     assert_eq!(runtime.handled, 1);
     assert_eq!(frame.test_return_authorized(), 0);
+    assert_eq!(
+        runtime.invalid_return,
+        Some(crate::arch::x86_64::syscall::UserReturnError::BindingChanged)
+    );
 }
 
 struct SuspendingRuntime;
@@ -322,8 +333,12 @@ impl NativeSyscallFrameRuntime for SuspendingRuntime {
         panic!("suspended dispatch must not authorize before resume")
     }
 
-    fn invalid_return(&mut self, error: crate::arch::x86_64::syscall::UserReturnError) -> ! {
+    fn invalid_return(&mut self, error: crate::arch::x86_64::syscall::UserReturnError) {
         panic!("unexpected invalid suspended return: {error:?}")
+    }
+
+    fn user_exception(&mut self, _record: crate::arch::x86_64::exceptions::UserExceptionRecord) {
+        panic!("unexpected suspended user exception")
     }
 
     fn terminate_current(&mut self) -> ! {

@@ -391,6 +391,7 @@ struct CompletionHost {
     exit: Result<PrimordialExitDisposition, CompletionFailure>,
     quiescent: Result<(), CompletionFailure>,
     observed_exit: bool,
+    verified_quiescence: bool,
 }
 
 impl PrimordialCompletionBackend for CompletionHost {
@@ -409,6 +410,7 @@ impl PrimordialCompletionBackend for CompletionHost {
     }
 
     fn verify_quiescent(&mut self) -> Result<(), Self::Error> {
+        self.verified_quiescence = true;
         self.quiescent
     }
 }
@@ -419,6 +421,7 @@ fn completion_host(exit: PrimordialExitDisposition) -> CompletionHost {
         exit: Ok(exit),
         quiescent: Ok(()),
         observed_exit: false,
+        verified_quiescence: false,
     }
 }
 
@@ -427,6 +430,7 @@ fn committed_ready_is_consumed_before_normal_exit_and_quiescence() {
     let mut host = completion_host(PrimordialExitDisposition::Normal(0));
     complete_primordial_launch(&mut host).unwrap();
     assert!(host.observed_exit);
+    assert!(host.verified_quiescence);
 
     let mut malformed = completion_host(PrimordialExitDisposition::Normal(0));
     malformed.ready = Ok(vec![0; 40]);
@@ -434,7 +438,8 @@ fn committed_ready_is_consumed_before_normal_exit_and_quiescence() {
         complete_primordial_launch(&mut malformed),
         Err(PrimordialCompletionError::MalformedReady)
     );
-    assert!(!malformed.observed_exit);
+    assert!(malformed.observed_exit);
+    assert!(malformed.verified_quiescence);
 }
 
 #[test]
@@ -447,6 +452,8 @@ fn completion_rejects_peer_failure_exception_nonzero_exit_and_residue() {
             CompletionFailure::Receive
         ))
     );
+    assert!(peer_closed.observed_exit);
+    assert!(peer_closed.verified_quiescence);
 
     for (exit, expected) in [
         (
@@ -464,6 +471,7 @@ fn completion_rejects_peer_failure_exception_nonzero_exit_and_residue() {
     ] {
         let mut host = completion_host(exit);
         assert_eq!(complete_primordial_launch(&mut host), Err(expected));
+        assert!(host.verified_quiescence);
     }
 
     let mut exit_error = completion_host(PrimordialExitDisposition::Normal(0));
@@ -479,6 +487,16 @@ fn completion_rejects_peer_failure_exception_nonzero_exit_and_residue() {
     residue.quiescent = Err(CompletionFailure::Quiescence);
     assert_eq!(
         complete_primordial_launch(&mut residue),
+        Err(PrimordialCompletionError::NotQuiescent(
+            CompletionFailure::Quiescence
+        ))
+    );
+
+    let mut peer_failure_with_residue = completion_host(PrimordialExitDisposition::Normal(0));
+    peer_failure_with_residue.ready = Err(CompletionFailure::Receive);
+    peer_failure_with_residue.quiescent = Err(CompletionFailure::Quiescence);
+    assert_eq!(
+        complete_primordial_launch(&mut peer_failure_with_residue),
         Err(PrimordialCompletionError::NotQuiescent(
             CompletionFailure::Quiescence
         ))

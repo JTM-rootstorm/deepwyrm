@@ -55,6 +55,21 @@ fn cpl3_entry_requires_exception_runtime_binding() {
 }
 
 #[test]
+fn g5_user_faults_and_invalid_returns_share_structured_terminal_reaper_handoff() {
+    let live = source("src/arch/x86_64/syscall/live.rs");
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+
+    assert!(live.contains("runtime.user_exception(record);"));
+    assert!(live.contains("runtime.invalid_return(error);"));
+    assert!(live.contains("handoff_to_terminal_reaper::<R>(context)"));
+    assert!(live.contains("binding.user_exception_handler"));
+    assert!(primordial.contains("process_unhandled_exception("));
+    assert!(primordial.contains("bind_native_runtime_user_exception_handler()"));
+    assert!(!primordial.contains("primordial userspace exception:"));
+    assert!(!primordial.contains("invalid primordial userspace return:"));
+}
+
+#[test]
 fn e4_exception_assembly_remains_freestanding() {
     let clang = "/usr/lib/llvm/22/bin/clang-22";
     if Command::new(clang).arg("--version").output().is_err() {

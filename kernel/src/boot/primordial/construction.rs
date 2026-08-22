@@ -441,16 +441,17 @@ pub(crate) fn complete_primordial_launch<B: PrimordialCompletionBackend>(
     backend: &mut B,
 ) -> Result<(), PrimordialCompletionError<B::Error>> {
     let mut bytes = [0_u8; 40];
-    let actual = backend
-        .receive_ready(&mut bytes)
-        .map_err(PrimordialCompletionError::Receive)?;
+    let ready = backend.receive_ready(&mut bytes);
+    let exit = backend.observe_exit();
+    let quiescent = backend.verify_quiescent();
+
+    quiescent.map_err(PrimordialCompletionError::NotQuiescent)?;
+    let actual = ready.map_err(PrimordialCompletionError::Receive)?;
     if actual != READY_BYTES.len() || bytes != READY_BYTES {
         return Err(PrimordialCompletionError::MalformedReady);
     }
-    match backend
-        .observe_exit()
-        .map_err(PrimordialCompletionError::ObserveExit)?
-    {
+    let disposition = exit.map_err(PrimordialCompletionError::ObserveExit)?;
+    match disposition {
         PrimordialExitDisposition::Normal(0) => {}
         PrimordialExitDisposition::Normal(code) => {
             return Err(PrimordialCompletionError::NonzeroExit(code));
@@ -462,9 +463,7 @@ pub(crate) fn complete_primordial_launch<B: PrimordialCompletionBackend>(
             return Err(PrimordialCompletionError::AuthorizedTermination);
         }
     }
-    backend
-        .verify_quiescent()
-        .map_err(PrimordialCompletionError::NotQuiescent)
+    Ok(())
 }
 
 #[cfg(test)]

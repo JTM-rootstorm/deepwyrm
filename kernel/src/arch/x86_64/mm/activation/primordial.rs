@@ -35,8 +35,9 @@ use crate::task::{ExecutionDomain, ProcessKey, SchedulerThreadState, TaskAuthori
 use crate::time::TimerAuthority;
 use crate::wait::{EventAuthority, WaitRegistry};
 use deepwyrm_abi::{
-    DW_CHANNEL_MAX_PAYLOAD, DW_STATUS_BAD_STATE, DW_STATUS_NO_RESOURCES, DW_STATUS_NOT_SUPPORTED,
-    DW_STATUS_SUCCESS, DW_TASK_STATE_EXITED, DW_TERMINATION_NORMAL_EXIT,
+    DW_CHANNEL_MAX_PAYLOAD, DW_EXCEPTION_GENERAL_PROTECTION, DW_STATUS_BAD_STATE,
+    DW_STATUS_NO_RESOURCES, DW_STATUS_NOT_SUPPORTED, DW_STATUS_SUCCESS, DW_TASK_STATE_EXITED,
+    DW_TERMINATION_NORMAL_EXIT,
 };
 
 const MAX_BOOTFS_BYTES: usize = 32 * 1024 * 1024;
@@ -86,7 +87,18 @@ static BOOTSTRAP_BYTES: ByteStorage<{ crate::boot::primordial::MAX_PRIMORDIAL_EL
     ByteStorage::new();
 static BOOTFS_BYTES: ByteStorage<MAX_BOOTFS_BYTES> = ByteStorage::new();
 
-struct ExecutionStorage(UnsafeCell<MaybeUninit<ExecutionDomain<EXECUTION_THREADS>>>);
+struct PrimordialExecution {
+    execution: ExecutionDomain<EXECUTION_THREADS>,
+}
+
+impl crate::time::DeadlineWakeTarget for PrimordialExecution {
+    fn wake_deadline(&self, key: crate::task::BlockWakeKey) {
+        crate::wait::engine::claim_timeout_and_wake(&self.execution, key)
+            .unwrap_or_else(|error| panic!("primordial deadline wake drifted: {error:?}"));
+    }
+}
+
+struct ExecutionStorage(UnsafeCell<MaybeUninit<PrimordialExecution>>);
 
 impl ExecutionStorage {
     const fn new() -> Self {
@@ -94,8 +106,8 @@ impl ExecutionStorage {
     }
 }
 
-// SAFETY: the one-shot BSP publishes the stationary execution domain before
-// the first userspace transition and never mutates this storage again.
+// SAFETY: the one-shot BSP publishes the stationary execution/deadline target
+// before the first userspace transition and never mutates this storage again.
 unsafe impl Sync for ExecutionStorage {}
 
 static EXECUTION_STATE: AtomicU8 = AtomicU8::new(0);
@@ -120,10 +132,13 @@ fn publish_execution() -> &'static ExecutionDomain<EXECUTION_THREADS> {
     let execution = ExecutionDomain::new([stacks[0]])
         .unwrap_or_else(|error| panic!("invalid primordial execution domain: {error:?}"));
     unsafe {
-        (*EXECUTION_STORAGE.0.get()).write(execution);
+        (*EXECUTION_STORAGE.0.get()).write(PrimordialExecution { execution });
     }
     EXECUTION_STATE.store(2, Ordering::Release);
-    unsafe { &*(*EXECUTION_STORAGE.0.get()).as_ptr() }
+    let target = unsafe { &*(*EXECUTION_STORAGE.0.get()).as_ptr() };
+    crate::time::bind_deadline_wake_target(target)
+        .unwrap_or_else(|error| panic!("could not bind primordial deadline wakes: {error:?}"));
+    &target.execution
 }
 
 fn take_channel_staging() -> &'static mut [u8; DW_CHANNEL_MAX_PAYLOAD as usize] {
@@ -236,6 +251,62 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 Err(user_access::LiveUserAccessError::MissingOrInvalid)
             }
         }
+    }
+
+    fn unmap_committed<
+        const SLOTS: usize,
+        const OBJECTS: usize,
+        const LEASES: usize,
+        const REGISTRY: usize,
+    >(
+        &mut self,
+        region: &mut AddressRegion<SLOTS>,
+        memory: &mut MemoryObjectAuthority<OBJECTS, LEASES>,
+        registry: &mut ObjectRegistry<REGISTRY>,
+        virtual_start: u64,
+        byte_len: u64,
+    ) -> crate::memory::object::MappingFinalReleases<REGISTRY> {
+        let mut candidates = [None, None, None];
+        let result = {
+            let target = &mut self.active.target;
+            let mut tracked = user_access::TrackedActiveTarget {
+                scratch: &mut target.scratch,
+                pins: &self.active.user_pins,
+            };
+            let mut publisher = unsafe {
+                crate::arch::x86_64::mm::X86AddressSpacePublisher::<
+                    _,
+                    RANGE_CAPACITY,
+                    ROLE_CAPACITY,
+                    PRIMORDIAL_TABLE_CANDIDATES,
+                    PRIMORDIAL_JOURNAL_ENTRIES,
+                    PRIMORDIAL_INVALIDATIONS,
+                >::new(
+                    region.address_space_key(),
+                    region.region_key(),
+                    &self.active.root,
+                    self.active.identity,
+                    target.roles,
+                    &mut tracked,
+                    &mut candidates,
+                )
+            }
+            .unwrap_or_else(|_| panic!("primordial teardown publisher unavailable"));
+            region.unmap(memory, registry, &mut publisher, virtual_start, byte_len)
+        };
+        for candidate in candidates.into_iter().flatten() {
+            self.active
+                .target
+                .roles
+                .cancel_table_candidate(candidate)
+                .unwrap_or_else(|_| panic!("primordial teardown table reclaim drifted"));
+        }
+        result.unwrap_or_else(|failure| {
+            panic!(
+                "primordial live mapping teardown diverged: {:?}",
+                failure.error()
+            )
+        })
     }
 }
 
@@ -406,38 +477,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
         virtual_start: u64,
         byte_len: u64,
     ) {
-        let mut candidates = [None, None, None];
-        let result = {
-            let target = &mut self.active.target;
-            let mut tracked = user_access::TrackedActiveTarget {
-                scratch: &mut target.scratch,
-                pins: &self.active.user_pins,
-            };
-            let mut publisher = unsafe {
-                crate::arch::x86_64::mm::X86AddressSpacePublisher::<
-                    _,
-                    RANGE_CAPACITY,
-                    ROLE_CAPACITY,
-                    PRIMORDIAL_TABLE_CANDIDATES,
-                    PRIMORDIAL_JOURNAL_ENTRIES,
-                    PRIMORDIAL_INVALIDATIONS,
-                >::new(
-                    region.address_space_key(),
-                    region.region_key(),
-                    &self.active.root,
-                    self.active.identity,
-                    target.roles,
-                    &mut tracked,
-                    &mut candidates,
-                )
-            }
-            .unwrap_or_else(|_| panic!("primordial rollback publisher unavailable"));
-            region.unmap(memory, registry, &mut publisher, virtual_start, byte_len)
-        };
-        match result {
-            Ok(releases) if releases.is_empty() => {}
-            _ => panic!("primordial live mapping rollback diverged"),
-        }
+        assert!(
+            self.unmap_committed(region, memory, registry, virtual_start, byte_len)
+                .is_empty(),
+            "primordial live mapping rollback finalized backing still owned by construction"
+        );
     }
 }
 
@@ -466,8 +510,10 @@ struct Runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> 
     stack_id: crate::task::KernelStackId,
     context_id: crate::task::ThreadContextId,
     root_key: crate::memory::address_region::AddressRegionObjectKey,
-    monitor: AuthorityPrimordialMonitor,
-    _root_owner: Option<InternalRef>,
+    channel_keys: [crate::ipc::ChannelEndpointKey; 2],
+    kernel_peer: Option<HandleRef>,
+    process_monitor: Option<HandleRef>,
+    root_owner: Option<InternalRef>,
     deferred_current: Option<crate::task::DeferredCurrentExecutionResources>,
     cleanup: CleanupQueue<REGISTRY_OBJECTS>,
 }
@@ -480,30 +526,208 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.cleanup.push(release);
         }
     }
+
+    fn terminate_exception(&mut self, exception: crate::task::TaskExceptionRecord) {
+        assert!(
+            self.deferred_current.is_none(),
+            "primordial runtime already owns deferred current resources"
+        );
+        let mut discarded = None;
+        let mut atomic_pin = None;
+        let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
+        let (status, control, deferred) = {
+            let mut terminal = self.services.terminal_cleanup(
+                Some(&mut wait_deadlines),
+                |output| {
+                    assert!(discarded.replace(output).is_none());
+                },
+                |pin| {
+                    assert!(atomic_pin.replace(pin).is_none());
+                },
+            );
+            crate::syscall::process_unhandled_exception(
+                &mut self.registry,
+                &mut self.tasks,
+                self.execution,
+                &self.waits,
+                &mut terminal,
+                self.process,
+                self.thread,
+                exception,
+                &mut self.cleanup,
+            )
+        };
+        assert_eq!(status, DW_STATUS_SUCCESS);
+        assert_eq!(control, SyscallControl::TerminateCurrent);
+        self.deferred_current =
+            Some(deferred.expect("primordial exception omitted deferred current resources"));
+        let mut user = self.active.current_process_address_space(self.process);
+        if let Some(output) = discarded {
+            user.discard_owned_output(output)
+                .unwrap_or_else(|_| panic!("primordial exception output pin drifted"));
+        }
+        if let Some(pin) = atomic_pin {
+            user.release_atomic_u32(pin)
+                .unwrap_or_else(|_| panic!("primordial exception atomic pin drifted"));
+        }
+        let cleanup = self.services.take_cleanup();
+        self.merge_cleanup(cleanup);
+    }
+
+    fn unmap_all_userspace(&mut self) -> Result<(), ()> {
+        loop {
+            let mapping = self
+                .regions
+                .region(self.root_key)
+                .map_err(|_| ())?
+                .mappings()
+                .iter()
+                .flatten()
+                .next()
+                .copied();
+            let Some(mapping) = mapping else {
+                break;
+            };
+            let releases = {
+                let region = self
+                    .regions
+                    .region_mut_for_teardown(&self.tasks, self.root_key)
+                    .map_err(|_| ())?;
+                let mut platform = LivePlatform {
+                    active: &mut self.active,
+                };
+                platform.unmap_committed(
+                    region,
+                    &mut self.memory,
+                    &mut self.registry,
+                    mapping.virtual_start(),
+                    mapping.byte_len(),
+                )
+            };
+            for release in releases.into_items().into_iter().flatten() {
+                self.cleanup.push(release);
+            }
+        }
+        Ok(())
+    }
+
+    fn release_terminal_authority(&mut self) -> Result<(), ()> {
+        for reference in [self.kernel_peer.take(), self.process_monitor.take()]
+            .into_iter()
+            .flatten()
+        {
+            self.cleanup
+                .push_optional(self.registry.release_handle(reference).map_err(|_| ())?);
+        }
+        let root_owner = self.root_owner.take().ok_or(())?;
+        self.cleanup
+            .push_optional(self.registry.release_internal(root_owner).map_err(|_| ())?);
+        Ok(())
+    }
+
+    fn drain_finalizers(&mut self) -> Result<(), ()> {
+        let cleanup = core::mem::replace(&mut self.cleanup, CleanupQueue::new());
+        let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
+        let mut finalizer = crate::object::PayloadFinalizer::new(
+            &mut self.registry,
+            &mut *self.active.target.roles,
+            &mut self.memory,
+            &self.events,
+            &self.timers,
+            &mut timer_deadlines,
+            &self.channels,
+            &self.waits,
+            &mut self.tasks,
+            &mut self.spaces,
+            &mut self.regions,
+        );
+        for release in cleanup.into_releases().into_iter().flatten() {
+            let batch = finalizer.finalize_chain(release);
+            let (wakes, pins) = batch.into_parts();
+            if wakes.into_iter().flatten().next().is_some()
+                || pins.into_iter().flatten().next().is_some()
+            {
+                return Err(());
+            }
+        }
+        Ok(())
+    }
+
+    fn prove_registry_capacity(&mut self) -> Result<(), ()> {
+        let mut probes: [Option<crate::object::CreationRef>; REGISTRY_OBJECTS] =
+            core::array::from_fn(|_| None);
+        for index in 0..REGISTRY_OBJECTS {
+            match self.registry.create(deepwyrm_abi::DW_OBJECT_TYPE_EVENT) {
+                Ok(probe) => probes[index] = Some(probe),
+                Err(_) => {
+                    for probe in probes.into_iter().flatten() {
+                        self.registry.cancel_creation(probe).map_err(|_| ())?;
+                    }
+                    return Err(());
+                }
+            }
+        }
+        for probe in probes.into_iter().flatten() {
+            self.registry.cancel_creation(probe).map_err(|_| ())?;
+        }
+        Ok(())
+    }
+
+    fn finish_terminal_teardown(&mut self) -> Result<(), ()> {
+        if !self.services.is_quiescent()
+            || self.execution.scheduler_state(self.thread).is_some()
+            || self.execution.blocked_operations().has_thread(self.thread)
+        {
+            return Err(());
+        }
+        let drained = self
+            .execution
+            .blocked_operations_drained(self.process)
+            .map_err(|_| ())?;
+        self.unmap_all_userspace()?;
+        if self.memory.active_lease_count() != 0 {
+            return Err(());
+        }
+        let root_pin = self
+            .regions
+            .retire_exited_root(
+                &mut self.tasks,
+                self.process,
+                self.execution.blocked_operations(),
+                drained,
+            )
+            .map_err(|_| ())?;
+        self.cleanup
+            .push_optional(self.registry.release_internal(root_pin).map_err(|_| ())?);
+        self.release_terminal_authority()?;
+        self.drain_finalizers()?;
+        let trailing = core::mem::replace(&mut self.cleanup, CleanupQueue::new());
+        if self.memory.active_lease_count() != 0
+            || self.tasks.process_info(self.process).is_ok()
+            || self.tasks.thread_info(self.thread).is_ok()
+            || self.regions.region(self.root_key).is_ok()
+            || trailing
+                .into_releases()
+                .into_iter()
+                .flatten()
+                .next()
+                .is_some()
+        {
+            return Err(());
+        }
+        self.prove_registry_capacity()
+    }
 }
 
-struct Completion<'a> {
-    channels: &'a Channels,
-    waits: &'a WaitRegistry<WAITERS>,
-    tasks: &'a Tasks,
-    execution: &'a ExecutionDomain<EXECUTION_THREADS>,
-    services: &'a FServiceState<
-        user_access::OwnedLiveUserOutput,
-        user_access::OwnedLiveAtomicU32,
-        REGISTRY_OBJECTS,
-        WAITERS,
-        EXECUTION_THREADS,
-    >,
-    monitor: &'a AuthorityPrimordialMonitor,
-}
-
-impl PrimordialCompletionBackend for Completion<'_> {
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialCompletionBackend
+    for Runtime<'_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
     type Error = ();
 
     fn receive_ready(&mut self, output: &mut [u8; 40]) -> Result<usize, Self::Error> {
         let (bytes, wakes) = self
             .channels
-            .receive_into(self.monitor.channel_keys[0], output, self.waits)
+            .receive_into(self.channel_keys[0], output, &self.waits)
             .map_err(|_| ())?;
         let (wake_intents, pins) = wakes.into_parts();
         if wake_intents.into_iter().flatten().next().is_some()
@@ -515,10 +739,7 @@ impl PrimordialCompletionBackend for Completion<'_> {
     }
 
     fn observe_exit(&mut self) -> Result<PrimordialExitDisposition, Self::Error> {
-        let info = self
-            .tasks
-            .process_info(self.monitor.process_key)
-            .map_err(|_| ())?;
+        let info = self.tasks.process_info(self.process).map_err(|_| ())?;
         if info.state != DW_TASK_STATE_EXITED {
             return Err(());
         }
@@ -532,19 +753,7 @@ impl PrimordialCompletionBackend for Completion<'_> {
     }
 
     fn verify_quiescent(&mut self) -> Result<(), Self::Error> {
-        if !self.services.is_quiescent()
-            || self
-                .execution
-                .scheduler_state(self.monitor.thread_key)
-                .is_some()
-            || self
-                .execution
-                .blocked_operations()
-                .has_thread(self.monitor.thread_key)
-        {
-            return Err(());
-        }
-        Ok(())
+        self.finish_terminal_teardown()
     }
 }
 
@@ -569,8 +778,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         frame.authorize_return(current_binding_generation, &mut mappings)
     }
 
-    fn invalid_return(&mut self, error: crate::arch::x86_64::syscall::UserReturnError) -> ! {
-        panic!("invalid primordial userspace return: {error:?}")
+    fn invalid_return(&mut self, error: crate::arch::x86_64::syscall::UserReturnError) {
+        self.terminate_exception(crate::task::TaskExceptionRecord::new(
+            DW_EXCEPTION_GENERAL_PROTECTION,
+            invalid_user_return_detail(error),
+            0,
+        ));
+    }
+
+    fn user_exception(&mut self, record: crate::arch::x86_64::exceptions::UserExceptionRecord) {
+        self.terminate_exception(record.task_exception());
     }
 
     fn terminate_current(&mut self) -> ! {
@@ -583,25 +800,29 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                 .unwrap_or_else(|| panic!("primordial exit omitted deferred resources")),
             &mut self.cleanup,
         );
-        let mut completion = Completion {
-            channels: &self.channels,
-            waits: &self.waits,
-            tasks: &self.tasks,
-            execution: self.execution,
-            services: &self.services,
-            monitor: &self.monitor,
-        };
-        complete_primordial_launch(&mut completion)
-            .unwrap_or_else(|error| panic!("primordial completion failed: {error:?}"));
+        let completion = complete_primordial_launch(self);
         #[cfg(feature = "test-support")]
-        crate::test_support::complete_pass(0);
+        match completion {
+            Ok(()) => crate::test_support::complete_pass(0),
+            Err(_) => crate::test_support::complete_fail(1),
+        }
         #[cfg(not(feature = "test-support"))]
         {
-            let _ = crate::debug::emit_early_record(
-                crate::debug::DiagnosticLevel::Info,
-                "primordial",
-                "Wyrmroot bootstrap completed normally",
-            );
+            let (level, message) = match completion {
+                Ok(()) => (
+                    crate::debug::DiagnosticLevel::Info,
+                    "Wyrmroot bootstrap completed normally",
+                ),
+                Err(crate::boot::primordial::construction::PrimordialCompletionError::UnhandledException) => (
+                    crate::debug::DiagnosticLevel::Error,
+                    "Wyrmroot bootstrap terminated after an unhandled userspace exception",
+                ),
+                Err(_) => (
+                    crate::debug::DiagnosticLevel::Error,
+                    "Wyrmroot bootstrap terminated with a structured completion failure",
+                ),
+            };
+            let _ = crate::debug::emit_early_record(level, "primordial", message);
             loop {
                 unsafe {
                     core::arch::asm!("sti", "hlt", options(nomem, nostack));
@@ -618,18 +839,59 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         &'owner mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     ) -> crate::syscall::native::NativeSuspendPlan<'owner> {
-        panic!("primordial bootstrap blocked despite its prepublished INIT")
+        unsafe {
+            self.services.prepare_suspend(
+                &self.tasks,
+                self.execution,
+                crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
+            )
+        }
+        .unwrap_or_else(|error| panic!("primordial suspend preparation drifted: {error:?}"))
     }
 
     unsafe fn poll_idle_suspend<'owner>(
         &'owner mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     ) -> crate::syscall::native::NativeIdleSuspendPoll<'owner> {
-        panic!("primordial bootstrap reached an unexpected idle suspension")
+        unsafe {
+            self.services.poll_idle_suspend(
+                &self.tasks,
+                self.execution,
+                crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
+            )
+        }
+        .unwrap_or_else(|error| panic!("primordial idle-suspend poll drifted: {error:?}"))
     }
 
-    fn resume_suspended(&mut self, _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame) {
-        panic!("primordial bootstrap unexpectedly resumed a blocked syscall")
+    fn resume_suspended(&mut self, frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame) {
+        let resumed = {
+            let mut user = self.active.current_process_address_space(self.process);
+            let mut deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
+            self.services.resume_suspended(
+                &mut user,
+                &mut self.registry,
+                &self.waits,
+                self.execution,
+                self.thread,
+                Some(&mut deadlines),
+            )
+        }
+        .unwrap_or_else(|error| panic!("primordial suspended syscall resume drifted: {error:?}"));
+        let (status, cleanup) = resumed.into_parts();
+        self.merge_cleanup(cleanup);
+        frame.set_status(status);
+    }
+}
+
+const fn invalid_user_return_detail(error: crate::arch::x86_64::syscall::UserReturnError) -> u32 {
+    use crate::arch::x86_64::syscall::UserReturnError;
+    match error {
+        UserReturnError::NonCanonicalUserAddress => 1,
+        UserReturnError::InstructionNotExecutable => 2,
+        UserReturnError::StackNotWritable => 3,
+        UserReturnError::UnsupportedTlsPolicy => 4,
+        UserReturnError::UnsupportedFpSimdPolicy => 5,
+        UserReturnError::BindingChanged => 6,
     }
 }
 
@@ -651,10 +913,6 @@ fn copy_module<'a, const BYTES: usize, const RANGE_CAPACITY: usize, const ROLE_C
         .read_physical_bytes(module.range().physical_start(), destination)
         .unwrap_or_else(|error| panic!("could not copy {label} module: {error:?}"));
     destination
-}
-
-fn unexpected_user_exception(record: crate::arch::x86_64::exceptions::UserExceptionRecord) -> ! {
-    panic!("primordial userspace exception: {record:?}")
 }
 
 #[allow(
@@ -722,6 +980,12 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     let process = monitor.process_key;
     let thread = monitor.thread_key;
     let root_key = monitor.root_key;
+    let AuthorityPrimordialMonitor {
+        kernel_peer,
+        process: process_monitor,
+        channel_keys,
+        ..
+    } = monitor;
     let mut runtime = Runtime {
         active,
         registry,
@@ -741,13 +1005,15 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         stack_id,
         context_id,
         root_key,
-        monitor,
-        _root_owner: Some(root_owner),
+        channel_keys,
+        kernel_peer: Some(kernel_peer),
+        process_monitor: Some(process_monitor),
+        root_owner: Some(root_owner),
         deferred_current: None,
         cleanup: CleanupQueue::new(),
     };
     let exception_binding =
-        crate::arch::x86_64::syscall::bind_user_exception_handler(unexpected_user_exception)
+        crate::arch::x86_64::syscall::bind_native_runtime_user_exception_handler()
             .unwrap_or_else(|error| panic!("could not bind primordial exceptions: {error:?}"));
     let context = runtime
         .execution

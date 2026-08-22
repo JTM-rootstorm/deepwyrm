@@ -48,8 +48,8 @@ use crate::task::{
     BlockWakeKey, DeferredCurrentExecutionResources, ExecutionDomain, ExecutionResourceError,
     ExecutionSwitchError, IdleScheduleDecision, PreparedProcess, ProcessExitEffects, ProcessKey,
     RetiredExitPins, ScheduleDecision, SchedulerError, SchedulerThreadState, StartThreadError,
-    TaskAuthority, TaskCreateError, TaskError, TaskGroupKey, TaskGroupTerminationEffects,
-    ThreadKey, ThreadStartState,
+    TaskAuthority, TaskCreateError, TaskError, TaskExceptionRecord, TaskGroupKey,
+    TaskGroupTerminationEffects, ThreadKey, ThreadStartState,
 };
 use crate::time::{TimerAuthority, TimerCreateError, TimerDeadlineAuthority, TimerError, TimerKey};
 use crate::wait::{
@@ -3210,6 +3210,65 @@ pub(crate) fn process_exit<
     assert!(
         deferred.is_some(),
         "process exit did not preserve the physical current execution bundle"
+    );
+    (
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+        deferred,
+    )
+}
+
+pub(crate) fn process_unhandled_exception<
+    C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
+    terminal_waits: &mut C,
+    current_process: ProcessKey,
+    current_thread: ThreadKey,
+    exception: TaskExceptionRecord,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> (
+    DwStatus,
+    SyscallControl,
+    Option<DeferredCurrentExecutionResources>,
+) {
+    if let Err(status) = validate_running_caller(tasks, execution, current_process, current_thread)
+    {
+        return (status, SyscallControl::ReturnToCaller, None);
+    }
+    let effects = match tasks.terminate_process_exception(
+        registry,
+        current_process,
+        current_thread,
+        exception.exception_type,
+        exception.detail,
+        exception.fault_address,
+    ) {
+        Ok(effects) => effects,
+        Err(error) => return (task_status(error), SyscallControl::ReturnToCaller, None),
+    };
+    let deferred = collect_process_effects(
+        registry,
+        execution,
+        waits,
+        effects,
+        Some(current_thread),
+        terminal_waits,
+        cleanup,
+    );
+    assert!(
+        deferred.is_some(),
+        "unhandled exception did not preserve the physical current execution bundle"
     );
     (
         DW_STATUS_SUCCESS,

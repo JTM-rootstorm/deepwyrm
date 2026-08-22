@@ -60,12 +60,15 @@ const RUNTIME_BOUND: u8 = 2;
 
 pub(crate) type SyscallRuntimeHandler = unsafe fn(*mut (), &mut RawSyscallFrame);
 type FreshThreadRuntimeHandler = unsafe fn(*mut ()) -> !;
+type UserExceptionRuntimeHandler =
+    unsafe fn(*mut (), crate::arch::x86_64::exceptions::UserExceptionRecord) -> !;
 
 #[derive(Clone, Copy)]
 struct RuntimeBindingState {
     context: *mut (),
     handler: SyscallRuntimeHandler,
     fresh_thread_handler: FreshThreadRuntimeHandler,
+    user_exception_handler: UserExceptionRuntimeHandler,
 }
 
 struct RuntimeStorage(UnsafeCell<MaybeUninit<RuntimeBindingState>>);
@@ -469,6 +472,7 @@ unsafe fn publish_syscall_runtime(
     context: *mut (),
     handler: SyscallRuntimeHandler,
     fresh_thread_handler: FreshThreadRuntimeHandler,
+    user_exception_handler: UserExceptionRuntimeHandler,
 ) -> Result<(), SyscallRuntimeBindError> {
     if context.is_null() {
         return Err(SyscallRuntimeBindError::NullContext);
@@ -489,6 +493,7 @@ unsafe fn publish_syscall_runtime(
             context,
             handler,
             fresh_thread_handler,
+            user_exception_handler,
         });
     }
     RUNTIME_STATE.store(RUNTIME_BOUND, Ordering::Release);
@@ -517,7 +522,45 @@ fn invalid_bound_return<R: crate::syscall::native::NativeSyscallFrameRuntime>(
     // SAFETY: each borrow is short-lived on the one-BSP runtime. No borrow of
     // `R` survives a kernel-context switch.
     let runtime = unsafe { &mut *context.cast::<R>() };
-    runtime.invalid_return(error)
+    runtime.invalid_return(error);
+    handoff_to_terminal_reaper::<R>(context)
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the exception callback reborrows the one-shot pinned runtime, records terminal Process state, and then abandons the faulting stack"
+)]
+unsafe fn native_runtime_user_exception<R: crate::syscall::native::NativeSyscallFrameRuntime>(
+    context: *mut (),
+    record: crate::arch::x86_64::exceptions::UserExceptionRecord,
+) -> ! {
+    let runtime = unsafe { &mut *context.cast::<R>() };
+    runtime.user_exception(record);
+    handoff_to_terminal_reaper::<R>(context)
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the immutable runtime binding pairs its erased context with the monomorphized exception handler published before CPL3 entry"
+)]
+fn dispatch_bound_native_runtime_user_exception(
+    record: crate::arch::x86_64::exceptions::UserExceptionRecord,
+) -> ! {
+    let Some(binding) = runtime_binding() else {
+        halt_forever();
+    };
+    unsafe { (binding.user_exception_handler)(binding.context, record) }
+}
+
+/// Binds CPL3 exception dispatch to the same one-shot runtime identity that is
+/// published by `enter_native_syscall_runtime` before userspace can execute.
+pub(crate) fn bind_native_runtime_user_exception_handler() -> Result<
+    crate::arch::x86_64::exceptions::UserExceptionBinding,
+    crate::arch::x86_64::exceptions::UserExceptionBindError,
+> {
+    crate::arch::x86_64::exceptions::bind_user_exception_handler(
+        dispatch_bound_native_runtime_user_exception,
+    )
 }
 
 #[allow(
@@ -783,6 +826,7 @@ impl<'runtime, R: crate::syscall::native::NativeSyscallFrameRuntime>
                 context.cast::<()>(),
                 native_runtime_trampoline::<R>,
                 native_runtime_fresh_thread::<R>,
+                native_runtime_user_exception::<R>,
             )
         }
         .unwrap_or_else(|_| halt_forever());

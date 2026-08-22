@@ -2091,6 +2091,68 @@ fn process_exit_defers_current_execution_bundle_until_reaper_completion() {
 }
 
 #[test]
+fn unhandled_user_exception_defers_current_stack_and_records_structured_exit() {
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let waits = WaitRegistry::<2>::new();
+    let mut terminal_waits = NoTerminalWaitCleanup;
+    let mut cleanup = CleanupQueue::<16>::new();
+    let process_pin = resolve_current_handle(
+        &tasks,
+        &mut registry,
+        process,
+        process_handle,
+        deepwyrm_abi::DW_OBJECT_TYPE_PROCESS,
+        DW_RIGHT_MODIFY,
+    )
+    .unwrap();
+    let (current, current_ref) = tasks.create_thread(&mut registry, &process_pin).unwrap();
+    release_lookup_pin(&mut registry, process_pin, &mut cleanup);
+    execution
+        .start_thread(&mut tasks, current, test_start(0x20))
+        .unwrap();
+    assert_eq!(execution.schedule_next().unwrap().current, Some(current));
+    let (stack, context) = tasks.thread_execution_resources(current).unwrap().unwrap();
+
+    let deferred = terminal_outcome(
+        process_unhandled_exception(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut terminal_waits,
+            process,
+            current,
+            crate::task::TaskExceptionRecord::new(
+                deepwyrm_abi::DW_EXCEPTION_PAGE_FAULT,
+                0x44,
+                0x5555,
+            ),
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    let info = tasks.process_info(process).unwrap();
+    assert_eq!(
+        info.reason,
+        deepwyrm_abi::DW_TERMINATION_UNHANDLED_EXCEPTION
+    );
+    assert_eq!(info.exception_type, deepwyrm_abi::DW_EXCEPTION_PAGE_FAULT);
+    assert_eq!(info.detail, 0x44);
+    assert_eq!(info.fault_address, 0x5555);
+    assert!(execution.stack_bounds(stack).is_ok());
+    assert!(execution.load_context(context).is_ok());
+
+    complete_deferred_current_reclaim(&mut registry, &execution, &waits, deferred, &mut cleanup);
+    assert!(execution.stack_bounds(stack).is_err());
+    assert!(execution.load_context(context).is_err());
+    cleanup.push_optional(registry.release_handle(current_ref).unwrap());
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+#[test]
 fn current_process_termination_defers_execution_bundle_until_reaper_completion() {
     let (mut registry, mut tasks, process, process_handle) = process_fixture();
     let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
