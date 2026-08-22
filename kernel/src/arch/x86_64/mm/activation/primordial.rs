@@ -932,7 +932,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     .map_err(|_| DW_STATUS_NO_RESOURCES)?,
             );
             let mut publisher = user
-                .publisher::<3, 4, 1>(address_space_key, region_key, &mut candidates)
+                .publisher::<
+                    PRIMORDIAL_TABLE_CANDIDATES,
+                    PRIMORDIAL_JOURNAL_ENTRIES,
+                    PRIMORDIAL_INVALIDATIONS,
+                >(address_space_key, region_key, &mut candidates)
                 .map_err(|_| DW_STATUS_BAD_STATE)?;
             crate::syscall::address_region_map_model(
                 &mut publisher,
@@ -980,7 +984,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let mut candidates = [None, None, None];
         let mut user = self.active.current_process_address_space(self.process);
         let mut publisher = user
-            .publisher::<3, 4, 1>(address_space_key, region_key, &mut candidates)
+            .publisher::<
+                PRIMORDIAL_TABLE_CANDIDATES,
+                PRIMORDIAL_JOURNAL_ENTRIES,
+                PRIMORDIAL_INVALIDATIONS,
+            >(address_space_key, region_key, &mut candidates)
             .unwrap_or_else(|_| panic!("primordial unmap publisher unavailable"));
         crate::syscall::address_region_unmap(
             &mut publisher,
