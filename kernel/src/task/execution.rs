@@ -469,6 +469,24 @@ pub(crate) struct ExecutionDomain<const CAPACITY: usize> {
     blocked_operations: BlockedOperationRegistry<CAPACITY>,
 }
 
+/// Fully allocated initial execution state that is not yet runnable.
+#[must_use = "prepared Thread starts must be committed or cancelled exactly once"]
+pub(crate) struct PreparedThreadStart<'a, const CAPACITY: usize> {
+    execution: &'a ExecutionDomain<CAPACITY>,
+    thread: ThreadKey,
+    reservation: Option<super::SchedulerReservation>,
+    completed: bool,
+}
+
+impl<const CAPACITY: usize> Drop for PreparedThreadStart<'_, CAPACITY> {
+    fn drop(&mut self) {
+        assert!(
+            self.completed,
+            "prepared Thread start dropped without commit or cancellation"
+        );
+    }
+}
+
 impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     pub(crate) fn new(
         stack_bounds: [KernelStackBounds; CAPACITY],
@@ -482,7 +500,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         })
     }
 
-    pub(crate) fn start_thread<
+    pub(crate) fn prepare_thread_start<
         const GROUPS: usize,
         const PROCESSES: usize,
         const THREADS: usize,
@@ -492,7 +510,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         tasks: &mut super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         thread: ThreadKey,
         start: ThreadStartState,
-    ) -> Result<(), StartThreadError> {
+    ) -> Result<PreparedThreadStart<'_, CAPACITY>, StartThreadError> {
         let reservation = self
             .scheduler
             .reserve(thread)
@@ -553,31 +571,27 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                 });
             return Err(StartThreadError::Task(error));
         }
-        if let Err(error) = tasks.start_thread(thread) {
-            let resources = tasks
-                .rollback_thread_execution(thread)
-                .unwrap_or_else(|rollback| {
-                    panic!("prepared thread could not roll back after start failure: {rollback:?}")
-                });
-            self.reclaim_resources(resources);
-            self.scheduler
-                .cancel(reservation)
-                .unwrap_or_else(|failure| {
-                    panic!(
-                        "scheduler reservation rollback failed: {:?}",
-                        failure.error()
-                    )
-                });
-            return Err(StartThreadError::Task(error));
-        }
-        self.scheduler
-            .commit(reservation)
-            .unwrap_or_else(|failure| {
-                panic!(
-                    "same-domain scheduler reservation failed after task start: {:?}",
-                    failure.error()
-                )
-            });
+        Ok(PreparedThreadStart {
+            execution: self,
+            thread,
+            reservation: Some(reservation),
+            completed: false,
+        })
+    }
+
+    pub(crate) fn start_thread<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &self,
+        tasks: &mut super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        thread: ThreadKey,
+        start: ThreadStartState,
+    ) -> Result<(), StartThreadError> {
+        self.prepare_thread_start(tasks, thread, start)?
+            .commit(tasks);
         Ok(())
     }
 
@@ -1088,6 +1102,70 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
 
     pub(crate) fn scheduler_state(&self, thread: ThreadKey) -> Option<super::SchedulerThreadState> {
         self.scheduler.state(thread)
+    }
+}
+
+impl<const CAPACITY: usize> PreparedThreadStart<'_, CAPACITY> {
+    /// Publishes task state and then consumes the same-domain scheduler
+    /// reservation. All recoverable resource work completed during prepare.
+    pub(crate) fn commit<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        mut self,
+        tasks: &mut super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    ) {
+        tasks
+            .start_thread(self.thread)
+            .unwrap_or_else(|error| panic!("prepared Thread task publication diverged: {error:?}"));
+        self.execution
+            .scheduler
+            .commit(
+                self.reservation
+                    .take()
+                    .expect("prepared Thread start retains its reservation"),
+            )
+            .unwrap_or_else(|failure| {
+                panic!(
+                    "prepared Thread scheduler publication diverged: {:?}",
+                    failure.error()
+                )
+            });
+        self.completed = true;
+    }
+
+    /// Returns the Thread to an execution-resource-free CREATED state.
+    pub(crate) fn cancel<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        mut self,
+        tasks: &mut super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    ) {
+        let resources = tasks
+            .rollback_thread_execution(self.thread)
+            .unwrap_or_else(|error| {
+                panic!("prepared Thread execution cancellation diverged: {error:?}")
+            });
+        self.execution.reclaim_resources(resources);
+        self.execution
+            .scheduler
+            .cancel(
+                self.reservation
+                    .take()
+                    .expect("prepared Thread start retains its reservation"),
+            )
+            .unwrap_or_else(|failure| {
+                panic!(
+                    "prepared Thread scheduler cancellation diverged: {:?}",
+                    failure.error()
+                )
+            });
+        self.completed = true;
     }
 }
 

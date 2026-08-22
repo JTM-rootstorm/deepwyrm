@@ -1161,11 +1161,11 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             .map(|prepared| prepared.commit(self))
     }
 
-    pub(crate) fn create_thread<const OBJECTS: usize>(
+    pub(crate) fn prepare_thread<const OBJECTS: usize>(
         &mut self,
         registry: &mut ObjectRegistry<OBJECTS>,
         parent_owner: &InternalRef,
-    ) -> Result<(ThreadKey, HandleRef), TaskCreateError> {
+    ) -> Result<PreparedThread, TaskCreateError> {
         let parent = registry
             .retain_internal(parent_owner)
             .map_err(TaskCreateError::Registry)?;
@@ -1212,7 +1212,99 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             });
         self.attach_thread_execution_pin(key, execution)
             .expect("fresh thread accepts its execution pin");
-        Ok((key, handle))
+        Ok(PreparedThread {
+            key,
+            handle: Some(handle),
+            completed: false,
+        })
+    }
+
+    /// Compatibility wrapper for ordinary E/F callers whose Process is
+    /// already published. Primordial construction retains the prepared token
+    /// until its wider transaction crosses the no-fail boundary.
+    pub(crate) fn create_thread<const OBJECTS: usize>(
+        &mut self,
+        registry: &mut ObjectRegistry<OBJECTS>,
+        parent_owner: &InternalRef,
+    ) -> Result<(ThreadKey, HandleRef), TaskCreateError> {
+        self.prepare_thread(registry, parent_owner)
+            .map(PreparedThread::commit)
+    }
+}
+
+impl PreparedThread {
+    pub(crate) fn commit(mut self) -> (ThreadKey, HandleRef) {
+        self.completed = true;
+        (
+            self.key,
+            self.handle
+                .take()
+                .expect("prepared Thread commit retains its unpublished handle"),
+        )
+    }
+
+    /// Cancels a CREATED Thread before its parent Process is published.
+    pub(crate) fn cancel<
+        const OBJECTS: usize,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        mut self,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        registry: &mut ObjectRegistry<OBJECTS>,
+    ) -> Option<FinalRelease> {
+        let thread = tasks
+            .thread_mut(self.key)
+            .expect("prepared Thread record remains live until cancellation");
+        assert_eq!(
+            thread.state.state, DW_TASK_STATE_CREATED,
+            "running Thread cannot use prepared cancellation"
+        );
+        assert!(
+            thread.start.is_none() && thread.kernel_stack.is_none() && thread.context.is_none(),
+            "prepared Thread execution must be cancelled before payload cancellation"
+        );
+        let execution = thread
+            .execution_pin
+            .take()
+            .expect("prepared Thread retains its execution pin");
+        assert!(
+            registry
+                .release_internal(execution)
+                .unwrap_or_else(|failure| {
+                    panic!(
+                        "prepared Thread execution-pin cancellation lost authority: {:?}",
+                        failure.error()
+                    )
+                })
+                .is_none(),
+            "prepared Thread execution pin was unexpectedly final"
+        );
+        let final_release = registry
+            .release_handle(
+                self.handle
+                    .take()
+                    .expect("prepared Thread cancellation retains its handle"),
+            )
+            .unwrap_or_else(|failure| {
+                panic!(
+                    "prepared Thread handle cancellation lost authority: {:?}",
+                    failure.error()
+                )
+            })
+            .expect("prepared Thread handle release must reach typed finalization");
+        let finalization = tasks
+            .take_finalization(final_release)
+            .unwrap_or_else(|failure| {
+                panic!(
+                    "prepared Thread typed cancellation diverged: {:?}",
+                    failure.error()
+                )
+            });
+        self.completed = true;
+        complete_task_finalization(registry, finalization)
     }
 }
 

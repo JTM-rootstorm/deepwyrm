@@ -544,6 +544,13 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
 }
 
 impl<const SLOTS: usize> PreparedRootRegion<SLOTS> {
+    pub(crate) fn key(&self) -> AddressRegionObjectKey {
+        self.binding
+            .as_ref()
+            .expect("prepared root AddressRegion retains its payload binding")
+            .key()
+    }
+
     /// Seals the prepared payload, creates its uninstalled parent HandleRef,
     /// installs the runtime pin, and commits the already-reserved Process
     /// attachment. Every recoverable operation occurred in preparation.

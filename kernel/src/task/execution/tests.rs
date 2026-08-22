@@ -291,8 +291,20 @@ fn failed_task_preparation_rolls_back_scheduler_stack_and_context_capacity() {
     assert!(registry.release_internal(root_owner).unwrap().is_none());
     assert!(registry.release_handle(process_handle).unwrap().is_none());
 
+    let prepared = domain
+        .prepare_thread_start(&mut tasks, thread, start_state(5))
+        .unwrap();
+    assert_eq!(
+        domain.scheduler_state(thread),
+        Some(super::super::SchedulerThreadState::Reserved)
+    );
+    assert!(tasks.thread_execution_resources(thread).unwrap().is_some());
+    prepared.cancel(&mut tasks);
+    assert_eq!(domain.scheduler_state(thread), None);
+    assert!(tasks.thread_execution_resources(thread).unwrap().is_none());
+
     domain
-        .start_thread(&mut tasks, thread, start_state(5))
+        .start_thread(&mut tasks, thread, start_state(6))
         .unwrap();
     assert_eq!(
         domain.scheduler_state(thread),

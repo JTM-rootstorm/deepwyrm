@@ -554,3 +554,10 @@ fn u64_at(bytes: &[u8], offset: usize) -> Result<u64, PrimordialElfError> {
 
 #[cfg(test)]
 mod tests;
+
+#[allow(
+    dead_code,
+    reason = "DW0-G2 host construction gate precedes live boot-path wiring"
+)]
+#[cfg(deepwyrm_integrated)]
+pub(crate) mod construction;

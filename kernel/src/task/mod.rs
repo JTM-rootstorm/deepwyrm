@@ -35,8 +35,8 @@ pub(crate) use blocked_operation::{
 )]
 pub(crate) use execution::{
     DeferredCurrentExecutionResources, ExecutionDomain, ExecutionResourceError,
-    ExecutionSwitchError, FpSimdPolicy, GeneralPurposeRegisters, RetiredExitPins,
-    RetiredProcessException, SavedThreadContext, StartThreadError, UserTlsPolicy,
+    ExecutionSwitchError, FpSimdPolicy, GeneralPurposeRegisters, PreparedThreadStart,
+    RetiredExitPins, RetiredProcessException, SavedThreadContext, StartThreadError, UserTlsPolicy,
 };
 #[allow(
     unused_imports,
@@ -330,6 +330,40 @@ pub(crate) struct PreparedProcess {
     key: ProcessKey,
     handle: Option<HandleRef>,
     completed: bool,
+}
+
+/// A CREATED Thread attached only to an unpublished Process.
+///
+/// G2 keeps this token until every primordial mapping, capability transfer,
+/// and execution resource has been prepared. Cancellation removes the Thread
+/// payload and returns all object/task capacity before the Process can become
+/// discoverable.
+#[must_use = "prepared Threads must be committed or cancelled exactly once"]
+pub(crate) struct PreparedThread {
+    key: ThreadKey,
+    handle: Option<HandleRef>,
+    completed: bool,
+}
+
+impl PreparedThread {
+    pub(crate) const fn key(&self) -> ThreadKey {
+        self.key
+    }
+
+    pub(crate) fn handle(&self) -> &HandleRef {
+        self.handle
+            .as_ref()
+            .expect("prepared Thread retains its unpublished handle")
+    }
+}
+
+impl Drop for PreparedThread {
+    fn drop(&mut self) {
+        assert!(
+            self.completed,
+            "prepared Thread dropped without commit or cancellation"
+        );
+    }
 }
 
 impl PreparedProcess {

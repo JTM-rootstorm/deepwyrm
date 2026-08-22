@@ -360,6 +360,53 @@ pub(crate) unsafe trait AddressSpacePublisher: publisher_seal::Sealed {
     ) -> Result<(), Self::Error>;
 }
 
+/// Identity-bound in-memory publisher used by the G2 concrete host gate.
+#[cfg(test)]
+pub(crate) struct PrimordialHostPublisher {
+    address_space: AddressSpaceKey,
+    region: RegionKey,
+}
+
+#[cfg(test)]
+impl PrimordialHostPublisher {
+    pub(crate) fn for_region<const SLOTS: usize>(region: &AddressRegion<SLOTS>) -> Self {
+        Self {
+            address_space: region.address_space_key(),
+            region: region.region_key(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl publisher_seal::Sealed for PrimordialHostPublisher {}
+
+#[cfg(test)]
+#[allow(
+    unsafe_code,
+    reason = "the G2 host publisher preserves the authority-issued in-memory identities exactly"
+)]
+unsafe impl AddressSpacePublisher for PrimordialHostPublisher {
+    type Error = ();
+
+    fn address_space_key(&self) -> AddressSpaceKey {
+        self.address_space
+    }
+
+    fn publish_replace(
+        &mut self,
+        address_space: AddressSpaceKey,
+        region: RegionKey,
+        _before: &[Mapping],
+        _after: &[Mapping],
+    ) -> Result<(), Self::Error> {
+        if address_space == self.address_space && region == self.region {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+}
+
 /// Fixed-capacity model for one lower-canonical user address region.
 pub(crate) struct AddressRegion<const SLOTS: usize> {
     address_space: AddressSpaceKey,

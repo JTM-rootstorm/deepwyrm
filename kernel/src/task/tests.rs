@@ -388,6 +388,60 @@ fn prepared_process_is_hidden_from_group_teardown_and_cancels_afterwards() {
 }
 
 #[test]
+fn prepared_thread_cancel_removes_parent_attachment_and_recovers_capacity() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (process, process_handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let process_owner = registry
+        .retain_internal_from_handle(&process_handle)
+        .unwrap();
+    let prepared = tasks.prepare_thread(&mut registry, &process_owner).unwrap();
+    let prepared_key = prepared.key();
+
+    let process_record = tasks
+        .processes
+        .iter()
+        .flatten()
+        .find(|record| record.object == process.object_id())
+        .unwrap();
+    assert!(
+        process_record
+            .threads
+            .iter()
+            .any(|object| *object == Some(prepared_key.object_id()))
+    );
+    assert!(prepared.cancel(&mut tasks, &mut registry).is_none());
+    let process_record = tasks
+        .processes
+        .iter()
+        .flatten()
+        .find(|record| record.object == process.object_id())
+        .unwrap();
+    assert!(process_record.threads.iter().all(Option::is_none));
+
+    let replacement = tasks.prepare_thread(&mut registry, &process_owner).unwrap();
+    assert_ne!(replacement.key(), prepared_key);
+    assert!(replacement.cancel(&mut tasks, &mut registry).is_none());
+    assert!(registry.release_internal(process_owner).unwrap().is_none());
+    let effects = tasks
+        .terminate_process_authorized(&mut registry, process, 0)
+        .unwrap();
+    assert_eq!(effects.drained.final_release_count(), 0);
+    assert!(
+        release_pins(&mut registry, effects.pins)
+            .into_iter()
+            .flatten()
+            .next()
+            .is_none()
+    );
+    let process_final = registry.release_handle(process_handle).unwrap().unwrap();
+    finish_task_release(&mut tasks, &mut registry, process_final);
+    let root_final = registry.release_internal(root_owner).unwrap().unwrap();
+    finish_task_release(&mut tasks, &mut registry, root_final);
+}
+
+#[test]
 fn explicit_thread_termination_returns_execution_resources_and_closes_final_thread_process() {
     let mut registry = ObjectRegistry::<OBJECTS>::new();
     let mut tasks = Tasks::new();

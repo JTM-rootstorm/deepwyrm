@@ -158,6 +158,24 @@ impl MemoryObjectFinalization {
     pub(crate) fn into_parts(self) -> (FinalRelease, ObjectBackingGrant) {
         (self.final_release, self.backing)
     }
+
+    pub(crate) const fn backing_physical_start(&self) -> u64 {
+        self.backing.physical_start()
+    }
+}
+
+/// Splits a transaction-cancelled page-backed object into its generic cleanup
+/// proof and typed backing. The integrated caller completes registry cleanup.
+pub(crate) fn into_page_backed_cancellation_parts(
+    finalization: MemoryObjectFinalization,
+) -> (MemoryObjectCleanup, ObjectBackingGrant) {
+    assert_eq!(
+        finalization.kind(),
+        MemoryObjectKind::PageBacked,
+        "primordial cancellation only recycles allocator-backed objects"
+    );
+    let (final_release, backing) = finalization.into_parts();
+    (MemoryObjectCleanup { final_release }, backing)
 }
 
 #[must_use = "typed MemoryObject cleanup must be consumed by the generic object registry"]
@@ -284,6 +302,12 @@ impl MemoryObjectKey {
 
     pub(crate) const fn object_id(self) -> Option<ObjectId> {
         self.object
+    }
+
+    pub(crate) const fn from_object_id(object: ObjectId) -> Self {
+        Self {
+            object: Some(object),
+        }
     }
 }
 
@@ -833,6 +857,24 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             kind: record.kind,
             protection_ceiling: record.protection_ceiling,
         })
+    }
+
+    /// Returns the exclusive typed backing for kernel population while the
+    /// caller still owns the unpublished creator reference.
+    pub(crate) fn backing_for_population(
+        &self,
+        object: MemoryObjectKey,
+    ) -> Result<&ObjectBackingGrant, MemoryObjectError> {
+        let record = self.object_record(object)?;
+        let object_id = record.object;
+        let slot = self
+            .objects
+            .iter()
+            .position(|slot| slot.record.is_some_and(|record| record.object == object_id))
+            .ok_or(MemoryObjectError::InvalidObjectKey)?;
+        self.backings[slot]
+            .as_ref()
+            .ok_or(MemoryObjectError::InvalidObjectKey)
     }
 
     pub(crate) fn object_info_for_resolved(

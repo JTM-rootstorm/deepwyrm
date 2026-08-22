@@ -98,6 +98,22 @@ impl ResolvedHandle {
             rights: self.rights,
         }
     }
+
+    /// Resolves a kernel-owned factory reference with an explicit compatible
+    /// rights ceiling. This is not a userspace lookup and never manufactures
+    /// authority beyond the rights selected by the trusted factory caller.
+    pub(crate) fn from_kernel_reference<const OBJECTS: usize>(
+        registry: &mut ObjectRegistry<OBJECTS>,
+        reference: &HandleRef,
+        rights: DwRights,
+    ) -> Result<Self, HandleTableError> {
+        validate_requested_syntax(rights).map_err(rights_error)?;
+        validate_compatible(reference.object_type(), rights).map_err(rights_error)?;
+        let reference = registry
+            .retain_internal_from_handle(reference)
+            .map_err(retain_error)?;
+        Ok(Self { reference, rights })
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -255,6 +271,12 @@ pub(crate) struct HandleBatchReservation<'a, const CAPACITY: usize> {
 pub(crate) struct HandleTransferReservation {
     domain: u64,
     reservation: Reservation,
+}
+
+impl HandleTransferReservation {
+    pub(crate) const fn handle(&self) -> DwHandle {
+        self.reservation.handle
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1145,6 +1167,31 @@ impl<'a, const CAPACITY: usize> HandleBatchReservation<'a, CAPACITY> {
 }
 
 impl HandleTransferReservation {
+    /// Publishes a kernel-owned factory reference into a previously reserved
+    /// child slot without routing it through a userspace MOVE source.
+    pub(crate) fn publish_reference<const CAPACITY: usize>(
+        self,
+        table: &mut HandleTable<CAPACITY>,
+        reference: HandleRef,
+        rights: DwRights,
+    ) -> PublishedHandleInfo {
+        assert_eq!(
+            self.domain, table.domain,
+            "foreign factory destination reservation"
+        );
+        validate_requested_syntax(rights)
+            .and_then(|_| validate_compatible(reference.object_type(), rights))
+            .unwrap_or_else(|error| panic!("invalid factory-published rights: {error:?}"));
+        table.assert_reservation_fresh(self.reservation);
+        let info = PublishedHandleInfo {
+            handle: self.reservation.handle,
+            rights,
+            object_type: reference.object_type(),
+        };
+        table.publish(self.reservation, HandleEntry { reference, rights });
+        info
+    }
+
     pub(crate) fn publish<const CAPACITY: usize>(
         self,
         table: &mut HandleTable<CAPACITY>,
