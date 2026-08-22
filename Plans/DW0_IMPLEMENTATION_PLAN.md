@@ -309,6 +309,18 @@ DW0 boots with one vCPU first, but the codebase must not assume single-threaded 
 - no subsystem may rely on "QEMU currently has one vCPU" for correctness
 - SMP bring-up follows after the UP foundation is stable
 
+Scheduling direction beyond DW0 is also locked at the architectural level without freezing a specific algorithm or ABI:
+
+- Deepwyrm remains a general-purpose kernel rather than becoming a hard-real-time OS.
+- DW0 may use a deliberately simple cooperative/bootstrap scheduler. Absolute deadlines, one-shot timer interrupts, bounded wait/IPC state, and resumable blocking are foundations only and do not imply a real-time scheduling guarantee.
+- DW0-H owns SMP/concurrency validation and hardening of the existing scheduler/task/wait machinery. It must not expand into priority classes, reservations, deadline scheduling, or other real-time policy merely because the timer/wait substrate now exists.
+- The next scheduler-focused milestone after DW0 should first establish ordinary timer-driven preemption, SMP-safe/per-CPU scheduling state, affinity/migration rules, starvation/fairness policy, and latency instrumentation for the normal general-purpose class.
+- Only after that foundation is proven should a later DW1 phase add an explicitly authorized real-time class for firm/soft real-time workloads. Expected mechanisms include bounded priority/reservation policy, execution budgets/periods/deadlines with throttling, priority/deadline inheritance or propagation across blocking/Channel dependency chains, and prefaulted/pinned real-time working sets.
+- Real-time authority must be explicit and policy-controlled, expected to compose with TaskGroup/resource authority. Arbitrary applications do not gain unrestricted real-time priority merely by requesting it.
+- No scheduler-class ID, priority scale, budget/deadline ABI record, admission-control syscall, or hard-real-time hardware guarantee is reserved by DW0.
+
+These rules preserve a future RT-capable substrate without pulling RT implementation into DW0-G, DW0-H, or compatibility-personality work.
+
 ## 2.16 Drivers
 
 Normal hardware drivers are intended to run in userspace under a driver manager. Deepwyrm will eventually grant restricted capabilities for configuration, MMIO, I/O ports where required, IRQ delivery, and DMA mapping.
@@ -570,7 +582,7 @@ Focused tests must cover invalid handle, stale handle, wrong type, insufficient 
 - Sanitize user-controlled flags/register state on entry/return.
 - Implement generated syscall dispatch.
 - Implement root `TaskGroup`, `Process`, and `Thread` objects.
-- Implement a simple preemptive or cooperative bootstrap scheduler sufficient to run kernel and user threads. Final scheduler policy is not frozen.
+- Implement a simple bootstrap scheduler sufficient to run kernel and user threads. Cooperative/non-preemptive scheduling is acceptable for DW0; the permanent normal preemptive policy belongs to the first scheduler-focused post-DW0 milestone, and real-time classes come only after that foundation is proven.
 - Implement task start/exit/wait state transitions.
 - Implement explicit task termination with rights checks.
 - Keep synchronization structures SMP-safe even though DW0 runs one vCPU first.
@@ -617,6 +629,8 @@ The WYR0 bootstrap binary must execute from the real Wyrmroot loader path in QEM
 ### Tasks
 
 - Enable QEMU SMP test mode with more than one vCPU and run concurrency smoke tests even if performance remains coarse-lock limited.
+- Exercise the existing scheduler, blocking/wakeup, timer, task teardown, and wait machinery under SMP strongly enough to establish a clean baseline for the later normal-preemption milestone.
+- Do **not** add real-time priority classes, reservations/budgets, deadline scheduling, priority inheritance/propagation, or a permanent scheduler-policy redesign in DW0-H; record any correctness blocker that must be resolved before post-DW0 preemption instead of absorbing that later milestone here.
 - Run sanitization/invariant checks available to the Rust/kernel environment.
 - Verify no production kernel subsystem depends on debug-only QEMU exits.
 - Verify ABI generated artifacts have no drift.
@@ -751,6 +765,8 @@ Do not let DW0 expand to include:
 - persistent root filesystem
 - package manager
 - service manager
+- permanent normal scheduler-policy redesign / timer-driven preemption beyond what DW0 bootstrap correctness requires
+- real-time scheduler classes, priority/deadline policy, reservations/budgets, RT admission control, or hard-real-time guarantees
 - shell/TTY/PTY
 - network stack
 - USB

@@ -322,6 +322,14 @@ F2 may reuse it only if the stationary owner remains valid across context
 switches and its current-Thread selection is explicit; otherwise F2 must replace
 it with mechanically stable runtime ownership before general blocking is live.
 
+### Future scheduling/real-time compatibility boundary
+
+F's scheduler state, wake generations, absolute deadlines, timer interrupts, and bounded wait/Channel machinery are **mechanism foundations, not a priority or real-time scheduling contract**. F does not assign scheduling priorities, execution budgets, periods, scheduler classes, or deadline urgency to a Thread, wait, Channel message, or block token.
+
+Later scheduler work must preserve F's exact wake/rollback/lifetime semantics while remaining able to add policy above them. In particular, future normal preemption and later capability-authorized real-time scheduling may need priority/deadline inheritance or urgency propagation across blocking synchronization and synchronous Channel/service dependencies. F data structures must not make that impossible by baking FIFO/cooperative policy into public ABI semantics, but F implementation must not speculate those fields or propagation rules into ABI-0 now.
+
+The sequencing boundary is explicit: DW0-H validates these existing mechanisms under SMP without adding an RT scheduler; the first scheduler-focused post-DW0 work establishes ordinary timer-driven preemption and SMP scheduling correctness; only a later DW1 phase may add firm/soft real-time policy, bounded reservations/budgets, and RT memory/latency contracts.
+
 ---
 
 ## 9. Clock, deadline, timer interrupt, and IRQ-lock contract

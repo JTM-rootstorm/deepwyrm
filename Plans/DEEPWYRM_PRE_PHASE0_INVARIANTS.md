@@ -179,6 +179,30 @@ The TaskGroup model must remain capable of supporting later:
 
 The scheduler/resource-control algorithms themselves remain deferred.
 
+## 10.1 General-purpose scheduling with a future real-time class
+
+Deepwyrm remains a **general-purpose kernel**, not a hard-real-time operating system. The ordinary scheduler must optimize for a usable multi-purpose system and must not require every process, service, or application to participate in deadline scheduling.
+
+The architecture must nevertheless preserve a later capability-authorized **firm/soft real-time execution class** for workloads such as pro audio, VR/tracking, media processing, and latency-sensitive display work. This direction is a scheduling/resource-policy extension over the same native Thread, TaskGroup, wait, Channel, memory, and capability mechanisms; it is not a second RT kernel and must not introduce subsystem-specific kernel semantics.
+
+Locked direction:
+
+- normal workloads remain in the general-purpose scheduling class by default;
+- real-time scheduling authority is explicit and policy-controlled, expected to be granted through TaskGroup/resource-policy authority or an equivalently narrow typed mechanism rather than self-asserted by arbitrary applications;
+- the first post-DW0 scheduler step is ordinary timer-driven preemption with SMP-safe scheduling state, CPU affinity/migration rules, and latency instrumentation before any real-time guarantee is claimed;
+- a later DW1 phase may add fixed-priority and/or reservation-based real-time scheduling, including bounded execution budgets/periods/deadlines and throttling so one authorized RT task cannot monopolize the machine;
+- blocking synchronization and synchronous Channel/service dependency chains must remain capable of later priority/deadline inheritance or urgency propagation so a high-urgency caller is not indefinitely blocked behind lower-urgency work;
+- real-time working sets must be able to use prefaulted/pinned/committed memory or an equivalent bounded-fault path before real-time execution begins; ordinary pageable memory remains valid for normal workloads;
+- IRQ, wait, timer, IPC, and scheduler paths intended for future real-time use should remain bounded where practical and measurable; latency claims require instrumentation and hardware-specific evidence rather than assumption;
+- commodity x86_64 firmware/hardware may prevent meaningful hard-real-time guarantees, so Deepwyrm must not advertise hard-real-time correctness without a separately validated hardware/profile contract; and
+- compatibility personalities may project foreign priority/scheduling APIs onto admitted native mechanisms, but they do not define or widen the native real-time model.
+
+DW0's absolute monotonic deadlines, one-shot timer service, bounded Channel queues, and resumable blocking are useful foundations but **do not themselves constitute a real-time scheduler or latency guarantee**.
+
+Sequencing is intentionally constrained: DW0-G4/G5 must not add real-time scheduler behavior; DW0-H validates the existing scheduler/task/wait machinery under SMP and hardens it without RT scope expansion; the next scheduler milestone should first establish normal preemptive scheduling; only a later DW1 phase should activate the real-time class once the ordinary preemptive/SMP foundation and useful Wyrmroot process/service dependency chains exist.
+
+No public ABI, scheduler class identifier, priority scale, budget record, or admission-control syscall is reserved by this section. Those details remain deferred until the implementation milestone reaches them.
+
 ---
 
 # 11. Driver/resource ABI remains explicitly unstable during early development
@@ -362,6 +386,7 @@ The following remain implementation choices:
 - kernel heap algorithm
 - scheduler algorithm/quantum
 - exact per-CPU runqueue design
+- exact normal/real-time scheduler-class representation, priority scale, reservation/admission ABI, and inheritance/propagation algorithm
 - exact CSPRNG/DRBG implementation
 - final task-accounting schema
 - final tracing implementation

@@ -203,6 +203,14 @@ Scheduler queue mutation must likewise not call task finalizers. A terminal
 thread is first made non-runnable, then task state is committed, then ownership
 references are released outside scheduler ownership.
 
+### 4.2 Scheduler-policy forward boundary
+
+E's scheduler/execution ownership is a task-lifetime mechanism, not a permanent scheduling-policy ABI. The E/F implementation may remain deterministic cooperative/FIFO for DW0; queue order, quantum, priority, and preemption policy are not user-visible semantics frozen by this contract.
+
+Future scheduler work must preserve the task execution pins, terminal retirement ordering, per-CPU entry-stack boundary, and resumable blocking ownership while changing policy in stages. DW0-H first proves the existing machinery under SMP. The first scheduler-focused post-DW0 phase then establishes ordinary timer-driven preemption and SMP/per-CPU scheduling correctness. Only a later DW1 phase may add capability-authorized firm/soft real-time classes, bounded budgets/reservations, or priority/deadline inheritance/propagation.
+
+E therefore adds no priority field, scheduler class, RT right, budget/deadline record, or admission-control syscall. `RESOURCE_POLICY` termination remains a generic future policy reason and must not be reinterpreted as an RT scheduler contract.
+
 ---
 
 ## 5. D7-R1/R2 are closed mechanically before task publication
