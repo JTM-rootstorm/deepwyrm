@@ -51,8 +51,8 @@ detached and its device, inode, size, capacity, allocation, and physical-size bo
 The exact `gpt-daybreak-blue-latest` rereviews pass C0/H0/M0/L0 after all findings and the final
 provenance request were remediated. See `security/DW0_G_SECURITY_REVIEW.md`.
 
-G5 is accepted and the separate P0 accounting lane is closed by the coordinator reconciliation in
-`../../DW0_G_P0_ACCOUNTING_RECONCILIATION.md`, which binds WYR0-B to exact retained F12/F14 loader/VM
-evidence and proves WYR0-C library/contract continuity. **DW0-G is FULL ACCEPTED for progression to
-DW0-H.** This still makes no SMP, preemption, real-time, general-exec, physical-hardware, i386,
+G5 is accepted and the separate P0 accounting lane was closed from exact retained F12/F14 loader/VM
+evidence plus WYR0-C library/contract continuity. The one-off root reconciliation record has since been
+retired with the completed G coordination material and remains available in Git history. **DW0-G is FULL
+ACCEPTED for progression to DW0-H.** This still makes no SMP, preemption, real-time, general-exec, physical-hardware, i386,
 full-WYR0-F, or full-Wyrmroot claim.
