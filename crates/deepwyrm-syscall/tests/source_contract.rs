@@ -12,6 +12,7 @@ fn public_wrappers_use_generated_ids_not_copied_numeric_values() {
         "DW_SYSCALL_HANDLE_CLOSE",
         "DW_SYSCALL_OBJECT_GET_INFO_V1",
         "DW_SYSCALL_PROCESS_EXIT",
+        "DW_SYSCALL_THREAD_EXIT",
         "DW_SYSCALL_CHANNEL_SEND",
         "DW_SYSCALL_CHANNEL_RECEIVE",
         "DW_SYSCALL_ADDRESS_REGION_MAP",

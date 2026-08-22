@@ -167,6 +167,13 @@ pub fn process_exit(exit_code: u32) -> DwStatus {
     unsafe { syscall6(DW_SYSCALL_PROCESS_EXIT, u64::from(exit_code), 0, 0, 0, 0, 0) }
 }
 
+/// Request normal termination of the calling thread with a native exit code.
+#[inline]
+pub fn thread_exit(exit_code: u32) -> DwStatus {
+    // SAFETY: `exit_code` is a generated scalar ABI argument.
+    unsafe { syscall6(DW_SYSCALL_THREAD_EXIT, u64::from(exit_code), 0, 0, 0, 0, 0) }
+}
+
 /// Atomically send one native Channel datagram and optional moved handles.
 #[inline]
 pub fn channel_send(
