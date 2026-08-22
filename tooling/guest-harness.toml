@@ -107,3 +107,9 @@ state = "implemented"
 [guest_test.process-create-bootstrap]
 id = 17
 state = "reserved"
+
+# DW0-G production-path test build. Unlike the synthetic F selectors, this
+# consumes the loader-provided bootstrap and bootfs modules.
+[guest_test.primordial-bootstrap]
+id = 18
+state = "implemented"

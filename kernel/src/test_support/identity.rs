@@ -28,6 +28,7 @@ pub(crate) enum BuildGuestTest {
     TaskUserException,
     IpcBlockingSmoke,
     AtomicWaitWake,
+    PrimordialBootstrap,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,6 +85,7 @@ impl BuildGuestTest {
             Self::TaskUserException => 12,
             Self::IpcBlockingSmoke => 13,
             Self::AtomicWaitWake => 16,
+            Self::PrimordialBootstrap => 18,
         }
     }
 
@@ -94,12 +96,24 @@ impl BuildGuestTest {
         )
     }
 
+    #[allow(
+        dead_code,
+        reason = "selector-specialized target builds compile only the matching F runtime"
+    )]
     pub(crate) const fn is_f9_userspace(self) -> bool {
         matches!(self, Self::AtomicWaitWake)
     }
 
+    #[allow(
+        dead_code,
+        reason = "selector-specialized target builds compile only the matching F runtime"
+    )]
     pub(crate) const fn is_f12_userspace(self) -> bool {
         matches!(self, Self::IpcBlockingSmoke)
+    }
+
+    pub(crate) const fn is_primordial(self) -> bool {
+        matches!(self, Self::PrimordialBootstrap)
     }
 
     pub(crate) const fn is_memory_foundation(self) -> bool {
@@ -192,6 +206,8 @@ const fn parse_known_selector(value: &str) -> BuildGuestTest {
         BuildGuestTest::IpcBlockingSmoke
     } else if string_equals(value, "atomic-wait-wake") {
         BuildGuestTest::AtomicWaitWake
+    } else if string_equals(value, "primordial-bootstrap") {
+        BuildGuestTest::PrimordialBootstrap
     } else {
         panic!("unknown build-selected guest test")
     }

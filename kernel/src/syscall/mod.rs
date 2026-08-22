@@ -36,6 +36,11 @@ pub(crate) use adapters::{
 pub(crate) use adapters::clock_get;
 #[cfg(deepwyrm_e7_guest)]
 pub(crate) use adapters::{NoTerminalWaitCleanup, abi_get_info};
+#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+pub(crate) use adapters::{
+    address_region_map_model, address_region_unmap, complete_deferred_current_reclaim,
+    decode_map_args, handle_close, object_get_info_v1, process_exit,
+};
 #[cfg(any(deepwyrm_e7_guest, deepwyrm_f9_guest, deepwyrm_f12_guest))]
 pub(crate) use adapters::{complete_deferred_current_reclaim, process_exit};
 #[cfg(deepwyrm_f12_guest)]

@@ -149,28 +149,6 @@ fn take_channel_staging() -> &'static mut [u8; DW_CHANNEL_MAX_PAYLOAD as usize] 
     unsafe { &mut *F12_CHANNEL_STAGING.0.get() }
 }
 
-impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
-    crate::syscall::FAtomicUserAccess
-    for super::super::LiveProcessAddressSpace<'borrow, 'root, RANGE_CAPACITY, ROLE_CAPACITY>
-{
-    type AtomicPin = super::super::user_access::OwnedLiveAtomicU32;
-
-    fn pin_atomic_u32(&mut self, address: DwUserAddress) -> Result<Self::AtomicPin, DwStatus> {
-        super::super::LiveProcessAddressSpace::pin_atomic_u32(self, address.0)
-            .map_err(|_| DW_STATUS_BAD_ADDRESS)
-    }
-
-    fn load_atomic_u32_acquire(&mut self, pin: &Self::AtomicPin) -> u32 {
-        super::super::LiveProcessAddressSpace::load_atomic_u32_acquire(self, pin)
-            .unwrap_or_else(|_| fail(0x06))
-    }
-
-    fn release_atomic_u32(&mut self, pin: Self::AtomicPin) {
-        super::super::LiveProcessAddressSpace::release_atomic_u32(self, pin)
-            .unwrap_or_else(|_| fail(0x07));
-    }
-}
-
 #[allow(
     unsafe_code,
     reason = "the selector-13 boot owns one-shot publication of a stationary ExecutionDomain consumed by the timer IRQ and syscall runtime"

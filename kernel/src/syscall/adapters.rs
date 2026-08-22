@@ -3782,7 +3782,7 @@ fn address_region_object_status(
     }
 }
 
-fn decode_map_args<U: UserPageAccess>(
+pub(crate) fn decode_map_args<U: UserPageAccess>(
     user: &mut U,
     args_address: DwUserAddress,
     args_size: u64,
@@ -3909,17 +3909,63 @@ fn address_region_map_preflighted<
     protection: crate::memory::address_region::Protection,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> DwStatus {
-    let region_resolved = match resolve_current(
+    match address_region_map_model(
+        publisher,
+        registry,
+        memory,
+        tasks,
+        regions,
+        current_process,
+        address_region,
+        memory_object,
+        args,
+        protection,
+        cleanup,
+    ) {
+        Ok(address) => {
+            output.commit(&encode_u64(address));
+            DW_STATUS_SUCCESS
+        }
+        Err(status) => status,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn address_region_map_model<
+    P: crate::memory::address_region::AddressSpacePublisher,
+    const OBJECTS: usize,
+    const MEMORY_OBJECTS: usize,
+    const LEASES: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const REGION_OBJECTS: usize,
+    const REGION_SLOTS: usize,
+>(
+    publisher: &mut P,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    memory: &mut MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    regions: &mut crate::memory::address_region::AddressRegionObjectAuthority<
+        REGION_OBJECTS,
+        REGION_SLOTS,
+    >,
+    current_process: ProcessKey,
+    address_region: DwHandle,
+    memory_object: DwHandle,
+    args: deepwyrm_abi::DwAddressRegionMapArgsV1,
+    protection: crate::memory::address_region::Protection,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> Result<u64, DwStatus> {
+    let region_resolved = resolve_current(
         tasks,
         registry,
         current_process,
         address_region,
         deepwyrm_abi::DW_OBJECT_TYPE_ADDRESS_REGION,
         DwRights(deepwyrm_abi::DW_RIGHT_MAP.0 | deepwyrm_abi::DW_RIGHT_MODIFY.0),
-    ) {
-        Ok(resolved) => resolved,
-        Err(status) => return status,
-    };
+    )?;
     let region_key = crate::memory::address_region::AddressRegionObjectKey::from_object_id(
         region_resolved.object_id(),
     );
@@ -3934,7 +3980,7 @@ fn address_region_map_preflighted<
         Ok(resolved) => resolved,
         Err(status) => {
             release_lookup_pin(registry, region_resolved.into_internal(), cleanup);
-            return status;
+            return Err(status);
         }
     };
     let region = match regions.region_mut_for_live_process(tasks, region_key) {
@@ -3942,7 +3988,7 @@ fn address_region_map_preflighted<
         Err(error) => {
             release_lookup_pin(registry, memory_resolved.into_internal(), cleanup);
             release_lookup_pin(registry, region_resolved.into_internal(), cleanup);
-            return address_region_object_status(error);
+            return Err(address_region_object_status(error));
         }
     };
     let authorization = match region.authorize_map(memory, memory_resolved, protection) {
@@ -3951,7 +3997,7 @@ fn address_region_map_preflighted<
             let (memory_error, releases) = error.release(registry);
             queue_mapping_releases(cleanup, releases);
             release_lookup_pin(registry, region_resolved.into_internal(), cleanup);
-            return match memory_error {
+            return Err(match memory_error {
                 crate::memory::object::MemoryObjectError::InsufficientRights
                 | crate::memory::object::MemoryObjectError::ProtectionCeiling => {
                     DW_STATUS_ACCESS_DENIED
@@ -3968,7 +4014,7 @@ fn address_region_map_preflighted<
                     DW_STATUS_INVALID_ARGUMENT
                 }
                 _ => DW_STATUS_BAD_STATE,
-            };
+            });
         }
     };
     let fixed = args.flags.0 == deepwyrm_abi::DW_ADDRESS_REGION_MAP_FLAG_FIXED.0;
@@ -4000,13 +4046,12 @@ fn address_region_map_preflighted<
     match result {
         Ok((address, releases)) => {
             queue_mapping_releases(cleanup, releases);
-            output.commit(&encode_u64(address));
-            DW_STATUS_SUCCESS
+            Ok(address)
         }
         Err(failure) => {
             let (error, releases) = failure.into_parts();
             queue_mapping_releases(cleanup, releases);
-            address_transaction_status(&error)
+            Err(address_transaction_status(&error))
         }
     }
 }

@@ -333,7 +333,7 @@ fn entry_shim_switches_stacks_before_its_first_push() {
 }
 
 #[test]
-fn production_entry_keeps_guest_completion_hooks_feature_gated() {
+fn production_entry_dispatches_primordial_runtime_and_keeps_test_hooks_feature_gated() {
     let kernel = fs::read_to_string(kernel_root().join("src/lib.rs")).expect("read kernel root");
     assert!(kernel.contains("#[cfg(feature = \"test-support\")]\npub mod test_support;"));
 
@@ -348,7 +348,10 @@ fn production_entry_keeps_guest_completion_hooks_feature_gated() {
             "production-visible guest hook lacked a local test-support gate: {marker}"
         );
     }
-    assert!(kernel.contains("#[cfg(not(feature = \"test-support\"))]\n        loop {"));
+    assert!(kernel.contains(
+        "#[cfg(not(feature = \"test-support\"))]\n        active_paging.run_primordial(primordial_modules)"
+    ));
+    assert!(!kernel.contains("#[cfg(not(feature = \"test-support\"))]\n        loop {"));
 }
 
 #[test]

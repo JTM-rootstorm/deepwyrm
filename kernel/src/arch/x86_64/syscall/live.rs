@@ -675,11 +675,16 @@ pub(crate) unsafe extern "sysv64" fn dw_x86_64_first_run_thread_entry() -> ! {
     unsafe { (binding.fresh_thread_handler)(binding.context) }
 }
 
+#[allow(
+    dead_code,
+    reason = "multi-thread F7/F12 runtimes use the first-run continuation; the single-thread G3 runtime does not"
+)]
 pub(crate) fn first_run_thread_entry_rip() -> u64 {
     dw_x86_64_first_run_thread_entry as *const () as usize as u64
 }
 
 #[allow(
+    dead_code,
     unsafe_code,
     reason = "the private divergent entry retains the pinned exclusive runtime owner for every dispatch through the stored context/function pair"
 )]
@@ -691,6 +696,7 @@ unsafe fn dispatch_bound_runtime(frame: &mut RawSyscallFrame) {
 }
 
 #[allow(
+    dead_code,
     unsafe_code,
     reason = "F7 first-run entry checks the IF-clear BSP entry-state stack identity established by the context-switch boundary"
 )]
@@ -699,6 +705,7 @@ fn current_kernel_stack_is(stack: KernelStackBounds) -> bool {
 }
 
 #[allow(
+    dead_code,
     unsafe_code,
     reason = "F7 fresh-Thread launch reuses the already-installed exception/syscall runtimes and the stack binding established by the kernel context switch"
 )]

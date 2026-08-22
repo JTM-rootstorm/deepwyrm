@@ -608,6 +608,41 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     #[allow(
         unsafe_code,
+        reason = "the authenticated scratch session zeroes the exclusive table allocation before the typed Zeroed transition"
+    )]
+    pub(crate) fn prepare_table_candidate(
+        &mut self,
+        level: TableLevel,
+    ) -> Result<TableCandidateGrant, LiveUserAccessError> {
+        let allocation = self
+            .roles
+            .allocate(1)
+            .map_err(|_| LiveUserAccessError::MissingOrInvalid)?;
+        let frame = FrameAddress::new(allocation.physical_start(), self.root.physical_limit())
+            .map_err(|_| LiveUserAccessError::MissingOrInvalid)?;
+        if self.target.scratch.zero_allocator_frame(frame).is_err() {
+            self.roles
+                .cancel_allocation(allocation)
+                .unwrap_or_else(|_| {
+                    panic!("G3 table-candidate rollback lost allocation authority")
+                });
+            return Err(LiveUserAccessError::MissingOrInvalid);
+        }
+        let zeroed = unsafe { self.roles.assume_zeroed(allocation) }
+            .unwrap_or_else(|_| panic!("G3 zeroed table-candidate transition drifted"));
+        self.roles
+            .prepare_table(zeroed, self.identity.owner(), level)
+            .map_err(|_| LiveUserAccessError::MissingOrInvalid)
+    }
+
+    pub(crate) fn recycle_table_candidate(&mut self, candidate: TableCandidateGrant) {
+        self.roles
+            .cancel_table_candidate(candidate)
+            .unwrap_or_else(|_| panic!("G3 unused table-candidate rollback drifted"));
+    }
+
+    #[allow(
+        unsafe_code,
         reason = "the live session binds authority-issued identities to its exact pin-aware serialized architecture root"
     )]
     pub(crate) fn publisher<
@@ -675,5 +710,29 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 {
     fn process_key(&self) -> crate::task::ProcessKey {
         self.process
+    }
+}
+
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> crate::syscall::FAtomicUserAccess
+    for LiveProcessAddressSpace<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    type AtomicPin = OwnedLiveAtomicU32;
+
+    fn pin_atomic_u32(
+        &mut self,
+        address: deepwyrm_abi::DwUserAddress,
+    ) -> Result<Self::AtomicPin, deepwyrm_abi::DwStatus> {
+        LiveProcessAddressSpace::pin_atomic_u32(self, address.0)
+            .map_err(|_| deepwyrm_abi::DW_STATUS_BAD_ADDRESS)
+    }
+
+    fn load_atomic_u32_acquire(&mut self, pin: &Self::AtomicPin) -> u32 {
+        LiveProcessAddressSpace::load_atomic_u32_acquire(self, pin)
+            .unwrap_or_else(|_| panic!("live atomic pin lost its mapping authority"))
+    }
+
+    fn release_atomic_u32(&mut self, pin: Self::AtomicPin) {
+        LiveProcessAddressSpace::release_atomic_u32(self, pin)
+            .unwrap_or_else(|_| panic!("live atomic pin release lost its owner"));
     }
 }

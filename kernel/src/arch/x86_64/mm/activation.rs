@@ -27,6 +27,9 @@ use super::super::{
 };
 #[path = "activation/graph.rs"]
 mod graph;
+#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+#[path = "activation/primordial.rs"]
+mod primordial;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[path = "activation/user_access.rs"]
 mod user_access;
@@ -636,6 +639,45 @@ impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
                 (self.scratch.window_page as usize + offset) as *const u8,
                 destination.as_mut_ptr(),
                 destination.len(),
+            );
+        }
+        self.restore_scratch_mapping(installed);
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    #[allow(
+        unsafe_code,
+        reason = "G3 initializes exclusively owned object backing through the authenticated transient Deep scratch leaf"
+    )]
+    fn write_physical_bytes(
+        &mut self,
+        frame: FrameAddress,
+        offset: usize,
+        source: &[u8],
+    ) -> Result<(), LiveActiveTargetError> {
+        assert!(!self.poisoned, "active Deep scratch mapper is poisoned");
+        if frame.address() == self.scratch.pt.physical_start()
+            || offset
+                .checked_add(source.len())
+                .is_none_or(|end| end > PAGE_SIZE as usize)
+        {
+            return Err(LiveActiveTargetError::ReservedScratchEntry);
+        }
+        if source.is_empty() {
+            return Ok(());
+        }
+        let installed = frame.address() | PRESENT | WRITABLE | NO_EXECUTE;
+        let leaf = self.scratch_leaf_address();
+        if self.io.compare_exchange(leaf, 0, installed).is_err() {
+            return Err(LiveActiveTargetError::Busy);
+        }
+        self.io.invalidate(self.scratch.window_page);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                source.as_ptr(),
+                (self.scratch.window_page as usize + offset) as *mut u8,
+                source.len(),
             );
         }
         self.restore_scratch_mapping(installed);
@@ -1254,6 +1296,13 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             },
             _root: core::marker::PhantomData,
         }
+    }
+
+    pub(crate) fn run_primordial(
+        self,
+        modules: crate::boot::primordial::PrimordialBootModules,
+    ) -> ! {
+        primordial::enter(self, modules)
     }
 }
 

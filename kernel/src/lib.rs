@@ -142,6 +142,17 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
     let boot_info = boot::validate_boot_info(&reader, boot_info_physical)
         .unwrap_or_else(|error| panic!("invalid DwBootInfoV1 handoff: {error:?}"));
 
+    #[cfg(not(feature = "test-support"))]
+    let primordial_modules = boot_info
+        .primordial_modules()
+        .unwrap_or_else(|error| panic!("invalid primordial modules: {error:?}"));
+    #[cfg(feature = "test-support")]
+    let primordial_modules = test_support::BUILD_GUEST_TEST.is_primordial().then(|| {
+        boot_info
+            .primordial_modules()
+            .unwrap_or_else(|error| panic!("invalid primordial modules: {error:?}"))
+    });
+
     #[cfg(feature = "test-support")]
     match test_support::BUILD_GUEST_TEST {
         test_support::BuildGuestTest::BootHandoffPass => test_support::complete_pass(0),
@@ -154,6 +165,7 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
         test if test.is_f9_userspace() => {}
         #[cfg(deepwyrm_f12_guest)]
         test if test.is_f12_userspace() => {}
+        test if test.is_primordial() => {}
         _ => unreachable!("all build-selected guest tests have explicit dispatch"),
     }
 
@@ -264,17 +276,12 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             test if test.is_f12_userspace() => {
                 active_paging.run_ipc_blocking_userspace_test(test_support::BUILD_GUEST_TEST)
             }
+            test if test.is_primordial() => active_paging
+                .run_primordial(primordial_modules.expect("primordial test selected its modules")),
             _ => unreachable!("post-activation selector lacks an explicit runtime"),
         }
         #[cfg(not(feature = "test-support"))]
-        loop {
-            core::hint::black_box(&active_paging);
-            // SAFETY: the active session remains owned on this stack, APs are
-            // offline, and DW0-C2 has no scheduler or later phase to resume.
-            unsafe {
-                core::arch::asm!("sti", "hlt", options(nomem, nostack));
-            }
-        }
+        active_paging.run_primordial(primordial_modules)
     }
 }
 

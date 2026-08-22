@@ -54,9 +54,17 @@ pub(crate) struct PmTimerProposal {
 }
 
 impl PmTimerProposal {
+    #[allow(
+        dead_code,
+        reason = "host ACPI tests inspect the proposal before authorization"
+    )]
     pub(crate) const fn port(self) -> u16 {
         self.port
     }
+    #[allow(
+        dead_code,
+        reason = "host ACPI tests inspect the proposal before authorization"
+    )]
     pub(crate) const fn width(self) -> PmTimerWidth {
         self.width
     }
@@ -69,6 +77,10 @@ pub(crate) struct AcpiSnapshotWorkspace {
 }
 
 impl AcpiSnapshotWorkspace {
+    #[allow(
+        dead_code,
+        reason = "host parser tests use value construction while the live BSP initializes its large workspace in place"
+    )]
     pub(crate) const fn new() -> Self {
         Self {
             rsdp: [0; MAX_RSDP_BYTES],

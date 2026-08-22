@@ -15,8 +15,8 @@ use crate::task::BlockWakeKey;
 
 use super::{
     DEADLINE_QUEUE_CAPACITY, DeadlineQueue, DeadlineRegistration, MonotonicSample,
-    PmTimerDescriptor, PmTimerState, PmTimerWidth, TimeInitState, TimerDeadlineAuthority,
-    TimerDeadlineError, TimerExpiryToken, apic_one_shot_for_delta,
+    PmTimerDescriptor, PmTimerState, TimeInitState, TimerDeadlineAuthority, TimerDeadlineError,
+    TimerExpiryToken, apic_one_shot_for_delta,
 };
 
 const UNINITIALIZED: u8 = 0;
@@ -841,7 +841,7 @@ pub(crate) fn run_target_deadline_probe() -> Result<F3TargetProbe, LiveTimeError
     // DB-01 regression: remain genuinely idle for at least two complete 24-bit
     // PM-timer wrap intervals. Quarter-wrap maintenance IRQs must keep extending
     // the same monotonic domain without clock_get/user-deadline traffic driving it.
-    let long_idle_ns = super::ticks_to_nanoseconds(PmTimerWidth::Bits24.modulus())
+    let long_idle_ns = super::ticks_to_nanoseconds(super::PmTimerWidth::Bits24.modulus())
         .map_err(|_| LiveTimeError::Clock)?
         .checked_mul(2)
         .ok_or(LiveTimeError::Clock)?;
