@@ -39,17 +39,19 @@ were actually run, their exact results, and any remaining unverified claims.
 
 ## Licensing changes
 
-Read [`LICENSING.md`](LICENSING.md) before adding copied/adapted third-party code
-or changing a package license. `GPL-2.0-or-later` is the repository default and
-all current Deepwyrm components retain it. Do not tighten kernel, ABI,
-generator, generated-ABI, or kernel-coupled code to `GPL-3.0-or-later` without
-an explicit compatibility review.
+Read [`LICENSING.md`](LICENSING.md) and the workspace
+[`LICENSING_POLICY.md`](../LICENSING_POLICY.md) before adding copied/adapted
+third-party code or changing a package license. The existing Deepwyrm tree
+currently retains its `GPL-2.0-or-later` declarations, but new wholly
+first-party components default to `GPL-3.0-or-later`. Do not choose 2+ merely
+to reserve a hypothetical future Linux import path.
 
-A clearly separable future host or userspace component may use
-`GPL-3.0-or-later` when its copyright and dependency provenance permits it and
-the exception is explicitly recorded. Do not silently relicense imported
-third-party code, and do not infer permission from where a file lives in the
-repository.
+When actual GPLv2-family material or another compatibility requirement enters
+a component, preserve the upstream license exactly and use the narrowest
+sensible GPLv2-compatible project-owned boundary. In particular, do not
+relabel imported `GPL-2.0-only` source as `GPL-2.0-or-later`. Check non-GPL
+licenses for compatibility before import, and never infer permission from where
+a file lives in the repository.
 
 ## Generated files and local artifacts
 

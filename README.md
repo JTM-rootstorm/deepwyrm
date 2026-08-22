@@ -28,4 +28,4 @@ Shared boot and ABI contracts are coordinated across both projects. Wyrmroot con
 
 ## License
 
-Deepwyrm's repository default is [GPL-2.0-or-later](LICENSE). All current components retain that license. The repository carries a GPLv3-or-later text and policy for future explicitly approved component-level use; see [LICENSING.md](LICENSING.md) for the compatibility rules and current exception list.
+Deepwyrm currently retains a [GPL-2.0-or-later](LICENSE) repository fallback and current component set. New wholly first-party project code defaults to `GPL-3.0-or-later`; GPLv2-compatible lanes are selected when actual source provenance or combination requirements call for them. See [LICENSING.md](LICENSING.md) for the current component state and workspace-aligned provenance rules.
