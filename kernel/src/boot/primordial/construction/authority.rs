@@ -533,10 +533,20 @@ where
             .tasks
             .acquire_process_operation(process)
             .map_err(AuthorityPrimordialError::Task)?;
-        let region = self
+        let region = match self
             .regions
             .region_mut_for_operation(self.tasks, &lease, key)
-            .map_err(AuthorityPrimordialError::Region)?;
+        {
+            Ok(region) => region,
+            Err(error) => {
+                self.tasks
+                    .release_process_operation(lease)
+                    .unwrap_or_else(|(release_error, _)| {
+                        panic!("primordial segment lookup leaked process lease: {release_error:?}")
+                    });
+                return Err(AuthorityPrimordialError::Region(error));
+            }
+        };
         let result = self.platform.map(
             region,
             self.memory,
@@ -576,10 +586,20 @@ where
             .tasks
             .acquire_process_operation(process)
             .map_err(AuthorityPrimordialError::Task)?;
-        let region = self
+        let region = match self
             .regions
             .region_mut_for_operation(self.tasks, &lease, key)
-            .map_err(AuthorityPrimordialError::Region)?;
+        {
+            Ok(region) => region,
+            Err(error) => {
+                self.tasks
+                    .release_process_operation(lease)
+                    .unwrap_or_else(|(release_error, _)| {
+                        panic!("primordial stack lookup leaked process lease: {release_error:?}")
+                    });
+                return Err(AuthorityPrimordialError::Region(error));
+            }
+        };
         let result = self.platform.map(
             region,
             self.memory,
