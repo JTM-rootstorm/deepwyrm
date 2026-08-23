@@ -33,7 +33,7 @@ use crate::syscall::native::{
     NativeSyscallFrameRuntime, NativeSyscallHandler, NativeSyscallRequest, NativeSyscallResult,
     SyscallControl,
 };
-use crate::syscall::{CleanupQueue, FServiceRoute, FServiceState};
+use crate::syscall::{CleanupQueue, FServiceRoute, FServiceState, TerminalWaitCleanup};
 use crate::task::{ExecutionDomain, ProcessKey, SchedulerThreadState, TaskAuthority, ThreadKey};
 use crate::time::TimerAuthority;
 use crate::wait::{EventAuthority, WaitRegistry};
@@ -1022,6 +1022,7 @@ struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_
     active: ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
     active_root: CarrierActiveRoot,
     stopping_claim: Option<crate::task::SchedulerExecutionClaim>,
+    stopping_claim_was_suspended: bool,
     rendezvous_reaper: Option<crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry>,
     registry: Registry,
     memory: Memory,
@@ -1272,6 +1273,51 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             "remote stop staged cleanup twice"
         );
         self.rendezvous_cleanup = Some(core::mem::replace(&mut self.cleanup, CleanupQueue::new()));
+    }
+
+    /// Moves a suspended F-service operation out of the stopped carrier before
+    /// the Process root is released. e1 delivery after block commit has no
+    /// Running claim, but it still owns exact wait/output/atomic cleanup that
+    /// cannot be left to trip the post-commit quiescence check.
+    fn transfer_suspended_service_cleanup_for_stop(&mut self) {
+        if self.services.is_quiescent() {
+            return;
+        }
+        let mut discarded = None;
+        let mut atomic_pin = None;
+        let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
+        {
+            let mut terminal = self.services.terminal_cleanup(
+                Some(&mut wait_deadlines),
+                |output| {
+                    assert!(discarded.replace(output).is_none());
+                },
+                |pin| {
+                    assert!(atomic_pin.replace(pin).is_none());
+                },
+            );
+            terminal.cleanup_terminal_wait(
+                &mut self.registry,
+                &mut self.tasks,
+                &self.shared.waits,
+                &self.shared.execution,
+                self.thread,
+                &mut self.cleanup,
+            );
+        }
+        let mut user = self.active.current_process_address_space(
+            self.active_root.as_ref().expect("active Process root"),
+            self.process,
+        );
+        if let Some(output) = discarded {
+            user.discard_owned_output(output)
+                .unwrap_or_else(|_| panic!("rendezvous suspended output pin drifted"));
+        }
+        if let Some(pin) = atomic_pin {
+            user.release_atomic_u32(pin)
+                .unwrap_or_else(|_| panic!("rendezvous suspended atomic pin drifted"));
+        }
+        self.merge_cleanup(self.services.take_cleanup());
     }
 
     fn drain_staged_rendezvous_cleanup(&mut self) {
@@ -1877,11 +1923,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let snapshot = registry
             .snapshot(self.cpu.index())
             .map_err(|_| crate::arch::x86_64::rendezvous::RemoteStopError::WrongIdentity)?;
-        let claim = self
-            .shared
-            .execution
-            .running_claim_on(self.cpu)
-            .ok_or(crate::arch::x86_64::rendezvous::RemoteStopError::StaleRequest)?;
+        // An e1 Stop may arrive after the blocked syscall has committed its
+        // exact Running generation into this CPU's suspended continuation.
+        // Keep that case generation-bound; it is not a thread-only fallback.
+        let (claim, was_suspended) = match self.shared.execution.running_claim_on(self.cpu) {
+            Some(claim) => (claim, false),
+            None => (
+                self.shared
+                    .execution
+                    .suspended_claim_on(self.cpu)
+                    .ok_or(crate::arch::x86_64::rendezvous::RemoteStopError::StaleRequest)?,
+                true,
+            ),
+        };
         let root = self
             .active_root
             .as_ref()
@@ -1920,6 +1974,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         // completed syscall releases out of the stopped carrier before the
         // reaper witness is consumed; only the post-ack continuation may
         // finalize them.
+        if was_suspended {
+            self.transfer_suspended_service_cleanup_for_stop();
+        }
         self.stage_rendezvous_cleanup();
         let reaper = self
             .rendezvous_reaper
@@ -1932,6 +1989,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let _ = reaper;
         self.active_root = CarrierActiveRoot::StopPrecommitted(root);
         self.stopping_claim = Some(claim);
+        self.stopping_claim_was_suspended = was_suspended;
         Ok(witness)
     }
 
@@ -1940,12 +1998,21 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .stopping_claim
             .take()
             .unwrap_or_else(|| panic!("remote stop commit omitted its exact Running claim"));
-        self.shared
-            .execution
-            .stop_running_claim_on(claim)
-            .unwrap_or_else(|error| {
-                panic!("remote stop Running claim drifted after precommit: {error:?}")
-            });
+        if self.stopping_claim_was_suspended {
+            self.shared
+                .execution
+                .stop_suspended_claim_on(claim)
+                .unwrap_or_else(|error| {
+                    panic!("remote stop suspended claim drifted after precommit: {error:?}")
+                });
+        } else {
+            self.shared
+                .execution
+                .stop_running_claim_on(claim)
+                .unwrap_or_else(|error| {
+                    panic!("remote stop Running claim drifted after precommit: {error:?}")
+                });
+        }
         self.stopping_claim = Some(claim);
     }
 
@@ -2369,6 +2436,7 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         active,
         active_root: CarrierActiveRoot::Process(initial_root),
         stopping_claim: None,
+        stopping_claim_was_suspended: false,
         rendezvous_reaper: None,
         registry,
         memory,

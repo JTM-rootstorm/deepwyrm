@@ -39,11 +39,12 @@ publisher, scratch session, or lock guard.
 
 F-service dispatch now has the same explicit identity seam:
 `PreparedFServiceDispatch` captures the decoded request plus exact current
-`ThreadKey` and root-binding generation, validates before adapter/usercopy
-work, and consumes a separate commit witness that revalidates after dispatch.
-The primordial and F12 target adapters supply the live binding generation;
-host models use a fixed nonzero fixture generation. This is not yet a transfer
-of the legacy authority fields into `RuntimeCore`.
+`ThreadKey` and root-binding generation and validates before adapter/usercopy
+work. The enclosing native `RuntimePhaseReservation`, rather than copied
+adapter arguments, performs the post-dispatch live revalidation. The
+primordial and F12 target adapters supply the live binding generation; host
+models use a fixed nonzero fixture generation. This is not yet a transfer of
+the legacy authority fields into `RuntimeCore`.
 
 The remaining required migration is intentionally explicit:
 

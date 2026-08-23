@@ -101,18 +101,13 @@ pub(crate) enum FServiceDispatchPhaseError {
 /// Owned identity reservation for one F-service adapter dispatch.
 ///
 /// It holds no user pointer, stationary authority borrow, usercopy pin, or
-/// scheduler/wait guard. `begin` validates the short prepare phase and yields
-/// a distinct move-only commit witness which must revalidate after the
-/// guard-free adapter work completes.
+/// scheduler/wait guard. `begin` validates the short prepare phase before the
+/// adapter work begins. The enclosing native runtime phase owns the only
+/// post-dispatch live identity revalidation; this object must not pretend
+/// that copied function arguments are a fresh carrier observation.
 #[must_use = "an F-service dispatch must be committed or explicitly aborted"]
 pub(crate) struct PreparedFServiceDispatch {
     request: NativeSyscallRequest,
-    thread: ThreadKey,
-    root_generation: u64,
-}
-
-#[must_use = "an F-service dispatch commit witness must be consumed"]
-struct FServiceDispatchCommit {
     thread: ThreadKey,
     root_generation: u64,
 }
@@ -137,33 +132,14 @@ impl PreparedFServiceDispatch {
         self,
         thread: ThreadKey,
         root_generation: u64,
-    ) -> Result<(NativeSyscallRequest, FServiceDispatchCommit), FServiceDispatchPhaseError> {
+    ) -> Result<NativeSyscallRequest, FServiceDispatchPhaseError> {
         if self.thread != thread || self.root_generation != root_generation {
             return Err(FServiceDispatchPhaseError::IdentityDrift);
         }
-        Ok((
-            self.request,
-            FServiceDispatchCommit {
-                thread: self.thread,
-                root_generation: self.root_generation,
-            },
-        ))
+        Ok(self.request)
     }
 
     pub(crate) fn abort(self) {}
-}
-
-impl FServiceDispatchCommit {
-    fn finish(
-        self,
-        thread: ThreadKey,
-        root_generation: u64,
-    ) -> Result<(), FServiceDispatchPhaseError> {
-        if self.thread != thread || self.root_generation != root_generation {
-            return Err(FServiceDispatchPhaseError::IdentityDrift);
-        }
-        Ok(())
-    }
 }
 
 impl<const OBJECTS: usize> FServiceDispatch<OBJECTS> {
@@ -279,7 +255,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         U: FAtomicUserAccess<AtomicPin = AtomicPin, OwnedOutput = OUTPUT>,
         CLOCK: FnMut() -> Result<u64, DwStatus>,
     {
-        let (request, commit) = prepared
+        let request = prepared
             .begin(current_thread, current_root_generation)
             .unwrap_or_else(|_| panic!("F-service dispatch identity drifted before adapter work"));
         let route = match request {
@@ -520,9 +496,6 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
             }
             request => FServiceRoute::Fallthrough(request),
         };
-        commit
-            .finish(current_thread, current_root_generation)
-            .unwrap_or_else(|_| panic!("F-service dispatch identity drifted after adapter work"));
         FServiceDispatch {
             route,
             cleanup: self.take_cleanup(),

@@ -1062,6 +1062,51 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         Ok(())
     }
 
+    /// Retires the exact blocked continuation that is still physically active
+    /// on `claim.cpu`. This is the e1 delivery-after-block case: the logical
+    /// Running claim was already exchanged for a generation-bound suspended
+    /// continuation, so treating it as a fresh Running claim would either
+    /// stop the wrong generation or panic before the safe-point ACK.
+    pub(crate) fn stop_suspended_claim_on(
+        &self,
+        claim: SchedulerExecutionClaim,
+    ) -> Result<(), SchedulerError> {
+        let mut state = self.state.lock();
+        if claim.domain != state.domain || claim.generation == 0 {
+            return Err(SchedulerError::StaleExecutionClaim);
+        }
+        let cpu_index = claim.cpu.index();
+        let Some(suspended) = state.suspended[cpu_index] else {
+            return Err(SchedulerError::StaleExecutionClaim);
+        };
+        if suspended.thread != claim.thread
+            || suspended.generation != claim.generation
+            || suspended.publication != SuspendedPublication::Queued
+        {
+            return Err(SchedulerError::StaleExecutionClaim);
+        }
+        let Some(index) = state.queue[..state.len]
+            .iter()
+            .position(|entry| entry.is_some_and(|entry| entry.thread == claim.thread))
+        else {
+            return Err(SchedulerError::NotScheduled);
+        };
+        let entry = state.queue[index].expect("queued suspended continuation disappeared");
+        if entry.continuation_cpu != Some(claim.cpu)
+            || entry.continuation_generation != claim.generation
+        {
+            return Err(SchedulerError::StaleExecutionClaim);
+        }
+        state.remove_index(index);
+        state.suspended[cpu_index] = Some(SuspendedContinuation {
+            thread: claim.thread,
+            generation: claim.generation,
+            publication: SuspendedPublication::Retired,
+        });
+        debug_assert_eq!(state.check_invariants(), Ok(()));
+        Ok(())
+    }
+
     pub(crate) fn state(&self, thread: ThreadKey) -> Option<SchedulerThreadState> {
         let state = self.state.lock();
         if state

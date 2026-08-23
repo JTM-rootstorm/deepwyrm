@@ -738,6 +738,15 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         self.scheduler.stop_running_claim_on(claim)
     }
 
+    /// Retires a blocked physical continuation by its exact CPU/thread/
+    /// execution-generation claim for the e1 delivery-after-block safe point.
+    pub(crate) fn stop_suspended_claim_on(
+        &self,
+        claim: SchedulerExecutionClaim,
+    ) -> Result<(), SchedulerError> {
+        self.scheduler.stop_suspended_claim_on(claim)
+    }
+
     pub(crate) fn suspended_claim_on(
         &self,
         cpu: SchedulerCpuId,

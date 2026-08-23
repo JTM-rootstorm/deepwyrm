@@ -187,9 +187,8 @@ fn i1_native_adapter_phases_revalidate_exact_identity_after_guard_free_work() {
     assert!(
         services.contains("prepared\n            .begin(current_thread, current_root_generation)")
     );
-    assert!(
-        services.contains("commit\n            .finish(current_thread, current_root_generation)")
-    );
+    assert!(!services.contains("struct FServiceDispatchCommit"));
+    assert!(services.contains("The enclosing native runtime phase owns the only"));
     assert!(primordial.contains(".prepare_dispatch(request, self.thread, root_generation)"));
     assert!(primordial.contains("self.services.dispatch_prepared("));
     assert!(primordial.contains("let phase = self.reserve_runtime_phase();"));
