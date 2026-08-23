@@ -87,6 +87,19 @@ fn h2_h3_ipi_entry_source_preserves_every_gpr_and_conditionally_normalizes_gs() 
 }
 
 #[test]
+fn i1_cpl3_rendezvous_gate_diverges_before_iret() {
+    let assembly = source("src/arch/x86_64/ipi_entry.S");
+    assert!(assembly.contains("dw_x86_64_rendezvous_pre_iret_gate"));
+    assert!(assembly.contains("dw_x86_64_rendezvous_reaper_handoff"));
+    let live = source("src/arch/x86_64/syscall/live.rs");
+    assert!(live.contains("rendezvous_gate_handler"));
+    assert!(live.contains("rendezvous_reaper_handler"));
+    assert!(live.contains("RENDEZVOUS_ACTION_READY"));
+    assert!(live.contains("dw_x86_64_rendezvous_pre_iret_gate"));
+    assert!(live.contains("dw_x86_64_rendezvous_reaper"));
+}
+
+#[test]
 fn h2_h3_receive_seam_eois_before_capability_free_protocol_callbacks() {
     let ipi = source("src/arch/x86_64/ipi.rs");
     let dispatch = ipi

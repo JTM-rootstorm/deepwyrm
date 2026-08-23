@@ -232,6 +232,36 @@ dw_x86_64_terminal_reaper_handoff:
     ud2
 .size dw_x86_64_terminal_reaper_handoff, .-dw_x86_64_terminal_reaper_handoff
 
+/* Dedicated e1 rendezvous reaper pivot. Unlike the syscall terminal handoff,
+ * its callback obtains only the separately staged rendezvous Stop request from
+ * the current CPU slot; it never consumes a syscall TerminalAction. */
+.p2align 4
+.globl dw_x86_64_rendezvous_reaper_handoff
+.type dw_x86_64_rendezvous_reaper_handoff,@function
+dw_x86_64_rendezvous_reaper_handoff:
+    cli
+    movl $IA32_GS_BASE, %ecx
+    rdmsr
+    shlq $32, %rdx
+    orq %rdx, %rax
+    testq %rax, %rax
+    jnz .Le1_reaper_entry_state
+    movl $IA32_KERNEL_GS_BASE, %ecx
+    rdmsr
+    shlq $32, %rdx
+    orq %rdx, %rax
+.Le1_reaper_entry_state:
+    testq %rax, %rax
+    jz .Le4_entry_fail
+    movq E4_GS_TERMINAL_REAPER_TOP(%rax), %rsp
+    testq %rsp, %rsp
+    jz .Le4_entry_fail
+    andq $-16, %rsp
+    xorq %rbp, %rbp
+    callq dw_x86_64_rendezvous_reaper
+    ud2
+.size dw_x86_64_rendezvous_reaper_handoff, .-dw_x86_64_rendezvous_reaper_handoff
+
 .p2align 4
 .Le4_entry_fail:
     cli

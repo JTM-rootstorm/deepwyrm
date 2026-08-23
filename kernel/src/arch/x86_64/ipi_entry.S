@@ -6,7 +6,7 @@
  * restore the exact register frame before IRETQ. The Rust dispatch boundary
  * owns local-APIC EOI and may return only after that acknowledgement succeeds.
  */
-.macro IPI_ENTRY symbol, dispatch, local_prefix
+.macro IPI_ENTRY symbol, dispatch, local_prefix, pre_iret
     .p2align 4
     .globl \symbol
     .type \symbol,@function
@@ -37,6 +37,16 @@
     andq $-16, %rsp
     callq \dispatch
     movq %r12, %rsp
+    .ifnb \pre_iret
+    /* CPL3 e1 must not restore GS/IRET until the fixed carrier has
+     * consumed its post-EOI latch. A Stop/HoldSafe result diverges to the
+     * dedicated rendezvous reaper and never returns through this IPI frame. */
+    callq \pre_iret
+    testb %al, %al
+    jz .L\local_prefix\()_cpl3_return
+    jmp dw_x86_64_rendezvous_reaper_handoff
+.L\local_prefix\()_cpl3_return:
+    .endif
     swapgs
     jmp .L\local_prefix\()_restore
 .L\local_prefix\()_kernel_origin:
@@ -64,7 +74,7 @@
     .size \symbol, .-\symbol
 .endm
 
-IPI_ENTRY dw_x86_64_rendezvous_ipi_entry, dw_x86_64_rendezvous_ipi_dispatch, rendezvous_ipi
-IPI_ENTRY dw_x86_64_tlb_shootdown_ipi_entry, dw_x86_64_tlb_shootdown_ipi_dispatch, tlb_shootdown_ipi
+IPI_ENTRY dw_x86_64_rendezvous_ipi_entry, dw_x86_64_rendezvous_ipi_dispatch, rendezvous_ipi, dw_x86_64_rendezvous_pre_iret_gate
+IPI_ENTRY dw_x86_64_tlb_shootdown_ipi_entry, dw_x86_64_tlb_shootdown_ipi_dispatch, tlb_shootdown_ipi,
 
 .section .note.GNU-stack,"",@progbits

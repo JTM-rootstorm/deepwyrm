@@ -72,6 +72,8 @@ pub(crate) type SyscallRuntimeHandler = unsafe fn(*mut (), &mut RawSyscallFrame)
 type FreshThreadRuntimeHandler = unsafe fn(*mut ()) -> !;
 type UserExceptionRuntimeHandler =
     unsafe fn(*mut (), crate::arch::x86_64::exceptions::UserExceptionRecord) -> !;
+type RendezvousGateHandler = unsafe fn(*mut ()) -> u8;
+type RendezvousReaperHandler = unsafe fn(*mut ()) -> !;
 
 #[derive(Clone, Copy)]
 struct RuntimeBindingState {
@@ -79,6 +81,8 @@ struct RuntimeBindingState {
     handler: SyscallRuntimeHandler,
     fresh_thread_handler: FreshThreadRuntimeHandler,
     user_exception_handler: UserExceptionRuntimeHandler,
+    rendezvous_gate_handler: RendezvousGateHandler,
+    rendezvous_reaper_handler: RendezvousReaperHandler,
 }
 
 struct RuntimeStorage(UnsafeCell<MaybeUninit<RuntimeBindingState>>);
@@ -118,6 +122,35 @@ enum TerminalAction {
     UserException(crate::arch::x86_64::exceptions::UserExceptionRecord),
 }
 
+const RENDEZVOUS_ACTION_EMPTY: u8 = 0;
+const RENDEZVOUS_ACTION_WRITING: u8 = 1;
+const RENDEZVOUS_ACTION_READY: u8 = 2;
+const RENDEZVOUS_ACTION_READING: u8 = 3;
+
+#[derive(Clone, Copy)]
+struct RendezvousAction(crate::arch::x86_64::rendezvous::StopRequest);
+
+struct RendezvousActionStorage(UnsafeCell<MaybeUninit<RendezvousAction>>);
+
+impl RendezvousActionStorage {
+    const fn uninit() -> Self {
+        Self(UnsafeCell::new(MaybeUninit::uninit()))
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "each GS-selected CPU owns its rendezvous-action slot and atomic state publishes the Copy request across the dedicated reaper pivot"
+)]
+unsafe impl Sync for RendezvousActionStorage {}
+
+static RENDEZVOUS_ACTION_STATE: [AtomicU8; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] =
+    [const { AtomicU8::new(RENDEZVOUS_ACTION_EMPTY) };
+        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT];
+static RENDEZVOUS_ACTION: [RendezvousActionStorage;
+    crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] =
+    [const { RendezvousActionStorage::uninit() }; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT];
+
 struct TerminalActionStorage(UnsafeCell<MaybeUninit<TerminalAction>>);
 
 impl TerminalActionStorage {
@@ -138,7 +171,11 @@ static TERMINAL_ACTION_STATE: [AtomicU8; crate::arch::x86_64::H1_RUNTIME_CPU_SLO
 static TERMINAL_ACTION: [TerminalActionStorage; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] =
     [const { TerminalActionStorage::uninit() }; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT];
 
-struct NativeSyscallRuntimeEntry<'runtime, R: crate::syscall::native::NativeSyscallFrameRuntime> {
+struct NativeSyscallRuntimeEntry<
+    'runtime,
+    R: crate::syscall::native::NativeSyscallFrameRuntime
+        + crate::syscall::native::NativeRendezvousRuntime,
+> {
     runtime: Pin<&'runtime mut R>,
 }
 
@@ -624,7 +661,9 @@ pub(crate) unsafe fn bind_current_thread_stack(
     reason = "one-shot AP carrier binding erases a unique pinned static address only after the CPU-private boundary is installed"
 )]
 pub(crate) unsafe fn bind_native_runtime_carrier_for_slot<
-    R: crate::syscall::native::NativeSyscallFrameRuntime + 'static,
+    R: crate::syscall::native::NativeSyscallFrameRuntime
+        + crate::syscall::native::NativeRendezvousRuntime
+        + 'static,
 >(
     cpu_index: crate::cpu::CpuIndex,
     mut runtime: Pin<&'static mut R>,
@@ -646,6 +685,8 @@ pub(crate) unsafe fn bind_native_runtime_carrier_for_slot<
             native_runtime_trampoline::<R>,
             native_runtime_fresh_thread::<R>,
             native_runtime_user_exception::<R>,
+            native_runtime_rendezvous_gate::<R>,
+            native_runtime_rendezvous_reaper::<R>,
         )
     }?;
     RUNTIME_CARRIER_LIFECYCLES
@@ -699,6 +740,8 @@ unsafe fn publish_syscall_runtime(
     handler: SyscallRuntimeHandler,
     fresh_thread_handler: FreshThreadRuntimeHandler,
     user_exception_handler: UserExceptionRuntimeHandler,
+    rendezvous_gate_handler: RendezvousGateHandler,
+    rendezvous_reaper_handler: RendezvousReaperHandler,
 ) -> Result<(), SyscallRuntimeBindError> {
     let state = RUNTIME_STATE
         .get(cpu_index)
@@ -734,6 +777,8 @@ unsafe fn publish_syscall_runtime(
             handler,
             fresh_thread_handler,
             user_exception_handler,
+            rendezvous_gate_handler,
+            rendezvous_reaper_handler,
         });
     }
     state.store(RUNTIME_BOUND, Ordering::Release);
@@ -754,6 +799,104 @@ fn runtime_binding() -> Option<RuntimeBindingState> {
     }
     let storage = RUNTIME.get(cpu_index)?;
     Some(unsafe { (*storage.0.get()).assume_init() })
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the CPU-private action slot is published before the divergent reaper consumes it"
+)]
+fn stage_rendezvous_action(action: RendezvousAction) -> Result<(), ()> {
+    let cpu_index = current_cpu_index_for_diagnostics().ok_or(())?;
+    let state = RENDEZVOUS_ACTION_STATE.get(cpu_index).ok_or(())?;
+    let storage = RENDEZVOUS_ACTION.get(cpu_index).ok_or(())?;
+    state
+        .compare_exchange(
+            RENDEZVOUS_ACTION_EMPTY,
+            RENDEZVOUS_ACTION_WRITING,
+            Ordering::Acquire,
+            Ordering::Acquire,
+        )
+        .map_err(|_| ())?;
+    unsafe { (*storage.0.get()).write(action) };
+    state.store(RENDEZVOUS_ACTION_READY, Ordering::Release);
+    Ok(())
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the CPU-private reaper acquires and consumes exactly one staged rendezvous action"
+)]
+fn take_rendezvous_action() -> Option<RendezvousAction> {
+    let cpu_index = current_cpu_index_for_diagnostics()?;
+    let state = RENDEZVOUS_ACTION_STATE.get(cpu_index)?;
+    let storage = RENDEZVOUS_ACTION.get(cpu_index)?;
+    state
+        .compare_exchange(
+            RENDEZVOUS_ACTION_READY,
+            RENDEZVOUS_ACTION_READING,
+            Ordering::Acquire,
+            Ordering::Acquire,
+        )
+        .ok()?;
+    let action = unsafe { (*storage.0.get()).assume_init_read() };
+    state.store(RENDEZVOUS_ACTION_EMPTY, Ordering::Release);
+    Some(action)
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the IPI pre-IRET gate invokes only its immutable current-CPU carrier callback"
+)]
+unsafe fn native_runtime_rendezvous_gate<R: crate::syscall::native::NativeRendezvousRuntime>(
+    context: *mut (),
+) -> u8 {
+    match crate::time::service_current_rendezvous_latch().unwrap_or_else(|_| halt_forever()) {
+        crate::arch::x86_64::rendezvous::MailboxNotification::None
+        | crate::arch::x86_64::rendezvous::MailboxNotification::Wake => 0,
+        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request)
+        | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(request) => {
+            stage_rendezvous_action(RendezvousAction(request)).unwrap_or_else(|_| halt_forever());
+            // The assembly immediately pivots away from the interrupted IPI
+            // frame; a nonzero result is never allowed to IRET to CPL3.
+            let _ = context;
+            1
+        }
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the dedicated rendezvous reaper receives the immutable current-CPU carrier context"
+)]
+unsafe fn native_runtime_rendezvous_reaper<R: crate::syscall::native::NativeRendezvousRuntime>(
+    context: *mut (),
+) -> ! {
+    let RendezvousAction(request) = take_rendezvous_action().unwrap_or_else(|| halt_forever());
+    let runtime = unsafe { &mut *context.cast::<R>() };
+    runtime.rendezvous_stop(request)
+}
+
+/// Called by the CPL3-origin e1 assembly boundary after EOI/latch and before
+/// GS restoration/IRET. Zero permits return; one enters the dedicated reaper.
+#[allow(
+    unsafe_code,
+    reason = "the audited assembly gate calls this exact fixed symbol and immutable callback"
+)]
+#[unsafe(no_mangle)]
+pub(crate) extern "sysv64" fn dw_x86_64_rendezvous_pre_iret_gate() -> u8 {
+    let binding = runtime_binding().unwrap_or_else(|| halt_forever());
+    unsafe { (binding.rendezvous_gate_handler)(binding.context) }
+}
+
+/// Diverges from the interrupted IPI frame onto the CPU-private reaper stack.
+#[allow(
+    unsafe_code,
+    reason = "the audited assembly reaper calls this exact fixed symbol and immutable callback"
+)]
+#[unsafe(no_mangle)]
+pub(crate) extern "sysv64" fn dw_x86_64_rendezvous_reaper() -> ! {
+    let binding = runtime_binding().unwrap_or_else(|| halt_forever());
+    unsafe { (binding.rendezvous_reaper_handler)(binding.context) }
 }
 
 #[allow(
@@ -802,7 +945,10 @@ fn take_terminal_action() -> Option<TerminalAction> {
     unsafe_code,
     reason = "the private divergent entry retains this CPU's pinned carrier owner while the terminal action is staged without reborrowing it"
 )]
-fn invalid_bound_return<R: crate::syscall::native::NativeSyscallFrameRuntime>(
+fn invalid_bound_return<
+    R: crate::syscall::native::NativeSyscallFrameRuntime
+        + crate::syscall::native::NativeRendezvousRuntime,
+>(
     context: *mut (),
     error: super::frame::UserReturnError,
 ) -> ! {
@@ -814,7 +960,10 @@ fn invalid_bound_return<R: crate::syscall::native::NativeSyscallFrameRuntime>(
     unsafe_code,
     reason = "the exception callback stages a Copy record in CPU-local storage and abandons the faulting stack before runtime mutation"
 )]
-unsafe fn native_runtime_user_exception<R: crate::syscall::native::NativeSyscallFrameRuntime>(
+unsafe fn native_runtime_user_exception<
+    R: crate::syscall::native::NativeSyscallFrameRuntime
+        + crate::syscall::native::NativeRendezvousRuntime,
+>(
     context: *mut (),
     record: crate::arch::x86_64::exceptions::UserExceptionRecord,
 ) -> ! {
@@ -862,7 +1011,8 @@ unsafe fn native_runtime_fresh_thread<R: crate::syscall::native::NativeSyscallFr
     reason = "the assembly handoff has abandoned the deferred Thread stack before the per-CPU staged terminal action mutates its uniquely bound carrier"
 )]
 unsafe extern "sysv64" fn native_runtime_terminal_reaper<
-    R: crate::syscall::native::NativeSyscallFrameRuntime,
+    R: crate::syscall::native::NativeSyscallFrameRuntime
+        + crate::syscall::native::NativeRendezvousRuntime,
 >(
     context: *mut (),
 ) -> ! {
@@ -886,7 +1036,10 @@ unsafe extern "sysv64" fn native_runtime_terminal_reaper<
     unsafe_code,
     reason = "the audited assembly boundary clears IF, switches to the guarded linker-owned reaper stack, and never returns to the deferred Thread stack"
 )]
-fn handoff_to_terminal_reaper<R: crate::syscall::native::NativeSyscallFrameRuntime>(
+fn handoff_to_terminal_reaper<
+    R: crate::syscall::native::NativeSyscallFrameRuntime
+        + crate::syscall::native::NativeRendezvousRuntime,
+>(
     context: *mut (),
 ) -> ! {
     unsafe extern "sysv64" {
@@ -913,7 +1066,10 @@ fn handoff_to_terminal_reaper<R: crate::syscall::native::NativeSyscallFrameRunti
     unsafe_code,
     reason = "the current CPU's unique carrier is reborrowed only in bounded regions that do not span a kernel-context switch"
 )]
-unsafe fn native_runtime_trampoline<R: crate::syscall::native::NativeSyscallFrameRuntime>(
+unsafe fn native_runtime_trampoline<
+    R: crate::syscall::native::NativeSyscallFrameRuntime
+        + crate::syscall::native::NativeRendezvousRuntime,
+>(
     context: *mut (),
     frame: &mut RawSyscallFrame,
 ) {
@@ -1160,7 +1316,8 @@ unsafe fn iret_validated_user(state: &ValidatedUserReturn) -> ! {
 )]
 pub(crate) unsafe fn enter_native_syscall_runtime<
     'runtime,
-    R: crate::syscall::native::NativeSyscallFrameRuntime,
+    R: crate::syscall::native::NativeSyscallFrameRuntime
+        + crate::syscall::native::NativeRendezvousRuntime,
 >(
     runtime: Pin<&'runtime mut R>,
     state: &ValidatedUserReturn,
@@ -1171,8 +1328,11 @@ pub(crate) unsafe fn enter_native_syscall_runtime<
     unsafe { entry.enter(state, stack, exception_binding) }
 }
 
-impl<'runtime, R: crate::syscall::native::NativeSyscallFrameRuntime>
-    NativeSyscallRuntimeEntry<'runtime, R>
+impl<
+    'runtime,
+    R: crate::syscall::native::NativeSyscallFrameRuntime
+        + crate::syscall::native::NativeRendezvousRuntime,
+> NativeSyscallRuntimeEntry<'runtime, R>
 {
     #[allow(
         unsafe_code,
@@ -1200,6 +1360,8 @@ impl<'runtime, R: crate::syscall::native::NativeSyscallFrameRuntime>
                 native_runtime_trampoline::<R>,
                 native_runtime_fresh_thread::<R>,
                 native_runtime_user_exception::<R>,
+                native_runtime_rendezvous_gate::<R>,
+                native_runtime_rendezvous_reaper::<R>,
             )
         }
         .unwrap_or_else(|_| halt_forever());

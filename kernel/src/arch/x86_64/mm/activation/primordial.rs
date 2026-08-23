@@ -493,6 +493,12 @@ impl NativeSyscallHandler for RuntimeCarrierFacade {
     }
 }
 
+impl crate::syscall::native::NativeRendezvousRuntime for RuntimeCarrierFacade {
+    fn rendezvous_stop(&mut self, _request: crate::arch::x86_64::rendezvous::StopRequest) -> ! {
+        self.reject_entry("rendezvous stop reaper")
+    }
+}
+
 #[allow(
     unsafe_code,
     reason = "the bound AP façade is deliberately fail-closed until the serialized scheduler/live runtime join releases it"
@@ -1740,6 +1746,18 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         #[cfg(feature = "test-support")]
         self.g5_probe.observe_resume(owner, status);
         frame.set_status(status);
+    }
+}
+
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    crate::syscall::native::NativeRendezvousRuntime
+    for PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn rendezvous_stop(&mut self, _request: crate::arch::x86_64::rendezvous::StopRequest) -> ! {
+        // The carrier-root/reaper join has not yet installed the exact stop
+        // transition for the BSP. The dedicated path is nevertheless
+        // non-returning, so an interrupted CPL3 continuation cannot escape.
+        panic!("primordial rendezvous stop reached before carrier safe-point join")
     }
 }
 
