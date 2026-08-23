@@ -1537,6 +1537,22 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     &mut self.cleanup,
                 ))
             }
+            NativeSyscallRequest::HandleDuplicate {
+                handle,
+                requested_rights,
+                out_handle,
+            } => {
+                let mut user = self.active.current_process_address_space(self.process);
+                NativeSyscallResult::returning(crate::syscall::handle_duplicate(
+                    &mut user,
+                    &mut self.registry,
+                    &mut self.tasks,
+                    self.process,
+                    handle,
+                    requested_rights,
+                    out_handle,
+                ))
+            }
             NativeSyscallRequest::ObjectGetInfoV1 {
                 handle,
                 topic,
