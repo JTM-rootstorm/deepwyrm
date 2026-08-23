@@ -433,7 +433,7 @@ fn f2_runtime_binding_is_retained_by_divergent_entry_and_suspension_drops_short_
         .split_once("pub(crate) unsafe fn enter_native_syscall_runtime")
         .expect("native runtime entry API")
         .1
-        .split_once("impl<'runtime")
+        .split_once("impl<")
         .expect("private divergent entry implementation")
         .0;
     assert!(divergent_entry_api.contains(") -> ! {"));
