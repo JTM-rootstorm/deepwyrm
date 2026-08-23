@@ -403,6 +403,11 @@ struct PerCpuCarrierLocal {
 }
 
 impl PerCpuLiveCarrier {
+    fn physically_executes(&self, thread: ThreadKey) -> bool {
+        let local = self.local.lock();
+        local.current_thread == Some(thread) && !local.reaper_staged
+    }
+
     fn record_current(
         &self,
         thread: ThreadKey,
@@ -1441,6 +1446,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                             // Stay on the kernel root and rescan; no stopped
                             // IPI frame exists to return through and no second
                             // acknowledgement may be published.
+                            if let Some(next) =
+                                self.shared.execution.terminal_reaper_next_on(self.cpu)
+                            {
+                                self.enter_rendezvous_replacement(next);
+                            }
                         }
                         crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_) => {
                             panic!("stopped kernel-root carrier received a second stop request")
@@ -1470,7 +1480,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 self.enter_rendezvous_replacement(next);
                             }
                         }
-                        crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {}
+                        crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {
+                            if let Some(next) =
+                                self.shared.execution.terminal_reaper_next_on(self.cpu)
+                            {
+                                self.enter_rendezvous_replacement(next);
+                            }
+                        }
                         crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_) => {
                             panic!("stopped kernel-root carrier received a second stop request")
                         }
@@ -1941,6 +1957,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .active_root
             .as_ref()
             .ok_or(crate::arch::x86_64::rendezvous::RemoteStopError::UnsafePrecommit)?;
+        let scheduler_current_matches = !was_suspended
+            && self.shared.execution.current_thread_on(self.cpu) == Some(self.thread);
+        // A block commit may have selected a logical replacement, but it has
+        // not yet switched the physical carrier when this post-hlt e1 gate
+        // runs. The CPU-private local record is the authoritative proof that
+        // no replacement is executing on this stack/carrier.
+        let suspended_carrier_matches =
+            was_suspended && self.local.physically_executes(self.thread);
         if crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
             != Some(self.cpu.index())
             || identity.target_cpu() != self.cpu.index()
@@ -1949,7 +1973,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             || identity.execution_generation() != claim.generation()
             || identity.root_binding_generation() != root.binding_generation()
             || claim.thread() != self.thread
-            || self.shared.execution.current_thread_on(self.cpu) != Some(self.thread)
+            || !(scheduler_current_matches || suspended_carrier_matches)
         {
             return Err(crate::arch::x86_64::rendezvous::RemoteStopError::WrongIdentity);
         }
@@ -1976,6 +2000,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         // reaper witness is consumed; only the post-ack continuation may
         // finalize them.
         if was_suspended {
+            self.services
+                .retire_idle_control_for_stop(self.thread, claim.generation())
+                .unwrap_or_else(|_| {
+                    panic!("remote stop suspended idle control drifted before precommit")
+                });
             self.transfer_suspended_service_cleanup_for_stop();
         }
         self.stage_rendezvous_cleanup();

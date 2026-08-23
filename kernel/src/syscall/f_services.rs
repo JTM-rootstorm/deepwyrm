@@ -734,6 +734,17 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
             && self.control.is_clear()
     }
 
+    /// Clears the ephemeral idle handoff only when it names the exact blocked
+    /// generation being retired by the e1 safe point.
+    pub(crate) fn retire_idle_control_for_stop(
+        &mut self,
+        thread: ThreadKey,
+        execution_generation: u64,
+    ) -> Result<(), WaitSuspendError> {
+        self.control
+            .retire_idle_for_stop(thread, execution_generation)
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "resume consumes the exact user-resource, wait, scheduler, deadline, and final-release owners"

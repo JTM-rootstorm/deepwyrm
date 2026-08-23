@@ -86,6 +86,16 @@ pub(crate) struct BlockWakeKey {
     execution_generation: u64,
 }
 
+impl BlockWakeKey {
+    pub(crate) const fn thread(self) -> ThreadKey {
+        self.thread
+    }
+
+    pub(crate) const fn execution_generation(self) -> u64 {
+        self.execution_generation
+    }
+}
+
 #[must_use = "prepared block ownership must be committed only after wait/deadline registration or explicitly cancelled"]
 #[derive(Debug)]
 pub(crate) struct BlockReservation {

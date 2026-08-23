@@ -2328,6 +2328,24 @@ impl NativeWaitControl {
     pub(crate) const fn is_clear(&self) -> bool {
         matches!(self.state, NativeWaitControlState::Clear)
     }
+
+    /// Consumes only the exact idle control handoff retained by a physical
+    /// blocked continuation that an e1 safe point is about to retire.
+    pub(crate) fn retire_idle_for_stop(
+        &mut self,
+        thread: ThreadKey,
+        execution_generation: u64,
+    ) -> Result<(), WaitSuspendError> {
+        let NativeWaitControlState::Idle(state) = self.state else {
+            return Err(WaitSuspendError::InvalidDecision);
+        };
+        let wake = state.wake_key();
+        if wake.thread() != thread || wake.execution_generation() != execution_generation {
+            return Err(WaitSuspendError::InvalidDecision);
+        }
+        self.state = NativeWaitControlState::Clear;
+        Ok(())
+    }
 }
 
 #[allow(
