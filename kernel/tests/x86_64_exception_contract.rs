@@ -148,6 +148,23 @@ fn g5_primordial_selectors_have_exact_post_teardown_oracles() {
 }
 
 #[test]
+fn terminal_reaper_uses_the_replacement_selected_by_deferred_retirement() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let terminate = primordial
+        .rsplit_once("fn terminate_current(&mut self) -> !")
+        .expect("primordial terminal handoff")
+        .1
+        .split_once("fn enter_scheduled_fresh_thread(&mut self) -> !")
+        .expect("primordial terminal handoff extent")
+        .0;
+
+    assert!(terminate.contains("current_thread_on(crate::cpu::CpuIndex::BOOTSTRAP)"));
+    assert!(terminate.contains("Some(next) => Some(next)"));
+    assert!(terminate.contains("None => {"));
+    assert!(terminate.contains(".schedule_next()"));
+}
+
+#[test]
 fn e4_exception_assembly_remains_freestanding() {
     let clang = "/usr/lib/llvm/22/bin/clang-22";
     if Command::new(clang).arg("--version").output().is_err() {

@@ -1554,12 +1554,29 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                 .unwrap_or_else(|| panic!("primordial exit omitted deferred resources")),
             &mut self.cleanup,
         );
-        let next = self
+        // `retire_exit_pins_defer_current` chose the replacement while it
+        // retired the logical current Thread, then acknowledged the retired
+        // continuation before this reaper began executing.  The scheduler
+        // therefore already owns the replacement (if any); asking it to
+        // schedule again rejects that valid Running owner.
+        let next = match self
             .shared
             .execution
-            .schedule_next()
-            .unwrap_or_else(|error| panic!("terminal scheduling failed: {error:?}"))
-            .current;
+            .current_thread_on(crate::cpu::CpuIndex::BOOTSTRAP)
+        {
+            Some(next) => Some(next),
+            // Reclaiming the exited Thread can deliver an EXITED signal that
+            // makes a blocked waiter Runnable. Only when retirement selected
+            // no replacement may the reaper make that newly published work
+            // current.
+            None => {
+                self.shared
+                    .execution
+                    .schedule_next()
+                    .unwrap_or_else(|error| panic!("terminal scheduling failed: {error:?}"))
+                    .current
+            }
+        };
         if let Some(next) = next {
             let (stack_id, context_id) = self
                 .tasks
