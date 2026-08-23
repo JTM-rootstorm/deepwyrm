@@ -90,6 +90,7 @@ struct G5PrimordialProbe {
     atomic_poll_resumed: bool,
     atomic_resumed_timed_out: bool,
     terminal_oracle_passed: bool,
+    terminal_application_code: u32,
 }
 
 #[cfg(feature = "test-support")]
@@ -114,6 +115,7 @@ impl G5PrimordialProbe {
             atomic_poll_resumed: false,
             atomic_resumed_timed_out: false,
             terminal_oracle_passed: false,
+            terminal_application_code: 0,
         }
     }
 
@@ -214,6 +216,7 @@ impl G5PrimordialProbe {
     }
 
     fn observe_terminal(&mut self, info: deepwyrm_abi::DwTaskTerminationInfoV1) {
+        self.terminal_application_code = info.application_code;
         let (exception_type, detail) = match self.expectation {
             G5PrimordialExpectation::UserException => {
                 (deepwyrm_abi::DW_EXCEPTION_ILLEGAL_INSTRUCTION, 6)
@@ -263,6 +266,24 @@ impl G5PrimordialProbe {
                 self.terminal_oracle_passed
                     && completion == &Err(PrimordialCompletionError::UnhandledException)
             }
+        }
+    }
+
+    fn failure_detail(
+        &self,
+        completion: &Result<
+            (),
+            crate::boot::primordial::construction::PrimordialCompletionError<()>,
+        >,
+    ) -> u32 {
+        if self.terminal_application_code != 0 {
+            return self.terminal_application_code;
+        }
+        match completion {
+            Err(crate::boot::primordial::construction::PrimordialCompletionError::NonzeroExit(
+                code,
+            )) => *code,
+            _ => 1,
         }
     }
 }
@@ -1178,15 +1199,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         if self.g5_probe.accepts_completion(&completion) {
             crate::test_support::complete_pass(0)
         } else {
-            let detail = match completion {
-                Err(
-                    crate::boot::primordial::construction::PrimordialCompletionError::NonzeroExit(
-                        code,
-                    ),
-                ) => code,
-                _ => 1,
-            };
-            crate::test_support::complete_fail(detail)
+            crate::test_support::complete_fail(self.g5_probe.failure_detail(&completion))
         }
         #[cfg(not(feature = "test-support"))]
         {
