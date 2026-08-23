@@ -16,8 +16,10 @@ const MAX_EVENTS: usize = 64;
 const SLOT_EMPTY: u8 = 0;
 const SLOT_WRITING: u8 = 1;
 const SLOT_READY: u8 = 2;
-const COLLECTING: u8 = 0;
-const FINALIZING: u8 = 1;
+const STATE_COUNT_MASK: usize = 0xff;
+const COLLECTING: usize = 0;
+const CLOSING: usize = 1;
+const FINALIZED: usize = 2;
 const FAILURE_NONE: u8 = 0;
 const FAILURE_OVERFLOW: u8 = 1;
 const FAILURE_MALFORMED: u8 = 2;
@@ -246,13 +248,16 @@ pub(crate) enum EvidenceFlushError {
     Overflow,
     Malformed,
     Invariant,
+    FinalizationClosed,
+    ReporterClaimed,
+    Transport,
 }
 
 /// Fixed, no-allocation DWEVID1 collector.  Each event field is atomic; no
 /// shared mutable reference is manufactured while the four CPUs publish.
 pub(crate) struct EvidenceCollector {
-    next: AtomicUsize,
-    phase: AtomicU8,
+    state: AtomicUsize,
+    reporter_claimed: AtomicU8,
     failure: AtomicU8,
     slots: [Slot; MAX_EVENTS],
 }
@@ -260,8 +265,8 @@ pub(crate) struct EvidenceCollector {
 impl EvidenceCollector {
     pub(crate) const fn new() -> Self {
         Self {
-            next: AtomicUsize::new(0),
-            phase: AtomicU8::new(COLLECTING),
+            state: AtomicUsize::new(pack_state(COLLECTING, 0)),
+            reporter_claimed: AtomicU8::new(0),
             failure: AtomicU8::new(FAILURE_NONE),
             slots: [const { Slot::new() }; MAX_EVENTS],
         }
@@ -270,10 +275,7 @@ impl EvidenceCollector {
     /// Record a scenario fact.  Calls after finalization or malformed facts
     /// latch terminal failure instead of silently changing the transcript.
     pub(crate) fn record(&self, event: EvidenceEvent) -> Result<(), EvidenceFlushError> {
-        if self.phase.load(Ordering::Acquire) != COLLECTING
-            || event.kind == EvidenceKind::RunningInvariant
-            || !event.valid()
-        {
+        if event.kind == EvidenceKind::RunningInvariant || !event.valid() {
             self.latch(FAILURE_MALFORMED);
             return Err(EvidenceFlushError::Malformed);
         }
@@ -284,62 +286,57 @@ impl EvidenceCollector {
 
     /// Seal collection and append the sole `RUNNING_INVARIANT` record.  This
     /// is the only API that can create that final evidence event.
-    pub(crate) fn finalize_running_invariant(&self) -> Result<(), EvidenceFlushError> {
-        match self.phase.compare_exchange(
-            COLLECTING,
-            FINALIZING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => {
-                let sequence = self.reserve()?;
-                self.publish(sequence, EvidenceEvent::running_invariant());
-                Ok(())
-            }
-            Err(FINALIZING) => Ok(()),
-            Err(_) => {
-                self.latch(FAILURE_INVARIANT);
-                Err(EvidenceFlushError::Invariant)
-            }
-        }
-    }
-
-    /// The designated reporter calls this immediately before `DWTEST1`.
-    /// It emits only after every reserved slot became Ready with Release/Acquire.
-    pub(crate) fn flush(
+    pub(crate) fn finalize_running_invariant(
         &self,
-        mut emit: impl FnMut(&[u8; I1_EVIDENCE_RECORD_LEN]),
-    ) -> Result<(), EvidenceFlushError> {
-        if self.phase.load(Ordering::Acquire) != FINALIZING {
-            return Err(EvidenceFlushError::NotFinalized);
-        }
-        self.failure_result()?;
-        let count = self.next.load(Ordering::Acquire);
-        for sequence in 0..count {
-            if self.slots[sequence].state.load(Ordering::Acquire) != SLOT_READY {
-                return Err(EvidenceFlushError::NotReady);
-            }
-        }
-        if !self.semantic_valid(count) {
-            self.latch(FAILURE_INVARIANT);
-            return Err(EvidenceFlushError::Invariant);
-        }
-        for sequence in 0..count {
-            emit(&encode(sequence as u32, &self.slots[sequence]));
-        }
-        Ok(())
-    }
-
-    fn reserve(&self) -> Result<usize, EvidenceFlushError> {
+    ) -> Result<FinalizedEvidence<'_>, EvidenceFlushError> {
         loop {
-            let current = self.next.load(Ordering::Acquire);
-            if current >= MAX_EVENTS {
+            let state = self.state.load(Ordering::Acquire);
+            if state_phase(state) != COLLECTING {
+                return Err(EvidenceFlushError::FinalizationClosed);
+            }
+            let count = state_count(state);
+            if count >= MAX_EVENTS {
                 self.latch(FAILURE_OVERFLOW);
                 return Err(EvidenceFlushError::Overflow);
             }
             if self
-                .next
-                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .state
+                .compare_exchange(
+                    state,
+                    pack_state(CLOSING, count),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                self.publish(count, EvidenceEvent::running_invariant());
+                self.state
+                    .store(pack_state(FINALIZED, count + 1), Ordering::Release);
+                return Ok(FinalizedEvidence { collector: self });
+            }
+        }
+    }
+
+    fn reserve(&self) -> Result<usize, EvidenceFlushError> {
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            if state_phase(state) != COLLECTING {
+                return Err(EvidenceFlushError::FinalizationClosed);
+            }
+            let current = state_count(state);
+            // Preserve the last fixed slot for finalization's invariant record.
+            if current >= MAX_EVENTS - 1 {
+                self.latch(FAILURE_OVERFLOW);
+                return Err(EvidenceFlushError::Overflow);
+            }
+            if self
+                .state
+                .compare_exchange_weak(
+                    state,
+                    pack_state(COLLECTING, current + 1),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
                 .is_ok()
             {
                 return Ok(current);
@@ -370,6 +367,33 @@ impl EvidenceCollector {
         slot.state.store(SLOT_READY, Ordering::Release);
     }
 
+    #[cfg(test)]
+    fn reserve_paused_for_test(&self, event: EvidenceEvent) -> Result<usize, EvidenceFlushError> {
+        let sequence = self.reserve()?;
+        let slot = &self.slots[sequence];
+        slot.state
+            .compare_exchange(
+                SLOT_EMPTY,
+                SLOT_WRITING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| EvidenceFlushError::Invariant)?;
+        slot.kind.store(event.kind as u8, Ordering::Relaxed);
+        slot.cpu.store(event.cpu, Ordering::Relaxed);
+        slot.token.store(event.token, Ordering::Relaxed);
+        slot.arg0.store(event.arg0, Ordering::Relaxed);
+        slot.arg1.store(event.arg1, Ordering::Relaxed);
+        Ok(sequence)
+    }
+
+    #[cfg(test)]
+    fn publish_paused_for_test(&self, sequence: usize) {
+        self.slots[sequence]
+            .state
+            .store(SLOT_READY, Ordering::Release);
+    }
+
     fn latch(&self, failure: u8) {
         let _ = self.failure.compare_exchange(
             FAILURE_NONE,
@@ -388,8 +412,16 @@ impl EvidenceCollector {
     }
 
     fn semantic_valid(&self, count: usize) -> bool {
-        if count < 5 {
+        if !(5..=MAX_EVENTS).contains(&count) {
             return false;
+        }
+        for later in 0..count {
+            let event = self.read(later);
+            for earlier in 0..later {
+                if self.read(earlier) == event {
+                    return false;
+                }
+            }
         }
         let mut online_cpus = 0_u8;
         let mut apic_ids = [0_u32; 4];
@@ -440,24 +472,48 @@ impl EvidenceCollector {
                         cpl3_count += 1;
                     }
                 }
-                EvidenceKind::ParentBlocked => parent = Some((relative, event)),
+                EvidenceKind::ParentBlocked => {
+                    if parent.is_some() {
+                        return false;
+                    }
+                    parent = Some((relative, event));
+                }
                 EvidenceKind::DescendantRunning => {
+                    if descendant_running {
+                        return false;
+                    }
                     if !matches!(parent, Some((before, parent_event)) if before < relative && parent_event.token == event.token && parent_event.cpu != event.cpu)
                     {
                         return false;
                     }
                     descendant_running = true;
                 }
-                EvidenceKind::WakeSent => wake = Some((relative, event)),
+                EvidenceKind::WakeSent => {
+                    if wake.is_some() {
+                        return false;
+                    }
+                    wake = Some((relative, event));
+                }
                 EvidenceKind::WakeObserved => {
+                    if wake_observed {
+                        return false;
+                    }
                     if !matches!(wake, Some((before, sent)) if before < relative && sent.token == event.token && sent.cpu != event.cpu && sent.arg0 == event.cpu as u32 && event.arg0 == sent.cpu as u32)
                     {
                         return false;
                     }
                     wake_observed = true;
                 }
-                EvidenceKind::ChildExit => child_exit = Some((relative, event)),
+                EvidenceKind::ChildExit => {
+                    if child_exit.is_some() {
+                        return false;
+                    }
+                    child_exit = Some((relative, event));
+                }
                 EvidenceKind::ChildCleanup => {
+                    if child_cleanup {
+                        return false;
+                    }
                     if !matches!(child_exit, Some((before, exited)) if before < relative && exited.token == event.token && exited.cpu != event.cpu)
                     {
                         return false;
@@ -516,6 +572,59 @@ impl EvidenceCollector {
     fn read(&self, index: usize) -> EvidenceEvent {
         read_slot(&self.slots[index])
     }
+}
+
+/// Move-only authorization for the one designated evidence reporter. Its
+/// consuming flush claim prevents competing terminal paths from interleaving
+/// DWEVID1 and DWTEST1 over COM1.
+#[must_use]
+pub(crate) struct FinalizedEvidence<'a> {
+    collector: &'a EvidenceCollector,
+}
+
+impl FinalizedEvidence<'_> {
+    pub(crate) fn flush(
+        self,
+        mut emit: impl FnMut(&[u8; I1_EVIDENCE_RECORD_LEN]) -> Result<(), EvidenceFlushError>,
+    ) -> Result<(), EvidenceFlushError> {
+        let collector = self.collector;
+        if collector
+            .reporter_claimed
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(EvidenceFlushError::ReporterClaimed);
+        }
+        let state = collector.state.load(Ordering::Acquire);
+        if state_phase(state) != FINALIZED {
+            return Err(EvidenceFlushError::NotFinalized);
+        }
+        collector.failure_result()?;
+        let count = state_count(state);
+        for sequence in 0..count {
+            while collector.slots[sequence].state.load(Ordering::Acquire) != SLOT_READY {
+                core::hint::spin_loop();
+            }
+        }
+        if !collector.semantic_valid(count) {
+            collector.latch(FAILURE_INVARIANT);
+            return Err(EvidenceFlushError::Invariant);
+        }
+        for sequence in 0..count {
+            emit(&encode(sequence as u32, &collector.slots[sequence]))?;
+        }
+        Ok(())
+    }
+}
+
+const fn pack_state(phase: usize, count: usize) -> usize {
+    (phase << 8) | count
+}
+const fn state_phase(state: usize) -> usize {
+    state >> 8
+}
+const fn state_count(state: usize) -> usize {
+    state & STATE_COUNT_MASK
 }
 
 /// The one build-selected collector; no public ABI or production state uses it.
@@ -658,7 +767,7 @@ mod tests {
             && record[84] == b'\n'
             && decode_hex(&record[76..84]) == Some(fnv1a32(&record[..76]))
     }
-    fn complete_contract(collector: &EvidenceCollector) {
+    fn complete_contract(collector: &EvidenceCollector) -> FinalizedEvidence<'_> {
         for cpu in 0..4 {
             collector
                 .record(EvidenceEvent::cpu_online(cpu, 0x20 + u32::from(cpu)))
@@ -696,18 +805,19 @@ mod tests {
         collector
             .record(EvidenceEvent::reclaim_allowed(0, 6))
             .unwrap();
-        collector.finalize_running_invariant().unwrap();
+        collector.finalize_running_invariant().unwrap()
     }
     #[test]
     fn encoding_round_trips_exactly() {
         let collector = EvidenceCollector::new();
-        complete_contract(&collector);
+        let permit = complete_contract(&collector);
         let mut records = [[0; 85]; 32];
         let mut count = 0;
-        collector
+        permit
             .flush(|record| {
                 records[count] = *record;
                 count += 1;
+                Ok(())
             })
             .unwrap();
         assert_eq!(count, 23);
@@ -722,10 +832,10 @@ mod tests {
             collector.record(EvidenceEvent::wake_sent(4, 1, 0)),
             Err(EvidenceFlushError::Malformed)
         );
-        collector.finalize_running_invariant().unwrap();
-        assert_eq!(collector.flush(|_| {}), Err(EvidenceFlushError::Malformed));
+        let permit = collector.finalize_running_invariant().unwrap();
+        assert_eq!(permit.flush(|_| Ok(())), Err(EvidenceFlushError::Malformed));
         let collector = EvidenceCollector::new();
-        for index in 0..MAX_EVENTS {
+        for index in 0..MAX_EVENTS - 1 {
             collector
                 .record(EvidenceEvent::cpu_online((index % 4) as u8, index as u32))
                 .unwrap();
@@ -757,10 +867,7 @@ mod tests {
         for join in joins {
             join.join().unwrap();
         }
-        assert_eq!(
-            collector.flush(|_| {}),
-            Err(EvidenceFlushError::NotFinalized)
-        );
+        let _permit = collector.finalize_running_invariant().unwrap();
     }
     #[test]
     fn only_finalization_emits_final_event() {
@@ -769,5 +876,96 @@ mod tests {
             collector.record(EvidenceEvent::running_invariant()),
             Err(EvidenceFlushError::Malformed)
         );
+    }
+
+    #[test]
+    fn finalization_linearizes_a_paused_reservation_and_blocks_new_producers() {
+        let collector = EvidenceCollector::new();
+        let paused = collector
+            .reserve_paused_for_test(EvidenceEvent::cpu_online(0, 0x20))
+            .unwrap();
+        assert_eq!(paused, 0);
+        let permit = collector.finalize_running_invariant().unwrap();
+        assert_eq!(collector.read(1), EvidenceEvent::running_invariant());
+        assert!(matches!(
+            collector.record(EvidenceEvent::cpu_online(1, 0x21)),
+            Err(EvidenceFlushError::FinalizationClosed)
+        ));
+        collector.publish_paused_for_test(paused);
+        assert_eq!(permit.flush(|_| Ok(())), Err(EvidenceFlushError::Invariant));
+    }
+
+    #[test]
+    fn duplicate_finalization_and_reporter_claim_fail_closed() {
+        let collector = EvidenceCollector::new();
+        complete_contract_without_final(&collector);
+        let permit = collector.finalize_running_invariant().unwrap();
+        assert!(matches!(
+            collector.finalize_running_invariant(),
+            Err(EvidenceFlushError::FinalizationClosed)
+        ));
+        collector.reporter_claimed.store(1, Ordering::Release);
+        assert_eq!(
+            permit.flush(|_| Ok(())),
+            Err(EvidenceFlushError::ReporterClaimed)
+        );
+    }
+
+    #[test]
+    fn transport_failure_and_duplicate_semantic_fact_never_flush() {
+        let collector = EvidenceCollector::new();
+        let permit = complete_contract(&collector);
+        assert_eq!(
+            permit.flush(|_| Err(EvidenceFlushError::Transport)),
+            Err(EvidenceFlushError::Transport)
+        );
+
+        let collector = EvidenceCollector::new();
+        complete_contract_without_final(&collector);
+        collector
+            .record(EvidenceEvent::parent_blocked(2, 7))
+            .unwrap();
+        let permit = collector.finalize_running_invariant().unwrap();
+        assert_eq!(permit.flush(|_| Ok(())), Err(EvidenceFlushError::Invariant));
+    }
+
+    fn complete_contract_without_final(collector: &EvidenceCollector) {
+        for cpu in 0..4 {
+            collector
+                .record(EvidenceEvent::cpu_online(cpu, 0x20 + u32::from(cpu)))
+                .unwrap();
+        }
+        collector
+            .record(EvidenceEvent::cpl3_syscall(0, 1, 1, 1))
+            .unwrap();
+        collector
+            .record(EvidenceEvent::cpl3_syscall(1, 2, 1, 1))
+            .unwrap();
+        collector
+            .record(EvidenceEvent::parent_blocked(0, 3))
+            .unwrap();
+        collector
+            .record(EvidenceEvent::descendant_running(1, 3))
+            .unwrap();
+        collector.record(EvidenceEvent::wake_sent(1, 4, 2)).unwrap();
+        collector
+            .record(EvidenceEvent::wake_observed(2, 4, 1))
+            .unwrap();
+        collector.record(EvidenceEvent::child_exit(2, 5)).unwrap();
+        collector
+            .record(EvidenceEvent::child_cleanup(3, 5))
+            .unwrap();
+        collector.record(EvidenceEvent::tlb_publish(0, 6)).unwrap();
+        for cpu in 0..4 {
+            collector.record(EvidenceEvent::tlb_ack(cpu, 6)).unwrap();
+        }
+        for cpu in 0..4 {
+            collector
+                .record(EvidenceEvent::rendezvous_ack(cpu, 6))
+                .unwrap();
+        }
+        collector
+            .record(EvidenceEvent::reclaim_allowed(0, 6))
+            .unwrap();
     }
 }

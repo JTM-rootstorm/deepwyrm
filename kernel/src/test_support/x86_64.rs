@@ -10,6 +10,8 @@ use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::arch::x86_64::exceptions::{EarlyException, ExceptionVector};
 use crate::debug::emit_early_raw_record;
+#[cfg(deepwyrm_i1_evidence)]
+use crate::debug::emit_test_evidence_record;
 
 #[cfg(deepwyrm_i1_evidence)]
 use super::{EvidenceFlushError, I1_EVIDENCE};
@@ -19,7 +21,7 @@ use super::{
         expected_fault_selector, expected_page_fault_matches, expects_invalid_opcode,
     },
     protocol::{COMPLETION_RECORD_LEN, CompletionOutcome},
-    transport::{CompletionTransport, DebugExitValue, complete},
+    transport::{CompletionTransport, CompletionTransportError, DebugExitValue, complete},
 };
 
 /// Test-only I/O port configured by the centralized QEMU runner.
@@ -100,10 +102,13 @@ impl QemuCompletionTransport {
 }
 
 impl CompletionTransport for QemuCompletionTransport {
-    fn write_serial_record(&mut self, record: &[u8; COMPLETION_RECORD_LEN]) {
+    fn write_serial_record(
+        &mut self,
+        record: &[u8; COMPLETION_RECORD_LEN],
+    ) -> Result<(), CompletionTransportError> {
         // The host requires both the serial record and matching process status;
         // a serial failure therefore becomes infrastructure failure, never PASS.
-        let _ = emit_early_raw_record(record);
+        emit_early_raw_record(record).map_err(|_| CompletionTransportError::Serial)
     }
 
     #[allow(
@@ -297,9 +302,9 @@ fn complete_known_outcome(outcome: CompletionOutcome, detail: u32) -> ! {
     // build path. Such artifacts are not production or physical-hardware images.
     let mut transport = unsafe { QemuCompletionTransport::new() };
     #[cfg(deepwyrm_i1_evidence)]
-    let (outcome, detail) = match I1_EVIDENCE.finalize_running_invariant().and_then(|()| {
-        I1_EVIDENCE.flush(|record| {
-            let _ = emit_early_raw_record(record);
+    let (outcome, detail) = match I1_EVIDENCE.finalize_running_invariant().and_then(|permit| {
+        permit.flush(|record| {
+            emit_test_evidence_record(record).map_err(|_| EvidenceFlushError::Transport)
         })
     }) {
         Ok(()) => (outcome, detail),
@@ -316,6 +321,9 @@ const fn evidence_failure_detail(error: EvidenceFlushError) -> u32 {
         EvidenceFlushError::Overflow => 0x4931_0003,
         EvidenceFlushError::Malformed => 0x4931_0004,
         EvidenceFlushError::Invariant => 0x4931_0005,
+        EvidenceFlushError::FinalizationClosed => 0x4931_0006,
+        EvidenceFlushError::ReporterClaimed => 0x4931_0007,
+        EvidenceFlushError::Transport => 0x4931_0008,
     }
 }
 

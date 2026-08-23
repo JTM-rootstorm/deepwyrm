@@ -280,7 +280,9 @@ fn i1_evidence_has_one_terminal_com1_reporter() {
         .expect("read terminal reporter");
     assert!(evidence.contains("Workers have no serial-port API"));
     assert!(!evidence.contains("emit_early_raw_record"));
-    assert!(terminal.contains("I1_EVIDENCE.flush"));
+    assert!(terminal.contains("I1_EVIDENCE.finalize_running_invariant"));
+    assert!(terminal.contains("permit.flush"));
+    assert!(terminal.contains("emit_test_evidence_record(record)"));
     assert!(terminal.contains("emit_early_raw_record(record)"));
 }
 

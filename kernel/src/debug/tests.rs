@@ -153,6 +153,16 @@ fn raw_machine_records_are_bounded() {
 }
 
 #[test]
+fn test_evidence_writer_transmits_the_exact_85_byte_record() {
+    let record = [b'E'; TEST_EVIDENCE_RECORD_BYTES];
+    let mut serial = Com1::new(FakePort::ready());
+    write_bounded_test_evidence_record(&mut serial, &record).unwrap();
+    let port = serial.io;
+    assert_eq!(port.write_count, TEST_EVIDENCE_RECORD_BYTES);
+    assert_eq!(&port.bytes()[..TEST_EVIDENCE_RECORD_BYTES], &record);
+}
+
+#[test]
 fn raw_machine_record_reports_a_distinct_drain_timeout() {
     let mut serial = Com1::with_poll_limit(FakePort::ready_with_delayed_drain(1, usize::MAX), 3);
     assert_eq!(
