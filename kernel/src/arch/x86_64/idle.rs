@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use crate::cpu::{CPU_CAPACITY, CpuIndex};
 
-use super::rendezvous::{MailboxNotification, RendezvousMailbox};
+use super::rendezvous::{MailboxNotification, RendezvousIpiLatches, RendezvousMailbox};
 
 const CPU_UNAVAILABLE: u8 = 0;
 const CPU_ACTIVE: u8 = 1;
@@ -83,6 +83,7 @@ impl IdleCpuSlot {
 pub(crate) struct IdleWakeSet {
     cpus: [IdleCpuSlot; CPU_CAPACITY],
     mailboxes: [RendezvousMailbox; CPU_CAPACITY],
+    ipi_latches: RendezvousIpiLatches,
     faulted: AtomicBool,
 }
 
@@ -96,6 +97,7 @@ impl IdleWakeSet {
                 RendezvousMailbox::for_cpu(cpu(2)),
                 RendezvousMailbox::for_cpu(cpu(3)),
             ],
+            ipi_latches: RendezvousIpiLatches::new(),
             faulted: AtomicBool::new(false),
         }
     }
@@ -246,6 +248,32 @@ impl IdleWakeSet {
         Ok(notification)
     }
 
+    /// Performs the only IRQ-side e1 state transition: a CPU-local atomic
+    /// latch. The later carrier safe point consumes the mailbox under normal
+    /// execution rules, never from the interrupt callback.
+    pub(crate) fn latch_rendezvous_ipi(&self, cpu: CpuIndex) -> Result<(), IdleWakeError> {
+        self.ensure_healthy()?;
+        if self.cpus[cpu.index()].state.load(Ordering::Acquire) == CPU_UNAVAILABLE {
+            return Err(IdleWakeError::Unavailable);
+        }
+        self.ipi_latches.latch(cpu);
+        Ok(())
+    }
+
+    /// Consumes a post-EOI latch and then acquires the exact mailbox state at
+    /// a carrier-owned safe point. A missed/late duplicate e1 is harmless:
+    /// the mailbox stays authoritative and the latch coalesces only rescan.
+    pub(crate) fn take_latched_notification(
+        &self,
+        cpu: CpuIndex,
+    ) -> Result<MailboxNotification, IdleWakeError> {
+        self.ensure_healthy()?;
+        if !self.ipi_latches.take(cpu) {
+            return Ok(MailboxNotification::None);
+        }
+        self.take_notification(cpu)
+    }
+
     pub(crate) fn fail_transport(&self) {
         self.faulted.store(true, Ordering::Release);
     }
@@ -351,6 +379,31 @@ pub(crate) fn take_current_notification() -> MailboxNotification {
         .unwrap_or_else(|_| fail_transport_and_halt())
 }
 
+/// Bounded e1 receive callback: publish a CPU-local latch after EOI. It does
+/// not take scheduler, mailbox, usercopy, timer, or finalization authority.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn latch_current_rendezvous_ipi() {
+    let Ok(cpu) = current_cpu() else {
+        fail_transport_and_halt();
+    };
+    LIVE_IDLE_WAKE
+        .latch_rendezvous_ipi(cpu)
+        .unwrap_or_else(|_| fail_transport_and_halt());
+}
+
+/// Carrier-side e1 safe point. The caller must rescan after `Wake`; `Stop`
+/// and `HoldSafe` are deliberately returned to the live carrier join rather
+/// than acknowledged from interrupt context.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn take_current_latched_notification() -> MailboxNotification {
+    let Ok(cpu) = current_cpu() else {
+        fail_transport_and_halt();
+    };
+    LIVE_IDLE_WAKE
+        .take_latched_notification(cpu)
+        .unwrap_or_else(|_| fail_transport_and_halt())
+}
+
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) fn live_idle_wake_is_healthy() -> bool {
     LIVE_IDLE_WAKE.ensure_healthy().is_ok()
@@ -449,6 +502,29 @@ mod tests {
         );
         assert_eq!(
             idle.take_notification(cpu(1)),
+            Ok(MailboxNotification::None)
+        );
+        idle.finish(halt).unwrap();
+    }
+
+    #[test]
+    fn post_eoi_latch_defers_wake_consumption_to_carrier_safe_point() {
+        let idle = IdleWakeSet::new();
+        idle.enable(cpu(0)).unwrap();
+        idle.enable(cpu(1)).unwrap();
+        let preparation = idle.prepare(cpu(1)).unwrap();
+        assert_eq!(idle.publish_runnable(cpu(0)), Ok(Some(cpu(1))));
+        let halt = idle.commit(preparation).unwrap();
+
+        // The IRQ callback publishes only this bit. It does not take the
+        // mailbox or make a scheduler decision.
+        idle.latch_rendezvous_ipi(cpu(1)).unwrap();
+        assert_eq!(
+            idle.take_latched_notification(cpu(1)),
+            Ok(MailboxNotification::Wake)
+        );
+        assert_eq!(
+            idle.take_latched_notification(cpu(1)),
             Ok(MailboxNotification::None)
         );
         idle.finish(halt).unwrap();

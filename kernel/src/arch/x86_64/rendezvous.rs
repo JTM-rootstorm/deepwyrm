@@ -19,6 +19,35 @@ const MAILBOX_TRANSITION: u8 = 1;
 const MAILBOX_STOP_REQUESTED: u8 = 2;
 const MAILBOX_STOP_SAFE: u8 = 3;
 
+/// IRQ-side handoff for fixed e1 delivery.
+///
+/// The interrupt callback is intentionally unable to inspect a mailbox or
+/// scheduler state.  It records only that its CPU must revisit its mailbox at
+/// a carrier-owned safe point after EOI.  Coalescing is sufficient: a stop
+/// request remains generation-bound in the mailbox until exact acknowledgement
+/// and a wake merely requires one scheduler rescan.
+pub(crate) struct RendezvousIpiLatches {
+    pending: [AtomicBool; RENDEZVOUS_CPU_CAPACITY],
+}
+
+impl RendezvousIpiLatches {
+    pub(crate) const fn new() -> Self {
+        Self {
+            pending: [const { AtomicBool::new(false) }; RENDEZVOUS_CPU_CAPACITY],
+        }
+    }
+
+    /// Release-publishes one bounded post-EOI rescan/stop check.
+    pub(crate) fn latch(&self, cpu: CpuIndex) {
+        self.pending[cpu.index()].store(true, Ordering::Release);
+    }
+
+    /// Acquires and clears the current CPU's coalesced handoff bit.
+    pub(crate) fn take(&self, cpu: CpuIndex) -> bool {
+        self.pending[cpu.index()].swap(false, Ordering::AcqRel)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StopIdentityError {
     InvalidCpu,
@@ -721,5 +750,17 @@ mod tests {
             StopIdentity::new(0, 1, thread, 1, 0),
             Err(StopIdentityError::ZeroRootBindingGeneration)
         );
+    }
+
+    #[test]
+    fn e1_latch_is_cpu_local_and_coalesces_before_the_safe_point() {
+        let latches = RendezvousIpiLatches::new();
+        let cpu0 = CpuIndex::new(0).unwrap();
+        let cpu1 = CpuIndex::new(1).unwrap();
+        latches.latch(cpu1);
+        latches.latch(cpu1);
+        assert!(!latches.take(cpu0));
+        assert!(latches.take(cpu1));
+        assert!(!latches.take(cpu1));
     }
 }

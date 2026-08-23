@@ -247,7 +247,7 @@ fn h4_idle_publication_brackets_rescan_and_uses_only_coalesced_e1_wake() {
 
     let live_syscall = source("src/arch/x86_64/syscall/live.rs");
     let suspension = live_syscall
-        .split_once("crate::syscall::native::NativeSuspendPlan::IdleCurrent => loop")
+        .split_once("crate::syscall::native::NativeSuspendPlan::IdleCurrent => {")
         .expect("native idle-suspend loop")
         .1
         .split_once("let generation = current_binding_generation()")
@@ -261,6 +261,8 @@ fn h4_idle_publication_brackets_rescan_and_uses_only_coalesced_e1_wake() {
     assert!(prepare < poll && poll < commit && commit < halt && halt < finish);
     assert_eq!(suspension.matches("cancel_current_idle(idle)").count(), 2);
     assert!(suspension.contains("SYSCALL FMASK keeps IF clear"));
+    assert!(suspension.contains("service_current_rendezvous_latch()"));
+    assert!(suspension.contains("MailboxNotification::Stop(_)"));
 
     let wait = live_syscall
         .split_once("fn wait_for_suspend_interrupt()")
@@ -298,6 +300,27 @@ fn h4_idle_publication_brackets_rescan_and_uses_only_coalesced_e1_wake() {
     let scheduler = source("src/task/scheduler.rs");
     assert!(scheduler.contains("let affinity = entry.continuation_cpu;"));
     assert!(scheduler.contains("complete_switch_on_with_runnable_publication"));
+}
+
+#[test]
+fn i1_e1_irq_callback_latches_only_and_defers_mailbox_work_to_safe_point() {
+    let time = source("src/time/live.rs");
+    let handler = time
+        .split_once("fn live_rendezvous_handler()")
+        .expect("live e1 callback")
+        .1
+        .split_once("pub(crate) fn service_current_rendezvous_latch")
+        .expect("live e1 callback extent")
+        .0;
+    assert!(handler.contains("latch_current_rendezvous_ipi()"));
+    assert!(!handler.contains("take_current_notification"));
+    assert!(!handler.contains("service_bsp_timer_request"));
+
+    let idle = source("src/arch/x86_64/idle.rs");
+    assert!(idle.contains("struct IdleWakeSet"));
+    assert!(idle.contains("ipi_latches: RendezvousIpiLatches"));
+    assert!(idle.contains("take_current_latched_notification"));
+    assert!(idle.contains("take_latched_notification(cpu)"));
 }
 
 #[test]

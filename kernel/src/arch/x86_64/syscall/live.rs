@@ -946,42 +946,58 @@ unsafe fn native_runtime_trampoline<R: crate::syscall::native::NativeSyscallFram
                 crate::syscall::native::NativeSuspendPlan::Switch(plan) => {
                     switch_kernel_context(plan);
                 }
-                crate::syscall::native::NativeSuspendPlan::IdleCurrent => loop {
-                    let idle = crate::arch::x86_64::idle::prepare_current_idle()
-                        .unwrap_or_else(|_| halt_forever());
-                    let poll = {
-                        let runtime = unsafe { &mut *context.cast::<R>() };
-                        // SAFETY: this loop has not left the suspended current
-                        // continuation; IRQ polling may change logical state but
-                        // not the physically active kernel-stack carrier.
-                        unsafe { runtime.poll_idle_suspend(frame) }
-                    };
-                    match poll {
-                        crate::syscall::native::NativeIdleSuspendPoll::Continue => {
-                            // SYSCALL FMASK keeps IF clear from the final
-                            // scheduler rescan through this commit. The only
-                            // re-enable is the atomic sti; hlt sequence below,
-                            // so an e1 Wake cannot be consumed and lost in
-                            // between publication and the architectural halt.
-                            let halt = crate::arch::x86_64::idle::commit_current_idle(idle)
-                                .unwrap_or_else(|_| halt_forever());
-                            wait_for_suspend_interrupt();
-                            crate::arch::x86_64::idle::finish_current_idle(halt)
-                                .unwrap_or_else(|_| halt_forever());
-                        }
-                        crate::syscall::native::NativeIdleSuspendPoll::ResumeCurrent => {
-                            crate::arch::x86_64::idle::cancel_current_idle(idle)
-                                .unwrap_or_else(|_| halt_forever());
-                            break;
-                        }
-                        crate::syscall::native::NativeIdleSuspendPoll::Switch(plan) => {
-                            crate::arch::x86_64::idle::cancel_current_idle(idle)
-                                .unwrap_or_else(|_| halt_forever());
-                            switch_kernel_context(plan);
-                            break;
+                crate::syscall::native::NativeSuspendPlan::IdleCurrent => {
+                    loop {
+                        let idle = crate::arch::x86_64::idle::prepare_current_idle()
+                            .unwrap_or_else(|_| halt_forever());
+                        let poll = {
+                            let runtime = unsafe { &mut *context.cast::<R>() };
+                            // SAFETY: this loop has not left the suspended current
+                            // continuation; IRQ polling may change logical state but
+                            // not the physically active kernel-stack carrier.
+                            unsafe { runtime.poll_idle_suspend(frame) }
+                        };
+                        match poll {
+                            crate::syscall::native::NativeIdleSuspendPoll::Continue => {
+                                // SYSCALL FMASK keeps IF clear from the final
+                                // scheduler rescan through this commit. The only
+                                // re-enable is the atomic sti; hlt sequence below,
+                                // so an e1 Wake cannot be consumed and lost in
+                                // between publication and the architectural halt.
+                                let halt = crate::arch::x86_64::idle::commit_current_idle(idle)
+                                    .unwrap_or_else(|_| halt_forever());
+                                wait_for_suspend_interrupt();
+                                match crate::time::service_current_rendezvous_latch()
+                                .unwrap_or_else(|_| halt_forever())
+                            {
+                                crate::arch::x86_64::rendezvous::MailboxNotification::None
+                                | crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {}
+                                crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
+                                | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {
+                                    // The live D carrier safe-point/reaper join has not yet
+                                    // been installed. Returning to a possibly stopped user
+                                    // continuation would be unsafe, so preserve fail-closed
+                                    // target behavior until that join exists.
+                                    halt_forever();
+                                }
+                            }
+                                crate::arch::x86_64::idle::finish_current_idle(halt)
+                                    .unwrap_or_else(|_| halt_forever());
+                            }
+                            crate::syscall::native::NativeIdleSuspendPoll::ResumeCurrent => {
+                                crate::arch::x86_64::idle::cancel_current_idle(idle)
+                                    .unwrap_or_else(|_| halt_forever());
+                                break;
+                            }
+                            crate::syscall::native::NativeIdleSuspendPoll::Switch(plan) => {
+                                crate::arch::x86_64::idle::cancel_current_idle(idle)
+                                    .unwrap_or_else(|_| halt_forever());
+                                switch_kernel_context(plan);
+                                break;
+                            }
                         }
                     }
-                },
+                }
             }
             let generation = current_binding_generation();
             if let Err(error) = frame.rebind_after_kernel_resume(generation) {
