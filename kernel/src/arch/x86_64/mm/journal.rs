@@ -2,7 +2,12 @@
 //!
 //! Planning reads observe an in-memory overlay. No target entry changes until
 //! [`PageTableJournal::publish`] revalidates every original observation and
-//! submits one atomic child-before-parent write batch.
+//! submits one atomic child-before-parent write batch. SMP consumers place the
+//! resulting [`X86AddressSpacePublisher`] beneath the portable
+//! [`CoherentAddressSpacePublisher`](crate::memory::address_region::CoherentAddressSpacePublisher);
+//! that adapter closes root residency before this journal writes and withholds
+//! mapping lease release until the exact generation's resident-CPU
+//! acknowledgements complete.
 
 use super::{
     CommitError, EntryAssertion, EntryMutation, FrameAddress, MutationPlan, PageTableTransaction,

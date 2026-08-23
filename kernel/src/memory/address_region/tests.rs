@@ -7,6 +7,7 @@ use crate::task::{TaskAuthority, TaskError, complete_task_finalization};
 use deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT;
 use std::boxed::Box;
 use std::ops::{Deref, DerefMut};
+use std::vec::Vec;
 
 struct FakePublisher {
     address_space: AddressSpaceKey,
@@ -55,6 +56,56 @@ unsafe impl AddressSpacePublisher for FakePublisher {
         self.last_before = before.len();
         self.last_after = after.len();
         if self.fail { Err(()) } else { Ok(()) }
+    }
+}
+
+struct DeterministicShootdownDriver {
+    initiating_cpu: CpuIndex,
+    pending: Vec<(CpuIndex, ShootdownRequest)>,
+    delivered: Vec<(CpuIndex, ShootdownRequest)>,
+    wait_steps: usize,
+}
+
+impl DeterministicShootdownDriver {
+    fn new(initiating_cpu: CpuIndex) -> Self {
+        Self {
+            initiating_cpu,
+            pending: Vec::new(),
+            delivered: Vec::new(),
+            wait_steps: 0,
+        }
+    }
+}
+
+impl<const CPUS: usize> ShootdownDriver<CPUS> for DeterministicShootdownDriver {
+    fn initiating_cpu(&self) -> CpuIndex {
+        self.initiating_cpu
+    }
+
+    fn notify_remote(
+        &mut self,
+        _coherency: &AddressSpaceCoherency<CPUS>,
+        target: CpuIndex,
+        request: ShootdownRequest,
+    ) {
+        self.pending.push((target, request));
+        self.delivered.push((target, request));
+    }
+
+    fn wait_step(&mut self, coherency: &AddressSpaceCoherency<CPUS>) {
+        self.wait_steps += 1;
+        if self.pending.is_empty() {
+            return;
+        }
+        let (target, notified) = self.pending.remove(0);
+        let acquired = coherency
+            .request_for_cpu(target)
+            .expect("notified target acquires its exact pending mailbox request");
+        assert_eq!(acquired, notified);
+        assert_eq!(
+            coherency.acknowledge(target, acquired),
+            Ok(ShootdownAcknowledgement::Recorded)
+        );
     }
 }
 
@@ -368,6 +419,94 @@ fn replacement_publishes_model_and_lease_together() {
         Protection::READ_EXECUTE
     );
     assert_eq!(authority.active_lease_count(), 1);
+}
+
+#[test]
+fn coherent_map_protect_unmap_wait_for_cross_cpu_acknowledgements() {
+    let mut authority = TestObjects::<2, 8>::new();
+    let object = object(&mut authority, Protection::READ_WRITE);
+    let mut region = region::<4>(PAGE_SIZE, PAGE_SIZE * 4);
+    let coherency = AddressSpaceCoherency::<4>::new(region.address_space_key());
+    let cpu0 = CpuIndex::new::<4>(0).unwrap();
+    let cpu1 = CpuIndex::new::<4>(1).unwrap();
+    let cpu2 = CpuIndex::new::<4>(2).unwrap();
+    let _resident0 = coherency.enter(cpu0).unwrap();
+    let _resident1 = coherency.enter(cpu1).unwrap();
+    let _resident2 = coherency.enter(cpu2).unwrap();
+    let mut base = FakePublisher::for_region(&region);
+    let mut driver = DeterministicShootdownDriver::new(cpu0);
+
+    let authorization = authorization(&mut authority, object, &region, Protection::READ_WRITE);
+    {
+        let mut publisher =
+            CoherentAddressSpacePublisher::<_, _, 4, 8>::new(&mut base, &coherency, &mut driver);
+        test_map(
+            &mut region,
+            &mut authority,
+            &mut publisher,
+            PAGE_SIZE,
+            authorization,
+            0,
+            PAGE_SIZE * 2,
+            Protection::READ_WRITE,
+        )
+        .unwrap();
+    }
+    assert_eq!(coherency.published_generation(), 1);
+    assert_eq!(authority.active_lease_count(), 1);
+
+    {
+        let mut publisher =
+            CoherentAddressSpacePublisher::<_, _, 4, 8>::new(&mut base, &coherency, &mut driver);
+        test_protect(
+            &mut region,
+            &mut authority,
+            &mut publisher,
+            PAGE_SIZE,
+            PAGE_SIZE * 2,
+            Protection::READ,
+        )
+        .unwrap();
+    }
+    assert_eq!(coherency.published_generation(), 2);
+    assert_eq!(authority.active_lease_count(), 1);
+
+    {
+        let mut publisher =
+            CoherentAddressSpacePublisher::<_, _, 4, 8>::new(&mut base, &coherency, &mut driver);
+        test_unmap(
+            &mut region,
+            &mut authority,
+            &mut publisher,
+            PAGE_SIZE,
+            PAGE_SIZE * 2,
+        )
+        .unwrap();
+    }
+    assert_eq!(coherency.published_generation(), 3);
+    assert_eq!(authority.active_lease_count(), 0);
+    assert!(region.mappings().iter().all(Option::is_none));
+    assert_eq!(driver.wait_steps, 6);
+    assert_eq!(driver.delivered.len(), 6);
+    for (index, (target, request)) in driver.delivered.iter().copied().enumerate() {
+        assert!(target == cpu1 || target == cpu2);
+        assert_eq!(request.generation(), u64::try_from(index / 2 + 1).unwrap());
+        assert_eq!(
+            request.mutation(),
+            [
+                MappingMutation::Map,
+                MappingMutation::Protect,
+                MappingMutation::Unmap,
+            ][index / 2]
+        );
+        assert_eq!(
+            request.scope(),
+            InvalidationScope::Pages {
+                start: PAGE_SIZE,
+                byte_len: PAGE_SIZE * 2,
+            }
+        );
+    }
 }
 
 #[test]

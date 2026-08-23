@@ -2,6 +2,9 @@
 //!
 //! The region never changes its model or authority leases until an injected
 //! publisher atomically accepts the same full replacement for page tables.
+//! SMP owners wrap their architecture publisher in
+//! [`CoherentAddressSpacePublisher`] so the successful return also proves the
+//! old resident-CPU snapshot acknowledged the published mutation generation.
 
 #![allow(
     dead_code,
@@ -19,8 +22,21 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 #[path = "address_region/authority.rs"]
 mod authority;
+#[path = "address_region/coherency.rs"]
+mod coherency;
 #[path = "address_region/region.rs"]
 mod region;
+
+#[allow(
+    unused_imports,
+    reason = "H3 exposes the target-independent residency/shootdown seam ahead of live x86 IPI convergence"
+)]
+pub(crate) use coherency::{
+    AddressSpaceCoherency, AddressSpaceCoherencyError, CoherentAddressSpacePublisher,
+    CoherentPublishError, CpuIndex, CpuSet, InvalidationScope, LeavePublication, MappingMutation,
+    MutationTransaction, ReclaimPermit, Residency, ShootdownAcknowledgement, ShootdownBarrier,
+    ShootdownDriver, ShootdownRequest,
+};
 
 const USER_CANONICAL_END: u64 = 0x0000_8000_0000_0000;
 const EMPTY_LEASE: MappingLease = MappingLease::EMPTY;
@@ -338,7 +354,10 @@ pub(crate) mod publisher_seal {
 ///
 /// The implementation must own the exact architecture root denoted by
 /// `address_space`, reject every other root/region pair, and make the full
-/// replacement atomic with respect to its page tables and invalidations.
+/// replacement atomic with respect to its page tables and initiating-CPU
+/// invalidations. Once a root may be resident on multiple CPUs, the concrete
+/// publisher must be placed beneath [`CoherentAddressSpacePublisher`]; only
+/// that adapter's successful return is sufficient for lease release/reclaim.
 #[allow(
     unsafe_code,
     reason = "page-table-root identity is an architecture invariant Rust cannot prove"
