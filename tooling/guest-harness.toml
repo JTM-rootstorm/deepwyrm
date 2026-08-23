@@ -125,3 +125,10 @@ state = "implemented"
 [guest_test.primordial-invalid-return]
 id = 21
 state = "implemented"
+
+# DW0-I1’s test-support-only SMP evidence collector.  This selector embeds a
+# build-owned nonce and has no production dispatch until the runtime lane wires
+# its semantic scenario hooks.
+[guest_test.smp-runtime-acceptance]
+id = 23
+state = "implemented"

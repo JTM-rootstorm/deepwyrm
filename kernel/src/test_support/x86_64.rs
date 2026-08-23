@@ -11,6 +11,8 @@ use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use crate::arch::x86_64::exceptions::{EarlyException, ExceptionVector};
 use crate::debug::emit_early_raw_record;
 
+#[cfg(deepwyrm_i1_evidence)]
+use super::{EvidenceFlushError, I1_EVIDENCE};
 use super::{
     identity::{
         ExpectedPageFaultFacts, ExpectedPageFaultKind, completion_record, exception_outcome,
@@ -294,7 +296,27 @@ fn complete_known_outcome(outcome: CompletionOutcome, detail: u32) -> ! {
     // whose compile-time selector was resolved by the central QEMU harness
     // build path. Such artifacts are not production or physical-hardware images.
     let mut transport = unsafe { QemuCompletionTransport::new() };
+    #[cfg(deepwyrm_i1_evidence)]
+    let (outcome, detail) = match I1_EVIDENCE.finalize_running_invariant().and_then(|()| {
+        I1_EVIDENCE.flush(|record| {
+            let _ = emit_early_raw_record(record);
+        })
+    }) {
+        Ok(()) => (outcome, detail),
+        Err(error) => (CompletionOutcome::Fail, evidence_failure_detail(error)),
+    };
     complete(&mut transport, completion_record(outcome, detail))
+}
+
+#[cfg(deepwyrm_i1_evidence)]
+const fn evidence_failure_detail(error: EvidenceFlushError) -> u32 {
+    match error {
+        EvidenceFlushError::NotFinalized => 0x4931_0001,
+        EvidenceFlushError::NotReady => 0x4931_0002,
+        EvidenceFlushError::Overflow => 0x4931_0003,
+        EvidenceFlushError::Malformed => 0x4931_0004,
+        EvidenceFlushError::Invariant => 0x4931_0005,
+    }
 }
 
 /// Write one outcome-only value to QEMU's test exit device.

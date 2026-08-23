@@ -258,6 +258,8 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
         #[cfg(deepwyrm_f12_guest)]
         test if test.is_f12_userspace() => {}
         test if test.is_primordial() => {}
+        #[cfg(deepwyrm_i1_evidence)]
+        test if test.is_i1_evidence() => {}
         _ => unreachable!("all build-selected guest tests have explicit dispatch"),
     }
 
@@ -454,6 +456,8 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             }
             test if test.is_primordial() => active_paging
                 .run_primordial(primordial_modules.expect("primordial test selected its modules")),
+            #[cfg(deepwyrm_i1_evidence)]
+            test if test.is_i1_evidence() => test_support::complete_fail(0x4931_4e48),
             _ => unreachable!("post-activation selector lacks an explicit runtime"),
         }
         #[cfg(not(feature = "test-support"))]

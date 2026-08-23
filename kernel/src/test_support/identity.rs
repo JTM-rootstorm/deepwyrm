@@ -32,6 +32,7 @@ pub(crate) enum BuildGuestTest {
     PrimordialBlockingCleanup,
     PrimordialUserException,
     PrimordialInvalidReturn,
+    SmpRuntimeAcceptance,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,6 +93,7 @@ impl BuildGuestTest {
             Self::PrimordialBlockingCleanup => 19,
             Self::PrimordialUserException => 20,
             Self::PrimordialInvalidReturn => 21,
+            Self::SmpRuntimeAcceptance => 23,
         }
     }
 
@@ -138,6 +140,10 @@ impl BuildGuestTest {
                 | Self::MemoryUserKernelIsolation
                 | Self::MemorySharedMemoryObject
         )
+    }
+
+    pub(crate) const fn is_i1_evidence(self) -> bool {
+        matches!(self, Self::SmpRuntimeAcceptance)
     }
 }
 
@@ -226,6 +232,8 @@ const fn parse_known_selector(value: &str) -> BuildGuestTest {
         BuildGuestTest::PrimordialUserException
     } else if string_equals(value, "primordial-invalid-return") {
         BuildGuestTest::PrimordialInvalidReturn
+    } else if string_equals(value, "smp-runtime-acceptance") {
+        BuildGuestTest::SmpRuntimeAcceptance
     } else {
         panic!("unknown build-selected guest test")
     }

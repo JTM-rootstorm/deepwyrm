@@ -91,10 +91,12 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_TEST_SUPPORT");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_GUEST_TEST_SELECTOR");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_GUEST_TEST_ID");
+    println!("cargo:rerun-if-env-changed=DEEPWYRM_I1_EVIDENCE_NONCE");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_c3_one_shot_ui)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_e7_guest)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_f9_guest)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_f12_guest)");
+    println!("cargo:rustc-check-cfg=cfg(deepwyrm_i1_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_integrated)");
     println!("cargo:rustc-cfg=deepwyrm_integrated");
 
@@ -129,6 +131,13 @@ fn run() -> Result<(), String> {
         .is_some_and(is_f12_userspace_selector)
     {
         println!("cargo:rustc-cfg=deepwyrm_f12_guest");
+    }
+    if env::var("DEEPWYRM_GUEST_TEST_SELECTOR")
+        .ok()
+        .as_deref()
+        .is_some_and(is_i1_evidence_selector)
+    {
+        println!("cargo:rustc-cfg=deepwyrm_i1_evidence");
     }
 
     if required_env("TARGET")? != KERNEL_TARGET {
@@ -231,6 +240,10 @@ fn is_f9_userspace_selector(selector: &str) -> bool {
 
 fn is_f12_userspace_selector(selector: &str) -> bool {
     selector == "ipc-blocking-smoke"
+}
+
+fn is_i1_evidence_selector(selector: &str) -> bool {
+    selector == "smp-runtime-acceptance"
 }
 
 fn emit_e7_user_env(elf: &Path) {
@@ -796,6 +809,31 @@ fn configure_guest_test(harness_path: &Path) -> Result<(), String> {
         let selector = selector.expect("validated enabled configuration has a selector");
         println!("cargo:rustc-env=DEEPWYRM_GUEST_TEST_SELECTOR={selector}");
         println!("cargo:rustc-env=DEEPWYRM_GUEST_TEST_ID={test_id}");
+        if is_i1_evidence_selector(&selector) {
+            let nonce = required_i1_evidence_nonce()?;
+            println!("cargo:rustc-env=DEEPWYRM_I1_EVIDENCE_NONCE={nonce}");
+        }
+    }
+    Ok(())
+}
+
+fn required_i1_evidence_nonce() -> Result<String, String> {
+    let nonce = env::var("DEEPWYRM_I1_EVIDENCE_NONCE")
+        .map_err(|_| "smp-runtime-acceptance requires DEEPWYRM_I1_EVIDENCE_NONCE".to_owned())?;
+    validate_i1_evidence_nonce(&nonce)?;
+    Ok(nonce)
+}
+
+pub(crate) fn validate_i1_evidence_nonce(nonce: &str) -> Result<(), String> {
+    if nonce.len() != 16
+        || !nonce
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'A'..=b'F'))
+        || nonce == "0000000000000000"
+    {
+        return Err(
+            "DEEPWYRM_I1_EVIDENCE_NONCE must be an uppercase nonzero 16-hex-digit u64".into(),
+        );
     }
     Ok(())
 }
