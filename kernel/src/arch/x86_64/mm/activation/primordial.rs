@@ -672,7 +672,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         virtual_start: u64,
         byte_len: u64,
     ) -> crate::memory::object::MappingFinalReleases<REGISTRY> {
-        let mut candidates = [None; PRIMORDIAL_TABLE_CANDIDATES];
+        let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
         let result = {
             let target = &mut self.active.target;
             let mut tracked = user_access::TrackedActiveTarget {
@@ -781,7 +781,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
         byte_len: u64,
         protection: Protection,
     ) -> Result<(), Self::Error> {
-        let mut candidates = [None; PRIMORDIAL_TABLE_CANDIDATES];
+        let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
         let result = (|| {
             // At most two hierarchy paths are needed for the bounded initial
             // stack mapping: it may cross a PDPT, PD, and PT boundary.
@@ -1221,7 +1221,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             let Some(mapping) = mapping else {
                 break;
             };
-            let mut candidates = [None; PRIMORDIAL_TABLE_CANDIDATES];
+            let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
             let releases = {
                 let region = self
                     .regions
@@ -2219,7 +2219,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .unwrap_or_else(|_| panic!("primordial map output pin drifted"));
             return DW_STATUS_BAD_STATE;
         }
-        let mut candidates = [None; PRIMORDIAL_TABLE_CANDIDATES];
+        let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
         let result = (|| {
             candidates[0] = Some(
                 user.prepare_table_candidate(TableLevel::Pdpt)
@@ -2306,7 +2306,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             Err(status) => return status,
         };
         let caller_process = self.process;
-        let mut candidates = [None; PRIMORDIAL_TABLE_CANDIDATES];
+        let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
         let mut user = self.active.current_process_address_space(
             self.active_root.as_ref().expect("active root"),
             self.process,
