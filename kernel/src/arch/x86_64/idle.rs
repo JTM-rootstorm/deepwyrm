@@ -357,8 +357,15 @@ pub(crate) fn cancel_current_idle(preparation: IdlePreparation) -> Result<(), Id
 pub(crate) fn commit_current_idle(
     preparation: IdlePreparation,
 ) -> Result<IdleHalt, IdleCommitFailure> {
-    if preparation.cpu() != current_cpu()? {
-        return Err(IdleWakeError::StalePreparation);
+    let current = match current_cpu() {
+        Ok(cpu) => cpu,
+        Err(error) => return Err(IdleCommitFailure { error, preparation }),
+    };
+    if preparation.cpu() != current {
+        return Err(IdleCommitFailure {
+            error: IdleWakeError::StalePreparation,
+            preparation,
+        });
     }
     LIVE_IDLE_WAKE.commit(preparation)
 }
