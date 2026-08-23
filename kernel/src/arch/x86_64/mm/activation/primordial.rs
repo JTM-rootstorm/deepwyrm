@@ -373,6 +373,8 @@ unsafe impl Sync for SharedRuntimeStorage {}
 
 static SHARED_RUNTIME_STATE: AtomicU8 = AtomicU8::new(0);
 static SHARED_RUNTIME_STORAGE: SharedRuntimeStorage = SharedRuntimeStorage::new();
+static STATIONARY_GUARD_DEPTH: crate::arch::x86_64::syscall::StationaryGuardDepth =
+    crate::arch::x86_64::syscall::StationaryGuardDepth::new();
 
 /// Fixed CPU-local façade over the stationary runtime authorities.
 ///
@@ -1049,6 +1051,9 @@ struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_
     root_owner: Option<InternalRef>,
     deferred_current: Option<crate::task::DeferredCurrentExecutionResources>,
     cleanup: CleanupQueue<REGISTRY_OBJECTS>,
+    // Pending final releases are moved before the irreversible stop commit.
+    // They are drained only by the post-ack kernel-root continuation.
+    rendezvous_cleanup: Option<CleanupQueue<REGISTRY_OBJECTS>>,
     #[cfg(feature = "test-support")]
     g5_probe: G5PrimordialProbe,
 }
@@ -1116,6 +1121,32 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
+    fn reserve_runtime_phase(&self) -> crate::arch::x86_64::syscall::RuntimePhaseReservation {
+        let root = self
+            .active_root
+            .as_ref()
+            .unwrap_or_else(|| panic!("runtime phase requires an active Process root"));
+        crate::arch::x86_64::syscall::RuntimePhaseReservation::new(
+            self.thread,
+            root.binding_generation(),
+        )
+        .unwrap_or_else(|_| panic!("runtime phase has an invalid exact root generation"))
+    }
+
+    fn commit_runtime_phase(&self, phase: crate::arch::x86_64::syscall::RuntimePhaseReservation) {
+        let root = self
+            .active_root
+            .as_ref()
+            .unwrap_or_else(|| panic!("runtime phase lost its active Process root"));
+        phase
+            .revalidate(self.thread, root.binding_generation())
+            .unwrap_or_else(|_| panic!("runtime phase identity drifted across guard-free work"));
+    }
+
+    fn assert_guard_free_external_work(&self) {
+        STATIONARY_GUARD_DEPTH.assert_clear_on(self.cpu);
+    }
+
     fn synchronize_scheduler_current(&mut self) {
         assert_eq!(self.local.cpu, self.cpu, "BSP carrier storage CPU drifted");
         let thread = self
@@ -1235,13 +1266,44 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
+    fn stage_rendezvous_cleanup(&mut self) {
+        assert!(
+            self.rendezvous_cleanup.is_none(),
+            "remote stop staged cleanup twice"
+        );
+        self.rendezvous_cleanup = Some(core::mem::replace(&mut self.cleanup, CleanupQueue::new()));
+    }
+
+    fn drain_staged_rendezvous_cleanup(&mut self) {
+        let cleanup = self
+            .rendezvous_cleanup
+            .take()
+            .unwrap_or_else(|| panic!("post-ack carrier omitted staged cleanup"));
+        self.merge_cleanup(cleanup);
+        self.drain_finalizers()
+            .unwrap_or_else(|_| panic!("post-ack rendezvous cleanup drifted"));
+    }
+
     /// Continues only after the remote-stop mailbox Release acknowledgement.
     /// The stopped Thread remains deferred in the scheduler/reaper ownership
     /// graph; this carrier may select a different Runnable Thread or idle on
     /// its retained kernel root, but it must never consume the stopped IPI
     /// frame or reclaim resources still held by the initiator's exact ack.
     fn continue_after_rendezvous_stop(&mut self) -> ! {
-        self.stopping_claim = None;
+        let stopped_claim = self
+            .stopping_claim
+            .take()
+            .unwrap_or_else(|| panic!("rendezvous continuation lost its stopped claim"));
+        // The exact-safe acknowledgement has already been Release-published.
+        // We may now abandon the CPU-local retired continuation slot, but not
+        // reclaim the stopped task/root/stack: that remains initiator-gated.
+        self.shared
+            .execution
+            .complete_switch_on(stopped_claim)
+            .unwrap_or_else(|error| {
+                panic!("rendezvous continuation could not clear retired slot: {error:?}")
+            });
+        self.drain_staged_rendezvous_cleanup();
         let next = self.shared.execution.terminal_reaper_next_on(self.cpu);
         let Some(next) = next else {
             self.idle_after_rendezvous_stop()
@@ -1313,8 +1375,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     {
                         crate::arch::x86_64::rendezvous::MailboxNotification::None
                         | crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {}
-                        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
-                        | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {
+                        crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {
+                            // A late duplicate e1 observes the exact safe
+                            // acknowledgement still held by its initiator.
+                            // Stay on the kernel root and rescan; no stopped
+                            // IPI frame exists to return through and no second
+                            // acknowledgement may be published.
+                        }
+                        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_) => {
                             panic!("stopped kernel-root carrier received a second stop request")
                         }
                     }
@@ -1761,6 +1829,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         crate::arch::x86_64::rendezvous::ExactSafeWitness,
         crate::arch::x86_64::rendezvous::RemoteStopError,
     > {
+        // The IPI/reaper seam is an external, divergent boundary.  It must
+        // never inherit a stationary authority guard from a preceding adapter
+        // phase before it consumes the move-only reaper witness.
+        self.assert_guard_free_external_work();
         if self.rendezvous_reaper.as_ref().is_none() {
             return Err(crate::arch::x86_64::rendezvous::RemoteStopError::UnsafePrecommit);
         }
@@ -1807,6 +1879,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 user_return_prevented: true,
             },
         )?;
+        // All rejectable identity/safe-point checks have passed. Move any
+        // completed syscall releases out of the stopped carrier before the
+        // reaper witness is consumed; only the post-ack continuation may
+        // finalize them.
+        self.stage_rendezvous_cleanup();
         let reaper = self
             .rendezvous_reaper
             .take()
@@ -1852,6 +1929,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     fn deferred_cleanup_is_quiescent(&self) -> bool {
         self.cleanup.is_empty()
+            && self.rendezvous_cleanup.is_some()
             && self.services.is_quiescent()
             && self.deferred_current.is_none()
             && self.shared.execution.running_claim_on(self.cpu).is_none()
@@ -1867,6 +1945,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         request: crate::arch::x86_64::rendezvous::StopRequest,
         reaper: crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry,
     ) -> ! {
+        self.assert_guard_free_external_work();
         self.rendezvous_reaper = Some(reaper);
         crate::arch::x86_64::idle::complete_current_rendezvous_stop(request, self).unwrap_or_else(
             |error| panic!("remote rendezvous stop failed before commit: {error:?}"),
@@ -2276,6 +2355,7 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         root_owner: Some(root_owner),
         deferred_current: None,
         cleanup: CleanupQueue::new(),
+        rendezvous_cleanup: None,
         #[cfg(feature = "test-support")]
         g5_probe: G5PrimordialProbe::for_build(),
     };
@@ -2322,18 +2402,23 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
         {
             panic!("primordial syscall arrived without its running Thread");
         }
-        let request = match request {
+        // This identity is deliberately detached from the carrier before any
+        // usercopy or service dispatch.  The final check keeps a resumed
+        // adapter from committing under a migrated Thread/root selection.
+        let phase = self.reserve_runtime_phase();
+        let result = match request {
             NativeSyscallRequest::ProcessCreate {
                 args,
                 args_size,
                 out_result,
                 result_size,
             } => {
+                self.assert_guard_free_external_work();
                 let mut user = self.active.current_process_address_space(
                     self.active_root.as_ref().expect("active root"),
                     self.process,
                 );
-                return NativeSyscallResult::returning(crate::syscall::process_create_with_root(
+                NativeSyscallResult::returning(crate::syscall::process_create_with_root(
                     &mut user,
                     &mut self.registry,
                     &mut self.tasks,
@@ -2345,43 +2430,50 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     out_result,
                     result_size,
                     &mut self.cleanup,
-                ));
+                ))
             }
-            other => other,
+            request => {
+                self.assert_guard_free_external_work();
+                let dispatch = {
+                    let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
+                    let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
+                    let mut user = self.active.current_process_address_space(
+                        self.active_root.as_ref().expect("active root"),
+                        self.process,
+                    );
+                    self.services.dispatch(
+                        request,
+                        &mut user,
+                        &mut self.registry,
+                        &mut self.tasks,
+                        &self.shared.execution,
+                        &self.shared.channels,
+                        &self.shared.events,
+                        &self.shared.timers,
+                        &self.shared.waits,
+                        &mut self.regions,
+                        &mut self.spaces,
+                        self.process,
+                        self.thread,
+                        Some(&mut wait_deadlines),
+                        &mut timer_deadlines,
+                        &mut self.channel_staging[..],
+                        || {
+                            crate::time::monotonic_now()
+                                .map_err(|_| deepwyrm_abi::DW_STATUS_BAD_STATE)
+                        },
+                    )
+                };
+                let (route, cleanup) = dispatch.into_parts();
+                self.merge_cleanup(cleanup);
+                match route {
+                    FServiceRoute::Handled(result) => result,
+                    FServiceRoute::Fallthrough(request) => self.handle_fallthrough(request),
+                }
+            }
         };
-        let dispatch = {
-            let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
-            let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
-            let mut user = self.active.current_process_address_space(
-                self.active_root.as_ref().expect("active root"),
-                self.process,
-            );
-            self.services.dispatch(
-                request,
-                &mut user,
-                &mut self.registry,
-                &mut self.tasks,
-                &self.shared.execution,
-                &self.shared.channels,
-                &self.shared.events,
-                &self.shared.timers,
-                &self.shared.waits,
-                &mut self.regions,
-                &mut self.spaces,
-                self.process,
-                self.thread,
-                Some(&mut wait_deadlines),
-                &mut timer_deadlines,
-                &mut self.channel_staging[..],
-                || crate::time::monotonic_now().map_err(|_| deepwyrm_abi::DW_STATUS_BAD_STATE),
-            )
-        };
-        let (route, cleanup) = dispatch.into_parts();
-        self.merge_cleanup(cleanup);
-        match route {
-            FServiceRoute::Handled(result) => result,
-            FServiceRoute::Fallthrough(request) => self.handle_fallthrough(request),
-        }
+        self.commit_runtime_phase(phase);
+        result
     }
 }
 
@@ -2389,6 +2481,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
     fn handle_fallthrough(&mut self, request: NativeSyscallRequest) -> NativeSyscallResult {
+        self.assert_guard_free_external_work();
         match request {
             NativeSyscallRequest::HandleClose { handle } => {
                 NativeSyscallResult::returning(crate::syscall::handle_close(
@@ -2544,128 +2637,138 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         args_size: u64,
         out_address: deepwyrm_abi::DwUserAddress,
     ) -> deepwyrm_abi::DwStatus {
-        let mut user = self.active.current_process_address_space(
-            self.active_root.as_ref().expect("active root"),
-            self.process,
-        );
-        let args = match crate::syscall::decode_map_args(&mut user, args_address, args_size) {
-            Ok(args) => args,
-            Err(status) => return status,
-        };
-        let protection = match MemoryProtection::mapping(args.protections.0 as u8) {
-            Ok(protection) => protection,
-            Err(crate::memory::object::MemoryObjectError::UnsupportedProtection) => {
-                return deepwyrm_abi::DW_STATUS_NOT_SUPPORTED;
-            }
-            Err(_) => return deepwyrm_abi::DW_STATUS_INVALID_ARGUMENT,
-        };
-        let output_range = match UserRange::new(
-            UserAddressSpace::x86_64_four_level(PAGE_SIZE)
-                .unwrap_or_else(|_| panic!("x86_64 userspace model unavailable")),
-            out_address.0,
-            8,
-            8,
-            UserAccess::WRITE,
-            EmptyAddressRule::Reject,
-        ) {
-            Ok(range) => range,
-            Err(_) => return deepwyrm_abi::DW_STATUS_BAD_ADDRESS,
-        };
-        let output = match user.preflight_owned_output(output_range) {
-            Ok(output) => output,
-            Err(_) => return deepwyrm_abi::DW_STATUS_BAD_ADDRESS,
-        };
-        let target = match crate::syscall::address_region_mutation_target(
-            &mut self.registry,
-            &self.tasks,
-            &self.regions,
-            self.process,
-            address_region,
-            deepwyrm_abi::DwRights(deepwyrm_abi::DW_RIGHT_MAP.0 | deepwyrm_abi::DW_RIGHT_MODIFY.0),
-            &mut self.cleanup,
-        ) {
-            Ok(target) => target,
-            Err(status) => {
+        let phase = self.reserve_runtime_phase();
+        self.assert_guard_free_external_work();
+        let status = (|| {
+            let mut user = self.active.current_process_address_space(
+                self.active_root.as_ref().expect("active root"),
+                self.process,
+            );
+            let args = match crate::syscall::decode_map_args(&mut user, args_address, args_size) {
+                Ok(args) => args,
+                Err(status) => return status,
+            };
+            let protection = match MemoryProtection::mapping(args.protections.0 as u8) {
+                Ok(protection) => protection,
+                Err(crate::memory::object::MemoryObjectError::UnsupportedProtection) => {
+                    return deepwyrm_abi::DW_STATUS_NOT_SUPPORTED;
+                }
+                Err(_) => return deepwyrm_abi::DW_STATUS_INVALID_ARGUMENT,
+            };
+            let output_range = match UserRange::new(
+                UserAddressSpace::x86_64_four_level(PAGE_SIZE)
+                    .unwrap_or_else(|_| panic!("x86_64 userspace model unavailable")),
+                out_address.0,
+                8,
+                8,
+                UserAccess::WRITE,
+                EmptyAddressRule::Reject,
+            ) {
+                Ok(range) => range,
+                Err(_) => return deepwyrm_abi::DW_STATUS_BAD_ADDRESS,
+            };
+            let output = match user.preflight_owned_output(output_range) {
+                Ok(output) => output,
+                Err(_) => return deepwyrm_abi::DW_STATUS_BAD_ADDRESS,
+            };
+            let prepared = match crate::syscall::prepare_address_region_mutation(
+                &mut self.registry,
+                &self.tasks,
+                &self.regions,
+                self.process,
+                address_region,
+                deepwyrm_abi::DwRights(
+                    deepwyrm_abi::DW_RIGHT_MAP.0 | deepwyrm_abi::DW_RIGHT_MODIFY.0,
+                ),
+                &mut self.cleanup,
+            ) {
+                Ok(target) => target,
+                Err(status) => {
+                    user.discard_owned_output(output)
+                        .unwrap_or_else(|_| panic!("primordial map output pin drifted"));
+                    return status;
+                }
+            };
+            let target = prepared.target();
+            let caller_process = self.process;
+            if user
+                .select_process_for_return_validation(target.process)
+                .is_err()
+            {
                 user.discard_owned_output(output)
                     .unwrap_or_else(|_| panic!("primordial map output pin drifted"));
-                return status;
+                return DW_STATUS_BAD_STATE;
             }
-        };
-        let caller_process = self.process;
-        if user
-            .select_process_for_return_validation(target.process)
-            .is_err()
-        {
-            user.discard_owned_output(output)
-                .unwrap_or_else(|_| panic!("primordial map output pin drifted"));
-            return DW_STATUS_BAD_STATE;
-        }
-        let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
-        let result = (|| {
-            candidates[0] = Some(
-                user.prepare_table_candidate(TableLevel::Pdpt)
-                    .map_err(|_| DW_STATUS_NO_RESOURCES)?,
-            );
-            candidates[1] = Some(
-                user.prepare_table_candidate(TableLevel::Pd)
-                    .map_err(|_| DW_STATUS_NO_RESOURCES)?,
-            );
-            candidates[2] = Some(
-                user.prepare_table_candidate(TableLevel::Pt)
-                    .map_err(|_| DW_STATUS_NO_RESOURCES)?,
-            );
-            candidates[3] = Some(
-                user.prepare_table_candidate(TableLevel::Pdpt)
-                    .map_err(|_| DW_STATUS_NO_RESOURCES)?,
-            );
-            candidates[4] = Some(
-                user.prepare_table_candidate(TableLevel::Pd)
-                    .map_err(|_| DW_STATUS_NO_RESOURCES)?,
-            );
-            candidates[5] = Some(
-                user.prepare_table_candidate(TableLevel::Pt)
-                    .map_err(|_| DW_STATUS_NO_RESOURCES)?,
-            );
-            let mut publisher = user
+            let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
+            let result = (|| {
+                candidates[0] = Some(
+                    user.prepare_table_candidate(TableLevel::Pdpt)
+                        .map_err(|_| DW_STATUS_NO_RESOURCES)?,
+                );
+                candidates[1] = Some(
+                    user.prepare_table_candidate(TableLevel::Pd)
+                        .map_err(|_| DW_STATUS_NO_RESOURCES)?,
+                );
+                candidates[2] = Some(
+                    user.prepare_table_candidate(TableLevel::Pt)
+                        .map_err(|_| DW_STATUS_NO_RESOURCES)?,
+                );
+                candidates[3] = Some(
+                    user.prepare_table_candidate(TableLevel::Pdpt)
+                        .map_err(|_| DW_STATUS_NO_RESOURCES)?,
+                );
+                candidates[4] = Some(
+                    user.prepare_table_candidate(TableLevel::Pd)
+                        .map_err(|_| DW_STATUS_NO_RESOURCES)?,
+                );
+                candidates[5] = Some(
+                    user.prepare_table_candidate(TableLevel::Pt)
+                        .map_err(|_| DW_STATUS_NO_RESOURCES)?,
+                );
+                let mut publisher = user
                 .publisher::<
                     PRIMORDIAL_TABLE_CANDIDATES,
                     PRIMORDIAL_JOURNAL_ENTRIES,
                     PRIMORDIAL_INVALIDATIONS,
                 >(target.address_space, target.region_key, &mut candidates)
                 .map_err(|_| DW_STATUS_BAD_STATE)?;
-            crate::syscall::address_region_map_model(
-                &mut publisher,
-                &mut self.registry,
-                &mut self.memory,
-                &mut self.tasks,
-                &mut self.regions,
-                self.process,
-                address_region,
-                memory_object,
-                args,
-                protection,
-                &mut self.cleanup,
-            )
+                crate::syscall::address_region_map_prepared_model(
+                    prepared,
+                    &mut publisher,
+                    &mut self.registry,
+                    &mut self.memory,
+                    &mut self.tasks,
+                    &mut self.regions,
+                    self.process,
+                    address_region,
+                    memory_object,
+                    args,
+                    protection,
+                    &mut self.cleanup,
+                )
+            })();
+            for candidate in candidates.into_iter().flatten() {
+                user.recycle_table_candidate(candidate);
+            }
+            user.select_process_for_return_validation(caller_process)
+                .unwrap_or_else(|error| {
+                    panic!("primordial map caller-root restoration failed: {error:?}")
+                });
+            match result {
+                Ok(address) => {
+                    user.commit_owned_output(output, &address.to_le_bytes())
+                        .unwrap_or_else(|_| panic!("primordial map output pin drifted"));
+                    DW_STATUS_SUCCESS
+                }
+                Err(status) => {
+                    user.discard_owned_output(output)
+                        .unwrap_or_else(|_| panic!("primordial map output pin drifted"));
+                    status
+                }
+            }
         })();
-        for candidate in candidates.into_iter().flatten() {
-            user.recycle_table_candidate(candidate);
-        }
-        user.select_process_for_return_validation(caller_process)
-            .unwrap_or_else(|error| {
-                panic!("primordial map caller-root restoration failed: {error:?}")
-            });
-        match result {
-            Ok(address) => {
-                user.commit_owned_output(output, &address.to_le_bytes())
-                    .unwrap_or_else(|_| panic!("primordial map output pin drifted"));
-                DW_STATUS_SUCCESS
-            }
-            Err(status) => {
-                user.discard_owned_output(output)
-                    .unwrap_or_else(|_| panic!("primordial map output pin drifted"));
-                status
-            }
-        }
+        self.commit_runtime_phase(phase);
+        status
     }
 
     fn unmap_memory(
@@ -2674,62 +2777,72 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         address: deepwyrm_abi::DwUserAddress,
         byte_len: u64,
     ) -> deepwyrm_abi::DwStatus {
-        let target = match crate::syscall::address_region_mutation_target(
-            &mut self.registry,
-            &self.tasks,
-            &self.regions,
-            self.process,
-            address_region,
-            deepwyrm_abi::DW_RIGHT_MODIFY,
-            &mut self.cleanup,
-        ) {
-            Ok(target) => target,
-            Err(status) => return status,
-        };
-        let caller_process = self.process;
-        let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
-        let mut user = self.active.current_process_address_space(
-            self.active_root.as_ref().expect("active root"),
-            self.process,
-        );
-        if user
-            .select_process_for_return_validation(target.process)
-            .is_err()
-        {
-            return DW_STATUS_BAD_STATE;
-        }
-        let status = {
-            let mut publisher = user
+        let phase = self.reserve_runtime_phase();
+        self.assert_guard_free_external_work();
+        let status = (|| {
+            let prepared = match crate::syscall::prepare_address_region_mutation(
+                &mut self.registry,
+                &self.tasks,
+                &self.regions,
+                self.process,
+                address_region,
+                deepwyrm_abi::DW_RIGHT_MODIFY,
+                &mut self.cleanup,
+            ) {
+                Ok(target) => target,
+                Err(status) => return status,
+            };
+            let target = prepared.target();
+            let caller_process = self.process;
+            let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
+            let mut user = self.active.current_process_address_space(
+                self.active_root.as_ref().expect("active root"),
+                self.process,
+            );
+            if user
+                .select_process_for_return_validation(target.process)
+                .is_err()
+            {
+                return DW_STATUS_BAD_STATE;
+            }
+            let status = {
+                let mut publisher = user
                 .publisher::<
                     PRIMORDIAL_TABLE_CANDIDATES,
                     PRIMORDIAL_JOURNAL_ENTRIES,
                     PRIMORDIAL_INVALIDATIONS,
                 >(target.address_space, target.region_key, &mut candidates)
                 .unwrap_or_else(|_| panic!("primordial unmap publisher unavailable"));
-            crate::syscall::address_region_unmap(
-                &mut publisher,
-                &mut self.registry,
-                &mut self.memory,
-                &mut self.tasks,
-                &mut self.regions,
-                self.process,
-                address_region,
-                address,
-                byte_len,
-                &mut self.cleanup,
-            )
-        };
-        for candidate in candidates.into_iter().flatten() {
-            user.recycle_table_candidate(candidate);
-        }
-        user.select_process_for_return_validation(caller_process)
-            .unwrap_or_else(|error| {
-                panic!("primordial unmap caller-root restoration failed: {error:?}")
-            });
+                crate::syscall::address_region_unmap_prepared(
+                    prepared,
+                    &mut publisher,
+                    &mut self.registry,
+                    &mut self.memory,
+                    &mut self.tasks,
+                    &mut self.regions,
+                    self.process,
+                    address_region,
+                    address,
+                    byte_len,
+                    &mut self.cleanup,
+                )
+            };
+            for candidate in candidates.into_iter().flatten() {
+                user.recycle_table_candidate(candidate);
+            }
+            user.select_process_for_return_validation(caller_process)
+                .unwrap_or_else(|error| {
+                    panic!("primordial unmap caller-root restoration failed: {error:?}")
+                });
+            status
+        })();
+        self.commit_runtime_phase(phase);
         status
     }
 
     fn exit_process(&mut self, exit_code: u32) -> NativeSyscallResult {
+        let phase = self.reserve_runtime_phase();
+        self.assert_guard_free_external_work();
         let mut discarded = None;
         let mut atomic_pin = None;
         let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
@@ -2776,7 +2889,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         let cleanup = self.services.take_cleanup();
         self.merge_cleanup(cleanup);
-        NativeSyscallResult { status, control }
+        let result = NativeSyscallResult { status, control };
+        self.commit_runtime_phase(phase);
+        result
     }
 
     fn terminate_process_handle(
@@ -2785,6 +2900,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         reason: deepwyrm_abi::DwTerminationReason,
         code: u32,
     ) -> NativeSyscallResult {
+        let phase = self.reserve_runtime_phase();
+        self.assert_guard_free_external_work();
         let mut discarded = None;
         let mut atomic_pin = None;
         let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
@@ -2841,7 +2958,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     .unwrap_or_else(|_| panic!("terminated inactive child teardown drifted"));
             }
         }
-        NativeSyscallResult { status, control }
+        let result = NativeSyscallResult { status, control };
+        self.commit_runtime_phase(phase);
+        result
     }
 
     fn terminate_thread_handle(
@@ -2850,6 +2969,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         reason: deepwyrm_abi::DwTerminationReason,
         code: u32,
     ) -> NativeSyscallResult {
+        let phase = self.reserve_runtime_phase();
+        self.assert_guard_free_external_work();
         let mut discarded = None;
         let mut atomic_pin = None;
         let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
@@ -2874,7 +2995,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             )
         };
         self.finish_terminal_adapter_resources(discarded, atomic_pin, control, deferred);
-        NativeSyscallResult { status, control }
+        let result = NativeSyscallResult { status, control };
+        self.commit_runtime_phase(phase);
+        result
     }
 
     fn finish_terminal_adapter_resources(

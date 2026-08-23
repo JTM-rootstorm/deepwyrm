@@ -1,6 +1,6 @@
 # DW0-I1 Kernel Execution Root Design
 
-**Status:** Approved D2 execution-root contract; implementation follows in the I1 runtime lane  
+**Status:** Implemented D2 foundation and BSP safe-point path; I1 carrier/AP execution join remains incomplete
 **Authority refined:** `DW0_H0_SMP_CONCURRENCY_CONTRACT.md` sections 5, 9, 10, and 12; `DW0_I0_ADDRESS_SPACE_ROOT_BINDING_DESIGN.md`
 
 ## Purpose
@@ -57,9 +57,19 @@ Running claim in H0 order, and consumes the move-only exact-safe witness to
 Release-publish acknowledgement.  Deferred Thread/root/stack reclamation
 remains forbidden until the initiator Acquire-observes that acknowledgement.
 
-No AP release is implied by this design.  e2 shootdown completion and the
-remaining I1 carrier publication gates must be complete before AP userspace
-execution is enabled.
+The BSP safe-point path now uses this root before releasing the stopped
+Process residency and Running claim, publishes the witness-only
+acknowledgement, clears its CPU-local retired continuation slot after ACK, and
+then either selects another Runnable Thread or idles on the retained kernel
+root. Late duplicate `HoldSafe` notifications remain on that root and do not
+return the stopped frame or publish a second acknowledgement. Pending completed
+syscall releases are transferred to the post-ACK continuation before the
+irreversible stop transition and finalized only there.
+
+No AP release, e2 shootdown completion, initiator/reclaim live gate, or
+idle-suspend stop completion is implied by this design. Those remaining carrier
+publication and delivery gates must be complete before AP userspace execution
+is enabled.
 
 ## Required evidence
 

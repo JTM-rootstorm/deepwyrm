@@ -27,18 +27,30 @@ callbacks remain reject-only. The BSP's primordial carrier references slot zero
 and checks its CPU identity, but it continues to own its active root and live
 adapter fields until the following split is complete.
 
+The first BSP adapter split now carries a move-only `RuntimePhaseReservation`
+from prepare through guard-free work and revalidates its exact `ThreadKey` and
+active-root binding generation before return. `map_memory` and `unmap_memory`
+also use a move-only `PreparedAddressRegionMutation`: lookup/reservation is
+complete before target-root selection and publisher work, and commit
+revalidates the exact process/region/address-space/region-key tuple. Terminal
+and remote-stop entry points assert that no stationary guard reached their
+external/reaper boundary. These reservations contain no user pointers, paging
+publisher, scratch session, or lock guard.
+
 The remaining required migration is intentionally explicit:
 
-1. `NativeSyscallHandler::handle` and `handle_fallthrough` currently need
-   Registry/Tasks/Regions/Spaces while they hold a live user-access object.
-   They must become validate/reserve -> usercopy -> short commit phases.
-2. `map_memory` and `unmap_memory` mix root publisher work with Registry,
-   Memory, Tasks, and Regions. Their table-candidate and output-pin flows need
-   explicit owned transactions before `PagingAuthority` can own the paging
-   side.
-3. terminal cleanup and remote-stop paths mix Tasks, Registry, F-service
-   state, and deferred cleanup. They require an exact reaper transaction before
-   either authority may be briefly acquired at its commit point.
+1. `NativeSyscallHandler::handle` and `handle_fallthrough` still borrow the
+   legacy BSP authority fields during each adapter call. F-service adapters
+   need per-operation owned prepare/commit payloads before `RuntimeCore` can
+   become their live owner.
+2. `map_memory` and `unmap_memory` now split delegated target preparation from
+   publisher commit, but the map-model and table-candidate transaction still
+   jointly borrow the legacy Registry/Memory/Tasks/Regions fields. It needs an
+   owned paging transaction before `PagingAuthority` can own that commit side.
+3. terminal cleanup and remote-stop paths have guard-free boundary checks, but
+   still mix Tasks, Registry, F-service state, and deferred cleanup. They need
+   an exact reaper transaction before either authority may be briefly acquired
+   at its commit point.
 
 No AP release, e2 acknowledgement, public ABI, or scheduler-policy change is
 implied by this foundation.

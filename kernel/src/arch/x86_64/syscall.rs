@@ -9,6 +9,9 @@ mod runtime_binding;
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 mod stationary_runtime;
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) use stationary_runtime::{RuntimePhaseReservation, StationaryGuardDepth};
+
 #[allow(
     unused_imports,
     reason = "E4 return validation is consumed by E5 mapping-aware syscall adapters and E7 userspace entry"

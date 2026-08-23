@@ -171,6 +171,89 @@ fn i1_bsp_scratch_is_usable_for_acpi_and_mmio_before_syscall_install() {
 }
 
 #[test]
+fn i1_native_adapter_phases_revalidate_exact_identity_after_guard_free_work() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let stationary = source("src/arch/x86_64/syscall/stationary_runtime.rs");
+
+    assert!(stationary.contains("struct RuntimePhaseReservation"));
+    assert!(stationary.contains("pub(crate) fn revalidate("));
+    assert!(stationary.contains("pub(crate) fn abort(self)"));
+    assert!(primordial.contains("prepare_address_region_mutation("));
+    assert!(primordial.contains("address_region_map_prepared_model("));
+    assert!(primordial.contains("address_region_unmap_prepared("));
+    assert!(primordial.contains("let phase = self.reserve_runtime_phase();"));
+    assert!(primordial.contains("self.assert_guard_free_external_work();"));
+    assert!(primordial.contains("self.commit_runtime_phase(phase);"));
+
+    let handle = primordial
+        .split_once("fn handle(&mut self, request: NativeSyscallRequest)")
+        .expect("native handler")
+        .1;
+    let reserve = handle
+        .find("let phase = self.reserve_runtime_phase();")
+        .unwrap();
+    let guard_free = handle
+        .find("self.assert_guard_free_external_work();")
+        .unwrap();
+    let commit = handle.find("self.commit_runtime_phase(phase);").unwrap();
+    assert!(reserve < guard_free && guard_free < commit);
+
+    for adapter in ["fn map_memory(", "fn unmap_memory(", "fn exit_process("] {
+        let adapter = primordial.split_once(adapter).expect("staged adapter").1;
+        let reserve = adapter
+            .find("let phase = self.reserve_runtime_phase();")
+            .unwrap();
+        let guard_free = adapter
+            .find("self.assert_guard_free_external_work();")
+            .unwrap();
+        let commit = adapter.find("self.commit_runtime_phase(phase);").unwrap();
+        assert!(reserve < guard_free && guard_free < commit, "{adapter}");
+    }
+
+    for external_boundary in ["fn precommit_exact_stop(", "fn rendezvous_stop("] {
+        let boundary = primordial
+            .split_once(external_boundary)
+            .expect("guard-free divergent boundary")
+            .1;
+        assert!(boundary.contains("self.assert_guard_free_external_work();"));
+    }
+}
+
+#[test]
+fn i1_post_ack_carrier_never_reuses_a_retired_frame_for_late_holdsafe() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let continuation = primordial
+        .split_once("fn continue_after_rendezvous_stop(&mut self) -> !")
+        .expect("post-ack carrier continuation")
+        .1;
+    assert!(continuation.contains("complete_switch_on(stopped_claim)"));
+    assert!(continuation.contains("self.drain_staged_rendezvous_cleanup();"));
+    assert!(continuation.contains("terminal_reaper_next_on(self.cpu)"));
+
+    let idle = primordial
+        .split_once("fn idle_after_rendezvous_stop(&mut self) -> !")
+        .expect("kernel-root idle path")
+        .1;
+    assert!(idle.contains("MailboxNotification::HoldSafe(_) => {"));
+    assert!(
+        idle.contains("no second\n                            // acknowledgement may be published")
+    );
+    assert!(!idle.contains("Stop(_)\n                        | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe"));
+
+    let precommit = primordial
+        .split_once("fn precommit_exact_stop(")
+        .expect("remote-stop precommit")
+        .1;
+    let stage = precommit
+        .find("self.stage_rendezvous_cleanup();")
+        .expect("cleanup staging");
+    let consume_reaper = precommit
+        .find("self\n            .rendezvous_reaper\n            .take()")
+        .expect("irreversible reaper witness consume");
+    assert!(stage < consume_reaper);
+}
+
+#[test]
 fn e5_live_user_pins_guard_actual_atomic_write_batches() {
     let access = source("src/arch/x86_64/mm/activation/user_access.rs");
     assert!(access.contains("self.target.pins"));
@@ -410,8 +493,9 @@ fn i1_stationary_foundation_keeps_authority_and_carrier_boundaries_explicit() {
             "missing stationary {authority}"
         );
     }
-    assert!(stationary.contains("RuntimeCore may not nest inside PagingAuthority"));
-    assert!(stationary.contains("RuntimeCore guard crossed a forbidden runtime boundary"));
+    assert!(stationary.contains("stationary authority nesting on CPU"));
+    assert!(stationary.contains("assert_clear_on"));
+    assert!(stationary.contains("prepare_on"));
     assert!(stationary.contains("ThreadServiceSlotError::StaleLease"));
     assert!(primordial.contains("struct PerCpuLiveCarrier"));
     assert!(primordial.contains("initialize_per_cpu_live_carriers"));

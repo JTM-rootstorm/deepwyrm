@@ -500,6 +500,38 @@ fn remote_stop_removes_only_the_exact_running_claim_without_replacement() {
 }
 
 #[test]
+fn remote_stop_continuation_clears_the_retired_slot_before_replacement_schedule() {
+    let scheduler = CooperativeScheduler::<4>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let stopped = thread_key(&mut registry);
+    let runnable = thread_key(&mut registry);
+    scheduler
+        .commit(scheduler.reserve(stopped).unwrap())
+        .unwrap();
+    scheduler
+        .commit(scheduler.reserve(runnable).unwrap())
+        .unwrap();
+    scheduler.schedule_next_on(cpu(1)).unwrap();
+    let claim = scheduler.running_claim_on(cpu(1)).unwrap();
+
+    scheduler.stop_running_claim_on(claim).unwrap();
+    assert_eq!(
+        scheduler.schedule_next_on(cpu(1)),
+        Err(SchedulerError::SwitchPending)
+    );
+    // This is the post-ACK carrier-only action: it abandons the stopped
+    // continuation without reintroducing its Running claim or reclaiming it.
+    scheduler.complete_switch_on(claim).unwrap();
+    assert_eq!(scheduler.suspended_claim_on(cpu(1)), None);
+    assert_eq!(
+        scheduler.schedule_next_on(cpu(1)).unwrap().current,
+        Some(runnable)
+    );
+    assert_eq!(scheduler.running_cpu(stopped), None);
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
 fn h4_remote_wake_and_terminal_retirement_never_revive_the_thread() {
     let mut registry = ObjectRegistry::<16>::new();
     for iteration in 0..2_000 {
