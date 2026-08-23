@@ -25,6 +25,12 @@ The root is therefore neither a synthetic portable address space nor a hidden
 primordial Process alias.  Its owner/root identity is architecture-private and
 distinct per CPU; no two live slots may share a PML4 or table-owner identity.
 
+Every Process binding also carries a registry-owned monotonically nonzero
+epoch. It is assigned only on successful binding publication, never reused
+after unbind/rebind, and is carried by prepared/active selection tokens. Stop
+publication derives its root generation only from that active token; counter
+exhaustion fails closed.
+
 ## Selection protocol
 
 `Process -> Kernel` first preflights the exact active Process selection and the

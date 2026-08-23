@@ -31,6 +31,7 @@ pub(crate) enum RootBindingError {
     CpuMismatch,
     Resident,
     MutationInFlight,
+    GenerationExhausted,
     FrameRole(FrameRoleError),
 }
 
@@ -265,6 +266,7 @@ struct RootBinding<const CPUS: usize> {
     identity: TableIdentity,
     storage: RootStorage,
     coherency: AddressSpaceCoherency<CPUS>,
+    generation: u64,
 }
 
 /// Bounded owner of every live user root on one architecture runtime.
@@ -275,6 +277,7 @@ struct RootBinding<const CPUS: usize> {
 pub(crate) struct AddressSpaceRootBindings<const SPACES: usize, const CPUS: usize> {
     entries: [Option<RootBinding<CPUS>>; SPACES],
     kernel_half: Option<KernelHalfBinding>,
+    next_binding_generation: u64,
 }
 
 impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CPUS> {
@@ -284,7 +287,17 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
         Self {
             entries: [const { None }; SPACES],
             kernel_half: None,
+            next_binding_generation: 1,
         }
+    }
+
+    fn mint_binding_generation(&mut self) -> Result<u64, RootBindingError> {
+        let generation = self.next_binding_generation;
+        if generation == 0 {
+            return Err(RootBindingError::GenerationExhausted);
+        }
+        self.next_binding_generation = generation.checked_add(1).unwrap_or(0);
+        Ok(generation)
     }
 
     pub(crate) fn install_kernel_half(
@@ -329,12 +342,14 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
             .validate_table_identity(identity)
             .map_err(RootBindingError::FrameRole)?;
         let slot = self.free_slot()?;
+        let generation = self.mint_binding_generation()?;
         self.entries[slot] = Some(RootBinding {
             address_space,
             process,
             identity,
             storage: RootStorage::Primordial,
             coherency: AddressSpaceCoherency::new(address_space),
+            generation,
         });
         Ok(())
     }
@@ -362,12 +377,17 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
             Ok(slot) => slot,
             Err(error) => return Err((error, root)),
         };
+        let generation = match self.mint_binding_generation() {
+            Ok(generation) => generation,
+            Err(error) => return Err((error, root)),
+        };
         self.entries[slot] = Some(RootBinding {
             address_space,
             process,
             identity,
             storage: RootStorage::Owned(root),
             coherency: AddressSpaceCoherency::new(address_space),
+            generation,
         });
         Ok(())
     }
@@ -408,7 +428,10 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
             return Err(RootBindingError::RootMismatch);
         }
         let binding = self.binding(active.process, active.address_space)?;
-        if binding.identity != active.identity || binding.identity.physical_start() != active.root {
+        if binding.identity != active.identity
+            || binding.identity.physical_start() != active.root
+            || binding.generation != active.binding_generation
+        {
             return Err(RootBindingError::RootMismatch);
         }
         binding
@@ -435,6 +458,7 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
             root: binding.identity.physical_start(),
             identity: binding.identity,
             residency,
+            binding_generation: binding.generation,
         })
     }
 
@@ -456,7 +480,9 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
                 return Err(RootBindingError::CpuMismatch);
             }
             let next = self.binding(prepared.process, prepared.address_space)?;
-            if next.identity != prepared.identity || next.identity.physical_start() != prepared.root
+            if next.identity != prepared.identity
+                || next.identity.physical_start() != prepared.root
+                || next.generation != prepared.binding_generation
             {
                 return Err(RootBindingError::RootMismatch);
             }
@@ -516,6 +542,7 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
             root: prepared.root,
             identity: prepared.identity,
             residency: prepared.residency,
+            binding_generation: prepared.binding_generation,
         })
     }
 
@@ -535,6 +562,7 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
             let binding = self.binding(previous.process, previous.address_space)?;
             if binding.identity != previous.identity
                 || binding.identity.physical_start() != previous.root
+                || binding.generation != previous.binding_generation
             {
                 return Err(RootBindingError::RootMismatch);
             }
@@ -583,6 +611,7 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
             let binding = self.binding(prepared.process, prepared.address_space)?;
             if binding.identity != prepared.identity
                 || binding.identity.physical_start() != prepared.root
+                || binding.generation != prepared.binding_generation
             {
                 return Err(RootBindingError::RootMismatch);
             }
@@ -605,6 +634,7 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
             root: prepared.root,
             identity: prepared.identity,
             residency: prepared.residency,
+            binding_generation: prepared.binding_generation,
         })
     }
 
@@ -796,6 +826,7 @@ pub(crate) struct PreparedRootSelection {
     root: u64,
     identity: TableIdentity,
     residency: Residency,
+    binding_generation: u64,
 }
 
 impl PreparedRootSelection {
@@ -837,6 +868,7 @@ pub(crate) struct ActiveRootSelection {
     root: u64,
     identity: TableIdentity,
     residency: Residency,
+    binding_generation: u64,
 }
 
 /// CPU-private token proving that this CPU is executing its retained kernel
@@ -911,6 +943,30 @@ impl ActiveRootSelection {
         self.identity
     }
 
+    pub(crate) const fn binding_generation(&self) -> u64 {
+        self.binding_generation
+    }
+
+    /// Derives a stop identity from the current active selection rather than
+    /// accepting a caller-supplied root epoch.
+    pub(crate) fn stop_identity(
+        &self,
+        cpu_online_generation: u64,
+        claim: crate::task::SchedulerExecutionClaim,
+    ) -> Result<
+        crate::arch::x86_64::rendezvous::StopIdentity,
+        crate::arch::x86_64::rendezvous::StopIdentityError,
+    > {
+        if claim.cpu() != self.cpu() {
+            return Err(crate::arch::x86_64::rendezvous::StopIdentityError::InvalidCpu);
+        }
+        crate::arch::x86_64::rendezvous::StopIdentity::from_scheduler_claim(
+            cpu_online_generation,
+            claim,
+            self.binding_generation,
+        )
+    }
+
     pub(crate) const fn cpu(&self) -> CpuIndex {
         self.residency.cpu()
     }
@@ -936,6 +992,7 @@ impl PreparedRootSelection {
             root: self.root,
             identity: self.identity,
             residency: self.residency,
+            binding_generation: self.binding_generation,
         }
     }
 }
