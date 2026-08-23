@@ -24,8 +24,8 @@ use deepwyrm_abi::{
     DW_STATUS_WRONG_OBJECT_TYPE, DW_TASK_STATE_EXITED, DW_TERMINATION_AUTHORIZED,
     DW_WAIT_MANY_MAX_ITEMS, DW_WAIT_MODE_ALL, DW_WAIT_MODE_ANY, DW_WAIT_RESULT_V1_SIZE,
     DwChannelReceiveResultV1, DwClockId, DwDeadline, DwHandle, DwHandleTransferV1,
-    DwProcessCreateResultV1, DwReceivedHandleInfoV1, DwRights, DwSignals, DwStatus,
-    DwTerminationReason, DwUserAddress, DwWaitItemV1, DwWaitResultV1,
+    DwProcessCreateArgsV1, DwProcessCreateResultV1, DwReceivedHandleInfoV1, DwRights, DwSignals,
+    DwStatus, DwTerminationReason, DwUserAddress, DwWaitItemV1, DwWaitResultV1,
 };
 
 use crate::handle::{
@@ -1141,6 +1141,56 @@ fn cancel_prepared_root_and_process<
     cancel_prepared_process(process, registry, tasks, cleanup);
 }
 
+#[must_use = "prepared process-create user input owns its output reservation"]
+struct PreparedProcessCreate<OUTPUT> {
+    args: DwProcessCreateArgsV1,
+    output: OUTPUT,
+}
+
+/// Copies and validates all caller-controlled process-create input before any
+/// stationary authority is reserved. The returned output reservation is owned
+/// rather than borrowed, so the later publication phase never retains a
+/// usercopy guard or pointer.
+fn prepare_process_create_input<U: UserPageAccess + OwnedUserOutputAccess>(
+    user: &mut U,
+    args_address: DwUserAddress,
+    args_size: u64,
+    out_result: DwUserAddress,
+    result_size: u64,
+) -> Result<PreparedProcessCreate<U::OwnedOutput>, DwStatus> {
+    if args_size != u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE)
+        || result_size != u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE)
+    {
+        return Err(DW_STATUS_INVALID_ARGUMENT);
+    }
+    let bytes = copy_input::<U, PROCESS_CREATE_ARGS_BYTES>(user, args_address, 8)?;
+    let args = decode_process_create_args(&bytes);
+    if args.size != DW_PROCESS_CREATE_ARGS_V1_SIZE
+        || args.version != 1
+        || args.flags != 0
+        || args.reserved != [0; 4]
+    {
+        return Err(DW_STATUS_INVALID_ARGUMENT);
+    }
+    for (object_type, rights) in [
+        (DW_OBJECT_TYPE_PROCESS, args.process_rights),
+        (DW_OBJECT_TYPE_ADDRESS_REGION, args.root_region_rights),
+        (DW_OBJECT_TYPE_CHANNEL, args.child_bootstrap_rights),
+    ] {
+        validate_created_handle_rights(object_type, rights)?;
+    }
+    let output_range = user_range(
+        out_result,
+        DW_PROCESS_CREATE_RESULT_V1_SIZE as usize,
+        8,
+        UserAccess::WRITE,
+    )?;
+    let output = user
+        .preflight_owned_output(output_range)
+        .map_err(|_| DW_STATUS_BAD_ADDRESS)?;
+    Ok(PreparedProcessCreate { args, output })
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the F10 observation barrier keeps independently-owned usercopy, object, task, HandleTable, and address-space authorities explicit"
@@ -1179,44 +1229,15 @@ fn process_create_transaction<
     mut rollback_root: B,
     mut inject: I,
 ) -> DwStatus {
-    if args_size != u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE)
-        || result_size != u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE)
-    {
-        return DW_STATUS_INVALID_ARGUMENT;
-    }
-    let bytes = match copy_input::<U, PROCESS_CREATE_ARGS_BYTES>(user, args_address, 8) {
-        Ok(bytes) => bytes,
-        Err(status) => return status,
-    };
-    let args = decode_process_create_args(&bytes);
-    if args.size != DW_PROCESS_CREATE_ARGS_V1_SIZE
-        || args.version != 1
-        || args.flags != 0
-        || args.reserved != [0; 4]
-    {
-        return DW_STATUS_INVALID_ARGUMENT;
-    }
-    for (object_type, rights) in [
-        (DW_OBJECT_TYPE_PROCESS, args.process_rights),
-        (DW_OBJECT_TYPE_ADDRESS_REGION, args.root_region_rights),
-        (DW_OBJECT_TYPE_CHANNEL, args.child_bootstrap_rights),
-    ] {
-        if let Err(status) = validate_created_handle_rights(object_type, rights) {
-            return status;
-        }
-    }
-    let output_range = match user_range(
+    let PreparedProcessCreate { args, output } = match prepare_process_create_input(
+        user,
+        args_address,
+        args_size,
         out_result,
-        DW_PROCESS_CREATE_RESULT_V1_SIZE as usize,
-        8,
-        UserAccess::WRITE,
+        result_size,
     ) {
-        Ok(range) => range,
+        Ok(prepared) => prepared,
         Err(status) => return status,
-    };
-    let output = match user.preflight_owned_output(output_range) {
-        Ok(output) => output,
-        Err(_) => return DW_STATUS_BAD_ADDRESS,
     };
 
     macro_rules! discard_and_return {
