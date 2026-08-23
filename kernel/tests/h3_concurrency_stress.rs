@@ -596,3 +596,1042 @@ fn h3c_scheduler_source_keeps_per_cpu_and_generation_contracts() {
     assert!(source.contains("entry.block_cpu == Some(key.cpu)"));
     assert!(!source.contains("static mut"));
 }
+
+// I2 extends the H3 model with the ownership edges that cannot be exercised
+// by the existing scheduler-only reference state.  This remains a host model:
+// the corresponding live evidence must come from the canonical four-vCPU
+// guest selector after I1.
+const I2_CPUS: usize = 4;
+const I2_SPACES: usize = 3;
+const I2_OBJECTS: usize = 3;
+const I2_PROCESSES: usize = 8;
+const I2_OPERATIONS_PER_SEED: usize = 768;
+const I2_SEEDS: [u64; 4] = [
+    0x4932_0000_cafe_0001,
+    0x4932_0000_cafe_0002,
+    0x4932_0000_cafe_0003,
+    0x4932_0000_cafe_0004,
+];
+const PM_TIMER_MODULUS: u32 = 1 << 24;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum I2Result {
+    Applied,
+    Rejected,
+    Noop,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum I2MappingMutation {
+    Map { object: usize, protection: u8 },
+    Protect { protection: u8 },
+    Unmap,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct I2PendingMutation {
+    generation: u64,
+    mutation: I2MappingMutation,
+    required_acks: u8,
+    received_acks: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct I2Space {
+    generation: u64,
+    owner: Option<usize>,
+    active: bool,
+    mapping: Option<(usize, u8)>,
+    mutation_generation: u64,
+    pending: Option<I2PendingMutation>,
+    resident: [bool; I2_CPUS],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum I2ObjectState {
+    Live,
+    Finalized,
+    Reclaimed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct I2Object {
+    generation: u64,
+    state: I2ObjectState,
+    mappings: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct I2Process {
+    generation: u64,
+    parent: Option<usize>,
+    active: bool,
+    space: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct I2Cpu {
+    space: Option<(usize, u64)>,
+    idle: bool,
+    wake_generation: u64,
+    timer_generation: u64,
+    timer_deadline: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum I2Operation {
+    Enter {
+        cpu: usize,
+        space: usize,
+    },
+    Leave {
+        cpu: usize,
+    },
+    Map {
+        space: usize,
+        object: usize,
+    },
+    Protect {
+        space: usize,
+        protection: u8,
+    },
+    Unmap {
+        space: usize,
+    },
+    Ack {
+        space: usize,
+        cpu: usize,
+        generation: u64,
+    },
+    FinalizeObject {
+        object: usize,
+    },
+    ReclaimObject {
+        object: usize,
+    },
+    TearDown {
+        space: usize,
+    },
+    CreateChild {
+        parent: usize,
+        slot: usize,
+    },
+    TrySiblingAuthority {
+        caller: usize,
+        target: usize,
+    },
+    ExitProcess {
+        process: usize,
+    },
+    Idle {
+        cpu: usize,
+    },
+    Wake {
+        cpu: usize,
+        generation: u64,
+    },
+    ArmTimer {
+        cpu: usize,
+        delta: u64,
+    },
+    FireTimer {
+        cpu: usize,
+        generation: u64,
+    },
+    Advance {
+        delta: u64,
+    },
+}
+
+impl Display for I2Operation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Enter { cpu, space } => write!(formatter, "enter(cpu={cpu},space={space})"),
+            Self::Leave { cpu } => write!(formatter, "leave(cpu={cpu})"),
+            Self::Map { space, object } => write!(formatter, "map(space={space},object={object})"),
+            Self::Protect { space, protection } => {
+                write!(formatter, "protect(space={space},protection={protection})")
+            }
+            Self::Unmap { space } => write!(formatter, "unmap(space={space})"),
+            Self::Ack {
+                space,
+                cpu,
+                generation,
+            } => write!(
+                formatter,
+                "ack(space={space},cpu={cpu},generation={generation})"
+            ),
+            Self::FinalizeObject { object } => {
+                write!(formatter, "finalize-object(object={object})")
+            }
+            Self::ReclaimObject { object } => write!(formatter, "reclaim-object(object={object})"),
+            Self::TearDown { space } => write!(formatter, "teardown(space={space})"),
+            Self::CreateChild { parent, slot } => {
+                write!(formatter, "create-child(parent={parent},slot={slot})")
+            }
+            Self::TrySiblingAuthority { caller, target } => {
+                write!(formatter, "try-authority(caller={caller},target={target})")
+            }
+            Self::ExitProcess { process } => write!(formatter, "exit-process(process={process})"),
+            Self::Idle { cpu } => write!(formatter, "idle(cpu={cpu})"),
+            Self::Wake { cpu, generation } => {
+                write!(formatter, "wake(cpu={cpu},generation={generation})")
+            }
+            Self::ArmTimer { cpu, delta } => {
+                write!(formatter, "arm-timer(cpu={cpu},delta={delta})")
+            }
+            Self::FireTimer { cpu, generation } => {
+                write!(formatter, "fire-timer(cpu={cpu},generation={generation})")
+            }
+            Self::Advance { delta } => write!(formatter, "advance(delta={delta})"),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct I2Context {
+    seed: u64,
+    operation: usize,
+    name: I2Operation,
+}
+
+impl I2Context {
+    fn failure(self, stage: &str, message: &str) -> String {
+        format!(
+            "seed={:#018x} operation={} stage={} {} ({})",
+            self.seed, self.operation, stage, self.name, message
+        )
+    }
+}
+
+struct I2Model {
+    spaces: [I2Space; I2_SPACES],
+    objects: [I2Object; I2_OBJECTS],
+    processes: [I2Process; I2_PROCESSES],
+    cpus: [I2Cpu; I2_CPUS],
+    now: u64,
+    pm_counter: u32,
+    pm_extended: u64,
+    pm_last_sample: u32,
+    pm_wraps: u64,
+}
+
+impl I2Model {
+    fn new() -> Self {
+        let spaces = std::array::from_fn(|index| I2Space {
+            generation: (index as u64) + 1,
+            owner: (index == 0).then_some(0),
+            active: true,
+            mapping: None,
+            mutation_generation: 1,
+            pending: None,
+            resident: [false; I2_CPUS],
+        });
+        let objects = std::array::from_fn(|index| I2Object {
+            generation: (index as u64) + 1,
+            state: I2ObjectState::Live,
+            mappings: 0,
+        });
+        let mut processes = std::array::from_fn(|index| I2Process {
+            generation: (index as u64) + 1,
+            parent: None,
+            active: false,
+            space: index % I2_SPACES,
+        });
+        processes[0].active = true;
+        Self {
+            spaces,
+            objects,
+            processes,
+            cpus: [I2Cpu {
+                space: None,
+                idle: true,
+                wake_generation: 1,
+                timer_generation: 1,
+                timer_deadline: None,
+            }; I2_CPUS],
+            now: 0,
+            pm_counter: PM_TIMER_MODULUS - 4,
+            pm_extended: u64::from(PM_TIMER_MODULUS - 4),
+            pm_last_sample: PM_TIMER_MODULUS - 4,
+            pm_wraps: 0,
+        }
+    }
+
+    fn mutation_mask(&self, space: usize, initiator: usize) -> u8 {
+        self.spaces[space]
+            .resident
+            .iter()
+            .enumerate()
+            .filter_map(|(cpu, resident)| (*resident && cpu != initiator).then_some(1_u8 << cpu))
+            .fold(0, |mask, bit| mask | bit)
+    }
+
+    fn begin_mutation(
+        &mut self,
+        space: usize,
+        mutation: I2MappingMutation,
+        initiator: usize,
+    ) -> I2Result {
+        if !self.spaces[space].active
+            || self.spaces[space].owner.is_none()
+            || self.spaces[space].pending.is_some()
+        {
+            return I2Result::Rejected;
+        }
+        if matches!(mutation, I2MappingMutation::Map { .. }) && self.spaces[space].mapping.is_some()
+        {
+            return I2Result::Rejected;
+        }
+        if let I2MappingMutation::Map { object, .. } = mutation
+            && self.objects[object].state != I2ObjectState::Live
+        {
+            return I2Result::Rejected;
+        }
+        if matches!(
+            mutation,
+            I2MappingMutation::Protect { .. } | I2MappingMutation::Unmap
+        ) && self.spaces[space].mapping.is_none()
+        {
+            return I2Result::Rejected;
+        }
+        let required_acks = self.mutation_mask(space, initiator);
+        self.spaces[space].pending = Some(I2PendingMutation {
+            generation: self.spaces[space].mutation_generation,
+            mutation,
+            required_acks,
+            received_acks: 0,
+        });
+        if required_acks == 0 {
+            self.commit_mutation(space);
+        }
+        I2Result::Applied
+    }
+
+    fn commit_mutation(&mut self, space: usize) {
+        let pending = self.spaces[space]
+            .pending
+            .take()
+            .expect("I2 mutation commit requires a pending mutation");
+        match pending.mutation {
+            I2MappingMutation::Map { object, protection } => {
+                self.spaces[space].mapping = Some((object, protection));
+                self.objects[object].mappings = self.objects[object]
+                    .mappings
+                    .checked_add(1)
+                    .expect("I2 object mapping count must not wrap");
+            }
+            I2MappingMutation::Protect { protection } => {
+                let mapping = self.spaces[space]
+                    .mapping
+                    .as_mut()
+                    .expect("I2 protect commit requires a mapping");
+                mapping.1 = protection;
+            }
+            I2MappingMutation::Unmap => {
+                let (object, _) = self.spaces[space]
+                    .mapping
+                    .take()
+                    .expect("I2 unmap commit requires a mapping");
+                self.objects[object].mappings = self.objects[object]
+                    .mappings
+                    .checked_sub(1)
+                    .expect("I2 object mapping count must not underflow");
+            }
+        }
+        self.spaces[space].mutation_generation = self.spaces[space]
+            .mutation_generation
+            .checked_add(1)
+            .expect("I2 mapping generation must not wrap");
+    }
+
+    fn acknowledge(&mut self, space: usize, cpu: usize, generation: u64) -> I2Result {
+        let Some(mut pending) = self.spaces[space].pending else {
+            return I2Result::Rejected;
+        };
+        if pending.generation != generation {
+            return I2Result::Rejected;
+        }
+        let bit = 1_u8 << cpu;
+        if pending.required_acks & bit == 0 || pending.received_acks & bit != 0 {
+            return I2Result::Rejected;
+        }
+        pending.received_acks |= bit;
+        let complete = pending.received_acks == pending.required_acks;
+        self.spaces[space].pending = Some(pending);
+        if complete {
+            self.commit_mutation(space);
+        }
+        I2Result::Applied
+    }
+
+    fn enter(&mut self, cpu: usize, space: usize) -> I2Result {
+        if !self.spaces[space].active
+            || self.spaces[space].owner.is_none()
+            || self.spaces[space].pending.is_some()
+        {
+            return I2Result::Rejected;
+        }
+        if self.cpus[cpu].space.is_some() {
+            return I2Result::Noop;
+        }
+        self.cpus[cpu].space = Some((space, self.spaces[space].generation));
+        self.cpus[cpu].idle = false;
+        self.spaces[space].resident[cpu] = true;
+        I2Result::Applied
+    }
+
+    fn leave(&mut self, cpu: usize) -> I2Result {
+        let Some((space, generation)) = self.cpus[cpu].space.take() else {
+            return I2Result::Noop;
+        };
+        if !self.spaces[space].active || self.spaces[space].generation != generation {
+            return I2Result::Rejected;
+        }
+        self.spaces[space].resident[cpu] = false;
+        I2Result::Applied
+    }
+
+    fn finalize_object(&mut self, object: usize) -> I2Result {
+        if self.objects[object].state != I2ObjectState::Live
+            || self.objects[object].mappings != 0
+            || self.spaces.iter().any(|space| {
+                space.pending.is_some_and(|pending| {
+                    matches!(
+                        pending.mutation,
+                        I2MappingMutation::Map { object: pending_object, .. }
+                            if pending_object == object
+                    )
+                })
+            })
+        {
+            return I2Result::Rejected;
+        }
+        self.objects[object].state = I2ObjectState::Finalized;
+        I2Result::Applied
+    }
+
+    fn reclaim_object(&mut self, object: usize) -> I2Result {
+        if self.objects[object].state != I2ObjectState::Finalized {
+            return I2Result::Rejected;
+        }
+        self.objects[object].state = I2ObjectState::Reclaimed;
+        self.objects[object].generation = self.objects[object]
+            .generation
+            .checked_add(1)
+            .expect("I2 object generation must not wrap");
+        I2Result::Applied
+    }
+
+    fn teardown(&mut self, space: usize) -> I2Result {
+        let record = &self.spaces[space];
+        if !record.active
+            || record.owner.is_some()
+            || record.pending.is_some()
+            || record.mapping.is_some()
+        {
+            return I2Result::Rejected;
+        }
+        if record.resident.iter().any(|resident| *resident) {
+            return I2Result::Rejected;
+        }
+        self.spaces[space].active = false;
+        self.spaces[space].generation = self.spaces[space]
+            .generation
+            .checked_add(1)
+            .expect("I2 space generation must not wrap");
+        I2Result::Applied
+    }
+
+    fn is_descendant(&self, ancestor: usize, candidate: usize) -> bool {
+        let mut current = Some(candidate);
+        while let Some(process) = current {
+            if process == ancestor {
+                return true;
+            }
+            current = self.processes[process].parent;
+        }
+        false
+    }
+
+    fn create_child(&mut self, parent: usize, slot: usize) -> I2Result {
+        if !self.processes[parent].active || self.processes[slot].active || parent == slot {
+            return I2Result::Rejected;
+        }
+        let Some(space) = self
+            .spaces
+            .iter()
+            .position(|record| record.active && record.owner.is_none())
+        else {
+            return I2Result::Noop;
+        };
+        self.processes[slot].active = true;
+        self.processes[slot].parent = Some(parent);
+        self.processes[slot].space = space;
+        self.processes[slot].generation = self.processes[slot]
+            .generation
+            .checked_add(1)
+            .expect("I2 process generation must not wrap");
+        self.spaces[space].owner = Some(slot);
+        I2Result::Applied
+    }
+
+    fn try_sibling_authority(&self, caller: usize, target: usize) -> I2Result {
+        if !self.processes[caller].active || !self.processes[target].active {
+            return I2Result::Rejected;
+        }
+        if self.is_descendant(caller, target) {
+            I2Result::Applied
+        } else {
+            I2Result::Rejected
+        }
+    }
+
+    fn exit_process(&mut self, process: usize) -> I2Result {
+        if !self.processes[process].active || process == 0 {
+            return I2Result::Rejected;
+        }
+        for index in 0..I2_PROCESSES {
+            if self.processes[index].active && self.is_descendant(process, index) {
+                let space = self.processes[index].space;
+                if self.spaces[space].resident.iter().any(|resident| *resident)
+                    || self.spaces[space].mapping.is_some()
+                    || self.spaces[space].pending.is_some()
+                {
+                    return I2Result::Rejected;
+                }
+            }
+        }
+        for index in 0..I2_PROCESSES {
+            if self.processes[index].active && self.is_descendant(process, index) {
+                self.spaces[self.processes[index].space].owner = None;
+                self.processes[index].active = false;
+            }
+        }
+        I2Result::Applied
+    }
+
+    fn idle(&mut self, cpu: usize) -> I2Result {
+        if self.cpus[cpu].space.is_some() || self.cpus[cpu].idle {
+            return I2Result::Noop;
+        }
+        self.cpus[cpu].idle = true;
+        I2Result::Applied
+    }
+
+    fn wake(&mut self, cpu: usize, generation: u64) -> I2Result {
+        if generation != self.cpus[cpu].wake_generation {
+            return I2Result::Rejected;
+        }
+        self.cpus[cpu].wake_generation = self.cpus[cpu]
+            .wake_generation
+            .checked_add(1)
+            .expect("I2 wake generation must not wrap");
+        self.cpus[cpu].idle = false;
+        I2Result::Applied
+    }
+
+    fn arm_timer(&mut self, cpu: usize, delta: u64) -> I2Result {
+        self.cpus[cpu].timer_generation = self.cpus[cpu]
+            .timer_generation
+            .checked_add(1)
+            .expect("I2 timer generation must not wrap");
+        self.cpus[cpu].timer_deadline = Some(
+            self.now
+                .checked_add(delta)
+                .expect("I2 timer deadline must not wrap"),
+        );
+        I2Result::Applied
+    }
+
+    fn fire_timer(&mut self, cpu: usize, generation: u64) -> I2Result {
+        if generation != self.cpus[cpu].timer_generation {
+            return I2Result::Rejected;
+        }
+        let Some(deadline) = self.cpus[cpu].timer_deadline else {
+            return I2Result::Noop;
+        };
+        if self.now < deadline {
+            return I2Result::Noop;
+        }
+        self.cpus[cpu].timer_deadline = None;
+        self.cpus[cpu].idle = false;
+        I2Result::Applied
+    }
+
+    fn advance(&mut self, delta: u64) -> I2Result {
+        if delta >= u64::from(PM_TIMER_MODULUS) {
+            return I2Result::Rejected;
+        }
+        self.now = self
+            .now
+            .checked_add(delta)
+            .expect("I2 monotonic clock must not wrap");
+        let previous_sample = self.pm_last_sample;
+        let next_sample = (u64::from(previous_sample) + delta) % u64::from(PM_TIMER_MODULUS);
+        let sampled_delta = if next_sample >= u64::from(previous_sample) {
+            next_sample - u64::from(previous_sample)
+        } else {
+            self.pm_wraps = self
+                .pm_wraps
+                .checked_add(1)
+                .expect("I2 PM wrap count must not wrap");
+            u64::from(PM_TIMER_MODULUS) - u64::from(previous_sample) + next_sample
+        };
+        self.pm_extended = self
+            .pm_extended
+            .checked_add(sampled_delta)
+            .expect("I2 PM extended counter must not wrap");
+        self.pm_counter = next_sample as u32;
+        self.pm_last_sample = self.pm_counter;
+        I2Result::Applied
+    }
+
+    fn apply(&mut self, operation: I2Operation) -> I2Result {
+        match operation {
+            I2Operation::Enter { cpu, space } => self.enter(cpu, space),
+            I2Operation::Leave { cpu } => self.leave(cpu),
+            I2Operation::Map { space, object } => self.begin_mutation(
+                space,
+                I2MappingMutation::Map {
+                    object,
+                    protection: 0b011,
+                },
+                0,
+            ),
+            I2Operation::Protect { space, protection } => {
+                self.begin_mutation(space, I2MappingMutation::Protect { protection }, 0)
+            }
+            I2Operation::Unmap { space } => self.begin_mutation(space, I2MappingMutation::Unmap, 0),
+            I2Operation::Ack {
+                space,
+                cpu,
+                generation,
+            } => self.acknowledge(space, cpu, generation),
+            I2Operation::FinalizeObject { object } => self.finalize_object(object),
+            I2Operation::ReclaimObject { object } => self.reclaim_object(object),
+            I2Operation::TearDown { space } => self.teardown(space),
+            I2Operation::CreateChild { parent, slot } => self.create_child(parent, slot),
+            I2Operation::TrySiblingAuthority { caller, target } => {
+                self.try_sibling_authority(caller, target)
+            }
+            I2Operation::ExitProcess { process } => self.exit_process(process),
+            I2Operation::Idle { cpu } => self.idle(cpu),
+            I2Operation::Wake { cpu, generation } => self.wake(cpu, generation),
+            I2Operation::ArmTimer { cpu, delta } => self.arm_timer(cpu, delta),
+            I2Operation::FireTimer { cpu, generation } => self.fire_timer(cpu, generation),
+            I2Operation::Advance { delta } => self.advance(delta),
+        }
+    }
+
+    fn assert_invariants(&self, context: I2Context) {
+        let fail = |stage: &str, message: &str| -> ! {
+            panic!("{}", context.failure(stage, message));
+        };
+
+        for (cpu, state) in self.cpus.iter().enumerate() {
+            if let Some((space, generation)) = state.space {
+                if !self.spaces[space].active || self.spaces[space].generation != generation {
+                    fail("residency", "CPU holds a stale address-space identity");
+                }
+                if !self.spaces[space].resident[cpu] {
+                    fail("residency", "CPU carrier is not published in the space");
+                }
+                if state.idle {
+                    fail("idle", "CPU is both resident and idle");
+                }
+            }
+            if state.timer_generation == 0 || state.wake_generation == 0 {
+                fail("timer", "CPU generation reached zero");
+            }
+        }
+
+        for (space_index, space) in self.spaces.iter().enumerate() {
+            let resident_count = space.resident.iter().filter(|resident| **resident).count();
+            let published_count = self
+                .cpus
+                .iter()
+                .filter(|cpu| {
+                    cpu.space.is_some_and(|(space_id, generation)| {
+                        space_id == space_index && generation == space.generation
+                    })
+                })
+                .count();
+            if resident_count != published_count {
+                fail("residency", "resident CPU set disagrees with CPU carriers");
+            }
+            if let Some(pending) = space.pending {
+                if pending.generation != space.mutation_generation {
+                    fail(
+                        "shootdown",
+                        "pending acknowledgement targets the wrong mutation generation",
+                    );
+                }
+                if pending.received_acks & !pending.required_acks != 0 {
+                    fail("shootdown", "acknowledgement arrived for a nonresident CPU");
+                }
+                if pending.received_acks == pending.required_acks {
+                    fail("shootdown", "completed shootdown remained published");
+                }
+            }
+            if !space.active
+                && (space.mapping.is_some()
+                    || space.pending.is_some()
+                    || space.resident.iter().any(|resident| *resident))
+            {
+                fail("teardown", "retired space retained live ownership");
+            }
+        }
+
+        let mut mapping_counts = [0_u8; I2_OBJECTS];
+        for space in &self.spaces {
+            if let Some((object, _)) = space.mapping {
+                mapping_counts[object] = mapping_counts[object]
+                    .checked_add(1)
+                    .unwrap_or_else(|| fail("memory-object", "mapping count overflowed"));
+                if self.objects[object].state != I2ObjectState::Live {
+                    fail("memory-object", "non-live object remains mapped");
+                }
+            }
+            if let Some(I2PendingMutation {
+                mutation: I2MappingMutation::Map { object, .. },
+                ..
+            }) = space.pending
+                && self.objects[object].state != I2ObjectState::Live
+            {
+                fail("memory-object", "finalization raced a pending map");
+            }
+        }
+        for (object, state) in self.objects.iter().enumerate() {
+            if state.mappings != mapping_counts[object] {
+                fail(
+                    "memory-object",
+                    "object mapping count disagrees with spaces",
+                );
+            }
+            if state.state != I2ObjectState::Live && state.mappings != 0 {
+                fail("memory-object", "finalized object still has mappings");
+            }
+        }
+
+        for (process, record) in self.processes.iter().enumerate() {
+            if record.active {
+                if !self.spaces[record.space].active
+                    || self.spaces[record.space].owner != Some(process)
+                {
+                    fail(
+                        "subtree",
+                        "active process does not own an active address space",
+                    );
+                }
+                if let Some(parent) = record.parent
+                    && (!self.processes[parent].active || parent == process)
+                {
+                    fail("subtree", "active process has an invalid parent");
+                }
+            }
+            let mut current = record.parent;
+            for _ in 0..I2_PROCESSES {
+                if current == Some(process) {
+                    fail("subtree", "process hierarchy contains a cycle");
+                }
+                current = current.and_then(|parent| self.processes[parent].parent);
+            }
+        }
+        for (space, record) in self.spaces.iter().enumerate() {
+            if let Some(owner) = record.owner
+                && (!self.processes[owner].active || self.processes[owner].space != space)
+            {
+                fail("subtree", "address-space owner is stale or mismatched");
+            }
+        }
+
+        if self.pm_counter >= PM_TIMER_MODULUS || self.pm_last_sample >= PM_TIMER_MODULUS {
+            fail("pm-timer", "counter escaped the 24-bit hardware range");
+        }
+        if self.pm_counter != self.pm_last_sample {
+            fail(
+                "pm-timer",
+                "stored PM counter differs from the last raw sample",
+            );
+        }
+        let expected_extended = self
+            .pm_wraps
+            .checked_mul(u64::from(PM_TIMER_MODULUS))
+            .and_then(|value| value.checked_add(u64::from(self.pm_counter)))
+            .unwrap_or_else(|| fail("pm-timer", "extended counter overflowed"));
+        if self.pm_extended != expected_extended {
+            fail(
+                "pm-timer",
+                "maintenance extension disagrees with sampled counter",
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct I2Rng(u64);
+
+impl I2Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn bounded(&mut self, upper: usize) -> usize {
+        (self.next() as usize) % upper
+    }
+
+    fn operation(&mut self, model: &I2Model) -> I2Operation {
+        match self.bounded(18) {
+            0 => I2Operation::Enter {
+                cpu: self.bounded(I2_CPUS),
+                space: self.bounded(I2_SPACES),
+            },
+            1 => I2Operation::Leave {
+                cpu: self.bounded(I2_CPUS),
+            },
+            2 => I2Operation::Map {
+                space: self.bounded(I2_SPACES),
+                object: self.bounded(I2_OBJECTS),
+            },
+            3 => I2Operation::Protect {
+                space: self.bounded(I2_SPACES),
+                protection: 1 + self.bounded(7) as u8,
+            },
+            4 => I2Operation::Unmap {
+                space: self.bounded(I2_SPACES),
+            },
+            5 | 6 => {
+                let space = self.bounded(I2_SPACES);
+                let generation = if self.next() & 1 == 0 {
+                    model.spaces[space].mutation_generation
+                } else {
+                    model.spaces[space].mutation_generation.saturating_sub(1)
+                };
+                I2Operation::Ack {
+                    space,
+                    cpu: self.bounded(I2_CPUS),
+                    generation,
+                }
+            }
+            7 => I2Operation::FinalizeObject {
+                object: self.bounded(I2_OBJECTS),
+            },
+            8 => I2Operation::ReclaimObject {
+                object: self.bounded(I2_OBJECTS),
+            },
+            9 => I2Operation::TearDown {
+                space: self.bounded(I2_SPACES),
+            },
+            10 => I2Operation::CreateChild {
+                parent: self.bounded(I2_PROCESSES),
+                slot: self.bounded(I2_PROCESSES),
+            },
+            11 => I2Operation::TrySiblingAuthority {
+                caller: self.bounded(I2_PROCESSES),
+                target: self.bounded(I2_PROCESSES),
+            },
+            12 => I2Operation::ExitProcess {
+                process: 1 + self.bounded(I2_PROCESSES - 1),
+            },
+            13 => I2Operation::Idle {
+                cpu: self.bounded(I2_CPUS),
+            },
+            14 => {
+                let cpu = self.bounded(I2_CPUS);
+                let generation = model.cpus[cpu].wake_generation;
+                I2Operation::Wake { cpu, generation }
+            }
+            15 => I2Operation::ArmTimer {
+                cpu: self.bounded(I2_CPUS),
+                delta: 1 + self.next() % 31,
+            },
+            16 => {
+                let cpu = self.bounded(I2_CPUS);
+                let generation = model.cpus[cpu].timer_generation;
+                I2Operation::FireTimer { cpu, generation }
+            }
+            _ => I2Operation::Advance {
+                delta: 1 + self.next() % 0x20_0000,
+            },
+        }
+    }
+}
+
+#[test]
+fn i2_deterministic_mapping_authority_and_idle_stress_preserves_ownership() {
+    for seed in I2_SEEDS {
+        let mut model = I2Model::new();
+        let mut rng = I2Rng(seed);
+        let prefix = [
+            I2Operation::Enter { cpu: 0, space: 0 },
+            I2Operation::Enter { cpu: 1, space: 0 },
+            I2Operation::Map {
+                space: 0,
+                object: 0,
+            },
+            I2Operation::Ack {
+                space: 0,
+                cpu: 1,
+                generation: 1,
+            },
+            I2Operation::Protect {
+                space: 0,
+                protection: 0b101,
+            },
+            I2Operation::Ack {
+                space: 0,
+                cpu: 1,
+                generation: 1,
+            },
+            I2Operation::Ack {
+                space: 0,
+                cpu: 1,
+                generation: 2,
+            },
+            I2Operation::FinalizeObject { object: 0 },
+            I2Operation::Unmap { space: 0 },
+            I2Operation::Ack {
+                space: 0,
+                cpu: 1,
+                generation: 2,
+            },
+            I2Operation::Ack {
+                space: 0,
+                cpu: 1,
+                generation: 3,
+            },
+            I2Operation::FinalizeObject { object: 0 },
+            I2Operation::ReclaimObject { object: 0 },
+            I2Operation::Leave { cpu: 0 },
+            I2Operation::Leave { cpu: 1 },
+            I2Operation::TearDown { space: 0 },
+            I2Operation::CreateChild { parent: 0, slot: 1 },
+            I2Operation::CreateChild { parent: 1, slot: 2 },
+            I2Operation::TrySiblingAuthority {
+                caller: 2,
+                target: 1,
+            },
+            I2Operation::TrySiblingAuthority {
+                caller: 1,
+                target: 2,
+            },
+            I2Operation::TearDown { space: 1 },
+            I2Operation::ExitProcess { process: 1 },
+            I2Operation::TearDown { space: 1 },
+            I2Operation::TearDown { space: 2 },
+            I2Operation::Idle { cpu: 0 },
+            I2Operation::Wake {
+                cpu: 0,
+                generation: 1,
+            },
+            I2Operation::Wake {
+                cpu: 0,
+                generation: 1,
+            },
+            I2Operation::ArmTimer { cpu: 0, delta: 7 },
+            I2Operation::FireTimer {
+                cpu: 0,
+                generation: 1,
+            },
+            I2Operation::Advance { delta: 7 },
+            I2Operation::FireTimer {
+                cpu: 0,
+                generation: 2,
+            },
+            I2Operation::Idle { cpu: 0 },
+            I2Operation::Wake {
+                cpu: 0,
+                generation: 2,
+            },
+            I2Operation::ArmTimer { cpu: 0, delta: 3 },
+            I2Operation::FireTimer {
+                cpu: 0,
+                generation: 2,
+            },
+            I2Operation::Advance { delta: 3 },
+            I2Operation::FireTimer {
+                cpu: 0,
+                generation: 3,
+            },
+        ];
+        for (operation_index, operation) in prefix.into_iter().enumerate() {
+            let context = I2Context {
+                seed,
+                operation: operation_index,
+                name: operation,
+            };
+            let result = model.apply(operation);
+            let expected = match operation_index {
+                5 | 7 | 9 | 15 | 18 | 20 | 26 | 28 | 34 => I2Result::Rejected,
+                _ => I2Result::Applied,
+            };
+            assert_eq!(
+                result,
+                expected,
+                "{} stage=expected-prefix",
+                context.failure("expected-prefix", "operation result diverged")
+            );
+            assert!(
+                matches!(
+                    result,
+                    I2Result::Applied | I2Result::Rejected | I2Result::Noop
+                ),
+                "{} stage=apply returned an unknown result",
+                context.failure("apply", "invalid result")
+            );
+            model.assert_invariants(context);
+            if operation_index == 6 {
+                assert_eq!(
+                    model.spaces[0].mapping,
+                    Some((0, 0b101)),
+                    "{} stage=protect-commit mapping protection was not published",
+                    context.failure("protect-commit", "protection update missing")
+                );
+            }
+        }
+
+        let mut applied = 0_usize;
+        let mut rejected = 0_usize;
+        let mut noop = 0_usize;
+        for operation_index in prefix.len()..(prefix.len() + I2_OPERATIONS_PER_SEED) {
+            let operation = rng.operation(&model);
+            let context = I2Context {
+                seed,
+                operation: operation_index,
+                name: operation,
+            };
+            let result = model.apply(operation);
+            match result {
+                I2Result::Applied => applied += 1,
+                I2Result::Rejected => rejected += 1,
+                I2Result::Noop => noop += 1,
+            }
+            model.assert_invariants(context);
+        }
+
+        assert!(
+            applied > 100,
+            "seed={seed:#018x} operation={} stage=coverage applied outcomes were not exercised: {applied}",
+            prefix.len() + I2_OPERATIONS_PER_SEED
+        );
+        assert!(
+            rejected > 100,
+            "seed={seed:#018x} operation={} stage=coverage rejected outcomes were not exercised: {rejected}",
+            prefix.len() + I2_OPERATIONS_PER_SEED
+        );
+        assert!(
+            noop > 10,
+            "seed={seed:#018x} operation={} stage=coverage noop outcomes were not exercised: {noop}",
+            prefix.len() + I2_OPERATIONS_PER_SEED
+        );
+        assert!(
+            model.pm_wraps > 0,
+            "seed={seed:#018x} operation={} stage=pm-timer no counter wrap was exercised",
+            prefix.len() + I2_OPERATIONS_PER_SEED
+        );
+    }
+}
