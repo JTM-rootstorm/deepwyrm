@@ -55,7 +55,22 @@ const WAITERS: usize = 4;
 const TASK_GROUPS: usize = 1;
 const PROCESSES: usize = USERSPACE_CHAIN_PROCESSES;
 const THREADS: usize = USERSPACE_CHAIN_PROCESSES;
-const HANDLES: usize = 8;
+// Exact live bootstrap peak per Process: four inherited handles, one net
+// ChannelCreate/rights-reduction result, Process+root, and Thread fill eight
+// slots; the two reduced-right duplicates needed before the three-handle INIT
+// move raise the pre-transfer peak to ten.
+const INITIAL_BOOTSTRAP_HANDLES: usize = 4;
+const CHANNEL_CREATE_REDUCE_NET_HANDLES: usize = 1;
+const PROCESS_ROOT_HANDLES: usize = 2;
+const THREAD_HANDLES: usize = 1;
+const INIT_DUPLICATE_HANDLES: usize = 2;
+const INIT_MOVED_HANDLES: usize = 3;
+const BOOTSTRAP_HANDLE_PEAK: usize = INITIAL_BOOTSTRAP_HANDLES
+    + CHANNEL_CREATE_REDUCE_NET_HANDLES
+    + PROCESS_ROOT_HANDLES
+    + THREAD_HANDLES
+    + INIT_DUPLICATE_HANDLES;
+const HANDLES: usize = BOOTSTRAP_HANDLE_PEAK;
 const SPACES: usize = USERSPACE_CHAIN_PROCESSES;
 const REGIONS: usize = USERSPACE_CHAIN_PROCESSES;
 const REGION_OBJECTS: usize = USERSPACE_CHAIN_PROCESSES;
@@ -78,6 +93,8 @@ const _: [(); PROCESSES] = [(); SPACES];
 const _: [(); PROCESSES] = [(); REGIONS];
 const _: [(); PROCESSES] = [(); REGION_OBJECTS];
 const _: [(); PROCESSES] = [(); EXECUTION_THREADS];
+const _: [(); 10] = [(); HANDLES];
+const _: [(); 7] = [(); BOOTSTRAP_HANDLE_PEAK - INIT_MOVED_HANDLES];
 
 #[cfg(feature = "test-support")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

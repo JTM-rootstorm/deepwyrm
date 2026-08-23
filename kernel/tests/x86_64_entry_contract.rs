@@ -490,6 +490,76 @@ fn g5_terminal_completion_drains_all_primordial_authority_before_capacity_proof(
 }
 
 #[test]
+fn i0_live_handle_capacity_covers_both_init_duplicates_before_three_moves() {
+    fn claim(live: &mut usize, capacity: usize, count: usize) -> bool {
+        let Some(next) = live.checked_add(count) else {
+            return false;
+        };
+        if next > capacity {
+            return false;
+        }
+        *live = next;
+        true
+    }
+
+    fn move_out(live: &mut usize, count: usize) -> bool {
+        let Some(next) = live.checked_sub(count) else {
+            return false;
+        };
+        *live = next;
+        true
+    }
+
+    fn occupancy_before_init_duplicates(capacity: usize) -> usize {
+        let mut live = 0;
+        for count in [4, 1, 2, 1] {
+            assert!(claim(&mut live, capacity, count));
+        }
+        live
+    }
+
+    let primordial =
+        fs::read_to_string(kernel_root().join("src/arch/x86_64/mm/activation/primordial.rs"))
+            .expect("read I0 primordial runtime source");
+    let normalized_primordial = primordial.split_whitespace().collect::<Vec<_>>().join(" ");
+    for required in [
+        "const INITIAL_BOOTSTRAP_HANDLES: usize = 4;",
+        "const CHANNEL_CREATE_REDUCE_NET_HANDLES: usize = 1;",
+        "const PROCESS_ROOT_HANDLES: usize = 2;",
+        "const THREAD_HANDLES: usize = 1;",
+        "const INIT_DUPLICATE_HANDLES: usize = 2;",
+        "const INIT_MOVED_HANDLES: usize = 3;",
+        "const HANDLES: usize = BOOTSTRAP_HANDLE_PEAK;",
+        "const _: [(); 10] = [(); HANDLES];",
+        "const _: [(); 7] = [(); BOOTSTRAP_HANDLE_PEAK - INIT_MOVED_HANDLES];",
+    ] {
+        assert!(
+            primordial.contains(required),
+            "live handle-capacity contract omitted {required}"
+        );
+    }
+    assert!(normalized_primordial.contains(
+        "const BOOTSTRAP_HANDLE_PEAK: usize = INITIAL_BOOTSTRAP_HANDLES + \
+         CHANNEL_CREATE_REDUCE_NET_HANDLES + PROCESS_ROOT_HANDLES + THREAD_HANDLES + \
+         INIT_DUPLICATE_HANDLES;"
+    ));
+
+    let mut old_capacity = occupancy_before_init_duplicates(8);
+    assert_eq!(old_capacity, 8);
+    assert!(!claim(&mut old_capacity, 8, 1));
+    assert_eq!(old_capacity, 8, "failed duplicate must not overclaim");
+
+    let mut chosen_capacity = occupancy_before_init_duplicates(10);
+    assert!(claim(&mut chosen_capacity, 10, 1));
+    assert!(claim(&mut chosen_capacity, 10, 1));
+    assert_eq!(chosen_capacity, 10);
+    assert!(!claim(&mut chosen_capacity, 10, 1));
+    assert_eq!(chosen_capacity, 10, "full table must not overclaim");
+    assert!(move_out(&mut chosen_capacity, 3));
+    assert_eq!(chosen_capacity, 7);
+}
+
+#[test]
 fn e7_user_contract_uses_generated_syscall_veneer_and_generated_abi_values() {
     let source = fs::read_to_string(kernel_root().join("tests/userspace/e7_task_smoke.S"))
         .expect("read E7 userspace source");
