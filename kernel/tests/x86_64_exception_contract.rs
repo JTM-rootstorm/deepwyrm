@@ -263,7 +263,7 @@ fn daybreak_time_init_faults_before_first_irreversible_effect_and_never_advertis
         .find("TIME_STATE.store(TimeInitState::Faulted as u8, Ordering::Release);")
         .unwrap();
     let commit = live
-        .find("let state = commit_initialize(active, pm_descriptor, plan)?;")
+        .find("let committed = commit_initialize(active, pm_descriptor, plan)?;")
         .unwrap();
     assert!(prepare < fault && fault < commit);
     let commit_body = live.split_once("fn commit_initialize").unwrap().1;
