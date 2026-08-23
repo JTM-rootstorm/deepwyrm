@@ -319,6 +319,13 @@ fn emit_record<P: PortIo>(
 }
 
 /// Emits the bounded H1 CPU identity/lifecycle record used by live SMP gates.
+#[cfg_attr(
+    all(feature = "test-support", target_os = "none"),
+    allow(
+        dead_code,
+        reason = "production CPU lifecycle diagnostics are omitted from test images"
+    )
+)]
 fn emit_cpu_state_record<P: PortIo>(
     serial: &mut Com1<P>,
     cpu_index: usize,

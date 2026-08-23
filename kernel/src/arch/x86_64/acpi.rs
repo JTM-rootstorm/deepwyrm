@@ -81,6 +81,7 @@ impl CpuTopologyEntry {
         self.local_apic_id
     }
 
+    #[cfg(test)]
     pub(crate) const fn acpi_processor_uid(self) -> u8 {
         self.acpi_processor_uid
     }
@@ -99,6 +100,7 @@ impl CpuTopology {
         self.local_apic_physical_address
     }
 
+    #[cfg(test)]
     pub(crate) const fn pc_at_compatible(self) -> bool {
         self.pc_at_compatible
     }
@@ -107,6 +109,7 @@ impl CpuTopology {
         self.len
     }
 
+    #[cfg(test)]
     pub(crate) const fn is_empty(self) -> bool {
         self.len == 0
     }
