@@ -173,6 +173,10 @@ pub(crate) enum EntryBindingError {
 /// implementation must diverge without entering userspace or mutably accessing
 /// shared runtime state. Its backing storage must remain pinned and unavailable
 /// to safe Rust after publication.
+#[allow(
+    unsafe_code,
+    reason = "the marker makes the fail-closed callback and sealed static-storage obligations explicit at each implementation"
+)]
 pub(crate) unsafe trait ParkedNativeRuntimeCarrier:
     crate::syscall::native::NativeSyscallFrameRuntime
 {
@@ -736,6 +740,10 @@ fn runtime_binding() -> Option<RuntimeBindingState> {
     Some(unsafe { (*storage.0.get()).assume_init() })
 }
 
+#[allow(
+    unsafe_code,
+    reason = "the current CPU exclusively stages one Copy terminal action before Release publication to its GS-selected reaper"
+)]
 fn stage_terminal_action(action: TerminalAction) -> Result<(), ()> {
     let cpu_index = current_cpu_index_for_diagnostics().ok_or(())?;
     let state = TERMINAL_ACTION_STATE.get(cpu_index).ok_or(())?;
