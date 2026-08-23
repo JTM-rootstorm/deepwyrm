@@ -675,11 +675,14 @@ fn validate_terminal_reaper_handoff(disassembly: &str) {
     let body = function_body(disassembly, "dw_x86_64_terminal_reaper_handoff");
     let required = [
         "\tcli",
-        "\tlea\trsp, [rip + ",
-        "<__dw_terminal_reaper_stack_top>",
+        "\tmov\tecx, 0xc0000101",
+        "\trdmsr",
+        "\tmov\tecx, 0xc0000102",
+        "\trdmsr",
+        "\tmov\trsp, qword ptr [rax + 0x30]",
         "\tand\trsp, -0x10",
         "\txor\trbp, rbp",
-        "\tcall\trsi",
+        "\tcall\tr9",
         "\tud2",
     ];
     let mut offset = 0;
@@ -807,7 +810,7 @@ fn terminal_reaper_handoff_ends_the_retired_stack_graph() {
         bytes: 16,
         symbol: "root".to_owned(),
     }];
-    let disassembly = "Disassembly of section .text:\n\n0000 <root>:\n  0:\tcall\t0x10 <dw_x86_64_terminal_reaper_handoff>\n\n0010 <dw_x86_64_terminal_reaper_handoff>:\n 10:\tcli\n 11:\tlea\trsp, [rip + 0x20] # 0x1000 <__dw_terminal_reaper_stack_top>\n 18:\tand\trsp, -0x10\n 1c:\txor\trbp, rbp\n 1f:\tcall\trsi\n 21:\tud2\n";
+    let disassembly = "Disassembly of section .text:\n\n0000 <root>:\n  0:\tcall\t0x10 <dw_x86_64_terminal_reaper_handoff>\n\n0010 <dw_x86_64_terminal_reaper_handoff>:\n 10:\tcli\n 11:\tmov\tecx, 0xc0000101\n 16:\trdmsr\n 18:\tmov\tecx, 0xc0000102\n 1d:\trdmsr\n 1f:\tmov\trsp, qword ptr [rax + 0x30]\n 24:\tand\trsp, -0x10\n 28:\txor\trbp, rbp\n 2b:\tcall\tr9\n 2e:\tud2\n";
     assert_eq!(
         direct_call_stack_bound(&sizes, disassembly, "terminal pivot", |symbol| {
             symbol == "root"
@@ -1027,7 +1030,7 @@ fn resolved_old_stack_edge_stops_at_the_audited_terminal_reaper_pivot() {
             symbol: "unused-selector-target".to_owned(),
         },
     ];
-    let disassembly = "Disassembly of section .text:\n\n0000 <old-stack-root>:\n  0:\tcall\trax\n\n0010 <dw_x86_64_terminal_reaper_handoff>:\n 10:\tcli\n 11:\tlea\trsp, [rip + 0x20] # 0x1000 <__dw_terminal_reaper_stack_top>\n 18:\tand\trsp, -0x10\n 1c:\txor\trbp, rbp\n 1f:\tcall\trsi\n 21:\tud2\n\n0030 <unused-selector-target>:\n";
+    let disassembly = "Disassembly of section .text:\n\n0000 <old-stack-root>:\n  0:\tcall\trax\n\n0010 <dw_x86_64_terminal_reaper_handoff>:\n 10:\tcli\n 11:\tmov\tecx, 0xc0000101\n 16:\trdmsr\n 18:\tmov\tecx, 0xc0000102\n 1d:\trdmsr\n 1f:\tmov\trsp, qword ptr [rax + 0x30]\n 24:\tand\trsp, -0x10\n 28:\txor\trbp, rbp\n 2b:\tcall\tr9\n 2e:\tud2\n\n0030 <unused-selector-target>:\n";
     let resolutions = BTreeMap::from([
         (
             "old-stack-root".to_owned(),

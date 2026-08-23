@@ -619,6 +619,289 @@ mod runtime_cpu_stack_tests {
     }
 }
 
+/// Publication lifecycle for one bounded runtime-CPU descriptor slot.
+///
+/// `DescriptorsActive` means that the current CPU has loaded its private
+/// GDT/TSS/IDT. `Online` is published only after that CPU has also installed
+/// its private GS-selected SYSCALL entry state. The scheduler remains BSP-only
+/// until H2 gives runtime execution carriers matching multi-CPU ownership.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+#[cfg_attr(
+    not(any(test, all(target_os = "none", target_arch = "x86_64"))),
+    allow(
+        dead_code,
+        reason = "runtime descriptor publication is target-owned and host-tested"
+    )
+)]
+pub(crate) enum RuntimeCpuDescriptorLifecycle {
+    Vacant = 0,
+    Building = 1,
+    DescriptorsActive = 2,
+    Online = 3,
+    Failed = 4,
+}
+
+impl RuntimeCpuDescriptorLifecycle {
+    #[cfg_attr(
+        not(any(test, all(target_os = "none", target_arch = "x86_64"))),
+        allow(
+            dead_code,
+            reason = "runtime descriptor publication is target-owned and host-tested"
+        )
+    )]
+    const fn from_bits(bits: u8) -> Option<Self> {
+        match bits {
+            0 => Some(Self::Vacant),
+            1 => Some(Self::Building),
+            2 => Some(Self::DescriptorsActive),
+            3 => Some(Self::Online),
+            4 => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod runtime_cpu_descriptor_state_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_descriptor_publication_states_have_stable_bounded_encoding() {
+        let expected = [
+            RuntimeCpuDescriptorLifecycle::Vacant,
+            RuntimeCpuDescriptorLifecycle::Building,
+            RuntimeCpuDescriptorLifecycle::DescriptorsActive,
+            RuntimeCpuDescriptorLifecycle::Online,
+            RuntimeCpuDescriptorLifecycle::Failed,
+        ];
+        for (bits, state) in expected.into_iter().enumerate() {
+            assert_eq!(
+                RuntimeCpuDescriptorLifecycle::from_bits(bits as u8),
+                Some(state)
+            );
+        }
+        assert_eq!(RuntimeCpuDescriptorLifecycle::from_bits(5), None);
+        assert_eq!(RuntimeCpuDescriptorLifecycle::from_bits(u8::MAX), None);
+    }
+}
+
+/// Target-owned private descriptor objects for one runtime CPU.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+struct RuntimeCpuDescriptorSlot {
+    lifecycle: AtomicU8,
+    tss: UnsafeCell<MaybeUninit<TaskStateSegment>>,
+    gdt: UnsafeCell<MaybeUninit<GlobalDescriptorTable>>,
+    idt: UnsafeCell<MaybeUninit<InterruptDescriptorTable>>,
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+impl RuntimeCpuDescriptorSlot {
+    const fn vacant() -> Self {
+        Self {
+            lifecycle: AtomicU8::new(RuntimeCpuDescriptorLifecycle::Vacant as u8),
+            tss: UnsafeCell::new(MaybeUninit::uninit()),
+            gdt: UnsafeCell::new(MaybeUninit::uninit()),
+            idt: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "each descriptor slot has one owning CPU and publishes immutable objects with release/acquire ordering"
+)]
+unsafe impl Sync for RuntimeCpuDescriptorSlot {}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+static RUNTIME_CPU_DESCRIPTOR_SLOTS: [RuntimeCpuDescriptorSlot; H1_RUNTIME_CPU_SLOT_COUNT] =
+    [const { RuntimeCpuDescriptorSlot::vacant() }; H1_RUNTIME_CPU_SLOT_COUNT];
+
+/// Failure to establish one CPU's private runtime architecture carriers.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeCpuDescriptorError {
+    InvalidCpuIndex,
+    BootstrapDescriptorsUnavailable,
+    SlotAlreadyClaimed,
+    InvalidStackLayout,
+    InvalidHandlerAddress(u64),
+    Syscall(syscall::SyscallInstallError),
+}
+
+/// Acquire-loads one runtime descriptor publication state.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn runtime_cpu_descriptor_lifecycle(
+    cpu_index: usize,
+) -> Option<RuntimeCpuDescriptorLifecycle> {
+    let slot = RUNTIME_CPU_DESCRIPTOR_SLOTS.get(cpu_index)?;
+    RuntimeCpuDescriptorLifecycle::from_bits(slot.lifecycle.load(Ordering::Acquire))
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn runtime_cpu_stack_layout(
+    cpu_index: usize,
+) -> Result<RuntimeCpuStackLayout, RuntimeCpuDescriptorError> {
+    linked_runtime_cpu_stack_layout()
+        .map_err(|_| RuntimeCpuDescriptorError::InvalidStackLayout)?
+        .get(cpu_index)
+        .copied()
+        .ok_or(RuntimeCpuDescriptorError::InvalidCpuIndex)
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn fail_runtime_cpu_descriptor_slot(cpu_index: usize) {
+    if let Some(slot) = RUNTIME_CPU_DESCRIPTOR_SLOTS.get(cpu_index) {
+        slot.lifecycle.store(
+            RuntimeCpuDescriptorLifecycle::Failed as u8,
+            Ordering::Release,
+        );
+    }
+}
+
+/// Publishes that the current CPU completed private SYSCALL/GS installation.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn publish_runtime_cpu_online(cpu_index: usize) -> Result<(), RuntimeCpuDescriptorError> {
+    let slot = RUNTIME_CPU_DESCRIPTOR_SLOTS
+        .get(cpu_index)
+        .ok_or(RuntimeCpuDescriptorError::InvalidCpuIndex)?;
+    slot.lifecycle
+        .compare_exchange(
+            RuntimeCpuDescriptorLifecycle::DescriptorsActive as u8,
+            RuntimeCpuDescriptorLifecycle::Online as u8,
+            Ordering::Release,
+            Ordering::Acquire,
+        )
+        .map_err(|_| RuntimeCpuDescriptorError::SlotAlreadyClaimed)?;
+    Ok(())
+}
+
+/// Constructs and activates one runtime CPU's private TSS/GDT/IDT bundle.
+///
+/// # Safety
+///
+/// The caller must execute on `cpu_index` at CPL0 with IF clear, after the
+/// runtime arena is mapped with its guard pages absent. This function must be
+/// the only initializer for the selected slot. Once activated, the slot is
+/// never mutated again.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "one owning CPU initializes static descriptor storage and executes the audited lgdt/ltr/lidt boundary"
+)]
+unsafe fn activate_runtime_cpu_descriptors(
+    cpu_index: usize,
+) -> Result<RuntimeCpuStackLayout, RuntimeCpuDescriptorError> {
+    let slot = RUNTIME_CPU_DESCRIPTOR_SLOTS
+        .get(cpu_index)
+        .ok_or(RuntimeCpuDescriptorError::InvalidCpuIndex)?;
+    slot.lifecycle
+        .compare_exchange(
+            RuntimeCpuDescriptorLifecycle::Vacant as u8,
+            RuntimeCpuDescriptorLifecycle::Building as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map_err(|_| RuntimeCpuDescriptorError::SlotAlreadyClaimed)?;
+
+    let result = (|| {
+        let stacks = runtime_cpu_stack_layout(cpu_index)?;
+        let handlers = unsafe { load_handler_addresses() }.map_err(|error| match error {
+            EarlyDescriptorInstallError::InvalidHandlerAddress(address) => {
+                RuntimeCpuDescriptorError::InvalidHandlerAddress(address)
+            }
+            _ => RuntimeCpuDescriptorError::InvalidStackLayout,
+        })?;
+
+        let mut tss = TaskStateSegment::empty();
+        tss.set_privilege_stack0(stacks.privilege_entry.top)
+            .map_err(|_| RuntimeCpuDescriptorError::InvalidStackLayout)?;
+        tss.set_interrupt_stack(InterruptStackIndex::One, stacks.interrupt_stacks[0].top)
+            .map_err(|_| RuntimeCpuDescriptorError::InvalidStackLayout)?;
+        tss.set_interrupt_stack(InterruptStackIndex::Two, stacks.interrupt_stacks[1].top)
+            .map_err(|_| RuntimeCpuDescriptorError::InvalidStackLayout)?;
+        tss.set_interrupt_stack(InterruptStackIndex::Three, stacks.interrupt_stacks[2].top)
+            .map_err(|_| RuntimeCpuDescriptorError::InvalidStackLayout)?;
+
+        unsafe { (*slot.tss.get()).write(tss) };
+        let tss = unsafe { &*(*slot.tss.get()).as_ptr() };
+        unsafe { (*slot.gdt.get()).write(GlobalDescriptorTable::new(tss)) };
+        unsafe { (*slot.idt.get()).write(InterruptDescriptorTable::new(handlers)) };
+        let gdt = unsafe { &*(*slot.gdt.get()).as_ptr() };
+        let idt = unsafe { &*(*slot.idt.get()).as_ptr() };
+        if !idt.has_exact_terminal_ist_assignment() {
+            return Err(RuntimeCpuDescriptorError::InvalidStackLayout);
+        }
+
+        unsafe { gdt::activate(gdt) };
+        unsafe { idt::activate(idt) };
+        Ok(stacks)
+    })();
+
+    match result {
+        Ok(stacks) => {
+            slot.lifecycle.store(
+                RuntimeCpuDescriptorLifecycle::DescriptorsActive as u8,
+                Ordering::Release,
+            );
+            Ok(stacks)
+        }
+        Err(error) => {
+            fail_runtime_cpu_descriptor_slot(cpu_index);
+            Err(error)
+        }
+    }
+}
+
+/// Moves the BSP from the one-shot early descriptor carriers onto runtime slot
+/// zero after the Deep-owned page-table root is active.
+///
+/// # Safety
+///
+/// Must run exactly once on the BSP at CPL0 with IF clear, after Deep paging
+/// maps the runtime arena and before any AP is released.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "the explicit BSP migration consumes the private runtime descriptor activation boundary"
+)]
+pub(crate) unsafe fn migrate_bsp_to_runtime_slot0_after_deep_paging()
+-> Result<(), RuntimeCpuDescriptorError> {
+    if early_descriptor_addresses().is_none() {
+        return Err(RuntimeCpuDescriptorError::BootstrapDescriptorsUnavailable);
+    }
+    unsafe { activate_runtime_cpu_descriptors(0) }.map(|_| ())
+}
+
+/// Installs an AP's complete private H1 descriptor and GS-entry substrate.
+///
+/// APs remain parked in CPL0 after this function returns; this does not grant
+/// access to the BSP-only native scheduler/runtime.
+///
+/// # Safety
+///
+/// Must run exactly once on the AP named by `cpu_index` with IF clear, after
+/// Deep paging and the runtime stack arena are active for that CPU.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "the AP initializes its own private descriptor and privileged MSR state before online publication"
+)]
+pub(crate) unsafe fn initialize_ap_runtime_slot(
+    cpu_index: usize,
+) -> Result<(), RuntimeCpuDescriptorError> {
+    if cpu_index == 0 {
+        return Err(RuntimeCpuDescriptorError::InvalidCpuIndex);
+    }
+    let stacks = unsafe { activate_runtime_cpu_descriptors(cpu_index) }?;
+    if let Err(error) = unsafe { syscall::install_syscall_boundary_for_slot(cpu_index, stacks) } {
+        fail_runtime_cpu_descriptor_slot(cpu_index);
+        return Err(RuntimeCpuDescriptorError::Syscall(error));
+    }
+    publish_runtime_cpu_online(cpu_index)
+}
+
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[allow(
     unsafe_code,

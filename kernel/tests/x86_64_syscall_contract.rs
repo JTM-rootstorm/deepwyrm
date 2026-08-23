@@ -54,6 +54,8 @@ fn raw_frame_and_gs_offsets_are_source_locked() {
         ".equ E4_GS_CURRENT_STACK_TOP,     8",
         ".equ E4_GS_BINDING_GENERATION,   16",
         ".equ E4_GS_STAGED_USER_RSP,      24",
+        ".equ E4_GS_TERMINAL_REAPER_TOP,  48",
+        ".equ E4_GS_CPU_INDEX,            56",
         ".equ E4_SC_USER_RIP,             104",
         ".equ E4_SC_BINDING_GENERATION,   128",
         ".equ E4_SC_RETURN_AUTHORIZED,    136",
@@ -266,17 +268,31 @@ fn f12_terminal_control_abandons_the_retiring_stack_before_runtime_reclaim() {
         .expect("terminal reaper handoff extent")
         .0;
     let clear_if = handoff.find("    cli").expect("terminal CLI");
+    let gs_base = handoff
+        .find("movl $IA32_GS_BASE, %ecx")
+        .expect("kernel GS-base selection");
+    let kernel_gs_base = handoff
+        .find("movl $IA32_KERNEL_GS_BASE, %ecx")
+        .expect("unswapped CPL3 exception GS-base selection");
     let switch = handoff
-        .find("leaq __dw_terminal_reaper_stack_top(%rip), %rsp")
-        .expect("dedicated terminal stack switch");
+        .find("movq E4_GS_TERMINAL_REAPER_TOP(%rax), %rsp")
+        .expect("CPU-private terminal stack switch");
     let align = handoff
         .find("andq $-16, %rsp")
         .expect("SysV stack alignment");
-    let callback = handoff.find("callq *%rsi").expect("noreturn Rust callback");
+    let callback = handoff.find("callq *%r9").expect("noreturn Rust callback");
     let trap = handoff.find("    ud2").expect("callback return trap");
-    assert!(clear_if < switch && switch < align && align < callback && callback < trap);
+    assert!(
+        clear_if < gs_base
+            && gs_base < kernel_gs_base
+            && kernel_gs_base < switch
+            && switch < align
+            && align < callback
+            && callback < trap
+    );
     assert!(!handoff.contains("retq"));
     assert!(!handoff.contains("E4_GS_CURRENT_STACK_TOP"));
+    assert!(!handoff.contains("__dw_terminal_reaper_stack_top"));
 
     let live = source("src/arch/x86_64/syscall/live.rs");
     let terminal_arm = live
@@ -288,6 +304,23 @@ fn f12_terminal_control_abandons_the_retiring_stack_before_runtime_reclaim() {
         .0;
     assert!(terminal_arm.contains("handoff_to_terminal_reaper::<R>(context)"));
     assert!(!terminal_arm.contains("terminate_current()"));
+}
+
+#[test]
+fn h1_syscall_entry_state_is_fixed_per_cpu_while_runtime_remains_bsp_only() {
+    let live = source("src/arch/x86_64/syscall/live.rs");
+    let arch = source("src/arch/x86_64/mod.rs");
+
+    assert!(live.contains("[EntryStateStorage; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT]"));
+    assert!(live.contains("install_syscall_boundary_for_slot("));
+    assert!(live.contains("cpu_index_for_entry_state_address"));
+    assert!(live.contains("super::msr::IA32_KERNEL_GS_BASE"));
+    assert!(live.contains("EntryBindingError::NonBootstrapCpu"));
+    assert!(arch.contains("migrate_bsp_to_runtime_slot0_after_deep_paging"));
+    assert!(arch.contains("initialize_ap_runtime_slot"));
+    assert!(arch.contains("RuntimeCpuDescriptorLifecycle::Online"));
+    assert!(live.contains("static RUNTIME_STATE: AtomicU8"));
+    assert!(!live.contains("static RUNTIME: ["));
 }
 
 #[test]

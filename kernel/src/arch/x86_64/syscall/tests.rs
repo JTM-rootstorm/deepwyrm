@@ -38,6 +38,7 @@ fn e4_raw_frames_have_fixed_offsets() {
     assert_eq!(offset_of!(PerCpuEntryState, staged_user_rsp), 24);
     assert_eq!(offset_of!(PerCpuEntryState, staged_user_rip), 32);
     assert_eq!(offset_of!(PerCpuEntryState, staged_user_rflags), 40);
+    assert_eq!(offset_of!(PerCpuEntryState, reserved), 48);
     assert_eq!(size_of::<RawUserReturnContext>(), 18 * 8);
     assert_eq!(offset_of!(RawUserReturnContext, r15), 0);
     assert_eq!(offset_of!(RawUserReturnContext, rax), 96);

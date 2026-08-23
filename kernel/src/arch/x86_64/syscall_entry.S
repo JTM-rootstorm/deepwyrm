@@ -8,6 +8,11 @@
 .equ E4_GS_STAGED_USER_RSP,      24
 .equ E4_GS_STAGED_USER_RIP,      32
 .equ E4_GS_STAGED_USER_RFLAGS,   40
+.equ E4_GS_TERMINAL_REAPER_TOP,  48
+.equ E4_GS_CPU_INDEX,            56
+
+.equ IA32_GS_BASE,       0xc0000101
+.equ IA32_KERNEL_GS_BASE,0xc0000102
 
 /* RawSyscallFrame offsets. */
 .equ E4_SC_R15,                   0
@@ -195,10 +200,35 @@ dw_x86_64_iret_to_user:
 .type dw_x86_64_terminal_reaper_handoff,@function
 dw_x86_64_terminal_reaper_handoff:
     cli
-    leaq __dw_terminal_reaper_stack_top(%rip), %rsp
+    /*
+     * A syscall-origin handoff has the CPU-private record in IA32_GS_BASE.
+     * A CPL3 exception has not executed SWAPGS and retains it in
+     * IA32_KERNEL_GS_BASE instead. The locked no-FSGSBASE/no-user-TLS policy
+     * makes the other base zero, so select the one nonzero private record
+     * without consulting the retiring Thread stack.
+     */
+    movq %rdi, %r8
+    movq %rsi, %r9
+    movl $IA32_GS_BASE, %ecx
+    rdmsr
+    shlq $32, %rdx
+    orq %rdx, %rax
+    testq %rax, %rax
+    jnz .Le4_reaper_entry_state
+    movl $IA32_KERNEL_GS_BASE, %ecx
+    rdmsr
+    shlq $32, %rdx
+    orq %rdx, %rax
+.Le4_reaper_entry_state:
+    testq %rax, %rax
+    jz .Le4_entry_fail
+    movq E4_GS_TERMINAL_REAPER_TOP(%rax), %rsp
+    testq %rsp, %rsp
+    jz .Le4_entry_fail
     andq $-16, %rsp
     xorq %rbp, %rbp
-    callq *%rsi
+    movq %r8, %rdi
+    callq *%r9
     ud2
 .size dw_x86_64_terminal_reaper_handoff, .-dw_x86_64_terminal_reaper_handoff
 

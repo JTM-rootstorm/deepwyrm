@@ -17,7 +17,7 @@ fn h1_runtime_storage_is_bounded_cpu_private_and_guarded() {
     ] {
         assert!(SMP_SOURCE.contains(private_stack));
     }
-    assert!(SMP_SOURCE.contains("cpu_index >= MAX_DW0_CPUS"));
+    assert!(SMP_SOURCE.contains("cpu_index >= H1_RUNTIME_CPU_CAPACITY"));
     assert!(!SMP_SOURCE.contains("[local_apic_id as usize]"));
 }
 
@@ -67,4 +67,18 @@ fn h1_early_bsp_stack_carriers_remain_distinct_from_runtime_slots() {
             .contains("__dw_terminal_reaper_stack_top <= __dw_runtime_cpu_stack_arena_start")
     );
     assert!(ARCH_SOURCE.contains("early BSP\n/// carriers remain separate"));
+}
+
+#[test]
+fn h1_runtime_descriptor_bundles_are_fixed_private_and_release_published() {
+    assert!(ARCH_SOURCE.contains("struct RuntimeCpuDescriptorSlot"));
+    assert!(ARCH_SOURCE.contains("tss: UnsafeCell<MaybeUninit<TaskStateSegment>>"));
+    assert!(ARCH_SOURCE.contains("gdt: UnsafeCell<MaybeUninit<GlobalDescriptorTable>>"));
+    assert!(ARCH_SOURCE.contains("idt: UnsafeCell<MaybeUninit<InterruptDescriptorTable>>"));
+    assert!(ARCH_SOURCE.contains("[RuntimeCpuDescriptorSlot; H1_RUNTIME_CPU_SLOT_COUNT]"));
+    assert!(ARCH_SOURCE.contains("Ordering::Release"));
+    assert!(ARCH_SOURCE.contains("Ordering::Acquire"));
+    assert!(ARCH_SOURCE.contains("migrate_bsp_to_runtime_slot0_after_deep_paging"));
+    assert!(ARCH_SOURCE.contains("initialize_ap_runtime_slot"));
+    assert!(ARCH_SOURCE.contains("if cpu_index == 0"));
 }

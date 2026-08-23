@@ -1,4 +1,4 @@
-//! Target-only one-CPU DW0-E4 SYSCALL installation and entry ownership.
+//! Target-only per-CPU DW0-H1 SYSCALL installation and entry ownership.
 
 use core::cell::UnsafeCell;
 use core::convert::Infallible;
@@ -50,9 +50,15 @@ impl PlanStorage {
 )]
 unsafe impl Sync for PlanStorage {}
 
-static INSTALL_STATE: AtomicU8 = AtomicU8::new(INSTALL_UNSTARTED);
-static ENTRY_STATE: EntryStateStorage = EntryStateStorage::new();
-static EXPECTED_PLAN: PlanStorage = PlanStorage::uninit();
+static INSTALL_STATE: [AtomicU8; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] =
+    [const { AtomicU8::new(INSTALL_UNSTARTED) }; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT];
+static ENTRY_STATE: [EntryStateStorage; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] =
+    [const { EntryStateStorage::new() }; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT];
+static EXPECTED_PLAN: [PlanStorage; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] =
+    [const { PlanStorage::uninit() }; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT];
+
+const ENTRY_STATE_TERMINAL_REAPER_INDEX: usize = 0;
+const ENTRY_STATE_CPU_INDEX: usize = 1;
 
 const RUNTIME_UNBOUND: u8 = 0;
 const RUNTIME_BINDING: u8 = 1;
@@ -115,6 +121,7 @@ pub(crate) enum EntryBindingError {
     BoundaryNotInstalled,
     ForeignKernelStack,
     GenerationExhausted,
+    NonBootstrapCpu,
 }
 
 struct LiveMsrAccess;
@@ -291,29 +298,39 @@ fn cpu_supports_syscall() -> bool {
         && __cpuid(CPUID_EXTENDED_FEATURES).edx & CPUID_SYSCALL_SYSRET != 0
 }
 
-fn entry_state_address() -> u64 {
-    ENTRY_STATE.0.get() as u64
+fn entry_state_address(cpu_index: usize) -> Option<u64> {
+    ENTRY_STATE.get(cpu_index).map(|state| state.0.get() as u64)
 }
 
 #[allow(
     unsafe_code,
     reason = "one-shot BSP initialization writes the supervisor-only GS entry record before publishing the swapgs MSR pair"
 )]
-unsafe fn initialize_entry_state(entry_stack_top: u64) {
+unsafe fn initialize_entry_state(
+    cpu_index: usize,
+    entry_stack_top: u64,
+    terminal_reaper_top: u64,
+) -> Result<(), SyscallInstallError> {
+    let state = ENTRY_STATE
+        .get(cpu_index)
+        .ok_or(SyscallInstallError::DescriptorState)?;
     unsafe {
-        ENTRY_STATE.0.get().write(PerCpuEntryState {
+        state.0.get().write(PerCpuEntryState {
             entry_stack_top,
+            reserved: [terminal_reaper_top, cpu_index as u64],
             ..PerCpuEntryState::empty()
         });
     }
+    Ok(())
 }
 
 #[allow(
     unsafe_code,
     reason = "installed-state Acquire publication makes the expected MSR plan immutable"
 )]
-unsafe fn expected_plan() -> SyscallMsrPlan {
-    unsafe { (*EXPECTED_PLAN.0.get()).assume_init() }
+unsafe fn expected_plan(cpu_index: usize) -> Option<SyscallMsrPlan> {
+    let plan = EXPECTED_PLAN.get(cpu_index)?;
+    Some(unsafe { (*plan.0.get()).assume_init() })
 }
 
 fn map_program_error(error: SyscallMsrProgramError<Infallible>) -> SyscallInstallError {
@@ -334,17 +351,66 @@ fn syscall_entry_address() -> u64 {
     core::ptr::addr_of!(dw_x86_64_syscall_entry) as u64
 }
 
-/// Installs the one-CPU DW0-E4 SYSCALL boundary.
+fn cpu_index_for_entry_state_address(address: u64) -> Option<usize> {
+    ENTRY_STATE
+        .iter()
+        .position(|state| state.0.get() as u64 == address)
+}
+
+/// Finds the current CPU's private entry record from the architectural GS
+/// pair. Kernel-origin paths use IA32_GS_BASE; a CPL3 exception that has not
+/// executed SWAPGS yet retains the same record in IA32_KERNEL_GS_BASE.
+#[allow(
+    unsafe_code,
+    reason = "RDMSR reads the current CPU's architectural GS base pair without mutating it"
+)]
+fn current_cpu_index() -> Option<usize> {
+    let gs_base = unsafe { read_msr(super::msr::IA32_GS_BASE) };
+    cpu_index_for_entry_state_address(gs_base).or_else(|| {
+        let kernel_gs_base = unsafe { read_msr(super::msr::IA32_KERNEL_GS_BASE) };
+        cpu_index_for_entry_state_address(kernel_gs_base)
+    })
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the exact architectural GS base selects one release-published static per-CPU entry record"
+)]
+fn current_entry_state() -> Option<&'static PerCpuEntryState> {
+    let cpu_index = current_cpu_index()?;
+    let state = ENTRY_STATE.get(cpu_index)?;
+    Some(unsafe { &*state.0.get() })
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the current CPU exclusively updates its GS-selected entry record while IF remains clear"
+)]
+unsafe fn current_entry_state_mut() -> Option<(usize, &'static mut PerCpuEntryState)> {
+    let cpu_index = current_cpu_index()?;
+    let state = ENTRY_STATE.get(cpu_index)?;
+    Some((cpu_index, unsafe { &mut *state.0.get() }))
+}
+
+/// Installs one runtime CPU's private DW0-H1 SYSCALL/GS boundary.
 ///
 /// # Safety
 ///
-/// Must run at CPL0 on the BSP with IF clear after the final GDT/TSS is active.
+/// Must run at CPL0 on `cpu_index` with IF clear after that CPU's private
+/// runtime GDT/TSS/IDT is active. The selected entry record and MSR plan must
+/// not have been initialized before.
 #[allow(
     unsafe_code,
-    reason = "E4 programs CR4 and architectural MSRs and publishes the swapgs-protected GS entry-state base"
+    reason = "H1 programs CPU-local CR4/MSRs and publishes the swapgs-protected private GS entry-state base"
 )]
-pub(crate) unsafe fn install_syscall_boundary() -> Result<(), SyscallInstallError> {
-    if INSTALL_STATE
+pub(crate) unsafe fn install_syscall_boundary_for_slot(
+    cpu_index: usize,
+    stacks: crate::arch::x86_64::RuntimeCpuStackLayout,
+) -> Result<(), SyscallInstallError> {
+    let install_state = INSTALL_STATE
+        .get(cpu_index)
+        .ok_or(SyscallInstallError::DescriptorState)?;
+    if install_state
         .compare_exchange(
             INSTALL_UNSTARTED,
             INSTALLING,
@@ -359,11 +425,9 @@ pub(crate) unsafe fn install_syscall_boundary() -> Result<(), SyscallInstallErro
         if !unsafe { installation_cpu_state_is_valid() } {
             return Err(SyscallInstallError::InterruptsEnabled);
         }
-        let descriptors = crate::arch::x86_64::early_descriptor_addresses()
-            .ok_or(SyscallInstallError::DescriptorState)?;
-        let privilege = crate::arch::x86_64::linked_privilege_entry_stack_layout()
-            .map_err(|_| SyscallInstallError::DescriptorState)?;
-        if descriptors.privilege_stack0 != privilege.top {
+        if crate::arch::x86_64::runtime_cpu_descriptor_lifecycle(cpu_index)
+            != Some(crate::arch::x86_64::RuntimeCpuDescriptorLifecycle::DescriptorsActive)
+        {
             return Err(SyscallInstallError::DescriptorState);
         }
         if !cpu_supports_syscall() {
@@ -371,31 +435,59 @@ pub(crate) unsafe fn install_syscall_boundary() -> Result<(), SyscallInstallErro
         }
         unsafe { enforce_live_fp_simd_unavailable()? };
         unsafe { normalize_live_cr4()? };
-        unsafe { initialize_entry_state(privilege.top) };
+        unsafe {
+            initialize_entry_state(
+                cpu_index,
+                stacks.privilege_entry.top,
+                stacks.terminal_reaper.top,
+            )?
+        };
 
         let mut access = LiveMsrAccess;
         let current_efer = match access.read(IA32_EFER) {
             Ok(value) => value,
             Err(never) => match never {},
         };
-        let plan =
-            SyscallMsrPlan::new(current_efer, syscall_entry_address(), entry_state_address())
-                .map_err(SyscallInstallError::InvalidMsrPlan)?;
+        let entry_state_base =
+            entry_state_address(cpu_index).ok_or(SyscallInstallError::DescriptorState)?;
+        let plan = SyscallMsrPlan::new(current_efer, syscall_entry_address(), entry_state_base)
+            .map_err(SyscallInstallError::InvalidMsrPlan)?;
         program_and_verify(&mut access, plan).map_err(map_program_error)?;
-        unsafe { (*EXPECTED_PLAN.0.get()).write(plan) };
+        let expected = EXPECTED_PLAN
+            .get(cpu_index)
+            .ok_or(SyscallInstallError::DescriptorState)?;
+        unsafe { (*expected.0.get()).write(plan) };
         Ok(())
     })();
 
     match result {
         Ok(()) => {
-            INSTALL_STATE.store(INSTALLED, Ordering::Release);
+            install_state.store(INSTALLED, Ordering::Release);
             Ok(())
         }
         Err(error) => {
-            INSTALL_STATE.store(INSTALL_UNSTARTED, Ordering::Release);
+            install_state.store(INSTALL_UNSTARTED, Ordering::Release);
             Err(error)
         }
     }
+}
+
+/// Installs the BSP's private runtime-slot-zero SYSCALL boundary.
+///
+/// # Safety
+///
+/// Must run on the BSP with IF clear after
+/// `migrate_bsp_to_runtime_slot0_after_deep_paging`.
+#[allow(
+    unsafe_code,
+    reason = "the BSP wrapper binds the already-active runtime slot zero to CPU-local SYSCALL MSRs"
+)]
+pub(crate) unsafe fn install_syscall_boundary() -> Result<(), SyscallInstallError> {
+    let stacks = crate::arch::x86_64::runtime_cpu_stack_layout(0)
+        .map_err(|_| SyscallInstallError::DescriptorState)?;
+    unsafe { install_syscall_boundary_for_slot(0, stacks) }?;
+    crate::arch::x86_64::publish_runtime_cpu_online(0)
+        .map_err(|_| SyscallInstallError::DescriptorState)
 }
 
 #[allow(
@@ -403,7 +495,11 @@ pub(crate) unsafe fn install_syscall_boundary() -> Result<(), SyscallInstallErro
     reason = "live E4 revalidation reads CR4 and the one-shot published expected MSR plan"
 )]
 pub(crate) fn validate_live_syscall_boundary() -> Result<(), SyscallInstallError> {
-    if INSTALL_STATE.load(Ordering::Acquire) != INSTALLED {
+    let cpu_index = current_cpu_index().ok_or(SyscallInstallError::DescriptorState)?;
+    if INSTALL_STATE[cpu_index].load(Ordering::Acquire) != INSTALLED
+        || crate::arch::x86_64::runtime_cpu_descriptor_lifecycle(cpu_index)
+            != Some(crate::arch::x86_64::RuntimeCpuDescriptorLifecycle::Online)
+    {
         return Err(SyscallInstallError::DescriptorState);
     }
     let cr4: u64;
@@ -420,7 +516,7 @@ pub(crate) fn validate_live_syscall_boundary() -> Result<(), SyscallInstallError
     if !live_fp_simd_unavailable_is_enforced() {
         return Err(SyscallInstallError::FpSimdPolicyNotEnforced);
     }
-    let plan = unsafe { expected_plan() };
+    let plan = unsafe { expected_plan(cpu_index) }.ok_or(SyscallInstallError::DescriptorState)?;
     verify(&mut LiveMsrAccess, plan).map_err(map_program_error)
 }
 
@@ -431,7 +527,12 @@ pub(crate) fn validate_live_syscall_boundary() -> Result<(), SyscallInstallError
 pub(crate) unsafe fn bind_current_thread_stack(
     stack: KernelStackBounds,
 ) -> Result<u64, EntryBindingError> {
-    if INSTALL_STATE.load(Ordering::Acquire) != INSTALLED {
+    let (cpu_index, state) =
+        unsafe { current_entry_state_mut() }.ok_or(EntryBindingError::BoundaryNotInstalled)?;
+    if cpu_index != 0 {
+        return Err(EntryBindingError::NonBootstrapCpu);
+    }
+    if INSTALL_STATE[cpu_index].load(Ordering::Acquire) != INSTALLED {
         return Err(EntryBindingError::BoundaryNotInstalled);
     }
     let linked = crate::arch::x86_64::linked_thread_kernel_stack_layout()
@@ -439,7 +540,6 @@ pub(crate) unsafe fn bind_current_thread_stack(
     if !linked.contains(&stack) {
         return Err(EntryBindingError::ForeignKernelStack);
     }
-    let state = unsafe { &mut *ENTRY_STATE.0.get() };
     let next = state
         .binding_generation
         .checked_add(1)
@@ -455,7 +555,7 @@ pub(crate) unsafe fn bind_current_thread_stack(
     reason = "SYSCALL dispatch reads one BSP binding generation while FMASK keeps IF clear"
 )]
 pub(crate) fn current_binding_generation() -> u64 {
-    unsafe { (*ENTRY_STATE.0.get()).binding_generation }
+    current_entry_state().map_or(0, |state| state.binding_generation)
 }
 
 /// Publishes the single BSP syscall runtime identity used by the assembly boundary.
@@ -600,9 +700,15 @@ fn handoff_to_terminal_reaper<R: crate::syscall::native::NativeSyscallFrameRunti
             callback: unsafe extern "sysv64" fn(*mut ()) -> !,
         ) -> !;
     }
-    let bounds = crate::arch::x86_64::linked_terminal_reaper_stack_layout()
-        .unwrap_or_else(|_| halt_forever());
-    if bounds.top == 0 {
+    let Some(state) = current_entry_state() else {
+        halt_forever();
+    };
+    if state.reserved[ENTRY_STATE_TERMINAL_REAPER_INDEX] == 0
+        || usize::try_from(state.reserved[ENTRY_STATE_CPU_INDEX])
+            .ok()
+            .and_then(|index| ENTRY_STATE.get(index))
+            .is_none()
+    {
         halt_forever();
     }
     unsafe { dw_x86_64_terminal_reaper_handoff(context, native_runtime_terminal_reaper::<R>) }
@@ -744,7 +850,7 @@ unsafe fn dispatch_bound_runtime(frame: &mut RawSyscallFrame) {
     reason = "F7 first-run entry checks the IF-clear BSP entry-state stack identity established by the context-switch boundary"
 )]
 fn current_kernel_stack_is(stack: KernelStackBounds) -> bool {
-    unsafe { (*ENTRY_STATE.0.get()).current_kernel_stack_top == stack.top }
+    current_entry_state().is_some_and(|state| state.current_kernel_stack_top == stack.top)
 }
 
 #[allow(
