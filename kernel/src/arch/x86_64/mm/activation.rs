@@ -418,6 +418,8 @@ pub(crate) struct ActiveDeepPaging<A> {
     #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
     root_bindings:
         AddressSpaceRootBindings<LIVE_ADDRESS_SPACE_CAPACITY, { crate::cpu::CPU_CAPACITY }>,
+    #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+    kernel_execution_roots: KernelExecutionRoots<{ crate::cpu::CPU_CAPACITY }>,
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -1513,6 +1515,36 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         )
     }
 
+    /// Constructs the permanently retained architecture-private root for every
+    /// fixed CPU slot. This is intentionally separate from Process binding:
+    /// the resulting roots have no portable address-space identity.
+    #[allow(
+        unsafe_code,
+        reason = "the committed typed PML4 grant becomes a permanently retained CPU execution root"
+    )]
+    pub(crate) fn reserve_kernel_execution_roots(&mut self) -> Result<(), RootBindingError> {
+        for index in 0..crate::cpu::CPU_CAPACITY {
+            let cpu = crate::cpu::CpuIndex::new(index)
+                .unwrap_or_else(|| panic!("fixed CPU capacity contains invalid index"));
+            reserve_kernel_execution_root_parts(
+                &self.root,
+                &self.root_bindings,
+                &mut self.kernel_execution_roots,
+                self.target.roles,
+                &mut self.target.scratch,
+                cpu,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn kernel_execution_root(
+        &self,
+        cpu: crate::cpu::CpuIndex,
+    ) -> Result<&KernelExecutionRoot, RootBindingError> {
+        self.kernel_execution_roots.get(cpu)
+    }
+
     /// Reserves a distinct child PML4, initializes only its supervisor half
     /// from the typed primordial kernel-half borrow, then publishes the exact
     /// portable-key/Process binding. Every failure before root publication
@@ -1591,6 +1623,88 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> ! {
         primordial::enter(self, modules)
     }
+}
+
+#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "the committed typed PML4 grant becomes one linearly owned PageTableRoot"
+)]
+fn reserve_kernel_execution_root_parts<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
+    primordial_root: &PageTableRoot,
+    root_bindings: &AddressSpaceRootBindings<
+        LIVE_ADDRESS_SPACE_CAPACITY,
+        { crate::cpu::CPU_CAPACITY },
+    >,
+    execution_roots: &mut KernelExecutionRoots<{ crate::cpu::CPU_CAPACITY }>,
+    roles: &mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
+    scratch: &mut ActiveScratchTarget<LiveActiveScratchIo>,
+    cpu: crate::cpu::CpuIndex,
+) -> Result<(), RootBindingError> {
+    if execution_roots.get(cpu).is_ok() {
+        return Err(RootBindingError::AlreadyActive);
+    }
+    let kernel_half = root_bindings.kernel_half()?;
+    let owner = roles
+        .create_table_owner()
+        .map_err(RootBindingError::FrameRole)?;
+    let allocation = roles.allocate(1).map_err(RootBindingError::FrameRole)?;
+    let frame = match FrameAddress::new(
+        allocation.physical_start(),
+        primordial_root.physical_limit(),
+    ) {
+        Ok(frame) => frame,
+        Err(_) => {
+            roles
+                .cancel_allocation(allocation)
+                .unwrap_or_else(|_| panic!("invalid execution-root allocation rollback drifted"));
+            return Err(RootBindingError::RootMismatch);
+        }
+    };
+    if scratch.zero_allocator_frame(frame).is_err() {
+        roles
+            .cancel_allocation(allocation)
+            .unwrap_or_else(|_| panic!("execution-root allocation rollback drifted"));
+        return Err(RootBindingError::RootMismatch);
+    }
+    let zeroed = unsafe { roles.assume_zeroed(allocation) }
+        .unwrap_or_else(|_| panic!("execution-root zeroed transition drifted"));
+    let candidate = match roles.prepare_table(zeroed, owner, TableLevel::Pml4) {
+        Ok(candidate) => candidate,
+        Err(failure) => {
+            let error = failure.error();
+            roles
+                .cancel_zeroed(failure.into_grant())
+                .unwrap_or_else(|_| panic!("execution-root candidate rollback drifted"));
+            return Err(RootBindingError::FrameRole(error));
+        }
+    };
+    if let Err(error) = kernel_half.install(scratch, frame) {
+        roles
+            .cancel_table_candidate(candidate)
+            .unwrap_or_else(|_| panic!("execution-root kernel-half rollback drifted"));
+        return Err(error);
+    }
+    let identity = match roles.commit_table(candidate, None) {
+        Ok(identity) => identity,
+        Err(failure) => {
+            let error = failure.error();
+            roles
+                .cancel_table_candidate(failure.into_grant())
+                .unwrap_or_else(|_| panic!("execution-root commit rollback drifted"));
+            return Err(RootBindingError::FrameRole(error));
+        }
+    };
+    let root = unsafe {
+        PageTableRoot::from_owned_root(identity.physical_start(), primordial_root.capabilities)
+    }
+    .unwrap_or_else(|_| panic!("typed execution-root PML4 address became invalid"));
+    execution_roots
+        .bind(cpu, root, identity)
+        .unwrap_or_else(|error| {
+            panic!("preflighted execution-root binding rejected after commit: {error:?}")
+        });
+    Ok(())
 }
 
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
@@ -1716,6 +1830,8 @@ impl<H, T: Cr3ActivationTarget<H>> PreparedActivation<H, T> {
             user_pins: crate::memory::usercopy::UserPinTracker::new(),
             #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
             root_bindings: AddressSpaceRootBindings::new(),
+            #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+            kernel_execution_roots: KernelExecutionRoots::new(),
         }
     }
 }

@@ -1836,6 +1836,9 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     active
         .bind_primordial_address_space(monitor.process_key, primordial_address_space)
         .unwrap_or_else(|error| panic!("could not bind primordial architecture root: {error:?}"));
+    active
+        .reserve_kernel_execution_roots()
+        .unwrap_or_else(|error| panic!("could not reserve CPU execution roots: {error:?}"));
     let initial_root = active
         .prepare_process_root_selection(
             crate::cpu::CpuIndex::BOOTSTRAP,
