@@ -569,9 +569,13 @@ fn h3c_scheduler_source_keeps_per_cpu_and_generation_contracts() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let source = std::fs::read_to_string(root.join("src/task/scheduler.rs"))
         .expect("read scheduler source for H3-C contract test");
+    let cpu_source = std::fs::read_to_string(root.join("src/cpu.rs"))
+        .expect("read canonical CPU identity source for H3-C contract test");
+
+    assert!(cpu_source.contains("CPU_CAPACITY: usize = 4"));
 
     for required in [
-        "H2_SCHEDULER_CPU_CAPACITY: usize = 4",
+        "H2_SCHEDULER_CPU_CAPACITY: usize = crate::cpu::CPU_CAPACITY",
         "running: [Option<RunningClaim>; H2_SCHEDULER_CPU_CAPACITY]",
         "pending_block: [Option<BlockWakeKey>; H2_SCHEDULER_CPU_CAPACITY]",
         "suspended: [Option<SuspendedContinuation>; H2_SCHEDULER_CPU_CAPACITY]",

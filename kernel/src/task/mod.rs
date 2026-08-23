@@ -44,8 +44,9 @@ pub(crate) use execution::{
 )]
 pub(crate) use scheduler::{
     BlockReservation, BlockReservationFailure, BlockToken, BlockWakeKey, CooperativeScheduler,
-    IdleScheduleDecision, ScheduleDecision, SchedulerError, SchedulerReservation,
-    SchedulerReservationFailure, SchedulerThreadState,
+    IdleScheduleDecision, ScheduleDecision, SchedulerCpuId, SchedulerError,
+    SchedulerExecutionClaim, SchedulerReservation, SchedulerReservationFailure,
+    SchedulerThreadState,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

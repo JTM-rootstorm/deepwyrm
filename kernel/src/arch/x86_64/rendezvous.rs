@@ -8,10 +8,11 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
+use crate::cpu::{CPU_CAPACITY, CpuIndex};
 use crate::sync::IrqSpinMutex;
-use crate::task::ThreadKey;
+use crate::task::{SchedulerExecutionClaim, ThreadKey};
 
-pub(crate) const RENDEZVOUS_CPU_CAPACITY: usize = 4;
+pub(crate) const RENDEZVOUS_CPU_CAPACITY: usize = CPU_CAPACITY;
 
 const MAILBOX_IDLE: u8 = 0;
 const MAILBOX_TRANSITION: u8 = 1;
@@ -33,7 +34,7 @@ pub(crate) enum StopIdentityError {
 /// this type once that claim is exported to the architecture layer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StopIdentity {
-    target_cpu: u8,
+    target_cpu: CpuIndex,
     cpu_online_generation: u64,
     thread: ThreadKey,
     execution_generation: u64,
@@ -48,9 +49,10 @@ impl StopIdentity {
         execution_generation: u64,
         root_binding_generation: u64,
     ) -> Result<Self, StopIdentityError> {
-        if target_cpu >= RENDEZVOUS_CPU_CAPACITY {
-            return Err(StopIdentityError::InvalidCpu);
-        }
+        let target_cpu = match CpuIndex::new(target_cpu) {
+            Some(cpu) => cpu,
+            None => return Err(StopIdentityError::InvalidCpu),
+        };
         if cpu_online_generation == 0 {
             return Err(StopIdentityError::ZeroOnlineGeneration);
         }
@@ -61,7 +63,7 @@ impl StopIdentity {
             return Err(StopIdentityError::ZeroRootBindingGeneration);
         }
         Ok(Self {
-            target_cpu: target_cpu as u8,
+            target_cpu,
             cpu_online_generation,
             thread,
             execution_generation,
@@ -70,7 +72,7 @@ impl StopIdentity {
     }
 
     pub(crate) const fn target_cpu(self) -> usize {
-        self.target_cpu as usize
+        self.target_cpu.index()
     }
 
     pub(crate) const fn cpu_online_generation(self) -> u64 {
@@ -87,6 +89,20 @@ impl StopIdentity {
 
     pub(crate) const fn root_binding_generation(self) -> u64 {
         self.root_binding_generation
+    }
+
+    pub(crate) const fn from_scheduler_claim(
+        cpu_online_generation: u64,
+        claim: SchedulerExecutionClaim,
+        root_binding_generation: u64,
+    ) -> Result<Self, StopIdentityError> {
+        Self::new(
+            claim.cpu().index(),
+            cpu_online_generation,
+            claim.thread(),
+            claim.generation(),
+            root_binding_generation,
+        )
     }
 }
 
@@ -251,7 +267,7 @@ impl<R> ReclaimFailure<R> {
 
 /// One bounded mailbox owned by one logical target CPU.
 pub(crate) struct RendezvousMailbox {
-    target_cpu: u8,
+    target_cpu: CpuIndex,
     state: AtomicU8,
     next_generation: AtomicU64,
     wake_pending: AtomicBool,
@@ -260,11 +276,12 @@ pub(crate) struct RendezvousMailbox {
 
 impl RendezvousMailbox {
     pub(crate) const fn new(target_cpu: usize) -> Option<Self> {
-        if target_cpu >= RENDEZVOUS_CPU_CAPACITY {
-            return None;
-        }
+        let target_cpu = match CpuIndex::new(target_cpu) {
+            Some(cpu) => cpu,
+            None => return None,
+        };
         Some(Self {
-            target_cpu: target_cpu as u8,
+            target_cpu,
             state: AtomicU8::new(MAILBOX_IDLE),
             next_generation: AtomicU64::new(1),
             wake_pending: AtomicBool::new(false),
@@ -275,7 +292,10 @@ impl RendezvousMailbox {
     #[cfg(test)]
     const fn with_next_generation_for_test(target_cpu: usize, next_generation: u64) -> Self {
         Self {
-            target_cpu: target_cpu as u8,
+            target_cpu: match CpuIndex::new(target_cpu) {
+                Some(cpu) => cpu,
+                None => panic!("test rendezvous CPU must be in range"),
+            },
             state: AtomicU8::new(MAILBOX_IDLE),
             next_generation: AtomicU64::new(next_generation),
             wake_pending: AtomicBool::new(false),

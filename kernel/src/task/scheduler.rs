@@ -1,5 +1,6 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
+pub(crate) use crate::cpu::CpuIndex as SchedulerCpuId;
 use crate::sync::IrqSpinMutex;
 
 use super::ThreadKey;
@@ -11,26 +12,7 @@ static NEXT_SCHEDULER_DOMAIN: AtomicU64 = AtomicU64::new(1);
 /// This is an internal ownership identity, not a userspace ABI value.  The
 /// canonical SMP profile has exactly four CPUs, so accepting a fifth owner is
 /// an explicit error rather than silently aliasing or dropping it.
-pub(crate) const H2_SCHEDULER_CPU_CAPACITY: usize = 4;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SchedulerCpuId(u8);
-
-impl SchedulerCpuId {
-    pub(crate) const BOOTSTRAP: Self = Self(0);
-
-    pub(crate) const fn new(index: usize) -> Option<Self> {
-        if index < H2_SCHEDULER_CPU_CAPACITY {
-            Some(Self(index as u8))
-        } else {
-            None
-        }
-    }
-
-    pub(crate) const fn index(self) -> usize {
-        self.0 as usize
-    }
-}
+pub(crate) const H2_SCHEDULER_CPU_CAPACITY: usize = crate::cpu::CPU_CAPACITY;
 
 fn mint_scheduler_domain() -> u64 {
     NEXT_SCHEDULER_DOMAIN

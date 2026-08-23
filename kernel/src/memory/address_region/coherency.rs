@@ -18,28 +18,9 @@
 //! acknowledges any snapshotted request and clears residency.
 
 use super::{AddressSpaceKey, AddressSpacePublisher, Mapping, RegionKey, publisher_seal};
+use crate::cpu::CpuIndex;
 use crate::sync::IrqSpinMutex;
 use core::marker::PhantomData;
-
-/// One bounded logical CPU index. This provisional internal identity is never
-/// ABI; [`CpuIndex::get`] is the explicit bridge to the canonical topology and
-/// execution-carrier identity selected during live H2/H3 integration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CpuIndex(usize);
-
-impl CpuIndex {
-    pub(crate) const fn new<const CPUS: usize>(index: usize) -> Option<Self> {
-        if index < CPUS {
-            Some(Self(index))
-        } else {
-            None
-        }
-    }
-
-    pub(crate) const fn get(self) -> usize {
-        self.0
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CpuSet<const CPUS: usize> {
@@ -52,7 +33,7 @@ impl<const CPUS: usize> CpuSet<CPUS> {
     };
 
     pub(crate) const fn contains(self, cpu: CpuIndex) -> bool {
-        cpu.0 < CPUS && self.members[cpu.0]
+        cpu.index() < CPUS && self.members[cpu.index()]
     }
 
     pub(crate) fn count(self) -> usize {
@@ -63,7 +44,8 @@ impl<const CPUS: usize> CpuSet<CPUS> {
         self.members
             .into_iter()
             .enumerate()
-            .filter_map(|(index, member)| member.then_some(CpuIndex(index)))
+            .filter(|(_, member)| *member)
+            .map(|(index, _)| CpuIndex::new(index).unwrap())
     }
 }
 
@@ -399,8 +381,8 @@ impl<const CPUS: usize> AddressSpaceCoherency<CPUS> {
     }
 
     fn checked_cpu(&self, cpu: CpuIndex) -> Result<usize, AddressSpaceCoherencyError> {
-        (cpu.0 < CPUS)
-            .then_some(cpu.0)
+        (cpu.index() < CPUS)
+            .then_some(cpu.index())
             .ok_or(AddressSpaceCoherencyError::CpuOutOfRange)
     }
 
@@ -749,8 +731,8 @@ mod tests {
     #[test]
     fn map_barrier_waits_for_every_snapshotted_cpu() {
         let coherency = coherency::<4>();
-        let cpu0 = CpuIndex::new::<4>(0).unwrap();
-        let cpu1 = CpuIndex::new::<4>(1).unwrap();
+        let cpu0 = CpuIndex::new(0).unwrap();
+        let cpu1 = CpuIndex::new(1).unwrap();
         let _cpu0_residency = coherency.enter(cpu0).unwrap();
         let _cpu1_residency = coherency.enter(cpu1).unwrap();
 
@@ -761,7 +743,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            coherency.enter(CpuIndex::new::<4>(2).unwrap()).err(),
+            coherency.enter(CpuIndex::new(2).unwrap()).err(),
             Some(AddressSpaceCoherencyError::MutationInFlight)
         );
         let barrier = mutation.publish();
@@ -786,9 +768,9 @@ mod tests {
     #[test]
     fn ordered_leave_and_post_publish_enter_close_snapshot_races() {
         let coherency = coherency::<4>();
-        let cpu0 = CpuIndex::new::<4>(0).unwrap();
-        let cpu1 = CpuIndex::new::<4>(1).unwrap();
-        let cpu2 = CpuIndex::new::<4>(2).unwrap();
+        let cpu0 = CpuIndex::new(0).unwrap();
+        let cpu1 = CpuIndex::new(1).unwrap();
+        let cpu2 = CpuIndex::new(2).unwrap();
         let _resident0 = coherency.enter(cpu0).unwrap();
         let resident1 = coherency.enter(cpu1).unwrap();
         let mutation = coherency
@@ -812,7 +794,7 @@ mod tests {
     #[test]
     fn stale_ack_cannot_complete_a_later_unmap_generation() {
         let coherency = coherency::<2>();
-        let cpu0 = CpuIndex::new::<2>(0).unwrap();
+        let cpu0 = CpuIndex::new(0).unwrap();
         let _resident = coherency.enter(cpu0).unwrap();
         let first = coherency
             .prepare_mutation(
@@ -846,8 +828,8 @@ mod tests {
     #[test]
     fn teardown_reclaim_waits_for_exit_flushes() {
         let coherency = coherency::<4>();
-        let cpu0 = CpuIndex::new::<4>(0).unwrap();
-        let cpu1 = CpuIndex::new::<4>(1).unwrap();
+        let cpu0 = CpuIndex::new(0).unwrap();
+        let cpu1 = CpuIndex::new(1).unwrap();
         let resident0 = coherency.enter(cpu0).unwrap();
         let resident1 = coherency.enter(cpu1).unwrap();
         let barrier = coherency
@@ -889,7 +871,7 @@ mod tests {
     #[test]
     fn cancelled_and_exhausted_mutations_fail_closed_without_generation_publish() {
         let coherency = coherency::<2>();
-        let cpu0 = CpuIndex::new::<2>(0).unwrap();
+        let cpu0 = CpuIndex::new(0).unwrap();
         let prepared = coherency
             .prepare_mutation(
                 MappingMutation::Protect,

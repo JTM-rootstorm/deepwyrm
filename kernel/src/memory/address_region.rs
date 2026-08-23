@@ -29,11 +29,16 @@ mod region;
 
 #[allow(
     unused_imports,
+    reason = "H3 exposes the canonical kernel CPU identity through the address-space coherency seam"
+)]
+pub(crate) use crate::cpu::CpuIndex;
+#[allow(
+    unused_imports,
     reason = "H3 exposes the target-independent residency/shootdown seam ahead of live x86 IPI convergence"
 )]
 pub(crate) use coherency::{
     AddressSpaceCoherency, AddressSpaceCoherencyError, CoherentAddressSpacePublisher,
-    CoherentPublishError, CpuIndex, CpuSet, InvalidationScope, LeavePublication, MappingMutation,
+    CoherentPublishError, CpuSet, InvalidationScope, LeavePublication, MappingMutation,
     MutationTransaction, ReclaimPermit, Residency, ShootdownAcknowledgement, ShootdownBarrier,
     ShootdownDriver, ShootdownRequest,
 };

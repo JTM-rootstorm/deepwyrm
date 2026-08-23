@@ -14,6 +14,7 @@ pub mod arch;
 )]
 pub(crate) mod atomic_wait;
 pub mod boot;
+pub(crate) mod cpu;
 pub mod debug;
 #[allow(
     dead_code,

@@ -427,9 +427,9 @@ fn coherent_map_protect_unmap_wait_for_cross_cpu_acknowledgements() {
     let object = object(&mut authority, Protection::READ_WRITE);
     let mut region = region::<4>(PAGE_SIZE, PAGE_SIZE * 4);
     let coherency = AddressSpaceCoherency::<4>::new(region.address_space_key());
-    let cpu0 = CpuIndex::new::<4>(0).unwrap();
-    let cpu1 = CpuIndex::new::<4>(1).unwrap();
-    let cpu2 = CpuIndex::new::<4>(2).unwrap();
+    let cpu0 = CpuIndex::new(0).unwrap();
+    let cpu1 = CpuIndex::new(1).unwrap();
+    let cpu2 = CpuIndex::new(2).unwrap();
     let _resident0 = coherency.enter(cpu0).unwrap();
     let _resident1 = coherency.enter(cpu1).unwrap();
     let _resident2 = coherency.enter(cpu2).unwrap();

@@ -4,6 +4,7 @@ mod frame;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod live;
 mod msr;
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 mod runtime_binding;
 
 #[allow(

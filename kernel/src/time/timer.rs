@@ -384,11 +384,11 @@ impl<const TIMERS: usize> TimerAuthority<TIMERS> {
             (old_arm, was_signaled, next_generation)
         };
 
-        if let Some(old_arm) = old_arm {
-            if let Err(error) = deadlines.cancel_timer_deadline(&old_arm.registration) {
-                self.restore_cancel(key, old_arm, was_signaled);
-                return Err(TimerError::Deadline(error));
-            }
+        if let Some(old_arm) = old_arm
+            && let Err(error) = deadlines.cancel_timer_deadline(&old_arm.registration)
+        {
+            self.restore_cancel(key, old_arm, was_signaled);
+            return Err(TimerError::Deadline(error));
         }
         let mut timers = self.timers.lock();
         let timer = timers
