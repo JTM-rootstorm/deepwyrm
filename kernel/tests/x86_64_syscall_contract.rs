@@ -153,6 +153,24 @@ fn production_installs_syscall_boundary_only_after_deep_root_activation() {
 }
 
 #[test]
+fn i1_bsp_scratch_is_usable_for_acpi_and_mmio_before_syscall_install() {
+    let kernel = source("src/lib.rs");
+    let activation = kernel
+        .find("activate_bootstrap_deep_paging(")
+        .expect("Deep root activation");
+    let acpi = kernel
+        .find("AcpiScratchReader::new(&mut active_paging, &boot_info)")
+        .expect("post-activation ACPI scratch reader");
+    let mmio = kernel
+        .find("time::initialize(&mut active_paging, pm_timer)")
+        .expect("post-activation MMIO scratch use");
+    let syscall = kernel
+        .find("arch::x86_64::syscall::install_syscall_boundary()")
+        .expect("later SYSCALL install");
+    assert!(activation < acpi && acpi < mmio && mmio < syscall);
+}
+
+#[test]
 fn e5_live_user_pins_guard_actual_atomic_write_batches() {
     let access = source("src/arch/x86_64/mm/activation/user_access.rs");
     assert!(access.contains("self.target.pins"));
@@ -364,10 +382,42 @@ fn h2_syscall_entry_and_native_runtime_carriers_are_fixed_per_cpu() {
         );
     }
     assert!(primordial.contains("struct PrimordialRuntimeCarrier"));
-    assert!(primordial.contains("struct RuntimeCarrierFacade"));
-    assert!(primordial.contains("bind_runtime_carrier_facades(shared)"));
+    assert!(primordial.contains("struct PerCpuLiveCarrier"));
+    assert!(primordial.contains("bind_parked_ap_runtime_carriers()"));
     assert!(primordial.contains("Parked -> Executing gate"));
     assert!(primordial.contains("self.reject_entry(\"fresh userspace entry\")"));
+}
+
+#[test]
+fn i1_stationary_foundation_keeps_authority_and_carrier_boundaries_explicit() {
+    let stationary = source("src/arch/x86_64/syscall/stationary_runtime.rs");
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+
+    for authority in [
+        "struct RuntimeCore",
+        "registry: REGISTRY",
+        "memory: MEMORY",
+        "tasks: TASKS",
+        "spaces: SPACES",
+        "regions: REGIONS",
+        "struct PagingAuthority",
+        "struct ThreadServiceSlots",
+        "struct PerCpuStaging",
+        "fn assert_clear",
+    ] {
+        assert!(
+            stationary.contains(authority),
+            "missing stationary {authority}"
+        );
+    }
+    assert!(stationary.contains("RuntimeCore may not nest inside PagingAuthority"));
+    assert!(stationary.contains("RuntimeCore guard crossed a forbidden runtime boundary"));
+    assert!(stationary.contains("ThreadServiceSlotError::StaleLease"));
+    assert!(primordial.contains("struct PerCpuLiveCarrier"));
+    assert!(primordial.contains("initialize_per_cpu_live_carriers"));
+    assert!(primordial.contains("0..crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT"));
+    assert!(primordial.contains("local: &'static PerCpuLiveCarrier"));
+    assert!(primordial.contains("bind_parked_ap_runtime_carriers"));
 }
 
 #[test]

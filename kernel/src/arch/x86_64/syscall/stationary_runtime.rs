@@ -5,6 +5,11 @@
 //! and per-CPU carrier state without permitting an IRQ-safe guard to survive
 //! into usercopy, switching, idle, or a terminal handoff.
 
+#![allow(
+    dead_code,
+    reason = "the staged stationary authority surface is target-built before the later split converts every long primordial adapter into prepare/commit phases"
+)]
+
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::cpu::CpuIndex;

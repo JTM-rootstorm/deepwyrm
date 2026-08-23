@@ -26,6 +26,7 @@ use crate::memory::frame_roles::{ObjectBackingGrant, TableLevel};
 use crate::memory::object::{MemoryObjectAuthority, MemoryProtection};
 use crate::memory::user_range::{EmptyAddressRule, UserAccess, UserAddressSpace, UserRange};
 use crate::object::{HandleRef, InternalRef, ObjectRegistry};
+use crate::sync::IrqSpinMutex;
 #[cfg(feature = "test-support")]
 use crate::syscall::FServiceOperationOwner;
 use crate::syscall::native::{
@@ -379,13 +380,50 @@ static SHARED_RUNTIME_STORAGE: SharedRuntimeStorage = SharedRuntimeStorage::new(
 /// the serialized H2 join can prove remote-stop and shootdown acknowledgements.
 /// The syscall binding lifecycle, rather than a replaceable callback pointer,
 /// is the one-way Parked -> Executing gate.
-struct RuntimeCarrierFacade {
+/// Fixed CPU-local carrier storage.  BSP currently enters through the richer
+/// primordial adapter, while parked AP bindings dispatch directly to this
+/// fail-closed carrier.  Both paths name the same one-per-slot stationary
+/// storage entry; no AP can borrow BSP-local state.
+struct PerCpuLiveCarrier {
     cpu: crate::cpu::CpuIndex,
+    staging_slot: usize,
+    local: IrqSpinMutex<PerCpuCarrierLocal>,
     _shared: &'static PrimordialRuntimeShared,
 }
 
-impl RuntimeCarrierFacade {
+#[derive(Clone, Copy)]
+struct PerCpuCarrierLocal {
+    current_thread: Option<ThreadKey>,
+    current_stack: Option<crate::task::KernelStackId>,
+    current_context: Option<crate::task::ThreadContextId>,
+    scratch_cpu: crate::cpu::CpuIndex,
+    reaper_staged: bool,
+}
+
+impl PerCpuLiveCarrier {
+    fn record_current(
+        &self,
+        thread: ThreadKey,
+        stack: crate::task::KernelStackId,
+        context: crate::task::ThreadContextId,
+    ) {
+        let mut local = self.local.lock();
+        assert_eq!(local.scratch_cpu, self.cpu, "carrier scratch CPU drifted");
+        assert!(
+            !local.reaper_staged,
+            "reaper-staged carrier cannot resume a Thread"
+        );
+        local.current_thread = Some(thread);
+        local.current_stack = Some(stack);
+        local.current_context = Some(context);
+    }
+
     fn reject_entry(&self, operation: &'static str) -> ! {
+        assert_eq!(
+            self.staging_slot,
+            self.cpu.index(),
+            "carrier staging slot drifted"
+        );
         panic!(
             "parked CPU {} reached forbidden native-runtime operation {operation}",
             self.cpu.index()
@@ -394,7 +432,7 @@ impl RuntimeCarrierFacade {
 }
 
 struct RuntimeCarrierStorage(
-    UnsafeCell<[MaybeUninit<RuntimeCarrierFacade>; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT]>,
+    UnsafeCell<[MaybeUninit<PerCpuLiveCarrier>; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT]>,
 );
 
 impl RuntimeCarrierStorage {
@@ -453,7 +491,62 @@ fn publish_runtime_shared() -> &'static PrimordialRuntimeShared {
     target
 }
 
-fn bind_runtime_carrier_facades(shared: &'static PrimordialRuntimeShared) {
+fn initialize_per_cpu_live_carriers(shared: &'static PrimordialRuntimeShared) {
+    for cpu_index in 0..crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT {
+        let cpu = crate::cpu::CpuIndex::new(cpu_index)
+            .unwrap_or_else(|| panic!("CPU {cpu_index} exceeds the native carrier bound"));
+        RUNTIME_CARRIER_STATE[cpu_index]
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .unwrap_or_else(|_| panic!("CPU {cpu_index} native carrier was initialized twice"));
+        unsafe {
+            let slots = &mut *RUNTIME_CARRIER_STORAGE.0.get();
+            slots[cpu_index].write(PerCpuLiveCarrier {
+                cpu,
+                staging_slot: cpu_index,
+                local: IrqSpinMutex::new(PerCpuCarrierLocal {
+                    current_thread: None,
+                    current_stack: None,
+                    current_context: None,
+                    scratch_cpu: cpu,
+                    reaper_staged: false,
+                }),
+                _shared: shared,
+            });
+        }
+        RUNTIME_CARRIER_STATE[cpu_index].store(2, Ordering::Release);
+    }
+}
+
+fn per_cpu_live_carrier(cpu: crate::cpu::CpuIndex) -> &'static PerCpuLiveCarrier {
+    let index = cpu.index();
+    if RUNTIME_CARRIER_STATE
+        .get(index)
+        .is_none_or(|state| state.load(Ordering::Acquire) != 2)
+    {
+        panic!("CPU {index} native carrier storage is unavailable");
+    }
+    unsafe { &*(*RUNTIME_CARRIER_STORAGE.0.get())[index].as_ptr() }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "each parked AP receives exactly one one-shot binding to its own initialized carrier cell"
+)]
+unsafe fn pin_per_cpu_live_carrier(
+    cpu: crate::cpu::CpuIndex,
+) -> core::pin::Pin<&'static mut PerCpuLiveCarrier> {
+    let index = cpu.index();
+    if RUNTIME_CARRIER_STATE
+        .get(index)
+        .is_none_or(|state| state.load(Ordering::Acquire) != 2)
+    {
+        panic!("CPU {index} native carrier storage is unavailable");
+    }
+    let slots = unsafe { &mut *RUNTIME_CARRIER_STORAGE.0.get() };
+    unsafe { core::pin::Pin::new_unchecked(&mut *slots[index].as_mut_ptr()) }
+}
+
+fn bind_parked_ap_runtime_carriers() {
     let registry = crate::arch::x86_64::smp::live_cpu_registry();
     for cpu_index in 1..registry.len() {
         let snapshot = registry
@@ -464,36 +557,21 @@ fn bind_runtime_carrier_facades(shared: &'static PrimordialRuntimeShared) {
         }
         let cpu = crate::cpu::CpuIndex::new(cpu_index)
             .unwrap_or_else(|| panic!("AP {cpu_index} exceeds the native carrier bound"));
-        let state = &RUNTIME_CARRIER_STATE[cpu_index];
-        state
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .unwrap_or_else(|_| panic!("AP {cpu_index} native carrier was initialized twice"));
-        let carrier = unsafe {
-            let slots = &mut *RUNTIME_CARRIER_STORAGE.0.get();
-            let slot = slots
-                .get_mut(cpu_index)
-                .unwrap_or_else(|| panic!("AP {cpu_index} lacks native carrier storage"));
-            slot.write(RuntimeCarrierFacade {
-                cpu,
-                _shared: shared,
-            });
-            core::pin::Pin::new_unchecked(&mut *slot.as_mut_ptr())
-        };
+        let carrier = unsafe { pin_per_cpu_live_carrier(cpu) };
         unsafe { crate::arch::x86_64::syscall::bind_native_runtime_carrier_for_slot(cpu, carrier) }
             .unwrap_or_else(|error| {
                 panic!("could not bind AP {cpu_index} native carrier: {error:?}")
             });
-        state.store(2, Ordering::Release);
     }
 }
 
-impl NativeSyscallHandler for RuntimeCarrierFacade {
+impl NativeSyscallHandler for PerCpuLiveCarrier {
     fn handle(&mut self, _request: NativeSyscallRequest) -> NativeSyscallResult {
         self.reject_entry("syscall dispatch")
     }
 }
 
-impl crate::syscall::native::NativeRendezvousRuntime for RuntimeCarrierFacade {
+impl crate::syscall::native::NativeRendezvousRuntime for PerCpuLiveCarrier {
     fn rendezvous_stop(
         &mut self,
         _request: crate::arch::x86_64::rendezvous::StopRequest,
@@ -507,7 +585,7 @@ impl crate::syscall::native::NativeRendezvousRuntime for RuntimeCarrierFacade {
     unsafe_code,
     reason = "the bound AP façade is deliberately fail-closed until the serialized scheduler/live runtime join releases it"
 )]
-impl NativeSyscallFrameRuntime for RuntimeCarrierFacade {
+impl NativeSyscallFrameRuntime for PerCpuLiveCarrier {
     fn authorize_return(
         &mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
@@ -938,6 +1016,7 @@ impl CarrierActiveRoot {
 
 struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
     cpu: crate::cpu::CpuIndex,
+    local: &'static PerCpuLiveCarrier,
     active: ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
     active_root: CarrierActiveRoot,
     stopping_claim: Option<crate::task::SchedulerExecutionClaim>,
@@ -1038,6 +1117,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
     fn synchronize_scheduler_current(&mut self) {
+        assert_eq!(self.local.cpu, self.cpu, "BSP carrier storage CPU drifted");
         let thread = self
             .shared
             .execution
@@ -1089,6 +1169,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.thread = thread;
             self.stack_id = stack_id;
             self.context_id = context_id;
+            self.local.record_current(thread, stack_id, context_id);
             return;
         }
         let prepared = self
@@ -1145,6 +1226,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.stack_id = stack_id;
         self.context_id = context_id;
         self.active_root = CarrierActiveRoot::Process(selected);
+        self.local.record_current(thread, stack_id, context_id);
     }
 
     fn merge_cleanup(&mut self, cleanup: CleanupQueue<REGISTRY_OBJECTS>) {
@@ -2095,7 +2177,8 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     let mut spaces = unsafe { Spaces::new() };
     let mut regions = Regions::new();
     let shared = publish_runtime_shared();
-    bind_runtime_carrier_facades(shared);
+    initialize_per_cpu_live_carriers(shared);
+    bind_parked_ap_runtime_carriers();
     let (_root_group, root_owner) = tasks
         .create_root_group(&mut registry)
         .unwrap_or_else(|error| panic!("could not create primordial root TaskGroup: {error:?}"));
@@ -2166,6 +2249,7 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     } = monitor;
     let mut runtime = PrimordialRuntimeCarrier {
         cpu: crate::cpu::CpuIndex::BOOTSTRAP,
+        local: per_cpu_live_carrier(crate::cpu::CpuIndex::BOOTSTRAP),
         active,
         active_root: CarrierActiveRoot::Process(initial_root),
         stopping_claim: None,
@@ -2195,6 +2279,9 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         #[cfg(feature = "test-support")]
         g5_probe: G5PrimordialProbe::for_build(),
     };
+    runtime
+        .local
+        .record_current(runtime.thread, runtime.stack_id, runtime.context_id);
     let exception_binding =
         crate::arch::x86_64::syscall::bind_native_runtime_user_exception_handler()
             .unwrap_or_else(|error| panic!("could not bind primordial exceptions: {error:?}"));
