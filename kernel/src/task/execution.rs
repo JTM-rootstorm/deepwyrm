@@ -2,7 +2,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sync::SpinMutex;
 
-use super::scheduler::SchedulerCpuId;
+use super::scheduler::{SchedulerCpuId, SchedulerExecutionClaim};
 use super::{
     BlockReservation, BlockReservationFailure, BlockToken, BlockWakeKey, BlockedOperationRegistry,
     BlockedOperationsDrained, CooperativeScheduler, ExitPins, KernelStackId, ProcessKey,
@@ -686,10 +686,20 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
 
     pub(crate) fn complete_switch_on(
         &self,
-        cpu: SchedulerCpuId,
-        previous: ThreadKey,
+        claim: SchedulerExecutionClaim,
     ) -> Result<(), SchedulerError> {
-        self.scheduler.complete_switch_on(cpu, previous)
+        self.scheduler.complete_switch_on(claim)
+    }
+
+    pub(crate) fn running_claim_on(&self, cpu: SchedulerCpuId) -> Option<SchedulerExecutionClaim> {
+        self.scheduler.running_claim_on(cpu)
+    }
+
+    pub(crate) fn suspended_claim_on(
+        &self,
+        cpu: SchedulerCpuId,
+    ) -> Option<SchedulerExecutionClaim> {
+        self.scheduler.suspended_claim_on(cpu)
     }
 
     pub(crate) fn wake(&self, key: BlockWakeKey) -> Result<(), SchedulerError> {
@@ -753,8 +763,13 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     ) -> (RetiredExitPins<THREADS>, DeferredCurrentExecutionResources) {
         let retired =
             self.retire_exit_pins_defer_current_on(SchedulerCpuId::BOOTSTRAP, pins, current);
+        let claim = self
+            .scheduler
+            .suspended_claim_on(SchedulerCpuId::BOOTSTRAP)
+            .expect("BSP terminal model handoff retains its execution claim");
+        assert_eq!(claim.thread(), current);
         self.scheduler
-            .complete_switch_on(SchedulerCpuId::BOOTSTRAP, current)
+            .complete_switch_on(claim)
             .expect("BSP terminal model handoff follows current retirement");
         retired
     }

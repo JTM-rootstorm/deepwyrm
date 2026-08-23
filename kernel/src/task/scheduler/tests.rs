@@ -53,6 +53,12 @@ fn four_competing_cpus_claim_distinct_fifo_work_once() {
         claimed.push(current);
         assert_eq!(scheduler.current_on(cpu(cpu_index)), Some(current));
         assert_eq!(scheduler.running_cpu(current), Some(cpu(cpu_index)));
+        let claim = scheduler
+            .running_claim_on(cpu(cpu_index))
+            .expect("Running ownership has an exact execution claim");
+        assert_eq!(claim.thread(), current);
+        assert_eq!(claim.cpu(), cpu(cpu_index));
+        assert_ne!(claim.generation(), 0);
     }
     assert_eq!(claimed.len(), H2_SCHEDULER_CPU_CAPACITY);
     assert!(
@@ -115,6 +121,8 @@ fn pending_blocks_are_cpu_local_and_reject_the_wrong_cpu() {
     }
     scheduler.schedule_next_on(cpu(0)).unwrap();
     scheduler.schedule_next_on(cpu(1)).unwrap();
+    let first_claim = scheduler.running_claim_on(cpu(0)).unwrap();
+    let second_claim = scheduler.running_claim_on(cpu(1)).unwrap();
 
     assert!(matches!(
         scheduler.prepare_block_current_on(cpu(1), first),
@@ -122,6 +130,14 @@ fn pending_blocks_are_cpu_local_and_reject_the_wrong_cpu() {
     ));
     let first_block = scheduler.prepare_block_current_on(cpu(0), first).unwrap();
     let second_block = scheduler.prepare_block_current_on(cpu(1), second).unwrap();
+    assert_eq!(
+        first_block.wake_key().execution_generation,
+        first_claim.generation()
+    );
+    assert_eq!(
+        second_block.wake_key().execution_generation,
+        second_claim.generation()
+    );
     assert_eq!(
         scheduler.yield_current_on(cpu(0), first),
         Err(SchedulerError::BlockPreparationActive)
@@ -139,9 +155,11 @@ fn suspended_waiter_is_not_migratable_until_release_acquire_handoff() {
     let reservation = scheduler.reserve(waiter).unwrap();
     scheduler.commit(reservation).unwrap();
     scheduler.schedule_next_on(cpu(0)).unwrap();
+    let active_claim = scheduler.running_claim_on(cpu(0)).unwrap();
     let (blocked, decision) = scheduler.block_current_on(cpu(0), waiter).unwrap();
     assert_eq!(decision.current, None);
     assert_eq!(scheduler.suspended_on(cpu(0)), Some(waiter));
+    assert_eq!(scheduler.suspended_claim_on(cpu(0)), Some(active_claim));
 
     scheduler.wake(blocked.into_wake_key()).unwrap();
     assert_eq!(scheduler.schedule_next_on(cpu(1)).unwrap().current, None);
@@ -151,6 +169,7 @@ fn suspended_waiter_is_not_migratable_until_release_acquire_handoff() {
         IdleScheduleDecision::ResumeCurrent
     );
     assert_eq!(scheduler.running_cpu(waiter), Some(cpu(0)));
+    assert_eq!(scheduler.running_claim_on(cpu(0)), Some(active_claim));
     assert_eq!(scheduler.suspended_on(cpu(0)), None);
     assert_eq!(scheduler.check_invariants(), Ok(()));
 }
@@ -166,19 +185,59 @@ fn completed_switch_makes_outgoing_continuation_claimable_by_an_idle_cpu() {
         scheduler.commit(reservation).unwrap();
     }
     scheduler.schedule_next_on(cpu(0)).unwrap();
+    let outgoing_claim = scheduler.running_claim_on(cpu(0)).unwrap();
     let decision = scheduler.yield_current_on(cpu(0), outgoing).unwrap();
     assert_eq!(decision.current, Some(destination));
     assert_eq!(scheduler.suspended_on(cpu(0)), Some(outgoing));
+    assert_eq!(scheduler.suspended_claim_on(cpu(0)), Some(outgoing_claim));
     assert_eq!(scheduler.schedule_next_on(cpu(1)).unwrap().current, None);
 
     // Models the post-assembly Release edge. The CPU-1 claim acquires the same
     // scheduler lock before it can observe the continuation as eligible.
-    scheduler.complete_switch_on(cpu(0), outgoing).unwrap();
+    scheduler.complete_switch_on(outgoing_claim).unwrap();
     assert_eq!(
         scheduler.schedule_next_on(cpu(1)).unwrap().current,
         Some(outgoing)
     );
     assert_eq!(scheduler.running_cpu(outgoing), Some(cpu(1)));
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn stale_same_thread_same_cpu_switch_completion_cannot_clear_a_later_claim() {
+    let scheduler = CooperativeScheduler::<2>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let first = thread_key(&mut registry);
+    let second = thread_key(&mut registry);
+    for key in [first, second] {
+        let reservation = scheduler.reserve(key).unwrap();
+        scheduler.commit(reservation).unwrap();
+    }
+
+    scheduler.schedule_next_on(cpu(0)).unwrap();
+    let first_claim = scheduler.running_claim_on(cpu(0)).unwrap();
+    scheduler.yield_current_on(cpu(0), first).unwrap();
+    assert_eq!(scheduler.suspended_claim_on(cpu(0)), Some(first_claim));
+    scheduler.complete_switch_on(first_claim).unwrap();
+
+    let second_claim = scheduler.running_claim_on(cpu(0)).unwrap();
+    scheduler.yield_current_on(cpu(0), second).unwrap();
+    scheduler.complete_switch_on(second_claim).unwrap();
+
+    let later_first_claim = scheduler.running_claim_on(cpu(0)).unwrap();
+    assert_eq!(later_first_claim.thread(), first);
+    assert_eq!(later_first_claim.cpu(), first_claim.cpu());
+    assert_ne!(later_first_claim.generation(), first_claim.generation());
+    scheduler.yield_current_on(cpu(0), first).unwrap();
+    assert_eq!(
+        scheduler.complete_switch_on(first_claim),
+        Err(SchedulerError::StaleExecutionClaim)
+    );
+    assert_eq!(
+        scheduler.suspended_claim_on(cpu(0)),
+        Some(later_first_claim)
+    );
+    scheduler.complete_switch_on(later_first_claim).unwrap();
     assert_eq!(scheduler.check_invariants(), Ok(()));
 }
 
