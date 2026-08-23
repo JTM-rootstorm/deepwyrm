@@ -138,6 +138,22 @@ SECTIONS
         . += DW_KERNEL_TERMINAL_REAPER_STACK_SIZE;
         __dw_terminal_reaper_stack_top = .;
 
+        /*
+         * H1 runtime CPU arena. The preceding IST/entry/reaper carriers are
+         * retained only for the BSP's pre-migration bootstrap path. Each of
+         * these four canonical runtime slots owns, in order, three ISTs, one
+         * privilege-entry stack, one terminal-reaper stack, and one AP
+         * bootstrap stack. Every payload is preceded by one base-page guard.
+         */
+        . = ALIGN(DW_KERNEL_BASE_PAGE_SIZE);
+        __dw_runtime_cpu_stack_arena_start = .;
+        . += 4 * (
+            3 * (DW_KERNEL_BASE_PAGE_SIZE + 4 * DW_KERNEL_BASE_PAGE_SIZE) +
+            (DW_KERNEL_BASE_PAGE_SIZE + DW_KERNEL_PRIVILEGE_ENTRY_STACK_SIZE) +
+            (DW_KERNEL_BASE_PAGE_SIZE + DW_KERNEL_TERMINAL_REAPER_STACK_SIZE) +
+            (DW_KERNEL_BASE_PAGE_SIZE + 16 * DW_KERNEL_BASE_PAGE_SIZE));
+        __dw_runtime_cpu_stack_arena_end = .;
+
         *(.bss .bss.*)
         *(.sbss .sbss.*)
         *(COMMON)
@@ -232,3 +248,17 @@ ASSERT((__dw_terminal_reaper_stack_bottom - __dw_terminal_reaper_stack_guard) ==
 ASSERT((__dw_terminal_reaper_stack_top - __dw_terminal_reaper_stack_bottom) ==
        DW_KERNEL_TERMINAL_REAPER_STACK_SIZE,
        "terminal reaper stack extent drifted")
+
+ASSERT((__dw_runtime_cpu_stack_arena_start & (DW_KERNEL_BASE_PAGE_SIZE - 1)) == 0,
+       "H1 runtime CPU stack arena must be base-page aligned")
+ASSERT(__dw_terminal_reaper_stack_top <= __dw_runtime_cpu_stack_arena_start,
+       "H1 runtime CPU stack arena must not overlap the early BSP carriers")
+ASSERT((__dw_runtime_cpu_stack_arena_end - __dw_runtime_cpu_stack_arena_start) ==
+       4 * 70 * DW_KERNEL_BASE_PAGE_SIZE,
+       "H1 runtime CPU stack arena must contain four exact 70-page slots")
+ASSERT(((__dw_runtime_cpu_stack_arena_end - __dw_runtime_cpu_stack_arena_start) / 4) ==
+       (3 * (DW_KERNEL_BASE_PAGE_SIZE + 4 * DW_KERNEL_BASE_PAGE_SIZE) +
+        (DW_KERNEL_BASE_PAGE_SIZE + DW_KERNEL_PRIVILEGE_ENTRY_STACK_SIZE) +
+        (DW_KERNEL_BASE_PAGE_SIZE + DW_KERNEL_TERMINAL_REAPER_STACK_SIZE) +
+        (DW_KERNEL_BASE_PAGE_SIZE + 16 * DW_KERNEL_BASE_PAGE_SIZE)),
+       "H1 runtime CPU slot geometry drifted")

@@ -874,6 +874,67 @@ fn terminal_reaper_layout_is_independent_guarded_and_conflict_free() {
 }
 
 #[test]
+fn h1_runtime_cpu_arena_validates_every_private_stack_and_guard() {
+    let arena_start = 0xffff_8000_0400_0000;
+    let arena_end = arena_start + 4 * 70 * PAGE_SIZE;
+    let slots =
+        crate::arch::x86_64::runtime_cpu_stack_layout_from_arena(arena_start, arena_end).unwrap();
+    let segments = [
+        KernelSegment {
+            start: arena_start - 2 * PAGE_SIZE,
+            end: arena_start - PAGE_SIZE,
+            kind: SegmentKind::Text,
+        },
+        KernelSegment {
+            start: arena_start - PAGE_SIZE,
+            end: arena_start,
+            kind: SegmentKind::ReadOnly,
+        },
+        KernelSegment {
+            start: arena_start,
+            end: arena_end,
+            kind: SegmentKind::Writable,
+        },
+    ];
+    assert_eq!(
+        validate_runtime_cpu_stack_layout(
+            &segments,
+            FIXTURE_SCRATCH,
+            FIXTURE_SCRATCH + PAGE_SIZE,
+            &slots,
+        ),
+        Ok(())
+    );
+    for slot in slots {
+        for stack in slot.stacks() {
+            assert!(is_runtime_cpu_stack_guard(&slots, stack.guard_page));
+            assert!(!is_runtime_cpu_stack_guard(&slots, stack.bottom));
+        }
+    }
+
+    let mut drifted = slots;
+    drifted[1].ap_bootstrap.top -= PAGE_SIZE;
+    assert_eq!(
+        validate_runtime_cpu_stack_layout(
+            &segments,
+            FIXTURE_SCRATCH,
+            FIXTURE_SCRATCH + PAGE_SIZE,
+            &drifted,
+        ),
+        Err(InactiveGraphError::InvalidSegmentLayout)
+    );
+    assert_eq!(
+        validate_runtime_cpu_stack_layout(
+            &segments,
+            slots[2].terminal_reaper.guard_page,
+            FIXTURE_SCRATCH + PAGE_SIZE,
+            &slots,
+        ),
+        Err(InactiveGraphError::InvalidSegmentLayout)
+    );
+}
+
+#[test]
 fn guard_leaf_absence_rejects_a_missing_parent_path() {
     let fixture = graph_fixture();
     let mut access = FakeGraphAccess::default();

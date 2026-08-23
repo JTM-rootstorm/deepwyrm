@@ -47,7 +47,6 @@ mod bootstrap_cpu_policy_tests {
     }
 }
 
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 use crate::memory::physical::BASE_PAGE_SIZE;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 use core::cell::UnsafeCell;
@@ -382,6 +381,242 @@ pub(crate) fn linked_terminal_reaper_stack_layout()
         return Err(TerminalReaperStackLayoutError::InvalidGeometry);
     }
     Ok(bounds)
+}
+
+/// Canonical H1 runtime CPU capacity. Firmware may describe more processors,
+/// but DW0 brings at most these four slots into the shared runtime.
+pub(crate) const H1_RUNTIME_CPU_SLOT_COUNT: usize = 4;
+pub(crate) const H1_RUNTIME_AP_BOOTSTRAP_STACK_SIZE: u64 = 64 * 1024;
+#[allow(
+    dead_code,
+    reason = "host integration builds do not resolve the target linker arena"
+)]
+const H1_RUNTIME_IST_STACK_SIZE: u64 = 16 * 1024;
+#[allow(
+    dead_code,
+    reason = "host integration builds do not consume target runtime slot members"
+)]
+const H1_RUNTIME_STACKS_PER_SLOT: usize = 6;
+#[allow(
+    dead_code,
+    reason = "host integration builds do not resolve the target linker arena"
+)]
+const H1_RUNTIME_CPU_SLOT_SIZE: u64 = 3 * (BASE_PAGE_SIZE + H1_RUNTIME_IST_STACK_SIZE)
+    + BASE_PAGE_SIZE
+    + crate::memory::kernel_stack::E4_PRIVILEGE_ENTRY_STACK_SIZE
+    + BASE_PAGE_SIZE
+    + crate::memory::kernel_stack::TERMINAL_REAPER_STACK_SIZE
+    + BASE_PAGE_SIZE
+    + H1_RUNTIME_AP_BOOTSTRAP_STACK_SIZE;
+
+/// Linker-backed private stack carriers for one runtime CPU. The early BSP
+/// carriers remain separate and are valid only until the BSP migrates here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeCpuStackLayout {
+    pub(crate) interrupt_stacks: [crate::memory::kernel_stack::KernelStackBounds; 3],
+    pub(crate) privilege_entry: crate::memory::kernel_stack::KernelStackBounds,
+    pub(crate) terminal_reaper: crate::memory::kernel_stack::KernelStackBounds,
+    pub(crate) ap_bootstrap: crate::memory::kernel_stack::KernelStackBounds,
+}
+
+impl RuntimeCpuStackLayout {
+    #[allow(
+        dead_code,
+        reason = "host integration builds do not consume target runtime slot members"
+    )]
+    pub(crate) const fn stacks(
+        self,
+    ) -> [crate::memory::kernel_stack::KernelStackBounds; H1_RUNTIME_STACKS_PER_SLOT] {
+        [
+            self.interrupt_stacks[0],
+            self.interrupt_stacks[1],
+            self.interrupt_stacks[2],
+            self.privilege_entry,
+            self.terminal_reaper,
+            self.ap_bootstrap,
+        ]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "host integration builds retain the bounded parser for source-contract coverage"
+)]
+pub(crate) enum RuntimeCpuStackLayoutError {
+    InvalidGeometry,
+}
+
+#[allow(
+    dead_code,
+    reason = "host integration builds do not resolve the target linker arena"
+)]
+fn next_runtime_stack(
+    cursor: &mut u64,
+    payload_size: u64,
+) -> Result<crate::memory::kernel_stack::KernelStackBounds, RuntimeCpuStackLayoutError> {
+    let guard_page = *cursor;
+    let bottom = guard_page
+        .checked_add(BASE_PAGE_SIZE)
+        .ok_or(RuntimeCpuStackLayoutError::InvalidGeometry)?;
+    let top = bottom
+        .checked_add(payload_size)
+        .ok_or(RuntimeCpuStackLayoutError::InvalidGeometry)?;
+    let stack = crate::memory::kernel_stack::KernelStackBounds::new(guard_page, bottom, top)
+        .map_err(|_| RuntimeCpuStackLayoutError::InvalidGeometry)?;
+    *cursor = top;
+    Ok(stack)
+}
+
+/// Derives all runtime CPU carriers from the two linker boundaries without
+/// unchecked indexing or pointer arithmetic.
+#[allow(
+    dead_code,
+    reason = "host integration builds do not resolve the target linker arena"
+)]
+pub(crate) fn runtime_cpu_stack_layout_from_arena(
+    arena_start: u64,
+    arena_end: u64,
+) -> Result<[RuntimeCpuStackLayout; H1_RUNTIME_CPU_SLOT_COUNT], RuntimeCpuStackLayoutError> {
+    let expected_size = H1_RUNTIME_CPU_SLOT_SIZE
+        .checked_mul(H1_RUNTIME_CPU_SLOT_COUNT as u64)
+        .ok_or(RuntimeCpuStackLayoutError::InvalidGeometry)?;
+    if arena_start < 0xffff_8000_0000_0000
+        || !arena_start.is_multiple_of(BASE_PAGE_SIZE)
+        || arena_end.checked_sub(arena_start) != Some(expected_size)
+    {
+        return Err(RuntimeCpuStackLayoutError::InvalidGeometry);
+    }
+
+    let placeholder = RuntimeCpuStackLayout {
+        interrupt_stacks: [crate::memory::kernel_stack::KernelStackBounds::new(
+            BASE_PAGE_SIZE,
+            2 * BASE_PAGE_SIZE,
+            3 * BASE_PAGE_SIZE,
+        )
+        .map_err(|_| RuntimeCpuStackLayoutError::InvalidGeometry)?; 3],
+        privilege_entry: crate::memory::kernel_stack::KernelStackBounds::new(
+            BASE_PAGE_SIZE,
+            2 * BASE_PAGE_SIZE,
+            3 * BASE_PAGE_SIZE,
+        )
+        .map_err(|_| RuntimeCpuStackLayoutError::InvalidGeometry)?,
+        terminal_reaper: crate::memory::kernel_stack::KernelStackBounds::new(
+            BASE_PAGE_SIZE,
+            2 * BASE_PAGE_SIZE,
+            3 * BASE_PAGE_SIZE,
+        )
+        .map_err(|_| RuntimeCpuStackLayoutError::InvalidGeometry)?,
+        ap_bootstrap: crate::memory::kernel_stack::KernelStackBounds::new(
+            BASE_PAGE_SIZE,
+            2 * BASE_PAGE_SIZE,
+            3 * BASE_PAGE_SIZE,
+        )
+        .map_err(|_| RuntimeCpuStackLayoutError::InvalidGeometry)?,
+    };
+    let mut slots = [placeholder; H1_RUNTIME_CPU_SLOT_COUNT];
+    let mut cursor = arena_start;
+    for slot in &mut slots {
+        let interrupt_stacks = [
+            next_runtime_stack(&mut cursor, H1_RUNTIME_IST_STACK_SIZE)?,
+            next_runtime_stack(&mut cursor, H1_RUNTIME_IST_STACK_SIZE)?,
+            next_runtime_stack(&mut cursor, H1_RUNTIME_IST_STACK_SIZE)?,
+        ];
+        let privilege_entry = next_runtime_stack(
+            &mut cursor,
+            crate::memory::kernel_stack::E4_PRIVILEGE_ENTRY_STACK_SIZE,
+        )?;
+        let terminal_reaper = next_runtime_stack(
+            &mut cursor,
+            crate::memory::kernel_stack::TERMINAL_REAPER_STACK_SIZE,
+        )?;
+        let ap_bootstrap = next_runtime_stack(&mut cursor, H1_RUNTIME_AP_BOOTSTRAP_STACK_SIZE)?;
+        *slot = RuntimeCpuStackLayout {
+            interrupt_stacks,
+            privilege_entry,
+            terminal_reaper,
+            ap_bootstrap,
+        };
+    }
+    if cursor != arena_end {
+        return Err(RuntimeCpuStackLayoutError::InvalidGeometry);
+    }
+    Ok(slots)
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "linker-defined H1 runtime CPU arena bounds are immutable kernel-layout facts"
+)]
+pub(crate) fn linked_runtime_cpu_stack_layout()
+-> Result<[RuntimeCpuStackLayout; H1_RUNTIME_CPU_SLOT_COUNT], RuntimeCpuStackLayoutError> {
+    unsafe extern "C" {
+        static __dw_runtime_cpu_stack_arena_start: u8;
+        static __dw_runtime_cpu_stack_arena_end: u8;
+    }
+    runtime_cpu_stack_layout_from_arena(
+        opaque_linker_symbol_address(core::ptr::addr_of!(__dw_runtime_cpu_stack_arena_start)),
+        opaque_linker_symbol_address(core::ptr::addr_of!(__dw_runtime_cpu_stack_arena_end)),
+    )
+}
+
+#[cfg(test)]
+mod runtime_cpu_stack_tests {
+    use super::*;
+
+    const ARENA_START: u64 = 0xffff_8000_1000_0000;
+
+    #[test]
+    fn four_runtime_slots_have_exact_private_guarded_geometry() {
+        let arena_end = ARENA_START
+            + H1_RUNTIME_CPU_SLOT_SIZE * u64::try_from(H1_RUNTIME_CPU_SLOT_COUNT).unwrap();
+        let slots = runtime_cpu_stack_layout_from_arena(ARENA_START, arena_end).unwrap();
+        let mut expected_guard = ARENA_START;
+        let mut guards = [0_u64; H1_RUNTIME_CPU_SLOT_COUNT * H1_RUNTIME_STACKS_PER_SLOT];
+        let mut guard_count = 0;
+        for slot in slots {
+            let stacks = slot.stacks();
+            for (index, stack) in stacks.into_iter().enumerate() {
+                assert_eq!(stack.guard_page, expected_guard);
+                assert_eq!(stack.bottom - stack.guard_page, BASE_PAGE_SIZE);
+                let expected_payload = match index {
+                    0..=2 => H1_RUNTIME_IST_STACK_SIZE,
+                    3 => crate::memory::kernel_stack::E4_PRIVILEGE_ENTRY_STACK_SIZE,
+                    4 => crate::memory::kernel_stack::TERMINAL_REAPER_STACK_SIZE,
+                    5 => H1_RUNTIME_AP_BOOTSTRAP_STACK_SIZE,
+                    _ => unreachable!(),
+                };
+                assert_eq!(stack.byte_len(), expected_payload);
+                assert!(!guards[..guard_count].contains(&stack.guard_page));
+                guards[guard_count] = stack.guard_page;
+                guard_count += 1;
+                expected_guard = stack.top;
+            }
+        }
+        assert_eq!(
+            guard_count,
+            H1_RUNTIME_CPU_SLOT_COUNT * H1_RUNTIME_STACKS_PER_SLOT
+        );
+        assert_eq!(expected_guard, arena_end);
+    }
+
+    #[test]
+    fn runtime_arena_rejects_unbounded_or_drifted_linker_geometry() {
+        let arena_end = ARENA_START + H1_RUNTIME_CPU_SLOT_SIZE * 4;
+        assert_eq!(
+            runtime_cpu_stack_layout_from_arena(ARENA_START + 1, arena_end),
+            Err(RuntimeCpuStackLayoutError::InvalidGeometry)
+        );
+        assert_eq!(
+            runtime_cpu_stack_layout_from_arena(ARENA_START, arena_end - BASE_PAGE_SIZE),
+            Err(RuntimeCpuStackLayoutError::InvalidGeometry)
+        );
+        assert_eq!(
+            runtime_cpu_stack_layout_from_arena(u64::MAX - BASE_PAGE_SIZE + 1, u64::MAX),
+            Err(RuntimeCpuStackLayoutError::InvalidGeometry)
+        );
+    }
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]

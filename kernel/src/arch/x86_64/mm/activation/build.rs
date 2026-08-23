@@ -204,6 +204,8 @@ pub(super) fn build_and_bind_deep_root<
             .map_err(|_| DeepRootBuildError::InvalidKernelLayout)?;
         let terminal_reaper = crate::arch::x86_64::linked_terminal_reaper_stack_layout()
             .map_err(|_| DeepRootBuildError::InvalidKernelLayout)?;
+        let runtime_cpu_stacks = crate::arch::x86_64::linked_runtime_cpu_stack_layout()
+            .map_err(|_| DeepRootBuildError::InvalidKernelLayout)?;
         let capabilities = mapper.capabilities();
         let window_page = mapper.temporary_virtual_address();
         let control_page = window_page
@@ -236,6 +238,13 @@ pub(super) fn build_and_bind_deep_root<
                 privilege_entry,
                 &thread_stacks,
                 terminal_reaper,
+            )
+            .is_err()
+            || validate_runtime_cpu_stack_layout(
+                &segments,
+                window_page,
+                control_page,
+                &runtime_cpu_stacks,
             )
             .is_err()
         {

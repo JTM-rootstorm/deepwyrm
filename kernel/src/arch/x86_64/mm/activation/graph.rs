@@ -170,6 +170,40 @@ pub(super) fn is_thread_stack_guard(
     thread_stacks.iter().any(|stack| stack.guard_page == page)
 }
 
+const H1_RUNTIME_CPU_SLOT_COUNT: usize = 4;
+const H1_RUNTIME_AP_BOOTSTRAP_STACK_SIZE: u64 = 64 * 1024;
+
+pub(super) trait RuntimeCpuStackFacts {
+    fn stacks(&self) -> [crate::memory::kernel_stack::KernelStackBounds; 6];
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+impl RuntimeCpuStackFacts for crate::arch::x86_64::RuntimeCpuStackLayout {
+    fn stacks(&self) -> [crate::memory::kernel_stack::KernelStackBounds; 6] {
+        (*self).stacks()
+    }
+}
+
+pub(super) fn is_runtime_cpu_stack_guard<T: RuntimeCpuStackFacts>(
+    runtime_slots: &[T],
+    page: u64,
+) -> bool {
+    runtime_slots
+        .iter()
+        .any(|slot| slot.stacks().iter().any(|stack| stack.guard_page == page))
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn is_linked_runtime_cpu_stack_guard(page: u64) -> bool {
+    crate::arch::x86_64::linked_runtime_cpu_stack_layout()
+        .is_ok_and(|slots| is_runtime_cpu_stack_guard(&slots, page))
+}
+
+#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+const fn is_linked_runtime_cpu_stack_guard(_page: u64) -> bool {
+    false
+}
+
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 fn is_terminal_reaper_guard(page: u64) -> bool {
     crate::arch::x86_64::linked_terminal_reaper_stack_layout()
@@ -191,6 +225,52 @@ pub(super) fn is_kernel_guard(
         || is_thread_stack_guard(thread_stacks, page)
         || privilege_entry.guard_page == page
         || is_terminal_reaper_guard(page)
+        || is_linked_runtime_cpu_stack_guard(page)
+}
+
+pub(super) fn validate_runtime_cpu_stack_layout<T: RuntimeCpuStackFacts>(
+    segments: &[KernelSegment; 3],
+    scratch_window_page: u64,
+    scratch_control_page: u64,
+    runtime_slots: &[T],
+) -> Result<(), InactiveGraphError<core::convert::Infallible>> {
+    let Some(writable) = segments
+        .iter()
+        .copied()
+        .find(|segment| segment.kind == SegmentKind::Writable)
+    else {
+        return Err(InactiveGraphError::InvalidSegmentLayout);
+    };
+    if runtime_slots.len() != H1_RUNTIME_CPU_SLOT_COUNT {
+        return Err(InactiveGraphError::InvalidSegmentLayout);
+    }
+    let scratch_mmio_page = scratch_control_page.checked_add(PAGE_SIZE).unwrap_or(0);
+    let mut previous_top = None;
+    for slot in runtime_slots {
+        for (index, stack) in slot.stacks().into_iter().enumerate() {
+            let expected_payload = match index {
+                0..=2 => 16 * 1024,
+                3 => crate::memory::kernel_stack::E4_PRIVILEGE_ENTRY_STACK_SIZE,
+                4 => crate::memory::kernel_stack::TERMINAL_REAPER_STACK_SIZE,
+                5 => H1_RUNTIME_AP_BOOTSTRAP_STACK_SIZE,
+                _ => return Err(InactiveGraphError::InvalidSegmentLayout),
+            };
+            if stack.bottom.checked_sub(stack.guard_page) != Some(PAGE_SIZE)
+                || stack.byte_len() != expected_payload
+                || !stack.guard_page.is_multiple_of(PAGE_SIZE)
+                || !writable.contains(stack.guard_page)
+                || stack.top > writable.end
+                || previous_top.is_some_and(|top| top != stack.guard_page)
+                || (scratch_window_page >= stack.guard_page && scratch_window_page < stack.top)
+                || (scratch_control_page >= stack.guard_page && scratch_control_page < stack.top)
+                || (scratch_mmio_page >= stack.guard_page && scratch_mmio_page < stack.top)
+            {
+                return Err(InactiveGraphError::InvalidSegmentLayout);
+            }
+            previous_top = Some(stack.top);
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn validate_ist_layout(
@@ -425,6 +505,14 @@ pub(super) fn validate_segment_layout(
         privilege_entry,
         thread_stacks,
         crate::arch::x86_64::linked_terminal_reaper_stack_layout()
+            .map_err(|_| InactiveGraphError::InvalidSegmentLayout)?,
+    )?;
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    validate_runtime_cpu_stack_layout(
+        segments,
+        scratch.window_page,
+        scratch.control_page,
+        &crate::arch::x86_64::linked_runtime_cpu_stack_layout()
             .map_err(|_| InactiveGraphError::InvalidSegmentLayout)?,
     )?;
     Ok(())
