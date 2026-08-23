@@ -159,6 +159,7 @@ pub(crate) enum OwnedPageTableJournalError<E> {
     JournalCapacity,
     JournalConflict,
     FrameRole(FrameRoleError),
+    InvalidCandidateEntry { level_index: usize, entry: u64 },
     InvalidPlan,
     UnauthorizedLeaf,
 }
@@ -323,8 +324,10 @@ where
                 }
                 return Ok((addresses, count));
             }
-            current = decode_intermediate(entry, page.is_user_half(), self.physical_limit)
-                .map_err(|_| OwnedPageTableJournalError::InvalidPlan)?;
+            current =
+                decode_intermediate(entry, page.is_user_half(), self.physical_limit).map_err(
+                    |_| OwnedPageTableJournalError::InvalidCandidateEntry { level_index, entry },
+                )?;
         }
         Ok((addresses, count))
     }
