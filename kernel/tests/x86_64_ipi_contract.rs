@@ -98,15 +98,17 @@ fn h2_h3_receive_seam_eois_before_capability_free_protocol_callbacks() {
         .0;
     let eoi = dispatch.find("transport.eoi").expect("EOI trampoline call");
     let handler = dispatch
-        .find("handlers.rendezvous")
+        .find("RENDEZVOUS_HANDLER.get()")
         .expect("rendezvous callback");
     assert!(
         eoi < handler,
         "EOI must precede a possibly waiting stop callback"
     );
     assert!(dispatch.contains("halt_without_return()"));
-    assert!(ipi.contains("rendezvous: fn()"));
-    assert!(ipi.contains("tlb_shootdown: fn()"));
+    assert!(ipi.contains("bind_live_rendezvous_handler(handler: fn())"));
+    assert!(ipi.contains("bind_live_tlb_shootdown_handler(handler: fn())"));
+    assert!(ipi.contains("static RENDEZVOUS_HANDLER: BindingSlot<fn()>"));
+    assert!(ipi.contains("static TLB_SHOOTDOWN_HANDLER: BindingSlot<fn()>"));
     for forbidden in [
         "crate::memory",
         "crate::syscall",
@@ -119,6 +121,55 @@ fn h2_h3_receive_seam_eois_before_capability_free_protocol_callbacks() {
             "fixed IPI seam acquired forbidden authority `{forbidden}`"
         );
     }
+}
+
+#[test]
+fn h4_remote_deadline_mutation_notifies_only_the_bsp_timer_service_over_e1() {
+    let live = source("src/time/live.rs");
+    for evidence in [
+        "static BSP_TIMER_SERVICE_PENDING: AtomicBool",
+        "BSP_TIMER_SERVICE_PENDING.store(true, Ordering::Release)",
+        "send_live_ipi(bsp.local_apic_id, LiveIpiVector::Rendezvous)",
+        "BSP_TIMER_SERVICE_PENDING.swap(false, Ordering::AcqRel)",
+        "installed_current_cpu_index() == Ok(CpuIndex::BOOTSTRAP)",
+        "bind_live_rendezvous_handler(live_rendezvous_handler)",
+    ] {
+        assert!(
+            live.contains(evidence),
+            "H4 BSP timer-service dispatch omitted `{evidence}`"
+        );
+    }
+
+    let request = live
+        .split_once("fn request_bsp_timer_service()")
+        .expect("H4 BSP timer-service request")
+        .1
+        .split_once("fn service_bsp_timer_request()")
+        .expect("H4 BSP timer-service request extent")
+        .0;
+    assert!(request.contains("LiveIpiVector::Rendezvous"));
+    assert!(!request.contains("LiveIpiVector::TlbShootdown"));
+
+    let ap_init = live
+        .split_once("pub(crate) fn initialize_ap_local_apic")
+        .expect("AP local-APIC initializer")
+        .1
+        .split_once("pub(crate) fn send_bsp_ipi")
+        .expect("AP local-APIC initializer extent")
+        .0;
+    assert!(ap_init.contains("configure_one_shot_timer"));
+    assert!(!ap_init.contains("program_one_shot_timer"));
+
+    let apic = source("src/arch/x86_64/apic.rs");
+    let masked_timer = apic
+        .split_once("pub fn configure_one_shot_timer")
+        .expect("masked one-shot configuration")
+        .1
+        .split_once("pub fn start_timer_calibration")
+        .expect("masked one-shot configuration extent")
+        .0;
+    assert!(masked_timer.contains("APIC_LVT_MASKED"));
+    assert!(masked_timer.contains("APIC_TIMER_INITIAL_COUNT, 0"));
 }
 
 #[test]

@@ -66,12 +66,6 @@ struct TransportBinding {
 )]
 unsafe impl Sync for TransportBinding {}
 
-#[derive(Clone, Copy)]
-struct HandlerBinding {
-    rendezvous: fn(),
-    tlb_shootdown: fn(),
-}
-
 struct BindingSlot<T> {
     state: AtomicU8,
     value: UnsafeCell<MaybeUninit<T>>,
@@ -119,7 +113,8 @@ impl<T> BindingSlot<T> {
 unsafe impl<T: Sync> Sync for BindingSlot<T> {}
 
 static TRANSPORT: BindingSlot<TransportBinding> = BindingSlot::new();
-static HANDLERS: BindingSlot<HandlerBinding> = BindingSlot::new();
+static RENDEZVOUS_HANDLER: BindingSlot<fn()> = BindingSlot::new();
+static TLB_SHOOTDOWN_HANDLER: BindingSlot<fn()> = BindingSlot::new();
 
 /// Reports whether the immutable send/EOI transport has been published.
 pub(crate) fn live_ipi_transport_is_bound() -> bool {
@@ -159,19 +154,22 @@ unsafe fn transport_eoi<T: LiveIpiTransport>(context: *const ()) -> bool {
     transport.end_of_interrupt()
 }
 
-/// Publishes bounded receive callbacks exactly once.
+/// Publishes the bounded rendezvous receive callback exactly once.
 ///
-/// The callbacks run with `IF=0`, after local-APIC EOI, and receive no general
-/// kernel capability. They may inspect only their own protocol-owned atomic
-/// mailbox/state and must not usercopy, finalize objects, or schedule.
-pub(crate) fn bind_live_ipi_handlers(
-    rendezvous: fn(),
-    tlb_shootdown: fn(),
-) -> Result<(), LiveIpiBindError> {
-    HANDLERS.bind(HandlerBinding {
-        rendezvous,
-        tlb_shootdown,
-    })
+/// The callback runs with `IF=0`, after local-APIC EOI, and receives no general
+/// kernel capability. It may inspect only protocol-owned IRQ-safe state and
+/// must not usercopy, finalize objects, or schedule.
+pub(crate) fn bind_live_rendezvous_handler(handler: fn()) -> Result<(), LiveIpiBindError> {
+    RENDEZVOUS_HANDLER.bind(handler)
+}
+
+/// Publishes the bounded TLB-shootdown receive callback exactly once.
+///
+/// Keeping the two protocol callbacks independently bindable prevents H4's
+/// timer-service/idle-wake rendezvous from installing a false no-op shootdown
+/// acknowledgement before H3's live root-coherency join is ready.
+pub(crate) fn bind_live_tlb_shootdown_handler(handler: fn()) -> Result<(), LiveIpiBindError> {
+    TLB_SHOOTDOWN_HANDLER.bind(handler)
 }
 
 /// Sends one fixed IPI through the installed persistent transport.
@@ -208,11 +206,12 @@ fn dispatch(vector: LiveIpiVector) {
     // stop callback may wait for release without retaining APIC in-service
     // ownership. An unbound callback is a wake/no-request no-op; it never
     // publishes a logical Safe or shootdown acknowledgement.
-    if let Some(handlers) = HANDLERS.get() {
-        match vector {
-            LiveIpiVector::Rendezvous => (handlers.rendezvous)(),
-            LiveIpiVector::TlbShootdown => (handlers.tlb_shootdown)(),
-        }
+    let handler = match vector {
+        LiveIpiVector::Rendezvous => RENDEZVOUS_HANDLER.get(),
+        LiveIpiVector::TlbShootdown => TLB_SHOOTDOWN_HANDLER.get(),
+    };
+    if let Some(handler) = handler {
+        handler();
     }
 }
 
@@ -307,7 +306,8 @@ mod tests {
         assert!(!live_ipi_transport_is_bound());
         bind_live_ipi_transport(&MOCK_TRANSPORT).unwrap();
         assert!(live_ipi_transport_is_bound());
-        bind_live_ipi_handlers(rendezvous_handler, shootdown_handler).unwrap();
+        bind_live_rendezvous_handler(rendezvous_handler).unwrap();
+        bind_live_tlb_shootdown_handler(shootdown_handler).unwrap();
 
         send_live_ipi(7, LiveIpiVector::Rendezvous).unwrap();
         assert_eq!(

@@ -2,7 +2,7 @@
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use crate::arch::x86_64::apic::{
     ApicMode, IpiOperation, LocalApic, LocalApicDiscovery, XApicRegisterAccess,
@@ -11,7 +11,8 @@ use crate::arch::x86_64::apic_live::{
     LiveApicBaseMsr, LiveXApicMmio, discover_local_apic, lapic_pat_entry_is_uncacheable,
 };
 use crate::arch::x86_64::ipi::{
-    LiveIpiTransport, LiveIpiVector, bind_live_ipi_transport, live_ipi_transport_is_bound,
+    LiveIpiTransport, LiveIpiVector, bind_live_ipi_transport, bind_live_rendezvous_handler,
+    live_ipi_transport_is_bound, send_live_ipi,
 };
 use crate::arch::x86_64::mm::{ActiveDeepPaging, FrameAddress, LiveActivePagingTarget};
 use crate::cpu::{CPU_CAPACITY, CpuIndex};
@@ -33,6 +34,14 @@ const LAPIC_SLOT_EMPTY: u8 = 0;
 const LAPIC_SLOT_PUBLISHING: u8 = 1;
 const LAPIC_SLOT_ONLINE: u8 = 2;
 const XAPIC_EOI_REGISTER: u32 = 0x0b0;
+
+/// Coalesced request for logical CPU 0 to resample and reprogram its one-shot
+/// timer after another CPU mutates the synchronized global deadline queues.
+///
+/// The Release store precedes the fixed e1 send. The BSP's Acquire swap runs
+/// after EOI and before it takes the time lock, so one delivery may safely
+/// cover any number of mutations already visible through that lock.
+static BSP_TIMER_SERVICE_PENDING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LiveTimeError {
@@ -347,6 +356,44 @@ fn with_bootstrap_local_apic<T>(
     LOCAL_APIC_SLOTS[CpuIndex::BOOTSTRAP.index()].with_owner(operation)
 }
 
+fn current_cpu_is_timer_service() -> Result<bool, LiveTimeError> {
+    Ok(installed_current_cpu_index()? == CpuIndex::BOOTSTRAP)
+}
+
+fn request_bsp_timer_service() -> Result<(), LiveTimeError> {
+    if current_cpu_is_timer_service()? {
+        return service_bsp_timer_request();
+    }
+    let bsp = LOCAL_APIC_SLOTS[CpuIndex::BOOTSTRAP.index()]
+        .identity()
+        .ok_or(LiveTimeError::ApicAccess)?;
+    BSP_TIMER_SERVICE_PENDING.store(true, Ordering::Release);
+    send_live_ipi(bsp.local_apic_id, LiveIpiVector::Rendezvous)
+        .map_err(|_| LiveTimeError::IpiTransport)
+}
+
+fn service_bsp_timer_request() -> Result<(), LiveTimeError> {
+    if !current_cpu_is_timer_service()? {
+        return Err(LiveTimeError::CpuIdentity);
+    }
+    let state = live_state().ok_or(LiveTimeError::Clock)?;
+    let mut state = state.lock();
+    let sample = state.sample_now()?;
+    state.reprogram(sample)
+}
+
+/// e1 receive seam shared with idle-wake/stop rendezvous state. A timer-service
+/// request is meaningful only on logical CPU 0; every other e1 remains a
+/// capability-free wake/no-request notification.
+fn live_rendezvous_handler() {
+    if installed_current_cpu_index() == Ok(CpuIndex::BOOTSTRAP)
+        && BSP_TIMER_SERVICE_PENDING.swap(false, Ordering::AcqRel)
+        && service_bsp_timer_request().is_err()
+    {
+        halt_forever();
+    }
+}
+
 struct StationaryLiveIpiTransport;
 
 static LIVE_IPI_TRANSPORT: StationaryLiveIpiTransport = StationaryLiveIpiTransport;
@@ -447,6 +494,7 @@ impl LiveTimeState {
         &mut self,
         deadline_ns: u64,
         wake: BlockWakeKey,
+        program_local_timer: bool,
     ) -> Result<DeadlineRegistration, DeadlineRegistrationFailure> {
         let sample = self
             .sample_now()
@@ -458,7 +506,7 @@ impl LiveTimeState {
             .deadlines
             .register(deadline_ns, wake)
             .map_err(|_| registration_failure(LiveTimeError::Deadline, wake))?;
-        if self.reprogram(sample).is_err() {
+        if program_local_timer && self.reprogram(sample).is_err() {
             let recovered = self
                 .deadlines
                 .cancel(registration)
@@ -468,12 +516,20 @@ impl LiveTimeState {
         Ok(registration)
     }
 
-    fn cancel_deadline(&mut self, registration: DeadlineRegistration) -> Result<(), LiveTimeError> {
+    fn cancel_deadline(
+        &mut self,
+        registration: DeadlineRegistration,
+        program_local_timer: bool,
+    ) -> Result<(), LiveTimeError> {
         let sample = self.sample_now()?;
         self.deadlines
             .cancel_if_live(registration)
             .map_err(|_| LiveTimeError::Deadline)?;
-        self.reprogram(sample)
+        if program_local_timer {
+            self.reprogram(sample)
+        } else {
+            Ok(())
+        }
     }
 
     fn replace_timer_deadline(
@@ -481,6 +537,7 @@ impl LiveTimeState {
         old: Option<&DeadlineRegistration>,
         deadline_ns: u64,
         token: TimerExpiryToken,
+        program_local_timer: bool,
     ) -> Result<Option<DeadlineRegistration>, TimerDeadlineError> {
         let sample = self.sample_now().map_err(|_| TimerDeadlineError::Fault)?;
         if deadline_ns <= sample.nanoseconds {
@@ -489,7 +546,7 @@ impl LiveTimeState {
                     .cancel_if_live_ref(old)
                     .map_err(|_| TimerDeadlineError::Fault)?;
             }
-            if self.reprogram(sample).is_err() {
+            if program_local_timer && self.reprogram(sample).is_err() {
                 halt_forever();
             }
             return Ok(None);
@@ -512,7 +569,7 @@ impl LiveTimeState {
                 .register(deadline_ns, token)
                 .map_err(map_timer_queue_error)?
         };
-        if self.reprogram(sample).is_err() {
+        if program_local_timer && self.reprogram(sample).is_err() {
             halt_forever();
         }
         Ok(Some(registration))
@@ -521,12 +578,13 @@ impl LiveTimeState {
     fn cancel_timer_deadline(
         &mut self,
         registration: &DeadlineRegistration,
+        program_local_timer: bool,
     ) -> Result<(), TimerDeadlineError> {
         let sample = self.sample_now().map_err(|_| TimerDeadlineError::Fault)?;
         self.timer_deadlines
             .cancel_if_live_ref(registration)
             .map_err(|_| TimerDeadlineError::Fault)?;
-        if self.reprogram(sample).is_err() {
+        if program_local_timer && self.reprogram(sample).is_err() {
             halt_forever();
         }
         Ok(())
@@ -594,6 +652,8 @@ pub(crate) fn initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY
     LOCAL_APIC_SLOTS[CpuIndex::BOOTSTRAP.index()].publish(committed.local_apic)?;
     bind_live_ipi_transport(&LIVE_IPI_TRANSPORT).map_err(|_| LiveTimeError::IpiTransport)?;
     publish(committed.time);
+    bind_live_rendezvous_handler(live_rendezvous_handler)
+        .map_err(|_| LiveTimeError::IpiTransport)?;
     Ok(())
 }
 
@@ -753,16 +813,37 @@ impl TimerDeadlineAuthority for LiveTimerDeadlineAuthority {
         if timer_expiry_binding().is_none() {
             return Err(TimerDeadlineError::Fault);
         }
+        let program_local_timer =
+            current_cpu_is_timer_service().map_err(|_| TimerDeadlineError::Fault)?;
         let state = live_state().ok_or(TimerDeadlineError::Fault)?;
-        state.lock().replace_timer_deadline(old, deadline_ns, token)
+        let registration =
+            state
+                .lock()
+                .replace_timer_deadline(old, deadline_ns, token, program_local_timer)?;
+        if !program_local_timer && request_bsp_timer_service().is_err() {
+            // The queue mutation is already committed and the authority trait
+            // forbids returning an error that pretends `old` remained valid.
+            // Losing the only timer-service notification is therefore a
+            // correctness fault, not a recoverable Timer syscall failure.
+            halt_forever();
+        }
+        Ok(registration)
     }
 
     fn cancel_timer_deadline(
         &mut self,
         registration: &DeadlineRegistration,
     ) -> Result<(), TimerDeadlineError> {
+        let program_local_timer =
+            current_cpu_is_timer_service().map_err(|_| TimerDeadlineError::Fault)?;
         let state = live_state().ok_or(TimerDeadlineError::Fault)?;
-        state.lock().cancel_timer_deadline(registration)
+        state
+            .lock()
+            .cancel_timer_deadline(registration, program_local_timer)?;
+        if !program_local_timer && request_bsp_timer_service().is_err() {
+            halt_forever();
+        }
+        Ok(())
     }
 }
 
@@ -872,14 +953,36 @@ pub(crate) fn register_deadline(
     let Some(state) = live_state() else {
         return Err(registration_failure(LiveTimeError::Clock, wake));
     };
-    state.lock().register_deadline(deadline_ns, wake)
+    let program_local_timer = match current_cpu_is_timer_service() {
+        Ok(value) => value,
+        Err(error) => return Err(registration_failure(error, wake)),
+    };
+    let registration = state
+        .lock()
+        .register_deadline(deadline_ns, wake, program_local_timer)?;
+    if !program_local_timer && request_bsp_timer_service().is_err() {
+        let recovered = state
+            .lock()
+            .deadlines
+            .cancel(registration)
+            .unwrap_or_else(|_| halt_forever());
+        return Err(registration_failure(LiveTimeError::IpiTransport, recovered));
+    }
+    Ok(registration)
 }
 
 pub(crate) fn cancel_deadline(registration: DeadlineRegistration) -> Result<(), LiveTimeError> {
     let Some(state) = live_state() else {
         return Err(LiveTimeError::Clock);
     };
-    state.lock().cancel_deadline(registration)
+    let program_local_timer = current_cpu_is_timer_service()?;
+    state
+        .lock()
+        .cancel_deadline(registration, program_local_timer)?;
+    if !program_local_timer {
+        request_bsp_timer_service()?;
+    }
+    Ok(())
 }
 
 #[allow(
