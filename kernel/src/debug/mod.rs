@@ -232,6 +232,43 @@ pub(crate) struct PanicRecord<'a> {
     pub(crate) backtrace_frames: &'a [u64],
 }
 
+/// Returns the logical CPU selected by the current x86_64 GS entry record.
+///
+/// This is deliberately best-effort: panic reporting also runs before the
+/// runtime CPU slot is installed, when there is no trustworthy current-CPU
+/// identity to report. Once H1 has installed the GS-selected entry state, the
+/// lookup is local to the faulting CPU and does not consult shared scheduler
+/// state.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn current_cpu_id_for_diagnostics() -> Option<u32> {
+    crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
+        .and_then(|index| u32::try_from(index).ok())
+}
+
+#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+#[allow(
+    dead_code,
+    reason = "the target-only panic emitter consumes this architecture-neutral fallback"
+)]
+const fn current_cpu_id_for_diagnostics() -> Option<u32> {
+    None
+}
+
+/// Preserves an explicit architectural CPU identity, or fills an absent one
+/// from the faulting CPU's private GS entry record.
+fn with_current_cpu_identity<'a>(
+    record: &PanicRecord<'a>,
+    current_cpu_id: Option<u32>,
+) -> PanicRecord<'a> {
+    PanicRecord {
+        reason: record.reason,
+        cpu_id: record.cpu_id.or(current_cpu_id),
+        instruction_pointer: record.instruction_pointer,
+        fault_address: record.fault_address,
+        backtrace_frames: record.backtrace_frames,
+    }
+}
+
 static EARLY_OUTPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 struct OutputGuard;
@@ -498,16 +535,18 @@ pub(crate) fn emit_early_cpu_state_record(
 #[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
 pub(crate) fn emit_early_panic_record(record: &PanicRecord<'_>) -> Result<(), SerialError> {
     let mut serial = Com1::new(X86PortIo);
-    emit_panic_record(&mut serial, record)
+    let record = with_current_cpu_identity(record, current_cpu_id_for_diagnostics());
+    emit_panic_record(&mut serial, &record)
 }
 
 /// Converts the core panic payload into a bounded early serial record, then
 /// permanently stops the current CPU.
 ///
-/// The generic panic path has no trustworthy architectural exception frame,
-/// so CPU, instruction pointer, fault address, and backtrace are explicitly
-/// reported as unavailable. Exception handling may provide richer fields via
-/// [`emit_early_panic_record`] once that boundary exists.
+/// The generic panic path has no trustworthy architectural exception frame, so
+/// instruction pointer, fault address, and backtrace are explicitly reported
+/// as unavailable. Once an H1 GS-selected entry record is installed, the
+/// emitter attaches the faulting CPU's logical identity without consulting
+/// shared runtime state.
 #[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
 pub(crate) fn handle_early_panic(info: &PanicInfo<'_>) -> ! {
     let mut reason = PanicReasonBuffer::new();

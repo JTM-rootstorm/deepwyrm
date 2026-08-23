@@ -186,6 +186,26 @@ fn panic_records_are_structured_bounded_and_redactable() {
 }
 
 #[test]
+fn panic_records_fill_only_missing_cpu_identity_from_the_local_entry_record() {
+    let missing = PanicRecord {
+        reason: "terminal exception",
+        cpu_id: None,
+        instruction_pointer: None,
+        fault_address: None,
+        backtrace_frames: &[],
+    };
+    let populated = with_current_cpu_identity(&missing, Some(3));
+    assert_eq!(populated.cpu_id, Some(3));
+
+    let explicit = PanicRecord {
+        cpu_id: Some(1),
+        ..missing
+    };
+    let preserved = with_current_cpu_identity(&explicit, Some(3));
+    assert_eq!(preserved.cpu_id, Some(1));
+}
+
+#[test]
 fn panic_reason_buffer_is_utf8_valid_and_bounded() {
     let mut reason = PanicReasonBuffer::new();
     reason

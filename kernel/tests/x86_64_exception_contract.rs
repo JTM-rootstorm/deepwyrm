@@ -32,6 +32,7 @@ fn e4_exception_assembly_copies_old_rsp_ss_only_for_cpl3() {
 #[test]
 fn e4_exception_rust_requires_exact_kernel_or_user_selectors() {
     let rust = source("src/arch/x86_64/exceptions.rs");
+    let debug = source("src/debug/mod.rs");
     assert!(rust.contains("KERNEL_CODE_SELECTOR"));
     assert!(rust.contains("USER_CODE_SELECTOR"));
     assert!(rust.contains("USER_DATA_SELECTOR"));
@@ -40,6 +41,9 @@ fn e4_exception_rust_requires_exact_kernel_or_user_selectors() {
     assert!(rust.contains("dispatch_bound_user_exception(record)"));
     assert!(rust.contains("Self::NonMaskableInterrupt | Self::DoubleFault | Self::MachineCheck"));
     assert!(rust.contains("native_exception_type().unwrap_or(DW_EXCEPTION_NONE)"));
+    assert!(debug.contains("current_cpu_id_for_diagnostics"));
+    assert!(debug.contains("current_cpu_index_for_diagnostics"));
+    assert!(debug.contains("record.cpu_id.or(current_cpu_id)"));
 }
 
 #[test]
