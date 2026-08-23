@@ -964,9 +964,9 @@ unsafe fn native_runtime_trampoline<R: crate::syscall::native::NativeSyscallFram
                                 // re-enable is the atomic sti; hlt sequence below,
                                 // so an e1 Wake cannot be consumed and lost in
                                 // between publication and the architectural halt.
-                                let halt = match crate::arch::x86_64::idle::commit_current_idle(
-                                    idle,
-                                ) {
+                                let idle_commit =
+                                    crate::arch::x86_64::idle::commit_current_idle(idle);
+                                let halt = match idle_commit {
                                     Ok(halt) => halt,
                                     Err(failure)
                                         if failure.error()
