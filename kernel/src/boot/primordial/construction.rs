@@ -7,9 +7,9 @@
 //! while this module owns transaction order and rollback.
 
 use deepwyrm_abi::{
-    DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_MEMORY_OBJECT, DW_RIGHT_DUPLICATE,
-    DW_RIGHT_INSPECT, DW_RIGHT_MAP, DW_RIGHT_MODIFY, DW_RIGHT_READ, DW_RIGHT_TRANSFER,
-    DW_RIGHT_WAIT, DW_RIGHT_WRITE, DwHandle, DwObjectType, DwRights,
+    DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_MEMORY_OBJECT, DW_OBJECT_TYPE_TASK_GROUP,
+    DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_MAP, DW_RIGHT_MODIFY, DW_RIGHT_READ,
+    DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE, DwHandle, DwObjectType, DwRights,
 };
 
 use super::{PrimordialElfLoadPlan, PrimordialLoadSegment};
@@ -22,15 +22,15 @@ pub(crate) const STACK_BYTES: u64 = 64 * 1024;
 const STARTUP_BLOCK_BYTES: usize = 4096;
 const STARTUP_ABI_VERSION: u64 = 1;
 
-const INIT_BYTES: [u8; 56] = [
-    0x57, 0x52, 0x42, 0x50, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x38, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+const INIT_BYTES: [u8; 64] = [
+    0x57, 0x52, 0x42, 0x50, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x40, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
 const READY_BYTES: [u8; 40] = [
-    0x57, 0x52, 0x42, 0x50, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x57, 0x52, 0x42, 0x50, 0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
@@ -46,6 +46,8 @@ const BOOTFS_RIGHTS: DwRights = DwRights(
         | DW_RIGHT_DUPLICATE.0
         | DW_RIGHT_TRANSFER.0,
 );
+const LOADER_TASK_GROUP_RIGHTS: DwRights =
+    DwRights(DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0 | DW_RIGHT_DUPLICATE.0 | DW_RIGHT_TRANSFER.0);
 
 /// One exact capability descriptor transferred in `BOOTSTRAP_INIT_V1`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,7 +57,7 @@ pub(crate) struct PrimordialCapabilitySpec {
     pub(crate) rights: DwRights,
 }
 
-const INITIAL_CAPABILITIES: [PrimordialCapabilitySpec; 2] = [
+const INITIAL_CAPABILITIES: [PrimordialCapabilitySpec; 3] = [
     PrimordialCapabilitySpec {
         role: 1,
         object_type: DW_OBJECT_TYPE_ADDRESS_REGION,
@@ -65,6 +67,11 @@ const INITIAL_CAPABILITIES: [PrimordialCapabilitySpec; 2] = [
         role: 2,
         object_type: DW_OBJECT_TYPE_MEMORY_OBJECT,
         rights: BOOTFS_RIGHTS,
+    },
+    PrimordialCapabilitySpec {
+        role: 3,
+        object_type: DW_OBJECT_TYPE_TASK_GROUP,
+        rights: LOADER_TASK_GROUP_RIGHTS,
     },
 ];
 
@@ -147,9 +154,9 @@ pub(crate) trait PrimordialConstructionBackend {
     ) -> Result<(), Self::Error>;
     fn stage_init_capabilities(
         &mut self,
-        capabilities: &[PrimordialCapabilitySpec; 2],
+        capabilities: &[PrimordialCapabilitySpec; 3],
     ) -> Result<(), Self::Error>;
-    fn publish_init(&mut self, bytes: &[u8; 56]) -> Result<(), Self::Error>;
+    fn publish_init(&mut self, bytes: &[u8; 64]) -> Result<(), Self::Error>;
     fn create_initial_thread(
         &mut self,
         entry: u64,

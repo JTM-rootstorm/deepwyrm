@@ -155,6 +155,7 @@ pub(crate) struct AuthorityPrimordialBackend<
     child_channel: Option<HandleTransferReservation>,
     child_handle: Option<DwHandle>,
     bootfs: Option<HandleRef>,
+    loader_task_group: Option<HandleRef>,
     capability_stage_ready: bool,
     init_reservation: Option<ChannelSendReservation>,
     thread: Option<PreparedThread>,
@@ -244,6 +245,7 @@ where
             child_channel: None,
             child_handle: None,
             bootfs: None,
+            loader_task_group: None,
             capability_stage_ready: false,
             init_reservation: None,
             thread: None,
@@ -627,16 +629,36 @@ where
 
     fn stage_init_capabilities(
         &mut self,
-        capabilities: &[PrimordialCapabilitySpec; 2],
+        capabilities: &[PrimordialCapabilitySpec; 3],
     ) -> Result<(), Self::Error> {
         if capabilities != &INITIAL_CAPABILITIES {
             return Err(AuthorityPrimordialError::State);
         }
+        let retained = self
+            .registry
+            .retain_internal(self.root_group_owner)
+            .map_err(AuthorityPrimordialError::Registry)?;
+        let task_group = match self.registry.internal_into_handle(retained) {
+            Ok(reference) => reference,
+            Err(failure) => {
+                let error = failure.error();
+                let retained = failure.into_reference();
+                assert!(
+                    self.registry
+                        .release_internal(retained)
+                        .expect("retained primordial TaskGroup reference releases")
+                        .is_none(),
+                    "live root TaskGroup finalized while staging primordial capability"
+                );
+                return Err(AuthorityPrimordialError::Registry(error));
+            }
+        };
+        self.loader_task_group = Some(task_group);
         self.capability_stage_ready = true;
         Ok(())
     }
 
-    fn publish_init(&mut self, bytes: &[u8; 56]) -> Result<(), Self::Error> {
+    fn publish_init(&mut self, bytes: &[u8; 64]) -> Result<(), Self::Error> {
         if bytes != &INIT_BYTES || !self.capability_stage_ready {
             return Err(AuthorityPrimordialError::State);
         }
@@ -719,19 +741,27 @@ where
                 CHILD_CHANNEL_RIGHTS,
             );
 
-        let mut stager = HandleTable::<2>::new();
+        let mut stager = HandleTable::<3>::new();
         let root_handle = stager
             .install(
                 root_reference,
                 DwRights(SELF_ROOT_RIGHTS.0 | DW_RIGHT_TRANSFER.0),
             )
-            .expect("fresh two-slot stager accepts root capability");
+            .expect("fresh three-slot stager accepts root capability");
         let bootfs_handle = stager
             .install(
                 self.bootfs.take().expect("primordial bootfs prepared"),
                 BOOTFS_RIGHTS,
             )
-            .expect("fresh two-slot stager accepts bootfs capability");
+            .expect("fresh three-slot stager accepts bootfs capability");
+        let task_group_handle = stager
+            .install(
+                self.loader_task_group
+                    .take()
+                    .expect("primordial loader TaskGroup retained"),
+                super::LOADER_TASK_GROUP_RIGHTS,
+            )
+            .expect("fresh three-slot stager accepts TaskGroup capability");
         let requests = [
             HandleMoveRequest {
                 handle: root_handle,
@@ -740,6 +770,10 @@ where
             HandleMoveRequest {
                 handle: bootfs_handle,
                 requested_rights: BOOTFS_RIGHTS,
+            },
+            HandleMoveRequest {
+                handle: task_group_handle,
+                requested_rights: super::LOADER_TASK_GROUP_RIGHTS,
             },
         ];
         let prepared = stager
@@ -836,6 +870,15 @@ where
         }
         self.child_channel = None;
         self.capability_stage_ready = false;
+        if let Some(reference) = self.loader_task_group.take() {
+            assert!(
+                self.registry
+                    .release_handle(reference)
+                    .expect("staged primordial TaskGroup reference releases")
+                    .is_none(),
+                "live root TaskGroup finalized during primordial rollback"
+            );
+        }
         if let Some(reference) = self.bootfs.take() {
             self.cancel_memory(reference);
         }

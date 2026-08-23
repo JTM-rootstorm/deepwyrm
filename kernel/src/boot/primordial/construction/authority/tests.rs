@@ -402,7 +402,7 @@ fn concrete_authority_adapter_commits_real_init_transfer_and_exact_start_state()
     let keys = monitor.channel_keys;
     let info = channels.peek_receive(keys[1]).unwrap();
     assert_eq!(info.required_bytes, INIT_BYTES.len() as u32);
-    assert_eq!(info.required_handles, 2);
+    assert_eq!(info.required_handles, 3);
     let thread = monitor.thread_key;
     assert_eq!(
         execution.scheduler_state(thread),
@@ -481,9 +481,9 @@ fn concrete_authority_adapter_commits_real_init_transfer_and_exact_start_state()
         .tasks
         .process_handles_mut(monitor.process_key)
         .unwrap()
-        .reserve_transfer_batch(2)
+        .reserve_transfer_batch(3)
         .unwrap();
-    let mut init = [0_u8; 56];
+    let mut init = [0_u8; 64];
     let received = channels
         .receive_reserved(receive, &mut init, &waits)
         .unwrap();
@@ -494,11 +494,16 @@ fn concrete_authority_adapter_commits_real_init_transfer_and_exact_start_state()
     let published = destinations.publish(transfers);
     let root = published[0].unwrap();
     let bootfs = published[1].unwrap();
+    let task_group = published[2].unwrap();
     assert_eq!(root.object_type, DW_OBJECT_TYPE_ADDRESS_REGION);
     assert_eq!(root.rights, SELF_ROOT_RIGHTS);
     assert_eq!(bootfs.object_type, DW_OBJECT_TYPE_MEMORY_OBJECT);
     assert_eq!(bootfs.rights, BOOTFS_RIGHTS);
+    assert_eq!(task_group.object_type, DW_OBJECT_TYPE_TASK_GROUP);
+    assert_eq!(task_group.rights, super::super::LOADER_TASK_GROUP_RIGHTS);
     assert_ne!(root.handle, bootfs.handle);
+    assert_ne!(root.handle, task_group.handle);
+    assert_ne!(bootfs.handle, task_group.handle);
     assert_ne!(root.handle, backend.child_handle.unwrap());
     assert_ne!(bootfs.handle, backend.child_handle.unwrap());
 
