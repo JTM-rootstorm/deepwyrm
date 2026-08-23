@@ -1,8 +1,9 @@
 extern crate std;
 
 use std::collections::BTreeMap;
-use std::{cell::RefCell, rc::Rc, vec::Vec};
+use std::{cell::RefCell, rc::Rc, vec, vec::Vec};
 
+use crate::cpu::CpuIndex;
 use crate::memory::frame_roles::{FrameRoleManager, TableOwnerKey, synthetic_frame_role_manager};
 use crate::memory::physical::PhysicalRange;
 
@@ -1515,4 +1516,361 @@ fn stack_and_descriptor_carriers_reject_drift() {
     };
     cpu.idt_base = crossing_idt.idt_base;
     assert!(!execution_carriers_match(cpu, &segments, crossing_idt));
+}
+
+struct FlatRootTarget {
+    entries: BTreeMap<(u64, usize), u64>,
+}
+
+impl crate::arch::x86_64::mm::journal::target_seal::Sealed for FlatRootTarget {}
+
+#[allow(
+    unsafe_code,
+    reason = "the host-only flat table target atomically applies an in-memory write batch"
+)]
+unsafe impl crate::arch::x86_64::mm::journal::AtomicPageTableTarget for FlatRootTarget {
+    type Error = ();
+
+    fn read_entry(&mut self, table: FrameAddress, index: usize) -> Result<u64, Self::Error> {
+        Ok(*self.entries.get(&(table.address(), index)).unwrap_or(&0))
+    }
+
+    fn apply(
+        &mut self,
+        writes: &[crate::arch::x86_64::mm::journal::JournalWrite],
+        _invalidations: &[VirtualPage],
+    ) -> Result<(), Self::Error> {
+        for write in writes {
+            self.entries
+                .insert((write.table().address(), write.index()), write.value());
+        }
+        Ok(())
+    }
+}
+
+struct RecordedRootSwitches {
+    cpu: Option<CpuIndex>,
+    roots: Vec<u64>,
+}
+
+impl address_space::root_switch_seal::Sealed for RecordedRootSwitches {}
+
+#[allow(
+    unsafe_code,
+    reason = "the host switch model records each infallible full-flush publication in order"
+)]
+unsafe impl RootSwitchTarget for RecordedRootSwitches {
+    fn current_cpu(&self) -> Option<CpuIndex> {
+        self.cpu
+    }
+
+    fn load_cr3_full_flush(&mut self, root_physical_start: u64) {
+        self.roots.push(root_physical_start);
+    }
+}
+
+fn process_keys() -> (crate::task::ProcessKey, crate::task::ProcessKey) {
+    let mut registry = crate::object::ObjectRegistry::<16>::new();
+    let mut tasks = crate::task::TaskAuthority::<1, 2, 1, 4>::new();
+    let (_group, owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (first, _first_owner) = tasks.create_process(&mut registry, &owner).unwrap();
+    let (second, _second_owner) = tasks.create_process(&mut registry, &owner).unwrap();
+    (first, second)
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "synthetic typed roots and authority keys model the host-only root-binding contract"
+)]
+fn exact_roots_isolate_same_virtual_address_and_switch_a_b_a() {
+    let mut roles = synthetic_frame_role_manager::<1, 16>(0x20_000, 8);
+    let owner_a = roles.create_table_owner().unwrap();
+    let owner_b = roles.create_table_owner().unwrap();
+    let identity_a = commit_table(&mut roles, owner_a, TableLevel::Pml4, None);
+    let identity_b = commit_table(&mut roles, owner_b, TableLevel::Pml4, None);
+    let capabilities = PagingCapabilities::validate(40, true, true, true).unwrap();
+    let root_a =
+        unsafe { PageTableRoot::from_owned_root(identity_a.physical_start(), capabilities) }
+            .unwrap();
+    let root_b =
+        unsafe { PageTableRoot::from_owned_root(identity_b.physical_start(), capabilities) }
+            .unwrap();
+    let (process_a, process_b) = process_keys();
+    let mut authority =
+        unsafe { crate::memory::address_region::AddressSpaceAuthority::<3, 3>::new() };
+    let key_a = authority.create_address_space().unwrap();
+    let key_b = authority.create_address_space().unwrap();
+    let missing_key = authority.create_address_space().unwrap();
+    let mut bindings = AddressSpaceRootBindings::<2, 2>::new();
+    bindings
+        .bind_primordial(&roles, key_a, process_a, &root_a, identity_a)
+        .unwrap();
+    bindings
+        .bind_owned(&roles, key_b, process_b, root_b, identity_b)
+        .unwrap_or_else(|_| panic!("child root binding succeeds"));
+
+    let (selected_a, selected_a_identity, _) =
+        bindings.root_for_process(&root_a, process_a).unwrap();
+    let (selected_b, selected_b_identity, _) =
+        bindings.root_for_process(&root_a, process_b).unwrap();
+    assert_ne!(selected_a.frame(), selected_b.frame());
+    assert_eq!(selected_a_identity, identity_a);
+    assert_eq!(selected_b_identity, identity_b);
+
+    let mut mappings = BTreeMap::new();
+    mappings.insert((selected_a.frame().address(), 0x40_0000_u64), 0x90_000_u64);
+    mappings.insert((selected_b.frame().address(), 0x40_0000_u64), 0xa0_000_u64);
+    assert_eq!(
+        mappings[&(identity_a.physical_start(), 0x40_0000)],
+        0x90_000
+    );
+    assert_eq!(
+        mappings[&(identity_b.physical_start(), 0x40_0000)],
+        0xa0_000
+    );
+
+    let cpu = CpuIndex::BOOTSTRAP;
+    let mut writes = RecordedRootSwitches {
+        cpu: CpuIndex::new(1),
+        roots: Vec::new(),
+    };
+    let initial_failure = bindings
+        .activate_selection(
+            bindings.prepare_selection(cpu, process_a, key_a).unwrap(),
+            None,
+            &mut writes,
+        )
+        .unwrap_err();
+    assert_eq!(initial_failure.error(), RootBindingError::CpuMismatch);
+    assert!(writes.roots.is_empty());
+    let (_, prepared_a, previous) = initial_failure.into_parts();
+    assert!(previous.is_none());
+    writes.cpu = Some(cpu);
+    let mut a0 = bindings
+        .activate_selection(prepared_a, None, &mut writes)
+        .unwrap_or_else(|failure| panic!("initial A switch failed: {:?}", failure.error()));
+    assert_eq!(a0.identity(), identity_a);
+    assert_eq!(
+        bindings
+            .active_root_for_process(&root_a, &a0, cpu, identity_b.physical_start(), process_a,),
+        Err(RootBindingError::RootMismatch)
+    );
+    assert_eq!(
+        bindings
+            .active_root_for_process(&root_a, &a0, cpu, identity_a.physical_start(), process_a,)
+            .unwrap()
+            .1,
+        identity_a
+    );
+
+    let cpu1 = CpuIndex::new(1).unwrap();
+    let prepared_b = bindings.prepare_selection(cpu1, process_b, key_b).unwrap();
+    writes.cpu = Some(cpu1);
+    let mismatch = bindings
+        .activate_selection(prepared_b, Some(a0), &mut writes)
+        .unwrap_err();
+    assert_eq!(mismatch.error(), RootBindingError::CpuMismatch);
+    assert_eq!(writes.roots, [identity_a.physical_start()]);
+    let (_, prepared_b, previous) = mismatch.into_parts();
+    bindings.abandon_selection(prepared_b).unwrap();
+    a0 = previous.unwrap();
+
+    writes.cpu = Some(cpu);
+    let prepared_b = bindings.prepare_selection(cpu, process_b, key_b).unwrap();
+    let stale_a = a0.test_with_root(identity_a.physical_start() + PAGE_SIZE);
+    let stale = bindings
+        .activate_selection(prepared_b, Some(stale_a), &mut writes)
+        .unwrap_err();
+    assert_eq!(stale.error(), RootBindingError::RootMismatch);
+    assert_eq!(writes.roots, [identity_a.physical_start()]);
+    let (_, prepared_b, previous) = stale.into_parts();
+    bindings.abandon_selection(prepared_b).unwrap();
+    a0 = previous
+        .unwrap()
+        .test_with_root(identity_a.physical_start());
+
+    let prepared_b = bindings.prepare_selection(cpu, process_b, key_b).unwrap();
+    let missing_a = a0.test_with_address_space(missing_key);
+    let missing = bindings
+        .activate_selection(prepared_b, Some(missing_a), &mut writes)
+        .unwrap_err();
+    assert_eq!(missing.error(), RootBindingError::Missing);
+    assert_eq!(writes.roots, [identity_a.physical_start()]);
+    let (_, prepared_b, previous) = missing.into_parts();
+    bindings.abandon_selection(prepared_b).unwrap();
+    a0 = previous.unwrap().test_with_address_space(key_a);
+
+    let b = bindings
+        .activate_selection(
+            bindings.prepare_selection(cpu, process_b, key_b).unwrap(),
+            Some(a0),
+            &mut writes,
+        )
+        .unwrap_or_else(|failure| panic!("A to B switch failed: {:?}", failure.error()));
+    assert_eq!(b.identity(), identity_b);
+    let a1 = bindings
+        .activate_selection(
+            bindings.prepare_selection(cpu, process_a, key_a).unwrap(),
+            Some(b),
+            &mut writes,
+        )
+        .unwrap_or_else(|failure| panic!("B to A switch failed: {:?}", failure.error()));
+    assert_eq!(a1.identity(), identity_a);
+    assert_eq!(
+        writes.roots,
+        vec![
+            identity_a.physical_start(),
+            identity_b.physical_start(),
+            identity_a.physical_start()
+        ]
+    );
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "synthetic roots exercise mismatch rejection without dereferencing physical frames"
+)]
+fn key_root_mismatch_is_rejected_and_residency_blocks_teardown() {
+    let mut roles = synthetic_frame_role_manager::<1, 16>(0x30_000, 8);
+    let owner_a = roles.create_table_owner().unwrap();
+    let owner_b = roles.create_table_owner().unwrap();
+    let identity_a = commit_table(&mut roles, owner_a, TableLevel::Pml4, None);
+    let identity_b = commit_table(&mut roles, owner_b, TableLevel::Pml4, None);
+    let capabilities = PagingCapabilities::validate(40, true, true, true).unwrap();
+    let root_a =
+        unsafe { PageTableRoot::from_owned_root(identity_a.physical_start(), capabilities) }
+            .unwrap();
+    let mismatched =
+        unsafe { PageTableRoot::from_owned_root(identity_a.physical_start(), capabilities) }
+            .unwrap();
+    let (process_a, process_b) = process_keys();
+    let mut authority =
+        unsafe { crate::memory::address_region::AddressSpaceAuthority::<2, 2>::new() };
+    let key_a = authority.create_address_space().unwrap();
+    let key_b = authority.create_address_space().unwrap();
+    let mut bindings = AddressSpaceRootBindings::<2, 1>::new();
+    bindings
+        .bind_primordial(&roles, key_a, process_a, &root_a, identity_a)
+        .unwrap();
+    let (error, _returned_root) = bindings
+        .bind_owned(&roles, key_b, process_b, mismatched, identity_b)
+        .unwrap_err();
+    assert_eq!(error, RootBindingError::RootMismatch);
+
+    let root_b =
+        unsafe { PageTableRoot::from_owned_root(identity_b.physical_start(), capabilities) }
+            .unwrap();
+    bindings
+        .bind_owned(&roles, key_b, process_b, root_b, identity_b)
+        .unwrap_or_else(|_| panic!("correct child root binds"));
+    let resident = bindings
+        .prepare_selection(CpuIndex::BOOTSTRAP, process_b, key_b)
+        .unwrap();
+    assert_eq!(
+        bindings.teardown_empty_owned(&mut roles, process_b, key_b),
+        Err(RootBindingError::Resident)
+    );
+    bindings.abandon_selection(resident).unwrap();
+    bindings
+        .teardown_empty_owned(&mut roles, process_b, key_b)
+        .unwrap();
+    assert!(matches!(
+        bindings.root_for_process(&root_a, process_b),
+        Err(RootBindingError::Missing)
+    ));
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "synthetic attached tables verify teardown rejection before residency retirement"
+)]
+fn attached_root_teardown_rejection_keeps_binding_usable_and_retryable() {
+    let mut roles = synthetic_frame_role_manager::<1, 16>(0x38_000, 8);
+    let owner = roles.create_table_owner().unwrap();
+    let identity = commit_table(&mut roles, owner, TableLevel::Pml4, None);
+    let _child = commit_table(&mut roles, owner, TableLevel::Pdpt, Some(identity));
+    let capabilities = PagingCapabilities::validate(40, true, true, true).unwrap();
+    let root =
+        unsafe { PageTableRoot::from_owned_root(identity.physical_start(), capabilities) }.unwrap();
+    let (process, _) = process_keys();
+    let mut authority =
+        unsafe { crate::memory::address_region::AddressSpaceAuthority::<1, 1>::new() };
+    let key = authority.create_address_space().unwrap();
+    let mut bindings = AddressSpaceRootBindings::<1, 1>::new();
+    bindings
+        .bind_owned(&roles, key, process, root, identity)
+        .unwrap_or_else(|_| panic!("owned root binds"));
+
+    assert_eq!(
+        bindings.teardown_empty_owned(&mut roles, process, key),
+        Err(RootBindingError::FrameRole(
+            crate::memory::frame_roles::FrameRoleError::InvalidTableParent
+        ))
+    );
+    let primordial_placeholder =
+        unsafe { PageTableRoot::from_owned_root(identity.physical_start(), capabilities) }.unwrap();
+    assert_eq!(
+        bindings
+            .root_for_process(&primordial_placeholder, process)
+            .unwrap()
+            .1,
+        identity
+    );
+    let prepared = bindings
+        .prepare_selection(CpuIndex::BOOTSTRAP, process, key)
+        .unwrap();
+    bindings.abandon_selection(prepared).unwrap();
+    assert_eq!(
+        bindings.teardown_empty_owned(&mut roles, process, key),
+        Err(RootBindingError::FrameRole(
+            crate::memory::frame_roles::FrameRoleError::InvalidTableParent
+        ))
+    );
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "synthetic flat tables model typed kernel-half capture and child initialization"
+)]
+fn kernel_half_copy_is_supervisor_only_and_leaves_child_low_half_empty() {
+    let mut roles = synthetic_frame_role_manager::<1, 8>(0x40_000, 4);
+    let owner_a = roles.create_table_owner().unwrap();
+    let owner_b = roles.create_table_owner().unwrap();
+    let identity_a = commit_table(&mut roles, owner_a, TableLevel::Pml4, None);
+    let identity_b = commit_table(&mut roles, owner_b, TableLevel::Pml4, None);
+    let capabilities = PagingCapabilities::validate(40, true, true, true).unwrap();
+    let root_a =
+        unsafe { PageTableRoot::from_owned_root(identity_a.physical_start(), capabilities) }
+            .unwrap();
+    let mut target = FlatRootTarget {
+        entries: BTreeMap::new(),
+    };
+    target.entries.insert(
+        (identity_a.physical_start(), 256),
+        0x80_000 | PRESENT | WRITABLE,
+    );
+    target.entries.insert(
+        (identity_a.physical_start(), 511),
+        0x81_000 | PRESENT | WRITABLE | NO_EXECUTE,
+    );
+    let shared = KernelHalfBinding::capture(&mut target, &roles, &root_a, identity_a).unwrap();
+    assert_eq!(shared.primordial_identity(), identity_a);
+    let child =
+        FrameAddress::new(identity_b.physical_start(), capabilities.physical_limit()).unwrap();
+    shared.install(&mut target, child).unwrap();
+    for index in 0..256 {
+        assert_eq!(target.entries.get(&(child.address(), index)), None);
+    }
+    assert_eq!(
+        target.entries[&(child.address(), 256)],
+        0x80_000 | PRESENT | WRITABLE
+    );
+    assert_eq!(
+        target.entries[&(child.address(), 511)],
+        0x81_000 | PRESENT | WRITABLE | NO_EXECUTE
+    );
 }

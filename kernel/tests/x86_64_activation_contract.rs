@@ -8,19 +8,16 @@ fn c2_source_has_one_retire_then_one_cr3_write() {
         .expect("read live C2 activation source");
     assert_eq!(
         activation.match_indices("\"mov cr3, {}\"").count(),
-        1,
-        "the live C2 target must contain exactly one CR3 write instruction"
+        2,
+        "the architecture source must contain one bootstrap and one typed runtime CR3 write"
     );
     let retirement = activation
         .find("handoff.retire_before_activation();")
         .expect("explicit terminal transition retirement");
-    let cr3_write = activation
-        .find("\"mov cr3, {}\"")
-        .expect("single CR3 write");
-    assert!(
-        retirement < cr3_write,
-        "transition authority must retire before the irreversible CR3 write"
-    );
+    let cr3_write = retirement
+        + activation[retirement..]
+            .find("\"mov cr3, {}\"")
+            .expect("C2 CR3 write after terminal retirement");
     let post_write = &activation[cr3_write..];
     let active_construction = post_write
         .find("LiveActivePagingTarget {")

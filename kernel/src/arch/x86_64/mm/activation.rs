@@ -27,6 +27,9 @@ use super::super::{
     PAGE_SIZE, PERMITTED_ENTRY_FLAGS, PRESENT, PageTableRoot, PagingCapabilities, SOFTWARE_HIGH,
     SOFTWARE_LOW, USER, WRITABLE, WRITE_THROUGH,
 };
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+#[path = "activation/address_space.rs"]
+mod address_space;
 #[path = "activation/graph.rs"]
 mod graph;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
@@ -35,13 +38,20 @@ mod primordial;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[path = "activation/user_access.rs"]
 mod user_access;
+#[allow(
+    unused_imports,
+    reason = "I0 root-binding typestates are consumed by the integrated carrier and focused host models"
+)]
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+pub(crate) use address_space::{
+    ActiveRootSelection, AddressSpaceRootBindings, KernelHalfBinding, PreparedRootSelection,
+    RootBindingError, RootSelectionFailure, RootSwitchTarget,
+};
 use graph::*;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) use user_access::LiveProcessAddressSpace;
 #[cfg(deepwyrm_f9_guest)]
 pub(crate) use user_access::OwnedLiveAtomicU32;
-#[cfg(deepwyrm_e7_guest)]
-pub(crate) use user_access::OwnedLiveUserOutput;
 #[path = "activation/build.rs"]
 mod build;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -56,6 +66,8 @@ use super::private::{
 
 const ENTRY_COUNT: usize = 512;
 const E5_USER_PIN_CAPACITY: usize = 8;
+#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+const LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;
 const MAX_DEEP_TABLE_FRAMES: usize = 256;
 const ADDRESS_OFFSET_MASK: u64 = PAGE_SIZE - 1;
 const HARDWARE_MUTABLE: u64 = ACCESSED | DIRTY;
@@ -402,6 +414,9 @@ pub(crate) struct ActiveDeepPaging<A> {
     identity: TableIdentity,
     #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
     user_pins: crate::memory::usercopy::UserPinTracker<E5_USER_PIN_CAPACITY>,
+    #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+    root_bindings:
+        AddressSpaceRootBindings<LIVE_ADDRESS_SPACE_CAPACITY, { crate::cpu::CPU_CAPACITY }>,
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -466,6 +481,38 @@ pub(crate) trait ActiveScratchIo {
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) struct LiveActiveScratchIo;
+
+#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+struct LiveRootSwitchTarget;
+
+#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+impl address_space::root_switch_seal::Sealed for LiveRootSwitchTarget {}
+
+#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "the sealed implementation performs the audited no-PCID/no-global-pages CR3 switch"
+)]
+unsafe impl RootSwitchTarget for LiveRootSwitchTarget {
+    fn current_cpu(&self) -> Option<crate::cpu::CpuIndex> {
+        crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
+            .and_then(crate::cpu::CpuIndex::new)
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "DW0-H selects one typed resident PML4 with PCID and global pages disabled"
+    )]
+    fn load_cr3_full_flush(&mut self, root_physical_start: u64) {
+        unsafe {
+            core::arch::asm!(
+                "mov cr3, {}",
+                in(reg) root_physical_start,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+}
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> target_seal::Sealed
@@ -1361,14 +1408,37 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.target.scratch.install_mmio_frame(frame)
     }
 
+    #[allow(
+        unsafe_code,
+        reason = "the CPU-owned active-root token is checked against current CPU identity and CR3 before raw-VA usercopy"
+    )]
     pub(crate) fn current_process_address_space(
         &mut self,
+        active_root: &ActiveRootSelection,
         process: crate::task::ProcessKey,
     ) -> LiveProcessAddressSpace<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
+        let cpu = crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
+            .and_then(crate::cpu::CpuIndex::new)
+            .unwrap_or_else(|| panic!("usercopy has no current architecture CPU binding"));
+        let observed_root: u64;
+        unsafe {
+            core::arch::asm!(
+                "mov {}, cr3",
+                out(reg) observed_root,
+                options(nostack, preserves_flags),
+            );
+        }
+        let (root, identity, address_space) = self
+            .root_bindings
+            .active_root_for_process(&self.root, active_root, cpu, observed_root, process)
+            .unwrap_or_else(|error| {
+                panic!("process usercopy root is not current on this CPU: {error:?}")
+            });
         let target = &mut self.target;
         LiveProcessAddressSpace {
-            root: &self.root,
-            identity: self.identity,
+            root,
+            identity,
+            address_space,
             process,
             roles: target.roles,
             target: user_access::TrackedActiveTarget {
@@ -1377,6 +1447,168 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             },
             _root: core::marker::PhantomData,
         }
+    }
+
+    pub(crate) fn bind_primordial_address_space(
+        &mut self,
+        process: crate::task::ProcessKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    ) -> Result<(), RootBindingError> {
+        if self.root_bindings.kernel_half().is_err() {
+            let kernel_half = KernelHalfBinding::capture(
+                &mut self.target.scratch,
+                &*self.target.roles,
+                &self.root,
+                self.identity,
+            )?;
+            self.root_bindings.install_kernel_half(kernel_half)?;
+        }
+        self.root_bindings.bind_primordial(
+            &*self.target.roles,
+            address_space,
+            process,
+            &self.root,
+            self.identity,
+        )
+    }
+
+    /// Reserves a distinct child PML4, initializes only its supervisor half
+    /// from the typed primordial kernel-half borrow, then publishes the exact
+    /// portable-key/Process binding. Every failure before root publication
+    /// returns the allocation to the role manager.
+    #[allow(
+        unsafe_code,
+        reason = "the committed typed PML4 grant becomes one linearly owned PageTableRoot"
+    )]
+    pub(crate) fn reserve_child_address_space(
+        &mut self,
+        process: crate::task::ProcessKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    ) -> Result<(), RootBindingError> {
+        self.root_bindings
+            .preflight_new_binding(address_space, process)?;
+        self.root_bindings.kernel_half()?;
+        let owner = self
+            .target
+            .roles
+            .create_table_owner()
+            .map_err(RootBindingError::FrameRole)?;
+        let allocation = self
+            .target
+            .roles
+            .allocate(1)
+            .map_err(RootBindingError::FrameRole)?;
+        let frame = match FrameAddress::new(allocation.physical_start(), self.root.physical_limit())
+        {
+            Ok(frame) => frame,
+            Err(_) => {
+                self.target
+                    .roles
+                    .cancel_allocation(allocation)
+                    .unwrap_or_else(|_| panic!("invalid child-root allocation rollback drifted"));
+                return Err(RootBindingError::RootMismatch);
+            }
+        };
+        if self.target.scratch.zero_allocator_frame(frame).is_err() {
+            self.target
+                .roles
+                .cancel_allocation(allocation)
+                .unwrap_or_else(|_| panic!("child-root allocation rollback drifted"));
+            return Err(RootBindingError::RootMismatch);
+        }
+        let zeroed = unsafe { self.target.roles.assume_zeroed(allocation) }
+            .unwrap_or_else(|_| panic!("child-root zeroed transition drifted"));
+        let candidate = match self
+            .target
+            .roles
+            .prepare_table(zeroed, owner, TableLevel::Pml4)
+        {
+            Ok(candidate) => candidate,
+            Err(failure) => {
+                let error = failure.error();
+                self.target
+                    .roles
+                    .cancel_zeroed(failure.into_grant())
+                    .unwrap_or_else(|_| panic!("child-root candidate rollback drifted"));
+                return Err(RootBindingError::FrameRole(error));
+            }
+        };
+        if let Err(error) = self
+            .root_bindings
+            .kernel_half()
+            .unwrap_or_else(|_| panic!("preflighted kernel-half binding disappeared"))
+            .install(&mut self.target.scratch, frame)
+        {
+            self.target
+                .roles
+                .cancel_table_candidate(candidate)
+                .unwrap_or_else(|_| panic!("child-root kernel-half rollback drifted"));
+            return Err(error);
+        }
+        let identity = match self.target.roles.commit_table(candidate, None) {
+            Ok(identity) => identity,
+            Err(failure) => {
+                let error = failure.error();
+                self.target
+                    .roles
+                    .cancel_table_candidate(failure.into_grant())
+                    .unwrap_or_else(|_| panic!("child-root commit rollback drifted"));
+                return Err(RootBindingError::FrameRole(error));
+            }
+        };
+        let root = unsafe {
+            PageTableRoot::from_owned_root(identity.physical_start(), self.root.capabilities)
+        }
+        .unwrap_or_else(|_| panic!("typed child PML4 address became invalid"));
+        if let Err((error, _root)) = self.root_bindings.bind_owned(
+            &*self.target.roles,
+            address_space,
+            process,
+            root,
+            identity,
+        ) {
+            panic!("preflighted child-root binding rejected after commit: {error:?}");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_process_root_selection(
+        &self,
+        cpu: crate::cpu::CpuIndex,
+        process: crate::task::ProcessKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    ) -> Result<PreparedRootSelection, RootBindingError> {
+        self.root_bindings
+            .prepare_selection(cpu, process, address_space)
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "the allocation-free carrier must recover both move-only root-selection tokens"
+    )]
+    pub(crate) fn activate_process_root_selection(
+        &self,
+        prepared: PreparedRootSelection,
+        previous: Option<ActiveRootSelection>,
+    ) -> Result<ActiveRootSelection, RootSelectionFailure> {
+        self.root_bindings
+            .activate_selection(prepared, previous, &mut LiveRootSwitchTarget)
+    }
+
+    pub(crate) fn abandon_process_root_selection(
+        &self,
+        prepared: PreparedRootSelection,
+    ) -> Result<(), RootBindingError> {
+        self.root_bindings.abandon_selection(prepared)
+    }
+
+    pub(crate) fn teardown_empty_child_address_space(
+        &mut self,
+        process: crate::task::ProcessKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    ) -> Result<(), RootBindingError> {
+        self.root_bindings
+            .teardown_empty_owned(self.target.roles, process, address_space)
     }
 
     pub(crate) fn run_primordial(
@@ -1424,6 +1656,8 @@ impl<H, T: Cr3ActivationTarget<H>> PreparedActivation<H, T> {
             identity,
             #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
             user_pins: crate::memory::usercopy::UserPinTracker::new(),
+            #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+            root_bindings: AddressSpaceRootBindings::new(),
         }
     }
 }

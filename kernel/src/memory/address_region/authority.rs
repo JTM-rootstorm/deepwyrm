@@ -84,6 +84,7 @@ impl<const SPACES: usize, const REGIONS: usize> AddressSpaceAuthority<SPACES, RE
             RegionKey {
                 domain: self.domain,
                 raw: encode_key(slot, generation),
+                address_space_raw: address_space.raw,
             },
             start,
             byte_len,

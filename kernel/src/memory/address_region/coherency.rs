@@ -127,10 +127,12 @@ pub(crate) enum AddressSpaceCoherencyError {
 /// reclaim. The live execution carrier owns it from pre-CR3 publication until
 /// post-CR3 local serialization.
 #[must_use = "a live residency must be released only after switching away and locally serializing"]
+#[derive(Debug)]
 pub(crate) struct Residency {
     cpu: CpuIndex,
     epoch: u64,
     observed_shootdown_generation: u64,
+    _cpu_local: PhantomData<*mut ()>,
 }
 
 impl Residency {
@@ -252,6 +254,7 @@ impl<const CPUS: usize> AddressSpaceCoherency<CPUS> {
             cpu,
             epoch,
             observed_shootdown_generation: state.shootdown_generation,
+            _cpu_local: PhantomData,
         })
     }
 
@@ -331,6 +334,50 @@ impl<const CPUS: usize> AddressSpaceCoherency<CPUS> {
         })
     }
 
+    /// Atomically requires an unoccupied root and closes its residency gate.
+    ///
+    /// Unlike a separate residency observation followed by
+    /// [`Self::prepare_mutation`], the zero-resident check and publication of
+    /// the prepared teardown phase occur under one coherency lock. A racing
+    /// entrant therefore either publishes residency first and receives a
+    /// retryable rejection here, or observes the closed gate and cannot enter.
+    pub(crate) fn prepare_uncontended_teardown(
+        &self,
+    ) -> Result<MutationTransaction<'_, CPUS>, AddressSpaceCoherencyError> {
+        let mut state = self.state.lock();
+        match state.phase {
+            MutationPhase::Idle => {}
+            MutationPhase::Retired => return Err(AddressSpaceCoherencyError::Retired),
+            MutationPhase::Prepared(_) | MutationPhase::Published(_) => {
+                return Err(AddressSpaceCoherencyError::MutationInFlight);
+            }
+        }
+        if state.residents.count() != 0 {
+            return Err(AddressSpaceCoherencyError::TeardownRequiresLeave);
+        }
+        let generation = state
+            .shootdown_generation
+            .checked_add(1)
+            .filter(|generation| *generation != 0)
+            .ok_or(AddressSpaceCoherencyError::GenerationExhausted)?;
+        state.phase = MutationPhase::Prepared(RequestState {
+            request: ShootdownRequest {
+                address_space: self.address_space,
+                generation,
+                mutation: MappingMutation::Teardown,
+                scope: InvalidationScope::FullAddressSpace,
+            },
+            targets: CpuSet::EMPTY,
+            acknowledged: CpuSet::EMPTY,
+        });
+        Ok(MutationTransaction {
+            coherency: self,
+            generation,
+            active: true,
+            _cpu_local: PhantomData,
+        })
+    }
+
     /// Acquire-loads this CPU's pending request for the vector `0xe2` handler.
     pub(crate) fn request_for_cpu(&self, cpu: CpuIndex) -> Option<ShootdownRequest> {
         let index = self.checked_cpu(cpu).ok()?;
@@ -374,6 +421,25 @@ impl<const CPUS: usize> AddressSpaceCoherency<CPUS> {
 
     pub(crate) fn resident_cpus(&self) -> CpuSet<CPUS> {
         self.state.lock().residents
+    }
+
+    /// Validates every precondition needed for a later infallible
+    /// `leave_after_local_flush` of this exact token. The execution carrier
+    /// retains the move-only token and root pin across the architecture switch;
+    /// no other owner can clear or replace this CPU epoch in between.
+    pub(crate) fn preflight_leave_after_local_flush(
+        &self,
+        residency: &Residency,
+    ) -> Result<(), AddressSpaceCoherencyError> {
+        let index = self.checked_cpu(residency.cpu)?;
+        let state = self.state.lock();
+        if !state.residents.members[index] {
+            return Err(AddressSpaceCoherencyError::NotResident);
+        }
+        if state.residency_epochs[index] != residency.epoch {
+            return Err(AddressSpaceCoherencyError::StaleResidency);
+        }
+        Ok(())
     }
 
     pub(crate) fn published_generation(&self) -> u64 {
@@ -862,6 +928,39 @@ mod tests {
             InvalidationScope::FullAddressSpace
         );
         assert_eq!(coherency.resident_cpus().count(), 0);
+        assert_eq!(
+            coherency.enter(cpu0).err(),
+            Some(AddressSpaceCoherencyError::Retired)
+        );
+    }
+
+    #[test]
+    fn occupied_uncontended_teardown_rejects_without_closing_gate_and_retries_after_leave() {
+        let coherency = coherency::<2>();
+        let cpu0 = CpuIndex::new(0).unwrap();
+        let cpu1 = CpuIndex::new(1).unwrap();
+        let resident0 = coherency.enter(cpu0).unwrap();
+
+        assert!(matches!(
+            coherency.prepare_uncontended_teardown(),
+            Err(AddressSpaceCoherencyError::TeardownRequiresLeave)
+        ));
+        assert_eq!(coherency.published_generation(), 0);
+        let resident1 = coherency
+            .enter(cpu1)
+            .expect("failed teardown preflight must leave the residency gate open");
+        coherency.leave_after_local_flush(resident0).unwrap();
+        coherency.leave_after_local_flush(resident1).unwrap();
+
+        let permit = coherency
+            .prepare_uncontended_teardown()
+            .unwrap()
+            .publish()
+            .try_complete()
+            .unwrap();
+        assert_eq!(permit.request().mutation(), MappingMutation::Teardown);
+        assert_eq!(permit.target_count(), 0);
+        assert_eq!(coherency.published_generation(), 1);
         assert_eq!(
             coherency.enter(cpu0).err(),
             Some(AddressSpaceCoherencyError::Retired)

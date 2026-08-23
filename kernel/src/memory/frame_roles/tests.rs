@@ -120,7 +120,7 @@ fn singleton_claim_is_one_shot_without_global_test_interference() {
 }
 
 #[test]
-fn table_role_matrix_recovers_candidates_and_never_reclaims_committed_tables() {
+fn table_role_matrix_recovers_candidates_and_keeps_attached_committed_tables() {
     let mut roles = manager(BASE_PAGE_SIZE, 8);
     let initial = roles.available_frames();
     let owner = roles.create_table_owner().unwrap();
@@ -176,6 +176,39 @@ fn table_role_matrix_recovers_candidates_and_never_reclaims_committed_tables() {
         })
     );
 
+    assert_eq!(roles.available_frames(), initial - 2);
+    assert_eq!(roles.check_invariants(), Ok(()));
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the host model treats the empty synthetic root as retired before consuming its reclaim proof"
+)]
+fn empty_committed_root_reclaim_returns_frames_and_rejects_attached_children() {
+    let mut roles = manager(BASE_PAGE_SIZE, 8);
+    let initial = roles.available_frames();
+    let owner = roles.create_table_owner().unwrap();
+    let root = allocate_zeroed(&mut roles, 1);
+    let root = roles.prepare_table(root, owner, TableLevel::Pml4).unwrap();
+    let root = roles.commit_table(root, None).unwrap();
+    assert_eq!(roles.available_frames(), initial - 1);
+    let empty = roles.prepare_empty_table_root(root).unwrap();
+    unsafe { roles.reclaim_preflighted_empty_table_root(empty) };
+    assert_eq!(roles.available_frames(), initial);
+    assert_eq!(roles.check_invariants(), Ok(()));
+
+    let owner = roles.create_table_owner().unwrap();
+    let root = allocate_zeroed(&mut roles, 1);
+    let root = roles.prepare_table(root, owner, TableLevel::Pml4).unwrap();
+    let root = roles.commit_table(root, None).unwrap();
+    let child = allocate_zeroed(&mut roles, 1);
+    let child = roles.prepare_table(child, owner, TableLevel::Pdpt).unwrap();
+    let _child = roles.commit_table(child, Some(root)).unwrap();
+    assert_eq!(
+        roles.prepare_empty_table_root(root).map(|_| ()),
+        Err(FrameRoleError::InvalidTableParent)
+    );
     assert_eq!(roles.available_frames(), initial - 2);
     assert_eq!(roles.check_invariants(), Ok(()));
 }

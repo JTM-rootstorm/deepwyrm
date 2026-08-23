@@ -476,10 +476,15 @@ impl PageTableRoot {
     ///
     /// # Safety
     ///
-    /// `physical_start` must name a page-table root exclusively owned by this
-    /// address-space instance. Every later access must use one backend
-    /// serialization domain, with APs offline and IF clear throughout the
-    /// DW0-C bootstrap mutation window.
+    /// `physical_start` must name a committed, typed PML4 exclusively owned by
+    /// this address-space instance. The caller must retain that unique root
+    /// ownership in its architecture binding and must not make the root active
+    /// before publishing H0 residency. Every later table access must use the
+    /// one serialization domain bound to that exact root. The DW0-C caller
+    /// additionally keeps APs offline and IF clear during bootstrap mutation;
+    /// a runtime child caller instead supplies a fresh inactive root, copies
+    /// only the lifetime-pinned supervisor half, and publishes it solely
+    /// through the H0 root-switch transaction.
     #[allow(
         unsafe_code,
         reason = "audited ownership transfer for an architecture page-table root"
@@ -656,6 +661,10 @@ impl PageTableRoot {
     /// general supervisor mapping: the virtual page must equal the expected
     /// frame, every ancestor must remain supervisor-only, and the leaf may
     /// carry only hardware A/D drift in addition to `PRESENT`.
+    #[allow(
+        dead_code,
+        reason = "the AP trampoline retirement path is target-integrated and host-model tested"
+    )]
     pub(crate) fn retire_architecture_bootstrap_identity_page<A: PageTableTransaction>(
         &self,
         access: &mut A,

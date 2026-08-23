@@ -86,7 +86,10 @@ pub(crate) struct AddressSpaceKey {
 impl AddressSpaceKey {
     pub(super) const EMPTY: Self = Self { domain: 0, raw: 0 };
     pub(crate) const fn same_domain(self, region: RegionKey) -> bool {
-        self.domain != 0 && self.domain == region.domain
+        self.domain != 0
+            && self.domain == region.domain
+            && self.raw != 0
+            && self.raw == region.address_space_raw
     }
 }
 
@@ -95,10 +98,15 @@ impl AddressSpaceKey {
 pub(crate) struct RegionKey {
     domain: u64,
     raw: u64,
+    address_space_raw: u64,
 }
 
 impl RegionKey {
-    pub(super) const EMPTY: Self = Self { domain: 0, raw: 0 };
+    pub(super) const EMPTY: Self = Self {
+        domain: 0,
+        raw: 0,
+        address_space_raw: 0,
+    };
 }
 
 static NEXT_AUTHORITY_DOMAIN: AtomicU64 = AtomicU64::new(1);

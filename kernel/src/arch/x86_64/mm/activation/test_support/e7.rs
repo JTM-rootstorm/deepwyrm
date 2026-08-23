@@ -29,6 +29,7 @@ type E7Region = AddressRegion<3>;
 
 struct E7SmokeRuntime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
     active: ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
+    active_root: ActiveRootSelection,
     registry: E7Registry,
     memory: E7Memory,
     tasks: E7Tasks,
@@ -385,6 +386,18 @@ fn build_smoke_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY:
     validate_user_layout(&mut setup);
     drop(setup);
 
+    active
+        .bind_primordial_address_space(process, address_space)
+        .unwrap_or_else(|_| fail(0x83));
+    let active_root = active
+        .prepare_process_root_selection(crate::cpu::CpuIndex::BOOTSTRAP, process, address_space)
+        .and_then(|prepared| {
+            active
+                .activate_process_root_selection(prepared, None)
+                .map_err(|failure| failure.error())
+        })
+        .unwrap_or_else(|_| fail(0x83));
+
     let stacks =
         crate::arch::x86_64::linked_thread_kernel_stack_layout().unwrap_or_else(|_| fail(0x84));
     let execution = ExecutionDomain::<1>::new([stacks[0]]).unwrap_or_else(|_| fail(0x85));
@@ -412,6 +425,7 @@ fn build_smoke_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY:
 
     E7SmokeRuntime {
         active,
+        active_root,
         registry,
         memory,
         tasks,
@@ -446,7 +460,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                 out_required_size,
             } => {
                 let status = {
-                    let mut user = self.active.current_process_address_space(self.process);
+                    let mut user = self
+                        .active
+                        .current_process_address_space(&self.active_root, self.process);
                     crate::syscall::abi_get_info(&mut user, out_info, out_size, out_required_size)
                 };
                 if status == DW_STATUS_SUCCESS {
@@ -459,7 +475,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                 out_nanoseconds,
             } => {
                 let status = {
-                    let mut user = self.active.current_process_address_space(self.process);
+                    let mut user = self
+                        .active
+                        .current_process_address_space(&self.active_root, self.process);
                     crate::syscall::clock_get(&mut user, clock_id, out_nanoseconds)
                 };
                 if status == DW_STATUS_SUCCESS {
@@ -516,7 +534,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         {
             return Err(crate::arch::x86_64::syscall::UserReturnError::BindingChanged);
         }
-        let mut mappings = self.active.current_process_address_space(self.process);
+        let mut mappings = self
+            .active
+            .current_process_address_space(&self.active_root, self.process);
         frame.authorize_return(current_binding_generation, &mut mappings)
     }
 
@@ -678,7 +698,7 @@ fn enter_smoke<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     let state = {
         let mut mappings = runtime
             .active
-            .current_process_address_space(runtime.process);
+            .current_process_address_space(&runtime.active_root, runtime.process);
         crate::arch::x86_64::syscall::ValidatedUserReturn::initial(context, &mut mappings)
             .unwrap_or_else(|error| match error {
                 crate::arch::x86_64::syscall::UserReturnError::NonCanonicalUserAddress => {

@@ -207,7 +207,7 @@ fn e7_smoke_runtime_uses_live_e5_syscall_and_return_authority() {
     assert!(user.contains("movw %ax, %gs"));
 
     for marker in [
-        "current_process_address_space(self.process)",
+        "current_process_address_space(&self.active_root, self.process)",
         "crate::syscall::abi_get_info(",
         "crate::syscall::process_exit(",
         "Some(SchedulerThreadState::Running)",

@@ -880,3 +880,211 @@ fn address_region_bridge_commits_replacements_and_rolls_back_target_failure() {
     assert_eq!(objects.active_lease_count(), 2);
     assert_eq!(roles.check_invariants(), Ok(()));
 }
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the host integration model supplies two independently typed inactive roots and zeroed frame grants"
+)]
+fn two_bound_publishers_map_same_va_to_distinct_root_local_frames() {
+    let limit = PhysicalAddressLimit::new(1_u64 << 40).unwrap();
+    let capabilities = PagingCapabilities {
+        physical_limit: limit,
+    };
+    let mut roles = synthetic_frame_role_manager::<1, 64>(0x20_000, 32);
+
+    let owner_a = roles.create_table_owner().unwrap();
+    let root_a = roles.allocate(1).unwrap();
+    let root_a = unsafe { roles.assume_zeroed(root_a) }.unwrap();
+    let root_a = roles
+        .prepare_table(root_a, owner_a, TableLevel::Pml4)
+        .unwrap();
+    let root_a = roles.commit_table(root_a, None).unwrap();
+    let page_tables_a =
+        unsafe { PageTableRoot::from_owned_root(root_a.physical_start(), capabilities) }.unwrap();
+
+    let owner_b = roles.create_table_owner().unwrap();
+    let root_b = roles.allocate(1).unwrap();
+    let root_b = unsafe { roles.assume_zeroed(root_b) }.unwrap();
+    let root_b = roles
+        .prepare_table(root_b, owner_b, TableLevel::Pml4)
+        .unwrap();
+    let root_b = roles.commit_table(root_b, None).unwrap();
+    let page_tables_b =
+        unsafe { PageTableRoot::from_owned_root(root_b.physical_start(), capabilities) }.unwrap();
+
+    let mut candidates_a: [Option<TableCandidateGrant>; 3] = [const { None }; 3];
+    let mut candidates_b: [Option<TableCandidateGrant>; 3] = [const { None }; 3];
+    for (candidates, owner) in [(&mut candidates_a, owner_a), (&mut candidates_b, owner_b)] {
+        for (slot, level) in [TableLevel::Pdpt, TableLevel::Pd, TableLevel::Pt]
+            .into_iter()
+            .enumerate()
+        {
+            let allocation = roles.allocate(1).unwrap();
+            let zeroed = unsafe { roles.assume_zeroed(allocation) }.unwrap();
+            candidates[slot] = Some(roles.prepare_table(zeroed, owner, level).unwrap());
+        }
+    }
+
+    let backing_a = roles.allocate(1).unwrap();
+    let backing_a = unsafe { roles.assume_zeroed(backing_a) }.unwrap();
+    let backing_a = roles.assign_object_backing(backing_a).unwrap();
+    let physical_a = backing_a.physical_start();
+    let backing_b = roles.allocate(1).unwrap();
+    let backing_b = unsafe { roles.assume_zeroed(backing_b) }.unwrap();
+    let backing_b = roles.assign_object_backing(backing_b).unwrap();
+    let physical_b = backing_b.physical_start();
+    assert_ne!(physical_a, physical_b);
+
+    let mut registry = ObjectRegistry::<2>::new();
+    let mut objects = MemoryObjectAuthority::<2, 4>::new();
+    let creation_a = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+    let object_a = objects
+        .grant_backing(
+            &creation_a,
+            backing_a,
+            BASE_PAGE_SIZE,
+            MemoryObjectKind::PageBacked,
+            Protection::READ_WRITE,
+        )
+        .unwrap();
+    let owner_ref_a = registry.creation_into_internal(creation_a).unwrap();
+    assert_eq!(object_a.object_id(), Some(owner_ref_a.id()));
+    let creation_b = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+    let object_b = objects
+        .grant_backing(
+            &creation_b,
+            backing_b,
+            BASE_PAGE_SIZE,
+            MemoryObjectKind::PageBacked,
+            Protection::READ_WRITE,
+        )
+        .unwrap();
+    let owner_ref_b = registry.creation_into_internal(creation_b).unwrap();
+    assert_eq!(object_b.object_id(), Some(owner_ref_b.id()));
+
+    let mut spaces = unsafe { AddressSpaceAuthority::<2, 2>::new() };
+    let key_a = spaces.create_address_space().unwrap();
+    let key_b = spaces.create_address_space().unwrap();
+    let mut region_a = spaces
+        .create_region::<1>(key_a, 0x40_0000, BASE_PAGE_SIZE)
+        .unwrap();
+    let mut region_b = spaces
+        .create_region::<1>(key_b, 0x40_0000, BASE_PAGE_SIZE)
+        .unwrap();
+    let mut target = FakeTarget::default();
+
+    {
+        let mut publisher = unsafe {
+            X86AddressSpacePublisher::<_, 1, 64, 3, 32, 1>::new(
+                key_a,
+                region_a.region_key(),
+                &page_tables_a,
+                root_a,
+                &mut roles,
+                &mut target,
+                &mut candidates_a,
+            )
+        }
+        .unwrap();
+        let resolved = crate::handle::resolve_test_internal_owner(
+            &mut registry,
+            &owner_ref_a,
+            deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT),
+        );
+        let authorization = region_a
+            .authorize_map(&objects, resolved, Protection::READ_WRITE)
+            .unwrap();
+        assert!(
+            region_a
+                .map(
+                    &mut objects,
+                    &mut registry,
+                    &mut publisher,
+                    0x40_0000,
+                    authorization,
+                    0,
+                    BASE_PAGE_SIZE,
+                    Protection::READ_WRITE,
+                )
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let entries_after_a = target.entries.clone();
+    {
+        let mut publisher = unsafe {
+            X86AddressSpacePublisher::<_, 1, 64, 3, 32, 1>::new(
+                key_b,
+                region_b.region_key(),
+                &page_tables_b,
+                root_b,
+                &mut roles,
+                &mut target,
+                &mut candidates_b,
+            )
+        }
+        .unwrap();
+        let resolved = crate::handle::resolve_test_internal_owner(
+            &mut registry,
+            &owner_ref_b,
+            deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT),
+        );
+        let authorization = region_b
+            .authorize_map(&objects, resolved, Protection::READ_WRITE)
+            .unwrap();
+        assert!(
+            region_b
+                .map(
+                    &mut objects,
+                    &mut registry,
+                    &mut publisher,
+                    0x40_0000,
+                    authorization,
+                    0,
+                    BASE_PAGE_SIZE,
+                    Protection::READ_WRITE,
+                )
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    fn walk_leaf(entries: &BTreeMap<(u64, usize), u64>, root: u64, page: u64) -> u64 {
+        let physical_mask = ((1_u64 << 40) - 1) & !(BASE_PAGE_SIZE - 1);
+        let mut table = root;
+        for level in (1..=3).rev() {
+            let entry = entries[&(table, ((page >> (12 + level * 9)) & 0x1ff) as usize)];
+            table = entry & physical_mask;
+        }
+        entries[&(table, ((page >> 12) & 0x1ff) as usize)] & physical_mask
+    }
+
+    assert_eq!(
+        walk_leaf(&target.entries, root_a.physical_start(), 0x40_0000),
+        physical_a
+    );
+    assert_eq!(
+        walk_leaf(&target.entries, root_b.physical_start(), 0x40_0000),
+        physical_b
+    );
+    for (location, value) in &entries_after_a {
+        assert_eq!(target.entries.get(location), Some(value));
+    }
+
+    let mut no_candidates: [Option<TableCandidateGrant>; 0] = [];
+    assert!(matches!(
+        unsafe {
+            X86AddressSpacePublisher::<_, 1, 64, 0, 1, 1>::new(
+                key_b,
+                region_a.region_key(),
+                &page_tables_a,
+                root_a,
+                &mut roles,
+                &mut target,
+                &mut no_candidates,
+            )
+        },
+        Err(X86AddressSpacePublishError::Identity)
+    ));
+}

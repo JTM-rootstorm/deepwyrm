@@ -504,6 +504,70 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok(())
     }
 
+    /// Reclaims one dynamically allocated, committed PML4 only after its
+    /// address-space owner has proved teardown complete and no committed child
+    /// table remains attached. Shared kernel-half descendants are deliberately
+    /// not represented as children of this owner; their lifetime remains with
+    /// the primordial kernel-half binding.
+    pub(crate) fn prepare_empty_table_root(
+        &self,
+        root: TableIdentity,
+    ) -> Result<EmptyTableRootGrant, FrameRoleError> {
+        self.validate_empty_table_root(root)?;
+        Ok(EmptyTableRootGrant { root })
+    }
+
+    fn validate_empty_table_root(&self, root: TableIdentity) -> Result<(), FrameRoleError> {
+        self.validate_table_identity(root)?;
+        if root.level != TableLevel::Pml4 {
+            return Err(FrameRoleError::WrongRole);
+        }
+        if self
+            .roles
+            .iter()
+            .filter_map(|slot| slot.record)
+            .any(|record| {
+                matches!(
+                    record.role,
+                    FrameRole::PageTable { parent: Some(parent), .. } if parent == root.role
+                )
+            })
+        {
+            return Err(FrameRoleError::InvalidTableParent);
+        }
+        Ok(())
+    }
+
+    /// Consumes one preflighted empty-root proof after the architecture binding
+    /// has retired the exact root and proved it nonresident.
+    ///
+    /// # Safety
+    ///
+    /// The caller must own the architecture binding for `grant`, must have
+    /// completed its H0 teardown barrier, and must retain exclusive access to
+    /// this manager from `prepare_empty_table_root` through this commit.
+    #[allow(
+        unsafe_code,
+        reason = "architecture residency retirement cannot be represented inside the target-independent role manager"
+    )]
+    pub(crate) unsafe fn reclaim_preflighted_empty_table_root(
+        &mut self,
+        grant: EmptyTableRootGrant,
+    ) {
+        let root = grant.root;
+        self.cancel(
+            root.role,
+            PageRange::from_page_count(root.physical_start, 1, self.allocator.physical_limit())
+                .expect("preflighted PML4 range remains representable"),
+            FrameRole::PageTable {
+                owner: root.owner,
+                level: TableLevel::Pml4,
+                parent: None,
+            },
+        )
+        .unwrap_or_else(|error| panic!("preflighted retired PML4 reclaim drifted: {error:?}"));
+    }
+
     /// Imports one transition-table or kernel-image range which has already
     /// been excluded from the allocator.
     ///

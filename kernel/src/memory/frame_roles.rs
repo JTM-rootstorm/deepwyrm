@@ -147,6 +147,14 @@ pub(crate) struct TableIdentity {
     physical_start: u64,
 }
 
+/// Move-only role-manager proof that one committed PML4 has no owned child
+/// tables at the preflight point. Architecture teardown retains the exclusive
+/// manager borrow, retires residency, then consumes this proof exactly once.
+#[must_use = "an empty-root proof must be consumed only after architecture retirement"]
+pub(crate) struct EmptyTableRootGrant {
+    root: TableIdentity,
+}
+
 impl TableIdentity {
     pub(crate) const fn physical_start(self) -> u64 {
         self.physical_start

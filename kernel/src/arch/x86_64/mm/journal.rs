@@ -79,13 +79,17 @@ pub(crate) struct JournalWrite {
     reason = "the live atomic mapper consumes these accessors after the host journal gate"
 )]
 impl JournalWrite {
-    #[cfg(test)]
-    pub(crate) const fn test_new(table: FrameAddress, index: usize, value: u64) -> Self {
+    pub(super) const fn new(table: FrameAddress, index: usize, value: u64) -> Self {
         Self {
             table,
             index,
             value,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn test_new(table: FrameAddress, index: usize, value: u64) -> Self {
+        Self::new(table, index, value)
     }
 
     pub(crate) const fn table(self) -> FrameAddress {

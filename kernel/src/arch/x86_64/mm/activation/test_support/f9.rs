@@ -69,6 +69,7 @@ const F9_USER_WAKER_STACK_TOP: u64 = parse_decimal_u64(env!("DEEPWYRM_F9_USER_WA
 
 struct F9Runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
     active: ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
+    active_root: ActiveRootSelection,
     registry: F9Registry,
     memory: F9Memory,
     tasks: F9Tasks,
@@ -464,6 +465,21 @@ fn build_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize
     );
     validate_user_layout(&mut setup);
     drop(setup);
+    let address_space = regions
+        .region(root_region)
+        .unwrap_or_else(|_| fail(0x8f))
+        .address_space_key();
+    active
+        .bind_primordial_address_space(process, address_space)
+        .unwrap_or_else(|_| fail(0x8f));
+    let active_root = active
+        .prepare_process_root_selection(crate::cpu::CpuIndex::BOOTSTRAP, process, address_space)
+        .and_then(|prepared| {
+            active
+                .activate_process_root_selection(prepared, None)
+                .map_err(|failure| failure.error())
+        })
+        .unwrap_or_else(|_| fail(0x8f));
 
     let stacks =
         crate::arch::x86_64::linked_thread_kernel_stack_layout().unwrap_or_else(|_| fail(0x90));
@@ -513,6 +529,7 @@ fn build_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize
 
     F9Runtime {
         active,
+        active_root,
         registry,
         memory,
         tasks,
@@ -574,7 +591,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     fn release_atomic_pin(&mut self, pin: super::super::OwnedLiveAtomicU32) {
         self.active
-            .current_process_address_space(self.process)
+            .current_process_address_space(&self.active_root, self.process)
             .release_atomic_u32(pin)
             .unwrap_or_else(|_| fail(0xa1));
     }
@@ -607,6 +624,7 @@ fn atomic_begin_error_status(error: crate::atomic_wait::AtomicWaitBeginError) ->
 struct F9TerminalAtomicCleanup<'a, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 {
     active: &'a mut ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
+    active_root: &'a ActiveRootSelection,
     atomic_waits: &'a AtomicWaitRegistry<4>,
     atomic_operations: &'a mut AtomicWaitOperationRegistry<super::super::OwnedLiveAtomicU32, 2>,
     process: ProcessKey,
@@ -635,7 +653,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         .unwrap_or_else(|_| fail(0xa2));
         if let Some(pin) = pin {
             self.active
-                .current_process_address_space(self.process)
+                .current_process_address_space(self.active_root, self.process)
                 .release_atomic_u32(pin)
                 .unwrap_or_else(|_| fail(0xa3));
         }
@@ -655,7 +673,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                 let thread = self.current_thread();
                 let pin = match self
                     .active
-                    .current_process_address_space(self.process)
+                    .current_process_address_space(&self.active_root, self.process)
                     .pin_atomic_u32(address.0)
                 {
                     Ok(pin) => pin,
@@ -684,7 +702,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     thread,
                     |word| {
                         active
-                            .current_process_address_space(process)
+                            .current_process_address_space(&self.active_root, process)
                             .load_atomic_u32_acquire(word)
                             .unwrap_or_else(|_| fail(0xa4))
                     },
@@ -740,7 +758,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                 let atomic_waits = &self.atomic_waits;
                 let execution = &self.execution;
                 let mut observed_woken = None;
-                let mut user = self.active.current_process_address_space(process);
+                let mut user = self
+                    .active
+                    .current_process_address_space(&self.active_root, process);
                 let status = crate::syscall::atomic_wake_with(
                     &mut user,
                     address,
@@ -787,6 +807,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                 }
                 let mut terminal = F9TerminalAtomicCleanup {
                     active: &mut self.active,
+                    active_root: &self.active_root,
                     atomic_waits: &self.atomic_waits,
                     atomic_operations: &mut self.atomic_operations,
                     process: self.process,
@@ -839,7 +860,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         {
             return Err(crate::arch::x86_64::syscall::UserReturnError::BindingChanged);
         }
-        let mut mappings = self.active.current_process_address_space(self.process);
+        let mut mappings = self
+            .active
+            .current_process_address_space(&self.active_root, self.process);
         frame.authorize_return(current_binding_generation, &mut mappings)
     }
 
@@ -935,7 +958,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
             .stack_bounds(self.stack_ids[1])
             .unwrap_or_else(|_| fail(0xba));
         let state = {
-            let mut mappings = self.active.current_process_address_space(self.process);
+            let mut mappings = self
+                .active
+                .current_process_address_space(&self.active_root, self.process);
             crate::arch::x86_64::syscall::ValidatedUserReturn::initial(context, &mut mappings)
                 .unwrap_or_else(|_| fail(0xbb))
         };
@@ -1028,7 +1053,7 @@ fn enter_f9<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     let state = {
         let mut mappings = runtime
             .active
-            .current_process_address_space(runtime.process);
+            .current_process_address_space(&runtime.active_root, runtime.process);
         crate::arch::x86_64::syscall::ValidatedUserReturn::initial(context, &mut mappings)
             .unwrap_or_else(|_| fail(0xe4))
     };

@@ -876,6 +876,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
 /// interior synchronization. AP carriers cannot name or borrow this state.
 struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
     active: ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
+    active_root: super::ActiveRootSelection,
     registry: Registry,
     memory: Memory,
     tasks: Tasks,
@@ -948,7 +949,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         assert_eq!(control, SyscallControl::TerminateCurrent);
         self.deferred_current =
             Some(deferred.expect("primordial exception omitted deferred current resources"));
-        let mut user = self.active.current_process_address_space(self.process);
+        let mut user = self
+            .active
+            .current_process_address_space(&self.active_root, self.process);
         if let Some(output) = discarded {
             user.discard_owned_output(output)
                 .unwrap_or_else(|_| panic!("primordial exception output pin drifted"));
@@ -1178,7 +1181,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         {
             return Err(crate::arch::x86_64::syscall::UserReturnError::BindingChanged);
         }
-        let mut mappings = self.active.current_process_address_space(self.process);
+        let mut mappings = self
+            .active
+            .current_process_address_space(&self.active_root, self.process);
         frame.authorize_return(current_binding_generation, &mut mappings)
     }
 
@@ -1298,7 +1303,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         #[cfg(feature = "test-support")]
         let owner = self.services.operation_owner(self.thread);
         let resumed = {
-            let mut user = self.active.current_process_address_space(self.process);
+            let mut user = self
+                .active
+                .current_process_address_space(&self.active_root, self.process);
             let mut deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
             self.services.resume_suspended(
                 &mut user,
@@ -1405,6 +1412,25 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
             .unwrap_or_else(|error| panic!("primordial construction failed: {error:?}"));
         backend.take_monitor()
     };
+    let primordial_address_space = regions
+        .region(monitor.root_key)
+        .unwrap_or_else(|error| panic!("primordial root region unavailable: {error:?}"))
+        .address_space_key();
+    active
+        .bind_primordial_address_space(monitor.process_key, primordial_address_space)
+        .unwrap_or_else(|error| panic!("could not bind primordial architecture root: {error:?}"));
+    let initial_root = active
+        .prepare_process_root_selection(
+            crate::cpu::CpuIndex::BOOTSTRAP,
+            monitor.process_key,
+            primordial_address_space,
+        )
+        .and_then(|prepared| {
+            active
+                .activate_process_root_selection(prepared, None)
+                .map_err(|failure| failure.error())
+        })
+        .unwrap_or_else(|error| panic!("could not publish primordial current root: {error:?}"));
     if shared
         .execution
         .schedule_next()
@@ -1429,6 +1455,7 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     } = monitor;
     let mut runtime = PrimordialRuntimeCarrier {
         active,
+        active_root: initial_root,
         registry,
         memory,
         tasks,
@@ -1467,7 +1494,7 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     let state = {
         let mut mappings = runtime
             .active
-            .current_process_address_space(runtime.process);
+            .current_process_address_space(&runtime.active_root, runtime.process);
         crate::arch::x86_64::syscall::ValidatedUserReturn::initial(context, &mut mappings)
             .unwrap_or_else(|error| panic!("invalid primordial initial return: {error:?}"))
     };
@@ -1493,7 +1520,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
         let dispatch = {
             let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
             let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
-            let mut user = self.active.current_process_address_space(self.process);
+            let mut user = self
+                .active
+                .current_process_address_space(&self.active_root, self.process);
             self.services.dispatch(
                 request,
                 &mut user,
@@ -1542,7 +1571,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 requested_rights,
                 out_handle,
             } => {
-                let mut user = self.active.current_process_address_space(self.process);
+                let mut user = self
+                    .active
+                    .current_process_address_space(&self.active_root, self.process);
                 NativeSyscallResult::returning(crate::syscall::handle_duplicate(
                     &mut user,
                     &mut self.registry,
@@ -1560,7 +1591,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 out_size,
                 out_required_size,
             } => {
-                let mut user = self.active.current_process_address_space(self.process);
+                let mut user = self
+                    .active
+                    .current_process_address_space(&self.active_root, self.process);
                 NativeSyscallResult::returning(crate::syscall::object_get_info_v1(
                     &mut user,
                     &mut self.registry,
@@ -1607,7 +1640,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         args_size: u64,
         out_address: deepwyrm_abi::DwUserAddress,
     ) -> deepwyrm_abi::DwStatus {
-        let mut user = self.active.current_process_address_space(self.process);
+        let mut user = self
+            .active
+            .current_process_address_space(&self.active_root, self.process);
         let args = match crate::syscall::decode_map_args(&mut user, args_address, args_size) {
             Ok(args) => args,
             Err(status) => return status,
@@ -1706,7 +1741,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let address_space_key = region.address_space_key();
         let region_key = region.region_key();
         let mut candidates = [None, None, None];
-        let mut user = self.active.current_process_address_space(self.process);
+        let mut user = self
+            .active
+            .current_process_address_space(&self.active_root, self.process);
         let mut publisher = user
             .publisher::<
                 PRIMORDIAL_TABLE_CANDIDATES,
@@ -1761,7 +1798,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         } else {
             assert!(deferred.is_none());
         }
-        let mut user = self.active.current_process_address_space(self.process);
+        let mut user = self
+            .active
+            .current_process_address_space(&self.active_root, self.process);
         if let Some(output) = discarded {
             user.discard_owned_output(output)
                 .unwrap_or_else(|_| panic!("primordial exit output pin drifted"));

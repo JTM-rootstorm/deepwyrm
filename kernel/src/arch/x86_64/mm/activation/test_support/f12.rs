@@ -433,6 +433,7 @@ impl F12Scenario {
 
 struct F12Runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
     active: ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
+    active_root: ActiveRootSelection,
     registry: F12Registry,
     memory: F12Memory,
     tasks: F12Tasks,
@@ -625,6 +626,21 @@ fn build_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize
     );
     validate_user_layout(&mut setup);
     drop(setup);
+    let address_space = regions
+        .region(root_region)
+        .unwrap_or_else(|_| fail(0x7f))
+        .address_space_key();
+    active
+        .bind_primordial_address_space(process, address_space)
+        .unwrap_or_else(|_| fail(0x7f));
+    let active_root = active
+        .prepare_process_root_selection(crate::cpu::CpuIndex::BOOTSTRAP, process, address_space)
+        .and_then(|prepared| {
+            active
+                .activate_process_root_selection(prepared, None)
+                .map_err(|failure| failure.error())
+        })
+        .unwrap_or_else(|_| fail(0x7f));
 
     let stacks =
         crate::arch::x86_64::linked_thread_kernel_stack_layout().unwrap_or_else(|_| fail(0x80));
@@ -673,6 +689,7 @@ fn build_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize
 
     F12Runtime {
         active,
+        active_root,
         registry,
         memory,
         tasks,
@@ -740,7 +757,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         .unwrap_or_else(|_| fail(0x92));
         let mut bytes = [0; BYTES];
         let mut scratch = [0; BYTES];
-        let mut mappings = self.active.current_process_address_space(self.process);
+        let mut mappings = self
+            .active
+            .current_process_address_space(&self.active_root, self.process);
         crate::memory::usercopy::copy_from_user(&mut mappings, range, &mut bytes, &mut scratch)
             .unwrap_or_else(|_| fail(0x93));
         bytes
@@ -998,7 +1017,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
         let dispatch = {
             let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
             let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
-            let mut user = self.active.current_process_address_space(self.process);
+            let mut user = self
+                .active
+                .current_process_address_space(&self.active_root, self.process);
             self.services.dispatch(
                 request,
                 &mut user,
@@ -1039,7 +1060,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     requested_rights,
                     out_handle,
                 } => {
-                    let mut user = self.active.current_process_address_space(self.process);
+                    let mut user = self
+                        .active
+                        .current_process_address_space(&self.active_root, self.process);
                     NativeSyscallResult::returning(crate::syscall::handle_duplicate(
                         &mut user,
                         &mut self.registry,
@@ -1057,7 +1080,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     out_size,
                     out_required_size,
                 } => {
-                    let mut user = self.active.current_process_address_space(self.process);
+                    let mut user = self
+                        .active
+                        .current_process_address_space(&self.active_root, self.process);
                     NativeSyscallResult::returning(crate::syscall::object_get_info_v1(
                         &mut user,
                         &mut self.registry,
@@ -1207,7 +1232,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                         fail(0xc2);
                     }
                     {
-                        let mut user = self.active.current_process_address_space(self.process);
+                        let mut user = self
+                            .active
+                            .current_process_address_space(&self.active_root, self.process);
                         if let Some(output) = discarded {
                             user.discard_owned_output(output)
                                 .unwrap_or_else(|_| fail(0xc0));
@@ -1503,7 +1530,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         {
             return Err(crate::arch::x86_64::syscall::UserReturnError::BindingChanged);
         }
-        let mut mappings = self.active.current_process_address_space(self.process);
+        let mut mappings = self
+            .active
+            .current_process_address_space(&self.active_root, self.process);
         frame.authorize_return(current_binding_generation, &mut mappings)
     }
 
@@ -1546,7 +1575,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
             .stack_bounds(self.stack_ids[1])
             .unwrap_or_else(|_| fail(0xf7));
         let state = {
-            let mut mappings = self.active.current_process_address_space(self.process);
+            let mut mappings = self
+                .active
+                .current_process_address_space(&self.active_root, self.process);
             crate::arch::x86_64::syscall::ValidatedUserReturn::initial(context, &mut mappings)
                 .unwrap_or_else(|_| fail(0xf8))
         };
@@ -1597,7 +1628,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
             fail(0xfb);
         }
         let resumed = {
-            let mut user = self.active.current_process_address_space(self.process);
+            let mut user = self
+                .active
+                .current_process_address_space(&self.active_root, self.process);
             let mut deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
             self.services.resume_suspended(
                 &mut user,
@@ -1650,7 +1683,7 @@ fn enter_f12<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     let state = {
         let mut mappings = runtime
             .active
-            .current_process_address_space(runtime.process);
+            .current_process_address_space(&runtime.active_root, runtime.process);
         crate::arch::x86_64::syscall::ValidatedUserReturn::initial(context, &mut mappings)
             .unwrap_or_else(|_| fail(0x113))
     };
