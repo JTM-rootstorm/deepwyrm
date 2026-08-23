@@ -15,6 +15,11 @@ pub mod entry;
 pub mod exceptions;
 pub mod gdt;
 pub mod idt;
+#[allow(
+    dead_code,
+    reason = "H2/H3 fixed-IPI entry and transport precede root protocol/APIC ownership convergence"
+)]
+pub(crate) mod ipi;
 pub mod mm;
 #[allow(
     dead_code,
@@ -915,6 +920,8 @@ pub(crate) unsafe fn initialize_ap_runtime_slot(
 unsafe extern "C" {
     static dw_x86_64_exception_handler_table: [u64; EXCEPTION_HANDLER_COUNT];
     static dw_x86_64_apic_timer_entry: u8;
+    static dw_x86_64_rendezvous_ipi_entry: u8;
+    static dw_x86_64_tlb_shootdown_ipi_entry: u8;
     static dw_x86_64_apic_error_entry: u8;
     static dw_x86_64_apic_spurious_entry: u8;
 }
@@ -1058,15 +1065,21 @@ unsafe fn load_handler_addresses() -> Result<EarlyIdtHandlers, EarlyDescriptorIn
             .map_err(|_| EarlyDescriptorInstallError::InvalidHandlerAddress(address))?;
         index += 1;
     }
-    // SAFETY: both symbols name sixteen-byte-aligned entry labels retained by
-    // the same linked exception object.
+    // SAFETY: every symbol names a sixteen-byte-aligned entry label retained
+    // by one of the linked architecture entry objects.
     let apic_timer = &raw const dw_x86_64_apic_timer_entry as *const u8 as u64;
+    let rendezvous_ipi = &raw const dw_x86_64_rendezvous_ipi_entry as *const u8 as u64;
+    let tlb_shootdown_ipi = &raw const dw_x86_64_tlb_shootdown_ipi_entry as *const u8 as u64;
     let apic_error = &raw const dw_x86_64_apic_error_entry as *const u8 as u64;
     let apic_spurious = &raw const dw_x86_64_apic_spurious_entry as *const u8 as u64;
     Ok(EarlyIdtHandlers {
         exceptions: ExceptionHandlerTable::new(handlers),
         local_apic_timer: HandlerAddress::new(apic_timer)
             .map_err(|_| EarlyDescriptorInstallError::InvalidHandlerAddress(apic_timer))?,
+        rendezvous_ipi: HandlerAddress::new(rendezvous_ipi)
+            .map_err(|_| EarlyDescriptorInstallError::InvalidHandlerAddress(rendezvous_ipi))?,
+        tlb_shootdown_ipi: HandlerAddress::new(tlb_shootdown_ipi)
+            .map_err(|_| EarlyDescriptorInstallError::InvalidHandlerAddress(tlb_shootdown_ipi))?,
         local_apic_error: HandlerAddress::new(apic_error)
             .map_err(|_| EarlyDescriptorInstallError::InvalidHandlerAddress(apic_error))?,
         local_apic_spurious: HandlerAddress::new(apic_spurious)

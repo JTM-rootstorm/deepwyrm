@@ -54,6 +54,7 @@ fn run() -> Result<(), String> {
     let linker_path = manifest_dir.join("arch/x86_64/linker.ld");
     let entry_path = manifest_dir.join("src/arch/x86_64/entry.S");
     let exceptions_path = manifest_dir.join("src/arch/x86_64/exceptions.S");
+    let ipi_entry_path = manifest_dir.join("src/arch/x86_64/ipi_entry.S");
     let syscall_path = manifest_dir.join("src/arch/x86_64/syscall_entry.S");
     let kernel_context_path = manifest_dir.join("src/arch/x86_64/kernel_context.S");
     let ap_trampoline_path = manifest_dir.join("src/arch/x86_64/ap_trampoline.S");
@@ -72,6 +73,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-changed={}", linker_path.display());
     println!("cargo:rerun-if-changed={}", entry_path.display());
     println!("cargo:rerun-if-changed={}", exceptions_path.display());
+    println!("cargo:rerun-if-changed={}", ipi_entry_path.display());
     println!("cargo:rerun-if-changed={}", syscall_path.display());
     println!("cargo:rerun-if-changed={}", kernel_context_path.display());
     println!("cargo:rerun-if-changed={}", ap_trampoline_path.display());
@@ -136,11 +138,13 @@ fn run() -> Result<(), String> {
     let out_dir = PathBuf::from(required_env("OUT_DIR")?);
     let entry_object = out_dir.join("deepwyrm-x86_64-entry.o");
     let exceptions_object = out_dir.join("deepwyrm-x86_64-exceptions.o");
+    let ipi_entry_object = out_dir.join("deepwyrm-x86_64-ipi-entry.o");
     let syscall_object = out_dir.join("deepwyrm-x86_64-syscall.o");
     let kernel_context_object = out_dir.join("deepwyrm-x86_64-kernel-context.o");
     let ap_trampoline_object = out_dir.join("deepwyrm-x86_64-ap-trampoline.o");
     assemble_source(&entry_path, &entry_object, layout)?;
     assemble_source(&exceptions_path, &exceptions_object, layout)?;
+    assemble_source(&ipi_entry_path, &ipi_entry_object, layout)?;
     assemble_source(&syscall_path, &syscall_object, layout)?;
     assemble_source(&kernel_context_path, &kernel_context_object, layout)?;
     assemble_source(&ap_trampoline_path, &ap_trampoline_object, layout)?;
@@ -148,6 +152,7 @@ fn run() -> Result<(), String> {
     let mut link_objects = vec![
         entry_object.as_path(),
         exceptions_object.as_path(),
+        ipi_entry_object.as_path(),
         syscall_object.as_path(),
         kernel_context_object.as_path(),
         ap_trampoline_object.as_path(),

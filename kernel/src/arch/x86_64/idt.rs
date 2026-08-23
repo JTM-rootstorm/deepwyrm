@@ -1,15 +1,17 @@
 //! x86_64 interrupt-descriptor-table construction and activation.
 //!
-//! The table installs DW0-B exception/APIC terminal handlers plus the F3
-//! returning local-APIC timer gate. PIC, external, and unowned internal
-//! vectors remain absent until their subsystems define entry semantics.
+//! The table installs DW0-B exception/APIC terminal handlers, the F3 returning
+//! local-APIC timer gate, and the H2/H3 returning fixed-IPI gates. PIC,
+//! external, and unowned internal vectors remain absent until their subsystems
+//! define entry semantics.
 
 use core::arch::asm;
 use core::mem::size_of;
 
 use crate::interrupt::{
     EXCEPTION_VECTOR_RANGE, LOCAL_APIC_ERROR_VECTOR, LOCAL_APIC_SPURIOUS_VECTOR,
-    LOCAL_APIC_TIMER_VECTOR, VectorClass, classify_vector,
+    LOCAL_APIC_TIMER_VECTOR, SMP_RENDEZVOUS_VECTOR, TLB_SHOOTDOWN_VECTOR, VectorClass,
+    classify_vector,
 };
 
 use super::exceptions::EXCEPTION_HANDLER_COUNT;
@@ -61,6 +63,8 @@ impl ExceptionHandlerTable {
 pub struct EarlyIdtHandlers {
     pub exceptions: ExceptionHandlerTable,
     pub local_apic_timer: HandlerAddress,
+    pub rendezvous_ipi: HandlerAddress,
+    pub tlb_shootdown_ipi: HandlerAddress,
     pub local_apic_error: HandlerAddress,
     pub local_apic_spurious: HandlerAddress,
 }
@@ -112,6 +116,10 @@ impl InterruptDescriptorTable {
         }
         entries[usize::from(LOCAL_APIC_TIMER_VECTOR)] =
             InterruptGate::kernel_interrupt(handlers.local_apic_timer, None, selector);
+        entries[usize::from(SMP_RENDEZVOUS_VECTOR)] =
+            InterruptGate::kernel_interrupt(handlers.rendezvous_ipi, None, selector);
+        entries[usize::from(TLB_SHOOTDOWN_VECTOR)] =
+            InterruptGate::kernel_interrupt(handlers.tlb_shootdown_ipi, None, selector);
         entries[usize::from(LOCAL_APIC_ERROR_VECTOR)] =
             InterruptGate::kernel_interrupt(handlers.local_apic_error, None, selector);
         entries[usize::from(LOCAL_APIC_SPURIOUS_VECTOR)] =
@@ -256,7 +264,7 @@ mod tests {
     use super::*;
     use crate::interrupt::{
         EXTERNAL_VECTOR_RANGE, INTERNAL_VECTOR_RANGE, LEGACY_PIC_VECTOR_RANGE,
-        LOCAL_APIC_TIMER_VECTOR,
+        LOCAL_APIC_TIMER_VECTOR, SMP_RENDEZVOUS_VECTOR, TLB_SHOOTDOWN_VECTOR,
     };
 
     const HANDLER: HandlerAddress = match HandlerAddress::new(0xffff_ffff_8000_0100) {
@@ -268,6 +276,8 @@ mod tests {
         EarlyIdtHandlers {
             exceptions: ExceptionHandlerTable::new([HANDLER; EXCEPTION_HANDLER_COUNT]),
             local_apic_timer: HANDLER,
+            rendezvous_ipi: HANDLER,
+            tlb_shootdown_ipi: HANDLER,
             local_apic_error: HANDLER,
             local_apic_spurious: HANDLER,
         }
@@ -288,6 +298,8 @@ mod tests {
             assert!(idt.is_present(vector));
         }
         assert!(idt.is_present(LOCAL_APIC_TIMER_VECTOR));
+        assert!(idt.is_present(SMP_RENDEZVOUS_VECTOR));
+        assert!(idt.is_present(TLB_SHOOTDOWN_VECTOR));
         assert!(idt.is_present(LOCAL_APIC_ERROR_VECTOR));
         assert!(idt.is_present(LOCAL_APIC_SPURIOUS_VECTOR));
         for vector in LEGACY_PIC_VECTOR_RANGE {
@@ -297,7 +309,13 @@ mod tests {
             assert!(!idt.is_present(vector));
         }
         for vector in INTERNAL_VECTOR_RANGE {
-            assert_eq!(idt.is_present(vector), vector == LOCAL_APIC_TIMER_VECTOR);
+            assert_eq!(
+                idt.is_present(vector),
+                matches!(
+                    vector,
+                    LOCAL_APIC_TIMER_VECTOR | SMP_RENDEZVOUS_VECTOR | TLB_SHOOTDOWN_VECTOR
+                )
+            );
         }
     }
 
