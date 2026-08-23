@@ -4,6 +4,8 @@ mod arch;
 mod atomic_wait;
 #[path = "../../src/boot/mod.rs"]
 mod boot;
+#[path = "../../src/cpu.rs"]
+mod cpu;
 #[path = "../../src/debug/mod.rs"]
 mod debug;
 #[path = "../../src/handle/mod.rs"]

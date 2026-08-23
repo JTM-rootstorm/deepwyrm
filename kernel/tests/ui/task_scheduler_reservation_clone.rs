@@ -2,6 +2,8 @@
 
 #[path = "../../src/sync/mod.rs"]
 mod sync;
+#[path = "../../src/cpu.rs"]
+mod cpu;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ThreadKey(u64);
