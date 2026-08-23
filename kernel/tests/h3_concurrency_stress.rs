@@ -690,13 +690,16 @@ enum I2Operation {
     Map {
         space: usize,
         object: usize,
+        initiator: usize,
     },
     Protect {
         space: usize,
         protection: u8,
+        initiator: usize,
     },
     Unmap {
         space: usize,
+        initiator: usize,
     },
     Ack {
         space: usize,
@@ -748,11 +751,27 @@ impl Display for I2Operation {
         match self {
             Self::Enter { cpu, space } => write!(formatter, "enter(cpu={cpu},space={space})"),
             Self::Leave { cpu } => write!(formatter, "leave(cpu={cpu})"),
-            Self::Map { space, object } => write!(formatter, "map(space={space},object={object})"),
-            Self::Protect { space, protection } => {
-                write!(formatter, "protect(space={space},protection={protection})")
+            Self::Map {
+                space,
+                object,
+                initiator,
+            } => write!(
+                formatter,
+                "map(space={space},object={object},initiator={initiator})"
+            ),
+            Self::Protect {
+                space,
+                protection,
+                initiator,
+            } => {
+                write!(
+                    formatter,
+                    "protect(space={space},protection={protection},initiator={initiator})"
+                )
             }
-            Self::Unmap { space } => write!(formatter, "unmap(space={space})"),
+            Self::Unmap { space, initiator } => {
+                write!(formatter, "unmap(space={space},initiator={initiator})")
+            }
             Self::Ack {
                 space,
                 cpu,
@@ -952,6 +971,9 @@ impl I2Model {
         if pending.generation != generation {
             return I2Result::Rejected;
         }
+        if !self.spaces[space].resident[cpu] {
+            return I2Result::Rejected;
+        }
         let bit = 1_u8 << cpu;
         if pending.required_acks & bit == 0 || pending.received_acks & bit != 0 {
             return I2Result::Rejected;
@@ -986,6 +1008,12 @@ impl I2Model {
             return I2Result::Noop;
         };
         if !self.spaces[space].active || self.spaces[space].generation != generation {
+            return I2Result::Rejected;
+        }
+        if self.spaces[space].pending.is_some_and(|pending| {
+            pending.required_acks & (1_u8 << cpu) != 0 && pending.received_acks & (1_u8 << cpu) == 0
+        }) {
+            self.cpus[cpu].space = Some((space, generation));
             return I2Result::Rejected;
         }
         self.spaces[space].resident[cpu] = false;
@@ -1191,18 +1219,26 @@ impl I2Model {
         match operation {
             I2Operation::Enter { cpu, space } => self.enter(cpu, space),
             I2Operation::Leave { cpu } => self.leave(cpu),
-            I2Operation::Map { space, object } => self.begin_mutation(
+            I2Operation::Map {
+                space,
+                object,
+                initiator,
+            } => self.begin_mutation(
                 space,
                 I2MappingMutation::Map {
                     object,
                     protection: 0b011,
                 },
-                0,
+                initiator,
             ),
-            I2Operation::Protect { space, protection } => {
-                self.begin_mutation(space, I2MappingMutation::Protect { protection }, 0)
+            I2Operation::Protect {
+                space,
+                protection,
+                initiator,
+            } => self.begin_mutation(space, I2MappingMutation::Protect { protection }, initiator),
+            I2Operation::Unmap { space, initiator } => {
+                self.begin_mutation(space, I2MappingMutation::Unmap, initiator)
             }
-            I2Operation::Unmap { space } => self.begin_mutation(space, I2MappingMutation::Unmap, 0),
             I2Operation::Ack {
                 space,
                 cpu,
@@ -1396,13 +1432,16 @@ impl I2Rng {
             2 => I2Operation::Map {
                 space: self.bounded(I2_SPACES),
                 object: self.bounded(I2_OBJECTS),
+                initiator: self.bounded(I2_CPUS),
             },
             3 => I2Operation::Protect {
                 space: self.bounded(I2_SPACES),
                 protection: 1 + self.bounded(7) as u8,
+                initiator: self.bounded(I2_CPUS),
             },
             4 => I2Operation::Unmap {
                 space: self.bounded(I2_SPACES),
+                initiator: self.bounded(I2_CPUS),
             },
             5 | 6 => {
                 let space = self.bounded(I2_SPACES);
@@ -1472,6 +1511,7 @@ fn i2_deterministic_mapping_authority_and_idle_stress_preserves_ownership() {
             I2Operation::Map {
                 space: 0,
                 object: 0,
+                initiator: 0,
             },
             I2Operation::Ack {
                 space: 0,
@@ -1481,6 +1521,7 @@ fn i2_deterministic_mapping_authority_and_idle_stress_preserves_ownership() {
             I2Operation::Protect {
                 space: 0,
                 protection: 0b101,
+                initiator: 0,
             },
             I2Operation::Ack {
                 space: 0,
@@ -1493,7 +1534,10 @@ fn i2_deterministic_mapping_authority_and_idle_stress_preserves_ownership() {
                 generation: 2,
             },
             I2Operation::FinalizeObject { object: 0 },
-            I2Operation::Unmap { space: 0 },
+            I2Operation::Unmap {
+                space: 0,
+                initiator: 0,
+            },
             I2Operation::Ack {
                 space: 0,
                 cpu: 1,
@@ -1632,6 +1676,943 @@ fn i2_deterministic_mapping_authority_and_idle_stress_preserves_ownership() {
             model.pm_wraps > 0,
             "seed={seed:#018x} operation={} stage=pm-timer no counter wrap was exercised",
             prefix.len() + I2_OPERATIONS_PER_SEED
+        );
+    }
+}
+
+// This companion oracle deliberately models the I2 operation *families* that
+// are broader than the page-table model above.  It is intentionally bounded:
+// the goal is deterministic ownership/lifetime coverage, not to pretend that
+// a host test has established the live four-vCPU runtime contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum I2Family {
+    Handle,
+    Channel,
+    Wait,
+    Lifecycle,
+    Mapping,
+    MemoryObject,
+    Subtree,
+    IdleWakeTimer,
+    Shootdown,
+}
+
+impl I2Family {
+    const COUNT: usize = 9;
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Handle => 0,
+            Self::Channel => 1,
+            Self::Wait => 2,
+            Self::Lifecycle => 3,
+            Self::Mapping => 4,
+            Self::MemoryObject => 5,
+            Self::Subtree => 6,
+            Self::IdleWakeTimer => 7,
+            Self::Shootdown => 8,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Handle => "handle",
+            Self::Channel => "channel",
+            Self::Wait => "wait",
+            Self::Lifecycle => "lifecycle",
+            Self::Mapping => "mapping",
+            Self::MemoryObject => "memory-object",
+            Self::Subtree => "subtree",
+            Self::IdleWakeTimer => "idle-wake-timer",
+            Self::Shootdown => "shootdown",
+        }
+    }
+
+    const ALL: [Self; Self::COUNT] = [
+        Self::Handle,
+        Self::Channel,
+        Self::Wait,
+        Self::Lifecycle,
+        Self::Mapping,
+        Self::MemoryObject,
+        Self::Subtree,
+        Self::IdleWakeTimer,
+        Self::Shootdown,
+    ];
+}
+
+#[derive(Default)]
+struct I2Coverage {
+    family: [usize; I2Family::COUNT],
+    cpu: [usize; I2_CPUS],
+}
+
+impl I2Coverage {
+    fn record(&mut self, family: I2Family, cpu: usize) {
+        self.family[family.index()] += 1;
+        self.cpu[cpu] += 1;
+    }
+
+    fn assert_complete(&self, seed: u64, operation: usize) {
+        for family in I2Family::ALL {
+            assert!(
+                self.family[family.index()] > 0,
+                "seed={seed:#018x} operation={operation} family={} stage=coverage family was not exercised",
+                family.name(),
+            );
+        }
+        for (cpu, count) in self.cpu.iter().enumerate() {
+            assert!(
+                *count > 0,
+                "seed={seed:#018x} operation={operation} family=cpu-{cpu} stage=coverage CPU was not exercised",
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct I2OracleHandle {
+    generation: u64,
+    rights: u8,
+    live: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum I2OracleThread {
+    Created,
+    Started,
+    Exited,
+    Excepted,
+    Terminated,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct I2OracleThreadSlot {
+    generation: u64,
+    state: I2OracleThread,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum I2WaitCompletion {
+    Signal,
+    Timeout,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct I2OracleWait {
+    token: u64,
+    thread_generation: u64,
+}
+
+struct I2ProtocolOracle {
+    handles: [I2OracleHandle; 3],
+    messages: usize,
+    peer_closed: bool,
+    waits: [Option<I2OracleWait>; I2_CPUS],
+    completed_waits: [Option<I2WaitCompletion>; I2_CPUS],
+    next_wait: u64,
+    threads: [I2OracleThreadSlot; I2_CPUS],
+}
+
+impl I2ProtocolOracle {
+    fn new() -> Self {
+        Self {
+            handles: [
+                I2OracleHandle {
+                    generation: 1,
+                    rights: 0b111,
+                    live: true,
+                },
+                I2OracleHandle {
+                    generation: 1,
+                    rights: 0,
+                    live: false,
+                },
+                I2OracleHandle {
+                    generation: 1,
+                    rights: 0b111,
+                    live: true,
+                },
+            ],
+            messages: 0,
+            peer_closed: false,
+            waits: [None; I2_CPUS],
+            completed_waits: [None; I2_CPUS],
+            next_wait: 1,
+            threads: [I2OracleThreadSlot {
+                generation: 1,
+                state: I2OracleThread::Created,
+            }; I2_CPUS],
+        }
+    }
+
+    fn duplicate_reduced(&mut self, source: usize, destination: usize, rights: u8) -> bool {
+        let source_handle = self.handles[source];
+        if !source_handle.live || rights & !source_handle.rights != 0 {
+            return false;
+        }
+        let destination_handle = &mut self.handles[destination];
+        destination_handle.generation += 1;
+        destination_handle.rights = rights;
+        destination_handle.live = true;
+        true
+    }
+
+    fn close(&mut self, handle: usize, generation: u64) -> bool {
+        let entry = &mut self.handles[handle];
+        if !entry.live || entry.generation != generation {
+            return false;
+        }
+        entry.live = false;
+        true
+    }
+
+    fn close_peer(&mut self, handle: usize, generation: u64) -> bool {
+        if !self.close(handle, generation) {
+            return false;
+        }
+        self.peer_closed = true;
+        true
+    }
+
+    fn send_reason(&mut self, handle: usize, generation: u64) -> I2ChannelResult {
+        let handle = self.handles[handle];
+        if !handle.live || handle.generation != generation || handle.rights & 0b001 == 0 {
+            return I2ChannelResult::StaleOrRights;
+        }
+        if self.peer_closed {
+            return I2ChannelResult::PeerClosed;
+        }
+        if self.messages == MESSAGE_CAPACITY {
+            return I2ChannelResult::Backpressure;
+        }
+        self.messages += 1;
+        I2ChannelResult::Applied
+    }
+
+    fn send(&mut self, handle: usize, generation: u64) -> bool {
+        self.send_reason(handle, generation) == I2ChannelResult::Applied
+    }
+
+    fn receive(&mut self, handle: usize, generation: u64) -> bool {
+        let handle = self.handles[handle];
+        if !handle.live || handle.generation != generation || handle.rights & 0b010 == 0 {
+            return false;
+        }
+        if self.messages == 0 {
+            return false;
+        }
+        self.messages -= 1;
+        true
+    }
+
+    fn wait(&mut self, cpu: usize) -> I2OracleWait {
+        if self.threads[cpu].state == I2OracleThread::Terminated {
+            return I2OracleWait {
+                token: 0,
+                thread_generation: 0,
+            };
+        }
+        let token = self.next_wait;
+        self.next_wait += 1;
+        let wait = I2OracleWait {
+            token,
+            thread_generation: self.threads[cpu].generation,
+        };
+        self.waits[cpu] = Some(wait);
+        wait
+    }
+
+    fn finish_wait(&mut self, cpu: usize, wait: I2OracleWait, reason: I2WaitCompletion) -> bool {
+        if wait.token == 0
+            || self.waits[cpu] != Some(wait)
+            || self.threads[cpu].generation != wait.thread_generation
+            || self.threads[cpu].state == I2OracleThread::Terminated
+        {
+            return false;
+        }
+        self.waits[cpu] = None;
+        self.completed_waits[cpu] = Some(reason);
+        true
+    }
+
+    fn create(&mut self, cpu: usize) -> bool {
+        if self.threads[cpu].state != I2OracleThread::Terminated {
+            return false;
+        }
+        self.threads[cpu].generation += 1;
+        self.threads[cpu].state = I2OracleThread::Created;
+        true
+    }
+
+    fn start(&mut self, cpu: usize, generation: u64) -> bool {
+        if self.threads[cpu].generation != generation
+            || self.threads[cpu].state != I2OracleThread::Created
+        {
+            return false;
+        }
+        self.threads[cpu].state = I2OracleThread::Started;
+        true
+    }
+
+    fn complete(&mut self, cpu: usize, generation: u64, state: I2OracleThread) -> bool {
+        if !matches!(state, I2OracleThread::Exited | I2OracleThread::Excepted)
+            || self.threads[cpu].generation != generation
+            || self.threads[cpu].state != I2OracleThread::Started
+        {
+            return false;
+        }
+        self.threads[cpu].state = state;
+        true
+    }
+
+    fn terminal_retire(&mut self, cpu: usize, generation: u64) -> bool {
+        if self.threads[cpu].generation != generation
+            || matches!(self.threads[cpu].state, I2OracleThread::Terminated)
+        {
+            return false;
+        }
+        self.threads[cpu].state = I2OracleThread::Terminated;
+        self.waits[cpu] = None;
+        self.completed_waits[cpu] = None;
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum I2ChannelResult {
+    Applied,
+    StaleOrRights,
+    Backpressure,
+    PeerClosed,
+}
+
+fn i2_oracle_assert(seed: u64, operation: usize, family: I2Family, stage: &str, condition: bool) {
+    assert!(
+        condition,
+        "seed={seed:#018x} operation={operation} family={} stage={stage}",
+        family.name(),
+    );
+}
+
+fn i2_seeded_cpu_order(rng: &mut I2Rng) -> [usize; I2_CPUS] {
+    let mut order = [0, 1, 2, 3];
+    for index in (1..I2_CPUS).rev() {
+        let swap = rng.bounded(index + 1);
+        order.swap(index, swap);
+    }
+    order
+}
+
+#[test]
+fn i2_deterministic_operation_family_oracle_is_bounded_and_complete() {
+    let mut schedules = Vec::new();
+    for seed in I2_SEEDS {
+        let mut rng = I2Rng(seed);
+        let cpu_order = i2_seeded_cpu_order(&mut rng);
+        let initiator_order = i2_seeded_cpu_order(&mut rng);
+        schedules.push((cpu_order, initiator_order));
+        let mut coverage = I2Coverage::default();
+        let mut protocol = I2ProtocolOracle::new();
+        let mut operation = 0;
+        let source_generation = protocol.handles[0].generation;
+
+        // Duplicate with reduced rights, close, then reject the stale source.
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Handle,
+            "duplicate-reduced",
+            protocol.duplicate_reduced(0, 1, 0b011),
+        );
+        coverage.record(I2Family::Handle, 0);
+        operation += 1;
+        let duplicate_generation = protocol.handles[1].generation;
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Handle,
+            "close-source",
+            protocol.close(0, source_generation),
+        );
+        coverage.record(I2Family::Handle, 1);
+        operation += 1;
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Handle,
+            "stale-source-rejected",
+            !protocol.close(0, source_generation),
+        );
+        coverage.record(I2Family::Handle, 2);
+        operation += 1;
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Handle,
+            "reduced-rights",
+            protocol.handles[1].rights == 0b011,
+        );
+        coverage.record(I2Family::Handle, 3);
+        operation += 1;
+
+        // Channel capacity and peer-close are distinct from local handle close.
+        for cpu in cpu_order {
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::Channel,
+                "send",
+                protocol.send(1, duplicate_generation),
+            );
+            coverage.record(I2Family::Channel, cpu);
+            operation += 1;
+        }
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Channel,
+            "backpressure",
+            protocol.send_reason(1, duplicate_generation) == I2ChannelResult::Backpressure,
+        );
+        coverage.record(I2Family::Channel, 0);
+        operation += 1;
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Channel,
+            "receive",
+            protocol.receive(1, duplicate_generation),
+        );
+        coverage.record(I2Family::Channel, 1);
+        operation += 1;
+        protocol.handles[1].rights = 0b001;
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Channel,
+            "rights-rejected-receive",
+            !protocol.receive(1, duplicate_generation),
+        );
+        protocol.handles[1].rights = 0b011;
+        operation += 1;
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Channel,
+            "endpoint-close",
+            protocol.close_peer(2, protocol.handles[2].generation),
+        );
+        coverage.record(I2Family::Channel, 2);
+        operation += 1;
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Channel,
+            "live-peer-propagated-close",
+            protocol.handles[1].live
+                && protocol.send_reason(1, duplicate_generation) == I2ChannelResult::PeerClosed,
+        );
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Channel,
+            "stale-receive-after-source-close",
+            !protocol.receive(0, source_generation),
+        );
+        operation += 1;
+
+        for cpu in cpu_order {
+            let signal = protocol.wait(cpu);
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::Wait,
+                "signal",
+                protocol.finish_wait(cpu, signal, I2WaitCompletion::Signal),
+            );
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::Wait,
+                "signal-race-rejected",
+                !protocol.finish_wait(cpu, signal, I2WaitCompletion::Cancel),
+            );
+            coverage.record(I2Family::Wait, cpu);
+            operation += 1;
+            let timeout = protocol.wait(cpu);
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::Wait,
+                "timeout",
+                protocol.finish_wait(cpu, timeout, I2WaitCompletion::Timeout),
+            );
+            operation += 1;
+            let cancel = protocol.wait(cpu);
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::Wait,
+                "cancel",
+                protocol.finish_wait(cpu, cancel, I2WaitCompletion::Cancel),
+            );
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::Wait,
+                "completion-reason",
+                protocol.completed_waits[cpu] == Some(I2WaitCompletion::Cancel),
+            );
+            operation += 1;
+        }
+        let stale_wait = protocol.wait(0);
+        let stale_generation = protocol.threads[0].generation;
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Lifecycle,
+            "terminal-wait-owner",
+            protocol.terminal_retire(0, stale_generation),
+        );
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Wait,
+            "terminal-retirement",
+            !protocol.finish_wait(0, stale_wait, I2WaitCompletion::Signal),
+        );
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Lifecycle,
+            "start-after-terminal",
+            !protocol.start(0, stale_generation),
+        );
+        coverage.record(I2Family::Wait, 0);
+        operation += 1;
+
+        for cpu in cpu_order {
+            // The earlier terminal-wait path may have retired this slot; this
+            // is a fresh generation's create transition before start.
+            if protocol.threads[cpu].state == I2OracleThread::Terminated {
+                i2_oracle_assert(
+                    seed,
+                    operation,
+                    I2Family::Lifecycle,
+                    "create-after-terminal",
+                    protocol.create(cpu),
+                );
+            }
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::Lifecycle,
+                "create",
+                protocol.threads[cpu].state == I2OracleThread::Created,
+            );
+            operation += 1;
+            let generation = protocol.threads[cpu].generation;
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::Lifecycle,
+                "start",
+                protocol.start(cpu, generation),
+            );
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::Lifecycle,
+                "duplicate-start",
+                !protocol.start(cpu, generation),
+            );
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::Lifecycle,
+                "start",
+                protocol.threads[cpu].state == I2OracleThread::Started,
+            );
+            coverage.record(I2Family::Lifecycle, cpu);
+            operation += 1;
+            let completion = if rng.next() & 1 == 0 {
+                I2OracleThread::Exited
+            } else {
+                I2OracleThread::Excepted
+            };
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::Lifecycle,
+                "exit-or-exception",
+                protocol.complete(cpu, generation, completion),
+            );
+            operation += 1;
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::Lifecycle,
+                "stale-generation-completion",
+                !protocol.complete(cpu, generation.saturating_sub(1), completion),
+            );
+            operation += 1;
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::Lifecycle,
+                "terminate",
+                protocol.terminal_retire(cpu, generation),
+            );
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::Lifecycle,
+                "terminate",
+                protocol.threads[cpu].state == I2OracleThread::Terminated,
+            );
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::Lifecycle,
+                "terminal-after-terminal",
+                !protocol.terminal_retire(cpu, generation),
+            );
+            operation += 1;
+        }
+
+        // Keep the negative remote-ack paths in one small model so every
+        // rejection is attributable to the pending exact generation, rather
+        // than merely to an unrelated finished mutation.
+        let mut ack_adversary = I2Model::new();
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Shootdown,
+            "ack-adversary-enter-initiator",
+            ack_adversary.enter(0, 0) == I2Result::Applied,
+        );
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Shootdown,
+            "ack-adversary-enter-remote",
+            ack_adversary.enter(1, 0) == I2Result::Applied,
+        );
+        let pending_generation = ack_adversary.spaces[0].mutation_generation;
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Shootdown,
+            "pending-map",
+            ack_adversary.begin_mutation(
+                0,
+                I2MappingMutation::Map {
+                    object: 0,
+                    protection: 0b011,
+                },
+                0,
+            ) == I2Result::Applied,
+        );
+        coverage.record(I2Family::Shootdown, 0);
+        operation += 1;
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Shootdown,
+            "mutation-contention",
+            ack_adversary.begin_mutation(
+                0,
+                I2MappingMutation::Map {
+                    object: 2,
+                    protection: 0b101,
+                },
+                0,
+            ) == I2Result::Rejected,
+        );
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Shootdown,
+            "nonresident-ack",
+            ack_adversary.acknowledge(0, 2, pending_generation) == I2Result::Rejected,
+        );
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Shootdown,
+            "leave-before-ack",
+            ack_adversary.leave(1) == I2Result::Rejected,
+        );
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::MemoryObject,
+            "finalize-refuses-pending-map",
+            ack_adversary.finalize_object(0) == I2Result::Rejected,
+        );
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::MemoryObject,
+            "reclaim-refuses-pending-map",
+            ack_adversary.reclaim_object(0) == I2Result::Rejected,
+        );
+        ack_adversary.spaces[0].owner = None;
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Shootdown,
+            "teardown-refuses-pending-map",
+            ack_adversary.teardown(0) == I2Result::Rejected,
+        );
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Shootdown,
+            "current-remote-ack",
+            ack_adversary.acknowledge(0, 1, pending_generation) == I2Result::Applied,
+        );
+        coverage.record(I2Family::Shootdown, 1);
+        operation += 1;
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Shootdown,
+            "duplicate-current-ack",
+            ack_adversary.acknowledge(0, 1, pending_generation) == I2Result::Rejected,
+        );
+
+        // Four initiators mutate a space resident on all four CPUs.  Every
+        // exact generation must acknowledge before map/protect/unmap commits;
+        // the prior generation is rejected while the mutation is pending.
+        let mut model = I2Model::new();
+        for cpu in 0..I2_CPUS {
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::Mapping,
+                "enter",
+                model.enter(cpu, 0) == I2Result::Applied,
+            );
+            coverage.record(I2Family::Mapping, cpu);
+            operation += 1;
+        }
+        for initiator in initiator_order {
+            let map_generation = model.spaces[0].mutation_generation;
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::Mapping,
+                "map",
+                model.begin_mutation(
+                    0,
+                    I2MappingMutation::Map {
+                        object: 1,
+                        protection: 0b011,
+                    },
+                    initiator,
+                ) == I2Result::Applied,
+            );
+            coverage.record(I2Family::Mapping, initiator);
+            operation += 1;
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::Shootdown,
+                "stale-exact-generation-ack",
+                model.acknowledge(
+                    0,
+                    (initiator + 1) % I2_CPUS,
+                    map_generation.saturating_sub(1),
+                ) == I2Result::Rejected,
+            );
+            coverage.record(I2Family::Shootdown, initiator);
+            operation += 1;
+            for cpu in 0..I2_CPUS {
+                if cpu != initiator {
+                    i2_oracle_assert(
+                        seed,
+                        operation,
+                        I2Family::Shootdown,
+                        "map-ack",
+                        model.acknowledge(0, cpu, map_generation) == I2Result::Applied,
+                    );
+                    coverage.record(I2Family::Shootdown, cpu);
+                    operation += 1;
+                }
+            }
+            let protect_generation = model.spaces[0].mutation_generation;
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::Mapping,
+                "protect",
+                model.begin_mutation(
+                    0,
+                    I2MappingMutation::Protect { protection: 0b101 },
+                    initiator,
+                ) == I2Result::Applied,
+            );
+            operation += 1;
+            for cpu in 0..I2_CPUS {
+                if cpu != initiator {
+                    i2_oracle_assert(
+                        seed,
+                        operation,
+                        I2Family::Shootdown,
+                        "protect-ack",
+                        model.acknowledge(0, cpu, protect_generation) == I2Result::Applied,
+                    );
+                    operation += 1;
+                }
+            }
+            let unmap_generation = model.spaces[0].mutation_generation;
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::Mapping,
+                "unmap",
+                model.begin_mutation(0, I2MappingMutation::Unmap, initiator) == I2Result::Applied,
+            );
+            operation += 1;
+            for cpu in 0..I2_CPUS {
+                if cpu != initiator {
+                    i2_oracle_assert(
+                        seed,
+                        operation,
+                        I2Family::Shootdown,
+                        "unmap-ack",
+                        model.acknowledge(0, cpu, unmap_generation) == I2Result::Applied,
+                    );
+                    operation += 1;
+                }
+            }
+        }
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::MemoryObject,
+            "finalize",
+            model.finalize_object(1) == I2Result::Applied,
+        );
+        coverage.record(I2Family::MemoryObject, 0);
+        operation += 1;
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::MemoryObject,
+            "reclaim",
+            model.reclaim_object(1) == I2Result::Applied,
+        );
+        coverage.record(I2Family::MemoryObject, 1);
+        operation += 1;
+
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Subtree,
+            "create-child",
+            model.create_child(0, 1) == I2Result::Applied,
+        );
+        coverage.record(I2Family::Subtree, 2);
+        operation += 1;
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Subtree,
+            "reject-sibling-authority",
+            model.try_sibling_authority(1, 0) == I2Result::Rejected,
+        );
+        coverage.record(I2Family::Subtree, 3);
+        operation += 1;
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::Lifecycle,
+            "process-exit",
+            model.exit_process(1) == I2Result::Applied,
+        );
+        coverage.record(I2Family::Lifecycle, 1);
+        operation += 1;
+
+        for cpu in 0..I2_CPUS {
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::IdleWakeTimer,
+                "leave",
+                model.leave(cpu) == I2Result::Applied,
+            );
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::IdleWakeTimer,
+                "idle",
+                model.idle(cpu) == I2Result::Applied,
+            );
+            let wake_generation = model.cpus[cpu].wake_generation;
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::IdleWakeTimer,
+                "wake",
+                model.wake(cpu, wake_generation) == I2Result::Applied,
+            );
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::IdleWakeTimer,
+                "stale-wake",
+                model.wake(cpu, wake_generation) == I2Result::Rejected,
+            );
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::IdleWakeTimer,
+                "arm-timer",
+                model.arm_timer(cpu, 1) == I2Result::Applied,
+            );
+            let timer_generation = model.cpus[cpu].timer_generation;
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::IdleWakeTimer,
+                "early-timer",
+                model.fire_timer(cpu, timer_generation) == I2Result::Noop,
+            );
+            coverage.record(I2Family::IdleWakeTimer, cpu);
+            operation += 1;
+        }
+        i2_oracle_assert(
+            seed,
+            operation,
+            I2Family::IdleWakeTimer,
+            "advance",
+            model.advance(1) == I2Result::Applied,
+        );
+        for cpu in 0..I2_CPUS {
+            i2_oracle_assert(
+                seed,
+                operation,
+                I2Family::IdleWakeTimer,
+                "fire-timer",
+                model.fire_timer(cpu, model.cpus[cpu].timer_generation) == I2Result::Applied,
+            );
+            operation += 1;
+        }
+        model.assert_invariants(I2Context {
+            seed,
+            operation,
+            name: I2Operation::Advance { delta: 0 },
+        });
+        coverage.assert_complete(seed, operation);
+    }
+    for (index, schedule) in schedules.iter().enumerate() {
+        assert!(
+            schedules[..index].iter().all(|prior| prior != schedule),
+            "I2 seeded companion schedule duplicated at index={index}: {schedule:?}",
         );
     }
 }
