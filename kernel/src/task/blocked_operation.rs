@@ -204,7 +204,7 @@ impl<const CAPACITY: usize> BlockedOperationRegistry<CAPACITY> {
             .any(|slot| slot.entry.is_some_and(|entry| entry.thread == thread))
     }
 
-    pub(crate) fn drained(
+    fn drained_inner(
         &self,
         process: ProcessKey,
     ) -> Result<BlockedOperationsDrained, BlockedOperationError> {
@@ -224,6 +224,14 @@ impl<const CAPACITY: usize> BlockedOperationRegistry<CAPACITY> {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn drained(
+        &self,
+        process: ProcessKey,
+    ) -> Result<BlockedOperationsDrained, BlockedOperationError> {
+        self.drained_inner(process)
+    }
+
     pub(crate) fn drained_after_quiesce<
         const GROUPS: usize,
         const PROCESSES: usize,
@@ -237,13 +245,13 @@ impl<const CAPACITY: usize> BlockedOperationRegistry<CAPACITY> {
         tasks
             .validate_process_quiescence(proof, proof.process)
             .map_err(BlockedOperationError::Task)?;
-        let mut drained = self.drained(proof.process)?;
+        let mut drained = self.drained_inner(proof.process)?;
         drained.task_domain = Some(proof.authority_domain);
         drained.task_generation = Some(proof.generation);
         Ok(drained)
     }
 
-    pub(crate) fn validate_drained(
+    fn validate_drained_inner(
         &self,
         proof: &BlockedOperationsDrained,
         process: ProcessKey,
@@ -260,6 +268,15 @@ impl<const CAPACITY: usize> BlockedOperationRegistry<CAPACITY> {
             return Err(BlockedOperationError::ProcessStillBlocked);
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn validate_drained(
+        &self,
+        proof: &BlockedOperationsDrained,
+        process: ProcessKey,
+    ) -> Result<(), BlockedOperationError> {
+        self.validate_drained_inner(proof, process)
     }
 
     pub(crate) fn validate_drained_after_quiesce<
@@ -281,7 +298,7 @@ impl<const CAPACITY: usize> BlockedOperationRegistry<CAPACITY> {
         {
             return Err(BlockedOperationError::ForeignReservation);
         }
-        self.validate_drained(drained, proof.process)
+        self.validate_drained_inner(drained, proof.process)
     }
 }
 
@@ -299,6 +316,7 @@ pub(crate) struct BlockedOperation<RESOURCES> {
 }
 
 impl<RESOURCES> BlockedOperation<RESOURCES> {
+    #[cfg(test)]
     pub(crate) fn publish<const CAPACITY: usize>(
         registry: &BlockedOperationRegistry<CAPACITY>,
         process: ProcessKey,
@@ -336,6 +354,35 @@ impl<RESOURCES> BlockedOperation<RESOURCES> {
             Ok(lease) => lease,
             Err(error) => return Err((BlockedOperationError::Task(error), resources)),
         };
+        Self::publish_with_process_lease(registry, tasks, lease, process, thread, wake, resources)
+    }
+
+    /// Publishes a block using authority acquired after any user access and
+    /// before process-owned setup. The lease moves into the durable operation
+    /// owner on success and is released on every publication failure.
+    pub(crate) fn publish_with_process_lease<
+        const CAPACITY: usize,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        registry: &BlockedOperationRegistry<CAPACITY>,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        lease: ProcessOperationLease,
+        process: ProcessKey,
+        thread: ThreadKey,
+        wake: BlockWakeKey,
+        resources: RESOURCES,
+    ) -> Result<Self, (BlockedOperationError, RESOURCES)> {
+        if let Err(error) = tasks.validate_process_operation(&lease, process) {
+            tasks
+                .release_process_operation(lease)
+                .unwrap_or_else(|(release_error, _)| {
+                    panic!("invalid block lease could not be released: {release_error:?}")
+                });
+            return Err((BlockedOperationError::Task(error), resources));
+        }
         match registry.reserve(process, thread, wake) {
             Ok(reservation) => Ok(Self {
                 reservation: Some(reservation),
@@ -360,6 +407,12 @@ impl<RESOURCES> BlockedOperation<RESOURCES> {
             .wake
     }
 
+    #[cfg(test)]
+    pub(crate) const fn has_process_lease(&self) -> bool {
+        self.process_lease.is_some()
+    }
+
+    #[cfg(test)]
     pub(crate) fn complete_with<const CAPACITY: usize, RESULT>(
         self,
         registry: &BlockedOperationRegistry<CAPACITY>,

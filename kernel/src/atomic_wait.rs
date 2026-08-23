@@ -14,7 +14,7 @@ use crate::sync::IrqSpinMutex;
 use crate::task::{
     BlockWakeKey, BlockedOperation, BlockedOperationError, BlockedOperationRegistry,
     BlockedOperationWinner, ExecutionDomain, ProcessKey, ScheduleDecision, SchedulerError,
-    ThreadKey,
+    TaskAuthority, ThreadKey,
 };
 use crate::time::DeadlineRegistration;
 use crate::wait::engine::{WaitDeadline, WaitDeadlineAuthority, WaitDeadlineError};
@@ -364,9 +364,16 @@ impl<PIN> AtomicWaitOperation<PIN> {
         blocked.winner(self.wake_key())
     }
 
-    pub(crate) fn complete<const BLOCKED: usize>(
+    pub(crate) fn complete<
+        const BLOCKED: usize,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
         self,
         blocked_registry: &BlockedOperationRegistry<BLOCKED>,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         winner: BlockedOperationWinner,
     ) -> Result<(PIN, AtomicWaitRegistration, Option<DeadlineRegistration>), BlockedOperationError>
     {
@@ -378,13 +385,25 @@ impl<PIN> AtomicWaitOperation<PIN> {
             registration,
             deadline,
         } = self;
-        blocked.complete_with(blocked_registry, winner, |()| ())?;
+        #[cfg(test)]
+        if !blocked.has_process_lease() {
+            blocked.complete_with(blocked_registry, winner, |()| ())?;
+            return Ok((pin, registration, deadline));
+        }
+        blocked.complete_for_process(blocked_registry, tasks, winner, |()| ())?;
         Ok((pin, registration, deadline))
     }
 
-    pub(crate) fn complete_terminal<const BLOCKED: usize>(
+    pub(crate) fn complete_terminal<
+        const BLOCKED: usize,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
         self,
         blocked_registry: &BlockedOperationRegistry<BLOCKED>,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     ) -> Result<(PIN, AtomicWaitRegistration, Option<DeadlineRegistration>), BlockedOperationError>
     {
         let wake = self.wake_key();
@@ -398,7 +417,7 @@ impl<PIN> AtomicWaitOperation<PIN> {
                 BlockedOperationWinner::Terminal
             }
         };
-        self.complete(blocked_registry, winner)
+        self.complete(blocked_registry, tasks, winner)
     }
 }
 
@@ -531,12 +550,21 @@ fn cancel_deadline(
     clippy::too_many_arguments,
     reason = "the wait transaction keeps predicate, deadline, scheduler, registry, operation, process, thread, and pinned-load authorities explicit"
 )]
-pub(crate) fn begin_atomic_wait<PIN, const WAITERS: usize, const EXECUTION: usize>(
+pub(crate) fn begin_atomic_wait<
+    PIN,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
     pin: PIN,
     key: AtomicWaitKey,
     expected: u32,
     deadline: WaitDeadline,
     registry: &AtomicWaitRegistry<WAITERS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
     operations: &mut AtomicWaitOperationRegistry<PIN, EXECUTION>,
     mut deadline_authority: Option<&mut dyn WaitDeadlineAuthority>,
@@ -561,8 +589,9 @@ pub(crate) fn begin_atomic_wait<PIN, const WAITERS: usize, const EXECUTION: usiz
         }
     };
     let wake = block.wake_key();
-    let blocked = match BlockedOperation::publish(
+    let blocked = match BlockedOperation::publish_for_process(
         execution.blocked_operations(),
+        tasks,
         process,
         thread,
         wake,
@@ -586,8 +615,9 @@ pub(crate) fn begin_atomic_wait<PIN, const WAITERS: usize, const EXECUTION: usiz
         WaitDeadline::Finite(deadline_ns) => {
             let Some(authority) = deadline_authority.as_mut() else {
                 blocked
-                    .complete_with(
+                    .complete_for_process(
                         execution.blocked_operations(),
+                        tasks,
                         BlockedOperationWinner::Cancelled,
                         |()| (),
                     )
@@ -604,8 +634,9 @@ pub(crate) fn begin_atomic_wait<PIN, const WAITERS: usize, const EXECUTION: usiz
                 Ok(registration) => Some(registration),
                 Err(WaitDeadlineError::Expired) => {
                     blocked
-                        .complete_with(
+                        .complete_for_process(
                             execution.blocked_operations(),
+                            tasks,
                             BlockedOperationWinner::Timeout,
                             |()| (),
                         )
@@ -617,8 +648,9 @@ pub(crate) fn begin_atomic_wait<PIN, const WAITERS: usize, const EXECUTION: usiz
                 }
                 Err(error) => {
                     blocked
-                        .complete_with(
+                        .complete_for_process(
                             execution.blocked_operations(),
+                            tasks,
                             BlockedOperationWinner::Cancelled,
                             |()| (),
                         )
@@ -639,8 +671,9 @@ pub(crate) fn begin_atomic_wait<PIN, const WAITERS: usize, const EXECUTION: usiz
         Ok(AtomicWaitRegisterOutcome::Registered(registration)) => registration,
         Ok(AtomicWaitRegisterOutcome::Mismatch { .. }) => {
             blocked
-                .complete_with(
+                .complete_for_process(
                     execution.blocked_operations(),
+                    tasks,
                     BlockedOperationWinner::Cancelled,
                     |()| (),
                 )
@@ -654,8 +687,9 @@ pub(crate) fn begin_atomic_wait<PIN, const WAITERS: usize, const EXECUTION: usiz
         }
         Err(error) => {
             blocked
-                .complete_with(
+                .complete_for_process(
                     execution.blocked_operations(),
+                    tasks,
                     BlockedOperationWinner::Cancelled,
                     |()| (),
                 )
@@ -690,6 +724,7 @@ pub(crate) fn begin_atomic_wait<PIN, const WAITERS: usize, const EXECUTION: usiz
         let (pin, _, deadline) = operation
             .complete(
                 execution.blocked_operations(),
+                tasks,
                 BlockedOperationWinner::Cancelled,
             )
             .expect("unpublished F9 operation cleanup remains exact");
@@ -721,7 +756,7 @@ pub(crate) fn begin_atomic_wait<PIN, const WAITERS: usize, const EXECUTION: usiz
                 .cancel_if_live(operation.registration())
                 .expect("pre-block F9 registration cleanup remains exact");
             let (pin, _, deadline) = operation
-                .complete(execution.blocked_operations(), winner)
+                .complete(execution.blocked_operations(), tasks, winner)
                 .expect("pre-block F9 completion remains exact");
             cancel_deadline(&mut deadline_authority, deadline)
                 .expect("pre-block F9 deadline remains cancellable");
@@ -739,8 +774,17 @@ pub(crate) fn begin_atomic_wait<PIN, const WAITERS: usize, const EXECUTION: usiz
     }
 }
 
-pub(crate) fn finish_atomic_wait<PIN, const WAITERS: usize, const EXECUTION: usize>(
+pub(crate) fn finish_atomic_wait<
+    PIN,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
     registry: &AtomicWaitRegistry<WAITERS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
     operations: &mut AtomicWaitOperationRegistry<PIN, EXECUTION>,
     mut deadline_authority: Option<&mut dyn WaitDeadlineAuthority>,
@@ -759,14 +803,23 @@ pub(crate) fn finish_atomic_wait<PIN, const WAITERS: usize, const EXECUTION: usi
         .cancel_if_live(operation.registration())
         .map_err(AtomicWaitBeginError::Registry)?;
     let (pin, _, deadline) = operation
-        .complete(execution.blocked_operations(), winner)
+        .complete(execution.blocked_operations(), tasks, winner)
         .map_err(AtomicWaitBeginError::Blocked)?;
     cancel_deadline(&mut deadline_authority, deadline).map_err(AtomicWaitBeginError::Deadline)?;
     Ok((pin, winner))
 }
 
-pub(crate) fn finish_terminal_atomic_wait<PIN, const WAITERS: usize, const EXECUTION: usize>(
+pub(crate) fn finish_terminal_atomic_wait<
+    PIN,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
     registry: &AtomicWaitRegistry<WAITERS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
     operations: &mut AtomicWaitOperationRegistry<PIN, EXECUTION>,
     mut deadline_authority: Option<&mut dyn WaitDeadlineAuthority>,
@@ -779,7 +832,7 @@ pub(crate) fn finish_terminal_atomic_wait<PIN, const WAITERS: usize, const EXECU
         .cancel_if_live(operation.registration())
         .map_err(AtomicWaitBeginError::Registry)?;
     let (pin, _, deadline) = operation
-        .complete_terminal(execution.blocked_operations())
+        .complete_terminal(execution.blocked_operations(), tasks)
         .map_err(AtomicWaitBeginError::Blocked)?;
     cancel_deadline(&mut deadline_authority, deadline).map_err(AtomicWaitBeginError::Deadline)?;
     Ok(Some(pin))
@@ -1343,14 +1396,22 @@ mod tests {
         operations.publish(&mut operation).unwrap();
         assert!(operation.is_none());
         let operation = operations.take_thread(threads[0]).unwrap();
-        let (pin, returned_registration, deadline) = operation.complete_terminal(&ledger).unwrap();
+        let mut tasks = TaskAuthority::<1, 1, 1, 1>::new();
+        let (pin, returned_registration, deadline) =
+            operation.complete_terminal(&ledger, &mut tasks).unwrap();
         assert_eq!(pin, 0x55);
         assert_eq!(returned_registration, registration);
         assert!(deadline.is_none());
         assert!(registrations.cancel_if_live(registration).unwrap());
     }
 
-    fn running_fixture() -> (ExecutionDomain<1>, ProcessKey, ThreadKey, AtomicWaitKey) {
+    fn running_fixture() -> (
+        TaskAuthority<1, 1, 1, 2>,
+        ExecutionDomain<1>,
+        ProcessKey,
+        ThreadKey,
+        AtomicWaitKey,
+    ) {
         let mut objects = ObjectRegistry::<8>::new();
         let mut tasks = TaskAuthority::<1, 1, 1, 2>::new();
         let (_root, root_owner) = tasks.create_root_group(&mut objects).unwrap();
@@ -1387,7 +1448,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(execution.schedule_next().unwrap().current, Some(thread));
-        (execution, process, thread, key)
+        (tasks, execution, process, thread, key)
     }
 
     struct ExpiredDeadline;
@@ -1411,7 +1472,7 @@ mod tests {
 
     #[test]
     fn initial_mismatch_precedes_now_deadline() {
-        let (execution, process, thread, key) = running_fixture();
+        let (mut tasks, execution, process, thread, key) = running_fixture();
         let registrations = AtomicWaitRegistry::<1>::new();
         let mut operations = AtomicWaitOperationRegistry::<u32, 1>::new();
         let outcome = begin_atomic_wait(
@@ -1420,6 +1481,7 @@ mod tests {
             7,
             WaitDeadline::Now,
             &registrations,
+            &mut tasks,
             &execution,
             &mut operations,
             None,
@@ -1439,7 +1501,7 @@ mod tests {
 
     #[test]
     fn initial_mismatch_precedes_an_already_expired_finite_deadline() {
-        let (execution, process, thread, key) = running_fixture();
+        let (mut tasks, execution, process, thread, key) = running_fixture();
         let registrations = AtomicWaitRegistry::<1>::new();
         let mut operations = AtomicWaitOperationRegistry::<u32, 1>::new();
         let mut deadlines = ExpiredDeadline;
@@ -1449,6 +1511,7 @@ mod tests {
             7,
             WaitDeadline::Finite(10),
             &registrations,
+            &mut tasks,
             &execution,
             &mut operations,
             Some(&mut deadlines),
@@ -1468,7 +1531,7 @@ mod tests {
 
     #[test]
     fn under_barrier_reread_mismatch_returns_without_registration() {
-        let (execution, process, thread, key) = running_fixture();
+        let (mut tasks, execution, process, thread, key) = running_fixture();
         let registrations = AtomicWaitRegistry::<1>::new();
         let mut operations = AtomicWaitOperationRegistry::<u32, 1>::new();
         let loads = Cell::new(0_u32);
@@ -1478,6 +1541,7 @@ mod tests {
             7,
             WaitDeadline::Infinite,
             &registrations,
+            &mut tasks,
             &execution,
             &mut operations,
             None,
@@ -1502,7 +1566,7 @@ mod tests {
 
     #[test]
     fn equal_word_with_expired_finite_deadline_times_out_cleanly() {
-        let (execution, process, thread, key) = running_fixture();
+        let (mut tasks, execution, process, thread, key) = running_fixture();
         let registrations = AtomicWaitRegistry::<1>::new();
         let mut operations = AtomicWaitOperationRegistry::<u32, 1>::new();
         let mut deadlines = ExpiredDeadline;
@@ -1512,6 +1576,7 @@ mod tests {
             7,
             WaitDeadline::Finite(10),
             &registrations,
+            &mut tasks,
             &execution,
             &mut operations,
             Some(&mut deadlines),

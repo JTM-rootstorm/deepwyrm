@@ -156,7 +156,6 @@ pub(crate) struct WaitSources<
     const CHANNEL_DEPTH: usize,
     const WAITERS: usize,
 > {
-    pub(crate) tasks: &'a TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     pub(crate) events: &'a EventAuthority<EVENTS>,
     pub(crate) timers: &'a TimerAuthority<TIMERS>,
     pub(crate) channels: &'a ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
@@ -236,6 +235,7 @@ impl ResolvedWaitSet {
         const WAITERS: usize,
     >(
         &self,
+        tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         sources: &WaitSources<
             '_,
             GROUPS,
@@ -251,7 +251,7 @@ impl ResolvedWaitSet {
     ) -> Result<Option<WaitSelection>, WaitSetError> {
         for item in self.items[..self.len].iter().flatten() {
             let observed = current_signals_for(
-                sources.tasks,
+                tasks,
                 sources.events,
                 sources.timers,
                 sources.channels,
@@ -281,6 +281,7 @@ impl ResolvedWaitSet {
         const WAITERS: usize,
     >(
         &self,
+        tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         registry: &mut ObjectRegistry<OBJECTS>,
         sources: &WaitSources<
             '_,
@@ -309,6 +310,7 @@ impl ResolvedWaitSet {
                 }
             };
             match register_one(
+                tasks,
                 sources,
                 retained,
                 item.desired,
@@ -324,7 +326,7 @@ impl ResolvedWaitSet {
                             "pre-publication wait registration unexpectedly became final",
                         );
                     return self
-                        .select_ready(sources)?
+                        .select_ready(tasks, sources)?
                         .ok_or(WaitSetError::StateDrift)
                         .map(Some);
                 }
@@ -339,7 +341,7 @@ impl ResolvedWaitSet {
             }
         }
 
-        match self.select_ready(sources) {
+        match self.select_ready(tasks, sources) {
             Ok(Some(selection)) => {
                 release_cancelled_generation(registry, sources.waits.cancel_generation(wake))
                     .expect_empty("pre-publication wait registration unexpectedly became final");
@@ -376,6 +378,7 @@ fn register_one<
     const CHANNEL_DEPTH: usize,
     const WAITERS: usize,
 >(
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     sources: &WaitSources<
         '_,
         GROUPS,
@@ -433,7 +436,7 @@ fn register_one<
         },
         DW_OBJECT_TYPE_PROCESS | DW_OBJECT_TYPE_THREAD => {
             let observed = match current_signals_for(
-                sources.tasks,
+                tasks,
                 sources.events,
                 sources.timers,
                 sources.channels,
@@ -546,6 +549,7 @@ pub(crate) struct WaitBeginContext<
     const EXECUTION: usize,
 > {
     pub(crate) registry: &'a mut ObjectRegistry<OBJECTS>,
+    pub(crate) tasks: &'a mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     pub(crate) sources: WaitSources<
         'a,
         GROUPS,
@@ -600,6 +604,7 @@ pub(crate) fn begin_registered_wait<
 ) -> Result<WaitBeginOutcome<OUTPUT>, WaitBeginFailure<OUTPUT>> {
     let WaitBeginContext {
         registry,
+        tasks,
         sources,
         execution,
         operations,
@@ -607,7 +612,7 @@ pub(crate) fn begin_registered_wait<
         thread,
     } = context;
 
-    match set.select_ready(&sources) {
+    match set.select_ready(tasks, &sources) {
         Ok(Some(selection)) => {
             set.release(registry);
             return Ok(WaitBeginOutcome::Ready { output, selection });
@@ -637,8 +642,9 @@ pub(crate) fn begin_registered_wait<
         }
     };
     let wake = block.wake_key();
-    let blocked = match BlockedOperation::publish(
+    let blocked = match BlockedOperation::publish_for_process(
         execution.blocked_operations(),
+        tasks,
         process,
         thread,
         wake,
@@ -666,8 +672,9 @@ pub(crate) fn begin_registered_wait<
         WaitDeadline::Finite(deadline_ns) => {
             let Some(authority) = deadline_authority.as_mut() else {
                 blocked
-                    .complete_with(
+                    .complete_for_process(
                         execution.blocked_operations(),
+                        tasks,
                         BlockedOperationWinner::Cancelled,
                         |()| (),
                     )
@@ -690,8 +697,9 @@ pub(crate) fn begin_registered_wait<
                 Ok(registration) => Some(registration),
                 Err(WaitDeadlineError::Expired) => {
                     blocked
-                        .complete_with(
+                        .complete_for_process(
                             execution.blocked_operations(),
+                            tasks,
                             BlockedOperationWinner::Timeout,
                             |()| (),
                         )
@@ -709,8 +717,9 @@ pub(crate) fn begin_registered_wait<
                 }
                 Err(error) => {
                     blocked
-                        .complete_with(
+                        .complete_for_process(
                             execution.blocked_operations(),
+                            tasks,
                             BlockedOperationWinner::Cancelled,
                             |()| (),
                         )
@@ -747,6 +756,7 @@ pub(crate) fn begin_registered_wait<
         let (output, deadline) = operation
             .complete(
                 execution.blocked_operations(),
+                tasks,
                 BlockedOperationWinner::Cancelled,
             )
             .unwrap_or_else(|failure| {
@@ -769,7 +779,7 @@ pub(crate) fn begin_registered_wait<
     }
     debug_assert!(operation.is_none());
 
-    match set.register_generation(registry, &sources, thread, wake) {
+    match set.register_generation(tasks, registry, &sources, thread, wake) {
         Ok(Some(selection)) => {
             let operation = operations
                 .take_wake(wake)
@@ -777,6 +787,7 @@ pub(crate) fn begin_registered_wait<
             let (output, deadline) = operation
                 .complete(
                     execution.blocked_operations(),
+                    tasks,
                     BlockedOperationWinner::Cancelled,
                 )
                 .unwrap_or_else(|failure| {
@@ -809,6 +820,7 @@ pub(crate) fn begin_registered_wait<
                     let (output, deadline) = operation
                         .complete(
                             execution.blocked_operations(),
+                            tasks,
                             BlockedOperationWinner::Timeout,
                         )
                         .unwrap_or_else(|failure| {
@@ -842,7 +854,7 @@ pub(crate) fn begin_registered_wait<
                         observed,
                     };
                     let (output, deadline) = operation
-                        .complete(execution.blocked_operations(), winner)
+                        .complete(execution.blocked_operations(), tasks, winner)
                         .unwrap_or_else(|failure| {
                             panic!("F7 pre-block signal completion drifted: {failure:?}")
                         });
@@ -884,6 +896,7 @@ pub(crate) fn begin_registered_wait<
             let (output, deadline) = operation
                 .complete(
                     execution.blocked_operations(),
+                    tasks,
                     BlockedOperationWinner::Cancelled,
                 )
                 .unwrap_or_else(|failure| {
@@ -931,10 +944,15 @@ pub(crate) enum WaitFinishError {
 pub(crate) fn finish_wait_operation<
     OUTPUT,
     const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
     const WAITERS: usize,
     const EXECUTION: usize,
 >(
     registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     waits: &WaitRegistry<WAITERS>,
     execution: &ExecutionDomain<EXECUTION>,
     operations: &mut WaitOperationRegistry<OUTPUT, EXECUTION>,
@@ -950,7 +968,7 @@ pub(crate) fn finish_wait_operation<
         .ok_or(WaitFinishError::MissingWinner)?;
     let releases = release_cancelled_generation(registry, waits.cancel_generation(wake));
     let (output, deadline) = operation
-        .complete(execution.blocked_operations(), winner)
+        .complete(execution.blocked_operations(), tasks, winner)
         .map_err(WaitFinishError::Blocked)?;
     cancel_deadline_exact(&mut deadline_authority, deadline).map_err(WaitFinishError::Deadline)?;
     Ok((output, winner, releases))
@@ -975,10 +993,15 @@ pub(crate) fn claim_timeout_and_wake<const EXECUTION: usize>(
 pub(crate) fn finish_terminal_wait<
     OUTPUT,
     const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
     const WAITERS: usize,
     const EXECUTION: usize,
 >(
     registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     waits: &WaitRegistry<WAITERS>,
     execution: &ExecutionDomain<EXECUTION>,
     operations: &mut WaitOperationRegistry<OUTPUT, EXECUTION>,
@@ -991,7 +1014,7 @@ pub(crate) fn finish_terminal_wait<
     let wake = operation.wake_key();
     let releases = release_cancelled_generation(registry, waits.cancel_generation(wake));
     let (output, deadline) = operation
-        .complete_terminal(execution.blocked_operations())
+        .complete_terminal(execution.blocked_operations(), tasks)
         .map_err(WaitFinishError::Blocked)?;
     cancel_deadline_exact(&mut deadline_authority, deadline).map_err(WaitFinishError::Deadline)?;
     Ok(Some((output, releases)))
@@ -1119,13 +1142,15 @@ mod tests {
         let set = ResolvedWaitSet::resolve(&tasks, &mut registry, process, &requests).unwrap();
         assert_eq!(set.len(), 2);
         assert_eq!(
-            set.select_ready(&WaitSources {
-                tasks: &tasks,
-                events: &events,
-                timers: &timers,
-                channels: &channels,
-                waits: &waits
-            })
+            set.select_ready(
+                &tasks,
+                &WaitSources {
+                    events: &events,
+                    timers: &timers,
+                    channels: &channels,
+                    waits: &waits
+                }
+            )
             .unwrap(),
             Some(WaitSelection {
                 index: 0,
@@ -1151,13 +1176,15 @@ mod tests {
         }];
         let set = ResolvedWaitSet::resolve(&tasks, &mut registry, process, &requests).unwrap();
         assert_eq!(
-            set.select_ready(&WaitSources {
-                tasks: &tasks,
-                events: &events,
-                timers: &timers,
-                channels: &channels,
-                waits: &waits
-            })
+            set.select_ready(
+                &tasks,
+                &WaitSources {
+                    events: &events,
+                    timers: &timers,
+                    channels: &channels,
+                    waits: &waits
+                }
+            )
             .unwrap(),
             None
         );
@@ -1178,8 +1205,8 @@ mod tests {
             WaitDeadline::Infinite,
             WaitBeginContext {
                 registry: &mut registry,
+                tasks: &mut tasks,
                 sources: WaitSources {
-                    tasks: &tasks,
                     events: &events,
                     timers: &timers,
                     channels: &channels,
@@ -1225,13 +1252,15 @@ mod tests {
         }];
         let set = ResolvedWaitSet::resolve(&tasks, &mut registry, process, &requests).unwrap();
         assert_eq!(
-            set.select_ready(&WaitSources {
-                tasks: &tasks,
-                events: &events,
-                timers: &timers,
-                channels: &channels,
-                waits: &waits
-            })
+            set.select_ready(
+                &tasks,
+                &WaitSources {
+                    events: &events,
+                    timers: &timers,
+                    channels: &channels,
+                    waits: &waits
+                }
+            )
             .unwrap(),
             None
         );
@@ -1242,8 +1271,8 @@ mod tests {
             WaitDeadline::Infinite,
             WaitBeginContext {
                 registry: &mut registry,
+                tasks: &mut tasks,
                 sources: WaitSources {
-                    tasks: &tasks,
                     events: &events,
                     timers: &timers,
                     channels: &channels,
@@ -1306,7 +1335,7 @@ mod tests {
             Some(winner)
         );
         let (output, deadline) = operation
-            .complete(execution.blocked_operations(), winner)
+            .complete(execution.blocked_operations(), &mut tasks, winner)
             .unwrap();
         assert_eq!(output, 0x77);
         assert!(deadline.is_none());
@@ -1413,8 +1442,8 @@ mod tests {
             WaitDeadline::Now,
             WaitBeginContext {
                 registry: &mut registry,
+                tasks: &mut tasks,
                 sources: WaitSources {
-                    tasks: &tasks,
                     events: &events,
                     timers: &timers,
                     channels: &channels,
@@ -1447,8 +1476,8 @@ mod tests {
             WaitDeadline::Now,
             WaitBeginContext {
                 registry: &mut registry,
+                tasks: &mut tasks,
                 sources: WaitSources {
-                    tasks: &tasks,
                     events: &events,
                     timers: &timers,
                     channels: &channels,
@@ -1496,8 +1525,8 @@ mod tests {
             WaitDeadline::Finite(50),
             WaitBeginContext {
                 registry: &mut registry,
+                tasks: &mut tasks,
                 sources: WaitSources {
-                    tasks: &tasks,
                     events: &events,
                     timers: &timers,
                     channels: &channels,
@@ -1530,6 +1559,7 @@ mod tests {
         );
         let (output, winner, releases) = finish_wait_operation(
             &mut registry,
+            &mut tasks,
             &waits,
             &execution,
             &mut operations,
@@ -1567,8 +1597,8 @@ mod tests {
             WaitDeadline::Finite(90),
             WaitBeginContext {
                 registry: &mut registry,
+                tasks: &mut tasks,
                 sources: WaitSources {
-                    tasks: &tasks,
                     events: &events,
                     timers: &timers,
                     channels: &channels,
@@ -1604,6 +1634,7 @@ mod tests {
         assert!(claim_timeout_and_wake(&execution, wake).unwrap());
         let (output, winner, releases) = finish_wait_operation(
             &mut registry,
+            &mut tasks,
             &waits,
             &execution,
             &mut operations,
@@ -1650,8 +1681,8 @@ mod tests {
             WaitDeadline::Finite(70),
             WaitBeginContext {
                 registry: &mut registry,
+                tasks: &mut tasks,
                 sources: WaitSources {
-                    tasks: &tasks,
                     events: &events,
                     timers: &timers,
                     channels: &channels,

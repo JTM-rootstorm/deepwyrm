@@ -4964,7 +4964,7 @@ fn signal_timeout_race_has_exactly_one_winner_in_both_orders() {
         let state = match wait_one_syscall(
             &mut user,
             &mut registry,
-            &tasks,
+            &mut tasks,
             &events,
             &timers,
             &channels,
@@ -5032,6 +5032,7 @@ fn signal_timeout_race_has_exactly_one_winner_in_both_orders() {
         let status = resume_wait_thread_syscall(
             &mut user,
             &mut registry,
+            &mut tasks,
             &waits,
             &execution,
             &mut operations,
@@ -5095,7 +5096,7 @@ fn deferred_signal_after_timeout_resume_releases_stale_registration_pins() {
     let state = match wait_one_syscall(
         &mut user,
         &mut registry,
-        &tasks,
+        &mut tasks,
         &events,
         &timers,
         &channels,
@@ -5139,6 +5140,7 @@ fn deferred_signal_after_timeout_resume_releases_stale_registration_pins() {
         resume_wait_thread_syscall(
             &mut user,
             &mut registry,
+            &mut tasks,
             &waits,
             &execution,
             &mut operations,
@@ -5196,7 +5198,7 @@ fn public_finite_wait_idles_then_timeout_resumes_in_place_and_discards_output() 
     let suspended = match wait_one_syscall(
         &mut user,
         &mut registry,
-        &tasks,
+        &mut tasks,
         &events,
         &timers,
         &channels,
@@ -5243,6 +5245,7 @@ fn public_finite_wait_idles_then_timeout_resumes_in_place_and_discards_output() 
         resume_wait_syscall(
             &mut user,
             &mut registry,
+            &mut tasks,
             &waits,
             &execution,
             &mut operations,
@@ -5275,7 +5278,7 @@ fn public_finite_wait_idles_then_timeout_resumes_in_place_and_discards_output() 
 struct NativeWaitHarness<'a> {
     user: &'a mut FakeUserMemory,
     registry: &'a mut ObjectRegistry<16>,
-    tasks: &'a Tasks,
+    tasks: &'a mut Tasks,
     events: &'a EventAuthority<1>,
     timers: &'a TimerAuthority<1>,
     channels: &'a ChannelAuthority<1, 2>,
@@ -5378,7 +5381,7 @@ fn native_wait_ids_route_through_real_wait_transactions_and_resume_control() {
         let mut harness = NativeWaitHarness {
             user: &mut user,
             registry: &mut registry,
-            tasks: &tasks,
+            tasks: &mut tasks,
             events: &events,
             timers: &timers,
             channels: &channels,
@@ -5429,6 +5432,7 @@ fn native_wait_ids_route_through_real_wait_transactions_and_resume_control() {
         resume_wait_thread_syscall(
             &mut user,
             &mut registry,
+            &mut tasks,
             &waits,
             &execution,
             &mut operations,
@@ -5449,7 +5453,7 @@ fn native_wait_ids_route_through_real_wait_transactions_and_resume_control() {
         let mut harness = NativeWaitHarness {
             user: &mut user,
             registry: &mut registry,
-            tasks: &tasks,
+            tasks: &mut tasks,
             events: &events,
             timers: &timers,
             channels: &channels,
@@ -5518,7 +5522,7 @@ fn public_wait_one_preflights_owned_output_before_handle_resolution_and_commits_
         wait_one_syscall(
             &mut user,
             &mut registry,
-            &tasks,
+            &mut tasks,
             &events,
             &timers,
             &channels,
@@ -5539,7 +5543,7 @@ fn public_wait_one_preflights_owned_output_before_handle_resolution_and_commits_
         wait_one_syscall(
             &mut user,
             &mut registry,
-            &tasks,
+            &mut tasks,
             &events,
             &timers,
             &channels,
@@ -5575,7 +5579,7 @@ fn public_wait_one_preflights_owned_output_before_handle_resolution_and_commits_
         wait_one_syscall(
             &mut user,
             &mut registry,
-            &tasks,
+            &mut tasks,
             &events,
             &timers,
             &channels,
@@ -5651,7 +5655,7 @@ fn public_timer_wait_handles_level_ready_and_irq_expiry_resume() {
         wait_one_syscall(
             &mut user,
             &mut registry,
-            &tasks,
+            &mut tasks,
             &events,
             &timers,
             &channels,
@@ -5687,7 +5691,7 @@ fn public_timer_wait_handles_level_ready_and_irq_expiry_resume() {
     let suspended = match wait_one_syscall(
         &mut user,
         &mut registry,
-        &tasks,
+        &mut tasks,
         &events,
         &timers,
         &channels,
@@ -5720,6 +5724,7 @@ fn public_timer_wait_handles_level_ready_and_irq_expiry_resume() {
         resume_wait_syscall(
             &mut user,
             &mut registry,
+            &mut tasks,
             &waits,
             &execution,
             &mut operations,
@@ -5779,7 +5784,7 @@ fn public_wait_one_suspend_keeps_owned_output_until_exact_resume() {
     let suspended = match wait_one_syscall(
         &mut user,
         &mut registry,
-        &tasks,
+        &mut tasks,
         &events,
         &timers,
         &channels,
@@ -5818,6 +5823,7 @@ fn public_wait_one_suspend_keeps_owned_output_until_exact_resume() {
         resume_wait_syscall(
             &mut user,
             &mut registry,
+            &mut tasks,
             &waits,
             &execution,
             &mut operations,
@@ -5874,7 +5880,7 @@ fn public_wait_one_observes_channel_writable_and_peer_closed() {
         wait_one_syscall(
             &mut user,
             &mut registry,
-            &tasks,
+            &mut tasks,
             &events,
             &timers,
             &channels,
@@ -5905,7 +5911,7 @@ fn public_wait_one_observes_channel_writable_and_peer_closed() {
         wait_one_syscall(
             &mut user,
             &mut registry,
-            &tasks,
+            &mut tasks,
             &events,
             &timers,
             &channels,
@@ -5971,7 +5977,7 @@ fn repeated_duplicate_wait_many_signal_trace_selects_index_zero_once() {
         let suspended = match wait_many_syscall(
             &mut user,
             &mut registry,
-            &tasks,
+            &mut tasks,
             &events,
             &timers,
             &channels,
@@ -6013,6 +6019,7 @@ fn repeated_duplicate_wait_many_signal_trace_selects_index_zero_once() {
             resume_wait_syscall(
                 &mut user,
                 &mut registry,
+                &mut tasks,
                 &waits,
                 &execution,
                 &mut operations,
@@ -6072,7 +6079,7 @@ fn public_wait_many_obeys_scalar_snapshot_output_then_handle_failure_order() {
         wait_many_syscall(
             &mut user,
             &mut registry,
-            &tasks,
+            &mut tasks,
             &events,
             &timers,
             &channels,
@@ -6096,7 +6103,7 @@ fn public_wait_many_obeys_scalar_snapshot_output_then_handle_failure_order() {
         wait_many_syscall(
             &mut user,
             &mut registry,
-            &tasks,
+            &mut tasks,
             &events,
             &timers,
             &channels,
@@ -6127,7 +6134,7 @@ fn public_wait_many_obeys_scalar_snapshot_output_then_handle_failure_order() {
         wait_many_syscall(
             &mut user,
             &mut registry,
-            &tasks,
+            &mut tasks,
             &events,
             &timers,
             &channels,
@@ -6152,7 +6159,7 @@ fn public_wait_many_obeys_scalar_snapshot_output_then_handle_failure_order() {
         wait_many_syscall(
             &mut user,
             &mut registry,
-            &tasks,
+            &mut tasks,
             &events,
             &timers,
             &channels,
@@ -6177,7 +6184,7 @@ fn public_wait_many_obeys_scalar_snapshot_output_then_handle_failure_order() {
         wait_many_syscall(
             &mut user,
             &mut registry,
-            &tasks,
+            &mut tasks,
             &events,
             &timers,
             &channels,
@@ -6240,7 +6247,7 @@ fn wait_one_ready_beats_now_and_unsignaled_now_times_out() {
     match wait_one_begin(
         0x41,
         &mut registry,
-        &tasks,
+        &mut tasks,
         &events,
         &timers,
         &channels,
@@ -6282,7 +6289,7 @@ fn wait_one_ready_beats_now_and_unsignaled_now_times_out() {
     match wait_one_begin(
         0x42,
         &mut registry,
-        &tasks,
+        &mut tasks,
         &events,
         &timers,
         &channels,
@@ -6391,7 +6398,7 @@ fn wait_many_validates_full_array_and_selects_lowest_ready_index() {
             &mut user,
             0x51,
             &mut registry,
-            &tasks,
+            &mut tasks,
             &events,
             &timers,
             &channels,
@@ -6416,7 +6423,7 @@ fn wait_many_validates_full_array_and_selects_lowest_ready_index() {
         &mut user,
         0x52,
         &mut registry,
-        &tasks,
+        &mut tasks,
         &events,
         &timers,
         &channels,
@@ -6440,7 +6447,7 @@ fn wait_many_validates_full_array_and_selects_lowest_ready_index() {
         &mut user,
         0x53,
         &mut registry,
-        &tasks,
+        &mut tasks,
         &events,
         &timers,
         &channels,
@@ -6500,7 +6507,7 @@ fn wait_one_suspend_transfers_output_owner_until_signal_resume() {
     let wake = match wait_one_begin(
         0x61,
         &mut registry,
-        &tasks,
+        &mut tasks,
         &events,
         &timers,
         &channels,
@@ -6530,6 +6537,7 @@ fn wait_one_suspend_transfers_output_owner_until_signal_resume() {
     complete_wait_wakes(&mut registry, &execution, wakes, &mut cleanup);
     let (output, winner, releases) = crate::wait::engine::finish_wait_operation(
         &mut registry,
+        &mut tasks,
         &waits,
         &execution,
         &mut operations,
@@ -6614,7 +6622,7 @@ fn terminal_retirement_precedes_deferred_signal_completion_without_resurrection(
     let wake = match wait_one_begin(
         0xfeed_u32,
         &mut registry,
-        &tasks,
+        &mut tasks,
         &events,
         &timers,
         &channels,

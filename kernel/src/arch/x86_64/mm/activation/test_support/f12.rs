@@ -1602,6 +1602,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
             self.services.resume_suspended(
                 &mut user,
                 &mut self.registry,
+                self.tasks,
                 &self.waits,
                 self.execution,
                 thread,

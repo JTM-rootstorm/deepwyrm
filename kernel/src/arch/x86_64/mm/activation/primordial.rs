@@ -930,7 +930,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.merge_cleanup(cleanup);
     }
 
-    fn unmap_all_userspace(&mut self) -> Result<(), ()> {
+    fn unmap_all_userspace(
+        &mut self,
+        proof: &crate::task::ProcessQuiescenceProof,
+    ) -> Result<(), ()> {
         loop {
             let mapping = self
                 .regions
@@ -947,7 +950,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             let releases = {
                 let region = self
                     .regions
-                    .region_mut_for_teardown(&self.tasks, self.root_key)
+                    .region_mut_for_quiesced_teardown(&self.tasks, proof, self.root_key)
                     .map_err(|_| ())?;
                 let mut platform = LivePlatform {
                     active: &mut self.active,
@@ -1040,20 +1043,25 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         {
             return Err(());
         }
+        let proof = self
+            .tasks
+            .process_quiescence_proof(self.process)
+            .map_err(|_| ())?;
         let drained = self
             .shared
             .execution
-            .blocked_operations_drained(self.process)
+            .blocked_operations_drained(&self.tasks, &proof)
             .map_err(|_| ())?;
-        self.unmap_all_userspace()?;
+        self.unmap_all_userspace(&proof)?;
         if self.memory.active_lease_count() != 0 {
             return Err(());
         }
         let root_pin = self
             .regions
-            .retire_exited_root(
+            .retire_quiesced_root(
                 &mut self.tasks,
                 self.process,
+                &proof,
                 self.shared.execution.blocked_operations(),
                 drained,
             )
@@ -1264,6 +1272,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
             self.services.resume_suspended(
                 &mut user,
                 &mut self.registry,
+                &mut self.tasks,
                 &self.shared.waits,
                 &self.shared.execution,
                 self.thread,

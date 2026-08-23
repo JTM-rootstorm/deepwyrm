@@ -76,6 +76,29 @@ use super::abi_bytes::{
     encode_wait_result,
 };
 
+/// Runs one bounded HandleTable mutation while retaining the exact process
+/// operation lease. The body is expanded lexically (not invoked as a callback)
+/// and must not contain an early `return`.
+macro_rules! process_handle_operation {
+    ($tasks:expr, $process:expr, $table:ident, $body:expr) => {{
+        match $tasks.acquire_process_operation($process) {
+            Ok(lease) => {
+                let result = match $tasks.process_handles_mut_for_operation(&lease, $process) {
+                    Ok($table) => Ok($body),
+                    Err(error) => Err(error),
+                };
+                $tasks
+                    .release_process_operation(lease)
+                    .unwrap_or_else(|(error, _)| {
+                        panic!("HandleTable operation leaked process lease: {error:?}")
+                    });
+                result
+            }
+            Err(error) => Err(error),
+        }
+    }};
+}
+
 #[must_use = "typed final releases must be routed after syscall pins/locks are dropped"]
 pub(crate) struct CleanupQueue<const CAPACITY: usize> {
     releases: [Option<FinalRelease>; CAPACITY],
@@ -116,9 +139,15 @@ pub(crate) trait TerminalWaitCleanup<
     const EXECUTION: usize,
 >
 {
-    fn cleanup_terminal_wait(
+    fn cleanup_terminal_wait<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
         &mut self,
         registry: &mut ObjectRegistry<OBJECTS>,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         waits: &WaitRegistry<WAITERS>,
         execution: &ExecutionDomain<EXECUTION>,
         thread: ThreadKey,
@@ -131,9 +160,15 @@ pub(crate) struct NoTerminalWaitCleanup;
 impl<const OBJECTS: usize, const WAITERS: usize, const EXECUTION: usize>
     TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION> for NoTerminalWaitCleanup
 {
-    fn cleanup_terminal_wait(
+    fn cleanup_terminal_wait<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
         &mut self,
         _registry: &mut ObjectRegistry<OBJECTS>,
+        _tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         _waits: &WaitRegistry<WAITERS>,
         execution: &ExecutionDomain<EXECUTION>,
         thread: ThreadKey,
@@ -177,9 +212,15 @@ impl<
 > TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>
     for WaitTerminalCleanup<'_, OUTPUT, DISCARD, EXECUTION>
 {
-    fn cleanup_terminal_wait(
+    fn cleanup_terminal_wait<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
         &mut self,
         registry: &mut ObjectRegistry<OBJECTS>,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         waits: &WaitRegistry<WAITERS>,
         execution: &ExecutionDomain<EXECUTION>,
         thread: ThreadKey,
@@ -191,6 +232,7 @@ impl<
             .map(|authority| &mut **authority as &mut dyn WaitDeadlineAuthority);
         let result = crate::wait::engine::finish_terminal_wait(
             registry,
+            tasks,
             waits,
             execution,
             self.operations,
@@ -590,16 +632,15 @@ pub(crate) fn handle_close<
     handle: DwHandle,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> DwStatus {
-    let table = match tasks.process_handles_mut(current_process) {
-        Ok(table) => table,
-        Err(error) => return task_status(error),
-    };
-    match crate::service::handle_close(table, registry, handle) {
-        Ok(release) => {
+    match process_handle_operation!(tasks, current_process, table, {
+        crate::service::handle_close(table, registry, handle)
+    }) {
+        Ok(Ok(release)) => {
             cleanup.push_optional(release);
             DW_STATUS_SUCCESS
         }
-        Err(status) => status,
+        Ok(Err(status)) => status,
+        Err(error) => task_status(error),
     }
 }
 
@@ -623,16 +664,15 @@ pub(crate) fn handle_duplicate<
         Ok(output) => output,
         Err(status) => return status,
     };
-    let table = match tasks.process_handles_mut(current_process) {
-        Ok(table) => table,
-        Err(error) => return task_status(error),
-    };
-    match crate::service::handle_duplicate(table, registry, handle, requested_rights) {
-        Ok(duplicate) => {
+    match process_handle_operation!(tasks, current_process, table, {
+        crate::service::handle_duplicate(table, registry, handle, requested_rights)
+    }) {
+        Ok(Ok(duplicate)) => {
             output.commit(&encode_handle(duplicate));
             DW_STATUS_SUCCESS
         }
-        Err(status) => status,
+        Ok(Err(status)) => status,
+        Err(error) => task_status(error),
     }
 }
 
@@ -847,12 +887,15 @@ pub(crate) fn complete_deferred_current_reclaim<
 fn collect_process_effects<
     C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
     const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
     const HANDLES: usize,
     const THREADS: usize,
     const WAITERS: usize,
     const EXECUTION: usize,
 >(
     registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
     waits: &WaitRegistry<WAITERS>,
     effects: ProcessExitEffects<HANDLES, THREADS>,
@@ -872,7 +915,7 @@ fn collect_process_effects<
         cleanup.push(release);
     }
     for thread in effects.pins.thread_keys().into_iter().flatten() {
-        terminal_waits.cleanup_terminal_wait(registry, waits, execution, thread, cleanup);
+        terminal_waits.cleanup_terminal_wait(registry, tasks, waits, execution, thread, cleanup);
     }
     let (pins, deferred) = match deferred_thread {
         Some(current) => {
@@ -2315,7 +2358,7 @@ fn begin_wait_set<
     output: OUTPUT,
     deadline: DwDeadline,
     registry: &mut ObjectRegistry<OBJECTS>,
-    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     events: &EventAuthority<EVENTS>,
     timers: &TimerAuthority<TIMERS>,
     channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
@@ -2332,8 +2375,8 @@ fn begin_wait_set<
         wait_deadline(deadline),
         WaitBeginContext {
             registry,
+            tasks,
             sources: WaitSources {
-                tasks,
                 events,
                 timers,
                 channels,
@@ -2383,7 +2426,7 @@ pub(crate) fn wait_one_begin<
 >(
     output: OUTPUT,
     registry: &mut ObjectRegistry<OBJECTS>,
-    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     events: &EventAuthority<EVENTS>,
     timers: &TimerAuthority<TIMERS>,
     channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
@@ -2478,7 +2521,7 @@ fn wait_many_requests_begin<
 >(
     output: OUTPUT,
     registry: &mut ObjectRegistry<OBJECTS>,
-    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     events: &EventAuthority<EVENTS>,
     timers: &TimerAuthority<TIMERS>,
     channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
@@ -2534,7 +2577,7 @@ pub(crate) fn wait_many_begin<
     user: &mut U,
     output: OUTPUT,
     registry: &mut ObjectRegistry<OBJECTS>,
-    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     events: &EventAuthority<EVENTS>,
     timers: &TimerAuthority<TIMERS>,
     channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
@@ -2632,7 +2675,7 @@ pub(crate) fn wait_one_syscall<
 >(
     user: &mut U,
     registry: &mut ObjectRegistry<OBJECTS>,
-    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     events: &EventAuthority<EVENTS>,
     timers: &TimerAuthority<TIMERS>,
     channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
@@ -2692,7 +2735,7 @@ pub(crate) fn wait_many_syscall<
 >(
     user: &mut U,
     registry: &mut ObjectRegistry<OBJECTS>,
-    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     events: &EventAuthority<EVENTS>,
     timers: &TimerAuthority<TIMERS>,
     channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
@@ -2738,11 +2781,16 @@ pub(crate) fn wait_many_syscall<
 pub(crate) fn resume_wait_syscall<
     U: OwnedUserOutputAccess,
     const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
     const WAITERS: usize,
     const EXECUTION: usize,
 >(
     user: &mut U,
     registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     waits: &WaitRegistry<WAITERS>,
     execution: &ExecutionDomain<EXECUTION>,
     operations: &mut WaitOperationRegistry<U::OwnedOutput, EXECUTION>,
@@ -2752,6 +2800,7 @@ pub(crate) fn resume_wait_syscall<
 ) -> Result<DwStatus, WaitFinishError> {
     let (output, winner, releases) = finish_wait_operation(
         registry,
+        tasks,
         waits,
         execution,
         operations,
@@ -2789,11 +2838,16 @@ pub(crate) fn resume_wait_syscall<
 pub(crate) fn resume_wait_thread_syscall<
     U: OwnedUserOutputAccess,
     const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
     const WAITERS: usize,
     const EXECUTION: usize,
 >(
     user: &mut U,
     registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     waits: &WaitRegistry<WAITERS>,
     execution: &ExecutionDomain<EXECUTION>,
     operations: &mut WaitOperationRegistry<U::OwnedOutput, EXECUTION>,
@@ -2809,6 +2863,7 @@ pub(crate) fn resume_wait_thread_syscall<
     resume_wait_syscall(
         user,
         registry,
+        tasks,
         waits,
         execution,
         operations,
@@ -3133,6 +3188,7 @@ pub(crate) fn thread_create<
 fn collect_group_effects<
     C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
     const OBJECTS: usize,
+    const GROUPS: usize,
     const PROCESSES: usize,
     const HANDLES: usize,
     const THREADS: usize,
@@ -3140,6 +3196,7 @@ fn collect_group_effects<
     const EXECUTION: usize,
 >(
     registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
     waits: &WaitRegistry<WAITERS>,
     effects: TaskGroupTerminationEffects<PROCESSES, HANDLES, THREADS>,
@@ -3174,6 +3231,7 @@ fn collect_group_effects<
     for process in processes.into_iter().flatten() {
         let deferred = collect_process_effects(
             registry,
+            tasks,
             execution,
             waits,
             process,
@@ -3190,6 +3248,7 @@ fn collect_group_effects<
     current_process.map(|process| {
         collect_process_effects(
             registry,
+            tasks,
             execution,
             waits,
             process,
@@ -3278,6 +3337,7 @@ pub(crate) fn task_group_terminate<
     };
     let deferred = collect_group_effects(
         registry,
+        tasks,
         execution,
         waits,
         effects,
@@ -3329,6 +3389,7 @@ pub(crate) fn process_exit<
     };
     let deferred = collect_process_effects(
         registry,
+        tasks,
         execution,
         waits,
         effects,
@@ -3388,6 +3449,7 @@ pub(crate) fn process_unhandled_exception<
     };
     let deferred = collect_process_effects(
         registry,
+        tasks,
         execution,
         waits,
         effects,
@@ -3460,6 +3522,7 @@ pub(crate) fn process_terminate<
     };
     let deferred = collect_process_effects(
         registry,
+        tasks,
         execution,
         waits,
         effects,
@@ -3605,7 +3668,14 @@ pub(crate) fn thread_terminate<
         }
     }
     for terminal_thread in pins.thread_keys().into_iter().flatten() {
-        terminal_waits.cleanup_terminal_wait(registry, waits, execution, terminal_thread, cleanup);
+        terminal_waits.cleanup_terminal_wait(
+            registry,
+            tasks,
+            waits,
+            execution,
+            terminal_thread,
+            cleanup,
+        );
     }
     let (pins, deferred) = if target == current_thread {
         let (pins, deferred) = execution.retire_exit_pins_defer_current(pins, current_thread);
@@ -4171,9 +4241,22 @@ pub(crate) fn address_region_map_model<
             return Err(status);
         }
     };
-    let region = match regions.region_mut_for_live_process(tasks, region_key) {
+    let operation_lease = match tasks.acquire_process_operation(current_process) {
+        Ok(lease) => lease,
+        Err(error) => {
+            release_lookup_pin(registry, memory_resolved.into_internal(), cleanup);
+            release_lookup_pin(registry, region_resolved.into_internal(), cleanup);
+            return Err(task_status(error));
+        }
+    };
+    let region = match regions.region_mut_for_operation(tasks, &operation_lease, region_key) {
         Ok(region) => region,
         Err(error) => {
+            tasks
+                .release_process_operation(operation_lease)
+                .unwrap_or_else(|(release_error, _)| {
+                    panic!("F11 map region lookup leaked process lease: {release_error:?}")
+                });
             release_lookup_pin(registry, memory_resolved.into_internal(), cleanup);
             release_lookup_pin(registry, region_resolved.into_internal(), cleanup);
             return Err(address_region_object_status(error));
@@ -4183,6 +4266,11 @@ pub(crate) fn address_region_map_model<
         Ok(authorization) => authorization,
         Err(error) => {
             let (memory_error, releases) = error.release(registry);
+            tasks
+                .release_process_operation(operation_lease)
+                .unwrap_or_else(|(release_error, _)| {
+                    panic!("F11 map authorization leaked process lease: {release_error:?}")
+                });
             queue_mapping_releases(cleanup, releases);
             release_lookup_pin(registry, region_resolved.into_internal(), cleanup);
             return Err(match memory_error {
@@ -4230,6 +4318,9 @@ pub(crate) fn address_region_map_model<
             protection,
         )
     };
+    tasks
+        .release_process_operation(operation_lease)
+        .unwrap_or_else(|(error, _)| panic!("F11 map leaked process lease: {error:?}"));
     release_lookup_pin(registry, region_resolved.into_internal(), cleanup);
     match result {
         Ok((address, releases)) => {
@@ -4282,14 +4373,29 @@ pub(crate) fn address_region_unmap<
     };
     let key =
         crate::memory::address_region::AddressRegionObjectKey::from_object_id(resolved.object_id());
-    let region = match regions.region_mut_for_live_process(tasks, key) {
+    let operation_lease = match tasks.acquire_process_operation(current_process) {
+        Ok(lease) => lease,
+        Err(error) => {
+            release_lookup_pin(registry, resolved.into_internal(), cleanup);
+            return task_status(error);
+        }
+    };
+    let region = match regions.region_mut_for_operation(tasks, &operation_lease, key) {
         Ok(region) => region,
         Err(error) => {
+            tasks
+                .release_process_operation(operation_lease)
+                .unwrap_or_else(|(release_error, _)| {
+                    panic!("F11 unmap region lookup leaked process lease: {release_error:?}")
+                });
             release_lookup_pin(registry, resolved.into_internal(), cleanup);
             return address_region_object_status(error);
         }
     };
     let result = region.unmap(memory, registry, publisher, address.0, byte_len);
+    tasks
+        .release_process_operation(operation_lease)
+        .unwrap_or_else(|(error, _)| panic!("F11 unmap leaked process lease: {error:?}"));
     release_lookup_pin(registry, resolved.into_internal(), cleanup);
     match result {
         Ok(releases) => {
@@ -4353,14 +4459,29 @@ pub(crate) fn address_region_protect<
     };
     let key =
         crate::memory::address_region::AddressRegionObjectKey::from_object_id(resolved.object_id());
-    let region = match regions.region_mut_for_live_process(tasks, key) {
+    let operation_lease = match tasks.acquire_process_operation(current_process) {
+        Ok(lease) => lease,
+        Err(error) => {
+            release_lookup_pin(registry, resolved.into_internal(), cleanup);
+            return task_status(error);
+        }
+    };
+    let region = match regions.region_mut_for_operation(tasks, &operation_lease, key) {
         Ok(region) => region,
         Err(error) => {
+            tasks
+                .release_process_operation(operation_lease)
+                .unwrap_or_else(|(release_error, _)| {
+                    panic!("F11 protect region lookup leaked process lease: {release_error:?}")
+                });
             release_lookup_pin(registry, resolved.into_internal(), cleanup);
             return address_region_object_status(error);
         }
     };
     let result = region.protect(memory, registry, publisher, address.0, byte_len, protection);
+    tasks
+        .release_process_operation(operation_lease)
+        .unwrap_or_else(|(error, _)| panic!("F11 protect leaked process lease: {error:?}"));
     release_lookup_pin(registry, resolved.into_internal(), cleanup);
     match result {
         Ok(releases) => {

@@ -5,8 +5,9 @@ use crate::sync::SpinMutex;
 use super::scheduler::{SchedulerCpuId, SchedulerExecutionClaim};
 use super::{
     BlockReservation, BlockReservationFailure, BlockToken, BlockWakeKey, BlockedOperationRegistry,
-    BlockedOperationsDrained, CooperativeScheduler, ExitPins, KernelStackId, ProcessKey,
-    SchedulerError, ThreadContextId, ThreadExecutionResources, ThreadKey, ThreadStartState,
+    BlockedOperationsDrained, CooperativeScheduler, ExitPins, KernelStackId,
+    ProcessQuiescenceProof, SchedulerError, TaskAuthority, ThreadContextId,
+    ThreadExecutionResources, ThreadKey, ThreadStartState,
 };
 
 pub(crate) const E3_INITIAL_USER_RFLAGS: u64 = 0x202;
@@ -714,11 +715,17 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         &self.blocked_operations
     }
 
-    pub(crate) fn blocked_operations_drained(
+    pub(crate) fn blocked_operations_drained<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
         &self,
-        process: ProcessKey,
+        tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        proof: &ProcessQuiescenceProof,
     ) -> Result<BlockedOperationsDrained, super::BlockedOperationError> {
-        self.blocked_operations.drained(process)
+        self.blocked_operations.drained_after_quiesce(tasks, proof)
     }
 
     pub(crate) fn retire_exit_pins<const THREADS: usize>(

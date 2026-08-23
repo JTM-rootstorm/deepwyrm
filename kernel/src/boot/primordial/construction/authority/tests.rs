@@ -556,6 +556,7 @@ fn concrete_authority_adapter_commits_real_init_transfer_and_exact_start_state()
         }
     }
 
+    let proof = tasks.process_quiescence_proof(monitor.process_key).unwrap();
     for (address, byte_len) in monitor
         .segment_ranges
         .into_iter()
@@ -563,17 +564,18 @@ fn concrete_authority_adapter_commits_real_init_transfer_and_exact_start_state()
         .chain(core::iter::once(monitor.stack_range))
     {
         let region = regions
-            .region_mut_for_teardown(&tasks, monitor.root_key)
+            .region_mut_for_quiesced_teardown(&tasks, &proof, monitor.root_key)
             .unwrap();
         platform.unmap(region, &mut memory, &mut registry, address, byte_len);
     }
     let drained = execution
-        .blocked_operations_drained(monitor.process_key)
+        .blocked_operations_drained(&tasks, &proof)
         .unwrap();
     let root_pin = regions
-        .retire_exited_root(
+        .retire_quiesced_root(
             &mut tasks,
             monitor.process_key,
+            &proof,
             execution.blocked_operations(),
             drained,
         )

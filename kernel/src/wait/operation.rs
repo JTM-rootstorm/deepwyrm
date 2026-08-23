@@ -1,6 +1,6 @@
 use crate::task::{
     BlockWakeKey, BlockedOperation, BlockedOperationError, BlockedOperationRegistry,
-    BlockedOperationWinner, ProcessKey, ThreadKey,
+    BlockedOperationWinner, ProcessKey, TaskAuthority, ThreadKey,
 };
 use crate::time::DeadlineRegistration;
 
@@ -61,9 +61,16 @@ impl<OUTPUT> WaitOperation<OUTPUT> {
         blocked.winner(self.wake_key())
     }
 
-    pub(crate) fn complete<const CAPACITY: usize>(
+    pub(crate) fn complete<
+        const CAPACITY: usize,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
         self,
         blocked_registry: &BlockedOperationRegistry<CAPACITY>,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         winner: BlockedOperationWinner,
     ) -> Result<(OUTPUT, Option<DeadlineRegistration>), BlockedOperationError> {
         let Self {
@@ -73,15 +80,27 @@ impl<OUTPUT> WaitOperation<OUTPUT> {
             output,
             deadline,
         } = self;
-        blocked.complete_with(blocked_registry, winner, |()| ())?;
+        #[cfg(test)]
+        if !blocked.has_process_lease() {
+            blocked.complete_with(blocked_registry, winner, |()| ())?;
+            return Ok((output, deadline));
+        }
+        blocked.complete_for_process(blocked_registry, tasks, winner, |()| ())?;
         Ok((output, deadline))
     }
 
     /// Terminal teardown consumes the durable wait owner even if signal or
     /// timeout already won but the suspended syscall has not resumed yet.
-    pub(crate) fn complete_terminal<const CAPACITY: usize>(
+    pub(crate) fn complete_terminal<
+        const CAPACITY: usize,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
         self,
         blocked_registry: &BlockedOperationRegistry<CAPACITY>,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     ) -> Result<(OUTPUT, Option<DeadlineRegistration>), BlockedOperationError> {
         let wake = self.wake_key();
         let winner = match blocked_registry.winner(wake)? {
@@ -94,7 +113,7 @@ impl<OUTPUT> WaitOperation<OUTPUT> {
                 BlockedOperationWinner::Terminal
             }
         };
-        self.complete(blocked_registry, winner)
+        self.complete(blocked_registry, tasks, winner)
     }
 }
 
@@ -228,6 +247,7 @@ mod tests {
     #[test]
     fn operation_registry_is_thread_unique_and_wake_exact() {
         let (process, thread, wake, blocked, blocked_registry) = keys();
+        let mut tasks = TaskAuthority::<1, 1, 1, 1>::new();
         let mut registry = WaitOperationRegistry::<u32, 1>::new();
         let mut first = Some(WaitOperation::new(process, thread, blocked, 7, None));
         registry
@@ -250,7 +270,11 @@ mod tests {
         let (rejected_output, rejected_deadline) = rejected
             .take()
             .expect("rejected wait operation remains caller-owned")
-            .complete(&second_registry, BlockedOperationWinner::Cancelled)
+            .complete(
+                &second_registry,
+                &mut tasks,
+                BlockedOperationWinner::Cancelled,
+            )
             .unwrap();
         assert_eq!(rejected_output, 9);
         assert!(rejected_deadline.is_none());
@@ -260,7 +284,11 @@ mod tests {
         assert_eq!(operation.thread(), thread);
         assert_eq!(operation.wake_key(), wake);
         let (output, deadline) = operation
-            .complete(&blocked_registry, BlockedOperationWinner::Cancelled)
+            .complete(
+                &blocked_registry,
+                &mut tasks,
+                BlockedOperationWinner::Cancelled,
+            )
             .unwrap();
         assert_eq!(output, 7);
         assert!(deadline.is_none());
@@ -270,6 +298,7 @@ mod tests {
     #[test]
     fn terminal_take_consumes_exact_thread_resources() {
         let (process, thread, wake, blocked, blocked_registry) = keys();
+        let mut tasks = TaskAuthority::<1, 1, 1, 1>::new();
         let mut registry = WaitOperationRegistry::<u32, 2>::new();
         let mut operation = Some(WaitOperation::new(process, thread, blocked, 11, None));
         registry
@@ -280,7 +309,11 @@ mod tests {
         assert_eq!(operation.wake_key(), wake);
         assert!(!registry.contains_thread(thread));
         let (output, deadline) = operation
-            .complete(&blocked_registry, BlockedOperationWinner::Terminal)
+            .complete(
+                &blocked_registry,
+                &mut tasks,
+                BlockedOperationWinner::Terminal,
+            )
             .unwrap();
         assert_eq!(output, 11);
         assert!(deadline.is_none());
@@ -289,13 +322,16 @@ mod tests {
     #[test]
     fn terminal_cleanup_accepts_a_preexisting_signal_winner() {
         let (process, thread, wake, blocked, blocked_registry) = keys();
+        let mut tasks = TaskAuthority::<1, 1, 1, 1>::new();
         let operation = WaitOperation::new(process, thread, blocked, 0x33_u32, None);
         let winner = BlockedOperationWinner::Signal {
             item_index: 2,
             observed: deepwyrm_abi::DwSignals(0x40),
         };
         assert!(blocked_registry.try_claim_winner(wake, winner).unwrap());
-        let (output, deadline) = operation.complete_terminal(&blocked_registry).unwrap();
+        let (output, deadline) = operation
+            .complete_terminal(&blocked_registry, &mut tasks)
+            .unwrap();
         assert_eq!(output, 0x33);
         assert!(deadline.is_none());
         assert!(!blocked_registry.has_thread(thread));

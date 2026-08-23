@@ -845,6 +845,7 @@ fn finite_wait_dispatch_idles_times_out_and_resumes_exact_owner() {
         .resume_suspended(
             &mut fixture.user,
             &mut fixture.registry,
+            &mut fixture.tasks,
             &fixture.waits,
             &fixture.execution,
             fixture.thread,
@@ -883,6 +884,7 @@ fn atomic_mismatch_then_suspend_wake_and_resume_has_one_exact_owner() {
         7,
         WaitDeadline::Now,
         &fixture.services.atomic_waits,
+        &mut fixture.tasks,
         &fixture.execution,
         &mut fixture.services.atomic_operations,
         None,
@@ -905,6 +907,7 @@ fn atomic_mismatch_then_suspend_wake_and_resume_has_one_exact_owner() {
         7,
         WaitDeadline::Infinite,
         &fixture.services.atomic_waits,
+        &mut fixture.tasks,
         &fixture.execution,
         &mut fixture.services.atomic_operations,
         None,
@@ -963,6 +966,7 @@ fn atomic_mismatch_then_suspend_wake_and_resume_has_one_exact_owner() {
         .resume_suspended(
             &mut fixture.user,
             &mut fixture.registry,
+            &mut fixture.tasks,
             &fixture.waits,
             &fixture.execution,
             fixture.thread,
@@ -1124,7 +1128,7 @@ fn terminal_generic_and_atomic_cleanup_leave_the_service_quiescent() {
     let action = super::super::adapters::wait_one_syscall(
         &mut generic.user,
         &mut generic.registry,
-        &generic.tasks,
+        &mut generic.tasks,
         &generic.events,
         &generic.timers,
         &generic.channels,
@@ -1158,6 +1162,7 @@ fn terminal_generic_and_atomic_cleanup_leave_the_service_quiescent() {
         );
         terminal.cleanup_terminal_wait(
             &mut generic.registry,
+            &mut generic.tasks,
             &generic.waits,
             &generic.execution,
             generic.thread,
@@ -1186,6 +1191,7 @@ fn terminal_generic_and_atomic_cleanup_leave_the_service_quiescent() {
         9,
         WaitDeadline::Infinite,
         &atomic.services.atomic_waits,
+        &mut atomic.tasks,
         &atomic.execution,
         &mut atomic.services.atomic_operations,
         None,
@@ -1210,6 +1216,7 @@ fn terminal_generic_and_atomic_cleanup_leave_the_service_quiescent() {
         );
         terminal.cleanup_terminal_wait(
             &mut atomic.registry,
+            &mut atomic.tasks,
             &atomic.waits,
             &atomic.execution,
             atomic.thread,

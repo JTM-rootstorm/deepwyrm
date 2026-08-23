@@ -168,6 +168,7 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
         Ok(&self.record(key)?.region)
     }
 
+    #[cfg(test)]
     pub(crate) fn region_mut_for_live_process<
         const GROUPS: usize,
         const PROCESSES: usize,
@@ -213,6 +214,7 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
 
     /// Resolves a pinned current-process virtual word without exposing the
     /// root-region payload or permitting a handle-selected foreign region.
+    #[cfg(test)]
     pub(crate) fn resolve_atomic_wait_key_for_live_process<
         const GROUPS: usize,
         const PROCESSES: usize,
@@ -289,6 +291,7 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
         Ok((record.parent, record.region))
     }
 
+    #[cfg(test)]
     pub(crate) fn region_mut_for_teardown<
         const GROUPS: usize,
         const PROCESSES: usize,
@@ -337,22 +340,16 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
         Ok(&mut self.record_mut(key)?.region)
     }
 
-    pub(crate) fn retire_exited_root<
+    fn retire_exited_root_inner<
         const GROUPS: usize,
         const PROCESSES: usize,
         const THREADS: usize,
         const HANDLES: usize,
-        const BLOCKED: usize,
     >(
         &mut self,
         tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         process: ProcessKey,
-        blocked: &BlockedOperationRegistry<BLOCKED>,
-        drained: BlockedOperationsDrained,
     ) -> Result<InternalRef, AddressRegionObjectError> {
-        blocked
-            .validate_drained(&drained, process)
-            .map_err(AddressRegionObjectError::BlockedOperation)?;
         if tasks
             .process_info(process)
             .map_err(AddressRegionObjectError::Task)?
@@ -412,6 +409,26 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
             .expect("checked runtime pin"))
     }
 
+    #[cfg(test)]
+    pub(crate) fn retire_exited_root<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+        const BLOCKED: usize,
+    >(
+        &mut self,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        process: ProcessKey,
+        blocked: &BlockedOperationRegistry<BLOCKED>,
+        drained: BlockedOperationsDrained,
+    ) -> Result<InternalRef, AddressRegionObjectError> {
+        blocked
+            .validate_drained(&drained, process)
+            .map_err(AddressRegionObjectError::BlockedOperation)?;
+        self.retire_exited_root_inner(tasks, process)
+    }
+
     pub(crate) fn retire_quiesced_root<
         const GROUPS: usize,
         const PROCESSES: usize,
@@ -432,7 +449,7 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
         tasks
             .validate_process_quiescence(proof, process)
             .map_err(AddressRegionObjectError::Task)?;
-        self.retire_exited_root(tasks, process, blocked, drained)
+        self.retire_exited_root_inner(tasks, process)
     }
 
     pub(crate) fn take_finalization<const SPACES: usize, const REGIONS: usize>(

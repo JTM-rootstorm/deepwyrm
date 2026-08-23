@@ -453,7 +453,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         &mut self,
         user: &mut U,
         _registry: &mut ObjectRegistry<OBJECTS>,
-        tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         execution: &ExecutionDomain<EXECUTION>,
         regions: &AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
         process: ProcessKey,
@@ -470,20 +470,39 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
             Ok(pin) => pin,
             Err(status) => return NativeSyscallResult::returning(status),
         };
-        let key = match regions.resolve_atomic_wait_key_for_live_process(tasks, process, address.0)
+        let lease = match tasks.acquire_process_operation(process) {
+            Ok(lease) => lease,
+            Err(_) => {
+                user.release_atomic_u32(pin);
+                return NativeSyscallResult::returning(DW_STATUS_BAD_STATE);
+            }
+        };
+        let key = match regions
+            .resolve_atomic_wait_key_for_operation(tasks, &lease, process, address.0)
         {
             Ok(key) => key,
             Err(_) => {
+                tasks
+                    .release_process_operation(lease)
+                    .unwrap_or_else(|(error, _)| {
+                        panic!("F9 key-resolution cleanup lost process lease: {error:?}")
+                    });
                 user.release_atomic_u32(pin);
                 return NativeSyscallResult::returning(DW_STATUS_BAD_ADDRESS);
             }
         };
+        tasks
+            .release_process_operation(lease)
+            .unwrap_or_else(|(error, _)| {
+                panic!("F9 key resolution leaked process lease: {error:?}")
+            });
         let begin = begin_atomic_wait(
             pin,
             key,
             expected,
             wait_deadline(deadline),
             &self.atomic_waits,
+            tasks,
             execution,
             &mut self.atomic_operations,
             wait_deadlines,
@@ -533,7 +552,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
     >(
         &self,
         user: &mut U,
-        tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         execution: &ExecutionDomain<EXECUTION>,
         regions: &AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
         process: ProcessKey,
@@ -551,9 +570,18 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
             out_woken,
             |user, address| user.pin_atomic_u32(address),
             |address, _pin| {
-                regions
-                    .resolve_atomic_wait_key_for_live_process(tasks, process, address.0)
-                    .map_err(|_| DW_STATUS_BAD_ADDRESS)
+                let lease = tasks
+                    .acquire_process_operation(process)
+                    .map_err(|_| DW_STATUS_BAD_STATE)?;
+                let key = regions
+                    .resolve_atomic_wait_key_for_operation(tasks, &lease, process, address.0)
+                    .map_err(|_| DW_STATUS_BAD_ADDRESS);
+                tasks
+                    .release_process_operation(lease)
+                    .unwrap_or_else(|(error, _)| {
+                        panic!("F9 wake key resolution leaked process lease: {error:?}")
+                    });
+                key
             },
             |user, pin| user.release_atomic_u32(pin),
             |key, count| {
@@ -645,10 +673,18 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         clippy::too_many_arguments,
         reason = "resume consumes the exact user-resource, wait, scheduler, deadline, and final-release owners"
     )]
-    pub(crate) fn resume_suspended<U, const WAITERS: usize>(
+    pub(crate) fn resume_suspended<
+        U,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+        const WAITERS: usize,
+    >(
         &mut self,
         user: &mut U,
         registry: &mut ObjectRegistry<OBJECTS>,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         waits: &WaitRegistry<WAITERS>,
         execution: &ExecutionDomain<EXECUTION>,
         thread: ThreadKey,
@@ -664,6 +700,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
             FServiceOperationOwner::GenericWait => resume_wait_thread_syscall(
                 user,
                 registry,
+                tasks,
                 waits,
                 execution,
                 &mut self.wait_operations,
@@ -679,6 +716,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
                     .ok_or(FServiceResumeError::Owner(FServiceOwnerError::Missing))?;
                 let (pin, winner) = finish_atomic_wait(
                     &self.atomic_waits,
+                    tasks,
                     execution,
                     &mut self.atomic_operations,
                     wait_deadlines,
@@ -757,9 +795,15 @@ impl<
 > TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>
     for FServiceTerminalCleanup<'_, OUTPUT, AtomicPin, DISCARD, RELEASE, ATOMIC_WAITERS, EXECUTION>
 {
-    fn cleanup_terminal_wait(
+    fn cleanup_terminal_wait<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
         &mut self,
         registry: &mut ObjectRegistry<OBJECTS>,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         waits: &WaitRegistry<WAITERS>,
         execution: &ExecutionDomain<EXECUTION>,
         thread: ThreadKey,
@@ -779,6 +823,7 @@ impl<
         if generic {
             let result = finish_terminal_wait(
                 registry,
+                tasks,
                 waits,
                 execution,
                 self.wait_operations,
@@ -795,6 +840,7 @@ impl<
         } else if atomic {
             let pin = finish_terminal_atomic_wait(
                 self.atomic_waits,
+                tasks,
                 execution,
                 self.atomic_operations,
                 wait_deadlines,

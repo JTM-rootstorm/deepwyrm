@@ -524,9 +524,18 @@ where
             .take()
             .ok_or(AuthorityPrimordialError::State)?;
         let key = self.root_key()?;
+        let process = self
+            .process
+            .as_ref()
+            .map(PreparedProcess::key)
+            .ok_or(AuthorityPrimordialError::State)?;
+        let lease = self
+            .tasks
+            .acquire_process_operation(process)
+            .map_err(AuthorityPrimordialError::Task)?;
         let region = self
             .regions
-            .region_mut_for_live_process(self.tasks, key)
+            .region_mut_for_operation(self.tasks, &lease, key)
             .map_err(AuthorityPrimordialError::Region)?;
         let result = self.platform.map(
             region,
@@ -538,6 +547,11 @@ where
             segment.mapped_byte_len(),
             protection,
         );
+        self.tasks
+            .release_process_operation(lease)
+            .unwrap_or_else(|(error, _)| {
+                panic!("primordial segment map leaked process lease: {error:?}")
+            });
         self.segments[index] = Some(object);
         result.map_err(AuthorityPrimordialError::Platform)?;
         self.segment_ranges[index] = Some((segment.page_start(), segment.mapped_byte_len()));
@@ -553,9 +567,18 @@ where
     fn map_stack(&mut self, layout: PrimordialStackLayout) -> Result<(), Self::Error> {
         let object = self.stack.take().ok_or(AuthorityPrimordialError::State)?;
         let key = self.root_key()?;
+        let process = self
+            .process
+            .as_ref()
+            .map(PreparedProcess::key)
+            .ok_or(AuthorityPrimordialError::State)?;
+        let lease = self
+            .tasks
+            .acquire_process_operation(process)
+            .map_err(AuthorityPrimordialError::Task)?;
         let region = self
             .regions
-            .region_mut_for_live_process(self.tasks, key)
+            .region_mut_for_operation(self.tasks, &lease, key)
             .map_err(AuthorityPrimordialError::Region)?;
         let result = self.platform.map(
             region,
@@ -567,6 +590,11 @@ where
             STACK_BYTES,
             MemoryProtection::READ_WRITE,
         );
+        self.tasks
+            .release_process_operation(lease)
+            .unwrap_or_else(|(error, _)| {
+                panic!("primordial stack map leaked process lease: {error:?}")
+            });
         self.stack = Some(object);
         result.map_err(AuthorityPrimordialError::Platform)?;
         self.stack_range = Some((layout.mapped_start, STACK_BYTES));
@@ -908,12 +936,26 @@ where
                 Some(key) => key,
                 None => panic!("mapped primordial stack lost its root"),
             };
+            let process = self
+                .process
+                .as_ref()
+                .map(PreparedProcess::key)
+                .expect("prepared primordial Process remains live");
+            let lease = self
+                .tasks
+                .acquire_process_operation(process)
+                .expect("prepared primordial Process accepts rollback operation");
             let region = self
                 .regions
-                .region_mut_for_live_process(self.tasks, key)
+                .region_mut_for_operation(self.tasks, &lease, key)
                 .expect("prepared primordial root remains live");
             self.platform
                 .unmap(region, self.memory, self.registry, start, len);
+            self.tasks
+                .release_process_operation(lease)
+                .unwrap_or_else(|(error, _)| {
+                    panic!("primordial stack rollback leaked process lease: {error:?}")
+                });
         }
         if let Some(reference) = self.stack.take() {
             self.cancel_memory(reference);
@@ -924,12 +966,26 @@ where
                     Some(key) => key,
                     None => panic!("mapped primordial segment lost its root"),
                 };
+                let process = self
+                    .process
+                    .as_ref()
+                    .map(PreparedProcess::key)
+                    .expect("prepared primordial Process remains live");
+                let lease = self
+                    .tasks
+                    .acquire_process_operation(process)
+                    .expect("prepared primordial Process accepts rollback operation");
                 let region = self
                     .regions
-                    .region_mut_for_live_process(self.tasks, key)
+                    .region_mut_for_operation(self.tasks, &lease, key)
                     .expect("prepared primordial root remains live");
                 self.platform
                     .unmap(region, self.memory, self.registry, start, len);
+                self.tasks
+                    .release_process_operation(lease)
+                    .unwrap_or_else(|(error, _)| {
+                        panic!("primordial segment rollback leaked process lease: {error:?}")
+                    });
             }
             if let Some(reference) = self.segments[index].take() {
                 self.cancel_memory(reference);
