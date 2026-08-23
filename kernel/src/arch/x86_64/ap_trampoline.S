@@ -54,6 +54,7 @@ __dw_ap_trampoline_protected_entry:
     movw %ax, %es
     movw %ax, %ss
     movq (.Lstack_top - __dw_ap_trampoline_template_start)(%rbx), %rsp
+    subq $8, %rsp
     xorq %rbp, %rbp
     movl (.Lcpu_index - __dw_ap_trampoline_template_start)(%rbx), %edi
     movl (.Llocal_apic_id - __dw_ap_trampoline_template_start)(%rbx), %esi
