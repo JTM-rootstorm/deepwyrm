@@ -217,6 +217,117 @@ fn owned_journal_claims_candidate_chain_only_after_target_publication() {
     unsafe_code,
     reason = "the host model attests synthetic frame zeroing and root ownership"
 )]
+fn owned_journal_upgrades_shared_supervisor_ancestors_without_exposing_the_leaf() {
+    let limit = PhysicalAddressLimit::new(1_u64 << 40).unwrap();
+    let capabilities = PagingCapabilities {
+        physical_limit: limit,
+    };
+    let mut roles = synthetic_frame_role_manager::<1, 24>(0x1000, 12);
+    let owner = roles.create_table_owner().unwrap();
+    let allocation = roles.allocate(1).unwrap();
+    let root = unsafe { roles.assume_zeroed(allocation) }.unwrap();
+    let root = roles.prepare_table(root, owner, TableLevel::Pml4).unwrap();
+    let root = roles.commit_table(root, None).unwrap();
+    let page_tables =
+        unsafe { PageTableRoot::from_owned_root(root.physical_start(), capabilities) }.unwrap();
+
+    let mut committed = [root; 3];
+    let mut parent = root;
+    for (slot, level) in [TableLevel::Pdpt, TableLevel::Pd, TableLevel::Pt]
+        .into_iter()
+        .enumerate()
+    {
+        let allocation = roles.allocate(1).unwrap();
+        let zeroed = unsafe { roles.assume_zeroed(allocation) }.unwrap();
+        let candidate = roles.prepare_table(zeroed, owner, level).unwrap();
+        committed[slot] = roles.commit_table(candidate, Some(parent)).unwrap();
+        parent = committed[slot];
+    }
+    let kernel_tables = committed.map(TableIdentity::physical_start);
+    let kernel_page = VirtualPage::new(0x7000).unwrap();
+    let mut target = FakeTarget::default();
+    target.entries.insert(
+        (root.physical_start(), kernel_page.index(3)),
+        kernel_tables[0] | super::super::PRESENT | super::super::WRITABLE,
+    );
+    target.entries.insert(
+        (kernel_tables[0], kernel_page.index(2)),
+        kernel_tables[1] | super::super::PRESENT | super::super::WRITABLE,
+    );
+    target.entries.insert(
+        (kernel_tables[1], kernel_page.index(1)),
+        kernel_tables[2] | super::super::PRESENT | super::super::WRITABLE,
+    );
+    target.entries.insert(
+        (kernel_tables[2], kernel_page.index(0)),
+        0x9000 | super::super::PRESENT,
+    );
+
+    let mut candidates: [Option<TableCandidateGrant>; 3] = [const { None }; 3];
+    let allocation = roles.allocate(1).unwrap();
+    let zeroed = unsafe { roles.assume_zeroed(allocation) }.unwrap();
+    let user_pt = roles.prepare_table(zeroed, owner, TableLevel::Pt).unwrap();
+    let user_pt_address = user_pt.physical_start();
+    candidates[0] = Some(user_pt);
+    let allocation = roles.allocate(1).unwrap();
+    let user_backing = unsafe { roles.assume_zeroed(allocation) }.unwrap();
+    let user_backing = roles.assign_object_backing(user_backing).unwrap();
+    let user_page = VirtualPage::new(0x400000).unwrap();
+    let mut journal = OwnedPageTableJournal::<_, 1, 24, 3, 8, 1>::new(
+        &mut target,
+        &mut roles,
+        root,
+        limit,
+        &mut candidates,
+    )
+    .unwrap();
+    journal
+        .authorize_leaf(user_backing.identity(), user_backing.physical_start())
+        .unwrap();
+    page_tables
+        .map_page(
+            &mut journal,
+            user_page,
+            user_backing.physical_start(),
+            MappingPermissions::USER_READ_ONLY,
+            &[user_pt_address],
+        )
+        .unwrap();
+    journal.publish().unwrap();
+
+    assert_ne!(
+        target.entries[&(root.physical_start(), user_page.index(3))] & super::super::USER,
+        0
+    );
+    assert_ne!(
+        target.entries[&(kernel_tables[0], user_page.index(2))] & super::super::USER,
+        0
+    );
+    assert_eq!(
+        target.entries[&(kernel_tables[1], kernel_page.index(1))] & super::super::USER,
+        0
+    );
+    assert_eq!(
+        target.entries[&(kernel_tables[2], kernel_page.index(0))] & super::super::USER,
+        0
+    );
+    assert_ne!(
+        target.entries[&(kernel_tables[1], user_page.index(1))] & super::super::USER,
+        0
+    );
+    assert_ne!(
+        target.entries[&(user_pt_address, user_page.index(0))] & super::super::USER,
+        0
+    );
+    assert_eq!(target.invalidated, [0x400000]);
+    assert_eq!(roles.check_invariants(), Ok(()));
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the host model attests synthetic frame zeroing and root ownership"
+)]
 fn owned_journal_restores_candidate_grants_when_atomic_target_rejects() {
     let limit = PhysicalAddressLimit::new(1_u64 << 40).unwrap();
     let capabilities = PagingCapabilities {

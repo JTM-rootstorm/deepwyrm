@@ -11,7 +11,7 @@
 
 use super::{
     CommitError, EntryAssertion, EntryMutation, FrameAddress, MutationPlan, PageTableTransaction,
-    PhysicalAddressLimit, VirtualPage, decode_intermediate,
+    PhysicalAddressLimit, VirtualPage, decode_intermediate, decode_intermediate_any,
 };
 use crate::memory::address_region::{
     AddressSpaceKey, AddressSpacePublisher, Mapping, RegionKey, publisher_seal,
@@ -324,10 +324,12 @@ where
                 }
                 return Ok((addresses, count));
             }
-            current =
-                decode_intermediate(entry, page.is_user_half(), self.physical_limit).map_err(
-                    |_| OwnedPageTableJournalError::InvalidCandidateEntry { level_index, entry },
-                )?;
+            current = decode_intermediate_any(entry, self.physical_limit)
+                .map_err(|_| OwnedPageTableJournalError::InvalidCandidateEntry {
+                    level_index,
+                    entry,
+                })?
+                .0;
         }
         Ok((addresses, count))
     }
@@ -397,8 +399,9 @@ where
         plan: &MutationPlan,
     ) -> Result<(), OwnedPageTableJournalError<T::Error>> {
         if plan.root().address() != self.root.physical_start()
-            || plan.assertions().len() + plan.new_tables().len() != 3
-            || plan.mutations().len() != plan.new_tables().len() + 1
+            || plan.mutations().is_empty()
+            || plan.assertions().len() + plan.mutations().len() != 4
+            || plan.new_tables().len() >= plan.mutations().len()
         {
             return Err(OwnedPageTableJournalError::InvalidPlan);
         }
@@ -429,53 +432,90 @@ where
             )
             .map_err(OwnedPageTableJournalError::FrameRole)?;
 
+        let ancestor_mutations = &plan.mutations()[..plan.mutations().len() - 1];
+        let mut assertion_index = 0;
+        let mut mutation_index = 0;
+        let mut new_table_index = 0;
         let mut current = TableReference::Committed(self.root);
         let mut current_address = self.root.physical_start();
-        for (depth, assertion) in plan.assertions().iter().copied().enumerate() {
-            let level_index = 3 - depth;
-            if assertion.table().address() != current_address
-                || assertion.index() != plan.page().index(level_index)
+        for level_index in (1..=3).rev() {
+            let page_index = plan.page().index(level_index);
+            let assertion_matches = plan.assertions().get(assertion_index).is_some_and(|entry| {
+                entry.table().address() == current_address && entry.index() == page_index
+            });
+            let mutation_matches = ancestor_mutations.get(mutation_index).is_some_and(|entry| {
+                entry.table().address() == current_address && entry.index() == page_index
+            });
+            if assertion_matches == mutation_matches {
+                return Err(OwnedPageTableJournalError::InvalidPlan);
+            }
+
+            let child_level = level_for_index(level_index - 1);
+            if assertion_matches {
+                let assertion = plan.assertions()[assertion_index];
+                let (frame, entry_user) =
+                    decode_intermediate_any(assertion.expected(), self.physical_limit)
+                        .map_err(|_| OwnedPageTableJournalError::InvalidPlan)?;
+                if plan.page().is_user_half() && !entry_user {
+                    return Err(OwnedPageTableJournalError::InvalidPlan);
+                }
+                let child = self.table_reference(frame.address(), child_level)?;
+                self.validate_parent(current, child)?;
+                current = child;
+                current_address = frame.address();
+                assertion_index += 1;
+                continue;
+            }
+
+            let mutation = ancestor_mutations[mutation_index];
+            mutation_index += 1;
+            if mutation.expected() == 0 {
+                if mutation.compare_mask() != u64::MAX || mutation.preserve_mask() != 0 {
+                    return Err(OwnedPageTableJournalError::InvalidPlan);
+                }
+                let frame = decode_intermediate(
+                    mutation.replacement(),
+                    plan.page().is_user_half(),
+                    self.physical_limit,
+                )
+                .map_err(|_| OwnedPageTableJournalError::InvalidPlan)?;
+                if plan.new_tables().get(new_table_index) != Some(&frame) {
+                    return Err(OwnedPageTableJournalError::InvalidPlan);
+                }
+                let slot = self.candidate_slot(frame.address(), child_level)?;
+                self.record_candidate_use(slot, child_level, current)?;
+                current = TableReference::Candidate(slot);
+                current_address = frame.address();
+                new_table_index += 1;
+                continue;
+            }
+
+            if !plan.page().is_user_half()
+                || mutation.compare_mask() != !super::ACCESSED
+                || mutation.preserve_mask() != super::ACCESSED
+                || mutation.replacement() != (mutation.expected() & !super::ACCESSED) | super::USER
             {
                 return Err(OwnedPageTableJournalError::InvalidPlan);
             }
-            let child_address = decode_intermediate(
-                assertion.expected(),
-                plan.page().is_user_half(),
-                self.physical_limit,
-            )
-            .map_err(|_| OwnedPageTableJournalError::InvalidPlan)?
-            .address();
-            let child_level = level_for_index(level_index - 1);
-            let child = self.table_reference(child_address, child_level)?;
+            let (before, before_user) =
+                decode_intermediate_any(mutation.expected(), self.physical_limit)
+                    .map_err(|_| OwnedPageTableJournalError::InvalidPlan)?;
+            let after = decode_intermediate(mutation.replacement(), true, self.physical_limit)
+                .map_err(|_| OwnedPageTableJournalError::InvalidPlan)?;
+            if before_user || before != after {
+                return Err(OwnedPageTableJournalError::InvalidPlan);
+            }
+            let child = self.table_reference(after.address(), child_level)?;
             self.validate_parent(current, child)?;
             current = child;
-            current_address = child_address;
+            current_address = after.address();
         }
 
-        for (offset, frame) in plan.new_tables().iter().copied().enumerate() {
-            let mutation = plan.mutations()[offset];
-            let level_index = 3 - plan.assertions().len() - offset;
-            if mutation.table().address() != current_address
-                || mutation.index() != plan.page().index(level_index)
-                || mutation.expected() != 0
-                || mutation.preserve_mask() != 0
-            {
-                return Err(OwnedPageTableJournalError::InvalidPlan);
-            }
-            let decoded = decode_intermediate(
-                mutation.replacement(),
-                plan.page().is_user_half(),
-                self.physical_limit,
-            )
-            .map_err(|_| OwnedPageTableJournalError::InvalidPlan)?;
-            if decoded != frame {
-                return Err(OwnedPageTableJournalError::InvalidPlan);
-            }
-            let child_level = level_for_index(level_index - 1);
-            let slot = self.candidate_slot(frame.address(), child_level)?;
-            self.record_candidate_use(slot, child_level, current)?;
-            current = TableReference::Candidate(slot);
-            current_address = frame.address();
+        if assertion_index != plan.assertions().len()
+            || mutation_index != ancestor_mutations.len()
+            || new_table_index != plan.new_tables().len()
+        {
+            return Err(OwnedPageTableJournalError::InvalidPlan);
         }
 
         if leaf_mutation.table().address() != current_address

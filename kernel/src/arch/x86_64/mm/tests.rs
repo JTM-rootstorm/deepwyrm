@@ -182,6 +182,45 @@ fn maps_rewalks_protects_and_unmaps_with_local_invalidation() {
 }
 
 #[test]
+fn user_map_atomically_upgrades_shared_supervisor_ancestors() {
+    let mut tables = FakeTables::owned_root();
+    let kernel_page = VirtualPage::new(0x7000).unwrap();
+    tables.claimed.extend([0x2000, 0x3000, 0x4000]);
+    tables
+        .entries
+        .insert((0x1000, kernel_page.index(3)), 0x2003);
+    tables
+        .entries
+        .insert((0x2000, kernel_page.index(2)), 0x3003);
+    tables
+        .entries
+        .insert((0x3000, kernel_page.index(1)), 0x4003);
+    tables
+        .entries
+        .insert((0x4000, kernel_page.index(0)), 0x5001);
+
+    tables.mark_zero_exclusive(&[0x6000]);
+    let user_page = VirtualPage::new(0x400000).unwrap();
+    root()
+        .map_page(
+            &mut tables,
+            user_page,
+            0x7000,
+            MappingPermissions::USER_READ_ONLY,
+            &[0x6000],
+        )
+        .unwrap();
+
+    assert_ne!(tables.entry(0x1000, user_page.index(3)) & USER, 0);
+    assert_ne!(tables.entry(0x2000, user_page.index(2)) & USER, 0);
+    assert_eq!(tables.entry(0x3000, kernel_page.index(1)) & USER, 0);
+    assert_eq!(tables.entry(0x4000, kernel_page.index(0)) & USER, 0);
+    assert_ne!(tables.entry(0x3000, user_page.index(1)) & USER, 0);
+    assert_ne!(tables.entry(0x6000, user_page.index(0)) & USER, 0);
+    assert_eq!(tables.invalidated, [0x400000]);
+}
+
+#[test]
 fn preflight_and_commit_failures_leave_entries_claims_and_tlb_unchanged() {
     for mode in 0..10 {
         let mut tables = FakeTables::owned_root();
@@ -375,23 +414,19 @@ fn rejects_reserved_addresses_and_conflicting_ancestor_flags() {
     assert!(FrameAddress::new(limit.exclusive(), limit).is_err());
     assert!(validate_entry_bits((1_u64 << 40) | PRESENT, limit).is_err());
 
-    for conflict in [
-        intermediate_entry(FrameAddress(0x2000), false),
-        intermediate_entry(FrameAddress(0x2000), true) | HUGE,
-    ] {
-        let mut tables = FakeTables::owned_root();
-        tables.entries.insert((0x1000, page().index(3)), conflict);
-        assert_eq!(
-            root().map_page(
-                &mut tables,
-                page(),
-                0x5000,
-                MappingPermissions::USER_READ_ONLY,
-                &[0x3000, 0x4000],
-            ),
-            Err(MapError::ParentConflict)
-        );
-    }
+    let conflict = intermediate_entry(FrameAddress(0x2000), true) | HUGE;
+    let mut tables = FakeTables::owned_root();
+    tables.entries.insert((0x1000, page().index(3)), conflict);
+    assert_eq!(
+        root().map_page(
+            &mut tables,
+            page(),
+            0x5000,
+            MappingPermissions::USER_READ_ONLY,
+            &[0x3000, 0x4000],
+        ),
+        Err(MapError::ParentConflict)
+    );
 }
 
 #[test]

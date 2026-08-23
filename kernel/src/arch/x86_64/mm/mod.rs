@@ -573,7 +573,7 @@ impl PageTableRoot {
                 });
                 child
             } else {
-                let child = decode_intermediate(old, permissions.user, physical_limit)
+                let (child, ancestor_user) = decode_intermediate_any(old, physical_limit)
                     .map_err(|_| MapError::ParentConflict)?;
                 if child == data
                     || traversed[..traversed_count].contains(&child)
@@ -581,12 +581,23 @@ impl PageTableRoot {
                 {
                     return Err(MapError::InvalidPath);
                 }
-                plan.push_assertion(EntryAssertion {
-                    table: current,
-                    index,
-                    expected: old,
-                    compare_mask: !ACCESSED,
-                });
+                if permissions.user && !ancestor_user {
+                    plan.push_mutation(EntryMutation {
+                        table: current,
+                        index,
+                        expected: old,
+                        compare_mask: !ACCESSED,
+                        replacement: (old & !ACCESSED) | USER,
+                        preserve_mask: ACCESSED,
+                    });
+                } else {
+                    plan.push_assertion(EntryAssertion {
+                        table: current,
+                        index,
+                        expected: old,
+                        compare_mask: !ACCESSED,
+                    });
+                }
                 child
             };
             traversed[traversed_count] = child;
@@ -858,11 +869,23 @@ fn decode_intermediate(
     user: bool,
     limit: PhysicalAddressLimit,
 ) -> Result<FrameAddress, ()> {
-    validate_entry_bits(entry, limit)?;
-    if entry & PRESENT == 0 || entry & HUGE != 0 || (entry & USER != 0) != user {
+    let (frame, entry_user) = decode_intermediate_any(entry, limit)?;
+    if entry_user != user {
         return Err(());
     }
-    FrameAddress::new(entry & address_mask(limit), limit).map_err(|_| ())
+    Ok(frame)
+}
+
+fn decode_intermediate_any(
+    entry: u64,
+    limit: PhysicalAddressLimit,
+) -> Result<(FrameAddress, bool), ()> {
+    validate_entry_bits(entry, limit)?;
+    if entry & PRESENT == 0 || entry & HUGE != 0 {
+        return Err(());
+    }
+    let frame = FrameAddress::new(entry & address_mask(limit), limit).map_err(|_| ())?;
+    Ok((frame, entry & USER != 0))
 }
 
 fn decode_leaf<E>(
