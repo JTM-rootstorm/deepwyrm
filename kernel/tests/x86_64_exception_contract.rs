@@ -74,6 +74,43 @@ fn g5_user_faults_and_invalid_returns_share_structured_terminal_reaper_handoff()
 }
 
 #[test]
+fn h2_user_exception_stages_before_the_cpu_private_reaper_then_mutates_runtime() {
+    let live = source("src/arch/x86_64/syscall/live.rs");
+
+    let user_exception = live
+        .split_once("unsafe fn native_runtime_user_exception")
+        .expect("H2 user exception entry")
+        .1
+        .split_once("#[allow(\n    unsafe_code,\n    reason = \"the immutable runtime binding")
+        .expect("H2 user exception entry extent")
+        .0;
+    assert!(
+        user_exception.contains("stage_terminal_action(TerminalAction::UserException(record))")
+    );
+    assert!(user_exception.contains("handoff_to_terminal_reaper::<R>(context)"));
+    assert!(
+        !user_exception.contains("runtime.user_exception(record)"),
+        "the exception entry must abandon the faulting stack before runtime mutation"
+    );
+
+    let reaper = live
+        .split_once("unsafe extern \"sysv64\" fn native_runtime_terminal_reaper")
+        .expect("H2 terminal reaper callback")
+        .1
+        .split_once("#[allow(\n    unsafe_code,\n    reason = \"the audited assembly boundary")
+        .expect("H2 terminal reaper callback extent")
+        .0;
+    let user_exception = reaper
+        .find("runtime.user_exception(record);")
+        .expect("reaper delivers staged user exception");
+    let terminate = reaper
+        .find("runtime.terminate_current()")
+        .expect("reaper terminal reclaim");
+    assert!(user_exception < terminate);
+    assert!(reaper.contains("take_terminal_action()"));
+}
+
+#[test]
 fn g5_primordial_selectors_have_exact_post_teardown_oracles() {
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
 
