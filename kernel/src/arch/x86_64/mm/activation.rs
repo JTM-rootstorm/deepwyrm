@@ -1618,6 +1618,26 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .activate_selection(prepared, previous, &mut LiveRootSwitchTarget)
     }
 
+    /// Audited CPU-kernel-root -> Process transition. The kernel-root token is
+    /// move-only and the live target observes both CPU identity and CR3 before
+    /// accepting it, so a stale token cannot leak a different Process
+    /// residency through the carrier.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the allocation-free carrier must recover both move-only root-selection tokens"
+    )]
+    pub(crate) fn activate_from_kernel_execution_root(
+        &self,
+        prepared: PreparedRootSelection,
+        previous: ActiveKernelExecutionRoot,
+    ) -> Result<ActiveRootSelection, KernelRootSelectionFailure> {
+        self.root_bindings.activate_from_kernel_execution_root(
+            prepared,
+            previous,
+            &mut LiveRootSwitchTarget,
+        )
+    }
+
     pub(crate) fn abandon_process_root_selection(
         &self,
         prepared: PreparedRootSelection,

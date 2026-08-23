@@ -1095,23 +1095,46 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .active
             .prepare_process_root_selection(self.cpu, process, address_space)
             .unwrap_or_else(|error| panic!("could not prepare scheduler-current root: {error:?}"));
-        let previous = Some(self.active_root.take_process());
-        let selected = match self
-            .active
-            .activate_process_root_selection(prepared, previous)
-        {
-            Ok(selected) => selected,
-            Err(failure) => {
-                let (error, prepared, previous) = failure.into_parts();
-                self.active
-                    .abandon_process_root_selection(prepared)
-                    .unwrap_or_else(|abandon| {
-                        panic!("failed root selection could not be abandoned: {abandon:?}")
-                    });
-                self.active_root = CarrierActiveRoot::Process(previous.unwrap_or_else(|| {
-                    panic!("runtime carrier lost its Process root during activation rollback")
-                }));
-                panic!("could not activate scheduler-current root: {error:?}");
+        let previous = core::mem::replace(&mut self.active_root, CarrierActiveRoot::Transitioning);
+        let selected = match previous {
+            CarrierActiveRoot::Process(previous) => match self
+                .active
+                .activate_process_root_selection(prepared, Some(previous))
+            {
+                Ok(selected) => selected,
+                Err(failure) => {
+                    let (error, prepared, previous) = failure.into_parts();
+                    self.active
+                        .abandon_process_root_selection(prepared)
+                        .unwrap_or_else(|abandon| {
+                            panic!("failed root selection could not be abandoned: {abandon:?}")
+                        });
+                    self.active_root = CarrierActiveRoot::Process(previous.unwrap_or_else(|| {
+                        panic!("runtime carrier lost its Process root during activation rollback")
+                    }));
+                    panic!("could not activate scheduler-current root: {error:?}");
+                }
+            },
+            CarrierActiveRoot::Kernel(previous) => match self
+                .active
+                .activate_from_kernel_execution_root(prepared, previous)
+            {
+                Ok(selected) => selected,
+                Err(failure) => {
+                    let (error, prepared, previous) = failure.into_parts();
+                    self.active
+                        .abandon_process_root_selection(prepared)
+                        .unwrap_or_else(|abandon| {
+                            panic!(
+                                "failed kernel-root selection could not be abandoned: {abandon:?}"
+                            )
+                        });
+                    self.active_root = CarrierActiveRoot::Kernel(previous);
+                    panic!("could not activate scheduler-current root from kernel root: {error:?}");
+                }
+            },
+            CarrierActiveRoot::StopPrecommitted(_) | CarrierActiveRoot::Transitioning => {
+                panic!("runtime carrier has no stable root while selecting scheduler current")
             }
         };
         // Publish the carrier identity only after CR3/residency selection is
@@ -1127,6 +1150,107 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     fn merge_cleanup(&mut self, cleanup: CleanupQueue<REGISTRY_OBJECTS>) {
         for release in cleanup.into_releases().into_iter().flatten() {
             self.cleanup.push(release);
+        }
+    }
+
+    /// Continues only after the remote-stop mailbox Release acknowledgement.
+    /// The stopped Thread remains deferred in the scheduler/reaper ownership
+    /// graph; this carrier may select a different Runnable Thread or idle on
+    /// its retained kernel root, but it must never consume the stopped IPI
+    /// frame or reclaim resources still held by the initiator's exact ack.
+    fn continue_after_rendezvous_stop(&mut self) -> ! {
+        self.stopping_claim = None;
+        let next = self.shared.execution.terminal_reaper_next_on(self.cpu);
+        let Some(next) = next else {
+            self.idle_after_rendezvous_stop()
+        };
+        let (stack_id, context_id) = self
+            .tasks
+            .thread_execution_resources(next)
+            .unwrap_or_else(|error| panic!("rendezvous replacement resources failed: {error:?}"))
+            .unwrap_or_else(|| panic!("rendezvous replacement Thread has no execution resources"));
+        let stack = self
+            .shared
+            .execution
+            .stack_bounds(stack_id)
+            .unwrap_or_else(|error| panic!("rendezvous replacement stack failed: {error:?}"));
+        let continuation = self
+            .shared
+            .execution
+            .kernel_continuation_rsp(context_id)
+            .unwrap_or_else(|error| {
+                panic!("rendezvous replacement continuation failed: {error:?}")
+            });
+        // This switches Kernel -> Process exactly once if replacement work is
+        // available. It performs no usercopy while the kernel-root state is
+        // live and returns only after the target CR3 serialization.
+        self.synchronize_scheduler_current();
+        unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(stack) }.unwrap_or_else(
+            |error| panic!("rendezvous replacement stack binding failed: {error:?}"),
+        );
+        let continuation = if continuation == 0 {
+            unsafe {
+                crate::arch::x86_64::context::prepare_initial_kernel_continuation(
+                    stack,
+                    crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
+                )
+            }
+            .unwrap_or_else(|error| {
+                panic!("rendezvous fresh continuation preparation failed: {error:?}")
+            })
+            .rsp()
+        } else {
+            continuation
+        };
+        crate::arch::x86_64::syscall::validate_live_syscall_boundary().unwrap_or_else(|error| {
+            panic!("rendezvous replacement syscall boundary drifted: {error:?}")
+        });
+        unsafe { crate::arch::x86_64::context::abandon_to_kernel_continuation(continuation) }
+    }
+
+    fn idle_after_rendezvous_stop(&mut self) -> ! {
+        assert!(matches!(self.active_root, CarrierActiveRoot::Kernel(_)));
+        loop {
+            let idle = crate::arch::x86_64::idle::prepare_current_idle().unwrap_or_else(|error| {
+                panic!("rendezvous kernel-root idle preparation failed: {error:?}")
+            });
+            match crate::arch::x86_64::idle::commit_current_idle(idle) {
+                Ok(halt) => {
+                    #[allow(
+                        unsafe_code,
+                        reason = "the committed idle transition owns the CPU-local kernel-root carrier and brackets the only sti;hlt boundary"
+                    )]
+                    unsafe {
+                        core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
+                    }
+                    crate::arch::x86_64::idle::finish_current_idle(halt).unwrap_or_else(|error| {
+                        panic!("rendezvous kernel-root idle completion failed: {error:?}")
+                    });
+                    match crate::time::service_current_rendezvous_latch()
+                        .unwrap_or_else(|_| panic!("rendezvous kernel-root idle latch failed"))
+                    {
+                        crate::arch::x86_64::rendezvous::MailboxNotification::None
+                        | crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {}
+                        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
+                        | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {
+                            panic!("stopped kernel-root carrier received a second stop request")
+                        }
+                    }
+                }
+                Err(failure)
+                    if failure.error()
+                        == crate::arch::x86_64::idle::IdleWakeError::RescanRequired =>
+                {
+                    crate::arch::x86_64::idle::cancel_current_idle(failure.into_preparation())
+                        .unwrap_or_else(|error| {
+                            panic!("rendezvous kernel-root idle cancellation failed: {error:?}")
+                        });
+                }
+                Err(failure) => panic!(
+                    "rendezvous kernel-root idle commit failed: {:?}",
+                    failure.error()
+                ),
+            }
         }
     }
 
@@ -1555,10 +1679,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         crate::arch::x86_64::rendezvous::ExactSafeWitness,
         crate::arch::x86_64::rendezvous::RemoteStopError,
     > {
-        let reaper = self
-            .rendezvous_reaper
-            .take()
-            .ok_or(crate::arch::x86_64::rendezvous::RemoteStopError::UnsafePrecommit)?;
+        if self.rendezvous_reaper.as_ref().is_none() {
+            return Err(crate::arch::x86_64::rendezvous::RemoteStopError::UnsafePrecommit);
+        }
         let registry = crate::arch::x86_64::smp::live_cpu_registry();
         let snapshot = registry
             .snapshot(self.cpu.index())
@@ -1584,6 +1707,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         {
             return Err(crate::arch::x86_64::rendezvous::RemoteStopError::WrongIdentity);
         }
+        self.active
+            .validate_current_process_root_selection(root, self.process, root.address_space())
+            .map_err(|_| crate::arch::x86_64::rendezvous::RemoteStopError::WrongIdentity)?;
+        if !matches!(self.active_root, CarrierActiveRoot::Process(_)) {
+            return Err(crate::arch::x86_64::rendezvous::RemoteStopError::UnsafePrecommit);
+        }
         let witness = precommit.verify(
             crate::arch::x86_64::rendezvous::SafePointPrecommitObservation {
                 identity,
@@ -1596,6 +1725,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 user_return_prevented: true,
             },
         )?;
+        let reaper = self
+            .rendezvous_reaper
+            .take()
+            .expect("reaper witness disappeared after successful precommit");
         let previous = core::mem::replace(&mut self.active_root, CarrierActiveRoot::Transitioning);
         let CarrierActiveRoot::Process(root) = previous else {
             panic!("remote stop precommit lost the active Process root");
@@ -1656,17 +1789,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         crate::arch::x86_64::idle::complete_current_rendezvous_stop(request, self).unwrap_or_else(
             |error| panic!("remote rendezvous stop failed before commit: {error:?}"),
         );
-        // A completed stop has removed this carrier's Running claim and
-        // Process-root residency. It must never resume the interrupted frame.
-        loop {
-            #[allow(
-                unsafe_code,
-                reason = "a stopped carrier has no schedulable continuation until the later reaper join owns its terminal completion"
-            )]
-            unsafe {
-                core::arch::asm!("cli", "hlt", options(nomem, nostack));
-            }
-        }
+        self.continue_after_rendezvous_stop()
     }
 }
 

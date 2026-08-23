@@ -2011,6 +2011,21 @@ fn kernel_execution_root_isolated_from_process_bindings_and_switches_both_direct
             &mut switches,
         )
         .unwrap_or_else(|failure| panic!("initial Process switch failed: {:?}", failure.error()));
+    // A Process token alone is not authority to leave the Process root: the
+    // observed current CR3 must still name that exact root. The failed
+    // preflight returns the move-only selection intact and performs no kernel
+    // root load or residency release.
+    switches
+        .roots
+        .push(child_identity.physical_start() + PAGE_SIZE);
+    let failure = bindings
+        .activate_kernel_execution_root(execution_roots.get(cpu).unwrap(), child, &mut switches)
+        .unwrap_err();
+    let (error, child) = failure;
+    assert_eq!(error, RootBindingError::RootMismatch);
+    assert!(child.selects_exact(cpu, child_process, child_space));
+    assert_eq!(switches.roots.len(), 2);
+    switches.roots.pop();
     let kernel = bindings
         .activate_kernel_execution_root(execution_roots.get(cpu).unwrap(), child, &mut switches)
         .unwrap();

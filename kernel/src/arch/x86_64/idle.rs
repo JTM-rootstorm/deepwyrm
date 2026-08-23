@@ -428,18 +428,6 @@ pub(crate) fn notify_runnable_work(affinity: Option<CpuIndex>) {
     }
 }
 
-/// Consumes only the current CPU's coalesced Wake notification after EOI.
-/// Stop and HoldSafe remain visible to their exact rendezvous owner.
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub(crate) fn take_current_notification() -> MailboxNotification {
-    let Ok(cpu) = current_cpu() else {
-        fail_transport_and_halt();
-    };
-    LIVE_IDLE_WAKE
-        .take_notification(cpu)
-        .unwrap_or_else(|_| fail_transport_and_halt())
-}
-
 /// Bounded e1 receive callback: publish a CPU-local latch after EOI. It does
 /// not take scheduler, mailbox, usercopy, timer, or finalization authority.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]

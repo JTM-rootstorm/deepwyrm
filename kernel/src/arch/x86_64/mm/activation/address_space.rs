@@ -568,6 +568,9 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
             if target.current_cpu() != Some(kernel.cpu) || previous.residency.cpu() != kernel.cpu {
                 return Err(RootBindingError::CpuMismatch);
             }
+            if target.current_root_physical_start() != Some(previous.root) {
+                return Err(RootBindingError::RootMismatch);
+            }
             let binding = self.binding(previous.process, previous.address_space)?;
             if binding.identity != previous.identity
                 || binding.identity.physical_start() != previous.root
