@@ -8,6 +8,9 @@
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 pub(crate) const H1_RUNTIME_CPU_CAPACITY: usize = 4;
+pub(crate) const INIT_ASSERT_DELAY_NS: u64 = 10_000_000;
+pub(crate) const INIT_TO_SIPI_DELAY_NS: u64 = 200_000;
+pub(crate) const SIPI_RETRY_DELAY_NS: u64 = 200_000;
 
 pub(crate) const PAGE_SIZE: u64 = 4096;
 pub(crate) const AP_TRAMPOLINE_LIMIT: u64 = 0x10_0000;
@@ -292,6 +295,8 @@ impl CpuRegistry {
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 static LIVE_CPU_REGISTRY: CpuRegistry = CpuRegistry::new();
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+static LIVE_LOCAL_APIC_PHYSICAL_BASE: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) fn configure_live_cpu_registry(
@@ -311,12 +316,76 @@ pub(crate) fn configure_live_cpu_registry(
         }
         ids[index] = entry.local_apic_id();
     }
-    LIVE_CPU_REGISTRY.discover(&ids[..topology.len()])
+    LIVE_CPU_REGISTRY.discover(&ids[..topology.len()])?;
+    LIVE_LOCAL_APIC_PHYSICAL_BASE.store(topology.local_apic_physical_address(), Ordering::Release);
+    Ok(())
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) fn live_cpu_registry() -> &'static CpuRegistry {
     &LIVE_CPU_REGISTRY
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn live_local_apic_physical_base() -> Result<u64, CpuRegistryError> {
+    let base = LIVE_LOCAL_APIC_PHYSICAL_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        return Err(CpuRegistryError::EmptyTopology);
+    }
+    Ok(base)
+}
+
+pub(crate) trait ApStartupPlatform {
+    type Error;
+
+    fn send_ipi(
+        &mut self,
+        destination: u8,
+        operation: super::apic::IpiOperation,
+    ) -> Result<(), Self::Error>;
+
+    fn busy_wait_nanoseconds(&mut self, delay: u64) -> Result<(), Self::Error>;
+}
+
+/// Delivers the exact bounded INIT/deassert/SIPI/SIPI sequence required by H1.
+pub(crate) fn deliver_ap_startup_sequence<P: ApStartupPlatform>(
+    platform: &mut P,
+    local_apic_id: u8,
+    trampoline_page: u64,
+) -> Result<(), P::Error> {
+    platform.send_ipi(local_apic_id, super::apic::IpiOperation::InitAssert)?;
+    platform.busy_wait_nanoseconds(INIT_ASSERT_DELAY_NS)?;
+    platform.send_ipi(local_apic_id, super::apic::IpiOperation::InitDeassert)?;
+    platform.busy_wait_nanoseconds(INIT_TO_SIPI_DELAY_NS)?;
+    platform.send_ipi(
+        local_apic_id,
+        super::apic::IpiOperation::Startup { trampoline_page },
+    )?;
+    platform.busy_wait_nanoseconds(SIPI_RETRY_DELAY_NS)?;
+    platform.send_ipi(
+        local_apic_id,
+        super::apic::IpiOperation::Startup { trampoline_page },
+    )
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) struct LiveApStartupPlatform;
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+impl ApStartupPlatform for LiveApStartupPlatform {
+    type Error = crate::time::LiveTimeError;
+
+    fn send_ipi(
+        &mut self,
+        destination: u8,
+        operation: super::apic::IpiOperation,
+    ) -> Result<(), Self::Error> {
+        crate::time::send_bsp_ipi(destination, operation)
+    }
+
+    fn busy_wait_nanoseconds(&mut self, delay: u64) -> Result<(), Self::Error> {
+        crate::time::busy_wait_nanoseconds(delay)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -597,6 +666,8 @@ pub(crate) fn linked_trampoline_template() -> (&'static [u8], TrampolineTemplate
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
 
     #[test]
@@ -746,6 +817,58 @@ mod tests {
         assert_eq!(
             registry.wait_until_parked(2, 1),
             Err(CpuRegistryError::Timeout)
+        );
+    }
+
+    #[test]
+    fn startup_sequence_has_exact_architectural_order_and_delays() {
+        #[derive(Debug, Eq, PartialEq)]
+        enum Event {
+            Ipi(u8, super::super::apic::IpiOperation),
+            Delay(u64),
+        }
+        struct Platform(std::vec::Vec<Event>);
+        impl ApStartupPlatform for Platform {
+            type Error = ();
+
+            fn send_ipi(
+                &mut self,
+                destination: u8,
+                operation: super::super::apic::IpiOperation,
+            ) -> Result<(), Self::Error> {
+                self.0.push(Event::Ipi(destination, operation));
+                Ok(())
+            }
+
+            fn busy_wait_nanoseconds(&mut self, delay: u64) -> Result<(), Self::Error> {
+                self.0.push(Event::Delay(delay));
+                Ok(())
+            }
+        }
+
+        let mut platform = Platform(std::vec::Vec::new());
+        deliver_ap_startup_sequence(&mut platform, 7, 0x8000).unwrap();
+        assert_eq!(
+            platform.0,
+            [
+                Event::Ipi(7, super::super::apic::IpiOperation::InitAssert),
+                Event::Delay(INIT_ASSERT_DELAY_NS),
+                Event::Ipi(7, super::super::apic::IpiOperation::InitDeassert),
+                Event::Delay(INIT_TO_SIPI_DELAY_NS),
+                Event::Ipi(
+                    7,
+                    super::super::apic::IpiOperation::Startup {
+                        trampoline_page: 0x8000,
+                    },
+                ),
+                Event::Delay(SIPI_RETRY_DELAY_NS),
+                Event::Ipi(
+                    7,
+                    super::super::apic::IpiOperation::Startup {
+                        trampoline_page: 0x8000,
+                    },
+                ),
+            ]
         );
     }
 }
