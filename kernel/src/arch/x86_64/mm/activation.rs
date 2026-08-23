@@ -542,7 +542,12 @@ pub(crate) trait ActiveScratchIo {
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub(crate) struct LiveActiveScratchIo;
+pub(crate) struct LiveActiveScratchIo {
+    /// Established by the consuming Deep-root activation before the first
+    /// ACPI/MMIO scratch access.  SYSCALL GS state is intentionally not an
+    /// input: it is installed later in BSP bring-up.
+    cpu: crate::cpu::CpuIndex,
+}
 
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 struct LiveRootSwitchTarget;
@@ -601,8 +606,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> target_seal::Seale
 )]
 impl ActiveScratchIo for LiveActiveScratchIo {
     fn current_cpu(&self) -> Option<crate::cpu::CpuIndex> {
-        crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
-            .and_then(crate::cpu::CpuIndex::new)
+        Some(self.cpu)
     }
 
     fn load(&mut self, address: u64) -> u64 {
@@ -853,11 +857,10 @@ impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
         if index >= ENTRY_COUNT {
             return Err(LiveActiveTargetError::InvalidIndex);
         }
-        if table.address() == self.scratch.pt.physical_start()
-            && (index == self.scratch_leaf_index()
-                || index == self.scratch_control_index()
-                || index == self.mmio_leaf_index())
-        {
+        // All four CPU control aliases reach one physical PT.  A generic
+        // journal may never name that table: its only permitted mutations are
+        // the selected carrier's private scratch/MMIO leaf CAS operations.
+        if table.address() == self.scratch.pt.physical_start() {
             return Err(LiveActiveTargetError::ReservedScratchEntry);
         }
         Ok(())
@@ -911,6 +914,7 @@ unsafe impl<I: ActiveScratchIo> AtomicPageTableTarget for ActiveScratchTarget<I>
         writes: &[JournalWrite],
         invalidations: &[VirtualPage],
     ) -> Result<(), Self::Error> {
+        self.require_owning_cpu()?;
         for write in writes {
             self.validate_location(write.table(), write.index())?;
             let _ = self.read_location(write.table(), write.index())?;
@@ -1393,7 +1397,9 @@ unsafe impl<'a, 'handoff, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
                     .scratch
                     .for_cpu(crate::cpu::CpuIndex::BOOTSTRAP)
                     .expect("C2 BSP scratch slot layout drifted"),
-                io: LiveActiveScratchIo,
+                io: LiveActiveScratchIo {
+                    cpu: crate::cpu::CpuIndex::BOOTSTRAP,
+                },
                 poisoned: false,
                 _not_send_sync: core::marker::PhantomData,
             },

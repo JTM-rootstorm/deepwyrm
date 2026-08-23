@@ -705,6 +705,29 @@ fn scratch_binding_rejects_cross_cpu_before_touching_its_leaf() {
 }
 
 #[test]
+fn wrong_cpu_empty_apply_rejects_before_the_scratch_leaf_load() {
+    let fixture = graph_fixture();
+    let slot = PerCpuScratchBindings::new(DeepScratchBinding {
+        window_page: FIXTURE_SCRATCH,
+        control_page: FIXTURE_SCRATCH + PAGE_SIZE,
+        pt: fixture.scratch_pt,
+    })
+    .for_cpu(CpuIndex::BOOTSTRAP)
+    .unwrap();
+    let mut target = ActiveScratchTarget {
+        scratch: slot,
+        io: FakeActiveScratchIo {
+            current_cpu: CpuIndex::new(1).unwrap(),
+            ..FakeActiveScratchIo::default()
+        },
+        poisoned: false,
+        _not_send_sync: core::marker::PhantomData,
+    };
+    assert_eq!(target.apply(&[], &[]), Err(LiveActiveTargetError::WrongCpu));
+    assert!(target.io.events.is_empty());
+}
+
+#[test]
 fn cpu_scratch_migration_selects_a_new_window_and_clears_independently() {
     let fixture = graph_fixture();
     let bindings = PerCpuScratchBindings::new(DeepScratchBinding {
@@ -785,7 +808,7 @@ fn active_scratch_error_restores_private_leaf_without_owned_write_or_requested_i
 }
 
 #[test]
-fn active_scratch_reserves_window_control_and_mmio_entries_without_io() {
+fn active_scratch_reserves_the_entire_shared_control_pt_without_io() {
     let fixture = graph_fixture();
     let mut target = fake_active_scratch(fixture.scratch_pt, None);
     let table = FrameAddress::new(
@@ -793,13 +816,55 @@ fn active_scratch_reserves_window_control_and_mmio_entries_without_io() {
         fixture.capabilities.physical_limit(),
     )
     .unwrap();
+    let cpu1 = PerCpuScratchBindings::new(DeepScratchBinding {
+        window_page: FIXTURE_SCRATCH,
+        control_page: FIXTURE_SCRATCH + PAGE_SIZE,
+        pt: fixture.scratch_pt,
+    })
+    .for_cpu(CpuIndex::new(1).unwrap())
+    .unwrap();
     for index in [
+        0,
         target.scratch_leaf_index(),
         target.scratch_control_index(),
         target.mmio_leaf_index(),
+        ((cpu1.window_page >> 12) & 0x1ff) as usize,
     ] {
         assert_eq!(
             target.read_entry(table, index),
+            Err(LiveActiveTargetError::ReservedScratchEntry)
+        );
+    }
+    assert!(target.io.events.is_empty());
+}
+
+#[test]
+fn cpu0_cannot_journal_cpu1_scratch_leaf_or_control_entries() {
+    let fixture = graph_fixture();
+    let mut target = fake_active_scratch(fixture.scratch_pt, None);
+    let table = FrameAddress::new(
+        fixture.scratch_pt.physical_start(),
+        fixture.capabilities.physical_limit(),
+    )
+    .unwrap();
+    let cpu1 = PerCpuScratchBindings::new(DeepScratchBinding {
+        window_page: FIXTURE_SCRATCH,
+        control_page: FIXTURE_SCRATCH + PAGE_SIZE,
+        pt: fixture.scratch_pt,
+    })
+    .for_cpu(CpuIndex::new(1).unwrap())
+    .unwrap();
+    for index in [
+        ((cpu1.window_page >> 12) & 0x1ff) as usize,
+        ((cpu1.control_page >> 12) & 0x1ff) as usize,
+    ] {
+        assert_eq!(
+            target.read_entry(table, index),
+            Err(LiveActiveTargetError::ReservedScratchEntry)
+        );
+        let write = JournalWrite::test_new(table, index, 0x1234);
+        assert_eq!(
+            target.apply(&[write], &[]),
             Err(LiveActiveTargetError::ReservedScratchEntry)
         );
     }
