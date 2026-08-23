@@ -234,4 +234,33 @@ mod tests {
             Some(RuntimeCarrierLifecycle::Unbound)
         );
     }
+
+    #[test]
+    fn two_cpu_slots_release_independent_dispatch_gates() {
+        let claims = RuntimeCarrierClaims::<2>::new();
+        let lifecycle = RuntimeCarrierLifecycles::<2>::new();
+        let mut carrier0 = 0_u64;
+        let mut carrier1 = 0_u64;
+
+        assert_eq!(claims.claim(0, (&mut carrier0 as *mut u64).cast()), Ok(()));
+        assert_eq!(claims.claim(1, (&mut carrier1 as *mut u64).cast()), Ok(()));
+        assert_eq!(lifecycle.bind_parked(0), Ok(()));
+        assert_eq!(lifecycle.bind_parked(1), Ok(()));
+
+        assert_eq!(lifecycle.release(1), Ok(()));
+        assert_eq!(
+            lifecycle.lifecycle(0),
+            Some(RuntimeCarrierLifecycle::Parked),
+            "releasing slot one must not admit slot zero dispatch"
+        );
+        assert_eq!(
+            lifecycle.lifecycle(1),
+            Some(RuntimeCarrierLifecycle::Executing)
+        );
+        assert_eq!(lifecycle.release(0), Ok(()));
+        assert_eq!(
+            lifecycle.lifecycle(0),
+            Some(RuntimeCarrierLifecycle::Executing)
+        );
+    }
 }

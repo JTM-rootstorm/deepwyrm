@@ -371,6 +371,23 @@ fn h2_syscall_entry_and_native_runtime_carriers_are_fixed_per_cpu() {
 }
 
 #[test]
+fn i1_runtime_join_keeps_cpu_identity_and_dispatch_release_separate() {
+    let live = source("src/arch/x86_64/syscall/live.rs");
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let execution = source("src/task/execution.rs");
+
+    assert!(live.contains("RuntimeCarrierLifecycle::Executing"));
+    assert!(live.contains("release_native_runtime_carrier_for_slot(cpu)"));
+    assert!(live.contains("runtime_binding() -> Option<RuntimeBindingState>"));
+    assert!(live.contains("!= Some(RuntimeCarrierLifecycle::Executing)"));
+    assert!(primordial.contains("current_thread_on(self.cpu)"));
+    assert!(primordial.contains("prepare_process_root_selection(self.cpu"));
+    assert!(primordial.contains("terminal_reaper_next_on(self.cpu)"));
+    assert!(execution.contains("pub(crate) fn terminal_reaper_next_on"));
+    assert!(!primordial.contains("bind_parked_runtime_carriers"));
+}
+
+#[test]
 fn f2_kernel_context_switch_is_sysv_only_and_separate_from_user_return() {
     let assembly = source("src/arch/x86_64/kernel_context.S");
     for marker in [
