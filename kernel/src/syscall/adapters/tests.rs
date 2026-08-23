@@ -891,6 +891,97 @@ fn channel_create_preflights_both_outputs_before_pair_publication() {
 }
 
 #[test]
+fn channel_create_pair_capacity_failure_cancels_destination_permits() {
+    use deepwyrm_abi::{DW_RIGHT_READ, DW_RIGHT_WRITE};
+
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let unavailable = ChannelAuthority::<1, 4>::new();
+    let channels = ChannelAuthority::<1, 4>::new();
+    let waits = WaitRegistry::<8>::new();
+    let mut user = FakeUserMemory::new();
+    let requested = DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0);
+    let [blocking0, blocking1] = create_channel_pair_for_test(
+        &mut user,
+        &mut registry,
+        &unavailable,
+        &mut tasks,
+        process,
+        requested,
+        BASE + 0x140,
+    );
+    let before = tasks.process_handle_count(process).unwrap();
+
+    for _ in 0..3 {
+        assert_eq!(
+            channel_create(
+                &mut user,
+                &mut registry,
+                &unavailable,
+                &mut tasks,
+                process,
+                requested,
+                DwUserAddress(BASE + 0x180),
+                DwUserAddress(BASE + 0x188),
+            ),
+            DW_STATUS_NO_RESOURCES
+        );
+        assert_eq!(tasks.process_handle_count(process).unwrap(), before);
+    }
+
+    let [endpoint0, endpoint1] = create_channel_pair_for_test(
+        &mut user,
+        &mut registry,
+        &channels,
+        &mut tasks,
+        process,
+        requested,
+        BASE + 0x180,
+    );
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        endpoint0,
+    );
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        endpoint1,
+    );
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &unavailable,
+        &waits,
+        blocking0,
+    );
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &unavailable,
+        &waits,
+        blocking1,
+    );
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut CleanupQueue::new(),
+        ),
+        DW_STATUS_SUCCESS
+    );
+}
+
+#[test]
 fn channel_send_receive_and_buffer_too_small_are_transactional() {
     use deepwyrm_abi::{DW_RIGHT_READ, DW_RIGHT_WRITE};
 

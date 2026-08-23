@@ -30,7 +30,8 @@ use deepwyrm_abi::{
 
 use crate::handle::{
     AcceptedObjectTypes, HANDLE_TRANSFER_LIMIT, HandleMovePrepareError, HandleMoveRequest,
-    HandleReservationSpec, HandleTableError, ResolvedHandle,
+    HandlePairReservation, HandleReservationSpec, HandleTableError, HandleTransferReservation,
+    PreparedHandleMove, ResolvedHandle, TypedHandlePairReservation,
 };
 use crate::ipc::{ChannelAuthority, ChannelCreateError, ChannelEndpointKey, ChannelError};
 use crate::memory::address_region::{
@@ -976,6 +977,82 @@ fn cancel_prepared_process<
     cleanup.push_optional(prepared.cancel(tasks, registry));
 }
 
+fn cancel_prepared_handle_move<
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    prepared: &mut PreparedHandleMove,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    process: ProcessKey,
+) {
+    prepared
+        .cancel(
+            tasks
+                .process_handles_mut(process)
+                .expect("prepared MOVE source table remains live during cancellation"),
+        )
+        .expect("prepared MOVE permit remains exact during cancellation");
+}
+
+fn cancel_transfer_destination<
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    reservation: &mut HandleTransferReservation,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    process: ProcessKey,
+) {
+    reservation
+        .cancel(
+            tasks
+                .process_handles_mut(process)
+                .expect("reserved destination table remains live during cancellation"),
+        )
+        .expect("destination permit remains exact during cancellation");
+}
+
+fn cancel_typed_pair_destination<
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    reservation: &mut TypedHandlePairReservation,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    process: ProcessKey,
+) {
+    reservation
+        .cancel(
+            tasks
+                .process_handles_mut(process)
+                .expect("reserved typed-pair table remains live during cancellation"),
+        )
+        .expect("typed-pair permits remain exact during cancellation");
+}
+
+fn cancel_pair_destination<
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    reservation: &mut HandlePairReservation,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    process: ProcessKey,
+) {
+    reservation
+        .cancel(
+            tasks
+                .process_handles_mut(process)
+                .expect("reserved pair table remains live during cancellation"),
+        )
+        .expect("pair destination permits remain exact during cancellation");
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "F10 cancellation keeps task, address-space, typed-region, and generic-finalizer owners explicit"
@@ -1109,7 +1186,7 @@ fn process_create_transaction<
             return task_status(error);
         }
     };
-    let prepared_move = match prepared_move {
+    let mut prepared_move = match prepared_move {
         Ok(prepared) => prepared,
         Err(error) => {
             release_lookup_pin(registry, bootstrap_pin, cleanup);
@@ -1118,6 +1195,7 @@ fn process_create_transaction<
         }
     };
     if let Err(status) = inject(ProcessCreatePreparation::BootstrapMove) {
+        cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
         release_lookup_pin(registry, bootstrap_pin, cleanup);
         release_lookup_pin(registry, parent_pin, cleanup);
         return status;
@@ -1126,6 +1204,7 @@ fn process_create_transaction<
     let prepared_process = match tasks.prepare_process(registry, &parent_pin) {
         Ok(prepared) => prepared,
         Err(error) => {
+            cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
             release_lookup_pin(registry, bootstrap_pin, cleanup);
             release_lookup_pin(registry, parent_pin, cleanup);
             return task_create_status(error);
@@ -1133,6 +1212,7 @@ fn process_create_transaction<
     };
     if let Err(status) = inject(ProcessCreatePreparation::ProcessShell) {
         cancel_prepared_process(prepared_process, registry, tasks, cleanup);
+        cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
         release_lookup_pin(registry, bootstrap_pin, cleanup);
         release_lookup_pin(registry, parent_pin, cleanup);
         return status;
@@ -1142,22 +1222,26 @@ fn process_create_transaction<
         Ok(table) => table.reserve_transfer_destination(),
         Err(error) => {
             cancel_prepared_process(prepared_process, registry, tasks, cleanup);
+            cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
             release_lookup_pin(registry, bootstrap_pin, cleanup);
             release_lookup_pin(registry, parent_pin, cleanup);
             return task_status(error);
         }
     };
-    let child_reservation = match child_reservation {
+    let mut child_reservation = match child_reservation {
         Ok(reservation) => reservation,
         Err(error) => {
             cancel_prepared_process(prepared_process, registry, tasks, cleanup);
+            cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
             release_lookup_pin(registry, bootstrap_pin, cleanup);
             release_lookup_pin(registry, parent_pin, cleanup);
             return handle_status(error);
         }
     };
     if let Err(status) = inject(ProcessCreatePreparation::ChildBootstrapSlot) {
+        cancel_transfer_destination(&mut child_reservation, tasks, prepared_process.key());
         cancel_prepared_process(prepared_process, registry, tasks, cleanup);
+        cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
         release_lookup_pin(registry, bootstrap_pin, cleanup);
         release_lookup_pin(registry, parent_pin, cleanup);
         return status;
@@ -1166,7 +1250,9 @@ fn process_create_transaction<
     let attachment = match prepared_process.reserve_root_region_attachment(tasks) {
         Ok(attachment) => attachment,
         Err(error) => {
+            cancel_transfer_destination(&mut child_reservation, tasks, prepared_process.key());
             cancel_prepared_process(prepared_process, registry, tasks, cleanup);
+            cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
             release_lookup_pin(registry, bootstrap_pin, cleanup);
             release_lookup_pin(registry, parent_pin, cleanup);
             return task_status(error);
@@ -1182,13 +1268,16 @@ fn process_create_transaction<
     ) {
         Ok(prepared) => prepared,
         Err(error) => {
+            cancel_transfer_destination(&mut child_reservation, tasks, prepared_process.key());
             cancel_prepared_process(prepared_process, registry, tasks, cleanup);
+            cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
             release_lookup_pin(registry, bootstrap_pin, cleanup);
             release_lookup_pin(registry, parent_pin, cleanup);
             return address_region_object_status(error);
         }
     };
     if let Err(status) = inject(ProcessCreatePreparation::RootRegion) {
+        cancel_transfer_destination(&mut child_reservation, tasks, prepared_process.key());
         cancel_prepared_root_and_process(
             prepared_root,
             prepared_process,
@@ -1198,6 +1287,7 @@ fn process_create_transaction<
             spaces,
             cleanup,
         );
+        cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
         release_lookup_pin(registry, bootstrap_pin, cleanup);
         release_lookup_pin(registry, parent_pin, cleanup);
         return status;
@@ -1215,6 +1305,7 @@ fn process_create_transaction<
             },
         ]),
         Err(error) => {
+            cancel_transfer_destination(&mut child_reservation, tasks, prepared_process.key());
             cancel_prepared_root_and_process(
                 prepared_root,
                 prepared_process,
@@ -1224,14 +1315,16 @@ fn process_create_transaction<
                 spaces,
                 cleanup,
             );
+            cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
             release_lookup_pin(registry, bootstrap_pin, cleanup);
             release_lookup_pin(registry, parent_pin, cleanup);
             return task_status(error);
         }
     };
-    let parent_reservation = match parent_reservation {
+    let mut parent_reservation = match parent_reservation {
         Ok(reservation) => reservation,
         Err(error) => {
+            cancel_transfer_destination(&mut child_reservation, tasks, prepared_process.key());
             cancel_prepared_root_and_process(
                 prepared_root,
                 prepared_process,
@@ -1241,12 +1334,15 @@ fn process_create_transaction<
                 spaces,
                 cleanup,
             );
+            cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
             release_lookup_pin(registry, bootstrap_pin, cleanup);
             release_lookup_pin(registry, parent_pin, cleanup);
             return handle_status(error);
         }
     };
     if let Err(status) = inject(ProcessCreatePreparation::ParentResultSlots) {
+        cancel_typed_pair_destination(&mut parent_reservation, tasks, current_process);
+        cancel_transfer_destination(&mut child_reservation, tasks, prepared_process.key());
         cancel_prepared_root_and_process(
             prepared_root,
             prepared_process,
@@ -1256,6 +1352,7 @@ fn process_create_transaction<
             spaces,
             cleanup,
         );
+        cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
         release_lookup_pin(registry, bootstrap_pin, cleanup);
         release_lookup_pin(registry, parent_pin, cleanup);
         return status;
@@ -1264,30 +1361,52 @@ fn process_create_transaction<
     // No recoverable operation remains beyond this point. The source MOVE is
     // published into the child before typed hierarchy visibility, and parent
     // result handles appear together only after both typed payloads commit.
-    let (move_rollback, transfer) = prepared_move.extract(
-        tasks
-            .process_handles_mut(current_process)
-            .unwrap_or_else(|error| panic!("F10 source table changed at commit: {error:?}")),
-    );
-    let child_bootstrap = child_reservation.publish(
-        tasks
-            .process_handles_mut(prepared_process.key())
-            .unwrap_or_else(|error| panic!("F10 child table changed at commit: {error:?}")),
-        transfer,
-    );
-    move_rollback.finish(
-        tasks
-            .process_handles_mut(current_process)
-            .unwrap_or_else(|error| panic!("F10 source table changed after extraction: {error:?}")),
-    );
+    let (mut move_rollback, transfer) = prepared_move
+        .try_extract(
+            tasks
+                .process_handles_mut(current_process)
+                .unwrap_or_else(|error| panic!("F10 source table changed at commit: {error:?}")),
+        )
+        .unwrap_or_else(|error| panic!("F10 source MOVE permit diverged at commit: {error:?}"));
+    let child_bootstrap = child_reservation
+        .try_publish(
+            tasks
+                .process_handles_mut(prepared_process.key())
+                .unwrap_or_else(|error| panic!("F10 child table changed at commit: {error:?}")),
+            transfer,
+        )
+        .unwrap_or_else(|failure| {
+            panic!(
+                "F10 child destination permit diverged at commit: {:?}",
+                failure.error()
+            )
+        });
+    move_rollback
+        .try_finish(
+            tasks
+                .process_handles_mut(current_process)
+                .unwrap_or_else(|error| {
+                    panic!("F10 source table changed after extraction: {error:?}")
+                }),
+        )
+        .unwrap_or_else(|error| panic!("F10 source MOVE finish permit diverged: {error:?}"));
     let (_root, root_reference) = prepared_root.commit(registry, tasks, regions);
     let (_process, process_reference) = prepared_process.commit(tasks);
-    let parent_handles = parent_reservation.publish(
-        tasks
-            .process_handles_mut(current_process)
-            .unwrap_or_else(|error| panic!("F10 parent table changed at publication: {error:?}")),
-        [process_reference, root_reference],
-    );
+    let parent_handles = parent_reservation
+        .try_publish(
+            tasks
+                .process_handles_mut(current_process)
+                .unwrap_or_else(|error| {
+                    panic!("F10 parent table changed at publication: {error:?}")
+                }),
+            [process_reference, root_reference],
+        )
+        .unwrap_or_else(|failure| {
+            panic!(
+                "F10 parent destination permits diverged at commit: {:?}",
+                failure.error()
+            )
+        });
 
     release_lookup_pin(registry, bootstrap_pin, cleanup);
     release_lookup_pin(registry, parent_pin, cleanup);
@@ -1384,7 +1503,7 @@ pub(crate) fn channel_create<
         Ok(outputs) => outputs,
         Err(status) => return status,
     };
-    let reservation = match tasks.process_handles_mut(current_process) {
+    let mut reservation = match tasks.process_handles_mut(current_process) {
         Ok(table) => match table.reserve_pair(DW_OBJECT_TYPE_CHANNEL, requested_rights) {
             Ok(reservation) => reservation,
             Err(error) => return handle_status(error),
@@ -1393,7 +1512,10 @@ pub(crate) fn channel_create<
     };
     let (_keys, references) = match channels.create_pair(registry) {
         Ok(pair) => pair,
-        Err(error) => return channel_create_status(error),
+        Err(error) => {
+            cancel_pair_destination(&mut reservation, tasks, current_process);
+            return channel_create_status(error);
+        }
     };
     let [first_reference, second_reference] = references;
     let handles = tasks
@@ -1401,7 +1523,13 @@ pub(crate) fn channel_create<
         .unwrap_or_else(|error| {
             panic!("F5 Channel caller changed during reserved creation: {error:?}")
         })
-        .publish_reserved_pair(reservation, first_reference, second_reference);
+        .try_publish_reserved_pair(&mut reservation, first_reference, second_reference)
+        .unwrap_or_else(|failure| {
+            panic!(
+                "F5 Channel destination permits diverged at publication: {:?}",
+                failure.error()
+            )
+        });
     let first_bytes = encode_handle(handles[0]);
     let second_bytes = encode_handle(handles[1]);
     outputs.commit([Some(&first_bytes), Some(&second_bytes), None]);

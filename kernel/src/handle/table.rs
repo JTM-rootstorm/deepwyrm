@@ -622,18 +622,6 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
     ///
     /// Any reservation/table drift is a kernel ownership bug rather than a
     /// recoverable userspace condition.
-    pub(crate) fn publish_reserved_pair(
-        &mut self,
-        mut reservation: HandlePairReservation,
-        first: HandleRef,
-        second: HandleRef,
-    ) -> [DwHandle; 2] {
-        self.try_publish_reserved_pair(&mut reservation, first, second)
-            .unwrap_or_else(|failure| {
-                panic!("reserved pair publication failed: {:?}", failure.error())
-            })
-    }
-
     pub(crate) fn try_publish_reserved_pair(
         &mut self,
         reservation: &mut HandlePairReservation,
@@ -1126,14 +1114,6 @@ impl PreparedHandleMove {
         Ok(())
     }
 
-    pub(crate) fn extract<const CAPACITY: usize>(
-        mut self,
-        table: &mut HandleTable<CAPACITY>,
-    ) -> (PreparedHandleMoveRollback, HandleTransferToken) {
-        self.try_extract(table)
-            .unwrap_or_else(|error| panic!("prepared move extraction failed: {error:?}"))
-    }
-
     pub(crate) fn try_extract<const CAPACITY: usize>(
         &mut self,
         table: &mut HandleTable<CAPACITY>,
@@ -1181,11 +1161,6 @@ impl Drop for PreparedHandleMove {
 }
 
 impl PreparedHandleMoveRollback {
-    pub(crate) fn finish<const CAPACITY: usize>(mut self, table: &mut HandleTable<CAPACITY>) {
-        self.try_finish(table)
-            .unwrap_or_else(|error| panic!("prepared move finish failed: {error:?}"));
-    }
-
     pub(crate) fn try_finish<const CAPACITY: usize>(
         &mut self,
         table: &mut HandleTable<CAPACITY>,
@@ -1201,16 +1176,6 @@ impl PreparedHandleMoveRollback {
         slot.reservation = None;
         self.completed = true;
         Ok(())
-    }
-
-    pub(crate) fn rollback<const CAPACITY: usize>(
-        mut self,
-        table: &mut HandleTable<CAPACITY>,
-        token: HandleTransferToken,
-    ) {
-        self.try_rollback(table, token).unwrap_or_else(|failure| {
-            panic!("prepared move rollback failed: {:?}", failure.error())
-        });
     }
 
     pub(crate) fn try_rollback<const CAPACITY: usize>(
@@ -1483,21 +1448,6 @@ impl HandleTransferReservation {
 
     /// Publishes a kernel-owned factory reference into a previously reserved
     /// child slot without routing it through a userspace MOVE source.
-    pub(crate) fn publish_reference<const CAPACITY: usize>(
-        mut self,
-        table: &mut HandleTable<CAPACITY>,
-        reference: HandleRef,
-        rights: DwRights,
-    ) -> PublishedHandleInfo {
-        self.try_publish_reference(table, reference, rights)
-            .unwrap_or_else(|failure| {
-                panic!(
-                    "factory destination publication failed: {:?}",
-                    failure.error()
-                )
-            })
-    }
-
     pub(crate) fn try_publish_reference<const CAPACITY: usize>(
         &mut self,
         table: &mut HandleTable<CAPACITY>,
@@ -1534,19 +1484,6 @@ impl HandleTransferReservation {
             .expect("validated factory destination reservation publishes");
         self.completed = true;
         Ok(info)
-    }
-
-    pub(crate) fn publish<const CAPACITY: usize>(
-        mut self,
-        table: &mut HandleTable<CAPACITY>,
-        token: HandleTransferToken,
-    ) -> PublishedHandleInfo {
-        self.try_publish(table, token).unwrap_or_else(|failure| {
-            panic!(
-                "transfer destination publication failed: {:?}",
-                failure.error()
-            )
-        })
     }
 
     pub(crate) fn try_publish<const CAPACITY: usize>(
@@ -1611,20 +1548,6 @@ impl TypedHandlePairReservation {
         }
         self.completed = true;
         Ok(())
-    }
-
-    pub(crate) fn publish<const CAPACITY: usize>(
-        mut self,
-        table: &mut HandleTable<CAPACITY>,
-        references: [HandleRef; 2],
-    ) -> [DwHandle; 2] {
-        self.try_publish(table, references)
-            .unwrap_or_else(|failure| {
-                panic!(
-                    "typed destination publication failed: {:?}",
-                    failure.error()
-                )
-            })
     }
 
     pub(crate) fn try_publish<const CAPACITY: usize>(

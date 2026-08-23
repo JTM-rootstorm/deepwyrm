@@ -730,16 +730,24 @@ where
         let child_reference = self.channel_refs[1]
             .take()
             .expect("primordial child Channel reference retained");
-        self.child_channel
+        let mut child_reservation = self
+            .child_channel
             .take()
-            .expect("primordial child handle slot reserved")
-            .publish_reference(
+            .expect("primordial child handle slot reserved");
+        child_reservation
+            .try_publish_reference(
                 self.tasks
                     .process_handles_mut(process_key)
                     .expect("prepared Process handle table remains live"),
                 child_reference,
                 CHILD_CHANNEL_RIGHTS,
-            );
+            )
+            .unwrap_or_else(|failure| {
+                panic!(
+                    "primordial child destination permit diverged: {:?}",
+                    failure.error()
+                )
+            });
 
         let mut stager = HandleTable::<3>::new();
         let root_handle = stager
@@ -868,7 +876,20 @@ where
                 .cancel_send(reservation)
                 .expect("primordial INIT reservation cancels");
         }
-        self.child_channel = None;
+        if let Some(mut reservation) = self.child_channel.take() {
+            let process = self
+                .process
+                .as_ref()
+                .expect("reserved primordial child slot retains its Process")
+                .key();
+            reservation
+                .cancel(
+                    self.tasks
+                        .process_handles_mut(process)
+                        .expect("prepared primordial Process handle table remains live"),
+                )
+                .expect("primordial child destination permit remains exact");
+        }
         self.capability_stage_ready = false;
         if let Some(reference) = self.loader_task_group.take() {
             assert!(
