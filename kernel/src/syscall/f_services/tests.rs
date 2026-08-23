@@ -1260,3 +1260,24 @@ fn prepared_dispatch_rejects_root_drift_before_usercopy_or_authority_borrow() {
         Err(FServiceDispatchPhaseError::IdentityDrift)
     ));
 }
+
+#[test]
+fn prepared_dispatch_rejects_root_drift_at_the_post_usercopy_commit() {
+    let fixture = Fixture::new();
+    let prepared = fixture
+        .services
+        .prepare_dispatch(
+            NativeSyscallRequest::ClockGet {
+                clock_id: deepwyrm_abi::DW_CLOCK_BOOTTIME,
+                out_nanoseconds: DwUserAddress(BASE),
+            },
+            fixture.thread,
+            7,
+        )
+        .unwrap();
+    let (_request, commit) = prepared.begin(fixture.thread, 7).unwrap();
+    assert_eq!(
+        commit.finish(fixture.thread, 8),
+        Err(FServiceDispatchPhaseError::IdentityDrift)
+    );
+}
