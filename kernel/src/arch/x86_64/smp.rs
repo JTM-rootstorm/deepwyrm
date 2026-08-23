@@ -7,7 +7,7 @@
 
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
-use super::acpi::MAX_DW0_CPUS;
+pub(crate) const H1_RUNTIME_CPU_CAPACITY: usize = 4;
 
 pub(crate) const PAGE_SIZE: u64 = 4096;
 pub(crate) const AP_TRAMPOLINE_LIMIT: u64 = 0x10_0000;
@@ -163,6 +163,163 @@ pub(crate) enum CpuStateError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CpuRegistryError {
+    EmptyTopology,
+    Capacity { observed: usize },
+    DuplicateLocalApicId(u8),
+    InvalidCpuIndex(usize),
+    LocalApicMismatch { expected: u8, observed: u8 },
+    State(CpuStateError),
+    Timeout,
+    Failed(u32),
+}
+
+pub(crate) struct CpuRegistry {
+    slots: [CpuSlotState; H1_RUNTIME_CPU_CAPACITY],
+    discovered: AtomicU8,
+}
+
+impl CpuRegistry {
+    pub(crate) const fn new() -> Self {
+        Self {
+            slots: [const { CpuSlotState::new() }; H1_RUNTIME_CPU_CAPACITY],
+            discovered: AtomicU8::new(0),
+        }
+    }
+
+    /// Publishes the canonical BSP-first APIC-ID prefix exactly once.
+    pub(crate) fn discover(&self, local_apic_ids: &[u8]) -> Result<(), CpuRegistryError> {
+        if local_apic_ids.is_empty() {
+            return Err(CpuRegistryError::EmptyTopology);
+        }
+        if local_apic_ids.len() > H1_RUNTIME_CPU_CAPACITY {
+            return Err(CpuRegistryError::Capacity {
+                observed: local_apic_ids.len(),
+            });
+        }
+        for (index, id) in local_apic_ids.iter().copied().enumerate() {
+            if local_apic_ids[..index].contains(&id) {
+                return Err(CpuRegistryError::DuplicateLocalApicId(id));
+            }
+        }
+        self.discovered
+            .compare_exchange(0, u8::MAX, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|observed| {
+                CpuRegistryError::State(CpuStateError::UnexpectedState(observed))
+            })?;
+        for (index, id) in local_apic_ids.iter().copied().enumerate() {
+            self.slots[index]
+                .discover(id)
+                .map_err(CpuRegistryError::State)?;
+        }
+        self.discovered.store(
+            u8::try_from(local_apic_ids.len()).unwrap(),
+            Ordering::Release,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        usize::from(self.discovered.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn begin_start(&self, cpu_index: usize) -> Result<(), CpuRegistryError> {
+        if cpu_index >= self.len() {
+            return Err(CpuRegistryError::InvalidCpuIndex(cpu_index));
+        }
+        self.slots[cpu_index]
+            .begin_start()
+            .map_err(CpuRegistryError::State)
+    }
+
+    pub(crate) fn publish_online(
+        &self,
+        cpu_index: usize,
+        local_apic_id: u8,
+        generation: u64,
+    ) -> Result<(), CpuRegistryError> {
+        let snapshot = self.snapshot(cpu_index)?;
+        if snapshot.local_apic_id != local_apic_id {
+            return Err(CpuRegistryError::LocalApicMismatch {
+                expected: snapshot.local_apic_id,
+                observed: local_apic_id,
+            });
+        }
+        self.slots[cpu_index]
+            .publish_online(generation)
+            .map_err(CpuRegistryError::State)
+    }
+
+    pub(crate) fn park(&self, cpu_index: usize) -> Result<(), CpuRegistryError> {
+        if cpu_index >= self.len() {
+            return Err(CpuRegistryError::InvalidCpuIndex(cpu_index));
+        }
+        self.slots[cpu_index]
+            .park()
+            .map_err(CpuRegistryError::State)
+    }
+
+    pub(crate) fn snapshot(&self, cpu_index: usize) -> Result<CpuStateSnapshot, CpuRegistryError> {
+        if cpu_index >= self.len() {
+            return Err(CpuRegistryError::InvalidCpuIndex(cpu_index));
+        }
+        self.slots[cpu_index]
+            .snapshot()
+            .map_err(CpuRegistryError::State)
+    }
+
+    pub(crate) fn wait_until_parked(
+        &self,
+        cpu_index: usize,
+        poll_limit: usize,
+    ) -> Result<CpuStateSnapshot, CpuRegistryError> {
+        if poll_limit == 0 {
+            return Err(CpuRegistryError::Timeout);
+        }
+        for _ in 0..poll_limit {
+            let snapshot = self.snapshot(cpu_index)?;
+            match snapshot.lifecycle {
+                CpuLifecycle::Parked => return Ok(snapshot),
+                CpuLifecycle::Failed => {
+                    return Err(CpuRegistryError::Failed(snapshot.failure_reason));
+                }
+                _ => core::hint::spin_loop(),
+            }
+        }
+        Err(CpuRegistryError::Timeout)
+    }
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+static LIVE_CPU_REGISTRY: CpuRegistry = CpuRegistry::new();
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn configure_live_cpu_registry(
+    topology: &super::acpi::CpuTopology,
+) -> Result<(), CpuRegistryError> {
+    if topology.len() > H1_RUNTIME_CPU_CAPACITY {
+        return Err(CpuRegistryError::Capacity {
+            observed: topology.len(),
+        });
+    }
+    let mut ids = [0_u8; H1_RUNTIME_CPU_CAPACITY];
+    for (index, entry) in topology.entries().enumerate() {
+        if usize::from(entry.logical_index()) != index {
+            return Err(CpuRegistryError::InvalidCpuIndex(usize::from(
+                entry.logical_index(),
+            )));
+        }
+        ids[index] = entry.local_apic_id();
+    }
+    LIVE_CPU_REGISTRY.discover(&ids[..topology.len()])
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn live_cpu_registry() -> &'static CpuRegistry {
+    &LIVE_CPU_REGISTRY
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct GuardedStack {
     pub(crate) guard: u64,
     pub(crate) bottom: u64,
@@ -182,7 +339,7 @@ impl PerCpuStackLayout {
         arena_start: u64,
         cpu_index: usize,
     ) -> Result<Self, PerCpuLayoutError> {
-        if cpu_index >= MAX_DW0_CPUS || !arena_start.is_multiple_of(PAGE_SIZE) {
+        if cpu_index >= H1_RUNTIME_CPU_CAPACITY || !arena_start.is_multiple_of(PAGE_SIZE) {
             return Err(PerCpuLayoutError::InvalidInput);
         }
         let slot_start = (cpu_index as u64)
@@ -210,7 +367,7 @@ impl PerCpuStackLayout {
     }
 
     pub(crate) const fn arena_bytes() -> u64 {
-        STACKS_PER_CPU_BYTES * MAX_DW0_CPUS as u64
+        STACKS_PER_CPU_BYTES * H1_RUNTIME_CPU_CAPACITY as u64
     }
 }
 
@@ -321,7 +478,7 @@ pub(crate) fn build_trampoline_image(
     if usize::from(plan.byte_len) != template.len() {
         return Err(TrampolineImageError::PlanMismatch);
     }
-    if cpu_index == 0 || cpu_index >= MAX_DW0_CPUS {
+    if cpu_index == 0 || cpu_index >= H1_RUNTIME_CPU_CAPACITY {
         return Err(TrampolineImageError::InvalidCpu);
     }
     if stack_top < 0xffff_8000_0000_0000 || !stack_top.is_multiple_of(16) {
@@ -474,7 +631,7 @@ mod tests {
         let base = 0xffff_9000_0000_0000;
         assert_eq!(
             PerCpuStackLayout::arena_bytes(),
-            STACKS_PER_CPU_BYTES * MAX_DW0_CPUS as u64
+            STACKS_PER_CPU_BYTES * H1_RUNTIME_CPU_CAPACITY as u64
         );
         let first = PerCpuStackLayout::from_arena(base, 0).unwrap();
         let second = PerCpuStackLayout::from_arena(base, 1).unwrap();
@@ -553,6 +710,42 @@ mod tests {
         assert_eq!(
             build_trampoline_image(&mut page, &template, layout, plan, 0, 0, 0),
             Err(TrampolineImageError::InvalidCpu)
+        );
+    }
+
+    #[test]
+    fn cpu_registry_is_bsp_first_bounded_and_release_publishes_parked_aps() {
+        let registry = CpuRegistry::new();
+        assert_eq!(registry.discover(&[]), Err(CpuRegistryError::EmptyTopology));
+        assert_eq!(
+            registry.discover(&[0, 1, 2, 3, 4]),
+            Err(CpuRegistryError::Capacity { observed: 5 })
+        );
+        assert_eq!(
+            registry.discover(&[2, 2]),
+            Err(CpuRegistryError::DuplicateLocalApicId(2))
+        );
+        registry.discover(&[2, 4, 7, 9]).unwrap();
+        assert_eq!(registry.len(), 4);
+        registry.begin_start(0).unwrap();
+        registry.publish_online(0, 2, 1).unwrap();
+        registry.begin_start(1).unwrap();
+        assert_eq!(
+            registry.publish_online(1, 5, 1),
+            Err(CpuRegistryError::LocalApicMismatch {
+                expected: 4,
+                observed: 5,
+            })
+        );
+        registry.publish_online(1, 4, 1).unwrap();
+        registry.park(1).unwrap();
+        assert_eq!(
+            registry.wait_until_parked(1, 1).unwrap().lifecycle,
+            CpuLifecycle::Parked
+        );
+        assert_eq!(
+            registry.wait_until_parked(2, 1),
+            Err(CpuRegistryError::Timeout)
         );
     }
 }

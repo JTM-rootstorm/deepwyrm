@@ -601,6 +601,41 @@ pub(crate) fn bsp_local_apic_identity() -> Result<(u8, u64), LiveTimeError> {
     Ok((id, state.apic.discovery().physical_base()))
 }
 
+/// Initializes the current application processor's xAPIC through the BSP's
+/// already-established permanent UC mapping. The scheduler timer remains
+/// masked under the H0 designated-timer-CPU policy.
+pub(crate) fn initialize_ap_local_apic(
+    expected_apic_id: u8,
+    expected_physical_base: u64,
+) -> Result<(), LiveTimeError> {
+    let discovery = discover_local_apic().map_err(|_| LiveTimeError::ApicDiscovery)?;
+    if discovery.is_bootstrap_processor()
+        || discovery.mode() == ApicMode::X2Apic
+        || discovery.physical_base() != expected_physical_base
+    {
+        return Err(LiveTimeError::ApicMode);
+    }
+    let virtual_base = {
+        let state = live_state().ok_or(LiveTimeError::Clock)?;
+        state.lock().registers.base()
+    };
+    let mut apic = LocalApic::discovered(discovery, LocalApicVectors::DW0);
+    if discovery.mode() == ApicMode::Disabled {
+        apic.enable_xapic(&mut LiveApicBaseMsr)
+            .map_err(|_| LiveTimeError::ApicAccess)?;
+    }
+    let mut registers = LiveXApicMmio::new(virtual_base).map_err(|_| LiveTimeError::ApicMapping)?;
+    apic.prepare(&mut registers)
+        .map_err(|_| LiveTimeError::ApicAccess)?;
+    if apic.apic_id() != Some(expected_apic_id) {
+        return Err(LiveTimeError::ApicAccess);
+    }
+    apic.bring_online(&mut registers)
+        .map_err(|_| LiveTimeError::ApicAccess)?;
+    apic.configure_one_shot_timer(&mut registers)
+        .map_err(|_| LiveTimeError::ApicAccess)
+}
+
 pub(crate) fn send_bsp_ipi(destination: u8, operation: IpiOperation) -> Result<(), LiveTimeError> {
     let state = live_state().ok_or(LiveTimeError::Clock)?;
     let mut state = state.lock();

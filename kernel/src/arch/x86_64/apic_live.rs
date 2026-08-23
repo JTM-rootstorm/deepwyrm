@@ -47,6 +47,10 @@ impl LiveXApicMmio {
         Ok(Self { base })
     }
 
+    pub(crate) const fn base(&self) -> u64 {
+        self.base
+    }
+
     fn address(&self, offset: u32) -> Result<*mut u32, LiveApicAccessError> {
         if offset >= PAGE_SIZE as u32 || !offset.is_multiple_of(16) {
             return Err(LiveApicAccessError::InvalidRegisterOffset);
