@@ -44,7 +44,8 @@ mod user_access;
 )]
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 pub(crate) use address_space::{
-    ActiveRootSelection, AddressSpaceRootBindings, KernelHalfBinding, PreparedRootSelection,
+    ActiveKernelExecutionRoot, ActiveRootSelection, AddressSpaceRootBindings, KernelExecutionRoot,
+    KernelExecutionRoots, KernelHalfBinding, KernelRootSelectionFailure, PreparedRootSelection,
     RootBindingError, RootSelectionFailure, RootSwitchTarget,
 };
 use graph::*;

@@ -1933,6 +1933,169 @@ fn last_runnable_child_switches_to_primordial_before_owned_root_teardown() {
 #[test]
 #[allow(
     unsafe_code,
+    reason = "synthetic PML4s exercise the architecture-private execution-root switch contract"
+)]
+fn kernel_execution_root_isolated_from_process_bindings_and_switches_both_directions() {
+    let mut roles = synthetic_frame_role_manager::<1, 16>(0x38_000, 8);
+    let primordial_owner = roles.create_table_owner().unwrap();
+    let child_owner = roles.create_table_owner().unwrap();
+    let kernel_owner = roles.create_table_owner().unwrap();
+    let primordial_identity = commit_table(&mut roles, primordial_owner, TableLevel::Pml4, None);
+    let child_identity = commit_table(&mut roles, child_owner, TableLevel::Pml4, None);
+    let kernel_identity = commit_table(&mut roles, kernel_owner, TableLevel::Pml4, None);
+    assert_ne!(kernel_identity.owner(), primordial_identity.owner());
+    assert_ne!(kernel_identity.owner(), child_identity.owner());
+    let capabilities = PagingCapabilities::validate(40, true, true, true).unwrap();
+    let primordial_root = unsafe {
+        PageTableRoot::from_owned_root(primordial_identity.physical_start(), capabilities)
+    }
+    .unwrap();
+    let child_root =
+        unsafe { PageTableRoot::from_owned_root(child_identity.physical_start(), capabilities) }
+            .unwrap();
+    let kernel_root =
+        unsafe { PageTableRoot::from_owned_root(kernel_identity.physical_start(), capabilities) }
+            .unwrap();
+    let (primordial_process, child_process) = process_keys();
+    let mut authority =
+        unsafe { crate::memory::address_region::AddressSpaceAuthority::<2, 2>::new() };
+    let primordial_space = authority.create_address_space().unwrap();
+    let child_space = authority.create_address_space().unwrap();
+    let mut bindings = AddressSpaceRootBindings::<2, 1>::new();
+    bindings
+        .bind_primordial(
+            &roles,
+            primordial_space,
+            primordial_process,
+            &primordial_root,
+            primordial_identity,
+        )
+        .unwrap();
+    bindings
+        .bind_owned(
+            &roles,
+            child_space,
+            child_process,
+            child_root,
+            child_identity,
+        )
+        .unwrap_or_else(|_| panic!("child root binding succeeds"));
+    let cpu = CpuIndex::BOOTSTRAP;
+    let mut execution_roots = KernelExecutionRoots::<1>::new();
+    execution_roots
+        .bind(cpu, kernel_root, kernel_identity)
+        .unwrap();
+    assert_eq!(execution_roots.get(cpu).unwrap().cpu(), cpu);
+    assert_eq!(
+        bindings
+            .root_for_process(&primordial_root, child_process)
+            .unwrap()
+            .1,
+        child_identity
+    );
+
+    let mut switches = RecordedRootSwitches {
+        cpu: Some(cpu),
+        roots: Vec::new(),
+    };
+    let child = bindings
+        .activate_selection(
+            bindings
+                .prepare_selection(cpu, child_process, child_space)
+                .unwrap(),
+            None,
+            &mut switches,
+        )
+        .unwrap_or_else(|failure| panic!("initial Process switch failed: {:?}", failure.error()));
+    let kernel = bindings
+        .activate_kernel_execution_root(execution_roots.get(cpu).unwrap(), child, &mut switches)
+        .unwrap();
+    assert_eq!(kernel.cpu(), cpu);
+    assert_eq!(
+        kernel.root_physical_start(),
+        kernel_identity.physical_start()
+    );
+
+    let child = bindings
+        .activate_from_kernel_execution_root(
+            bindings
+                .prepare_selection(cpu, child_process, child_space)
+                .unwrap(),
+            kernel,
+            &mut switches,
+        )
+        .unwrap_or_else(|failure| panic!("kernel-to-Process switch failed: {:?}", failure.error()));
+    assert!(child.selects_exact(cpu, child_process, child_space));
+    assert_eq!(
+        switches.roots,
+        [
+            child_identity.physical_start(),
+            kernel_identity.physical_start(),
+            child_identity.physical_start(),
+        ]
+    );
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "synthetic CPU mismatch proves kernel-to-Process pre-CR3 token recovery"
+)]
+fn kernel_execution_root_switch_recovers_tokens_before_cr3_on_cpu_mismatch() {
+    let mut roles = synthetic_frame_role_manager::<1, 12>(0x3a_000, 6);
+    let process_owner = roles.create_table_owner().unwrap();
+    let kernel_owner = roles.create_table_owner().unwrap();
+    let process_identity = commit_table(&mut roles, process_owner, TableLevel::Pml4, None);
+    let kernel_identity = commit_table(&mut roles, kernel_owner, TableLevel::Pml4, None);
+    let capabilities = PagingCapabilities::validate(40, true, true, true).unwrap();
+    let process_root =
+        unsafe { PageTableRoot::from_owned_root(process_identity.physical_start(), capabilities) }
+            .unwrap();
+    let kernel_root =
+        unsafe { PageTableRoot::from_owned_root(kernel_identity.physical_start(), capabilities) }
+            .unwrap();
+    let (process, _) = process_keys();
+    let mut authority =
+        unsafe { crate::memory::address_region::AddressSpaceAuthority::<1, 1>::new() };
+    let address_space = authority.create_address_space().unwrap();
+    let mut bindings = AddressSpaceRootBindings::<1, 2>::new();
+    bindings
+        .bind_owned(
+            &roles,
+            address_space,
+            process,
+            process_root,
+            process_identity,
+        )
+        .unwrap_or_else(|_| panic!("process binding succeeds"));
+    let cpu0 = CpuIndex::BOOTSTRAP;
+    let cpu1 = CpuIndex::new(1).unwrap();
+    let mut execution_roots = KernelExecutionRoots::<2>::new();
+    execution_roots
+        .bind(cpu0, kernel_root, kernel_identity)
+        .unwrap();
+    let mut switches = RecordedRootSwitches {
+        cpu: Some(cpu1),
+        roots: Vec::new(),
+    };
+    let prepared = bindings
+        .prepare_selection(cpu0, process, address_space)
+        .unwrap();
+    let kernel = execution_roots.get(cpu0).unwrap().test_assume_active();
+    let failure = bindings
+        .activate_from_kernel_execution_root(prepared, kernel, &mut switches)
+        .unwrap_err();
+    let (error, prepared, recovered_kernel) = failure.into_parts();
+    assert_eq!(error, RootBindingError::CpuMismatch);
+    assert_eq!(recovered_kernel.cpu(), cpu0);
+    assert_eq!(prepared.cpu(), cpu0);
+    assert!(switches.roots.is_empty());
+    bindings.abandon_selection(prepared).unwrap();
+}
+
+#[test]
+#[allow(
+    unsafe_code,
     reason = "synthetic scheduler siblings exercise retained move-only root ownership without live CR3 access"
 )]
 fn same_process_sibling_switch_retains_exact_active_root_selection() {

@@ -108,6 +108,95 @@ enum RootStorage {
     Owned(PageTableRoot),
 }
 
+/// One architecture-private PML4 retained by exactly one fixed CPU slot.
+///
+/// It deliberately cannot name a portable address space or Process.  The low
+/// half stays empty and its typed kernel half is copied from `KernelHalfBinding`
+/// during construction.  Unlike a Process root it has no residency domain and
+/// is never passed to usercopy, publishing, teardown, or normal reclamation.
+#[derive(Debug)]
+pub(crate) struct KernelExecutionRoot {
+    cpu: CpuIndex,
+    root: PageTableRoot,
+    identity: TableIdentity,
+}
+
+impl KernelExecutionRoot {
+    pub(crate) const fn cpu(&self) -> CpuIndex {
+        self.cpu
+    }
+
+    pub(crate) const fn root_physical_start(&self) -> u64 {
+        self.identity.physical_start()
+    }
+
+    pub(crate) const fn identity(&self) -> TableIdentity {
+        self.identity
+    }
+}
+
+/// Fixed, permanently retained execution roots indexed only by `CpuIndex`.
+pub(crate) struct KernelExecutionRoots<const CPUS: usize> {
+    roots: [Option<KernelExecutionRoot>; CPUS],
+}
+
+impl<const CPUS: usize> KernelExecutionRoots<CPUS> {
+    pub(crate) const fn new() -> Self {
+        assert!(CPUS > 0, "kernel execution-root capacity must be nonzero");
+        Self {
+            roots: [const { None }; CPUS],
+        }
+    }
+
+    pub(crate) fn bind(
+        &mut self,
+        cpu: CpuIndex,
+        root: PageTableRoot,
+        identity: TableIdentity,
+    ) -> Result<(), RootBindingError> {
+        if identity.level() != TableLevel::Pml4
+            || identity.physical_start() != root.frame().address()
+            || cpu.index() >= CPUS
+        {
+            return Err(RootBindingError::RootMismatch);
+        }
+        if self
+            .roots
+            .get(cpu.index())
+            .ok_or(RootBindingError::RootMismatch)?
+            .is_some()
+        {
+            return Err(RootBindingError::AlreadyActive);
+        }
+        if self
+            .roots
+            .iter()
+            .flatten()
+            .any(|existing| existing.identity == identity || existing.root.frame() == root.frame())
+        {
+            return Err(RootBindingError::RootMismatch);
+        }
+        let slot = self
+            .roots
+            .get_mut(cpu.index())
+            .expect("preflighted kernel execution-root slot disappeared");
+        *slot = Some(KernelExecutionRoot {
+            cpu,
+            root,
+            identity,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn get(&self, cpu: CpuIndex) -> Result<&KernelExecutionRoot, RootBindingError> {
+        self.roots
+            .get(cpu.index())
+            .and_then(Option::as_ref)
+            .filter(|root| root.cpu == cpu)
+            .ok_or(RootBindingError::Missing)
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the bounded recursive walk carries distinct target, role, proof, physical-limit, and atomic-batch authorities"
@@ -430,6 +519,95 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
         })
     }
 
+    /// Switches one CPU from an exact Process root to its retained
+    /// architecture-private execution root. The Process residency is cleared
+    /// only after the kernel-root CR3 load and local serialization.
+    pub(crate) fn activate_kernel_execution_root<T: RootSwitchTarget>(
+        &self,
+        kernel: &KernelExecutionRoot,
+        previous: ActiveRootSelection,
+        target: &mut T,
+    ) -> Result<ActiveKernelExecutionRoot, (RootBindingError, ActiveRootSelection)> {
+        let preflight = || {
+            if target.current_cpu() != Some(kernel.cpu) || previous.residency.cpu() != kernel.cpu {
+                return Err(RootBindingError::CpuMismatch);
+            }
+            let binding = self.binding(previous.process, previous.address_space)?;
+            if binding.identity != previous.identity
+                || binding.identity.physical_start() != previous.root
+            {
+                return Err(RootBindingError::RootMismatch);
+            }
+            binding
+                .coherency
+                .preflight_leave_after_local_flush(&previous.residency)?;
+            Ok(binding)
+        };
+        let binding = match preflight() {
+            Ok(binding) => binding,
+            Err(error) => return Err((error, previous)),
+        };
+        target.load_cr3_full_flush(kernel.identity.physical_start());
+        binding
+            .coherency
+            .leave_after_local_flush(previous.residency)
+            .unwrap_or_else(|error| {
+                panic!("preflighted Process residency drifted after kernel-root CR3: {error:?}")
+            });
+        Ok(ActiveKernelExecutionRoot {
+            cpu: kernel.cpu,
+            root: kernel.identity.physical_start(),
+            identity: kernel.identity,
+        })
+    }
+
+    /// Switches one CPU from its retained execution root to a prepared Process
+    /// root. The prepared Process residency is already published before CR3;
+    /// execution roots have no residency and remain permanently retained.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the allocation-free failure path must return both move-only selection tokens"
+    )]
+    pub(crate) fn activate_from_kernel_execution_root<T: RootSwitchTarget>(
+        &self,
+        prepared: PreparedRootSelection,
+        previous: ActiveKernelExecutionRoot,
+        target: &mut T,
+    ) -> Result<ActiveRootSelection, KernelRootSelectionFailure> {
+        let preflight = || {
+            if target.current_cpu() != Some(previous.cpu)
+                || prepared.residency.cpu() != previous.cpu
+            {
+                return Err(RootBindingError::CpuMismatch);
+            }
+            let binding = self.binding(prepared.process, prepared.address_space)?;
+            if binding.identity != prepared.identity
+                || binding.identity.physical_start() != prepared.root
+            {
+                return Err(RootBindingError::RootMismatch);
+            }
+            binding
+                .coherency
+                .preflight_leave_after_local_flush(&prepared.residency)?;
+            Ok(())
+        };
+        if let Err(error) = preflight() {
+            return Err(KernelRootSelectionFailure {
+                error,
+                prepared,
+                previous,
+            });
+        }
+        target.load_cr3_full_flush(prepared.root);
+        Ok(ActiveRootSelection {
+            process: prepared.process,
+            address_space: prepared.address_space,
+            root: prepared.root,
+            identity: prepared.identity,
+            residency: prepared.residency,
+        })
+    }
+
     pub(crate) fn abandon_selection(
         &self,
         prepared: PreparedRootSelection,
@@ -620,6 +798,12 @@ pub(crate) struct PreparedRootSelection {
     residency: Residency,
 }
 
+impl PreparedRootSelection {
+    pub(crate) const fn cpu(&self) -> CpuIndex {
+        self.residency.cpu()
+    }
+}
+
 /// Recoverable pre-CR3 rejection with every move-only residency token returned
 /// unchanged. No `RootSelectionFailure` can be constructed after CR3.
 #[must_use = "failed root selection retains the prepared and previous residency owners"]
@@ -653,6 +837,61 @@ pub(crate) struct ActiveRootSelection {
     root: u64,
     identity: TableIdentity,
     residency: Residency,
+}
+
+/// CPU-private token proving that this CPU is executing its retained kernel
+/// execution root. It has no portable address-space identity or residency.
+#[must_use = "kernel execution-root selection must be carried into the next switch"]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ActiveKernelExecutionRoot {
+    cpu: CpuIndex,
+    root: u64,
+    identity: TableIdentity,
+}
+
+impl ActiveKernelExecutionRoot {
+    pub(crate) const fn cpu(&self) -> CpuIndex {
+        self.cpu
+    }
+
+    pub(crate) const fn root_physical_start(&self) -> u64 {
+        self.root
+    }
+}
+
+#[cfg(test)]
+impl KernelExecutionRoot {
+    pub(super) const fn test_assume_active(&self) -> ActiveKernelExecutionRoot {
+        ActiveKernelExecutionRoot {
+            cpu: self.cpu,
+            root: self.identity.physical_start(),
+            identity: self.identity,
+        }
+    }
+}
+
+/// Recoverable kernel->Process pre-CR3 failure retaining both selections.
+#[must_use = "failed kernel-to-process switch retains both selection tokens"]
+pub(crate) struct KernelRootSelectionFailure {
+    error: RootBindingError,
+    prepared: PreparedRootSelection,
+    previous: ActiveKernelExecutionRoot,
+}
+
+impl KernelRootSelectionFailure {
+    pub(crate) const fn error(&self) -> RootBindingError {
+        self.error
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        RootBindingError,
+        PreparedRootSelection,
+        ActiveKernelExecutionRoot,
+    ) {
+        (self.error, self.prepared, self.previous)
+    }
 }
 
 impl ActiveRootSelection {
