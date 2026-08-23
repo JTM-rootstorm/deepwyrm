@@ -13,7 +13,7 @@ use crate::memory::usercopy::{
 pub(crate) enum LiveUserAccessError {
     MissingOrInvalid,
     MapModel(crate::memory::address_region::AddressRegionError),
-    MapPublish,
+    MapPublish(crate::arch::x86_64::mm::X86AddressSpacePublishError<LiveTrackedTargetError>),
     Permission,
     Pin(UserPinError),
 }

@@ -802,9 +802,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
                         crate::memory::address_region::AddressSpaceTransactionError::Model(
                             error,
                         ) => Err(user_access::LiveUserAccessError::MapModel(error)),
-                        crate::memory::address_region::AddressSpaceTransactionError::Publish(_) => {
-                            Err(user_access::LiveUserAccessError::MapPublish)
-                        }
+                        crate::memory::address_region::AddressSpaceTransactionError::Publish(
+                            error,
+                        ) => Err(user_access::LiveUserAccessError::MapPublish(error)),
                     }
                 }
             }
