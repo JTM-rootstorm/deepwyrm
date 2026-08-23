@@ -331,8 +331,10 @@ fn h2_syscall_entry_and_native_runtime_carriers_are_fixed_per_cpu() {
     assert!(runtime_binding.contains("owners: SpinMutex<[usize; SLOTS]>"));
     assert!(runtime_binding.contains("owners.contains(&address)"));
     assert!(runtime_binding.contains("RuntimeCarrierClaimError::ContextAlreadyClaimed"));
-    assert!(live.contains("pub(crate) unsafe trait ParkedNativeRuntimeCarrier"));
-    assert!(live.contains("bind_parked_native_runtime_carrier_for_slot"));
+    assert!(live.contains("RuntimeCarrierLifecycles"));
+    assert!(live.contains("bind_native_runtime_carrier_for_slot"));
+    assert!(live.contains("release_native_runtime_carrier_for_slot"));
+    assert!(live.contains("RuntimeCarrierLifecycle::Executing"));
     assert!(!live.contains("EntryBindingError::NonBootstrapCpu"));
 
     let shared = primordial
@@ -362,9 +364,9 @@ fn h2_syscall_entry_and_native_runtime_carriers_are_fixed_per_cpu() {
         );
     }
     assert!(primordial.contains("struct PrimordialRuntimeCarrier"));
-    assert!(primordial.contains("struct ParkedRuntimeCarrier"));
-    assert!(primordial.contains("bind_parked_runtime_carriers(shared)"));
-    assert!(primordial.contains("ParkedNativeRuntimeCarrier for ParkedRuntimeCarrier"));
+    assert!(primordial.contains("struct RuntimeCarrierFacade"));
+    assert!(primordial.contains("bind_runtime_carrier_facades(shared)"));
+    assert!(primordial.contains("Parked -> Executing gate"));
     assert!(primordial.contains("self.reject_entry(\"fresh userspace entry\")"));
 }
 

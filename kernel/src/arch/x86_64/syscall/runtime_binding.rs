@@ -6,6 +6,77 @@
 //! address can never be published in two slots.
 
 use crate::sync::SpinMutex;
+use core::sync::atomic::{AtomicU8, Ordering};
+
+const CARRIER_UNBOUND: u8 = 0;
+const CARRIER_PARKED: u8 = 1;
+const CARRIER_EXECUTING: u8 = 2;
+
+/// The irreversible publication state for one fixed CPU carrier.
+///
+/// Binding a carrier only makes its identity visible to the CPU-local entry
+/// machinery.  It does not authorize that CPU to execute shared scheduler or
+/// userspace work.  A separate Release/Acquire transition is required after
+/// the complete runtime join has published every dependent authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeCarrierLifecycle {
+    Unbound,
+    Parked,
+    Executing,
+}
+
+pub(super) struct RuntimeCarrierLifecycles<const SLOTS: usize> {
+    states: [AtomicU8; SLOTS],
+}
+
+impl<const SLOTS: usize> RuntimeCarrierLifecycles<SLOTS> {
+    pub(super) const fn new() -> Self {
+        Self {
+            states: [const { AtomicU8::new(CARRIER_UNBOUND) }; SLOTS],
+        }
+    }
+
+    pub(super) fn bind_parked(&self, cpu_index: usize) -> Result<(), RuntimeCarrierClaimError> {
+        let state = self
+            .states
+            .get(cpu_index)
+            .ok_or(RuntimeCarrierClaimError::InvalidSlot)?;
+        state
+            .compare_exchange(
+                CARRIER_UNBOUND,
+                CARRIER_PARKED,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|_| RuntimeCarrierClaimError::SlotAlreadyClaimed)
+    }
+
+    pub(super) fn release(&self, cpu_index: usize) -> Result<(), RuntimeCarrierClaimError> {
+        let state = self
+            .states
+            .get(cpu_index)
+            .ok_or(RuntimeCarrierClaimError::InvalidSlot)?;
+        state
+            .compare_exchange(
+                CARRIER_PARKED,
+                CARRIER_EXECUTING,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|_| RuntimeCarrierClaimError::SlotAlreadyClaimed)
+    }
+
+    pub(super) fn lifecycle(&self, cpu_index: usize) -> Option<RuntimeCarrierLifecycle> {
+        match self.states.get(cpu_index)?.load(Ordering::Acquire) {
+            CARRIER_UNBOUND => Some(RuntimeCarrierLifecycle::Unbound),
+            CARRIER_PARKED => Some(RuntimeCarrierLifecycle::Parked),
+            CARRIER_EXECUTING => Some(RuntimeCarrierLifecycle::Executing),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RuntimeCarrierClaimError {
@@ -134,6 +205,33 @@ mod tests {
         assert_eq!(
             claims.claim(0, core::ptr::null_mut()),
             Err(RuntimeCarrierClaimError::NullContext)
+        );
+    }
+
+    #[test]
+    fn bound_carrier_stays_parked_until_the_single_release_transition() {
+        let lifecycle = RuntimeCarrierLifecycles::<2>::new();
+        assert_eq!(
+            lifecycle.lifecycle(0),
+            Some(RuntimeCarrierLifecycle::Unbound)
+        );
+        assert_eq!(lifecycle.bind_parked(0), Ok(()));
+        assert_eq!(
+            lifecycle.lifecycle(0),
+            Some(RuntimeCarrierLifecycle::Parked)
+        );
+        assert_eq!(lifecycle.release(0), Ok(()));
+        assert_eq!(
+            lifecycle.lifecycle(0),
+            Some(RuntimeCarrierLifecycle::Executing)
+        );
+        assert_eq!(
+            lifecycle.release(0),
+            Err(RuntimeCarrierClaimError::SlotAlreadyClaimed)
+        );
+        assert_eq!(
+            lifecycle.lifecycle(1),
+            Some(RuntimeCarrierLifecycle::Unbound)
         );
     }
 }

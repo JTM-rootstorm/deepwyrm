@@ -106,6 +106,14 @@ impl CpuSlotState {
         self.transition(CpuLifecycle::Online, CpuLifecycle::Parked)
     }
 
+    /// Releases a fully published CPU-local carrier into the common runtime
+    /// lifecycle. The caller must have completed the separate scheduler,
+    /// remote-stop, and TLB-acknowledgement join; this state transition itself
+    /// never wakes the CPU or grants it runnable work.
+    pub(crate) fn begin_execution(&self) -> Result<(), CpuStateError> {
+        self.transition(CpuLifecycle::Parked, CpuLifecycle::Executing)
+    }
+
     pub(crate) fn fail(&self, reason: u32) -> Result<(), CpuStateError> {
         if reason == 0 {
             return Err(CpuStateError::ZeroFailureReason);
@@ -267,6 +275,15 @@ impl CpuRegistry {
         }
         self.slots[cpu_index]
             .park()
+            .map_err(CpuRegistryError::State)
+    }
+
+    pub(crate) fn begin_execution(&self, cpu_index: usize) -> Result<(), CpuRegistryError> {
+        if cpu_index >= self.len() {
+            return Err(CpuRegistryError::InvalidCpuIndex(cpu_index));
+        }
+        self.slots[cpu_index]
+            .begin_execution()
             .map_err(CpuRegistryError::State)
     }
 
@@ -848,6 +865,15 @@ mod tests {
             registry.wait_until_parked(2, 1),
             Err(CpuRegistryError::Timeout)
         );
+        registry.begin_execution(1).unwrap();
+        assert_eq!(
+            registry.snapshot(1).unwrap().lifecycle,
+            CpuLifecycle::Executing
+        );
+        assert!(matches!(
+            registry.begin_execution(1),
+            Err(CpuRegistryError::State(CpuStateError::UnexpectedState(_)))
+        ));
     }
 
     #[test]

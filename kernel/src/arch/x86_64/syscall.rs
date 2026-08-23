@@ -36,11 +36,11 @@ pub(crate) use super::exceptions::{
     reason = "E4 target entry is wired into primordial runtime and E5 syscall adapters in later E work"
 )]
 pub(crate) use live::{
-    ParkedNativeRuntimeCarrier, SyscallInstallError, bind_current_thread_stack,
-    bind_native_runtime_user_exception_handler, bind_parked_native_runtime_carrier_for_slot,
-    current_binding_generation, current_cpu_index_for_diagnostics, enter_bound_validated_user,
-    enter_native_syscall_runtime, first_run_thread_entry_rip, install_syscall_boundary,
-    install_syscall_boundary_for_slot, validate_live_syscall_boundary,
+    SyscallInstallError, bind_current_thread_stack, bind_native_runtime_carrier_for_slot,
+    bind_native_runtime_user_exception_handler, current_binding_generation,
+    current_cpu_index_for_diagnostics, enter_bound_validated_user, enter_native_syscall_runtime,
+    first_run_thread_entry_rip, install_syscall_boundary, install_syscall_boundary_for_slot,
+    release_native_runtime_carrier_for_slot, validate_live_syscall_boundary,
 };
 
 #[cfg(test)]

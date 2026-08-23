@@ -14,7 +14,10 @@ use super::msr::{
     SyscallMsrPlanError, SyscallMsrProgramError, normalize_cr0_for_e5, normalize_cr4_for_e4,
     program_and_verify, verify,
 };
-use super::runtime_binding::{RuntimeCarrierClaimError, RuntimeCarrierClaims};
+use super::runtime_binding::{
+    RuntimeCarrierClaimError, RuntimeCarrierClaims, RuntimeCarrierLifecycle,
+    RuntimeCarrierLifecycles,
+};
 
 const INSTALL_UNSTARTED: u8 = 0;
 const INSTALLING: u8 = 1;
@@ -99,6 +102,9 @@ static RUNTIME: [RuntimeStorage; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT]
 static RUNTIME_CARRIER_CLAIMS: RuntimeCarrierClaims<
     { crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT },
 > = RuntimeCarrierClaims::new();
+static RUNTIME_CARRIER_LIFECYCLES: RuntimeCarrierLifecycles<
+    { crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT },
+> = RuntimeCarrierLifecycles::new();
 
 const TERMINAL_ACTION_EMPTY: u8 = 0;
 const TERMINAL_ACTION_WRITING: u8 = 1;
@@ -162,24 +168,6 @@ pub(crate) enum EntryBindingError {
     BoundaryNotInstalled,
     ForeignKernelStack,
     GenerationExhausted,
-}
-
-/// Marker for a CPU-local runtime carrier bound while its CPU remains parked
-/// in CPL0.
-///
-/// # Safety
-///
-/// Every [`crate::syscall::native::NativeSyscallFrameRuntime`] entry on the
-/// implementation must diverge without entering userspace or mutably accessing
-/// shared runtime state. Its backing storage must remain pinned and unavailable
-/// to safe Rust after publication.
-#[allow(
-    unsafe_code,
-    reason = "the marker makes the fail-closed callback and sealed static-storage obligations explicit at each implementation"
-)]
-pub(crate) unsafe trait ParkedNativeRuntimeCarrier:
-    crate::syscall::native::NativeSyscallFrameRuntime
-{
 }
 
 struct LiveMsrAccess;
@@ -616,7 +604,7 @@ pub(crate) unsafe fn bind_current_thread_stack(
     Ok(next)
 }
 
-/// Publishes a fail-closed carrier for an installed CPU that is still parked
+/// Publishes a stationary carrier for an installed CPU while it remains parked
 /// in CPL0.
 ///
 /// This establishes the bounded per-CPU runtime identity before later H2
@@ -625,16 +613,18 @@ pub(crate) unsafe fn bind_current_thread_stack(
 ///
 /// # Safety
 ///
-/// `runtime` must satisfy [`ParkedNativeRuntimeCarrier`] for the full kernel
-/// lifetime. The caller must prove that `cpu_index` cannot execute userspace
-/// or otherwise reach the carrier callbacks during publication, and must never
-/// recover another reference to its sealed static storage.
+/// `runtime` must remain stationary for the full kernel lifetime. The caller
+/// must prove that `cpu_index` cannot execute userspace or otherwise reach the
+/// carrier callbacks during publication, and must never recover another
+/// reference to its sealed static storage. Binding only publishes a `Parked`
+/// lifecycle state; a later explicit release is required before dispatch can
+/// observe the binding.
 #[allow(
     unsafe_code,
     reason = "one-shot AP carrier binding erases a unique pinned static address only after the CPU-private boundary is installed"
 )]
-pub(crate) unsafe fn bind_parked_native_runtime_carrier_for_slot<
-    R: ParkedNativeRuntimeCarrier + 'static,
+pub(crate) unsafe fn bind_native_runtime_carrier_for_slot<
+    R: crate::syscall::native::NativeSyscallFrameRuntime + 'static,
 >(
     cpu_index: crate::cpu::CpuIndex,
     mut runtime: Pin<&'static mut R>,
@@ -657,7 +647,30 @@ pub(crate) unsafe fn bind_parked_native_runtime_carrier_for_slot<
             native_runtime_fresh_thread::<R>,
             native_runtime_user_exception::<R>,
         )
+    }?;
+    RUNTIME_CARRIER_LIFECYCLES
+        .bind_parked(cpu_index)
+        .map_err(|_| SyscallRuntimeBindError::AlreadyBound)
+}
+
+/// Releases one already-bound carrier after the complete SMP runtime join.
+///
+/// This intentionally does not wake an AP, choose runnable work, or publish
+/// scheduler ownership. The H2 join must establish remote-stop and TLB
+/// acknowledgement before it invokes this final gate on a non-BSP CPU.
+pub(crate) fn release_native_runtime_carrier_for_slot(
+    cpu: crate::cpu::CpuIndex,
+) -> Result<(), SyscallRuntimeBindError> {
+    let cpu_index = cpu.index();
+    if RUNTIME_STATE
+        .get(cpu_index)
+        .is_none_or(|state| state.load(Ordering::Acquire) != RUNTIME_BOUND)
+    {
+        return Err(SyscallRuntimeBindError::BoundaryNotInstalled);
     }
+    RUNTIME_CARRIER_LIFECYCLES
+        .release(cpu_index)
+        .map_err(|_| SyscallRuntimeBindError::AlreadyBound)
 }
 
 #[allow(
@@ -734,6 +747,9 @@ unsafe fn publish_syscall_runtime(
 fn runtime_binding() -> Option<RuntimeBindingState> {
     let cpu_index = current_cpu_index_for_diagnostics()?;
     if RUNTIME_STATE.get(cpu_index)?.load(Ordering::Acquire) != RUNTIME_BOUND {
+        return None;
+    }
+    if RUNTIME_CARRIER_LIFECYCLES.lifecycle(cpu_index) != Some(RuntimeCarrierLifecycle::Executing) {
         return None;
     }
     let storage = RUNTIME.get(cpu_index)?;
@@ -1143,6 +1159,11 @@ impl<'runtime, R: crate::syscall::native::NativeSyscallFrameRuntime>
             )
         }
         .unwrap_or_else(|_| halt_forever());
+        RUNTIME_CARRIER_LIFECYCLES
+            .bind_parked(cpu_index)
+            .unwrap_or_else(|_| halt_forever());
+        let cpu = crate::cpu::CpuIndex::new(cpu_index).unwrap_or_else(|| halt_forever());
+        release_native_runtime_carrier_for_slot(cpu).unwrap_or_else(|_| halt_forever());
         unsafe { iret_validated_user(state) }
     }
 }

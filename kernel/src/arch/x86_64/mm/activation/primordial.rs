@@ -373,12 +373,18 @@ unsafe impl Sync for SharedRuntimeStorage {}
 static SHARED_RUNTIME_STATE: AtomicU8 = AtomicU8::new(0);
 static SHARED_RUNTIME_STORAGE: SharedRuntimeStorage = SharedRuntimeStorage::new();
 
-struct ParkedRuntimeCarrier {
+/// Fixed CPU-local façade over the stationary runtime authorities.
+///
+/// It is bound before AP release but deliberately has no execution path until
+/// the serialized H2 join can prove remote-stop and shootdown acknowledgements.
+/// The syscall binding lifecycle, rather than a replaceable callback pointer,
+/// is the one-way Parked -> Executing gate.
+struct RuntimeCarrierFacade {
     cpu: crate::cpu::CpuIndex,
     _shared: &'static PrimordialRuntimeShared,
 }
 
-impl ParkedRuntimeCarrier {
+impl RuntimeCarrierFacade {
     fn reject_entry(&self, operation: &'static str) -> ! {
         panic!(
             "parked CPU {} reached forbidden native-runtime operation {operation}",
@@ -387,11 +393,11 @@ impl ParkedRuntimeCarrier {
     }
 }
 
-struct ParkedCarrierStorage(
-    UnsafeCell<[MaybeUninit<ParkedRuntimeCarrier>; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT]>,
+struct RuntimeCarrierStorage(
+    UnsafeCell<[MaybeUninit<RuntimeCarrierFacade>; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT]>,
 );
 
-impl ParkedCarrierStorage {
+impl RuntimeCarrierStorage {
     const fn new() -> Self {
         Self(UnsafeCell::new(
             [const { MaybeUninit::uninit() }; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
@@ -403,11 +409,11 @@ impl ParkedCarrierStorage {
 // its address into that CPU's runtime binding, and never exposes the backing
 // cell again. Parked carriers never return from a callback or touch shared
 // mutable subsystem state.
-unsafe impl Sync for ParkedCarrierStorage {}
+unsafe impl Sync for RuntimeCarrierStorage {}
 
-static PARKED_CARRIER_STATE: [AtomicU8; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] =
+static RUNTIME_CARRIER_STATE: [AtomicU8; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] =
     [const { AtomicU8::new(0) }; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT];
-static PARKED_CARRIER_STORAGE: ParkedCarrierStorage = ParkedCarrierStorage::new();
+static RUNTIME_CARRIER_STORAGE: RuntimeCarrierStorage = RuntimeCarrierStorage::new();
 
 struct ChannelStaging(UnsafeCell<[u8; DW_CHANNEL_MAX_PAYLOAD as usize]>);
 
@@ -447,7 +453,7 @@ fn publish_runtime_shared() -> &'static PrimordialRuntimeShared {
     target
 }
 
-fn bind_parked_runtime_carriers(shared: &'static PrimordialRuntimeShared) {
+fn bind_runtime_carrier_facades(shared: &'static PrimordialRuntimeShared) {
     let registry = crate::arch::x86_64::smp::live_cpu_registry();
     for cpu_index in 1..registry.len() {
         let snapshot = registry
@@ -458,30 +464,30 @@ fn bind_parked_runtime_carriers(shared: &'static PrimordialRuntimeShared) {
         }
         let cpu = crate::cpu::CpuIndex::new(cpu_index)
             .unwrap_or_else(|| panic!("AP {cpu_index} exceeds the native carrier bound"));
-        let state = &PARKED_CARRIER_STATE[cpu_index];
+        let state = &RUNTIME_CARRIER_STATE[cpu_index];
         state
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .unwrap_or_else(|_| panic!("AP {cpu_index} native carrier was initialized twice"));
         let carrier = unsafe {
-            let slots = &mut *PARKED_CARRIER_STORAGE.0.get();
+            let slots = &mut *RUNTIME_CARRIER_STORAGE.0.get();
             let slot = slots
                 .get_mut(cpu_index)
                 .unwrap_or_else(|| panic!("AP {cpu_index} lacks native carrier storage"));
-            slot.write(ParkedRuntimeCarrier {
+            slot.write(RuntimeCarrierFacade {
                 cpu,
                 _shared: shared,
             });
             core::pin::Pin::new_unchecked(&mut *slot.as_mut_ptr())
         };
-        unsafe {
-            crate::arch::x86_64::syscall::bind_parked_native_runtime_carrier_for_slot(cpu, carrier)
-        }
-        .unwrap_or_else(|error| panic!("could not bind AP {cpu_index} native carrier: {error:?}"));
+        unsafe { crate::arch::x86_64::syscall::bind_native_runtime_carrier_for_slot(cpu, carrier) }
+            .unwrap_or_else(|error| {
+                panic!("could not bind AP {cpu_index} native carrier: {error:?}")
+            });
         state.store(2, Ordering::Release);
     }
 }
 
-impl NativeSyscallHandler for ParkedRuntimeCarrier {
+impl NativeSyscallHandler for RuntimeCarrierFacade {
     fn handle(&mut self, _request: NativeSyscallRequest) -> NativeSyscallResult {
         self.reject_entry("syscall dispatch")
     }
@@ -489,15 +495,9 @@ impl NativeSyscallHandler for ParkedRuntimeCarrier {
 
 #[allow(
     unsafe_code,
-    reason = "every parked carrier callback below diverges before userspace entry or shared-state mutation and its static storage is sealed after binding"
+    reason = "the bound AP façade is deliberately fail-closed until the serialized scheduler/live runtime join releases it"
 )]
-unsafe impl crate::arch::x86_64::syscall::ParkedNativeRuntimeCarrier for ParkedRuntimeCarrier {}
-
-#[allow(
-    unsafe_code,
-    reason = "the parked AP carrier is deliberately fail-closed until scheduler/live integration explicitly replaces this runtime role"
-)]
-impl NativeSyscallFrameRuntime for ParkedRuntimeCarrier {
+impl NativeSyscallFrameRuntime for RuntimeCarrierFacade {
     fn authorize_return(
         &mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
@@ -902,6 +902,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
 /// here because their adapter surfaces do not yet provide transactional
 /// interior synchronization. AP carriers cannot name or borrow this state.
 struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
+    cpu: crate::cpu::CpuIndex,
     active: ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
     active_root: Option<super::ActiveRootSelection>,
     registry: Registry,
@@ -1003,8 +1004,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let thread = self
             .shared
             .execution
-            .current_thread_on(crate::cpu::CpuIndex::BOOTSTRAP)
-            .unwrap_or_else(|| panic!("BSP carrier has no scheduler-current Thread"));
+            .current_thread_on(self.cpu)
+            .unwrap_or_else(|| panic!("runtime carrier has no scheduler-current Thread"));
         let process = self
             .tasks
             .thread_process(thread)
@@ -1030,9 +1031,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .unwrap_or_else(|| panic!("scheduler-current Thread has no execution resources"));
         if process == self.process
             && root_key == self.root_key
-            && self.active_root.as_ref().is_some_and(|root| {
-                root.selects_exact(crate::cpu::CpuIndex::BOOTSTRAP, process, address_space)
-            })
+            && self
+                .active_root
+                .as_ref()
+                .is_some_and(|root| root.selects_exact(self.cpu, process, address_space))
         {
             self.active
                 .validate_current_process_root_selection(
@@ -1054,7 +1056,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         let prepared = self
             .active
-            .prepare_process_root_selection(crate::cpu::CpuIndex::BOOTSTRAP, process, address_space)
+            .prepare_process_root_selection(self.cpu, process, address_space)
             .unwrap_or_else(|error| panic!("could not prepare scheduler-current root: {error:?}"));
         let previous = self.active_root.take();
         let selected = match self
@@ -1396,7 +1398,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             let prepared = self
                 .active
                 .prepare_process_root_selection(
-                    crate::cpu::CpuIndex::BOOTSTRAP,
+                    self.cpu,
                     self.primordial_process,
                     self.primordial_address_space,
                 )
@@ -1554,7 +1556,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                 .unwrap_or_else(|| panic!("primordial exit omitted deferred resources")),
             &mut self.cleanup,
         );
-        let next = self.shared.execution.terminal_reaper_next();
+        let next = self.shared.execution.terminal_reaper_next_on(self.cpu);
         if let Some(next) = next {
             let (stack_id, context_id) = self
                 .tasks
@@ -1802,7 +1804,7 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     let mut spaces = unsafe { Spaces::new() };
     let mut regions = Regions::new();
     let shared = publish_runtime_shared();
-    bind_parked_runtime_carriers(shared);
+    bind_runtime_carrier_facades(shared);
     let (_root_group, root_owner) = tasks
         .create_root_group(&mut registry)
         .unwrap_or_else(|error| panic!("could not create primordial root TaskGroup: {error:?}"));
@@ -1848,7 +1850,7 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         .unwrap_or_else(|error| panic!("could not publish primordial current root: {error:?}"));
     if shared
         .execution
-        .schedule_next()
+        .schedule_next_on(crate::cpu::CpuIndex::BOOTSTRAP)
         .unwrap_or_else(|error| panic!("primordial scheduling failed: {error:?}"))
         .current
         != Some(monitor.thread_key)
@@ -1869,6 +1871,7 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         ..
     } = monitor;
     let mut runtime = PrimordialRuntimeCarrier {
+        cpu: crate::cpu::CpuIndex::BOOTSTRAP,
         active,
         active_root: Some(initial_root),
         registry,

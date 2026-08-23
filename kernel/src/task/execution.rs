@@ -597,10 +597,17 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     /// when no replacement was selected. These are the only two legal reaper
     /// states.
     pub(crate) fn terminal_reaper_next(&self) -> Option<ThreadKey> {
-        match self.current_thread_on(SchedulerCpuId::BOOTSTRAP) {
+        self.terminal_reaper_next_on(SchedulerCpuId::BOOTSTRAP)
+    }
+
+    /// Chooses a replacement for the exact CPU that abandoned a terminal
+    /// continuation. A terminal reaper is CPU-local; it must never infer BSP
+    /// ownership while another carrier is executing.
+    pub(crate) fn terminal_reaper_next_on(&self, cpu: SchedulerCpuId) -> Option<ThreadKey> {
+        match self.current_thread_on(cpu) {
             Some(next) => Some(next),
             None => {
-                self.schedule_next()
+                self.schedule_next_on(cpu)
                     .unwrap_or_else(|error| panic!("terminal scheduling failed: {error:?}"))
                     .current
             }
