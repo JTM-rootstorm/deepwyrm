@@ -504,6 +504,158 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok(())
     }
 
+    /// Starts an architecture-attested empty-hierarchy preflight for one exact
+    /// committed PML4. Descendants must subsequently be observed top-down.
+    pub(crate) fn begin_empty_table_hierarchy(
+        &self,
+        root: TableIdentity,
+    ) -> Result<EmptyTableHierarchyCandidate<ROLE_CAPACITY>, FrameRoleError> {
+        self.validate_table_identity(root)?;
+        if root.level != TableLevel::Pml4 {
+            return Err(FrameRoleError::WrongRole);
+        }
+        let mut observed = [false; ROLE_CAPACITY];
+        observed[self.slot(root.role)?] = true;
+        Ok(EmptyTableHierarchyCandidate { root, observed })
+    }
+
+    /// Records one exact child discovered by the architecture walk. Requiring
+    /// the parent to have already been observed makes the proof structurally
+    /// top-down; rejecting duplicate slots catches same-frame aliases.
+    pub(crate) fn observe_empty_table_child(
+        &self,
+        candidate: &mut EmptyTableHierarchyCandidate<ROLE_CAPACITY>,
+        parent: TableIdentity,
+        child: TableIdentity,
+    ) -> Result<(), FrameRoleError> {
+        self.validate_table_identity(candidate.root)?;
+        if candidate.root.owner != parent.owner || candidate.root.owner != child.owner {
+            return Err(FrameRoleError::InvalidTableParent);
+        }
+        let parent_slot = self.slot(parent.role)?;
+        if !candidate.observed[parent_slot] {
+            return Err(FrameRoleError::InvalidTableParent);
+        }
+        self.validate_table_child(parent, child)?;
+        let child_slot = self.slot(child.role)?;
+        if candidate.observed[child_slot] {
+            return Err(FrameRoleError::InvalidTableParent);
+        }
+        candidate.observed[child_slot] = true;
+        Ok(())
+    }
+
+    /// Seals the hierarchy proof only when the architecture walk accounted for
+    /// every committed table carrying the root owner's identity. This rejects
+    /// disconnected role records as well as aliases in the live graph.
+    pub(crate) fn finish_empty_table_hierarchy(
+        &self,
+        candidate: EmptyTableHierarchyCandidate<ROLE_CAPACITY>,
+    ) -> Result<EmptyTableHierarchyGrant<ROLE_CAPACITY>, FrameRoleError> {
+        self.validate_table_identity(candidate.root)?;
+        let mut levels = [None; ROLE_CAPACITY];
+        for (slot, role_slot) in self.roles.iter().enumerate() {
+            match role_slot.record {
+                Some(RoleRecord {
+                    role: FrameRole::PageTable { owner, level, .. },
+                    ..
+                }) if owner == candidate.root.owner => {
+                    if !candidate.observed[slot]
+                        || (level == TableLevel::Pml4 && slot != self.slot(candidate.root.role)?)
+                    {
+                        return Err(FrameRoleError::InvalidTableParent);
+                    }
+                    levels[slot] = Some(level);
+                }
+                _ if candidate.observed[slot] => {
+                    return Err(FrameRoleError::InvalidTableParent);
+                }
+                _ => {}
+            }
+        }
+        Ok(EmptyTableHierarchyGrant {
+            root: candidate.root,
+            levels,
+        })
+    }
+
+    /// Reclaims all preflighted descendants bottom-up after the architecture
+    /// root has atomically disconnected its low half. The returned root grant
+    /// remains gated by the existing retired/nonresident root reclaim API.
+    ///
+    /// # Safety
+    ///
+    /// The caller must own the architecture binding for `grant`, must have
+    /// closed its residency gate with zero resident CPUs, must have atomically
+    /// cleared every observed low-half PML4 entry, and must retain exclusive
+    /// access to this manager through root reclaim.
+    #[allow(
+        unsafe_code,
+        reason = "architecture residency and atomic root disconnection are outside the target-independent role manager"
+    )]
+    pub(crate) unsafe fn reclaim_preflighted_empty_table_hierarchy(
+        &mut self,
+        grant: EmptyTableHierarchyGrant<ROLE_CAPACITY>,
+    ) -> EmptyTableRootGrant {
+        for level in [TableLevel::Pt, TableLevel::Pd, TableLevel::Pdpt] {
+            for slot in 0..ROLE_CAPACITY {
+                if grant.levels[slot] != Some(level) {
+                    continue;
+                }
+                let Some(record) = self.roles[slot].record else {
+                    panic!("preflighted empty hierarchy role disappeared before reclaim");
+                };
+                let FrameRole::PageTable {
+                    owner,
+                    level: record_level,
+                    parent,
+                } = record.role
+                else {
+                    panic!("preflighted empty hierarchy role changed before reclaim");
+                };
+                if owner != grant.root.owner || record_level != level {
+                    panic!("preflighted empty hierarchy owner or level drifted before reclaim");
+                }
+                let parent = parent.unwrap_or_else(|| {
+                    panic!("preflighted empty hierarchy descendant lost its parent")
+                });
+                let parent_record = self
+                    .record(parent)
+                    .unwrap_or_else(|error| panic!("preflighted parent disappeared: {error:?}"));
+                if !matches!(
+                    parent_record.role,
+                    FrameRole::PageTable {
+                        owner: parent_owner,
+                        level: parent_level,
+                        ..
+                    } if parent_owner == grant.root.owner
+                        && parent_level.child() == Some(record_level)
+                ) {
+                    panic!("preflighted empty hierarchy parent drifted before reclaim");
+                }
+                let identity = self
+                    .identity(slot, self.roles[slot].generation)
+                    .expect("preflighted empty hierarchy identity remains representable");
+                self.cancel(
+                    identity,
+                    record.range,
+                    FrameRole::PageTable {
+                        owner,
+                        level: record_level,
+                        parent: Some(parent),
+                    },
+                )
+                .unwrap_or_else(|error| {
+                    panic!("preflighted empty hierarchy reclaim drifted: {error:?}")
+                });
+            }
+        }
+        self.prepare_empty_table_root(grant.root)
+            .unwrap_or_else(|error| {
+                panic!("retired hierarchy root did not become empty: {error:?}")
+            })
+    }
+
     /// Reclaims one dynamically allocated, committed PML4 only after its
     /// address-space owner has proved teardown complete and no committed child
     /// table remains attached. Shared kernel-half descendants are deliberately

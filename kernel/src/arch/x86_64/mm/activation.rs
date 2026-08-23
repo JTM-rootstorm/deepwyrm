@@ -1569,8 +1569,12 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         process: crate::task::ProcessKey,
         address_space: crate::memory::address_region::AddressSpaceKey,
     ) -> Result<(), RootBindingError> {
-        self.root_bindings
-            .teardown_empty_owned(self.target.roles, process, address_space)
+        self.root_bindings.teardown_empty_owned(
+            self.target.roles,
+            &mut self.target.scratch,
+            process,
+            address_space,
+        )
     }
 
     pub(crate) fn run_primordial(

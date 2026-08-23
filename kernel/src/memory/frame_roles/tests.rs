@@ -214,6 +214,60 @@ fn empty_committed_root_reclaim_returns_frames_and_rejects_attached_children() {
 }
 
 #[test]
+#[allow(
+    unsafe_code,
+    reason = "the host model treats the exact empty hierarchy as atomically disconnected and retired"
+)]
+fn exact_empty_hierarchy_proof_reclaims_descendants_bottom_up() {
+    let mut roles = manager(BASE_PAGE_SIZE, 8);
+    let initial = roles.available_frames();
+    let owner = roles.create_table_owner().unwrap();
+
+    let root = allocate_zeroed(&mut roles, 1);
+    let root = roles.prepare_table(root, owner, TableLevel::Pml4).unwrap();
+    let root = roles.commit_table(root, None).unwrap();
+    let pdpt = allocate_zeroed(&mut roles, 1);
+    let pdpt = roles.prepare_table(pdpt, owner, TableLevel::Pdpt).unwrap();
+    let pdpt = roles.commit_table(pdpt, Some(root)).unwrap();
+    let pd = allocate_zeroed(&mut roles, 1);
+    let pd = roles.prepare_table(pd, owner, TableLevel::Pd).unwrap();
+    let pd = roles.commit_table(pd, Some(pdpt)).unwrap();
+    let pt = allocate_zeroed(&mut roles, 1);
+    let pt = roles.prepare_table(pt, owner, TableLevel::Pt).unwrap();
+    let pt = roles.commit_table(pt, Some(pd)).unwrap();
+
+    let mut incomplete = roles.begin_empty_table_hierarchy(root).unwrap();
+    roles
+        .observe_empty_table_child(&mut incomplete, root, pdpt)
+        .unwrap();
+    assert!(matches!(
+        roles.finish_empty_table_hierarchy(incomplete),
+        Err(FrameRoleError::InvalidTableParent)
+    ));
+
+    let mut hierarchy = roles.begin_empty_table_hierarchy(root).unwrap();
+    roles
+        .observe_empty_table_child(&mut hierarchy, root, pdpt)
+        .unwrap();
+    assert_eq!(
+        roles.observe_empty_table_child(&mut hierarchy, root, pdpt),
+        Err(FrameRoleError::InvalidTableParent)
+    );
+    roles
+        .observe_empty_table_child(&mut hierarchy, pdpt, pd)
+        .unwrap();
+    roles
+        .observe_empty_table_child(&mut hierarchy, pd, pt)
+        .unwrap();
+    let hierarchy = roles.finish_empty_table_hierarchy(hierarchy).unwrap();
+    let empty_root = unsafe { roles.reclaim_preflighted_empty_table_hierarchy(hierarchy) };
+    unsafe { roles.reclaim_preflighted_empty_table_root(empty_root) };
+
+    assert_eq!(roles.available_frames(), initial);
+    assert_eq!(roles.check_invariants(), Ok(()));
+}
+
+#[test]
 fn staged_root_requires_a_unique_candidate_and_can_publish_after_rollback() {
     let mut roles = manager(BASE_PAGE_SIZE, 4);
     let owner = roles.create_table_owner().unwrap();

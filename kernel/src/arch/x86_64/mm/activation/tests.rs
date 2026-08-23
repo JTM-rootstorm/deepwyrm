@@ -1520,6 +1520,14 @@ fn stack_and_descriptor_carriers_reject_drift() {
 
 struct FlatRootTarget {
     entries: BTreeMap<(u64, usize), u64>,
+    fail_apply: bool,
+}
+
+fn empty_flat_root_target() -> FlatRootTarget {
+    FlatRootTarget {
+        entries: BTreeMap::new(),
+        fail_apply: false,
+    }
 }
 
 impl crate::arch::x86_64::mm::journal::target_seal::Sealed for FlatRootTarget {}
@@ -1540,6 +1548,9 @@ unsafe impl crate::arch::x86_64::mm::journal::AtomicPageTableTarget for FlatRoot
         writes: &[crate::arch::x86_64::mm::journal::JournalWrite],
         _invalidations: &[VirtualPage],
     ) -> Result<(), Self::Error> {
+        if self.fail_apply {
+            return Err(());
+        }
         for write in writes {
             self.entries
                 .insert((write.table().address(), write.index()), write.value());
@@ -1727,7 +1738,7 @@ fn exact_roots_isolate_same_virtual_address_and_switch_a_b_a() {
     );
     assert!(a1.selects_exact(cpu, process_a, key_a));
     bindings
-        .teardown_empty_owned(&mut roles, process_b, key_b)
+        .teardown_empty_owned(&mut roles, &mut empty_flat_root_target(), process_b, key_b)
         .unwrap();
     assert!(matches!(
         bindings.root_for_process(&root_a, process_b),
@@ -1794,7 +1805,12 @@ fn last_runnable_child_switches_to_primordial_before_owned_root_teardown() {
         )
         .unwrap_or_else(|failure| panic!("initial child switch failed: {:?}", failure.error()));
     assert_eq!(
-        bindings.teardown_empty_owned(&mut roles, child_process, child_space),
+        bindings.teardown_empty_owned(
+            &mut roles,
+            &mut empty_flat_root_target(),
+            child_process,
+            child_space,
+        ),
         Err(RootBindingError::Resident)
     );
 
@@ -1818,7 +1834,12 @@ fn last_runnable_child_switches_to_primordial_before_owned_root_teardown() {
         ]
     );
     bindings
-        .teardown_empty_owned(&mut roles, child_process, child_space)
+        .teardown_empty_owned(
+            &mut roles,
+            &mut empty_flat_root_target(),
+            child_process,
+            child_space,
+        )
         .unwrap();
     assert!(matches!(
         bindings.root_for_process(&primordial_root, child_process),
@@ -1943,12 +1964,12 @@ fn key_root_mismatch_is_rejected_and_residency_blocks_teardown() {
         .prepare_selection(CpuIndex::BOOTSTRAP, process_b, key_b)
         .unwrap();
     assert_eq!(
-        bindings.teardown_empty_owned(&mut roles, process_b, key_b),
+        bindings.teardown_empty_owned(&mut roles, &mut empty_flat_root_target(), process_b, key_b,),
         Err(RootBindingError::Resident)
     );
     bindings.abandon_selection(resident).unwrap();
     bindings
-        .teardown_empty_owned(&mut roles, process_b, key_b)
+        .teardown_empty_owned(&mut roles, &mut empty_flat_root_target(), process_b, key_b)
         .unwrap();
     assert!(matches!(
         bindings.root_for_process(&root_a, process_b),
@@ -1959,13 +1980,16 @@ fn key_root_mismatch_is_rejected_and_residency_blocks_teardown() {
 #[test]
 #[allow(
     unsafe_code,
-    reason = "synthetic attached tables verify teardown rejection before residency retirement"
+    reason = "synthetic flat tables model an inactive empty child hierarchy and retryable leaf rejection"
 )]
-fn attached_root_teardown_rejection_keeps_binding_usable_and_retryable() {
+fn empty_child_hierarchy_is_retired_bottom_up_and_nonempty_rejection_is_retryable() {
     let mut roles = synthetic_frame_role_manager::<1, 16>(0x38_000, 8);
+    let initial = roles.available_frames();
     let owner = roles.create_table_owner().unwrap();
     let identity = commit_table(&mut roles, owner, TableLevel::Pml4, None);
-    let _child = commit_table(&mut roles, owner, TableLevel::Pdpt, Some(identity));
+    let pdpt = commit_table(&mut roles, owner, TableLevel::Pdpt, Some(identity));
+    let pd = commit_table(&mut roles, owner, TableLevel::Pd, Some(pdpt));
+    let pt = commit_table(&mut roles, owner, TableLevel::Pt, Some(pd));
     let capabilities = PagingCapabilities::validate(40, true, true, true).unwrap();
     let root =
         unsafe { PageTableRoot::from_owned_root(identity.physical_start(), capabilities) }.unwrap();
@@ -1977,12 +2001,30 @@ fn attached_root_teardown_rejection_keeps_binding_usable_and_retryable() {
     bindings
         .bind_owned(&roles, key, process, root, identity)
         .unwrap_or_else(|_| panic!("owned root binds"));
+    let supervisor_sentinel = 0x88_000 | PRESENT | WRITABLE;
+    let mut target = empty_flat_root_target();
+    target.entries.insert(
+        (identity.physical_start(), 0),
+        pdpt.physical_start() | PRESENT | WRITABLE | USER,
+    );
+    target.entries.insert(
+        (pdpt.physical_start(), 0),
+        pd.physical_start() | PRESENT | WRITABLE | USER,
+    );
+    target.entries.insert(
+        (pd.physical_start(), 2),
+        pt.physical_start() | PRESENT | WRITABLE | USER,
+    );
+    target
+        .entries
+        .insert((identity.physical_start(), 256), supervisor_sentinel);
+    target
+        .entries
+        .insert((pt.physical_start(), 0), 0x90_000 | PRESENT | USER);
 
     assert_eq!(
-        bindings.teardown_empty_owned(&mut roles, process, key),
-        Err(RootBindingError::FrameRole(
-            crate::memory::frame_roles::FrameRoleError::InvalidTableParent
-        ))
+        bindings.teardown_empty_owned(&mut roles, &mut target, process, key),
+        Err(RootBindingError::RootMismatch)
     );
     let primordial_placeholder =
         unsafe { PageTableRoot::from_owned_root(identity.physical_start(), capabilities) }.unwrap();
@@ -1997,12 +2039,47 @@ fn attached_root_teardown_rejection_keeps_binding_usable_and_retryable() {
         .prepare_selection(CpuIndex::BOOTSTRAP, process, key)
         .unwrap();
     bindings.abandon_selection(prepared).unwrap();
+    target.entries.insert((pt.physical_start(), 0), 0);
+    target.fail_apply = true;
     assert_eq!(
-        bindings.teardown_empty_owned(&mut roles, process, key),
-        Err(RootBindingError::FrameRole(
-            crate::memory::frame_roles::FrameRoleError::InvalidTableParent
-        ))
+        bindings.teardown_empty_owned(&mut roles, &mut target, process, key),
+        Err(RootBindingError::RootMismatch)
     );
+    assert_ne!(target.entries[&(identity.physical_start(), 0)], 0);
+    assert_eq!(roles.available_frames(), initial - 4);
+    assert_eq!(
+        bindings
+            .root_for_process(&primordial_placeholder, process)
+            .unwrap()
+            .1,
+        identity
+    );
+    let prepared = bindings
+        .prepare_selection(CpuIndex::BOOTSTRAP, process, key)
+        .unwrap();
+    bindings.abandon_selection(prepared).unwrap();
+    target.fail_apply = false;
+    bindings
+        .teardown_empty_owned(&mut roles, &mut target, process, key)
+        .unwrap();
+    assert_eq!(
+        target.entries[&(identity.physical_start(), 0)],
+        0,
+        "the child low half must be disconnected"
+    );
+    assert_eq!(target.entries[&(pdpt.physical_start(), 0)], 0);
+    assert_eq!(target.entries[&(pd.physical_start(), 2)], 0);
+    assert_eq!(
+        target.entries[&(identity.physical_start(), 256)],
+        supervisor_sentinel,
+        "shared supervisor entries must remain untouched"
+    );
+    assert_eq!(roles.available_frames(), initial);
+    assert_eq!(roles.check_invariants(), Ok(()));
+    assert!(matches!(
+        bindings.root_for_process(&primordial_placeholder, process),
+        Err(RootBindingError::Missing)
+    ));
 }
 
 #[test]
@@ -2022,6 +2099,7 @@ fn kernel_half_copy_is_supervisor_only_and_leaves_child_low_half_empty() {
             .unwrap();
     let mut target = FlatRootTarget {
         entries: BTreeMap::new(),
+        fail_apply: false,
     };
     target.entries.insert(
         (identity_a.physical_start(), 256),

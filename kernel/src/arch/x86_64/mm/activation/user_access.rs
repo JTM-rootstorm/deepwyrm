@@ -365,8 +365,12 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         process: crate::task::ProcessKey,
         address_space: crate::memory::address_region::AddressSpaceKey,
     ) -> Result<(), super::RootBindingError> {
-        self.root_bindings
-            .teardown_empty_owned(self.roles, process, address_space)
+        self.root_bindings.teardown_empty_owned(
+            self.roles,
+            &mut self.target,
+            process,
+            address_space,
+        )
     }
 
     /// Retargets only the scratch-walk validation identity. Raw usercopy must

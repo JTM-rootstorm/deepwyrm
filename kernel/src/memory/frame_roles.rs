@@ -155,6 +155,25 @@ pub(crate) struct EmptyTableRootGrant {
     root: TableIdentity,
 }
 
+/// Move-only preflight state for one exact owned page-table hierarchy.
+///
+/// Architecture teardown observes every reachable low-half table top-down.
+/// The role manager records observed slots without exposing role identities or
+/// permitting reclamation until the complete owner graph has been matched.
+#[must_use = "an empty hierarchy candidate must be finished or abandoned"]
+pub(crate) struct EmptyTableHierarchyCandidate<const ROLE_CAPACITY: usize> {
+    root: TableIdentity,
+    observed: [bool; ROLE_CAPACITY],
+}
+
+/// Move-only proof that every committed table owned by one PML4 was observed
+/// in an empty, exact-parent architecture walk.
+#[must_use = "an empty hierarchy proof must be consumed only after architecture retirement"]
+pub(crate) struct EmptyTableHierarchyGrant<const ROLE_CAPACITY: usize> {
+    root: TableIdentity,
+    levels: [Option<TableLevel>; ROLE_CAPACITY],
+}
+
 impl TableIdentity {
     pub(crate) const fn physical_start(self) -> u64 {
         self.physical_start

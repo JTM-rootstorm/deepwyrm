@@ -6,13 +6,16 @@
 //! write and retains a move-only token until the old root has been left after
 //! local serialization.
 
-use super::super::super::{FrameAddress, HUGE, PageTableRoot, USER};
+use super::super::super::{FrameAddress, HUGE, PageTableRoot, USER, decode_intermediate};
 use crate::arch::x86_64::mm::journal::{AtomicPageTableTarget, JournalWrite};
 use crate::cpu::CpuIndex;
 use crate::memory::address_region::{
     AddressSpaceCoherency, AddressSpaceCoherencyError, AddressSpaceKey, Residency,
 };
-use crate::memory::frame_roles::{FrameRoleError, FrameRoleManager, TableIdentity, TableLevel};
+use crate::memory::frame_roles::{
+    EmptyTableHierarchyCandidate, FrameRoleError, FrameRoleManager, TableIdentity, TableLevel,
+};
+use crate::memory::physical::PhysicalAddressLimit;
 use crate::task::ProcessKey;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,6 +105,68 @@ impl From<AddressSpaceCoherencyError> for RootBindingError {
 enum RootStorage {
     Primordial,
     Owned(PageTableRoot),
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the bounded recursive walk carries distinct target, role, proof, physical-limit, and atomic-batch authorities"
+)]
+fn observe_empty_owned_subtree<
+    T: AtomicPageTableTarget,
+    const RANGES: usize,
+    const ROLES: usize,
+>(
+    target: &mut T,
+    roles: &FrameRoleManager<RANGES, ROLES>,
+    hierarchy: &mut EmptyTableHierarchyCandidate<ROLES>,
+    parent: TableIdentity,
+    table: FrameAddress,
+    physical_limit: PhysicalAddressLimit,
+    disconnects: &mut [JournalWrite; ROLES],
+    disconnect_count: &mut usize,
+) -> Result<(), RootBindingError> {
+    for index in 0..512 {
+        let entry = target
+            .read_entry(table, index)
+            .map_err(|_| RootBindingError::RootMismatch)?;
+        if parent.level() == TableLevel::Pt {
+            if entry != 0 {
+                return Err(RootBindingError::RootMismatch);
+            }
+            continue;
+        }
+        if entry == 0 {
+            continue;
+        }
+        let child_frame = decode_intermediate(entry, true, physical_limit)
+            .map_err(|_| RootBindingError::RootMismatch)?;
+        let child_level = parent
+            .level()
+            .child()
+            .ok_or(RootBindingError::RootMismatch)?;
+        let child = roles
+            .table_identity(parent.owner(), child_level, child_frame.address())
+            .map_err(RootBindingError::FrameRole)?;
+        roles
+            .observe_empty_table_child(hierarchy, parent, child)
+            .map_err(RootBindingError::FrameRole)?;
+        observe_empty_owned_subtree(
+            target,
+            roles,
+            hierarchy,
+            child,
+            child_frame,
+            physical_limit,
+            disconnects,
+            disconnect_count,
+        )?;
+        let write = disconnects
+            .get_mut(*disconnect_count)
+            .ok_or(RootBindingError::RootMismatch)?;
+        *write = JournalWrite::new(table, index, 0);
+        *disconnect_count += 1;
+    }
+    Ok(())
 }
 
 struct RootBinding<const CPUS: usize> {
@@ -386,9 +451,14 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
         unsafe_code,
         reason = "the completed H0 teardown barrier discharges the empty-root reclaim proof"
     )]
-    pub(crate) fn teardown_empty_owned<const RANGES: usize, const ROLES: usize>(
+    pub(crate) fn teardown_empty_owned<
+        const RANGES: usize,
+        const ROLES: usize,
+        T: AtomicPageTableTarget,
+    >(
         &mut self,
         roles: &mut FrameRoleManager<RANGES, ROLES>,
+        target: &mut T,
         process: ProcessKey,
         address_space: AddressSpaceKey,
     ) -> Result<(), RootBindingError> {
@@ -396,12 +466,10 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
         let binding = self.entries[slot]
             .as_ref()
             .expect("binding slot remains live");
-        if matches!(binding.storage, RootStorage::Primordial) {
-            return Err(RootBindingError::RootMismatch);
-        }
-        let empty_root = roles
-            .prepare_empty_table_root(binding.identity)
-            .map_err(RootBindingError::FrameRole)?;
+        let root = match &binding.storage {
+            RootStorage::Primordial => return Err(RootBindingError::RootMismatch),
+            RootStorage::Owned(root) => root,
+        };
         let transaction = binding
             .coherency
             .prepare_uncontended_teardown()
@@ -409,10 +477,62 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
                 AddressSpaceCoherencyError::TeardownRequiresLeave => RootBindingError::Resident,
                 error => RootBindingError::from(error),
             })?;
+
+        let mut hierarchy = roles
+            .begin_empty_table_hierarchy(binding.identity)
+            .map_err(RootBindingError::FrameRole)?;
+        let mut disconnects = [JournalWrite::new(root.frame(), 0, 0); ROLES];
+        let mut disconnect_count = 0;
+        for index in 0..256 {
+            let entry = target
+                .read_entry(root.frame(), index)
+                .map_err(|_| RootBindingError::RootMismatch)?;
+            if entry == 0 {
+                continue;
+            }
+            let child_frame = decode_intermediate(entry, true, root.physical_limit())
+                .map_err(|_| RootBindingError::RootMismatch)?;
+            let child = roles
+                .table_identity(
+                    binding.identity.owner(),
+                    TableLevel::Pdpt,
+                    child_frame.address(),
+                )
+                .map_err(RootBindingError::FrameRole)?;
+            roles
+                .observe_empty_table_child(&mut hierarchy, binding.identity, child)
+                .map_err(RootBindingError::FrameRole)?;
+            observe_empty_owned_subtree(
+                target,
+                roles,
+                &mut hierarchy,
+                child,
+                child_frame,
+                root.physical_limit(),
+                &mut disconnects,
+                &mut disconnect_count,
+            )?;
+            let write = disconnects
+                .get_mut(disconnect_count)
+                .ok_or(RootBindingError::RootMismatch)?;
+            *write = JournalWrite::new(root.frame(), index, 0);
+            disconnect_count += 1;
+        }
+        let hierarchy = roles
+            .finish_empty_table_hierarchy(hierarchy)
+            .map_err(RootBindingError::FrameRole)?;
+        target
+            .apply(&disconnects[..disconnect_count], &[])
+            .map_err(|_| RootBindingError::RootMismatch)?;
+
+        // The successful atomic root disconnect is the irreversible boundary.
+        // Zero residency and the closed gate make barrier completion infallible;
+        // returning a recoverable error after this point would poison teardown.
         let barrier = transaction.publish();
         let _permit = barrier
             .try_complete()
-            .map_err(|_| RootBindingError::Resident)?;
+            .unwrap_or_else(|_| panic!("zero-resident teardown barrier became incomplete"));
+        let empty_root = unsafe { roles.reclaim_preflighted_empty_table_hierarchy(hierarchy) };
         unsafe {
             roles.reclaim_preflighted_empty_table_root(empty_root);
         }
