@@ -309,6 +309,13 @@ pub(crate) enum TransitionZeroError<E> {
     FrameRole(FrameRoleError),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransitionInitializeError<E> {
+    InvalidAllocation,
+    Scratch(TransitionScratchError<E>),
+    FrameRole(FrameRoleError),
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct TransitionZeroFailure<E> {
     error: TransitionZeroError<E>,
@@ -394,6 +401,61 @@ impl<'a, B: TransitionScratchBackend> TransitionScratchMapper<'a, B> {
                 backend.write_window_u64(index, 0);
             }
         })
+    }
+
+    fn write_initialized_frame_unchecked(
+        &mut self,
+        frame: FrameAddress,
+        source: &[u8],
+    ) -> Result<(), TransitionScratchError<B::Error>> {
+        debug_assert_eq!(source.len(), PAGE_SIZE as usize);
+        self.with_frame(frame, |backend| {
+            for (index, bytes) in source.chunks_exact(8).enumerate() {
+                backend.write_window_u64(index, u64::from_le_bytes(bytes.try_into().unwrap()));
+            }
+        })
+    }
+
+    /// Initializes every byte of one still-uninitialized exclusive allocation.
+    /// The borrowed grant remains with the caller on every failure path.
+    pub(super) fn initialize_allocation<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
+        &mut self,
+        roles: &FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
+        grant: &AllocationGrant,
+        source: &[u8],
+    ) -> Result<(), TransitionInitializeError<B::Error>> {
+        roles
+            .validate_allocation(grant)
+            .map_err(TransitionInitializeError::FrameRole)?;
+        let start = grant.physical_start();
+        let byte_len = grant.byte_len();
+        if byte_len == 0
+            || !byte_len.is_multiple_of(PAGE_SIZE)
+            || usize::try_from(byte_len).ok() != Some(source.len())
+        {
+            return Err(TransitionInitializeError::InvalidAllocation);
+        }
+        let mut offset = 0_u64;
+        while offset < byte_len {
+            FrameAddress::new(start + offset, self.capabilities().physical_limit())
+                .map_err(|_| TransitionInitializeError::InvalidAllocation)?;
+            offset += PAGE_SIZE;
+        }
+
+        offset = 0;
+        while offset < byte_len {
+            let frame = FrameAddress::new(start + offset, self.capabilities().physical_limit())
+                .expect("complete initialization range was prevalidated");
+            let source_start = usize::try_from(offset)
+                .map_err(|_| TransitionInitializeError::InvalidAllocation)?;
+            self.write_initialized_frame_unchecked(
+                frame,
+                &source[source_start..source_start + PAGE_SIZE as usize],
+            )
+            .map_err(TransitionInitializeError::Scratch)?;
+            offset += PAGE_SIZE;
+        }
+        Ok(())
     }
 
     /// Zeroes a complete allocator grant and consumes it into the manager's
@@ -923,6 +985,16 @@ impl<'a> LiveTransitionMapper<'a> {
         grant: AllocationGrant,
     ) -> Result<ZeroedGrant, TransitionZeroFailure<Infallible>> {
         self.mapper.zero_allocation(roles, grant)
+    }
+
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    pub(crate) fn initialize_allocation<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
+        &mut self,
+        roles: &FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
+        grant: &AllocationGrant,
+        source: &[u8],
+    ) -> Result<(), TransitionInitializeError<Infallible>> {
+        self.mapper.initialize_allocation(roles, grant, source)
     }
 
     pub(crate) fn into_activation_handoff(self) -> TransitionActivationHandoff<'a> {

@@ -244,6 +244,60 @@ fn linear_mapper_uses_exact_cas_invalidation_and_window_order() {
 }
 
 #[test]
+#[allow(
+    unsafe_code,
+    reason = "the host scratch model proves complete exclusive initialization before the typed transition"
+)]
+fn mapper_initializes_every_byte_before_architecture_role_publication() {
+    let mut backend = graph();
+    let attested = attest_transition(cpu(), &handoff(), &mut backend).unwrap();
+    let mut mapper = TransitionScratchMapper::from_attested(attested, backend).unwrap();
+    let mut roles = synthetic_frame_role_manager::<1, 8>(0x8000, 1);
+    let allocation = roles.allocate(1).unwrap();
+    let mut source = std::vec![0_u8; PAGE_SIZE as usize];
+    for (index, byte) in source.iter_mut().enumerate() {
+        *byte = (index as u8).wrapping_mul(17);
+    }
+
+    mapper
+        .initialize_allocation(&roles, &allocation, &source)
+        .unwrap();
+    for (index, bytes) in source.chunks_exact(8).enumerate() {
+        assert_eq!(
+            mapper.backend.entries.get(&(0x8000, index)),
+            Some(&u64::from_le_bytes(bytes.try_into().unwrap()))
+        );
+    }
+    assert_eq!(mapper.backend.entries.get(&(0x4000, 0)), Some(&0));
+    assert_eq!(mapper.backend.mapped_frame, None);
+    let retained = unsafe {
+        roles.assume_architecture_bootstrap_initialized(
+            allocation,
+            crate::memory::frame_roles::ArchitectureBootstrapKind::X86ApTrampoline,
+        )
+    }
+    .unwrap();
+    assert_eq!(roles.validate_architecture_bootstrap(&retained), Ok(()));
+}
+
+#[test]
+fn mapper_rejects_short_initialization_without_touching_physical_memory() {
+    let mut backend = graph();
+    let attested = attest_transition(cpu(), &handoff(), &mut backend).unwrap();
+    let mut mapper = TransitionScratchMapper::from_attested(attested, backend).unwrap();
+    let mut roles = synthetic_frame_role_manager::<1, 8>(0x8000, 1);
+    let allocation = roles.allocate(1).unwrap();
+    mapper.backend.events.clear();
+
+    assert_eq!(
+        mapper.initialize_allocation(&roles, &allocation, &[0; 8]),
+        Err(TransitionInitializeError::InvalidAllocation)
+    );
+    assert!(mapper.backend.events.is_empty());
+    roles.cancel_allocation(allocation).unwrap();
+}
+
+#[test]
 fn mapper_rejects_typed_allocation_of_transition_alias_before_leaf_cas() {
     let mut backend = graph();
     let attested = attest_transition(cpu(), &handoff(), &mut backend).unwrap();
