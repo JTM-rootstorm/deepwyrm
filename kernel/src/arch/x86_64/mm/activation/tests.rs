@@ -2095,6 +2095,24 @@ fn kernel_execution_root_switch_recovers_tokens_before_cr3_on_cpu_mismatch() {
     assert_eq!(prepared.cpu(), cpu0);
     assert!(switches.roots.is_empty());
     bindings.abandon_selection(prepared).unwrap();
+
+    let prepared = bindings
+        .prepare_selection(cpu0, process, address_space)
+        .unwrap();
+    let kernel = execution_roots.get(cpu0).unwrap().test_assume_active();
+    let mut wrong_root = RecordedRootSwitches {
+        cpu: Some(cpu0),
+        roots: vec![kernel_identity.physical_start() + PAGE_SIZE],
+    };
+    let failure = bindings
+        .activate_from_kernel_execution_root(prepared, kernel, &mut wrong_root)
+        .unwrap_err();
+    let (error, prepared, recovered_kernel) = failure.into_parts();
+    assert_eq!(error, RootBindingError::RootMismatch);
+    assert_eq!(recovered_kernel.cpu(), cpu0);
+    assert_eq!(prepared.cpu(), cpu0);
+    assert_eq!(wrong_root.roots.len(), 1);
+    bindings.abandon_selection(prepared).unwrap();
 }
 
 #[test]
