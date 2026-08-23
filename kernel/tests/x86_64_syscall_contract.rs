@@ -307,20 +307,29 @@ fn f12_terminal_control_abandons_the_retiring_stack_before_runtime_reclaim() {
 }
 
 #[test]
-fn h1_syscall_entry_state_is_fixed_per_cpu_while_runtime_remains_bsp_only() {
+fn h2_syscall_entry_and_native_runtime_carriers_are_fixed_per_cpu() {
     let live = source("src/arch/x86_64/syscall/live.rs");
+    let runtime_binding = source("src/arch/x86_64/syscall/runtime_binding.rs");
     let arch = source("src/arch/x86_64/mod.rs");
 
     assert!(live.contains("[EntryStateStorage; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT]"));
     assert!(live.contains("install_syscall_boundary_for_slot("));
     assert!(live.contains("cpu_index_for_entry_state_address"));
     assert!(live.contains("super::msr::IA32_KERNEL_GS_BASE"));
-    assert!(live.contains("EntryBindingError::NonBootstrapCpu"));
     assert!(arch.contains("migrate_bsp_to_runtime_slot0_after_deep_paging"));
     assert!(arch.contains("initialize_ap_runtime_slot"));
     assert!(arch.contains("RuntimeCpuDescriptorLifecycle::Online"));
-    assert!(live.contains("static RUNTIME_STATE: AtomicU8"));
-    assert!(!live.contains("static RUNTIME: ["));
+    assert!(live.contains(
+        "static RUNTIME_STATE: [AtomicU8; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT]"
+    ));
+    assert!(live.contains(
+        "static RUNTIME: [RuntimeStorage; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT]"
+    ));
+    assert!(live.contains("let cpu_index = current_cpu_index_for_diagnostics()?;"));
+    assert!(live.contains("RUNTIME_CARRIER_CLAIMS.claim(cpu_index, context)"));
+    assert!(runtime_binding.contains("owners: SpinMutex<[usize; SLOTS]>"));
+    assert!(runtime_binding.contains("owners.contains(&address)"));
+    assert!(runtime_binding.contains("RuntimeCarrierClaimError::ContextAlreadyClaimed"));
 }
 
 #[test]

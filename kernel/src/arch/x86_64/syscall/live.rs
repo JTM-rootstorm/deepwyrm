@@ -14,6 +14,7 @@ use super::msr::{
     SyscallMsrPlanError, SyscallMsrProgramError, normalize_cr0_for_e5, normalize_cr4_for_e4,
     program_and_verify, verify,
 };
+use super::runtime_binding::{RuntimeCarrierClaimError, RuntimeCarrierClaims};
 
 const INSTALL_UNSTARTED: u8 = 0;
 const INSTALLING: u8 = 1;
@@ -87,12 +88,49 @@ impl RuntimeStorage {
 
 #[allow(
     unsafe_code,
-    reason = "the BSP publishes one immutable runtime pointer/function pair before any CPL3 entry and IF-clear syscall dispatch only reads it"
+    reason = "one CPU publishes each immutable carrier pointer/function pair before that slot's CPL3 entry and IF-clear dispatch only reads its own slot"
 )]
 unsafe impl Sync for RuntimeStorage {}
 
-static RUNTIME_STATE: AtomicU8 = AtomicU8::new(RUNTIME_UNBOUND);
-static RUNTIME: RuntimeStorage = RuntimeStorage::uninit();
+static RUNTIME_STATE: [AtomicU8; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] =
+    [const { AtomicU8::new(RUNTIME_UNBOUND) }; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT];
+static RUNTIME: [RuntimeStorage; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] =
+    [const { RuntimeStorage::uninit() }; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT];
+static RUNTIME_CARRIER_CLAIMS: RuntimeCarrierClaims<
+    { crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT },
+> = RuntimeCarrierClaims::new();
+
+const TERMINAL_ACTION_EMPTY: u8 = 0;
+const TERMINAL_ACTION_WRITING: u8 = 1;
+const TERMINAL_ACTION_READY: u8 = 2;
+const TERMINAL_ACTION_READING: u8 = 3;
+
+#[derive(Clone, Copy)]
+enum TerminalAction {
+    CompleteCurrent,
+    InvalidReturn(super::frame::UserReturnError),
+    UserException(crate::arch::x86_64::exceptions::UserExceptionRecord),
+}
+
+struct TerminalActionStorage(UnsafeCell<MaybeUninit<TerminalAction>>);
+
+impl TerminalActionStorage {
+    const fn uninit() -> Self {
+        Self(UnsafeCell::new(MaybeUninit::uninit()))
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "each GS-selected CPU owns its terminal-action slot and atomic state publishes the staged Copy payload across the stack pivot"
+)]
+unsafe impl Sync for TerminalActionStorage {}
+
+static TERMINAL_ACTION_STATE: [AtomicU8; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] =
+    [const { AtomicU8::new(TERMINAL_ACTION_EMPTY) };
+        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT];
+static TERMINAL_ACTION: [TerminalActionStorage; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] =
+    [const { TerminalActionStorage::uninit() }; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT];
 
 struct NativeSyscallRuntimeEntry<'runtime, R: crate::syscall::native::NativeSyscallFrameRuntime> {
     runtime: Pin<&'runtime mut R>,
@@ -101,6 +139,8 @@ struct NativeSyscallRuntimeEntry<'runtime, R: crate::syscall::native::NativeSysc
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SyscallRuntimeBindError {
     AlreadyBound,
+    ContextAlreadyBound,
+    InvalidCpu,
     NullContext,
 }
 
@@ -372,6 +412,17 @@ fn current_cpu_index() -> Option<usize> {
     })
 }
 
+/// Returns the installed logical CPU slot selected by the current
+/// GS/KERNEL_GS_BASE entry-record identity.
+///
+/// Early bootstrap and malformed architectural state deliberately return
+/// `None`; diagnostics must remain best-effort before the per-CPU boundary is
+/// installed.
+pub(crate) fn current_cpu_index_for_diagnostics() -> Option<usize> {
+    let cpu_index = current_cpu_index()?;
+    (INSTALL_STATE.get(cpu_index)?.load(Ordering::Acquire) == INSTALLED).then_some(cpu_index)
+}
+
 #[allow(
     unsafe_code,
     reason = "the exact architectural GS base selects one release-published static per-CPU entry record"
@@ -552,32 +603,38 @@ pub(crate) unsafe fn bind_current_thread_stack(
 
 #[allow(
     unsafe_code,
-    reason = "SYSCALL dispatch reads one BSP binding generation while FMASK keeps IF clear"
+    reason = "SYSCALL dispatch reads the current CPU's private binding generation while FMASK keeps IF clear"
 )]
 pub(crate) fn current_binding_generation() -> u64 {
     current_entry_state().map_or(0, |state| state.binding_generation)
 }
 
-/// Publishes the single BSP syscall runtime identity used by the assembly boundary.
+/// Publishes one CPU's private syscall execution carrier.
 ///
 /// # Safety
 ///
-/// The caller must keep `context` stationary and exclusively borrowed for the
-/// full nonreturning lifetime of the private native-runtime entry frame.
+/// The caller must keep `context` stationary and exclusively owned by
+/// `cpu_index` for the full nonreturning lifetime of that CPU's private
+/// native-runtime entry frame. Shared runtime state reachable through the
+/// carrier must use its own bounded interior synchronization.
 #[allow(
     unsafe_code,
-    reason = "one-shot publication stores the pinned runtime address plus its monomorphized dispatcher"
+    reason = "per-CPU one-shot publication stores a unique pinned carrier address plus its monomorphized dispatcher"
 )]
 unsafe fn publish_syscall_runtime(
+    cpu_index: usize,
     context: *mut (),
     handler: SyscallRuntimeHandler,
     fresh_thread_handler: FreshThreadRuntimeHandler,
     user_exception_handler: UserExceptionRuntimeHandler,
 ) -> Result<(), SyscallRuntimeBindError> {
-    if context.is_null() {
-        return Err(SyscallRuntimeBindError::NullContext);
-    }
-    if RUNTIME_STATE
+    let state = RUNTIME_STATE
+        .get(cpu_index)
+        .ok_or(SyscallRuntimeBindError::InvalidCpu)?;
+    let storage = RUNTIME
+        .get(cpu_index)
+        .ok_or(SyscallRuntimeBindError::InvalidCpu)?;
+    if state
         .compare_exchange(
             RUNTIME_UNBOUND,
             RUNTIME_BINDING,
@@ -588,54 +645,101 @@ unsafe fn publish_syscall_runtime(
     {
         return Err(SyscallRuntimeBindError::AlreadyBound);
     }
+    if let Err(error) = RUNTIME_CARRIER_CLAIMS.claim(cpu_index, context) {
+        state.store(RUNTIME_UNBOUND, Ordering::Release);
+        return Err(match error {
+            RuntimeCarrierClaimError::InvalidSlot => SyscallRuntimeBindError::InvalidCpu,
+            RuntimeCarrierClaimError::NullContext => SyscallRuntimeBindError::NullContext,
+            RuntimeCarrierClaimError::SlotAlreadyClaimed => SyscallRuntimeBindError::AlreadyBound,
+            RuntimeCarrierClaimError::ContextAlreadyClaimed => {
+                SyscallRuntimeBindError::ContextAlreadyBound
+            }
+        });
+    }
     unsafe {
-        (*RUNTIME.0.get()).write(RuntimeBindingState {
+        (*storage.0.get()).write(RuntimeBindingState {
             context,
             handler,
             fresh_thread_handler,
             user_exception_handler,
         });
     }
-    RUNTIME_STATE.store(RUNTIME_BOUND, Ordering::Release);
+    state.store(RUNTIME_BOUND, Ordering::Release);
     Ok(())
 }
 
 #[allow(
     unsafe_code,
-    reason = "Acquire observes the immutable one-shot runtime binding published before CPL3 entry"
+    reason = "Acquire observes only the current CPU's immutable one-shot carrier binding published before its CPL3 entry"
 )]
 fn runtime_binding() -> Option<RuntimeBindingState> {
-    if RUNTIME_STATE.load(Ordering::Acquire) != RUNTIME_BOUND {
+    let cpu_index = current_cpu_index_for_diagnostics()?;
+    if RUNTIME_STATE.get(cpu_index)?.load(Ordering::Acquire) != RUNTIME_BOUND {
         return None;
     }
-    Some(unsafe { (*RUNTIME.0.get()).assume_init() })
+    let storage = RUNTIME.get(cpu_index)?;
+    Some(unsafe { (*storage.0.get()).assume_init() })
+}
+
+fn stage_terminal_action(action: TerminalAction) -> Result<(), ()> {
+    let cpu_index = current_cpu_index_for_diagnostics().ok_or(())?;
+    let state = TERMINAL_ACTION_STATE.get(cpu_index).ok_or(())?;
+    let storage = TERMINAL_ACTION.get(cpu_index).ok_or(())?;
+    state
+        .compare_exchange(
+            TERMINAL_ACTION_EMPTY,
+            TERMINAL_ACTION_WRITING,
+            Ordering::Acquire,
+            Ordering::Acquire,
+        )
+        .map_err(|_| ())?;
+    unsafe { (*storage.0.get()).write(action) };
+    state.store(TERMINAL_ACTION_READY, Ordering::Release);
+    Ok(())
 }
 
 #[allow(
     unsafe_code,
-    reason = "the private divergent entry retains the pinned exclusive runtime owner while this erased pointer is reborrowed briefly"
+    reason = "Acquire claims the current CPU's Copy terminal payload after the assembly stack pivot and no other CPU can select this GS-owned slot"
+)]
+fn take_terminal_action() -> Option<TerminalAction> {
+    let cpu_index = current_cpu_index_for_diagnostics()?;
+    let state = TERMINAL_ACTION_STATE.get(cpu_index)?;
+    let storage = TERMINAL_ACTION.get(cpu_index)?;
+    state
+        .compare_exchange(
+            TERMINAL_ACTION_READY,
+            TERMINAL_ACTION_READING,
+            Ordering::Acquire,
+            Ordering::Acquire,
+        )
+        .ok()?;
+    let action = unsafe { (*storage.0.get()).assume_init_read() };
+    state.store(TERMINAL_ACTION_EMPTY, Ordering::Release);
+    Some(action)
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the private divergent entry retains this CPU's pinned carrier owner while the terminal action is staged without reborrowing it"
 )]
 fn invalid_bound_return<R: crate::syscall::native::NativeSyscallFrameRuntime>(
     context: *mut (),
     error: super::frame::UserReturnError,
 ) -> ! {
-    // SAFETY: each borrow is short-lived on the one-BSP runtime. No borrow of
-    // `R` survives a kernel-context switch.
-    let runtime = unsafe { &mut *context.cast::<R>() };
-    runtime.invalid_return(error);
+    stage_terminal_action(TerminalAction::InvalidReturn(error)).unwrap_or_else(|_| halt_forever());
     handoff_to_terminal_reaper::<R>(context)
 }
 
 #[allow(
     unsafe_code,
-    reason = "the exception callback reborrows the one-shot pinned runtime, records terminal Process state, and then abandons the faulting stack"
+    reason = "the exception callback stages a Copy record in CPU-local storage and abandons the faulting stack before runtime mutation"
 )]
 unsafe fn native_runtime_user_exception<R: crate::syscall::native::NativeSyscallFrameRuntime>(
     context: *mut (),
     record: crate::arch::x86_64::exceptions::UserExceptionRecord,
 ) -> ! {
-    let runtime = unsafe { &mut *context.cast::<R>() };
-    runtime.user_exception(record);
+    stage_terminal_action(TerminalAction::UserException(record)).unwrap_or_else(|_| halt_forever());
     handoff_to_terminal_reaper::<R>(context)
 }
 
@@ -652,7 +756,7 @@ fn dispatch_bound_native_runtime_user_exception(
     unsafe { (binding.user_exception_handler)(binding.context, record) }
 }
 
-/// Binds CPL3 exception dispatch to the same one-shot runtime identity that is
+/// Binds CPL3 exception dispatch to the current CPU's one-shot carrier identity
 /// published by `enter_native_syscall_runtime` before userspace can execute.
 pub(crate) fn bind_native_runtime_user_exception_handler() -> Result<
     crate::arch::x86_64::exceptions::UserExceptionBinding,
@@ -665,7 +769,7 @@ pub(crate) fn bind_native_runtime_user_exception_handler() -> Result<
 
 #[allow(
     unsafe_code,
-    reason = "the fixed first-run entry reborrows the same one-shot pinned runtime for one divergent fresh-Thread launch"
+    reason = "the fixed first-run entry reborrows only the current CPU's uniquely published carrier for one divergent fresh-Thread launch"
 )]
 unsafe fn native_runtime_fresh_thread<R: crate::syscall::native::NativeSyscallFrameRuntime>(
     context: *mut (),
@@ -676,14 +780,26 @@ unsafe fn native_runtime_fresh_thread<R: crate::syscall::native::NativeSyscallFr
 
 #[allow(
     unsafe_code,
-    reason = "the assembly handoff has already abandoned the deferred Thread stack and passes the pinned runtime to one noreturn terminal callback"
+    reason = "the assembly handoff has abandoned the deferred Thread stack before the per-CPU staged terminal action mutates its uniquely bound carrier"
 )]
 unsafe extern "sysv64" fn native_runtime_terminal_reaper<
     R: crate::syscall::native::NativeSyscallFrameRuntime,
 >(
     context: *mut (),
 ) -> ! {
+    let Some(action) = take_terminal_action() else {
+        halt_forever();
+    };
     let runtime = unsafe { &mut *context.cast::<R>() };
+    match action {
+        TerminalAction::CompleteCurrent => {}
+        TerminalAction::InvalidReturn(error) => {
+            runtime.invalid_return(error);
+        }
+        TerminalAction::UserException(record) => {
+            runtime.user_exception(record);
+        }
+    }
     runtime.terminate_current()
 }
 
@@ -716,7 +832,7 @@ fn handoff_to_terminal_reaper<R: crate::syscall::native::NativeSyscallFrameRunti
 
 #[allow(
     unsafe_code,
-    reason = "the pinned one-BSP runtime is reborrowed only in bounded regions that do not span a kernel-context switch"
+    reason = "the current CPU's unique carrier is reborrowed only in bounded regions that do not span a kernel-context switch"
 )]
 unsafe fn native_runtime_trampoline<R: crate::syscall::native::NativeSyscallFrameRuntime>(
     context: *mut (),
@@ -729,6 +845,8 @@ unsafe fn native_runtime_trampoline<R: crate::syscall::native::NativeSyscallFram
     match control {
         crate::syscall::native::SyscallControl::ReturnToCaller => {}
         crate::syscall::native::SyscallControl::TerminateCurrent => {
+            stage_terminal_action(TerminalAction::CompleteCurrent)
+                .unwrap_or_else(|_| halt_forever());
             handoff_to_terminal_reaper::<R>(context)
         }
         crate::syscall::native::SyscallControl::SuspendCurrent => {
@@ -804,8 +922,9 @@ fn wait_for_suspend_interrupt() {
 }
 
 /// Fixed trusted return target used by F7 synthetic first-run kernel frames.
-/// The frame contains no erased runtime pointer; this symbol re-reads the one-shot
-/// immutable binding and dispatches through its monomorphized fresh-thread handler.
+/// The frame contains no erased runtime pointer; this symbol re-reads the
+/// current CPU's one-shot immutable carrier binding and dispatches through its
+/// monomorphized fresh-thread handler.
 #[allow(
     unsafe_code,
     reason = "the one-shot runtime binding authenticates the erased context and fresh-thread function pointer before the divergent launch"
@@ -835,7 +954,7 @@ pub(crate) fn first_run_thread_entry_rip() -> u64 {
 #[allow(
     dead_code,
     unsafe_code,
-    reason = "the private divergent entry retains the pinned exclusive runtime owner for every dispatch through the stored context/function pair"
+    reason = "the private divergent entry retains the CPU-local pinned carrier owner for every dispatch through that slot's context/function pair"
 )]
 unsafe fn dispatch_bound_runtime(frame: &mut RawSyscallFrame) {
     let Some(binding) = runtime_binding() else {
@@ -883,15 +1002,16 @@ unsafe fn iret_validated_user(state: &ValidatedUserReturn) -> ! {
     unsafe { dw_x86_64_iret_to_user(state.raw()) }
 }
 
-/// Publishes one stationary typed runtime and enters CPL3 through the validated
-/// IRETQ helper without returning the exclusive runtime borrow to safe Rust.
+/// Publishes one stationary CPU-local execution carrier and enters CPL3 through
+/// the validated IRETQ helper without returning its exclusive borrow to safe
+/// Rust. A carrier address may be published for exactly one CPU slot.
 ///
 /// # Safety
 ///
 /// `stack` is the exact live E3 kernel-stack carrier of the selected Thread.
 #[allow(
     unsafe_code,
-    reason = "the divergent entry frame retains the pinned exclusive runtime borrow after publishing its erased pointer and transfers through audited IRETQ assembly"
+    reason = "the divergent entry frame retains one CPU's pinned carrier borrow after unique per-CPU publication and transfers through audited IRETQ assembly"
 )]
 pub(crate) unsafe fn enter_native_syscall_runtime<
     'runtime,
@@ -911,7 +1031,7 @@ impl<'runtime, R: crate::syscall::native::NativeSyscallFrameRuntime>
 {
     #[allow(
         unsafe_code,
-        reason = "the private divergent entry owns the pinned runtime borrow for every path after one-shot raw-pointer publication"
+        reason = "the private divergent entry owns one CPU's pinned carrier borrow for every path after unique per-CPU raw-pointer publication"
     )]
     unsafe fn enter(
         mut self,
@@ -925,10 +1045,12 @@ impl<'runtime, R: crate::syscall::native::NativeSyscallFrameRuntime>
         }
         unsafe { bind_current_thread_stack(stack) }.unwrap_or_else(|_| halt_forever());
         // Reborrow the Pin so `self.runtime` remains owned by this nonreturning
-        // frame after its address is erased into the immutable BSP binding.
+        // frame after its address is erased into this CPU's immutable binding.
         let context = unsafe { Pin::get_unchecked_mut(self.runtime.as_mut()) as *mut R };
+        let cpu_index = current_cpu_index_for_diagnostics().unwrap_or_else(|| halt_forever());
         unsafe {
             publish_syscall_runtime(
+                cpu_index,
                 context.cast::<()>(),
                 native_runtime_trampoline::<R>,
                 native_runtime_fresh_thread::<R>,

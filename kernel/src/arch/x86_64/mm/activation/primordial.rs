@@ -314,13 +314,16 @@ static EXECUTION_STORAGE: ExecutionStorage = ExecutionStorage::new();
 
 struct ChannelStaging(UnsafeCell<[u8; DW_CHANNEL_MAX_PAYLOAD as usize]>);
 
-// SAFETY: the sole primordial syscall dispatcher claims this buffer before
-// userspace starts and serializes every use through its pinned runtime.
+// SAFETY: one runtime CPU slot claims each buffer before userspace starts; no
+// other carrier can receive the same buffer and each carrier serializes its
+// own use while executing on that CPU.
 unsafe impl Sync for ChannelStaging {}
 
-static CHANNEL_STAGING_STATE: AtomicU8 = AtomicU8::new(0);
-static CHANNEL_STAGING: ChannelStaging =
-    ChannelStaging(UnsafeCell::new([0; DW_CHANNEL_MAX_PAYLOAD as usize]));
+static CHANNEL_STAGING_STATE: [AtomicU8; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] =
+    [const { AtomicU8::new(0) }; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT];
+static CHANNEL_STAGING: [ChannelStaging; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] =
+    [const { ChannelStaging(UnsafeCell::new([0; DW_CHANNEL_MAX_PAYLOAD as usize])) };
+        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT];
 
 fn publish_execution() -> &'static ExecutionDomain<EXECUTION_THREADS> {
     EXECUTION_STATE
@@ -340,11 +343,17 @@ fn publish_execution() -> &'static ExecutionDomain<EXECUTION_THREADS> {
     &target.execution
 }
 
-fn take_channel_staging() -> &'static mut [u8; DW_CHANNEL_MAX_PAYLOAD as usize] {
-    CHANNEL_STAGING_STATE
+fn take_channel_staging(cpu_index: usize) -> &'static mut [u8; DW_CHANNEL_MAX_PAYLOAD as usize] {
+    let state = CHANNEL_STAGING_STATE
+        .get(cpu_index)
+        .unwrap_or_else(|| panic!("invalid primordial Channel staging CPU slot"));
+    let staging = CHANNEL_STAGING
+        .get(cpu_index)
+        .unwrap_or_else(|| panic!("invalid primordial Channel staging CPU slot"));
+    state
         .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-        .unwrap_or_else(|_| panic!("primordial Channel staging was claimed twice"));
-    unsafe { &mut *CHANNEL_STAGING.0.get() }
+        .unwrap_or_else(|_| panic!("primordial Channel staging CPU slot was claimed twice"));
+    unsafe { &mut *staging.0.get() }
 }
 
 struct LivePlatform<'a, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
@@ -1157,6 +1166,8 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     mut active: ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
     modules: crate::boot::primordial::PrimordialBootModules,
 ) -> ! {
+    let cpu_index = crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
+        .unwrap_or_else(|| panic!("primordial runtime entered without an installed CPU slot"));
     let bootstrap = copy_module(
         &mut active,
         modules.bootstrap(),
@@ -1231,7 +1242,7 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         timers: TimerAuthority::new(),
         waits,
         services: FServiceState::new(),
-        channel_staging: take_channel_staging(),
+        channel_staging: take_channel_staging(cpu_index),
         spaces,
         regions,
         process,
