@@ -2255,6 +2255,114 @@ fn key_root_mismatch_is_rejected_and_residency_blocks_teardown() {
 #[test]
 #[allow(
     unsafe_code,
+    reason = "synthetic roots verify that a released Process/key pair never reuses its binding epoch"
+)]
+fn owned_root_rebind_mints_a_distinct_nonzero_binding_epoch() {
+    let mut roles = synthetic_frame_role_manager::<1, 16>(0x31_000, 16);
+    let owner_a = roles.create_table_owner().unwrap();
+    let owner_b = roles.create_table_owner().unwrap();
+    let identity_a = commit_table(&mut roles, owner_a, TableLevel::Pml4, None);
+    let identity_b = commit_table(&mut roles, owner_b, TableLevel::Pml4, None);
+    let capabilities = PagingCapabilities::validate(40, true, true, true).unwrap();
+    let root_a =
+        unsafe { PageTableRoot::from_owned_root(identity_a.physical_start(), capabilities) }
+            .unwrap();
+    let root_b =
+        unsafe { PageTableRoot::from_owned_root(identity_b.physical_start(), capabilities) }
+            .unwrap();
+    let (process_a, process_b) = process_keys();
+    let mut authority =
+        unsafe { crate::memory::address_region::AddressSpaceAuthority::<2, 2>::new() };
+    let key_a = authority.create_address_space().unwrap();
+    let key_b = authority.create_address_space().unwrap();
+    let mut bindings = AddressSpaceRootBindings::<2, 1>::new();
+    bindings
+        .bind_primordial(&roles, key_a, process_a, &root_a, identity_a)
+        .unwrap();
+    bindings
+        .bind_owned(&roles, key_b, process_b, root_b, identity_b)
+        .unwrap();
+    let first = bindings
+        .prepare_selection(CpuIndex::BOOTSTRAP, process_b, key_b)
+        .unwrap();
+    assert_eq!(first.binding_generation(), 2);
+    bindings.abandon_selection(first).unwrap();
+    let pins = UserPinTracker::<1>::new();
+    bindings
+        .teardown_empty_owned(
+            &mut roles,
+            &mut empty_flat_root_target(),
+            process_b,
+            key_b,
+            &pins,
+            pins.reserve_teardown(key_b).unwrap(),
+        )
+        .unwrap();
+    let owner_c = roles.create_table_owner().unwrap();
+    let identity_c = commit_table(&mut roles, owner_c, TableLevel::Pml4, None);
+    let root_c =
+        unsafe { PageTableRoot::from_owned_root(identity_c.physical_start(), capabilities) }
+            .unwrap();
+    bindings
+        .bind_owned(&roles, key_b, process_b, root_c, identity_c)
+        .unwrap();
+    let rebound = bindings
+        .prepare_selection(CpuIndex::BOOTSTRAP, process_b, key_b)
+        .unwrap();
+    assert_eq!(rebound.binding_generation(), 3);
+    assert_ne!(rebound.binding_generation(), 0);
+    bindings.abandon_selection(rebound).unwrap();
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "synthetic roots make binding-generation exhaustion deterministic without consuming a candidate root"
+)]
+fn binding_generation_exhaustion_fails_closed_without_publishing_a_root() {
+    let mut roles = synthetic_frame_role_manager::<1, 16>(0x32_000, 8);
+    let owner_a = roles.create_table_owner().unwrap();
+    let owner_b = roles.create_table_owner().unwrap();
+    let identity_a = commit_table(&mut roles, owner_a, TableLevel::Pml4, None);
+    let identity_b = commit_table(&mut roles, owner_b, TableLevel::Pml4, None);
+    let capabilities = PagingCapabilities::validate(40, true, true, true).unwrap();
+    let root_a =
+        unsafe { PageTableRoot::from_owned_root(identity_a.physical_start(), capabilities) }
+            .unwrap();
+    let root_b =
+        unsafe { PageTableRoot::from_owned_root(identity_b.physical_start(), capabilities) }
+            .unwrap();
+    let (process_a, process_b) = process_keys();
+    let mut authority =
+        unsafe { crate::memory::address_region::AddressSpaceAuthority::<2, 2>::new() };
+    let key_a = authority.create_address_space().unwrap();
+    let key_b = authority.create_address_space().unwrap();
+    let mut bindings = AddressSpaceRootBindings::<2, 1>::new();
+    bindings.set_next_binding_generation_for_test(u64::MAX);
+    bindings
+        .bind_primordial(&roles, key_a, process_a, &root_a, identity_a)
+        .unwrap();
+    let (error, returned_root) = bindings
+        .bind_owned(&roles, key_b, process_b, root_b, identity_b)
+        .unwrap_err();
+    assert_eq!(error, RootBindingError::GenerationExhausted);
+    assert_eq!(returned_root.frame().address(), identity_b.physical_start());
+    assert!(matches!(
+        bindings.prepare_selection(CpuIndex::BOOTSTRAP, process_b, key_b),
+        Err(RootBindingError::Missing)
+    ));
+    assert_eq!(
+        bindings
+            .prepare_selection(CpuIndex::BOOTSTRAP, process_a, key_a)
+            .unwrap()
+            .binding_generation(),
+        u64::MAX
+    );
+}
+
+#[test]
+#[allow(
+    unsafe_code,
     reason = "synthetic flat tables model an inactive empty child hierarchy and retryable leaf rejection"
 )]
 fn empty_child_hierarchy_is_retired_bottom_up_and_nonempty_rejection_is_retryable() {

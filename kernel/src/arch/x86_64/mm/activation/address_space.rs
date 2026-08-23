@@ -300,6 +300,11 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
         Ok(generation)
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_next_binding_generation_for_test(&mut self, generation: u64) {
+        self.next_binding_generation = generation;
+    }
+
     pub(crate) fn install_kernel_half(
         &mut self,
         binding: KernelHalfBinding,
