@@ -599,11 +599,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         &self,
         thread: ThreadKey,
     ) -> Result<super::ScheduleDecision, SchedulerError> {
-        let decision = self.scheduler.yield_current(thread)?;
-        if decision.current != decision.previous {
-            super::notify_runnable_work();
-        }
-        Ok(decision)
+        self.scheduler.yield_current(thread)
     }
 
     pub(crate) fn yield_current_on(
@@ -611,11 +607,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         cpu: SchedulerCpuId,
         thread: ThreadKey,
     ) -> Result<super::ScheduleDecision, SchedulerError> {
-        let decision = self.scheduler.yield_current_on(cpu, thread)?;
-        if decision.current != decision.previous {
-            super::notify_runnable_work();
-        }
-        Ok(decision)
+        self.scheduler.yield_current_on(cpu, thread)
     }
 
     pub(crate) fn schedule_from_idle(
@@ -697,8 +689,12 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         &self,
         claim: SchedulerExecutionClaim,
     ) -> Result<(), SchedulerError> {
-        self.scheduler.complete_switch_on(claim)?;
-        super::notify_runnable_work();
+        let published_runnable = self
+            .scheduler
+            .complete_switch_on_with_runnable_publication(claim)?;
+        if published_runnable {
+            super::notify_runnable_work(None);
+        }
         Ok(())
     }
 
@@ -714,8 +710,8 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     }
 
     pub(crate) fn wake(&self, key: BlockWakeKey) -> Result<(), SchedulerError> {
-        self.scheduler.wake(key)?;
-        super::notify_runnable_work();
+        let affinity = self.scheduler.wake_with_affinity(key)?;
+        super::notify_runnable_work(affinity);
         Ok(())
     }
 
@@ -1381,7 +1377,7 @@ impl<const CAPACITY: usize> PreparedThreadStart<'_, CAPACITY> {
                     failure.error()
                 )
             });
-        super::notify_runnable_work();
+        super::notify_runnable_work(None);
         self.completed = true;
     }
 

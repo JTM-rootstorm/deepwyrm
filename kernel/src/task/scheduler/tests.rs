@@ -540,6 +540,34 @@ fn idle_scheduler_continues_then_resumes_exact_woken_waiter() {
 }
 
 #[test]
+fn wake_reports_exact_continuation_owner_until_switch_completion() {
+    let scheduler = CooperativeScheduler::<2>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let blocked_thread = thread_key(&mut registry);
+    let destination = thread_key(&mut registry);
+    for thread in [blocked_thread, destination] {
+        let reservation = scheduler.reserve(thread).unwrap();
+        scheduler.commit(reservation).unwrap();
+    }
+    scheduler.schedule_next_on(cpu(2)).unwrap();
+    let (blocked, decision) = scheduler.block_current_on(cpu(2), blocked_thread).unwrap();
+    assert_eq!(decision.current, Some(destination));
+    let suspended = scheduler.suspended_claim_on(cpu(2)).unwrap();
+
+    assert_eq!(
+        scheduler
+            .wake_with_affinity(blocked.into_wake_key())
+            .unwrap(),
+        Some(cpu(2))
+    );
+    assert_eq!(
+        scheduler.complete_switch_on_with_runnable_publication(suspended),
+        Ok(true)
+    );
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
 fn idle_scheduler_preserves_fifo_when_other_work_wakes_first() {
     let scheduler = CooperativeScheduler::<2>::new();
     let mut registry = ObjectRegistry::<16>::new();

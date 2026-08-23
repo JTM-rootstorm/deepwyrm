@@ -208,6 +208,30 @@ impl IdleWakeSet {
         Ok(None)
     }
 
+    /// Publishes Wake only to the CPU that still owns a Runnable Thread's
+    /// physically suspended continuation. An active owner needs no IPI; an
+    /// unavailable owner is a broken scheduler/carrier binding and fails
+    /// closed rather than waking a non-owner that cannot claim the Thread.
+    pub(crate) fn publish_affine_runnable(
+        &self,
+        publisher: CpuIndex,
+        owner: CpuIndex,
+    ) -> Result<Option<CpuIndex>, IdleWakeError> {
+        self.ensure_healthy()?;
+        if owner == publisher {
+            return Ok(None);
+        }
+        match self.cpus[owner.index()].state.load(Ordering::Acquire) {
+            CPU_PREPARING | CPU_HALTED => {
+                self.mailboxes[owner.index()].publish_wake();
+                self.ensure_healthy()?;
+                Ok(Some(owner))
+            }
+            CPU_ACTIVE => Ok(None),
+            _ => Err(IdleWakeError::Unavailable),
+        }
+    }
+
     /// Acquires the current CPU's rendezvous notification after architecture
     /// EOI. Wake never changes idle generation/state and therefore cannot make
     /// a stale e1 cancel a later preparation. Stop/HoldSafe remain pending in
@@ -287,11 +311,15 @@ pub(crate) fn finish_current_idle(halt: IdleHalt) -> Result<(), IdleWakeError> {
 /// fail-stop because Runnable publication has already committed and cannot be
 /// rolled back without violating the wait/start winner contract.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub(crate) fn notify_runnable_work() {
+pub(crate) fn notify_runnable_work(affinity: Option<CpuIndex>) {
     let Ok(publisher) = current_cpu() else {
         fail_transport_and_halt();
     };
-    let Ok(target) = LIVE_IDLE_WAKE.publish_runnable(publisher) else {
+    let target = match affinity {
+        Some(owner) => LIVE_IDLE_WAKE.publish_affine_runnable(publisher, owner),
+        None => LIVE_IDLE_WAKE.publish_runnable(publisher),
+    };
+    let Ok(target) = target else {
         fail_transport_and_halt();
     };
     let Some(target) = target else {
@@ -372,7 +400,38 @@ mod tests {
         idle.enable(cpu(0)).unwrap();
         let preparation = idle.prepare(cpu(0)).unwrap();
         assert_eq!(idle.publish_runnable(cpu(0)), Ok(None));
+        assert_eq!(idle.publish_affine_runnable(cpu(0), cpu(0)), Ok(None));
+        assert_eq!(
+            idle.take_notification(cpu(0)),
+            Ok(MailboxNotification::None)
+        );
         idle.cancel(preparation).unwrap();
+    }
+
+    #[test]
+    fn affine_runnable_wakes_only_its_owner_among_multiple_idle_cpus() {
+        let idle = IdleWakeSet::new();
+        idle.enable(cpu(0)).unwrap();
+        idle.enable(cpu(1)).unwrap();
+        idle.enable(cpu(2)).unwrap();
+        let non_owner = idle.prepare(cpu(1)).unwrap();
+        let owner = idle.prepare(cpu(2)).unwrap();
+
+        assert_eq!(
+            idle.publish_affine_runnable(cpu(0), cpu(2)),
+            Ok(Some(cpu(2)))
+        );
+        assert_eq!(
+            idle.take_notification(cpu(1)),
+            Ok(MailboxNotification::None)
+        );
+        assert_eq!(
+            idle.take_notification(cpu(2)),
+            Ok(MailboxNotification::Wake)
+        );
+
+        idle.cancel(non_owner).unwrap();
+        idle.cancel(owner).unwrap();
     }
 
     #[test]

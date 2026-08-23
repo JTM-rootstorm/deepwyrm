@@ -227,8 +227,9 @@ fn h4_idle_publication_brackets_rescan_and_uses_only_coalesced_e1_wake() {
     }
     assert!(!idle.contains("LiveIpiVector::TlbShootdown"));
     assert!(idle.contains("for offset in 1..CPU_CAPACITY"));
+    assert!(idle.contains("publish_affine_runnable(publisher, owner)"));
     let live_notify = idle
-        .split_once("pub(crate) fn notify_runnable_work()")
+        .split_once("pub(crate) fn notify_runnable_work(affinity: Option<CpuIndex>)")
         .expect("live runnable notifier")
         .1
         .split_once("pub(crate) fn take_current_notification()")
@@ -289,9 +290,14 @@ fn h4_idle_publication_brackets_rescan_and_uses_only_coalesced_e1_wake() {
 
     let execution = source("src/task/execution.rs");
     assert!(
-        execution.contains("self.scheduler.wake(key)?;\n        super::notify_runnable_work();")
+        execution.contains("let affinity = self.scheduler.wake_with_affinity(key)?;\n        super::notify_runnable_work(affinity);")
     );
-    assert!(execution.contains("super::notify_runnable_work();\n        self.completed = true;"));
+    assert!(
+        execution.contains("super::notify_runnable_work(None);\n        self.completed = true;")
+    );
+    let scheduler = source("src/task/scheduler.rs");
+    assert!(scheduler.contains("let affinity = entry.continuation_cpu;"));
+    assert!(scheduler.contains("complete_switch_on_with_runnable_publication"));
 }
 
 #[test]

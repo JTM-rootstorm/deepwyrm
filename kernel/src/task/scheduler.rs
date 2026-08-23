@@ -769,7 +769,14 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         }
     }
 
-    pub(crate) fn wake(&self, key: BlockWakeKey) -> Result<(), SchedulerError> {
+    /// Makes one exact blocked generation Runnable and reports whether its
+    /// physically suspended continuation is still owned by one CPU. The
+    /// caller must direct any idle-wake notification to that CPU until switch
+    /// completion releases the continuation for ordinary FIFO acquisition.
+    pub(crate) fn wake_with_affinity(
+        &self,
+        key: BlockWakeKey,
+    ) -> Result<Option<SchedulerCpuId>, SchedulerError> {
         let mut state = self.state.lock();
         if key.domain != state.domain {
             return Err(SchedulerError::ForeignBlockToken);
@@ -788,8 +795,13 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         entry.token = 0;
         entry.block_cpu = None;
         entry.block_execution_generation = 0;
+        let affinity = entry.continuation_cpu;
         debug_assert_eq!(state.check_invariants(), Ok(()));
-        Ok(())
+        Ok(affinity)
+    }
+
+    pub(crate) fn wake(&self, key: BlockWakeKey) -> Result<(), SchedulerError> {
+        self.wake_with_affinity(key).map(|_| ())
     }
 
     /// Validates that a deferred wake key belongs to this scheduler and names
@@ -879,6 +891,16 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         &self,
         claim: SchedulerExecutionClaim,
     ) -> Result<(), SchedulerError> {
+        self.complete_switch_on_with_runnable_publication(claim)
+            .map(|_| ())
+    }
+
+    /// Releases an exact saved continuation and reports whether doing so made
+    /// queued Runnable work eligible for acquisition by any idle CPU.
+    pub(crate) fn complete_switch_on_with_runnable_publication(
+        &self,
+        claim: SchedulerExecutionClaim,
+    ) -> Result<bool, SchedulerError> {
         let mut state = self.state.lock();
         if claim.domain != state.domain {
             return Err(SchedulerError::ForeignExecutionClaim);
@@ -893,7 +915,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         if suspended.thread != claim.thread || suspended.generation != claim.generation {
             return Err(SchedulerError::StaleExecutionClaim);
         }
-        if suspended.publication == SuspendedPublication::Queued {
+        let published_runnable = if suspended.publication == SuspendedPublication::Queued {
             let len = state.len;
             let Some(entry) = state.queue[..len]
                 .iter_mut()
@@ -907,12 +929,16 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             {
                 return Err(SchedulerError::StaleExecutionClaim);
             }
+            let published_runnable = entry.state == SchedulerThreadState::Runnable;
             entry.continuation_cpu = None;
             entry.continuation_generation = 0;
-        }
+            published_runnable
+        } else {
+            false
+        };
         state.suspended[cpu_index] = None;
         debug_assert_eq!(state.check_invariants(), Ok(()));
-        Ok(())
+        Ok(published_runnable)
     }
 
     pub(crate) fn retire_on(
