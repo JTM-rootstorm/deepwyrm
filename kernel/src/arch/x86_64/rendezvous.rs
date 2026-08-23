@@ -46,6 +46,13 @@ impl RendezvousIpiLatches {
     pub(crate) fn take(&self, cpu: CpuIndex) -> bool {
         self.pending[cpu.index()].swap(false, Ordering::AcqRel)
     }
+
+    /// Acquires whether a carrier-safe rescan is already required without
+    /// consuming it. Idle uses this immediately before publishing `Halted` so
+    /// an EOI-completed interrupt cannot be slept through.
+    pub(crate) fn is_pending(&self, cpu: CpuIndex) -> bool {
+        self.pending[cpu.index()].load(Ordering::Acquire)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,42 +158,6 @@ impl StopRequest {
     }
 }
 
-/// Observable conditions required before a remote CPU may acknowledge Safe.
-///
-/// The live rendezvous handler must establish every condition while parked on
-/// its CPU-private entry stack.  Keeping these facts explicit prevents an IPI
-/// receipt alone from being confused with permission to reclaim execution
-/// resources.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SafePointConditions {
-    pub(crate) parked_on_cpu_private_stack: bool,
-    pub(crate) scheduler_ownership_released: bool,
-    pub(crate) user_access_disabled: bool,
-    pub(crate) deferred_cleanup_quiescent: bool,
-}
-
-impl SafePointConditions {
-    pub(crate) const EXACT_SAFE: Self = Self {
-        parked_on_cpu_private_stack: true,
-        scheduler_ownership_released: true,
-        user_access_disabled: true,
-        deferred_cleanup_quiescent: true,
-    };
-
-    const fn is_exact_safe(self) -> bool {
-        self.parked_on_cpu_private_stack
-            && self.scheduler_ownership_released
-            && self.user_access_disabled
-            && self.deferred_cleanup_quiescent
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct StopObservation {
-    pub(crate) identity: StopIdentity,
-    pub(crate) conditions: SafePointConditions,
-}
-
 /// H0 facts observed by the architecture/carrier before it commits a stop.
 ///
 /// This is deliberately not the acknowledgement proof. It is an input to the
@@ -276,13 +247,6 @@ pub(crate) enum RemoteStopError {
     AlreadyAcknowledged,
 }
 
-/// Move-only proof that the currently published request was observed at Safe.
-#[must_use = "an exact-safe proof must be acknowledged or discarded without changing mailbox state"]
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct ExactSafeProof {
-    request: StopRequest,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MailboxNotification {
     None,
@@ -296,15 +260,6 @@ pub(crate) enum StopPublishError {
     WrongTargetCpu,
     Busy,
     GenerationExhausted,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SafeProofError {
-    NoStopRequested,
-    AlreadyAcknowledged,
-    WrongIdentity,
-    NotSafe,
-    StaleRequest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -524,56 +479,6 @@ impl RendezvousMailbox {
             .expect("published rendezvous state has a request")
     }
 
-    /// Validates the exact target tuple and every safe-point condition.
-    pub(crate) fn prove_exact_safe(
-        &self,
-        observation: StopObservation,
-    ) -> Result<ExactSafeProof, SafeProofError> {
-        match self.state.load(Ordering::Acquire) {
-            MAILBOX_STOP_SAFE => return Err(SafeProofError::AlreadyAcknowledged),
-            MAILBOX_STOP_REQUESTED => {}
-            _ => return Err(SafeProofError::NoStopRequested),
-        }
-        let request = self.current_request();
-        if request.identity != observation.identity {
-            return Err(SafeProofError::WrongIdentity);
-        }
-        if !observation.conditions.is_exact_safe() {
-            return Err(SafeProofError::NotSafe);
-        }
-        Ok(ExactSafeProof { request })
-    }
-
-    /// Release-publishes Safe only for the still-current exact request.
-    pub(crate) fn acknowledge_exact_safe(
-        &self,
-        proof: ExactSafeProof,
-    ) -> Result<(), SafeProofError> {
-        match self.state.load(Ordering::Acquire) {
-            MAILBOX_STOP_SAFE => return Err(SafeProofError::AlreadyAcknowledged),
-            MAILBOX_STOP_REQUESTED => {}
-            _ => return Err(SafeProofError::StaleRequest),
-        }
-        if self.current_request() != proof.request {
-            return Err(SafeProofError::StaleRequest);
-        }
-        self.state
-            .compare_exchange(
-                MAILBOX_STOP_REQUESTED,
-                MAILBOX_STOP_SAFE,
-                Ordering::Release,
-                Ordering::Acquire,
-            )
-            .map(|_| ())
-            .map_err(|state| {
-                if state == MAILBOX_STOP_SAFE {
-                    SafeProofError::AlreadyAcknowledged
-                } else {
-                    SafeProofError::StaleRequest
-                }
-            })
-    }
-
     /// Commits a remote stop on the target CPU's safe/reaper context.
     ///
     /// No interrupt handler may call this. The exact identity, safe stack,
@@ -733,13 +638,14 @@ mod tests {
     }
 
     fn acknowledge(mailbox: &RendezvousMailbox, identity: StopIdentity) {
-        let proof = mailbox
-            .prove_exact_safe(StopObservation {
-                identity,
-                conditions: SafePointConditions::EXACT_SAFE,
-            })
+        let request = match mailbox.take_notification() {
+            MailboxNotification::Stop(request) => request,
+            notification => panic!("expected stop request, got {notification:?}"),
+        };
+        let mut target = SafePointModel::new(identity);
+        mailbox
+            .complete_stop_at_safe_point(request, &mut target)
             .unwrap();
-        mailbox.acknowledge_exact_safe(proof).unwrap();
     }
 
     struct SafePointModel {
@@ -929,31 +835,15 @@ mod tests {
             MailboxNotification::Stop(deferred.request())
         );
 
-        let mut wrong = identity(thread);
-        wrong.cpu_online_generation += 1;
+        let wrong = identity(other_thread);
+        let request = match mailbox.take_notification() {
+            MailboxNotification::Stop(request) => request,
+            notification => panic!("expected stop request, got {notification:?}"),
+        };
+        let mut wrong_target = SafePointModel::new(wrong);
         assert_eq!(
-            mailbox.prove_exact_safe(StopObservation {
-                identity: wrong,
-                conditions: SafePointConditions::EXACT_SAFE,
-            }),
-            Err(SafeProofError::WrongIdentity)
-        );
-        wrong = identity(other_thread);
-        assert_eq!(
-            mailbox.prove_exact_safe(StopObservation {
-                identity: wrong,
-                conditions: SafePointConditions::EXACT_SAFE,
-            }),
-            Err(SafeProofError::WrongIdentity)
-        );
-        let mut unsafe_conditions = SafePointConditions::EXACT_SAFE;
-        unsafe_conditions.deferred_cleanup_quiescent = false;
-        assert_eq!(
-            mailbox.prove_exact_safe(StopObservation {
-                identity: identity(thread),
-                conditions: unsafe_conditions,
-            }),
-            Err(SafeProofError::NotSafe)
+            mailbox.complete_stop_at_safe_point(request, &mut wrong_target),
+            Err(RemoteStopError::WrongIdentity)
         );
 
         acknowledge(&mailbox, identity(thread));
@@ -997,20 +887,11 @@ mod tests {
         assert_eq!(failure.error(), ReclaimError::AwaitingAcknowledgement);
         deferred = failure.into_deferred();
 
-        let proof = mailbox
-            .prove_exact_safe(StopObservation {
-                identity: identity(thread),
-                conditions: SafePointConditions::EXACT_SAFE,
-            })
-            .unwrap();
-        mailbox.acknowledge_exact_safe(proof).unwrap();
-        assert_eq!(
-            mailbox.prove_exact_safe(StopObservation {
-                identity: identity(thread),
-                conditions: SafePointConditions::EXACT_SAFE,
-            }),
-            Err(SafeProofError::AlreadyAcknowledged)
-        );
+        acknowledge(&mailbox, identity(thread));
+        assert!(matches!(
+            mailbox.take_notification(),
+            MailboxNotification::HoldSafe(_)
+        ));
         assert_eq!(mailbox.complete_reclaim(deferred).unwrap(), 77);
     }
 

@@ -964,8 +964,36 @@ unsafe fn native_runtime_trampoline<R: crate::syscall::native::NativeSyscallFram
                                 // re-enable is the atomic sti; hlt sequence below,
                                 // so an e1 Wake cannot be consumed and lost in
                                 // between publication and the architectural halt.
-                                let halt = crate::arch::x86_64::idle::commit_current_idle(idle)
-                                    .unwrap_or_else(|_| halt_forever());
+                                let halt = match crate::arch::x86_64::idle::commit_current_idle(
+                                    idle,
+                                ) {
+                                    Ok(halt) => halt,
+                                    Err(failure)
+                                        if failure.error()
+                                            == crate::arch::x86_64::idle::IdleWakeError::RescanRequired =>
+                                    {
+                                        // A rendezvous IRQ completed EOI before this
+                                        // carrier reached `sti; hlt`. Consume its
+                                        // latch and repeat the scheduler rescan; do
+                                        // not sleep awaiting a second IPI.
+                                        match crate::time::service_current_rendezvous_latch()
+                                            .unwrap_or_else(|_| halt_forever())
+                                        {
+                                            crate::arch::x86_64::rendezvous::MailboxNotification::None
+                                            | crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {}
+                                            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
+                                            | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {
+                                                halt_forever();
+                                            }
+                                        }
+                                        crate::arch::x86_64::idle::cancel_current_idle(
+                                            failure.into_preparation(),
+                                        )
+                                        .unwrap_or_else(|_| halt_forever());
+                                        continue;
+                                    }
+                                    Err(_) => halt_forever(),
+                                };
                                 wait_for_suspend_interrupt();
                                 match crate::time::service_current_rendezvous_latch()
                                 .unwrap_or_else(|_| halt_forever())

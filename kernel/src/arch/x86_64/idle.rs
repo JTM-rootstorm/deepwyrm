@@ -30,6 +30,7 @@ pub(crate) enum IdleWakeError {
     AlreadyEnabled,
     NotActive,
     StalePreparation,
+    RescanRequired,
     GenerationExhausted,
     TransportFaulted,
 }
@@ -52,6 +53,23 @@ impl IdlePreparation {
 pub(crate) struct IdleHalt {
     cpu: CpuIndex,
     generation: u64,
+}
+
+#[must_use = "failed idle commit retains the preparation that must be cancelled"]
+#[derive(Debug)]
+pub(crate) struct IdleCommitFailure {
+    error: IdleWakeError,
+    preparation: IdlePreparation,
+}
+
+impl IdleCommitFailure {
+    pub(crate) const fn error(&self) -> IdleWakeError {
+        self.error
+    }
+
+    pub(crate) fn into_preparation(self) -> IdlePreparation {
+        self.preparation
+    }
 }
 
 #[derive(Debug)]
@@ -159,11 +177,28 @@ impl IdleWakeSet {
     }
 
     /// Commits the exact preparation immediately before `sti; hlt; cli`.
-    pub(crate) fn commit(&self, preparation: IdlePreparation) -> Result<IdleHalt, IdleWakeError> {
-        self.ensure_healthy()?;
+    pub(crate) fn commit(
+        &self,
+        preparation: IdlePreparation,
+    ) -> Result<IdleHalt, IdleCommitFailure> {
+        if let Err(error) = self.ensure_healthy() {
+            return Err(IdleCommitFailure { error, preparation });
+        }
         let cpu = preparation.cpu;
         let generation = preparation.generation;
-        self.finish_transition(cpu, generation, CPU_PREPARING, CPU_HALTED)?;
+        // An EOI-completed e1 may already have published its CPU-local latch
+        // before we reach the architectural `sti; hlt`. Consume/rescan it in
+        // the carrier path rather than entering HALTED and depending on a
+        // second interrupt that need never arrive.
+        if self.ipi_latches.is_pending(cpu) {
+            return Err(IdleCommitFailure {
+                error: IdleWakeError::RescanRequired,
+                preparation,
+            });
+        }
+        if let Err(error) = self.finish_transition(cpu, generation, CPU_PREPARING, CPU_HALTED) {
+            return Err(IdleCommitFailure { error, preparation });
+        }
         Ok(IdleHalt { cpu, generation })
     }
 
@@ -319,7 +354,9 @@ pub(crate) fn cancel_current_idle(preparation: IdlePreparation) -> Result<(), Id
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub(crate) fn commit_current_idle(preparation: IdlePreparation) -> Result<IdleHalt, IdleWakeError> {
+pub(crate) fn commit_current_idle(
+    preparation: IdlePreparation,
+) -> Result<IdleHalt, IdleCommitFailure> {
     if preparation.cpu() != current_cpu()? {
         return Err(IdleWakeError::StalePreparation);
     }
@@ -528,6 +565,25 @@ mod tests {
             Ok(MailboxNotification::None)
         );
         idle.finish(halt).unwrap();
+    }
+
+    #[test]
+    fn preexisting_post_eoi_latch_requires_rescan_before_halt() {
+        let idle = IdleWakeSet::new();
+        idle.enable(cpu(0)).unwrap();
+        idle.enable(cpu(1)).unwrap();
+        let preparation = idle.prepare(cpu(1)).unwrap();
+        assert_eq!(idle.publish_runnable(cpu(0)), Ok(Some(cpu(1))));
+        // Model an e1 handler that completed EOI before this carrier reaches
+        // its final `sti; hlt` commit.
+        idle.latch_rendezvous_ipi(cpu(1)).unwrap();
+        let failure = idle.commit(preparation).unwrap_err();
+        assert_eq!(failure.error(), IdleWakeError::RescanRequired);
+        assert_eq!(
+            idle.take_latched_notification(cpu(1)),
+            Ok(MailboxNotification::Wake)
+        );
+        idle.cancel(failure.into_preparation()).unwrap();
     }
 
     #[test]
