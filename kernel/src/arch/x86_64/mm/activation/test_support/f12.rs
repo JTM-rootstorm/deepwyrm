@@ -27,9 +27,8 @@ use crate::wait::{EventAuthority, WaitRegistry};
 use deepwyrm_abi::{
     DW_CHANNEL_MAX_PAYLOAD, DW_DEADLINE_INFINITE, DW_DEADLINE_NOW, DW_OBJECT_TYPE_ADDRESS_REGION,
     DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_PROCESS, DW_RIGHT_MODIFY, DW_RIGHT_READ,
-    DW_STATUS_BAD_ADDRESS, DW_STATUS_BAD_HANDLE, DW_STATUS_NOT_SUPPORTED, DW_STATUS_SUCCESS,
-    DW_TASK_STATE_CREATED, DW_TASK_STATE_EXITED, DW_TERMINATION_AUTHORIZED,
-    DW_TERMINATION_NORMAL_EXIT, DwStatus, DwUserAddress,
+    DW_STATUS_BAD_HANDLE, DW_STATUS_NOT_SUPPORTED, DW_STATUS_SUCCESS, DW_TASK_STATE_CREATED,
+    DW_TASK_STATE_EXITED, DW_TERMINATION_AUTHORIZED, DW_TERMINATION_NORMAL_EXIT, DwUserAddress,
 };
 
 const REGISTRY_OBJECTS: usize = 24;
@@ -247,7 +246,8 @@ fn map_page<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     setup: &mut ActiveRootTestAuthority<'_, RANGE_CAPACITY, ROLE_CAPACITY>,
     registry: &mut F12Registry,
     memory: &mut F12Memory,
-    tasks: &F12Tasks,
+    tasks: &mut F12Tasks,
+    process: ProcessKey,
     regions: &mut F12Regions,
     root_region: AddressRegionObjectKey,
     owner: &InternalRef,
@@ -262,21 +262,24 @@ fn map_page<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
         owner,
         deepwyrm_abi::dw_object_compatible_rights(deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT),
     );
-    let region = regions
-        .region_mut_for_live_process(tasks, root_region)
+    let lease = tasks
+        .acquire_process_operation(process)
         .unwrap_or_else(|_| fail(detail));
-    let authorization = memory
-        .issue_map_authorization(
-            resolved,
-            region.address_space_key(),
-            region.region_key(),
-            authorization_ceiling,
-        )
-        .unwrap_or_else(|_| fail(detail + 1));
-    let mut publisher = setup
-        .bind_test_publisher(region.address_space_key(), region.region_key(), candidates)
-        .unwrap_or_else(|_| fail(detail + 2));
-    require_clean_mapping(
+    let result = {
+        let region = regions
+            .region_mut_for_operation(tasks, &lease, root_region)
+            .unwrap_or_else(|_| fail(detail));
+        let authorization = memory
+            .issue_map_authorization(
+                resolved,
+                region.address_space_key(),
+                region.region_key(),
+                authorization_ceiling,
+            )
+            .unwrap_or_else(|_| fail(detail + 1));
+        let mut publisher = setup
+            .bind_test_publisher(region.address_space_key(), region.region_key(), candidates)
+            .unwrap_or_else(|_| fail(detail + 2));
         region.map(
             memory,
             registry,
@@ -286,9 +289,12 @@ fn map_page<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
             0,
             PAGE_SIZE,
             protection,
-        ),
-        detail + 3,
-    );
+        )
+    };
+    tasks
+        .release_process_operation(lease)
+        .unwrap_or_else(|_| fail(detail + 3));
+    require_clean_mapping(result, detail + 3);
 }
 
 #[allow(
@@ -299,7 +305,8 @@ fn protect_page<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     setup: &mut ActiveRootTestAuthority<'_, RANGE_CAPACITY, ROLE_CAPACITY>,
     registry: &mut F12Registry,
     memory: &mut F12Memory,
-    tasks: &F12Tasks,
+    tasks: &mut F12Tasks,
+    process: ProcessKey,
     regions: &mut F12Regions,
     root_region: AddressRegionObjectKey,
     address: u64,
@@ -307,13 +314,16 @@ fn protect_page<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     candidates: &mut [Option<crate::memory::frame_roles::TableCandidateGrant>; 3],
     detail: u32,
 ) {
-    let region = regions
-        .region_mut_for_live_process(tasks, root_region)
+    let lease = tasks
+        .acquire_process_operation(process)
         .unwrap_or_else(|_| fail(detail));
-    let mut publisher = setup
-        .bind_test_publisher(region.address_space_key(), region.region_key(), candidates)
-        .unwrap_or_else(|_| fail(detail + 1));
-    require_clean_mapping(
+    let result = {
+        let region = regions
+            .region_mut_for_operation(tasks, &lease, root_region)
+            .unwrap_or_else(|_| fail(detail));
+        let mut publisher = setup
+            .bind_test_publisher(region.address_space_key(), region.region_key(), candidates)
+            .unwrap_or_else(|_| fail(detail + 1));
         region.protect(
             memory,
             registry,
@@ -321,9 +331,12 @@ fn protect_page<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
             address,
             PAGE_SIZE,
             protection,
-        ),
-        detail + 2,
-    );
+        )
+    };
+    tasks
+        .release_process_operation(lease)
+        .unwrap_or_else(|_| fail(detail + 2));
+    require_clean_mapping(result, detail + 2);
 }
 
 #[allow(
@@ -560,7 +573,8 @@ fn build_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize
         &mut setup,
         &mut registry,
         &mut memory,
-        &tasks,
+        &mut tasks,
+        process,
         &mut regions,
         root_region,
         &code_owner,
@@ -574,7 +588,8 @@ fn build_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize
         &mut setup,
         &mut registry,
         &mut memory,
-        &tasks,
+        &mut tasks,
+        process,
         &mut regions,
         root_region,
         &data_owner,
@@ -596,7 +611,8 @@ fn build_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize
         &mut setup,
         &mut registry,
         &mut memory,
-        &tasks,
+        &mut tasks,
+        process,
         &mut regions,
         root_region,
         &stack_owner,
@@ -616,7 +632,8 @@ fn build_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize
         &mut setup,
         &mut registry,
         &mut memory,
-        &tasks,
+        &mut tasks,
+        process,
         &mut regions,
         root_region,
         F12_USER_ENTRY,
@@ -1165,15 +1182,20 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                         {
                             fail(0xb9);
                         }
+                        let proof = self
+                            .tasks
+                            .process_quiescence_proof(child)
+                            .unwrap_or_else(|_| fail(0xba));
                         let drained = self
                             .execution
-                            .blocked_operations_drained(child)
+                            .blocked_operations_drained(&self.tasks, &proof)
                             .unwrap_or_else(|_| fail(0xba));
                         let root_pin = self
                             .regions
-                            .retire_exited_root(
+                            .retire_quiesced_root(
                                 &mut self.tasks,
                                 child,
+                                &proof,
                                 self.execution.blocked_operations(),
                                 drained,
                             )
@@ -1260,10 +1282,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     F12Runtime<'_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
-    fn unmap_main_userspace(&mut self, drained: &crate::task::BlockedOperationsDrained) {
+    fn unmap_main_userspace(
+        &mut self,
+        proof: &crate::task::ProcessQuiescenceProof,
+        drained: &crate::task::BlockedOperationsDrained,
+    ) {
         self.execution
             .blocked_operations()
-            .validate_drained(drained, self.process)
+            .validate_drained_after_quiesce(&self.tasks, proof, drained)
             .unwrap_or_else(|_| fail(0xc3));
         let mut setup = ActiveRootTestAuthority {
             root: &self.active.root,
@@ -1280,7 +1306,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         ] {
             let region = self
                 .regions
-                .region_mut_for_teardown(&self.tasks, self.root_region)
+                .region_mut_for_quiesced_teardown(&self.tasks, proof, self.root_region)
                 .unwrap_or_else(|_| fail(detail));
             let mut publisher = setup
                 .bind_test_publisher(
@@ -1463,16 +1489,21 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 fail(0xee);
             }
         }
+        let proof = self
+            .tasks
+            .process_quiescence_proof(self.process)
+            .unwrap_or_else(|_| fail(0xef));
         let drained = self
             .execution
-            .blocked_operations_drained(self.process)
+            .blocked_operations_drained(&self.tasks, &proof)
             .unwrap_or_else(|_| fail(0xef));
-        self.unmap_main_userspace(&drained);
+        self.unmap_main_userspace(&proof, &drained);
         let root_pin = self
             .regions
-            .retire_exited_root(
+            .retire_quiesced_root(
                 &mut self.tasks,
                 self.process,
+                &proof,
                 self.execution.blocked_operations(),
                 drained,
             )
@@ -1635,7 +1666,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
             self.services.resume_suspended(
                 &mut user,
                 &mut self.registry,
-                self.tasks,
+                &mut self.tasks,
                 &self.waits,
                 self.execution,
                 thread,

@@ -177,7 +177,8 @@ fn map_page<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     setup: &mut ActiveRootTestAuthority<'_, RANGE_CAPACITY, ROLE_CAPACITY>,
     registry: &mut F9Registry,
     memory: &mut F9Memory,
-    tasks: &F9Tasks,
+    tasks: &mut F9Tasks,
+    process: ProcessKey,
     regions: &mut F9Regions,
     root_region: AddressRegionObjectKey,
     owner: &InternalRef,
@@ -192,21 +193,24 @@ fn map_page<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
         owner,
         deepwyrm_abi::dw_object_compatible_rights(deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT),
     );
-    let region = regions
-        .region_mut_for_live_process(tasks, root_region)
+    let lease = tasks
+        .acquire_process_operation(process)
         .unwrap_or_else(|_| fail(detail));
-    let authorization = memory
-        .issue_map_authorization(
-            resolved,
-            region.address_space_key(),
-            region.region_key(),
-            authorization_ceiling,
-        )
-        .unwrap_or_else(|_| fail(detail + 1));
-    let mut publisher = setup
-        .bind_test_publisher(region.address_space_key(), region.region_key(), candidates)
-        .unwrap_or_else(|_| fail(detail + 2));
-    require_clean_mapping(
+    let result = {
+        let region = regions
+            .region_mut_for_operation(tasks, &lease, root_region)
+            .unwrap_or_else(|_| fail(detail));
+        let authorization = memory
+            .issue_map_authorization(
+                resolved,
+                region.address_space_key(),
+                region.region_key(),
+                authorization_ceiling,
+            )
+            .unwrap_or_else(|_| fail(detail + 1));
+        let mut publisher = setup
+            .bind_test_publisher(region.address_space_key(), region.region_key(), candidates)
+            .unwrap_or_else(|_| fail(detail + 2));
         region.map(
             memory,
             registry,
@@ -216,9 +220,12 @@ fn map_page<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
             0,
             PAGE_SIZE,
             protection,
-        ),
-        detail + 3,
-    );
+        )
+    };
+    tasks
+        .release_process_operation(lease)
+        .unwrap_or_else(|_| fail(detail + 3));
+    require_clean_mapping(result, detail + 3);
 }
 
 #[allow(
@@ -229,7 +236,8 @@ fn protect_page<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     setup: &mut ActiveRootTestAuthority<'_, RANGE_CAPACITY, ROLE_CAPACITY>,
     registry: &mut F9Registry,
     memory: &mut F9Memory,
-    tasks: &F9Tasks,
+    tasks: &mut F9Tasks,
+    process: ProcessKey,
     regions: &mut F9Regions,
     root_region: AddressRegionObjectKey,
     address: u64,
@@ -237,13 +245,16 @@ fn protect_page<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     candidates: &mut [Option<crate::memory::frame_roles::TableCandidateGrant>; 3],
     detail: u32,
 ) {
-    let region = regions
-        .region_mut_for_live_process(tasks, root_region)
+    let lease = tasks
+        .acquire_process_operation(process)
         .unwrap_or_else(|_| fail(detail));
-    let mut publisher = setup
-        .bind_test_publisher(region.address_space_key(), region.region_key(), candidates)
-        .unwrap_or_else(|_| fail(detail + 1));
-    require_clean_mapping(
+    let result = {
+        let region = regions
+            .region_mut_for_operation(tasks, &lease, root_region)
+            .unwrap_or_else(|_| fail(detail));
+        let mut publisher = setup
+            .bind_test_publisher(region.address_space_key(), region.region_key(), candidates)
+            .unwrap_or_else(|_| fail(detail + 1));
         region.protect(
             memory,
             registry,
@@ -251,9 +262,12 @@ fn protect_page<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
             address,
             PAGE_SIZE,
             protection,
-        ),
-        detail + 2,
-    );
+        )
+    };
+    tasks
+        .release_process_operation(lease)
+        .unwrap_or_else(|_| fail(detail + 2));
+    require_clean_mapping(result, detail + 2);
 }
 
 #[allow(
@@ -400,7 +414,8 @@ fn build_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize
         &mut setup,
         &mut registry,
         &mut memory,
-        &tasks,
+        &mut tasks,
+        process,
         &mut regions,
         root_region,
         &code_owner,
@@ -414,7 +429,8 @@ fn build_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize
         &mut setup,
         &mut registry,
         &mut memory,
-        &tasks,
+        &mut tasks,
+        process,
         &mut regions,
         root_region,
         &data_owner,
@@ -436,7 +452,8 @@ fn build_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize
         &mut setup,
         &mut registry,
         &mut memory,
-        &tasks,
+        &mut tasks,
+        process,
         &mut regions,
         root_region,
         &stack_owner,
@@ -455,7 +472,8 @@ fn build_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize
         &mut setup,
         &mut registry,
         &mut memory,
-        &tasks,
+        &mut tasks,
+        process,
         &mut regions,
         root_region,
         F9_USER_ENTRY,
@@ -583,10 +601,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
-    fn atomic_key(&self, address: u64) -> Result<crate::atomic_wait::AtomicWaitKey, DwStatus> {
-        self.regions
-            .resolve_atomic_wait_key_for_live_process(&self.tasks, self.process, address)
-            .map_err(|_| DW_STATUS_BAD_ADDRESS)
+    fn atomic_key(&mut self, address: u64) -> Result<crate::atomic_wait::AtomicWaitKey, DwStatus> {
+        let lease = self
+            .tasks
+            .acquire_process_operation(self.process)
+            .map_err(|_| DW_STATUS_BAD_ADDRESS)?;
+        let result = self
+            .regions
+            .resolve_atomic_wait_key_for_operation(&self.tasks, &lease, self.process, address)
+            .map_err(|_| DW_STATUS_BAD_ADDRESS);
+        self.tasks
+            .release_process_operation(lease)
+            .map_err(|_| DW_STATUS_BAD_ADDRESS)?;
+        result
     }
 
     fn release_atomic_pin(&mut self, pin: super::super::OwnedLiveAtomicU32) {
@@ -634,9 +661,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     crate::syscall::TerminalWaitCleanup<REGISTRY_OBJECTS, 1, 2>
     for F9TerminalAtomicCleanup<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
-    fn cleanup_terminal_wait(
+    fn cleanup_terminal_wait<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
         &mut self,
         _registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         _waits: &WaitRegistry<1>,
         execution: &ExecutionDomain<2>,
         thread: ThreadKey,
@@ -645,6 +678,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let mut deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
         let pin = crate::atomic_wait::finish_terminal_atomic_wait(
             self.atomic_waits,
+            tasks,
             execution,
             self.atomic_operations,
             Some(&mut deadlines),
@@ -695,6 +729,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     expected,
                     wait_deadline(deadline),
                     &self.atomic_waits,
+                    &mut self.tasks,
                     &self.execution,
                     &mut self.atomic_operations,
                     Some(&mut deadlines),
@@ -754,6 +789,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                 }
                 let process = self.process;
                 let regions = &self.regions;
+                let lease = self
+                    .tasks
+                    .acquire_process_operation(process)
+                    .unwrap_or_else(|_| fail(0xa8));
                 let tasks = &self.tasks;
                 let atomic_waits = &self.atomic_waits;
                 let execution = &self.execution;
@@ -772,7 +811,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     },
                     |address, _pin| {
                         regions
-                            .resolve_atomic_wait_key_for_live_process(tasks, process, address.0)
+                            .resolve_atomic_wait_key_for_operation(
+                                tasks, &lease, process, address.0,
+                            )
                             .map_err(|_| DW_STATUS_BAD_ADDRESS)
                     },
                     |user, pin| {
@@ -787,6 +828,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                             .map_err(atomic_begin_error_status)
                     },
                 );
+                self.tasks
+                    .release_process_operation(lease)
+                    .unwrap_or_else(|_| fail(0xa8));
                 if status != DW_STATUS_SUCCESS {
                     return NativeSyscallResult::returning(status);
                 }
@@ -921,9 +965,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                 fail(0xb5);
             }
         }
+        let proof = self
+            .tasks
+            .process_quiescence_proof(self.process)
+            .unwrap_or_else(|_| fail(0xb6));
         if self
             .execution
-            .blocked_operations_drained(self.process)
+            .blocked_operations_drained(&self.tasks, &proof)
             .is_err()
         {
             fail(0xb6);
@@ -1007,6 +1055,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         let mut deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
         let (pin, winner) = crate::atomic_wait::finish_atomic_wait(
             &self.atomic_waits,
+            &mut self.tasks,
             &self.execution,
             &mut self.atomic_operations,
             Some(&mut deadlines),
