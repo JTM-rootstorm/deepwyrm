@@ -499,6 +499,7 @@ fn timer_status(error: TimerError) -> DwStatus {
         TimerError::AccessDenied => DW_STATUS_ACCESS_DENIED,
         TimerError::InvalidObject
         | TimerError::GenerationExhausted
+        | TimerError::TransitionInProgress
         | TimerError::ForeignExpiry
         | TimerError::Deadline(_)
         | TimerError::FinalizationMismatch

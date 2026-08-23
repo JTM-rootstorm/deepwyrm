@@ -34,6 +34,10 @@ pub(crate) enum TimerDeadlineError {
 }
 
 pub(crate) trait TimerDeadlineAuthority {
+    /// Replaces one still-owned Timer registration.  On `Err`, the caller
+    /// retains ownership of `old` and it must remain valid for a later retry
+    /// or cancellation.  A deadline authority must therefore not partially
+    /// consume `old` before reporting a recoverable failure.
     fn replace_timer_deadline(
         &mut self,
         old: Option<&DeadlineRegistration>,
@@ -41,9 +45,13 @@ pub(crate) trait TimerDeadlineAuthority {
         token: TimerExpiryToken,
     ) -> Result<Option<DeadlineRegistration>, TimerDeadlineError>;
 
+    /// Cancels one still-owned Timer registration.  On `Err`, the caller
+    /// retains the registration unchanged.  This makes cancellation failures
+    /// recoverable: typed Timer state can restore the active arm instead of
+    /// dropping it while an authority call is in flight.
     fn cancel_timer_deadline(
         &mut self,
-        registration: DeadlineRegistration,
+        registration: &DeadlineRegistration,
     ) -> Result<(), TimerDeadlineError>;
 }
 
@@ -55,6 +63,10 @@ pub(crate) enum TimerError {
     InvalidSignals,
     AccessDenied,
     GenerationExhausted,
+    /// Another operation has staged this Timer outside the Timer state lock.
+    /// Callers may retry after that operation returns; the staged operation
+    /// retains the prior arm until it either commits or restores it.
+    TransitionInProgress,
     ForeignExpiry,
     Deadline(TimerDeadlineError),
     FinalizationMismatch,
@@ -122,11 +134,25 @@ struct TimerArm {
     registration: DeadlineRegistration,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimerTransition {
+    Set { generation: u32 },
+    Cancel,
+    Finalize,
+    Expire { generation: u32 },
+    Readiness { generation: u32 },
+}
+
 struct TimerRecord {
     object: ObjectId,
     arm_generation: u32,
     arm: Option<TimerArm>,
     signaled: bool,
+    /// An operation owns any removed arm while it invokes an external
+    /// deadline authority or readiness hook.  No Timer lock is held across
+    /// those calls.  Competing operations receive a recoverable busy result
+    /// rather than observing a half-published arm.
+    transition: Option<TimerTransition>,
 }
 
 pub(crate) struct TimerAuthority<const TIMERS: usize> {
@@ -166,6 +192,7 @@ impl<const TIMERS: usize> TimerAuthority<TIMERS> {
             arm_generation: 0,
             arm: None,
             signaled: false,
+            transition: None,
         });
         Ok(TimerPayloadBinding { creation, key })
     }
@@ -216,6 +243,9 @@ impl<const TIMERS: usize> TimerAuthority<TIMERS> {
             .flatten()
             .find(|timer| timer.object == key.object_id())
             .ok_or(TimerError::InvalidObject)?;
+        if timer.transition.is_some() {
+            return Err(TimerError::TransitionInProgress);
+        }
         Ok(if timer.signaled {
             DW_SIGNAL_SIGNALED
         } else {
@@ -245,42 +275,80 @@ impl<const TIMERS: usize> TimerAuthority<TIMERS> {
             return Err(TimerError::InvalidDeadline);
         }
 
-        let mut timers = self.timers.lock();
-        let timer = timers
-            .iter_mut()
-            .flatten()
-            .find(|timer| timer.object == key.object_id())
-            .ok_or(TimerError::InvalidObject)?;
-        let generation = timer
-            .arm_generation
-            .checked_add(1)
-            .filter(|generation| *generation != 0)
-            .ok_or(TimerError::GenerationExhausted)?;
+        // Stage only the ownership transition while holding `timers`.  The
+        // deadline authority is allowed to lock unrelated scheduler/time
+        // state or call back into TimerAuthority, so it must never run while
+        // this lock is held.
+        let (generation, old_arm, was_signaled) = {
+            let mut timers = self.timers.lock();
+            let timer = timers
+                .iter_mut()
+                .flatten()
+                .find(|timer| timer.object == key.object_id())
+                .ok_or(TimerError::InvalidObject)?;
+            if timer.transition.is_some() {
+                return Err(TimerError::TransitionInProgress);
+            }
+            let generation = timer
+                .arm_generation
+                .checked_add(1)
+                .filter(|generation| *generation != 0)
+                .ok_or(TimerError::GenerationExhausted)?;
+            let old_arm = timer.arm.take();
+            let was_signaled = timer.signaled;
+            timer.transition = Some(TimerTransition::Set { generation });
+            (generation, old_arm, was_signaled)
+        };
         let token = TimerExpiryToken {
             domain: self.domain,
             object: key.object_id(),
             generation,
         };
 
-        let registration = deadlines
-            .replace_timer_deadline(
-                timer.arm.as_ref().map(|arm| &arm.registration),
-                deadline.0,
-                token,
-            )
-            .map_err(TimerError::Deadline)?;
-
-        timer.arm_generation = generation;
-        timer.signaled = registration.is_none();
-        timer.arm = registration.map(|registration| TimerArm { registration });
-        let became_signaled = timer.signaled;
-        let wakes = if became_signaled {
-            before_readiness();
-            waits.take_ready(key.object_id(), DW_SIGNAL_SIGNALED)
-        } else {
-            WakeBatch::empty()
+        let registration = match deadlines.replace_timer_deadline(
+            old_arm.as_ref().map(|arm| &arm.registration),
+            deadline.0,
+            token,
+        ) {
+            Ok(registration) => registration,
+            Err(error) => {
+                self.restore_set(key, generation, old_arm, was_signaled);
+                return Err(TimerError::Deadline(error));
+            }
         };
-        drop(timers);
+        let became_signaled = registration.is_none();
+        {
+            let mut timers = self.timers.lock();
+            let timer = timers
+                .iter_mut()
+                .flatten()
+                .find(|timer| timer.object == key.object_id())
+                .expect("staged Timer disappeared during deadline replacement");
+            assert_eq!(
+                timer.transition,
+                Some(TimerTransition::Set { generation }),
+                "Timer transition ownership changed during deadline replacement"
+            );
+            timer.arm_generation = generation;
+            timer.signaled = became_signaled;
+            timer.arm = registration.map(|registration| TimerArm { registration });
+            timer.transition = if became_signaled {
+                Some(TimerTransition::Readiness { generation })
+            } else {
+                None
+            };
+        }
+        if !became_signaled {
+            return Ok(WakeBatch::empty());
+        }
+
+        // A readiness hook may re-enter TimerAuthority.  The explicit
+        // Readiness transition keeps that re-entry recoverable without
+        // holding `timers`; register_wait also observes this boundary so a
+        // fresh waiter cannot be captured by this prior signal edge.
+        before_readiness();
+        let wakes = waits.take_ready(key.object_id(), DW_SIGNAL_SIGNALED);
+        self.complete_readiness(key, generation);
         Ok(wakes)
     }
 
@@ -289,38 +357,103 @@ impl<const TIMERS: usize> TimerAuthority<TIMERS> {
         key: TimerKey,
         deadlines: &mut dyn TimerDeadlineAuthority,
     ) -> Result<(), TimerError> {
+        let (old_arm, was_signaled, next_generation) = {
+            let mut timers = self.timers.lock();
+            let timer = timers
+                .iter_mut()
+                .flatten()
+                .find(|timer| timer.object == key.object_id())
+                .ok_or(TimerError::InvalidObject)?;
+            if timer.transition.is_some() {
+                return Err(TimerError::TransitionInProgress);
+            }
+            let next_generation = if timer.arm.is_some() {
+                Some(
+                    timer
+                        .arm_generation
+                        .checked_add(1)
+                        .filter(|generation| *generation != 0)
+                        .ok_or(TimerError::GenerationExhausted)?,
+                )
+            } else {
+                None
+            };
+            let old_arm = timer.arm.take();
+            let was_signaled = timer.signaled;
+            timer.transition = Some(TimerTransition::Cancel);
+            (old_arm, was_signaled, next_generation)
+        };
+
+        if let Some(old_arm) = old_arm {
+            if let Err(error) = deadlines.cancel_timer_deadline(&old_arm.registration) {
+                self.restore_cancel(key, old_arm, was_signaled);
+                return Err(TimerError::Deadline(error));
+            }
+        }
         let mut timers = self.timers.lock();
         let timer = timers
             .iter_mut()
             .flatten()
             .find(|timer| timer.object == key.object_id())
-            .ok_or(TimerError::InvalidObject)?;
-        let next_generation = if timer.arm.is_some() {
-            Some(
-                timer
-                    .arm_generation
-                    .checked_add(1)
-                    .filter(|generation| *generation != 0)
-                    .ok_or(TimerError::GenerationExhausted)?,
-            )
-        } else {
-            None
-        };
-        let old_arm = timer.arm.take();
+            .expect("staged Timer disappeared during deadline cancellation");
+        assert_eq!(timer.transition, Some(TimerTransition::Cancel));
         if let Some(generation) = next_generation {
             timer.arm_generation = generation;
         }
         timer.signaled = false;
-        drop(timers);
-
-        if let Some(old_arm) = old_arm {
-            deadlines
-                .cancel_timer_deadline(old_arm.registration)
-                .unwrap_or_else(|error| {
-                    panic!("cancelled Timer deadline authority drifted: {error:?}")
-                });
-        }
+        timer.transition = None;
         Ok(())
+    }
+
+    fn restore_set(
+        &self,
+        key: TimerKey,
+        generation: u32,
+        old_arm: Option<TimerArm>,
+        was_signaled: bool,
+    ) {
+        let mut timers = self.timers.lock();
+        let timer = timers
+            .iter_mut()
+            .flatten()
+            .find(|timer| timer.object == key.object_id())
+            .expect("staged Timer disappeared while recovering deadline replacement");
+        assert_eq!(
+            timer.transition,
+            Some(TimerTransition::Set { generation }),
+            "Timer transition ownership changed while recovering deadline replacement"
+        );
+        timer.arm = old_arm;
+        timer.signaled = was_signaled;
+        timer.transition = None;
+    }
+
+    fn restore_cancel(&self, key: TimerKey, old_arm: TimerArm, was_signaled: bool) {
+        let mut timers = self.timers.lock();
+        let timer = timers
+            .iter_mut()
+            .flatten()
+            .find(|timer| timer.object == key.object_id())
+            .expect("staged Timer disappeared while recovering deadline cancellation");
+        assert_eq!(timer.transition, Some(TimerTransition::Cancel));
+        timer.arm = Some(old_arm);
+        timer.signaled = was_signaled;
+        timer.transition = None;
+    }
+
+    fn complete_readiness(&self, key: TimerKey, generation: u32) {
+        let mut timers = self.timers.lock();
+        let timer = timers
+            .iter_mut()
+            .flatten()
+            .find(|timer| timer.object == key.object_id())
+            .expect("signaled Timer disappeared while collecting readiness");
+        assert_eq!(
+            timer.transition,
+            Some(TimerTransition::Readiness { generation }),
+            "Timer transition ownership changed while collecting readiness"
+        );
+        timer.transition = None;
     }
 
     /// Commits one exact Timer arm expiry. Stale/replaced/cancelled generations
@@ -343,23 +476,48 @@ impl<const TIMERS: usize> TimerAuthority<TIMERS> {
         if token.domain != self.domain {
             return Err(TimerError::ForeignExpiry);
         }
-        let mut timers = self.timers.lock();
-        let Some(timer) = timers
-            .iter_mut()
-            .flatten()
-            .find(|timer| timer.object == token.object)
-        else {
-            return Ok(WakeBatch::empty());
+        let object = {
+            let mut timers = self.timers.lock();
+            let Some(timer) = timers
+                .iter_mut()
+                .flatten()
+                .find(|timer| timer.object == token.object)
+            else {
+                return Ok(WakeBatch::empty());
+            };
+            if timer.transition.is_some() {
+                // The deadline queue may already have detached this token.
+                // Returning a recoverable result lets the dispatch owner retry
+                // it after the staged operation commits or restores its arm;
+                // treating it as stale here would silently lose a live expiry.
+                return Err(TimerError::TransitionInProgress);
+            }
+            if timer.arm_generation != token.generation || timer.arm.is_none() {
+                return Ok(WakeBatch::empty());
+            }
+            timer.arm = None;
+            timer.transition = Some(TimerTransition::Expire {
+                generation: token.generation,
+            });
+            timer.object
         };
-        if timer.arm_generation != token.generation || timer.arm.is_none() {
-            return Ok(WakeBatch::empty());
-        }
-        timer.arm = None;
-        timer.signaled = true;
-        let object = timer.object;
         before_readiness();
         let wakes = waits.ready_wakes(object, DW_SIGNAL_SIGNALED);
-        drop(timers);
+        let mut timers = self.timers.lock();
+        let timer = timers
+            .iter_mut()
+            .flatten()
+            .find(|timer| timer.object == object)
+            .expect("expiring Timer disappeared while collecting readiness");
+        assert_eq!(
+            timer.transition,
+            Some(TimerTransition::Expire {
+                generation: token.generation,
+            }),
+            "Timer transition ownership changed while expiring"
+        );
+        timer.signaled = true;
+        timer.transition = None;
         Ok(wakes)
     }
 
@@ -401,6 +559,12 @@ impl<const TIMERS: usize> TimerAuthority<TIMERS> {
                 pin: target.into_internal(),
             });
         };
+        if timer.transition.is_some() {
+            return Err(TimerWaitFailure {
+                error: TimerError::TransitionInProgress,
+                pin: target.into_internal(),
+            });
+        }
         if timer.signaled {
             return Ok(TimerWaitOutcome::Ready {
                 observed: DW_SIGNAL_SIGNALED,
@@ -424,21 +588,48 @@ impl<const TIMERS: usize> TimerAuthority<TIMERS> {
         if final_release.object_type() != DW_OBJECT_TYPE_TIMER {
             return Err((TimerError::FinalizationMismatch, final_release));
         }
-        let mut timers = self.timers.lock();
-        let Some(slot) = timers.iter_mut().find(|slot| {
-            slot.as_ref()
-                .is_some_and(|timer| timer.object == final_release.id())
-        }) else {
-            return Err((TimerError::FinalizationMismatch, final_release));
+        let old_arm = {
+            let mut timers = self.timers.lock();
+            let Some(timer) = timers
+                .iter_mut()
+                .flatten()
+                .find(|timer| timer.object == final_release.id())
+            else {
+                return Err((TimerError::FinalizationMismatch, final_release));
+            };
+            if timer.transition.is_some() {
+                return Err((TimerError::TransitionInProgress, final_release));
+            }
+            let old_arm = timer.arm.take();
+            timer.transition = Some(TimerTransition::Finalize);
+            old_arm
         };
-        let old_arm = slot.as_mut().and_then(|timer| timer.arm.take());
-        if let Some(old_arm) = old_arm {
-            deadlines
-                .cancel_timer_deadline(old_arm.registration)
-                .unwrap_or_else(|error| {
-                    panic!("final Timer deadline authority drifted: {error:?}")
-                });
+        if let Some(old_arm) = old_arm
+            && let Err(error) = deadlines.cancel_timer_deadline(&old_arm.registration)
+        {
+            let mut timers = self.timers.lock();
+            let timer = timers
+                .iter_mut()
+                .flatten()
+                .find(|timer| timer.object == final_release.id())
+                .expect("staged Timer disappeared while recovering finalization");
+            assert_eq!(timer.transition, Some(TimerTransition::Finalize));
+            timer.arm = Some(old_arm);
+            timer.transition = None;
+            return Err((TimerError::Deadline(error), final_release));
         }
+        let mut timers = self.timers.lock();
+        let slot = timers
+            .iter_mut()
+            .find(|slot| {
+                slot.as_ref()
+                    .is_some_and(|timer| timer.object == final_release.id())
+            })
+            .expect("staged Timer disappeared during finalization");
+        assert_eq!(
+            slot.as_ref().and_then(|timer| timer.transition),
+            Some(TimerTransition::Finalize)
+        );
         *slot = None;
         Ok(TimerFinalization { final_release })
     }
@@ -560,10 +751,10 @@ mod tests {
 
         fn cancel_timer_deadline(
             &mut self,
-            registration: DeadlineRegistration,
+            registration: &DeadlineRegistration,
         ) -> Result<(), TimerDeadlineError> {
             self.queue
-                .cancel_if_live(registration)
+                .cancel_if_live_ref(registration)
                 .map(|_| ())
                 .map_err(|_| TimerDeadlineError::Fault)
         }
@@ -586,9 +777,61 @@ mod tests {
 
         fn cancel_timer_deadline(
             &mut self,
-            registration: DeadlineRegistration,
+            registration: &DeadlineRegistration,
         ) -> Result<(), TimerDeadlineError> {
             self.0.lock().unwrap().cancel_timer_deadline(registration)
+        }
+    }
+
+    struct FaultingDeadlines {
+        replace: bool,
+        cancel: bool,
+    }
+
+    impl TimerDeadlineAuthority for FaultingDeadlines {
+        fn replace_timer_deadline(
+            &mut self,
+            _old: Option<&DeadlineRegistration>,
+            _deadline_ns: u64,
+            _token: TimerExpiryToken,
+        ) -> Result<Option<DeadlineRegistration>, TimerDeadlineError> {
+            assert!(self.replace, "unexpected non-faulting replacement");
+            Err(TimerDeadlineError::Fault)
+        }
+
+        fn cancel_timer_deadline(
+            &mut self,
+            _registration: &DeadlineRegistration,
+        ) -> Result<(), TimerDeadlineError> {
+            assert!(self.cancel, "unexpected non-faulting cancellation");
+            Err(TimerDeadlineError::Fault)
+        }
+    }
+
+    struct ReentrantDeadlines<'a, const N: usize> {
+        timers: &'a TimerAuthority<1>,
+        key: TimerKey,
+        observed: Option<TimerError>,
+        inner: HostDeadlines<N>,
+    }
+
+    impl<const N: usize> TimerDeadlineAuthority for ReentrantDeadlines<'_, N> {
+        fn replace_timer_deadline(
+            &mut self,
+            old: Option<&DeadlineRegistration>,
+            deadline_ns: u64,
+            token: TimerExpiryToken,
+        ) -> Result<Option<DeadlineRegistration>, TimerDeadlineError> {
+            self.observed = self.timers.current_signals(self.key).err();
+            self.inner.replace_timer_deadline(old, deadline_ns, token)
+        }
+
+        fn cancel_timer_deadline(
+            &mut self,
+            registration: &DeadlineRegistration,
+        ) -> Result<(), TimerDeadlineError> {
+            self.observed = self.timers.current_signals(self.key).err();
+            self.inner.cancel_timer_deadline(registration)
         }
     }
 
@@ -1011,6 +1254,112 @@ mod tests {
     }
 
     #[test]
+    fn deadline_authority_and_readiness_callbacks_observe_recoverable_transition() {
+        let mut registry = ObjectRegistry::<2>::new();
+        let timers = TimerAuthority::<1>::new();
+        let waits = WaitRegistry::<1>::new();
+        let (key, handle) = timers.create_timer(&mut registry).unwrap();
+        let mut deadlines = ReentrantDeadlines {
+            timers: &timers,
+            key,
+            observed: None,
+            inner: HostDeadlines::<2>::new(10),
+        };
+
+        assert_eq!(
+            timers
+                .set(key, DwDeadline(20), &mut deadlines, &waits)
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            deadlines.observed,
+            Some(TimerError::TransitionInProgress),
+            "deadline authorities run after the Timer mutex is released"
+        );
+
+        let mut readiness_observed = None;
+        assert_eq!(
+            timers
+                .set_with_readiness_hook(key, DwDeadline(10), &mut deadlines, &waits, || {
+                    readiness_observed = timers.current_signals(key).err()
+                },)
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            readiness_observed,
+            Some(TimerError::TransitionInProgress),
+            "readiness callbacks run outside the Timer mutex"
+        );
+        assert_eq!(timers.current_signals(key), Ok(DW_SIGNAL_SIGNALED));
+
+        let final_release = registry.release_handle(handle).unwrap().unwrap();
+        let finalization = timers
+            .take_finalization(final_release, &mut deadlines)
+            .unwrap();
+        complete_timer_finalization(&mut registry, finalization);
+    }
+
+    #[test]
+    fn authority_faults_restore_active_arms_for_retry_and_finalization() {
+        let mut registry = ObjectRegistry::<2>::new();
+        let timers = TimerAuthority::<1>::new();
+        let waits = WaitRegistry::<1>::new();
+        let mut deadlines = HostDeadlines::<2>::new(10);
+        let (key, handle) = timers.create_timer(&mut registry).unwrap();
+
+        let _ = timers
+            .set(key, DwDeadline(20), &mut deadlines, &waits)
+            .unwrap();
+        let mut faults = FaultingDeadlines {
+            replace: true,
+            cancel: true,
+        };
+        assert!(matches!(
+            timers.set(key, DwDeadline(30), &mut faults, &waits),
+            Err(TimerError::Deadline(TimerDeadlineError::Fault))
+        ));
+        assert_eq!(timers.current_signals(key), Ok(DwSignals(0)));
+
+        let (expired, count) = deadlines.expire(20);
+        assert_eq!(count, 1);
+        assert_eq!(timers.expire(expired[0].unwrap(), &waits).unwrap().len(), 0);
+        assert_eq!(timers.current_signals(key), Ok(DW_SIGNAL_SIGNALED));
+
+        let _ = timers
+            .set(key, DwDeadline(40), &mut deadlines, &waits)
+            .unwrap();
+        assert_eq!(
+            timers.cancel(key, &mut faults),
+            Err(TimerError::Deadline(TimerDeadlineError::Fault))
+        );
+        let (expired, count) = deadlines.expire(40);
+        assert_eq!(count, 1);
+        assert_eq!(timers.expire(expired[0].unwrap(), &waits).unwrap().len(), 0);
+        assert_eq!(timers.current_signals(key), Ok(DW_SIGNAL_SIGNALED));
+
+        let _ = timers
+            .set(key, DwDeadline(50), &mut deadlines, &waits)
+            .unwrap();
+        let final_release = registry.release_handle(handle).unwrap().unwrap();
+        let (error, final_release) = match timers.take_finalization(final_release, &mut faults) {
+            Err(error) => error,
+            Ok(_) => panic!("faulting deadline authority accepted finalization"),
+        };
+        assert_eq!(error, TimerError::Deadline(TimerDeadlineError::Fault));
+        let (expired, count) = deadlines.expire(50);
+        assert_eq!(count, 1);
+        assert_eq!(timers.expire(expired[0].unwrap(), &waits).unwrap().len(), 0);
+        let finalization = timers
+            .take_finalization(final_release, &mut deadlines)
+            .unwrap();
+        complete_timer_finalization(&mut registry, finalization);
+    }
+
+    #[test]
     fn expiry_returns_irq_safe_wake_intent_without_consuming_wait_pin() {
         let mut registry = ObjectRegistry::<4>::new();
         let timers = TimerAuthority::<1>::new();
@@ -1168,32 +1517,44 @@ mod tests {
             let deadlines_ref = &deadlines;
             let rearm = scope.spawn(move || {
                 attempting_tx.send(()).unwrap();
-                let wakes = timers_ref
-                    .set(
+                finished_tx
+                    .send(timers_ref.set(
                         key,
                         DwDeadline(200),
                         &mut LockedHostDeadlines(deadlines_ref),
                         waits_ref,
-                    )
+                    ))
                     .unwrap();
-                assert_eq!(wakes.len(), 0);
-                let _new_registration = waits_ref
-                    .register(new_pin, DW_SIGNAL_SIGNALED, 1, new_thread, new_wake)
-                    .unwrap();
-                finished_tx.send(()).unwrap();
             });
             attempting_rx.recv().unwrap();
-            assert_eq!(
-                finished_rx.recv_timeout(Duration::from_millis(50)),
-                Err(mpsc::RecvTimeoutError::Timeout),
-                "rearm must remain behind the Timer readiness linearization point"
+            assert!(
+                matches!(
+                    finished_rx.recv_timeout(Duration::from_millis(50)).unwrap(),
+                    Err(TimerError::TransitionInProgress)
+                ),
+                "reentrant set must return a recoverable transition result"
             );
             continue_tx.send(()).unwrap();
             let batch = expiry.join().unwrap().unwrap();
             rearm.join().unwrap();
-            finished_rx.recv().unwrap();
             batch
         });
+
+        assert_eq!(
+            timers
+                .set(
+                    key,
+                    DwDeadline(200),
+                    &mut LockedHostDeadlines(&deadlines),
+                    &waits,
+                )
+                .unwrap()
+                .len(),
+            0
+        );
+        let _new_registration = waits
+            .register(new_pin, DW_SIGNAL_SIGNALED, 1, new_thread, new_wake)
+            .unwrap();
 
         let (wake_intents, pins) = batch.into_parts();
         assert!(pins.into_iter().flatten().next().is_none());
@@ -1258,32 +1619,44 @@ mod tests {
             let deadlines_ref = &deadlines;
             let rearm = scope.spawn(move || {
                 attempting_tx.send(()).unwrap();
-                let wakes = timers_ref
-                    .set(
+                finished_tx
+                    .send(timers_ref.set(
                         key,
                         DwDeadline(75),
                         &mut LockedHostDeadlines(deadlines_ref),
                         waits_ref,
-                    )
+                    ))
                     .unwrap();
-                assert_eq!(wakes.len(), 0);
-                let _new_registration = waits_ref
-                    .register(new_pin, DW_SIGNAL_SIGNALED, 1, new_thread, new_wake)
-                    .unwrap();
-                finished_tx.send(()).unwrap();
             });
             attempting_rx.recv().unwrap();
-            assert_eq!(
-                finished_rx.recv_timeout(Duration::from_millis(50)),
-                Err(mpsc::RecvTimeoutError::Timeout),
-                "rearm must remain behind the immediate-set readiness point"
+            assert!(
+                matches!(
+                    finished_rx.recv_timeout(Duration::from_millis(50)).unwrap(),
+                    Err(TimerError::TransitionInProgress)
+                ),
+                "reentrant set must return a recoverable transition result"
             );
             continue_tx.send(()).unwrap();
             let batch = immediate.join().unwrap().unwrap();
             rearm.join().unwrap();
-            finished_rx.recv().unwrap();
             batch
         });
+
+        assert_eq!(
+            timers
+                .set(
+                    key,
+                    DwDeadline(75),
+                    &mut LockedHostDeadlines(&deadlines),
+                    &waits,
+                )
+                .unwrap()
+                .len(),
+            0
+        );
+        let _new_registration = waits
+            .register(new_pin, DW_SIGNAL_SIGNALED, 1, new_thread, new_wake)
+            .unwrap();
 
         let (wake_intents, pins) = batch.into_parts();
         let intents: std::vec::Vec<_> = wake_intents.into_iter().flatten().collect();

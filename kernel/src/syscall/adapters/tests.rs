@@ -4809,10 +4809,10 @@ impl<const N: usize> crate::time::TimerDeadlineAuthority for AdapterTimerDeadlin
 
     fn cancel_timer_deadline(
         &mut self,
-        registration: crate::time::DeadlineRegistration,
+        registration: &crate::time::DeadlineRegistration,
     ) -> Result<(), crate::time::TimerDeadlineError> {
         self.queue
-            .cancel_if_live(registration)
+            .cancel_if_live_ref(registration)
             .map(|_| ())
             .map_err(|_| crate::time::TimerDeadlineError::Fault)
     }

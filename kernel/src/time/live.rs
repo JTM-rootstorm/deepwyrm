@@ -358,11 +358,11 @@ impl LiveTimeState {
 
     fn cancel_timer_deadline(
         &mut self,
-        registration: DeadlineRegistration,
+        registration: &DeadlineRegistration,
     ) -> Result<(), TimerDeadlineError> {
         let sample = self.sample_now().map_err(|_| TimerDeadlineError::Fault)?;
         self.timer_deadlines
-            .cancel_if_live(registration)
+            .cancel_if_live_ref(registration)
             .map_err(|_| TimerDeadlineError::Fault)?;
         if self.reprogram(sample).is_err() {
             halt_forever();
@@ -581,7 +581,7 @@ impl TimerDeadlineAuthority for LiveTimerDeadlineAuthority {
 
     fn cancel_timer_deadline(
         &mut self,
-        registration: DeadlineRegistration,
+        registration: &DeadlineRegistration,
     ) -> Result<(), TimerDeadlineError> {
         let state = live_state().ok_or(TimerDeadlineError::Fault)?;
         state.lock().cancel_timer_deadline(registration)

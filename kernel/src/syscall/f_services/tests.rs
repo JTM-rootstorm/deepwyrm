@@ -309,10 +309,10 @@ impl<const N: usize> TimerDeadlineAuthority for TestTimerDeadlines<N> {
 
     fn cancel_timer_deadline(
         &mut self,
-        registration: DeadlineRegistration,
+        registration: &DeadlineRegistration,
     ) -> Result<(), TimerDeadlineError> {
         self.queue
-            .cancel_if_live(registration)
+            .cancel_if_live_ref(registration)
             .map(|_| ())
             .map_err(|_| TimerDeadlineError::Fault)
     }
