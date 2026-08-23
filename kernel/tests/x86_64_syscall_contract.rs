@@ -310,6 +310,7 @@ fn f12_terminal_control_abandons_the_retiring_stack_before_runtime_reclaim() {
 fn h2_syscall_entry_and_native_runtime_carriers_are_fixed_per_cpu() {
     let live = source("src/arch/x86_64/syscall/live.rs");
     let runtime_binding = source("src/arch/x86_64/syscall/runtime_binding.rs");
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
     let arch = source("src/arch/x86_64/mod.rs");
 
     assert!(live.contains("[EntryStateStorage; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT]"));
@@ -330,6 +331,41 @@ fn h2_syscall_entry_and_native_runtime_carriers_are_fixed_per_cpu() {
     assert!(runtime_binding.contains("owners: SpinMutex<[usize; SLOTS]>"));
     assert!(runtime_binding.contains("owners.contains(&address)"));
     assert!(runtime_binding.contains("RuntimeCarrierClaimError::ContextAlreadyClaimed"));
+    assert!(live.contains("pub(crate) unsafe trait ParkedNativeRuntimeCarrier"));
+    assert!(live.contains("bind_parked_native_runtime_carrier_for_slot"));
+    assert!(!live.contains("EntryBindingError::NonBootstrapCpu"));
+
+    let shared = primordial
+        .split_once("struct PrimordialRuntimeShared")
+        .expect("stationary shared runtime")
+        .1
+        .split_once("impl crate::time::DeadlineWakeTarget")
+        .expect("stationary shared runtime extent")
+        .0;
+    for authority in ["execution:", "channels:", "events:", "timers:", "waits:"] {
+        assert!(
+            shared.contains(authority),
+            "shared runtime omitted {authority}"
+        );
+    }
+    for exclusive in [
+        "active:",
+        "registry:",
+        "memory:",
+        "tasks:",
+        "services:",
+        "regions:",
+    ] {
+        assert!(
+            !shared.contains(exclusive),
+            "unsynchronized {exclusive} leaked into the shared runtime"
+        );
+    }
+    assert!(primordial.contains("struct PrimordialRuntimeCarrier"));
+    assert!(primordial.contains("struct ParkedRuntimeCarrier"));
+    assert!(primordial.contains("bind_parked_runtime_carriers(shared)"));
+    assert!(primordial.contains("ParkedNativeRuntimeCarrier for ParkedRuntimeCarrier"));
+    assert!(primordial.contains("self.reject_entry(\"fresh userspace entry\")"));
 }
 
 #[test]
