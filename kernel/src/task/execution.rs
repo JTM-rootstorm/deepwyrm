@@ -1,7 +1,8 @@
-use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sync::SpinMutex;
 
+use super::scheduler::SchedulerCpuId;
 use super::{
     BlockReservation, BlockReservationFailure, BlockToken, BlockWakeKey, BlockedOperationRegistry,
     BlockedOperationsDrained, CooperativeScheduler, ExitPins, KernelStackId, ProcessKey,
@@ -312,19 +313,13 @@ impl<const CAPACITY: usize> ThreadContextPool<CAPACITY> {
     }
 }
 
-struct KernelContinuationSlot(UnsafeCell<u64>);
+struct KernelContinuationSlot(AtomicU64);
 
 impl KernelContinuationSlot {
     fn new() -> Self {
-        Self(UnsafeCell::new(0))
+        Self(AtomicU64::new(0))
     }
 }
-
-#[allow(
-    unsafe_code,
-    reason = "F2 uses one scheduler-owned writer/reader per Thread on the single BSP; DW0-H re-reviews publication for SMP"
-)]
-unsafe impl Sync for KernelContinuationSlot {}
 
 struct KernelContinuationPool<const CAPACITY: usize> {
     slots: [KernelContinuationSlot; CAPACITY],
@@ -348,41 +343,34 @@ impl<const CAPACITY: usize> KernelContinuationPool<CAPACITY> {
             .ok_or(ExecutionResourceError::InvalidId)
     }
 
-    #[allow(
-        unsafe_code,
-        reason = "the scheduler/execution owner guarantees no concurrent access to one continuation slot on the F2 BSP"
-    )]
     fn load(&self, context: ThreadContextId) -> Result<u64, ExecutionResourceError> {
         let slot = self.slot(context)?;
-        Ok(unsafe { core::ptr::read_volatile(slot.0.get()) })
+        Ok(slot.0.load(Ordering::Acquire))
     }
 
-    #[allow(
-        unsafe_code,
-        reason = "slot reset occurs only while the owning context is unpublished or being terminally reclaimed"
-    )]
     fn reset(&self, context: ThreadContextId) -> Result<(), ExecutionResourceError> {
         let slot = self.slot(context)?;
-        unsafe { core::ptr::write_volatile(slot.0.get(), 0) };
+        slot.0.store(0, Ordering::Release);
         Ok(())
     }
 
-    #[allow(
-        unsafe_code,
-        reason = "F2 seed publication is serialized by the execution owner before a continuation becomes runnable"
-    )]
     fn seed(&self, context: ThreadContextId, rsp: u64) -> Result<(), ExecutionResourceError> {
         let slot = self.slot(context)?;
-        let current = unsafe { core::ptr::read_volatile(slot.0.get()) };
-        if current != 0 {
-            return Err(ExecutionResourceError::ContinuationAlreadyInitialized);
-        }
-        unsafe { core::ptr::write_volatile(slot.0.get(), rsp) };
-        Ok(())
+        slot.0
+            .compare_exchange(0, rsp, Ordering::Release, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| ExecutionResourceError::ContinuationAlreadyInitialized)
     }
 
+    /// Returns the aligned storage written by the context-switch assembly.
+    ///
+    /// That non-atomic write is exclusive while the scheduler records the
+    /// outgoing continuation as CPU-owned.  After assembly has saved RSP, the
+    /// new carrier must call `complete_switch_on`; the scheduler lock's
+    /// Release/Acquire handoff makes the write happen-before a different CPU
+    /// can claim the Thread and Acquire-load this atomic slot.
     fn save_ptr(&self, context: ThreadContextId) -> Result<*mut u64, ExecutionResourceError> {
-        Ok(self.slot(context)?.0.get())
+        Ok(self.slot(context)?.0.as_ptr())
     }
 }
 
@@ -599,11 +587,26 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         self.scheduler.schedule_next()
     }
 
+    pub(crate) fn schedule_next_on(
+        &self,
+        cpu: SchedulerCpuId,
+    ) -> Result<super::ScheduleDecision, SchedulerError> {
+        self.scheduler.schedule_next_on(cpu)
+    }
+
     pub(crate) fn yield_current(
         &self,
         thread: ThreadKey,
     ) -> Result<super::ScheduleDecision, SchedulerError> {
         self.scheduler.yield_current(thread)
+    }
+
+    pub(crate) fn yield_current_on(
+        &self,
+        cpu: SchedulerCpuId,
+        thread: ThreadKey,
+    ) -> Result<super::ScheduleDecision, SchedulerError> {
+        self.scheduler.yield_current_on(cpu, thread)
     }
 
     pub(crate) fn schedule_from_idle(
@@ -613,11 +616,27 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         self.scheduler.schedule_from_idle(suspended)
     }
 
+    pub(crate) fn schedule_from_idle_on(
+        &self,
+        cpu: SchedulerCpuId,
+        suspended: ThreadKey,
+    ) -> Result<super::IdleScheduleDecision, SchedulerError> {
+        self.scheduler.schedule_from_idle_on(cpu, suspended)
+    }
+
     pub(crate) fn prepare_block_current(
         &self,
         thread: ThreadKey,
     ) -> Result<BlockReservation, SchedulerError> {
         self.scheduler.prepare_block_current(thread)
+    }
+
+    pub(crate) fn prepare_block_current_on(
+        &self,
+        cpu: SchedulerCpuId,
+        thread: ThreadKey,
+    ) -> Result<BlockReservation, SchedulerError> {
+        self.scheduler.prepare_block_current_on(cpu, thread)
     }
 
     pub(crate) fn cancel_block(
@@ -627,6 +646,14 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         self.scheduler.cancel_block(reservation)
     }
 
+    pub(crate) fn cancel_block_on(
+        &self,
+        cpu: SchedulerCpuId,
+        reservation: BlockReservation,
+    ) -> Result<(), BlockReservationFailure> {
+        self.scheduler.cancel_block_on(cpu, reservation)
+    }
+
     pub(crate) fn commit_block(
         &self,
         reservation: BlockReservation,
@@ -634,11 +661,35 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         self.scheduler.commit_block(reservation)
     }
 
+    pub(crate) fn commit_block_on(
+        &self,
+        cpu: SchedulerCpuId,
+        reservation: BlockReservation,
+    ) -> Result<super::ScheduleDecision, BlockReservationFailure> {
+        self.scheduler.commit_block_on(cpu, reservation)
+    }
+
     pub(crate) fn block_current(
         &self,
         thread: ThreadKey,
     ) -> Result<(BlockToken, super::ScheduleDecision), SchedulerError> {
         self.scheduler.block_current(thread)
+    }
+
+    pub(crate) fn block_current_on(
+        &self,
+        cpu: SchedulerCpuId,
+        thread: ThreadKey,
+    ) -> Result<(BlockToken, super::ScheduleDecision), SchedulerError> {
+        self.scheduler.block_current_on(cpu, thread)
+    }
+
+    pub(crate) fn complete_switch_on(
+        &self,
+        cpu: SchedulerCpuId,
+        previous: ThreadKey,
+    ) -> Result<(), SchedulerError> {
+        self.scheduler.complete_switch_on(cpu, previous)
     }
 
     pub(crate) fn wake(&self, key: BlockWakeKey) -> Result<(), SchedulerError> {
@@ -664,17 +715,32 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         &self,
         pins: ExitPins<THREADS>,
     ) -> RetiredExitPins<THREADS> {
-        if let Some(current) = self.scheduler.current() {
-            assert!(
-                !pins
-                    .thread_keys()
-                    .into_iter()
-                    .flatten()
-                    .any(|thread| thread == current),
-                "immediate terminal retirement contained the physical current Thread"
-            );
-        }
-        self.retire_exit_pins_inner(pins, None).0
+        assert!(
+            !pins
+                .thread_keys()
+                .into_iter()
+                .flatten()
+                .any(|thread| self.scheduler.running_cpu(thread).is_some()),
+            "immediate terminal retirement contained a physical current Thread"
+        );
+        self.retire_exit_pins_inner(pins, None, SchedulerCpuId::BOOTSTRAP)
+            .0
+    }
+
+    pub(crate) fn retire_exit_pins_on<const THREADS: usize>(
+        &self,
+        cpu: SchedulerCpuId,
+        pins: ExitPins<THREADS>,
+    ) -> RetiredExitPins<THREADS> {
+        assert!(
+            !pins
+                .thread_keys()
+                .into_iter()
+                .flatten()
+                .any(|thread| self.scheduler.running_cpu(thread).is_some()),
+            "immediate terminal retirement contained a physical current Thread"
+        );
+        self.retire_exit_pins_inner(pins, None, cpu).0
     }
 
     /// Retires one terminal batch while preserving the named current Thread's
@@ -685,8 +751,22 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         pins: ExitPins<THREADS>,
         current: ThreadKey,
     ) -> (RetiredExitPins<THREADS>, DeferredCurrentExecutionResources) {
+        let retired =
+            self.retire_exit_pins_defer_current_on(SchedulerCpuId::BOOTSTRAP, pins, current);
+        self.scheduler
+            .complete_switch_on(SchedulerCpuId::BOOTSTRAP, current)
+            .expect("BSP terminal model handoff follows current retirement");
+        retired
+    }
+
+    pub(crate) fn retire_exit_pins_defer_current_on<const THREADS: usize>(
+        &self,
+        cpu: SchedulerCpuId,
+        pins: ExitPins<THREADS>,
+        current: ThreadKey,
+    ) -> (RetiredExitPins<THREADS>, DeferredCurrentExecutionResources) {
         assert_eq!(
-            self.scheduler.current(),
+            self.scheduler.current_on(cpu),
             Some(current),
             "deferred terminal retirement did not name the physical current Thread"
         );
@@ -697,7 +777,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                 .any(|thread| thread == current),
             "deferred terminal retirement batch did not contain the physical current Thread"
         );
-        let (pins, deferred) = self.retire_exit_pins_inner(pins, Some(current));
+        let (pins, deferred) = self.retire_exit_pins_inner(pins, Some(current), cpu);
         (
             pins,
             deferred.expect("terminal batch did not contain the running current Thread"),
@@ -708,55 +788,70 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         &self,
         pins: ExitPins<THREADS>,
         defer_current: Option<ThreadKey>,
+        cpu: SchedulerCpuId,
     ) -> (
         RetiredExitPins<THREADS>,
         Option<DeferredCurrentExecutionResources>,
     ) {
-        let (mut process, thread_pins, resources) = pins.into_parts();
+        let (mut process, mut thread_pins, mut resources) = pins.into_parts();
         let mut retired_threads = core::array::from_fn(|_| None);
         let mut deferred = None;
-        for (index, (pin, resources)) in thread_pins.into_iter().zip(resources).enumerate() {
-            let Some(pin) = pin else {
-                assert!(
-                    resources.is_none(),
-                    "resource exists without a terminal thread pin"
-                );
-                continue;
-            };
-            let thread = ThreadKey::from_object_id(pin.id());
-            assert!(
-                !self.blocked_operations.has_thread(thread),
-                "terminal Thread still owns a blocked operation at execution-resource reclaim",
-            );
-            let scheduled = self.scheduler.state(thread).is_some();
-            assert_eq!(
-                scheduled,
-                resources.is_some(),
-                "scheduler/resource ownership diverged at terminal retirement"
-            );
-            if scheduled {
-                self.scheduler.retire(thread).unwrap_or_else(|error| {
-                    panic!("terminal thread was not removable from scheduler: {error:?}")
-                });
-            }
-            if let Some(resources) = resources {
-                if defer_current == Some(thread) {
+        // Retire every non-current member first. Otherwise retiring `current`
+        // can select a terminal sibling as its replacement and manufacture a
+        // transient Running owner that the same batch must immediately undo.
+        for deferred_pass in [false, true] {
+            for index in 0..THREADS {
+                let Some(pin) = thread_pins[index].as_ref() else {
                     assert!(
-                        deferred.is_none(),
-                        "terminal batch contained duplicate current execution resources"
+                        resources[index].is_none(),
+                        "resource exists without a terminal thread pin"
                     );
-                    deferred = Some(DeferredCurrentExecutionResources {
-                        thread,
-                        resources: Some(resources),
-                        process_pin: None,
-                        thread_pin: Some(pin),
-                    });
+                    continue;
+                };
+                let thread = ThreadKey::from_object_id(pin.id());
+                if (defer_current == Some(thread)) != deferred_pass {
+                    continue;
+                }
+                let pin = thread_pins[index]
+                    .take()
+                    .expect("selected terminal thread retains its pin");
+                let resources = resources[index].take();
+                assert!(
+                    !self.blocked_operations.has_thread(thread),
+                    "terminal Thread still owns a blocked operation at execution-resource reclaim",
+                );
+                let scheduled = self.scheduler.state(thread).is_some();
+                assert_eq!(
+                    scheduled,
+                    resources.is_some(),
+                    "scheduler/resource ownership diverged at terminal retirement"
+                );
+                if scheduled {
+                    self.scheduler
+                        .retire_on(cpu, thread)
+                        .unwrap_or_else(|error| {
+                            panic!("terminal thread was not removable from scheduler: {error:?}")
+                        });
+                }
+                if let Some(resources) = resources {
+                    if defer_current == Some(thread) {
+                        assert!(
+                            deferred.is_none(),
+                            "terminal batch contained duplicate current execution resources"
+                        );
+                        deferred = Some(DeferredCurrentExecutionResources {
+                            thread,
+                            resources: Some(resources),
+                            process_pin: None,
+                            thread_pin: Some(pin),
+                        });
+                    } else {
+                        self.reclaim_resources(resources);
+                        retired_threads[index] = Some(pin);
+                    }
                 } else {
-                    self.reclaim_resources(resources);
                     retired_threads[index] = Some(pin);
                 }
-            } else {
-                retired_threads[index] = Some(pin);
             }
         }
         if let Some(deferred) = deferred.as_mut() {
@@ -781,6 +876,11 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
             self.scheduler.state(deferred.thread),
             None,
             "deferred current Thread became schedulable before resource reclaim"
+        );
+        assert_eq!(
+            self.scheduler.suspended_cpu(deferred.thread),
+            None,
+            "deferred current Thread continuation was reclaimed before CPU handoff acknowledgement"
         );
         let resources = deferred
             .resources
@@ -893,7 +993,30 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         decision: super::ScheduleDecision,
     ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan<'owner>, ExecutionSwitchError> {
-        unsafe { self.prepare_kernel_switch_inner(tasks, decision, false, None) }
+        unsafe { self.prepare_kernel_switch_inner(tasks, None, decision, false, None) }
+    }
+
+    /// CPU-owned counterpart of [`Self::prepare_kernel_switch`].
+    ///
+    /// The scheduler must still record `decision.previous` as the suspended
+    /// continuation on `cpu`; this closes cross-CPU decision substitution.
+    #[allow(
+        unsafe_code,
+        reason = "the caller proves the active CPU and continuation identity while the scheduler validates their exact ownership"
+    )]
+    pub(crate) unsafe fn prepare_kernel_switch_on<
+        'owner,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &'owner self,
+        tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        cpu: SchedulerCpuId,
+        decision: super::ScheduleDecision,
+    ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan<'owner>, ExecutionSwitchError> {
+        unsafe { self.prepare_kernel_switch_inner(tasks, Some(cpu), decision, false, None) }
     }
 
     /// Builds a blocking switch plan whose destination may be either a genuine
@@ -925,7 +1048,41 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         trusted_first_run_entry: u64,
     ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan<'owner>, ExecutionSwitchError> {
         unsafe {
-            self.prepare_kernel_switch_inner(tasks, decision, false, Some(trusted_first_run_entry))
+            self.prepare_kernel_switch_inner(
+                tasks,
+                None,
+                decision,
+                false,
+                Some(trusted_first_run_entry),
+            )
+        }
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "the caller proves the active CPU, continuation identity, and trusted first-run entry while the scheduler validates ownership"
+    )]
+    pub(crate) unsafe fn prepare_blocking_kernel_switch_on<
+        'owner,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &'owner self,
+        tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        cpu: SchedulerCpuId,
+        decision: super::ScheduleDecision,
+        trusted_first_run_entry: u64,
+    ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan<'owner>, ExecutionSwitchError> {
+        unsafe {
+            self.prepare_kernel_switch_inner(
+                tasks,
+                Some(cpu),
+                decision,
+                false,
+                Some(trusted_first_run_entry),
+            )
         }
     }
 
@@ -954,7 +1111,26 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         decision: super::ScheduleDecision,
     ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan<'owner>, ExecutionSwitchError> {
-        unsafe { self.prepare_kernel_switch_inner(tasks, decision, true, None) }
+        unsafe { self.prepare_kernel_switch_inner(tasks, None, decision, true, None) }
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "the idle caller proves the active CPU and suspended continuation while the scheduler validates the exact carrier"
+    )]
+    pub(crate) unsafe fn prepare_idle_kernel_switch_on<
+        'owner,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &'owner self,
+        tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        cpu: SchedulerCpuId,
+        decision: super::ScheduleDecision,
+    ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan<'owner>, ExecutionSwitchError> {
+        unsafe { self.prepare_kernel_switch_inner(tasks, Some(cpu), decision, true, None) }
     }
 
     /// Idle-suspend counterpart of [`Self::prepare_blocking_kernel_switch`].
@@ -983,7 +1159,41 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         trusted_first_run_entry: u64,
     ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan<'owner>, ExecutionSwitchError> {
         unsafe {
-            self.prepare_kernel_switch_inner(tasks, decision, true, Some(trusted_first_run_entry))
+            self.prepare_kernel_switch_inner(
+                tasks,
+                None,
+                decision,
+                true,
+                Some(trusted_first_run_entry),
+            )
+        }
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "the idle caller proves CPU, continuation, and first-run entry ownership while the scheduler validates the exact carrier"
+    )]
+    pub(crate) unsafe fn prepare_idle_blocking_kernel_switch_on<
+        'owner,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &'owner self,
+        tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        cpu: SchedulerCpuId,
+        decision: super::ScheduleDecision,
+        trusted_first_run_entry: u64,
+    ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan<'owner>, ExecutionSwitchError> {
+        unsafe {
+            self.prepare_kernel_switch_inner(
+                tasks,
+                Some(cpu),
+                decision,
+                true,
+                Some(trusted_first_run_entry),
+            )
         }
     }
 
@@ -1000,6 +1210,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     >(
         &'owner self,
         tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        cpu: Option<SchedulerCpuId>,
         decision: super::ScheduleDecision,
         allow_runnable_previous: bool,
         trusted_first_run_entry: Option<u64>,
@@ -1008,6 +1219,9 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
             .previous
             .ok_or(ExecutionSwitchError::MissingPrevious)?;
         let next = decision.current.ok_or(ExecutionSwitchError::MissingNext)?;
+        if cpu.is_some_and(|cpu| self.scheduler.validate_switch_on(cpu, decision).is_err()) {
+            return Err(ExecutionSwitchError::WrongSchedulerState);
+        }
         let previous_state = self.scheduler.state(previous);
         let previous_valid = previous_state == Some(super::SchedulerThreadState::Blocked)
             || (allow_runnable_previous

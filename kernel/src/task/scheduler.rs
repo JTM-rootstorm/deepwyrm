@@ -6,6 +6,32 @@ use super::ThreadKey;
 
 static NEXT_SCHEDULER_DOMAIN: AtomicU64 = AtomicU64::new(1);
 
+/// DW0-H's bounded logical scheduler-CPU namespace.
+///
+/// This is an internal ownership identity, not a userspace ABI value.  The
+/// canonical SMP profile has exactly four CPUs, so accepting a fifth owner is
+/// an explicit error rather than silently aliasing or dropping it.
+pub(crate) const H2_SCHEDULER_CPU_CAPACITY: usize = 4;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SchedulerCpuId(u8);
+
+impl SchedulerCpuId {
+    pub(crate) const BOOTSTRAP: Self = Self(0);
+
+    pub(crate) const fn new(index: usize) -> Option<Self> {
+        if index < H2_SCHEDULER_CPU_CAPACITY {
+            Some(Self(index as u8))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 fn mint_scheduler_domain() -> u64 {
     NEXT_SCHEDULER_DOMAIN
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -25,8 +51,11 @@ pub(crate) enum SchedulerError {
     CurrentThreadRunning,
     NotScheduled,
     NotRunning,
+    WrongCpu,
     TokenExhausted,
     BlockPreparationActive,
+    SwitchPending,
+    ContinuationOwned,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,6 +71,7 @@ pub(crate) struct BlockWakeKey {
     domain: u64,
     token: u64,
     thread: ThreadKey,
+    cpu: SchedulerCpuId,
 }
 
 #[must_use = "prepared block ownership must be committed only after wait/deadline registration or explicitly cancelled"]
@@ -130,6 +160,20 @@ struct QueueEntry {
     thread: ThreadKey,
     state: SchedulerThreadState,
     token: u64,
+    block_cpu: Option<SchedulerCpuId>,
+    continuation_cpu: Option<SchedulerCpuId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SuspendedPublication {
+    Queued,
+    Retired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SuspendedContinuation {
+    thread: ThreadKey,
+    publication: SuspendedPublication,
 }
 
 struct SchedulerState<const CAPACITY: usize> {
@@ -137,8 +181,9 @@ struct SchedulerState<const CAPACITY: usize> {
     next_token: u64,
     queue: [Option<QueueEntry>; CAPACITY],
     len: usize,
-    current: Option<ThreadKey>,
-    pending_block: Option<BlockWakeKey>,
+    running: [Option<ThreadKey>; H2_SCHEDULER_CPU_CAPACITY],
+    pending_block: [Option<BlockWakeKey>; H2_SCHEDULER_CPU_CAPACITY],
+    suspended: [Option<SuspendedContinuation>; H2_SCHEDULER_CPU_CAPACITY],
 }
 
 impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
@@ -148,13 +193,14 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             next_token: 1,
             queue: [None; CAPACITY],
             len: 0,
-            current: None,
-            pending_block: None,
+            running: [None; H2_SCHEDULER_CPU_CAPACITY],
+            pending_block: [None; H2_SCHEDULER_CPU_CAPACITY],
+            suspended: [None; H2_SCHEDULER_CPU_CAPACITY],
         }
     }
 
     fn contains(&self, thread: ThreadKey) -> bool {
-        self.current == Some(thread)
+        self.running.contains(&Some(thread))
             || self.queue[..self.len]
                 .iter()
                 .flatten()
@@ -182,21 +228,82 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         removed
     }
 
-    fn pop_first_runnable(&mut self) -> Option<ThreadKey> {
+    fn pop_first_runnable(&mut self) -> Option<QueueEntry> {
         let index = self.queue[..self.len].iter().position(|entry| {
-            entry.is_some_and(|entry| entry.state == SchedulerThreadState::Runnable)
+            entry.is_some_and(|entry| {
+                entry.state == SchedulerThreadState::Runnable && entry.continuation_cpu.is_none()
+            })
         })?;
-        Some(self.remove_index(index).thread)
+        Some(self.remove_index(index))
+    }
+
+    fn pop_first_runnable_for_idle(&mut self, cpu: SchedulerCpuId) -> Option<QueueEntry> {
+        let index = self.queue[..self.len].iter().position(|entry| {
+            entry.is_some_and(|entry| {
+                entry.state == SchedulerThreadState::Runnable
+                    && (entry.continuation_cpu.is_none() || entry.continuation_cpu == Some(cpu))
+            })
+        })?;
+        Some(self.remove_index(index))
+    }
+
+    fn running_cpu(&self, thread: ThreadKey) -> Option<SchedulerCpuId> {
+        self.running
+            .iter()
+            .position(|current| *current == Some(thread))
+            .and_then(SchedulerCpuId::new)
     }
 
     fn check_invariants(&self) -> Result<(), SchedulerError> {
         if self.len > CAPACITY || self.queue[self.len..].iter().any(Option::is_some) {
             return Err(SchedulerError::Capacity);
         }
-        if let Some(pending) = self.pending_block
-            && self.current != Some(pending.thread)
-        {
-            return Err(SchedulerError::StaleBlockToken);
+        for (cpu_index, pending) in self.pending_block.iter().copied().enumerate() {
+            if let Some(pending) = pending {
+                let cpu = SchedulerCpuId::new(cpu_index).expect("bounded scheduler CPU index");
+                if pending.cpu != cpu || self.running[cpu_index] != Some(pending.thread) {
+                    return Err(SchedulerError::StaleBlockToken);
+                }
+            }
+        }
+        for (cpu_index, current) in self.running.iter().copied().enumerate() {
+            if let Some(current) = current
+                && (self.running[..cpu_index].contains(&Some(current))
+                    || self.queue[..self.len]
+                        .iter()
+                        .flatten()
+                        .any(|entry| entry.thread == current))
+            {
+                return Err(SchedulerError::DuplicateThread);
+            }
+        }
+        for (cpu_index, suspended) in self.suspended.iter().copied().enumerate() {
+            let Some(suspended) = suspended else {
+                continue;
+            };
+            if self.suspended[..cpu_index]
+                .iter()
+                .flatten()
+                .any(|prior| prior.thread == suspended.thread)
+                || self.running.contains(&Some(suspended.thread))
+            {
+                return Err(SchedulerError::DuplicateThread);
+            }
+            let cpu = SchedulerCpuId::new(cpu_index).expect("bounded scheduler CPU index");
+            let queued_owner = self.queue[..self.len]
+                .iter()
+                .flatten()
+                .find(|entry| entry.thread == suspended.thread)
+                .map(|entry| entry.continuation_cpu);
+            match suspended.publication {
+                SuspendedPublication::Queued if queued_owner != Some(Some(cpu)) => {
+                    return Err(SchedulerError::ContinuationOwned);
+                }
+                SuspendedPublication::Retired if queued_owner.is_some() => {
+                    return Err(SchedulerError::ContinuationOwned);
+                }
+                _ => {}
+            }
         }
         for (index, entry) in self.queue[..self.len].iter().enumerate() {
             let Some(entry) = entry else {
@@ -212,7 +319,21 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             if entry.state == SchedulerThreadState::Runnable && entry.token != 0 {
                 return Err(SchedulerError::StaleReservation);
             }
-            if self.current == Some(entry.thread)
+            if entry.state == SchedulerThreadState::Blocked && entry.block_cpu.is_none() {
+                return Err(SchedulerError::StaleBlockToken);
+            }
+            if entry.state != SchedulerThreadState::Blocked && entry.block_cpu.is_some() {
+                return Err(SchedulerError::StaleBlockToken);
+            }
+            if entry.continuation_cpu.is_some()
+                && !self.suspended.iter().flatten().any(|suspended| {
+                    suspended.thread == entry.thread
+                        && suspended.publication == SuspendedPublication::Queued
+                })
+            {
+                return Err(SchedulerError::ContinuationOwned);
+            }
+            if self.running.contains(&Some(entry.thread))
                 || self.queue[..index]
                     .iter()
                     .flatten()
@@ -225,10 +346,13 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
     }
 }
 
-/// Deterministic non-preemptive BSP scheduler.
+/// Deterministic non-preemptive scheduler with four bounded CPU owners.
 ///
 /// The private spin lock never escapes a method call. Callers therefore cannot
-/// nest scheduler ownership around task finalization or process handle-table work.
+/// nest scheduler ownership around task finalization or process handle-table
+/// work.  Releasing this lock from [`Self::complete_switch_on`] is also the
+/// continuation-publication Release edge: another CPU must acquire this lock
+/// to make that queued continuation eligible and claim it.
 pub(crate) struct CooperativeScheduler<const CAPACITY: usize> {
     state: IrqSpinMutex<SchedulerState<CAPACITY>>,
 }
@@ -248,7 +372,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         if state.contains(thread) {
             return Err(SchedulerError::DuplicateThread);
         }
-        if state.len + usize::from(state.current.is_some()) >= CAPACITY {
+        if state.len + state.running.iter().flatten().count() >= CAPACITY {
             return Err(SchedulerError::Capacity);
         }
         let token = state.next_token;
@@ -262,6 +386,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             thread,
             state: SchedulerThreadState::Reserved,
             token,
+            block_cpu: None,
+            continuation_cpu: None,
         })?;
         debug_assert_eq!(state.check_invariants(), Ok(()));
         Ok(SchedulerReservation {
@@ -334,13 +460,21 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         Ok(())
     }
 
-    pub(crate) fn schedule_next(&self) -> Result<ScheduleDecision, SchedulerError> {
+    /// Atomically claims the oldest unowned Runnable Thread for `cpu`.
+    pub(crate) fn schedule_next_on(
+        &self,
+        cpu: SchedulerCpuId,
+    ) -> Result<ScheduleDecision, SchedulerError> {
         let mut state = self.state.lock();
-        if state.current.is_some() {
+        let cpu_index = cpu.index();
+        if state.running[cpu_index].is_some() {
             return Err(SchedulerError::CurrentThreadRunning);
         }
-        let current = state.pop_first_runnable();
-        state.current = current;
+        if state.suspended[cpu_index].is_some() {
+            return Err(SchedulerError::SwitchPending);
+        }
+        let current = state.pop_first_runnable().map(|entry| entry.thread);
+        state.running[cpu_index] = current;
         debug_assert_eq!(state.check_invariants(), Ok(()));
         Ok(ScheduleDecision {
             previous: None,
@@ -348,29 +482,46 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         })
     }
 
-    pub(crate) fn yield_current(
+    pub(crate) fn yield_current_on(
         &self,
+        cpu: SchedulerCpuId,
         thread: ThreadKey,
     ) -> Result<ScheduleDecision, SchedulerError> {
         let mut state = self.state.lock();
-        if state.current != Some(thread) {
-            return Err(SchedulerError::NotRunning);
+        let cpu_index = cpu.index();
+        if state.running[cpu_index] != Some(thread) {
+            return if state.running_cpu(thread).is_some() {
+                Err(SchedulerError::WrongCpu)
+            } else {
+                Err(SchedulerError::NotRunning)
+            };
         }
-        if state.pending_block.is_some() {
+        if state.pending_block[cpu_index].is_some() {
             return Err(SchedulerError::BlockPreparationActive);
         }
-        let Some(next) = state.pop_first_runnable() else {
+        if state.suspended[cpu_index].is_some() {
+            return Err(SchedulerError::SwitchPending);
+        }
+        let Some(next) = state.pop_first_runnable().map(|entry| entry.thread) else {
             return Ok(ScheduleDecision {
                 previous: Some(thread),
                 current: Some(thread),
             });
         };
-        state.push(QueueEntry {
+        state.running[cpu_index] = Some(next);
+        state
+            .push(QueueEntry {
+                thread,
+                state: SchedulerThreadState::Runnable,
+                token: 0,
+                block_cpu: None,
+                continuation_cpu: Some(cpu),
+            })
+            .expect("replacing one Running Thread preserves scheduler capacity");
+        state.suspended[cpu_index] = Some(SuspendedContinuation {
             thread,
-            state: SchedulerThreadState::Runnable,
-            token: 0,
-        })?;
-        state.current = Some(next);
+            publication: SuspendedPublication::Queued,
+        });
         debug_assert_eq!(state.check_invariants(), Ok(()));
         Ok(ScheduleDecision {
             previous: Some(thread),
@@ -378,15 +529,24 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         })
     }
 
-    pub(crate) fn prepare_block_current(
+    pub(crate) fn prepare_block_current_on(
         &self,
+        cpu: SchedulerCpuId,
         thread: ThreadKey,
     ) -> Result<BlockReservation, SchedulerError> {
         let mut state = self.state.lock();
-        if state.current != Some(thread) {
-            return Err(SchedulerError::NotRunning);
+        let cpu_index = cpu.index();
+        if state.running[cpu_index] != Some(thread) {
+            return if state.running_cpu(thread).is_some() {
+                Err(SchedulerError::WrongCpu)
+            } else {
+                Err(SchedulerError::NotRunning)
+            };
         }
-        if state.pending_block.is_some() {
+        if state.suspended[cpu_index].is_some() {
+            return Err(SchedulerError::SwitchPending);
+        }
+        if state.pending_block[cpu_index].is_some() {
             return Err(SchedulerError::BlockPreparationActive);
         }
         let token = state.next_token;
@@ -399,14 +559,16 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             domain: state.domain,
             token,
             thread,
+            cpu,
         };
-        state.pending_block = Some(key);
+        state.pending_block[cpu_index] = Some(key);
         debug_assert_eq!(state.check_invariants(), Ok(()));
         Ok(BlockReservation { key })
     }
 
-    pub(crate) fn cancel_block(
+    pub(crate) fn cancel_block_on(
         &self,
+        cpu: SchedulerCpuId,
         reservation: BlockReservation,
     ) -> Result<(), BlockReservationFailure> {
         let mut state = self.state.lock();
@@ -416,19 +578,20 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 reservation,
             });
         }
-        if state.pending_block != Some(reservation.key) {
+        if reservation.key.cpu != cpu || state.pending_block[cpu.index()] != Some(reservation.key) {
             return Err(BlockReservationFailure {
                 error: SchedulerError::StaleBlockToken,
                 reservation,
             });
         }
-        state.pending_block = None;
+        state.pending_block[cpu.index()] = None;
         debug_assert_eq!(state.check_invariants(), Ok(()));
         Ok(())
     }
 
-    pub(crate) fn commit_block(
+    pub(crate) fn commit_block_on(
         &self,
+        cpu: SchedulerCpuId,
         reservation: BlockReservation,
     ) -> Result<ScheduleDecision, BlockReservationFailure> {
         let mut state = self.state.lock();
@@ -438,25 +601,34 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 reservation,
             });
         }
-        if state.pending_block != Some(reservation.key)
-            || state.current != Some(reservation.key.thread)
+        let cpu_index = cpu.index();
+        if reservation.key.cpu != cpu
+            || state.pending_block[cpu_index] != Some(reservation.key)
+            || state.running[cpu_index] != Some(reservation.key.thread)
+            || state.suspended[cpu_index].is_some()
         {
             return Err(BlockReservationFailure {
                 error: SchedulerError::StaleBlockToken,
                 reservation,
             });
         }
-        state.pending_block = None;
+        state.pending_block[cpu_index] = None;
+        state.running[cpu_index] = None;
         state
             .push(QueueEntry {
                 thread: reservation.key.thread,
                 state: SchedulerThreadState::Blocked,
                 token: reservation.key.token,
+                block_cpu: Some(cpu),
+                continuation_cpu: Some(cpu),
             })
-            .expect("running scheduler member always has queue capacity when it becomes blocked");
-        state.current = None;
-        let current = state.pop_first_runnable();
-        state.current = current;
+            .expect("moving one Running Thread to the queue preserves scheduler capacity");
+        let current = state.pop_first_runnable().map(|entry| entry.thread);
+        state.running[cpu_index] = current;
+        state.suspended[cpu_index] = Some(SuspendedContinuation {
+            thread: reservation.key.thread,
+            publication: SuspendedPublication::Queued,
+        });
         debug_assert_eq!(state.check_invariants(), Ok(()));
         Ok(ScheduleDecision {
             previous: Some(reservation.key.thread),
@@ -464,13 +636,14 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         })
     }
 
-    pub(crate) fn block_current(
+    pub(crate) fn block_current_on(
         &self,
+        cpu: SchedulerCpuId,
         thread: ThreadKey,
     ) -> Result<(BlockToken, ScheduleDecision), SchedulerError> {
-        let reservation = self.prepare_block_current(thread)?;
+        let reservation = self.prepare_block_current_on(cpu, thread)?;
         let key = reservation.wake_key();
-        match self.commit_block(reservation) {
+        match self.commit_block_on(cpu, reservation) {
             Ok(decision) => Ok((BlockToken { key }, decision)),
             Err(failure) => Err(failure.error()),
         }
@@ -485,12 +658,14 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         let Some(entry) = state.queue[..len].iter_mut().flatten().find(|entry| {
             entry.thread == key.thread
                 && entry.token == key.token
+                && entry.block_cpu == Some(key.cpu)
                 && entry.state == SchedulerThreadState::Blocked
         }) else {
             return Err(SchedulerError::StaleBlockToken);
         };
         entry.state = SchedulerThreadState::Runnable;
         entry.token = 0;
+        entry.block_cpu = None;
         debug_assert_eq!(state.check_invariants(), Ok(()));
         Ok(())
     }
@@ -512,10 +687,14 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         }
         if state
             .pending_block
-            .is_some_and(|pending| pending.token == key.token && pending != key)
+            .iter()
+            .flatten()
+            .any(|pending| pending.token == key.token && *pending != key)
             || state.queue[..state.len].iter().flatten().any(|entry| {
                 entry.token == key.token
-                    && (entry.thread != key.thread || entry.state != SchedulerThreadState::Blocked)
+                    && (entry.thread != key.thread
+                        || entry.state != SchedulerThreadState::Blocked
+                        || entry.block_cpu != Some(key.cpu))
             })
         {
             return Err(SchedulerError::StaleBlockToken);
@@ -531,52 +710,139 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     /// another Runnable Thread wins FIFO order, the returned decision names the
     /// physically-active suspended continuation as `previous` so the execution
     /// owner can save it before switching away.
-    pub(crate) fn schedule_from_idle(
+    pub(crate) fn schedule_from_idle_on(
         &self,
+        cpu: SchedulerCpuId,
         suspended: ThreadKey,
     ) -> Result<IdleScheduleDecision, SchedulerError> {
         let mut state = self.state.lock();
-        if state.current.is_some() {
+        let cpu_index = cpu.index();
+        if state.running[cpu_index].is_some() {
             return Err(SchedulerError::CurrentThreadRunning);
         }
-        let suspended_present = state.queue[..state.len]
-            .iter()
-            .flatten()
-            .any(|entry| entry.thread == suspended);
-        if !suspended_present {
-            return Err(SchedulerError::NotScheduled);
+        if state.suspended[cpu_index]
+            != Some(SuspendedContinuation {
+                thread: suspended,
+                publication: SuspendedPublication::Queued,
+            })
+        {
+            return Err(SchedulerError::ContinuationOwned);
         }
-        let Some(next) = state.pop_first_runnable() else {
+        let Some(next) = state.pop_first_runnable_for_idle(cpu) else {
             debug_assert_eq!(state.check_invariants(), Ok(()));
             return Ok(IdleScheduleDecision::ContinueIdle);
         };
-        state.current = Some(next);
-        debug_assert_eq!(state.check_invariants(), Ok(()));
-        if next == suspended {
+        state.running[cpu_index] = Some(next.thread);
+        if next.thread == suspended {
+            state.suspended[cpu_index] = None;
+            debug_assert_eq!(next.continuation_cpu, Some(cpu));
+            debug_assert_eq!(state.check_invariants(), Ok(()));
             Ok(IdleScheduleDecision::ResumeCurrent)
         } else {
+            debug_assert_eq!(next.continuation_cpu, None);
+            debug_assert_eq!(state.check_invariants(), Ok(()));
             Ok(IdleScheduleDecision::Switch(ScheduleDecision {
                 previous: Some(suspended),
-                current: Some(next),
+                current: Some(next.thread),
             }))
         }
     }
 
-    pub(crate) fn retire(&self, thread: ThreadKey) -> Result<ScheduleDecision, SchedulerError> {
+    /// Publishes that `cpu` has saved or abandoned its outgoing continuation.
+    ///
+    /// The architecture switch path writes the outgoing saved RSP before this
+    /// call. Dropping the scheduler lock is a Release operation; a contender
+    /// must subsequently acquire the same lock before it can claim the now
+    /// unowned Runnable Thread and Acquire-load its continuation slot.
+    pub(crate) fn complete_switch_on(
+        &self,
+        cpu: SchedulerCpuId,
+        previous: ThreadKey,
+    ) -> Result<(), SchedulerError> {
         let mut state = self.state.lock();
-        let previous = state.current;
-        if state.current == Some(thread) {
-            if state
-                .pending_block
-                .is_some_and(|pending| pending.thread == thread)
-            {
-                state.pending_block = None;
+        let cpu_index = cpu.index();
+        let Some(suspended) = state.suspended[cpu_index] else {
+            return Err(SchedulerError::SwitchPending);
+        };
+        if suspended.thread != previous {
+            return Err(SchedulerError::ContinuationOwned);
+        }
+        if suspended.publication == SuspendedPublication::Queued {
+            let len = state.len;
+            let Some(entry) = state.queue[..len]
+                .iter_mut()
+                .flatten()
+                .find(|entry| entry.thread == previous)
+            else {
+                return Err(SchedulerError::NotScheduled);
+            };
+            if entry.continuation_cpu != Some(cpu) {
+                return Err(SchedulerError::ContinuationOwned);
             }
-            state.current = state.pop_first_runnable();
+            entry.continuation_cpu = None;
+        }
+        state.suspended[cpu_index] = None;
+        debug_assert_eq!(state.check_invariants(), Ok(()));
+        Ok(())
+    }
+
+    pub(crate) fn retire_on(
+        &self,
+        cpu: SchedulerCpuId,
+        thread: ThreadKey,
+    ) -> Result<ScheduleDecision, SchedulerError> {
+        let mut state = self.state.lock();
+        let cpu_index = cpu.index();
+        if let Some(running_cpu) = state.running_cpu(thread) {
+            if running_cpu != cpu {
+                return Err(SchedulerError::WrongCpu);
+            }
+            if state.suspended[cpu_index].is_some() {
+                return Err(SchedulerError::SwitchPending);
+            }
+            if state.pending_block[cpu_index].is_some_and(|pending| pending.thread == thread) {
+                state.pending_block[cpu_index] = None;
+            }
+            state.running[cpu_index] = None;
+            let current = state.pop_first_runnable().map(|entry| entry.thread);
+            state.running[cpu_index] = current;
+            state.suspended[cpu_index] = Some(SuspendedContinuation {
+                thread,
+                publication: SuspendedPublication::Retired,
+            });
             debug_assert_eq!(state.check_invariants(), Ok(()));
             return Ok(ScheduleDecision {
-                previous,
-                current: state.current,
+                previous: Some(thread),
+                current,
+            });
+        }
+        if let Some(owner_cpu) = state
+            .suspended
+            .iter()
+            .position(|suspended| suspended.is_some_and(|owner| owner.thread == thread))
+            .and_then(SchedulerCpuId::new)
+        {
+            if owner_cpu != cpu {
+                return Err(SchedulerError::WrongCpu);
+            }
+            let Some(index) = state.queue[..state.len]
+                .iter()
+                .position(|entry| entry.is_some_and(|entry| entry.thread == thread))
+            else {
+                return Err(SchedulerError::NotScheduled);
+            };
+            state.remove_index(index);
+            state.suspended[cpu_index] = Some(SuspendedContinuation {
+                thread,
+                publication: SuspendedPublication::Retired,
+            });
+            if state.running[cpu_index].is_none() {
+                state.running[cpu_index] = state.pop_first_runnable().map(|entry| entry.thread);
+            }
+            debug_assert_eq!(state.check_invariants(), Ok(()));
+            return Ok(ScheduleDecision {
+                previous: Some(thread),
+                current: state.running[cpu_index],
             });
         }
         let Some(index) = state.queue[..state.len]
@@ -585,17 +851,20 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         else {
             return Err(SchedulerError::NotScheduled);
         };
+        if state.queue[index].is_some_and(|entry| entry.continuation_cpu.is_some()) {
+            return Err(SchedulerError::ContinuationOwned);
+        }
         state.remove_index(index);
         debug_assert_eq!(state.check_invariants(), Ok(()));
         Ok(ScheduleDecision {
-            previous,
-            current: state.current,
+            previous: state.running[cpu_index],
+            current: state.running[cpu_index],
         })
     }
 
     pub(crate) fn state(&self, thread: ThreadKey) -> Option<SchedulerThreadState> {
         let state = self.state.lock();
-        if state.current == Some(thread) {
+        if state.running.contains(&Some(thread)) {
             return Some(SchedulerThreadState::Running);
         }
         state.queue[..state.len]
@@ -610,8 +879,160 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         self.state.lock().check_invariants()
     }
 
+    pub(crate) fn current_on(&self, cpu: SchedulerCpuId) -> Option<ThreadKey> {
+        self.state.lock().running[cpu.index()]
+    }
+
+    pub(crate) fn running_cpu(&self, thread: ThreadKey) -> Option<SchedulerCpuId> {
+        self.state.lock().running_cpu(thread)
+    }
+
+    pub(crate) fn suspended_cpu(&self, thread: ThreadKey) -> Option<SchedulerCpuId> {
+        self.state
+            .lock()
+            .suspended
+            .iter()
+            .position(|suspended| suspended.is_some_and(|owner| owner.thread == thread))
+            .and_then(SchedulerCpuId::new)
+    }
+
+    pub(crate) fn validate_switch_on(
+        &self,
+        cpu: SchedulerCpuId,
+        decision: ScheduleDecision,
+    ) -> Result<(), SchedulerError> {
+        let state = self.state.lock();
+        let previous = decision.previous.ok_or(SchedulerError::NotRunning)?;
+        let current = decision.current.ok_or(SchedulerError::NotRunning)?;
+        if state.running[cpu.index()] != Some(current) {
+            return if state.running_cpu(current).is_some() {
+                Err(SchedulerError::WrongCpu)
+            } else {
+                Err(SchedulerError::NotRunning)
+            };
+        }
+        if state.suspended[cpu.index()].is_none_or(|owner| owner.thread != previous) {
+            return Err(SchedulerError::ContinuationOwned);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn suspended_on(&self, cpu: SchedulerCpuId) -> Option<ThreadKey> {
+        self.state.lock().suspended[cpu.index()].map(|suspended| suspended.thread)
+    }
+
+    // Temporary BSP adapters keep the pre-H2 target callers buildable while
+    // the root integration lane migrates physical-current call sites.  They
+    // must not be used after APs enter shared scheduling.
+    pub(crate) fn schedule_next(&self) -> Result<ScheduleDecision, SchedulerError> {
+        if let Some(suspended) = self.suspended_on_cpu(SchedulerCpuId::BOOTSTRAP) {
+            return match self.schedule_from_idle(suspended)? {
+                IdleScheduleDecision::ContinueIdle => Ok(ScheduleDecision {
+                    previous: Some(suspended),
+                    current: None,
+                }),
+                IdleScheduleDecision::ResumeCurrent => Ok(ScheduleDecision {
+                    previous: Some(suspended),
+                    current: Some(suspended),
+                }),
+                IdleScheduleDecision::Switch(decision) => Ok(decision),
+            };
+        }
+        self.schedule_next_on(SchedulerCpuId::BOOTSTRAP)
+    }
+
+    pub(crate) fn yield_current(
+        &self,
+        thread: ThreadKey,
+    ) -> Result<ScheduleDecision, SchedulerError> {
+        let decision = self.yield_current_on(SchedulerCpuId::BOOTSTRAP, thread)?;
+        self.complete_bsp_model_switch(decision)?;
+        Ok(decision)
+    }
+
+    pub(crate) fn prepare_block_current(
+        &self,
+        thread: ThreadKey,
+    ) -> Result<BlockReservation, SchedulerError> {
+        self.prepare_block_current_on(SchedulerCpuId::BOOTSTRAP, thread)
+    }
+
+    pub(crate) fn cancel_block(
+        &self,
+        reservation: BlockReservation,
+    ) -> Result<(), BlockReservationFailure> {
+        self.cancel_block_on(reservation.key.cpu, reservation)
+    }
+
+    pub(crate) fn commit_block(
+        &self,
+        reservation: BlockReservation,
+    ) -> Result<ScheduleDecision, BlockReservationFailure> {
+        let cpu = reservation.key.cpu;
+        let decision = self.commit_block_on(cpu, reservation)?;
+        if decision.current.is_some() {
+            self.complete_switch_on(
+                cpu,
+                decision
+                    .previous
+                    .expect("block decision names its outgoing Thread"),
+            )
+            .expect("BSP model switch completion follows a valid block decision");
+        }
+        Ok(decision)
+    }
+
+    pub(crate) fn block_current(
+        &self,
+        thread: ThreadKey,
+    ) -> Result<(BlockToken, ScheduleDecision), SchedulerError> {
+        let reservation = self.prepare_block_current(thread)?;
+        let key = reservation.wake_key();
+        match self.commit_block(reservation) {
+            Ok(decision) => Ok((BlockToken { key }, decision)),
+            Err(failure) => Err(failure.error()),
+        }
+    }
+
+    pub(crate) fn schedule_from_idle(
+        &self,
+        suspended: ThreadKey,
+    ) -> Result<IdleScheduleDecision, SchedulerError> {
+        let decision = self.schedule_from_idle_on(SchedulerCpuId::BOOTSTRAP, suspended)?;
+        if let IdleScheduleDecision::Switch(decision) = decision {
+            self.complete_bsp_model_switch(decision)?;
+        }
+        Ok(decision)
+    }
+
+    pub(crate) fn retire(&self, thread: ThreadKey) -> Result<ScheduleDecision, SchedulerError> {
+        if self
+            .running_cpu(thread)
+            .is_some_and(|cpu| cpu != SchedulerCpuId::BOOTSTRAP)
+        {
+            return Err(SchedulerError::WrongCpu);
+        }
+        let decision = self.retire_on(SchedulerCpuId::BOOTSTRAP, thread)?;
+        self.complete_bsp_model_switch(decision)?;
+        Ok(decision)
+    }
+
     pub(crate) fn current(&self) -> Option<ThreadKey> {
-        self.state.lock().current
+        self.current_on(SchedulerCpuId::BOOTSTRAP)
+    }
+
+    fn complete_bsp_model_switch(&self, decision: ScheduleDecision) -> Result<(), SchedulerError> {
+        if let Some(previous) = decision.previous
+            && decision.previous != decision.current
+        {
+            self.complete_switch_on(SchedulerCpuId::BOOTSTRAP, previous)?;
+        }
+        Ok(())
+    }
+
+    fn suspended_on_cpu(&self, cpu: SchedulerCpuId) -> Option<ThreadKey> {
+        self.state.lock().suspended[cpu.index()].map(|suspended| suspended.thread)
     }
 }
 

@@ -3,7 +3,7 @@ extern crate std;
 use super::*;
 use crate::object::ObjectRegistry;
 use deepwyrm_abi::DW_OBJECT_TYPE_THREAD;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread;
 
 fn thread_key(seed_registry: &mut ObjectRegistry<16>) -> ThreadKey {
@@ -11,6 +11,175 @@ fn thread_key(seed_registry: &mut ObjectRegistry<16>) -> ThreadKey {
     let key = ThreadKey::from_object_id(creation.id());
     seed_registry.cancel_creation(creation).unwrap();
     key
+}
+
+fn cpu(index: usize) -> SchedulerCpuId {
+    SchedulerCpuId::new(index).expect("test CPU is inside the H2 bound")
+}
+
+#[test]
+fn four_competing_cpus_claim_distinct_fifo_work_once() {
+    let scheduler = Arc::new(CooperativeScheduler::<8>::new());
+    let mut registry = ObjectRegistry::<16>::new();
+    let keys = core::array::from_fn::<_, 8, _>(|_| thread_key(&mut registry));
+    for key in keys {
+        let reservation = scheduler.reserve(key).unwrap();
+        scheduler.commit(reservation).unwrap();
+    }
+
+    let start = Arc::new(Barrier::new(H2_SCHEDULER_CPU_CAPACITY + 1));
+    let mut workers = std::vec::Vec::new();
+    for cpu_index in 0..H2_SCHEDULER_CPU_CAPACITY {
+        let scheduler = Arc::clone(&scheduler);
+        let start = Arc::clone(&start);
+        workers.push(thread::spawn(move || {
+            start.wait();
+            (
+                cpu_index,
+                scheduler.schedule_next_on(cpu(cpu_index)).unwrap(),
+            )
+        }));
+    }
+    start.wait();
+
+    let mut claimed = std::vec::Vec::new();
+    for worker in workers {
+        let (cpu_index, decision) = worker.join().expect("CPU claim worker completes");
+        let current = decision.current.expect("each CPU claims queued work");
+        assert!(
+            !claimed.contains(&current),
+            "a Thread was claimed by two CPUs"
+        );
+        claimed.push(current);
+        assert_eq!(scheduler.current_on(cpu(cpu_index)), Some(current));
+        assert_eq!(scheduler.running_cpu(current), Some(cpu(cpu_index)));
+    }
+    assert_eq!(claimed.len(), H2_SCHEDULER_CPU_CAPACITY);
+    assert!(
+        claimed
+            .iter()
+            .all(|thread| keys[..H2_SCHEDULER_CPU_CAPACITY].contains(thread))
+    );
+    for key in &keys[H2_SCHEDULER_CPU_CAPACITY..] {
+        assert_eq!(scheduler.state(*key), Some(SchedulerThreadState::Runnable));
+    }
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn one_cpu_and_one_thread_cannot_be_claimed_twice() {
+    let scheduler = Arc::new(CooperativeScheduler::<2>::new());
+    let mut registry = ObjectRegistry::<16>::new();
+    let first = thread_key(&mut registry);
+    let second = thread_key(&mut registry);
+    for key in [first, second] {
+        let reservation = scheduler.reserve(key).unwrap();
+        scheduler.commit(reservation).unwrap();
+    }
+
+    let start = Arc::new(Barrier::new(3));
+    let mut workers = std::vec::Vec::new();
+    for _ in 0..2 {
+        let scheduler = Arc::clone(&scheduler);
+        let start = Arc::clone(&start);
+        workers.push(thread::spawn(move || {
+            start.wait();
+            scheduler.schedule_next_on(cpu(2))
+        }));
+    }
+    start.wait();
+    let results = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("same-CPU claimant completes"))
+        .collect::<std::vec::Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| **result == Err(SchedulerError::CurrentThreadRunning))
+            .count(),
+        1
+    );
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn pending_blocks_are_cpu_local_and_reject_the_wrong_cpu() {
+    let scheduler = CooperativeScheduler::<2>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let first = thread_key(&mut registry);
+    let second = thread_key(&mut registry);
+    for key in [first, second] {
+        let reservation = scheduler.reserve(key).unwrap();
+        scheduler.commit(reservation).unwrap();
+    }
+    scheduler.schedule_next_on(cpu(0)).unwrap();
+    scheduler.schedule_next_on(cpu(1)).unwrap();
+
+    assert!(matches!(
+        scheduler.prepare_block_current_on(cpu(1), first),
+        Err(SchedulerError::WrongCpu)
+    ));
+    let first_block = scheduler.prepare_block_current_on(cpu(0), first).unwrap();
+    let second_block = scheduler.prepare_block_current_on(cpu(1), second).unwrap();
+    assert_eq!(
+        scheduler.yield_current_on(cpu(0), first),
+        Err(SchedulerError::BlockPreparationActive)
+    );
+    scheduler.cancel_block_on(cpu(0), first_block).unwrap();
+    scheduler.cancel_block_on(cpu(1), second_block).unwrap();
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn suspended_waiter_is_not_migratable_until_release_acquire_handoff() {
+    let scheduler = CooperativeScheduler::<1>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let waiter = thread_key(&mut registry);
+    let reservation = scheduler.reserve(waiter).unwrap();
+    scheduler.commit(reservation).unwrap();
+    scheduler.schedule_next_on(cpu(0)).unwrap();
+    let (blocked, decision) = scheduler.block_current_on(cpu(0), waiter).unwrap();
+    assert_eq!(decision.current, None);
+    assert_eq!(scheduler.suspended_on(cpu(0)), Some(waiter));
+
+    scheduler.wake(blocked.into_wake_key()).unwrap();
+    assert_eq!(scheduler.schedule_next_on(cpu(1)).unwrap().current, None);
+    assert_eq!(scheduler.running_cpu(waiter), None);
+    assert_eq!(
+        scheduler.schedule_from_idle_on(cpu(0), waiter).unwrap(),
+        IdleScheduleDecision::ResumeCurrent
+    );
+    assert_eq!(scheduler.running_cpu(waiter), Some(cpu(0)));
+    assert_eq!(scheduler.suspended_on(cpu(0)), None);
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn completed_switch_makes_outgoing_continuation_claimable_by_an_idle_cpu() {
+    let scheduler = CooperativeScheduler::<2>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let outgoing = thread_key(&mut registry);
+    let destination = thread_key(&mut registry);
+    for key in [outgoing, destination] {
+        let reservation = scheduler.reserve(key).unwrap();
+        scheduler.commit(reservation).unwrap();
+    }
+    scheduler.schedule_next_on(cpu(0)).unwrap();
+    let decision = scheduler.yield_current_on(cpu(0), outgoing).unwrap();
+    assert_eq!(decision.current, Some(destination));
+    assert_eq!(scheduler.suspended_on(cpu(0)), Some(outgoing));
+    assert_eq!(scheduler.schedule_next_on(cpu(1)).unwrap().current, None);
+
+    // Models the post-assembly Release edge. The CPU-1 claim acquires the same
+    // scheduler lock before it can observe the continuation as eligible.
+    scheduler.complete_switch_on(cpu(0), outgoing).unwrap();
+    assert_eq!(
+        scheduler.schedule_next_on(cpu(1)).unwrap().current,
+        Some(outgoing)
+    );
+    assert_eq!(scheduler.running_cpu(outgoing), Some(cpu(1)));
+    assert_eq!(scheduler.check_invariants(), Ok(()));
 }
 
 #[test]

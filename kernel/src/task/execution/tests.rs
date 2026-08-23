@@ -4,6 +4,7 @@ use super::*;
 use crate::object::ObjectRegistry;
 use crate::task::{TaskAuthority, TaskError};
 use deepwyrm_abi::DW_TASK_STATE_RUNNING;
+use std::sync::{Arc, Barrier};
 
 const OBJECTS: usize = 16;
 type Tasks = TaskAuthority<2, 2, 4, 4>;
@@ -99,6 +100,46 @@ fn context_pool_preserves_exact_saved_state_and_retires_generation() {
     let replacement = pool.allocate(first_context).unwrap();
     assert_ne!(first, replacement);
     assert_eq!(pool.reclaim(replacement), Ok(first_context));
+}
+
+#[test]
+fn continuation_publication_has_one_release_winner_and_acquire_readers() {
+    const WRITERS: usize = 8;
+
+    let pool = Arc::new(KernelContinuationPool::<1>::new());
+    let context = ThreadContextId::from_raw(encode_resource_id(0, 1).unwrap()).unwrap();
+    let start = Arc::new(Barrier::new(WRITERS + 1));
+    let mut workers = std::vec::Vec::new();
+    for writer in 0..WRITERS {
+        let pool = Arc::clone(&pool);
+        let start = Arc::clone(&start);
+        workers.push(std::thread::spawn(move || {
+            let candidate = 0x1000 + u64::try_from(writer).unwrap() * 0x10;
+            start.wait();
+            (candidate, pool.seed(context, candidate))
+        }));
+    }
+    start.wait();
+
+    let results = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("continuation publisher completes"))
+        .collect::<std::vec::Vec<_>>();
+    let winners = results
+        .iter()
+        .filter(|(_, result)| result.is_ok())
+        .collect::<std::vec::Vec<_>>();
+    assert_eq!(winners.len(), 1);
+    assert_eq!(pool.load(context), Ok(winners[0].0));
+    assert_eq!(
+        results
+            .iter()
+            .filter(|(_, result)| {
+                *result == Err(ExecutionResourceError::ContinuationAlreadyInitialized)
+            })
+            .count(),
+        WRITERS - 1
+    );
 }
 
 #[test]
