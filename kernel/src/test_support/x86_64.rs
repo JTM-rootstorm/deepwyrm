@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use crate::arch::x86_64::exceptions::{EarlyException, ExceptionVector};
 use crate::debug::emit_early_raw_record;
 #[cfg(deepwyrm_i1_evidence)]
-use crate::debug::emit_test_evidence_record;
+use crate::debug::{TestSerialTransaction, begin_test_serial_transaction};
 
 #[cfg(deepwyrm_i1_evidence)]
 use super::{EvidenceFlushError, I1_EVIDENCE};
@@ -81,6 +81,8 @@ unsafe extern "sysv64" {
 /// that the QEMU-only I/O device is present on an arbitrary machine.
 struct QemuCompletionTransport {
     _private: (),
+    #[cfg(deepwyrm_i1_evidence)]
+    transaction: Option<TestSerialTransaction>,
 }
 
 impl QemuCompletionTransport {
@@ -97,7 +99,11 @@ impl QemuCompletionTransport {
         reason = "construction proves the test-only QEMU device precondition"
     )]
     const unsafe fn new() -> Self {
-        Self { _private: () }
+        Self {
+            _private: (),
+            #[cfg(deepwyrm_i1_evidence)]
+            transaction: None,
+        }
     }
 }
 
@@ -108,6 +114,12 @@ impl CompletionTransport for QemuCompletionTransport {
     ) -> Result<(), CompletionTransportError> {
         // The host requires both the serial record and matching process status;
         // a serial failure therefore becomes infrastructure failure, never PASS.
+        #[cfg(deepwyrm_i1_evidence)]
+        if let Some(transaction) = self.transaction.as_mut() {
+            return transaction
+                .write_terminal(record)
+                .map_err(|_| CompletionTransportError::Serial);
+        }
         emit_early_raw_record(record).map_err(|_| CompletionTransportError::Serial)
     }
 
@@ -300,15 +312,31 @@ fn complete_known_outcome(outcome: CompletionOutcome, detail: u32) -> ! {
     // SAFETY: this function exists only in an x86_64-none `test-support` build
     // whose compile-time selector was resolved by the central QEMU harness
     // build path. Such artifacts are not production or physical-hardware images.
+    #[cfg(deepwyrm_i1_evidence)]
+    let permit = match I1_EVIDENCE.finalize_running_invariant() {
+        Ok(permit) => permit,
+        // A competing terminal path already owns the I1 transcript. It alone
+        // may write COM1 or debug-exit; losers simply stop.
+        Err(_) => halt_after_completion(),
+    };
     let mut transport = unsafe { QemuCompletionTransport::new() };
     #[cfg(deepwyrm_i1_evidence)]
-    let (outcome, detail) = match I1_EVIDENCE.finalize_running_invariant().and_then(|permit| {
-        permit.flush(|record| {
-            emit_test_evidence_record(record).map_err(|_| EvidenceFlushError::Transport)
-        })
-    }) {
-        Ok(()) => (outcome, detail),
-        Err(error) => (CompletionOutcome::Fail, evidence_failure_detail(error)),
+    let (outcome, detail) = match begin_test_serial_transaction() {
+        Ok(transaction) => {
+            transport.transaction = Some(transaction);
+            match permit.flush(|record| {
+                transport
+                    .transaction
+                    .as_mut()
+                    .expect("I1 reporter owns its serial transaction")
+                    .write_evidence(record)
+                    .map_err(|_| EvidenceFlushError::Transport)
+            }) {
+                Ok(()) => (outcome, detail),
+                Err(error) => (CompletionOutcome::Fail, evidence_failure_detail(error)),
+            }
+        }
+        Err(_) => halt_after_completion(),
     };
     complete(&mut transport, completion_record(outcome, detail))
 }

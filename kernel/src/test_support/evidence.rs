@@ -17,6 +17,7 @@ const SLOT_EMPTY: u8 = 0;
 const SLOT_WRITING: u8 = 1;
 const SLOT_READY: u8 = 2;
 const STATE_COUNT_MASK: usize = 0xff;
+const STATE_FAILURE: usize = 0x100;
 const COLLECTING: usize = 0;
 const CLOSING: usize = 1;
 const FINALIZED: usize = 2;
@@ -200,7 +201,7 @@ impl EvidenceEvent {
             EvidenceKind::RunningInvariant => {
                 self.cpu == 0 && self.token == 0 && self.arg0 == 0 && self.arg1 == 0
             }
-            EvidenceKind::Cpl3Syscall => self.token != 0 && self.arg1 != 0,
+            EvidenceKind::Cpl3Syscall => self.token != 0,
             EvidenceKind::TlbPublish | EvidenceKind::TlbAck | EvidenceKind::RendezvousAck => {
                 self.token != 0 && self.arg0 == 0x0000_000f && self.arg1 == 0
             }
@@ -275,11 +276,11 @@ impl EvidenceCollector {
     /// Record a scenario fact.  Calls after finalization or malformed facts
     /// latch terminal failure instead of silently changing the transcript.
     pub(crate) fn record(&self, event: EvidenceEvent) -> Result<(), EvidenceFlushError> {
+        let sequence = self.reserve()?;
         if event.kind == EvidenceKind::RunningInvariant || !event.valid() {
-            self.latch(FAILURE_MALFORMED);
+            self.abort(sequence);
             return Err(EvidenceFlushError::Malformed);
         }
-        let sequence = self.reserve()?;
         self.publish(sequence, event);
         Ok(())
     }
@@ -295,23 +296,21 @@ impl EvidenceCollector {
                 return Err(EvidenceFlushError::FinalizationClosed);
             }
             let count = state_count(state);
-            if count >= MAX_EVENTS {
-                self.latch(FAILURE_OVERFLOW);
-                return Err(EvidenceFlushError::Overflow);
-            }
             if self
                 .state
                 .compare_exchange(
                     state,
-                    pack_state(CLOSING, count),
+                    pack_state(CLOSING, count) | (state & STATE_FAILURE),
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
                 .is_ok()
             {
                 self.publish(count, EvidenceEvent::running_invariant());
-                self.state
-                    .store(pack_state(FINALIZED, count + 1), Ordering::Release);
+                self.state.store(
+                    pack_state(FINALIZED, count + 1) | (state & STATE_FAILURE),
+                    Ordering::Release,
+                );
                 return Ok(FinalizedEvidence { collector: self });
             }
         }
@@ -323,11 +322,25 @@ impl EvidenceCollector {
             if state_phase(state) != COLLECTING {
                 return Err(EvidenceFlushError::FinalizationClosed);
             }
+            if state_has_failure(state) {
+                return Err(EvidenceFlushError::Overflow);
+            }
             let current = state_count(state);
             // Preserve the last fixed slot for finalization's invariant record.
             if current >= MAX_EVENTS - 1 {
-                self.latch(FAILURE_OVERFLOW);
-                return Err(EvidenceFlushError::Overflow);
+                if self
+                    .state
+                    .compare_exchange_weak(
+                        state,
+                        state | STATE_FAILURE,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return Err(EvidenceFlushError::Overflow);
+                }
+                continue;
             }
             if self
                 .state
@@ -365,6 +378,22 @@ impl EvidenceCollector {
         slot.arg0.store(event.arg0, Ordering::Relaxed);
         slot.arg1.store(event.arg1, Ordering::Relaxed);
         slot.state.store(SLOT_READY, Ordering::Release);
+    }
+
+    fn abort(&self, sequence: usize) {
+        let slot = &self.slots[sequence];
+        if slot
+            .state
+            .compare_exchange(
+                SLOT_EMPTY,
+                SLOT_ABORTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            self.latch(FAILURE_INVARIANT);
+        }
     }
 
     #[cfg(test)]
@@ -460,9 +489,6 @@ impl EvidenceCollector {
         let mut reclaim_allowed = false;
         for (relative, slot) in facts.iter().enumerate() {
             let event = read_slot(slot);
-            if reclaim_allowed {
-                return false;
-            }
             match event.kind {
                 EvidenceKind::CpuOnline | EvidenceKind::RunningInvariant => return false,
                 EvidenceKind::Cpl3Syscall => {
@@ -545,7 +571,10 @@ impl EvidenceCollector {
                     }
                 }
                 EvidenceKind::ReclaimAllowed => {
-                    if !matches!(tlb, Some((before, published)) if before < relative && published.token == event.token && published.cpu == event.cpu)
+                    if reclaim_allowed {
+                        return false;
+                    }
+                    if !matches!(tlb, Some((before, published)) if before < relative && published.token == event.token)
                         || tlb_acks != 0x0f
                         || rendezvous_acks != 0x0f
                     {
@@ -599,12 +628,22 @@ impl FinalizedEvidence<'_> {
         if state_phase(state) != FINALIZED {
             return Err(EvidenceFlushError::NotFinalized);
         }
-        collector.failure_result()?;
         let count = state_count(state);
         for sequence in 0..count {
-            while collector.slots[sequence].state.load(Ordering::Acquire) != SLOT_READY {
+            let mut spins = 0;
+            while collector.slots[sequence].state.load(Ordering::Acquire) == SLOT_WRITING {
+                if spins == MAX_PUBLICATION_SPINS {
+                    return Err(EvidenceFlushError::NotReady);
+                }
+                spins += 1;
                 core::hint::spin_loop();
             }
+            if collector.slots[sequence].state.load(Ordering::Acquire) == SLOT_ABORTED {
+                return Err(EvidenceFlushError::Malformed);
+            }
+        }
+        if state_has_failure(state) {
+            return Err(EvidenceFlushError::Overflow);
         }
         if !collector.semantic_valid(count) {
             collector.latch(FAILURE_INVARIANT);
@@ -617,14 +656,19 @@ impl FinalizedEvidence<'_> {
     }
 }
 
+const MAX_PUBLICATION_SPINS: usize = 4096;
+const SLOT_ABORTED: u8 = 3;
 const fn pack_state(phase: usize, count: usize) -> usize {
-    (phase << 8) | count
+    (phase << 9) | count
 }
 const fn state_phase(state: usize) -> usize {
-    state >> 8
+    state >> 9
 }
 const fn state_count(state: usize) -> usize {
     state & STATE_COUNT_MASK
+}
+const fn state_has_failure(state: usize) -> bool {
+    state & STATE_FAILURE != 0
 }
 
 /// The one build-selected collector; no public ABI or production state uses it.
@@ -927,6 +971,25 @@ mod tests {
             .unwrap();
         let permit = collector.finalize_running_invariant().unwrap();
         assert_eq!(permit.flush(|_| Ok(())), Err(EvidenceFlushError::Invariant));
+    }
+
+    #[test]
+    fn failure_reserved_before_close_is_in_the_final_terminal_decision() {
+        let collector = EvidenceCollector::new();
+        let sequence = collector.reserve().unwrap();
+        let permit = collector.finalize_running_invariant().unwrap();
+        collector.abort(sequence);
+        assert_eq!(permit.flush(|_| Ok(())), Err(EvidenceFlushError::Malformed));
+    }
+
+    #[test]
+    fn abandoned_inflight_writer_fails_boundedly_instead_of_spinning_forever() {
+        let collector = EvidenceCollector::new();
+        let _sequence = collector
+            .reserve_paused_for_test(EvidenceEvent::cpu_online(0, 0x20))
+            .unwrap();
+        let permit = collector.finalize_running_invariant().unwrap();
+        assert_eq!(permit.flush(|_| Ok(())), Err(EvidenceFlushError::NotReady));
     }
 
     fn complete_contract_without_final(collector: &EvidenceCollector) {

@@ -636,6 +636,48 @@ pub(crate) fn emit_test_evidence_record(
     write_bounded_test_evidence_record(&mut serial, record)
 }
 
+/// Exclusive test-only COM1 transaction used to keep DWEVID1 evidence and its
+/// following DWTEST1 terminal record indivisible against competing reporters.
+#[cfg(all(
+    feature = "test-support",
+    target_os = "none",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+pub(crate) struct TestSerialTransaction {
+    _guard: OutputGuard,
+    serial: Com1<X86PortIo>,
+}
+
+#[cfg(all(
+    feature = "test-support",
+    target_os = "none",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+pub(crate) fn begin_test_serial_transaction() -> Result<TestSerialTransaction, SerialError> {
+    Ok(TestSerialTransaction {
+        _guard: OutputGuard::acquire().ok_or(SerialError::Busy)?,
+        serial: Com1::new(X86PortIo),
+    })
+}
+
+#[cfg(all(
+    feature = "test-support",
+    target_os = "none",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+impl TestSerialTransaction {
+    pub(crate) fn write_evidence(
+        &mut self,
+        record: &[u8; TEST_EVIDENCE_RECORD_BYTES],
+    ) -> Result<(), SerialError> {
+        write_bounded_test_evidence_record(&mut self.serial, record)
+    }
+
+    pub(crate) fn write_terminal(&mut self, record: &[u8]) -> Result<(), SerialError> {
+        write_bounded_raw_record(&mut self.serial, record)
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 fn write_bounded_raw_record<P: PortIo>(
     serial: &mut Com1<P>,

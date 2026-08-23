@@ -282,7 +282,8 @@ fn i1_evidence_has_one_terminal_com1_reporter() {
     assert!(!evidence.contains("emit_early_raw_record"));
     assert!(terminal.contains("I1_EVIDENCE.finalize_running_invariant"));
     assert!(terminal.contains("permit.flush"));
-    assert!(terminal.contains("emit_test_evidence_record(record)"));
+    assert!(terminal.contains("begin_test_serial_transaction"));
+    assert!(terminal.contains(".write_evidence(record)"));
     assert!(terminal.contains("emit_early_raw_record(record)"));
 }
 
