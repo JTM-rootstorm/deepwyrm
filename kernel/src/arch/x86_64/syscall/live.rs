@@ -935,14 +935,18 @@ unsafe fn native_runtime_rendezvous_gate<R: crate::syscall::native::NativeRendez
     match crate::time::service_current_rendezvous_latch().unwrap_or_else(|_| halt_forever()) {
         crate::arch::x86_64::rendezvous::MailboxNotification::None
         | crate::arch::x86_64::rendezvous::MailboxNotification::Wake => 0,
-        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request)
-        | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(request) => {
+        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request) => {
             stage_rendezvous_action(RendezvousAction(request)).unwrap_or_else(|_| halt_forever());
             // The assembly immediately pivots away from the interrupted IPI
             // frame; a nonzero result is never allowed to IRET to CPL3.
             let _ = context;
             1
         }
+        // The exact request has already been acknowledged by a stopped
+        // carrier and remains only to gate initiator reclaim. A replacement
+        // carrier on this CPU must neither acknowledge it again nor inherit
+        // the stopped IPI frame.
+        crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => 0,
     }
 }
 
@@ -1196,11 +1200,11 @@ unsafe fn native_runtime_trampoline<
     match crate::time::service_current_rendezvous_latch().unwrap_or_else(|_| halt_forever()) {
         crate::arch::x86_64::rendezvous::MailboxNotification::None
         | crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {}
-        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request)
-        | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(request) => {
+        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request) => {
             stage_rendezvous_action(RendezvousAction(request)).unwrap_or_else(|_| halt_forever());
             handoff_to_rendezvous_reaper(context);
         }
+        crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {}
     }
     match control {
         crate::syscall::native::SyscallControl::ReturnToCaller => {}
@@ -1264,8 +1268,7 @@ unsafe fn native_runtime_trampoline<
                                                 .unwrap_or_else(|_| halt_forever());
                                                 continue;
                                             }
-                                            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request)
-                                            | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(request) => {
+                                            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request) => {
                                                 crate::arch::x86_64::idle::cancel_current_idle(
                                                     preparation,
                                                 )
@@ -1273,6 +1276,13 @@ unsafe fn native_runtime_trampoline<
                                                 stage_rendezvous_action(RendezvousAction(request))
                                                     .unwrap_or_else(|_| halt_forever());
                                                 handoff_to_rendezvous_reaper(context);
+                                            }
+                                            crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {
+                                                crate::arch::x86_64::idle::cancel_current_idle(
+                                                    preparation,
+                                                )
+                                                .unwrap_or_else(|_| halt_forever());
+                                                continue;
                                             }
                                         }
                                     }
@@ -1290,12 +1300,12 @@ unsafe fn native_runtime_trampoline<
                                 {
                                 crate::arch::x86_64::rendezvous::MailboxNotification::None
                                 | crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {}
-                                crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request)
-                                | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(request) => {
+                                crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request) => {
                                     stage_rendezvous_action(RendezvousAction(request))
                                         .unwrap_or_else(|_| halt_forever());
                                     handoff_to_rendezvous_reaper(context);
                                 }
+                                crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {}
                                 }
                             }
                             crate::syscall::native::NativeIdleSuspendPoll::ResumeCurrent => {

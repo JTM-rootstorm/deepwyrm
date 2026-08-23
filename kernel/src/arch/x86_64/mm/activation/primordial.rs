@@ -1627,28 +1627,32 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn drain_finalizers(&mut self) -> Result<(), ()> {
-        let cleanup = core::mem::replace(&mut self.cleanup, CleanupQueue::new());
-        let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
-        let mut finalizer = crate::object::PayloadFinalizer::new(
-            &mut self.registry,
-            &mut *self.active.target.roles,
-            &mut self.memory,
-            &self.shared.events,
-            &self.shared.timers,
-            &mut timer_deadlines,
-            &self.shared.channels,
-            &self.shared.waits,
-            &mut self.tasks,
-            &mut self.spaces,
-            &mut self.regions,
-        );
-        for release in cleanup.into_releases().into_iter().flatten() {
-            let batch = finalizer.finalize_chain(release);
-            let (wakes, pins) = batch.into_parts();
-            if wakes.into_iter().flatten().next().is_some()
-                || pins.into_iter().flatten().next().is_some()
-            {
-                return Err(());
+        while !self.cleanup.is_empty() {
+            let cleanup = core::mem::replace(&mut self.cleanup, CleanupQueue::new());
+            for release in cleanup.into_releases().into_iter().flatten() {
+                let batch = {
+                    let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
+                    let mut finalizer = crate::object::PayloadFinalizer::new(
+                        &mut self.registry,
+                        &mut *self.active.target.roles,
+                        &mut self.memory,
+                        &self.shared.events,
+                        &self.shared.timers,
+                        &mut timer_deadlines,
+                        &self.shared.channels,
+                        &self.shared.waits,
+                        &mut self.tasks,
+                        &mut self.spaces,
+                        &mut self.regions,
+                    );
+                    finalizer.finalize_chain(release)
+                };
+                crate::syscall::complete_wait_wakes(
+                    &mut self.registry,
+                    &self.shared.execution,
+                    batch,
+                    &mut self.cleanup,
+                );
             }
         }
         Ok(())
@@ -2437,12 +2441,23 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                 let dispatch = {
                     let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
                     let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
+                    let root_generation = self
+                        .active_root
+                        .as_ref()
+                        .expect("active root")
+                        .binding_generation();
+                    let prepared = self
+                        .services
+                        .prepare_dispatch(request, self.thread, root_generation)
+                        .unwrap_or_else(|_| {
+                            panic!("F-service prepare has an invalid root identity")
+                        });
                     let mut user = self.active.current_process_address_space(
                         self.active_root.as_ref().expect("active root"),
                         self.process,
                     );
-                    self.services.dispatch(
-                        request,
+                    self.services.dispatch_prepared(
+                        prepared,
                         &mut user,
                         &mut self.registry,
                         &mut self.tasks,
@@ -2455,6 +2470,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                         &mut self.spaces,
                         self.process,
                         self.thread,
+                        root_generation,
                         Some(&mut wait_deadlines),
                         &mut timer_deadlines,
                         &mut self.channel_staging[..],

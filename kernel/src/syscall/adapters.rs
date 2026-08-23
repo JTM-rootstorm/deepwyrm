@@ -2116,7 +2116,11 @@ pub(crate) fn channel_receive<
     DW_STATUS_SUCCESS
 }
 
-fn complete_wait_wakes<const OBJECTS: usize, const WAITERS: usize, const EXECUTION: usize>(
+pub(crate) fn complete_wait_wakes<
+    const OBJECTS: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
     registry: &mut ObjectRegistry<OBJECTS>,
     execution: &ExecutionDomain<EXECUTION>,
     wakes: WakeBatch<WAITERS>,

@@ -1037,8 +1037,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
             let mut user = self
                 .active
                 .current_process_address_space(&self.active_root, self.process);
-            self.services.dispatch(
-                request,
+            let root_generation = self.active_root.binding_generation();
+            let prepared = self
+                .services
+                .prepare_dispatch(request, thread, root_generation)
+                .unwrap_or_else(|_| fail(0xaf));
+            self.services.dispatch_prepared(
+                prepared,
                 &mut user,
                 &mut self.registry,
                 &mut self.tasks,
@@ -1051,6 +1056,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                 &mut self.spaces,
                 self.process,
                 thread,
+                root_generation,
                 Some(&mut wait_deadlines),
                 &mut timer_deadlines,
                 &mut self.channel_staging[..],

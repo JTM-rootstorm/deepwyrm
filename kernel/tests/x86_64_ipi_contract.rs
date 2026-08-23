@@ -382,7 +382,8 @@ fn h4_idle_publication_brackets_rescan_and_uses_only_coalesced_e1_wake() {
     assert_eq!(suspension.matches("cancel_current_idle(idle)").count(), 2);
     assert!(suspension.contains("SYSCALL FMASK keeps IF clear"));
     assert!(suspension.contains("service_current_rendezvous_latch()"));
-    assert!(suspension.contains("MailboxNotification::Stop(_)"));
+    assert!(suspension.contains("MailboxNotification::Stop(request)"));
+    assert!(suspension.contains("handoff_to_rendezvous_reaper(context)"));
 
     let wait = live_syscall
         .split_once("fn wait_for_suspend_interrupt()")

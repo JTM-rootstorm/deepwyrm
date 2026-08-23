@@ -62,9 +62,13 @@ Process residency and Running claim, publishes the witness-only
 acknowledgement, clears its CPU-local retired continuation slot after ACK, and
 then either selects another Runnable Thread or idles on the retained kernel
 root. Late duplicate `HoldSafe` notifications remain on that root and do not
-return the stopped frame or publish a second acknowledgement. Pending completed
-syscall releases are transferred to the post-ACK continuation before the
-irreversible stop transition and finalized only there. The idle-suspend loop
+return the stopped frame or publish a second acknowledgement. A `HoldSafe`
+observed by a replacement Process carrier is likewise a prior-generation
+reclaim gate, not a new stop: it returns through the normal replacement path
+without a duplicate acknowledgement. Pending completed syscall releases are
+transferred to the post-ACK continuation before the irreversible stop
+transition and finalized only there; finalization wake intents and registration
+pins are completed through the normal guard-free waiter publication path. The idle-suspend loop
 uses the same handoff both for a pre-halt rescan and after `sti; hlt` returns:
 it finishes the exact idle generation, consumes the latch, stages the exact
 request, and diverges to the reaper rather than halting or returning the

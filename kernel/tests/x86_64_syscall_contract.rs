@@ -181,6 +181,17 @@ fn i1_native_adapter_phases_revalidate_exact_identity_after_guard_free_work() {
     assert!(primordial.contains("prepare_address_region_mutation("));
     assert!(primordial.contains("address_region_map_prepared_model("));
     assert!(primordial.contains("address_region_unmap_prepared("));
+    let services = source("src/syscall/f_services.rs");
+    assert!(services.contains("struct PreparedFServiceDispatch"));
+    assert!(services.contains("fn dispatch_prepared<"));
+    assert!(
+        services.contains("prepared\n            .begin(current_thread, current_root_generation)")
+    );
+    assert!(
+        services.contains("commit\n            .finish(current_thread, current_root_generation)")
+    );
+    assert!(primordial.contains(".prepare_dispatch(request, self.thread, root_generation)"));
+    assert!(primordial.contains("self.services.dispatch_prepared("));
     assert!(primordial.contains("let phase = self.reserve_runtime_phase();"));
     assert!(primordial.contains("self.assert_guard_free_external_work();"));
     assert!(primordial.contains("self.commit_runtime_phase(phase);"));
@@ -251,6 +262,15 @@ fn i1_post_ack_carrier_never_reuses_a_retired_frame_for_late_holdsafe() {
         .find("self\n            .rendezvous_reaper\n            .take()")
         .expect("irreversible reaper witness consume");
     assert!(stage < consume_reaper);
+    let finalizers = primordial
+        .split_once("fn drain_finalizers(&mut self)")
+        .expect("post-ack finalizer drain")
+        .1
+        .split_once("fn prove_registry_capacity")
+        .expect("finalizer drain extent")
+        .0;
+    assert!(finalizers.contains("while !self.cleanup.is_empty()"));
+    assert!(finalizers.contains("crate::syscall::complete_wait_wakes("));
 }
 
 #[test]
@@ -284,6 +304,32 @@ fn i1_idle_suspend_stop_handoffs_after_idle_cleanup_instead_of_halting() {
         .expect("post-hlt reaper handoff");
     assert!(post_halt_latch < post_halt_handoff);
     assert!(!idle_suspend.contains("live D carrier safe-point/reaper join has not yet"));
+}
+
+#[test]
+fn i1_replacement_carrier_treats_prior_holdsafe_as_a_reclaim_gate_not_a_stop() {
+    let live = source("src/arch/x86_64/syscall/live.rs");
+    let gate = live
+        .split_once("unsafe fn native_runtime_rendezvous_gate")
+        .expect("CPL3 pre-IRET gate")
+        .1
+        .split_once("unsafe fn native_runtime_rendezvous_reaper")
+        .expect("gate extent")
+        .0;
+    assert!(gate.contains("MailboxNotification::HoldSafe(_) => 0"));
+    assert!(!gate.contains(
+        "Stop(request)\n        | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe"
+    ));
+
+    let trampoline = live
+        .split_once("unsafe fn native_runtime_trampoline")
+        .expect("native trampoline")
+        .1
+        .split_once("crate::syscall::native::SyscallControl::ReturnToCaller")
+        .expect("post-dispatch gate extent")
+        .0;
+    assert!(trampoline.contains("MailboxNotification::HoldSafe(_) => {}"));
+    assert!(trampoline.contains("MailboxNotification::Stop(request) =>"));
 }
 
 #[test]
