@@ -250,6 +250,14 @@ fn i1_post_ack_carrier_never_reuses_a_retired_frame_for_late_holdsafe() {
         idle.contains("no second\n                            // acknowledgement may be published")
     );
     assert!(!idle.contains("Stop(_)\n                        | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe"));
+    assert!(idle.contains("MailboxNotification::Wake => {"));
+    assert!(idle.contains("self.enter_rendezvous_replacement(next);"));
+    let rescan = idle
+        .split_once("IdleWakeError::RescanRequired")
+        .expect("kernel-root idle rescan path")
+        .1;
+    assert!(rescan.contains("service_current_rendezvous_latch()"));
+    assert!(rescan.contains("permanent RescanRequired spin"));
 
     let precommit = primordial
         .split_once("fn precommit_exact_stop(")

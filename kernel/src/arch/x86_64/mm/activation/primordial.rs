@@ -1308,6 +1308,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let Some(next) = next else {
             self.idle_after_rendezvous_stop()
         };
+        self.enter_rendezvous_replacement(next)
+    }
+
+    /// Enters an exact Runnable replacement selected after the stopped frame
+    /// has been irreversibly abandoned. This is also used by kernel-root idle
+    /// after a late Wake; it never consumes or returns through that frame.
+    fn enter_rendezvous_replacement(&mut self, next: ThreadKey) -> ! {
         let (stack_id, context_id) = self
             .tasks
             .thread_execution_resources(next)
@@ -1373,8 +1380,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     match crate::time::service_current_rendezvous_latch()
                         .unwrap_or_else(|_| panic!("rendezvous kernel-root idle latch failed"))
                     {
-                        crate::arch::x86_64::rendezvous::MailboxNotification::None
-                        | crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {}
+                        crate::arch::x86_64::rendezvous::MailboxNotification::None => {}
+                        crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {
+                            if let Some(next) =
+                                self.shared.execution.terminal_reaper_next_on(self.cpu)
+                            {
+                                self.enter_rendezvous_replacement(next);
+                            }
+                        }
                         crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {
                             // A late duplicate e1 observes the exact safe
                             // acknowledgement still held by its initiator.
@@ -1395,6 +1408,26 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         .unwrap_or_else(|error| {
                             panic!("rendezvous kernel-root idle cancellation failed: {error:?}")
                         });
+                    // An interrupt that completed EOI before the final idle
+                    // commit must be consumed here. Merely cancelling leaves
+                    // the latch set and turns every following commit into a
+                    // permanent RescanRequired spin.
+                    match crate::time::service_current_rendezvous_latch()
+                        .unwrap_or_else(|_| panic!("rendezvous kernel-root rescan latch failed"))
+                    {
+                        crate::arch::x86_64::rendezvous::MailboxNotification::None => {}
+                        crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {
+                            if let Some(next) =
+                                self.shared.execution.terminal_reaper_next_on(self.cpu)
+                            {
+                                self.enter_rendezvous_replacement(next);
+                            }
+                        }
+                        crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {}
+                        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_) => {
+                            panic!("stopped kernel-root carrier received a second stop request")
+                        }
+                    }
                 }
                 Err(failure) => panic!(
                     "rendezvous kernel-root idle commit failed: {:?}",
