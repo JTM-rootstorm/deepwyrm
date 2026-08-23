@@ -34,6 +34,13 @@ pub(crate) enum HandleTableError {
     ReferenceCapacity,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HandleReservationError {
+    ForeignTable,
+    StalePermit,
+    Conflict,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum AcceptedObjectTypes<'a> {
     Any,
@@ -147,6 +154,7 @@ impl<const CAPACITY: usize> DrainResult<CAPACITY> {
     }
 }
 
+#[derive(Debug)]
 struct HandleEntry {
     reference: HandleRef,
     rights: DwRights,
@@ -156,6 +164,20 @@ struct HandleSlot {
     generation: u32,
     retired: bool,
     entry: Option<HandleEntry>,
+    reservation: Option<SlotReservation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SlotReservationKind {
+    MovePrepared,
+    MoveExtracted,
+    Destination,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SlotReservation {
+    permit: u64,
+    kind: SlotReservationKind,
 }
 
 #[derive(Clone, Copy)]
@@ -164,6 +186,7 @@ struct Reservation {
     prior_generation: u32,
     generation: u32,
     handle: DwHandle,
+    permit: u64,
 }
 
 #[must_use = "reserved handle pairs must be published exactly once or deliberately discarded before any intervening table mutation"]
@@ -173,6 +196,7 @@ pub(crate) struct HandlePairReservation {
     rights: DwRights,
     first: Reservation,
     second: Reservation,
+    completed: bool,
 }
 
 pub(crate) const HANDLE_TRANSFER_LIMIT: usize = DW_CHANNEL_MAX_HANDLES as usize;
@@ -191,6 +215,7 @@ struct PreparedMoveEntry {
     object_type: DwObjectType,
     source_rights: DwRights,
     requested_rights: DwRights,
+    permit: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -225,6 +250,7 @@ pub(crate) struct HandleMoveRollback<'a, const CAPACITY: usize> {
 pub(crate) struct PreparedHandleMove {
     domain: u64,
     entry: PreparedMoveEntry,
+    completed: bool,
 }
 
 /// An extracted F10 single-handle MOVE that must be either finished or rolled
@@ -236,7 +262,72 @@ pub(crate) struct PreparedHandleMoveRollback {
     completed: bool,
 }
 
+#[derive(Debug)]
+pub(crate) struct HandleTransferPublishError {
+    error: HandleReservationError,
+    token: HandleTransferToken,
+}
+
+impl HandleTransferPublishError {
+    pub(crate) const fn error(&self) -> HandleReservationError {
+        self.error
+    }
+
+    pub(crate) fn into_token(self) -> HandleTransferToken {
+        self.token
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct HandleReferencePublishError {
+    error: HandleReservationError,
+    reference: HandleRef,
+}
+
+impl HandleReferencePublishError {
+    pub(crate) const fn error(&self) -> HandleReservationError {
+        self.error
+    }
+
+    pub(crate) fn into_reference(self) -> HandleRef {
+        self.reference
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct HandlePairPublishError {
+    error: HandleReservationError,
+    references: [HandleRef; 2],
+}
+
+impl HandlePairPublishError {
+    pub(crate) const fn error(&self) -> HandleReservationError {
+        self.error
+    }
+
+    pub(crate) fn into_references(self) -> [HandleRef; 2] {
+        self.references
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct HandleTransferRollbackError {
+    error: HandleReservationError,
+    token: HandleTransferToken,
+}
+
+impl HandleTransferRollbackError {
+    pub(crate) const fn error(&self) -> HandleReservationError {
+        self.error
+    }
+
+    pub(crate) fn into_token(self) -> HandleTransferToken {
+        self.token
+    }
+}
+
 #[must_use = "queued transfer tokens own generic handle references until receive publication or queue teardown"]
+#[derive(Debug)]
 pub(crate) struct HandleTransferToken {
     reference: HandleRef,
     source_rights: DwRights,
@@ -265,12 +356,14 @@ pub(crate) struct HandleBatchReservation<'a, const CAPACITY: usize> {
 
 /// An owned reservation for one incoming transfer token.
 ///
-/// The reservation changes no table state until publication. It is bound to
-/// one HandleTable domain and one vacant slot generation.
+/// The reservation pins one vacant slot with a table-local permit until
+/// publication or explicit cancellation. It is bound to one HandleTable
+/// domain and one vacant slot generation.
 #[must_use = "reserved transfer destinations must be published or deliberately discarded"]
 pub(crate) struct HandleTransferReservation {
     domain: u64,
     reservation: Reservation,
+    completed: bool,
 }
 
 impl HandleTransferReservation {
@@ -294,6 +387,7 @@ pub(crate) struct TypedHandlePairReservation {
     domain: u64,
     specs: [HandleReservationSpec; 2],
     reservations: [Reservation; 2],
+    completed: bool,
 }
 
 #[must_use = "handle tables with live entries must be explicitly drained before teardown"]
@@ -301,6 +395,7 @@ pub(crate) struct HandleTable<const CAPACITY: usize> {
     domain: u64,
     slots: [HandleSlot; CAPACITY],
     live_count: usize,
+    next_permit: u64,
 }
 impl<const CAPACITY: usize> HandleTable<CAPACITY> {
     pub(crate) fn new() -> Self {
@@ -310,8 +405,10 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
                 generation: 0,
                 retired: false,
                 entry: None,
+                reservation: None,
             }),
             live_count: 0,
+            next_permit: 1,
         }
     }
 
@@ -363,6 +460,7 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
                 object_type: entry.reference.object_type(),
                 source_rights: entry.rights,
                 requested_rights: request.requested_rights,
+                permit: 0,
             });
         }
 
@@ -375,10 +473,9 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
 
     /// Prepares exactly one MOVE without retaining HandleTable ownership.
     ///
-    /// The returned token is table-domain and source-generation bound. The
-    /// caller must provide the same table to `PreparedHandleMove::extract`
-    /// while its wider transaction barrier still excludes conflicting table
-    /// mutation.
+    /// The returned token is table-domain and source-generation bound. Its
+    /// permit excludes conflicting close and duplicate operations until
+    /// extraction or explicit cancellation.
     pub(crate) fn prepare_move(
         &mut self,
         request: HandleMoveRequest,
@@ -386,28 +483,40 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
         let slot = self
             .resolve_slot(request.handle)
             .map_err(HandleMovePrepareError::Table)?;
-        let entry = self.slots[slot]
-            .entry
-            .as_ref()
-            .expect("resolved transfer source remains live");
-        require_held(entry.rights, DW_RIGHT_TRANSFER)
+        let (object, object_type, source_rights) = {
+            let entry = self.slots[slot]
+                .entry
+                .as_ref()
+                .expect("resolved transfer source remains live");
+            (
+                entry.reference.id(),
+                entry.reference.object_type(),
+                entry.rights,
+            )
+        };
+        require_held(source_rights, DW_RIGHT_TRANSFER)
             .map_err(|error| HandleMovePrepareError::Table(rights_error(error)))?;
         validate_requested_syntax(request.requested_rights)
             .map_err(|error| HandleMovePrepareError::Table(rights_error(error)))?;
-        validate_compatible(entry.reference.object_type(), request.requested_rights)
+        validate_compatible(object_type, request.requested_rights)
             .map_err(|error| HandleMovePrepareError::Table(rights_error(error)))?;
-        require_subset(entry.rights, request.requested_rights)
+        require_subset(source_rights, request.requested_rights)
             .map_err(|error| HandleMovePrepareError::Table(rights_error(error)))?;
+        let permit = self
+            .reserve_live_slot(slot, SlotReservationKind::MovePrepared)
+            .map_err(HandleMovePrepareError::Table)?;
         Ok(PreparedHandleMove {
             domain: self.domain,
             entry: PreparedMoveEntry {
                 slot,
                 handle: request.handle,
-                object: entry.reference.id(),
-                object_type: entry.reference.object_type(),
-                source_rights: entry.rights,
+                object,
+                object_type,
+                source_rights,
                 requested_rights: request.requested_rights,
+                permit,
             },
+            completed: false,
         })
     }
 
@@ -422,35 +531,16 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
         let mut reservations: [Option<Reservation>; HANDLE_TRANSFER_LIMIT] =
             [None; HANDLE_TRANSFER_LIMIT];
         for index in 0..count {
-            let mut found = None;
-            for slot in 0..CAPACITY {
-                if reservations[..index]
-                    .iter()
-                    .flatten()
-                    .any(|reservation| reservation.slot == slot)
-                    || self.slots[slot].retired
-                    || self.slots[slot].entry.is_some()
-                {
-                    continue;
+            match self.reserve_slot_excluding(None) {
+                Ok(reservation) => reservations[index] = Some(reservation),
+                Err(error) => {
+                    for reservation in reservations[..index].iter().flatten().copied() {
+                        self.release_reservation(reservation, SlotReservationKind::Destination)
+                            .expect("batch destination reservation remains locally owned");
+                    }
+                    return Err(error);
                 }
-                let prior_generation = self.slots[slot].generation;
-                let Some(generation) = next_generation(prior_generation) else {
-                    self.slots[slot].retired = true;
-                    continue;
-                };
-                let Some(handle) = encode_handle(slot, generation) else {
-                    self.slots[slot].retired = true;
-                    continue;
-                };
-                found = Some(Reservation {
-                    slot,
-                    prior_generation,
-                    generation,
-                    handle,
-                });
-                break;
             }
-            reservations[index] = Some(found.ok_or(HandleTableError::Capacity)?);
         }
         Ok(HandleBatchReservation {
             table: self,
@@ -460,7 +550,7 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
     }
 
     /// Reserves one transfer destination without retaining HandleTable
-    /// ownership. Cancellation is mutation-free.
+    /// ownership. The owned token must publish or explicitly cancel its permit.
     pub(crate) fn reserve_transfer_destination(
         &mut self,
     ) -> Result<HandleTransferReservation, HandleTableError> {
@@ -468,6 +558,7 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
         Ok(HandleTransferReservation {
             domain: self.domain,
             reservation,
+            completed: false,
         })
     }
 
@@ -481,20 +572,26 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
             validate_compatible(spec.object_type, spec.rights).map_err(rights_error)?;
         }
         let first = self.reserve_slot_unpublished(None)?;
-        let second = self.reserve_slot_unpublished(Some(first.slot))?;
+        let second = match self.reserve_slot_unpublished(Some(first.slot)) {
+            Ok(second) => second,
+            Err(error) => {
+                self.release_reservation(first, SlotReservationKind::Destination)
+                    .expect("first typed-pair reservation remains locally owned");
+                return Err(error);
+            }
+        };
         Ok(TypedHandlePairReservation {
             domain: self.domain,
             specs,
             reservations: [first, second],
+            completed: false,
         })
     }
 
     /// Reserves two caller-local slots without publishing either handle.
     ///
-    /// The caller must retain exclusive logical ownership of this HandleTable
-    /// until `publish_reserved_pair` consumes the token. The reservation itself
-    /// does not mutate slot generations, so abandoning it before publication is
-    /// rollback-free.
+    /// Each returned slot is protected by a table-local permit until
+    /// publication or explicit cancellation.
     pub(crate) fn reserve_pair(
         &mut self,
         object_type: DwObjectType,
@@ -503,13 +600,21 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
         validate_requested_syntax(rights).map_err(rights_error)?;
         validate_compatible(object_type, rights).map_err(rights_error)?;
         let first = self.reserve_slot_excluding(None)?;
-        let second = self.reserve_slot_excluding(Some(first.slot))?;
+        let second = match self.reserve_slot_excluding(Some(first.slot)) {
+            Ok(second) => second,
+            Err(error) => {
+                self.release_reservation(first, SlotReservationKind::Destination)
+                    .expect("first handle-pair reservation remains locally owned");
+                return Err(error);
+            }
+        };
         Ok(HandlePairReservation {
             domain: self.domain,
             object_type,
             rights,
             first,
             second,
+            completed: false,
         })
     }
 
@@ -519,42 +624,63 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
     /// recoverable userspace condition.
     pub(crate) fn publish_reserved_pair(
         &mut self,
-        reservation: HandlePairReservation,
+        mut reservation: HandlePairReservation,
         first: HandleRef,
         second: HandleRef,
     ) -> [DwHandle; 2] {
-        assert_eq!(
-            reservation.domain, self.domain,
-            "foreign handle-pair reservation"
-        );
-        assert_eq!(
-            first.object_type(),
-            reservation.object_type,
-            "first reserved handle type drift"
-        );
-        assert_eq!(
-            second.object_type(),
-            reservation.object_type,
-            "second reserved handle type drift"
-        );
-        self.assert_reservation_fresh(reservation.first);
-        self.assert_reservation_fresh(reservation.second);
+        self.try_publish_reserved_pair(&mut reservation, first, second)
+            .unwrap_or_else(|failure| {
+                panic!("reserved pair publication failed: {:?}", failure.error())
+            })
+    }
+
+    pub(crate) fn try_publish_reserved_pair(
+        &mut self,
+        reservation: &mut HandlePairReservation,
+        first: HandleRef,
+        second: HandleRef,
+    ) -> Result<[DwHandle; 2], HandlePairPublishError> {
+        let references = [first, second];
+        if reservation.domain != self.domain {
+            return Err(HandlePairPublishError {
+                error: HandleReservationError::ForeignTable,
+                references,
+            });
+        }
+        if references
+            .iter()
+            .any(|reference| reference.object_type() != reservation.object_type)
+        {
+            return Err(HandlePairPublishError {
+                error: HandleReservationError::Conflict,
+                references,
+            });
+        }
+        for owned in [reservation.first, reservation.second] {
+            if let Err(error) = self.validate_reservation(owned, SlotReservationKind::Destination) {
+                return Err(HandlePairPublishError { error, references });
+            }
+        }
         let handles = [reservation.first.handle, reservation.second.handle];
+        let [first, second] = references;
         self.publish(
             reservation.first,
             HandleEntry {
                 reference: first,
                 rights: reservation.rights,
             },
-        );
+        )
+        .expect("validated first pair reservation publishes");
         self.publish(
             reservation.second,
             HandleEntry {
                 reference: second,
                 rights: reservation.rights,
             },
-        );
-        handles
+        )
+        .expect("validated second pair reservation publishes");
+        reservation.completed = true;
+        Ok(handles)
     }
 
     pub(crate) fn install(
@@ -574,7 +700,8 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
             Ok(reservation) => reservation,
             Err(error) => return Err(InstallError { error, reference }),
         };
-        self.publish(reservation, HandleEntry { reference, rights });
+        self.publish(reservation, HandleEntry { reference, rights })
+            .expect("newly reserved install slot publishes");
         Ok(reservation.handle)
     }
 
@@ -619,7 +746,7 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
         registry: &mut ObjectRegistry<OBJECTS>,
         handle: DwHandle,
     ) -> Result<Option<FinalRelease>, HandleTableError> {
-        let slot = self.resolve_slot(handle)?;
+        let slot = self.resolve_mutation_slot(handle)?;
         let entry = self.slots[slot]
             .entry
             .take()
@@ -647,7 +774,7 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
         requested_rights: DwRights,
     ) -> Result<DwHandle, HandleTableError> {
         validate_requested_syntax(requested_rights).map_err(rights_error)?;
-        let source_slot = self.resolve_slot(source)?;
+        let source_slot = self.resolve_mutation_slot(source)?;
         let (object_type, held_rights) = {
             let entry = self.slots[source_slot]
                 .entry
@@ -675,7 +802,8 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
                 reference: retained,
                 rights: requested_rights,
             },
-        );
+        )
+        .expect("newly reserved duplicate slot publishes");
         Ok(reservation.handle)
     }
 
@@ -686,6 +814,9 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
         let mut final_releases = core::array::from_fn(|_| None);
         let mut final_release_count = 0;
         for slot in 0..CAPACITY {
+            if self.slots[slot].reservation.is_some() {
+                continue;
+            }
             let Some(entry) = self.slots[slot].entry.take() else {
                 continue;
             };
@@ -724,89 +855,130 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
     /// unavailable; normal close/install paths continue to retire them when
     /// they perform an actual table mutation.
     fn reserve_slot_unpublished(
-        &self,
+        &mut self,
         excluded: Option<usize>,
     ) -> Result<Reservation, HandleTableError> {
-        for slot in 0..CAPACITY {
-            if excluded == Some(slot)
-                || self.slots[slot].retired
-                || self.slots[slot].entry.is_some()
-            {
-                continue;
-            }
-            let prior_generation = self.slots[slot].generation;
-            let Some(generation) = next_generation(prior_generation) else {
-                continue;
-            };
-            let Some(handle) = encode_handle(slot, generation) else {
-                continue;
-            };
-            return Ok(Reservation {
-                slot,
-                prior_generation,
-                generation,
-                handle,
-            });
-        }
-        Err(HandleTableError::Capacity)
+        self.reserve_slot_with_kind(excluded, SlotReservationKind::Destination, false)
     }
 
     fn reserve_slot_excluding(
         &mut self,
         excluded: Option<usize>,
     ) -> Result<Reservation, HandleTableError> {
+        self.reserve_slot_with_kind(excluded, SlotReservationKind::Destination, true)
+    }
+
+    fn reserve_slot_with_kind(
+        &mut self,
+        excluded: Option<usize>,
+        kind: SlotReservationKind,
+        retire_exhausted: bool,
+    ) -> Result<Reservation, HandleTableError> {
         for slot in 0..CAPACITY {
             if excluded == Some(slot)
                 || self.slots[slot].retired
                 || self.slots[slot].entry.is_some()
+                || self.slots[slot].reservation.is_some()
             {
                 continue;
             }
             let prior_generation = self.slots[slot].generation;
             let Some(generation) = next_generation(prior_generation) else {
-                self.slots[slot].retired = true;
+                if retire_exhausted {
+                    self.slots[slot].retired = true;
+                }
                 continue;
             };
             let Some(handle) = encode_handle(slot, generation) else {
-                self.slots[slot].retired = true;
+                if retire_exhausted {
+                    self.slots[slot].retired = true;
+                }
                 continue;
             };
+            let permit = self.mint_permit();
+            self.slots[slot].reservation = Some(SlotReservation { permit, kind });
             return Ok(Reservation {
                 slot,
                 prior_generation,
                 generation,
                 handle,
+                permit,
             });
         }
         Err(HandleTableError::Capacity)
     }
 
-    fn assert_reservation_fresh(&self, reservation: Reservation) {
-        let slot = &self.slots[reservation.slot];
-        assert!(
-            !slot.retired
-                && slot.entry.is_none()
-                && slot.generation == reservation.prior_generation,
-            "reserved handle slot changed before pair publication"
-        );
+    fn mint_permit(&mut self) -> u64 {
+        let permit = self.next_permit;
+        self.next_permit = self
+            .next_permit
+            .checked_add(1)
+            .filter(|next| *next != 0)
+            .expect("handle reservation permit space exhausted");
+        permit
     }
 
-    fn publish(&mut self, reservation: Reservation, entry: HandleEntry) {
+    fn reserve_live_slot(
+        &mut self,
+        slot: usize,
+        kind: SlotReservationKind,
+    ) -> Result<u64, HandleTableError> {
+        if self.slots[slot].reservation.is_some() {
+            return Err(HandleTableError::AccessDenied);
+        }
+        let permit = self.mint_permit();
+        self.slots[slot].reservation = Some(SlotReservation { permit, kind });
+        Ok(permit)
+    }
+
+    fn validate_reservation(
+        &self,
+        reservation: Reservation,
+        expected_kind: SlotReservationKind,
+    ) -> Result<(), HandleReservationError> {
+        let slot = &self.slots[reservation.slot];
+        if slot.reservation
+            != Some(SlotReservation {
+                permit: reservation.permit,
+                kind: expected_kind,
+            })
+        {
+            return Err(HandleReservationError::StalePermit);
+        }
+        if slot.retired || slot.entry.is_some() || slot.generation != reservation.prior_generation {
+            return Err(HandleReservationError::Conflict);
+        }
+        Ok(())
+    }
+
+    fn release_reservation(
+        &mut self,
+        reservation: Reservation,
+        expected_kind: SlotReservationKind,
+    ) -> Result<(), HandleReservationError> {
+        self.validate_reservation(reservation, expected_kind)?;
+        self.slots[reservation.slot].reservation = None;
+        Ok(())
+    }
+
+    fn publish(
+        &mut self,
+        reservation: Reservation,
+        entry: HandleEntry,
+    ) -> Result<(), (HandleReservationError, HandleEntry)> {
+        if let Err(error) = self.validate_reservation(reservation, SlotReservationKind::Destination)
+        {
+            return Err((error, entry));
+        }
         let slot = &mut self.slots[reservation.slot];
-        assert!(
-            !slot.retired,
-            "reserved handle slot retired before publication"
-        );
-        assert!(
-            slot.entry.is_none(),
-            "reserved handle slot became live before publication"
-        );
         slot.generation = reservation.generation;
         slot.entry = Some(entry);
+        slot.reservation = None;
         self.live_count = self
             .live_count
             .checked_add(1)
             .expect("live handle count exceeds table capacity");
+        Ok(())
     }
 
     fn resolve_entry(&self, handle: DwHandle) -> Result<&HandleEntry, HandleTableError> {
@@ -830,6 +1002,47 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
             return Err(HandleTableError::InvalidHandle);
         }
         Ok(slot)
+    }
+
+    fn resolve_mutation_slot(&self, handle: DwHandle) -> Result<usize, HandleTableError> {
+        let slot = self.resolve_slot(handle)?;
+        if self.slots[slot].reservation.is_some() {
+            return Err(HandleTableError::AccessDenied);
+        }
+        Ok(slot)
+    }
+
+    fn validate_prepared_move(
+        &self,
+        prepared: &PreparedMoveEntry,
+        expected_kind: SlotReservationKind,
+        source_must_be_live: bool,
+    ) -> Result<(), HandleReservationError> {
+        let Some(slot) = self.slots.get(prepared.slot) else {
+            return Err(HandleReservationError::StalePermit);
+        };
+        if slot.reservation
+            != Some(SlotReservation {
+                permit: prepared.permit,
+                kind: expected_kind,
+            })
+        {
+            return Err(HandleReservationError::StalePermit);
+        }
+        if slot.retired || slot.generation != (prepared.handle.0 >> 32) as u32 {
+            return Err(HandleReservationError::Conflict);
+        }
+        match (source_must_be_live, slot.entry.as_ref()) {
+            (true, Some(entry))
+                if entry.reference.id() == prepared.object
+                    && entry.reference.object_type() == prepared.object_type
+                    && entry.rights == prepared.source_rights =>
+            {
+                Ok(())
+            }
+            (false, None) => Ok(()),
+            _ => Err(HandleReservationError::Conflict),
+        }
     }
 }
 
@@ -900,29 +1113,50 @@ impl<'a, const CAPACITY: usize> PreparedHandleMoveBatch<'a, CAPACITY> {
 }
 
 impl PreparedHandleMove {
+    pub(crate) fn cancel<const CAPACITY: usize>(
+        &mut self,
+        table: &mut HandleTable<CAPACITY>,
+    ) -> Result<(), HandleReservationError> {
+        if self.domain != table.domain {
+            return Err(HandleReservationError::ForeignTable);
+        }
+        table.validate_prepared_move(&self.entry, SlotReservationKind::MovePrepared, true)?;
+        table.slots[self.entry.slot].reservation = None;
+        self.completed = true;
+        Ok(())
+    }
+
     pub(crate) fn extract<const CAPACITY: usize>(
-        self,
+        mut self,
         table: &mut HandleTable<CAPACITY>,
     ) -> (PreparedHandleMoveRollback, HandleTransferToken) {
-        assert_eq!(self.domain, table.domain, "foreign prepared handle move");
+        self.try_extract(table)
+            .unwrap_or_else(|error| panic!("prepared move extraction failed: {error:?}"))
+    }
+
+    pub(crate) fn try_extract<const CAPACITY: usize>(
+        &mut self,
+        table: &mut HandleTable<CAPACITY>,
+    ) -> Result<(PreparedHandleMoveRollback, HandleTransferToken), HandleReservationError> {
+        if self.domain != table.domain {
+            return Err(HandleReservationError::ForeignTable);
+        }
         let entry = self.entry;
-        assert_eq!(
-            table.resolve_slot(entry.handle),
-            Ok(entry.slot),
-            "prepared single transfer source changed before extraction"
-        );
+        table.validate_prepared_move(&entry, SlotReservationKind::MovePrepared, true)?;
         let source = table.slots[entry.slot]
             .entry
             .take()
             .expect("prepared single transfer source remains live until extraction");
-        assert_eq!(source.reference.id(), entry.object);
-        assert_eq!(source.reference.object_type(), entry.object_type);
-        assert_eq!(source.rights, entry.source_rights);
+        table.slots[entry.slot].reservation = Some(SlotReservation {
+            permit: entry.permit,
+            kind: SlotReservationKind::MoveExtracted,
+        });
         table.live_count = table
             .live_count
             .checked_sub(1)
             .expect("live handle count underflow during single transfer extraction");
-        (
+        self.completed = true;
+        Ok((
             PreparedHandleMoveRollback {
                 domain: self.domain,
                 entry,
@@ -933,25 +1167,40 @@ impl PreparedHandleMove {
                 source_rights: source.rights,
                 requested_rights: entry.requested_rights,
             },
-        )
+        ))
+    }
+}
+
+impl Drop for PreparedHandleMove {
+    fn drop(&mut self) {
+        assert!(
+            self.completed,
+            "prepared single handle move dropped without extraction or cancellation"
+        );
     }
 }
 
 impl PreparedHandleMoveRollback {
     pub(crate) fn finish<const CAPACITY: usize>(mut self, table: &mut HandleTable<CAPACITY>) {
-        assert_eq!(
-            self.domain, table.domain,
-            "foreign single transfer rollback"
-        );
+        self.try_finish(table)
+            .unwrap_or_else(|error| panic!("prepared move finish failed: {error:?}"));
+    }
+
+    pub(crate) fn try_finish<const CAPACITY: usize>(
+        &mut self,
+        table: &mut HandleTable<CAPACITY>,
+    ) -> Result<(), HandleReservationError> {
+        if self.domain != table.domain {
+            return Err(HandleReservationError::ForeignTable);
+        }
+        table.validate_prepared_move(&self.entry, SlotReservationKind::MoveExtracted, false)?;
         let slot = &mut table.slots[self.entry.slot];
-        assert!(
-            slot.entry.is_none() && slot.generation == (self.entry.handle.0 >> 32) as u32,
-            "committed single transfer source slot drifted before invalidation finish"
-        );
         if next_generation(slot.generation).is_none() {
             slot.retired = true;
         }
+        slot.reservation = None;
         self.completed = true;
+        Ok(())
     }
 
     pub(crate) fn rollback<const CAPACITY: usize>(
@@ -959,30 +1208,49 @@ impl PreparedHandleMoveRollback {
         table: &mut HandleTable<CAPACITY>,
         token: HandleTransferToken,
     ) {
-        assert_eq!(
-            self.domain, table.domain,
-            "foreign single transfer rollback"
-        );
-        assert_eq!(token.reference.id(), self.entry.object);
-        assert_eq!(token.reference.object_type(), self.entry.object_type);
-        assert_eq!(token.source_rights, self.entry.source_rights);
-        assert_eq!(token.requested_rights, self.entry.requested_rights);
+        self.try_rollback(table, token).unwrap_or_else(|failure| {
+            panic!("prepared move rollback failed: {:?}", failure.error())
+        });
+    }
+
+    pub(crate) fn try_rollback<const CAPACITY: usize>(
+        &mut self,
+        table: &mut HandleTable<CAPACITY>,
+        token: HandleTransferToken,
+    ) -> Result<(), HandleTransferRollbackError> {
+        if self.domain != table.domain {
+            return Err(HandleTransferRollbackError {
+                error: HandleReservationError::ForeignTable,
+                token,
+            });
+        }
+        if token.reference.id() != self.entry.object
+            || token.reference.object_type() != self.entry.object_type
+            || token.source_rights != self.entry.source_rights
+            || token.requested_rights != self.entry.requested_rights
+        {
+            return Err(HandleTransferRollbackError {
+                error: HandleReservationError::Conflict,
+                token,
+            });
+        }
+        if let Err(error) =
+            table.validate_prepared_move(&self.entry, SlotReservationKind::MoveExtracted, false)
+        {
+            return Err(HandleTransferRollbackError { error, token });
+        }
         let slot = &mut table.slots[self.entry.slot];
-        assert!(
-            !slot.retired
-                && slot.entry.is_none()
-                && slot.generation == (self.entry.handle.0 >> 32) as u32,
-            "single transfer rollback source slot drifted"
-        );
         slot.entry = Some(HandleEntry {
             reference: token.reference,
             rights: token.source_rights,
         });
+        slot.reservation = None;
         table.live_count = table
             .live_count
             .checked_add(1)
             .expect("live handle count overflow during single transfer rollback");
         self.completed = true;
+        Ok(())
     }
 }
 
@@ -1046,6 +1314,36 @@ impl<const CAPACITY: usize> HandleMoveRollback<'_, CAPACITY> {
                 .expect("live handle count overflow during transfer rollback");
         }
         self.completed = true;
+    }
+}
+
+impl HandlePairReservation {
+    pub(crate) fn cancel<const CAPACITY: usize>(
+        &mut self,
+        table: &mut HandleTable<CAPACITY>,
+    ) -> Result<(), HandleReservationError> {
+        if self.domain != table.domain {
+            return Err(HandleReservationError::ForeignTable);
+        }
+        for reservation in [self.first, self.second] {
+            table.validate_reservation(reservation, SlotReservationKind::Destination)?;
+        }
+        for reservation in [self.first, self.second] {
+            table
+                .release_reservation(reservation, SlotReservationKind::Destination)
+                .expect("validated pair reservation releases");
+        }
+        self.completed = true;
+        Ok(())
+    }
+}
+
+impl Drop for HandlePairReservation {
+    fn drop(&mut self) {
+        assert!(
+            self.completed,
+            "handle-pair reservation dropped without publication or cancellation"
+        );
     }
 }
 
@@ -1144,7 +1442,9 @@ impl<'a, const CAPACITY: usize> HandleBatchReservation<'a, CAPACITY> {
         for index in 0..len {
             let reservation = reservations[index]
                 .expect("destination reservation exists for every received token");
-            table.assert_reservation_fresh(reservation);
+            table
+                .validate_reservation(reservation, SlotReservationKind::Destination)
+                .expect("borrowed destination reservation remains fresh");
             let token = transfers.entries[index]
                 .take()
                 .expect("received transfer batch retains every token");
@@ -1153,13 +1453,15 @@ impl<'a, const CAPACITY: usize> HandleBatchReservation<'a, CAPACITY> {
                 rights: token.requested_rights,
                 object_type: token.reference.object_type(),
             };
-            table.publish(
-                reservation,
-                HandleEntry {
-                    reference: token.reference,
-                    rights: token.requested_rights,
-                },
-            );
+            table
+                .publish(
+                    reservation,
+                    HandleEntry {
+                        reference: token.reference,
+                        rights: token.requested_rights,
+                    },
+                )
+                .expect("validated borrowed destination reservation publishes");
             published[index] = Some(info);
         }
         published
@@ -1167,93 +1469,222 @@ impl<'a, const CAPACITY: usize> HandleBatchReservation<'a, CAPACITY> {
 }
 
 impl HandleTransferReservation {
+    pub(crate) fn cancel<const CAPACITY: usize>(
+        &mut self,
+        table: &mut HandleTable<CAPACITY>,
+    ) -> Result<(), HandleReservationError> {
+        if self.domain != table.domain {
+            return Err(HandleReservationError::ForeignTable);
+        }
+        table.release_reservation(self.reservation, SlotReservationKind::Destination)?;
+        self.completed = true;
+        Ok(())
+    }
+
     /// Publishes a kernel-owned factory reference into a previously reserved
     /// child slot without routing it through a userspace MOVE source.
     pub(crate) fn publish_reference<const CAPACITY: usize>(
-        self,
+        mut self,
         table: &mut HandleTable<CAPACITY>,
         reference: HandleRef,
         rights: DwRights,
     ) -> PublishedHandleInfo {
-        assert_eq!(
-            self.domain, table.domain,
-            "foreign factory destination reservation"
-        );
-        validate_requested_syntax(rights)
+        self.try_publish_reference(table, reference, rights)
+            .unwrap_or_else(|failure| {
+                panic!(
+                    "factory destination publication failed: {:?}",
+                    failure.error()
+                )
+            })
+    }
+
+    pub(crate) fn try_publish_reference<const CAPACITY: usize>(
+        &mut self,
+        table: &mut HandleTable<CAPACITY>,
+        reference: HandleRef,
+        rights: DwRights,
+    ) -> Result<PublishedHandleInfo, HandleReferencePublishError> {
+        if self.domain != table.domain {
+            return Err(HandleReferencePublishError {
+                error: HandleReservationError::ForeignTable,
+                reference,
+            });
+        }
+        if validate_requested_syntax(rights)
             .and_then(|_| validate_compatible(reference.object_type(), rights))
-            .unwrap_or_else(|error| panic!("invalid factory-published rights: {error:?}"));
-        table.assert_reservation_fresh(self.reservation);
+            .is_err()
+        {
+            return Err(HandleReferencePublishError {
+                error: HandleReservationError::Conflict,
+                reference,
+            });
+        }
+        if let Err(error) =
+            table.validate_reservation(self.reservation, SlotReservationKind::Destination)
+        {
+            return Err(HandleReferencePublishError { error, reference });
+        }
         let info = PublishedHandleInfo {
             handle: self.reservation.handle,
             rights,
             object_type: reference.object_type(),
         };
-        table.publish(self.reservation, HandleEntry { reference, rights });
-        info
+        table
+            .publish(self.reservation, HandleEntry { reference, rights })
+            .expect("validated factory destination reservation publishes");
+        self.completed = true;
+        Ok(info)
     }
 
     pub(crate) fn publish<const CAPACITY: usize>(
-        self,
+        mut self,
         table: &mut HandleTable<CAPACITY>,
         token: HandleTransferToken,
     ) -> PublishedHandleInfo {
-        assert_eq!(
-            self.domain, table.domain,
-            "foreign transfer destination reservation"
-        );
-        table.assert_reservation_fresh(self.reservation);
+        self.try_publish(table, token).unwrap_or_else(|failure| {
+            panic!(
+                "transfer destination publication failed: {:?}",
+                failure.error()
+            )
+        })
+    }
+
+    pub(crate) fn try_publish<const CAPACITY: usize>(
+        &mut self,
+        table: &mut HandleTable<CAPACITY>,
+        token: HandleTransferToken,
+    ) -> Result<PublishedHandleInfo, HandleTransferPublishError> {
+        if self.domain != table.domain {
+            return Err(HandleTransferPublishError {
+                error: HandleReservationError::ForeignTable,
+                token,
+            });
+        }
+        if let Err(error) =
+            table.validate_reservation(self.reservation, SlotReservationKind::Destination)
+        {
+            return Err(HandleTransferPublishError { error, token });
+        }
         let info = PublishedHandleInfo {
             handle: self.reservation.handle,
             rights: token.requested_rights,
             object_type: token.reference.object_type(),
         };
-        table.publish(
-            self.reservation,
-            HandleEntry {
-                reference: token.reference,
-                rights: token.requested_rights,
-            },
+        table
+            .publish(
+                self.reservation,
+                HandleEntry {
+                    reference: token.reference,
+                    rights: token.requested_rights,
+                },
+            )
+            .expect("validated transfer destination reservation publishes");
+        self.completed = true;
+        Ok(info)
+    }
+}
+
+impl Drop for HandleTransferReservation {
+    fn drop(&mut self) {
+        assert!(
+            self.completed,
+            "transfer destination reservation dropped without publication or cancellation"
         );
-        info
     }
 }
 
 impl TypedHandlePairReservation {
+    pub(crate) fn cancel<const CAPACITY: usize>(
+        &mut self,
+        table: &mut HandleTable<CAPACITY>,
+    ) -> Result<(), HandleReservationError> {
+        if self.domain != table.domain {
+            return Err(HandleReservationError::ForeignTable);
+        }
+        for reservation in self.reservations {
+            table.validate_reservation(reservation, SlotReservationKind::Destination)?;
+        }
+        for reservation in self.reservations {
+            table
+                .release_reservation(reservation, SlotReservationKind::Destination)
+                .expect("validated typed-pair reservation releases");
+        }
+        self.completed = true;
+        Ok(())
+    }
+
     pub(crate) fn publish<const CAPACITY: usize>(
-        self,
+        mut self,
         table: &mut HandleTable<CAPACITY>,
         references: [HandleRef; 2],
     ) -> [DwHandle; 2] {
-        assert_eq!(
-            self.domain, table.domain,
-            "foreign typed handle-pair reservation"
-        );
+        self.try_publish(table, references)
+            .unwrap_or_else(|failure| {
+                panic!(
+                    "typed destination publication failed: {:?}",
+                    failure.error()
+                )
+            })
+    }
+
+    pub(crate) fn try_publish<const CAPACITY: usize>(
+        &mut self,
+        table: &mut HandleTable<CAPACITY>,
+        references: [HandleRef; 2],
+    ) -> Result<[DwHandle; 2], HandlePairPublishError> {
+        if self.domain != table.domain {
+            return Err(HandlePairPublishError {
+                error: HandleReservationError::ForeignTable,
+                references,
+            });
+        }
         for (index, reference) in references.iter().enumerate() {
-            assert_eq!(
-                reference.object_type(),
-                self.specs[index].object_type,
-                "typed reserved handle object type drift"
-            );
-            table.assert_reservation_fresh(self.reservations[index]);
+            if reference.object_type() != self.specs[index].object_type {
+                return Err(HandlePairPublishError {
+                    error: HandleReservationError::Conflict,
+                    references,
+                });
+            }
+            if let Err(error) = table
+                .validate_reservation(self.reservations[index], SlotReservationKind::Destination)
+            {
+                return Err(HandlePairPublishError { error, references });
+            }
         }
         let handles = [self.reservations[0].handle, self.reservations[1].handle];
         for (index, reference) in references.into_iter().enumerate() {
-            table.publish(
-                self.reservations[index],
-                HandleEntry {
-                    reference,
-                    rights: self.specs[index].rights,
-                },
-            );
+            table
+                .publish(
+                    self.reservations[index],
+                    HandleEntry {
+                        reference,
+                        rights: self.specs[index].rights,
+                    },
+                )
+                .expect("validated typed destination reservation publishes");
         }
-        handles
+        self.completed = true;
+        Ok(handles)
+    }
+}
+
+impl Drop for TypedHandlePairReservation {
+    fn drop(&mut self) {
+        assert!(
+            self.completed,
+            "typed handle-pair reservation dropped without publication or cancellation"
+        );
     }
 }
 
 impl<const CAPACITY: usize> Drop for HandleTable<CAPACITY> {
     fn drop(&mut self) {
         assert!(
-            self.live_count == 0 && self.slots.iter().all(|slot| slot.entry.is_none()),
+            self.live_count == 0
+                && self
+                    .slots
+                    .iter()
+                    .all(|slot| slot.entry.is_none() && slot.reservation.is_none()),
             "live HandleTable dropped without explicit close/drain"
         );
     }

@@ -765,39 +765,39 @@ fn owned_single_move_preparation_releases_table_before_exact_cancel_or_child_pub
     let reduced = rights(&[DW_RIGHT_READ, DW_RIGHT_WRITE]);
     let bootstrap = install_object(&mut registry, &mut parent, DW_OBJECT_TYPE_CHANNEL, held);
 
-    let prepared = parent
+    let mut prepared = parent
         .prepare_move(HandleMoveRequest {
             handle: bootstrap,
             requested_rights: reduced,
         })
         .unwrap();
-    let reservation = child.reserve_transfer_destination().unwrap();
-    drop(reservation);
+    let mut reservation = child.reserve_transfer_destination().unwrap();
+    reservation.cancel(&mut child).unwrap();
     assert!(
         child.is_empty(),
         "unpublished child reservation must be inert"
     );
 
-    let (rollback, token) = prepared.extract(&mut parent);
+    let (mut rollback, token) = prepared.try_extract(&mut parent).unwrap();
     assert_eq!(
         parent.inspect_basic(bootstrap),
         Err(HandleTableError::InvalidHandle),
         "the source is hidden only after explicit extraction"
     );
-    rollback.rollback(&mut parent, token);
+    rollback.try_rollback(&mut parent, token).unwrap();
     assert_eq!(parent.inspect_basic(bootstrap).unwrap().rights, held);
     assert!(child.is_empty());
 
-    let prepared = parent
+    let mut prepared = parent
         .prepare_move(HandleMoveRequest {
             handle: bootstrap,
             requested_rights: reduced,
         })
         .unwrap();
-    let destination = child.reserve_transfer_destination().unwrap();
-    let (rollback, token) = prepared.extract(&mut parent);
-    let published = destination.publish(&mut child, token);
-    rollback.finish(&mut parent);
+    let mut destination = child.reserve_transfer_destination().unwrap();
+    let (mut rollback, token) = prepared.try_extract(&mut parent).unwrap();
+    let published = destination.try_publish(&mut child, token).unwrap();
+    rollback.try_finish(&mut parent).unwrap();
 
     assert_eq!(
         parent.inspect_basic(bootstrap),
@@ -826,6 +826,153 @@ fn owned_single_move_preparation_releases_table_before_exact_cancel_or_child_pub
 }
 
 #[test]
+fn prepared_move_permit_excludes_close_and_duplicate_until_cancel() {
+    let mut registry = ObjectRegistry::<2>::new();
+    let mut table = HandleTable::<2>::new();
+    let held = rights(&[
+        DW_RIGHT_READ,
+        DW_RIGHT_DUPLICATE,
+        DW_RIGHT_TRANSFER,
+        DW_RIGHT_INSPECT,
+    ]);
+    let source = install_object(
+        &mut registry,
+        &mut table,
+        DW_OBJECT_TYPE_MEMORY_OBJECT,
+        held,
+    );
+    let mut prepared = table
+        .prepare_move(HandleMoveRequest {
+            handle: source,
+            requested_rights: DW_RIGHT_READ,
+        })
+        .unwrap();
+
+    assert_eq!(
+        table.close(&mut registry, source),
+        Err(HandleTableError::AccessDenied)
+    );
+    assert_eq!(
+        table.duplicate(&mut registry, source, DW_RIGHT_READ),
+        Err(HandleTableError::AccessDenied)
+    );
+    assert_eq!(table.inspect_basic(source).unwrap().rights, held);
+
+    prepared.cancel(&mut table).unwrap();
+    let duplicate = table
+        .duplicate(&mut registry, source, DW_RIGHT_READ)
+        .unwrap();
+    assert!(table.close(&mut registry, source).unwrap().is_none());
+    let final_release = table.close(&mut registry, duplicate).unwrap();
+    complete(&mut registry, final_release);
+}
+
+#[test]
+fn destination_permit_excludes_install_until_cancel() {
+    let mut registry = ObjectRegistry::<2>::new();
+    let mut table = HandleTable::<1>::new();
+    let mut reservation = table.reserve_transfer_destination().unwrap();
+    let creation = registry.create(DW_OBJECT_TYPE_EVENT).unwrap();
+    let reference = registry.creation_into_handle(creation).unwrap();
+
+    let failure = table
+        .install(reference, dw_object_compatible_rights(DW_OBJECT_TYPE_EVENT))
+        .unwrap_err();
+    assert_eq!(failure.error(), HandleTableError::Capacity);
+    let reference = failure.into_reference();
+
+    reservation.cancel(&mut table).unwrap();
+    let handle = table
+        .install(reference, dw_object_compatible_rights(DW_OBJECT_TYPE_EVENT))
+        .unwrap();
+    let final_release = table.close(&mut registry, handle).unwrap();
+    complete(&mut registry, final_release);
+}
+
+#[test]
+fn stale_destination_permit_is_reported_without_consuming_ownership() {
+    let mut table = HandleTable::<1>::new();
+    let mut reservation = table.reserve_transfer_destination().unwrap();
+    let slot = reservation.reservation.slot;
+    let owned = table.slots[slot].reservation.unwrap();
+    table.slots[slot].reservation = Some(SlotReservation {
+        permit: owned.permit + 1,
+        kind: owned.kind,
+    });
+
+    assert_eq!(
+        reservation.cancel(&mut table),
+        Err(HandleReservationError::StalePermit)
+    );
+    table.slots[slot].reservation = Some(owned);
+    reservation.cancel(&mut table).unwrap();
+}
+
+#[test]
+fn extracted_move_permit_survives_foreign_rollback_and_restores_exactly_once() {
+    let mut registry = ObjectRegistry::<1>::new();
+    let mut source_table = HandleTable::<1>::new();
+    let mut foreign_table = HandleTable::<1>::new();
+    let held = rights(&[DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_INSPECT]);
+    let source = install_object(
+        &mut registry,
+        &mut source_table,
+        DW_OBJECT_TYPE_MEMORY_OBJECT,
+        held,
+    );
+    let mut prepared = source_table
+        .prepare_move(HandleMoveRequest {
+            handle: source,
+            requested_rights: DW_RIGHT_READ,
+        })
+        .unwrap();
+    let (mut rollback, token) = prepared.try_extract(&mut source_table).unwrap();
+
+    let failure = rollback
+        .try_rollback(&mut foreign_table, token)
+        .unwrap_err();
+    assert_eq!(failure.error(), HandleReservationError::ForeignTable);
+    let token = failure.into_token();
+    rollback.try_rollback(&mut source_table, token).unwrap();
+    assert_eq!(source_table.inspect_basic(source).unwrap().rights, held);
+
+    let final_release = source_table.close(&mut registry, source).unwrap();
+    complete(&mut registry, final_release);
+}
+
+#[test]
+fn destination_publish_foreign_table_preserves_token_for_exact_retry() {
+    let mut registry = ObjectRegistry::<1>::new();
+    let mut sender = HandleTable::<1>::new();
+    let mut destination = HandleTable::<1>::new();
+    let mut foreign = HandleTable::<1>::new();
+    let held = rights(&[DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_INSPECT]);
+    let source = install_object(
+        &mut registry,
+        &mut sender,
+        DW_OBJECT_TYPE_MEMORY_OBJECT,
+        held,
+    );
+    let mut prepared = sender
+        .prepare_move(HandleMoveRequest {
+            handle: source,
+            requested_rights: DW_RIGHT_READ,
+        })
+        .unwrap();
+    let (mut rollback, token) = prepared.try_extract(&mut sender).unwrap();
+    let mut reservation = destination.reserve_transfer_destination().unwrap();
+
+    let failure = reservation.try_publish(&mut foreign, token).unwrap_err();
+    assert_eq!(failure.error(), HandleReservationError::ForeignTable);
+    let token = failure.into_token();
+    let published = reservation.try_publish(&mut destination, token).unwrap();
+    rollback.try_finish(&mut sender).unwrap();
+
+    let final_release = destination.close(&mut registry, published.handle).unwrap();
+    complete(&mut registry, final_release);
+}
+
+#[test]
 fn owned_typed_pair_reserves_and_publishes_heterogeneous_parent_results() {
     let mut registry = ObjectRegistry::<2>::new();
     let mut table = HandleTable::<2>::new();
@@ -844,12 +991,14 @@ fn owned_typed_pair_reserves_and_publishes_heterogeneous_parent_results() {
         },
     ];
 
-    let reservation = table.reserve_typed_pair(specs).unwrap();
+    let mut reservation = table.reserve_typed_pair(specs).unwrap();
     assert!(
         table.is_empty(),
         "reservation must not publish a partial result"
     );
-    let handles = reservation.publish(&mut table, [process, region]);
+    let handles = reservation
+        .try_publish(&mut table, [process, region])
+        .unwrap();
     assert_eq!(table.len(), 2);
     let process_pin = table
         .lookup(
@@ -930,7 +1079,7 @@ fn owned_typed_pair_rejects_type_drift_before_partial_publication() {
     let process = registry.creation_into_handle(process_creation).unwrap();
     let region_creation = registry.create(DW_OBJECT_TYPE_ADDRESS_REGION).unwrap();
     let region = registry.creation_into_handle(region_creation).unwrap();
-    let reservation = table
+    let mut reservation = table
         .reserve_typed_pair([
             HandleReservationSpec {
                 object_type: DW_OBJECT_TYPE_PROCESS,
@@ -943,12 +1092,18 @@ fn owned_typed_pair_rejects_type_drift_before_partial_publication() {
         ])
         .unwrap();
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = reservation.publish(&mut table, [region, process]);
-    }));
-    assert!(result.is_err());
+    let failure = reservation
+        .try_publish(&mut table, [region, process])
+        .unwrap_err();
+    assert_eq!(failure.error(), HandleReservationError::Conflict);
+    let [region, process] = failure.into_references();
     assert!(
         table.is_empty(),
         "type validation must run before either reserved slot is published"
     );
+    reservation.cancel(&mut table).unwrap();
+    let region_release = registry.release_handle(region).unwrap();
+    let process_release = registry.release_handle(process).unwrap();
+    complete(&mut registry, region_release);
+    complete(&mut registry, process_release);
 }
