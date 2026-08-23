@@ -177,6 +177,52 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         })
     }
 
+    /// Consumes an allocation after architecture code initialized its complete
+    /// byte range for one retained bootstrap purpose.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have exclusively initialized every byte of `grant`,
+    /// completed any required cache maintenance, and ensured the contents
+    /// satisfy the selected architecture contract.
+    #[allow(
+        unsafe_code,
+        reason = "architecture initialization is an external physical-access fact represented by a typed role transition"
+    )]
+    pub(crate) unsafe fn assume_architecture_bootstrap_initialized(
+        &mut self,
+        grant: AllocationGrant,
+        kind: ArchitectureBootstrapKind,
+    ) -> Result<ArchitectureBootstrapGrant, GrantTransitionError<AllocationGrant>> {
+        if let Err(error) = self.transition(
+            grant.identity,
+            grant.range,
+            FrameRole::AllocatedUninitialized,
+            FrameRole::ArchitectureBootstrap(kind),
+        ) {
+            return Err(GrantTransitionError::new(error, grant));
+        }
+        Ok(ArchitectureBootstrapGrant {
+            identity: grant.identity,
+            range: grant.range,
+            kind,
+        })
+    }
+
+    /// Revalidates retained ownership of an architecture bootstrap range.
+    pub(crate) fn validate_architecture_bootstrap(
+        &self,
+        grant: &ArchitectureBootstrapGrant,
+    ) -> Result<(), FrameRoleError> {
+        let record = self.record(grant.identity)?;
+        if record.range != grant.range
+            || record.role != FrameRole::ArchitectureBootstrap(grant.kind)
+        {
+            return Err(FrameRoleError::WrongRole);
+        }
+        Ok(())
+    }
+
     pub(crate) fn assign_object_backing(
         &mut self,
         grant: ZeroedGrant,

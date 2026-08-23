@@ -174,6 +174,15 @@ pub(crate) enum KernelImageSegment {
     WritableData,
 }
 
+/// Architecture-owned dynamic storage whose contents are initialized outside
+/// the generic object and page-table pipelines and then retained for the
+/// kernel lifetime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ArchitectureBootstrapKind {
+    /// The single low physical page containing the x86 AP startup image.
+    X86ApTrampoline,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExternalFrameRole {
     TransitionTable { table_index: u32 },
@@ -185,6 +194,7 @@ pub(crate) enum FrameRoleKind {
     AllocatedUninitialized,
     Zeroed,
     ObjectBacking(ObjectBackingKind),
+    ArchitectureBootstrap(ArchitectureBootstrapKind),
     TableCandidate {
         owner: TableOwnerKey,
         level: TableLevel,
@@ -204,6 +214,7 @@ enum FrameRole {
     AllocatedUninitialized,
     Zeroed,
     ObjectBacking(ObjectBackingKind),
+    ArchitectureBootstrap(ArchitectureBootstrapKind),
     TableCandidate {
         owner: TableOwnerKey,
         level: TableLevel,
@@ -232,6 +243,7 @@ impl FrameRole {
             Self::AllocatedUninitialized => FrameRoleKind::AllocatedUninitialized,
             Self::Zeroed => FrameRoleKind::Zeroed,
             Self::ObjectBacking(kind) => FrameRoleKind::ObjectBacking(kind),
+            Self::ArchitectureBootstrap(kind) => FrameRoleKind::ArchitectureBootstrap(kind),
             Self::TableCandidate { owner, level } => FrameRoleKind::TableCandidate { owner, level },
             Self::PageTable {
                 owner,
@@ -360,6 +372,28 @@ impl KernelImageRoleSet {
 pub(crate) struct ZeroedGrant {
     identity: FrameRoleIdentity,
     range: PageRange,
+}
+
+/// Linear ownership of one fully initialized architecture bootstrap range.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ArchitectureBootstrapGrant {
+    identity: FrameRoleIdentity,
+    range: PageRange,
+    kind: ArchitectureBootstrapKind,
+}
+
+impl ArchitectureBootstrapGrant {
+    pub(crate) const fn physical_start(&self) -> u64 {
+        self.range.start
+    }
+
+    pub(crate) const fn byte_len(&self) -> u64 {
+        self.range.end - self.range.start
+    }
+
+    pub(crate) const fn kind(&self) -> ArchitectureBootstrapKind {
+        self.kind
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]

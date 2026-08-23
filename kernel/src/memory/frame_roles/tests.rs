@@ -275,6 +275,38 @@ fn rejected_multi_page_table_transition_returns_zeroed_grant_for_rollback() {
 #[test]
 #[allow(
     unsafe_code,
+    reason = "the synthetic test attests complete architecture initialization"
+)]
+fn architecture_bootstrap_grant_retains_exact_low_page_ownership() {
+    let mut roles = manager(BASE_PAGE_SIZE, 4);
+    let grant = roles.allocate_below(1, 0x10_0000).unwrap();
+    let physical_start = grant.physical_start();
+    let retained = unsafe {
+        roles.assume_architecture_bootstrap_initialized(
+            grant,
+            ArchitectureBootstrapKind::X86ApTrampoline,
+        )
+    }
+    .unwrap();
+
+    assert_ne!(physical_start, 0);
+    assert!(physical_start < 0x10_0000);
+    assert_eq!(retained.physical_start(), physical_start);
+    assert_eq!(retained.byte_len(), BASE_PAGE_SIZE);
+    assert_eq!(retained.kind(), ArchitectureBootstrapKind::X86ApTrampoline);
+    assert_eq!(roles.validate_architecture_bootstrap(&retained), Ok(()));
+    assert_eq!(
+        roles.role(retained.identity),
+        Ok(FrameRoleKind::ArchitectureBootstrap(
+            ArchitectureBootstrapKind::X86ApTrampoline
+        ))
+    );
+    assert_eq!(roles.check_invariants(), Ok(()));
+}
+
+#[test]
+#[allow(
+    unsafe_code,
     reason = "the test supplies synthetic boot-provenance attestations"
 )]
 fn external_roles_are_disjoint_and_immutable_backing_is_read_only() {
