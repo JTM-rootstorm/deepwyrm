@@ -254,6 +254,39 @@ fn i1_post_ack_carrier_never_reuses_a_retired_frame_for_late_holdsafe() {
 }
 
 #[test]
+fn i1_idle_suspend_stop_handoffs_after_idle_cleanup_instead_of_halting() {
+    let live = source("src/arch/x86_64/syscall/live.rs");
+    let idle_suspend = live
+        .split_once("crate::syscall::native::NativeSuspendPlan::IdleCurrent =>")
+        .expect("idle-suspend path")
+        .1;
+
+    assert_eq!(
+        idle_suspend
+            .match_indices("stage_rendezvous_action(RendezvousAction(request))")
+            .count(),
+        2
+    );
+    assert_eq!(
+        idle_suspend
+            .match_indices("handoff_to_rendezvous_reaper(context)")
+            .count(),
+        2
+    );
+    let finish = idle_suspend
+        .find("crate::arch::x86_64::idle::finish_current_idle(halt)")
+        .expect("post-hlt idle finish");
+    let post_halt_latch = idle_suspend[finish..]
+        .find("service_current_rendezvous_latch()")
+        .expect("post-hlt latch consume");
+    let post_halt_handoff = idle_suspend[finish..]
+        .find("handoff_to_rendezvous_reaper(context)")
+        .expect("post-hlt reaper handoff");
+    assert!(post_halt_latch < post_halt_handoff);
+    assert!(!idle_suspend.contains("live D carrier safe-point/reaper join has not yet"));
+}
+
+#[test]
 fn e5_live_user_pins_guard_actual_atomic_write_batches() {
     let access = source("src/arch/x86_64/mm/activation/user_access.rs");
     assert!(access.contains("self.target.pins"));

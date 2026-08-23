@@ -1252,41 +1252,51 @@ unsafe fn native_runtime_trampoline<
                                         // carrier reached `sti; hlt`. Consume its
                                         // latch and repeat the scheduler rescan; do
                                         // not sleep awaiting a second IPI.
+                                        let preparation = failure.into_preparation();
                                         match crate::time::service_current_rendezvous_latch()
                                             .unwrap_or_else(|_| halt_forever())
                                         {
                                             crate::arch::x86_64::rendezvous::MailboxNotification::None
-                                            | crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {}
-                                            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
-                                            | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {
-                                                halt_forever();
+                                            | crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {
+                                                crate::arch::x86_64::idle::cancel_current_idle(
+                                                    preparation,
+                                                )
+                                                .unwrap_or_else(|_| halt_forever());
+                                                continue;
+                                            }
+                                            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request)
+                                            | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(request) => {
+                                                crate::arch::x86_64::idle::cancel_current_idle(
+                                                    preparation,
+                                                )
+                                                .unwrap_or_else(|_| halt_forever());
+                                                stage_rendezvous_action(RendezvousAction(request))
+                                                    .unwrap_or_else(|_| halt_forever());
+                                                handoff_to_rendezvous_reaper(context);
                                             }
                                         }
-                                        crate::arch::x86_64::idle::cancel_current_idle(
-                                            failure.into_preparation(),
-                                        )
-                                        .unwrap_or_else(|_| halt_forever());
-                                        continue;
                                     }
                                     Err(_) => halt_forever(),
                                 };
                                 wait_for_suspend_interrupt();
-                                match crate::time::service_current_rendezvous_latch()
-                                .unwrap_or_else(|_| halt_forever())
-                            {
-                                crate::arch::x86_64::rendezvous::MailboxNotification::None
-                                | crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {}
-                                crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
-                                | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {
-                                    // The live D carrier safe-point/reaper join has not yet
-                                    // been installed. Returning to a possibly stopped user
-                                    // continuation would be unsafe, so preserve fail-closed
-                                    // target behavior until that join exists.
-                                    halt_forever();
-                                }
-                            }
+                                // `hlt` returned with interrupts masked again.
+                                // First complete the exact idle generation, then
+                                // Acquire-consume its post-EOI latch before any
+                                // scheduler poll or user-return work.
                                 crate::arch::x86_64::idle::finish_current_idle(halt)
                                     .unwrap_or_else(|_| halt_forever());
+                                match crate::time::service_current_rendezvous_latch()
+                                    .unwrap_or_else(|_| halt_forever())
+                                {
+                                crate::arch::x86_64::rendezvous::MailboxNotification::None
+                                | crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {}
+                                crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request)
+                                | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(request) => {
+                                    stage_rendezvous_action(RendezvousAction(request))
+                                        .unwrap_or_else(|_| halt_forever());
+                                    handoff_to_rendezvous_reaper(context);
+                                }
+                                }
                             }
                             crate::syscall::native::NativeIdleSuspendPoll::ResumeCurrent => {
                                 crate::arch::x86_64::idle::cancel_current_idle(idle)
