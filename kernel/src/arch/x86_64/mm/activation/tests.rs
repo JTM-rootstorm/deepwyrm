@@ -2218,6 +2218,10 @@ fn key_root_mismatch_is_rejected_and_residency_blocks_teardown() {
     let resident = bindings
         .prepare_selection(CpuIndex::BOOTSTRAP, process_b, key_b)
         .unwrap();
+    // The rejected mismatched bind above must not consume or publish an
+    // ambiguous epoch: primordial is generation 1, this first successful
+    // child binding is generation 2.
+    assert_eq!(resident.binding_generation(), 2);
     let resident_pins = UserPinTracker::<1>::new();
     assert_eq!(
         bindings.teardown_empty_owned(

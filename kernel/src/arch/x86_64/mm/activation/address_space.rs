@@ -836,6 +836,10 @@ impl PreparedRootSelection {
     pub(crate) const fn cpu(&self) -> CpuIndex {
         self.residency.cpu()
     }
+
+    pub(crate) const fn binding_generation(&self) -> u64 {
+        self.binding_generation
+    }
 }
 
 /// Recoverable pre-CR3 rejection with every move-only residency token returned
