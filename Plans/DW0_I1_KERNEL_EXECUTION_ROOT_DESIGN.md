@@ -51,7 +51,7 @@ is an invariant failure and does not resume a mixed root identity.
 Vector `0xe1` only latches work after EOI.  The real per-CPU carrier consumes
 the latch on its safe/reaper path.  Its precommit verifies exact CPU, Thread,
 execution generation, Process-root generation, CPU-private safe stack,
-disabled user access, and prevented user return.  It then switches to the
+a released CPU-private native-usercopy window, and prevented user return.  It then switches to the
 slot's kernel execution root, releases the Process residency and scheduler
 Running claim in H0 order, and consumes the move-only exact-safe witness to
 Release-publish acknowledgement.  Deferred Thread/root/stack reclamation

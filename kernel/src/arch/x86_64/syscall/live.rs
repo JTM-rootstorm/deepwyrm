@@ -25,6 +25,36 @@ const INSTALLED: u8 = 2;
 const RFLAGS_IF: u64 = 1 << 9;
 const CPUID_EXTENDED_FEATURES: u32 = 0x8000_0001;
 const CPUID_SYSCALL_SYSRET: u32 = 1 << 11;
+const RFLAGS_AC: u64 = 1 << 18;
+
+/// A CPU-private native-dispatch window.  e1 may latch while this is held,
+/// but no safe-point may consume Stop/HoldSafe until the dispatch has dropped
+/// the guard and no adapter can still be in usercopy.
+static NATIVE_USERCOPY_WINDOW: [AtomicU8; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] =
+    [const { AtomicU8::new(0) }; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT];
+
+#[must_use = "the native usercopy window must close before a carrier safe point"]
+struct NativeUsercopyWindow {
+    cpu_index: usize,
+}
+
+impl NativeUsercopyWindow {
+    fn enter_current() -> Result<Self, ()> {
+        let cpu_index = current_cpu_index_for_diagnostics().ok_or(())?;
+        NATIVE_USERCOPY_WINDOW[cpu_index]
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| ())?;
+        Ok(Self { cpu_index })
+    }
+}
+
+impl Drop for NativeUsercopyWindow {
+    fn drop(&mut self) {
+        NATIVE_USERCOPY_WINDOW[self.cpu_index]
+            .compare_exchange(1, 0, Ordering::Release, Ordering::Acquire)
+            .unwrap_or_else(|_| panic!("native usercopy window state drifted"));
+    }
+}
 
 struct EntryStateStorage(UnsafeCell<PerCpuEntryState>);
 
@@ -466,6 +496,58 @@ pub(crate) fn current_cpu_index_for_diagnostics() -> Option<usize> {
     (INSTALL_STATE.get(cpu_index)?.load(Ordering::Acquire) == INSTALLED).then_some(cpu_index)
 }
 
+/// Observes the carrier-local condition required before an e1 stop safe point:
+/// native dispatch has released every usercopy-capable adapter borrow, and the
+/// architectural AC flag remains clear.  This deliberately does not use
+/// CR4.SMAP: DW0-C keeps SMAP disabled by contract.
+pub(crate) fn current_native_usercopy_is_quiescent() -> bool {
+    let Some(cpu_index) = current_cpu_index_for_diagnostics() else {
+        return false;
+    };
+    let rflags: u64;
+    #[allow(
+        unsafe_code,
+        reason = "PUSHFQ/POP observes the current CPU flag word without changing it"
+    )]
+    unsafe {
+        core::arch::asm!(
+            "pushfq",
+            "pop {}",
+            out(reg) rflags,
+            options(nomem, preserves_flags)
+        );
+    }
+    NATIVE_USERCOPY_WINDOW[cpu_index].load(Ordering::Acquire) == 0 && rflags & RFLAGS_AC == 0
+}
+
+/// Confirms that this CPU reached Rust through its own guarded rendezvous
+/// reaper stack rather than the interrupted Thread or entry stack.
+pub(crate) fn current_cpu_is_on_terminal_reaper_stack() -> bool {
+    let Some(cpu_index) = current_cpu_index_for_diagnostics() else {
+        return false;
+    };
+    let Some(state) = current_entry_state() else {
+        return false;
+    };
+    let Ok(layouts) = crate::arch::x86_64::linked_runtime_cpu_stack_layout() else {
+        return false;
+    };
+    let Some(stack) = layouts.get(cpu_index).map(|layout| layout.terminal_reaper) else {
+        return false;
+    };
+    let stack_pointer: u64;
+    #[allow(
+        unsafe_code,
+        reason = "the reaper proof observes the current stack pointer without changing execution state"
+    )]
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) stack_pointer, options(nomem, nostack, preserves_flags));
+    }
+    state.reserved[ENTRY_STATE_TERMINAL_REAPER_INDEX] == stack.top
+        && stack_pointer >= stack.bottom
+        && stack_pointer <= stack.top
+}
+
 #[allow(
     unsafe_code,
     reason = "the exact architectural GS base selects one release-published static per-CPU entry record"
@@ -872,8 +954,32 @@ unsafe fn native_runtime_rendezvous_reaper<R: crate::syscall::native::NativeRend
     context: *mut (),
 ) -> ! {
     let RendezvousAction(request) = take_rendezvous_action().unwrap_or_else(|| halt_forever());
+    let reaper = crate::arch::x86_64::rendezvous::verify_native_rendezvous_reaper_entry()
+        .unwrap_or_else(|| halt_forever());
     let runtime = unsafe { &mut *context.cast::<R>() };
-    runtime.rendezvous_stop(request)
+    runtime.rendezvous_stop(request, reaper)
+}
+
+/// Abandons the current continuation for the separate e1 reaper seam.  The
+/// staged request and immutable bound carrier are both selected by the current
+/// CPU; unlike terminal syscall cleanup, no syscall terminal action crosses
+/// this boundary.
+#[allow(
+    unsafe_code,
+    reason = "the private ABI declaration and call enter the audited divergent e1 reaper pivot"
+)]
+fn handoff_to_rendezvous_reaper(context: *mut ()) -> ! {
+    unsafe extern "sysv64" {
+        fn dw_x86_64_rendezvous_reaper_handoff() -> !;
+    }
+    let _ = context;
+    #[allow(
+        unsafe_code,
+        reason = "the audited assembly pivot selects the current CPU's private reaper stack and never returns"
+    )]
+    unsafe {
+        dw_x86_64_rendezvous_reaper_handoff()
+    }
 }
 
 /// Called by the CPL3-origin e1 assembly boundary after EOI/latch and before
@@ -1078,10 +1184,24 @@ unsafe fn native_runtime_trampoline<
     {
         halt_forever();
     }
+    let usercopy_window = NativeUsercopyWindow::enter_current().unwrap_or_else(|_| halt_forever());
     let control = {
         let runtime = unsafe { &mut *context.cast::<R>() };
         crate::syscall::native::dispatch_frame(runtime, frame, current_binding_generation())
     };
+    // `dispatch_frame` may authorize a frame, but the raw assembly has not
+    // returned to it yet. Dropping this guard makes that authorization
+    // revocable by the following e1 safe point.
+    drop(usercopy_window);
+    match crate::time::service_current_rendezvous_latch().unwrap_or_else(|_| halt_forever()) {
+        crate::arch::x86_64::rendezvous::MailboxNotification::None
+        | crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {}
+        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request)
+        | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(request) => {
+            stage_rendezvous_action(RendezvousAction(request)).unwrap_or_else(|_| halt_forever());
+            handoff_to_rendezvous_reaper(context);
+        }
+    }
     match control {
         crate::syscall::native::SyscallControl::ReturnToCaller => {}
         crate::syscall::native::SyscallControl::TerminateCurrent => {

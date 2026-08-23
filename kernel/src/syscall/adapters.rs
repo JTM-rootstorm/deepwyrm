@@ -128,6 +128,10 @@ impl<const CAPACITY: usize> CleanupQueue<CAPACITY> {
         }
     }
 
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     pub(crate) fn into_releases(self) -> [Option<FinalRelease>; CAPACITY] {
         self.releases
     }

@@ -184,6 +184,22 @@ pub(crate) struct ExactSafeWitness {
     request: StopRequest,
 }
 
+/// Move-only evidence that the native e1 path has diverged onto the current
+/// CPU's terminal reaper stack after native dispatch released its usercopy
+/// window.  It is deliberately minted only by the target architecture seam;
+/// host models continue to exercise `SafePointPrecommitObservation` directly.
+#[must_use = "a native rendezvous reaper arrival must be consumed by the stop safe point"]
+pub(crate) struct NativeRendezvousReaperEntry {
+    _private: (),
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn verify_native_rendezvous_reaper_entry() -> Option<NativeRendezvousReaperEntry> {
+    (crate::arch::x86_64::syscall::current_cpu_is_on_terminal_reaper_stack()
+        && crate::arch::x86_64::syscall::current_native_usercopy_is_quiescent())
+    .then_some(NativeRendezvousReaperEntry { _private: () })
+}
+
 /// Private request-bound verifier supplied to a carrier precommit.
 #[derive(Debug)]
 pub(crate) struct ExactSafePrecommit {
@@ -229,11 +245,13 @@ pub(crate) trait RemoteStopSafePoint {
         precommit: ExactSafePrecommit,
     ) -> Result<ExactSafeWitness, RemoteStopError>;
 
-    /// Removes the exact Running claim from the target CPU's scheduler slot.
-    fn release_running_ownership(&mut self);
-
     /// Leaves the exact active root after its required local serialization.
     fn release_root_residency(&mut self);
+
+    /// Removes the exact Running claim from the target CPU's scheduler slot.
+    /// This follows the Process-to-kernel-root switch, so no scheduler-visible
+    /// stopped execution retains user-root residency.
+    fn release_running_ownership(&mut self);
 
     /// Confirms that no deferred cleanup still references the stopped carrier.
     fn deferred_cleanup_is_quiescent(&self) -> bool;
@@ -483,7 +501,7 @@ impl RendezvousMailbox {
     ///
     /// No interrupt handler may call this. The exact identity, safe stack,
     /// disabled user access, and prevented return are precommitted before the
-    /// irreversible order `remove Running -> leave root residency ->
+    /// irreversible order `switch to kernel root and leave Process residency -> remove Running ->
     /// acknowledge`. The final acknowledgement is the
     /// existing Release publication consumed by `complete_reclaim` with
     /// Acquire, so a deferred Thread/root/stack resource cannot be reclaimed
@@ -503,8 +521,8 @@ impl RendezvousMailbox {
         }
         let witness =
             target.precommit_exact_stop(request.identity, ExactSafePrecommit { request })?;
-        target.release_running_ownership();
         target.release_root_residency();
+        target.release_running_ownership();
         assert!(
             target.deferred_cleanup_is_quiescent(),
             "remote stop released execution ownership before deferred cleanup quiesced"
@@ -700,12 +718,13 @@ mod tests {
 
         fn release_running_ownership(&mut self) {
             assert!(self.user_return_prevented);
+            assert!(self.residency_released);
             assert!(!self.running_released);
             self.running_released = true;
         }
 
         fn release_root_residency(&mut self) {
-            assert!(self.running_released);
+            assert!(self.user_return_prevented);
             assert!(!self.residency_released);
             self.residency_released = true;
         }
@@ -716,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn safe_point_stop_orders_return_running_residency_before_release_ack() {
+    fn safe_point_stop_orders_return_root_running_before_release_ack() {
         let mut objects = ObjectRegistry::<8>::new();
         let stop_identity = identity(thread_key(&mut objects));
         let mailbox = RendezvousMailbox::new(stop_identity.target_cpu()).unwrap();

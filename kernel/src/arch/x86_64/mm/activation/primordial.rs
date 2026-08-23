@@ -494,7 +494,11 @@ impl NativeSyscallHandler for RuntimeCarrierFacade {
 }
 
 impl crate::syscall::native::NativeRendezvousRuntime for RuntimeCarrierFacade {
-    fn rendezvous_stop(&mut self, _request: crate::arch::x86_64::rendezvous::StopRequest) -> ! {
+    fn rendezvous_stop(
+        &mut self,
+        _request: crate::arch::x86_64::rendezvous::StopRequest,
+        _reaper: crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry,
+    ) -> ! {
         self.reject_entry("rendezvous stop reaper")
     }
 }
@@ -909,6 +913,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
 /// interior synchronization. AP carriers cannot name or borrow this state.
 enum CarrierActiveRoot {
     Process(super::ActiveRootSelection),
+    StopPrecommitted(super::ActiveRootSelection),
     Kernel(super::ActiveKernelExecutionRoot),
     Transitioning,
 }
@@ -917,14 +922,16 @@ impl CarrierActiveRoot {
     fn as_ref(&self) -> Option<&super::ActiveRootSelection> {
         match self {
             Self::Process(root) => Some(root),
-            Self::Kernel(_) | Self::Transitioning => None,
+            Self::StopPrecommitted(_) | Self::Kernel(_) | Self::Transitioning => None,
         }
     }
 
     fn take_process(&mut self) -> super::ActiveRootSelection {
         match core::mem::replace(self, Self::Transitioning) {
             Self::Process(root) => root,
-            Self::Kernel(_) | Self::Transitioning => panic!("carrier has no active Process root"),
+            Self::StopPrecommitted(_) | Self::Kernel(_) | Self::Transitioning => {
+                panic!("carrier has no active Process root")
+            }
         }
     }
 }
@@ -933,6 +940,8 @@ struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_
     cpu: crate::cpu::CpuIndex,
     active: ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
     active_root: CarrierActiveRoot,
+    stopping_claim: Option<crate::task::SchedulerExecutionClaim>,
+    rendezvous_reaper: Option<crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry>,
     registry: Registry,
     memory: Memory,
     tasks: Tasks,
@@ -1534,6 +1543,133 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialCompleti
     }
 }
 
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    crate::arch::x86_64::rendezvous::RemoteStopSafePoint
+    for PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn precommit_exact_stop(
+        &mut self,
+        identity: crate::arch::x86_64::rendezvous::StopIdentity,
+        precommit: crate::arch::x86_64::rendezvous::ExactSafePrecommit,
+    ) -> Result<
+        crate::arch::x86_64::rendezvous::ExactSafeWitness,
+        crate::arch::x86_64::rendezvous::RemoteStopError,
+    > {
+        let reaper = self
+            .rendezvous_reaper
+            .take()
+            .ok_or(crate::arch::x86_64::rendezvous::RemoteStopError::UnsafePrecommit)?;
+        let registry = crate::arch::x86_64::smp::live_cpu_registry();
+        let snapshot = registry
+            .snapshot(self.cpu.index())
+            .map_err(|_| crate::arch::x86_64::rendezvous::RemoteStopError::WrongIdentity)?;
+        let claim = self
+            .shared
+            .execution
+            .running_claim_on(self.cpu)
+            .ok_or(crate::arch::x86_64::rendezvous::RemoteStopError::StaleRequest)?;
+        let root = self
+            .active_root
+            .as_ref()
+            .ok_or(crate::arch::x86_64::rendezvous::RemoteStopError::UnsafePrecommit)?;
+        if crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
+            != Some(self.cpu.index())
+            || identity.target_cpu() != self.cpu.index()
+            || identity.cpu_online_generation() != snapshot.online_generation
+            || identity.thread() != self.thread
+            || identity.execution_generation() != claim.generation()
+            || identity.root_binding_generation() != root.binding_generation()
+            || claim.thread() != self.thread
+            || self.shared.execution.current_thread_on(self.cpu) != Some(self.thread)
+        {
+            return Err(crate::arch::x86_64::rendezvous::RemoteStopError::WrongIdentity);
+        }
+        let witness = precommit.verify(
+            crate::arch::x86_64::rendezvous::SafePointPrecommitObservation {
+                identity,
+                // `reaper` is move-only evidence from the target-only seam;
+                // it can be minted only after both facts were observed.
+                cpu_private_safe_stack: true,
+                user_access_disabled: true,
+                // This method runs only from the divergent `-> !` rendezvous
+                // callback; its caller has no route back to the IPI frame.
+                user_return_prevented: true,
+            },
+        )?;
+        let previous = core::mem::replace(&mut self.active_root, CarrierActiveRoot::Transitioning);
+        let CarrierActiveRoot::Process(root) = previous else {
+            panic!("remote stop precommit lost the active Process root");
+        };
+        let _ = reaper;
+        self.active_root = CarrierActiveRoot::StopPrecommitted(root);
+        self.stopping_claim = Some(claim);
+        Ok(witness)
+    }
+
+    fn release_running_ownership(&mut self) {
+        let claim = self
+            .stopping_claim
+            .take()
+            .unwrap_or_else(|| panic!("remote stop commit omitted its exact Running claim"));
+        self.shared
+            .execution
+            .stop_running_claim_on(claim)
+            .unwrap_or_else(|error| {
+                panic!("remote stop Running claim drifted after precommit: {error:?}")
+            });
+        self.stopping_claim = Some(claim);
+    }
+
+    fn release_root_residency(&mut self) {
+        let previous =
+            match core::mem::replace(&mut self.active_root, CarrierActiveRoot::Transitioning) {
+                CarrierActiveRoot::StopPrecommitted(root) => root,
+                _ => panic!("remote stop root release without an exact Process selection"),
+            };
+        match self.active.enter_kernel_execution_root(previous) {
+            Ok(kernel) => self.active_root = CarrierActiveRoot::Kernel(kernel),
+            Err((error, recovered)) => {
+                self.active_root = CarrierActiveRoot::StopPrecommitted(recovered);
+                panic!("remote stop kernel-root handoff drifted after Running release: {error:?}");
+            }
+        }
+    }
+
+    fn deferred_cleanup_is_quiescent(&self) -> bool {
+        self.cleanup.is_empty()
+            && self.services.is_quiescent()
+            && self.deferred_current.is_none()
+            && self.shared.execution.running_claim_on(self.cpu).is_none()
+    }
+}
+
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    crate::syscall::native::NativeRendezvousRuntime
+    for PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn rendezvous_stop(
+        &mut self,
+        request: crate::arch::x86_64::rendezvous::StopRequest,
+        reaper: crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry,
+    ) -> ! {
+        self.rendezvous_reaper = Some(reaper);
+        crate::arch::x86_64::idle::complete_current_rendezvous_stop(request, self).unwrap_or_else(
+            |error| panic!("remote rendezvous stop failed before commit: {error:?}"),
+        );
+        // A completed stop has removed this carrier's Running claim and
+        // Process-root residency. It must never resume the interrupted frame.
+        loop {
+            #[allow(
+                unsafe_code,
+                reason = "a stopped carrier has no schedulable continuation until the later reaper join owns its terminal completion"
+            )]
+            unsafe {
+                core::arch::asm!("cli", "hlt", options(nomem, nostack));
+            }
+        }
+    }
+}
+
 #[allow(
     unsafe_code,
     reason = "the target runtime propagates the physical-current carrier and architecture-owned first-run entry"
@@ -1775,18 +1911,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 }
 
-impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
-    crate::syscall::native::NativeRendezvousRuntime
-    for PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>
-{
-    fn rendezvous_stop(&mut self, _request: crate::arch::x86_64::rendezvous::StopRequest) -> ! {
-        // The carrier-root/reaper join has not yet installed the exact stop
-        // transition for the BSP. The dedicated path is nevertheless
-        // non-returning, so an interrupted CPL3 continuation cannot escape.
-        panic!("primordial rendezvous stop reached before carrier safe-point join")
-    }
-}
-
 const fn invalid_user_return_detail(error: crate::arch::x86_64::syscall::UserReturnError) -> u32 {
     use crate::arch::x86_64::syscall::UserReturnError;
     match error {
@@ -1921,6 +2045,8 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         cpu: crate::cpu::CpuIndex::BOOTSTRAP,
         active,
         active_root: CarrierActiveRoot::Process(initial_root),
+        stopping_claim: None,
+        rendezvous_reaper: None,
         registry,
         memory,
         tasks,

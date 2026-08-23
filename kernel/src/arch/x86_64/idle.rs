@@ -10,7 +10,10 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use crate::cpu::{CPU_CAPACITY, CpuIndex};
 
-use super::rendezvous::{MailboxNotification, RendezvousIpiLatches, RendezvousMailbox};
+use super::rendezvous::{
+    MailboxNotification, RemoteStopError, RemoteStopSafePoint, RendezvousIpiLatches,
+    RendezvousMailbox, StopRequest,
+};
 
 const CPU_UNAVAILABLE: u8 = 0;
 const CPU_ACTIVE: u8 = 1;
@@ -309,6 +312,20 @@ impl IdleWakeSet {
         self.take_notification(cpu)
     }
 
+    fn complete_stop_at_safe_point<T: RemoteStopSafePoint>(
+        &self,
+        cpu: CpuIndex,
+        request: StopRequest,
+        target: &mut T,
+    ) -> Result<(), RemoteStopError> {
+        if self.ensure_healthy().is_err()
+            || self.cpus[cpu.index()].state.load(Ordering::Acquire) == CPU_UNAVAILABLE
+        {
+            return Err(RemoteStopError::StaleRequest);
+        }
+        self.mailboxes[cpu.index()].complete_stop_at_safe_point(request, target)
+    }
+
     pub(crate) fn fail_transport(&self) {
         self.faulted.store(true, Ordering::Release);
     }
@@ -446,6 +463,20 @@ pub(crate) fn take_current_latched_notification() -> MailboxNotification {
     LIVE_IDLE_WAKE
         .take_latched_notification(cpu)
         .unwrap_or_else(|_| fail_transport_and_halt())
+}
+
+/// Completes an exact Stop/HoldSafe only from the current CPU's reaper/safe
+/// point.  The mailbox remains stationary; the carrier supplies the unique
+/// mutable transition authority after the hard IRQ has returned.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn complete_current_rendezvous_stop<T: RemoteStopSafePoint>(
+    request: StopRequest,
+    target: &mut T,
+) -> Result<(), RemoteStopError> {
+    let cpu = current_cpu().map_err(|_| RemoteStopError::WrongIdentity)?;
+    LIVE_IDLE_WAKE
+        .complete_stop_at_safe_point(cpu, request, target)
+        .map_err(|_| RemoteStopError::StaleRequest)
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]

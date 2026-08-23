@@ -97,6 +97,62 @@ fn i1_cpl3_rendezvous_gate_diverges_before_iret() {
     assert!(live.contains("RENDEZVOUS_ACTION_READY"));
     assert!(live.contains("dw_x86_64_rendezvous_pre_iret_gate"));
     assert!(live.contains("dw_x86_64_rendezvous_reaper"));
+    assert!(live.contains("NativeUsercopyWindow::enter_current"));
+    assert!(live.contains("drop(usercopy_window)"));
+    assert!(live.contains("handoff_to_rendezvous_reaper(context)"));
+    assert!(live.contains("current_native_usercopy_is_quiescent"));
+    assert!(live.contains("current_cpu_is_on_terminal_reaper_stack"));
+
+    let dispatch = live
+        .split_once("unsafe fn native_runtime_trampoline")
+        .expect("native dispatch trampoline")
+        .1
+        .split_once("match control")
+        .expect("native dispatch control handoff")
+        .0;
+    assert!(
+        dispatch
+            .find("drop(usercopy_window)")
+            .expect("native usercopy window closes")
+            < dispatch
+                .find("service_current_rendezvous_latch")
+                .expect("post-dispatch e1 gate"),
+        "a Stop cannot be consumed while a native usercopy-capable dispatch window remains active"
+    );
+
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    for evidence in [
+        "impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>\n    crate::arch::x86_64::rendezvous::RemoteStopSafePoint",
+        "identity.cpu_online_generation() != snapshot.online_generation",
+        "current_cpu_index_for_diagnostics()\n            != Some(self.cpu.index())",
+        "identity.execution_generation() != claim.generation()",
+        "identity.root_binding_generation() != root.binding_generation()",
+        "self.shared.execution.current_thread_on(self.cpu) != Some(self.thread)",
+        "self.active.enter_kernel_execution_root(previous)",
+        "stop_running_claim_on(claim)",
+        "complete_current_rendezvous_stop(request, self)",
+        "core::arch::asm!(\"cli\", \"hlt\"",
+    ] {
+        assert!(
+            primordial.contains(evidence),
+            "I1 live stop seam omitted `{evidence}`"
+        );
+    }
+    let rendezvous = source("src/arch/x86_64/rendezvous.rs");
+    let completion = rendezvous
+        .split_once("pub(crate) fn complete_stop_at_safe_point")
+        .expect("stop acknowledgement")
+        .1
+        .split_once("/// Consumes a precommit witness")
+        .expect("stop acknowledgement end")
+        .0;
+    assert!(
+        completion.find("target.release_root_residency()")
+            < completion.find("target.release_running_ownership()")
+            && completion.find("target.release_running_ownership()")
+                < completion.find("self.acknowledge_committed_exact_safe(witness)"),
+        "the exact safe acknowledgement must follow root residency and Running release"
+    );
 }
 
 #[test]

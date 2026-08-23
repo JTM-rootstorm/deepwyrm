@@ -554,6 +554,10 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
     /// Switches one CPU from an exact Process root to its retained
     /// architecture-private execution root. The Process residency is cleared
     /// only after the kernel-root CR3 load and local serialization.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the allocation-free failure path must return the move-only Process residency owner unchanged"
+    )]
     pub(crate) fn activate_kernel_execution_root<T: RootSwitchTarget>(
         &self,
         kernel: &KernelExecutionRoot,

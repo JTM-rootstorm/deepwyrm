@@ -802,7 +802,11 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
 /// reaper and calls this divergent method with the staged request; it may not
 /// return to the interrupted user context.
 pub(crate) trait NativeRendezvousRuntime {
-    fn rendezvous_stop(&mut self, request: crate::arch::x86_64::rendezvous::StopRequest) -> !;
+    fn rendezvous_stop(
+        &mut self,
+        request: crate::arch::x86_64::rendezvous::StopRequest,
+        reaper: crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry,
+    ) -> !;
 }
 
 pub(crate) fn dispatch_frame<R: NativeSyscallFrameRuntime>(
