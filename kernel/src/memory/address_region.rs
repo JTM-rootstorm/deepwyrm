@@ -85,6 +85,12 @@ pub(crate) struct AddressSpaceKey {
 
 impl AddressSpaceKey {
     pub(super) const EMPTY: Self = Self { domain: 0, raw: 0 };
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(domain: u64, raw: u64) -> Self {
+        Self { domain, raw }
+    }
+
     pub(crate) const fn same_domain(self, region: RegionKey) -> bool {
         self.domain != 0
             && self.domain == region.domain

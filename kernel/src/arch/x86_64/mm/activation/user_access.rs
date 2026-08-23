@@ -39,6 +39,7 @@ struct LiveUserWalk {
 pub(crate) struct TrackedActiveTarget<'a> {
     pub(super) scratch: &'a mut ActiveScratchTarget<LiveActiveScratchIo>,
     pub(super) pins: &'a UserPinTracker<E5_USER_PIN_CAPACITY>,
+    pub(super) address_space: crate::memory::address_region::AddressSpaceKey,
 }
 
 impl super::journal_target_seal::Sealed for TrackedActiveTarget<'_> {}
@@ -74,7 +75,7 @@ unsafe impl AtomicPageTableTarget for TrackedActiveTarget<'_> {
             }
             Some(
                 self.pins
-                    .begin_mutation(start, end - start)
+                    .begin_mutation(self.address_space, start, end - start)
                     .map_err(LiveTrackedTargetError::Pin)?,
             )
         };
@@ -120,6 +121,7 @@ pub(crate) struct LiveProcessAddressSpace<
 #[must_use = "owned live user outputs must be committed or discarded through the originating process address space"]
 pub(crate) struct OwnedLiveUserOutput {
     process: crate::task::ProcessKey,
+    address_space: crate::memory::address_region::AddressSpaceKey,
     range: UserRange,
     token: UserRangePinToken,
 }
@@ -130,6 +132,7 @@ pub(crate) struct OwnedLiveUserOutput {
 #[must_use = "owned live atomic-word pins must be released through their originating process address space"]
 pub(crate) struct OwnedLiveAtomicU32 {
     process: crate::task::ProcessKey,
+    address_space: crate::memory::address_region::AddressSpaceKey,
     range: UserRange,
     token: UserRangePinToken,
 }
@@ -167,7 +170,9 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> Us
 
     fn pin(&mut self, range: UserRange) -> Result<Self::Pinned<'_>, Self::Error> {
         let pins = self.target.pins;
-        let pin = pins.pin(range).map_err(LiveUserAccessError::Pin)?;
+        let pin = pins
+            .pin(self.address_space, range)
+            .map_err(LiveUserAccessError::Pin)?;
         for chunk in range.page_chunks() {
             if let Err(error) = self.preflight(chunk) {
                 drop(pin);
@@ -199,7 +204,11 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> Us
             if range.is_empty() {
                 continue;
             }
-            pins[index] = Some(tracker.pin(range).map_err(LiveUserAccessError::Pin)?);
+            pins[index] = Some(
+                tracker
+                    .pin(self.address_space, range)
+                    .map_err(LiveUserAccessError::Pin)?,
+            );
         }
         for range in ranges.into_iter().flatten() {
             for chunk in range.page_chunks() {
@@ -388,6 +397,7 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.identity = identity;
         self.address_space = address_space;
         self.process = process;
+        self.target.address_space = address_space;
         Ok(())
     }
 
@@ -419,18 +429,22 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let token = self
             .target
             .pins
-            .pin_owned(range)
+            .pin_owned(self.address_space, range)
             .map_err(LiveUserAccessError::Pin)?;
         for chunk in range.page_chunks() {
             if let Err(error) = self.preflight(chunk) {
-                self.target.pins.release_owned(token).expect(
-                    "fresh owned atomic-word pin remains releasable after failed preflight",
-                );
+                self.target
+                    .pins
+                    .release_owned(self.address_space, token)
+                    .expect(
+                        "fresh owned atomic-word pin remains releasable after failed preflight",
+                    );
                 return Err(error);
             }
         }
         Ok(OwnedLiveAtomicU32 {
             process: self.process,
+            address_space: self.address_space,
             range,
             token,
         })
@@ -453,7 +467,7 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let (start, end_exclusive) = self
             .target
             .pins
-            .validate_owned(&word.token)
+            .validate_owned(word.address_space, &word.token)
             .map_err(LiveUserAccessError::Pin)?;
         if start != word.range.start()
             || end_exclusive != word.range.end_exclusive()
@@ -477,7 +491,7 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         self.target
             .pins
-            .release_owned(word.token)
+            .release_owned(word.address_space, word.token)
             .map_err(LiveUserAccessError::Pin)
     }
 
@@ -493,19 +507,20 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let token = self
             .target
             .pins
-            .pin_owned(range)
+            .pin_owned(self.address_space, range)
             .map_err(LiveUserAccessError::Pin)?;
         for chunk in range.page_chunks() {
             if let Err(error) = self.preflight(chunk) {
                 self.target
                     .pins
-                    .release_owned(token)
+                    .release_owned(self.address_space, token)
                     .expect("fresh owned user pin remains releasable after failed preflight");
                 return Err(error);
             }
         }
         Ok(OwnedLiveUserOutput {
             process: self.process,
+            address_space: self.address_space,
             range,
             token,
         })
@@ -520,7 +535,7 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         self.target
             .pins
-            .release_owned(output.token)
+            .release_owned(output.address_space, output.token)
             .map_err(LiveUserAccessError::Pin)
     }
 
@@ -544,7 +559,7 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let (start, end_exclusive) = self
             .target
             .pins
-            .validate_owned(&output.token)
+            .validate_owned(output.address_space, &output.token)
             .map_err(LiveUserAccessError::Pin)?;
         assert_eq!(start, output.range.start());
         assert_eq!(end_exclusive, output.range.end_exclusive());
@@ -555,7 +570,7 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         self.target
             .pins
-            .release_owned(output.token)
+            .release_owned(output.address_space, output.token)
             .map_err(LiveUserAccessError::Pin)
     }
 

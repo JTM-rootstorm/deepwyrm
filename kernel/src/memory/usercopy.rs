@@ -77,6 +77,7 @@ mod pin_tracker {
     use core::sync::atomic::{AtomicU64, Ordering};
 
     use super::UserRange;
+    use crate::memory::address_region::AddressSpaceKey;
 
     static NEXT_USER_PIN_DOMAIN: AtomicU64 = AtomicU64::new(1);
 
@@ -99,24 +100,28 @@ mod pin_tracker {
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct PinnedRange {
+        address_space: AddressSpaceKey,
         start: u64,
         end_exclusive: u64,
     }
 
     impl PinnedRange {
-        const fn from_user_range(range: UserRange) -> Option<Self> {
+        const fn from_user_range(address_space: AddressSpaceKey, range: UserRange) -> Option<Self> {
             if range.is_empty() {
                 None
             } else {
                 Some(Self {
+                    address_space,
                     start: range.start(),
                     end_exclusive: range.end_exclusive(),
                 })
             }
         }
 
-        const fn overlaps(self, other: Self) -> bool {
-            self.start < other.end_exclusive && other.start < self.end_exclusive
+        fn overlaps(self, other: Self) -> bool {
+            self.address_space == other.address_space
+                && self.start < other.end_exclusive
+                && other.start < self.end_exclusive
         }
     }
 
@@ -151,6 +156,10 @@ mod pin_tracker {
     }
 
     impl UserRangePinToken {
+        const fn address_space(&self) -> AddressSpaceKey {
+            self.range.address_space
+        }
+
         #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
         pub(crate) const fn start(&self) -> u64 {
             self.range.start
@@ -183,9 +192,13 @@ mod pin_tracker {
             }
         }
 
-        fn reserve_token(&self, range: UserRange) -> Result<UserRangePinToken, UserPinError> {
-            let range =
-                PinnedRange::from_user_range(range).ok_or(UserPinError::InvalidMutationRange)?;
+        fn reserve_token(
+            &self,
+            address_space: AddressSpaceKey,
+            range: UserRange,
+        ) -> Result<UserRangePinToken, UserPinError> {
+            let range = PinnedRange::from_user_range(address_space, range)
+                .ok_or(UserPinError::InvalidMutationRange)?;
             let mut state = self.state.lock();
             if state
                 .mutation
@@ -216,26 +229,29 @@ mod pin_tracker {
 
         pub(crate) fn pin(
             &self,
+            address_space: AddressSpaceKey,
             range: UserRange,
         ) -> Result<UserRangePin<'_, CAPACITY>, UserPinError> {
             Ok(UserRangePin {
                 tracker: self,
-                token: Some(self.reserve_token(range)?),
+                token: Some(self.reserve_token(address_space, range)?),
             })
         }
 
         pub(crate) fn pin_owned(
             &self,
+            address_space: AddressSpaceKey,
             range: UserRange,
         ) -> Result<UserRangePinToken, UserPinError> {
-            self.reserve_token(range)
+            self.reserve_token(address_space, range)
         }
 
         pub(crate) fn validate_owned(
             &self,
+            address_space: AddressSpaceKey,
             token: &UserRangePinToken,
         ) -> Result<(u64, u64), UserPinError> {
-            if token.domain != self.domain {
+            if token.domain != self.domain || token.address_space() != address_space {
                 return Err(UserPinError::ForeignToken);
             }
             let state = self.state.lock();
@@ -249,8 +265,12 @@ mod pin_tracker {
             Ok((token.range.start, token.range.end_exclusive))
         }
 
-        pub(crate) fn release_owned(&self, token: UserRangePinToken) -> Result<(), UserPinError> {
-            if token.domain != self.domain {
+        pub(crate) fn release_owned(
+            &self,
+            address_space: AddressSpaceKey,
+            token: UserRangePinToken,
+        ) -> Result<(), UserPinError> {
+            if token.domain != self.domain || token.address_space() != address_space {
                 return Err(UserPinError::ForeignToken);
             }
             let mut state = self.state.lock();
@@ -267,6 +287,7 @@ mod pin_tracker {
 
         pub(crate) fn begin_mutation(
             &self,
+            address_space: AddressSpaceKey,
             start: u64,
             byte_len: u64,
         ) -> Result<UserMutationPermit<'_, CAPACITY>, UserPinError> {
@@ -277,6 +298,7 @@ mod pin_tracker {
                 .checked_add(byte_len)
                 .ok_or(UserPinError::InvalidMutationRange)?;
             let mutation = PinnedRange {
+                address_space,
                 start,
                 end_exclusive,
             };
@@ -318,7 +340,7 @@ mod pin_tracker {
                 return;
             };
             self.tracker
-                .release_owned(token)
+                .release_owned(token.address_space(), token)
                 .expect("borrowed user pin tracker slot drift");
         }
     }
@@ -614,6 +636,7 @@ fn preflight_all<P: PinnedUserPages>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::address_region::AddressSpaceKey;
     use crate::memory::user_range::{EmptyAddressRule, UserAddressSpace, UserRangeError};
 
     const PAGE_SIZE: u64 = 4096;
@@ -842,20 +865,31 @@ mod tests {
         UserRange::new(space, start, byte_len, 1, access, EmptyAddressRule::Reject).unwrap()
     }
 
+    fn scope(raw: u64) -> AddressSpaceKey {
+        AddressSpaceKey::for_test(1, raw)
+    }
+
     #[test]
     fn range_tracker_blocks_only_overlapping_mutations() {
         let tracker = UserPinTracker::<2>::new();
         let pin = tracker
-            .pin(range_at(PAGE_SIZE * 4 + 32, 64, UserAccess::WRITE))
+            .pin(
+                scope(1),
+                range_at(PAGE_SIZE * 4 + 32, 64, UserAccess::WRITE),
+            )
             .unwrap();
         assert!(matches!(
-            tracker.begin_mutation(PAGE_SIZE * 4, PAGE_SIZE),
+            tracker.begin_mutation(scope(1), PAGE_SIZE * 4, PAGE_SIZE),
             Err(UserPinError::Conflict)
         ));
-        let disjoint = tracker.begin_mutation(PAGE_SIZE * 8, PAGE_SIZE).unwrap();
+        let disjoint = tracker
+            .begin_mutation(scope(1), PAGE_SIZE * 8, PAGE_SIZE)
+            .unwrap();
         drop(disjoint);
         drop(pin);
-        let overlap_after_drop = tracker.begin_mutation(PAGE_SIZE * 4, PAGE_SIZE).unwrap();
+        let overlap_after_drop = tracker
+            .begin_mutation(scope(1), PAGE_SIZE * 4, PAGE_SIZE)
+            .unwrap();
         drop(overlap_after_drop);
     }
 
@@ -871,13 +905,15 @@ mod tests {
             EmptyAddressRule::Reject,
         )
         .unwrap();
-        let pin = tracker.pin_owned(word).unwrap();
+        let pin = tracker.pin_owned(scope(1), word).unwrap();
         assert!(matches!(
-            tracker.begin_mutation(PAGE_SIZE * 6, PAGE_SIZE),
+            tracker.begin_mutation(scope(1), PAGE_SIZE * 6, PAGE_SIZE),
             Err(UserPinError::Conflict)
         ));
-        tracker.release_owned(pin).unwrap();
-        let mutation = tracker.begin_mutation(PAGE_SIZE * 6, PAGE_SIZE).unwrap();
+        tracker.release_owned(scope(1), pin).unwrap();
+        let mutation = tracker
+            .begin_mutation(scope(1), PAGE_SIZE * 6, PAGE_SIZE)
+            .unwrap();
         drop(mutation);
     }
 
@@ -885,18 +921,49 @@ mod tests {
     fn active_mutation_rejects_new_overlapping_pin() {
         let tracker = UserPinTracker::<2>::new();
         let mutation = tracker
-            .begin_mutation(PAGE_SIZE * 4, PAGE_SIZE * 2)
+            .begin_mutation(scope(1), PAGE_SIZE * 4, PAGE_SIZE * 2)
             .unwrap();
         assert!(matches!(
-            tracker.pin(range_at(PAGE_SIZE * 5, 8, UserAccess::READ)),
+            tracker.pin(scope(1), range_at(PAGE_SIZE * 5, 8, UserAccess::READ)),
             Err(UserPinError::Conflict)
         ));
         assert!(
             tracker
-                .pin(range_at(PAGE_SIZE * 9, 8, UserAccess::READ))
+                .pin(scope(1), range_at(PAGE_SIZE * 9, 8, UserAccess::READ))
                 .is_ok()
         );
         drop(mutation);
+    }
+
+    #[test]
+    fn same_virtual_range_is_independent_between_address_spaces() {
+        let tracker = UserPinTracker::<2>::new();
+        let range = range_at(PAGE_SIZE * 4, PAGE_SIZE, UserAccess::WRITE);
+        let parent = tracker.pin_owned(scope(1), range).unwrap();
+        let child_mutation = tracker
+            .begin_mutation(scope(2), PAGE_SIZE * 4, PAGE_SIZE)
+            .unwrap();
+        drop(child_mutation);
+        assert!(matches!(
+            tracker.begin_mutation(scope(1), PAGE_SIZE * 4, PAGE_SIZE),
+            Err(UserPinError::Conflict)
+        ));
+        tracker.release_owned(scope(1), parent).unwrap();
+    }
+
+    #[test]
+    fn owned_token_scope_is_authenticated_for_validation_and_release() {
+        let tracker = UserPinTracker::<1>::new();
+        let range = range_at(PAGE_SIZE * 5, 64, UserAccess::WRITE);
+        let token = tracker.pin_owned(scope(1), range).unwrap();
+        assert_eq!(
+            tracker.validate_owned(scope(2), &token),
+            Err(UserPinError::ForeignToken)
+        );
+        assert_eq!(
+            tracker.release_owned(scope(2), token),
+            Err(UserPinError::ForeignToken)
+        );
     }
 
     #[test]
@@ -924,40 +991,42 @@ mod tests {
         let first = UserPinTracker::<1>::new();
         let second = UserPinTracker::<1>::new();
         let range = range_at(PAGE_SIZE * 6, 64, UserAccess::WRITE);
-        let token = first.pin_owned(range).unwrap();
+        let token = first.pin_owned(scope(1), range).unwrap();
         assert_eq!(
-            first.validate_owned(&token),
+            first.validate_owned(scope(1), &token),
             Ok((range.start(), range.end_exclusive()))
         );
         assert_eq!(
-            second.validate_owned(&token),
+            second.validate_owned(scope(1), &token),
             Err(UserPinError::ForeignToken)
         );
         assert!(matches!(
-            first.begin_mutation(PAGE_SIZE * 6, PAGE_SIZE),
+            first.begin_mutation(scope(1), PAGE_SIZE * 6, PAGE_SIZE),
             Err(UserPinError::Conflict)
         ));
-        first.release_owned(token).unwrap();
-        let replacement = first.pin_owned(range).unwrap();
+        first.release_owned(scope(1), token).unwrap();
+        let replacement = first.pin_owned(scope(1), range).unwrap();
         assert_eq!(
-            first.validate_owned(&replacement),
+            first.validate_owned(scope(1), &replacement),
             Ok((range.start(), range.end_exclusive()))
         );
-        first.release_owned(replacement).unwrap();
+        first.release_owned(scope(1), replacement).unwrap();
     }
 
     #[test]
     fn borrowed_pin_can_detach_into_owned_token_without_unpinning() {
         let tracker = UserPinTracker::<1>::new();
         let range = range_at(PAGE_SIZE * 7, 32, UserAccess::READ);
-        let borrowed = tracker.pin(range).unwrap();
+        let borrowed = tracker.pin(scope(1), range).unwrap();
         let token = borrowed.into_owned();
         assert!(matches!(
-            tracker.begin_mutation(PAGE_SIZE * 7, PAGE_SIZE),
+            tracker.begin_mutation(scope(1), PAGE_SIZE * 7, PAGE_SIZE),
             Err(UserPinError::Conflict)
         ));
-        tracker.release_owned(token).unwrap();
-        let permit = tracker.begin_mutation(PAGE_SIZE * 7, PAGE_SIZE).unwrap();
+        tracker.release_owned(scope(1), token).unwrap();
+        let permit = tracker
+            .begin_mutation(scope(1), PAGE_SIZE * 7, PAGE_SIZE)
+            .unwrap();
         drop(permit);
     }
 }

@@ -1446,6 +1446,7 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             target: user_access::TrackedActiveTarget {
                 scratch: &mut target.scratch,
                 pins: &self.user_pins,
+                address_space,
             },
             _root: core::marker::PhantomData,
         }

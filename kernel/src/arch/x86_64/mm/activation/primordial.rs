@@ -675,6 +675,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             let mut tracked = user_access::TrackedActiveTarget {
                 scratch: &mut target.scratch,
                 pins: &self.active.user_pins,
+                address_space: region.address_space_key(),
             };
             let mut publisher = unsafe {
                 crate::arch::x86_64::mm::X86AddressSpacePublisher::<
@@ -787,6 +788,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
             let mut tracked = user_access::TrackedActiveTarget {
                 scratch: &mut target.scratch,
                 pins: &self.active.user_pins,
+                address_space: region.address_space_key(),
             };
             let mut publisher = unsafe {
                 crate::arch::x86_64::mm::X86AddressSpacePublisher::<

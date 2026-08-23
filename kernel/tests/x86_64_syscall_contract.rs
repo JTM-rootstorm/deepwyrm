@@ -156,10 +156,10 @@ fn production_installs_syscall_boundary_only_after_deep_root_activation() {
 fn e5_live_user_pins_guard_actual_atomic_write_batches() {
     let access = source("src/arch/x86_64/mm/activation/user_access.rs");
     assert!(access.contains("self.target.pins"));
-    assert!(access.contains("begin_mutation(start, end - start)"));
+    assert!(access.contains("begin_mutation(self.address_space, start, end - start)"));
     assert!(access.contains(".apply(writes, invalidations)"));
     let reserve = access
-        .find("begin_mutation(start, end - start)")
+        .find("begin_mutation(self.address_space, start, end - start)")
         .expect("E5 mutation reservation");
     let apply = access
         .find(".apply(writes, invalidations)")
