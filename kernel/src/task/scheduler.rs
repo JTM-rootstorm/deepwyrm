@@ -1023,6 +1023,45 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         })
     }
 
+    /// Removes one exact remote Running claim without selecting replacement
+    /// work. This is the scheduler half of an e1 stop safe point: the target
+    /// CPU has already prevented user return, and its CPU-private reaper path
+    /// must complete or abandon the retained continuation before any later
+    /// carrier work is admitted on that CPU.
+    pub(crate) fn stop_running_claim_on(
+        &self,
+        claim: SchedulerExecutionClaim,
+    ) -> Result<(), SchedulerError> {
+        let mut state = self.state.lock();
+        if claim.domain != state.domain {
+            return Err(SchedulerError::ForeignExecutionClaim);
+        }
+        if claim.generation == 0 {
+            return Err(SchedulerError::StaleExecutionClaim);
+        }
+        let cpu_index = claim.cpu.index();
+        let Some(running) = state.running[cpu_index] else {
+            return Err(SchedulerError::StaleExecutionClaim);
+        };
+        if running.thread != claim.thread || running.generation != claim.generation {
+            return Err(SchedulerError::StaleExecutionClaim);
+        }
+        if state.suspended[cpu_index].is_some() {
+            return Err(SchedulerError::SwitchPending);
+        }
+        if state.pending_block[cpu_index].is_some_and(|pending| pending.thread == claim.thread) {
+            state.pending_block[cpu_index] = None;
+        }
+        state.running[cpu_index] = None;
+        state.suspended[cpu_index] = Some(SuspendedContinuation {
+            thread: claim.thread,
+            generation: claim.generation,
+            publication: SuspendedPublication::Retired,
+        });
+        debug_assert_eq!(state.check_invariants(), Ok(()));
+        Ok(())
+    }
+
     pub(crate) fn state(&self, thread: ThreadKey) -> Option<SchedulerThreadState> {
         let state = self.state.lock();
         if state

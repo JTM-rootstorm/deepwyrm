@@ -468,6 +468,38 @@ fn pending_block_preparation_is_retired_with_running_thread() {
 }
 
 #[test]
+fn remote_stop_removes_only_the_exact_running_claim_without_replacement() {
+    let scheduler = CooperativeScheduler::<4>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let stopped = thread_key(&mut registry);
+    let runnable = thread_key(&mut registry);
+    scheduler
+        .commit(scheduler.reserve(stopped).unwrap())
+        .unwrap();
+    scheduler
+        .commit(scheduler.reserve(runnable).unwrap())
+        .unwrap();
+    scheduler.schedule_next_on(cpu(1)).unwrap();
+    let claim = scheduler.running_claim_on(cpu(1)).unwrap();
+    assert_eq!(claim.thread(), stopped);
+
+    scheduler.stop_running_claim_on(claim).unwrap();
+    assert_eq!(scheduler.current_on(cpu(1)), None);
+    assert_eq!(scheduler.running_cpu(stopped), None);
+    assert_eq!(scheduler.suspended_claim_on(cpu(1)), Some(claim));
+    assert_eq!(scheduler.state(stopped), None);
+    assert_eq!(
+        scheduler.state(runnable),
+        Some(SchedulerThreadState::Runnable)
+    );
+    assert_eq!(
+        scheduler.stop_running_claim_on(claim),
+        Err(SchedulerError::StaleExecutionClaim)
+    );
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
 fn h4_remote_wake_and_terminal_retirement_never_revive_the_thread() {
     let mut registry = ObjectRegistry::<16>::new();
     for iteration in 0..2_000 {

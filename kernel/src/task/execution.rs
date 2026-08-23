@@ -728,6 +728,16 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         self.scheduler.running_claim_on(cpu)
     }
 
+    /// Removes an exact remote Running claim without choosing replacement
+    /// work. The CPU-owned rendezvous safe point holds the retained
+    /// continuation until its reaper path can complete the terminal handoff.
+    pub(crate) fn stop_running_claim_on(
+        &self,
+        claim: SchedulerExecutionClaim,
+    ) -> Result<(), SchedulerError> {
+        self.scheduler.stop_running_claim_on(claim)
+    }
+
     pub(crate) fn suspended_claim_on(
         &self,
         cpu: SchedulerCpuId,

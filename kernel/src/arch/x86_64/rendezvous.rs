@@ -187,6 +187,39 @@ pub(crate) struct StopObservation {
     pub(crate) conditions: SafePointConditions,
 }
 
+/// CPU-owned, non-IRQ stop transition.
+///
+/// The implementation is reached only after the target CPU consumed a latched
+/// `StopRequest` at a carrier safe point. `validate_exact_stop` is the entire
+/// recoverable phase: it checks the CPU, current Thread/execution generation,
+/// and active-root generation before user return is prevented. Every later
+/// method is an infallible-by-construction commit step and must fail-stop on
+/// local architecture drift rather than publish a partial acknowledgement.
+pub(crate) trait RemoteStopSafePoint {
+    /// Validates that this CPU still owns precisely `identity` while the
+    /// Thread is Running and its root is resident.
+    fn validate_exact_stop(&self, identity: StopIdentity) -> bool;
+
+    /// Prevents a return to the stopped user context before ownership moves.
+    fn prevent_user_return(&mut self);
+
+    /// Removes the exact Running claim from the target CPU's scheduler slot.
+    fn release_running_ownership(&mut self);
+
+    /// Leaves the exact active root after its required local serialization.
+    fn release_root_residency(&mut self);
+
+    /// Confirms that no deferred cleanup still references the stopped carrier.
+    fn deferred_cleanup_is_quiescent(&self) -> bool;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RemoteStopError {
+    StaleRequest,
+    WrongIdentity,
+    AlreadyAcknowledged,
+}
+
 /// Move-only proof that the currently published request was observed at Safe.
 #[must_use = "an exact-safe proof must be acknowledged or discarded without changing mailbox state"]
 #[derive(Debug, Eq, PartialEq)]
@@ -485,6 +518,65 @@ impl RendezvousMailbox {
             })
     }
 
+    /// Commits a remote stop on the target CPU's safe/reaper context.
+    ///
+    /// No interrupt handler may call this. The exact identity is revalidated
+    /// before the irreversible order `prevent return -> remove Running ->
+    /// leave root residency -> acknowledge`. The final acknowledgement is the
+    /// existing Release publication consumed by `complete_reclaim` with
+    /// Acquire, so a deferred Thread/root/stack resource cannot be reclaimed
+    /// before the target has completed all four conditions.
+    pub(crate) fn complete_stop_at_safe_point<T: RemoteStopSafePoint>(
+        &self,
+        request: StopRequest,
+        target: &mut T,
+    ) -> Result<(), RemoteStopError> {
+        match self.state.load(Ordering::Acquire) {
+            MAILBOX_STOP_SAFE => return Err(RemoteStopError::AlreadyAcknowledged),
+            MAILBOX_STOP_REQUESTED => {}
+            _ => return Err(RemoteStopError::StaleRequest),
+        }
+        if self.current_request() != request {
+            return Err(RemoteStopError::StaleRequest);
+        }
+        if !target.validate_exact_stop(request.identity) {
+            return Err(RemoteStopError::WrongIdentity);
+        }
+
+        target.prevent_user_return();
+        target.release_running_ownership();
+        target.release_root_residency();
+        assert!(
+            target.deferred_cleanup_is_quiescent(),
+            "remote stop released execution ownership before deferred cleanup quiesced"
+        );
+
+        let proof = self
+            .prove_exact_safe(StopObservation {
+                identity: request.identity,
+                conditions: SafePointConditions::EXACT_SAFE,
+            })
+            .map_err(|error| match error {
+                SafeProofError::AlreadyAcknowledged => RemoteStopError::AlreadyAcknowledged,
+                SafeProofError::StaleRequest | SafeProofError::NoStopRequested => {
+                    RemoteStopError::StaleRequest
+                }
+                SafeProofError::WrongIdentity | SafeProofError::NotSafe => {
+                    panic!("preflighted remote stop safe-point drifted: {error:?}")
+                }
+            })?;
+        self.acknowledge_exact_safe(proof)
+            .map_err(|error| match error {
+                SafeProofError::AlreadyAcknowledged => RemoteStopError::AlreadyAcknowledged,
+                SafeProofError::StaleRequest | SafeProofError::NoStopRequested => {
+                    RemoteStopError::StaleRequest
+                }
+                SafeProofError::WrongIdentity | SafeProofError::NotSafe => {
+                    panic!("remote stop acknowledgement drifted: {error:?}")
+                }
+            })
+    }
+
     /// Records a timeout or transport failure without consuming ownership.
     pub(crate) fn retain_after_failure<R>(
         &self,
@@ -587,6 +679,110 @@ mod tests {
             })
             .unwrap();
         mailbox.acknowledge_exact_safe(proof).unwrap();
+    }
+
+    struct SafePointModel {
+        identity: StopIdentity,
+        user_return_prevented: bool,
+        running_released: bool,
+        residency_released: bool,
+        cleanup_quiescent: bool,
+    }
+
+    impl SafePointModel {
+        fn new(identity: StopIdentity) -> Self {
+            Self {
+                identity,
+                user_return_prevented: false,
+                running_released: false,
+                residency_released: false,
+                cleanup_quiescent: true,
+            }
+        }
+    }
+
+    impl RemoteStopSafePoint for SafePointModel {
+        fn validate_exact_stop(&self, identity: StopIdentity) -> bool {
+            self.identity == identity
+                && !self.user_return_prevented
+                && !self.running_released
+                && !self.residency_released
+        }
+
+        fn prevent_user_return(&mut self) {
+            assert!(!self.user_return_prevented);
+            self.user_return_prevented = true;
+        }
+
+        fn release_running_ownership(&mut self) {
+            assert!(self.user_return_prevented);
+            assert!(!self.running_released);
+            self.running_released = true;
+        }
+
+        fn release_root_residency(&mut self) {
+            assert!(self.running_released);
+            assert!(!self.residency_released);
+            self.residency_released = true;
+        }
+
+        fn deferred_cleanup_is_quiescent(&self) -> bool {
+            self.residency_released && self.cleanup_quiescent
+        }
+    }
+
+    #[test]
+    fn safe_point_stop_orders_return_running_residency_before_release_ack() {
+        let mut objects = ObjectRegistry::<8>::new();
+        let stop_identity = identity(thread_key(&mut objects));
+        let mailbox = RendezvousMailbox::new(stop_identity.target_cpu()).unwrap();
+        let deferred = mailbox.publish_stop(stop_identity, 0x55_u64).unwrap();
+        let request = match mailbox.take_notification() {
+            MailboxNotification::Stop(request) => request,
+            notification => panic!("expected stop request, got {notification:?}"),
+        };
+        let mut target = SafePointModel::new(stop_identity);
+        mailbox
+            .complete_stop_at_safe_point(request, &mut target)
+            .unwrap();
+        assert!(target.user_return_prevented);
+        assert!(target.running_released);
+        assert!(target.residency_released);
+        assert_eq!(mailbox.complete_reclaim(deferred).unwrap(), 0x55);
+    }
+
+    #[test]
+    fn safe_point_stop_rejects_wrong_duplicate_and_already_terminal_target() {
+        let mut objects = ObjectRegistry::<8>::new();
+        let stop_identity = identity(thread_key(&mut objects));
+        let mailbox = RendezvousMailbox::new(stop_identity.target_cpu()).unwrap();
+        let deferred = mailbox.publish_stop(stop_identity, 0x66_u64).unwrap();
+        let request = match mailbox.take_notification() {
+            MailboxNotification::Stop(request) => request,
+            notification => panic!("expected stop request, got {notification:?}"),
+        };
+        let wrong_identity = StopIdentity::new(
+            stop_identity.target_cpu(),
+            stop_identity.cpu_online_generation(),
+            thread_key(&mut objects),
+            stop_identity.execution_generation(),
+            stop_identity.root_binding_generation(),
+        )
+        .unwrap();
+        let mut wrong = SafePointModel::new(wrong_identity);
+        assert_eq!(
+            mailbox.complete_stop_at_safe_point(request, &mut wrong),
+            Err(RemoteStopError::WrongIdentity)
+        );
+        let mut target = SafePointModel::new(stop_identity);
+        mailbox
+            .complete_stop_at_safe_point(request, &mut target)
+            .unwrap();
+        assert_eq!(
+            mailbox.complete_stop_at_safe_point(request, &mut target),
+            Err(RemoteStopError::AlreadyAcknowledged)
+        );
+        assert_eq!(mailbox.complete_reclaim(deferred).unwrap(), 0x66);
     }
 
     #[test]
