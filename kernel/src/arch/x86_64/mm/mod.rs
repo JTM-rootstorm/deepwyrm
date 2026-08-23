@@ -18,6 +18,8 @@ pub(crate) const AP_TRAMPOLINE_LIMIT: u64 = 0x10_0000;
 mod journal;
 pub(crate) mod transition;
 
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+pub(crate) use transition::ActiveRootSelection;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) use transition::LiveActivePagingTarget;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]

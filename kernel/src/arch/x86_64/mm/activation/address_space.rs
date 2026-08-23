@@ -322,6 +322,9 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
         process: ProcessKey,
     ) -> Result<(), RootBindingError> {
         self.validate_new_binding(address_space, process)?;
+        if self.next_binding_generation == 0 {
+            return Err(RootBindingError::GenerationExhausted);
+        }
         self.free_slot().map(|_| ())
     }
 
@@ -979,10 +982,10 @@ impl ActiveRootSelection {
         if claim.cpu() != self.cpu() {
             return Err(crate::arch::x86_64::rendezvous::StopIdentityError::InvalidCpu);
         }
-        crate::arch::x86_64::rendezvous::StopIdentity::from_scheduler_claim(
+        crate::arch::x86_64::rendezvous::StopIdentity::from_active_root(
             cpu_online_generation,
             claim,
-            self.binding_generation,
+            self,
         )
     }
 

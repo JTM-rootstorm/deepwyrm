@@ -10,7 +10,12 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use crate::cpu::{CPU_CAPACITY, CpuIndex};
 use crate::sync::IrqSpinMutex;
-use crate::task::{SchedulerExecutionClaim, ThreadKey};
+#[cfg(any(
+    test,
+    all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")
+))]
+use crate::task::SchedulerExecutionClaim;
+use crate::task::ThreadKey;
 
 pub(crate) const RENDEZVOUS_CPU_CAPACITY: usize = CPU_CAPACITY;
 
@@ -78,17 +83,13 @@ pub(crate) struct StopIdentity {
 }
 
 impl StopIdentity {
-    pub(crate) const fn new(
-        target_cpu: usize,
+    const fn from_parts(
+        target_cpu: CpuIndex,
         cpu_online_generation: u64,
         thread: ThreadKey,
         execution_generation: u64,
         root_binding_generation: u64,
     ) -> Result<Self, StopIdentityError> {
-        let target_cpu = match CpuIndex::new(target_cpu) {
-            Some(cpu) => cpu,
-            None => return Err(StopIdentityError::InvalidCpu),
-        };
         if cpu_online_generation == 0 {
             return Err(StopIdentityError::ZeroOnlineGeneration);
         }
@@ -105,6 +106,27 @@ impl StopIdentity {
             execution_generation,
             root_binding_generation,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn new(
+        target_cpu: usize,
+        cpu_online_generation: u64,
+        thread: ThreadKey,
+        execution_generation: u64,
+        root_binding_generation: u64,
+    ) -> Result<Self, StopIdentityError> {
+        let target_cpu = match CpuIndex::new(target_cpu) {
+            Some(cpu) => cpu,
+            None => return Err(StopIdentityError::InvalidCpu),
+        };
+        Self::from_parts(
+            target_cpu,
+            cpu_online_generation,
+            thread,
+            execution_generation,
+            root_binding_generation,
+        )
     }
 
     pub(crate) const fn target_cpu(self) -> usize {
@@ -127,6 +149,7 @@ impl StopIdentity {
         self.root_binding_generation
     }
 
+    #[cfg(test)]
     pub(crate) const fn from_scheduler_claim(
         cpu_online_generation: u64,
         claim: SchedulerExecutionClaim,
@@ -138,6 +161,29 @@ impl StopIdentity {
             claim.thread(),
             claim.generation(),
             root_binding_generation,
+        )
+    }
+
+    /// The only production constructor: root epoch is read directly from the
+    /// retained active selection rather than supplied by the requester.
+    #[cfg(any(
+        test,
+        all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")
+    ))]
+    pub(crate) fn from_active_root(
+        cpu_online_generation: u64,
+        claim: SchedulerExecutionClaim,
+        active: &crate::arch::x86_64::mm::ActiveRootSelection,
+    ) -> Result<Self, StopIdentityError> {
+        if claim.cpu() != active.cpu() {
+            return Err(StopIdentityError::InvalidCpu);
+        }
+        Self::from_parts(
+            claim.cpu(),
+            cpu_online_generation,
+            claim.thread(),
+            claim.generation(),
+            active.binding_generation(),
         )
     }
 }
