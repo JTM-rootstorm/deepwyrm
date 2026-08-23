@@ -46,18 +46,21 @@ const MAX_BOOTFS_BYTES: usize = 32 * 1024 * 1024;
 const REGISTRY_OBJECTS: usize = 32;
 const MEMORY_OBJECTS: usize = 10;
 const MEMORY_LEASES: usize = 10;
-const CHANNEL_PAIRS: usize = 1;
+// I0 keeps the complete bootstrap -> init0 -> hello chain live while each
+// parent performs bounded READY/exit supervision of its direct child.
+const USERSPACE_CHAIN_PROCESSES: usize = 3;
+const CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;
 const CHANNEL_DEPTH: usize = 2;
 const WAITERS: usize = 4;
 const TASK_GROUPS: usize = 1;
-const PROCESSES: usize = 1;
-const THREADS: usize = 1;
+const PROCESSES: usize = USERSPACE_CHAIN_PROCESSES;
+const THREADS: usize = USERSPACE_CHAIN_PROCESSES;
 const HANDLES: usize = 8;
-const SPACES: usize = 1;
-const REGIONS: usize = 1;
-const REGION_OBJECTS: usize = 1;
+const SPACES: usize = USERSPACE_CHAIN_PROCESSES;
+const REGIONS: usize = USERSPACE_CHAIN_PROCESSES;
+const REGION_OBJECTS: usize = USERSPACE_CHAIN_PROCESSES;
 const REGION_SLOTS: usize = 10;
-const EXECUTION_THREADS: usize = 1;
+const EXECUTION_THREADS: usize = USERSPACE_CHAIN_PROCESSES;
 const EVENTS: usize = 1;
 const TIMERS: usize = 1;
 const PRIMORDIAL_TABLE_CANDIDATES: usize = 3;
@@ -69,6 +72,12 @@ const PRIMORDIAL_INVALIDATIONS: usize = PRIMORDIAL_MAX_MAPPING_PAGES;
 // The native binding table and kernel-wide CPU identity must describe the
 // same bounded carrier set; a capacity drift is a compile-time error.
 const _: [(); crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] = [(); crate::cpu::CPU_CAPACITY];
+const _: [(); PROCESSES] = [(); THREADS];
+const _: [(); PROCESSES] = [(); CHANNEL_PAIRS];
+const _: [(); PROCESSES] = [(); SPACES];
+const _: [(); PROCESSES] = [(); REGIONS];
+const _: [(); PROCESSES] = [(); REGION_OBJECTS];
+const _: [(); PROCESSES] = [(); EXECUTION_THREADS];
 
 #[cfg(feature = "test-support")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -399,8 +408,9 @@ fn publish_runtime_shared() -> &'static PrimordialRuntimeShared {
         .unwrap_or_else(|_| panic!("primordial shared runtime was initialized twice"));
     let stacks = crate::arch::x86_64::linked_thread_kernel_stack_layout()
         .unwrap_or_else(|error| panic!("invalid primordial kernel stack layout: {error:?}"));
-    let execution = ExecutionDomain::new([stacks[0]])
-        .unwrap_or_else(|error| panic!("invalid primordial execution domain: {error:?}"));
+    let execution =
+        ExecutionDomain::<EXECUTION_THREADS>::new(core::array::from_fn(|index| stacks[index]))
+            .unwrap_or_else(|error| panic!("invalid primordial execution domain: {error:?}"));
     unsafe {
         (*SHARED_RUNTIME_STORAGE.0.get()).write(PrimordialRuntimeShared {
             execution,
