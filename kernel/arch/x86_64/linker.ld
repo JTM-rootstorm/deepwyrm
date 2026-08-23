@@ -60,6 +60,7 @@ SECTIONS
     __dw_rodata_start = ALIGN(CONSTANT(MAXPAGESIZE));
     .rodata ALIGN(CONSTANT(MAXPAGESIZE)) :
     {
+        KEEP(*(.rodata.ap_trampoline_template))
         KEEP(*(.rodata.exceptions))
         *(.rodata .rodata.*)
         *(.data.rel.ro .data.rel.ro.*)
@@ -155,6 +156,11 @@ SECTIONS
 
 ASSERT(_dw_kernel_entry == DW_KERNEL_LINK_BASE,
        "entry must begin at the fixed kernel link base")
+ASSERT(__dw_ap_trampoline_template_start < __dw_ap_trampoline_template_end,
+       "AP trampoline template must be nonempty")
+ASSERT((__dw_ap_trampoline_template_end - __dw_ap_trampoline_template_start) <=
+       DW_KERNEL_BASE_PAGE_SIZE,
+       "AP trampoline template must fit one base page")
 ASSERT((__dw_kernel_image_start & (DW_KERNEL_BASE_PAGE_SIZE - 1)) == 0,
        "kernel image must be base-page aligned")
 ASSERT((__dw_boot_stack_bottom & (DW_KERNEL_BOOT_STACK_ALIGNMENT - 1)) == 0,

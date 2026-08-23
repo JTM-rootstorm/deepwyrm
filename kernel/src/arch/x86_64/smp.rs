@@ -283,6 +283,161 @@ pub(crate) enum TrampolinePlanError {
     InvalidEntry,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TrampolineTemplateLayout {
+    pub(crate) gdt_offset: usize,
+    pub(crate) gdt_base_patch: usize,
+    pub(crate) protected_entry_offset: usize,
+    pub(crate) protected_pointer_patch: usize,
+    pub(crate) page_table_root_patch: usize,
+    pub(crate) cpu_index_patch: usize,
+    pub(crate) local_apic_id_patch: usize,
+    pub(crate) stack_top_patch: usize,
+    pub(crate) higher_half_entry_patch: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TrampolineImageError {
+    TemplateSize,
+    Layout,
+    PlanMismatch,
+    InvalidCpu,
+    InvalidStack,
+    PhysicalOverflow,
+}
+
+pub(crate) fn build_trampoline_image(
+    destination: &mut [u8; PAGE_SIZE as usize],
+    template: &[u8],
+    layout: TrampolineTemplateLayout,
+    plan: TrampolinePlan,
+    cpu_index: usize,
+    local_apic_id: u8,
+    stack_top: u64,
+) -> Result<(), TrampolineImageError> {
+    if template.is_empty() || template.len() > destination.len() {
+        return Err(TrampolineImageError::TemplateSize);
+    }
+    if usize::from(plan.byte_len) != template.len() {
+        return Err(TrampolineImageError::PlanMismatch);
+    }
+    if cpu_index == 0 || cpu_index >= MAX_DW0_CPUS {
+        return Err(TrampolineImageError::InvalidCpu);
+    }
+    if stack_top < 0xffff_8000_0000_0000 || !stack_top.is_multiple_of(16) {
+        return Err(TrampolineImageError::InvalidStack);
+    }
+    validate_template_layout(layout, template.len())?;
+    let gdt = checked_low_address(plan.physical_start, layout.gdt_offset)?;
+    let protected = checked_low_address(plan.physical_start, layout.protected_entry_offset)?;
+
+    destination.fill(0);
+    destination[..template.len()].copy_from_slice(template);
+    write_u32(destination, layout.gdt_base_patch, gdt);
+    write_u32(destination, layout.protected_pointer_patch, protected);
+    write_u32(
+        destination,
+        layout.page_table_root_patch,
+        plan.page_table_root as u32,
+    );
+    write_u32(destination, layout.cpu_index_patch, cpu_index as u32);
+    write_u32(
+        destination,
+        layout.local_apic_id_patch,
+        u32::from(local_apic_id),
+    );
+    write_u64(destination, layout.stack_top_patch, stack_top);
+    write_u64(
+        destination,
+        layout.higher_half_entry_patch,
+        plan.higher_half_entry,
+    );
+    Ok(())
+}
+
+fn validate_template_layout(
+    layout: TrampolineTemplateLayout,
+    template_len: usize,
+) -> Result<(), TrampolineImageError> {
+    for (offset, width) in [
+        (layout.gdt_base_patch, 4),
+        (layout.protected_pointer_patch, 4),
+        (layout.page_table_root_patch, 4),
+        (layout.cpu_index_patch, 4),
+        (layout.local_apic_id_patch, 4),
+        (layout.stack_top_patch, 8),
+        (layout.higher_half_entry_patch, 8),
+    ] {
+        if offset
+            .checked_add(width)
+            .is_none_or(|end| end > template_len)
+        {
+            return Err(TrampolineImageError::Layout);
+        }
+    }
+    if layout.gdt_offset >= template_len || layout.protected_entry_offset >= template_len {
+        return Err(TrampolineImageError::Layout);
+    }
+    Ok(())
+}
+
+fn checked_low_address(base: u64, offset: usize) -> Result<u32, TrampolineImageError> {
+    base.checked_add(offset as u64)
+        .and_then(|address| u32::try_from(address).ok())
+        .ok_or(TrampolineImageError::PhysicalOverflow)
+}
+
+fn write_u32(destination: &mut [u8], offset: usize, value: u32) {
+    destination[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u64(destination: &mut [u8], offset: usize, value: u64) {
+    destination[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "linker-defined trampoline symbols delimit one immutable template section"
+)]
+pub(crate) fn linked_trampoline_template() -> (&'static [u8], TrampolineTemplateLayout) {
+    unsafe extern "C" {
+        static __dw_ap_trampoline_template_start: u8;
+        static __dw_ap_trampoline_template_end: u8;
+        static __dw_ap_trampoline_gdt: u8;
+        static __dw_ap_trampoline_gdt_base: u8;
+        static __dw_ap_trampoline_protected_entry: u8;
+        static __dw_ap_trampoline_protected_pointer: u8;
+        static __dw_ap_trampoline_page_table_root: u8;
+        static __dw_ap_trampoline_cpu_index: u8;
+        static __dw_ap_trampoline_local_apic_id: u8;
+        static __dw_ap_trampoline_stack_top: u8;
+        static __dw_ap_trampoline_higher_half_entry: u8;
+    }
+    let start = core::ptr::addr_of!(__dw_ap_trampoline_template_start) as usize;
+    let end = core::ptr::addr_of!(__dw_ap_trampoline_template_end) as usize;
+    assert!(start < end, "AP trampoline template bounds are ordered");
+    let offset = |symbol: *const u8| {
+        (symbol as usize)
+            .checked_sub(start)
+            .expect("AP trampoline patch symbol follows template start")
+    };
+    // SAFETY: the linker retains one contiguous immutable template from `start..end`.
+    let template = unsafe { core::slice::from_raw_parts(start as *const u8, end - start) };
+    let layout = TrampolineTemplateLayout {
+        gdt_offset: offset(core::ptr::addr_of!(__dw_ap_trampoline_gdt)),
+        gdt_base_patch: offset(core::ptr::addr_of!(__dw_ap_trampoline_gdt_base)),
+        protected_entry_offset: offset(core::ptr::addr_of!(__dw_ap_trampoline_protected_entry)),
+        protected_pointer_patch: offset(core::ptr::addr_of!(__dw_ap_trampoline_protected_pointer)),
+        page_table_root_patch: offset(core::ptr::addr_of!(__dw_ap_trampoline_page_table_root)),
+        cpu_index_patch: offset(core::ptr::addr_of!(__dw_ap_trampoline_cpu_index)),
+        local_apic_id_patch: offset(core::ptr::addr_of!(__dw_ap_trampoline_local_apic_id)),
+        stack_top_patch: offset(core::ptr::addr_of!(__dw_ap_trampoline_stack_top)),
+        higher_half_entry_patch: offset(core::ptr::addr_of!(__dw_ap_trampoline_higher_half_entry)),
+    };
+    (template, layout)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,5 +508,51 @@ mod tests {
         assert!(TrampolinePlan::new(0x8000, 4097, 0x1000, plan.higher_half_entry).is_err());
         assert!(TrampolinePlan::new(0x8000, 1, 1_u64 << 32, plan.higher_half_entry).is_err());
         assert!(TrampolinePlan::new(0x8000, 1, 0x1000, 0x400000).is_err());
+    }
+
+    #[test]
+    fn trampoline_image_patches_only_validated_runtime_fields() {
+        let template = [0xa5_u8; 96];
+        let layout = TrampolineTemplateLayout {
+            gdt_offset: 8,
+            gdt_base_patch: 40,
+            protected_entry_offset: 16,
+            protected_pointer_patch: 44,
+            page_table_root_patch: 48,
+            cpu_index_patch: 52,
+            local_apic_id_patch: 56,
+            stack_top_patch: 64,
+            higher_half_entry_patch: 72,
+        };
+        let plan = TrampolinePlan::new(
+            0x8000,
+            template.len() as u64,
+            0x20_0000,
+            0xffff_8000_0010_0000,
+        )
+        .unwrap();
+        let mut page = [0xff; PAGE_SIZE as usize];
+        build_trampoline_image(
+            &mut page,
+            &template,
+            layout,
+            plan,
+            2,
+            7,
+            0xffff_9000_0001_0000,
+        )
+        .unwrap();
+        assert_eq!(&page[40..44], &0x8008_u32.to_le_bytes());
+        assert_eq!(&page[44..48], &0x8010_u32.to_le_bytes());
+        assert_eq!(&page[48..52], &0x20_0000_u32.to_le_bytes());
+        assert_eq!(&page[52..56], &2_u32.to_le_bytes());
+        assert_eq!(&page[56..60], &7_u32.to_le_bytes());
+        assert_eq!(&page[64..72], &0xffff_9000_0001_0000_u64.to_le_bytes());
+        assert_eq!(&page[72..80], &0xffff_8000_0010_0000_u64.to_le_bytes());
+        assert!(page[template.len()..].iter().all(|byte| *byte == 0));
+        assert_eq!(
+            build_trampoline_image(&mut page, &template, layout, plan, 0, 0, 0),
+            Err(TrampolineImageError::InvalidCpu)
+        );
     }
 }
