@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+#[path = "../../src/cpu.rs"]
+mod cpu;
 #[path = "../../src/handle/mod.rs"]
 mod handle;
 #[path = "frame_roles_stub.rs"]
