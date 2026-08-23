@@ -423,8 +423,10 @@ fn g5_terminal_completion_drains_all_primordial_authority_before_capacity_proof(
         .expect("read primordial completion source");
 
     for required in [
-        "unmap_all_userspace()?",
-        "retire_exited_root(",
+        "process_quiescence_proof(self.process)",
+        "blocked_operations_drained(&self.tasks, &proof)",
+        "unmap_all_userspace(&proof)?",
+        "retire_quiesced_root(",
         "release_terminal_authority()?",
         "drain_finalizers()?",
         "prove_registry_capacity()",
