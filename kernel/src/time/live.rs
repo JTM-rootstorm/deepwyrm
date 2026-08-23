@@ -4,7 +4,7 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use crate::arch::x86_64::apic::{ApicMode, LocalApic, LocalApicDiscovery};
+use crate::arch::x86_64::apic::{ApicMode, IpiOperation, LocalApic, LocalApicDiscovery};
 use crate::arch::x86_64::apic_live::{
     LiveApicBaseMsr, LiveXApicMmio, discover_local_apic, lapic_pat_entry_is_uncacheable,
 };
@@ -592,6 +592,37 @@ pub(crate) fn monotonic_now() -> Result<u64, LiveTimeError> {
     let state = live_state().ok_or(LiveTimeError::Clock)?;
     let mut state = state.lock();
     Ok(state.sample_now()?.nanoseconds)
+}
+
+pub(crate) fn bsp_local_apic_identity() -> Result<(u8, u64), LiveTimeError> {
+    let state = live_state().ok_or(LiveTimeError::Clock)?;
+    let state = state.lock();
+    let id = state.apic.apic_id().ok_or(LiveTimeError::ApicAccess)?;
+    Ok((id, state.apic.discovery().physical_base()))
+}
+
+pub(crate) fn send_bsp_ipi(destination: u8, operation: IpiOperation) -> Result<(), LiveTimeError> {
+    let state = live_state().ok_or(LiveTimeError::Clock)?;
+    let mut state = state.lock();
+    let LiveTimeState {
+        apic, registers, ..
+    } = &mut *state;
+    apic.send_ipi(registers, destination, operation)
+        .map_err(|_| LiveTimeError::ApicAccess)
+}
+
+pub(crate) fn busy_wait_nanoseconds(delay: u64) -> Result<(), LiveTimeError> {
+    let state = live_state().ok_or(LiveTimeError::Clock)?;
+    let mut state = state.lock();
+    let start = state.sample_now()?.nanoseconds;
+    let target = start.checked_add(delay).ok_or(LiveTimeError::Clock)?;
+    for _ in 0..20_000_000_u32 {
+        if state.sample_now()?.nanoseconds >= target {
+            return Ok(());
+        }
+        core::hint::spin_loop();
+    }
+    Err(LiveTimeError::Clock)
 }
 
 pub(crate) fn register_deadline(

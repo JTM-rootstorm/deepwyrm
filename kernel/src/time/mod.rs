@@ -50,8 +50,9 @@ pub(crate) use pm_timer::{
 )]
 pub(crate) use live::{
     DeadlineRegistrationFailure, DeadlineWakeTarget, LiveTimeError, LiveTimerDeadlineAuthority,
-    TimerExpiryTarget, bind_deadline_wake_target, bind_timer_expiry_target, cancel_deadline,
-    initialize, monotonic_now, register_deadline,
+    TimerExpiryTarget, bind_deadline_wake_target, bind_timer_expiry_target,
+    bsp_local_apic_identity, busy_wait_nanoseconds, cancel_deadline, initialize, monotonic_now,
+    register_deadline, send_bsp_ipi,
 };
 #[cfg(all(feature = "test-support", target_os = "none", target_arch = "x86_64"))]
 #[allow(
