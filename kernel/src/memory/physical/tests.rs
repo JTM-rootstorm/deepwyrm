@@ -85,6 +85,87 @@ fn allocator_repeatedly_reports_oom_after_exhaustion() {
 }
 
 #[test]
+fn low_ceiling_allocation_is_lowest_fit_and_never_crosses_the_ceiling() {
+    let limit = PhysicalAddressLimit::new(1_u64 << 24).unwrap();
+    let candidates = [
+        PageRange {
+            start: 0,
+            end: 0x5000,
+        },
+        PageRange {
+            start: 0x9000,
+            end: 0x14_000,
+        },
+    ];
+    let mut allocator =
+        PhysicalFrameAllocator::<2>::from_candidates(&candidates, limit, []).unwrap();
+
+    // Page zero is reserved, so this demonstrates that a low-memory caller
+    // gets a nonzero page without assuming a fixed address.
+    let first = allocator.allocate_run_below(2, 0x10_0000).unwrap();
+    assert_eq!(
+        first,
+        PageRange {
+            start: 0x1000,
+            end: 0x3000
+        }
+    );
+    assert!(first.end <= 0x10_0000);
+
+    // The remaining low fragment is too short. The later range wins only
+    // after the earlier candidate cannot satisfy the requested run.
+    let second = allocator.allocate_run_below(3, 0x11_000).unwrap();
+    assert_eq!(
+        second,
+        PageRange {
+            start: 0x9000,
+            end: 0xc000
+        }
+    );
+    assert!(second.end <= 0x11_000);
+}
+
+#[test]
+fn low_ceiling_rejection_is_failure_atomic_for_fragmented_ranges() {
+    let limit = PhysicalAddressLimit::new(1_u64 << 24).unwrap();
+    let candidates = [
+        PageRange {
+            start: 0x1000,
+            end: 0x3000,
+        },
+        PageRange {
+            start: 0x5000,
+            end: 0x8000,
+        },
+    ];
+    let mut allocator =
+        PhysicalFrameAllocator::<2>::from_candidates(&candidates, limit, []).unwrap();
+    let available = allocator.available_frames();
+
+    assert_eq!(
+        allocator.allocate_run_below(2, 0x2000),
+        Err(PhysicalMemoryError::NoFramesAvailable)
+    );
+    assert_eq!(allocator.available_frames(), available);
+
+    // A non-page-aligned ceiling cannot permit a page which would cross it.
+    assert_eq!(
+        allocator.allocate_run_below(1, 0x1fff),
+        Err(PhysicalMemoryError::NoFramesAvailable)
+    );
+    assert_eq!(allocator.available_frames(), available);
+
+    // The rejected requests did not disturb the original lowest-fit result.
+    assert_eq!(
+        allocator.allocate_run(1),
+        Ok(PageRange {
+            start: 0x1000,
+            end: 0x2000,
+        })
+    );
+}
+
+#[test]
 fn allocator_rejects_invalid_candidate_ranges() {
     for candidate in [
         PageRange {

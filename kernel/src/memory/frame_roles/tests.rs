@@ -64,6 +64,52 @@ fn foreign_manager_rejection_returns_the_live_grant() {
 }
 
 #[test]
+fn low_ceiling_grant_is_exact_and_failed_selection_preserves_manager_state() {
+    let mut roles = manager(BASE_PAGE_SIZE, 8);
+    let initial = roles.available_frames();
+    let ceiling = BASE_PAGE_SIZE * 3;
+
+    let grant = roles.allocate_below(1, ceiling).unwrap();
+    let stale = grant.identity;
+    assert_eq!(grant.physical_start(), BASE_PAGE_SIZE);
+    assert_eq!(grant.byte_len(), BASE_PAGE_SIZE);
+    assert!(grant.physical_start() + grant.byte_len() <= ceiling);
+    assert_eq!(roles.available_frames(), initial - 1);
+    roles.validate_allocation(&grant).unwrap();
+
+    let available = roles.available_frames();
+    assert_eq!(
+        roles.allocate_below(2, ceiling),
+        Err(FrameRoleError::Physical(
+            PhysicalMemoryError::NoFramesAvailable
+        ))
+    );
+    assert_eq!(roles.available_frames(), available);
+    roles.validate_allocation(&grant).unwrap();
+
+    roles.cancel_allocation(grant).unwrap();
+    let replacement = roles.allocate_below(1, ceiling).unwrap();
+    assert_eq!(replacement.physical_start(), BASE_PAGE_SIZE);
+    assert_ne!(replacement.identity, stale);
+    roles.cancel_allocation(replacement).unwrap();
+    assert_eq!(roles.available_frames(), initial);
+    assert_eq!(roles.check_invariants(), Ok(()));
+
+    let limit = PhysicalAddressLimit::new(1_u64 << 40).unwrap();
+    let candidate = PageRange::from_page_count(BASE_PAGE_SIZE, 2, limit).unwrap();
+    let allocator = PhysicalFrameAllocator::<2>::from_candidates(&[candidate], limit, []).unwrap();
+    let mut capacity_limited = FrameRoleManager::<2, 1>::new(allocator).unwrap();
+    let first = capacity_limited.allocate(1).unwrap();
+    let available = capacity_limited.available_frames();
+    assert_eq!(
+        capacity_limited.allocate_below(1, BASE_PAGE_SIZE * 3),
+        Err(FrameRoleError::Capacity)
+    );
+    assert_eq!(capacity_limited.available_frames(), available);
+    capacity_limited.cancel_allocation(first).unwrap();
+}
+
+#[test]
 fn singleton_claim_is_one_shot_without_global_test_interference() {
     let claimed = AtomicBool::new(false);
     assert_eq!(claim_manager(&claimed), Ok(()));

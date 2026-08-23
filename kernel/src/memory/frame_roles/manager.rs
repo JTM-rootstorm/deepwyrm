@@ -107,6 +107,34 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok(AllocationGrant { identity, range })
     }
 
+    /// Allocates an uninitialized contiguous grant strictly below an exclusive
+    /// physical ceiling.
+    ///
+    /// This is the only role-manager entry point for consumers which need a
+    /// low physical run, such as an x86 AP startup trampoline. Slot and
+    /// generation validation occurs before the allocator changes, and the
+    /// role record is published only after a run is owned, preserving exact
+    /// grant ownership across every failure path.
+    pub(crate) fn allocate_below(
+        &mut self,
+        page_count: u64,
+        exclusive_ceiling: u64,
+    ) -> Result<AllocationGrant, FrameRoleError> {
+        let (slot, generation) = self.next_slot()?;
+        let identity = self.identity(slot, generation)?;
+        let range = self
+            .allocator
+            .allocate_run_below(page_count, exclusive_ceiling)?;
+        self.roles[slot] = RoleSlot {
+            generation,
+            record: Some(RoleRecord {
+                range,
+                role: FrameRole::AllocatedUninitialized,
+            }),
+        };
+        Ok(AllocationGrant { identity, range })
+    }
+
     /// Revalidates a live allocation grant before architecture code mutates
     /// its physical contents.
     pub(crate) fn validate_allocation(

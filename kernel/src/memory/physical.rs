@@ -366,6 +366,51 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
         Ok(PageRange { start, end })
     }
 
+    /// Allocates the lowest available contiguous run whose exclusive end is
+    /// no greater than `exclusive_ceiling`.
+    ///
+    /// The ceiling is an additional caller-supplied constraint, not a second
+    /// physical-address limit. Values above the allocator's validated limit
+    /// are therefore harmlessly bounded by that limit. A non-page-aligned
+    /// ceiling is also supported: every returned whole page is still strictly
+    /// below it. Selection and all arithmetic complete before the free list is
+    /// changed, so an error leaves allocator state untouched.
+    pub(super) fn allocate_run_below(
+        &mut self,
+        page_count: u64,
+        exclusive_ceiling: u64,
+    ) -> Result<PageRange, PhysicalMemoryError> {
+        if page_count == 0 {
+            return Err(PhysicalMemoryError::InvalidPageRange);
+        }
+        let byte_len = page_count
+            .checked_mul(BASE_PAGE_SIZE)
+            .ok_or(PhysicalMemoryError::AddressOverflow)?;
+        let ceiling = exclusive_ceiling.min(self.limit.exclusive());
+        let index = self.free[..self.free_len]
+            .iter()
+            .position(|range| {
+                range
+                    .end
+                    .min(ceiling)
+                    .checked_sub(range.start)
+                    .is_some_and(|available| available >= byte_len)
+            })
+            .ok_or(PhysicalMemoryError::NoFramesAvailable)?;
+        let start = self.free[index].start;
+        let end = start
+            .checked_add(byte_len)
+            .ok_or(PhysicalMemoryError::AddressOverflow)?;
+
+        // `index` was selected only when this exact run ended at or below the
+        // ceiling and inside the free range. Mutate only after that proof.
+        self.free[index].start = end;
+        if self.free[index].start == self.free[index].end {
+            self.remove_free(index);
+        }
+        Ok(PageRange { start, end })
+    }
+
     /// Returns one previously allocated contiguous run. Callers above this
     /// mechanism must prove that no live role still owns the run.
     pub(super) fn free_run(&mut self, range: PageRange) -> Result<(), PhysicalMemoryError> {
