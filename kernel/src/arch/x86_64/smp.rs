@@ -8,6 +8,7 @@
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 pub(crate) const H1_RUNTIME_CPU_CAPACITY: usize = 4;
+const CPU_REGISTRY_CONFIGURING: u8 = u8::MAX;
 pub(crate) const INIT_ASSERT_DELAY_NS: u64 = 10_000_000;
 pub(crate) const INIT_TO_SIPI_DELAY_NS: u64 = 200_000;
 pub(crate) const SIPI_RETRY_DELAY_NS: u64 = 200_000;
@@ -170,6 +171,7 @@ pub(crate) enum CpuRegistryError {
     EmptyTopology,
     Capacity { observed: usize },
     DuplicateLocalApicId(u8),
+    AlreadyConfigured,
     InvalidCpuIndex(usize),
     LocalApicMismatch { expected: u8, observed: u8 },
     State(CpuStateError),
@@ -206,10 +208,13 @@ impl CpuRegistry {
             }
         }
         self.discovered
-            .compare_exchange(0, u8::MAX, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|observed| {
-                CpuRegistryError::State(CpuStateError::UnexpectedState(observed))
-            })?;
+            .compare_exchange(
+                0,
+                CPU_REGISTRY_CONFIGURING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| CpuRegistryError::AlreadyConfigured)?;
         for (index, id) in local_apic_ids.iter().copied().enumerate() {
             self.slots[index]
                 .discover(id)
@@ -223,7 +228,10 @@ impl CpuRegistry {
     }
 
     pub(crate) fn len(&self) -> usize {
-        usize::from(self.discovered.load(Ordering::Acquire))
+        match self.discovered.load(Ordering::Acquire) {
+            CPU_REGISTRY_CONFIGURING => 0,
+            published => usize::from(published),
+        }
     }
 
     pub(crate) fn begin_start(&self, cpu_index: usize) -> Result<(), CpuRegistryError> {
@@ -805,7 +813,20 @@ mod tests {
             registry.discover(&[2, 2]),
             Err(CpuRegistryError::DuplicateLocalApicId(2))
         );
+        registry
+            .discovered
+            .store(CPU_REGISTRY_CONFIGURING, Ordering::Release);
+        assert_eq!(
+            registry.len(),
+            0,
+            "an in-progress prefix must never publish length 255"
+        );
+        registry.discovered.store(0, Ordering::Release);
         registry.discover(&[2, 4, 7, 9]).unwrap();
+        assert_eq!(
+            registry.discover(&[2]),
+            Err(CpuRegistryError::AlreadyConfigured)
+        );
         assert_eq!(registry.len(), 4);
         registry.begin_start(0).unwrap();
         registry.publish_online(0, 2, 1).unwrap();
