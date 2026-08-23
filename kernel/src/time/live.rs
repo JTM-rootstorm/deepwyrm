@@ -2,14 +2,20 @@
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-use crate::arch::x86_64::apic::{ApicMode, IpiOperation, LocalApic, LocalApicDiscovery};
+use crate::arch::x86_64::apic::{
+    ApicMode, IpiOperation, LocalApic, LocalApicDiscovery, XApicRegisterAccess,
+};
 use crate::arch::x86_64::apic_live::{
     LiveApicBaseMsr, LiveXApicMmio, discover_local_apic, lapic_pat_entry_is_uncacheable,
 };
+use crate::arch::x86_64::ipi::{
+    LiveIpiTransport, LiveIpiVector, bind_live_ipi_transport, live_ipi_transport_is_bound,
+};
 use crate::arch::x86_64::mm::{ActiveDeepPaging, FrameAddress, LiveActivePagingTarget};
-use crate::interrupt::LocalApicVectors;
+use crate::cpu::{CPU_CAPACITY, CpuIndex};
+use crate::interrupt::{ControllerState, LocalApicVectors};
 use crate::sync::IrqSpinMutex;
 use crate::task::BlockWakeKey;
 
@@ -23,6 +29,10 @@ const UNINITIALIZED: u8 = 0;
 const INITIALIZING: u8 = 1;
 const INITIALIZED: u8 = 2;
 const CALIBRATION_NANOSECONDS: u64 = 10_000_000;
+const LAPIC_SLOT_EMPTY: u8 = 0;
+const LAPIC_SLOT_PUBLISHING: u8 = 1;
+const LAPIC_SLOT_ONLINE: u8 = 2;
+const XAPIC_EOI_REGISTER: u32 = 0x0b0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LiveTimeError {
@@ -32,10 +42,12 @@ pub(crate) enum LiveTimeError {
     ApicMode,
     ApicMapping,
     ApicAccess,
+    CpuIdentity,
     Calibration,
     Clock,
     Deadline,
     NoWakeRuntime,
+    IpiTransport,
     Faulted,
 }
 
@@ -213,6 +225,158 @@ fn timer_expiry_binding() -> Option<TimerExpiryBinding> {
     Some(unsafe { (*TIMER_EXPIRY_STORAGE.0.get()).assume_init() })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LocalApicIdentity {
+    local_apic_id: u8,
+    physical_base: u64,
+    virtual_base: u64,
+}
+
+struct LiveLocalApicOwner {
+    controller: LocalApic,
+    registers: LiveXApicMmio,
+}
+
+/// One stationary local-APIC owner selected only through canonical logical CPU
+/// identity. Controller state is serialized with local IF clear. Receive EOI
+/// uses only the release-published immutable MMIO base and never takes this
+/// lock, so an IPI cannot deadlock an interrupted sender.
+struct PerCpuLocalApicSlot {
+    state: AtomicU8,
+    local_apic_id: AtomicU8,
+    physical_base: AtomicU64,
+    virtual_base: AtomicU64,
+    owner: IrqSpinMutex<Option<LiveLocalApicOwner>>,
+}
+
+impl PerCpuLocalApicSlot {
+    const fn empty() -> Self {
+        Self {
+            state: AtomicU8::new(LAPIC_SLOT_EMPTY),
+            local_apic_id: AtomicU8::new(0),
+            physical_base: AtomicU64::new(0),
+            virtual_base: AtomicU64::new(0),
+            owner: IrqSpinMutex::new(None),
+        }
+    }
+
+    fn publish(&self, owner: LiveLocalApicOwner) -> Result<(), LiveTimeError> {
+        if owner.controller.state() != ControllerState::Online {
+            return Err(LiveTimeError::ApicAccess);
+        }
+        let local_apic_id = owner
+            .controller
+            .apic_id()
+            .ok_or(LiveTimeError::ApicAccess)?;
+        let physical_base = owner.controller.discovery().physical_base();
+        let virtual_base = owner.registers.base();
+        self.state
+            .compare_exchange(
+                LAPIC_SLOT_EMPTY,
+                LAPIC_SLOT_PUBLISHING,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .map_err(|_| LiveTimeError::AlreadyInitialized)?;
+
+        let mut slot = self.owner.lock();
+        debug_assert!(slot.is_none());
+        *slot = Some(owner);
+        self.local_apic_id.store(local_apic_id, Ordering::Relaxed);
+        self.physical_base.store(physical_base, Ordering::Relaxed);
+        self.virtual_base.store(virtual_base, Ordering::Relaxed);
+        self.state.store(LAPIC_SLOT_ONLINE, Ordering::Release);
+        Ok(())
+    }
+
+    fn identity(&self) -> Option<LocalApicIdentity> {
+        if self.state.load(Ordering::Acquire) != LAPIC_SLOT_ONLINE {
+            return None;
+        }
+        Some(LocalApicIdentity {
+            local_apic_id: self.local_apic_id.load(Ordering::Relaxed),
+            physical_base: self.physical_base.load(Ordering::Relaxed),
+            virtual_base: self.virtual_base.load(Ordering::Relaxed),
+        })
+    }
+
+    fn with_owner<T>(
+        &self,
+        operation: impl FnOnce(&mut LocalApic, &mut LiveXApicMmio) -> Result<T, LiveTimeError>,
+    ) -> Result<T, LiveTimeError> {
+        if self.state.load(Ordering::Acquire) != LAPIC_SLOT_ONLINE {
+            return Err(LiveTimeError::ApicAccess);
+        }
+        let mut owner = self.owner.lock();
+        let owner = owner.as_mut().ok_or(LiveTimeError::ApicAccess)?;
+        operation(&mut owner.controller, &mut owner.registers)
+    }
+
+    fn end_of_interrupt(&self) -> Result<(), LiveTimeError> {
+        let identity = self.identity().ok_or(LiveTimeError::ApicAccess)?;
+        let mut registers =
+            LiveXApicMmio::new(identity.virtual_base).map_err(|_| LiveTimeError::ApicMapping)?;
+        registers
+            .write(XAPIC_EOI_REGISTER, 0)
+            .map_err(|_| LiveTimeError::ApicAccess)
+    }
+}
+
+static LOCAL_APIC_SLOTS: [PerCpuLocalApicSlot; CPU_CAPACITY] =
+    [const { PerCpuLocalApicSlot::empty() }; CPU_CAPACITY];
+
+fn installed_current_cpu_index() -> Result<CpuIndex, LiveTimeError> {
+    crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
+        .and_then(CpuIndex::new)
+        .ok_or(LiveTimeError::CpuIdentity)
+}
+
+fn current_local_apic_slot() -> Result<&'static PerCpuLocalApicSlot, LiveTimeError> {
+    let cpu = installed_current_cpu_index()?;
+    LOCAL_APIC_SLOTS
+        .get(cpu.index())
+        .ok_or(LiveTimeError::CpuIdentity)
+}
+
+fn with_bootstrap_local_apic<T>(
+    operation: impl FnOnce(&mut LocalApic, &mut LiveXApicMmio) -> Result<T, LiveTimeError>,
+) -> Result<T, LiveTimeError> {
+    if installed_current_cpu_index()? != CpuIndex::BOOTSTRAP {
+        return Err(LiveTimeError::CpuIdentity);
+    }
+    LOCAL_APIC_SLOTS[CpuIndex::BOOTSTRAP.index()].with_owner(operation)
+}
+
+struct StationaryLiveIpiTransport;
+
+static LIVE_IPI_TRANSPORT: StationaryLiveIpiTransport = StationaryLiveIpiTransport;
+
+impl LiveIpiTransport for StationaryLiveIpiTransport {
+    fn send_fixed(&self, destination_apic_id: u8, vector: LiveIpiVector) -> bool {
+        current_local_apic_slot()
+            .and_then(|slot| {
+                slot.with_owner(|controller, registers| {
+                    controller
+                        .send_ipi(
+                            registers,
+                            destination_apic_id,
+                            IpiOperation::Fixed {
+                                vector: vector.vector(),
+                            },
+                        )
+                        .map_err(|_| LiveTimeError::ApicAccess)
+                })
+            })
+            .is_ok()
+    }
+
+    fn end_of_interrupt(&self) -> bool {
+        current_local_apic_slot()
+            .and_then(PerCpuLocalApicSlot::end_of_interrupt)
+            .is_ok()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct InterruptOutcome {
     wakes: [Option<BlockWakeKey>; DEADLINE_QUEUE_CAPACITY],
@@ -223,8 +387,6 @@ struct InterruptOutcome {
 
 struct LiveTimeState {
     pm: PmTimerState,
-    apic: LocalApic,
-    registers: LiveXApicMmio,
     apic_timer_hz: u64,
     deadlines: DeadlineQueue,
     timer_deadlines: DeadlineQueue<DEADLINE_QUEUE_CAPACITY, TimerExpiryToken>,
@@ -256,9 +418,11 @@ impl LiveTimeState {
         let delta = next.saturating_sub(sample.nanoseconds);
         let shot = apic_one_shot_for_delta(delta, self.apic_timer_hz)
             .map_err(|_| LiveTimeError::Deadline)?;
-        self.apic
-            .program_one_shot_timer(&mut self.registers, shot.initial_count)
-            .map_err(|_| LiveTimeError::ApicAccess)
+        with_bootstrap_local_apic(|controller, registers| {
+            controller
+                .program_one_shot_timer(registers, shot.initial_count)
+                .map_err(|_| LiveTimeError::ApicAccess)
+        })
     }
 
     fn interrupt(&mut self) -> Result<InterruptOutcome, LiveTimeError> {
@@ -270,9 +434,7 @@ impl LiveTimeState {
             .timer_deadlines
             .expire(sample.nanoseconds, &mut timer_expiries);
         self.reprogram(sample)?;
-        self.apic
-            .end_of_interrupt(&mut self.registers)
-            .map_err(|_| LiveTimeError::ApicAccess)?;
+        current_local_apic_slot()?.end_of_interrupt()?;
         Ok(InterruptOutcome {
             wakes,
             wake_count,
@@ -428,8 +590,10 @@ pub(crate) fn initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY
     // Installing the LAPIC leaf is the first irreversible effect. Publish the
     // non-retryable state before crossing that boundary; success later replaces it.
     TIME_STATE.store(TimeInitState::Faulted as u8, Ordering::Release);
-    let state = commit_initialize(active, pm_descriptor, plan)?;
-    publish(state);
+    let committed = commit_initialize(active, pm_descriptor, plan)?;
+    LOCAL_APIC_SLOTS[CpuIndex::BOOTSTRAP.index()].publish(committed.local_apic)?;
+    bind_live_ipi_transport(&LIVE_IPI_TRANSPORT).map_err(|_| LiveTimeError::IpiTransport)?;
+    publish(committed.time);
     Ok(())
 }
 
@@ -465,11 +629,16 @@ fn publish(state: LiveTimeState) {
     TIME_STATE.store(TimeInitState::Initialized as u8, Ordering::Release);
 }
 
+struct CommittedLiveTimeState {
+    time: LiveTimeState,
+    local_apic: LiveLocalApicOwner,
+}
+
 fn commit_initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     active: &mut ActiveDeepPaging<LiveActivePagingTarget<'root, RANGE_CAPACITY, ROLE_CAPACITY>>,
     pm_descriptor: PmTimerDescriptor,
     plan: TimeInitPlan,
-) -> Result<LiveTimeState, LiveTimeError> {
+) -> Result<CommittedLiveTimeState, LiveTimeError> {
     let discovery = plan.discovery;
     let virtual_base = active
         .install_kernel_mmio_page(plan.frame)
@@ -497,17 +666,26 @@ fn commit_initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     if final_sample.nanoseconds <= initial_sample.nanoseconds {
         return Err(LiveTimeError::AcpiTimerDidNotAdvance);
     }
-    let mut state = LiveTimeState {
+    let state = LiveTimeState {
         pm,
-        apic,
-        registers,
         apic_timer_hz,
         deadlines: DeadlineQueue::new(),
         timer_deadlines: DeadlineQueue::new(),
         last_sample: final_sample,
     };
-    state.reprogram(final_sample)?;
-    Ok(state)
+    let next = state.next_deadline(final_sample);
+    let delta = next.saturating_sub(final_sample.nanoseconds);
+    let shot =
+        apic_one_shot_for_delta(delta, apic_timer_hz).map_err(|_| LiveTimeError::Deadline)?;
+    apic.program_one_shot_timer(&mut registers, shot.initial_count)
+        .map_err(|_| LiveTimeError::ApicAccess)?;
+    Ok(CommittedLiveTimeState {
+        time: state,
+        local_apic: LiveLocalApicOwner {
+            controller: apic,
+            registers,
+        },
+    })
 }
 
 fn calibrate_apic_timer(
@@ -595,19 +773,24 @@ pub(crate) fn monotonic_now() -> Result<u64, LiveTimeError> {
 }
 
 pub(crate) fn bsp_local_apic_identity() -> Result<(u8, u64), LiveTimeError> {
-    let state = live_state().ok_or(LiveTimeError::Clock)?;
-    let state = state.lock();
-    let id = state.apic.apic_id().ok_or(LiveTimeError::ApicAccess)?;
-    Ok((id, state.apic.discovery().physical_base()))
+    let identity = LOCAL_APIC_SLOTS[CpuIndex::BOOTSTRAP.index()]
+        .identity()
+        .ok_or(LiveTimeError::ApicAccess)?;
+    Ok((identity.local_apic_id, identity.physical_base))
 }
 
 /// Initializes the current application processor's xAPIC through the BSP's
 /// already-established permanent UC mapping. The scheduler timer remains
 /// masked under the H0 designated-timer-CPU policy.
 pub(crate) fn initialize_ap_local_apic(
+    cpu_index: usize,
     expected_apic_id: u8,
     expected_physical_base: u64,
 ) -> Result<(), LiveTimeError> {
+    let cpu = CpuIndex::new(cpu_index).ok_or(LiveTimeError::CpuIdentity)?;
+    if cpu == CpuIndex::BOOTSTRAP || installed_current_cpu_index()? != cpu {
+        return Err(LiveTimeError::CpuIdentity);
+    }
     let discovery = discover_local_apic().map_err(|_| LiveTimeError::ApicDiscovery)?;
     if discovery.is_bootstrap_processor()
         || discovery.mode() == ApicMode::X2Apic
@@ -615,10 +798,13 @@ pub(crate) fn initialize_ap_local_apic(
     {
         return Err(LiveTimeError::ApicMode);
     }
-    let virtual_base = {
-        let state = live_state().ok_or(LiveTimeError::Clock)?;
-        state.lock().registers.base()
-    };
+    let bsp_identity = LOCAL_APIC_SLOTS[CpuIndex::BOOTSTRAP.index()]
+        .identity()
+        .ok_or(LiveTimeError::ApicAccess)?;
+    if bsp_identity.physical_base != expected_physical_base {
+        return Err(LiveTimeError::ApicMapping);
+    }
+    let virtual_base = bsp_identity.virtual_base;
     let mut apic = LocalApic::discovered(discovery, LocalApicVectors::DW0);
     if discovery.mode() == ApicMode::Disabled {
         apic.enable_xapic(&mut LiveApicBaseMsr)
@@ -633,17 +819,33 @@ pub(crate) fn initialize_ap_local_apic(
     apic.bring_online(&mut registers)
         .map_err(|_| LiveTimeError::ApicAccess)?;
     apic.configure_one_shot_timer(&mut registers)
-        .map_err(|_| LiveTimeError::ApicAccess)
+        .map_err(|_| LiveTimeError::ApicAccess)?;
+    LOCAL_APIC_SLOTS[cpu.index()].publish(LiveLocalApicOwner {
+        controller: apic,
+        registers,
+    })?;
+    current_cpu_ipi_transport_ready(cpu_index)
+        .then_some(())
+        .ok_or(LiveTimeError::IpiTransport)
+}
+
+/// Proves that the current CPU has its private IDT/GS identity, stationary
+/// local-APIC slot, and the global send/EOI transport before it enables IF.
+fn current_cpu_ipi_transport_ready(expected_cpu_index: usize) -> bool {
+    let Some(expected) = CpuIndex::new(expected_cpu_index) else {
+        return false;
+    };
+    live_ipi_transport_is_bound()
+        && installed_current_cpu_index() == Ok(expected)
+        && LOCAL_APIC_SLOTS[expected.index()].identity().is_some()
 }
 
 pub(crate) fn send_bsp_ipi(destination: u8, operation: IpiOperation) -> Result<(), LiveTimeError> {
-    let state = live_state().ok_or(LiveTimeError::Clock)?;
-    let mut state = state.lock();
-    let LiveTimeState {
-        apic, registers, ..
-    } = &mut *state;
-    apic.send_ipi(registers, destination, operation)
-        .map_err(|_| LiveTimeError::ApicAccess)
+    with_bootstrap_local_apic(|controller, registers| {
+        controller
+            .send_ipi(registers, destination, operation)
+            .map_err(|_| LiveTimeError::ApicAccess)
+    })
 }
 
 pub(crate) fn busy_wait_nanoseconds(delay: u64) -> Result<(), LiveTimeError> {
@@ -686,6 +888,9 @@ pub(crate) fn cancel_deadline(registration: DeadlineRegistration) -> Result<(), 
 )]
 #[unsafe(no_mangle)]
 pub(crate) extern "sysv64" fn dw_x86_64_timer_interrupt_dispatch() {
+    if installed_current_cpu_index() != Ok(CpuIndex::BOOTSTRAP) {
+        halt_forever();
+    }
     let Some(state) = live_state() else {
         halt_forever();
     };

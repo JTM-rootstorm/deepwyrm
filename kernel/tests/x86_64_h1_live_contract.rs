@@ -35,17 +35,22 @@ fn ap_entry_publishes_only_after_private_architecture_and_local_apic_state() {
     let entry = source.find("fn dw_x86_64_ap_higher_half_entry").unwrap();
     let body = &source[entry..];
     let private = body.find("initialize_ap_runtime_slot(cpu_index)").unwrap();
-    let apic = body.find("initialize_ap_local_apic").unwrap();
+    let apic = body
+        .find("initialize_ap_local_apic(cpu_index, local_apic_id, local_apic_base)")
+        .unwrap();
     let online = body.find("publish_online(cpu_index").unwrap();
     let parked = body.find(".park(cpu_index)").unwrap();
-    let halt = body.find("park_h1_application_processor()").unwrap();
+    let idle = body.find("idle_h2_application_processor()").unwrap();
+    let failure_halt = body.find("park_h1_application_processor()").unwrap();
 
     assert!(private < apic);
     assert!(apic < online);
     assert!(online < parked);
+    assert!(parked < idle);
     assert!(source.contains("core::arch::asm!(\"cli; hlt\""));
+    assert!(source.contains("core::arch::asm!(\"sti; hlt; cli\""));
     assert!(
-        halt < private,
+        failure_halt < private,
         "validation failures must park before initialization"
     );
 }

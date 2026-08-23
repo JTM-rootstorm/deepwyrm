@@ -121,6 +121,11 @@ unsafe impl<T: Sync> Sync for BindingSlot<T> {}
 static TRANSPORT: BindingSlot<TransportBinding> = BindingSlot::new();
 static HANDLERS: BindingSlot<HandlerBinding> = BindingSlot::new();
 
+/// Reports whether the immutable send/EOI transport has been published.
+pub(crate) fn live_ipi_transport_is_bound() -> bool {
+    TRANSPORT.get().is_some()
+}
+
 /// Publishes the persistent per-CPU-aware APIC transport exactly once.
 pub(crate) fn bind_live_ipi_transport<T: LiveIpiTransport + 'static>(
     transport: &'static T,
@@ -299,7 +304,9 @@ mod tests {
 
     #[test]
     fn bound_transport_sends_and_eois_before_each_protocol_callback() {
+        assert!(!live_ipi_transport_is_bound());
         bind_live_ipi_transport(&MOCK_TRANSPORT).unwrap();
+        assert!(live_ipi_transport_is_bound());
         bind_live_ipi_handlers(rendezvous_handler, shootdown_handler).unwrap();
 
         send_live_ipi(7, LiveIpiVector::Rendezvous).unwrap();

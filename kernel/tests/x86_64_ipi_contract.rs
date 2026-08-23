@@ -122,6 +122,88 @@ fn h2_h3_receive_seam_eois_before_capability_free_protocol_callbacks() {
 }
 
 #[test]
+fn h2_live_transport_has_stationary_cpu_slots_and_lock_free_receive_eoi() {
+    let live = source("src/time/live.rs");
+    for evidence in [
+        "static LOCAL_APIC_SLOTS: [PerCpuLocalApicSlot; CPU_CAPACITY]",
+        "current_cpu_index_for_diagnostics()",
+        "CpuIndex::new",
+        "IrqSpinMutex<Option<LiveLocalApicOwner>>",
+        "bind_live_ipi_transport(&LIVE_IPI_TRANSPORT)",
+        "IpiOperation::Fixed",
+        "const XAPIC_EOI_REGISTER: u32 = 0x0b0",
+    ] {
+        assert!(
+            live.contains(evidence),
+            "live IPI transport omitted `{evidence}`"
+        );
+    }
+
+    let eoi = live
+        .split_once("fn end_of_interrupt(&self) -> Result<(), LiveTimeError>")
+        .expect("lock-free per-CPU EOI")
+        .1
+        .split_once("static LOCAL_APIC_SLOTS")
+        .expect("per-CPU EOI extent")
+        .0;
+    assert!(eoi.contains("self.identity()"));
+    assert!(eoi.contains("XAPIC_EOI_REGISTER, 0"));
+    assert!(!eoi.contains("self.owner.lock()"));
+
+    let time_state = live
+        .split_once("struct LiveTimeState")
+        .expect("live time state")
+        .1
+        .split_once("impl LiveTimeState")
+        .expect("live time state extent")
+        .0;
+    assert!(!time_state.contains("apic: LocalApic"));
+    assert!(!time_state.contains("registers: LiveXApicMmio"));
+}
+
+#[test]
+fn h2_bsp_timer_and_ap_idle_publish_in_fail_closed_order() {
+    let live = source("src/time/live.rs");
+    let initialize = live
+        .split_once("pub(crate) fn initialize<'root")
+        .expect("live time initializer")
+        .1
+        .split_once("struct TimeInitPlan")
+        .expect("live time initializer extent")
+        .0;
+    let slot = initialize
+        .find("LOCAL_APIC_SLOTS[CpuIndex::BOOTSTRAP.index()].publish")
+        .expect("BSP LAPIC slot publication");
+    let transport = initialize
+        .find("bind_live_ipi_transport(&LIVE_IPI_TRANSPORT)")
+        .expect("live IPI transport publication");
+    let time = initialize
+        .find("publish(committed.time)")
+        .expect("time service publication");
+    assert!(slot < transport && transport < time);
+
+    let ap_init = live
+        .split_once("pub(crate) fn initialize_ap_local_apic")
+        .expect("AP local APIC initializer")
+        .1
+        .split_once("pub(crate) fn send_bsp_ipi")
+        .expect("AP local APIC initializer extent")
+        .0;
+    let masked = ap_init
+        .find("configure_one_shot_timer")
+        .expect("masked AP timer setup");
+    let publish = ap_init
+        .find("LOCAL_APIC_SLOTS[cpu.index()].publish")
+        .expect("AP LAPIC publication");
+    let ready = ap_init
+        .find("current_cpu_ipi_transport_ready(cpu_index)")
+        .expect("AP transport readiness check");
+    assert!(masked < publish && publish < ready);
+    assert!(live.contains("installed_current_cpu_index()? != CpuIndex::BOOTSTRAP"));
+    assert!(live.contains("installed_current_cpu_index() != Ok(CpuIndex::BOOTSTRAP)"));
+}
+
+#[test]
 fn h2_h3_production_assembly_object_retains_both_exact_returning_entries() {
     let clang = env::var_os("DEEPWYRM_CLANG").unwrap_or_else(|| "clang".into());
     let objdump =

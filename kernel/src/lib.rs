@@ -129,7 +129,7 @@ const H1_AP_PARK_POLL_LIMIT: usize = 10_000_000;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[allow(
     unsafe_code,
-    reason = "an H1 application processor has no scheduler ownership and parks forever with IF clear"
+    reason = "an AP initialization failure cannot enable interrupts or resume shared execution"
 )]
 fn park_h1_application_processor() -> ! {
     loop {
@@ -137,6 +137,22 @@ fn park_h1_application_processor() -> ! {
         // clear prevents them from entering shared runtime state before H2.
         unsafe {
             core::arch::asm!("cli; hlt", options(nomem, nostack));
+        }
+    }
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "an initialized H2 AP uses the STI-HLT interrupt shadow to sleep without losing a fixed-IPI wake"
+)]
+fn idle_h2_application_processor() -> ! {
+    loop {
+        // SAFETY: the AP has a private runtime IDT/GS boundary and stationary
+        // local-APIC EOI owner before entering this path. STI;HLT closes the
+        // wake race; CLI restores IF-clear state between idle iterations.
+        unsafe {
+            core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
         }
     }
 }
@@ -179,7 +195,7 @@ extern "sysv64" fn dw_x86_64_ap_higher_half_entry(cpu_index: u32, local_apic_id:
     let Ok(local_apic_base) = arch::x86_64::smp::live_local_apic_physical_base() else {
         fail_h1_application_processor(cpu_index, 0x103);
     };
-    if time::initialize_ap_local_apic(local_apic_id, local_apic_base).is_err() {
+    if time::initialize_ap_local_apic(cpu_index, local_apic_id, local_apic_base).is_err() {
         fail_h1_application_processor(cpu_index, 0x104);
     }
     if registry
@@ -195,7 +211,7 @@ extern "sysv64" fn dw_x86_64_ap_higher_half_entry(cpu_index: u32, local_apic_id:
     }
     #[cfg(not(feature = "test-support"))]
     let _ = debug::emit_early_cpu_state_record(cpu_index, local_apic_id, "parked");
-    park_h1_application_processor()
+    idle_h2_application_processor()
 }
 
 /// Transfers from the raw architecture entry into validated DW0-B bring-up.
