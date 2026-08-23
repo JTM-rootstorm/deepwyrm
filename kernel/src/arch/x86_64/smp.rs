@@ -1,0 +1,357 @@
+//! Bounded AP-startup and per-CPU architectural-storage model for DW0-H1.
+
+#![allow(
+    dead_code,
+    reason = "H1 publishes this bounded substrate before the serialized live AP-startup join wires each operation"
+)]
+
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+
+use super::acpi::MAX_DW0_CPUS;
+
+pub(crate) const PAGE_SIZE: u64 = 4096;
+pub(crate) const AP_TRAMPOLINE_LIMIT: u64 = 0x10_0000;
+pub(crate) const AP_TRAMPOLINE_MAX_BYTES: u64 = PAGE_SIZE;
+pub(crate) const AP_BOOTSTRAP_STACK_BYTES: u64 = 64 * 1024;
+pub(crate) const IST_STACK_BYTES: u64 = 16 * 1024;
+pub(crate) const PRIVILEGE_ENTRY_STACK_BYTES: u64 = 16 * 1024;
+pub(crate) const TERMINAL_REAPER_STACK_BYTES: u64 = 128 * 1024;
+
+const STACKS_PER_CPU_BYTES: u64 = 3 * (PAGE_SIZE + IST_STACK_BYTES)
+    + PAGE_SIZE
+    + PRIVILEGE_ENTRY_STACK_BYTES
+    + PAGE_SIZE
+    + TERMINAL_REAPER_STACK_BYTES
+    + PAGE_SIZE
+    + AP_BOOTSTRAP_STACK_BYTES;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum CpuLifecycle {
+    Discovered = 0,
+    Starting = 1,
+    Online = 2,
+    Parked = 3,
+    Executing = 4,
+    Stopping = 5,
+    Offline = 6,
+    Failed = 7,
+}
+
+impl CpuLifecycle {
+    const fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Discovered),
+            1 => Some(Self::Starting),
+            2 => Some(Self::Online),
+            3 => Some(Self::Parked),
+            4 => Some(Self::Executing),
+            5 => Some(Self::Stopping),
+            6 => Some(Self::Offline),
+            7 => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CpuSlotState {
+    lifecycle: AtomicU8,
+    local_apic_id: AtomicU8,
+    online_generation: AtomicU64,
+    failure_reason: AtomicU32,
+}
+
+impl CpuSlotState {
+    pub(crate) const fn new() -> Self {
+        Self {
+            lifecycle: AtomicU8::new(CpuLifecycle::Offline as u8),
+            local_apic_id: AtomicU8::new(0),
+            online_generation: AtomicU64::new(0),
+            failure_reason: AtomicU32::new(0),
+        }
+    }
+
+    pub(crate) fn discover(&self, local_apic_id: u8) -> Result<(), CpuStateError> {
+        self.lifecycle
+            .compare_exchange(
+                CpuLifecycle::Offline as u8,
+                CpuLifecycle::Discovered as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|observed| CpuStateError::UnexpectedState(observed))?;
+        self.local_apic_id.store(local_apic_id, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(crate) fn begin_start(&self) -> Result<(), CpuStateError> {
+        self.transition(CpuLifecycle::Discovered, CpuLifecycle::Starting)
+    }
+
+    /// Publishes all private architectural initialization performed before this call.
+    pub(crate) fn publish_online(&self, generation: u64) -> Result<(), CpuStateError> {
+        if generation == 0 {
+            return Err(CpuStateError::ZeroGeneration);
+        }
+        self.online_generation.store(generation, Ordering::Relaxed);
+        self.transition(CpuLifecycle::Starting, CpuLifecycle::Online)
+    }
+
+    pub(crate) fn park(&self) -> Result<(), CpuStateError> {
+        self.transition(CpuLifecycle::Online, CpuLifecycle::Parked)
+    }
+
+    pub(crate) fn fail(&self, reason: u32) -> Result<(), CpuStateError> {
+        if reason == 0 {
+            return Err(CpuStateError::ZeroFailureReason);
+        }
+        self.failure_reason.store(reason, Ordering::Relaxed);
+        let observed = self.lifecycle.load(Ordering::Acquire);
+        if observed != CpuLifecycle::Starting as u8 && observed != CpuLifecycle::Discovered as u8 {
+            return Err(CpuStateError::UnexpectedState(observed));
+        }
+        self.lifecycle
+            .compare_exchange(
+                observed,
+                CpuLifecycle::Failed as u8,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .map_err(CpuStateError::UnexpectedState)?;
+        Ok(())
+    }
+
+    pub(crate) fn snapshot(&self) -> Result<CpuStateSnapshot, CpuStateError> {
+        let lifecycle = CpuLifecycle::from_raw(self.lifecycle.load(Ordering::Acquire))
+            .ok_or(CpuStateError::CorruptState)?;
+        Ok(CpuStateSnapshot {
+            lifecycle,
+            local_apic_id: self.local_apic_id.load(Ordering::Relaxed),
+            online_generation: self.online_generation.load(Ordering::Relaxed),
+            failure_reason: self.failure_reason.load(Ordering::Relaxed),
+        })
+    }
+
+    fn transition(&self, expected: CpuLifecycle, next: CpuLifecycle) -> Result<(), CpuStateError> {
+        self.lifecycle
+            .compare_exchange(
+                expected as u8,
+                next as u8,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(CpuStateError::UnexpectedState)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CpuStateSnapshot {
+    pub(crate) lifecycle: CpuLifecycle,
+    pub(crate) local_apic_id: u8,
+    pub(crate) online_generation: u64,
+    pub(crate) failure_reason: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CpuStateError {
+    UnexpectedState(u8),
+    CorruptState,
+    ZeroGeneration,
+    ZeroFailureReason,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GuardedStack {
+    pub(crate) guard: u64,
+    pub(crate) bottom: u64,
+    pub(crate) top: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PerCpuStackLayout {
+    pub(crate) interrupt_stacks: [GuardedStack; 3],
+    pub(crate) privilege_entry: GuardedStack,
+    pub(crate) terminal_reaper: GuardedStack,
+    pub(crate) ap_bootstrap: GuardedStack,
+}
+
+impl PerCpuStackLayout {
+    pub(crate) fn from_arena(
+        arena_start: u64,
+        cpu_index: usize,
+    ) -> Result<Self, PerCpuLayoutError> {
+        if cpu_index >= MAX_DW0_CPUS || !arena_start.is_multiple_of(PAGE_SIZE) {
+            return Err(PerCpuLayoutError::InvalidInput);
+        }
+        let slot_start = (cpu_index as u64)
+            .checked_mul(STACKS_PER_CPU_BYTES)
+            .and_then(|offset| arena_start.checked_add(offset))
+            .ok_or(PerCpuLayoutError::Overflow)?;
+        let mut cursor = slot_start;
+        let interrupt_stacks = [
+            next_stack(&mut cursor, IST_STACK_BYTES)?,
+            next_stack(&mut cursor, IST_STACK_BYTES)?,
+            next_stack(&mut cursor, IST_STACK_BYTES)?,
+        ];
+        let privilege_entry = next_stack(&mut cursor, PRIVILEGE_ENTRY_STACK_BYTES)?;
+        let terminal_reaper = next_stack(&mut cursor, TERMINAL_REAPER_STACK_BYTES)?;
+        let ap_bootstrap = next_stack(&mut cursor, AP_BOOTSTRAP_STACK_BYTES)?;
+        if cursor != slot_start + STACKS_PER_CPU_BYTES {
+            return Err(PerCpuLayoutError::Overflow);
+        }
+        Ok(Self {
+            interrupt_stacks,
+            privilege_entry,
+            terminal_reaper,
+            ap_bootstrap,
+        })
+    }
+
+    pub(crate) const fn arena_bytes() -> u64 {
+        STACKS_PER_CPU_BYTES * MAX_DW0_CPUS as u64
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PerCpuLayoutError {
+    InvalidInput,
+    Overflow,
+}
+
+fn next_stack(cursor: &mut u64, bytes: u64) -> Result<GuardedStack, PerCpuLayoutError> {
+    let guard = *cursor;
+    let bottom = guard
+        .checked_add(PAGE_SIZE)
+        .ok_or(PerCpuLayoutError::Overflow)?;
+    let top = bottom
+        .checked_add(bytes)
+        .ok_or(PerCpuLayoutError::Overflow)?;
+    *cursor = top;
+    Ok(GuardedStack { guard, bottom, top })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TrampolinePlan {
+    pub(crate) physical_start: u64,
+    pub(crate) byte_len: u16,
+    pub(crate) startup_vector: u8,
+    pub(crate) page_table_root: u64,
+    pub(crate) higher_half_entry: u64,
+}
+
+impl TrampolinePlan {
+    pub(crate) fn new(
+        physical_start: u64,
+        byte_len: u64,
+        page_table_root: u64,
+        higher_half_entry: u64,
+    ) -> Result<Self, TrampolinePlanError> {
+        let physical_end = physical_start
+            .checked_add(byte_len)
+            .ok_or(TrampolinePlanError::Overflow)?;
+        if physical_start < PAGE_SIZE
+            || !physical_start.is_multiple_of(PAGE_SIZE)
+            || byte_len == 0
+            || byte_len > AP_TRAMPOLINE_MAX_BYTES
+            || physical_end > AP_TRAMPOLINE_LIMIT
+        {
+            return Err(TrampolinePlanError::InvalidPlacement);
+        }
+        if !page_table_root.is_multiple_of(PAGE_SIZE) || page_table_root >= 1_u64 << 32 {
+            return Err(TrampolinePlanError::InvalidPageTableRoot);
+        }
+        if higher_half_entry < 0xffff_8000_0000_0000 {
+            return Err(TrampolinePlanError::InvalidEntry);
+        }
+        Ok(Self {
+            physical_start,
+            byte_len: byte_len as u16,
+            startup_vector: (physical_start >> 12) as u8,
+            page_table_root,
+            higher_half_entry,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TrampolinePlanError {
+    Overflow,
+    InvalidPlacement,
+    InvalidPageTableRoot,
+    InvalidEntry,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_publication_is_monotonic_and_generation_bound() {
+        let slot = CpuSlotState::new();
+        slot.discover(9).unwrap();
+        slot.begin_start().unwrap();
+        assert_eq!(slot.publish_online(0), Err(CpuStateError::ZeroGeneration));
+        slot.publish_online(3).unwrap();
+        slot.park().unwrap();
+        assert_eq!(
+            slot.snapshot().unwrap(),
+            CpuStateSnapshot {
+                lifecycle: CpuLifecycle::Parked,
+                local_apic_id: 9,
+                online_generation: 3,
+                failure_reason: 0,
+            }
+        );
+        assert!(slot.begin_start().is_err());
+
+        let failed = CpuSlotState::new();
+        failed.discover(10).unwrap();
+        assert_eq!(failed.fail(0), Err(CpuStateError::ZeroFailureReason));
+        failed.fail(0x21).unwrap();
+        assert_eq!(failed.snapshot().unwrap().lifecycle, CpuLifecycle::Failed);
+        assert_eq!(failed.snapshot().unwrap().failure_reason, 0x21);
+    }
+
+    #[test]
+    fn every_cpu_stack_and_guard_range_is_private() {
+        let base = 0xffff_9000_0000_0000;
+        assert_eq!(
+            PerCpuStackLayout::arena_bytes(),
+            STACKS_PER_CPU_BYTES * MAX_DW0_CPUS as u64
+        );
+        let first = PerCpuStackLayout::from_arena(base, 0).unwrap();
+        let second = PerCpuStackLayout::from_arena(base, 1).unwrap();
+        assert!(first.ap_bootstrap.top <= second.interrupt_stacks[0].guard);
+        for layout in [first, second] {
+            let stacks = [
+                layout.interrupt_stacks[0],
+                layout.interrupt_stacks[1],
+                layout.interrupt_stacks[2],
+                layout.privilege_entry,
+                layout.terminal_reaper,
+                layout.ap_bootstrap,
+            ];
+            for pair in stacks.windows(2) {
+                assert_eq!(pair[0].top, pair[1].guard);
+            }
+            assert!(stacks.iter().all(|stack| {
+                stack.bottom - stack.guard == PAGE_SIZE
+                    && stack.guard.is_multiple_of(PAGE_SIZE)
+                    && stack.top.is_multiple_of(16)
+            }));
+        }
+    }
+
+    #[test]
+    fn trampoline_is_one_low_nonzero_page_with_32_bit_cr3() {
+        let plan = TrampolinePlan::new(0x8000, 2048, 0x20_0000, 0xffff_8000_0010_0000).unwrap();
+        assert_eq!(plan.startup_vector, 8);
+        assert_eq!(plan.byte_len, 2048);
+        assert!(TrampolinePlan::new(0, 1, 0x1000, plan.higher_half_entry).is_err());
+        assert!(TrampolinePlan::new(0x8000, 4097, 0x1000, plan.higher_half_entry).is_err());
+        assert!(TrampolinePlan::new(0x8000, 1, 1_u64 << 32, plan.higher_half_entry).is_err());
+        assert!(TrampolinePlan::new(0x8000, 1, 0x1000, 0x400000).is_err());
+    }
+}
