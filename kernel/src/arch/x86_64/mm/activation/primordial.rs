@@ -907,10 +907,32 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
 /// BSP execution carrier. Plain mutable authorities remain exclusively owned
 /// here because their adapter surfaces do not yet provide transactional
 /// interior synchronization. AP carriers cannot name or borrow this state.
+enum CarrierActiveRoot {
+    Process(super::ActiveRootSelection),
+    Kernel(super::ActiveKernelExecutionRoot),
+    Transitioning,
+}
+
+impl CarrierActiveRoot {
+    fn as_ref(&self) -> Option<&super::ActiveRootSelection> {
+        match self {
+            Self::Process(root) => Some(root),
+            Self::Kernel(_) | Self::Transitioning => None,
+        }
+    }
+
+    fn take_process(&mut self) -> super::ActiveRootSelection {
+        match core::mem::replace(self, Self::Transitioning) {
+            Self::Process(root) => root,
+            Self::Kernel(_) | Self::Transitioning => panic!("carrier has no active Process root"),
+        }
+    }
+}
+
 struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
     cpu: crate::cpu::CpuIndex,
     active: ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
-    active_root: Option<super::ActiveRootSelection>,
+    active_root: CarrierActiveRoot,
     registry: Registry,
     memory: Memory,
     tasks: Tasks,
@@ -1064,7 +1086,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .active
             .prepare_process_root_selection(self.cpu, process, address_space)
             .unwrap_or_else(|error| panic!("could not prepare scheduler-current root: {error:?}"));
-        let previous = self.active_root.take();
+        let previous = Some(self.active_root.take_process());
         let selected = match self
             .active
             .activate_process_root_selection(prepared, previous)
@@ -1077,7 +1099,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     .unwrap_or_else(|abandon| {
                         panic!("failed root selection could not be abandoned: {abandon:?}")
                     });
-                self.active_root = previous;
+                self.active_root = CarrierActiveRoot::Process(previous.unwrap_or_else(|| {
+                    panic!("runtime carrier lost its Process root during activation rollback")
+                }));
                 panic!("could not activate scheduler-current root: {error:?}");
             }
         };
@@ -1088,7 +1112,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.root_key = root_key;
         self.stack_id = stack_id;
         self.context_id = context_id;
-        self.active_root = Some(selected);
+        self.active_root = CarrierActiveRoot::Process(selected);
     }
 
     fn merge_cleanup(&mut self, cleanup: CleanupQueue<REGISTRY_OBJECTS>) {
@@ -1409,7 +1433,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     self.primordial_address_space,
                 )
                 .map_err(|_| ())?;
-            let previous = self.active_root.take();
+            let previous = Some(self.active_root.take_process());
             let selected = match self
                 .active
                 .activate_process_root_selection(prepared, previous)
@@ -1422,11 +1446,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         .unwrap_or_else(|error| {
                             panic!("terminal safe-root rollback drifted: {error:?}")
                         });
-                    self.active_root = previous;
+                    self.active_root = CarrierActiveRoot::Process(previous.unwrap_or_else(|| {
+                        panic!("runtime carrier lost its Process root during activation rollback")
+                    }));
                     return Err(());
                 }
             };
-            self.active_root = Some(selected);
+            self.active_root = CarrierActiveRoot::Process(selected);
             self.unmap_inactive_userspace(self.process, self.root_key, &proof)?;
             self.active
                 .teardown_empty_child_address_space(self.process, address_space)
@@ -1894,7 +1920,7 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     let mut runtime = PrimordialRuntimeCarrier {
         cpu: crate::cpu::CpuIndex::BOOTSTRAP,
         active,
-        active_root: Some(initial_root),
+        active_root: CarrierActiveRoot::Process(initial_root),
         registry,
         memory,
         tasks,
