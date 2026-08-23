@@ -901,6 +901,11 @@ unsafe fn native_runtime_trampoline<R: crate::syscall::native::NativeSyscallFram
     context: *mut (),
     frame: &mut RawSyscallFrame,
 ) {
+    if !crate::time::timer_service_is_healthy()
+        || !crate::arch::x86_64::idle::live_idle_wake_is_healthy()
+    {
+        halt_forever();
+    }
     let control = {
         let runtime = unsafe { &mut *context.cast::<R>() };
         crate::syscall::native::dispatch_frame(runtime, frame, current_binding_generation())
@@ -926,6 +931,8 @@ unsafe fn native_runtime_trampoline<R: crate::syscall::native::NativeSyscallFram
                     switch_kernel_context(plan);
                 }
                 crate::syscall::native::NativeSuspendPlan::IdleCurrent => loop {
+                    let idle = crate::arch::x86_64::idle::prepare_current_idle()
+                        .unwrap_or_else(|_| halt_forever());
                     let poll = {
                         let runtime = unsafe { &mut *context.cast::<R>() };
                         // SAFETY: this loop has not left the suspended current
@@ -935,10 +942,25 @@ unsafe fn native_runtime_trampoline<R: crate::syscall::native::NativeSyscallFram
                     };
                     match poll {
                         crate::syscall::native::NativeIdleSuspendPoll::Continue => {
+                            // SYSCALL FMASK keeps IF clear from the final
+                            // scheduler rescan through this commit. The only
+                            // re-enable is the atomic sti; hlt sequence below,
+                            // so an e1 Wake cannot be consumed and lost in
+                            // between publication and the architectural halt.
+                            let halt = crate::arch::x86_64::idle::commit_current_idle(idle)
+                                .unwrap_or_else(|_| halt_forever());
                             wait_for_suspend_interrupt();
+                            crate::arch::x86_64::idle::finish_current_idle(halt)
+                                .unwrap_or_else(|_| halt_forever());
                         }
-                        crate::syscall::native::NativeIdleSuspendPoll::ResumeCurrent => break,
+                        crate::syscall::native::NativeIdleSuspendPoll::ResumeCurrent => {
+                            crate::arch::x86_64::idle::cancel_current_idle(idle)
+                                .unwrap_or_else(|_| halt_forever());
+                            break;
+                        }
                         crate::syscall::native::NativeIdleSuspendPoll::Switch(plan) => {
+                            crate::arch::x86_64::idle::cancel_current_idle(idle)
+                                .unwrap_or_else(|_| halt_forever());
                             switch_kernel_context(plan);
                             break;
                         }

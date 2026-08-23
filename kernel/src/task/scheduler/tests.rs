@@ -468,6 +468,56 @@ fn pending_block_preparation_is_retired_with_running_thread() {
 }
 
 #[test]
+fn h4_remote_wake_and_terminal_retirement_never_revive_the_thread() {
+    let mut registry = ObjectRegistry::<16>::new();
+    for iteration in 0..2_000 {
+        let scheduler = Arc::new(CooperativeScheduler::<1>::new());
+        let thread_key = thread_key(&mut registry);
+        let reservation = scheduler.reserve(thread_key).unwrap();
+        scheduler.commit(reservation).unwrap();
+        scheduler.schedule_next_on(cpu(1)).unwrap();
+        let (blocked, decision) = scheduler.block_current_on(cpu(1), thread_key).unwrap();
+        assert_eq!(decision.current, None);
+        let wake = blocked.into_wake_key();
+        let suspended = scheduler.suspended_claim_on(cpu(1)).unwrap();
+        let start = Arc::new(Barrier::new(3));
+
+        let wake_scheduler = Arc::clone(&scheduler);
+        let wake_start = Arc::clone(&start);
+        let wake_worker = thread::spawn(move || {
+            wake_start.wait();
+            wake_scheduler.wake(wake)
+        });
+        let terminal_scheduler = Arc::clone(&scheduler);
+        let terminal_start = Arc::clone(&start);
+        let terminal_worker = thread::spawn(move || {
+            terminal_start.wait();
+            terminal_scheduler.retire_on(cpu(1), thread_key)
+        });
+        start.wait();
+
+        let wake_result = wake_worker.join().unwrap();
+        let terminal_result = terminal_worker.join().unwrap();
+        assert!(
+            matches!(wake_result, Ok(()) | Err(SchedulerError::StaleBlockToken)),
+            "iteration={iteration} wake={wake_result:?}"
+        );
+        assert!(
+            terminal_result.is_ok(),
+            "iteration={iteration} terminal={terminal_result:?}"
+        );
+        assert_eq!(scheduler.state(thread_key), None, "iteration={iteration}");
+        assert_eq!(
+            scheduler.wake(wake),
+            Err(SchedulerError::StaleBlockToken),
+            "iteration={iteration}"
+        );
+        scheduler.complete_switch_on(suspended).unwrap();
+        assert_eq!(scheduler.check_invariants(), Ok(()));
+    }
+}
+
+#[test]
 fn idle_scheduler_continues_then_resumes_exact_woken_waiter() {
     let scheduler = CooperativeScheduler::<1>::new();
     let mut registry = ObjectRegistry::<16>::new();

@@ -275,18 +275,22 @@ pub(crate) struct RendezvousMailbox {
 }
 
 impl RendezvousMailbox {
-    pub(crate) const fn new(target_cpu: usize) -> Option<Self> {
-        let target_cpu = match CpuIndex::new(target_cpu) {
-            Some(cpu) => cpu,
-            None => return None,
-        };
-        Some(Self {
+    pub(super) const fn for_cpu(target_cpu: CpuIndex) -> Self {
+        Self {
             target_cpu,
             state: AtomicU8::new(MAILBOX_IDLE),
             next_generation: AtomicU64::new(1),
             wake_pending: AtomicBool::new(false),
             request: IrqSpinMutex::new(None),
-        })
+        }
+    }
+
+    pub(crate) const fn new(target_cpu: usize) -> Option<Self> {
+        let target_cpu = match CpuIndex::new(target_cpu) {
+            Some(cpu) => cpu,
+            None => return None,
+        };
+        Some(Self::for_cpu(target_cpu))
     }
 
     #[cfg(test)]

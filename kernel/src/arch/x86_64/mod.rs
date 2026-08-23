@@ -14,6 +14,11 @@ pub(crate) mod context;
 pub mod entry;
 pub mod exceptions;
 pub mod gdt;
+#[allow(
+    dead_code,
+    reason = "H4 idle-wake publication is live-bound only after the shared scheduler carrier is enabled on a CPU"
+)]
+pub(crate) mod idle;
 pub mod idt;
 #[allow(
     dead_code,

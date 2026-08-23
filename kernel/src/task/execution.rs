@@ -599,7 +599,11 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         &self,
         thread: ThreadKey,
     ) -> Result<super::ScheduleDecision, SchedulerError> {
-        self.scheduler.yield_current(thread)
+        let decision = self.scheduler.yield_current(thread)?;
+        if decision.current != decision.previous {
+            super::notify_runnable_work();
+        }
+        Ok(decision)
     }
 
     pub(crate) fn yield_current_on(
@@ -607,7 +611,11 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         cpu: SchedulerCpuId,
         thread: ThreadKey,
     ) -> Result<super::ScheduleDecision, SchedulerError> {
-        self.scheduler.yield_current_on(cpu, thread)
+        let decision = self.scheduler.yield_current_on(cpu, thread)?;
+        if decision.current != decision.previous {
+            super::notify_runnable_work();
+        }
+        Ok(decision)
     }
 
     pub(crate) fn schedule_from_idle(
@@ -689,7 +697,9 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         &self,
         claim: SchedulerExecutionClaim,
     ) -> Result<(), SchedulerError> {
-        self.scheduler.complete_switch_on(claim)
+        self.scheduler.complete_switch_on(claim)?;
+        super::notify_runnable_work();
+        Ok(())
     }
 
     pub(crate) fn running_claim_on(&self, cpu: SchedulerCpuId) -> Option<SchedulerExecutionClaim> {
@@ -704,7 +714,9 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     }
 
     pub(crate) fn wake(&self, key: BlockWakeKey) -> Result<(), SchedulerError> {
-        self.scheduler.wake(key)
+        self.scheduler.wake(key)?;
+        super::notify_runnable_work();
+        Ok(())
     }
 
     pub(crate) fn validate_issued_wake_key(&self, key: BlockWakeKey) -> Result<(), SchedulerError> {
@@ -1369,6 +1381,7 @@ impl<const CAPACITY: usize> PreparedThreadStart<'_, CAPACITY> {
                     failure.error()
                 )
             });
+        super::notify_runnable_work();
         self.completed = true;
     }
 

@@ -493,6 +493,11 @@ impl<RESOURCES> Drop for BlockedOperation<RESOURCES> {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
     use super::*;
     use crate::memory::user_range::{EmptyAddressRule, UserAccess, UserAddressSpace, UserRange};
     use crate::memory::usercopy::{UserPinError, UserPinTracker};
@@ -709,6 +714,51 @@ mod tests {
             Ok(false)
         );
         assert_eq!(operation.complete_with(&registry, signal, |_| ()), Ok(()));
+    }
+
+    #[test]
+    fn h4_cross_cpu_signal_timeout_race_has_one_exact_winner() {
+        for iteration in 0..2_000 {
+            let (process, thread_key, wake) = keys();
+            let registry = Arc::new(BlockedOperationRegistry::<1>::new());
+            let operation =
+                BlockedOperation::publish(&registry, process, thread_key, wake, iteration).unwrap();
+            let signal = BlockedOperationWinner::Signal {
+                item_index: 2,
+                observed: DwSignals(0x40),
+            };
+            let start = Arc::new(Barrier::new(3));
+            let signal_registry = Arc::clone(&registry);
+            let signal_start = Arc::clone(&start);
+            let signal_worker = thread::spawn(move || {
+                signal_start.wait();
+                signal_registry.try_claim_winner(wake, signal)
+            });
+            let timeout_registry = Arc::clone(&registry);
+            let timeout_start = Arc::clone(&start);
+            let timeout_worker = thread::spawn(move || {
+                timeout_start.wait();
+                timeout_registry.try_claim_winner(wake, BlockedOperationWinner::Timeout)
+            });
+            start.wait();
+            let signal_won = signal_worker.join().unwrap().unwrap();
+            let timeout_won = timeout_worker.join().unwrap().unwrap();
+            assert_ne!(signal_won, timeout_won, "iteration={iteration}");
+            let winner = registry.winner(wake).unwrap().unwrap();
+            assert_eq!(
+                winner,
+                if signal_won {
+                    signal
+                } else {
+                    BlockedOperationWinner::Timeout
+                }
+            );
+            assert_eq!(
+                operation.complete_with(&registry, winner, core::convert::identity),
+                Ok(iteration)
+            );
+            assert!(!registry.has_thread(thread_key));
+        }
     }
 
     #[test]

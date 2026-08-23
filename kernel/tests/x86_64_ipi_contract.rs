@@ -127,10 +127,11 @@ fn h2_h3_receive_seam_eois_before_capability_free_protocol_callbacks() {
 fn h4_remote_deadline_mutation_notifies_only_the_bsp_timer_service_over_e1() {
     let live = source("src/time/live.rs");
     for evidence in [
-        "static BSP_TIMER_SERVICE_PENDING: AtomicBool",
-        "BSP_TIMER_SERVICE_PENDING.store(true, Ordering::Release)",
+        "static BSP_TIMER_SERVICE: TimerServiceSignal",
+        ".publish()",
         "send_live_ipi(bsp.local_apic_id, LiveIpiVector::Rendezvous)",
-        "BSP_TIMER_SERVICE_PENDING.swap(false, Ordering::AcqRel)",
+        "BSP_TIMER_SERVICE.fail_transport()",
+        "match BSP_TIMER_SERVICE.take()",
         "installed_current_cpu_index() == Ok(CpuIndex::BOOTSTRAP)",
         "bind_live_rendezvous_handler(live_rendezvous_handler)",
     ] {
@@ -149,6 +150,14 @@ fn h4_remote_deadline_mutation_notifies_only_the_bsp_timer_service_over_e1() {
         .0;
     assert!(request.contains("LiveIpiVector::Rendezvous"));
     assert!(!request.contains("LiveIpiVector::TlbShootdown"));
+    assert!(
+        request
+            .matches("BSP_TIMER_SERVICE.fail_transport()")
+            .count()
+            >= 3
+    );
+    assert!(request.contains("Err(error) => {"));
+    assert!(request.contains("let Some(bsp) ="));
 
     let ap_init = live
         .split_once("pub(crate) fn initialize_ap_local_apic")
@@ -170,6 +179,119 @@ fn h4_remote_deadline_mutation_notifies_only_the_bsp_timer_service_over_e1() {
         .0;
     assert!(masked_timer.contains("APIC_LVT_MASKED"));
     assert!(masked_timer.contains("APIC_TIMER_INITIAL_COUNT, 0"));
+
+    let service = source("src/time/service.rs");
+    for evidence in [
+        "pending: AtomicBool",
+        "faulted: AtomicBool",
+        "self.pending.store(true, Ordering::Release)",
+        "self.faulted.store(true, Ordering::Release)",
+        "self.pending.swap(false, Ordering::AcqRel)",
+        "self.ensure_healthy()?",
+    ] {
+        assert!(
+            service.contains(evidence),
+            "H4 ambiguous timer transport guard omitted `{evidence}`"
+        );
+    }
+    let timer_dispatch = live
+        .split_once("pub(crate) extern \"sysv64\" fn dw_x86_64_timer_interrupt_dispatch()")
+        .expect("BSP timer dispatch")
+        .1
+        .split_once("fn read_pm_timer")
+        .expect("BSP timer dispatch extent")
+        .0;
+    let health = timer_dispatch
+        .find("BSP_TIMER_SERVICE.ensure_healthy()")
+        .expect("global timer-service fault check");
+    let queue = timer_dispatch
+        .find("state.interrupt()")
+        .expect("deadline queue interrupt service");
+    assert!(health < queue);
+}
+
+#[test]
+fn h4_idle_publication_brackets_rescan_and_uses_only_coalesced_e1_wake() {
+    let idle = source("src/arch/x86_64/idle.rs");
+    for evidence in [
+        "RendezvousMailbox",
+        "self.mailboxes[index].publish_wake()",
+        "faulted: AtomicBool",
+        "self.faulted.store(true, Ordering::Release)",
+        "super::ipi::LiveIpiVector::Rendezvous",
+        "CPU_PREPARING",
+        "CPU_HALTED",
+        "finish_transition(halt.cpu, halt.generation, CPU_HALTED, CPU_ACTIVE)",
+    ] {
+        assert!(idle.contains(evidence), "H4 idle seam omitted `{evidence}`");
+    }
+    assert!(!idle.contains("LiveIpiVector::TlbShootdown"));
+    assert!(idle.contains("for offset in 1..CPU_CAPACITY"));
+    let live_notify = idle
+        .split_once("pub(crate) fn notify_runnable_work()")
+        .expect("live runnable notifier")
+        .1
+        .split_once("pub(crate) fn take_current_notification()")
+        .expect("live runnable notifier extent")
+        .0;
+    assert_eq!(live_notify.matches("fail_transport_and_halt()").count(), 4);
+    let transport_fault = idle
+        .split_once("fn fail_transport_and_halt()")
+        .expect("idle transport-fault handler")
+        .1
+        .split_once("#[cfg(test)]")
+        .expect("idle transport-fault handler extent")
+        .0;
+    assert!(transport_fault.contains("LIVE_IDLE_WAKE.fail_transport()"));
+
+    let live_syscall = source("src/arch/x86_64/syscall/live.rs");
+    let suspension = live_syscall
+        .split_once("crate::syscall::native::NativeSuspendPlan::IdleCurrent => loop")
+        .expect("native idle-suspend loop")
+        .1
+        .split_once("let generation = current_binding_generation()")
+        .expect("native idle-suspend loop extent")
+        .0;
+    let prepare = suspension.find("prepare_current_idle()").unwrap();
+    let poll = suspension.find("runtime.poll_idle_suspend(frame)").unwrap();
+    let commit = suspension.find("commit_current_idle(idle)").unwrap();
+    let halt = suspension.find("wait_for_suspend_interrupt()").unwrap();
+    let finish = suspension.find("finish_current_idle(halt)").unwrap();
+    assert!(prepare < poll && poll < commit && commit < halt && halt < finish);
+    assert_eq!(suspension.matches("cancel_current_idle(idle)").count(), 2);
+    assert!(suspension.contains("SYSCALL FMASK keeps IF clear"));
+
+    let wait = live_syscall
+        .split_once("fn wait_for_suspend_interrupt()")
+        .expect("architectural idle halt")
+        .1
+        .split_once("dw_x86_64_first_run_thread_entry")
+        .expect("architectural idle halt extent")
+        .0;
+    assert!(wait.contains("core::arch::asm!(\"sti\", \"hlt\", \"cli\""));
+    let msr = source("src/arch/x86_64/syscall/msr.rs");
+    assert!(msr.contains("pub(crate) const E4_FMASK: u64 = 0x001f_7700"));
+    assert_ne!(
+        0x001f_7700_u64 & (1 << 9),
+        0,
+        "FMASK must clear IF on SYSCALL"
+    );
+
+    let time_live = source("src/time/live.rs");
+    let timer_dispatch = time_live
+        .split_once("pub(crate) extern \"sysv64\" fn dw_x86_64_timer_interrupt_dispatch()")
+        .unwrap()
+        .1
+        .split_once("fn read_pm_timer")
+        .unwrap()
+        .0;
+    assert!(timer_dispatch.contains("live_idle_wake_is_healthy()"));
+
+    let execution = source("src/task/execution.rs");
+    assert!(
+        execution.contains("self.scheduler.wake(key)?;\n        super::notify_runnable_work();")
+    );
+    assert!(execution.contains("super::notify_runnable_work();\n        self.completed = true;"));
 }
 
 #[test]

@@ -380,6 +380,8 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
         cpu_registry
             .publish_online(0, bsp_local_apic_id, 1)
             .unwrap_or_else(|error| panic!("failed to publish the H1 BSP online: {error:?}"));
+        arch::x86_64::idle::enable_live_cpu(cpu::CpuIndex::BOOTSTRAP)
+            .unwrap_or_else(|error| panic!("failed to enable H4 BSP idle wake: {error:?}"));
         #[cfg(not(feature = "test-support"))]
         let _ = debug::emit_early_cpu_state_record(0, bsp_local_apic_id, "online");
 

@@ -370,6 +370,24 @@ mod tests {
     }
 
     #[test]
+    fn h4_deadline_never_expires_early_and_stale_cancel_cannot_revive_it() {
+        let mut queue = DeadlineQueue::<1, u64>::new();
+        let registration = queue.register(1_000, 0x44).unwrap();
+        let mut expired = [None; 1];
+        assert_eq!(queue.expire(999, &mut expired), 0);
+        assert_eq!(expired, [None]);
+        assert_eq!(queue.expire(1_000, &mut expired), 1);
+        assert_eq!(expired, [Some(0x44)]);
+        assert_eq!(queue.cancel_if_live_ref(&registration), Ok(None));
+
+        let replacement = queue.register(2_000, 0x55).unwrap();
+        assert_eq!(queue.cancel_if_live_ref(&registration), Ok(None));
+        assert_eq!(queue.expire(1_999, &mut expired), 0);
+        assert_eq!(queue.cancel_if_live(replacement), Ok(Some(0x55)));
+        assert_eq!(queue.expire(u64::MAX, &mut expired), 0);
+    }
+
+    #[test]
     fn lapic_programming_rounds_outward_and_handles_long_intervals() {
         let one = apic_one_shot_for_delta(1, 10_000_000).unwrap();
         assert_eq!(one.initial_count, 1);

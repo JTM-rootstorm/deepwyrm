@@ -2,7 +2,7 @@
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::arch::x86_64::apic::{
     ApicMode, IpiOperation, LocalApic, LocalApicDiscovery, XApicRegisterAccess,
@@ -20,6 +20,7 @@ use crate::interrupt::{ControllerState, LocalApicVectors};
 use crate::sync::IrqSpinMutex;
 use crate::task::BlockWakeKey;
 
+use super::service::TimerServiceSignal;
 use super::{
     DEADLINE_QUEUE_CAPACITY, DeadlineQueue, DeadlineRegistration, MonotonicSample,
     PmTimerDescriptor, PmTimerState, TimeInitState, TimerDeadlineAuthority, TimerDeadlineError,
@@ -41,7 +42,7 @@ const XAPIC_EOI_REGISTER: u32 = 0x0b0;
 /// The Release store precedes the fixed e1 send. The BSP's Acquire swap runs
 /// after EOI and before it takes the time lock, so one delivery may safely
 /// cover any number of mutations already visible through that lock.
-static BSP_TIMER_SERVICE_PENDING: AtomicBool = AtomicBool::new(false);
+static BSP_TIMER_SERVICE: TimerServiceSignal = TimerServiceSignal::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LiveTimeError {
@@ -361,18 +362,37 @@ fn current_cpu_is_timer_service() -> Result<bool, LiveTimeError> {
 }
 
 fn request_bsp_timer_service() -> Result<(), LiveTimeError> {
-    if current_cpu_is_timer_service()? {
+    BSP_TIMER_SERVICE
+        .ensure_healthy()
+        .map_err(|_| LiveTimeError::Faulted)?;
+    let is_timer_service = match current_cpu_is_timer_service() {
+        Ok(is_timer_service) => is_timer_service,
+        Err(error) => {
+            BSP_TIMER_SERVICE.fail_transport();
+            return Err(error);
+        }
+    };
+    if is_timer_service {
         return service_bsp_timer_request();
     }
-    let bsp = LOCAL_APIC_SLOTS[CpuIndex::BOOTSTRAP.index()]
-        .identity()
-        .ok_or(LiveTimeError::ApicAccess)?;
-    BSP_TIMER_SERVICE_PENDING.store(true, Ordering::Release);
-    send_live_ipi(bsp.local_apic_id, LiveIpiVector::Rendezvous)
-        .map_err(|_| LiveTimeError::IpiTransport)
+    let Some(bsp) = LOCAL_APIC_SLOTS[CpuIndex::BOOTSTRAP.index()].identity() else {
+        BSP_TIMER_SERVICE.fail_transport();
+        return Err(LiveTimeError::ApicAccess);
+    };
+    BSP_TIMER_SERVICE
+        .publish()
+        .map_err(|_| LiveTimeError::Faulted)?;
+    if send_live_ipi(bsp.local_apic_id, LiveIpiVector::Rendezvous).is_err() {
+        BSP_TIMER_SERVICE.fail_transport();
+        return Err(LiveTimeError::IpiTransport);
+    }
+    Ok(())
 }
 
 fn service_bsp_timer_request() -> Result<(), LiveTimeError> {
+    BSP_TIMER_SERVICE
+        .ensure_healthy()
+        .map_err(|_| LiveTimeError::Faulted)?;
     if !current_cpu_is_timer_service()? {
         return Err(LiveTimeError::CpuIdentity);
     }
@@ -386,11 +406,20 @@ fn service_bsp_timer_request() -> Result<(), LiveTimeError> {
 /// request is meaningful only on logical CPU 0; every other e1 remains a
 /// capability-free wake/no-request notification.
 fn live_rendezvous_handler() {
-    if installed_current_cpu_index() == Ok(CpuIndex::BOOTSTRAP)
-        && BSP_TIMER_SERVICE_PENDING.swap(false, Ordering::AcqRel)
-        && service_bsp_timer_request().is_err()
-    {
-        halt_forever();
+    // Wake is consumed only as a rescan notification. Stop/HoldSafe remain
+    // generation-bound in the rendezvous mailbox and are not acknowledged by
+    // H4's timer/idle callback.
+    let _notification = crate::arch::x86_64::idle::take_current_notification();
+    if installed_current_cpu_index() == Ok(CpuIndex::BOOTSTRAP) {
+        match BSP_TIMER_SERVICE.take() {
+            Ok(true) => {
+                if service_bsp_timer_request().is_err() {
+                    halt_forever();
+                }
+            }
+            Ok(false) => {}
+            Err(_) => halt_forever(),
+        }
     }
 }
 
@@ -810,6 +839,9 @@ impl TimerDeadlineAuthority for LiveTimerDeadlineAuthority {
         deadline_ns: u64,
         token: TimerExpiryToken,
     ) -> Result<Option<DeadlineRegistration>, TimerDeadlineError> {
+        BSP_TIMER_SERVICE
+            .ensure_healthy()
+            .map_err(|_| TimerDeadlineError::Fault)?;
         if timer_expiry_binding().is_none() {
             return Err(TimerDeadlineError::Fault);
         }
@@ -834,6 +866,9 @@ impl TimerDeadlineAuthority for LiveTimerDeadlineAuthority {
         &mut self,
         registration: &DeadlineRegistration,
     ) -> Result<(), TimerDeadlineError> {
+        BSP_TIMER_SERVICE
+            .ensure_healthy()
+            .map_err(|_| TimerDeadlineError::Fault)?;
         let program_local_timer =
             current_cpu_is_timer_service().map_err(|_| TimerDeadlineError::Fault)?;
         let state = live_state().ok_or(TimerDeadlineError::Fault)?;
@@ -848,9 +883,19 @@ impl TimerDeadlineAuthority for LiveTimerDeadlineAuthority {
 }
 
 pub(crate) fn monotonic_now() -> Result<u64, LiveTimeError> {
+    BSP_TIMER_SERVICE
+        .ensure_healthy()
+        .map_err(|_| LiveTimeError::Faulted)?;
     let state = live_state().ok_or(LiveTimeError::Clock)?;
     let mut state = state.lock();
     Ok(state.sample_now()?.nanoseconds)
+}
+
+/// Allows every native kernel re-entry to observe an ambiguous timer-service
+/// transport failure even before the BSP's already-programmed maintenance
+/// interrupt arrives.
+pub(crate) fn timer_service_is_healthy() -> bool {
+    BSP_TIMER_SERVICE.ensure_healthy().is_ok()
 }
 
 pub(crate) fn bsp_local_apic_identity() -> Result<(u8, u64), LiveTimeError> {
@@ -930,6 +975,9 @@ pub(crate) fn send_bsp_ipi(destination: u8, operation: IpiOperation) -> Result<(
 }
 
 pub(crate) fn busy_wait_nanoseconds(delay: u64) -> Result<(), LiveTimeError> {
+    BSP_TIMER_SERVICE
+        .ensure_healthy()
+        .map_err(|_| LiveTimeError::Faulted)?;
     let state = live_state().ok_or(LiveTimeError::Clock)?;
     let mut state = state.lock();
     let start = state.sample_now()?.nanoseconds;
@@ -947,6 +995,9 @@ pub(crate) fn register_deadline(
     deadline_ns: u64,
     wake: BlockWakeKey,
 ) -> Result<DeadlineRegistration, DeadlineRegistrationFailure> {
+    if BSP_TIMER_SERVICE.ensure_healthy().is_err() {
+        return Err(registration_failure(LiveTimeError::Faulted, wake));
+    }
     if wake_binding().is_none() {
         return Err(registration_failure(LiveTimeError::NoWakeRuntime, wake));
     }
@@ -972,6 +1023,9 @@ pub(crate) fn register_deadline(
 }
 
 pub(crate) fn cancel_deadline(registration: DeadlineRegistration) -> Result<(), LiveTimeError> {
+    BSP_TIMER_SERVICE
+        .ensure_healthy()
+        .map_err(|_| LiveTimeError::Faulted)?;
     let Some(state) = live_state() else {
         return Err(LiveTimeError::Clock);
     };
@@ -991,6 +1045,11 @@ pub(crate) fn cancel_deadline(registration: DeadlineRegistration) -> Result<(), 
 )]
 #[unsafe(no_mangle)]
 pub(crate) extern "sysv64" fn dw_x86_64_timer_interrupt_dispatch() {
+    if BSP_TIMER_SERVICE.ensure_healthy().is_err()
+        || !crate::arch::x86_64::idle::live_idle_wake_is_healthy()
+    {
+        halt_forever();
+    }
     if installed_current_cpu_index() != Ok(CpuIndex::BOOTSTRAP) {
         halt_forever();
     }

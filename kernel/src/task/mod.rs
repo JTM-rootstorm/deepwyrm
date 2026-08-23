@@ -49,6 +49,17 @@ pub(crate) use scheduler::{
     SchedulerThreadState,
 };
 
+/// Notifies one eligible remote idle CPU after Runnable publication. This is
+/// intentionally a no-op in host/model builds; their deterministic idle-wake
+/// controller tests drive the same protocol explicitly.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn notify_runnable_work() {
+    crate::arch::x86_64::idle::notify_runnable_work();
+}
+
+#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+fn notify_runnable_work() {}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TaskExceptionRecord {
     pub(crate) exception_type: DwExceptionType,
