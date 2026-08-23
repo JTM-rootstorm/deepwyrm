@@ -1178,7 +1178,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         if self.g5_probe.accepts_completion(&completion) {
             crate::test_support::complete_pass(0)
         } else {
-            crate::test_support::complete_fail(1)
+            let detail = match completion {
+                Err(
+                    crate::boot::primordial::construction::PrimordialCompletionError::NonzeroExit(
+                        code,
+                    ),
+                ) => code,
+                _ => 1,
+            };
+            crate::test_support::complete_fail(detail)
         }
         #[cfg(not(feature = "test-support"))]
         {
