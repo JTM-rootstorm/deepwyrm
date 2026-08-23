@@ -631,15 +631,21 @@ impl FinalizedEvidence<'_> {
         let count = state_count(state);
         for sequence in 0..count {
             let mut spins = 0;
-            while collector.slots[sequence].state.load(Ordering::Acquire) == SLOT_WRITING {
+            while matches!(
+                collector.slots[sequence].state.load(Ordering::Acquire),
+                SLOT_EMPTY | SLOT_WRITING
+            ) {
                 if spins == MAX_PUBLICATION_SPINS {
                     return Err(EvidenceFlushError::NotReady);
                 }
                 spins += 1;
                 core::hint::spin_loop();
             }
-            if collector.slots[sequence].state.load(Ordering::Acquire) == SLOT_ABORTED {
-                return Err(EvidenceFlushError::Malformed);
+            match collector.slots[sequence].state.load(Ordering::Acquire) {
+                SLOT_READY => {}
+                SLOT_ABORTED => return Err(EvidenceFlushError::Malformed),
+                SLOT_EMPTY | SLOT_WRITING => return Err(EvidenceFlushError::NotReady),
+                _ => return Err(EvidenceFlushError::Invariant),
             }
         }
         if state_has_failure(state) {
@@ -990,6 +996,31 @@ mod tests {
             .unwrap();
         let permit = collector.finalize_running_invariant().unwrap();
         assert_eq!(permit.flush(|_| Ok(())), Err(EvidenceFlushError::NotReady));
+    }
+
+    #[test]
+    fn pause_after_reserve_before_writing_fails_without_panicking_or_hanging() {
+        let collector = EvidenceCollector::new();
+        let sequence = collector.reserve().unwrap();
+        assert_eq!(
+            collector.slots[sequence].state.load(Ordering::Acquire),
+            SLOT_EMPTY
+        );
+        let permit = collector.finalize_running_invariant().unwrap();
+        assert_eq!(permit.flush(|_| Ok(())), Err(EvidenceFlushError::NotReady));
+    }
+
+    #[test]
+    fn publication_crossing_reporter_wait_is_observed_before_snapshot() {
+        let collector = EvidenceCollector::new();
+        let sequence = collector
+            .reserve_paused_for_test(EvidenceEvent::cpu_online(0, 0x20))
+            .unwrap();
+        let permit = collector.finalize_running_invariant().unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| collector.publish_paused_for_test(sequence));
+            assert_eq!(permit.flush(|_| Ok(())), Err(EvidenceFlushError::Invariant));
+        });
     }
 
     fn complete_contract_without_final(collector: &EvidenceCollector) {
