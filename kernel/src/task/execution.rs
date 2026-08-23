@@ -588,6 +588,25 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         self.scheduler.schedule_next()
     }
 
+    /// Chooses the BSP Thread to enter after the terminal reaper has
+    /// abandoned and reclaimed the retired Thread's kernel stack.
+    ///
+    /// Deferred retirement has already selected and published a replacement
+    /// when one was Runnable at retirement time. Reclaim may additionally
+    /// publish a waiter woken by the retired Thread's EXITED signal, but only
+    /// when no replacement was selected. These are the only two legal reaper
+    /// states.
+    pub(crate) fn terminal_reaper_next(&self) -> Option<ThreadKey> {
+        match self.current_thread_on(SchedulerCpuId::BOOTSTRAP) {
+            Some(next) => Some(next),
+            None => {
+                self.schedule_next()
+                    .unwrap_or_else(|error| panic!("terminal scheduling failed: {error:?}"))
+                    .current
+            }
+        }
+    }
+
     pub(crate) fn schedule_next_on(
         &self,
         cpu: SchedulerCpuId,

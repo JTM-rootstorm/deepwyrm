@@ -5,10 +5,65 @@ use std::{cell::RefCell, rc::Rc, vec, vec::Vec};
 
 use crate::cpu::CpuIndex;
 use crate::memory::frame_roles::{FrameRoleManager, TableOwnerKey, synthetic_frame_role_manager};
+use crate::memory::kernel_stack::KernelStackBounds;
 use crate::memory::physical::PhysicalRange;
 use crate::memory::usercopy::UserPinTracker;
+use crate::object::ObjectRegistry;
+use crate::task::{ExecutionDomain, SchedulerThreadState, TaskAuthority, ThreadStartState};
 
 use super::*;
+
+const TERMINAL_TEST_OBJECTS: usize = 16;
+type TerminalTestTasks = TaskAuthority<2, 2, 4, 4>;
+
+fn terminal_stack_bounds<const COUNT: usize>() -> [KernelStackBounds; COUNT] {
+    core::array::from_fn(|index| {
+        let stride = 0x11_000_u64;
+        let guard = 0xffff_9000_0000_0000 + u64::try_from(index).unwrap() * stride;
+        KernelStackBounds::new(guard, guard + 0x1000, guard + stride).unwrap()
+    })
+}
+
+fn terminal_start_state(seed: u64) -> ThreadStartState {
+    ThreadStartState::from_validated_user_state(
+        0x0000_0000_4000_0000 + seed * 0x1000,
+        0x0000_0000_5000_0000 + seed * 0x1000,
+        seed,
+        seed + 1,
+    )
+}
+
+fn terminal_two_thread_fixture() -> (
+    ObjectRegistry<TERMINAL_TEST_OBJECTS>,
+    TerminalTestTasks,
+    crate::object::InternalRef,
+    crate::object::HandleRef,
+    crate::task::ThreadKey,
+    crate::object::HandleRef,
+    crate::task::ThreadKey,
+    crate::object::HandleRef,
+) {
+    let mut registry = ObjectRegistry::<TERMINAL_TEST_OBJECTS>::new();
+    let mut tasks = TerminalTestTasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (_process, process_handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let process_owner = registry
+        .retain_internal_from_handle(&process_handle)
+        .unwrap();
+    let (current, current_handle) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    let (other, other_handle) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    assert!(registry.release_internal(process_owner).unwrap().is_none());
+    (
+        registry,
+        tasks,
+        root_owner,
+        process_handle,
+        current,
+        current_handle,
+        other,
+        other_handle,
+    )
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Event {
@@ -2192,4 +2247,102 @@ fn kernel_half_copy_is_supervisor_only_and_leaves_child_low_half_empty() {
         target.entries[&(child.address(), 511)],
         0x81_000 | PRESENT | WRITABLE | NO_EXECUTE
     );
+}
+
+#[test]
+fn terminal_reaper_reuses_replacement_selected_by_deferred_retirement() {
+    let (
+        mut registry,
+        mut tasks,
+        root_owner,
+        process_handle,
+        current,
+        current_handle,
+        replacement,
+        replacement_handle,
+    ) = terminal_two_thread_fixture();
+    let execution = ExecutionDomain::<2>::new(terminal_stack_bounds::<2>()).unwrap();
+    execution
+        .start_thread(&mut tasks, current, terminal_start_state(11))
+        .unwrap();
+    execution
+        .start_thread(&mut tasks, replacement, terminal_start_state(12))
+        .unwrap();
+    assert_eq!(execution.schedule_next().unwrap().current, Some(current));
+
+    let pins = tasks.exit_thread(current, 0).unwrap();
+    let (retired, deferred) = execution.retire_exit_pins_defer_current(pins, current);
+    let deferred_pins = execution.reclaim_deferred_current(deferred);
+
+    // The old production path called `schedule_next` here and failed with
+    // CurrentThreadRunning. The helper is the reaper's exact decision.
+    assert_eq!(execution.terminal_reaper_next(), Some(replacement));
+    assert_eq!(
+        execution.scheduler_state(replacement),
+        Some(SchedulerThreadState::Running)
+    );
+
+    let (process_pin, thread_pins) = retired.into_parts();
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        assert!(registry.release_internal(pin).unwrap().is_none());
+    }
+    let (process_pin, thread_pins) = deferred_pins.into_parts();
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        assert!(registry.release_internal(pin).unwrap().is_none());
+    }
+    for reference in [current_handle, replacement_handle, process_handle] {
+        let _ = registry.release_handle(reference).unwrap();
+    }
+    let _ = registry.release_internal(root_owner).unwrap();
+}
+
+#[test]
+fn terminal_reaper_schedules_work_published_after_deferred_retirement() {
+    let (
+        mut registry,
+        mut tasks,
+        root_owner,
+        process_handle,
+        current,
+        current_handle,
+        awakened,
+        awakened_handle,
+    ) = terminal_two_thread_fixture();
+    let execution = ExecutionDomain::<2>::new(terminal_stack_bounds::<2>()).unwrap();
+    execution
+        .start_thread(&mut tasks, current, terminal_start_state(13))
+        .unwrap();
+    assert_eq!(execution.schedule_next().unwrap().current, Some(current));
+
+    let pins = tasks.exit_thread(current, 0).unwrap();
+    let (retired, deferred) = execution.retire_exit_pins_defer_current(pins, current);
+    assert_eq!(
+        execution.current_thread_on(crate::cpu::CpuIndex::BOOTSTRAP),
+        None
+    );
+
+    // Model work published by the terminal EXITED cleanup before the reaper
+    // chooses a fresh current Thread.
+    execution
+        .start_thread(&mut tasks, awakened, terminal_start_state(14))
+        .unwrap();
+    let deferred_pins = execution.reclaim_deferred_current(deferred);
+    assert_eq!(execution.terminal_reaper_next(), Some(awakened));
+    assert_eq!(
+        execution.scheduler_state(awakened),
+        Some(SchedulerThreadState::Running)
+    );
+
+    let (process_pin, thread_pins) = retired.into_parts();
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        assert!(registry.release_internal(pin).unwrap().is_none());
+    }
+    let (process_pin, thread_pins) = deferred_pins.into_parts();
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        assert!(registry.release_internal(pin).unwrap().is_none());
+    }
+    for reference in [current_handle, awakened_handle, process_handle] {
+        let _ = registry.release_handle(reference).unwrap();
+    }
+    let _ = registry.release_internal(root_owner).unwrap();
 }
