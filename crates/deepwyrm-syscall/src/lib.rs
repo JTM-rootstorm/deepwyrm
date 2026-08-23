@@ -453,6 +453,24 @@ pub fn address_region_protect(
     }
 }
 
+/// Read one generated Deepwyrm clock domain into a caller-owned nanosecond value.
+#[inline]
+pub fn clock_get(clock_id: u32, out_nanoseconds: &mut u64) -> DwStatus {
+    // SAFETY: the generated clock scalar is copied by value and the aligned
+    // output remains uniquely borrowed for the complete call.
+    unsafe {
+        syscall6(
+            DW_SYSCALL_CLOCK_GET,
+            u64::from(clock_id),
+            output_address(out_nanoseconds),
+            0,
+            0,
+            0,
+            0,
+        )
+    }
+}
+
 /// Create one connected Channel pair with a shared requested rights mask.
 #[inline]
 pub fn channel_create(
