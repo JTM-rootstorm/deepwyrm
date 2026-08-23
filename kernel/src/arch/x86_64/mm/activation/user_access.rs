@@ -99,10 +99,19 @@ pub(crate) struct LiveProcessAddressSpace<
     const RANGE_CAPACITY: usize,
     const ROLE_CAPACITY: usize,
 > {
-    pub(super) root: &'borrow PageTableRoot,
+    // The selected root may be stored inside `root_bindings`. Keeping only its
+    // stationary pointer lets this session mutate a different binding slot
+    // during ProcessCreate without manufacturing overlapping Rust references.
+    // Every dereference is serialized away from binding-table mutation below.
+    pub(super) root: *const PageTableRoot,
+    pub(super) primordial_root: &'borrow PageTableRoot,
     pub(super) identity: TableIdentity,
     pub(super) address_space: crate::memory::address_region::AddressSpaceKey,
     pub(super) process: crate::task::ProcessKey,
+    pub(super) root_bindings: &'borrow mut super::AddressSpaceRootBindings<
+        { super::LIVE_ADDRESS_SPACE_CAPACITY },
+        { crate::cpu::CPU_CAPACITY },
+    >,
     pub(super) roles: &'borrow mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
     pub(super) target: TrackedActiveTarget<'borrow>,
     pub(super) _root: core::marker::PhantomData<&'root mut ()>,
@@ -332,6 +341,60 @@ impl PinnedUserBatchPages for PinnedLiveUserBatch<'_> {
 impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     LiveProcessAddressSpace<'borrow, 'root, RANGE_CAPACITY, ROLE_CAPACITY>
 {
+    /// Publishes a child architecture root while this same session owns the
+    /// originating user-output pin, role manager, scratch mapper, and binding
+    /// table. Keeping those capabilities in one borrow prevents an aliased
+    /// ProcessCreate transaction from observing only half of the reservation.
+    pub(crate) fn reserve_child_address_space(
+        &mut self,
+        process: crate::task::ProcessKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    ) -> Result<(), super::RootBindingError> {
+        super::reserve_child_address_space_parts(
+            self.primordial_root,
+            self.root_bindings,
+            self.roles,
+            self.target.scratch,
+            process,
+            address_space,
+        )
+    }
+
+    pub(crate) fn rollback_empty_child_address_space(
+        &mut self,
+        process: crate::task::ProcessKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    ) -> Result<(), super::RootBindingError> {
+        self.root_bindings
+            .teardown_empty_owned(self.roles, process, address_space)
+    }
+
+    /// Retargets only the scratch-walk validation identity. Raw usercopy must
+    /// already be complete before this is called; the hardware-active root and
+    /// its residency token remain unchanged until the scheduler selects the
+    /// child Thread.
+    pub(crate) fn select_process_for_return_validation(
+        &mut self,
+        process: crate::task::ProcessKey,
+    ) -> Result<(), super::RootBindingError> {
+        let (root, identity, address_space) = self
+            .root_bindings
+            .root_for_process(self.primordial_root, process)?;
+        self.root = root as *const PageTableRoot;
+        self.identity = identity;
+        self.address_space = address_space;
+        self.process = process;
+        Ok(())
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "the active-root table owns stationary entries and this session never dereferences its selected root while mutating that table"
+    )]
+    fn selected_root(&self) -> &PageTableRoot {
+        unsafe { &*self.root }
+    }
+
     /// Pins and preflights one aligned readable userspace `u32`, then detaches
     /// the range reservation so it can survive a blocking syscall.
     pub(crate) fn pin_atomic_u32(
@@ -521,7 +584,7 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .table_identity(
                     self.identity.owner(),
                     child_level,
-                    entry & physical_mask(self.root.capabilities),
+                    entry & physical_mask(self.selected_root().capabilities),
                 )
                 .map_err(|_| LiveUserAccessError::MissingOrInvalid)?;
             self.roles
@@ -553,8 +616,11 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> Result<u64, LiveUserAccessError> {
         self.target
             .read_entry(
-                FrameAddress::new(table.physical_start(), self.root.physical_limit())
-                    .map_err(|_| LiveUserAccessError::MissingOrInvalid)?,
+                FrameAddress::new(
+                    table.physical_start(),
+                    self.selected_root().physical_limit(),
+                )
+                .map_err(|_| LiveUserAccessError::MissingOrInvalid)?,
                 index,
             )
             .map_err(|_| LiveUserAccessError::MissingOrInvalid)
@@ -587,8 +653,11 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let byte_len = allocation.byte_len();
         let mut offset = 0;
         while offset < byte_len {
-            let frame = FrameAddress::new(physical_start + offset, self.root.physical_limit())
-                .map_err(|_| LiveUserAccessError::MissingOrInvalid)?;
+            let frame = FrameAddress::new(
+                physical_start + offset,
+                self.selected_root().physical_limit(),
+            )
+            .map_err(|_| LiveUserAccessError::MissingOrInvalid)?;
             if self.target.scratch.zero_allocator_frame(frame).is_err() {
                 self.roles
                     .cancel_allocation(allocation)
@@ -621,8 +690,11 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .roles
             .allocate(1)
             .map_err(|_| LiveUserAccessError::MissingOrInvalid)?;
-        let frame = FrameAddress::new(allocation.physical_start(), self.root.physical_limit())
-            .map_err(|_| LiveUserAccessError::MissingOrInvalid)?;
+        let frame = FrameAddress::new(
+            allocation.physical_start(),
+            self.selected_root().physical_limit(),
+        )
+        .map_err(|_| LiveUserAccessError::MissingOrInvalid)?;
         if self.target.scratch.zero_allocator_frame(frame).is_err() {
             self.roles
                 .cancel_allocation(allocation)
@@ -682,13 +754,14 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if address_space != self.address_space {
             return Err(crate::arch::x86_64::mm::X86AddressSpacePublishError::Identity);
         }
-        let root = self.root;
+        let root_pointer = self.root;
         let identity = self.identity;
         let roles = &mut *self.roles;
         let target = &mut self.target;
         // SAFETY: this session owns the exact active root, role manager and
         // pin-aware serialized target; E5 supplies authority-issued identities.
         unsafe {
+            let root = &*root_pointer;
             crate::arch::x86_64::mm::X86AddressSpacePublisher::new(
                 address_space,
                 region,

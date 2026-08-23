@@ -1005,6 +1005,20 @@ enum ProcessCreatePreparation {
     ParentResultSlots,
 }
 
+pub(crate) trait ProcessRootReservation {
+    fn reserve_child_root(
+        &mut self,
+        process: ProcessKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    ) -> Result<(), DwStatus>;
+
+    fn rollback_empty_child_root(
+        &mut self,
+        process: ProcessKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    );
+}
+
 fn cancel_prepared_process<
     const OBJECTS: usize,
     const GROUPS: usize,
@@ -1128,7 +1142,13 @@ fn cancel_prepared_root_and_process<
     reason = "the F10 observation barrier keeps independently-owned usercopy, object, task, HandleTable, and address-space authorities explicit"
 )]
 fn process_create_transaction<
-    U: UserPageAccess,
+    U: UserPageAccess + OwnedUserOutputAccess,
+    R: FnMut(
+        &mut U,
+        ProcessKey,
+        crate::memory::address_region::AddressSpaceKey,
+    ) -> Result<(), DwStatus>,
+    B: FnMut(&mut U, ProcessKey, crate::memory::address_region::AddressSpaceKey),
     I: FnMut(ProcessCreatePreparation) -> Result<(), DwStatus>,
     const OBJECTS: usize,
     const GROUPS: usize,
@@ -1151,6 +1171,8 @@ fn process_create_transaction<
     out_result: DwUserAddress,
     result_size: u64,
     cleanup: &mut CleanupQueue<OBJECTS>,
+    mut reserve_root: R,
+    mut rollback_root: B,
     mut inject: I,
 ) -> DwStatus {
     if args_size != u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE)
@@ -1179,15 +1201,26 @@ fn process_create_transaction<
             return status;
         }
     }
-    let output = match preflight_output(
-        user,
+    let output_range = match user_range(
         out_result,
         DW_PROCESS_CREATE_RESULT_V1_SIZE as usize,
         8,
+        UserAccess::WRITE,
     ) {
-        Ok(output) => output,
+        Ok(range) => range,
         Err(status) => return status,
     };
+    let output = match user.preflight_owned_output(output_range) {
+        Ok(output) => output,
+        Err(_) => return DW_STATUS_BAD_ADDRESS,
+    };
+
+    macro_rules! discard_and_return {
+        ($status:expr) => {{
+            user.discard_owned_output(output);
+            return $status;
+        }};
+    }
 
     let parent_pin = match resolve_current_handle(
         tasks,
@@ -1198,7 +1231,7 @@ fn process_create_transaction<
         DW_RIGHT_MODIFY,
     ) {
         Ok(pin) => pin,
-        Err(status) => return status,
+        Err(status) => discard_and_return!(status),
     };
     let bootstrap_pin = match resolve_current_handle(
         tasks,
@@ -1211,7 +1244,7 @@ fn process_create_transaction<
         Ok(pin) => pin,
         Err(status) => {
             release_lookup_pin(registry, parent_pin, cleanup);
-            return status;
+            discard_and_return!(status);
         }
     };
 
@@ -1226,7 +1259,7 @@ fn process_create_transaction<
         Err(error) => {
             release_lookup_pin(registry, bootstrap_pin, cleanup);
             release_lookup_pin(registry, parent_pin, cleanup);
-            return task_status(error);
+            discard_and_return!(task_status(error));
         }
     };
     let mut prepared_move = match prepared_move {
@@ -1234,14 +1267,14 @@ fn process_create_transaction<
         Err(error) => {
             release_lookup_pin(registry, bootstrap_pin, cleanup);
             release_lookup_pin(registry, parent_pin, cleanup);
-            return handle_move_status(error);
+            discard_and_return!(handle_move_status(error));
         }
     };
     if let Err(status) = inject(ProcessCreatePreparation::BootstrapMove) {
         cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
         release_lookup_pin(registry, bootstrap_pin, cleanup);
         release_lookup_pin(registry, parent_pin, cleanup);
-        return status;
+        discard_and_return!(status);
     }
 
     let prepared_process = match tasks.prepare_process(registry, &parent_pin) {
@@ -1250,7 +1283,7 @@ fn process_create_transaction<
             cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
             release_lookup_pin(registry, bootstrap_pin, cleanup);
             release_lookup_pin(registry, parent_pin, cleanup);
-            return task_create_status(error);
+            discard_and_return!(task_create_status(error));
         }
     };
     if let Err(status) = inject(ProcessCreatePreparation::ProcessShell) {
@@ -1258,7 +1291,7 @@ fn process_create_transaction<
         cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
         release_lookup_pin(registry, bootstrap_pin, cleanup);
         release_lookup_pin(registry, parent_pin, cleanup);
-        return status;
+        discard_and_return!(status);
     }
 
     let child_reservation = match tasks.process_handles_mut(prepared_process.key()) {
@@ -1268,7 +1301,7 @@ fn process_create_transaction<
             cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
             release_lookup_pin(registry, bootstrap_pin, cleanup);
             release_lookup_pin(registry, parent_pin, cleanup);
-            return task_status(error);
+            discard_and_return!(task_status(error));
         }
     };
     let mut child_reservation = match child_reservation {
@@ -1278,7 +1311,7 @@ fn process_create_transaction<
             cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
             release_lookup_pin(registry, bootstrap_pin, cleanup);
             release_lookup_pin(registry, parent_pin, cleanup);
-            return handle_status(error);
+            discard_and_return!(handle_status(error));
         }
     };
     if let Err(status) = inject(ProcessCreatePreparation::ChildBootstrapSlot) {
@@ -1287,7 +1320,7 @@ fn process_create_transaction<
         cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
         release_lookup_pin(registry, bootstrap_pin, cleanup);
         release_lookup_pin(registry, parent_pin, cleanup);
-        return status;
+        discard_and_return!(status);
     }
 
     let attachment = match prepared_process.reserve_root_region_attachment(tasks) {
@@ -1298,7 +1331,7 @@ fn process_create_transaction<
             cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
             release_lookup_pin(registry, bootstrap_pin, cleanup);
             release_lookup_pin(registry, parent_pin, cleanup);
-            return task_status(error);
+            discard_and_return!(task_status(error));
         }
     };
     let prepared_root = match regions.prepare_root_region(
@@ -1316,7 +1349,7 @@ fn process_create_transaction<
             cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
             release_lookup_pin(registry, bootstrap_pin, cleanup);
             release_lookup_pin(registry, parent_pin, cleanup);
-            return address_region_object_status(error);
+            discard_and_return!(address_region_object_status(error));
         }
     };
     if let Err(status) = inject(ProcessCreatePreparation::RootRegion) {
@@ -1333,7 +1366,28 @@ fn process_create_transaction<
         cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
         release_lookup_pin(registry, bootstrap_pin, cleanup);
         release_lookup_pin(registry, parent_pin, cleanup);
-        return status;
+        discard_and_return!(status);
+    }
+    let child_process = prepared_process.key();
+    let child_address_space = regions
+        .region(prepared_root.key())
+        .unwrap_or_else(|error| panic!("prepared child root disappeared: {error:?}"))
+        .address_space_key();
+    if let Err(status) = reserve_root(user, child_process, child_address_space) {
+        cancel_transfer_destination(&mut child_reservation, tasks, child_process);
+        cancel_prepared_root_and_process(
+            prepared_root,
+            prepared_process,
+            registry,
+            tasks,
+            regions,
+            spaces,
+            cleanup,
+        );
+        cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
+        release_lookup_pin(registry, bootstrap_pin, cleanup);
+        release_lookup_pin(registry, parent_pin, cleanup);
+        discard_and_return!(status);
     }
 
     let parent_reservation = match tasks.process_handles_mut(current_process) {
@@ -1348,6 +1402,7 @@ fn process_create_transaction<
             },
         ]),
         Err(error) => {
+            rollback_root(user, child_process, child_address_space);
             cancel_transfer_destination(&mut child_reservation, tasks, prepared_process.key());
             cancel_prepared_root_and_process(
                 prepared_root,
@@ -1361,12 +1416,13 @@ fn process_create_transaction<
             cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
             release_lookup_pin(registry, bootstrap_pin, cleanup);
             release_lookup_pin(registry, parent_pin, cleanup);
-            return task_status(error);
+            discard_and_return!(task_status(error));
         }
     };
     let mut parent_reservation = match parent_reservation {
         Ok(reservation) => reservation,
         Err(error) => {
+            rollback_root(user, child_process, child_address_space);
             cancel_transfer_destination(&mut child_reservation, tasks, prepared_process.key());
             cancel_prepared_root_and_process(
                 prepared_root,
@@ -1380,10 +1436,11 @@ fn process_create_transaction<
             cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
             release_lookup_pin(registry, bootstrap_pin, cleanup);
             release_lookup_pin(registry, parent_pin, cleanup);
-            return handle_status(error);
+            discard_and_return!(handle_status(error));
         }
     };
     if let Err(status) = inject(ProcessCreatePreparation::ParentResultSlots) {
+        rollback_root(user, child_process, child_address_space);
         cancel_typed_pair_destination(&mut parent_reservation, tasks, current_process);
         cancel_transfer_destination(&mut child_reservation, tasks, prepared_process.key());
         cancel_prepared_root_and_process(
@@ -1398,7 +1455,7 @@ fn process_create_transaction<
         cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
         release_lookup_pin(registry, bootstrap_pin, cleanup);
         release_lookup_pin(registry, parent_pin, cleanup);
-        return status;
+        discard_and_return!(status);
     }
 
     // No recoverable operation remains beyond this point. The source MOVE is
@@ -1461,7 +1518,7 @@ fn process_create_transaction<
         child_bootstrap_handle: child_bootstrap.handle,
         reserved: [0; 4],
     });
-    output.commit(&encoded);
+    user.commit_owned_output(output, &encoded);
     DW_STATUS_SUCCESS
 }
 
@@ -1470,7 +1527,7 @@ fn process_create_transaction<
     reason = "the public F10 adapter preserves explicit transaction authority ownership"
 )]
 pub(crate) fn process_create<
-    U: UserPageAccess,
+    U: UserPageAccess + OwnedUserOutputAccess,
     const OBJECTS: usize,
     const GROUPS: usize,
     const PROCESSES: usize,
@@ -1505,6 +1562,54 @@ pub(crate) fn process_create<
         out_result,
         result_size,
         cleanup,
+        |_, _, _| Ok(()),
+        |_, _, _| {},
+        |_| Ok(()),
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the live F10 adapter keeps usercopy, portable construction, and exact architecture-root reservation in one failure-atomic transaction"
+)]
+pub(crate) fn process_create_with_root<
+    U: UserPageAccess + OwnedUserOutputAccess + ProcessRootReservation,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const REGION_OBJECTS: usize,
+    const REGION_SLOTS: usize,
+    const SPACES: usize,
+    const REGIONS: usize,
+>(
+    user: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    regions: &mut AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
+    spaces: &mut AddressSpaceAuthority<SPACES, REGIONS>,
+    current_process: ProcessKey,
+    args_address: DwUserAddress,
+    args_size: u64,
+    out_result: DwUserAddress,
+    result_size: u64,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
+    process_create_transaction(
+        user,
+        registry,
+        tasks,
+        regions,
+        spaces,
+        current_process,
+        args_address,
+        args_size,
+        out_result,
+        result_size,
+        cleanup,
+        |access, process, address_space| access.reserve_child_root(process, address_space),
+        |access, process, address_space| access.rollback_empty_child_root(process, address_space),
         |_| Ok(()),
     )
 }
@@ -3800,6 +3905,96 @@ pub(crate) fn thread_start<
     }
 }
 
+pub(crate) trait ThreadStartMappingAccess:
+    UserPageAccess + crate::arch::x86_64::syscall::ProcessUserReturnMappingValidation
+{
+    fn select_process_for_return_validation(&mut self, process: ProcessKey)
+    -> Result<(), DwStatus>;
+}
+
+/// Decodes the ThreadStart record against the active caller first, then
+/// retargets this same serialized scratch session to the child Process solely
+/// for RIP/RSP mapping validation. No caller usercopy occurs after retargeting.
+pub(crate) fn thread_start_with_access<
+    U: ThreadStartMappingAccess,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EXECUTION: usize,
+>(
+    access: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    current_process: ProcessKey,
+    args_address: DwUserAddress,
+    args_size: u64,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
+    if args_size != THREAD_START_BYTES as u64 {
+        return DW_STATUS_INVALID_ARGUMENT;
+    }
+    let bytes = match copy_input::<U, THREAD_START_BYTES>(access, args_address, 8) {
+        Ok(bytes) => bytes,
+        Err(status) => return status,
+    };
+    let args = decode_thread_start(&bytes);
+    if args.size != THREAD_START_BYTES as u32
+        || args.version != 1
+        || args.flags != 0
+        || args.reserved != [0; 3]
+    {
+        return DW_STATUS_INVALID_ARGUMENT;
+    }
+    let pin = match resolve_current_handle(
+        tasks,
+        registry,
+        current_process,
+        args.thread,
+        deepwyrm_abi::DW_OBJECT_TYPE_THREAD,
+        DW_RIGHT_EXECUTE,
+    ) {
+        Ok(pin) => pin,
+        Err(status) => return status,
+    };
+    let thread = ThreadKey::from_object_id(pin.id());
+    let target_process = match tasks.thread_process(thread) {
+        Ok(process) => process,
+        Err(error) => {
+            release_lookup_pin(registry, pin, cleanup);
+            return task_status(error);
+        }
+    };
+    if let Err(status) = access.select_process_for_return_validation(target_process) {
+        release_lookup_pin(registry, pin, cleanup);
+        return status;
+    }
+    if access.process_key() != target_process {
+        release_lookup_pin(registry, pin, cleanup);
+        return DW_STATUS_BAD_STATE;
+    }
+    let start = ThreadStartState::from_validated_user_state(
+        args.entry.0,
+        args.stack_pointer.0,
+        args.startup_argument0,
+        args.startup_argument1,
+    );
+    let context = crate::task::SavedThreadContext::initial(start);
+    if let Err(error) = crate::arch::x86_64::syscall::ValidatedUserReturn::initial(context, access)
+    {
+        release_lookup_pin(registry, pin, cleanup);
+        return user_return_status(error);
+    }
+    let result = execution.start_thread(tasks, thread, start);
+    release_lookup_pin(registry, pin, cleanup);
+    match result {
+        Ok(()) => DW_STATUS_SUCCESS,
+        Err(error) => start_thread_status(error),
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -3962,6 +4157,141 @@ pub(crate) fn memory_object_create<
     DW_STATUS_SUCCESS
 }
 
+/// Live MemoryObject creation uses one combined address-space session for the
+/// detached output pin and physical backing authority. This avoids creating
+/// simultaneous mutable aliases merely to satisfy the older split adapter.
+pub(crate) fn memory_object_create_owned<
+    U: OwnedUserOutputAccess + MemoryObjectBackingAccess,
+    const OBJECTS: usize,
+    const MEMORY_OBJECTS: usize,
+    const LEASES: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    access: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    memory: &mut MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    current_process: ProcessKey,
+    byte_len: u64,
+    flags: u32,
+    requested_rights: DwRights,
+    out_handle: DwUserAddress,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
+    if byte_len == 0
+        || !byte_len.is_multiple_of(u64::from(DW_BASE_PAGE_SIZE))
+        || flags != 0
+        || requested_rights.0 == 0
+        || !deepwyrm_abi::dw_rights_are_known(requested_rights)
+        || !deepwyrm_abi::dw_rights_are_compatible(
+            deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT,
+            requested_rights,
+        )
+    {
+        return DW_STATUS_INVALID_ARGUMENT;
+    }
+    let range = match user_range(out_handle, 8, 8, UserAccess::WRITE) {
+        Ok(range) => range,
+        Err(status) => return status,
+    };
+    let output = match access.preflight_owned_output(range) {
+        Ok(output) => output,
+        Err(_) => return DW_STATUS_BAD_ADDRESS,
+    };
+    let page_count = byte_len / u64::from(DW_BASE_PAGE_SIZE);
+    let creation = match registry.create(deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT) {
+        Ok(creation) => creation,
+        Err(ObjectRegistryError::Capacity | ObjectRegistryError::ReferenceCountExhausted) => {
+            access.discard_owned_output(output);
+            return DW_STATUS_NO_RESOURCES;
+        }
+        Err(error) => panic!("live MemoryObject generic creation failed unexpectedly: {error:?}"),
+    };
+    let backing = match access.allocate_zeroed_backing(page_count) {
+        Ok(backing) => backing,
+        Err(status) => {
+            registry
+                .cancel_creation(creation)
+                .unwrap_or_else(|failure| {
+                    panic!(
+                        "live MemoryObject creation rollback drifted: {:?}",
+                        failure.error()
+                    )
+                });
+            access.discard_owned_output(output);
+            return status;
+        }
+    };
+    let binding = match memory.bind_backing(
+        creation,
+        backing,
+        byte_len,
+        crate::memory::object::MemoryObjectKind::PageBacked,
+        crate::memory::object::MemoryProtection::READ_WRITE_EXECUTE,
+    ) {
+        Ok(binding) => binding,
+        Err(error) => {
+            let status = memory_object_status(error.error());
+            let (creation, backing) = error.into_parts();
+            access.rollback_object_backing(backing);
+            registry
+                .cancel_creation(creation)
+                .unwrap_or_else(|failure| {
+                    panic!(
+                        "live MemoryObject bind rollback drifted: {:?}",
+                        failure.error()
+                    )
+                });
+            access.discard_owned_output(output);
+            return status;
+        }
+    };
+    let bound = registry
+        .finish_payload_binding(binding)
+        .unwrap_or_else(|failure| {
+            panic!(
+                "fresh live MemoryObject binding was rejected: {:?}",
+                failure.error()
+            )
+        });
+    let reference = registry.bound_into_handle(bound).unwrap_or_else(|failure| {
+        panic!(
+            "fresh live MemoryObject could not become a handle: {:?}",
+            failure.error()
+        )
+    });
+    let handle = match tasks.process_handles_mut(current_process) {
+        Ok(table) => {
+            match install_created_handle(table, registry, reference, requested_rights, cleanup) {
+                Ok(handle) => handle,
+                Err(status) => {
+                    access.discard_owned_output(output);
+                    return status;
+                }
+            }
+        }
+        Err(error) => {
+            cleanup.push_optional(
+                registry
+                    .release_handle(reference)
+                    .unwrap_or_else(|failure| {
+                        panic!(
+                            "live MemoryObject publication rollback drifted: {:?}",
+                            failure.error()
+                        )
+                    }),
+            );
+            access.discard_owned_output(output);
+            return task_status(error);
+        }
+    };
+    access.commit_owned_output(output, &encode_handle(handle));
+    DW_STATUS_SUCCESS
+}
+
 fn queue_mapping_releases<const OBJECTS: usize>(
     cleanup: &mut CleanupQueue<OBJECTS>,
     releases: crate::memory::object::MappingFinalReleases<OBJECTS>,
@@ -4076,6 +4406,88 @@ fn map_required_rights(protection: crate::memory::address_region::Protection) ->
     }
     DwRights(bits)
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AddressRegionMutationTarget {
+    pub(crate) process: ProcessKey,
+    pub(crate) region: crate::memory::address_region::AddressRegionObjectKey,
+    pub(crate) address_space: crate::memory::address_region::AddressSpaceKey,
+    pub(crate) region_key: crate::memory::address_region::RegionKey,
+}
+
+/// Resolves delegated handle authority while preserving the target Process
+/// whose operation gate and architecture root own the actual mutation.
+pub(crate) fn address_region_mutation_target<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const REGION_OBJECTS: usize,
+    const REGION_SLOTS: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    regions: &AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
+    current_process: ProcessKey,
+    address_region: DwHandle,
+    required_rights: DwRights,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> Result<AddressRegionMutationTarget, DwStatus> {
+    let resolved = resolve_current(
+        tasks,
+        registry,
+        current_process,
+        address_region,
+        deepwyrm_abi::DW_OBJECT_TYPE_ADDRESS_REGION,
+        required_rights,
+    )?;
+    let region_key =
+        crate::memory::address_region::AddressRegionObjectKey::from_object_id(resolved.object_id());
+    let target = (|| {
+        let process = regions
+            .region_process(region_key)
+            .map_err(address_region_object_status)?;
+        let region = regions
+            .region(region_key)
+            .map_err(address_region_object_status)?;
+        Ok(AddressRegionMutationTarget {
+            process,
+            region: region_key,
+            address_space: region.address_space_key(),
+            region_key: region.region_key(),
+        })
+    })();
+    release_lookup_pin(registry, resolved.into_internal(), cleanup);
+    target
+}
+
+pub(crate) fn process_handle_target<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    current_process: ProcessKey,
+    process: DwHandle,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> Result<ProcessKey, DwStatus> {
+    let resolved = resolve_current(
+        tasks,
+        registry,
+        current_process,
+        process,
+        deepwyrm_abi::DW_OBJECT_TYPE_PROCESS,
+        DW_RIGHT_MODIFY,
+    )?;
+    let target = ProcessKey::from_object_id(resolved.object_id());
+    release_lookup_pin(registry, resolved.into_internal(), cleanup);
+    Ok(target)
+}
+
 pub(crate) fn address_region_map<
     U: UserPageAccess,
     P: crate::memory::address_region::AddressSpacePublisher,
@@ -4241,7 +4653,15 @@ pub(crate) fn address_region_map_model<
             return Err(status);
         }
     };
-    let operation_lease = match tasks.acquire_process_operation(current_process) {
+    let target_process = match regions.region_process(region_key) {
+        Ok(process) => process,
+        Err(error) => {
+            release_lookup_pin(registry, memory_resolved.into_internal(), cleanup);
+            release_lookup_pin(registry, region_resolved.into_internal(), cleanup);
+            return Err(address_region_object_status(error));
+        }
+    };
+    let operation_lease = match tasks.acquire_process_operation(target_process) {
         Ok(lease) => lease,
         Err(error) => {
             release_lookup_pin(registry, memory_resolved.into_internal(), cleanup);
@@ -4373,7 +4793,14 @@ pub(crate) fn address_region_unmap<
     };
     let key =
         crate::memory::address_region::AddressRegionObjectKey::from_object_id(resolved.object_id());
-    let operation_lease = match tasks.acquire_process_operation(current_process) {
+    let target_process = match regions.region_process(key) {
+        Ok(process) => process,
+        Err(error) => {
+            release_lookup_pin(registry, resolved.into_internal(), cleanup);
+            return address_region_object_status(error);
+        }
+    };
+    let operation_lease = match tasks.acquire_process_operation(target_process) {
         Ok(lease) => lease,
         Err(error) => {
             release_lookup_pin(registry, resolved.into_internal(), cleanup);

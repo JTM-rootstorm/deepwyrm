@@ -421,21 +421,64 @@ fn g5_terminal_completion_drains_all_primordial_authority_before_capacity_proof(
             .expect("read G5 primordial runtime source");
     let completion = fs::read_to_string(kernel_root().join("src/boot/primordial/construction.rs"))
         .expect("read primordial completion source");
+    let primordial_unmap_start = primordial
+        .find("fn unmap_primordial_userspace(")
+        .expect("guarded primordial unmap helper");
+    let inactive_unmap_start = primordial[primordial_unmap_start..]
+        .find("fn unmap_inactive_userspace(")
+        .map(|offset| primordial_unmap_start + offset)
+        .expect("exact inactive-root unmap helper");
+    let primordial_unmap = &primordial[primordial_unmap_start..inactive_unmap_start];
+    for required in [
+        "validate_current_process_root_selection(",
+        "self.primordial_process",
+        "self.primordial_address_space",
+        "self.process != self.primordial_process",
+        "LivePlatform {",
+    ] {
+        assert!(
+            primordial_unmap.contains(required),
+            "primordial-only unmap omitted guard {required}"
+        );
+    }
+
+    let terminal_start = primordial
+        .find("fn finish_terminal_teardown(")
+        .expect("terminal teardown helper");
+    let terminal_end = primordial[terminal_start..]
+        .find("impl<const RANGE_CAPACITY")
+        .map(|offset| terminal_start + offset)
+        .expect("terminal teardown implementation boundary");
+    let terminal = &primordial[terminal_start..terminal_end];
 
     for required in [
         "process_quiescence_proof(self.process)",
         "blocked_operations_drained(&self.tasks, &proof)",
-        "unmap_all_userspace(&proof)?",
+        "unmap_primordial_userspace(&proof)?",
+        "if self.process == self.primordial_process",
+        "prepare_process_root_selection(",
+        "self.primordial_address_space",
+        "self.unmap_inactive_userspace(self.process, self.root_key, &proof)?",
+        "teardown_empty_child_address_space(self.process, address_space)",
         "retire_quiesced_root(",
         "release_terminal_authority()?",
         "drain_finalizers()?",
         "prove_registry_capacity()",
     ] {
         assert!(
-            primordial.contains(required),
+            terminal.contains(required),
             "primordial terminal teardown omitted {required}"
         );
     }
+    assert!(!terminal.contains("LivePlatform {"));
+    let child_unmap = terminal
+        .find("self.unmap_inactive_userspace(self.process, self.root_key, &proof)?")
+        .unwrap();
+    let child_root_reclaim = terminal
+        .find("teardown_empty_child_address_space(self.process, address_space)")
+        .unwrap();
+    let portable_root_retire = terminal.find("retire_quiesced_root(").unwrap();
+    assert!(child_unmap < child_root_reclaim && child_root_reclaim < portable_root_retire);
     let observe = completion
         .find("let exit = backend.observe_exit();")
         .unwrap();

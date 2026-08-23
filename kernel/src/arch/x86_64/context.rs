@@ -252,6 +252,27 @@ pub(crate) unsafe fn switch_kernel_context(current_rsp_out: *mut u64, next_rsp: 
     unsafe { dw_x86_64_switch_kernel_context(current_rsp_out, next_rsp) };
 }
 
+/// Leaves an architecture-owned terminal-reaper stack and resumes one already
+/// validated scheduler continuation without retaining a path back to the
+/// reaper frame. The temporary save slot is intentionally abandoned.
+///
+/// # Safety
+///
+/// `next_rsp` must be either an execution-domain continuation for the selected
+/// running Thread or a freshly prepared initial continuation on that Thread's
+/// currently bound kernel stack. The caller must have no live references into
+/// the terminal-reaper frame after this call.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "terminal reclaim must abandon its private reaper frame before resuming scheduler-owned work"
+)]
+pub(crate) unsafe fn abandon_to_kernel_continuation(next_rsp: u64) -> ! {
+    let mut abandoned_rsp = 0_u64;
+    unsafe { switch_kernel_context(&mut abandoned_rsp, next_rsp) };
+    panic!("abandoned terminal-reaper continuation was resumed")
+}
+
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[allow(
     unsafe_code,

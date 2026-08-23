@@ -168,6 +168,16 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
         Ok(&self.record(key)?.region)
     }
 
+    /// Returns the Process whose operation gate owns this region. Handle
+    /// authority may be delegated to another Process, but mapping mutation is
+    /// serialized by the target Process rather than the caller.
+    pub(crate) fn region_process(
+        &self,
+        key: AddressRegionObjectKey,
+    ) -> Result<ProcessKey, AddressRegionObjectError> {
+        Ok(ProcessKey::from_object_id(self.record(key)?.process))
+    }
+
     #[cfg(test)]
     pub(crate) fn region_mut_for_live_process<
         const GROUPS: usize,

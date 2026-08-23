@@ -1347,6 +1347,13 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     pub(crate) fn scheduler_state(&self, thread: ThreadKey) -> Option<super::SchedulerThreadState> {
         self.scheduler.state(thread)
     }
+
+    /// Reports the scheduler-authoritative running Thread for one physical CPU
+    /// carrier. This exposes identity only; it does not choose work or infer
+    /// scheduling policy.
+    pub(crate) fn current_thread_on(&self, cpu: SchedulerCpuId) -> Option<ThreadKey> {
+        self.scheduler.current_on(cpu)
+    }
 }
 
 impl<const CAPACITY: usize> PreparedThreadStart<'_, CAPACITY> {

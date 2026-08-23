@@ -548,6 +548,17 @@ impl ActiveRootSelection {
     pub(crate) const fn cpu(&self) -> CpuIndex {
         self.residency.cpu()
     }
+
+    pub(crate) fn selects_exact(
+        &self,
+        cpu: CpuIndex,
+        process: ProcessKey,
+        address_space: AddressSpaceKey,
+    ) -> bool {
+        self.residency.cpu() == cpu
+            && self.process == process
+            && self.address_space == address_space
+    }
 }
 
 #[cfg(test)]

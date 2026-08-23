@@ -876,7 +876,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
 /// interior synchronization. AP carriers cannot name or borrow this state.
 struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
     active: ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
-    active_root: super::ActiveRootSelection,
+    active_root: Option<super::ActiveRootSelection>,
     registry: Registry,
     memory: Memory,
     tasks: Tasks,
@@ -896,6 +896,9 @@ struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_
     stack_id: crate::task::KernelStackId,
     context_id: crate::task::ThreadContextId,
     root_key: crate::memory::address_region::AddressRegionObjectKey,
+    primordial_process: ProcessKey,
+    primordial_root_key: crate::memory::address_region::AddressRegionObjectKey,
+    primordial_address_space: crate::memory::address_region::AddressSpaceKey,
     channel_keys: [crate::ipc::ChannelEndpointKey; 2],
     kernel_peer: Option<HandleRef>,
     process_monitor: Option<HandleRef>,
@@ -907,8 +910,152 @@ struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_
 }
 
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    crate::syscall::MemoryObjectBackingAccess
+    for user_access::LiveProcessAddressSpace<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn allocate_zeroed_backing(
+        &mut self,
+        page_count: u64,
+    ) -> Result<ObjectBackingGrant, deepwyrm_abi::DwStatus> {
+        user_access::LiveProcessAddressSpace::allocate_zeroed_backing(self, page_count)
+            .map_err(|_| DW_STATUS_NO_RESOURCES)
+    }
+
+    fn rollback_object_backing(&mut self, backing: ObjectBackingGrant) {
+        self.roles
+            .cancel_object_backing(backing)
+            .unwrap_or_else(|_| panic!("live MemoryObject backing rollback drifted"));
+    }
+}
+
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> crate::syscall::ProcessRootReservation
+    for user_access::LiveProcessAddressSpace<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn reserve_child_root(
+        &mut self,
+        process: ProcessKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    ) -> Result<(), deepwyrm_abi::DwStatus> {
+        self.reserve_child_address_space(process, address_space)
+            .map_err(|error| match error {
+                super::RootBindingError::Capacity
+                | super::RootBindingError::FrameRole(
+                    crate::memory::frame_roles::FrameRoleError::Capacity,
+                ) => DW_STATUS_NO_RESOURCES,
+                _ => DW_STATUS_BAD_STATE,
+            })
+    }
+
+    fn rollback_empty_child_root(
+        &mut self,
+        process: ProcessKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    ) {
+        self.rollback_empty_child_address_space(process, address_space)
+            .unwrap_or_else(|error| panic!("empty child-root rollback drifted: {error:?}"));
+    }
+}
+
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    crate::syscall::ThreadStartMappingAccess
+    for user_access::LiveProcessAddressSpace<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn select_process_for_return_validation(
+        &mut self,
+        process: ProcessKey,
+    ) -> Result<(), deepwyrm_abi::DwStatus> {
+        user_access::LiveProcessAddressSpace::select_process_for_return_validation(self, process)
+            .map_err(|_| DW_STATUS_BAD_STATE)
+    }
+}
+
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
+    fn synchronize_scheduler_current(&mut self) {
+        let thread = self
+            .shared
+            .execution
+            .current_thread_on(crate::cpu::CpuIndex::BOOTSTRAP)
+            .unwrap_or_else(|| panic!("BSP carrier has no scheduler-current Thread"));
+        let process = self
+            .tasks
+            .thread_process(thread)
+            .unwrap_or_else(|error| panic!("scheduler-current Thread lost its Process: {error:?}"));
+        let root_object = self
+            .tasks
+            .root_region(process)
+            .unwrap_or_else(|error| {
+                panic!("scheduler-current Process root lookup failed: {error:?}")
+            })
+            .unwrap_or_else(|| panic!("scheduler-current Process has no root AddressRegion"));
+        let root_key =
+            crate::memory::address_region::AddressRegionObjectKey::from_object_id(root_object);
+        let address_space = self
+            .regions
+            .region(root_key)
+            .unwrap_or_else(|error| panic!("scheduler-current root is unavailable: {error:?}"))
+            .address_space_key();
+        let (stack_id, context_id) = self
+            .tasks
+            .thread_execution_resources(thread)
+            .unwrap_or_else(|error| panic!("scheduler-current resources failed: {error:?}"))
+            .unwrap_or_else(|| panic!("scheduler-current Thread has no execution resources"));
+        if process == self.process
+            && root_key == self.root_key
+            && self.active_root.as_ref().is_some_and(|root| {
+                root.selects_exact(crate::cpu::CpuIndex::BOOTSTRAP, process, address_space)
+            })
+        {
+            self.active
+                .validate_current_process_root_selection(
+                    self.active_root.as_ref().expect("active root"),
+                    process,
+                    address_space,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("retained scheduler-current root is not physically active: {error:?}")
+                });
+            // A sibling Thread in the same Process retains the unique root
+            // selection token and changes only scheduler-owned execution
+            // identity. Re-activating the same address space would violate
+            // the residency protocol with AlreadyActive.
+            self.thread = thread;
+            self.stack_id = stack_id;
+            self.context_id = context_id;
+            return;
+        }
+        let prepared = self
+            .active
+            .prepare_process_root_selection(crate::cpu::CpuIndex::BOOTSTRAP, process, address_space)
+            .unwrap_or_else(|error| panic!("could not prepare scheduler-current root: {error:?}"));
+        let previous = self.active_root.take();
+        let selected = match self
+            .active
+            .activate_process_root_selection(prepared, previous)
+        {
+            Ok(selected) => selected,
+            Err(failure) => {
+                let (error, prepared, previous) = failure.into_parts();
+                self.active
+                    .abandon_process_root_selection(prepared)
+                    .unwrap_or_else(|abandon| {
+                        panic!("failed root selection could not be abandoned: {abandon:?}")
+                    });
+                self.active_root = previous;
+                panic!("could not activate scheduler-current root: {error:?}");
+            }
+        };
+        // Publish the carrier identity only after CR3/residency selection is
+        // complete. No usercopy can observe a mixed Process/root tuple.
+        self.process = process;
+        self.thread = thread;
+        self.root_key = root_key;
+        self.stack_id = stack_id;
+        self.context_id = context_id;
+        self.active_root = Some(selected);
+    }
+
     fn merge_cleanup(&mut self, cleanup: CleanupQueue<REGISTRY_OBJECTS>) {
         for release in cleanup.into_releases().into_iter().flatten() {
             self.cleanup.push(release);
@@ -949,9 +1096,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         assert_eq!(control, SyscallControl::TerminateCurrent);
         self.deferred_current =
             Some(deferred.expect("primordial exception omitted deferred current resources"));
-        let mut user = self
-            .active
-            .current_process_address_space(&self.active_root, self.process);
+        let mut user = self.active.current_process_address_space(
+            self.active_root.as_ref().expect("active root"),
+            self.process,
+        );
         if let Some(output) = discarded {
             user.discard_owned_output(output)
                 .unwrap_or_else(|_| panic!("primordial exception output pin drifted"));
@@ -964,10 +1112,20 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.merge_cleanup(cleanup);
     }
 
-    fn unmap_all_userspace(
+    fn unmap_primordial_userspace(
         &mut self,
         proof: &crate::task::ProcessQuiescenceProof,
     ) -> Result<(), ()> {
+        self.active
+            .validate_current_process_root_selection(
+                self.active_root.as_ref().ok_or(())?,
+                self.primordial_process,
+                self.primordial_address_space,
+            )
+            .map_err(|_| ())?;
+        if self.process != self.primordial_process || self.root_key != self.primordial_root_key {
+            return Err(());
+        }
         loop {
             let mapping = self
                 .regions
@@ -1002,6 +1160,114 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
         }
         Ok(())
+    }
+
+    /// Removes every low-half mapping from an exited, noncurrent Process while
+    /// the current Process retains the hardware-active CR3. Scratch publication
+    /// is retargeted to the exited Process's exact bound root and restored
+    /// before this single live session is dropped.
+    fn unmap_inactive_userspace(
+        &mut self,
+        process: ProcessKey,
+        root_key: crate::memory::address_region::AddressRegionObjectKey,
+        proof: &crate::task::ProcessQuiescenceProof,
+    ) -> Result<(), ()> {
+        let current_process = self.active_root.as_ref().ok_or(())?.process();
+        if process == current_process {
+            return Err(());
+        }
+        let mut user = self
+            .active
+            .current_process_address_space(self.active_root.as_ref().ok_or(())?, current_process);
+        user.select_process_for_return_validation(process)
+            .map_err(|_| ())?;
+        loop {
+            let mapping = self
+                .regions
+                .region(root_key)
+                .map_err(|_| ())?
+                .mappings()
+                .iter()
+                .flatten()
+                .next()
+                .copied();
+            let Some(mapping) = mapping else {
+                break;
+            };
+            let mut candidates = [None, None, None];
+            let releases = {
+                let region = self
+                    .regions
+                    .region_mut_for_quiesced_teardown(&self.tasks, proof, root_key)
+                    .map_err(|_| ())?;
+                let mut publisher = user
+                    .publisher::<
+                        PRIMORDIAL_TABLE_CANDIDATES,
+                        PRIMORDIAL_JOURNAL_ENTRIES,
+                        PRIMORDIAL_INVALIDATIONS,
+                    >(region.address_space_key(), region.region_key(), &mut candidates)
+                    .map_err(|_| ())?;
+                region
+                    .unmap(
+                        &mut self.memory,
+                        &mut self.registry,
+                        &mut publisher,
+                        mapping.virtual_start(),
+                        mapping.byte_len(),
+                    )
+                    .unwrap_or_else(|failure| {
+                        panic!(
+                            "inactive child mapping teardown diverged: {:?}",
+                            failure.error()
+                        )
+                    })
+            };
+            for candidate in candidates.into_iter().flatten() {
+                user.recycle_table_candidate(candidate);
+            }
+            for release in releases.into_items().into_iter().flatten() {
+                self.cleanup.push(release);
+            }
+        }
+        user.select_process_for_return_validation(current_process)
+            .map_err(|_| ())?;
+        Ok(())
+    }
+
+    fn finish_inactive_process_teardown(
+        &mut self,
+        process: ProcessKey,
+        root_key: crate::memory::address_region::AddressRegionObjectKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    ) -> Result<(), ()> {
+        let proof = self
+            .tasks
+            .process_quiescence_proof(process)
+            .map_err(|_| ())?;
+        let drained = self
+            .shared
+            .execution
+            .blocked_operations_drained(&self.tasks, &proof)
+            .map_err(|_| ())?;
+        self.unmap_inactive_userspace(process, root_key, &proof)?;
+        if process != self.primordial_process {
+            self.active
+                .teardown_empty_child_address_space(process, address_space)
+                .map_err(|_| ())?;
+        }
+        let root_pin = self
+            .regions
+            .retire_quiesced_root(
+                &mut self.tasks,
+                process,
+                &proof,
+                self.shared.execution.blocked_operations(),
+                drained,
+            )
+            .map_err(|_| ())?;
+        self.cleanup
+            .push_optional(self.registry.release_internal(root_pin).map_err(|_| ())?);
+        self.drain_finalizers()
     }
 
     fn release_terminal_authority(&mut self) -> Result<(), ()> {
@@ -1086,7 +1352,51 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .execution
             .blocked_operations_drained(&self.tasks, &proof)
             .map_err(|_| ())?;
-        self.unmap_all_userspace(&proof)?;
+        let address_space = self
+            .regions
+            .region(self.root_key)
+            .map_err(|_| ())?
+            .address_space_key();
+        if self.process == self.primordial_process {
+            self.unmap_primordial_userspace(&proof)?;
+        } else {
+            // The terminal child remains the physically active root when no
+            // successor is runnable. Move the unique residency token to the
+            // permanently retained primordial/kernel root before touching the
+            // child's low half. The child is then noncurrent, so teardown can
+            // use its exact scratch-selected publisher and finally reclaim its
+            // owned PML4 without ever publishing through the primordial root.
+            let prepared = self
+                .active
+                .prepare_process_root_selection(
+                    crate::cpu::CpuIndex::BOOTSTRAP,
+                    self.primordial_process,
+                    self.primordial_address_space,
+                )
+                .map_err(|_| ())?;
+            let previous = self.active_root.take();
+            let selected = match self
+                .active
+                .activate_process_root_selection(prepared, previous)
+            {
+                Ok(selected) => selected,
+                Err(failure) => {
+                    let (_error, prepared, previous) = failure.into_parts();
+                    self.active
+                        .abandon_process_root_selection(prepared)
+                        .unwrap_or_else(|error| {
+                            panic!("terminal safe-root rollback drifted: {error:?}")
+                        });
+                    self.active_root = previous;
+                    return Err(());
+                }
+            };
+            self.active_root = Some(selected);
+            self.unmap_inactive_userspace(self.process, self.root_key, &proof)?;
+            self.active
+                .teardown_empty_child_address_space(self.process, address_space)
+                .map_err(|_| ())?;
+        }
         if self.memory.active_lease_count() != 0 {
             return Err(());
         }
@@ -1181,9 +1491,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         {
             return Err(crate::arch::x86_64::syscall::UserReturnError::BindingChanged);
         }
-        let mut mappings = self
-            .active
-            .current_process_address_space(&self.active_root, self.process);
+        let mut mappings = self.active.current_process_address_space(
+            self.active_root.as_ref().expect("active root"),
+            self.process,
+        );
         frame.authorize_return(current_binding_generation, &mut mappings)
     }
 
@@ -1200,6 +1511,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 
     fn terminate_current(&mut self) -> ! {
+        let retired_process = self.process;
+        let retired_root_key = self.root_key;
+        let retired_address_space = self
+            .regions
+            .region(retired_root_key)
+            .unwrap_or_else(|error| panic!("terminal Process root disappeared: {error:?}"))
+            .address_space_key();
         crate::syscall::complete_deferred_current_reclaim(
             &mut self.registry,
             &self.shared.execution,
@@ -1209,6 +1527,60 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                 .unwrap_or_else(|| panic!("primordial exit omitted deferred resources")),
             &mut self.cleanup,
         );
+        let next = self
+            .shared
+            .execution
+            .schedule_next()
+            .unwrap_or_else(|error| panic!("terminal scheduling failed: {error:?}"))
+            .current;
+        if let Some(next) = next {
+            let (stack_id, context_id) = self
+                .tasks
+                .thread_execution_resources(next)
+                .unwrap_or_else(|error| panic!("terminal next resources failed: {error:?}"))
+                .unwrap_or_else(|| panic!("terminal next Thread has no execution resources"));
+            let stack = self
+                .shared
+                .execution
+                .stack_bounds(stack_id)
+                .unwrap_or_else(|error| panic!("terminal next stack failed: {error:?}"));
+            let continuation = self
+                .shared
+                .execution
+                .kernel_continuation_rsp(context_id)
+                .unwrap_or_else(|error| panic!("terminal next continuation failed: {error:?}"));
+            self.synchronize_scheduler_current();
+            if retired_process != self.process
+                && self.tasks.process_quiescence_proof(retired_process).is_ok()
+            {
+                self.finish_inactive_process_teardown(
+                    retired_process,
+                    retired_root_key,
+                    retired_address_space,
+                )
+                .unwrap_or_else(|_| panic!("inactive exited Process teardown drifted"));
+            }
+            unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(stack) }
+                .unwrap_or_else(|error| panic!("terminal next stack binding failed: {error:?}"));
+            let continuation = if continuation == 0 {
+                unsafe {
+                    crate::arch::x86_64::context::prepare_initial_kernel_continuation(
+                        stack,
+                        crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
+                    )
+                }
+                .unwrap_or_else(|error| {
+                    panic!("terminal fresh continuation preparation failed: {error:?}")
+                })
+                .rsp()
+            } else {
+                continuation
+            };
+            crate::arch::x86_64::syscall::validate_live_syscall_boundary().unwrap_or_else(
+                |error| panic!("terminal next syscall boundary validation failed: {error:?}"),
+            );
+            unsafe { crate::arch::x86_64::context::abandon_to_kernel_continuation(continuation) }
+        }
         let completion = complete_primordial_launch(self);
         #[cfg(feature = "test-support")]
         if self.g5_probe.accepts_completion(&completion) {
@@ -1242,7 +1614,26 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 
     fn enter_scheduled_fresh_thread(&mut self) -> ! {
-        panic!("single-thread primordial runtime selected an unexpected fresh Thread")
+        self.synchronize_scheduler_current();
+        let context = self
+            .shared
+            .execution
+            .load_context(self.context_id)
+            .unwrap_or_else(|error| panic!("could not load fresh Thread context: {error:?}"));
+        let stack = self
+            .shared
+            .execution
+            .stack_bounds(self.stack_id)
+            .unwrap_or_else(|error| panic!("could not load fresh Thread stack: {error:?}"));
+        let state = {
+            let mut mappings = self.active.current_process_address_space(
+                self.active_root.as_ref().expect("active root"),
+                self.process,
+            );
+            crate::arch::x86_64::syscall::ValidatedUserReturn::initial(context, &mut mappings)
+                .unwrap_or_else(|error| panic!("invalid fresh Thread return: {error:?}"))
+        };
+        unsafe { crate::arch::x86_64::syscall::enter_bound_validated_user(&state, stack) }
     }
 
     unsafe fn prepare_suspend<'owner>(
@@ -1300,12 +1691,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 
     fn resume_suspended(&mut self, frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame) {
+        self.synchronize_scheduler_current();
         #[cfg(feature = "test-support")]
         let owner = self.services.operation_owner(self.thread);
         let resumed = {
-            let mut user = self
-                .active
-                .current_process_address_space(&self.active_root, self.process);
+            let mut user = self.active.current_process_address_space(
+                self.active_root.as_ref().expect("active root"),
+                self.process,
+            );
             let mut deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
             self.services.resume_suspended(
                 &mut user,
@@ -1455,7 +1848,7 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     } = monitor;
     let mut runtime = PrimordialRuntimeCarrier {
         active,
-        active_root: initial_root,
+        active_root: Some(initial_root),
         registry,
         memory,
         tasks,
@@ -1469,6 +1862,9 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         stack_id,
         context_id,
         root_key,
+        primordial_process: process,
+        primordial_root_key: root_key,
+        primordial_address_space,
         channel_keys,
         kernel_peer: Some(kernel_peer),
         process_monitor: Some(process_monitor),
@@ -1492,9 +1888,10 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         .stack_bounds(runtime.stack_id)
         .unwrap_or_else(|error| panic!("could not load primordial kernel stack: {error:?}"));
     let state = {
-        let mut mappings = runtime
-            .active
-            .current_process_address_space(&runtime.active_root, runtime.process);
+        let mut mappings = runtime.active.current_process_address_space(
+            runtime.active_root.as_ref().expect("active root"),
+            runtime.process,
+        );
         crate::arch::x86_64::syscall::ValidatedUserReturn::initial(context, &mut mappings)
             .unwrap_or_else(|error| panic!("invalid primordial initial return: {error:?}"))
     };
@@ -1517,12 +1914,40 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
         {
             panic!("primordial syscall arrived without its running Thread");
         }
+        let request = match request {
+            NativeSyscallRequest::ProcessCreate {
+                args,
+                args_size,
+                out_result,
+                result_size,
+            } => {
+                let mut user = self.active.current_process_address_space(
+                    self.active_root.as_ref().expect("active root"),
+                    self.process,
+                );
+                return NativeSyscallResult::returning(crate::syscall::process_create_with_root(
+                    &mut user,
+                    &mut self.registry,
+                    &mut self.tasks,
+                    &mut self.regions,
+                    &mut self.spaces,
+                    self.process,
+                    args,
+                    args_size,
+                    out_result,
+                    result_size,
+                    &mut self.cleanup,
+                ));
+            }
+            other => other,
+        };
         let dispatch = {
             let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
             let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
-            let mut user = self
-                .active
-                .current_process_address_space(&self.active_root, self.process);
+            let mut user = self.active.current_process_address_space(
+                self.active_root.as_ref().expect("active root"),
+                self.process,
+            );
             self.services.dispatch(
                 request,
                 &mut user,
@@ -1571,9 +1996,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 requested_rights,
                 out_handle,
             } => {
-                let mut user = self
-                    .active
-                    .current_process_address_space(&self.active_root, self.process);
+                let mut user = self.active.current_process_address_space(
+                    self.active_root.as_ref().expect("active root"),
+                    self.process,
+                );
                 NativeSyscallResult::returning(crate::syscall::handle_duplicate(
                     &mut user,
                     &mut self.registry,
@@ -1591,9 +2017,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 out_size,
                 out_required_size,
             } => {
-                let mut user = self
-                    .active
-                    .current_process_address_space(&self.active_root, self.process);
+                let mut user = self.active.current_process_address_space(
+                    self.active_root.as_ref().expect("active root"),
+                    self.process,
+                );
                 NativeSyscallResult::returning(crate::syscall::object_get_info_v1(
                     &mut user,
                     &mut self.registry,
@@ -1605,6 +2032,75 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     out_info,
                     out_size,
                     out_required_size,
+                ))
+            }
+            NativeSyscallRequest::ThreadCreate {
+                process,
+                requested_rights,
+                out_thread,
+            } => {
+                let mut user = self.active.current_process_address_space(
+                    self.active_root.as_ref().expect("active root"),
+                    self.process,
+                );
+                NativeSyscallResult::returning(crate::syscall::thread_create(
+                    &mut user,
+                    &mut self.registry,
+                    &mut self.tasks,
+                    self.process,
+                    process,
+                    requested_rights,
+                    out_thread,
+                    &mut self.cleanup,
+                ))
+            }
+            NativeSyscallRequest::ThreadStart { args, args_size } => {
+                let mut user = self.active.current_process_address_space(
+                    self.active_root.as_ref().expect("active root"),
+                    self.process,
+                );
+                NativeSyscallResult::returning(crate::syscall::thread_start_with_access(
+                    &mut user,
+                    &mut self.registry,
+                    &mut self.tasks,
+                    &self.shared.execution,
+                    self.process,
+                    args,
+                    args_size,
+                    &mut self.cleanup,
+                ))
+            }
+            NativeSyscallRequest::ProcessTerminate {
+                process,
+                reason,
+                code,
+            } => self.terminate_process_handle(process, reason, code),
+            NativeSyscallRequest::ThreadTerminate {
+                thread,
+                reason,
+                code,
+            } => self.terminate_thread_handle(thread, reason, code),
+            NativeSyscallRequest::MemoryObjectCreate {
+                byte_len,
+                flags,
+                requested_rights,
+                out_handle,
+            } => {
+                let mut user = self.active.current_process_address_space(
+                    self.active_root.as_ref().expect("active root"),
+                    self.process,
+                );
+                NativeSyscallResult::returning(crate::syscall::memory_object_create_owned(
+                    &mut user,
+                    &mut self.registry,
+                    &mut self.memory,
+                    &mut self.tasks,
+                    self.process,
+                    byte_len,
+                    flags,
+                    requested_rights,
+                    out_handle,
+                    &mut self.cleanup,
                 ))
             }
             NativeSyscallRequest::AddressRegionMap {
@@ -1640,9 +2136,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         args_size: u64,
         out_address: deepwyrm_abi::DwUserAddress,
     ) -> deepwyrm_abi::DwStatus {
-        let mut user = self
-            .active
-            .current_process_address_space(&self.active_root, self.process);
+        let mut user = self.active.current_process_address_space(
+            self.active_root.as_ref().expect("active root"),
+            self.process,
+        );
         let args = match crate::syscall::decode_map_args(&mut user, args_address, args_size) {
             Ok(args) => args,
             Err(status) => return status,
@@ -1670,12 +2167,31 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             Ok(output) => output,
             Err(_) => return deepwyrm_abi::DW_STATUS_BAD_ADDRESS,
         };
-        let region = self
-            .regions
-            .region(self.root_key)
-            .unwrap_or_else(|error| panic!("primordial root region unavailable: {error:?}"));
-        let address_space_key = region.address_space_key();
-        let region_key = region.region_key();
+        let target = match crate::syscall::address_region_mutation_target(
+            &mut self.registry,
+            &self.tasks,
+            &self.regions,
+            self.process,
+            address_region,
+            deepwyrm_abi::DwRights(deepwyrm_abi::DW_RIGHT_MAP.0 | deepwyrm_abi::DW_RIGHT_MODIFY.0),
+            &mut self.cleanup,
+        ) {
+            Ok(target) => target,
+            Err(status) => {
+                user.discard_owned_output(output)
+                    .unwrap_or_else(|_| panic!("primordial map output pin drifted"));
+                return status;
+            }
+        };
+        let caller_process = self.process;
+        if user
+            .select_process_for_return_validation(target.process)
+            .is_err()
+        {
+            user.discard_owned_output(output)
+                .unwrap_or_else(|_| panic!("primordial map output pin drifted"));
+            return DW_STATUS_BAD_STATE;
+        }
         let mut candidates = [None, None, None];
         let result = (|| {
             candidates[0] = Some(
@@ -1695,7 +2211,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     PRIMORDIAL_TABLE_CANDIDATES,
                     PRIMORDIAL_JOURNAL_ENTRIES,
                     PRIMORDIAL_INVALIDATIONS,
-                >(address_space_key, region_key, &mut candidates)
+                >(target.address_space, target.region_key, &mut candidates)
                 .map_err(|_| DW_STATUS_BAD_STATE)?;
             crate::syscall::address_region_map_model(
                 &mut publisher,
@@ -1714,6 +2230,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         for candidate in candidates.into_iter().flatten() {
             user.recycle_table_candidate(candidate);
         }
+        user.select_process_for_return_validation(caller_process)
+            .unwrap_or_else(|error| {
+                panic!("primordial map caller-root restoration failed: {error:?}")
+            });
         match result {
             Ok(address) => {
                 user.commit_owned_output(output, &address.to_le_bytes())
@@ -1734,35 +2254,59 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         address: deepwyrm_abi::DwUserAddress,
         byte_len: u64,
     ) -> deepwyrm_abi::DwStatus {
-        let region = self
-            .regions
-            .region(self.root_key)
-            .unwrap_or_else(|error| panic!("primordial root region unavailable: {error:?}"));
-        let address_space_key = region.address_space_key();
-        let region_key = region.region_key();
-        let mut candidates = [None, None, None];
-        let mut user = self
-            .active
-            .current_process_address_space(&self.active_root, self.process);
-        let mut publisher = user
-            .publisher::<
-                PRIMORDIAL_TABLE_CANDIDATES,
-                PRIMORDIAL_JOURNAL_ENTRIES,
-                PRIMORDIAL_INVALIDATIONS,
-            >(address_space_key, region_key, &mut candidates)
-            .unwrap_or_else(|_| panic!("primordial unmap publisher unavailable"));
-        crate::syscall::address_region_unmap(
-            &mut publisher,
+        let target = match crate::syscall::address_region_mutation_target(
             &mut self.registry,
-            &mut self.memory,
-            &mut self.tasks,
-            &mut self.regions,
+            &self.tasks,
+            &self.regions,
             self.process,
             address_region,
-            address,
-            byte_len,
+            deepwyrm_abi::DW_RIGHT_MODIFY,
             &mut self.cleanup,
-        )
+        ) {
+            Ok(target) => target,
+            Err(status) => return status,
+        };
+        let caller_process = self.process;
+        let mut candidates = [None, None, None];
+        let mut user = self.active.current_process_address_space(
+            self.active_root.as_ref().expect("active root"),
+            self.process,
+        );
+        if user
+            .select_process_for_return_validation(target.process)
+            .is_err()
+        {
+            return DW_STATUS_BAD_STATE;
+        }
+        let status = {
+            let mut publisher = user
+                .publisher::<
+                    PRIMORDIAL_TABLE_CANDIDATES,
+                    PRIMORDIAL_JOURNAL_ENTRIES,
+                    PRIMORDIAL_INVALIDATIONS,
+                >(target.address_space, target.region_key, &mut candidates)
+                .unwrap_or_else(|_| panic!("primordial unmap publisher unavailable"));
+            crate::syscall::address_region_unmap(
+                &mut publisher,
+                &mut self.registry,
+                &mut self.memory,
+                &mut self.tasks,
+                &mut self.regions,
+                self.process,
+                address_region,
+                address,
+                byte_len,
+                &mut self.cleanup,
+            )
+        };
+        for candidate in candidates.into_iter().flatten() {
+            user.recycle_table_candidate(candidate);
+        }
+        user.select_process_for_return_validation(caller_process)
+            .unwrap_or_else(|error| {
+                panic!("primordial unmap caller-root restoration failed: {error:?}")
+            });
+        status
     }
 
     fn exit_process(&mut self, exit_code: u32) -> NativeSyscallResult {
@@ -1798,9 +2342,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         } else {
             assert!(deferred.is_none());
         }
-        let mut user = self
-            .active
-            .current_process_address_space(&self.active_root, self.process);
+        let mut user = self.active.current_process_address_space(
+            self.active_root.as_ref().expect("active root"),
+            self.process,
+        );
         if let Some(output) = discarded {
             user.discard_owned_output(output)
                 .unwrap_or_else(|_| panic!("primordial exit output pin drifted"));
@@ -1812,5 +2357,133 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let cleanup = self.services.take_cleanup();
         self.merge_cleanup(cleanup);
         NativeSyscallResult { status, control }
+    }
+
+    fn terminate_process_handle(
+        &mut self,
+        process: deepwyrm_abi::DwHandle,
+        reason: deepwyrm_abi::DwTerminationReason,
+        code: u32,
+    ) -> NativeSyscallResult {
+        let mut discarded = None;
+        let mut atomic_pin = None;
+        let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
+        let (status, control, deferred) = {
+            let mut terminal = self.services.terminal_cleanup(
+                Some(&mut wait_deadlines),
+                |output| assert!(discarded.replace(output).is_none()),
+                |pin| assert!(atomic_pin.replace(pin).is_none()),
+            );
+            crate::syscall::process_terminate(
+                &mut self.registry,
+                &mut self.tasks,
+                &self.shared.execution,
+                &self.shared.waits,
+                &mut terminal,
+                self.process,
+                self.thread,
+                process,
+                reason,
+                code,
+                &mut self.cleanup,
+            )
+        };
+        self.finish_terminal_adapter_resources(discarded, atomic_pin, control, deferred);
+        if status == DW_STATUS_SUCCESS && control == SyscallControl::ReturnToCaller {
+            let target = crate::syscall::process_handle_target(
+                &mut self.registry,
+                &self.tasks,
+                self.process,
+                process,
+                &mut self.cleanup,
+            )
+            .unwrap_or_else(|error| {
+                panic!("terminated child Process handle lost identity: {error:?}")
+            });
+            if target != self.process {
+                let root_object = self
+                    .tasks
+                    .root_region(target)
+                    .unwrap_or_else(|error| {
+                        panic!("terminated child root lookup failed: {error:?}")
+                    })
+                    .unwrap_or_else(|| panic!("terminated child has no root AddressRegion"));
+                let root_key =
+                    crate::memory::address_region::AddressRegionObjectKey::from_object_id(
+                        root_object,
+                    );
+                let address_space = self
+                    .regions
+                    .region(root_key)
+                    .unwrap_or_else(|error| panic!("terminated child root disappeared: {error:?}"))
+                    .address_space_key();
+                self.finish_inactive_process_teardown(target, root_key, address_space)
+                    .unwrap_or_else(|_| panic!("terminated inactive child teardown drifted"));
+            }
+        }
+        NativeSyscallResult { status, control }
+    }
+
+    fn terminate_thread_handle(
+        &mut self,
+        thread: deepwyrm_abi::DwHandle,
+        reason: deepwyrm_abi::DwTerminationReason,
+        code: u32,
+    ) -> NativeSyscallResult {
+        let mut discarded = None;
+        let mut atomic_pin = None;
+        let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
+        let (status, control, deferred) = {
+            let mut terminal = self.services.terminal_cleanup(
+                Some(&mut wait_deadlines),
+                |output| assert!(discarded.replace(output).is_none()),
+                |pin| assert!(atomic_pin.replace(pin).is_none()),
+            );
+            crate::syscall::thread_terminate(
+                &mut self.registry,
+                &mut self.tasks,
+                &self.shared.execution,
+                &self.shared.waits,
+                &mut terminal,
+                self.process,
+                self.thread,
+                thread,
+                reason,
+                code,
+                &mut self.cleanup,
+            )
+        };
+        self.finish_terminal_adapter_resources(discarded, atomic_pin, control, deferred);
+        NativeSyscallResult { status, control }
+    }
+
+    fn finish_terminal_adapter_resources(
+        &mut self,
+        discarded: Option<user_access::OwnedLiveUserOutput>,
+        atomic_pin: Option<user_access::OwnedLiveAtomicU32>,
+        control: SyscallControl,
+        deferred: Option<crate::task::DeferredCurrentExecutionResources>,
+    ) {
+        if control == SyscallControl::TerminateCurrent {
+            self.deferred_current = Some(
+                deferred.unwrap_or_else(|| panic!("terminal adapter omitted deferred reclaim")),
+            );
+        } else {
+            assert!(deferred.is_none());
+        }
+        let mut user = self.active.current_process_address_space(
+            self.active_root.as_ref().expect("active root"),
+            self.process,
+        );
+        if let Some(output) = discarded {
+            user.discard_owned_output(output)
+                .unwrap_or_else(|_| panic!("terminal adapter output pin drifted"));
+        }
+        if let Some(pin) = atomic_pin {
+            user.release_atomic_u32(pin)
+                .unwrap_or_else(|_| panic!("terminal adapter atomic pin drifted"));
+        }
+        let cleanup = self.services.take_cleanup();
+        self.merge_cleanup(cleanup);
     }
 }

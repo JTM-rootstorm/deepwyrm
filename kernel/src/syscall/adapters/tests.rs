@@ -39,6 +39,8 @@ struct FakeUserMemory {
     deny_write: bool,
     deny_write_at: Option<u64>,
     owned_outputs: usize,
+    validation_process: Option<ProcessKey>,
+    validation_process_override: Option<ProcessKey>,
 }
 
 struct FakeOwnedOutput {
@@ -62,6 +64,8 @@ impl FakeUserMemory {
             deny_write: false,
             deny_write_at: None,
             owned_outputs: 0,
+            validation_process: None,
+            validation_process_override: None,
         }
     }
 
@@ -130,6 +134,33 @@ impl OwnedUserOutputAccess for FakeUserMemory {
             .owned_outputs
             .checked_sub(1)
             .expect("owned fake output discard underflow");
+    }
+}
+
+impl crate::arch::x86_64::syscall::UserReturnMappingValidation for FakeUserMemory {
+    fn executable_at(&mut self, _instruction_pointer: u64) -> bool {
+        true
+    }
+
+    fn writable_byte_below(&mut self, _stack_pointer: u64) -> bool {
+        true
+    }
+}
+
+impl crate::arch::x86_64::syscall::ProcessUserReturnMappingValidation for FakeUserMemory {
+    fn process_key(&self) -> ProcessKey {
+        self.validation_process
+            .expect("fake validation process was not selected")
+    }
+}
+
+impl ThreadStartMappingAccess for FakeUserMemory {
+    fn select_process_for_return_validation(
+        &mut self,
+        process: ProcessKey,
+    ) -> Result<(), DwStatus> {
+        self.validation_process = Some(self.validation_process_override.unwrap_or(process));
+        Ok(())
     }
 }
 
@@ -2100,6 +2131,149 @@ fn address_region_map_preflights_copyout_and_preserves_mapping_leases() {
     assert_eq!(tasks.process_handle_count(process).unwrap(), 0);
 }
 
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the test-local authority uniquely owns both synthetic address-space identities"
+)]
+fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
+    use deepwyrm_abi::{DW_MEMORY_PROTECTION_READ, DW_RIGHT_MAP, DW_RIGHT_READ, DW_RIGHT_WRITE};
+
+    let mut registry = ObjectRegistry::<24>::new();
+    let mut tasks = Tasks::new();
+    let (_group, group_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (caller, caller_ref) = tasks.create_process(&mut registry, &group_owner).unwrap();
+    let (child, child_ref) = tasks.create_process(&mut registry, &group_owner).unwrap();
+    assert!(registry.release_internal(group_owner).unwrap().is_none());
+    let mut spaces = unsafe { crate::memory::address_region::AddressSpaceAuthority::<2, 2>::new() };
+    let mut regions = crate::memory::address_region::AddressRegionObjectAuthority::<2, 8>::new();
+    let (child_region, child_region_ref) = regions
+        .create_root_region(&mut registry, &mut tasks, &mut spaces, child, &child_ref)
+        .unwrap();
+    let caller_handle = tasks
+        .process_handles_mut(caller)
+        .unwrap()
+        .install(caller_ref, DW_RIGHT_MODIFY)
+        .unwrap();
+    let child_handle = tasks
+        .process_handles_mut(caller)
+        .unwrap()
+        .install(child_ref, DW_RIGHT_INSPECT)
+        .unwrap();
+    let child_region_handle = tasks
+        .process_handles_mut(caller)
+        .unwrap()
+        .install(
+            child_region_ref,
+            DwRights(DW_RIGHT_MAP.0 | DW_RIGHT_MODIFY.0),
+        )
+        .unwrap();
+
+    let mut user = FakeUserMemory::new();
+    let mut backing = TestBacking::new();
+    let mut memory = MemoryObjectAuthority::<4, 8>::new();
+    let mut cleanup = CleanupQueue::<24>::new();
+    assert_eq!(
+        memory_object_create(
+            &mut user,
+            &mut backing,
+            &mut registry,
+            &mut memory,
+            &mut tasks,
+            caller,
+            4096,
+            0,
+            DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MAP.0),
+            DwUserAddress(BASE + 0x100),
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let memory_handle = DwHandle(u64_at(&user, BASE + 0x100));
+    write_map_args(&mut user, BASE + 0x200, DW_MEMORY_PROTECTION_READ.0);
+    let child_model = regions.region(child_region).unwrap();
+    let child_address_space = child_model.address_space_key();
+    let mut publisher = FakePublisher {
+        address_space: child_address_space,
+        region: child_model.region_key(),
+        replacements: 0,
+    };
+    let target = address_region_mutation_target(
+        &mut registry,
+        &tasks,
+        &regions,
+        caller,
+        child_region_handle,
+        DwRights(DW_RIGHT_MAP.0 | DW_RIGHT_MODIFY.0),
+        &mut cleanup,
+    )
+    .unwrap();
+    assert_eq!(target.process, child);
+    assert_eq!(target.address_space, child_address_space);
+    assert_eq!(target.region, child_region);
+
+    assert_eq!(
+        address_region_map(
+            &mut user,
+            &mut publisher,
+            &mut registry,
+            &mut memory,
+            &mut tasks,
+            &mut regions,
+            caller,
+            child_region_handle,
+            memory_handle,
+            DwUserAddress(BASE + 0x200),
+            u64::from(deepwyrm_abi::DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE),
+            DwUserAddress(BASE + 0x300),
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let mapped = u64_at(&user, BASE + 0x300);
+    assert_eq!(publisher.replacements, 1);
+    assert_eq!(regions.region_process(child_region).unwrap(), child);
+    assert_eq!(
+        address_region_unmap(
+            &mut publisher,
+            &mut registry,
+            &mut memory,
+            &mut tasks,
+            &mut regions,
+            caller,
+            child_region_handle,
+            DwUserAddress(mapped),
+            4096,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(publisher.replacements, 2);
+
+    for handle in [
+        memory_handle,
+        child_region_handle,
+        child_handle,
+        caller_handle,
+    ] {
+        assert_eq!(
+            handle_close(&mut registry, &mut tasks, caller, handle, &mut cleanup,),
+            DW_STATUS_SUCCESS
+        );
+    }
+    for release in cleanup.into_releases().into_iter().flatten() {
+        if release.object_type() == deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT {
+            let finalization = memory.take_finalization(release).unwrap();
+            crate::memory::object::complete_memory_finalization(
+                &mut registry,
+                &mut backing.roles,
+                finalization,
+            );
+        }
+    }
+    assert_eq!(tasks.process_handle_count(caller).unwrap(), 0);
+}
+
 fn test_stack_bounds<const N: usize>() -> [crate::memory::kernel_stack::KernelStackBounds; N] {
     core::array::from_fn(|index| {
         let stride = 0x11_000_u64;
@@ -2388,6 +2562,102 @@ fn non_current_process_termination_reclaims_only_the_target_batch() {
     cleanup.push_optional(registry.release_handle(current_thread_ref).unwrap());
     cleanup.push_optional(registry.release_handle(target_thread_ref).unwrap());
     cleanup.push_optional(registry.release_handle(current_process_ref).unwrap());
+    cleanup.push_optional(registry.release_internal(root_owner).unwrap());
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+#[test]
+fn noncurrent_unstarted_child_termination_is_immediately_quiescent() {
+    let mut registry = ObjectRegistry::<16>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (current_process, current_process_ref) =
+        tasks.create_process(&mut registry, &root_owner).unwrap();
+    let (child_process, child_process_ref) =
+        tasks.create_process(&mut registry, &root_owner).unwrap();
+    let current_owner = registry
+        .retain_internal_from_handle(&current_process_ref)
+        .unwrap();
+    let (current_thread, current_thread_ref) =
+        tasks.create_thread(&mut registry, &current_owner).unwrap();
+    assert!(registry.release_internal(current_owner).unwrap().is_none());
+    let _current_handle = tasks
+        .process_handles_mut(current_process)
+        .unwrap()
+        .install(current_process_ref, DW_RIGHT_MODIFY)
+        .unwrap();
+    let child_handle = tasks
+        .process_handles_mut(current_process)
+        .unwrap()
+        .install(child_process_ref, DW_RIGHT_MODIFY)
+        .unwrap();
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    execution
+        .start_thread(&mut tasks, current_thread, test_start(0x15))
+        .unwrap();
+    assert_eq!(
+        execution.schedule_next().unwrap().current,
+        Some(current_thread)
+    );
+    let waits = WaitRegistry::<1>::new();
+    let mut terminal_waits = NoTerminalWaitCleanup;
+    let mut cleanup = CleanupQueue::<16>::new();
+
+    assert!(
+        terminal_outcome(
+            process_terminate(
+                &mut registry,
+                &mut tasks,
+                &execution,
+                &waits,
+                &mut terminal_waits,
+                current_process,
+                current_thread,
+                child_handle,
+                deepwyrm_abi::DW_TERMINATION_AUTHORIZED,
+                0x22,
+                &mut cleanup,
+            ),
+            DW_STATUS_SUCCESS,
+            SyscallControl::ReturnToCaller,
+        )
+        .is_none()
+    );
+    assert_eq!(
+        process_handle_target(
+            &mut registry,
+            &tasks,
+            current_process,
+            child_handle,
+            &mut cleanup,
+        )
+        .unwrap(),
+        child_process
+    );
+    assert!(tasks.process_quiescence_proof(child_process).is_ok());
+    assert_eq!(
+        tasks.process_info(child_process).unwrap().state,
+        deepwyrm_abi::DW_TASK_STATE_EXITED
+    );
+
+    let deferred = terminal_outcome(
+        process_exit(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut terminal_waits,
+            current_process,
+            current_thread,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    complete_deferred_current_reclaim(&mut registry, &execution, &waits, deferred, &mut cleanup);
+    cleanup.push_optional(registry.release_handle(current_thread_ref).unwrap());
     cleanup.push_optional(registry.release_internal(root_owner).unwrap());
     finish_task_cleanup(&mut registry, &mut tasks, cleanup);
 }
@@ -2732,28 +3002,6 @@ fn self_thread_termination_with_live_sibling_never_returns_to_reclaimed_context(
     finish_task_cleanup(&mut registry, &mut tasks, cleanup);
 }
 
-struct ProcessBoundMappings {
-    process: ProcessKey,
-    executable: bool,
-    writable_stack: bool,
-}
-
-impl crate::arch::x86_64::syscall::UserReturnMappingValidation for ProcessBoundMappings {
-    fn executable_at(&mut self, _instruction_pointer: u64) -> bool {
-        self.executable
-    }
-
-    fn writable_byte_below(&mut self, _stack_pointer: u64) -> bool {
-        self.writable_stack
-    }
-}
-
-impl crate::arch::x86_64::syscall::ProcessUserReturnMappingValidation for ProcessBoundMappings {
-    fn process_key(&self) -> ProcessKey {
-        self.process
-    }
-}
-
 fn write_thread_start_args(
     memory: &mut FakeUserMemory,
     address: u64,
@@ -2807,15 +3055,10 @@ fn thread_start_validates_the_target_process_address_space() {
     let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
     let mut cleanup = CleanupQueue::<24>::new();
 
-    let mut wrong = ProcessBoundMappings {
-        process: caller,
-        executable: true,
-        writable_stack: true,
-    };
+    user.validation_process_override = Some(caller);
     assert_eq!(
-        thread_start(
+        thread_start_with_access(
             &mut user,
-            &mut wrong,
             &mut registry,
             &mut tasks,
             &execution,
@@ -2831,16 +3074,12 @@ fn thread_start_validates_the_target_process_address_space() {
         tasks.thread_info(thread).unwrap().state,
         deepwyrm_abi::DW_TASK_STATE_CREATED
     );
+    assert_eq!(user.validation_process, Some(caller));
 
-    let mut correct = ProcessBoundMappings {
-        process: target,
-        executable: true,
-        writable_stack: true,
-    };
+    user.validation_process_override = None;
     assert_eq!(
-        thread_start(
+        thread_start_with_access(
             &mut user,
-            &mut correct,
             &mut registry,
             &mut tasks,
             &execution,
@@ -2851,14 +3090,14 @@ fn thread_start_validates_the_target_process_address_space() {
         ),
         DW_STATUS_SUCCESS
     );
+    assert_eq!(user.validation_process, Some(target));
     assert_eq!(
         execution.scheduler_state(thread),
         Some(SchedulerThreadState::Runnable)
     );
     assert_eq!(
-        thread_start(
+        thread_start_with_access(
             &mut user,
-            &mut correct,
             &mut registry,
             &mut tasks,
             &execution,
@@ -7726,6 +7965,8 @@ fn process_create_injected_precommit_boundaries_rollback_every_authority() {
         for retry in 0..3 {
             let mut cleanup = CleanupQueue::<16>::new();
             let mut observed = false;
+            let reserved_roots = core::cell::Cell::new(0_u32);
+            let rolled_back_roots = core::cell::Cell::new(0_u32);
             assert_eq!(
                 process_create_transaction(
                     &mut fixture.user,
@@ -7739,6 +7980,13 @@ fn process_create_injected_precommit_boundaries_rollback_every_authority() {
                     DwUserAddress(OUT),
                     u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE),
                     &mut cleanup,
+                    |_, _, _| {
+                        reserved_roots.set(reserved_roots.get() + 1);
+                        Ok(())
+                    },
+                    |_, _, _| {
+                        rolled_back_roots.set(rolled_back_roots.get() + 1);
+                    },
                     |candidate| {
                         if candidate == stage {
                             observed = true;
@@ -7752,6 +8000,10 @@ fn process_create_injected_precommit_boundaries_rollback_every_authority() {
                 "{stage:?} retry {retry}"
             );
             assert!(observed, "{stage:?} retry {retry} was not reached");
+            let expected_architecture_reservation =
+                u32::from(stage == ProcessCreatePreparation::ParentResultSlots);
+            assert_eq!(reserved_roots.get(), expected_architecture_reservation);
+            assert_eq!(rolled_back_roots.get(), expected_architecture_reservation);
             assert_f10_failure_preserves_caller(
                 &fixture,
                 OUT,

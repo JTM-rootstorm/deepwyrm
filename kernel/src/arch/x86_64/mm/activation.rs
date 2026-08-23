@@ -1436,10 +1436,12 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             });
         let target = &mut self.target;
         LiveProcessAddressSpace {
-            root,
+            root: root as *const PageTableRoot,
+            primordial_root: &self.root,
             identity,
             address_space,
             process,
+            root_bindings: &mut self.root_bindings,
             roles: target.roles,
             target: user_access::TrackedActiveTarget {
                 scratch: &mut target.scratch,
@@ -1447,6 +1449,43 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             },
             _root: core::marker::PhantomData,
         }
+    }
+
+    /// Revalidates a retained move-only selection against the physical CPU and
+    /// CR3 without manufacturing a second residency token. Same-Process
+    /// sibling switches use this before updating only carrier Thread state.
+    #[allow(
+        unsafe_code,
+        reason = "the retained active-root token is checked against current CPU identity and CR3"
+    )]
+    pub(crate) fn validate_current_process_root_selection(
+        &self,
+        active_root: &ActiveRootSelection,
+        process: crate::task::ProcessKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    ) -> Result<(), RootBindingError> {
+        let cpu = crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
+            .and_then(crate::cpu::CpuIndex::new)
+            .ok_or(RootBindingError::CpuMismatch)?;
+        let observed_root: u64;
+        unsafe {
+            core::arch::asm!(
+                "mov {}, cr3",
+                out(reg) observed_root,
+                options(nostack, preserves_flags),
+            );
+        }
+        let (_, _, selected_address_space) = self.root_bindings.active_root_for_process(
+            &self.root,
+            active_root,
+            cpu,
+            observed_root,
+            process,
+        )?;
+        if selected_address_space != address_space {
+            return Err(RootBindingError::RootMismatch);
+        }
+        Ok(())
     }
 
     pub(crate) fn bind_primordial_address_space(
@@ -1485,91 +1524,14 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         process: crate::task::ProcessKey,
         address_space: crate::memory::address_region::AddressSpaceKey,
     ) -> Result<(), RootBindingError> {
-        self.root_bindings
-            .preflight_new_binding(address_space, process)?;
-        self.root_bindings.kernel_half()?;
-        let owner = self
-            .target
-            .roles
-            .create_table_owner()
-            .map_err(RootBindingError::FrameRole)?;
-        let allocation = self
-            .target
-            .roles
-            .allocate(1)
-            .map_err(RootBindingError::FrameRole)?;
-        let frame = match FrameAddress::new(allocation.physical_start(), self.root.physical_limit())
-        {
-            Ok(frame) => frame,
-            Err(_) => {
-                self.target
-                    .roles
-                    .cancel_allocation(allocation)
-                    .unwrap_or_else(|_| panic!("invalid child-root allocation rollback drifted"));
-                return Err(RootBindingError::RootMismatch);
-            }
-        };
-        if self.target.scratch.zero_allocator_frame(frame).is_err() {
-            self.target
-                .roles
-                .cancel_allocation(allocation)
-                .unwrap_or_else(|_| panic!("child-root allocation rollback drifted"));
-            return Err(RootBindingError::RootMismatch);
-        }
-        let zeroed = unsafe { self.target.roles.assume_zeroed(allocation) }
-            .unwrap_or_else(|_| panic!("child-root zeroed transition drifted"));
-        let candidate = match self
-            .target
-            .roles
-            .prepare_table(zeroed, owner, TableLevel::Pml4)
-        {
-            Ok(candidate) => candidate,
-            Err(failure) => {
-                let error = failure.error();
-                self.target
-                    .roles
-                    .cancel_zeroed(failure.into_grant())
-                    .unwrap_or_else(|_| panic!("child-root candidate rollback drifted"));
-                return Err(RootBindingError::FrameRole(error));
-            }
-        };
-        if let Err(error) = self
-            .root_bindings
-            .kernel_half()
-            .unwrap_or_else(|_| panic!("preflighted kernel-half binding disappeared"))
-            .install(&mut self.target.scratch, frame)
-        {
-            self.target
-                .roles
-                .cancel_table_candidate(candidate)
-                .unwrap_or_else(|_| panic!("child-root kernel-half rollback drifted"));
-            return Err(error);
-        }
-        let identity = match self.target.roles.commit_table(candidate, None) {
-            Ok(identity) => identity,
-            Err(failure) => {
-                let error = failure.error();
-                self.target
-                    .roles
-                    .cancel_table_candidate(failure.into_grant())
-                    .unwrap_or_else(|_| panic!("child-root commit rollback drifted"));
-                return Err(RootBindingError::FrameRole(error));
-            }
-        };
-        let root = unsafe {
-            PageTableRoot::from_owned_root(identity.physical_start(), self.root.capabilities)
-        }
-        .unwrap_or_else(|_| panic!("typed child PML4 address became invalid"));
-        if let Err((error, _root)) = self.root_bindings.bind_owned(
-            &*self.target.roles,
-            address_space,
+        reserve_child_address_space_parts(
+            &self.root,
+            &mut self.root_bindings,
+            self.target.roles,
+            &mut self.target.scratch,
             process,
-            root,
-            identity,
-        ) {
-            panic!("preflighted child-root binding rejected after commit: {error:?}");
-        }
-        Ok(())
+            address_space,
+        )
     }
 
     pub(crate) fn prepare_process_root_selection(
@@ -1617,6 +1579,90 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> ! {
         primordial::enter(self, modules)
     }
+}
+
+#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "the committed typed PML4 grant becomes one linearly owned PageTableRoot"
+)]
+fn reserve_child_address_space_parts<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
+    primordial_root: &PageTableRoot,
+    root_bindings: &mut AddressSpaceRootBindings<
+        LIVE_ADDRESS_SPACE_CAPACITY,
+        { crate::cpu::CPU_CAPACITY },
+    >,
+    roles: &mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
+    scratch: &mut ActiveScratchTarget<LiveActiveScratchIo>,
+    process: crate::task::ProcessKey,
+    address_space: crate::memory::address_region::AddressSpaceKey,
+) -> Result<(), RootBindingError> {
+    root_bindings.preflight_new_binding(address_space, process)?;
+    root_bindings.kernel_half()?;
+    let owner = roles
+        .create_table_owner()
+        .map_err(RootBindingError::FrameRole)?;
+    let allocation = roles.allocate(1).map_err(RootBindingError::FrameRole)?;
+    let frame = match FrameAddress::new(
+        allocation.physical_start(),
+        primordial_root.physical_limit(),
+    ) {
+        Ok(frame) => frame,
+        Err(_) => {
+            roles
+                .cancel_allocation(allocation)
+                .unwrap_or_else(|_| panic!("invalid child-root allocation rollback drifted"));
+            return Err(RootBindingError::RootMismatch);
+        }
+    };
+    if scratch.zero_allocator_frame(frame).is_err() {
+        roles
+            .cancel_allocation(allocation)
+            .unwrap_or_else(|_| panic!("child-root allocation rollback drifted"));
+        return Err(RootBindingError::RootMismatch);
+    }
+    let zeroed = unsafe { roles.assume_zeroed(allocation) }
+        .unwrap_or_else(|_| panic!("child-root zeroed transition drifted"));
+    let candidate = match roles.prepare_table(zeroed, owner, TableLevel::Pml4) {
+        Ok(candidate) => candidate,
+        Err(failure) => {
+            let error = failure.error();
+            roles
+                .cancel_zeroed(failure.into_grant())
+                .unwrap_or_else(|_| panic!("child-root candidate rollback drifted"));
+            return Err(RootBindingError::FrameRole(error));
+        }
+    };
+    if let Err(error) = root_bindings
+        .kernel_half()
+        .unwrap_or_else(|_| panic!("preflighted kernel-half binding disappeared"))
+        .install(scratch, frame)
+    {
+        roles
+            .cancel_table_candidate(candidate)
+            .unwrap_or_else(|_| panic!("child-root kernel-half rollback drifted"));
+        return Err(error);
+    }
+    let identity = match roles.commit_table(candidate, None) {
+        Ok(identity) => identity,
+        Err(failure) => {
+            let error = failure.error();
+            roles
+                .cancel_table_candidate(failure.into_grant())
+                .unwrap_or_else(|_| panic!("child-root commit rollback drifted"));
+            return Err(RootBindingError::FrameRole(error));
+        }
+    };
+    let root = unsafe {
+        PageTableRoot::from_owned_root(identity.physical_start(), primordial_root.capabilities)
+    }
+    .unwrap_or_else(|_| panic!("typed child PML4 address became invalid"));
+    if let Err((error, _root)) =
+        root_bindings.bind_owned(&*roles, address_space, process, root, identity)
+    {
+        panic!("preflighted child-root binding rejected after commit: {error:?}");
+    }
+    Ok(())
 }
 
 impl<A> ActiveDeepPaging<A> {

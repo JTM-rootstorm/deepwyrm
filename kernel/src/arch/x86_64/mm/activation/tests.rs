@@ -1725,6 +1725,180 @@ fn exact_roots_isolate_same_virtual_address_and_switch_a_b_a() {
             identity_a.physical_start()
         ]
     );
+    assert!(a1.selects_exact(cpu, process_a, key_a));
+    bindings
+        .teardown_empty_owned(&mut roles, process_b, key_b)
+        .unwrap();
+    assert!(matches!(
+        bindings.root_for_process(&root_a, process_b),
+        Err(RootBindingError::Missing)
+    ));
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "synthetic roots model the no-successor terminal handoff before owned-root reclaim"
+)]
+fn last_runnable_child_switches_to_primordial_before_owned_root_teardown() {
+    let mut roles = synthetic_frame_role_manager::<1, 16>(0x34_000, 8);
+    let primordial_owner = roles.create_table_owner().unwrap();
+    let child_owner = roles.create_table_owner().unwrap();
+    let primordial_identity = commit_table(&mut roles, primordial_owner, TableLevel::Pml4, None);
+    let child_identity = commit_table(&mut roles, child_owner, TableLevel::Pml4, None);
+    let capabilities = PagingCapabilities::validate(40, true, true, true).unwrap();
+    let primordial_root = unsafe {
+        PageTableRoot::from_owned_root(primordial_identity.physical_start(), capabilities)
+    }
+    .unwrap();
+    let child_root =
+        unsafe { PageTableRoot::from_owned_root(child_identity.physical_start(), capabilities) }
+            .unwrap();
+    let (primordial_process, child_process) = process_keys();
+    let mut authority =
+        unsafe { crate::memory::address_region::AddressSpaceAuthority::<2, 2>::new() };
+    let primordial_space = authority.create_address_space().unwrap();
+    let child_space = authority.create_address_space().unwrap();
+    let mut bindings = AddressSpaceRootBindings::<2, 1>::new();
+    bindings
+        .bind_primordial(
+            &roles,
+            primordial_space,
+            primordial_process,
+            &primordial_root,
+            primordial_identity,
+        )
+        .unwrap();
+    bindings
+        .bind_owned(
+            &roles,
+            child_space,
+            child_process,
+            child_root,
+            child_identity,
+        )
+        .unwrap_or_else(|_| panic!("child root binding succeeds"));
+
+    let cpu = CpuIndex::BOOTSTRAP;
+    let mut switches = RecordedRootSwitches {
+        cpu: Some(cpu),
+        roots: Vec::new(),
+    };
+    let child = bindings
+        .activate_selection(
+            bindings
+                .prepare_selection(cpu, child_process, child_space)
+                .unwrap(),
+            None,
+            &mut switches,
+        )
+        .unwrap_or_else(|failure| panic!("initial child switch failed: {:?}", failure.error()));
+    assert_eq!(
+        bindings.teardown_empty_owned(&mut roles, child_process, child_space),
+        Err(RootBindingError::Resident)
+    );
+
+    let primordial = bindings
+        .activate_selection(
+            bindings
+                .prepare_selection(cpu, primordial_process, primordial_space)
+                .unwrap(),
+            Some(child),
+            &mut switches,
+        )
+        .unwrap_or_else(|failure| {
+            panic!("terminal safe-root switch failed: {:?}", failure.error())
+        });
+    assert!(primordial.selects_exact(cpu, primordial_process, primordial_space));
+    assert_eq!(
+        switches.roots,
+        [
+            child_identity.physical_start(),
+            primordial_identity.physical_start()
+        ]
+    );
+    bindings
+        .teardown_empty_owned(&mut roles, child_process, child_space)
+        .unwrap();
+    assert!(matches!(
+        bindings.root_for_process(&primordial_root, child_process),
+        Err(RootBindingError::Missing)
+    ));
+    assert_eq!(
+        bindings
+            .active_root_for_process(
+                &primordial_root,
+                &primordial,
+                cpu,
+                primordial_identity.physical_start(),
+                primordial_process,
+            )
+            .unwrap()
+            .1,
+        primordial_identity
+    );
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "synthetic scheduler siblings exercise retained move-only root ownership without live CR3 access"
+)]
+fn same_process_sibling_switch_retains_exact_active_root_selection() {
+    let mut registry = crate::object::ObjectRegistry::<16>::new();
+    let mut tasks = crate::task::TaskAuthority::<1, 1, 2, 2>::new();
+    let (_group, group_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (process, process_ref) = tasks.create_process(&mut registry, &group_owner).unwrap();
+    let process_owner = registry.retain_internal_from_handle(&process_ref).unwrap();
+    let (first, _first_ref) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    let (second, _second_ref) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    assert_ne!(first, second);
+    assert_eq!(tasks.thread_process(first).unwrap(), process);
+    assert_eq!(tasks.thread_process(second).unwrap(), process);
+
+    let mut roles = synthetic_frame_role_manager::<1, 8>(0x3c_000, 4);
+    let owner = roles.create_table_owner().unwrap();
+    let identity = commit_table(&mut roles, owner, TableLevel::Pml4, None);
+    let capabilities = PagingCapabilities::validate(40, true, true, true).unwrap();
+    let root =
+        unsafe { PageTableRoot::from_owned_root(identity.physical_start(), capabilities) }.unwrap();
+    let mut authority =
+        unsafe { crate::memory::address_region::AddressSpaceAuthority::<1, 1>::new() };
+    let address_space = authority.create_address_space().unwrap();
+    let mut bindings = AddressSpaceRootBindings::<1, 1>::new();
+    bindings
+        .bind_primordial(&roles, address_space, process, &root, identity)
+        .unwrap();
+    let cpu = CpuIndex::BOOTSTRAP;
+    let mut writes = RecordedRootSwitches {
+        cpu: Some(cpu),
+        roots: Vec::new(),
+    };
+    let active = bindings
+        .activate_selection(
+            bindings
+                .prepare_selection(cpu, process, address_space)
+                .unwrap(),
+            None,
+            &mut writes,
+        )
+        .unwrap_or_else(|failure| {
+            panic!("initial sibling root switch failed: {:?}", failure.error())
+        });
+    let mut carrier_thread = first;
+    assert_eq!(carrier_thread, first);
+    assert!(active.selects_exact(cpu, process, address_space));
+    carrier_thread = second;
+    assert_eq!(carrier_thread, second);
+    assert!(active.selects_exact(cpu, process, address_space));
+    assert_eq!(
+        bindings
+            .active_root_for_process(&root, &active, cpu, identity.physical_start(), process,)
+            .unwrap()
+            .1,
+        identity
+    );
+    assert_eq!(writes.roots, [identity.physical_start()]);
 }
 
 #[test]
