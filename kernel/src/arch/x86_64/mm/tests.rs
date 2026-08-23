@@ -221,6 +221,75 @@ fn user_map_atomically_upgrades_shared_supervisor_ancestors() {
 }
 
 #[test]
+fn retiring_ap_identity_leaf_releases_the_low_user_path() {
+    let mut tables = FakeTables::owned_root();
+    let trampoline = VirtualPage::new(0x8000).unwrap();
+    tables.claimed.extend([0x2000, 0x3000, 0x4000]);
+    tables
+        .entries
+        .insert((0x1000, trampoline.index(3)), 0x2000 | PRESENT | WRITABLE);
+    tables
+        .entries
+        .insert((0x2000, trampoline.index(2)), 0x3000 | PRESENT | WRITABLE);
+    tables
+        .entries
+        .insert((0x3000, trampoline.index(1)), 0x4000 | PRESENT | WRITABLE);
+    tables.entries.insert(
+        (0x4000, trampoline.index(0)),
+        trampoline.address() | PRESENT | ACCESSED | DIRTY,
+    );
+
+    root()
+        .retire_architecture_bootstrap_identity_page(&mut tables, trampoline, trampoline.address())
+        .unwrap();
+    assert_eq!(tables.entry(0x4000, trampoline.index(0)), 0);
+    assert_eq!(tables.invalidated, [trampoline.address()]);
+
+    root()
+        .map_page(
+            &mut tables,
+            trampoline,
+            0x9000,
+            MappingPermissions::USER_READ_ONLY,
+            &[],
+        )
+        .unwrap();
+    assert_ne!(tables.entry(0x4000, trampoline.index(0)) & USER, 0);
+}
+
+#[test]
+fn ap_identity_retirement_rejects_nonidentity_or_user_paths() {
+    let trampoline = VirtualPage::new(0x8000).unwrap();
+    for user_ancestor in [false, true] {
+        let mut tables = FakeTables::owned_root();
+        tables.claimed.extend([0x2000, 0x3000, 0x4000]);
+        let user = if user_ancestor { USER } else { 0 };
+        tables.entries.insert(
+            (0x1000, trampoline.index(3)),
+            0x2000 | PRESENT | WRITABLE | user,
+        );
+        tables
+            .entries
+            .insert((0x2000, trampoline.index(2)), 0x3000 | PRESENT | WRITABLE);
+        tables
+            .entries
+            .insert((0x3000, trampoline.index(1)), 0x4000 | PRESENT | WRITABLE);
+        tables
+            .entries
+            .insert((0x4000, trampoline.index(0)), 0x9000 | PRESENT);
+        assert_eq!(
+            root().retire_architecture_bootstrap_identity_page(
+                &mut tables,
+                trampoline,
+                trampoline.address(),
+            ),
+            Err(MapError::InvalidPath)
+        );
+        assert!(tables.invalidated.is_empty());
+    }
+}
+
+#[test]
 fn preflight_and_commit_failures_leave_entries_claims_and_tlb_unchanged() {
     for mode in 0..10 {
         let mut tables = FakeTables::owned_root();

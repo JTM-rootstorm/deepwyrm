@@ -651,6 +651,70 @@ impl PageTableRoot {
         Ok(frame)
     }
 
+    /// Retires the one supervisor-only low identity leaf used to enter the
+    /// higher-half AP bootstrap path. This deliberately does not accept a
+    /// general supervisor mapping: the virtual page must equal the expected
+    /// frame, every ancestor must remain supervisor-only, and the leaf may
+    /// carry only hardware A/D drift in addition to `PRESENT`.
+    pub(crate) fn retire_architecture_bootstrap_identity_page<A: PageTableTransaction>(
+        &self,
+        access: &mut A,
+        page: VirtualPage,
+        expected_physical_start: u64,
+    ) -> Result<(), MapError<A::Error>> {
+        let expected = FrameAddress::new(expected_physical_start, self.physical_limit())
+            .map_err(|_| MapError::InvalidPath)?;
+        if page.address() != expected.address()
+            || page.address() == 0
+            || page.address() >= AP_TRAMPOLINE_LIMIT
+        {
+            return Err(MapError::InvalidPath);
+        }
+
+        let mut plan = MutationPlan::empty(self.frame, page);
+        let mut current = self.frame;
+        let mut traversed = [EMPTY_FRAME; 4];
+        traversed[0] = current;
+        for (depth, level) in (1..=3).rev().enumerate() {
+            let old = access
+                .read_entry(current, page.index(level))
+                .map_err(MapError::Access)?;
+            let (child, user) = decode_intermediate_any(old, self.physical_limit())
+                .map_err(|_| MapError::InvalidPath)?;
+            if user || traversed[..=depth].contains(&child) {
+                return Err(MapError::InvalidPath);
+            }
+            plan.push_assertion(EntryAssertion {
+                table: current,
+                index: page.index(level),
+                expected: old,
+                compare_mask: !ACCESSED,
+            });
+            traversed[depth + 1] = child;
+            current = child;
+        }
+
+        let old = access
+            .read_entry(current, page.index(0))
+            .map_err(MapError::Access)?;
+        validate_entry_bits(old, self.physical_limit()).map_err(|_| MapError::InvalidPath)?;
+        if old & !(address_mask(self.physical_limit()) | ACCESSED | DIRTY) != PRESENT
+            || old & address_mask(self.physical_limit()) != expected.address()
+        {
+            return Err(MapError::InvalidPath);
+        }
+        plan.push_mutation(EntryMutation {
+            table: current,
+            index: page.index(0),
+            expected: old,
+            compare_mask: !(ACCESSED | DIRTY),
+            replacement: 0,
+            preserve_mask: 0,
+        });
+        plan.leaf_data = Some(expected);
+        commit(access, &plan)
+    }
+
     /// Changes one present base-page mapping without changing its frame.
     pub fn protect_page<A: PageTableTransaction>(
         &self,

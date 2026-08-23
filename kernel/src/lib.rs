@@ -428,6 +428,9 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
                 .wait_until_parked(cpu_index, H1_AP_PARK_POLL_LIMIT)
                 .unwrap_or_else(|error| panic!("AP {cpu_index} did not park: {error:?}"));
         }
+        active_paging
+            .retire_ap_trampoline_mapping()
+            .unwrap_or_else(|error| panic!("failed to retire the H1 AP trampoline: {error:?}"));
         #[cfg(not(feature = "test-support"))]
         let _ = debug::emit_early_record(
             debug::DiagnosticLevel::Info,

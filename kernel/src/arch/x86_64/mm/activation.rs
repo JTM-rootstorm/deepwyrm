@@ -17,6 +17,8 @@ use crate::memory::frame_roles::{
 use crate::memory::physical::PhysicalRange;
 
 use super::super::VirtualPage;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+use super::super::journal::PageTableJournal;
 use super::super::journal::{
     AtomicPageTableTarget, JournalWrite, target_seal as journal_target_seal,
 };
@@ -436,6 +438,7 @@ pub(crate) struct LiveActivePagingTarget<
     roles: &'a mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
     _kernel_roles: KernelImageRoleSet,
     ap_trampoline: ArchitectureBootstrapGrant,
+    ap_trampoline_mapped: bool,
     scratch: ActiveScratchTarget<LiveActiveScratchIo>,
     _not_send_sync: core::marker::PhantomData<*mut ()>,
 }
@@ -1245,6 +1248,7 @@ unsafe impl<'a, 'handoff, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
             roles: self.roles,
             _kernel_roles: kernel_roles,
             ap_trampoline,
+            ap_trampoline_mapped: true,
             scratch: ActiveScratchTarget {
                 scratch: self.scratch,
                 io: LiveActiveScratchIo,
@@ -1268,6 +1272,9 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .roles
             .validate_architecture_bootstrap(&self.target.ap_trampoline)
             .map_err(|_| LiveActiveTargetError::InvalidIndex)?;
+        if !self.target.ap_trampoline_mapped {
+            return Err(LiveActiveTargetError::InvalidIndex);
+        }
         let frame = FrameAddress::new(
             self.target.ap_trampoline.physical_start(),
             self.root.physical_limit(),
@@ -1276,8 +1283,48 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.target.scratch.write_physical_bytes(frame, 0, image)
     }
 
-    pub(crate) const fn ap_trampoline_physical_start(&self) -> u64 {
+    pub(crate) fn ap_trampoline_physical_start(&self) -> u64 {
+        assert!(
+            self.target.ap_trampoline_mapped,
+            "AP trampoline mapping was already retired"
+        );
         self.target.ap_trampoline.physical_start()
+    }
+
+    /// Removes the low identity leaf once every AP has reached its private
+    /// higher-half parked carrier. The live-mapping state is consumed exactly
+    /// once so no later caller can reinstall or execute the retired trampoline.
+    pub(crate) fn retire_ap_trampoline_mapping(&mut self) -> Result<(), LiveActiveTargetError> {
+        if !self.target.ap_trampoline_mapped {
+            return Err(LiveActiveTargetError::InvalidIndex);
+        }
+        let grant = &self.target.ap_trampoline;
+        if self
+            .target
+            .roles
+            .validate_architecture_bootstrap(grant)
+            .is_err()
+            || grant.byte_len() != PAGE_SIZE
+        {
+            return Err(LiveActiveTargetError::InvalidIndex);
+        }
+        let page = match VirtualPage::new(grant.physical_start()) {
+            Ok(page) => page,
+            Err(_) => return Err(LiveActiveTargetError::InvalidIndex),
+        };
+        let mut journal = PageTableJournal::<_, 4, 1>::new(&mut self.target.scratch);
+        let result = self.root.retire_architecture_bootstrap_identity_page(
+            &mut journal,
+            page,
+            grant.physical_start(),
+        );
+        match result.and_then(|()| journal.publish().map_err(super::super::MapError::Access)) {
+            Ok(()) => {
+                self.target.ap_trampoline_mapped = false;
+                Ok(())
+            }
+            Err(_) => Err(LiveActiveTargetError::InvalidIndex),
+        }
     }
 
     pub(crate) fn read_physical_bytes(
