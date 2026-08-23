@@ -452,6 +452,18 @@ pub(super) fn subtree_is_required(
         })
 }
 
+fn subtree_is_required_with_bootstrap(
+    virtual_prefix: u64,
+    child_level: u8,
+    segments: &[KernelSegment; 3],
+    scratch_page: u64,
+    ap_trampoline_page: Option<u64>,
+) -> bool {
+    let shift = 12 + u32::from(child_level + 1) * 9;
+    subtree_is_required(virtual_prefix, child_level, segments, scratch_page)
+        || ap_trampoline_page.is_some_and(|page| virtual_prefix >> shift == page >> shift)
+}
+
 pub(super) fn validate_segment_layout(
     segments: &[KernelSegment; 3],
     scratch: DeepScratchBinding,
@@ -663,6 +675,7 @@ pub(super) fn validate_inactive_graph_with_workspace<
     access: &mut A,
     roles: &FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
     kernel_roles: &K,
+    ap_trampoline: Option<&ArchitectureBootstrapGrant>,
     root: TableIdentity,
     transition_root: FrameAddress,
     scratch: DeepScratchBinding,
@@ -674,6 +687,21 @@ pub(super) fn validate_inactive_graph_with_workspace<
     pending: &mut [Option<PendingTable>; MAX_DEEP_TABLE_FRAMES],
     visited: &mut [u64; MAX_DEEP_TABLE_FRAMES],
 ) -> Result<(), InactiveGraphError<A::Error>> {
+    let ap_trampoline_page = if let Some(ap_trampoline) = ap_trampoline {
+        roles
+            .validate_architecture_bootstrap(ap_trampoline)
+            .map_err(InactiveGraphError::FrameRole)?;
+        let page = ap_trampoline.physical_start();
+        if ap_trampoline.byte_len() != PAGE_SIZE
+            || page == 0
+            || page >= crate::arch::x86_64::smp::AP_TRAMPOLINE_LIMIT
+        {
+            return Err(InactiveGraphError::InvalidEntry);
+        }
+        Some(page)
+    } else {
+        None
+    };
     validate_segment_layout(segments, scratch, ist, thread_stacks, privilege_entry).map_err(
         |error| match error {
             InactiveGraphError::InvalidSegmentLayout => InactiveGraphError::InvalidSegmentLayout,
@@ -729,6 +757,12 @@ pub(super) fn validate_inactive_graph_with_workspace<
                     {
                         return Err(InactiveGraphError::InvalidScratchPath);
                     }
+                } else if ap_trampoline_page == Some(virtual_page) {
+                    if mapped.address() != virtual_page
+                        || entry & !(physical_mask(capabilities) | HARDWARE_MUTABLE) != PRESENT
+                    {
+                        return Err(InactiveGraphError::InvalidEntry);
+                    }
                 } else {
                     if is_kernel_guard(ist, thread_stacks, privilege_entry, virtual_page) {
                         return Err(InactiveGraphError::MappedGuardPage);
@@ -747,7 +781,13 @@ pub(super) fn validate_inactive_graph_with_workspace<
                 return Err(InactiveGraphError::InvalidEntry);
             }
             let child_level = node.level.child().ok_or(InactiveGraphError::InvalidEntry)?;
-            if !subtree_is_required(virtual_page, depth - 1, segments, scratch.window_page) {
+            if !subtree_is_required_with_bootstrap(
+                virtual_page,
+                depth - 1,
+                segments,
+                scratch.window_page,
+                ap_trampoline_page,
+            ) {
                 return Err(InactiveGraphError::ExtraTable);
             }
             let child = roles
@@ -839,6 +879,7 @@ pub(super) fn validate_inactive_graph<
         access,
         roles,
         kernel_roles,
+        None,
         root,
         transition_root,
         scratch,

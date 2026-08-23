@@ -348,7 +348,7 @@ fn graph_fixture() -> GraphFixture {
         },
     ];
     let capabilities = PagingCapabilities::validate(40, true, true, true).unwrap();
-    let mut roles = synthetic_frame_role_manager::<1, 16>(0x8000, 8);
+    let mut roles = synthetic_frame_role_manager::<1, 16>(0x8000, 12);
     let owner = roles.create_table_owner().unwrap();
     let root = commit_table(&mut roles, owner, TableLevel::Pml4, None);
     let kernel_pdpt = commit_table(&mut roles, owner, TableLevel::Pdpt, Some(root));
@@ -438,6 +438,110 @@ fn graph_fixture() -> GraphFixture {
         ist,
         privilege_entry,
     }
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the host graph fixture attests complete AP trampoline initialization"
+)]
+fn graph_accepts_only_the_typed_low_rx_ap_trampoline_leaf() {
+    let mut fixture = graph_fixture();
+    let allocation = fixture
+        .roles
+        .allocate_below(1, crate::arch::x86_64::smp::AP_TRAMPOLINE_LIMIT)
+        .unwrap();
+    let trampoline_page = allocation.physical_start();
+    let trampoline = unsafe {
+        fixture.roles.assume_architecture_bootstrap_initialized(
+            allocation,
+            crate::memory::frame_roles::ArchitectureBootstrapKind::X86ApTrampoline,
+        )
+    }
+    .unwrap();
+    let owner = fixture.root.owner();
+    let pdpt = commit_table(
+        &mut fixture.roles,
+        owner,
+        TableLevel::Pdpt,
+        Some(fixture.root),
+    );
+    let pd = commit_table(&mut fixture.roles, owner, TableLevel::Pd, Some(pdpt));
+    let pt = commit_table(&mut fixture.roles, owner, TableLevel::Pt, Some(pd));
+    add_path(
+        &mut fixture.access.inactive,
+        trampoline_page,
+        [
+            fixture.root.physical_start(),
+            pdpt.physical_start(),
+            pd.physical_start(),
+            pt.physical_start(),
+        ],
+        trampoline_page | PRESENT,
+    );
+    let mut pending = [None; MAX_DEEP_TABLE_FRAMES];
+    let mut visited = [0; MAX_DEEP_TABLE_FRAMES];
+    assert_eq!(
+        validate_inactive_graph_with_workspace(
+            &mut fixture.access,
+            &fixture.roles,
+            &fixture.staged,
+            Some(&trampoline),
+            fixture.root,
+            FrameAddress::new(
+                fixture.transition_tables[0],
+                fixture.capabilities.physical_limit(),
+            )
+            .unwrap(),
+            DeepScratchBinding {
+                window_page: FIXTURE_SCRATCH,
+                control_page: FIXTURE_SCRATCH + PAGE_SIZE,
+                pt: fixture.scratch_pt,
+            },
+            &fixture.segments,
+            fixture.ist,
+            &[],
+            fixture.privilege_entry,
+            fixture.capabilities,
+            &mut pending,
+            &mut visited,
+        ),
+        Ok(())
+    );
+
+    fixture.access.inactive.insert(
+        (pt.physical_start(), page_index(trampoline_page, 0)),
+        trampoline_page | PRESENT | WRITABLE,
+    );
+    pending.fill(None);
+    visited.fill(0);
+    assert_eq!(
+        validate_inactive_graph_with_workspace(
+            &mut fixture.access,
+            &fixture.roles,
+            &fixture.staged,
+            Some(&trampoline),
+            fixture.root,
+            FrameAddress::new(
+                fixture.transition_tables[0],
+                fixture.capabilities.physical_limit(),
+            )
+            .unwrap(),
+            DeepScratchBinding {
+                window_page: FIXTURE_SCRATCH,
+                control_page: FIXTURE_SCRATCH + PAGE_SIZE,
+                pt: fixture.scratch_pt,
+            },
+            &fixture.segments,
+            fixture.ist,
+            &[],
+            fixture.privilege_entry,
+            fixture.capabilities,
+            &mut pending,
+            &mut visited,
+        ),
+        Err(InactiveGraphError::InvalidEntry)
+    );
 }
 
 fn fake_active_scratch(

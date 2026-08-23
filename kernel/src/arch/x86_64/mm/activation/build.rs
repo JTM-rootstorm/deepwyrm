@@ -8,8 +8,13 @@ fn allocate_owned_table<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     owner: TableOwnerKey,
     level: TableLevel,
     parent: Option<TableIdentity>,
+    exclusive_ceiling: Option<u64>,
 ) -> Result<TableIdentity, DeepRootBuildError> {
-    let allocation = roles.allocate(1).map_err(DeepRootBuildError::FrameRole)?;
+    let allocation = match exclusive_ceiling {
+        Some(ceiling) => roles.allocate_below(1, ceiling),
+        None => roles.allocate(1),
+    }
+    .map_err(DeepRootBuildError::FrameRole)?;
     let zeroed = mapper
         .zero_allocation(roles, allocation)
         .map_err(|failure| {
@@ -61,7 +66,7 @@ fn ensure_leaf_table<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
             .level()
             .child()
             .ok_or(DeepRootBuildError::MappingMismatch)?;
-        let child = allocate_owned_table(mapper, roles, owner, child_level, Some(parent))?;
+        let child = allocate_owned_table(mapper, roles, owner, child_level, Some(parent), None)?;
         mapper
             .write_owned_table_entry(
                 roles,
@@ -264,13 +269,45 @@ pub(super) fn build_and_bind_deep_root<
         let owner = roles
             .create_table_owner()
             .map_err(DeepRootBuildError::FrameRole)?;
-        let root_identity =
-            allocate_owned_table(&mut mapper, roles, owner, TableLevel::Pml4, None)?;
+        let root_identity = allocate_owned_table(
+            &mut mapper,
+            roles,
+            owner,
+            TableLevel::Pml4,
+            None,
+            Some(1_u64 << 32),
+        )?;
         let edges = unsafe { &mut *BUILD_WORKSPACE.0.get() };
         for edge in edges.iter_mut() {
             *edge = None;
         }
         let mut edge_count = 0;
+
+        let trampoline_allocation = roles
+            .allocate_below(1, crate::arch::x86_64::smp::AP_TRAMPOLINE_LIMIT)
+            .map_err(DeepRootBuildError::FrameRole)?;
+        let trampoline_page = [0_u8; PAGE_SIZE as usize];
+        mapper
+            .initialize_allocation(roles, &trampoline_allocation, &trampoline_page)
+            .map_err(|_| DeepRootBuildError::Transition)?;
+        let ap_trampoline = unsafe {
+            roles.assume_architecture_bootstrap_initialized(
+                trampoline_allocation,
+                crate::memory::frame_roles::ArchitectureBootstrapKind::X86ApTrampoline,
+            )
+        }
+        .map_err(|failure| failure.error())
+        .map_err(DeepRootBuildError::FrameRole)?;
+        map_owned_leaf(
+            &mut mapper,
+            roles,
+            owner,
+            root_identity,
+            ap_trampoline.physical_start(),
+            ap_trampoline.physical_start() | PRESENT,
+            edges,
+            &mut edge_count,
+        )?;
 
         for segment in segments {
             let mut page = segment.start;
@@ -371,10 +408,11 @@ pub(super) fn build_and_bind_deep_root<
                 pt: scratch_pt,
             },
             kernel_roles,
+            ap_trampoline,
         ))
     })();
 
-    let (root, identity, scratch, kernel_roles) = match result {
+    let (root, identity, scratch, kernel_roles, ap_trampoline) = match result {
         Ok(parts) => parts,
         Err(error) => return Err(DeepRootBuildFailure { error }),
     };
@@ -384,6 +422,7 @@ pub(super) fn build_and_bind_deep_root<
         identity,
         scratch,
         kernel_roles,
+        ap_trampoline,
         roles,
     )
     .map_err(|(error, _handoff, _)| DeepRootBuildFailure {

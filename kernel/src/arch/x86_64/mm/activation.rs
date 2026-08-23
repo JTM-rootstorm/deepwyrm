@@ -10,8 +10,8 @@ use crate::memory::boot_map::{BootstrapMemoryWitness, KernelImageBoundaryError};
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 use crate::memory::frame_roles::TableOwnerKey;
 use crate::memory::frame_roles::{
-    FrameRoleError, FrameRoleManager, KernelImageRoleSet, KernelImageSegment,
-    StagedKernelImageRoles, TableIdentity, TableLevel,
+    ArchitectureBootstrapGrant, FrameRoleError, FrameRoleManager, KernelImageRoleSet,
+    KernelImageSegment, StagedKernelImageRoles, TableIdentity, TableLevel,
 };
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 use crate::memory::physical::PhysicalRange;
@@ -215,6 +215,7 @@ pub(crate) struct InactiveRootAuthority<'a, const RANGE_CAPACITY: usize, const R
     identity: TableIdentity,
     scratch: DeepScratchBinding,
     kernel_roles: KernelImageRoleSet,
+    ap_trampoline: ArchitectureBootstrapGrant,
     roles: &'a mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
     _not_send_sync: core::marker::PhantomData<*mut ()>,
 }
@@ -232,6 +233,7 @@ impl<'a, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         identity: TableIdentity,
         scratch: DeepScratchBinding,
         kernel_roles: KernelImageRoleSet,
+        ap_trampoline: ArchitectureBootstrapGrant,
         roles: &'a mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
     ) -> Result<
         Self,
@@ -262,6 +264,7 @@ impl<'a, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             identity,
             scratch,
             kernel_roles,
+            ap_trampoline,
             roles,
             _not_send_sync: core::marker::PhantomData,
         })
@@ -418,6 +421,7 @@ pub(crate) struct LiveCr3ActivationTarget<
 > {
     roles: &'a mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
     kernel_roles: Option<KernelImageRoleSet>,
+    ap_trampoline: Option<ArchitectureBootstrapGrant>,
     scratch: DeepScratchBinding,
     root_identity: Option<TableIdentity>,
     _not_send_sync: core::marker::PhantomData<*mut ()>,
@@ -431,6 +435,7 @@ pub(crate) struct LiveActivePagingTarget<
 > {
     roles: &'a mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
     _kernel_roles: KernelImageRoleSet,
+    ap_trampoline: ArchitectureBootstrapGrant,
     scratch: ActiveScratchTarget<LiveActiveScratchIo>,
     _not_send_sync: core::marker::PhantomData<*mut ()>,
 }
@@ -1146,6 +1151,10 @@ unsafe impl<'a, 'handoff, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
             .kernel_roles
             .as_ref()
             .ok_or(LiveActivationError::WrongControlState)?;
+        let ap_trampoline = self
+            .ap_trampoline
+            .as_ref()
+            .ok_or(LiveActivationError::WrongControlState)?;
         let segments = live_kernel_segments()?;
         let ist = crate::arch::x86_64::linked_ist_stack_layout()
             .map_err(|_| LiveActivationError::InvalidKernelLayout)?;
@@ -1166,6 +1175,7 @@ unsafe impl<'a, 'handoff, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
             &mut LiveGraphAccess(handoff),
             &*self.roles,
             kernel_roles,
+            Some(ap_trampoline),
             identity,
             transition_root,
             self.scratch,
@@ -1217,6 +1227,9 @@ unsafe impl<'a, 'handoff, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
         let kernel_roles = self
             .kernel_roles
             .expect("C2 kernel image roles were not published during preflight");
+        let ap_trampoline = self
+            .ap_trampoline
+            .expect("C2 AP trampoline ownership was not retained during preflight");
         let _root_identity = self
             .root_identity
             .expect("C2 root identity was not retained during preflight");
@@ -1231,6 +1244,7 @@ unsafe impl<'a, 'handoff, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
         LiveActivePagingTarget {
             roles: self.roles,
             _kernel_roles: kernel_roles,
+            ap_trampoline,
             scratch: ActiveScratchTarget {
                 scratch: self.scratch,
                 io: LiveActiveScratchIo,
@@ -1246,6 +1260,26 @@ unsafe impl<'a, 'handoff, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
 impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ActiveDeepPaging<LiveActivePagingTarget<'root, RANGE_CAPACITY, ROLE_CAPACITY>>
 {
+    pub(crate) fn install_ap_trampoline_image(
+        &mut self,
+        image: &[u8; PAGE_SIZE as usize],
+    ) -> Result<(), LiveActiveTargetError> {
+        self.target
+            .roles
+            .validate_architecture_bootstrap(&self.target.ap_trampoline)
+            .map_err(|_| LiveActiveTargetError::InvalidIndex)?;
+        let frame = FrameAddress::new(
+            self.target.ap_trampoline.physical_start(),
+            self.root.physical_limit(),
+        )
+        .map_err(|_| LiveActiveTargetError::InvalidIndex)?;
+        self.target.scratch.write_physical_bytes(frame, 0, image)
+    }
+
+    pub(crate) const fn ap_trampoline_physical_start(&self) -> u64 {
+        self.target.ap_trampoline.physical_start()
+    }
+
     pub(crate) fn read_physical_bytes(
         &mut self,
         physical_start: u64,
@@ -1428,12 +1462,14 @@ fn prepare_deep_activation<'a, const RANGE_CAPACITY: usize, const ROLE_CAPACITY:
         identity,
         scratch,
         kernel_roles,
+        ap_trampoline,
         roles,
         _not_send_sync: _,
     } = authority;
     let target = LiveCr3ActivationTarget {
         roles,
         kernel_roles: Some(kernel_roles),
+        ap_trampoline: Some(ap_trampoline),
         scratch,
         root_identity: None,
         _not_send_sync: core::marker::PhantomData,
@@ -1450,6 +1486,9 @@ fn prepare_deep_activation<'a, const RANGE_CAPACITY: usize, const ROLE_CAPACITY:
                 kernel_roles: target
                     .kernel_roles
                     .expect("preflight failure retains imported kernel roles"),
+                ap_trampoline: target
+                    .ap_trampoline
+                    .expect("preflight failure retains AP trampoline ownership"),
                 roles: target.roles,
                 _not_send_sync: core::marker::PhantomData,
             },
