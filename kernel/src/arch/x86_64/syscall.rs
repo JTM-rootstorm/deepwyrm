@@ -6,6 +6,8 @@ mod live;
 mod msr;
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 mod runtime_binding;
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+mod stationary_runtime;
 
 #[allow(
     unused_imports,
