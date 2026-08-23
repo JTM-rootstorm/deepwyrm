@@ -886,6 +886,211 @@ fn address_region_bridge_commits_replacements_and_rolls_back_target_failure() {
     unsafe_code,
     reason = "the host integration model supplies two independently typed inactive roots and zeroed frame grants"
 )]
+fn bounded_stack_mapping_crosses_every_lower_table_boundary_and_overflow_rolls_back() {
+    const STACK_PAGES: u64 = 16;
+    const STACK_START: u64 = 0x0000_007f_ffff_f000;
+    let limit = PhysicalAddressLimit::new(1_u64 << 40).unwrap();
+    let capabilities = PagingCapabilities {
+        physical_limit: limit,
+    };
+
+    // The final page below 512 GiB crosses the PT, PD, PDPT, and PML4 entry
+    // boundaries at once. A complete 16-page stack therefore needs two
+    // candidates at every lower level, and 16 leaves plus six intermediate
+    // journal writes.
+    let mut roles = synthetic_frame_role_manager::<1, 64>(0x1000, 32);
+    let owner = roles.create_table_owner().unwrap();
+    let root_allocation = roles.allocate(1).unwrap();
+    let root_zeroed = unsafe { roles.assume_zeroed(root_allocation) }.unwrap();
+    let root = roles
+        .prepare_table(root_zeroed, owner, TableLevel::Pml4)
+        .unwrap();
+    let root = roles.commit_table(root, None).unwrap();
+    let page_tables =
+        unsafe { PageTableRoot::from_owned_root(root.physical_start(), capabilities) }.unwrap();
+    let mut candidates: [Option<TableCandidateGrant>; 6] = [const { None }; 6];
+    for (slot, level) in [
+        TableLevel::Pdpt,
+        TableLevel::Pd,
+        TableLevel::Pt,
+        TableLevel::Pdpt,
+        TableLevel::Pd,
+        TableLevel::Pt,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let allocation = roles.allocate(1).unwrap();
+        let zeroed = unsafe { roles.assume_zeroed(allocation) }.unwrap();
+        candidates[slot] = Some(roles.prepare_table(zeroed, owner, level).unwrap());
+    }
+    let allocation = roles.allocate(STACK_PAGES).unwrap();
+    let zeroed = unsafe { roles.assume_zeroed(allocation) }.unwrap();
+    let backing = roles.assign_object_backing(zeroed).unwrap();
+    let mut registry = ObjectRegistry::<1>::new();
+    let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+    let mut objects = MemoryObjectAuthority::<1, 2>::new();
+    let object = objects
+        .grant_backing(
+            &creation,
+            backing,
+            STACK_PAGES * BASE_PAGE_SIZE,
+            MemoryObjectKind::PageBacked,
+            Protection::READ_WRITE,
+        )
+        .unwrap();
+    let object_owner = registry.creation_into_internal(creation).unwrap();
+    assert_eq!(object.object_id(), Some(object_owner.id()));
+    let mut spaces = unsafe { AddressSpaceAuthority::<1, 1>::new() };
+    let address_space = spaces.create_address_space().unwrap();
+    let mut region = spaces
+        .create_region::<1>(address_space, STACK_START, STACK_PAGES * BASE_PAGE_SIZE)
+        .unwrap();
+    let mut target = FakeTarget::default();
+    let mut publisher = unsafe {
+        X86AddressSpacePublisher::<_, 1, 64, 6, 22, 16>::new(
+            region.address_space_key(),
+            region.region_key(),
+            &page_tables,
+            root,
+            &mut roles,
+            &mut target,
+            &mut candidates,
+        )
+    }
+    .unwrap();
+    let resolved = crate::handle::resolve_test_internal_owner(
+        &mut registry,
+        &object_owner,
+        deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT),
+    );
+    let authorization = region
+        .authorize_map(&objects, resolved, Protection::READ_WRITE)
+        .unwrap();
+    assert!(
+        region
+            .map(
+                &mut objects,
+                &mut registry,
+                &mut publisher,
+                STACK_START,
+                authorization,
+                0,
+                STACK_PAGES * BASE_PAGE_SIZE,
+                Protection::READ_WRITE,
+            )
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(region.mappings().iter().flatten().count(), 1);
+    assert_eq!(objects.active_lease_count(), 1);
+    assert_eq!(target.invalidated.len(), STACK_PAGES as usize);
+    assert_eq!(candidates.iter().flatten().count(), 0, "{candidates:?}");
+    assert_eq!(roles.check_invariants(), Ok(()));
+
+    // The 17th changed page must fail at the publisher's fixed invalidation
+    // bound before it can publish any table writes or consume model leases.
+    let mut roles = synthetic_frame_role_manager::<1, 64>(0x20000, 32);
+    let owner = roles.create_table_owner().unwrap();
+    let root_allocation = roles.allocate(1).unwrap();
+    let root_zeroed = unsafe { roles.assume_zeroed(root_allocation) }.unwrap();
+    let root = roles
+        .prepare_table(root_zeroed, owner, TableLevel::Pml4)
+        .unwrap();
+    let root = roles.commit_table(root, None).unwrap();
+    let page_tables =
+        unsafe { PageTableRoot::from_owned_root(root.physical_start(), capabilities) }.unwrap();
+    let mut candidates: [Option<TableCandidateGrant>; 6] = [const { None }; 6];
+    for (slot, level) in [
+        TableLevel::Pdpt,
+        TableLevel::Pd,
+        TableLevel::Pt,
+        TableLevel::Pdpt,
+        TableLevel::Pd,
+        TableLevel::Pt,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let allocation = roles.allocate(1).unwrap();
+        let zeroed = unsafe { roles.assume_zeroed(allocation) }.unwrap();
+        candidates[slot] = Some(roles.prepare_table(zeroed, owner, level).unwrap());
+    }
+    let allocation = roles.allocate(STACK_PAGES + 1).unwrap();
+    let zeroed = unsafe { roles.assume_zeroed(allocation) }.unwrap();
+    let backing = roles.assign_object_backing(zeroed).unwrap();
+    let mut registry = ObjectRegistry::<1>::new();
+    let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+    let mut objects = MemoryObjectAuthority::<1, 2>::new();
+    let object = objects
+        .grant_backing(
+            &creation,
+            backing,
+            (STACK_PAGES + 1) * BASE_PAGE_SIZE,
+            MemoryObjectKind::PageBacked,
+            Protection::READ_WRITE,
+        )
+        .unwrap();
+    let object_owner = registry.creation_into_internal(creation).unwrap();
+    assert_eq!(object.object_id(), Some(object_owner.id()));
+    let mut spaces = unsafe { AddressSpaceAuthority::<1, 1>::new() };
+    let address_space = spaces.create_address_space().unwrap();
+    let mut region = spaces
+        .create_region::<1>(address_space, 0x400000, (STACK_PAGES + 1) * BASE_PAGE_SIZE)
+        .unwrap();
+    let mut target = FakeTarget::default();
+    let mut publisher = unsafe {
+        X86AddressSpacePublisher::<_, 1, 64, 6, 22, 16>::new(
+            region.address_space_key(),
+            region.region_key(),
+            &page_tables,
+            root,
+            &mut roles,
+            &mut target,
+            &mut candidates,
+        )
+    }
+    .unwrap();
+    let resolved = crate::handle::resolve_test_internal_owner(
+        &mut registry,
+        &object_owner,
+        deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT),
+    );
+    let authorization = region
+        .authorize_map(&objects, resolved, Protection::READ_WRITE)
+        .unwrap();
+    let failure = region
+        .map(
+            &mut objects,
+            &mut registry,
+            &mut publisher,
+            0x400000,
+            authorization,
+            0,
+            (STACK_PAGES + 1) * BASE_PAGE_SIZE,
+            Protection::READ_WRITE,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        failure.error(),
+        crate::memory::address_region::AddressSpaceTransactionError::Publish(
+            X86AddressSpacePublishError::Capacity
+        )
+    ));
+    assert!(failure.into_final_releases().is_empty());
+    assert!(region.mappings().iter().all(Option::is_none));
+    assert_eq!(objects.active_lease_count(), 0);
+    assert!(target.entries.is_empty());
+    assert!(target.invalidated.is_empty());
+    assert!(candidates.iter().all(Option::is_some));
+    assert_eq!(roles.check_invariants(), Ok(()));
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the host integration model supplies two independently typed inactive roots and zeroed frame grants"
+)]
 fn two_bound_publishers_map_same_va_to_distinct_root_local_frames() {
     let limit = PhysicalAddressLimit::new(1_u64 << 40).unwrap();
     let capabilities = PagingCapabilities {

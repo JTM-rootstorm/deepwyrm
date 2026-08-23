@@ -1570,11 +1570,17 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         process: crate::task::ProcessKey,
         address_space: crate::memory::address_region::AddressSpaceKey,
     ) -> Result<(), RootBindingError> {
+        let reservation = self
+            .user_pins
+            .reserve_teardown(address_space)
+            .map_err(|_| RootBindingError::MutationInFlight)?;
         self.root_bindings.teardown_empty_owned(
             self.target.roles,
             &mut self.target.scratch,
             process,
             address_space,
+            &self.user_pins,
+            reservation,
         )
     }
 

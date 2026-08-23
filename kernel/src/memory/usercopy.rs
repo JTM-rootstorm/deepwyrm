@@ -139,6 +139,7 @@ mod pin_tracker {
     struct UserPinState<const CAPACITY: usize> {
         pins: [PinSlot; CAPACITY],
         mutation: Option<PinnedRange>,
+        teardown: Option<AddressSpaceKey>,
     }
 
     /// Detached mapping-stability ownership suitable for blocked operations.
@@ -188,6 +189,7 @@ mod pin_tracker {
                 state: crate::sync::SpinMutex::new(UserPinState {
                     pins: [EMPTY_PIN_SLOT; CAPACITY],
                     mutation: None,
+                    teardown: None,
                 }),
             }
         }
@@ -200,6 +202,9 @@ mod pin_tracker {
             let range = PinnedRange::from_user_range(address_space, range)
                 .ok_or(UserPinError::InvalidMutationRange)?;
             let mut state = self.state.lock();
+            if state.teardown == Some(address_space) {
+                return Err(UserPinError::Conflict);
+            }
             if state
                 .mutation
                 .is_some_and(|mutation| mutation.overlaps(range))
@@ -303,7 +308,8 @@ mod pin_tracker {
                 end_exclusive,
             };
             let mut state = self.state.lock();
-            if state.mutation.is_some()
+            if state.teardown == Some(address_space)
+                || state.mutation.is_some()
                 || state
                     .pins
                     .iter()
@@ -317,6 +323,72 @@ mod pin_tracker {
                 tracker: self,
                 range: mutation,
             })
+        }
+
+        /// Atomically excludes new user access from one address space while an
+        /// empty owned root is detached and reclaimed.
+        ///
+        /// This deliberately has address-space scope rather than range scope:
+        /// after root detachment there is no valid user mapping range left to
+        /// describe. The move-only reservation is dropped on every fallible
+        /// pre-destructive path, reopening ordinary pin and mutation admission.
+        pub(crate) fn reserve_teardown(
+            &self,
+            address_space: AddressSpaceKey,
+        ) -> Result<AddressSpaceTeardownReservation<'_, CAPACITY>, UserPinError> {
+            let mut state = self.state.lock();
+            if state.teardown.is_some()
+                || state
+                    .mutation
+                    .is_some_and(|mutation| mutation.address_space == address_space)
+                || state
+                    .pins
+                    .iter()
+                    .filter_map(|slot| slot.range)
+                    .any(|pin| pin.address_space == address_space)
+            {
+                return Err(UserPinError::Conflict);
+            }
+            state.teardown = Some(address_space);
+            Ok(AddressSpaceTeardownReservation {
+                tracker: self,
+                domain: self.domain,
+                address_space,
+            })
+        }
+
+        pub(crate) fn owns_teardown_reservation(
+            &self,
+            reservation: &AddressSpaceTeardownReservation<'_, CAPACITY>,
+        ) -> bool {
+            self.domain == reservation.domain
+        }
+    }
+
+    /// Move-only proof that an address space has no live user pins or mapping
+    /// publication and that no new such access can begin before root teardown.
+    #[must_use = "empty-root teardown reservations must span detach and reclaim"]
+    pub(crate) struct AddressSpaceTeardownReservation<'a, const CAPACITY: usize> {
+        tracker: &'a UserPinTracker<CAPACITY>,
+        domain: u64,
+        address_space: AddressSpaceKey,
+    }
+
+    impl<const CAPACITY: usize> AddressSpaceTeardownReservation<'_, CAPACITY> {
+        pub(crate) fn covers(&self, address_space: AddressSpaceKey) -> bool {
+            self.address_space == address_space
+        }
+    }
+
+    impl<const CAPACITY: usize> Drop for AddressSpaceTeardownReservation<'_, CAPACITY> {
+        fn drop(&mut self) {
+            let mut state = self.tracker.state.lock();
+            assert_eq!(
+                state.teardown,
+                Some(self.address_space),
+                "user teardown reservation drift"
+            );
+            state.teardown = None;
         }
     }
 
@@ -366,10 +438,10 @@ mod pin_tracker {
     }
 }
 
-#[cfg(test)]
-pub(crate) use pin_tracker::{UserPinError, UserPinTracker};
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+pub(crate) use pin_tracker::{AddressSpaceTeardownReservation, UserPinError, UserPinTracker};
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
-pub(crate) use pin_tracker::{UserPinError, UserPinTracker, UserRangePin, UserRangePinToken};
+pub(crate) use pin_tracker::{UserRangePin, UserRangePinToken};
 
 /// Mapping-stable page access held across full preflight and exact copy.
 pub(crate) trait PinnedUserPages {
@@ -1028,5 +1100,71 @@ mod tests {
             .begin_mutation(scope(1), PAGE_SIZE * 7, PAGE_SIZE)
             .unwrap();
         drop(permit);
+    }
+
+    #[test]
+    fn teardown_reservation_rejects_live_pin_then_reopens_after_release() {
+        let tracker = UserPinTracker::<2>::new();
+        let range = range_at(PAGE_SIZE * 11, 64, UserAccess::READ);
+        let pin = tracker.pin_owned(scope(1), range).unwrap();
+        assert!(matches!(
+            tracker.reserve_teardown(scope(1)),
+            Err(UserPinError::Conflict)
+        ));
+        tracker.release_owned(scope(1), pin).unwrap();
+        let reservation = tracker.reserve_teardown(scope(1)).unwrap();
+        drop(reservation);
+        let pin = tracker.pin_owned(scope(1), range).unwrap();
+        tracker.release_owned(scope(1), pin).unwrap();
+    }
+
+    #[test]
+    fn teardown_reservation_is_key_scoped_and_drop_reopens_admission() {
+        let tracker = UserPinTracker::<3>::new();
+        let same = scope(1);
+        let other = scope(2);
+        let reservation = tracker.reserve_teardown(same).unwrap();
+        assert!(matches!(
+            tracker.pin(same, range_at(PAGE_SIZE * 12, 8, UserAccess::READ)),
+            Err(UserPinError::Conflict)
+        ));
+        assert!(matches!(
+            tracker.begin_mutation(same, PAGE_SIZE * 12, PAGE_SIZE),
+            Err(UserPinError::Conflict)
+        ));
+        let other_pin = tracker
+            .pin(other, range_at(PAGE_SIZE * 12, 8, UserAccess::READ))
+            .unwrap();
+        drop(other_pin);
+        let other_mutation = tracker
+            .begin_mutation(other, PAGE_SIZE * 12, PAGE_SIZE)
+            .unwrap();
+        drop(other_mutation);
+        drop(reservation);
+        let retry = tracker
+            .begin_mutation(same, PAGE_SIZE * 12, PAGE_SIZE)
+            .unwrap();
+        drop(retry);
+    }
+
+    #[test]
+    fn teardown_reservations_are_globally_serialized_and_drop_order_is_stable() {
+        let tracker = UserPinTracker::<2>::new();
+        let first = scope(1);
+        let second = scope(2);
+        let reservation = tracker.reserve_teardown(first).unwrap();
+        assert!(matches!(
+            tracker.reserve_teardown(second),
+            Err(UserPinError::Conflict)
+        ));
+        drop(reservation);
+        let second_reservation = tracker.reserve_teardown(second).unwrap();
+        assert!(matches!(
+            tracker.reserve_teardown(first),
+            Err(UserPinError::Conflict)
+        ));
+        drop(second_reservation);
+        let first_reservation = tracker.reserve_teardown(first).unwrap();
+        drop(first_reservation);
     }
 }

@@ -6,6 +6,7 @@ use std::{cell::RefCell, rc::Rc, vec, vec::Vec};
 use crate::cpu::CpuIndex;
 use crate::memory::frame_roles::{FrameRoleManager, TableOwnerKey, synthetic_frame_role_manager};
 use crate::memory::physical::PhysicalRange;
+use crate::memory::usercopy::UserPinTracker;
 
 use super::*;
 
@@ -1737,8 +1738,16 @@ fn exact_roots_isolate_same_virtual_address_and_switch_a_b_a() {
         ]
     );
     assert!(a1.selects_exact(cpu, process_a, key_a));
+    let pins = UserPinTracker::<1>::new();
     bindings
-        .teardown_empty_owned(&mut roles, &mut empty_flat_root_target(), process_b, key_b)
+        .teardown_empty_owned(
+            &mut roles,
+            &mut empty_flat_root_target(),
+            process_b,
+            key_b,
+            &pins,
+            pins.reserve_teardown(key_b).unwrap(),
+        )
         .unwrap();
     assert!(matches!(
         bindings.root_for_process(&root_a, process_b),
@@ -1804,12 +1813,15 @@ fn last_runnable_child_switches_to_primordial_before_owned_root_teardown() {
             &mut switches,
         )
         .unwrap_or_else(|failure| panic!("initial child switch failed: {:?}", failure.error()));
+    let resident_pins = UserPinTracker::<1>::new();
     assert_eq!(
         bindings.teardown_empty_owned(
             &mut roles,
             &mut empty_flat_root_target(),
             child_process,
             child_space,
+            &resident_pins,
+            resident_pins.reserve_teardown(child_space).unwrap(),
         ),
         Err(RootBindingError::Resident)
     );
@@ -1833,12 +1845,15 @@ fn last_runnable_child_switches_to_primordial_before_owned_root_teardown() {
             primordial_identity.physical_start()
         ]
     );
+    let pins = UserPinTracker::<1>::new();
     bindings
         .teardown_empty_owned(
             &mut roles,
             &mut empty_flat_root_target(),
             child_process,
             child_space,
+            &pins,
+            pins.reserve_teardown(child_space).unwrap(),
         )
         .unwrap();
     assert!(matches!(
@@ -1963,13 +1978,29 @@ fn key_root_mismatch_is_rejected_and_residency_blocks_teardown() {
     let resident = bindings
         .prepare_selection(CpuIndex::BOOTSTRAP, process_b, key_b)
         .unwrap();
+    let resident_pins = UserPinTracker::<1>::new();
     assert_eq!(
-        bindings.teardown_empty_owned(&mut roles, &mut empty_flat_root_target(), process_b, key_b,),
+        bindings.teardown_empty_owned(
+            &mut roles,
+            &mut empty_flat_root_target(),
+            process_b,
+            key_b,
+            &resident_pins,
+            resident_pins.reserve_teardown(key_b).unwrap(),
+        ),
         Err(RootBindingError::Resident)
     );
     bindings.abandon_selection(resident).unwrap();
+    let pins = UserPinTracker::<1>::new();
     bindings
-        .teardown_empty_owned(&mut roles, &mut empty_flat_root_target(), process_b, key_b)
+        .teardown_empty_owned(
+            &mut roles,
+            &mut empty_flat_root_target(),
+            process_b,
+            key_b,
+            &pins,
+            pins.reserve_teardown(key_b).unwrap(),
+        )
         .unwrap();
     assert!(matches!(
         bindings.root_for_process(&root_a, process_b),
@@ -2022,8 +2053,30 @@ fn empty_child_hierarchy_is_retired_bottom_up_and_nonempty_rejection_is_retryabl
         .entries
         .insert((pt.physical_start(), 0), 0x90_000 | PRESENT | USER);
 
+    let pins = UserPinTracker::<1>::new();
+    let foreign_pins = UserPinTracker::<1>::new();
     assert_eq!(
-        bindings.teardown_empty_owned(&mut roles, &mut target, process, key),
+        bindings.teardown_empty_owned(
+            &mut roles,
+            &mut target,
+            process,
+            key,
+            &pins,
+            foreign_pins.reserve_teardown(key).unwrap(),
+        ),
+        Err(RootBindingError::RootMismatch)
+    );
+    assert_ne!(target.entries[&(identity.physical_start(), 0)], 0);
+    assert_eq!(roles.available_frames(), initial - 4);
+    assert_eq!(
+        bindings.teardown_empty_owned(
+            &mut roles,
+            &mut target,
+            process,
+            key,
+            &pins,
+            pins.reserve_teardown(key).unwrap(),
+        ),
         Err(RootBindingError::RootMismatch)
     );
     let primordial_placeholder =
@@ -2042,7 +2095,14 @@ fn empty_child_hierarchy_is_retired_bottom_up_and_nonempty_rejection_is_retryabl
     target.entries.insert((pt.physical_start(), 0), 0);
     target.fail_apply = true;
     assert_eq!(
-        bindings.teardown_empty_owned(&mut roles, &mut target, process, key),
+        bindings.teardown_empty_owned(
+            &mut roles,
+            &mut target,
+            process,
+            key,
+            &pins,
+            pins.reserve_teardown(key).unwrap(),
+        ),
         Err(RootBindingError::RootMismatch)
     );
     assert_ne!(target.entries[&(identity.physical_start(), 0)], 0);
@@ -2060,7 +2120,14 @@ fn empty_child_hierarchy_is_retired_bottom_up_and_nonempty_rejection_is_retryabl
     bindings.abandon_selection(prepared).unwrap();
     target.fail_apply = false;
     bindings
-        .teardown_empty_owned(&mut roles, &mut target, process, key)
+        .teardown_empty_owned(
+            &mut roles,
+            &mut target,
+            process,
+            key,
+            &pins,
+            pins.reserve_teardown(key).unwrap(),
+        )
         .unwrap();
     assert_eq!(
         target.entries[&(identity.physical_start(), 0)],

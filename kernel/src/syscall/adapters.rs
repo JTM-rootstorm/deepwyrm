@@ -4337,15 +4337,49 @@ fn address_region_status(error: crate::memory::address_region::AddressRegionErro
     }
 }
 
-fn address_transaction_status<E>(
+pub(crate) trait AddressSpacePublishStatus {
+    fn syscall_status(&self) -> DwStatus;
+}
+
+impl AddressSpacePublishStatus for () {
+    fn syscall_status(&self) -> DwStatus {
+        DW_STATUS_BAD_STATE
+    }
+}
+
+impl<E> AddressSpacePublishStatus for crate::arch::x86_64::mm::X86AddressSpacePublishError<E> {
+    fn syscall_status(&self) -> DwStatus {
+        if self.is_capacity_error() {
+            DW_STATUS_NO_RESOURCES
+        } else {
+            DW_STATUS_BAD_STATE
+        }
+    }
+}
+
+impl<E: AddressSpacePublishStatus> AddressSpacePublishStatus
+    for crate::memory::address_region::CoherentPublishError<E>
+{
+    fn syscall_status(&self) -> DwStatus {
+        match self {
+            Self::Publish(error) => error.syscall_status(),
+            Self::Coherency(
+                crate::memory::address_region::AddressSpaceCoherencyError::GenerationExhausted,
+            ) => DW_STATUS_NO_RESOURCES,
+            Self::Identity | Self::InvalidBatch | Self::Coherency(_) => DW_STATUS_BAD_STATE,
+        }
+    }
+}
+
+fn address_transaction_status<E: AddressSpacePublishStatus>(
     error: &crate::memory::address_region::AddressSpaceTransactionError<E>,
 ) -> DwStatus {
     match error {
         crate::memory::address_region::AddressSpaceTransactionError::Model(error) => {
             address_region_status(*error)
         }
-        crate::memory::address_region::AddressSpaceTransactionError::Publish(_) => {
-            DW_STATUS_BAD_STATE
+        crate::memory::address_region::AddressSpaceTransactionError::Publish(error) => {
+            error.syscall_status()
         }
     }
 }
@@ -4517,7 +4551,10 @@ pub(crate) fn address_region_map<
     args_size: u64,
     out_address: DwUserAddress,
     cleanup: &mut CleanupQueue<OBJECTS>,
-) -> DwStatus {
+) -> DwStatus
+where
+    P::Error: AddressSpacePublishStatus,
+{
     let args = match decode_map_args(user, args_address, args_size) {
         Ok(args) => args,
         Err(status) => return status,
@@ -4578,7 +4615,10 @@ fn address_region_map_preflighted<
     args: deepwyrm_abi::DwAddressRegionMapArgsV1,
     protection: crate::memory::address_region::Protection,
     cleanup: &mut CleanupQueue<OBJECTS>,
-) -> DwStatus {
+) -> DwStatus
+where
+    P::Error: AddressSpacePublishStatus,
+{
     match address_region_map_model(
         publisher,
         registry,
@@ -4627,7 +4667,10 @@ pub(crate) fn address_region_map_model<
     args: deepwyrm_abi::DwAddressRegionMapArgsV1,
     protection: crate::memory::address_region::Protection,
     cleanup: &mut CleanupQueue<OBJECTS>,
-) -> Result<u64, DwStatus> {
+) -> Result<u64, DwStatus>
+where
+    P::Error: AddressSpacePublishStatus,
+{
     let region_resolved = resolve_current(
         tasks,
         registry,
@@ -4779,7 +4822,10 @@ pub(crate) fn address_region_unmap<
     address: DwUserAddress,
     byte_len: u64,
     cleanup: &mut CleanupQueue<OBJECTS>,
-) -> DwStatus {
+) -> DwStatus
+where
+    P::Error: AddressSpacePublishStatus,
+{
     let resolved = match resolve_current(
         tasks,
         registry,
@@ -4862,7 +4908,10 @@ pub(crate) fn address_region_protect<
     byte_len: u64,
     protections: u32,
     cleanup: &mut CleanupQueue<OBJECTS>,
-) -> DwStatus {
+) -> DwStatus
+where
+    P::Error: AddressSpacePublishStatus,
+{
     if protections & !deepwyrm_abi::DW_MEMORY_PROTECTION_SUPPORTED_MASK.0 != 0 {
         return DW_STATUS_INVALID_ARGUMENT;
     }
@@ -4886,7 +4935,14 @@ pub(crate) fn address_region_protect<
     };
     let key =
         crate::memory::address_region::AddressRegionObjectKey::from_object_id(resolved.object_id());
-    let operation_lease = match tasks.acquire_process_operation(current_process) {
+    let target_process = match regions.region_process(key) {
+        Ok(process) => process,
+        Err(error) => {
+            release_lookup_pin(registry, resolved.into_internal(), cleanup);
+            return address_region_object_status(error);
+        }
+    };
+    let operation_lease = match tasks.acquire_process_operation(target_process) {
         Ok(lease) => lease,
         Err(error) => {
             release_lookup_pin(registry, resolved.into_internal(), cleanup);

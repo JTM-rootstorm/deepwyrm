@@ -374,11 +374,17 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         process: crate::task::ProcessKey,
         address_space: crate::memory::address_region::AddressSpaceKey,
     ) -> Result<(), super::RootBindingError> {
+        let pins = self.target.pins;
+        let reservation = pins
+            .reserve_teardown(address_space)
+            .map_err(|_| super::RootBindingError::MutationInFlight)?;
         self.root_bindings.teardown_empty_owned(
             self.roles,
             &mut self.target,
             process,
             address_space,
+            pins,
+            reservation,
         )
     }
 

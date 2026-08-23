@@ -1836,6 +1836,25 @@ fn memory_object_create_preflights_output_before_backing_allocation() {
         DW_STATUS_SUCCESS
     );
 }
+#[test]
+fn x86_publisher_capacity_is_not_reported_as_state_corruption() {
+    use crate::arch::x86_64::mm::X86AddressSpacePublishError;
+    use crate::memory::address_region::AddressSpaceTransactionError;
+
+    assert_eq!(
+        super::address_transaction_status(&AddressSpaceTransactionError::Publish(
+            X86AddressSpacePublishError::<()>::Capacity,
+        )),
+        DW_STATUS_NO_RESOURCES
+    );
+    assert_eq!(
+        super::address_transaction_status(&AddressSpaceTransactionError::Publish(
+            X86AddressSpacePublishError::<()>::Identity,
+        )),
+        DW_STATUS_BAD_STATE
+    );
+}
+
 struct FakePublisher {
     address_space: crate::memory::address_region::AddressSpaceKey,
     region: crate::memory::address_region::RegionKey,
@@ -2234,7 +2253,7 @@ fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
     assert_eq!(publisher.replacements, 1);
     assert_eq!(regions.region_process(child_region).unwrap(), child);
     assert_eq!(
-        address_region_unmap(
+        address_region_protect(
             &mut publisher,
             &mut registry,
             &mut memory,
@@ -2244,9 +2263,66 @@ fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
             child_region_handle,
             DwUserAddress(mapped),
             4096,
+            DW_MEMORY_PROTECTION_READ.0,
             &mut cleanup,
         ),
         DW_STATUS_SUCCESS
+    );
+    assert_eq!(publisher.replacements, 2);
+
+    // Termination closes the child gate, not the delegated caller's gate.
+    // A caller retaining this handle must therefore be rejected before the
+    // region model or publisher sees another mutation.
+    let child_operation = tasks.acquire_process_operation(child).unwrap();
+    assert!(matches!(
+        tasks.terminate_process_authorized(&mut registry, child, 0x71),
+        Err(crate::task::TaskError::BadState)
+    ));
+    assert_eq!(
+        address_region_protect(
+            &mut publisher,
+            &mut registry,
+            &mut memory,
+            &mut tasks,
+            &mut regions,
+            caller,
+            child_region_handle,
+            DwUserAddress(mapped),
+            4096,
+            DW_MEMORY_PROTECTION_READ.0,
+            &mut cleanup,
+        ),
+        DW_STATUS_BAD_STATE
+    );
+    assert_eq!(publisher.replacements, 2);
+    tasks.release_process_operation(child_operation).unwrap();
+
+    let effects = tasks
+        .terminate_process_authorized(&mut registry, child, 0x71)
+        .unwrap();
+    assert_eq!(effects.drained.final_release_count(), 0);
+    let (process_pin, thread_pins, resources) = effects.pins.into_parts();
+    assert!(thread_pins.into_iter().flatten().next().is_none());
+    assert!(resources.into_iter().flatten().next().is_none());
+    cleanup.push_optional(registry.release_internal(process_pin.unwrap()).unwrap());
+
+    // The terminal target remains unavailable even after the last old
+    // operation drains.
+    assert_eq!(
+        address_region_protect(
+            &mut publisher,
+            &mut registry,
+            &mut memory,
+            &mut tasks,
+            &mut regions,
+            caller,
+            child_region_handle,
+            DwUserAddress(mapped),
+            4096,
+            DW_MEMORY_PROTECTION_READ.0,
+            &mut cleanup,
+        ),
+        DW_STATUS_BAD_STATE
     );
     assert_eq!(publisher.replacements, 2);
 

@@ -11,6 +11,22 @@ pub(crate) enum X86AddressSpacePublishError<E> {
     Journal(OwnedPageTableJournalError<E>),
 }
 
+impl<E> X86AddressSpacePublishError<E> {
+    /// Distinguishes bounded publisher-resource exhaustion from invalid
+    /// authority, identity, or page-table state for the syscall boundary.
+    pub(crate) const fn is_capacity_error(&self) -> bool {
+        matches!(
+            self,
+            Self::Capacity
+                | Self::Journal(OwnedPageTableJournalError::JournalCapacity)
+                | Self::Map(MapError::InsufficientTableFrames)
+                | Self::Map(MapError::Access(
+                    OwnedPageTableJournalError::JournalCapacity
+                ))
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PageDescriptor {
     backing: BackingIdentity,

@@ -16,6 +16,7 @@ use crate::memory::frame_roles::{
     EmptyTableHierarchyCandidate, FrameRoleError, FrameRoleManager, TableIdentity, TableLevel,
 };
 use crate::memory::physical::PhysicalAddressLimit;
+use crate::memory::usercopy::{AddressSpaceTeardownReservation, UserPinTracker};
 use crate::task::ProcessKey;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -454,6 +455,7 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
     pub(crate) fn teardown_empty_owned<
         const RANGES: usize,
         const ROLES: usize,
+        const PINS: usize,
         T: AtomicPageTableTarget,
     >(
         &mut self,
@@ -461,7 +463,12 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
         target: &mut T,
         process: ProcessKey,
         address_space: AddressSpaceKey,
+        pins: &UserPinTracker<PINS>,
+        reservation: AddressSpaceTeardownReservation<'_, PINS>,
     ) -> Result<(), RootBindingError> {
+        if !pins.owns_teardown_reservation(&reservation) || !reservation.covers(address_space) {
+            return Err(RootBindingError::RootMismatch);
+        }
         let slot = self.binding_slot(process, address_space)?;
         let binding = self.entries[slot]
             .as_ref()
