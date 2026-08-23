@@ -21,7 +21,7 @@ fn raw_allocator_mechanisms_remain_ownership_scoped() {
     for declaration in [
         "pub(super) struct PhysicalFrameAllocator",
         "pub(super) fn from_candidates",
-        "pub(super) fn allocate_run",
+        "pub(super) fn allocate_run(",
         "pub(super) fn free_run",
     ] {
         assert_eq!(

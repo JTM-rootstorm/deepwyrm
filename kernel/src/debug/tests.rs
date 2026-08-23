@@ -217,3 +217,14 @@ fn ordinary_records_have_bounded_fields() {
     assert!(text.starts_with("[DW0][INFO][boot] "));
     assert!(text.ends_with("...\r\n"));
 }
+
+#[test]
+fn smp_records_identify_cpu_apic_and_state() {
+    let _test_lock = lock_output_guard_test();
+    let mut serial = Com1::new(FakePort::ready());
+    emit_cpu_state_record(&mut serial, 3, 17, "parked").unwrap();
+    let port = serial.io;
+    let bytes = port.bytes();
+    let text = core::str::from_utf8(&bytes[..port.write_count]).unwrap();
+    assert_eq!(text, "[DW0][INFO][smp] cpu=3 apic=17 state=parked\r\n");
+}

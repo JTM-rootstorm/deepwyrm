@@ -281,6 +281,25 @@ fn emit_record<P: PortIo>(
         .map_err(|_| SerialError::TransmitTimeout)
 }
 
+/// Emits the bounded H1 CPU identity/lifecycle record used by live SMP gates.
+fn emit_cpu_state_record<P: PortIo>(
+    serial: &mut Com1<P>,
+    cpu_index: usize,
+    local_apic_id: u8,
+    state: &str,
+) -> Result<(), SerialError> {
+    let _guard = OutputGuard::acquire().ok_or(SerialError::Busy)?;
+    write!(
+        serial,
+        "[DW0][INFO][smp] cpu={cpu_index} apic={local_apic_id} state="
+    )
+    .map_err(|_| SerialError::TransmitTimeout)?;
+    write_limited(serial, state.as_bytes(), 16)?;
+    serial
+        .write_str("\n")
+        .map_err(|_| SerialError::TransmitTimeout)
+}
+
 /// Emits one bounded panic record. Address-bearing fields are redacted outside
 /// debug builds so a release serial log cannot disclose kernel layout.
 #[cfg_attr(
@@ -458,6 +477,21 @@ pub(crate) fn emit_early_record(
 ) -> Result<(), SerialError> {
     let mut serial = Com1::new(X86PortIo);
     emit_record(&mut serial, level, subsystem, message)
+}
+
+/// Emits one allocation-free CPU identity/lifecycle record through COM1.
+#[cfg(all(
+    not(feature = "test-support"),
+    target_os = "none",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+pub(crate) fn emit_early_cpu_state_record(
+    cpu_index: usize,
+    local_apic_id: u8,
+    state: &str,
+) -> Result<(), SerialError> {
+    let mut serial = Com1::new(X86PortIo);
+    emit_cpu_state_record(&mut serial, cpu_index, local_apic_id, state)
 }
 
 /// Emits a panic record through the kernel's COM1 diagnostic writer.

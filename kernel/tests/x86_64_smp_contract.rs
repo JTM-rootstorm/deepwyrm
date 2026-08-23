@@ -32,7 +32,9 @@ fn h1_online_publication_and_failure_are_explicit() {
 
 #[test]
 fn h1_trampoline_plan_is_bounded_to_one_low_nonzero_page() {
-    assert!(SMP_SOURCE.contains("AP_TRAMPOLINE_LIMIT: u64 = 0x10_0000"));
+    let mm = include_str!("../src/arch/x86_64/mm/mod.rs");
+    assert!(mm.contains("AP_TRAMPOLINE_LIMIT: u64 = 0x10_0000"));
+    assert!(SMP_SOURCE.contains("super::mm::AP_TRAMPOLINE_LIMIT"));
     assert!(SMP_SOURCE.contains("AP_TRAMPOLINE_MAX_BYTES: u64 = PAGE_SIZE"));
     assert!(SMP_SOURCE.contains("physical_start < PAGE_SIZE"));
     assert!(SMP_SOURCE.contains("page_table_root >= 1_u64 << 32"));

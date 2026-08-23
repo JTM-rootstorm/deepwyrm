@@ -13,6 +13,8 @@
 
 use crate::memory::physical::{BASE_PAGE_SIZE, PhysicalAddressLimit};
 
+pub(crate) const AP_TRAMPOLINE_LIMIT: u64 = 0x10_0000;
+
 mod journal;
 pub(crate) mod transition;
 

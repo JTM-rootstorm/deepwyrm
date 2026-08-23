@@ -122,6 +122,81 @@ static BOOTSTRAP_SANITIZED_MAP: BootstrapStorage<memory::boot_map::SanitizedBoot
 static BOOTSTRAP_ACPI_WORKSPACE: BootstrapStorage<arch::x86_64::acpi::AcpiSnapshotWorkspace> =
     BootstrapStorage::uninit();
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+const H1_AP_PARK_POLL_LIMIT: usize = 10_000_000;
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "an H1 application processor has no scheduler ownership and parks forever with IF clear"
+)]
+fn park_h1_application_processor() -> ! {
+    loop {
+        // SAFETY: H1 APs deliberately expose no runnable work. Keeping IF
+        // clear prevents them from entering shared runtime state before H2.
+        unsafe {
+            core::arch::asm!("cli; hlt", options(nomem, nostack));
+        }
+    }
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn fail_h1_application_processor(cpu_index: usize, reason: u32) -> ! {
+    let _ = arch::x86_64::smp::live_cpu_registry().fail(cpu_index, reason);
+    park_h1_application_processor()
+}
+
+/// Higher-half H1 entry reached only from the validated low trampoline.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    reason = "the AP consumes its private descriptor and machine-register slot before publication"
+)]
+extern "sysv64" fn dw_x86_64_ap_higher_half_entry(cpu_index: u32, local_apic_id: u32) -> ! {
+    let cpu_index = cpu_index as usize;
+    let Ok(local_apic_id) = u8::try_from(local_apic_id) else {
+        park_h1_application_processor();
+    };
+    let registry = arch::x86_64::smp::live_cpu_registry();
+    let Ok(snapshot) = registry.snapshot(cpu_index) else {
+        park_h1_application_processor();
+    };
+    if cpu_index == 0
+        || snapshot.lifecycle != arch::x86_64::smp::CpuLifecycle::Starting
+        || snapshot.local_apic_id != local_apic_id
+    {
+        fail_h1_application_processor(cpu_index, 0x101);
+    }
+
+    // SAFETY: the trampoline entered the active Deep root on this CPU's
+    // private bootstrap stack with IF clear and passes a registry-validated
+    // nonzero slot exactly once.
+    if unsafe { arch::x86_64::initialize_ap_runtime_slot(cpu_index) }.is_err() {
+        fail_h1_application_processor(cpu_index, 0x102);
+    }
+    let Ok(local_apic_base) = arch::x86_64::smp::live_local_apic_physical_base() else {
+        fail_h1_application_processor(cpu_index, 0x103);
+    };
+    if time::initialize_ap_local_apic(local_apic_id, local_apic_base).is_err() {
+        fail_h1_application_processor(cpu_index, 0x104);
+    }
+    if registry
+        .publish_online(cpu_index, local_apic_id, 1)
+        .is_err()
+    {
+        fail_h1_application_processor(cpu_index, 0x105);
+    }
+    #[cfg(not(feature = "test-support"))]
+    let _ = debug::emit_early_cpu_state_record(cpu_index, local_apic_id, "online");
+    if registry.park(cpu_index).is_err() {
+        park_h1_application_processor();
+    }
+    #[cfg(not(feature = "test-support"))]
+    let _ = debug::emit_early_cpu_state_record(cpu_index, local_apic_id, "parked");
+    park_h1_application_processor()
+}
+
 /// Transfers from the raw architecture entry into validated DW0-B bring-up.
 ///
 /// This symbol is architecture-internal. The loader enters through
@@ -250,11 +325,90 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
         };
         time::initialize(&mut active_paging, pm_timer)
             .unwrap_or_else(|error| panic!("failed to initialize DW0-F3 time service: {error:?}"));
+
+        let (bsp_local_apic_id, bsp_local_apic_base) = time::bsp_local_apic_identity()
+            .unwrap_or_else(|error| panic!("failed to identify the H1 bootstrap CPU: {error:?}"));
+        let cpu_topology = {
+            // The one-shot BSP owns this workspace serially. CPU discovery
+            // snapshots every table again and does not retain workspace data.
+            let workspace = unsafe { &mut *(*BOOTSTRAP_ACPI_WORKSPACE.slot()).as_mut_ptr() };
+            let mut acpi =
+                arch::x86_64::acpi::AcpiScratchReader::new(&mut active_paging, &boot_info);
+            arch::x86_64::acpi::discover_cpu_topology(
+                &mut acpi,
+                boot_info.header().acpi_rsdp_physical_address,
+                bsp_local_apic_id,
+                true,
+                workspace,
+            )
+            .unwrap_or_else(|error| panic!("failed to discover H1 CPU topology: {error:?}"))
+        };
+        if cpu_topology.local_apic_physical_address() != bsp_local_apic_base {
+            panic!("MADT Local APIC base contradicts the BSP APIC MSR");
+        }
+        arch::x86_64::smp::configure_live_cpu_registry(&cpu_topology)
+            .unwrap_or_else(|error| panic!("failed to configure the H1 CPU registry: {error:?}"));
+        let cpu_registry = arch::x86_64::smp::live_cpu_registry();
+        cpu_registry
+            .begin_start(0)
+            .unwrap_or_else(|error| panic!("failed to start H1 BSP registration: {error:?}"));
+
         // SAFETY: the final Deep-owned root is active, the BSP remains at CPL0
-        // with IF clear, and the finalized GDT/TSS already carries the guarded
-        // E4 privilege-entry stack. No CPL3 execution exists before this point.
+        // with IF clear, and no AP has been released. Migration installs BSP
+        // runtime slot zero before its CPU-local SYSCALL state is published.
+        unsafe { arch::x86_64::migrate_bsp_to_runtime_slot0_after_deep_paging() }
+            .unwrap_or_else(|error| panic!("failed to migrate the H1 BSP descriptors: {error:?}"));
         unsafe { arch::x86_64::syscall::install_syscall_boundary() }
             .unwrap_or_else(|error| panic!("failed to install E4 SYSCALL boundary: {error:?}"));
+        cpu_registry
+            .publish_online(0, bsp_local_apic_id, 1)
+            .unwrap_or_else(|error| panic!("failed to publish the H1 BSP online: {error:?}"));
+        #[cfg(not(feature = "test-support"))]
+        let _ = debug::emit_early_cpu_state_record(0, bsp_local_apic_id, "online");
+
+        let runtime_stacks = arch::x86_64::linked_runtime_cpu_stack_layout()
+            .unwrap_or_else(|error| panic!("invalid H1 per-CPU stack arena: {error:?}"));
+        let (trampoline_template, trampoline_layout) =
+            arch::x86_64::smp::linked_trampoline_template();
+        let trampoline_plan = arch::x86_64::smp::TrampolinePlan::new(
+            active_paging.ap_trampoline_physical_start(),
+            trampoline_template.len() as u64,
+            active_paging.root().frame().address(),
+            dw_x86_64_ap_higher_half_entry as *const () as u64,
+        )
+        .unwrap_or_else(|error| panic!("invalid H1 AP trampoline plan: {error:?}"));
+        for entry in cpu_topology.entries().skip(1) {
+            let cpu_index = usize::from(entry.logical_index());
+            let local_apic_id = entry.local_apic_id();
+            cpu_registry
+                .begin_start(cpu_index)
+                .unwrap_or_else(|error| panic!("failed to begin AP {cpu_index}: {error:?}"));
+            let mut image = [0_u8; arch::x86_64::smp::PAGE_SIZE as usize];
+            arch::x86_64::smp::build_trampoline_image(
+                &mut image,
+                trampoline_template,
+                trampoline_layout,
+                trampoline_plan,
+                cpu_index,
+                local_apic_id,
+                runtime_stacks[cpu_index].ap_bootstrap.top,
+            )
+            .unwrap_or_else(|error| panic!("failed to build AP {cpu_index} trampoline: {error:?}"));
+            active_paging
+                .install_ap_trampoline_image(&image)
+                .unwrap_or_else(|error| {
+                    panic!("failed to install AP {cpu_index} trampoline: {error:?}")
+                });
+            arch::x86_64::smp::deliver_ap_startup_sequence(
+                &mut arch::x86_64::smp::LiveApStartupPlatform,
+                local_apic_id,
+                trampoline_plan.physical_start,
+            )
+            .unwrap_or_else(|error| panic!("failed to deliver AP {cpu_index} startup: {error:?}"));
+            cpu_registry
+                .wait_until_parked(cpu_index, H1_AP_PARK_POLL_LIMIT)
+                .unwrap_or_else(|error| panic!("AP {cpu_index} did not park: {error:?}"));
+        }
         #[cfg(not(feature = "test-support"))]
         let _ = debug::emit_early_record(
             debug::DiagnosticLevel::Info,

@@ -284,7 +284,7 @@ pub(super) fn build_and_bind_deep_root<
         let mut edge_count = 0;
 
         let trampoline_allocation = roles
-            .allocate_below(1, crate::arch::x86_64::smp::AP_TRAMPOLINE_LIMIT)
+            .allocate_below(1, super::super::super::AP_TRAMPOLINE_LIMIT)
             .map_err(DeepRootBuildError::FrameRole)?;
         let trampoline_page = [0_u8; PAGE_SIZE as usize];
         mapper

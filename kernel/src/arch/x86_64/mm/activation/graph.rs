@@ -694,7 +694,7 @@ pub(super) fn validate_inactive_graph_with_workspace<
         let page = ap_trampoline.physical_start();
         if ap_trampoline.byte_len() != PAGE_SIZE
             || page == 0
-            || page >= crate::arch::x86_64::smp::AP_TRAMPOLINE_LIMIT
+            || page >= super::super::super::AP_TRAMPOLINE_LIMIT
         {
             return Err(InactiveGraphError::InvalidEntry);
         }

@@ -449,7 +449,7 @@ fn graph_accepts_only_the_typed_low_rx_ap_trampoline_leaf() {
     let mut fixture = graph_fixture();
     let allocation = fixture
         .roles
-        .allocate_below(1, crate::arch::x86_64::smp::AP_TRAMPOLINE_LIMIT)
+        .allocate_below(1, super::super::super::AP_TRAMPOLINE_LIMIT)
         .unwrap();
     let trampoline_page = allocation.physical_start();
     let trampoline = unsafe {

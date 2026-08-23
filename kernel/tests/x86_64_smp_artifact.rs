@@ -96,7 +96,7 @@ fn h1_trampoline_template_is_one_page_and_relocation_free() {
         );
     }
 
-    for relocation in elf.relocations_for(template.index) {
+    if let Some(relocation) = elf.relocations_for(template.index).next() {
         panic!(
             "AP trampoline template must be relocation-free; relocation section {} entry {} targets it",
             relocation.section_name, relocation.entry_index

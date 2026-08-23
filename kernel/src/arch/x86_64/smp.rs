@@ -13,7 +13,7 @@ pub(crate) const INIT_TO_SIPI_DELAY_NS: u64 = 200_000;
 pub(crate) const SIPI_RETRY_DELAY_NS: u64 = 200_000;
 
 pub(crate) const PAGE_SIZE: u64 = 4096;
-pub(crate) const AP_TRAMPOLINE_LIMIT: u64 = 0x10_0000;
+pub(crate) const AP_TRAMPOLINE_LIMIT: u64 = super::mm::AP_TRAMPOLINE_LIMIT;
 pub(crate) const AP_TRAMPOLINE_MAX_BYTES: u64 = PAGE_SIZE;
 pub(crate) const AP_BOOTSTRAP_STACK_BYTES: u64 = 64 * 1024;
 pub(crate) const IST_STACK_BYTES: u64 = 16 * 1024;
@@ -83,7 +83,7 @@ impl CpuSlotState {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .map_err(|observed| CpuStateError::UnexpectedState(observed))?;
+            .map_err(CpuStateError::UnexpectedState)?;
         self.local_apic_id.store(local_apic_id, Ordering::Relaxed);
         Ok(())
     }
@@ -259,6 +259,15 @@ impl CpuRegistry {
         }
         self.slots[cpu_index]
             .park()
+            .map_err(CpuRegistryError::State)
+    }
+
+    pub(crate) fn fail(&self, cpu_index: usize, reason: u32) -> Result<(), CpuRegistryError> {
+        if cpu_index >= self.len() {
+            return Err(CpuRegistryError::InvalidCpuIndex(cpu_index));
+        }
+        self.slots[cpu_index]
+            .fail(reason)
             .map_err(CpuRegistryError::State)
     }
 

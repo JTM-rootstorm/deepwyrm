@@ -532,6 +532,7 @@ fn linked_entry_and_rust_boundary_match_the_canonical_elf_policy() {
     let temporary = TemporaryDirectory::new("deepwyrm-x86_64-entry-contract");
     let entry_object = temporary.path.join("entry.o");
     let exceptions_object = temporary.path.join("exceptions.o");
+    let ap_trampoline_object = temporary.path.join("ap-trampoline.o");
     let rust_object = temporary.path.join("rust-boundary.o");
     let section_object = temporary.path.join("section-probe.o");
     let kernel_elf = temporary.path.join("deepwyrm-kernel.elf");
@@ -602,6 +603,12 @@ extern "sysv64" fn dw_x86_64_terminal_interrupt_dispatch(_vector: u64) -> ! {{
         .expect("assemble the actual entry shim through the kernel build helper");
     kernel_build::assemble_source(&exceptions_assembly_path(), &exceptions_object, layout)
         .expect("assemble the actual exception stubs through the kernel build helper");
+    kernel_build::assemble_source(
+        &ap_trampoline_assembly_path(),
+        &ap_trampoline_object,
+        layout,
+    )
+    .expect("assemble the actual AP trampoline through the kernel build helper");
 
     let section_source = temporary.path.join("section-probe.S");
     fs::write(
@@ -637,7 +644,11 @@ dw_test_bss_probe:
         layout,
         task_layout,
         &linker_path(),
-        &[entry_object.as_path(), exceptions_object.as_path()],
+        &[
+            entry_object.as_path(),
+            exceptions_object.as_path(),
+            ap_trampoline_object.as_path(),
+        ],
     );
     run_success(
         Command::new("ld.lld")
@@ -897,6 +908,10 @@ fn entry_rust_path() -> PathBuf {
 
 fn exceptions_assembly_path() -> PathBuf {
     kernel_root().join("src/arch/x86_64/exceptions.S")
+}
+
+fn ap_trampoline_assembly_path() -> PathBuf {
+    kernel_root().join("src/arch/x86_64/ap_trampoline.S")
 }
 
 struct TemporaryDirectory {
