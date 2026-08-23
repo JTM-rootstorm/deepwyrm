@@ -1557,6 +1557,21 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.kernel_execution_roots.get(cpu)
     }
 
+    /// Audited Process->CPU-kernel-root transition. The move-only Process
+    /// selection is consumed; callers must retain the returned kernel token
+    /// before performing any reaper work.
+    pub(crate) fn enter_kernel_execution_root(
+        &self,
+        active: ActiveRootSelection,
+    ) -> Result<ActiveKernelExecutionRoot, (RootBindingError, ActiveRootSelection)> {
+        let kernel = match self.kernel_execution_root(active.cpu()) {
+            Ok(kernel) => kernel,
+            Err(error) => return Err((error, active)),
+        };
+        self.root_bindings
+            .activate_kernel_execution_root(kernel, active, &mut LiveRootSwitchTarget)
+    }
+
     /// Reserves a distinct child PML4, initializes only its supervisor half
     /// from the typed primordial kernel-half borrow, then publishes the exact
     /// portable-key/Process binding. Every failure before root publication
