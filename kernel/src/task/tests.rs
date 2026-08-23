@@ -214,6 +214,68 @@ fn process_exit_drains_handles_and_records_per_thread_reason() {
 }
 
 #[test]
+fn process_gate_selects_one_termination_and_drains_preexisting_operations() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (process, process_handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
+
+    let lease = tasks.acquire_process_operation(process).unwrap();
+    assert!(matches!(
+        tasks.terminate_process_authorized(&mut registry, process, 0x11),
+        Err(TaskError::BadState)
+    ));
+    assert_eq!(
+        tasks.process_lifecycle(process),
+        Ok(ProcessLifecycleState::Quiescing)
+    );
+    assert_eq!(
+        tasks.acquire_process_operation(process).err(),
+        Some(TaskError::BadState)
+    );
+    assert!(tasks.validate_process_operation(&lease, process).is_ok());
+    assert!(
+        tasks
+            .process_handles_mut_for_operation(&lease, process)
+            .is_ok()
+    );
+
+    // A competing reason cannot replace the winner selected when the gate
+    // first closed, either before or after the old operation drains.
+    assert!(matches!(
+        tasks.terminate_process_authorized(&mut registry, process, 0x22),
+        Err(TaskError::BadState)
+    ));
+    tasks.release_process_operation(lease).unwrap();
+    assert!(matches!(
+        tasks.terminate_process_authorized(&mut registry, process, 0x22),
+        Err(TaskError::BadState)
+    ));
+    let effects = tasks
+        .terminate_process_authorized(&mut registry, process, 0x11)
+        .unwrap();
+    assert_eq!(
+        tasks.process_lifecycle(process),
+        Ok(ProcessLifecycleState::Exited)
+    );
+    let proof = tasks.process_quiescence_proof(process).unwrap();
+    assert!(tasks.validate_process_quiescence(&proof, process).is_ok());
+    assert_eq!(tasks.process_info(process).unwrap().detail, 0x11);
+    assert!(
+        release_pins(&mut registry, effects.pins)
+            .into_iter()
+            .flatten()
+            .next()
+            .is_none()
+    );
+
+    let process_final = registry.release_handle(process_handle).unwrap().unwrap();
+    finish_task_release(&mut tasks, &mut registry, process_final);
+    let root_final = registry.release_internal(root_owner).unwrap().unwrap();
+    finish_task_release(&mut tasks, &mut registry, root_final);
+}
+
+#[test]
 fn userspace_exception_is_process_fatal_and_siblings_do_not_claim_fault() {
     let mut registry = ObjectRegistry::<OBJECTS>::new();
     let mut tasks = Tasks::new();

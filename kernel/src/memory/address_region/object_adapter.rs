@@ -7,7 +7,8 @@ use crate::object::{
 };
 use crate::task::{
     BlockedOperationError, BlockedOperationRegistry, BlockedOperationsDrained,
-    PreparedRootRegionAttachment, ProcessKey, TaskAuthority, TaskError,
+    PreparedRootRegionAttachment, ProcessKey, ProcessOperationLease, ProcessQuiescenceProof,
+    TaskAuthority, TaskError,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -189,6 +190,27 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
         Ok(&mut self.record_mut(key)?.region)
     }
 
+    /// Resolves mutable region access under a process operation lease. The
+    /// lease is retained by the caller across the complete transactional use;
+    /// no TaskAuthority borrow remains after this check.
+    pub(crate) fn region_mut_for_operation<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &mut self,
+        tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        lease: &ProcessOperationLease,
+        key: AddressRegionObjectKey,
+    ) -> Result<&mut AddressRegion<SLOTS>, AddressRegionObjectError> {
+        let process = ProcessKey::from_object_id(self.record(key)?.process);
+        tasks
+            .validate_process_operation(lease, process)
+            .map_err(AddressRegionObjectError::Task)?;
+        Ok(&mut self.record_mut(key)?.region)
+    }
+
     /// Resolves a pinned current-process virtual word without exposing the
     /// root-region payload or permitting a handle-selected foreign region.
     pub(crate) fn resolve_atomic_wait_key_for_live_process<
@@ -210,6 +232,35 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
         {
             return Err(AddressRegionObjectError::Task(TaskError::BadState));
         }
+        let root = tasks
+            .root_region(process)
+            .map_err(AddressRegionObjectError::Task)?
+            .ok_or(AddressRegionObjectError::WrongProcess)?;
+        let record = self.record(AddressRegionObjectKey::from_object_id(root))?;
+        if record.process != process.object_id() || !record.owns_address_space {
+            return Err(AddressRegionObjectError::WrongProcess);
+        }
+        record
+            .region
+            .resolve_atomic_wait_key(address)
+            .map_err(AddressRegionObjectError::Model)
+    }
+
+    pub(crate) fn resolve_atomic_wait_key_for_operation<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &self,
+        tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        lease: &ProcessOperationLease,
+        process: ProcessKey,
+        address: u64,
+    ) -> Result<AtomicWaitKey, AddressRegionObjectError> {
+        tasks
+            .validate_process_operation(lease, process)
+            .map_err(AddressRegionObjectError::Task)?;
         let root = tasks
             .root_region(process)
             .map_err(AddressRegionObjectError::Task)?
@@ -249,6 +300,32 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
         key: AddressRegionObjectKey,
     ) -> Result<&mut AddressRegion<SLOTS>, AddressRegionObjectError> {
         let process = ProcessKey::from_object_id(self.record(key)?.process);
+        if tasks
+            .process_info(process)
+            .map_err(AddressRegionObjectError::Task)?
+            .state
+            != DW_TASK_STATE_EXITED
+        {
+            return Err(AddressRegionObjectError::Task(TaskError::BadState));
+        }
+        Ok(&mut self.record_mut(key)?.region)
+    }
+
+    pub(crate) fn region_mut_for_quiesced_teardown<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &mut self,
+        tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        proof: &ProcessQuiescenceProof,
+        key: AddressRegionObjectKey,
+    ) -> Result<&mut AddressRegion<SLOTS>, AddressRegionObjectError> {
+        let process = ProcessKey::from_object_id(self.record(key)?.process);
+        tasks
+            .validate_process_quiescence(proof, process)
+            .map_err(AddressRegionObjectError::Task)?;
         if tasks
             .process_info(process)
             .map_err(AddressRegionObjectError::Task)?
@@ -333,6 +410,29 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
             .runtime_pin
             .take()
             .expect("checked runtime pin"))
+    }
+
+    pub(crate) fn retire_quiesced_root<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+        const BLOCKED: usize,
+    >(
+        &mut self,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        process: ProcessKey,
+        proof: &ProcessQuiescenceProof,
+        blocked: &BlockedOperationRegistry<BLOCKED>,
+        drained: BlockedOperationsDrained,
+    ) -> Result<InternalRef, AddressRegionObjectError> {
+        blocked
+            .validate_drained_after_quiesce(tasks, proof, &drained)
+            .map_err(AddressRegionObjectError::BlockedOperation)?;
+        tasks
+            .validate_process_quiescence(proof, process)
+            .map_err(AddressRegionObjectError::Task)?;
+        self.retire_exited_root(tasks, process, blocked, drained)
     }
 
     pub(crate) fn take_finalization<const SPACES: usize, const REGIONS: usize>(

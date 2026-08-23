@@ -1,10 +1,22 @@
 use super::*;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_TASK_OPERATION_DOMAIN: AtomicU64 = AtomicU64::new(1);
+
+fn mint_task_operation_domain() -> u64 {
+    NEXT_TASK_OPERATION_DOMAIN
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1).filter(|next| *next != 0)
+        })
+        .expect("task operation domain space exhausted")
+}
 
 impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HANDLES: usize>
     TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>
 {
     pub(crate) fn new() -> Self {
         Self {
+            operation_domain: mint_task_operation_domain(),
             groups: core::array::from_fn(|_| None),
             processes: core::array::from_fn(|_| None),
             threads: core::array::from_fn(|_| None),
@@ -144,6 +156,7 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             hierarchy: ProcessHierarchyState::Reserved(child_index),
             threads: [None; THREADS],
             handles: HandleTable::new(),
+            operations: ProcessOperationState::accepting(),
         });
         Ok(TaskPayloadBinding::Process { creation, key })
     }
@@ -165,7 +178,7 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         let process = self.processes[process_slot]
             .as_mut()
             .expect("validated process slot");
-        if process.state.state == DW_TASK_STATE_EXITED {
+        if process.operations.phase != ProcessLifecycleState::AcceptingOperations {
             return Err((TaskError::BadState, creation, parent));
         }
         let child_index = match process.threads.iter().position(Option::is_none) {
@@ -285,6 +298,7 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
     ) -> Result<PreparedRootRegionAttachment, TaskError> {
         let process = self.process_mut(key)?;
         if process.state.state != DW_TASK_STATE_CREATED
+            || process.operations.phase != ProcessLifecycleState::AcceptingOperations
             || process.root_region.is_some()
             || process.root_region_reserved
         {
@@ -356,10 +370,19 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         key: ProcessKey,
     ) -> Result<&mut HandleTable<HANDLES>, TaskError> {
         let process = self.process_mut(key)?;
-        if process.state.state == DW_TASK_STATE_EXITED {
+        if process.operations.phase != ProcessLifecycleState::AcceptingOperations {
             return Err(TaskError::BadState);
         }
         Ok(&mut process.handles)
+    }
+
+    pub(crate) fn process_handles_mut_for_operation(
+        &mut self,
+        lease: &ProcessOperationLease,
+        key: ProcessKey,
+    ) -> Result<&mut HandleTable<HANDLES>, TaskError> {
+        self.validate_process_operation(lease, key)?;
+        Ok(&mut self.process_mut(key)?.handles)
     }
 
     pub(crate) fn process_handle_count(&self, key: ProcessKey) -> Result<usize, TaskError> {
@@ -396,6 +419,7 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
     ) -> Result<(), TaskError> {
         let process = self.process_mut(key)?;
         if process.state.state != DW_TASK_STATE_CREATED
+            || process.operations.phase != ProcessLifecycleState::AcceptingOperations
             || process.root_region.is_some()
             || process.root_region_reserved
         {
@@ -441,6 +465,172 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         key: ProcessKey,
     ) -> Result<DwTaskTerminationInfoV1, TaskError> {
         Ok(self.process(key)?.state.abi())
+    }
+
+    pub(crate) fn process_lifecycle(
+        &self,
+        key: ProcessKey,
+    ) -> Result<ProcessLifecycleState, TaskError> {
+        Ok(self.process(key)?.operations.phase)
+    }
+
+    /// Acquires move-only authority for setup or publication associated with a
+    /// live Process. New leases are rejected as soon as quiescing begins.
+    pub(crate) fn acquire_process_operation(
+        &mut self,
+        key: ProcessKey,
+    ) -> Result<ProcessOperationLease, TaskError> {
+        let authority_domain = self.operation_domain;
+        let process = self.process_mut(key)?;
+        if process.operations.phase != ProcessLifecycleState::AcceptingOperations {
+            return Err(TaskError::BadState);
+        }
+        process.operations.active = process
+            .operations
+            .active
+            .checked_add(1)
+            .ok_or(TaskError::Capacity)?;
+        Ok(ProcessOperationLease {
+            authority_domain,
+            process: key,
+            generation: process.operations.generation,
+            completed: false,
+        })
+    }
+
+    pub(crate) fn validate_process_operation(
+        &self,
+        lease: &ProcessOperationLease,
+        key: ProcessKey,
+    ) -> Result<(), TaskError> {
+        let process = self.process(key)?;
+        if lease.completed
+            || lease.authority_domain != self.operation_domain
+            || lease.process != key
+            || lease.generation != process.operations.generation
+            || process.operations.phase == ProcessLifecycleState::Exited
+            || process.operations.active == 0
+        {
+            return Err(TaskError::Reference);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_process_operation(
+        &mut self,
+        mut lease: ProcessOperationLease,
+    ) -> Result<(), (TaskError, ProcessOperationLease)> {
+        let authority_domain = self.operation_domain;
+        let process = match self.process_mut(lease.process) {
+            Ok(process) => process,
+            Err(error) => return Err((error, lease)),
+        };
+        if lease.completed
+            || lease.authority_domain != authority_domain
+            || lease.generation != process.operations.generation
+            || process.operations.phase == ProcessLifecycleState::Exited
+            || process.operations.active == 0
+        {
+            return Err((TaskError::Reference, lease));
+        }
+        process.operations.active -= 1;
+        lease.completed = true;
+        Ok(())
+    }
+
+    /// Closes the operation gate. A retry returns proof once all leases that
+    /// predate the close have been released.
+    pub(crate) fn begin_process_quiesce(
+        &mut self,
+        key: ProcessKey,
+    ) -> Result<ProcessQuiescenceProof, ProcessGateError> {
+        let authority_domain = self.operation_domain;
+        let process = self.process_mut(key).map_err(ProcessGateError::Task)?;
+        match process.operations.phase {
+            ProcessLifecycleState::AcceptingOperations => {
+                process.operations.phase = ProcessLifecycleState::Quiescing;
+            }
+            ProcessLifecycleState::Quiescing => {}
+            ProcessLifecycleState::Exited => {
+                return Err(ProcessGateError::Task(TaskError::BadState));
+            }
+        }
+        if process.operations.active != 0 {
+            return Err(ProcessGateError::OperationsInFlight);
+        }
+        Ok(ProcessQuiescenceProof {
+            authority_domain,
+            process: key,
+            generation: process.operations.generation,
+        })
+    }
+
+    pub(crate) fn process_quiescence_proof(
+        &self,
+        key: ProcessKey,
+    ) -> Result<ProcessQuiescenceProof, TaskError> {
+        let process = self.process(key)?;
+        if process.operations.phase == ProcessLifecycleState::AcceptingOperations
+            || process.operations.active != 0
+        {
+            return Err(TaskError::BadState);
+        }
+        Ok(ProcessQuiescenceProof {
+            authority_domain: self.operation_domain,
+            process: key,
+            generation: process.operations.generation,
+        })
+    }
+
+    pub(crate) fn validate_process_quiescence(
+        &self,
+        proof: &ProcessQuiescenceProof,
+        key: ProcessKey,
+    ) -> Result<(), TaskError> {
+        let process = self.process(key)?;
+        if proof.authority_domain != self.operation_domain
+            || proof.process != key
+            || proof.generation != process.operations.generation
+            || process.operations.phase == ProcessLifecycleState::AcceptingOperations
+            || process.operations.active != 0
+        {
+            return Err(TaskError::Reference);
+        }
+        Ok(())
+    }
+
+    fn finish_process_exit(
+        &mut self,
+        proof: &ProcessQuiescenceProof,
+        termination: TerminationRecord,
+    ) -> Result<(), TaskError> {
+        self.validate_process_quiescence(proof, proof.process)?;
+        let process = self.process_mut(proof.process)?;
+        if process.operations.phase != ProcessLifecycleState::Quiescing {
+            return Err(TaskError::BadState);
+        }
+        if process.operations.pending_termination != Some(termination) {
+            return Err(TaskError::BadState);
+        }
+        process.state.terminate(termination)?;
+        process.operations.phase = ProcessLifecycleState::Exited;
+        Ok(())
+    }
+
+    fn begin_process_termination(
+        &mut self,
+        key: ProcessKey,
+        termination: TerminationRecord,
+    ) -> Result<ProcessQuiescenceProof, ProcessGateError> {
+        {
+            let process = self.process_mut(key).map_err(ProcessGateError::Task)?;
+            match process.operations.pending_termination {
+                None => process.operations.pending_termination = Some(termination),
+                Some(selected) if selected == termination => {}
+                Some(_) => return Err(ProcessGateError::Task(TaskError::BadState)),
+            }
+        }
+        self.begin_process_quiesce(key)
     }
 
     pub(crate) fn thread_info(&self, key: ThreadKey) -> Result<DwTaskTerminationInfoV1, TaskError> {
@@ -519,7 +709,8 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
                 .parent
                 .id(),
         );
-        if self.process(process_key)?.state.state == DW_TASK_STATE_EXITED {
+        if self.process(process_key)?.operations.phase != ProcessLifecycleState::AcceptingOperations
+        {
             return Err(TaskError::BadState);
         }
         let thread = self.threads[thread_slot]
@@ -571,9 +762,9 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         if self.processes[process_slot]
             .as_ref()
             .expect("validated process slot")
-            .state
-            .state
-            == DW_TASK_STATE_EXITED
+            .operations
+            .phase
+            != ProcessLifecycleState::AcceptingOperations
         {
             return Err(TaskError::BadState);
         }
@@ -615,6 +806,24 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
                 .parent
                 .id(),
         );
+        let exits_process = !self.process_has_other_live_threads(process_key, key)?;
+        if !exits_process
+            && self.process(process_key)?.operations.phase
+                != ProcessLifecycleState::AcceptingOperations
+        {
+            return Err(TaskError::BadState);
+        }
+        let quiescence = if exits_process {
+            Some(
+                self.begin_process_termination(process_key, TerminationRecord::normal(code))
+                    .map_err(|error| match error {
+                        ProcessGateError::Task(error) => error,
+                        ProcessGateError::OperationsInFlight => TaskError::BadState,
+                    })?,
+            )
+        } else {
+            None
+        };
         let thread = self.threads[thread_slot]
             .as_mut()
             .expect("validated thread slot");
@@ -630,10 +839,9 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             );
         }
 
-        if !self.process_has_live_threads(process_key)? {
-            let process = self.process_mut(process_key)?;
-            process.state.terminate(TerminationRecord::normal(code))?;
-            pins.process = process.execution_pin.take();
+        if let Some(proof) = quiescence {
+            self.finish_process_exit(&proof, TerminationRecord::normal(code))?;
+            pins.process = self.process_mut(process_key)?.execution_pin.take();
         }
         Ok(pins)
     }
@@ -651,6 +859,24 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
                 .parent
                 .id(),
         );
+        let exits_process = !self.process_has_other_live_threads(process_key, key)?;
+        if !exits_process
+            && self.process(process_key)?.operations.phase
+                != ProcessLifecycleState::AcceptingOperations
+        {
+            return Err(TaskError::BadState);
+        }
+        let quiescence = if exits_process {
+            Some(
+                self.begin_process_termination(process_key, TerminationRecord::authorized(detail))
+                    .map_err(|error| match error {
+                        ProcessGateError::Task(error) => error,
+                        ProcessGateError::OperationsInFlight => TaskError::BadState,
+                    })?,
+            )
+        } else {
+            None
+        };
         let thread = self.threads[thread_slot]
             .as_mut()
             .expect("validated thread slot");
@@ -667,12 +893,9 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
                 "Thread lost its execution pin before resource retirement"
             );
         }
-        if !self.process_has_live_threads(process_key)? {
-            let process = self.process_mut(process_key)?;
-            process
-                .state
-                .terminate(TerminationRecord::authorized(detail))?;
-            pins.process = process.execution_pin.take();
+        if let Some(proof) = quiescence {
+            self.finish_process_exit(&proof, TerminationRecord::authorized(detail))?;
+            pins.process = self.process_mut(process_key)?.execution_pin.take();
         }
         Ok(pins)
     }
@@ -744,16 +967,13 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         primary: Option<(ThreadKey, TerminationRecord)>,
         sibling_termination: TerminationRecord,
     ) -> Result<ExitPins<THREADS>, TaskError> {
+        let quiescence = self
+            .begin_process_termination(key, process_termination)
+            .map_err(|error| match error {
+                ProcessGateError::Task(error) => error,
+                ProcessGateError::OperationsInFlight => TaskError::BadState,
+            })?;
         let process_slot = self.process_slot(key)?;
-        if self.processes[process_slot]
-            .as_ref()
-            .expect("validated process slot")
-            .state
-            .state
-            == DW_TASK_STATE_EXITED
-        {
-            return Err(TaskError::BadState);
-        }
         let thread_ids = self.processes[process_slot]
             .as_ref()
             .expect("validated process slot")
@@ -783,11 +1003,8 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
                 );
             }
         }
-        let process = self.processes[process_slot]
-            .as_mut()
-            .expect("validated process slot");
-        process.state.terminate(process_termination)?;
-        pins.process = process.execution_pin.take();
+        self.finish_process_exit(&quiescence, process_termination)?;
+        pins.process = self.process_mut(key)?.execution_pin.take();
         Ok(pins)
     }
 
@@ -866,6 +1083,16 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         assert!(
             !record.root_region_reserved,
             "finalizing Process still reserves a root AddressRegion"
+        );
+        assert!(
+            record.operations.phase == ProcessLifecycleState::Exited
+                || (matches!(record.hierarchy, ProcessHierarchyState::Reserved(_))
+                    && record.operations.phase == ProcessLifecycleState::AcceptingOperations),
+            "finalizing published Process whose lifecycle gate is not exited"
+        );
+        assert_eq!(
+            record.operations.active, 0,
+            "finalizing Process with active operation leases"
         );
         let parent_slot = self.group_slot(TaskGroupKey(record.parent.id()))?;
         let parent = self.groups[parent_slot]
@@ -961,6 +1188,21 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         for object in ids.into_iter().flatten() {
             let thread = self.thread(ThreadKey(object))?;
             if thread.state.state != DW_TASK_STATE_EXITED {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn process_has_other_live_threads(
+        &self,
+        process: ProcessKey,
+        excluded: ThreadKey,
+    ) -> Result<bool, TaskError> {
+        let ids = self.process(process)?.threads;
+        for object in ids.into_iter().flatten() {
+            let key = ThreadKey(object);
+            if key != excluded && self.thread(key)?.state.state != DW_TASK_STATE_EXITED {
                 return Ok(true);
             }
         }
@@ -1455,12 +1697,13 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         key: TaskGroupKey,
     ) -> Result<TaskGroupTerminationEffects<PROCESSES, HANDLES, THREADS>, TaskError> {
         let root_slot = self.group_slot(key)?;
-        if self.groups[root_slot]
-            .as_ref()
-            .expect("validated group slot")
-            .state
-            != TaskGroupState::Active
-        {
+        if !matches!(
+            self.groups[root_slot]
+                .as_ref()
+                .expect("validated group slot")
+                .state,
+            TaskGroupState::Active | TaskGroupState::Terminating
+        ) {
             return Err(TaskError::BadState);
         }
 
@@ -1513,6 +1756,18 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         }
 
         let mut effects = TaskGroupTerminationEffects::empty();
+        for process_key in process_keys.into_iter().flatten() {
+            if self.process(process_key)?.state.state != DW_TASK_STATE_EXITED {
+                self.begin_process_termination(
+                    process_key,
+                    TerminationRecord::task_group_teardown(),
+                )
+                .map_err(|error| match error {
+                    ProcessGateError::Task(error) => error,
+                    ProcessGateError::OperationsInFlight => TaskError::BadState,
+                })?;
+            }
+        }
         for process_key in process_keys.into_iter().flatten() {
             if self.process(process_key)?.state.state == DW_TASK_STATE_EXITED {
                 continue;

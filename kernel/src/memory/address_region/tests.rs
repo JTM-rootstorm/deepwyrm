@@ -3,7 +3,7 @@ extern crate std;
 use super::super::object::MemoryObjectKind;
 use super::*;
 use crate::object::{InternalRef, ObjectRegistry};
-use crate::task::{TaskAuthority, TaskError, complete_task_finalization};
+use crate::task::{ProcessLifecycleState, TaskAuthority, TaskError, complete_task_finalization};
 use deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT;
 use std::boxed::Box;
 use std::ops::{Deref, DerefMut};
@@ -1065,6 +1065,38 @@ fn root_region_handle_close_preserves_address_space_until_process_exit() {
         Err(AddressRegionObjectError::Task(TaskError::BadState))
     ));
 
+    let operation = tasks.acquire_process_operation(process).unwrap();
+    assert!(
+        regions
+            .region_mut_for_operation(&tasks, &operation, region_key)
+            .is_ok()
+    );
+    assert!(
+        regions
+            .resolve_atomic_wait_key_for_operation(&tasks, &operation, process, 0)
+            .is_err()
+    );
+    assert!(matches!(
+        tasks.terminate_process_authorized(&mut registry, process, 0x77),
+        Err(TaskError::BadState)
+    ));
+    assert_eq!(
+        tasks.process_lifecycle(process),
+        Ok(ProcessLifecycleState::Quiescing)
+    );
+    // Work admitted before gate-close retains exact access authority, while a
+    // new mapping/atomic setup cannot start.
+    assert!(
+        regions
+            .region_mut_for_operation(&tasks, &operation, region_key)
+            .is_ok()
+    );
+    assert_eq!(
+        tasks.acquire_process_operation(process).err(),
+        Some(TaskError::BadState)
+    );
+    tasks.release_process_operation(operation).unwrap();
+
     let effects = tasks
         .terminate_process_authorized(&mut registry, process, 0x77)
         .unwrap();
@@ -1083,10 +1115,17 @@ fn root_region_handle_close_preserves_address_space_until_process_exit() {
         Err(AddressRegionObjectError::Task(TaskError::BadState))
     ));
 
+    let quiescence = tasks.process_quiescence_proof(process).unwrap();
+    assert!(
+        regions
+            .region_mut_for_quiesced_teardown(&tasks, &quiescence, region_key)
+            .is_ok()
+    );
+
     let blocked = crate::task::BlockedOperationRegistry::<2>::new();
-    let drained = blocked.drained(process).unwrap();
+    let drained = blocked.drained_after_quiesce(&tasks, &quiescence).unwrap();
     let runtime_pin = regions
-        .retire_exited_root(&mut tasks, process, &blocked, drained)
+        .retire_quiesced_root(&mut tasks, process, &quiescence, &blocked, drained)
         .unwrap();
     let region_final = registry.release_internal(runtime_pin).unwrap().unwrap();
     let finalization = regions

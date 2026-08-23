@@ -82,6 +82,19 @@ pub(crate) enum TaskError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProcessGateError {
+    Task(TaskError),
+    OperationsInFlight,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProcessLifecycleState {
+    AcceptingOperations,
+    Quiescing,
+    Exited,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TaskGroupState {
     Active,
     Terminating,
@@ -318,6 +331,57 @@ struct ProcessRecord<const THREADS: usize, const HANDLES: usize> {
     hierarchy: ProcessHierarchyState,
     threads: [Option<ObjectId>; THREADS],
     handles: HandleTable<HANDLES>,
+    operations: ProcessOperationState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcessOperationState {
+    phase: ProcessLifecycleState,
+    generation: u64,
+    active: u32,
+    pending_termination: Option<TerminationRecord>,
+}
+
+impl ProcessOperationState {
+    const fn accepting() -> Self {
+        Self {
+            phase: ProcessLifecycleState::AcceptingOperations,
+            generation: 1,
+            active: 0,
+            pending_termination: None,
+        }
+    }
+}
+
+/// Move-only authority for one process operation that may publish shared state.
+///
+/// The token carries no lock. It keeps the process lifecycle gate open while
+/// setup temporarily crosses usercopy, blocking, or callback boundaries.
+#[must_use = "process operation leases must be released through TaskAuthority"]
+#[derive(Debug)]
+pub(crate) struct ProcessOperationLease {
+    authority_domain: u64,
+    process: ProcessKey,
+    generation: u64,
+    completed: bool,
+}
+
+impl Drop for ProcessOperationLease {
+    fn drop(&mut self) {
+        assert!(
+            self.completed,
+            "process operation lease dropped without release"
+        );
+    }
+}
+
+/// Generation-bound evidence that a process gate is closed and has no active
+/// operation leases. The proof remains valid after the process reaches EXITED.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProcessQuiescenceProof {
+    authority_domain: u64,
+    process: ProcessKey,
+    generation: u64,
 }
 
 /// A fully bound CREATED Process whose parent hierarchy slot is reserved but
@@ -527,6 +591,7 @@ pub(crate) struct TaskAuthority<
     const THREADS: usize,
     const HANDLES: usize,
 > {
+    operation_domain: u64,
     groups: [Option<TaskGroupRecord<GROUPS, PROCESSES>>; GROUPS],
     processes: [Option<ProcessRecord<THREADS, HANDLES>>; PROCESSES],
     threads: [Option<ThreadRecord>; THREADS],

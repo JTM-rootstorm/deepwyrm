@@ -3,7 +3,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::IrqSpinMutex;
 use deepwyrm_abi::DwSignals;
 
-use super::{BlockWakeKey, ProcessKey, ThreadKey};
+use super::{
+    BlockWakeKey, ProcessKey, ProcessOperationLease, ProcessQuiescenceProof, TaskAuthority,
+    ThreadKey,
+};
 
 static NEXT_BLOCKED_DOMAIN: AtomicU64 = AtomicU64::new(1);
 
@@ -23,6 +26,8 @@ pub(crate) enum BlockedOperationError {
     StaleReservation,
     ProcessStillBlocked,
     WinnerMismatch,
+    Task(super::TaskError),
+    OperationLeaseRequired,
 }
 
 #[derive(Clone, Copy)]
@@ -58,6 +63,8 @@ pub(crate) struct BlockedOperationReservation {
 pub(crate) struct BlockedOperationsDrained {
     domain: u64,
     process: ProcessKey,
+    task_domain: Option<u64>,
+    task_generation: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -212,7 +219,28 @@ impl<const CAPACITY: usize> BlockedOperationRegistry<CAPACITY> {
         Ok(BlockedOperationsDrained {
             domain: self.domain,
             process,
+            task_domain: None,
+            task_generation: None,
         })
+    }
+
+    pub(crate) fn drained_after_quiesce<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &self,
+        tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        proof: &ProcessQuiescenceProof,
+    ) -> Result<BlockedOperationsDrained, BlockedOperationError> {
+        tasks
+            .validate_process_quiescence(proof, proof.process)
+            .map_err(BlockedOperationError::Task)?;
+        let mut drained = self.drained(proof.process)?;
+        drained.task_domain = Some(proof.authority_domain);
+        drained.task_generation = Some(proof.generation);
+        Ok(drained)
     }
 
     pub(crate) fn validate_drained(
@@ -233,6 +261,28 @@ impl<const CAPACITY: usize> BlockedOperationRegistry<CAPACITY> {
         }
         Ok(())
     }
+
+    pub(crate) fn validate_drained_after_quiesce<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &self,
+        tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        proof: &ProcessQuiescenceProof,
+        drained: &BlockedOperationsDrained,
+    ) -> Result<(), BlockedOperationError> {
+        tasks
+            .validate_process_quiescence(proof, proof.process)
+            .map_err(BlockedOperationError::Task)?;
+        if drained.task_domain != Some(proof.authority_domain)
+            || drained.task_generation != Some(proof.generation)
+        {
+            return Err(BlockedOperationError::ForeignReservation);
+        }
+        self.validate_drained(drained, proof.process)
+    }
 }
 
 /// One move-only owner for every resource that survives a blocking suspension.
@@ -245,6 +295,7 @@ impl<const CAPACITY: usize> BlockedOperationRegistry<CAPACITY> {
 pub(crate) struct BlockedOperation<RESOURCES> {
     reservation: Option<BlockedOperationReservation>,
     resources: Option<RESOURCES>,
+    process_lease: Option<ProcessOperationLease>,
 }
 
 impl<RESOURCES> BlockedOperation<RESOURCES> {
@@ -259,8 +310,46 @@ impl<RESOURCES> BlockedOperation<RESOURCES> {
             Ok(reservation) => Ok(Self {
                 reservation: Some(reservation),
                 resources: Some(resources),
+                process_lease: None,
             }),
             Err(error) => Err((error, resources)),
+        }
+    }
+
+    /// Acquires and retains process-operation authority across block
+    /// publication. No TaskAuthority borrow or registry lock survives return.
+    pub(crate) fn publish_for_process<
+        const CAPACITY: usize,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        registry: &BlockedOperationRegistry<CAPACITY>,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        process: ProcessKey,
+        thread: ThreadKey,
+        wake: BlockWakeKey,
+        resources: RESOURCES,
+    ) -> Result<Self, (BlockedOperationError, RESOURCES)> {
+        let lease = match tasks.acquire_process_operation(process) {
+            Ok(lease) => lease,
+            Err(error) => return Err((BlockedOperationError::Task(error), resources)),
+        };
+        match registry.reserve(process, thread, wake) {
+            Ok(reservation) => Ok(Self {
+                reservation: Some(reservation),
+                resources: Some(resources),
+                process_lease: Some(lease),
+            }),
+            Err(error) => {
+                tasks
+                    .release_process_operation(lease)
+                    .unwrap_or_else(|(task_error, _)| {
+                        panic!("failed block publication leaked operation lease: {task_error:?}")
+                    });
+                Err((error, resources))
+            }
         }
     }
 
@@ -272,17 +361,54 @@ impl<RESOURCES> BlockedOperation<RESOURCES> {
     }
 
     pub(crate) fn complete_with<const CAPACITY: usize, RESULT>(
-        mut self,
+        self,
         registry: &BlockedOperationRegistry<CAPACITY>,
         _winner: BlockedOperationWinner,
+        cleanup: impl FnOnce(RESOURCES) -> RESULT,
+    ) -> Result<RESULT, BlockedOperationError> {
+        if self.process_lease.is_some() {
+            return Err(BlockedOperationError::OperationLeaseRequired);
+        }
+        self.complete_inner(registry, _winner, cleanup)
+    }
+
+    pub(crate) fn complete_for_process<
+        const CAPACITY: usize,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+        RESULT,
+    >(
+        mut self,
+        registry: &BlockedOperationRegistry<CAPACITY>,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        winner: BlockedOperationWinner,
+        cleanup: impl FnOnce(RESOURCES) -> RESULT,
+    ) -> Result<RESULT, BlockedOperationError> {
+        let lease = self
+            .process_lease
+            .take()
+            .ok_or(BlockedOperationError::OperationLeaseRequired)?;
+        let result = self.complete_inner(registry, winner, cleanup)?;
+        tasks
+            .release_process_operation(lease)
+            .map_err(|(error, _)| BlockedOperationError::Task(error))?;
+        Ok(result)
+    }
+
+    fn complete_inner<const CAPACITY: usize, RESULT>(
+        mut self,
+        registry: &BlockedOperationRegistry<CAPACITY>,
+        winner: BlockedOperationWinner,
         cleanup: impl FnOnce(RESOURCES) -> RESULT,
     ) -> Result<RESULT, BlockedOperationError> {
         let reservation = self
             .reservation
             .as_ref()
             .expect("blocked operation reservation is live");
-        let claimed = registry.try_claim_winner(reservation.wake, _winner)?;
-        if !claimed && registry.winner(reservation.wake)? != Some(_winner) {
+        let claimed = registry.try_claim_winner(reservation.wake, winner)?;
+        if !claimed && registry.winner(reservation.wake)? != Some(winner) {
             return Err(BlockedOperationError::WinnerMismatch);
         }
         let resources = self
@@ -305,6 +431,10 @@ impl<RESOURCES> Drop for BlockedOperation<RESOURCES> {
             self.reservation.is_none() && self.resources.is_none(),
             "live blocked operation dropped without signal/timeout/cancel/terminal completion"
         );
+        assert!(
+            self.process_lease.is_none(),
+            "live blocked operation dropped with a process-operation lease"
+        );
     }
 }
 
@@ -314,7 +444,9 @@ mod tests {
     use crate::memory::user_range::{EmptyAddressRule, UserAccess, UserAddressSpace, UserRange};
     use crate::memory::usercopy::{UserPinError, UserPinTracker};
     use crate::object::ObjectRegistry;
-    use crate::task::CooperativeScheduler;
+    use crate::task::{
+        CooperativeScheduler, ProcessGateError, ProcessLifecycleState, TaskAuthority,
+    };
     use deepwyrm_abi::{DW_OBJECT_TYPE_PROCESS, DW_OBJECT_TYPE_THREAD};
 
     fn keys() -> (ProcessKey, ThreadKey, BlockWakeKey) {
@@ -350,6 +482,63 @@ mod tests {
         assert_eq!(result, 8);
         let proof = registry.drained(process).unwrap();
         assert!(registry.validate_drained(&proof, process).is_ok());
+    }
+
+    #[test]
+    fn block_publication_lease_closes_before_quiesced_drain_proof() {
+        let mut objects = ObjectRegistry::<8>::new();
+        let mut tasks = TaskAuthority::<1, 1, 1, 1>::new();
+        let (_root, root_owner) = tasks.create_root_group(&mut objects).unwrap();
+        let (process, process_handle) = tasks.create_process(&mut objects, &root_owner).unwrap();
+        let process_pin = objects
+            .retain_internal_from_handle(&process_handle)
+            .unwrap();
+        let (thread, _thread_handle) = tasks.create_thread(&mut objects, &process_pin).unwrap();
+        assert!(objects.release_internal(process_pin).unwrap().is_none());
+
+        let scheduler = CooperativeScheduler::<1>::new();
+        scheduler
+            .commit(scheduler.reserve(thread).unwrap())
+            .unwrap();
+        scheduler.schedule_next().unwrap();
+        let (blocked, _) = scheduler.block_current(thread).unwrap();
+        let wake = blocked.into_wake_key();
+        let registry = BlockedOperationRegistry::<1>::new();
+        let operation = BlockedOperation::publish_for_process(
+            &registry, &mut tasks, process, thread, wake, 0x55_u64,
+        )
+        .unwrap();
+
+        assert_eq!(
+            tasks.begin_process_quiesce(process),
+            Err(ProcessGateError::OperationsInFlight)
+        );
+        assert_eq!(
+            tasks.process_lifecycle(process),
+            Ok(ProcessLifecycleState::Quiescing)
+        );
+        assert_eq!(
+            registry.drained(process).err(),
+            Some(BlockedOperationError::ProcessStillBlocked)
+        );
+        assert_eq!(
+            operation
+                .complete_for_process(
+                    &registry,
+                    &mut tasks,
+                    BlockedOperationWinner::Terminal,
+                    |resource| resource + 1,
+                )
+                .unwrap(),
+            0x56
+        );
+        let proof = tasks.begin_process_quiesce(process).unwrap();
+        let drained = registry.drained_after_quiesce(&tasks, &proof).unwrap();
+        assert!(
+            registry
+                .validate_drained_after_quiesce(&tasks, &proof, &drained)
+                .is_ok()
+        );
     }
 
     #[test]
