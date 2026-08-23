@@ -605,6 +605,7 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
         let preflight = || {
             if target.current_cpu() != Some(previous.cpu)
                 || prepared.residency.cpu() != previous.cpu
+                || target.current_root_physical_start() != Some(previous.root)
             {
                 return Err(RootBindingError::CpuMismatch);
             }
@@ -874,7 +875,7 @@ pub(crate) struct ActiveRootSelection {
 /// CPU-private token proving that this CPU is executing its retained kernel
 /// execution root. It has no portable address-space identity or residency.
 #[must_use = "kernel execution-root selection must be carried into the next switch"]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ActiveKernelExecutionRoot {
     cpu: CpuIndex,
     root: u64,
@@ -1029,6 +1030,11 @@ pub(crate) unsafe trait RootSwitchTarget: root_switch_seal::Sealed {
     /// Returns the architecture/carrier CPU on which `load_cr3_full_flush`
     /// would execute. `None` is a fail-closed unbound carrier.
     fn current_cpu(&self) -> Option<CpuIndex>;
+
+    /// Returns the currently active CR3 PML4 frame when it can be observed.
+    /// Kernel-root token consumption requires this exact check before its next
+    /// Process switch; an unknown value is fail-closed for that transition.
+    fn current_root_physical_start(&self) -> Option<u64>;
 
     fn load_cr3_full_flush(&mut self, root_physical_start: u64);
 }

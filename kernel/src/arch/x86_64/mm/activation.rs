@@ -502,6 +502,18 @@ unsafe impl RootSwitchTarget for LiveRootSwitchTarget {
             .and_then(crate::cpu::CpuIndex::new)
     }
 
+    fn current_root_physical_start(&self) -> Option<u64> {
+        let root: u64;
+        unsafe {
+            core::arch::asm!(
+                "mov {}, cr3",
+                out(reg) root,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        Some(root & !(super::PAGE_SIZE - 1))
+    }
+
     #[allow(
         unsafe_code,
         reason = "DW0-H selects one typed resident PML4 with PCID and global pages disabled"

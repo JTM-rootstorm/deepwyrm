@@ -1631,6 +1631,10 @@ unsafe impl RootSwitchTarget for RecordedRootSwitches {
         self.cpu
     }
 
+    fn current_root_physical_start(&self) -> Option<u64> {
+        self.roots.last().copied()
+    }
+
     fn load_cr3_full_flush(&mut self, root_physical_start: u64) {
         self.roots.push(root_physical_start);
     }
