@@ -16,6 +16,11 @@ pub mod exceptions;
 pub mod gdt;
 pub mod idt;
 pub mod mm;
+#[allow(
+    dead_code,
+    reason = "H2-D rendezvous ownership model precedes serialized live APIC transport integration"
+)]
+pub(crate) mod rendezvous;
 pub(crate) mod smp;
 pub(crate) mod syscall;
 pub mod tss;
