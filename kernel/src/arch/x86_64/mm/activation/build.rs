@@ -371,27 +371,42 @@ pub(super) fn build_and_bind_deep_root<
             edges,
             &mut edge_count,
         )?;
-        let window_index = ((window_page >> 12) & 0x1ff) as usize;
-        let control_index = ((control_page >> 12) & 0x1ff) as usize;
-        if mapper
-            .read_owned_table_entry(roles, scratch_pt, window_index)
-            .map_err(|_| DeepRootBuildError::Transition)?
-            != 0
-            || mapper
-                .read_owned_table_entry(roles, scratch_pt, control_index)
+        let scratch = PerCpuScratchBindings::new(DeepScratchBinding {
+            window_page,
+            control_page,
+            pt: scratch_pt,
+        });
+        for slot in scratch
+            .slots()
+            .ok_or(DeepRootBuildError::InvalidKernelLayout)?
+        {
+            let window_index = ((slot.window_page >> 12) & 0x1ff) as usize;
+            let control_index = ((slot.control_page >> 12) & 0x1ff) as usize;
+            let mmio_index = ((slot.control_page + PAGE_SIZE >> 12) & 0x1ff) as usize;
+            if mapper
+                .read_owned_table_entry(roles, scratch_pt, window_index)
                 .map_err(|_| DeepRootBuildError::Transition)?
                 != 0
-        {
-            return Err(DeepRootBuildError::MappingMismatch);
+                || mapper
+                    .read_owned_table_entry(roles, scratch_pt, control_index)
+                    .map_err(|_| DeepRootBuildError::Transition)?
+                    != 0
+                || mapper
+                    .read_owned_table_entry(roles, scratch_pt, mmio_index)
+                    .map_err(|_| DeepRootBuildError::Transition)?
+                    != 0
+            {
+                return Err(DeepRootBuildError::MappingMismatch);
+            }
+            mapper
+                .write_owned_table_entry(
+                    roles,
+                    scratch_pt,
+                    control_index,
+                    scratch_pt.physical_start() | PRESENT | WRITABLE | NO_EXECUTE,
+                )
+                .map_err(|_| DeepRootBuildError::Transition)?;
         }
-        mapper
-            .write_owned_table_entry(
-                roles,
-                scratch_pt,
-                control_index,
-                scratch_pt.physical_start() | PRESENT | WRITABLE | NO_EXECUTE,
-            )
-            .map_err(|_| DeepRootBuildError::Transition)?;
 
         // SAFETY: every table is allocator-owned, fully zeroed, typed to this
         // one owner, and reachable only from the still-inactive root built by
@@ -399,17 +414,7 @@ pub(super) fn build_and_bind_deep_root<
         let root =
             unsafe { PageTableRoot::from_owned_root(root_identity.physical_start(), capabilities) }
                 .map_err(DeepRootBuildError::Root)?;
-        Ok((
-            root,
-            root_identity,
-            DeepScratchBinding {
-                window_page,
-                control_page,
-                pt: scratch_pt,
-            },
-            kernel_roles,
-            ap_trampoline,
-        ))
+        Ok((root, root_identity, scratch, kernel_roles, ap_trampoline))
     })();
 
     let (root, identity, scratch, kernel_roles, ap_trampoline) = match result {

@@ -84,15 +84,31 @@ enum ScratchIoEvent {
     Invalidate(u64),
 }
 
-#[derive(Default)]
 struct FakeActiveScratchIo {
     memory: BTreeMap<u64, u64>,
     events: Vec<ScratchIoEvent>,
     install_attempts: usize,
     fail_install_attempt: Option<usize>,
+    current_cpu: CpuIndex,
+}
+
+impl Default for FakeActiveScratchIo {
+    fn default() -> Self {
+        Self {
+            memory: BTreeMap::new(),
+            events: Vec::new(),
+            install_attempts: 0,
+            fail_install_attempt: None,
+            current_cpu: CpuIndex::BOOTSTRAP,
+        }
+    }
 }
 
 impl ActiveScratchIo for FakeActiveScratchIo {
+    fn current_cpu(&self) -> Option<CpuIndex> {
+        Some(self.current_cpu)
+    }
+
     fn load(&mut self, address: u64) -> u64 {
         self.events.push(ScratchIoEvent::Load(address));
         *self.memory.get(&address).unwrap_or(&0)
@@ -455,14 +471,27 @@ fn graph_fixture() -> GraphFixture {
             add_path(&mut access.inactive, page, kernel_tables, physical | flags);
         }
     }
-    add_path(&mut access.inactive, FIXTURE_SCRATCH, scratch_tables, 0);
-    access.inactive.insert(
-        (
-            scratch_pt.physical_start(),
-            page_index(FIXTURE_SCRATCH + PAGE_SIZE, 0),
-        ),
-        scratch_pt.physical_start() | PRESENT | WRITABLE | NO_EXECUTE,
-    );
+    // Every fixed CPU owns a distinct leaf/control/MMIO triplet, even though
+    // the control aliases intentionally reach the one stationary scratch PT.
+    // The live path accesses only its selected atomic PTE cell; the fixture
+    // must model each legitimate alias so graph validation can reject extras.
+    for slot in PerCpuScratchBindings::new(DeepScratchBinding {
+        window_page: FIXTURE_SCRATCH,
+        control_page: FIXTURE_SCRATCH + PAGE_SIZE,
+        pt: scratch_pt,
+    })
+    .slots()
+    .unwrap()
+    {
+        add_path(&mut access.inactive, slot.window_page, scratch_tables, 0);
+        access.inactive.insert(
+            (
+                scratch_pt.physical_start(),
+                page_index(slot.control_page, 0),
+            ),
+            scratch_pt.physical_start() | PRESENT | WRITABLE | NO_EXECUTE,
+        );
+    }
     let staged = unsafe {
         roles.stage_kernel_image_roles([
             (
@@ -550,11 +579,11 @@ fn graph_accepts_only_the_typed_low_rx_ap_trampoline_leaf() {
                 fixture.capabilities.physical_limit(),
             )
             .unwrap(),
-            DeepScratchBinding {
+            PerCpuScratchBindings::new(DeepScratchBinding {
                 window_page: FIXTURE_SCRATCH,
                 control_page: FIXTURE_SCRATCH + PAGE_SIZE,
                 pt: fixture.scratch_pt,
-            },
+            }),
             &fixture.segments,
             fixture.ist,
             &[],
@@ -584,11 +613,11 @@ fn graph_accepts_only_the_typed_low_rx_ap_trampoline_leaf() {
                 fixture.capabilities.physical_limit(),
             )
             .unwrap(),
-            DeepScratchBinding {
+            PerCpuScratchBindings::new(DeepScratchBinding {
                 window_page: FIXTURE_SCRATCH,
                 control_page: FIXTURE_SCRATCH + PAGE_SIZE,
                 pt: fixture.scratch_pt,
-            },
+            }),
             &fixture.segments,
             fixture.ist,
             &[],
@@ -606,7 +635,8 @@ fn fake_active_scratch(
     fail_install_attempt: Option<usize>,
 ) -> ActiveScratchTarget<FakeActiveScratchIo> {
     ActiveScratchTarget {
-        scratch: DeepScratchBinding {
+        scratch: ScratchBinding {
+            cpu: CpuIndex::BOOTSTRAP,
             window_page: FIXTURE_SCRATCH,
             control_page: FIXTURE_SCRATCH + PAGE_SIZE,
             pt: scratch_pt,
@@ -618,6 +648,101 @@ fn fake_active_scratch(
         poisoned: false,
         _not_send_sync: core::marker::PhantomData,
     }
+}
+
+#[test]
+fn per_cpu_scratch_slots_have_disjoint_leaf_control_and_mmio_entries() {
+    let fixture = graph_fixture();
+    let slots = PerCpuScratchBindings::new(DeepScratchBinding {
+        window_page: FIXTURE_SCRATCH,
+        control_page: FIXTURE_SCRATCH + PAGE_SIZE,
+        pt: fixture.scratch_pt,
+    })
+    .slots()
+    .expect("four fixed scratch slots fit the authenticated scratch PT");
+    assert_eq!(slots.len(), crate::cpu::CPU_CAPACITY);
+    for (index, slot) in slots.iter().enumerate() {
+        assert_eq!(slot.cpu.index(), index);
+        assert_eq!(slot.pt, fixture.scratch_pt);
+        assert_eq!(slot.control_page, slot.window_page + PAGE_SIZE);
+        assert_eq!(slot.control_page >> 21, FIXTURE_SCRATCH >> 21);
+        for prior in &slots[..index] {
+            assert_ne!(slot.window_page, prior.window_page);
+            assert_ne!(slot.control_page, prior.control_page);
+            assert_ne!(
+                slot.control_page + PAGE_SIZE,
+                prior.control_page + PAGE_SIZE
+            );
+        }
+    }
+}
+
+#[test]
+fn scratch_binding_rejects_cross_cpu_before_touching_its_leaf() {
+    let fixture = graph_fixture();
+    let slot = PerCpuScratchBindings::new(DeepScratchBinding {
+        window_page: FIXTURE_SCRATCH,
+        control_page: FIXTURE_SCRATCH + PAGE_SIZE,
+        pt: fixture.scratch_pt,
+    })
+    .for_cpu(CpuIndex::BOOTSTRAP)
+    .unwrap();
+    let mut target = ActiveScratchTarget {
+        scratch: slot,
+        io: FakeActiveScratchIo {
+            current_cpu: CpuIndex::new(1).unwrap(),
+            ..FakeActiveScratchIo::default()
+        },
+        poisoned: false,
+        _not_send_sync: core::marker::PhantomData,
+    };
+    let frame = FrameAddress::new(0x90_000, fixture.capabilities.physical_limit()).unwrap();
+    assert_eq!(
+        target.install_mmio_frame(frame),
+        Err(LiveActiveTargetError::WrongCpu)
+    );
+    assert!(target.io.events.is_empty());
+}
+
+#[test]
+fn cpu_scratch_migration_selects_a_new_window_and_clears_independently() {
+    let fixture = graph_fixture();
+    let bindings = PerCpuScratchBindings::new(DeepScratchBinding {
+        window_page: FIXTURE_SCRATCH,
+        control_page: FIXTURE_SCRATCH + PAGE_SIZE,
+        pt: fixture.scratch_pt,
+    });
+    let first = bindings.for_cpu(CpuIndex::BOOTSTRAP).unwrap();
+    let second_cpu = CpuIndex::new(1).unwrap();
+    let second = bindings.for_cpu(second_cpu).unwrap();
+    let table = FrameAddress::new(0x90_000, fixture.capabilities.physical_limit()).unwrap();
+    let mut cpu0 = ActiveScratchTarget {
+        scratch: first,
+        io: FakeActiveScratchIo::default(),
+        poisoned: false,
+        _not_send_sync: core::marker::PhantomData,
+    };
+    let mut cpu1 = ActiveScratchTarget {
+        scratch: second,
+        io: FakeActiveScratchIo {
+            current_cpu: second_cpu,
+            ..FakeActiveScratchIo::default()
+        },
+        poisoned: false,
+        _not_send_sync: core::marker::PhantomData,
+    };
+
+    assert_eq!(cpu0.read_location(table, 7), Ok(0));
+    assert_eq!(cpu1.read_location(table, 7), Ok(0));
+    assert_ne!(cpu0.scratch_leaf_address(), cpu1.scratch_leaf_address());
+    assert_eq!(cpu0.io.memory.get(&cpu0.scratch_leaf_address()), Some(&0));
+    assert_eq!(cpu1.io.memory.get(&cpu1.scratch_leaf_address()), Some(&0));
+    assert!(cpu0.io.events.iter().any(|event| {
+        matches!(event, ScratchIoEvent::Invalidate(page) if *page == first.window_page)
+    }));
+    assert!(cpu1.io.events.iter().any(|event| {
+        matches!(event, ScratchIoEvent::Invalidate(page) if *page == second.window_page)
+    }));
 }
 
 #[test]
@@ -1123,7 +1248,10 @@ fn graph_rejects_occupied_deep_scratch_leaf() {
         (fixture.scratch_tables[3], page_index(FIXTURE_SCRATCH, 0)),
         0x24_0000 | PRESENT | WRITABLE | NO_EXECUTE,
     );
-    assert_eq!(fixture.validate(), Err(InactiveGraphError::ExtraLeaf));
+    assert_eq!(
+        fixture.validate(),
+        Err(InactiveGraphError::InvalidScratchPath)
+    );
 }
 
 #[test]
@@ -1190,7 +1318,10 @@ fn graph_rejects_second_scratch_control_alias() {
     fixture.access.inactive.insert(
         (
             fixture.scratch_pt.physical_start(),
-            page_index(FIXTURE_SCRATCH + 2 * PAGE_SIZE, 0),
+            page_index(
+                FIXTURE_SCRATCH + 3 * crate::cpu::CPU_CAPACITY as u64 * PAGE_SIZE,
+                0,
+            ),
         ),
         fixture.scratch_pt.physical_start() | PRESENT | WRITABLE | NO_EXECUTE,
     );

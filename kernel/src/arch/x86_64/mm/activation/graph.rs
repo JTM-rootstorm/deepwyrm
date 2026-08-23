@@ -678,7 +678,7 @@ pub(super) fn validate_inactive_graph_with_workspace<
     ap_trampoline: Option<&ArchitectureBootstrapGrant>,
     root: TableIdentity,
     transition_root: FrameAddress,
-    scratch: DeepScratchBinding,
+    scratch: PerCpuScratchBindings,
     segments: &[KernelSegment; 3],
     ist: IstStackLayout,
     thread_stacks: &[crate::memory::kernel_stack::KernelStackBounds],
@@ -687,6 +687,9 @@ pub(super) fn validate_inactive_graph_with_workspace<
     pending: &mut [Option<PendingTable>; MAX_DEEP_TABLE_FRAMES],
     visited: &mut [u64; MAX_DEEP_TABLE_FRAMES],
 ) -> Result<(), InactiveGraphError<A::Error>> {
+    let scratch_slots = scratch
+        .slots()
+        .ok_or(InactiveGraphError::InvalidScratchPath)?;
     let ap_trampoline_page = if let Some(ap_trampoline) = ap_trampoline {
         roles
             .validate_architecture_bootstrap(ap_trampoline)
@@ -702,12 +705,23 @@ pub(super) fn validate_inactive_graph_with_workspace<
     } else {
         None
     };
-    validate_segment_layout(segments, scratch, ist, thread_stacks, privilege_entry).map_err(
-        |error| match error {
+    for slot in scratch_slots {
+        validate_segment_layout(
+            segments,
+            DeepScratchBinding {
+                window_page: slot.window_page,
+                control_page: slot.control_page,
+                pt: slot.pt,
+            },
+            ist,
+            thread_stacks,
+            privilege_entry,
+        )
+        .map_err(|error| match error {
             InactiveGraphError::InvalidSegmentLayout => InactiveGraphError::InvalidSegmentLayout,
             _ => unreachable!("layout validation has one error"),
-        },
-    )?;
+        })?;
+    }
     let owner = root.owner();
     pending.fill(None);
     visited.fill(0);
@@ -750,13 +764,21 @@ pub(super) fn validate_inactive_graph_with_workspace<
                 .map_err(|_| InactiveGraphError::InvalidEntry)?;
             let virtual_page = entry_virtual_address(node.virtual_prefix, index, depth);
             if depth == 0 {
-                if virtual_page == scratch.control_page {
-                    if mapped.address() != scratch.pt.physical_start()
+                if let Some(slot) = scratch_slots
+                    .iter()
+                    .find(|slot| virtual_page == slot.control_page)
+                {
+                    if mapped.address() != slot.pt.physical_start()
                         || entry & !(physical_mask(capabilities) | HARDWARE_MUTABLE)
                             != PRESENT | WRITABLE | NO_EXECUTE
                     {
                         return Err(InactiveGraphError::InvalidScratchPath);
                     }
+                } else if scratch_slots.iter().any(|slot| {
+                    virtual_page == slot.window_page
+                        || virtual_page == slot.control_page + PAGE_SIZE
+                }) {
+                    return Err(InactiveGraphError::InvalidScratchPath);
                 } else if ap_trampoline_page == Some(virtual_page) {
                     if mapped.address() != virtual_page
                         || entry & !(physical_mask(capabilities) | HARDWARE_MUTABLE) != PRESENT
@@ -781,13 +803,15 @@ pub(super) fn validate_inactive_graph_with_workspace<
                 return Err(InactiveGraphError::InvalidEntry);
             }
             let child_level = node.level.child().ok_or(InactiveGraphError::InvalidEntry)?;
-            if !subtree_is_required_with_bootstrap(
-                virtual_page,
-                depth - 1,
-                segments,
-                scratch.window_page,
-                ap_trampoline_page,
-            ) {
+            if !scratch_slots.iter().any(|slot| {
+                subtree_is_required_with_bootstrap(
+                    virtual_page,
+                    depth - 1,
+                    segments,
+                    slot.window_page,
+                    ap_trampoline_page,
+                )
+            }) {
                 return Err(InactiveGraphError::ExtraTable);
             }
             let child = roles
@@ -808,12 +832,18 @@ pub(super) fn validate_inactive_graph_with_workspace<
         }
     }
 
-    validate_scratch_path(
-        access,
-        root_frame(root, capabilities)?,
-        scratch,
-        capabilities,
-    )?;
+    for slot in scratch_slots {
+        validate_scratch_path(
+            access,
+            root_frame(root, capabilities)?,
+            DeepScratchBinding {
+                window_page: slot.window_page,
+                control_page: slot.control_page,
+                pt: slot.pt,
+            },
+            capabilities,
+        )?;
+    }
     for segment in segments {
         let mut page = segment.start;
         while page < segment.end {
@@ -882,7 +912,7 @@ pub(super) fn validate_inactive_graph<
         None,
         root,
         transition_root,
-        scratch,
+        PerCpuScratchBindings::new(scratch),
         segments,
         ist,
         &[],

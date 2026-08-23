@@ -31,6 +31,20 @@ held only while its leaf maps a physical frame.  It invalidates locally after
 install and again after clearing.  A second session on the same CPU rejects
 before mapping; a cross-CPU or stale binding rejects before touching a leaf.
 
+The four control aliases intentionally map the same physical PT. They never
+produce `&mut [u64; 512]`, a page reference, or another whole-table mutable
+alias. A binding accesses only its proven-disjoint leaf through an aligned
+atomic/volatile PTE-cell operation; pre-publication graph construction is the
+only whole-table mutation phase, and post-publication whole-table inspection
+requires every carrier quiescent.
+
+The design independently applies the general temporary-mapping lessons of
+Linux's documented CPU-local local mappings and the Intel paging-invalidation
+rule: the running carrier is CPU-pinned/non-migratable while a leaf is live,
+interrupt/reaper paths never reuse that slot, and each atomic leaf install and
+clear has a local `invlpg`. This is conceptual provenance only; no Linux or
+BSD source is imported or adapted.
+
 No scheduler, object, address-space, or usercopy guard may contain a live
 scratch session.  Frame-role and root metadata preparation may be briefly
 serialized, but a carrier retains only its CPU-local session while it performs

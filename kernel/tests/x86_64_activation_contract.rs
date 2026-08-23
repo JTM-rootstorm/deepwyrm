@@ -30,6 +30,26 @@ fn c2_source_has_one_retire_then_one_cr3_write() {
 }
 
 #[test]
+fn i1_per_cpu_scratch_uses_disjoint_atomic_cells_not_page_wide_mut_aliases() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let activation = fs::read_to_string(manifest_dir.join("src/arch/x86_64/mm/activation.rs"))
+        .expect("read live activation source");
+    let build = fs::read_to_string(manifest_dir.join("src/arch/x86_64/mm/activation/build.rs"))
+        .expect("read scratch construction source");
+    assert!(activation.contains("struct PerCpuScratchBindings"));
+    assert!(activation.contains("struct ScratchBinding"));
+    assert!(activation.contains("AtomicU64"));
+    assert!(activation.contains("require_owning_cpu"));
+    assert!(activation.contains("LiveActiveTargetError::WrongCpu"));
+    assert!(activation.contains("self.io.invalidate(self.scratch.window_page)"));
+    assert!(activation.contains("for_cpu(crate::cpu::CpuIndex::BOOTSTRAP)"));
+    assert!(!activation.contains("&mut [u64; ENTRY_COUNT]"));
+    assert!(!activation.contains("&mut [u64; 512]"));
+    assert!(build.contains("for slot in scratch"));
+    assert!(build.contains(".slots()"));
+}
+
+#[test]
 fn c2_linker_bounds_and_linearity_markers_are_unique() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let activation = fs::read_to_string(manifest_dir.join("src/arch/x86_64/mm/activation.rs"))
