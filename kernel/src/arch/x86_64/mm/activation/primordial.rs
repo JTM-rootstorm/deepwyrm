@@ -1317,7 +1317,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             user.release_atomic_u32(pin)
                 .unwrap_or_else(|_| panic!("rendezvous suspended atomic pin drifted"));
         }
-        self.merge_cleanup(self.services.take_cleanup());
+        let cleanup = self.services.take_cleanup();
+        self.merge_cleanup(cleanup);
     }
 
     fn drain_staged_rendezvous_cleanup(&mut self) {
