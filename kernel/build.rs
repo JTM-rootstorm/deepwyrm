@@ -97,6 +97,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_f9_guest)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_f12_guest)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_i1_evidence)");
+    println!("cargo:rustc-check-cfg=cfg(deepwyrm_i2_stress)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_integrated)");
     println!("cargo:rustc-cfg=deepwyrm_integrated");
 
@@ -138,6 +139,13 @@ fn run() -> Result<(), String> {
         .is_some_and(is_i1_evidence_selector)
     {
         println!("cargo:rustc-cfg=deepwyrm_i1_evidence");
+    }
+    if env::var("DEEPWYRM_GUEST_TEST_SELECTOR")
+        .ok()
+        .as_deref()
+        .is_some_and(is_i2_stress_selector)
+    {
+        println!("cargo:rustc-cfg=deepwyrm_i2_stress");
     }
 
     if required_env("TARGET")? != KERNEL_TARGET {
@@ -244,6 +252,10 @@ fn is_f12_userspace_selector(selector: &str) -> bool {
 
 fn is_i1_evidence_selector(selector: &str) -> bool {
     selector == "smp-runtime-acceptance"
+}
+
+fn is_i2_stress_selector(selector: &str) -> bool {
+    selector == "smp-runtime-stress"
 }
 
 fn emit_e7_user_env(elf: &Path) {

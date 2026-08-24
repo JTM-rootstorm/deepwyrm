@@ -68,7 +68,13 @@ use super::private::{
 const ENTRY_COUNT: usize = 512;
 const E5_USER_PIN_CAPACITY: usize = 8;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+#[cfg(not(deepwyrm_i2_stress))]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;
+// Selector 22 keeps bootstrap, init0, the controller, and multiple stress
+// descendants live together. This is a bounded test-artifact capacity, not a
+// production policy or a new ABI limit.
+#[cfg(deepwyrm_i2_stress)]
+const LIVE_ADDRESS_SPACE_CAPACITY: usize = 6;
 const MAX_DEEP_TABLE_FRAMES: usize = 256;
 const ADDRESS_OFFSET_MASK: u64 = PAGE_SIZE - 1;
 const HARDWARE_MUTABLE: u64 = ACCESSED | DIRTY;

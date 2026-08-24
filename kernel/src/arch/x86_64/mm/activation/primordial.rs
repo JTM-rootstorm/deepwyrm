@@ -47,16 +47,37 @@ use deepwyrm_abi::{
 };
 
 const MAX_BOOTFS_BYTES: usize = 32 * 1024 * 1024;
+#[cfg(not(deepwyrm_i2_stress))]
 const REGISTRY_OBJECTS: usize = 32;
+#[cfg(deepwyrm_i2_stress)]
+const REGISTRY_OBJECTS: usize = 64;
+#[cfg(not(deepwyrm_i2_stress))]
 const MEMORY_OBJECTS: usize = 10;
+#[cfg(deepwyrm_i2_stress)]
+const MEMORY_OBJECTS: usize = 24;
+#[cfg(not(deepwyrm_i2_stress))]
 const MEMORY_LEASES: usize = 10;
+#[cfg(deepwyrm_i2_stress)]
+const MEMORY_LEASES: usize = 24;
 // I0 keeps the complete bootstrap -> init0 -> hello chain live while each
 // parent performs bounded READY/exit supervision of its direct child.
+#[cfg(not(deepwyrm_i2_stress))]
 const USERSPACE_CHAIN_PROCESSES: usize = 3;
+#[cfg(deepwyrm_i2_stress)]
+const USERSPACE_CHAIN_PROCESSES: usize = 6;
+#[cfg(not(deepwyrm_i2_stress))]
 const CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;
+#[cfg(deepwyrm_i2_stress)]
+const CHANNEL_PAIRS: usize = 8;
 const CHANNEL_DEPTH: usize = 2;
+#[cfg(not(deepwyrm_i2_stress))]
 const WAITERS: usize = 4;
+#[cfg(deepwyrm_i2_stress)]
+const WAITERS: usize = 12;
+#[cfg(not(deepwyrm_i2_stress))]
 const TASK_GROUPS: usize = 1;
+#[cfg(deepwyrm_i2_stress)]
+const TASK_GROUPS: usize = 4;
 const PROCESSES: usize = USERSPACE_CHAIN_PROCESSES;
 const THREADS: usize = USERSPACE_CHAIN_PROCESSES;
 // Exact live bootstrap peak per Process: four inherited handles, one net
@@ -74,14 +95,23 @@ const BOOTSTRAP_HANDLE_PEAK: usize = INITIAL_BOOTSTRAP_HANDLES
     + PROCESS_ROOT_HANDLES
     + THREAD_HANDLES
     + INIT_DUPLICATE_HANDLES;
+#[cfg(not(deepwyrm_i2_stress))]
 const HANDLES: usize = BOOTSTRAP_HANDLE_PEAK;
+#[cfg(deepwyrm_i2_stress)]
+const HANDLES: usize = 16;
 const SPACES: usize = USERSPACE_CHAIN_PROCESSES;
 const REGIONS: usize = USERSPACE_CHAIN_PROCESSES;
 const REGION_OBJECTS: usize = USERSPACE_CHAIN_PROCESSES;
 const REGION_SLOTS: usize = 10;
 const EXECUTION_THREADS: usize = USERSPACE_CHAIN_PROCESSES;
+#[cfg(not(deepwyrm_i2_stress))]
 const EVENTS: usize = 1;
+#[cfg(deepwyrm_i2_stress)]
+const EVENTS: usize = 2;
+#[cfg(not(deepwyrm_i2_stress))]
 const TIMERS: usize = 1;
+#[cfg(deepwyrm_i2_stress)]
+const TIMERS: usize = 2;
 // A bounded 16-page mapping can cross one boundary at each non-root level.
 // Keep two candidates for PDPT, PD, and PT creation so the live publisher can
 // construct both paths without depending on where the requested range lands.
@@ -95,12 +125,16 @@ const PRIMORDIAL_INVALIDATIONS: usize = PRIMORDIAL_MAX_MAPPING_PAGES;
 // same bounded carrier set; a capacity drift is a compile-time error.
 const _: [(); crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] = [(); crate::cpu::CPU_CAPACITY];
 const _: [(); PROCESSES] = [(); THREADS];
+#[cfg(not(deepwyrm_i2_stress))]
 const _: [(); PROCESSES] = [(); CHANNEL_PAIRS];
 const _: [(); PROCESSES] = [(); SPACES];
 const _: [(); PROCESSES] = [(); REGIONS];
 const _: [(); PROCESSES] = [(); REGION_OBJECTS];
 const _: [(); PROCESSES] = [(); EXECUTION_THREADS];
+#[cfg(not(deepwyrm_i2_stress))]
 const _: [(); 10] = [(); HANDLES];
+#[cfg(deepwyrm_i2_stress)]
+const _: [(); 16] = [(); HANDLES];
 const _: [(); 7] = [(); BOOTSTRAP_HANDLE_PEAK - INIT_MOVED_HANDLES];
 
 #[cfg(feature = "test-support")]

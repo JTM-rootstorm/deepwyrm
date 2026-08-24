@@ -585,6 +585,29 @@ fn i2_terminal_reclaim_handoff_is_owned_by_the_exact_physical_cpu() {
 }
 
 #[test]
+fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
+    let build = source("build.rs");
+    let activation = source("src/arch/x86_64/mm/activation.rs");
+    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+
+    assert!(build.contains("cargo:rustc-check-cfg=cfg(deepwyrm_i2_stress)"));
+    assert!(build.contains("selector == \"smp-runtime-stress\""));
+    assert!(build.contains("cargo:rustc-cfg=deepwyrm_i2_stress"));
+    assert!(
+        activation
+            .contains("#[cfg(deepwyrm_i2_stress)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 6;")
+    );
+    assert!(
+        runtime.contains("#[cfg(deepwyrm_i2_stress)]\nconst USERSPACE_CHAIN_PROCESSES: usize = 6;")
+    );
+    assert!(
+        runtime.contains(
+            "#[cfg(not(deepwyrm_i2_stress))]\nconst USERSPACE_CHAIN_PROCESSES: usize = 3;"
+        )
+    );
+}
+
+#[test]
 fn i1_terminal_child_without_local_work_rejoins_the_idle_scheduler() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
 
