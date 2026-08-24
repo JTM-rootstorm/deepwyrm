@@ -446,9 +446,10 @@ fn i1_e1_irq_callback_latches_only_and_defers_mailbox_work_to_safe_point() {
     assert!(idle.contains("take_current_latched_notification"));
     assert!(idle.contains("take_latched_notification(cpu)"));
     assert!(
-        !idle.contains("take_current_notification"),
-        "live rendezvous notifications may be consumed only through a carrier-owned post-EOI latch"
+        idle.contains("pub(crate) fn take_current_notification_at_safe_point()"),
+        "a carrier-owned safe point must close the pending-IPI publication race"
     );
+    assert!(idle.contains(".take_notification(cpu)"));
 }
 
 #[test]
