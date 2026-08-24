@@ -441,7 +441,7 @@ fn g5_primordial_blocking_uses_the_f12_idle_suspend_resume_flow() {
         fs::read_to_string(kernel_root().join("src/arch/x86_64/mm/activation/primordial.rs"))
             .expect("read G5 primordial runtime source");
 
-    assert!(primordial.contains("self.services.prepare_suspend("));
+    assert!(primordial.contains("self.services.prepare_suspend_on("));
     assert!(primordial.contains("self.services.poll_idle_suspend("));
     assert!(primordial.contains("self.services.resume_suspended("));
     assert!(primordial.contains("bind_deadline_wake_target(target)"));
@@ -490,15 +490,15 @@ fn g5_terminal_completion_drains_all_primordial_authority_before_capacity_proof(
     for required in [
         "process_quiescence_proof(self.process)",
         "blocked_operations_drained(&self.tasks, &proof)",
-        "unmap_primordial_userspace(&proof)?",
+        "unmap_primordial_userspace(&proof)",
         "if self.process == self.primordial_process",
         "prepare_process_root_selection(",
         "self.primordial_address_space",
-        "self.unmap_inactive_userspace(self.process, self.root_key, &proof)?",
+        "self.unmap_inactive_userspace(self.process, self.root_key, &proof)",
         "teardown_empty_child_address_space(self.process, address_space)",
         "retire_quiesced_root(",
-        "release_terminal_authority()?",
-        "drain_finalizers()?",
+        "release_terminal_authority()",
+        "drain_finalizers()",
         "prove_registry_capacity()",
     ] {
         assert!(
@@ -508,7 +508,7 @@ fn g5_terminal_completion_drains_all_primordial_authority_before_capacity_proof(
     }
     assert!(!terminal.contains("LivePlatform {"));
     let child_unmap = terminal
-        .find("self.unmap_inactive_userspace(self.process, self.root_key, &proof)?")
+        .find("self.unmap_inactive_userspace(self.process, self.root_key, &proof)")
         .unwrap();
     let child_root_reclaim = terminal
         .find("teardown_empty_child_address_space(self.process, address_space)")
