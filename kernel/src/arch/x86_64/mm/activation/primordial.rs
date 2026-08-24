@@ -1530,11 +1530,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     #[track_caller]
     fn synchronize_scheduler_current(&mut self) {
         assert_eq!(self.local.cpu, self.cpu, "BSP carrier storage CPU drifted");
-        let thread = self
-            .shared
-            .execution
-            .current_thread_on(self.cpu)
-            .unwrap_or_else(|| panic!("runtime carrier has no scheduler-current Thread"));
+        let Some(thread) = self.shared.execution.current_thread_on(self.cpu) else {
+            panic!("runtime carrier has no scheduler-current Thread");
+        };
         let process = self
             .tasks
             .thread_process(thread)
