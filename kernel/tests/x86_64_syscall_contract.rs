@@ -543,6 +543,23 @@ fn i2_suspended_resume_gives_remote_stop_priority_under_scheduler_authority() {
 }
 
 #[test]
+fn i2_terminal_reclaim_handoff_is_owned_by_the_exact_physical_cpu() {
+    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+
+    assert!(
+        runtime.contains(
+            "deferred_currents: [Option<crate::task::DeferredCurrentExecutionResources>;"
+        )
+    );
+    assert!(runtime.contains("self.deferred_currents[self.cpu.index()]"));
+    assert!(runtime.contains("deferred_currents: core::array::from_fn(|_| None)"));
+    assert!(
+        !runtime
+            .contains("deferred_current: Option<crate::task::DeferredCurrentExecutionResources>")
+    );
+}
+
+#[test]
 fn i1_terminal_child_without_local_work_rejoins_the_idle_scheduler() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
 

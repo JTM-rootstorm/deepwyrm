@@ -1148,7 +1148,8 @@ struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_
     kernel_peer: Option<HandleRef>,
     process_monitor: Option<HandleRef>,
     root_owner: Option<InternalRef>,
-    deferred_current: Option<crate::task::DeferredCurrentExecutionResources>,
+    deferred_currents: [Option<crate::task::DeferredCurrentExecutionResources>;
+        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
     cleanup: CleanupQueue<REGISTRY_OBJECTS>,
     // Pending final releases are moved before the irreversible stop commit.
     // They are drained only by the post-ack kernel-root continuation.
@@ -1367,7 +1368,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             &self.shared.execution,
             &self.shared.waits,
             self.cpu,
-            self.deferred_current
+            self.deferred_currents[self.cpu.index()]
                 .take()
                 .unwrap_or_else(|| panic!("primordial exit omitted deferred resources")),
             &mut self.cleanup,
@@ -1822,7 +1823,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     fn terminate_exception(&mut self, exception: crate::task::TaskExceptionRecord) {
         assert!(
-            self.deferred_current.is_none(),
+            self.deferred_currents[self.cpu.index()].is_none(),
             "primordial runtime already owns deferred current resources"
         );
         let mut discarded = None;
@@ -1852,7 +1853,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         };
         assert_eq!(status, DW_STATUS_SUCCESS);
         assert_eq!(control, SyscallControl::TerminateCurrent);
-        self.deferred_current =
+        self.deferred_currents[self.cpu.index()] =
             Some(deferred.expect("primordial exception omitted deferred current resources"));
         let mut user = self.active.current_process_address_space(
             self.active_root.as_ref().expect("active root"),
@@ -2407,7 +2408,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.cleanup.is_empty()
             && self.rendezvous_cleanup.is_some()
             && self.stopped_service_state_is_quiescent()
-            && self.deferred_current.is_none()
+            && self.deferred_currents[self.cpu.index()].is_none()
             && self.shared.execution.running_claim_on(self.cpu).is_none()
     }
 }
@@ -2884,7 +2885,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                             None if runtime.stopping_claim.is_some() => {
                                 panic!("resume crossed an in-progress remote-stop carrier")
                             }
-                            None if runtime.deferred_current.is_some() => {
+                            None if runtime.deferred_currents[self.cpu.index()].is_some() => {
                                 panic!("resume crossed an in-progress local terminal carrier")
                             }
                             None if suspended_claim.is_some_and(|claim| {
@@ -3097,7 +3098,7 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         kernel_peer: Some(kernel_peer),
         process_monitor: Some(process_monitor),
         root_owner: Some(root_owner),
-        deferred_current: None,
+        deferred_currents: core::array::from_fn(|_| None),
         cleanup: CleanupQueue::new(),
         rendezvous_cleanup: None,
         #[cfg(feature = "test-support")]
@@ -3695,7 +3696,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             )
         };
         if status == DW_STATUS_SUCCESS && control == SyscallControl::TerminateCurrent {
-            self.deferred_current = Some(
+            self.deferred_currents[self.cpu.index()] = Some(
                 deferred.unwrap_or_else(|| panic!("primordial exit omitted deferred reclaim")),
             );
             #[cfg(deepwyrm_i1_evidence)]
@@ -3956,7 +3957,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         deferred: Option<crate::task::DeferredCurrentExecutionResources>,
     ) {
         if control == SyscallControl::TerminateCurrent {
-            self.deferred_current = Some(
+            self.deferred_currents[self.cpu.index()] = Some(
                 deferred.unwrap_or_else(|| panic!("terminal adapter omitted deferred reclaim")),
             );
         } else {
