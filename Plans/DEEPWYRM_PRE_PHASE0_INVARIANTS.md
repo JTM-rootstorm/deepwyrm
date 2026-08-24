@@ -47,6 +47,30 @@ The native kernel ABI does not make these foundational:
 
 POSIX/Linux compatibility is implemented above the kernel.
 
+## 2.1 Native application ABI should terminate at a kernel-matched vDSO
+
+The long-term native application ABI should follow the Zircon-style separation between the stable userspace symbol surface and the kernel's raw machine-entry ABI. Native applications should call schema-generated `dw_*` entry points supplied through a kernel-matched virtual DSO rather than treating raw syscall numbers, register assignments, or the `SYSCALL` instruction sequence as the permanent application contract.
+
+The current ABI-0 generated `dw_syscall6` veneer and documented raw x86_64 convention remain valid bootstrap/test bindings until the dedicated vDSO milestone replaces that consumption path. Their existence during DW0 does **not** by itself promise that raw syscall numbering/calling convention as the stable post-ABI-0 application ABI.
+
+Locked direction for that later milestone:
+
+- the canonical Deepwyrm ABI schema generates the public native `dw_*` symbol contract, the vDSO implementation metadata, and the corresponding kernel dispatch metadata from one source of truth;
+- the kernel and vDSO are built and matched as one ABI tuple, and Wyrmroot maps the immutable kernel-provided image into native processes without requiring `PT_INTERP` or a general dynamic linker;
+- the vDSO stays freestanding and deterministic, with no libc/TLS dependency, no writable load segment, no W+X mapping, and no runtime relocation requirement for its normal bootstrap use;
+- kernel-initialized read-only data may support safe syscall-free queries or clock fast paths when correctness permits, with a real kernel entry retained where necessary;
+- once this path is active, ordinary native executables should not need to embed architecture syscall instructions or private syscall numbers; machine-checkable validation should keep raw native kernel-entry sites inside the generated vDSO/runtime boundary; and
+- validating that every raw syscall originated from an approved vDSO call site is a later defense-in-depth option, not an authority boundary and not a requirement for the first vDSO milestone. Handle rights/capabilities remain the security boundary.
+
+Foreign personalities do not inherit the native vDSO contract. Linux vDSO/vsyscall behavior, Windows/NT entry stubs, and other foreign observable ABI machinery remain personality-owned even when they ultimately consume the same admitted Deepwyrm mechanisms.
+
+Primary prior art for the implementation milestone is Zircon's vDSO design and generated public/private syscall split:
+
+- `https://fuchsia.dev/fuchsia-src/concepts/kernel/vdso`
+- `https://fuchsia.googlesource.com/fuchsia/+/HEAD/zircon/vdso/`
+
+Zircon currently describes its syscall definitions with a customized FIDL dialect and generates both public API and private vDSO/kernel implementation pieces. That generator architecture is useful prior art, but it does not change Deepwyrm ownership: the canonical Deepwyrm kernel ABI schema remains distinct from Wyrmroot's service-level WyrmIDL. Before adapting source, pin an exact upstream revision and verify file-level license/provenance.
+
 ---
 
 # 3. No universal `ioctl()` kernel escape hatch
@@ -76,6 +100,14 @@ Deepwyrm does not provide:
 - a mandatory system message broker
 
 Wyrmroot builds service discovery in userspace and connects clients directly to services through Channel capabilities.
+
+## 4.1 Kernel does not own post-primordial boot orchestration
+
+Deepwyrm's boot responsibility ends at creating the deliberately narrow primordial Wyrmroot process and transferring its initial capabilities. The kernel does not become init, a service supervisor, a dependency controller, a device manager, a VFS server, or a root-filesystem mount coordinator.
+
+The intended post-WYR0 userspace dependency spine is Wyrmroot policy: primordial bootstrap -> small permanent supervisor -> separate discovery -> device coordinator/essential userspace drivers -> VFS/filesystem services -> persistent root -> ordinary services. Deepwyrm supplies the generic Process/TaskGroup, Channel, wait/timer, memory, device-resource, and capability mechanisms needed by those components without learning their service names or boot graph.
+
+Persistent root is therefore not a prerequisite for entering userspace. Boot-critical drivers/filesystem services may be loaded from the Wyrmroot bootfs and receive explicit MMIO/IRQ/DMA/block-device/namespace authority as applicable. Failure to mount persistent root is a Wyrmroot recovery-policy event, not a reason to add filesystem-aware kernel `exec(path)` or kernel service-management policy.
 
 ---
 
@@ -362,7 +394,8 @@ Do not require Linux loop-device semantics or `/dev/loopN` as kernel primitives.
 
 Deepwyrm remains authoritative for:
 
-- syscall numbers
+- native kernel-operation semantics and the stable public `dw_*` vDSO symbol contract once that milestone is reached
+- ABI-0 raw syscall numbers/calling metadata while bootstrap consumers still require them, and the private kernel<->vDSO dispatch metadata that may replace them later
 - native status values
 - object types
 - handle rights
@@ -370,7 +403,7 @@ Deepwyrm remains authoritative for:
 - `DwBootInfo`
 - kernel feature queries
 
-These are generated/validated from the canonical ABI schema.
+These are generated/validated from the canonical ABI schema. Once the vDSO boundary exists, the schema/generator must distinguish the stable native application symbol ABI from private machine-entry/dispatch details rather than making implementation numbering stable merely because it is generated.
 
 Wyrmroot service protocol schemas are separate and must not be copied into the kernel merely for convenience.
 
@@ -394,6 +427,7 @@ The following remain implementation choices:
 - network stack
 - USB/audio/Bluetooth/Wi-Fi stacks
 - graphics device ABI details beyond later explicit design
+- exact native vDSO ELF layout/startup-location carrier and optional syscall-origin enforcement beyond the locked symbol/private-entry direction above
 - Secure Boot
 
 Do not infer a commitment from an early prototype implementation.

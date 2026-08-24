@@ -218,7 +218,9 @@ BlockDevice capability/service
 
 without requiring `/dev/loopN`, `losetup`, or Linux-specific control ioctls.
 
-Filesystem mounting, mount namespaces, filesystem discovery, partition policy, and image attachment policy remain Wyrmroot userspace responsibilities unless a minimal kernel mechanism is technically unavoidable.
+Filesystem mounting, mount namespaces, filesystem discovery, partition policy, filesystem-format choice, and image attachment policy remain Wyrmroot userspace responsibilities unless a minimal kernel mechanism is technically unavoidable.
+
+Wyrmroot has pinned FAT32 as the guest-side EFI System Partition/boot-management filesystem and ext4 as the initial persistent root required for full persistent-userspace onlining. Those choices do **not** add FAT32/ext4 semantics to Deepwyrm: the kernel continues to expose only the generic block/device-resource, memory, capability, wait, and IPC mechanisms needed by the bootfs-resident filesystem services. The later Wyrmroot-native filesystem likewise remains a userspace storage/VFS concern.
 
 ---
 

@@ -776,6 +776,7 @@ Do not let DW0 expand to include:
 - accelerated graphics
 - Glasswyrm/Prismdrake
 - Windows/DOS compatibility
+- post-bootstrap native vDSO transition or mandatory vDSO syscall-origin enforcement; DW0 keeps the generated ABI-0 `dw_syscall6`/raw entry binding
 - dynamic linker
 - Rust `std` port
 - Secure Boot

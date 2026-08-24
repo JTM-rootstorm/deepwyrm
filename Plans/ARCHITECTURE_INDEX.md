@@ -14,7 +14,7 @@ This file defines the minimum architecture reading set for Deepwyrm implementati
 5. [`Plans/DW0_IMPLEMENTATION_PLAN_LIBC_POLICY_ADDENDUM.md`](DW0_IMPLEMENTATION_PLAN_LIBC_POLICY_ADDENDUM.md) - libc/POSIX independence of the native ABI and primordial userspace.
 6. [`Plans/DW0_IMPLEMENTATION_PLAN_TOOLCHAIN_ADDENDUM.md`](DW0_IMPLEMENTATION_PLAN_TOOLCHAIN_ADDENDUM.md) - LLVM/Clang/LLD/compiler-rt policy and host GDB/QEMU debugging.
 7. [`Plans/DW0_IMPLEMENTATION_PLAN_NATIVE_CONTROL_SURFACES_ADDENDUM.md`](DW0_IMPLEMENTATION_PLAN_NATIVE_CONTROL_SURFACES_ADDENDUM.md) - typed native control/introspection direction and Linux-compatibility boundaries.
-8. Wyrmroot's corresponding `Plans/WYRMROOT_PLATFORM_CONVENTIONS.md`, WYR0 plan, and addenda for any shared boot/bootstrap/userspace work.
+8. Wyrmroot's corresponding `Plans/WYRMROOT_PLATFORM_CONVENTIONS.md`, WYR0 plan, and addenda for any shared boot/bootstrap/userspace work. For post-WYR0 block/storage/VFS/root work, also read Wyrmroot `Plans/WYRMROOT_STORAGE_FILESYSTEM_DIRECTION.md` (FAT32 ESP role, ext4 initial root, later native-filesystem direction).
 9. When work touches compatibility personalities, personality hosting, or uses Linux/Windows/DOS/POSIX requirements to justify a native kernel change, the OS-Project coordination doctrine `../personality-plan/CROSS_PERSONALITY_KERNEL_MECHANISM_DOCTRINE.md` and the affected family plan are mandatory reading.
 
 ## Authority rules
