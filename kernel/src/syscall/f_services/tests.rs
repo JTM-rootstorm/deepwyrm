@@ -420,6 +420,7 @@ impl Fixture {
             &mut self.spaces,
             self.process,
             self.thread,
+            crate::cpu::CpuIndex::BOOTSTRAP,
             1,
             Some(&mut self.wait_deadlines),
             &mut self.timer_deadlines,

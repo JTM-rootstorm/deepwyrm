@@ -488,6 +488,21 @@ fn i1_live_process_exit_retires_the_current_cpu_carrier() {
 }
 
 #[test]
+fn i1_live_wait_suspension_uses_the_physical_current_cpu() {
+    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let services = source("src/syscall/f_services.rs");
+    let waits = source("src/wait/engine.rs");
+
+    assert!(runtime.contains("self.thread,\n                        self.cpu,"));
+    assert!(services.contains("wait_many_syscall_on("));
+    assert!(services.contains("wait_one_syscall_on("));
+    assert!(services.contains("current_cpu,"));
+    assert!(waits.contains("prepare_block_current_on(cpu, thread)"));
+    assert!(waits.contains("cancel_block_on(cpu, block)"));
+    assert!(waits.contains("commit_block_on(cpu, block)"));
+}
+
+#[test]
 fn f2_syscall_frame_moves_to_thread_stack_before_rust_dispatch() {
     let assembly = source("src/arch/x86_64/syscall_entry.S");
     let entry = assembly

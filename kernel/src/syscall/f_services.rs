@@ -33,7 +33,7 @@ use super::adapters::{
     CleanupQueue, NativeWaitControl, TerminalWaitCleanup, WaitSuspendError, atomic_wake_with,
     channel_create, channel_receive, channel_send, clock_get_with, event_create, event_signal,
     process_create, resume_wait_thread_syscall, timer_cancel, timer_create, timer_set,
-    wait_many_syscall, wait_one_syscall,
+    wait_many_syscall_on, wait_one_syscall_on,
 };
 use super::native::{
     NativeIdleSuspendPoll, NativeSuspendPlan, NativeSyscallRequest, NativeSyscallResult,
@@ -244,6 +244,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         spaces: &mut AddressSpaceAuthority<SPACES, REGIONS>,
         current_process: ProcessKey,
         current_thread: ThreadKey,
+        current_cpu: crate::cpu::CpuIndex,
         current_root_generation: u64,
         wait_deadlines: Option<&mut dyn WaitDeadlineAuthority>,
         timer_deadlines: &mut dyn TimerDeadlineAuthority,
@@ -343,7 +344,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
                 signals,
                 deadline,
                 out_result,
-            } => FServiceRoute::Handled(control.accept(wait_one_syscall(
+            } => FServiceRoute::Handled(control.accept(wait_one_syscall_on(
                 user,
                 registry,
                 tasks,
@@ -354,6 +355,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
                 execution,
                 &mut self.wait_operations,
                 wait_deadlines,
+                current_cpu,
                 current_process,
                 current_thread,
                 handle,
@@ -367,7 +369,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
                 mode,
                 deadline,
                 out_result,
-            } => FServiceRoute::Handled(control.accept(wait_many_syscall(
+            } => FServiceRoute::Handled(control.accept(wait_many_syscall_on(
                 user,
                 registry,
                 tasks,
@@ -378,6 +380,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
                 execution,
                 &mut self.wait_operations,
                 wait_deadlines,
+                current_cpu,
                 current_process,
                 current_thread,
                 items,

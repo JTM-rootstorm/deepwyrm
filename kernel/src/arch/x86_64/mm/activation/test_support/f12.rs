@@ -1059,6 +1059,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                 &mut self.spaces,
                 self.process,
                 thread,
+                crate::cpu::CpuIndex::BOOTSTRAP,
                 root_generation,
                 Some(&mut wait_deadlines),
                 &mut timer_deadlines,

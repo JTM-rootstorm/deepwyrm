@@ -564,6 +564,7 @@ pub(crate) struct WaitBeginContext<
     >,
     pub(crate) execution: &'a ExecutionDomain<EXECUTION>,
     pub(crate) operations: &'a mut WaitOperationRegistry<OUTPUT, EXECUTION>,
+    pub(crate) cpu: crate::cpu::CpuIndex,
     pub(crate) process: ProcessKey,
     pub(crate) thread: ThreadKey,
 }
@@ -608,6 +609,7 @@ pub(crate) fn begin_registered_wait<
         sources,
         execution,
         operations,
+        cpu,
         process,
         thread,
     } = context;
@@ -631,7 +633,7 @@ pub(crate) fn begin_registered_wait<
         return Ok(WaitBeginOutcome::TimedOut { output });
     }
 
-    let block = match execution.prepare_block_current(thread) {
+    let block = match execution.prepare_block_current_on(cpu, thread) {
         Ok(block) => block,
         Err(error) => {
             set.release(registry);
@@ -652,12 +654,14 @@ pub(crate) fn begin_registered_wait<
     ) {
         Ok(blocked) => blocked,
         Err((error, ())) => {
-            execution.cancel_block(block).unwrap_or_else(|failure| {
-                panic!(
-                    "fresh F7 block preparation failed rollback: {:?}",
-                    failure.error()
-                )
-            });
+            execution
+                .cancel_block_on(cpu, block)
+                .unwrap_or_else(|failure| {
+                    panic!(
+                        "fresh F7 block preparation failed rollback: {:?}",
+                        failure.error()
+                    )
+                });
             set.release(registry);
             return Err(WaitBeginFailure {
                 error: WaitBeginError::Blocked(error),
@@ -681,12 +685,14 @@ pub(crate) fn begin_registered_wait<
                     .unwrap_or_else(|failure| {
                         panic!("F7 missing deadline authority cleanup drifted: {failure:?}")
                     });
-                execution.cancel_block(block).unwrap_or_else(|failure| {
-                    panic!(
-                        "F7 missing deadline authority block rollback drifted: {:?}",
-                        failure.error()
-                    )
-                });
+                execution
+                    .cancel_block_on(cpu, block)
+                    .unwrap_or_else(|failure| {
+                        panic!(
+                            "F7 missing deadline authority block rollback drifted: {:?}",
+                            failure.error()
+                        )
+                    });
                 set.release(registry);
                 return Err(WaitBeginFailure {
                     error: WaitBeginError::Deadline(WaitDeadlineError::Fault),
@@ -706,12 +712,14 @@ pub(crate) fn begin_registered_wait<
                         .unwrap_or_else(|failure| {
                             panic!("F7 expired deadline completion drifted: {failure:?}")
                         });
-                    execution.cancel_block(block).unwrap_or_else(|failure| {
-                        panic!(
-                            "F7 expired deadline block rollback drifted: {:?}",
-                            failure.error()
-                        )
-                    });
+                    execution
+                        .cancel_block_on(cpu, block)
+                        .unwrap_or_else(|failure| {
+                            panic!(
+                                "F7 expired deadline block rollback drifted: {:?}",
+                                failure.error()
+                            )
+                        });
                     set.release(registry);
                     return Ok(WaitBeginOutcome::TimedOut { output });
                 }
@@ -726,12 +734,14 @@ pub(crate) fn begin_registered_wait<
                         .unwrap_or_else(|failure| {
                             panic!("F7 deadline-registration cleanup drifted: {failure:?}")
                         });
-                    execution.cancel_block(block).unwrap_or_else(|failure| {
-                        panic!(
-                            "F7 deadline failure block rollback drifted: {:?}",
-                            failure.error()
-                        )
-                    });
+                    execution
+                        .cancel_block_on(cpu, block)
+                        .unwrap_or_else(|failure| {
+                            panic!(
+                                "F7 deadline failure block rollback drifted: {:?}",
+                                failure.error()
+                            )
+                        });
                     set.release(registry);
                     return Err(WaitBeginFailure {
                         error: WaitBeginError::Deadline(error),
@@ -765,12 +775,14 @@ pub(crate) fn begin_registered_wait<
         cancel_deadline_exact(&mut deadline_authority, deadline).unwrap_or_else(|failure| {
             panic!("F7 unpublished deadline cleanup drifted: {failure:?}")
         });
-        execution.cancel_block(block).unwrap_or_else(|failure| {
-            panic!(
-                "fresh F7 block preparation failed rollback: {:?}",
-                failure.error()
-            )
-        });
+        execution
+            .cancel_block_on(cpu, block)
+            .unwrap_or_else(|failure| {
+                panic!(
+                    "fresh F7 block preparation failed rollback: {:?}",
+                    failure.error()
+                )
+            });
         set.release(registry);
         return Err(WaitBeginFailure {
             error: WaitBeginError::Operation(error),
@@ -795,12 +807,14 @@ pub(crate) fn begin_registered_wait<
                 });
             cancel_deadline_exact(&mut deadline_authority, deadline)
                 .unwrap_or_else(|failure| panic!("F7 ready deadline cleanup drifted: {failure:?}"));
-            execution.cancel_block(block).unwrap_or_else(|failure| {
-                panic!(
-                    "F7 ready rollback block cancellation drifted: {:?}",
-                    failure.error()
-                )
-            });
+            execution
+                .cancel_block_on(cpu, block)
+                .unwrap_or_else(|failure| {
+                    panic!(
+                        "F7 ready rollback block cancellation drifted: {:?}",
+                        failure.error()
+                    )
+                });
             set.release(registry);
             Ok(WaitBeginOutcome::Ready { output, selection })
         }
@@ -829,12 +843,14 @@ pub(crate) fn begin_registered_wait<
                     cancel_deadline_exact(&mut deadline_authority, deadline).unwrap_or_else(
                         |failure| panic!("F7 pre-block deadline cleanup drifted: {failure:?}"),
                     );
-                    execution.cancel_block(block).unwrap_or_else(|failure| {
-                        panic!(
-                            "F7 pre-block timeout cancellation drifted: {:?}",
-                            failure.error()
-                        )
-                    });
+                    execution
+                        .cancel_block_on(cpu, block)
+                        .unwrap_or_else(|failure| {
+                            panic!(
+                                "F7 pre-block timeout cancellation drifted: {:?}",
+                                failure.error()
+                            )
+                        });
                     set.release(registry);
                     Ok(WaitBeginOutcome::TimedOut { output })
                 }
@@ -863,12 +879,14 @@ pub(crate) fn begin_registered_wait<
                             panic!("F7 pre-block signal deadline cleanup drifted: {failure:?}")
                         },
                     );
-                    execution.cancel_block(block).unwrap_or_else(|failure| {
-                        panic!(
-                            "F7 pre-block signal cancellation drifted: {:?}",
-                            failure.error()
-                        )
-                    });
+                    execution
+                        .cancel_block_on(cpu, block)
+                        .unwrap_or_else(|failure| {
+                            panic!(
+                                "F7 pre-block signal cancellation drifted: {:?}",
+                                failure.error()
+                            )
+                        });
                     set.release(registry);
                     Ok(WaitBeginOutcome::Ready {
                         output,
@@ -881,9 +899,12 @@ pub(crate) fn begin_registered_wait<
                 Ok(Some(other)) => panic!("unexpected F7 winner before block commit: {other:?}"),
                 Ok(None) => {
                     set.release(registry);
-                    let decision = execution.commit_block(block).unwrap_or_else(|failure| {
-                        panic!("F7 registered block commit drifted: {:?}", failure.error())
-                    });
+                    let decision =
+                        execution
+                            .commit_block_on(cpu, block)
+                            .unwrap_or_else(|failure| {
+                                panic!("F7 registered block commit drifted: {:?}", failure.error())
+                            });
                     Ok(WaitBeginOutcome::Suspended { wake, decision })
                 }
                 Err(error) => panic!("fresh F7 winner ledger disappeared: {error:?}"),
@@ -905,12 +926,14 @@ pub(crate) fn begin_registered_wait<
             cancel_deadline_exact(&mut deadline_authority, deadline).unwrap_or_else(|failure| {
                 panic!("F7 failed deadline cleanup drifted: {failure:?}")
             });
-            execution.cancel_block(block).unwrap_or_else(|failure| {
-                panic!(
-                    "F7 failed publication block cancellation drifted: {:?}",
-                    failure.error()
-                )
-            });
+            execution
+                .cancel_block_on(cpu, block)
+                .unwrap_or_else(|failure| {
+                    panic!(
+                        "F7 failed publication block cancellation drifted: {:?}",
+                        failure.error()
+                    )
+                });
             set.release(registry);
             Err(WaitBeginFailure {
                 error: WaitBeginError::Set(error),
@@ -1214,6 +1237,7 @@ mod tests {
                 },
                 execution: &execution,
                 operations: &mut operations,
+                cpu: crate::cpu::CpuIndex::BOOTSTRAP,
                 process,
                 thread,
             },
@@ -1280,6 +1304,7 @@ mod tests {
                 },
                 execution: &execution,
                 operations: &mut operations,
+                cpu: crate::cpu::CpuIndex::BOOTSTRAP,
                 process,
                 thread,
             },
@@ -1451,6 +1476,7 @@ mod tests {
                 },
                 execution: &execution,
                 operations: &mut operations,
+                cpu: crate::cpu::CpuIndex::BOOTSTRAP,
                 process,
                 thread,
             },
@@ -1485,6 +1511,7 @@ mod tests {
                 },
                 execution: &execution,
                 operations: &mut operations,
+                cpu: crate::cpu::CpuIndex::BOOTSTRAP,
                 process,
                 thread,
             },
@@ -1534,6 +1561,7 @@ mod tests {
                 },
                 execution: &execution,
                 operations: &mut operations,
+                cpu: crate::cpu::CpuIndex::BOOTSTRAP,
                 process,
                 thread,
             },
@@ -1606,6 +1634,7 @@ mod tests {
                 },
                 execution: &execution,
                 operations: &mut operations,
+                cpu: crate::cpu::CpuIndex::BOOTSTRAP,
                 process,
                 thread,
             },
@@ -1690,6 +1719,7 @@ mod tests {
                 },
                 execution: &execution,
                 operations: &mut operations,
+                cpu: crate::cpu::CpuIndex::BOOTSTRAP,
                 process,
                 thread,
             },
