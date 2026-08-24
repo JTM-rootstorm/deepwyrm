@@ -70,6 +70,8 @@ DW0-F is now **FULL ACCEPTED for progression to DW0-G**. The exact F13 Daybreak 
 
 DW0-G is now **FULL ACCEPTED for progression to DW0-H**. The exact G5 product candidate is Deepwyrm `91d9b204c1ed0bdd4cef934e1be6203d41e9e5c3`, paired with Wyrmroot artifact source `f433baf36d671f3f8b515adf5f613bd01dc8bbb9` and Rust `a92dc7f7464ad6ddfece4402bd7b86dbfa86166d`. The designated q35/UEFI campaign passed selectors 18 through 21 with byte-identical restoration; final Daybreak rereviews report C0/H0/M0/L0. The separate P0 WYR0-B/C accounting debt was then closed from exact retained F12/F14 evidence in the coordinator reconciliation record. WYR0-D is FULL ACCEPTED, while the WYR0-F primordial bootstrap remains partial. DW0-H/SMP, physical hardware, i386, general exec, and complete-DW0 acceptance remain open.
 
+DW0-H and the overall Deepwyrm DW0 milestone are now **FULL ACCEPTED**. The exact reviewed product tuple is Deepwyrm `5da17d0d2460936e171d0874ffd2262ad4a5cc97`, Wyrmroot `c6f2f6c10972983eeb76e3b686f4379cbab08c78`, and Rust `a92dc7f7464ad6ddfece4402bd7b86dbfa86166d`. The final default userspace chain, four-vCPU SMP acceptance, five repeated SMP stress runs, malformed-input/authority negatives, production debug-exit separation, and final Daybreak remediation/rerun all pass on that tuple. See [`DW0_H_VALIDATION.md`](DW0_H_VALIDATION.md), [`DW0_COMPLETION_REPORT.md`](DW0_COMPLETION_REPORT.md), and [`DW0_H_SECURITY_REVIEW.md`](../security/DW0_H_SECURITY_REVIEW.md). Physical hardware, i386, WYR0-I, general VFS/exec, normal timer-driven preemption, and real-time scheduling remain post-DW0 work.
+
 ## Authority
 
 The canonical reading order and authority rules are in
