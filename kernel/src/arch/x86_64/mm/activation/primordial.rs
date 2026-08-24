@@ -12,12 +12,14 @@ use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
+#[cfg(not(deepwyrm_i2_stress))]
+use crate::boot::primordial::construction::STACK_BYTES;
 use crate::boot::primordial::construction::authority::{
     AuthorityPrimordialBackend, AuthorityPrimordialMonitor, PrimordialPlatform,
 };
 use crate::boot::primordial::construction::{
-    PrimordialCompletionBackend, PrimordialExitDisposition, STACK_BYTES,
-    complete_primordial_launch, construct_primordial,
+    PrimordialCompletionBackend, PrimordialExitDisposition, complete_primordial_launch,
+    construct_primordial,
 };
 use crate::ipc::ChannelAuthority;
 use crate::memory::address_region::{
