@@ -1565,6 +1565,22 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.local.record_current(thread, stack_id, context_id);
     }
 
+    /// Publishes completion of the outgoing continuation only after this CPU
+    /// has physically arrived on the selected destination stack.  Scheduler
+    /// selection deliberately retains the suspended claim until this point so
+    /// no other CPU can acquire a Runnable continuation before its saved RSP
+    /// is visible.
+    fn complete_physical_switch_handoff(&self) {
+        if let Some(outgoing) = self.shared.execution.suspended_claim_on(self.cpu) {
+            self.shared
+                .execution
+                .complete_switch_on(outgoing)
+                .unwrap_or_else(|error| {
+                    panic!("physical kernel switch completion drifted: {error:?}")
+                });
+        }
+    }
+
     fn merge_cleanup(&mut self, cleanup: CleanupQueue<REGISTRY_OBJECTS>) {
         for release in cleanup.into_releases().into_iter().flatten() {
             self.cleanup.push(release);
@@ -2328,6 +2344,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 
     fn enter_scheduled_fresh_thread(&mut self) -> ! {
+        self.complete_physical_switch_handoff();
         let (state, stack) = self.prepare_fresh_user_entry();
         unsafe { crate::arch::x86_64::syscall::enter_bound_validated_user(&state, stack) }
     }
@@ -2347,6 +2364,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 
     fn resume_suspended(&mut self, frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame) {
+        self.complete_physical_switch_handoff();
         self.synchronize_scheduler_current();
         #[cfg(feature = "test-support")]
         let owner = self.services.operation_owner(self.thread);
