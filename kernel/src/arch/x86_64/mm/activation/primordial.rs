@@ -2886,7 +2886,15 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                                 panic!("resume crossed an in-progress remote-stop carrier")
                             }
                             None if runtime.deferred_currents[self.cpu.index()].is_some() => {
-                                panic!("resume crossed an in-progress local terminal carrier")
+                                let deferred = runtime.deferred_currents[self.cpu.index()]
+                                    .as_ref()
+                                    .expect("checked deferred current disappeared");
+                                if suspended_claim
+                                    .is_some_and(|claim| claim.thread() == deferred.thread())
+                                {
+                                    panic!("resume reentered its own local terminal carrier")
+                                }
+                                panic!("resume crossed another local terminal carrier on this CPU")
                             }
                             None if suspended_claim.is_some_and(|claim| {
                                 runtime.local.physically_executes(claim.thread())
