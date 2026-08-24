@@ -908,6 +908,8 @@ struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_
     cpu: crate::cpu::CpuIndex,
     active: ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
     active_root: Option<super::ActiveRootSelection>,
+    active_roots:
+        [Option<super::ActiveRootSelection>; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
     registry: Registry,
     memory: Memory,
     tasks: Tasks,
@@ -1005,7 +1007,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 {
     fn select_cpu(&mut self, cpu: crate::cpu::CpuIndex) {
         if self.cpu != cpu {
+            self.active_roots[self.cpu.index()] = self.active_root.take();
             self.cpu = cpu;
+            self.active_root = self.active_roots[cpu.index()].take();
             self.channel_staging = take_channel_staging_once(cpu.index(), true);
         }
         self.synchronize_scheduler_current();
@@ -2059,6 +2063,7 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         cpu: crate::cpu::CpuIndex::BOOTSTRAP,
         active,
         active_root: Some(initial_root),
+        active_roots: core::array::from_fn(|_| None),
         registry,
         memory,
         tasks,
