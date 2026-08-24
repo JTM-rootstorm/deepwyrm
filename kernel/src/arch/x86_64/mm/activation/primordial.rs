@@ -2876,7 +2876,10 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                     panic!("resume lost current without a mailbox notification or suspension")
                 }
                 (crate::arch::x86_64::rendezvous::MailboxNotification::None, true) => {
-                    panic!("resume lost current while a suspension remained owned")
+                    if runtime.wait_controls[self.cpu.index()].is_clear() {
+                        panic!("resume lost current behind a cleared switched suspension")
+                    }
+                    panic!("resume lost current while an idle suspension remained owned")
                 }
                 (crate::arch::x86_64::rendezvous::MailboxNotification::Wake, false) => {
                     panic!("resume lost current after consuming a wake")
