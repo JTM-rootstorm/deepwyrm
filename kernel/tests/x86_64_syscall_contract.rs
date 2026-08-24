@@ -632,6 +632,23 @@ fn live_return_boundary_publishes_final_release_effects_before_userspace_resume(
 }
 
 #[test]
+fn live_timer_expiry_is_bound_and_serviced_only_from_carrier_safe_points() {
+    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+
+    assert!(runtime.contains("impl crate::time::TimerExpiryTarget for PrimordialRuntimeShared"));
+    assert!(runtime.contains("crate::time::bind_timer_expiry_target(target)"));
+    assert!(runtime.contains("fn service_pending_timer_expiries(&mut self)"));
+    assert!(runtime.contains(".expire(token, &self.shared.waits)"));
+    assert!(runtime.contains("timer_expiries:\n        IrqSpinMutex<"));
+    assert!(
+        runtime
+            .matches("runtime.service_pending_timer_expiries();")
+            .count()
+            >= 3
+    );
+}
+
+#[test]
 fn i1_terminal_child_without_local_work_rejoins_the_idle_scheduler() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
 

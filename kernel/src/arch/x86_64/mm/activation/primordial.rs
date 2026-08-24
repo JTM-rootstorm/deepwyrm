@@ -406,6 +406,8 @@ struct PrimordialRuntimeShared {
     channels: Channels,
     events: EventAuthority<EVENTS>,
     timers: TimerAuthority<TIMERS>,
+    timer_expiries:
+        IrqSpinMutex<[Option<crate::time::TimerExpiryToken>; crate::time::DEADLINE_QUEUE_CAPACITY]>,
     waits: WaitRegistry<WAITERS>,
 }
 
@@ -413,6 +415,17 @@ impl crate::time::DeadlineWakeTarget for PrimordialRuntimeShared {
     fn wake_deadline(&self, key: crate::task::BlockWakeKey) {
         crate::wait::engine::claim_timeout_and_wake(&self.execution, key)
             .unwrap_or_else(|error| panic!("primordial deadline wake drifted: {error:?}"));
+    }
+}
+
+impl crate::time::TimerExpiryTarget for PrimordialRuntimeShared {
+    fn expire_timer(&self, token: crate::time::TimerExpiryToken) {
+        let mut pending = self.timer_expiries.lock();
+        let slot = pending
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .unwrap_or_else(|| panic!("primordial timer-expiry inbox exhausted"));
+        *slot = Some(token);
     }
 }
 
@@ -650,6 +663,7 @@ fn publish_runtime_shared() -> &'static PrimordialRuntimeShared {
             channels: Channels::new(),
             events: EventAuthority::new(),
             timers: TimerAuthority::new(),
+            timer_expiries: IrqSpinMutex::new([None; crate::time::DEADLINE_QUEUE_CAPACITY]),
             waits: WaitRegistry::new(),
         });
     }
@@ -657,6 +671,8 @@ fn publish_runtime_shared() -> &'static PrimordialRuntimeShared {
     let target = unsafe { &*(*SHARED_RUNTIME_STORAGE.0.get()).as_ptr() };
     crate::time::bind_deadline_wake_target(target)
         .unwrap_or_else(|error| panic!("could not bind primordial deadline wakes: {error:?}"));
+    crate::time::bind_timer_expiry_target(target)
+        .unwrap_or_else(|error| panic!("could not bind primordial timer expiries: {error:?}"));
     target
 }
 
@@ -2190,6 +2206,28 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok(())
     }
 
+    fn service_pending_timer_expiries(&mut self) {
+        let pending = {
+            let mut inbox = self.shared.timer_expiries.lock();
+            core::mem::replace(&mut *inbox, [None; crate::time::DEADLINE_QUEUE_CAPACITY])
+        };
+        for token in pending.into_iter().flatten() {
+            let wakes = self
+                .shared
+                .timers
+                .expire(token, &self.shared.waits)
+                .unwrap_or_else(|error| panic!("primordial timer expiry drifted: {error:?}"));
+            crate::syscall::complete_wait_wakes(
+                &mut self.registry,
+                &self.shared.execution,
+                wakes,
+                &mut self.cleanup,
+            );
+        }
+        self.drain_finalizers()
+            .unwrap_or_else(|_| panic!("timer expiry could not drain wake pins"));
+    }
+
     fn prove_registry_capacity(&mut self) -> Result<(), ()> {
         let mut probes: [Option<crate::object::CreationRef>; REGISTRY_OBJECTS] =
             core::array::from_fn(|_| None);
@@ -2690,6 +2728,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             };
         }
         runtime.select_cpu(self.cpu);
+        runtime.service_pending_timer_expiries();
         runtime.handle(request)
     }
 }
@@ -2848,6 +2887,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
 
             let entry = {
                 let mut runtime = self.runtime.lock();
+                runtime.service_pending_timer_expiries();
                 let decision = runtime
                     .shared
                     .execution
@@ -2960,6 +3000,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
     ) -> crate::syscall::native::NativeIdleSuspendPoll<'owner> {
         let mut runtime = self.runtime.lock();
         runtime.switch_cpu(self.cpu);
+        runtime.service_pending_timer_expiries();
         unsafe { runtime.poll_idle_suspend_stationary() }
     }
 
