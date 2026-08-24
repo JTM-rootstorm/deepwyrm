@@ -34,6 +34,16 @@ pub use transport::{
 )]
 pub(crate) use evidence::{
     EvidenceEvent, EvidenceFlushError, EvidenceKind, I1_EVIDENCE, I1_EVIDENCE_RECORD_LEN,
+    observe_child_cleanup as observe_i1_child_cleanup, observe_child_exit as observe_i1_child_exit,
+    observe_cpl3_syscall as observe_i1_cpl3_syscall,
+    observe_descendant_running as observe_i1_descendant_running,
+    observe_parent_blocked as observe_i1_parent_blocked,
+    observe_reclaim_allowed as observe_i1_reclaim_allowed,
+    observe_remote_wake_received as observe_i1_remote_wake_received,
+    observe_remote_wake_sent as observe_i1_remote_wake_sent,
+    observe_rendezvous_ack as observe_i1_rendezvous_ack,
+    observe_rendezvous_targets as observe_i1_rendezvous_targets,
+    observe_tlb_ack as observe_i1_tlb_ack, observe_tlb_publish as observe_i1_tlb_publish,
 };
 
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]

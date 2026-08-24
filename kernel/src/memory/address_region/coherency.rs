@@ -47,6 +47,19 @@ impl<const CPUS: usize> CpuSet<CPUS> {
             .filter(|(_, member)| *member)
             .map(|(index, _)| CpuIndex::new(index).unwrap())
     }
+
+    #[cfg(deepwyrm_i1_evidence)]
+    pub(crate) fn evidence_mask(self) -> u32 {
+        self.members
+            .iter()
+            .enumerate()
+            .fold(
+                0_u32,
+                |mask, (cpu, member)| {
+                    if *member { mask | (1_u32 << cpu) } else { mask }
+                },
+            )
+    }
 }
 
 /// The mapping operation whose page-table visibility is being synchronized.
@@ -707,10 +720,18 @@ where
 
         let mut barrier = transaction.publish();
         let request = barrier.request();
+        #[cfg(deepwyrm_i1_evidence)]
+        crate::test_support::observe_i1_tlb_publish(
+            initiating_cpu,
+            request,
+            barrier.targets().evidence_mask(),
+        );
         if barrier.targets().contains(initiating_cpu) {
             self.coherency
                 .acknowledge(initiating_cpu, request)
                 .expect("initiating CPU owns the published shootdown target");
+            #[cfg(deepwyrm_i1_evidence)]
+            crate::test_support::observe_i1_tlb_ack(initiating_cpu, request);
         }
         for target in barrier.targets().iter() {
             if target != initiating_cpu && self.coherency.request_for_cpu(target).is_some() {

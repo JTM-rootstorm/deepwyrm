@@ -2304,6 +2304,16 @@ impl NativeWaitControl {
         }
     }
 
+    #[cfg(deepwyrm_i1_evidence)]
+    pub(crate) const fn pending_wake_key(&self) -> Option<BlockWakeKey> {
+        match self.state {
+            NativeWaitControlState::Pending(state) | NativeWaitControlState::Idle(state) => {
+                Some(state.wake_key())
+            }
+            NativeWaitControlState::Clear => None,
+        }
+    }
+
     pub(crate) fn accept(&mut self, action: WaitSyscallAction) -> NativeSyscallResult {
         assert_eq!(
             self.state,

@@ -3,6 +3,8 @@
 //! CPUs reserve and publish fixed-size facts here; only the terminal reporter
 //! serializes those facts to COM1. Workers have no serial-port API.
 
+#![cfg_attr(not(target_os = "none"), allow(dead_code))]
+
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 pub(crate) const I1_EVIDENCE_RECORD_LEN: usize = 85;
@@ -696,6 +698,309 @@ const fn state_has_failure(state: usize) -> bool {
     reason = "the runtime lane owns the target-side collector hookup"
 )]
 pub(crate) static I1_EVIDENCE: EvidenceCollector = EvidenceCollector::new();
+
+#[derive(Clone, Copy)]
+struct ParentBlockFact {
+    token: u32,
+    cpu: u8,
+}
+
+#[derive(Clone, Copy)]
+struct WakeFact {
+    token: u32,
+    publisher: u8,
+    target: u8,
+    observed: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ChildFact {
+    process: crate::task::ProcessKey,
+    token: u32,
+    exit_cpu: u8,
+    cleaned: bool,
+}
+
+#[derive(Clone, Copy)]
+struct TlbFact {
+    request: crate::memory::address_region::ShootdownRequest,
+    token: u32,
+    targets: u32,
+    acknowledgements: u32,
+}
+
+struct I1RuntimeFacts {
+    cpl3_cpus: u8,
+    parent: Option<ParentBlockFact>,
+    descendant_observed: bool,
+    wake: Option<WakeFact>,
+    child: Option<ChildFact>,
+    tlb: Option<TlbFact>,
+    rendezvous_targets: u32,
+    rendezvous_acknowledgements: u32,
+    reclaim_observed: bool,
+}
+
+impl I1RuntimeFacts {
+    const fn new() -> Self {
+        Self {
+            cpl3_cpus: 0,
+            parent: None,
+            descendant_observed: false,
+            wake: None,
+            child: None,
+            tlb: None,
+            rendezvous_targets: 0,
+            rendezvous_acknowledgements: 0,
+            reclaim_observed: false,
+        }
+    }
+}
+
+static I1_RUNTIME_FACTS: crate::sync::IrqSpinMutex<I1RuntimeFacts> =
+    crate::sync::IrqSpinMutex::new(I1RuntimeFacts::new());
+
+fn cpu_wire(cpu: crate::cpu::CpuIndex) -> u8 {
+    u8::try_from(cpu.index()).unwrap_or_else(|_| panic!("I1 CPU index exceeds the evidence wire"))
+}
+
+fn claim_token(cpu: crate::cpu::CpuIndex, generation: u64) -> u32 {
+    let generation = u32::try_from(generation)
+        .ok()
+        .filter(|generation| *generation != 0 && *generation <= 0x00ff_ffff)
+        .unwrap_or_else(|| panic!("I1 execution generation exceeds the evidence token"));
+    (u32::from(cpu_wire(cpu)) + 1) << 24 | generation
+}
+
+fn exact_token(token: u64, label: &str) -> u32 {
+    u32::try_from(token)
+        .ok()
+        .filter(|token| *token != 0)
+        .unwrap_or_else(|| panic!("I1 {label} token exceeds the evidence wire"))
+}
+
+fn record_runtime_fact(event: EvidenceEvent) {
+    I1_EVIDENCE
+        .record(event)
+        .unwrap_or_else(|error| panic!("I1 runtime evidence rejected: {error:?}"));
+}
+
+pub(crate) fn observe_cpl3_syscall(cpu: crate::cpu::CpuIndex, generation: u64, syscall_class: u32) {
+    let cpu_wire = cpu_wire(cpu);
+    let bit = 1_u8 << cpu_wire;
+    let mut facts = I1_RUNTIME_FACTS.lock();
+    if facts.cpl3_cpus & bit != 0 {
+        return;
+    }
+    let token = claim_token(cpu, generation);
+    facts.cpl3_cpus |= bit;
+    record_runtime_fact(EvidenceEvent::cpl3_syscall(
+        cpu_wire,
+        token,
+        syscall_class,
+        1,
+    ));
+}
+
+pub(crate) fn observe_parent_blocked(cpu: crate::cpu::CpuIndex, wake: crate::task::BlockWakeKey) {
+    let mut facts = I1_RUNTIME_FACTS.lock();
+    if facts.parent.is_some() {
+        return;
+    }
+    let fact = ParentBlockFact {
+        token: exact_token(wake.token(), "wait"),
+        cpu: cpu_wire(cpu),
+    };
+    facts.parent = Some(fact);
+    record_runtime_fact(EvidenceEvent::parent_blocked(fact.cpu, fact.token));
+}
+
+pub(crate) fn observe_descendant_running(cpu: crate::cpu::CpuIndex) {
+    let cpu = cpu_wire(cpu);
+    let mut facts = I1_RUNTIME_FACTS.lock();
+    let Some(parent) = facts.parent else {
+        return;
+    };
+    if facts.descendant_observed || parent.cpu == cpu {
+        return;
+    }
+    facts.descendant_observed = true;
+    record_runtime_fact(EvidenceEvent::descendant_running(cpu, parent.token));
+}
+
+pub(crate) fn observe_remote_wake_sent(
+    publisher: crate::cpu::CpuIndex,
+    target: crate::cpu::CpuIndex,
+) {
+    let publisher = cpu_wire(publisher);
+    let target = cpu_wire(target);
+    if publisher == target {
+        panic!("I1 remote wake targeted its publisher");
+    }
+    let mut facts = I1_RUNTIME_FACTS.lock();
+    if facts.wake.is_some() {
+        return;
+    }
+    let fact = WakeFact {
+        token: 0x5700_0000 | (u32::from(publisher) << 8) | u32::from(target) | 1,
+        publisher,
+        target,
+        observed: false,
+    };
+    facts.wake = Some(fact);
+    record_runtime_fact(EvidenceEvent::wake_sent(publisher, fact.token, target));
+}
+
+pub(crate) fn observe_remote_wake_received(cpu: crate::cpu::CpuIndex) {
+    let cpu = cpu_wire(cpu);
+    let mut facts = I1_RUNTIME_FACTS.lock();
+    let Some(mut wake) = facts.wake else {
+        return;
+    };
+    if wake.observed || wake.target != cpu {
+        return;
+    }
+    wake.observed = true;
+    facts.wake = Some(wake);
+    record_runtime_fact(EvidenceEvent::wake_observed(
+        cpu,
+        wake.token,
+        wake.publisher,
+    ));
+}
+
+pub(crate) fn observe_child_exit(
+    process: crate::task::ProcessKey,
+    cpu: crate::cpu::CpuIndex,
+    generation: u64,
+) {
+    let mut facts = I1_RUNTIME_FACTS.lock();
+    if facts.child.is_some() {
+        return;
+    }
+    let fact = ChildFact {
+        process,
+        token: claim_token(cpu, generation),
+        exit_cpu: cpu_wire(cpu),
+        cleaned: false,
+    };
+    facts.child = Some(fact);
+    record_runtime_fact(EvidenceEvent::child_exit(fact.exit_cpu, fact.token));
+}
+
+pub(crate) fn observe_child_cleanup(process: crate::task::ProcessKey, cpu: crate::cpu::CpuIndex) {
+    let cpu = cpu_wire(cpu);
+    let mut facts = I1_RUNTIME_FACTS.lock();
+    let Some(mut child) = facts.child else {
+        return;
+    };
+    if child.process != process || child.cleaned {
+        return;
+    }
+    if child.exit_cpu == cpu {
+        panic!("I1 child cleanup remained on the exiting CPU");
+    }
+    child.cleaned = true;
+    facts.child = Some(child);
+    record_runtime_fact(EvidenceEvent::child_cleanup(cpu, child.token));
+}
+
+pub(crate) fn observe_tlb_publish(
+    cpu: crate::cpu::CpuIndex,
+    request: crate::memory::address_region::ShootdownRequest,
+    targets: u32,
+) {
+    if targets == 0 {
+        return;
+    }
+    let mut facts = I1_RUNTIME_FACTS.lock();
+    if facts.tlb.is_some() {
+        return;
+    }
+    let token = exact_token(request.generation(), "TLB generation");
+    facts.tlb = Some(TlbFact {
+        request,
+        token,
+        targets,
+        acknowledgements: 0,
+    });
+    record_runtime_fact(EvidenceEvent::tlb_publish(cpu_wire(cpu), token, targets));
+}
+
+pub(crate) fn observe_tlb_ack(
+    cpu: crate::cpu::CpuIndex,
+    request: crate::memory::address_region::ShootdownRequest,
+) {
+    let cpu = cpu_wire(cpu);
+    let mut facts = I1_RUNTIME_FACTS.lock();
+    let Some(mut tlb) = facts.tlb else {
+        return;
+    };
+    if tlb.request != request {
+        return;
+    }
+    let bit = 1_u32 << cpu;
+    if tlb.targets & bit == 0 || tlb.acknowledgements & bit != 0 {
+        panic!("I1 TLB acknowledgement disagreed with its target set");
+    }
+    tlb.acknowledgements |= bit;
+    facts.tlb = Some(tlb);
+    record_runtime_fact(EvidenceEvent::tlb_ack(cpu, tlb.token, tlb.targets));
+}
+
+pub(crate) fn observe_rendezvous_targets(targets: u32) {
+    if targets == 0 || targets & !0x0f != 0 {
+        panic!("I1 rendezvous target mask is invalid");
+    }
+    let mut facts = I1_RUNTIME_FACTS.lock();
+    if facts.rendezvous_targets == 0 {
+        facts.rendezvous_targets = targets;
+    } else if facts.rendezvous_targets != targets {
+        panic!("I1 rendezvous target set changed");
+    }
+}
+
+pub(crate) fn observe_rendezvous_ack(cpu: crate::cpu::CpuIndex) {
+    let cpu = cpu_wire(cpu);
+    let mut facts = I1_RUNTIME_FACTS.lock();
+    let Some(tlb) = facts.tlb else {
+        panic!("I1 rendezvous acknowledgement preceded TLB publication");
+    };
+    let bit = 1_u32 << cpu;
+    if facts.rendezvous_targets & bit == 0 || facts.rendezvous_acknowledgements & bit != 0 {
+        panic!("I1 rendezvous acknowledgement disagreed with its target set");
+    }
+    facts.rendezvous_acknowledgements |= bit;
+    record_runtime_fact(EvidenceEvent::rendezvous_ack(
+        cpu,
+        tlb.token,
+        facts.rendezvous_targets,
+    ));
+}
+
+pub(crate) fn observe_reclaim_allowed(cpu: crate::cpu::CpuIndex) {
+    let mut facts = I1_RUNTIME_FACTS.lock();
+    if facts.reclaim_observed {
+        return;
+    }
+    let Some(tlb) = facts.tlb else {
+        return;
+    };
+    if tlb.acknowledgements != tlb.targets
+        || facts.rendezvous_targets == 0
+        || facts.rendezvous_acknowledgements != facts.rendezvous_targets
+        || !facts.child.is_some_and(|child| child.cleaned)
+    {
+        return;
+    }
+    facts.reclaim_observed = true;
+    record_runtime_fact(EvidenceEvent::reclaim_allowed(
+        cpu_wire(cpu),
+        tlb.token,
+        tlb.targets,
+        facts.rendezvous_targets,
+    ));
+}
 
 fn encode(sequence: u32, slot: &Slot) -> [u8; I1_EVIDENCE_RECORD_LEN] {
     let mut record = [0_u8; I1_EVIDENCE_RECORD_LEN];

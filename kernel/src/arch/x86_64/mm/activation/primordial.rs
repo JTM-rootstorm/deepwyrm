@@ -1262,6 +1262,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         #[cfg(feature = "test-support")]
         let owner = self.services.operation_owner(self.thread);
         let control = &mut self.wait_controls[self.cpu.index()];
+        #[cfg(deepwyrm_i1_evidence)]
+        let pending_wake = control.pending_wake_key();
         let plan = unsafe {
             self.services.prepare_suspend_on(
                 control,
@@ -1272,6 +1274,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             )
         }
         .unwrap_or_else(|error| panic!("primordial suspend preparation drifted: {error:?}"));
+        #[cfg(deepwyrm_i1_evidence)]
+        if let Some(wake) = pending_wake {
+            crate::test_support::observe_i1_parent_blocked(self.cpu, wake);
+        }
         #[cfg(feature = "test-support")]
         self.g5_probe.observe_prepare(
             owner,
@@ -1321,6 +1327,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         crate::memory::kernel_stack::KernelStackBounds,
     ) {
         self.synchronize_scheduler_current();
+        #[cfg(deepwyrm_i1_evidence)]
+        if self.process != self.primordial_process {
+            crate::test_support::observe_i1_descendant_running(self.cpu);
+        }
         let context = self
             .shared
             .execution
@@ -2014,7 +2024,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .map_err(|_| ())?;
         self.cleanup
             .push_optional(self.registry.release_internal(root_pin).map_err(|_| ())?);
-        self.drain_finalizers()
+        self.drain_finalizers()?;
+        #[cfg(deepwyrm_i1_evidence)]
+        {
+            crate::test_support::observe_i1_child_cleanup(process, self.cpu);
+            crate::test_support::observe_i1_reclaim_allowed(self.cpu);
+        }
+        Ok(())
     }
 
     fn release_terminal_authority(&mut self) -> Result<(), ()> {
@@ -2622,6 +2638,11 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 continue;
             };
             let ((), permit) = crate::arch::x86_64::idle::await_live_remote_stop(deferred);
+            #[cfg(deepwyrm_i1_evidence)]
+            crate::test_support::observe_i1_rendezvous_ack(
+                crate::cpu::CpuIndex::new(permit.target_cpu())
+                    .unwrap_or_else(|| panic!("I1 stop permit names an invalid CPU")),
+            );
             permits[cpu_index] = Some(permit);
         }
         let result = {
@@ -2795,8 +2816,11 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                     };
                     match notification {
                         crate::arch::x86_64::rendezvous::MailboxNotification::None
-                        | crate::arch::x86_64::rendezvous::MailboxNotification::Wake
                         | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {}
+                        crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {
+                            #[cfg(deepwyrm_i1_evidence)]
+                            crate::test_support::observe_i1_remote_wake_received(self.cpu);
+                        }
                         crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_) => {
                             panic!("kernel-root idle carrier received an unexpected stop request")
                         }
@@ -3060,6 +3084,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
         if self.shared.execution.scheduler_state(self.thread) != Some(SchedulerThreadState::Running)
         {
             panic!("primordial syscall arrived without its running Thread");
+        }
+        #[cfg(deepwyrm_i1_evidence)]
+        {
+            let claim = self
+                .shared
+                .execution
+                .running_claim_on(self.cpu)
+                .unwrap_or_else(|| panic!("I1 syscall has no running execution claim"));
+            crate::test_support::observe_i1_cpl3_syscall(self.cpu, claim.generation(), 1);
         }
         // This identity is deliberately detached from the carrier before any
         // usercopy or service dispatch.  The final check keeps a resumed
@@ -3542,6 +3575,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     fn exit_process(&mut self, exit_code: u32) -> NativeSyscallResult {
         let phase = self.reserve_runtime_phase();
         self.assert_guard_free_external_work();
+        #[cfg(deepwyrm_i1_evidence)]
+        let exiting_claim = self.shared.execution.running_claim_on(self.cpu);
         let mut discarded = None;
         let mut atomic_pin = None;
         let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
@@ -3572,6 +3607,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.deferred_current = Some(
                 deferred.unwrap_or_else(|| panic!("primordial exit omitted deferred reclaim")),
             );
+            #[cfg(deepwyrm_i1_evidence)]
+            if self.process != self.primordial_process {
+                let claim = exiting_claim
+                    .unwrap_or_else(|| panic!("I1 child exit omitted its execution claim"));
+                crate::test_support::observe_i1_child_exit(
+                    self.process,
+                    self.cpu,
+                    claim.generation(),
+                );
+            }
         } else {
             assert!(deferred.is_none());
         }
@@ -3695,6 +3740,20 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 prepared,
                 core::array::from_fn(|_| None),
             ));
+        }
+        #[cfg(deepwyrm_i1_evidence)]
+        {
+            let mask = identities
+                .iter()
+                .enumerate()
+                .fold(0_u32, |mask, (cpu, identity)| {
+                    if identity.is_some() {
+                        mask | (1_u32 << cpu)
+                    } else {
+                        mask
+                    }
+                });
+            crate::test_support::observe_i1_rendezvous_targets(mask);
         }
         ProcessTerminationPreparation::Remote(PreparedRemoteProcessTermination {
             phase,

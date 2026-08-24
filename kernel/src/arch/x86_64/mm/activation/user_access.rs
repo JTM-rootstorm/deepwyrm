@@ -250,9 +250,13 @@ fn live_tlb_shootdown_handler() {
     // exact CPU slot. The immutable request/coherency copies above remain
     // local to this handler.
     mailbox.release_after_local_serialization();
-    coherency
+    let acknowledgement = coherency
         .acknowledge(cpu, request)
         .unwrap_or_else(|error| panic!("live TLB shootdown acknowledgement drifted: {error:?}"));
+    #[cfg(deepwyrm_i1_evidence)]
+    if acknowledgement == crate::memory::address_region::ShootdownAcknowledgement::Recorded {
+        crate::test_support::observe_i1_tlb_ack(cpu, request);
+    }
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]

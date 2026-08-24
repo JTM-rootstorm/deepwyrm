@@ -361,6 +361,10 @@ impl RemoteStopReclaimPermit {
         self.identity.thread()
     }
 
+    pub(crate) const fn target_cpu(&self) -> usize {
+        self.identity.target_cpu()
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(thread: ThreadKey) -> Self {
         Self {

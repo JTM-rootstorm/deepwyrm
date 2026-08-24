@@ -431,6 +431,8 @@ pub(crate) fn notify_runnable_work(affinity: Option<CpuIndex>) {
     {
         fail_transport_and_halt();
     }
+    #[cfg(deepwyrm_i1_evidence)]
+    crate::test_support::observe_i1_remote_wake_sent(publisher, target);
 }
 
 /// Release-publishes an exact Stop to one remote CPU before sending e1.

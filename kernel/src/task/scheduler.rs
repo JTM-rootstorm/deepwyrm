@@ -87,6 +87,10 @@ pub(crate) struct BlockWakeKey {
 }
 
 impl BlockWakeKey {
+    pub(crate) const fn token(self) -> u64 {
+        self.token
+    }
+
     pub(crate) const fn thread(self) -> ThreadKey {
         self.thread
     }
