@@ -620,22 +620,6 @@ pub(crate) fn emit_early_raw_record(record: &[u8]) -> Result<(), SerialError> {
     write_bounded_raw_record(&mut serial, record)
 }
 
-/// Writes one exact DWEVID1 record through COM1 without widening the ordinary
-/// diagnostic raw-record limit. Only the test-support reporter can name this
-/// fixed-size transport seam.
-#[cfg(all(
-    feature = "test-support",
-    target_os = "none",
-    any(target_arch = "x86", target_arch = "x86_64")
-))]
-pub(crate) fn emit_test_evidence_record(
-    record: &[u8; TEST_EVIDENCE_RECORD_BYTES],
-) -> Result<(), SerialError> {
-    let _guard = OutputGuard::acquire().ok_or(SerialError::Busy)?;
-    let mut serial = Com1::new(X86PortIo);
-    write_bounded_test_evidence_record(&mut serial, record)
-}
-
 /// Exclusive test-only COM1 transaction used to keep DWEVID1 evidence and its
 /// following DWTEST1 terminal record indivisible against competing reporters.
 #[cfg(all(

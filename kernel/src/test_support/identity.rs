@@ -127,6 +127,7 @@ impl BuildGuestTest {
                 | Self::PrimordialBlockingCleanup
                 | Self::PrimordialUserException
                 | Self::PrimordialInvalidReturn
+                | Self::SmpRuntimeAcceptance
         )
     }
 
@@ -142,9 +143,6 @@ impl BuildGuestTest {
         )
     }
 
-    pub(crate) const fn is_i1_evidence(self) -> bool {
-        matches!(self, Self::SmpRuntimeAcceptance)
-    }
 }
 
 /// Canonical selector embedded into this test kernel for provenance.
