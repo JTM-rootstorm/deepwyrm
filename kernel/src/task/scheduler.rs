@@ -86,6 +86,16 @@ pub(crate) struct BlockWakeKey {
     execution_generation: u64,
 }
 
+impl BlockWakeKey {
+    pub(crate) const fn thread(self) -> ThreadKey {
+        self.thread
+    }
+
+    pub(crate) const fn execution_generation(self) -> u64 {
+        self.execution_generation
+    }
+}
+
 #[must_use = "prepared block ownership must be committed only after wait/deadline registration or explicitly cancelled"]
 #[derive(Debug)]
 pub(crate) struct BlockReservation {
@@ -1021,6 +1031,90 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             previous: state.running[cpu_index].map(|claim| claim.thread),
             current: state.running[cpu_index].map(|claim| claim.thread),
         })
+    }
+
+    /// Removes one exact remote Running claim without selecting replacement
+    /// work. This is the scheduler half of an e1 stop safe point: the target
+    /// CPU has already prevented user return, and its CPU-private reaper path
+    /// must complete or abandon the retained continuation before any later
+    /// carrier work is admitted on that CPU.
+    pub(crate) fn stop_running_claim_on(
+        &self,
+        claim: SchedulerExecutionClaim,
+    ) -> Result<(), SchedulerError> {
+        let mut state = self.state.lock();
+        if claim.domain != state.domain {
+            return Err(SchedulerError::ForeignExecutionClaim);
+        }
+        if claim.generation == 0 {
+            return Err(SchedulerError::StaleExecutionClaim);
+        }
+        let cpu_index = claim.cpu.index();
+        let Some(running) = state.running[cpu_index] else {
+            return Err(SchedulerError::StaleExecutionClaim);
+        };
+        if running.thread != claim.thread || running.generation != claim.generation {
+            return Err(SchedulerError::StaleExecutionClaim);
+        }
+        if state.suspended[cpu_index].is_some() {
+            return Err(SchedulerError::SwitchPending);
+        }
+        if state.pending_block[cpu_index].is_some_and(|pending| pending.thread == claim.thread) {
+            state.pending_block[cpu_index] = None;
+        }
+        state.running[cpu_index] = None;
+        state.suspended[cpu_index] = Some(SuspendedContinuation {
+            thread: claim.thread,
+            generation: claim.generation,
+            publication: SuspendedPublication::Retired,
+        });
+        debug_assert_eq!(state.check_invariants(), Ok(()));
+        Ok(())
+    }
+
+    /// Retires the exact blocked continuation that is still physically active
+    /// on `claim.cpu`. This is the e1 delivery-after-block case: the logical
+    /// Running claim was already exchanged for a generation-bound suspended
+    /// continuation, so treating it as a fresh Running claim would either
+    /// stop the wrong generation or panic before the safe-point ACK.
+    pub(crate) fn stop_suspended_claim_on(
+        &self,
+        claim: SchedulerExecutionClaim,
+    ) -> Result<(), SchedulerError> {
+        let mut state = self.state.lock();
+        if claim.domain != state.domain || claim.generation == 0 {
+            return Err(SchedulerError::StaleExecutionClaim);
+        }
+        let cpu_index = claim.cpu.index();
+        let Some(suspended) = state.suspended[cpu_index] else {
+            return Err(SchedulerError::StaleExecutionClaim);
+        };
+        if suspended.thread != claim.thread
+            || suspended.generation != claim.generation
+            || suspended.publication != SuspendedPublication::Queued
+        {
+            return Err(SchedulerError::StaleExecutionClaim);
+        }
+        let Some(index) = state.queue[..state.len]
+            .iter()
+            .position(|entry| entry.is_some_and(|entry| entry.thread == claim.thread))
+        else {
+            return Err(SchedulerError::NotScheduled);
+        };
+        let entry = state.queue[index].expect("queued suspended continuation disappeared");
+        if entry.continuation_cpu != Some(claim.cpu)
+            || entry.continuation_generation != claim.generation
+        {
+            return Err(SchedulerError::StaleExecutionClaim);
+        }
+        state.remove_index(index);
+        state.suspended[cpu_index] = Some(SuspendedContinuation {
+            thread: claim.thread,
+            generation: claim.generation,
+            publication: SuspendedPublication::Retired,
+        });
+        debug_assert_eq!(state.check_invariants(), Ok(()));
+        Ok(())
     }
 
     pub(crate) fn state(&self, thread: ThreadKey) -> Option<SchedulerThreadState> {

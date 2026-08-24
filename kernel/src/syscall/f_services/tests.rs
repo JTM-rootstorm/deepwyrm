@@ -399,8 +399,12 @@ impl Fixture {
     }
 
     fn dispatch(&mut self, request: NativeSyscallRequest) -> FServiceDispatch<OBJECTS> {
-        self.services.dispatch(
-            request,
+        let prepared = self
+            .services
+            .prepare_dispatch(request, self.thread, 1)
+            .unwrap();
+        self.services.dispatch_prepared(
+            prepared,
             &mut self.user,
             &mut self.registry,
             &mut self.tasks,
@@ -413,6 +417,7 @@ impl Fixture {
             &mut self.spaces,
             self.process,
             self.thread,
+            1,
             Some(&mut self.wait_deadlines),
             &mut self.timer_deadlines,
             &mut self.staging,
@@ -1234,4 +1239,24 @@ fn terminal_generic_and_atomic_cleanup_leave_the_service_quiescent() {
         atomic.execution.scheduler_state(atomic.thread),
         Some(SchedulerThreadState::Blocked)
     );
+}
+
+#[test]
+fn prepared_dispatch_rejects_root_drift_before_usercopy_or_authority_borrow() {
+    let fixture = Fixture::new();
+    let prepared = fixture
+        .services
+        .prepare_dispatch(
+            NativeSyscallRequest::ClockGet {
+                clock_id: deepwyrm_abi::DW_CLOCK_BOOTTIME,
+                out_nanoseconds: DwUserAddress(BASE),
+            },
+            fixture.thread,
+            7,
+        )
+        .unwrap();
+    assert!(matches!(
+        prepared.begin(fixture.thread, 8),
+        Err(FServiceDispatchPhaseError::IdentityDrift)
+    ));
 }

@@ -24,8 +24,8 @@ use deepwyrm_abi::{
     DW_STATUS_WRONG_OBJECT_TYPE, DW_TASK_STATE_EXITED, DW_TERMINATION_AUTHORIZED,
     DW_WAIT_MANY_MAX_ITEMS, DW_WAIT_MODE_ALL, DW_WAIT_MODE_ANY, DW_WAIT_RESULT_V1_SIZE,
     DwChannelReceiveResultV1, DwClockId, DwDeadline, DwHandle, DwHandleTransferV1,
-    DwProcessCreateResultV1, DwReceivedHandleInfoV1, DwRights, DwSignals, DwStatus,
-    DwTerminationReason, DwUserAddress, DwWaitItemV1, DwWaitResultV1,
+    DwProcessCreateArgsV1, DwProcessCreateResultV1, DwReceivedHandleInfoV1, DwRights, DwSignals,
+    DwStatus, DwTerminationReason, DwUserAddress, DwWaitItemV1, DwWaitResultV1,
 };
 
 use crate::handle::{
@@ -126,6 +126,10 @@ impl<const CAPACITY: usize> CleanupQueue<CAPACITY> {
         if let Some(release) = release {
             self.push(release);
         }
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     pub(crate) fn into_releases(self) -> [Option<FinalRelease>; CAPACITY] {
@@ -1137,6 +1141,56 @@ fn cancel_prepared_root_and_process<
     cancel_prepared_process(process, registry, tasks, cleanup);
 }
 
+#[must_use = "prepared process-create user input owns its output reservation"]
+struct PreparedProcessCreate<OUTPUT> {
+    args: DwProcessCreateArgsV1,
+    output: OUTPUT,
+}
+
+/// Copies and validates all caller-controlled process-create input before any
+/// stationary authority is reserved. The returned output reservation is owned
+/// rather than borrowed, so the later publication phase never retains a
+/// usercopy guard or pointer.
+fn prepare_process_create_input<U: UserPageAccess + OwnedUserOutputAccess>(
+    user: &mut U,
+    args_address: DwUserAddress,
+    args_size: u64,
+    out_result: DwUserAddress,
+    result_size: u64,
+) -> Result<PreparedProcessCreate<U::OwnedOutput>, DwStatus> {
+    if args_size != u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE)
+        || result_size != u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE)
+    {
+        return Err(DW_STATUS_INVALID_ARGUMENT);
+    }
+    let bytes = copy_input::<U, PROCESS_CREATE_ARGS_BYTES>(user, args_address, 8)?;
+    let args = decode_process_create_args(&bytes);
+    if args.size != DW_PROCESS_CREATE_ARGS_V1_SIZE
+        || args.version != 1
+        || args.flags != 0
+        || args.reserved != [0; 4]
+    {
+        return Err(DW_STATUS_INVALID_ARGUMENT);
+    }
+    for (object_type, rights) in [
+        (DW_OBJECT_TYPE_PROCESS, args.process_rights),
+        (DW_OBJECT_TYPE_ADDRESS_REGION, args.root_region_rights),
+        (DW_OBJECT_TYPE_CHANNEL, args.child_bootstrap_rights),
+    ] {
+        validate_created_handle_rights(object_type, rights)?;
+    }
+    let output_range = user_range(
+        out_result,
+        DW_PROCESS_CREATE_RESULT_V1_SIZE as usize,
+        8,
+        UserAccess::WRITE,
+    )?;
+    let output = user
+        .preflight_owned_output(output_range)
+        .map_err(|_| DW_STATUS_BAD_ADDRESS)?;
+    Ok(PreparedProcessCreate { args, output })
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the F10 observation barrier keeps independently-owned usercopy, object, task, HandleTable, and address-space authorities explicit"
@@ -1175,44 +1229,15 @@ fn process_create_transaction<
     mut rollback_root: B,
     mut inject: I,
 ) -> DwStatus {
-    if args_size != u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE)
-        || result_size != u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE)
-    {
-        return DW_STATUS_INVALID_ARGUMENT;
-    }
-    let bytes = match copy_input::<U, PROCESS_CREATE_ARGS_BYTES>(user, args_address, 8) {
-        Ok(bytes) => bytes,
-        Err(status) => return status,
-    };
-    let args = decode_process_create_args(&bytes);
-    if args.size != DW_PROCESS_CREATE_ARGS_V1_SIZE
-        || args.version != 1
-        || args.flags != 0
-        || args.reserved != [0; 4]
-    {
-        return DW_STATUS_INVALID_ARGUMENT;
-    }
-    for (object_type, rights) in [
-        (DW_OBJECT_TYPE_PROCESS, args.process_rights),
-        (DW_OBJECT_TYPE_ADDRESS_REGION, args.root_region_rights),
-        (DW_OBJECT_TYPE_CHANNEL, args.child_bootstrap_rights),
-    ] {
-        if let Err(status) = validate_created_handle_rights(object_type, rights) {
-            return status;
-        }
-    }
-    let output_range = match user_range(
+    let PreparedProcessCreate { args, output } = match prepare_process_create_input(
+        user,
+        args_address,
+        args_size,
         out_result,
-        DW_PROCESS_CREATE_RESULT_V1_SIZE as usize,
-        8,
-        UserAccess::WRITE,
+        result_size,
     ) {
-        Ok(range) => range,
+        Ok(prepared) => prepared,
         Err(status) => return status,
-    };
-    let output = match user.preflight_owned_output(output_range) {
-        Ok(output) => output,
-        Err(_) => return DW_STATUS_BAD_ADDRESS,
     };
 
     macro_rules! discard_and_return {
@@ -2112,7 +2137,11 @@ pub(crate) fn channel_receive<
     DW_STATUS_SUCCESS
 }
 
-fn complete_wait_wakes<const OBJECTS: usize, const WAITERS: usize, const EXECUTION: usize>(
+pub(crate) fn complete_wait_wakes<
+    const OBJECTS: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
     registry: &mut ObjectRegistry<OBJECTS>,
     execution: &ExecutionDomain<EXECUTION>,
     wakes: WakeBatch<WAITERS>,
@@ -2298,6 +2327,24 @@ impl NativeWaitControl {
 
     pub(crate) const fn is_clear(&self) -> bool {
         matches!(self.state, NativeWaitControlState::Clear)
+    }
+
+    /// Consumes only the exact idle control handoff retained by a physical
+    /// blocked continuation that an e1 safe point is about to retire.
+    pub(crate) fn retire_idle_for_stop(
+        &mut self,
+        thread: ThreadKey,
+        execution_generation: u64,
+    ) -> Result<(), WaitSuspendError> {
+        let NativeWaitControlState::Idle(state) = self.state else {
+            return Err(WaitSuspendError::InvalidDecision);
+        };
+        let wake = state.wake_key();
+        if wake.thread() != thread || wake.execution_generation() != execution_generation {
+            return Err(WaitSuspendError::InvalidDecision);
+        }
+        self.state = NativeWaitControlState::Clear;
+        Ok(())
     }
 }
 
@@ -4449,6 +4496,44 @@ pub(crate) struct AddressRegionMutationTarget {
     pub(crate) region_key: crate::memory::address_region::RegionKey,
 }
 
+/// Move-only preparation for a delegated address-region mutation.
+///
+/// Handle lookup and root selection are intentionally separated from the
+/// later publisher work.  The commit adapter revalidates this exact target
+/// before it touches a live address-space transaction, so a guard-free
+/// usercopy/paging interval cannot silently retarget a mutation.
+#[must_use = "prepared address-region authority must be committed or aborted"]
+pub(crate) struct PreparedAddressRegionMutation {
+    target: AddressRegionMutationTarget,
+}
+
+impl PreparedAddressRegionMutation {
+    pub(crate) fn target(&self) -> AddressRegionMutationTarget {
+        self.target
+    }
+
+    fn revalidate<const REGION_OBJECTS: usize, const REGION_SLOTS: usize>(
+        &self,
+        regions: &AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
+    ) -> Result<(), DwStatus> {
+        let process = regions
+            .region_process(self.target.region)
+            .map_err(address_region_object_status)?;
+        let region = regions
+            .region(self.target.region)
+            .map_err(address_region_object_status)?;
+        if process != self.target.process
+            || region.address_space_key() != self.target.address_space
+            || region.region_key() != self.target.region_key
+        {
+            return Err(DW_STATUS_BAD_STATE);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn abort(self) {}
+}
+
 /// Resolves delegated handle authority while preserving the target Process
 /// whose operation gate and architecture root own the actual mutation.
 pub(crate) fn address_region_mutation_target<
@@ -4494,6 +4579,36 @@ pub(crate) fn address_region_mutation_target<
     })();
     release_lookup_pin(registry, resolved.into_internal(), cleanup);
     target
+}
+
+/// Short authority phase for delegated mapping or unmapping.
+pub(crate) fn prepare_address_region_mutation<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const REGION_OBJECTS: usize,
+    const REGION_SLOTS: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    regions: &AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
+    current_process: ProcessKey,
+    address_region: DwHandle,
+    required_rights: DwRights,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> Result<PreparedAddressRegionMutation, DwStatus> {
+    address_region_mutation_target(
+        registry,
+        tasks,
+        regions,
+        current_process,
+        address_region,
+        required_rights,
+        cleanup,
+    )
+    .map(|target| PreparedAddressRegionMutation { target })
 }
 
 pub(crate) fn process_handle_target<
@@ -4797,6 +4912,53 @@ where
         }
     }
 }
+
+/// Commit a previously prepared map after guard-free usercopy/root work.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn address_region_map_prepared_model<
+    P: crate::memory::address_region::AddressSpacePublisher,
+    const OBJECTS: usize,
+    const MEMORY_OBJECTS: usize,
+    const LEASES: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const REGION_OBJECTS: usize,
+    const REGION_SLOTS: usize,
+>(
+    prepared: PreparedAddressRegionMutation,
+    publisher: &mut P,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    memory: &mut MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    regions: &mut AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
+    current_process: ProcessKey,
+    address_region: DwHandle,
+    memory_object: DwHandle,
+    args: deepwyrm_abi::DwAddressRegionMapArgsV1,
+    protection: crate::memory::address_region::Protection,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> Result<u64, DwStatus>
+where
+    P::Error: AddressSpacePublishStatus,
+{
+    prepared.revalidate(regions)?;
+    address_region_map_model(
+        publisher,
+        registry,
+        memory,
+        tasks,
+        regions,
+        current_process,
+        address_region,
+        memory_object,
+        args,
+        protection,
+        cleanup,
+    )
+}
+
 pub(crate) fn address_region_unmap<
     P: crate::memory::address_region::AddressSpacePublisher,
     const OBJECTS: usize,
@@ -4881,6 +5043,52 @@ where
             address_transaction_status(&error)
         }
     }
+}
+
+/// Commit a previously prepared unmap after guard-free root selection.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn address_region_unmap_prepared<
+    P: crate::memory::address_region::AddressSpacePublisher,
+    const OBJECTS: usize,
+    const MEMORY_OBJECTS: usize,
+    const LEASES: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const REGION_OBJECTS: usize,
+    const REGION_SLOTS: usize,
+>(
+    prepared: PreparedAddressRegionMutation,
+    publisher: &mut P,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    memory: &mut MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    regions: &mut AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
+    current_process: ProcessKey,
+    address_region: DwHandle,
+    address: DwUserAddress,
+    byte_len: u64,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus
+where
+    P::Error: AddressSpacePublishStatus,
+{
+    if let Err(status) = prepared.revalidate(regions) {
+        return status;
+    }
+    address_region_unmap(
+        publisher,
+        registry,
+        memory,
+        tasks,
+        regions,
+        current_process,
+        address_region,
+        address,
+        byte_len,
+        cleanup,
+    )
 }
 pub(crate) fn address_region_protect<
     P: crate::memory::address_region::AddressSpacePublisher,

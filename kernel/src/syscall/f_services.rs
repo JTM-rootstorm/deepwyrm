@@ -92,6 +92,56 @@ pub(crate) struct FServiceDispatch<const OBJECTS: usize> {
     cleanup: CleanupQueue<OBJECTS>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FServiceDispatchPhaseError {
+    ZeroRootGeneration,
+    IdentityDrift,
+}
+
+/// Owned identity reservation for one F-service adapter dispatch.
+///
+/// It holds no user pointer, stationary authority borrow, usercopy pin, or
+/// scheduler/wait guard. `begin` validates the short prepare phase before the
+/// adapter work begins. The enclosing native runtime phase owns the only
+/// post-dispatch live identity revalidation; this object must not pretend
+/// that copied function arguments are a fresh carrier observation.
+#[must_use = "an F-service dispatch must be committed or explicitly aborted"]
+pub(crate) struct PreparedFServiceDispatch {
+    request: NativeSyscallRequest,
+    thread: ThreadKey,
+    root_generation: u64,
+}
+
+impl PreparedFServiceDispatch {
+    pub(crate) fn new(
+        request: NativeSyscallRequest,
+        thread: ThreadKey,
+        root_generation: u64,
+    ) -> Result<Self, FServiceDispatchPhaseError> {
+        if root_generation == 0 {
+            return Err(FServiceDispatchPhaseError::ZeroRootGeneration);
+        }
+        Ok(Self {
+            request,
+            thread,
+            root_generation,
+        })
+    }
+
+    fn begin(
+        self,
+        thread: ThreadKey,
+        root_generation: u64,
+    ) -> Result<NativeSyscallRequest, FServiceDispatchPhaseError> {
+        if self.thread != thread || self.root_generation != root_generation {
+            return Err(FServiceDispatchPhaseError::IdentityDrift);
+        }
+        Ok(self.request)
+    }
+
+    pub(crate) fn abort(self) {}
+}
+
 impl<const OBJECTS: usize> FServiceDispatch<OBJECTS> {
     pub(crate) fn into_parts(self) -> (FServiceRoute, CleanupQueue<OBJECTS>) {
         (self.route, self.cleanup)
@@ -144,6 +194,17 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         }
     }
 
+    /// Captures only the exact current identity and decoded request before
+    /// releasing the short stationary prepare phase.
+    pub(crate) fn prepare_dispatch(
+        &self,
+        request: NativeSyscallRequest,
+        thread: ThreadKey,
+        root_generation: u64,
+    ) -> Result<PreparedFServiceDispatch, FServiceDispatchPhaseError> {
+        PreparedFServiceDispatch::new(request, thread, root_generation)
+    }
+
     /// Routes one decoded request through the public DW0-F service families.
     ///
     /// E/basic operations and scenario-owned exit/inspection remain explicit
@@ -153,7 +214,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         clippy::too_many_arguments,
         reason = "F service composition keeps every independently-owned authority explicit"
     )]
-    pub(crate) fn dispatch<
+    pub(crate) fn dispatch_prepared<
         U,
         CLOCK,
         const PAIRS: usize,
@@ -171,7 +232,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         const REGIONS: usize,
     >(
         &mut self,
-        request: NativeSyscallRequest,
+        prepared: PreparedFServiceDispatch,
         user: &mut U,
         registry: &mut ObjectRegistry<OBJECTS>,
         tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
@@ -184,6 +245,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         spaces: &mut AddressSpaceAuthority<SPACES, REGIONS>,
         current_process: ProcessKey,
         current_thread: ThreadKey,
+        current_root_generation: u64,
         wait_deadlines: Option<&mut dyn WaitDeadlineAuthority>,
         timer_deadlines: &mut dyn TimerDeadlineAuthority,
         channel_staging: &mut [u8],
@@ -193,6 +255,9 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         U: FAtomicUserAccess<AtomicPin = AtomicPin, OwnedOutput = OUTPUT>,
         CLOCK: FnMut() -> Result<u64, DwStatus>,
     {
+        let request = prepared
+            .begin(current_thread, current_root_generation)
+            .unwrap_or_else(|_| panic!("F-service dispatch identity drifted before adapter work"));
         let route = match request {
             NativeSyscallRequest::ProcessCreate {
                 args,
@@ -667,6 +732,17 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
             && self.atomic_waits.is_empty()
             && self.atomic_operations.is_empty()
             && self.control.is_clear()
+    }
+
+    /// Clears the ephemeral idle handoff only when it names the exact blocked
+    /// generation being retired by the e1 safe point.
+    pub(crate) fn retire_idle_control_for_stop(
+        &mut self,
+        thread: ThreadKey,
+        execution_generation: u64,
+    ) -> Result<(), WaitSuspendError> {
+        self.control
+            .retire_idle_for_stop(thread, execution_generation)
     }
 
     #[allow(

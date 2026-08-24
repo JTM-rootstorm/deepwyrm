@@ -87,6 +87,128 @@ fn h2_h3_ipi_entry_source_preserves_every_gpr_and_conditionally_normalizes_gs() 
 }
 
 #[test]
+fn i1_cpl3_rendezvous_gate_diverges_before_iret() {
+    let assembly = source("src/arch/x86_64/ipi_entry.S");
+    assert!(assembly.contains("dw_x86_64_rendezvous_pre_iret_gate"));
+    assert!(assembly.contains("dw_x86_64_rendezvous_reaper_handoff"));
+    let post_dispatch = assembly
+        .split_once("movq %r12, %rsp\n    .ifnb \\pre_iret")
+        .expect("CPL3 IPI post-dispatch seam")
+        .1;
+    let cpl3 = post_dispatch
+        .split_once(".L\\local_prefix\\()_kernel_origin:")
+        .expect("CPL3 IPI seam end")
+        .0;
+    let gate = post_dispatch
+        .find("callq \\pre_iret")
+        .expect("CPL3 rendezvous pre-IRET gate");
+    let return_swapgs = post_dispatch[gate..]
+        .find("swapgs")
+        .map(|offset| gate + offset)
+        .expect("CPL3 GS restore after rendezvous gate");
+    let restore = post_dispatch[gate..]
+        .find(".L\\local_prefix\\()_restore:")
+        .map(|offset| gate + offset)
+        .expect("CPL3 register restore after rendezvous gate");
+    assert!(
+        cpl3.contains("callq \\pre_iret")
+            && gate < return_swapgs
+            && gate < restore
+            && post_dispatch[restore..].contains("iretq"),
+        "the rendezvous gate must run after EOI/latch dispatch and before GS restore, GPR pops, and IRET"
+    );
+    let live = source("src/arch/x86_64/syscall/live.rs");
+    assert!(live.contains("rendezvous_gate_handler"));
+    assert!(live.contains("rendezvous_reaper_handler"));
+    assert!(live.contains("RENDEZVOUS_ACTION_READY"));
+    assert!(live.contains("dw_x86_64_rendezvous_pre_iret_gate"));
+    assert!(live.contains("dw_x86_64_rendezvous_reaper"));
+    assert!(live.contains("NativeUsercopyWindow::enter_current"));
+    assert!(live.contains("drop(usercopy_window)"));
+    assert!(live.contains("handoff_to_rendezvous_reaper(context)"));
+    assert!(live.contains("current_native_usercopy_is_quiescent"));
+    assert!(live.contains("current_cpu_is_on_terminal_reaper_stack"));
+
+    let dispatch = live
+        .split_once("unsafe fn native_runtime_trampoline")
+        .expect("native dispatch trampoline")
+        .1
+        .split_once("match control")
+        .expect("native dispatch control handoff")
+        .0;
+    assert!(
+        dispatch
+            .find("drop(usercopy_window)")
+            .expect("native usercopy window closes")
+            < dispatch
+                .find("service_current_rendezvous_latch")
+                .expect("post-dispatch e1 gate"),
+        "a Stop cannot be consumed while a native usercopy-capable dispatch window remains active"
+    );
+
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    for evidence in [
+        "impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>\n    crate::arch::x86_64::rendezvous::RemoteStopSafePoint",
+        "identity.cpu_online_generation() != snapshot.online_generation",
+        "current_cpu_index_for_diagnostics()\n            != Some(self.cpu.index())",
+        "identity.execution_generation() != claim.generation()",
+        "identity.root_binding_generation() != root.binding_generation()",
+        "let scheduler_current_matches =",
+        "let suspended_carrier_matches =",
+        "self.local.physically_executes(self.thread)",
+        "self.active.enter_kernel_execution_root(previous)",
+        "stop_running_claim_on(claim)",
+        "complete_current_rendezvous_stop(request, self)",
+        "continue_after_rendezvous_stop()",
+        "terminal_reaper_next_on(self.cpu)",
+        "idle_after_rendezvous_stop",
+    ] {
+        assert!(
+            primordial.contains(evidence),
+            "I1 live stop seam omitted `{evidence}`"
+        );
+    }
+    let precommit = primordial
+        .split_once("fn precommit_exact_stop(")
+        .expect("carrier stop precommit")
+        .1
+        .split_once("fn release_root_residency")
+        .expect("carrier stop precommit end")
+        .0;
+    let reaper_observation = precommit
+        .find("self.rendezvous_reaper.as_ref().is_none()")
+        .expect("borrowed reaper observation");
+    let current_root = precommit
+        .find("validate_current_process_root_selection")
+        .expect("observed current process CR3 validation");
+    let witness = precommit
+        .find("let witness = precommit.verify")
+        .expect("exact safe witness");
+    let reaper_take = precommit
+        .find(".rendezvous_reaper\n            .take()")
+        .expect("irreversible reaper witness consumption");
+    assert!(
+        reaper_observation < current_root && current_root < witness && witness < reaper_take,
+        "all rejectable identity/current-CR3 checks must preserve the reaper witness before commit"
+    );
+    let rendezvous = source("src/arch/x86_64/rendezvous.rs");
+    let completion = rendezvous
+        .split_once("pub(crate) fn complete_stop_at_safe_point")
+        .expect("stop acknowledgement")
+        .1
+        .split_once("/// Consumes a precommit witness")
+        .expect("stop acknowledgement end")
+        .0;
+    assert!(
+        completion.find("target.release_root_residency()")
+            < completion.find("target.release_running_ownership()")
+            && completion.find("target.release_running_ownership()")
+                < completion.find("self.acknowledge_committed_exact_safe(witness)"),
+        "the exact safe acknowledgement must follow root residency and Running release"
+    );
+}
+
+#[test]
 fn h2_h3_receive_seam_eois_before_capability_free_protocol_callbacks() {
     let ipi = source("src/arch/x86_64/ipi.rs");
     let dispatch = ipi
@@ -232,7 +354,7 @@ fn h4_idle_publication_brackets_rescan_and_uses_only_coalesced_e1_wake() {
         .split_once("pub(crate) fn notify_runnable_work(affinity: Option<CpuIndex>)")
         .expect("live runnable notifier")
         .1
-        .split_once("pub(crate) fn take_current_notification()")
+        .split_once("pub(crate) fn latch_current_rendezvous_ipi()")
         .expect("live runnable notifier extent")
         .0;
     assert_eq!(live_notify.matches("fail_transport_and_halt()").count(), 4);
@@ -247,7 +369,7 @@ fn h4_idle_publication_brackets_rescan_and_uses_only_coalesced_e1_wake() {
 
     let live_syscall = source("src/arch/x86_64/syscall/live.rs");
     let suspension = live_syscall
-        .split_once("crate::syscall::native::NativeSuspendPlan::IdleCurrent => loop")
+        .split_once("crate::syscall::native::NativeSuspendPlan::IdleCurrent => {")
         .expect("native idle-suspend loop")
         .1
         .split_once("let generation = current_binding_generation()")
@@ -261,6 +383,9 @@ fn h4_idle_publication_brackets_rescan_and_uses_only_coalesced_e1_wake() {
     assert!(prepare < poll && poll < commit && commit < halt && halt < finish);
     assert_eq!(suspension.matches("cancel_current_idle(idle)").count(), 2);
     assert!(suspension.contains("SYSCALL FMASK keeps IF clear"));
+    assert!(suspension.contains("service_current_rendezvous_latch()"));
+    assert!(suspension.contains("MailboxNotification::Stop(request)"));
+    assert!(suspension.contains("handoff_to_rendezvous_reaper(context)"));
 
     let wait = live_syscall
         .split_once("fn wait_for_suspend_interrupt()")
@@ -298,6 +423,31 @@ fn h4_idle_publication_brackets_rescan_and_uses_only_coalesced_e1_wake() {
     let scheduler = source("src/task/scheduler.rs");
     assert!(scheduler.contains("let affinity = entry.continuation_cpu;"));
     assert!(scheduler.contains("complete_switch_on_with_runnable_publication"));
+}
+
+#[test]
+fn i1_e1_irq_callback_latches_only_and_defers_mailbox_work_to_safe_point() {
+    let time = source("src/time/live.rs");
+    let handler = time
+        .split_once("fn live_rendezvous_handler()")
+        .expect("live e1 callback")
+        .1
+        .split_once("pub(crate) fn service_current_rendezvous_latch")
+        .expect("live e1 callback extent")
+        .0;
+    assert!(handler.contains("latch_current_rendezvous_ipi()"));
+    assert!(!handler.contains("take_current_notification"));
+    assert!(!handler.contains("service_bsp_timer_request"));
+
+    let idle = source("src/arch/x86_64/idle.rs");
+    assert!(idle.contains("struct IdleWakeSet"));
+    assert!(idle.contains("ipi_latches: RendezvousIpiLatches"));
+    assert!(idle.contains("take_current_latched_notification"));
+    assert!(idle.contains("take_latched_notification(cpu)"));
+    assert!(
+        !idle.contains("take_current_notification"),
+        "live rendezvous notifications may be consumed only through a carrier-owned post-EOI latch"
+    );
 }
 
 #[test]

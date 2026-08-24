@@ -2231,6 +2231,23 @@ fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
     assert_eq!(target.address_space, child_address_space);
     assert_eq!(target.region, child_region);
 
+    let prepared = prepare_address_region_mutation(
+        &mut registry,
+        &tasks,
+        &regions,
+        caller,
+        child_region_handle,
+        DwRights(DW_RIGHT_MAP.0 | DW_RIGHT_MODIFY.0),
+        &mut cleanup,
+    )
+    .unwrap();
+    assert_eq!(prepared.target(), target);
+    // The prepare phase owns no long-lived lookup pin or mutable authority;
+    // it can cross the guard-free usercopy/root-selection interval and must
+    // still name the exact region at commit time.
+    assert_eq!(prepared.revalidate(&regions), Ok(()));
+    prepared.abort();
+
     assert_eq!(
         address_region_map(
             &mut user,

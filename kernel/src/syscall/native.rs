@@ -803,6 +803,20 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
     fn resume_suspended(&mut self, frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame);
 }
 
+/// Private carrier seam for a CPL3-origin e1 return gate.
+///
+/// The hard IRQ itself only latches work.  If the pre-IRET gate observes an
+/// exact Stop/HoldSafe notification, it pivots to the CPU-private rendezvous
+/// reaper and calls this divergent method with the staged request; it may not
+/// return to the interrupted user context.
+pub(crate) trait NativeRendezvousRuntime {
+    fn rendezvous_stop(
+        &mut self,
+        request: crate::arch::x86_64::rendezvous::StopRequest,
+        reaper: crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry,
+    ) -> !;
+}
+
 pub(crate) fn dispatch_frame<R: NativeSyscallFrameRuntime>(
     runtime: &mut R,
     frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,

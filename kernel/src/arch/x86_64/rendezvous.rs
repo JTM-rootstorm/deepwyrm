@@ -10,7 +10,12 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use crate::cpu::{CPU_CAPACITY, CpuIndex};
 use crate::sync::IrqSpinMutex;
-use crate::task::{SchedulerExecutionClaim, ThreadKey};
+#[cfg(any(
+    test,
+    all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")
+))]
+use crate::task::SchedulerExecutionClaim;
+use crate::task::ThreadKey;
 
 pub(crate) const RENDEZVOUS_CPU_CAPACITY: usize = CPU_CAPACITY;
 
@@ -18,6 +23,42 @@ const MAILBOX_IDLE: u8 = 0;
 const MAILBOX_TRANSITION: u8 = 1;
 const MAILBOX_STOP_REQUESTED: u8 = 2;
 const MAILBOX_STOP_SAFE: u8 = 3;
+
+/// IRQ-side handoff for fixed e1 delivery.
+///
+/// The interrupt callback is intentionally unable to inspect a mailbox or
+/// scheduler state.  It records only that its CPU must revisit its mailbox at
+/// a carrier-owned safe point after EOI.  Coalescing is sufficient: a stop
+/// request remains generation-bound in the mailbox until exact acknowledgement
+/// and a wake merely requires one scheduler rescan.
+pub(crate) struct RendezvousIpiLatches {
+    pending: [AtomicBool; RENDEZVOUS_CPU_CAPACITY],
+}
+
+impl RendezvousIpiLatches {
+    pub(crate) const fn new() -> Self {
+        Self {
+            pending: [const { AtomicBool::new(false) }; RENDEZVOUS_CPU_CAPACITY],
+        }
+    }
+
+    /// Release-publishes one bounded post-EOI rescan/stop check.
+    pub(crate) fn latch(&self, cpu: CpuIndex) {
+        self.pending[cpu.index()].store(true, Ordering::Release);
+    }
+
+    /// Acquires and clears the current CPU's coalesced handoff bit.
+    pub(crate) fn take(&self, cpu: CpuIndex) -> bool {
+        self.pending[cpu.index()].swap(false, Ordering::AcqRel)
+    }
+
+    /// Acquires whether a carrier-safe rescan is already required without
+    /// consuming it. Idle uses this immediately before publishing `Halted` so
+    /// an EOI-completed interrupt cannot be slept through.
+    pub(crate) fn is_pending(&self, cpu: CpuIndex) -> bool {
+        self.pending[cpu.index()].load(Ordering::Acquire)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StopIdentityError {
@@ -42,17 +83,13 @@ pub(crate) struct StopIdentity {
 }
 
 impl StopIdentity {
-    pub(crate) const fn new(
-        target_cpu: usize,
+    const fn from_parts(
+        target_cpu: CpuIndex,
         cpu_online_generation: u64,
         thread: ThreadKey,
         execution_generation: u64,
         root_binding_generation: u64,
     ) -> Result<Self, StopIdentityError> {
-        let target_cpu = match CpuIndex::new(target_cpu) {
-            Some(cpu) => cpu,
-            None => return Err(StopIdentityError::InvalidCpu),
-        };
         if cpu_online_generation == 0 {
             return Err(StopIdentityError::ZeroOnlineGeneration);
         }
@@ -69,6 +106,27 @@ impl StopIdentity {
             execution_generation,
             root_binding_generation,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn new(
+        target_cpu: usize,
+        cpu_online_generation: u64,
+        thread: ThreadKey,
+        execution_generation: u64,
+        root_binding_generation: u64,
+    ) -> Result<Self, StopIdentityError> {
+        let target_cpu = match CpuIndex::new(target_cpu) {
+            Some(cpu) => cpu,
+            None => return Err(StopIdentityError::InvalidCpu),
+        };
+        Self::from_parts(
+            target_cpu,
+            cpu_online_generation,
+            thread,
+            execution_generation,
+            root_binding_generation,
+        )
     }
 
     pub(crate) const fn target_cpu(self) -> usize {
@@ -91,6 +149,7 @@ impl StopIdentity {
         self.root_binding_generation
     }
 
+    #[cfg(test)]
     pub(crate) const fn from_scheduler_claim(
         cpu_online_generation: u64,
         claim: SchedulerExecutionClaim,
@@ -102,6 +161,29 @@ impl StopIdentity {
             claim.thread(),
             claim.generation(),
             root_binding_generation,
+        )
+    }
+
+    /// The only production constructor: root epoch is read directly from the
+    /// retained active selection rather than supplied by the requester.
+    #[cfg(any(
+        test,
+        all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")
+    ))]
+    pub(crate) fn from_active_root(
+        cpu_online_generation: u64,
+        claim: SchedulerExecutionClaim,
+        active: &crate::arch::x86_64::mm::ActiveRootSelection,
+    ) -> Result<Self, StopIdentityError> {
+        if claim.cpu() != active.cpu() {
+            return Err(StopIdentityError::InvalidCpu);
+        }
+        Self::from_parts(
+            claim.cpu(),
+            cpu_online_generation,
+            claim.thread(),
+            claim.generation(),
+            active.binding_generation(),
         )
     }
 }
@@ -122,47 +204,111 @@ impl StopRequest {
     }
 }
 
-/// Observable conditions required before a remote CPU may acknowledge Safe.
+/// H0 facts observed by the architecture/carrier before it commits a stop.
 ///
-/// The live rendezvous handler must establish every condition while parked on
-/// its CPU-private entry stack.  Keeping these facts explicit prevents an IPI
-/// receipt alone from being confused with permission to reclaim execution
-/// resources.
+/// This is deliberately not the acknowledgement proof. It is an input to the
+/// private verifier below, which binds all observations to one exact request
+/// and returns a move-only witness. A carrier must obtain these facts on its
+/// CPU-private safe/reaper stack, after disabling user access and preventing
+/// any return to the stopped continuation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SafePointConditions {
-    pub(crate) parked_on_cpu_private_stack: bool,
-    pub(crate) scheduler_ownership_released: bool,
+pub(crate) struct SafePointPrecommitObservation {
+    pub(crate) identity: StopIdentity,
+    pub(crate) cpu_private_safe_stack: bool,
     pub(crate) user_access_disabled: bool,
-    pub(crate) deferred_cleanup_quiescent: bool,
+    pub(crate) user_return_prevented: bool,
 }
 
-impl SafePointConditions {
-    pub(crate) const EXACT_SAFE: Self = Self {
-        parked_on_cpu_private_stack: true,
-        scheduler_ownership_released: true,
-        user_access_disabled: true,
-        deferred_cleanup_quiescent: true,
-    };
+/// Move-only authorization to enter the irreversible stop commit phase.
+///
+/// Only `ExactSafePrecommit::verify` can mint this type. It is consumed by
+/// the final Release acknowledgement, so a carrier cannot accidentally reuse
+/// observations from another CPU, generation, or mailbox request.
+#[must_use = "an exact-safe precommit witness must be committed or fail-stop"]
+#[derive(Debug)]
+pub(crate) struct ExactSafeWitness {
+    request: StopRequest,
+}
 
-    const fn is_exact_safe(self) -> bool {
-        self.parked_on_cpu_private_stack
-            && self.scheduler_ownership_released
-            && self.user_access_disabled
-            && self.deferred_cleanup_quiescent
+/// Move-only evidence that the native e1 path has diverged onto the current
+/// CPU's terminal reaper stack after native dispatch released its usercopy
+/// window.  It is deliberately minted only by the target architecture seam;
+/// host models continue to exercise `SafePointPrecommitObservation` directly.
+#[must_use = "a native rendezvous reaper arrival must be consumed by the stop safe point"]
+pub(crate) struct NativeRendezvousReaperEntry {
+    _private: (),
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn verify_native_rendezvous_reaper_entry() -> Option<NativeRendezvousReaperEntry> {
+    (crate::arch::x86_64::syscall::current_cpu_is_on_terminal_reaper_stack()
+        && crate::arch::x86_64::syscall::current_native_usercopy_is_quiescent())
+    .then_some(NativeRendezvousReaperEntry { _private: () })
+}
+
+/// Private request-bound verifier supplied to a carrier precommit.
+#[derive(Debug)]
+pub(crate) struct ExactSafePrecommit {
+    request: StopRequest,
+}
+
+impl ExactSafePrecommit {
+    pub(crate) fn verify(
+        self,
+        observation: SafePointPrecommitObservation,
+    ) -> Result<ExactSafeWitness, RemoteStopError> {
+        if observation.identity != self.request.identity {
+            return Err(RemoteStopError::WrongIdentity);
+        }
+        if !observation.cpu_private_safe_stack
+            || !observation.user_access_disabled
+            || !observation.user_return_prevented
+        {
+            return Err(RemoteStopError::UnsafePrecommit);
+        }
+        Ok(ExactSafeWitness {
+            request: self.request,
+        })
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct StopObservation {
-    pub(crate) identity: StopIdentity,
-    pub(crate) conditions: SafePointConditions,
+/// CPU-owned, non-IRQ stop transition.
+///
+/// The implementation is reached only after the target CPU consumed a latched
+/// `StopRequest` at a carrier safe point. `precommit_exact_stop` is the entire
+/// recoverable phase: it must verify CPU/current Thread/execution/root
+/// generations, move to a CPU-private safe/reaper stack, disable user access,
+/// and prevent user return before minting `ExactSafeWitness`. Every later
+/// method is an infallible-by-construction commit step and must fail-stop on
+/// local architecture drift rather than publish a partial acknowledgement.
+pub(crate) trait RemoteStopSafePoint {
+    /// Verifies and establishes the complete precommit safe point for
+    /// `identity`, then mints the request-bound witness through `precommit`.
+    /// No recoverable work may remain after this returns `Ok`.
+    fn precommit_exact_stop(
+        &mut self,
+        identity: StopIdentity,
+        precommit: ExactSafePrecommit,
+    ) -> Result<ExactSafeWitness, RemoteStopError>;
+
+    /// Leaves the exact active root after its required local serialization.
+    fn release_root_residency(&mut self);
+
+    /// Removes the exact Running claim from the target CPU's scheduler slot.
+    /// This follows the Process-to-kernel-root switch, so no scheduler-visible
+    /// stopped execution retains user-root residency.
+    fn release_running_ownership(&mut self);
+
+    /// Confirms that no deferred cleanup still references the stopped carrier.
+    fn deferred_cleanup_is_quiescent(&self) -> bool;
 }
 
-/// Move-only proof that the currently published request was observed at Safe.
-#[must_use = "an exact-safe proof must be acknowledged or discarded without changing mailbox state"]
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct ExactSafeProof {
-    request: StopRequest,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RemoteStopError {
+    StaleRequest,
+    WrongIdentity,
+    UnsafePrecommit,
+    AlreadyAcknowledged,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -178,15 +324,6 @@ pub(crate) enum StopPublishError {
     WrongTargetCpu,
     Busy,
     GenerationExhausted,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SafeProofError {
-    NoStopRequested,
-    AlreadyAcknowledged,
-    WrongIdentity,
-    NotSafe,
-    StaleRequest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -406,39 +543,58 @@ impl RendezvousMailbox {
             .expect("published rendezvous state has a request")
     }
 
-    /// Validates the exact target tuple and every safe-point condition.
-    pub(crate) fn prove_exact_safe(
+    /// Commits a remote stop on the target CPU's safe/reaper context.
+    ///
+    /// No interrupt handler may call this. The exact identity, safe stack,
+    /// disabled user access, and prevented return are precommitted before the
+    /// irreversible order `switch to kernel root and leave Process residency -> remove Running ->
+    /// acknowledge`. The final acknowledgement is the
+    /// existing Release publication consumed by `complete_reclaim` with
+    /// Acquire, so a deferred Thread/root/stack resource cannot be reclaimed
+    /// before the target has completed all four conditions.
+    pub(crate) fn complete_stop_at_safe_point<T: RemoteStopSafePoint>(
         &self,
-        observation: StopObservation,
-    ) -> Result<ExactSafeProof, SafeProofError> {
+        request: StopRequest,
+        target: &mut T,
+    ) -> Result<(), RemoteStopError> {
         match self.state.load(Ordering::Acquire) {
-            MAILBOX_STOP_SAFE => return Err(SafeProofError::AlreadyAcknowledged),
+            MAILBOX_STOP_SAFE => return Err(RemoteStopError::AlreadyAcknowledged),
             MAILBOX_STOP_REQUESTED => {}
-            _ => return Err(SafeProofError::NoStopRequested),
+            _ => return Err(RemoteStopError::StaleRequest),
         }
-        let request = self.current_request();
-        if request.identity != observation.identity {
-            return Err(SafeProofError::WrongIdentity);
+        if self.current_request() != request {
+            return Err(RemoteStopError::StaleRequest);
         }
-        if !observation.conditions.is_exact_safe() {
-            return Err(SafeProofError::NotSafe);
-        }
-        Ok(ExactSafeProof { request })
+        let witness =
+            target.precommit_exact_stop(request.identity, ExactSafePrecommit { request })?;
+        target.release_root_residency();
+        target.release_running_ownership();
+        assert!(
+            target.deferred_cleanup_is_quiescent(),
+            "remote stop released execution ownership before deferred cleanup quiesced"
+        );
+
+        self.acknowledge_committed_exact_safe(witness);
+        Ok(())
     }
 
-    /// Release-publishes Safe only for the still-current exact request.
-    pub(crate) fn acknowledge_exact_safe(
-        &self,
-        proof: ExactSafeProof,
-    ) -> Result<(), SafeProofError> {
-        match self.state.load(Ordering::Acquire) {
-            MAILBOX_STOP_SAFE => return Err(SafeProofError::AlreadyAcknowledged),
-            MAILBOX_STOP_REQUESTED => {}
-            _ => return Err(SafeProofError::StaleRequest),
-        }
-        if self.current_request() != proof.request {
-            return Err(SafeProofError::StaleRequest);
-        }
+    /// Consumes a precommit witness after the irreversible carrier release.
+    ///
+    /// A return from this function means the exact Safe state was
+    /// Release-published. Any drift is a kernel invariant violation: returning
+    /// an ordinary error here would permit a partially released carrier to
+    /// resume with deferred resources still retained.
+    fn acknowledge_committed_exact_safe(&self, witness: ExactSafeWitness) {
+        let state = self.state.load(Ordering::Acquire);
+        assert_eq!(
+            state, MAILBOX_STOP_REQUESTED,
+            "committed remote stop mailbox state drifted before acknowledgement"
+        );
+        assert_eq!(
+            self.current_request(),
+            witness.request,
+            "committed remote stop request drifted before acknowledgement"
+        );
         self.state
             .compare_exchange(
                 MAILBOX_STOP_REQUESTED,
@@ -446,14 +602,9 @@ impl RendezvousMailbox {
                 Ordering::Release,
                 Ordering::Acquire,
             )
-            .map(|_| ())
-            .map_err(|state| {
-                if state == MAILBOX_STOP_SAFE {
-                    SafeProofError::AlreadyAcknowledged
-                } else {
-                    SafeProofError::StaleRequest
-                }
-            })
+            .unwrap_or_else(|state| {
+                panic!("committed remote stop acknowledgement state drifted: {state}")
+            });
     }
 
     /// Records a timeout or transport failure without consuming ownership.
@@ -551,13 +702,189 @@ mod tests {
     }
 
     fn acknowledge(mailbox: &RendezvousMailbox, identity: StopIdentity) {
-        let proof = mailbox
-            .prove_exact_safe(StopObservation {
-                identity,
-                conditions: SafePointConditions::EXACT_SAFE,
-            })
+        let request = match mailbox.take_notification() {
+            MailboxNotification::Stop(request) => request,
+            notification => panic!("expected stop request, got {notification:?}"),
+        };
+        let mut target = SafePointModel::new(identity);
+        mailbox
+            .complete_stop_at_safe_point(request, &mut target)
             .unwrap();
-        mailbox.acknowledge_exact_safe(proof).unwrap();
+    }
+
+    struct SafePointModel {
+        identity: StopIdentity,
+        cpu_private_safe_stack: bool,
+        user_access_disabled: bool,
+        user_return_prevented: bool,
+        running_released: bool,
+        residency_released: bool,
+        cleanup_quiescent: bool,
+    }
+
+    impl SafePointModel {
+        fn new(identity: StopIdentity) -> Self {
+            Self {
+                identity,
+                cpu_private_safe_stack: true,
+                user_access_disabled: true,
+                user_return_prevented: false,
+                running_released: false,
+                residency_released: false,
+                cleanup_quiescent: true,
+            }
+        }
+    }
+
+    impl RemoteStopSafePoint for SafePointModel {
+        fn precommit_exact_stop(
+            &mut self,
+            identity: StopIdentity,
+            precommit: ExactSafePrecommit,
+        ) -> Result<ExactSafeWitness, RemoteStopError> {
+            if self.identity != identity
+                || self.user_return_prevented
+                || self.running_released
+                || self.residency_released
+            {
+                return Err(RemoteStopError::WrongIdentity);
+            }
+            if !self.cpu_private_safe_stack || !self.user_access_disabled {
+                return Err(RemoteStopError::UnsafePrecommit);
+            }
+            assert!(!self.user_return_prevented);
+            self.user_return_prevented = true;
+            precommit.verify(SafePointPrecommitObservation {
+                identity: self.identity,
+                cpu_private_safe_stack: self.cpu_private_safe_stack,
+                user_access_disabled: self.user_access_disabled,
+                user_return_prevented: self.user_return_prevented,
+            })
+        }
+
+        fn release_running_ownership(&mut self) {
+            assert!(self.user_return_prevented);
+            assert!(self.residency_released);
+            assert!(!self.running_released);
+            self.running_released = true;
+        }
+
+        fn release_root_residency(&mut self) {
+            assert!(self.user_return_prevented);
+            assert!(!self.residency_released);
+            self.residency_released = true;
+        }
+
+        fn deferred_cleanup_is_quiescent(&self) -> bool {
+            self.residency_released && self.cleanup_quiescent
+        }
+    }
+
+    #[test]
+    fn safe_point_stop_orders_return_root_running_before_release_ack() {
+        let mut objects = ObjectRegistry::<8>::new();
+        let stop_identity = identity(thread_key(&mut objects));
+        let mailbox = RendezvousMailbox::new(stop_identity.target_cpu()).unwrap();
+        let deferred = mailbox.publish_stop(stop_identity, 0x55_u64).unwrap();
+        let request = match mailbox.take_notification() {
+            MailboxNotification::Stop(request) => request,
+            notification => panic!("expected stop request, got {notification:?}"),
+        };
+        let mut target = SafePointModel::new(stop_identity);
+        mailbox
+            .complete_stop_at_safe_point(request, &mut target)
+            .unwrap();
+        assert!(target.user_return_prevented);
+        assert!(target.running_released);
+        assert!(target.residency_released);
+        assert_eq!(mailbox.complete_reclaim(deferred).unwrap(), 0x55);
+    }
+
+    #[test]
+    fn safe_point_stop_requires_private_stack_and_disabled_user_access() {
+        let mut objects = ObjectRegistry::<8>::new();
+        let stop_identity = identity(thread_key(&mut objects));
+
+        for missing_stack in [true, false] {
+            let mailbox = RendezvousMailbox::new(stop_identity.target_cpu()).unwrap();
+            let deferred = mailbox.publish_stop(stop_identity, 0x73_u64).unwrap();
+            let request = match mailbox.take_notification() {
+                MailboxNotification::Stop(request) => request,
+                notification => panic!("expected stop request, got {notification:?}"),
+            };
+            let mut target = SafePointModel::new(stop_identity);
+            if missing_stack {
+                target.cpu_private_safe_stack = false;
+            } else {
+                target.user_access_disabled = false;
+            }
+            assert_eq!(
+                mailbox.complete_stop_at_safe_point(request, &mut target),
+                Err(RemoteStopError::UnsafePrecommit)
+            );
+            assert!(!target.running_released);
+            assert!(!target.residency_released);
+            let failure = mailbox.complete_reclaim(deferred).unwrap_err();
+            assert_eq!(failure.error(), ReclaimError::AwaitingAcknowledgement);
+            let deferred = failure.into_deferred();
+            core::mem::forget(deferred);
+        }
+    }
+
+    #[test]
+    fn postcommit_acknowledgement_drift_fails_stop() {
+        let mut objects = ObjectRegistry::<8>::new();
+        let stop_identity = identity(thread_key(&mut objects));
+        let mailbox = RendezvousMailbox::new(stop_identity.target_cpu()).unwrap();
+        let deferred = mailbox.publish_stop(stop_identity, 0x74_u64).unwrap();
+        let mismatched = StopRequest {
+            mailbox_generation: deferred.request().mailbox_generation() + 1,
+            identity: stop_identity,
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mailbox.acknowledge_committed_exact_safe(ExactSafeWitness {
+                request: mismatched,
+            });
+        }));
+        assert!(result.is_err());
+        let failure = mailbox.complete_reclaim(deferred).unwrap_err();
+        assert_eq!(failure.error(), ReclaimError::AwaitingAcknowledgement);
+        let deferred = failure.into_deferred();
+        core::mem::forget(deferred);
+    }
+
+    #[test]
+    fn safe_point_stop_rejects_wrong_duplicate_and_already_terminal_target() {
+        let mut objects = ObjectRegistry::<8>::new();
+        let stop_identity = identity(thread_key(&mut objects));
+        let mailbox = RendezvousMailbox::new(stop_identity.target_cpu()).unwrap();
+        let deferred = mailbox.publish_stop(stop_identity, 0x66_u64).unwrap();
+        let request = match mailbox.take_notification() {
+            MailboxNotification::Stop(request) => request,
+            notification => panic!("expected stop request, got {notification:?}"),
+        };
+        let wrong_identity = StopIdentity::new(
+            stop_identity.target_cpu(),
+            stop_identity.cpu_online_generation(),
+            thread_key(&mut objects),
+            stop_identity.execution_generation(),
+            stop_identity.root_binding_generation(),
+        )
+        .unwrap();
+        let mut wrong = SafePointModel::new(wrong_identity);
+        assert_eq!(
+            mailbox.complete_stop_at_safe_point(request, &mut wrong),
+            Err(RemoteStopError::WrongIdentity)
+        );
+        let mut target = SafePointModel::new(stop_identity);
+        mailbox
+            .complete_stop_at_safe_point(request, &mut target)
+            .unwrap();
+        assert_eq!(
+            mailbox.complete_stop_at_safe_point(request, &mut target),
+            Err(RemoteStopError::AlreadyAcknowledged)
+        );
+        assert_eq!(mailbox.complete_reclaim(deferred).unwrap(), 0x66);
     }
 
     #[test]
@@ -573,31 +900,15 @@ mod tests {
             MailboxNotification::Stop(deferred.request())
         );
 
-        let mut wrong = identity(thread);
-        wrong.cpu_online_generation += 1;
+        let wrong = identity(other_thread);
+        let request = match mailbox.take_notification() {
+            MailboxNotification::Stop(request) => request,
+            notification => panic!("expected stop request, got {notification:?}"),
+        };
+        let mut wrong_target = SafePointModel::new(wrong);
         assert_eq!(
-            mailbox.prove_exact_safe(StopObservation {
-                identity: wrong,
-                conditions: SafePointConditions::EXACT_SAFE,
-            }),
-            Err(SafeProofError::WrongIdentity)
-        );
-        wrong = identity(other_thread);
-        assert_eq!(
-            mailbox.prove_exact_safe(StopObservation {
-                identity: wrong,
-                conditions: SafePointConditions::EXACT_SAFE,
-            }),
-            Err(SafeProofError::WrongIdentity)
-        );
-        let mut unsafe_conditions = SafePointConditions::EXACT_SAFE;
-        unsafe_conditions.deferred_cleanup_quiescent = false;
-        assert_eq!(
-            mailbox.prove_exact_safe(StopObservation {
-                identity: identity(thread),
-                conditions: unsafe_conditions,
-            }),
-            Err(SafeProofError::NotSafe)
+            mailbox.complete_stop_at_safe_point(request, &mut wrong_target),
+            Err(RemoteStopError::WrongIdentity)
         );
 
         acknowledge(&mailbox, identity(thread));
@@ -641,20 +952,11 @@ mod tests {
         assert_eq!(failure.error(), ReclaimError::AwaitingAcknowledgement);
         deferred = failure.into_deferred();
 
-        let proof = mailbox
-            .prove_exact_safe(StopObservation {
-                identity: identity(thread),
-                conditions: SafePointConditions::EXACT_SAFE,
-            })
-            .unwrap();
-        mailbox.acknowledge_exact_safe(proof).unwrap();
-        assert_eq!(
-            mailbox.prove_exact_safe(StopObservation {
-                identity: identity(thread),
-                conditions: SafePointConditions::EXACT_SAFE,
-            }),
-            Err(SafeProofError::AlreadyAcknowledged)
-        );
+        acknowledge(&mailbox, identity(thread));
+        assert!(matches!(
+            mailbox.take_notification(),
+            MailboxNotification::HoldSafe(_)
+        ));
         assert_eq!(mailbox.complete_reclaim(deferred).unwrap(), 77);
     }
 
@@ -721,5 +1023,17 @@ mod tests {
             StopIdentity::new(0, 1, thread, 1, 0),
             Err(StopIdentityError::ZeroRootBindingGeneration)
         );
+    }
+
+    #[test]
+    fn e1_latch_is_cpu_local_and_coalesces_before_the_safe_point() {
+        let latches = RendezvousIpiLatches::new();
+        let cpu0 = CpuIndex::new(0).unwrap();
+        let cpu1 = CpuIndex::new(1).unwrap();
+        latches.latch(cpu1);
+        latches.latch(cpu1);
+        assert!(!latches.take(cpu0));
+        assert!(latches.take(cpu1));
+        assert!(!latches.take(cpu1));
     }
 }

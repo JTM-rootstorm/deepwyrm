@@ -153,6 +153,193 @@ fn production_installs_syscall_boundary_only_after_deep_root_activation() {
 }
 
 #[test]
+fn i1_bsp_scratch_is_usable_for_acpi_and_mmio_before_syscall_install() {
+    let kernel = source("src/lib.rs");
+    let activation = kernel
+        .find("activate_bootstrap_deep_paging(")
+        .expect("Deep root activation");
+    let acpi = kernel
+        .find("AcpiScratchReader::new(&mut active_paging, &boot_info)")
+        .expect("post-activation ACPI scratch reader");
+    let mmio = kernel
+        .find("time::initialize(&mut active_paging, pm_timer)")
+        .expect("post-activation MMIO scratch use");
+    let syscall = kernel
+        .find("arch::x86_64::syscall::install_syscall_boundary()")
+        .expect("later SYSCALL install");
+    assert!(activation < acpi && acpi < mmio && mmio < syscall);
+}
+
+#[test]
+fn i1_native_adapter_phases_revalidate_exact_identity_after_guard_free_work() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let stationary = source("src/arch/x86_64/syscall/stationary_runtime.rs");
+
+    assert!(stationary.contains("struct RuntimePhaseReservation"));
+    assert!(stationary.contains("pub(crate) fn revalidate("));
+    assert!(stationary.contains("pub(crate) fn abort(self)"));
+    assert!(primordial.contains("prepare_address_region_mutation("));
+    assert!(primordial.contains("address_region_map_prepared_model("));
+    assert!(primordial.contains("address_region_unmap_prepared("));
+    let services = source("src/syscall/f_services.rs");
+    assert!(services.contains("struct PreparedFServiceDispatch"));
+    assert!(services.contains("fn dispatch_prepared<"));
+    assert!(
+        services.contains("prepared\n            .begin(current_thread, current_root_generation)")
+    );
+    assert!(!services.contains("struct FServiceDispatchCommit"));
+    assert!(services.contains("The enclosing native runtime phase owns the only"));
+    assert!(primordial.contains(".prepare_dispatch(request, self.thread, root_generation)"));
+    assert!(primordial.contains("self.services.dispatch_prepared("));
+    assert!(primordial.contains("let phase = self.reserve_runtime_phase();"));
+    assert!(primordial.contains("self.assert_guard_free_external_work();"));
+    assert!(primordial.contains("self.commit_runtime_phase(phase);"));
+
+    let handle = primordial
+        .split_once("fn handle(&mut self, request: NativeSyscallRequest)")
+        .expect("native handler")
+        .1;
+    let reserve = handle
+        .find("let phase = self.reserve_runtime_phase();")
+        .unwrap();
+    let guard_free = handle
+        .find("self.assert_guard_free_external_work();")
+        .unwrap();
+    let commit = handle.find("self.commit_runtime_phase(phase);").unwrap();
+    assert!(reserve < guard_free && guard_free < commit);
+
+    for adapter in ["fn map_memory(", "fn unmap_memory(", "fn exit_process("] {
+        let adapter = primordial.split_once(adapter).expect("staged adapter").1;
+        let reserve = adapter
+            .find("let phase = self.reserve_runtime_phase();")
+            .unwrap();
+        let guard_free = adapter
+            .find("self.assert_guard_free_external_work();")
+            .unwrap();
+        let commit = adapter.find("self.commit_runtime_phase(phase);").unwrap();
+        assert!(reserve < guard_free && guard_free < commit, "{adapter}");
+    }
+
+    for external_boundary in ["fn precommit_exact_stop(", "fn rendezvous_stop("] {
+        let boundary = primordial
+            .split_once(external_boundary)
+            .expect("guard-free divergent boundary")
+            .1;
+        assert!(boundary.contains("self.assert_guard_free_external_work();"));
+    }
+}
+
+#[test]
+fn i1_post_ack_carrier_never_reuses_a_retired_frame_for_late_holdsafe() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let continuation = primordial
+        .split_once("fn continue_after_rendezvous_stop(&mut self) -> !")
+        .expect("post-ack carrier continuation")
+        .1;
+    assert!(continuation.contains("complete_switch_on(stopped_claim)"));
+    assert!(continuation.contains("self.drain_staged_rendezvous_cleanup();"));
+    assert!(continuation.contains("terminal_reaper_next_on(self.cpu)"));
+
+    let idle = primordial
+        .split_once("fn idle_after_rendezvous_stop(&mut self) -> !")
+        .expect("kernel-root idle path")
+        .1;
+    assert!(idle.contains("MailboxNotification::HoldSafe(_) => {"));
+    assert!(
+        idle.contains("no second\n                            // acknowledgement may be published")
+    );
+    assert!(!idle.contains("Stop(_)\n                        | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe"));
+    assert!(idle.contains("MailboxNotification::Wake => {"));
+    assert!(idle.contains("self.enter_rendezvous_replacement(next);"));
+    let rescan = idle
+        .split_once("IdleWakeError::RescanRequired")
+        .expect("kernel-root idle rescan path")
+        .1;
+    assert!(rescan.contains("service_current_rendezvous_latch()"));
+    assert!(rescan.contains("permanent RescanRequired spin"));
+
+    let precommit = primordial
+        .split_once("fn precommit_exact_stop(")
+        .expect("remote-stop precommit")
+        .1;
+    let stage = precommit
+        .find("self.stage_rendezvous_cleanup();")
+        .expect("cleanup staging");
+    let consume_reaper = precommit
+        .find("self\n            .rendezvous_reaper\n            .take()")
+        .expect("irreversible reaper witness consume");
+    assert!(stage < consume_reaper);
+    let finalizers = primordial
+        .split_once("fn drain_finalizers(&mut self)")
+        .expect("post-ack finalizer drain")
+        .1
+        .split_once("fn prove_registry_capacity")
+        .expect("finalizer drain extent")
+        .0;
+    assert!(finalizers.contains("while !self.cleanup.is_empty()"));
+    assert!(finalizers.contains("crate::syscall::complete_wait_wakes("));
+}
+
+#[test]
+fn i1_idle_suspend_stop_handoffs_after_idle_cleanup_instead_of_halting() {
+    let live = source("src/arch/x86_64/syscall/live.rs");
+    let idle_suspend = live
+        .split_once("crate::syscall::native::NativeSuspendPlan::IdleCurrent =>")
+        .expect("idle-suspend path")
+        .1;
+
+    assert_eq!(
+        idle_suspend
+            .match_indices("stage_rendezvous_action(RendezvousAction(request))")
+            .count(),
+        2
+    );
+    assert_eq!(
+        idle_suspend
+            .match_indices("handoff_to_rendezvous_reaper(context)")
+            .count(),
+        2
+    );
+    let finish = idle_suspend
+        .find("crate::arch::x86_64::idle::finish_current_idle(halt)")
+        .expect("post-hlt idle finish");
+    let post_halt_latch = idle_suspend[finish..]
+        .find("service_current_rendezvous_latch()")
+        .expect("post-hlt latch consume");
+    let post_halt_handoff = idle_suspend[finish..]
+        .find("handoff_to_rendezvous_reaper(context)")
+        .expect("post-hlt reaper handoff");
+    assert!(post_halt_latch < post_halt_handoff);
+    assert!(!idle_suspend.contains("live D carrier safe-point/reaper join has not yet"));
+}
+
+#[test]
+fn i1_replacement_carrier_treats_prior_holdsafe_as_a_reclaim_gate_not_a_stop() {
+    let live = source("src/arch/x86_64/syscall/live.rs");
+    let gate = live
+        .split_once("unsafe fn native_runtime_rendezvous_gate")
+        .expect("CPL3 pre-IRET gate")
+        .1
+        .split_once("unsafe fn native_runtime_rendezvous_reaper")
+        .expect("gate extent")
+        .0;
+    assert!(gate.contains("MailboxNotification::HoldSafe(_) => 0"));
+    assert!(!gate.contains(
+        "Stop(request)\n        | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe"
+    ));
+
+    let trampoline = live
+        .split_once("unsafe fn native_runtime_trampoline")
+        .expect("native trampoline")
+        .1
+        .split_once("crate::syscall::native::SyscallControl::ReturnToCaller")
+        .expect("post-dispatch gate extent")
+        .0;
+    assert!(trampoline.contains("MailboxNotification::HoldSafe(_) => {}"));
+    assert!(trampoline.contains("MailboxNotification::Stop(request) =>"));
+}
+
+#[test]
 fn e5_live_user_pins_guard_actual_atomic_write_batches() {
     let access = source("src/arch/x86_64/mm/activation/user_access.rs");
     assert!(access.contains("self.target.pins"));
@@ -366,11 +553,48 @@ fn h2_syscall_entry_and_native_runtime_carriers_are_fixed_per_cpu() {
     assert!(primordial.contains("struct PrimordialRuntimeCarrier"));
     assert!(primordial.contains("struct RuntimeCarrierFacade"));
     assert!(primordial.contains("struct RuntimeAuthorityLock"));
+    assert!(primordial.contains("struct PerCpuLiveCarrier"));
+    assert!(primordial.contains("initialize_per_cpu_live_carriers()"));
     assert!(primordial.contains("bind_runtime_carrier_facades(facades.as_mut())"));
     assert!(primordial.contains("release_runtime_carrier_facades()"));
     assert!(primordial.contains("runtime.select_cpu(self.cpu)"));
     assert!(primordial.contains("runtime.prepare_fresh_user_entry()"));
     assert!(primordial.contains("enter_bound_validated_user(&state, stack)"));
+    assert!(!primordial.contains("reject_entry"));
+}
+
+#[test]
+fn i1_stationary_foundation_keeps_authority_and_carrier_boundaries_explicit() {
+    let stationary = source("src/arch/x86_64/syscall/stationary_runtime.rs");
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+
+    for authority in [
+        "struct RuntimeCore",
+        "registry: REGISTRY",
+        "memory: MEMORY",
+        "tasks: TASKS",
+        "spaces: SPACES",
+        "regions: REGIONS",
+        "struct PagingAuthority",
+        "struct ThreadServiceSlots",
+        "struct PerCpuStaging",
+        "fn assert_clear",
+    ] {
+        assert!(
+            stationary.contains(authority),
+            "missing stationary {authority}"
+        );
+    }
+    assert!(stationary.contains("stationary authority nesting on CPU"));
+    assert!(stationary.contains("assert_clear_on"));
+    assert!(stationary.contains("prepare_on"));
+    assert!(stationary.contains("ThreadServiceSlotError::StaleLease"));
+    assert!(primordial.contains("struct PerCpuLiveCarrier"));
+    assert!(primordial.contains("initialize_per_cpu_live_carriers"));
+    assert!(primordial.contains("0..crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT"));
+    assert!(primordial.contains("local: &'static PerCpuLiveCarrier"));
+    assert!(primordial.contains("bind_runtime_carrier_facades(facades.as_mut())"));
+    assert!(primordial.contains("release_runtime_carrier_facades()"));
     assert!(!primordial.contains("reject_entry"));
 }
 
@@ -440,7 +664,7 @@ fn f2_runtime_binding_is_retained_by_divergent_entry_and_suspension_drops_short_
         .split_once("pub(crate) unsafe fn enter_native_syscall_runtime")
         .expect("native runtime entry API")
         .1
-        .split_once("impl<'runtime")
+        .split_once("impl<")
         .expect("private divergent entry implementation")
         .0;
     assert!(divergent_entry_api.contains(") -> ! {"));

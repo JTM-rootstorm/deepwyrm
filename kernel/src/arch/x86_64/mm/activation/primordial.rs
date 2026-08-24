@@ -27,13 +27,14 @@ use crate::memory::frame_roles::{ObjectBackingGrant, TableLevel};
 use crate::memory::object::{MemoryObjectAuthority, MemoryProtection};
 use crate::memory::user_range::{EmptyAddressRule, UserAccess, UserAddressSpace, UserRange};
 use crate::object::{HandleRef, InternalRef, ObjectRegistry};
+use crate::sync::IrqSpinMutex;
 #[cfg(feature = "test-support")]
 use crate::syscall::FServiceOperationOwner;
 use crate::syscall::native::{
     NativeSyscallFrameRuntime, NativeSyscallHandler, NativeSyscallRequest, NativeSyscallResult,
     SyscallControl,
 };
-use crate::syscall::{CleanupQueue, FServiceRoute, FServiceState};
+use crate::syscall::{CleanupQueue, FServiceRoute, FServiceState, TerminalWaitCleanup};
 use crate::task::{ExecutionDomain, ProcessKey, SchedulerThreadState, TaskAuthority, ThreadKey};
 use crate::time::TimerAuthority;
 use crate::wait::{EventAuthority, WaitRegistry};
@@ -373,6 +374,8 @@ unsafe impl Sync for SharedRuntimeStorage {}
 
 static SHARED_RUNTIME_STATE: AtomicU8 = AtomicU8::new(0);
 static SHARED_RUNTIME_STORAGE: SharedRuntimeStorage = SharedRuntimeStorage::new();
+static STATIONARY_GUARD_DEPTH: crate::arch::x86_64::syscall::StationaryGuardDepth =
+    crate::arch::x86_64::syscall::StationaryGuardDepth::new();
 
 /// Coarse DW0-H transaction boundary for the still-monolithic live authority
 /// set. Per-CPU carrier state remains outside this lock; shared mutations are
@@ -451,6 +454,68 @@ struct RuntimeCarrierFacade<
     >,
 }
 
+/// Fixed CPU-local façade over the stationary runtime authorities.
+///
+/// The live runtime façades serialize shared authority access separately; this
+/// object records only the physical execution identity that belongs to one CPU
+/// and remains available to its divergent rendezvous/reaper path.
+struct PerCpuLiveCarrier {
+    cpu: crate::cpu::CpuIndex,
+    local: IrqSpinMutex<PerCpuCarrierLocal>,
+}
+
+#[derive(Clone, Copy)]
+struct PerCpuCarrierLocal {
+    current_thread: Option<ThreadKey>,
+    current_stack: Option<crate::task::KernelStackId>,
+    current_context: Option<crate::task::ThreadContextId>,
+    scratch_cpu: crate::cpu::CpuIndex,
+    reaper_staged: bool,
+}
+
+impl PerCpuLiveCarrier {
+    fn physically_executes(&self, thread: ThreadKey) -> bool {
+        let local = self.local.lock();
+        local.current_thread == Some(thread) && !local.reaper_staged
+    }
+
+    fn record_current(
+        &self,
+        thread: ThreadKey,
+        stack: crate::task::KernelStackId,
+        context: crate::task::ThreadContextId,
+    ) {
+        let mut local = self.local.lock();
+        assert_eq!(local.scratch_cpu, self.cpu, "carrier scratch CPU drifted");
+        assert!(
+            !local.reaper_staged,
+            "reaper-staged carrier cannot resume a Thread"
+        );
+        local.current_thread = Some(thread);
+        local.current_stack = Some(stack);
+        local.current_context = Some(context);
+    }
+}
+
+struct RuntimeCarrierStorage(
+    UnsafeCell<[MaybeUninit<PerCpuLiveCarrier>; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT]>,
+);
+
+impl RuntimeCarrierStorage {
+    const fn new() -> Self {
+        Self(UnsafeCell::new(
+            [const { MaybeUninit::uninit() }; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+        ))
+    }
+}
+
+// SAFETY: the BSP initializes each fixed slot exactly once before any AP is
+// released. Later access is through the slot's IRQ-serialized local record.
+unsafe impl Sync for RuntimeCarrierStorage {}
+
+static RUNTIME_CARRIER_STATE: [AtomicU8; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] =
+    [const { AtomicU8::new(0) }; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT];
+static RUNTIME_CARRIER_STORAGE: RuntimeCarrierStorage = RuntimeCarrierStorage::new();
 struct ChannelStaging(UnsafeCell<[u8; DW_CHANNEL_MAX_PAYLOAD as usize]>);
 
 // SAFETY: one runtime CPU slot claims each buffer before userspace starts; no
@@ -487,6 +552,41 @@ fn publish_runtime_shared() -> &'static PrimordialRuntimeShared {
     crate::time::bind_deadline_wake_target(target)
         .unwrap_or_else(|error| panic!("could not bind primordial deadline wakes: {error:?}"));
     target
+}
+
+fn initialize_per_cpu_live_carriers() {
+    for cpu_index in 0..crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT {
+        let cpu = crate::cpu::CpuIndex::new(cpu_index)
+            .unwrap_or_else(|| panic!("CPU {cpu_index} exceeds the native carrier bound"));
+        RUNTIME_CARRIER_STATE[cpu_index]
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .unwrap_or_else(|_| panic!("CPU {cpu_index} native carrier was initialized twice"));
+        unsafe {
+            let slots = &mut *RUNTIME_CARRIER_STORAGE.0.get();
+            slots[cpu_index].write(PerCpuLiveCarrier {
+                cpu,
+                local: IrqSpinMutex::new(PerCpuCarrierLocal {
+                    current_thread: None,
+                    current_stack: None,
+                    current_context: None,
+                    scratch_cpu: cpu,
+                    reaper_staged: false,
+                }),
+            });
+        }
+        RUNTIME_CARRIER_STATE[cpu_index].store(2, Ordering::Release);
+    }
+}
+
+fn per_cpu_live_carrier(cpu: crate::cpu::CpuIndex) -> &'static PerCpuLiveCarrier {
+    let index = cpu.index();
+    if RUNTIME_CARRIER_STATE
+        .get(index)
+        .is_none_or(|state| state.load(Ordering::Acquire) != 2)
+    {
+        panic!("CPU {index} native carrier storage is unavailable");
+    }
+    unsafe { &*(*RUNTIME_CARRIER_STORAGE.0.get())[index].as_ptr() }
 }
 
 fn bind_runtime_carrier_facades<
@@ -904,12 +1004,44 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
 /// BSP execution carrier. Plain mutable authorities remain exclusively owned
 /// here because their adapter surfaces do not yet provide transactional
 /// interior synchronization. AP carriers cannot name or borrow this state.
+enum CarrierActiveRoot {
+    Unselected,
+    Process(super::ActiveRootSelection),
+    StopPrecommitted(super::ActiveRootSelection),
+    Kernel(super::ActiveKernelExecutionRoot),
+    Transitioning,
+}
+
+impl CarrierActiveRoot {
+    fn as_ref(&self) -> Option<&super::ActiveRootSelection> {
+        match self {
+            Self::Process(root) => Some(root),
+            Self::Unselected
+            | Self::StopPrecommitted(_)
+            | Self::Kernel(_)
+            | Self::Transitioning => None,
+        }
+    }
+
+    fn take_process(&mut self) -> super::ActiveRootSelection {
+        match core::mem::replace(self, Self::Transitioning) {
+            Self::Process(root) => root,
+            Self::Unselected
+            | Self::StopPrecommitted(_)
+            | Self::Kernel(_)
+            | Self::Transitioning => {
+                panic!("carrier has no active Process root")
+            }
+        }
+    }
+}
+
 struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
     cpu: crate::cpu::CpuIndex,
+    local: &'static PerCpuLiveCarrier,
     active: ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
-    active_root: Option<super::ActiveRootSelection>,
-    active_roots:
-        [Option<super::ActiveRootSelection>; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+    active_root: CarrierActiveRoot,
+    active_roots: [CarrierActiveRoot; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
     cpu_processes: [Option<ProcessKey>; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
     cpu_threads: [Option<ThreadKey>; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
     cpu_stack_ids:
@@ -918,6 +1050,9 @@ struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_
         [Option<crate::task::ThreadContextId>; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
     cpu_root_keys: [Option<crate::memory::address_region::AddressRegionObjectKey>;
         crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+    stopping_claim: Option<crate::task::SchedulerExecutionClaim>,
+    stopping_claim_was_suspended: bool,
+    rendezvous_reaper: Option<crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry>,
     registry: Registry,
     memory: Memory,
     tasks: Tasks,
@@ -946,6 +1081,9 @@ struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_
     root_owner: Option<InternalRef>,
     deferred_current: Option<crate::task::DeferredCurrentExecutionResources>,
     cleanup: CleanupQueue<REGISTRY_OBJECTS>,
+    // Pending final releases are moved before the irreversible stop commit.
+    // They are drained only by the post-ack kernel-root continuation.
+    rendezvous_cleanup: Option<CleanupQueue<REGISTRY_OBJECTS>>,
     #[cfg(feature = "test-support")]
     g5_probe: G5PrimordialProbe,
 }
@@ -1016,7 +1154,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     fn switch_cpu(&mut self, cpu: crate::cpu::CpuIndex) {
         if self.cpu != cpu {
             let previous = self.cpu.index();
-            self.active_roots[previous] = self.active_root.take();
+            let outgoing = core::mem::replace(&mut self.active_root, CarrierActiveRoot::Unselected);
+            let displaced = core::mem::replace(&mut self.active_roots[previous], outgoing);
+            assert!(
+                matches!(displaced, CarrierActiveRoot::Unselected),
+                "active CPU slot already retained a root"
+            );
             self.cpu_processes[previous] = Some(self.process);
             self.cpu_threads[previous] = Some(self.thread);
             self.cpu_stack_ids[previous] = Some(self.stack_id);
@@ -1024,7 +1167,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.cpu_root_keys[previous] = Some(self.root_key);
             self.cpu = cpu;
             let current = cpu.index();
-            self.active_root = self.active_roots[current].take();
+            self.active_root = core::mem::replace(
+                &mut self.active_roots[current],
+                CarrierActiveRoot::Unselected,
+            );
+            self.local = per_cpu_live_carrier(cpu);
             if let Some(process) = self.cpu_processes[current] {
                 self.process = process;
                 self.thread = self.cpu_threads[current].expect("CPU state omitted Thread");
@@ -1219,7 +1366,34 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
+    fn reserve_runtime_phase(&self) -> crate::arch::x86_64::syscall::RuntimePhaseReservation {
+        let root = self
+            .active_root
+            .as_ref()
+            .unwrap_or_else(|| panic!("runtime phase requires an active Process root"));
+        crate::arch::x86_64::syscall::RuntimePhaseReservation::new(
+            self.thread,
+            root.binding_generation(),
+        )
+        .unwrap_or_else(|_| panic!("runtime phase has an invalid exact root generation"))
+    }
+
+    fn commit_runtime_phase(&self, phase: crate::arch::x86_64::syscall::RuntimePhaseReservation) {
+        let root = self
+            .active_root
+            .as_ref()
+            .unwrap_or_else(|| panic!("runtime phase lost its active Process root"));
+        phase
+            .revalidate(self.thread, root.binding_generation())
+            .unwrap_or_else(|_| panic!("runtime phase identity drifted across guard-free work"));
+    }
+
+    fn assert_guard_free_external_work(&self) {
+        STATIONARY_GUARD_DEPTH.assert_clear_on(self.cpu);
+    }
+
     fn synchronize_scheduler_current(&mut self) {
+        assert_eq!(self.local.cpu, self.cpu, "BSP carrier storage CPU drifted");
         let thread = self
             .shared
             .execution
@@ -1271,27 +1445,69 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.root_key = root_key;
             self.stack_id = stack_id;
             self.context_id = context_id;
+            self.local.record_current(thread, stack_id, context_id);
             return;
         }
         let prepared = self
             .active
             .prepare_process_root_selection(self.cpu, process, address_space)
             .unwrap_or_else(|error| panic!("could not prepare scheduler-current root: {error:?}"));
-        let previous = self.active_root.take();
-        let selected = match self
-            .active
-            .activate_process_root_selection(prepared, previous)
-        {
-            Ok(selected) => selected,
-            Err(failure) => {
-                let (error, prepared, previous) = failure.into_parts();
-                self.active
-                    .abandon_process_root_selection(prepared)
-                    .unwrap_or_else(|abandon| {
-                        panic!("failed root selection could not be abandoned: {abandon:?}")
-                    });
-                self.active_root = previous;
-                panic!("could not activate scheduler-current root: {error:?}");
+        let previous = core::mem::replace(&mut self.active_root, CarrierActiveRoot::Transitioning);
+        let selected = match previous {
+            CarrierActiveRoot::Unselected => {
+                match self.active.activate_process_root_selection(prepared, None) {
+                    Ok(selected) => selected,
+                    Err(failure) => {
+                        let (error, prepared, previous) = failure.into_parts();
+                        debug_assert!(previous.is_none());
+                        self.active
+                        .abandon_process_root_selection(prepared)
+                        .unwrap_or_else(|abandon| {
+                            panic!("failed first root selection could not be abandoned: {abandon:?}")
+                        });
+                        self.active_root = CarrierActiveRoot::Unselected;
+                        panic!("could not activate first scheduler-current root: {error:?}");
+                    }
+                }
+            }
+            CarrierActiveRoot::Process(previous) => match self
+                .active
+                .activate_process_root_selection(prepared, Some(previous))
+            {
+                Ok(selected) => selected,
+                Err(failure) => {
+                    let (error, prepared, previous) = failure.into_parts();
+                    self.active
+                        .abandon_process_root_selection(prepared)
+                        .unwrap_or_else(|abandon| {
+                            panic!("failed root selection could not be abandoned: {abandon:?}")
+                        });
+                    self.active_root = CarrierActiveRoot::Process(previous.unwrap_or_else(|| {
+                        panic!("runtime carrier lost its Process root during activation rollback")
+                    }));
+                    panic!("could not activate scheduler-current root: {error:?}");
+                }
+            },
+            CarrierActiveRoot::Kernel(previous) => match self
+                .active
+                .activate_from_kernel_execution_root(prepared, previous)
+            {
+                Ok(selected) => selected,
+                Err(failure) => {
+                    let (error, prepared, previous) = failure.into_parts();
+                    self.active
+                        .abandon_process_root_selection(prepared)
+                        .unwrap_or_else(|abandon| {
+                            panic!(
+                                "failed kernel-root selection could not be abandoned: {abandon:?}"
+                            )
+                        });
+                    self.active_root = CarrierActiveRoot::Kernel(previous);
+                    panic!("could not activate scheduler-current root from kernel root: {error:?}");
+                }
+            },
+            CarrierActiveRoot::StopPrecommitted(_) | CarrierActiveRoot::Transitioning => {
+                panic!("runtime carrier has no stable root while selecting scheduler current")
             }
         };
         // Publish the carrier identity only after CR3/residency selection is
@@ -1301,12 +1517,241 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.root_key = root_key;
         self.stack_id = stack_id;
         self.context_id = context_id;
-        self.active_root = Some(selected);
+        self.active_root = CarrierActiveRoot::Process(selected);
+        self.local.record_current(thread, stack_id, context_id);
     }
 
     fn merge_cleanup(&mut self, cleanup: CleanupQueue<REGISTRY_OBJECTS>) {
         for release in cleanup.into_releases().into_iter().flatten() {
             self.cleanup.push(release);
+        }
+    }
+
+    fn stage_rendezvous_cleanup(&mut self) {
+        assert!(
+            self.rendezvous_cleanup.is_none(),
+            "remote stop staged cleanup twice"
+        );
+        self.rendezvous_cleanup = Some(core::mem::replace(&mut self.cleanup, CleanupQueue::new()));
+    }
+
+    /// Moves a suspended F-service operation out of the stopped carrier before
+    /// the Process root is released. e1 delivery after block commit has no
+    /// Running claim, but it still owns exact wait/output/atomic cleanup that
+    /// cannot be left to trip the post-commit quiescence check.
+    fn transfer_suspended_service_cleanup_for_stop(&mut self) {
+        if self.services.is_quiescent() {
+            return;
+        }
+        let mut discarded = None;
+        let mut atomic_pin = None;
+        let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
+        {
+            let mut terminal = self.services.terminal_cleanup(
+                Some(&mut wait_deadlines),
+                |output| {
+                    assert!(discarded.replace(output).is_none());
+                },
+                |pin| {
+                    assert!(atomic_pin.replace(pin).is_none());
+                },
+            );
+            terminal.cleanup_terminal_wait(
+                &mut self.registry,
+                &mut self.tasks,
+                &self.shared.waits,
+                &self.shared.execution,
+                self.thread,
+                &mut self.cleanup,
+            );
+        }
+        let mut user = self.active.current_process_address_space(
+            self.active_root.as_ref().expect("active Process root"),
+            self.process,
+        );
+        if let Some(output) = discarded {
+            user.discard_owned_output(output)
+                .unwrap_or_else(|_| panic!("rendezvous suspended output pin drifted"));
+        }
+        if let Some(pin) = atomic_pin {
+            user.release_atomic_u32(pin)
+                .unwrap_or_else(|_| panic!("rendezvous suspended atomic pin drifted"));
+        }
+        let cleanup = self.services.take_cleanup();
+        self.merge_cleanup(cleanup);
+    }
+
+    fn drain_staged_rendezvous_cleanup(&mut self) {
+        let cleanup = self
+            .rendezvous_cleanup
+            .take()
+            .unwrap_or_else(|| panic!("post-ack carrier omitted staged cleanup"));
+        self.merge_cleanup(cleanup);
+        self.drain_finalizers()
+            .unwrap_or_else(|_| panic!("post-ack rendezvous cleanup drifted"));
+    }
+
+    /// Continues only after the remote-stop mailbox Release acknowledgement.
+    /// The stopped Thread remains deferred in the scheduler/reaper ownership
+    /// graph; this carrier may select a different Runnable Thread or idle on
+    /// its retained kernel root, but it must never consume the stopped IPI
+    /// frame or reclaim resources still held by the initiator's exact ack.
+    fn continue_after_rendezvous_stop(&mut self) -> ! {
+        let stopped_claim = self
+            .stopping_claim
+            .take()
+            .unwrap_or_else(|| panic!("rendezvous continuation lost its stopped claim"));
+        // The exact-safe acknowledgement has already been Release-published.
+        // We may now abandon the CPU-local retired continuation slot, but not
+        // reclaim the stopped task/root/stack: that remains initiator-gated.
+        self.shared
+            .execution
+            .complete_switch_on(stopped_claim)
+            .unwrap_or_else(|error| {
+                panic!("rendezvous continuation could not clear retired slot: {error:?}")
+            });
+        self.drain_staged_rendezvous_cleanup();
+        let next = self.shared.execution.terminal_reaper_next_on(self.cpu);
+        let Some(next) = next else {
+            self.idle_after_rendezvous_stop()
+        };
+        self.enter_rendezvous_replacement(next)
+    }
+
+    /// Enters an exact Runnable replacement selected after the stopped frame
+    /// has been irreversibly abandoned. This is also used by kernel-root idle
+    /// after a late Wake; it never consumes or returns through that frame.
+    fn enter_rendezvous_replacement(&mut self, next: ThreadKey) -> ! {
+        let (stack_id, context_id) = self
+            .tasks
+            .thread_execution_resources(next)
+            .unwrap_or_else(|error| panic!("rendezvous replacement resources failed: {error:?}"))
+            .unwrap_or_else(|| panic!("rendezvous replacement Thread has no execution resources"));
+        let stack = self
+            .shared
+            .execution
+            .stack_bounds(stack_id)
+            .unwrap_or_else(|error| panic!("rendezvous replacement stack failed: {error:?}"));
+        let continuation = self
+            .shared
+            .execution
+            .kernel_continuation_rsp(context_id)
+            .unwrap_or_else(|error| {
+                panic!("rendezvous replacement continuation failed: {error:?}")
+            });
+        // This switches Kernel -> Process exactly once if replacement work is
+        // available. It performs no usercopy while the kernel-root state is
+        // live and returns only after the target CR3 serialization.
+        self.synchronize_scheduler_current();
+        unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(stack) }.unwrap_or_else(
+            |error| panic!("rendezvous replacement stack binding failed: {error:?}"),
+        );
+        let continuation = if continuation == 0 {
+            unsafe {
+                crate::arch::x86_64::context::prepare_initial_kernel_continuation(
+                    stack,
+                    crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
+                )
+            }
+            .unwrap_or_else(|error| {
+                panic!("rendezvous fresh continuation preparation failed: {error:?}")
+            })
+            .rsp()
+        } else {
+            continuation
+        };
+        crate::arch::x86_64::syscall::validate_live_syscall_boundary().unwrap_or_else(|error| {
+            panic!("rendezvous replacement syscall boundary drifted: {error:?}")
+        });
+        unsafe { crate::arch::x86_64::context::abandon_to_kernel_continuation(continuation) }
+    }
+
+    fn idle_after_rendezvous_stop(&mut self) -> ! {
+        assert!(matches!(self.active_root, CarrierActiveRoot::Kernel(_)));
+        loop {
+            let idle = crate::arch::x86_64::idle::prepare_current_idle().unwrap_or_else(|error| {
+                panic!("rendezvous kernel-root idle preparation failed: {error:?}")
+            });
+            match crate::arch::x86_64::idle::commit_current_idle(idle) {
+                Ok(halt) => {
+                    #[allow(
+                        unsafe_code,
+                        reason = "the committed idle transition owns the CPU-local kernel-root carrier and brackets the only sti;hlt boundary"
+                    )]
+                    unsafe {
+                        core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
+                    }
+                    crate::arch::x86_64::idle::finish_current_idle(halt).unwrap_or_else(|error| {
+                        panic!("rendezvous kernel-root idle completion failed: {error:?}")
+                    });
+                    match crate::time::service_current_rendezvous_latch()
+                        .unwrap_or_else(|_| panic!("rendezvous kernel-root idle latch failed"))
+                    {
+                        crate::arch::x86_64::rendezvous::MailboxNotification::None => {}
+                        crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {
+                            if let Some(next) =
+                                self.shared.execution.terminal_reaper_next_on(self.cpu)
+                            {
+                                self.enter_rendezvous_replacement(next);
+                            }
+                        }
+                        crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {
+                            // A late duplicate e1 observes the exact safe
+                            // acknowledgement still held by its initiator.
+                            // Stay on the kernel root and rescan; no stopped
+                            // IPI frame exists to return through and no second
+                            // acknowledgement may be published.
+                            if let Some(next) =
+                                self.shared.execution.terminal_reaper_next_on(self.cpu)
+                            {
+                                self.enter_rendezvous_replacement(next);
+                            }
+                        }
+                        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_) => {
+                            panic!("stopped kernel-root carrier received a second stop request")
+                        }
+                    }
+                }
+                Err(failure)
+                    if failure.error()
+                        == crate::arch::x86_64::idle::IdleWakeError::RescanRequired =>
+                {
+                    crate::arch::x86_64::idle::cancel_current_idle(failure.into_preparation())
+                        .unwrap_or_else(|error| {
+                            panic!("rendezvous kernel-root idle cancellation failed: {error:?}")
+                        });
+                    // An interrupt that completed EOI before the final idle
+                    // commit must be consumed here. Merely cancelling leaves
+                    // the latch set and turns every following commit into a
+                    // permanent RescanRequired spin.
+                    match crate::time::service_current_rendezvous_latch()
+                        .unwrap_or_else(|_| panic!("rendezvous kernel-root rescan latch failed"))
+                    {
+                        crate::arch::x86_64::rendezvous::MailboxNotification::None => {}
+                        crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {
+                            if let Some(next) =
+                                self.shared.execution.terminal_reaper_next_on(self.cpu)
+                            {
+                                self.enter_rendezvous_replacement(next);
+                            }
+                        }
+                        crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {
+                            if let Some(next) =
+                                self.shared.execution.terminal_reaper_next_on(self.cpu)
+                            {
+                                self.enter_rendezvous_replacement(next);
+                            }
+                        }
+                        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_) => {
+                            panic!("stopped kernel-root carrier received a second stop request")
+                        }
+                    }
+                }
+                Err(failure) => panic!(
+                    "rendezvous kernel-root idle commit failed: {:?}",
+                    failure.error()
+                ),
+            }
         }
     }
 
@@ -1533,28 +1978,32 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn drain_finalizers(&mut self) -> Result<(), ()> {
-        let cleanup = core::mem::replace(&mut self.cleanup, CleanupQueue::new());
-        let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
-        let mut finalizer = crate::object::PayloadFinalizer::new(
-            &mut self.registry,
-            &mut *self.active.target.roles,
-            &mut self.memory,
-            &self.shared.events,
-            &self.shared.timers,
-            &mut timer_deadlines,
-            &self.shared.channels,
-            &self.shared.waits,
-            &mut self.tasks,
-            &mut self.spaces,
-            &mut self.regions,
-        );
-        for release in cleanup.into_releases().into_iter().flatten() {
-            let batch = finalizer.finalize_chain(release);
-            let (wakes, pins) = batch.into_parts();
-            if wakes.into_iter().flatten().next().is_some()
-                || pins.into_iter().flatten().next().is_some()
-            {
-                return Err(());
+        while !self.cleanup.is_empty() {
+            let cleanup = core::mem::replace(&mut self.cleanup, CleanupQueue::new());
+            for release in cleanup.into_releases().into_iter().flatten() {
+                let batch = {
+                    let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
+                    let mut finalizer = crate::object::PayloadFinalizer::new(
+                        &mut self.registry,
+                        &mut *self.active.target.roles,
+                        &mut self.memory,
+                        &self.shared.events,
+                        &self.shared.timers,
+                        &mut timer_deadlines,
+                        &self.shared.channels,
+                        &self.shared.waits,
+                        &mut self.tasks,
+                        &mut self.spaces,
+                        &mut self.regions,
+                    );
+                    finalizer.finalize_chain(release)
+                };
+                crate::syscall::complete_wait_wakes(
+                    &mut self.registry,
+                    &self.shared.execution,
+                    batch,
+                    &mut self.cleanup,
+                );
             }
         }
         Ok(())
@@ -1622,7 +2071,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     self.primordial_address_space,
                 )
                 .map_err(|_| ())?;
-            let previous = self.active_root.take();
+            let previous = Some(self.active_root.take_process());
             let selected = match self
                 .active
                 .activate_process_root_selection(prepared, previous)
@@ -1635,11 +2084,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         .unwrap_or_else(|error| {
                             panic!("terminal safe-root rollback drifted: {error:?}")
                         });
-                    self.active_root = previous;
+                    self.active_root = CarrierActiveRoot::Process(previous.unwrap_or_else(|| {
+                        panic!("runtime carrier lost its Process root during activation rollback")
+                    }));
                     return Err(());
                 }
             };
-            self.active_root = Some(selected);
+            self.active_root = CarrierActiveRoot::Process(selected);
             self.unmap_inactive_userspace(self.process, self.root_key, &proof)?;
             self.active
                 .teardown_empty_child_address_space(self.process, address_space)
@@ -1718,6 +2169,177 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialCompleti
 
     fn verify_quiescent(&mut self) -> Result<(), Self::Error> {
         self.finish_terminal_teardown()
+    }
+}
+
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    crate::arch::x86_64::rendezvous::RemoteStopSafePoint
+    for PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn precommit_exact_stop(
+        &mut self,
+        identity: crate::arch::x86_64::rendezvous::StopIdentity,
+        precommit: crate::arch::x86_64::rendezvous::ExactSafePrecommit,
+    ) -> Result<
+        crate::arch::x86_64::rendezvous::ExactSafeWitness,
+        crate::arch::x86_64::rendezvous::RemoteStopError,
+    > {
+        // The IPI/reaper seam is an external, divergent boundary.  It must
+        // never inherit a stationary authority guard from a preceding adapter
+        // phase before it consumes the move-only reaper witness.
+        self.assert_guard_free_external_work();
+        if self.rendezvous_reaper.as_ref().is_none() {
+            return Err(crate::arch::x86_64::rendezvous::RemoteStopError::UnsafePrecommit);
+        }
+        let registry = crate::arch::x86_64::smp::live_cpu_registry();
+        let snapshot = registry
+            .snapshot(self.cpu.index())
+            .map_err(|_| crate::arch::x86_64::rendezvous::RemoteStopError::WrongIdentity)?;
+        // An e1 Stop may arrive after the blocked syscall has committed its
+        // exact Running generation into this CPU's suspended continuation.
+        // Keep that case generation-bound; it is not a thread-only fallback.
+        let (claim, was_suspended) = match self.shared.execution.running_claim_on(self.cpu) {
+            Some(claim) => (claim, false),
+            None => (
+                self.shared
+                    .execution
+                    .suspended_claim_on(self.cpu)
+                    .ok_or(crate::arch::x86_64::rendezvous::RemoteStopError::StaleRequest)?,
+                true,
+            ),
+        };
+        let root = self
+            .active_root
+            .as_ref()
+            .ok_or(crate::arch::x86_64::rendezvous::RemoteStopError::UnsafePrecommit)?;
+        let scheduler_current_matches = !was_suspended
+            && self.shared.execution.current_thread_on(self.cpu) == Some(self.thread);
+        // A block commit may have selected a logical replacement, but it has
+        // not yet switched the physical carrier when this post-hlt e1 gate
+        // runs. The CPU-private local record is the authoritative proof that
+        // no replacement is executing on this stack/carrier.
+        let suspended_carrier_matches =
+            was_suspended && self.local.physically_executes(self.thread);
+        if crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
+            != Some(self.cpu.index())
+            || identity.target_cpu() != self.cpu.index()
+            || identity.cpu_online_generation() != snapshot.online_generation
+            || identity.thread() != self.thread
+            || identity.execution_generation() != claim.generation()
+            || identity.root_binding_generation() != root.binding_generation()
+            || claim.thread() != self.thread
+            || !(scheduler_current_matches || suspended_carrier_matches)
+        {
+            return Err(crate::arch::x86_64::rendezvous::RemoteStopError::WrongIdentity);
+        }
+        self.active
+            .validate_current_process_root_selection(root, self.process, root.address_space())
+            .map_err(|_| crate::arch::x86_64::rendezvous::RemoteStopError::WrongIdentity)?;
+        if !matches!(self.active_root, CarrierActiveRoot::Process(_)) {
+            return Err(crate::arch::x86_64::rendezvous::RemoteStopError::UnsafePrecommit);
+        }
+        let witness = precommit.verify(
+            crate::arch::x86_64::rendezvous::SafePointPrecommitObservation {
+                identity,
+                // `reaper` is move-only evidence from the target-only seam;
+                // it can be minted only after both facts were observed.
+                cpu_private_safe_stack: true,
+                user_access_disabled: true,
+                // This method runs only from the divergent `-> !` rendezvous
+                // callback; its caller has no route back to the IPI frame.
+                user_return_prevented: true,
+            },
+        )?;
+        // All rejectable identity/safe-point checks have passed. Move any
+        // completed syscall releases out of the stopped carrier before the
+        // reaper witness is consumed; only the post-ack continuation may
+        // finalize them.
+        if was_suspended {
+            self.services
+                .retire_idle_control_for_stop(self.thread, claim.generation())
+                .unwrap_or_else(|_| {
+                    panic!("remote stop suspended idle control drifted before precommit")
+                });
+            self.transfer_suspended_service_cleanup_for_stop();
+        }
+        self.stage_rendezvous_cleanup();
+        let reaper = self
+            .rendezvous_reaper
+            .take()
+            .expect("reaper witness disappeared after successful precommit");
+        let previous = core::mem::replace(&mut self.active_root, CarrierActiveRoot::Transitioning);
+        let CarrierActiveRoot::Process(root) = previous else {
+            panic!("remote stop precommit lost the active Process root");
+        };
+        let _ = reaper;
+        self.active_root = CarrierActiveRoot::StopPrecommitted(root);
+        self.stopping_claim = Some(claim);
+        self.stopping_claim_was_suspended = was_suspended;
+        Ok(witness)
+    }
+
+    fn release_running_ownership(&mut self) {
+        let claim = self
+            .stopping_claim
+            .take()
+            .unwrap_or_else(|| panic!("remote stop commit omitted its exact Running claim"));
+        if self.stopping_claim_was_suspended {
+            self.shared
+                .execution
+                .stop_suspended_claim_on(claim)
+                .unwrap_or_else(|error| {
+                    panic!("remote stop suspended claim drifted after precommit: {error:?}")
+                });
+        } else {
+            self.shared
+                .execution
+                .stop_running_claim_on(claim)
+                .unwrap_or_else(|error| {
+                    panic!("remote stop Running claim drifted after precommit: {error:?}")
+                });
+        }
+        self.stopping_claim = Some(claim);
+    }
+
+    fn release_root_residency(&mut self) {
+        let previous =
+            match core::mem::replace(&mut self.active_root, CarrierActiveRoot::Transitioning) {
+                CarrierActiveRoot::StopPrecommitted(root) => root,
+                _ => panic!("remote stop root release without an exact Process selection"),
+            };
+        match self.active.enter_kernel_execution_root(previous) {
+            Ok(kernel) => self.active_root = CarrierActiveRoot::Kernel(kernel),
+            Err((error, recovered)) => {
+                self.active_root = CarrierActiveRoot::StopPrecommitted(recovered);
+                panic!("remote stop kernel-root handoff drifted after Running release: {error:?}");
+            }
+        }
+    }
+
+    fn deferred_cleanup_is_quiescent(&self) -> bool {
+        self.cleanup.is_empty()
+            && self.rendezvous_cleanup.is_some()
+            && self.services.is_quiescent()
+            && self.deferred_current.is_none()
+            && self.shared.execution.running_claim_on(self.cpu).is_none()
+    }
+}
+
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    crate::syscall::native::NativeRendezvousRuntime
+    for PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn rendezvous_stop(
+        &mut self,
+        request: crate::arch::x86_64::rendezvous::StopRequest,
+        reaper: crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry,
+    ) -> ! {
+        self.assert_guard_free_external_work();
+        self.rendezvous_reaper = Some(reaper);
+        crate::arch::x86_64::idle::complete_current_rendezvous_stop(request, self).unwrap_or_else(
+            |error| panic!("remote rendezvous stop failed before commit: {error:?}"),
+        );
+        self.continue_after_rendezvous_stop()
     }
 }
 
@@ -1818,6 +2440,21 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         let mut runtime = self.runtime.lock();
         runtime.select_cpu(self.cpu);
         runtime.handle(request)
+    }
+}
+
+impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    crate::syscall::native::NativeRendezvousRuntime
+    for RuntimeCarrierFacade<'_, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn rendezvous_stop(
+        &mut self,
+        request: crate::arch::x86_64::rendezvous::StopRequest,
+        reaper: crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry,
+    ) -> ! {
+        let mut runtime = self.runtime.lock();
+        runtime.switch_cpu(self.cpu);
+        runtime.rendezvous_stop(request, reaper)
     }
 }
 
@@ -2028,6 +2665,7 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     let mut spaces = unsafe { Spaces::new() };
     let mut regions = Regions::new();
     let shared = publish_runtime_shared();
+    initialize_per_cpu_live_carriers();
     let (_root_group, root_owner) = tasks
         .create_root_group(&mut registry)
         .unwrap_or_else(|error| panic!("could not create primordial root TaskGroup: {error:?}"));
@@ -2059,6 +2697,9 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     active
         .bind_primordial_address_space(monitor.process_key, primordial_address_space)
         .unwrap_or_else(|error| panic!("could not bind primordial architecture root: {error:?}"));
+    active
+        .reserve_kernel_execution_roots()
+        .unwrap_or_else(|error| panic!("could not reserve CPU execution roots: {error:?}"));
     let initial_root = active
         .prepare_process_root_selection(
             crate::cpu::CpuIndex::BOOTSTRAP,
@@ -2095,14 +2736,18 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     } = monitor;
     let mut runtime = PrimordialRuntimeCarrier {
         cpu: crate::cpu::CpuIndex::BOOTSTRAP,
+        local: per_cpu_live_carrier(crate::cpu::CpuIndex::BOOTSTRAP),
         active,
-        active_root: Some(initial_root),
-        active_roots: core::array::from_fn(|_| None),
+        active_root: CarrierActiveRoot::Process(initial_root),
+        active_roots: core::array::from_fn(|_| CarrierActiveRoot::Unselected),
         cpu_processes: core::array::from_fn(|_| None),
         cpu_threads: core::array::from_fn(|_| None),
         cpu_stack_ids: core::array::from_fn(|_| None),
         cpu_context_ids: core::array::from_fn(|_| None),
         cpu_root_keys: core::array::from_fn(|_| None),
+        stopping_claim: None,
+        stopping_claim_was_suspended: false,
+        rendezvous_reaper: None,
         registry,
         memory,
         tasks,
@@ -2125,9 +2770,13 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         root_owner: Some(root_owner),
         deferred_current: None,
         cleanup: CleanupQueue::new(),
+        rendezvous_cleanup: None,
         #[cfg(feature = "test-support")]
         g5_probe: G5PrimordialProbe::for_build(),
     };
+    runtime
+        .local
+        .record_current(runtime.thread, runtime.stack_id, runtime.context_id);
     let exception_binding =
         crate::arch::x86_64::syscall::bind_native_runtime_user_exception_handler()
             .unwrap_or_else(|error| panic!("could not bind primordial exceptions: {error:?}"));
@@ -2182,18 +2831,23 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
         {
             panic!("primordial syscall arrived without its running Thread");
         }
-        let request = match request {
+        // This identity is deliberately detached from the carrier before any
+        // usercopy or service dispatch.  The final check keeps a resumed
+        // adapter from committing under a migrated Thread/root selection.
+        let phase = self.reserve_runtime_phase();
+        let result = match request {
             NativeSyscallRequest::ProcessCreate {
                 args,
                 args_size,
                 out_result,
                 result_size,
             } => {
+                self.assert_guard_free_external_work();
                 let mut user = self.active.current_process_address_space(
                     self.active_root.as_ref().expect("active root"),
                     self.process,
                 );
-                return NativeSyscallResult::returning(crate::syscall::process_create_with_root(
+                NativeSyscallResult::returning(crate::syscall::process_create_with_root(
                     &mut user,
                     &mut self.registry,
                     &mut self.tasks,
@@ -2205,43 +2859,62 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     out_result,
                     result_size,
                     &mut self.cleanup,
-                ));
+                ))
             }
-            other => other,
+            request => {
+                self.assert_guard_free_external_work();
+                let dispatch = {
+                    let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
+                    let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
+                    let root_generation = self
+                        .active_root
+                        .as_ref()
+                        .expect("active root")
+                        .binding_generation();
+                    let prepared = self
+                        .services
+                        .prepare_dispatch(request, self.thread, root_generation)
+                        .unwrap_or_else(|_| {
+                            panic!("F-service prepare has an invalid root identity")
+                        });
+                    let mut user = self.active.current_process_address_space(
+                        self.active_root.as_ref().expect("active root"),
+                        self.process,
+                    );
+                    self.services.dispatch_prepared(
+                        prepared,
+                        &mut user,
+                        &mut self.registry,
+                        &mut self.tasks,
+                        &self.shared.execution,
+                        &self.shared.channels,
+                        &self.shared.events,
+                        &self.shared.timers,
+                        &self.shared.waits,
+                        &mut self.regions,
+                        &mut self.spaces,
+                        self.process,
+                        self.thread,
+                        root_generation,
+                        Some(&mut wait_deadlines),
+                        &mut timer_deadlines,
+                        &mut self.channel_staging[..],
+                        || {
+                            crate::time::monotonic_now()
+                                .map_err(|_| deepwyrm_abi::DW_STATUS_BAD_STATE)
+                        },
+                    )
+                };
+                let (route, cleanup) = dispatch.into_parts();
+                self.merge_cleanup(cleanup);
+                match route {
+                    FServiceRoute::Handled(result) => result,
+                    FServiceRoute::Fallthrough(request) => self.handle_fallthrough(request),
+                }
+            }
         };
-        let dispatch = {
-            let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
-            let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
-            let mut user = self.active.current_process_address_space(
-                self.active_root.as_ref().expect("active root"),
-                self.process,
-            );
-            self.services.dispatch(
-                request,
-                &mut user,
-                &mut self.registry,
-                &mut self.tasks,
-                &self.shared.execution,
-                &self.shared.channels,
-                &self.shared.events,
-                &self.shared.timers,
-                &self.shared.waits,
-                &mut self.regions,
-                &mut self.spaces,
-                self.process,
-                self.thread,
-                Some(&mut wait_deadlines),
-                &mut timer_deadlines,
-                &mut self.channel_staging[..],
-                || crate::time::monotonic_now().map_err(|_| deepwyrm_abi::DW_STATUS_BAD_STATE),
-            )
-        };
-        let (route, cleanup) = dispatch.into_parts();
-        self.merge_cleanup(cleanup);
-        match route {
-            FServiceRoute::Handled(result) => result,
-            FServiceRoute::Fallthrough(request) => self.handle_fallthrough(request),
-        }
+        self.commit_runtime_phase(phase);
+        result
     }
 }
 
@@ -2249,6 +2922,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
     fn handle_fallthrough(&mut self, request: NativeSyscallRequest) -> NativeSyscallResult {
+        self.assert_guard_free_external_work();
         match request {
             NativeSyscallRequest::HandleClose { handle } => {
                 NativeSyscallResult::returning(crate::syscall::handle_close(
@@ -2404,128 +3078,138 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         args_size: u64,
         out_address: deepwyrm_abi::DwUserAddress,
     ) -> deepwyrm_abi::DwStatus {
-        let mut user = self.active.current_process_address_space(
-            self.active_root.as_ref().expect("active root"),
-            self.process,
-        );
-        let args = match crate::syscall::decode_map_args(&mut user, args_address, args_size) {
-            Ok(args) => args,
-            Err(status) => return status,
-        };
-        let protection = match MemoryProtection::mapping(args.protections.0 as u8) {
-            Ok(protection) => protection,
-            Err(crate::memory::object::MemoryObjectError::UnsupportedProtection) => {
-                return deepwyrm_abi::DW_STATUS_NOT_SUPPORTED;
-            }
-            Err(_) => return deepwyrm_abi::DW_STATUS_INVALID_ARGUMENT,
-        };
-        let output_range = match UserRange::new(
-            UserAddressSpace::x86_64_four_level(PAGE_SIZE)
-                .unwrap_or_else(|_| panic!("x86_64 userspace model unavailable")),
-            out_address.0,
-            8,
-            8,
-            UserAccess::WRITE,
-            EmptyAddressRule::Reject,
-        ) {
-            Ok(range) => range,
-            Err(_) => return deepwyrm_abi::DW_STATUS_BAD_ADDRESS,
-        };
-        let output = match user.preflight_owned_output(output_range) {
-            Ok(output) => output,
-            Err(_) => return deepwyrm_abi::DW_STATUS_BAD_ADDRESS,
-        };
-        let target = match crate::syscall::address_region_mutation_target(
-            &mut self.registry,
-            &self.tasks,
-            &self.regions,
-            self.process,
-            address_region,
-            deepwyrm_abi::DwRights(deepwyrm_abi::DW_RIGHT_MAP.0 | deepwyrm_abi::DW_RIGHT_MODIFY.0),
-            &mut self.cleanup,
-        ) {
-            Ok(target) => target,
-            Err(status) => {
+        let phase = self.reserve_runtime_phase();
+        self.assert_guard_free_external_work();
+        let status = (|| {
+            let mut user = self.active.current_process_address_space(
+                self.active_root.as_ref().expect("active root"),
+                self.process,
+            );
+            let args = match crate::syscall::decode_map_args(&mut user, args_address, args_size) {
+                Ok(args) => args,
+                Err(status) => return status,
+            };
+            let protection = match MemoryProtection::mapping(args.protections.0 as u8) {
+                Ok(protection) => protection,
+                Err(crate::memory::object::MemoryObjectError::UnsupportedProtection) => {
+                    return deepwyrm_abi::DW_STATUS_NOT_SUPPORTED;
+                }
+                Err(_) => return deepwyrm_abi::DW_STATUS_INVALID_ARGUMENT,
+            };
+            let output_range = match UserRange::new(
+                UserAddressSpace::x86_64_four_level(PAGE_SIZE)
+                    .unwrap_or_else(|_| panic!("x86_64 userspace model unavailable")),
+                out_address.0,
+                8,
+                8,
+                UserAccess::WRITE,
+                EmptyAddressRule::Reject,
+            ) {
+                Ok(range) => range,
+                Err(_) => return deepwyrm_abi::DW_STATUS_BAD_ADDRESS,
+            };
+            let output = match user.preflight_owned_output(output_range) {
+                Ok(output) => output,
+                Err(_) => return deepwyrm_abi::DW_STATUS_BAD_ADDRESS,
+            };
+            let prepared = match crate::syscall::prepare_address_region_mutation(
+                &mut self.registry,
+                &self.tasks,
+                &self.regions,
+                self.process,
+                address_region,
+                deepwyrm_abi::DwRights(
+                    deepwyrm_abi::DW_RIGHT_MAP.0 | deepwyrm_abi::DW_RIGHT_MODIFY.0,
+                ),
+                &mut self.cleanup,
+            ) {
+                Ok(target) => target,
+                Err(status) => {
+                    user.discard_owned_output(output)
+                        .unwrap_or_else(|_| panic!("primordial map output pin drifted"));
+                    return status;
+                }
+            };
+            let target = prepared.target();
+            let caller_process = self.process;
+            if user
+                .select_process_for_return_validation(target.process)
+                .is_err()
+            {
                 user.discard_owned_output(output)
                     .unwrap_or_else(|_| panic!("primordial map output pin drifted"));
-                return status;
+                return DW_STATUS_BAD_STATE;
             }
-        };
-        let caller_process = self.process;
-        if user
-            .select_process_for_return_validation(target.process)
-            .is_err()
-        {
-            user.discard_owned_output(output)
-                .unwrap_or_else(|_| panic!("primordial map output pin drifted"));
-            return DW_STATUS_BAD_STATE;
-        }
-        let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
-        let result = (|| {
-            candidates[0] = Some(
-                user.prepare_table_candidate(TableLevel::Pdpt)
-                    .map_err(|_| DW_STATUS_NO_RESOURCES)?,
-            );
-            candidates[1] = Some(
-                user.prepare_table_candidate(TableLevel::Pd)
-                    .map_err(|_| DW_STATUS_NO_RESOURCES)?,
-            );
-            candidates[2] = Some(
-                user.prepare_table_candidate(TableLevel::Pt)
-                    .map_err(|_| DW_STATUS_NO_RESOURCES)?,
-            );
-            candidates[3] = Some(
-                user.prepare_table_candidate(TableLevel::Pdpt)
-                    .map_err(|_| DW_STATUS_NO_RESOURCES)?,
-            );
-            candidates[4] = Some(
-                user.prepare_table_candidate(TableLevel::Pd)
-                    .map_err(|_| DW_STATUS_NO_RESOURCES)?,
-            );
-            candidates[5] = Some(
-                user.prepare_table_candidate(TableLevel::Pt)
-                    .map_err(|_| DW_STATUS_NO_RESOURCES)?,
-            );
-            let mut publisher = user
+            let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
+            let result = (|| {
+                candidates[0] = Some(
+                    user.prepare_table_candidate(TableLevel::Pdpt)
+                        .map_err(|_| DW_STATUS_NO_RESOURCES)?,
+                );
+                candidates[1] = Some(
+                    user.prepare_table_candidate(TableLevel::Pd)
+                        .map_err(|_| DW_STATUS_NO_RESOURCES)?,
+                );
+                candidates[2] = Some(
+                    user.prepare_table_candidate(TableLevel::Pt)
+                        .map_err(|_| DW_STATUS_NO_RESOURCES)?,
+                );
+                candidates[3] = Some(
+                    user.prepare_table_candidate(TableLevel::Pdpt)
+                        .map_err(|_| DW_STATUS_NO_RESOURCES)?,
+                );
+                candidates[4] = Some(
+                    user.prepare_table_candidate(TableLevel::Pd)
+                        .map_err(|_| DW_STATUS_NO_RESOURCES)?,
+                );
+                candidates[5] = Some(
+                    user.prepare_table_candidate(TableLevel::Pt)
+                        .map_err(|_| DW_STATUS_NO_RESOURCES)?,
+                );
+                let mut publisher = user
                 .publisher::<
                     PRIMORDIAL_TABLE_CANDIDATES,
                     PRIMORDIAL_JOURNAL_ENTRIES,
                     PRIMORDIAL_INVALIDATIONS,
                 >(target.address_space, target.region_key, &mut candidates)
                 .map_err(|_| DW_STATUS_BAD_STATE)?;
-            crate::syscall::address_region_map_model(
-                &mut publisher,
-                &mut self.registry,
-                &mut self.memory,
-                &mut self.tasks,
-                &mut self.regions,
-                self.process,
-                address_region,
-                memory_object,
-                args,
-                protection,
-                &mut self.cleanup,
-            )
+                crate::syscall::address_region_map_prepared_model(
+                    prepared,
+                    &mut publisher,
+                    &mut self.registry,
+                    &mut self.memory,
+                    &mut self.tasks,
+                    &mut self.regions,
+                    self.process,
+                    address_region,
+                    memory_object,
+                    args,
+                    protection,
+                    &mut self.cleanup,
+                )
+            })();
+            for candidate in candidates.into_iter().flatten() {
+                user.recycle_table_candidate(candidate);
+            }
+            user.select_process_for_return_validation(caller_process)
+                .unwrap_or_else(|error| {
+                    panic!("primordial map caller-root restoration failed: {error:?}")
+                });
+            match result {
+                Ok(address) => {
+                    user.commit_owned_output(output, &address.to_le_bytes())
+                        .unwrap_or_else(|_| panic!("primordial map output pin drifted"));
+                    DW_STATUS_SUCCESS
+                }
+                Err(status) => {
+                    user.discard_owned_output(output)
+                        .unwrap_or_else(|_| panic!("primordial map output pin drifted"));
+                    status
+                }
+            }
         })();
-        for candidate in candidates.into_iter().flatten() {
-            user.recycle_table_candidate(candidate);
-        }
-        user.select_process_for_return_validation(caller_process)
-            .unwrap_or_else(|error| {
-                panic!("primordial map caller-root restoration failed: {error:?}")
-            });
-        match result {
-            Ok(address) => {
-                user.commit_owned_output(output, &address.to_le_bytes())
-                    .unwrap_or_else(|_| panic!("primordial map output pin drifted"));
-                DW_STATUS_SUCCESS
-            }
-            Err(status) => {
-                user.discard_owned_output(output)
-                    .unwrap_or_else(|_| panic!("primordial map output pin drifted"));
-                status
-            }
-        }
+        self.commit_runtime_phase(phase);
+        status
     }
 
     fn unmap_memory(
@@ -2534,62 +3218,72 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         address: deepwyrm_abi::DwUserAddress,
         byte_len: u64,
     ) -> deepwyrm_abi::DwStatus {
-        let target = match crate::syscall::address_region_mutation_target(
-            &mut self.registry,
-            &self.tasks,
-            &self.regions,
-            self.process,
-            address_region,
-            deepwyrm_abi::DW_RIGHT_MODIFY,
-            &mut self.cleanup,
-        ) {
-            Ok(target) => target,
-            Err(status) => return status,
-        };
-        let caller_process = self.process;
-        let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
-        let mut user = self.active.current_process_address_space(
-            self.active_root.as_ref().expect("active root"),
-            self.process,
-        );
-        if user
-            .select_process_for_return_validation(target.process)
-            .is_err()
-        {
-            return DW_STATUS_BAD_STATE;
-        }
-        let status = {
-            let mut publisher = user
+        let phase = self.reserve_runtime_phase();
+        self.assert_guard_free_external_work();
+        let status = (|| {
+            let prepared = match crate::syscall::prepare_address_region_mutation(
+                &mut self.registry,
+                &self.tasks,
+                &self.regions,
+                self.process,
+                address_region,
+                deepwyrm_abi::DW_RIGHT_MODIFY,
+                &mut self.cleanup,
+            ) {
+                Ok(target) => target,
+                Err(status) => return status,
+            };
+            let target = prepared.target();
+            let caller_process = self.process;
+            let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
+            let mut user = self.active.current_process_address_space(
+                self.active_root.as_ref().expect("active root"),
+                self.process,
+            );
+            if user
+                .select_process_for_return_validation(target.process)
+                .is_err()
+            {
+                return DW_STATUS_BAD_STATE;
+            }
+            let status = {
+                let mut publisher = user
                 .publisher::<
                     PRIMORDIAL_TABLE_CANDIDATES,
                     PRIMORDIAL_JOURNAL_ENTRIES,
                     PRIMORDIAL_INVALIDATIONS,
                 >(target.address_space, target.region_key, &mut candidates)
                 .unwrap_or_else(|_| panic!("primordial unmap publisher unavailable"));
-            crate::syscall::address_region_unmap(
-                &mut publisher,
-                &mut self.registry,
-                &mut self.memory,
-                &mut self.tasks,
-                &mut self.regions,
-                self.process,
-                address_region,
-                address,
-                byte_len,
-                &mut self.cleanup,
-            )
-        };
-        for candidate in candidates.into_iter().flatten() {
-            user.recycle_table_candidate(candidate);
-        }
-        user.select_process_for_return_validation(caller_process)
-            .unwrap_or_else(|error| {
-                panic!("primordial unmap caller-root restoration failed: {error:?}")
-            });
+                crate::syscall::address_region_unmap_prepared(
+                    prepared,
+                    &mut publisher,
+                    &mut self.registry,
+                    &mut self.memory,
+                    &mut self.tasks,
+                    &mut self.regions,
+                    self.process,
+                    address_region,
+                    address,
+                    byte_len,
+                    &mut self.cleanup,
+                )
+            };
+            for candidate in candidates.into_iter().flatten() {
+                user.recycle_table_candidate(candidate);
+            }
+            user.select_process_for_return_validation(caller_process)
+                .unwrap_or_else(|error| {
+                    panic!("primordial unmap caller-root restoration failed: {error:?}")
+                });
+            status
+        })();
+        self.commit_runtime_phase(phase);
         status
     }
 
     fn exit_process(&mut self, exit_code: u32) -> NativeSyscallResult {
+        let phase = self.reserve_runtime_phase();
+        self.assert_guard_free_external_work();
         let mut discarded = None;
         let mut atomic_pin = None;
         let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
@@ -2636,7 +3330,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         let cleanup = self.services.take_cleanup();
         self.merge_cleanup(cleanup);
-        NativeSyscallResult { status, control }
+        let result = NativeSyscallResult { status, control };
+        self.commit_runtime_phase(phase);
+        result
     }
 
     fn terminate_process_handle(
@@ -2645,6 +3341,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         reason: deepwyrm_abi::DwTerminationReason,
         code: u32,
     ) -> NativeSyscallResult {
+        let phase = self.reserve_runtime_phase();
+        self.assert_guard_free_external_work();
         let mut discarded = None;
         let mut atomic_pin = None;
         let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
@@ -2701,7 +3399,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     .unwrap_or_else(|_| panic!("terminated inactive child teardown drifted"));
             }
         }
-        NativeSyscallResult { status, control }
+        let result = NativeSyscallResult { status, control };
+        self.commit_runtime_phase(phase);
+        result
     }
 
     fn terminate_thread_handle(
@@ -2710,6 +3410,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         reason: deepwyrm_abi::DwTerminationReason,
         code: u32,
     ) -> NativeSyscallResult {
+        let phase = self.reserve_runtime_phase();
+        self.assert_guard_free_external_work();
         let mut discarded = None;
         let mut atomic_pin = None;
         let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
@@ -2734,7 +3436,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             )
         };
         self.finish_terminal_adapter_resources(discarded, atomic_pin, control, deferred);
-        NativeSyscallResult { status, control }
+        let result = NativeSyscallResult { status, control };
+        self.commit_runtime_phase(phase);
+        result
     }
 
     fn finish_terminal_adapter_resources(

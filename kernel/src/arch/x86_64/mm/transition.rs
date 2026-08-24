@@ -31,6 +31,8 @@ mod private;
 #[path = "activation.rs"]
 mod activation;
 
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+pub(crate) use activation::ActiveRootSelection;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) use activation::LiveActivePagingTarget;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]

@@ -10,7 +10,10 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use crate::cpu::{CPU_CAPACITY, CpuIndex};
 
-use super::rendezvous::{MailboxNotification, RendezvousMailbox};
+use super::rendezvous::{
+    MailboxNotification, RemoteStopError, RemoteStopSafePoint, RendezvousIpiLatches,
+    RendezvousMailbox, StopRequest,
+};
 
 const CPU_UNAVAILABLE: u8 = 0;
 const CPU_ACTIVE: u8 = 1;
@@ -30,6 +33,7 @@ pub(crate) enum IdleWakeError {
     AlreadyEnabled,
     NotActive,
     StalePreparation,
+    RescanRequired,
     GenerationExhausted,
     TransportFaulted,
 }
@@ -52,6 +56,23 @@ impl IdlePreparation {
 pub(crate) struct IdleHalt {
     cpu: CpuIndex,
     generation: u64,
+}
+
+#[must_use = "failed idle commit retains the preparation that must be cancelled"]
+#[derive(Debug)]
+pub(crate) struct IdleCommitFailure {
+    error: IdleWakeError,
+    preparation: IdlePreparation,
+}
+
+impl IdleCommitFailure {
+    pub(crate) const fn error(&self) -> IdleWakeError {
+        self.error
+    }
+
+    pub(crate) fn into_preparation(self) -> IdlePreparation {
+        self.preparation
+    }
 }
 
 #[derive(Debug)]
@@ -83,6 +104,7 @@ impl IdleCpuSlot {
 pub(crate) struct IdleWakeSet {
     cpus: [IdleCpuSlot; CPU_CAPACITY],
     mailboxes: [RendezvousMailbox; CPU_CAPACITY],
+    ipi_latches: RendezvousIpiLatches,
     faulted: AtomicBool,
 }
 
@@ -96,6 +118,7 @@ impl IdleWakeSet {
                 RendezvousMailbox::for_cpu(cpu(2)),
                 RendezvousMailbox::for_cpu(cpu(3)),
             ],
+            ipi_latches: RendezvousIpiLatches::new(),
             faulted: AtomicBool::new(false),
         }
     }
@@ -157,11 +180,28 @@ impl IdleWakeSet {
     }
 
     /// Commits the exact preparation immediately before `sti; hlt; cli`.
-    pub(crate) fn commit(&self, preparation: IdlePreparation) -> Result<IdleHalt, IdleWakeError> {
-        self.ensure_healthy()?;
+    pub(crate) fn commit(
+        &self,
+        preparation: IdlePreparation,
+    ) -> Result<IdleHalt, IdleCommitFailure> {
+        if let Err(error) = self.ensure_healthy() {
+            return Err(IdleCommitFailure { error, preparation });
+        }
         let cpu = preparation.cpu;
         let generation = preparation.generation;
-        self.finish_transition(cpu, generation, CPU_PREPARING, CPU_HALTED)?;
+        // An EOI-completed e1 may already have published its CPU-local latch
+        // before we reach the architectural `sti; hlt`. Consume/rescan it in
+        // the carrier path rather than entering HALTED and depending on a
+        // second interrupt that need never arrive.
+        if self.ipi_latches.is_pending(cpu) {
+            return Err(IdleCommitFailure {
+                error: IdleWakeError::RescanRequired,
+                preparation,
+            });
+        }
+        if let Err(error) = self.finish_transition(cpu, generation, CPU_PREPARING, CPU_HALTED) {
+            return Err(IdleCommitFailure { error, preparation });
+        }
         Ok(IdleHalt { cpu, generation })
     }
 
@@ -246,6 +286,46 @@ impl IdleWakeSet {
         Ok(notification)
     }
 
+    /// Performs the only IRQ-side e1 state transition: a CPU-local atomic
+    /// latch. The later carrier safe point consumes the mailbox under normal
+    /// execution rules, never from the interrupt callback.
+    pub(crate) fn latch_rendezvous_ipi(&self, cpu: CpuIndex) -> Result<(), IdleWakeError> {
+        self.ensure_healthy()?;
+        if self.cpus[cpu.index()].state.load(Ordering::Acquire) == CPU_UNAVAILABLE {
+            return Err(IdleWakeError::Unavailable);
+        }
+        self.ipi_latches.latch(cpu);
+        Ok(())
+    }
+
+    /// Consumes a post-EOI latch and then acquires the exact mailbox state at
+    /// a carrier-owned safe point. A missed/late duplicate e1 is harmless:
+    /// the mailbox stays authoritative and the latch coalesces only rescan.
+    pub(crate) fn take_latched_notification(
+        &self,
+        cpu: CpuIndex,
+    ) -> Result<MailboxNotification, IdleWakeError> {
+        self.ensure_healthy()?;
+        if !self.ipi_latches.take(cpu) {
+            return Ok(MailboxNotification::None);
+        }
+        self.take_notification(cpu)
+    }
+
+    fn complete_stop_at_safe_point<T: RemoteStopSafePoint>(
+        &self,
+        cpu: CpuIndex,
+        request: StopRequest,
+        target: &mut T,
+    ) -> Result<(), RemoteStopError> {
+        if self.ensure_healthy().is_err()
+            || self.cpus[cpu.index()].state.load(Ordering::Acquire) == CPU_UNAVAILABLE
+        {
+            return Err(RemoteStopError::StaleRequest);
+        }
+        self.mailboxes[cpu.index()].complete_stop_at_safe_point(request, target)
+    }
+
     pub(crate) fn fail_transport(&self) {
         self.faulted.store(true, Ordering::Release);
     }
@@ -291,9 +371,18 @@ pub(crate) fn cancel_current_idle(preparation: IdlePreparation) -> Result<(), Id
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub(crate) fn commit_current_idle(preparation: IdlePreparation) -> Result<IdleHalt, IdleWakeError> {
-    if preparation.cpu() != current_cpu()? {
-        return Err(IdleWakeError::StalePreparation);
+pub(crate) fn commit_current_idle(
+    preparation: IdlePreparation,
+) -> Result<IdleHalt, IdleCommitFailure> {
+    let current = match current_cpu() {
+        Ok(cpu) => cpu,
+        Err(error) => return Err(IdleCommitFailure { error, preparation }),
+    };
+    if preparation.cpu() != current {
+        return Err(IdleCommitFailure {
+            error: IdleWakeError::StalePreparation,
+            preparation,
+        });
     }
     LIVE_IDLE_WAKE.commit(preparation)
 }
@@ -339,16 +428,43 @@ pub(crate) fn notify_runnable_work(affinity: Option<CpuIndex>) {
     }
 }
 
-/// Consumes only the current CPU's coalesced Wake notification after EOI.
-/// Stop and HoldSafe remain visible to their exact rendezvous owner.
+/// Bounded e1 receive callback: publish a CPU-local latch after EOI. It does
+/// not take scheduler, mailbox, usercopy, timer, or finalization authority.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub(crate) fn take_current_notification() -> MailboxNotification {
+pub(crate) fn latch_current_rendezvous_ipi() {
     let Ok(cpu) = current_cpu() else {
         fail_transport_and_halt();
     };
     LIVE_IDLE_WAKE
-        .take_notification(cpu)
+        .latch_rendezvous_ipi(cpu)
+        .unwrap_or_else(|_| fail_transport_and_halt());
+}
+
+/// Carrier-side e1 safe point. The caller must rescan after `Wake`; `Stop`
+/// and `HoldSafe` are deliberately returned to the live carrier join rather
+/// than acknowledged from interrupt context.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn take_current_latched_notification() -> MailboxNotification {
+    let Ok(cpu) = current_cpu() else {
+        fail_transport_and_halt();
+    };
+    LIVE_IDLE_WAKE
+        .take_latched_notification(cpu)
         .unwrap_or_else(|_| fail_transport_and_halt())
+}
+
+/// Completes an exact Stop/HoldSafe only from the current CPU's reaper/safe
+/// point.  The mailbox remains stationary; the carrier supplies the unique
+/// mutable transition authority after the hard IRQ has returned.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn complete_current_rendezvous_stop<T: RemoteStopSafePoint>(
+    request: StopRequest,
+    target: &mut T,
+) -> Result<(), RemoteStopError> {
+    let cpu = current_cpu().map_err(|_| RemoteStopError::WrongIdentity)?;
+    LIVE_IDLE_WAKE
+        .complete_stop_at_safe_point(cpu, request, target)
+        .map_err(|_| RemoteStopError::StaleRequest)
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -452,6 +568,48 @@ mod tests {
             Ok(MailboxNotification::None)
         );
         idle.finish(halt).unwrap();
+    }
+
+    #[test]
+    fn post_eoi_latch_defers_wake_consumption_to_carrier_safe_point() {
+        let idle = IdleWakeSet::new();
+        idle.enable(cpu(0)).unwrap();
+        idle.enable(cpu(1)).unwrap();
+        let preparation = idle.prepare(cpu(1)).unwrap();
+        assert_eq!(idle.publish_runnable(cpu(0)), Ok(Some(cpu(1))));
+        let halt = idle.commit(preparation).unwrap();
+
+        // The IRQ callback publishes only this bit. It does not take the
+        // mailbox or make a scheduler decision.
+        idle.latch_rendezvous_ipi(cpu(1)).unwrap();
+        assert_eq!(
+            idle.take_latched_notification(cpu(1)),
+            Ok(MailboxNotification::Wake)
+        );
+        assert_eq!(
+            idle.take_latched_notification(cpu(1)),
+            Ok(MailboxNotification::None)
+        );
+        idle.finish(halt).unwrap();
+    }
+
+    #[test]
+    fn preexisting_post_eoi_latch_requires_rescan_before_halt() {
+        let idle = IdleWakeSet::new();
+        idle.enable(cpu(0)).unwrap();
+        idle.enable(cpu(1)).unwrap();
+        let preparation = idle.prepare(cpu(1)).unwrap();
+        assert_eq!(idle.publish_runnable(cpu(0)), Ok(Some(cpu(1))));
+        // Model an e1 handler that completed EOI before this carrier reaches
+        // its final `sti; hlt` commit.
+        idle.latch_rendezvous_ipi(cpu(1)).unwrap();
+        let failure = idle.commit(preparation).unwrap_err();
+        assert_eq!(failure.error(), IdleWakeError::RescanRequired);
+        assert_eq!(
+            idle.take_latched_notification(cpu(1)),
+            Ok(MailboxNotification::Wake)
+        );
+        idle.cancel(failure.into_preparation()).unwrap();
     }
 
     #[test]

@@ -402,14 +402,22 @@ fn service_bsp_timer_request() -> Result<(), LiveTimeError> {
     state.reprogram(sample)
 }
 
-/// e1 receive seam shared with idle-wake/stop rendezvous state. A timer-service
-/// request is meaningful only on logical CPU 0; every other e1 remains a
-/// capability-free wake/no-request notification.
+/// e1 receive seam shared with idle-wake/stop rendezvous state.
+///
+/// This runs after EOI with IF clear and may only publish the CPU-local latch.
+/// Timer service, mailbox inspection, scheduling, and stop acknowledgement
+/// happen later from the carrier-owned safe point.
 fn live_rendezvous_handler() {
-    // Wake is consumed only as a rescan notification. Stop/HoldSafe remain
-    // generation-bound in the rendezvous mailbox and are not acknowledged by
-    // H4's timer/idle callback.
-    let _notification = crate::arch::x86_64::idle::take_current_notification();
+    crate::arch::x86_64::idle::latch_current_rendezvous_ipi();
+}
+
+/// Consumes the current carrier's post-EOI rendezvous latch. `Wake` requires
+/// only the caller's ordinary scheduler rescan. `Stop` and `HoldSafe` are
+/// returned without acknowledgement so the later D carrier join can establish
+/// the exact safe tuple outside interrupt context.
+pub(crate) fn service_current_rendezvous_latch()
+-> Result<crate::arch::x86_64::rendezvous::MailboxNotification, LiveTimeError> {
+    let notification = crate::arch::x86_64::idle::take_current_latched_notification();
     if installed_current_cpu_index() == Ok(CpuIndex::BOOTSTRAP) {
         match BSP_TIMER_SERVICE.take() {
             Ok(true) => {
@@ -421,6 +429,7 @@ fn live_rendezvous_handler() {
             Err(_) => halt_forever(),
         }
     }
+    Ok(notification)
 }
 
 struct StationaryLiveIpiTransport;

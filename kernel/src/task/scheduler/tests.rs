@@ -468,6 +468,94 @@ fn pending_block_preparation_is_retired_with_running_thread() {
 }
 
 #[test]
+fn remote_stop_removes_only_the_exact_running_claim_without_replacement() {
+    let scheduler = CooperativeScheduler::<4>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let stopped = thread_key(&mut registry);
+    let runnable = thread_key(&mut registry);
+    scheduler
+        .commit(scheduler.reserve(stopped).unwrap())
+        .unwrap();
+    scheduler
+        .commit(scheduler.reserve(runnable).unwrap())
+        .unwrap();
+    scheduler.schedule_next_on(cpu(1)).unwrap();
+    let claim = scheduler.running_claim_on(cpu(1)).unwrap();
+    assert_eq!(claim.thread(), stopped);
+
+    scheduler.stop_running_claim_on(claim).unwrap();
+    assert_eq!(scheduler.current_on(cpu(1)), None);
+    assert_eq!(scheduler.running_cpu(stopped), None);
+    assert_eq!(scheduler.suspended_claim_on(cpu(1)), Some(claim));
+    assert_eq!(scheduler.state(stopped), None);
+    assert_eq!(
+        scheduler.state(runnable),
+        Some(SchedulerThreadState::Runnable)
+    );
+    assert_eq!(
+        scheduler.stop_running_claim_on(claim),
+        Err(SchedulerError::StaleExecutionClaim)
+    );
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn remote_stop_continuation_clears_the_retired_slot_before_replacement_schedule() {
+    let scheduler = CooperativeScheduler::<4>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let stopped = thread_key(&mut registry);
+    let runnable = thread_key(&mut registry);
+    scheduler
+        .commit(scheduler.reserve(stopped).unwrap())
+        .unwrap();
+    scheduler
+        .commit(scheduler.reserve(runnable).unwrap())
+        .unwrap();
+    scheduler.schedule_next_on(cpu(1)).unwrap();
+    let claim = scheduler.running_claim_on(cpu(1)).unwrap();
+
+    scheduler.stop_running_claim_on(claim).unwrap();
+    assert_eq!(
+        scheduler.schedule_next_on(cpu(1)),
+        Err(SchedulerError::SwitchPending)
+    );
+    // This is the post-ACK carrier-only action: it abandons the stopped
+    // continuation without reintroducing its Running claim or reclaiming it.
+    scheduler.complete_switch_on(claim).unwrap();
+    assert_eq!(scheduler.suspended_claim_on(cpu(1)), None);
+    assert_eq!(
+        scheduler.schedule_next_on(cpu(1)).unwrap().current,
+        Some(runnable)
+    );
+    assert_eq!(scheduler.running_cpu(stopped), None);
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn remote_stop_after_block_retires_only_the_exact_suspended_generation() {
+    let scheduler = CooperativeScheduler::<2>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let stopped = thread_key(&mut registry);
+    scheduler
+        .commit(scheduler.reserve(stopped).unwrap())
+        .unwrap();
+    scheduler.schedule_next_on(cpu(1)).unwrap();
+    let (_block, _decision) = scheduler.block_current_on(cpu(1), stopped).unwrap();
+    let claim = scheduler.suspended_claim_on(cpu(1)).unwrap();
+
+    scheduler.stop_suspended_claim_on(claim).unwrap();
+    assert_eq!(scheduler.suspended_claim_on(cpu(1)), Some(claim));
+    assert_eq!(scheduler.state(stopped), None);
+    assert_eq!(
+        scheduler.stop_suspended_claim_on(claim),
+        Err(SchedulerError::StaleExecutionClaim)
+    );
+    scheduler.complete_switch_on(claim).unwrap();
+    assert_eq!(scheduler.suspended_claim_on(cpu(1)), None);
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
 fn h4_remote_wake_and_terminal_retirement_never_revive_the_thread() {
     let mut registry = ObjectRegistry::<16>::new();
     for iteration in 0..2_000 {

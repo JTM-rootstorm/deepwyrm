@@ -44,7 +44,8 @@ mod user_access;
 )]
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 pub(crate) use address_space::{
-    ActiveRootSelection, AddressSpaceRootBindings, KernelHalfBinding, PreparedRootSelection,
+    ActiveKernelExecutionRoot, ActiveRootSelection, AddressSpaceRootBindings, KernelExecutionRoot,
+    KernelExecutionRoots, KernelHalfBinding, KernelRootSelectionFailure, PreparedRootSelection,
     RootBindingError, RootSelectionFailure, RootSwitchTarget,
 };
 use graph::*;
@@ -117,6 +118,62 @@ pub(super) struct DeepScratchBinding {
     window_page: u64,
     control_page: u64,
     pt: TableIdentity,
+}
+
+/// Stationary description of the four disjoint scratch slots that are copied
+/// through every Process and retained kernel root's typed kernel half.  The
+/// table is shared as immutable topology; its mutable leaves are selected only
+/// through a CPU-branded binding below.
+#[derive(Clone, Copy)]
+pub(super) struct PerCpuScratchBindings {
+    base: DeepScratchBinding,
+}
+
+/// One CPU-private scratch leaf/control pair.  It is deliberately distinct
+/// from stationary `PerCpuScratchBindings`: carrying a slot requires naming
+/// the CPU that owns its mutable PTEs.
+#[derive(Clone, Copy)]
+struct ScratchBinding {
+    cpu: crate::cpu::CpuIndex,
+    window_page: u64,
+    control_page: u64,
+    pt: TableIdentity,
+}
+
+impl PerCpuScratchBindings {
+    const SLOT_PAGES: u64 = 3;
+
+    fn new(base: DeepScratchBinding) -> Self {
+        Self { base }
+    }
+
+    fn for_cpu(self, cpu: crate::cpu::CpuIndex) -> Option<ScratchBinding> {
+        let offset = (cpu.index() as u64).checked_mul(Self::SLOT_PAGES * PAGE_SIZE)?;
+        let window_page = self.base.window_page.checked_add(offset)?;
+        let control_page = window_page.checked_add(PAGE_SIZE)?;
+        let mmio_page = control_page.checked_add(PAGE_SIZE)?;
+        if window_page >> 21 != self.base.window_page >> 21
+            || control_page >> 21 != self.base.window_page >> 21
+            || mmio_page >> 21 != self.base.window_page >> 21
+            || ((mmio_page >> 12) & 0x1ff) >= 0x1fe
+        {
+            return None;
+        }
+        Some(ScratchBinding {
+            cpu,
+            window_page,
+            control_page,
+            pt: self.base.pt,
+        })
+    }
+
+    fn slots(self) -> Option<[ScratchBinding; crate::cpu::CPU_CAPACITY]> {
+        let mut slots = [self.for_cpu(crate::cpu::CpuIndex::BOOTSTRAP)?; crate::cpu::CPU_CAPACITY];
+        for (index, slot) in slots.iter_mut().enumerate() {
+            *slot = self.for_cpu(crate::cpu::CpuIndex::new(index)?)?;
+        }
+        Some(slots)
+    }
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -227,7 +284,7 @@ pub(crate) struct InactiveRootAuthority<'a, const RANGE_CAPACITY: usize, const R
     handoff: TransitionActivationHandoff<'a>,
     root: PageTableRoot,
     identity: TableIdentity,
-    scratch: DeepScratchBinding,
+    scratch: PerCpuScratchBindings,
     kernel_roles: KernelImageRoleSet,
     ap_trampoline: ArchitectureBootstrapGrant,
     roles: &'a mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
@@ -245,7 +302,7 @@ impl<'a, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         handoff: TransitionActivationHandoff<'a>,
         root: PageTableRoot,
         identity: TableIdentity,
-        scratch: DeepScratchBinding,
+        scratch: PerCpuScratchBindings,
         kernel_roles: KernelImageRoleSet,
         ap_trampoline: ArchitectureBootstrapGrant,
         roles: &'a mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
@@ -260,16 +317,16 @@ impl<'a, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if root.frame().address() != identity.physical_start()
             || root.physical_limit().exclusive() == 0
             || identity.level() != TableLevel::Pml4
-            || scratch.pt.level() != TableLevel::Pt
-            || scratch.pt.owner() != identity.owner()
-            || scratch.control_page != scratch.window_page + PAGE_SIZE
+            || scratch.base.pt.level() != TableLevel::Pt
+            || scratch.base.pt.owner() != identity.owner()
+            || scratch.base.control_page != scratch.base.window_page + PAGE_SIZE
         {
             return Err((FrameRoleError::WrongRole, handoff, root));
         }
         if let Err(error) = roles.validate_table_identity(identity) {
             return Err((error, handoff, root));
         }
-        if let Err(error) = roles.validate_table_identity(scratch.pt) {
+        if let Err(error) = roles.validate_table_identity(scratch.base.pt) {
             return Err((error, handoff, root));
         }
         Ok(Self {
@@ -417,6 +474,8 @@ pub(crate) struct ActiveDeepPaging<A> {
     #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
     root_bindings:
         AddressSpaceRootBindings<LIVE_ADDRESS_SPACE_CAPACITY, { crate::cpu::CPU_CAPACITY }>,
+    #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+    kernel_execution_roots: KernelExecutionRoots<{ crate::cpu::CPU_CAPACITY }>,
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -439,7 +498,7 @@ pub(crate) struct LiveCr3ActivationTarget<
     roles: &'a mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
     kernel_roles: Option<KernelImageRoleSet>,
     ap_trampoline: Option<ArchitectureBootstrapGrant>,
-    scratch: DeepScratchBinding,
+    scratch: PerCpuScratchBindings,
     root_identity: Option<TableIdentity>,
     _not_send_sync: core::marker::PhantomData<*mut ()>,
 }
@@ -454,12 +513,13 @@ pub(crate) struct LiveActivePagingTarget<
     _kernel_roles: KernelImageRoleSet,
     ap_trampoline: ArchitectureBootstrapGrant,
     ap_trampoline_mapped: bool,
+    scratch_bindings: PerCpuScratchBindings,
     scratch: ActiveScratchTarget<LiveActiveScratchIo>,
     _not_send_sync: core::marker::PhantomData<*mut ()>,
 }
 
 pub(crate) struct ActiveScratchTarget<I> {
-    scratch: DeepScratchBinding,
+    scratch: ScratchBinding,
     io: I,
     poisoned: bool,
     _not_send_sync: core::marker::PhantomData<*mut ()>,
@@ -468,11 +528,13 @@ pub(crate) struct ActiveScratchTarget<I> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LiveActiveTargetError {
     Busy,
+    WrongCpu,
     InvalidIndex,
     ReservedScratchEntry,
 }
 
 pub(crate) trait ActiveScratchIo {
+    fn current_cpu(&self) -> Option<crate::cpu::CpuIndex>;
     fn load(&mut self, address: u64) -> u64;
     fn store(&mut self, address: u64, value: u64);
     fn compare_exchange(&mut self, address: u64, current: u64, new: u64) -> Result<(), u64>;
@@ -480,7 +542,12 @@ pub(crate) trait ActiveScratchIo {
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub(crate) struct LiveActiveScratchIo;
+pub(crate) struct LiveActiveScratchIo {
+    /// Established by the consuming Deep-root activation before the first
+    /// ACPI/MMIO scratch access.  SYSCALL GS state is intentionally not an
+    /// input: it is installed later in BSP bring-up.
+    cpu: crate::cpu::CpuIndex,
+}
 
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 struct LiveRootSwitchTarget;
@@ -497,6 +564,18 @@ unsafe impl RootSwitchTarget for LiveRootSwitchTarget {
     fn current_cpu(&self) -> Option<crate::cpu::CpuIndex> {
         crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
             .and_then(crate::cpu::CpuIndex::new)
+    }
+
+    fn current_root_physical_start(&self) -> Option<u64> {
+        let root: u64;
+        unsafe {
+            core::arch::asm!(
+                "mov {}, cr3",
+                out(reg) root,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        Some(root & !(super::PAGE_SIZE - 1))
     }
 
     #[allow(
@@ -526,6 +605,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> target_seal::Seale
     reason = "the authenticated control/window aliases provide aligned atomic PTE access and local invalidation"
 )]
 impl ActiveScratchIo for LiveActiveScratchIo {
+    fn current_cpu(&self) -> Option<crate::cpu::CpuIndex> {
+        Some(self.cpu)
+    }
+
     fn load(&mut self, address: u64) -> u64 {
         unsafe {
             (&*(address as *const core::sync::atomic::AtomicU64))
@@ -565,6 +648,13 @@ impl ActiveScratchIo for LiveActiveScratchIo {
 impl<I: ActiveScratchIo> journal_target_seal::Sealed for ActiveScratchTarget<I> {}
 
 impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
+    fn require_owning_cpu(&self) -> Result<(), LiveActiveTargetError> {
+        if self.io.current_cpu() != Some(self.scratch.cpu) {
+            return Err(LiveActiveTargetError::WrongCpu);
+        }
+        Ok(())
+    }
+
     fn scratch_leaf_index(&self) -> usize {
         ((self.scratch.window_page >> 12) & 0x1ff) as usize
     }
@@ -618,6 +708,7 @@ impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
         replacement: Option<u64>,
     ) -> Result<u64, LiveActiveTargetError> {
         assert!(!self.poisoned, "active Deep scratch mapper is poisoned");
+        self.require_owning_cpu()?;
         let (base, installed) = if frame.address() == self.scratch.pt.physical_start() {
             (self.scratch.control_page, None)
         } else {
@@ -644,6 +735,7 @@ impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
     #[cfg(all(target_os = "none", target_arch = "x86_64"))]
     fn zero_allocator_frame(&mut self, frame: FrameAddress) -> Result<(), LiveActiveTargetError> {
         assert!(!self.poisoned, "active Deep scratch mapper is poisoned");
+        self.require_owning_cpu()?;
         if frame.address() == self.scratch.pt.physical_start() {
             return Err(LiveActiveTargetError::ReservedScratchEntry);
         }
@@ -673,6 +765,7 @@ impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
         destination: &mut [u8],
     ) -> Result<(), LiveActiveTargetError> {
         assert!(!self.poisoned, "active Deep scratch mapper is poisoned");
+        self.require_owning_cpu()?;
         if frame.address() == self.scratch.pt.physical_start()
             || offset
                 .checked_add(destination.len())
@@ -712,6 +805,7 @@ impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
         source: &[u8],
     ) -> Result<(), LiveActiveTargetError> {
         assert!(!self.poisoned, "active Deep scratch mapper is poisoned");
+        self.require_owning_cpu()?;
         if frame.address() == self.scratch.pt.physical_start()
             || offset
                 .checked_add(source.len())
@@ -741,6 +835,7 @@ impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
 
     fn install_mmio_frame(&mut self, frame: FrameAddress) -> Result<u64, LiveActiveTargetError> {
         assert!(!self.poisoned, "active Deep scratch mapper is poisoned");
+        self.require_owning_cpu()?;
         if frame.address() == self.scratch.pt.physical_start() {
             return Err(LiveActiveTargetError::ReservedScratchEntry);
         }
@@ -762,11 +857,10 @@ impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
         if index >= ENTRY_COUNT {
             return Err(LiveActiveTargetError::InvalidIndex);
         }
-        if table.address() == self.scratch.pt.physical_start()
-            && (index == self.scratch_leaf_index()
-                || index == self.scratch_control_index()
-                || index == self.mmio_leaf_index())
-        {
+        // All four CPU control aliases reach one physical PT.  A generic
+        // journal may never name that table: its only permitted mutations are
+        // the selected carrier's private scratch/MMIO leaf CAS operations.
+        if table.address() == self.scratch.pt.physical_start() {
             return Err(LiveActiveTargetError::ReservedScratchEntry);
         }
         Ok(())
@@ -820,6 +914,7 @@ unsafe impl<I: ActiveScratchIo> AtomicPageTableTarget for ActiveScratchTarget<I>
         writes: &[JournalWrite],
         invalidations: &[VirtualPage],
     ) -> Result<(), Self::Error> {
+        self.require_owning_cpu()?;
         for write in writes {
             self.validate_location(write.table(), write.index())?;
             let _ = self.read_location(write.table(), write.index())?;
@@ -1296,9 +1391,15 @@ unsafe impl<'a, 'handoff, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
             _kernel_roles: kernel_roles,
             ap_trampoline,
             ap_trampoline_mapped: true,
+            scratch_bindings: self.scratch,
             scratch: ActiveScratchTarget {
-                scratch: self.scratch,
-                io: LiveActiveScratchIo,
+                scratch: self
+                    .scratch
+                    .for_cpu(crate::cpu::CpuIndex::BOOTSTRAP)
+                    .expect("C2 BSP scratch slot layout drifted"),
+                io: LiveActiveScratchIo {
+                    cpu: crate::cpu::CpuIndex::BOOTSTRAP,
+                },
                 poisoned: false,
                 _not_send_sync: core::marker::PhantomData,
             },
@@ -1311,6 +1412,23 @@ unsafe impl<'a, 'handoff, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
 impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ActiveDeepPaging<LiveActivePagingTarget<'root, RANGE_CAPACITY, ROLE_CAPACITY>>
 {
+    /// Returns the immutable, CPU-branded slot descriptor. Construction of a
+    /// live scratch target remains carrier-private; callers cannot retarget a
+    /// different CPU's PTE through this descriptor.
+    #[allow(
+        dead_code,
+        reason = "AP carrier construction remains parked until the stationary runtime join is complete"
+    )]
+    fn scratch_binding_for_cpu(
+        &self,
+        cpu: crate::cpu::CpuIndex,
+    ) -> Result<ScratchBinding, LiveActiveTargetError> {
+        self.target
+            .scratch_bindings
+            .for_cpu(cpu)
+            .ok_or(LiveActiveTargetError::InvalidIndex)
+    }
+
     pub(crate) fn install_ap_trampoline_image(
         &mut self,
         image: &[u8; PAGE_SIZE as usize],
@@ -1512,6 +1630,51 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         )
     }
 
+    /// Constructs the permanently retained architecture-private root for every
+    /// fixed CPU slot. This is intentionally separate from Process binding:
+    /// the resulting roots have no portable address-space identity.
+    #[allow(
+        unsafe_code,
+        reason = "the committed typed PML4 grant becomes a permanently retained CPU execution root"
+    )]
+    pub(crate) fn reserve_kernel_execution_roots(&mut self) -> Result<(), RootBindingError> {
+        for index in 0..crate::cpu::CPU_CAPACITY {
+            let cpu = crate::cpu::CpuIndex::new(index)
+                .unwrap_or_else(|| panic!("fixed CPU capacity contains invalid index"));
+            reserve_kernel_execution_root_parts(
+                &self.root,
+                &self.root_bindings,
+                &mut self.kernel_execution_roots,
+                self.target.roles,
+                &mut self.target.scratch,
+                cpu,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn kernel_execution_root(
+        &self,
+        cpu: crate::cpu::CpuIndex,
+    ) -> Result<&KernelExecutionRoot, RootBindingError> {
+        self.kernel_execution_roots.get(cpu)
+    }
+
+    /// Audited Process->CPU-kernel-root transition. The move-only Process
+    /// selection is consumed; callers must retain the returned kernel token
+    /// before performing any reaper work.
+    pub(crate) fn enter_kernel_execution_root(
+        &self,
+        active: ActiveRootSelection,
+    ) -> Result<ActiveKernelExecutionRoot, (RootBindingError, ActiveRootSelection)> {
+        let kernel = match self.kernel_execution_root(active.cpu()) {
+            Ok(kernel) => kernel,
+            Err(error) => return Err((error, active)),
+        };
+        self.root_bindings
+            .activate_kernel_execution_root(kernel, active, &mut LiveRootSwitchTarget)
+    }
+
     /// Reserves a distinct child PML4, initializes only its supervisor half
     /// from the typed primordial kernel-half borrow, then publishes the exact
     /// portable-key/Process binding. Every failure before root publication
@@ -1558,6 +1721,26 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .activate_selection(prepared, previous, &mut LiveRootSwitchTarget)
     }
 
+    /// Audited CPU-kernel-root -> Process transition. The kernel-root token is
+    /// move-only and the live target observes both CPU identity and CR3 before
+    /// accepting it, so a stale token cannot leak a different Process
+    /// residency through the carrier.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the allocation-free carrier must recover both move-only root-selection tokens"
+    )]
+    pub(crate) fn activate_from_kernel_execution_root(
+        &self,
+        prepared: PreparedRootSelection,
+        previous: ActiveKernelExecutionRoot,
+    ) -> Result<ActiveRootSelection, KernelRootSelectionFailure> {
+        self.root_bindings.activate_from_kernel_execution_root(
+            prepared,
+            previous,
+            &mut LiveRootSwitchTarget,
+        )
+    }
+
     pub(crate) fn abandon_process_root_selection(
         &self,
         prepared: PreparedRootSelection,
@@ -1590,6 +1773,88 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> ! {
         primordial::enter(self, modules)
     }
+}
+
+#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "the committed typed PML4 grant becomes one linearly owned PageTableRoot"
+)]
+fn reserve_kernel_execution_root_parts<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
+    primordial_root: &PageTableRoot,
+    root_bindings: &AddressSpaceRootBindings<
+        LIVE_ADDRESS_SPACE_CAPACITY,
+        { crate::cpu::CPU_CAPACITY },
+    >,
+    execution_roots: &mut KernelExecutionRoots<{ crate::cpu::CPU_CAPACITY }>,
+    roles: &mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
+    scratch: &mut ActiveScratchTarget<LiveActiveScratchIo>,
+    cpu: crate::cpu::CpuIndex,
+) -> Result<(), RootBindingError> {
+    if execution_roots.get(cpu).is_ok() {
+        return Err(RootBindingError::AlreadyActive);
+    }
+    let kernel_half = root_bindings.kernel_half()?;
+    let owner = roles
+        .create_table_owner()
+        .map_err(RootBindingError::FrameRole)?;
+    let allocation = roles.allocate(1).map_err(RootBindingError::FrameRole)?;
+    let frame = match FrameAddress::new(
+        allocation.physical_start(),
+        primordial_root.physical_limit(),
+    ) {
+        Ok(frame) => frame,
+        Err(_) => {
+            roles
+                .cancel_allocation(allocation)
+                .unwrap_or_else(|_| panic!("invalid execution-root allocation rollback drifted"));
+            return Err(RootBindingError::RootMismatch);
+        }
+    };
+    if scratch.zero_allocator_frame(frame).is_err() {
+        roles
+            .cancel_allocation(allocation)
+            .unwrap_or_else(|_| panic!("execution-root allocation rollback drifted"));
+        return Err(RootBindingError::RootMismatch);
+    }
+    let zeroed = unsafe { roles.assume_zeroed(allocation) }
+        .unwrap_or_else(|_| panic!("execution-root zeroed transition drifted"));
+    let candidate = match roles.prepare_table(zeroed, owner, TableLevel::Pml4) {
+        Ok(candidate) => candidate,
+        Err(failure) => {
+            let error = failure.error();
+            roles
+                .cancel_zeroed(failure.into_grant())
+                .unwrap_or_else(|_| panic!("execution-root candidate rollback drifted"));
+            return Err(RootBindingError::FrameRole(error));
+        }
+    };
+    if let Err(error) = kernel_half.install(scratch, frame) {
+        roles
+            .cancel_table_candidate(candidate)
+            .unwrap_or_else(|_| panic!("execution-root kernel-half rollback drifted"));
+        return Err(error);
+    }
+    let identity = match roles.commit_table(candidate, None) {
+        Ok(identity) => identity,
+        Err(failure) => {
+            let error = failure.error();
+            roles
+                .cancel_table_candidate(failure.into_grant())
+                .unwrap_or_else(|_| panic!("execution-root commit rollback drifted"));
+            return Err(RootBindingError::FrameRole(error));
+        }
+    };
+    let root = unsafe {
+        PageTableRoot::from_owned_root(identity.physical_start(), primordial_root.capabilities)
+    }
+    .unwrap_or_else(|_| panic!("typed execution-root PML4 address became invalid"));
+    execution_roots
+        .bind(cpu, root, identity)
+        .unwrap_or_else(|error| {
+            panic!("preflighted execution-root binding rejected after commit: {error:?}")
+        });
+    Ok(())
 }
 
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
@@ -1715,6 +1980,8 @@ impl<H, T: Cr3ActivationTarget<H>> PreparedActivation<H, T> {
             user_pins: crate::memory::usercopy::UserPinTracker::new(),
             #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
             root_bindings: AddressSpaceRootBindings::new(),
+            #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+            kernel_execution_roots: KernelExecutionRoots::new(),
         }
     }
 }

@@ -6,6 +6,11 @@ mod live;
 mod msr;
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 mod runtime_binding;
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+mod stationary_runtime;
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) use stationary_runtime::{RuntimePhaseReservation, StationaryGuardDepth};
 
 #[allow(
     unused_imports,
@@ -38,7 +43,8 @@ pub(crate) use super::exceptions::{
 pub(crate) use live::{
     SyscallInstallError, bind_current_thread_stack, bind_native_runtime_carrier_for_slot,
     bind_native_runtime_user_exception_handler, current_binding_generation,
-    current_cpu_index_for_diagnostics, enter_bound_idle_scheduler, enter_bound_validated_user,
+    current_cpu_index_for_diagnostics, current_cpu_is_on_terminal_reaper_stack,
+    current_native_usercopy_is_quiescent, enter_bound_idle_scheduler, enter_bound_validated_user,
     enter_native_syscall_runtime, first_run_thread_entry_rip, install_syscall_boundary,
     install_syscall_boundary_for_slot, release_native_runtime_carrier_for_slot,
     validate_live_syscall_boundary,

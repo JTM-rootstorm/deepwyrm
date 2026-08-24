@@ -30,6 +30,61 @@ fn c2_source_has_one_retire_then_one_cr3_write() {
 }
 
 #[test]
+fn i1_per_cpu_scratch_uses_disjoint_atomic_cells_not_page_wide_mut_aliases() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let activation = fs::read_to_string(manifest_dir.join("src/arch/x86_64/mm/activation.rs"))
+        .expect("read live activation source");
+    let build = fs::read_to_string(manifest_dir.join("src/arch/x86_64/mm/activation/build.rs"))
+        .expect("read scratch construction source");
+    assert!(activation.contains("struct PerCpuScratchBindings"));
+    assert!(activation.contains("struct ScratchBinding"));
+    assert!(activation.contains("AtomicU64"));
+    assert!(activation.contains("require_owning_cpu"));
+    assert!(activation.contains("LiveActiveTargetError::WrongCpu"));
+    assert!(activation.contains("self.io.invalidate(self.scratch.window_page)"));
+    assert!(activation.contains("for_cpu(crate::cpu::CpuIndex::BOOTSTRAP)"));
+    assert!(activation.contains("pub(crate) struct LiveActiveScratchIo {"));
+    assert!(activation.contains("cpu: crate::cpu::CpuIndex::BOOTSTRAP"));
+    let live_io = activation
+        .split_once("impl ActiveScratchIo for LiveActiveScratchIo")
+        .expect("live scratch IO implementation")
+        .1
+        .split_once("impl<I: ActiveScratchIo> journal_target_seal")
+        .expect("live scratch IO extent")
+        .0;
+    assert!(!live_io.contains("current_cpu_index_for_diagnostics"));
+    let validation = activation
+        .split_once("fn validate_location")
+        .expect("scratch location validator")
+        .1
+        .split_once("fn read_location")
+        .expect("scratch location validator extent")
+        .0;
+    assert!(validation.contains("table.address() == self.scratch.pt.physical_start()"));
+    let apply = activation
+        .split_once("fn apply(")
+        .expect("scratch apply")
+        .1
+        .split_once("impl<'root")
+        .expect("scratch apply extent")
+        .0;
+    let owner = apply
+        .find("self.require_owning_cpu()?")
+        .expect("apply owner gate");
+    let leaf = apply
+        .find("self.io.load(self.scratch_leaf_address())")
+        .expect("apply leaf load");
+    assert!(
+        owner < leaf,
+        "wrong CPU must reject before even an empty leaf load"
+    );
+    assert!(!activation.contains("&mut [u64; ENTRY_COUNT]"));
+    assert!(!activation.contains("&mut [u64; 512]"));
+    assert!(build.contains("for slot in scratch"));
+    assert!(build.contains(".slots()"));
+}
+
+#[test]
 fn c2_linker_bounds_and_linearity_markers_are_unique() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let activation = fs::read_to_string(manifest_dir.join("src/arch/x86_64/mm/activation.rs"))

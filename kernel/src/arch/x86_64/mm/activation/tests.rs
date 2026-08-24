@@ -84,15 +84,31 @@ enum ScratchIoEvent {
     Invalidate(u64),
 }
 
-#[derive(Default)]
 struct FakeActiveScratchIo {
     memory: BTreeMap<u64, u64>,
     events: Vec<ScratchIoEvent>,
     install_attempts: usize,
     fail_install_attempt: Option<usize>,
+    current_cpu: CpuIndex,
+}
+
+impl Default for FakeActiveScratchIo {
+    fn default() -> Self {
+        Self {
+            memory: BTreeMap::new(),
+            events: Vec::new(),
+            install_attempts: 0,
+            fail_install_attempt: None,
+            current_cpu: CpuIndex::BOOTSTRAP,
+        }
+    }
 }
 
 impl ActiveScratchIo for FakeActiveScratchIo {
+    fn current_cpu(&self) -> Option<CpuIndex> {
+        Some(self.current_cpu)
+    }
+
     fn load(&mut self, address: u64) -> u64 {
         self.events.push(ScratchIoEvent::Load(address));
         *self.memory.get(&address).unwrap_or(&0)
@@ -455,14 +471,27 @@ fn graph_fixture() -> GraphFixture {
             add_path(&mut access.inactive, page, kernel_tables, physical | flags);
         }
     }
-    add_path(&mut access.inactive, FIXTURE_SCRATCH, scratch_tables, 0);
-    access.inactive.insert(
-        (
-            scratch_pt.physical_start(),
-            page_index(FIXTURE_SCRATCH + PAGE_SIZE, 0),
-        ),
-        scratch_pt.physical_start() | PRESENT | WRITABLE | NO_EXECUTE,
-    );
+    // Every fixed CPU owns a distinct leaf/control/MMIO triplet, even though
+    // the control aliases intentionally reach the one stationary scratch PT.
+    // The live path accesses only its selected atomic PTE cell; the fixture
+    // must model each legitimate alias so graph validation can reject extras.
+    for slot in PerCpuScratchBindings::new(DeepScratchBinding {
+        window_page: FIXTURE_SCRATCH,
+        control_page: FIXTURE_SCRATCH + PAGE_SIZE,
+        pt: scratch_pt,
+    })
+    .slots()
+    .unwrap()
+    {
+        add_path(&mut access.inactive, slot.window_page, scratch_tables, 0);
+        access.inactive.insert(
+            (
+                scratch_pt.physical_start(),
+                page_index(slot.control_page, 0),
+            ),
+            scratch_pt.physical_start() | PRESENT | WRITABLE | NO_EXECUTE,
+        );
+    }
     let staged = unsafe {
         roles.stage_kernel_image_roles([
             (
@@ -550,11 +579,11 @@ fn graph_accepts_only_the_typed_low_rx_ap_trampoline_leaf() {
                 fixture.capabilities.physical_limit(),
             )
             .unwrap(),
-            DeepScratchBinding {
+            PerCpuScratchBindings::new(DeepScratchBinding {
                 window_page: FIXTURE_SCRATCH,
                 control_page: FIXTURE_SCRATCH + PAGE_SIZE,
                 pt: fixture.scratch_pt,
-            },
+            }),
             &fixture.segments,
             fixture.ist,
             &[],
@@ -584,11 +613,11 @@ fn graph_accepts_only_the_typed_low_rx_ap_trampoline_leaf() {
                 fixture.capabilities.physical_limit(),
             )
             .unwrap(),
-            DeepScratchBinding {
+            PerCpuScratchBindings::new(DeepScratchBinding {
                 window_page: FIXTURE_SCRATCH,
                 control_page: FIXTURE_SCRATCH + PAGE_SIZE,
                 pt: fixture.scratch_pt,
-            },
+            }),
             &fixture.segments,
             fixture.ist,
             &[],
@@ -606,7 +635,8 @@ fn fake_active_scratch(
     fail_install_attempt: Option<usize>,
 ) -> ActiveScratchTarget<FakeActiveScratchIo> {
     ActiveScratchTarget {
-        scratch: DeepScratchBinding {
+        scratch: ScratchBinding {
+            cpu: CpuIndex::BOOTSTRAP,
             window_page: FIXTURE_SCRATCH,
             control_page: FIXTURE_SCRATCH + PAGE_SIZE,
             pt: scratch_pt,
@@ -618,6 +648,124 @@ fn fake_active_scratch(
         poisoned: false,
         _not_send_sync: core::marker::PhantomData,
     }
+}
+
+#[test]
+fn per_cpu_scratch_slots_have_disjoint_leaf_control_and_mmio_entries() {
+    let fixture = graph_fixture();
+    let slots = PerCpuScratchBindings::new(DeepScratchBinding {
+        window_page: FIXTURE_SCRATCH,
+        control_page: FIXTURE_SCRATCH + PAGE_SIZE,
+        pt: fixture.scratch_pt,
+    })
+    .slots()
+    .expect("four fixed scratch slots fit the authenticated scratch PT");
+    assert_eq!(slots.len(), crate::cpu::CPU_CAPACITY);
+    for (index, slot) in slots.iter().enumerate() {
+        assert_eq!(slot.cpu.index(), index);
+        assert_eq!(slot.pt, fixture.scratch_pt);
+        assert_eq!(slot.control_page, slot.window_page + PAGE_SIZE);
+        assert_eq!(slot.control_page >> 21, FIXTURE_SCRATCH >> 21);
+        for prior in &slots[..index] {
+            assert_ne!(slot.window_page, prior.window_page);
+            assert_ne!(slot.control_page, prior.control_page);
+            assert_ne!(
+                slot.control_page + PAGE_SIZE,
+                prior.control_page + PAGE_SIZE
+            );
+        }
+    }
+}
+
+#[test]
+fn scratch_binding_rejects_cross_cpu_before_touching_its_leaf() {
+    let fixture = graph_fixture();
+    let slot = PerCpuScratchBindings::new(DeepScratchBinding {
+        window_page: FIXTURE_SCRATCH,
+        control_page: FIXTURE_SCRATCH + PAGE_SIZE,
+        pt: fixture.scratch_pt,
+    })
+    .for_cpu(CpuIndex::BOOTSTRAP)
+    .unwrap();
+    let mut target = ActiveScratchTarget {
+        scratch: slot,
+        io: FakeActiveScratchIo {
+            current_cpu: CpuIndex::new(1).unwrap(),
+            ..FakeActiveScratchIo::default()
+        },
+        poisoned: false,
+        _not_send_sync: core::marker::PhantomData,
+    };
+    let frame = FrameAddress::new(0x90_000, fixture.capabilities.physical_limit()).unwrap();
+    assert_eq!(
+        target.install_mmio_frame(frame),
+        Err(LiveActiveTargetError::WrongCpu)
+    );
+    assert!(target.io.events.is_empty());
+}
+
+#[test]
+fn wrong_cpu_empty_apply_rejects_before_the_scratch_leaf_load() {
+    let fixture = graph_fixture();
+    let slot = PerCpuScratchBindings::new(DeepScratchBinding {
+        window_page: FIXTURE_SCRATCH,
+        control_page: FIXTURE_SCRATCH + PAGE_SIZE,
+        pt: fixture.scratch_pt,
+    })
+    .for_cpu(CpuIndex::BOOTSTRAP)
+    .unwrap();
+    let mut target = ActiveScratchTarget {
+        scratch: slot,
+        io: FakeActiveScratchIo {
+            current_cpu: CpuIndex::new(1).unwrap(),
+            ..FakeActiveScratchIo::default()
+        },
+        poisoned: false,
+        _not_send_sync: core::marker::PhantomData,
+    };
+    assert_eq!(target.apply(&[], &[]), Err(LiveActiveTargetError::WrongCpu));
+    assert!(target.io.events.is_empty());
+}
+
+#[test]
+fn cpu_scratch_migration_selects_a_new_window_and_clears_independently() {
+    let fixture = graph_fixture();
+    let bindings = PerCpuScratchBindings::new(DeepScratchBinding {
+        window_page: FIXTURE_SCRATCH,
+        control_page: FIXTURE_SCRATCH + PAGE_SIZE,
+        pt: fixture.scratch_pt,
+    });
+    let first = bindings.for_cpu(CpuIndex::BOOTSTRAP).unwrap();
+    let second_cpu = CpuIndex::new(1).unwrap();
+    let second = bindings.for_cpu(second_cpu).unwrap();
+    let table = FrameAddress::new(0x90_000, fixture.capabilities.physical_limit()).unwrap();
+    let mut cpu0 = ActiveScratchTarget {
+        scratch: first,
+        io: FakeActiveScratchIo::default(),
+        poisoned: false,
+        _not_send_sync: core::marker::PhantomData,
+    };
+    let mut cpu1 = ActiveScratchTarget {
+        scratch: second,
+        io: FakeActiveScratchIo {
+            current_cpu: second_cpu,
+            ..FakeActiveScratchIo::default()
+        },
+        poisoned: false,
+        _not_send_sync: core::marker::PhantomData,
+    };
+
+    assert_eq!(cpu0.read_location(table, 7), Ok(0));
+    assert_eq!(cpu1.read_location(table, 7), Ok(0));
+    assert_ne!(cpu0.scratch_leaf_address(), cpu1.scratch_leaf_address());
+    assert_eq!(cpu0.io.memory.get(&cpu0.scratch_leaf_address()), Some(&0));
+    assert_eq!(cpu1.io.memory.get(&cpu1.scratch_leaf_address()), Some(&0));
+    assert!(cpu0.io.events.iter().any(|event| {
+        matches!(event, ScratchIoEvent::Invalidate(page) if *page == first.window_page)
+    }));
+    assert!(cpu1.io.events.iter().any(|event| {
+        matches!(event, ScratchIoEvent::Invalidate(page) if *page == second.window_page)
+    }));
 }
 
 #[test]
@@ -660,7 +808,7 @@ fn active_scratch_error_restores_private_leaf_without_owned_write_or_requested_i
 }
 
 #[test]
-fn active_scratch_reserves_window_control_and_mmio_entries_without_io() {
+fn active_scratch_reserves_the_entire_shared_control_pt_without_io() {
     let fixture = graph_fixture();
     let mut target = fake_active_scratch(fixture.scratch_pt, None);
     let table = FrameAddress::new(
@@ -668,13 +816,55 @@ fn active_scratch_reserves_window_control_and_mmio_entries_without_io() {
         fixture.capabilities.physical_limit(),
     )
     .unwrap();
+    let cpu1 = PerCpuScratchBindings::new(DeepScratchBinding {
+        window_page: FIXTURE_SCRATCH,
+        control_page: FIXTURE_SCRATCH + PAGE_SIZE,
+        pt: fixture.scratch_pt,
+    })
+    .for_cpu(CpuIndex::new(1).unwrap())
+    .unwrap();
     for index in [
+        0,
         target.scratch_leaf_index(),
         target.scratch_control_index(),
         target.mmio_leaf_index(),
+        ((cpu1.window_page >> 12) & 0x1ff) as usize,
     ] {
         assert_eq!(
             target.read_entry(table, index),
+            Err(LiveActiveTargetError::ReservedScratchEntry)
+        );
+    }
+    assert!(target.io.events.is_empty());
+}
+
+#[test]
+fn cpu0_cannot_journal_cpu1_scratch_leaf_or_control_entries() {
+    let fixture = graph_fixture();
+    let mut target = fake_active_scratch(fixture.scratch_pt, None);
+    let table = FrameAddress::new(
+        fixture.scratch_pt.physical_start(),
+        fixture.capabilities.physical_limit(),
+    )
+    .unwrap();
+    let cpu1 = PerCpuScratchBindings::new(DeepScratchBinding {
+        window_page: FIXTURE_SCRATCH,
+        control_page: FIXTURE_SCRATCH + PAGE_SIZE,
+        pt: fixture.scratch_pt,
+    })
+    .for_cpu(CpuIndex::new(1).unwrap())
+    .unwrap();
+    for index in [
+        ((cpu1.window_page >> 12) & 0x1ff) as usize,
+        ((cpu1.control_page >> 12) & 0x1ff) as usize,
+    ] {
+        assert_eq!(
+            target.read_entry(table, index),
+            Err(LiveActiveTargetError::ReservedScratchEntry)
+        );
+        let write = JournalWrite::test_new(table, index, 0x1234);
+        assert_eq!(
+            target.apply(&[write], &[]),
             Err(LiveActiveTargetError::ReservedScratchEntry)
         );
     }
@@ -1123,7 +1313,10 @@ fn graph_rejects_occupied_deep_scratch_leaf() {
         (fixture.scratch_tables[3], page_index(FIXTURE_SCRATCH, 0)),
         0x24_0000 | PRESENT | WRITABLE | NO_EXECUTE,
     );
-    assert_eq!(fixture.validate(), Err(InactiveGraphError::ExtraLeaf));
+    assert_eq!(
+        fixture.validate(),
+        Err(InactiveGraphError::InvalidScratchPath)
+    );
 }
 
 #[test]
@@ -1190,7 +1383,10 @@ fn graph_rejects_second_scratch_control_alias() {
     fixture.access.inactive.insert(
         (
             fixture.scratch_pt.physical_start(),
-            page_index(FIXTURE_SCRATCH + 2 * PAGE_SIZE, 0),
+            page_index(
+                FIXTURE_SCRATCH + 3 * crate::cpu::CPU_CAPACITY as u64 * PAGE_SIZE,
+                0,
+            ),
         ),
         fixture.scratch_pt.physical_start() | PRESENT | WRITABLE | NO_EXECUTE,
     );
@@ -1631,6 +1827,10 @@ unsafe impl RootSwitchTarget for RecordedRootSwitches {
         self.cpu
     }
 
+    fn current_root_physical_start(&self) -> Option<u64> {
+        self.roots.last().copied()
+    }
+
     fn load_cr3_full_flush(&mut self, root_physical_start: u64) {
         self.roots.push(root_physical_start);
     }
@@ -1933,6 +2133,202 @@ fn last_runnable_child_switches_to_primordial_before_owned_root_teardown() {
 #[test]
 #[allow(
     unsafe_code,
+    reason = "synthetic PML4s exercise the architecture-private execution-root switch contract"
+)]
+fn kernel_execution_root_isolated_from_process_bindings_and_switches_both_directions() {
+    let mut roles = synthetic_frame_role_manager::<1, 16>(0x38_000, 8);
+    let primordial_owner = roles.create_table_owner().unwrap();
+    let child_owner = roles.create_table_owner().unwrap();
+    let kernel_owner = roles.create_table_owner().unwrap();
+    let primordial_identity = commit_table(&mut roles, primordial_owner, TableLevel::Pml4, None);
+    let child_identity = commit_table(&mut roles, child_owner, TableLevel::Pml4, None);
+    let kernel_identity = commit_table(&mut roles, kernel_owner, TableLevel::Pml4, None);
+    assert_ne!(kernel_identity.owner(), primordial_identity.owner());
+    assert_ne!(kernel_identity.owner(), child_identity.owner());
+    let capabilities = PagingCapabilities::validate(40, true, true, true).unwrap();
+    let primordial_root = unsafe {
+        PageTableRoot::from_owned_root(primordial_identity.physical_start(), capabilities)
+    }
+    .unwrap();
+    let child_root =
+        unsafe { PageTableRoot::from_owned_root(child_identity.physical_start(), capabilities) }
+            .unwrap();
+    let kernel_root =
+        unsafe { PageTableRoot::from_owned_root(kernel_identity.physical_start(), capabilities) }
+            .unwrap();
+    let (primordial_process, child_process) = process_keys();
+    let mut authority =
+        unsafe { crate::memory::address_region::AddressSpaceAuthority::<2, 2>::new() };
+    let primordial_space = authority.create_address_space().unwrap();
+    let child_space = authority.create_address_space().unwrap();
+    let mut bindings = AddressSpaceRootBindings::<2, 1>::new();
+    bindings
+        .bind_primordial(
+            &roles,
+            primordial_space,
+            primordial_process,
+            &primordial_root,
+            primordial_identity,
+        )
+        .unwrap();
+    bindings
+        .bind_owned(
+            &roles,
+            child_space,
+            child_process,
+            child_root,
+            child_identity,
+        )
+        .unwrap_or_else(|_| panic!("child root binding succeeds"));
+    let cpu = CpuIndex::BOOTSTRAP;
+    let mut execution_roots = KernelExecutionRoots::<1>::new();
+    execution_roots
+        .bind(cpu, kernel_root, kernel_identity)
+        .unwrap();
+    assert_eq!(execution_roots.get(cpu).unwrap().cpu(), cpu);
+    assert_eq!(
+        bindings
+            .root_for_process(&primordial_root, child_process)
+            .unwrap()
+            .1,
+        child_identity
+    );
+
+    let mut switches = RecordedRootSwitches {
+        cpu: Some(cpu),
+        roots: Vec::new(),
+    };
+    let child = bindings
+        .activate_selection(
+            bindings
+                .prepare_selection(cpu, child_process, child_space)
+                .unwrap(),
+            None,
+            &mut switches,
+        )
+        .unwrap_or_else(|failure| panic!("initial Process switch failed: {:?}", failure.error()));
+    // A Process token alone is not authority to leave the Process root: the
+    // observed current CR3 must still name that exact root. The failed
+    // preflight returns the move-only selection intact and performs no kernel
+    // root load or residency release.
+    switches
+        .roots
+        .push(child_identity.physical_start() + PAGE_SIZE);
+    let failure = bindings
+        .activate_kernel_execution_root(execution_roots.get(cpu).unwrap(), child, &mut switches)
+        .unwrap_err();
+    let (error, child) = failure;
+    assert_eq!(error, RootBindingError::RootMismatch);
+    assert!(child.selects_exact(cpu, child_process, child_space));
+    assert_eq!(switches.roots.len(), 2);
+    switches.roots.pop();
+    let kernel = bindings
+        .activate_kernel_execution_root(execution_roots.get(cpu).unwrap(), child, &mut switches)
+        .unwrap();
+    assert_eq!(kernel.cpu(), cpu);
+    assert_eq!(
+        kernel.root_physical_start(),
+        kernel_identity.physical_start()
+    );
+
+    let child = bindings
+        .activate_from_kernel_execution_root(
+            bindings
+                .prepare_selection(cpu, child_process, child_space)
+                .unwrap(),
+            kernel,
+            &mut switches,
+        )
+        .unwrap_or_else(|failure| panic!("kernel-to-Process switch failed: {:?}", failure.error()));
+    assert!(child.selects_exact(cpu, child_process, child_space));
+    assert_eq!(
+        switches.roots,
+        [
+            child_identity.physical_start(),
+            kernel_identity.physical_start(),
+            child_identity.physical_start(),
+        ]
+    );
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "synthetic CPU mismatch proves kernel-to-Process pre-CR3 token recovery"
+)]
+fn kernel_execution_root_switch_recovers_tokens_before_cr3_on_cpu_mismatch() {
+    let mut roles = synthetic_frame_role_manager::<1, 12>(0x3a_000, 6);
+    let process_owner = roles.create_table_owner().unwrap();
+    let kernel_owner = roles.create_table_owner().unwrap();
+    let process_identity = commit_table(&mut roles, process_owner, TableLevel::Pml4, None);
+    let kernel_identity = commit_table(&mut roles, kernel_owner, TableLevel::Pml4, None);
+    let capabilities = PagingCapabilities::validate(40, true, true, true).unwrap();
+    let process_root =
+        unsafe { PageTableRoot::from_owned_root(process_identity.physical_start(), capabilities) }
+            .unwrap();
+    let kernel_root =
+        unsafe { PageTableRoot::from_owned_root(kernel_identity.physical_start(), capabilities) }
+            .unwrap();
+    let (process, _) = process_keys();
+    let mut authority =
+        unsafe { crate::memory::address_region::AddressSpaceAuthority::<1, 1>::new() };
+    let address_space = authority.create_address_space().unwrap();
+    let mut bindings = AddressSpaceRootBindings::<1, 2>::new();
+    bindings
+        .bind_owned(
+            &roles,
+            address_space,
+            process,
+            process_root,
+            process_identity,
+        )
+        .unwrap_or_else(|_| panic!("process binding succeeds"));
+    let cpu0 = CpuIndex::BOOTSTRAP;
+    let cpu1 = CpuIndex::new(1).unwrap();
+    let mut execution_roots = KernelExecutionRoots::<2>::new();
+    execution_roots
+        .bind(cpu0, kernel_root, kernel_identity)
+        .unwrap();
+    let mut switches = RecordedRootSwitches {
+        cpu: Some(cpu1),
+        roots: Vec::new(),
+    };
+    let prepared = bindings
+        .prepare_selection(cpu0, process, address_space)
+        .unwrap();
+    let kernel = execution_roots.get(cpu0).unwrap().test_assume_active();
+    let failure = bindings
+        .activate_from_kernel_execution_root(prepared, kernel, &mut switches)
+        .unwrap_err();
+    let (error, prepared, recovered_kernel) = failure.into_parts();
+    assert_eq!(error, RootBindingError::CpuMismatch);
+    assert_eq!(recovered_kernel.cpu(), cpu0);
+    assert_eq!(prepared.cpu(), cpu0);
+    assert!(switches.roots.is_empty());
+    bindings.abandon_selection(prepared).unwrap();
+
+    let prepared = bindings
+        .prepare_selection(cpu0, process, address_space)
+        .unwrap();
+    let kernel = execution_roots.get(cpu0).unwrap().test_assume_active();
+    let mut wrong_root = RecordedRootSwitches {
+        cpu: Some(cpu0),
+        roots: vec![kernel_identity.physical_start() + PAGE_SIZE],
+    };
+    let failure = bindings
+        .activate_from_kernel_execution_root(prepared, kernel, &mut wrong_root)
+        .unwrap_err();
+    let (error, prepared, recovered_kernel) = failure.into_parts();
+    assert_eq!(error, RootBindingError::RootMismatch);
+    assert_eq!(recovered_kernel.cpu(), cpu0);
+    assert_eq!(prepared.cpu(), cpu0);
+    assert_eq!(wrong_root.roots.len(), 1);
+    bindings.abandon_selection(prepared).unwrap();
+}
+
+#[test]
+#[allow(
+    unsafe_code,
     reason = "synthetic scheduler siblings exercise retained move-only root ownership without live CR3 access"
 )]
 fn same_process_sibling_switch_retains_exact_active_root_selection() {
@@ -2033,6 +2429,10 @@ fn key_root_mismatch_is_rejected_and_residency_blocks_teardown() {
     let resident = bindings
         .prepare_selection(CpuIndex::BOOTSTRAP, process_b, key_b)
         .unwrap();
+    // The rejected mismatched bind above must not consume or publish an
+    // ambiguous epoch: primordial is generation 1, this first successful
+    // child binding is generation 2.
+    assert_eq!(resident.binding_generation(), 2);
     let resident_pins = UserPinTracker::<1>::new();
     assert_eq!(
         bindings.teardown_empty_owned(
@@ -2061,6 +2461,114 @@ fn key_root_mismatch_is_rejected_and_residency_blocks_teardown() {
         bindings.root_for_process(&root_a, process_b),
         Err(RootBindingError::Missing)
     ));
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "synthetic roots verify that a released Process/key pair never reuses its binding epoch"
+)]
+fn owned_root_rebind_mints_a_distinct_nonzero_binding_epoch() {
+    let mut roles = synthetic_frame_role_manager::<1, 16>(0x31_000, 16);
+    let owner_a = roles.create_table_owner().unwrap();
+    let owner_b = roles.create_table_owner().unwrap();
+    let identity_a = commit_table(&mut roles, owner_a, TableLevel::Pml4, None);
+    let identity_b = commit_table(&mut roles, owner_b, TableLevel::Pml4, None);
+    let capabilities = PagingCapabilities::validate(40, true, true, true).unwrap();
+    let root_a =
+        unsafe { PageTableRoot::from_owned_root(identity_a.physical_start(), capabilities) }
+            .unwrap();
+    let root_b =
+        unsafe { PageTableRoot::from_owned_root(identity_b.physical_start(), capabilities) }
+            .unwrap();
+    let (process_a, process_b) = process_keys();
+    let mut authority =
+        unsafe { crate::memory::address_region::AddressSpaceAuthority::<2, 2>::new() };
+    let key_a = authority.create_address_space().unwrap();
+    let key_b = authority.create_address_space().unwrap();
+    let mut bindings = AddressSpaceRootBindings::<2, 1>::new();
+    bindings
+        .bind_primordial(&roles, key_a, process_a, &root_a, identity_a)
+        .unwrap();
+    bindings
+        .bind_owned(&roles, key_b, process_b, root_b, identity_b)
+        .unwrap();
+    let first = bindings
+        .prepare_selection(CpuIndex::BOOTSTRAP, process_b, key_b)
+        .unwrap();
+    assert_eq!(first.binding_generation(), 2);
+    bindings.abandon_selection(first).unwrap();
+    let pins = UserPinTracker::<1>::new();
+    bindings
+        .teardown_empty_owned(
+            &mut roles,
+            &mut empty_flat_root_target(),
+            process_b,
+            key_b,
+            &pins,
+            pins.reserve_teardown(key_b).unwrap(),
+        )
+        .unwrap();
+    let owner_c = roles.create_table_owner().unwrap();
+    let identity_c = commit_table(&mut roles, owner_c, TableLevel::Pml4, None);
+    let root_c =
+        unsafe { PageTableRoot::from_owned_root(identity_c.physical_start(), capabilities) }
+            .unwrap();
+    bindings
+        .bind_owned(&roles, key_b, process_b, root_c, identity_c)
+        .unwrap();
+    let rebound = bindings
+        .prepare_selection(CpuIndex::BOOTSTRAP, process_b, key_b)
+        .unwrap();
+    assert_eq!(rebound.binding_generation(), 3);
+    assert_ne!(rebound.binding_generation(), 0);
+    bindings.abandon_selection(rebound).unwrap();
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "synthetic roots make binding-generation exhaustion deterministic without consuming a candidate root"
+)]
+fn binding_generation_exhaustion_fails_closed_without_publishing_a_root() {
+    let mut roles = synthetic_frame_role_manager::<1, 16>(0x32_000, 8);
+    let owner_a = roles.create_table_owner().unwrap();
+    let owner_b = roles.create_table_owner().unwrap();
+    let identity_a = commit_table(&mut roles, owner_a, TableLevel::Pml4, None);
+    let identity_b = commit_table(&mut roles, owner_b, TableLevel::Pml4, None);
+    let capabilities = PagingCapabilities::validate(40, true, true, true).unwrap();
+    let root_a =
+        unsafe { PageTableRoot::from_owned_root(identity_a.physical_start(), capabilities) }
+            .unwrap();
+    let root_b =
+        unsafe { PageTableRoot::from_owned_root(identity_b.physical_start(), capabilities) }
+            .unwrap();
+    let (process_a, process_b) = process_keys();
+    let mut authority =
+        unsafe { crate::memory::address_region::AddressSpaceAuthority::<2, 2>::new() };
+    let key_a = authority.create_address_space().unwrap();
+    let key_b = authority.create_address_space().unwrap();
+    let mut bindings = AddressSpaceRootBindings::<2, 1>::new();
+    bindings.set_next_binding_generation_for_test(u64::MAX);
+    bindings
+        .bind_primordial(&roles, key_a, process_a, &root_a, identity_a)
+        .unwrap();
+    let (error, returned_root) = bindings
+        .bind_owned(&roles, key_b, process_b, root_b, identity_b)
+        .unwrap_err();
+    assert_eq!(error, RootBindingError::GenerationExhausted);
+    assert_eq!(returned_root.frame().address(), identity_b.physical_start());
+    assert!(matches!(
+        bindings.prepare_selection(CpuIndex::BOOTSTRAP, process_b, key_b),
+        Err(RootBindingError::Missing)
+    ));
+    assert_eq!(
+        bindings
+            .prepare_selection(CpuIndex::BOOTSTRAP, process_a, key_a)
+            .unwrap()
+            .binding_generation(),
+        u64::MAX
+    );
 }
 
 #[test]
