@@ -2875,19 +2875,35 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 (crate::arch::x86_64::rendezvous::MailboxNotification::None, true) => {
                     if runtime.wait_controls[self.cpu.index()].is_clear() {
                         match suspended_claim.and_then(|claim| {
-                            runtime.shared.execution.scheduler_state(claim.thread())
+                            runtime
+                                .shared
+                                .execution
+                                .scheduler_state(claim.thread())
+                                .map(|state| (claim, state))
                         }) {
-                            None => panic!("resume reached a terminally retired switched carrier"),
-                            Some(crate::task::SchedulerThreadState::Blocked) => {
+                            None if runtime.stopping_claim.is_some() => {
+                                panic!("resume crossed an in-progress remote-stop carrier")
+                            }
+                            None if runtime.deferred_current.is_some() => {
+                                panic!("resume crossed an in-progress local terminal carrier")
+                            }
+                            None if suspended_claim.is_some_and(|claim| {
+                                runtime.local.physically_executes(claim.thread())
+                            }) =>
+                            {
+                                panic!("resume physically executes its terminally retired carrier")
+                            }
+                            None => panic!("resume reached another terminally retired carrier"),
+                            Some((_, crate::task::SchedulerThreadState::Blocked)) => {
                                 panic!("resume reached a still-blocked switched carrier")
                             }
-                            Some(crate::task::SchedulerThreadState::Runnable) => {
+                            Some((_, crate::task::SchedulerThreadState::Runnable)) => {
                                 panic!("resume reached an unclaimed runnable switched carrier")
                             }
-                            Some(crate::task::SchedulerThreadState::Running) => {
+                            Some((_, crate::task::SchedulerThreadState::Running)) => {
                                 panic!("resume reached a suspension whose Thread runs elsewhere")
                             }
-                            Some(crate::task::SchedulerThreadState::Reserved) => {
+                            Some((_, crate::task::SchedulerThreadState::Reserved)) => {
                                 panic!("resume reached a reserved switched carrier")
                             }
                         }
