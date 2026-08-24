@@ -1572,15 +1572,29 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .as_ref()
             .is_some_and(|root| root.selects_exact(self.cpu, process, address_space))
         {
-            self.active
-                .validate_current_process_root_selection(
-                    self.active_root.as_ref().expect("active root"),
-                    process,
-                    address_space,
-                )
-                .unwrap_or_else(|error| {
-                    panic!("retained scheduler-current root is not physically active: {error:?}")
-                });
+            if let Err(error) = self.active.validate_current_process_root_selection(
+                self.active_root.as_ref().expect("active root"),
+                process,
+                address_space,
+            ) {
+                match error {
+                    super::RootBindingError::CpuMismatch => {
+                        panic!("retained scheduler-current root names the wrong CPU")
+                    }
+                    super::RootBindingError::RootMismatch => {
+                        panic!("retained scheduler-current root differs from hardware")
+                    }
+                    super::RootBindingError::Missing => {
+                        panic!("retained scheduler-current root lost its binding")
+                    }
+                    super::RootBindingError::AlreadyActive
+                    | super::RootBindingError::Resident
+                    | super::RootBindingError::MutationInFlight => {
+                        panic!("retained scheduler-current root has stale residency state")
+                    }
+                    _ => panic!("retained scheduler-current root validation failed"),
+                }
+            }
             // A sibling Thread or a return to this CPU's saved carrier slot
             // retains the unique root selection token and changes only the
             // scheduler-owned execution identity. Re-activating the same
