@@ -2866,18 +2866,31 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             .current_thread_on(self.cpu)
             .is_none()
         {
-            let suspended = runtime
-                .shared
-                .execution
-                .suspended_claim_on(self.cpu)
-                .is_some();
+            let suspended_claim = runtime.shared.execution.suspended_claim_on(self.cpu);
+            let suspended = suspended_claim.is_some();
             match (notification, suspended) {
                 (crate::arch::x86_64::rendezvous::MailboxNotification::None, false) => {
                     panic!("resume lost current without a mailbox notification or suspension")
                 }
                 (crate::arch::x86_64::rendezvous::MailboxNotification::None, true) => {
                     if runtime.wait_controls[self.cpu.index()].is_clear() {
-                        panic!("resume lost current behind a cleared switched suspension")
+                        match suspended_claim.and_then(|claim| {
+                            runtime.shared.execution.scheduler_state(claim.thread())
+                        }) {
+                            None => panic!("resume reached a terminally retired switched carrier"),
+                            Some(crate::task::SchedulerThreadState::Blocked) => {
+                                panic!("resume reached a still-blocked switched carrier")
+                            }
+                            Some(crate::task::SchedulerThreadState::Runnable) => {
+                                panic!("resume reached an unclaimed runnable switched carrier")
+                            }
+                            Some(crate::task::SchedulerThreadState::Running) => {
+                                panic!("resume reached a suspension whose Thread runs elsewhere")
+                            }
+                            Some(crate::task::SchedulerThreadState::Reserved) => {
+                                panic!("resume reached a reserved switched carrier")
+                            }
+                        }
                     }
                     panic!("resume lost current while an idle suspension remained owned")
                 }
