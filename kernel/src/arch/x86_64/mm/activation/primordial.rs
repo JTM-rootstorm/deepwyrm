@@ -1121,6 +1121,104 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         (state, stack)
     }
 
+    fn prepare_terminal_handoff(&mut self) -> u64 {
+        let retired_process = self.process;
+        let retired_root_key = self.root_key;
+        let retired_address_space = self
+            .regions
+            .region(retired_root_key)
+            .unwrap_or_else(|error| panic!("terminal Process root disappeared: {error:?}"))
+            .address_space_key();
+        crate::syscall::complete_deferred_current_reclaim(
+            &mut self.registry,
+            &self.shared.execution,
+            &self.shared.waits,
+            self.deferred_current
+                .take()
+                .unwrap_or_else(|| panic!("primordial exit omitted deferred resources")),
+            &mut self.cleanup,
+        );
+        if let Some(next) = self.shared.execution.terminal_reaper_next_on(self.cpu) {
+            let (stack_id, context_id) = self
+                .tasks
+                .thread_execution_resources(next)
+                .unwrap_or_else(|error| panic!("terminal next resources failed: {error:?}"))
+                .unwrap_or_else(|| panic!("terminal next Thread has no execution resources"));
+            let stack = self
+                .shared
+                .execution
+                .stack_bounds(stack_id)
+                .unwrap_or_else(|error| panic!("terminal next stack failed: {error:?}"));
+            let continuation = self
+                .shared
+                .execution
+                .kernel_continuation_rsp(context_id)
+                .unwrap_or_else(|error| panic!("terminal next continuation failed: {error:?}"));
+            self.synchronize_scheduler_current();
+            if retired_process != self.process
+                && self.tasks.process_quiescence_proof(retired_process).is_ok()
+            {
+                self.finish_inactive_process_teardown(
+                    retired_process,
+                    retired_root_key,
+                    retired_address_space,
+                )
+                .unwrap_or_else(|_| panic!("inactive exited Process teardown drifted"));
+            }
+            unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(stack) }
+                .unwrap_or_else(|error| panic!("terminal next stack binding failed: {error:?}"));
+            let continuation = if continuation == 0 {
+                unsafe {
+                    crate::arch::x86_64::context::prepare_initial_kernel_continuation(
+                        stack,
+                        crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
+                    )
+                }
+                .unwrap_or_else(|error| {
+                    panic!("terminal fresh continuation preparation failed: {error:?}")
+                })
+                .rsp()
+            } else {
+                continuation
+            };
+            crate::arch::x86_64::syscall::validate_live_syscall_boundary().unwrap_or_else(
+                |error| panic!("terminal next syscall boundary validation failed: {error:?}"),
+            );
+            return continuation;
+        }
+
+        let completion = complete_primordial_launch(self);
+        #[cfg(feature = "test-support")]
+        if self.g5_probe.accepts_completion(&completion) {
+            crate::test_support::complete_pass(0)
+        } else {
+            crate::test_support::complete_fail(self.g5_probe.failure_detail(&completion))
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            let (level, message) = match completion {
+                Ok(()) => (
+                    crate::debug::DiagnosticLevel::Info,
+                    "Wyrmroot bootstrap completed normally",
+                ),
+                Err(crate::boot::primordial::construction::PrimordialCompletionError::UnhandledException) => (
+                    crate::debug::DiagnosticLevel::Error,
+                    "Wyrmroot bootstrap terminated after an unhandled userspace exception",
+                ),
+                Err(_) => (
+                    crate::debug::DiagnosticLevel::Error,
+                    "Wyrmroot bootstrap terminated with a structured completion failure",
+                ),
+            };
+            let _ = crate::debug::emit_early_record(level, "primordial", message);
+            loop {
+                unsafe {
+                    core::arch::asm!("sti", "hlt", options(nomem, nostack));
+                }
+            }
+        }
+    }
+
     fn synchronize_scheduler_current(&mut self) {
         let thread = self
             .shared
@@ -1661,101 +1759,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 
     fn terminate_current(&mut self) -> ! {
-        let retired_process = self.process;
-        let retired_root_key = self.root_key;
-        let retired_address_space = self
-            .regions
-            .region(retired_root_key)
-            .unwrap_or_else(|error| panic!("terminal Process root disappeared: {error:?}"))
-            .address_space_key();
-        crate::syscall::complete_deferred_current_reclaim(
-            &mut self.registry,
-            &self.shared.execution,
-            &self.shared.waits,
-            self.deferred_current
-                .take()
-                .unwrap_or_else(|| panic!("primordial exit omitted deferred resources")),
-            &mut self.cleanup,
-        );
-        let next = self.shared.execution.terminal_reaper_next_on(self.cpu);
-        if let Some(next) = next {
-            let (stack_id, context_id) = self
-                .tasks
-                .thread_execution_resources(next)
-                .unwrap_or_else(|error| panic!("terminal next resources failed: {error:?}"))
-                .unwrap_or_else(|| panic!("terminal next Thread has no execution resources"));
-            let stack = self
-                .shared
-                .execution
-                .stack_bounds(stack_id)
-                .unwrap_or_else(|error| panic!("terminal next stack failed: {error:?}"));
-            let continuation = self
-                .shared
-                .execution
-                .kernel_continuation_rsp(context_id)
-                .unwrap_or_else(|error| panic!("terminal next continuation failed: {error:?}"));
-            self.synchronize_scheduler_current();
-            if retired_process != self.process
-                && self.tasks.process_quiescence_proof(retired_process).is_ok()
-            {
-                self.finish_inactive_process_teardown(
-                    retired_process,
-                    retired_root_key,
-                    retired_address_space,
-                )
-                .unwrap_or_else(|_| panic!("inactive exited Process teardown drifted"));
-            }
-            unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(stack) }
-                .unwrap_or_else(|error| panic!("terminal next stack binding failed: {error:?}"));
-            let continuation = if continuation == 0 {
-                unsafe {
-                    crate::arch::x86_64::context::prepare_initial_kernel_continuation(
-                        stack,
-                        crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
-                    )
-                }
-                .unwrap_or_else(|error| {
-                    panic!("terminal fresh continuation preparation failed: {error:?}")
-                })
-                .rsp()
-            } else {
-                continuation
-            };
-            crate::arch::x86_64::syscall::validate_live_syscall_boundary().unwrap_or_else(
-                |error| panic!("terminal next syscall boundary validation failed: {error:?}"),
-            );
-            unsafe { crate::arch::x86_64::context::abandon_to_kernel_continuation(continuation) }
-        }
-        let completion = complete_primordial_launch(self);
-        #[cfg(feature = "test-support")]
-        if self.g5_probe.accepts_completion(&completion) {
-            crate::test_support::complete_pass(0)
-        } else {
-            crate::test_support::complete_fail(self.g5_probe.failure_detail(&completion))
-        }
-        #[cfg(not(feature = "test-support"))]
-        {
-            let (level, message) = match completion {
-                Ok(()) => (
-                    crate::debug::DiagnosticLevel::Info,
-                    "Wyrmroot bootstrap completed normally",
-                ),
-                Err(crate::boot::primordial::construction::PrimordialCompletionError::UnhandledException) => (
-                    crate::debug::DiagnosticLevel::Error,
-                    "Wyrmroot bootstrap terminated after an unhandled userspace exception",
-                ),
-                Err(_) => (
-                    crate::debug::DiagnosticLevel::Error,
-                    "Wyrmroot bootstrap terminated with a structured completion failure",
-                ),
-            };
-            let _ = crate::debug::emit_early_record(level, "primordial", message);
-            loop {
-                unsafe {
-                    core::arch::asm!("sti", "hlt", options(nomem, nostack));
-                }
-            }
-        }
+        let continuation = self.prepare_terminal_handoff();
+        unsafe { crate::arch::x86_64::context::abandon_to_kernel_continuation(continuation) }
     }
 
     fn enter_scheduled_fresh_thread(&mut self) -> ! {
@@ -1846,9 +1851,12 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
     }
 
     fn terminate_current(&mut self) -> ! {
-        let mut runtime = self.runtime.lock();
-        runtime.switch_cpu(self.cpu);
-        runtime.terminate_current()
+        let continuation = {
+            let mut runtime = self.runtime.lock();
+            runtime.switch_cpu(self.cpu);
+            runtime.prepare_terminal_handoff()
+        };
+        unsafe { crate::arch::x86_64::context::abandon_to_kernel_continuation(continuation) }
     }
 
     fn enter_scheduled_fresh_thread(&mut self) -> ! {
