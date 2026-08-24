@@ -442,7 +442,7 @@ fn g5_primordial_blocking_uses_the_f12_idle_suspend_resume_flow() {
             .expect("read G5 primordial runtime source");
 
     assert!(primordial.contains("self.services.prepare_suspend_on("));
-    assert!(primordial.contains("self.services.poll_idle_suspend("));
+    assert!(primordial.contains("self.services.poll_idle_suspend_on("));
     assert!(primordial.contains("self.services.resume_suspended("));
     assert!(primordial.contains("bind_deadline_wake_target(target)"));
     assert!(!primordial.contains("primordial bootstrap blocked despite its prepublished INIT"));
