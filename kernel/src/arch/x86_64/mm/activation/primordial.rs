@@ -454,6 +454,18 @@ struct RuntimeCarrierFacade<
     >,
 }
 
+enum PreparedCarrierEntry {
+    Fresh {
+        state: crate::arch::x86_64::syscall::ValidatedUserReturn,
+        stack: crate::memory::kernel_stack::KernelStackBounds,
+    },
+    Continuation {
+        stack: crate::memory::kernel_stack::KernelStackBounds,
+        rsp: u64,
+    },
+    Idle,
+}
+
 /// Fixed CPU-local façade over the stationary runtime authorities.
 ///
 /// The live runtime façades serialize shared authority access separately; this
@@ -1591,12 +1603,22 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .unwrap_or_else(|_| panic!("post-ack rendezvous cleanup drifted"));
     }
 
-    /// Continues only after the remote-stop mailbox Release acknowledgement.
-    /// The stopped Thread remains deferred in the scheduler/reaper ownership
-    /// graph; this carrier may select a different Runnable Thread or idle on
-    /// its retained kernel root, but it must never consume the stopped IPI
-    /// frame or reclaim resources still held by the initiator's exact ack.
-    fn continue_after_rendezvous_stop(&mut self) -> ! {
+    fn complete_rendezvous_stop(
+        &mut self,
+        request: crate::arch::x86_64::rendezvous::StopRequest,
+        reaper: crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry,
+    ) -> PreparedCarrierEntry {
+        self.assert_guard_free_external_work();
+        self.rendezvous_reaper = Some(reaper);
+        crate::arch::x86_64::idle::complete_current_rendezvous_stop(request, self).unwrap_or_else(
+            |error| panic!("remote rendezvous stop failed before commit: {error:?}"),
+        );
+        self.prepare_after_rendezvous_stop()
+    }
+
+    /// Prepares the stopped CPU's next divergent entry as owned data. The
+    /// caller must drop the coarse runtime guard before consuming the result.
+    fn prepare_after_rendezvous_stop(&mut self) -> PreparedCarrierEntry {
         let stopped_claim = self
             .stopping_claim
             .take()
@@ -1613,15 +1635,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.drain_staged_rendezvous_cleanup();
         let next = self.shared.execution.terminal_reaper_next_on(self.cpu);
         let Some(next) = next else {
-            self.idle_after_rendezvous_stop()
+            assert!(matches!(self.active_root, CarrierActiveRoot::Kernel(_)));
+            return PreparedCarrierEntry::Idle;
         };
-        self.enter_rendezvous_replacement(next)
-    }
-
-    /// Enters an exact Runnable replacement selected after the stopped frame
-    /// has been irreversibly abandoned. This is also used by kernel-root idle
-    /// after a late Wake; it never consumes or returns through that frame.
-    fn enter_rendezvous_replacement(&mut self, next: ThreadKey) -> ! {
         let (stack_id, context_id) = self
             .tasks
             .thread_execution_resources(next)
@@ -1641,116 +1657,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             });
         // This switches Kernel -> Process exactly once if replacement work is
         // available. It performs no usercopy while the kernel-root state is
-        // live and returns only after the target CR3 serialization.
+        // live and returns only after the target CR3 serialization. Actual
+        // stack binding/user entry occurs after the shared guard is dropped.
         self.synchronize_scheduler_current();
-        unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(stack) }.unwrap_or_else(
-            |error| panic!("rendezvous replacement stack binding failed: {error:?}"),
-        );
-        let continuation = if continuation == 0 {
-            unsafe {
-                crate::arch::x86_64::context::prepare_initial_kernel_continuation(
-                    stack,
-                    crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
-                )
-            }
-            .unwrap_or_else(|error| {
-                panic!("rendezvous fresh continuation preparation failed: {error:?}")
-            })
-            .rsp()
+        if continuation == 0 {
+            let (state, stack) = self.prepare_fresh_user_entry();
+            PreparedCarrierEntry::Fresh { state, stack }
         } else {
-            continuation
-        };
-        crate::arch::x86_64::syscall::validate_live_syscall_boundary().unwrap_or_else(|error| {
-            panic!("rendezvous replacement syscall boundary drifted: {error:?}")
-        });
-        unsafe { crate::arch::x86_64::context::abandon_to_kernel_continuation(continuation) }
-    }
-
-    fn idle_after_rendezvous_stop(&mut self) -> ! {
-        assert!(matches!(self.active_root, CarrierActiveRoot::Kernel(_)));
-        loop {
-            let idle = crate::arch::x86_64::idle::prepare_current_idle().unwrap_or_else(|error| {
-                panic!("rendezvous kernel-root idle preparation failed: {error:?}")
-            });
-            match crate::arch::x86_64::idle::commit_current_idle(idle) {
-                Ok(halt) => {
-                    #[allow(
-                        unsafe_code,
-                        reason = "the committed idle transition owns the CPU-local kernel-root carrier and brackets the only sti;hlt boundary"
-                    )]
-                    unsafe {
-                        core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
-                    }
-                    crate::arch::x86_64::idle::finish_current_idle(halt).unwrap_or_else(|error| {
-                        panic!("rendezvous kernel-root idle completion failed: {error:?}")
-                    });
-                    match crate::time::service_current_rendezvous_latch()
-                        .unwrap_or_else(|_| panic!("rendezvous kernel-root idle latch failed"))
-                    {
-                        crate::arch::x86_64::rendezvous::MailboxNotification::None => {}
-                        crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {
-                            if let Some(next) =
-                                self.shared.execution.terminal_reaper_next_on(self.cpu)
-                            {
-                                self.enter_rendezvous_replacement(next);
-                            }
-                        }
-                        crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {
-                            // A late duplicate e1 observes the exact safe
-                            // acknowledgement still held by its initiator.
-                            // Stay on the kernel root and rescan; no stopped
-                            // IPI frame exists to return through and no second
-                            // acknowledgement may be published.
-                            if let Some(next) =
-                                self.shared.execution.terminal_reaper_next_on(self.cpu)
-                            {
-                                self.enter_rendezvous_replacement(next);
-                            }
-                        }
-                        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_) => {
-                            panic!("stopped kernel-root carrier received a second stop request")
-                        }
-                    }
-                }
-                Err(failure)
-                    if failure.error()
-                        == crate::arch::x86_64::idle::IdleWakeError::RescanRequired =>
-                {
-                    crate::arch::x86_64::idle::cancel_current_idle(failure.into_preparation())
-                        .unwrap_or_else(|error| {
-                            panic!("rendezvous kernel-root idle cancellation failed: {error:?}")
-                        });
-                    // An interrupt that completed EOI before the final idle
-                    // commit must be consumed here. Merely cancelling leaves
-                    // the latch set and turns every following commit into a
-                    // permanent RescanRequired spin.
-                    match crate::time::service_current_rendezvous_latch()
-                        .unwrap_or_else(|_| panic!("rendezvous kernel-root rescan latch failed"))
-                    {
-                        crate::arch::x86_64::rendezvous::MailboxNotification::None => {}
-                        crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {
-                            if let Some(next) =
-                                self.shared.execution.terminal_reaper_next_on(self.cpu)
-                            {
-                                self.enter_rendezvous_replacement(next);
-                            }
-                        }
-                        crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {
-                            if let Some(next) =
-                                self.shared.execution.terminal_reaper_next_on(self.cpu)
-                            {
-                                self.enter_rendezvous_replacement(next);
-                            }
-                        }
-                        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_) => {
-                            panic!("stopped kernel-root carrier received a second stop request")
-                        }
-                    }
-                }
-                Err(failure) => panic!(
-                    "rendezvous kernel-root idle commit failed: {:?}",
-                    failure.error()
-                ),
+            PreparedCarrierEntry::Continuation {
+                stack,
+                rsp: continuation,
             }
         }
     }
@@ -2325,24 +2241,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 }
 
-impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
-    crate::syscall::native::NativeRendezvousRuntime
-    for PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>
-{
-    fn rendezvous_stop(
-        &mut self,
-        request: crate::arch::x86_64::rendezvous::StopRequest,
-        reaper: crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry,
-    ) -> ! {
-        self.assert_guard_free_external_work();
-        self.rendezvous_reaper = Some(reaper);
-        crate::arch::x86_64::idle::complete_current_rendezvous_stop(request, self).unwrap_or_else(
-            |error| panic!("remote rendezvous stop failed before commit: {error:?}"),
-        );
-        self.continue_after_rendezvous_stop()
-    }
-}
-
 #[allow(
     unsafe_code,
     reason = "the target runtime propagates the physical-current carrier and architecture-owned first-run entry"
@@ -2452,9 +2350,27 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         request: crate::arch::x86_64::rendezvous::StopRequest,
         reaper: crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry,
     ) -> ! {
-        let mut runtime = self.runtime.lock();
-        runtime.switch_cpu(self.cpu);
-        runtime.rendezvous_stop(request, reaper)
+        let entry = {
+            let mut runtime = self.runtime.lock();
+            runtime.switch_cpu(self.cpu);
+            runtime.complete_rendezvous_stop(request, reaper)
+        };
+        match entry {
+            PreparedCarrierEntry::Fresh { state, stack } => unsafe {
+                crate::arch::x86_64::syscall::enter_bound_validated_user(&state, stack)
+            },
+            PreparedCarrierEntry::Continuation { stack, rsp } => {
+                unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(stack) }
+                    .unwrap_or_else(|error| {
+                        panic!("rendezvous replacement stack binding failed: {error:?}")
+                    });
+                crate::arch::x86_64::syscall::validate_live_syscall_boundary().unwrap_or_else(
+                    |error| panic!("rendezvous replacement boundary failed: {error:?}"),
+                );
+                unsafe { crate::arch::x86_64::context::abandon_to_kernel_continuation(rsp) }
+            }
+            PreparedCarrierEntry::Idle => self.enter_idle_scheduler(),
+        }
     }
 }
 
@@ -2567,13 +2483,44 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 None => {
                     let idle = crate::arch::x86_64::idle::prepare_current_idle()
                         .unwrap_or_else(|error| panic!("AP idle publication failed: {error:?}"));
-                    let halt = crate::arch::x86_64::idle::commit_current_idle(idle)
-                        .unwrap_or_else(|error| panic!("AP idle commit failed: {error:?}"));
-                    unsafe {
-                        core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
+                    let notification = match crate::arch::x86_64::idle::commit_current_idle(idle) {
+                        Ok(halt) => {
+                            unsafe {
+                                core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
+                            }
+                            crate::arch::x86_64::idle::finish_current_idle(halt).unwrap_or_else(
+                                |error| panic!("AP idle completion failed: {error:?}"),
+                            );
+                            crate::time::service_current_rendezvous_latch().unwrap_or_else(
+                                |error| panic!("AP idle rendezvous service failed: {error:?}"),
+                            )
+                        }
+                        Err(failure)
+                            if failure.error()
+                                == crate::arch::x86_64::idle::IdleWakeError::RescanRequired =>
+                        {
+                            crate::arch::x86_64::idle::cancel_current_idle(
+                                failure.into_preparation(),
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!("AP idle rescan cancellation failed: {error:?}")
+                            });
+                            crate::time::service_current_rendezvous_latch().unwrap_or_else(
+                                |error| panic!("AP idle rescan service failed: {error:?}"),
+                            )
+                        }
+                        Err(failure) => {
+                            panic!("AP idle commit failed: {:?}", failure.error())
+                        }
+                    };
+                    match notification {
+                        crate::arch::x86_64::rendezvous::MailboxNotification::None
+                        | crate::arch::x86_64::rendezvous::MailboxNotification::Wake
+                        | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {}
+                        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_) => {
+                            panic!("kernel-root idle carrier received an unexpected stop request")
+                        }
                     }
-                    crate::arch::x86_64::idle::finish_current_idle(halt)
-                        .unwrap_or_else(|error| panic!("AP idle completion failed: {error:?}"));
                 }
             }
         }

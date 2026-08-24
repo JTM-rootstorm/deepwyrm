@@ -159,9 +159,10 @@ fn i1_cpl3_rendezvous_gate_diverges_before_iret() {
         "self.active.enter_kernel_execution_root(previous)",
         "stop_running_claim_on(claim)",
         "complete_current_rendezvous_stop(request, self)",
-        "continue_after_rendezvous_stop()",
+        "prepare_after_rendezvous_stop()",
         "terminal_reaper_next_on(self.cpu)",
-        "idle_after_rendezvous_stop",
+        "PreparedCarrierEntry::Idle => self.enter_idle_scheduler()",
+        "runtime.complete_rendezvous_stop(request, reaper)",
     ] {
         assert!(
             primordial.contains(evidence),

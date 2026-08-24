@@ -233,30 +233,32 @@ fn i1_native_adapter_phases_revalidate_exact_identity_after_guard_free_work() {
 fn i1_post_ack_carrier_never_reuses_a_retired_frame_for_late_holdsafe() {
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
     let continuation = primordial
-        .split_once("fn continue_after_rendezvous_stop(&mut self) -> !")
+        .split_once("fn prepare_after_rendezvous_stop(&mut self) -> PreparedCarrierEntry")
         .expect("post-ack carrier continuation")
-        .1;
+        .1
+        .split_once("fn terminate_exception")
+        .expect("post-ack carrier continuation end")
+        .0;
     assert!(continuation.contains("complete_switch_on(stopped_claim)"));
     assert!(continuation.contains("self.drain_staged_rendezvous_cleanup();"));
     assert!(continuation.contains("terminal_reaper_next_on(self.cpu)"));
 
     let idle = primordial
-        .split_once("fn idle_after_rendezvous_stop(&mut self) -> !")
+        .split_once("fn enter_idle_scheduler(&mut self) -> !")
         .expect("kernel-root idle path")
-        .1;
-    assert!(idle.contains("MailboxNotification::HoldSafe(_) => {"));
-    assert!(
-        idle.contains("no second\n                            // acknowledgement may be published")
-    );
-    assert!(!idle.contains("Stop(_)\n                        | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe"));
-    assert!(idle.contains("MailboxNotification::Wake => {"));
-    assert!(idle.contains("self.enter_rendezvous_replacement(next);"));
+        .1
+        .split_once("unsafe fn prepare_suspend")
+        .expect("kernel-root idle path end")
+        .0;
+    assert!(idle.contains("MailboxNotification::HoldSafe(_) => {}"));
+    assert!(idle.contains("service_current_rendezvous_latch()"));
+    assert!(idle.contains("kernel-root idle carrier received an unexpected stop request"));
     let rescan = idle
         .split_once("IdleWakeError::RescanRequired")
         .expect("kernel-root idle rescan path")
         .1;
+    assert!(rescan.contains("cancel_current_idle("));
     assert!(rescan.contains("service_current_rendezvous_latch()"));
-    assert!(rescan.contains("permanent RescanRequired spin"));
 
     let precommit = primordial
         .split_once("fn precommit_exact_stop(")
