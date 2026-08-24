@@ -1363,14 +1363,43 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .region(retired_root_key)
             .unwrap_or_else(|error| panic!("terminal Process root disappeared: {error:?}"))
             .address_space_key();
+        let deferred = self.deferred_currents[self.cpu.index()]
+            .take()
+            .unwrap_or_else(|| {
+                if self.deferred_currents.iter().any(Option::is_some) {
+                    panic!("terminal deferred resources migrated to another CPU")
+                }
+                if self.shared.execution.current_thread_on(self.cpu).is_some() {
+                    panic!("terminal handoff retained a scheduler-current Thread")
+                }
+                if self.shared.execution.suspended_claim_on(self.cpu).is_some() {
+                    panic!("terminal handoff retained a suspended claim without resources")
+                }
+                if self.shared.execution.running_claim_on(self.cpu).is_some() {
+                    panic!("terminal handoff retained a Running claim without resources")
+                }
+                match self.shared.execution.scheduler_state(self.thread) {
+                    Some(SchedulerThreadState::Reserved) => {
+                        panic!("terminal handoff reached a reserved Thread without resources")
+                    }
+                    Some(SchedulerThreadState::Runnable) => {
+                        panic!("terminal handoff reached a runnable Thread without resources")
+                    }
+                    Some(SchedulerThreadState::Running) => {
+                        panic!("terminal handoff reached a Running Thread without resources")
+                    }
+                    Some(SchedulerThreadState::Blocked) => {
+                        panic!("terminal handoff reached a blocked Thread without resources")
+                    }
+                    None => panic!("terminal handoff repeated after Thread retirement"),
+                }
+            });
         crate::syscall::complete_deferred_current_reclaim_on(
             &mut self.registry,
             &self.shared.execution,
             &self.shared.waits,
             self.cpu,
-            self.deferred_currents[self.cpu.index()]
-                .take()
-                .unwrap_or_else(|| panic!("primordial exit omitted deferred resources")),
+            deferred,
             &mut self.cleanup,
         );
         if let Some(next) = self.shared.execution.terminal_reaper_next_on(self.cpu) {
