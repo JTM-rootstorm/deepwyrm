@@ -613,6 +613,25 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
 }
 
 #[test]
+fn live_return_boundary_publishes_final_release_effects_before_userspace_resume() {
+    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let dispatch = runtime
+        .find("impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandler")
+        .expect("live native handler");
+    let return_boundary = runtime[dispatch..]
+        .find("if result.control == SyscallControl::ReturnToCaller")
+        .expect("normal syscall return finalizer boundary");
+    let drain = runtime[dispatch..]
+        .find("self.drain_finalizers()")
+        .expect("normal syscall return drains finalizers");
+    let result_return = runtime[dispatch..]
+        .find("\n        result\n")
+        .expect("native handler result return");
+
+    assert!(return_boundary < drain && drain < result_return);
+}
+
+#[test]
 fn i1_terminal_child_without_local_work_rejoins_the_idle_scheduler() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
 

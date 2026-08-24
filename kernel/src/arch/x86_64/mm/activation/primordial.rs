@@ -3389,6 +3389,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
             }
         };
         self.commit_runtime_phase(phase);
+        if result.control == SyscallControl::ReturnToCaller {
+            // A normal syscall return is the publication boundary for final
+            // handle releases. Do not expose a successful close to userspace
+            // while its peer signal, waiter wakes, or payload reclamation is
+            // still parked in the carrier-local cleanup queue.
+            self.drain_finalizers()
+                .unwrap_or_else(|_| panic!("normal syscall return could not drain finalizers"));
+        }
         result
     }
 }
