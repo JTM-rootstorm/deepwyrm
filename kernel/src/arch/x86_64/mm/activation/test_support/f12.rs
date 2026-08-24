@@ -20,7 +20,7 @@ use crate::syscall::native::{
     NativeSyscallFrameRuntime, NativeSyscallHandler, NativeSyscallRequest, NativeSyscallResult,
     SyscallControl,
 };
-use crate::syscall::{CleanupQueue, FServiceRoute, FServiceState};
+use crate::syscall::{CleanupQueue, FServiceRoute, FServiceState, NativeWaitControl};
 use crate::task::{ExecutionDomain, ProcessKey, SchedulerThreadState, TaskAuthority, ThreadKey};
 use crate::time::TimerAuthority;
 use crate::wait::{EventAuthority, WaitRegistry};
@@ -462,6 +462,7 @@ struct F12Runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
         WAITERS,
         EXECUTION_THREADS,
     >,
+    control: NativeWaitControl,
     channel_staging: &'static mut [u8; DW_CHANNEL_MAX_PAYLOAD as usize],
     spaces: F12Spaces,
     regions: F12Regions,
@@ -716,6 +717,7 @@ fn build_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize
         timers: TimerAuthority::new(),
         waits: WaitRegistry::new(),
         services: FServiceState::new(),
+        control: NativeWaitControl::new(),
         channel_staging: take_channel_staging(),
         spaces,
         regions,
@@ -1043,6 +1045,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                 .prepare_dispatch(request, thread, root_generation)
                 .unwrap_or_else(|_| fail(0xaf));
             self.services.dispatch_prepared(
+                &mut self.control,
                 prepared,
                 &mut user,
                 &mut self.registry,
@@ -1446,6 +1449,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 exit_seen: true,
             })
             || !self.services.is_quiescent()
+            || !self.control.is_clear()
         {
             fail(0xe7);
         }
@@ -1627,6 +1631,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     ) -> crate::syscall::native::NativeSuspendPlan<'owner> {
         unsafe {
             self.services.prepare_suspend(
+                &mut self.control,
                 &self.tasks,
                 self.execution,
                 crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
@@ -1641,6 +1646,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     ) -> crate::syscall::native::NativeIdleSuspendPoll<'owner> {
         unsafe {
             self.services.poll_idle_suspend(
+                &mut self.control,
                 &self.tasks,
                 self.execution,
                 crate::arch::x86_64::syscall::first_run_thread_entry_rip(),

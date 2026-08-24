@@ -34,7 +34,9 @@ use crate::syscall::native::{
     NativeSyscallFrameRuntime, NativeSyscallHandler, NativeSyscallRequest, NativeSyscallResult,
     SyscallControl,
 };
-use crate::syscall::{CleanupQueue, FServiceRoute, FServiceState, TerminalWaitCleanup};
+use crate::syscall::{
+    CleanupQueue, FServiceRoute, FServiceState, NativeWaitControl, TerminalWaitCleanup,
+};
 use crate::task::{ExecutionDomain, ProcessKey, SchedulerThreadState, TaskAuthority, ThreadKey};
 use crate::time::TimerAuthority;
 use crate::wait::{EventAuthority, WaitRegistry};
@@ -1090,6 +1092,10 @@ struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_
         WAITERS,
         EXECUTION_THREADS,
     >,
+    // Suspension handoff is physical-carrier state, unlike the durable wait
+    // registries above. One CPU must never consume another CPU's pending/idle
+    // control decision even though both serialize the shared service owners.
+    wait_controls: [NativeWaitControl; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
     channel_staging: &'static mut [u8; DW_CHANNEL_MAX_PAYLOAD as usize],
     spaces: Spaces,
     regions: Regions,
@@ -1219,8 +1225,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> crate::syscall::native::NativeSuspendPlan<'static> {
         #[cfg(feature = "test-support")]
         let owner = self.services.operation_owner(self.thread);
+        let control = &mut self.wait_controls[self.cpu.index()];
         let plan = unsafe {
             self.services.prepare_suspend(
+                control,
                 &self.tasks,
                 &self.shared.execution,
                 crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
@@ -1243,8 +1251,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> crate::syscall::native::NativeIdleSuspendPoll<'static> {
         #[cfg(feature = "test-support")]
         let owner = self.services.operation_owner(self.thread);
+        let control = &mut self.wait_controls[self.cpu.index()];
         let poll = unsafe {
             self.services.poll_idle_suspend(
+                control,
                 &self.tasks,
                 &self.shared.execution,
                 crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
@@ -1566,7 +1576,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// Running claim, but it still owns exact wait/output/atomic cleanup that
     /// cannot be left to trip the post-commit quiescence check.
     fn transfer_suspended_service_cleanup_for_stop(&mut self) {
-        if self.services.is_quiescent() {
+        if self.service_state_is_quiescent() {
             return;
         }
         let mut discarded = None;
@@ -1605,6 +1615,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         let cleanup = self.services.take_cleanup();
         self.merge_cleanup(cleanup);
+    }
+
+    fn service_state_is_quiescent(&self) -> bool {
+        self.services.is_quiescent() && self.wait_controls.iter().all(NativeWaitControl::is_clear)
     }
 
     fn drain_staged_rendezvous_cleanup(&mut self) {
@@ -1960,7 +1974,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn finish_terminal_teardown(&mut self) -> Result<(), ()> {
-        if !self.services.is_quiescent()
+        if !self.service_state_is_quiescent()
             || self.shared.execution.scheduler_state(self.thread).is_some()
             || self
                 .shared
@@ -2185,8 +2199,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         // reaper witness is consumed; only the post-ack continuation may
         // finalize them.
         if was_suspended {
+            let control = &mut self.wait_controls[self.cpu.index()];
             self.services
-                .retire_idle_control_for_stop(self.thread, claim.generation())
+                .retire_idle_control_for_stop(control, self.thread, claim.generation())
                 .unwrap_or_else(|_| {
                     panic!("remote stop suspended idle control drifted before precommit")
                 });
@@ -2249,7 +2264,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     fn deferred_cleanup_is_quiescent(&self) -> bool {
         self.cleanup.is_empty()
             && self.rendezvous_cleanup.is_some()
-            && self.services.is_quiescent()
+            && self.service_state_is_quiescent()
             && self.deferred_current.is_none()
             && self.shared.execution.running_claim_on(self.cpu).is_none()
     }
@@ -2786,6 +2801,7 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         tasks,
         shared,
         services: FServiceState::new(),
+        wait_controls: core::array::from_fn(|_| NativeWaitControl::new()),
         channel_staging: take_channel_staging(cpu_index),
         spaces,
         regions,
@@ -2917,6 +2933,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                         self.process,
                     );
                     self.services.dispatch_prepared(
+                        &mut self.wait_controls[self.cpu.index()],
                         prepared,
                         &mut user,
                         &mut self.registry,

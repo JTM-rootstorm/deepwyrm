@@ -333,6 +333,7 @@ struct Fixture {
     staging: Vec<u8>,
     user: FakeUserMemory,
     services: Services,
+    control: NativeWaitControl,
     process: ProcessKey,
     thread: ThreadKey,
 }
@@ -393,6 +394,7 @@ impl Fixture {
             staging: vec![0; DW_CHANNEL_MAX_PAYLOAD as usize],
             user: FakeUserMemory::new(),
             services: Services::new(),
+            control: NativeWaitControl::new(),
             process,
             thread,
         }
@@ -404,6 +406,7 @@ impl Fixture {
             .prepare_dispatch(request, self.thread, 1)
             .unwrap();
         self.services.dispatch_prepared(
+            &mut self.control,
             prepared,
             &mut self.user,
             &mut self.registry,
@@ -822,6 +825,7 @@ fn finite_wait_dispatch_idles_times_out_and_resumes_exact_owner() {
     assert!(matches!(
         unsafe {
             fixture.services.prepare_suspend(
+                &mut fixture.control,
                 &fixture.tasks,
                 &fixture.execution,
                 0xffff_8000_0012_3000,
@@ -837,6 +841,7 @@ fn finite_wait_dispatch_idles_times_out_and_resumes_exact_owner() {
     assert!(matches!(
         unsafe {
             fixture.services.poll_idle_suspend(
+                &mut fixture.control,
                 &fixture.tasks,
                 &fixture.execution,
                 0xffff_8000_0012_3000,
@@ -865,7 +870,7 @@ fn finite_wait_dispatch_idles_times_out_and_resumes_exact_owner() {
         Err(FServiceOwnerError::Missing)
     );
     assert_eq!(fixture.user.owned_outputs, 0);
-    assert!(fixture.services.control.is_clear());
+    assert!(fixture.control.is_clear());
     assert!(fixture.services.is_quiescent());
     assert_eq!(fixture.wait_deadlines.queue.earliest(), None);
     close_event(&mut fixture, event);
@@ -924,13 +929,11 @@ fn atomic_mismatch_then_suspend_wake_and_resume_has_one_exact_owner() {
     let AtomicWaitBegin::Suspended { wake, decision } = suspended else {
         panic!("matching infinite atomic wait did not suspend")
     };
-    let accepted =
-        fixture
-            .services
-            .control
-            .accept(super::super::adapters::WaitSyscallAction::Suspended(
-                super::super::adapters::WaitSuspendState::new(wake, decision),
-            ));
+    let accepted = fixture
+        .control
+        .accept(super::super::adapters::WaitSyscallAction::Suspended(
+            super::super::adapters::WaitSuspendState::new(wake, decision),
+        ));
     assert_eq!(
         accepted.control,
         super::super::native::SyscallControl::SuspendCurrent
@@ -943,6 +946,7 @@ fn atomic_mismatch_then_suspend_wake_and_resume_has_one_exact_owner() {
     assert!(matches!(
         unsafe {
             fixture.services.prepare_suspend(
+                &mut fixture.control,
                 &fixture.tasks,
                 &fixture.execution,
                 0xffff_8000_0012_3000,
@@ -958,6 +962,7 @@ fn atomic_mismatch_then_suspend_wake_and_resume_has_one_exact_owner() {
     assert!(matches!(
         unsafe {
             fixture.services.poll_idle_suspend(
+                &mut fixture.control,
                 &fixture.tasks,
                 &fixture.execution,
                 0xffff_8000_0012_3000,

@@ -761,6 +761,22 @@ fn f2_runtime_binding_is_retained_by_divergent_entry_and_suspension_drops_short_
 }
 
 #[test]
+fn i1_live_wait_control_is_owned_by_each_physical_cpu_carrier() {
+    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let services = source("src/syscall/f_services.rs");
+
+    assert!(runtime.contains(
+        "wait_controls: [NativeWaitControl; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT]"
+    ));
+    assert!(runtime.contains("&mut self.wait_controls[self.cpu.index()]"));
+    assert!(runtime.contains(".all(NativeWaitControl::is_clear)"));
+    assert!(
+        !services.contains("control: NativeWaitControl,"),
+        "shared F-service state must not own one cross-CPU suspension handoff"
+    );
+}
+
+#[test]
 fn daybreak_switch_plan_brands_execution_owner_through_every_suspend_facade() {
     let context = source("src/arch/x86_64/context.rs");
     let execution = source("src/task/execution.rs");

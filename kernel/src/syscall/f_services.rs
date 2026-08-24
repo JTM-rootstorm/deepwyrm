@@ -177,7 +177,6 @@ pub(crate) struct FServiceState<
     wait_operations: WaitOperationRegistry<OUTPUT, EXECUTION>,
     atomic_waits: AtomicWaitRegistry<ATOMIC_WAITERS>,
     atomic_operations: AtomicWaitOperationRegistry<AtomicPin, EXECUTION>,
-    control: NativeWaitControl,
     cleanup: CleanupQueue<OBJECTS>,
 }
 
@@ -189,7 +188,6 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
             wait_operations: WaitOperationRegistry::new(),
             atomic_waits: AtomicWaitRegistry::new(),
             atomic_operations: AtomicWaitOperationRegistry::new(),
-            control: NativeWaitControl::new(),
             cleanup: CleanupQueue::new(),
         }
     }
@@ -232,6 +230,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         const REGIONS: usize,
     >(
         &mut self,
+        control: &mut NativeWaitControl,
         prepared: PreparedFServiceDispatch,
         user: &mut U,
         registry: &mut ObjectRegistry<OBJECTS>,
@@ -344,7 +343,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
                 signals,
                 deadline,
                 out_result,
-            } => FServiceRoute::Handled(self.control.accept(wait_one_syscall(
+            } => FServiceRoute::Handled(control.accept(wait_one_syscall(
                 user,
                 registry,
                 tasks,
@@ -368,7 +367,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
                 mode,
                 deadline,
                 out_result,
-            } => FServiceRoute::Handled(self.control.accept(wait_many_syscall(
+            } => FServiceRoute::Handled(control.accept(wait_many_syscall(
                 user,
                 registry,
                 tasks,
@@ -421,6 +420,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
                 expected,
                 deadline,
             } => FServiceRoute::Handled(self.dispatch_atomic_wait(
+                control,
                 user,
                 registry,
                 tasks,
@@ -516,6 +516,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         const REGION_SLOTS: usize,
     >(
         &mut self,
+        control: &mut NativeWaitControl,
         user: &mut U,
         _registry: &mut ObjectRegistry<OBJECTS>,
         tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
@@ -589,10 +590,9 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
                 NativeSyscallResult::returning(DW_STATUS_SUCCESS)
             }
             Ok(AtomicWaitBegin::Suspended { wake, decision }) => {
-                self.control
-                    .accept(super::adapters::WaitSyscallAction::Suspended(
-                        super::adapters::WaitSuspendState::new(wake, decision),
-                    ))
+                control.accept(super::adapters::WaitSyscallAction::Suspended(
+                    super::adapters::WaitSuspendState::new(wake, decision),
+                ))
             }
             Err(failure) => {
                 let status = atomic_wait_status(failure.error);
@@ -672,15 +672,13 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         const THREADS: usize,
         const HANDLES: usize,
     >(
-        &mut self,
+        &self,
+        control: &mut NativeWaitControl,
         tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         execution: &'owner ExecutionDomain<EXECUTION>,
         trusted_first_run_entry: u64,
     ) -> Result<NativeSuspendPlan<'owner>, WaitSuspendError> {
-        unsafe {
-            self.control
-                .prepare_suspend(tasks, execution, trusted_first_run_entry)
-        }
+        unsafe { control.prepare_suspend(tasks, execution, trusted_first_run_entry) }
     }
 
     #[allow(
@@ -699,15 +697,13 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         const THREADS: usize,
         const HANDLES: usize,
     >(
-        &mut self,
+        &self,
+        control: &mut NativeWaitControl,
         tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         execution: &'owner ExecutionDomain<EXECUTION>,
         trusted_first_run_entry: u64,
     ) -> Result<NativeIdleSuspendPoll<'owner>, WaitSuspendError> {
-        unsafe {
-            self.control
-                .poll_idle(tasks, execution, trusted_first_run_entry)
-        }
+        unsafe { control.poll_idle(tasks, execution, trusted_first_run_entry) }
     }
 
     pub(crate) fn operation_owner(
@@ -725,24 +721,23 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         }
     }
 
-    /// Reports whether every durable F suspension owner and the ephemeral
-    /// native-control handoff are empty.
+    /// Reports whether every durable F suspension owner is empty. The physical
+    /// carrier owns and checks its ephemeral native-control handoff separately.
     pub(crate) fn is_quiescent(&self) -> bool {
         self.wait_operations.is_empty()
             && self.atomic_waits.is_empty()
             && self.atomic_operations.is_empty()
-            && self.control.is_clear()
     }
 
     /// Clears the ephemeral idle handoff only when it names the exact blocked
     /// generation being retired by the e1 safe point.
     pub(crate) fn retire_idle_control_for_stop(
-        &mut self,
+        &self,
+        control: &mut NativeWaitControl,
         thread: ThreadKey,
         execution_generation: u64,
     ) -> Result<(), WaitSuspendError> {
-        self.control
-            .retire_idle_for_stop(thread, execution_generation)
+        control.retire_idle_for_stop(thread, execution_generation)
     }
 
     #[allow(
