@@ -389,6 +389,7 @@ fn i1_runtime_join_keeps_cpu_identity_and_dispatch_release_separate() {
     assert!(primordial.contains("terminal_reaper_next_on(self.cpu)"));
     assert!(primordial.contains("schedule_next_on(self.cpu)"));
     assert!(primordial.contains("begin_execution(cpu_index)"));
+    assert!(primordial.contains("idle::enable_live_cpu(cpu)"));
     assert!(execution.contains("pub(crate) fn terminal_reaper_next_on"));
     assert!(!primordial.contains("bind_parked_runtime_carriers"));
 }

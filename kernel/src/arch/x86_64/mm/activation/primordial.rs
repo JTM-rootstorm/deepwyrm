@@ -525,6 +525,8 @@ fn release_runtime_carrier_facades() {
     for cpu_index in 1..registry.len() {
         let cpu = crate::cpu::CpuIndex::new(cpu_index)
             .unwrap_or_else(|| panic!("AP {cpu_index} exceeds the native carrier bound"));
+        crate::arch::x86_64::idle::enable_live_cpu(cpu)
+            .unwrap_or_else(|error| panic!("could not enable AP {cpu_index} idle wake: {error:?}"));
         crate::arch::x86_64::syscall::release_native_runtime_carrier_for_slot(cpu)
             .unwrap_or_else(|error| panic!("could not release AP {cpu_index}: {error:?}"));
         registry
