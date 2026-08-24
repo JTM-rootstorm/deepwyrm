@@ -550,6 +550,8 @@ pub(crate) struct TrampolineTemplateLayout {
     pub(crate) gdt_base_patch: usize,
     pub(crate) protected_entry_offset: usize,
     pub(crate) protected_pointer_patch: usize,
+    pub(crate) long_entry_offset: usize,
+    pub(crate) long_pointer_patch: usize,
     pub(crate) page_table_root_patch: usize,
     pub(crate) cpu_index_patch: usize,
     pub(crate) local_apic_id_patch: usize,
@@ -591,6 +593,7 @@ pub(crate) fn build_trampoline_image(
     validate_template_layout(layout, template.len())?;
     let gdt = checked_low_address(plan.physical_start, layout.gdt_offset)?;
     let protected = checked_low_address(plan.physical_start, layout.protected_entry_offset)?;
+    let long = checked_low_address(plan.physical_start, layout.long_entry_offset)?;
 
     destination.fill(0);
     destination[..template.len()].copy_from_slice(template);
@@ -602,6 +605,7 @@ pub(crate) fn build_trampoline_image(
     );
     write_u32(destination, layout.gdt_base_patch, gdt);
     write_u32(destination, layout.protected_pointer_patch, protected);
+    write_u32(destination, layout.long_pointer_patch, long);
     write_u32(
         destination,
         layout.page_table_root_patch,
@@ -630,6 +634,7 @@ fn validate_template_layout(
         (layout.physical_base_patch, 4),
         (layout.gdt_base_patch, 4),
         (layout.protected_pointer_patch, 4),
+        (layout.long_pointer_patch, 4),
         (layout.page_table_root_patch, 4),
         (layout.cpu_index_patch, 4),
         (layout.local_apic_id_patch, 4),
@@ -643,7 +648,10 @@ fn validate_template_layout(
             return Err(TrampolineImageError::Layout);
         }
     }
-    if layout.gdt_offset >= template_len || layout.protected_entry_offset >= template_len {
+    if layout.gdt_offset >= template_len
+        || layout.protected_entry_offset >= template_len
+        || layout.long_entry_offset >= template_len
+    {
         return Err(TrampolineImageError::Layout);
     }
     Ok(())
@@ -677,6 +685,8 @@ pub(crate) fn linked_trampoline_template() -> (&'static [u8], TrampolineTemplate
         static __dw_ap_trampoline_gdt_base: u8;
         static __dw_ap_trampoline_protected_entry: u8;
         static __dw_ap_trampoline_protected_pointer: u8;
+        static __dw_ap_trampoline_long_entry: u8;
+        static __dw_ap_trampoline_long_pointer: u8;
         static __dw_ap_trampoline_page_table_root: u8;
         static __dw_ap_trampoline_cpu_index: u8;
         static __dw_ap_trampoline_local_apic_id: u8;
@@ -699,6 +709,8 @@ pub(crate) fn linked_trampoline_template() -> (&'static [u8], TrampolineTemplate
         gdt_base_patch: offset(core::ptr::addr_of!(__dw_ap_trampoline_gdt_base)),
         protected_entry_offset: offset(core::ptr::addr_of!(__dw_ap_trampoline_protected_entry)),
         protected_pointer_patch: offset(core::ptr::addr_of!(__dw_ap_trampoline_protected_pointer)),
+        long_entry_offset: offset(core::ptr::addr_of!(__dw_ap_trampoline_long_entry)),
+        long_pointer_patch: offset(core::ptr::addr_of!(__dw_ap_trampoline_long_pointer)),
         page_table_root_patch: offset(core::ptr::addr_of!(__dw_ap_trampoline_page_table_root)),
         cpu_index_patch: offset(core::ptr::addr_of!(__dw_ap_trampoline_cpu_index)),
         local_apic_id_patch: offset(core::ptr::addr_of!(__dw_ap_trampoline_local_apic_id)),
@@ -791,9 +803,11 @@ mod tests {
             gdt_base_patch: 40,
             protected_entry_offset: 16,
             protected_pointer_patch: 44,
-            page_table_root_patch: 48,
-            cpu_index_patch: 52,
-            local_apic_id_patch: 56,
+            long_entry_offset: 24,
+            long_pointer_patch: 48,
+            page_table_root_patch: 52,
+            cpu_index_patch: 56,
+            local_apic_id_patch: 60,
             stack_top_patch: 64,
             higher_half_entry_patch: 72,
         };
@@ -818,9 +832,10 @@ mod tests {
         assert_eq!(&page[36..40], &0x8000_u32.to_le_bytes());
         assert_eq!(&page[40..44], &0x8008_u32.to_le_bytes());
         assert_eq!(&page[44..48], &0x8010_u32.to_le_bytes());
-        assert_eq!(&page[48..52], &0x20_0000_u32.to_le_bytes());
-        assert_eq!(&page[52..56], &2_u32.to_le_bytes());
-        assert_eq!(&page[56..60], &7_u32.to_le_bytes());
+        assert_eq!(&page[48..52], &0x8018_u32.to_le_bytes());
+        assert_eq!(&page[52..56], &0x20_0000_u32.to_le_bytes());
+        assert_eq!(&page[56..60], &2_u32.to_le_bytes());
+        assert_eq!(&page[60..64], &7_u32.to_le_bytes());
         assert_eq!(&page[64..72], &0xffff_9000_0001_0000_u64.to_le_bytes());
         assert_eq!(&page[72..80], &0xffff_8000_0010_0000_u64.to_le_bytes());
         assert!(page[template.len()..].iter().all(|byte| *byte == 0));

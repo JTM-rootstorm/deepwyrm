@@ -47,12 +47,12 @@ __dw_ap_trampoline_physical_base:
     movl %cr0, %eax
     orl $0x80010001, %eax
     movl %eax, %cr0
-    leal (.Llong_entry - __dw_ap_trampoline_template_start)(%ebx), %eax
-    pushl $0x18
-    pushl %eax
-    lretl
+    ljmpl *(.Llong_pointer - __dw_ap_trampoline_template_start)(%ebx)
 
 .code64
+.globl __dw_ap_trampoline_long_entry
+.hidden __dw_ap_trampoline_long_entry
+__dw_ap_trampoline_long_entry:
 .Llong_entry:
     movw $0x10, %ax
     movw %ax, %ds
@@ -88,6 +88,12 @@ __dw_ap_trampoline_gdt_base:
 __dw_ap_trampoline_protected_pointer:
     .long 0
     .word 0x08
+.Llong_pointer:
+.globl __dw_ap_trampoline_long_pointer
+.hidden __dw_ap_trampoline_long_pointer
+__dw_ap_trampoline_long_pointer:
+    .long 0
+    .word 0x18
 .globl __dw_ap_trampoline_page_table_root
 .hidden __dw_ap_trampoline_page_table_root
 .Lpage_table_root:

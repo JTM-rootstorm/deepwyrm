@@ -80,6 +80,8 @@ fn h1_trampoline_template_is_one_page_and_relocation_free() {
         ("__dw_ap_trampoline_physical_base", 4),
         ("__dw_ap_trampoline_gdt_base", 4),
         ("__dw_ap_trampoline_protected_entry", 4),
+        ("__dw_ap_trampoline_long_entry", 4),
+        ("__dw_ap_trampoline_long_pointer", 4),
         ("__dw_ap_trampoline_page_table_root", 4),
         ("__dw_ap_trampoline_cpu_index", 4),
         ("__dw_ap_trampoline_local_apic_id", 4),
