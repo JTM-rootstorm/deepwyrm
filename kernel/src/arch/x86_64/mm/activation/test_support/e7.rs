@@ -487,12 +487,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
             }
             NativeSyscallRequest::ProcessExit { exit_code } => {
                 let mut terminal_waits = crate::syscall::NoTerminalWaitCleanup;
-                let (status, control, deferred) = crate::syscall::process_exit(
+                let (status, control, deferred) = crate::syscall::process_exit_on(
                     &mut self.registry,
                     &mut self.tasks,
                     &self.execution,
                     &self.waits,
                     &mut terminal_waits,
+                    crate::cpu::CpuIndex::BOOTSTRAP,
                     self.process,
                     self.thread,
                     exit_code,

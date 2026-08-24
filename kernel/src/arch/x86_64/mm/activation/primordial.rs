@@ -3421,12 +3421,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     assert!(atomic_pin.replace(pin).is_none());
                 },
             );
-            crate::syscall::process_exit(
+            crate::syscall::process_exit_on(
                 &mut self.registry,
                 &mut self.tasks,
                 &self.shared.execution,
                 &self.shared.waits,
                 &mut terminal,
+                self.cpu,
                 self.process,
                 self.thread,
                 exit_code,

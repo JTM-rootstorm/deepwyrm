@@ -903,12 +903,12 @@ fn collect_process_effects<
     execution: &ExecutionDomain<EXECUTION>,
     waits: &WaitRegistry<WAITERS>,
     effects: ProcessExitEffects<HANDLES, THREADS>,
-    defer_current: Option<ThreadKey>,
+    defer_current: Option<(crate::cpu::CpuIndex, ThreadKey)>,
     remotely_stopped: &[Option<ThreadKey>],
     terminal_waits: &mut C,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> Option<DeferredCurrentExecutionResources> {
-    let deferred_thread = defer_current.filter(|current| {
+    let deferred_thread = defer_current.filter(|(_, current)| {
         effects
             .pins
             .thread_keys()
@@ -923,8 +923,12 @@ fn collect_process_effects<
         terminal_waits.cleanup_terminal_wait(registry, tasks, waits, execution, thread, cleanup);
     }
     let (pins, deferred) = match deferred_thread {
-        Some(current) => {
-            let (pins, deferred) = execution.retire_exit_pins_defer_current(effects.pins, current);
+        Some((cpu, current)) => {
+            let (pins, deferred) = if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                execution.retire_exit_pins_defer_current(effects.pins, current)
+            } else {
+                execution.retire_exit_pins_defer_current_on(cpu, effects.pins, current)
+            };
             (pins, Some(deferred))
         }
         None if remotely_stopped.is_empty() => (execution.retire_exit_pins(effects.pins), None),
@@ -3413,7 +3417,7 @@ fn collect_group_effects<
             execution,
             waits,
             process,
-            Some(current_thread),
+            Some((crate::cpu::CpuIndex::BOOTSTRAP, current_thread)),
             &[],
             terminal_waits,
             cleanup,
@@ -3431,7 +3435,7 @@ fn collect_group_effects<
             execution,
             waits,
             process,
-            Some(current_thread),
+            Some((crate::cpu::CpuIndex::BOOTSTRAP, current_thread)),
             &[],
             terminal_waits,
             cleanup,
@@ -3535,7 +3539,7 @@ pub(crate) fn task_group_terminate<
     (DW_STATUS_SUCCESS, control, deferred)
 }
 
-pub(crate) fn process_exit<
+pub(crate) fn process_exit_on<
     C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
     const OBJECTS: usize,
     const GROUPS: usize,
@@ -3550,6 +3554,7 @@ pub(crate) fn process_exit<
     execution: &ExecutionDomain<EXECUTION>,
     waits: &WaitRegistry<WAITERS>,
     terminal_waits: &mut C,
+    current_cpu: crate::cpu::CpuIndex,
     current_process: ProcessKey,
     current_thread: ThreadKey,
     code: u32,
@@ -3573,7 +3578,7 @@ pub(crate) fn process_exit<
         execution,
         waits,
         effects,
-        Some(current_thread),
+        Some((current_cpu, current_thread)),
         &[],
         terminal_waits,
         cleanup,
@@ -3634,7 +3639,7 @@ pub(crate) fn process_unhandled_exception<
         execution,
         waits,
         effects,
-        Some(current_thread),
+        Some((crate::cpu::CpuIndex::BOOTSTRAP, current_thread)),
         &[],
         terminal_waits,
         cleanup,
@@ -3858,7 +3863,7 @@ fn complete_prepared_process_termination_with_remote_threads<
         execution,
         waits,
         prepared.effects,
-        Some(current_thread),
+        Some((crate::cpu::CpuIndex::BOOTSTRAP, current_thread)),
         remote_threads,
         terminal_waits,
         cleanup,

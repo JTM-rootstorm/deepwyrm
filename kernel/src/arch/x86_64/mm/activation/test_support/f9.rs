@@ -856,12 +856,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     atomic_operations: &mut self.atomic_operations,
                     process: self.process,
                 };
-                let (status, control, deferred) = crate::syscall::process_exit(
+                let (status, control, deferred) = crate::syscall::process_exit_on(
                     &mut self.registry,
                     &mut self.tasks,
                     &self.execution,
                     &self.waits,
                     &mut terminal,
+                    crate::cpu::CpuIndex::BOOTSTRAP,
                     self.process,
                     current,
                     exit_code,

@@ -448,7 +448,7 @@ fn e7_smoke_runtime_uses_live_e5_syscall_and_return_authority() {
     for marker in [
         "current_process_address_space(&self.active_root, self.process)",
         "crate::syscall::abi_get_info(",
-        "crate::syscall::process_exit(",
+        "crate::syscall::process_exit_on(",
         "Some(SchedulerThreadState::Running)",
         "frame.authorize_return(current_binding_generation, &mut mappings)",
         "validate_target_continuation_roundtrip()",
@@ -471,6 +471,18 @@ fn e7_smoke_runtime_uses_live_e5_syscall_and_return_authority() {
         .expect("E7 post-activation dispatch");
     assert!(activation < task_dispatch);
     assert!(build.contains("cargo:rustc-cfg=deepwyrm_e7_guest"));
+}
+
+#[test]
+fn i1_live_process_exit_retires_the_current_cpu_carrier() {
+    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let adapters = source("src/syscall/adapters.rs");
+
+    assert!(runtime.contains("crate::syscall::process_exit_on("));
+    assert!(runtime.contains("self.cpu,"));
+    assert!(adapters.contains("current_cpu: crate::cpu::CpuIndex"));
+    assert!(adapters.contains("Some((current_cpu, current_thread))"));
+    assert!(adapters.contains("retire_exit_pins_defer_current_on(cpu"));
 }
 
 #[test]

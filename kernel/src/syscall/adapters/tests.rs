@@ -2424,12 +2424,13 @@ fn process_exit_defers_current_execution_bundle_until_reaper_completion() {
     let (stack, context) = tasks.thread_execution_resources(current).unwrap().unwrap();
 
     let deferred = terminal_outcome(
-        process_exit(
+        process_exit_on(
             &mut registry,
             &mut tasks,
             &execution,
             &waits,
             &mut terminal_waits,
+            crate::cpu::CpuIndex::BOOTSTRAP,
             process,
             current,
             0,
@@ -2636,12 +2637,13 @@ fn non_current_process_termination_reclaims_only_the_target_batch() {
     assert!(execution.load_context(target_context).is_err());
 
     let deferred = terminal_outcome(
-        process_exit(
+        process_exit_on(
             &mut registry,
             &mut tasks,
             &execution,
             &waits,
             &mut terminal_waits,
+            crate::cpu::CpuIndex::BOOTSTRAP,
             current_process,
             current_thread,
             0,
@@ -2757,12 +2759,13 @@ fn prepared_process_termination_preserves_remote_execution_until_exact_stop() {
     assert!(execution.load_context(target_context).is_err());
 
     let deferred = terminal_outcome(
-        process_exit(
+        process_exit_on(
             &mut registry,
             &mut tasks,
             &execution,
             &waits,
             &mut terminal_waits,
+            crate::cpu::CpuIndex::BOOTSTRAP,
             current_process,
             current_thread,
             0,
@@ -2855,12 +2858,13 @@ fn noncurrent_unstarted_child_termination_is_immediately_quiescent() {
     );
 
     let deferred = terminal_outcome(
-        process_exit(
+        process_exit_on(
             &mut registry,
             &mut tasks,
             &execution,
             &waits,
             &mut terminal_waits,
+            crate::cpu::CpuIndex::BOOTSTRAP,
             current_process,
             current_thread,
             0,

@@ -1239,12 +1239,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                                 }
                             },
                         );
-                        crate::syscall::process_exit(
+                        crate::syscall::process_exit_on(
                             &mut self.registry,
                             &mut self.tasks,
                             self.execution,
                             &self.waits,
                             &mut terminal,
+                            crate::cpu::CpuIndex::BOOTSTRAP,
                             self.process,
                             thread,
                             exit_code,

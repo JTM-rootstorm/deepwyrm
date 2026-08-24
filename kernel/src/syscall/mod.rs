@@ -53,14 +53,14 @@ pub(crate) use adapters::{
     PreparedProcessTermination, address_region_map_prepared_model, address_region_unmap_prepared,
     complete_deferred_current_reclaim, complete_prepared_process_termination_after_remote_stops,
     complete_wait_wakes, decode_map_args, handle_close, handle_duplicate, object_get_info_v1,
-    prepare_address_region_mutation, prepare_process_terminate, process_exit,
+    prepare_address_region_mutation, prepare_process_terminate, process_exit_on,
     process_unhandled_exception,
 };
 #[cfg(all(
     not(deepwyrm_integrated),
     any(deepwyrm_e7_guest, deepwyrm_f9_guest, deepwyrm_f12_guest)
 ))]
-pub(crate) use adapters::{complete_deferred_current_reclaim, process_exit};
+pub(crate) use adapters::{complete_deferred_current_reclaim, process_exit_on};
 #[cfg(all(deepwyrm_f12_guest, not(deepwyrm_integrated)))]
 pub(crate) use adapters::{handle_close, handle_duplicate, object_get_info_v1};
 
