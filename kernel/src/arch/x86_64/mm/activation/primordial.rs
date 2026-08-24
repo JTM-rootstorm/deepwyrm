@@ -2019,8 +2019,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn finish_terminal_teardown(&mut self) -> Result<(), u32> {
-        if !self.services.is_quiescent() {
-            return Err(0x7000_0101_u32);
+        let service_residue = self.services.quiescence_residue();
+        if service_residue != 0 {
+            return Err(0x7000_0100_u32 | service_residue);
         }
         if let Some(cpu) = self
             .wait_controls

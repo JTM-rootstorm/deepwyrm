@@ -769,9 +769,15 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
     /// Reports whether every durable F suspension owner is empty. The physical
     /// carrier owns and checks its ephemeral native-control handoff separately.
     pub(crate) fn is_quiescent(&self) -> bool {
-        self.wait_operations.is_empty()
-            && self.atomic_waits.is_empty()
-            && self.atomic_operations.is_empty()
+        self.quiescence_residue() == 0
+    }
+
+    /// Returns a stable diagnostic bitset for live completion failures without
+    /// exposing or weakening any of the underlying operation owners.
+    pub(crate) fn quiescence_residue(&self) -> u32 {
+        u32::from(!self.wait_operations.is_empty())
+            | (u32::from(!self.atomic_waits.is_empty()) << 1)
+            | (u32::from(!self.atomic_operations.is_empty()) << 2)
     }
 
     /// Clears the ephemeral idle handoff only when it names the exact blocked
