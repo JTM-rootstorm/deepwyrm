@@ -645,6 +645,35 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             .state)
     }
 
+    fn group_subtree_slots(&self, key: TaskGroupKey) -> Result<[bool; GROUPS], TaskError> {
+        let root_slot = self.group_slot(key)?;
+        let mut selected = [false; GROUPS];
+        selected[root_slot] = true;
+        for _ in 0..GROUPS {
+            let mut changed = false;
+            for slot in 0..GROUPS {
+                if selected[slot] {
+                    continue;
+                }
+                let Some(record) = self.groups[slot].as_ref() else {
+                    continue;
+                };
+                let Some(parent) = record.parent.as_ref() else {
+                    continue;
+                };
+                let parent_slot = self.group_slot(TaskGroupKey(parent.id()))?;
+                if selected[parent_slot] {
+                    selected[slot] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        Ok(selected)
+    }
+
     #[cfg(test)]
     pub(crate) fn configure_thread_start(
         &mut self,
@@ -1707,30 +1736,7 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             return Err(TaskError::BadState);
         }
 
-        let mut selected = [false; GROUPS];
-        selected[root_slot] = true;
-        for _ in 0..GROUPS {
-            let mut changed = false;
-            for slot in 0..GROUPS {
-                if selected[slot] {
-                    continue;
-                }
-                let Some(record) = self.groups[slot].as_ref() else {
-                    continue;
-                };
-                let Some(parent) = record.parent.as_ref() else {
-                    continue;
-                };
-                let parent_slot = self.group_slot(TaskGroupKey(parent.id()))?;
-                if selected[parent_slot] {
-                    selected[slot] = true;
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
+        let selected = self.group_subtree_slots(key)?;
 
         for (slot, is_selected) in selected.iter().copied().enumerate() {
             if is_selected {
@@ -1779,7 +1785,7 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
                 TerminationRecord::task_group_teardown(),
             )?;
             let drained = self.drain_process_handles(registry, process_key)?;
-            effects.push(ProcessExitEffects { drained, pins });
+            effects.push(process_key, ProcessExitEffects { drained, pins });
         }
 
         for (slot, is_selected) in selected.iter().copied().enumerate().rev() {

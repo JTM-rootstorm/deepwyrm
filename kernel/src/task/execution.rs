@@ -889,6 +889,41 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         )
     }
 
+    /// Retires a terminal batch after acknowledged remote owners have already
+    /// abandoned their continuations while preserving the physical caller for
+    /// the final divergent handoff.
+    pub(crate) fn retire_exit_pins_defer_current_after_remote_stops_on<const THREADS: usize>(
+        &self,
+        cpu: SchedulerCpuId,
+        pins: ExitPins<THREADS>,
+        current: ThreadKey,
+        remote_stopped: &[Option<ThreadKey>],
+    ) -> (RetiredExitPins<THREADS>, DeferredCurrentExecutionResources) {
+        assert_eq!(
+            self.scheduler.current_on(cpu),
+            Some(current),
+            "deferred terminal retirement did not name the physical current Thread"
+        );
+        let terminal_threads = pins.thread_keys();
+        assert!(
+            terminal_threads.contains(&Some(current)),
+            "deferred terminal retirement batch did not contain the physical current Thread"
+        );
+        assert!(
+            remote_stopped
+                .iter()
+                .flatten()
+                .all(|stopped| terminal_threads.contains(&Some(*stopped))),
+            "remote-stop permit named a Thread outside the deferred terminal pin batch"
+        );
+        let (pins, deferred) =
+            self.retire_exit_pins_inner(pins, Some(current), cpu, remote_stopped);
+        (
+            pins,
+            deferred.expect("terminal batch did not contain the running current Thread"),
+        )
+    }
+
     fn retire_exit_pins_inner<const THREADS: usize>(
         &self,
         pins: ExitPins<THREADS>,

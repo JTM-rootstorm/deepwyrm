@@ -3050,6 +3050,128 @@ fn mixed_group_termination_defers_only_the_caller_process_batch() {
 }
 
 #[test]
+fn prepared_group_termination_waits_for_remote_owners_before_reclaim() {
+    let mut registry = ObjectRegistry::<24>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let root_handle_owner = registry.retain_internal(&root_owner).unwrap();
+    let root_handle_ref = registry.internal_into_handle(root_handle_owner).unwrap();
+    let (current_process, current_process_ref) =
+        tasks.create_process(&mut registry, &root_owner).unwrap();
+    let (remote_process, remote_process_ref) =
+        tasks.create_process(&mut registry, &root_owner).unwrap();
+    let current_owner = registry
+        .retain_internal_from_handle(&current_process_ref)
+        .unwrap();
+    let remote_owner = registry
+        .retain_internal_from_handle(&remote_process_ref)
+        .unwrap();
+    let (current_thread, current_thread_ref) =
+        tasks.create_thread(&mut registry, &current_owner).unwrap();
+    let (remote_thread, remote_thread_ref) =
+        tasks.create_thread(&mut registry, &remote_owner).unwrap();
+    assert!(registry.release_internal(current_owner).unwrap().is_none());
+    assert!(registry.release_internal(remote_owner).unwrap().is_none());
+    let group_handle = tasks
+        .process_handles_mut(current_process)
+        .unwrap()
+        .install(root_handle_ref, DW_RIGHT_MODIFY)
+        .unwrap();
+    let execution = ExecutionDomain::<2>::new(test_stack_bounds::<2>()).unwrap();
+    let waits = WaitRegistry::<2>::new();
+    let mut terminal_waits = NoTerminalWaitCleanup;
+    let mut cleanup = CleanupQueue::<24>::new();
+    execution
+        .start_thread(&mut tasks, current_thread, test_start(0x41))
+        .unwrap();
+    execution
+        .start_thread(&mut tasks, remote_thread, test_start(0x42))
+        .unwrap();
+    let cpu0 = crate::cpu::CpuIndex::new(0).unwrap();
+    let cpu1 = crate::cpu::CpuIndex::new(1).unwrap();
+    assert_eq!(
+        execution.schedule_next_on(cpu0).unwrap().current,
+        Some(current_thread)
+    );
+    assert_eq!(
+        execution.schedule_next_on(cpu1).unwrap().current,
+        Some(remote_thread)
+    );
+    let remote_claim = execution.running_claim_on(cpu1).unwrap();
+    let (current_stack, current_context) = tasks
+        .thread_execution_resources(current_thread)
+        .unwrap()
+        .unwrap();
+    let (remote_stack, remote_context) = tasks
+        .thread_execution_resources(remote_thread)
+        .unwrap()
+        .unwrap();
+
+    let prepared = prepare_task_group_terminate(
+        &mut registry,
+        &mut tasks,
+        &execution,
+        current_process,
+        current_thread,
+        group_handle,
+        deepwyrm_abi::DW_TERMINATION_AUTHORIZED,
+        &mut cleanup,
+    )
+    .unwrap();
+    assert!(prepared.process_keys().contains(&Some(current_process)));
+    assert!(prepared.process_keys().contains(&Some(remote_process)));
+    assert!(prepared.contains_thread(current_thread));
+    assert!(prepared.contains_thread(remote_thread));
+    assert_eq!(execution.running_claim_on(cpu1), Some(remote_claim));
+    assert!(execution.stack_bounds(remote_stack).is_ok());
+
+    execution.stop_running_claim_on(remote_claim).unwrap();
+    execution.complete_switch_on(remote_claim).unwrap();
+    let mut permits = core::array::from_fn(|_| None);
+    permits[1] =
+        Some(crate::arch::x86_64::rendezvous::RemoteStopReclaimPermit::for_test(remote_thread));
+    let deferred = terminal_outcome(
+        complete_prepared_task_group_termination_after_remote_stops_on(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut terminal_waits,
+            cpu0,
+            current_process,
+            current_thread,
+            prepared,
+            permits,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    assert!(execution.stack_bounds(current_stack).is_ok());
+    assert!(execution.load_context(current_context).is_ok());
+    assert!(execution.stack_bounds(remote_stack).is_err());
+    assert!(execution.load_context(remote_context).is_err());
+
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        cpu0,
+        deferred,
+        &mut cleanup,
+    );
+    assert!(execution.stack_bounds(current_stack).is_err());
+    assert!(execution.load_context(current_context).is_err());
+    cleanup.push_optional(registry.release_handle(current_thread_ref).unwrap());
+    cleanup.push_optional(registry.release_handle(remote_thread_ref).unwrap());
+    cleanup.push_optional(registry.release_handle(current_process_ref).unwrap());
+    cleanup.push_optional(registry.release_handle(remote_process_ref).unwrap());
+    cleanup.push_optional(registry.release_internal(root_owner).unwrap());
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+#[test]
 fn invalid_task_creation_rights_do_not_burn_object_generations() {
     let (mut registry, mut tasks, process, process_handle) = process_fixture();
     let mut user = FakeUserMemory::new();

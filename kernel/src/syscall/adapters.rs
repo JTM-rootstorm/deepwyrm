@@ -961,8 +961,12 @@ fn collect_process_effects<
             (pins, Some(deferred))
         }
         Some(DeferredCurrentRetirement::Handoff { cpu, thread }) => {
-            let (pins, deferred) =
-                execution.retire_exit_pins_defer_current_on(cpu, effects.pins, thread);
+            let (pins, deferred) = execution.retire_exit_pins_defer_current_after_remote_stops_on(
+                cpu,
+                effects.pins,
+                thread,
+                remotely_stopped,
+            );
             (pins, Some(deferred))
         }
         None if remotely_stopped.is_empty() => (execution.retire_exit_pins(effects.pins), None),
@@ -984,6 +988,34 @@ fn collect_process_effects<
 pub(crate) struct PreparedProcessTermination<const HANDLES: usize, const THREADS: usize> {
     target: ProcessKey,
     effects: ProcessExitEffects<HANDLES, THREADS>,
+}
+
+/// Recursive TaskGroup terminal effects retained across live remote-stop
+/// acknowledgement. Logical task state is already terminal, but no execution
+/// resources in this batch may be reclaimed until completion consumes it.
+#[must_use = "prepared TaskGroup termination must be completed after remote execution owners are stopped"]
+pub(crate) struct PreparedTaskGroupTermination<
+    const PROCESSES: usize,
+    const HANDLES: usize,
+    const THREADS: usize,
+> {
+    effects: TaskGroupTerminationEffects<PROCESSES, HANDLES, THREADS>,
+}
+
+impl<const PROCESSES: usize, const HANDLES: usize, const THREADS: usize>
+    PreparedTaskGroupTermination<PROCESSES, HANDLES, THREADS>
+{
+    pub(crate) const fn process_keys(&self) -> [Option<ProcessKey>; PROCESSES] {
+        self.effects.process_keys()
+    }
+
+    pub(crate) fn thread_keys(&self) -> [Option<ThreadKey>; THREADS] {
+        self.effects.thread_keys()
+    }
+
+    pub(crate) fn contains_thread(&self, thread: ThreadKey) -> bool {
+        self.thread_keys().contains(&Some(thread))
+    }
 }
 
 impl<const HANDLES: usize, const THREADS: usize> PreparedProcessTermination<HANDLES, THREADS> {
@@ -3680,10 +3712,20 @@ fn collect_group_effects<
     execution: &ExecutionDomain<EXECUTION>,
     waits: &WaitRegistry<WAITERS>,
     effects: TaskGroupTerminationEffects<PROCESSES, HANDLES, THREADS>,
-    current_thread: ThreadKey,
+    defer_current: DeferredCurrentRetirement,
+    remotely_stopped: &[Option<ThreadKey>],
     terminal_waits: &mut C,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> Option<DeferredCurrentExecutionResources> {
+    let current_thread = defer_current.thread();
+    let terminal_threads = effects.thread_keys();
+    assert!(
+        remotely_stopped
+            .iter()
+            .flatten()
+            .all(|thread| terminal_threads.contains(&Some(*thread))),
+        "remote-stop permit named a Thread outside the TaskGroup terminal batch"
+    );
     let mut processes = effects.into_processes();
     let mut current_process = None;
     for process in &mut processes {
@@ -3709,14 +3751,24 @@ fn collect_group_effects<
     // current batch must be the final scheduler mutation before architecture
     // code diverges onto the terminal reaper stack.
     for process in processes.into_iter().flatten() {
+        let terminal_threads = process.pins.thread_keys();
+        let mut batch_remote = [None; THREADS];
+        let mut remote_count = 0;
+        for thread in remotely_stopped.iter().flatten() {
+            if terminal_threads.contains(&Some(*thread)) {
+                assert!(remote_count < THREADS, "group remote-stop batch overflow");
+                batch_remote[remote_count] = Some(*thread);
+                remote_count += 1;
+            }
+        }
         let deferred = collect_process_effects(
             registry,
             tasks,
             execution,
             waits,
             process,
-            Some(DeferredCurrentRetirement::Model(current_thread)),
-            &[],
+            Some(defer_current),
+            &batch_remote,
             terminal_waits,
             cleanup,
         );
@@ -3727,14 +3779,24 @@ fn collect_group_effects<
     }
 
     current_process.map(|process| {
+        let terminal_threads = process.pins.thread_keys();
+        let mut batch_remote = [None; THREADS];
+        let mut remote_count = 0;
+        for thread in remotely_stopped.iter().flatten() {
+            if terminal_threads.contains(&Some(*thread)) {
+                assert!(remote_count < THREADS, "group remote-stop batch overflow");
+                batch_remote[remote_count] = Some(*thread);
+                remote_count += 1;
+            }
+        }
         collect_process_effects(
             registry,
             tasks,
             execution,
             waits,
             process,
-            Some(DeferredCurrentRetirement::Model(current_thread)),
-            &[],
+            Some(defer_current),
+            &batch_remote,
             terminal_waits,
             cleanup,
         )
@@ -3791,48 +3853,164 @@ pub(crate) fn task_group_terminate<
     SyscallControl,
     Option<DeferredCurrentExecutionResources>,
 ) {
-    if let Err(status) = authorized_reason(reason) {
-        return (status, SyscallControl::ReturnToCaller, None);
-    }
-    if let Err(status) = validate_running_caller(tasks, execution, current_process, current_thread)
-    {
-        return (status, SyscallControl::ReturnToCaller, None);
-    }
-    let pin = match resolve_current_handle(
+    let prepared = match prepare_task_group_terminate(
+        registry,
+        tasks,
+        execution,
+        current_process,
+        current_thread,
+        task_group,
+        reason,
+        cleanup,
+    ) {
+        Ok(prepared) => prepared,
+        Err(status) => return (status, SyscallControl::ReturnToCaller, None),
+    };
+    complete_prepared_task_group_termination(
+        registry,
+        tasks,
+        execution,
+        waits,
+        terminal_waits,
+        current_process,
+        current_thread,
+        prepared,
+        cleanup,
+    )
+}
+
+pub(crate) fn prepare_task_group_terminate<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    current_process: ProcessKey,
+    current_thread: ThreadKey,
+    task_group: DwHandle,
+    reason: DwTerminationReason,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> Result<PreparedTaskGroupTermination<PROCESSES, HANDLES, THREADS>, DwStatus> {
+    authorized_reason(reason)?;
+    validate_running_caller(tasks, execution, current_process, current_thread)?;
+    let pin = resolve_current_handle(
         tasks,
         registry,
         current_process,
         task_group,
         deepwyrm_abi::DW_OBJECT_TYPE_TASK_GROUP,
         DW_RIGHT_MODIFY,
-    ) {
-        Ok(pin) => pin,
-        Err(status) => return (status, SyscallControl::ReturnToCaller, None),
-    };
+    )?;
     let key = TaskGroupKey::from_object_id(pin.id());
     let effects = match tasks.terminate_group(registry, key) {
         Ok(effects) => effects,
         Err(error) => {
             release_lookup_pin(registry, pin, cleanup);
-            return (task_status(error), SyscallControl::ReturnToCaller, None);
+            return Err(task_status(error));
         }
     };
+    release_lookup_pin(registry, pin, cleanup);
+    Ok(PreparedTaskGroupTermination { effects })
+}
+
+pub(crate) fn complete_prepared_task_group_termination<
+    C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
+    terminal_waits: &mut C,
+    current_process: ProcessKey,
+    current_thread: ThreadKey,
+    prepared: PreparedTaskGroupTermination<PROCESSES, HANDLES, THREADS>,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> (
+    DwStatus,
+    SyscallControl,
+    Option<DeferredCurrentExecutionResources>,
+) {
     let deferred = collect_group_effects(
         registry,
         tasks,
         execution,
         waits,
-        effects,
-        current_thread,
+        prepared.effects,
+        DeferredCurrentRetirement::Model(current_thread),
+        &[],
         terminal_waits,
         cleanup,
     );
-    release_lookup_pin(registry, pin, cleanup);
     let control = control_after_process_state(tasks, current_process);
     assert_eq!(
         control == SyscallControl::TerminateCurrent,
         deferred.is_some(),
         "group terminal control and deferred current ownership diverged"
+    );
+    (DW_STATUS_SUCCESS, control, deferred)
+}
+
+pub(crate) fn complete_prepared_task_group_termination_after_remote_stops_on<
+    C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
+    terminal_waits: &mut C,
+    current_cpu: crate::cpu::CpuIndex,
+    current_process: ProcessKey,
+    current_thread: ThreadKey,
+    prepared: PreparedTaskGroupTermination<PROCESSES, HANDLES, THREADS>,
+    permits: [Option<crate::arch::x86_64::rendezvous::RemoteStopReclaimPermit>;
+        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> (
+    DwStatus,
+    SyscallControl,
+    Option<DeferredCurrentExecutionResources>,
+) {
+    let remote_threads = permits
+        .each_ref()
+        .map(|permit| permit.as_ref().map(|permit| permit.thread()));
+    let deferred = collect_group_effects(
+        registry,
+        tasks,
+        execution,
+        waits,
+        prepared.effects,
+        DeferredCurrentRetirement::Handoff {
+            cpu: current_cpu,
+            thread: current_thread,
+        },
+        remote_threads.as_slice(),
+        terminal_waits,
+        cleanup,
+    );
+    let control = control_after_process_state(tasks, current_process);
+    assert_eq!(
+        control == SyscallControl::TerminateCurrent,
+        deferred.is_some(),
+        "TaskGroup terminal control and deferred current ownership diverged"
     );
     (DW_STATUS_SUCCESS, control, deferred)
 }

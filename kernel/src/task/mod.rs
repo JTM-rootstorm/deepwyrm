@@ -665,6 +665,7 @@ pub(crate) struct TaskGroupTerminationEffects<
     const HANDLES: usize,
     const THREADS: usize,
 > {
+    process_keys: [Option<ProcessKey>; PROCESSES],
     processes: [Option<ProcessExitEffects<HANDLES, THREADS>>; PROCESSES],
     count: usize,
 }
@@ -674,22 +675,41 @@ impl<const PROCESSES: usize, const HANDLES: usize, const THREADS: usize>
 {
     fn empty() -> Self {
         Self {
+            process_keys: [None; PROCESSES],
             processes: core::array::from_fn(|_| None),
             count: 0,
         }
     }
 
-    fn push(&mut self, effects: ProcessExitEffects<HANDLES, THREADS>) {
+    fn push(&mut self, process: ProcessKey, effects: ProcessExitEffects<HANDLES, THREADS>) {
         assert!(
             self.count < PROCESSES,
             "TaskGroup process-effect batch overflow"
         );
+        self.process_keys[self.count] = Some(process);
         self.processes[self.count] = Some(effects);
         self.count += 1;
     }
 
     pub(crate) const fn len(&self) -> usize {
         self.count
+    }
+
+    pub(crate) const fn process_keys(&self) -> [Option<ProcessKey>; PROCESSES] {
+        self.process_keys
+    }
+
+    pub(crate) fn thread_keys(&self) -> [Option<ThreadKey>; THREADS] {
+        let mut keys = [None; THREADS];
+        let mut count = 0;
+        for effects in self.processes.iter().flatten() {
+            for thread in effects.pins.thread_keys().into_iter().flatten() {
+                assert!(count < THREADS, "TaskGroup thread-key batch overflow");
+                keys[count] = Some(thread);
+                count += 1;
+            }
+        }
+        keys
     }
 
     pub(crate) fn into_processes(

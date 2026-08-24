@@ -519,6 +519,18 @@ struct PendingRemoteProcessTermination {
         crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
 }
 
+struct PendingRemoteTaskGroupTermination {
+    phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
+    prepared: crate::syscall::PreparedTaskGroupTermination<PROCESSES, HANDLES, THREADS>,
+    deferred: [Option<crate::arch::x86_64::rendezvous::DeferredReclaim<()>>;
+        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+}
+
+enum PendingRemoteTermination {
+    Process(PendingRemoteProcessTermination),
+    TaskGroup(PendingRemoteTaskGroupTermination),
+}
+
 struct PreparedRemoteProcessTermination {
     phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
     prepared: crate::syscall::PreparedProcessTermination<HANDLES, THREADS>,
@@ -526,9 +538,42 @@ struct PreparedRemoteProcessTermination {
         crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
 }
 
+struct PreparedRemoteTaskGroupTermination {
+    phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
+    prepared: crate::syscall::PreparedTaskGroupTermination<PROCESSES, HANDLES, THREADS>,
+    identities: [Option<crate::arch::x86_64::rendezvous::StopIdentity>;
+        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+}
+
 enum ProcessTerminationPreparation {
     Immediate(NativeSyscallResult),
     Remote(PreparedRemoteProcessTermination),
+}
+
+enum TaskGroupTerminationPreparation {
+    Immediate(NativeSyscallResult),
+    Remote(PreparedRemoteTaskGroupTermination),
+}
+
+fn await_remote_stop_permits(
+    deferred: [Option<crate::arch::x86_64::rendezvous::DeferredReclaim<()>>;
+        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+) -> [Option<crate::arch::x86_64::rendezvous::RemoteStopReclaimPermit>;
+    crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] {
+    let mut permits = core::array::from_fn(|_| None);
+    for (cpu_index, deferred) in deferred.into_iter().enumerate() {
+        let Some(deferred) = deferred else {
+            continue;
+        };
+        let ((), permit) = crate::arch::x86_64::idle::await_live_remote_stop(deferred);
+        #[cfg(deepwyrm_i1_evidence)]
+        crate::test_support::observe_i1_rendezvous_ack(
+            crate::cpu::CpuIndex::new(permit.target_cpu())
+                .unwrap_or_else(|| panic!("I1 stop permit names an invalid CPU")),
+        );
+        permits[cpu_index] = Some(permit);
+    }
+    permits
 }
 
 struct RuntimeCarrierFacade<
@@ -541,7 +586,7 @@ struct RuntimeCarrierFacade<
     runtime: &'runtime RuntimeAuthorityLock<
         PrimordialRuntimeCarrier<'roles, RANGE_CAPACITY, ROLE_CAPACITY>,
     >,
-    pending_remote_termination: Option<PendingRemoteProcessTermination>,
+    pending_remote_termination: Option<PendingRemoteTermination>,
 }
 
 enum PreparedCarrierEntry {
@@ -2672,49 +2717,83 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
     for RuntimeCarrierFacade<'_, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>
 {
     fn handle(&mut self, request: NativeSyscallRequest) -> NativeSyscallResult {
-        if let NativeSyscallRequest::ProcessTerminate {
-            process,
-            reason,
-            code,
-        } = request
-        {
+        if matches!(
+            request,
+            NativeSyscallRequest::ProcessTerminate { .. }
+                | NativeSyscallRequest::TaskGroupTerminate { .. }
+        ) {
             assert!(
                 self.pending_remote_termination.is_none(),
                 "CPU-local carrier already owns a pending remote termination"
             );
             let mut runtime = self.runtime.lock();
             runtime.select_cpu(self.cpu);
-            return match runtime.prepare_remote_process_termination(process, reason, code) {
-                ProcessTerminationPreparation::Immediate(result) => result,
-                ProcessTerminationPreparation::Remote(prepared) => {
-                    // Publish while the same authority guard still orders the
-                    // terminal state transition. A target that was already in
-                    // syscall entry must either finish its earlier guarded
-                    // transaction or observe this Stop after acquiring it.
-                    let mut deferred = core::array::from_fn(|_| None);
-                    for (cpu_index, identity) in prepared.identities.into_iter().enumerate() {
-                        let Some(identity) = identity else {
-                            continue;
-                        };
-                        deferred[cpu_index] = Some(
-                            crate::arch::x86_64::idle::publish_live_remote_stop(identity, ())
-                                .unwrap_or_else(|failure| {
-                                    let error = failure.error();
-                                    let _resource = failure.into_resource();
-                                    panic!("remote-stop publication failed: {error:?}")
-                                }),
-                        );
+            let prepared = match request {
+                NativeSyscallRequest::ProcessTerminate {
+                    process,
+                    reason,
+                    code,
+                } => match runtime.prepare_remote_process_termination(process, reason, code) {
+                    ProcessTerminationPreparation::Immediate(result) => return result,
+                    ProcessTerminationPreparation::Remote(prepared) => {
+                        let phase = prepared.phase;
+                        let identities = prepared.identities;
+                        let pending =
+                            PendingRemoteTermination::Process(PendingRemoteProcessTermination {
+                                phase,
+                                prepared: prepared.prepared,
+                                deferred: core::array::from_fn(|_| None),
+                            });
+                        (identities, pending)
                     }
-                    self.pending_remote_termination = Some(PendingRemoteProcessTermination {
-                        phase: prepared.phase,
-                        prepared: prepared.prepared,
-                        deferred,
-                    });
-                    NativeSyscallResult {
-                        status: DW_STATUS_SUCCESS,
-                        control: SyscallControl::CompleteRemoteStop,
+                },
+                NativeSyscallRequest::TaskGroupTerminate { task_group, reason } => {
+                    match runtime.prepare_remote_task_group_termination(task_group, reason) {
+                        TaskGroupTerminationPreparation::Immediate(result) => return result,
+                        TaskGroupTerminationPreparation::Remote(prepared) => {
+                            let phase = prepared.phase;
+                            let identities = prepared.identities;
+                            let pending = PendingRemoteTermination::TaskGroup(
+                                PendingRemoteTaskGroupTermination {
+                                    phase,
+                                    prepared: prepared.prepared,
+                                    deferred: core::array::from_fn(|_| None),
+                                },
+                            );
+                            (identities, pending)
+                        }
                     }
                 }
+                _ => unreachable!("terminal request classification drifted"),
+            };
+            let (identities, mut pending) = prepared;
+            // Publish while the same authority guard still orders the terminal
+            // state transition. A target that was already in syscall entry
+            // must either finish its earlier guarded transaction or observe
+            // this Stop after acquiring it.
+            for (cpu_index, identity) in identities.into_iter().enumerate() {
+                let Some(identity) = identity else {
+                    continue;
+                };
+                let deferred = crate::arch::x86_64::idle::publish_live_remote_stop(identity, ())
+                    .unwrap_or_else(|failure| {
+                        let error = failure.error();
+                        let _resource = failure.into_resource();
+                        panic!("remote-stop publication failed: {error:?}")
+                    });
+                match &mut pending {
+                    PendingRemoteTermination::Process(pending) => {
+                        pending.deferred[cpu_index] = Some(deferred)
+                    }
+                    PendingRemoteTermination::TaskGroup(pending) => {
+                        pending.deferred[cpu_index] = Some(deferred)
+                    }
+                }
+            }
+            self.pending_remote_termination = Some(pending);
+            return NativeSyscallResult {
+                status: DW_STATUS_SUCCESS,
+                control: SyscallControl::CompleteRemoteStop,
             };
         }
         let mut runtime = self.runtime.lock();
@@ -2786,23 +2865,19 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             .pending_remote_termination
             .take()
             .unwrap_or_else(|| panic!("remote-stop control omitted its CPU-local termination"));
-        let mut permits = core::array::from_fn(|_| None);
-        for (cpu_index, deferred) in pending.deferred.into_iter().enumerate() {
-            let Some(deferred) = deferred else {
-                continue;
-            };
-            let ((), permit) = crate::arch::x86_64::idle::await_live_remote_stop(deferred);
-            #[cfg(deepwyrm_i1_evidence)]
-            crate::test_support::observe_i1_rendezvous_ack(
-                crate::cpu::CpuIndex::new(permit.target_cpu())
-                    .unwrap_or_else(|| panic!("I1 stop permit names an invalid CPU")),
-            );
-            permits[cpu_index] = Some(permit);
-        }
-        let result = {
-            let mut runtime = self.runtime.lock();
-            runtime.select_cpu(self.cpu);
-            runtime.complete_process_termination(pending.phase, pending.prepared, permits)
+        let result = match pending {
+            PendingRemoteTermination::Process(pending) => {
+                let permits = await_remote_stop_permits(pending.deferred);
+                let mut runtime = self.runtime.lock();
+                runtime.select_cpu(self.cpu);
+                runtime.complete_process_termination(pending.phase, pending.prepared, permits)
+            }
+            PendingRemoteTermination::TaskGroup(pending) => {
+                let permits = await_remote_stop_permits(pending.deferred);
+                let mut runtime = self.runtime.lock();
+                runtime.select_cpu(self.cpu);
+                runtime.complete_task_group_termination(pending.phase, pending.prepared, permits)
+            }
         };
         frame.set_status(result.status);
         if result.control == SyscallControl::ReturnToCaller
@@ -3524,6 +3599,29 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     out_required_size,
                 ))
             }
+            NativeSyscallRequest::TaskGroupCreate {
+                parent,
+                requested_rights,
+                out_handle,
+            } => {
+                let mut user = self.active.current_process_address_space(
+                    self.active_root.as_ref().expect("active root"),
+                    self.process,
+                );
+                NativeSyscallResult::returning(crate::syscall::task_group_create(
+                    &mut user,
+                    &mut self.registry,
+                    &mut self.tasks,
+                    self.process,
+                    parent,
+                    requested_rights,
+                    out_handle,
+                    &mut self.cleanup,
+                ))
+            }
+            NativeSyscallRequest::TaskGroupTerminate { .. } => {
+                unreachable!("TaskGroupTerminate must be intercepted by the CPU-local facade")
+            }
             NativeSyscallRequest::ThreadCreate {
                 process,
                 requested_rights,
@@ -4123,6 +4221,151 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             prepared,
             identities,
         })
+    }
+
+    fn prepare_remote_task_group_termination(
+        &mut self,
+        task_group: deepwyrm_abi::DwHandle,
+        reason: deepwyrm_abi::DwTerminationReason,
+    ) -> TaskGroupTerminationPreparation {
+        let phase = self.reserve_runtime_phase();
+        self.assert_guard_free_external_work();
+        let prepared = match crate::syscall::prepare_task_group_terminate(
+            &mut self.registry,
+            &mut self.tasks,
+            &self.shared.execution,
+            self.process,
+            self.thread,
+            task_group,
+            reason,
+            &mut self.cleanup,
+        ) {
+            Ok(prepared) => prepared,
+            Err(status) => {
+                self.commit_runtime_phase(phase);
+                return TaskGroupTerminationPreparation::Immediate(NativeSyscallResult::returning(
+                    status,
+                ));
+            }
+        };
+        let mut identities = core::array::from_fn(|_| None);
+        for cpu_index in 0..crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT {
+            let cpu = crate::cpu::CpuIndex::new(cpu_index)
+                .unwrap_or_else(|| panic!("I2 remote-stop CPU index is out of range"));
+            if cpu == self.cpu {
+                continue;
+            }
+            let claim = self
+                .shared
+                .execution
+                .running_claim_on(cpu)
+                .or_else(|| self.shared.execution.suspended_claim_on(cpu));
+            let Some(claim) = claim else {
+                continue;
+            };
+            if !prepared.contains_thread(claim.thread()) {
+                continue;
+            }
+            let root = self.active_roots[cpu_index]
+                .as_ref()
+                .unwrap_or_else(|| panic!("remote terminal owner has no retained Process root"));
+            let owner = self
+                .tasks
+                .thread_process(claim.thread())
+                .unwrap_or_else(|_| panic!("remote terminal Thread lost its Process owner"));
+            assert_eq!(
+                root.process(),
+                owner,
+                "remote TaskGroup terminal owner selected a different Process root"
+            );
+            let snapshot = crate::arch::x86_64::smp::live_cpu_registry()
+                .snapshot(cpu_index)
+                .unwrap_or_else(|_| panic!("remote terminal owner is not online"));
+            identities[cpu_index] = Some(
+                root.stop_identity(snapshot.online_generation, claim)
+                    .unwrap_or_else(|_| panic!("remote terminal identity is inconsistent")),
+            );
+        }
+        if identities.iter().all(Option::is_none) {
+            return TaskGroupTerminationPreparation::Immediate(
+                self.complete_task_group_termination(
+                    phase,
+                    prepared,
+                    core::array::from_fn(|_| None),
+                ),
+            );
+        }
+        TaskGroupTerminationPreparation::Remote(PreparedRemoteTaskGroupTermination {
+            phase,
+            prepared,
+            identities,
+        })
+    }
+
+    fn complete_task_group_termination(
+        &mut self,
+        phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
+        prepared: crate::syscall::PreparedTaskGroupTermination<PROCESSES, HANDLES, THREADS>,
+        permits: [Option<crate::arch::x86_64::rendezvous::RemoteStopReclaimPermit>;
+            crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+    ) -> NativeSyscallResult {
+        let process_keys = prepared.process_keys();
+        let mut discarded = None;
+        let mut atomic_pin = None;
+        let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
+        let (status, control, deferred) = {
+            let mut terminal = self.services.terminal_cleanup(
+                Some(&mut wait_deadlines),
+                |output| assert!(discarded.replace(output).is_none()),
+                |pin| assert!(atomic_pin.replace(pin).is_none()),
+            );
+            crate::syscall::complete_prepared_task_group_termination_after_remote_stops_on(
+                &mut self.registry,
+                &mut self.tasks,
+                &self.shared.execution,
+                &self.shared.waits,
+                &mut terminal,
+                self.cpu,
+                self.process,
+                self.thread,
+                prepared,
+                permits,
+                &mut self.cleanup,
+            )
+        };
+        self.finish_terminal_adapter_resources(discarded, atomic_pin, control, deferred);
+        if status == DW_STATUS_SUCCESS {
+            for target in process_keys.into_iter().flatten() {
+                if target == self.process {
+                    continue;
+                }
+                let root_object = self
+                    .tasks
+                    .root_region(target)
+                    .unwrap_or_else(|error| {
+                        panic!("terminated TaskGroup child root lookup failed: {error:?}")
+                    })
+                    .unwrap_or_else(|| panic!("terminated TaskGroup child has no root region"));
+                let root_key =
+                    crate::memory::address_region::AddressRegionObjectKey::from_object_id(
+                        root_object,
+                    );
+                let address_space = self
+                    .regions
+                    .region(root_key)
+                    .unwrap_or_else(|error| {
+                        panic!("terminated TaskGroup child root disappeared: {error:?}")
+                    })
+                    .address_space_key();
+                self.finish_inactive_process_teardown(target, root_key, address_space)
+                    .unwrap_or_else(|_| {
+                        panic!("terminated TaskGroup inactive child teardown drifted")
+                    });
+            }
+        }
+        let result = NativeSyscallResult { status, control };
+        self.commit_runtime_phase(phase);
+        result
     }
 
     fn complete_process_termination(

@@ -315,12 +315,23 @@ fn i1_remote_termination_waits_guard_free_for_exact_ack_before_reclaim() {
         .split_once("fn authorize_return(")
         .expect("remote-stop initiator extent")
         .0;
-    let await_ack = initiator.find("await_live_remote_stop(deferred)").unwrap();
+    assert!(primordial.contains("fn await_remote_stop_permits("));
+    let await_ack = primordial.find("await_live_remote_stop(deferred)").unwrap();
+    let await_call = initiator
+        .find("let permits = await_remote_stop_permits(pending.deferred)")
+        .unwrap();
+    let authority_lock = initiator[await_call..]
+        .find("let mut runtime = self.runtime.lock();")
+        .map(|offset| await_call + offset)
+        .unwrap();
     let reclaim = initiator
         .find("runtime.complete_process_termination(")
         .unwrap();
-    assert!(await_ack < reclaim);
-    assert!(initiator.contains("permits[cpu_index] = Some(permit)"));
+    let helper = primordial.find("fn await_remote_stop_permits(").unwrap();
+    assert!(helper < await_ack);
+    assert!(await_call < authority_lock);
+    assert!(authority_lock < reclaim);
+    assert!(primordial.contains("permits[cpu_index] = Some(permit)"));
 
     let adapters = source("src/syscall/adapters.rs");
     assert!(adapters.contains("prepare_process_terminate("));
@@ -484,7 +495,7 @@ fn i1_live_process_exit_retires_the_current_cpu_carrier() {
     assert!(adapters.contains("DeferredCurrentRetirement::Handoff"));
     assert!(adapters.contains("cpu: current_cpu"));
     assert!(runtime.contains("complete_deferred_current_reclaim_on("));
-    assert!(adapters.contains("retire_exit_pins_defer_current_on(cpu"));
+    assert!(adapters.contains("retire_exit_pins_defer_current_after_remote_stops_on("));
 }
 
 #[test]
@@ -661,6 +672,8 @@ fn i2_live_dispatch_covers_every_stress_payload_syscall_family() {
         "NativeSyscallRequest::HandleClose",
         "NativeSyscallRequest::HandleDuplicate",
         "NativeSyscallRequest::ObjectGetInfoV1",
+        "NativeSyscallRequest::TaskGroupCreate",
+        "NativeSyscallRequest::TaskGroupTerminate",
         "NativeSyscallRequest::MemoryObjectCreate",
         "NativeSyscallRequest::AddressRegionMap",
         "NativeSyscallRequest::AddressRegionUnmap",
@@ -670,6 +683,15 @@ fn i2_live_dispatch_covers_every_stress_payload_syscall_family() {
     ] {
         assert!(runtime.contains(family), "live carrier omitted {family}");
     }
+    assert!(runtime.contains("fn prepare_remote_task_group_termination("));
+    assert!(runtime.contains("fn complete_task_group_termination("));
+    assert!(runtime.contains("PendingRemoteTermination::TaskGroup"));
+    assert!(adapters.contains("pub(crate) fn prepare_task_group_terminate<"));
+    assert!(
+        adapters.contains(
+            "pub(crate) fn complete_prepared_task_group_termination_after_remote_stops_on<"
+        )
+    );
 }
 
 #[test]
