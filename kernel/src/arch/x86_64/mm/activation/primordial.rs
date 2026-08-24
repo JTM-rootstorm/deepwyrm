@@ -314,10 +314,16 @@ impl G5PrimordialProbe {
             return self.terminal_application_code;
         }
         match completion {
+            Err(crate::boot::primordial::construction::PrimordialCompletionError::Receive(_)) => 2,
+            Err(crate::boot::primordial::construction::PrimordialCompletionError::MalformedReady) => 3,
+            Err(crate::boot::primordial::construction::PrimordialCompletionError::ObserveExit(_)) => 4,
             Err(crate::boot::primordial::construction::PrimordialCompletionError::NonzeroExit(
                 code,
             )) => *code,
-            _ => 1,
+            Err(crate::boot::primordial::construction::PrimordialCompletionError::UnhandledException) => 5,
+            Err(crate::boot::primordial::construction::PrimordialCompletionError::AuthorizedTermination) => 6,
+            Err(crate::boot::primordial::construction::PrimordialCompletionError::NotQuiescent(_)) => 7,
+            Ok(()) => 1,
         }
     }
 }
