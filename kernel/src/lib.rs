@@ -147,14 +147,21 @@ fn park_h1_application_processor() -> ! {
     reason = "an initialized H2 AP uses the STI-HLT interrupt shadow to sleep without losing a fixed-IPI wake"
 )]
 fn idle_h2_application_processor() -> ! {
+    let cpu_index = arch::x86_64::syscall::current_cpu_index_for_diagnostics()
+        .unwrap_or_else(|| park_h1_application_processor());
     loop {
-        // SAFETY: the AP has a private runtime IDT/GS boundary and stationary
-        // local-APIC EOI owner before entering this path. STI;HLT closes the
-        // wake race; CLI restores IF-clear state between idle iterations.
-        unsafe {
-            core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+        let snapshot = arch::x86_64::smp::live_cpu_registry()
+            .snapshot(cpu_index)
+            .unwrap_or_else(|_| park_h1_application_processor());
+        if snapshot.lifecycle == arch::x86_64::smp::CpuLifecycle::Executing {
+            break;
         }
+        if snapshot.lifecycle != arch::x86_64::smp::CpuLifecycle::Parked {
+            park_h1_application_processor();
+        }
+        core::hint::spin_loop();
     }
+    arch::x86_64::syscall::enter_bound_idle_scheduler()
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]

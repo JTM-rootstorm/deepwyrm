@@ -48,7 +48,11 @@ fn ap_entry_publishes_only_after_private_architecture_and_local_apic_state() {
     assert!(online < parked);
     assert!(parked < idle);
     assert!(source.contains("core::arch::asm!(\"cli; hlt\""));
-    assert!(source.contains("core::arch::asm!(\"sti; hlt; cli\""));
+    assert!(source.contains("arch::x86_64::syscall::enter_bound_idle_scheduler()"));
+    let runtime =
+        fs::read_to_string(kernel_root().join("src/arch/x86_64/mm/activation/primordial.rs"))
+            .unwrap();
+    assert!(runtime.contains("core::arch::asm!(\"sti\", \"hlt\", \"cli\""));
     assert!(
         failure_halt < private,
         "validation failures must park before initialization"

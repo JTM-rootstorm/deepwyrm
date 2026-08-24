@@ -70,6 +70,7 @@ const RUNTIME_BOUND: u8 = 2;
 
 pub(crate) type SyscallRuntimeHandler = unsafe fn(*mut (), &mut RawSyscallFrame);
 type FreshThreadRuntimeHandler = unsafe fn(*mut ()) -> !;
+type IdleSchedulerRuntimeHandler = unsafe fn(*mut ()) -> !;
 type UserExceptionRuntimeHandler =
     unsafe fn(*mut (), crate::arch::x86_64::exceptions::UserExceptionRecord) -> !;
 
@@ -78,6 +79,7 @@ struct RuntimeBindingState {
     context: *mut (),
     handler: SyscallRuntimeHandler,
     fresh_thread_handler: FreshThreadRuntimeHandler,
+    idle_scheduler_handler: IdleSchedulerRuntimeHandler,
     user_exception_handler: UserExceptionRuntimeHandler,
 }
 
@@ -624,10 +626,10 @@ pub(crate) unsafe fn bind_current_thread_stack(
     reason = "one-shot AP carrier binding erases a unique pinned static address only after the CPU-private boundary is installed"
 )]
 pub(crate) unsafe fn bind_native_runtime_carrier_for_slot<
-    R: crate::syscall::native::NativeSyscallFrameRuntime + 'static,
+    R: crate::syscall::native::NativeSyscallFrameRuntime,
 >(
     cpu_index: crate::cpu::CpuIndex,
-    mut runtime: Pin<&'static mut R>,
+    mut runtime: Pin<&mut R>,
 ) -> Result<(), SyscallRuntimeBindError> {
     let cpu_index = cpu_index.index();
     if INSTALL_STATE
@@ -645,6 +647,7 @@ pub(crate) unsafe fn bind_native_runtime_carrier_for_slot<
             context.cast::<()>(),
             native_runtime_trampoline::<R>,
             native_runtime_fresh_thread::<R>,
+            native_runtime_idle_scheduler::<R>,
             native_runtime_user_exception::<R>,
         )
     }?;
@@ -698,6 +701,7 @@ unsafe fn publish_syscall_runtime(
     context: *mut (),
     handler: SyscallRuntimeHandler,
     fresh_thread_handler: FreshThreadRuntimeHandler,
+    idle_scheduler_handler: IdleSchedulerRuntimeHandler,
     user_exception_handler: UserExceptionRuntimeHandler,
 ) -> Result<(), SyscallRuntimeBindError> {
     let state = RUNTIME_STATE
@@ -733,6 +737,7 @@ unsafe fn publish_syscall_runtime(
             context,
             handler,
             fresh_thread_handler,
+            idle_scheduler_handler,
             user_exception_handler,
         });
     }
@@ -855,6 +860,17 @@ unsafe fn native_runtime_fresh_thread<R: crate::syscall::native::NativeSyscallFr
 ) -> ! {
     let runtime = unsafe { &mut *context.cast::<R>() };
     runtime.enter_scheduled_fresh_thread()
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the AP scheduler entry reborrows only its uniquely published CPU-local carrier"
+)]
+unsafe fn native_runtime_idle_scheduler<R: crate::syscall::native::NativeSyscallFrameRuntime>(
+    context: *mut (),
+) -> ! {
+    let runtime = unsafe { &mut *context.cast::<R>() };
+    runtime.enter_idle_scheduler()
 }
 
 #[allow(
@@ -1044,6 +1060,18 @@ pub(crate) unsafe extern "sysv64" fn dw_x86_64_first_run_thread_entry() -> ! {
     unsafe { (binding.fresh_thread_handler)(binding.context) }
 }
 
+/// Enters the bound cooperative scheduler from an AP's private bootstrap
+/// stack. The AP carrier must already be released to `Executing`.
+#[allow(
+    unsafe_code,
+    reason = "the immutable current-CPU binding pairs its carrier with the monomorphized divergent scheduler callback"
+)]
+pub(crate) fn enter_bound_idle_scheduler() -> ! {
+    validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
+    let binding = runtime_binding().unwrap_or_else(|| halt_forever());
+    unsafe { (binding.idle_scheduler_handler)(binding.context) }
+}
+
 #[allow(
     dead_code,
     reason = "multi-thread F7/F12 runtimes use the first-run continuation; the single-thread G3 runtime does not"
@@ -1155,6 +1183,7 @@ impl<'runtime, R: crate::syscall::native::NativeSyscallFrameRuntime>
                 context.cast::<()>(),
                 native_runtime_trampoline::<R>,
                 native_runtime_fresh_thread::<R>,
+                native_runtime_idle_scheduler::<R>,
                 native_runtime_user_exception::<R>,
             )
         }

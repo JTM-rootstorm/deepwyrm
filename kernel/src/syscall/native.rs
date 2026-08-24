@@ -765,6 +765,14 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
     /// already bound that Thread's owned kernel stack.
     fn enter_scheduled_fresh_thread(&mut self) -> !;
 
+    /// Acquires work for a CPU that entered the live runtime from its private
+    /// AP bootstrap stack rather than from an existing Thread continuation.
+    /// Implementations must remain cooperative: an idle CPU may claim Runnable
+    /// work, but this entry does not displace a Running Thread.
+    fn enter_idle_scheduler(&mut self) -> ! {
+        panic!("native runtime does not admit idle-CPU scheduler entry")
+    }
+
     /// Returns a plan branded by the stationary execution owner borrowed from
     /// this runtime. The raw trampoline must consume it immediately.
     ///

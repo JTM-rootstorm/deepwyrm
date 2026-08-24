@@ -9,7 +9,8 @@ use super::*;
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::ops::{Deref, DerefMut};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::boot::primordial::construction::authority::{
     AuthorityPrimordialBackend, AuthorityPrimordialMonitor, PrimordialPlatform,
@@ -373,47 +374,82 @@ unsafe impl Sync for SharedRuntimeStorage {}
 static SHARED_RUNTIME_STATE: AtomicU8 = AtomicU8::new(0);
 static SHARED_RUNTIME_STORAGE: SharedRuntimeStorage = SharedRuntimeStorage::new();
 
-/// Fixed CPU-local façade over the stationary runtime authorities.
-///
-/// It is bound before AP release but deliberately has no execution path until
-/// the serialized H2 join can prove remote-stop and shootdown acknowledgements.
-/// The syscall binding lifecycle, rather than a replaceable callback pointer,
-/// is the one-way Parked -> Executing gate.
-struct RuntimeCarrierFacade {
+/// Coarse DW0-H transaction boundary for the still-monolithic live authority
+/// set. Per-CPU carrier state remains outside this lock; shared mutations are
+/// serialized until the individual authorities grow narrower SMP adapters.
+struct RuntimeAuthorityLock<T> {
+    held: AtomicBool,
+    value: UnsafeCell<T>,
+}
+
+impl<T> RuntimeAuthorityLock<T> {
+    const fn new(value: T) -> Self {
+        Self {
+            held: AtomicBool::new(false),
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    fn lock(&self) -> RuntimeAuthorityGuard<'_, T> {
+        while self
+            .held
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        RuntimeAuthorityGuard {
+            lock: self,
+            owns_lock: true,
+        }
+    }
+}
+
+// SAFETY: `value` is initialized before any AP carrier is released, never
+// moved afterward, and every access is serialized by `held`. This is the
+// explicit DW0-H bridge for authorities whose types intentionally do not claim
+// `Send`/`Sync` independently.
+unsafe impl<T> Sync for RuntimeAuthorityLock<T> {}
+
+struct RuntimeAuthorityGuard<'a, T> {
+    lock: &'a RuntimeAuthorityLock<T>,
+    owns_lock: bool,
+}
+
+impl<T> Deref for RuntimeAuthorityGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.lock.value.get() }
+    }
+}
+
+impl<T> DerefMut for RuntimeAuthorityGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.lock.value.get() }
+    }
+}
+
+impl<T> Drop for RuntimeAuthorityGuard<'_, T> {
+    fn drop(&mut self) {
+        if self.owns_lock {
+            self.lock.held.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// CPU-local immutable identity over the stationary synchronized runtime.
+struct RuntimeCarrierFacade<
+    'runtime,
+    'roles,
+    const RANGE_CAPACITY: usize,
+    const ROLE_CAPACITY: usize,
+> {
     cpu: crate::cpu::CpuIndex,
-    _shared: &'static PrimordialRuntimeShared,
+    runtime: &'runtime RuntimeAuthorityLock<
+        PrimordialRuntimeCarrier<'roles, RANGE_CAPACITY, ROLE_CAPACITY>,
+    >,
 }
-
-impl RuntimeCarrierFacade {
-    fn reject_entry(&self, operation: &'static str) -> ! {
-        panic!(
-            "parked CPU {} reached forbidden native-runtime operation {operation}",
-            self.cpu.index()
-        )
-    }
-}
-
-struct RuntimeCarrierStorage(
-    UnsafeCell<[MaybeUninit<RuntimeCarrierFacade>; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT]>,
-);
-
-impl RuntimeCarrierStorage {
-    const fn new() -> Self {
-        Self(UnsafeCell::new(
-            [const { MaybeUninit::uninit() }; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
-        ))
-    }
-}
-
-// SAFETY: the BSP initializes each discovered AP slot exactly once, publishes
-// its address into that CPU's runtime binding, and never exposes the backing
-// cell again. Parked carriers never return from a callback or touch shared
-// mutable subsystem state.
-unsafe impl Sync for RuntimeCarrierStorage {}
-
-static RUNTIME_CARRIER_STATE: [AtomicU8; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] =
-    [const { AtomicU8::new(0) }; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT];
-static RUNTIME_CARRIER_STORAGE: RuntimeCarrierStorage = RuntimeCarrierStorage::new();
 
 struct ChannelStaging(UnsafeCell<[u8; DW_CHANNEL_MAX_PAYLOAD as usize]>);
 
@@ -453,8 +489,20 @@ fn publish_runtime_shared() -> &'static PrimordialRuntimeShared {
     target
 }
 
-fn bind_runtime_carrier_facades(shared: &'static PrimordialRuntimeShared) {
+fn bind_runtime_carrier_facades<
+    'borrow,
+    'runtime,
+    'roles,
+    const RANGE_CAPACITY: usize,
+    const ROLE_CAPACITY: usize,
+>(
+    facades: core::pin::Pin<
+        &'borrow mut [RuntimeCarrierFacade<'runtime, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>;
+                         crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+    >,
+) {
     let registry = crate::arch::x86_64::smp::live_cpu_registry();
+    let facades = unsafe { core::pin::Pin::get_unchecked_mut(facades) };
     for cpu_index in 1..registry.len() {
         let snapshot = registry
             .snapshot(cpu_index)
@@ -464,93 +512,46 @@ fn bind_runtime_carrier_facades(shared: &'static PrimordialRuntimeShared) {
         }
         let cpu = crate::cpu::CpuIndex::new(cpu_index)
             .unwrap_or_else(|| panic!("AP {cpu_index} exceeds the native carrier bound"));
-        let state = &RUNTIME_CARRIER_STATE[cpu_index];
-        state
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .unwrap_or_else(|_| panic!("AP {cpu_index} native carrier was initialized twice"));
-        let carrier = unsafe {
-            let slots = &mut *RUNTIME_CARRIER_STORAGE.0.get();
-            let slot = slots
-                .get_mut(cpu_index)
-                .unwrap_or_else(|| panic!("AP {cpu_index} lacks native carrier storage"));
-            slot.write(RuntimeCarrierFacade {
-                cpu,
-                _shared: shared,
-            });
-            core::pin::Pin::new_unchecked(&mut *slot.as_mut_ptr())
-        };
+        let carrier = unsafe { core::pin::Pin::new_unchecked(&mut facades[cpu_index]) };
         unsafe { crate::arch::x86_64::syscall::bind_native_runtime_carrier_for_slot(cpu, carrier) }
             .unwrap_or_else(|error| {
                 panic!("could not bind AP {cpu_index} native carrier: {error:?}")
             });
-        state.store(2, Ordering::Release);
     }
 }
 
-impl NativeSyscallHandler for RuntimeCarrierFacade {
-    fn handle(&mut self, _request: NativeSyscallRequest) -> NativeSyscallResult {
-        self.reject_entry("syscall dispatch")
-    }
-}
-
-#[allow(
-    unsafe_code,
-    reason = "the bound AP façade is deliberately fail-closed until the serialized scheduler/live runtime join releases it"
-)]
-impl NativeSyscallFrameRuntime for RuntimeCarrierFacade {
-    fn authorize_return(
-        &mut self,
-        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
-        _current_binding_generation: u64,
-    ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
-        self.reject_entry("user-return authorization")
-    }
-
-    fn invalid_return(&mut self, _error: crate::arch::x86_64::syscall::UserReturnError) {
-        self.reject_entry("invalid user return")
-    }
-
-    fn user_exception(&mut self, _record: crate::arch::x86_64::exceptions::UserExceptionRecord) {
-        self.reject_entry("userspace exception")
-    }
-
-    fn terminate_current(&mut self) -> ! {
-        self.reject_entry("terminal reclaim")
-    }
-
-    fn enter_scheduled_fresh_thread(&mut self) -> ! {
-        self.reject_entry("fresh userspace entry")
-    }
-
-    unsafe fn prepare_suspend<'owner>(
-        &'owner mut self,
-        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
-    ) -> crate::syscall::native::NativeSuspendPlan<'owner> {
-        self.reject_entry("suspend preparation")
-    }
-
-    unsafe fn poll_idle_suspend<'owner>(
-        &'owner mut self,
-        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
-    ) -> crate::syscall::native::NativeIdleSuspendPoll<'owner> {
-        self.reject_entry("idle-suspend polling")
-    }
-
-    fn resume_suspended(&mut self, _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame) {
-        self.reject_entry("suspended syscall resume")
+fn release_runtime_carrier_facades() {
+    let registry = crate::arch::x86_64::smp::live_cpu_registry();
+    for cpu_index in 1..registry.len() {
+        let cpu = crate::cpu::CpuIndex::new(cpu_index)
+            .unwrap_or_else(|| panic!("AP {cpu_index} exceeds the native carrier bound"));
+        crate::arch::x86_64::syscall::release_native_runtime_carrier_for_slot(cpu)
+            .unwrap_or_else(|error| panic!("could not release AP {cpu_index}: {error:?}"));
+        registry
+            .begin_execution(cpu_index)
+            .unwrap_or_else(|error| panic!("could not execute AP {cpu_index}: {error:?}"));
     }
 }
 
 fn take_channel_staging(cpu_index: usize) -> &'static mut [u8; DW_CHANNEL_MAX_PAYLOAD as usize] {
+    take_channel_staging_once(cpu_index, false)
+}
+
+fn take_channel_staging_once(
+    cpu_index: usize,
+    permit_existing_claim: bool,
+) -> &'static mut [u8; DW_CHANNEL_MAX_PAYLOAD as usize] {
     let state = CHANNEL_STAGING_STATE
         .get(cpu_index)
         .unwrap_or_else(|| panic!("invalid primordial Channel staging CPU slot"));
     let staging = CHANNEL_STAGING
         .get(cpu_index)
         .unwrap_or_else(|| panic!("invalid primordial Channel staging CPU slot"));
-    state
-        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-        .unwrap_or_else(|_| panic!("primordial Channel staging CPU slot was claimed twice"));
+    if let Err(observed) = state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
+        if !permit_existing_claim || observed != 1 {
+            panic!("primordial Channel staging CPU slot was claimed twice");
+        }
+    }
     unsafe { &mut *staging.0.get() }
 }
 
@@ -1000,6 +1001,94 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
+    fn select_cpu(&mut self, cpu: crate::cpu::CpuIndex) {
+        if self.cpu != cpu {
+            self.cpu = cpu;
+            self.channel_staging = take_channel_staging_once(cpu.index(), true);
+        }
+        self.synchronize_scheduler_current();
+    }
+
+    unsafe fn prepare_suspend_stationary(
+        &mut self,
+    ) -> crate::syscall::native::NativeSuspendPlan<'static> {
+        #[cfg(feature = "test-support")]
+        let owner = self.services.operation_owner(self.thread);
+        let plan = unsafe {
+            self.services.prepare_suspend(
+                &self.tasks,
+                &self.shared.execution,
+                crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
+            )
+        }
+        .unwrap_or_else(|error| panic!("primordial suspend preparation drifted: {error:?}"));
+        #[cfg(feature = "test-support")]
+        self.g5_probe.observe_prepare(
+            owner,
+            matches!(
+                &plan,
+                crate::syscall::native::NativeSuspendPlan::IdleCurrent
+            ),
+        );
+        plan
+    }
+
+    unsafe fn poll_idle_suspend_stationary(
+        &mut self,
+    ) -> crate::syscall::native::NativeIdleSuspendPoll<'static> {
+        #[cfg(feature = "test-support")]
+        let owner = self.services.operation_owner(self.thread);
+        let poll = unsafe {
+            self.services.poll_idle_suspend(
+                &self.tasks,
+                &self.shared.execution,
+                crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
+            )
+        }
+        .unwrap_or_else(|error| panic!("primordial idle-suspend poll drifted: {error:?}"));
+        #[cfg(feature = "test-support")]
+        self.g5_probe.observe_poll(
+            owner,
+            matches!(
+                &poll,
+                crate::syscall::native::NativeIdleSuspendPoll::ResumeCurrent
+            ),
+            matches!(
+                &poll,
+                crate::syscall::native::NativeIdleSuspendPoll::Switch(_)
+            ),
+        );
+        poll
+    }
+
+    fn prepare_fresh_user_entry(
+        &mut self,
+    ) -> (
+        crate::arch::x86_64::syscall::ValidatedUserReturn,
+        crate::memory::kernel_stack::KernelStackBounds,
+    ) {
+        self.synchronize_scheduler_current();
+        let context = self
+            .shared
+            .execution
+            .load_context(self.context_id)
+            .unwrap_or_else(|error| panic!("could not load fresh Thread context: {error:?}"));
+        let stack = self
+            .shared
+            .execution
+            .stack_bounds(self.stack_id)
+            .unwrap_or_else(|error| panic!("could not load fresh Thread stack: {error:?}"));
+        let state = {
+            let mut mappings = self.active.current_process_address_space(
+                self.active_root.as_ref().expect("active root"),
+                self.process,
+            );
+            crate::arch::x86_64::syscall::ValidatedUserReturn::initial(context, &mut mappings)
+                .unwrap_or_else(|error| panic!("invalid fresh Thread return: {error:?}"))
+        };
+        (state, stack)
+    }
+
     fn synchronize_scheduler_current(&mut self) {
         let thread = self
             .shared
@@ -1638,25 +1727,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 
     fn enter_scheduled_fresh_thread(&mut self) -> ! {
-        self.synchronize_scheduler_current();
-        let context = self
-            .shared
-            .execution
-            .load_context(self.context_id)
-            .unwrap_or_else(|error| panic!("could not load fresh Thread context: {error:?}"));
-        let stack = self
-            .shared
-            .execution
-            .stack_bounds(self.stack_id)
-            .unwrap_or_else(|error| panic!("could not load fresh Thread stack: {error:?}"));
-        let state = {
-            let mut mappings = self.active.current_process_address_space(
-                self.active_root.as_ref().expect("active root"),
-                self.process,
-            );
-            crate::arch::x86_64::syscall::ValidatedUserReturn::initial(context, &mut mappings)
-                .unwrap_or_else(|error| panic!("invalid fresh Thread return: {error:?}"))
-        };
+        let (state, stack) = self.prepare_fresh_user_entry();
         unsafe { crate::arch::x86_64::syscall::enter_bound_validated_user(&state, stack) }
     }
 
@@ -1664,54 +1735,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         &'owner mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     ) -> crate::syscall::native::NativeSuspendPlan<'owner> {
-        #[cfg(feature = "test-support")]
-        let owner = self.services.operation_owner(self.thread);
-        let plan = unsafe {
-            self.services.prepare_suspend(
-                &self.tasks,
-                &self.shared.execution,
-                crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
-            )
-        }
-        .unwrap_or_else(|error| panic!("primordial suspend preparation drifted: {error:?}"));
-        #[cfg(feature = "test-support")]
-        self.g5_probe.observe_prepare(
-            owner,
-            matches!(
-                &plan,
-                crate::syscall::native::NativeSuspendPlan::IdleCurrent
-            ),
-        );
-        plan
+        unsafe { self.prepare_suspend_stationary() }
     }
 
     unsafe fn poll_idle_suspend<'owner>(
         &'owner mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     ) -> crate::syscall::native::NativeIdleSuspendPoll<'owner> {
-        #[cfg(feature = "test-support")]
-        let owner = self.services.operation_owner(self.thread);
-        let poll = unsafe {
-            self.services.poll_idle_suspend(
-                &self.tasks,
-                &self.shared.execution,
-                crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
-            )
-        }
-        .unwrap_or_else(|error| panic!("primordial idle-suspend poll drifted: {error:?}"));
-        #[cfg(feature = "test-support")]
-        self.g5_probe.observe_poll(
-            owner,
-            matches!(
-                &poll,
-                crate::syscall::native::NativeIdleSuspendPoll::ResumeCurrent
-            ),
-            matches!(
-                &poll,
-                crate::syscall::native::NativeIdleSuspendPoll::Switch(_)
-            ),
-        );
-        poll
+        unsafe { self.poll_idle_suspend_stationary() }
     }
 
     fn resume_suspended(&mut self, frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame) {
@@ -1740,6 +1771,159 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         #[cfg(feature = "test-support")]
         self.g5_probe.observe_resume(owner, status);
         frame.set_status(status);
+    }
+}
+
+impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandler
+    for RuntimeCarrierFacade<'_, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn handle(&mut self, request: NativeSyscallRequest) -> NativeSyscallResult {
+        let mut runtime = self.runtime.lock();
+        runtime.select_cpu(self.cpu);
+        runtime.handle(request)
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "CPU-local carrier callbacks serialize shared authorities and drop their coarse guard before every AP idle or userspace handoff"
+)]
+impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrameRuntime
+    for RuntimeCarrierFacade<'_, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn authorize_return(
+        &mut self,
+        frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+        current_binding_generation: u64,
+    ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
+        let mut runtime = self.runtime.lock();
+        runtime.select_cpu(self.cpu);
+        runtime.authorize_return(frame, current_binding_generation)
+    }
+
+    fn invalid_return(&mut self, error: crate::arch::x86_64::syscall::UserReturnError) {
+        let mut runtime = self.runtime.lock();
+        runtime.select_cpu(self.cpu);
+        runtime.invalid_return(error);
+    }
+
+    fn user_exception(&mut self, record: crate::arch::x86_64::exceptions::UserExceptionRecord) {
+        let mut runtime = self.runtime.lock();
+        runtime.select_cpu(self.cpu);
+        runtime.user_exception(record);
+    }
+
+    fn terminate_current(&mut self) -> ! {
+        let mut runtime = self.runtime.lock();
+        runtime.select_cpu(self.cpu);
+        runtime.terminate_current()
+    }
+
+    fn enter_scheduled_fresh_thread(&mut self) -> ! {
+        let (state, stack) = {
+            let mut runtime = self.runtime.lock();
+            runtime.select_cpu(self.cpu);
+            runtime.prepare_fresh_user_entry()
+        };
+        unsafe { crate::arch::x86_64::syscall::enter_bound_validated_user(&state, stack) }
+    }
+
+    fn enter_idle_scheduler(&mut self) -> ! {
+        loop {
+            enum Entry {
+                Fresh {
+                    state: crate::arch::x86_64::syscall::ValidatedUserReturn,
+                    stack: crate::memory::kernel_stack::KernelStackBounds,
+                },
+                Continuation {
+                    stack: crate::memory::kernel_stack::KernelStackBounds,
+                    rsp: u64,
+                },
+            }
+
+            let entry = {
+                let mut runtime = self.runtime.lock();
+                let decision = runtime
+                    .shared
+                    .execution
+                    .schedule_next_on(self.cpu)
+                    .unwrap_or_else(|error| panic!("AP scheduling failed: {error:?}"));
+                decision.current.map(|thread| {
+                    runtime.select_cpu(self.cpu);
+                    let continuation = runtime
+                        .shared
+                        .execution
+                        .kernel_continuation_rsp(runtime.context_id)
+                        .unwrap_or_else(|error| {
+                            panic!("AP continuation lookup failed for {thread:?}: {error:?}")
+                        });
+                    if continuation == 0 {
+                        let (state, stack) = runtime.prepare_fresh_user_entry();
+                        Entry::Fresh { state, stack }
+                    } else {
+                        let stack = runtime
+                            .shared
+                            .execution
+                            .stack_bounds(runtime.stack_id)
+                            .unwrap_or_else(|error| panic!("AP stack lookup failed: {error:?}"));
+                        Entry::Continuation {
+                            stack,
+                            rsp: continuation,
+                        }
+                    }
+                })
+            };
+            match entry {
+                Some(Entry::Fresh { state, stack }) => unsafe {
+                    crate::arch::x86_64::syscall::enter_bound_validated_user(&state, stack)
+                },
+                Some(Entry::Continuation { stack, rsp }) => {
+                    unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(stack) }
+                        .unwrap_or_else(|error| {
+                            panic!("AP continuation stack binding failed: {error:?}")
+                        });
+                    crate::arch::x86_64::syscall::validate_live_syscall_boundary().unwrap_or_else(
+                        |error| panic!("AP continuation syscall boundary failed: {error:?}"),
+                    );
+                    unsafe { crate::arch::x86_64::context::abandon_to_kernel_continuation(rsp) }
+                }
+                None => {
+                    let idle = crate::arch::x86_64::idle::prepare_current_idle()
+                        .unwrap_or_else(|error| panic!("AP idle publication failed: {error:?}"));
+                    let halt = crate::arch::x86_64::idle::commit_current_idle(idle)
+                        .unwrap_or_else(|error| panic!("AP idle commit failed: {error:?}"));
+                    unsafe {
+                        core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
+                    }
+                    crate::arch::x86_64::idle::finish_current_idle(halt)
+                        .unwrap_or_else(|error| panic!("AP idle completion failed: {error:?}"));
+                }
+            }
+        }
+    }
+
+    unsafe fn prepare_suspend<'owner>(
+        &'owner mut self,
+        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> crate::syscall::native::NativeSuspendPlan<'owner> {
+        let mut runtime = self.runtime.lock();
+        runtime.select_cpu(self.cpu);
+        unsafe { runtime.prepare_suspend_stationary() }
+    }
+
+    unsafe fn poll_idle_suspend<'owner>(
+        &'owner mut self,
+        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> crate::syscall::native::NativeIdleSuspendPoll<'owner> {
+        let mut runtime = self.runtime.lock();
+        runtime.select_cpu(self.cpu);
+        unsafe { runtime.poll_idle_suspend_stationary() }
+    }
+
+    fn resume_suspended(&mut self, frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame) {
+        let mut runtime = self.runtime.lock();
+        runtime.select_cpu(self.cpu);
+        runtime.resume_suspended(frame);
     }
 }
 
@@ -1804,7 +1988,6 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     let mut spaces = unsafe { Spaces::new() };
     let mut regions = Regions::new();
     let shared = publish_runtime_shared();
-    bind_runtime_carrier_facades(shared);
     let (_root_group, root_owner) = tasks
         .create_root_group(&mut registry)
         .unwrap_or_else(|error| panic!("could not create primordial root TaskGroup: {error:?}"));
@@ -1920,10 +2103,24 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         crate::arch::x86_64::syscall::ValidatedUserReturn::initial(context, &mut mappings)
             .unwrap_or_else(|error| panic!("invalid primordial initial return: {error:?}"))
     };
-    let mut runtime = core::pin::pin!(runtime);
+    let runtime = RuntimeAuthorityLock::new(runtime);
+    let runtime = core::pin::pin!(runtime);
+    let runtime_ref = runtime.as_ref().get_ref();
+    let facades = core::array::from_fn(|cpu_index| RuntimeCarrierFacade {
+        cpu: crate::cpu::CpuIndex::new(cpu_index)
+            .unwrap_or_else(|| panic!("native carrier CPU {cpu_index} is out of range")),
+        runtime: runtime_ref,
+    });
+    let mut facades = core::pin::pin!(facades);
+    bind_runtime_carrier_facades(facades.as_mut());
+    let bsp_carrier = unsafe {
+        let facade = &mut core::pin::Pin::get_unchecked_mut(facades.as_mut())[0];
+        core::pin::Pin::new_unchecked(facade)
+    };
+    release_runtime_carrier_facades();
     unsafe {
         crate::arch::x86_64::syscall::enter_native_syscall_runtime(
-            runtime.as_mut(),
+            bsp_carrier,
             &state,
             stack,
             &exception_binding,

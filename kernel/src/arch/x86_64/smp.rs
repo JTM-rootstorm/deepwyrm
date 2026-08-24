@@ -600,8 +600,7 @@ pub(crate) fn build_trampoline_image(
     write_u32(
         destination,
         layout.physical_base_patch,
-        u32::try_from(plan.physical_start)
-            .map_err(|_| TrampolineImageError::PhysicalOverflow)?,
+        u32::try_from(plan.physical_start).map_err(|_| TrampolineImageError::PhysicalOverflow)?,
     );
     write_u32(destination, layout.gdt_base_patch, gdt);
     write_u32(destination, layout.protected_pointer_patch, protected);

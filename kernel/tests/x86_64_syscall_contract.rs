@@ -365,9 +365,13 @@ fn h2_syscall_entry_and_native_runtime_carriers_are_fixed_per_cpu() {
     }
     assert!(primordial.contains("struct PrimordialRuntimeCarrier"));
     assert!(primordial.contains("struct RuntimeCarrierFacade"));
-    assert!(primordial.contains("bind_runtime_carrier_facades(shared)"));
-    assert!(primordial.contains("Parked -> Executing gate"));
-    assert!(primordial.contains("self.reject_entry(\"fresh userspace entry\")"));
+    assert!(primordial.contains("struct RuntimeAuthorityLock"));
+    assert!(primordial.contains("bind_runtime_carrier_facades(facades.as_mut())"));
+    assert!(primordial.contains("release_runtime_carrier_facades()"));
+    assert!(primordial.contains("runtime.select_cpu(self.cpu)"));
+    assert!(primordial.contains("runtime.prepare_fresh_user_entry()"));
+    assert!(primordial.contains("enter_bound_validated_user(&state, stack)"));
+    assert!(!primordial.contains("reject_entry"));
 }
 
 #[test]
@@ -383,6 +387,8 @@ fn i1_runtime_join_keeps_cpu_identity_and_dispatch_release_separate() {
     assert!(primordial.contains("current_thread_on(self.cpu)"));
     assert!(primordial.contains("prepare_process_root_selection(self.cpu"));
     assert!(primordial.contains("terminal_reaper_next_on(self.cpu)"));
+    assert!(primordial.contains("schedule_next_on(self.cpu)"));
+    assert!(primordial.contains("begin_execution(cpu_index)"));
     assert!(execution.contains("pub(crate) fn terminal_reaper_next_on"));
     assert!(!primordial.contains("bind_parked_runtime_carriers"));
 }
