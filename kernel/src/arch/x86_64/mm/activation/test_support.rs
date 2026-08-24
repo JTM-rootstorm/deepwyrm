@@ -1386,11 +1386,15 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         mut self,
         test: crate::test_support::BuildGuestTest,
     ) -> ! {
+        let mut scratch = self
+            .target
+            .current_scratch_target()
+            .unwrap_or_else(|_| crate::test_support::complete_fail(0x00fc));
         let authority = &mut ActiveRootTestAuthority {
             root: &self.root,
             identity: self.identity,
             roles: &mut *self.target.roles,
-            scratch: &mut self.target.scratch,
+            scratch: &mut scratch,
             _not_send_sync: core::marker::PhantomData,
         };
         if let Err(detail) = authority.validate_live_kernel_guard_layout() {

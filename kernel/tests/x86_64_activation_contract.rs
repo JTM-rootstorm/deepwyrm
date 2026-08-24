@@ -36,23 +36,46 @@ fn i1_per_cpu_scratch_uses_disjoint_atomic_cells_not_page_wide_mut_aliases() {
         .expect("read live activation source");
     let build = fs::read_to_string(manifest_dir.join("src/arch/x86_64/mm/activation/build.rs"))
         .expect("read scratch construction source");
+    let kernel =
+        fs::read_to_string(manifest_dir.join("src/lib.rs")).expect("read kernel bring-up source");
     assert!(activation.contains("struct PerCpuScratchBindings"));
     assert!(activation.contains("struct ScratchBinding"));
     assert!(activation.contains("AtomicU64"));
     assert!(activation.contains("require_owning_cpu"));
     assert!(activation.contains("LiveActiveTargetError::WrongCpu"));
     assert!(activation.contains("self.io.invalidate(self.scratch.window_page)"));
-    assert!(activation.contains("for_cpu(crate::cpu::CpuIndex::BOOTSTRAP)"));
-    assert!(activation.contains("pub(crate) struct LiveActiveScratchIo {"));
-    assert!(activation.contains("cpu: crate::cpu::CpuIndex::BOOTSTRAP"));
+    assert!(activation.contains("fn target_for_current_cpu<I: ActiveScratchIo>"));
+    assert!(activation.contains("pub(crate) struct LiveActiveScratchIo;"));
+    assert!(activation.contains("struct BootstrapActiveScratchIo;"));
+    assert!(activation.contains("fn current_scratch_target("));
     let live_io = activation
         .split_once("impl ActiveScratchIo for LiveActiveScratchIo")
         .expect("live scratch IO implementation")
         .1
-        .split_once("impl<I: ActiveScratchIo> journal_target_seal")
+        .split_once("impl ActiveScratchIo for BootstrapActiveScratchIo")
         .expect("live scratch IO extent")
         .0;
-    assert!(!live_io.contains("current_cpu_index_for_diagnostics"));
+    assert!(live_io.contains("current_cpu_index_for_diagnostics"));
+    assert!(!live_io.contains("Some(crate::cpu::CpuIndex::BOOTSTRAP)"));
+    let active_target = activation
+        .split_once("pub(crate) struct LiveActivePagingTarget")
+        .expect("live active paging target")
+        .1
+        .split_once("pub(crate) struct ActiveScratchTarget")
+        .expect("live active paging target extent")
+        .0;
+    assert!(active_target.contains("scratch_bindings: PerCpuScratchBindings"));
+    assert!(!active_target.contains("scratch: ActiveScratchTarget"));
+    let install_identity = kernel
+        .find("install_syscall_boundary()")
+        .expect("runtime CPU identity installation");
+    let retire_bootstrap = kernel
+        .find("retire_bootstrap_scratch_binding()")
+        .expect("fixed BSP scratch retirement");
+    let ap_release = kernel
+        .find("for entry in cpu_topology.entries().skip(1)")
+        .expect("AP startup loop");
+    assert!(install_identity < retire_bootstrap && retire_bootstrap < ap_release);
     let validation = activation
         .split_once("fn validate_location")
         .expect("scratch location validator")

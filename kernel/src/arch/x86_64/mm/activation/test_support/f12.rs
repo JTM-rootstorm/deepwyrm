@@ -539,11 +539,15 @@ fn build_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize
     }
 
     let mut memory = F12Memory::new();
+    let mut scratch = active
+        .target
+        .current_scratch_target()
+        .unwrap_or_else(|_| fail(0x3c));
     let mut setup = ActiveRootTestAuthority {
         root: &active.root,
         identity: active.identity,
         roles: &mut *active.target.roles,
-        scratch: &mut active.target.scratch,
+        scratch: &mut scratch,
         _not_send_sync: core::marker::PhantomData,
     };
     if let Err(detail) = setup.validate_live_kernel_guard_layout() {
@@ -1302,11 +1306,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .blocked_operations()
             .validate_drained_after_quiesce(&self.tasks, proof, drained)
             .unwrap_or_else(|_| fail(0xc3));
+        let mut scratch = self
+            .active
+            .target
+            .current_scratch_target()
+            .unwrap_or_else(|_| fail(0xc4));
         let mut setup = ActiveRootTestAuthority {
             root: &self.active.root,
             identity: self.active.identity,
             roles: &mut *self.active.target.roles,
-            scratch: &mut self.active.target.scratch,
+            scratch: &mut scratch,
             _not_send_sync: core::marker::PhantomData,
         };
         let mut candidates = [None, None, None];

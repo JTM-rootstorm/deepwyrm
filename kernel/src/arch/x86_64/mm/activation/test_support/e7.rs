@@ -293,11 +293,15 @@ fn build_smoke_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY:
         .unwrap_or_else(|_| fail(0x48));
     let mut memory = E7Memory::new();
 
+    let mut scratch = active
+        .target
+        .current_scratch_target()
+        .unwrap_or_else(|_| fail(0x49));
     let mut setup = ActiveRootTestAuthority {
         root: &active.root,
         identity: active.identity,
         roles: &mut *active.target.roles,
-        scratch: &mut active.target.scratch,
+        scratch: &mut scratch,
         _not_send_sync: core::marker::PhantomData,
     };
     if let Err(detail) = setup.validate_live_kernel_guard_layout() {

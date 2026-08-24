@@ -102,7 +102,11 @@ fn c3_test_authority_is_target_only_linear_and_nonescaping() {
     assert!(activation.contains("let user_half = page.is_user_half();"));
     assert!(activation.contains("if effective_user != user_half"));
     assert!(activation.contains("pub(crate) fn run_memory_foundation_test(\n        mut self,"));
-    assert!(activation.contains(") -> ! {\n        let authority = &mut ActiveRootTestAuthority"));
+    assert!(activation.contains(
+        ") -> ! {\n        let mut scratch = self\n            .target\n            .current_scratch_target()"
+    ));
+    assert!(activation.contains("scratch: &mut scratch,"));
+    assert!(activation.contains("let authority = &mut ActiveRootTestAuthority"));
     assert!(activation.contains("fn run_mapped_case(&mut self, test:"));
     assert!(activation.contains(
         "use crate::memory::address_region::{\n            AddressSpaceAuthority, AddressSpaceTransactionFailure,"

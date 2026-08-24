@@ -138,7 +138,7 @@ pub(super) struct PerCpuScratchBindings {
 /// One CPU-private scratch leaf/control pair.  It is deliberately distinct
 /// from stationary `PerCpuScratchBindings`: carrying a slot requires naming
 /// the CPU that owns its mutable PTEs.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ScratchBinding {
     cpu: crate::cpu::CpuIndex,
     window_page: u64,
@@ -179,6 +179,26 @@ impl PerCpuScratchBindings {
             *slot = self.for_cpu(crate::cpu::CpuIndex::new(index)?)?;
         }
         Some(slots)
+    }
+
+    /// Selects one immutable binding from the executing CPU identity observed
+    /// by `io`. The returned target retains that exact binding and every leaf
+    /// access re-attests the identity, so a later migration rejects instead of
+    /// retargeting shared mutable state.
+    fn target_for_current_cpu<I: ActiveScratchIo>(
+        self,
+        io: I,
+    ) -> Result<ActiveScratchTarget<I>, LiveActiveTargetError> {
+        let cpu = io.current_cpu().ok_or(LiveActiveTargetError::WrongCpu)?;
+        let scratch = self
+            .for_cpu(cpu)
+            .ok_or(LiveActiveTargetError::InvalidIndex)?;
+        Ok(ActiveScratchTarget {
+            scratch,
+            io,
+            poisoned: false,
+            _not_send_sync: core::marker::PhantomData,
+        })
     }
 }
 
@@ -520,7 +540,7 @@ pub(crate) struct LiveActivePagingTarget<
     ap_trampoline: ArchitectureBootstrapGrant,
     ap_trampoline_mapped: bool,
     scratch_bindings: PerCpuScratchBindings,
-    scratch: ActiveScratchTarget<LiveActiveScratchIo>,
+    bootstrap_scratch_available: bool,
     _not_send_sync: core::marker::PhantomData<*mut ()>,
 }
 
@@ -548,12 +568,14 @@ pub(crate) trait ActiveScratchIo {
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub(crate) struct LiveActiveScratchIo {
-    /// Established by the consuming Deep-root activation before the first
-    /// ACPI/MMIO scratch access.  SYSCALL GS state is intentionally not an
-    /// input: it is installed later in BSP bring-up.
-    cpu: crate::cpu::CpuIndex,
-}
+pub(crate) struct LiveActiveScratchIo;
+
+/// Early one-shot BSP scratch access before the runtime CPU slot and SYSCALL
+/// GS identity exist. This type never escapes the bootstrap-only helpers; the
+/// live SMP carrier uses `LiveActiveScratchIo` and re-attests hardware-current
+/// CPU identity at every leaf operation.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+struct BootstrapActiveScratchIo;
 
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 struct LiveRootSwitchTarget;
@@ -612,7 +634,54 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> target_seal::Seale
 )]
 impl ActiveScratchIo for LiveActiveScratchIo {
     fn current_cpu(&self) -> Option<crate::cpu::CpuIndex> {
-        Some(self.cpu)
+        crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
+            .and_then(crate::cpu::CpuIndex::new)
+    }
+
+    fn load(&mut self, address: u64) -> u64 {
+        unsafe {
+            (&*(address as *const core::sync::atomic::AtomicU64))
+                .load(core::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    fn store(&mut self, address: u64, value: u64) {
+        unsafe {
+            (&*(address as *const core::sync::atomic::AtomicU64))
+                .store(value, core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn compare_exchange(&mut self, address: u64, current: u64, new: u64) -> Result<(), u64> {
+        unsafe { &*(address as *const core::sync::atomic::AtomicU64) }
+            .compare_exchange(
+                current,
+                new,
+                core::sync::atomic::Ordering::SeqCst,
+                core::sync::atomic::Ordering::SeqCst,
+            )
+            .map(|_| ())
+    }
+
+    fn invalidate(&mut self, virtual_address: u64) {
+        unsafe {
+            core::arch::asm!(
+                "invlpg [{}]",
+                in(reg) virtual_address,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "the one-shot BSP bootstrap uses the same authenticated atomic scratch cells before runtime CPU identity exists"
+)]
+impl ActiveScratchIo for BootstrapActiveScratchIo {
+    fn current_cpu(&self) -> Option<crate::cpu::CpuIndex> {
+        Some(crate::cpu::CpuIndex::BOOTSTRAP)
     }
 
     fn load(&mut self, address: u64) -> u64 {
@@ -1398,41 +1467,77 @@ unsafe impl<'a, 'handoff, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
             ap_trampoline,
             ap_trampoline_mapped: true,
             scratch_bindings: self.scratch,
-            scratch: ActiveScratchTarget {
-                scratch: self
-                    .scratch
-                    .for_cpu(crate::cpu::CpuIndex::BOOTSTRAP)
-                    .expect("C2 BSP scratch slot layout drifted"),
-                io: LiveActiveScratchIo {
-                    cpu: crate::cpu::CpuIndex::BOOTSTRAP,
-                },
-                poisoned: false,
-                _not_send_sync: core::marker::PhantomData,
-            },
+            bootstrap_scratch_available: true,
             _not_send_sync: core::marker::PhantomData,
         }
     }
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    LiveActivePagingTarget<'_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn bootstrap_scratch_target(
+        &self,
+    ) -> Result<ActiveScratchTarget<BootstrapActiveScratchIo>, LiveActiveTargetError> {
+        if !self.bootstrap_scratch_available {
+            return Err(LiveActiveTargetError::WrongCpu);
+        }
+        self.scratch_bindings
+            .target_for_current_cpu(BootstrapActiveScratchIo)
+    }
+
+    fn current_scratch_target(
+        &self,
+    ) -> Result<ActiveScratchTarget<LiveActiveScratchIo>, LiveActiveTargetError> {
+        self.scratch_bindings
+            .target_for_current_cpu(LiveActiveScratchIo)
+    }
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn read_physical_bytes_with_scratch<I: ActiveScratchIo>(
+    root: &PageTableRoot,
+    scratch: &mut ActiveScratchTarget<I>,
+    physical_start: u64,
+    destination: &mut [u8],
+) -> Result<(), LiveActiveTargetError> {
+    let mut physical = physical_start;
+    let mut copied = 0_usize;
+    while copied < destination.len() {
+        let page = physical & !(PAGE_SIZE - 1);
+        let offset = usize::try_from(physical & (PAGE_SIZE - 1))
+            .map_err(|_| LiveActiveTargetError::InvalidIndex)?;
+        let take = (PAGE_SIZE as usize - offset).min(destination.len() - copied);
+        let frame = FrameAddress::new(page, root.physical_limit())
+            .map_err(|_| LiveActiveTargetError::InvalidIndex)?;
+        scratch.read_physical_bytes(frame, offset, &mut destination[copied..copied + take])?;
+        physical = physical
+            .checked_add(take as u64)
+            .ok_or(LiveActiveTargetError::InvalidIndex)?;
+        copied += take;
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ActiveDeepPaging<LiveActivePagingTarget<'root, RANGE_CAPACITY, ROLE_CAPACITY>>
 {
-    /// Returns the immutable, CPU-branded slot descriptor. Construction of a
-    /// live scratch target remains carrier-private; callers cannot retarget a
-    /// different CPU's PTE through this descriptor.
-    #[allow(
-        dead_code,
-        reason = "AP carrier construction remains parked until the stationary runtime join is complete"
-    )]
-    fn scratch_binding_for_cpu(
-        &self,
-        cpu: crate::cpu::CpuIndex,
-    ) -> Result<ScratchBinding, LiveActiveTargetError> {
-        self.target
-            .scratch_bindings
-            .for_cpu(cpu)
-            .ok_or(LiveActiveTargetError::InvalidIndex)
+    /// Permanently closes the fixed-BSP scratch bootstrap boundary once slot
+    /// zero's runtime identity is installed. AP release and all later carrier
+    /// work may then construct scratch targets only from hardware-current CPU
+    /// identity.
+    pub(crate) fn retire_bootstrap_scratch_binding(&mut self) -> Result<(), LiveActiveTargetError> {
+        let current = crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
+            .and_then(crate::cpu::CpuIndex::new);
+        if current != Some(crate::cpu::CpuIndex::BOOTSTRAP)
+            || !self.target.bootstrap_scratch_available
+        {
+            return Err(LiveActiveTargetError::WrongCpu);
+        }
+        self.target.bootstrap_scratch_available = false;
+        Ok(())
     }
 
     pub(crate) fn install_ap_trampoline_image(
@@ -1451,7 +1556,9 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.root.physical_limit(),
         )
         .map_err(|_| LiveActiveTargetError::InvalidIndex)?;
-        self.target.scratch.write_physical_bytes(frame, 0, image)
+        self.target
+            .current_scratch_target()?
+            .write_physical_bytes(frame, 0, image)
     }
 
     pub(crate) fn ap_trampoline_physical_start(&self) -> u64 {
@@ -1483,7 +1590,8 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             Ok(page) => page,
             Err(_) => return Err(LiveActiveTargetError::InvalidIndex),
         };
-        let mut journal = PageTableJournal::<_, 4, 1>::new(&mut self.target.scratch);
+        let mut scratch = self.target.current_scratch_target()?;
+        let mut journal = PageTableJournal::<_, 4, 1>::new(&mut scratch);
         let result = self.root.retire_architecture_bootstrap_identity_page(
             &mut journal,
             page,
@@ -1503,33 +1611,28 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         physical_start: u64,
         destination: &mut [u8],
     ) -> Result<(), LiveActiveTargetError> {
-        let mut physical = physical_start;
-        let mut copied = 0_usize;
-        while copied < destination.len() {
-            let page = physical & !(PAGE_SIZE - 1);
-            let offset = usize::try_from(physical & (PAGE_SIZE - 1))
-                .map_err(|_| LiveActiveTargetError::InvalidIndex)?;
-            let take = (PAGE_SIZE as usize - offset).min(destination.len() - copied);
-            let frame = FrameAddress::new(page, self.root.physical_limit())
-                .map_err(|_| LiveActiveTargetError::InvalidIndex)?;
-            self.target.scratch.read_physical_bytes(
-                frame,
-                offset,
-                &mut destination[copied..copied + take],
-            )?;
-            physical = physical
-                .checked_add(take as u64)
-                .ok_or(LiveActiveTargetError::InvalidIndex)?;
-            copied += take;
-        }
-        Ok(())
+        let mut scratch = self.target.current_scratch_target()?;
+        read_physical_bytes_with_scratch(&self.root, &mut scratch, physical_start, destination)
+    }
+
+    /// Early one-shot BSP physical access used before runtime CPU identity is
+    /// installed. No AP can execute while this helper is reachable.
+    pub(crate) fn read_bootstrap_physical_bytes(
+        &mut self,
+        physical_start: u64,
+        destination: &mut [u8],
+    ) -> Result<(), LiveActiveTargetError> {
+        let mut scratch = self.target.bootstrap_scratch_target()?;
+        read_physical_bytes_with_scratch(&self.root, &mut scratch, physical_start, destination)
     }
 
     pub(crate) fn install_kernel_mmio_page(
         &mut self,
         frame: FrameAddress,
     ) -> Result<u64, LiveActiveTargetError> {
-        self.target.scratch.install_mmio_frame(frame)
+        self.target
+            .bootstrap_scratch_target()?
+            .install_mmio_frame(frame)
     }
 
     #[allow(
@@ -1558,6 +1661,10 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .unwrap_or_else(|error| {
                 panic!("process usercopy root is not current on this CPU: {error:?}")
             });
+        let scratch = self
+            .target
+            .current_scratch_target()
+            .unwrap_or_else(|error| panic!("usercopy scratch CPU selection failed: {error:?}"));
         let target = &mut self.target;
         LiveProcessAddressSpace {
             root: root as *const PageTableRoot,
@@ -1568,7 +1675,7 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             root_bindings: &mut self.root_bindings,
             roles: target.roles,
             target: user_access::TrackedActiveTarget {
-                scratch: &mut target.scratch,
+                scratch,
                 pins: &self.user_pins,
                 address_space,
             },
@@ -1619,8 +1726,12 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         address_space: crate::memory::address_region::AddressSpaceKey,
     ) -> Result<(), RootBindingError> {
         if self.root_bindings.kernel_half().is_err() {
+            let mut scratch = self
+                .target
+                .current_scratch_target()
+                .map_err(|_| RootBindingError::CpuMismatch)?;
             let kernel_half = KernelHalfBinding::capture(
-                &mut self.target.scratch,
+                &mut scratch,
                 &*self.target.roles,
                 &self.root,
                 self.identity,
@@ -1647,12 +1758,16 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         for index in 0..crate::cpu::CPU_CAPACITY {
             let cpu = crate::cpu::CpuIndex::new(index)
                 .unwrap_or_else(|| panic!("fixed CPU capacity contains invalid index"));
+            let mut scratch = self
+                .target
+                .current_scratch_target()
+                .map_err(|_| RootBindingError::CpuMismatch)?;
             reserve_kernel_execution_root_parts(
                 &self.root,
                 &self.root_bindings,
                 &mut self.kernel_execution_roots,
                 self.target.roles,
-                &mut self.target.scratch,
+                &mut scratch,
                 cpu,
             )?;
         }
@@ -1694,11 +1809,15 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         process: crate::task::ProcessKey,
         address_space: crate::memory::address_region::AddressSpaceKey,
     ) -> Result<(), RootBindingError> {
+        let mut scratch = self
+            .target
+            .current_scratch_target()
+            .map_err(|_| RootBindingError::CpuMismatch)?;
         reserve_child_address_space_parts(
             &self.root,
             &mut self.root_bindings,
             self.target.roles,
-            &mut self.target.scratch,
+            &mut scratch,
             process,
             address_space,
         )
@@ -1763,9 +1882,13 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .user_pins
             .reserve_teardown(address_space)
             .map_err(|_| RootBindingError::MutationInFlight)?;
+        let mut scratch = self
+            .target
+            .current_scratch_target()
+            .map_err(|_| RootBindingError::CpuMismatch)?;
         self.root_bindings.teardown_empty_owned(
             self.target.roles,
-            &mut self.target.scratch,
+            &mut scratch,
             process,
             address_space,
             &self.user_pins,

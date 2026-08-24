@@ -680,22 +680,18 @@ fn per_cpu_scratch_slots_have_disjoint_leaf_control_and_mmio_entries() {
 #[test]
 fn scratch_binding_rejects_cross_cpu_before_touching_its_leaf() {
     let fixture = graph_fixture();
-    let slot = PerCpuScratchBindings::new(DeepScratchBinding {
+    let bindings = PerCpuScratchBindings::new(DeepScratchBinding {
         window_page: FIXTURE_SCRATCH,
         control_page: FIXTURE_SCRATCH + PAGE_SIZE,
         pt: fixture.scratch_pt,
-    })
-    .for_cpu(CpuIndex::BOOTSTRAP)
-    .unwrap();
-    let mut target = ActiveScratchTarget {
-        scratch: slot,
-        io: FakeActiveScratchIo {
-            current_cpu: CpuIndex::new(1).unwrap(),
-            ..FakeActiveScratchIo::default()
-        },
-        poisoned: false,
-        _not_send_sync: core::marker::PhantomData,
-    };
+    });
+    let mut target = bindings
+        .target_for_current_cpu(FakeActiveScratchIo::default())
+        .unwrap();
+    assert_eq!(target.scratch.cpu, CpuIndex::BOOTSTRAP);
+    // Model a carrier migration after its immutable binding was selected.
+    // Attestation must reject rather than silently retargeting CPU1's leaf.
+    target.io.current_cpu = CpuIndex::new(1).unwrap();
     let frame = FrameAddress::new(0x90_000, fixture.capabilities.physical_limit()).unwrap();
     assert_eq!(
         target.install_mmio_frame(frame),
@@ -739,28 +735,27 @@ fn cpu_scratch_migration_selects_a_new_window_and_clears_independently() {
     let second_cpu = CpuIndex::new(1).unwrap();
     let second = bindings.for_cpu(second_cpu).unwrap();
     let table = FrameAddress::new(0x90_000, fixture.capabilities.physical_limit()).unwrap();
-    let mut cpu0 = ActiveScratchTarget {
-        scratch: first,
-        io: FakeActiveScratchIo::default(),
-        poisoned: false,
-        _not_send_sync: core::marker::PhantomData,
-    };
-    let mut cpu1 = ActiveScratchTarget {
-        scratch: second,
-        io: FakeActiveScratchIo {
-            current_cpu: second_cpu,
-            ..FakeActiveScratchIo::default()
-        },
-        poisoned: false,
-        _not_send_sync: core::marker::PhantomData,
-    };
+    let mut cpu0 = bindings
+        .target_for_current_cpu(FakeActiveScratchIo::default())
+        .unwrap();
 
     assert_eq!(cpu0.read_location(table, 7), Ok(0));
+    let cpu0_leaf = cpu0.scratch_leaf_address();
+    let cpu0_events = core::mem::take(&mut cpu0.io.events);
+    let shared_leaf_memory = core::mem::take(&mut cpu0.io.memory);
+    let mut cpu1 = bindings
+        .target_for_current_cpu(FakeActiveScratchIo {
+            memory: shared_leaf_memory,
+            current_cpu: second_cpu,
+            ..FakeActiveScratchIo::default()
+        })
+        .unwrap();
+    assert_eq!(cpu1.scratch, second);
     assert_eq!(cpu1.read_location(table, 7), Ok(0));
-    assert_ne!(cpu0.scratch_leaf_address(), cpu1.scratch_leaf_address());
-    assert_eq!(cpu0.io.memory.get(&cpu0.scratch_leaf_address()), Some(&0));
+    assert_ne!(cpu0_leaf, cpu1.scratch_leaf_address());
+    assert_eq!(cpu1.io.memory.get(&cpu0_leaf), Some(&0));
     assert_eq!(cpu1.io.memory.get(&cpu1.scratch_leaf_address()), Some(&0));
-    assert!(cpu0.io.events.iter().any(|event| {
+    assert!(cpu0_events.iter().any(|event| {
         matches!(event, ScratchIoEvent::Invalidate(page) if *page == first.window_page)
     }));
     assert!(cpu1.io.events.iter().any(|event| {

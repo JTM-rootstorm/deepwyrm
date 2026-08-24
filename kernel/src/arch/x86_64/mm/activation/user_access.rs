@@ -303,7 +303,7 @@ struct LiveUserWalk {
 /// underlying atomic batch begins. New user pins and mapping mutations thus
 /// exclude one another without holding the tracker spin lock across publication.
 pub(crate) struct TrackedActiveTarget<'a> {
-    pub(super) scratch: &'a mut ActiveScratchTarget<LiveActiveScratchIo>,
+    pub(super) scratch: ActiveScratchTarget<LiveActiveScratchIo>,
     pub(super) pins: &'a UserPinTracker<E5_USER_PIN_CAPACITY>,
     pub(super) address_space: crate::memory::address_region::AddressSpaceKey,
 }
@@ -629,7 +629,7 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.primordial_root,
             self.root_bindings,
             self.roles,
-            self.target.scratch,
+            &mut self.target.scratch,
             process,
             address_space,
         )

@@ -384,6 +384,11 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             .unwrap_or_else(|error| panic!("failed to migrate the H1 BSP descriptors: {error:?}"));
         unsafe { arch::x86_64::syscall::install_syscall_boundary() }
             .unwrap_or_else(|error| panic!("failed to install E4 SYSCALL boundary: {error:?}"));
+        active_paging
+            .retire_bootstrap_scratch_binding()
+            .unwrap_or_else(|error| {
+                panic!("failed to retire the fixed BSP scratch binding: {error:?}")
+            });
         cpu_registry
             .publish_online(0, bsp_local_apic_id, 1)
             .unwrap_or_else(|error| panic!("failed to publish the H1 BSP online: {error:?}"));

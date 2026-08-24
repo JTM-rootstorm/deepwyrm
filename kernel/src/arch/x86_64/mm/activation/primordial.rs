@@ -843,18 +843,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)?;
         let physical_start = allocation.physical_start();
         let byte_len = allocation.byte_len();
+        let mut scratch = self
+            .active
+            .target
+            .current_scratch_target()
+            .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)?;
         let mut offset = 0;
         while offset < byte_len {
             let frame =
                 FrameAddress::new(physical_start + offset, self.active.root.physical_limit())
                     .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)?;
-            if self
-                .active
-                .target
-                .scratch
-                .zero_allocator_frame(frame)
-                .is_err()
-            {
+            if scratch.zero_allocator_frame(frame).is_err() {
                 self.active
                     .target
                     .roles
@@ -895,13 +894,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.active.root.physical_limit(),
         )
         .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)?;
-        if self
+        let mut scratch = self
             .active
             .target
-            .scratch
-            .zero_allocator_frame(frame)
-            .is_err()
-        {
+            .current_scratch_target()
+            .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)?;
+        if scratch.zero_allocator_frame(frame).is_err() {
             self.active
                 .target
                 .roles
@@ -944,9 +942,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> crate::memory::object::MappingFinalReleases<REGISTRY> {
         let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
         let result = {
+            let scratch = self
+                .active
+                .target
+                .current_scratch_target()
+                .unwrap_or_else(|error| {
+                    panic!("primordial teardown scratch CPU failed: {error:?}")
+                });
             let target = &mut self.active.target;
             let mut tracked = user_access::TrackedActiveTarget {
-                scratch: &mut target.scratch,
+                scratch,
                 pins: &self.active.user_pins,
                 address_space: region.address_space_key(),
             };
@@ -1015,15 +1020,18 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
         }
         let mut physical = backing.physical_start() + offset;
         let mut copied = 0_usize;
+        let mut scratch = self
+            .active
+            .target
+            .current_scratch_target()
+            .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)?;
         while copied < bytes.len() {
             let page = physical & !(PAGE_SIZE - 1);
             let page_offset = (physical & (PAGE_SIZE - 1)) as usize;
             let take = (PAGE_SIZE as usize - page_offset).min(bytes.len() - copied);
             let frame = FrameAddress::new(page, self.active.root.physical_limit())
                 .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)?;
-            self.active
-                .target
-                .scratch
+            scratch
                 .write_physical_bytes(frame, page_offset, &bytes[copied..copied + take])
                 .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)?;
             physical += take as u64;
@@ -1062,9 +1070,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
             candidates[4] = Some(self.prepare_candidate(TableLevel::Pd)?);
             candidates[5] = Some(self.prepare_candidate(TableLevel::Pt)?);
 
+            let scratch = self
+                .active
+                .target
+                .current_scratch_target()
+                .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)?;
             let target = &mut self.active.target;
             let mut tracked = user_access::TrackedActiveTarget {
-                scratch: &mut target.scratch,
+                scratch,
                 pins: &self.active.user_pins,
                 address_space: region.address_space_key(),
             };

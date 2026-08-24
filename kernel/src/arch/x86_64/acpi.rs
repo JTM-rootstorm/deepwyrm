@@ -1064,7 +1064,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> AcpiByteReader
             return Err(());
         }
         self.paging
-            .read_physical_bytes(physical_start, destination)
+            .read_bootstrap_physical_bytes(physical_start, destination)
             .map_err(|_| ())
     }
 }
