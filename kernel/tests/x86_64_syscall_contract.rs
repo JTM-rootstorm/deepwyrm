@@ -283,6 +283,47 @@ fn i1_post_ack_carrier_never_reuses_a_retired_frame_for_late_holdsafe() {
 }
 
 #[test]
+fn i1_remote_termination_waits_guard_free_for_exact_ack_before_reclaim() {
+    let live = source("src/arch/x86_64/syscall/live.rs");
+    let trampoline = live
+        .split_once("unsafe fn native_runtime_trampoline")
+        .expect("native runtime trampoline")
+        .1;
+    let usercopy_drop = trampoline.find("drop(usercopy_window)").unwrap();
+    let completion = trampoline
+        .find("runtime.complete_remote_stop(frame, current_binding_generation())")
+        .unwrap();
+    assert!(usercopy_drop < completion);
+
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let initiator = primordial
+        .split_once("fn complete_remote_stop(")
+        .expect("remote-stop initiator")
+        .1
+        .split_once("fn authorize_return(")
+        .expect("remote-stop initiator extent")
+        .0;
+    let publish = initiator
+        .find("publish_live_remote_stop(identity, ())")
+        .unwrap();
+    let await_ack = initiator.find("await_live_remote_stop(deferred)").unwrap();
+    let reclaim = initiator
+        .find("runtime.complete_process_termination(")
+        .unwrap();
+    assert!(publish < await_ack && await_ack < reclaim);
+    assert!(initiator.contains("permits[cpu_index] = Some(permit)"));
+
+    let adapters = source("src/syscall/adapters.rs");
+    assert!(adapters.contains("prepare_process_terminate("));
+    assert!(adapters.contains("complete_prepared_process_termination_after_remote_stops"));
+    assert!(adapters.contains("retire_exit_pins_after_remote_stops("));
+
+    let execution = source("src/task/execution.rs");
+    assert!(execution.contains("acknowledged_remote_stop"));
+    assert!(execution.contains("remote-stop permit named a Thread still owned by the scheduler"));
+}
+
+#[test]
 fn i1_idle_suspend_stop_handoffs_after_idle_cleanup_instead_of_halting() {
     let live = source("src/arch/x86_64/syscall/live.rs");
     let idle_suspend = live

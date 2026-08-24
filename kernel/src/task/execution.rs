@@ -793,7 +793,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                 .any(|thread| self.scheduler.running_cpu(thread).is_some()),
             "immediate terminal retirement contained a physical current Thread"
         );
-        self.retire_exit_pins_inner(pins, None, SchedulerCpuId::BOOTSTRAP)
+        self.retire_exit_pins_inner(pins, None, SchedulerCpuId::BOOTSTRAP, &[])
             .0
     }
 
@@ -810,7 +810,37 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                 .any(|thread| self.scheduler.running_cpu(thread).is_some()),
             "immediate terminal retirement contained a physical current Thread"
         );
-        self.retire_exit_pins_inner(pins, None, cpu).0
+        self.retire_exit_pins_inner(pins, None, cpu, &[]).0
+    }
+
+    /// Retires a terminal batch after architecture rendezvous has already
+    /// removed and abandoned the exact named remote continuations.
+    ///
+    /// `remote_stopped` is not a general scheduler bypass. The caller must
+    /// derive it from consumed exact-safe acknowledgement permits, and every
+    /// named Thread must belong to this terminal pin batch.
+    pub(crate) fn retire_exit_pins_after_remote_stops<const THREADS: usize>(
+        &self,
+        pins: ExitPins<THREADS>,
+        remote_stopped: &[Option<ThreadKey>],
+    ) -> RetiredExitPins<THREADS> {
+        let terminal_threads = pins.thread_keys();
+        assert!(
+            !terminal_threads
+                .into_iter()
+                .flatten()
+                .any(|thread| self.scheduler.running_cpu(thread).is_some()),
+            "acknowledged terminal retirement still contained a physical current Thread"
+        );
+        assert!(
+            remote_stopped
+                .iter()
+                .flatten()
+                .all(|stopped| terminal_threads.contains(&Some(*stopped))),
+            "remote-stop permit named a Thread outside the terminal pin batch"
+        );
+        self.retire_exit_pins_inner(pins, None, SchedulerCpuId::BOOTSTRAP, remote_stopped)
+            .0
     }
 
     /// Retires one terminal batch while preserving the named current Thread's
@@ -852,7 +882,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                 .any(|thread| thread == current),
             "deferred terminal retirement batch did not contain the physical current Thread"
         );
-        let (pins, deferred) = self.retire_exit_pins_inner(pins, Some(current), cpu);
+        let (pins, deferred) = self.retire_exit_pins_inner(pins, Some(current), cpu, &[]);
         (
             pins,
             deferred.expect("terminal batch did not contain the running current Thread"),
@@ -864,6 +894,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         pins: ExitPins<THREADS>,
         defer_current: Option<ThreadKey>,
         cpu: SchedulerCpuId,
+        remote_stopped: &[Option<ThreadKey>],
     ) -> (
         RetiredExitPins<THREADS>,
         Option<DeferredCurrentExecutionResources>,
@@ -896,10 +927,14 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                     "terminal Thread still owns a blocked operation at execution-resource reclaim",
                 );
                 let scheduled = self.scheduler.state(thread).is_some();
-                assert_eq!(
-                    scheduled,
-                    resources.is_some(),
-                    "scheduler/resource ownership diverged at terminal retirement"
+                let acknowledged_remote_stop = remote_stopped.contains(&Some(thread));
+                assert!(
+                    resources.is_some() == (scheduled || acknowledged_remote_stop),
+                    "scheduler/resource/remote-stop ownership diverged at terminal retirement"
+                );
+                assert!(
+                    !(scheduled && acknowledged_remote_stop),
+                    "remote-stop permit named a Thread still owned by the scheduler"
                 );
                 if scheduled {
                     self.scheduler

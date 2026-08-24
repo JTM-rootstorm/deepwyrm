@@ -135,9 +135,12 @@ fn g5_primordial_selectors_have_exact_post_teardown_oracles() {
     }
 
     let terminate = primordial
-        .split_once("fn terminate_current(&mut self) -> !")
+        .split_once("fn prepare_terminal_handoff(&mut self) -> u64")
         .expect("primordial terminal handoff")
-        .1;
+        .1
+        .split_once("fn reserve_runtime_phase")
+        .expect("primordial terminal handoff extent")
+        .0;
     let completion = terminate
         .find("let completion = complete_primordial_launch(self);")
         .expect("structured completion after reaper reclaim");

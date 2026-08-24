@@ -37,6 +37,10 @@ pub(crate) use adapters::clock_get;
 #[cfg(all(deepwyrm_f12_guest, not(deepwyrm_integrated)))]
 pub(crate) use adapters::process_terminate;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unused_imports,
+    reason = "the integrated F12 target probe consumes the synchronous compatibility adapter only when test support is selected"
+)]
 pub(crate) use adapters::{
     MemoryObjectBackingAccess, ProcessRootReservation, ThreadStartMappingAccess,
     memory_object_create_owned, process_create_with_root, process_terminate, thread_create,
@@ -46,10 +50,11 @@ pub(crate) use adapters::{
 pub(crate) use adapters::{NoTerminalWaitCleanup, abi_get_info};
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use adapters::{
-    address_region_map_prepared_model, address_region_unmap_prepared,
-    complete_deferred_current_reclaim, complete_wait_wakes, decode_map_args, handle_close,
-    handle_duplicate, object_get_info_v1, prepare_address_region_mutation, process_exit,
-    process_handle_target, process_unhandled_exception,
+    PreparedProcessTermination, address_region_map_prepared_model, address_region_unmap_prepared,
+    complete_deferred_current_reclaim, complete_prepared_process_termination_after_remote_stops,
+    complete_wait_wakes, decode_map_args, handle_close, handle_duplicate, object_get_info_v1,
+    prepare_address_region_mutation, prepare_process_terminate, process_exit,
+    process_unhandled_exception,
 };
 #[cfg(all(
     not(deepwyrm_integrated),

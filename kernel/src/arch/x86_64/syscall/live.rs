@@ -1221,6 +1221,12 @@ unsafe fn native_runtime_trampoline<
         }
         crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {}
     }
+    let control = if control == crate::syscall::native::SyscallControl::CompleteRemoteStop {
+        let runtime = unsafe { &mut *context.cast::<R>() };
+        runtime.complete_remote_stop(frame, current_binding_generation())
+    } else {
+        control
+    };
     match control {
         crate::syscall::native::SyscallControl::ReturnToCaller => {}
         crate::syscall::native::SyscallControl::TerminateCurrent => {
@@ -1351,6 +1357,7 @@ unsafe fn native_runtime_trampoline<
                 invalid_bound_return::<R>(context, error);
             }
         }
+        crate::syscall::native::SyscallControl::CompleteRemoteStop => halt_forever(),
     }
 }
 

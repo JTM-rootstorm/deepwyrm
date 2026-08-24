@@ -442,6 +442,18 @@ impl<T> Drop for RuntimeAuthorityGuard<'_, T> {
 }
 
 /// CPU-local immutable identity over the stationary synchronized runtime.
+struct PendingRemoteProcessTermination {
+    phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
+    prepared: crate::syscall::PreparedProcessTermination<HANDLES, THREADS>,
+    identities: [Option<crate::arch::x86_64::rendezvous::StopIdentity>;
+        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+}
+
+enum ProcessTerminationPreparation {
+    Immediate(NativeSyscallResult),
+    Remote(PendingRemoteProcessTermination),
+}
+
 struct RuntimeCarrierFacade<
     'runtime,
     'roles,
@@ -452,6 +464,7 @@ struct RuntimeCarrierFacade<
     runtime: &'runtime RuntimeAuthorityLock<
         PrimordialRuntimeCarrier<'roles, RANGE_CAPACITY, ROLE_CAPACITY>,
     >,
+    pending_remote_termination: Option<PendingRemoteProcessTermination>,
 }
 
 enum PreparedCarrierEntry {
@@ -2335,6 +2348,32 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
     for RuntimeCarrierFacade<'_, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>
 {
     fn handle(&mut self, request: NativeSyscallRequest) -> NativeSyscallResult {
+        if let NativeSyscallRequest::ProcessTerminate {
+            process,
+            reason,
+            code,
+        } = request
+        {
+            assert!(
+                self.pending_remote_termination.is_none(),
+                "CPU-local carrier already owns a pending remote termination"
+            );
+            let preparation = {
+                let mut runtime = self.runtime.lock();
+                runtime.select_cpu(self.cpu);
+                runtime.prepare_remote_process_termination(process, reason, code)
+            };
+            return match preparation {
+                ProcessTerminationPreparation::Immediate(result) => result,
+                ProcessTerminationPreparation::Remote(pending) => {
+                    self.pending_remote_termination = Some(pending);
+                    NativeSyscallResult {
+                        status: DW_STATUS_SUCCESS,
+                        control: SyscallControl::CompleteRemoteStop,
+                    }
+                }
+            };
+        }
         let mut runtime = self.runtime.lock();
         runtime.select_cpu(self.cpu);
         runtime.handle(request)
@@ -2381,6 +2420,44 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrameRuntime
     for RuntimeCarrierFacade<'_, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>
 {
+    fn complete_remote_stop(
+        &mut self,
+        frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+        current_binding_generation: u64,
+    ) -> SyscallControl {
+        let pending = self
+            .pending_remote_termination
+            .take()
+            .unwrap_or_else(|| panic!("remote-stop control omitted its CPU-local termination"));
+        let mut permits = core::array::from_fn(|_| None);
+        for (cpu_index, identity) in pending.identities.into_iter().enumerate() {
+            let Some(identity) = identity else {
+                continue;
+            };
+            let deferred = crate::arch::x86_64::idle::publish_live_remote_stop(identity, ())
+                .unwrap_or_else(|failure| {
+                    let error = failure.error();
+                    let _resource = failure.into_resource();
+                    panic!("remote-stop publication failed: {error:?}")
+                });
+            let ((), permit) = crate::arch::x86_64::idle::await_live_remote_stop(deferred);
+            permits[cpu_index] = Some(permit);
+        }
+        let result = {
+            let mut runtime = self.runtime.lock();
+            runtime.select_cpu(self.cpu);
+            runtime.complete_process_termination(pending.phase, pending.prepared, permits)
+        };
+        frame.set_status(result.status);
+        if result.control == SyscallControl::ReturnToCaller
+            && let Err(error) = self.authorize_return(frame, current_binding_generation)
+        {
+            self.invalid_return(error);
+            return SyscallControl::TerminateCurrent;
+        }
+        result.control
+    }
+
     fn authorize_return(
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
@@ -2752,6 +2829,7 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         cpu: crate::cpu::CpuIndex::new(cpu_index)
             .unwrap_or_else(|| panic!("native carrier CPU {cpu_index} is out of range")),
         runtime: runtime_ref,
+        pending_remote_termination: None,
     });
     let mut facades = core::pin::pin!(facades);
     bind_runtime_carrier_facades(facades.as_mut());
@@ -3290,6 +3368,115 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> NativeSyscallResult {
         let phase = self.reserve_runtime_phase();
         self.assert_guard_free_external_work();
+        let prepared = match crate::syscall::prepare_process_terminate(
+            &mut self.registry,
+            &mut self.tasks,
+            &self.shared.execution,
+            self.process,
+            self.thread,
+            process,
+            reason,
+            code,
+            &mut self.cleanup,
+        ) {
+            Ok(prepared) => prepared,
+            Err(status) => {
+                let result = NativeSyscallResult::returning(status);
+                self.commit_runtime_phase(phase);
+                return result;
+            }
+        };
+        self.complete_process_termination(phase, prepared, core::array::from_fn(|_| None))
+    }
+
+    fn prepare_remote_process_termination(
+        &mut self,
+        process: deepwyrm_abi::DwHandle,
+        reason: deepwyrm_abi::DwTerminationReason,
+        code: u32,
+    ) -> ProcessTerminationPreparation {
+        let phase = self.reserve_runtime_phase();
+        self.assert_guard_free_external_work();
+        let prepared = match crate::syscall::prepare_process_terminate(
+            &mut self.registry,
+            &mut self.tasks,
+            &self.shared.execution,
+            self.process,
+            self.thread,
+            process,
+            reason,
+            code,
+            &mut self.cleanup,
+        ) {
+            Ok(prepared) => prepared,
+            Err(status) => {
+                self.commit_runtime_phase(phase);
+                return ProcessTerminationPreparation::Immediate(NativeSyscallResult::returning(
+                    status,
+                ));
+            }
+        };
+        let thread_keys = prepared.thread_keys();
+        let mut identities = core::array::from_fn(|_| None);
+        for cpu_index in 0..crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT {
+            let cpu = crate::cpu::CpuIndex::new(cpu_index)
+                .unwrap_or_else(|| panic!("I1 remote-stop CPU index is out of range"));
+            if cpu == self.cpu {
+                continue;
+            }
+            let claim = self
+                .shared
+                .execution
+                .running_claim_on(cpu)
+                .or_else(|| self.shared.execution.suspended_claim_on(cpu));
+            let Some(claim) = claim else {
+                continue;
+            };
+            if !thread_keys
+                .into_iter()
+                .flatten()
+                .any(|thread| thread == claim.thread())
+            {
+                continue;
+            }
+            let root = self.active_roots[cpu_index]
+                .as_ref()
+                .unwrap_or_else(|| panic!("remote terminal owner has no retained Process root"));
+            assert_eq!(
+                root.process(),
+                prepared.target(),
+                "remote terminal owner selected a different Process root"
+            );
+            let snapshot = crate::arch::x86_64::smp::live_cpu_registry()
+                .snapshot(cpu_index)
+                .unwrap_or_else(|_| panic!("remote terminal owner is not online"));
+            identities[cpu_index] = Some(
+                root.stop_identity(snapshot.online_generation, claim)
+                    .unwrap_or_else(|_| panic!("remote terminal identity is inconsistent")),
+            );
+        }
+        if identities.iter().all(Option::is_none) {
+            return ProcessTerminationPreparation::Immediate(self.complete_process_termination(
+                phase,
+                prepared,
+                core::array::from_fn(|_| None),
+            ));
+        }
+        ProcessTerminationPreparation::Remote(PendingRemoteProcessTermination {
+            phase,
+            prepared,
+            identities,
+        })
+    }
+
+    fn complete_process_termination(
+        &mut self,
+        phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
+        prepared: crate::syscall::PreparedProcessTermination<HANDLES, THREADS>,
+        permits: [Option<crate::arch::x86_64::rendezvous::RemoteStopReclaimPermit>;
+            crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+    ) -> NativeSyscallResult {
+        let target = prepared.target();
         let mut discarded = None;
         let mut atomic_pin = None;
         let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
@@ -3299,7 +3486,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 |output| assert!(discarded.replace(output).is_none()),
                 |pin| assert!(atomic_pin.replace(pin).is_none()),
             );
-            crate::syscall::process_terminate(
+            crate::syscall::complete_prepared_process_termination_after_remote_stops(
                 &mut self.registry,
                 &mut self.tasks,
                 &self.shared.execution,
@@ -3307,24 +3494,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 &mut terminal,
                 self.process,
                 self.thread,
-                process,
-                reason,
-                code,
+                prepared,
+                permits,
                 &mut self.cleanup,
             )
         };
         self.finish_terminal_adapter_resources(discarded, atomic_pin, control, deferred);
         if status == DW_STATUS_SUCCESS && control == SyscallControl::ReturnToCaller {
-            let target = crate::syscall::process_handle_target(
-                &mut self.registry,
-                &self.tasks,
-                self.process,
-                process,
-                &mut self.cleanup,
-            )
-            .unwrap_or_else(|error| {
-                panic!("terminated child Process handle lost identity: {error:?}")
-            });
             if target != self.process {
                 let root_object = self
                     .tasks

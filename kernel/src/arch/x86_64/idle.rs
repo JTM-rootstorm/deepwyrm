@@ -10,6 +10,11 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use crate::cpu::{CPU_CAPACITY, CpuIndex};
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+use super::rendezvous::{
+    DeferredFailure, DeferredReclaim, ReclaimError, RemoteStopReclaimPermit, StopIdentity,
+    StopPublishFailure,
+};
 use super::rendezvous::{
     MailboxNotification, RemoteStopError, RemoteStopSafePoint, RendezvousIpiLatches,
     RendezvousMailbox, StopRequest,
@@ -426,6 +431,87 @@ pub(crate) fn notify_runnable_work(affinity: Option<CpuIndex>) {
     {
         fail_transport_and_halt();
     }
+}
+
+/// Release-publishes an exact Stop to one remote CPU before sending e1.
+///
+/// Publication failure returns the caller's linear resource. A transport
+/// failure after publication is fail-stop because the target may still
+/// observe the request and the deferred ownership may no longer be released.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn publish_live_remote_stop<R>(
+    identity: StopIdentity,
+    resource: R,
+) -> Result<DeferredReclaim<R>, StopPublishFailure<R>> {
+    let target = CpuIndex::new(identity.target_cpu())
+        .unwrap_or_else(|| panic!("remote Stop identity names an invalid CPU"));
+    assert_ne!(
+        current_cpu().unwrap_or_else(|_| fail_transport_and_halt()),
+        target,
+        "remote Stop publisher targeted its own physical CPU"
+    );
+    LIVE_IDLE_WAKE
+        .ensure_healthy()
+        .unwrap_or_else(|_| fail_transport_and_halt());
+    let snapshot = super::smp::live_cpu_registry()
+        .snapshot(target.index())
+        .unwrap_or_else(|_| panic!("remote Stop target is not in the live CPU registry"));
+    assert_eq!(
+        snapshot.online_generation,
+        identity.cpu_online_generation(),
+        "remote Stop target changed online generation before publication"
+    );
+    let deferred = LIVE_IDLE_WAKE.mailboxes[target.index()].publish_stop(identity, resource)?;
+    if super::ipi::send_live_ipi(
+        snapshot.local_apic_id,
+        super::ipi::LiveIpiVector::Rendezvous,
+    )
+    .is_err()
+    {
+        LIVE_IDLE_WAKE.mailboxes[target.index()]
+            .retain_after_failure(&deferred, DeferredFailure::Transport)
+            .unwrap_or_else(|_| panic!("remote Stop transport failure lost mailbox ownership"));
+        core::mem::forget(deferred);
+        fail_transport_and_halt();
+    }
+    Ok(deferred)
+}
+
+/// Acquire-consumes one exact-safe acknowledgement before returning the
+/// caller's deferred resource. The bounded failure path retains the mailbox
+/// witness and fails stop; it never turns a timeout into permission to reclaim.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn await_live_remote_stop<R>(
+    mut deferred: DeferredReclaim<R>,
+) -> (R, RemoteStopReclaimPermit) {
+    let identity = deferred.request().identity();
+    let target = CpuIndex::new(identity.target_cpu())
+        .unwrap_or_else(|| panic!("deferred remote Stop names an invalid CPU"));
+    let mailbox = &LIVE_IDLE_WAKE.mailboxes[target.index()];
+    for _ in 0..20_000_000_u32 {
+        match mailbox.complete_reclaim(deferred) {
+            Ok(resource) => {
+                return (
+                    resource,
+                    RemoteStopReclaimPermit::from_acknowledgement(identity),
+                );
+            }
+            Err(failure) if failure.error() == ReclaimError::AwaitingAcknowledgement => {
+                deferred = failure.into_deferred();
+                core::hint::spin_loop();
+            }
+            Err(failure) => {
+                deferred = failure.into_deferred();
+                core::mem::forget(deferred);
+                fail_transport_and_halt();
+            }
+        }
+    }
+    mailbox
+        .retain_after_failure(&deferred, DeferredFailure::Timeout)
+        .unwrap_or_else(|_| panic!("remote Stop timeout lost mailbox ownership"));
+    core::mem::forget(deferred);
+    fail_transport_and_halt()
 }
 
 /// Bounded e1 receive callback: publish a CPU-local latch after EOI. It does

@@ -345,6 +345,30 @@ pub(crate) struct RetainedFailure {
     pub(crate) failure: DeferredFailure,
 }
 
+/// Linear proof that the initiator Acquire-consumed one exact-safe Stop
+/// acknowledgement. Only the live mailbox completion path may mint it.
+#[must_use = "an acknowledged remote Stop permit must authorize the matching terminal reclaim"]
+pub(crate) struct RemoteStopReclaimPermit {
+    identity: StopIdentity,
+}
+
+impl RemoteStopReclaimPermit {
+    pub(super) const fn from_acknowledgement(identity: StopIdentity) -> Self {
+        Self { identity }
+    }
+
+    pub(crate) const fn thread(&self) -> ThreadKey {
+        self.identity.thread()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(thread: ThreadKey) -> Self {
+        Self {
+            identity: StopIdentity::new(1, 1, thread, 1, 1).unwrap(),
+        }
+    }
+}
+
 #[must_use = "failed publication returns ownership of the unreclaimed resource"]
 #[derive(Debug)]
 pub(crate) struct StopPublishFailure<R> {

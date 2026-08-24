@@ -904,6 +904,7 @@ fn collect_process_effects<
     waits: &WaitRegistry<WAITERS>,
     effects: ProcessExitEffects<HANDLES, THREADS>,
     defer_current: Option<ThreadKey>,
+    remotely_stopped: &[Option<ThreadKey>],
     terminal_waits: &mut C,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> Option<DeferredCurrentExecutionResources> {
@@ -926,10 +927,35 @@ fn collect_process_effects<
             let (pins, deferred) = execution.retire_exit_pins_defer_current(effects.pins, current);
             (pins, Some(deferred))
         }
-        None => (execution.retire_exit_pins(effects.pins), None),
+        None if remotely_stopped.is_empty() => (execution.retire_exit_pins(effects.pins), None),
+        None => (
+            execution.retire_exit_pins_after_remote_stops(effects.pins, remotely_stopped),
+            None,
+        ),
     };
     collect_retired_pins(registry, execution, waits, pins, cleanup);
     deferred
+}
+
+/// Terminal Process effects whose execution pins have not yet been retired.
+///
+/// A live SMP caller may inspect the exact Thread set, stop every remote
+/// physical owner, and only then pass this linear batch to
+/// `complete_prepared_process_termination` for reclamation.
+#[must_use = "prepared Process termination must be completed after remote execution owners are stopped"]
+pub(crate) struct PreparedProcessTermination<const HANDLES: usize, const THREADS: usize> {
+    target: ProcessKey,
+    effects: ProcessExitEffects<HANDLES, THREADS>,
+}
+
+impl<const HANDLES: usize, const THREADS: usize> PreparedProcessTermination<HANDLES, THREADS> {
+    pub(crate) const fn target(&self) -> ProcessKey {
+        self.target
+    }
+
+    pub(crate) fn thread_keys(&self) -> [Option<ThreadKey>; THREADS] {
+        self.effects.pins.thread_keys()
+    }
 }
 
 pub(crate) fn task_group_create<
@@ -3388,6 +3414,7 @@ fn collect_group_effects<
             waits,
             process,
             Some(current_thread),
+            &[],
             terminal_waits,
             cleanup,
         );
@@ -3405,6 +3432,7 @@ fn collect_group_effects<
             waits,
             process,
             Some(current_thread),
+            &[],
             terminal_waits,
             cleanup,
         )
@@ -3546,6 +3574,7 @@ pub(crate) fn process_exit<
         waits,
         effects,
         Some(current_thread),
+        &[],
         terminal_waits,
         cleanup,
     );
@@ -3606,6 +3635,7 @@ pub(crate) fn process_unhandled_exception<
         waits,
         effects,
         Some(current_thread),
+        &[],
         terminal_waits,
         cleanup,
     );
@@ -3646,43 +3676,193 @@ pub(crate) fn process_terminate<
     SyscallControl,
     Option<DeferredCurrentExecutionResources>,
 ) {
-    if let Err(status) = authorized_reason(reason) {
-        return (status, SyscallControl::ReturnToCaller, None);
-    }
-    if let Err(status) = validate_running_caller(tasks, execution, current_process, current_thread)
-    {
-        return (status, SyscallControl::ReturnToCaller, None);
-    }
-    let pin = match resolve_current_handle(
+    let prepared = match prepare_process_terminate(
+        registry,
+        tasks,
+        execution,
+        current_process,
+        current_thread,
+        process,
+        reason,
+        detail,
+        cleanup,
+    ) {
+        Ok(prepared) => prepared,
+        Err(status) => return (status, SyscallControl::ReturnToCaller, None),
+    };
+    complete_prepared_process_termination(
+        registry,
+        tasks,
+        execution,
+        waits,
+        terminal_waits,
+        current_process,
+        current_thread,
+        prepared,
+        cleanup,
+    )
+}
+
+pub(crate) fn prepare_process_terminate<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    current_process: ProcessKey,
+    current_thread: ThreadKey,
+    process: DwHandle,
+    reason: DwTerminationReason,
+    detail: u32,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> Result<PreparedProcessTermination<HANDLES, THREADS>, DwStatus> {
+    authorized_reason(reason)?;
+    validate_running_caller(tasks, execution, current_process, current_thread)?;
+    let pin = resolve_current_handle(
         tasks,
         registry,
         current_process,
         process,
         deepwyrm_abi::DW_OBJECT_TYPE_PROCESS,
         DW_RIGHT_MODIFY,
-    ) {
-        Ok(pin) => pin,
-        Err(status) => return (status, SyscallControl::ReturnToCaller, None),
-    };
+    )?;
     let target = ProcessKey::from_object_id(pin.id());
     let effects = match tasks.terminate_process_authorized(registry, target, detail) {
         Ok(effects) => effects,
         Err(error) => {
             release_lookup_pin(registry, pin, cleanup);
-            return (task_status(error), SyscallControl::ReturnToCaller, None);
+            return Err(task_status(error));
         }
     };
+    // The Process identity is now captured by the terminal effects and the
+    // caller's Handle may be released before a potentially blocking remote
+    // stop. No HandleTable/registry borrow crosses that wait.
+    release_lookup_pin(registry, pin, cleanup);
+    Ok(PreparedProcessTermination { target, effects })
+}
+
+pub(crate) fn complete_prepared_process_termination<
+    C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
+    terminal_waits: &mut C,
+    current_process: ProcessKey,
+    current_thread: ThreadKey,
+    prepared: PreparedProcessTermination<HANDLES, THREADS>,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> (
+    DwStatus,
+    SyscallControl,
+    Option<DeferredCurrentExecutionResources>,
+) {
+    complete_prepared_process_termination_with_remote_threads(
+        registry,
+        tasks,
+        execution,
+        waits,
+        terminal_waits,
+        current_process,
+        current_thread,
+        prepared,
+        &[],
+        cleanup,
+    )
+}
+
+pub(crate) fn complete_prepared_process_termination_after_remote_stops<
+    C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
+    terminal_waits: &mut C,
+    current_process: ProcessKey,
+    current_thread: ThreadKey,
+    prepared: PreparedProcessTermination<HANDLES, THREADS>,
+    permits: [Option<crate::arch::x86_64::rendezvous::RemoteStopReclaimPermit>;
+        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> (
+    DwStatus,
+    SyscallControl,
+    Option<DeferredCurrentExecutionResources>,
+) {
+    let remote_threads = permits
+        .each_ref()
+        .map(|permit| permit.as_ref().map(|permit| permit.thread()));
+    complete_prepared_process_termination_with_remote_threads(
+        registry,
+        tasks,
+        execution,
+        waits,
+        terminal_waits,
+        current_process,
+        current_thread,
+        prepared,
+        remote_threads.as_slice(),
+        cleanup,
+    )
+}
+
+fn complete_prepared_process_termination_with_remote_threads<
+    C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
+    terminal_waits: &mut C,
+    current_process: ProcessKey,
+    current_thread: ThreadKey,
+    prepared: PreparedProcessTermination<HANDLES, THREADS>,
+    remote_threads: &[Option<ThreadKey>],
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> (
+    DwStatus,
+    SyscallControl,
+    Option<DeferredCurrentExecutionResources>,
+) {
     let deferred = collect_process_effects(
         registry,
         tasks,
         execution,
         waits,
-        effects,
+        prepared.effects,
         Some(current_thread),
+        remote_threads,
         terminal_waits,
         cleanup,
     );
-    release_lookup_pin(registry, pin, cleanup);
     let control = control_after_process_state(tasks, current_process);
     assert_eq!(
         control == SyscallControl::TerminateCurrent,

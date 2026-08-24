@@ -355,7 +355,7 @@ fn h4_idle_publication_brackets_rescan_and_uses_only_coalesced_e1_wake() {
         .split_once("pub(crate) fn notify_runnable_work(affinity: Option<CpuIndex>)")
         .expect("live runnable notifier")
         .1
-        .split_once("pub(crate) fn latch_current_rendezvous_ipi()")
+        .split_once("pub(crate) fn publish_live_remote_stop")
         .expect("live runnable notifier extent")
         .0;
     assert_eq!(live_notify.matches("fail_transport_and_halt()").count(), 4);

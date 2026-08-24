@@ -338,6 +338,7 @@ mod tests;
 pub(crate) enum SyscallControl {
     ReturnToCaller,
     TerminateCurrent,
+    CompleteRemoteStop,
     SuspendCurrent,
 }
 
@@ -771,6 +772,18 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
     /// work, but this entry does not displace a Running Thread.
     fn enter_idle_scheduler(&mut self) -> ! {
         panic!("native runtime does not admit idle-CPU scheduler entry")
+    }
+
+    /// Completes an initiator-side remote-stop wait after the raw trampoline
+    /// has closed its usercopy window. Implementations must not retain a
+    /// shared runtime guard while publishing, waiting for, or consuming the
+    /// exact-safe acknowledgement.
+    fn complete_remote_stop(
+        &mut self,
+        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+        _current_binding_generation: u64,
+    ) -> SyscallControl {
+        panic!("native runtime has no pending remote stop")
     }
 
     /// Returns a plan branded by the stationary execution owner borrowed from
