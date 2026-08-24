@@ -133,6 +133,7 @@ impl G5PrimordialProbe {
 
         let expectation = match crate::test_support::BUILD_GUEST_TEST {
             BuildGuestTest::PrimordialBootstrap => G5PrimordialExpectation::Baseline,
+            BuildGuestTest::SmpRuntimeStress => G5PrimordialExpectation::Baseline,
             BuildGuestTest::SmpRuntimeAcceptance => G5PrimordialExpectation::Baseline,
             BuildGuestTest::PrimordialBlockingCleanup => G5PrimordialExpectation::BlockingCleanup,
             BuildGuestTest::PrimordialUserException => G5PrimordialExpectation::UserException,

@@ -126,6 +126,12 @@ state = "implemented"
 id = 21
 state = "implemented"
 
+# DW0-I2 bounded deterministic live stress. This reuses the production
+# primordial runtime and the canonical WYR0-H result transport.
+[guest_test.smp-runtime-stress]
+id = 22
+state = "implemented"
+
 # DW0-I1’s test-support-only SMP evidence collector.  This selector embeds a
 # build-owned nonce and has no production dispatch until the runtime lane wires
 # its semantic scenario hooks.

@@ -32,6 +32,7 @@ pub(crate) enum BuildGuestTest {
     PrimordialBlockingCleanup,
     PrimordialUserException,
     PrimordialInvalidReturn,
+    SmpRuntimeStress,
     SmpRuntimeAcceptance,
 }
 
@@ -93,6 +94,7 @@ impl BuildGuestTest {
             Self::PrimordialBlockingCleanup => 19,
             Self::PrimordialUserException => 20,
             Self::PrimordialInvalidReturn => 21,
+            Self::SmpRuntimeStress => 22,
             Self::SmpRuntimeAcceptance => 23,
         }
     }
@@ -127,6 +129,7 @@ impl BuildGuestTest {
                 | Self::PrimordialBlockingCleanup
                 | Self::PrimordialUserException
                 | Self::PrimordialInvalidReturn
+                | Self::SmpRuntimeStress
                 | Self::SmpRuntimeAcceptance
         )
     }
@@ -229,6 +232,8 @@ const fn parse_known_selector(value: &str) -> BuildGuestTest {
         BuildGuestTest::PrimordialUserException
     } else if string_equals(value, "primordial-invalid-return") {
         BuildGuestTest::PrimordialInvalidReturn
+    } else if string_equals(value, "smp-runtime-stress") {
+        BuildGuestTest::SmpRuntimeStress
     } else if string_equals(value, "smp-runtime-acceptance") {
         BuildGuestTest::SmpRuntimeAcceptance
     } else {

@@ -228,6 +228,7 @@ fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
         ("primordial-blocking-cleanup", 19),
         ("primordial-user-exception", 20),
         ("primordial-invalid-return", 21),
+        ("smp-runtime-stress", 22),
         ("smp-runtime-acceptance", 23),
     ] {
         assert_eq!(
