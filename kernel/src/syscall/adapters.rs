@@ -5672,3 +5672,51 @@ where
         }
     }
 }
+
+/// Commit a previously prepared protection change after guard-free root selection.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn address_region_protect_prepared<
+    P: crate::memory::address_region::AddressSpacePublisher,
+    const OBJECTS: usize,
+    const MEMORY_OBJECTS: usize,
+    const LEASES: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const REGION_OBJECTS: usize,
+    const REGION_SLOTS: usize,
+>(
+    prepared: PreparedAddressRegionMutation,
+    publisher: &mut P,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    memory: &mut MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    regions: &mut AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
+    current_process: ProcessKey,
+    address_region: DwHandle,
+    address: DwUserAddress,
+    byte_len: u64,
+    protections: u32,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus
+where
+    P::Error: AddressSpacePublishStatus,
+{
+    if let Err(status) = prepared.revalidate(regions) {
+        return status;
+    }
+    address_region_protect(
+        publisher,
+        registry,
+        memory,
+        tasks,
+        regions,
+        current_process,
+        address_region,
+        address,
+        byte_len,
+        protections,
+        cleanup,
+    )
+}

@@ -649,6 +649,30 @@ fn live_timer_expiry_is_bound_and_serviced_only_from_carrier_safe_points() {
 }
 
 #[test]
+fn i2_live_dispatch_covers_every_stress_payload_syscall_family() {
+    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let adapters = source("src/syscall/adapters.rs");
+
+    assert!(runtime.contains("NativeSyscallRequest::AddressRegionProtect"));
+    assert!(runtime.contains("fn protect_memory("));
+    assert!(runtime.contains("crate::syscall::address_region_protect_prepared("));
+    assert!(adapters.contains("pub(crate) fn address_region_protect_prepared<"));
+    for family in [
+        "NativeSyscallRequest::HandleClose",
+        "NativeSyscallRequest::HandleDuplicate",
+        "NativeSyscallRequest::ObjectGetInfoV1",
+        "NativeSyscallRequest::MemoryObjectCreate",
+        "NativeSyscallRequest::AddressRegionMap",
+        "NativeSyscallRequest::AddressRegionUnmap",
+        "NativeSyscallRequest::AddressRegionProtect",
+        "NativeSyscallRequest::ProcessTerminate",
+        "NativeSyscallRequest::ProcessExit",
+    ] {
+        assert!(runtime.contains(family), "live carrier omitted {family}");
+    }
+}
+
+#[test]
 fn i1_terminal_child_without_local_work_rejoins_the_idle_scheduler() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
 

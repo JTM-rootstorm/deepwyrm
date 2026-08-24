@@ -3613,6 +3613,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             } => {
                 NativeSyscallResult::returning(self.unmap_memory(address_region, address, byte_len))
             }
+            NativeSyscallRequest::AddressRegionProtect {
+                address_region,
+                address,
+                byte_len,
+                protections,
+            } => NativeSyscallResult::returning(self.protect_memory(
+                address_region,
+                address,
+                byte_len,
+                protections,
+            )),
             NativeSyscallRequest::ProcessExit { exit_code } => self.exit_process(exit_code),
             _ => NativeSyscallResult::returning(DW_STATUS_NOT_SUPPORTED),
         }
@@ -3838,6 +3849,85 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             user.select_process_for_return_validation(caller_process)
                 .unwrap_or_else(|error| {
                     panic!("primordial unmap caller-root restoration failed: {error:?}")
+                });
+            status
+        })();
+        self.commit_runtime_phase(phase);
+        status
+    }
+
+    fn protect_memory(
+        &mut self,
+        address_region: deepwyrm_abi::DwHandle,
+        address: deepwyrm_abi::DwUserAddress,
+        byte_len: u64,
+        protections: u32,
+    ) -> deepwyrm_abi::DwStatus {
+        let phase = self.reserve_runtime_phase();
+        self.assert_guard_free_external_work();
+        let status = (|| {
+            let prepared = match crate::syscall::prepare_address_region_mutation(
+                &mut self.registry,
+                &self.tasks,
+                &self.regions,
+                self.process,
+                address_region,
+                deepwyrm_abi::DW_RIGHT_MODIFY,
+                &mut self.cleanup,
+            ) {
+                Ok(target) => target,
+                Err(status) => return status,
+            };
+            let target = prepared.target();
+            let caller_process = self.process;
+            let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
+            let mut user = self.active.current_process_address_space(
+                self.active_root.as_ref().expect("active root"),
+                self.process,
+            );
+            if user
+                .select_process_for_return_validation(target.process)
+                .is_err()
+            {
+                return DW_STATUS_BAD_STATE;
+            }
+            let status = {
+                let mut shootdown = user_access::LiveTlbShootdownDriver::current();
+                let (mut publisher, coherency) = user
+                    .publisher_with_coherency::<
+                        PRIMORDIAL_TABLE_CANDIDATES,
+                        PRIMORDIAL_JOURNAL_ENTRIES,
+                        PRIMORDIAL_INVALIDATIONS,
+                    >(target.address_space, target.region_key, &mut candidates)
+                    .unwrap_or_else(|_| panic!("primordial protect publisher unavailable"));
+                let mut publisher =
+                    crate::memory::address_region::CoherentAddressSpacePublisher::<
+                        _,
+                        _,
+                        { crate::cpu::CPU_CAPACITY },
+                        1_000_000,
+                    >::new(&mut publisher, coherency, &mut shootdown);
+                crate::syscall::address_region_protect_prepared(
+                    prepared,
+                    &mut publisher,
+                    &mut self.registry,
+                    &mut self.memory,
+                    &mut self.tasks,
+                    &mut self.regions,
+                    self.process,
+                    address_region,
+                    address,
+                    byte_len,
+                    protections,
+                    &mut self.cleanup,
+                )
+            };
+            for candidate in candidates.into_iter().flatten() {
+                user.recycle_table_candidate(candidate);
+            }
+            user.select_process_for_return_validation(caller_process)
+                .unwrap_or_else(|error| {
+                    panic!("primordial protect caller-root restoration failed: {error:?}")
                 });
             status
         })();
