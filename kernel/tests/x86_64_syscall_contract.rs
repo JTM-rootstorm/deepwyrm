@@ -502,6 +502,17 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
 }
 
 #[test]
+fn i1_terminal_child_without_local_work_rejoins_the_idle_scheduler() {
+    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+
+    assert!(runtime.contains("enum PreparedTerminalHandoff"));
+    assert!(runtime.contains("if retired_process != self.primordial_process"));
+    assert!(runtime.contains("self.finish_inactive_process_teardown("));
+    assert!(runtime.contains("PreparedTerminalHandoff::IdleScheduler"));
+    assert!(runtime.contains("enter_bound_idle_scheduler()"));
+}
+
+#[test]
 fn i1_live_wait_suspension_uses_the_physical_current_cpu() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
     let services = source("src/syscall/f_services.rs");

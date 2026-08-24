@@ -501,6 +501,11 @@ enum PreparedCarrierEntry {
     Idle,
 }
 
+enum PreparedTerminalHandoff {
+    Continuation(u64),
+    IdleScheduler,
+}
+
 /// Fixed CPU-local façade over the stationary runtime authorities.
 ///
 /// The live runtime façades serialize shared authority access separately; this
@@ -541,6 +546,18 @@ impl PerCpuLiveCarrier {
         local.current_thread = Some(thread);
         local.current_stack = Some(stack);
         local.current_context = Some(context);
+    }
+
+    fn record_idle(&self) {
+        let mut local = self.local.lock();
+        assert_eq!(local.scratch_cpu, self.cpu, "carrier scratch CPU drifted");
+        assert!(
+            !local.reaper_staged,
+            "reaper-staged carrier cannot enter ordinary idle"
+        );
+        local.current_thread = None;
+        local.current_stack = None;
+        local.current_context = None;
     }
 }
 
@@ -1325,7 +1342,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         (state, stack)
     }
 
-    fn prepare_terminal_handoff(&mut self) -> u64 {
+    fn prepare_terminal_handoff(&mut self) -> PreparedTerminalHandoff {
         let retired_process = self.process;
         let retired_root_key = self.root_key;
         let retired_address_space = self
@@ -1389,7 +1406,55 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             crate::arch::x86_64::syscall::validate_live_syscall_boundary().unwrap_or_else(
                 |error| panic!("terminal next syscall boundary validation failed: {error:?}"),
             );
-            return continuation;
+            return PreparedTerminalHandoff::Continuation(continuation);
+        }
+
+        if retired_process != self.primordial_process {
+            let prepared = self
+                .active
+                .prepare_process_root_selection(
+                    self.cpu,
+                    self.primordial_process,
+                    self.primordial_address_space,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("terminal idle safe-root preparation failed: {error:?}")
+                });
+            let previous = Some(self.active_root.take_process());
+            let selected = self
+                .active
+                .activate_process_root_selection(prepared, previous)
+                .unwrap_or_else(|failure| {
+                    let (error, prepared, previous) = failure.into_parts();
+                    self.active
+                        .abandon_process_root_selection(prepared)
+                        .unwrap_or_else(|abandon| {
+                            panic!("terminal idle safe-root abandonment failed: {abandon:?}")
+                        });
+                    self.active_root = CarrierActiveRoot::Process(previous.unwrap_or_else(|| {
+                        panic!("terminal idle safe-root rollback lost its previous root")
+                    }));
+                    panic!("terminal idle safe-root activation failed: {error:?}")
+                });
+            self.active_root = CarrierActiveRoot::Process(selected);
+            self.finish_inactive_process_teardown(
+                retired_process,
+                retired_root_key,
+                retired_address_space,
+            )
+            .unwrap_or_else(|_| panic!("idle exited Process teardown drifted"));
+            let previous = self.active_root.take_process();
+            match self.active.enter_kernel_execution_root(previous) {
+                Ok(kernel) => self.active_root = CarrierActiveRoot::Kernel(kernel),
+                Err((error, recovered)) => {
+                    self.active_root = CarrierActiveRoot::Process(recovered);
+                    panic!("terminal idle kernel-root handoff failed: {error:?}");
+                }
+            }
+            self.process = self.primordial_process;
+            self.root_key = self.primordial_root_key;
+            self.local.record_idle();
+            return PreparedTerminalHandoff::IdleScheduler;
         }
 
         let completion = complete_primordial_launch(self);
@@ -2374,8 +2439,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 
     fn terminate_current(&mut self) -> ! {
-        let continuation = self.prepare_terminal_handoff();
-        unsafe { crate::arch::x86_64::context::abandon_to_kernel_continuation(continuation) }
+        match self.prepare_terminal_handoff() {
+            PreparedTerminalHandoff::Continuation(continuation) => unsafe {
+                crate::arch::x86_64::context::abandon_to_kernel_continuation(continuation)
+            },
+            PreparedTerminalHandoff::IdleScheduler => {
+                crate::arch::x86_64::syscall::enter_bound_idle_scheduler()
+            }
+        }
     }
 
     fn enter_scheduled_fresh_thread(&mut self) -> ! {
@@ -2601,12 +2672,19 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
     }
 
     fn terminate_current(&mut self) -> ! {
-        let continuation = {
+        let handoff = {
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);
             runtime.prepare_terminal_handoff()
         };
-        unsafe { crate::arch::x86_64::context::abandon_to_kernel_continuation(continuation) }
+        match handoff {
+            PreparedTerminalHandoff::Continuation(continuation) => unsafe {
+                crate::arch::x86_64::context::abandon_to_kernel_continuation(continuation)
+            },
+            PreparedTerminalHandoff::IdleScheduler => {
+                crate::arch::x86_64::syscall::enter_bound_idle_scheduler()
+            }
+        }
     }
 
     fn enter_scheduled_fresh_thread(&mut self) -> ! {
