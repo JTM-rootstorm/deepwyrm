@@ -885,7 +885,6 @@ pub(crate) fn observe_child_exit(
         cleaned: false,
     };
     facts.child = Some(fact);
-    record_runtime_fact(EvidenceEvent::child_exit(fact.exit_cpu, fact.token));
 }
 
 pub(crate) fn observe_child_cleanup(process: crate::task::ProcessKey, cpu: crate::cpu::CpuIndex) {
@@ -898,10 +897,12 @@ pub(crate) fn observe_child_cleanup(process: crate::task::ProcessKey, cpu: crate
         return;
     }
     if child.exit_cpu == cpu {
-        panic!("I1 child cleanup remained on the exiting CPU");
+        facts.child = None;
+        return;
     }
     child.cleaned = true;
     facts.child = Some(child);
+    record_runtime_fact(EvidenceEvent::child_exit(child.exit_cpu, child.token));
     record_runtime_fact(EvidenceEvent::child_cleanup(cpu, child.token));
 }
 
@@ -941,6 +942,7 @@ pub(crate) fn observe_tlb_ack(
     }
     let bit = 1_u32 << cpu;
     if tlb.targets & bit == 0 || tlb.acknowledgements & bit != 0 {
+        drop(facts);
         panic!("I1 TLB acknowledgement disagreed with its target set");
     }
     tlb.acknowledgements |= bit;
@@ -956,6 +958,7 @@ pub(crate) fn observe_rendezvous_targets(targets: u32) {
     if facts.rendezvous_targets == 0 {
         facts.rendezvous_targets = targets;
     } else if facts.rendezvous_targets != targets {
+        drop(facts);
         panic!("I1 rendezvous target set changed");
     }
 }
@@ -964,10 +967,12 @@ pub(crate) fn observe_rendezvous_ack(cpu: crate::cpu::CpuIndex) {
     let cpu = cpu_wire(cpu);
     let mut facts = I1_RUNTIME_FACTS.lock();
     let Some(tlb) = facts.tlb else {
+        drop(facts);
         panic!("I1 rendezvous acknowledgement preceded TLB publication");
     };
     let bit = 1_u32 << cpu;
     if facts.rendezvous_targets & bit == 0 || facts.rendezvous_acknowledgements & bit != 0 {
+        drop(facts);
         panic!("I1 rendezvous acknowledgement disagreed with its target set");
     }
     facts.rendezvous_acknowledgements |= bit;
