@@ -1628,6 +1628,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.services.is_quiescent() && self.wait_controls.iter().all(NativeWaitControl::is_clear)
     }
 
+    fn stopped_service_state_is_quiescent(&self) -> bool {
+        matches!(
+            self.services.operation_owner(self.thread),
+            Err(crate::syscall::FServiceOwnerError::Missing)
+        ) && self.wait_controls[self.cpu.index()].is_clear()
+    }
+
     fn drain_staged_rendezvous_cleanup(&mut self) {
         let cleanup = self
             .rendezvous_cleanup
@@ -2271,7 +2278,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     fn deferred_cleanup_is_quiescent(&self) -> bool {
         self.cleanup.is_empty()
             && self.rendezvous_cleanup.is_some()
-            && self.service_state_is_quiescent()
+            && self.stopped_service_state_is_quiescent()
             && self.deferred_current.is_none()
             && self.shared.execution.running_claim_on(self.cpu).is_none()
     }

@@ -305,6 +305,9 @@ fn i1_remote_termination_waits_guard_free_for_exact_ack_before_reclaim() {
         .0;
     assert!(dispatch.contains("publish_live_remote_stop(identity, ())"));
     assert!(dispatch.contains("let mut runtime = self.runtime.lock();"));
+    assert!(primordial.contains("fn stopped_service_state_is_quiescent(&self)"));
+    assert!(primordial.contains("self.services.operation_owner(self.thread)"));
+    assert!(primordial.contains("self.wait_controls[self.cpu.index()].is_clear()"));
     let initiator = primordial
         .split_once("fn complete_remote_stop(")
         .expect("remote-stop initiator")
