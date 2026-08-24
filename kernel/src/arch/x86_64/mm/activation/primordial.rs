@@ -2019,15 +2019,26 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn finish_terminal_teardown(&mut self) -> Result<(), u32> {
-        if !self.service_state_is_quiescent()
-            || self.shared.execution.scheduler_state(self.thread).is_some()
-            || self
-                .shared
-                .execution
-                .blocked_operations()
-                .has_thread(self.thread)
+        if !self.services.is_quiescent() {
+            return Err(0x7000_0101_u32);
+        }
+        if let Some(cpu) = self
+            .wait_controls
+            .iter()
+            .position(|control| !control.is_clear())
         {
-            return Err(0x7000_0001_u32);
+            return Err(0x7000_0110_u32 | u32::try_from(cpu).unwrap_or(u32::MAX));
+        }
+        if self.shared.execution.scheduler_state(self.thread).is_some() {
+            return Err(0x7000_0102_u32);
+        }
+        if self
+            .shared
+            .execution
+            .blocked_operations()
+            .has_thread(self.thread)
+        {
+            return Err(0x7000_0103_u32);
         }
         let proof = self
             .tasks
