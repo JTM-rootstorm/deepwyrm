@@ -1,13 +1,7 @@
 //! DW0-I1 SMP acceptance evidence, confined to the test-support build.
 //!
 //! CPUs reserve and publish fixed-size facts here; only the terminal reporter
-//! serializes those facts to COM1.  Workers have no serial-port API. This module deliberately has no runtime
-//! scenario hookup yet.
-
-#![allow(
-    dead_code,
-    reason = "the target-only I1 hooks are intentionally unconnected until the runtime lane owns them"
-)]
+//! serializes those facts to COM1. Workers have no serial-port API.
 
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
@@ -22,7 +16,9 @@ const COLLECTING: usize = 0;
 const CLOSING: usize = 1;
 const FINALIZED: usize = 2;
 const FAILURE_NONE: u8 = 0;
+#[allow(dead_code, reason = "decoded by the target-side terminal reporter")]
 const FAILURE_OVERFLOW: u8 = 1;
+#[allow(dead_code, reason = "decoded by the target-side terminal reporter")]
 const FAILURE_MALFORMED: u8 = 2;
 const FAILURE_INVARIANT: u8 = 3;
 const NONCE: u64 = parse_nonce(env!("DEEPWYRM_I1_EVIDENCE_NONCE"));
@@ -142,43 +138,48 @@ impl EvidenceEvent {
         }
     }
 
-    pub(crate) const fn tlb_publish(cpu: u8, token: u32) -> Self {
+    pub(crate) const fn tlb_publish(cpu: u8, token: u32, target_mask: u32) -> Self {
         Self {
             kind: EvidenceKind::TlbPublish,
             cpu,
             token,
-            arg0: 0x0000_000f,
+            arg0: target_mask,
             arg1: 0,
         }
     }
 
-    pub(crate) const fn tlb_ack(cpu: u8, token: u32) -> Self {
+    pub(crate) const fn tlb_ack(cpu: u8, token: u32, target_mask: u32) -> Self {
         Self {
             kind: EvidenceKind::TlbAck,
             cpu,
             token,
-            arg0: 0x0000_000f,
+            arg0: target_mask,
             arg1: 0,
         }
     }
 
-    pub(crate) const fn rendezvous_ack(cpu: u8, token: u32) -> Self {
+    pub(crate) const fn rendezvous_ack(cpu: u8, token: u32, target_mask: u32) -> Self {
         Self {
             kind: EvidenceKind::RendezvousAck,
             cpu,
             token,
-            arg0: 0x0000_000f,
+            arg0: target_mask,
             arg1: 0,
         }
     }
 
-    pub(crate) const fn reclaim_allowed(cpu: u8, token: u32) -> Self {
+    pub(crate) const fn reclaim_allowed(
+        cpu: u8,
+        token: u32,
+        tlb_mask: u32,
+        rendezvous_mask: u32,
+    ) -> Self {
         Self {
             kind: EvidenceKind::ReclaimAllowed,
             cpu,
             token,
-            arg0: 0x0000_000f,
-            arg1: 0x0000_000f,
+            arg0: tlb_mask,
+            arg1: rendezvous_mask,
         }
     }
 
@@ -203,10 +204,10 @@ impl EvidenceEvent {
             }
             EvidenceKind::Cpl3Syscall => self.token != 0,
             EvidenceKind::TlbPublish | EvidenceKind::TlbAck | EvidenceKind::RendezvousAck => {
-                self.token != 0 && self.arg0 == 0x0000_000f && self.arg1 == 0
+                self.token != 0 && valid_cpu_mask(self.arg0) && self.arg1 == 0
             }
             EvidenceKind::ReclaimAllowed => {
-                self.token != 0 && self.arg0 == 0x0000_000f && self.arg1 == 0x0000_000f
+                self.token != 0 && valid_cpu_mask(self.arg0) && valid_cpu_mask(self.arg1)
             }
             EvidenceKind::WakeSent | EvidenceKind::WakeObserved => {
                 self.token != 0 && self.arg0 <= 3 && self.arg1 == 0
@@ -217,6 +218,10 @@ impl EvidenceEvent {
             _ => self.token != 0 && self.arg0 == 0 && self.arg1 == 0,
         }
     }
+}
+
+const fn valid_cpu_mask(mask: u32) -> bool {
+    mask != 0 && mask & !0x0f == 0
 }
 
 struct Slot {
@@ -431,6 +436,7 @@ impl EvidenceCollector {
             Ordering::Acquire,
         );
     }
+    #[allow(dead_code, reason = "used by the target-side terminal reporter")]
     fn failure_result(&self) -> Result<(), EvidenceFlushError> {
         match self.failure.load(Ordering::Acquire) {
             FAILURE_NONE => Ok(()),
@@ -486,6 +492,7 @@ impl EvidenceCollector {
         let mut tlb = None;
         let mut tlb_acks = 0_u8;
         let mut rendezvous_acks = 0_u8;
+        let mut rendezvous_mask = None;
         let mut reclaim_allowed = false;
         for (relative, slot) in facts.iter().enumerate() {
             let event = read_slot(slot);
@@ -553,8 +560,9 @@ impl EvidenceCollector {
                     tlb = Some((relative, event));
                 }
                 EvidenceKind::TlbAck => {
-                    if !matches!(tlb, Some((before, published)) if before < relative && published.token == event.token)
+                    if !matches!(tlb, Some((before, published)) if before < relative && published.token == event.token && event.arg0 == published.arg0)
                         || tlb_acks & (1 << event.cpu) != 0
+                        || event.arg0 & (1 << event.cpu) == 0
                     {
                         return false;
                     } else {
@@ -564,10 +572,13 @@ impl EvidenceCollector {
                 EvidenceKind::RendezvousAck => {
                     if !matches!(tlb, Some((before, published)) if before < relative && published.token == event.token)
                         || rendezvous_acks & (1 << event.cpu) != 0
+                        || event.arg0 & (1 << event.cpu) == 0
+                        || matches!(rendezvous_mask, Some(mask) if mask != event.arg0)
                     {
                         return false;
                     } else {
                         rendezvous_acks |= 1 << event.cpu;
+                        rendezvous_mask.get_or_insert(event.arg0);
                     }
                 }
                 EvidenceKind::ReclaimAllowed => {
@@ -575,8 +586,10 @@ impl EvidenceCollector {
                         return false;
                     }
                     if !matches!(tlb, Some((before, published)) if before < relative && published.token == event.token)
-                        || tlb_acks != 0x0f
-                        || rendezvous_acks != 0x0f
+                        || !matches!(tlb, Some((_, published)) if u32::from(tlb_acks) == published.arg0)
+                        || !matches!(rendezvous_mask, Some(mask) if u32::from(rendezvous_acks) == mask)
+                        || event.arg0 != u32::from(tlb_acks)
+                        || event.arg1 != u32::from(rendezvous_acks)
                     {
                         return false;
                     }
@@ -593,8 +606,8 @@ impl EvidenceCollector {
             && child_exit.is_some()
             && child_cleanup
             && tlb.is_some()
-            && tlb_acks == 0x0f
-            && rendezvous_acks == 0x0f
+            && matches!(tlb, Some((_, published)) if u32::from(tlb_acks) == published.arg0)
+            && matches!(rendezvous_mask, Some(mask) if u32::from(rendezvous_acks) == mask)
             && reclaim_allowed
     }
 
@@ -678,6 +691,7 @@ const fn state_has_failure(state: usize) -> bool {
 }
 
 /// The one build-selected collector; no public ABI or production state uses it.
+#[allow(dead_code, reason = "the runtime lane owns the target-side collector hookup")]
 pub(crate) static I1_EVIDENCE: EvidenceCollector = EvidenceCollector::new();
 
 fn encode(sequence: u32, slot: &Slot) -> [u8; I1_EVIDENCE_RECORD_LEN] {
@@ -818,45 +832,10 @@ mod tests {
             && decode_hex(&record[76..84]) == Some(fnv1a32(&record[..76]))
     }
     fn complete_contract(collector: &EvidenceCollector) -> FinalizedEvidence<'_> {
-        for cpu in 0..4 {
-            collector
-                .record(EvidenceEvent::cpu_online(cpu, 0x20 + u32::from(cpu)))
-                .unwrap();
-        }
-        collector
-            .record(EvidenceEvent::cpl3_syscall(0, 1, 1, 1))
-            .unwrap();
-        collector
-            .record(EvidenceEvent::cpl3_syscall(1, 2, 1, 1))
-            .unwrap();
-        collector
-            .record(EvidenceEvent::parent_blocked(0, 3))
-            .unwrap();
-        collector
-            .record(EvidenceEvent::descendant_running(1, 3))
-            .unwrap();
-        collector.record(EvidenceEvent::wake_sent(1, 4, 2)).unwrap();
-        collector
-            .record(EvidenceEvent::wake_observed(2, 4, 1))
-            .unwrap();
-        collector.record(EvidenceEvent::child_exit(2, 5)).unwrap();
-        collector
-            .record(EvidenceEvent::child_cleanup(3, 5))
-            .unwrap();
-        collector.record(EvidenceEvent::tlb_publish(0, 6)).unwrap();
-        for cpu in 0..4 {
-            collector.record(EvidenceEvent::tlb_ack(cpu, 6)).unwrap();
-        }
-        for cpu in 0..4 {
-            collector
-                .record(EvidenceEvent::rendezvous_ack(cpu, 6))
-                .unwrap();
-        }
-        collector
-            .record(EvidenceEvent::reclaim_allowed(0, 6))
-            .unwrap();
+        complete_contract_without_final(collector);
         collector.finalize_running_invariant().unwrap()
     }
+
     #[test]
     fn encoding_round_trips_exactly() {
         let collector = EvidenceCollector::new();
@@ -870,7 +849,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(count, 23);
+        assert_eq!(count, 19);
         assert!(records[..count].iter().all(|record| parse(record)));
         assert_eq!(&records[0][8..10], b"01");
         assert_eq!(&records[count - 1][37..39], b"05");
@@ -980,6 +959,24 @@ mod tests {
     }
 
     #[test]
+    fn operation_masks_are_nonempty_and_fail_closed_on_reclaim_mismatch() {
+        let collector = EvidenceCollector::new();
+        assert_eq!(
+            collector.record(EvidenceEvent::tlb_publish(0, 6, 0)),
+            Err(EvidenceFlushError::Malformed)
+        );
+        assert_eq!(
+            collector.record(EvidenceEvent::rendezvous_ack(0, 6, 0x10)),
+            Err(EvidenceFlushError::Malformed)
+        );
+
+        let collector = EvidenceCollector::new();
+        complete_contract_with_reclaim_masks(&collector, 0x05, 0x02);
+        let permit = collector.finalize_running_invariant().unwrap();
+        assert_eq!(permit.flush(|_| Ok(())), Err(EvidenceFlushError::Invariant));
+    }
+
+    #[test]
     fn failure_reserved_before_close_is_in_the_final_terminal_decision() {
         let collector = EvidenceCollector::new();
         let sequence = collector.reserve().unwrap();
@@ -1024,6 +1021,14 @@ mod tests {
     }
 
     fn complete_contract_without_final(collector: &EvidenceCollector) {
+        complete_contract_with_reclaim_masks(collector, 0x05, 0x0a);
+    }
+
+    fn complete_contract_with_reclaim_masks(
+        collector: &EvidenceCollector,
+        reclaim_tlb_mask: u32,
+        reclaim_rendezvous_mask: u32,
+    ) {
         for cpu in 0..4 {
             collector
                 .record(EvidenceEvent::cpu_online(cpu, 0x20 + u32::from(cpu)))
@@ -1049,17 +1054,26 @@ mod tests {
         collector
             .record(EvidenceEvent::child_cleanup(3, 5))
             .unwrap();
-        collector.record(EvidenceEvent::tlb_publish(0, 6)).unwrap();
-        for cpu in 0..4 {
-            collector.record(EvidenceEvent::tlb_ack(cpu, 6)).unwrap();
-        }
-        for cpu in 0..4 {
+        collector
+            .record(EvidenceEvent::tlb_publish(0, 6, 0x05))
+            .unwrap();
+        for cpu in [0, 2] {
             collector
-                .record(EvidenceEvent::rendezvous_ack(cpu, 6))
+                .record(EvidenceEvent::tlb_ack(cpu, 6, 0x05))
+                .unwrap();
+        }
+        for cpu in [1, 3] {
+            collector
+                .record(EvidenceEvent::rendezvous_ack(cpu, 6, 0x0a))
                 .unwrap();
         }
         collector
-            .record(EvidenceEvent::reclaim_allowed(0, 6))
+            .record(EvidenceEvent::reclaim_allowed(
+                0,
+                6,
+                reclaim_tlb_mask,
+                reclaim_rendezvous_mask,
+            ))
             .unwrap();
     }
 }
