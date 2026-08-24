@@ -51,10 +51,10 @@ pub(crate) use adapters::{NoTerminalWaitCleanup, abi_get_info};
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use adapters::{
     PreparedProcessTermination, address_region_map_prepared_model, address_region_unmap_prepared,
-    complete_deferred_current_reclaim, complete_deferred_current_reclaim_on,
-    complete_prepared_process_termination_after_remote_stops, complete_wait_wakes, decode_map_args,
-    handle_close, handle_duplicate, object_get_info_v1, prepare_address_region_mutation,
-    prepare_process_terminate, process_exit_on, process_unhandled_exception,
+    complete_deferred_current_reclaim_on, complete_prepared_process_termination_after_remote_stops,
+    complete_wait_wakes, decode_map_args, handle_close, handle_duplicate, object_get_info_v1,
+    prepare_address_region_mutation, prepare_process_terminate, process_exit_on,
+    process_unhandled_exception,
 };
 #[cfg(all(
     not(deepwyrm_integrated),

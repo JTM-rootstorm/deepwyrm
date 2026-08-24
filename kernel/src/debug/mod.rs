@@ -59,7 +59,7 @@ const MAX_PANIC_REASON_BYTES: usize = 192;
 const MAX_BACKTRACE_FRAMES: usize = 16;
 #[cfg(any(test, feature = "test-support"))]
 const MAX_RAW_RECORD_BYTES: usize = 64;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, deepwyrm_i1_evidence))]
 const TEST_EVIDENCE_RECORD_BYTES: usize = 85;
 
 /// Minimal byte-port interface used by the early serial writer.
@@ -639,6 +639,7 @@ pub(crate) fn emit_early_raw_record(record: &[u8]) -> Result<(), SerialError> {
 /// following DWTEST1 terminal record indivisible against competing reporters.
 #[cfg(all(
     feature = "test-support",
+    deepwyrm_i1_evidence,
     target_os = "none",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
@@ -649,6 +650,7 @@ pub(crate) struct TestSerialTransaction {
 
 #[cfg(all(
     feature = "test-support",
+    deepwyrm_i1_evidence,
     target_os = "none",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
@@ -661,6 +663,7 @@ pub(crate) fn begin_test_serial_transaction() -> Result<TestSerialTransaction, S
 
 #[cfg(all(
     feature = "test-support",
+    deepwyrm_i1_evidence,
     target_os = "none",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
@@ -692,7 +695,7 @@ fn write_bounded_raw_record<P: PortIo>(
     Ok(())
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, deepwyrm_i1_evidence))]
 fn write_bounded_test_evidence_record<P: PortIo>(
     serial: &mut Com1<P>,
     record: &[u8; TEST_EVIDENCE_RECORD_BYTES],
