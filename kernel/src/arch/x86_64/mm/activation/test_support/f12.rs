@@ -1658,7 +1658,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         .unwrap_or_else(|_| fail(0xfa))
     }
 
-    fn resume_suspended(&mut self, frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame) {
+    fn resume_suspended(
+        &mut self,
+        frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> crate::syscall::native::NativeResumeOutcome {
         let thread = self.current_thread();
         let index = self.current_index();
         let expected = if index == 0 {
@@ -1700,6 +1703,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         } else {
             self.scenario.producer_phase += 1;
         }
+        crate::syscall::native::NativeResumeOutcome::Resumed
     }
 }
 

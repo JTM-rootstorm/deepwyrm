@@ -618,7 +618,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         fail(0xa4)
     }
 
-    fn resume_suspended(&mut self, _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame) {
+    fn resume_suspended(
+        &mut self,
+        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> crate::syscall::native::NativeResumeOutcome {
         fail(0xa3)
     }
 }

@@ -738,6 +738,13 @@ pub(crate) enum NativeIdleSuspendPoll<'owner> {
     Switch(crate::arch::x86_64::context::KernelSwitchPlan<'owner>),
 }
 
+#[must_use = "a resumed syscall either owns a live current Thread or must service the published rendezvous"]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeResumeOutcome {
+    Resumed,
+    ServiceRendezvous,
+}
+
 #[allow(
     unsafe_code,
     reason = "plan-producing runtime methods carry physical-current and fixed-entry obligations that safe Rust cannot encode"
@@ -814,7 +821,14 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     ) -> NativeIdleSuspendPoll<'owner>;
 
-    fn resume_suspended(&mut self, frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame);
+    /// Resumes a logically selected suspended Thread while holding the
+    /// runtime's scheduler authority. Implementations must poll the
+    /// authoritative rendezvous mailbox before consulting current task state;
+    /// a published Stop wins this edge and is returned to the raw trampoline.
+    fn resume_suspended(
+        &mut self,
+        frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> NativeResumeOutcome;
 }
 
 /// Private carrier seam for a CPL3-origin e1 return gate.

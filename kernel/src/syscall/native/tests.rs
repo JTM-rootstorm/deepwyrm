@@ -251,7 +251,10 @@ impl NativeSyscallFrameRuntime for FrameRuntime {
         panic!("unexpected synthetic idle suspension")
     }
 
-    fn resume_suspended(&mut self, _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame) {
+    fn resume_suspended(
+        &mut self,
+        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> NativeResumeOutcome {
         panic!("unexpected synthetic resume")
     }
 }
@@ -363,7 +366,10 @@ impl NativeSyscallFrameRuntime for SuspendingRuntime {
         panic!("direct dispatch test never enters idle suspension")
     }
 
-    fn resume_suspended(&mut self, _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame) {
+    fn resume_suspended(
+        &mut self,
+        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> NativeResumeOutcome {
         panic!("direct dispatch test never resumes")
     }
 }

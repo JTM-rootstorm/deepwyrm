@@ -2843,10 +2843,20 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         unsafe { runtime.poll_idle_suspend_stationary() }
     }
 
-    fn resume_suspended(&mut self, frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame) {
+    fn resume_suspended(
+        &mut self,
+        frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> crate::syscall::native::NativeResumeOutcome {
         let mut runtime = self.runtime.lock();
+        if matches!(
+            crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
+            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
+        ) {
+            return crate::syscall::native::NativeResumeOutcome::ServiceRendezvous;
+        }
         runtime.switch_cpu(self.cpu);
         runtime.resume_suspended(frame);
+        crate::syscall::native::NativeResumeOutcome::Resumed
     }
 }
 

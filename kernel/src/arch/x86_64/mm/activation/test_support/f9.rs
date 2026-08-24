@@ -1045,7 +1045,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         .unwrap_or_else(|_| fail(0xbd))
     }
 
-    fn resume_suspended(&mut self, frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame) {
+    fn resume_suspended(
+        &mut self,
+        frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> crate::syscall::native::NativeResumeOutcome {
         let current = self.current_thread();
         if current != self.threads[0] || self.waiter_resumed {
             fail(0xbe);
@@ -1075,6 +1078,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
             }
             _ => fail(0xc1),
         }
+        crate::syscall::native::NativeResumeOutcome::Resumed
     }
 }
 

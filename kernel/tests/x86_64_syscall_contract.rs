@@ -344,13 +344,13 @@ fn i1_idle_suspend_stop_handoffs_after_idle_cleanup_instead_of_halting() {
         idle_suspend
             .match_indices("stage_rendezvous_action(RendezvousAction(request))")
             .count(),
-        2
+        3
     );
     assert_eq!(
         idle_suspend
             .match_indices("handoff_to_rendezvous_reaper(context)")
             .count(),
-        2
+        3
     );
     let finish = idle_suspend
         .find("crate::arch::x86_64::idle::finish_current_idle(halt)")
@@ -496,9 +496,50 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
     assert!(runtime.contains(
         "runtime.switch_cpu(self.cpu);\n            runtime.complete_physical_switch_handoff();\n            runtime.prepare_fresh_user_entry()"
     ));
-    assert!(
-        runtime.contains("runtime.switch_cpu(self.cpu);\n        runtime.resume_suspended(frame);")
-    );
+    let resume = runtime
+        .split_once("fn resume_suspended(")
+        .expect("live suspended-resume facade")
+        .1;
+    assert!(resume.contains("runtime.switch_cpu(self.cpu);"));
+    assert!(resume.contains("runtime.resume_suspended(frame);"));
+}
+
+#[test]
+fn i2_suspended_resume_gives_remote_stop_priority_under_scheduler_authority() {
+    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let live = source("src/arch/x86_64/syscall/live.rs");
+
+    let resume = runtime
+        .rsplit_once("fn resume_suspended(")
+        .expect("live suspended-resume facade")
+        .1
+        .split_once("\n    }\n}")
+        .expect("live suspended-resume facade terminator")
+        .0;
+    let authority = resume.find("self.runtime.lock()").unwrap();
+    let mailbox = resume
+        .find("take_current_notification_at_safe_point()")
+        .unwrap();
+    let current = resume.find("runtime.resume_suspended(frame)").unwrap();
+    assert!(authority < mailbox && mailbox < current);
+    assert!(resume.contains("NativeResumeOutcome::ServiceRendezvous"));
+
+    let suspended = live
+        .split_once("SyscallControl::SuspendCurrent =>")
+        .expect("suspended syscall trampoline")
+        .1
+        .split_once("SyscallControl::CompleteRemoteStop")
+        .expect("suspended syscall trampoline terminator")
+        .0;
+    let outcome = suspended.find("runtime.resume_suspended(frame)").unwrap();
+    let handoff = suspended[outcome..]
+        .find("handoff_to_rendezvous_reaper(context)")
+        .unwrap()
+        + outcome;
+    let authorize = suspended
+        .find("runtime.authorize_return(frame, generation)")
+        .unwrap();
+    assert!(outcome < handoff && handoff < authorize);
 }
 
 #[test]
