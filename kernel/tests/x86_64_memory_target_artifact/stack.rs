@@ -658,6 +658,14 @@ fn terminal_graph_cut(symbol: &str, disassembly: &str) -> Option<DirectCallStack
             terminal: "audited terminal-reaper stack pivot".to_owned(),
         });
     }
+    if symbol == "dw_x86_64_rendezvous_reaper_handoff" {
+        validate_rendezvous_reaper_handoff(disassembly);
+        return Some(DirectCallStackBound {
+            bytes: 0,
+            call_count: 0,
+            terminal: "audited rendezvous-reaper stack pivot".to_owned(),
+        });
+    }
     if matches!(
         symbol,
         "core::panicking::panic_fmt" | "core::panicking::panic_nounwind_fmt"
@@ -702,6 +710,41 @@ fn validate_terminal_reaper_handoff(disassembly: &str) {
     assert!(
         !body.lines().any(|line| line.contains("\tret")),
         "terminal-reaper handoff must not return to the retired Thread stack"
+    );
+}
+
+fn validate_rendezvous_reaper_handoff(disassembly: &str) {
+    let body = function_body(disassembly, "dw_x86_64_rendezvous_reaper_handoff");
+    let required = [
+        "\tcli",
+        "\tmov\tecx, 0xc0000101",
+        "\trdmsr",
+        "\tmov\tecx, 0xc0000102",
+        "\trdmsr",
+        "\tmov\trsp, qword ptr [rax + 0x30]",
+        "\tand\trsp, -0x10",
+        "\txor\trbp, rbp",
+        "\tcall\t0x",
+        " <dw_x86_64_rendezvous_reaper>",
+        "\tud2",
+    ];
+    let mut offset = 0;
+    for needle in required {
+        let next = body[offset..]
+            .find(needle)
+            .unwrap_or_else(|| panic!("rendezvous-reaper handoff omitted `{needle}`"));
+        offset += next + needle.len();
+    }
+    assert_eq!(
+        body.lines()
+            .filter(|line| line.contains("\tcall\t"))
+            .count(),
+        1,
+        "rendezvous-reaper handoff must make exactly one fixed callback call"
+    );
+    assert!(
+        !body.lines().any(|line| line.contains("\tret")),
+        "rendezvous-reaper handoff must not return to the interrupted stack"
     );
 }
 
@@ -819,6 +862,28 @@ fn terminal_reaper_handoff_ends_the_retired_stack_graph() {
             bytes: 16,
             call_count: 1,
             terminal: "audited terminal-reaper stack pivot".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn rendezvous_reaper_handoff_ends_the_interrupted_stack_graph() {
+    let sizes = [StackSize {
+        bytes: 16,
+        symbol: "root".to_owned(),
+    }];
+    let disassembly = "Disassembly of section .text:\n\n0000 <root>:\n  0:\tcall\t0x10 <dw_x86_64_rendezvous_reaper_handoff>\n\n0010 <dw_x86_64_rendezvous_reaper_handoff>:\n 10:\tcli\n 11:\tmov\tecx, 0xc0000101\n 16:\trdmsr\n 18:\tmov\tecx, 0xc0000102\n 1d:\trdmsr\n 1f:\tmov\trsp, qword ptr [rax + 0x30]\n 24:\tand\trsp, -0x10\n 28:\txor\trbp, rbp\n 2b:\tcall\t0x30 <dw_x86_64_rendezvous_reaper>\n 2e:\tud2\n";
+    assert_eq!(
+        direct_call_stack_bound(
+            sizes.as_slice(),
+            disassembly,
+            "rendezvous pivot",
+            |symbol| { symbol == "root" }
+        ),
+        DirectCallStackBound {
+            bytes: 16,
+            call_count: 1,
+            terminal: "audited rendezvous-reaper stack pivot".to_owned(),
         }
     );
 }

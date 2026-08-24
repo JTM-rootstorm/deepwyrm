@@ -522,6 +522,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
     }
 }
 
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    crate::syscall::native::NativeRendezvousRuntime
+    for E7SmokeRuntime<'_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn rendezvous_stop(
+        &mut self,
+        _request: crate::arch::x86_64::rendezvous::StopRequest,
+        _reaper: crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry,
+    ) -> ! {
+        fail(0x1e7)
+    }
+}
+
 #[allow(
     unsafe_code,
     reason = "the target runtime implements the physical-current suspension contract for the raw syscall trampoline"

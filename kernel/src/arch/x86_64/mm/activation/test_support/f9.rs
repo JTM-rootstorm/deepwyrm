@@ -891,6 +891,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
     }
 }
 
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    crate::syscall::native::NativeRendezvousRuntime
+    for F9Runtime<'_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn rendezvous_stop(
+        &mut self,
+        _request: crate::arch::x86_64::rendezvous::StopRequest,
+        _reaper: crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry,
+    ) -> ! {
+        fail(0x1f9)
+    }
+}
+
 #[allow(
     unsafe_code,
     reason = "the target runtime propagates the physical-current carrier and architecture-owned first-run entry"

@@ -93,7 +93,7 @@ pub(crate) fn validate_kernel_stack_artifact_geometry(symbols: &str) {
     let terminal_top = address("__dw_terminal_reaper_stack_top");
     assert_eq!(terminal_guard & 0xfff, 0, "terminal reaper guard alignment");
     assert_eq!(terminal_bottom - terminal_guard, 4096);
-    assert_eq!(terminal_top - terminal_bottom, 128 * 1024);
+    assert_eq!(terminal_top - terminal_bottom, 132 * 1024);
     assert!(
         privilege_top <= terminal_guard && terminal_top <= address("__dw_data_end"),
         "linked terminal reaper stack escapes the writable data PT_LOAD bounds"

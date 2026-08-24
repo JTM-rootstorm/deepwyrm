@@ -12,6 +12,7 @@ pub(super) struct AcceptedToolPaths<'a> {
 }
 
 pub(super) fn validate_accepted_identities(
+    workspace: &Path,
     rust_identity: &str,
     build_tools_identity: &str,
     tools: AcceptedToolPaths<'_>,
@@ -64,9 +65,15 @@ pub(super) fn validate_accepted_identities(
             artifact_root.join(manifest_value(rust_identity, "root_manifest")),
             "root_manifest_sha256",
         ),
-        (artifact_root.join("bootstrap.toml"), "config_sha256"),
         (
-            artifact_root.join(manifest_value(rust_identity, "sysroot_manifest")),
+            workspace
+                .parent()
+                .expect("workspace has an OS-Project parent")
+                .join(manifest_value(rust_identity, "config")),
+            "config_sha256",
+        ),
+        (
+            workspace.join(manifest_value(rust_identity, "sysroot_manifest")),
             "sysroot_manifest_sha256",
         ),
     ] {
@@ -828,10 +835,10 @@ pub(super) fn accepted_runtime_artifacts(
     let root_manifest =
         fs::read_to_string(&root_manifest_path).expect("read accepted root manifest");
     let (core_path, core_hash) =
-        root_manifest_artifact(&root_manifest, "artifacts.freestanding_core", artifact_root);
+        root_manifest_artifact(&root_manifest, "artifacts.none_core", artifact_root);
     let (builtins_path, builtins_hash) = root_manifest_artifact(
         &root_manifest,
-        "artifacts.freestanding_compiler_builtins",
+        "artifacts.none_compiler_builtins",
         artifact_root,
     );
     vec![

@@ -1,5 +1,5 @@
 schema = "deepwyrm-x86_64-task-layout"
-version = 3
+version = 4
 
 # Kernel-private DW0-E3 execution-resource budget. This is not a userspace ABI
 # and is intentionally separate from the Wyrmroot-consumed layout.toml.
@@ -19,6 +19,6 @@ privilege_entry_stack_alignment = 4096
 # through a noreturn assembly handoff before its pool-owned stack/context are
 # made reusable.
 terminal_reaper_stack_count = 1
-terminal_reaper_stack_size = 131072
+terminal_reaper_stack_size = 135168
 terminal_reaper_stack_guard_size = 4096
 terminal_reaper_stack_alignment = 4096

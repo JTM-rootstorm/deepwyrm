@@ -46,7 +46,7 @@ fn h1_trampoline_plan_is_bounded_to_one_low_nonzero_page() {
 fn h1_runtime_stack_arena_is_linker_bounded_and_first_root_guarded() {
     assert!(LINKER_SOURCE.contains("__dw_runtime_cpu_stack_arena_start = .;"));
     assert!(LINKER_SOURCE.contains("__dw_runtime_cpu_stack_arena_end = .;"));
-    assert!(LINKER_SOURCE.contains("4 * 70 * DW_KERNEL_BASE_PAGE_SIZE"));
+    assert!(LINKER_SOURCE.contains("4 * 71 * DW_KERNEL_BASE_PAGE_SIZE"));
     assert!(ARCH_SOURCE.contains("H1_RUNTIME_CPU_SLOT_COUNT: usize = 4"));
     assert!(ARCH_SOURCE.contains("H1_RUNTIME_AP_BOOTSTRAP_STACK_SIZE: u64 = 64 * 1024"));
     assert!(ARCH_SOURCE.contains("linked_runtime_cpu_stack_layout"));

@@ -1378,7 +1378,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 }
 
-#[cfg(all(feature = "test-support", target_os = "none", target_arch = "x86_64"))]
+#[cfg(all(
+    feature = "test-support",
+    deepwyrm_memory_guest,
+    target_os = "none",
+    target_arch = "x86_64"
+))]
 impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>
 {
@@ -1439,6 +1444,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
 #[cfg(all(
     feature = "test-support",
+    deepwyrm_memory_guest,
     target_os = "none",
     target_arch = "x86_64",
     deepwyrm_c3_one_shot_ui

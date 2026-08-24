@@ -93,6 +93,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=DEEPWYRM_GUEST_TEST_ID");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_I1_EVIDENCE_NONCE");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_c3_one_shot_ui)");
+    println!("cargo:rustc-check-cfg=cfg(deepwyrm_memory_guest)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_e7_guest)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_f9_guest)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_f12_guest)");
@@ -112,6 +113,13 @@ fn run() -> Result<(), String> {
     emit_task_layout_env(task_layout);
 
     configure_guest_test(&guest_harness_path)?;
+    if env::var("DEEPWYRM_GUEST_TEST_SELECTOR")
+        .ok()
+        .as_deref()
+        .is_some_and(is_memory_foundation_selector)
+    {
+        println!("cargo:rustc-cfg=deepwyrm_memory_guest");
+    }
     if env::var("DEEPWYRM_GUEST_TEST_SELECTOR")
         .ok()
         .as_deref()
@@ -239,6 +247,18 @@ fn is_e7_userspace_selector(selector: &str) -> bool {
     matches!(
         selector,
         "task-syscall-smoke" | "task-syscall-sanitize" | "task-user-exception"
+    )
+}
+
+fn is_memory_foundation_selector(selector: &str) -> bool {
+    matches!(
+        selector,
+        "memory-mapping"
+            | "memory-unmapping"
+            | "memory-permissions"
+            | "memory-invalid-pointer"
+            | "memory-user-kernel-isolation"
+            | "memory-shared-memory-object"
     )
 }
 
@@ -1290,7 +1310,7 @@ impl TaskLayout {
             ));
         }
         expect_string(&values, "schema", "deepwyrm-x86_64-task-layout")?;
-        expect_u64(&values, "version", 3)?;
+        expect_u64(&values, "version", 4)?;
         let count = parse_u64(required_value(&values, "thread_kernel_stack_count")?)?;
         let size = parse_u64(required_value(&values, "thread_kernel_stack_size")?)?;
         let guard = parse_u64(required_value(&values, "thread_kernel_stack_guard_size")?)?;
@@ -1329,13 +1349,13 @@ impl TaskLayout {
             return Err("DW0-E4 BSP privilege-entry stack must be one guarded 16384-byte stack on a 4096-byte boundary".into());
         }
         if terminal_count != 1
-            || terminal_size != 131_072
+            || terminal_size != 135_168
             || terminal_guard != 4_096
             || terminal_alignment != 4_096
             || !terminal_size.is_multiple_of(terminal_alignment)
             || !terminal_guard.is_multiple_of(terminal_alignment)
         {
-            return Err("terminal reaper carrier must be one guarded 131072-byte stack on a 4096-byte boundary".into());
+            return Err("terminal reaper carrier must be one guarded 135168-byte stack on a 4096-byte boundary".into());
         }
         Ok(Self {
             thread_kernel_stack_count: count,

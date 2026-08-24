@@ -461,6 +461,7 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
         );
         #[cfg(feature = "test-support")]
         match test_support::BUILD_GUEST_TEST {
+            #[cfg(deepwyrm_memory_guest)]
             test if test.is_memory_foundation() => {
                 test_support::run_memory_guest_test(active_paging)
             }

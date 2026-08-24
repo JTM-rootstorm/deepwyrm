@@ -9,7 +9,7 @@
 #[cfg(deepwyrm_i1_evidence)]
 mod evidence;
 mod identity;
-#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+#[cfg(all(deepwyrm_memory_guest, target_arch = "x86_64", target_os = "none"))]
 mod memory;
 mod protocol;
 #[cfg(all(deepwyrm_e7_guest, target_arch = "x86_64", target_os = "none"))]
@@ -56,7 +56,7 @@ pub(crate) use x86_64::{
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 pub(crate) use identity::ExpectedPageFaultKind;
 
-#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+#[cfg(all(deepwyrm_memory_guest, target_arch = "x86_64", target_os = "none"))]
 pub(crate) use memory::run_memory_guest_test;
 
 #[cfg(all(deepwyrm_e7_guest, target_arch = "x86_64", target_os = "none"))]

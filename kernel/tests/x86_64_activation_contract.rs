@@ -268,7 +268,7 @@ fn e3_e4_kernel_stacks_are_private_linker_carriers_with_first_root_guards() {
         "privilege_entry_stack_guard_size = 4096",
         "privilege_entry_stack_alignment = 4096",
         "terminal_reaper_stack_count = 1",
-        "terminal_reaper_stack_size = 131072",
+        "terminal_reaper_stack_size = 135168",
         "terminal_reaper_stack_guard_size = 4096",
         "terminal_reaper_stack_alignment = 4096",
     ] {

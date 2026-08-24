@@ -41,10 +41,14 @@ pub(crate) fn validate_f9_stack_context_evidence(
         one_stack_symbol(sizes, description, predicate)
     };
     let fresh_handler = symbol("F9 fresh handler", &|name| {
-        name.contains("native_runtime_fresh_thread::<") && name.contains("F9Runtime<")
+        name.contains("native_runtime_fresh_thread::<")
+            && name.contains("F9Runtime<")
+            && !name.contains("::{closure")
     });
     let trampoline = symbol("F9 runtime trampoline", &|name| {
-        name.contains("native_runtime_trampoline::<") && name.contains("F9Runtime<")
+        name.contains("native_runtime_trampoline::<")
+            && name.contains("F9Runtime<")
+            && !name.contains("::{closure")
     });
     let first_run = symbol("x86 first-run entry", &|name| {
         name == "dw_x86_64_first_run_thread_entry"
@@ -55,9 +59,25 @@ pub(crate) fn validate_f9_stack_context_evidence(
     let syscall_dispatch = symbol("x86 syscall dispatcher", &|name| {
         name == "dw_x86_64_syscall_dispatch"
     });
+    let rendezvous_reaper = symbol("x86 rendezvous reaper", &|name| {
+        name == "dw_x86_64_rendezvous_reaper"
+    });
+    let rendezvous_reaper_handler = symbol("F9 rendezvous reaper handler", &|name| {
+        name.contains("native_runtime_rendezvous_reaper::<")
+            && name.contains("F9Runtime<")
+            && !name.contains("::{closure")
+    });
+    let send_live_ipi = symbol("live IPI send boundary", &|name| {
+        name.ends_with("arch::x86_64::ipi::send_live_ipi")
+    });
+    let live_ipi_transport_send = symbol("stationary live IPI transport", &|name| {
+        name.contains("arch::x86_64::ipi::transport_send::<")
+            && name.contains("StationaryLiveIpiTransport")
+            && !name.contains("::{closure")
+    });
     let atomic_wait_begin = symbol("F9 atomic-wait transaction", &|name| {
         name.starts_with("deepwyrm_kernel::atomic_wait::begin_atomic_wait::<")
-            && name.contains("OwnedLiveAtomicU32")
+            && name.contains("OwnedLiveAtomicU32, 1, 1, 2, 1, 4, 2,")
             && name.ends_with('>')
     });
     let register_wait_deadline = symbol("F9 live wait-deadline registration", &|name| {
@@ -73,34 +93,24 @@ pub(crate) fn validate_f9_stack_context_evidence(
             "wait::engine::LiveWaitDeadlineAuthority as deepwyrm_kernel::wait::engine::WaitDeadlineAuthority>::cancel_wait_deadline",
         )
     });
-    let scheduler_prepare_block = symbol("F9 scheduler block preparation", &|name| {
-        name == "<deepwyrm_kernel::task::scheduler::CooperativeScheduler<2>>::prepare_block_current"
-    });
-    let scheduler_commit_block = symbol("F9 scheduler block commit", &|name| {
-        name == "<deepwyrm_kernel::task::scheduler::CooperativeScheduler<2>>::commit_block"
-    });
-    let scheduler_guard_deref_mut = symbol("scheduler guard mutable dereference", &|name| {
-        name == "<deepwyrm_kernel::sync::irq::IrqSpinMutexGuard<deepwyrm_kernel::task::scheduler::SchedulerState<2>> as core::ops::deref::DerefMut>::deref_mut"
-    });
-    let scheduler_guard_deref = symbol("scheduler guard shared dereference", &|name| {
-        name == "<deepwyrm_kernel::sync::irq::IrqSpinMutexGuard<deepwyrm_kernel::task::scheduler::SchedulerState<2>> as core::ops::deref::Deref>::deref"
-    });
 
     let mut resolutions = BTreeMap::new();
     resolutions.insert(first_run.clone(), vec![fresh_handler]);
     resolutions.insert(dispatch_bound, vec![trampoline]);
+    resolutions.insert(rendezvous_reaper, vec![rendezvous_reaper_handler]);
+    resolutions.insert(send_live_ipi, vec![live_ipi_transport_send]);
     resolutions.insert(atomic_wait_begin, vec![register_wait_deadline]);
     resolutions.insert(cancel_atomic_wait_deadline, vec![cancel_live_wait_deadline]);
-    resolutions.insert(scheduler_prepare_block, vec![scheduler_guard_deref]);
-    resolutions.insert(scheduler_commit_block, vec![scheduler_guard_deref_mut; 2]);
     let graph = DirectCallGraph::new(sizes, disassembly);
     let mut resolved = graph.with_resolutions(&resolutions);
     let fresh = resolved.stack_bound("F9 fresh-thread path", |name| name == first_run);
     let syscall = resolved.stack_bound("F9 syscall dispatch path", |name| name == syscall_dispatch);
     let terminal = resolved.stack_bound("F9 terminal-reaper path", |name| {
-        name.contains("native_runtime_terminal_reaper::<") && name.contains("F9Runtime<")
+        name.contains("native_runtime_terminal_reaper::<")
+            && name.contains("F9Runtime<")
+            && !name.contains("::{closure")
     });
-    let setup = graph.stack_bound("F9 selector setup", |name| {
+    let setup = resolved.stack_bound("F9 selector setup", |name| {
         name.contains("f9::enter_f9::<") && !name.contains("::{closure")
     });
 

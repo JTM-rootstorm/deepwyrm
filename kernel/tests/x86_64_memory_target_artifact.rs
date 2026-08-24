@@ -62,6 +62,7 @@ fn production_and_six_memory_selector_artifacts_are_separated() {
     let build_tools_identity = fs::read_to_string(workspace.join("tooling/build-tools.toml"))
         .expect("read trusted build-tools identity");
     validate_accepted_identities(
+        &workspace,
         &toolchain_identity,
         &build_tools_identity,
         AcceptedToolPaths {
@@ -277,6 +278,7 @@ fn production_and_six_memory_selector_artifacts_are_separated() {
         "build-relevant source/configuration changed during the isolated builds"
     );
     validate_accepted_identities(
+        &workspace,
         &toolchain_identity,
         &build_tools_identity,
         AcceptedToolPaths {
@@ -329,6 +331,7 @@ fn e7_task_smoke_artifact_is_freestanding_and_separated() {
     let build_tools_identity = fs::read_to_string(workspace.join("tooling/build-tools.toml"))
         .expect("read trusted build-tools identity");
     validate_accepted_identities(
+        &workspace,
         &toolchain_identity,
         &build_tools_identity,
         AcceptedToolPaths {
@@ -500,6 +503,7 @@ fn e7_task_smoke_artifact_is_freestanding_and_separated() {
         "build-relevant source/configuration changed during E7 artifact builds"
     );
     validate_accepted_identities(
+        &workspace,
         &toolchain_identity,
         &build_tools_identity,
         AcceptedToolPaths {
@@ -549,6 +553,7 @@ fn implemented_f_and_g5_selector_artifacts_are_freestanding_and_separated() {
     let build_tools_identity = fs::read_to_string(workspace.join("tooling/build-tools.toml"))
         .expect("read trusted build-tools identity");
     validate_accepted_identities(
+        &workspace,
         &toolchain_identity,
         &build_tools_identity,
         AcceptedToolPaths {
@@ -896,6 +901,7 @@ fn implemented_f_and_g5_selector_artifacts_are_freestanding_and_separated() {
         "build-relevant source/configuration changed during F12 artifact builds"
     );
     validate_accepted_identities(
+        &workspace,
         &toolchain_identity,
         &build_tools_identity,
         AcceptedToolPaths {

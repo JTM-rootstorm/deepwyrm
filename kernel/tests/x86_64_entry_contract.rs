@@ -138,12 +138,12 @@ fn task_layout_manifest_is_kernel_private_exact_and_fails_closed_on_drift() {
     assert_eq!(layout.privilege_entry_stack_guard_size, 4_096);
     assert_eq!(layout.privilege_entry_stack_alignment, 4_096);
     assert_eq!(layout.terminal_reaper_stack_count, 1);
-    assert_eq!(layout.terminal_reaper_stack_size, 131_072);
+    assert_eq!(layout.terminal_reaper_stack_size, 135_168);
     assert_eq!(layout.terminal_reaper_stack_guard_size, 4_096);
     assert_eq!(layout.terminal_reaper_stack_alignment, 4_096);
     for malformed in [
         format!("{source}\nunknown_task_layout_key = 1\n"),
-        source.replace("version = 3", "version = 2"),
+        source.replace("version = 4", "version = 3"),
         source.replace(
             "thread_kernel_stack_count = 16",
             "thread_kernel_stack_count = 8",
@@ -169,7 +169,7 @@ fn task_layout_manifest_is_kernel_private_exact_and_fails_closed_on_drift() {
             "terminal_reaper_stack_count = 2",
         ),
         source.replace(
-            "terminal_reaper_stack_size = 131072",
+            "terminal_reaper_stack_size = 135168",
             "terminal_reaper_stack_size = 65536",
         ),
         source.replace(
@@ -375,17 +375,15 @@ fn production_entry_dispatches_primordial_runtime_and_keeps_test_hooks_feature_g
     let kernel = fs::read_to_string(kernel_root().join("src/lib.rs")).expect("read kernel root");
     assert!(kernel.contains("#[cfg(feature = \"test-support\")]\npub mod test_support;"));
 
-    for marker in [
-        "match test_support::BUILD_GUEST_TEST",
-        "test_support::run_memory_guest_test(active_paging)",
-    ] {
-        let position = kernel.find(marker).expect("test-support hook exists");
-        let prefix = &kernel[position.saturating_sub(160)..position];
-        assert!(
-            prefix.contains("#[cfg(feature = \"test-support\")]"),
-            "production-visible guest hook lacked a local test-support gate: {marker}"
-        );
-    }
+    let gated_start = kernel
+        .find("#[cfg(feature = \"test-support\")]\n        match test_support::BUILD_GUEST_TEST")
+        .expect("test-support dispatcher has its local feature gate");
+    let production_start = kernel[gated_start..]
+        .find("#[cfg(not(feature = \"test-support\"))]\n        active_paging.run_primordial")
+        .map(|offset| gated_start + offset)
+        .expect("production primordial dispatcher follows the test-only dispatcher");
+    let gated_dispatch = &kernel[gated_start..production_start];
+    assert!(gated_dispatch.contains("test_support::run_memory_guest_test(active_paging)"));
     assert!(kernel.contains(
         "#[cfg(not(feature = \"test-support\"))]\n        active_paging.run_primordial(primordial_modules)"
     ));

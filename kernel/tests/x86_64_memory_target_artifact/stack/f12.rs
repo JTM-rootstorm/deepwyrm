@@ -29,6 +29,7 @@ pub(crate) fn validate_f12_stack_context_evidence(
         "dw_x86_64_switch_kernel_context",
         "F12Runtime",
         "F12DeadlineWakeTarget",
+        "FServiceState",
     ] {
         assert!(
             symbols.contains(required),
@@ -51,10 +52,14 @@ pub(crate) fn validate_f12_stack_context_evidence(
         one_stack_symbol(sizes, description, predicate)
     };
     let fresh_handler = symbol("F12 fresh handler", &|name| {
-        name.contains("native_runtime_fresh_thread::<") && name.contains("F12Runtime<")
+        name.contains("native_runtime_fresh_thread::<")
+            && name.contains("F12Runtime<")
+            && !name.contains("::{closure")
     });
     let trampoline = symbol("F12 runtime trampoline", &|name| {
-        name.contains("native_runtime_trampoline::<") && name.contains("F12Runtime<")
+        name.contains("native_runtime_trampoline::<")
+            && name.contains("F12Runtime<")
+            && !name.contains("::{closure")
     });
     let first_run = symbol("x86 first-run entry", &|name| {
         name == "dw_x86_64_first_run_thread_entry"
@@ -68,20 +73,38 @@ pub(crate) fn validate_f12_stack_context_evidence(
     let timer_dispatch = symbol("x86 timer dispatcher", &|name| {
         name == "dw_x86_64_timer_interrupt_dispatch"
     });
+    let rendezvous_reaper = symbol("x86 rendezvous reaper", &|name| {
+        name == "dw_x86_64_rendezvous_reaper"
+    });
+    let rendezvous_reaper_handler = symbol("F12 rendezvous reaper handler", &|name| {
+        name.contains("native_runtime_rendezvous_reaper::<")
+            && name.contains("F12Runtime<")
+            && !name.contains("::{closure")
+    });
+    let send_live_ipi = symbol("live IPI send boundary", &|name| {
+        name.ends_with("arch::x86_64::ipi::send_live_ipi")
+    });
+    let live_ipi_transport_send = symbol("stationary live IPI transport", &|name| {
+        name.contains("arch::x86_64::ipi::transport_send::<")
+            && name.contains("StationaryLiveIpiTransport")
+            && !name.contains("::{closure")
+    });
     let deadline_wake = symbol("F12 deadline wake trampoline", &|name| {
-        name.contains("time::live::wake_trampoline::<") && name.contains("F12DeadlineWakeTarget")
+        name.contains("time::live::wake_trampoline::<")
+            && name.contains("F12DeadlineWakeTarget")
+            && !name.contains("::{closure")
     });
     let timer_halt = symbol("timer fail-stop", &|name| {
         name.ends_with("time::live::halt_forever")
     });
     let wait_begin = symbol("F12 registered-wait transaction", &|name| {
         name.contains("wait::engine::begin_registered_wait::<")
-            && name.contains("OwnedLiveUserOutput")
+            && name.contains("OwnedLiveUserOutput, 24, 1, 2, 2, 16, 1, 1, 2, 2, 4, 2>")
             && !name.contains("::{closure")
     });
     let atomic_wait_begin = symbol("F12 atomic-wait transaction", &|name| {
         name.starts_with("deepwyrm_kernel::atomic_wait::begin_atomic_wait::<")
-            && name.contains("OwnedLiveAtomicU32")
+            && name.contains("OwnedLiveAtomicU32, 1, 2, 2, 16, 4, 2,")
             // The transaction's generic load argument is itself a closure, so
             // filtering every name containing `::{closure` would also reject
             // the outer monomorph. Its emitted helper closures end in `}`,
@@ -126,21 +149,11 @@ pub(crate) fn validate_f12_stack_context_evidence(
             "time::live::LiveTimerDeadlineAuthority as deepwyrm_kernel::time::timer::TimerDeadlineAuthority>::cancel_timer_deadline",
         )
     });
-    let scheduler_prepare_block = symbol("F12 scheduler block preparation", &|name| {
-        name == "<deepwyrm_kernel::task::scheduler::CooperativeScheduler<2>>::prepare_block_current"
-    });
-    let scheduler_commit_block = symbol("F12 scheduler block commit", &|name| {
-        name == "<deepwyrm_kernel::task::scheduler::CooperativeScheduler<2>>::commit_block"
-    });
-    let scheduler_guard_deref_mut = symbol("scheduler guard mutable dereference", &|name| {
-        name == "<deepwyrm_kernel::sync::irq::IrqSpinMutexGuard<deepwyrm_kernel::task::scheduler::SchedulerState<2>> as core::ops::deref::DerefMut>::deref_mut"
-    });
-    let scheduler_guard_deref = symbol("scheduler guard shared dereference", &|name| {
-        name == "<deepwyrm_kernel::sync::irq::IrqSpinMutexGuard<deepwyrm_kernel::task::scheduler::SchedulerState<2>> as core::ops::deref::Deref>::deref"
-    });
     let mut runtime_resolutions = BTreeMap::new();
     runtime_resolutions.insert(first_run.clone(), vec![fresh_handler]);
     runtime_resolutions.insert(dispatch_bound, vec![trampoline.clone()]);
+    runtime_resolutions.insert(rendezvous_reaper, vec![rendezvous_reaper_handler]);
+    runtime_resolutions.insert(send_live_ipi, vec![live_ipi_transport_send]);
     // Selector 13 constructs only `LiveWaitDeadlineAuthority` at every F
     // service call site. The erased deadline call in the monomorphized wait
     // transaction therefore has this one emitted target.
@@ -159,15 +172,6 @@ pub(crate) fn validate_f12_stack_context_evidence(
     runtime_resolutions.insert(timer_set_locked.clone(), vec![replace_live_timer_deadline]);
     runtime_resolutions.insert(timer_cancel, vec![cancel_live_timer_deadline.clone()]);
     runtime_resolutions.insert(timer_finalization, vec![cancel_live_timer_deadline]);
-    // Debug codegen spills these two statically typed guard-method addresses
-    // through local stack words before calling them. The closed source type is
-    // `IrqSpinMutexGuard<SchedulerState<2>>`; no trait object or alternate
-    // runtime implementation participates in this monomorph.
-    runtime_resolutions.insert(scheduler_prepare_block, vec![scheduler_guard_deref]);
-    runtime_resolutions.insert(
-        scheduler_commit_block,
-        vec![scheduler_guard_deref_mut.clone(); 2],
-    );
     let graph = DirectCallGraph::new(sizes, disassembly);
     assert!(
         graph.reaches(
@@ -182,15 +186,22 @@ pub(crate) fn validate_f12_stack_context_evidence(
     let syscall =
         runtime_graph.stack_bound("F12 syscall dispatch path", |name| name == syscall_dispatch);
     let terminal = runtime_graph.stack_bound("F12 terminal-reaper path", |name| {
-        name.contains("native_runtime_terminal_reaper::<") && name.contains("F12Runtime<")
+        name.contains("native_runtime_terminal_reaper::<")
+            && name.contains("F12Runtime<")
+            && !name.contains("::{closure")
     });
     assert!(
         graph.reaches(
             "F12 runtime dispatch",
             |name| name == trampoline,
-            |name| name.contains("FServiceState<") && name.contains(">>::dispatch::<"),
+            |name| {
+                name.contains("F12Runtime<")
+                    && name.ends_with(
+                        " as deepwyrm_kernel::syscall::native::NativeSyscallHandler>::handle",
+                    )
+            },
         ),
-        "F12 syscall graph does not reach FService dispatch"
+        "F12 syscall graph does not reach its concrete FService-owning runtime handler"
     );
 
     // Immutable call slots are resolved from the accepted ELF before this
@@ -198,14 +209,14 @@ pub(crate) fn validate_f12_stack_context_evidence(
     // deadline target and the unreachable Timer-expiry target. No typed F12
     // Timer-expiry trampoline is emitted, so the latter is charged as its
     // fail-stop path instead of being waived.
-    let mut timer_resolutions = BTreeMap::new();
+    let mut timer_resolutions = runtime_resolutions.clone();
     timer_resolutions.insert(timer_dispatch.clone(), vec![deadline_wake, timer_halt]);
     let timer = graph
         .with_resolutions(&timer_resolutions)
         .stack_bound("F12 APIC timer interrupt path", |name| {
             name == timer_dispatch
         });
-    let setup = graph.stack_bound("F12 selector setup", |name| {
+    let setup = runtime_graph.stack_bound("F12 selector setup", |name| {
         name.contains("f12::enter_f12::<") && !name.contains("::{closure")
     });
 
