@@ -314,15 +314,21 @@ impl G5PrimordialProbe {
             return self.terminal_application_code;
         }
         match completion {
-            Err(crate::boot::primordial::construction::PrimordialCompletionError::Receive(_)) => 2,
+            Err(crate::boot::primordial::construction::PrimordialCompletionError::Receive(
+                detail,
+            )) => *detail,
             Err(crate::boot::primordial::construction::PrimordialCompletionError::MalformedReady) => 3,
-            Err(crate::boot::primordial::construction::PrimordialCompletionError::ObserveExit(_)) => 4,
+            Err(crate::boot::primordial::construction::PrimordialCompletionError::ObserveExit(
+                detail,
+            )) => *detail,
             Err(crate::boot::primordial::construction::PrimordialCompletionError::NonzeroExit(
                 code,
             )) => *code,
             Err(crate::boot::primordial::construction::PrimordialCompletionError::UnhandledException) => 5,
             Err(crate::boot::primordial::construction::PrimordialCompletionError::AuthorizedTermination) => 6,
-            Err(crate::boot::primordial::construction::PrimordialCompletionError::NotQuiescent(_)) => 7,
+            Err(crate::boot::primordial::construction::PrimordialCompletionError::NotQuiescent(
+                detail,
+            )) => *detail,
             Ok(()) => 1,
         }
     }
@@ -2012,7 +2018,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok(())
     }
 
-    fn finish_terminal_teardown(&mut self) -> Result<(), ()> {
+    fn finish_terminal_teardown(&mut self) -> Result<(), u32> {
         if !self.service_state_is_quiescent()
             || self.shared.execution.scheduler_state(self.thread).is_some()
             || self
@@ -2021,24 +2027,25 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .blocked_operations()
                 .has_thread(self.thread)
         {
-            return Err(());
+            return Err(0x7000_0001);
         }
         let proof = self
             .tasks
             .process_quiescence_proof(self.process)
-            .map_err(|_| ())?;
+            .map_err(|_| 0x7000_0002)?;
         let drained = self
             .shared
             .execution
             .blocked_operations_drained(&self.tasks, &proof)
-            .map_err(|_| ())?;
+            .map_err(|_| 0x7000_0003)?;
         let address_space = self
             .regions
             .region(self.root_key)
-            .map_err(|_| ())?
+            .map_err(|_| 0x7000_0004)?
             .address_space_key();
         if self.process == self.primordial_process {
-            self.unmap_primordial_userspace(&proof)?;
+            self.unmap_primordial_userspace(&proof)
+                .map_err(|_| 0x7000_0005)?;
         } else {
             // The terminal child remains the physically active root when no
             // successor is runnable. Move the unique residency token to the
@@ -2053,7 +2060,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     self.primordial_process,
                     self.primordial_address_space,
                 )
-                .map_err(|_| ())?;
+                .map_err(|_| 0x7000_0006)?;
             let previous = Some(self.active_root.take_process());
             let selected = match self
                 .active
@@ -2070,17 +2077,18 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     self.active_root = CarrierActiveRoot::Process(previous.unwrap_or_else(|| {
                         panic!("runtime carrier lost its Process root during activation rollback")
                     }));
-                    return Err(());
+                    return Err(0x7000_0007);
                 }
             };
             self.active_root = CarrierActiveRoot::Process(selected);
-            self.unmap_inactive_userspace(self.process, self.root_key, &proof)?;
+            self.unmap_inactive_userspace(self.process, self.root_key, &proof)
+                .map_err(|_| 0x7000_0008)?;
             self.active
                 .teardown_empty_child_address_space(self.process, address_space)
-                .map_err(|_| ())?;
+                .map_err(|_| 0x7000_0009)?;
         }
         if self.memory.active_lease_count() != 0 {
-            return Err(());
+            return Err(0x7000_000a);
         }
         let root_pin = self
             .regions
@@ -2091,11 +2099,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 self.shared.execution.blocked_operations(),
                 drained,
             )
-            .map_err(|_| ())?;
-        self.cleanup
-            .push_optional(self.registry.release_internal(root_pin).map_err(|_| ())?);
-        self.release_terminal_authority()?;
-        self.drain_finalizers()?;
+            .map_err(|_| 0x7000_000b)?;
+        self.cleanup.push_optional(
+            self.registry
+                .release_internal(root_pin)
+                .map_err(|_| 0x7000_000c)?,
+        );
+        self.release_terminal_authority().map_err(|_| 0x7000_000d)?;
+        self.drain_finalizers().map_err(|_| 0x7000_000e)?;
         let trailing = core::mem::replace(&mut self.cleanup, CleanupQueue::new());
         if self.memory.active_lease_count() != 0
             || self.tasks.process_info(self.process).is_ok()
@@ -2108,38 +2119,41 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .next()
                 .is_some()
         {
-            return Err(());
+            return Err(0x7000_000f);
         }
-        self.prove_registry_capacity()
+        self.prove_registry_capacity().map_err(|_| 0x7000_0010)
     }
 }
 
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialCompletionBackend
     for PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
-    type Error = ();
+    type Error = u32;
 
     fn receive_ready(&mut self, output: &mut [u8; 40]) -> Result<usize, Self::Error> {
         let (bytes, wakes) = self
             .shared
             .channels
             .receive_into(self.channel_keys[0], output, &self.shared.waits)
-            .map_err(|_| ())?;
+            .map_err(|_| 0x7100_0001)?;
         let (wake_intents, pins) = wakes.into_parts();
         if wake_intents.into_iter().flatten().next().is_some()
             || pins.into_iter().flatten().next().is_some()
         {
-            return Err(());
+            return Err(0x7100_0002);
         }
         Ok(bytes)
     }
 
     fn observe_exit(&mut self) -> Result<PrimordialExitDisposition, Self::Error> {
-        let info = self.tasks.process_info(self.process).map_err(|_| ())?;
+        let info = self
+            .tasks
+            .process_info(self.process)
+            .map_err(|_| 0x7200_0001)?;
         #[cfg(feature = "test-support")]
         self.g5_probe.observe_terminal(info);
         if info.state != DW_TASK_STATE_EXITED {
-            return Err(());
+            return Err(0x7200_0002);
         }
         if info.reason == DW_TERMINATION_NORMAL_EXIT {
             Ok(PrimordialExitDisposition::Normal(info.application_code))
