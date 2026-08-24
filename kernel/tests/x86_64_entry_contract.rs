@@ -424,8 +424,13 @@ fn g3_primordial_mapping_failures_remain_recoverable_and_rollback_owned_candidat
     assert!(primordial.contains("cancel_zeroed(failure.into_grant())"));
     assert!(user_access.contains("cancel_zeroed(failure.into_grant())"));
     assert!(primordial.contains(
-        "const PRIMORDIAL_MAX_MAPPING_PAGES: usize = (STACK_BYTES / PAGE_SIZE) as usize;"
+        "#[cfg(not(deepwyrm_i2_stress))]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = (STACK_BYTES / PAGE_SIZE) as usize;"
     ));
+    assert!(
+        primordial.contains(
+            "#[cfg(deepwyrm_i2_stress)]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 32;"
+        )
+    );
     assert!(primordial.contains("PRIMORDIAL_MAX_MAPPING_PAGES + PRIMORDIAL_TABLE_CANDIDATES"));
     assert!(primordial.contains("PRIMORDIAL_INVALIDATIONS: usize = PRIMORDIAL_MAX_MAPPING_PAGES"));
 }

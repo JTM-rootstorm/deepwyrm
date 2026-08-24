@@ -112,11 +112,16 @@ const EVENTS: usize = 2;
 const TIMERS: usize = 1;
 #[cfg(deepwyrm_i2_stress)]
 const TIMERS: usize = 2;
-// A bounded 16-page mapping can cross one boundary at each non-root level.
-// Keep two candidates for PDPT, PD, and PT creation so the live publisher can
-// construct both paths without depending on where the requested range lands.
+// A bounded mapping can cross one boundary at each non-root level. Keep two
+// candidates for PDPT, PD, and PT creation so the live publisher can construct
+// both paths without depending on where the requested range lands. The I2
+// bootfs carries the selector-specific controller and therefore needs a
+// bounded 32-page window; ordinary images retain the original 16-page limit.
 const PRIMORDIAL_TABLE_CANDIDATES: usize = 6;
+#[cfg(not(deepwyrm_i2_stress))]
 const PRIMORDIAL_MAX_MAPPING_PAGES: usize = (STACK_BYTES / PAGE_SIZE) as usize;
+#[cfg(deepwyrm_i2_stress)]
+const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 32;
 const PRIMORDIAL_JOURNAL_ENTRIES: usize =
     PRIMORDIAL_MAX_MAPPING_PAGES + PRIMORDIAL_TABLE_CANDIDATES;
 const PRIMORDIAL_INVALIDATIONS: usize = PRIMORDIAL_MAX_MAPPING_PAGES;

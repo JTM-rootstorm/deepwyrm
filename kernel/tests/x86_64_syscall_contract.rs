@@ -605,6 +605,11 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
             "#[cfg(not(deepwyrm_i2_stress))]\nconst USERSPACE_CHAIN_PROCESSES: usize = 3;"
         )
     );
+    assert!(
+        runtime.contains(
+            "#[cfg(deepwyrm_i2_stress)]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 32;"
+        )
+    );
 }
 
 #[test]
