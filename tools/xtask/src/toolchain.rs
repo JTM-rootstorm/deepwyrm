@@ -5,6 +5,12 @@ pub(super) fn validate_toolchain_provenance(
 ) -> io::Result<TrustedToolchain> {
     let mut trusted = load_trusted_toolchain(&workspace_root().join(TRUSTED_TOOLCHAIN_CONFIG))?;
     validate_request_toolchain_identity(request, &trusted)?;
+    verify_trusted_artifact(
+        &trusted.config_path,
+        &trusted.config_sha256,
+        "accepted toolchain request",
+        64 * 1024,
+    )?;
     let root_manifest = read_bounded(&trusted.root_manifest_path, "root manifest", 64 * 1024)?;
     verify_artifact_bytes(
         &root_manifest,
@@ -176,7 +182,7 @@ pub(super) fn load_trusted_toolchain(path: &Path) -> io::Result<TrustedToolchain
     if values.get("schema").map(String::as_str) != Some("deepwyrm-rust-toolchain-identity-v1") {
         return invalid_input("trusted toolchain config has an unknown schema".into());
     }
-    if values.get("request_id").map(String::as_str) != Some("RUST-PHASE0B-TOOLCHAIN-001") {
+    if values.get("request_id").map(String::as_str) != Some("RUST-WYR0-I-B-SYSROOTS-007") {
         return invalid_input("trusted toolchain config has an unexpected request ID".into());
     }
     if values.get("toolchain_tree_recipe").map(String::as_str)
@@ -207,6 +213,10 @@ pub(super) fn load_trusted_toolchain(path: &Path) -> io::Result<TrustedToolchain
         request_id: required_string(&values, "request_id")?,
         rust_commit,
         target,
+        config_path: workspace_root()
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "workspace lacks a parent"))?
+            .join(required_relative_path(&values, "config")?),
         config_sha256: required_sha256(&values, "config_sha256")?,
         artifact_root: artifact_root.clone(),
         toolchain_root: toolchain_root.clone(),
@@ -230,7 +240,7 @@ pub(super) fn load_trusted_toolchain(path: &Path) -> io::Result<TrustedToolchain
             path: toolchain_root.join(required_relative_path(&values, "llvm_internal_library")?),
             sha256: required_sha256(&values, "llvm_internal_library_sha256")?,
         },
-        sysroot_manifest_path: artifact_root
+        sysroot_manifest_path: workspace_root()
             .join(required_relative_path(&values, "sysroot_manifest")?),
         sysroot_manifest_sha256: required_sha256(&values, "sysroot_manifest_sha256")?,
         freestanding_core: None,
@@ -456,14 +466,10 @@ pub(super) fn bind_freestanding_artifacts(
 ) -> io::Result<()> {
     let text = std::str::from_utf8(root_manifest)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "root manifest is not UTF-8"))?;
-    let core = extract_root_manifest_artifact(
-        text,
-        "artifacts.freestanding_core",
-        &trusted.artifact_root,
-    )?;
+    let core = extract_root_manifest_artifact(text, "artifacts.none_core", &trusted.artifact_root)?;
     let builtins = extract_root_manifest_artifact(
         text,
-        "artifacts.freestanding_compiler_builtins",
+        "artifacts.none_compiler_builtins",
         &trusted.artifact_root,
     )?;
     trusted.freestanding_core = Some(core);
@@ -537,11 +543,11 @@ pub(super) fn canonical_rust_commit(path: &Path) -> io::Result<String> {
         }
         let (key, value) = parse_toml_scalar(line)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        if key == "base_commit" {
-            return validate_git_commit(&value, "canonical Rust base_commit");
+        if key == "accepted_commit" {
+            return validate_git_commit(&value, "canonical Rust accepted_commit");
         }
     }
-    invalid_input("canonical toolchain provenance lacks [rust].base_commit".into())
+    invalid_input("canonical toolchain provenance lacks [rust].accepted_commit".into())
 }
 
 pub(super) fn validate_sysroot_manifest(

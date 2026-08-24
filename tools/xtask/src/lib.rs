@@ -258,6 +258,7 @@ struct TrustedToolchain {
     request_id: String,
     rust_commit: String,
     target: String,
+    config_path: PathBuf,
     config_sha256: String,
     artifact_root: PathBuf,
     toolchain_root: PathBuf,

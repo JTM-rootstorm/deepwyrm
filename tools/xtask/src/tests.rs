@@ -431,13 +431,13 @@ fn trusted_toolchain_binds_tree_and_internal_library_identities() {
     let trusted = load_trusted_toolchain(&workspace_root().join(TRUSTED_TOOLCHAIN_CONFIG)).unwrap();
     assert_eq!(
         trusted.toolchain_tree_sha256,
-        "5d4275428555a7cd6ae7decc100456fe31cfa4562a7f5eb81a3cf7fe08aa03a5"
+        "dce57d31def1f509ce537f96ae6b6dd320da11c9f321382cb93d142f558a32ca"
     );
     assert!(
         trusted
             .rustc_driver_internal_library
             .path
-            .ends_with("lib/librustc_driver-7cb6fba0afdc0262.so")
+            .ends_with("lib/librustc_driver-948919618f142f9a.so")
     );
     assert!(
         trusted
