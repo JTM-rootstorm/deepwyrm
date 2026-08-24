@@ -662,6 +662,37 @@ fn i1_runtime_join_keeps_cpu_identity_and_dispatch_release_separate() {
 }
 
 #[test]
+fn i1_ap_and_rendezvous_fresh_entries_bind_the_selected_thread_stack_before_cpl3() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    for (start, end) in [
+        ("fn rendezvous_stop(", "fn complete_remote_stop("),
+        (
+            "fn enter_idle_scheduler(&mut self) -> !",
+            "unsafe fn prepare_suspend",
+        ),
+    ] {
+        let path = primordial
+            .split_once(start)
+            .expect("fresh-entry path")
+            .1
+            .split_once(end)
+            .expect("fresh-entry path extent")
+            .0;
+        let fresh = path
+            .split_once("Entry::Fresh { state, stack }")
+            .expect("fresh-entry branch")
+            .1;
+        let bind = fresh
+            .find("bind_current_thread_stack(stack)")
+            .expect("selected stack binding");
+        let enter = fresh
+            .find("enter_bound_validated_user(&state, stack)")
+            .expect("CPL3 entry");
+        assert!(bind < enter, "fresh CPL3 entry preceded its stack binding");
+    }
+}
+
+#[test]
 fn f2_kernel_context_switch_is_sysv_only_and_separate_from_user_return() {
     let assembly = source("src/arch/x86_64/kernel_context.S");
     for marker in [

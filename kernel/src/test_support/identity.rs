@@ -142,7 +142,6 @@ impl BuildGuestTest {
                 | Self::MemorySharedMemoryObject
         )
     }
-
 }
 
 /// Canonical selector embedded into this test kernel for provenance.

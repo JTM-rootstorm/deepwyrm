@@ -691,7 +691,10 @@ const fn state_has_failure(state: usize) -> bool {
 }
 
 /// The one build-selected collector; no public ABI or production state uses it.
-#[allow(dead_code, reason = "the runtime lane owns the target-side collector hookup")]
+#[allow(
+    dead_code,
+    reason = "the runtime lane owns the target-side collector hookup"
+)]
 pub(crate) static I1_EVIDENCE: EvidenceCollector = EvidenceCollector::new();
 
 fn encode(sequence: u32, slot: &Slot) -> [u8; I1_EVIDENCE_RECORD_LEN] {

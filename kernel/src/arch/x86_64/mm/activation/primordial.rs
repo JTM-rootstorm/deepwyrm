@@ -2396,9 +2396,13 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             runtime.complete_rendezvous_stop(request, reaper)
         };
         match entry {
-            PreparedCarrierEntry::Fresh { state, stack } => unsafe {
-                crate::arch::x86_64::syscall::enter_bound_validated_user(&state, stack)
-            },
+            PreparedCarrierEntry::Fresh { state, stack } => {
+                unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(stack) }
+                    .unwrap_or_else(|error| {
+                        panic!("rendezvous fresh stack binding failed: {error:?}")
+                    });
+                unsafe { crate::arch::x86_64::syscall::enter_bound_validated_user(&state, stack) }
+            }
             PreparedCarrierEntry::Continuation { stack, rsp } => {
                 unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(stack) }
                     .unwrap_or_else(|error| {
@@ -2545,9 +2549,13 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 })
             };
             match entry {
-                Some(Entry::Fresh { state, stack }) => unsafe {
-                    crate::arch::x86_64::syscall::enter_bound_validated_user(&state, stack)
-                },
+                Some(Entry::Fresh { state, stack }) => {
+                    unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(stack) }
+                        .unwrap_or_else(|error| panic!("AP fresh stack binding failed: {error:?}"));
+                    unsafe {
+                        crate::arch::x86_64::syscall::enter_bound_validated_user(&state, stack)
+                    }
+                }
                 Some(Entry::Continuation { stack, rsp }) => {
                     unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(stack) }
                         .unwrap_or_else(|error| {
