@@ -1252,6 +1252,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
+    #[track_caller]
     fn select_cpu(&mut self, cpu: crate::cpu::CpuIndex) {
         self.switch_cpu(cpu);
         self.synchronize_scheduler_current();
@@ -1526,6 +1527,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         STATIONARY_GUARD_DEPTH.assert_clear_on(self.cpu);
     }
 
+    #[track_caller]
     fn synchronize_scheduler_current(&mut self) {
         assert_eq!(self.local.cpu, self.cpu, "BSP carrier storage CPU drifted");
         let thread = self
