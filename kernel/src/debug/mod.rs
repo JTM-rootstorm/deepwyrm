@@ -576,11 +576,26 @@ pub(crate) fn handle_early_panic(info: &PanicInfo<'_>) -> ! {
     // the production halt path below.
     #[cfg(all(feature = "test-support", target_arch = "x86_64"))]
     {
-        crate::test_support::complete_panic(0x5041_4E49);
+        crate::test_support::complete_panic(test_panic_location_detail(info));
     }
 
     #[cfg(not(all(feature = "test-support", target_arch = "x86_64")))]
     halt_after_early_panic()
+}
+
+#[cfg(all(feature = "test-support", target_os = "none", target_arch = "x86_64"))]
+fn test_panic_location_detail(info: &PanicInfo<'_>) -> u32 {
+    let Some(location) = info.location() else {
+        return 0x5041_4e49;
+    };
+    let file_hash = location
+        .file()
+        .as_bytes()
+        .iter()
+        .fold(0x811c_u16, |hash, byte| {
+            hash.wrapping_mul(0x0193) ^ u16::from(*byte)
+        });
+    u32::from(file_hash) << 16 | (location.line() & 0xffff)
 }
 
 /// Terminal x86 panic path when no higher-level scheduler or recovery policy
