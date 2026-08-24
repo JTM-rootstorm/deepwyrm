@@ -421,6 +421,18 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
         Ok((root, binding.identity, binding.address_space))
     }
 
+    /// Returns the exact residency/shootdown domain for one bound Process
+    /// root.  The returned state is stationary while the binding exists; its
+    /// owner may not retire the binding until the associated reclaim barrier
+    /// proves that every resident CPU has acknowledged the mutation.
+    pub(crate) fn coherency_for(
+        &self,
+        process: ProcessKey,
+        address_space: AddressSpaceKey,
+    ) -> Result<&AddressSpaceCoherency<CPUS>, RootBindingError> {
+        Ok(&self.binding(process, address_space)?.coherency)
+    }
+
     pub(crate) fn active_root_for_process<'a>(
         &'a self,
         primordial: &'a PageTableRoot,

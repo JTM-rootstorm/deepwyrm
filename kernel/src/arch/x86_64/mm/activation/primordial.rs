@@ -2834,6 +2834,7 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     });
     let mut facades = core::pin::pin!(facades);
     bind_runtime_carrier_facades(facades.as_mut());
+    user_access::initialize_live_tlb_shootdown();
     let bsp_carrier = unsafe {
         let facade = &mut core::pin::Pin::get_unchecked_mut(facades.as_mut())[0];
         core::pin::Pin::new_unchecked(facade)
@@ -3192,13 +3193,21 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     user.prepare_table_candidate(TableLevel::Pt)
                         .map_err(|_| DW_STATUS_NO_RESOURCES)?,
                 );
-                let mut publisher = user
-                .publisher::<
+                let mut shootdown = user_access::LiveTlbShootdownDriver::current();
+                let (mut publisher, coherency) = user
+                .publisher_with_coherency::<
                     PRIMORDIAL_TABLE_CANDIDATES,
                     PRIMORDIAL_JOURNAL_ENTRIES,
                     PRIMORDIAL_INVALIDATIONS,
                 >(target.address_space, target.region_key, &mut candidates)
                 .map_err(|_| DW_STATUS_BAD_STATE)?;
+                let mut publisher =
+                    crate::memory::address_region::CoherentAddressSpacePublisher::<
+                        _,
+                        _,
+                        { crate::cpu::CPU_CAPACITY },
+                        1_000_000,
+                    >::new(&mut publisher, coherency, &mut shootdown);
                 crate::syscall::address_region_map_prepared_model(
                     prepared,
                     &mut publisher,
@@ -3273,13 +3282,21 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 return DW_STATUS_BAD_STATE;
             }
             let status = {
-                let mut publisher = user
-                .publisher::<
+                let mut shootdown = user_access::LiveTlbShootdownDriver::current();
+                let (mut publisher, coherency) = user
+                .publisher_with_coherency::<
                     PRIMORDIAL_TABLE_CANDIDATES,
                     PRIMORDIAL_JOURNAL_ENTRIES,
                     PRIMORDIAL_INVALIDATIONS,
                 >(target.address_space, target.region_key, &mut candidates)
                 .unwrap_or_else(|_| panic!("primordial unmap publisher unavailable"));
+                let mut publisher =
+                    crate::memory::address_region::CoherentAddressSpacePublisher::<
+                        _,
+                        _,
+                        { crate::cpu::CPU_CAPACITY },
+                        1_000_000,
+                    >::new(&mut publisher, coherency, &mut shootdown);
                 crate::syscall::address_region_unmap_prepared(
                     prepared,
                     &mut publisher,

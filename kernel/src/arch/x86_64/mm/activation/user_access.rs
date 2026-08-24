@@ -8,6 +8,268 @@ use crate::memory::usercopy::{
     OwnedUserOutputAccess, PinnedUserBatchPages, PinnedUserPages, UserPageAccess,
     UserPageBatchAccess, UserPinError, UserPinTracker, UserRangePin, UserRangePinToken,
 };
+use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
+use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
+
+const TLB_MAILBOX_EMPTY: u8 = 0;
+const TLB_MAILBOX_PUBLISHING: u8 = 1;
+const TLB_MAILBOX_PUBLISHED: u8 = 2;
+const TLB_MAILBOX_CONSUMING: u8 = 3;
+
+/// One CPU-private, protocol-owned e2 mailbox.
+///
+/// The sender owns `PUBLISHING` and may only advance it to `PUBLISHED` after
+/// fully writing the exact request and stationary coherency pointer.  The e2
+/// handler owns `CONSUMING`; it copies those fields before local serialization
+/// and never consults the mailbox after returning it to `EMPTY`.
+struct LiveTlbMailbox {
+    state: AtomicU8,
+    coherency: AtomicPtr<
+        crate::memory::address_region::AddressSpaceCoherency<{ crate::cpu::CPU_CAPACITY }>,
+    >,
+    request: UnsafeCell<MaybeUninit<crate::memory::address_region::ShootdownRequest>>,
+}
+
+impl LiveTlbMailbox {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(TLB_MAILBOX_EMPTY),
+            coherency: AtomicPtr::new(core::ptr::null_mut()),
+            request: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+
+    fn publish(
+        &self,
+        coherency: &crate::memory::address_region::AddressSpaceCoherency<
+            { crate::cpu::CPU_CAPACITY },
+        >,
+        request: crate::memory::address_region::ShootdownRequest,
+    ) {
+        self.state
+            .compare_exchange(
+                TLB_MAILBOX_EMPTY,
+                TLB_MAILBOX_PUBLISHING,
+                Ordering::Acquire,
+                Ordering::Acquire,
+            )
+            .unwrap_or_else(|state| {
+                panic!("TLB shootdown target already has an outstanding mailbox: {state}")
+            });
+        // SAFETY: this sender exclusively owns PUBLISHING. The request is
+        // immutable after the following Release publication, and the handler
+        // may read it only after it Acquire-observes PUBLISHED.
+        #[allow(
+            unsafe_code,
+            reason = "the sender exclusively owns PUBLISHING until its Release publication"
+        )]
+        unsafe {
+            (*self.request.get()).write(request);
+        }
+        self.coherency
+            .store(core::ptr::from_ref(coherency).cast_mut(), Ordering::Relaxed);
+        self.state.store(TLB_MAILBOX_PUBLISHED, Ordering::Release);
+    }
+
+    fn cancel_if_published(&self) {
+        let _ = self.state.compare_exchange(
+            TLB_MAILBOX_PUBLISHED,
+            TLB_MAILBOX_EMPTY,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn consume(
+        &self,
+    ) -> Option<(
+        &crate::memory::address_region::AddressSpaceCoherency<{ crate::cpu::CPU_CAPACITY }>,
+        crate::memory::address_region::ShootdownRequest,
+    )> {
+        self.state
+            .compare_exchange(
+                TLB_MAILBOX_PUBLISHED,
+                TLB_MAILBOX_CONSUMING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()?;
+        let coherency = self.coherency.load(Ordering::Relaxed);
+        if coherency.is_null() {
+            panic!("published TLB shootdown mailbox omitted coherency domain");
+        }
+        // SAFETY: the successful AcqRel transition owns the immutable request
+        // after the sender's Release publication. The pointer names the exact
+        // stationary root-binding coherency object; binding teardown remains
+        // gated by the acknowledgement completed below.
+        #[allow(
+            unsafe_code,
+            reason = "the handler exclusively owns CONSUMING after acquire-consuming the sender publication"
+        )]
+        let request = unsafe { (*self.request.get()).assume_init_read() };
+        #[allow(
+            unsafe_code,
+            reason = "the exact stationary coherency pointer is retained by its root binding until acknowledgement-gated reclaim"
+        )]
+        let coherency = unsafe { &*coherency };
+        Some((coherency, request))
+    }
+
+    fn release_after_local_serialization(&self) {
+        self.state
+            .compare_exchange(
+                TLB_MAILBOX_CONSUMING,
+                TLB_MAILBOX_EMPTY,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .unwrap_or_else(|state| {
+                panic!("TLB shootdown mailbox ownership drifted after local flush: {state}")
+            });
+    }
+}
+
+// SAFETY: the request cell is read only by the e2 CPU after acquire-consuming
+// the state publication and before release-clearing its unique mailbox state.
+#[allow(
+    unsafe_code,
+    reason = "mailbox state serializes the UnsafeCell request between one sender and one e2 handler"
+)]
+unsafe impl Sync for LiveTlbMailbox {}
+
+static LIVE_TLB_MAILBOXES: [LiveTlbMailbox; crate::cpu::CPU_CAPACITY] =
+    [const { LiveTlbMailbox::new() }; crate::cpu::CPU_CAPACITY];
+
+/// Bounded e2 adapter for the live address-space publisher.
+///
+/// One runtime mapping transaction owns this value. The runtime's existing
+/// serialization prevents concurrent publishers, while the mailbox state
+/// rejects accidental target overlap rather than overwriting a request.
+pub(crate) struct LiveTlbShootdownDriver {
+    initiating_cpu: crate::cpu::CpuIndex,
+    published_targets: [bool; crate::cpu::CPU_CAPACITY],
+}
+
+impl LiveTlbShootdownDriver {
+    pub(crate) fn current() -> Self {
+        let initiating_cpu = crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
+            .and_then(crate::cpu::CpuIndex::new)
+            .unwrap_or_else(|| panic!("live TLB publication has no current CPU identity"));
+        Self {
+            initiating_cpu,
+            published_targets: [false; crate::cpu::CPU_CAPACITY],
+        }
+    }
+
+    fn mailbox(cpu: crate::cpu::CpuIndex) -> &'static LiveTlbMailbox {
+        LIVE_TLB_MAILBOXES
+            .get(cpu.index())
+            .unwrap_or_else(|| panic!("TLB shootdown CPU is outside the live mailbox bound"))
+    }
+}
+
+impl Drop for LiveTlbShootdownDriver {
+    fn drop(&mut self) {
+        // A successful acknowledgement clears its mailbox before publishing
+        // the ack.  This only recovers a send failure/panic path and never
+        // steals a handler that already owns CONSUMING.
+        for (cpu, published) in self.published_targets.iter().enumerate() {
+            if *published {
+                LIVE_TLB_MAILBOXES[cpu].cancel_if_published();
+            }
+        }
+    }
+}
+
+impl crate::memory::address_region::ShootdownDriver<{ crate::cpu::CPU_CAPACITY }>
+    for LiveTlbShootdownDriver
+{
+    fn initiating_cpu(&self) -> crate::cpu::CpuIndex {
+        self.initiating_cpu
+    }
+
+    fn notify_remote(
+        &mut self,
+        coherency: &crate::memory::address_region::AddressSpaceCoherency<
+            { crate::cpu::CPU_CAPACITY },
+        >,
+        target: crate::cpu::CpuIndex,
+        request: crate::memory::address_region::ShootdownRequest,
+    ) {
+        if self.published_targets[target.index()] {
+            panic!("TLB shootdown publisher attempted a duplicate target notification");
+        }
+        let mailbox = Self::mailbox(target);
+        mailbox.publish(coherency, request);
+        self.published_targets[target.index()] = true;
+        let snapshot = crate::arch::x86_64::smp::live_cpu_registry()
+            .snapshot(target.index())
+            .unwrap_or_else(|error| panic!("TLB target CPU identity unavailable: {error:?}"));
+        crate::arch::x86_64::ipi::send_live_ipi(
+            snapshot.local_apic_id,
+            crate::arch::x86_64::ipi::LiveIpiVector::TlbShootdown,
+        )
+        .unwrap_or_else(|error| panic!("TLB shootdown IPI delivery failed: {error:?}"));
+    }
+
+    fn wait_step(
+        &mut self,
+        _coherency: &crate::memory::address_region::AddressSpaceCoherency<
+            { crate::cpu::CPU_CAPACITY },
+        >,
+    ) {
+        // The initiator holds no IRQ-safe mailbox or address-space lock while
+        // it waits. The target's acknowledgement is the Release event that
+        // lets the model mint its reclaim permit.
+        core::hint::spin_loop();
+    }
+}
+
+/// Installs the e2 receive path after the live APIC transport is available and
+/// before AP runtime carriers can execute userspace mappings.
+pub(crate) fn initialize_live_tlb_shootdown() {
+    crate::arch::x86_64::ipi::bind_live_tlb_shootdown_handler(live_tlb_shootdown_handler)
+        .unwrap_or_else(|error| panic!("could not bind live TLB shootdown handler: {error:?}"));
+}
+
+/// e2 runs after EOI with IF clear. It takes no runtime lock and no scheduler,
+/// usercopy, finalization, or page-table mutation authority.
+fn live_tlb_shootdown_handler() {
+    let cpu = crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
+        .and_then(crate::cpu::CpuIndex::new)
+        .unwrap_or_else(|| panic!("TLB shootdown arrived without CPU identity"));
+    let mailbox = LiveTlbShootdownDriver::mailbox(cpu);
+    let Some((coherency, request)) = mailbox.consume() else {
+        // A stale e2 after a failed sender cannot acknowledge any generation.
+        return;
+    };
+    local_full_tlb_serialization();
+    // Return the mailbox before acknowledgement so the initiator can only
+    // observe completion after a later operation is permitted to reuse this
+    // exact CPU slot. The immutable request/coherency copies above remain
+    // local to this handler.
+    mailbox.release_after_local_serialization();
+    coherency
+        .acknowledge(cpu, request)
+        .unwrap_or_else(|error| panic!("live TLB shootdown acknowledgement drifted: {error:?}"));
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "reloading the current no-PCID CR3 is the bounded local translation serialization required before an e2 acknowledgement"
+)]
+fn local_full_tlb_serialization() {
+    let cr3: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, preserves_flags));
+        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+    }
+}
+
+#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+fn local_full_tlb_serialization() {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LiveUserAccessError {
@@ -798,6 +1060,69 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             )
         }
     }
+
+    /// Splits the disjoint live root-binding and page-table publisher borrows
+    /// for one synchronous coherent mutation. Keeping that split here makes
+    /// the exact residency domain mechanically follow the selected root rather
+    /// than allowing a caller to pair a raw publisher with a different root.
+    #[allow(
+        unsafe_code,
+        reason = "the live session binds authority-issued identities to its exact pin-aware serialized architecture root"
+    )]
+    pub(crate) fn publisher_with_coherency<
+        'publisher,
+        const CANDIDATE_CAPACITY: usize,
+        const ENTRY_CAPACITY: usize,
+        const INVALIDATION_CAPACITY: usize,
+    >(
+        &'publisher mut self,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+        region: crate::memory::address_region::RegionKey,
+        candidates: &'publisher mut [Option<TableCandidateGrant>; CANDIDATE_CAPACITY],
+    ) -> Result<
+        (
+            crate::arch::x86_64::mm::X86AddressSpacePublisher<
+                'publisher,
+                TrackedActiveTarget<'borrow>,
+                RANGE_CAPACITY,
+                ROLE_CAPACITY,
+                CANDIDATE_CAPACITY,
+                ENTRY_CAPACITY,
+                INVALIDATION_CAPACITY,
+            >,
+            &'publisher crate::memory::address_region::AddressSpaceCoherency<
+                { crate::cpu::CPU_CAPACITY },
+            >,
+        ),
+        crate::arch::x86_64::mm::X86AddressSpacePublishError<LiveTrackedTargetError>,
+    > {
+        if address_space != self.address_space {
+            return Err(crate::arch::x86_64::mm::X86AddressSpacePublishError::Identity);
+        }
+        let coherency = self
+            .root_bindings
+            .coherency_for(self.process, address_space)
+            .map_err(|_| crate::arch::x86_64::mm::X86AddressSpacePublishError::Identity)?;
+        let root_pointer = self.root;
+        let identity = self.identity;
+        let roles = &mut *self.roles;
+        let target = &mut self.target;
+        // SAFETY: the immutable coherency borrow is disjoint from the mutable
+        // role/target fields. This session still owns the exact root and its
+        // pin-aware serialized publisher for the complete returned lifetime.
+        let publisher = unsafe {
+            crate::arch::x86_64::mm::X86AddressSpacePublisher::new(
+                address_space,
+                region,
+                &*root_pointer,
+                identity,
+                roles,
+                target,
+                candidates,
+            )
+        }?;
+        Ok((publisher, coherency))
+    }
 }
 
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
@@ -847,5 +1172,68 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> crate::syscall::FA
     fn release_atomic_u32(&mut self, pin: Self::AtomicPin) {
         LiveProcessAddressSpace::release_atomic_u32(self, pin)
             .unwrap_or_else(|_| panic!("live atomic pin release lost its owner"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn e2_mailbox_releases_only_after_local_serialization_before_exact_ack() {
+        let address_space = crate::memory::address_region::AddressSpaceKey::for_test(7, 11);
+        let coherency = crate::memory::address_region::AddressSpaceCoherency::<
+            { crate::cpu::CPU_CAPACITY },
+        >::new(address_space);
+        let cpu = crate::cpu::CpuIndex::new(1).unwrap();
+        let _residency = coherency.enter(cpu).unwrap();
+        let transaction = coherency
+            .prepare_mutation(
+                crate::memory::address_region::MappingMutation::Protect,
+                crate::memory::address_region::InvalidationScope::pages(0x4000, 0x1000).unwrap(),
+            )
+            .unwrap();
+        let barrier = transaction.publish();
+        let request = barrier.request();
+        let mailbox = LiveTlbMailbox::new();
+
+        mailbox.publish(&coherency, request);
+        let (received_coherency, received_request) = mailbox.consume().unwrap();
+        assert_eq!(received_request, request);
+        assert_eq!(
+            received_coherency.request_for_cpu(cpu),
+            Some(request),
+            "the e2 target still has a pending exact generation before acknowledgement"
+        );
+        mailbox.release_after_local_serialization();
+        received_coherency
+            .acknowledge(cpu, received_request)
+            .unwrap();
+        assert!(barrier.try_complete().is_ok());
+        assert_eq!(mailbox.state.load(Ordering::Acquire), TLB_MAILBOX_EMPTY);
+    }
+
+    #[test]
+    fn e2_mailbox_rejects_overlapping_target_publication() {
+        let address_space = crate::memory::address_region::AddressSpaceKey::for_test(9, 13);
+        let coherency = crate::memory::address_region::AddressSpaceCoherency::<
+            { crate::cpu::CPU_CAPACITY },
+        >::new(address_space);
+        let cpu = crate::cpu::CpuIndex::new(1).unwrap();
+        let _residency = coherency.enter(cpu).unwrap();
+        let transaction = coherency
+            .prepare_mutation(
+                crate::memory::address_region::MappingMutation::Map,
+                crate::memory::address_region::InvalidationScope::pages(0x5000, 0x1000).unwrap(),
+            )
+            .unwrap();
+        let barrier = transaction.publish();
+        let mailbox = LiveTlbMailbox::new();
+        mailbox.publish(&coherency, barrier.request());
+        let overlap = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mailbox.publish(&coherency, barrier.request());
+        }));
+        assert!(overlap.is_err());
+        mailbox.cancel_if_published();
     }
 }
