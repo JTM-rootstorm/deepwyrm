@@ -279,7 +279,7 @@ impl G5PrimordialProbe {
         &self,
         completion: &Result<
             (),
-            crate::boot::primordial::construction::PrimordialCompletionError<()>,
+            crate::boot::primordial::construction::PrimordialCompletionError<u32>,
         >,
     ) -> bool {
         use crate::boot::primordial::construction::PrimordialCompletionError;
@@ -307,7 +307,7 @@ impl G5PrimordialProbe {
         &self,
         completion: &Result<
             (),
-            crate::boot::primordial::construction::PrimordialCompletionError<()>,
+            crate::boot::primordial::construction::PrimordialCompletionError<u32>,
         >,
     ) -> u32 {
         if self.terminal_application_code != 0 {
@@ -2027,25 +2027,25 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .blocked_operations()
                 .has_thread(self.thread)
         {
-            return Err(0x7000_0001);
+            return Err(0x7000_0001_u32);
         }
         let proof = self
             .tasks
             .process_quiescence_proof(self.process)
-            .map_err(|_| 0x7000_0002)?;
+            .map_err(|_| 0x7000_0002_u32)?;
         let drained = self
             .shared
             .execution
             .blocked_operations_drained(&self.tasks, &proof)
-            .map_err(|_| 0x7000_0003)?;
+            .map_err(|_| 0x7000_0003_u32)?;
         let address_space = self
             .regions
             .region(self.root_key)
-            .map_err(|_| 0x7000_0004)?
+            .map_err(|_| 0x7000_0004_u32)?
             .address_space_key();
         if self.process == self.primordial_process {
             self.unmap_primordial_userspace(&proof)
-                .map_err(|_| 0x7000_0005)?;
+                .map_err(|_| 0x7000_0005_u32)?;
         } else {
             // The terminal child remains the physically active root when no
             // successor is runnable. Move the unique residency token to the
@@ -2060,7 +2060,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     self.primordial_process,
                     self.primordial_address_space,
                 )
-                .map_err(|_| 0x7000_0006)?;
+                .map_err(|_| 0x7000_0006_u32)?;
             let previous = Some(self.active_root.take_process());
             let selected = match self
                 .active
@@ -2077,18 +2077,18 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     self.active_root = CarrierActiveRoot::Process(previous.unwrap_or_else(|| {
                         panic!("runtime carrier lost its Process root during activation rollback")
                     }));
-                    return Err(0x7000_0007);
+                    return Err(0x7000_0007_u32);
                 }
             };
             self.active_root = CarrierActiveRoot::Process(selected);
             self.unmap_inactive_userspace(self.process, self.root_key, &proof)
-                .map_err(|_| 0x7000_0008)?;
+                .map_err(|_| 0x7000_0008_u32)?;
             self.active
                 .teardown_empty_child_address_space(self.process, address_space)
-                .map_err(|_| 0x7000_0009)?;
+                .map_err(|_| 0x7000_0009_u32)?;
         }
         if self.memory.active_lease_count() != 0 {
-            return Err(0x7000_000a);
+            return Err(0x7000_000a_u32);
         }
         let root_pin = self
             .regions
@@ -2099,14 +2099,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 self.shared.execution.blocked_operations(),
                 drained,
             )
-            .map_err(|_| 0x7000_000b)?;
+            .map_err(|_| 0x7000_000b_u32)?;
         self.cleanup.push_optional(
             self.registry
                 .release_internal(root_pin)
-                .map_err(|_| 0x7000_000c)?,
+                .map_err(|_| 0x7000_000c_u32)?,
         );
-        self.release_terminal_authority().map_err(|_| 0x7000_000d)?;
-        self.drain_finalizers().map_err(|_| 0x7000_000e)?;
+        self.release_terminal_authority()
+            .map_err(|_| 0x7000_000d_u32)?;
+        self.drain_finalizers().map_err(|_| 0x7000_000e_u32)?;
         let trailing = core::mem::replace(&mut self.cleanup, CleanupQueue::new());
         if self.memory.active_lease_count() != 0
             || self.tasks.process_info(self.process).is_ok()
@@ -2119,9 +2120,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .next()
                 .is_some()
         {
-            return Err(0x7000_000f);
+            return Err(0x7000_000f_u32);
         }
-        self.prove_registry_capacity().map_err(|_| 0x7000_0010)
+        self.prove_registry_capacity().map_err(|_| 0x7000_0010_u32)
     }
 }
 
@@ -2135,12 +2136,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialCompleti
             .shared
             .channels
             .receive_into(self.channel_keys[0], output, &self.shared.waits)
-            .map_err(|_| 0x7100_0001)?;
+            .map_err(|_| 0x7100_0001_u32)?;
         let (wake_intents, pins) = wakes.into_parts();
         if wake_intents.into_iter().flatten().next().is_some()
             || pins.into_iter().flatten().next().is_some()
         {
-            return Err(0x7100_0002);
+            return Err(0x7100_0002_u32);
         }
         Ok(bytes)
     }
@@ -2149,11 +2150,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialCompleti
         let info = self
             .tasks
             .process_info(self.process)
-            .map_err(|_| 0x7200_0001)?;
+            .map_err(|_| 0x7200_0001_u32)?;
         #[cfg(feature = "test-support")]
         self.g5_probe.observe_terminal(info);
         if info.state != DW_TASK_STATE_EXITED {
-            return Err(0x7200_0002);
+            return Err(0x7200_0002_u32);
         }
         if info.reason == DW_TERMINATION_NORMAL_EXIT {
             Ok(PrimordialExitDisposition::Normal(info.application_code))
