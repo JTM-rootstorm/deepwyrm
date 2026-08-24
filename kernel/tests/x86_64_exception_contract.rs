@@ -67,7 +67,7 @@ fn g5_user_faults_and_invalid_returns_share_structured_terminal_reaper_handoff()
     assert!(live.contains("runtime.invalid_return(error);"));
     assert!(live.contains("handoff_to_terminal_reaper::<R>(context)"));
     assert!(live.contains("binding.user_exception_handler"));
-    assert!(primordial.contains("process_unhandled_exception("));
+    assert!(primordial.contains("process_unhandled_exception_on("));
     assert!(primordial.contains("bind_native_runtime_user_exception_handler()"));
     assert!(!primordial.contains("primordial userspace exception:"));
     assert!(!primordial.contains("invalid primordial userspace return:"));
@@ -135,7 +135,7 @@ fn g5_primordial_selectors_have_exact_post_teardown_oracles() {
     }
 
     let terminate = primordial
-        .split_once("fn prepare_terminal_handoff(&mut self) -> u64")
+        .split_once("fn prepare_terminal_handoff(&mut self) -> PreparedTerminalHandoff")
         .expect("primordial terminal handoff")
         .1
         .split_once("fn reserve_runtime_phase")
