@@ -1457,7 +1457,20 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 Ok(kernel) => self.active_root = CarrierActiveRoot::Kernel(kernel),
                 Err((error, recovered)) => {
                     self.active_root = CarrierActiveRoot::Process(recovered);
-                    panic!("terminal idle kernel-root handoff failed: {error:?}");
+                    match error {
+                        super::RootBindingError::CpuMismatch => {
+                            panic!("terminal idle kernel-root handoff used the wrong CPU")
+                        }
+                        super::RootBindingError::RootMismatch => {
+                            panic!("terminal idle kernel-root handoff differed from hardware")
+                        }
+                        super::RootBindingError::Resident
+                        | super::RootBindingError::AlreadyActive
+                        | super::RootBindingError::MutationInFlight => {
+                            panic!("terminal idle kernel-root handoff retained stale residency")
+                        }
+                        _ => panic!("terminal idle kernel-root handoff validation failed"),
+                    }
                 }
             }
             let prepared = self
