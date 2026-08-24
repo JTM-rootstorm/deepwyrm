@@ -910,6 +910,14 @@ struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_
     active_root: Option<super::ActiveRootSelection>,
     active_roots:
         [Option<super::ActiveRootSelection>; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+    cpu_processes: [Option<ProcessKey>; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+    cpu_threads: [Option<ThreadKey>; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+    cpu_stack_ids:
+        [Option<crate::task::KernelStackId>; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+    cpu_context_ids:
+        [Option<crate::task::ThreadContextId>; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+    cpu_root_keys: [Option<crate::memory::address_region::AddressRegionObjectKey>;
+        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
     registry: Registry,
     memory: Memory,
     tasks: Tasks,
@@ -1005,13 +1013,31 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
-    fn select_cpu(&mut self, cpu: crate::cpu::CpuIndex) {
+    fn switch_cpu(&mut self, cpu: crate::cpu::CpuIndex) {
         if self.cpu != cpu {
-            self.active_roots[self.cpu.index()] = self.active_root.take();
+            let previous = self.cpu.index();
+            self.active_roots[previous] = self.active_root.take();
+            self.cpu_processes[previous] = Some(self.process);
+            self.cpu_threads[previous] = Some(self.thread);
+            self.cpu_stack_ids[previous] = Some(self.stack_id);
+            self.cpu_context_ids[previous] = Some(self.context_id);
+            self.cpu_root_keys[previous] = Some(self.root_key);
             self.cpu = cpu;
-            self.active_root = self.active_roots[cpu.index()].take();
+            let current = cpu.index();
+            self.active_root = self.active_roots[current].take();
+            if let Some(process) = self.cpu_processes[current] {
+                self.process = process;
+                self.thread = self.cpu_threads[current].expect("CPU state omitted Thread");
+                self.stack_id = self.cpu_stack_ids[current].expect("CPU state omitted stack");
+                self.context_id = self.cpu_context_ids[current].expect("CPU state omitted context");
+                self.root_key = self.cpu_root_keys[current].expect("CPU state omitted root");
+            }
             self.channel_staging = take_channel_staging_once(cpu.index(), true);
         }
+    }
+
+    fn select_cpu(&mut self, cpu: crate::cpu::CpuIndex) {
+        self.switch_cpu(cpu);
         self.synchronize_scheduler_current();
     }
 
@@ -1821,7 +1847,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
 
     fn terminate_current(&mut self) -> ! {
         let mut runtime = self.runtime.lock();
-        runtime.select_cpu(self.cpu);
+        runtime.switch_cpu(self.cpu);
         runtime.terminate_current()
     }
 
@@ -1913,7 +1939,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     ) -> crate::syscall::native::NativeSuspendPlan<'owner> {
         let mut runtime = self.runtime.lock();
-        runtime.select_cpu(self.cpu);
+        runtime.switch_cpu(self.cpu);
         unsafe { runtime.prepare_suspend_stationary() }
     }
 
@@ -1922,7 +1948,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     ) -> crate::syscall::native::NativeIdleSuspendPoll<'owner> {
         let mut runtime = self.runtime.lock();
-        runtime.select_cpu(self.cpu);
+        runtime.switch_cpu(self.cpu);
         unsafe { runtime.poll_idle_suspend_stationary() }
     }
 
@@ -2064,6 +2090,11 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         active,
         active_root: Some(initial_root),
         active_roots: core::array::from_fn(|_| None),
+        cpu_processes: core::array::from_fn(|_| None),
+        cpu_threads: core::array::from_fn(|_| None),
+        cpu_stack_ids: core::array::from_fn(|_| None),
+        cpu_context_ids: core::array::from_fn(|_| None),
+        cpu_root_keys: core::array::from_fn(|_| None),
         registry,
         memory,
         tasks,
