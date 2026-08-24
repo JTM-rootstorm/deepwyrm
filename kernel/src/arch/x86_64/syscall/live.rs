@@ -1234,6 +1234,18 @@ unsafe fn native_runtime_trampoline<
         }
         crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {}
     }
+    if control == crate::syscall::native::SyscallControl::ServiceRendezvous {
+        match crate::arch::x86_64::idle::take_current_notification_at_safe_point() {
+            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request) => {
+                stage_rendezvous_action(RendezvousAction(request))
+                    .unwrap_or_else(|_| halt_forever());
+                handoff_to_rendezvous_reaper(context);
+            }
+            crate::arch::x86_64::rendezvous::MailboxNotification::None
+            | crate::arch::x86_64::rendezvous::MailboxNotification::Wake
+            | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => halt_forever(),
+        }
+    }
     let control = if control == crate::syscall::native::SyscallControl::CompleteRemoteStop {
         let runtime = unsafe { &mut *context.cast::<R>() };
         runtime.complete_remote_stop(frame, current_binding_generation())
@@ -1371,6 +1383,7 @@ unsafe fn native_runtime_trampoline<
             }
         }
         crate::syscall::native::SyscallControl::CompleteRemoteStop => halt_forever(),
+        crate::syscall::native::SyscallControl::ServiceRendezvous => halt_forever(),
     }
 }
 

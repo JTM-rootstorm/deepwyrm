@@ -296,6 +296,15 @@ fn i1_remote_termination_waits_guard_free_for_exact_ack_before_reclaim() {
     assert!(usercopy_drop < completion);
 
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let dispatch = primordial
+        .split_once("impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandler")
+        .expect("live carrier dispatch")
+        .1
+        .split_once("impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>\n    crate::syscall::native::NativeRendezvousRuntime")
+        .expect("live carrier dispatch extent")
+        .0;
+    assert!(dispatch.contains("publish_live_remote_stop(identity, ())"));
+    assert!(dispatch.contains("let mut runtime = self.runtime.lock();"));
     let initiator = primordial
         .split_once("fn complete_remote_stop(")
         .expect("remote-stop initiator")
@@ -303,14 +312,11 @@ fn i1_remote_termination_waits_guard_free_for_exact_ack_before_reclaim() {
         .split_once("fn authorize_return(")
         .expect("remote-stop initiator extent")
         .0;
-    let publish = initiator
-        .find("publish_live_remote_stop(identity, ())")
-        .unwrap();
     let await_ack = initiator.find("await_live_remote_stop(deferred)").unwrap();
     let reclaim = initiator
         .find("runtime.complete_process_termination(")
         .unwrap();
-    assert!(publish < await_ack && await_ack < reclaim);
+    assert!(await_ack < reclaim);
     assert!(initiator.contains("permits[cpu_index] = Some(permit)"));
 
     let adapters = source("src/syscall/adapters.rs");

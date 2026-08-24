@@ -448,13 +448,20 @@ impl<T> Drop for RuntimeAuthorityGuard<'_, T> {
 struct PendingRemoteProcessTermination {
     phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
     prepared: crate::syscall::PreparedProcessTermination<HANDLES, THREADS>,
+    deferred: [Option<crate::arch::x86_64::rendezvous::DeferredReclaim<()>>;
+        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+}
+
+struct PreparedRemoteProcessTermination {
+    phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
+    prepared: crate::syscall::PreparedProcessTermination<HANDLES, THREADS>,
     identities: [Option<crate::arch::x86_64::rendezvous::StopIdentity>;
         crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
 }
 
 enum ProcessTerminationPreparation {
     Immediate(NativeSyscallResult),
-    Remote(PendingRemoteProcessTermination),
+    Remote(PreparedRemoteProcessTermination),
 }
 
 struct RuntimeCarrierFacade<
@@ -2374,15 +2381,34 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 self.pending_remote_termination.is_none(),
                 "CPU-local carrier already owns a pending remote termination"
             );
-            let preparation = {
-                let mut runtime = self.runtime.lock();
-                runtime.select_cpu(self.cpu);
-                runtime.prepare_remote_process_termination(process, reason, code)
-            };
-            return match preparation {
+            let mut runtime = self.runtime.lock();
+            runtime.select_cpu(self.cpu);
+            return match runtime.prepare_remote_process_termination(process, reason, code) {
                 ProcessTerminationPreparation::Immediate(result) => result,
-                ProcessTerminationPreparation::Remote(pending) => {
-                    self.pending_remote_termination = Some(pending);
+                ProcessTerminationPreparation::Remote(prepared) => {
+                    // Publish while the same authority guard still orders the
+                    // terminal state transition. A target that was already in
+                    // syscall entry must either finish its earlier guarded
+                    // transaction or observe this Stop after acquiring it.
+                    let mut deferred = core::array::from_fn(|_| None);
+                    for (cpu_index, identity) in prepared.identities.into_iter().enumerate() {
+                        let Some(identity) = identity else {
+                            continue;
+                        };
+                        deferred[cpu_index] = Some(
+                            crate::arch::x86_64::idle::publish_live_remote_stop(identity, ())
+                                .unwrap_or_else(|failure| {
+                                    let error = failure.error();
+                                    let _resource = failure.into_resource();
+                                    panic!("remote-stop publication failed: {error:?}")
+                                }),
+                        );
+                    }
+                    self.pending_remote_termination = Some(PendingRemoteProcessTermination {
+                        phase: prepared.phase,
+                        prepared: prepared.prepared,
+                        deferred,
+                    });
                     NativeSyscallResult {
                         status: DW_STATUS_SUCCESS,
                         control: SyscallControl::CompleteRemoteStop,
@@ -2391,6 +2417,15 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             };
         }
         let mut runtime = self.runtime.lock();
+        if matches!(
+            crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
+            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
+        ) {
+            return NativeSyscallResult {
+                status: DW_STATUS_SUCCESS,
+                control: SyscallControl::ServiceRendezvous,
+            };
+        }
         runtime.select_cpu(self.cpu);
         runtime.handle(request)
     }
@@ -2450,16 +2485,10 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             .take()
             .unwrap_or_else(|| panic!("remote-stop control omitted its CPU-local termination"));
         let mut permits = core::array::from_fn(|_| None);
-        for (cpu_index, identity) in pending.identities.into_iter().enumerate() {
-            let Some(identity) = identity else {
+        for (cpu_index, deferred) in pending.deferred.into_iter().enumerate() {
+            let Some(deferred) = deferred else {
                 continue;
             };
-            let deferred = crate::arch::x86_64::idle::publish_live_remote_stop(identity, ())
-                .unwrap_or_else(|failure| {
-                    let error = failure.error();
-                    let _resource = failure.into_resource();
-                    panic!("remote-stop publication failed: {error:?}")
-                });
             let ((), permit) = crate::arch::x86_64::idle::await_live_remote_stop(deferred);
             permits[cpu_index] = Some(permit);
         }
@@ -3515,7 +3544,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 core::array::from_fn(|_| None),
             ));
         }
-        ProcessTerminationPreparation::Remote(PendingRemoteProcessTermination {
+        ProcessTerminationPreparation::Remote(PreparedRemoteProcessTermination {
             phase,
             prepared,
             identities,

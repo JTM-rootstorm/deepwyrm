@@ -339,6 +339,7 @@ pub(crate) enum SyscallControl {
     ReturnToCaller,
     TerminateCurrent,
     CompleteRemoteStop,
+    ServiceRendezvous,
     SuspendCurrent,
 }
 
