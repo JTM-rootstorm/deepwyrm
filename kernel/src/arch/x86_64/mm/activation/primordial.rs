@@ -2577,7 +2577,8 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
     fn enter_scheduled_fresh_thread(&mut self) -> ! {
         let (state, stack) = {
             let mut runtime = self.runtime.lock();
-            runtime.select_cpu(self.cpu);
+            runtime.switch_cpu(self.cpu);
+            runtime.complete_physical_switch_handoff();
             runtime.prepare_fresh_user_entry()
         };
         unsafe { crate::arch::x86_64::syscall::enter_bound_validated_user(&state, stack) }
@@ -2712,7 +2713,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
 
     fn resume_suspended(&mut self, frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame) {
         let mut runtime = self.runtime.lock();
-        runtime.select_cpu(self.cpu);
+        runtime.switch_cpu(self.cpu);
         runtime.resume_suspended(frame);
     }
 }

@@ -488,6 +488,20 @@ fn i1_live_process_exit_retires_the_current_cpu_carrier() {
 }
 
 #[test]
+fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
+    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+
+    assert!(runtime.contains("fn complete_physical_switch_handoff(&self)"));
+    assert!(runtime.contains(".complete_switch_on(outgoing)"));
+    assert!(runtime.contains(
+        "runtime.switch_cpu(self.cpu);\n            runtime.complete_physical_switch_handoff();\n            runtime.prepare_fresh_user_entry()"
+    ));
+    assert!(
+        runtime.contains("runtime.switch_cpu(self.cpu);\n        runtime.resume_suspended(frame);")
+    );
+}
+
+#[test]
 fn i1_live_wait_suspension_uses_the_physical_current_cpu() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
     let services = source("src/syscall/f_services.rs");
