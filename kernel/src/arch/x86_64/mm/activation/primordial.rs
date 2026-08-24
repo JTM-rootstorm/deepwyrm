@@ -2852,11 +2852,48 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     ) -> crate::syscall::native::NativeResumeOutcome {
         let mut runtime = self.runtime.lock();
+        let notification = crate::arch::x86_64::idle::take_current_notification_at_safe_point();
         if matches!(
-            crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
+            notification,
             crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
         ) {
             return crate::syscall::native::NativeResumeOutcome::ServiceRendezvous;
+        }
+        #[cfg(feature = "test-support")]
+        if runtime
+            .shared
+            .execution
+            .current_thread_on(self.cpu)
+            .is_none()
+        {
+            let suspended = runtime
+                .shared
+                .execution
+                .suspended_claim_on(self.cpu)
+                .is_some();
+            match (notification, suspended) {
+                (crate::arch::x86_64::rendezvous::MailboxNotification::None, false) => {
+                    panic!("resume lost current without a mailbox notification or suspension")
+                }
+                (crate::arch::x86_64::rendezvous::MailboxNotification::None, true) => {
+                    panic!("resume lost current while a suspension remained owned")
+                }
+                (crate::arch::x86_64::rendezvous::MailboxNotification::Wake, false) => {
+                    panic!("resume lost current after consuming a wake")
+                }
+                (crate::arch::x86_64::rendezvous::MailboxNotification::Wake, true) => {
+                    panic!("resume lost current after wake with a suspension still owned")
+                }
+                (crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_), false) => {
+                    panic!("resume lost current behind a completed remote stop")
+                }
+                (crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_), true) => {
+                    panic!("resume lost current behind remote stop with a suspension still owned")
+                }
+                (crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_), _) => {
+                    unreachable!()
+                }
+            }
         }
         runtime.switch_cpu(self.cpu);
         runtime.resume_suspended(frame)
