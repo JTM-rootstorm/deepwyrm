@@ -1382,10 +1382,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>
 {
-    pub(crate) fn run_memory_foundation_test(
-        mut self,
-        test: crate::test_support::BuildGuestTest,
-    ) -> ! {
+    pub(crate) fn run_memory_foundation_test(self, test: crate::test_support::BuildGuestTest) -> ! {
         let mut scratch = self
             .target
             .current_scratch_target()
