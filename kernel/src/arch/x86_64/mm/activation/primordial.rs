@@ -2952,13 +2952,23 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.assert_guard_free_external_work();
         match request {
             NativeSyscallRequest::HandleClose { handle } => {
-                NativeSyscallResult::returning(crate::syscall::handle_close(
+                let status = crate::syscall::handle_close(
                     &mut self.registry,
                     &mut self.tasks,
                     self.process,
                     handle,
                     &mut self.cleanup,
-                ))
+                );
+                #[cfg(feature = "test-support")]
+                if status == DW_STATUS_BAD_STATE {
+                    panic!(
+                        "running HandleClose caller has bad lifecycle: process={:?} thread={:?} lifecycle={:?}",
+                        self.process,
+                        self.thread,
+                        self.tasks.process_lifecycle(self.process),
+                    );
+                }
+                NativeSyscallResult::returning(status)
             }
             NativeSyscallRequest::HandleDuplicate {
                 handle,
