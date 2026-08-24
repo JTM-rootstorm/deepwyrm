@@ -1124,12 +1124,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .thread_execution_resources(thread)
             .unwrap_or_else(|error| panic!("scheduler-current resources failed: {error:?}"))
             .unwrap_or_else(|| panic!("scheduler-current Thread has no execution resources"));
-        if process == self.process
-            && root_key == self.root_key
-            && self
-                .active_root
-                .as_ref()
-                .is_some_and(|root| root.selects_exact(self.cpu, process, address_space))
+        if self
+            .active_root
+            .as_ref()
+            .is_some_and(|root| root.selects_exact(self.cpu, process, address_space))
         {
             self.active
                 .validate_current_process_root_selection(
@@ -1140,11 +1138,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .unwrap_or_else(|error| {
                     panic!("retained scheduler-current root is not physically active: {error:?}")
                 });
-            // A sibling Thread in the same Process retains the unique root
-            // selection token and changes only scheduler-owned execution
-            // identity. Re-activating the same address space would violate
-            // the residency protocol with AlreadyActive.
+            // A sibling Thread or a return to this CPU's saved carrier slot
+            // retains the unique root selection token and changes only the
+            // scheduler-owned execution identity. Re-activating the same
+            // address space would violate the residency protocol.
+            self.process = process;
             self.thread = thread;
+            self.root_key = root_key;
             self.stack_id = stack_id;
             self.context_id = context_id;
             return;
