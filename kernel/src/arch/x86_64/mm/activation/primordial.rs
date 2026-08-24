@@ -2860,6 +2860,20 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         ) {
             return crate::syscall::native::NativeResumeOutcome::ServiceRendezvous;
         }
+        let suspended_claim = runtime.shared.execution.suspended_claim_on(self.cpu);
+        if runtime
+            .shared
+            .execution
+            .current_thread_on(self.cpu)
+            .is_none()
+            && let (Some(suspended), Some(deferred)) = (
+                suspended_claim,
+                runtime.deferred_currents[self.cpu.index()].as_ref(),
+            )
+            && suspended.thread() == deferred.thread()
+        {
+            return crate::syscall::native::NativeResumeOutcome::TerminateCurrent;
+        }
         #[cfg(feature = "test-support")]
         if runtime
             .shared
@@ -2867,7 +2881,6 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             .current_thread_on(self.cpu)
             .is_none()
         {
-            let suspended_claim = runtime.shared.execution.suspended_claim_on(self.cpu);
             let suspended = suspended_claim.is_some();
             match (notification, suspended) {
                 (crate::arch::x86_64::rendezvous::MailboxNotification::None, false) => {
@@ -2886,14 +2899,6 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                                 panic!("resume crossed an in-progress remote-stop carrier")
                             }
                             None if runtime.deferred_currents[self.cpu.index()].is_some() => {
-                                let deferred = runtime.deferred_currents[self.cpu.index()]
-                                    .as_ref()
-                                    .expect("checked deferred current disappeared");
-                                if suspended_claim
-                                    .is_some_and(|claim| claim.thread() == deferred.thread())
-                                {
-                                    panic!("resume reentered its own local terminal carrier")
-                                }
                                 panic!("resume crossed another local terminal carrier on this CPU")
                             }
                             None if suspended_claim.is_some_and(|claim| {

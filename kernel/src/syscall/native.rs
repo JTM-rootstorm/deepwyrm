@@ -743,6 +743,7 @@ pub(crate) enum NativeIdleSuspendPoll<'owner> {
 pub(crate) enum NativeResumeOutcome {
     Resumed,
     ServiceRendezvous,
+    TerminateCurrent,
 }
 
 #[allow(

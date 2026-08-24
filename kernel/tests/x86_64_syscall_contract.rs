@@ -545,6 +545,7 @@ fn i2_suspended_resume_gives_remote_stop_priority_under_scheduler_authority() {
 #[test]
 fn i2_terminal_reclaim_handoff_is_owned_by_the_exact_physical_cpu() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let live = source("src/arch/x86_64/syscall/live.rs");
 
     assert!(
         runtime.contains(
@@ -557,6 +558,26 @@ fn i2_terminal_reclaim_handoff_is_owned_by_the_exact_physical_cpu() {
         !runtime
             .contains("deferred_current: Option<crate::task::DeferredCurrentExecutionResources>")
     );
+    assert!(runtime.contains("NativeResumeOutcome::TerminateCurrent"));
+
+    let suspended = live
+        .split_once("SyscallControl::SuspendCurrent =>")
+        .expect("suspended syscall trampoline")
+        .1
+        .split_once("SyscallControl::CompleteRemoteStop")
+        .expect("suspended syscall trampoline terminator")
+        .0;
+    let terminal = suspended
+        .find("NativeResumeOutcome::TerminateCurrent")
+        .unwrap();
+    let handoff = suspended[terminal..]
+        .find("handoff_to_terminal_reaper::<R>(context)")
+        .unwrap()
+        + terminal;
+    let authorize = suspended
+        .find("runtime.authorize_return(frame, generation)")
+        .unwrap();
+    assert!(terminal < handoff && handoff < authorize);
 }
 
 #[test]
