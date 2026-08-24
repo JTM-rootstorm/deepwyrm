@@ -505,6 +505,7 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
 fn i1_live_wait_suspension_uses_the_physical_current_cpu() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
     let services = source("src/syscall/f_services.rs");
+    let adapters = source("src/syscall/adapters.rs");
     let waits = source("src/wait/engine.rs");
 
     assert!(runtime.contains("self.thread,\n                        self.cpu,"));
@@ -514,6 +515,13 @@ fn i1_live_wait_suspension_uses_the_physical_current_cpu() {
     assert!(waits.contains("prepare_block_current_on(cpu, thread)"));
     assert!(waits.contains("cancel_block_on(cpu, block)"));
     assert!(waits.contains("commit_block_on(cpu, block)"));
+    assert!(runtime.contains("self.services.prepare_suspend_on("));
+    assert!(runtime.contains("self.services.poll_idle_suspend_on("));
+    assert!(services.contains("control.prepare_suspend_on(cpu"));
+    assert!(services.contains("control.poll_idle_on(cpu"));
+    assert!(adapters.contains("schedule_from_idle_on(cpu, suspended)"));
+    assert!(adapters.contains("prepare_blocking_kernel_switch_on("));
+    assert!(adapters.contains("prepare_idle_blocking_kernel_switch_on("));
 }
 
 #[test]

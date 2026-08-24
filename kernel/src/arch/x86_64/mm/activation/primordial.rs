@@ -1240,8 +1240,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let owner = self.services.operation_owner(self.thread);
         let control = &mut self.wait_controls[self.cpu.index()];
         let plan = unsafe {
-            self.services.prepare_suspend(
+            self.services.prepare_suspend_on(
                 control,
+                self.cpu,
                 &self.tasks,
                 &self.shared.execution,
                 crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
@@ -1266,8 +1267,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let owner = self.services.operation_owner(self.thread);
         let control = &mut self.wait_controls[self.cpu.index()];
         let poll = unsafe {
-            self.services.poll_idle_suspend(
+            self.services.poll_idle_suspend_on(
                 control,
+                self.cpu,
                 &self.tasks,
                 &self.shared.execution,
                 crate::arch::x86_64::syscall::first_run_thread_entry_rip(),

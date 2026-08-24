@@ -2358,6 +2358,37 @@ impl NativeWaitControl {
 
     #[allow(
         unsafe_code,
+        reason = "the caller must prove the CPU-owned pending scheduler carrier and fixed first-run entry before plan production"
+    )]
+    pub(crate) unsafe fn prepare_suspend_on<
+        'owner,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+        const EXECUTION: usize,
+    >(
+        &mut self,
+        cpu: crate::cpu::CpuIndex,
+        tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        execution: &'owner ExecutionDomain<EXECUTION>,
+        trusted_first_run_entry: u64,
+    ) -> Result<NativeSuspendPlan<'owner>, WaitSuspendError> {
+        let NativeWaitControlState::Pending(state) = self.state else {
+            return Err(WaitSuspendError::InvalidDecision);
+        };
+        let plan = unsafe {
+            prepare_wait_suspend_plan_on(tasks, execution, cpu, state, trusted_first_run_entry)
+        }?;
+        self.state = match &plan {
+            NativeSuspendPlan::IdleCurrent => NativeWaitControlState::Idle(state),
+            NativeSuspendPlan::Switch(_) => NativeWaitControlState::Clear,
+        };
+        Ok(plan)
+    }
+
+    #[allow(
+        unsafe_code,
         reason = "the caller must prove the physically active idle carrier and fixed first-run entry before plan production"
     )]
     /// # Safety
@@ -2383,6 +2414,36 @@ impl NativeWaitControl {
         };
         let poll =
             unsafe { poll_wait_idle_suspend(tasks, execution, state, trusted_first_run_entry) }?;
+        if !matches!(poll, NativeIdleSuspendPoll::Continue) {
+            self.state = NativeWaitControlState::Clear;
+        }
+        Ok(poll)
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "the caller must prove the CPU-owned physically active idle carrier and fixed first-run entry before plan production"
+    )]
+    pub(crate) unsafe fn poll_idle_on<
+        'owner,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+        const EXECUTION: usize,
+    >(
+        &mut self,
+        cpu: crate::cpu::CpuIndex,
+        tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        execution: &'owner ExecutionDomain<EXECUTION>,
+        trusted_first_run_entry: u64,
+    ) -> Result<NativeIdleSuspendPoll<'owner>, WaitSuspendError> {
+        let NativeWaitControlState::Idle(state) = self.state else {
+            return Err(WaitSuspendError::InvalidDecision);
+        };
+        let poll = unsafe {
+            poll_wait_idle_suspend_on(tasks, execution, cpu, state, trusted_first_run_entry)
+        }?;
         if !matches!(poll, NativeIdleSuspendPoll::Continue) {
             self.state = NativeWaitControlState::Clear;
         }
@@ -2450,6 +2511,38 @@ pub(crate) unsafe fn prepare_wait_suspend_plan<
 
 #[allow(
     unsafe_code,
+    reason = "the returned lifetime-branded plan carries the CPU-owned execution borrow to immediate switch consumption"
+)]
+pub(crate) unsafe fn prepare_wait_suspend_plan_on<
+    'owner,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EXECUTION: usize,
+>(
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &'owner ExecutionDomain<EXECUTION>,
+    cpu: crate::cpu::CpuIndex,
+    state: WaitSuspendState,
+    trusted_first_run_entry: u64,
+) -> Result<NativeSuspendPlan<'owner>, WaitSuspendError> {
+    let decision = state.decision();
+    if decision.previous.is_none() {
+        return Err(WaitSuspendError::InvalidDecision);
+    }
+    if decision.current.is_none() {
+        return Ok(NativeSuspendPlan::IdleCurrent);
+    }
+    let plan = unsafe {
+        execution.prepare_blocking_kernel_switch_on(tasks, cpu, decision, trusted_first_run_entry)
+    }
+    .map_err(WaitSuspendError::Switch)?;
+    Ok(NativeSuspendPlan::Switch(plan))
+}
+
+#[allow(
+    unsafe_code,
     reason = "the idle continuation identity is runtime-proven and the returned plan brands its execution owner through immediate switch consumption"
 )]
 /// # Safety
@@ -2484,6 +2577,49 @@ pub(crate) unsafe fn poll_wait_idle_suspend<
             let plan = unsafe {
                 execution.prepare_idle_blocking_kernel_switch(
                     tasks,
+                    decision,
+                    trusted_first_run_entry,
+                )
+            }
+            .map_err(WaitSuspendError::Switch)?;
+            Ok(NativeIdleSuspendPoll::Switch(plan))
+        }
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the returned lifetime-branded idle plan retains the exact CPU-owned continuation through switch consumption"
+)]
+pub(crate) unsafe fn poll_wait_idle_suspend_on<
+    'owner,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EXECUTION: usize,
+>(
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &'owner ExecutionDomain<EXECUTION>,
+    cpu: crate::cpu::CpuIndex,
+    state: WaitSuspendState,
+    trusted_first_run_entry: u64,
+) -> Result<NativeIdleSuspendPoll<'owner>, WaitSuspendError> {
+    let suspended = state
+        .decision()
+        .previous
+        .ok_or(WaitSuspendError::InvalidDecision)?;
+    match execution
+        .schedule_from_idle_on(cpu, suspended)
+        .map_err(WaitSuspendError::Scheduler)?
+    {
+        IdleScheduleDecision::ContinueIdle => Ok(NativeIdleSuspendPoll::Continue),
+        IdleScheduleDecision::ResumeCurrent => Ok(NativeIdleSuspendPoll::ResumeCurrent),
+        IdleScheduleDecision::Switch(decision) => {
+            let plan = unsafe {
+                execution.prepare_idle_blocking_kernel_switch_on(
+                    tasks,
+                    cpu,
                     decision,
                     trusted_first_run_entry,
                 )

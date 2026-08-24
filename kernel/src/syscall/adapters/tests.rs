@@ -7143,6 +7143,11 @@ fn terminal_retirement_precedes_deferred_signal_completion_without_resurrection(
         execution.scheduler_state(killer),
         Some(SchedulerThreadState::Running)
     );
+    let switched_target = execution
+        .suspended_claim_on(crate::cpu::CpuIndex::BOOTSTRAP)
+        .expect("model switch retains target continuation until stack handoff");
+    assert_eq!(switched_target.thread(), target);
+    execution.complete_switch_on(switched_target).unwrap();
     assert!(operations.contains_thread(target));
     assert_eq!(waits.len(), 1);
 

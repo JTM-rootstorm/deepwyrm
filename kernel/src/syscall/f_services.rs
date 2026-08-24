@@ -686,6 +686,27 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
 
     #[allow(
         unsafe_code,
+        reason = "the caller must prove the CPU-owned pending carrier and fixed first-run entry through the F-service facade"
+    )]
+    pub(crate) unsafe fn prepare_suspend_on<
+        'owner,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &self,
+        control: &mut NativeWaitControl,
+        cpu: crate::cpu::CpuIndex,
+        tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        execution: &'owner ExecutionDomain<EXECUTION>,
+        trusted_first_run_entry: u64,
+    ) -> Result<NativeSuspendPlan<'owner>, WaitSuspendError> {
+        unsafe { control.prepare_suspend_on(cpu, tasks, execution, trusted_first_run_entry) }
+    }
+
+    #[allow(
+        unsafe_code,
         reason = "the caller must prove the physically active idle carrier and fixed first-run entry through the F-service facade"
     )]
     /// # Safety
@@ -707,6 +728,27 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         trusted_first_run_entry: u64,
     ) -> Result<NativeIdleSuspendPoll<'owner>, WaitSuspendError> {
         unsafe { control.poll_idle(tasks, execution, trusted_first_run_entry) }
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "the caller must prove the CPU-owned idle carrier and fixed first-run entry through the F-service facade"
+    )]
+    pub(crate) unsafe fn poll_idle_suspend_on<
+        'owner,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &self,
+        control: &mut NativeWaitControl,
+        cpu: crate::cpu::CpuIndex,
+        tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        execution: &'owner ExecutionDomain<EXECUTION>,
+        trusted_first_run_entry: u64,
+    ) -> Result<NativeIdleSuspendPoll<'owner>, WaitSuspendError> {
+        unsafe { control.poll_idle_on(cpu, tasks, execution, trusted_first_run_entry) }
     }
 
     pub(crate) fn operation_owner(
