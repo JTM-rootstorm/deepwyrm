@@ -2919,6 +2919,11 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     ) -> crate::syscall::native::NativeResumeOutcome {
         let mut runtime = self.runtime.lock();
+        // A suspended continuation may resume after another physical CPU used
+        // the shared carrier. Restore this CPU's exact carrier/root token
+        // before inspecting any scheduler or terminal ownership associated
+        // with the resumed frame.
+        runtime.switch_cpu(self.cpu);
         let notification = crate::arch::x86_64::idle::take_current_notification_at_safe_point();
         if matches!(
             notification,
@@ -3007,7 +3012,6 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 }
             }
         }
-        runtime.switch_cpu(self.cpu);
         runtime.resume_suspended(frame)
     }
 }

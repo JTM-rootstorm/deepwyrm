@@ -517,11 +517,12 @@ fn i2_suspended_resume_gives_remote_stop_priority_under_scheduler_authority() {
         .expect("live suspended-resume facade terminator")
         .0;
     let authority = resume.find("self.runtime.lock()").unwrap();
+    let carrier = resume.find("runtime.switch_cpu(self.cpu)").unwrap();
     let mailbox = resume
         .find("take_current_notification_at_safe_point()")
         .unwrap();
     let current = resume.find("runtime.resume_suspended(frame)").unwrap();
-    assert!(authority < mailbox && mailbox < current);
+    assert!(authority < carrier && carrier < mailbox && mailbox < current);
     assert!(resume.contains("NativeResumeOutcome::ServiceRendezvous"));
 
     let suspended = live
