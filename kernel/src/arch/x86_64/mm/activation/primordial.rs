@@ -2480,7 +2480,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         unsafe { self.poll_idle_suspend_stationary() }
     }
 
-    fn resume_suspended(&mut self, frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame) {
+    fn resume_suspended(
+        &mut self,
+        frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> crate::syscall::native::NativeResumeOutcome {
         self.complete_physical_switch_handoff();
         self.synchronize_scheduler_current();
         #[cfg(feature = "test-support")]
@@ -2507,6 +2510,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         #[cfg(feature = "test-support")]
         self.g5_probe.observe_resume(owner, status);
         frame.set_status(status);
+        crate::syscall::native::NativeResumeOutcome::Resumed
     }
 }
 
@@ -2855,8 +2859,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             return crate::syscall::native::NativeResumeOutcome::ServiceRendezvous;
         }
         runtime.switch_cpu(self.cpu);
-        runtime.resume_suspended(frame);
-        crate::syscall::native::NativeResumeOutcome::Resumed
+        runtime.resume_suspended(frame)
     }
 }
 

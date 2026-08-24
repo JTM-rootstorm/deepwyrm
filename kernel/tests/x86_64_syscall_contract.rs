@@ -501,7 +501,7 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
         .expect("live suspended-resume facade")
         .1;
     assert!(resume.contains("runtime.switch_cpu(self.cpu);"));
-    assert!(resume.contains("runtime.resume_suspended(frame);"));
+    assert!(resume.contains("runtime.resume_suspended(frame)"));
 }
 
 #[test]
