@@ -539,6 +539,20 @@ pub(crate) fn take_current_latched_notification() -> MailboxNotification {
         .unwrap_or_else(|_| fail_transport_and_halt())
 }
 
+/// Acquires the current CPU's mailbox directly at a carrier-owned safe point.
+/// This closes the syscall-entry race where e1 is pending in the local APIC
+/// while IF is already clear: the mailbox publication remains authoritative
+/// even though the interrupt callback has not yet published its rescan latch.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn take_current_notification_at_safe_point() -> MailboxNotification {
+    let Ok(cpu) = current_cpu() else {
+        fail_transport_and_halt();
+    };
+    LIVE_IDLE_WAKE
+        .take_notification(cpu)
+        .unwrap_or_else(|_| fail_transport_and_halt())
+}
+
 /// Completes an exact Stop/HoldSafe only from the current CPU's reaper/safe
 /// point.  The mailbox remains stationary; the carrier supplies the unique
 /// mutable transition authority after the hard IRQ has returned.

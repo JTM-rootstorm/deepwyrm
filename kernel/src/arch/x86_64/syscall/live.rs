@@ -1203,6 +1203,19 @@ unsafe fn native_runtime_trampoline<
     {
         halt_forever();
     }
+    // The syscall gate entered with IF clear. A remote Stop may therefore be
+    // published in the stationary mailbox while its e1 delivery is still
+    // pending in the local APIC. Poll the authoritative mailbox before any
+    // usercopy or syscall authority can observe terminal task state.
+    match crate::arch::x86_64::idle::take_current_notification_at_safe_point() {
+        crate::arch::x86_64::rendezvous::MailboxNotification::None
+        | crate::arch::x86_64::rendezvous::MailboxNotification::Wake
+        | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {}
+        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request) => {
+            stage_rendezvous_action(RendezvousAction(request)).unwrap_or_else(|_| halt_forever());
+            handoff_to_rendezvous_reaper(context);
+        }
+    }
     let usercopy_window = NativeUsercopyWindow::enter_current().unwrap_or_else(|_| halt_forever());
     let control = {
         let runtime = unsafe { &mut *context.cast::<R>() };

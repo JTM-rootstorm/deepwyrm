@@ -777,6 +777,28 @@ fn i1_live_wait_control_is_owned_by_each_physical_cpu_carrier() {
 }
 
 #[test]
+fn i1_syscall_entry_polls_remote_stop_before_usercopy_or_dispatch() {
+    let live = source("src/arch/x86_64/syscall/live.rs");
+    let trampoline = live
+        .split_once("unsafe fn native_runtime_trampoline<")
+        .expect("native runtime trampoline")
+        .1
+        .split_once("fn switch_kernel_context(")
+        .expect("native runtime trampoline terminator")
+        .0;
+    let stop_poll = trampoline
+        .find("take_current_notification_at_safe_point()")
+        .expect("entry mailbox safe point");
+    let usercopy = trampoline
+        .find("NativeUsercopyWindow::enter_current()")
+        .expect("usercopy entry");
+    let dispatch = trampoline
+        .find("dispatch_frame(runtime, frame")
+        .expect("native dispatch");
+    assert!(stop_poll < usercopy && usercopy < dispatch);
+}
+
+#[test]
 fn daybreak_switch_plan_brands_execution_owner_through_every_suspend_facade() {
     let context = source("src/arch/x86_64/context.rs");
     let execution = source("src/task/execution.rs");
