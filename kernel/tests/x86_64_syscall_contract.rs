@@ -589,6 +589,21 @@ fn i1_terminal_child_without_local_work_rejoins_the_idle_scheduler() {
     assert!(runtime.contains("self.finish_inactive_process_teardown("));
     assert!(runtime.contains("PreparedTerminalHandoff::IdleScheduler"));
     assert!(runtime.contains("enter_bound_idle_scheduler()"));
+    let terminal = runtime
+        .split_once("fn prepare_terminal_handoff(")
+        .expect("terminal handoff")
+        .1
+        .split_once("fn terminate_exception(")
+        .expect("terminal handoff terminator")
+        .0;
+    let kernel_root = terminal
+        .find("enter_kernel_execution_root(previous)")
+        .unwrap();
+    let teardown = terminal
+        .rfind("self.finish_inactive_process_teardown(")
+        .unwrap();
+    assert!(kernel_root < teardown);
+    assert!(!terminal.contains("terminal idle safe-root"));
 }
 
 #[test]

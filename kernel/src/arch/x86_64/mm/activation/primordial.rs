@@ -1423,39 +1423,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
 
         if retired_process != self.primordial_process {
-            let prepared = self
-                .active
-                .prepare_process_root_selection(
-                    self.cpu,
-                    self.primordial_process,
-                    self.primordial_address_space,
-                )
-                .unwrap_or_else(|error| {
-                    panic!("terminal idle safe-root preparation failed: {error:?}")
-                });
-            let previous = Some(self.active_root.take_process());
-            let selected = self
-                .active
-                .activate_process_root_selection(prepared, previous)
-                .unwrap_or_else(|failure| {
-                    let (error, prepared, previous) = failure.into_parts();
-                    self.active
-                        .abandon_process_root_selection(prepared)
-                        .unwrap_or_else(|abandon| {
-                            panic!("terminal idle safe-root abandonment failed: {abandon:?}")
-                        });
-                    self.active_root = CarrierActiveRoot::Process(previous.unwrap_or_else(|| {
-                        panic!("terminal idle safe-root rollback lost its previous root")
-                    }));
-                    panic!("terminal idle safe-root activation failed: {error:?}")
-                });
-            self.active_root = CarrierActiveRoot::Process(selected);
-            self.finish_inactive_process_teardown(
-                retired_process,
-                retired_root_key,
-                retired_address_space,
-            )
-            .unwrap_or_else(|_| panic!("idle exited Process teardown drifted"));
             let previous = self.active_root.take_process();
             match self.active.enter_kernel_execution_root(previous) {
                 Ok(kernel) => self.active_root = CarrierActiveRoot::Kernel(kernel),
@@ -1464,6 +1431,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     panic!("terminal idle kernel-root handoff failed: {error:?}");
                 }
             }
+            self.finish_inactive_process_teardown(
+                retired_process,
+                retired_root_key,
+                retired_address_space,
+            )
+            .unwrap_or_else(|_| panic!("idle exited Process teardown drifted"));
             self.process = self.primordial_process;
             self.root_key = self.primordial_root_key;
             self.local.record_idle();
