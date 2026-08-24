@@ -1452,7 +1452,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
 
         if retired_process != self.primordial_process {
+            if crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
+                != Some(self.cpu.index())
+            {
+                panic!("terminal idle facade resumed on another physical CPU")
+            }
             let previous = self.active_root.take_process();
+            if previous.cpu() != self.cpu {
+                panic!("terminal idle carrier retained another CPU's Process root")
+            }
             match self.active.enter_kernel_execution_root(previous) {
                 Ok(kernel) => self.active_root = CarrierActiveRoot::Kernel(kernel),
                 Err((error, recovered)) => {
