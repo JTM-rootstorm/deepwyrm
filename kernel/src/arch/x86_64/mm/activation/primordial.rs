@@ -2024,13 +2024,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .map_err(|_| ())?;
         self.cleanup
             .push_optional(self.registry.release_internal(root_pin).map_err(|_| ())?);
-        self.drain_finalizers()?;
-        #[cfg(deepwyrm_i1_evidence)]
-        {
-            crate::test_support::observe_i1_child_cleanup(process, self.cpu);
-            crate::test_support::observe_i1_reclaim_allowed(self.cpu);
-        }
-        Ok(())
+        self.drain_finalizers()
     }
 
     fn release_terminal_authority(&mut self) -> Result<(), ()> {
@@ -3190,6 +3184,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.assert_guard_free_external_work();
         match request {
             NativeSyscallRequest::HandleClose { handle } => {
+                #[cfg(deepwyrm_i1_evidence)]
+                let closed_process = self
+                    .tasks
+                    .process_handles(self.process)
+                    .ok()
+                    .and_then(|handles| handles.process_target_for_evidence(handle))
+                    .map(crate::task::ProcessKey::from_object_id);
                 let status = crate::syscall::handle_close(
                     &mut self.registry,
                     &mut self.tasks,
@@ -3205,6 +3206,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         self.thread,
                         self.tasks.process_lifecycle(self.process),
                     );
+                }
+                #[cfg(deepwyrm_i1_evidence)]
+                if status == DW_STATUS_SUCCESS
+                    && let Some(process) = closed_process
+                {
+                    crate::test_support::observe_i1_child_cleanup(process, self.cpu);
+                    crate::test_support::observe_i1_reclaim_allowed(self.cpu);
                 }
                 NativeSyscallResult::returning(status)
             }

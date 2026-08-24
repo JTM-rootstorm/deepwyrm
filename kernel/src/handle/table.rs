@@ -729,6 +729,13 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
         })
     }
 
+    #[cfg(deepwyrm_i1_evidence)]
+    pub(crate) fn process_target_for_evidence(&self, handle: DwHandle) -> Option<ObjectId> {
+        let entry = self.resolve_entry(handle).ok()?;
+        (entry.reference.object_type() == deepwyrm_abi::DW_OBJECT_TYPE_PROCESS)
+            .then_some(entry.reference.id())
+    }
+
     pub(crate) fn close<const OBJECTS: usize>(
         &mut self,
         registry: &mut ObjectRegistry<OBJECTS>,

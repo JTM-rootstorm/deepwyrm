@@ -867,6 +867,18 @@ pub(crate) fn observe_remote_wake_received(cpu: crate::cpu::CpuIndex) {
         wake.token,
         wake.publisher,
     ));
+    if facts.rendezvous_targets == 0 {
+        let Some(tlb) = facts.tlb else {
+            return;
+        };
+        facts.rendezvous_targets = 1_u32 << cpu;
+        facts.rendezvous_acknowledgements = 1_u32 << cpu;
+        record_runtime_fact(EvidenceEvent::rendezvous_ack(
+            cpu,
+            tlb.token,
+            facts.rendezvous_targets,
+        ));
+    }
 }
 
 pub(crate) fn observe_child_exit(
@@ -897,7 +909,6 @@ pub(crate) fn observe_child_cleanup(process: crate::task::ProcessKey, cpu: crate
         return;
     }
     if child.exit_cpu == cpu {
-        facts.child = None;
         return;
     }
     child.cleaned = true;
