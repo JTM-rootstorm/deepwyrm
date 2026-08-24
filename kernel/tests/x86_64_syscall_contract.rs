@@ -802,6 +802,22 @@ fn i1_syscall_entry_polls_remote_stop_before_usercopy_or_dispatch() {
         .find("dispatch_frame(runtime, frame")
         .expect("native dispatch");
     assert!(stop_poll < usercopy && usercopy < dispatch);
+    assert!(
+        trampoline
+            .match_indices("take_current_notification_at_safe_point()")
+            .count()
+            >= 3,
+        "entry, post-dispatch, and rendezvous-control seams must poll the authoritative mailbox"
+    );
+    let usercopy_drop = trampoline.find("drop(usercopy_window)").unwrap();
+    let post_dispatch_poll = trampoline[usercopy_drop..]
+        .find("take_current_notification_at_safe_point()")
+        .unwrap()
+        + usercopy_drop;
+    let latched_poll = trampoline
+        .find("service_current_rendezvous_latch()")
+        .unwrap();
+    assert!(usercopy_drop < post_dispatch_poll && post_dispatch_poll < latched_poll);
 }
 
 #[test]

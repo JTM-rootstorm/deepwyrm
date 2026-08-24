@@ -1225,6 +1225,19 @@ unsafe fn native_runtime_trampoline<
     // returned to it yet. Dropping this guard makes that authorization
     // revocable by the following e1 safe point.
     drop(usercopy_window);
+    // Recheck the authoritative mailbox after the guarded syscall/return
+    // transaction. The initiator may have published terminal state and Stop
+    // while this CPU was waiting to reacquire the shared runtime authority for
+    // return authorization, before e1 could run with IF clear.
+    match crate::arch::x86_64::idle::take_current_notification_at_safe_point() {
+        crate::arch::x86_64::rendezvous::MailboxNotification::None
+        | crate::arch::x86_64::rendezvous::MailboxNotification::Wake
+        | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {}
+        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request) => {
+            stage_rendezvous_action(RendezvousAction(request)).unwrap_or_else(|_| halt_forever());
+            handoff_to_rendezvous_reaper(context);
+        }
+    }
     match crate::time::service_current_rendezvous_latch().unwrap_or_else(|_| halt_forever()) {
         crate::arch::x86_64::rendezvous::MailboxNotification::None
         | crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {}

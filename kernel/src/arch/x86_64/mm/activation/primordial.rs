@@ -2513,6 +2513,16 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         current_binding_generation: u64,
     ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
         let mut runtime = self.runtime.lock();
+        if matches!(
+            crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
+            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
+        ) {
+            // The raw trampoline performs an authoritative post-dispatch
+            // mailbox poll after dropping usercopy. It will diverge through
+            // the rendezvous reaper, so no user-return authorization may be
+            // minted from the terminal task state observed here.
+            return Ok(());
+        }
         runtime.select_cpu(self.cpu);
         runtime.authorize_return(frame, current_binding_generation)
     }
