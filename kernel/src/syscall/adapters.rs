@@ -888,6 +888,39 @@ pub(crate) fn complete_deferred_current_reclaim<
     collect_retired_pins(registry, execution, waits, pins, cleanup);
 }
 
+pub(crate) fn complete_deferred_current_reclaim_on<
+    const OBJECTS: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
+    cpu: crate::cpu::CpuIndex,
+    deferred: DeferredCurrentExecutionResources,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) {
+    let pins = execution.reclaim_deferred_current_on(cpu, deferred);
+    collect_retired_pins(registry, execution, waits, pins, cleanup);
+}
+
+#[derive(Clone, Copy)]
+enum DeferredCurrentRetirement {
+    Model(ThreadKey),
+    Handoff {
+        cpu: crate::cpu::CpuIndex,
+        thread: ThreadKey,
+    },
+}
+
+impl DeferredCurrentRetirement {
+    fn thread(self) -> ThreadKey {
+        match self {
+            Self::Model(thread) | Self::Handoff { thread, .. } => thread,
+        }
+    }
+}
+
 fn collect_process_effects<
     C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
     const OBJECTS: usize,
@@ -903,18 +936,18 @@ fn collect_process_effects<
     execution: &ExecutionDomain<EXECUTION>,
     waits: &WaitRegistry<WAITERS>,
     effects: ProcessExitEffects<HANDLES, THREADS>,
-    defer_current: Option<(crate::cpu::CpuIndex, ThreadKey)>,
+    defer_current: Option<DeferredCurrentRetirement>,
     remotely_stopped: &[Option<ThreadKey>],
     terminal_waits: &mut C,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> Option<DeferredCurrentExecutionResources> {
-    let deferred_thread = defer_current.filter(|(_, current)| {
+    let deferred_thread = defer_current.filter(|current| {
         effects
             .pins
             .thread_keys()
             .into_iter()
             .flatten()
-            .any(|thread| thread == *current)
+            .any(|thread| thread == current.thread())
     });
     for release in effects.drained.into_final_releases().into_iter().flatten() {
         cleanup.push(release);
@@ -923,12 +956,13 @@ fn collect_process_effects<
         terminal_waits.cleanup_terminal_wait(registry, tasks, waits, execution, thread, cleanup);
     }
     let (pins, deferred) = match deferred_thread {
-        Some((cpu, current)) => {
-            let (pins, deferred) = if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
-                execution.retire_exit_pins_defer_current(effects.pins, current)
-            } else {
-                execution.retire_exit_pins_defer_current_on(cpu, effects.pins, current)
-            };
+        Some(DeferredCurrentRetirement::Model(current)) => {
+            let (pins, deferred) = execution.retire_exit_pins_defer_current(effects.pins, current);
+            (pins, Some(deferred))
+        }
+        Some(DeferredCurrentRetirement::Handoff { cpu, thread }) => {
+            let (pins, deferred) =
+                execution.retire_exit_pins_defer_current_on(cpu, effects.pins, thread);
             (pins, Some(deferred))
         }
         None if remotely_stopped.is_empty() => (execution.retire_exit_pins(effects.pins), None),
@@ -3417,7 +3451,7 @@ fn collect_group_effects<
             execution,
             waits,
             process,
-            Some((crate::cpu::CpuIndex::BOOTSTRAP, current_thread)),
+            Some(DeferredCurrentRetirement::Model(current_thread)),
             &[],
             terminal_waits,
             cleanup,
@@ -3435,7 +3469,7 @@ fn collect_group_effects<
             execution,
             waits,
             process,
-            Some((crate::cpu::CpuIndex::BOOTSTRAP, current_thread)),
+            Some(DeferredCurrentRetirement::Model(current_thread)),
             &[],
             terminal_waits,
             cleanup,
@@ -3578,7 +3612,10 @@ pub(crate) fn process_exit_on<
         execution,
         waits,
         effects,
-        Some((current_cpu, current_thread)),
+        Some(DeferredCurrentRetirement::Handoff {
+            cpu: current_cpu,
+            thread: current_thread,
+        }),
         &[],
         terminal_waits,
         cleanup,
@@ -3639,7 +3676,7 @@ pub(crate) fn process_unhandled_exception<
         execution,
         waits,
         effects,
-        Some((crate::cpu::CpuIndex::BOOTSTRAP, current_thread)),
+        Some(DeferredCurrentRetirement::Model(current_thread)),
         &[],
         terminal_waits,
         cleanup,
@@ -3863,7 +3900,7 @@ fn complete_prepared_process_termination_with_remote_threads<
         execution,
         waits,
         prepared.effects,
-        Some((crate::cpu::CpuIndex::BOOTSTRAP, current_thread)),
+        Some(DeferredCurrentRetirement::Model(current_thread)),
         remote_threads,
         terminal_waits,
         cleanup,

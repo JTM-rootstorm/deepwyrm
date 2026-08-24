@@ -2442,7 +2442,14 @@ fn process_exit_defers_current_execution_bundle_until_reaper_completion() {
     .unwrap();
     assert!(execution.stack_bounds(stack).is_ok());
     assert!(execution.load_context(context).is_ok());
-    complete_deferred_current_reclaim(&mut registry, &execution, &waits, deferred, &mut cleanup);
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        crate::cpu::CpuIndex::BOOTSTRAP,
+        deferred,
+        &mut cleanup,
+    );
     assert!(execution.stack_bounds(stack).is_err());
     assert!(execution.load_context(context).is_err());
     cleanup.push_optional(registry.release_handle(current_ref).unwrap());
@@ -2653,7 +2660,14 @@ fn non_current_process_termination_reclaims_only_the_target_batch() {
         SyscallControl::TerminateCurrent,
     )
     .unwrap();
-    complete_deferred_current_reclaim(&mut registry, &execution, &waits, deferred, &mut cleanup);
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        crate::cpu::CpuIndex::BOOTSTRAP,
+        deferred,
+        &mut cleanup,
+    );
     cleanup.push_optional(registry.release_handle(current_thread_ref).unwrap());
     cleanup.push_optional(registry.release_handle(target_thread_ref).unwrap());
     cleanup.push_optional(registry.release_handle(current_process_ref).unwrap());
@@ -2775,7 +2789,14 @@ fn prepared_process_termination_preserves_remote_execution_until_exact_stop() {
         SyscallControl::TerminateCurrent,
     )
     .unwrap();
-    complete_deferred_current_reclaim(&mut registry, &execution, &waits, deferred, &mut cleanup);
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        crate::cpu::CpuIndex::BOOTSTRAP,
+        deferred,
+        &mut cleanup,
+    );
     cleanup.push_optional(registry.release_handle(current_thread_ref).unwrap());
     cleanup.push_optional(registry.release_handle(target_thread_ref).unwrap());
     cleanup.push_optional(registry.release_handle(current_process_ref).unwrap());
@@ -2874,7 +2895,14 @@ fn noncurrent_unstarted_child_termination_is_immediately_quiescent() {
         SyscallControl::TerminateCurrent,
     )
     .unwrap();
-    complete_deferred_current_reclaim(&mut registry, &execution, &waits, deferred, &mut cleanup);
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        crate::cpu::CpuIndex::BOOTSTRAP,
+        deferred,
+        &mut cleanup,
+    );
     cleanup.push_optional(registry.release_handle(current_thread_ref).unwrap());
     cleanup.push_optional(registry.release_internal(root_owner).unwrap());
     finish_task_cleanup(&mut registry, &mut tasks, cleanup);

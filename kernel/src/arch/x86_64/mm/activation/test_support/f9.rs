@@ -920,10 +920,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 
     fn terminate_current(&mut self) -> ! {
-        crate::syscall::complete_deferred_current_reclaim(
+        crate::syscall::complete_deferred_current_reclaim_on(
             &mut self.registry,
             &self.execution,
             &self.waits,
+            crate::cpu::CpuIndex::BOOTSTRAP,
             self.deferred_current.take().unwrap_or_else(|| fail(0xae)),
             &mut self.cleanup,
         );

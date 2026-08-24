@@ -1319,10 +1319,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .region(retired_root_key)
             .unwrap_or_else(|error| panic!("terminal Process root disappeared: {error:?}"))
             .address_space_key();
-        crate::syscall::complete_deferred_current_reclaim(
+        crate::syscall::complete_deferred_current_reclaim_on(
             &mut self.registry,
             &self.shared.execution,
             &self.shared.waits,
+            self.cpu,
             self.deferred_current
                 .take()
                 .unwrap_or_else(|| panic!("primordial exit omitted deferred resources")),

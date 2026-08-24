@@ -481,7 +481,9 @@ fn i1_live_process_exit_retires_the_current_cpu_carrier() {
     assert!(runtime.contains("crate::syscall::process_exit_on("));
     assert!(runtime.contains("self.cpu,"));
     assert!(adapters.contains("current_cpu: crate::cpu::CpuIndex"));
-    assert!(adapters.contains("Some((current_cpu, current_thread))"));
+    assert!(adapters.contains("DeferredCurrentRetirement::Handoff"));
+    assert!(adapters.contains("cpu: current_cpu"));
+    assert!(runtime.contains("complete_deferred_current_reclaim_on("));
     assert!(adapters.contains("retire_exit_pins_defer_current_on(cpu"));
 }
 

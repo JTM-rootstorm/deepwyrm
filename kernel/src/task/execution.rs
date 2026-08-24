@@ -978,6 +978,30 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
 
     /// Consumes execution-resource ownership after the caller has irreversibly
     /// left the deferred Thread's kernel stack.
+    pub(crate) fn reclaim_deferred_current_on(
+        &self,
+        cpu: SchedulerCpuId,
+        deferred: DeferredCurrentExecutionResources,
+    ) -> RetiredExitPins<1> {
+        let claim = self
+            .scheduler
+            .suspended_claim_on(cpu)
+            .expect("terminal reaper omitted the outgoing execution claim");
+        assert_eq!(
+            claim.thread(),
+            deferred.thread,
+            "terminal reaper CPU retained a different outgoing continuation"
+        );
+        self.complete_switch_on(claim)
+            .expect("terminal reaper could not acknowledge the abandoned continuation");
+        self.reclaim_deferred_current(deferred)
+    }
+
+    /// Consumes execution-resource ownership after an already-completed
+    /// scheduler handoff. Architecture terminal reapers use
+    /// [`Self::reclaim_deferred_current_on`] so the CPU-local claim is cleared
+    /// at the actual stack-abandon boundary rather than during syscall model
+    /// mutation.
     pub(crate) fn reclaim_deferred_current(
         &self,
         mut deferred: DeferredCurrentExecutionResources,
