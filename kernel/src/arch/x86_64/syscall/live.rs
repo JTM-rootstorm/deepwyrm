@@ -887,6 +887,20 @@ fn runtime_binding() -> Option<RuntimeBindingState> {
     Some(unsafe { (*storage.0.get()).assume_init() })
 }
 
+/// Reacquires the erased runtime carrier published for the physical CPU on
+/// which a suspended kernel continuation actually resumed. Kernel stack
+/// continuations may migrate, so the raw pointer saved in the outgoing Rust
+/// frame is not destination authority after a context switch returns.
+fn current_runtime_context<R>() -> Option<*mut ()>
+where
+    R: crate::syscall::native::NativeSyscallFrameRuntime
+        + crate::syscall::native::NativeRendezvousRuntime,
+{
+    let binding = runtime_binding()?;
+    let expected = native_runtime_trampoline::<R> as SyscallRuntimeHandler as usize;
+    (binding.handler as usize == expected).then_some(binding.context)
+}
+
 #[allow(
     unsafe_code,
     reason = "the CPU-private action slot is published before the divergent reaper consumes it"
@@ -1195,7 +1209,7 @@ unsafe fn native_runtime_trampoline<
     R: crate::syscall::native::NativeSyscallFrameRuntime
         + crate::syscall::native::NativeRendezvousRuntime,
 >(
-    context: *mut (),
+    mut context: *mut (),
     frame: &mut RawSyscallFrame,
 ) {
     if !crate::time::timer_service_is_healthy()
@@ -1382,6 +1396,11 @@ unsafe fn native_runtime_trampoline<
                     }
                 }
             }
+            // `switch_kernel_context` returns on the destination CPU. The
+            // outgoing stack frame still contains its source facade pointer;
+            // reacquire the destination's one-shot published carrier before
+            // any scheduler, terminal, mapping, or user-return operation.
+            context = current_runtime_context::<R>().unwrap_or_else(|| halt_forever());
             let generation = current_binding_generation();
             if let Err(error) = frame.rebind_after_kernel_resume(generation) {
                 invalid_bound_return::<R>(context, error);

@@ -533,6 +533,9 @@ fn i2_suspended_resume_gives_remote_stop_priority_under_scheduler_authority() {
         .expect("suspended syscall trampoline terminator")
         .0;
     let outcome = suspended.find("runtime.resume_suspended(frame)").unwrap();
+    let rebind = suspended
+        .find("current_runtime_context::<R>()")
+        .expect("destination runtime carrier rebind");
     let handoff = suspended[outcome..]
         .find("handoff_to_rendezvous_reaper(context)")
         .unwrap()
@@ -540,7 +543,7 @@ fn i2_suspended_resume_gives_remote_stop_priority_under_scheduler_authority() {
     let authorize = suspended
         .find("runtime.authorize_return(frame, generation)")
         .unwrap();
-    assert!(outcome < handoff && handoff < authorize);
+    assert!(rebind < outcome && outcome < handoff && handoff < authorize);
 }
 
 #[test]
