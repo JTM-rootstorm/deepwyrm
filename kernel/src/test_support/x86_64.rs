@@ -342,13 +342,13 @@ fn complete_known_outcome(outcome: CompletionOutcome, detail: u32) -> ! {
 }
 
 #[cfg(deepwyrm_i1_evidence)]
-const fn evidence_failure_detail(error: EvidenceFlushError) -> u32 {
+fn evidence_failure_detail(error: EvidenceFlushError) -> u32 {
     match error {
         EvidenceFlushError::NotFinalized => 0x4931_0001,
         EvidenceFlushError::NotReady => 0x4931_0002,
         EvidenceFlushError::Overflow => 0x4931_0003,
         EvidenceFlushError::Malformed => 0x4931_0004,
-        EvidenceFlushError::Invariant => 0x4931_0005,
+        EvidenceFlushError::Invariant => 0x4931_0500 | super::i1_runtime_missing_mask(),
         EvidenceFlushError::FinalizationClosed => 0x4931_0006,
         EvidenceFlushError::ReporterClaimed => 0x4931_0007,
         EvidenceFlushError::Transport => 0x4931_0008,

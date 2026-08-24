@@ -1002,6 +1002,38 @@ pub(crate) fn observe_reclaim_allowed(cpu: crate::cpu::CpuIndex) {
     ));
 }
 
+pub(crate) fn runtime_missing_mask() -> u32 {
+    let facts = I1_RUNTIME_FACTS.lock();
+    let mut missing = 0_u32;
+    if facts.cpl3_cpus.count_ones() < 2 {
+        missing |= 1 << 0;
+    }
+    if facts.parent.is_none() || !facts.descendant_observed {
+        missing |= 1 << 1;
+    }
+    if !facts.wake.is_some_and(|wake| wake.observed) {
+        missing |= 1 << 2;
+    }
+    if !facts.child.is_some_and(|child| child.cleaned) {
+        missing |= 1 << 3;
+    }
+    if !facts
+        .tlb
+        .is_some_and(|tlb| tlb.acknowledgements == tlb.targets)
+    {
+        missing |= 1 << 4;
+    }
+    if facts.rendezvous_targets == 0
+        || facts.rendezvous_acknowledgements != facts.rendezvous_targets
+    {
+        missing |= 1 << 5;
+    }
+    if !facts.reclaim_observed {
+        missing |= 1 << 6;
+    }
+    missing
+}
+
 fn encode(sequence: u32, slot: &Slot) -> [u8; I1_EVIDENCE_RECORD_LEN] {
     let mut record = [0_u8; I1_EVIDENCE_RECORD_LEN];
     record[..7].copy_from_slice(b"DWEVID1");

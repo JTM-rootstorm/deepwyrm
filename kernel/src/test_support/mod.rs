@@ -44,6 +44,7 @@ pub(crate) use evidence::{
     observe_rendezvous_ack as observe_i1_rendezvous_ack,
     observe_rendezvous_targets as observe_i1_rendezvous_targets,
     observe_tlb_ack as observe_i1_tlb_ack, observe_tlb_publish as observe_i1_tlb_publish,
+    runtime_missing_mask as i1_runtime_missing_mask,
 };
 
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
