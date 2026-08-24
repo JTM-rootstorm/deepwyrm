@@ -77,6 +77,11 @@ fn implemented_central_selectors_have_exact_kernel_identities() {
             BuildGuestTest::PrimordialInvalidReturn,
             21,
         ),
+        (
+            "smp-runtime-acceptance",
+            BuildGuestTest::SmpRuntimeAcceptance,
+            23,
+        ),
     ];
     for (selector, identity, id) in cases {
         assert_eq!(parse_known_selector(selector), identity);

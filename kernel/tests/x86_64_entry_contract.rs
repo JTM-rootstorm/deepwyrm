@@ -228,6 +228,7 @@ fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
         ("primordial-blocking-cleanup", 19),
         ("primordial-user-exception", 20),
         ("primordial-invalid-return", 21),
+        ("smp-runtime-acceptance", 23),
     ] {
         assert_eq!(
             kernel_build::select_guest_test(true, Some(selector), false, &harness),
@@ -255,6 +256,35 @@ fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
         kernel_build::select_guest_test(false, None, false, ""),
         Ok(None)
     );
+}
+
+#[test]
+fn i1_evidence_nonce_is_build_owned_and_strict() {
+    assert!(kernel_build::validate_i1_evidence_nonce("0123456789ABCDEF").is_ok());
+    for nonce in [
+        "0000000000000000",
+        "0123456789abcdef",
+        "0123456789ABCDE",
+        "0123456789ABCDEFF",
+        "0123456789ABCDEG",
+    ] {
+        assert!(kernel_build::validate_i1_evidence_nonce(nonce).is_err());
+    }
+}
+
+#[test]
+fn i1_evidence_has_one_terminal_com1_reporter() {
+    let evidence = fs::read_to_string(kernel_root().join("src/test_support/evidence.rs"))
+        .expect("read I1 evidence collector");
+    let terminal = fs::read_to_string(kernel_root().join("src/test_support/x86_64.rs"))
+        .expect("read terminal reporter");
+    assert!(evidence.contains("Workers have no serial-port API"));
+    assert!(!evidence.contains("emit_early_raw_record"));
+    assert!(terminal.contains("I1_EVIDENCE.finalize_running_invariant"));
+    assert!(terminal.contains("permit.flush"));
+    assert!(terminal.contains("begin_test_serial_transaction"));
+    assert!(terminal.contains(".write_evidence(record)"));
+    assert!(terminal.contains("emit_early_raw_record(record)"));
 }
 
 #[test]

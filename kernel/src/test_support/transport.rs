@@ -6,6 +6,13 @@ use super::protocol::{COMPLETION_RECORD_LEN, CompletionOutcome, CompletionRecord
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DebugExitValue(u32);
 
+/// A terminal serial transport could not publish its required record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompletionTransportError {
+    /// The serialized terminal record was not written completely.
+    Serial,
+}
+
 impl DebugExitValue {
     /// PASS value written by the guest.
     pub const PASS: Self = Self(0x10);
@@ -44,7 +51,10 @@ pub const fn expected_host_exit_status(value: DebugExitValue) -> u8 {
 /// boot artifacts or production configuration.
 pub trait CompletionTransport {
     /// Emit the exact machine-readable serial record.
-    fn write_serial_record(&mut self, record: &[u8; COMPLETION_RECORD_LEN]);
+    fn write_serial_record(
+        &mut self,
+        record: &[u8; COMPLETION_RECORD_LEN],
+    ) -> Result<(), CompletionTransportError>;
 
     /// Signal the terminal outcome through the outcome-only debug-exit path.
     fn write_debug_exit(&mut self, value: DebugExitValue);
@@ -57,15 +67,19 @@ pub trait CompletionTransport {
 ///
 /// This split operation is host-testable. Production integration should call
 /// [`complete`], which also enters the transport's terminal halt path.
-pub fn emit_completion<T: CompletionTransport>(transport: &mut T, record: CompletionRecord) {
+pub fn emit_completion<T: CompletionTransport>(
+    transport: &mut T,
+    record: CompletionRecord,
+) -> Result<(), CompletionTransportError> {
     let encoded = record.encode();
-    transport.write_serial_record(encoded.as_bytes());
+    transport.write_serial_record(encoded.as_bytes())?;
     transport.write_debug_exit(record.outcome.into());
+    Ok(())
 }
 
 /// Emit a terminal record and halt if QEMU does not exit.
 pub fn complete<T: CompletionTransport>(transport: &mut T, record: CompletionRecord) -> ! {
-    emit_completion(transport, record);
+    let _ = emit_completion(transport, record);
     transport.halt()
 }
 
@@ -93,10 +107,14 @@ mod tests {
     }
 
     impl CompletionTransport for CaptureTransport {
-        fn write_serial_record(&mut self, record: &[u8; COMPLETION_RECORD_LEN]) {
+        fn write_serial_record(
+            &mut self,
+            record: &[u8; COMPLETION_RECORD_LEN],
+        ) -> Result<(), CompletionTransportError> {
             self.order[self.order_len] = 1;
             self.order_len += 1;
             self.record = Some(*record);
+            Ok(())
         }
 
         fn write_debug_exit(&mut self, value: DebugExitValue) {
@@ -131,7 +149,7 @@ mod tests {
             detail: 9,
         };
         let mut transport = CaptureTransport::new();
-        emit_completion(&mut transport, record);
+        assert_eq!(emit_completion(&mut transport, record), Ok(()));
 
         assert_eq!(transport.order, [1, 2]);
         assert_eq!(transport.exit, Some(DebugExitValue::FAIL));
@@ -139,5 +157,37 @@ mod tests {
             EncodedCompletionRecord::parse(transport.record.as_ref().unwrap()),
             Ok(record)
         );
+    }
+
+    #[test]
+    fn serial_transport_failure_never_writes_a_success_exit() {
+        struct FailingTransport {
+            exit: Option<DebugExitValue>,
+        }
+        impl CompletionTransport for FailingTransport {
+            fn write_serial_record(
+                &mut self,
+                _record: &[u8; COMPLETION_RECORD_LEN],
+            ) -> Result<(), CompletionTransportError> {
+                Err(CompletionTransportError::Serial)
+            }
+            fn write_debug_exit(&mut self, value: DebugExitValue) {
+                self.exit = Some(value);
+            }
+            fn halt(&mut self) -> ! {
+                panic!("not reached")
+            }
+        }
+        let mut transport = FailingTransport { exit: None };
+        let record = CompletionRecord {
+            outcome: CompletionOutcome::Pass,
+            test_id: 23,
+            detail: 0,
+        };
+        assert_eq!(
+            emit_completion(&mut transport, record),
+            Err(CompletionTransportError::Serial)
+        );
+        assert_eq!(transport.exit, None);
     }
 }

@@ -6,6 +6,8 @@
 
 #![cfg(feature = "test-support")]
 
+#[cfg(deepwyrm_i1_evidence)]
+mod evidence;
 mod identity;
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 mod memory;
@@ -23,6 +25,15 @@ pub use protocol::{
 };
 pub use transport::{
     CompletionTransport, DebugExitValue, complete, emit_completion, expected_host_exit_status,
+};
+
+#[cfg(deepwyrm_i1_evidence)]
+#[allow(
+    unused_imports,
+    reason = "the target-only scenario hooks consume these typed APIs in the I1 runtime lane"
+)]
+pub(crate) use evidence::{
+    EvidenceEvent, EvidenceFlushError, EvidenceKind, I1_EVIDENCE, I1_EVIDENCE_RECORD_LEN,
 };
 
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]

@@ -59,6 +59,8 @@ const MAX_PANIC_REASON_BYTES: usize = 192;
 const MAX_BACKTRACE_FRAMES: usize = 16;
 #[cfg(any(test, feature = "test-support"))]
 const MAX_RAW_RECORD_BYTES: usize = 64;
+#[cfg(any(test, feature = "test-support"))]
+const TEST_EVIDENCE_RECORD_BYTES: usize = 85;
 
 /// Minimal byte-port interface used by the early serial writer.
 ///
@@ -618,6 +620,64 @@ pub(crate) fn emit_early_raw_record(record: &[u8]) -> Result<(), SerialError> {
     write_bounded_raw_record(&mut serial, record)
 }
 
+/// Writes one exact DWEVID1 record through COM1 without widening the ordinary
+/// diagnostic raw-record limit. Only the test-support reporter can name this
+/// fixed-size transport seam.
+#[cfg(all(
+    feature = "test-support",
+    target_os = "none",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+pub(crate) fn emit_test_evidence_record(
+    record: &[u8; TEST_EVIDENCE_RECORD_BYTES],
+) -> Result<(), SerialError> {
+    let _guard = OutputGuard::acquire().ok_or(SerialError::Busy)?;
+    let mut serial = Com1::new(X86PortIo);
+    write_bounded_test_evidence_record(&mut serial, record)
+}
+
+/// Exclusive test-only COM1 transaction used to keep DWEVID1 evidence and its
+/// following DWTEST1 terminal record indivisible against competing reporters.
+#[cfg(all(
+    feature = "test-support",
+    target_os = "none",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+pub(crate) struct TestSerialTransaction {
+    _guard: OutputGuard,
+    serial: Com1<X86PortIo>,
+}
+
+#[cfg(all(
+    feature = "test-support",
+    target_os = "none",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+pub(crate) fn begin_test_serial_transaction() -> Result<TestSerialTransaction, SerialError> {
+    Ok(TestSerialTransaction {
+        _guard: OutputGuard::acquire().ok_or(SerialError::Busy)?,
+        serial: Com1::new(X86PortIo),
+    })
+}
+
+#[cfg(all(
+    feature = "test-support",
+    target_os = "none",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+impl TestSerialTransaction {
+    pub(crate) fn write_evidence(
+        &mut self,
+        record: &[u8; TEST_EVIDENCE_RECORD_BYTES],
+    ) -> Result<(), SerialError> {
+        write_bounded_test_evidence_record(&mut self.serial, record)
+    }
+
+    pub(crate) fn write_terminal(&mut self, record: &[u8]) -> Result<(), SerialError> {
+        write_bounded_raw_record(&mut self.serial, record)
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 fn write_bounded_raw_record<P: PortIo>(
     serial: &mut Com1<P>,
@@ -631,6 +691,15 @@ fn write_bounded_raw_record<P: PortIo>(
         serial.wait_until_transmitter_drained()?;
     }
     Ok(())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn write_bounded_test_evidence_record<P: PortIo>(
+    serial: &mut Com1<P>,
+    record: &[u8; TEST_EVIDENCE_RECORD_BYTES],
+) -> Result<(), SerialError> {
+    serial.write_raw_bytes(record)?;
+    serial.wait_until_transmitter_drained()
 }
 
 #[cfg(test)]

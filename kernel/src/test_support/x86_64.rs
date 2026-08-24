@@ -10,14 +10,18 @@ use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::arch::x86_64::exceptions::{EarlyException, ExceptionVector};
 use crate::debug::emit_early_raw_record;
+#[cfg(deepwyrm_i1_evidence)]
+use crate::debug::{TestSerialTransaction, begin_test_serial_transaction};
 
+#[cfg(deepwyrm_i1_evidence)]
+use super::{EvidenceFlushError, I1_EVIDENCE};
 use super::{
     identity::{
         ExpectedPageFaultFacts, ExpectedPageFaultKind, completion_record, exception_outcome,
         expected_fault_selector, expected_page_fault_matches, expects_invalid_opcode,
     },
     protocol::{COMPLETION_RECORD_LEN, CompletionOutcome},
-    transport::{CompletionTransport, DebugExitValue, complete},
+    transport::{CompletionTransport, CompletionTransportError, DebugExitValue, complete},
 };
 
 /// Test-only I/O port configured by the centralized QEMU runner.
@@ -77,6 +81,8 @@ unsafe extern "sysv64" {
 /// that the QEMU-only I/O device is present on an arbitrary machine.
 struct QemuCompletionTransport {
     _private: (),
+    #[cfg(deepwyrm_i1_evidence)]
+    transaction: Option<TestSerialTransaction>,
 }
 
 impl QemuCompletionTransport {
@@ -93,15 +99,28 @@ impl QemuCompletionTransport {
         reason = "construction proves the test-only QEMU device precondition"
     )]
     const unsafe fn new() -> Self {
-        Self { _private: () }
+        Self {
+            _private: (),
+            #[cfg(deepwyrm_i1_evidence)]
+            transaction: None,
+        }
     }
 }
 
 impl CompletionTransport for QemuCompletionTransport {
-    fn write_serial_record(&mut self, record: &[u8; COMPLETION_RECORD_LEN]) {
+    fn write_serial_record(
+        &mut self,
+        record: &[u8; COMPLETION_RECORD_LEN],
+    ) -> Result<(), CompletionTransportError> {
         // The host requires both the serial record and matching process status;
         // a serial failure therefore becomes infrastructure failure, never PASS.
-        let _ = emit_early_raw_record(record);
+        #[cfg(deepwyrm_i1_evidence)]
+        if let Some(transaction) = self.transaction.as_mut() {
+            return transaction
+                .write_terminal(record)
+                .map_err(|_| CompletionTransportError::Serial);
+        }
+        emit_early_raw_record(record).map_err(|_| CompletionTransportError::Serial)
     }
 
     #[allow(
@@ -293,8 +312,47 @@ fn complete_known_outcome(outcome: CompletionOutcome, detail: u32) -> ! {
     // SAFETY: this function exists only in an x86_64-none `test-support` build
     // whose compile-time selector was resolved by the central QEMU harness
     // build path. Such artifacts are not production or physical-hardware images.
+    #[cfg(deepwyrm_i1_evidence)]
+    let permit = match I1_EVIDENCE.finalize_running_invariant() {
+        Ok(permit) => permit,
+        // A competing terminal path already owns the I1 transcript. It alone
+        // may write COM1 or debug-exit; losers simply stop.
+        Err(_) => halt_after_completion(),
+    };
     let mut transport = unsafe { QemuCompletionTransport::new() };
+    #[cfg(deepwyrm_i1_evidence)]
+    let (outcome, detail) = match begin_test_serial_transaction() {
+        Ok(transaction) => {
+            transport.transaction = Some(transaction);
+            match permit.flush(|record| {
+                transport
+                    .transaction
+                    .as_mut()
+                    .expect("I1 reporter owns its serial transaction")
+                    .write_evidence(record)
+                    .map_err(|_| EvidenceFlushError::Transport)
+            }) {
+                Ok(()) => (outcome, detail),
+                Err(error) => (CompletionOutcome::Fail, evidence_failure_detail(error)),
+            }
+        }
+        Err(_) => halt_after_completion(),
+    };
     complete(&mut transport, completion_record(outcome, detail))
+}
+
+#[cfg(deepwyrm_i1_evidence)]
+const fn evidence_failure_detail(error: EvidenceFlushError) -> u32 {
+    match error {
+        EvidenceFlushError::NotFinalized => 0x4931_0001,
+        EvidenceFlushError::NotReady => 0x4931_0002,
+        EvidenceFlushError::Overflow => 0x4931_0003,
+        EvidenceFlushError::Malformed => 0x4931_0004,
+        EvidenceFlushError::Invariant => 0x4931_0005,
+        EvidenceFlushError::FinalizationClosed => 0x4931_0006,
+        EvidenceFlushError::ReporterClaimed => 0x4931_0007,
+        EvidenceFlushError::Transport => 0x4931_0008,
+    }
 }
 
 /// Write one outcome-only value to QEMU's test exit device.
