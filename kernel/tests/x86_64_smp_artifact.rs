@@ -77,6 +77,7 @@ fn h1_trampoline_template_is_one_page_and_relocation_free() {
     assert_eq!(end.value - start.value, template.size);
 
     for (symbol, width) in [
+        ("__dw_ap_trampoline_physical_base", 4),
         ("__dw_ap_trampoline_gdt_base", 4),
         ("__dw_ap_trampoline_protected_entry", 4),
         ("__dw_ap_trampoline_page_table_root", 4),

@@ -26,10 +26,15 @@ __dw_ap_trampoline_protected_entry:
     movw %ax, %ds
     movw %ax, %es
     movw %ax, %ss
-    calll 1f
-1:
-    popl %ebx
-    subl $(1b - __dw_ap_trampoline_template_start), %ebx
+    # No 32-bit stack exists yet. Load the BSP-patched physical template base
+    # as an immediate instead of using CALL/POP position discovery, which
+    # would push through an uninitialized ESP before the AP's 64-bit private
+    # bootstrap stack becomes available.
+    .byte 0xbb
+.globl __dw_ap_trampoline_physical_base
+.hidden __dw_ap_trampoline_physical_base
+__dw_ap_trampoline_physical_base:
+    .long 0
     movl %cr4, %eax
     orl $0x20, %eax
     movl %eax, %cr4

@@ -39,6 +39,7 @@ fn h1_trampoline_plan_is_bounded_to_one_low_nonzero_page() {
     assert!(SMP_SOURCE.contains("physical_start < PAGE_SIZE"));
     assert!(SMP_SOURCE.contains("page_table_root >= 1_u64 << 32"));
     assert!(SMP_SOURCE.contains("startup_vector: (physical_start >> 12) as u8"));
+    assert!(SMP_SOURCE.contains("physical_base_patch"));
 }
 
 #[test]

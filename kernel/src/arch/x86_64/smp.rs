@@ -545,6 +545,7 @@ pub(crate) enum TrampolinePlanError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TrampolineTemplateLayout {
+    pub(crate) physical_base_patch: usize,
     pub(crate) gdt_offset: usize,
     pub(crate) gdt_base_patch: usize,
     pub(crate) protected_entry_offset: usize,
@@ -593,6 +594,12 @@ pub(crate) fn build_trampoline_image(
 
     destination.fill(0);
     destination[..template.len()].copy_from_slice(template);
+    write_u32(
+        destination,
+        layout.physical_base_patch,
+        u32::try_from(plan.physical_start)
+            .map_err(|_| TrampolineImageError::PhysicalOverflow)?,
+    );
     write_u32(destination, layout.gdt_base_patch, gdt);
     write_u32(destination, layout.protected_pointer_patch, protected);
     write_u32(
@@ -620,6 +627,7 @@ fn validate_template_layout(
     template_len: usize,
 ) -> Result<(), TrampolineImageError> {
     for (offset, width) in [
+        (layout.physical_base_patch, 4),
         (layout.gdt_base_patch, 4),
         (layout.protected_pointer_patch, 4),
         (layout.page_table_root_patch, 4),
@@ -664,6 +672,7 @@ pub(crate) fn linked_trampoline_template() -> (&'static [u8], TrampolineTemplate
     unsafe extern "C" {
         static __dw_ap_trampoline_template_start: u8;
         static __dw_ap_trampoline_template_end: u8;
+        static __dw_ap_trampoline_physical_base: u8;
         static __dw_ap_trampoline_gdt: u8;
         static __dw_ap_trampoline_gdt_base: u8;
         static __dw_ap_trampoline_protected_entry: u8;
@@ -685,6 +694,7 @@ pub(crate) fn linked_trampoline_template() -> (&'static [u8], TrampolineTemplate
     // SAFETY: the linker retains one contiguous immutable template from `start..end`.
     let template = unsafe { core::slice::from_raw_parts(start as *const u8, end - start) };
     let layout = TrampolineTemplateLayout {
+        physical_base_patch: offset(core::ptr::addr_of!(__dw_ap_trampoline_physical_base)),
         gdt_offset: offset(core::ptr::addr_of!(__dw_ap_trampoline_gdt)),
         gdt_base_patch: offset(core::ptr::addr_of!(__dw_ap_trampoline_gdt_base)),
         protected_entry_offset: offset(core::ptr::addr_of!(__dw_ap_trampoline_protected_entry)),
@@ -776,6 +786,7 @@ mod tests {
     fn trampoline_image_patches_only_validated_runtime_fields() {
         let template = [0xa5_u8; 96];
         let layout = TrampolineTemplateLayout {
+            physical_base_patch: 36,
             gdt_offset: 8,
             gdt_base_patch: 40,
             protected_entry_offset: 16,
@@ -804,6 +815,7 @@ mod tests {
             0xffff_9000_0001_0000,
         )
         .unwrap();
+        assert_eq!(&page[36..40], &0x8000_u32.to_le_bytes());
         assert_eq!(&page[40..44], &0x8008_u32.to_le_bytes());
         assert_eq!(&page[44..48], &0x8010_u32.to_le_bytes());
         assert_eq!(&page[48..52], &0x20_0000_u32.to_le_bytes());
