@@ -4097,6 +4097,87 @@ pub(crate) fn process_unhandled_exception<
     SyscallControl,
     Option<DeferredCurrentExecutionResources>,
 ) {
+    process_unhandled_exception_with_retirement(
+        registry,
+        tasks,
+        execution,
+        waits,
+        terminal_waits,
+        current_process,
+        current_thread,
+        exception,
+        DeferredCurrentRetirement::Model(current_thread),
+        cleanup,
+    )
+}
+
+pub(crate) fn process_unhandled_exception_on<
+    C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
+    terminal_waits: &mut C,
+    current_cpu: crate::cpu::CpuIndex,
+    current_process: ProcessKey,
+    current_thread: ThreadKey,
+    exception: TaskExceptionRecord,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> (
+    DwStatus,
+    SyscallControl,
+    Option<DeferredCurrentExecutionResources>,
+) {
+    process_unhandled_exception_with_retirement(
+        registry,
+        tasks,
+        execution,
+        waits,
+        terminal_waits,
+        current_process,
+        current_thread,
+        exception,
+        DeferredCurrentRetirement::Handoff {
+            cpu: current_cpu,
+            thread: current_thread,
+        },
+        cleanup,
+    )
+}
+
+fn process_unhandled_exception_with_retirement<
+    C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
+    terminal_waits: &mut C,
+    current_process: ProcessKey,
+    current_thread: ThreadKey,
+    exception: TaskExceptionRecord,
+    retirement: DeferredCurrentRetirement,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> (
+    DwStatus,
+    SyscallControl,
+    Option<DeferredCurrentExecutionResources>,
+) {
     if let Err(status) = validate_running_caller(tasks, execution, current_process, current_thread)
     {
         return (status, SyscallControl::ReturnToCaller, None);
@@ -4118,7 +4199,7 @@ pub(crate) fn process_unhandled_exception<
         execution,
         waits,
         effects,
-        Some(DeferredCurrentRetirement::Model(current_thread)),
+        Some(retirement),
         &[],
         terminal_waits,
         cleanup,
@@ -4261,8 +4342,8 @@ pub(crate) fn complete_prepared_process_termination<
         waits,
         terminal_waits,
         current_process,
-        current_thread,
         prepared,
+        DeferredCurrentRetirement::Model(current_thread),
         &[],
         cleanup,
     )
@@ -4304,8 +4385,55 @@ pub(crate) fn complete_prepared_process_termination_after_remote_stops<
         waits,
         terminal_waits,
         current_process,
-        current_thread,
         prepared,
+        DeferredCurrentRetirement::Model(current_thread),
+        remote_threads.as_slice(),
+        cleanup,
+    )
+}
+
+pub(crate) fn complete_prepared_process_termination_after_remote_stops_on<
+    C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
+    terminal_waits: &mut C,
+    current_cpu: crate::cpu::CpuIndex,
+    current_process: ProcessKey,
+    current_thread: ThreadKey,
+    prepared: PreparedProcessTermination<HANDLES, THREADS>,
+    permits: [Option<crate::arch::x86_64::rendezvous::RemoteStopReclaimPermit>;
+        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> (
+    DwStatus,
+    SyscallControl,
+    Option<DeferredCurrentExecutionResources>,
+) {
+    let remote_threads = permits
+        .each_ref()
+        .map(|permit| permit.as_ref().map(|permit| permit.thread()));
+    complete_prepared_process_termination_with_remote_threads(
+        registry,
+        tasks,
+        execution,
+        waits,
+        terminal_waits,
+        current_process,
+        prepared,
+        DeferredCurrentRetirement::Handoff {
+            cpu: current_cpu,
+            thread: current_thread,
+        },
         remote_threads.as_slice(),
         cleanup,
     )
@@ -4327,8 +4455,8 @@ fn complete_prepared_process_termination_with_remote_threads<
     waits: &WaitRegistry<WAITERS>,
     terminal_waits: &mut C,
     current_process: ProcessKey,
-    current_thread: ThreadKey,
     prepared: PreparedProcessTermination<HANDLES, THREADS>,
+    retirement: DeferredCurrentRetirement,
     remote_threads: &[Option<ThreadKey>],
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> (
@@ -4342,7 +4470,7 @@ fn complete_prepared_process_termination_with_remote_threads<
         execution,
         waits,
         prepared.effects,
-        Some(DeferredCurrentRetirement::Model(current_thread)),
+        Some(retirement),
         remote_threads,
         terminal_waits,
         cleanup,

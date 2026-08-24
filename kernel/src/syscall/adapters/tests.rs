@@ -2519,9 +2519,74 @@ fn unhandled_user_exception_defers_current_stack_and_records_structured_exit() {
 }
 
 #[test]
-fn current_process_termination_defers_execution_bundle_until_reaper_completion() {
+fn live_unhandled_exception_preserves_the_exact_ap_execution_bundle() {
     let (mut registry, mut tasks, process, process_handle) = process_fixture();
-    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let execution = ExecutionDomain::<2>::new(test_stack_bounds::<2>()).unwrap();
+    let waits = WaitRegistry::<2>::new();
+    let mut terminal_waits = NoTerminalWaitCleanup;
+    let mut cleanup = CleanupQueue::<16>::new();
+    let process_pin = resolve_current_handle(
+        &tasks,
+        &mut registry,
+        process,
+        process_handle,
+        deepwyrm_abi::DW_OBJECT_TYPE_PROCESS,
+        DW_RIGHT_MODIFY,
+    )
+    .unwrap();
+    let (current, current_ref) = tasks.create_thread(&mut registry, &process_pin).unwrap();
+    release_lookup_pin(&mut registry, process_pin, &mut cleanup);
+    execution
+        .start_thread(&mut tasks, current, test_start(0x21))
+        .unwrap();
+    let cpu1 = crate::cpu::CpuIndex::new(1).unwrap();
+    assert_eq!(
+        execution.schedule_next_on(cpu1).unwrap().current,
+        Some(current)
+    );
+    let (stack, context) = tasks.thread_execution_resources(current).unwrap().unwrap();
+
+    let deferred = terminal_outcome(
+        process_unhandled_exception_on(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut terminal_waits,
+            cpu1,
+            process,
+            current,
+            crate::task::TaskExceptionRecord::new(
+                deepwyrm_abi::DW_EXCEPTION_ILLEGAL_INSTRUCTION,
+                0,
+                0,
+            ),
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    assert!(execution.stack_bounds(stack).is_ok());
+    assert!(execution.load_context(context).is_ok());
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        cpu1,
+        deferred,
+        &mut cleanup,
+    );
+    assert!(execution.stack_bounds(stack).is_err());
+    assert!(execution.load_context(context).is_err());
+    cleanup.push_optional(registry.release_handle(current_ref).unwrap());
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+#[test]
+fn live_current_process_termination_preserves_the_exact_ap_execution_bundle() {
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let execution = ExecutionDomain::<2>::new(test_stack_bounds::<2>()).unwrap();
     let waits = WaitRegistry::<2>::new();
     let mut terminal_waits = NoTerminalWaitCleanup;
     let mut cleanup = CleanupQueue::<16>::new();
@@ -2539,21 +2604,37 @@ fn current_process_termination_defers_execution_bundle_until_reaper_completion()
     execution
         .start_thread(&mut tasks, current, test_start(0x11))
         .unwrap();
-    assert_eq!(execution.schedule_next().unwrap().current, Some(current));
+    let cpu1 = crate::cpu::CpuIndex::new(1).unwrap();
+    assert_eq!(
+        execution.schedule_next_on(cpu1).unwrap().current,
+        Some(current)
+    );
     let (stack, context) = tasks.thread_execution_resources(current).unwrap().unwrap();
 
+    let prepared = prepare_process_terminate(
+        &mut registry,
+        &mut tasks,
+        &execution,
+        process,
+        current,
+        process_handle,
+        deepwyrm_abi::DW_TERMINATION_AUTHORIZED,
+        0x20,
+        &mut cleanup,
+    )
+    .unwrap();
     let deferred = terminal_outcome(
-        process_terminate(
+        complete_prepared_process_termination_after_remote_stops_on(
             &mut registry,
             &mut tasks,
             &execution,
             &waits,
             &mut terminal_waits,
+            cpu1,
             process,
             current,
-            process_handle,
-            deepwyrm_abi::DW_TERMINATION_AUTHORIZED,
-            0x20,
+            prepared,
+            core::array::from_fn(|_| None),
             &mut cleanup,
         ),
         DW_STATUS_SUCCESS,
@@ -2562,7 +2643,14 @@ fn current_process_termination_defers_execution_bundle_until_reaper_completion()
     .unwrap();
     assert!(execution.stack_bounds(stack).is_ok());
     assert!(execution.load_context(context).is_ok());
-    complete_deferred_current_reclaim(&mut registry, &execution, &waits, deferred, &mut cleanup);
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        cpu1,
+        deferred,
+        &mut cleanup,
+    );
     assert!(execution.stack_bounds(stack).is_err());
     assert!(execution.load_context(context).is_err());
     cleanup.push_optional(registry.release_handle(current_ref).unwrap());

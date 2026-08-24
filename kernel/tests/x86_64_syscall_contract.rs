@@ -692,6 +692,13 @@ fn i2_live_dispatch_covers_every_stress_payload_syscall_family() {
             "pub(crate) fn complete_prepared_task_group_termination_after_remote_stops_on<"
         )
     );
+    assert!(runtime.contains("crate::syscall::process_unhandled_exception_on("));
+    assert!(adapters.contains("pub(crate) fn process_unhandled_exception_on<"));
+    assert!(
+        runtime.contains(
+            "crate::syscall::complete_prepared_process_termination_after_remote_stops_on("
+        )
+    );
 }
 
 #[test]

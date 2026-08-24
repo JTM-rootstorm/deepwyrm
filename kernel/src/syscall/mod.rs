@@ -52,11 +52,12 @@ pub(crate) use adapters::{NoTerminalWaitCleanup, abi_get_info};
 pub(crate) use adapters::{
     PreparedProcessTermination, PreparedTaskGroupTermination, address_region_map_prepared_model,
     address_region_protect_prepared, address_region_unmap_prepared,
-    complete_deferred_current_reclaim_on, complete_prepared_process_termination_after_remote_stops,
+    complete_deferred_current_reclaim_on,
+    complete_prepared_process_termination_after_remote_stops_on,
     complete_prepared_task_group_termination_after_remote_stops_on, complete_wait_wakes,
     decode_map_args, handle_close, handle_duplicate, object_get_info_v1,
     prepare_address_region_mutation, prepare_process_terminate, prepare_task_group_terminate,
-    process_exit_on, process_unhandled_exception, task_group_create,
+    process_exit_on, process_unhandled_exception_on, task_group_create,
 };
 #[cfg(all(
     not(deepwyrm_integrated),

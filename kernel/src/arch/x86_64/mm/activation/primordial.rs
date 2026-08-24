@@ -2015,12 +2015,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     assert!(atomic_pin.replace(pin).is_none());
                 },
             );
-            crate::syscall::process_unhandled_exception(
+            crate::syscall::process_unhandled_exception_on(
                 &mut self.registry,
                 &mut self.tasks,
                 &self.shared.execution,
                 &self.shared.waits,
                 &mut terminal,
+                self.cpu,
                 self.process,
                 self.thread,
                 exception,
@@ -4385,12 +4386,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 |output| assert!(discarded.replace(output).is_none()),
                 |pin| assert!(atomic_pin.replace(pin).is_none()),
             );
-            crate::syscall::complete_prepared_process_termination_after_remote_stops(
+            crate::syscall::complete_prepared_process_termination_after_remote_stops_on(
                 &mut self.registry,
                 &mut self.tasks,
                 &self.shared.execution,
                 &self.shared.waits,
                 &mut terminal,
+                self.cpu,
                 self.process,
                 self.thread,
                 prepared,
