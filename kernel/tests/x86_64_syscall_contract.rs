@@ -607,11 +607,15 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
     assert!(activation.contains(
         "#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;"
     ));
-    assert!(activation.contains(
-        "#[cfg(deepwyrm_wrcap_relay)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 4;"
-    ));
-    assert!(activation
-        .contains("#[cfg(deepwyrm_i2_stress)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 6;"));
+    assert!(
+        activation.contains(
+            "#[cfg(deepwyrm_wrcap_relay)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 4;"
+        )
+    );
+    assert!(
+        activation
+            .contains("#[cfg(deepwyrm_i2_stress)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 6;")
+    );
     assert!(
         runtime.contains(
             "#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]\nconst USERSPACE_CHAIN_PROCESSES: usize = 6;"
@@ -627,9 +631,7 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
             .contains("#[cfg(deepwyrm_wrcap_relay)]\nconst USERSPACE_CHAIN_PROCESSES: usize = 4;")
     );
     assert!(runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst TASK_GROUPS: usize = 2;"));
-    assert!(
-        runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst MEMORY_OBJECTS: usize = 12;")
-    );
+    assert!(runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst MEMORY_OBJECTS: usize = 12;"));
     assert!(runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst MEMORY_LEASES: usize = 13;"));
     assert!(runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst WAITERS: usize = 6;"));
     assert!(runtime.contains(
