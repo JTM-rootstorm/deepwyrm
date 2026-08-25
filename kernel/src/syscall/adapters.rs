@@ -4142,10 +4142,7 @@ pub(crate) fn prepare_process_exit<
     code: u32,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> Result<PreparedProcessTermination<HANDLES, THREADS>, DwStatus> {
-    if let Err(status) = validate_running_caller(tasks, execution, current_process, current_thread)
-    {
-        return Err(status);
-    }
+    validate_running_caller(tasks, execution, current_process, current_thread)?;
     let effects = match tasks.exit_process(registry, current_process, current_thread, code) {
         Ok(effects) => effects,
         Err(TaskError::OperationsInFlight) => {
@@ -4298,10 +4295,7 @@ pub(crate) fn prepare_process_unhandled_exception<
     exception: TaskExceptionRecord,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> Result<PreparedProcessTermination<HANDLES, THREADS>, DwStatus> {
-    if let Err(status) = validate_running_caller(tasks, execution, current_process, current_thread)
-    {
-        return Err(status);
-    }
+    validate_running_caller(tasks, execution, current_process, current_thread)?;
     let effects = match tasks.terminate_process_exception(
         registry,
         current_process,
@@ -4777,24 +4771,16 @@ pub(crate) fn prepare_thread_terminate<
     detail: u32,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> Result<PreparedThreadTermination<THREADS>, DwStatus> {
-    if let Err(status) = authorized_reason(reason) {
-        return Err(status);
-    }
-    if let Err(status) = validate_running_caller(tasks, execution, current_process, current_thread)
-    {
-        return Err(status);
-    }
-    let pin = match resolve_current_handle(
+    authorized_reason(reason)?;
+    validate_running_caller(tasks, execution, current_process, current_thread)?;
+    let pin = resolve_current_handle(
         tasks,
         registry,
         current_process,
         thread,
         deepwyrm_abi::DW_OBJECT_TYPE_THREAD,
         DW_RIGHT_MODIFY,
-    ) {
-        Ok(pin) => pin,
-        Err(status) => return Err(status),
-    };
+    )?;
     let target = ThreadKey::from_object_id(pin.id());
     let target_process = match tasks.thread_process(target) {
         Ok(process) => process,
