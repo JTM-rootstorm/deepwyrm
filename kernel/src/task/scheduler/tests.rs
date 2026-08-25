@@ -110,6 +110,140 @@ fn one_cpu_and_one_thread_cannot_be_claimed_twice() {
 }
 
 #[test]
+fn queued_and_running_threads_reject_duplicate_reservation() {
+    let scheduler = CooperativeScheduler::<2>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let queued = thread_key(&mut registry);
+    let running = thread_key(&mut registry);
+
+    scheduler
+        .commit(scheduler.reserve(queued).unwrap())
+        .unwrap();
+    assert_eq!(
+        scheduler.reserve(queued).unwrap_err(),
+        SchedulerError::DuplicateThread
+    );
+    scheduler
+        .commit(scheduler.reserve(running).unwrap())
+        .unwrap();
+    assert_eq!(scheduler.schedule_next().unwrap().current, Some(queued));
+    assert_eq!(
+        scheduler.reserve(queued).unwrap_err(),
+        SchedulerError::DuplicateThread
+    );
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn checked_accounting_freezes_overflow_and_rejects_bad_gauges_and_time() {
+    let mut counters = SchedulerCounters::default();
+    counters.context_switches = u64::MAX;
+    assert_eq!(
+        counters.increment(SchedulerEvent::ContextSwitch),
+        Err(SchedulerError::AccountingOverflow)
+    );
+    assert_eq!(counters.context_switches, u64::MAX);
+    assert!(counters.overflow_fault);
+
+    let mut gauge = SchedulerCounters::default();
+    assert_eq!(
+        gauge.decrement_runnable(),
+        Err(SchedulerError::AccountingUnderflow)
+    );
+    assert_eq!(gauge.current_runnable, 0);
+    gauge.current_runnable = u64::MAX;
+    assert_eq!(
+        gauge.increment_runnable(),
+        Err(SchedulerError::AccountingOverflow)
+    );
+    assert_eq!(gauge.current_runnable, u64::MAX);
+
+    let mut time = SchedulerCounters::default();
+    time.idle_time_ns = u64::MAX - 2;
+    assert_eq!(
+        time.record_idle_time(3),
+        Err(SchedulerError::AccountingOverflow)
+    );
+    assert_eq!(time.idle_time_ns, u64::MAX - 2);
+    assert_eq!(
+        time.observe_ready_delay(20, 19),
+        Err(SchedulerError::TimeRegression)
+    );
+    assert_eq!(time.longest_ready_delay_ns, 0);
+    time.observe_ready_delay(20, 27).unwrap();
+    time.observe_ready_delay(25, 29).unwrap();
+    assert_eq!(time.longest_ready_delay_ns, 7);
+}
+
+#[test]
+fn accounting_failure_cannot_grant_running_ownership() {
+    let scheduler = CooperativeScheduler::<1>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let thread = thread_key(&mut registry);
+    scheduler
+        .commit(scheduler.reserve(thread).unwrap())
+        .unwrap();
+    {
+        let mut state = scheduler.state.lock();
+        state.accounting.cpu[1].context_switches = u64::MAX;
+    }
+
+    assert_eq!(
+        scheduler.schedule_next_on(cpu(1)),
+        Err(SchedulerError::AccountingOverflow)
+    );
+    assert_eq!(scheduler.current_on(cpu(1)), None);
+    assert_eq!(
+        scheduler.state(thread),
+        Some(SchedulerThreadState::Runnable)
+    );
+    let counters = scheduler.counters_on(cpu(1));
+    assert_eq!(counters.context_switches, u64::MAX);
+    assert!(counters.overflow_fault);
+    assert_eq!(
+        scheduler.check_invariants(),
+        Err(SchedulerError::AccountingOverflow)
+    );
+}
+
+#[test]
+fn cooperative_transitions_update_exact_cpu_accounting() {
+    let scheduler = CooperativeScheduler::<2>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let first = thread_key(&mut registry);
+    let second = thread_key(&mut registry);
+    for thread in [first, second] {
+        scheduler
+            .commit(scheduler.reserve(thread).unwrap())
+            .unwrap();
+    }
+    assert_eq!(scheduler.counters_on(cpu(0)).current_runnable, 2);
+
+    scheduler.schedule_next_on(cpu(1)).unwrap();
+    let first_claim = scheduler.running_claim_on(cpu(1)).unwrap();
+    scheduler.yield_current_on(cpu(1), first).unwrap();
+    scheduler.complete_switch_on(first_claim).unwrap();
+    let second_claim = scheduler.running_claim_on(cpu(1)).unwrap();
+    let (blocked, decision) = scheduler.block_current_on(cpu(1), second).unwrap();
+    assert_eq!(decision.current, Some(first));
+    scheduler.wake(blocked.into_wake_key()).unwrap();
+    scheduler.complete_switch_on(second_claim).unwrap();
+    scheduler.retire_on(cpu(1), second).unwrap();
+    scheduler.retire_on(cpu(1), first).unwrap();
+
+    let bootstrap = scheduler.counters_on(cpu(0));
+    assert_eq!(bootstrap.current_runnable, 0);
+    let worker = scheduler.counters_on(cpu(1));
+    assert_eq!(worker.current_runnable, 0);
+    assert_eq!(worker.context_switches, 4);
+    assert_eq!(worker.voluntary_yields, 1);
+    assert_eq!(worker.voluntary_blocks, 1);
+    assert_eq!(worker.wakeups, 1);
+    assert!(!worker.overflow_fault);
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
 fn pending_blocks_are_cpu_local_and_reject_the_wrong_cpu() {
     let scheduler = CooperativeScheduler::<2>::new();
     let mut registry = ObjectRegistry::<16>::new();
@@ -1026,4 +1160,11 @@ fn dw0_f11_fixed_seed_scheduler_transaction_trace_preserves_queue_exclusivity() 
         covered.into_iter().all(core::convert::identity),
         "DW0-F11 seed={SEED:#x} did not cover every scheduler transaction"
     );
+    let counters = scheduler.counters_on(SchedulerCpuId::BOOTSTRAP);
+    assert_eq!(counters.current_runnable, 0);
+    assert_eq!(counters.context_switches, (CYCLES * 4) as u64);
+    assert_eq!(counters.voluntary_yields, CYCLES as u64);
+    assert_eq!(counters.voluntary_blocks, CYCLES as u64);
+    assert_eq!(counters.wakeups, CYCLES as u64);
+    assert!(!counters.overflow_fault);
 }
