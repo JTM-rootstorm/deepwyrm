@@ -319,6 +319,9 @@ fn wrcap_relay_is_selector_only_bounded_and_precedes_terminal_completion() {
     assert_eq!(primordial.matches("self.drain_wrcap_record();").count(), 1);
     assert!(terminal.contains("WRCAP_RELAY.claim_reporter()"));
     assert!(terminal.contains("WRCAP1 reporter owns its serial transaction"));
+    assert!(terminal.contains("wrcap_flush_failure(outcome, detail, error)"));
+    assert!(terminal.contains("if outcome == CompletionOutcome::Pass"));
+    assert!(terminal.contains("(outcome, detail)"));
     assert!(debug.contains("one_com1_transaction_orders_fifteen_wrcap_records_before_dwtest1"));
 }
 

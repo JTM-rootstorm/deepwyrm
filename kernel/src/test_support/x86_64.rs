@@ -355,12 +355,29 @@ fn complete_known_outcome(outcome: CompletionOutcome, detail: u32) -> ! {
                     .map_err(|_| WrcapFlushError::Transport)
             }) {
                 Ok(()) => (outcome, detail),
-                Err(error) => (CompletionOutcome::Fail, wrcap_failure_detail(error)),
+                Err(error) => wrcap_flush_failure(outcome, detail, error),
             }
         }
         Err(_) => halt_after_completion(),
     };
     complete(&mut transport, completion_record(outcome, detail))
+}
+
+#[cfg(deepwyrm_wrcap_relay)]
+fn wrcap_flush_failure(
+    outcome: CompletionOutcome,
+    detail: u32,
+    error: WrcapFlushError,
+) -> (CompletionOutcome, u32) {
+    if outcome == CompletionOutcome::Pass {
+        (CompletionOutcome::Fail, wrcap_failure_detail(error))
+    } else {
+        // A missing transcript is a consequence when the primordial process
+        // failed before evidence publication. Preserve that first exact
+        // application or kernel failure instead of replacing it with the
+        // secondary incomplete-relay diagnosis.
+        (outcome, detail)
+    }
 }
 
 #[cfg(deepwyrm_wrcap_relay)]
