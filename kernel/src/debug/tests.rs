@@ -16,7 +16,7 @@ struct FakePort {
     final_write_count_for_drain: Option<usize>,
     drain_polls_before_empty: usize,
     drain_poll_count: usize,
-    writes: [(u16, u8); 1024],
+    writes: [(u16, u8); 2048],
     write_count: usize,
 }
 
@@ -27,7 +27,7 @@ impl FakePort {
             final_write_count_for_drain: None,
             drain_polls_before_empty: 0,
             drain_poll_count: 0,
-            writes: [(0, 0); 1024],
+            writes: [(0, 0); 2048],
             write_count: 0,
         }
     }
@@ -38,7 +38,7 @@ impl FakePort {
             final_write_count_for_drain: None,
             drain_polls_before_empty: 0,
             drain_poll_count: 0,
-            writes: [(0, 0); 1024],
+            writes: [(0, 0); 2048],
             write_count: 0,
         }
     }
@@ -52,13 +52,13 @@ impl FakePort {
             final_write_count_for_drain: Some(final_write_count_for_drain),
             drain_polls_before_empty,
             drain_poll_count: 0,
-            writes: [(0, 0); 1024],
+            writes: [(0, 0); 2048],
             write_count: 0,
         }
     }
 
-    fn bytes(&self) -> [u8; 1024] {
-        let mut bytes = [0; 1024];
+    fn bytes(&self) -> [u8; 2048] {
+        let mut bytes = [0; 2048];
         let mut index = 0;
         while index < self.write_count {
             bytes[index] = self.writes[index].1;
@@ -154,12 +154,43 @@ fn raw_machine_records_are_bounded() {
 
 #[test]
 fn test_evidence_writer_transmits_the_exact_85_byte_record() {
-    let record = [b'E'; TEST_EVIDENCE_RECORD_BYTES];
+    const RECORD_BYTES: usize = 85;
+    let record = [b'E'; RECORD_BYTES];
     let mut serial = Com1::new(FakePort::ready());
     write_bounded_test_evidence_record(&mut serial, &record).unwrap();
     let port = serial.io;
-    assert_eq!(port.write_count, TEST_EVIDENCE_RECORD_BYTES);
-    assert_eq!(&port.bytes()[..TEST_EVIDENCE_RECORD_BYTES], &record);
+    assert_eq!(port.write_count, RECORD_BYTES);
+    assert_eq!(&port.bytes()[..RECORD_BYTES], &record);
+}
+
+#[test]
+fn one_com1_transaction_orders_ten_wrcap_records_before_dwtest1() {
+    const WRCAP_BYTES: usize = 117;
+    const WRCAP_COUNT: usize = 10;
+    const TERMINAL: &[u8] = b"DWTEST1|01|00000018|00000000|00000000\n";
+    let mut record = [b'0'; WRCAP_BYTES];
+    record[..6].copy_from_slice(b"WRCAP1");
+    record[WRCAP_BYTES - 1] = b'\n';
+
+    let mut serial = Com1::new(FakePort::ready());
+    for sequence in 0..WRCAP_COUNT {
+        record[34] = b'0' + u8::try_from(sequence).unwrap();
+        write_bounded_test_evidence_record(&mut serial, &record).unwrap();
+    }
+    write_bounded_raw_record(&mut serial, TERMINAL).unwrap();
+
+    let port = serial.io;
+    let bytes = port.bytes();
+    assert_eq!(port.write_count, WRCAP_BYTES * WRCAP_COUNT + TERMINAL.len());
+    for sequence in 0..WRCAP_COUNT {
+        let start = sequence * WRCAP_BYTES;
+        assert_eq!(&bytes[start..start + 6], b"WRCAP1");
+        assert_eq!(bytes[start + WRCAP_BYTES - 1], b'\n');
+    }
+    assert_eq!(
+        &bytes[WRCAP_BYTES * WRCAP_COUNT..port.write_count],
+        TERMINAL
+    );
 }
 
 #[test]

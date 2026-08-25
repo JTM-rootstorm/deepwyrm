@@ -34,6 +34,7 @@ pub(crate) enum BuildGuestTest {
     PrimordialInvalidReturn,
     SmpRuntimeStress,
     SmpRuntimeAcceptance,
+    NativeUserspaceCapability,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,6 +97,7 @@ impl BuildGuestTest {
             Self::PrimordialInvalidReturn => 21,
             Self::SmpRuntimeStress => 22,
             Self::SmpRuntimeAcceptance => 23,
+            Self::NativeUserspaceCapability => 24,
         }
     }
 
@@ -131,6 +133,7 @@ impl BuildGuestTest {
                 | Self::PrimordialInvalidReturn
                 | Self::SmpRuntimeStress
                 | Self::SmpRuntimeAcceptance
+                | Self::NativeUserspaceCapability
         )
     }
 
@@ -236,6 +239,8 @@ const fn parse_known_selector(value: &str) -> BuildGuestTest {
         BuildGuestTest::SmpRuntimeStress
     } else if string_equals(value, "smp-runtime-acceptance") {
         BuildGuestTest::SmpRuntimeAcceptance
+    } else if string_equals(value, "native-userspace-capability") {
+        BuildGuestTest::NativeUserspaceCapability
     } else {
         panic!("unknown build-selected guest test")
     }

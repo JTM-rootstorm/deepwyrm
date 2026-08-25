@@ -59,9 +59,6 @@ const MAX_PANIC_REASON_BYTES: usize = 192;
 const MAX_BACKTRACE_FRAMES: usize = 16;
 #[cfg(any(test, feature = "test-support"))]
 const MAX_RAW_RECORD_BYTES: usize = 64;
-#[cfg(any(test, deepwyrm_i1_evidence))]
-const TEST_EVIDENCE_RECORD_BYTES: usize = 85;
-
 /// Minimal byte-port interface used by the early serial writer.
 ///
 /// The trait keeps formatting and polling testable without permitting tests to
@@ -635,11 +632,12 @@ pub(crate) fn emit_early_raw_record(record: &[u8]) -> Result<(), SerialError> {
     write_bounded_raw_record(&mut serial, record)
 }
 
-/// Exclusive test-only COM1 transaction used to keep DWEVID1 evidence and its
-/// following DWTEST1 terminal record indivisible against competing reporters.
+/// Exclusive test-only COM1 transaction used to keep DWEVID1 or WRCAP1
+/// evidence and its following DWTEST1 terminal record indivisible against
+/// competing reporters.
 #[cfg(all(
     feature = "test-support",
-    deepwyrm_i1_evidence,
+    any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay),
     target_os = "none",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
@@ -650,7 +648,7 @@ pub(crate) struct TestSerialTransaction {
 
 #[cfg(all(
     feature = "test-support",
-    deepwyrm_i1_evidence,
+    any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay),
     target_os = "none",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
@@ -663,14 +661,14 @@ pub(crate) fn begin_test_serial_transaction() -> Result<TestSerialTransaction, S
 
 #[cfg(all(
     feature = "test-support",
-    deepwyrm_i1_evidence,
+    any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay),
     target_os = "none",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
 impl TestSerialTransaction {
-    pub(crate) fn write_evidence(
+    pub(crate) fn write_evidence<const BYTES: usize>(
         &mut self,
-        record: &[u8; TEST_EVIDENCE_RECORD_BYTES],
+        record: &[u8; BYTES],
     ) -> Result<(), SerialError> {
         write_bounded_test_evidence_record(&mut self.serial, record)
     }
@@ -695,10 +693,10 @@ fn write_bounded_raw_record<P: PortIo>(
     Ok(())
 }
 
-#[cfg(any(test, deepwyrm_i1_evidence))]
-fn write_bounded_test_evidence_record<P: PortIo>(
+#[cfg(any(test, deepwyrm_i1_evidence, deepwyrm_wrcap_relay))]
+fn write_bounded_test_evidence_record<P: PortIo, const BYTES: usize>(
     serial: &mut Com1<P>,
-    record: &[u8; TEST_EVIDENCE_RECORD_BYTES],
+    record: &[u8; BYTES],
 ) -> Result<(), SerialError> {
     serial.write_raw_bytes(record)?;
     serial.wait_until_transmitter_drained()

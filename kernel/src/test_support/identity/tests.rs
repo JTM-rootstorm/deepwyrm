@@ -82,6 +82,11 @@ fn implemented_central_selectors_have_exact_kernel_identities() {
             BuildGuestTest::SmpRuntimeAcceptance,
             23,
         ),
+        (
+            "native-userspace-capability",
+            BuildGuestTest::NativeUserspaceCapability,
+            24,
+        ),
     ];
     for (selector, identity, id) in cases {
         assert_eq!(parse_known_selector(selector), identity);
@@ -120,6 +125,7 @@ fn only_expected_invalid_opcode_is_classified_as_fail() {
         (BuildGuestTest::PrimordialBlockingCleanup, 6),
         (BuildGuestTest::PrimordialUserException, 6),
         (BuildGuestTest::PrimordialInvalidReturn, 6),
+        (BuildGuestTest::NativeUserspaceCapability, 6),
     ] {
         assert_eq!(
             exception_outcome_for(test, vector),
@@ -176,6 +182,7 @@ fn memory_and_task_selectors_have_distinct_post_activation_dispatch() {
         BuildGuestTest::PrimordialBlockingCleanup,
         BuildGuestTest::PrimordialUserException,
         BuildGuestTest::PrimordialInvalidReturn,
+        BuildGuestTest::NativeUserspaceCapability,
     ] {
         assert!(test.is_primordial());
         assert!(!test.is_memory_foundation());

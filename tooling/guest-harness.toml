@@ -138,3 +138,9 @@ state = "implemented"
 [guest_test.smp-runtime-acceptance]
 id = 23
 state = "implemented"
+
+# WYR0-I's test-support-only primordial evidence relay. Wyrmroot remains the
+# sole source of WRCAP1 facts; the kernel only validates and relays them.
+[guest_test.native-userspace-capability]
+id = 24
+state = "implemented"

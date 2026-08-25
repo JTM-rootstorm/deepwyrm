@@ -6,6 +6,9 @@
 
 #![cfg(feature = "test-support")]
 
+#[cfg(all(deepwyrm_i1_evidence, deepwyrm_wrcap_relay))]
+compile_error!("DWEVID1 and WRCAP1 terminal reporters are selector-exclusive");
+
 #[cfg(deepwyrm_i1_evidence)]
 mod evidence;
 mod identity;
@@ -15,6 +18,8 @@ mod protocol;
 #[cfg(all(deepwyrm_e7_guest, target_arch = "x86_64", target_os = "none"))]
 mod task;
 mod transport;
+#[cfg(any(test, deepwyrm_wrcap_relay))]
+mod wrcap;
 
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 mod x86_64;
@@ -26,6 +31,13 @@ pub use protocol::{
 pub use transport::{
     CompletionTransport, DebugExitValue, complete, emit_completion, expected_host_exit_status,
 };
+
+#[cfg(deepwyrm_wrcap_relay)]
+#[allow(
+    unused_imports,
+    reason = "the target-only primordial and terminal paths consume the WRCAP1 relay"
+)]
+pub(crate) use wrcap::{WRCAP_RECORD_LEN, WRCAP_RELAY, WrcapDrainAction, WrcapFlushError};
 
 #[cfg(deepwyrm_i1_evidence)]
 #[allow(

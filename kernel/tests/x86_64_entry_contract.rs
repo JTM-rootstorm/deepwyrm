@@ -230,6 +230,7 @@ fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
         ("primordial-invalid-return", 21),
         ("smp-runtime-stress", 22),
         ("smp-runtime-acceptance", 23),
+        ("native-userspace-capability", 24),
     ] {
         assert_eq!(
             kernel_build::select_guest_test(true, Some(selector), false, &harness),
@@ -286,6 +287,37 @@ fn i1_evidence_has_one_terminal_com1_reporter() {
     assert!(terminal.contains("begin_test_serial_transaction"));
     assert!(terminal.contains(".write_evidence(record)"));
     assert!(terminal.contains("emit_early_raw_record(record)"));
+}
+
+#[test]
+fn wrcap_relay_is_selector_only_bounded_and_precedes_terminal_completion() {
+    let build = fs::read_to_string(kernel_root().join("build.rs")).expect("read kernel build");
+    let relay = fs::read_to_string(kernel_root().join("src/test_support/wrcap.rs"))
+        .expect("read WRCAP1 relay");
+    let support = fs::read_to_string(kernel_root().join("src/test_support/mod.rs"))
+        .expect("read test-support boundary");
+    let primordial =
+        fs::read_to_string(kernel_root().join("src/arch/x86_64/mm/activation/primordial.rs"))
+            .expect("read primordial runtime");
+    let debug = fs::read_to_string(kernel_root().join("src/debug/tests.rs"))
+        .expect("read COM1 ordering tests");
+    let terminal = fs::read_to_string(kernel_root().join("src/test_support/x86_64.rs"))
+        .expect("read terminal reporter");
+
+    assert!(build.contains("cfg(deepwyrm_wrcap_relay)"));
+    assert!(build.contains("selector == \"native-userspace-capability\""));
+    assert!(support.contains("DWEVID1 and WRCAP1 terminal reporters are selector-exclusive"));
+    assert!(support.contains("#[cfg(any(test, deepwyrm_wrcap_relay))]\nmod wrcap;"));
+    assert!(relay.contains("const WRCAP_RECORD_COUNT: usize = 10;"));
+    assert!(relay.contains("pub(crate) const WRCAP_RECORD_LEN: usize = 117;"));
+    assert!(relay.contains("transcript.records[index].copy_from_slice(record)"));
+    assert!(primordial.contains(
+        "#[cfg(all(feature = \"test-support\", deepwyrm_wrcap_relay))]\n    fn drain_wrcap_record"
+    ));
+    assert_eq!(primordial.matches("self.drain_wrcap_record();").count(), 1);
+    assert!(terminal.contains("WRCAP_RELAY.claim_reporter()"));
+    assert!(terminal.contains("WRCAP1 reporter owns its serial transaction"));
+    assert!(debug.contains("one_com1_transaction_orders_ten_wrcap_records_before_dwtest1"));
 }
 
 #[test]

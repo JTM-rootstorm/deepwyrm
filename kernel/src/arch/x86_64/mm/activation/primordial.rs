@@ -22,6 +22,8 @@ use crate::boot::primordial::construction::{
     construct_primordial,
 };
 use crate::ipc::ChannelAuthority;
+#[cfg(all(feature = "test-support", deepwyrm_wrcap_relay))]
+use crate::ipc::ChannelError;
 use crate::memory::address_region::{
     AddressRegion, AddressRegionObjectAuthority, AddressSpaceAuthority, Protection,
 };
@@ -176,6 +178,7 @@ impl G5PrimordialProbe {
             BuildGuestTest::PrimordialBootstrap => G5PrimordialExpectation::Baseline,
             BuildGuestTest::SmpRuntimeStress => G5PrimordialExpectation::Baseline,
             BuildGuestTest::SmpRuntimeAcceptance => G5PrimordialExpectation::Baseline,
+            BuildGuestTest::NativeUserspaceCapability => G5PrimordialExpectation::Baseline,
             BuildGuestTest::PrimordialBlockingCleanup => G5PrimordialExpectation::BlockingCleanup,
             BuildGuestTest::PrimordialUserException => G5PrimordialExpectation::UserException,
             BuildGuestTest::PrimordialInvalidReturn => G5PrimordialExpectation::InvalidReturn,
@@ -2425,6 +2428,51 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         self.prove_registry_capacity().map_err(|_| 0x7000_0010_u32)
     }
+
+    /// Selector-24-only join between the Wyrmroot controller and the host
+    /// evidence parser. The kernel validates framing and preserves raw bytes;
+    /// it does not originate or interpret capability facts.
+    #[cfg(all(feature = "test-support", deepwyrm_wrcap_relay))]
+    fn drain_wrcap_record(&mut self) {
+        use crate::test_support::{WRCAP_RECORD_LEN, WRCAP_RELAY, WrcapDrainAction};
+
+        let info = match self.shared.channels.peek_receive(self.channel_keys[0]) {
+            Ok(info) => info,
+            Err(ChannelError::WouldBlock) => return,
+            Err(_) => {
+                let _ = WRCAP_RELAY.reject_receive();
+                return;
+            }
+        };
+        match WRCAP_RELAY.drain_action(info.required_bytes, info.required_handles) {
+            WrcapDrainAction::Drain => {}
+            WrcapDrainAction::LeaveForReady => return,
+            WrcapDrainAction::Reject => {
+                let _ = WRCAP_RELAY.reject_receive();
+                return;
+            }
+        }
+
+        let mut record = [0_u8; WRCAP_RECORD_LEN];
+        let (bytes, wakes) = match self.shared.channels.receive_into(
+            self.channel_keys[0],
+            &mut record,
+            &self.shared.waits,
+        ) {
+            Ok(received) => received,
+            Err(_) => {
+                let _ = WRCAP_RELAY.reject_receive();
+                return;
+            }
+        };
+        crate::syscall::complete_wait_wakes(
+            &mut self.registry,
+            &self.shared.execution,
+            wakes,
+            &mut self.cleanup,
+        );
+        let _ = WRCAP_RELAY.record(&record[..bytes]);
+    }
 }
 
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialCompletionBackend
@@ -2647,7 +2695,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
             self.active_root.as_ref().expect("active root"),
             self.process,
         );
-        frame.authorize_return(current_binding_generation, &mut mappings)
+        frame.authorize_return(current_binding_generation, &mut mappings)?;
+        drop(mappings);
+        #[cfg(all(feature = "test-support", deepwyrm_wrcap_relay))]
+        self.drain_wrcap_record();
+        Ok(())
     }
 
     fn invalid_return(&mut self, error: crate::arch::x86_64::syscall::UserReturnError) {

@@ -10,11 +10,13 @@ use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::arch::x86_64::exceptions::{EarlyException, ExceptionVector};
 use crate::debug::emit_early_raw_record;
-#[cfg(deepwyrm_i1_evidence)]
+#[cfg(any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay))]
 use crate::debug::{TestSerialTransaction, begin_test_serial_transaction};
 
 #[cfg(deepwyrm_i1_evidence)]
 use super::{EvidenceFlushError, I1_EVIDENCE};
+#[cfg(deepwyrm_wrcap_relay)]
+use super::{WRCAP_RELAY, WrcapFlushError};
 use super::{
     identity::{
         ExpectedPageFaultFacts, ExpectedPageFaultKind, completion_record, exception_outcome,
@@ -81,7 +83,7 @@ unsafe extern "sysv64" {
 /// that the QEMU-only I/O device is present on an arbitrary machine.
 struct QemuCompletionTransport {
     _private: (),
-    #[cfg(deepwyrm_i1_evidence)]
+    #[cfg(any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay))]
     transaction: Option<TestSerialTransaction>,
 }
 
@@ -101,7 +103,7 @@ impl QemuCompletionTransport {
     const unsafe fn new() -> Self {
         Self {
             _private: (),
-            #[cfg(deepwyrm_i1_evidence)]
+            #[cfg(any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay))]
             transaction: None,
         }
     }
@@ -114,7 +116,7 @@ impl CompletionTransport for QemuCompletionTransport {
     ) -> Result<(), CompletionTransportError> {
         // The host requires both the serial record and matching process status;
         // a serial failure therefore becomes infrastructure failure, never PASS.
-        #[cfg(deepwyrm_i1_evidence)]
+        #[cfg(any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay))]
         if let Some(transaction) = self.transaction.as_mut() {
             return transaction
                 .write_terminal(record)
@@ -319,11 +321,19 @@ fn complete_known_outcome(outcome: CompletionOutcome, detail: u32) -> ! {
         // may write COM1 or debug-exit; losers simply stop.
         Err(_) => halt_after_completion(),
     };
+    #[cfg(deepwyrm_wrcap_relay)]
+    let permit = match WRCAP_RELAY.claim_reporter() {
+        Ok(permit) => permit,
+        // One reporter owns the WRCAP1 + DWTEST1 serial transaction. A
+        // competing terminal path must not append a second transcript.
+        Err(_) => halt_after_completion(),
+    };
     let mut transport = unsafe { QemuCompletionTransport::new() };
-    #[cfg(deepwyrm_i1_evidence)]
+    #[cfg(any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay))]
     let (outcome, detail) = match begin_test_serial_transaction() {
         Ok(transaction) => {
             transport.transaction = Some(transaction);
+            #[cfg(deepwyrm_i1_evidence)]
             match permit.flush(|record| {
                 transport
                     .transaction
@@ -335,10 +345,36 @@ fn complete_known_outcome(outcome: CompletionOutcome, detail: u32) -> ! {
                 Ok(()) => (outcome, detail),
                 Err(error) => (CompletionOutcome::Fail, evidence_failure_detail(error)),
             }
+            #[cfg(deepwyrm_wrcap_relay)]
+            match permit.flush(|record| {
+                transport
+                    .transaction
+                    .as_mut()
+                    .expect("WRCAP1 reporter owns its serial transaction")
+                    .write_evidence(record)
+                    .map_err(|_| WrcapFlushError::Transport)
+            }) {
+                Ok(()) => (outcome, detail),
+                Err(error) => (CompletionOutcome::Fail, wrcap_failure_detail(error)),
+            }
         }
         Err(_) => halt_after_completion(),
     };
     complete(&mut transport, completion_record(outcome, detail))
+}
+
+#[cfg(deepwyrm_wrcap_relay)]
+fn wrcap_failure_detail(error: WrcapFlushError) -> u32 {
+    match error {
+        WrcapFlushError::Incomplete => 0x240a_f001,
+        WrcapFlushError::Malformed => 0x240a_f002,
+        WrcapFlushError::OutOfOrder => 0x240a_f003,
+        WrcapFlushError::Extra => 0x240a_f004,
+        WrcapFlushError::Receive => 0x240a_f005,
+        WrcapFlushError::ReporterClaimed => 0x240a_f006,
+        WrcapFlushError::Busy => 0x240a_f007,
+        WrcapFlushError::Transport => 0x240a_f008,
+    }
 }
 
 #[cfg(deepwyrm_i1_evidence)]
