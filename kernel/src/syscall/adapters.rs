@@ -3859,6 +3859,8 @@ pub(crate) fn task_group_terminate<
         registry,
         tasks,
         execution,
+        waits,
+        terminal_waits,
         current_process,
         current_thread,
         task_group,
@@ -3882,16 +3884,20 @@ pub(crate) fn task_group_terminate<
 }
 
 pub(crate) fn prepare_task_group_terminate<
+    C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
     const OBJECTS: usize,
     const GROUPS: usize,
     const PROCESSES: usize,
     const THREADS: usize,
     const HANDLES: usize,
+    const WAITERS: usize,
     const EXECUTION: usize,
 >(
     registry: &mut ObjectRegistry<OBJECTS>,
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
+    terminal_waits: &mut C,
     current_process: ProcessKey,
     current_thread: ThreadKey,
     task_group: DwHandle,
@@ -3911,6 +3917,26 @@ pub(crate) fn prepare_task_group_terminate<
     let key = TaskGroupKey::from_object_id(pin.id());
     let effects = match tasks.terminate_group(registry, key) {
         Ok(effects) => effects,
+        Err(TaskError::OperationsInFlight) => {
+            let threads = match tasks.task_group_thread_keys(key) {
+                Ok(threads) => threads,
+                Err(error) => {
+                    release_lookup_pin(registry, pin, cleanup);
+                    return Err(task_status(error));
+                }
+            };
+            for thread in threads.into_iter().flatten() {
+                terminal_waits
+                    .cleanup_terminal_wait(registry, tasks, waits, execution, thread, cleanup);
+            }
+            match tasks.terminate_group(registry, key) {
+                Ok(effects) => effects,
+                Err(error) => {
+                    release_lookup_pin(registry, pin, cleanup);
+                    return Err(task_status(error));
+                }
+            }
+        }
         Err(error) => {
             release_lookup_pin(registry, pin, cleanup);
             return Err(task_status(error));
@@ -4048,6 +4074,24 @@ pub(crate) fn process_exit_on<
     }
     let effects = match tasks.exit_process(registry, current_process, current_thread, code) {
         Ok(effects) => effects,
+        Err(TaskError::OperationsInFlight) => {
+            let threads = match tasks.process_thread_keys(current_process) {
+                Ok(threads) => threads,
+                Err(error) => {
+                    return (task_status(error), SyscallControl::ReturnToCaller, None);
+                }
+            };
+            for thread in threads.into_iter().flatten() {
+                terminal_waits
+                    .cleanup_terminal_wait(registry, tasks, waits, execution, thread, cleanup);
+            }
+            match tasks.exit_process(registry, current_process, current_thread, code) {
+                Ok(effects) => effects,
+                Err(error) => {
+                    return (task_status(error), SyscallControl::ReturnToCaller, None);
+                }
+            }
+        }
         Err(error) => return (task_status(error), SyscallControl::ReturnToCaller, None),
     };
     let deferred = collect_process_effects(
@@ -4193,6 +4237,31 @@ fn process_unhandled_exception_with_retirement<
         exception.fault_address,
     ) {
         Ok(effects) => effects,
+        Err(TaskError::OperationsInFlight) => {
+            let threads = match tasks.process_thread_keys(current_process) {
+                Ok(threads) => threads,
+                Err(error) => {
+                    return (task_status(error), SyscallControl::ReturnToCaller, None);
+                }
+            };
+            for thread in threads.into_iter().flatten() {
+                terminal_waits
+                    .cleanup_terminal_wait(registry, tasks, waits, execution, thread, cleanup);
+            }
+            match tasks.terminate_process_exception(
+                registry,
+                current_process,
+                current_thread,
+                exception.exception_type,
+                exception.detail,
+                exception.fault_address,
+            ) {
+                Ok(effects) => effects,
+                Err(error) => {
+                    return (task_status(error), SyscallControl::ReturnToCaller, None);
+                }
+            }
+        }
         Err(error) => return (task_status(error), SyscallControl::ReturnToCaller, None),
     };
     let deferred = collect_process_effects(
@@ -4619,6 +4688,17 @@ pub(crate) fn thread_terminate<
     };
     let pins = match tasks.terminate_thread_authorized(target, detail) {
         Ok(pins) => pins,
+        Err(TaskError::OperationsInFlight) => {
+            terminal_waits
+                .cleanup_terminal_wait(registry, tasks, waits, execution, target, cleanup);
+            match tasks.terminate_thread_authorized(target, detail) {
+                Ok(pins) => pins,
+                Err(error) => {
+                    release_lookup_pin(registry, pin, cleanup);
+                    return (task_status(error), SyscallControl::ReturnToCaller, None);
+                }
+            }
+        }
         Err(error) => {
             release_lookup_pin(registry, pin, cleanup);
             return (task_status(error), SyscallControl::ReturnToCaller, None);

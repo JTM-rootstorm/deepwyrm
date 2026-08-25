@@ -1248,6 +1248,119 @@ fn terminal_generic_and_atomic_cleanup_leave_the_service_quiescent() {
 }
 
 #[test]
+fn terminal_cleanup_drains_two_atomic_waits_with_a_finite_deadline() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (process, process_reference) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let process_owner = registry
+        .retain_internal_from_handle(&process_reference)
+        .unwrap();
+    let (first, first_reference) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    let (second, second_reference) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    assert!(registry.release_handle(first_reference).unwrap().is_none());
+    assert!(registry.release_handle(second_reference).unwrap().is_none());
+    assert!(
+        registry
+            .release_handle(process_reference)
+            .unwrap()
+            .is_none()
+    );
+    assert!(registry.release_internal(process_owner).unwrap().is_none());
+    assert!(registry.release_internal(root_owner).unwrap().is_none());
+
+    let execution = ExecutionDomain::<EXECUTION>::new(test_stack_bounds()).unwrap();
+    for (thread, seed) in [(first, 1_u64), (second, 2_u64)] {
+        execution
+            .start_thread(
+                &mut tasks,
+                thread,
+                ThreadStartState::from_validated_user_state(
+                    0x0000_0000_4000_0000 + seed * 0x1000,
+                    0x0000_0000_5000_0000 + seed * 0x1000,
+                    seed,
+                    seed + 1,
+                ),
+            )
+            .unwrap();
+    }
+    assert_eq!(execution.schedule_next().unwrap().current, Some(first));
+
+    let mut services = Services::new();
+    let mut user = FakeUserMemory::new();
+    user.atomic_value = 0x77;
+    let mut deadlines = TestWaitDeadlines::<2>::new();
+    for (thread, address, deadline) in [
+        (
+            first,
+            DwUserAddress(BASE + 0xc00),
+            WaitDeadline::Finite(50_000),
+        ),
+        (second, DwUserAddress(BASE + 0xc04), WaitDeadline::Infinite),
+    ] {
+        let key = stable_atomic_key(&mut registry);
+        let pin = user.pin_atomic_u32(address).unwrap();
+        let suspended = begin_atomic_wait(
+            pin,
+            key,
+            0x77,
+            deadline,
+            &services.atomic_waits,
+            &mut tasks,
+            &execution,
+            &mut services.atomic_operations,
+            Some(&mut deadlines),
+            process,
+            thread,
+            |pin| user.load_atomic_u32_acquire(pin),
+        )
+        .unwrap_or_else(|failure| panic!("multi-atomic setup failed: {:?}", failure.error));
+        let AtomicWaitBegin::Suspended { .. } = suspended else {
+            panic!("matching atomic wait did not suspend")
+        };
+        if let Some(switched) = execution.suspended_claim_on(crate::cpu::CpuIndex::BOOTSTRAP) {
+            assert_eq!(switched.thread(), thread);
+            execution.complete_switch_on(switched).unwrap();
+        }
+    }
+    assert_eq!(user.atomic_pins, 2);
+    assert_eq!(
+        services.operation_owner(first),
+        Ok(FServiceOperationOwner::AtomicWait)
+    );
+    assert_eq!(
+        services.operation_owner(second),
+        Ok(FServiceOperationOwner::AtomicWait)
+    );
+
+    let waits = WaitRegistry::<WAITERS>::new();
+    let mut cleanup = CleanupQueue::<OBJECTS>::new();
+    {
+        let mut terminal = services.terminal_cleanup(
+            Some(&mut deadlines),
+            |_| panic!("atomic terminal cleanup cannot own a userspace output"),
+            |pin| user.release_atomic_u32(pin),
+        );
+        for thread in [first, second] {
+            terminal.cleanup_terminal_wait(
+                &mut registry,
+                &mut tasks,
+                &waits,
+                &execution,
+                thread,
+                &mut cleanup,
+            );
+        }
+    }
+    assert_empty_cleanup(cleanup);
+    assert_eq!(user.atomic_pins, 0);
+    assert_eq!(deadlines.queue.earliest(), None);
+    assert!(services.is_quiescent());
+    assert!(!execution.blocked_operations().has_thread(first));
+    assert!(!execution.blocked_operations().has_thread(second));
+}
+
+#[test]
 fn prepared_dispatch_rejects_root_drift_before_usercopy_or_authority_borrow() {
     let fixture = Fixture::new();
     let prepared = fixture

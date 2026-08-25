@@ -482,6 +482,30 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         Ok(threads.map(|thread| thread.map(ThreadKey)))
     }
 
+    pub(crate) fn task_group_thread_keys(
+        &self,
+        key: TaskGroupKey,
+    ) -> Result<[Option<ThreadKey>; THREADS], TaskError> {
+        let selected = self.group_subtree_slots(key)?;
+        let mut threads = [None; THREADS];
+        let mut count = 0;
+        for process in self.processes.iter().flatten() {
+            if !matches!(process.hierarchy, ProcessHierarchyState::Attached(_)) {
+                continue;
+            }
+            let parent_slot = self.group_slot(TaskGroupKey(process.parent.id()))?;
+            if !selected[parent_slot] {
+                continue;
+            }
+            for object in process.threads.into_iter().flatten() {
+                assert!(count < THREADS, "selected TaskGroup thread list overflow");
+                threads[count] = Some(ThreadKey(object));
+                count += 1;
+            }
+        }
+        Ok(threads)
+    }
+
     /// Acquires move-only authority for setup or publication associated with a
     /// live Process. New leases are rejected as soon as quiescing begins.
     pub(crate) fn acquire_process_operation(
@@ -855,7 +879,7 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
                 self.begin_process_termination(process_key, TerminationRecord::normal(code))
                     .map_err(|error| match error {
                         ProcessGateError::Task(error) => error,
-                        ProcessGateError::OperationsInFlight => TaskError::BadState,
+                        ProcessGateError::OperationsInFlight => TaskError::OperationsInFlight,
                     })?,
             )
         } else {
@@ -908,7 +932,7 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
                 self.begin_process_termination(process_key, TerminationRecord::authorized(detail))
                     .map_err(|error| match error {
                         ProcessGateError::Task(error) => error,
-                        ProcessGateError::OperationsInFlight => TaskError::BadState,
+                        ProcessGateError::OperationsInFlight => TaskError::OperationsInFlight,
                     })?,
             )
         } else {
@@ -1778,7 +1802,7 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
                 )
                 .map_err(|error| match error {
                     ProcessGateError::Task(error) => error,
-                    ProcessGateError::OperationsInFlight => TaskError::BadState,
+                    ProcessGateError::OperationsInFlight => TaskError::OperationsInFlight,
                 })?;
             }
         }

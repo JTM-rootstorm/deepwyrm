@@ -2936,6 +2936,521 @@ fn non_current_process_termination_drains_a_suspended_wait_lease() {
 }
 
 #[test]
+fn external_final_blocked_thread_cleanup_precedes_process_quiescence_and_reclaim() {
+    use deepwyrm_abi::{
+        DW_DEADLINE_INFINITE, DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED, DW_TERMINATION_AUTHORIZED,
+    };
+
+    let mut registry = ObjectRegistry::<24>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (caller_process, caller_process_ref) =
+        tasks.create_process(&mut registry, &root_owner).unwrap();
+    let (target_process, target_process_ref) =
+        tasks.create_process(&mut registry, &root_owner).unwrap();
+    let caller_owner = registry
+        .retain_internal_from_handle(&caller_process_ref)
+        .unwrap();
+    let target_owner = registry
+        .retain_internal_from_handle(&target_process_ref)
+        .unwrap();
+    let (target, target_ref) = tasks.create_thread(&mut registry, &target_owner).unwrap();
+    let (caller, caller_ref) = tasks.create_thread(&mut registry, &caller_owner).unwrap();
+    assert!(registry.release_internal(caller_owner).unwrap().is_none());
+    assert!(registry.release_internal(target_owner).unwrap().is_none());
+    let target_handle = tasks
+        .process_handles_mut(caller_process)
+        .unwrap()
+        .install(target_ref, DW_RIGHT_MODIFY)
+        .unwrap();
+    let events = EventAuthority::<1>::new();
+    let timers = TimerAuthority::<1>::new();
+    let channels = ChannelAuthority::<1, 2>::new();
+    let waits = WaitRegistry::<4>::new();
+    let (_event_key, event_ref) = events.create_event(&mut registry).unwrap();
+    let event = tasks
+        .process_handles_mut(target_process)
+        .unwrap()
+        .install(event_ref, DW_RIGHT_WAIT)
+        .unwrap();
+    let execution = ExecutionDomain::<2>::new(test_stack_bounds::<2>()).unwrap();
+    execution
+        .start_thread(&mut tasks, target, test_start(0xd7))
+        .unwrap();
+    execution
+        .start_thread(&mut tasks, caller, test_start(0xd8))
+        .unwrap();
+    assert_eq!(execution.schedule_next().unwrap().current, Some(target));
+    let mut operations = WaitOperationRegistry::<u32, 2>::new();
+    let wake = match wait_one_begin(
+        0xd9,
+        &mut registry,
+        &mut tasks,
+        &events,
+        &timers,
+        &channels,
+        &waits,
+        &execution,
+        &mut operations,
+        None,
+        crate::cpu::CpuIndex::BOOTSTRAP,
+        target_process,
+        target,
+        event,
+        DW_SIGNAL_SIGNALED,
+        DW_DEADLINE_INFINITE,
+    ) {
+        WaitSyscallBegin::Suspended { wake, .. } => wake,
+        _ => panic!("final target wait did not suspend"),
+    };
+    let switched = execution
+        .suspended_claim_on(crate::cpu::CpuIndex::BOOTSTRAP)
+        .unwrap();
+    execution.complete_switch_on(switched).unwrap();
+    assert_eq!(
+        execution.scheduler_state(caller),
+        Some(SchedulerThreadState::Running)
+    );
+
+    let mut cleanup = CleanupQueue::<24>::new();
+    let mut discarded = None;
+    {
+        let mut terminal = WaitTerminalCleanup::new(&mut operations, None, |output| {
+            assert!(discarded.replace(output).is_none());
+        });
+        assert!(
+            terminal_outcome(
+                thread_terminate(
+                    &mut registry,
+                    &mut tasks,
+                    &execution,
+                    &waits,
+                    &mut terminal,
+                    caller_process,
+                    caller,
+                    target_handle,
+                    DW_TERMINATION_AUTHORIZED,
+                    0xda,
+                    &mut cleanup,
+                ),
+                DW_STATUS_SUCCESS,
+                SyscallControl::ReturnToCaller,
+            )
+            .is_none()
+        );
+    }
+    assert_eq!(discarded, Some(0xd9));
+    assert!(operations.is_empty());
+    assert_eq!(waits.len(), 0);
+    assert!(!execution.blocked_operations().has_thread(target));
+    assert_eq!(execution.scheduler_state(target), None);
+    assert_eq!(
+        execution.blocked_operations().winner(wake),
+        Err(crate::task::BlockedOperationError::StaleReservation)
+    );
+    let thread_info = tasks.thread_info(target).unwrap();
+    assert_eq!(thread_info.reason, DW_TERMINATION_AUTHORIZED);
+    assert_eq!(thread_info.detail, 0xda);
+    let process_info = tasks.process_info(target_process).unwrap();
+    assert_eq!(process_info.reason, DW_TERMINATION_AUTHORIZED);
+    assert_eq!(process_info.detail, 0xda);
+
+    let deferred = terminal_outcome(
+        process_exit_on(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut NoTerminalWaitCleanup,
+            crate::cpu::CpuIndex::BOOTSTRAP,
+            caller_process,
+            caller,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        crate::cpu::CpuIndex::BOOTSTRAP,
+        deferred,
+        &mut cleanup,
+    );
+    cleanup.push_optional(registry.release_handle(caller_ref).unwrap());
+    cleanup.push_optional(registry.release_handle(caller_process_ref).unwrap());
+    cleanup.push_optional(registry.release_handle(target_process_ref).unwrap());
+    cleanup.push_optional(registry.release_internal(root_owner).unwrap());
+    for release in cleanup.into_releases().into_iter().flatten() {
+        if release.object_type() == deepwyrm_abi::DW_OBJECT_TYPE_EVENT {
+            let finalization = events.take_finalization(release).unwrap();
+            crate::wait::complete_event_finalization(&mut registry, finalization);
+            continue;
+        }
+        let mut pending = Some(release);
+        while let Some(release) = pending.take() {
+            let finalization = tasks.take_finalization(release).unwrap();
+            pending = crate::task::complete_task_finalization(&mut registry, finalization);
+        }
+    }
+}
+
+fn terminate_current_process_with_blocked_sibling(exception: bool) {
+    use deepwyrm_abi::{DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED};
+
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let events = EventAuthority::<1>::new();
+    let timers = TimerAuthority::<1>::new();
+    let channels = ChannelAuthority::<1, 2>::new();
+    let waits = WaitRegistry::<4>::new();
+    let execution = ExecutionDomain::<2>::new(test_stack_bounds::<2>()).unwrap();
+    let (event_key, event_ref) = events.create_event(&mut registry).unwrap();
+    let event = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(event_ref, DW_RIGHT_WAIT)
+        .unwrap();
+    let process_pin = resolve_current_handle(
+        &tasks,
+        &mut registry,
+        process,
+        process_handle,
+        deepwyrm_abi::DW_OBJECT_TYPE_PROCESS,
+        DW_RIGHT_MODIFY,
+    )
+    .unwrap();
+    let (current, current_ref) = tasks.create_thread(&mut registry, &process_pin).unwrap();
+    let (sibling, sibling_ref) = tasks.create_thread(&mut registry, &process_pin).unwrap();
+    let mut cleanup = CleanupQueue::<16>::new();
+    release_lookup_pin(&mut registry, process_pin, &mut cleanup);
+    execution
+        .start_thread(&mut tasks, current, test_start(0xe1))
+        .unwrap();
+    execution
+        .start_thread(&mut tasks, sibling, test_start(0xe2))
+        .unwrap();
+    assert_eq!(execution.schedule_next().unwrap().current, Some(current));
+    assert_eq!(
+        execution.yield_current(current).unwrap().current,
+        Some(sibling)
+    );
+
+    let mut operations = WaitOperationRegistry::<u32, 2>::new();
+    let mut deadlines = AdapterDeadline::<2>::new();
+    assert!(matches!(
+        wait_one_begin(
+            0xe3,
+            &mut registry,
+            &mut tasks,
+            &events,
+            &timers,
+            &channels,
+            &waits,
+            &execution,
+            &mut operations,
+            Some(&mut deadlines),
+            crate::cpu::CpuIndex::BOOTSTRAP,
+            process,
+            sibling,
+            event,
+            DW_SIGNAL_SIGNALED,
+            deepwyrm_abi::DwDeadline(10_000),
+        ),
+        WaitSyscallBegin::Suspended { .. }
+    ));
+    let switched = execution
+        .suspended_claim_on(crate::cpu::CpuIndex::BOOTSTRAP)
+        .unwrap();
+    assert_eq!(switched.thread(), sibling);
+    execution.complete_switch_on(switched).unwrap();
+    assert_eq!(
+        execution.scheduler_state(current),
+        Some(SchedulerThreadState::Running)
+    );
+
+    let mut discarded = std::vec::Vec::new();
+    let deferred = {
+        let mut terminal =
+            WaitTerminalCleanup::new(&mut operations, Some(&mut deadlines), |output| {
+                discarded.push(output)
+            });
+        let outcome = if exception {
+            process_unhandled_exception(
+                &mut registry,
+                &mut tasks,
+                &execution,
+                &waits,
+                &mut terminal,
+                process,
+                current,
+                crate::task::TaskExceptionRecord::new(
+                    deepwyrm_abi::DW_EXCEPTION_PAGE_FAULT,
+                    0xe4,
+                    0xe5,
+                ),
+                &mut cleanup,
+            )
+        } else {
+            process_exit_on(
+                &mut registry,
+                &mut tasks,
+                &execution,
+                &waits,
+                &mut terminal,
+                crate::cpu::CpuIndex::BOOTSTRAP,
+                process,
+                current,
+                0xe6,
+                &mut cleanup,
+            )
+        };
+        terminal_outcome(outcome, DW_STATUS_SUCCESS, SyscallControl::TerminateCurrent).unwrap()
+    };
+    assert_eq!(discarded, std::vec![0xe3]);
+    assert!(operations.is_empty());
+    assert_eq!(waits.len(), 0);
+    assert!(!execution.blocked_operations().has_thread(sibling));
+    let info = tasks.process_info(process).unwrap();
+    if exception {
+        assert_eq!(
+            info.reason,
+            deepwyrm_abi::DW_TERMINATION_UNHANDLED_EXCEPTION
+        );
+        assert_eq!(info.detail, 0xe4);
+        assert_eq!(info.fault_address, 0xe5);
+    } else {
+        assert_eq!(info.reason, deepwyrm_abi::DW_TERMINATION_NORMAL_EXIT);
+        assert_eq!(info.application_code, 0xe6);
+    }
+    if exception {
+        complete_deferred_current_reclaim(
+            &mut registry,
+            &execution,
+            &waits,
+            deferred,
+            &mut cleanup,
+        );
+    } else {
+        complete_deferred_current_reclaim_on(
+            &mut registry,
+            &execution,
+            &waits,
+            crate::cpu::CpuIndex::BOOTSTRAP,
+            deferred,
+            &mut cleanup,
+        );
+    }
+    cleanup.push_optional(registry.release_handle(current_ref).unwrap());
+    cleanup.push_optional(registry.release_handle(sibling_ref).unwrap());
+    for release in cleanup.into_releases().into_iter().flatten() {
+        if release.object_type() == deepwyrm_abi::DW_OBJECT_TYPE_EVENT {
+            let finalization = events.take_finalization(release).unwrap();
+            crate::wait::complete_event_finalization(&mut registry, finalization);
+            continue;
+        }
+        let mut pending = Some(release);
+        while let Some(release) = pending.take() {
+            let finalization = tasks.take_finalization(release).unwrap();
+            pending = crate::task::complete_task_finalization(&mut registry, finalization);
+        }
+    }
+    let _ = event_key;
+}
+
+#[test]
+fn process_exit_drains_blocked_sibling_finite_wait_before_retrying_selected_exit() {
+    terminate_current_process_with_blocked_sibling(false);
+}
+
+#[test]
+fn process_exception_drains_blocked_sibling_wait_before_retrying_selected_fault() {
+    terminate_current_process_with_blocked_sibling(true);
+}
+
+#[test]
+fn authorized_process_termination_drains_two_generic_waits_in_one_process() {
+    use deepwyrm_abi::{
+        DW_DEADLINE_INFINITE, DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED, DW_TERMINATION_AUTHORIZED,
+    };
+
+    type MultiWaitTasks = TaskAuthority<2, 2, 3, 12>;
+    let mut registry = ObjectRegistry::<32>::new();
+    let mut tasks = MultiWaitTasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (caller_process, caller_process_ref) =
+        tasks.create_process(&mut registry, &root_owner).unwrap();
+    let (target_process, target_process_ref) =
+        tasks.create_process(&mut registry, &root_owner).unwrap();
+    let caller_owner = registry
+        .retain_internal_from_handle(&caller_process_ref)
+        .unwrap();
+    let target_owner = registry
+        .retain_internal_from_handle(&target_process_ref)
+        .unwrap();
+    let (target_a, target_a_ref) = tasks.create_thread(&mut registry, &target_owner).unwrap();
+    let (target_b, target_b_ref) = tasks.create_thread(&mut registry, &target_owner).unwrap();
+    let (caller, caller_ref) = tasks.create_thread(&mut registry, &caller_owner).unwrap();
+    assert!(registry.release_internal(caller_owner).unwrap().is_none());
+    assert!(registry.release_internal(target_owner).unwrap().is_none());
+    let target_handle = tasks
+        .process_handles_mut(caller_process)
+        .unwrap()
+        .install(target_process_ref, DW_RIGHT_MODIFY)
+        .unwrap();
+    let events = EventAuthority::<2>::new();
+    let timers = TimerAuthority::<1>::new();
+    let channels = ChannelAuthority::<1, 2>::new();
+    let waits = WaitRegistry::<8>::new();
+    let (event_a_key, event_a_ref) = events.create_event(&mut registry).unwrap();
+    let (event_b_key, event_b_ref) = events.create_event(&mut registry).unwrap();
+    let event_a = tasks
+        .process_handles_mut(target_process)
+        .unwrap()
+        .install(event_a_ref, DW_RIGHT_WAIT)
+        .unwrap();
+    let event_b = tasks
+        .process_handles_mut(target_process)
+        .unwrap()
+        .install(event_b_ref, DW_RIGHT_WAIT)
+        .unwrap();
+    let execution = ExecutionDomain::<3>::new(test_stack_bounds::<3>()).unwrap();
+    execution
+        .start_thread(&mut tasks, target_a, test_start(0xf1))
+        .unwrap();
+    execution
+        .start_thread(&mut tasks, target_b, test_start(0xf2))
+        .unwrap();
+    execution
+        .start_thread(&mut tasks, caller, test_start(0xf3))
+        .unwrap();
+    assert_eq!(execution.schedule_next().unwrap().current, Some(target_a));
+
+    let mut operations = WaitOperationRegistry::<u32, 3>::new();
+    let mut deadlines = AdapterDeadline::<2>::new();
+    for (thread, event, output, deadline) in [
+        (target_a, event_a, 0xfa, deepwyrm_abi::DwDeadline(20_000)),
+        (target_b, event_b, 0xfb, DW_DEADLINE_INFINITE),
+    ] {
+        assert!(matches!(
+            wait_one_begin(
+                output,
+                &mut registry,
+                &mut tasks,
+                &events,
+                &timers,
+                &channels,
+                &waits,
+                &execution,
+                &mut operations,
+                Some(&mut deadlines),
+                crate::cpu::CpuIndex::BOOTSTRAP,
+                target_process,
+                thread,
+                event,
+                DW_SIGNAL_SIGNALED,
+                deadline,
+            ),
+            WaitSyscallBegin::Suspended { .. }
+        ));
+        let switched = execution
+            .suspended_claim_on(crate::cpu::CpuIndex::BOOTSTRAP)
+            .unwrap();
+        assert_eq!(switched.thread(), thread);
+        execution.complete_switch_on(switched).unwrap();
+    }
+    assert_eq!(
+        execution.scheduler_state(caller),
+        Some(SchedulerThreadState::Running)
+    );
+    assert_eq!(operations.len(), 2);
+
+    let mut cleanup = CleanupQueue::<32>::new();
+    let mut discarded = std::vec::Vec::new();
+    {
+        let mut terminal =
+            WaitTerminalCleanup::new(&mut operations, Some(&mut deadlines), |output| {
+                discarded.push(output)
+            });
+        assert!(
+            terminal_outcome(
+                process_terminate(
+                    &mut registry,
+                    &mut tasks,
+                    &execution,
+                    &waits,
+                    &mut terminal,
+                    caller_process,
+                    caller,
+                    target_handle,
+                    DW_TERMINATION_AUTHORIZED,
+                    0xfc,
+                    &mut cleanup,
+                ),
+                DW_STATUS_SUCCESS,
+                SyscallControl::ReturnToCaller,
+            )
+            .is_none()
+        );
+    }
+    discarded.sort_unstable();
+    assert_eq!(discarded, std::vec![0xfa, 0xfb]);
+    assert!(operations.is_empty());
+    assert_eq!(waits.len(), 0);
+    assert!(!execution.blocked_operations().has_thread(target_a));
+    assert!(!execution.blocked_operations().has_thread(target_b));
+    let info = tasks.process_info(target_process).unwrap();
+    assert_eq!(info.reason, DW_TERMINATION_AUTHORIZED);
+    assert_eq!(info.detail, 0xfc);
+
+    // Preserve the target final releases while retiring the caller cleanly.
+    let deferred = terminal_outcome(
+        process_exit_on(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut NoTerminalWaitCleanup,
+            crate::cpu::CpuIndex::BOOTSTRAP,
+            caller_process,
+            caller,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        crate::cpu::CpuIndex::BOOTSTRAP,
+        deferred,
+        &mut cleanup,
+    );
+    for reference in [target_a_ref, target_b_ref, caller_ref, caller_process_ref] {
+        cleanup.push_optional(registry.release_handle(reference).unwrap());
+    }
+    cleanup.push_optional(registry.release_internal(root_owner).unwrap());
+    for release in cleanup.into_releases().into_iter().flatten() {
+        if release.object_type() == deepwyrm_abi::DW_OBJECT_TYPE_EVENT {
+            let finalization = events.take_finalization(release).unwrap();
+            crate::wait::complete_event_finalization(&mut registry, finalization);
+            continue;
+        }
+        let mut pending = Some(release);
+        while let Some(release) = pending.take() {
+            let finalization = tasks.take_finalization(release).unwrap();
+            pending = crate::task::complete_task_finalization(&mut registry, finalization);
+        }
+    }
+    let _ = (event_a_key, event_b_key);
+}
+
+#[test]
 fn prepared_process_termination_preserves_remote_execution_until_exact_stop() {
     let mut registry = ObjectRegistry::<24>::new();
     let mut tasks = Tasks::new();
@@ -3373,6 +3888,8 @@ fn prepared_group_termination_waits_for_remote_owners_before_reclaim() {
         &mut registry,
         &mut tasks,
         &execution,
+        &waits,
+        &mut terminal_waits,
         current_process,
         current_thread,
         group_handle,
@@ -3431,6 +3948,152 @@ fn prepared_group_termination_waits_for_remote_owners_before_reclaim() {
     cleanup.push_optional(registry.release_handle(remote_process_ref).unwrap());
     cleanup.push_optional(registry.release_internal(root_owner).unwrap());
     finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+#[test]
+fn task_group_termination_drains_blocked_descendant_wait_before_terminal_batches() {
+    use deepwyrm_abi::{
+        DW_DEADLINE_INFINITE, DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED, DW_TERMINATION_AUTHORIZED,
+    };
+
+    let mut registry = ObjectRegistry::<24>::new();
+    let mut tasks = Tasks::new();
+    let (root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let root_handle_owner = registry.retain_internal(&root_owner).unwrap();
+    let root_handle_ref = registry.internal_into_handle(root_handle_owner).unwrap();
+    let (current_process, current_process_ref) =
+        tasks.create_process(&mut registry, &root_owner).unwrap();
+    let (target_process, target_process_ref) =
+        tasks.create_process(&mut registry, &root_owner).unwrap();
+    let current_owner = registry
+        .retain_internal_from_handle(&current_process_ref)
+        .unwrap();
+    let target_owner = registry
+        .retain_internal_from_handle(&target_process_ref)
+        .unwrap();
+    let (target, target_ref) = tasks.create_thread(&mut registry, &target_owner).unwrap();
+    let (current, current_ref) = tasks.create_thread(&mut registry, &current_owner).unwrap();
+    assert!(registry.release_internal(current_owner).unwrap().is_none());
+    assert!(registry.release_internal(target_owner).unwrap().is_none());
+    let group_handle = tasks
+        .process_handles_mut(current_process)
+        .unwrap()
+        .install(root_handle_ref, DW_RIGHT_MODIFY)
+        .unwrap();
+    let events = EventAuthority::<1>::new();
+    let timers = TimerAuthority::<1>::new();
+    let channels = ChannelAuthority::<1, 2>::new();
+    let waits = WaitRegistry::<4>::new();
+    let (_event_key, event_ref) = events.create_event(&mut registry).unwrap();
+    let event = tasks
+        .process_handles_mut(target_process)
+        .unwrap()
+        .install(event_ref, DW_RIGHT_WAIT)
+        .unwrap();
+    let execution = ExecutionDomain::<2>::new(test_stack_bounds::<2>()).unwrap();
+    execution
+        .start_thread(&mut tasks, target, test_start(0xb7))
+        .unwrap();
+    execution
+        .start_thread(&mut tasks, current, test_start(0xb8))
+        .unwrap();
+    assert_eq!(execution.schedule_next().unwrap().current, Some(target));
+    let mut operations = WaitOperationRegistry::<u32, 2>::new();
+    assert!(matches!(
+        wait_one_begin(
+            0xb9,
+            &mut registry,
+            &mut tasks,
+            &events,
+            &timers,
+            &channels,
+            &waits,
+            &execution,
+            &mut operations,
+            None,
+            crate::cpu::CpuIndex::BOOTSTRAP,
+            target_process,
+            target,
+            event,
+            DW_SIGNAL_SIGNALED,
+            DW_DEADLINE_INFINITE,
+        ),
+        WaitSyscallBegin::Suspended { .. }
+    ));
+    let switched = execution
+        .suspended_claim_on(crate::cpu::CpuIndex::BOOTSTRAP)
+        .unwrap();
+    execution.complete_switch_on(switched).unwrap();
+    assert_eq!(
+        execution.scheduler_state(current),
+        Some(SchedulerThreadState::Running)
+    );
+
+    let mut cleanup = CleanupQueue::<24>::new();
+    let mut discarded = None;
+    let prepared = {
+        let mut terminal = WaitTerminalCleanup::new(&mut operations, None, |output| {
+            assert!(discarded.replace(output).is_none());
+        });
+        prepare_task_group_terminate(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut terminal,
+            current_process,
+            current,
+            group_handle,
+            DW_TERMINATION_AUTHORIZED,
+            &mut cleanup,
+        )
+        .unwrap()
+    };
+    assert_eq!(discarded, Some(0xb9));
+    assert!(operations.is_empty());
+    assert_eq!(waits.len(), 0);
+    assert!(!execution.blocked_operations().has_thread(target));
+    assert_eq!(
+        tasks.group_state(root),
+        Ok(crate::task::TaskGroupState::Terminated)
+    );
+    assert!(prepared.contains_thread(target));
+    assert!(prepared.contains_thread(current));
+
+    let deferred = terminal_outcome(
+        complete_prepared_task_group_termination(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut NoTerminalWaitCleanup,
+            current_process,
+            current,
+            prepared,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    complete_deferred_current_reclaim(&mut registry, &execution, &waits, deferred, &mut cleanup);
+    cleanup.push_optional(registry.release_handle(target_ref).unwrap());
+    cleanup.push_optional(registry.release_handle(current_ref).unwrap());
+    cleanup.push_optional(registry.release_handle(current_process_ref).unwrap());
+    cleanup.push_optional(registry.release_handle(target_process_ref).unwrap());
+    cleanup.push_optional(registry.release_internal(root_owner).unwrap());
+    for release in cleanup.into_releases().into_iter().flatten() {
+        if release.object_type() == deepwyrm_abi::DW_OBJECT_TYPE_EVENT {
+            let finalization = events.take_finalization(release).unwrap();
+            crate::wait::complete_event_finalization(&mut registry, finalization);
+            continue;
+        }
+        let mut pending = Some(release);
+        while let Some(release) = pending.take() {
+            let finalization = tasks.take_finalization(release).unwrap();
+            pending = crate::task::complete_task_finalization(&mut registry, finalization);
+        }
+    }
 }
 
 #[test]

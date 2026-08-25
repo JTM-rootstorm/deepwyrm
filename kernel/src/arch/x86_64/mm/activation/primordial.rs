@@ -2054,17 +2054,25 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.deferred_currents[self.cpu.index()].is_none(),
             "primordial runtime already owns deferred current resources"
         );
-        let mut discarded = None;
-        let mut atomic_pin = None;
+        let mut discarded: [Option<user_access::OwnedLiveUserOutput>; THREADS] =
+            core::array::from_fn(|_| None);
+        let mut atomic_pins: [Option<user_access::OwnedLiveAtomicU32>; THREADS] =
+            core::array::from_fn(|_| None);
         let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
         let (status, control, deferred) = {
             let mut terminal = self.services.terminal_cleanup(
                 Some(&mut wait_deadlines),
                 |output| {
-                    assert!(discarded.replace(output).is_none());
+                    *discarded
+                        .iter_mut()
+                        .find(|slot| slot.is_none())
+                        .expect("exception terminal output batch overflow") = Some(output);
                 },
                 |pin| {
-                    assert!(atomic_pin.replace(pin).is_none());
+                    *atomic_pins
+                        .iter_mut()
+                        .find(|slot| slot.is_none())
+                        .expect("exception terminal atomic-pin batch overflow") = Some(pin);
                 },
             );
             crate::syscall::process_unhandled_exception_on(
@@ -2084,16 +2092,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         assert_eq!(control, SyscallControl::TerminateCurrent);
         self.deferred_currents[self.cpu.index()] =
             Some(deferred.expect("primordial exception omitted deferred current resources"));
-        let mut user = self.active.current_process_address_space(
-            self.active_root.as_ref().expect("active root"),
-            self.process,
-        );
-        if let Some(output) = discarded {
-            user.discard_owned_output(output)
+        for output in discarded.into_iter().flatten() {
+            output
+                .discard_terminal(&self.active.user_pins)
                 .unwrap_or_else(|_| panic!("primordial exception output pin drifted"));
         }
-        if let Some(pin) = atomic_pin {
-            user.release_atomic_u32(pin)
+        for pin in atomic_pins.into_iter().flatten() {
+            pin.release_terminal(&self.active.user_pins)
                 .unwrap_or_else(|_| panic!("primordial exception atomic pin drifted"));
         }
         let cleanup = self.services.take_cleanup();
@@ -4140,17 +4145,25 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.assert_guard_free_external_work();
         #[cfg(deepwyrm_i1_evidence)]
         let exiting_claim = self.shared.execution.running_claim_on(self.cpu);
-        let mut discarded = None;
-        let mut atomic_pin = None;
+        let mut discarded: [Option<user_access::OwnedLiveUserOutput>; THREADS] =
+            core::array::from_fn(|_| None);
+        let mut atomic_pins: [Option<user_access::OwnedLiveAtomicU32>; THREADS] =
+            core::array::from_fn(|_| None);
         let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
         let (status, control, deferred) = {
             let mut terminal = self.services.terminal_cleanup(
                 Some(&mut wait_deadlines),
                 |output| {
-                    assert!(discarded.replace(output).is_none());
+                    *discarded
+                        .iter_mut()
+                        .find(|slot| slot.is_none())
+                        .expect("process-exit terminal output batch overflow") = Some(output);
                 },
                 |pin| {
-                    assert!(atomic_pin.replace(pin).is_none());
+                    *atomic_pins
+                        .iter_mut()
+                        .find(|slot| slot.is_none())
+                        .expect("process-exit terminal atomic-pin batch overflow") = Some(pin);
                 },
             );
             crate::syscall::process_exit_on(
@@ -4183,16 +4196,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         } else {
             assert!(deferred.is_none());
         }
-        let mut user = self.active.current_process_address_space(
-            self.active_root.as_ref().expect("active root"),
-            self.process,
-        );
-        if let Some(output) = discarded {
-            user.discard_owned_output(output)
+        for output in discarded.into_iter().flatten() {
+            output
+                .discard_terminal(&self.active.user_pins)
                 .unwrap_or_else(|_| panic!("primordial exit output pin drifted"));
         }
-        if let Some(pin) = atomic_pin {
-            user.release_atomic_u32(pin)
+        for pin in atomic_pins.into_iter().flatten() {
+            pin.release_terminal(&self.active.user_pins)
                 .unwrap_or_else(|_| panic!("primordial exit atomic pin drifted"));
         }
         let cleanup = self.services.take_cleanup();
@@ -4314,17 +4324,25 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         code: u32,
     ) -> Result<crate::syscall::PreparedProcessTermination<HANDLES, THREADS>, deepwyrm_abi::DwStatus>
     {
-        let mut discarded = None;
-        let mut atomic_pin = None;
+        let mut discarded: [Option<user_access::OwnedLiveUserOutput>; THREADS] =
+            core::array::from_fn(|_| None);
+        let mut atomic_pins: [Option<user_access::OwnedLiveAtomicU32>; THREADS] =
+            core::array::from_fn(|_| None);
         let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
         let result = {
             let mut terminal = self.services.terminal_cleanup(
                 Some(&mut wait_deadlines),
                 |output| {
-                    assert!(discarded.replace(output).is_none());
+                    *discarded
+                        .iter_mut()
+                        .find(|slot| slot.is_none())
+                        .expect("process termination output batch overflow") = Some(output);
                 },
                 |pin| {
-                    assert!(atomic_pin.replace(pin).is_none());
+                    *atomic_pins
+                        .iter_mut()
+                        .find(|slot| slot.is_none())
+                        .expect("process termination atomic-pin batch overflow") = Some(pin);
                 },
             );
             crate::syscall::prepare_process_terminate(
@@ -4341,12 +4359,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 &mut self.cleanup,
             )
         };
-        if let Some(output) = discarded {
+        for output in discarded.into_iter().flatten() {
             output
                 .discard_terminal(&self.active.user_pins)
                 .unwrap_or_else(|_| panic!("process termination output pin drifted"));
         }
-        if let Some(pin) = atomic_pin {
+        for pin in atomic_pins.into_iter().flatten() {
             pin.release_terminal(&self.active.user_pins)
                 .unwrap_or_else(|_| panic!("process termination atomic pin drifted"));
         }
@@ -4362,24 +4380,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> TaskGroupTerminationPreparation {
         let phase = self.reserve_runtime_phase();
         self.assert_guard_free_external_work();
-        let prepared = match crate::syscall::prepare_task_group_terminate(
-            &mut self.registry,
-            &mut self.tasks,
-            &self.shared.execution,
-            self.process,
-            self.thread,
-            task_group,
-            reason,
-            &mut self.cleanup,
-        ) {
-            Ok(prepared) => prepared,
-            Err(status) => {
-                self.commit_runtime_phase(phase);
-                return TaskGroupTerminationPreparation::Immediate(NativeSyscallResult::returning(
-                    status,
-                ));
-            }
-        };
+        let prepared =
+            match self.prepare_task_group_termination_with_wait_cleanup(task_group, reason) {
+                Ok(prepared) => prepared,
+                Err(status) => {
+                    self.commit_runtime_phase(phase);
+                    return TaskGroupTerminationPreparation::Immediate(
+                        NativeSyscallResult::returning(status),
+                    );
+                }
+            };
         let mut identities = core::array::from_fn(|_| None);
         for cpu_index in 0..crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT {
             let cpu = crate::cpu::CpuIndex::new(cpu_index)
@@ -4434,6 +4444,62 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         })
     }
 
+    fn prepare_task_group_termination_with_wait_cleanup(
+        &mut self,
+        task_group: deepwyrm_abi::DwHandle,
+        reason: deepwyrm_abi::DwTerminationReason,
+    ) -> Result<
+        crate::syscall::PreparedTaskGroupTermination<PROCESSES, HANDLES, THREADS>,
+        deepwyrm_abi::DwStatus,
+    > {
+        let mut discarded: [Option<user_access::OwnedLiveUserOutput>; THREADS] =
+            core::array::from_fn(|_| None);
+        let mut atomic_pins: [Option<user_access::OwnedLiveAtomicU32>; THREADS] =
+            core::array::from_fn(|_| None);
+        let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
+        let result = {
+            let mut terminal = self.services.terminal_cleanup(
+                Some(&mut wait_deadlines),
+                |output| {
+                    *discarded
+                        .iter_mut()
+                        .find(|slot| slot.is_none())
+                        .expect("TaskGroup termination output batch overflow") = Some(output);
+                },
+                |pin| {
+                    *atomic_pins
+                        .iter_mut()
+                        .find(|slot| slot.is_none())
+                        .expect("TaskGroup termination atomic-pin batch overflow") = Some(pin);
+                },
+            );
+            crate::syscall::prepare_task_group_terminate(
+                &mut self.registry,
+                &mut self.tasks,
+                &self.shared.execution,
+                &self.shared.waits,
+                &mut terminal,
+                self.process,
+                self.thread,
+                task_group,
+                reason,
+                &mut self.cleanup,
+            )
+        };
+        for output in discarded.into_iter().flatten() {
+            output
+                .discard_terminal(&self.active.user_pins)
+                .unwrap_or_else(|_| panic!("TaskGroup termination output pin drifted"));
+        }
+        for pin in atomic_pins.into_iter().flatten() {
+            pin.release_terminal(&self.active.user_pins)
+                .unwrap_or_else(|_| panic!("TaskGroup termination atomic pin drifted"));
+        }
+        let cleanup = self.services.take_cleanup();
+        self.merge_cleanup(cleanup);
+        result
+    }
+
     fn complete_task_group_termination(
         &mut self,
         phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
@@ -4442,14 +4508,26 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
     ) -> NativeSyscallResult {
         let process_keys = prepared.process_keys();
-        let mut discarded = None;
-        let mut atomic_pin = None;
+        let mut discarded: [Option<user_access::OwnedLiveUserOutput>; THREADS] =
+            core::array::from_fn(|_| None);
+        let mut atomic_pins: [Option<user_access::OwnedLiveAtomicU32>; THREADS] =
+            core::array::from_fn(|_| None);
         let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
         let (status, control, deferred) = {
             let mut terminal = self.services.terminal_cleanup(
                 Some(&mut wait_deadlines),
-                |output| assert!(discarded.replace(output).is_none()),
-                |pin| assert!(atomic_pin.replace(pin).is_none()),
+                |output| {
+                    *discarded
+                        .iter_mut()
+                        .find(|slot| slot.is_none())
+                        .expect("TaskGroup completion output batch overflow") = Some(output);
+                },
+                |pin| {
+                    *atomic_pins
+                        .iter_mut()
+                        .find(|slot| slot.is_none())
+                        .expect("TaskGroup completion atomic-pin batch overflow") = Some(pin);
+                },
             );
             crate::syscall::complete_prepared_task_group_termination_after_remote_stops_on(
                 &mut self.registry,
@@ -4465,7 +4543,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 &mut self.cleanup,
             )
         };
-        self.finish_terminal_adapter_resources(discarded, atomic_pin, control, deferred);
+        self.finish_terminal_adapter_resources(discarded, atomic_pins, control, deferred);
         if status == DW_STATUS_SUCCESS {
             for target in process_keys.into_iter().flatten() {
                 if target == self.process {
@@ -4508,14 +4586,26 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
     ) -> NativeSyscallResult {
         let target = prepared.target();
-        let mut discarded = None;
-        let mut atomic_pin = None;
+        let mut discarded: [Option<user_access::OwnedLiveUserOutput>; THREADS] =
+            core::array::from_fn(|_| None);
+        let mut atomic_pins: [Option<user_access::OwnedLiveAtomicU32>; THREADS] =
+            core::array::from_fn(|_| None);
         let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
         let (status, control, deferred) = {
             let mut terminal = self.services.terminal_cleanup(
                 Some(&mut wait_deadlines),
-                |output| assert!(discarded.replace(output).is_none()),
-                |pin| assert!(atomic_pin.replace(pin).is_none()),
+                |output| {
+                    *discarded
+                        .iter_mut()
+                        .find(|slot| slot.is_none())
+                        .expect("process completion output batch overflow") = Some(output);
+                },
+                |pin| {
+                    *atomic_pins
+                        .iter_mut()
+                        .find(|slot| slot.is_none())
+                        .expect("process completion atomic-pin batch overflow") = Some(pin);
+                },
             );
             crate::syscall::complete_prepared_process_termination_after_remote_stops_on(
                 &mut self.registry,
@@ -4531,7 +4621,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 &mut self.cleanup,
             )
         };
-        self.finish_terminal_adapter_resources(discarded, atomic_pin, control, deferred);
+        self.finish_terminal_adapter_resources(discarded, atomic_pins, control, deferred);
         if status == DW_STATUS_SUCCESS && control == SyscallControl::ReturnToCaller {
             if target != self.process {
                 let root_object = self
@@ -4567,14 +4657,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> NativeSyscallResult {
         let phase = self.reserve_runtime_phase();
         self.assert_guard_free_external_work();
-        let mut discarded = None;
-        let mut atomic_pin = None;
+        let mut discarded: [Option<user_access::OwnedLiveUserOutput>; 1] = [None];
+        let mut atomic_pins: [Option<user_access::OwnedLiveAtomicU32>; 1] = [None];
         let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
         let (status, control, deferred) = {
             let mut terminal = self.services.terminal_cleanup(
                 Some(&mut wait_deadlines),
-                |output| assert!(discarded.replace(output).is_none()),
-                |pin| assert!(atomic_pin.replace(pin).is_none()),
+                |output| discarded[0] = Some(output),
+                |pin| atomic_pins[0] = Some(pin),
             );
             crate::syscall::thread_terminate(
                 &mut self.registry,
@@ -4590,16 +4680,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 &mut self.cleanup,
             )
         };
-        self.finish_terminal_adapter_resources(discarded, atomic_pin, control, deferred);
+        self.finish_terminal_adapter_resources(discarded, atomic_pins, control, deferred);
         let result = NativeSyscallResult { status, control };
         self.commit_runtime_phase(phase);
         result
     }
 
-    fn finish_terminal_adapter_resources(
+    fn finish_terminal_adapter_resources<const TERMINAL_RESOURCES: usize>(
         &mut self,
-        discarded: Option<user_access::OwnedLiveUserOutput>,
-        atomic_pin: Option<user_access::OwnedLiveAtomicU32>,
+        discarded: [Option<user_access::OwnedLiveUserOutput>; TERMINAL_RESOURCES],
+        atomic_pins: [Option<user_access::OwnedLiveAtomicU32>; TERMINAL_RESOURCES],
         control: SyscallControl,
         deferred: Option<crate::task::DeferredCurrentExecutionResources>,
     ) {
@@ -4610,16 +4700,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         } else {
             assert!(deferred.is_none());
         }
-        let mut user = self.active.current_process_address_space(
-            self.active_root.as_ref().expect("active root"),
-            self.process,
-        );
-        if let Some(output) = discarded {
-            user.discard_owned_output(output)
+        for output in discarded.into_iter().flatten() {
+            output
+                .discard_terminal(&self.active.user_pins)
                 .unwrap_or_else(|_| panic!("terminal adapter output pin drifted"));
         }
-        if let Some(pin) = atomic_pin {
-            user.release_atomic_u32(pin)
+        for pin in atomic_pins.into_iter().flatten() {
+            pin.release_terminal(&self.active.user_pins)
                 .unwrap_or_else(|_| panic!("terminal adapter atomic pin drifted"));
         }
         let cleanup = self.services.take_cleanup();
