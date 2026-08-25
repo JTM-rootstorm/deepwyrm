@@ -604,6 +604,8 @@ fn i0_live_handle_capacity_covers_both_init_duplicates_before_three_moves() {
         "const INIT_MOVED_HANDLES: usize = 3;",
         "const HANDLES: usize = BOOTSTRAP_HANDLE_PEAK;",
         "const _: [(); 10] = [(); HANDLES];",
+        "const HANDLES: usize = BOOTSTRAP_HANDLE_PEAK + 1;",
+        "const _: [(); 11] = [(); HANDLES];",
         "const _: [(); 7] = [(); BOOTSTRAP_HANDLE_PEAK - INIT_MOVED_HANDLES];",
     ] {
         assert!(

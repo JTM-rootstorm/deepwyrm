@@ -106,10 +106,14 @@ const BOOTSTRAP_HANDLE_PEAK: usize = INITIAL_BOOTSTRAP_HANDLES
     + PROCESS_ROOT_HANDLES
     + THREAD_HANDLES
     + INIT_DUPLICATE_HANDLES;
-#[cfg(not(deepwyrm_i2_stress))]
+#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
 const HANDLES: usize = BOOTSTRAP_HANDLE_PEAK;
-#[cfg(deepwyrm_i2_stress)]
+#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const HANDLES: usize = 16;
+// Selector 24 retains the temporary child's TaskGroup handle while running the
+// ordinary loader transaction, one above the ten-handle bootstrap peak.
+#[cfg(deepwyrm_wrcap_relay)]
+const HANDLES: usize = BOOTSTRAP_HANDLE_PEAK + 1;
 const SPACES: usize = USERSPACE_CHAIN_PROCESSES;
 const REGIONS: usize = USERSPACE_CHAIN_PROCESSES;
 const REGION_OBJECTS: usize = USERSPACE_CHAIN_PROCESSES;
@@ -151,10 +155,12 @@ const _: [(); PROCESSES] = [(); SPACES];
 const _: [(); PROCESSES] = [(); REGIONS];
 const _: [(); PROCESSES] = [(); REGION_OBJECTS];
 const _: [(); PROCESSES] = [(); EXECUTION_THREADS];
-#[cfg(not(deepwyrm_i2_stress))]
+#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
 const _: [(); 10] = [(); HANDLES];
-#[cfg(deepwyrm_i2_stress)]
+#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const _: [(); 16] = [(); HANDLES];
+#[cfg(deepwyrm_wrcap_relay)]
+const _: [(); 11] = [(); HANDLES];
 const _: [(); 7] = [(); BOOTSTRAP_HANDLE_PEAK - INIT_MOVED_HANDLES];
 
 #[cfg(feature = "test-support")]
