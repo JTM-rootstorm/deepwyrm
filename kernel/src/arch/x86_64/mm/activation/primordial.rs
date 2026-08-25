@@ -12,8 +12,6 @@ use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
-use crate::boot::primordial::construction::STACK_BYTES;
 use crate::boot::primordial::construction::authority::{
     AuthorityPrimordialBackend, AuthorityPrimordialMonitor, PrimordialPlatform,
 };
@@ -151,11 +149,11 @@ const TIMERS: usize = 2;
 // both paths without depending on where the requested range lands. The I2
 // bootfs needs a bounded 32-page window. The selector-24 WRCAP bootfs contains
 // the controller plus its deterministic config and asset and is exactly 39
-// pages after init0 termination-race reconciliation. Ordinary images
-// retain the original 16-page limit.
+// pages after init0 termination-race reconciliation. The ordinary Wave 4
+// bootfs is exactly 18 pages after the same shared init0 remediation.
 const PRIMORDIAL_TABLE_CANDIDATES: usize = 6;
 #[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
-const PRIMORDIAL_MAX_MAPPING_PAGES: usize = (STACK_BYTES / PAGE_SIZE) as usize;
+const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 18;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 32;
 #[cfg(deepwyrm_wrcap_relay)]
