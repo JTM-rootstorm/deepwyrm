@@ -4210,24 +4210,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> NativeSyscallResult {
         let phase = self.reserve_runtime_phase();
         self.assert_guard_free_external_work();
-        let prepared = match crate::syscall::prepare_process_terminate(
-            &mut self.registry,
-            &mut self.tasks,
-            &self.shared.execution,
-            self.process,
-            self.thread,
-            process,
-            reason,
-            code,
-            &mut self.cleanup,
-        ) {
-            Ok(prepared) => prepared,
-            Err(status) => {
-                let result = NativeSyscallResult::returning(status);
-                self.commit_runtime_phase(phase);
-                return result;
-            }
-        };
+        let prepared =
+            match self.prepare_process_termination_with_wait_cleanup(process, reason, code) {
+                Ok(prepared) => prepared,
+                Err(status) => {
+                    let result = NativeSyscallResult::returning(status);
+                    self.commit_runtime_phase(phase);
+                    return result;
+                }
+            };
         self.complete_process_termination(phase, prepared, core::array::from_fn(|_| None))
     }
 
@@ -4239,25 +4230,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> ProcessTerminationPreparation {
         let phase = self.reserve_runtime_phase();
         self.assert_guard_free_external_work();
-        let prepared = match crate::syscall::prepare_process_terminate(
-            &mut self.registry,
-            &mut self.tasks,
-            &self.shared.execution,
-            self.process,
-            self.thread,
-            process,
-            reason,
-            code,
-            &mut self.cleanup,
-        ) {
-            Ok(prepared) => prepared,
-            Err(status) => {
-                self.commit_runtime_phase(phase);
-                return ProcessTerminationPreparation::Immediate(NativeSyscallResult::returning(
-                    status,
-                ));
-            }
-        };
+        let prepared =
+            match self.prepare_process_termination_with_wait_cleanup(process, reason, code) {
+                Ok(prepared) => prepared,
+                Err(status) => {
+                    self.commit_runtime_phase(phase);
+                    return ProcessTerminationPreparation::Immediate(
+                        NativeSyscallResult::returning(status),
+                    );
+                }
+            };
         let thread_keys = prepared.thread_keys();
         let mut identities = core::array::from_fn(|_| None);
         for cpu_index in 0..crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT {
@@ -4323,6 +4305,54 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             prepared,
             identities,
         })
+    }
+
+    fn prepare_process_termination_with_wait_cleanup(
+        &mut self,
+        process: deepwyrm_abi::DwHandle,
+        reason: deepwyrm_abi::DwTerminationReason,
+        code: u32,
+    ) -> Result<crate::syscall::PreparedProcessTermination<HANDLES, THREADS>, deepwyrm_abi::DwStatus>
+    {
+        let mut discarded = None;
+        let mut atomic_pin = None;
+        let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
+        let result = {
+            let mut terminal = self.services.terminal_cleanup(
+                Some(&mut wait_deadlines),
+                |output| {
+                    assert!(discarded.replace(output).is_none());
+                },
+                |pin| {
+                    assert!(atomic_pin.replace(pin).is_none());
+                },
+            );
+            crate::syscall::prepare_process_terminate(
+                &mut self.registry,
+                &mut self.tasks,
+                &self.shared.execution,
+                &self.shared.waits,
+                &mut terminal,
+                self.process,
+                self.thread,
+                process,
+                reason,
+                code,
+                &mut self.cleanup,
+            )
+        };
+        if let Some(output) = discarded {
+            output
+                .discard_terminal(&self.active.user_pins)
+                .unwrap_or_else(|_| panic!("process termination output pin drifted"));
+        }
+        if let Some(pin) = atomic_pin {
+            pin.release_terminal(&self.active.user_pins)
+                .unwrap_or_else(|_| panic!("process termination atomic pin drifted"));
+        }
+        let cleanup = self.services.take_cleanup();
+        self.merge_cleanup(cleanup);
+        result
     }
 
     fn prepare_remote_task_group_termination(

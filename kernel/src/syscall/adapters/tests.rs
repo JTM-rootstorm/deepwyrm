@@ -2293,7 +2293,7 @@ fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
     let child_operation = tasks.acquire_process_operation(child).unwrap();
     assert!(matches!(
         tasks.terminate_process_authorized(&mut registry, child, 0x71),
-        Err(crate::task::TaskError::BadState)
+        Err(crate::task::TaskError::OperationsInFlight)
     ));
     assert_eq!(
         address_region_protect(
@@ -2615,6 +2615,8 @@ fn live_current_process_termination_preserves_the_exact_ap_execution_bundle() {
         &mut registry,
         &mut tasks,
         &execution,
+        &waits,
+        &mut terminal_waits,
         process,
         current,
         process_handle,
@@ -2764,6 +2766,176 @@ fn non_current_process_termination_reclaims_only_the_target_batch() {
 }
 
 #[test]
+fn non_current_process_termination_drains_a_suspended_wait_lease() {
+    use deepwyrm_abi::{
+        DW_DEADLINE_INFINITE, DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED, DW_TERMINATION_AUTHORIZED,
+    };
+
+    let mut registry = ObjectRegistry::<24>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (current_process, current_process_ref) =
+        tasks.create_process(&mut registry, &root_owner).unwrap();
+    let (target_process, target_process_ref) =
+        tasks.create_process(&mut registry, &root_owner).unwrap();
+    let current_owner = registry
+        .retain_internal_from_handle(&current_process_ref)
+        .unwrap();
+    let target_owner = registry
+        .retain_internal_from_handle(&target_process_ref)
+        .unwrap();
+    let (target_thread, target_thread_ref) =
+        tasks.create_thread(&mut registry, &target_owner).unwrap();
+    let (current_thread, current_thread_ref) =
+        tasks.create_thread(&mut registry, &current_owner).unwrap();
+    assert!(registry.release_internal(current_owner).unwrap().is_none());
+    assert!(registry.release_internal(target_owner).unwrap().is_none());
+    let target_handle = tasks
+        .process_handles_mut(current_process)
+        .unwrap()
+        .install(target_process_ref, DW_RIGHT_MODIFY)
+        .unwrap();
+    let events = EventAuthority::<2>::new();
+    let timers = TimerAuthority::<1>::new();
+    let channels = ChannelAuthority::<2, 4>::new();
+    let waits = WaitRegistry::<8>::new();
+    let execution = ExecutionDomain::<2>::new(test_stack_bounds::<2>()).unwrap();
+    let (_event_key, event_ref) = events.create_event(&mut registry).unwrap();
+    let event = tasks
+        .process_handles_mut(target_process)
+        .unwrap()
+        .install(event_ref, DW_RIGHT_WAIT)
+        .unwrap();
+    let mut operations = WaitOperationRegistry::<u32, 2>::new();
+    let mut cleanup = CleanupQueue::<24>::new();
+
+    execution
+        .start_thread(&mut tasks, target_thread, test_start(0x15))
+        .unwrap();
+    execution
+        .start_thread(&mut tasks, current_thread, test_start(0x16))
+        .unwrap();
+    assert_eq!(
+        execution.schedule_next().unwrap().current,
+        Some(target_thread)
+    );
+    assert!(matches!(
+        wait_one_begin(
+            0xbeef_u32,
+            &mut registry,
+            &mut tasks,
+            &events,
+            &timers,
+            &channels,
+            &waits,
+            &execution,
+            &mut operations,
+            None,
+            crate::cpu::CpuIndex::BOOTSTRAP,
+            target_process,
+            target_thread,
+            event,
+            DW_SIGNAL_SIGNALED,
+            DW_DEADLINE_INFINITE,
+        ),
+        WaitSyscallBegin::Suspended { .. }
+    ));
+    let switched_target = execution
+        .suspended_claim_on(crate::cpu::CpuIndex::BOOTSTRAP)
+        .expect("blocked target retains its continuation until stack handoff");
+    assert_eq!(switched_target.thread(), target_thread);
+    execution.complete_switch_on(switched_target).unwrap();
+    assert_eq!(
+        execution.scheduler_state(current_thread),
+        Some(SchedulerThreadState::Running)
+    );
+    assert!(operations.contains_thread(target_thread));
+    assert_eq!(waits.len(), 1);
+
+    let mut discarded = None;
+    {
+        let mut terminal_waits = WaitTerminalCleanup::new(&mut operations, None, |output| {
+            assert!(discarded.replace(output).is_none());
+        });
+        assert!(
+            terminal_outcome(
+                process_terminate(
+                    &mut registry,
+                    &mut tasks,
+                    &execution,
+                    &waits,
+                    &mut terminal_waits,
+                    current_process,
+                    current_thread,
+                    target_handle,
+                    DW_TERMINATION_AUTHORIZED,
+                    0x22,
+                    &mut cleanup,
+                ),
+                DW_STATUS_SUCCESS,
+                SyscallControl::ReturnToCaller,
+            )
+            .is_none()
+        );
+    }
+    assert_eq!(discarded, Some(0xbeef));
+    assert!(!operations.contains_thread(target_thread));
+    assert_eq!(waits.len(), 0);
+    assert!(!execution.blocked_operations().has_thread(target_thread));
+    assert_eq!(execution.scheduler_state(target_thread), None);
+    assert_eq!(
+        tasks.process_info(target_process).unwrap().state,
+        deepwyrm_abi::DW_TASK_STATE_EXITED
+    );
+    assert_eq!(
+        tasks.process_info(target_process).unwrap().reason,
+        DW_TERMINATION_AUTHORIZED
+    );
+
+    let deferred = terminal_outcome(
+        process_exit_on(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut NoTerminalWaitCleanup,
+            crate::cpu::CpuIndex::BOOTSTRAP,
+            current_process,
+            current_thread,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        crate::cpu::CpuIndex::BOOTSTRAP,
+        deferred,
+        &mut cleanup,
+    );
+    cleanup.push_optional(registry.release_handle(current_thread_ref).unwrap());
+    cleanup.push_optional(registry.release_handle(target_thread_ref).unwrap());
+    cleanup.push_optional(registry.release_handle(current_process_ref).unwrap());
+    cleanup.push_optional(registry.release_internal(root_owner).unwrap());
+    for release in cleanup.into_releases().into_iter().flatten() {
+        if release.object_type() == deepwyrm_abi::DW_OBJECT_TYPE_EVENT {
+            let finalization = events.take_finalization(release).unwrap();
+            crate::wait::complete_event_finalization(&mut registry, finalization);
+            continue;
+        }
+        let mut pending = Some(release);
+        while let Some(release) = pending.take() {
+            let finalization = tasks.take_finalization(release).unwrap();
+            pending = crate::task::complete_task_finalization(&mut registry, finalization);
+        }
+    }
+}
+
+#[test]
 fn prepared_process_termination_preserves_remote_execution_until_exact_stop() {
     let mut registry = ObjectRegistry::<24>::new();
     let mut tasks = Tasks::new();
@@ -2819,6 +2991,8 @@ fn prepared_process_termination_preserves_remote_execution_until_exact_stop() {
         &mut registry,
         &mut tasks,
         &execution,
+        &waits,
+        &mut terminal_waits,
         current_process,
         current_thread,
         target_handle,

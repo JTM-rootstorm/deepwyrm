@@ -407,11 +407,27 @@ impl OwnedLiveAtomicU32 {
     pub(crate) const fn address(&self) -> u64 {
         self.range.start()
     }
+
+    pub(crate) fn release_terminal(
+        self,
+        pins: &UserPinTracker<E5_USER_PIN_CAPACITY>,
+    ) -> Result<(), LiveUserAccessError> {
+        pins.release_owned(self.address_space, self.token)
+            .map_err(LiveUserAccessError::Pin)
+    }
 }
 
 impl OwnedLiveUserOutput {
     pub(crate) const fn process(&self) -> crate::task::ProcessKey {
         self.process
+    }
+
+    pub(crate) fn discard_terminal(
+        self,
+        pins: &UserPinTracker<E5_USER_PIN_CAPACITY>,
+    ) -> Result<(), LiveUserAccessError> {
+        pins.release_owned(self.address_space, self.token)
+            .map_err(LiveUserAccessError::Pin)
     }
 }
 

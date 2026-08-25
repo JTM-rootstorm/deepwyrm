@@ -84,6 +84,7 @@ impl TaskExceptionRecord {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TaskError {
     Capacity,
+    OperationsInFlight,
     InvalidParent,
     ParentTerminating,
     InvalidTask,

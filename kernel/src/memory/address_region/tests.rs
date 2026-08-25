@@ -1078,7 +1078,7 @@ fn root_region_handle_close_preserves_address_space_until_process_exit() {
     );
     assert!(matches!(
         tasks.terminate_process_authorized(&mut registry, process, 0x77),
-        Err(TaskError::BadState)
+        Err(TaskError::OperationsInFlight)
     ));
     assert_eq!(
         tasks.process_lifecycle(process),

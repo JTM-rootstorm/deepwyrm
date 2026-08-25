@@ -223,7 +223,7 @@ fn process_gate_selects_one_termination_and_drains_preexisting_operations() {
     let lease = tasks.acquire_process_operation(process).unwrap();
     assert!(matches!(
         tasks.terminate_process_authorized(&mut registry, process, 0x11),
-        Err(TaskError::BadState)
+        Err(TaskError::OperationsInFlight)
     ));
     assert_eq!(
         tasks.process_lifecycle(process),

@@ -494,7 +494,9 @@ fn task_status(error: TaskError) -> DwStatus {
     match error {
         TaskError::Capacity => DW_STATUS_NO_RESOURCES,
         TaskError::WrongObjectType => DW_STATUS_WRONG_OBJECT_TYPE,
-        TaskError::BadState | TaskError::ParentTerminating => DW_STATUS_BAD_STATE,
+        TaskError::BadState | TaskError::OperationsInFlight | TaskError::ParentTerminating => {
+            DW_STATUS_BAD_STATE
+        }
         TaskError::InvalidParent | TaskError::InvalidTask | TaskError::Reference => {
             DW_STATUS_BAD_HANDLE
         }
@@ -4245,6 +4247,8 @@ pub(crate) fn process_terminate<
         registry,
         tasks,
         execution,
+        waits,
+        terminal_waits,
         current_process,
         current_thread,
         process,
@@ -4269,16 +4273,20 @@ pub(crate) fn process_terminate<
 }
 
 pub(crate) fn prepare_process_terminate<
+    C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
     const OBJECTS: usize,
     const GROUPS: usize,
     const PROCESSES: usize,
     const THREADS: usize,
     const HANDLES: usize,
+    const WAITERS: usize,
     const EXECUTION: usize,
 >(
     registry: &mut ObjectRegistry<OBJECTS>,
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
+    terminal_waits: &mut C,
     current_process: ProcessKey,
     current_thread: ThreadKey,
     process: DwHandle,
@@ -4299,6 +4307,26 @@ pub(crate) fn prepare_process_terminate<
     let target = ProcessKey::from_object_id(pin.id());
     let effects = match tasks.terminate_process_authorized(registry, target, detail) {
         Ok(effects) => effects,
+        Err(TaskError::OperationsInFlight) => {
+            let threads = match tasks.process_thread_keys(target) {
+                Ok(threads) => threads,
+                Err(error) => {
+                    release_lookup_pin(registry, pin, cleanup);
+                    return Err(task_status(error));
+                }
+            };
+            for thread in threads.into_iter().flatten() {
+                terminal_waits
+                    .cleanup_terminal_wait(registry, tasks, waits, execution, thread, cleanup);
+            }
+            match tasks.terminate_process_authorized(registry, target, detail) {
+                Ok(effects) => effects,
+                Err(error) => {
+                    release_lookup_pin(registry, pin, cleanup);
+                    return Err(task_status(error));
+                }
+            }
+        }
         Err(error) => {
             release_lookup_pin(registry, pin, cleanup);
             return Err(task_status(error));

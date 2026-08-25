@@ -474,6 +474,14 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         Ok(self.process(key)?.operations.phase)
     }
 
+    pub(crate) fn process_thread_keys(
+        &self,
+        key: ProcessKey,
+    ) -> Result<[Option<ThreadKey>; THREADS], TaskError> {
+        let threads = self.process(key)?.threads;
+        Ok(threads.map(|thread| thread.map(ThreadKey)))
+    }
+
     /// Acquires move-only authority for setup or publication associated with a
     /// live Process. New leases are rejected as soon as quiescing begins.
     pub(crate) fn acquire_process_operation(
@@ -1000,7 +1008,7 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             .begin_process_termination(key, process_termination)
             .map_err(|error| match error {
                 ProcessGateError::Task(error) => error,
-                ProcessGateError::OperationsInFlight => TaskError::BadState,
+                ProcessGateError::OperationsInFlight => TaskError::OperationsInFlight,
             })?;
         let process_slot = self.process_slot(key)?;
         let thread_ids = self.processes[process_slot]
