@@ -565,9 +565,17 @@ struct PendingRemoteTaskGroupTermination {
         crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
 }
 
+struct PendingRemoteThreadTermination {
+    phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
+    prepared: crate::syscall::PreparedThreadTermination<THREADS>,
+    deferred: [Option<crate::arch::x86_64::rendezvous::DeferredReclaim<()>>;
+        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+}
+
 enum PendingRemoteTermination {
     Process(PendingRemoteProcessTermination),
     TaskGroup(PendingRemoteTaskGroupTermination),
+    Thread(PendingRemoteThreadTermination),
 }
 
 struct PreparedRemoteProcessTermination {
@@ -584,6 +592,13 @@ struct PreparedRemoteTaskGroupTermination {
         crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
 }
 
+struct PreparedRemoteThreadTermination {
+    phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
+    prepared: crate::syscall::PreparedThreadTermination<THREADS>,
+    identities: [Option<crate::arch::x86_64::rendezvous::StopIdentity>;
+        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+}
+
 enum ProcessTerminationPreparation {
     Immediate(NativeSyscallResult),
     Remote(PreparedRemoteProcessTermination),
@@ -592,6 +607,11 @@ enum ProcessTerminationPreparation {
 enum TaskGroupTerminationPreparation {
     Immediate(NativeSyscallResult),
     Remote(PreparedRemoteTaskGroupTermination),
+}
+
+enum ThreadTerminationPreparation {
+    Immediate(NativeSyscallResult),
+    Remote(PreparedRemoteThreadTermination),
 }
 
 fn await_remote_stop_permits(
@@ -626,6 +646,60 @@ struct RuntimeCarrierFacade<
         PrimordialRuntimeCarrier<'roles, RANGE_CAPACITY, ROLE_CAPACITY>,
     >,
     pending_remote_termination: Option<PendingRemoteTermination>,
+}
+
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    RuntimeCarrierFacade<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn terminate_exception_with_remote_stops(
+        &mut self,
+        exception: crate::task::TaskExceptionRecord,
+    ) {
+        assert!(
+            self.pending_remote_termination.is_none(),
+            "terminal exception crossed a pending remote termination"
+        );
+        let pending = {
+            let mut runtime = self.runtime.lock();
+            runtime.select_cpu(self.cpu);
+            match runtime.prepare_remote_process_exception(exception) {
+                ProcessTerminationPreparation::Immediate(result) => {
+                    assert_eq!(result.status, DW_STATUS_SUCCESS);
+                    assert_eq!(result.control, SyscallControl::TerminateCurrent);
+                    return;
+                }
+                ProcessTerminationPreparation::Remote(prepared) => {
+                    let mut deferred = core::array::from_fn(|_| None);
+                    for (cpu_index, identity) in prepared.identities.into_iter().enumerate() {
+                        let Some(identity) = identity else {
+                            continue;
+                        };
+                        deferred[cpu_index] = Some(
+                            crate::arch::x86_64::idle::publish_live_remote_stop(identity, ())
+                                .unwrap_or_else(|failure| {
+                                    let error = failure.error();
+                                    let _resource = failure.into_resource();
+                                    panic!("exception remote-stop publication failed: {error:?}")
+                                }),
+                        );
+                    }
+                    PendingRemoteProcessTermination {
+                        phase: prepared.phase,
+                        prepared: prepared.prepared,
+                        deferred,
+                    }
+                }
+            }
+        };
+        let permits = await_remote_stop_permits(pending.deferred);
+        let result = {
+            let mut runtime = self.runtime.lock();
+            runtime.select_cpu(self.cpu);
+            runtime.complete_process_termination(pending.phase, pending.prepared, permits)
+        };
+        assert_eq!(result.status, DW_STATUS_SUCCESS);
+        assert_eq!(result.control, SyscallControl::TerminateCurrent);
+    }
 }
 
 enum PreparedCarrierEntry {
@@ -2105,6 +2179,88 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.merge_cleanup(cleanup);
     }
 
+    fn prepare_remote_process_exception(
+        &mut self,
+        exception: crate::task::TaskExceptionRecord,
+    ) -> ProcessTerminationPreparation {
+        let phase = self.reserve_runtime_phase();
+        self.assert_guard_free_external_work();
+        let prepared = match self.prepare_process_exception_with_wait_cleanup(exception) {
+            Ok(prepared) => prepared,
+            Err(status) => {
+                self.commit_runtime_phase(phase);
+                return ProcessTerminationPreparation::Immediate(NativeSyscallResult::returning(
+                    status,
+                ));
+            }
+        };
+        let identities = self.process_stop_identities(&prepared);
+        if identities.iter().all(Option::is_none) {
+            return ProcessTerminationPreparation::Immediate(self.complete_process_termination(
+                phase,
+                prepared,
+                core::array::from_fn(|_| None),
+            ));
+        }
+        ProcessTerminationPreparation::Remote(PreparedRemoteProcessTermination {
+            phase,
+            prepared,
+            identities,
+        })
+    }
+
+    fn prepare_process_exception_with_wait_cleanup(
+        &mut self,
+        exception: crate::task::TaskExceptionRecord,
+    ) -> Result<crate::syscall::PreparedProcessTermination<HANDLES, THREADS>, deepwyrm_abi::DwStatus>
+    {
+        let mut discarded: [Option<user_access::OwnedLiveUserOutput>; THREADS] =
+            core::array::from_fn(|_| None);
+        let mut atomic_pins: [Option<user_access::OwnedLiveAtomicU32>; THREADS] =
+            core::array::from_fn(|_| None);
+        let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
+        let result = {
+            let mut terminal = self.services.terminal_cleanup(
+                Some(&mut wait_deadlines),
+                |output| {
+                    *discarded
+                        .iter_mut()
+                        .find(|slot| slot.is_none())
+                        .expect("exception terminal output batch overflow") = Some(output);
+                },
+                |pin| {
+                    *atomic_pins
+                        .iter_mut()
+                        .find(|slot| slot.is_none())
+                        .expect("exception terminal atomic-pin batch overflow") = Some(pin);
+                },
+            );
+            crate::syscall::prepare_process_unhandled_exception(
+                &mut self.registry,
+                &mut self.tasks,
+                &self.shared.execution,
+                &self.shared.waits,
+                &mut terminal,
+                self.process,
+                self.thread,
+                exception,
+                &mut self.cleanup,
+            )
+        };
+        for output in discarded.into_iter().flatten() {
+            output
+                .discard_terminal(&self.active.user_pins)
+                .unwrap_or_else(|_| panic!("exception terminal output pin drifted"));
+        }
+        for pin in atomic_pins.into_iter().flatten() {
+            pin.release_terminal(&self.active.user_pins)
+                .unwrap_or_else(|_| panic!("exception terminal atomic pin drifted"));
+        }
+        let cleanup = self.services.take_cleanup();
+        self.merge_cleanup(cleanup);
+        result
+    }
+
     fn unmap_primordial_userspace(
         &mut self,
         proof: &crate::task::ProcessQuiescenceProof,
@@ -2586,16 +2742,20 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         // An e1 Stop may arrive after the blocked syscall has committed its
         // exact Running generation into this CPU's suspended continuation.
         // Keep that case generation-bound; it is not a thread-only fallback.
-        let (claim, was_suspended) = match self.shared.execution.running_claim_on(self.cpu) {
-            Some(claim) => (claim, false),
-            None => (
-                self.shared
-                    .execution
-                    .suspended_claim_on(self.cpu)
-                    .ok_or(crate::arch::x86_64::rendezvous::RemoteStopError::StaleRequest)?,
-                true,
-            ),
+        let suspended = self.shared.execution.suspended_claim_on(self.cpu);
+        let running = self.shared.execution.running_claim_on(self.cpu);
+        let matches_identity = |claim: crate::task::SchedulerExecutionClaim| {
+            claim.thread() == identity.thread()
+                && claim.generation() == identity.execution_generation()
         };
+        let (claim, was_suspended) =
+            if let Some(claim) = suspended.filter(|claim| matches_identity(*claim)) {
+                (claim, true)
+            } else if let Some(claim) = running.filter(|claim| matches_identity(*claim)) {
+                (claim, false)
+            } else {
+                return Err(crate::arch::x86_64::rendezvous::RemoteStopError::StaleRequest);
+            };
         let root = self
             .active_root
             .as_ref()
@@ -2706,11 +2866,18 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn deferred_cleanup_is_quiescent(&self) -> bool {
+        let stopped = self
+            .stopping_claim
+            .unwrap_or_else(|| panic!("remote stop cleanup omitted its exact stopped claim"));
         self.cleanup.is_empty()
             && self.rendezvous_cleanup.is_some()
             && self.stopped_service_state_is_quiescent()
             && self.deferred_currents[self.cpu.index()].is_none()
-            && self.shared.execution.running_claim_on(self.cpu).is_none()
+            && self
+                .shared
+                .execution
+                .running_claim_on(self.cpu)
+                .is_none_or(|running| running.thread() != stopped.thread())
     }
 }
 
@@ -2826,8 +2993,10 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
     fn handle(&mut self, request: NativeSyscallRequest) -> NativeSyscallResult {
         if matches!(
             request,
-            NativeSyscallRequest::ProcessTerminate { .. }
+            NativeSyscallRequest::ProcessExit { .. }
+                | NativeSyscallRequest::ProcessTerminate { .. }
                 | NativeSyscallRequest::TaskGroupTerminate { .. }
+                | NativeSyscallRequest::ThreadTerminate { .. }
         ) {
             assert!(
                 self.pending_remote_termination.is_none(),
@@ -2836,6 +3005,23 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             let mut runtime = self.runtime.lock();
             runtime.select_cpu(self.cpu);
             let prepared = match request {
+                NativeSyscallRequest::ProcessExit { exit_code } => {
+                    match runtime.prepare_remote_process_exit(exit_code) {
+                        ProcessTerminationPreparation::Immediate(result) => return result,
+                        ProcessTerminationPreparation::Remote(prepared) => {
+                            let phase = prepared.phase;
+                            let identities = prepared.identities;
+                            let pending = PendingRemoteTermination::Process(
+                                PendingRemoteProcessTermination {
+                                    phase,
+                                    prepared: prepared.prepared,
+                                    deferred: core::array::from_fn(|_| None),
+                                },
+                            );
+                            (identities, pending)
+                        }
+                    }
+                }
                 NativeSyscallRequest::ProcessTerminate {
                     process,
                     reason,
@@ -2871,6 +3057,24 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                         }
                     }
                 }
+                NativeSyscallRequest::ThreadTerminate {
+                    thread,
+                    reason,
+                    code,
+                } => match runtime.prepare_remote_thread_termination(thread, reason, code) {
+                    ThreadTerminationPreparation::Immediate(result) => return result,
+                    ThreadTerminationPreparation::Remote(prepared) => {
+                        let phase = prepared.phase;
+                        let identities = prepared.identities;
+                        let pending =
+                            PendingRemoteTermination::Thread(PendingRemoteThreadTermination {
+                                phase,
+                                prepared: prepared.prepared,
+                                deferred: core::array::from_fn(|_| None),
+                            });
+                        (identities, pending)
+                    }
+                },
                 _ => unreachable!("terminal request classification drifted"),
             };
             let (identities, mut pending) = prepared;
@@ -2893,6 +3097,9 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                         pending.deferred[cpu_index] = Some(deferred)
                     }
                     PendingRemoteTermination::TaskGroup(pending) => {
+                        pending.deferred[cpu_index] = Some(deferred)
+                    }
+                    PendingRemoteTermination::Thread(pending) => {
                         pending.deferred[cpu_index] = Some(deferred)
                     }
                 }
@@ -2985,6 +3192,12 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 runtime.select_cpu(self.cpu);
                 runtime.complete_task_group_termination(pending.phase, pending.prepared, permits)
             }
+            PendingRemoteTermination::Thread(pending) => {
+                let permits = await_remote_stop_permits(pending.deferred);
+                let mut runtime = self.runtime.lock();
+                runtime.select_cpu(self.cpu);
+                runtime.complete_thread_termination(pending.phase, pending.prepared, permits)
+            }
         };
         frame.set_status(result.status);
         if result.control == SyscallControl::ReturnToCaller
@@ -3017,15 +3230,15 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
     }
 
     fn invalid_return(&mut self, error: crate::arch::x86_64::syscall::UserReturnError) {
-        let mut runtime = self.runtime.lock();
-        runtime.select_cpu(self.cpu);
-        runtime.invalid_return(error);
+        self.terminate_exception_with_remote_stops(crate::task::TaskExceptionRecord::new(
+            DW_EXCEPTION_GENERAL_PROTECTION,
+            invalid_user_return_detail(error),
+            0,
+        ));
     }
 
     fn user_exception(&mut self, record: crate::arch::x86_64::exceptions::UserExceptionRecord) {
-        let mut runtime = self.runtime.lock();
-        runtime.select_cpu(self.cpu);
-        runtime.user_exception(record);
+        self.terminate_exception_with_remote_stops(record.task_exception());
     }
 
     fn terminate_current(&mut self) -> ! {
@@ -4212,6 +4425,93 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         result
     }
 
+    fn prepare_remote_process_exit(&mut self, exit_code: u32) -> ProcessTerminationPreparation {
+        let phase = self.reserve_runtime_phase();
+        self.assert_guard_free_external_work();
+        #[cfg(deepwyrm_i1_evidence)]
+        let exiting_claim = self.shared.execution.running_claim_on(self.cpu);
+        let prepared = match self.prepare_process_exit_with_wait_cleanup(exit_code) {
+            Ok(prepared) => prepared,
+            Err(status) => {
+                self.commit_runtime_phase(phase);
+                return ProcessTerminationPreparation::Immediate(NativeSyscallResult::returning(
+                    status,
+                ));
+            }
+        };
+        #[cfg(deepwyrm_i1_evidence)]
+        if self.process != self.primordial_process {
+            let claim = exiting_claim
+                .unwrap_or_else(|| panic!("I1 child exit omitted its execution claim"));
+            crate::test_support::observe_i1_child_exit(self.process, self.cpu, claim.generation());
+        }
+        let identities = self.process_stop_identities(&prepared);
+        if identities.iter().all(Option::is_none) {
+            return ProcessTerminationPreparation::Immediate(self.complete_process_termination(
+                phase,
+                prepared,
+                core::array::from_fn(|_| None),
+            ));
+        }
+        ProcessTerminationPreparation::Remote(PreparedRemoteProcessTermination {
+            phase,
+            prepared,
+            identities,
+        })
+    }
+
+    fn prepare_process_exit_with_wait_cleanup(
+        &mut self,
+        exit_code: u32,
+    ) -> Result<crate::syscall::PreparedProcessTermination<HANDLES, THREADS>, deepwyrm_abi::DwStatus>
+    {
+        let mut discarded: [Option<user_access::OwnedLiveUserOutput>; THREADS] =
+            core::array::from_fn(|_| None);
+        let mut atomic_pins: [Option<user_access::OwnedLiveAtomicU32>; THREADS] =
+            core::array::from_fn(|_| None);
+        let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
+        let result = {
+            let mut terminal = self.services.terminal_cleanup(
+                Some(&mut wait_deadlines),
+                |output| {
+                    *discarded
+                        .iter_mut()
+                        .find(|slot| slot.is_none())
+                        .expect("process-exit output batch overflow") = Some(output);
+                },
+                |pin| {
+                    *atomic_pins
+                        .iter_mut()
+                        .find(|slot| slot.is_none())
+                        .expect("process-exit atomic-pin batch overflow") = Some(pin);
+                },
+            );
+            crate::syscall::prepare_process_exit(
+                &mut self.registry,
+                &mut self.tasks,
+                &self.shared.execution,
+                &self.shared.waits,
+                &mut terminal,
+                self.process,
+                self.thread,
+                exit_code,
+                &mut self.cleanup,
+            )
+        };
+        for output in discarded.into_iter().flatten() {
+            output
+                .discard_terminal(&self.active.user_pins)
+                .unwrap_or_else(|_| panic!("process-exit output pin drifted"));
+        }
+        for pin in atomic_pins.into_iter().flatten() {
+            pin.release_terminal(&self.active.user_pins)
+                .unwrap_or_else(|_| panic!("process-exit atomic pin drifted"));
+        }
+        let cleanup = self.services.take_cleanup();
+        self.merge_cleanup(cleanup);
+        result
+    }
+
     fn terminate_process_handle(
         &mut self,
         process: deepwyrm_abi::DwHandle,
@@ -4250,45 +4550,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     );
                 }
             };
-        let thread_keys = prepared.thread_keys();
-        let mut identities = core::array::from_fn(|_| None);
-        for cpu_index in 0..crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT {
-            let cpu = crate::cpu::CpuIndex::new(cpu_index)
-                .unwrap_or_else(|| panic!("I1 remote-stop CPU index is out of range"));
-            if cpu == self.cpu {
-                continue;
-            }
-            let claim = self
-                .shared
-                .execution
-                .running_claim_on(cpu)
-                .or_else(|| self.shared.execution.suspended_claim_on(cpu));
-            let Some(claim) = claim else {
-                continue;
-            };
-            if !thread_keys
-                .into_iter()
-                .flatten()
-                .any(|thread| thread == claim.thread())
-            {
-                continue;
-            }
-            let root = self.active_roots[cpu_index]
-                .as_ref()
-                .unwrap_or_else(|| panic!("remote terminal owner has no retained Process root"));
-            assert_eq!(
-                root.process(),
-                prepared.target(),
-                "remote terminal owner selected a different Process root"
-            );
-            let snapshot = crate::arch::x86_64::smp::live_cpu_registry()
-                .snapshot(cpu_index)
-                .unwrap_or_else(|_| panic!("remote terminal owner is not online"));
-            identities[cpu_index] = Some(
-                root.stop_identity(snapshot.online_generation, claim)
-                    .unwrap_or_else(|_| panic!("remote terminal identity is inconsistent")),
-            );
-        }
+        let identities = self.process_stop_identities(&prepared);
         if identities.iter().all(Option::is_none) {
             return ProcessTerminationPreparation::Immediate(self.complete_process_termination(
                 phase,
@@ -4315,6 +4577,52 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             prepared,
             identities,
         })
+    }
+
+    fn process_stop_identities(
+        &self,
+        prepared: &crate::syscall::PreparedProcessTermination<HANDLES, THREADS>,
+    ) -> [Option<crate::arch::x86_64::rendezvous::StopIdentity>;
+        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] {
+        let thread_keys = prepared.thread_keys();
+        let mut identities = core::array::from_fn(|_| None);
+        for cpu_index in 0..crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT {
+            let cpu = crate::cpu::CpuIndex::new(cpu_index)
+                .unwrap_or_else(|| panic!("I1 remote-stop CPU index is out of range"));
+            if cpu == self.cpu {
+                continue;
+            }
+            let claim = self
+                .shared
+                .execution
+                .terminal_physical_claim_on(cpu, &thread_keys);
+            let Some(claim) = claim else {
+                continue;
+            };
+            if !thread_keys
+                .into_iter()
+                .flatten()
+                .any(|thread| thread == claim.thread())
+            {
+                continue;
+            }
+            let root = self.active_roots[cpu_index]
+                .as_ref()
+                .unwrap_or_else(|| panic!("remote terminal owner has no retained Process root"));
+            assert_eq!(
+                root.process(),
+                prepared.target(),
+                "remote terminal owner selected a different Process root"
+            );
+            let snapshot = crate::arch::x86_64::smp::live_cpu_registry()
+                .snapshot(cpu_index)
+                .unwrap_or_else(|_| panic!("remote terminal owner is not online"));
+            identities[cpu_index] = Some(
+                root.stop_identity(snapshot.online_generation, claim)
+                    .unwrap_or_else(|_| panic!("remote terminal identity is inconsistent")),
+            );
+        }
+        identities
     }
 
     fn prepare_process_termination_with_wait_cleanup(
@@ -4397,11 +4705,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             if cpu == self.cpu {
                 continue;
             }
+            let thread_keys = prepared.thread_keys();
             let claim = self
                 .shared
                 .execution
-                .running_claim_on(cpu)
-                .or_else(|| self.shared.execution.suspended_claim_on(cpu));
+                .terminal_physical_claim_on(cpu, &thread_keys);
             let Some(claim) = claim else {
                 continue;
             };
@@ -4677,6 +4985,156 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 thread,
                 reason,
                 code,
+                &mut self.cleanup,
+            )
+        };
+        self.finish_terminal_adapter_resources(discarded, atomic_pins, control, deferred);
+        let result = NativeSyscallResult { status, control };
+        self.commit_runtime_phase(phase);
+        result
+    }
+
+    fn prepare_remote_thread_termination(
+        &mut self,
+        thread: deepwyrm_abi::DwHandle,
+        reason: deepwyrm_abi::DwTerminationReason,
+        code: u32,
+    ) -> ThreadTerminationPreparation {
+        let phase = self.reserve_runtime_phase();
+        self.assert_guard_free_external_work();
+        let prepared = match self.prepare_thread_termination_with_wait_cleanup(thread, reason, code)
+        {
+            Ok(prepared) => prepared,
+            Err(status) => {
+                self.commit_runtime_phase(phase);
+                return ThreadTerminationPreparation::Immediate(NativeSyscallResult::returning(
+                    status,
+                ));
+            }
+        };
+        let terminal_threads = prepared.thread_keys();
+        let mut identities = core::array::from_fn(|_| None);
+        for cpu_index in 0..crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT {
+            let cpu = crate::cpu::CpuIndex::new(cpu_index)
+                .unwrap_or_else(|| panic!("Thread remote-stop CPU index is out of range"));
+            if cpu == self.cpu {
+                continue;
+            }
+            let Some(claim) = self
+                .shared
+                .execution
+                .terminal_physical_claim_on(cpu, &terminal_threads)
+            else {
+                continue;
+            };
+            let root = self.active_roots[cpu_index]
+                .as_ref()
+                .unwrap_or_else(|| panic!("remote Thread owner has no retained Process root"));
+            assert_eq!(
+                root.process(),
+                prepared.target_process(),
+                "remote Thread owner selected a different Process root"
+            );
+            let snapshot = crate::arch::x86_64::smp::live_cpu_registry()
+                .snapshot(cpu_index)
+                .unwrap_or_else(|_| panic!("remote Thread owner is not online"));
+            identities[cpu_index] = Some(
+                root.stop_identity(snapshot.online_generation, claim)
+                    .unwrap_or_else(|_| panic!("remote Thread identity is inconsistent")),
+            );
+        }
+        if identities.iter().all(Option::is_none) {
+            return ThreadTerminationPreparation::Immediate(self.complete_thread_termination(
+                phase,
+                prepared,
+                core::array::from_fn(|_| None),
+            ));
+        }
+        ThreadTerminationPreparation::Remote(PreparedRemoteThreadTermination {
+            phase,
+            prepared,
+            identities,
+        })
+    }
+
+    fn prepare_thread_termination_with_wait_cleanup(
+        &mut self,
+        thread: deepwyrm_abi::DwHandle,
+        reason: deepwyrm_abi::DwTerminationReason,
+        code: u32,
+    ) -> Result<crate::syscall::PreparedThreadTermination<THREADS>, deepwyrm_abi::DwStatus> {
+        let mut discarded: [Option<user_access::OwnedLiveUserOutput>; 1] = [None];
+        let mut atomic_pins: [Option<user_access::OwnedLiveAtomicU32>; 1] = [None];
+        let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
+        let result = {
+            let mut terminal = self.services.terminal_cleanup(
+                Some(&mut wait_deadlines),
+                |output| {
+                    assert!(discarded[0].replace(output).is_none());
+                },
+                |pin| {
+                    assert!(atomic_pins[0].replace(pin).is_none());
+                },
+            );
+            crate::syscall::prepare_thread_terminate(
+                &mut self.registry,
+                &mut self.tasks,
+                &self.shared.execution,
+                &self.shared.waits,
+                &mut terminal,
+                self.process,
+                self.thread,
+                thread,
+                reason,
+                code,
+                &mut self.cleanup,
+            )
+        };
+        for output in discarded.into_iter().flatten() {
+            output
+                .discard_terminal(&self.active.user_pins)
+                .unwrap_or_else(|_| panic!("Thread termination output pin drifted"));
+        }
+        for pin in atomic_pins.into_iter().flatten() {
+            pin.release_terminal(&self.active.user_pins)
+                .unwrap_or_else(|_| panic!("Thread termination atomic pin drifted"));
+        }
+        let cleanup = self.services.take_cleanup();
+        self.merge_cleanup(cleanup);
+        result
+    }
+
+    fn complete_thread_termination(
+        &mut self,
+        phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
+        prepared: crate::syscall::PreparedThreadTermination<THREADS>,
+        permits: [Option<crate::arch::x86_64::rendezvous::RemoteStopReclaimPermit>;
+            crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+    ) -> NativeSyscallResult {
+        let mut discarded: [Option<user_access::OwnedLiveUserOutput>; 1] = [None];
+        let mut atomic_pins: [Option<user_access::OwnedLiveAtomicU32>; 1] = [None];
+        let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
+        let (status, control, deferred) = {
+            let mut terminal = self.services.terminal_cleanup(
+                Some(&mut wait_deadlines),
+                |output| {
+                    assert!(discarded[0].replace(output).is_none());
+                },
+                |pin| {
+                    assert!(atomic_pins[0].replace(pin).is_none());
+                },
+            );
+            crate::syscall::complete_prepared_thread_termination_after_remote_stops_on(
+                &mut self.registry,
+                &mut self.tasks,
+                &self.shared.execution,
+                &self.shared.waits,
+                &mut terminal,
+                self.cpu,
+                self.process,
+                self.thread,
+                prepared,
+                permits,
                 &mut self.cleanup,
             )
         };

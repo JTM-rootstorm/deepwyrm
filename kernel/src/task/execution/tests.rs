@@ -531,6 +531,49 @@ fn blocked_thread_retains_resources_until_terminal_retirement() {
 }
 
 #[test]
+fn terminal_physical_claim_prefers_unpublished_suspended_generation_over_logical_replacement() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (_process, process_handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let process_owner = registry
+        .retain_internal_from_handle(&process_handle)
+        .unwrap();
+    let (outgoing, _outgoing_handle) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    let (replacement, _replacement_handle) =
+        tasks.create_thread(&mut registry, &process_owner).unwrap();
+    assert!(registry.release_internal(process_owner).unwrap().is_none());
+    assert!(registry.release_internal(root_owner).unwrap().is_none());
+
+    let domain = ExecutionDomain::<2>::new(stack_bounds::<2>()).unwrap();
+    domain
+        .start_thread(&mut tasks, outgoing, start_state(61))
+        .unwrap();
+    domain
+        .start_thread(&mut tasks, replacement, start_state(62))
+        .unwrap();
+    let cpu1 = crate::cpu::CpuIndex::new(1).unwrap();
+    assert_eq!(
+        domain.schedule_next_on(cpu1).unwrap().current,
+        Some(outgoing)
+    );
+    let (_block, decision) = domain.block_current_on(cpu1, outgoing).unwrap();
+    assert_eq!(decision.current, Some(replacement));
+    let suspended = domain.suspended_claim_on(cpu1).unwrap();
+    let running = domain.running_claim_on(cpu1).unwrap();
+    assert_eq!(suspended.thread(), outgoing);
+    assert_eq!(running.thread(), replacement);
+    assert_eq!(
+        domain.terminal_physical_claim_on(cpu1, &[Some(outgoing), None]),
+        Some(suspended)
+    );
+    assert_eq!(
+        domain.terminal_physical_claim_on(cpu1, &[Some(replacement), None]),
+        Some(running)
+    );
+}
+
+#[test]
 fn continuation_seed_rejects_foreign_geometry_and_double_publication() {
     let (mut registry, mut tasks, thread, _thread_handle) = one_thread_fixture();
     let domain = ExecutionDomain::<1>::new(stack_bounds::<1>()).unwrap();

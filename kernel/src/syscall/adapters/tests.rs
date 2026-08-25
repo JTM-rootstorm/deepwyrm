@@ -2815,9 +2815,19 @@ fn non_current_process_termination_drains_a_suspended_wait_lease() {
     execution
         .start_thread(&mut tasks, current_thread, test_start(0x16))
         .unwrap();
+    let (target_stack, _target_context) = tasks
+        .thread_execution_resources(target_thread)
+        .unwrap()
+        .unwrap();
+    let cpu0 = crate::cpu::CpuIndex::new(0).unwrap();
+    let cpu1 = crate::cpu::CpuIndex::new(1).unwrap();
     assert_eq!(
-        execution.schedule_next().unwrap().current,
+        execution.schedule_next_on(cpu1).unwrap().current,
         Some(target_thread)
+    );
+    assert_eq!(
+        execution.schedule_next_on(cpu0).unwrap().current,
+        Some(current_thread)
     );
     assert!(matches!(
         wait_one_begin(
@@ -2831,7 +2841,7 @@ fn non_current_process_termination_drains_a_suspended_wait_lease() {
             &execution,
             &mut operations,
             None,
-            crate::cpu::CpuIndex::BOOTSTRAP,
+            cpu1,
             target_process,
             target_thread,
             event,
@@ -2841,13 +2851,13 @@ fn non_current_process_termination_drains_a_suspended_wait_lease() {
         WaitSyscallBegin::Suspended { .. }
     ));
     let switched_target = execution
-        .suspended_claim_on(crate::cpu::CpuIndex::BOOTSTRAP)
+        .suspended_claim_on(cpu1)
         .expect("blocked target retains its continuation until stack handoff");
     assert_eq!(switched_target.thread(), target_thread);
-    execution.complete_switch_on(switched_target).unwrap();
+    assert_eq!(execution.running_claim_on(cpu1), None);
     assert_eq!(
-        execution.scheduler_state(current_thread),
-        Some(SchedulerThreadState::Running)
+        execution.running_claim_on(cpu0).unwrap().thread(),
+        current_thread
     );
     assert!(operations.contains_thread(target_thread));
     assert_eq!(waits.len(), 1);
@@ -2857,19 +2867,40 @@ fn non_current_process_termination_drains_a_suspended_wait_lease() {
         let mut terminal_waits = WaitTerminalCleanup::new(&mut operations, None, |output| {
             assert!(discarded.replace(output).is_none());
         });
+        let prepared = prepare_process_terminate(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut terminal_waits,
+            current_process,
+            current_thread,
+            target_handle,
+            DW_TERMINATION_AUTHORIZED,
+            0x22,
+            &mut cleanup,
+        )
+        .unwrap();
+        assert_eq!(execution.suspended_claim_on(cpu1), Some(switched_target));
+        assert!(execution.stack_bounds(target_stack).is_ok());
+        execution.stop_suspended_claim_on(switched_target).unwrap();
+        execution.complete_switch_on(switched_target).unwrap();
+        let mut permits = core::array::from_fn(|_| None);
+        permits[cpu1.index()] =
+            Some(crate::arch::x86_64::rendezvous::RemoteStopReclaimPermit::for_test(target_thread));
         assert!(
             terminal_outcome(
-                process_terminate(
+                complete_prepared_process_termination_after_remote_stops_on(
                     &mut registry,
                     &mut tasks,
                     &execution,
                     &waits,
                     &mut terminal_waits,
+                    cpu0,
                     current_process,
                     current_thread,
-                    target_handle,
-                    DW_TERMINATION_AUTHORIZED,
-                    0x22,
+                    prepared,
+                    permits,
                     &mut cleanup,
                 ),
                 DW_STATUS_SUCCESS,
@@ -2883,6 +2914,7 @@ fn non_current_process_termination_drains_a_suspended_wait_lease() {
     assert_eq!(waits.len(), 0);
     assert!(!execution.blocked_operations().has_thread(target_thread));
     assert_eq!(execution.scheduler_state(target_thread), None);
+    assert!(execution.stack_bounds(target_stack).is_err());
     assert_eq!(
         tasks.process_info(target_process).unwrap().state,
         deepwyrm_abi::DW_TASK_STATE_EXITED
@@ -2899,7 +2931,7 @@ fn non_current_process_termination_drains_a_suspended_wait_lease() {
             &execution,
             &waits,
             &mut NoTerminalWaitCleanup,
-            crate::cpu::CpuIndex::BOOTSTRAP,
+            cpu0,
             current_process,
             current_thread,
             0,
@@ -2913,7 +2945,7 @@ fn non_current_process_termination_drains_a_suspended_wait_lease() {
         &mut registry,
         &execution,
         &waits,
-        crate::cpu::CpuIndex::BOOTSTRAP,
+        cpu0,
         deferred,
         &mut cleanup,
     );
@@ -2980,7 +3012,16 @@ fn external_final_blocked_thread_cleanup_precedes_process_quiescence_and_reclaim
     execution
         .start_thread(&mut tasks, caller, test_start(0xd8))
         .unwrap();
-    assert_eq!(execution.schedule_next().unwrap().current, Some(target));
+    let cpu0 = crate::cpu::CpuIndex::new(0).unwrap();
+    let cpu1 = crate::cpu::CpuIndex::new(1).unwrap();
+    assert_eq!(
+        execution.schedule_next_on(cpu1).unwrap().current,
+        Some(target)
+    );
+    assert_eq!(
+        execution.schedule_next_on(cpu0).unwrap().current,
+        Some(caller)
+    );
     let mut operations = WaitOperationRegistry::<u32, 2>::new();
     let wake = match wait_one_begin(
         0xd9,
@@ -2993,7 +3034,7 @@ fn external_final_blocked_thread_cleanup_precedes_process_quiescence_and_reclaim
         &execution,
         &mut operations,
         None,
-        crate::cpu::CpuIndex::BOOTSTRAP,
+        cpu1,
         target_process,
         target,
         event,
@@ -3003,14 +3044,9 @@ fn external_final_blocked_thread_cleanup_precedes_process_quiescence_and_reclaim
         WaitSyscallBegin::Suspended { wake, .. } => wake,
         _ => panic!("final target wait did not suspend"),
     };
-    let switched = execution
-        .suspended_claim_on(crate::cpu::CpuIndex::BOOTSTRAP)
-        .unwrap();
-    execution.complete_switch_on(switched).unwrap();
-    assert_eq!(
-        execution.scheduler_state(caller),
-        Some(SchedulerThreadState::Running)
-    );
+    let switched = execution.suspended_claim_on(cpu1).unwrap();
+    assert_eq!(switched.thread(), target);
+    assert_eq!(execution.running_claim_on(cpu1), None);
 
     let mut cleanup = CleanupQueue::<24>::new();
     let mut discarded = None;
@@ -3018,19 +3054,39 @@ fn external_final_blocked_thread_cleanup_precedes_process_quiescence_and_reclaim
         let mut terminal = WaitTerminalCleanup::new(&mut operations, None, |output| {
             assert!(discarded.replace(output).is_none());
         });
+        let prepared = prepare_thread_terminate(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut terminal,
+            caller_process,
+            caller,
+            target_handle,
+            DW_TERMINATION_AUTHORIZED,
+            0xda,
+            &mut cleanup,
+        )
+        .unwrap();
+        assert_eq!(execution.suspended_claim_on(cpu1), Some(switched));
+        execution.stop_suspended_claim_on(switched).unwrap();
+        execution.complete_switch_on(switched).unwrap();
+        let mut permits = core::array::from_fn(|_| None);
+        permits[cpu1.index()] =
+            Some(crate::arch::x86_64::rendezvous::RemoteStopReclaimPermit::for_test(target));
         assert!(
             terminal_outcome(
-                thread_terminate(
+                complete_prepared_thread_termination_after_remote_stops_on(
                     &mut registry,
                     &mut tasks,
                     &execution,
                     &waits,
                     &mut terminal,
+                    cpu0,
                     caller_process,
                     caller,
-                    target_handle,
-                    DW_TERMINATION_AUTHORIZED,
-                    0xda,
+                    prepared,
+                    permits,
                     &mut cleanup,
                 ),
                 DW_STATUS_SUCCESS,
@@ -3062,7 +3118,7 @@ fn external_final_blocked_thread_cleanup_precedes_process_quiescence_and_reclaim
             &execution,
             &waits,
             &mut NoTerminalWaitCleanup,
-            crate::cpu::CpuIndex::BOOTSTRAP,
+            cpu0,
             caller_process,
             caller,
             0,
@@ -3076,7 +3132,7 @@ fn external_final_blocked_thread_cleanup_precedes_process_quiescence_and_reclaim
         &mut registry,
         &execution,
         &waits,
-        crate::cpu::CpuIndex::BOOTSTRAP,
+        cpu0,
         deferred,
         &mut cleanup,
     );
@@ -3132,9 +3188,14 @@ fn terminate_current_process_with_blocked_sibling(exception: bool) {
     execution
         .start_thread(&mut tasks, sibling, test_start(0xe2))
         .unwrap();
-    assert_eq!(execution.schedule_next().unwrap().current, Some(current));
+    let cpu0 = crate::cpu::CpuIndex::new(0).unwrap();
+    let cpu1 = crate::cpu::CpuIndex::new(1).unwrap();
     assert_eq!(
-        execution.yield_current(current).unwrap().current,
+        execution.schedule_next_on(cpu0).unwrap().current,
+        Some(current)
+    );
+    assert_eq!(
+        execution.schedule_next_on(cpu1).unwrap().current,
         Some(sibling)
     );
 
@@ -3152,7 +3213,7 @@ fn terminate_current_process_with_blocked_sibling(exception: bool) {
             &execution,
             &mut operations,
             Some(&mut deadlines),
-            crate::cpu::CpuIndex::BOOTSTRAP,
+            cpu1,
             process,
             sibling,
             event,
@@ -3161,24 +3222,18 @@ fn terminate_current_process_with_blocked_sibling(exception: bool) {
         ),
         WaitSyscallBegin::Suspended { .. }
     ));
-    let switched = execution
-        .suspended_claim_on(crate::cpu::CpuIndex::BOOTSTRAP)
-        .unwrap();
+    let switched = execution.suspended_claim_on(cpu1).unwrap();
     assert_eq!(switched.thread(), sibling);
-    execution.complete_switch_on(switched).unwrap();
-    assert_eq!(
-        execution.scheduler_state(current),
-        Some(SchedulerThreadState::Running)
-    );
+    assert_eq!(execution.running_claim_on(cpu1), None);
 
     let mut discarded = std::vec::Vec::new();
-    let deferred = {
+    let prepared = {
         let mut terminal =
             WaitTerminalCleanup::new(&mut operations, Some(&mut deadlines), |output| {
                 discarded.push(output)
             });
-        let outcome = if exception {
-            process_unhandled_exception(
+        if exception {
+            prepare_process_unhandled_exception(
                 &mut registry,
                 &mut tasks,
                 &execution,
@@ -3194,25 +3249,48 @@ fn terminate_current_process_with_blocked_sibling(exception: bool) {
                 &mut cleanup,
             )
         } else {
-            process_exit_on(
+            prepare_process_exit(
                 &mut registry,
                 &mut tasks,
                 &execution,
                 &waits,
                 &mut terminal,
-                crate::cpu::CpuIndex::BOOTSTRAP,
                 process,
                 current,
                 0xe6,
                 &mut cleanup,
             )
-        };
-        terminal_outcome(outcome, DW_STATUS_SUCCESS, SyscallControl::TerminateCurrent).unwrap()
+        }
+        .unwrap()
     };
     assert_eq!(discarded, std::vec![0xe3]);
     assert!(operations.is_empty());
     assert_eq!(waits.len(), 0);
     assert!(!execution.blocked_operations().has_thread(sibling));
+    assert_eq!(execution.suspended_claim_on(cpu1), Some(switched));
+    execution.stop_suspended_claim_on(switched).unwrap();
+    execution.complete_switch_on(switched).unwrap();
+    let mut permits = core::array::from_fn(|_| None);
+    permits[cpu1.index()] =
+        Some(crate::arch::x86_64::rendezvous::RemoteStopReclaimPermit::for_test(sibling));
+    let deferred = terminal_outcome(
+        complete_prepared_process_termination_after_remote_stops_on(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut NoTerminalWaitCleanup,
+            cpu0,
+            process,
+            current,
+            prepared,
+            permits,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
     let info = tasks.process_info(process).unwrap();
     if exception {
         assert_eq!(
@@ -3225,24 +3303,14 @@ fn terminate_current_process_with_blocked_sibling(exception: bool) {
         assert_eq!(info.reason, deepwyrm_abi::DW_TERMINATION_NORMAL_EXIT);
         assert_eq!(info.application_code, 0xe6);
     }
-    if exception {
-        complete_deferred_current_reclaim(
-            &mut registry,
-            &execution,
-            &waits,
-            deferred,
-            &mut cleanup,
-        );
-    } else {
-        complete_deferred_current_reclaim_on(
-            &mut registry,
-            &execution,
-            &waits,
-            crate::cpu::CpuIndex::BOOTSTRAP,
-            deferred,
-            &mut cleanup,
-        );
-    }
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        cpu0,
+        deferred,
+        &mut cleanup,
+    );
     cleanup.push_optional(registry.release_handle(current_ref).unwrap());
     cleanup.push_optional(registry.release_handle(sibling_ref).unwrap());
     for release in cleanup.into_releases().into_iter().flatten() {
@@ -3991,13 +4059,22 @@ fn task_group_termination_drains_blocked_descendant_wait_before_terminal_batches
         .install(event_ref, DW_RIGHT_WAIT)
         .unwrap();
     let execution = ExecutionDomain::<2>::new(test_stack_bounds::<2>()).unwrap();
+    let cpu0 = crate::cpu::CpuIndex::BOOTSTRAP;
+    let cpu1 = crate::cpu::CpuIndex::new(1).unwrap();
     execution
         .start_thread(&mut tasks, target, test_start(0xb7))
         .unwrap();
     execution
         .start_thread(&mut tasks, current, test_start(0xb8))
         .unwrap();
-    assert_eq!(execution.schedule_next().unwrap().current, Some(target));
+    assert_eq!(
+        execution.schedule_next_on(cpu1).unwrap().current,
+        Some(target)
+    );
+    assert_eq!(
+        execution.schedule_next_on(cpu0).unwrap().current,
+        Some(current)
+    );
     let mut operations = WaitOperationRegistry::<u32, 2>::new();
     assert!(matches!(
         wait_one_begin(
@@ -4011,7 +4088,7 @@ fn task_group_termination_drains_blocked_descendant_wait_before_terminal_batches
             &execution,
             &mut operations,
             None,
-            crate::cpu::CpuIndex::BOOTSTRAP,
+            cpu1,
             target_process,
             target,
             event,
@@ -4020,14 +4097,9 @@ fn task_group_termination_drains_blocked_descendant_wait_before_terminal_batches
         ),
         WaitSyscallBegin::Suspended { .. }
     ));
-    let switched = execution
-        .suspended_claim_on(crate::cpu::CpuIndex::BOOTSTRAP)
-        .unwrap();
-    execution.complete_switch_on(switched).unwrap();
-    assert_eq!(
-        execution.scheduler_state(current),
-        Some(SchedulerThreadState::Running)
-    );
+    let switched = execution.suspended_claim_on(cpu1).unwrap();
+    assert_eq!(switched.thread(), target);
+    assert_eq!(execution.running_claim_on(cpu0).unwrap().thread(), current);
 
     let mut cleanup = CleanupQueue::<24>::new();
     let mut discarded = None;
@@ -4059,24 +4131,39 @@ fn task_group_termination_drains_blocked_descendant_wait_before_terminal_batches
     );
     assert!(prepared.contains_thread(target));
     assert!(prepared.contains_thread(current));
+    assert_eq!(execution.suspended_claim_on(cpu1), Some(switched));
 
+    execution.stop_suspended_claim_on(switched).unwrap();
+    execution.complete_switch_on(switched).unwrap();
+    let mut permits = core::array::from_fn(|_| None);
+    permits[cpu1.index()] =
+        Some(crate::arch::x86_64::rendezvous::RemoteStopReclaimPermit::for_test(target));
     let deferred = terminal_outcome(
-        complete_prepared_task_group_termination(
+        complete_prepared_task_group_termination_after_remote_stops_on(
             &mut registry,
             &mut tasks,
             &execution,
             &waits,
             &mut NoTerminalWaitCleanup,
+            cpu0,
             current_process,
             current,
             prepared,
+            permits,
             &mut cleanup,
         ),
         DW_STATUS_SUCCESS,
         SyscallControl::TerminateCurrent,
     )
     .unwrap();
-    complete_deferred_current_reclaim(&mut registry, &execution, &waits, deferred, &mut cleanup);
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        cpu0,
+        deferred,
+        &mut cleanup,
+    );
     cleanup.push_optional(registry.release_handle(target_ref).unwrap());
     cleanup.push_optional(registry.release_handle(current_ref).unwrap());
     cleanup.push_optional(registry.release_handle(current_process_ref).unwrap());

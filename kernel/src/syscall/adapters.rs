@@ -992,6 +992,15 @@ pub(crate) struct PreparedProcessTermination<const HANDLES: usize, const THREADS
     effects: ProcessExitEffects<HANDLES, THREADS>,
 }
 
+/// Terminal Thread effects retained until every foreign physical continuation
+/// owner has acknowledged the exact generation-bound stop.
+#[must_use = "prepared Thread termination must be completed after remote execution owners are stopped"]
+pub(crate) struct PreparedThreadTermination<const THREADS: usize> {
+    target: ThreadKey,
+    target_process: ProcessKey,
+    pins: crate::task::ExitPins<THREADS>,
+}
+
 /// Recursive TaskGroup terminal effects retained across live remote-stop
 /// acknowledgement. Logical task state is already terminal, but no execution
 /// resources in this batch may be reclaimed until completion consumes it.
@@ -1027,6 +1036,20 @@ impl<const HANDLES: usize, const THREADS: usize> PreparedProcessTermination<HAND
 
     pub(crate) fn thread_keys(&self) -> [Option<ThreadKey>; THREADS] {
         self.effects.pins.thread_keys()
+    }
+}
+
+impl<const THREADS: usize> PreparedThreadTermination<THREADS> {
+    pub(crate) const fn target(&self) -> ThreadKey {
+        self.target
+    }
+
+    pub(crate) const fn target_process(&self) -> ProcessKey {
+        self.target_process
+    }
+
+    pub(crate) fn thread_keys(&self) -> [Option<ThreadKey>; THREADS] {
+        self.pins.thread_keys()
     }
 }
 
@@ -4068,18 +4091,67 @@ pub(crate) fn process_exit_on<
     SyscallControl,
     Option<DeferredCurrentExecutionResources>,
 ) {
+    let prepared = match prepare_process_exit(
+        registry,
+        tasks,
+        execution,
+        waits,
+        terminal_waits,
+        current_process,
+        current_thread,
+        code,
+        cleanup,
+    ) {
+        Ok(prepared) => prepared,
+        Err(status) => return (status, SyscallControl::ReturnToCaller, None),
+    };
+    complete_prepared_process_termination_with_remote_threads(
+        registry,
+        tasks,
+        execution,
+        waits,
+        terminal_waits,
+        current_process,
+        prepared,
+        DeferredCurrentRetirement::Handoff {
+            cpu: current_cpu,
+            thread: current_thread,
+        },
+        &[],
+        cleanup,
+    )
+}
+
+pub(crate) fn prepare_process_exit<
+    C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
+    terminal_waits: &mut C,
+    current_process: ProcessKey,
+    current_thread: ThreadKey,
+    code: u32,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> Result<PreparedProcessTermination<HANDLES, THREADS>, DwStatus> {
     if let Err(status) = validate_running_caller(tasks, execution, current_process, current_thread)
     {
-        return (status, SyscallControl::ReturnToCaller, None);
+        return Err(status);
     }
     let effects = match tasks.exit_process(registry, current_process, current_thread, code) {
         Ok(effects) => effects,
         Err(TaskError::OperationsInFlight) => {
             let threads = match tasks.process_thread_keys(current_process) {
                 Ok(threads) => threads,
-                Err(error) => {
-                    return (task_status(error), SyscallControl::ReturnToCaller, None);
-                }
+                Err(error) => return Err(task_status(error)),
             };
             for thread in threads.into_iter().flatten() {
                 terminal_waits
@@ -4087,36 +4159,15 @@ pub(crate) fn process_exit_on<
             }
             match tasks.exit_process(registry, current_process, current_thread, code) {
                 Ok(effects) => effects,
-                Err(error) => {
-                    return (task_status(error), SyscallControl::ReturnToCaller, None);
-                }
+                Err(error) => return Err(task_status(error)),
             }
         }
-        Err(error) => return (task_status(error), SyscallControl::ReturnToCaller, None),
+        Err(error) => return Err(task_status(error)),
     };
-    let deferred = collect_process_effects(
-        registry,
-        tasks,
-        execution,
-        waits,
+    Ok(PreparedProcessTermination {
+        target: current_process,
         effects,
-        Some(DeferredCurrentRetirement::Handoff {
-            cpu: current_cpu,
-            thread: current_thread,
-        }),
-        &[],
-        terminal_waits,
-        cleanup,
-    );
-    assert!(
-        deferred.is_some(),
-        "process exit did not preserve the physical current execution bundle"
-    );
-    (
-        DW_STATUS_SUCCESS,
-        SyscallControl::TerminateCurrent,
-        deferred,
-    )
+    })
 }
 
 pub(crate) fn process_unhandled_exception<
@@ -4143,7 +4194,7 @@ pub(crate) fn process_unhandled_exception<
     SyscallControl,
     Option<DeferredCurrentExecutionResources>,
 ) {
-    process_unhandled_exception_with_retirement(
+    let prepared = match prepare_process_unhandled_exception(
         registry,
         tasks,
         execution,
@@ -4152,7 +4203,21 @@ pub(crate) fn process_unhandled_exception<
         current_process,
         current_thread,
         exception,
+        cleanup,
+    ) {
+        Ok(prepared) => prepared,
+        Err(status) => return (status, SyscallControl::ReturnToCaller, None),
+    };
+    complete_prepared_process_termination_with_remote_threads(
+        registry,
+        tasks,
+        execution,
+        waits,
+        terminal_waits,
+        current_process,
+        prepared,
         DeferredCurrentRetirement::Model(current_thread),
+        &[],
         cleanup,
     )
 }
@@ -4182,7 +4247,7 @@ pub(crate) fn process_unhandled_exception_on<
     SyscallControl,
     Option<DeferredCurrentExecutionResources>,
 ) {
-    process_unhandled_exception_with_retirement(
+    let prepared = match prepare_process_unhandled_exception(
         registry,
         tasks,
         execution,
@@ -4191,15 +4256,29 @@ pub(crate) fn process_unhandled_exception_on<
         current_process,
         current_thread,
         exception,
+        cleanup,
+    ) {
+        Ok(prepared) => prepared,
+        Err(status) => return (status, SyscallControl::ReturnToCaller, None),
+    };
+    complete_prepared_process_termination_with_remote_threads(
+        registry,
+        tasks,
+        execution,
+        waits,
+        terminal_waits,
+        current_process,
+        prepared,
         DeferredCurrentRetirement::Handoff {
             cpu: current_cpu,
             thread: current_thread,
         },
+        &[],
         cleanup,
     )
 }
 
-fn process_unhandled_exception_with_retirement<
+pub(crate) fn prepare_process_unhandled_exception<
     C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
     const OBJECTS: usize,
     const GROUPS: usize,
@@ -4217,16 +4296,11 @@ fn process_unhandled_exception_with_retirement<
     current_process: ProcessKey,
     current_thread: ThreadKey,
     exception: TaskExceptionRecord,
-    retirement: DeferredCurrentRetirement,
     cleanup: &mut CleanupQueue<OBJECTS>,
-) -> (
-    DwStatus,
-    SyscallControl,
-    Option<DeferredCurrentExecutionResources>,
-) {
+) -> Result<PreparedProcessTermination<HANDLES, THREADS>, DwStatus> {
     if let Err(status) = validate_running_caller(tasks, execution, current_process, current_thread)
     {
-        return (status, SyscallControl::ReturnToCaller, None);
+        return Err(status);
     }
     let effects = match tasks.terminate_process_exception(
         registry,
@@ -4240,9 +4314,7 @@ fn process_unhandled_exception_with_retirement<
         Err(TaskError::OperationsInFlight) => {
             let threads = match tasks.process_thread_keys(current_process) {
                 Ok(threads) => threads,
-                Err(error) => {
-                    return (task_status(error), SyscallControl::ReturnToCaller, None);
-                }
+                Err(error) => return Err(task_status(error)),
             };
             for thread in threads.into_iter().flatten() {
                 terminal_waits
@@ -4257,33 +4329,15 @@ fn process_unhandled_exception_with_retirement<
                 exception.fault_address,
             ) {
                 Ok(effects) => effects,
-                Err(error) => {
-                    return (task_status(error), SyscallControl::ReturnToCaller, None);
-                }
+                Err(error) => return Err(task_status(error)),
             }
         }
-        Err(error) => return (task_status(error), SyscallControl::ReturnToCaller, None),
+        Err(error) => return Err(task_status(error)),
     };
-    let deferred = collect_process_effects(
-        registry,
-        tasks,
-        execution,
-        waits,
+    Ok(PreparedProcessTermination {
+        target: current_process,
         effects,
-        Some(retirement),
-        &[],
-        terminal_waits,
-        cleanup,
-    );
-    assert!(
-        deferred.is_some(),
-        "unhandled exception did not preserve the physical current execution bundle"
-    );
-    (
-        DW_STATUS_SUCCESS,
-        SyscallControl::TerminateCurrent,
-        deferred,
-    )
+    })
 }
 
 pub(crate) fn process_terminate<
@@ -4660,12 +4714,75 @@ pub(crate) fn thread_terminate<
     SyscallControl,
     Option<DeferredCurrentExecutionResources>,
 ) {
+    let prepared = match prepare_thread_terminate(
+        registry,
+        tasks,
+        execution,
+        waits,
+        terminal_waits,
+        current_process,
+        current_thread,
+        thread,
+        reason,
+        detail,
+        cleanup,
+    ) {
+        Ok(prepared) => prepared,
+        Err(status) => return (status, SyscallControl::ReturnToCaller, None),
+    };
+    let outcome = complete_prepared_thread_termination_with_remote_threads(
+        registry,
+        tasks,
+        execution,
+        waits,
+        terminal_waits,
+        crate::cpu::CpuIndex::BOOTSTRAP,
+        current_process,
+        current_thread,
+        prepared,
+        &[],
+        cleanup,
+    );
+    if outcome.2.is_some() {
+        let claim = execution
+            .suspended_claim_on(crate::cpu::CpuIndex::BOOTSTRAP)
+            .expect("BSP ThreadTerminate model handoff retains its execution claim");
+        assert_eq!(claim.thread(), current_thread);
+        execution
+            .complete_switch_on(claim)
+            .expect("BSP ThreadTerminate model handoff follows current retirement");
+    }
+    outcome
+}
+
+pub(crate) fn prepare_thread_terminate<
+    C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
+    terminal_waits: &mut C,
+    current_process: ProcessKey,
+    current_thread: ThreadKey,
+    thread: DwHandle,
+    reason: DwTerminationReason,
+    detail: u32,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> Result<PreparedThreadTermination<THREADS>, DwStatus> {
     if let Err(status) = authorized_reason(reason) {
-        return (status, SyscallControl::ReturnToCaller, None);
+        return Err(status);
     }
     if let Err(status) = validate_running_caller(tasks, execution, current_process, current_thread)
     {
-        return (status, SyscallControl::ReturnToCaller, None);
+        return Err(status);
     }
     let pin = match resolve_current_handle(
         tasks,
@@ -4676,14 +4793,14 @@ pub(crate) fn thread_terminate<
         DW_RIGHT_MODIFY,
     ) {
         Ok(pin) => pin,
-        Err(status) => return (status, SyscallControl::ReturnToCaller, None),
+        Err(status) => return Err(status),
     };
     let target = ThreadKey::from_object_id(pin.id());
     let target_process = match tasks.thread_process(target) {
         Ok(process) => process,
         Err(error) => {
             release_lookup_pin(registry, pin, cleanup);
-            return (task_status(error), SyscallControl::ReturnToCaller, None);
+            return Err(task_status(error));
         }
     };
     let pins = match tasks.terminate_thread_authorized(target, detail) {
@@ -4695,13 +4812,13 @@ pub(crate) fn thread_terminate<
                 Ok(pins) => pins,
                 Err(error) => {
                     release_lookup_pin(registry, pin, cleanup);
-                    return (task_status(error), SyscallControl::ReturnToCaller, None);
+                    return Err(task_status(error));
                 }
             }
         }
         Err(error) => {
             release_lookup_pin(registry, pin, cleanup);
-            return (task_status(error), SyscallControl::ReturnToCaller, None);
+            return Err(task_status(error));
         }
     };
     if tasks
@@ -4719,7 +4836,99 @@ pub(crate) fn thread_terminate<
             cleanup.push(release);
         }
     }
-    for terminal_thread in pins.thread_keys().into_iter().flatten() {
+    release_lookup_pin(registry, pin, cleanup);
+    Ok(PreparedThreadTermination {
+        target,
+        target_process,
+        pins,
+    })
+}
+
+pub(crate) fn complete_prepared_thread_termination_after_remote_stops_on<
+    C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
+    terminal_waits: &mut C,
+    current_cpu: crate::cpu::CpuIndex,
+    current_process: ProcessKey,
+    current_thread: ThreadKey,
+    prepared: PreparedThreadTermination<THREADS>,
+    permits: [Option<crate::arch::x86_64::rendezvous::RemoteStopReclaimPermit>;
+        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> (
+    DwStatus,
+    SyscallControl,
+    Option<DeferredCurrentExecutionResources>,
+) {
+    let remote_threads = permits
+        .each_ref()
+        .map(|permit| permit.as_ref().map(|permit| permit.thread()));
+    complete_prepared_thread_termination_with_remote_threads(
+        registry,
+        tasks,
+        execution,
+        waits,
+        terminal_waits,
+        current_cpu,
+        current_process,
+        current_thread,
+        prepared,
+        remote_threads.as_slice(),
+        cleanup,
+    )
+}
+
+fn complete_prepared_thread_termination_with_remote_threads<
+    C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
+    terminal_waits: &mut C,
+    current_cpu: crate::cpu::CpuIndex,
+    current_process: ProcessKey,
+    current_thread: ThreadKey,
+    prepared: PreparedThreadTermination<THREADS>,
+    remote_threads: &[Option<ThreadKey>],
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> (
+    DwStatus,
+    SyscallControl,
+    Option<DeferredCurrentExecutionResources>,
+) {
+    let PreparedThreadTermination {
+        target,
+        target_process: _,
+        pins,
+    } = prepared;
+    let terminal_threads = pins.thread_keys();
+    assert!(
+        remote_threads
+            .iter()
+            .flatten()
+            .all(|thread| terminal_threads.contains(&Some(*thread))),
+        "remote-stop permit named a Thread outside the terminal Thread batch"
+    );
+    for terminal_thread in terminal_threads.into_iter().flatten() {
         terminal_waits.cleanup_terminal_wait(
             registry,
             tasks,
@@ -4730,13 +4939,22 @@ pub(crate) fn thread_terminate<
         );
     }
     let (pins, deferred) = if target == current_thread {
-        let (pins, deferred) = execution.retire_exit_pins_defer_current(pins, current_thread);
+        let (pins, deferred) = execution.retire_exit_pins_defer_current_after_remote_stops_on(
+            current_cpu,
+            pins,
+            current_thread,
+            remote_threads,
+        );
         (pins, Some(deferred))
-    } else {
+    } else if remote_threads.is_empty() {
         (execution.retire_exit_pins(pins), None)
+    } else {
+        (
+            execution.retire_exit_pins_after_remote_stops(pins, remote_threads),
+            None,
+        )
     };
     collect_retired_pins(registry, execution, waits, pins, cleanup);
-    release_lookup_pin(registry, pin, cleanup);
     let control = if target == current_thread {
         SyscallControl::TerminateCurrent
     } else {

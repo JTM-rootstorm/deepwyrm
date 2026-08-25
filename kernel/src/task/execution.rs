@@ -754,6 +754,23 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         self.scheduler.suspended_claim_on(cpu)
     }
 
+    /// Selects the exact continuation still physically owned by `cpu` for a
+    /// terminal batch. A committed block may already name a logical Running
+    /// replacement while the outgoing continuation remains unpublished; the
+    /// matching suspended generation is authoritative until switch completion.
+    pub(crate) fn terminal_physical_claim_on<const THREADS: usize>(
+        &self,
+        cpu: SchedulerCpuId,
+        terminal_threads: &[Option<ThreadKey>; THREADS],
+    ) -> Option<SchedulerExecutionClaim> {
+        self.suspended_claim_on(cpu)
+            .filter(|claim| terminal_threads.contains(&Some(claim.thread())))
+            .or_else(|| {
+                self.running_claim_on(cpu)
+                    .filter(|claim| terminal_threads.contains(&Some(claim.thread())))
+            })
+    }
+
     pub(crate) fn wake(&self, key: BlockWakeKey) -> Result<(), SchedulerError> {
         let affinity = self.scheduler.wake_with_affinity(key)?;
         super::notify_runnable_work(affinity);
