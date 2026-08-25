@@ -1361,6 +1361,14 @@ unsafe fn native_runtime_trampoline<
                                     }
                                     Err(_) => halt_forever(),
                                 };
+                                let idle_accounting = {
+                                    let started_at_ns = crate::time::monotonic_now()
+                                        .unwrap_or_else(|_| halt_forever());
+                                    let runtime = unsafe { &mut *context.cast::<R>() };
+                                    runtime
+                                        .publish_scheduler_idle(started_at_ns)
+                                        .unwrap_or_else(|_| halt_forever())
+                                };
                                 wait_for_suspend_interrupt();
                                 // `hlt` returned with interrupts masked again.
                                 // First complete the exact idle generation, then
@@ -1368,6 +1376,14 @@ unsafe fn native_runtime_trampoline<
                                 // scheduler poll or user-return work.
                                 crate::arch::x86_64::idle::finish_current_idle(halt)
                                     .unwrap_or_else(|_| halt_forever());
+                                let finished_at_ns =
+                                    crate::time::monotonic_now().unwrap_or_else(|_| halt_forever());
+                                {
+                                    let runtime = unsafe { &mut *context.cast::<R>() };
+                                    runtime
+                                        .finish_scheduler_idle(idle_accounting, finished_at_ns)
+                                        .unwrap_or_else(|_| halt_forever());
+                                }
                                 match crate::time::service_current_rendezvous_latch()
                                     .unwrap_or_else(|_| halt_forever())
                                 {

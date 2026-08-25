@@ -235,3 +235,69 @@ fn suspended_frame_rebinds_only_before_return_authorization() {
         Err(UserReturnError::BindingChanged)
     );
 }
+
+#[test]
+fn dw1_a_idle_accounting_is_bound_to_successful_halted_publication() {
+    fn assert_live_boundary(source: &str, commit_marker: &str, wait_marker: &str) {
+        let commit = source
+            .find(commit_marker)
+            .expect("live idle path must commit its architecture generation");
+        let source = &source[commit..];
+        let rescan = source
+            .find("IdleWakeError::RescanRequired")
+            .expect("live idle path must preserve the RescanRequired branch");
+        let rescan_continue = source[rescan..]
+            .find("continue;")
+            .map(|offset| rescan + offset)
+            .expect("RescanRequired must return to the scheduler scan");
+        let publish = source
+            .find("publish_scheduler_idle(started_at_ns)")
+            .expect("successful HALTED publication must begin scheduler idle accounting");
+        let wait = source
+            .find(wait_marker)
+            .expect("published scheduler idle accounting must precede the physical halt");
+        let physical_finish = source
+            .find("finish_current_idle(halt)")
+            .expect("the exact HALTED generation must finish after return");
+        let accounting_finish = source
+            .find("finish_scheduler_idle(idle_accounting, finished_at_ns)")
+            .expect("the matching scheduler idle token must close after HALTED completion");
+
+        assert!(rescan < rescan_continue);
+        assert!(rescan_continue < publish);
+        assert!(publish < wait);
+        assert!(wait < physical_finish);
+        assert!(physical_finish < accounting_finish);
+    }
+
+    assert_live_boundary(
+        include_str!("live.rs"),
+        "commit_current_idle(idle)",
+        "wait_for_suspend_interrupt();",
+    );
+    let primordial = include_str!("../mm/activation/primordial.rs");
+    let commit = primordial
+        .find("commit_current_idle(idle)")
+        .expect("AP idle path must commit its architecture generation");
+    let primordial = &primordial[commit..];
+    let publish = primordial
+        .find("publish_scheduler_idle(started_at_ns)")
+        .expect("successful AP HALTED publication must begin scheduler idle accounting");
+    let wait = primordial
+        .find("core::arch::asm!(\"sti\", \"hlt\", \"cli\"")
+        .expect("AP scheduler idle accounting must precede the physical halt");
+    let physical_finish = primordial
+        .find("finish_current_idle(halt)")
+        .expect("the AP HALTED generation must finish after return");
+    let accounting_finish = primordial
+        .find("finish_scheduler_idle(idle_accounting, finished_at_ns)")
+        .expect("the matching AP scheduler idle token must close after HALTED completion");
+    let rescan = primordial
+        .find("IdleWakeError::RescanRequired")
+        .expect("AP idle path must preserve the RescanRequired branch");
+    assert!(publish < wait);
+    assert!(wait < physical_finish);
+    assert!(physical_finish < accounting_finish);
+    assert!(accounting_finish < rescan);
+    assert!(!primordial[rescan..].contains("publish_scheduler_idle"));
+}

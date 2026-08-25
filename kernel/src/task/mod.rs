@@ -45,8 +45,8 @@ pub(crate) use execution::{
 pub(crate) use scheduler::{
     BlockReservation, BlockReservationFailure, BlockToken, BlockWakeKey, CooperativeScheduler,
     IdleScheduleDecision, ScheduleDecision, SchedulerCpuId, SchedulerError,
-    SchedulerExecutionClaim, SchedulerReservation, SchedulerReservationFailure,
-    SchedulerThreadState,
+    SchedulerExecutionClaim, SchedulerIdleAccountingToken, SchedulerReservation,
+    SchedulerReservationFailure, SchedulerThreadState,
 };
 
 /// Notifies an exact continuation owner, or one eligible remote idle CPU for

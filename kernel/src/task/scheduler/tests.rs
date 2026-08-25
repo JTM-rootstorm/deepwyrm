@@ -204,6 +204,292 @@ fn accounting_failure_cannot_grant_running_ownership() {
         scheduler.check_invariants(),
         Err(SchedulerError::AccountingOverflow)
     );
+    assert_eq!(
+        scheduler.schedule_next_on(cpu(1)),
+        Err(SchedulerError::AccountingOverflow)
+    );
+    assert_eq!(scheduler.current_on(cpu(1)), None);
+}
+
+#[test]
+#[should_panic(expected = "scheduler invariant failed: AccountingUnderflow")]
+fn invariant_reconciliation_is_fail_stop_in_all_build_modes() {
+    let scheduler = CooperativeScheduler::<1>::new();
+    scheduler.state.lock().accounting.cpu[0].current_runnable = 1;
+
+    scheduler
+        .observe_instrumentation_time_on(cpu(0), 1)
+        .unwrap();
+}
+
+#[test]
+fn idle_accounting_begins_only_after_publication_and_resume_is_not_a_switch() {
+    let scheduler = CooperativeScheduler::<1>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let waiter = thread_key(&mut registry);
+
+    scheduler
+        .observe_instrumentation_time_on(cpu(0), 10)
+        .unwrap();
+    scheduler
+        .commit(scheduler.reserve(waiter).unwrap())
+        .unwrap();
+    scheduler
+        .observe_instrumentation_time_on(cpu(1), 20)
+        .unwrap();
+    scheduler.schedule_next_on(cpu(1)).unwrap();
+    scheduler
+        .observe_instrumentation_time_on(cpu(1), 30)
+        .unwrap();
+    let (blocked, decision) = scheduler.block_current_on(cpu(1), waiter).unwrap();
+    assert_eq!(decision.current, None);
+
+    scheduler
+        .observe_instrumentation_time_on(cpu(1), 40)
+        .unwrap();
+    assert_eq!(
+        scheduler.schedule_from_idle_on(cpu(1), waiter),
+        Ok(IdleScheduleDecision::ContinueIdle)
+    );
+    let before_publication = scheduler.counters_on(cpu(1));
+    assert_eq!(before_publication.idle_entries, 0);
+    assert_eq!(before_publication.idle_time_ns, 0);
+
+    let idle = scheduler.publish_idle_on(cpu(1), 41).unwrap();
+    assert_eq!(scheduler.counters_on(cpu(1)).idle_entries, 1);
+    assert_eq!(
+        scheduler.publish_idle_on(cpu(1), 42),
+        Err(SchedulerError::IdleAccountingActive)
+    );
+    assert_eq!(
+        scheduler.finish_idle_on(idle, 40),
+        Err(SchedulerError::TimeRegression)
+    );
+    scheduler.finish_idle_on(idle, 51).unwrap();
+    assert_eq!(
+        scheduler.finish_idle_on(idle, 52),
+        Err(SchedulerError::StaleIdleAccounting)
+    );
+
+    scheduler
+        .observe_instrumentation_time_on(cpu(1), 60)
+        .unwrap();
+    scheduler.wake(blocked.into_wake_key()).unwrap();
+    let switches_before_resume = scheduler.counters_on(cpu(1)).context_switches;
+    scheduler
+        .observe_instrumentation_time_on(cpu(1), 70)
+        .unwrap();
+    assert_eq!(
+        scheduler.schedule_from_idle_on(cpu(1), waiter),
+        Ok(IdleScheduleDecision::ResumeCurrent)
+    );
+    let counters = scheduler.counters_on(cpu(1));
+    assert_eq!(counters.context_switches, switches_before_resume);
+    assert_eq!(counters.idle_entries, 1);
+    assert_eq!(counters.idle_time_ns, 10);
+    assert_eq!(counters.longest_ready_delay_ns, 10);
+
+    let (records, _, len) = scheduler.trace_snapshot();
+    assert!(len >= 2);
+    let mut idle_records = [None; 2];
+    let mut idle_count = 0;
+    for record in records.iter().flatten().filter(|record| {
+        matches!(
+            record.kind,
+            SchedulerTraceKind::IdleBegin | SchedulerTraceKind::IdleEnd
+        )
+    }) {
+        idle_records[idle_count] = Some(*record);
+        idle_count += 1;
+    }
+    assert_eq!(idle_count, 2);
+    let idle_begin = idle_records[0].unwrap();
+    let idle_end = idle_records[1].unwrap();
+    assert_ne!(idle_begin.generation, 0);
+    assert_eq!(idle_begin.generation, idle_end.generation);
+    assert_eq!(idle_begin.at_ns, 41);
+    assert_eq!(idle_end.at_ns, 51);
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn reordered_per_cpu_samples_preserve_idle_and_ready_delay_attribution() {
+    let scheduler = CooperativeScheduler::<1>::new();
+    let cpu0_idle = scheduler.publish_idle_on(cpu(0), 100).unwrap();
+    let cpu1_idle = scheduler.publish_idle_on(cpu(1), 110).unwrap();
+
+    scheduler.finish_idle_on(cpu0_idle, 105).unwrap();
+    scheduler
+        .observe_instrumentation_time_on(cpu(0), 106)
+        .unwrap();
+    scheduler.finish_idle_on(cpu1_idle, 115).unwrap();
+    scheduler
+        .observe_instrumentation_time_on(cpu(1), 116)
+        .unwrap();
+    assert_eq!(scheduler.counters_on(cpu(0)).idle_time_ns, 5);
+    assert_eq!(scheduler.counters_on(cpu(1)).idle_time_ns, 5);
+    assert_eq!(
+        scheduler.observe_instrumentation_time_on(cpu(0), 104),
+        Err(SchedulerError::TimeRegression)
+    );
+
+    let ready_scheduler = CooperativeScheduler::<1>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let ready = thread_key(&mut registry);
+    ready_scheduler
+        .observe_instrumentation_time_on(cpu(0), 200)
+        .unwrap();
+    ready_scheduler
+        .commit(ready_scheduler.reserve(ready).unwrap())
+        .unwrap();
+    ready_scheduler
+        .observe_instrumentation_time_on(cpu(1), 199)
+        .unwrap();
+    assert_eq!(
+        ready_scheduler.schedule_next_on(cpu(1)).unwrap().current,
+        Some(ready)
+    );
+    assert_eq!(
+        ready_scheduler.counters_on(cpu(1)).longest_ready_delay_ns,
+        0
+    );
+    assert_eq!(ready_scheduler.counters_on(cpu(0)).current_runnable, 0);
+    assert_eq!(ready_scheduler.check_invariants(), Ok(()));
+
+    let same_cpu_scheduler = CooperativeScheduler::<1>::new();
+    let same_cpu_ready = thread_key(&mut registry);
+    same_cpu_scheduler
+        .observe_instrumentation_time_on(cpu(0), 300)
+        .unwrap();
+    same_cpu_scheduler
+        .commit(same_cpu_scheduler.reserve(same_cpu_ready).unwrap())
+        .unwrap();
+    same_cpu_scheduler.state.lock().instrumentation_now_ns[0] = Some(299);
+    assert_eq!(
+        same_cpu_scheduler.schedule_next_on(cpu(0)),
+        Err(SchedulerError::TimeRegression)
+    );
+    assert_eq!(
+        same_cpu_scheduler.state(same_cpu_ready),
+        Some(SchedulerThreadState::Runnable)
+    );
+    assert_eq!(same_cpu_scheduler.current_on(cpu(0)), None);
+    assert_eq!(same_cpu_scheduler.counters_on(cpu(0)).current_runnable, 1);
+    assert_eq!(same_cpu_scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn trace_ring_is_fixed_capacity_and_every_record_is_generation_bound() {
+    let scheduler = CooperativeScheduler::<1>::new();
+    for generation in 0..(SCHEDULER_TRACE_CAPACITY + 8) {
+        let start = (generation as u64) * 2;
+        let idle = scheduler.publish_idle_on(cpu(2), start).unwrap();
+        scheduler.finish_idle_on(idle, start + 1).unwrap();
+    }
+    let (records, _, len) = scheduler.trace_snapshot();
+    assert_eq!(len, SCHEDULER_TRACE_CAPACITY);
+    assert_eq!(records.iter().flatten().count(), SCHEDULER_TRACE_CAPACITY);
+    assert!(
+        records
+            .iter()
+            .flatten()
+            .all(|record| record.generation != 0)
+    );
+}
+
+#[test]
+fn suspended_retire_generation_exhaustion_is_atomic_then_retryable() {
+    let scheduler = CooperativeScheduler::<2>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let suspended = thread_key(&mut registry);
+    let replacement = thread_key(&mut registry);
+
+    scheduler
+        .commit(scheduler.reserve(suspended).unwrap())
+        .unwrap();
+    scheduler.schedule_next_on(cpu(1)).unwrap();
+    let (blocked, decision) = scheduler.block_current_on(cpu(1), suspended).unwrap();
+    assert_eq!(decision.current, None);
+    scheduler.wake(blocked.into_wake_key()).unwrap();
+    scheduler
+        .commit(scheduler.reserve(replacement).unwrap())
+        .unwrap();
+    let before_cpu0 = scheduler.counters_on(cpu(0));
+    let before_cpu1 = scheduler.counters_on(cpu(1));
+    let suspended_claim = scheduler.suspended_claim_on(cpu(1)).unwrap();
+    {
+        let mut state = scheduler.state.lock();
+        state.next_execution_generation = u64::MAX;
+    }
+
+    assert_eq!(
+        scheduler.retire_on(cpu(1), suspended),
+        Err(SchedulerError::TokenExhausted)
+    );
+    assert_eq!(
+        scheduler.state(suspended),
+        Some(SchedulerThreadState::Runnable)
+    );
+    assert_eq!(
+        scheduler.state(replacement),
+        Some(SchedulerThreadState::Runnable)
+    );
+    assert_eq!(scheduler.suspended_claim_on(cpu(1)), Some(suspended_claim));
+    assert_eq!(scheduler.current_on(cpu(1)), None);
+    assert_eq!(scheduler.counters_on(cpu(0)), before_cpu0);
+    assert_eq!(scheduler.counters_on(cpu(1)), before_cpu1);
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+
+    {
+        let mut state = scheduler.state.lock();
+        state.next_execution_generation = 100;
+    }
+    assert_eq!(
+        scheduler.retire_on(cpu(1), suspended).unwrap().current,
+        Some(replacement)
+    );
+    assert_eq!(scheduler.state(suspended), None);
+    assert_eq!(scheduler.current_on(cpu(1)), Some(replacement));
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn remote_and_suspended_stop_accounting_preserves_exact_ownership() {
+    let mut registry = ObjectRegistry::<16>::new();
+
+    let running_scheduler = CooperativeScheduler::<1>::new();
+    let running = thread_key(&mut registry);
+    running_scheduler
+        .commit(running_scheduler.reserve(running).unwrap())
+        .unwrap();
+    running_scheduler.schedule_next_on(cpu(1)).unwrap();
+    let running_claim = running_scheduler.running_claim_on(cpu(1)).unwrap();
+    running_scheduler
+        .stop_running_claim_on(running_claim)
+        .unwrap();
+    assert_eq!(running_scheduler.current_on(cpu(1)), None);
+    assert_eq!(running_scheduler.counters_on(cpu(1)).context_switches, 2);
+    assert_eq!(running_scheduler.check_invariants(), Ok(()));
+
+    let suspended_scheduler = CooperativeScheduler::<1>::new();
+    let suspended = thread_key(&mut registry);
+    suspended_scheduler
+        .commit(suspended_scheduler.reserve(suspended).unwrap())
+        .unwrap();
+    suspended_scheduler.schedule_next_on(cpu(1)).unwrap();
+    let (blocked, _) = suspended_scheduler
+        .block_current_on(cpu(1), suspended)
+        .unwrap();
+    let suspended_claim = suspended_scheduler.suspended_claim_on(cpu(1)).unwrap();
+    suspended_scheduler.wake(blocked.into_wake_key()).unwrap();
+    suspended_scheduler
+        .stop_suspended_claim_on(suspended_claim)
+        .unwrap();
+    assert_eq!(suspended_scheduler.state(suspended), None);
+    let counters = suspended_scheduler.counters_on(cpu(1));
+    assert_eq!(counters.current_runnable, 0);
+    assert_eq!(counters.context_switches, 2);
+    assert_eq!(suspended_scheduler.check_invariants(), Ok(()));
 }
 
 #[test]

@@ -621,6 +621,22 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         self.scheduler.schedule_next_on(cpu)
     }
 
+    pub(crate) fn publish_idle_on(
+        &self,
+        cpu: SchedulerCpuId,
+        started_at_ns: u64,
+    ) -> Result<super::SchedulerIdleAccountingToken, SchedulerError> {
+        self.scheduler.publish_idle_on(cpu, started_at_ns)
+    }
+
+    pub(crate) fn finish_idle_on(
+        &self,
+        token: super::SchedulerIdleAccountingToken,
+        finished_at_ns: u64,
+    ) -> Result<(), SchedulerError> {
+        self.scheduler.finish_idle_on(token, finished_at_ns)
+    }
+
     pub(crate) fn yield_current(
         &self,
         thread: ThreadKey,

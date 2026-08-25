@@ -783,6 +783,25 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
         panic!("native runtime does not admit idle-CPU scheduler entry")
     }
 
+    /// Begins accounting only after the architecture has successfully
+    /// published this CPU's exact HALTED generation.
+    fn publish_scheduler_idle(
+        &mut self,
+        _started_at_ns: u64,
+    ) -> Result<crate::task::SchedulerIdleAccountingToken, crate::task::SchedulerError> {
+        panic!("native runtime does not admit scheduler idle accounting")
+    }
+
+    /// Closes the matching scheduler idle interval after the architecture has
+    /// completed the exact HALTED generation that returned from `hlt`.
+    fn finish_scheduler_idle(
+        &mut self,
+        _token: crate::task::SchedulerIdleAccountingToken,
+        _finished_at_ns: u64,
+    ) -> Result<(), crate::task::SchedulerError> {
+        panic!("native runtime does not admit scheduler idle accounting")
+    }
+
     /// Completes an initiator-side remote-stop wait after the raw trampoline
     /// has closed its usercopy window. Implementations must not retain a
     /// shared runtime guard while publishing, waiting for, or consuming the

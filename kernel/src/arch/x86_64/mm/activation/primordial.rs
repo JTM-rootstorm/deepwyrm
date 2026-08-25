@@ -2937,6 +2937,23 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         unsafe { crate::arch::x86_64::syscall::enter_bound_validated_user(&state, stack) }
     }
 
+    fn publish_scheduler_idle(
+        &mut self,
+        started_at_ns: u64,
+    ) -> Result<crate::task::SchedulerIdleAccountingToken, crate::task::SchedulerError> {
+        self.shared
+            .execution
+            .publish_idle_on(self.cpu, started_at_ns)
+    }
+
+    fn finish_scheduler_idle(
+        &mut self,
+        token: crate::task::SchedulerIdleAccountingToken,
+        finished_at_ns: u64,
+    ) -> Result<(), crate::task::SchedulerError> {
+        self.shared.execution.finish_idle_on(token, finished_at_ns)
+    }
+
     unsafe fn prepare_suspend<'owner>(
         &'owner mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
@@ -3265,6 +3282,29 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         unsafe { crate::arch::x86_64::syscall::enter_bound_validated_user(&state, stack) }
     }
 
+    fn publish_scheduler_idle(
+        &mut self,
+        started_at_ns: u64,
+    ) -> Result<crate::task::SchedulerIdleAccountingToken, crate::task::SchedulerError> {
+        let runtime = self.runtime.lock();
+        runtime
+            .shared
+            .execution
+            .publish_idle_on(self.cpu, started_at_ns)
+    }
+
+    fn finish_scheduler_idle(
+        &mut self,
+        token: crate::task::SchedulerIdleAccountingToken,
+        finished_at_ns: u64,
+    ) -> Result<(), crate::task::SchedulerError> {
+        let runtime = self.runtime.lock();
+        runtime
+            .shared
+            .execution
+            .finish_idle_on(token, finished_at_ns)
+    }
+
     fn enter_idle_scheduler(&mut self) -> ! {
         loop {
             enum Entry {
@@ -3334,12 +3374,29 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                         .unwrap_or_else(|error| panic!("AP idle publication failed: {error:?}"));
                     let notification = match crate::arch::x86_64::idle::commit_current_idle(idle) {
                         Ok(halt) => {
+                            let started_at_ns =
+                                crate::time::monotonic_now().unwrap_or_else(|error| {
+                                    panic!("AP idle start sample failed: {error:?}")
+                                });
+                            let idle_accounting = self
+                                .publish_scheduler_idle(started_at_ns)
+                                .unwrap_or_else(|error| {
+                                    panic!("AP idle accounting publication failed: {error:?}")
+                                });
                             unsafe {
                                 core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
                             }
                             crate::arch::x86_64::idle::finish_current_idle(halt).unwrap_or_else(
                                 |error| panic!("AP idle completion failed: {error:?}"),
                             );
+                            let finished_at_ns =
+                                crate::time::monotonic_now().unwrap_or_else(|error| {
+                                    panic!("AP idle finish sample failed: {error:?}")
+                                });
+                            self.finish_scheduler_idle(idle_accounting, finished_at_ns)
+                                .unwrap_or_else(|error| {
+                                    panic!("AP idle accounting completion failed: {error:?}")
+                                });
                             crate::time::service_current_rendezvous_latch().unwrap_or_else(
                                 |error| panic!("AP idle rendezvous service failed: {error:?}"),
                             )
