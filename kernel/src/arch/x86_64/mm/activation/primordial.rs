@@ -51,10 +51,15 @@ use deepwyrm_abi::{
 };
 
 const MAX_BOOTFS_BYTES: usize = 32 * 1024 * 1024;
-#[cfg(not(deepwyrm_i2_stress))]
+#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
 const REGISTRY_OBJECTS: usize = 32;
-#[cfg(deepwyrm_i2_stress)]
+#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const REGISTRY_OBJECTS: usize = 64;
+// Selector 24 adds one bounded child-loader object set plus the controller's
+// MemoryObject, Channel, Event, and Timer probes without taking I2's larger
+// multi-process stress budget.
+#[cfg(deepwyrm_wrcap_relay)]
+const REGISTRY_OBJECTS: usize = 48;
 #[cfg(not(deepwyrm_i2_stress))]
 const MEMORY_OBJECTS: usize = 10;
 #[cfg(deepwyrm_i2_stress)]
