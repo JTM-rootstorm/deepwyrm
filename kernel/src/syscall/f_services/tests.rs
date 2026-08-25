@@ -1115,6 +1115,62 @@ fn process_create_dispatch_publishes_created_root_and_child_bootstrap() {
         Err(HandleTableError::InvalidHandle)
     );
 
+    let payload = b"ordinary-init0-channel-contract-datagram";
+    assert_eq!(payload.len(), 40);
+    let input = FakeUserMemory::offset(BASE + 0xa00, payload.len());
+    fixture.user.bytes[input..input + payload.len()].copy_from_slice(payload);
+    let mut cleanup = CleanupQueue::<OBJECTS>::new();
+    assert_eq!(
+        super::super::adapters::channel_send(
+            &mut fixture.user,
+            &mut fixture.staging,
+            &mut fixture.registry,
+            &fixture.channels,
+            &fixture.waits,
+            &mut fixture.tasks,
+            &fixture.execution,
+            fixture.process,
+            peer,
+            DwUserAddress(BASE + 0xa00),
+            u32::try_from(payload.len()).unwrap(),
+            DwUserAddress(0),
+            0,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert_empty_cleanup(cleanup);
+
+    let mut cleanup = CleanupQueue::<OBJECTS>::new();
+    assert_eq!(
+        super::super::adapters::channel_receive(
+            &mut fixture.user,
+            &mut fixture.staging,
+            &mut fixture.registry,
+            &fixture.channels,
+            &fixture.waits,
+            &mut fixture.tasks,
+            &fixture.execution,
+            child,
+            child_bootstrap,
+            DwUserAddress(BASE + 0xa80),
+            u32::try_from(payload.len()).unwrap(),
+            DwUserAddress(0),
+            0,
+            DwUserAddress(BASE + 0xb00),
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert_empty_cleanup(cleanup);
+    let output = FakeUserMemory::offset(BASE + 0xa80, payload.len());
+    assert_eq!(&fixture.user.bytes[output..output + payload.len()], payload);
+    assert_eq!(u32_at(&fixture.user, BASE + 0xb00 + 8), 40);
+    assert_eq!(u32_at(&fixture.user, BASE + 0xb00 + 12), 0);
+    assert_eq!(u32_at(&fixture.user, BASE + 0xb00 + 16), 40);
+    assert_eq!(u32_at(&fixture.user, BASE + 0xb00 + 20), 0);
+
     retire_created_process(
         &mut fixture,
         child,

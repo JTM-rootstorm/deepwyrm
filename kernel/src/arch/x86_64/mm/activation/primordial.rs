@@ -150,10 +150,10 @@ const TIMERS: usize = 2;
 // bootfs needs a bounded 32-page window. The selector-24 WRCAP bootfs contains
 // the controller plus its deterministic config and asset and is exactly 39
 // pages after init0 termination-race reconciliation. The ordinary Wave 4
-// bootfs is exactly 18 pages after the same shared init0 remediation.
+// bootfs is exactly 17 pages with its selector-specific init0 artifact.
 const PRIMORDIAL_TABLE_CANDIDATES: usize = 6;
 #[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
-const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 18;
+const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 17;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 32;
 #[cfg(deepwyrm_wrcap_relay)]

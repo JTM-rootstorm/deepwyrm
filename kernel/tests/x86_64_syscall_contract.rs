@@ -639,7 +639,7 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
     ));
     assert!(runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst REGISTRY_OBJECTS: usize = 48;"));
     assert!(runtime.contains(
-        "#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 18;"
+        "#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 17;"
     ));
     assert!(
         runtime.contains(
