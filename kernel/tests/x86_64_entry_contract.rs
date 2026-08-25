@@ -456,11 +456,16 @@ fn g3_primordial_mapping_failures_remain_recoverable_and_rollback_owned_candidat
     assert!(primordial.contains("cancel_zeroed(failure.into_grant())"));
     assert!(user_access.contains("cancel_zeroed(failure.into_grant())"));
     assert!(primordial.contains(
-        "#[cfg(not(deepwyrm_i2_stress))]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = (STACK_BYTES / PAGE_SIZE) as usize;"
+        "#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = (STACK_BYTES / PAGE_SIZE) as usize;"
     ));
     assert!(
         primordial.contains(
-            "#[cfg(deepwyrm_i2_stress)]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 32;"
+            "#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 32;"
+        )
+    );
+    assert!(
+        primordial.contains(
+            "#[cfg(deepwyrm_wrcap_relay)]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 34;"
         )
     );
     assert!(primordial.contains("PRIMORDIAL_MAX_MAPPING_PAGES + PRIMORDIAL_TABLE_CANDIDATES"));

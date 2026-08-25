@@ -12,7 +12,7 @@ use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-#[cfg(not(deepwyrm_i2_stress))]
+#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
 use crate::boot::primordial::construction::STACK_BYTES;
 use crate::boot::primordial::construction::authority::{
     AuthorityPrimordialBackend, AuthorityPrimordialMonitor, PrimordialPlatform,
@@ -119,13 +119,17 @@ const TIMERS: usize = 2;
 // A bounded mapping can cross one boundary at each non-root level. Keep two
 // candidates for PDPT, PD, and PT creation so the live publisher can construct
 // both paths without depending on where the requested range lands. The I2
-// bootfs carries the selector-specific controller and therefore needs a
-// bounded 32-page window; ordinary images retain the original 16-page limit.
+// bootfs needs a bounded 32-page window. The selector-24 WRCAP bootfs contains
+// the controller plus its deterministic config and asset and is exactly 34
+// pages in the first live candidate. Ordinary images retain the original
+// 16-page limit.
 const PRIMORDIAL_TABLE_CANDIDATES: usize = 6;
-#[cfg(not(deepwyrm_i2_stress))]
+#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
 const PRIMORDIAL_MAX_MAPPING_PAGES: usize = (STACK_BYTES / PAGE_SIZE) as usize;
-#[cfg(deepwyrm_i2_stress)]
+#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 32;
+#[cfg(deepwyrm_wrcap_relay)]
+const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 34;
 const PRIMORDIAL_JOURNAL_ENTRIES: usize =
     PRIMORDIAL_MAX_MAPPING_PAGES + PRIMORDIAL_TABLE_CANDIDATES;
 const PRIMORDIAL_INVALIDATIONS: usize = PRIMORDIAL_MAX_MAPPING_PAGES;
