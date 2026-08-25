@@ -269,7 +269,7 @@ fn production_and_six_memory_selector_artifacts_are_separated() {
         validate_selector_stack_margin(
             selector,
             &stack_sizes(&llvm_readelf, &stack_artifact),
-            &stack_disassembly,
+            &resolved_read_only_indirect_disassembly(&llvm_objdump, &llvm_nm, &stack_artifact),
         );
     }
     let build_input_after = build_input_manifest_sha256(&workspace);
@@ -495,7 +495,10 @@ fn e7_task_smoke_artifact_is_freestanding_and_separated() {
         text_disassembly(&smoke_disassembly),
         "E7 stack-size carrier changed task-syscall-smoke machine code"
     );
-    validate_e7_stack_margin(&stack_sizes(&llvm_readelf, &smoke_stack));
+    validate_e7_stack_margin(
+        &stack_sizes(&llvm_readelf, &smoke_stack),
+        &resolved_read_only_indirect_disassembly(&llvm_objdump, &llvm_nm, &smoke_stack),
+    );
 
     let build_input_after = build_input_manifest_sha256(&workspace);
     assert_eq!(

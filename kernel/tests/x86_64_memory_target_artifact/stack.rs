@@ -650,6 +650,14 @@ fn normalized_callees(
 }
 
 fn terminal_graph_cut(symbol: &str, disassembly: &str) -> Option<DirectCallStackBound> {
+    if symbol == "dw_x86_64_iret_to_user" {
+        validate_iret_to_user_handoff(disassembly);
+        return Some(DirectCallStackBound {
+            bytes: 0,
+            call_count: 0,
+            terminal: "audited Thread-stack IRET pivot".to_owned(),
+        });
+    }
     if symbol == "dw_x86_64_terminal_reaper_handoff" {
         validate_terminal_reaper_handoff(disassembly);
         return Some(DirectCallStackBound {
@@ -677,6 +685,45 @@ fn terminal_graph_cut(symbol: &str, disassembly: &str) -> Option<DirectCallStack
         });
     }
     None
+}
+
+fn validate_iret_to_user_handoff(disassembly: &str) {
+    let body = function_body(disassembly, "dw_x86_64_iret_to_user");
+    let required = [
+        "\tmov\tr12, rdi",
+        "\tmov\trsp, qword ptr gs:[0x8]",
+        "\ttest\trsp, rsp",
+        "\tpush\t0x2b",
+        "\tpush\tqword ptr [r12 + 0x88]",
+        "\tpush\tqword ptr [r12 + 0x80]",
+        "\tpush\t0x33",
+        "\tpush\tqword ptr [r12 + 0x78]",
+        "\tswapgs",
+        "\tiretq",
+    ];
+    let mut offset = 0;
+    for needle in required {
+        let next = body[offset..]
+            .find(needle)
+            .unwrap_or_else(|| panic!("IRET handoff omitted `{needle}`"));
+        offset += next + needle.len();
+    }
+    let stack_switch = body
+        .find("\tmov\trsp, qword ptr gs:[0x8]")
+        .expect("IRET handoff installs its Thread stack");
+    let first_push = body
+        .find("\tpush\t")
+        .expect("IRET handoff constructs its return frame");
+    assert!(
+        stack_switch < first_push,
+        "IRET handoff wrote a return frame before installing the Thread stack"
+    );
+    assert!(
+        !body
+            .lines()
+            .any(|line| line.contains("\tcall\t") || line.contains("\tret")),
+        "IRET handoff must not call or return on the retired boot stack"
+    );
 }
 
 fn validate_terminal_reaper_handoff(disassembly: &str) {
@@ -862,6 +909,25 @@ fn terminal_reaper_handoff_ends_the_retired_stack_graph() {
             bytes: 16,
             call_count: 1,
             terminal: "audited terminal-reaper stack pivot".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn iret_handoff_ends_the_boot_stack_graph() {
+    let sizes = [StackSize {
+        bytes: 16,
+        symbol: "root".to_owned(),
+    }];
+    let disassembly = "Disassembly of section .text:\n\n0000 <root>:\n  0:\tcall\t0x10 <dw_x86_64_iret_to_user>\n\n0010 <dw_x86_64_iret_to_user>:\n 10:\tmov\tr12, rdi\n 13:\tmov\trsp, qword ptr gs:[0x8]\n 1c:\ttest\trsp, rsp\n 1f:\tje\t0x30 <halt>\n 21:\tpush\t0x2b\n 23:\tpush\tqword ptr [r12 + 0x88]\n 2b:\tpush\tqword ptr [r12 + 0x80]\n 33:\tpush\t0x33\n 35:\tpush\tqword ptr [r12 + 0x78]\n 3d:\tswapgs\n 40:\tiretq\n";
+    assert_eq!(
+        direct_call_stack_bound(sizes.as_slice(), disassembly, "IRET pivot", |symbol| {
+            symbol == "root"
+        }),
+        DirectCallStackBound {
+            bytes: 16,
+            call_count: 1,
+            terminal: "audited Thread-stack IRET pivot".to_owned(),
         }
     );
 }

@@ -160,7 +160,30 @@ fn preserves_rax_slot_through_argument_setup(line: &str) -> bool {
     let destination = destination.trim();
     matches!(
         destination,
-        "rdi" | "edi" | "rsi" | "esi" | "rdx" | "edx" | "rcx" | "ecx" | "r8" | "r8d" | "r9" | "r9d"
+        "rdi"
+            | "edi"
+            | "di"
+            | "dil"
+            | "rsi"
+            | "esi"
+            | "si"
+            | "sil"
+            | "rdx"
+            | "edx"
+            | "dx"
+            | "dl"
+            | "rcx"
+            | "ecx"
+            | "cx"
+            | "cl"
+            | "r8"
+            | "r8d"
+            | "r8w"
+            | "r8b"
+            | "r9"
+            | "r9d"
+            | "r9w"
+            | "r9b"
     ) || destination.ends_with(" ptr [rsp]")
         || destination.contains(" ptr [rsp + ")
 }
@@ -275,7 +298,7 @@ fn immutable_indirect_resolution_allows_only_rax_preserving_argument_setup() {
 
 #[test]
 fn immutable_indirect_resolution_tracks_exact_caller_local_spills() {
-    let accepted = "Disassembly of section .text:\n\n0000 <root>:\n  0:\tmov\trax, qword ptr [rip + 0x10] # 0x1000\n  7:\tmov\tqword ptr [rsp + 0x28], rax\n  c:\tcall\trax\n  e:\tmov\trdi, qword ptr [rsp + 0x40]\n 13:\tmov\trax, qword ptr [rsp + 0x28]\n 18:\tcall\trax\n";
+    let accepted = "Disassembly of section .text:\n\n0000 <root>:\n  0:\tmov\trax, qword ptr [rip + 0x10] # 0x1000\n  7:\tmov\tqword ptr [rsp + 0x28], rax\n  c:\tcall\trax\n  e:\tmov\trdi, qword ptr [rsp + 0x40]\n 13:\tmov\trax, qword ptr [rsp + 0x28]\n 18:\tmov\tcl, byte ptr [rsp + 0x48]\n 1c:\tmov\tbyte ptr [rsp + 0x49], cl\n 20:\tcall\trax\n";
     let resolved = resolve_read_only_indirect_disassembly(accepted, |slot| {
         assert_eq!(slot, 0x1000);
         (0x2000, "memcpy".to_owned())
