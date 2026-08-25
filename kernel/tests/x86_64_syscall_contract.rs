@@ -230,6 +230,31 @@ fn i1_native_adapter_phases_revalidate_exact_identity_after_guard_free_work() {
 }
 
 #[test]
+fn address_region_adapter_source_contract_tracks_the_private_module() {
+    let facade = source("src/syscall/adapters.rs");
+    let address_region = source("src/syscall/adapters/address_region.rs");
+
+    assert!(facade.contains("mod address_region;"));
+    assert!(facade.contains("pub(crate) use address_region::{"));
+    for marker in [
+        "fn queue_mapping_releases",
+        "pub(crate) fn decode_map_args",
+        "pub(crate) fn address_region_map_prepared_model",
+        "pub(crate) fn address_region_unmap_prepared",
+        "pub(crate) fn address_region_protect_prepared",
+    ] {
+        assert!(
+            address_region.contains(marker),
+            "private address-region adapter module is missing {marker}"
+        );
+        assert!(
+            !facade.contains(marker),
+            "address-region implementation marker remains duplicated in the facade: {marker}"
+        );
+    }
+}
+
+#[test]
 fn i1_post_ack_carrier_never_reuses_a_retired_frame_for_late_holdsafe() {
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
     let continuation = primordial
@@ -693,11 +718,12 @@ fn live_timer_expiry_is_bound_and_serviced_only_from_carrier_safe_points() {
 fn i2_live_dispatch_covers_every_stress_payload_syscall_family() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
     let adapters = source("src/syscall/adapters.rs");
+    let address_region = source("src/syscall/adapters/address_region.rs");
 
     assert!(runtime.contains("NativeSyscallRequest::AddressRegionProtect"));
     assert!(runtime.contains("fn protect_memory("));
     assert!(runtime.contains("crate::syscall::address_region_protect_prepared("));
-    assert!(adapters.contains("pub(crate) fn address_region_protect_prepared<"));
+    assert!(address_region.contains("pub(crate) fn address_region_protect_prepared<"));
     for family in [
         "NativeSyscallRequest::HandleClose",
         "NativeSyscallRequest::HandleDuplicate",
