@@ -122,23 +122,23 @@ pub(crate) fn validate_e7_stack_margin(sizes: &[StackSize], disassembly: &str) {
     );
     let probe_prefix = plain(
         "F3 target deadline probe",
-        "time::live::run_target_deadline_probe",
+        "time::live::probes::run_target_deadline_probe",
     )
     .max(plain(
         "F8 target Timer probe",
-        "time::live::run_target_timer_probe",
+        "time::live::probes::run_target_timer_probe",
     ));
     let timer_dispatch = one_stack_symbol(sizes, "x86 timer dispatcher", |symbol| {
         symbol == "dw_x86_64_timer_interrupt_dispatch"
     });
     let deadline_wake = one_stack_symbol(sizes, "F3 deadline wake trampoline", |symbol| {
         symbol.contains("time::live::wake_trampoline::<")
-            && symbol.contains("time::live::ProbeWakeTarget")
+            && symbol.contains("time::live::probes::ProbeWakeTarget")
             && !symbol.contains("::{closure")
     });
     let timer_expiry = one_stack_symbol(sizes, "F8 Timer expiry trampoline", |symbol| {
         symbol.contains("time::live::timer_expiry_trampoline::<")
-            && symbol.contains("time::live::TimerProbeTarget")
+            && symbol.contains("time::live::probes::TimerProbeTarget")
             && !symbol.contains("::{closure")
     });
     let mut timer_resolutions = resolutions.clone();
