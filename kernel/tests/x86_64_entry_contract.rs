@@ -308,7 +308,9 @@ fn wrcap_relay_is_selector_only_bounded_and_precedes_terminal_completion() {
     assert!(build.contains("selector == \"native-userspace-capability\""));
     assert!(support.contains("DWEVID1 and WRCAP1 terminal reporters are selector-exclusive"));
     assert!(support.contains("#[cfg(any(test, deepwyrm_wrcap_relay))]\nmod wrcap;"));
-    assert!(relay.contains("const WRCAP_RECORD_COUNT: usize = 10;"));
+    assert!(relay.contains("const WRCAP_RECORD_COUNT: usize = 15;"));
+    assert!(relay.contains("const WRCAP_RECORD_KINDS: [u8; WRCAP_RECORD_COUNT]"));
+    assert!(relay.contains("let expected_kind = WRCAP_RECORD_KINDS[transcript.seen];"));
     assert!(relay.contains("pub(crate) const WRCAP_RECORD_LEN: usize = 117;"));
     assert!(relay.contains("transcript.records[index].copy_from_slice(record)"));
     assert!(primordial.contains(
@@ -317,7 +319,7 @@ fn wrcap_relay_is_selector_only_bounded_and_precedes_terminal_completion() {
     assert_eq!(primordial.matches("self.drain_wrcap_record();").count(), 1);
     assert!(terminal.contains("WRCAP_RELAY.claim_reporter()"));
     assert!(terminal.contains("WRCAP1 reporter owns its serial transaction"));
-    assert!(debug.contains("one_com1_transaction_orders_ten_wrcap_records_before_dwtest1"));
+    assert!(debug.contains("one_com1_transaction_orders_fifteen_wrcap_records_before_dwtest1"));
 }
 
 #[test]

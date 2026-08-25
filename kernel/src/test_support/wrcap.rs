@@ -1,7 +1,7 @@
 //! Test-only bounded relay for Wyrmroot-owned WRCAP1 evidence.
 //!
 //! The kernel does not originate or reinterpret capability facts. It accepts
-//! the ten canonical, handle-free records in exact order, preserves their raw
+//! the fifteen canonical, handle-free records in exact order, preserves their raw
 //! bytes, and authorizes one terminal reporter to relay them over COM1.
 
 #![cfg_attr(
@@ -17,7 +17,10 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use crate::sync::SpinMutex;
 
 pub(crate) const WRCAP_RECORD_LEN: usize = 117;
-const WRCAP_RECORD_COUNT: usize = 10;
+const WRCAP_RECORD_COUNT: usize = 15;
+const WRCAP_RECORD_KINDS: [u8; WRCAP_RECORD_COUNT] = [
+    0x01, 0x02, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x07, 0x08, 0x08, 0x08, 0x08, 0x09, 0x0a,
+];
 const CHECKSUM_OFFSET: usize = 108;
 
 const EMPTY_RECORD: [u8; WRCAP_RECORD_LEN] = [0; WRCAP_RECORD_LEN];
@@ -95,8 +98,8 @@ impl WrcapRelay {
     }
 
     /// Decide whether the selector-only primordial join consumes the head
-    /// datagram. After ten records, every head is left to ordinary READY
-    /// handling so an eleventh WRCAP1 record fails there as oversized input.
+    /// datagram. After fifteen records, every head is left to ordinary READY
+    /// handling so a sixteenth WRCAP1 record fails there as oversized input.
     pub(crate) fn drain_action(
         &self,
         required_bytes: u32,
@@ -123,8 +126,7 @@ impl WrcapRelay {
             return Err(transcript.latch(WrcapRelayError::Extra));
         }
         let expected_sequence = transcript.seen as u32;
-        let expected_kind =
-            u8::try_from(transcript.seen + 1).expect("the ten canonical WRCAP1 kinds fit u8");
+        let expected_kind = WRCAP_RECORD_KINDS[transcript.seen];
         transcript.seen += 1;
         if let Some(error) = transcript.failure {
             return Err(error);
@@ -319,11 +321,14 @@ mod tests {
     }
 
     #[test]
-    fn relay_preserves_ten_valid_records_byte_exactly() {
+    fn relay_preserves_fifteen_valid_records_byte_exactly() {
         let relay = WrcapRelay::new();
-        let expected = core::array::from_fn(|sequence| {
-            record(sequence as u32, u8::try_from(sequence + 1).unwrap())
-        });
+        assert_eq!(
+            WRCAP_RECORD_KINDS,
+            [1, 2, 2, 3, 4, 5, 6, 7, 7, 8, 8, 8, 8, 9, 10]
+        );
+        let expected =
+            core::array::from_fn(|sequence| record(sequence as u32, WRCAP_RECORD_KINDS[sequence]));
         for record in &expected {
             relay.record(record).unwrap();
         }
@@ -371,12 +376,10 @@ mod tests {
         );
 
         let extra = WrcapRelay::new();
-        for sequence in 0..WRCAP_RECORD_COUNT {
-            extra
-                .record(&record(sequence as u32, (sequence + 1) as u8))
-                .unwrap();
+        for (sequence, kind) in WRCAP_RECORD_KINDS.iter().copied().enumerate() {
+            extra.record(&record(sequence as u32, kind)).unwrap();
         }
-        assert_eq!(extra.record(&record(10, 11)), Err(WrcapRelayError::Extra));
+        assert_eq!(extra.record(&record(15, 11)), Err(WrcapRelayError::Extra));
         assert_eq!(
             extra.claim_reporter().unwrap().flush(|_| Ok(())),
             Err(WrcapFlushError::Extra)
@@ -384,16 +387,14 @@ mod tests {
     }
 
     #[test]
-    fn ten_records_leave_ready_and_an_eleventh_record_for_ordinary_fail_closed_receive() {
+    fn fifteen_records_leave_ready_and_a_sixteenth_record_for_ordinary_fail_closed_receive() {
         let relay = WrcapRelay::new();
-        for sequence in 0..WRCAP_RECORD_COUNT {
+        for (sequence, kind) in WRCAP_RECORD_KINDS.iter().copied().enumerate() {
             assert_eq!(
                 relay.drain_action(WRCAP_RECORD_LEN as u32, 0),
                 WrcapDrainAction::Drain
             );
-            relay
-                .record(&record(sequence as u32, (sequence + 1) as u8))
-                .unwrap();
+            relay.record(&record(sequence as u32, kind)).unwrap();
         }
         assert_eq!(relay.drain_action(40, 0), WrcapDrainAction::LeaveForReady);
         assert_eq!(
@@ -406,7 +407,7 @@ mod tests {
             Ok(output)
         }
         assert!(ordinary_ready_receive(&[b'R'; 40]).is_ok());
-        assert!(ordinary_ready_receive(&record(10, 11)).is_err());
+        assert!(ordinary_ready_receive(&record(15, 11)).is_err());
     }
 
     #[test]
@@ -425,10 +426,8 @@ mod tests {
         drop(guard);
 
         let transport = WrcapRelay::new();
-        for sequence in 0..WRCAP_RECORD_COUNT {
-            transport
-                .record(&record(sequence as u32, (sequence + 1) as u8))
-                .unwrap();
+        for (sequence, kind) in WRCAP_RECORD_KINDS.iter().copied().enumerate() {
+            transport.record(&record(sequence as u32, kind)).unwrap();
         }
         let mut emitted = 0;
         assert_eq!(

@@ -164,9 +164,9 @@ fn test_evidence_writer_transmits_the_exact_85_byte_record() {
 }
 
 #[test]
-fn one_com1_transaction_orders_ten_wrcap_records_before_dwtest1() {
+fn one_com1_transaction_orders_fifteen_wrcap_records_before_dwtest1() {
     const WRCAP_BYTES: usize = 117;
-    const WRCAP_COUNT: usize = 10;
+    const WRCAP_COUNT: usize = 15;
     const TERMINAL: &[u8] = b"DWTEST1|01|00000018|00000000|00000000\n";
     let mut record = [b'0'; WRCAP_BYTES];
     record[..6].copy_from_slice(b"WRCAP1");
