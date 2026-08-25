@@ -60,14 +60,23 @@ const REGISTRY_OBJECTS: usize = 64;
 // multi-process stress budget.
 #[cfg(deepwyrm_wrcap_relay)]
 const REGISTRY_OBJECTS: usize = 48;
-#[cfg(not(deepwyrm_i2_stress))]
+#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
 const MEMORY_OBJECTS: usize = 10;
-#[cfg(deepwyrm_i2_stress)]
+#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const MEMORY_OBJECTS: usize = 24;
-#[cfg(not(deepwyrm_i2_stress))]
+// The selector-24 baseline owns eight bootfs/bootstrap/init0/controller
+// objects. A worker adds two ELF segments plus its stack; the shared-memory
+// case keeps one controller-owned probe object live at the same time.
+#[cfg(deepwyrm_wrcap_relay)]
+const MEMORY_OBJECTS: usize = 12;
+#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
 const MEMORY_LEASES: usize = 10;
-#[cfg(deepwyrm_i2_stress)]
+#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const MEMORY_LEASES: usize = 24;
+// The shared-memory peak maps all twelve live objects and maps the probe once
+// more into the worker, so it needs one additional mapping lease.
+#[cfg(deepwyrm_wrcap_relay)]
+const MEMORY_LEASES: usize = 13;
 // I0 keeps the complete bootstrap -> init0 -> hello chain live while each
 // parent performs bounded READY/exit supervision of its direct child. The
 // selector-24 controller adds exactly one temporary supervised child.
