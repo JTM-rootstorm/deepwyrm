@@ -609,13 +609,23 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
             .contains("#[cfg(deepwyrm_i2_stress)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 6;")
     );
     assert!(
-        runtime.contains("#[cfg(deepwyrm_i2_stress)]\nconst USERSPACE_CHAIN_PROCESSES: usize = 6;")
+        runtime.contains(
+            "#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]\nconst USERSPACE_CHAIN_PROCESSES: usize = 6;"
+        )
     );
     assert!(
         runtime.contains(
-            "#[cfg(not(deepwyrm_i2_stress))]\nconst USERSPACE_CHAIN_PROCESSES: usize = 3;"
+            "#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]\nconst USERSPACE_CHAIN_PROCESSES: usize = 3;"
         )
     );
+    assert!(
+        runtime
+            .contains("#[cfg(deepwyrm_wrcap_relay)]\nconst USERSPACE_CHAIN_PROCESSES: usize = 4;")
+    );
+    assert!(runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst TASK_GROUPS: usize = 2;"));
+    assert!(runtime.contains(
+        "#[cfg(deepwyrm_wrcap_relay)]\nconst CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;"
+    ));
     assert!(
         runtime.contains(
             "#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 32;"

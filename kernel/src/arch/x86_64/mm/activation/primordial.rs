@@ -64,24 +64,31 @@ const MEMORY_LEASES: usize = 10;
 #[cfg(deepwyrm_i2_stress)]
 const MEMORY_LEASES: usize = 24;
 // I0 keeps the complete bootstrap -> init0 -> hello chain live while each
-// parent performs bounded READY/exit supervision of its direct child.
-#[cfg(not(deepwyrm_i2_stress))]
+// parent performs bounded READY/exit supervision of its direct child. The
+// selector-24 controller adds exactly one temporary supervised child.
+#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
 const USERSPACE_CHAIN_PROCESSES: usize = 3;
-#[cfg(deepwyrm_i2_stress)]
+#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const USERSPACE_CHAIN_PROCESSES: usize = 6;
-#[cfg(not(deepwyrm_i2_stress))]
+#[cfg(deepwyrm_wrcap_relay)]
+const USERSPACE_CHAIN_PROCESSES: usize = 4;
+#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
 const CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;
-#[cfg(deepwyrm_i2_stress)]
+#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const CHANNEL_PAIRS: usize = 8;
+#[cfg(deepwyrm_wrcap_relay)]
+const CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;
 const CHANNEL_DEPTH: usize = 2;
 #[cfg(not(deepwyrm_i2_stress))]
 const WAITERS: usize = 4;
 #[cfg(deepwyrm_i2_stress)]
 const WAITERS: usize = 12;
-#[cfg(not(deepwyrm_i2_stress))]
+#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
 const TASK_GROUPS: usize = 1;
-#[cfg(deepwyrm_i2_stress)]
+#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const TASK_GROUPS: usize = 4;
+#[cfg(deepwyrm_wrcap_relay)]
+const TASK_GROUPS: usize = 2;
 const PROCESSES: usize = USERSPACE_CHAIN_PROCESSES;
 const THREADS: usize = USERSPACE_CHAIN_PROCESSES;
 // Exact live bootstrap peak per Process: four inherited handles, one net
