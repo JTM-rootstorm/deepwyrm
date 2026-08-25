@@ -758,6 +758,38 @@ fn i1_terminal_child_without_local_work_rejoins_the_idle_scheduler() {
 }
 
 #[test]
+fn final_external_thread_completion_retires_pins_before_process_root_teardown() {
+    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let completion = runtime
+        .split_once("fn complete_thread_termination(")
+        .expect("Thread termination completion")
+        .1
+        .split_once("fn finish_terminal_adapter_resources")
+        .expect("Thread completion boundary")
+        .0;
+
+    let preserve = completion
+        .find("let exited_process = prepared.exited_process();")
+        .expect("prepared final-Process identity");
+    let retire = completion
+        .find("complete_prepared_thread_termination_after_remote_stops_on(")
+        .expect("remote-stop pin retirement");
+    let resources = completion
+        .find("self.finish_terminal_adapter_resources(")
+        .expect("terminal resource completion");
+    let external_guard = completion
+        .find("exited_process.filter(|target| *target != self.process)")
+        .expect("external final-Process guard");
+    let teardown = completion
+        .find("self.finish_inactive_process_teardown(")
+        .expect("inactive final-Process teardown");
+
+    assert!(preserve < retire && retire < resources);
+    assert!(resources < external_guard && external_guard < teardown);
+    assert!(completion.contains("control == SyscallControl::ReturnToCaller"));
+}
+
+#[test]
 fn i1_live_wait_suspension_uses_the_physical_current_cpu() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
     let services = source("src/syscall/f_services.rs");

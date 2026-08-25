@@ -1048,6 +1048,18 @@ impl<const THREADS: usize> PreparedThreadTermination<THREADS> {
         self.target_process
     }
 
+    /// Returns the owning Process only when this Thread transition also made
+    /// that Process terminal. The retained Process execution pin is the exact
+    /// linear proof; merely observing the Process state later would not bind
+    /// the result to this prepared completion.
+    pub(crate) const fn exited_process(&self) -> Option<ProcessKey> {
+        if self.pins.exits_process() {
+            Some(self.target_process)
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn thread_keys(&self) -> [Option<ThreadKey>; THREADS] {
         self.pins.thread_keys()
     }

@@ -5109,6 +5109,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         permits: [Option<crate::arch::x86_64::rendezvous::RemoteStopReclaimPermit>;
             crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
     ) -> NativeSyscallResult {
+        let exited_process = prepared.exited_process();
         let mut discarded: [Option<user_access::OwnedLiveUserOutput>; 1] = [None];
         let mut atomic_pins: [Option<user_access::OwnedLiveAtomicU32>; 1] = [None];
         let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
@@ -5137,6 +5138,30 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             )
         };
         self.finish_terminal_adapter_resources(discarded, atomic_pins, control, deferred);
+        if status == DW_STATUS_SUCCESS && control == SyscallControl::ReturnToCaller {
+            if let Some(target) = exited_process.filter(|target| *target != self.process) {
+                let root_object = self
+                    .tasks
+                    .root_region(target)
+                    .unwrap_or_else(|error| {
+                        panic!("final-Thread child root lookup failed: {error:?}")
+                    })
+                    .unwrap_or_else(|| panic!("final-Thread child has no root AddressRegion"));
+                let root_key =
+                    crate::memory::address_region::AddressRegionObjectKey::from_object_id(
+                        root_object,
+                    );
+                let address_space = self
+                    .regions
+                    .region(root_key)
+                    .unwrap_or_else(|error| {
+                        panic!("final-Thread child root disappeared: {error:?}")
+                    })
+                    .address_space_key();
+                self.finish_inactive_process_teardown(target, root_key, address_space)
+                    .unwrap_or_else(|_| panic!("final-Thread inactive child teardown drifted"));
+            }
+        }
         let result = NativeSyscallResult { status, control };
         self.commit_runtime_phase(phase);
         result

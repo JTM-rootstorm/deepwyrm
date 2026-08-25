@@ -581,6 +581,10 @@ impl<const THREADS: usize> ExitPins<THREADS> {
         })
     }
 
+    pub(crate) const fn exits_process(&self) -> bool {
+        self.process.is_some()
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (

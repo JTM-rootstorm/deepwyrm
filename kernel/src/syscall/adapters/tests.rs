@@ -2385,9 +2385,15 @@ fn test_start(seed: u64) -> ThreadStartState {
     )
 }
 
-fn finish_task_cleanup<const OBJECTS: usize>(
+fn finish_task_cleanup<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
     registry: &mut ObjectRegistry<OBJECTS>,
-    tasks: &mut Tasks,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     cleanup: CleanupQueue<OBJECTS>,
 ) {
     for release in cleanup.into_releases().into_iter().flatten() {
@@ -3068,6 +3074,7 @@ fn external_final_blocked_thread_cleanup_precedes_process_quiescence_and_reclaim
             &mut cleanup,
         )
         .unwrap();
+        assert_eq!(prepared.exited_process(), Some(target_process));
         assert_eq!(execution.suspended_claim_on(cpu1), Some(switched));
         execution.stop_suspended_claim_on(switched).unwrap();
         execution.complete_switch_on(switched).unwrap();
@@ -3152,6 +3159,233 @@ fn external_final_blocked_thread_cleanup_precedes_process_quiescence_and_reclaim
             pending = crate::task::complete_task_finalization(&mut registry, finalization);
         }
     }
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the test-local authority uniquely owns its single synthetic address-space identity"
+)]
+fn final_external_thread_exit_preserves_process_identity_for_mapped_root_recycling() {
+    use deepwyrm_abi::{
+        DW_MEMORY_PROTECTION_READ, DW_RIGHT_MAP, DW_RIGHT_MODIFY, DW_RIGHT_READ,
+        DW_TERMINATION_AUTHORIZED,
+    };
+
+    type RecyclingTasks = TaskAuthority<2, 3, 2, 8>;
+    let mut registry = ObjectRegistry::<24>::new();
+    let mut tasks = RecyclingTasks::new();
+    let (_group, group_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (caller_process, caller_process_ref) =
+        tasks.create_process(&mut registry, &group_owner).unwrap();
+    let (target_process, target_process_ref) =
+        tasks.create_process(&mut registry, &group_owner).unwrap();
+    let mut spaces = unsafe { AddressSpaceAuthority::<1, 1>::new() };
+    let mut regions = AddressRegionObjectAuthority::<1, 2>::new();
+    let (root_key, root_ref) = regions
+        .create_root_region(
+            &mut registry,
+            &mut tasks,
+            &mut spaces,
+            target_process,
+            &target_process_ref,
+        )
+        .unwrap();
+    let target_owner = registry
+        .retain_internal_from_handle(&target_process_ref)
+        .unwrap();
+    let (target_thread, target_thread_ref) =
+        tasks.create_thread(&mut registry, &target_owner).unwrap();
+    assert!(registry.release_internal(target_owner).unwrap().is_none());
+    assert!(
+        registry
+            .release_handle(target_process_ref)
+            .unwrap()
+            .is_none()
+    );
+    let caller_owner = registry
+        .retain_internal_from_handle(&caller_process_ref)
+        .unwrap();
+    let (caller_thread, _caller_thread_ref) =
+        tasks.create_thread(&mut registry, &caller_owner).unwrap();
+    assert!(registry.release_internal(caller_owner).unwrap().is_none());
+    let target_thread_handle = tasks
+        .process_handles_mut(caller_process)
+        .unwrap()
+        .install(target_thread_ref, DW_RIGHT_MODIFY)
+        .unwrap();
+    let target_root_handle = tasks
+        .process_handles_mut(target_process)
+        .unwrap()
+        .install(root_ref, DwRights(DW_RIGHT_MAP.0 | DW_RIGHT_MODIFY.0))
+        .unwrap();
+
+    let mut user = FakeUserMemory::new();
+    let mut backing = TestBacking::new();
+    let mut memory = MemoryObjectAuthority::<1, 2>::new();
+    let mut cleanup = CleanupQueue::<24>::new();
+    assert_eq!(
+        memory_object_create(
+            &mut user,
+            &mut backing,
+            &mut registry,
+            &mut memory,
+            &mut tasks,
+            target_process,
+            4096,
+            0,
+            DwRights(DW_RIGHT_READ.0 | DW_RIGHT_MAP.0),
+            DwUserAddress(BASE + 0x100),
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let memory_handle = DwHandle(u64_at(&user, BASE + 0x100));
+    write_map_args(&mut user, BASE + 0x200, DW_MEMORY_PROTECTION_READ.0);
+    let root = regions.region(root_key).unwrap();
+    let mut publisher = FakePublisher {
+        address_space: root.address_space_key(),
+        region: root.region_key(),
+        replacements: 0,
+    };
+    assert_eq!(
+        address_region_map(
+            &mut user,
+            &mut publisher,
+            &mut registry,
+            &mut memory,
+            &mut tasks,
+            &mut regions,
+            target_process,
+            target_root_handle,
+            memory_handle,
+            DwUserAddress(BASE + 0x200),
+            u64::from(deepwyrm_abi::DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE),
+            DwUserAddress(BASE + 0x300),
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let mapped = u64_at(&user, BASE + 0x300);
+
+    let execution = ExecutionDomain::<2>::new(test_stack_bounds::<2>()).unwrap();
+    execution
+        .start_thread(&mut tasks, caller_thread, test_start(0xdc))
+        .unwrap();
+    assert_eq!(
+        execution
+            .schedule_next_on(crate::cpu::CpuIndex::new(0).unwrap())
+            .unwrap()
+            .current,
+        Some(caller_thread)
+    );
+    let waits = WaitRegistry::<2>::new();
+    let mut terminal = NoTerminalWaitCleanup;
+    let prepared = prepare_thread_terminate(
+        &mut registry,
+        &mut tasks,
+        &execution,
+        &waits,
+        &mut terminal,
+        caller_process,
+        caller_thread,
+        target_thread_handle,
+        DW_TERMINATION_AUTHORIZED,
+        0xdb,
+        &mut cleanup,
+    )
+    .unwrap();
+    assert_eq!(prepared.target(), target_thread);
+    assert_eq!(prepared.exited_process(), Some(target_process));
+    assert!(
+        terminal_outcome(
+            complete_prepared_thread_termination_after_remote_stops_on(
+                &mut registry,
+                &mut tasks,
+                &execution,
+                &waits,
+                &mut terminal,
+                crate::cpu::CpuIndex::new(0).unwrap(),
+                caller_process,
+                caller_thread,
+                prepared,
+                core::array::from_fn(|_| None),
+                &mut cleanup,
+            ),
+            DW_STATUS_SUCCESS,
+            SyscallControl::ReturnToCaller,
+        )
+        .is_none()
+    );
+
+    let proof = tasks.process_quiescence_proof(target_process).unwrap();
+    let drained = execution
+        .blocked_operations_drained(&tasks, &proof)
+        .unwrap();
+    let releases = regions
+        .region_mut_for_quiesced_teardown(&tasks, &proof, root_key)
+        .unwrap()
+        .unmap(&mut memory, &mut registry, &mut publisher, mapped, 4096)
+        .unwrap();
+    for release in releases.into_items().into_iter().flatten() {
+        cleanup.push(release);
+    }
+    for release in core::mem::replace(&mut cleanup, CleanupQueue::new())
+        .into_releases()
+        .into_iter()
+        .flatten()
+    {
+        assert_eq!(
+            release.object_type(),
+            deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT
+        );
+        let finalization = memory.take_finalization(release).unwrap();
+        crate::memory::object::complete_memory_finalization(
+            &mut registry,
+            &mut backing.roles,
+            finalization,
+        );
+    }
+    let root_pin = regions
+        .retire_quiesced_root(
+            &mut tasks,
+            target_process,
+            &proof,
+            execution.blocked_operations(),
+            drained,
+        )
+        .unwrap();
+    let root_final = registry.release_internal(root_pin).unwrap().unwrap();
+    let root_finalization = regions.take_finalization(&mut spaces, root_final).unwrap();
+    assert!(complete_address_region_finalization(&mut registry, root_finalization).is_none());
+    assert_eq!(tasks.root_region(target_process), Ok(None));
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            caller_process,
+            target_thread_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+    assert_eq!(
+        tasks.process_info(target_process),
+        Err(crate::task::TaskError::InvalidTask)
+    );
+
+    let (replacement, replacement_ref) = tasks.create_process(&mut registry, &group_owner).unwrap();
+    let (replacement_root, _replacement_root_ref) = regions
+        .create_root_region(
+            &mut registry,
+            &mut tasks,
+            &mut spaces,
+            replacement,
+            &replacement_ref,
+        )
+        .unwrap();
+    assert_ne!(replacement_root, root_key);
 }
 
 fn terminate_current_process_with_blocked_sibling(exception: bool) {
@@ -4716,19 +4950,35 @@ fn termination_rejects_reason_type_and_rights_before_target_mutation() {
         tasks.thread_info(target).unwrap().state,
         deepwyrm_abi::DW_TASK_STATE_CREATED
     );
+    let prepared = prepare_thread_terminate(
+        &mut registry,
+        &mut tasks,
+        &execution,
+        &waits,
+        &mut terminal_waits,
+        process,
+        current,
+        target_full,
+        DW_TERMINATION_AUTHORIZED,
+        0x44,
+        &mut cleanup,
+    )
+    .unwrap();
+    assert_eq!(prepared.target_process(), process);
+    assert_eq!(prepared.exited_process(), None);
     assert!(
         terminal_outcome(
-            thread_terminate(
+            complete_prepared_thread_termination_after_remote_stops_on(
                 &mut registry,
                 &mut tasks,
                 &execution,
                 &waits,
                 &mut terminal_waits,
+                crate::cpu::CpuIndex::new(0).unwrap(),
                 process,
                 current,
-                target_full,
-                DW_TERMINATION_AUTHORIZED,
-                0x44,
+                prepared,
+                core::array::from_fn(|_| None),
                 &mut cleanup,
             ),
             DW_STATUS_SUCCESS,
