@@ -631,6 +631,7 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
         runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst MEMORY_OBJECTS: usize = 12;")
     );
     assert!(runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst MEMORY_LEASES: usize = 13;"));
+    assert!(runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst WAITERS: usize = 6;"));
     assert!(runtime.contains(
         "#[cfg(deepwyrm_wrcap_relay)]\nconst CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;"
     ));

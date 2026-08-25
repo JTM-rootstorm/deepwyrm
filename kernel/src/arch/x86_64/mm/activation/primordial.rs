@@ -93,10 +93,15 @@ const CHANNEL_PAIRS: usize = 8;
 #[cfg(deepwyrm_wrcap_relay)]
 const CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;
 const CHANNEL_DEPTH: usize = 2;
-#[cfg(not(deepwyrm_i2_stress))]
+#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
 const WAITERS: usize = 4;
-#[cfg(deepwyrm_i2_stress)]
+#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const WAITERS: usize = 12;
+// Bootstrap supervises init0 and init0 supervises the controller while the
+// controller supervises one worker. Each WAIT_ANY owns a Channel and Process
+// registration, for an exact selector-24 peak of six.
+#[cfg(deepwyrm_wrcap_relay)]
+const WAITERS: usize = 6;
 #[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
 const TASK_GROUPS: usize = 1;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
