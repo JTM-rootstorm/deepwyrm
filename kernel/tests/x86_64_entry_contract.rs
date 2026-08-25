@@ -468,7 +468,7 @@ fn g3_primordial_mapping_failures_remain_recoverable_and_rollback_owned_candidat
     );
     assert!(
         primordial.contains(
-            "#[cfg(deepwyrm_wrcap_relay)]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 34;"
+            "#[cfg(deepwyrm_wrcap_relay)]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 35;"
         )
     );
     assert!(primordial.contains("PRIMORDIAL_MAX_MAPPING_PAGES + PRIMORDIAL_TABLE_CANDIDATES"));
