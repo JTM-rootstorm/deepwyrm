@@ -335,17 +335,23 @@ acceptance channel.
 Implementation must instrument and test the current transition surfaces before
 changing policy:
 
-| Surface | Current owner/path |
-| --- | --- |
-| reserve/commit, claim, yield, block, wake, retire, remote stop | `kernel/src/task/scheduler.rs` |
-| execution façade, switch completion, terminal batch | `kernel/src/task/execution.rs` |
-| wait completion/wake | `kernel/src/wait/engine.rs`, `kernel/src/wait/` |
-| atomic-wait wake | `kernel/src/atomic_wait.rs` |
-| user entry/return and idle rescan | `kernel/src/arch/x86_64/syscall/live.rs` |
-| remote stop/root handoff | `kernel/src/arch/x86_64/rendezvous.rs`, `kernel/src/arch/x86_64/mm/activation/primordial.rs` |
-| Local APIC timer programming | `kernel/src/arch/x86_64/apic.rs`, `kernel/src/time/live.rs` |
-| stationary runtime/root guards | `kernel/src/arch/x86_64/syscall/stationary_runtime.rs`, `kernel/src/arch/x86_64/syscall/runtime_binding.rs` |
-| scratch/migration exclusion | `kernel/src/arch/x86_64/mm/` and the I1 scratch contract |
+| Transition surface | Concrete current owner/call path | DW1 preservation point |
+| --- | --- | --- |
+| reserve, commit, cancel, and initial Runnable publication | `CooperativeScheduler::{reserve,commit,cancel}` in `kernel/src/task/scheduler.rs`; task creation reaches it through `ExecutionAuthority` in `kernel/src/task/execution.rs` | Reservation tokens and enqueue generations remain exact; the normal-policy model is separate and test-only. |
+| idle claim and Running publication | `CooperativeScheduler::{schedule_next_on,schedule_from_idle_on}`; façade `ExecutionAuthority::{schedule_next_on,schedule_from_idle_on}` | Claim removes one queue identity and publishes one CPU/execution generation. AP live scheduling is still parked. |
+| voluntary yield and continuation publication | `CooperativeScheduler::{yield_current_on,complete_switch_on,complete_switch_on_with_runnable_publication}`; `ExecutionAuthority::{yield_current_on,complete_switch_on}`; physical switch preparation in `ExecutionAuthority::prepare_kernel_switch_inner` | No scheduler guard crosses the root/carrier switch; the suspended continuation remains CPU/generation-bound until completion. |
+| block prepare, cancel, and commit | `CooperativeScheduler::{prepare_block_current_on,cancel_block_on,commit_block_on}` via `ExecutionAuthority`; callers in `kernel/src/wait/operation.rs`, `kernel/src/atomic_wait.rs`, and the primordial syscall adapter | Registration commits before Running removal; timer/quantum work must defer while preparation owns the exact claim. |
+| ordinary wait and deadline wake | `kernel/src/wait/engine.rs` and `kernel/src/wait/operation.rs` produce exact `BlockWakeKey`; `ExecutionAuthority::wake` calls `CooperativeScheduler::wake_with_affinity`; `kernel/src/time/live.rs::wake_trampoline` reaches the bound deadline target | One matching block generation is consumed; stale/competing wakes cannot enqueue. |
+| atomic-wait winner and wake | `kernel/src/atomic_wait.rs::{begin_atomic_wait,complete_atomic_wait,wake_atomic_waiters}` and `BlockedOperations` winner ownership, followed by `ExecutionAuthority::wake` | Predicate, registration, pin, deadline, and scheduler wake ownership remain one transaction. |
+| terminal retirement and reaper handoff | `CooperativeScheduler::retire_on`; `ExecutionAuthority::{retire_exit_pins_on,retire_exit_pins_after_remote_stops,terminal_physical_claim_on,terminal_reaper_next_on}`; primordial terminal/reaper paths in `kernel/src/arch/x86_64/mm/activation/primordial.rs` | Terminal state wins monotonically; task/execution pins and physical continuation are released only after the exact stop/switch acknowledgement. |
+| remote stop and Running/suspended removal | mailbox/state validation in `kernel/src/arch/x86_64/rendezvous.rs`; delivery and root handoff in primordial `prepare_suspend_stationary`/`poll_idle_suspend_stationary`; `ExecutionAuthority::{stop_running_claim_on,stop_suspended_claim_on}` | Exact CPU, Thread, execution, and root generation are revalidated before acknowledgement; scheduler removal precedes ACK. |
+| user entry, syscall/interrupt return, and idle loop | `kernel/src/arch/x86_64/syscall/live.rs` entry/carrier code and primordial live carrier dispatch/return/idle-rescan paths | DW1-B may consume `need_resched` only at the later validated CPL3-return boundary; DW1-A changes none of these paths. |
+| idle accounting publication | `ExecutionAuthority::{publish_idle_on,finish_idle_on}` -> matching `CooperativeScheduler` operations; primordial carrier idle entry/exit | Accounting begins only after the architecture publishes an exact idle generation and ends once. |
+| Timer/wait deadline queue and interrupt service | `kernel/src/time/live.rs::{register_deadline,cancel_deadline,dw_x86_64_timer_interrupt_dispatch}` plus `LiveTimerDeadlineAuthority`; general Timer objects in `kernel/src/time/timer.rs` | CPU0 remains sole live Timer/wait-service owner in DW1-A; no scheduler deadline source is live yet. |
+| Local APIC one-shot programming | `LocalApic::program_one_shot_timer`/`stop_timer` in `kernel/src/arch/x86_64/apic.rs`, called by `LiveTimeState::reprogram` and time initialization in `kernel/src/time/live.rs` | The future unified arbiter must become the sole programmer before DW1-B adds a quantum source. |
+| stationary runtime/root guards and root switch | depth/phase witnesses in `kernel/src/arch/x86_64/syscall/stationary_runtime.rs`; runtime binding in `kernel/src/arch/x86_64/syscall/runtime_binding.rs`; root selection in `kernel/src/arch/x86_64/mm/activation/` | No stationary/paging guard or root-switch transaction may cross a scheduler switch/preemption boundary. |
+| scratch and execution-pin migration exclusion | CPU-local scratch sessions under `kernel/src/arch/x86_64/mm/`; task exit pins in `kernel/src/task/mod.rs` and `kernel/src/task/execution.rs` | Live scratch, execution pins, root switch, suspended continuation, block preparation, and unacknowledged stop all reject migration. |
+| DW1 future-policy host model | `kernel/src/task/scheduler/normal_policy_model.rs`, compiled only under `cfg(test)` | Fixed-capacity model covers placement, per-CPU FIFO rotation, eligibility/offline rejection, bounded cyclic idle stealing, migration guards, quantum generations/arithmetic, and block/wake/terminal races without changing cooperative production behavior. |
 
 New transition surfaces must be added to this inventory or to the DW1
 validation record before their behavior is accepted.

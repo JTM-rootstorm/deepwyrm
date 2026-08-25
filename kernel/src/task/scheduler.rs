@@ -2114,3 +2114,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
 #[cfg(test)]
 #[path = "scheduler/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "scheduler/normal_policy_model.rs"]
+mod normal_policy_model;
