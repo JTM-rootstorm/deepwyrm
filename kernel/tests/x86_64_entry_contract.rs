@@ -536,6 +536,9 @@ fn g3_primordial_mapping_failures_remain_recoverable_and_rollback_owned_candidat
             "#[cfg(deepwyrm_wrcap_relay)]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 39;"
         )
     );
+    assert!(primordial.contains(
+        "#[cfg(deepwyrm_wyr1_evidence)]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 41;"
+    ));
     assert!(primordial.contains("PRIMORDIAL_MAX_MAPPING_PAGES + PRIMORDIAL_TABLE_CANDIDATES"));
     assert!(primordial.contains("PRIMORDIAL_INVALIDATIONS: usize = PRIMORDIAL_MAX_MAPPING_PAGES"));
 }
@@ -553,6 +556,24 @@ fn g5_primordial_blocking_uses_the_f12_idle_suspend_resume_flow() {
     assert!(!primordial.contains("primordial bootstrap blocked despite its prepublished INIT"));
     assert!(!primordial.contains("primordial bootstrap reached an unexpected idle suspension"));
     assert!(!primordial.contains("primordial bootstrap unexpectedly resumed a blocked syscall"));
+}
+
+#[test]
+fn wyr1_bootfs_capacity_is_bound_to_both_immutable_media_measurements() {
+    let primordial =
+        fs::read_to_string(kernel_root().join("src/arch/x86_64/mm/activation/primordial.rs"))
+            .expect("read primordial runtime source");
+    assert!(primordial.contains("const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 41;"));
+    assert!(primordial.contains("166,784 bytes (41 pages)"));
+    assert!(
+        primordial.contains("68a90892a79fd2955bbbabdae4f29886c1480d82ee307a2ffda1a6d087e9209d")
+    );
+    assert!(primordial.contains("166,184 bytes (41 pages)"));
+    assert!(
+        primordial.contains("692b23a564078b6caf6d1ae4b31b53b89312c9046b12c2199c785e6f0786afc7")
+    );
+    assert!(primordial.contains("wyr1_bootfs_page_count(41 * 4096 + 1), Some(42)"));
+    assert!(primordial.contains("Some(1..=PRIMORDIAL_MAX_MAPPING_PAGES)"));
 }
 
 #[test]

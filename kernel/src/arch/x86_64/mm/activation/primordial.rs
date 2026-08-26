@@ -191,11 +191,14 @@ const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 17;
 const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 32;
 #[cfg(deepwyrm_wrcap_relay)]
 const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 39;
-// WYR1 media must replace this conservative selector-local ceiling with its
-// exact measured bootfs page count at image integration; it is deliberately
-// separate from the accepted WYR0 selector bounds.
+// Selector 25 immutable media measurements:
+// - normal: 166,784 bytes (41 pages), SHA-256
+//   68a90892a79fd2955bbbabdae4f29886c1480d82ee307a2ffda1a6d087e9209d;
+// - degraded recovery: 166,184 bytes (41 pages), SHA-256
+//   692b23a564078b6caf6d1ae4b31b53b89312c9046b12c2199c785e6f0786afc7.
+// This selector-local bound remains separate from the accepted WYR0 bounds.
 #[cfg(deepwyrm_wyr1_evidence)]
-const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 64;
+const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 41;
 const PRIMORDIAL_JOURNAL_ENTRIES: usize =
     PRIMORDIAL_MAX_MAPPING_PAGES + PRIMORDIAL_TABLE_CANDIDATES;
 const PRIMORDIAL_INVALIDATIONS: usize = PRIMORDIAL_MAX_MAPPING_PAGES;
@@ -4027,13 +4030,23 @@ mod wyr1_capacity_tests {
     use super::*;
 
     #[test]
-    fn integration_bootfs_measurement_hook_is_exact_at_64_pages() {
+    fn integration_bootfs_measurement_hook_accepts_41_pages_and_rejects_42() {
         assert_eq!(wyr1_bootfs_page_count(0), None);
         assert_eq!(wyr1_bootfs_page_count(1), Some(1));
         assert_eq!(wyr1_bootfs_page_count(4096), Some(1));
         assert_eq!(wyr1_bootfs_page_count(4097), Some(2));
-        assert_eq!(wyr1_bootfs_page_count(64 * 4096), Some(64));
-        assert_eq!(wyr1_bootfs_page_count(64 * 4096 + 1), Some(65));
+        assert_eq!(wyr1_bootfs_page_count(166_184), Some(41));
+        assert_eq!(wyr1_bootfs_page_count(166_784), Some(41));
+        assert_eq!(wyr1_bootfs_page_count(41 * 4096), Some(41));
+        assert!(matches!(
+            wyr1_bootfs_page_count(41 * 4096),
+            Some(1..=PRIMORDIAL_MAX_MAPPING_PAGES)
+        ));
+        assert_eq!(wyr1_bootfs_page_count(41 * 4096 + 1), Some(42));
+        assert!(!matches!(
+            wyr1_bootfs_page_count(41 * 4096 + 1),
+            Some(1..=PRIMORDIAL_MAX_MAPPING_PAGES)
+        ));
         assert_eq!(wyr1_bootfs_page_count(usize::MAX), None);
     }
 }
