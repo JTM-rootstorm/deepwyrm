@@ -1700,17 +1700,21 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             // Primordial is still this CPU's hardware-active Process root.
             // Remove its low half through that exact publisher before choosing
             // either a userspace successor or the CPU-private kernel root.
+            let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|RETIRE|PROOF\n");
             let proof = self
                 .tasks
                 .process_quiescence_proof(retired_process)
                 .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d009));
+            let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|RETIRE|DRAIN\n");
             let drained = self
                 .shared
                 .execution
                 .blocked_operations_drained(&self.tasks, &proof)
                 .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d00a));
+            let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|RETIRE|UNMAP\n");
             self.unmap_primordial_userspace(&proof)
                 .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d00b));
+            let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|RETIRE|UNMAPPED\n");
             Some((proof, drained))
         } else {
             None
@@ -2411,6 +2415,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
         proof: &crate::task::ProcessQuiescenceProof,
     ) -> Result<(), ()> {
+        #[cfg(deepwyrm_wyr1_evidence)]
+        let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|UNMAP|VALIDATE\n");
         self.active
             .validate_current_process_root_selection(
                 self.active_root.as_ref().ok_or(())?,
@@ -2432,8 +2438,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .next()
                 .copied();
             let Some(mapping) = mapping else {
+                #[cfg(deepwyrm_wyr1_evidence)]
+                let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|UNMAP|EMPTY\n");
                 break;
             };
+            #[cfg(deepwyrm_wyr1_evidence)]
+            let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|UNMAP|MAPPING\n");
             let releases = {
                 let region = self
                     .regions
@@ -2450,6 +2460,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     mapping.byte_len(),
                 )
             };
+            #[cfg(deepwyrm_wyr1_evidence)]
+            let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|UNMAP|REMOVED\n");
             for release in releases.into_items().into_iter().flatten() {
                 self.cleanup.push(release);
             }
