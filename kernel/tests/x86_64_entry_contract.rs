@@ -231,6 +231,7 @@ fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
         ("smp-runtime-stress", 22),
         ("smp-runtime-acceptance", 23),
         ("native-userspace-capability", 24),
+        ("normal-preemption-up", 26),
     ] {
         assert_eq!(
             kernel_build::select_guest_test(true, Some(selector), false, &harness),
@@ -244,7 +245,6 @@ fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
         "ipc-transfer-rollback",
         "wait-deadline-timer",
         "process-create-bootstrap",
-        "normal-preemption-up",
         "bootstrap-registry-launch",
     ] {
         assert!(
@@ -260,6 +260,50 @@ fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
         kernel_build::select_guest_test(false, None, false, ""),
         Ok(None)
     );
+}
+
+#[test]
+fn selector26_private_evidence_surface_is_isolated_and_terminally_ordered() {
+    let root = kernel_root();
+    let build = fs::read_to_string(root.join("build.rs")).expect("read kernel build");
+    let support =
+        fs::read_to_string(root.join("src/test_support/mod.rs")).expect("read test support");
+    let evidence = fs::read_to_string(root.join("src/test_support/dw1b_evidence.rs"))
+        .expect("read selector-26 evidence");
+    let terminal =
+        fs::read_to_string(root.join("src/test_support/x86_64.rs")).expect("read terminal support");
+    let debug = fs::read_to_string(root.join("src/debug/mod.rs")).expect("read debug support");
+    let primordial = fs::read_to_string(root.join("src/arch/x86_64/mm/activation/primordial.rs"))
+        .expect("read primordial runtime");
+    let public_abi = fs::read_to_string(root.join("../abi/generated/deepwyrm_abi.rs"))
+        .expect("read generated ABI");
+
+    assert!(build.contains("selector == \"normal-preemption-up\""));
+    assert!(build.contains("cargo:rustc-cfg=deepwyrm_dw1b_evidence"));
+    assert!(support.contains("#[cfg(any(test, deepwyrm_dw1b_evidence))]\nmod dw1b_evidence;"));
+    assert!(evidence.contains("pub(crate) const DW1B_EVIDENCE_RAW_SYSCALL: u32 = 0xffff_ff1a;"));
+    assert!(!public_abi.contains("FFFF_FF1A"));
+    assert!(!public_abi.contains("ffff_ff1a"));
+    assert!(debug.contains("deepwyrm_dw1b_evidence\n))]\nfn write_bounded_test_evidence_record"));
+
+    let completion = terminal
+        .find("pub(crate) fn complete_dw1b_evidence")
+        .expect("selector-26 terminal exists");
+    let evidence_write = terminal[completion..]
+        .find("write_evidence(permit.record())")
+        .expect("DWPRE1 evidence write exists");
+    let pass = terminal[completion..]
+        .find("completion_record(CompletionOutcome::Pass, 0)")
+        .expect("selector-26 PASS exists");
+    assert!(evidence_write < pass, "DWPRE1 must precede PASS DWTEST1");
+
+    assert!(primordial.contains("self.evidence_init_process != Some(self.process)"));
+    assert!(primordial.contains("process_target_for_dw1b_evidence"));
+    assert!(primordial.contains("exact_single_thread("));
+    assert!(primordial.contains("Dw1bRawOperation::decode(arguments.as_array())"));
+    assert!(primordial.contains(".progress(self.process, exchange_count, digest)"));
+    assert!(primordial.contains("g5_probe.accepts_completion(&completion)"));
+    assert!(primordial.contains("complete_dw1b_evidence(permit)"));
 }
 
 #[test]
@@ -368,10 +412,9 @@ fn wrcap_relay_is_selector_only_bounded_and_precedes_terminal_completion() {
 
     assert!(build.contains("cfg(deepwyrm_wrcap_relay)"));
     assert!(build.contains("selector == \"native-userspace-capability\""));
-    assert!(
-        support
-            .contains("DWEVID1, WRCAP1, and WYR1EVID1 terminal reporters are selector-exclusive")
-    );
+    assert!(support.contains(
+        "DWEVID1, WRCAP1, WYR1EVID1, and DWPRE1 terminal reporters are selector-exclusive"
+    ));
     assert!(support.contains("#[cfg(any(test, deepwyrm_wrcap_relay))]\nmod wrcap;"));
     assert!(relay.contains("const WRCAP_RECORD_COUNT: usize = 15;"));
     assert!(relay.contains("const WRCAP_RECORD_KINDS: [u8; WRCAP_RECORD_COUNT]"));
@@ -525,7 +568,7 @@ fn g3_primordial_mapping_failures_remain_recoverable_and_rollback_owned_candidat
     assert!(user_access.contains("cancel_zeroed(failure.into_grant())"));
     assert!(
         primordial.contains(
-            "#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence)))]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 17;"
+            "deepwyrm_dw1b_evidence\n)))]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 17;"
         )
     );
     assert!(
@@ -540,6 +583,9 @@ fn g3_primordial_mapping_failures_remain_recoverable_and_rollback_owned_candidat
     );
     assert!(primordial.contains(
         "#[cfg(deepwyrm_wyr1_evidence)]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 42;"
+    ));
+    assert!(primordial.contains(
+        "#[cfg(deepwyrm_dw1b_evidence)]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = parse_dw1b_bootfs_pages();"
     ));
     assert!(primordial.contains("PRIMORDIAL_MAX_MAPPING_PAGES + PRIMORDIAL_TABLE_CANDIDATES"));
     assert!(primordial.contains("PRIMORDIAL_INVALIDATIONS: usize = PRIMORDIAL_MAX_MAPPING_PAGES"));
@@ -570,9 +616,9 @@ fn wyr1_bootfs_capacity_owns_the_page_ceiling_without_recursive_media_identity()
     assert!(primordial.contains("169,896 bytes (42 pages)"));
     assert!(primordial.contains("Deepwyrm owns this page ceiling and its rejection"));
     assert!(primordial.contains("Content hashes belong to receipt/root evidence"));
-    assert!(primordial.contains("wyr1_bootfs_page_count(42 * 4096), Some(42)"));
-    assert!(primordial.contains("wyr1_bootfs_page_count(42 * 4096 + 1), Some(43)"));
-    assert!(primordial.contains("wyr1_bootfs_page_count(usize::MAX), None"));
+    assert!(primordial.contains("integration_bootfs_page_count(42 * 4096), Some(42)"));
+    assert!(primordial.contains("integration_bootfs_page_count(42 * 4096 + 1), Some(43)"));
+    assert!(primordial.contains("integration_bootfs_page_count(usize::MAX), None"));
     assert!(primordial.contains("Some(1..=PRIMORDIAL_MAX_MAPPING_PAGES)"));
     assert!(primordial.contains("crate::test_support::complete_fail(0x2510_b001)"));
 }

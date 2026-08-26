@@ -41,6 +41,42 @@ fn rights(bits: &[DwRights]) -> DwRights {
     DwRights(bits.iter().fold(0_u64, |mask, right| mask | right.0))
 }
 
+#[cfg(deepwyrm_dw1b_evidence)]
+#[test]
+fn selector26_process_identity_requires_inspect_and_exact_process_handle() {
+    let mut registry = ObjectRegistry::<3>::new();
+    let mut table = HandleTable::<3>::new();
+    let inspected = install_object(
+        &mut registry,
+        &mut table,
+        DW_OBJECT_TYPE_PROCESS,
+        DW_RIGHT_INSPECT,
+    );
+    let uninspected = install_object(
+        &mut registry,
+        &mut table,
+        DW_OBJECT_TYPE_PROCESS,
+        DW_RIGHT_WAIT,
+    );
+    let wrong_type = install_object(
+        &mut registry,
+        &mut table,
+        DW_OBJECT_TYPE_THREAD,
+        DW_RIGHT_INSPECT,
+    );
+    assert!(table.process_target_for_dw1b_evidence(inspected).is_some());
+    assert_eq!(table.process_target_for_dw1b_evidence(uninspected), None);
+    assert_eq!(table.process_target_for_dw1b_evidence(wrong_type), None);
+    assert_eq!(
+        table.process_target_for_dw1b_evidence(deepwyrm_abi::DwHandle(u64::MAX)),
+        None
+    );
+    let drained = table.drain(&mut registry);
+    for release in drained.into_final_releases().into_iter().flatten() {
+        registry.complete_finalization(release).unwrap();
+    }
+}
+
 #[test]
 fn every_live_object_type_installs_with_generated_compatible_rights() {
     let mut registry = ObjectRegistry::<8>::new();

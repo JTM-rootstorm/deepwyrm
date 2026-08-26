@@ -10,9 +10,16 @@ use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::arch::x86_64::exceptions::{EarlyException, ExceptionVector};
 use crate::debug::emit_early_raw_record;
-#[cfg(any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence))]
+#[cfg(any(
+    deepwyrm_i1_evidence,
+    deepwyrm_wrcap_relay,
+    deepwyrm_wyr1_evidence,
+    deepwyrm_dw1b_evidence
+))]
 use crate::debug::{TestSerialTransaction, begin_test_serial_transaction};
 
+#[cfg(deepwyrm_dw1b_evidence)]
+use super::dw1b_evidence::Dw1bEvidenceFlushPermit;
 #[cfg(deepwyrm_i1_evidence)]
 use super::{EvidenceFlushError, I1_EVIDENCE};
 #[cfg(deepwyrm_wrcap_relay)]
@@ -85,7 +92,12 @@ unsafe extern "sysv64" {
 /// that the QEMU-only I/O device is present on an arbitrary machine.
 struct QemuCompletionTransport {
     _private: (),
-    #[cfg(any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence))]
+    #[cfg(any(
+        deepwyrm_i1_evidence,
+        deepwyrm_wrcap_relay,
+        deepwyrm_wyr1_evidence,
+        deepwyrm_dw1b_evidence
+    ))]
     transaction: Option<TestSerialTransaction>,
 }
 
@@ -105,7 +117,12 @@ impl QemuCompletionTransport {
     const unsafe fn new() -> Self {
         Self {
             _private: (),
-            #[cfg(any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence))]
+            #[cfg(any(
+                deepwyrm_i1_evidence,
+                deepwyrm_wrcap_relay,
+                deepwyrm_wyr1_evidence,
+                deepwyrm_dw1b_evidence
+            ))]
             transaction: None,
         }
     }
@@ -118,7 +135,12 @@ impl CompletionTransport for QemuCompletionTransport {
     ) -> Result<(), CompletionTransportError> {
         // The host requires both the serial record and matching process status;
         // a serial failure therefore becomes infrastructure failure, never PASS.
-        #[cfg(any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence))]
+        #[cfg(any(
+            deepwyrm_i1_evidence,
+            deepwyrm_wrcap_relay,
+            deepwyrm_wyr1_evidence,
+            deepwyrm_dw1b_evidence
+        ))]
         if let Some(transaction) = self.transaction.as_mut() {
             return transaction
                 .write_terminal(record)
@@ -140,6 +162,24 @@ impl CompletionTransport for QemuCompletionTransport {
     fn halt(&mut self) -> ! {
         halt_after_completion()
     }
+}
+
+/// Flush selector 26's fixed evidence record and append its PASS terminal in
+/// one exclusive serial transaction before issuing debug-exit.
+#[cfg(deepwyrm_dw1b_evidence)]
+pub(crate) fn complete_dw1b_evidence(permit: Dw1bEvidenceFlushPermit) -> ! {
+    let mut transport = unsafe { QemuCompletionTransport::new() };
+    let Ok(mut transaction) = begin_test_serial_transaction() else {
+        halt_after_completion()
+    };
+    if transaction.write_evidence(permit.record()).is_err() {
+        halt_after_completion()
+    }
+    transport.transaction = Some(transaction);
+    complete(
+        &mut transport,
+        completion_record(CompletionOutcome::Pass, 0),
+    )
 }
 
 /// Flush selector-25's preserved transcript and append its PASS terminal in
@@ -221,7 +261,12 @@ pub(crate) fn complete_pass(detail: u32) -> ! {
         let _ = detail;
         complete_wyr1_evidence_kernel_terminal(CompletionOutcome::Fail, 0x2510_ffff)
     }
-    #[cfg(not(deepwyrm_wyr1_evidence))]
+    #[cfg(deepwyrm_dw1b_evidence)]
+    {
+        let _ = detail;
+        complete_known_outcome(CompletionOutcome::Fail, 0x2610_ffff)
+    }
+    #[cfg(not(any(deepwyrm_wyr1_evidence, deepwyrm_dw1b_evidence)))]
     complete_known_outcome(CompletionOutcome::Pass, detail)
 }
 

@@ -44,8 +44,8 @@ pub(crate) use execution::{
 )]
 pub(crate) use scheduler::{
     BlockReservation, BlockReservationFailure, BlockToken, BlockWakeKey, CooperativeScheduler,
-    DEFAULT_NORMAL_QUANTUM_NS, IdleScheduleDecision, ScheduleDecision, SchedulerCpuId,
-    SchedulerError, SchedulerExecutionClaim, SchedulerIdleAccountingToken,
+    DEFAULT_NORMAL_QUANTUM_NS, IdleScheduleDecision, ScheduleDecision, SchedulerCounters,
+    SchedulerCpuId, SchedulerError, SchedulerExecutionClaim, SchedulerIdleAccountingToken,
     SchedulerPreemptionDecision, SchedulerPreemptionSnapshot, SchedulerQuantumTicket,
     SchedulerReservation, SchedulerReservationFailure, SchedulerThreadState,
 };

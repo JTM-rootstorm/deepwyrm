@@ -68,7 +68,12 @@ use super::private::{
 const ENTRY_COUNT: usize = 512;
 const E5_USER_PIN_CAPACITY: usize = 8;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
-#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence)))]
+#[cfg(not(any(
+    deepwyrm_i2_stress,
+    deepwyrm_wrcap_relay,
+    deepwyrm_wyr1_evidence,
+    deepwyrm_dw1b_evidence
+)))]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;
 // Selector 24 keeps bootstrap, init0, the controller, and one bounded worker
 // live together. The controller tears each worker down before starting the
@@ -79,6 +84,10 @@ const LIVE_ADDRESS_SPACE_CAPACITY: usize = 4;
 // the one-shot primordial retirement completes.
 #[cfg(deepwyrm_wyr1_evidence)]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 4;
+// Selector 26 keeps primordial, init0, hog, progress, and hello roots live for
+// its one-CPU independent-progress workload.
+#[cfg(deepwyrm_dw1b_evidence)]
+const LIVE_ADDRESS_SPACE_CAPACITY: usize = 5;
 // Selector 22 keeps bootstrap, init0, the controller, and multiple stress
 // descendants live together. This is a bounded test-artifact capacity, not a
 // production policy or a new ABI limit.

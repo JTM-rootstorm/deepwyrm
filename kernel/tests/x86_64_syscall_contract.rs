@@ -527,7 +527,7 @@ fn i1_live_process_exit_retires_the_current_cpu_carrier() {
 fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
 
-    assert!(runtime.contains("fn complete_physical_switch_handoff(&self)"));
+    assert!(runtime.contains("fn complete_physical_switch_handoff(&mut self)"));
     assert!(runtime.contains(".complete_switch_on(outgoing)"));
     assert!(runtime.contains(
         "runtime.switch_cpu(self.cpu);\n            runtime.complete_physical_switch_handoff();\n            runtime.prepare_fresh_user_entry()"
@@ -631,7 +631,7 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
     assert!(build.contains("cargo:rustc-cfg=deepwyrm_i2_stress"));
     assert!(
         activation.contains(
-            "#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence)))]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;"
+            "deepwyrm_dw1b_evidence\n)))]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;"
         )
     );
     assert!(
@@ -649,14 +649,18 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
             .contains("#[cfg(deepwyrm_i2_stress)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 6;")
     );
     assert!(
+        activation.contains(
+            "#[cfg(deepwyrm_dw1b_evidence)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 5;"
+        )
+    );
+    assert!(
         runtime.contains(
             "#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]\nconst USERSPACE_CHAIN_PROCESSES: usize = 6;"
         )
     );
     assert!(
-        runtime.contains(
-            "#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence)))]\nconst USERSPACE_CHAIN_PROCESSES: usize = 3;"
-        )
+        runtime
+            .contains("deepwyrm_dw1b_evidence\n)))]\nconst USERSPACE_CHAIN_PROCESSES: usize = 3;")
     );
     assert!(
         runtime
@@ -677,7 +681,7 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
     assert!(runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst REGISTRY_OBJECTS: usize = 48;"));
     assert!(
         runtime.contains(
-        "#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence)))]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 17;"
+            "deepwyrm_dw1b_evidence\n)))]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 17;"
         )
     );
     assert!(

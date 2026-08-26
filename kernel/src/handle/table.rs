@@ -736,6 +736,17 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
             .then_some(entry.reference.id())
     }
 
+    /// Resolves selector 26's private Process identity without retaining a
+    /// reference. INSPECT is required because the caller submits identity as
+    /// evidence rather than merely operating on the handle.
+    #[cfg(deepwyrm_dw1b_evidence)]
+    pub(crate) fn process_target_for_dw1b_evidence(&self, handle: DwHandle) -> Option<ObjectId> {
+        let entry = self.resolve_entry(handle).ok()?;
+        require_held(entry.rights, DW_RIGHT_INSPECT).ok()?;
+        (entry.reference.object_type() == deepwyrm_abi::DW_OBJECT_TYPE_PROCESS)
+            .then_some(entry.reference.id())
+    }
+
     pub(crate) fn close<const OBJECTS: usize>(
         &mut self,
         registry: &mut ObjectRegistry<OBJECTS>,

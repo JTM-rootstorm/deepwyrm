@@ -152,11 +152,11 @@ state = "implemented"
 id = 25
 state = "implemented"
 
-# DW1-B's CPU0-only normal-preemption gate. Implementation must add the real
-# selector body and structured evidence before changing this state.
+# DW1-B's CPU0-only normal-preemption gate. Its kernel-authored DWPRE1 summary
+# remains test-build-only and precedes the canonical DWTEST1 terminal.
 [guest_test.normal-preemption-up]
 id = 26
-state = "reserved"
+state = "implemented"
 
 # WYR1-B's separate bootstrap-registry and supervisor launch/job gate. It is a
 # distinct product/evidence contract and does not extend selector 25.

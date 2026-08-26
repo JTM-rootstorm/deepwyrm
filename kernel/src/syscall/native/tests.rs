@@ -213,6 +213,14 @@ impl crate::arch::x86_64::syscall::UserReturnMappingValidation for FrameRuntime 
     reason = "the host fixture implements the runtime suspension boundary without producing a live plan"
 )]
 impl NativeSyscallFrameRuntime for FrameRuntime {
+    #[cfg(deepwyrm_dw1b_evidence)]
+    fn intercept_dw1b_evidence_raw(
+        &mut self,
+        _arguments: RawSyscallArguments,
+    ) -> NativeSyscallResult {
+        panic!("host frame fixture must not intercept selector-26 evidence")
+    }
+
     #[cfg(deepwyrm_wyr1_evidence)]
     fn intercept_wyr1_evidence_raw(
         &mut self,
@@ -336,6 +344,14 @@ impl NativeSyscallHandler for SuspendingRuntime {
     reason = "the host fixture implements the runtime suspension boundary without producing a live plan"
 )]
 impl NativeSyscallFrameRuntime for SuspendingRuntime {
+    #[cfg(deepwyrm_dw1b_evidence)]
+    fn intercept_dw1b_evidence_raw(
+        &mut self,
+        _arguments: RawSyscallArguments,
+    ) -> NativeSyscallResult {
+        panic!("suspending host fixture must not intercept selector-26 evidence")
+    }
+
     #[cfg(deepwyrm_wyr1_evidence)]
     fn intercept_wyr1_evidence_raw(
         &mut self,

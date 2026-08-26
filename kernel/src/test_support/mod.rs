@@ -9,10 +9,15 @@
 #[cfg(any(
     all(deepwyrm_i1_evidence, deepwyrm_wrcap_relay),
     all(deepwyrm_i1_evidence, deepwyrm_wyr1_evidence),
-    all(deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence)
+    all(deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence),
+    all(deepwyrm_i1_evidence, deepwyrm_dw1b_evidence),
+    all(deepwyrm_wrcap_relay, deepwyrm_dw1b_evidence),
+    all(deepwyrm_wyr1_evidence, deepwyrm_dw1b_evidence)
 ))]
-compile_error!("DWEVID1, WRCAP1, and WYR1EVID1 terminal reporters are selector-exclusive");
+compile_error!("DWEVID1, WRCAP1, WYR1EVID1, and DWPRE1 terminal reporters are selector-exclusive");
 
+#[cfg(any(test, deepwyrm_dw1b_evidence))]
+mod dw1b_evidence;
 #[cfg(deepwyrm_i1_evidence)]
 mod evidence;
 mod identity;
@@ -45,8 +50,15 @@ pub use transport::{
 )]
 pub(crate) use wrcap::{WRCAP_RECORD_LEN, WRCAP_RELAY, WrcapDrainAction, WrcapFlushError};
 
+#[cfg(deepwyrm_dw1b_evidence)]
+pub(crate) use dw1b_evidence::DW1B_EVIDENCE_RAW_SYSCALL;
 #[cfg(deepwyrm_wyr1_evidence)]
 pub(crate) use wyr1_evidence::WYR1_EVIDENCE_RAW_SYSCALL;
+
+#[cfg(all(deepwyrm_dw1b_evidence, target_arch = "x86_64", target_os = "none"))]
+pub(crate) use dw1b_evidence::{
+    DW1B_EVIDENCE, Dw1bEvidenceError, Dw1bRawOperation, Dw1bSubjects, exact_single_thread,
+};
 
 #[cfg(all(deepwyrm_wyr1_evidence, target_arch = "x86_64", target_os = "none"))]
 pub(crate) use wyr1_evidence::{
@@ -74,6 +86,8 @@ pub(crate) use evidence::{
     runtime_missing_mask as i1_runtime_missing_mask,
 };
 
+#[cfg(all(deepwyrm_dw1b_evidence, target_arch = "x86_64", target_os = "none"))]
+pub(crate) use x86_64::complete_dw1b_evidence;
 #[cfg(all(deepwyrm_wyr1_evidence, target_arch = "x86_64", target_os = "none"))]
 pub(crate) use x86_64::complete_wyr1_evidence;
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]

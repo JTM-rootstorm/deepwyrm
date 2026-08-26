@@ -384,3 +384,6 @@ debug-exit status; serial text alone remains insufficient.
 Selector 26 has an independent four-descendant-capable runtime budget. Its
 bootfs mapping-page ceiling remains pending measurement of the frozen Wyrmroot
 payload and must not reuse or change selector 25's measured 42-page exception.
+The selector build therefore requires the measured canonical-decimal
+`DEEPWYRM_DW1B_BOOTFS_MAX_PAGES` input (bounded to `1..=8192`) and compiles that
+value into selector-local mapping journal, invalidation, and admission bounds.

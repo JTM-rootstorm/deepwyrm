@@ -94,6 +94,9 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=DEEPWYRM_I1_EVIDENCE_NONCE");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1_EVIDENCE_NONCE");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1_EVIDENCE_SCENARIO");
+    println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1B_EVIDENCE_NONCE");
+    println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1B_CHALLENGE_DIGEST");
+    println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1B_BOOTFS_MAX_PAGES");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_c3_one_shot_ui)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_memory_guest)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_e7_guest)");
@@ -889,8 +892,41 @@ fn configure_guest_test(harness_path: &Path) -> Result<(), String> {
             println!("cargo:rustc-env=DEEPWYRM_WYR1_EVIDENCE_NONCE={nonce}");
             println!("cargo:rustc-env=DEEPWYRM_WYR1_EVIDENCE_SCENARIO={scenario}");
         }
+        if is_dw1b_evidence_selector(&selector) {
+            let nonce = required_dw1b_hex("DEEPWYRM_DW1B_EVIDENCE_NONCE")?;
+            let digest = required_dw1b_hex("DEEPWYRM_DW1B_CHALLENGE_DIGEST")?;
+            let bootfs_pages = required_dw1b_bootfs_pages()?;
+            println!("cargo:rustc-env=DEEPWYRM_DW1B_EVIDENCE_NONCE={nonce}");
+            println!("cargo:rustc-env=DEEPWYRM_DW1B_CHALLENGE_DIGEST={digest}");
+            println!("cargo:rustc-env=DEEPWYRM_DW1B_BOOTFS_MAX_PAGES={bootfs_pages}");
+        }
     }
     Ok(())
+}
+
+fn required_dw1b_hex(name: &str) -> Result<String, String> {
+    let value = env::var(name).map_err(|_| format!("normal-preemption-up requires {name}"))?;
+    validate_upper_nonzero_hex_nonce(&value, name)?;
+    Ok(value)
+}
+
+fn required_dw1b_bootfs_pages() -> Result<String, String> {
+    let name = "DEEPWYRM_DW1B_BOOTFS_MAX_PAGES";
+    let value =
+        env::var(name).map_err(|_| format!("normal-preemption-up requires measured {name}"))?;
+    validate_dw1b_bootfs_pages(&value)?;
+    Ok(value)
+}
+
+fn validate_dw1b_bootfs_pages(value: &str) -> Result<usize, String> {
+    let name = "DEEPWYRM_DW1B_BOOTFS_MAX_PAGES";
+    let pages = value
+        .parse::<usize>()
+        .map_err(|_| format!("{name} must be canonical decimal"))?;
+    if pages == 0 || pages > 8192 || pages.to_string() != value {
+        return Err(format!("{name} must be canonical decimal in 1..=8192"));
+    }
+    Ok(pages)
 }
 
 fn required_wyr1_evidence_nonce() -> Result<String, String> {
@@ -2015,11 +2051,31 @@ mod tests {
     }
 
     #[test]
-    fn dw1b_selector_cfg_is_exact_but_manifest_identity_remains_reserved() {
+    fn dw1b_selector_and_build_owned_hex_are_exact() {
         assert!(is_dw1b_evidence_selector("normal-preemption-up"));
         assert!(!is_dw1b_evidence_selector("permanent-supervisor-rrc"));
+        for valid in ["0000000000000001", "0123456789ABCDEF", "FFFFFFFFFFFFFFFF"] {
+            assert!(validate_upper_nonzero_hex_nonce(valid, "DW1B").is_ok());
+        }
+        for invalid in [
+            "0000000000000000",
+            "0123456789abcdef",
+            "0123456789ABCDE",
+            "G123456789ABCDEF",
+        ] {
+            assert!(validate_upper_nonzero_hex_nonce(invalid, "DW1B").is_err());
+        }
         let manifest = include_str!("../tooling/guest-harness.toml");
-        assert!(select_guest_test(true, Some("normal-preemption-up"), false, manifest).is_err());
+        assert_eq!(
+            select_guest_test(true, Some("normal-preemption-up"), false, manifest),
+            Ok(Some(26))
+        );
+        for (value, pages) in [("1", 1), ("42", 42), ("8192", 8192)] {
+            assert_eq!(validate_dw1b_bootfs_pages(value), Ok(pages));
+        }
+        for invalid in ["", "0", "01", "+1", "8193", "not-pages"] {
+            assert!(validate_dw1b_bootfs_pages(invalid).is_err());
+        }
     }
 
     #[test]
