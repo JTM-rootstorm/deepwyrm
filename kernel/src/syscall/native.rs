@@ -746,11 +746,67 @@ pub(crate) enum NativeResumeOutcome {
     TerminateCurrent,
 }
 
+#[must_use = "a DW1-B safe-boundary decision must return or immediately consume its switch plan"]
+pub(crate) enum NativePreemptionPlan<'owner> {
+    Return,
+    Switch(crate::arch::x86_64::context::KernelSwitchPlan<'owner>),
+}
+
 #[allow(
     unsafe_code,
     reason = "plan-producing runtime methods carry physical-current and fixed-entry obligations that safe Rust cannot encode"
 )]
 pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
+    fn publish_quantum_expiry(
+        &mut self,
+        _ticket: crate::task::SchedulerQuantumTicket,
+    ) -> Result<bool, crate::task::SchedulerError> {
+        Ok(false)
+    }
+
+    fn prepare_quantum(
+        &mut self,
+        _now_ns: u64,
+    ) -> Result<crate::task::SchedulerQuantumTicket, crate::task::SchedulerError> {
+        panic!("native runtime does not admit DW1-B quantum arming")
+    }
+
+    fn has_reschedule_request(&mut self) -> bool {
+        false
+    }
+
+    fn authorize_timer_return(
+        &mut self,
+        _frame: &mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
+    ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
+        panic!("native runtime does not admit asynchronous CPL3 return")
+    }
+
+    /// Produces a guard-free switch plan from an exact pending scheduler
+    /// request. The caller must consume it immediately.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the raw timer/syscall safe-boundary trampoline on
+    /// the current Thread's bound kernel stack.
+    unsafe fn prepare_preemption<'owner>(&'owner mut self) -> NativePreemptionPlan<'owner> {
+        panic!("native runtime does not admit DW1-B preemption")
+    }
+
+    fn resume_timer_preemption(
+        &mut self,
+        _frame: &mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
+    ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
+        panic!("native runtime does not admit timer-preempted continuation resume")
+    }
+
+    fn resume_syscall_preemption(
+        &mut self,
+        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+        _current_binding_generation: u64,
+    ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
+        panic!("native runtime does not admit syscall-return preemption resume")
+    }
     /// Selector-25-only interception of one raw ID deliberately absent from
     /// native ABI decode. Production and every other selector compile neither
     /// this method nor its call site, so the ID remains NOT_SUPPORTED there.

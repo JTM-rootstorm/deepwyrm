@@ -4,6 +4,7 @@
 //! ACPI PM timer and uses a calibrated Local APIC one-shot only as the wakeup
 //! source; timer objects and generic wait registration remain later F phases.
 
+mod arbiter;
 mod deadline;
 mod init_state;
 #[allow(
@@ -51,9 +52,9 @@ pub(crate) use pm_timer::{
 )]
 pub(crate) use live::{
     DeadlineRegistrationFailure, DeadlineWakeTarget, LiveTimeError, LiveTimerDeadlineAuthority,
-    TimerExpiryTarget, bind_deadline_wake_target, bind_timer_expiry_target,
-    bsp_local_apic_identity, busy_wait_nanoseconds, cancel_deadline, initialize,
-    initialize_ap_local_apic, monotonic_now, register_deadline, send_bsp_ipi,
+    TimerExpiryTarget, arm_scheduler_quantum, bind_deadline_wake_target, bind_timer_expiry_target,
+    bsp_local_apic_identity, busy_wait_nanoseconds, cancel_deadline, cancel_scheduler_quantum,
+    initialize, initialize_ap_local_apic, monotonic_now, register_deadline, send_bsp_ipi,
     service_current_rendezvous_latch, timer_service_is_healthy,
 };
 #[cfg(all(feature = "test-support", target_os = "none", target_arch = "x86_64"))]

@@ -17,7 +17,8 @@ pub(crate) use stationary_runtime::{RuntimePhaseReservation, StationaryGuardDept
     reason = "E4 return validation is consumed by E5 mapping-aware syscall adapters and E7 userspace entry"
 )]
 pub(crate) use frame::{
-    ProcessUserReturnMappingValidation, RawSyscallFrame, RawUserReturnContext, UserReturnError,
+    ProcessUserReturnMappingValidation, RawCpl3TimerReturnFrame, RawSyscallFrame,
+    RawUserReturnContext, USER_CODE_SELECTOR, USER_DATA_SELECTOR, UserReturnError,
     UserReturnMappingValidation, ValidatedUserReturn, is_lower_canonical_user_address,
     sanitize_user_rflags,
 };
@@ -46,8 +47,8 @@ pub(crate) use live::{
     current_cpu_index_for_diagnostics, current_cpu_is_on_terminal_reaper_stack,
     current_native_usercopy_is_quiescent, enter_bound_idle_scheduler, enter_bound_validated_user,
     enter_native_syscall_runtime, first_run_thread_entry_rip, install_syscall_boundary,
-    install_syscall_boundary_for_slot, release_native_runtime_carrier_for_slot,
-    validate_live_syscall_boundary,
+    install_syscall_boundary_for_slot, publish_current_quantum_expiry,
+    release_native_runtime_carrier_for_slot, validate_live_syscall_boundary,
 };
 
 #[cfg(test)]

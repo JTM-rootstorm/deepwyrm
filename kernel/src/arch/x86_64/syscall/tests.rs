@@ -58,6 +58,83 @@ fn e4_raw_frames_have_fixed_offsets() {
     assert_eq!(offset_of!(RawSyscallFrame, user_rsp), 120);
     assert_eq!(offset_of!(RawSyscallFrame, binding_generation), 128);
     assert_eq!(offset_of!(RawSyscallFrame, return_authorized), 136);
+
+    assert_eq!(size_of::<RawCpl3TimerReturnFrame>(), 160);
+    assert_eq!(offset_of!(RawCpl3TimerReturnFrame, r15), 0);
+    assert_eq!(offset_of!(RawCpl3TimerReturnFrame, rax), 112);
+    assert_eq!(offset_of!(RawCpl3TimerReturnFrame, rip), 120);
+    assert_eq!(offset_of!(RawCpl3TimerReturnFrame, cs), 128);
+    assert_eq!(offset_of!(RawCpl3TimerReturnFrame, rflags), 136);
+    assert_eq!(offset_of!(RawCpl3TimerReturnFrame, rsp), 144);
+    assert_eq!(offset_of!(RawCpl3TimerReturnFrame, ss), 152);
+}
+
+fn timer_frame() -> RawCpl3TimerReturnFrame {
+    RawCpl3TimerReturnFrame {
+        r15: 0,
+        r14: 0,
+        r13: 0,
+        r12: 0,
+        r11: 0,
+        r10: 0,
+        r9: 0,
+        r8: 0,
+        rbp: 0,
+        rdi: 0,
+        rsi: 0,
+        rdx: 0,
+        rcx: 0,
+        rbx: 0,
+        rax: 0,
+        rip: 0x4000,
+        cs: USER_CODE_SELECTOR,
+        rflags: u64::MAX,
+        rsp: 0x8000,
+        ss: USER_DATA_SELECTOR,
+    }
+}
+
+#[test]
+fn dw1b_timer_return_requires_exact_selectors_mappings_and_sanitized_flags() {
+    let mut mappings = Mapping {
+        executable: true,
+        writable_stack: true,
+    };
+    let mut frame = timer_frame();
+    frame.validate_and_sanitize(&mut mappings).unwrap();
+    assert_eq!(frame.rflags, sanitize_user_rflags(u64::MAX));
+
+    for invalid in [0x23, 0x3b] {
+        let mut frame = timer_frame();
+        frame.cs = invalid;
+        assert_eq!(
+            frame.validate_and_sanitize(&mut mappings),
+            Err(UserReturnError::InvalidSelector)
+        );
+    }
+    let mut frame = timer_frame();
+    frame.ss = 0x23;
+    assert_eq!(
+        frame.validate_and_sanitize(&mut mappings),
+        Err(UserReturnError::InvalidSelector)
+    );
+
+    let mut no_execute = Mapping {
+        executable: false,
+        writable_stack: true,
+    };
+    assert_eq!(
+        timer_frame().validate_and_sanitize(&mut no_execute),
+        Err(UserReturnError::InstructionNotExecutable)
+    );
+    let mut no_stack = Mapping {
+        executable: true,
+        writable_stack: false,
+    };
+    assert_eq!(
+        timer_frame().validate_and_sanitize(&mut no_stack),
+        Err(UserReturnError::StackNotWritable)
+    );
 }
 
 #[test]

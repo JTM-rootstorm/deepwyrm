@@ -629,7 +629,9 @@ fn dw1b_matching_expiry_rotates_fifo_and_retains_exact_continuation() {
     );
     assert_eq!(scheduler.suspended_claim_on(cpu(0)), Some(outgoing));
     assert_eq!(scheduler.current_on(cpu(0)), Some(second));
+    assert_eq!(scheduler.counters_on(cpu(0)).involuntary_preemptions, 0);
     scheduler.complete_switch_on(outgoing).unwrap();
+    assert_eq!(scheduler.counters_on(cpu(0)).involuntary_preemptions, 1);
     scheduler.yield_current_on(cpu(0), second).unwrap();
     assert_eq!(scheduler.current_on(cpu(0)), Some(third));
     let counters = scheduler.counters_on(cpu(0));
@@ -682,6 +684,70 @@ fn dw1b_checked_preemption_depth_defers_exact_request() {
         scheduler.preemption_enable_on(cpu(0)),
         Err(SchedulerError::PreemptionDepthUnderflow)
     );
+}
+
+#[test]
+fn dw1b_block_commit_and_terminal_retirement_win_over_pending_expiry() {
+    let scheduler = CooperativeScheduler::<2>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let first = thread_key(&mut registry);
+    let second = thread_key(&mut registry);
+    for thread in [first, second] {
+        scheduler
+            .commit(scheduler.reserve(thread).unwrap())
+            .unwrap();
+    }
+    scheduler.schedule_next_on(cpu(0)).unwrap();
+    let first_claim = scheduler.running_claim_on(cpu(0)).unwrap();
+    let ticket = scheduler.prepare_quantum_on(cpu(0), 1).unwrap();
+    scheduler.publish_quantum_expiry(ticket).unwrap();
+    let block = scheduler.prepare_block_current_on(cpu(0), first).unwrap();
+    assert_eq!(
+        scheduler.preempt_current_on(cpu(0)),
+        Ok(SchedulerPreemptionDecision::Deferred)
+    );
+    let decision = scheduler.commit_block_on(cpu(0), block).unwrap();
+    assert_eq!(decision.current, Some(second));
+    assert!(!scheduler.has_reschedule_request_on(cpu(0)));
+    assert_eq!(scheduler.publish_quantum_expiry(ticket), Ok(false));
+    scheduler.complete_switch_on(first_claim).unwrap();
+
+    let second_claim = scheduler.running_claim_on(cpu(0)).unwrap();
+    let ticket = scheduler.prepare_quantum_on(cpu(0), 2).unwrap();
+    scheduler.publish_quantum_expiry(ticket).unwrap();
+    assert_eq!(scheduler.retire_on(cpu(0), second).unwrap().current, None);
+    assert!(!scheduler.has_reschedule_request_on(cpu(0)));
+    assert_eq!(scheduler.publish_quantum_expiry(ticket), Ok(false));
+    scheduler.complete_switch_on(second_claim).unwrap();
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn dw1b_preemption_snapshot_is_exact_and_kernel_private() {
+    let scheduler = CooperativeScheduler::<1>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let running = thread_key(&mut registry);
+    scheduler
+        .commit(scheduler.reserve(running).unwrap())
+        .unwrap();
+    scheduler.schedule_next_on(cpu(0)).unwrap();
+    let claim = scheduler.running_claim_on(cpu(0));
+    let ticket = scheduler.prepare_quantum_on(cpu(0), 10).unwrap();
+    let armed = scheduler.preemption_snapshot_on(cpu(0));
+    assert_eq!(armed.running, claim);
+    assert_eq!(armed.quantum, Some(ticket));
+    assert_eq!(armed.request, None);
+    assert_eq!(armed.preemption_disable_depth, 0);
+
+    scheduler.preemption_disable_on(cpu(0)).unwrap();
+    scheduler.publish_quantum_expiry(ticket).unwrap();
+    let expired = scheduler.preemption_snapshot_on(cpu(0));
+    assert_eq!(expired.running, claim);
+    assert_eq!(expired.quantum, None);
+    assert_eq!(expired.request, Some(ticket));
+    assert_eq!(expired.preemption_disable_depth, 1);
+    assert_eq!(expired.counters.quantum_expirations, 1);
+    assert_eq!(expired.counters.involuntary_preemptions, 0);
 }
 
 #[test]

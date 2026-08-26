@@ -334,6 +334,73 @@ fn h4_remote_deadline_mutation_notifies_only_the_bsp_timer_service_over_e1() {
 }
 
 #[test]
+fn dw1b_deadline_arbiter_uses_exact_logical_and_physical_generations() {
+    let arbiter = source("src/time/arbiter.rs");
+    for evidence in [
+        "struct LocalDeadlineSource",
+        "generation <= self.last_generation",
+        "struct PhysicalArmSequence",
+        "desired_generation",
+        "pub(crate) const fn is_current",
+        "earliest_deadline",
+    ] {
+        assert!(
+            arbiter.contains(evidence),
+            "DW1-B arbiter omitted `{evidence}`"
+        );
+    }
+
+    let live = source("src/time/live.rs");
+    let reconcile = live
+        .split_once("fn reconcile_bsp_hardware_arm()")
+        .expect("DW1-B hardware reconcile")
+        .1
+        .split_once("fn live_rendezvous_handler()")
+        .expect("DW1-B hardware reconcile extent")
+        .0;
+    let prepare = reconcile
+        .find("state.prepare_hardware_arm(sample)")
+        .expect("prepare physical arm under time-state guard");
+    let program = reconcile
+        .find("program_one_shot_timer")
+        .expect("program LAPIC after dropping time-state guard");
+    let revalidate = reconcile
+        .find("state.hardware_arms.is_current(&intent)")
+        .expect("revalidate physical generation");
+    assert!(prepare < program && program < revalidate);
+    assert_eq!(reconcile.matches("program_one_shot_timer").count(), 1);
+    assert!(live.contains("scheduler_quantum: LocalDeadlineSource"));
+    assert!(live.contains("self.scheduler_quantum.take_due(sample.nanoseconds)"));
+
+    let timer_dispatch = live
+        .split_once("pub(crate) extern \"sysv64\" fn dw_x86_64_timer_interrupt_dispatch()")
+        .expect("DW1-B timer dispatch")
+        .1
+        .split_once("fn read_pm_timer")
+        .expect("DW1-B timer dispatch extent")
+        .0;
+    let irq = timer_dispatch
+        .find("state.interrupt()")
+        .expect("collect due work");
+    let arm = timer_dispatch
+        .find("reconcile_bsp_hardware_arm()")
+        .expect("rearm physical timer");
+    let eoi = timer_dispatch
+        .find("end_of_interrupt")
+        .expect("acknowledge BSP timer");
+    let waits = timer_dispatch
+        .find("if outcome.wake_count != 0")
+        .expect("wait callbacks");
+    let timers = timer_dispatch
+        .find("if outcome.timer_expiry_count != 0")
+        .expect("timer-object callbacks");
+    let quantum = timer_dispatch
+        .find("publish_current_quantum_expiry")
+        .expect("scheduler callback");
+    assert!(irq < arm && arm < eoi && eoi < waits && waits < timers && timers < quantum);
+}
+
+#[test]
 fn h4_idle_publication_brackets_rescan_and_uses_only_coalesced_e1_wake() {
     let idle = source("src/arch/x86_64/idle.rs");
     for evidence in [

@@ -46,8 +46,8 @@ pub(crate) use scheduler::{
     BlockReservation, BlockReservationFailure, BlockToken, BlockWakeKey, CooperativeScheduler,
     DEFAULT_NORMAL_QUANTUM_NS, IdleScheduleDecision, ScheduleDecision, SchedulerCpuId,
     SchedulerError, SchedulerExecutionClaim, SchedulerIdleAccountingToken,
-    SchedulerPreemptionDecision, SchedulerQuantumTicket, SchedulerReservation,
-    SchedulerReservationFailure, SchedulerThreadState,
+    SchedulerPreemptionDecision, SchedulerPreemptionSnapshot, SchedulerQuantumTicket,
+    SchedulerReservation, SchedulerReservationFailure, SchedulerThreadState,
 };
 
 /// Notifies an exact continuation owner, or one eligible remote idle CPU for

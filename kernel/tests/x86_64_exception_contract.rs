@@ -203,8 +203,85 @@ fn f3_timer_interrupt_is_returning_preserves_gprs_and_normalizes_user_gs() {
     assert!(body.contains("testb $3, %al"));
     assert_eq!(body.match_indices("swapgs").count(), 2);
     assert!(body.contains("callq dw_x86_64_timer_interrupt_dispatch"));
+    assert!(body.contains("callq dw_x86_64_timer_pre_iret_gate"));
     assert!(body.contains("iretq"));
     assert!(!body.contains("dw_x86_64_terminal_interrupt_dispatch"));
+
+    let user_origin = body
+        .split_once("jz .Lapic_timer_kernel_origin")
+        .expect("DW1-B CPL3 timer branch")
+        .1
+        .split_once(".Lapic_timer_kernel_origin:")
+        .expect("DW1-B kernel-origin timer branch")
+        .0;
+    let dispatch = user_origin
+        .find("callq dw_x86_64_timer_interrupt_dispatch")
+        .expect("CPL3 timer dispatch");
+    let gate = user_origin
+        .find("callq dw_x86_64_timer_pre_iret_gate")
+        .expect("CPL3 pre-IRET gate");
+    let second_swapgs = user_origin.rfind("swapgs").expect("CPL3 return swapgs");
+    assert!(dispatch < gate && gate < second_swapgs);
+
+    let kernel_origin = body
+        .split_once(".Lapic_timer_kernel_origin:")
+        .expect("DW1-B kernel-origin timer branch")
+        .1
+        .split_once(".Lapic_timer_restore:")
+        .expect("DW1-B timer restore")
+        .0;
+    assert!(kernel_origin.contains("callq dw_x86_64_timer_interrupt_dispatch"));
+    assert!(!kernel_origin.contains("dw_x86_64_timer_pre_iret_gate"));
+
+    for exact_offset in [
+        ".equ DW_TIMER_FRAME_SIZE, 160",
+        ".equ DW_TIMER_FRAME_R15, 0",
+        ".equ DW_TIMER_FRAME_RAX, 112",
+        ".equ DW_TIMER_FRAME_RIP, 120",
+        ".equ DW_TIMER_FRAME_CS, 128",
+        ".equ DW_TIMER_FRAME_RFLAGS, 136",
+        ".equ DW_TIMER_FRAME_RSP, 144",
+        ".equ DW_TIMER_FRAME_SS, 152",
+    ] {
+        assert!(assembly.contains(exact_offset), "missing {exact_offset}");
+    }
+}
+
+#[test]
+fn dw1b_timer_return_validation_is_fail_closed_before_resume_or_rearm() {
+    let live = source("src/arch/x86_64/syscall/live.rs");
+    let gate = live
+        .split_once("unsafe fn native_runtime_timer_pre_iret")
+        .expect("DW1-B timer pre-IRET handler")
+        .1
+        .split_once("pub(crate) unsafe extern \"sysv64\" fn dw_x86_64_timer_pre_iret_gate")
+        .expect("DW1-B timer pre-IRET handler extent")
+        .0;
+    let validate = gate
+        .find("runtime.authorize_timer_return(frame)")
+        .expect("validate interrupted CPL3 return frame");
+    let stop = gate
+        .find("poll_timer_return_stop(context)")
+        .expect("remote Stop precedence poll");
+    let prepare = gate
+        .find("runtime.prepare_preemption()")
+        .expect("prepare preemptive switch");
+    let resume = gate
+        .find("runtime.resume_timer_preemption(frame)")
+        .expect("resume selected timer continuation");
+    let rearm = gate
+        .find("arm_current_normal_quantum()")
+        .expect("arm fresh selected-thread quantum");
+    assert!(stop < validate && validate < prepare && prepare < resume && resume < rearm);
+    assert!(gate.contains("poll_timer_return_stop(context)"));
+    assert!(gate.contains("runtime.has_reschedule_request()"));
+
+    let frame = source("src/arch/x86_64/syscall/frame.rs");
+    assert!(frame.contains("pub(crate) struct RawCpl3TimerReturnFrame"));
+    assert!(frame.contains("size_of::<RawCpl3TimerReturnFrame>() == 160"));
+    assert!(frame.contains("self.cs != USER_CODE_SELECTOR"));
+    assert!(frame.contains("self.ss != USER_DATA_SELECTOR"));
+    assert!(frame.contains("sanitize_user_rflags(self.rflags)"));
 }
 
 #[test]

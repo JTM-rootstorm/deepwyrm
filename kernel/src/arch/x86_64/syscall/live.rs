@@ -6,6 +6,7 @@ use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU8, Ordering};
 
+use crate::cpu::CpuIndex;
 use crate::memory::kernel_stack::KernelStackBounds;
 
 use super::frame::{PerCpuEntryState, RawSyscallFrame, ValidatedUserReturn};
@@ -105,6 +106,9 @@ type UserExceptionRuntimeHandler =
     unsafe fn(*mut (), crate::arch::x86_64::exceptions::UserExceptionRecord) -> !;
 type RendezvousGateHandler = unsafe fn(*mut ()) -> u8;
 type RendezvousReaperHandler = unsafe fn(*mut ()) -> !;
+type QuantumExpiryHandler = unsafe fn(*mut (), crate::task::SchedulerQuantumTicket) -> bool;
+type PrepareQuantumHandler = unsafe fn(*mut (), u64) -> crate::task::SchedulerQuantumTicket;
+type TimerPreIretHandler = unsafe fn(*mut (), &mut super::frame::RawCpl3TimerReturnFrame);
 
 #[derive(Clone, Copy)]
 struct RuntimeBindingState {
@@ -115,6 +119,9 @@ struct RuntimeBindingState {
     user_exception_handler: UserExceptionRuntimeHandler,
     rendezvous_gate_handler: RendezvousGateHandler,
     rendezvous_reaper_handler: RendezvousReaperHandler,
+    quantum_expiry_handler: QuantumExpiryHandler,
+    prepare_quantum_handler: PrepareQuantumHandler,
+    timer_pre_iret_handler: TimerPreIretHandler,
 }
 
 struct RuntimeStorage(UnsafeCell<MaybeUninit<RuntimeBindingState>>);
@@ -771,6 +778,9 @@ pub(crate) unsafe fn bind_native_runtime_carrier_for_slot<
             native_runtime_user_exception::<R>,
             native_runtime_rendezvous_gate::<R>,
             native_runtime_rendezvous_reaper::<R>,
+            native_runtime_quantum_expiry::<R>,
+            native_runtime_prepare_quantum::<R>,
+            native_runtime_timer_pre_iret::<R>,
         )
     }?;
     RUNTIME_CARRIER_LIFECYCLES
@@ -827,6 +837,9 @@ unsafe fn publish_syscall_runtime(
     user_exception_handler: UserExceptionRuntimeHandler,
     rendezvous_gate_handler: RendezvousGateHandler,
     rendezvous_reaper_handler: RendezvousReaperHandler,
+    quantum_expiry_handler: QuantumExpiryHandler,
+    prepare_quantum_handler: PrepareQuantumHandler,
+    timer_pre_iret_handler: TimerPreIretHandler,
 ) -> Result<(), SyscallRuntimeBindError> {
     let state = RUNTIME_STATE
         .get(cpu_index)
@@ -865,6 +878,9 @@ unsafe fn publish_syscall_runtime(
             user_exception_handler,
             rendezvous_gate_handler,
             rendezvous_reaper_handler,
+            quantum_expiry_handler,
+            prepare_quantum_handler,
+            timer_pre_iret_handler,
         });
     }
     state.store(RUNTIME_BOUND, Ordering::Release);
@@ -1025,6 +1041,136 @@ pub(crate) extern "sysv64" fn dw_x86_64_rendezvous_pre_iret_gate() -> u8 {
 pub(crate) extern "sysv64" fn dw_x86_64_rendezvous_reaper() -> ! {
     let binding = runtime_binding().unwrap_or_else(|| halt_forever());
     unsafe { (binding.rendezvous_reaper_handler)(binding.context) }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the interrupt dispatcher invokes only the immutable CPU-local carrier callback with an exact scheduler ticket"
+)]
+unsafe fn native_runtime_quantum_expiry<R: crate::syscall::native::NativeSyscallFrameRuntime>(
+    context: *mut (),
+    ticket: crate::task::SchedulerQuantumTicket,
+) -> bool {
+    let runtime = unsafe { &mut *context.cast::<R>() };
+    runtime
+        .publish_quantum_expiry(ticket)
+        .unwrap_or_else(|_| halt_forever())
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the guard-free quantum-arm seam briefly reborrows the current CPU's unique carrier"
+)]
+unsafe fn native_runtime_prepare_quantum<R: crate::syscall::native::NativeSyscallFrameRuntime>(
+    context: *mut (),
+    now_ns: u64,
+) -> crate::task::SchedulerQuantumTicket {
+    let runtime = unsafe { &mut *context.cast::<R>() };
+    runtime
+        .prepare_quantum(now_ns)
+        .unwrap_or_else(|_| halt_forever())
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the immutable CPU-local binding pairs the exact ticket with its monomorphized runtime callback"
+)]
+pub(crate) fn publish_current_quantum_expiry(
+    ticket: crate::task::SchedulerQuantumTicket,
+) -> Result<bool, ()> {
+    let binding = runtime_binding().ok_or(())?;
+    Ok(unsafe { (binding.quantum_expiry_handler)(binding.context, ticket) })
+}
+
+/// Begins a fresh exact quantum only after all runtime/scheduler guards have
+/// been released. The time service performs LAPIC MMIO through its own
+/// guard-free prepare/program/revalidate sequence.
+#[allow(
+    unsafe_code,
+    reason = "the immutable CPU-local binding briefly reborrows its unique carrier to mint one exact scheduler ticket"
+)]
+fn arm_current_normal_quantum() {
+    if current_cpu_index_for_diagnostics() != Some(CpuIndex::BOOTSTRAP.index()) {
+        return;
+    }
+    let binding = runtime_binding().unwrap_or_else(|| halt_forever());
+    let now_ns = crate::time::monotonic_now().unwrap_or_else(|_| halt_forever());
+    let ticket = unsafe { (binding.prepare_quantum_handler)(binding.context, now_ns) };
+    crate::time::arm_scheduler_quantum(ticket).unwrap_or_else(|_| halt_forever());
+}
+
+fn poll_timer_return_stop(context: *mut ()) {
+    match crate::arch::x86_64::idle::take_current_notification_at_safe_point() {
+        crate::arch::x86_64::rendezvous::MailboxNotification::None
+        | crate::arch::x86_64::rendezvous::MailboxNotification::Wake
+        | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {}
+        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request) => {
+            stage_rendezvous_action(RendezvousAction(request)).unwrap_or_else(|_| halt_forever());
+            handoff_to_rendezvous_reaper(context);
+        }
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the timer frame remains on the current Thread's bound stack while the lifetime-branded switch plan is consumed immediately"
+)]
+unsafe fn native_runtime_timer_pre_iret<
+    R: crate::syscall::native::NativeSyscallFrameRuntime
+        + crate::syscall::native::NativeRendezvousRuntime,
+>(
+    mut context: *mut (),
+    frame: &mut super::frame::RawCpl3TimerReturnFrame,
+) {
+    poll_timer_return_stop(context);
+    {
+        let runtime = unsafe { &mut *context.cast::<R>() };
+        if let Err(error) = runtime.authorize_timer_return(frame) {
+            invalid_bound_return::<R>(context, error);
+        }
+    }
+    let has_request = {
+        let runtime = unsafe { &mut *context.cast::<R>() };
+        runtime.has_reschedule_request()
+    };
+    if has_request {
+        let plan = {
+            let runtime = unsafe { &mut *context.cast::<R>() };
+            unsafe { runtime.prepare_preemption() }
+        };
+        match plan {
+            crate::syscall::native::NativePreemptionPlan::Return => {}
+            crate::syscall::native::NativePreemptionPlan::Switch(plan) => {
+                switch_kernel_context(plan);
+                context = current_runtime_context::<R>().unwrap_or_else(|| halt_forever());
+                poll_timer_return_stop(context);
+                let runtime = unsafe { &mut *context.cast::<R>() };
+                if let Err(error) = runtime.resume_timer_preemption(frame) {
+                    invalid_bound_return::<R>(context, error);
+                }
+            }
+        }
+    }
+    poll_timer_return_stop(context);
+    arm_current_normal_quantum();
+}
+
+/// Fixed assembly seam for CPL3-origin Local APIC timer return. Returning from
+/// this function means the retained frame was revalidated for the exact
+/// scheduler-current Thread and owns a fresh quantum source.
+#[allow(
+    unsafe_code,
+    reason = "the audited assembly supplies the complete in-place 160-byte timer frame"
+)]
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "sysv64" fn dw_x86_64_timer_pre_iret_gate(
+    frame: *mut super::frame::RawCpl3TimerReturnFrame,
+) {
+    if frame.is_null() || (frame as usize) & 7 != 0 {
+        halt_forever();
+    }
+    let binding = runtime_binding().unwrap_or_else(|| halt_forever());
+    unsafe { (binding.timer_pre_iret_handler)(binding.context, &mut *frame) }
 }
 
 #[allow(
@@ -1454,6 +1600,46 @@ unsafe fn native_runtime_trampoline<
         crate::syscall::native::SyscallControl::CompleteRemoteStop => halt_forever(),
         crate::syscall::native::SyscallControl::ServiceRendezvous => halt_forever(),
     }
+    service_syscall_return_preemption::<R>(&mut context, frame);
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the authorized raw syscall frame remains on its Thread-owned stack while an exact lifetime-branded preemption plan is consumed"
+)]
+fn service_syscall_return_preemption<
+    R: crate::syscall::native::NativeSyscallFrameRuntime
+        + crate::syscall::native::NativeRendezvousRuntime,
+>(
+    context: &mut *mut (),
+    frame: &mut RawSyscallFrame,
+) {
+    poll_timer_return_stop(*context);
+    let has_request = {
+        let runtime = unsafe { &mut *(*context).cast::<R>() };
+        runtime.has_reschedule_request()
+    };
+    if has_request {
+        let plan = {
+            let runtime = unsafe { &mut *(*context).cast::<R>() };
+            unsafe { runtime.prepare_preemption() }
+        };
+        if let crate::syscall::native::NativePreemptionPlan::Switch(plan) = plan {
+            switch_kernel_context(plan);
+            *context = current_runtime_context::<R>().unwrap_or_else(|| halt_forever());
+            poll_timer_return_stop(*context);
+            let generation = current_binding_generation();
+            if let Err(error) = frame.rebind_after_kernel_resume(generation) {
+                invalid_bound_return::<R>(*context, error);
+            }
+            let runtime = unsafe { &mut *(*context).cast::<R>() };
+            if let Err(error) = runtime.resume_syscall_preemption(frame, generation) {
+                invalid_bound_return::<R>(*context, error);
+            }
+        }
+    }
+    poll_timer_return_stop(*context);
+    arm_current_normal_quantum();
 }
 
 #[allow(
@@ -1569,6 +1755,7 @@ unsafe fn iret_validated_user(state: &ValidatedUserReturn) -> ! {
     unsafe extern "sysv64" {
         fn dw_x86_64_iret_to_user(state: *const super::frame::RawUserReturnContext) -> !;
     }
+    arm_current_normal_quantum();
     unsafe { dw_x86_64_iret_to_user(state.raw()) }
 }
 
@@ -1632,6 +1819,9 @@ impl<
                 native_runtime_user_exception::<R>,
                 native_runtime_rendezvous_gate::<R>,
                 native_runtime_rendezvous_reaper::<R>,
+                native_runtime_quantum_expiry::<R>,
+                native_runtime_prepare_quantum::<R>,
+                native_runtime_timer_pre_iret::<R>,
             )
         }
         .unwrap_or_else(|_| halt_forever());

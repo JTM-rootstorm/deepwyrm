@@ -102,6 +102,14 @@ NO_ERROR 31
     ud2
 
 .p2align 4
+.equ DW_TIMER_FRAME_SIZE, 160
+.equ DW_TIMER_FRAME_R15, 0
+.equ DW_TIMER_FRAME_RAX, 112
+.equ DW_TIMER_FRAME_RIP, 120
+.equ DW_TIMER_FRAME_CS, 128
+.equ DW_TIMER_FRAME_RFLAGS, 136
+.equ DW_TIMER_FRAME_RSP, 144
+.equ DW_TIMER_FRAME_SS, 152
 .globl dw_x86_64_apic_timer_entry
 .type dw_x86_64_apic_timer_entry,@function
 dw_x86_64_apic_timer_entry:
@@ -130,6 +138,10 @@ dw_x86_64_apic_timer_entry:
     movq %rsp, %r12
     andq $-16, %rsp
     callq dw_x86_64_timer_interrupt_dispatch
+    movq %r12, %rsp
+    movq %rsp, %rdi
+    andq $-16, %rsp
+    callq dw_x86_64_timer_pre_iret_gate
     movq %r12, %rsp
     swapgs
     jmp .Lapic_timer_restore

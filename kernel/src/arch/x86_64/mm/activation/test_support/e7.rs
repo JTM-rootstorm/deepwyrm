@@ -726,6 +726,7 @@ fn enter_smoke<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
                 crate::arch::x86_64::syscall::UserReturnError::NonCanonicalUserAddress => {
                     fail(0xb5)
                 }
+                crate::arch::x86_64::syscall::UserReturnError::InvalidSelector => fail(0xbb),
                 crate::arch::x86_64::syscall::UserReturnError::InstructionNotExecutable => {
                     fail(0xb6)
                 }

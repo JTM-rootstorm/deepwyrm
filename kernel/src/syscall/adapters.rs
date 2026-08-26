@@ -5067,6 +5067,7 @@ fn user_return_status(error: crate::arch::x86_64::syscall::UserReturnError) -> D
     use crate::arch::x86_64::syscall::UserReturnError;
     match error {
         UserReturnError::NonCanonicalUserAddress
+        | UserReturnError::InvalidSelector
         | UserReturnError::InstructionNotExecutable
         | UserReturnError::StackNotWritable => DW_STATUS_BAD_ADDRESS,
         UserReturnError::UnsupportedTlsPolicy | UserReturnError::UnsupportedFpSimdPolicy => {

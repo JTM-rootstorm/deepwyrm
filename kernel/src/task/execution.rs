@@ -671,6 +671,13 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         self.scheduler.has_reschedule_request_on(cpu)
     }
 
+    pub(crate) fn preemption_snapshot_on(
+        &self,
+        cpu: SchedulerCpuId,
+    ) -> super::SchedulerPreemptionSnapshot {
+        self.scheduler.preemption_snapshot_on(cpu)
+    }
+
     pub(crate) fn preempt_current_on(
         &self,
         cpu: SchedulerCpuId,
@@ -1317,6 +1324,37 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                 Some(cpu),
                 decision,
                 false,
+                Some(trusted_first_run_entry),
+            )
+        }
+    }
+
+    /// Builds the DW1-B involuntary switch plan. Unlike a blocked switch, the
+    /// outgoing Thread is already Runnable at the local FIFO tail and retains
+    /// exact continuation ownership until destination arrival publishes it.
+    #[allow(
+        unsafe_code,
+        reason = "the timer/syscall safe-boundary caller proves the physically active CPU and fixed first-run entry"
+    )]
+    pub(crate) unsafe fn prepare_preemptive_kernel_switch_on<
+        'owner,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &'owner self,
+        tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        cpu: SchedulerCpuId,
+        decision: super::ScheduleDecision,
+        trusted_first_run_entry: u64,
+    ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan<'owner>, ExecutionSwitchError> {
+        unsafe {
+            self.prepare_kernel_switch_inner(
+                tasks,
+                Some(cpu),
+                decision,
+                true,
                 Some(trusted_first_run_entry),
             )
         }

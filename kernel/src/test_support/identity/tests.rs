@@ -92,6 +92,11 @@ fn implemented_central_selectors_have_exact_kernel_identities() {
             BuildGuestTest::PermanentSupervisorRrc,
             25,
         ),
+        (
+            "normal-preemption-up",
+            BuildGuestTest::NormalPreemptionUp,
+            26,
+        ),
     ];
     for (selector, identity, id) in cases {
         assert_eq!(parse_known_selector(selector), identity);
@@ -132,6 +137,7 @@ fn only_expected_invalid_opcode_is_classified_as_fail() {
         (BuildGuestTest::PrimordialInvalidReturn, 6),
         (BuildGuestTest::NativeUserspaceCapability, 6),
         (BuildGuestTest::PermanentSupervisorRrc, 6),
+        (BuildGuestTest::NormalPreemptionUp, 6),
     ] {
         assert_eq!(
             exception_outcome_for(test, vector),

@@ -101,6 +101,17 @@ pub(crate) enum SchedulerPreemptionDecision {
     },
 }
 
+/// Exact internal snapshot consumed by selector-26 evidence integration after
+/// its cross-repository wire is frozen. This is kernel-private and not ABI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SchedulerPreemptionSnapshot {
+    pub(crate) running: Option<SchedulerExecutionClaim>,
+    pub(crate) quantum: Option<SchedulerQuantumTicket>,
+    pub(crate) request: Option<SchedulerQuantumTicket>,
+    pub(crate) preemption_disable_depth: u32,
+    pub(crate) counters: SchedulerCounters,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SchedulerThreadState {
     Reserved,
@@ -482,6 +493,7 @@ struct SuspendedContinuation {
     thread: ThreadKey,
     generation: u64,
     publication: SuspendedPublication,
+    involuntary_preemption: bool,
 }
 
 struct SchedulerState<const CAPACITY: usize> {
@@ -1153,6 +1165,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             thread,
             generation: previous_claim.generation,
             publication: SuspendedPublication::Queued,
+            involuntary_preemption: false,
         });
         state.next_enqueue_generation = next_enqueue_generation;
         state.accounting = accounting;
@@ -1257,6 +1270,25 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         self.state.lock().need_resched[cpu.index()].is_some()
     }
 
+    pub(crate) fn preemption_snapshot_on(
+        &self,
+        cpu: SchedulerCpuId,
+    ) -> SchedulerPreemptionSnapshot {
+        let state = self.state.lock();
+        SchedulerPreemptionSnapshot {
+            running: state.running[cpu.index()].map(|claim| SchedulerExecutionClaim {
+                domain: state.domain,
+                cpu,
+                thread: claim.thread,
+                generation: claim.generation,
+            }),
+            quantum: state.quantum[cpu.index()],
+            request: state.need_resched[cpu.index()],
+            preemption_disable_depth: state.preemption_disable_depth[cpu.index()],
+            counters: state.accounting.cpu[cpu.index()],
+        }
+    }
+
     pub(crate) fn preemption_disable_on(&self, cpu: SchedulerCpuId) -> Result<(), SchedulerError> {
         let mut state = self.state.lock();
         state.preemption_disable_depth[cpu.index()] = state.preemption_disable_depth[cpu.index()]
@@ -1328,7 +1360,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 )
             })
             .and_then(|()| accounting.increment_runnable(cpu))
-            .and_then(|()| accounting.increment(cpu, SchedulerEvent::InvoluntaryPreemption))
             .and_then(|()| accounting.increment(cpu, SchedulerEvent::ContextSwitch));
         if let Err(error) = accounting_result {
             state.reject_accounting(accounting, error);
@@ -1357,6 +1388,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             thread: current.thread,
             generation: current.generation,
             publication: SuspendedPublication::Queued,
+            involuntary_preemption: true,
         });
         state.next_enqueue_generation = next_enqueue_generation;
         state.need_resched[cpu_index] = None;
@@ -1530,6 +1562,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             thread: reservation.key.thread,
             generation: reservation.key.execution_generation,
             publication: SuspendedPublication::Queued,
+            involuntary_preemption: false,
         });
         state.accounting = accounting;
         state.record_trace(
@@ -1794,6 +1827,16 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         } else {
             false
         };
+        if suspended.involuntary_preemption {
+            let mut accounting = state.accounting;
+            if let Err(error) =
+                accounting.increment(claim.cpu, SchedulerEvent::InvoluntaryPreemption)
+            {
+                state.reject_accounting(accounting, error);
+                return Err(error);
+            }
+            state.accounting = accounting;
+        }
         state.suspended[cpu_index] = None;
         state.assert_invariants();
         Ok(published_runnable)
@@ -1851,6 +1894,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 thread,
                 generation: outgoing.generation,
                 publication: SuspendedPublication::Retired,
+                involuntary_preemption: false,
             });
             state.accounting = accounting;
             state.record_trace(
@@ -1932,6 +1976,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 thread,
                 generation: suspended_generation,
                 publication: SuspendedPublication::Retired,
+                involuntary_preemption: false,
             });
             if state.running[cpu_index].is_none() {
                 state.running[cpu_index] = state.claim_first_runnable()?;
@@ -2021,6 +2066,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             thread: claim.thread,
             generation: claim.generation,
             publication: SuspendedPublication::Retired,
+            involuntary_preemption: false,
         });
         state.accounting = accounting;
         state.record_trace(
@@ -2080,6 +2126,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             thread: claim.thread,
             generation: claim.generation,
             publication: SuspendedPublication::Retired,
+            involuntary_preemption: false,
         });
         state.accounting = accounting;
         state.record_trace(

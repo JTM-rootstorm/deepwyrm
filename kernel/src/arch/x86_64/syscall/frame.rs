@@ -59,12 +59,60 @@ pub(crate) trait ProcessUserReturnMappingValidation: UserReturnMappingValidation
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UserReturnError {
     NonCanonicalUserAddress,
+    InvalidSelector,
     InstructionNotExecutable,
     StackNotWritable,
     UnsupportedTlsPolicy,
     UnsupportedFpSimdPolicy,
     BindingChanged,
 }
+
+pub(crate) const USER_CODE_SELECTOR: u64 = 0x33;
+pub(crate) const USER_DATA_SELECTOR: u64 = 0x2b;
+
+/// Complete CPL3-origin Local APIC timer stack image. It remains in place on
+/// the interrupted Thread's owned kernel stack across a preemptive switch.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RawCpl3TimerReturnFrame {
+    pub(crate) r15: u64,
+    pub(crate) r14: u64,
+    pub(crate) r13: u64,
+    pub(crate) r12: u64,
+    pub(crate) r11: u64,
+    pub(crate) r10: u64,
+    pub(crate) r9: u64,
+    pub(crate) r8: u64,
+    pub(crate) rbp: u64,
+    pub(crate) rdi: u64,
+    pub(crate) rsi: u64,
+    pub(crate) rdx: u64,
+    pub(crate) rcx: u64,
+    pub(crate) rbx: u64,
+    pub(crate) rax: u64,
+    pub(crate) rip: u64,
+    pub(crate) cs: u64,
+    pub(crate) rflags: u64,
+    pub(crate) rsp: u64,
+    pub(crate) ss: u64,
+}
+
+impl RawCpl3TimerReturnFrame {
+    pub(crate) fn validate_and_sanitize<M: UserReturnMappingValidation>(
+        &mut self,
+        mappings: &mut M,
+    ) -> Result<(), UserReturnError> {
+        if self.cs != USER_CODE_SELECTOR || self.ss != USER_DATA_SELECTOR {
+            return Err(UserReturnError::InvalidSelector);
+        }
+        validate_return_mapping(self.rip, self.rsp, mappings)?;
+        self.rflags = sanitize_user_rflags(self.rflags);
+        Ok(())
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<RawCpl3TimerReturnFrame>() == 160);
+const _: () = assert!(core::mem::align_of::<RawCpl3TimerReturnFrame>() == 8);
 
 pub(crate) const fn sanitize_user_rflags(saved: u64) -> u64 {
     (saved & SAFE_USER_RFLAGS_MASK) | REQUIRED_USER_RFLAGS

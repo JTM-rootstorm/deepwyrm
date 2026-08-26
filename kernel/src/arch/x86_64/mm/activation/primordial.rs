@@ -272,6 +272,7 @@ impl G5PrimordialProbe {
             BuildGuestTest::SmpRuntimeAcceptance => G5PrimordialExpectation::Baseline,
             BuildGuestTest::NativeUserspaceCapability => G5PrimordialExpectation::Baseline,
             BuildGuestTest::PermanentSupervisorRrc => G5PrimordialExpectation::Baseline,
+            BuildGuestTest::NormalPreemptionUp => G5PrimordialExpectation::Baseline,
             BuildGuestTest::PrimordialBlockingCleanup => G5PrimordialExpectation::BlockingCleanup,
             BuildGuestTest::PrimordialUserException => G5PrimordialExpectation::UserException,
             BuildGuestTest::PrimordialInvalidReturn => G5PrimordialExpectation::InvalidReturn,
@@ -1577,6 +1578,41 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             ),
         );
         plan
+    }
+
+    unsafe fn prepare_preemption_stationary(
+        &mut self,
+    ) -> crate::syscall::native::NativePreemptionPlan<'static> {
+        self.assert_guard_free_external_work();
+        match self
+            .shared
+            .execution
+            .preempt_current_on(self.cpu)
+            .unwrap_or_else(|error| panic!("DW1-B scheduler decision drifted: {error:?}"))
+        {
+            crate::task::SchedulerPreemptionDecision::Deferred => {
+                panic!("DW1-B CPL3 return reached with preemption still disabled")
+            }
+            crate::task::SchedulerPreemptionDecision::RetainCurrent => {
+                crate::syscall::native::NativePreemptionPlan::Return
+            }
+            crate::task::SchedulerPreemptionDecision::Switch { decision, outgoing } => {
+                debug_assert_eq!(
+                    self.shared.execution.suspended_claim_on(self.cpu),
+                    Some(outgoing)
+                );
+                let plan = unsafe {
+                    self.shared.execution.prepare_preemptive_kernel_switch_on(
+                        &self.tasks,
+                        self.cpu,
+                        decision,
+                        crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
+                    )
+                }
+                .unwrap_or_else(|error| panic!("DW1-B switch preparation drifted: {error:?}"));
+                crate::syscall::native::NativePreemptionPlan::Switch(plan)
+            }
+        }
     }
 
     unsafe fn poll_idle_suspend_stationary(
@@ -3183,6 +3219,66 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrameRuntime
     for PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
+    fn publish_quantum_expiry(
+        &mut self,
+        ticket: crate::task::SchedulerQuantumTicket,
+    ) -> Result<bool, crate::task::SchedulerError> {
+        self.shared.execution.publish_quantum_expiry(ticket)
+    }
+
+    fn prepare_quantum(
+        &mut self,
+        now_ns: u64,
+    ) -> Result<crate::task::SchedulerQuantumTicket, crate::task::SchedulerError> {
+        self.shared.execution.prepare_quantum_on(self.cpu, now_ns)
+    }
+
+    fn has_reschedule_request(&mut self) -> bool {
+        self.shared.execution.has_reschedule_request_on(self.cpu)
+    }
+
+    fn authorize_timer_return(
+        &mut self,
+        frame: &mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
+    ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
+        if self.cpu != crate::cpu::CpuIndex::BOOTSTRAP
+            || self.tasks.thread_process(self.thread) != Ok(self.process)
+            || self.shared.execution.current_thread_on(self.cpu) != Some(self.thread)
+        {
+            return Err(crate::arch::x86_64::syscall::UserReturnError::BindingChanged);
+        }
+        let mut mappings = self.active.current_process_address_space(
+            self.active_root.as_ref().expect("active root"),
+            self.process,
+        );
+        frame.validate_and_sanitize(&mut mappings)
+    }
+
+    unsafe fn prepare_preemption<'owner>(
+        &'owner mut self,
+    ) -> crate::syscall::native::NativePreemptionPlan<'owner> {
+        unsafe { self.prepare_preemption_stationary() }
+    }
+
+    fn resume_timer_preemption(
+        &mut self,
+        frame: &mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
+    ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
+        self.complete_physical_switch_handoff();
+        self.synchronize_scheduler_current();
+        self.authorize_timer_return(frame)
+    }
+
+    fn resume_syscall_preemption(
+        &mut self,
+        frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+        current_binding_generation: u64,
+    ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
+        self.complete_physical_switch_handoff();
+        self.synchronize_scheduler_current();
+        self.authorize_return(frame, current_binding_generation)
+    }
+
     #[cfg(deepwyrm_wyr1_evidence)]
     fn intercept_wyr1_evidence_raw(
         &mut self,
@@ -3537,6 +3633,66 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrameRuntime
     for RuntimeCarrierFacade<'_, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>
 {
+    fn publish_quantum_expiry(
+        &mut self,
+        ticket: crate::task::SchedulerQuantumTicket,
+    ) -> Result<bool, crate::task::SchedulerError> {
+        let mut runtime = self.runtime.lock();
+        runtime.select_cpu(self.cpu);
+        runtime.publish_quantum_expiry(ticket)
+    }
+
+    fn prepare_quantum(
+        &mut self,
+        now_ns: u64,
+    ) -> Result<crate::task::SchedulerQuantumTicket, crate::task::SchedulerError> {
+        let mut runtime = self.runtime.lock();
+        runtime.select_cpu(self.cpu);
+        runtime.prepare_quantum(now_ns)
+    }
+
+    fn has_reschedule_request(&mut self) -> bool {
+        let mut runtime = self.runtime.lock();
+        runtime.select_cpu(self.cpu);
+        runtime.has_reschedule_request()
+    }
+
+    fn authorize_timer_return(
+        &mut self,
+        frame: &mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
+    ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
+        let mut runtime = self.runtime.lock();
+        runtime.select_cpu(self.cpu);
+        runtime.authorize_timer_return(frame)
+    }
+
+    unsafe fn prepare_preemption<'owner>(
+        &'owner mut self,
+    ) -> crate::syscall::native::NativePreemptionPlan<'owner> {
+        let mut runtime = self.runtime.lock();
+        runtime.switch_cpu(self.cpu);
+        unsafe { runtime.prepare_preemption_stationary() }
+    }
+
+    fn resume_timer_preemption(
+        &mut self,
+        frame: &mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
+    ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
+        let mut runtime = self.runtime.lock();
+        runtime.switch_cpu(self.cpu);
+        runtime.resume_timer_preemption(frame)
+    }
+
+    fn resume_syscall_preemption(
+        &mut self,
+        frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+        current_binding_generation: u64,
+    ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
+        let mut runtime = self.runtime.lock();
+        runtime.switch_cpu(self.cpu);
+        runtime.resume_syscall_preemption(frame, current_binding_generation)
+    }
+
     #[cfg(deepwyrm_wyr1_evidence)]
     fn intercept_wyr1_evidence_raw(
         &mut self,
@@ -3922,6 +4078,7 @@ const fn invalid_user_return_detail(error: crate::arch::x86_64::syscall::UserRet
     use crate::arch::x86_64::syscall::UserReturnError;
     match error {
         UserReturnError::NonCanonicalUserAddress => 1,
+        UserReturnError::InvalidSelector => 7,
         UserReturnError::InstructionNotExecutable => 2,
         UserReturnError::StackNotWritable => 3,
         UserReturnError::UnsupportedTlsPolicy => 4,

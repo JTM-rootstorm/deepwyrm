@@ -103,6 +103,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_i2_stress)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wrcap_relay)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1_evidence)");
+    println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1b_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_integrated)");
     println!("cargo:rustc-cfg=deepwyrm_integrated");
 
@@ -172,6 +173,13 @@ fn run() -> Result<(), String> {
         .is_some_and(is_wyr1_evidence_selector)
     {
         println!("cargo:rustc-cfg=deepwyrm_wyr1_evidence");
+    }
+    if env::var("DEEPWYRM_GUEST_TEST_SELECTOR")
+        .ok()
+        .as_deref()
+        .is_some_and(is_dw1b_evidence_selector)
+    {
+        println!("cargo:rustc-cfg=deepwyrm_dw1b_evidence");
     }
 
     if required_env("TARGET")? != KERNEL_TARGET {
@@ -302,6 +310,10 @@ fn is_wrcap_relay_selector(selector: &str) -> bool {
 
 fn is_wyr1_evidence_selector(selector: &str) -> bool {
     selector == "permanent-supervisor-rrc"
+}
+
+fn is_dw1b_evidence_selector(selector: &str) -> bool {
+    selector == "normal-preemption-up"
 }
 
 fn emit_e7_user_env(elf: &Path) {
@@ -2000,6 +2012,14 @@ mod tests {
         assert!(validate_wyr1_evidence_scenario("normal").is_ok());
         assert!(validate_wyr1_evidence_scenario("degraded_recovery").is_ok());
         assert!(validate_wyr1_evidence_scenario("degraded").is_err());
+    }
+
+    #[test]
+    fn dw1b_selector_cfg_is_exact_but_manifest_identity_remains_reserved() {
+        assert!(is_dw1b_evidence_selector("normal-preemption-up"));
+        assert!(!is_dw1b_evidence_selector("permanent-supervisor-rrc"));
+        let manifest = include_str!("../tooling/guest-harness.toml");
+        assert!(select_guest_test(true, Some("normal-preemption-up"), false, manifest).is_err());
     }
 
     #[test]
