@@ -537,7 +537,7 @@ fn g3_primordial_mapping_failures_remain_recoverable_and_rollback_owned_candidat
         )
     );
     assert!(primordial.contains(
-        "#[cfg(deepwyrm_wyr1_evidence)]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 41;"
+        "#[cfg(deepwyrm_wyr1_evidence)]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 42;"
     ));
     assert!(primordial.contains("PRIMORDIAL_MAX_MAPPING_PAGES + PRIMORDIAL_TABLE_CANDIDATES"));
     assert!(primordial.contains("PRIMORDIAL_INVALIDATIONS: usize = PRIMORDIAL_MAX_MAPPING_PAGES"));
@@ -563,13 +563,13 @@ fn wyr1_bootfs_capacity_owns_the_page_ceiling_without_recursive_media_identity()
     let primordial =
         fs::read_to_string(kernel_root().join("src/arch/x86_64/mm/activation/primordial.rs"))
             .expect("read primordial runtime source");
-    assert!(primordial.contains("const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 41;"));
-    assert!(primordial.contains("166,784 bytes (41 pages)"));
-    assert!(primordial.contains("166,184 bytes (41 pages)"));
+    assert!(primordial.contains("const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 42;"));
+    assert!(primordial.contains("170,496 bytes (42 pages)"));
+    assert!(primordial.contains("169,896 bytes (42 pages)"));
     assert!(primordial.contains("Deepwyrm owns this page ceiling and its rejection"));
     assert!(primordial.contains("Content hashes belong to receipt/root evidence"));
-    assert!(primordial.contains("wyr1_bootfs_page_count(41 * 4096), Some(41)"));
-    assert!(primordial.contains("wyr1_bootfs_page_count(41 * 4096 + 1), Some(42)"));
+    assert!(primordial.contains("wyr1_bootfs_page_count(42 * 4096), Some(42)"));
+    assert!(primordial.contains("wyr1_bootfs_page_count(42 * 4096 + 1), Some(43)"));
     assert!(primordial.contains("wyr1_bootfs_page_count(usize::MAX), None"));
     assert!(primordial.contains("Some(1..=PRIMORDIAL_MAX_MAPPING_PAGES)"));
     assert!(primordial.contains("crate::test_support::complete_fail(0x2510_b001)"));

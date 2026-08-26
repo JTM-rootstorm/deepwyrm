@@ -691,7 +691,7 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
         )
     );
     assert!(runtime.contains(
-        "#[cfg(deepwyrm_wyr1_evidence)]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 41;"
+        "#[cfg(deepwyrm_wyr1_evidence)]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 42;"
     ));
 }
 

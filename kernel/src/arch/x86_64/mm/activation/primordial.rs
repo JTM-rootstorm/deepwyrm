@@ -191,15 +191,15 @@ const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 17;
 const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 32;
 #[cfg(deepwyrm_wrcap_relay)]
 const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 39;
-// Selector 25 measured integration inputs establish a 41-page admission
-// ceiling: normal is 166,784 bytes (41 pages), and degraded recovery is
-// 166,184 bytes (41 pages). Deepwyrm owns this page ceiling and its rejection
+// Selector 25 measured integration inputs establish a 42-page admission
+// ceiling: normal is 170,496 bytes (42 pages), and degraded recovery is
+// 169,896 bytes (42 pages). Deepwyrm owns this page ceiling and its rejection
 // detail. Content hashes belong to receipt/root evidence recorded after the
 // cross-repository source and media identities freeze; embedding them here
 // would make the Deepwyrm revision recursively determine its own bootfs hash.
 // This selector-local bound remains separate from the accepted WYR0 bounds.
 #[cfg(deepwyrm_wyr1_evidence)]
-const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 41;
+const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 42;
 const PRIMORDIAL_JOURNAL_ENTRIES: usize =
     PRIMORDIAL_MAX_MAPPING_PAGES + PRIMORDIAL_TABLE_CANDIDATES;
 const PRIMORDIAL_INVALIDATIONS: usize = PRIMORDIAL_MAX_MAPPING_PAGES;
@@ -4165,21 +4165,21 @@ mod wyr1_capacity_tests {
     use super::*;
 
     #[test]
-    fn integration_bootfs_measurement_accepts_41_pages_and_rejects_larger_or_overflowing_inputs() {
+    fn integration_bootfs_measurement_accepts_42_pages_and_rejects_larger_or_overflowing_inputs() {
         assert_eq!(wyr1_bootfs_page_count(0), None);
         assert_eq!(wyr1_bootfs_page_count(1), Some(1));
         assert_eq!(wyr1_bootfs_page_count(4096), Some(1));
         assert_eq!(wyr1_bootfs_page_count(4097), Some(2));
-        assert_eq!(wyr1_bootfs_page_count(166_184), Some(41));
-        assert_eq!(wyr1_bootfs_page_count(166_784), Some(41));
-        assert_eq!(wyr1_bootfs_page_count(41 * 4096), Some(41));
+        assert_eq!(wyr1_bootfs_page_count(169_896), Some(42));
+        assert_eq!(wyr1_bootfs_page_count(170_496), Some(42));
+        assert_eq!(wyr1_bootfs_page_count(42 * 4096), Some(42));
         assert!(matches!(
-            wyr1_bootfs_page_count(41 * 4096),
+            wyr1_bootfs_page_count(42 * 4096),
             Some(1..=PRIMORDIAL_MAX_MAPPING_PAGES)
         ));
-        assert_eq!(wyr1_bootfs_page_count(41 * 4096 + 1), Some(42));
+        assert_eq!(wyr1_bootfs_page_count(42 * 4096 + 1), Some(43));
         assert!(!matches!(
-            wyr1_bootfs_page_count(41 * 4096 + 1),
+            wyr1_bootfs_page_count(42 * 4096 + 1),
             Some(1..=PRIMORDIAL_MAX_MAPPING_PAGES)
         ));
         assert_eq!(wyr1_bootfs_page_count(usize::MAX), None);
