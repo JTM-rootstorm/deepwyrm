@@ -250,6 +250,18 @@ fn f3_timer_interrupt_is_returning_preserves_gprs_and_normalizes_user_gs() {
 #[test]
 fn dw1b_timer_return_validation_is_fail_closed_before_resume_or_rearm() {
     let live = source("src/arch/x86_64/syscall/live.rs");
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let expiry = primordial
+        .rsplit_once("fn publish_quantum_expiry(")
+        .expect("live facade quantum-expiry publisher")
+        .1
+        .split_once("fn prepare_quantum(")
+        .expect("live facade quantum-expiry publisher extent")
+        .0;
+    assert!(expiry.contains("runtime.switch_cpu(self.cpu);"));
+    assert!(!expiry.contains("runtime.select_cpu(self.cpu);"));
+    assert!(expiry.contains("runtime.publish_quantum_expiry(ticket)"));
+
     let gate = live
         .split_once("unsafe fn native_runtime_timer_pre_iret")
         .expect("DW1-B timer pre-IRET handler")

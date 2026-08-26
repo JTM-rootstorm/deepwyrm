@@ -3924,7 +3924,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         ticket: crate::task::SchedulerQuantumTicket,
     ) -> Result<bool, crate::task::SchedulerError> {
         let mut runtime = self.runtime.lock();
-        runtime.select_cpu(self.cpu);
+        runtime.switch_cpu(self.cpu);
         runtime.publish_quantum_expiry(ticket)
     }
 
