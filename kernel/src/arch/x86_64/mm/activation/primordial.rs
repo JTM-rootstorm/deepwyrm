@@ -1838,6 +1838,57 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             return PreparedTerminalHandoff::IdleScheduler;
         }
 
+        #[cfg(deepwyrm_wyr1_evidence)]
+        let primordial_retired = self
+            .tasks
+            .root_region(self.primordial_process)
+            .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d00d))
+            .is_none();
+        #[cfg(deepwyrm_wyr1_evidence)]
+        if retired_process != self.primordial_process && primordial_retired {
+            // Once WYR1 has retired primordial, its retained boot-lifetime
+            // PML4 is architecture-private state, not a Process publisher.
+            // Tear down the current child through its own exact active root,
+            // then enter the CPU-private kernel root before retiring the empty
+            // child root and rescanning from ordinary idle.
+            let proof = self
+                .tasks
+                .process_quiescence_proof(retired_process)
+                .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d00e));
+            let drained = self
+                .shared
+                .execution
+                .blocked_operations_drained(&self.tasks, &proof)
+                .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d00f));
+            let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|CHILD|UNMAP\n");
+            self.unmap_current_userspace(
+                retired_process,
+                retired_root_key,
+                retired_address_space,
+                &proof,
+            )
+            .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d010));
+            let previous = self.active_root.take_process();
+            match self.active.enter_kernel_execution_root(previous) {
+                Ok(kernel) => self.active_root = CarrierActiveRoot::Kernel(kernel),
+                Err((_, recovered)) => {
+                    self.active_root = CarrierActiveRoot::Process(recovered);
+                    crate::test_support::complete_fail(0x2510_d011)
+                }
+            }
+            let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|CHILD|KERNEL\n");
+            self.finish_quiesced_process_root_retirement(
+                retired_process,
+                retired_address_space,
+                &proof,
+                drained,
+            )
+            .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d012));
+            self.local.record_idle();
+            let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|CHILD|IDLE\n");
+            return PreparedTerminalHandoff::IdleScheduler;
+        }
+
         if retired_process != self.primordial_process {
             if crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
                 != Some(self.cpu.index())
@@ -2424,22 +2475,37 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
         proof: &crate::task::ProcessQuiescenceProof,
     ) -> Result<(), ()> {
+        self.unmap_current_userspace(
+            self.primordial_process,
+            self.primordial_root_key,
+            self.primordial_address_space,
+            proof,
+        )
+    }
+
+    fn unmap_current_userspace(
+        &mut self,
+        process: ProcessKey,
+        root_key: crate::memory::address_region::AddressRegionObjectKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+        proof: &crate::task::ProcessQuiescenceProof,
+    ) -> Result<(), ()> {
         #[cfg(deepwyrm_wyr1_evidence)]
         let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|UNMAP|VALIDATE\n");
         self.active
             .validate_current_process_root_selection(
                 self.active_root.as_ref().ok_or(())?,
-                self.primordial_process,
-                self.primordial_address_space,
+                process,
+                address_space,
             )
             .map_err(|_| ())?;
-        if self.process != self.primordial_process || self.root_key != self.primordial_root_key {
+        if self.process != process || self.root_key != root_key {
             return Err(());
         }
         loop {
             let mapping = self
                 .regions
-                .region(self.root_key)
+                .region(root_key)
                 .map_err(|_| ())?
                 .mappings()
                 .iter()
@@ -2456,7 +2522,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             let releases = {
                 let region = self
                     .regions
-                    .region_mut_for_quiesced_teardown(&self.tasks, proof, self.root_key)
+                    .region_mut_for_quiesced_teardown(&self.tasks, proof, root_key)
                     .map_err(|_| ())?;
                 let mut platform = LivePlatform {
                     active: &mut self.active,

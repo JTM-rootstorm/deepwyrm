@@ -585,21 +585,37 @@ fn g5_terminal_completion_drains_all_primordial_authority_before_capacity_proof(
     let primordial_unmap_start = primordial
         .find("fn unmap_primordial_userspace(")
         .expect("guarded primordial unmap helper");
-    let inactive_unmap_start = primordial[primordial_unmap_start..]
-        .find("fn unmap_inactive_userspace(")
+    let current_unmap_start = primordial[primordial_unmap_start..]
+        .find("fn unmap_current_userspace(")
         .map(|offset| primordial_unmap_start + offset)
-        .expect("exact inactive-root unmap helper");
-    let primordial_unmap = &primordial[primordial_unmap_start..inactive_unmap_start];
+        .expect("exact current-root unmap helper");
+    let primordial_unmap = &primordial[primordial_unmap_start..current_unmap_start];
     for required in [
-        "validate_current_process_root_selection(",
         "self.primordial_process",
+        "self.primordial_root_key",
         "self.primordial_address_space",
-        "self.process != self.primordial_process",
-        "LivePlatform {",
+        "self.unmap_current_userspace(",
     ] {
         assert!(
             primordial_unmap.contains(required),
-            "primordial-only unmap omitted guard {required}"
+            "primordial unmap wrapper omitted exact binding {required}"
+        );
+    }
+
+    let inactive_unmap_start = primordial[current_unmap_start..]
+        .find("fn unmap_inactive_userspace(")
+        .map(|offset| current_unmap_start + offset)
+        .expect("exact inactive-root unmap helper");
+    let current_unmap = &primordial[current_unmap_start..inactive_unmap_start];
+    for required in [
+        "validate_current_process_root_selection(",
+        "self.process != process",
+        "self.root_key != root_key",
+        "LivePlatform {",
+    ] {
+        assert!(
+            current_unmap.contains(required),
+            "current-root unmap omitted guard {required}"
         );
     }
 

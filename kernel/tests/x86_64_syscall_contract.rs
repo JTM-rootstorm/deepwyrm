@@ -817,6 +817,39 @@ fn i1_terminal_child_without_local_work_rejoins_the_idle_scheduler() {
 }
 
 #[test]
+fn wyr1_terminal_child_after_primordial_retirement_uses_its_current_root() {
+    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let terminal = runtime
+        .split_once("fn prepare_terminal_handoff(")
+        .expect("terminal handoff")
+        .1
+        .split_once("fn terminate_exception(")
+        .expect("terminal handoff terminator")
+        .0;
+    let retired_child = terminal
+        .split_once("if retired_process != self.primordial_process && primordial_retired {")
+        .expect("WYR1 retired-primordial child branch")
+        .1
+        .split_once("\n        if retired_process != self.primordial_process {")
+        .expect("legacy retained-primordial child branch")
+        .0;
+    let unmap = retired_child.find("self.unmap_current_userspace(").unwrap();
+    let kernel_root = retired_child
+        .find("enter_kernel_execution_root(previous)")
+        .unwrap();
+    let retirement = retired_child
+        .find("self.finish_quiesced_process_root_retirement(")
+        .unwrap();
+    let idle = retired_child.find("self.local.record_idle()").unwrap();
+
+    assert!(unmap < kernel_root);
+    assert!(kernel_root < retirement);
+    assert!(retirement < idle);
+    assert!(!retired_child.contains("prepare_process_root_selection("));
+    assert!(!retired_child.contains("self.primordial_address_space"));
+}
+
+#[test]
 fn final_external_thread_completion_retires_pins_before_process_root_teardown() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
     let completion = runtime
