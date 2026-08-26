@@ -1839,11 +1839,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
 
         #[cfg(deepwyrm_wyr1_evidence)]
-        let primordial_retired = self
-            .tasks
-            .root_region(self.primordial_process)
-            .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d00d))
-            .is_none();
+        let primordial_retired = match self.tasks.root_region(self.primordial_process) {
+            Ok(None) | Err(crate::task::TaskError::InvalidTask) => true,
+            Ok(Some(_)) => false,
+            Err(_) => crate::test_support::complete_fail(0x2510_d00d),
+        };
         #[cfg(deepwyrm_wyr1_evidence)]
         if retired_process != self.primordial_process && primordial_retired {
             // Once WYR1 has retired primordial, its retained boot-lifetime

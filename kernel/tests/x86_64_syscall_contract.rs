@@ -833,6 +833,13 @@ fn wyr1_terminal_child_after_primordial_retirement_uses_its_current_root() {
         .split_once("\n        if retired_process != self.primordial_process {")
         .expect("legacy retained-primordial child branch")
         .0;
+    let retirement_fact = terminal
+        .split_once("let primordial_retired = match")
+        .expect("WYR1 primordial retirement fact")
+        .1
+        .split_once("if retired_process != self.primordial_process && primordial_retired {")
+        .expect("WYR1 retired-primordial child branch")
+        .0;
     let unmap = retired_child.find("self.unmap_current_userspace(").unwrap();
     let kernel_root = retired_child
         .find("enter_kernel_execution_root(previous)")
@@ -845,6 +852,11 @@ fn wyr1_terminal_child_after_primordial_retirement_uses_its_current_root() {
     assert!(unmap < kernel_root);
     assert!(kernel_root < retirement);
     assert!(retirement < idle);
+    assert!(
+        retirement_fact.contains("Ok(None) | Err(crate::task::TaskError::InvalidTask) => true")
+    );
+    assert!(retirement_fact.contains("Ok(Some(_)) => false"));
+    assert!(retirement_fact.contains("Err(_) => crate::test_support::complete_fail(0x2510_d00d)"));
     assert!(!retired_child.contains("prepare_process_root_selection("));
     assert!(!retired_child.contains("self.primordial_address_space"));
 }
