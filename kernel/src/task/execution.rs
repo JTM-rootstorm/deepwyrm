@@ -652,12 +652,12 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         self.scheduler.yield_current_on(cpu, thread)
     }
 
-    pub(crate) fn prepare_quantum_on(
+    pub(crate) fn prepare_quantum_if_needed_on(
         &self,
         cpu: SchedulerCpuId,
         now_ns: u64,
-    ) -> Result<super::SchedulerQuantumTicket, SchedulerError> {
-        self.scheduler.prepare_quantum_on(cpu, now_ns)
+    ) -> Result<Option<super::SchedulerQuantumTicket>, SchedulerError> {
+        self.scheduler.prepare_quantum_if_needed_on(cpu, now_ns)
     }
 
     pub(crate) fn publish_quantum_expiry(

@@ -98,6 +98,7 @@ pub(crate) const fn earliest_deadline(sources: [Option<u64>; 3], maintenance_dea
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct HardwareArmIntent {
     pub(crate) generation: u64,
+    pub(crate) source_revision: u64,
     pub(crate) deadline_ns: u64,
     pub(crate) shot: ApicOneShot,
 }
@@ -105,6 +106,7 @@ pub(crate) struct HardwareArmIntent {
 pub(crate) struct PhysicalArmSequence {
     next_generation: u64,
     desired_generation: u64,
+    source_revision: u64,
 }
 
 impl PhysicalArmSequence {
@@ -112,7 +114,19 @@ impl PhysicalArmSequence {
         Self {
             next_generation: 2,
             desired_generation: 1,
+            source_revision: 1,
         }
+    }
+
+    /// Invalidates every hardware intent prepared before an accepted logical
+    /// source mutation, including a mutation that races LAPIC MMIO.
+    pub(crate) fn source_mutated(&mut self) -> Result<(), DeadlineQueueError> {
+        self.source_revision = self
+            .source_revision
+            .checked_add(1)
+            .filter(|revision| *revision != 0)
+            .ok_or(DeadlineQueueError::GenerationExhausted)?;
+        Ok(())
     }
 
     pub(crate) fn prepare(
@@ -130,6 +144,7 @@ impl PhysicalArmSequence {
         self.desired_generation = generation;
         Ok(HardwareArmIntent {
             generation,
+            source_revision: self.source_revision,
             deadline_ns,
             shot,
         })
@@ -137,6 +152,7 @@ impl PhysicalArmSequence {
 
     pub(crate) const fn is_current(&self, intent: &HardwareArmIntent) -> bool {
         self.desired_generation == intent.generation
+            && self.source_revision == intent.source_revision
     }
 }
 
@@ -185,6 +201,44 @@ mod tests {
         assert_ne!(old.generation, 0);
         assert_ne!(new.generation, 0);
         assert!(new.shot.initial_count <= old.shot.initial_count);
+    }
+
+    #[test]
+    fn logical_source_mutation_invalidates_an_inflight_physical_intent() {
+        let mut source = LocalDeadlineSource::new();
+        let mut arms = PhysicalArmSequence::initialized();
+        source.replace(1, 1_000, 7_u8).unwrap();
+        arms.source_mutated().unwrap();
+        let stale = arms.prepare(1_000, 900, 1_000_000).unwrap();
+
+        source.replace(2, 950, 8).unwrap();
+        arms.source_mutated().unwrap();
+        assert!(!arms.is_current(&stale));
+
+        let current = arms.prepare(950, 900, 1_000_000).unwrap();
+        assert!(arms.is_current(&current));
+        assert_ne!(stale.source_revision, current.source_revision);
+    }
+
+    #[test]
+    fn if_clear_expiry_and_late_vector_cannot_overwrite_the_next_budget() {
+        let mut source = LocalDeadlineSource::new();
+        let mut arms = PhysicalArmSequence::initialized();
+        source.replace(41, 1_000, 7_u8).unwrap();
+        arms.source_mutated().unwrap();
+        let pending_expiry = arms.prepare(1_000, 900, 1_000_000).unwrap();
+
+        assert_eq!(source.take_due(1_000), Some(7));
+        arms.source_mutated().unwrap();
+        assert!(!arms.is_current(&pending_expiry));
+
+        source.replace(42, 6_000_000, 8).unwrap();
+        arms.source_mutated().unwrap();
+        let next_budget = arms.prepare(6_000_000, 1_000, 1_000_000).unwrap();
+        assert!(arms.is_current(&next_budget));
+        assert!(!source.cancel(41, 7), "late expiry identity is stale");
+        assert_eq!(source.take_due(5_999_999), None);
+        assert_eq!(source.take_due(6_000_000), Some(8));
     }
 
     #[test]

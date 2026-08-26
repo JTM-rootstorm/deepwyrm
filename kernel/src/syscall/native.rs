@@ -767,7 +767,7 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
     fn prepare_quantum(
         &mut self,
         _now_ns: u64,
-    ) -> Result<crate::task::SchedulerQuantumTicket, crate::task::SchedulerError> {
+    ) -> Result<Option<crate::task::SchedulerQuantumTicket>, crate::task::SchedulerError> {
         panic!("native runtime does not admit DW1-B quantum arming")
     }
 

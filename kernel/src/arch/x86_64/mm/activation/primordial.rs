@@ -3229,8 +3229,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     fn prepare_quantum(
         &mut self,
         now_ns: u64,
-    ) -> Result<crate::task::SchedulerQuantumTicket, crate::task::SchedulerError> {
-        self.shared.execution.prepare_quantum_on(self.cpu, now_ns)
+    ) -> Result<Option<crate::task::SchedulerQuantumTicket>, crate::task::SchedulerError> {
+        self.shared
+            .execution
+            .prepare_quantum_if_needed_on(self.cpu, now_ns)
     }
 
     fn has_reschedule_request(&mut self) -> bool {
@@ -3645,7 +3647,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
     fn prepare_quantum(
         &mut self,
         now_ns: u64,
-    ) -> Result<crate::task::SchedulerQuantumTicket, crate::task::SchedulerError> {
+    ) -> Result<Option<crate::task::SchedulerQuantumTicket>, crate::task::SchedulerError> {
         let mut runtime = self.runtime.lock();
         runtime.select_cpu(self.cpu);
         runtime.prepare_quantum(now_ns)

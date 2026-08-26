@@ -520,6 +520,12 @@ struct LiveTimeState {
 }
 
 impl LiveTimeState {
+    fn record_source_mutation(&mut self) {
+        self.hardware_arms
+            .source_mutated()
+            .unwrap_or_else(|_| panic!("DW1-B logical-source revision exhausted"));
+    }
+
     fn sample_now(&mut self) -> Result<MonotonicSample, LiveTimeError> {
         let raw = read_pm_timer(self.pm.descriptor());
         let sample = self.pm.sample(raw).map_err(|_| LiveTimeError::Clock)?;
@@ -557,6 +563,9 @@ impl LiveTimeState {
             .timer_deadlines
             .expire(sample.nanoseconds, &mut timer_expiries);
         let scheduler_quantum = self.scheduler_quantum.take_due(sample.nanoseconds);
+        if wake_count != 0 || timer_expiry_count != 0 || scheduler_quantum.is_some() {
+            self.record_source_mutation();
+        }
         Ok(InterruptOutcome {
             wakes,
             wake_count,
@@ -582,6 +591,7 @@ impl LiveTimeState {
             .deadlines
             .register(deadline_ns, wake)
             .map_err(|_| registration_failure(LiveTimeError::Deadline, wake))?;
+        self.record_source_mutation();
         Ok(registration)
     }
 
@@ -591,9 +601,13 @@ impl LiveTimeState {
         program_local_timer: bool,
     ) -> Result<(), LiveTimeError> {
         let sample = self.sample_now()?;
-        self.deadlines
+        let cancelled = self
+            .deadlines
             .cancel_if_live(registration)
             .map_err(|_| LiveTimeError::Deadline)?;
+        if cancelled.is_some() {
+            self.record_source_mutation();
+        }
         let _ = (sample, program_local_timer);
         Ok(())
     }
@@ -608,9 +622,13 @@ impl LiveTimeState {
         let sample = self.sample_now().map_err(|_| TimerDeadlineError::Fault)?;
         if deadline_ns <= sample.nanoseconds {
             if let Some(old) = old {
-                self.timer_deadlines
+                let cancelled = self
+                    .timer_deadlines
                     .cancel_if_live_ref(old)
                     .map_err(|_| TimerDeadlineError::Fault)?;
+                if cancelled.is_some() {
+                    self.record_source_mutation();
+                }
             }
             let _ = program_local_timer;
             return Ok(None);
@@ -633,6 +651,7 @@ impl LiveTimeState {
                 .register(deadline_ns, token)
                 .map_err(map_timer_queue_error)?
         };
+        self.record_source_mutation();
         Ok(Some(registration))
     }
 
@@ -642,9 +661,13 @@ impl LiveTimeState {
         program_local_timer: bool,
     ) -> Result<(), TimerDeadlineError> {
         let sample = self.sample_now().map_err(|_| TimerDeadlineError::Fault)?;
-        self.timer_deadlines
+        let cancelled = self
+            .timer_deadlines
             .cancel_if_live_ref(registration)
             .map_err(|_| TimerDeadlineError::Fault)?;
+        if cancelled.is_some() {
+            self.record_source_mutation();
+        }
         let _ = (sample, program_local_timer);
         Ok(())
     }
@@ -663,12 +686,36 @@ impl LiveTimeState {
         self.scheduler_quantum
             .replace(ticket.source_arm_generation(), ticket.deadline_ns(), ticket)
             .map_err(|_| LiveTimeError::Deadline)?;
-        Ok(self.scheduler_quantum.take_due(sample.nanoseconds))
+        self.record_source_mutation();
+        let due = self.scheduler_quantum.take_due(sample.nanoseconds);
+        if due.is_some() {
+            self.record_source_mutation();
+        }
+        Ok(due)
     }
 
-    fn cancel_scheduler_quantum(&mut self, ticket: crate::task::SchedulerQuantumTicket) -> bool {
-        self.scheduler_quantum
-            .cancel(ticket.source_arm_generation(), ticket)
+    fn cancel_scheduler_quantum(
+        &mut self,
+        ticket: crate::task::SchedulerQuantumTicket,
+    ) -> Result<bool, LiveTimeError> {
+        let cancelled = self
+            .scheduler_quantum
+            .cancel(ticket.source_arm_generation(), ticket);
+        if cancelled {
+            self.record_source_mutation();
+        }
+        Ok(cancelled)
+    }
+
+    fn take_due_scheduler_quantum(
+        &mut self,
+    ) -> Result<Option<crate::task::SchedulerQuantumTicket>, LiveTimeError> {
+        let sample = self.sample_now()?;
+        let due = self.scheduler_quantum.take_due(sample.nanoseconds);
+        if due.is_some() {
+            self.record_source_mutation();
+        }
+        Ok(due)
     }
 }
 
@@ -1071,19 +1118,27 @@ pub(crate) fn register_deadline(
         .register_deadline(deadline_ns, wake, program_local_timer)?;
     if program_local_timer {
         if reconcile_bsp_hardware_arm().is_err() {
-            let recovered = state
-                .lock()
-                .deadlines
-                .cancel(registration)
-                .unwrap_or_else(|_| halt_forever());
+            let recovered = {
+                let mut state = state.lock();
+                let recovered = state
+                    .deadlines
+                    .cancel(registration)
+                    .unwrap_or_else(|_| halt_forever());
+                state.record_source_mutation();
+                recovered
+            };
             return Err(registration_failure(LiveTimeError::ApicAccess, recovered));
         }
     } else if request_bsp_timer_service().is_err() {
-        let recovered = state
-            .lock()
-            .deadlines
-            .cancel(registration)
-            .unwrap_or_else(|_| halt_forever());
+        let recovered = {
+            let mut state = state.lock();
+            let recovered = state
+                .deadlines
+                .cancel(registration)
+                .unwrap_or_else(|_| halt_forever());
+            state.record_source_mutation();
+            recovered
+        };
         return Err(registration_failure(LiveTimeError::IpiTransport, recovered));
     }
     Ok(registration)
@@ -1134,11 +1189,29 @@ pub(crate) fn cancel_scheduler_quantum(
         return Err(LiveTimeError::CpuIdentity);
     }
     let state = live_state().ok_or(LiveTimeError::Clock)?;
-    let cancelled = state.lock().cancel_scheduler_quantum(ticket);
+    let cancelled = state.lock().cancel_scheduler_quantum(ticket)?;
     if cancelled {
         reconcile_bsp_hardware_arm()?;
     }
     Ok(cancelled)
+}
+
+/// Converts an exact CPU0 quantum that became due while IF was clear in a
+/// syscall into the same coalesced scheduler request the timer IRQ publishes.
+/// A later delivery of the already-pending vector is only a harmless rescan.
+pub(crate) fn service_current_scheduler_quantum_deadline() -> Result<bool, LiveTimeError> {
+    if installed_current_cpu_index()? != CpuIndex::BOOTSTRAP {
+        return Err(LiveTimeError::CpuIdentity);
+    }
+    let state = live_state().ok_or(LiveTimeError::Clock)?;
+    let due = state.lock().take_due_scheduler_quantum()?;
+    let Some(ticket) = due else {
+        return Ok(false);
+    };
+    reconcile_bsp_hardware_arm()?;
+    crate::arch::x86_64::syscall::publish_current_quantum_expiry(ticket)
+        .map_err(|_| LiveTimeError::Faulted)?;
+    Ok(true)
 }
 
 #[allow(

@@ -107,7 +107,7 @@ type UserExceptionRuntimeHandler =
 type RendezvousGateHandler = unsafe fn(*mut ()) -> u8;
 type RendezvousReaperHandler = unsafe fn(*mut ()) -> !;
 type QuantumExpiryHandler = unsafe fn(*mut (), crate::task::SchedulerQuantumTicket) -> bool;
-type PrepareQuantumHandler = unsafe fn(*mut (), u64) -> crate::task::SchedulerQuantumTicket;
+type PrepareQuantumHandler = unsafe fn(*mut (), u64) -> Option<crate::task::SchedulerQuantumTicket>;
 type TimerPreIretHandler = unsafe fn(*mut (), &mut super::frame::RawCpl3TimerReturnFrame);
 
 #[derive(Clone, Copy)]
@@ -1064,7 +1064,7 @@ unsafe fn native_runtime_quantum_expiry<R: crate::syscall::native::NativeSyscall
 unsafe fn native_runtime_prepare_quantum<R: crate::syscall::native::NativeSyscallFrameRuntime>(
     context: *mut (),
     now_ns: u64,
-) -> crate::task::SchedulerQuantumTicket {
+) -> Option<crate::task::SchedulerQuantumTicket> {
     let runtime = unsafe { &mut *context.cast::<R>() };
     runtime
         .prepare_quantum(now_ns)
@@ -1095,8 +1095,9 @@ fn arm_current_normal_quantum() {
     }
     let binding = runtime_binding().unwrap_or_else(|| halt_forever());
     let now_ns = crate::time::monotonic_now().unwrap_or_else(|_| halt_forever());
-    let ticket = unsafe { (binding.prepare_quantum_handler)(binding.context, now_ns) };
-    crate::time::arm_scheduler_quantum(ticket).unwrap_or_else(|_| halt_forever());
+    if let Some(ticket) = unsafe { (binding.prepare_quantum_handler)(binding.context, now_ns) } {
+        crate::time::arm_scheduler_quantum(ticket).unwrap_or_else(|_| halt_forever());
+    }
 }
 
 fn poll_timer_return_stop(context: *mut ()) {
@@ -1615,6 +1616,10 @@ fn service_syscall_return_preemption<
     frame: &mut RawSyscallFrame,
 ) {
     poll_timer_return_stop(*context);
+    if current_cpu_index_for_diagnostics() == Some(CpuIndex::BOOTSTRAP.index()) {
+        crate::time::service_current_scheduler_quantum_deadline()
+            .unwrap_or_else(|_| halt_forever());
+    }
     let has_request = {
         let runtime = unsafe { &mut *(*context).cast::<R>() };
         runtime.has_reschedule_request()

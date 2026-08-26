@@ -285,6 +285,44 @@ fn dw1b_timer_return_validation_is_fail_closed_before_resume_or_rearm() {
 }
 
 #[test]
+fn dw1b_syscall_return_accounts_due_budget_before_preemption_and_rearm() {
+    let live = source("src/arch/x86_64/syscall/live.rs");
+    let service = live
+        .split_once("fn service_syscall_return_preemption")
+        .expect("DW1-B syscall return preemption service")
+        .1
+        .split_once("fn switch_kernel_context")
+        .expect("DW1-B syscall return preemption extent")
+        .0;
+    let stop = service
+        .find("poll_timer_return_stop(*context)")
+        .expect("remote Stop precedence poll");
+    let due = service
+        .find("service_current_scheduler_quantum_deadline()")
+        .expect("IF-clear due-budget service");
+    let request = service
+        .find("runtime.has_reschedule_request()")
+        .expect("exact scheduler request observation");
+    let prepare = service
+        .find("runtime.prepare_preemption()")
+        .expect("normal preemption preparation");
+    let rearm = service
+        .rfind("arm_current_normal_quantum()")
+        .expect("selected execution quantum preparation");
+    assert!(stop < due && due < request && request < prepare && prepare < rearm);
+
+    let arm = live
+        .split_once("fn arm_current_normal_quantum()")
+        .expect("DW1-B normal quantum helper")
+        .1
+        .split_once("fn poll_timer_return_stop")
+        .expect("DW1-B normal quantum helper extent")
+        .0;
+    assert!(arm.contains("if let Some(ticket)"));
+    assert!(arm.contains("arm_scheduler_quantum(ticket)"));
+}
+
+#[test]
 fn f3_spurious_apic_interrupt_returns_without_eoi_or_rust_dispatch() {
     let assembly = source("src/arch/x86_64/exceptions.S");
     let body = assembly

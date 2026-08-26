@@ -698,6 +698,38 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         self.need_resched[cpu.index()] = None;
     }
 
+    fn mint_quantum_on(
+        &mut self,
+        cpu: SchedulerCpuId,
+        claim: RunningClaim,
+        now_ns: u64,
+    ) -> Result<SchedulerQuantumTicket, SchedulerError> {
+        let deadline_ns = now_ns
+            .checked_add(DEFAULT_NORMAL_QUANTUM_NS)
+            .ok_or(SchedulerError::TokenExhausted)?;
+        let source_arm_generation = self.next_quantum_generation;
+        self.next_quantum_generation = source_arm_generation
+            .checked_add(1)
+            .filter(|next| *next != 0)
+            .ok_or(SchedulerError::TokenExhausted)?;
+        let ticket = SchedulerQuantumTicket {
+            domain: self.domain,
+            cpu,
+            thread: claim.thread,
+            execution_generation: claim.generation,
+            source_arm_generation,
+            deadline_ns,
+        };
+        self.quantum[cpu.index()] = Some(ticket);
+        self.record_trace(
+            SchedulerTraceKind::QuantumArm,
+            cpu,
+            Some(claim.thread),
+            source_arm_generation,
+        );
+        Ok(ticket)
+    }
+
     fn check_invariants(&self) -> Result<(), SchedulerError> {
         if self.accounting.cpu.iter().any(|cpu| cpu.overflow_fault) {
             return Err(SchedulerError::AccountingOverflow);
@@ -1099,7 +1131,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         if state.suspended[cpu_index].is_some() {
             return Err(SchedulerError::SwitchPending);
         }
-        state.clear_preemption_on(cpu);
         let next_entry = state.queue[..state.len]
             .iter()
             .flatten()
@@ -1145,6 +1176,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         let next = state
             .claim_first_runnable()?
             .expect("validated Runnable entry remains claimable");
+        state.clear_preemption_on(cpu);
         state.running[cpu_index] = Some(next);
         let ready_at_ns = state.instrumentation_now_ns[cpu_index];
         state
@@ -1182,8 +1214,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         })
     }
 
-    /// Replaces CPU0's exact normal-quantum source immediately before a
-    /// permitted CPL3 return. AP scheduler timers remain a DW1-C concern.
+    /// Test-only forced replacement used to exercise stale-ticket rejection.
+    #[cfg(test)]
     pub(crate) fn prepare_quantum_on(
         &self,
         cpu: SchedulerCpuId,
@@ -1197,32 +1229,37 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         if state.suspended[cpu.index()].is_some() || state.pending_block[cpu.index()].is_some() {
             return Err(SchedulerError::QuantumUnavailable);
         }
-        let deadline_ns = now_ns
-            .checked_add(DEFAULT_NORMAL_QUANTUM_NS)
-            .ok_or(SchedulerError::TokenExhausted)?;
-        let source_arm_generation = state.next_quantum_generation;
-        state.next_quantum_generation = source_arm_generation
-            .checked_add(1)
-            .filter(|next| *next != 0)
-            .ok_or(SchedulerError::TokenExhausted)?;
-        let ticket = SchedulerQuantumTicket {
-            domain: state.domain,
-            cpu,
-            thread: claim.thread,
-            execution_generation: claim.generation,
-            source_arm_generation,
-            deadline_ns,
-        };
-        state.quantum[cpu.index()] = Some(ticket);
+        let ticket = state.mint_quantum_on(cpu, claim, now_ns)?;
         state.need_resched[cpu.index()] = None;
-        state.record_trace(
-            SchedulerTraceKind::QuantumArm,
-            cpu,
-            Some(claim.thread),
-            source_arm_generation,
-        );
         state.assert_invariants();
         Ok(ticket)
+    }
+
+    /// Preserves an existing exact CPU0 budget across syscall entry/return and
+    /// mints only when the selected execution genuinely has no quantum.
+    pub(crate) fn prepare_quantum_if_needed_on(
+        &self,
+        cpu: SchedulerCpuId,
+        now_ns: u64,
+    ) -> Result<Option<SchedulerQuantumTicket>, SchedulerError> {
+        if cpu != SchedulerCpuId::BOOTSTRAP {
+            return Err(SchedulerError::QuantumUnavailable);
+        }
+        let mut state = self.state.lock();
+        let claim = state.running[cpu.index()].ok_or(SchedulerError::NotRunning)?;
+        if state.suspended[cpu.index()].is_some()
+            || state.pending_block[cpu.index()].is_some()
+            || state.need_resched[cpu.index()].is_some()
+        {
+            return Err(SchedulerError::QuantumUnavailable);
+        }
+        if state.quantum[cpu.index()].is_some() {
+            state.assert_invariants();
+            return Ok(None);
+        }
+        let ticket = state.mint_quantum_on(cpu, claim, now_ns)?;
+        state.assert_invariants();
+        Ok(Some(ticket))
     }
 
     /// Publishes a coalescing request only for the still-current exact ticket.

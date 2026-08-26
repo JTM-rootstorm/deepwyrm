@@ -598,6 +598,112 @@ fn dw1b_quantum_identity_rejects_stale_replaced_and_cross_cpu_events() {
 }
 
 #[test]
+fn dw1b_repeated_syscall_returns_preserve_budget_until_exact_expiry() {
+    let scheduler = CooperativeScheduler::<2>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let first = thread_key(&mut registry);
+    let second = thread_key(&mut registry);
+    for thread in [first, second] {
+        scheduler
+            .commit(scheduler.reserve(thread).unwrap())
+            .unwrap();
+    }
+    scheduler.schedule_next_on(cpu(0)).unwrap();
+
+    let ticket = scheduler
+        .prepare_quantum_if_needed_on(cpu(0), 100)
+        .unwrap()
+        .expect("initial CPL3 entry mints a budget");
+    for syscall_return_ns in [101, 1_000, 1_000_000, ticket.deadline_ns() - 1] {
+        assert_eq!(
+            scheduler
+                .prepare_quantum_if_needed_on(cpu(0), syscall_return_ns)
+                .unwrap(),
+            None,
+            "a syscall return must preserve the running execution's exact budget"
+        );
+        assert_eq!(
+            scheduler.preemption_snapshot_on(cpu(0)).quantum,
+            Some(ticket)
+        );
+    }
+
+    assert_eq!(scheduler.publish_quantum_expiry(ticket), Ok(true));
+    assert_eq!(
+        scheduler.prepare_quantum_if_needed_on(cpu(0), ticket.deadline_ns()),
+        Err(SchedulerError::QuantumUnavailable),
+        "a due request must survive return preparation"
+    );
+    let outgoing = scheduler.running_claim_on(cpu(0)).unwrap();
+    assert!(matches!(
+        scheduler.preempt_current_on(cpu(0)),
+        Ok(SchedulerPreemptionDecision::Switch {
+            decision: ScheduleDecision {
+                previous: Some(previous),
+                current: Some(current),
+            },
+            outgoing: switched,
+        }) if previous == first && current == second && switched == outgoing
+    ));
+    scheduler.complete_switch_on(outgoing).unwrap();
+
+    let next = scheduler
+        .prepare_quantum_if_needed_on(cpu(0), ticket.deadline_ns())
+        .unwrap()
+        .expect("the dispatched peer receives a new budget");
+    assert_eq!(next.thread(), second);
+    assert_ne!(next.source_arm_generation(), ticket.source_arm_generation());
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn dw1b_no_peer_yield_preserves_budget_until_due_retain_consumes_it() {
+    let scheduler = CooperativeScheduler::<1>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let running = thread_key(&mut registry);
+    scheduler
+        .commit(scheduler.reserve(running).unwrap())
+        .unwrap();
+    scheduler.schedule_next_on(cpu(0)).unwrap();
+    let ticket = scheduler
+        .prepare_quantum_if_needed_on(cpu(0), 100)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        scheduler.yield_current_on(cpu(0), running).unwrap(),
+        ScheduleDecision {
+            previous: Some(running),
+            current: Some(running),
+        }
+    );
+    assert_eq!(
+        scheduler.preemption_snapshot_on(cpu(0)).quantum,
+        Some(ticket)
+    );
+
+    assert_eq!(scheduler.publish_quantum_expiry(ticket), Ok(true));
+    scheduler.yield_current_on(cpu(0), running).unwrap();
+    assert_eq!(
+        scheduler.preemption_snapshot_on(cpu(0)).request,
+        Some(ticket),
+        "a no-peer yield cannot erase an already-due exact request"
+    );
+    assert_eq!(
+        scheduler.preempt_current_on(cpu(0)),
+        Ok(SchedulerPreemptionDecision::RetainCurrent)
+    );
+    assert!(
+        scheduler
+            .prepare_quantum_if_needed_on(cpu(0), ticket.deadline_ns())
+            .unwrap()
+            .is_some(),
+        "only due no-peer retention renews this running execution"
+    );
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
 fn dw1b_matching_expiry_rotates_fifo_and_retains_exact_continuation() {
     let scheduler = CooperativeScheduler::<3>::new();
     let mut registry = ObjectRegistry::<16>::new();

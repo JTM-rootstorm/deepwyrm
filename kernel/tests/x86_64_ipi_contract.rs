@@ -341,6 +341,8 @@ fn dw1b_deadline_arbiter_uses_exact_logical_and_physical_generations() {
         "generation <= self.last_generation",
         "struct PhysicalArmSequence",
         "desired_generation",
+        "source_revision",
+        "source_mutated",
         "pub(crate) const fn is_current",
         "earliest_deadline",
     ] {
@@ -370,6 +372,7 @@ fn dw1b_deadline_arbiter_uses_exact_logical_and_physical_generations() {
     assert!(prepare < program && program < revalidate);
     assert_eq!(reconcile.matches("program_one_shot_timer").count(), 1);
     assert!(live.contains("scheduler_quantum: LocalDeadlineSource"));
+    assert!(live.contains("record_source_mutation"));
     assert!(live.contains("self.scheduler_quantum.take_due(sample.nanoseconds)"));
 
     let timer_dispatch = live
