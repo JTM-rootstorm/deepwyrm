@@ -191,11 +191,12 @@ const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 17;
 const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 32;
 #[cfg(deepwyrm_wrcap_relay)]
 const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 39;
-// Selector 25 immutable media measurements:
-// - normal: 166,784 bytes (41 pages), SHA-256
-//   68a90892a79fd2955bbbabdae4f29886c1480d82ee307a2ffda1a6d087e9209d;
-// - degraded recovery: 166,184 bytes (41 pages), SHA-256
-//   692b23a564078b6caf6d1ae4b31b53b89312c9046b12c2199c785e6f0786afc7.
+// Selector 25 measured integration inputs establish a 41-page admission
+// ceiling: normal is 166,784 bytes (41 pages), and degraded recovery is
+// 166,184 bytes (41 pages). Deepwyrm owns this page ceiling and its rejection
+// detail. Content hashes belong to receipt/root evidence recorded after the
+// cross-repository source and media identities freeze; embedding them here
+// would make the Deepwyrm revision recursively determine its own bootfs hash.
 // This selector-local bound remains separate from the accepted WYR0 bounds.
 #[cfg(deepwyrm_wyr1_evidence)]
 const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 41;
@@ -4030,7 +4031,7 @@ mod wyr1_capacity_tests {
     use super::*;
 
     #[test]
-    fn integration_bootfs_measurement_hook_accepts_41_pages_and_rejects_42() {
+    fn integration_bootfs_measurement_accepts_41_pages_and_rejects_larger_or_overflowing_inputs() {
         assert_eq!(wyr1_bootfs_page_count(0), None);
         assert_eq!(wyr1_bootfs_page_count(1), Some(1));
         assert_eq!(wyr1_bootfs_page_count(4096), Some(1));
