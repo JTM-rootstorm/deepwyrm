@@ -857,6 +857,8 @@ fn wyr1_terminal_child_after_primordial_retirement_uses_its_current_root() {
     );
     assert!(retirement_fact.contains("Ok(Some(_)) => false"));
     assert!(retirement_fact.contains("Err(_) => crate::test_support::complete_fail(0x2510_d00d)"));
+    assert!(retired_child.contains("DWDBG|WYR1|CHILD|REPORTER"));
+    assert!(retired_child.contains("DWDBG|WYR1|CHILD|ROLE"));
     assert!(!retired_child.contains("prepare_process_root_selection("));
     assert!(!retired_child.contains("self.primordial_address_space"));
 }

@@ -1851,6 +1851,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             // Tear down the current child through its own exact active root,
             // then enter the CPU-private kernel root before retiring the empty
             // child root and rescanning from ordinary idle.
+            let retiring_reporter = self.wyr1_init_process == Some(retired_process);
+            let _ = crate::debug::emit_early_raw_record(if retiring_reporter {
+                b"DWDBG|WYR1|CHILD|REPORTER\n"
+            } else {
+                b"DWDBG|WYR1|CHILD|ROLE\n"
+            });
             let proof = self
                 .tasks
                 .process_quiescence_proof(retired_process)
@@ -2768,6 +2774,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     );
                     finalizer.finalize_chain(release)
                 };
+                #[cfg(deepwyrm_wyr1_evidence)]
+                let _ = crate::debug::emit_early_raw_record(if batch.len() == 0 {
+                    b"DWDBG|WYR1|FINALIZER|NO-WAKE\n"
+                } else {
+                    b"DWDBG|WYR1|FINALIZER|WAKE\n"
+                });
                 crate::syscall::complete_wait_wakes(
                     &mut self.registry,
                     &self.shared.execution,
@@ -3687,6 +3699,10 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
     }
 
     fn enter_idle_scheduler(&mut self) -> ! {
+        #[cfg(deepwyrm_wyr1_evidence)]
+        let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|IDLE|ENTER\n");
+        #[cfg(deepwyrm_wyr1_evidence)]
+        let mut first_scan = true;
         loop {
             enum Entry {
                 Fresh {
@@ -3732,6 +3748,15 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                     }
                 })
             };
+            #[cfg(deepwyrm_wyr1_evidence)]
+            if first_scan {
+                let _ = crate::debug::emit_early_raw_record(if entry.is_some() {
+                    b"DWDBG|WYR1|IDLE|WORK\n"
+                } else {
+                    b"DWDBG|WYR1|IDLE|EMPTY\n"
+                });
+                first_scan = false;
+            }
             match entry {
                 Some(Entry::Fresh { state, stack }) => {
                     unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(stack) }

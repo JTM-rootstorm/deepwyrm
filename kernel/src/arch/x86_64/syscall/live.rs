@@ -1508,8 +1508,14 @@ pub(crate) unsafe extern "sysv64" fn dw_x86_64_first_run_thread_entry() -> ! {
     reason = "the immutable current-CPU binding pairs its carrier with the monomorphized divergent scheduler callback"
 )]
 pub(crate) fn enter_bound_idle_scheduler() -> ! {
+    #[cfg(deepwyrm_wyr1_evidence)]
+    let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|IDLE|BOUND\n");
     validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
+    #[cfg(deepwyrm_wyr1_evidence)]
+    let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|IDLE|VALID\n");
     let binding = runtime_binding().unwrap_or_else(|| halt_forever());
+    #[cfg(deepwyrm_wyr1_evidence)]
+    let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|IDLE|BINDING\n");
     unsafe { (binding.idle_scheduler_handler)(binding.context) }
 }
 
