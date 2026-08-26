@@ -151,3 +151,15 @@ state = "implemented"
 [guest_test.permanent-supervisor-rrc]
 id = 25
 state = "implemented"
+
+# DW1-B's CPU0-only normal-preemption gate. Implementation must add the real
+# selector body and structured evidence before changing this state.
+[guest_test.normal-preemption-up]
+id = 26
+state = "reserved"
+
+# WYR1-B's separate bootstrap-registry and supervisor launch/job gate. It is a
+# distinct product/evidence contract and does not extend selector 25.
+[guest_test.bootstrap-registry-launch]
+id = 27
+state = "reserved"
