@@ -790,13 +790,29 @@ fn i1_terminal_child_without_local_work_rejoins_the_idle_scheduler() {
         .split_once("fn terminate_exception(")
         .expect("terminal handoff terminator")
         .0;
-    let kernel_root = terminal
+    let primordial_unmap = terminal
+        .find("self.unmap_primordial_userspace(&proof)")
+        .unwrap();
+    let next_selection = terminal.find("terminal_reaper_next_on(self.cpu)").unwrap();
+    assert!(primordial_unmap < next_selection);
+    let no_successor = terminal
+        .split_once(
+            "if retiring_wyr1_primordial {\n            // A permanent supervisor may already be Running on another CPU",
+        )
+        .expect("WYR1 no-successor branch")
+        .1
+        .split_once("\n        if retired_process != self.primordial_process {")
+        .expect("ordinary no-successor branch")
+        .0;
+    let kernel_root = no_successor
         .find("enter_kernel_execution_root(previous)")
         .unwrap();
-    let teardown = terminal
-        .rfind("self.finish_inactive_process_teardown(")
+    let retirement = no_successor
+        .find("self.finish_quiesced_process_root_retirement(")
         .unwrap();
-    assert!(kernel_root < teardown);
+    assert!(kernel_root < retirement);
+    assert!(!no_successor.contains("self.unmap_primordial_userspace("));
+    assert!(!no_successor.contains("self.finish_inactive_process_teardown("));
     assert!(!terminal.contains("terminal idle safe-root"));
 }
 

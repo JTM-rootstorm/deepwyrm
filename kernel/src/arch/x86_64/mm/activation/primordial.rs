@@ -1695,6 +1695,26 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if retiring_wyr1_primordial && validate_primordial_retirement_facts(self).is_err() {
             crate::test_support::complete_fail(0x2510_d001)
         }
+        #[cfg(deepwyrm_wyr1_evidence)]
+        let mut wyr1_primordial_teardown = if retiring_wyr1_primordial {
+            // Primordial is still this CPU's hardware-active Process root.
+            // Remove its low half through that exact publisher before choosing
+            // either a userspace successor or the CPU-private kernel root.
+            let proof = self
+                .tasks
+                .process_quiescence_proof(retired_process)
+                .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d009));
+            let drained = self
+                .shared
+                .execution
+                .blocked_operations_drained(&self.tasks, &proof)
+                .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d00a));
+            self.unmap_primordial_userspace(&proof)
+                .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d00b));
+            Some((proof, drained))
+        } else {
+            None
+        };
         if let Some(next) = self.shared.execution.terminal_reaper_next_on(self.cpu) {
             let (stack_id, context_id) = self
                 .tasks
@@ -1715,10 +1735,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             if retired_process != self.process {
                 #[cfg(deepwyrm_wyr1_evidence)]
                 if retiring_wyr1_primordial {
-                    self.finish_inactive_process_teardown(
+                    let (proof, drained) = wyr1_primordial_teardown
+                        .take()
+                        .unwrap_or_else(|| crate::test_support::complete_fail(0x2510_d00c));
+                    self.finish_quiesced_process_root_retirement(
                         retired_process,
-                        retired_root_key,
                         retired_address_space,
+                        &proof,
+                        drained,
                     )
                     .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d002));
                 } else if self.tasks.process_quiescence_proof(retired_process).is_ok() {
@@ -1769,9 +1793,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         #[cfg(deepwyrm_wyr1_evidence)]
         if retiring_wyr1_primordial {
             // A permanent supervisor may already be Running on another CPU,
-            // leaving no same-CPU successor. Move to this CPU's private kernel
-            // root, retire primordial independently, then leave the carrier
-            // idle without resurrecting the bootstrap root.
+            // leaving no same-CPU successor. Primordial's low half is already
+            // gone, so move to this CPU's private kernel root, retire the empty
+            // primordial root, then leave the carrier idle without resurrecting
+            // the bootstrap root.
             let previous = self.active_root.take_process();
             match self.active.enter_kernel_execution_root(previous) {
                 Ok(kernel) => self.active_root = CarrierActiveRoot::Kernel(kernel),
@@ -1784,10 +1809,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     })
                 }
             }
-            self.finish_inactive_process_teardown(
+            let (proof, drained) = wyr1_primordial_teardown
+                .take()
+                .unwrap_or_else(|| crate::test_support::complete_fail(0x2510_d00c));
+            self.finish_quiesced_process_root_retirement(
                 retired_process,
-                retired_root_key,
                 retired_address_space,
+                &proof,
+                drained,
             )
             .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d007));
             self.enable_wyr1_reporter_after_retirement()
@@ -2516,6 +2545,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .blocked_operations_drained(&self.tasks, &proof)
             .map_err(|_| ())?;
         self.unmap_inactive_userspace(process, root_key, &proof)?;
+        self.finish_quiesced_process_root_retirement(process, address_space, &proof, drained)
+    }
+
+    fn finish_quiesced_process_root_retirement(
+        &mut self,
+        process: ProcessKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+        proof: &crate::task::ProcessQuiescenceProof,
+        drained: crate::task::BlockedOperationsDrained,
+    ) -> Result<(), ()> {
         if process != self.primordial_process {
             self.active
                 .teardown_empty_child_address_space(process, address_space)
@@ -2526,7 +2565,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .retire_quiesced_root(
                 &mut self.tasks,
                 process,
-                &proof,
+                proof,
                 self.shared.execution.blocked_operations(),
                 drained,
             )
