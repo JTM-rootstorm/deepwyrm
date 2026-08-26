@@ -322,6 +322,34 @@ fn wyr1_terminal_outcomes_share_one_claimed_prefix_transaction() {
 }
 
 #[test]
+fn wyr1_reporter_enablement_requires_quiescence_after_root_retirement() {
+    let primordial =
+        fs::read_to_string(kernel_root().join("src/arch/x86_64/mm/activation/primordial.rs"))
+            .expect("read primordial runtime");
+    let start = primordial
+        .find("fn enable_wyr1_reporter_after_retirement(")
+        .expect("selector-25 reporter enablement");
+    let end = primordial[start..]
+        .find("\n    fn drain_finalizers(")
+        .map(|offset| start + offset)
+        .expect("selector-25 reporter enablement boundary");
+    let enablement = &primordial[start..end];
+    assert!(
+        enablement.contains(
+            ".process_quiescence_proof(self.primordial_process)\n                .is_err()"
+        )
+    );
+    assert!(
+        !enablement.contains(
+            ".process_quiescence_proof(self.primordial_process)\n                .is_ok()"
+        )
+    );
+    assert!(enablement.contains(".root_region(self.primordial_process)"));
+    assert!(enablement.contains(".is_some()"));
+    assert!(enablement.contains("process_lifecycle(reporter)"));
+}
+
+#[test]
 fn wrcap_relay_is_selector_only_bounded_and_precedes_terminal_completion() {
     let build = fs::read_to_string(kernel_root().join("build.rs")).expect("read kernel build");
     let relay = fs::read_to_string(kernel_root().join("src/test_support/wrcap.rs"))

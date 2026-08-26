@@ -1,6 +1,8 @@
 extern crate std;
 
 use super::*;
+#[cfg(deepwyrm_wyr1_evidence)]
+use deepwyrm_abi::DW_OBJECT_TYPE_ADDRESS_REGION;
 use deepwyrm_abi::{
     DW_EXCEPTION_PAGE_FAULT, DW_OBJECT_TYPE_EVENT, DW_RIGHT_INSPECT, DW_TASK_STATE_CREATED,
     DW_TASK_STATE_EXITED, DW_TASK_STATE_RUNNING, DW_TERMINATION_AUTHORIZED,
@@ -41,6 +43,18 @@ fn finish_task_release(
 
 fn process_parent_pin(registry: &mut ObjectRegistry<OBJECTS>, process: &HandleRef) -> InternalRef {
     registry.retain_internal_from_handle(process).unwrap()
+}
+
+#[cfg(deepwyrm_wyr1_evidence)]
+fn wyr1_reporter_enablement_model(
+    tasks: &Tasks,
+    primordial: ProcessKey,
+    reporter: ProcessKey,
+) -> bool {
+    reporter != primordial
+        && tasks.process_quiescence_proof(primordial).is_ok()
+        && tasks.root_region(primordial) == Ok(None)
+        && tasks.process_lifecycle(reporter) == Ok(ProcessLifecycleState::AcceptingOperations)
 }
 
 fn release_nonfinal_pin(registry: &mut ObjectRegistry<OBJECTS>, pin: InternalRef) {
@@ -273,6 +287,54 @@ fn process_gate_selects_one_termination_and_drains_preexisting_operations() {
     finish_task_release(&mut tasks, &mut registry, process_final);
     let root_final = registry.release_internal(root_owner).unwrap().unwrap();
     finish_task_release(&mut tasks, &mut registry, root_final);
+}
+
+#[cfg(deepwyrm_wyr1_evidence)]
+#[test]
+fn wyr1_monitor_retains_exited_process_through_root_retirement_enablement_model() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root_group, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (primordial, process_monitor) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let (reporter, _reporter_handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let root = registry.create(DW_OBJECT_TYPE_ADDRESS_REGION).unwrap();
+    let root_object = root.id();
+    let region_owner = registry.creation_into_internal(root).unwrap();
+    tasks.attach_root_region(primordial, root_object).unwrap();
+
+    assert!(!wyr1_reporter_enablement_model(
+        &tasks, primordial, reporter
+    ));
+
+    let effects = tasks
+        .terminate_process_authorized(&mut registry, primordial, 0x2510)
+        .unwrap();
+    let (process_pin, thread_pins, resources) = effects.pins.into_parts();
+    assert!(thread_pins.into_iter().all(|pin| pin.is_none()));
+    assert!(resources.into_iter().all(|resource| resource.is_none()));
+    assert!(
+        registry
+            .release_internal(process_pin.unwrap())
+            .unwrap()
+            .is_none()
+    );
+    assert!(!wyr1_reporter_enablement_model(
+        &tasks, primordial, reporter
+    ));
+
+    assert_eq!(
+        tasks.take_exited_root_region(primordial).unwrap(),
+        Some(root_object)
+    );
+    assert!(tasks.process_quiescence_proof(primordial).is_ok());
+    assert_eq!(ProcessKey::from_object_id(process_monitor.id()), primordial);
+    assert_eq!(
+        tasks.process_info(primordial).unwrap().state,
+        DW_TASK_STATE_EXITED
+    );
+    assert!(wyr1_reporter_enablement_model(&tasks, primordial, reporter));
+
+    assert!(registry.release_internal(region_owner).unwrap().is_some());
 }
 
 #[test]

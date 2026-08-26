@@ -2553,7 +2553,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             || self
                 .tasks
                 .process_quiescence_proof(self.primordial_process)
-                .is_ok()
+                .is_err()
             || self
                 .tasks
                 .root_region(self.primordial_process)
