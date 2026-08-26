@@ -823,7 +823,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         );
         let pending = {
             let mut runtime = self.runtime.lock();
-            runtime.select_cpu(self.cpu);
+            runtime.switch_cpu(self.cpu);
+            runtime.complete_physical_switch_handoff();
+            runtime.synchronize_scheduler_current();
             match runtime.prepare_remote_process_exception(exception) {
                 ProcessTerminationPreparation::Immediate(result) => {
                     assert_eq!(result.status, DW_STATUS_SUCCESS);
@@ -3597,6 +3599,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 
     fn invalid_return(&mut self, error: crate::arch::x86_64::syscall::UserReturnError) {
+        self.complete_physical_switch_handoff();
+        self.synchronize_scheduler_current();
         self.terminate_exception(crate::task::TaskExceptionRecord::new(
             DW_EXCEPTION_GENERAL_PROTECTION,
             invalid_user_return_detail(error),
@@ -3605,6 +3609,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 
     fn user_exception(&mut self, record: crate::arch::x86_64::exceptions::UserExceptionRecord) {
+        self.complete_physical_switch_handoff();
+        self.synchronize_scheduler_current();
         self.terminate_exception(record.task_exception());
     }
 
@@ -4269,9 +4275,11 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         let mut runtime = self.runtime.lock();
         // A suspended continuation may resume after another physical CPU used
         // the shared carrier. Restore this CPU's exact carrier/root token
-        // before inspecting any scheduler or terminal ownership associated
-        // with the resumed frame.
+        // and acknowledge destination-stack arrival before inspecting any
+        // scheduler or terminal ownership associated with the resumed frame.
         runtime.switch_cpu(self.cpu);
+        runtime.complete_physical_switch_handoff();
+        runtime.synchronize_scheduler_current();
         let notification = crate::arch::x86_64::idle::take_current_notification_at_safe_point();
         if matches!(
             notification,

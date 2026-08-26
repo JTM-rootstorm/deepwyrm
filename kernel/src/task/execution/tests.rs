@@ -574,6 +574,60 @@ fn terminal_physical_claim_prefers_unpublished_suspended_generation_over_logical
 }
 
 #[test]
+fn destination_acknowledges_prior_suspension_before_terminal_process_retirement() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (process, process_handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let process_owner = registry
+        .retain_internal_from_handle(&process_handle)
+        .unwrap();
+    let (outgoing, _outgoing_handle) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    let (replacement, _replacement_handle) =
+        tasks.create_thread(&mut registry, &process_owner).unwrap();
+    assert!(registry.release_internal(process_owner).unwrap().is_none());
+    assert!(registry.release_internal(root_owner).unwrap().is_none());
+
+    let domain = ExecutionDomain::<2>::new(stack_bounds::<2>()).unwrap();
+    domain
+        .start_thread(&mut tasks, outgoing, start_state(65))
+        .unwrap();
+    domain
+        .start_thread(&mut tasks, replacement, start_state(66))
+        .unwrap();
+    let cpu0 = crate::cpu::CpuIndex::BOOTSTRAP;
+    assert_eq!(
+        domain.schedule_next_on(cpu0).unwrap().current,
+        Some(outgoing)
+    );
+    let (_block, decision) = domain.block_current_on(cpu0, outgoing).unwrap();
+    assert_eq!(decision.current, Some(replacement));
+
+    let outgoing_claim = domain.suspended_claim_on(cpu0).unwrap();
+    domain.complete_switch_on(outgoing_claim).unwrap();
+    assert_eq!(domain.suspended_claim_on(cpu0), None);
+
+    let effects = tasks
+        .exit_process(&mut registry, process, replacement, 0)
+        .unwrap();
+    let (retired, deferred) =
+        domain.retire_exit_pins_defer_current_on(cpu0, effects.pins, replacement);
+    let terminal_claim = domain.suspended_claim_on(cpu0).unwrap();
+    assert_eq!(terminal_claim.thread(), replacement);
+    let deferred_pins = domain.reclaim_deferred_current_on(cpu0, deferred);
+    assert_eq!(domain.suspended_claim_on(cpu0), None);
+
+    let (process_pin, thread_pins) = retired.into_parts();
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        assert!(registry.release_internal(pin).unwrap().is_none());
+    }
+    let (process_pin, thread_pins) = deferred_pins.into_parts();
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        assert!(registry.release_internal(pin).unwrap().is_none());
+    }
+}
+
+#[test]
 #[allow(
     unsafe_code,
     reason = "the test owns both CPU0 stack carriers while reproducing a wake after logical block commit but before the physical switch"

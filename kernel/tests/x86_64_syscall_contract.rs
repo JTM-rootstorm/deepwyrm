@@ -538,6 +538,45 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
         .1;
     assert!(resume.contains("runtime.switch_cpu(self.cpu);"));
     assert!(resume.contains("runtime.resume_suspended(frame)"));
+
+    let direct_invalid = runtime
+        .split_once("fn invalid_return(&mut self, error:")
+        .expect("direct invalid-return terminal path")
+        .1
+        .split_once("fn user_exception(")
+        .expect("direct user-exception boundary")
+        .0;
+    let direct_ack = direct_invalid
+        .find("self.complete_physical_switch_handoff();")
+        .expect("direct invalid-return switch acknowledgement");
+    let direct_sync = direct_invalid
+        .find("self.synchronize_scheduler_current();")
+        .expect("direct invalid-return scheduler synchronization");
+    let direct_terminal = direct_invalid
+        .find("self.terminate_exception(")
+        .expect("direct invalid-return termination");
+    assert!(direct_ack < direct_sync && direct_sync < direct_terminal);
+
+    let remote_terminal = runtime
+        .split_once("fn terminate_exception_with_remote_stops(")
+        .expect("remote terminal exception path")
+        .1
+        .split_once("fn intercept_wyr1_evidence_raw(")
+        .expect("remote terminal exception boundary")
+        .0;
+    let remote_switch = remote_terminal
+        .find("runtime.switch_cpu(self.cpu);")
+        .expect("remote terminal CPU restoration");
+    let remote_ack = remote_terminal
+        .find("runtime.complete_physical_switch_handoff();")
+        .expect("remote terminal switch acknowledgement");
+    let remote_sync = remote_terminal
+        .find("runtime.synchronize_scheduler_current();")
+        .expect("remote terminal scheduler synchronization");
+    let remote_prepare = remote_terminal
+        .find("runtime.prepare_remote_process_exception(exception)")
+        .expect("remote terminal preparation");
+    assert!(remote_switch < remote_ack && remote_ack < remote_sync && remote_sync < remote_prepare);
 }
 
 #[test]
@@ -554,11 +593,23 @@ fn i2_suspended_resume_gives_remote_stop_priority_under_scheduler_authority() {
         .0;
     let authority = resume.find("self.runtime.lock()").unwrap();
     let carrier = resume.find("runtime.switch_cpu(self.cpu)").unwrap();
+    let acknowledgement = resume
+        .find("runtime.complete_physical_switch_handoff()")
+        .unwrap();
+    let synchronization = resume
+        .find("runtime.synchronize_scheduler_current()")
+        .unwrap();
     let mailbox = resume
         .find("take_current_notification_at_safe_point()")
         .unwrap();
     let current = resume.find("runtime.resume_suspended(frame)").unwrap();
-    assert!(authority < carrier && carrier < mailbox && mailbox < current);
+    assert!(
+        authority < carrier
+            && carrier < acknowledgement
+            && acknowledgement < synchronization
+            && synchronization < mailbox
+            && mailbox < current
+    );
     assert!(resume.contains("NativeResumeOutcome::ServiceRendezvous"));
 
     let suspended = live
