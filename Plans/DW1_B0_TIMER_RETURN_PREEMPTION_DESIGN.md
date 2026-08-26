@@ -299,3 +299,74 @@ source code or ABI was copied or adapted.
 
 This document is first-party `GPL-2.0-or-later` work. Existing component/file
 license declarations remain unchanged.
+
+## 11. Selector-26 paired evidence contract
+
+Selector `normal-preemption-up`, test ID `26`, uses one test-build-only raw
+operation number, `0xFFFF_FF1A`. It is absent from the generated public ABI and
+production kernels. Selector 25 retains its distinct `0xFFFF_FF19` operation,
+collector, capacity, and transcript.
+
+The raw argument forms are exact:
+
+```text
+ARM:
+    arg0 = 1
+    arg1 = CPU-hog Process handle
+    arg2 = progress Process handle
+    arg3 = 8
+    arg4 = 0
+    arg5 = 0
+
+PROGRESS:
+    arg0 = 2
+    arg1 = 8
+    arg2 = fixed challenge/reply digest
+    arg3 = ordinary hello transaction ID
+    arg4 = 0
+    arg5 = 0
+```
+
+ARM and PROGRESS are ordered, once-only operations from the same exact init0
+Process. ARM resolves two distinct live Process handles, each with exactly one
+live Thread, and records their generation-safe kernel identities. PROGRESS is
+accepted only after ARM from the bound reporter. The Wyrmroot product freezes
+the challenge/reply digest and ordinary hello transaction value before paired
+acceptance; Deepwyrm records their exact ARM/PROGRESS values without admitting
+them to the public ABI.
+
+The selector collector observes scheduler transitions independently of
+userspace. It must see the exact registered hog Thread Running after ARM and an
+involuntary switch whose outgoing identity is that exact Thread. Aggregate CPU
+counters alone cannot establish the outgoing-hog fact.
+
+At normal primordial completion, Deepwyrm emits exactly one fixed 122-byte
+summary immediately before the canonical PASS `DWTEST1` terminal:
+
+```text
+DWPRE1|01|NNNNNNNNNNNNNNNN|00000000|QQQQQQQQQQQQQQQQ|PPPPPPPPPPPPPPPP|CCCCCCCCCCCCCCCC|WWWWWWWWWWWWWWWW|FFFFFFFF|CCCCCCCC\n
+```
+
+The fields are, in order: build-owned nonzero nonce, CPU ID, quantum-expiration
+delta, involuntary-preemption delta, context-switch delta, wakeup delta,
+required fact mask, and uppercase FNV-1a-32 checksum over every byte preceding
+the checksum field. The fact mask is exactly `0x000000FF`:
+
+1. exact hog and progress identities bound;
+2. the exact hog observed Running after ARM;
+3. the exact outgoing hog involuntarily preempted;
+4. the progress actor completed eight Channel exchanges;
+5. ordinary hello READY, exit-zero, and cleanup completed;
+6. exact hog termination and reap completed once;
+7. primordial/bootstrap completion was normal; and
+8. scheduler accounting remained non-overflowed.
+
+PASS additionally requires `1 <= involuntary_preemptions <=
+quantum_expirations <= 256`, `context_switches >=
+involuntary_preemptions`, `wakeups >= 8`, the exact outgoing-hog fact, and
+canonical `DWTEST1` test ID 26/detail zero. The host must require the matching
+debug-exit status; serial text alone remains insufficient.
+
+Selector 26 has an independent four-descendant-capable runtime budget. Its
+bootfs mapping-page ceiling remains pending measurement of the frozen Wyrmroot
+payload and must not reuse or change selector 25's measured 42-page exception.
