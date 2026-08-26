@@ -10,13 +10,15 @@ use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::arch::x86_64::exceptions::{EarlyException, ExceptionVector};
 use crate::debug::emit_early_raw_record;
-#[cfg(any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay))]
+#[cfg(any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence))]
 use crate::debug::{TestSerialTransaction, begin_test_serial_transaction};
 
 #[cfg(deepwyrm_i1_evidence)]
 use super::{EvidenceFlushError, I1_EVIDENCE};
 #[cfg(deepwyrm_wrcap_relay)]
 use super::{WRCAP_RELAY, WrcapFlushError};
+#[cfg(deepwyrm_wyr1_evidence)]
+use super::{Wyr1EvidenceFlushError, wyr1_evidence::Wyr1EvidenceFlushPermit};
 use super::{
     identity::{
         ExpectedPageFaultFacts, ExpectedPageFaultKind, completion_record, exception_outcome,
@@ -83,7 +85,7 @@ unsafe extern "sysv64" {
 /// that the QEMU-only I/O device is present on an arbitrary machine.
 struct QemuCompletionTransport {
     _private: (),
-    #[cfg(any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay))]
+    #[cfg(any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence))]
     transaction: Option<TestSerialTransaction>,
 }
 
@@ -103,7 +105,7 @@ impl QemuCompletionTransport {
     const unsafe fn new() -> Self {
         Self {
             _private: (),
-            #[cfg(any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay))]
+            #[cfg(any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence))]
             transaction: None,
         }
     }
@@ -116,7 +118,7 @@ impl CompletionTransport for QemuCompletionTransport {
     ) -> Result<(), CompletionTransportError> {
         // The host requires both the serial record and matching process status;
         // a serial failure therefore becomes infrastructure failure, never PASS.
-        #[cfg(any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay))]
+        #[cfg(any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence))]
         if let Some(transaction) = self.transaction.as_mut() {
             return transaction
                 .write_terminal(record)
@@ -140,18 +142,106 @@ impl CompletionTransport for QemuCompletionTransport {
     }
 }
 
+/// Flush selector-25's preserved transcript and append its PASS terminal in
+/// the same exclusive COM1 transaction before issuing debug-exit.
+#[cfg(deepwyrm_wyr1_evidence)]
+pub(crate) fn complete_wyr1_evidence(permit: Wyr1EvidenceFlushPermit<'_>) -> ! {
+    let mut transport = unsafe { QemuCompletionTransport::new() };
+    let outcome = match begin_test_serial_transaction() {
+        Ok(transaction) => {
+            transport.transaction = Some(transaction);
+            match permit.flush(|record| {
+                transport
+                    .transaction
+                    .as_mut()
+                    .expect("WYR1EVID1 reporter owns its serial transaction")
+                    .write_evidence(record)
+                    .map_err(|_| Wyr1EvidenceFlushError::Transport)
+            }) {
+                Ok(()) => (CompletionOutcome::Pass, 0),
+                Err(error) => (CompletionOutcome::Fail, wyr1_failure_detail(error)),
+            }
+        }
+        Err(_) => halt_after_completion(),
+    };
+    complete(&mut transport, completion_record(outcome.0, outcome.1))
+}
+
+/// Selector-25's sole kernel terminal for failures and panics. One atomic
+/// claimant owns the accepted evidence prefix, DWTEST1, and debug-exit as one
+/// transaction.
+#[cfg(deepwyrm_wyr1_evidence)]
+fn complete_wyr1_evidence_kernel_terminal(outcome: CompletionOutcome, detail: u32) -> ! {
+    debug_assert!(outcome != CompletionOutcome::Pass);
+    let Some(permit) = super::WYR1_EVIDENCE.claim_failure() else {
+        halt_after_completion()
+    };
+    let mut transport = unsafe { QemuCompletionTransport::new() };
+    let Ok(transaction) = begin_test_serial_transaction() else {
+        halt_after_completion()
+    };
+    transport.transaction = Some(transaction);
+    if permit
+        .flush_prefix(|record| {
+            transport
+                .transaction
+                .as_mut()
+                .expect("WYR1EVID1 failure owns its serial transaction")
+                .write_evidence(record)
+                .map_err(|_| Wyr1EvidenceFlushError::Transport)
+        })
+        .is_err()
+    {
+        halt_after_completion()
+    }
+    complete(&mut transport, completion_record(outcome, detail))
+}
+
+#[cfg(deepwyrm_wyr1_evidence)]
+fn wyr1_failure_detail(error: Wyr1EvidenceFlushError) -> u32 {
+    match error {
+        Wyr1EvidenceFlushError::Incomplete => 0x2510_f001,
+        Wyr1EvidenceFlushError::Early => 0x2510_f002,
+        Wyr1EvidenceFlushError::Retirement => 0x2510_f003,
+        Wyr1EvidenceFlushError::WrongReporter => 0x2510_f004,
+        Wyr1EvidenceFlushError::Malformed => 0x2510_f005,
+        Wyr1EvidenceFlushError::OutOfOrder => 0x2510_f006,
+        Wyr1EvidenceFlushError::Full => 0x2510_f007,
+        Wyr1EvidenceFlushError::DuplicateTerminal => 0x2510_f008,
+        Wyr1EvidenceFlushError::ReporterClaimed => 0x2510_f009,
+        Wyr1EvidenceFlushError::Busy => 0x2510_f00a,
+        Wyr1EvidenceFlushError::Transport => 0x2510_f00b,
+    }
+}
+
 /// Emit the build-selected test's PASS terminal record and stop.
 pub(crate) fn complete_pass(detail: u32) -> ! {
+    #[cfg(deepwyrm_wyr1_evidence)]
+    {
+        let _ = detail;
+        complete_wyr1_evidence_kernel_terminal(CompletionOutcome::Fail, 0x2510_ffff)
+    }
+    #[cfg(not(deepwyrm_wyr1_evidence))]
     complete_known_outcome(CompletionOutcome::Pass, detail)
 }
 
 /// Emit the build-selected test's FAIL terminal record and stop.
 pub(crate) fn complete_fail(detail: u32) -> ! {
+    #[cfg(deepwyrm_wyr1_evidence)]
+    {
+        complete_wyr1_evidence_kernel_terminal(CompletionOutcome::Fail, detail)
+    }
+    #[cfg(not(deepwyrm_wyr1_evidence))]
     complete_known_outcome(CompletionOutcome::Fail, detail)
 }
 
 /// Emit the build-selected test's PANIC terminal record and stop.
 pub(crate) fn complete_panic(detail: u32) -> ! {
+    #[cfg(deepwyrm_wyr1_evidence)]
+    {
+        complete_wyr1_evidence_kernel_terminal(CompletionOutcome::Panic, detail)
+    }
+    #[cfg(not(deepwyrm_wyr1_evidence))]
     complete_known_outcome(CompletionOutcome::Panic, detail)
 }
 
@@ -310,6 +400,7 @@ pub(crate) fn trigger_expected_invalid_opcode() -> ! {
     unsafe_code,
     reason = "compile-time test identity confines construction to the QEMU test image"
 )]
+#[cfg(not(deepwyrm_wyr1_evidence))]
 fn complete_known_outcome(outcome: CompletionOutcome, detail: u32) -> ! {
     // SAFETY: this function exists only in an x86_64-none `test-support` build
     // whose compile-time selector was resolved by the central QEMU harness

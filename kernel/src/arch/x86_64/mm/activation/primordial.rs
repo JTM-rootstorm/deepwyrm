@@ -15,6 +15,8 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use crate::boot::primordial::construction::authority::{
     AuthorityPrimordialBackend, AuthorityPrimordialMonitor, PrimordialPlatform,
 };
+#[cfg(deepwyrm_wyr1_evidence)]
+use crate::boot::primordial::construction::validate_primordial_retirement_facts;
 use crate::boot::primordial::construction::{
     PrimordialCompletionBackend, PrimordialExitDisposition, complete_primordial_launch,
     construct_primordial,
@@ -39,6 +41,8 @@ use crate::syscall::native::{
 use crate::syscall::{
     CleanupQueue, FServiceRoute, FServiceState, NativeWaitControl, TerminalWaitCleanup,
 };
+#[cfg(deepwyrm_wyr1_evidence)]
+use crate::task::ProcessLifecycleState;
 use crate::task::{ExecutionDomain, ProcessKey, SchedulerThreadState, TaskAuthority, ThreadKey};
 use crate::time::TimerAuthority;
 use crate::wait::{EventAuthority, WaitRegistry};
@@ -49,7 +53,7 @@ use deepwyrm_abi::{
 };
 
 const MAX_BOOTFS_BYTES: usize = 32 * 1024 * 1024;
-#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
+#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence)))]
 const REGISTRY_OBJECTS: usize = 32;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const REGISTRY_OBJECTS: usize = 64;
@@ -58,7 +62,14 @@ const REGISTRY_OBJECTS: usize = 64;
 // multi-process stress budget.
 #[cfg(deepwyrm_wrcap_relay)]
 const REGISTRY_OBJECTS: usize = 48;
-#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
+// Selector 25's exact concurrent graph is primordial + init + two early
+// roles.  Relative to the 32-object three-Process baseline, the fourth loader
+// set contributes Process/root/Thread, three image MemoryObjects, and one
+// Channel pair; three attempt TaskGroups and one control Timer keep the
+// measured peak below this 48-object bound.
+#[cfg(deepwyrm_wyr1_evidence)]
+const REGISTRY_OBJECTS: usize = 48;
+#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence)))]
 const MEMORY_OBJECTS: usize = 10;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const MEMORY_OBJECTS: usize = 24;
@@ -67,7 +78,11 @@ const MEMORY_OBJECTS: usize = 24;
 // case keeps one controller-owned probe object live at the same time.
 #[cfg(deepwyrm_wrcap_relay)]
 const MEMORY_OBJECTS: usize = 12;
-#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
+// Four live images need the baseline bootfs plus three segments/stack objects
+// per descendant: 10 for three Processes plus one three-object role image.
+#[cfg(deepwyrm_wyr1_evidence)]
+const MEMORY_OBJECTS: usize = 13;
+#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence)))]
 const MEMORY_LEASES: usize = 10;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const MEMORY_LEASES: usize = 24;
@@ -75,23 +90,29 @@ const MEMORY_LEASES: usize = 24;
 // more into the worker, so it needs one additional mapping lease.
 #[cfg(deepwyrm_wrcap_relay)]
 const MEMORY_LEASES: usize = 13;
+#[cfg(deepwyrm_wyr1_evidence)]
+const MEMORY_LEASES: usize = 13;
 // I0 keeps the complete bootstrap -> init0 -> hello chain live while each
 // parent performs bounded READY/exit supervision of its direct child. The
 // selector-24 controller adds exactly one temporary supervised child.
-#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
+#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence)))]
 const USERSPACE_CHAIN_PROCESSES: usize = 3;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const USERSPACE_CHAIN_PROCESSES: usize = 6;
 #[cfg(deepwyrm_wrcap_relay)]
 const USERSPACE_CHAIN_PROCESSES: usize = 4;
-#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
+#[cfg(deepwyrm_wyr1_evidence)]
+const USERSPACE_CHAIN_PROCESSES: usize = 4;
+#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence)))]
 const CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const CHANNEL_PAIRS: usize = 8;
 #[cfg(deepwyrm_wrcap_relay)]
 const CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;
+#[cfg(deepwyrm_wyr1_evidence)]
+const CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;
 const CHANNEL_DEPTH: usize = 2;
-#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
+#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence)))]
 const WAITERS: usize = 4;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const WAITERS: usize = 12;
@@ -100,12 +121,19 @@ const WAITERS: usize = 12;
 // registration, for an exact selector-24 peak of six.
 #[cfg(deepwyrm_wrcap_relay)]
 const WAITERS: usize = 6;
-#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
+// Before primordial retires, its init READY wait overlaps init's one-at-a-time
+// early-role READY wait: two registrations per WAIT_ANY, exact peak four.
+#[cfg(deepwyrm_wyr1_evidence)]
+const WAITERS: usize = 4;
+#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence)))]
 const TASK_GROUPS: usize = 1;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const TASK_GROUPS: usize = 4;
 #[cfg(deepwyrm_wrcap_relay)]
 const TASK_GROUPS: usize = 2;
+// Root, init's delegated group, and one attempt group per two resident roles.
+#[cfg(deepwyrm_wyr1_evidence)]
+const TASK_GROUPS: usize = 4;
 const PROCESSES: usize = USERSPACE_CHAIN_PROCESSES;
 const THREADS: usize = USERSPACE_CHAIN_PROCESSES;
 // Exact live bootstrap peak per Process: four inherited handles, one net
@@ -123,7 +151,7 @@ const BOOTSTRAP_HANDLE_PEAK: usize = INITIAL_BOOTSTRAP_HANDLES
     + PROCESS_ROOT_HANDLES
     + THREAD_HANDLES
     + INIT_DUPLICATE_HANDLES;
-#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
+#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence)))]
 const HANDLES: usize = BOOTSTRAP_HANDLE_PEAK;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const HANDLES: usize = 16;
@@ -131,6 +159,11 @@ const HANDLES: usize = 16;
 // ordinary loader transaction, one above the ten-handle bootstrap peak.
 #[cfg(deepwyrm_wrcap_relay)]
 const HANDLES: usize = BOOTSTRAP_HANDLE_PEAK + 1;
+// Init retains three supervision handles per resident role. While launching
+// the second role, its four inherited handles + first role's three retained
+// handles + the ordinary six-handle loader delta produce the exact peak 13.
+#[cfg(deepwyrm_wyr1_evidence)]
+const HANDLES: usize = BOOTSTRAP_HANDLE_PEAK + 3;
 const SPACES: usize = USERSPACE_CHAIN_PROCESSES;
 const REGIONS: usize = USERSPACE_CHAIN_PROCESSES;
 const REGION_OBJECTS: usize = USERSPACE_CHAIN_PROCESSES;
@@ -152,12 +185,17 @@ const TIMERS: usize = 2;
 // pages after init0 termination-race reconciliation. The ordinary Wave 4
 // bootfs is exactly 17 pages with its selector-specific init0 artifact.
 const PRIMORDIAL_TABLE_CANDIDATES: usize = 6;
-#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
+#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence)))]
 const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 17;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 32;
 #[cfg(deepwyrm_wrcap_relay)]
 const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 39;
+// WYR1 media must replace this conservative selector-local ceiling with its
+// exact measured bootfs page count at image integration; it is deliberately
+// separate from the accepted WYR0 selector bounds.
+#[cfg(deepwyrm_wyr1_evidence)]
+const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 64;
 const PRIMORDIAL_JOURNAL_ENTRIES: usize =
     PRIMORDIAL_MAX_MAPPING_PAGES + PRIMORDIAL_TABLE_CANDIDATES;
 const PRIMORDIAL_INVALIDATIONS: usize = PRIMORDIAL_MAX_MAPPING_PAGES;
@@ -172,12 +210,28 @@ const _: [(); PROCESSES] = [(); SPACES];
 const _: [(); PROCESSES] = [(); REGIONS];
 const _: [(); PROCESSES] = [(); REGION_OBJECTS];
 const _: [(); PROCESSES] = [(); EXECUTION_THREADS];
-#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
+#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence)))]
 const _: [(); 10] = [(); HANDLES];
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const _: [(); 16] = [(); HANDLES];
 #[cfg(deepwyrm_wrcap_relay)]
 const _: [(); 11] = [(); HANDLES];
+#[cfg(deepwyrm_wyr1_evidence)]
+const _: [(); 13] = [(); HANDLES];
+#[cfg(deepwyrm_wyr1_evidence)]
+const _: [(); 4] = [(); USERSPACE_CHAIN_PROCESSES];
+#[cfg(deepwyrm_wyr1_evidence)]
+const _: [(); 4] = [(); CHANNEL_PAIRS];
+#[cfg(deepwyrm_wyr1_evidence)]
+const _: [(); 4] = [(); WAITERS];
+#[cfg(deepwyrm_wyr1_evidence)]
+const _: [(); 4] = [(); TASK_GROUPS];
+#[cfg(deepwyrm_wyr1_evidence)]
+const _: [(); 13] = [(); MEMORY_OBJECTS];
+#[cfg(deepwyrm_wyr1_evidence)]
+const _: [(); 13] = [(); MEMORY_LEASES];
+#[cfg(deepwyrm_wyr1_evidence)]
+const _: [(); 48] = [(); REGISTRY_OBJECTS];
 const _: [(); 7] = [(); BOOTSTRAP_HANDLE_PEAK - INIT_MOVED_HANDLES];
 
 #[cfg(feature = "test-support")]
@@ -213,6 +267,7 @@ impl G5PrimordialProbe {
             BuildGuestTest::SmpRuntimeStress => G5PrimordialExpectation::Baseline,
             BuildGuestTest::SmpRuntimeAcceptance => G5PrimordialExpectation::Baseline,
             BuildGuestTest::NativeUserspaceCapability => G5PrimordialExpectation::Baseline,
+            BuildGuestTest::PermanentSupervisorRrc => G5PrimordialExpectation::Baseline,
             BuildGuestTest::PrimordialBlockingCleanup => G5PrimordialExpectation::BlockingCleanup,
             BuildGuestTest::PrimordialUserException => G5PrimordialExpectation::UserException,
             BuildGuestTest::PrimordialInvalidReturn => G5PrimordialExpectation::InvalidReturn,
@@ -1370,6 +1425,8 @@ struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_
     primordial_process: ProcessKey,
     primordial_root_key: crate::memory::address_region::AddressRegionObjectKey,
     primordial_address_space: crate::memory::address_region::AddressSpaceKey,
+    #[cfg(deepwyrm_wyr1_evidence)]
+    wyr1_init_process: Option<ProcessKey>,
     channel_keys: [crate::ipc::ChannelEndpointKey; 2],
     kernel_peer: Option<HandleRef>,
     process_monitor: Option<HandleRef>,
@@ -1628,6 +1685,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deferred,
             &mut self.cleanup,
         );
+        #[cfg(deepwyrm_wyr1_evidence)]
+        let retiring_wyr1_primordial = retired_process == self.primordial_process;
+        #[cfg(deepwyrm_wyr1_evidence)]
+        if retiring_wyr1_primordial && validate_primordial_retirement_facts(self).is_err() {
+            crate::test_support::complete_fail(0x2510_d001)
+        }
         if let Some(next) = self.shared.execution.terminal_reaper_next_on(self.cpu) {
             let (stack_id, context_id) = self
                 .tasks
@@ -1645,15 +1708,37 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .kernel_continuation_rsp(context_id)
                 .unwrap_or_else(|error| panic!("terminal next continuation failed: {error:?}"));
             self.synchronize_scheduler_current();
-            if retired_process != self.process
-                && self.tasks.process_quiescence_proof(retired_process).is_ok()
-            {
-                self.finish_inactive_process_teardown(
-                    retired_process,
-                    retired_root_key,
-                    retired_address_space,
-                )
-                .unwrap_or_else(|_| panic!("inactive exited Process teardown drifted"));
+            if retired_process != self.process {
+                #[cfg(deepwyrm_wyr1_evidence)]
+                if retiring_wyr1_primordial {
+                    self.finish_inactive_process_teardown(
+                        retired_process,
+                        retired_root_key,
+                        retired_address_space,
+                    )
+                    .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d002));
+                } else if self.tasks.process_quiescence_proof(retired_process).is_ok() {
+                    self.finish_inactive_process_teardown(
+                        retired_process,
+                        retired_root_key,
+                        retired_address_space,
+                    )
+                    .unwrap_or_else(|_| panic!("inactive exited Process teardown drifted"));
+                }
+                #[cfg(not(deepwyrm_wyr1_evidence))]
+                if self.tasks.process_quiescence_proof(retired_process).is_ok() {
+                    self.finish_inactive_process_teardown(
+                        retired_process,
+                        retired_root_key,
+                        retired_address_space,
+                    )
+                    .unwrap_or_else(|_| panic!("inactive exited Process teardown drifted"));
+                }
+            }
+            #[cfg(deepwyrm_wyr1_evidence)]
+            if retiring_wyr1_primordial {
+                self.enable_wyr1_reporter_after_retirement()
+                    .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d003));
             }
             unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(stack) }
                 .unwrap_or_else(|error| panic!("terminal next stack binding failed: {error:?}"));
@@ -1675,6 +1760,36 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 |error| panic!("terminal next syscall boundary validation failed: {error:?}"),
             );
             return PreparedTerminalHandoff::Continuation(continuation);
+        }
+
+        #[cfg(deepwyrm_wyr1_evidence)]
+        if retiring_wyr1_primordial {
+            // A permanent supervisor may already be Running on another CPU,
+            // leaving no same-CPU successor. Move to this CPU's private kernel
+            // root, retire primordial independently, then leave the carrier
+            // idle without resurrecting the bootstrap root.
+            let previous = self.active_root.take_process();
+            match self.active.enter_kernel_execution_root(previous) {
+                Ok(kernel) => self.active_root = CarrierActiveRoot::Kernel(kernel),
+                Err((error, recovered)) => {
+                    self.active_root = CarrierActiveRoot::Process(recovered);
+                    crate::test_support::complete_fail(match error {
+                        super::RootBindingError::CpuMismatch => 0x2510_d004,
+                        super::RootBindingError::RootMismatch => 0x2510_d005,
+                        _ => 0x2510_d006,
+                    })
+                }
+            }
+            self.finish_inactive_process_teardown(
+                retired_process,
+                retired_root_key,
+                retired_address_space,
+            )
+            .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d007));
+            self.enable_wyr1_reporter_after_retirement()
+                .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d008));
+            self.local.record_idle();
+            return PreparedTerminalHandoff::IdleScheduler;
         }
 
         if retired_process != self.primordial_process {
@@ -2431,6 +2546,50 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok(())
     }
 
+    #[cfg(deepwyrm_wyr1_evidence)]
+    fn enable_wyr1_reporter_after_retirement(&mut self) -> Result<(), ()> {
+        let reporter = self.wyr1_init_process.ok_or(())?;
+        if reporter == self.primordial_process
+            || self
+                .tasks
+                .process_quiescence_proof(self.primordial_process)
+                .is_ok()
+            || self
+                .tasks
+                .root_region(self.primordial_process)
+                .map_err(|_| ())?
+                .is_some()
+            || self.tasks.process_lifecycle(reporter)
+                != Ok(ProcessLifecycleState::AcceptingOperations)
+        {
+            return Err(());
+        }
+        for reference in [self.kernel_peer.take(), self.process_monitor.take()]
+            .into_iter()
+            .flatten()
+        {
+            self.cleanup
+                .push_optional(self.registry.release_handle(reference).map_err(|_| ())?);
+        }
+        self.drain_finalizers()?;
+        crate::test_support::WYR1_EVIDENCE
+            .bind_reporter_after_retirement(
+                reporter,
+                crate::test_support::Wyr1RetirementFacts {
+                    process_quiesced: true,
+                    root_region_retired: true,
+                    monitor_and_kernel_peer_released: self.kernel_peer.is_none()
+                        && self.process_monitor.is_none(),
+                    finalizers_drained: self.cleanup.is_empty(),
+                    // The architecture owns the primordial bootstrap PML4 for
+                    // the boot lifetime; all user mappings/root authority are
+                    // gone, but this private table is intentionally retained.
+                    private_primordial_pml4_retained: true,
+                },
+            )
+            .map_err(|_| ())
+    }
+
     fn drain_finalizers(&mut self) -> Result<(), ()> {
         while !self.cleanup.is_empty() {
             let cleanup = core::mem::replace(&mut self.cleanup, CleanupQueue::new());
@@ -2886,6 +3045,46 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrameRuntime
     for PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
+    #[cfg(deepwyrm_wyr1_evidence)]
+    fn intercept_wyr1_evidence_raw(
+        &mut self,
+        arguments: crate::syscall::RawSyscallArguments,
+    ) -> NativeSyscallResult {
+        use crate::test_support::{WYR1_EVIDENCE, WYR1_EVIDENCE_RECORD_LEN, Wyr1EvidenceSubmit};
+
+        let values = arguments.as_array();
+        if values[1] != WYR1_EVIDENCE_RECORD_LEN as u64
+            || values[2..].iter().any(|value| *value != 0)
+        {
+            crate::test_support::complete_fail(0x2510_e001)
+        }
+        let phase = self.reserve_runtime_phase();
+        WYR1_EVIDENCE
+            .authorize_submission(self.process)
+            .unwrap_or_else(|error| crate::test_support::complete_fail(wyr1_submit_detail(error)));
+        let record = {
+            let mut user = self.active.current_process_address_space(
+                self.active_root.as_ref().expect("active root"),
+                self.process,
+            );
+            match crate::syscall::copy_wyr1_evidence_input::<_, WYR1_EVIDENCE_RECORD_LEN>(
+                &mut user,
+                deepwyrm_abi::DwUserAddress(values[0]),
+            ) {
+                Ok(record) => record,
+                Err(_) => crate::test_support::complete_fail(0x2510_e002),
+            }
+        };
+        self.commit_runtime_phase(phase);
+        match WYR1_EVIDENCE.submit(self.process, &record) {
+            Ok(Wyr1EvidenceSubmit::Accepted) => NativeSyscallResult::returning(DW_STATUS_SUCCESS),
+            Ok(Wyr1EvidenceSubmit::Terminal(permit)) => {
+                crate::test_support::complete_wyr1_evidence(permit)
+            }
+            Err(error) => crate::test_support::complete_fail(wyr1_submit_detail(error)),
+        }
+    }
+
     fn authorize_return(
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
@@ -2999,6 +3198,21 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         self.g5_probe.observe_resume(owner, status);
         frame.set_status(status);
         crate::syscall::native::NativeResumeOutcome::Resumed
+    }
+}
+
+#[cfg(deepwyrm_wyr1_evidence)]
+const fn wyr1_submit_detail(error: crate::test_support::Wyr1EvidenceError) -> u32 {
+    use crate::test_support::Wyr1EvidenceError;
+    match error {
+        Wyr1EvidenceError::Early => 0x2510_e003,
+        Wyr1EvidenceError::Retirement => 0x2510_e004,
+        Wyr1EvidenceError::WrongReporter => 0x2510_e005,
+        Wyr1EvidenceError::Malformed => 0x2510_e006,
+        Wyr1EvidenceError::OutOfOrder => 0x2510_e007,
+        Wyr1EvidenceError::Full => 0x2510_e008,
+        Wyr1EvidenceError::DuplicateTerminal => 0x2510_e009,
+        Wyr1EvidenceError::ReporterClaimed => 0x2510_e00a,
     }
 }
 
@@ -3185,6 +3399,16 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrameRuntime
     for RuntimeCarrierFacade<'_, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>
 {
+    #[cfg(deepwyrm_wyr1_evidence)]
+    fn intercept_wyr1_evidence_raw(
+        &mut self,
+        arguments: crate::syscall::RawSyscallArguments,
+    ) -> NativeSyscallResult {
+        let mut runtime = self.runtime.lock();
+        runtime.select_cpu(self.cpu);
+        runtime.intercept_wyr1_evidence_raw(arguments)
+    }
+
     fn complete_remote_stop(
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
@@ -3588,6 +3812,17 @@ fn copy_module<'a, const BYTES: usize, const RANGE_CAPACITY: usize, const ROLE_C
     destination
 }
 
+#[cfg(any(test, deepwyrm_wyr1_evidence))]
+const fn wyr1_bootfs_page_count(byte_len: usize) -> Option<usize> {
+    if byte_len == 0 {
+        return None;
+    }
+    match byte_len.checked_add(4095) {
+        Some(rounded) => Some(rounded / 4096),
+        None => None,
+    }
+}
+
 #[allow(
     unsafe_code,
     reason = "G3 publishes stationary synchronized authorities, seals fail-closed AP carriers, and binds the BSP-exclusive carrier for audited initial CPL3 transition"
@@ -3608,6 +3843,13 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         "bootstrap",
     );
     let bootfs = copy_module(&mut active, modules.bootfs(), &BOOTFS_BYTES, "bootfs");
+    #[cfg(deepwyrm_wyr1_evidence)]
+    if !matches!(
+        wyr1_bootfs_page_count(bootfs.len()),
+        Some(1..=PRIMORDIAL_MAX_MAPPING_PAGES)
+    ) {
+        crate::test_support::complete_fail(0x2510_b001)
+    }
     let plan = crate::boot::primordial::parse_primordial_elf(bootstrap)
         .unwrap_or_else(|error| panic!("invalid primordial bootstrap ELF: {error:?}"));
 
@@ -3717,6 +3959,8 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         primordial_process: process,
         primordial_root_key: root_key,
         primordial_address_space,
+        #[cfg(deepwyrm_wyr1_evidence)]
+        wyr1_init_process: None,
         channel_keys,
         kernel_peer: Some(kernel_peer),
         process_monitor: Some(process_monitor),
@@ -3778,6 +4022,22 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     }
 }
 
+#[cfg(test)]
+mod wyr1_capacity_tests {
+    use super::*;
+
+    #[test]
+    fn integration_bootfs_measurement_hook_is_exact_at_64_pages() {
+        assert_eq!(wyr1_bootfs_page_count(0), None);
+        assert_eq!(wyr1_bootfs_page_count(1), Some(1));
+        assert_eq!(wyr1_bootfs_page_count(4096), Some(1));
+        assert_eq!(wyr1_bootfs_page_count(4097), Some(2));
+        assert_eq!(wyr1_bootfs_page_count(64 * 4096), Some(64));
+        assert_eq!(wyr1_bootfs_page_count(64 * 4096 + 1), Some(65));
+        assert_eq!(wyr1_bootfs_page_count(usize::MAX), None);
+    }
+}
+
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandler
     for PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
@@ -3811,7 +4071,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     self.active_root.as_ref().expect("active root"),
                     self.process,
                 );
-                NativeSyscallResult::returning(crate::syscall::process_create_with_root(
+                #[cfg(deepwyrm_wyr1_evidence)]
+                let creating_wyr1_init = self.process == self.primordial_process;
+                #[cfg(deepwyrm_wyr1_evidence)]
+                if creating_wyr1_init && self.wyr1_init_process.is_some() {
+                    crate::test_support::complete_fail(0x2510_c001)
+                }
+                #[cfg(deepwyrm_wyr1_evidence)]
+                let mut committed_child = None;
+                #[cfg(deepwyrm_wyr1_evidence)]
+                let status = crate::syscall::process_create_with_root_observed(
                     &mut user,
                     &mut self.registry,
                     &mut self.tasks,
@@ -3823,7 +4092,30 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     out_result,
                     result_size,
                     &mut self.cleanup,
-                ))
+                    |child| committed_child = Some(child),
+                );
+                #[cfg(not(deepwyrm_wyr1_evidence))]
+                let status = crate::syscall::process_create_with_root(
+                    &mut user,
+                    &mut self.registry,
+                    &mut self.tasks,
+                    &mut self.regions,
+                    &mut self.spaces,
+                    self.process,
+                    args,
+                    args_size,
+                    out_result,
+                    result_size,
+                    &mut self.cleanup,
+                );
+                #[cfg(deepwyrm_wyr1_evidence)]
+                if creating_wyr1_init && status == DW_STATUS_SUCCESS {
+                    self.wyr1_init_process = Some(
+                        committed_child
+                            .unwrap_or_else(|| crate::test_support::complete_fail(0x2510_c002)),
+                    );
+                }
+                NativeSyscallResult::returning(status)
             }
             request => {
                 self.assert_guard_free_external_work();

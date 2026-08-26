@@ -637,7 +637,7 @@ pub(crate) fn emit_early_raw_record(record: &[u8]) -> Result<(), SerialError> {
 /// competing reporters.
 #[cfg(all(
     feature = "test-support",
-    any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay),
+    any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence),
     target_os = "none",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
@@ -648,7 +648,7 @@ pub(crate) struct TestSerialTransaction {
 
 #[cfg(all(
     feature = "test-support",
-    any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay),
+    any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence),
     target_os = "none",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
@@ -661,7 +661,7 @@ pub(crate) fn begin_test_serial_transaction() -> Result<TestSerialTransaction, S
 
 #[cfg(all(
     feature = "test-support",
-    any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay),
+    any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence),
     target_os = "none",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
@@ -693,7 +693,12 @@ fn write_bounded_raw_record<P: PortIo>(
     Ok(())
 }
 
-#[cfg(any(test, deepwyrm_i1_evidence, deepwyrm_wrcap_relay))]
+#[cfg(any(
+    test,
+    deepwyrm_i1_evidence,
+    deepwyrm_wrcap_relay,
+    deepwyrm_wyr1_evidence
+))]
 fn write_bounded_test_evidence_record<P: PortIo, const BYTES: usize>(
     serial: &mut Com1<P>,
     record: &[u8; BYTES],

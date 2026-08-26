@@ -68,12 +68,16 @@ use super::private::{
 const ENTRY_COUNT: usize = 512;
 const E5_USER_PIN_CAPACITY: usize = 8;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
-#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]
+#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence)))]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;
 // Selector 24 keeps bootstrap, init0, the controller, and one bounded worker
 // live together. The controller tears each worker down before starting the
 // next case, so the relay artifact needs exactly one additional binding.
 #[cfg(deepwyrm_wrcap_relay)]
+const LIVE_ADDRESS_SPACE_CAPACITY: usize = 4;
+// Selector 25 keeps primordial, init, registryd, and devmgr roots live until
+// the one-shot primordial retirement completes.
+#[cfg(deepwyrm_wyr1_evidence)]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 4;
 // Selector 22 keeps bootstrap, init0, the controller, and multiple stress
 // descendants live together. This is a bounded test-artifact capacity, not a

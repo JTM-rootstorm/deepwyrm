@@ -629,12 +629,19 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
     assert!(build.contains("cargo:rustc-check-cfg=cfg(deepwyrm_i2_stress)"));
     assert!(build.contains("selector == \"smp-runtime-stress\""));
     assert!(build.contains("cargo:rustc-cfg=deepwyrm_i2_stress"));
-    assert!(activation.contains(
-        "#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;"
-    ));
+    assert!(
+        activation.contains(
+            "#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence)))]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;"
+        )
+    );
     assert!(
         activation.contains(
             "#[cfg(deepwyrm_wrcap_relay)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 4;"
+        )
+    );
+    assert!(
+        activation.contains(
+            "#[cfg(deepwyrm_wyr1_evidence)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 4;"
         )
     );
     assert!(
@@ -648,12 +655,17 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
     );
     assert!(
         runtime.contains(
-            "#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]\nconst USERSPACE_CHAIN_PROCESSES: usize = 3;"
+            "#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence)))]\nconst USERSPACE_CHAIN_PROCESSES: usize = 3;"
         )
     );
     assert!(
         runtime
             .contains("#[cfg(deepwyrm_wrcap_relay)]\nconst USERSPACE_CHAIN_PROCESSES: usize = 4;")
+    );
+    assert!(
+        runtime.contains(
+            "#[cfg(deepwyrm_wyr1_evidence)]\nconst USERSPACE_CHAIN_PROCESSES: usize = 4;"
+        )
     );
     assert!(runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst TASK_GROUPS: usize = 2;"));
     assert!(runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst MEMORY_OBJECTS: usize = 12;"));
@@ -663,9 +675,11 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
         "#[cfg(deepwyrm_wrcap_relay)]\nconst CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;"
     ));
     assert!(runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst REGISTRY_OBJECTS: usize = 48;"));
-    assert!(runtime.contains(
-        "#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 17;"
-    ));
+    assert!(
+        runtime.contains(
+        "#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence)))]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 17;"
+        )
+    );
     assert!(
         runtime.contains(
             "#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 32;"

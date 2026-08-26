@@ -9607,6 +9607,7 @@ fn process_create_injected_precommit_boundaries_rollback_every_authority() {
         for retry in 0..3 {
             let mut cleanup = CleanupQueue::<16>::new();
             let mut observed = false;
+            let mut committed_child = None;
             let reserved_roots = core::cell::Cell::new(0_u32);
             let rolled_back_roots = core::cell::Cell::new(0_u32);
             assert_eq!(
@@ -9637,11 +9638,13 @@ fn process_create_injected_precommit_boundaries_rollback_every_authority() {
                             Ok(())
                         }
                     },
+                    |child| committed_child = Some(child),
                 ),
                 DW_STATUS_NO_RESOURCES,
                 "{stage:?} retry {retry}"
             );
             assert!(observed, "{stage:?} retry {retry} was not reached");
+            assert_eq!(committed_child, None);
             let expected_architecture_reservation =
                 u32::from(stage == ProcessCreatePreparation::ParentResultSlots);
             assert_eq!(reserved_roots.get(), expected_architecture_reservation);

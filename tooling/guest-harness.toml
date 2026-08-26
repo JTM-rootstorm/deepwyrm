@@ -144,3 +144,10 @@ state = "implemented"
 [guest_test.native-userspace-capability]
 id = 24
 state = "implemented"
+
+# WYR1-A's test-support-only permanent-supervisor/RRC evidence collector.
+# The raw submission trap remains outside the public ABI and exists only in
+# the selector-specialized kernel artifact.
+[guest_test.permanent-supervisor-rrc]
+id = 25
+state = "implemented"

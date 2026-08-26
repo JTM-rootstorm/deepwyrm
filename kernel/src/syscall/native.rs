@@ -751,6 +751,15 @@ pub(crate) enum NativeResumeOutcome {
     reason = "plan-producing runtime methods carry physical-current and fixed-entry obligations that safe Rust cannot encode"
 )]
 pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
+    /// Selector-25-only interception of one raw ID deliberately absent from
+    /// native ABI decode. Production and every other selector compile neither
+    /// this method nor its call site, so the ID remains NOT_SUPPORTED there.
+    #[cfg(deepwyrm_wyr1_evidence)]
+    fn intercept_wyr1_evidence_raw(
+        &mut self,
+        arguments: RawSyscallArguments,
+    ) -> NativeSyscallResult;
+
     fn authorize_return(
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
@@ -870,6 +879,15 @@ pub(crate) fn dispatch_frame<R: NativeSyscallFrameRuntime>(
     frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     current_binding_generation: u64,
 ) -> SyscallControl {
+    #[cfg(deepwyrm_wyr1_evidence)]
+    let result = match frame.request() {
+        Some((id, arguments)) if id.0 == crate::test_support::WYR1_EVIDENCE_RAW_SYSCALL => {
+            runtime.intercept_wyr1_evidence_raw(arguments)
+        }
+        Some((id, arguments)) => dispatch_native(runtime, id, arguments),
+        None => NativeSyscallResult::returning(DW_STATUS_INVALID_ARGUMENT),
+    };
+    #[cfg(not(deepwyrm_wyr1_evidence))]
     let result = match frame.request() {
         Some((id, arguments)) => dispatch_native(runtime, id, arguments),
         None => NativeSyscallResult::returning(DW_STATUS_INVALID_ARGUMENT),

@@ -31,6 +31,8 @@ pub(crate) use adapters::{
     WaitSyscallAction, WaitTerminalCleanup, resume_wait_thread_syscall, timer_cancel, timer_create,
     timer_set, wait_many_syscall, wait_one_syscall,
 };
+#[cfg(all(deepwyrm_wyr1_evidence, target_os = "none", target_arch = "x86_64"))]
+pub(crate) use adapters::{copy_wyr1_evidence_input, process_create_with_root_observed};
 
 #[cfg(all(target_os = "none", target_arch = "x86_64", deepwyrm_e7_guest))]
 pub(crate) use adapters::clock_get;

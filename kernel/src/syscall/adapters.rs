@@ -355,6 +355,16 @@ fn copy_input<U: UserPageAccess, const N: usize>(
     Ok(destination)
 }
 
+/// Selector-specialized fixed-size diagnostic input copy. This is kept behind
+/// the private test cfg so production adapters expose no additional surface.
+#[cfg(deepwyrm_wyr1_evidence)]
+pub(crate) fn copy_wyr1_evidence_input<U: UserPageAccess, const N: usize>(
+    user: &mut U,
+    address: DwUserAddress,
+) -> Result<[u8; N], DwStatus> {
+    copy_input(user, address, 1)
+}
+
 pub(crate) fn abi_get_info<U: UserPageAccess>(
     user: &mut U,
     out_info: DwUserAddress,
@@ -1354,6 +1364,7 @@ fn process_create_transaction<
     ) -> Result<(), DwStatus>,
     B: FnMut(&mut U, ProcessKey, crate::memory::address_region::AddressSpaceKey),
     I: FnMut(ProcessCreatePreparation) -> Result<(), DwStatus>,
+    O: FnOnce(ProcessKey),
     const OBJECTS: usize,
     const GROUPS: usize,
     const PROCESSES: usize,
@@ -1378,6 +1389,7 @@ fn process_create_transaction<
     mut reserve_root: R,
     mut rollback_root: B,
     mut inject: I,
+    observe_committed_process: O,
 ) -> DwStatus {
     let PreparedProcessCreate { args, output } = match prepare_process_create_input(
         user,
@@ -1667,6 +1679,7 @@ fn process_create_transaction<
         .unwrap_or_else(|error| panic!("F10 source MOVE finish permit diverged: {error:?}"));
     let (_root, root_reference) = prepared_root.commit(registry, tasks, regions);
     let (_process, process_reference) = prepared_process.commit(tasks);
+    observe_committed_process(child_process);
     let parent_handles = parent_reservation
         .try_publish(
             tasks
@@ -1740,6 +1753,7 @@ pub(crate) fn process_create<
         |_, _, _| Ok(()),
         |_, _, _| {},
         |_| Ok(()),
+        |_| {},
     )
 }
 
@@ -1786,6 +1800,62 @@ pub(crate) fn process_create_with_root<
         |access, process, address_space| access.reserve_child_root(process, address_space),
         |access, process, address_space| access.rollback_empty_child_root(process, address_space),
         |_| Ok(()),
+        |_| {},
+    )
+}
+
+/// Selector-25-only live process construction with an exact kernel-commit
+/// observer. The observer sees the child only after its Process and root
+/// objects commit, but before parent result handles and user output publish;
+/// it is not a completed-syscall notification. Any later invariant failure is
+/// terminal, so the captured identity cannot reach reporter authorization.
+#[cfg(deepwyrm_wyr1_evidence)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the selector-local observer preserves the live F10 transaction boundaries"
+)]
+pub(crate) fn process_create_with_root_observed<
+    U: UserPageAccess + OwnedUserOutputAccess + ProcessRootReservation,
+    O: FnOnce(ProcessKey),
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const REGION_OBJECTS: usize,
+    const REGION_SLOTS: usize,
+    const SPACES: usize,
+    const REGIONS: usize,
+>(
+    user: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    regions: &mut AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
+    spaces: &mut AddressSpaceAuthority<SPACES, REGIONS>,
+    current_process: ProcessKey,
+    args_address: DwUserAddress,
+    args_size: u64,
+    out_result: DwUserAddress,
+    result_size: u64,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+    observe_committed_process: O,
+) -> DwStatus {
+    process_create_transaction(
+        user,
+        registry,
+        tasks,
+        regions,
+        spaces,
+        current_process,
+        args_address,
+        args_size,
+        out_result,
+        result_size,
+        cleanup,
+        |access, process, address_space| access.reserve_child_root(process, address_space),
+        |access, process, address_space| access.rollback_empty_child_root(process, address_space),
+        |_| Ok(()),
+        observe_committed_process,
     )
 }
 

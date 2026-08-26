@@ -35,6 +35,7 @@ pub(crate) enum BuildGuestTest {
     SmpRuntimeStress,
     SmpRuntimeAcceptance,
     NativeUserspaceCapability,
+    PermanentSupervisorRrc,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,6 +99,7 @@ impl BuildGuestTest {
             Self::SmpRuntimeStress => 22,
             Self::SmpRuntimeAcceptance => 23,
             Self::NativeUserspaceCapability => 24,
+            Self::PermanentSupervisorRrc => 25,
         }
     }
 
@@ -134,6 +136,7 @@ impl BuildGuestTest {
                 | Self::SmpRuntimeStress
                 | Self::SmpRuntimeAcceptance
                 | Self::NativeUserspaceCapability
+                | Self::PermanentSupervisorRrc
         )
     }
 
@@ -241,6 +244,8 @@ const fn parse_known_selector(value: &str) -> BuildGuestTest {
         BuildGuestTest::SmpRuntimeAcceptance
     } else if string_equals(value, "native-userspace-capability") {
         BuildGuestTest::NativeUserspaceCapability
+    } else if string_equals(value, "permanent-supervisor-rrc") {
+        BuildGuestTest::PermanentSupervisorRrc
     } else {
         panic!("unknown build-selected guest test")
     }

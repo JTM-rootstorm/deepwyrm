@@ -92,6 +92,8 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=DEEPWYRM_GUEST_TEST_SELECTOR");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_GUEST_TEST_ID");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_I1_EVIDENCE_NONCE");
+    println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1_EVIDENCE_NONCE");
+    println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1_EVIDENCE_SCENARIO");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_c3_one_shot_ui)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_memory_guest)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_e7_guest)");
@@ -100,6 +102,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_i1_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_i2_stress)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wrcap_relay)");
+    println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_integrated)");
     println!("cargo:rustc-cfg=deepwyrm_integrated");
 
@@ -162,6 +165,13 @@ fn run() -> Result<(), String> {
         .is_some_and(is_wrcap_relay_selector)
     {
         println!("cargo:rustc-cfg=deepwyrm_wrcap_relay");
+    }
+    if env::var("DEEPWYRM_GUEST_TEST_SELECTOR")
+        .ok()
+        .as_deref()
+        .is_some_and(is_wyr1_evidence_selector)
+    {
+        println!("cargo:rustc-cfg=deepwyrm_wyr1_evidence");
     }
 
     if required_env("TARGET")? != KERNEL_TARGET {
@@ -288,6 +298,10 @@ fn is_i2_stress_selector(selector: &str) -> bool {
 
 fn is_wrcap_relay_selector(selector: &str) -> bool {
     selector == "native-userspace-capability"
+}
+
+fn is_wyr1_evidence_selector(selector: &str) -> bool {
+    selector == "permanent-supervisor-rrc"
 }
 
 fn emit_e7_user_env(elf: &Path) {
@@ -857,8 +871,41 @@ fn configure_guest_test(harness_path: &Path) -> Result<(), String> {
             let nonce = required_i1_evidence_nonce()?;
             println!("cargo:rustc-env=DEEPWYRM_I1_EVIDENCE_NONCE={nonce}");
         }
+        if is_wyr1_evidence_selector(&selector) {
+            let nonce = required_wyr1_evidence_nonce()?;
+            let scenario = required_wyr1_evidence_scenario()?;
+            println!("cargo:rustc-env=DEEPWYRM_WYR1_EVIDENCE_NONCE={nonce}");
+            println!("cargo:rustc-env=DEEPWYRM_WYR1_EVIDENCE_SCENARIO={scenario}");
+        }
     }
     Ok(())
+}
+
+fn required_wyr1_evidence_nonce() -> Result<String, String> {
+    let nonce = env::var("DEEPWYRM_WYR1_EVIDENCE_NONCE")
+        .map_err(|_| "permanent-supervisor-rrc requires DEEPWYRM_WYR1_EVIDENCE_NONCE".to_owned())?;
+    validate_wyr1_evidence_nonce(&nonce)?;
+    Ok(nonce)
+}
+
+pub(crate) fn validate_wyr1_evidence_nonce(nonce: &str) -> Result<(), String> {
+    validate_upper_nonzero_hex_nonce(nonce, "DEEPWYRM_WYR1_EVIDENCE_NONCE")
+}
+
+fn required_wyr1_evidence_scenario() -> Result<String, String> {
+    let scenario = env::var("DEEPWYRM_WYR1_EVIDENCE_SCENARIO").map_err(|_| {
+        "permanent-supervisor-rrc requires DEEPWYRM_WYR1_EVIDENCE_SCENARIO".to_owned()
+    })?;
+    validate_wyr1_evidence_scenario(&scenario)?;
+    Ok(scenario)
+}
+
+pub(crate) fn validate_wyr1_evidence_scenario(scenario: &str) -> Result<(), String> {
+    if matches!(scenario, "normal" | "degraded_recovery") {
+        Ok(())
+    } else {
+        Err("DEEPWYRM_WYR1_EVIDENCE_SCENARIO must be normal or degraded_recovery".into())
+    }
 }
 
 fn required_i1_evidence_nonce() -> Result<String, String> {
@@ -869,15 +916,19 @@ fn required_i1_evidence_nonce() -> Result<String, String> {
 }
 
 pub(crate) fn validate_i1_evidence_nonce(nonce: &str) -> Result<(), String> {
+    validate_upper_nonzero_hex_nonce(nonce, "DEEPWYRM_I1_EVIDENCE_NONCE")
+}
+
+fn validate_upper_nonzero_hex_nonce(nonce: &str, name: &str) -> Result<(), String> {
     if nonce.len() != 16
         || !nonce
             .bytes()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'A'..=b'F'))
         || nonce == "0000000000000000"
     {
-        return Err(
-            "DEEPWYRM_I1_EVIDENCE_NONCE must be an uppercase nonzero 16-hex-digit u64".into(),
-        );
+        return Err(format!(
+            "{name} must be an uppercase nonzero 16-hex-digit u64"
+        ));
     }
     Ok(())
 }
@@ -1930,6 +1981,26 @@ mod tests {
     use super::*;
 
     const GENERATED_ABI: &str = include_str!("../abi/generated/deepwyrm_abi.rs");
+
+    #[test]
+    fn wyr1_selector_and_build_owned_fields_are_exact() {
+        assert!(is_wyr1_evidence_selector("permanent-supervisor-rrc"));
+        assert!(!is_wyr1_evidence_selector("native-userspace-capability"));
+        for valid in ["0000000000000001", "0123456789ABCDEF", "FFFFFFFFFFFFFFFF"] {
+            assert!(validate_wyr1_evidence_nonce(valid).is_ok());
+        }
+        for invalid in [
+            "0000000000000000",
+            "0123456789abcdef",
+            "0123456789ABCDE",
+            "G123456789ABCDEF",
+        ] {
+            assert!(validate_wyr1_evidence_nonce(invalid).is_err());
+        }
+        assert!(validate_wyr1_evidence_scenario("normal").is_ok());
+        assert!(validate_wyr1_evidence_scenario("degraded_recovery").is_ok());
+        assert!(validate_wyr1_evidence_scenario("degraded").is_err());
+    }
 
     #[test]
     fn f12_assembly_constants_are_derived_from_generated_abi() {

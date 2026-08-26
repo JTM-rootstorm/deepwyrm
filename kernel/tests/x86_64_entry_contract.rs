@@ -290,6 +290,38 @@ fn i1_evidence_has_one_terminal_com1_reporter() {
 }
 
 #[test]
+fn wyr1_terminal_outcomes_share_one_claimed_prefix_transaction() {
+    let terminal = fs::read_to_string(kernel_root().join("src/test_support/x86_64.rs"))
+        .expect("read terminal reporter");
+    let start = terminal
+        .find("fn complete_wyr1_evidence_kernel_terminal(")
+        .expect("selector-25 kernel terminal helper");
+    let end = terminal[start..]
+        .find("\n#[cfg(deepwyrm_wyr1_evidence)]\nfn wyr1_failure_detail")
+        .map(|offset| start + offset)
+        .expect("selector-25 kernel terminal helper boundary");
+    let shared = &terminal[start..end];
+    let claim = shared.find("WYR1_EVIDENCE.claim_failure()").unwrap();
+    let transaction = shared.find("begin_test_serial_transaction()").unwrap();
+    let prefix = shared.find("permit\n        .flush_prefix").unwrap();
+    let completion = shared.find("completion_record(outcome, detail)").unwrap();
+    assert!(claim < transaction && transaction < prefix && prefix < completion);
+    assert!(
+        terminal.contains(
+            "complete_wyr1_evidence_kernel_terminal(CompletionOutcome::Fail, 0x2510_ffff)"
+        )
+    );
+    assert!(
+        terminal
+            .contains("complete_wyr1_evidence_kernel_terminal(CompletionOutcome::Fail, detail)")
+    );
+    assert!(
+        terminal
+            .contains("complete_wyr1_evidence_kernel_terminal(CompletionOutcome::Panic, detail)")
+    );
+}
+
+#[test]
 fn wrcap_relay_is_selector_only_bounded_and_precedes_terminal_completion() {
     let build = fs::read_to_string(kernel_root().join("build.rs")).expect("read kernel build");
     let relay = fs::read_to_string(kernel_root().join("src/test_support/wrcap.rs"))
@@ -306,7 +338,10 @@ fn wrcap_relay_is_selector_only_bounded_and_precedes_terminal_completion() {
 
     assert!(build.contains("cfg(deepwyrm_wrcap_relay)"));
     assert!(build.contains("selector == \"native-userspace-capability\""));
-    assert!(support.contains("DWEVID1 and WRCAP1 terminal reporters are selector-exclusive"));
+    assert!(
+        support
+            .contains("DWEVID1, WRCAP1, and WYR1EVID1 terminal reporters are selector-exclusive")
+    );
     assert!(support.contains("#[cfg(any(test, deepwyrm_wrcap_relay))]\nmod wrcap;"));
     assert!(relay.contains("const WRCAP_RECORD_COUNT: usize = 15;"));
     assert!(relay.contains("const WRCAP_RECORD_KINDS: [u8; WRCAP_RECORD_COUNT]"));
@@ -458,9 +493,11 @@ fn g3_primordial_mapping_failures_remain_recoverable_and_rollback_owned_candidat
     );
     assert!(primordial.contains("cancel_zeroed(failure.into_grant())"));
     assert!(user_access.contains("cancel_zeroed(failure.into_grant())"));
-    assert!(primordial.contains(
-        "#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay)))]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 17;"
-    ));
+    assert!(
+        primordial.contains(
+            "#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence)))]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 17;"
+        )
+    );
     assert!(
         primordial.contains(
             "#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 32;"

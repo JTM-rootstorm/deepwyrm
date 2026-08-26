@@ -6,8 +6,12 @@
 
 #![cfg(feature = "test-support")]
 
-#[cfg(all(deepwyrm_i1_evidence, deepwyrm_wrcap_relay))]
-compile_error!("DWEVID1 and WRCAP1 terminal reporters are selector-exclusive");
+#[cfg(any(
+    all(deepwyrm_i1_evidence, deepwyrm_wrcap_relay),
+    all(deepwyrm_i1_evidence, deepwyrm_wyr1_evidence),
+    all(deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence)
+))]
+compile_error!("DWEVID1, WRCAP1, and WYR1EVID1 terminal reporters are selector-exclusive");
 
 #[cfg(deepwyrm_i1_evidence)]
 mod evidence;
@@ -20,6 +24,8 @@ mod task;
 mod transport;
 #[cfg(any(test, deepwyrm_wrcap_relay))]
 mod wrcap;
+#[cfg(any(test, deepwyrm_wyr1_evidence))]
+mod wyr1_evidence;
 
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 mod x86_64;
@@ -38,6 +44,15 @@ pub use transport::{
     reason = "the target-only primordial and terminal paths consume the WRCAP1 relay"
 )]
 pub(crate) use wrcap::{WRCAP_RECORD_LEN, WRCAP_RELAY, WrcapDrainAction, WrcapFlushError};
+
+#[cfg(deepwyrm_wyr1_evidence)]
+pub(crate) use wyr1_evidence::WYR1_EVIDENCE_RAW_SYSCALL;
+
+#[cfg(all(deepwyrm_wyr1_evidence, target_arch = "x86_64", target_os = "none"))]
+pub(crate) use wyr1_evidence::{
+    WYR1_EVIDENCE, WYR1_EVIDENCE_RECORD_LEN, Wyr1EvidenceError, Wyr1EvidenceFlushError,
+    Wyr1EvidenceSubmit, Wyr1RetirementFacts,
+};
 
 #[cfg(deepwyrm_i1_evidence)]
 #[allow(
@@ -59,6 +74,8 @@ pub(crate) use evidence::{
     runtime_missing_mask as i1_runtime_missing_mask,
 };
 
+#[cfg(all(deepwyrm_wyr1_evidence, target_arch = "x86_64", target_os = "none"))]
+pub(crate) use x86_64::complete_wyr1_evidence;
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 pub(crate) use x86_64::{
     complete_exception, complete_fail, complete_panic, complete_pass, expect_terminal_page_fault,
