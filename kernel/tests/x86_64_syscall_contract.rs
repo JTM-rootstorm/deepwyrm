@@ -848,7 +848,19 @@ fn wyr1_terminal_child_after_primordial_retirement_uses_its_current_root() {
         .find("self.finish_quiesced_process_root_retirement(")
         .unwrap();
     let idle = retired_child.find("self.local.record_idle()").unwrap();
+    let reporter_guard = retired_child.find("if retiring_reporter {").unwrap();
+    let reporter_info = retired_child
+        .find(".process_info(retired_process)")
+        .unwrap();
+    let reporter_failure = retired_child
+        .find("crate::test_support::complete_fail(detail)")
+        .unwrap();
 
+    assert!(reporter_guard < reporter_info);
+    assert!(reporter_info < reporter_failure);
+    assert!(reporter_failure < unmap);
+    assert!(retired_child.contains("if info.application_code == 0"));
+    assert!(retired_child.contains("0x2510_d014"));
     assert!(unmap < kernel_root);
     assert!(kernel_root < retirement);
     assert!(retirement < idle);
@@ -857,7 +869,6 @@ fn wyr1_terminal_child_after_primordial_retirement_uses_its_current_root() {
     );
     assert!(retirement_fact.contains("Ok(Some(_)) => false"));
     assert!(retirement_fact.contains("Err(_) => crate::test_support::complete_fail(0x2510_d00d)"));
-    assert!(retired_child.contains("DWDBG|WYR1|CHILD|REPORTER"));
     assert!(retired_child.contains("DWDBG|WYR1|CHILD|ROLE"));
     assert!(!retired_child.contains("prepare_process_root_selection("));
     assert!(!retired_child.contains("self.primordial_address_space"));

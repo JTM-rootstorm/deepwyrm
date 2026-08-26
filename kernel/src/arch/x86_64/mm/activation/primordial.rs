@@ -1852,11 +1852,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             // then enter the CPU-private kernel root before retiring the empty
             // child root and rescanning from ordinary idle.
             let retiring_reporter = self.wyr1_init_process == Some(retired_process);
-            let _ = crate::debug::emit_early_raw_record(if retiring_reporter {
-                b"DWDBG|WYR1|CHILD|REPORTER\n"
-            } else {
-                b"DWDBG|WYR1|CHILD|ROLE\n"
-            });
+            if retiring_reporter {
+                let info = self
+                    .tasks
+                    .process_info(retired_process)
+                    .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d013));
+                let detail = if info.application_code == 0 {
+                    0x2510_d014
+                } else {
+                    info.application_code
+                };
+                crate::test_support::complete_fail(detail)
+            }
+            let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|CHILD|ROLE\n");
             let proof = self
                 .tasks
                 .process_quiescence_proof(retired_process)
