@@ -1,10 +1,14 @@
 # Deepwyrm DW1-A Validation and Closure Record
 
-**Status:** DW1-A host/model closure accepted; DW1-B/C live behavior remains open
-**Validation date:** 2026-08-25
-**Validated implementation revision:** `2e014d0002437b18952df0159f9389a9ae5d4000`
+**Status:** DW1-A host/model closure accepted on integrated `main`; DW1-B/C live behavior remains open
+**Original validation date:** 2026-08-25
+**Original lane candidate:** `2e014d0002437b18952df0159f9389a9ae5d4000`
+**Integrated implementation revision:** `1cd8ff09dff7fb627928cccc28b1a9813f25ddb2`
+**Integrated closure record revision:** `de51c6c81bf719b488bb4d0e36fa34831a138fb9`
+**Current-tree revalidation date:** 2026-08-26
+**Current-tree revalidation revision:** `96155793c1c8d06dea0139832bd96d9572d40cd6`
 **Starting revision:** `b7773515bf56e452a6c224bd72a5ad05a8b82fa1`
-**Branch:** `lane/dw1a-closure`
+**Historical lane:** `lane/dw1a-closure`
 
 ## Scope and disposition
 
@@ -26,6 +30,14 @@ The live `CooperativeScheduler` remains cooperative. This revision adds no
 Local APIC scheduler deadline, `need_resched`, involuntary preemption,
 arbitrary kernel preemption, AP userspace execution, stable ABI, or Wyrmroot
 change. DW1-B and DW1-C remain responsible for those live gates.
+
+The lane candidate was integrated as
+`1cd8ff09dff7fb627928cccc28b1a9813f25ddb2`. A direct path-scoped tree
+comparison confirms that the reached contract, scheduler instrumentation, and
+test-only normal-policy model are identical between the original candidate and
+the integrated implementation revision. The closure record was then merged as
+`de51c6c81bf719b488bb4d0e36fa34831a138fb9`. Both integrated revisions are
+ancestors of the current revalidation revision.
 
 ## Required-source disposition
 
@@ -75,6 +87,30 @@ kernel unit suite reported 643 passed. The full all-target run retained three
 intentional explicit target-artifact ignores and reported no failure. ABI
 checking found no generated drift. Rustdoc completed with warnings denied.
 
+The coordinator rebound that historical lane result to current `main` on
+2026-08-26 by running the following commands at exact revision
+`96155793c1c8d06dea0139832bd96d9572d40cd6`:
+
+```text
+cargo fmt --all -- --check
+cargo test --locked -p deepwyrm-kernel normal_policy_model
+cargo test --locked -p deepwyrm-kernel task::scheduler::tests
+cargo xtask abi check
+cargo xtask test host abi
+cargo xtask test host handles
+cargo xtask test host memory
+cargo xtask test host tasks
+cargo xtask test host ipc
+cargo test --locked --workspace --all-targets
+RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
+```
+
+All current-tree commands passed. The focused model again reported 7 passed,
+the cooperative scheduler suite again reported 34 passed, ABI checking found
+no generated drift, every canonical DW0 host gate and the full all-target
+workspace run had no failures, the three intentional target-artifact ignores
+remained explicit, and Rustdoc completed with warnings denied.
+
 The proportionate all-target Clippy command was also attempted:
 
 ```text
@@ -108,8 +144,8 @@ changed or validated by this Deepwyrm-only record.
 
 ## Closure conclusion
 
-The exact implementation revision satisfies the DW1-A contract/model gate and
-preserves the existing DW0 host regression suite. It is ready for coordinator
-integration as the Deepwyrm DW1-A closure candidate. DW1-B must still implement
-and validate one-CPU timer-driven userspace preemption; DW1-C must still admit
-AP carriers and validate the four-CPU live normal scheduler.
+The integrated implementation revision satisfies the DW1-A contract/model gate
+and preserves the existing DW0 host regression suite on the current-tree
+revalidation revision. DW1-A is complete. DW1-B must still implement and
+validate one-CPU timer-driven userspace preemption; DW1-C must still admit AP
+carriers and validate the four-CPU live normal scheduler.
