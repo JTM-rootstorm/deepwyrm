@@ -1700,30 +1700,22 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             // Primordial is still this CPU's hardware-active Process root.
             // Remove its low half through that exact publisher before choosing
             // either a userspace successor or the CPU-private kernel root.
-            let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|RETIRE|PROOF\n");
             let proof = self
                 .tasks
                 .process_quiescence_proof(retired_process)
                 .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d009));
-            let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|RETIRE|DRAIN\n");
             let drained = self
                 .shared
                 .execution
                 .blocked_operations_drained(&self.tasks, &proof)
                 .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d00a));
-            let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|RETIRE|UNMAP\n");
             self.unmap_primordial_userspace(&proof)
                 .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d00b));
-            let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|RETIRE|UNMAPPED\n");
             Some((proof, drained))
         } else {
             None
         };
-        #[cfg(deepwyrm_wyr1_evidence)]
-        let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|RETIRE|SELECT\n");
         if let Some(next) = self.shared.execution.terminal_reaper_next_on(self.cpu) {
-            #[cfg(deepwyrm_wyr1_evidence)]
-            let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|RETIRE|SUCCESSOR\n");
             let (stack_id, context_id) = self
                 .tasks
                 .thread_execution_resources(next)
@@ -1740,15 +1732,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .kernel_continuation_rsp(context_id)
                 .unwrap_or_else(|error| panic!("terminal next continuation failed: {error:?}"));
             self.synchronize_scheduler_current();
-            #[cfg(deepwyrm_wyr1_evidence)]
-            let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|RETIRE|SWITCHED\n");
             if retired_process != self.process {
                 #[cfg(deepwyrm_wyr1_evidence)]
                 if retiring_wyr1_primordial {
                     let (proof, drained) = wyr1_primordial_teardown
                         .take()
                         .unwrap_or_else(|| crate::test_support::complete_fail(0x2510_d00c));
-                    let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|RETIRE|ROOT\n");
                     self.finish_quiesced_process_root_retirement(
                         retired_process,
                         retired_address_space,
@@ -1756,7 +1745,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         drained,
                     )
                     .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d002));
-                    let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|RETIRE|RETIRED\n");
                 } else if self.tasks.process_quiescence_proof(retired_process).is_ok() {
                     self.finish_inactive_process_teardown(
                         retired_process,
@@ -1809,7 +1797,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             // gone, so move to this CPU's private kernel root, retire the empty
             // primordial root, then leave the carrier idle without resurrecting
             // the bootstrap root.
-            let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|RETIRE|NO-SUCCESSOR\n");
             let previous = self.active_root.take_process();
             match self.active.enter_kernel_execution_root(previous) {
                 Ok(kernel) => self.active_root = CarrierActiveRoot::Kernel(kernel),
@@ -1864,7 +1851,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 };
                 crate::test_support::complete_fail(detail)
             }
-            let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|CHILD|ROLE\n");
             let proof = self
                 .tasks
                 .process_quiescence_proof(retired_process)
@@ -1874,7 +1860,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .execution
                 .blocked_operations_drained(&self.tasks, &proof)
                 .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d00f));
-            let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|CHILD|UNMAP\n");
             self.unmap_current_userspace(
                 retired_process,
                 retired_root_key,
@@ -1890,7 +1875,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     crate::test_support::complete_fail(0x2510_d011)
                 }
             }
-            let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|CHILD|KERNEL\n");
             self.finish_quiesced_process_root_retirement(
                 retired_process,
                 retired_address_space,
@@ -1899,7 +1883,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             )
             .unwrap_or_else(|_| crate::test_support::complete_fail(0x2510_d012));
             self.local.record_idle();
-            let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|CHILD|IDLE\n");
             return PreparedTerminalHandoff::IdleScheduler;
         }
 
@@ -2504,8 +2487,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         address_space: crate::memory::address_region::AddressSpaceKey,
         proof: &crate::task::ProcessQuiescenceProof,
     ) -> Result<(), ()> {
-        #[cfg(deepwyrm_wyr1_evidence)]
-        let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|UNMAP|VALIDATE\n");
         self.active
             .validate_current_process_root_selection(
                 self.active_root.as_ref().ok_or(())?,
@@ -2530,12 +2511,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .next()
                 .copied();
             let Some(mapping) = mapping else {
-                #[cfg(deepwyrm_wyr1_evidence)]
-                let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|UNMAP|EMPTY\n");
                 break;
             };
-            #[cfg(deepwyrm_wyr1_evidence)]
-            let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|UNMAP|MAPPING\n");
             let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
             let releases = {
                 let region = self
@@ -2564,8 +2541,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         )
                     })
             };
-            #[cfg(deepwyrm_wyr1_evidence)]
-            let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|UNMAP|REMOVED\n");
             for candidate in candidates.into_iter().flatten() {
                 user.recycle_table_candidate(candidate);
             }
@@ -2679,8 +2654,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .teardown_empty_child_address_space(process, address_space)
                 .map_err(|_| ())?;
         }
-        #[cfg(deepwyrm_wyr1_evidence)]
-        let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|ROOT|RETIRE\n");
         let root_pin = self
             .regions
             .retire_quiesced_root(
@@ -2691,15 +2664,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 drained,
             )
             .map_err(|_| ())?;
-        #[cfg(deepwyrm_wyr1_evidence)]
-        let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|ROOT|RELEASE\n");
         self.cleanup
             .push_optional(self.registry.release_internal(root_pin).map_err(|_| ())?);
-        #[cfg(deepwyrm_wyr1_evidence)]
-        let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|ROOT|FINALIZE\n");
         self.drain_finalizers()?;
-        #[cfg(deepwyrm_wyr1_evidence)]
-        let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|ROOT|DONE\n");
         Ok(())
     }
 
@@ -2782,12 +2749,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     );
                     finalizer.finalize_chain(release)
                 };
-                #[cfg(deepwyrm_wyr1_evidence)]
-                let _ = crate::debug::emit_early_raw_record(if batch.len() == 0 {
-                    b"DWDBG|WYR1|FINALIZER|NO-WAKE\n"
-                } else {
-                    b"DWDBG|WYR1|FINALIZER|WAKE\n"
-                });
                 crate::syscall::complete_wait_wakes(
                     &mut self.registry,
                     &self.shared.execution,
@@ -3707,10 +3668,6 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
     }
 
     fn enter_idle_scheduler(&mut self) -> ! {
-        #[cfg(deepwyrm_wyr1_evidence)]
-        let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|IDLE|ENTER\n");
-        #[cfg(deepwyrm_wyr1_evidence)]
-        let mut first_scan = true;
         loop {
             enum Entry {
                 Fresh {
@@ -3756,15 +3713,6 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                     }
                 })
             };
-            #[cfg(deepwyrm_wyr1_evidence)]
-            if first_scan {
-                let _ = crate::debug::emit_early_raw_record(if entry.is_some() {
-                    b"DWDBG|WYR1|IDLE|WORK\n"
-                } else {
-                    b"DWDBG|WYR1|IDLE|EMPTY\n"
-                });
-                first_scan = false;
-            }
             match entry {
                 Some(Entry::Fresh { state, stack }) => {
                     unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(stack) }
