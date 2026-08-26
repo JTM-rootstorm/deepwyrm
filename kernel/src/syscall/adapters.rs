@@ -1804,12 +1804,13 @@ pub(crate) fn process_create_with_root<
     )
 }
 
-/// Selector-25-only live process construction with an exact kernel-commit
-/// observer. The observer sees the child only after its Process and root
-/// objects commit, but before parent result handles and user output publish;
-/// it is not a completed-syscall notification. Any later invariant failure is
-/// terminal, so the captured identity cannot reach reporter authorization.
-#[cfg(deepwyrm_wyr1_evidence)]
+/// Private evidence-selector live process construction with an exact
+/// kernel-commit observer. The observer sees the child only after its Process
+/// and root objects commit, but before parent result handles and user output
+/// publish; it is not a completed-syscall notification. Any later invariant
+/// failure is terminal, so the captured identity cannot reach reporter
+/// authorization.
+#[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_dw1b_evidence))]
 #[allow(
     clippy::too_many_arguments,
     reason = "the selector-local observer preserves the live F10 transaction boundaries"

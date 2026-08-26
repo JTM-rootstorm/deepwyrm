@@ -275,6 +275,10 @@ fn selector26_private_evidence_surface_is_isolated_and_terminally_ordered() {
     let debug = fs::read_to_string(root.join("src/debug/mod.rs")).expect("read debug support");
     let primordial = fs::read_to_string(root.join("src/arch/x86_64/mm/activation/primordial.rs"))
         .expect("read primordial runtime");
+    let syscall =
+        fs::read_to_string(root.join("src/syscall/mod.rs")).expect("read syscall exports");
+    let adapters =
+        fs::read_to_string(root.join("src/syscall/adapters.rs")).expect("read syscall adapters");
     let public_abi = fs::read_to_string(root.join("../abi/generated/deepwyrm_abi.rs"))
         .expect("read generated ABI");
 
@@ -304,6 +308,11 @@ fn selector26_private_evidence_surface_is_isolated_and_terminally_ordered() {
     assert!(primordial.contains(".progress(self.process, exchange_count, digest)"));
     assert!(primordial.contains("g5_probe.accepts_completion(&completion)"));
     assert!(primordial.contains("complete_dw1b_evidence(permit)"));
+    assert!(syscall.contains("any(deepwyrm_wyr1_evidence, deepwyrm_dw1b_evidence)"));
+    assert!(syscall.contains("pub(crate) use adapters::process_create_with_root_observed;"));
+    assert!(
+        adapters.contains("#[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_dw1b_evidence))]\n#[allow(")
+    );
 }
 
 #[test]
