@@ -322,23 +322,37 @@ PROGRESS:
     arg0 = 2
     arg1 = 8
     arg2 = fixed challenge/reply digest
-    arg3 = ordinary hello transaction ID
+    arg3 = 0
     arg4 = 0
     arg5 = 0
 ```
 
-ARM and PROGRESS are ordered, once-only operations from the same exact init0
-Process. ARM resolves two distinct live Process handles, each with exactly one
-live Thread, and records their generation-safe kernel identities. PROGRESS is
-accepted only after ARM from the bound reporter. The Wyrmroot product freezes
-the challenge/reply digest and ordinary hello transaction value before paired
-acceptance; Deepwyrm records their exact ARM/PROGRESS values without admitting
-them to the public ABI.
+The selector build binds a nonzero uppercase-hex evidence nonce and expected
+challenge digest through `DEEPWYRM_DW1B_EVIDENCE_NONCE` and
+`DEEPWYRM_DW1B_CHALLENGE_DIGEST`. PROGRESS must match those frozen values.
+
+ARM is accepted only from the exact committed first child of primordial, the
+existing init0 Process. It resolves two distinct live Process handles, each
+with exactly one live Thread, and records their generation-safe kernel
+identities. PROGRESS is accepted once, after ARM, only from the exact bound
+progress Process. The Wyrmroot product freezes the challenge/reply digest and
+audits that this child submits PROGRESS only after its eight correlated Channel
+exchanges; Deepwyrm checks the exact count and digest without admitting them to
+the public ABI.
 
 The selector collector observes scheduler transitions independently of
-userspace. It must see the exact registered hog Thread Running after ARM and an
-involuntary switch whose outgoing identity is that exact Thread. Aggregate CPU
-counters alone cannot establish the outgoing-hog fact.
+userspace. It must see the exact registered hog Thread Running after ARM and at
+least one involuntary switch whose outgoing identity is that exact Thread.
+Repeated exact outgoing-hog preemptions are legitimate and idempotent;
+aggregate CPU counters alone cannot establish this fact.
+
+Successful `complete_primordial_launch` accepted by the existing G5 probe is
+the ordinary WYR0 bootstrap/init0/hello proof: hello READY, exit zero, cleanup,
+and primordial completion were normal. Deepwyrm sets both the ordinary-hello
+and primordial-normal facts only at that genuine completion boundary. This is
+joined with the exact progress-child submission and the global `wakeups >= 8`
+relation; the paired Wyrmroot payload/model audit proves those wakes represent
+the child's correlated exchange loop.
 
 At normal primordial completion, Deepwyrm emits exactly one fixed 122-byte
 summary immediately before the canonical PASS `DWTEST1` terminal:
