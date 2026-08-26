@@ -328,7 +328,7 @@ fn h4_remote_deadline_mutation_notifies_only_the_bsp_timer_service_over_e1() {
         .find("BSP_TIMER_SERVICE.ensure_healthy()")
         .expect("global timer-service fault check");
     let queue = timer_dispatch
-        .find("state.interrupt()")
+        .find(".interrupt(outcome)")
         .expect("deadline queue interrupt service");
     assert!(health < queue);
 }
@@ -383,7 +383,7 @@ fn dw1b_deadline_arbiter_uses_exact_logical_and_physical_generations() {
         .expect("DW1-B timer dispatch extent")
         .0;
     let irq = timer_dispatch
-        .find("state.interrupt()")
+        .find(".interrupt(outcome)")
         .expect("collect due work");
     let arm = timer_dispatch
         .find("reconcile_bsp_hardware_arm()")
@@ -401,6 +401,67 @@ fn dw1b_deadline_arbiter_uses_exact_logical_and_physical_generations() {
         .find("publish_current_quantum_expiry")
         .expect("scheduler callback");
     assert!(irq < arm && arm < eoi && eoi < waits && waits < timers && timers < quantum);
+}
+
+#[test]
+fn dw1b_timer_dispatch_uses_one_nonreentrant_cpu0_outcome_scratch() {
+    let live = source("src/time/live.rs");
+    for evidence in [
+        "struct BspInterruptOutcomeStorage(UnsafeCell<InterruptOutcome>)",
+        "static BSP_INTERRUPT_OUTCOME: BspInterruptOutcomeStorage",
+        "fn interrupt(&mut self, outcome: &mut InterruptOutcome)",
+        "outcome.assert_drained()",
+        "expire(sample.nanoseconds, &mut outcome.wakes)",
+        "expire(sample.nanoseconds, &mut outcome.timer_expiries)",
+        "let outcome = unsafe { &mut *BSP_INTERRUPT_OUTCOME.0.get() }",
+        ".filter_map(Option::take)",
+        "outcome.scheduler_quantum.take()",
+    ] {
+        assert!(
+            live.contains(evidence),
+            "DW1-B stationary timer outcome scratch omitted `{evidence}`"
+        );
+    }
+
+    let collect = live
+        .split_once("fn interrupt(&mut self, outcome: &mut InterruptOutcome)")
+        .expect("in-place deadline collection")
+        .1
+        .split_once("fn register_deadline")
+        .expect("in-place deadline collection extent")
+        .0;
+    assert!(!collect.contains("let mut wakes"));
+    assert!(!collect.contains("let mut timer_expiries"));
+    assert!(!collect.contains("Result<InterruptOutcome"));
+
+    let drained = live
+        .split_once("fn assert_drained(&self)")
+        .expect("stationary outcome drain assertion")
+        .1
+        .split_once("struct BspInterruptOutcomeStorage")
+        .expect("stationary outcome drain assertion extent")
+        .0;
+    for evidence in [
+        "debug_assert_eq!(self.wake_count, 0)",
+        "self.wakes.iter().all(Option::is_none)",
+        "debug_assert_eq!(self.timer_expiry_count, 0)",
+        "self.timer_expiries.iter().all(Option::is_none)",
+        "self.scheduler_quantum.is_none()",
+    ] {
+        assert!(
+            drained.contains(evidence),
+            "outcome drain assertion omitted `{evidence}`"
+        );
+    }
+    let timer_dispatch = live
+        .split_once("pub(crate) extern \"sysv64\" fn dw_x86_64_timer_interrupt_dispatch()")
+        .expect("DW1-B timer dispatch")
+        .1
+        .split_once("fn read_pm_timer")
+        .expect("DW1-B timer dispatch extent")
+        .0;
+    assert!(timer_dispatch.contains("core::mem::take(&mut outcome.wake_count)"));
+    assert!(timer_dispatch.contains("core::mem::take(&mut outcome.timer_expiry_count)"));
 }
 
 #[test]

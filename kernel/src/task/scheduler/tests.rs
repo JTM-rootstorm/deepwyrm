@@ -136,8 +136,10 @@ fn queued_and_running_threads_reject_duplicate_reservation() {
 
 #[test]
 fn checked_accounting_freezes_overflow_and_rejects_bad_gauges_and_time() {
-    let mut counters = SchedulerCounters::default();
-    counters.context_switches = u64::MAX;
+    let mut counters = SchedulerCounters {
+        context_switches: u64::MAX,
+        ..SchedulerCounters::default()
+    };
     assert_eq!(
         counters.increment(SchedulerEvent::ContextSwitch),
         Err(SchedulerError::AccountingOverflow)
@@ -158,8 +160,10 @@ fn checked_accounting_freezes_overflow_and_rejects_bad_gauges_and_time() {
     );
     assert_eq!(gauge.current_runnable, u64::MAX);
 
-    let mut time = SchedulerCounters::default();
-    time.idle_time_ns = u64::MAX - 2;
+    let mut time = SchedulerCounters {
+        idle_time_ns: u64::MAX - 2,
+        ..SchedulerCounters::default()
+    };
     assert_eq!(
         time.record_idle_time(3),
         Err(SchedulerError::AccountingOverflow)

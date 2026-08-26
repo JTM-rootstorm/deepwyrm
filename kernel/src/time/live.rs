@@ -500,7 +500,6 @@ impl LiveIpiTransport for StationaryLiveIpiTransport {
     }
 }
 
-#[derive(Clone, Copy)]
 struct InterruptOutcome {
     wakes: [Option<BlockWakeKey>; DEADLINE_QUEUE_CAPACITY],
     wake_count: usize,
@@ -508,6 +507,42 @@ struct InterruptOutcome {
     timer_expiry_count: usize,
     scheduler_quantum: Option<crate::task::SchedulerQuantumTicket>,
 }
+
+impl InterruptOutcome {
+    const fn empty() -> Self {
+        Self {
+            wakes: [None; DEADLINE_QUEUE_CAPACITY],
+            wake_count: 0,
+            timer_expiries: [None; DEADLINE_QUEUE_CAPACITY],
+            timer_expiry_count: 0,
+            scheduler_quantum: None,
+        }
+    }
+
+    fn assert_drained(&self) {
+        debug_assert_eq!(self.wake_count, 0);
+        debug_assert!(self.wakes.iter().all(Option::is_none));
+        debug_assert_eq!(self.timer_expiry_count, 0);
+        debug_assert!(self.timer_expiries.iter().all(Option::is_none));
+        debug_assert!(self.scheduler_quantum.is_none());
+    }
+}
+
+struct BspInterruptOutcomeStorage(UnsafeCell<InterruptOutcome>);
+
+impl BspInterruptOutcomeStorage {
+    const fn new() -> Self {
+        Self(UnsafeCell::new(InterruptOutcome::empty()))
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the CPU0-only timer interrupt gate keeps IF clear, so its stationary outcome scratch cannot be entered concurrently or recursively"
+)]
+unsafe impl Sync for BspInterruptOutcomeStorage {}
+
+static BSP_INTERRUPT_OUTCOME: BspInterruptOutcomeStorage = BspInterruptOutcomeStorage::new();
 
 struct LiveTimeState {
     pm: PmTimerState,
@@ -554,25 +589,23 @@ impl LiveTimeState {
             .map_err(|_| LiveTimeError::Deadline)
     }
 
-    fn interrupt(&mut self) -> Result<InterruptOutcome, LiveTimeError> {
+    fn interrupt(&mut self, outcome: &mut InterruptOutcome) -> Result<(), LiveTimeError> {
+        outcome.assert_drained();
         let sample = self.sample_now()?;
-        let mut wakes = [None; DEADLINE_QUEUE_CAPACITY];
-        let wake_count = self.deadlines.expire(sample.nanoseconds, &mut wakes);
-        let mut timer_expiries = [None; DEADLINE_QUEUE_CAPACITY];
-        let timer_expiry_count = self
+        outcome.wake_count = self
+            .deadlines
+            .expire(sample.nanoseconds, &mut outcome.wakes);
+        outcome.timer_expiry_count = self
             .timer_deadlines
-            .expire(sample.nanoseconds, &mut timer_expiries);
-        let scheduler_quantum = self.scheduler_quantum.take_due(sample.nanoseconds);
-        if wake_count != 0 || timer_expiry_count != 0 || scheduler_quantum.is_some() {
+            .expire(sample.nanoseconds, &mut outcome.timer_expiries);
+        outcome.scheduler_quantum = self.scheduler_quantum.take_due(sample.nanoseconds);
+        if outcome.wake_count != 0
+            || outcome.timer_expiry_count != 0
+            || outcome.scheduler_quantum.is_some()
+        {
             self.record_source_mutation();
         }
-        Ok(InterruptOutcome {
-            wakes,
-            wake_count,
-            timer_expiries,
-            timer_expiry_count,
-            scheduler_quantum,
-        })
+        Ok(())
     }
 
     fn register_deadline(
@@ -1231,10 +1264,15 @@ pub(crate) extern "sysv64" fn dw_x86_64_timer_interrupt_dispatch() {
     let Some(state) = live_state() else {
         halt_forever();
     };
-    let outcome = {
+    #[allow(
+        unsafe_code,
+        reason = "CPU0 alone owns this scratch and the interrupt gate keeps IF clear through all callback consumption"
+    )]
+    let outcome = unsafe { &mut *BSP_INTERRUPT_OUTCOME.0.get() };
+    {
         let mut state = state.lock();
-        state.interrupt().unwrap_or_else(|_| halt_forever())
-    };
+        state.interrupt(outcome).unwrap_or_else(|_| halt_forever());
+    }
     reconcile_bsp_hardware_arm().unwrap_or_else(|_| halt_forever());
     current_local_apic_slot()
         .and_then(PerCpuLocalApicSlot::end_of_interrupt)
@@ -1243,7 +1281,13 @@ pub(crate) extern "sysv64" fn dw_x86_64_timer_interrupt_dispatch() {
         let Some(binding) = wake_binding() else {
             halt_forever();
         };
-        for key in outcome.wakes.into_iter().take(outcome.wake_count).flatten() {
+        let wake_count = core::mem::take(&mut outcome.wake_count);
+        for key in outcome
+            .wakes
+            .iter_mut()
+            .take(wake_count)
+            .filter_map(Option::take)
+        {
             #[allow(
                 unsafe_code,
                 reason = "the immutable static wake binding is invoked only after the IRQ-safe time lock has been released"
@@ -1257,11 +1301,12 @@ pub(crate) extern "sysv64" fn dw_x86_64_timer_interrupt_dispatch() {
         let Some(binding) = timer_expiry_binding() else {
             halt_forever();
         };
+        let timer_expiry_count = core::mem::take(&mut outcome.timer_expiry_count);
         for token in outcome
             .timer_expiries
-            .into_iter()
-            .take(outcome.timer_expiry_count)
-            .flatten()
+            .iter_mut()
+            .take(timer_expiry_count)
+            .filter_map(Option::take)
         {
             #[allow(
                 unsafe_code,
@@ -1272,7 +1317,7 @@ pub(crate) extern "sysv64" fn dw_x86_64_timer_interrupt_dispatch() {
             }
         }
     }
-    if let Some(ticket) = outcome.scheduler_quantum {
+    if let Some(ticket) = outcome.scheduler_quantum.take() {
         crate::arch::x86_64::syscall::publish_current_quantum_expiry(ticket)
             .unwrap_or_else(|_| halt_forever());
     }

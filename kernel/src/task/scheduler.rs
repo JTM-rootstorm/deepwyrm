@@ -981,7 +981,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         let next_enqueue_generation = enqueue_generation
             .checked_add(1)
             .filter(|next| *next != 0)
-            .ok_or_else(|| SchedulerReservationFailure {
+            .ok_or(SchedulerReservationFailure {
                 error: SchedulerError::TokenExhausted,
                 reservation: SchedulerReservation {
                     domain: reservation.domain,
