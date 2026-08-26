@@ -2502,6 +2502,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if self.process != process || self.root_key != root_key {
             return Err(());
         }
+        let mut user = self
+            .active
+            .current_process_address_space(self.active_root.as_ref().ok_or(())?, process);
         loop {
             let mapping = self
                 .regions
@@ -2519,24 +2522,39 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             };
             #[cfg(deepwyrm_wyr1_evidence)]
             let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|UNMAP|MAPPING\n");
+            let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
             let releases = {
                 let region = self
                     .regions
                     .region_mut_for_quiesced_teardown(&self.tasks, proof, root_key)
                     .map_err(|_| ())?;
-                let mut platform = LivePlatform {
-                    active: &mut self.active,
-                };
-                platform.unmap_committed(
-                    region,
-                    &mut self.memory,
-                    &mut self.registry,
-                    mapping.virtual_start(),
-                    mapping.byte_len(),
-                )
+                let mut publisher = user
+                    .publisher::<
+                        PRIMORDIAL_TABLE_CANDIDATES,
+                        PRIMORDIAL_JOURNAL_ENTRIES,
+                        PRIMORDIAL_INVALIDATIONS,
+                    >(region.address_space_key(), region.region_key(), &mut candidates)
+                    .map_err(|_| ())?;
+                region
+                    .unmap(
+                        &mut self.memory,
+                        &mut self.registry,
+                        &mut publisher,
+                        mapping.virtual_start(),
+                        mapping.byte_len(),
+                    )
+                    .unwrap_or_else(|failure| {
+                        panic!(
+                            "current process mapping teardown diverged: {:?}",
+                            failure.error()
+                        )
+                    })
             };
             #[cfg(deepwyrm_wyr1_evidence)]
             let _ = crate::debug::emit_early_raw_record(b"DWDBG|WYR1|UNMAP|REMOVED\n");
+            for candidate in candidates.into_iter().flatten() {
+                user.recycle_table_candidate(candidate);
+            }
             for release in releases.into_items().into_iter().flatten() {
                 self.cleanup.push(release);
             }

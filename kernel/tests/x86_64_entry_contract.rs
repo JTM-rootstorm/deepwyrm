@@ -611,13 +611,17 @@ fn g5_terminal_completion_drains_all_primordial_authority_before_capacity_proof(
         "validate_current_process_root_selection(",
         "self.process != process",
         "self.root_key != root_key",
-        "LivePlatform {",
+        ".current_process_address_space(",
+        ".publisher::<",
+        ".unmap(",
     ] {
         assert!(
             current_unmap.contains(required),
             "current-root unmap omitted guard {required}"
         );
     }
+    assert!(!current_unmap.contains("LivePlatform {"));
+    assert!(!current_unmap.contains("self.active.identity"));
 
     let terminal_start = primordial
         .find("fn finish_terminal_teardown(")
