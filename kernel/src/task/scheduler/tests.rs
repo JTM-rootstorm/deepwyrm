@@ -568,6 +568,123 @@ fn pending_blocks_are_cpu_local_and_reject_the_wrong_cpu() {
 }
 
 #[test]
+fn dw1b_quantum_identity_rejects_stale_replaced_and_cross_cpu_events() {
+    let scheduler = CooperativeScheduler::<1>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let running = thread_key(&mut registry);
+    scheduler
+        .commit(scheduler.reserve(running).unwrap())
+        .unwrap();
+    scheduler.schedule_next_on(cpu(0)).unwrap();
+
+    let first = scheduler.prepare_quantum_on(cpu(0), 10).unwrap();
+    assert_eq!(first.deadline_ns(), 10 + DEFAULT_NORMAL_QUANTUM_NS);
+    let replacement = scheduler.prepare_quantum_on(cpu(0), 20).unwrap();
+    assert_ne!(
+        first.source_arm_generation(),
+        replacement.source_arm_generation()
+    );
+    assert_eq!(scheduler.publish_quantum_expiry(first), Ok(false));
+    assert!(!scheduler.has_reschedule_request_on(cpu(0)));
+    assert_eq!(scheduler.publish_quantum_expiry(replacement), Ok(true));
+    assert!(scheduler.has_reschedule_request_on(cpu(0)));
+    assert_eq!(scheduler.publish_quantum_expiry(replacement), Ok(false));
+    assert_eq!(
+        scheduler.prepare_quantum_on(cpu(1), 30),
+        Err(SchedulerError::QuantumUnavailable)
+    );
+    assert_eq!(scheduler.counters_on(cpu(0)).quantum_expirations, 1);
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn dw1b_matching_expiry_rotates_fifo_and_retains_exact_continuation() {
+    let scheduler = CooperativeScheduler::<3>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let first = thread_key(&mut registry);
+    let second = thread_key(&mut registry);
+    let third = thread_key(&mut registry);
+    for thread in [first, second, third] {
+        scheduler
+            .commit(scheduler.reserve(thread).unwrap())
+            .unwrap();
+    }
+    assert_eq!(
+        scheduler.schedule_next_on(cpu(0)).unwrap().current,
+        Some(first)
+    );
+    let ticket = scheduler.prepare_quantum_on(cpu(0), 100).unwrap();
+    assert_eq!(scheduler.publish_quantum_expiry(ticket), Ok(true));
+    let outgoing = scheduler.running_claim_on(cpu(0)).unwrap();
+    let decision = scheduler.preempt_current_on(cpu(0)).unwrap();
+    assert_eq!(
+        decision,
+        SchedulerPreemptionDecision::Switch {
+            decision: ScheduleDecision {
+                previous: Some(first),
+                current: Some(second),
+            },
+            outgoing,
+        }
+    );
+    assert_eq!(scheduler.suspended_claim_on(cpu(0)), Some(outgoing));
+    assert_eq!(scheduler.current_on(cpu(0)), Some(second));
+    scheduler.complete_switch_on(outgoing).unwrap();
+    scheduler.yield_current_on(cpu(0), second).unwrap();
+    assert_eq!(scheduler.current_on(cpu(0)), Some(third));
+    let counters = scheduler.counters_on(cpu(0));
+    assert_eq!(counters.quantum_expirations, 1);
+    assert_eq!(counters.involuntary_preemptions, 1);
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn dw1b_no_peer_consumes_request_without_manufacturing_switch() {
+    let scheduler = CooperativeScheduler::<1>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let running = thread_key(&mut registry);
+    scheduler
+        .commit(scheduler.reserve(running).unwrap())
+        .unwrap();
+    scheduler.schedule_next_on(cpu(0)).unwrap();
+    let switches = scheduler.counters_on(cpu(0)).context_switches;
+    let ticket = scheduler.prepare_quantum_on(cpu(0), 1).unwrap();
+    scheduler.publish_quantum_expiry(ticket).unwrap();
+    assert_eq!(
+        scheduler.preempt_current_on(cpu(0)),
+        Ok(SchedulerPreemptionDecision::RetainCurrent)
+    );
+    assert!(!scheduler.has_reschedule_request_on(cpu(0)));
+    assert_eq!(scheduler.current_on(cpu(0)), Some(running));
+    assert_eq!(scheduler.counters_on(cpu(0)).context_switches, switches);
+    assert_eq!(scheduler.counters_on(cpu(0)).involuntary_preemptions, 0);
+    assert!(scheduler.prepare_quantum_on(cpu(0), 2).is_ok());
+}
+
+#[test]
+fn dw1b_checked_preemption_depth_defers_exact_request() {
+    let scheduler = CooperativeScheduler::<1>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let running = thread_key(&mut registry);
+    scheduler
+        .commit(scheduler.reserve(running).unwrap())
+        .unwrap();
+    scheduler.schedule_next_on(cpu(0)).unwrap();
+    scheduler.preemption_disable_on(cpu(0)).unwrap();
+    let ticket = scheduler.prepare_quantum_on(cpu(0), 1).unwrap();
+    scheduler.publish_quantum_expiry(ticket).unwrap();
+    assert_eq!(
+        scheduler.preempt_current_on(cpu(0)),
+        Ok(SchedulerPreemptionDecision::Deferred)
+    );
+    assert!(scheduler.preemption_enable_on(cpu(0)).unwrap());
+    assert_eq!(
+        scheduler.preemption_enable_on(cpu(0)),
+        Err(SchedulerError::PreemptionDepthUnderflow)
+    );
+}
+
+#[test]
 fn suspended_waiter_is_not_migratable_until_release_acquire_handoff() {
     let scheduler = CooperativeScheduler::<1>::new();
     let mut registry = ObjectRegistry::<16>::new();

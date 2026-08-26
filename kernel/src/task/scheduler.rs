@@ -45,6 +45,60 @@ pub(crate) enum SchedulerError {
     TimeRegression,
     IdleAccountingActive,
     StaleIdleAccounting,
+    QuantumUnavailable,
+    StaleQuantum,
+    PreemptionDisabled,
+    PreemptionDepthOverflow,
+    PreemptionDepthUnderflow,
+}
+
+/// Fixed DW1 normal-class quantum. This is internal policy, not ABI.
+pub(crate) const DEFAULT_NORMAL_QUANTUM_NS: u64 = 5_000_000;
+
+/// Exact identity of one CPU-local scheduler deadline source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SchedulerQuantumTicket {
+    domain: u64,
+    cpu: SchedulerCpuId,
+    thread: ThreadKey,
+    execution_generation: u64,
+    source_arm_generation: u64,
+    deadline_ns: u64,
+}
+
+impl SchedulerQuantumTicket {
+    pub(crate) const fn cpu(self) -> SchedulerCpuId {
+        self.cpu
+    }
+
+    pub(crate) const fn thread(self) -> ThreadKey {
+        self.thread
+    }
+
+    pub(crate) const fn execution_generation(self) -> u64 {
+        self.execution_generation
+    }
+
+    pub(crate) const fn source_arm_generation(self) -> u64 {
+        self.source_arm_generation
+    }
+
+    pub(crate) const fn deadline_ns(self) -> u64 {
+        self.deadline_ns
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SchedulerPreemptionDecision {
+    /// The exact request remains pending until the checked depth reaches zero.
+    Deferred,
+    /// The request was consumed, but no eligible local peer existed.
+    RetainCurrent,
+    /// The outgoing continuation must be saved before the decision completes.
+    Switch {
+        decision: ScheduleDecision,
+        outgoing: SchedulerExecutionClaim,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -215,6 +269,9 @@ pub(crate) enum SchedulerTraceKind {
     RemoteStop,
     IdleBegin,
     IdleEnd,
+    QuantumArm,
+    QuantumExpire,
+    Preempt,
 }
 
 #[cfg(test)]
@@ -293,6 +350,8 @@ enum SchedulerEvent {
     VoluntaryYield,
     Wakeup,
     IdleEntry,
+    QuantumExpiration,
+    InvoluntaryPreemption,
 }
 
 impl SchedulerCounters {
@@ -303,6 +362,8 @@ impl SchedulerCounters {
             SchedulerEvent::VoluntaryYield => &mut self.voluntary_yields,
             SchedulerEvent::Wakeup => &mut self.wakeups,
             SchedulerEvent::IdleEntry => &mut self.idle_entries,
+            SchedulerEvent::QuantumExpiration => &mut self.quantum_expirations,
+            SchedulerEvent::InvoluntaryPreemption => &mut self.involuntary_preemptions,
         };
         let Some(next) = counter.checked_add(1) else {
             self.overflow_fault = true;
@@ -429,6 +490,7 @@ struct SchedulerState<const CAPACITY: usize> {
     next_execution_generation: u64,
     next_enqueue_generation: u64,
     next_idle_generation: u64,
+    next_quantum_generation: u64,
     queue: [Option<QueueEntry>; CAPACITY],
     len: usize,
     running: [Option<RunningClaim>; H2_SCHEDULER_CPU_CAPACITY],
@@ -437,6 +499,9 @@ struct SchedulerState<const CAPACITY: usize> {
     accounting: SchedulerAccounting,
     active_idle: [Option<SchedulerIdleAccountingToken>; H2_SCHEDULER_CPU_CAPACITY],
     instrumentation_now_ns: [Option<u64>; H2_SCHEDULER_CPU_CAPACITY],
+    quantum: [Option<SchedulerQuantumTicket>; H2_SCHEDULER_CPU_CAPACITY],
+    need_resched: [Option<SchedulerQuantumTicket>; H2_SCHEDULER_CPU_CAPACITY],
+    preemption_disable_depth: [u32; H2_SCHEDULER_CPU_CAPACITY],
     #[cfg(test)]
     trace: SchedulerTrace,
 }
@@ -449,6 +514,7 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             next_execution_generation: 1,
             next_enqueue_generation: 1,
             next_idle_generation: 1,
+            next_quantum_generation: 1,
             queue: [None; CAPACITY],
             len: 0,
             running: [None; H2_SCHEDULER_CPU_CAPACITY],
@@ -457,6 +523,9 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             accounting: SchedulerAccounting::default(),
             active_idle: [None; H2_SCHEDULER_CPU_CAPACITY],
             instrumentation_now_ns: [None; H2_SCHEDULER_CPU_CAPACITY],
+            quantum: [None; H2_SCHEDULER_CPU_CAPACITY],
+            need_resched: [None; H2_SCHEDULER_CPU_CAPACITY],
+            preemption_disable_depth: [0; H2_SCHEDULER_CPU_CAPACITY],
             #[cfg(test)]
             trace: SchedulerTrace::new(),
         }
@@ -612,6 +681,11 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         Ok(generation)
     }
 
+    fn clear_preemption_on(&mut self, cpu: SchedulerCpuId) {
+        self.quantum[cpu.index()] = None;
+        self.need_resched[cpu.index()] = None;
+    }
+
     fn check_invariants(&self) -> Result<(), SchedulerError> {
         if self.accounting.cpu.iter().any(|cpu| cpu.overflow_fault) {
             return Err(SchedulerError::AccountingOverflow);
@@ -646,6 +720,27 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
                         .any(|entry| entry.thread == current.thread))
             {
                 return Err(SchedulerError::DuplicateThread);
+            }
+        }
+        for cpu_index in 0..H2_SCHEDULER_CPU_CAPACITY {
+            let cpu = SchedulerCpuId::new(cpu_index).expect("bounded scheduler CPU index");
+            let current = self.running[cpu_index];
+            for ticket in [self.quantum[cpu_index], self.need_resched[cpu_index]]
+                .into_iter()
+                .flatten()
+            {
+                if ticket.domain != self.domain
+                    || ticket.cpu != cpu
+                    || ticket.execution_generation == 0
+                    || ticket.source_arm_generation == 0
+                    || ticket.deadline_ns == 0
+                    || !current.is_some_and(|claim| {
+                        claim.thread == ticket.thread
+                            && claim.generation == ticket.execution_generation
+                    })
+                {
+                    return Err(SchedulerError::StaleQuantum);
+                }
             }
         }
         for (cpu_index, suspended) in self.suspended.iter().copied().enumerate() {
@@ -992,6 +1087,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         if state.suspended[cpu_index].is_some() {
             return Err(SchedulerError::SwitchPending);
         }
+        state.clear_preemption_on(cpu);
         let next_entry = state.queue[..state.len]
             .iter()
             .flatten()
@@ -1070,6 +1166,220 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         Ok(ScheduleDecision {
             previous: Some(thread),
             current: Some(next.thread),
+        })
+    }
+
+    /// Replaces CPU0's exact normal-quantum source immediately before a
+    /// permitted CPL3 return. AP scheduler timers remain a DW1-C concern.
+    pub(crate) fn prepare_quantum_on(
+        &self,
+        cpu: SchedulerCpuId,
+        now_ns: u64,
+    ) -> Result<SchedulerQuantumTicket, SchedulerError> {
+        if cpu != SchedulerCpuId::BOOTSTRAP {
+            return Err(SchedulerError::QuantumUnavailable);
+        }
+        let mut state = self.state.lock();
+        let claim = state.running[cpu.index()].ok_or(SchedulerError::NotRunning)?;
+        if state.suspended[cpu.index()].is_some() || state.pending_block[cpu.index()].is_some() {
+            return Err(SchedulerError::QuantumUnavailable);
+        }
+        let deadline_ns = now_ns
+            .checked_add(DEFAULT_NORMAL_QUANTUM_NS)
+            .ok_or(SchedulerError::TokenExhausted)?;
+        let source_arm_generation = state.next_quantum_generation;
+        state.next_quantum_generation = source_arm_generation
+            .checked_add(1)
+            .filter(|next| *next != 0)
+            .ok_or(SchedulerError::TokenExhausted)?;
+        let ticket = SchedulerQuantumTicket {
+            domain: state.domain,
+            cpu,
+            thread: claim.thread,
+            execution_generation: claim.generation,
+            source_arm_generation,
+            deadline_ns,
+        };
+        state.quantum[cpu.index()] = Some(ticket);
+        state.need_resched[cpu.index()] = None;
+        state.record_trace(
+            SchedulerTraceKind::QuantumArm,
+            cpu,
+            Some(claim.thread),
+            source_arm_generation,
+        );
+        state.assert_invariants();
+        Ok(ticket)
+    }
+
+    /// Publishes a coalescing request only for the still-current exact ticket.
+    /// A late physical vector is a harmless rescan and cannot mutate a later
+    /// dispatch or clear its source.
+    pub(crate) fn publish_quantum_expiry(
+        &self,
+        ticket: SchedulerQuantumTicket,
+    ) -> Result<bool, SchedulerError> {
+        let mut state = self.state.lock();
+        if ticket.domain != state.domain || ticket.cpu != SchedulerCpuId::BOOTSTRAP {
+            return Ok(false);
+        }
+        let cpu_index = ticket.cpu.index();
+        if state.quantum[cpu_index] != Some(ticket)
+            || !state.running[cpu_index].is_some_and(|claim| {
+                claim.thread == ticket.thread && claim.generation == ticket.execution_generation
+            })
+        {
+            return Ok(false);
+        }
+        let mut accounting = state.accounting;
+        if let Err(error) = accounting.increment(ticket.cpu, SchedulerEvent::QuantumExpiration) {
+            state.reject_accounting(accounting, error);
+            return Err(error);
+        }
+        state.quantum[cpu_index] = None;
+        match state.need_resched[cpu_index] {
+            None => state.need_resched[cpu_index] = Some(ticket),
+            Some(current) if current == ticket => {}
+            Some(_) => return Err(SchedulerError::StaleQuantum),
+        }
+        state.accounting = accounting;
+        state.record_trace(
+            SchedulerTraceKind::QuantumExpire,
+            ticket.cpu,
+            Some(ticket.thread),
+            ticket.source_arm_generation,
+        );
+        state.assert_invariants();
+        Ok(true)
+    }
+
+    pub(crate) fn has_reschedule_request_on(&self, cpu: SchedulerCpuId) -> bool {
+        self.state.lock().need_resched[cpu.index()].is_some()
+    }
+
+    pub(crate) fn preemption_disable_on(&self, cpu: SchedulerCpuId) -> Result<(), SchedulerError> {
+        let mut state = self.state.lock();
+        state.preemption_disable_depth[cpu.index()] = state.preemption_disable_depth[cpu.index()]
+            .checked_add(1)
+            .ok_or(SchedulerError::PreemptionDepthOverflow)?;
+        Ok(())
+    }
+
+    pub(crate) fn preemption_enable_on(&self, cpu: SchedulerCpuId) -> Result<bool, SchedulerError> {
+        let mut state = self.state.lock();
+        state.preemption_disable_depth[cpu.index()] = state.preemption_disable_depth[cpu.index()]
+            .checked_sub(1)
+            .ok_or(SchedulerError::PreemptionDepthUnderflow)?;
+        Ok(state.preemption_disable_depth[cpu.index()] == 0
+            && state.need_resched[cpu.index()].is_some())
+    }
+
+    /// Consumes CPU0's exact request at a guard-free CPL3 return boundary.
+    /// The outgoing Thread is placed at the FIFO tail only when a local peer
+    /// can be claimed in the same scheduler transaction.
+    pub(crate) fn preempt_current_on(
+        &self,
+        cpu: SchedulerCpuId,
+    ) -> Result<SchedulerPreemptionDecision, SchedulerError> {
+        if cpu != SchedulerCpuId::BOOTSTRAP {
+            return Err(SchedulerError::QuantumUnavailable);
+        }
+        let mut state = self.state.lock();
+        let cpu_index = cpu.index();
+        let request = state.need_resched[cpu_index].ok_or(SchedulerError::StaleQuantum)?;
+        let current = state.running[cpu_index].ok_or(SchedulerError::NotRunning)?;
+        if current.thread != request.thread || current.generation != request.execution_generation {
+            state.need_resched[cpu_index] = None;
+            return Err(SchedulerError::StaleQuantum);
+        }
+        if state.preemption_disable_depth[cpu_index] != 0
+            || state.pending_block[cpu_index].is_some()
+            || state.suspended[cpu_index].is_some()
+        {
+            return Ok(SchedulerPreemptionDecision::Deferred);
+        }
+        let Some(next_entry) = state.queue[..state.len]
+            .iter()
+            .flatten()
+            .find(|entry| {
+                entry.state == SchedulerThreadState::Runnable && entry.continuation_cpu.is_none()
+            })
+            .copied()
+        else {
+            state.need_resched[cpu_index] = None;
+            state.assert_invariants();
+            return Ok(SchedulerPreemptionDecision::RetainCurrent);
+        };
+
+        let enqueue_generation = state.next_enqueue_generation;
+        let next_enqueue_generation = enqueue_generation
+            .checked_add(1)
+            .filter(|next| *next != 0)
+            .ok_or(SchedulerError::TokenExhausted)?;
+        let mut accounting = state.accounting;
+        let accounting_result = accounting
+            .decrement_runnable(next_entry.accounting_cpu)
+            .and_then(|()| {
+                accounting.observe_ready_delay(
+                    next_entry.accounting_cpu,
+                    cpu,
+                    next_entry.ready_at_ns,
+                    state.instrumentation_now_ns[cpu_index],
+                )
+            })
+            .and_then(|()| accounting.increment_runnable(cpu))
+            .and_then(|()| accounting.increment(cpu, SchedulerEvent::InvoluntaryPreemption))
+            .and_then(|()| accounting.increment(cpu, SchedulerEvent::ContextSwitch));
+        if let Err(error) = accounting_result {
+            state.reject_accounting(accounting, error);
+            return Err(error);
+        }
+        let next = state
+            .claim_first_runnable()?
+            .expect("validated normal Runnable peer remains claimable");
+        state.running[cpu_index] = Some(next);
+        let ready_at_ns = state.instrumentation_now_ns[cpu_index];
+        state
+            .push(QueueEntry {
+                thread: current.thread,
+                state: SchedulerThreadState::Runnable,
+                token: 0,
+                block_cpu: None,
+                block_execution_generation: 0,
+                continuation_cpu: Some(cpu),
+                continuation_generation: current.generation,
+                accounting_cpu: cpu,
+                enqueue_generation,
+                ready_at_ns,
+            })
+            .expect("replacing one Running Thread preserves scheduler capacity");
+        state.suspended[cpu_index] = Some(SuspendedContinuation {
+            thread: current.thread,
+            generation: current.generation,
+            publication: SuspendedPublication::Queued,
+        });
+        state.next_enqueue_generation = next_enqueue_generation;
+        state.need_resched[cpu_index] = None;
+        state.quantum[cpu_index] = None;
+        state.accounting = accounting;
+        state.record_trace(
+            SchedulerTraceKind::Preempt,
+            cpu,
+            Some(current.thread),
+            request.source_arm_generation,
+        );
+        state.assert_invariants();
+        Ok(SchedulerPreemptionDecision::Switch {
+            decision: ScheduleDecision {
+                previous: Some(current.thread),
+                current: Some(next.thread),
+            },
+            outgoing: SchedulerExecutionClaim {
+                domain: state.domain,
+                cpu,
+                thread: current.thread,
+                generation: current.generation,
+            },
         })
     }
 
@@ -1199,6 +1509,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             Err(error) => return Err(BlockReservationFailure { error, reservation }),
         };
         state.pending_block[cpu_index] = None;
+        state.clear_preemption_on(cpu);
         state.running[cpu_index] = None;
         state
             .push(QueueEntry {
@@ -1533,6 +1844,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             if state.pending_block[cpu_index].is_some_and(|pending| pending.thread == thread) {
                 state.pending_block[cpu_index] = None;
             }
+            state.clear_preemption_on(cpu);
             state.running[cpu_index] = None;
             state.running[cpu_index] = current;
             state.suspended[cpu_index] = Some(SuspendedContinuation {
@@ -1703,6 +2015,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         if state.pending_block[cpu_index].is_some_and(|pending| pending.thread == claim.thread) {
             state.pending_block[cpu_index] = None;
         }
+        state.clear_preemption_on(claim.cpu);
         state.running[cpu_index] = None;
         state.suspended[cpu_index] = Some(SuspendedContinuation {
             thread: claim.thread,

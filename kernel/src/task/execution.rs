@@ -652,6 +652,40 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         self.scheduler.yield_current_on(cpu, thread)
     }
 
+    pub(crate) fn prepare_quantum_on(
+        &self,
+        cpu: SchedulerCpuId,
+        now_ns: u64,
+    ) -> Result<super::SchedulerQuantumTicket, SchedulerError> {
+        self.scheduler.prepare_quantum_on(cpu, now_ns)
+    }
+
+    pub(crate) fn publish_quantum_expiry(
+        &self,
+        ticket: super::SchedulerQuantumTicket,
+    ) -> Result<bool, SchedulerError> {
+        self.scheduler.publish_quantum_expiry(ticket)
+    }
+
+    pub(crate) fn has_reschedule_request_on(&self, cpu: SchedulerCpuId) -> bool {
+        self.scheduler.has_reschedule_request_on(cpu)
+    }
+
+    pub(crate) fn preempt_current_on(
+        &self,
+        cpu: SchedulerCpuId,
+    ) -> Result<super::SchedulerPreemptionDecision, SchedulerError> {
+        self.scheduler.preempt_current_on(cpu)
+    }
+
+    pub(crate) fn preemption_disable_on(&self, cpu: SchedulerCpuId) -> Result<(), SchedulerError> {
+        self.scheduler.preemption_disable_on(cpu)
+    }
+
+    pub(crate) fn preemption_enable_on(&self, cpu: SchedulerCpuId) -> Result<bool, SchedulerError> {
+        self.scheduler.preemption_enable_on(cpu)
+    }
+
     pub(crate) fn schedule_from_idle(
         &self,
         suspended: ThreadKey,
