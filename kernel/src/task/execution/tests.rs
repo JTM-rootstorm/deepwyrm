@@ -574,6 +574,72 @@ fn terminal_physical_claim_prefers_unpublished_suspended_generation_over_logical
 }
 
 #[test]
+#[allow(
+    unsafe_code,
+    reason = "the test owns both CPU0 stack carriers while reproducing a wake after logical block commit but before the physical switch"
+)]
+fn cpu_bound_blocking_switch_accepts_woken_outgoing_continuation() {
+    extern crate std;
+    #[repr(align(4096))]
+    struct Region([u8; 0x12_000]);
+
+    fn owned_bounds(region: &mut Region) -> KernelStackBounds {
+        let guard = region.0.as_mut_ptr() as u64;
+        KernelStackBounds::new(guard, guard + 0x1000, guard + 0x11_000).unwrap()
+    }
+
+    let mut outgoing_region = std::boxed::Box::new(Region([0; 0x12_000]));
+    let mut replacement_region = std::boxed::Box::new(Region([0; 0x12_000]));
+    let outgoing_bounds = owned_bounds(&mut outgoing_region);
+    let replacement_bounds = owned_bounds(&mut replacement_region);
+
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (_process, process_handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let process_owner = registry
+        .retain_internal_from_handle(&process_handle)
+        .unwrap();
+    let (outgoing, _outgoing_handle) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    let (replacement, _replacement_handle) =
+        tasks.create_thread(&mut registry, &process_owner).unwrap();
+    assert!(registry.release_internal(process_owner).unwrap().is_none());
+    assert!(registry.release_internal(root_owner).unwrap().is_none());
+
+    let domain = ExecutionDomain::<2>::new([outgoing_bounds, replacement_bounds]).unwrap();
+    domain
+        .start_thread(&mut tasks, outgoing, start_state(71))
+        .unwrap();
+    domain
+        .start_thread(&mut tasks, replacement, start_state(72))
+        .unwrap();
+    let cpu0 = crate::cpu::CpuIndex::BOOTSTRAP;
+    assert_eq!(
+        domain.schedule_next_on(cpu0).unwrap().current,
+        Some(outgoing)
+    );
+
+    let (block, decision) = domain.block_current_on(cpu0, outgoing).unwrap();
+    assert_eq!(decision.current, Some(replacement));
+    let suspended = domain.suspended_claim_on(cpu0).unwrap();
+    assert_eq!(suspended.thread(), outgoing);
+
+    domain.wake(block.into_wake_key()).unwrap();
+    assert_eq!(
+        domain.scheduler_state(outgoing),
+        Some(crate::task::SchedulerThreadState::Runnable)
+    );
+    assert_eq!(domain.suspended_claim_on(cpu0), Some(suspended));
+
+    let trusted_entry = 0xffff_8000_0012_3000;
+    let plan =
+        unsafe { domain.prepare_blocking_kernel_switch_on(&tasks, cpu0, decision, trusted_entry) }
+            .unwrap();
+    assert_eq!(plan.next_stack(), replacement_bounds);
+    assert_eq!(plan.next_rsp() & 0xf, 8);
+}
+
+#[test]
 fn continuation_seed_rejects_foreign_geometry_and_double_publication() {
     let (mut registry, mut tasks, thread, _thread_handle) = one_thread_fixture();
     let domain = ExecutionDomain::<1>::new(stack_bounds::<1>()).unwrap();

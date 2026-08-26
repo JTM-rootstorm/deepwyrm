@@ -1323,7 +1323,11 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                 tasks,
                 Some(cpu),
                 decision,
-                false,
+                // A signal or deadline may wake the outgoing Thread after the
+                // logical block commits but before assembly saves its physical
+                // continuation. The CPU-bound scheduler validation above still
+                // requires that exact suspended generation on this CPU.
+                true,
                 Some(trusted_first_run_entry),
             )
         }
