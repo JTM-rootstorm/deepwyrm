@@ -1045,7 +1045,9 @@ pub(crate) fn finish_terminal_wait<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deepwyrm_abi::{DW_OBJECT_TYPE_EVENT, DW_SIGNAL_SIGNALED, dw_object_compatible_rights};
+    use deepwyrm_abi::{
+        DW_OBJECT_TYPE_EVENT, DW_SIGNAL_READABLE, DW_SIGNAL_SIGNALED, dw_object_compatible_rights,
+    };
 
     use crate::memory::kernel_stack::KernelStackBounds;
     use crate::task::{SchedulerThreadState, ThreadStartState};
@@ -1059,7 +1061,9 @@ mod tests {
     type Waits = WaitRegistry<8>;
     type Execution = ExecutionDomain<1>;
 
-    fn running_fixture() -> (Registry, Tasks, Execution, ProcessKey, ThreadKey) {
+    fn running_fixture_on(
+        cpu: crate::cpu::CpuIndex,
+    ) -> (Registry, Tasks, Execution, ProcessKey, ThreadKey) {
         let mut registry = Registry::new();
         let mut tasks = Tasks::new();
         let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
@@ -1092,8 +1096,15 @@ mod tests {
                 ),
             )
             .unwrap();
-        assert_eq!(execution.schedule_next().unwrap().current, Some(thread));
+        assert_eq!(
+            execution.schedule_next_on(cpu).unwrap().current,
+            Some(thread)
+        );
         (registry, tasks, execution, process, thread)
+    }
+
+    fn running_fixture() -> (Registry, Tasks, Execution, ProcessKey, ThreadKey) {
+        running_fixture_on(crate::cpu::CpuIndex::BOOTSTRAP)
     }
 
     fn install_event(
@@ -1111,6 +1122,33 @@ mod tests {
         (key, handle)
     }
 
+    fn install_channel_pair(
+        registry: &mut Registry,
+        tasks: &mut Tasks,
+        channels: &Channels,
+        process: ProcessKey,
+    ) -> (
+        [crate::ipc::ChannelEndpointKey; 2],
+        [deepwyrm_abi::DwHandle; 2],
+    ) {
+        let (keys, references) = channels.create_pair(registry).unwrap();
+        let [first, second] = references;
+        let rights = dw_object_compatible_rights(deepwyrm_abi::DW_OBJECT_TYPE_CHANNEL);
+        let handles = [
+            tasks
+                .process_handles_mut(process)
+                .unwrap()
+                .install(first, rights)
+                .unwrap(),
+            tasks
+                .process_handles_mut(process)
+                .unwrap()
+                .install(second, rights)
+                .unwrap(),
+        ];
+        (keys, handles)
+    }
+
     fn close_event(
         registry: &mut Registry,
         tasks: &mut Tasks,
@@ -1126,6 +1164,27 @@ mod tests {
             .unwrap();
         let finalization = events.take_finalization(release).unwrap();
         super::super::complete_event_finalization(registry, finalization);
+    }
+
+    fn close_channel(
+        registry: &mut Registry,
+        tasks: &mut Tasks,
+        channels: &Channels,
+        waits: &Waits,
+        process: ProcessKey,
+        handle: deepwyrm_abi::DwHandle,
+    ) {
+        let release = tasks
+            .process_handles_mut(process)
+            .unwrap()
+            .close(registry, handle)
+            .unwrap()
+            .unwrap();
+        let finalization = channels.take_finalization(release, waits).unwrap();
+        let completion = crate::ipc::complete_channel_finalization(registry, finalization);
+        let (wakes, releases) = completion.into_parts();
+        assert_eq!(wakes.len(), 0);
+        assert!(releases.into_iter().flatten().next().is_none());
     }
 
     #[test]
@@ -1366,6 +1425,316 @@ mod tests {
         assert_eq!(operations.len(), 0);
         assert_eq!(execution.schedule_next().unwrap().current, Some(thread));
         close_event(&mut registry, &mut tasks, &events, process, event);
+    }
+
+    #[test]
+    fn dw1c4_wait_many_block_commit_consumes_a_due_quantum_before_signal_wake() {
+        let (mut registry, mut tasks, execution, process, thread) = running_fixture();
+        let events = Events::new();
+        let timers = Timers::new();
+        let channels = Channels::new();
+        let waits = Waits::new();
+        let (first_key, first) = install_event(&mut registry, &mut tasks, &events, process);
+        let (second_key, second) = install_event(&mut registry, &mut tasks, &events, process);
+        let requests = [
+            DwWaitItemV1 {
+                handle: first,
+                signals: DW_SIGNAL_SIGNALED,
+            },
+            DwWaitItemV1 {
+                handle: second,
+                signals: DW_SIGNAL_SIGNALED,
+            },
+        ];
+        let set = ResolvedWaitSet::resolve(&tasks, &mut registry, process, &requests).unwrap();
+        let cpu = crate::cpu::CpuIndex::BOOTSTRAP;
+        let outgoing = execution.running_claim_on(cpu).unwrap();
+        let ticket = execution
+            .prepare_quantum_if_needed_on(cpu, 100)
+            .unwrap()
+            .unwrap();
+        assert!(execution.publish_quantum_expiry(ticket).unwrap());
+
+        let mut operations = WaitOperationRegistry::<u32, 1>::new();
+        let wake = match begin_registered_wait(
+            set,
+            0xd1c4,
+            WaitDeadline::Infinite,
+            WaitBeginContext {
+                registry: &mut registry,
+                tasks: &mut tasks,
+                sources: WaitSources {
+                    events: &events,
+                    timers: &timers,
+                    channels: &channels,
+                    waits: &waits,
+                },
+                execution: &execution,
+                operations: &mut operations,
+                cpu,
+                process,
+                thread,
+            },
+            None,
+        )
+        .unwrap_or_else(|failure| panic!("wait-many quantum fixture failed: {:?}", failure.error))
+        {
+            WaitBeginOutcome::Suspended { wake, decision } => {
+                assert_eq!(decision.cancelled_quantum, None);
+                wake
+            }
+            _ => panic!("due quantum wait-many unexpectedly did not suspend"),
+        };
+        let preemption = execution.preemption_snapshot_on(cpu);
+        assert_eq!(preemption.quantum, None);
+        assert_eq!(preemption.request, None);
+        assert_eq!(
+            execution.scheduler_state(thread),
+            Some(SchedulerThreadState::Blocked)
+        );
+
+        let batch = events
+            .signal(second_key, DwSignals(0), DW_SIGNAL_SIGNALED, &waits)
+            .unwrap();
+        let (wake_intents, pins) = batch.into_parts();
+        for intent in wake_intents.into_iter().flatten() {
+            assert_eq!(intent.item_index(), 1);
+            assert!(
+                execution
+                    .blocked_operations()
+                    .try_claim_winner(
+                        intent.wake_key(),
+                        BlockedOperationWinner::Signal {
+                            item_index: intent.item_index(),
+                            observed: intent.observed(),
+                        },
+                    )
+                    .unwrap()
+            );
+            execution.wake(intent.wake_key()).unwrap();
+        }
+        for pin in pins.into_iter().flatten() {
+            assert!(registry.release_internal(pin).unwrap().is_none());
+        }
+        let (output, winner, releases) = finish_wait_operation(
+            &mut registry,
+            &mut tasks,
+            &waits,
+            &execution,
+            &mut operations,
+            None,
+            wake,
+        )
+        .unwrap();
+        assert_eq!(output, 0xd1c4);
+        assert_eq!(
+            winner,
+            BlockedOperationWinner::Signal {
+                item_index: 1,
+                observed: DW_SIGNAL_SIGNALED,
+            }
+        );
+        assert!(releases.is_empty());
+        execution.complete_switch_on(outgoing).unwrap();
+        assert_eq!(
+            execution.schedule_next_on(cpu).unwrap().current,
+            Some(thread)
+        );
+        close_event(&mut registry, &mut tasks, &events, process, first);
+        close_event(&mut registry, &mut tasks, &events, process, second);
+        let _ = first_key;
+    }
+
+    #[test]
+    fn dw1c4_event_wake_cannot_be_stolen_until_its_continuation_is_released() {
+        let owner = crate::cpu::CpuIndex::new(1).unwrap();
+        let thief = crate::cpu::CpuIndex::new(2).unwrap();
+        let (mut registry, mut tasks, execution, process, thread) = running_fixture_on(owner);
+        let events = Events::new();
+        let timers = Timers::new();
+        let channels = Channels::new();
+        let waits = Waits::new();
+        let (event_key, event) = install_event(&mut registry, &mut tasks, &events, process);
+        let requests = [DwWaitItemV1 {
+            handle: event,
+            signals: DW_SIGNAL_SIGNALED,
+        }];
+        let set = ResolvedWaitSet::resolve(&tasks, &mut registry, process, &requests).unwrap();
+        let outgoing = execution.running_claim_on(owner).unwrap();
+        let mut operations = WaitOperationRegistry::<u32, 1>::new();
+        let wake = match begin_registered_wait(
+            set,
+            0xe1,
+            WaitDeadline::Infinite,
+            WaitBeginContext {
+                registry: &mut registry,
+                tasks: &mut tasks,
+                sources: WaitSources {
+                    events: &events,
+                    timers: &timers,
+                    channels: &channels,
+                    waits: &waits,
+                },
+                execution: &execution,
+                operations: &mut operations,
+                cpu: owner,
+                process,
+                thread,
+            },
+            None,
+        )
+        .unwrap_or_else(|failure| panic!("Event migration fixture failed: {:?}", failure.error))
+        {
+            WaitBeginOutcome::Suspended { wake, .. } => wake,
+            _ => panic!("unsignaled Event did not suspend"),
+        };
+        let batch = events
+            .signal(event_key, DwSignals(0), DW_SIGNAL_SIGNALED, &waits)
+            .unwrap();
+        let (wake_intents, pins) = batch.into_parts();
+        for intent in wake_intents.into_iter().flatten() {
+            assert!(
+                execution
+                    .blocked_operations()
+                    .try_claim_winner(
+                        intent.wake_key(),
+                        BlockedOperationWinner::Signal {
+                            item_index: intent.item_index(),
+                            observed: intent.observed(),
+                        },
+                    )
+                    .unwrap()
+            );
+            execution.wake(intent.wake_key()).unwrap();
+        }
+        for pin in pins.into_iter().flatten() {
+            assert!(registry.release_internal(pin).unwrap().is_none());
+        }
+        assert_eq!(execution.schedule_next_on(thief).unwrap().current, None);
+        assert_eq!(execution.suspended_claim_on(owner), Some(outgoing));
+        execution.complete_switch_on(outgoing).unwrap();
+        assert_eq!(
+            execution.schedule_next_on(thief).unwrap().current,
+            Some(thread)
+        );
+        let (_, winner, releases) = finish_wait_operation(
+            &mut registry,
+            &mut tasks,
+            &waits,
+            &execution,
+            &mut operations,
+            None,
+            wake,
+        )
+        .unwrap();
+        assert!(matches!(
+            winner,
+            BlockedOperationWinner::Signal { item_index: 0, .. }
+        ));
+        assert!(releases.is_empty());
+        close_event(&mut registry, &mut tasks, &events, process, event);
+    }
+
+    #[test]
+    fn dw1c4_channel_wake_cannot_migrate_before_continuation_release() {
+        let owner = crate::cpu::CpuIndex::new(1).unwrap();
+        let thief = crate::cpu::CpuIndex::new(2).unwrap();
+        let (mut registry, mut tasks, execution, process, thread) = running_fixture_on(owner);
+        let events = Events::new();
+        let timers = Timers::new();
+        let channels = Channels::new();
+        let waits = Waits::new();
+        let (keys, handles) = install_channel_pair(&mut registry, &mut tasks, &channels, process);
+        let requests = [DwWaitItemV1 {
+            handle: handles[1],
+            signals: DW_SIGNAL_READABLE,
+        }];
+        let set = ResolvedWaitSet::resolve(&tasks, &mut registry, process, &requests).unwrap();
+        let outgoing = execution.running_claim_on(owner).unwrap();
+        let mut operations = WaitOperationRegistry::<u32, 1>::new();
+        let wake = match begin_registered_wait(
+            set,
+            0xc4,
+            WaitDeadline::Infinite,
+            WaitBeginContext {
+                registry: &mut registry,
+                tasks: &mut tasks,
+                sources: WaitSources {
+                    events: &events,
+                    timers: &timers,
+                    channels: &channels,
+                    waits: &waits,
+                },
+                execution: &execution,
+                operations: &mut operations,
+                cpu: owner,
+                process,
+                thread,
+            },
+            None,
+        )
+        .unwrap_or_else(|failure| panic!("Channel migration fixture failed: {:?}", failure.error))
+        {
+            WaitBeginOutcome::Suspended { wake, .. } => wake,
+            _ => panic!("empty Channel wait did not suspend"),
+        };
+        let batch = channels.send(keys[0], b"c4", &waits).unwrap();
+        let (wake_intents, pins) = batch.into_parts();
+        for intent in wake_intents.into_iter().flatten() {
+            assert!(
+                execution
+                    .blocked_operations()
+                    .try_claim_winner(
+                        intent.wake_key(),
+                        BlockedOperationWinner::Signal {
+                            item_index: intent.item_index(),
+                            observed: intent.observed(),
+                        },
+                    )
+                    .unwrap()
+            );
+            execution.wake(intent.wake_key()).unwrap();
+        }
+        for pin in pins.into_iter().flatten() {
+            assert!(registry.release_internal(pin).unwrap().is_none());
+        }
+        assert_eq!(execution.schedule_next_on(thief).unwrap().current, None);
+        execution.complete_switch_on(outgoing).unwrap();
+        assert_eq!(
+            execution.schedule_next_on(thief).unwrap().current,
+            Some(thread)
+        );
+        let (_, winner, releases) = finish_wait_operation(
+            &mut registry,
+            &mut tasks,
+            &waits,
+            &execution,
+            &mut operations,
+            None,
+            wake,
+        )
+        .unwrap();
+        assert!(matches!(
+            winner,
+            BlockedOperationWinner::Signal { item_index: 0, .. }
+        ));
+        assert!(releases.is_empty());
+        close_channel(
+            &mut registry,
+            &mut tasks,
+            &channels,
+            &waits,
+            process,
+            handles[0],
+        );
+        close_channel(
+            &mut registry,
+            &mut tasks,
+            &channels,
+            &waits,
+            process,
+            handles[1],
+        );
     }
 
     struct HostDeadline<const N: usize> {

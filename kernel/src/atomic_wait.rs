@@ -567,11 +567,60 @@ pub(crate) fn begin_atomic_wait<
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
     operations: &mut AtomicWaitOperationRegistry<PIN, EXECUTION>,
+    deadline_authority: Option<&mut dyn WaitDeadlineAuthority>,
+    cpu: crate::cpu::CpuIndex,
+    process: ProcessKey,
+    thread: ThreadKey,
+    load: impl FnMut(&PIN) -> u32,
+) -> Result<AtomicWaitBegin<PIN>, AtomicWaitBeginFailure<PIN>> {
+    begin_atomic_wait_with_post_registration(
+        pin,
+        key,
+        expected,
+        deadline,
+        registry,
+        tasks,
+        execution,
+        operations,
+        deadline_authority,
+        cpu,
+        process,
+        thread,
+        load,
+        || {},
+    )
+}
+
+/// Keeps the production transaction identical while letting host tests force a
+/// winner after the atomic-key registration has published and before the final
+/// scheduler-block decision. The hook runs with no atomic-registry lock held.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the exact atomic wait transaction stays explicit"
+)]
+fn begin_atomic_wait_with_post_registration<
+    PIN,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    pin: PIN,
+    key: AtomicWaitKey,
+    expected: u32,
+    deadline: WaitDeadline,
+    registry: &AtomicWaitRegistry<WAITERS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    operations: &mut AtomicWaitOperationRegistry<PIN, EXECUTION>,
     mut deadline_authority: Option<&mut dyn WaitDeadlineAuthority>,
     cpu: crate::cpu::CpuIndex,
     process: ProcessKey,
     thread: ThreadKey,
     mut load: impl FnMut(&PIN) -> u32,
+    after_registration: impl FnOnce(),
 ) -> Result<AtomicWaitBegin<PIN>, AtomicWaitBeginFailure<PIN>> {
     if registry.observe(|| load(&pin)) != expected {
         return Ok(AtomicWaitBegin::Mismatch(pin));
@@ -739,6 +788,8 @@ pub(crate) fn begin_atomic_wait<
             pin,
         });
     }
+
+    after_registration();
 
     match execution.blocked_operations().winner(wake) {
         Ok(None) => {
@@ -1540,6 +1591,53 @@ mod tests {
         .unwrap();
         assert_eq!(pin, 0x44);
         assert_eq!(winner, BlockedOperationWinner::AtomicWake);
+    }
+
+    #[test]
+    fn dw1c4_remote_atomic_wake_after_registration_cancels_before_physical_block() {
+        let waiter_cpu = crate::cpu::CpuIndex::new(1).unwrap();
+        let (mut tasks, execution, process, thread, key) = running_fixture_on(waiter_cpu);
+        let registrations = AtomicWaitRegistry::<1>::new();
+        let mut operations = AtomicWaitOperationRegistry::<u32, 1>::new();
+
+        // Host execution publication uses BOOTSTRAP as the requester. The
+        // waiter is physically owned by CPU1, so this is the remote-wake shape
+        // without adding a test-only scheduler identity override.
+        let outcome = begin_atomic_wait_with_post_registration(
+            0xc4,
+            key,
+            7,
+            WaitDeadline::Infinite,
+            &registrations,
+            &mut tasks,
+            &execution,
+            &mut operations,
+            None,
+            waiter_cpu,
+            process,
+            thread,
+            |_| 7,
+            || {
+                assert_eq!(
+                    wake_atomic_waiters(&registrations, &execution, key, 1).unwrap(),
+                    1
+                );
+            },
+        )
+        .unwrap_or_else(|failure| {
+            panic!("post-registration atomic wake failed: {:?}", failure.error)
+        });
+
+        assert!(matches!(outcome, AtomicWaitBegin::Ready(0xc4)));
+        assert_eq!(
+            execution.scheduler_state(thread),
+            Some(SchedulerThreadState::Running),
+            "the winner must cancel pending block ownership rather than publish Blocked"
+        );
+        assert!(execution.suspended_claim_on(waiter_cpu).is_none());
+        assert!(registrations.is_empty());
+        assert!(operations.is_empty());
+        assert!(!execution.blocked_operations().has_thread(thread));
     }
 
     #[test]
