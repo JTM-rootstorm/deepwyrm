@@ -307,6 +307,20 @@ pub(crate) struct SchedulerMigrationRecord {
     pub(crate) enqueue_generation: u64,
 }
 
+/// A migration has changed queue placement but has not yet crossed the
+/// fallible dispatch-accounting/claim boundary.  Keeping the exact prior
+/// values makes an idle steal one transaction rather than a visible partial
+/// scheduler mutation.
+#[derive(Clone, Copy)]
+struct PendingMigration {
+    record: SchedulerMigrationRecord,
+    index: usize,
+    prior_entry: QueueEntry,
+    prior_accounting: SchedulerAccounting,
+    prior_last_migration: Option<SchedulerMigrationRecord>,
+    prior_next_generation: u64,
+}
+
 /// Scheduler dispatch result that carries an exact committed migration to the
 /// execution facade without enlarging the common scheduling decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -972,7 +986,7 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
     fn steal_oldest_for(
         &mut self,
         target: SchedulerCpuId,
-    ) -> Result<Option<SchedulerMigrationRecord>, SchedulerError> {
+    ) -> Result<Option<PendingMigration>, SchedulerError> {
         let mask = self.schedulable_mask();
         for offset in 1..H2_SCHEDULER_CPU_CAPACITY {
             let victim_index = (target.index() + offset) % H2_SCHEDULER_CPU_CAPACITY;
@@ -1003,6 +1017,7 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
                 self.reject_accounting(accounting, error);
                 return Err(error);
             }
+            let prior_entry = self.queue[index].expect("validated migration source remains queued");
             let entry = self.queue[index]
                 .as_mut()
                 .expect("validated migration source remains queued");
@@ -1016,12 +1031,32 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
                 generation,
                 enqueue_generation: entry.enqueue_generation,
             };
+            let pending = PendingMigration {
+                record: migration,
+                index,
+                prior_entry,
+                prior_accounting: self.accounting,
+                prior_last_migration: self.last_migration,
+                prior_next_generation: self.next_migration_generation,
+            };
             self.last_migration = Some(migration);
             self.next_migration_generation = next_generation;
             self.accounting = accounting;
-            return Ok(Some(migration));
+            return Ok(Some(pending));
         }
         Ok(None)
+    }
+
+    fn rollback_pending_migration(&mut self, pending: PendingMigration) {
+        let current =
+            self.queue[pending.index].expect("post-steal rollback retains its queued candidate");
+        assert_eq!(current.thread, pending.record.thread);
+        assert_eq!(current.target_cpu, pending.record.target);
+        assert_eq!(current.migration_generation, pending.record.generation);
+        self.queue[pending.index] = Some(pending.prior_entry);
+        self.accounting = pending.prior_accounting;
+        self.last_migration = pending.prior_last_migration;
+        self.next_migration_generation = pending.prior_next_generation;
     }
 
     fn running_cpu(&self, thread: ThreadKey) -> Option<SchedulerCpuId> {
@@ -1510,7 +1545,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         if state.active_idle[cpu_index].is_some() {
             return Err(SchedulerError::IdleAccountingActive);
         }
-        let migration = if state.first_local_runnable_index(cpu).is_none() {
+        let pending_migration = if state.first_local_runnable_index(cpu).is_none() {
             state.steal_oldest_for(cpu)?
         } else {
             None
@@ -1540,10 +1575,21 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             Ok(())
         };
         if let Err(error) = accounting_result {
+            if let Some(pending) = pending_migration {
+                state.rollback_pending_migration(pending);
+            }
             state.reject_accounting(accounting, error);
             return Err(error);
         }
-        let current = state.claim_first_runnable_on(cpu)?;
+        let current = match state.claim_first_runnable_on(cpu) {
+            Ok(current) => current,
+            Err(error) => {
+                if let Some(pending) = pending_migration {
+                    state.rollback_pending_migration(pending);
+                }
+                return Err(error);
+            }
+        };
         state.running[cpu_index] = current;
         state.accounting = accounting;
         if let Some(current) = current {
@@ -1561,7 +1607,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 current: current.map(|claim| claim.thread),
                 cancelled_quantum: None,
             },
-            migration,
+            migration: pending_migration.map(|pending| pending.record),
         })
     }
 
@@ -2298,7 +2344,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                     && (entry.continuation_cpu.is_none() || entry.continuation_cpu == Some(cpu))
             })
         });
-        let migration = if !local_runnable {
+        let pending_migration = if !local_runnable {
             state.steal_oldest_for(cpu)?
         } else {
             None
@@ -2314,10 +2360,13 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             .copied();
         let mut accounting = state.accounting;
         let Some(next_entry) = next_entry else {
+            if let Some(pending) = pending_migration {
+                state.rollback_pending_migration(pending);
+            }
             state.assert_invariants();
             return Ok(SchedulerIdleDispatch {
                 decision: IdleScheduleDecision::ContinueIdle,
-                migration,
+                migration: None,
             });
         };
         let mut accounting_result = accounting
@@ -2334,12 +2383,22 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 .and_then(|()| accounting.increment(cpu, SchedulerEvent::ContextSwitch));
         }
         if let Err(error) = accounting_result {
+            if let Some(pending) = pending_migration {
+                state.rollback_pending_migration(pending);
+            }
             state.reject_accounting(accounting, error);
             return Err(error);
         }
-        let next = state
-            .claim_first_runnable_for_idle(cpu, suspended_claim)?
-            .expect("validated Runnable entry remains claimable from idle");
+        let next = match state.claim_first_runnable_for_idle(cpu, suspended_claim) {
+            Ok(Some(next)) => next,
+            Ok(None) => panic!("validated Runnable entry became unclaimable from idle"),
+            Err(error) => {
+                if let Some(pending) = pending_migration {
+                    state.rollback_pending_migration(pending);
+                }
+                return Err(error);
+            }
+        };
         state.running[cpu_index] = Some(next);
         state.accounting = accounting;
         state.record_trace(
@@ -2353,7 +2412,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             state.assert_invariants();
             Ok(SchedulerIdleDispatch {
                 decision: IdleScheduleDecision::ResumeCurrent,
-                migration,
+                migration: pending_migration.map(|pending| pending.record),
             })
         } else {
             state.assert_invariants();
@@ -2363,7 +2422,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                     current: Some(next.thread),
                     cancelled_quantum: None,
                 }),
-                migration,
+                migration: pending_migration.map(|pending| pending.record),
             })
         }
     }
@@ -2876,9 +2935,12 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     }
 
     #[cfg(any(test, deepwyrm_dw1c_evidence))]
-    pub(crate) fn probe_migration_rejection_on(
+    /// Performs one selector-private migration attempt through the same locked
+    /// candidate revalidation used by idle stealing.  A rejected attempt never
+    /// changes queue placement, accounting, or migration generations.
+    pub(crate) fn attempt_migration_revalidation_on(
         &self,
-        cpu: SchedulerCpuId,
+        target: SchedulerCpuId,
         thread: ThreadKey,
         execution_generation: u64,
     ) -> Result<SchedulerMigrationRejection, SchedulerError> {
@@ -2890,20 +2952,28 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         else {
             return Err(SchedulerError::NotScheduled);
         };
-        if execution_generation == 0
-            || entry.started_execution_generation != execution_generation
-            || entry.target_cpu == cpu
-            || !state.entry_migratable_without_external_exclusion(*entry, entry.target_cpu, cpu)
+        if execution_generation == 0 || entry.started_execution_generation != execution_generation {
+            return Err(SchedulerError::StaleExecutionClaim);
+        }
+        let victim = entry.target_cpu;
+        if victim == target
+            || !state.entry_migratable_without_external_exclusion(*entry, victim, target)
         {
             return Err(SchedulerError::StaleExecutionClaim);
         }
+        // `steal_oldest_for` calls the same predicate while holding this lock;
+        // the test-only exclusion makes this exact candidate reject at its
+        // final external-authority revalidation rather than moving it.
         let reason = entry
             .migration_exclusion
             .ok_or(SchedulerError::StaleExecutionClaim)?;
+        if state.entry_migratable(*entry, victim, target) {
+            return Err(SchedulerError::StaleExecutionClaim);
+        }
         Ok(SchedulerMigrationRejection {
             thread,
             execution_generation,
-            cpu,
+            cpu: target,
             reason,
         })
     }

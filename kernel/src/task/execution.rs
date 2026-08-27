@@ -643,7 +643,10 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     ) -> Result<super::ScheduleDecision, SchedulerError> {
         let dispatch = self.scheduler.schedule_next_on_with_migration(cpu)?;
         #[cfg(deepwyrm_dw1c_evidence)]
-        if let Some(migration) = dispatch.migration() {
+        if let Some(migration) = dispatch
+            .migration()
+            .filter(|migration| crate::test_support::DW1C_EVIDENCE.tracks_thread(migration.thread))
+        {
             crate::test_support::DW1C_EVIDENCE
                 .observe_steal_migration_claim(
                     migration.source.index() as u8,
@@ -658,7 +661,11 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         }
         let decision = dispatch.decision();
         #[cfg(deepwyrm_dw1c_evidence)]
-        if let Some(claim) = self.scheduler.running_claim_on(cpu) {
+        if let Some(claim) = self
+            .scheduler
+            .running_claim_on(cpu)
+            .filter(|claim| crate::test_support::DW1C_EVIDENCE.tracks_thread(claim.thread()))
+        {
             crate::test_support::DW1C_EVIDENCE
                 .observe_running_claim(cpu.index() as u8, claim.thread(), claim.generation())
                 .unwrap_or_else(|error| panic!("selector-28 RUN observation failed: {error:?}"));
@@ -817,7 +824,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     ) -> Result<bool, SchedulerError> {
         let published = self.scheduler.publish_quantum_expiry(ticket)?;
         #[cfg(deepwyrm_dw1c_evidence)]
-        if published {
+        if published && crate::test_support::DW1C_EVIDENCE.tracks_thread(ticket.thread()) {
             crate::test_support::DW1C_EVIDENCE
                 .observe_quantum_claim(
                     ticket.cpu().index() as u8,
@@ -874,7 +881,10 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
             .scheduler
             .schedule_from_idle_on_with_migration(cpu, suspended)?;
         #[cfg(deepwyrm_dw1c_evidence)]
-        if let Some(migration) = dispatch.migration() {
+        if let Some(migration) = dispatch
+            .migration()
+            .filter(|migration| crate::test_support::DW1C_EVIDENCE.tracks_thread(migration.thread))
+        {
             crate::test_support::DW1C_EVIDENCE
                 .observe_steal_migration_claim(
                     migration.source.index() as u8,
@@ -889,7 +899,11 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         }
         let decision = dispatch.decision();
         #[cfg(deepwyrm_dw1c_evidence)]
-        if let Some(claim) = self.scheduler.running_claim_on(cpu) {
+        if let Some(claim) = self
+            .scheduler
+            .running_claim_on(cpu)
+            .filter(|claim| crate::test_support::DW1C_EVIDENCE.tracks_thread(claim.thread()))
+        {
             crate::test_support::DW1C_EVIDENCE
                 .observe_running_claim(cpu.index() as u8, claim.thread(), claim.generation())
                 .unwrap_or_else(|error| panic!("selector-28 RUN observation failed: {error:?}"));
@@ -995,7 +1009,9 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
             .scheduler
             .complete_switch_on_with_runnable_publication(claim)?;
         #[cfg(deepwyrm_dw1c_evidence)]
-        if completed.involuntary_preemption() {
+        if completed.involuntary_preemption()
+            && crate::test_support::DW1C_EVIDENCE.tracks_thread(claim.thread())
+        {
             crate::test_support::DW1C_EVIDENCE
                 .observe_preemption_claim(
                     claim.cpu().index() as u8,
@@ -1103,17 +1119,21 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
             .scheduler
             .wake_on(super::scheduler_requester_cpu(), key)?;
         #[cfg(deepwyrm_dw1c_evidence)]
-        let actor_token = crate::test_support::DW1C_EVIDENCE
-            .observe_remote_wake_claim(
-                publication.source().index() as u8,
-                publication.target().index() as u8,
-                key.thread(),
-                key.execution_generation(),
-                publication.generation(),
-            )
-            .unwrap_or_else(|error| {
-                panic!("selector-28 REMOTE_WAKE observation failed: {error:?}")
-            });
+        let actor_token = if crate::test_support::DW1C_EVIDENCE.tracks_thread(key.thread()) {
+            crate::test_support::DW1C_EVIDENCE
+                .observe_remote_wake_claim(
+                    publication.source().index() as u8,
+                    publication.target().index() as u8,
+                    key.thread(),
+                    key.execution_generation(),
+                    publication.generation(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("selector-28 REMOTE_WAKE observation failed: {error:?}")
+                })
+        } else {
+            None
+        };
         #[cfg(deepwyrm_dw1c_evidence)]
         if actor_token == Some(6) {
             let reason = super::SchedulerMigrationRejectionReason::ExecutionPinned;
@@ -1124,7 +1144,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                 });
             let rejection = self
                 .scheduler
-                .probe_migration_rejection_on(
+                .attempt_migration_revalidation_on(
                     publication.source(),
                     key.thread(),
                     key.execution_generation(),

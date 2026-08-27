@@ -5450,7 +5450,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         &mut self,
         arguments: crate::syscall::RawSyscallArguments,
     ) -> NativeSyscallResult {
-        use crate::test_support::{DW1C_ARM_BYTES, DW1C_EVIDENCE, DW1C_PROGRESS_MASK, Dw1cActor};
+        use crate::test_support::{
+            DW1C_ARM_BYTES, DW1C_ARM_TIMEOUT_SECONDS, DW1C_EVIDENCE, DW1C_PROGRESS_MASK, Dw1cActor,
+        };
 
         let values = arguments.as_array();
         let phase = self.reserve_runtime_phase();
@@ -5458,7 +5460,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
             1 => {
                 if !self.dw1c_controller_authorized()
                     || values[2] != 10
-                    || values[3] != DW1C_ARM_BYTES as u64
+                    || values[3] != DW1C_ARM_TIMEOUT_SECONDS
                     || values[4] != 0
                     || values[5] != 0
                 {

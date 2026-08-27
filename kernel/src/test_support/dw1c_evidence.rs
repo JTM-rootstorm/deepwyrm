@@ -17,6 +17,10 @@ pub(crate) const DW1C_EVIDENCE_RECORD_LEN: usize = 96;
 pub(crate) const DW1C_EVIDENCE_RECORD_CAPACITY: usize = 46;
 pub(crate) const DW1C_ACTOR_COUNT: usize = 10;
 pub(crate) const DW1C_ARM_BYTES: usize = DW1C_ACTOR_COUNT * 24;
+pub(crate) const DW1C_ARM_TIMEOUT_SECONDS: u64 = 240;
+/// A selector-private workload count is bounded to prevent a malformed raw
+/// request from turning a progress acknowledgement into an unbounded value.
+pub(crate) const DW1C_PROGRESS_MAX: u64 = u32::MAX as u64;
 pub(crate) const DW1C_PROGRESS_MASK: u8 = 0x1f;
 pub(crate) const DW1C_MIGRATION_REJECT_EXECUTION_PINNED: u8 = 0x04;
 const DW1C_WAKE_GENERATION_MAX: u64 = 0x0000_ffff_ffff_ffff;
@@ -144,6 +148,7 @@ struct State {
     prospective: [Option<ProspectiveActor>; DW1C_ACTOR_COUNT],
     actors: [Option<Dw1cActor>; DW1C_ACTOR_COUNT],
     progress: [u64; 5],
+    arm_timeout_seconds: u64,
     cpu_ready_payload: [Option<Dw1cRecordPayload>; 4],
     run_payload: [Option<Dw1cRecordPayload>; 4],
     quantum_payload: [Option<Dw1cRecordPayload>; 4],
@@ -170,6 +175,7 @@ impl State {
             prospective: [None; DW1C_ACTOR_COUNT],
             actors: [None; DW1C_ACTOR_COUNT],
             progress: [0; 5],
+            arm_timeout_seconds: 0,
             cpu_ready_payload: [None; 4],
             run_payload: [None; 4],
             quantum_payload: [None; 4],
@@ -469,6 +475,7 @@ impl Dw1cEvidenceCollector {
             lifecycle_generations[lifecycle_index] = Some(prospective.process_generation);
         }
         state.reporter = Some(reporter);
+        state.arm_timeout_seconds = DW1C_ARM_TIMEOUT_SECONDS;
         state.token6_wait_joined = token6_wait_joined;
         state.lifecycle_process_generation = lifecycle_generations;
         for (slot, actor) in state.actors.iter_mut().zip(actors) {
@@ -524,6 +531,13 @@ impl Dw1cEvidenceCollector {
         generation: u64,
     ) -> Result<(), Dw1cEvidenceError> {
         self.observe_cpu_claim(cpu, thread, generation, u64::from(cpu), 0)
+    }
+
+    /// Execution hooks use this to filter global scheduler activity. Direct
+    /// actor-specific observer calls deliberately reject unknown subjects.
+    pub(crate) fn tracks_thread(&self, thread: ThreadKey) -> bool {
+        let state = self.state.lock();
+        state.installed && actor_thread_known(&state, thread)
     }
 
     pub(crate) fn observe_quantum_expiry(
@@ -589,7 +603,7 @@ impl Dw1cEvidenceCollector {
             return Err(state.latch(Dw1cEvidenceError::Early));
         }
         if !actor_thread_known(&state, thread) {
-            return Ok(None);
+            return Err(state.latch(Dw1cEvidenceError::WrongActor));
         }
         if !actor_thread_bound(&state, thread, generation) {
             return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
@@ -642,7 +656,7 @@ impl Dw1cEvidenceCollector {
             return Err(state.latch(Dw1cEvidenceError::Early));
         }
         if !actor_thread_known(&state, thread) {
-            return Ok(());
+            return Err(state.latch(Dw1cEvidenceError::WrongActor));
         }
         if !actor_thread_bound(&state, thread, execution_generation) {
             return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
@@ -680,7 +694,7 @@ impl Dw1cEvidenceCollector {
             return Err(state.latch(Dw1cEvidenceError::Early));
         }
         if !actor_thread_known(&state, thread) {
-            return Ok(());
+            return Err(state.latch(Dw1cEvidenceError::WrongActor));
         }
         let Some(token) = actor_token_for_claim(&state, thread, execution_generation) else {
             return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
@@ -887,7 +901,7 @@ impl Dw1cEvidenceCollector {
             return Err(state.latch(Dw1cEvidenceError::Early));
         }
         if !actor_thread_known(&state, thread) {
-            return Ok(());
+            return Err(state.latch(Dw1cEvidenceError::WrongActor));
         }
         if !actor_thread_bound(&state, thread, generation) {
             return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
@@ -917,7 +931,7 @@ impl Dw1cEvidenceCollector {
         if caller != actor.process {
             return Err(state.latch(Dw1cEvidenceError::WrongReporter));
         }
-        if count == 0 || state.progress[index] != 0 {
+        if count == 0 || count > DW1C_PROGRESS_MAX || state.progress[index] != 0 {
             return Err(state.latch(Dw1cEvidenceError::Malformed));
         }
         state.progress[index] = count;
@@ -937,6 +951,9 @@ impl Dw1cEvidenceCollector {
         }
         if state.reporter.map(|reporter| reporter.0) != Some(caller) {
             return Err(state.latch(Dw1cEvidenceError::WrongReporter));
+        }
+        if state.arm_timeout_seconds != DW1C_ARM_TIMEOUT_SECONDS {
+            return Err(state.latch(Dw1cEvidenceError::Malformed));
         }
         if mask != u64::from(DW1C_PROGRESS_MASK)
             || digest != self.digest
@@ -1488,6 +1505,35 @@ mod tests {
         assert_eq!(
             unrelated.observe_thread_create(actors[0].process, thread),
             Err(Dw1cEvidenceError::Contradiction)
+        );
+    }
+
+    #[test]
+    fn direct_actor_observers_latch_unknown_or_stale_identities() {
+        let (collector, _actors) = armed_collector();
+        let mut registry = ObjectRegistry::<2>::new();
+        let unknown =
+            ThreadKey::from_object_id(registry.create(DW_OBJECT_TYPE_THREAD).unwrap().id());
+        assert!(!collector.tracks_thread(unknown));
+        assert_eq!(
+            collector.observe_running_claim(0, unknown, 1),
+            Err(Dw1cEvidenceError::WrongActor)
+        );
+        assert_eq!(
+            collector.state.lock().failure,
+            Some(Dw1cEvidenceError::WrongActor)
+        );
+
+        let (collector, actors) = armed_collector();
+        let actor = actors[0];
+        assert!(collector.tracks_thread(actor.thread));
+        assert_eq!(
+            collector.observe_quantum_claim(0, actor.thread, actor.execution_generation + 1, 7),
+            Err(Dw1cEvidenceError::WrongGeneration)
+        );
+        assert_eq!(
+            collector.state.lock().failure,
+            Some(Dw1cEvidenceError::WrongGeneration)
         );
     }
 

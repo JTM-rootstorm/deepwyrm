@@ -2287,6 +2287,46 @@ fn dw1c3_failed_migration_preserves_source_exactly_once() {
 }
 
 #[test]
+fn dw1c3_post_steal_accounting_overflow_rolls_back_every_migration_field() {
+    let scheduler = CooperativeScheduler::<1>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let thread = thread_key(&mut registry);
+    scheduler
+        .commit_on(cpu(1), scheduler.reserve(thread).unwrap())
+        .unwrap();
+    let generation = scheduler.runnable_start_generation(thread).unwrap();
+    let source_before = scheduler.counters_on(cpu(1));
+    let target_before = scheduler.counters_on(cpu(0));
+    let next_before = scheduler.state.lock().next_migration_generation;
+    scheduler.state.lock().accounting.cpu[0].context_switches = u64::MAX;
+
+    assert_eq!(
+        scheduler.schedule_next_on_with_migration(cpu(0)),
+        Err(SchedulerError::AccountingOverflow)
+    );
+    assert_eq!(scheduler.current_on(cpu(0)), None);
+    assert_eq!(scheduler.running_cpu(thread), None);
+    assert_eq!(
+        scheduler.state(thread),
+        Some(SchedulerThreadState::Runnable)
+    );
+    assert_eq!(
+        scheduler.runnable_start_generation(thread),
+        Some(generation)
+    );
+    assert_eq!(scheduler.counters_on(cpu(1)), source_before);
+    assert_eq!(
+        scheduler.counters_on(cpu(0)).current_runnable,
+        target_before.current_runnable
+    );
+    assert_eq!(scheduler.last_migration(), None);
+    assert_eq!(
+        scheduler.state.lock().next_migration_generation,
+        next_before
+    );
+}
+
+#[test]
 fn dw1c4_external_authority_exclusions_leave_the_source_queued() {
     for exclusion in [
         SchedulerMigrationRejectionReason::ExecutionPinned,
@@ -2308,7 +2348,7 @@ fn dw1c4_external_authority_exclusions_leave_the_source_queued() {
 
         assert_eq!(
             scheduler
-                .probe_migration_rejection_on(cpu(0), subject, generation)
+                .attempt_migration_revalidation_on(cpu(0), subject, generation)
                 .unwrap(),
             SchedulerMigrationRejection {
                 thread: subject,
@@ -2353,7 +2393,7 @@ fn selector_migration_exclusion_set_probe_clear_is_generation_exact_and_retryabl
         .set_migration_exclusion(subject, generation, reason)
         .unwrap();
     assert_eq!(
-        scheduler.probe_migration_rejection_on(cpu(1), subject, generation),
+        scheduler.attempt_migration_revalidation_on(cpu(1), subject, generation),
         Err(SchedulerError::StaleExecutionClaim)
     );
     assert_eq!(
@@ -2366,7 +2406,7 @@ fn selector_migration_exclusion_set_probe_clear_is_generation_exact_and_retryabl
     );
     assert_eq!(
         scheduler
-            .probe_migration_rejection_on(cpu(0), subject, generation)
+            .attempt_migration_revalidation_on(cpu(0), subject, generation)
             .unwrap()
             .reason,
         reason
