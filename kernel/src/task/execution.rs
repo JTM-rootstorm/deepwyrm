@@ -947,6 +947,47 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
             })
     }
 
+    /// Removes every terminal Thread that has scheduler ownership but no
+    /// physical continuation. The caller serializes this transaction with
+    /// scheduler entry/return through the runtime guard; exact Running and
+    /// suspended claims remain available for local handoff or remote Stop.
+    pub(crate) fn quiesce_terminal_threads<const THREADS: usize>(
+        &self,
+        terminal_threads: [Option<ThreadKey>; THREADS],
+    ) -> [Option<ThreadKey>; THREADS] {
+        let mut pre_retired = [None; THREADS];
+        for (index, thread) in terminal_threads.into_iter().enumerate() {
+            let Some(thread) = thread else {
+                continue;
+            };
+            if self.scheduler.running_cpu(thread).is_some()
+                || self.scheduler.suspended_cpu(thread).is_some()
+            {
+                continue;
+            }
+            if self.scheduler.state(thread).is_none() {
+                continue;
+            }
+            let decision = self
+                .scheduler
+                .retire_on(SchedulerCpuId::BOOTSTRAP, thread)
+                .unwrap_or_else(|error| {
+                    panic!("terminal Thread could not be scheduler-quiesced: {error:?}")
+                });
+            assert!(
+                decision.cancelled_quantum.is_none(),
+                "nonphysical terminal quiesce cancelled a CPU-local quantum"
+            );
+            assert_eq!(
+                self.scheduler.state(thread),
+                None,
+                "scheduler-quiesced terminal Thread remained schedulable"
+            );
+            pre_retired[index] = Some(thread);
+        }
+        pre_retired
+    }
+
     pub(crate) fn wake(&self, key: BlockWakeKey) -> Result<(), SchedulerError> {
         let publication = self
             .scheduler
@@ -980,22 +1021,14 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         &self,
         pins: ExitPins<THREADS>,
     ) -> RetiredExitPins<THREADS> {
-        assert!(
-            !pins
-                .thread_keys()
-                .into_iter()
-                .flatten()
-                .any(|thread| self.scheduler.running_cpu(thread).is_some()),
-            "immediate terminal retirement contained a physical current Thread"
-        );
-        self.retire_exit_pins_inner(pins, None, SchedulerCpuId::BOOTSTRAP, &[])
-            .0
+        let mut pre_retired = [None; THREADS];
+        self.retire_quiesced_exit_pins(pins, &mut pre_retired)
     }
 
-    pub(crate) fn retire_exit_pins_on<const THREADS: usize>(
+    pub(crate) fn retire_quiesced_exit_pins<const THREADS: usize>(
         &self,
-        cpu: SchedulerCpuId,
         pins: ExitPins<THREADS>,
+        pre_retired: &mut [Option<ThreadKey>; THREADS],
     ) -> RetiredExitPins<THREADS> {
         assert!(
             !pins
@@ -1005,7 +1038,26 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                 .any(|thread| self.scheduler.running_cpu(thread).is_some()),
             "immediate terminal retirement contained a physical current Thread"
         );
-        self.retire_exit_pins_inner(pins, None, cpu, &[]).0
+        self.retire_exit_pins_inner(pins, None, SchedulerCpuId::BOOTSTRAP, &[], pre_retired)
+            .0
+    }
+
+    pub(crate) fn retire_exit_pins_on<const THREADS: usize>(
+        &self,
+        cpu: SchedulerCpuId,
+        pins: ExitPins<THREADS>,
+    ) -> RetiredExitPins<THREADS> {
+        let mut pre_retired = [None; THREADS];
+        assert!(
+            !pins
+                .thread_keys()
+                .into_iter()
+                .flatten()
+                .any(|thread| self.scheduler.running_cpu(thread).is_some()),
+            "immediate terminal retirement contained a physical current Thread"
+        );
+        self.retire_exit_pins_inner(pins, None, cpu, &[], &mut pre_retired)
+            .0
     }
 
     /// Retires a terminal batch after architecture rendezvous has already
@@ -1018,6 +1070,16 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         &self,
         pins: ExitPins<THREADS>,
         remote_stopped: &[Option<ThreadKey>],
+    ) -> RetiredExitPins<THREADS> {
+        let mut pre_retired = [None; THREADS];
+        self.retire_quiesced_exit_pins_after_remote_stops(pins, remote_stopped, &mut pre_retired)
+    }
+
+    pub(crate) fn retire_quiesced_exit_pins_after_remote_stops<const THREADS: usize>(
+        &self,
+        pins: ExitPins<THREADS>,
+        remote_stopped: &[Option<ThreadKey>],
+        pre_retired: &mut [Option<ThreadKey>; THREADS],
     ) -> RetiredExitPins<THREADS> {
         let terminal_threads = pins.thread_keys();
         assert!(
@@ -1034,8 +1096,14 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                 .all(|stopped| terminal_threads.contains(&Some(*stopped))),
             "remote-stop permit named a Thread outside the terminal pin batch"
         );
-        self.retire_exit_pins_inner(pins, None, SchedulerCpuId::BOOTSTRAP, remote_stopped)
-            .0
+        self.retire_exit_pins_inner(
+            pins,
+            None,
+            SchedulerCpuId::BOOTSTRAP,
+            remote_stopped,
+            pre_retired,
+        )
+        .0
     }
 
     /// Retires one terminal batch while preserving the named current Thread's
@@ -1046,8 +1114,22 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         pins: ExitPins<THREADS>,
         current: ThreadKey,
     ) -> (RetiredExitPins<THREADS>, DeferredCurrentExecutionResources) {
-        let retired =
-            self.retire_exit_pins_defer_current_on(SchedulerCpuId::BOOTSTRAP, pins, current);
+        let mut pre_retired = [None; THREADS];
+        self.retire_quiesced_exit_pins_defer_current(pins, current, &mut pre_retired)
+    }
+
+    pub(crate) fn retire_quiesced_exit_pins_defer_current<const THREADS: usize>(
+        &self,
+        pins: ExitPins<THREADS>,
+        current: ThreadKey,
+        pre_retired: &mut [Option<ThreadKey>; THREADS],
+    ) -> (RetiredExitPins<THREADS>, DeferredCurrentExecutionResources) {
+        let retired = self.retire_exit_pins_defer_current_on_inner(
+            SchedulerCpuId::BOOTSTRAP,
+            pins,
+            current,
+            pre_retired,
+        );
         let claim = self
             .scheduler
             .suspended_claim_on(SchedulerCpuId::BOOTSTRAP)
@@ -1065,6 +1147,17 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         pins: ExitPins<THREADS>,
         current: ThreadKey,
     ) -> (RetiredExitPins<THREADS>, DeferredCurrentExecutionResources) {
+        let mut pre_retired = [None; THREADS];
+        self.retire_exit_pins_defer_current_on_inner(cpu, pins, current, &mut pre_retired)
+    }
+
+    fn retire_exit_pins_defer_current_on_inner<const THREADS: usize>(
+        &self,
+        cpu: SchedulerCpuId,
+        pins: ExitPins<THREADS>,
+        current: ThreadKey,
+        pre_retired: &mut [Option<ThreadKey>; THREADS],
+    ) -> (RetiredExitPins<THREADS>, DeferredCurrentExecutionResources) {
         assert_eq!(
             self.scheduler.current_on(cpu),
             Some(current),
@@ -1077,7 +1170,8 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                 .any(|thread| thread == current),
             "deferred terminal retirement batch did not contain the physical current Thread"
         );
-        let (pins, deferred) = self.retire_exit_pins_inner(pins, Some(current), cpu, &[]);
+        let (pins, deferred) =
+            self.retire_exit_pins_inner(pins, Some(current), cpu, &[], pre_retired);
         (
             pins,
             deferred.expect("terminal batch did not contain the running current Thread"),
@@ -1093,6 +1187,26 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         pins: ExitPins<THREADS>,
         current: ThreadKey,
         remote_stopped: &[Option<ThreadKey>],
+    ) -> (RetiredExitPins<THREADS>, DeferredCurrentExecutionResources) {
+        let mut pre_retired = [None; THREADS];
+        self.retire_quiesced_exit_pins_defer_current_after_remote_stops_on(
+            cpu,
+            pins,
+            current,
+            remote_stopped,
+            &mut pre_retired,
+        )
+    }
+
+    pub(crate) fn retire_quiesced_exit_pins_defer_current_after_remote_stops_on<
+        const THREADS: usize,
+    >(
+        &self,
+        cpu: SchedulerCpuId,
+        pins: ExitPins<THREADS>,
+        current: ThreadKey,
+        remote_stopped: &[Option<ThreadKey>],
+        pre_retired: &mut [Option<ThreadKey>; THREADS],
     ) -> (RetiredExitPins<THREADS>, DeferredCurrentExecutionResources) {
         assert_eq!(
             self.scheduler.current_on(cpu),
@@ -1112,7 +1226,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
             "remote-stop permit named a Thread outside the deferred terminal pin batch"
         );
         let (pins, deferred) =
-            self.retire_exit_pins_inner(pins, Some(current), cpu, remote_stopped);
+            self.retire_exit_pins_inner(pins, Some(current), cpu, remote_stopped, pre_retired);
         (
             pins,
             deferred.expect("terminal batch did not contain the running current Thread"),
@@ -1125,6 +1239,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         defer_current: Option<ThreadKey>,
         cpu: SchedulerCpuId,
         remote_stopped: &[Option<ThreadKey>],
+        pre_retired: &mut [Option<ThreadKey>; THREADS],
     ) -> (
         RetiredExitPins<THREADS>,
         Option<DeferredCurrentExecutionResources>,
@@ -1158,13 +1273,26 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                 );
                 let scheduled = self.scheduler.state(thread).is_some();
                 let acknowledged_remote_stop = remote_stopped.contains(&Some(thread));
+                let scheduler_pre_retired = if let Some(index) = pre_retired
+                    .iter()
+                    .position(|candidate| *candidate == Some(thread))
+                {
+                    pre_retired[index] = None;
+                    true
+                } else {
+                    false
+                };
                 assert!(
-                    resources.is_some() == (scheduled || acknowledged_remote_stop),
-                    "scheduler/resource/remote-stop ownership diverged at terminal retirement"
+                    resources.is_some()
+                        == (scheduled || acknowledged_remote_stop || scheduler_pre_retired),
+                    "scheduler/resource/remote-stop/pre-retirement ownership diverged at terminal retirement"
                 );
                 assert!(
-                    !(scheduled && acknowledged_remote_stop),
-                    "remote-stop permit named a Thread still owned by the scheduler"
+                    usize::from(scheduled)
+                        + usize::from(acknowledged_remote_stop)
+                        + usize::from(scheduler_pre_retired)
+                        <= 1,
+                    "terminal Thread retained multiple scheduler retirement authorities"
                 );
                 if scheduled {
                     let decision = self

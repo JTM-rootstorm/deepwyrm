@@ -3754,8 +3754,9 @@ fn authorized_process_termination_drains_two_generic_waits_in_one_process() {
 
 #[test]
 fn prepared_process_termination_preserves_remote_execution_until_exact_stop() {
-    let mut registry = ObjectRegistry::<24>::new();
-    let mut tasks = Tasks::new();
+    type RemoteTerminationTasks = TaskAuthority<2, 2, 3, 8>;
+    let mut registry = ObjectRegistry::<32>::new();
+    let mut tasks = RemoteTerminationTasks::new();
     let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
     let (current_process, current_process_ref) =
         tasks.create_process(&mut registry, &root_owner).unwrap();
@@ -3771,6 +3772,8 @@ fn prepared_process_termination_preserves_remote_execution_until_exact_stop() {
         tasks.create_thread(&mut registry, &current_owner).unwrap();
     let (target_thread, target_thread_ref) =
         tasks.create_thread(&mut registry, &target_owner).unwrap();
+    let (target_queued, target_queued_ref) =
+        tasks.create_thread(&mut registry, &target_owner).unwrap();
     assert!(registry.release_internal(current_owner).unwrap().is_none());
     assert!(registry.release_internal(target_owner).unwrap().is_none());
     let target_handle = tasks
@@ -3778,18 +3781,22 @@ fn prepared_process_termination_preserves_remote_execution_until_exact_stop() {
         .unwrap()
         .install(target_process_ref, DW_RIGHT_MODIFY)
         .unwrap();
-    let execution = ExecutionDomain::<2>::new(test_stack_bounds::<2>()).unwrap();
+    let execution = ExecutionDomain::<3>::new(test_stack_bounds::<3>()).unwrap();
     let waits = WaitRegistry::<2>::new();
     let mut terminal_waits = NoTerminalWaitCleanup;
-    let mut cleanup = CleanupQueue::<24>::new();
+    let mut cleanup = CleanupQueue::<32>::new();
     execution
         .start_thread(&mut tasks, current_thread, test_start(0x31))
         .unwrap();
     execution
         .start_thread(&mut tasks, target_thread, test_start(0x32))
         .unwrap();
+    execution
+        .start_thread(&mut tasks, target_queued, test_start(0x33))
+        .unwrap();
     let cpu0 = crate::cpu::CpuIndex::new(0).unwrap();
     let cpu1 = crate::cpu::CpuIndex::new(1).unwrap();
+    let cpu2 = crate::cpu::CpuIndex::new(2).unwrap();
     assert_eq!(
         execution.schedule_next_on(cpu0).unwrap().current,
         Some(current_thread)
@@ -3803,6 +3810,14 @@ fn prepared_process_termination_preserves_remote_execution_until_exact_stop() {
         .thread_execution_resources(target_thread)
         .unwrap()
         .unwrap();
+    let (queued_stack, queued_context) = tasks
+        .thread_execution_resources(target_queued)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        execution.scheduler_state(target_queued),
+        Some(SchedulerThreadState::Runnable)
+    );
 
     let prepared = prepare_process_terminate(
         &mut registry,
@@ -3820,9 +3835,14 @@ fn prepared_process_termination_preserves_remote_execution_until_exact_stop() {
     .unwrap();
     assert_eq!(prepared.target(), target_process);
     assert!(prepared.thread_keys().contains(&Some(target_thread)));
+    assert!(prepared.thread_keys().contains(&Some(target_queued)));
     assert_eq!(execution.running_claim_on(cpu1), Some(target_claim));
+    assert_eq!(execution.scheduler_state(target_queued), None);
+    assert_eq!(execution.schedule_next_on(cpu2).unwrap().current, None);
     assert!(execution.stack_bounds(target_stack).is_ok());
     assert!(execution.load_context(target_context).is_ok());
+    assert!(execution.stack_bounds(queued_stack).is_ok());
+    assert!(execution.load_context(queued_context).is_ok());
 
     execution.stop_running_claim_on(target_claim).unwrap();
     execution.complete_switch_on(target_claim).unwrap();
@@ -3850,6 +3870,8 @@ fn prepared_process_termination_preserves_remote_execution_until_exact_stop() {
     );
     assert!(execution.stack_bounds(target_stack).is_err());
     assert!(execution.load_context(target_context).is_err());
+    assert!(execution.stack_bounds(queued_stack).is_err());
+    assert!(execution.load_context(queued_context).is_err());
 
     let deferred = terminal_outcome(
         process_exit_on(
@@ -3878,6 +3900,7 @@ fn prepared_process_termination_preserves_remote_execution_until_exact_stop() {
     );
     cleanup.push_optional(registry.release_handle(current_thread_ref).unwrap());
     cleanup.push_optional(registry.release_handle(target_thread_ref).unwrap());
+    cleanup.push_optional(registry.release_handle(target_queued_ref).unwrap());
     cleanup.push_optional(registry.release_handle(current_process_ref).unwrap());
     cleanup.push_optional(registry.release_internal(root_owner).unwrap());
     finish_task_cleanup(&mut registry, &mut tasks, cleanup);

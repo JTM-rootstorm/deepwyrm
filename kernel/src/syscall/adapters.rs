@@ -973,6 +973,7 @@ fn collect_process_effects<
     execution: &ExecutionDomain<EXECUTION>,
     waits: &WaitRegistry<WAITERS>,
     effects: ProcessExitEffects<HANDLES, THREADS>,
+    pre_retired: &mut PreRetiredTerminalThreads<THREADS>,
     defer_current: Option<DeferredCurrentRetirement>,
     remotely_stopped: &[Option<ThreadKey>],
     terminal_waits: &mut C,
@@ -994,21 +995,34 @@ fn collect_process_effects<
     }
     let (pins, deferred) = match deferred_thread {
         Some(DeferredCurrentRetirement::Model(current)) => {
-            let (pins, deferred) = execution.retire_exit_pins_defer_current(effects.pins, current);
-            (pins, Some(deferred))
-        }
-        Some(DeferredCurrentRetirement::Handoff { cpu, thread }) => {
-            let (pins, deferred) = execution.retire_exit_pins_defer_current_after_remote_stops_on(
-                cpu,
+            let (pins, deferred) = execution.retire_quiesced_exit_pins_defer_current(
                 effects.pins,
-                thread,
-                remotely_stopped,
+                current,
+                pre_retired.as_mut(),
             );
             (pins, Some(deferred))
         }
-        None if remotely_stopped.is_empty() => (execution.retire_exit_pins(effects.pins), None),
+        Some(DeferredCurrentRetirement::Handoff { cpu, thread }) => {
+            let (pins, deferred) = execution
+                .retire_quiesced_exit_pins_defer_current_after_remote_stops_on(
+                    cpu,
+                    effects.pins,
+                    thread,
+                    remotely_stopped,
+                    pre_retired.as_mut(),
+                );
+            (pins, Some(deferred))
+        }
+        None if remotely_stopped.is_empty() => (
+            execution.retire_quiesced_exit_pins(effects.pins, pre_retired.as_mut()),
+            None,
+        ),
         None => (
-            execution.retire_exit_pins_after_remote_stops(effects.pins, remotely_stopped),
+            execution.retire_quiesced_exit_pins_after_remote_stops(
+                effects.pins,
+                remotely_stopped,
+                pre_retired.as_mut(),
+            ),
             None,
         ),
     };
@@ -1021,10 +1035,33 @@ fn collect_process_effects<
 /// A live SMP caller may inspect the exact Thread set, stop every remote
 /// physical owner, and only then pass this linear batch to
 /// `complete_prepared_process_termination` for reclamation.
+#[must_use = "prepared scheduler retirement must be consumed with its terminal execution pins"]
+struct PreRetiredTerminalThreads<const THREADS: usize> {
+    threads: [Option<ThreadKey>; THREADS],
+}
+
+impl<const THREADS: usize> PreRetiredTerminalThreads<THREADS> {
+    const fn new(threads: [Option<ThreadKey>; THREADS]) -> Self {
+        Self { threads }
+    }
+
+    const fn as_mut(&mut self) -> &mut [Option<ThreadKey>; THREADS] {
+        &mut self.threads
+    }
+
+    fn assert_consumed(self) {
+        assert!(
+            self.threads.into_iter().all(|thread| thread.is_none()),
+            "prepared scheduler retirement outlived its terminal pin batch"
+        );
+    }
+}
+
 #[must_use = "prepared Process termination must be completed after remote execution owners are stopped"]
 pub(crate) struct PreparedProcessTermination<const HANDLES: usize, const THREADS: usize> {
     target: ProcessKey,
     effects: ProcessExitEffects<HANDLES, THREADS>,
+    pre_retired: PreRetiredTerminalThreads<THREADS>,
 }
 
 /// Terminal Thread effects retained until every foreign physical continuation
@@ -1034,6 +1071,7 @@ pub(crate) struct PreparedThreadTermination<const THREADS: usize> {
     target: ThreadKey,
     target_process: ProcessKey,
     pins: crate::task::ExitPins<THREADS>,
+    pre_retired: PreRetiredTerminalThreads<THREADS>,
 }
 
 /// Recursive TaskGroup terminal effects retained across live remote-stop
@@ -1046,6 +1084,7 @@ pub(crate) struct PreparedTaskGroupTermination<
     const THREADS: usize,
 > {
     effects: TaskGroupTerminationEffects<PROCESSES, HANDLES, THREADS>,
+    pre_retired: PreRetiredTerminalThreads<THREADS>,
 }
 
 impl<const PROCESSES: usize, const HANDLES: usize, const THREADS: usize>
@@ -3862,6 +3901,7 @@ fn collect_group_effects<
     execution: &ExecutionDomain<EXECUTION>,
     waits: &WaitRegistry<WAITERS>,
     effects: TaskGroupTerminationEffects<PROCESSES, HANDLES, THREADS>,
+    pre_retired: &mut PreRetiredTerminalThreads<THREADS>,
     defer_current: DeferredCurrentRetirement,
     remotely_stopped: &[Option<ThreadKey>],
     terminal_waits: &mut C,
@@ -3917,6 +3957,7 @@ fn collect_group_effects<
             execution,
             waits,
             process,
+            pre_retired,
             Some(defer_current),
             &batch_remote,
             terminal_waits,
@@ -3945,6 +3986,7 @@ fn collect_group_effects<
             execution,
             waits,
             process,
+            pre_retired,
             Some(defer_current),
             &batch_remote,
             terminal_waits,
@@ -4090,8 +4132,13 @@ pub(crate) fn prepare_task_group_terminate<
             return Err(task_status(error));
         }
     };
+    let pre_retired =
+        PreRetiredTerminalThreads::new(execution.quiesce_terminal_threads(effects.thread_keys()));
     release_lookup_pin(registry, pin, cleanup);
-    Ok(PreparedTaskGroupTermination { effects })
+    Ok(PreparedTaskGroupTermination {
+        effects,
+        pre_retired,
+    })
 }
 
 pub(crate) fn complete_prepared_task_group_termination<
@@ -4118,17 +4165,23 @@ pub(crate) fn complete_prepared_task_group_termination<
     SyscallControl,
     Option<DeferredCurrentExecutionResources>,
 ) {
+    let PreparedTaskGroupTermination {
+        effects,
+        mut pre_retired,
+    } = prepared;
     let deferred = collect_group_effects(
         registry,
         tasks,
         execution,
         waits,
-        prepared.effects,
+        effects,
+        &mut pre_retired,
         DeferredCurrentRetirement::Model(current_thread),
         &[],
         terminal_waits,
         cleanup,
     );
+    pre_retired.assert_consumed();
     let control = control_after_process_state(tasks, current_process);
     assert_eq!(
         control == SyscallControl::TerminateCurrent,
@@ -4168,12 +4221,17 @@ pub(crate) fn complete_prepared_task_group_termination_after_remote_stops_on<
     let remote_threads = permits
         .each_ref()
         .map(|permit| permit.as_ref().map(|permit| permit.thread()));
+    let PreparedTaskGroupTermination {
+        effects,
+        mut pre_retired,
+    } = prepared;
     let deferred = collect_group_effects(
         registry,
         tasks,
         execution,
         waits,
-        prepared.effects,
+        effects,
+        &mut pre_retired,
         DeferredCurrentRetirement::Handoff {
             cpu: current_cpu,
             thread: current_thread,
@@ -4182,6 +4240,7 @@ pub(crate) fn complete_prepared_task_group_termination_after_remote_stops_on<
         terminal_waits,
         cleanup,
     );
+    pre_retired.assert_consumed();
     let control = control_after_process_state(tasks, current_process);
     assert_eq!(
         control == SyscallControl::TerminateCurrent,
@@ -4286,9 +4345,13 @@ pub(crate) fn prepare_process_exit<
         }
         Err(error) => return Err(task_status(error)),
     };
+    let pre_retired = PreRetiredTerminalThreads::new(
+        execution.quiesce_terminal_threads(effects.pins.thread_keys()),
+    );
     Ok(PreparedProcessTermination {
         target: current_process,
         effects,
+        pre_retired,
     })
 }
 
@@ -4453,9 +4516,13 @@ pub(crate) fn prepare_process_unhandled_exception<
         }
         Err(error) => return Err(task_status(error)),
     };
+    let pre_retired = PreRetiredTerminalThreads::new(
+        execution.quiesce_terminal_threads(effects.pins.thread_keys()),
+    );
     Ok(PreparedProcessTermination {
         target: current_process,
         effects,
+        pre_retired,
     })
 }
 
@@ -4574,11 +4641,18 @@ pub(crate) fn prepare_process_terminate<
             return Err(task_status(error));
         }
     };
+    let pre_retired = PreRetiredTerminalThreads::new(
+        execution.quiesce_terminal_threads(effects.pins.thread_keys()),
+    );
     // The Process identity is now captured by the terminal effects and the
     // caller's Handle may be released before a potentially blocking remote
     // stop. No HandleTable/registry borrow crosses that wait.
     release_lookup_pin(registry, pin, cleanup);
-    Ok(PreparedProcessTermination { target, effects })
+    Ok(PreparedProcessTermination {
+        target,
+        effects,
+        pre_retired,
+    })
 }
 
 pub(crate) fn complete_prepared_process_termination<
@@ -4734,17 +4808,24 @@ fn complete_prepared_process_termination_with_remote_threads<
     SyscallControl,
     Option<DeferredCurrentExecutionResources>,
 ) {
+    let PreparedProcessTermination {
+        target: _,
+        effects,
+        mut pre_retired,
+    } = prepared;
     let deferred = collect_process_effects(
         registry,
         tasks,
         execution,
         waits,
-        prepared.effects,
+        effects,
+        &mut pre_retired,
         Some(retirement),
         remote_threads,
         terminal_waits,
         cleanup,
     );
+    pre_retired.assert_consumed();
     let control = control_after_process_state(tasks, current_process);
     assert_eq!(
         control == SyscallControl::TerminateCurrent,
@@ -4932,6 +5013,8 @@ pub(crate) fn prepare_thread_terminate<
             return Err(task_status(error));
         }
     };
+    let pre_retired =
+        PreRetiredTerminalThreads::new(execution.quiesce_terminal_threads(pins.thread_keys()));
     if tasks
         .process_info(target_process)
         .is_ok_and(|info| info.state == DW_TASK_STATE_EXITED)
@@ -4952,6 +5035,7 @@ pub(crate) fn prepare_thread_terminate<
         target,
         target_process,
         pins,
+        pre_retired,
     })
 }
 
@@ -5030,6 +5114,7 @@ fn complete_prepared_thread_termination_with_remote_threads<
         target,
         target_process: _,
         pins,
+        mut pre_retired,
     } = prepared;
     let terminal_threads = pins.thread_keys();
     assert!(
@@ -5050,21 +5135,31 @@ fn complete_prepared_thread_termination_with_remote_threads<
         );
     }
     let (pins, deferred) = if target == current_thread {
-        let (pins, deferred) = execution.retire_exit_pins_defer_current_after_remote_stops_on(
-            current_cpu,
-            pins,
-            current_thread,
-            remote_threads,
-        );
+        let (pins, deferred) = execution
+            .retire_quiesced_exit_pins_defer_current_after_remote_stops_on(
+                current_cpu,
+                pins,
+                current_thread,
+                remote_threads,
+                pre_retired.as_mut(),
+            );
         (pins, Some(deferred))
     } else if remote_threads.is_empty() {
-        (execution.retire_exit_pins(pins), None)
+        (
+            execution.retire_quiesced_exit_pins(pins, pre_retired.as_mut()),
+            None,
+        )
     } else {
         (
-            execution.retire_exit_pins_after_remote_stops(pins, remote_threads),
+            execution.retire_quiesced_exit_pins_after_remote_stops(
+                pins,
+                remote_threads,
+                pre_retired.as_mut(),
+            ),
             None,
         )
     };
+    pre_retired.assert_consumed();
     collect_retired_pins(registry, execution, waits, pins, cleanup);
     let control = if target == current_thread {
         SyscallControl::TerminateCurrent
