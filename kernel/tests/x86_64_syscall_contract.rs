@@ -1077,6 +1077,19 @@ fn f12_terminal_control_abandons_the_retiring_stack_before_runtime_reclaim() {
 }
 
 #[test]
+fn terminal_reaper_revalidation_accepts_only_the_exact_swapgs_pair() {
+    let live = source("src/arch/x86_64/syscall/live.rs");
+    let msr = source("src/arch/x86_64/syscall/msr.rs");
+
+    assert!(live.contains("program_and_verify(&mut access, plan)"));
+    assert!(live.contains("verify_live_boundary(&mut LiveMsrAccess, plan)"));
+    assert!(msr.contains("pub(crate) fn verify_live_boundary"));
+    assert!(msr.contains("(observed, 0) if observed == entry_state_base"));
+    assert!(msr.contains("(0, observed) if observed == entry_state_base"));
+    assert!(msr.contains("verify_expected(access, plan, IA32_EFER)"));
+}
+
+#[test]
 fn h2_syscall_entry_and_native_runtime_carriers_are_fixed_per_cpu() {
     let live = source("src/arch/x86_64/syscall/live.rs");
     let runtime_binding = source("src/arch/x86_64/syscall/runtime_binding.rs");
