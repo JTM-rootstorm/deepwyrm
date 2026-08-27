@@ -235,6 +235,7 @@ pub(crate) struct SchedulerReservation {
 pub(crate) struct ScheduleDecision {
     pub(crate) previous: Option<ThreadKey>,
     pub(crate) current: Option<ThreadKey>,
+    pub(crate) cancelled_quantum: Option<SchedulerQuantumTicket>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -511,7 +512,7 @@ struct SchedulerState<const CAPACITY: usize> {
     next_execution_generation: u64,
     next_enqueue_generation: u64,
     next_idle_generation: u64,
-    next_quantum_generation: u64,
+    next_quantum_generation: [u64; H2_SCHEDULER_CPU_CAPACITY],
     queue: [Option<QueueEntry>; CAPACITY],
     len: usize,
     running: [Option<RunningClaim>; H2_SCHEDULER_CPU_CAPACITY],
@@ -536,7 +537,7 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             next_execution_generation: 1,
             next_enqueue_generation: 1,
             next_idle_generation: 1,
-            next_quantum_generation: 1,
+            next_quantum_generation: [1; H2_SCHEDULER_CPU_CAPACITY],
             queue: [None; CAPACITY],
             len: 0,
             running: [None; H2_SCHEDULER_CPU_CAPACITY],
@@ -704,9 +705,10 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         Ok(generation)
     }
 
-    fn clear_preemption_on(&mut self, cpu: SchedulerCpuId) {
-        self.quantum[cpu.index()] = None;
+    fn clear_preemption_on(&mut self, cpu: SchedulerCpuId) -> Option<SchedulerQuantumTicket> {
+        let cancelled = self.quantum[cpu.index()].take();
         self.need_resched[cpu.index()] = None;
+        cancelled
     }
 
     fn mint_quantum_on(
@@ -718,8 +720,8 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         let deadline_ns = now_ns
             .checked_add(DEFAULT_NORMAL_QUANTUM_NS)
             .ok_or(SchedulerError::TokenExhausted)?;
-        let source_arm_generation = self.next_quantum_generation;
-        self.next_quantum_generation = source_arm_generation
+        let source_arm_generation = self.next_quantum_generation[cpu.index()];
+        self.next_quantum_generation[cpu.index()] = source_arm_generation
             .checked_add(1)
             .filter(|next| *next != 0)
             .ok_or(SchedulerError::TokenExhausted)?;
@@ -1117,6 +1119,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         Ok(ScheduleDecision {
             previous: None,
             current: current.map(|claim| claim.thread),
+            cancelled_quantum: None,
         })
     }
 
@@ -1165,6 +1168,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             return Ok(ScheduleDecision {
                 previous: Some(thread),
                 current: Some(thread),
+                cancelled_quantum: None,
             });
         };
         let enqueue_generation = state.next_enqueue_generation;
@@ -1192,7 +1196,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         let next = state
             .claim_first_runnable()?
             .expect("validated Runnable entry remains claimable");
-        state.clear_preemption_on(cpu);
+        let cancelled_quantum = state.clear_preemption_on(cpu);
         state.running[cpu_index] = Some(next);
         let ready_at_ns = state.instrumentation_now_ns[cpu_index];
         state
@@ -1227,6 +1231,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         Ok(ScheduleDecision {
             previous: Some(thread),
             current: Some(next.thread),
+            cancelled_quantum,
         })
     }
 
@@ -1237,9 +1242,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         cpu: SchedulerCpuId,
         now_ns: u64,
     ) -> Result<SchedulerQuantumTicket, SchedulerError> {
-        if cpu != SchedulerCpuId::BOOTSTRAP {
-            return Err(SchedulerError::QuantumUnavailable);
-        }
         let mut state = self.state.lock();
         let claim = state.running[cpu.index()].ok_or(SchedulerError::NotRunning)?;
         if state.suspended[cpu.index()].is_some() || state.pending_block[cpu.index()].is_some() {
@@ -1251,16 +1253,13 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         Ok(ticket)
     }
 
-    /// Preserves an existing exact CPU0 budget across syscall entry/return and
+    /// Preserves an existing exact CPU-local budget across syscall entry/return and
     /// mints only when the selected execution genuinely has no quantum.
     pub(crate) fn prepare_quantum_if_needed_on(
         &self,
         cpu: SchedulerCpuId,
         now_ns: u64,
     ) -> Result<Option<SchedulerQuantumTicket>, SchedulerError> {
-        if cpu != SchedulerCpuId::BOOTSTRAP {
-            return Err(SchedulerError::QuantumUnavailable);
-        }
         let mut state = self.state.lock();
         let claim = state.running[cpu.index()].ok_or(SchedulerError::NotRunning)?;
         if state.suspended[cpu.index()].is_some()
@@ -1286,7 +1285,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         ticket: SchedulerQuantumTicket,
     ) -> Result<bool, SchedulerError> {
         let mut state = self.state.lock();
-        if ticket.domain != state.domain || ticket.cpu != SchedulerCpuId::BOOTSTRAP {
+        if ticket.domain != state.domain {
             return Ok(false);
         }
         let cpu_index = ticket.cpu.index();
@@ -1359,16 +1358,13 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             && state.need_resched[cpu.index()].is_some())
     }
 
-    /// Consumes CPU0's exact request at a guard-free CPL3 return boundary.
+    /// Consumes the current CPU's exact request at a guard-free CPL3 return boundary.
     /// The outgoing Thread is placed at the FIFO tail only when a local peer
     /// can be claimed in the same scheduler transaction.
     pub(crate) fn preempt_current_on(
         &self,
         cpu: SchedulerCpuId,
     ) -> Result<SchedulerPreemptionDecision, SchedulerError> {
-        if cpu != SchedulerCpuId::BOOTSTRAP {
-            return Err(SchedulerError::QuantumUnavailable);
-        }
         let mut state = self.state.lock();
         let cpu_index = cpu.index();
         let request = state.need_resched[cpu_index].ok_or(SchedulerError::StaleQuantum)?;
@@ -1458,6 +1454,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             decision: ScheduleDecision {
                 previous: Some(current.thread),
                 current: Some(next.thread),
+                cancelled_quantum: None,
             },
             outgoing: SchedulerExecutionClaim {
                 domain: state.domain,
@@ -1594,7 +1591,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             Err(error) => return Err(BlockReservationFailure { error, reservation }),
         };
         state.pending_block[cpu_index] = None;
-        state.clear_preemption_on(cpu);
+        let cancelled_quantum = state.clear_preemption_on(cpu);
         state.running[cpu_index] = None;
         state
             .push(QueueEntry {
@@ -1628,6 +1625,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         Ok(ScheduleDecision {
             previous: Some(reservation.key.thread),
             current: current.map(|claim| claim.thread),
+            cancelled_quantum,
         })
     }
 
@@ -1826,6 +1824,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             Ok(IdleScheduleDecision::Switch(ScheduleDecision {
                 previous: Some(suspended),
                 current: Some(next.thread),
+                cancelled_quantum: None,
             }))
         }
     }
@@ -1945,7 +1944,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             if state.pending_block[cpu_index].is_some_and(|pending| pending.thread == thread) {
                 state.pending_block[cpu_index] = None;
             }
-            state.clear_preemption_on(cpu);
+            let cancelled_quantum = state.clear_preemption_on(cpu);
             state.running[cpu_index] = None;
             state.running[cpu_index] = current;
             state.suspended[cpu_index] = Some(SuspendedContinuation {
@@ -1973,6 +1972,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             return Ok(ScheduleDecision {
                 previous: Some(thread),
                 current: current.map(|claim| claim.thread),
+                cancelled_quantum,
             });
         }
         if let Some(owner_cpu) = state
@@ -2050,6 +2050,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             return Ok(ScheduleDecision {
                 previous: Some(thread),
                 current: state.running[cpu_index].map(|claim| claim.thread),
+                cancelled_quantum: None,
             });
         }
         let Some(index) = state.queue[..state.len]
@@ -2081,6 +2082,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         Ok(ScheduleDecision {
             previous: state.running[cpu_index].map(|claim| claim.thread),
             current: state.running[cpu_index].map(|claim| claim.thread),
+            cancelled_quantum: None,
         })
     }
 
@@ -2092,7 +2094,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     pub(crate) fn stop_running_claim_on(
         &self,
         claim: SchedulerExecutionClaim,
-    ) -> Result<(), SchedulerError> {
+    ) -> Result<Option<SchedulerQuantumTicket>, SchedulerError> {
         let mut state = self.state.lock();
         if claim.domain != state.domain {
             return Err(SchedulerError::ForeignExecutionClaim);
@@ -2118,7 +2120,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         if state.pending_block[cpu_index].is_some_and(|pending| pending.thread == claim.thread) {
             state.pending_block[cpu_index] = None;
         }
-        state.clear_preemption_on(claim.cpu);
+        let cancelled_quantum = state.clear_preemption_on(claim.cpu);
         state.running[cpu_index] = None;
         state.suspended[cpu_index] = Some(SuspendedContinuation {
             thread: claim.thread,
@@ -2134,7 +2136,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             claim.generation,
         );
         state.assert_invariants();
-        Ok(())
+        Ok(cancelled_quantum)
     }
 
     /// Retires the exact blocked continuation that is still physically active
@@ -2419,10 +2421,12 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 IdleScheduleDecision::ContinueIdle => Ok(ScheduleDecision {
                     previous: Some(suspended),
                     current: None,
+                    cancelled_quantum: None,
                 }),
                 IdleScheduleDecision::ResumeCurrent => Ok(ScheduleDecision {
                     previous: Some(suspended),
                     current: Some(suspended),
+                    cancelled_quantum: None,
                 }),
                 IdleScheduleDecision::Switch(decision) => Ok(decision),
             };

@@ -2435,6 +2435,10 @@ impl WaitSuspendState {
     pub(crate) const fn decision(self) -> ScheduleDecision {
         self.decision
     }
+
+    pub(crate) const fn cancelled_quantum(self) -> Option<crate::task::SchedulerQuantumTicket> {
+        self.decision.cancelled_quantum
+    }
 }
 
 #[must_use = "native wait dispatch must either return to userspace or consume the suspension state"]
@@ -2467,6 +2471,15 @@ pub(crate) struct NativeWaitControl {
 }
 
 impl NativeWaitControl {
+    pub(crate) const fn pending_quantum_cancellation(
+        &self,
+    ) -> Option<crate::task::SchedulerQuantumTicket> {
+        match self.state {
+            NativeWaitControlState::Pending(state) => state.cancelled_quantum(),
+            NativeWaitControlState::Clear | NativeWaitControlState::Idle(_) => None,
+        }
+    }
+
     pub(crate) const fn new() -> Self {
         Self {
             state: NativeWaitControlState::Clear,

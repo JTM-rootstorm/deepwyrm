@@ -595,9 +595,114 @@ fn dw1b_quantum_identity_rejects_stale_replaced_and_cross_cpu_events() {
     assert_eq!(scheduler.publish_quantum_expiry(replacement), Ok(false));
     assert_eq!(
         scheduler.prepare_quantum_on(cpu(1), 30),
-        Err(SchedulerError::QuantumUnavailable)
+        Err(SchedulerError::NotRunning)
     );
     assert_eq!(scheduler.counters_on(cpu(0)).quantum_expirations, 1);
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn dw1c2_four_cpu_quantum_sources_arm_expire_cancel_and_rearm_independently() {
+    let scheduler = CooperativeScheduler::<8>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let running = core::array::from_fn::<_, 4, _>(|cpu_index| {
+        let thread = thread_key(&mut registry);
+        scheduler
+            .commit(scheduler.reserve(thread).unwrap())
+            .unwrap();
+        scheduler.schedule_next_on(cpu(cpu_index)).unwrap();
+        thread
+    });
+
+    let first = core::array::from_fn::<_, 4, _>(|cpu_index| {
+        scheduler
+            .prepare_quantum_on(cpu(cpu_index), 100 + cpu_index as u64)
+            .unwrap()
+    });
+    for (cpu_index, ticket) in first.into_iter().enumerate() {
+        assert_eq!(ticket.cpu(), cpu(cpu_index));
+        assert_eq!(ticket.source_arm_generation(), 1);
+        assert_eq!(scheduler.publish_quantum_expiry(ticket), Ok(true));
+        for other in 0..4 {
+            assert_eq!(
+                scheduler.has_reschedule_request_on(cpu(other)),
+                other <= cpu_index
+            );
+        }
+    }
+    let replacements = core::array::from_fn::<_, 4, _>(|cpu_index| {
+        assert_eq!(scheduler.counters_on(cpu(cpu_index)).quantum_expirations, 1);
+        assert_eq!(
+            scheduler.preempt_current_on(cpu(cpu_index)),
+            Ok(SchedulerPreemptionDecision::RetainCurrent)
+        );
+        let replacement = scheduler
+            .prepare_quantum_on(cpu(cpu_index), 1_000 + cpu_index as u64)
+            .unwrap();
+        assert_eq!(replacement.source_arm_generation(), 2);
+        assert_eq!(
+            scheduler.publish_quantum_expiry(first[cpu_index]),
+            Ok(false)
+        );
+        assert_eq!(
+            scheduler.preemption_snapshot_on(cpu(cpu_index)).quantum,
+            Some(replacement)
+        );
+        replacement
+    });
+
+    for _ in 0..4 {
+        let peer = thread_key(&mut registry);
+        scheduler.commit(scheduler.reserve(peer).unwrap()).unwrap();
+    }
+    for cpu_index in 0..4 {
+        let decision = scheduler
+            .yield_current_on(cpu(cpu_index), running[cpu_index])
+            .unwrap();
+        assert_eq!(decision.cancelled_quantum, Some(replacements[cpu_index]));
+        assert_ne!(decision.current, Some(running[cpu_index]));
+        scheduler
+            .complete_switch_on(scheduler.suspended_claim_on(cpu(cpu_index)).unwrap())
+            .unwrap();
+        let rearmed = scheduler
+            .prepare_quantum_if_needed_on(cpu(cpu_index), 10_000 + cpu_index as u64)
+            .unwrap()
+            .expect("replacement execution receives an independent fresh source");
+        assert_eq!(rearmed.source_arm_generation(), 3);
+        assert_eq!(
+            scheduler.publish_quantum_expiry(replacements[cpu_index]),
+            Ok(false)
+        );
+        assert_eq!(
+            scheduler.preemption_snapshot_on(cpu(cpu_index)).quantum,
+            Some(rearmed)
+        );
+    }
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn dw1c2_cross_cpu_ticket_identity_cannot_mutate_another_local_source() {
+    let scheduler = CooperativeScheduler::<2>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    for cpu_index in 0..2 {
+        let thread = thread_key(&mut registry);
+        scheduler
+            .commit(scheduler.reserve(thread).unwrap())
+            .unwrap();
+        scheduler.schedule_next_on(cpu(cpu_index)).unwrap();
+    }
+    let cpu0 = scheduler.prepare_quantum_on(cpu(0), 10).unwrap();
+    let cpu1 = scheduler.prepare_quantum_on(cpu(1), 10).unwrap();
+    assert_eq!(cpu0.source_arm_generation(), cpu1.source_arm_generation());
+
+    let forged = SchedulerQuantumTicket {
+        cpu: cpu(1),
+        ..cpu0
+    };
+    assert_eq!(scheduler.publish_quantum_expiry(forged), Ok(false));
+    assert_eq!(scheduler.preemption_snapshot_on(cpu(0)).quantum, Some(cpu0));
+    assert_eq!(scheduler.preemption_snapshot_on(cpu(1)).quantum, Some(cpu1));
     assert_eq!(scheduler.check_invariants(), Ok(()));
 }
 
@@ -645,6 +750,7 @@ fn dw1b_repeated_syscall_returns_preserve_budget_until_exact_expiry() {
             decision: ScheduleDecision {
                 previous: Some(previous),
                 current: Some(current),
+                cancelled_quantum: None,
             },
             outgoing: switched,
         }) if previous == first && current == second && switched == outgoing
@@ -679,6 +785,7 @@ fn dw1b_no_peer_yield_preserves_budget_until_due_retain_consumes_it() {
         ScheduleDecision {
             previous: Some(running),
             current: Some(running),
+            cancelled_quantum: None,
         }
     );
     assert_eq!(
@@ -733,6 +840,7 @@ fn dw1b_matching_expiry_rotates_fifo_and_retains_exact_continuation() {
             decision: ScheduleDecision {
                 previous: Some(first),
                 current: Some(second),
+                cancelled_quantum: None,
             },
             outgoing,
         }
@@ -1151,10 +1259,12 @@ fn prepared_block_keeps_thread_running_until_commit_and_cancel_is_exact() {
     assert_eq!(scheduler.state(thread), Some(SchedulerThreadState::Running));
     assert_eq!(scheduler.wake(wake), Err(SchedulerError::StaleBlockToken));
 
+    let ticket = scheduler.prepare_quantum_on(cpu(0), 10).unwrap();
     let block = scheduler.prepare_block_current(thread).unwrap();
     let wake = block.wake_key();
     let decision = scheduler.commit_block(block).unwrap();
     assert_eq!(decision.previous, Some(thread));
+    assert_eq!(decision.cancelled_quantum, Some(ticket));
     assert_eq!(scheduler.state(thread), Some(SchedulerThreadState::Blocked));
     scheduler.wake(wake).unwrap();
     assert_eq!(
@@ -1171,11 +1281,13 @@ fn pending_block_preparation_is_retired_with_running_thread() {
     let reservation = scheduler.reserve(thread).unwrap();
     scheduler.commit(reservation).unwrap();
     scheduler.schedule_next().unwrap();
+    let ticket = scheduler.prepare_quantum_on(cpu(0), 20).unwrap();
     let block = scheduler.prepare_block_current(thread).unwrap();
     let wake = block.wake_key();
     let decision = scheduler.retire(thread).unwrap();
     assert_eq!(decision.previous, Some(thread));
     assert_eq!(decision.current, None);
+    assert_eq!(decision.cancelled_quantum, Some(ticket));
     assert_eq!(scheduler.state(thread), None);
     assert_eq!(scheduler.wake(wake), Err(SchedulerError::StaleBlockToken));
 }
@@ -1195,8 +1307,9 @@ fn remote_stop_removes_only_the_exact_running_claim_without_replacement() {
     scheduler.schedule_next_on(cpu(1)).unwrap();
     let claim = scheduler.running_claim_on(cpu(1)).unwrap();
     assert_eq!(claim.thread(), stopped);
+    let ticket = scheduler.prepare_quantum_on(cpu(1), 30).unwrap();
 
-    scheduler.stop_running_claim_on(claim).unwrap();
+    assert_eq!(scheduler.stop_running_claim_on(claim), Ok(Some(ticket)));
     assert_eq!(scheduler.current_on(cpu(1)), None);
     assert_eq!(scheduler.running_cpu(stopped), None);
     assert_eq!(scheduler.suspended_claim_on(cpu(1)), Some(claim));
@@ -1391,6 +1504,7 @@ fn idle_scheduler_preserves_fifo_when_other_work_wakes_first() {
         IdleScheduleDecision::Switch(ScheduleDecision {
             previous: Some(suspended),
             current: Some(first),
+            cancelled_quantum: None,
         })
     );
     assert_eq!(scheduler.state(first), Some(SchedulerThreadState::Running));
@@ -1557,6 +1671,7 @@ fn dw0_f11_fixed_seed_scheduler_transaction_trace_preserves_queue_exclusivity() 
             ScheduleDecision {
                 previous: None,
                 current: Some(first_thread),
+                cancelled_quantum: None,
             },
             "DW0-F11 seed={SEED:#x} step={step} operation=schedule"
         );
@@ -1577,6 +1692,7 @@ fn dw0_f11_fixed_seed_scheduler_transaction_trace_preserves_queue_exclusivity() 
             ScheduleDecision {
                 previous: Some(first_thread),
                 current: Some(second_thread),
+                cancelled_quantum: None,
             },
             "DW0-F11 seed={SEED:#x} step={step} operation=yield"
         );
@@ -1634,6 +1750,7 @@ fn dw0_f11_fixed_seed_scheduler_transaction_trace_preserves_queue_exclusivity() 
             ScheduleDecision {
                 previous: Some(second_thread),
                 current: Some(first_thread),
+                cancelled_quantum: None,
             },
             "DW0-F11 seed={SEED:#x} step={step} operation=commit-block"
         );
@@ -1700,6 +1817,7 @@ fn dw0_f11_fixed_seed_scheduler_transaction_trace_preserves_queue_exclusivity() 
             ScheduleDecision {
                 previous: Some(first_thread),
                 current: Some(first_thread),
+                cancelled_quantum: None,
             },
             "DW0-F11 seed={SEED:#x} step={step} operation=retire-runnable"
         );
@@ -1720,6 +1838,7 @@ fn dw0_f11_fixed_seed_scheduler_transaction_trace_preserves_queue_exclusivity() 
             ScheduleDecision {
                 previous: Some(first_thread),
                 current: None,
+                cancelled_quantum: None,
             },
             "DW0-F11 seed={SEED:#x} step={step} operation=retire-running"
         );

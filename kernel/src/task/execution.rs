@@ -411,11 +411,16 @@ pub(crate) struct DeferredCurrentExecutionResources {
     resources: Option<ThreadExecutionResources>,
     process_pin: Option<crate::object::InternalRef>,
     thread_pin: Option<crate::object::InternalRef>,
+    cancelled_quantum: Option<super::SchedulerQuantumTicket>,
 }
 
 impl DeferredCurrentExecutionResources {
     pub(crate) const fn thread(&self) -> ThreadKey {
         self.thread
+    }
+
+    pub(crate) const fn cancelled_quantum(&self) -> Option<super::SchedulerQuantumTicket> {
+        self.cancelled_quantum
     }
 }
 
@@ -892,7 +897,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     pub(crate) fn stop_running_claim_on(
         &self,
         claim: SchedulerExecutionClaim,
-    ) -> Result<(), SchedulerError> {
+    ) -> Result<Option<super::SchedulerQuantumTicket>, SchedulerError> {
         self.scheduler.stop_running_claim_on(claim)
     }
 
@@ -1147,11 +1152,42 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                     "remote-stop permit named a Thread still owned by the scheduler"
                 );
                 if scheduled {
-                    self.scheduler
+                    let decision = self
+                        .scheduler
                         .retire_on(cpu, thread)
                         .unwrap_or_else(|error| {
                             panic!("terminal thread was not removable from scheduler: {error:?}")
                         });
+                    if defer_current == Some(thread) {
+                        assert!(
+                            deferred.is_none(),
+                            "terminal current quantum cancellation must be captured once"
+                        );
+                    }
+                    let cancelled_quantum = decision.cancelled_quantum;
+                    if defer_current != Some(thread) {
+                        assert!(
+                            cancelled_quantum.is_none(),
+                            "non-current terminal retirement cancelled a CPU-local quantum"
+                        );
+                    }
+                    if let Some(resources) = resources {
+                        if defer_current == Some(thread) {
+                            deferred = Some(DeferredCurrentExecutionResources {
+                                thread,
+                                resources: Some(resources),
+                                process_pin: None,
+                                thread_pin: Some(pin),
+                                cancelled_quantum,
+                            });
+                        } else {
+                            self.reclaim_resources(resources);
+                            retired_threads[index] = Some(pin);
+                        }
+                    } else {
+                        retired_threads[index] = Some(pin);
+                    }
+                    continue;
                 }
                 if let Some(resources) = resources {
                     if defer_current == Some(thread) {
@@ -1164,6 +1200,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                             resources: Some(resources),
                             process_pin: None,
                             thread_pin: Some(pin),
+                            cancelled_quantum: None,
                         });
                     } else {
                         self.reclaim_resources(resources);

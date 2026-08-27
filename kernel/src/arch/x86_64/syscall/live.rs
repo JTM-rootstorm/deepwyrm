@@ -6,7 +6,6 @@ use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use crate::cpu::CpuIndex;
 use crate::memory::kernel_stack::KernelStackBounds;
 
 use super::frame::{PerCpuEntryState, RawSyscallFrame, ValidatedUserReturn};
@@ -1118,9 +1117,6 @@ pub(crate) fn publish_current_quantum_expiry(
     reason = "the immutable CPU-local binding briefly reborrows its unique carrier to mint one exact scheduler ticket"
 )]
 fn arm_current_normal_quantum() {
-    if current_cpu_index_for_diagnostics() != Some(CpuIndex::BOOTSTRAP.index()) {
-        return;
-    }
     let binding = runtime_binding().unwrap_or_else(|| halt_forever());
     let now_ns = crate::time::monotonic_now().unwrap_or_else(|_| halt_forever());
     if let Some(ticket) = unsafe { (binding.prepare_quantum_handler)(binding.context, now_ns) } {
@@ -1152,6 +1148,7 @@ unsafe fn native_runtime_timer_pre_iret<
     frame: &mut super::frame::RawCpl3TimerReturnFrame,
 ) {
     poll_timer_return_stop(context);
+    validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
     {
         let runtime = unsafe { &mut *context.cast::<R>() };
         if let Err(error) = runtime.authorize_timer_return(frame) {
@@ -1644,10 +1641,7 @@ fn service_syscall_return_preemption<
     frame: &mut RawSyscallFrame,
 ) {
     poll_timer_return_stop(*context);
-    if current_cpu_index_for_diagnostics() == Some(CpuIndex::BOOTSTRAP.index()) {
-        crate::time::service_current_scheduler_quantum_deadline()
-            .unwrap_or_else(|_| halt_forever());
-    }
+    crate::time::service_current_scheduler_quantum_deadline().unwrap_or_else(|_| halt_forever());
     let has_request = {
         let runtime = unsafe { &mut *(*context).cast::<R>() };
         runtime.has_reschedule_request()

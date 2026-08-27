@@ -296,6 +296,9 @@ fn dw1b_timer_return_validation_is_fail_closed_before_resume_or_rearm() {
     let stop = gate
         .find("poll_timer_return_stop(context)")
         .expect("remote Stop precedence poll");
+    let boundary = gate
+        .find("validate_live_syscall_boundary()")
+        .expect("revalidate the exact current-CPU runtime binding");
     let prepare = gate
         .find("runtime.prepare_preemption()")
         .expect("prepare preemptive switch");
@@ -311,6 +314,8 @@ fn dw1b_timer_return_validation_is_fail_closed_before_resume_or_rearm() {
         .expect("arm fresh selected-thread quantum");
     assert!(
         stop < validate
+            && stop < boundary
+            && boundary < validate
             && validate < prepare
             && prepare < resume
             && resume < post_switch_stop
@@ -381,6 +386,86 @@ fn dw1b_syscall_return_accounts_due_budget_before_preemption_and_rearm() {
         .0;
     assert!(arm.contains("if let Some(ticket)"));
     assert!(arm.contains("arm_scheduler_quantum(ticket)"));
+    assert!(!arm.contains("CpuIndex::BOOTSTRAP"));
+
+    let scheduler = source("src/task/scheduler.rs");
+    assert!(scheduler.contains("next_quantum_generation: [u64; H2_SCHEDULER_CPU_CAPACITY]"));
+    assert!(scheduler.contains("self.next_quantum_generation[cpu.index()]"));
+
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let authorize = primordial
+        .split_once("fn authorize_timer_return(")
+        .expect("DW1-C2 timer-return authorization")
+        .1
+        .split_once("unsafe fn prepare_preemption")
+        .expect("DW1-C2 timer-return authorization extent")
+        .0;
+    assert!(!authorize.contains("CpuIndex::BOOTSTRAP"));
+
+    let adapters = source("src/syscall/adapters.rs");
+    assert!(adapters.contains("pending_quantum_cancellation"));
+    assert!(adapters.contains("state.cancelled_quantum()"));
+    assert!(
+        primordial.contains("self.stage_local_scheduler_quantum_cancellation(cancelled_quantum)")
+    );
+    assert!(primordial.contains("deferred.cancelled_quantum()"));
+    assert!(primordial.contains("crate::time::cancel_scheduler_quantum(ticket)"));
+    assert!(primordial.contains("stop_running_claim_on(claim)"));
+
+    let detached_cancel = primordial
+        .split_once("fn drain_quantum_cancellation_detached(&mut self)")
+        .expect("DW1-C2 detached physical cancellation")
+        .1
+        .split_once("fn synchronize_scheduler_current_detached")
+        .expect("DW1-C2 detached physical cancellation extent")
+        .0;
+    let take = detached_cancel
+        .find("take_local_scheduler_quantum_cancellation()")
+        .expect("take exact transition ticket under runtime authority");
+    let cancel = detached_cancel
+        .find("crate::time::cancel_scheduler_quantum(ticket)")
+        .expect("cancel exact physical source without runtime authority");
+    let commit = detached_cancel
+        .find("runtime.commit_local_scheduler_quantum_cancellation(ticket)")
+        .expect("revalidate cancellation under runtime authority");
+    assert!(take < cancel && cancel < commit);
+
+    let suspend = primordial
+        .rsplit_once("unsafe fn prepare_suspend<'owner>(")
+        .expect("runtime facade suspend path")
+        .1
+        .split_once("unsafe fn poll_idle_suspend")
+        .expect("runtime facade suspend path extent")
+        .0;
+    let unlock = suspend
+        .find("};")
+        .expect("runtime authority lock scope ends");
+    let drain = suspend
+        .find("self.drain_quantum_cancellation_detached()")
+        .expect("suspend drains exact quantum after lock release");
+    assert!(unlock < drain);
+
+    let time = source("src/time/live.rs");
+    let monotonic = time
+        .split_once("pub(crate) fn monotonic_now()")
+        .expect("DW1-C2 monotonic sample path")
+        .1
+        .split_once("pub(crate) fn timer_service_is_healthy")
+        .expect("DW1-C2 monotonic sample path extent")
+        .0;
+    assert!(monotonic.contains("installed_current_cpu_index()? == CpuIndex::BOOTSTRAP"));
+    assert!(monotonic.contains("BSP_TIMER_SERVICE"));
+    assert!(monotonic.contains("sample_clock_now()?"));
+
+    let clear = scheduler
+        .split_once("fn clear_preemption_on(")
+        .expect("DW1-C2 exact quantum transition cancellation")
+        .1
+        .split_once("fn mint_quantum_on(")
+        .expect("DW1-C2 exact quantum transition cancellation extent")
+        .0;
+    assert!(clear.contains("let cancelled = self.quantum[cpu.index()].take()"));
+    assert!(clear.contains("cancelled"));
 }
 
 #[test]

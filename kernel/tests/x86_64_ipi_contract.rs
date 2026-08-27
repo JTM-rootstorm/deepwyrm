@@ -384,23 +384,27 @@ fn dw1b_deadline_arbiter_uses_exact_logical_and_physical_generations() {
         .split_once("fn read_pm_timer")
         .expect("DW1-B timer dispatch extent")
         .0;
-    let irq = timer_dispatch
+    let cpu0_dispatch = timer_dispatch
+        .split_once("let Some(state) = live_state()")
+        .expect("DW1-B CPU0 timer dispatch")
+        .1;
+    let irq = cpu0_dispatch
         .find(".interrupt(outcome)")
         .expect("collect due work");
-    let arm = timer_dispatch
+    let arm = cpu0_dispatch
         .find("reconcile_bsp_hardware_arm()")
         .expect("rearm physical timer");
-    let eoi = timer_dispatch
+    let eoi = cpu0_dispatch
         .find("end_of_interrupt")
         .expect("acknowledge BSP timer");
-    let waits = timer_dispatch
+    let waits = cpu0_dispatch
         .find("if outcome.wake_count != 0")
         .expect("wait callbacks");
-    let timers = timer_dispatch
+    let timers = cpu0_dispatch
         .find("if outcome.timer_expiry_count != 0")
         .expect("timer-object callbacks");
-    let quantum = timer_dispatch
-        .find("publish_current_quantum_expiry")
+    let quantum = cpu0_dispatch
+        .rfind("publish_current_quantum_expiry")
         .expect("scheduler callback");
     assert!(irq < arm && arm < eoi && eoi < waits && waits < timers && timers < quantum);
 }
@@ -464,6 +468,86 @@ fn dw1b_timer_dispatch_uses_one_nonreentrant_cpu0_outcome_scratch() {
         .0;
     assert!(timer_dispatch.contains("core::mem::take(&mut outcome.wake_count)"));
     assert!(timer_dispatch.contains("core::mem::take(&mut outcome.timer_expiry_count)"));
+}
+
+#[test]
+fn dw1c2_ap_quantum_sources_are_cpu_local_and_leave_bsp_timer_service_separate() {
+    let live = source("src/time/live.rs");
+    for exact in [
+        "struct ApSchedulerTimerState",
+        "static AP_SCHEDULER_TIMERS: [ApSchedulerTimerSlot; CPU_CAPACITY]",
+        "static AP_INTERRUPT_OUTCOMES: [ApInterruptOutcomeStorage; CPU_CAPACITY]",
+        "fn reconcile_ap_scheduler_hardware(",
+        "PreparedApHardwareIntent::Arm",
+        "PreparedApHardwareIntent::Stop",
+        "hardware_intent_is_current(&intent)",
+    ] {
+        assert!(live.contains(exact), "AP quantum path omitted {exact}");
+    }
+    let reconcile = live
+        .split_once("fn reconcile_ap_scheduler_hardware(")
+        .expect("AP timer reconcile")
+        .1
+        .split_once("pub(crate) fn arm_scheduler_quantum(")
+        .expect("AP timer reconcile extent")
+        .0;
+    let prepare = reconcile.find("state.prepare_hardware(now_ns)").unwrap();
+    let mmio = reconcile.find("current_local_apic_slot()?").unwrap();
+    let revalidate = reconcile
+        .find("hardware_intent_is_current(&intent)")
+        .unwrap();
+    assert!(prepare < mmio && mmio < revalidate);
+    assert!(reconcile.contains("sample_clock_now()?.nanoseconds"));
+    assert!(!reconcile.contains("BSP_TIMER_SERVICE"));
+    assert!(!reconcile.contains("live_state()"));
+    assert!(!reconcile.contains("state.deadlines"));
+    assert!(!reconcile.contains("state.timer_deadlines"));
+
+    let cancel = live
+        .split_once("pub(crate) fn cancel_scheduler_quantum(")
+        .expect("current-CPU quantum cancellation")
+        .1
+        .split_once("pub(crate) fn service_current_scheduler_quantum_deadline()")
+        .expect("current-CPU quantum cancellation extent")
+        .0;
+    let ap_cancel = cancel
+        .split_once("let slot = ap_scheduler_timer_slot(cpu)?;")
+        .expect("AP-private quantum cancellation")
+        .1;
+    assert!(ap_cancel.contains("slot.state.lock().cancel(ticket)?"));
+    assert!(ap_cancel.contains("reconcile_ap_scheduler_hardware(cpu)?"));
+    assert!(!ap_cancel.contains("reconcile_bsp_hardware_arm"));
+    assert!(!ap_cancel.contains("deadlines"));
+    assert!(!ap_cancel.contains("timer_deadlines"));
+
+    let dispatch = live
+        .split_once("pub(crate) extern \"sysv64\" fn dw_x86_64_timer_interrupt_dispatch()")
+        .expect("timer dispatch")
+        .1
+        .split_once("fn read_pm_timer")
+        .expect("timer dispatch extent")
+        .0;
+    let ap = dispatch.find("if cpu != CpuIndex::BOOTSTRAP").unwrap();
+    let ap_branch = dispatch[ap..]
+        .split_once("return;")
+        .expect("AP timer branch returns before CPU0 service handling")
+        .0;
+    assert!(!ap_branch.contains("BSP_TIMER_SERVICE"));
+    let reconcile = dispatch[ap..]
+        .find("reconcile_ap_scheduler_hardware(cpu)")
+        .unwrap()
+        + ap;
+    let eoi = dispatch[reconcile..].find("end_of_interrupt").unwrap() + reconcile;
+    let publish = dispatch[reconcile..]
+        .find("publish_current_quantum_expiry(ticket)")
+        .unwrap()
+        + reconcile;
+    assert!(ap < reconcile && reconcile < eoi && eoi < publish);
+
+    let cpu0_health = dispatch
+        .find("BSP_TIMER_SERVICE.ensure_healthy()")
+        .expect("CPU0 general timer-service health gate");
+    assert!(publish < cpu0_health);
 }
 
 #[test]
@@ -642,7 +726,7 @@ fn h2_bsp_timer_and_ap_idle_publish_in_fail_closed_order() {
         .find("bind_live_ipi_transport(&LIVE_IPI_TRANSPORT)")
         .expect("live IPI transport publication");
     let time = initialize
-        .find("publish(committed.time)")
+        .find("publish(committed.clock, committed.time)")
         .expect("time service publication");
     assert!(slot < transport && transport < time);
 
@@ -659,12 +743,24 @@ fn h2_bsp_timer_and_ap_idle_publish_in_fail_closed_order() {
     let publish = ap_init
         .find("LOCAL_APIC_SLOTS[cpu.index()].publish")
         .expect("AP LAPIC publication");
+    let quantum_source = ap_init
+        .find("AP_SCHEDULER_TIMERS[cpu.index()].initialize")
+        .expect("AP scheduler quantum source initialization");
+    let masked_ready = ap_init
+        .find("AP_SCHEDULER_TIMER_MASKED[cpu.index()].store(true")
+        .expect("AP masked-ready publication");
     let ready = ap_init
         .find("current_cpu_ipi_transport_ready(cpu_index)")
         .expect("AP transport readiness check");
-    assert!(masked < publish && publish < ready);
+    assert!(
+        masked < quantum_source
+            && quantum_source < masked_ready
+            && masked_ready < publish
+            && publish < ready
+    );
     assert!(live.contains("installed_current_cpu_index()? != CpuIndex::BOOTSTRAP"));
-    assert!(live.contains("installed_current_cpu_index() != Ok(CpuIndex::BOOTSTRAP)"));
+    assert!(live.contains("if cpu != CpuIndex::BOOTSTRAP"));
+    assert!(live.contains("reconcile_ap_scheduler_hardware(cpu)"));
 }
 
 #[test]

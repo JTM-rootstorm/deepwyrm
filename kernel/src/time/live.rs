@@ -21,7 +21,8 @@ use crate::sync::IrqSpinMutex;
 use crate::task::BlockWakeKey;
 
 use super::arbiter::{
-    HardwareArmIntent, LocalDeadlineSource, PhysicalArmSequence, earliest_deadline,
+    HardwareArmIntent, HardwareStopIntent, LocalDeadlineSource, PhysicalArmSequence,
+    earliest_deadline,
 };
 use super::service::TimerServiceSignal;
 use super::{
@@ -45,6 +46,9 @@ const CALIBRATION_NANOSECONDS: u64 = 10_000_000;
 const LAPIC_SLOT_EMPTY: u8 = 0;
 const LAPIC_SLOT_PUBLISHING: u8 = 1;
 const LAPIC_SLOT_ONLINE: u8 = 2;
+const AP_TIMER_UNINITIALIZED: u8 = 0;
+const AP_TIMER_MASKED_READY: u8 = 1;
+const AP_TIMER_FAULTED: u8 = 2;
 const XAPIC_EOI_REGISTER: u32 = 0x0b0;
 
 /// Coalesced request for logical CPU 0 to resample and reprogram its one-shot
@@ -56,6 +60,146 @@ const XAPIC_EOI_REGISTER: u32 = 0x0b0;
 static BSP_TIMER_SERVICE: TimerServiceSignal = TimerServiceSignal::new();
 static AP_SCHEDULER_TIMER_MASKED: [AtomicBool; CPU_CAPACITY] =
     [const { AtomicBool::new(false) }; CPU_CAPACITY];
+
+struct ApSchedulerTimerState {
+    cpu: CpuIndex,
+    timer_hz: u64,
+    scheduler_quantum: LocalDeadlineSource<crate::task::SchedulerQuantumTicket>,
+    hardware_arms: PhysicalArmSequence,
+}
+
+impl ApSchedulerTimerState {
+    const fn uninitialized() -> Self {
+        Self {
+            cpu: CpuIndex::BOOTSTRAP,
+            timer_hz: 0,
+            scheduler_quantum: LocalDeadlineSource::new(),
+            hardware_arms: PhysicalArmSequence::initialized(),
+        }
+    }
+
+    fn initialize(&mut self, cpu: CpuIndex, timer_hz: u64) -> Result<(), LiveTimeError> {
+        if cpu == CpuIndex::BOOTSTRAP || timer_hz == 0 || self.timer_hz != 0 {
+            return Err(LiveTimeError::AlreadyInitialized);
+        }
+        self.cpu = cpu;
+        self.timer_hz = timer_hz;
+        Ok(())
+    }
+
+    fn record_source_mutation(&mut self) -> Result<(), LiveTimeError> {
+        self.hardware_arms
+            .source_mutated()
+            .map_err(|_| LiveTimeError::Deadline)
+    }
+
+    fn arm(&mut self, ticket: crate::task::SchedulerQuantumTicket) -> Result<(), LiveTimeError> {
+        if ticket.cpu() != self.cpu
+            || ticket.source_arm_generation() == 0
+            || ticket.execution_generation() == 0
+        {
+            return Err(LiveTimeError::Deadline);
+        }
+        self.scheduler_quantum
+            .replace(ticket.source_arm_generation(), ticket.deadline_ns(), ticket)
+            .map_err(|_| LiveTimeError::Deadline)?;
+        self.record_source_mutation()
+    }
+
+    fn cancel(
+        &mut self,
+        ticket: crate::task::SchedulerQuantumTicket,
+    ) -> Result<bool, LiveTimeError> {
+        if ticket.cpu() != self.cpu {
+            return Ok(false);
+        }
+        let cancelled = self
+            .scheduler_quantum
+            .cancel(ticket.source_arm_generation(), ticket);
+        if cancelled {
+            self.record_source_mutation()?;
+        }
+        Ok(cancelled)
+    }
+
+    fn take_due(
+        &mut self,
+        now_ns: u64,
+    ) -> Result<Option<crate::task::SchedulerQuantumTicket>, LiveTimeError> {
+        let due = self.scheduler_quantum.take_due(now_ns);
+        if due.is_some() {
+            self.record_source_mutation()?;
+        }
+        Ok(due)
+    }
+
+    fn prepare_hardware(&mut self, now_ns: u64) -> Result<PreparedApHardwareIntent, LiveTimeError> {
+        match self.scheduler_quantum.earliest() {
+            Some(deadline_ns) => self
+                .hardware_arms
+                .prepare(deadline_ns, now_ns, self.timer_hz)
+                .map(PreparedApHardwareIntent::Arm)
+                .map_err(|_| LiveTimeError::Deadline),
+            None => self
+                .hardware_arms
+                .prepare_stop()
+                .map(PreparedApHardwareIntent::Stop)
+                .map_err(|_| LiveTimeError::Deadline),
+        }
+    }
+
+    fn hardware_intent_is_current(&self, intent: &PreparedApHardwareIntent) -> bool {
+        match intent {
+            PreparedApHardwareIntent::Arm(intent) => self.hardware_arms.is_current(intent),
+            PreparedApHardwareIntent::Stop(intent) => self.hardware_arms.is_stop_current(intent),
+        }
+    }
+}
+
+enum PreparedApHardwareIntent {
+    Arm(HardwareArmIntent),
+    Stop(HardwareStopIntent),
+}
+
+struct ApSchedulerTimerSlot {
+    lifecycle: AtomicU8,
+    state: IrqSpinMutex<ApSchedulerTimerState>,
+}
+
+impl ApSchedulerTimerSlot {
+    const fn uninitialized() -> Self {
+        Self {
+            lifecycle: AtomicU8::new(AP_TIMER_UNINITIALIZED),
+            state: IrqSpinMutex::new(ApSchedulerTimerState::uninitialized()),
+        }
+    }
+
+    fn initialize(&self, cpu: CpuIndex, timer_hz: u64) -> Result<(), LiveTimeError> {
+        if self
+            .lifecycle
+            .compare_exchange(
+                AP_TIMER_UNINITIALIZED,
+                AP_TIMER_FAULTED,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return Err(LiveTimeError::AlreadyInitialized);
+        }
+        self.state.lock().initialize(cpu, timer_hz)?;
+        self.lifecycle
+            .store(AP_TIMER_MASKED_READY, Ordering::Release);
+        Ok(())
+    }
+
+    fn is_ready(&self) -> bool {
+        self.lifecycle.load(Ordering::Acquire) == AP_TIMER_MASKED_READY
+    }
+}
+
+static AP_SCHEDULER_TIMERS: [ApSchedulerTimerSlot; CPU_CAPACITY] =
+    [const { ApSchedulerTimerSlot::uninitialized() }; CPU_CAPACITY];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LiveTimeError {
@@ -420,9 +564,9 @@ fn reconcile_bsp_hardware_arm() -> Result<(), LiveTimeError> {
     }
     let state = live_state().ok_or(LiveTimeError::Clock)?;
     for _ in 0..8 {
+        let sample = sample_clock_now()?;
         let intent = {
             let mut state = state.lock();
-            let sample = state.sample_now()?;
             state.prepare_hardware_arm(sample)?
         };
         with_bootstrap_local_apic(|controller, registers| {
@@ -546,14 +690,29 @@ unsafe impl Sync for BspInterruptOutcomeStorage {}
 
 static BSP_INTERRUPT_OUTCOME: BspInterruptOutcomeStorage = BspInterruptOutcomeStorage::new();
 
+struct ApInterruptOutcomeStorage(UnsafeCell<Option<crate::task::SchedulerQuantumTicket>>);
+
+impl ApInterruptOutcomeStorage {
+    const fn empty() -> Self {
+        Self(UnsafeCell::new(None))
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "each AP owns one CPU-indexed timer outcome cell and its interrupt gate keeps local IF clear through consumption"
+)]
+unsafe impl Sync for ApInterruptOutcomeStorage {}
+
+static AP_INTERRUPT_OUTCOMES: [ApInterruptOutcomeStorage; CPU_CAPACITY] =
+    [const { ApInterruptOutcomeStorage::empty() }; CPU_CAPACITY];
+
 struct LiveTimeState {
-    pm: PmTimerState,
     apic_timer_hz: u64,
     deadlines: DeadlineQueue,
     timer_deadlines: DeadlineQueue<DEADLINE_QUEUE_CAPACITY, TimerExpiryToken>,
     scheduler_quantum: LocalDeadlineSource<crate::task::SchedulerQuantumTicket>,
     hardware_arms: PhysicalArmSequence,
-    last_sample: MonotonicSample,
 }
 
 impl LiveTimeState {
@@ -561,13 +720,6 @@ impl LiveTimeState {
         self.hardware_arms
             .source_mutated()
             .unwrap_or_else(|_| panic!("DW1-B logical-source revision exhausted"));
-    }
-
-    fn sample_now(&mut self) -> Result<MonotonicSample, LiveTimeError> {
-        let raw = read_pm_timer(self.pm.descriptor());
-        let sample = self.pm.sample(raw).map_err(|_| LiveTimeError::Clock)?;
-        self.last_sample = sample;
-        Ok(sample)
     }
 
     fn next_deadline(&self, sample: MonotonicSample) -> u64 {
@@ -593,7 +745,7 @@ impl LiveTimeState {
 
     fn interrupt(&mut self, outcome: &mut InterruptOutcome) -> Result<(), LiveTimeError> {
         outcome.assert_drained();
-        let sample = self.sample_now()?;
+        let sample = sample_clock_now()?;
         outcome.wake_count = self
             .deadlines
             .expire(sample.nanoseconds, &mut outcome.wakes);
@@ -616,9 +768,7 @@ impl LiveTimeState {
         wake: BlockWakeKey,
         _program_local_timer: bool,
     ) -> Result<DeadlineRegistration, DeadlineRegistrationFailure> {
-        let sample = self
-            .sample_now()
-            .map_err(|error| registration_failure(error, wake))?;
+        let sample = sample_clock_now().map_err(|error| registration_failure(error, wake))?;
         if deadline_ns <= sample.nanoseconds {
             return Err(registration_failure(LiveTimeError::Deadline, wake));
         }
@@ -635,7 +785,7 @@ impl LiveTimeState {
         registration: DeadlineRegistration,
         program_local_timer: bool,
     ) -> Result<(), LiveTimeError> {
-        let sample = self.sample_now()?;
+        let sample = sample_clock_now()?;
         let cancelled = self
             .deadlines
             .cancel_if_live(registration)
@@ -654,7 +804,7 @@ impl LiveTimeState {
         token: TimerExpiryToken,
         program_local_timer: bool,
     ) -> Result<Option<DeadlineRegistration>, TimerDeadlineError> {
-        let sample = self.sample_now().map_err(|_| TimerDeadlineError::Fault)?;
+        let sample = sample_clock_now().map_err(|_| TimerDeadlineError::Fault)?;
         if deadline_ns <= sample.nanoseconds {
             if let Some(old) = old {
                 let cancelled = self
@@ -695,7 +845,7 @@ impl LiveTimeState {
         registration: &DeadlineRegistration,
         program_local_timer: bool,
     ) -> Result<(), TimerDeadlineError> {
-        let sample = self.sample_now().map_err(|_| TimerDeadlineError::Fault)?;
+        let sample = sample_clock_now().map_err(|_| TimerDeadlineError::Fault)?;
         let cancelled = self
             .timer_deadlines
             .cancel_if_live_ref(registration)
@@ -717,7 +867,7 @@ impl LiveTimeState {
         {
             return Err(LiveTimeError::Deadline);
         }
-        let sample = self.sample_now()?;
+        let sample = sample_clock_now()?;
         self.scheduler_quantum
             .replace(ticket.source_arm_generation(), ticket.deadline_ns(), ticket)
             .map_err(|_| LiveTimeError::Deadline)?;
@@ -745,7 +895,7 @@ impl LiveTimeState {
     fn take_due_scheduler_quantum(
         &mut self,
     ) -> Result<Option<crate::task::SchedulerQuantumTicket>, LiveTimeError> {
-        let sample = self.sample_now()?;
+        let sample = sample_clock_now()?;
         let due = self.scheduler_quantum.take_due(sample.nanoseconds);
         if due.is_some() {
             self.record_source_mutation();
@@ -768,8 +918,37 @@ impl TimeStorage {
 )]
 unsafe impl Sync for TimeStorage {}
 
+struct LiveClockState {
+    pm: PmTimerState,
+    last_sample: MonotonicSample,
+}
+
+impl LiveClockState {
+    fn sample_now(&mut self) -> Result<MonotonicSample, LiveTimeError> {
+        let raw = read_pm_timer(self.pm.descriptor());
+        let sample = self.pm.sample(raw).map_err(|_| LiveTimeError::Clock)?;
+        self.last_sample = sample;
+        Ok(sample)
+    }
+}
+
+struct ClockStorage(UnsafeCell<MaybeUninit<IrqSpinMutex<LiveClockState>>>);
+
+impl ClockStorage {
+    const fn new() -> Self {
+        Self(UnsafeCell::new(MaybeUninit::uninit()))
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the one-shot F3 initializer publishes one stationary IRQ-safe monotonic clock before any CPU samples it"
+)]
+unsafe impl Sync for ClockStorage {}
+
 static TIME_STATE: AtomicU8 = AtomicU8::new(TimeInitState::Uninitialized as u8);
 static TIME_STORAGE: TimeStorage = TimeStorage::new();
+static CLOCK_STORAGE: ClockStorage = ClockStorage::new();
 
 fn live_state() -> Option<&'static IrqSpinMutex<LiveTimeState>> {
     if TIME_STATE.load(Ordering::Acquire) != TimeInitState::Initialized as u8 {
@@ -780,6 +959,22 @@ fn live_state() -> Option<&'static IrqSpinMutex<LiveTimeState>> {
         reason = "Acquire observes the fully initialized stationary F3 time service"
     )]
     Some(unsafe { &*(*TIME_STORAGE.0.get()).as_ptr() })
+}
+
+fn live_clock() -> Option<&'static IrqSpinMutex<LiveClockState>> {
+    if TIME_STATE.load(Ordering::Acquire) != TimeInitState::Initialized as u8 {
+        return None;
+    }
+    #[allow(
+        unsafe_code,
+        reason = "Acquire observes the fully initialized stationary F3 monotonic clock"
+    )]
+    Some(unsafe { &*(*CLOCK_STORAGE.0.get()).as_ptr() })
+}
+
+fn sample_clock_now() -> Result<MonotonicSample, LiveTimeError> {
+    let clock = live_clock().ok_or(LiveTimeError::Clock)?;
+    clock.lock().sample_now()
 }
 
 pub(crate) fn initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
@@ -814,7 +1009,7 @@ pub(crate) fn initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY
     let committed = commit_initialize(active, pm_descriptor, plan)?;
     LOCAL_APIC_SLOTS[CpuIndex::BOOTSTRAP.index()].publish(committed.local_apic)?;
     bind_live_ipi_transport(&LIVE_IPI_TRANSPORT).map_err(|_| LiveTimeError::IpiTransport)?;
-    publish(committed.time);
+    publish(committed.clock, committed.time);
     bind_live_rendezvous_handler(live_rendezvous_handler)
         .map_err(|_| LiveTimeError::IpiTransport)?;
     Ok(())
@@ -841,18 +1036,20 @@ fn prepare_initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: u
     Ok(TimeInitPlan { discovery, frame })
 }
 
-fn publish(state: LiveTimeState) {
+fn publish(clock: LiveClockState, state: LiveTimeState) {
     #[allow(
         unsafe_code,
         reason = "the successful one-shot initializer has exclusive publication ownership"
     )]
     unsafe {
+        (*CLOCK_STORAGE.0.get()).write(IrqSpinMutex::new(clock));
         (*TIME_STORAGE.0.get()).write(IrqSpinMutex::new(state));
     }
     TIME_STATE.store(TimeInitState::Initialized as u8, Ordering::Release);
 }
 
 struct CommittedLiveTimeState {
+    clock: LiveClockState,
     time: LiveTimeState,
     local_apic: LiveLocalApicOwner,
 }
@@ -890,13 +1087,11 @@ fn commit_initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         return Err(LiveTimeError::AcpiTimerDidNotAdvance);
     }
     let state = LiveTimeState {
-        pm,
         apic_timer_hz,
         deadlines: DeadlineQueue::new(),
         timer_deadlines: DeadlineQueue::new(),
         scheduler_quantum: LocalDeadlineSource::new(),
         hardware_arms: PhysicalArmSequence::initialized(),
-        last_sample: final_sample,
     };
     let next = state.next_deadline(final_sample);
     let delta = next.saturating_sub(final_sample.nanoseconds);
@@ -905,6 +1100,10 @@ fn commit_initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     apic.program_one_shot_timer(&mut registers, shot.initial_count)
         .map_err(|_| LiveTimeError::ApicAccess)?;
     Ok(CommittedLiveTimeState {
+        clock: LiveClockState {
+            pm,
+            last_sample: final_sample,
+        },
         time: state,
         local_apic: LiveLocalApicOwner {
             controller: apic,
@@ -1023,12 +1222,12 @@ impl TimerDeadlineAuthority for LiveTimerDeadlineAuthority {
 }
 
 pub(crate) fn monotonic_now() -> Result<u64, LiveTimeError> {
-    BSP_TIMER_SERVICE
-        .ensure_healthy()
-        .map_err(|_| LiveTimeError::Faulted)?;
-    let state = live_state().ok_or(LiveTimeError::Clock)?;
-    let mut state = state.lock();
-    Ok(state.sample_now()?.nanoseconds)
+    if installed_current_cpu_index()? == CpuIndex::BOOTSTRAP {
+        BSP_TIMER_SERVICE
+            .ensure_healthy()
+            .map_err(|_| LiveTimeError::Faulted)?;
+    }
+    Ok(sample_clock_now()?.nanoseconds)
 }
 
 /// Allows every native kernel re-entry to observe an ambiguous timer-service
@@ -1086,6 +1285,15 @@ pub(crate) fn initialize_ap_local_apic(
         .map_err(|_| LiveTimeError::ApicAccess)?;
     apic.configure_one_shot_timer(&mut registers)
         .map_err(|_| LiveTimeError::ApicAccess)?;
+    // The xAPIC one-shot counter rate is a package/platform property on the
+    // supported q35 xAPIC profile. Copy the BSP's PM-timer-calibrated rate into
+    // this CPU-private scheduler-only source; APs never acquire the BSP's
+    // general Timer/wait queues or physical-arm state.
+    let timer_hz = live_state()
+        .ok_or(LiveTimeError::Clock)?
+        .lock()
+        .apic_timer_hz;
+    AP_SCHEDULER_TIMERS[cpu.index()].initialize(cpu, timer_hz)?;
     AP_SCHEDULER_TIMER_MASKED[cpu.index()].store(true, Ordering::Release);
     LOCAL_APIC_SLOTS[cpu.index()].publish(LiveLocalApicOwner {
         controller: apic,
@@ -1097,7 +1305,9 @@ pub(crate) fn initialize_ap_local_apic(
 }
 
 pub(crate) fn ap_scheduler_timer_is_masked(cpu: CpuIndex) -> bool {
-    cpu != CpuIndex::BOOTSTRAP && AP_SCHEDULER_TIMER_MASKED[cpu.index()].load(Ordering::Acquire)
+    cpu != CpuIndex::BOOTSTRAP
+        && AP_SCHEDULER_TIMERS[cpu.index()].is_ready()
+        && AP_SCHEDULER_TIMER_MASKED[cpu.index()].load(Ordering::Acquire)
 }
 
 /// Proves that the current CPU has its private IDT/GS identity, stationary
@@ -1123,12 +1333,12 @@ pub(crate) fn busy_wait_nanoseconds(delay: u64) -> Result<(), LiveTimeError> {
     BSP_TIMER_SERVICE
         .ensure_healthy()
         .map_err(|_| LiveTimeError::Faulted)?;
-    let state = live_state().ok_or(LiveTimeError::Clock)?;
-    let mut state = state.lock();
-    let start = state.sample_now()?.nanoseconds;
+    let clock = live_clock().ok_or(LiveTimeError::Clock)?;
+    let mut clock = clock.lock();
+    let start = clock.sample_now()?.nanoseconds;
     let target = start.checked_add(delay).ok_or(LiveTimeError::Clock)?;
     for _ in 0..20_000_000_u32 {
-        if state.sample_now()?.nanoseconds >= target {
+        if clock.sample_now()?.nanoseconds >= target {
             return Ok(());
         }
         core::hint::spin_loop();
@@ -1203,18 +1413,83 @@ pub(crate) fn cancel_deadline(registration: DeadlineRegistration) -> Result<(), 
     Ok(())
 }
 
-/// Replaces CPU0's scheduler source in the unified deadline arbiter. The
-/// source update is serialized under the time guard; LAPIC MMIO and any
-/// immediate expiry callback occur after that guard is dropped.
+fn ap_scheduler_timer_slot(cpu: CpuIndex) -> Result<&'static ApSchedulerTimerSlot, LiveTimeError> {
+    if cpu == CpuIndex::BOOTSTRAP {
+        return Err(LiveTimeError::CpuIdentity);
+    }
+    let slot = &AP_SCHEDULER_TIMERS[cpu.index()];
+    slot.is_ready()
+        .then_some(slot)
+        .ok_or(LiveTimeError::Faulted)
+}
+
+/// Reconciles one AP's scheduler-only logical source with that AP's physical
+/// one-shot. The CPU-local source guard is dropped before Local APIC MMIO and
+/// the exact physical generation is revalidated afterward.
+fn reconcile_ap_scheduler_hardware(
+    cpu: CpuIndex,
+) -> Result<Option<crate::task::SchedulerQuantumTicket>, LiveTimeError> {
+    if installed_current_cpu_index()? != cpu {
+        return Err(LiveTimeError::CpuIdentity);
+    }
+    let slot = ap_scheduler_timer_slot(cpu)?;
+    let mut pending_due = None;
+    for _ in 0..8 {
+        // AP scheduler deadlines share only the monotonic clock. They never
+        // acquire CPU0's unified deadline state or BSP timer-service signal.
+        let now_ns = sample_clock_now()?.nanoseconds;
+        let intent = {
+            let mut state = slot.state.lock();
+            if let Some(due) = state.take_due(now_ns)? {
+                if pending_due.replace(due).is_some() {
+                    return Err(LiveTimeError::Faulted);
+                }
+            }
+            state.prepare_hardware(now_ns)?
+        };
+        current_local_apic_slot()?.with_owner(|controller, registers| match &intent {
+            PreparedApHardwareIntent::Arm(intent) => {
+                controller
+                    .program_one_shot_timer(registers, intent.shot.initial_count)
+                    .map_err(|_| LiveTimeError::ApicAccess)?;
+                AP_SCHEDULER_TIMER_MASKED[cpu.index()].store(false, Ordering::Release);
+                Ok(())
+            }
+            PreparedApHardwareIntent::Stop(_) => {
+                controller
+                    .stop_timer(registers)
+                    .map_err(|_| LiveTimeError::ApicAccess)?;
+                AP_SCHEDULER_TIMER_MASKED[cpu.index()].store(true, Ordering::Release);
+                Ok(())
+            }
+        })?;
+        if slot.state.lock().hardware_intent_is_current(&intent) {
+            return Ok(pending_due);
+        }
+    }
+    Err(LiveTimeError::Faulted)
+}
+
+/// Replaces the current CPU's scheduler source. CPU0 retains its unified
+/// Timer/wait arbiter; each AP mutates only its private quantum source and
+/// physical-arm generation.
 pub(crate) fn arm_scheduler_quantum(
     ticket: crate::task::SchedulerQuantumTicket,
 ) -> Result<(), LiveTimeError> {
-    if installed_current_cpu_index()? != CpuIndex::BOOTSTRAP {
+    let cpu = installed_current_cpu_index()?;
+    if ticket.cpu() != cpu {
         return Err(LiveTimeError::CpuIdentity);
     }
-    let state = live_state().ok_or(LiveTimeError::Clock)?;
-    let due = state.lock().arm_scheduler_quantum(ticket)?;
-    reconcile_bsp_hardware_arm()?;
+    let due = if cpu == CpuIndex::BOOTSTRAP {
+        let state = live_state().ok_or(LiveTimeError::Clock)?;
+        let due = state.lock().arm_scheduler_quantum(ticket)?;
+        reconcile_bsp_hardware_arm()?;
+        due
+    } else {
+        let slot = ap_scheduler_timer_slot(cpu)?;
+        slot.state.lock().arm(ticket)?;
+        reconcile_ap_scheduler_hardware(cpu)?
+    };
     if let Some(due) = due {
         crate::arch::x86_64::syscall::publish_current_quantum_expiry(due)
             .map_err(|_| LiveTimeError::Faulted)?;
@@ -1225,30 +1500,46 @@ pub(crate) fn arm_scheduler_quantum(
 pub(crate) fn cancel_scheduler_quantum(
     ticket: crate::task::SchedulerQuantumTicket,
 ) -> Result<bool, LiveTimeError> {
-    if installed_current_cpu_index()? != CpuIndex::BOOTSTRAP {
+    let cpu = installed_current_cpu_index()?;
+    if ticket.cpu() != cpu {
         return Err(LiveTimeError::CpuIdentity);
     }
-    let state = live_state().ok_or(LiveTimeError::Clock)?;
-    let cancelled = state.lock().cancel_scheduler_quantum(ticket)?;
-    if cancelled {
-        reconcile_bsp_hardware_arm()?;
+    if cpu == CpuIndex::BOOTSTRAP {
+        let state = live_state().ok_or(LiveTimeError::Clock)?;
+        let cancelled = state.lock().cancel_scheduler_quantum(ticket)?;
+        if cancelled {
+            reconcile_bsp_hardware_arm()?;
+        }
+        return Ok(cancelled);
+    }
+    let slot = ap_scheduler_timer_slot(cpu)?;
+    let cancelled = slot.state.lock().cancel(ticket)?;
+    let due = reconcile_ap_scheduler_hardware(cpu)?;
+    if let Some(due) = due {
+        crate::arch::x86_64::syscall::publish_current_quantum_expiry(due)
+            .map_err(|_| LiveTimeError::Faulted)?;
     }
     Ok(cancelled)
 }
 
-/// Converts an exact CPU0 quantum that became due while IF was clear in a
+/// Converts an exact CPU-local quantum that became due while IF was clear in a
 /// syscall into the same coalesced scheduler request the timer IRQ publishes.
 /// A later delivery of the already-pending vector is only a harmless rescan.
 pub(crate) fn service_current_scheduler_quantum_deadline() -> Result<bool, LiveTimeError> {
-    if installed_current_cpu_index()? != CpuIndex::BOOTSTRAP {
-        return Err(LiveTimeError::CpuIdentity);
-    }
-    let state = live_state().ok_or(LiveTimeError::Clock)?;
-    let due = state.lock().take_due_scheduler_quantum()?;
+    let cpu = installed_current_cpu_index()?;
+    let due = if cpu == CpuIndex::BOOTSTRAP {
+        let state = live_state().ok_or(LiveTimeError::Clock)?;
+        let due = state.lock().take_due_scheduler_quantum()?;
+        if due.is_some() {
+            reconcile_bsp_hardware_arm()?;
+        }
+        due
+    } else {
+        reconcile_ap_scheduler_hardware(cpu)?
+    };
     let Some(ticket) = due else {
         return Ok(false);
     };
-    reconcile_bsp_hardware_arm()?;
     crate::arch::x86_64::syscall::publish_current_quantum_expiry(ticket)
         .map_err(|_| LiveTimeError::Faulted)?;
     Ok(true)
@@ -1260,12 +1551,34 @@ pub(crate) fn service_current_scheduler_quantum_deadline() -> Result<bool, LiveT
 )]
 #[unsafe(no_mangle)]
 pub(crate) extern "sysv64" fn dw_x86_64_timer_interrupt_dispatch() {
-    if BSP_TIMER_SERVICE.ensure_healthy().is_err()
-        || !crate::arch::x86_64::idle::live_idle_wake_is_healthy()
-    {
+    if !crate::arch::x86_64::idle::live_idle_wake_is_healthy() {
         halt_forever();
     }
-    if installed_current_cpu_index() != Ok(CpuIndex::BOOTSTRAP) {
+    let cpu = installed_current_cpu_index().unwrap_or_else(|_| halt_forever());
+    if cpu != CpuIndex::BOOTSTRAP {
+        let scratch = {
+            #[allow(
+                unsafe_code,
+                reason = "the current AP exclusively owns its IF-clear timer outcome slot"
+            )]
+            unsafe {
+                &mut *AP_INTERRUPT_OUTCOMES[cpu.index()].0.get()
+            }
+        };
+        if scratch.is_some() {
+            halt_forever();
+        }
+        *scratch = reconcile_ap_scheduler_hardware(cpu).unwrap_or_else(|_| halt_forever());
+        current_local_apic_slot()
+            .and_then(PerCpuLocalApicSlot::end_of_interrupt)
+            .unwrap_or_else(|_| halt_forever());
+        if let Some(ticket) = scratch.take() {
+            crate::arch::x86_64::syscall::publish_current_quantum_expiry(ticket)
+                .unwrap_or_else(|_| halt_forever());
+        }
+        return;
+    }
+    if BSP_TIMER_SERVICE.ensure_healthy().is_err() {
         halt_forever();
     }
     let Some(state) = live_state() else {

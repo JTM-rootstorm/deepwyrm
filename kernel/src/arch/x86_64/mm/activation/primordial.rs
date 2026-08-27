@@ -919,6 +919,25 @@ struct RuntimeCarrierFacade<
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     RuntimeCarrierFacade<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
+    fn drain_quantum_cancellation_detached(&mut self) {
+        let ticket = {
+            let mut runtime = self.runtime.lock();
+            runtime.switch_cpu(self.cpu);
+            runtime.take_local_scheduler_quantum_cancellation()
+        };
+        let Some(ticket) = ticket else {
+            return;
+        };
+        match crate::time::cancel_scheduler_quantum(ticket) {
+            Ok(true) => {}
+            Ok(false) => panic!("scheduler transition lost its exact local quantum source"),
+            Err(error) => panic!("scheduler quantum cancellation failed: {error:?}"),
+        }
+        let mut runtime = self.runtime.lock();
+        runtime.switch_cpu(self.cpu);
+        runtime.commit_local_scheduler_quantum_cancellation(ticket);
+    }
+
     fn synchronize_scheduler_current_detached(&mut self) {
         let prepared = {
             let mut runtime = self.runtime.lock();
@@ -977,6 +996,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             runtime.switch_cpu(self.cpu);
             match runtime.prepare_remote_process_exception(exception) {
                 ProcessTerminationPreparation::Immediate(result) => {
+                    drop(runtime);
+                    self.drain_quantum_cancellation_detached();
                     assert_eq!(result.status, DW_STATUS_SUCCESS);
                     assert_eq!(result.control, SyscallControl::TerminateCurrent);
                     return;
@@ -1011,6 +1032,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             runtime.switch_cpu(self.cpu);
             runtime.complete_process_termination(pending.phase, pending.prepared, permits)
         };
+        self.drain_quantum_cancellation_detached();
         assert_eq!(result.status, DW_STATUS_SUCCESS);
         assert_eq!(result.control, SyscallControl::TerminateCurrent);
     }
@@ -2200,6 +2222,8 @@ struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_
     root_owner: Option<InternalRef>,
     deferred_currents: [Option<crate::task::DeferredCurrentExecutionResources>;
         crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+    pending_quantum_cancellations: [Option<crate::task::SchedulerQuantumTicket>;
+        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
     cleanup: CleanupQueue<REGISTRY_OBJECTS>,
     // Pending final releases are moved before the irreversible stop commit.
     // They are drained only by the post-ack kernel-root continuation.
@@ -2520,6 +2544,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> crate::syscall::native::NativeSuspendPlan<'static> {
         #[cfg(feature = "test-support")]
         let owner = self.services.operation_owner(self.thread);
+        let cancelled_quantum = self.wait_controls[self.cpu.index()].pending_quantum_cancellation();
+        self.stage_local_scheduler_quantum_cancellation(cancelled_quantum);
         let control = &mut self.wait_controls[self.cpu.index()];
         #[cfg(deepwyrm_i1_evidence)]
         let pending_wake = control.pending_wake_key();
@@ -2546,6 +2572,74 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             ),
         );
         plan
+    }
+
+    fn stage_local_scheduler_quantum_cancellation(
+        &mut self,
+        ticket: Option<crate::task::SchedulerQuantumTicket>,
+    ) {
+        let Some(ticket) = ticket else {
+            return;
+        };
+        assert_eq!(ticket.cpu(), self.cpu, "quantum cancellation changed CPU");
+        let slot = &mut self.pending_quantum_cancellations[self.cpu.index()];
+        assert!(
+            slot.is_none(),
+            "CPU already owns a pending quantum cancellation"
+        );
+        *slot = Some(ticket);
+    }
+
+    fn take_local_scheduler_quantum_cancellation(
+        &mut self,
+    ) -> Option<crate::task::SchedulerQuantumTicket> {
+        self.pending_quantum_cancellations[self.cpu.index()].take()
+    }
+
+    fn commit_local_scheduler_quantum_cancellation(
+        &self,
+        ticket: crate::task::SchedulerQuantumTicket,
+    ) {
+        assert_eq!(
+            ticket.cpu(),
+            self.cpu,
+            "quantum cancellation committed on another CPU"
+        );
+        assert!(
+            self.pending_quantum_cancellations[self.cpu.index()].is_none(),
+            "a newer CPU-local cancellation overtook physical reconciliation"
+        );
+        assert_ne!(
+            self.shared
+                .execution
+                .preemption_snapshot_on(self.cpu)
+                .quantum,
+            Some(ticket),
+            "scheduler still owns the physically cancelled exact quantum"
+        );
+    }
+
+    fn execute_local_scheduler_quantum_cancellation(&mut self) {
+        let Some(ticket) = self.take_local_scheduler_quantum_cancellation() else {
+            return;
+        };
+        self.assert_guard_free_external_work();
+        match crate::time::cancel_scheduler_quantum(ticket) {
+            Ok(true) => {}
+            Ok(false) => panic!("scheduler transition lost its exact local quantum source"),
+            Err(error) => panic!("scheduler quantum cancellation failed: {error:?}"),
+        }
+        self.commit_local_scheduler_quantum_cancellation(ticket);
+    }
+
+    fn install_deferred_current(
+        &mut self,
+        deferred: crate::task::DeferredCurrentExecutionResources,
+    ) {
+        self.stage_local_scheduler_quantum_cancellation(deferred.cancelled_quantum());
+        let slot = &mut self.deferred_currents[self.cpu.index()];
+        assert!(slot.is_none(), "deferred current resources installed twice");
+        *slot = Some(deferred);
     }
 
     unsafe fn prepare_preemption_stationary(
@@ -4052,8 +4146,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         };
         assert_eq!(status, DW_STATUS_SUCCESS);
         assert_eq!(control, SyscallControl::TerminateCurrent);
-        self.deferred_currents[self.cpu.index()] =
-            Some(deferred.expect("primordial exception omitted deferred current resources"));
+        self.install_deferred_current(
+            deferred.expect("primordial exception omitted deferred current resources"),
+        );
         for output in discarded.into_iter().flatten() {
             output
                 .discard_terminal(&self.active.user_pins)
@@ -4976,12 +5071,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     panic!("remote stop suspended claim drifted after precommit: {error:?}")
                 });
         } else {
-            self.shared
+            let cancelled_quantum = self
+                .shared
                 .execution
                 .stop_running_claim_on(claim)
                 .unwrap_or_else(|error| {
                     panic!("remote stop Running claim drifted after precommit: {error:?}")
                 });
+            self.stage_local_scheduler_quantum_cancellation(cancelled_quantum);
         }
         self.stopping_claim = Some(claim);
     }
@@ -5048,8 +5145,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
     ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
-        if self.cpu != crate::cpu::CpuIndex::BOOTSTRAP
-            || self.tasks.thread_process(self.thread) != Ok(self.process)
+        if self.tasks.thread_process(self.thread) != Ok(self.process)
             || self.shared.execution.current_thread_on(self.cpu) != Some(self.thread)
         {
             return Err(crate::arch::x86_64::syscall::UserReturnError::BindingChanged);
@@ -5307,6 +5403,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 
     fn terminate_current(&mut self) -> ! {
+        self.execute_local_scheduler_quantum_cancellation();
         match self.prepare_terminal_handoff() {
             PreparedTerminalHandoff::Continuation(continuation) => unsafe {
                 crate::arch::x86_64::context::abandon_to_kernel_continuation(continuation)
@@ -5344,7 +5441,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         &'owner mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     ) -> crate::syscall::native::NativeSuspendPlan<'owner> {
-        unsafe { self.prepare_suspend_stationary() }
+        let plan = unsafe { self.prepare_suspend_stationary() };
+        self.execute_local_scheduler_quantum_cancellation();
+        plan
     }
 
     unsafe fn poll_idle_suspend<'owner>(
@@ -5538,7 +5637,11 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             let prepared = match request {
                 NativeSyscallRequest::ProcessExit { exit_code } => {
                     match runtime.prepare_remote_process_exit(exit_code) {
-                        ProcessTerminationPreparation::Immediate(result) => return result,
+                        ProcessTerminationPreparation::Immediate(result) => {
+                            drop(runtime);
+                            self.drain_quantum_cancellation_detached();
+                            return result;
+                        }
                         ProcessTerminationPreparation::Remote(prepared) => {
                             let phase = prepared.phase;
                             let identities = prepared.identities;
@@ -5558,7 +5661,11 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                     reason,
                     code,
                 } => match runtime.prepare_remote_process_termination(process, reason, code) {
-                    ProcessTerminationPreparation::Immediate(result) => return result,
+                    ProcessTerminationPreparation::Immediate(result) => {
+                        drop(runtime);
+                        self.drain_quantum_cancellation_detached();
+                        return result;
+                    }
                     ProcessTerminationPreparation::Remote(prepared) => {
                         let phase = prepared.phase;
                         let identities = prepared.identities;
@@ -5573,7 +5680,11 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 },
                 NativeSyscallRequest::TaskGroupTerminate { task_group, reason } => {
                     match runtime.prepare_remote_task_group_termination(task_group, reason) {
-                        TaskGroupTerminationPreparation::Immediate(result) => return result,
+                        TaskGroupTerminationPreparation::Immediate(result) => {
+                            drop(runtime);
+                            self.drain_quantum_cancellation_detached();
+                            return result;
+                        }
                         TaskGroupTerminationPreparation::Remote(prepared) => {
                             let phase = prepared.phase;
                             let identities = prepared.identities;
@@ -5593,7 +5704,11 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                     reason,
                     code,
                 } => match runtime.prepare_remote_thread_termination(thread, reason, code) {
-                    ThreadTerminationPreparation::Immediate(result) => return result,
+                    ThreadTerminationPreparation::Immediate(result) => {
+                        drop(runtime);
+                        self.drain_quantum_cancellation_detached();
+                        return result;
+                    }
                     ThreadTerminationPreparation::Remote(prepared) => {
                         let phase = prepared.phase;
                         let identities = prepared.identities;
@@ -5651,10 +5766,14 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             };
         }
         self.synchronize_scheduler_current_detached();
-        let mut runtime = self.runtime.lock();
-        runtime.switch_cpu(self.cpu);
-        runtime.service_pending_timer_expiries();
-        runtime.handle(request)
+        let result = {
+            let mut runtime = self.runtime.lock();
+            runtime.switch_cpu(self.cpu);
+            runtime.service_pending_timer_expiries();
+            runtime.handle(request)
+        };
+        self.drain_quantum_cancellation_detached();
+        result
     }
 }
 
@@ -5684,6 +5803,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             let mut runtime = self.runtime.lock();
             runtime.commit_rendezvous_stop(witness, root_switch)
         };
+        self.drain_quantum_cancellation_detached();
         let entry = match next {
             PreparedRendezvousNext::Idle => PreparedCarrierEntry::Idle,
             PreparedRendezvousNext::Scheduled {
@@ -5858,25 +5978,36 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             PendingRemoteTermination::Process(pending) => {
                 let permits = await_remote_stop_permits(pending.deferred);
                 self.synchronize_scheduler_current_detached();
-                let mut runtime = self.runtime.lock();
-                runtime.switch_cpu(self.cpu);
-                runtime.complete_process_termination(pending.phase, pending.prepared, permits)
+                {
+                    let mut runtime = self.runtime.lock();
+                    runtime.switch_cpu(self.cpu);
+                    runtime.complete_process_termination(pending.phase, pending.prepared, permits)
+                }
             }
             PendingRemoteTermination::TaskGroup(pending) => {
                 let permits = await_remote_stop_permits(pending.deferred);
                 self.synchronize_scheduler_current_detached();
-                let mut runtime = self.runtime.lock();
-                runtime.switch_cpu(self.cpu);
-                runtime.complete_task_group_termination(pending.phase, pending.prepared, permits)
+                {
+                    let mut runtime = self.runtime.lock();
+                    runtime.switch_cpu(self.cpu);
+                    runtime.complete_task_group_termination(
+                        pending.phase,
+                        pending.prepared,
+                        permits,
+                    )
+                }
             }
             PendingRemoteTermination::Thread(pending) => {
                 let permits = await_remote_stop_permits(pending.deferred);
                 self.synchronize_scheduler_current_detached();
-                let mut runtime = self.runtime.lock();
-                runtime.switch_cpu(self.cpu);
-                runtime.complete_thread_termination(pending.phase, pending.prepared, permits)
+                {
+                    let mut runtime = self.runtime.lock();
+                    runtime.switch_cpu(self.cpu);
+                    runtime.complete_thread_termination(pending.phase, pending.prepared, permits)
+                }
             }
         };
+        self.drain_quantum_cancellation_detached();
         frame.set_status(result.status);
         if result.control == SyscallControl::ReturnToCaller
             && let Err(error) = self.authorize_return(frame, current_binding_generation)
@@ -5921,6 +6052,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
     }
 
     fn terminate_current(&mut self) -> ! {
+        self.drain_quantum_cancellation_detached();
         let mut step = {
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);
@@ -6246,9 +6378,13 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         &'owner mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     ) -> crate::syscall::native::NativeSuspendPlan<'owner> {
-        let mut runtime = self.runtime.lock();
-        runtime.switch_cpu(self.cpu);
-        unsafe { runtime.prepare_suspend_stationary() }
+        let plan = {
+            let mut runtime = self.runtime.lock();
+            runtime.switch_cpu(self.cpu);
+            unsafe { runtime.prepare_suspend_stationary() }
+        };
+        self.drain_quantum_cancellation_detached();
+        plan
     }
 
     unsafe fn poll_idle_suspend<'owner>(
@@ -6588,6 +6724,7 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         process_monitor: Some(process_monitor),
         root_owner: Some(root_owner),
         deferred_currents: core::array::from_fn(|_| None),
+        pending_quantum_cancellations: core::array::from_fn(|_| None),
         cleanup: CleanupQueue::new(),
         rendezvous_cleanup: None,
         #[cfg(feature = "test-support")]
@@ -7421,7 +7558,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             )
         };
         if status == DW_STATUS_SUCCESS && control == SyscallControl::TerminateCurrent {
-            self.deferred_currents[self.cpu.index()] = Some(
+            self.install_deferred_current(
                 deferred.unwrap_or_else(|| panic!("primordial exit omitted deferred reclaim")),
             );
             #[cfg(deepwyrm_i1_evidence)]
@@ -8205,7 +8342,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         deferred: Option<crate::task::DeferredCurrentExecutionResources>,
     ) {
         if control == SyscallControl::TerminateCurrent {
-            self.deferred_currents[self.cpu.index()] = Some(
+            self.install_deferred_current(
                 deferred.unwrap_or_else(|| panic!("terminal adapter omitted deferred reclaim")),
             );
         } else {

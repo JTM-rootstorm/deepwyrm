@@ -103,6 +103,12 @@ pub(crate) struct HardwareArmIntent {
     pub(crate) shot: ApicOneShot,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct HardwareStopIntent {
+    pub(crate) generation: u64,
+    pub(crate) source_revision: u64,
+}
+
 pub(crate) struct PhysicalArmSequence {
     next_generation: u64,
     desired_generation: u64,
@@ -150,7 +156,25 @@ impl PhysicalArmSequence {
         })
     }
 
+    pub(crate) fn prepare_stop(&mut self) -> Result<HardwareStopIntent, DeadlineQueueError> {
+        let generation = self.next_generation;
+        self.next_generation = generation
+            .checked_add(1)
+            .filter(|next| *next != 0)
+            .ok_or(DeadlineQueueError::GenerationExhausted)?;
+        self.desired_generation = generation;
+        Ok(HardwareStopIntent {
+            generation,
+            source_revision: self.source_revision,
+        })
+    }
+
     pub(crate) const fn is_current(&self, intent: &HardwareArmIntent) -> bool {
+        self.desired_generation == intent.generation
+            && self.source_revision == intent.source_revision
+    }
+
+    pub(crate) const fn is_stop_current(&self, intent: &HardwareStopIntent) -> bool {
         self.desired_generation == intent.generation
             && self.source_revision == intent.source_revision
     }
@@ -204,6 +228,16 @@ mod tests {
     }
 
     #[test]
+    fn stop_intent_is_generation_bound_against_a_later_arm() {
+        let mut arms = PhysicalArmSequence::initialized();
+        let stop = arms.prepare_stop().unwrap();
+        assert!(arms.is_stop_current(&stop));
+        let arm = arms.prepare(1_000, 900, 1_000_000).unwrap();
+        assert!(!arms.is_stop_current(&stop));
+        assert!(arms.is_current(&arm));
+    }
+
+    #[test]
     fn logical_source_mutation_invalidates_an_inflight_physical_intent() {
         let mut source = LocalDeadlineSource::new();
         let mut arms = PhysicalArmSequence::initialized();
@@ -239,6 +273,57 @@ mod tests {
         assert!(!source.cancel(41, 7), "late expiry identity is stale");
         assert_eq!(source.take_due(5_999_999), None);
         assert_eq!(source.take_due(6_000_000), Some(8));
+    }
+
+    #[test]
+    fn dw1c2_four_cpu_quantum_sources_reconcile_without_cross_cpu_mutation() {
+        let mut sources: [LocalDeadlineSource<(u8, u64)>; 4] =
+            core::array::from_fn(|_| LocalDeadlineSource::new());
+        let mut arms: [PhysicalArmSequence; 4] =
+            core::array::from_fn(|_| PhysicalArmSequence::initialized());
+        let mut first_intents: [Option<HardwareArmIntent>; 4] = core::array::from_fn(|_| None);
+
+        for cpu in 0..4_u8 {
+            let index = usize::from(cpu);
+            sources[index]
+                .replace(1, 1_000 + u64::from(cpu), (cpu, 1))
+                .unwrap();
+            arms[index].source_mutated().unwrap();
+            first_intents[index] = Some(
+                arms[index]
+                    .prepare(1_000 + u64::from(cpu), 900, 1_000_000)
+                    .unwrap(),
+            );
+        }
+
+        assert_eq!(sources[2].take_due(1_002), Some((2, 1)));
+        arms[2].source_mutated().unwrap();
+        assert_eq!(sources[0].take_due(1_002), Some((0, 1)));
+        assert_eq!(sources[1].take_due(1_002), Some((1, 1)));
+        assert_eq!(sources[3].take_due(1_002), None);
+        assert!(!sources[3].cancel(1, (2, 1)));
+        assert_eq!(sources[3].earliest(), Some(1_003));
+
+        assert!(sources[3].cancel(1, (3, 1)));
+        arms[3].source_mutated().unwrap();
+        let stopped = arms[3].prepare_stop().unwrap();
+        assert!(arms[3].is_stop_current(&stopped));
+        assert_eq!(sources[3].earliest(), None);
+        sources[3].replace(2, 3_000, (3, 2)).unwrap();
+        arms[3].source_mutated().unwrap();
+        let rearmed = arms[3].prepare(3_000, 1_002, 1_000_000).unwrap();
+        assert!(!arms[3].is_stop_current(&stopped));
+        assert!(arms[3].is_current(&rearmed));
+        assert_eq!(sources[3].take_due(3_000), Some((3, 2)));
+
+        sources[2].replace(2, 2_000, (2, 2)).unwrap();
+        arms[2].source_mutated().unwrap();
+        let replacement = arms[2].prepare(2_000, 1_002, 1_000_000).unwrap();
+        assert!(!arms[2].is_current(first_intents[2].as_ref().unwrap()));
+        assert!(arms[2].is_current(&replacement));
+        assert!(!sources[2].cancel(1, (2, 1)));
+        assert_eq!(sources[2].take_due(1_999), None);
+        assert_eq!(sources[2].take_due(2_000), Some((2, 2)));
     }
 
     #[test]
