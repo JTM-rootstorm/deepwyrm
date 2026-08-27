@@ -63,9 +63,12 @@ const MAX_BOOTFS_BYTES: usize = 32 * 1024 * 1024;
     deepwyrm_wrcap_relay,
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
-    deepwyrm_wyr1b_evidence
+    deepwyrm_wyr1b_evidence,
+    deepwyrm_dw1c_evidence
 )))]
 const REGISTRY_OBJECTS: usize = 32;
+#[cfg(deepwyrm_dw1c_evidence)]
+const REGISTRY_OBJECTS: usize = 256;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const REGISTRY_OBJECTS: usize = 64;
 // Selector 24 adds one bounded child-loader object set plus the controller's
@@ -89,9 +92,12 @@ const REGISTRY_OBJECTS: usize = 160;
     deepwyrm_wrcap_relay,
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
-    deepwyrm_wyr1b_evidence
+    deepwyrm_wyr1b_evidence,
+    deepwyrm_dw1c_evidence
 )))]
 const MEMORY_OBJECTS: usize = 10;
+#[cfg(deepwyrm_dw1c_evidence)]
+const MEMORY_OBJECTS: usize = 40;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const MEMORY_OBJECTS: usize = 24;
 // The selector-24 baseline owns eight bootfs/bootstrap/init0/controller
@@ -112,9 +118,12 @@ const MEMORY_OBJECTS: usize = 28;
     deepwyrm_wrcap_relay,
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
-    deepwyrm_wyr1b_evidence
+    deepwyrm_wyr1b_evidence,
+    deepwyrm_dw1c_evidence
 )))]
 const MEMORY_LEASES: usize = 10;
+#[cfg(deepwyrm_dw1c_evidence)]
+const MEMORY_LEASES: usize = 40;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const MEMORY_LEASES: usize = 24;
 // The shared-memory peak maps all twelve live objects and maps the probe once
@@ -135,9 +144,14 @@ const MEMORY_LEASES: usize = 28;
     deepwyrm_wrcap_relay,
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
-    deepwyrm_wyr1b_evidence
+    deepwyrm_wyr1b_evidence,
+    deepwyrm_dw1c_evidence
 )))]
 const USERSPACE_CHAIN_PROCESSES: usize = 3;
+// Primordial, controller, and the fixed ten workload actors.  This is test
+// artifact geometry, not a production process limit.
+#[cfg(deepwyrm_dw1c_evidence)]
+const USERSPACE_CHAIN_PROCESSES: usize = 12;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const USERSPACE_CHAIN_PROCESSES: usize = 6;
 #[cfg(deepwyrm_wrcap_relay)]
@@ -153,9 +167,12 @@ const USERSPACE_CHAIN_PROCESSES: usize = 8;
     deepwyrm_wrcap_relay,
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
-    deepwyrm_wyr1b_evidence
+    deepwyrm_wyr1b_evidence,
+    deepwyrm_dw1c_evidence
 )))]
 const CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;
+#[cfg(deepwyrm_dw1c_evidence)]
+const CHANNEL_PAIRS: usize = 32;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const CHANNEL_PAIRS: usize = 8;
 #[cfg(deepwyrm_wrcap_relay)]
@@ -172,9 +189,12 @@ const CHANNEL_DEPTH: usize = 2;
     deepwyrm_wrcap_relay,
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
-    deepwyrm_wyr1b_evidence
+    deepwyrm_wyr1b_evidence,
+    deepwyrm_dw1c_evidence
 )))]
 const WAITERS: usize = 4;
+#[cfg(deepwyrm_dw1c_evidence)]
+const WAITERS: usize = 24;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const WAITERS: usize = 12;
 // Bootstrap supervises init0 and init0 supervises the controller while the
@@ -195,9 +215,12 @@ const WAITERS: usize = 16;
     deepwyrm_wrcap_relay,
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
-    deepwyrm_wyr1b_evidence
+    deepwyrm_wyr1b_evidence,
+    deepwyrm_dw1c_evidence
 )))]
 const TASK_GROUPS: usize = 1;
+#[cfg(deepwyrm_dw1c_evidence)]
+const TASK_GROUPS: usize = 12;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const TASK_GROUPS: usize = 4;
 #[cfg(deepwyrm_wrcap_relay)]
@@ -231,9 +254,12 @@ const BOOTSTRAP_HANDLE_PEAK: usize = INITIAL_BOOTSTRAP_HANDLES
     deepwyrm_wrcap_relay,
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
-    deepwyrm_wyr1b_evidence
+    deepwyrm_wyr1b_evidence,
+    deepwyrm_dw1c_evidence
 )))]
 const HANDLES: usize = BOOTSTRAP_HANDLE_PEAK;
+#[cfg(deepwyrm_dw1c_evidence)]
+const HANDLES: usize = 64;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const HANDLES: usize = 16;
 // Selector 24 retains the temporary child's TaskGroup handle while running the
@@ -275,7 +301,8 @@ const PRIMORDIAL_TABLE_CANDIDATES: usize = 6;
     deepwyrm_wrcap_relay,
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
-    deepwyrm_wyr1b_evidence
+    deepwyrm_wyr1b_evidence,
+    deepwyrm_dw1c_evidence
 )))]
 const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 17;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
@@ -296,6 +323,8 @@ const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 128;
 const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_dw1b_bootfs_pages();
 #[cfg(deepwyrm_wyr1b_evidence)]
 const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_wyr1b_bootfs_pages();
+#[cfg(deepwyrm_dw1c_evidence)]
+const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_dw1c_bootfs_pages();
 const PRIMORDIAL_STACK_MAPPING_PAGES: usize =
     crate::boot::primordial::construction::STACK_BYTES as usize / 4096;
 const _: () = assert!(crate::boot::primordial::construction::STACK_BYTES % 4096 == 0);
@@ -419,6 +448,30 @@ const fn parse_wyr1b_bootfs_pages() -> usize {
     assert!(
         value > 0 && value <= 8192,
         "selector-27 bootfs page ceiling is out of range"
+    );
+    value
+}
+
+#[cfg(deepwyrm_dw1c_evidence)]
+const fn parse_dw1c_bootfs_pages() -> usize {
+    let bytes = env!("DEEPWYRM_DW1C_BOOTFS_MAX_PAGES").as_bytes();
+    let mut value = 0_usize;
+    let mut index = 0;
+    assert!(
+        !bytes.is_empty(),
+        "selector-28 bootfs page ceiling is empty"
+    );
+    while index < bytes.len() {
+        assert!(
+            bytes[index].is_ascii_digit(),
+            "selector-28 bootfs page ceiling is not decimal"
+        );
+        value = value * 10 + (bytes[index] - b'0') as usize;
+        index += 1;
+    }
+    assert!(
+        value > 0 && value <= 8192,
+        "selector-28 bootfs page ceiling is out of range"
     );
     value
 }
@@ -6584,7 +6637,8 @@ fn copy_module<'a, const BYTES: usize, const RANGE_CAPACITY: usize, const ROLE_C
     test,
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
-    deepwyrm_wyr1b_evidence
+    deepwyrm_wyr1b_evidence,
+    deepwyrm_dw1c_evidence
 ))]
 const fn integration_bootfs_page_count(byte_len: usize) -> Option<usize> {
     if byte_len == 0 {
@@ -6636,6 +6690,13 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         Some(1..=PRIMORDIAL_BOOTFS_MAX_PAGES)
     ) {
         crate::test_support::complete_fail(0x2710_b001)
+    }
+    #[cfg(deepwyrm_dw1c_evidence)]
+    if !matches!(
+        integration_bootfs_page_count(bootfs.len()),
+        Some(1..=PRIMORDIAL_BOOTFS_MAX_PAGES)
+    ) {
+        crate::test_support::complete_fail(0x2810_b001)
     }
     let plan = crate::boot::primordial::parse_primordial_elf(bootstrap)
         .unwrap_or_else(|error| panic!("invalid primordial bootstrap ELF: {error:?}"));
