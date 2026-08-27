@@ -366,6 +366,116 @@ fn selector27_private_wrb1_relay_is_exact_and_outside_public_abi() {
 }
 
 #[test]
+fn selector27_binds_reporter_start_to_fixed_stack_root_and_guard() {
+    let root = kernel_root();
+    let evidence = fs::read_to_string(root.join("src/test_support/wyr1b_evidence.rs"))
+        .expect("read selector-27 evidence");
+    let terminal =
+        fs::read_to_string(root.join("src/test_support/x86_64.rs")).expect("read terminal support");
+    let primordial = fs::read_to_string(root.join("src/arch/x86_64/mm/activation/primordial.rs"))
+        .expect("read primordial runtime");
+
+    for geometry in [
+        "WYR1B_SYSTEM_INIT_STACK_TOP: u64 = 0x0000_7fff_ffff_0000",
+        "WYR1B_SYSTEM_INIT_STACK_BYTES: u64 = 64 * 1024",
+        "WYR1B_SYSTEM_INIT_STACK_TOP - WYR1B_SYSTEM_INIT_STACK_BYTES",
+        "WYR1B_SYSTEM_INIT_STACK_TOP - 4096",
+        "WYR1B_SYSTEM_INIT_STACK_BOTTOM - 4096",
+    ] {
+        assert!(
+            evidence.contains(geometry),
+            "missing fixed loader geometry {geometry}"
+        );
+    }
+    for invariant in [
+        "startup.reporter_process != reporter",
+        "startup.reporter_thread != reporter_thread",
+        "startup.reporter_root != reporter_root",
+        "self.stack_pointer != WYR1B_SYSTEM_INIT_STACK_POINTER",
+        "self.stack_mapping_start != WYR1B_SYSTEM_INIT_STACK_BOTTOM",
+        "self.stack_mapping_bytes != WYR1B_SYSTEM_INIT_STACK_BYTES",
+        "!self.stack_mapping_rw_nx",
+        "!self.guard_absent",
+    ] {
+        assert!(
+            evidence.contains(invariant),
+            "missing reporter-start invariant {invariant}"
+        );
+    }
+
+    let observer = primordial
+        .split_once("fn observe_wyr1b_system_init_start(")
+        .expect("selector-27 reporter-start observer")
+        .1
+        .split_once("fn drain_finalizers(")
+        .expect("reporter-start observer extent")
+        .0;
+    for binding in [
+        "process_thread_keys(reporter_process)",
+        "thread_start_state(thread)",
+        "root_region(reporter_process)",
+        "region_process(reporter_root)",
+        "mapping.protection() == Protection::READ_EXECUTE",
+        "mapping.protection() == Protection::READ_WRITE",
+        "WYR1B_SYSTEM_INIT_GUARD_START",
+        "WYR1B_EVIDENCE.observe_reporter_start",
+    ] {
+        assert!(
+            observer.contains(binding),
+            "missing live start binding {binding}"
+        );
+    }
+
+    let thread_start = primordial
+        .split_once("NativeSyscallRequest::ThreadStart { args, args_size } => {")
+        .expect("ThreadStart dispatch")
+        .1
+        .split_once("NativeSyscallRequest::ProcessTerminate")
+        .expect("ThreadStart dispatch extent")
+        .0;
+    let commit = thread_start.find("thread_start_with_access(").unwrap();
+    let release_user = thread_start.find("drop(user);").unwrap();
+    let success = thread_start.find("if status == DW_STATUS_SUCCESS").unwrap();
+    let observe = thread_start
+        .find("self.observe_wyr1b_system_init_start()")
+        .unwrap();
+    assert!(commit < release_user);
+    assert!(release_user < success);
+    assert!(success < observe);
+
+    for detail in [
+        "StartupMissing => 0x2710_f00c",
+        "StartupDuplicate => 0x2710_f00d",
+        "StartupRoot => 0x2710_f00e",
+        "StartupEntry => 0x2710_f00f",
+        "StartupStackPointer => 0x2710_f010",
+        "StartupStackMapping => 0x2710_f011",
+        "StartupStackProtection => 0x2710_f012",
+        "StartupGuard => 0x2710_f013",
+    ] {
+        assert!(
+            terminal.contains(detail),
+            "missing distinct terminal detail {detail}"
+        );
+    }
+    for detail in [
+        "StartupMissing => 0x2710_e00b",
+        "StartupDuplicate => 0x2710_e00c",
+        "StartupRoot => 0x2710_e00d",
+        "StartupEntry => 0x2710_e00e",
+        "StartupStackPointer => 0x2710_e00f",
+        "StartupStackMapping => 0x2710_e010",
+        "StartupStackProtection => 0x2710_e011",
+        "StartupGuard => 0x2710_e012",
+    ] {
+        assert!(
+            primordial.contains(detail),
+            "missing distinct live detail {detail}"
+        );
+    }
+}
+
+#[test]
 fn i1_evidence_nonce_is_build_owned_and_strict() {
     assert!(kernel_build::validate_i1_evidence_nonce("0123456789ABCDEF").is_ok());
     for nonce in [

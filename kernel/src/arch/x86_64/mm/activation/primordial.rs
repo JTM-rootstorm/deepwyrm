@@ -1632,6 +1632,8 @@ struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_
         deepwyrm_wyr1b_evidence
     ))]
     evidence_init_process: Option<ProcessKey>,
+    #[cfg(deepwyrm_wyr1b_evidence)]
+    evidence_init_thread: Option<ThreadKey>,
     channel_keys: [crate::ipc::ChannelEndpointKey; 2],
     kernel_peer: Option<HandleRef>,
     process_monitor: Option<HandleRef>,
@@ -2999,6 +3001,27 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
     fn enable_wyr1_reporter_after_retirement(&mut self) -> Result<(), ()> {
         let reporter = self.evidence_init_process.ok_or(())?;
+        #[cfg(deepwyrm_wyr1b_evidence)]
+        let reporter_thread = self.evidence_init_thread.unwrap_or_else(|| {
+            crate::test_support::complete_fail(wyr1b_submit_detail(
+                crate::test_support::Wyr1bEvidenceError::StartupMissing,
+            ))
+        });
+        #[cfg(deepwyrm_wyr1b_evidence)]
+        let reporter_root = self
+            .tasks
+            .root_region(reporter)
+            .unwrap_or_else(|_| {
+                crate::test_support::complete_fail(wyr1b_submit_detail(
+                    crate::test_support::Wyr1bEvidenceError::StartupRoot,
+                ))
+            })
+            .map(crate::memory::address_region::AddressRegionObjectKey::from_object_id)
+            .unwrap_or_else(|| {
+                crate::test_support::complete_fail(wyr1b_submit_detail(
+                    crate::test_support::Wyr1bEvidenceError::StartupRoot,
+                ))
+            });
         if reporter == self.primordial_process
             || self
                 .tasks
@@ -3040,6 +3063,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         crate::test_support::WYR1B_EVIDENCE
             .bind_reporter_after_retirement(
                 reporter,
+                reporter_thread,
+                reporter_root,
                 crate::test_support::Wyr1bRetirementFacts {
                     process_quiesced: true,
                     root_region_retired: true,
@@ -3052,7 +3077,107 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     private_primordial_pml4_retained: true,
                 },
             )
-            .map_err(|_| ())?;
+            .unwrap_or_else(|error| crate::test_support::complete_fail(wyr1b_submit_detail(error)));
+        Ok(())
+    }
+
+    #[cfg(deepwyrm_wyr1b_evidence)]
+    fn observe_wyr1b_system_init_start(
+        &mut self,
+    ) -> Result<(), crate::test_support::Wyr1bEvidenceError> {
+        use crate::test_support::{
+            WYR1B_EVIDENCE, WYR1B_SYSTEM_INIT_GUARD_START, WYR1B_SYSTEM_INIT_STACK_BOTTOM,
+            Wyr1bEvidenceError, Wyr1bReporterStartFacts,
+        };
+
+        if self.evidence_init_thread.is_some() {
+            return Ok(());
+        }
+        let Some(reporter_process) = self.evidence_init_process else {
+            return Ok(());
+        };
+        let mut started = None;
+        for thread in self
+            .tasks
+            .process_thread_keys(reporter_process)
+            .map_err(|_| Wyr1bEvidenceError::StartupRoot)?
+            .into_iter()
+            .flatten()
+        {
+            let Some(start) = self
+                .tasks
+                .thread_start_state(thread)
+                .map_err(|_| Wyr1bEvidenceError::StartupRoot)?
+            else {
+                continue;
+            };
+            if started.replace((thread, start)).is_some() {
+                return Err(Wyr1bEvidenceError::StartupDuplicate);
+            }
+        }
+        let Some((reporter_thread, start)) = started else {
+            return Ok(());
+        };
+        let reporter_root = self
+            .tasks
+            .root_region(reporter_process)
+            .map_err(|_| Wyr1bEvidenceError::StartupRoot)?
+            .map(crate::memory::address_region::AddressRegionObjectKey::from_object_id)
+            .ok_or(Wyr1bEvidenceError::StartupRoot)?;
+        let root_owned_by_reporter =
+            self.regions.region_process(reporter_root) == Ok(reporter_process);
+        let region = self
+            .regions
+            .region(reporter_root)
+            .map_err(|_| Wyr1bEvidenceError::StartupRoot)?;
+        let mappings = region.mappings();
+        let entry_mapping_bound = mappings.iter().flatten().any(|mapping| {
+            mapping.virtual_start() <= start.entry()
+                && mapping
+                    .virtual_start()
+                    .checked_add(mapping.byte_len())
+                    .is_some_and(|end| start.entry() < end)
+                && mapping.protection() == Protection::READ_EXECUTE
+        });
+        let stack_mapping = mappings.iter().flatten().find(|mapping| {
+            mapping.virtual_start() < start.stack_pointer()
+                && mapping
+                    .virtual_start()
+                    .checked_add(mapping.byte_len())
+                    .is_some_and(|end| start.stack_pointer() <= end)
+        });
+        let (stack_mapping_start, stack_mapping_bytes, stack_mapping_rw_nx) = stack_mapping
+            .map(|mapping| {
+                (
+                    mapping.virtual_start(),
+                    mapping.byte_len(),
+                    mapping.protection() == Protection::READ_WRITE,
+                )
+            })
+            .unwrap_or((0, 0, false));
+        let guard_absent = mappings.iter().flatten().all(|mapping| {
+            mapping
+                .virtual_start()
+                .checked_add(mapping.byte_len())
+                .is_some_and(|end| {
+                    end <= WYR1B_SYSTEM_INIT_GUARD_START
+                        || mapping.virtual_start() >= WYR1B_SYSTEM_INIT_STACK_BOTTOM
+                })
+        });
+        WYR1B_EVIDENCE.observe_reporter_start(Wyr1bReporterStartFacts {
+            reporter_process,
+            reporter_thread,
+            reporter_root,
+            root_owned_by_reporter,
+            entry_point: start.entry(),
+            entry_mapping_bound,
+            stack_pointer: start.stack_pointer(),
+            stack_mapping_start,
+            stack_mapping_bytes,
+            stack_mapping_rw_nx,
+            guard_absent,
+        })?;
+        self.evidence_init_thread = Some(reporter_thread);
         Ok(())
     }
 
@@ -3916,6 +4041,14 @@ const fn wyr1b_submit_detail(error: crate::test_support::Wyr1bEvidenceError) -> 
         Wyr1bEvidenceError::Full => 0x2710_e008,
         Wyr1bEvidenceError::DuplicateTerminal => 0x2710_e009,
         Wyr1bEvidenceError::ReporterClaimed => 0x2710_e00a,
+        Wyr1bEvidenceError::StartupMissing => 0x2710_e00b,
+        Wyr1bEvidenceError::StartupDuplicate => 0x2710_e00c,
+        Wyr1bEvidenceError::StartupRoot => 0x2710_e00d,
+        Wyr1bEvidenceError::StartupEntry => 0x2710_e00e,
+        Wyr1bEvidenceError::StartupStackPointer => 0x2710_e00f,
+        Wyr1bEvidenceError::StartupStackMapping => 0x2710_e010,
+        Wyr1bEvidenceError::StartupStackProtection => 0x2710_e011,
+        Wyr1bEvidenceError::StartupGuard => 0x2710_e012,
     }
 }
 
@@ -4865,6 +4998,8 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
             deepwyrm_wyr1b_evidence
         ))]
         evidence_init_process: None,
+        #[cfg(deepwyrm_wyr1b_evidence)]
+        evidence_init_thread: None,
         channel_keys,
         kernel_peer: Some(kernel_peer),
         process_monitor: Some(process_monitor),
@@ -5259,7 +5394,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     self.active_root.as_ref().expect("active root"),
                     self.process,
                 );
-                NativeSyscallResult::returning(crate::syscall::thread_start_with_access(
+                let status = crate::syscall::thread_start_with_access(
                     &mut user,
                     &mut self.registry,
                     &mut self.tasks,
@@ -5268,7 +5403,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     args,
                     args_size,
                     &mut self.cleanup,
-                ))
+                );
+                drop(user);
+                #[cfg(deepwyrm_wyr1b_evidence)]
+                if status == DW_STATUS_SUCCESS {
+                    self.observe_wyr1b_system_init_start()
+                        .unwrap_or_else(|error| {
+                            crate::test_support::complete_fail(wyr1b_submit_detail(error))
+                        });
+                }
+                NativeSyscallResult::returning(status)
             }
             NativeSyscallRequest::ProcessTerminate {
                 process,

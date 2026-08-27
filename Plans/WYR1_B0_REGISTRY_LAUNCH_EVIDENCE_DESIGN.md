@@ -46,6 +46,27 @@ is one-shot. Early submission, a different Process, reporter replacement, or
 reporter exit before terminal evidence latches failure and reaches selector
 27's sole failing terminal path.
 
+Before reporter authority is enabled, selector 27 also binds the first
+successfully started Thread in that exact Process to Wyrmroot's fixed legacy-v1
+system-init loader geometry. Deepwyrm samples the committed effective start
+state and the Process's exact root AddressRegion, then requires:
+
+- the start RIP is nonzero and belongs to an RX mapping in that root;
+- the effective RSP is `0x0000_7fff_fffe_f000`;
+- the containing stack mapping is exactly the 64 KiB RW/NX span
+  `[0x0000_7fff_fffe_0000, 0x0000_7fff_ffff_0000)`; and
+- the immediately lower 4 KiB guard span
+  `[0x0000_7fff_fffd_f000, 0x0000_7fff_fffe_0000)` has no mapping.
+
+These constants mirror the reached Wyrmroot loader contract only inside the
+selector-specialized test artifact. They do not change the public ABI or
+production behavior. A missing, duplicate, wrong-root, unbound-entry,
+wrong-RSP, wrong-span, executable/wrong-protection stack, or mapped-guard
+observation fails closed with a distinct selector-private detail before WRB1
+reporting. Deepwyrm can bind the executable entry to the exact reporter root,
+but the ThreadStart seam does not expose bootfs path or artifact-hash identity;
+claiming either would require a separately coordinated contract.
+
 ## 3. Raw operation and WRB1 validation
 
 The only accepted raw argument form is:

@@ -11,12 +11,21 @@
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
+use crate::memory::address_region::AddressRegionObjectKey;
 use crate::sync::SpinMutex;
-use crate::task::ProcessKey;
+use crate::task::{ProcessKey, ThreadKey};
 
 pub(crate) const WYR1B_EVIDENCE_RAW_SYSCALL: u32 = 0xffff_ff1b;
 pub(crate) const WYR1B_EVIDENCE_RECORD_LEN: usize = 96;
 pub(crate) const WYR1B_EVIDENCE_RECORD_CAPACITY: usize = 14;
+// Private selector-27 mirror of Wyrmroot's fixed legacy-v1 system-init loader
+// geometry. This is a runtime acceptance invariant, not a platform ABI.
+pub(crate) const WYR1B_SYSTEM_INIT_STACK_TOP: u64 = 0x0000_7fff_ffff_0000;
+pub(crate) const WYR1B_SYSTEM_INIT_STACK_BYTES: u64 = 64 * 1024;
+pub(crate) const WYR1B_SYSTEM_INIT_STACK_BOTTOM: u64 =
+    WYR1B_SYSTEM_INIT_STACK_TOP - WYR1B_SYSTEM_INIT_STACK_BYTES;
+pub(crate) const WYR1B_SYSTEM_INIT_STACK_POINTER: u64 = WYR1B_SYSTEM_INIT_STACK_TOP - 4096;
+pub(crate) const WYR1B_SYSTEM_INIT_GUARD_START: u64 = WYR1B_SYSTEM_INIT_STACK_BOTTOM - 4096;
 const CHECKSUM_OFFSET: usize = 88;
 const TERMINAL_EVENT: u8 = 0xff;
 const EMPTY_RECORD: [u8; WYR1B_EVIDENCE_RECORD_LEN] = [0; WYR1B_EVIDENCE_RECORD_LEN];
@@ -33,6 +42,14 @@ pub(crate) enum Wyr1bEvidenceError {
     Full,
     DuplicateTerminal,
     ReporterClaimed,
+    StartupMissing,
+    StartupDuplicate,
+    StartupRoot,
+    StartupEntry,
+    StartupStackPointer,
+    StartupStackMapping,
+    StartupStackProtection,
+    StartupGuard,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,6 +63,14 @@ pub(crate) enum Wyr1bEvidenceFlushError {
     Full,
     DuplicateTerminal,
     ReporterClaimed,
+    StartupMissing,
+    StartupDuplicate,
+    StartupRoot,
+    StartupEntry,
+    StartupStackPointer,
+    StartupStackMapping,
+    StartupStackProtection,
+    StartupGuard,
     Busy,
     Transport,
 }
@@ -75,9 +100,54 @@ impl Wyr1bRetirementFacts {
     }
 }
 
+/// Selector-local facts captured from the exact first Thread started in the
+/// primordial child that becomes the permanent controller. These are private
+/// kernel/test identities, not a Wyrmroot or Deepwyrm ABI record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Wyr1bReporterStartFacts {
+    pub(crate) reporter_process: ProcessKey,
+    pub(crate) reporter_thread: ThreadKey,
+    pub(crate) reporter_root: AddressRegionObjectKey,
+    pub(crate) root_owned_by_reporter: bool,
+    pub(crate) entry_point: u64,
+    pub(crate) entry_mapping_bound: bool,
+    pub(crate) stack_pointer: u64,
+    pub(crate) stack_mapping_start: u64,
+    pub(crate) stack_mapping_bytes: u64,
+    pub(crate) stack_mapping_rw_nx: bool,
+    pub(crate) guard_absent: bool,
+}
+
+impl Wyr1bReporterStartFacts {
+    const fn validate(self) -> Result<(), Wyr1bEvidenceError> {
+        if !self.root_owned_by_reporter {
+            return Err(Wyr1bEvidenceError::StartupRoot);
+        }
+        if self.entry_point == 0 || !self.entry_mapping_bound {
+            return Err(Wyr1bEvidenceError::StartupEntry);
+        }
+        if self.stack_pointer != WYR1B_SYSTEM_INIT_STACK_POINTER {
+            return Err(Wyr1bEvidenceError::StartupStackPointer);
+        }
+        if self.stack_mapping_start != WYR1B_SYSTEM_INIT_STACK_BOTTOM
+            || self.stack_mapping_bytes != WYR1B_SYSTEM_INIT_STACK_BYTES
+        {
+            return Err(Wyr1bEvidenceError::StartupStackMapping);
+        }
+        if !self.stack_mapping_rw_nx {
+            return Err(Wyr1bEvidenceError::StartupStackProtection);
+        }
+        if !self.guard_absent {
+            return Err(Wyr1bEvidenceError::StartupGuard);
+        }
+        Ok(())
+    }
+}
+
 struct Transcript {
     records: [[u8; WYR1B_EVIDENCE_RECORD_LEN]; WYR1B_EVIDENCE_RECORD_CAPACITY],
     count: usize,
+    startup: Option<Wyr1bReporterStartFacts>,
     reporter: Option<ProcessKey>,
     retired: bool,
     terminal: bool,
@@ -89,6 +159,7 @@ impl Transcript {
         Self {
             records: [EMPTY_RECORD; WYR1B_EVIDENCE_RECORD_CAPACITY],
             count: 0,
+            startup: None,
             reporter: None,
             retired: false,
             terminal: false,
@@ -121,9 +192,29 @@ impl Wyr1bEvidenceCollector {
         }
     }
 
+    pub(crate) fn observe_reporter_start(
+        &self,
+        facts: Wyr1bReporterStartFacts,
+    ) -> Result<(), Wyr1bEvidenceError> {
+        let mut transcript = self.transcript.lock();
+        if transcript.startup.is_some() {
+            return Err(transcript.latch(Wyr1bEvidenceError::StartupDuplicate));
+        }
+        if let Some(error) = transcript.failure {
+            return Err(error);
+        }
+        if let Err(error) = facts.validate() {
+            return Err(transcript.latch(error));
+        }
+        transcript.startup = Some(facts);
+        Ok(())
+    }
+
     pub(crate) fn bind_reporter_after_retirement(
         &self,
         reporter: ProcessKey,
+        reporter_thread: ThreadKey,
+        reporter_root: AddressRegionObjectKey,
         facts: Wyr1bRetirementFacts,
     ) -> Result<(), Wyr1bEvidenceError> {
         let mut transcript = self.transcript.lock();
@@ -132,6 +223,15 @@ impl Wyr1bEvidenceCollector {
         }
         if let Some(error) = transcript.failure {
             return Err(error);
+        }
+        let Some(startup) = transcript.startup else {
+            return Err(transcript.latch(Wyr1bEvidenceError::StartupMissing));
+        };
+        if startup.reporter_process != reporter
+            || startup.reporter_thread != reporter_thread
+            || startup.reporter_root != reporter_root
+        {
+            return Err(transcript.latch(Wyr1bEvidenceError::StartupRoot));
         }
         transcript.reporter = Some(reporter);
         transcript.retired = true;
@@ -272,6 +372,16 @@ const fn flush_error(error: Wyr1bEvidenceError) -> Wyr1bEvidenceFlushError {
         Wyr1bEvidenceError::Full => Wyr1bEvidenceFlushError::Full,
         Wyr1bEvidenceError::DuplicateTerminal => Wyr1bEvidenceFlushError::DuplicateTerminal,
         Wyr1bEvidenceError::ReporterClaimed => Wyr1bEvidenceFlushError::ReporterClaimed,
+        Wyr1bEvidenceError::StartupMissing => Wyr1bEvidenceFlushError::StartupMissing,
+        Wyr1bEvidenceError::StartupDuplicate => Wyr1bEvidenceFlushError::StartupDuplicate,
+        Wyr1bEvidenceError::StartupRoot => Wyr1bEvidenceFlushError::StartupRoot,
+        Wyr1bEvidenceError::StartupEntry => Wyr1bEvidenceFlushError::StartupEntry,
+        Wyr1bEvidenceError::StartupStackPointer => Wyr1bEvidenceFlushError::StartupStackPointer,
+        Wyr1bEvidenceError::StartupStackMapping => Wyr1bEvidenceFlushError::StartupStackMapping,
+        Wyr1bEvidenceError::StartupStackProtection => {
+            Wyr1bEvidenceFlushError::StartupStackProtection
+        }
+        Wyr1bEvidenceError::StartupGuard => Wyr1bEvidenceFlushError::StartupGuard,
     }
 }
 
@@ -381,7 +491,9 @@ pub(crate) static WYR1B_EVIDENCE: Wyr1bEvidenceCollector =
 mod tests {
     use super::*;
     use crate::object::ObjectRegistry;
-    use deepwyrm_abi::DW_OBJECT_TYPE_PROCESS;
+    use deepwyrm_abi::{
+        DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_PROCESS, DW_OBJECT_TYPE_THREAD,
+    };
 
     const NONCE: u64 = 0x0123_4567_89ab_cdef;
     const RETIRED: Wyr1bRetirementFacts = Wyr1bRetirementFacts {
@@ -392,10 +504,54 @@ mod tests {
         private_primordial_pml4_retained: true,
     };
 
-    fn process_key() -> ProcessKey {
-        let mut registry = ObjectRegistry::<1>::new();
+    fn subject() -> (ProcessKey, ThreadKey, AddressRegionObjectKey) {
+        let mut registry = ObjectRegistry::<3>::new();
         let process = registry.create(DW_OBJECT_TYPE_PROCESS).unwrap();
-        ProcessKey::from_object_id(process.id())
+        let thread = registry.create(DW_OBJECT_TYPE_THREAD).unwrap();
+        let root = registry.create(DW_OBJECT_TYPE_ADDRESS_REGION).unwrap();
+        (
+            ProcessKey::from_object_id(process.id()),
+            ThreadKey::from_object_id(thread.id()),
+            AddressRegionObjectKey::from_object_id(root.id()),
+        )
+    }
+
+    fn process_key() -> ProcessKey {
+        subject().0
+    }
+
+    fn valid_start(
+        reporter_process: ProcessKey,
+        reporter_thread: ThreadKey,
+        reporter_root: AddressRegionObjectKey,
+    ) -> Wyr1bReporterStartFacts {
+        Wyr1bReporterStartFacts {
+            reporter_process,
+            reporter_thread,
+            reporter_root,
+            root_owned_by_reporter: true,
+            entry_point: 0x20_0000,
+            entry_mapping_bound: true,
+            stack_pointer: WYR1B_SYSTEM_INIT_STACK_POINTER,
+            stack_mapping_start: WYR1B_SYSTEM_INIT_STACK_BOTTOM,
+            stack_mapping_bytes: WYR1B_SYSTEM_INIT_STACK_BYTES,
+            stack_mapping_rw_nx: true,
+            guard_absent: true,
+        }
+    }
+
+    fn arm(
+        collector: &Wyr1bEvidenceCollector,
+        reporter: ProcessKey,
+        thread: ThreadKey,
+        root: AddressRegionObjectKey,
+    ) {
+        collector
+            .observe_reporter_start(valid_start(reporter, thread, root))
+            .unwrap();
+        collector
+            .bind_reporter_after_retirement(reporter, thread, root, RETIRED)
+            .unwrap();
     }
 
     fn put_hex(output: &mut [u8], value: u64) {
@@ -426,10 +582,8 @@ mod tests {
     #[test]
     fn exact_fourteen_record_transcript_is_preserved() {
         let collector = Wyr1bEvidenceCollector::new(NONCE);
-        let reporter = process_key();
-        collector
-            .bind_reporter_after_retirement(reporter, RETIRED)
-            .unwrap();
+        let (reporter, thread, root) = subject();
+        arm(&collector, reporter, thread, root);
         for (sequence, event) in EXPECTED_EVENTS.into_iter().enumerate() {
             let submission = collector
                 .submit(reporter, &record(sequence, event))
@@ -454,31 +608,25 @@ mod tests {
 
     #[test]
     fn malformed_order_reporter_and_duplicate_fail_closed() {
-        let reporter = process_key();
+        let (reporter, thread, root) = subject();
         let other = process_key();
 
         let wrong = Wyr1bEvidenceCollector::new(NONCE);
-        wrong
-            .bind_reporter_after_retirement(reporter, RETIRED)
-            .unwrap();
+        arm(&wrong, reporter, thread, root);
         assert!(matches!(
             wrong.submit(other, &record(0, 1)),
             Err(Wyr1bEvidenceError::WrongReporter)
         ));
 
         let order = Wyr1bEvidenceCollector::new(NONCE);
-        order
-            .bind_reporter_after_retirement(reporter, RETIRED)
-            .unwrap();
+        arm(&order, reporter, thread, root);
         assert!(matches!(
             order.submit(reporter, &record(0, 2)),
             Err(Wyr1bEvidenceError::OutOfOrder)
         ));
 
         let malformed = Wyr1bEvidenceCollector::new(NONCE);
-        malformed
-            .bind_reporter_after_retirement(reporter, RETIRED)
-            .unwrap();
+        arm(&malformed, reporter, thread, root);
         let mut bad = record(0, 1);
         bad[95] ^= 1;
         assert!(matches!(
@@ -487,9 +635,7 @@ mod tests {
         ));
 
         let terminal = Wyr1bEvidenceCollector::new(NONCE);
-        terminal
-            .bind_reporter_after_retirement(reporter, RETIRED)
-            .unwrap();
+        arm(&terminal, reporter, thread, root);
         for (sequence, event) in EXPECTED_EVENTS.into_iter().enumerate() {
             let _ = terminal.submit(reporter, &record(sequence, event)).unwrap();
         }
@@ -502,7 +648,7 @@ mod tests {
 
     #[test]
     fn every_retirement_fact_and_early_submission_are_rejected() {
-        let reporter = process_key();
+        let (reporter, thread, root) = subject();
         let early = Wyr1bEvidenceCollector::new(NONCE);
         assert_eq!(
             early.authorize_submission(reporter),
@@ -532,9 +678,95 @@ mod tests {
         ] {
             let collector = Wyr1bEvidenceCollector::new(NONCE);
             assert_eq!(
-                collector.bind_reporter_after_retirement(reporter, facts),
+                collector.bind_reporter_after_retirement(reporter, thread, root, facts),
                 Err(Wyr1bEvidenceError::Retirement)
             );
         }
+    }
+
+    #[test]
+    fn reporter_start_facts_bind_exact_root_stack_and_guard() {
+        let (reporter, thread, root) = subject();
+        let collector = Wyr1bEvidenceCollector::new(NONCE);
+        assert_eq!(
+            collector.bind_reporter_after_retirement(reporter, thread, root, RETIRED),
+            Err(Wyr1bEvidenceError::StartupMissing)
+        );
+
+        for (facts, expected) in [
+            (
+                Wyr1bReporterStartFacts {
+                    root_owned_by_reporter: false,
+                    ..valid_start(reporter, thread, root)
+                },
+                Wyr1bEvidenceError::StartupRoot,
+            ),
+            (
+                Wyr1bReporterStartFacts {
+                    entry_mapping_bound: false,
+                    ..valid_start(reporter, thread, root)
+                },
+                Wyr1bEvidenceError::StartupEntry,
+            ),
+            (
+                Wyr1bReporterStartFacts {
+                    stack_pointer: WYR1B_SYSTEM_INIT_STACK_POINTER - 16,
+                    ..valid_start(reporter, thread, root)
+                },
+                Wyr1bEvidenceError::StartupStackPointer,
+            ),
+            (
+                Wyr1bReporterStartFacts {
+                    stack_mapping_bytes: WYR1B_SYSTEM_INIT_STACK_BYTES + 4096,
+                    ..valid_start(reporter, thread, root)
+                },
+                Wyr1bEvidenceError::StartupStackMapping,
+            ),
+            (
+                Wyr1bReporterStartFacts {
+                    stack_mapping_rw_nx: false,
+                    ..valid_start(reporter, thread, root)
+                },
+                Wyr1bEvidenceError::StartupStackProtection,
+            ),
+            (
+                Wyr1bReporterStartFacts {
+                    guard_absent: false,
+                    ..valid_start(reporter, thread, root)
+                },
+                Wyr1bEvidenceError::StartupGuard,
+            ),
+        ] {
+            let malformed = Wyr1bEvidenceCollector::new(NONCE);
+            assert_eq!(malformed.observe_reporter_start(facts), Err(expected));
+            assert_eq!(malformed.observe_reporter_start(facts), Err(expected));
+        }
+
+        let valid = Wyr1bEvidenceCollector::new(NONCE);
+        valid
+            .observe_reporter_start(valid_start(reporter, thread, root))
+            .unwrap();
+        assert_eq!(
+            valid.observe_reporter_start(valid_start(reporter, thread, root)),
+            Err(Wyr1bEvidenceError::StartupDuplicate)
+        );
+
+        let mismatched_root = Wyr1bEvidenceCollector::new(NONCE);
+        mismatched_root
+            .observe_reporter_start(valid_start(reporter, thread, root))
+            .unwrap();
+        assert_eq!(
+            mismatched_root.bind_reporter_after_retirement(reporter, thread, subject().2, RETIRED),
+            Err(Wyr1bEvidenceError::StartupRoot)
+        );
+
+        let mismatched_thread = Wyr1bEvidenceCollector::new(NONCE);
+        mismatched_thread
+            .observe_reporter_start(valid_start(reporter, thread, root))
+            .unwrap();
+        assert_eq!(
+            mismatched_thread.bind_reporter_after_retirement(reporter, subject().1, root, RETIRED,),
+            Err(Wyr1bEvidenceError::StartupRoot)
+        );
     }
 }

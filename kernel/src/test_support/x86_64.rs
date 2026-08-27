@@ -326,6 +326,14 @@ fn wyr1b_failure_detail(error: Wyr1bEvidenceFlushError) -> u32 {
         Wyr1bEvidenceFlushError::ReporterClaimed => 0x2710_f009,
         Wyr1bEvidenceFlushError::Busy => 0x2710_f00a,
         Wyr1bEvidenceFlushError::Transport => 0x2710_f00b,
+        Wyr1bEvidenceFlushError::StartupMissing => 0x2710_f00c,
+        Wyr1bEvidenceFlushError::StartupDuplicate => 0x2710_f00d,
+        Wyr1bEvidenceFlushError::StartupRoot => 0x2710_f00e,
+        Wyr1bEvidenceFlushError::StartupEntry => 0x2710_f00f,
+        Wyr1bEvidenceFlushError::StartupStackPointer => 0x2710_f010,
+        Wyr1bEvidenceFlushError::StartupStackMapping => 0x2710_f011,
+        Wyr1bEvidenceFlushError::StartupStackProtection => 0x2710_f012,
+        Wyr1bEvidenceFlushError::StartupGuard => 0x2710_f013,
     }
 }
 
