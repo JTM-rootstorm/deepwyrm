@@ -342,6 +342,16 @@ fn selector27_private_wrb1_relay_is_exact_and_outside_public_abi() {
     assert!(primordial.contains(".authorize_submission(self.process)"));
     assert!(primordial.contains("Wyr1bRetirementFacts"));
     assert!(primordial.contains("parse_wyr1b_bootfs_pages"));
+    assert!(
+        primordial.contains(
+            "BuildGuestTest::BootstrapRegistryLaunch => G5PrimordialExpectation::Baseline"
+        )
+    );
+    assert!(
+        !primordial
+            .contains("_ => unreachable!(\"primordial runtime requires a primordial selector\")"),
+        "primordial probe admission must exhaustively classify every build selector"
+    );
 
     let completion = terminal
         .find("pub(crate) fn complete_wyr1b_evidence")

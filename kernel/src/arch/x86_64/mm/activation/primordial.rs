@@ -445,10 +445,26 @@ impl G5PrimordialProbe {
             BuildGuestTest::NativeUserspaceCapability => G5PrimordialExpectation::Baseline,
             BuildGuestTest::PermanentSupervisorRrc => G5PrimordialExpectation::Baseline,
             BuildGuestTest::NormalPreemptionUp => G5PrimordialExpectation::Baseline,
+            BuildGuestTest::BootstrapRegistryLaunch => G5PrimordialExpectation::Baseline,
             BuildGuestTest::PrimordialBlockingCleanup => G5PrimordialExpectation::BlockingCleanup,
             BuildGuestTest::PrimordialUserException => G5PrimordialExpectation::UserException,
             BuildGuestTest::PrimordialInvalidReturn => G5PrimordialExpectation::InvalidReturn,
-            _ => unreachable!("primordial runtime requires a primordial selector"),
+            BuildGuestTest::BootHandoffPass
+            | BuildGuestTest::ExceptionFailPath
+            | BuildGuestTest::PanicPath
+            | BuildGuestTest::MemoryMapping
+            | BuildGuestTest::MemoryUnmapping
+            | BuildGuestTest::MemoryPermissions
+            | BuildGuestTest::MemoryInvalidPointer
+            | BuildGuestTest::MemoryUserKernelIsolation
+            | BuildGuestTest::MemorySharedMemoryObject
+            | BuildGuestTest::TaskSyscallSmoke
+            | BuildGuestTest::TaskSyscallSanitize
+            | BuildGuestTest::TaskUserException
+            | BuildGuestTest::IpcBlockingSmoke
+            | BuildGuestTest::AtomicWaitWake => {
+                unreachable!("primordial runtime requires a primordial selector")
+            }
         };
         Self {
             expectation,
