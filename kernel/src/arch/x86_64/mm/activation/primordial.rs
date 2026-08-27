@@ -2212,7 +2212,8 @@ struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_
     #[cfg(any(
         deepwyrm_wyr1_evidence,
         deepwyrm_dw1b_evidence,
-        deepwyrm_wyr1b_evidence
+        deepwyrm_wyr1b_evidence,
+        deepwyrm_dw1c_evidence
     ))]
     evidence_init_process: Option<ProcessKey>,
     #[cfg(deepwyrm_wyr1b_evidence)]
@@ -5562,7 +5563,8 @@ const fn dw1b_evidence_detail(error: crate::test_support::Dw1bEvidenceError) -> 
 #[cfg(any(
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
-    deepwyrm_wyr1b_evidence
+    deepwyrm_wyr1b_evidence,
+    deepwyrm_dw1c_evidence
 ))]
 const fn evidence_process_create_detail(case: u32) -> u32 {
     #[cfg(deepwyrm_wyr1_evidence)]
@@ -6897,13 +6899,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                 #[cfg(any(
                     deepwyrm_wyr1_evidence,
                     deepwyrm_dw1b_evidence,
-                    deepwyrm_wyr1b_evidence
+                    deepwyrm_wyr1b_evidence,
+                    deepwyrm_dw1c_evidence
                 ))]
                 let creating_evidence_init = self.process == self.primordial_process;
                 #[cfg(any(
                     deepwyrm_wyr1_evidence,
                     deepwyrm_dw1b_evidence,
-                    deepwyrm_wyr1b_evidence
+                    deepwyrm_wyr1b_evidence,
+                    deepwyrm_dw1c_evidence
                 ))]
                 if creating_evidence_init && self.evidence_init_process.is_some() {
                     crate::test_support::complete_fail(evidence_process_create_detail(1))
@@ -6911,7 +6915,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                 #[cfg(any(
                     deepwyrm_wyr1_evidence,
                     deepwyrm_dw1b_evidence,
-                    deepwyrm_wyr1b_evidence
+                    deepwyrm_wyr1b_evidence,
+                    deepwyrm_dw1c_evidence
                 ))]
                 let mut committed_child = None;
                 #[cfg(any(
@@ -6936,7 +6941,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                 #[cfg(not(any(
                     deepwyrm_wyr1_evidence,
                     deepwyrm_dw1b_evidence,
-                    deepwyrm_wyr1b_evidence
+                    deepwyrm_wyr1b_evidence,
+                    deepwyrm_dw1c_evidence
                 )))]
                 let status = crate::syscall::process_create_with_root(
                     &mut user,
@@ -6954,7 +6960,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                 #[cfg(any(
                     deepwyrm_wyr1_evidence,
                     deepwyrm_dw1b_evidence,
-                    deepwyrm_wyr1b_evidence
+                    deepwyrm_wyr1b_evidence,
+                    deepwyrm_dw1c_evidence
                 ))]
                 if creating_evidence_init && status == DW_STATUS_SUCCESS {
                     self.evidence_init_process = Some(committed_child.unwrap_or_else(|| {
@@ -7176,6 +7183,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     self.observe_wyr1b_system_init_start()
                         .unwrap_or_else(|error| {
                             crate::test_support::complete_fail(wyr1b_submit_detail(error))
+                        });
+                }
+                #[cfg(deepwyrm_dw1c_evidence)]
+                if status == DW_STATUS_SUCCESS
+                    && self.process == self.primordial_process
+                    && self.evidence_init_process.is_some()
+                {
+                    crate::test_support::DW1C_EVIDENCE
+                        .install()
+                        .unwrap_or_else(|error| {
+                            crate::test_support::complete_fail(0x2810_c000 | error as u32)
                         });
                 }
                 NativeSyscallResult::returning(status)
