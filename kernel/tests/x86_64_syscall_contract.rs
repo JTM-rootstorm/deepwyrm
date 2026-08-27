@@ -1010,6 +1010,19 @@ fn wyr1_primordial_completion_failures_have_variant_specific_details() {
     assert!(runtime.contains("let exception_type = (application_code >> 14) & 0x0f;"));
     assert!(runtime.contains("(reason << 4) | exception_type"));
     assert!(runtime.contains("0x80 | (application_code & 0x3f)"));
+    let terminal_summary = runtime
+        .split_once("fn primordial_terminal_summary(")
+        .expect("primordial terminal summary")
+        .1
+        .split_once("const fn primordial_receive_failure_tag(")
+        .expect("terminal summary extent")
+        .0;
+    assert!(terminal_summary.contains("info.exception_type.0 > 0x0f"));
+    assert!(terminal_summary.contains("0xe0 | exception_type"));
+    assert!(terminal_summary.contains("return 0xfc;"));
+    assert!(terminal_summary.contains("0xfd"));
+    assert!(terminal_summary.contains("return 0xff;"));
+    assert!(!terminal_summary.contains("        0xfe\n"));
     assert!(runtime.contains("primordial_completion_case(error, terminal_info)"));
 }
 
