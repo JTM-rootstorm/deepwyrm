@@ -365,6 +365,14 @@ pub(crate) fn copy_wyr1_evidence_input<U: UserPageAccess, const N: usize>(
     copy_input(user, address, 1)
 }
 
+#[cfg(deepwyrm_wyr1b_evidence)]
+pub(crate) fn copy_wyr1b_evidence_input<U: UserPageAccess, const N: usize>(
+    user: &mut U,
+    address: DwUserAddress,
+) -> Result<[u8; N], DwStatus> {
+    copy_input(user, address, 1)
+}
+
 pub(crate) fn abi_get_info<U: UserPageAccess>(
     user: &mut U,
     out_info: DwUserAddress,
@@ -1810,7 +1818,11 @@ pub(crate) fn process_create_with_root<
 /// publish; it is not a completed-syscall notification. Any later invariant
 /// failure is terminal, so the captured identity cannot reach reporter
 /// authorization.
-#[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_dw1b_evidence))]
+#[cfg(any(
+    deepwyrm_wyr1_evidence,
+    deepwyrm_dw1b_evidence,
+    deepwyrm_wyr1b_evidence
+))]
 #[allow(
     clippy::too_many_arguments,
     reason = "the selector-local observer preserves the live F10 transaction boundaries"

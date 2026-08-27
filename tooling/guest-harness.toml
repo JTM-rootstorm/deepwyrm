@@ -162,4 +162,4 @@ state = "implemented"
 # distinct product/evidence contract and does not extend selector 25.
 [guest_test.bootstrap-registry-launch]
 id = 27
-state = "reserved"
+state = "implemented"

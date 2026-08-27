@@ -97,6 +97,8 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1B_EVIDENCE_NONCE");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1B_CHALLENGE_DIGEST");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1B_BOOTFS_MAX_PAGES");
+    println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1B_EVIDENCE_NONCE");
+    println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_c3_one_shot_ui)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_memory_guest)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_e7_guest)");
@@ -107,6 +109,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wrcap_relay)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1b_evidence)");
+    println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1b_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_integrated)");
     println!("cargo:rustc-cfg=deepwyrm_integrated");
 
@@ -183,6 +186,13 @@ fn run() -> Result<(), String> {
         .is_some_and(is_dw1b_evidence_selector)
     {
         println!("cargo:rustc-cfg=deepwyrm_dw1b_evidence");
+    }
+    if env::var("DEEPWYRM_GUEST_TEST_SELECTOR")
+        .ok()
+        .as_deref()
+        .is_some_and(is_wyr1b_evidence_selector)
+    {
+        println!("cargo:rustc-cfg=deepwyrm_wyr1b_evidence");
     }
 
     if required_env("TARGET")? != KERNEL_TARGET {
@@ -317,6 +327,10 @@ fn is_wyr1_evidence_selector(selector: &str) -> bool {
 
 fn is_dw1b_evidence_selector(selector: &str) -> bool {
     selector == "normal-preemption-up"
+}
+
+fn is_wyr1b_evidence_selector(selector: &str) -> bool {
+    selector == "bootstrap-registry-launch"
 }
 
 fn emit_e7_user_env(elf: &Path) {
@@ -900,6 +914,12 @@ fn configure_guest_test(harness_path: &Path) -> Result<(), String> {
             println!("cargo:rustc-env=DEEPWYRM_DW1B_CHALLENGE_DIGEST={digest}");
             println!("cargo:rustc-env=DEEPWYRM_DW1B_BOOTFS_MAX_PAGES={bootfs_pages}");
         }
+        if is_wyr1b_evidence_selector(&selector) {
+            let nonce = required_wyr1b_hex("DEEPWYRM_WYR1B_EVIDENCE_NONCE")?;
+            let bootfs_pages = required_wyr1b_bootfs_pages()?;
+            println!("cargo:rustc-env=DEEPWYRM_WYR1B_EVIDENCE_NONCE={nonce}");
+            println!("cargo:rustc-env=DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES={bootfs_pages}");
+        }
     }
     Ok(())
 }
@@ -920,6 +940,31 @@ fn required_dw1b_bootfs_pages() -> Result<String, String> {
 
 fn validate_dw1b_bootfs_pages(value: &str) -> Result<usize, String> {
     let name = "DEEPWYRM_DW1B_BOOTFS_MAX_PAGES";
+    let pages = value
+        .parse::<usize>()
+        .map_err(|_| format!("{name} must be canonical decimal"))?;
+    if pages == 0 || pages > 8192 || pages.to_string() != value {
+        return Err(format!("{name} must be canonical decimal in 1..=8192"));
+    }
+    Ok(pages)
+}
+
+fn required_wyr1b_hex(name: &str) -> Result<String, String> {
+    let value = env::var(name).map_err(|_| format!("bootstrap-registry-launch requires {name}"))?;
+    validate_upper_nonzero_hex_nonce(&value, name)?;
+    Ok(value)
+}
+
+fn required_wyr1b_bootfs_pages() -> Result<String, String> {
+    let name = "DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES";
+    let value = env::var(name)
+        .map_err(|_| format!("bootstrap-registry-launch requires measured {name}"))?;
+    validate_wyr1b_bootfs_pages(&value)?;
+    Ok(value)
+}
+
+fn validate_wyr1b_bootfs_pages(value: &str) -> Result<usize, String> {
+    let name = "DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES";
     let pages = value
         .parse::<usize>()
         .map_err(|_| format!("{name} must be canonical decimal"))?;
@@ -2075,6 +2120,34 @@ mod tests {
         }
         for invalid in ["", "0", "01", "+1", "8193", "not-pages"] {
             assert!(validate_dw1b_bootfs_pages(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn wyr1b_selector_nonce_and_bootfs_bound_are_exact() {
+        assert!(is_wyr1b_evidence_selector("bootstrap-registry-launch"));
+        assert!(!is_wyr1b_evidence_selector("permanent-supervisor-rrc"));
+        for valid in ["0000000000000001", "0123456789ABCDEF", "FFFFFFFFFFFFFFFF"] {
+            assert!(validate_upper_nonzero_hex_nonce(valid, "WYR1B").is_ok());
+        }
+        for invalid in [
+            "0000000000000000",
+            "0123456789abcdef",
+            "0123456789ABCDE",
+            "G123456789ABCDEF",
+        ] {
+            assert!(validate_upper_nonzero_hex_nonce(invalid, "WYR1B").is_err());
+        }
+        let manifest = include_str!("../tooling/guest-harness.toml");
+        assert_eq!(
+            select_guest_test(true, Some("bootstrap-registry-launch"), false, manifest),
+            Ok(Some(27))
+        );
+        for (value, pages) in [("1", 1), ("64", 64), ("8192", 8192)] {
+            assert_eq!(validate_wyr1b_bootfs_pages(value), Ok(pages));
+        }
+        for invalid in ["", "0", "01", "+1", "8193", "not-pages"] {
+            assert!(validate_wyr1b_bootfs_pages(invalid).is_err());
         }
     }
 

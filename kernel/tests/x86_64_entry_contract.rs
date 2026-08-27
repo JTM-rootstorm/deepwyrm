@@ -232,6 +232,7 @@ fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
         ("smp-runtime-acceptance", 23),
         ("native-userspace-capability", 24),
         ("normal-preemption-up", 26),
+        ("bootstrap-registry-launch", 27),
     ] {
         assert_eq!(
             kernel_build::select_guest_test(true, Some(selector), false, &harness),
@@ -245,7 +246,6 @@ fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
         "ipc-transfer-rollback",
         "wait-deadline-timer",
         "process-create-bootstrap",
-        "bootstrap-registry-launch",
     ] {
         assert!(
             kernel_build::select_guest_test(true, Some(selector), false, &harness).is_err(),
@@ -288,7 +288,8 @@ fn selector26_private_evidence_surface_is_isolated_and_terminally_ordered() {
     assert!(evidence.contains("pub(crate) const DW1B_EVIDENCE_RAW_SYSCALL: u32 = 0xffff_ff1a;"));
     assert!(!public_abi.contains("FFFF_FF1A"));
     assert!(!public_abi.contains("ffff_ff1a"));
-    assert!(debug.contains("deepwyrm_dw1b_evidence\n))]\nfn write_bounded_test_evidence_record"));
+    assert!(debug.contains("deepwyrm_dw1b_evidence"));
+    assert!(debug.contains("fn write_bounded_test_evidence_record"));
 
     let completion = terminal
         .find("pub(crate) fn complete_dw1b_evidence")
@@ -308,11 +309,50 @@ fn selector26_private_evidence_surface_is_isolated_and_terminally_ordered() {
     assert!(primordial.contains(".progress(self.process, exchange_count, digest)"));
     assert!(primordial.contains("g5_probe.accepts_completion(&completion)"));
     assert!(primordial.contains("complete_dw1b_evidence(permit)"));
-    assert!(syscall.contains("any(deepwyrm_wyr1_evidence, deepwyrm_dw1b_evidence)"));
+    assert!(syscall.contains("deepwyrm_dw1b_evidence"));
     assert!(syscall.contains("pub(crate) use adapters::process_create_with_root_observed;"));
-    assert!(
-        adapters.contains("#[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_dw1b_evidence))]\n#[allow(")
-    );
+    assert!(adapters.contains("process_create_with_root_observed"));
+}
+
+#[test]
+fn selector27_private_wrb1_relay_is_exact_and_outside_public_abi() {
+    let root = kernel_root();
+    let build = fs::read_to_string(root.join("build.rs")).expect("read kernel build");
+    let support =
+        fs::read_to_string(root.join("src/test_support/mod.rs")).expect("read test support");
+    let evidence = fs::read_to_string(root.join("src/test_support/wyr1b_evidence.rs"))
+        .expect("read selector-27 evidence");
+    let terminal =
+        fs::read_to_string(root.join("src/test_support/x86_64.rs")).expect("read terminal support");
+    let primordial = fs::read_to_string(root.join("src/arch/x86_64/mm/activation/primordial.rs"))
+        .expect("read primordial runtime");
+    let public_abi = fs::read_to_string(root.join("../abi/generated/deepwyrm_abi.rs"))
+        .expect("read generated ABI");
+
+    assert!(build.contains("selector == \"bootstrap-registry-launch\""));
+    assert!(build.contains("cargo:rustc-cfg=deepwyrm_wyr1b_evidence"));
+    assert!(support.contains("#[cfg(any(test, deepwyrm_wyr1b_evidence))]\nmod wyr1b_evidence;"));
+    assert!(evidence.contains("pub(crate) const WYR1B_EVIDENCE_RAW_SYSCALL: u32 = 0xffff_ff1b;"));
+    assert!(evidence.contains("WYR1B_EVIDENCE_RECORD_LEN: usize = 96"));
+    assert!(evidence.contains("WYR1B_EVIDENCE_RECORD_CAPACITY: usize = 14"));
+    assert!(evidence.contains("[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, TERMINAL_EVENT]"));
+    assert!(!public_abi.contains("FFFF_FF1B"));
+    assert!(!public_abi.contains("ffff_ff1b"));
+    assert!(primordial.contains("WYR1B_EVIDENCE"));
+    assert!(primordial.contains(".authorize_submission(self.process)"));
+    assert!(primordial.contains("Wyr1bRetirementFacts"));
+    assert!(primordial.contains("parse_wyr1b_bootfs_pages"));
+
+    let completion = terminal
+        .find("pub(crate) fn complete_wyr1b_evidence")
+        .expect("selector-27 terminal exists");
+    let evidence_write = terminal[completion..]
+        .find(".write_evidence(record)")
+        .expect("WRB1 evidence write exists");
+    let pass = terminal[completion..]
+        .find("CompletionOutcome::Pass")
+        .expect("selector-27 PASS exists");
+    assert!(evidence_write < pass, "WRB1 must precede PASS DWTEST1");
 }
 
 #[test]
@@ -422,7 +462,7 @@ fn wrcap_relay_is_selector_only_bounded_and_precedes_terminal_completion() {
     assert!(build.contains("cfg(deepwyrm_wrcap_relay)"));
     assert!(build.contains("selector == \"native-userspace-capability\""));
     assert!(support.contains(
-        "DWEVID1, WRCAP1, WYR1EVID1, and DWPRE1 terminal reporters are selector-exclusive"
+        "DWEVID1, WRCAP1, WYR1EVID1, DWPRE1, and WRB1 terminal reporters are selector-exclusive"
     ));
     assert!(support.contains("#[cfg(any(test, deepwyrm_wrcap_relay))]\nmod wrcap;"));
     assert!(relay.contains("const WRCAP_RECORD_COUNT: usize = 15;"));
@@ -575,10 +615,11 @@ fn g3_primordial_mapping_failures_remain_recoverable_and_rollback_owned_candidat
     );
     assert!(primordial.contains("cancel_zeroed(failure.into_grant())"));
     assert!(user_access.contains("cancel_zeroed(failure.into_grant())"));
+    assert!(primordial.contains("const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 17;"));
+    assert!(primordial.contains("deepwyrm_wyr1b_evidence"));
     assert!(
-        primordial.contains(
-            "deepwyrm_dw1b_evidence\n)))]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 17;"
-        )
+        primordial
+            .contains("const PRIMORDIAL_MAX_MAPPING_PAGES: usize = parse_wyr1b_bootfs_pages();")
     );
     assert!(
         primordial.contains(

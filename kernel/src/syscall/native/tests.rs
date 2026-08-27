@@ -221,6 +221,14 @@ impl NativeSyscallFrameRuntime for FrameRuntime {
         panic!("host frame fixture must not intercept selector-26 evidence")
     }
 
+    #[cfg(deepwyrm_wyr1b_evidence)]
+    fn intercept_wyr1b_evidence_raw(
+        &mut self,
+        _arguments: RawSyscallArguments,
+    ) -> NativeSyscallResult {
+        panic!("host frame fixture must not intercept selector-27 evidence")
+    }
+
     #[cfg(deepwyrm_wyr1_evidence)]
     fn intercept_wyr1_evidence_raw(
         &mut self,
@@ -350,6 +358,14 @@ impl NativeSyscallFrameRuntime for SuspendingRuntime {
         _arguments: RawSyscallArguments,
     ) -> NativeSyscallResult {
         panic!("suspending host fixture must not intercept selector-26 evidence")
+    }
+
+    #[cfg(deepwyrm_wyr1b_evidence)]
+    fn intercept_wyr1b_evidence_raw(
+        &mut self,
+        _arguments: RawSyscallArguments,
+    ) -> NativeSyscallResult {
+        panic!("suspending host fixture must not intercept selector-27 evidence")
     }
 
     #[cfg(deepwyrm_wyr1_evidence)]

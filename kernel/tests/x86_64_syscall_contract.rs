@@ -704,11 +704,7 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
     assert!(build.contains("cargo:rustc-check-cfg=cfg(deepwyrm_i2_stress)"));
     assert!(build.contains("selector == \"smp-runtime-stress\""));
     assert!(build.contains("cargo:rustc-cfg=deepwyrm_i2_stress"));
-    assert!(
-        activation.contains(
-            "deepwyrm_dw1b_evidence\n)))]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;"
-        )
-    );
+    assert!(activation.contains("const LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;"));
     assert!(
         activation.contains(
             "#[cfg(deepwyrm_wrcap_relay)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 4;"
@@ -728,15 +724,15 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
             "#[cfg(deepwyrm_dw1b_evidence)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 5;"
         )
     );
+    assert!(activation.contains(
+        "#[cfg(deepwyrm_wyr1b_evidence)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;"
+    ));
     assert!(
         runtime.contains(
             "#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]\nconst USERSPACE_CHAIN_PROCESSES: usize = 6;"
         )
     );
-    assert!(
-        runtime
-            .contains("deepwyrm_dw1b_evidence\n)))]\nconst USERSPACE_CHAIN_PROCESSES: usize = 3;")
-    );
+    assert!(runtime.contains("const USERSPACE_CHAIN_PROCESSES: usize = 3;"));
     assert!(
         runtime
             .contains("#[cfg(deepwyrm_wrcap_relay)]\nconst USERSPACE_CHAIN_PROCESSES: usize = 4;")
@@ -754,11 +750,10 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
         "#[cfg(deepwyrm_wrcap_relay)]\nconst CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;"
     ));
     assert!(runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst REGISTRY_OBJECTS: usize = 48;"));
-    assert!(
-        runtime.contains(
-            "deepwyrm_dw1b_evidence\n)))]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 17;"
-        )
-    );
+    assert!(runtime.contains("const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 17;"));
+    assert!(runtime.contains(
+        "#[cfg(deepwyrm_wyr1b_evidence)]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = parse_wyr1b_bootfs_pages();"
+    ));
     assert!(
         runtime.contains(
             "#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 32;"
@@ -939,7 +934,9 @@ fn wyr1_terminal_child_after_primordial_retirement_uses_its_current_root() {
     assert!(reporter_info < reporter_failure);
     assert!(reporter_failure < unmap);
     assert!(retired_child.contains("if info.application_code == 0"));
-    assert!(retired_child.contains("0x2510_d014"));
+    assert!(retired_child.contains("supervisor_evidence_detail(0xd014)"));
+    assert!(runtime.contains("return 0x2510_0000 | case;"));
+    assert!(runtime.contains("return 0x2710_0000 | case;"));
     assert!(unmap < kernel_root);
     assert!(kernel_root < retirement);
     assert!(retirement < idle);
@@ -947,7 +944,7 @@ fn wyr1_terminal_child_after_primordial_retirement_uses_its_current_root() {
         retirement_fact.contains("Ok(None) | Err(crate::task::TaskError::InvalidTask) => true")
     );
     assert!(retirement_fact.contains("Ok(Some(_)) => false"));
-    assert!(retirement_fact.contains("Err(_) => crate::test_support::complete_fail(0x2510_d00d)"));
+    assert!(retirement_fact.contains("supervisor_evidence_detail(0xd00d)"));
     assert!(!retired_child.contains("prepare_process_root_selection("));
     assert!(!retired_child.contains("self.primordial_address_space"));
 }

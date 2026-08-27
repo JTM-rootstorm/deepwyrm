@@ -177,6 +177,15 @@ if [ "$selector" = normal-preemption-up ]; then
         ''|0|*[!0-9]*) fail "DEEPWYRM_DW1B_BOOTFS_MAX_PAGES must be a positive decimal page count" ;;
     esac
 fi
+if [ "$selector" = bootstrap-registry-launch ]; then
+    wyr1b_nonce=${DEEPWYRM_WYR1B_EVIDENCE_NONCE:-}
+    wyr1b_pages=${DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES:-}
+    require_upper_hex_u64 DEEPWYRM_WYR1B_EVIDENCE_NONCE "$wyr1b_nonce"
+    case "$wyr1b_pages" in
+        ''|0|0*|*[!0-9]*) fail "DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES must be canonical decimal in 1..=8192" ;;
+    esac
+    [ "$wyr1b_pages" -le 8192 ] || fail "DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES must be canonical decimal in 1..=8192"
+fi
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 workspace=$(CDPATH='' cd -- "$script_dir/.." && pwd -P)

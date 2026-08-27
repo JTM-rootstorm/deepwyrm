@@ -230,6 +230,54 @@ fn selector_26_environment_is_validated_before_cargo_admission() {
 }
 
 #[test]
+fn selector_27_environment_is_validated_before_cargo_admission() {
+    let output = rejected_with_env(
+        &[
+            "host",
+            "test",
+            "-p",
+            "deepwyrm-kernel",
+            "--features",
+            "test-support",
+            "--lib",
+        ],
+        &[
+            ("DEEPWYRM_GUEST_TEST_SELECTOR", "bootstrap-registry-launch"),
+            ("DEEPWYRM_WYR1B_EVIDENCE_NONCE", "0123456789abcDEF"),
+            ("DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES", "64"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "DEEPWYRM_WYR1B_EVIDENCE_NONCE must be exactly 16 uppercase hexadecimal digits"
+        )
+    );
+
+    let output = rejected_with_env(
+        &[
+            "host",
+            "test",
+            "-p",
+            "deepwyrm-kernel",
+            "--features",
+            "test-support",
+            "--lib",
+        ],
+        &[
+            ("DEEPWYRM_GUEST_TEST_SELECTOR", "bootstrap-registry-launch"),
+            ("DEEPWYRM_WYR1B_EVIDENCE_NONCE", "0123456789ABCDEF"),
+            ("DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES", "not-pages"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES must be canonical decimal in 1..=8192")
+    );
+}
+
+#[test]
 fn both_toolchain_identities_pin_the_same_project_cargo_home() {
     for identity in [
         "tooling/host-rust-toolchain.toml",

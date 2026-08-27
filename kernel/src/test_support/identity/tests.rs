@@ -97,6 +97,11 @@ fn implemented_central_selectors_have_exact_kernel_identities() {
             BuildGuestTest::NormalPreemptionUp,
             26,
         ),
+        (
+            "bootstrap-registry-launch",
+            BuildGuestTest::BootstrapRegistryLaunch,
+            27,
+        ),
     ];
     for (selector, identity, id) in cases {
         assert_eq!(parse_known_selector(selector), identity);

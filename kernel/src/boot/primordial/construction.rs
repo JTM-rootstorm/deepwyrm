@@ -476,7 +476,7 @@ pub(crate) fn complete_primordial_launch<B: PrimordialCompletionBackend>(
 /// Selector-local split of the primordial completion contract. This validates
 /// the committed READY and structured zero exit without consuming the runtime
 /// authority that a live permanent-supervisor descendant still requires.
-#[cfg(deepwyrm_wyr1_evidence)]
+#[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
 pub(crate) fn validate_primordial_retirement_facts<B: PrimordialCompletionBackend>(
     backend: &mut B,
 ) -> Result<(), PrimordialCompletionError<B::Error>> {
