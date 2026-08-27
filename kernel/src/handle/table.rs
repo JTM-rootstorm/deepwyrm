@@ -747,6 +747,17 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
             .then_some(entry.reference.id())
     }
 
+    /// Selector 28 borrows a Process identity only after ordinary INSPECT
+    /// validation.  It retains no handle/object reference and cannot affect
+    /// the controller's ownership.
+    #[cfg(deepwyrm_dw1c_evidence)]
+    pub(crate) fn process_target_for_dw1c_evidence(&self, handle: DwHandle) -> Option<ObjectId> {
+        let entry = self.resolve_entry(handle).ok()?;
+        require_held(entry.rights, DW_RIGHT_INSPECT).ok()?;
+        (entry.reference.object_type() == deepwyrm_abi::DW_OBJECT_TYPE_PROCESS)
+            .then_some(entry.reference.id())
+    }
+
     pub(crate) fn close<const OBJECTS: usize>(
         &mut self,
         registry: &mut ObjectRegistry<OBJECTS>,

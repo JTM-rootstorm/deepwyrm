@@ -38,6 +38,7 @@ pub(crate) enum BuildGuestTest {
     PermanentSupervisorRrc,
     NormalPreemptionUp,
     BootstrapRegistryLaunch,
+    NormalPreemptionSmp,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,6 +105,7 @@ impl BuildGuestTest {
             Self::PermanentSupervisorRrc => 25,
             Self::NormalPreemptionUp => 26,
             Self::BootstrapRegistryLaunch => 27,
+            Self::NormalPreemptionSmp => 28,
         }
     }
 
@@ -143,6 +145,7 @@ impl BuildGuestTest {
                 | Self::PermanentSupervisorRrc
                 | Self::NormalPreemptionUp
                 | Self::BootstrapRegistryLaunch
+                | Self::NormalPreemptionSmp
         )
     }
 
@@ -256,6 +259,8 @@ const fn parse_known_selector(value: &str) -> BuildGuestTest {
         BuildGuestTest::NormalPreemptionUp
     } else if string_equals(value, "bootstrap-registry-launch") {
         BuildGuestTest::BootstrapRegistryLaunch
+    } else if string_equals(value, "normal-preemption-smp") {
+        BuildGuestTest::NormalPreemptionSmp
     } else {
         panic!("unknown build-selected guest test")
     }

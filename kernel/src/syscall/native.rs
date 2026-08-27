@@ -833,6 +833,16 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
         arguments: RawSyscallArguments,
     ) -> NativeSyscallResult;
 
+    /// Selector-28-only private ARM/PROGRESS/WORKLOAD_COMPLETE operation.
+    /// It is intentionally absent from generated ABI decode.
+    #[cfg(deepwyrm_dw1c_evidence)]
+    fn intercept_dw1c_evidence_raw(
+        &mut self,
+        _arguments: RawSyscallArguments,
+    ) -> NativeSyscallResult {
+        panic!("native runtime does not admit selector-28 evidence")
+    }
+
     fn authorize_return(
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
@@ -957,7 +967,8 @@ pub(crate) fn dispatch_frame<R: NativeSyscallFrameRuntime>(
     #[cfg(any(
         deepwyrm_wyr1_evidence,
         deepwyrm_dw1b_evidence,
-        deepwyrm_wyr1b_evidence
+        deepwyrm_wyr1b_evidence,
+        deepwyrm_dw1c_evidence
     ))]
     let result = match frame.request() {
         #[cfg(deepwyrm_wyr1_evidence)]
@@ -972,13 +983,18 @@ pub(crate) fn dispatch_frame<R: NativeSyscallFrameRuntime>(
         Some((id, arguments)) if id.0 == crate::test_support::WYR1B_EVIDENCE_RAW_SYSCALL => {
             runtime.intercept_wyr1b_evidence_raw(arguments)
         }
+        #[cfg(deepwyrm_dw1c_evidence)]
+        Some((id, arguments)) if id.0 == crate::test_support::DW1C_EVIDENCE_RAW_SYSCALL => {
+            runtime.intercept_dw1c_evidence_raw(arguments)
+        }
         Some((id, arguments)) => dispatch_native(runtime, id, arguments),
         None => NativeSyscallResult::returning(DW_STATUS_INVALID_ARGUMENT),
     };
     #[cfg(not(any(
         deepwyrm_wyr1_evidence,
         deepwyrm_dw1b_evidence,
-        deepwyrm_wyr1b_evidence
+        deepwyrm_wyr1b_evidence,
+        deepwyrm_dw1c_evidence
     )))]
     let result = match frame.request() {
         Some((id, arguments)) => dispatch_native(runtime, id, arguments),

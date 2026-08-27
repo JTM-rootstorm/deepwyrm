@@ -373,6 +373,14 @@ pub(crate) fn copy_wyr1b_evidence_input<U: UserPageAccess, const N: usize>(
     copy_input(user, address, 1)
 }
 
+#[cfg(deepwyrm_dw1c_evidence)]
+pub(crate) fn copy_dw1c_evidence_input<U: UserPageAccess, const N: usize>(
+    user: &mut U,
+    address: DwUserAddress,
+) -> Result<[u8; N], DwStatus> {
+    copy_input(user, address, 8)
+}
+
 pub(crate) fn abi_get_info<U: UserPageAccess>(
     user: &mut U,
     out_info: DwUserAddress,

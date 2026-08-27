@@ -15,12 +15,15 @@ use crate::debug::emit_early_raw_record;
     deepwyrm_wrcap_relay,
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
-    deepwyrm_wyr1b_evidence
+    deepwyrm_wyr1b_evidence,
+    deepwyrm_dw1c_evidence
 ))]
 use crate::debug::{TestSerialTransaction, begin_test_serial_transaction};
 
 #[cfg(deepwyrm_dw1b_evidence)]
 use super::dw1b_evidence::Dw1bEvidenceFlushPermit;
+#[cfg(deepwyrm_dw1c_evidence)]
+use super::{Dw1cEvidenceError, Dw1cEvidenceFlushPermit};
 #[cfg(deepwyrm_i1_evidence)]
 use super::{EvidenceFlushError, I1_EVIDENCE};
 #[cfg(deepwyrm_wrcap_relay)]
@@ -236,6 +239,49 @@ pub(crate) fn complete_wyr1b_evidence(permit: Wyr1bEvidenceFlushPermit<'_>) -> !
         Err(_) => halt_after_completion(),
     };
     complete(&mut transport, completion_record(outcome.0, outcome.1))
+}
+
+/// Selector 28 owns one uninterrupted transaction: all 46 kernel-authored
+/// DW1C records, then canonical DWTEST1 28/0, then the matching debug exit.
+#[cfg(deepwyrm_dw1c_evidence)]
+pub(crate) fn complete_dw1c_evidence(permit: Dw1cEvidenceFlushPermit<'_>) -> ! {
+    let mut transport = unsafe { QemuCompletionTransport::new() };
+    let outcome = match begin_test_serial_transaction() {
+        Ok(transaction) => {
+            transport.transaction = Some(transaction);
+            match permit.flush(|record| {
+                transport
+                    .transaction
+                    .as_mut()
+                    .expect("DW1C owns serial transaction")
+                    .write_evidence(record)
+                    .map_err(|_| ())
+            }) {
+                Ok(()) => (CompletionOutcome::Pass, 0),
+                Err(error) => (CompletionOutcome::Fail, dw1c_failure_detail(error)),
+            }
+        }
+        Err(_) => halt_after_completion(),
+    };
+    complete(&mut transport, completion_record(outcome.0, outcome.1))
+}
+
+#[cfg(deepwyrm_dw1c_evidence)]
+fn dw1c_failure_detail(error: Dw1cEvidenceError) -> u32 {
+    0x2810_f000
+        | match error {
+            Dw1cEvidenceError::Early => 1,
+            Dw1cEvidenceError::WrongReporter => 2,
+            Dw1cEvidenceError::Malformed => 3,
+            Dw1cEvidenceError::Duplicate => 4,
+            Dw1cEvidenceError::Full => 5,
+            Dw1cEvidenceError::Incomplete => 6,
+            Dw1cEvidenceError::Contradiction => 7,
+            Dw1cEvidenceError::WrongDigest => 8,
+            Dw1cEvidenceError::WrongActor => 9,
+            Dw1cEvidenceError::WrongGeneration => 10,
+            Dw1cEvidenceError::MissingKernelFact => 11,
+        }
 }
 
 /// Selector-25's sole kernel terminal for failures and panics. One atomic

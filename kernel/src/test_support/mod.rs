@@ -13,6 +13,8 @@
     all(deepwyrm_i1_evidence, deepwyrm_dw1b_evidence),
     all(deepwyrm_wrcap_relay, deepwyrm_dw1b_evidence),
     all(deepwyrm_wyr1_evidence, deepwyrm_dw1b_evidence),
+    all(deepwyrm_dw1b_evidence, deepwyrm_dw1c_evidence),
+    all(deepwyrm_wyr1b_evidence, deepwyrm_dw1c_evidence),
     all(deepwyrm_i1_evidence, deepwyrm_wyr1b_evidence),
     all(deepwyrm_wrcap_relay, deepwyrm_wyr1b_evidence),
     all(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence),
@@ -24,6 +26,8 @@ compile_error!(
 
 #[cfg(any(test, deepwyrm_dw1b_evidence))]
 mod dw1b_evidence;
+#[cfg(any(test, deepwyrm_dw1c_evidence))]
+mod dw1c_evidence;
 #[cfg(deepwyrm_i1_evidence)]
 mod evidence;
 mod identity;
@@ -60,10 +64,18 @@ pub(crate) use wrcap::{WRCAP_RECORD_LEN, WRCAP_RELAY, WrcapDrainAction, WrcapFlu
 
 #[cfg(deepwyrm_dw1b_evidence)]
 pub(crate) use dw1b_evidence::DW1B_EVIDENCE_RAW_SYSCALL;
+#[cfg(deepwyrm_dw1c_evidence)]
+pub(crate) use dw1c_evidence::DW1C_EVIDENCE_RAW_SYSCALL;
 #[cfg(deepwyrm_wyr1_evidence)]
 pub(crate) use wyr1_evidence::WYR1_EVIDENCE_RAW_SYSCALL;
 #[cfg(deepwyrm_wyr1b_evidence)]
 pub(crate) use wyr1b_evidence::WYR1B_EVIDENCE_RAW_SYSCALL;
+
+#[cfg(all(deepwyrm_dw1c_evidence, target_arch = "x86_64", target_os = "none"))]
+pub(crate) use dw1c_evidence::{
+    DW1C_ARM_BYTES, DW1C_EVIDENCE, DW1C_PROGRESS_MASK, Dw1cActor, Dw1cEvidenceError,
+    Dw1cEvidenceFlushPermit,
+};
 
 #[cfg(all(deepwyrm_dw1b_evidence, target_arch = "x86_64", target_os = "none"))]
 pub(crate) use dw1b_evidence::{
@@ -106,6 +118,8 @@ pub(crate) use evidence::{
 
 #[cfg(all(deepwyrm_dw1b_evidence, target_arch = "x86_64", target_os = "none"))]
 pub(crate) use x86_64::complete_dw1b_evidence;
+#[cfg(all(deepwyrm_dw1c_evidence, target_arch = "x86_64", target_os = "none"))]
+pub(crate) use x86_64::complete_dw1c_evidence;
 #[cfg(all(deepwyrm_wyr1_evidence, target_arch = "x86_64", target_os = "none"))]
 pub(crate) use x86_64::complete_wyr1_evidence;
 #[cfg(all(deepwyrm_wyr1b_evidence, target_arch = "x86_64", target_os = "none"))]
