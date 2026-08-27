@@ -555,7 +555,7 @@ fn h4_idle_publication_brackets_rescan_and_uses_only_coalesced_e1_wake() {
     let idle = source("src/arch/x86_64/idle.rs");
     for evidence in [
         "RendezvousMailbox",
-        "self.mailboxes[index].publish_wake()",
+        "self.mailboxes[index].try_publish_wake()",
         "faulted: AtomicBool",
         "self.faulted.store(true, Ordering::Release)",
         "super::ipi::LiveIpiVector::Rendezvous",
@@ -633,14 +633,30 @@ fn h4_idle_publication_brackets_rescan_and_uses_only_coalesced_e1_wake() {
 
     let execution = source("src/task/execution.rs");
     assert!(
-        execution.contains("let affinity = self.scheduler.wake_with_affinity(key)?;\n        super::notify_runnable_work(affinity);")
+        execution.contains(".wake_on(super::scheduler_requester_cpu(), key)?;\n        super::notify_runnable_work(publication.wake_affinity());")
     );
     assert!(
-        execution.contains("super::notify_runnable_work(None);\n        self.completed = true;")
+        execution.contains(".commit_on(\n                requester,")
+            && execution.contains(
+                "super::notify_runnable_work(publication.wake_affinity());\n        self.completed = true;"
+            )
     );
     let scheduler = source("src/task/scheduler.rs");
-    assert!(scheduler.contains("let affinity = entry.continuation_cpu;"));
+    assert!(scheduler.contains("continuation_bound: blocked.continuation_cpu.is_some(),"));
     assert!(scheduler.contains("complete_switch_on_with_runnable_publication"));
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    assert!(primordial.contains("crate::task::notify_completed_switch_runnable(published);"));
+    assert!(primordial.contains(
+        "runtime.service_pending_timer_expiries();\n                runtime\n                    .shared\n                    .execution\n                    .schedule_next_on(self.cpu)"
+    ));
+    assert!(primordial.contains(
+        ".current\n            };\n            crate::task::drain_runnable_work_notifications();"
+    ));
+    let task = source("src/task/mod.rs");
+    assert!(task.contains("static PENDING_GENERIC_RUNNABLE_WAKES"));
+    assert!(task.contains("for _ in 0..generic"));
+    let idle = source("src/arch/x86_64/idle.rs");
+    assert!(idle.contains("self.mailboxes[index].try_publish_wake()"));
 }
 
 #[test]

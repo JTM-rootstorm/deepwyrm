@@ -238,6 +238,37 @@ pub(crate) struct ScheduleDecision {
     pub(crate) cancelled_quantum: Option<SchedulerQuantumTicket>,
 }
 
+/// Scheduler-authoritative ownership published before an architecture wake.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RunnablePublication {
+    target: SchedulerCpuId,
+    continuation_bound: bool,
+}
+
+/// Exact identity of the most recently committed idle-steal migration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SchedulerMigrationRecord {
+    pub(crate) thread: ThreadKey,
+    pub(crate) source: SchedulerCpuId,
+    pub(crate) target: SchedulerCpuId,
+    pub(crate) generation: u64,
+    pub(crate) enqueue_generation: u64,
+}
+
+impl RunnablePublication {
+    pub(crate) const fn target(self) -> SchedulerCpuId {
+        self.target
+    }
+
+    pub(crate) const fn wake_affinity(self) -> Option<SchedulerCpuId> {
+        if self.continuation_bound {
+            Some(self.target)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IdleScheduleDecision {
     ContinueIdle,
@@ -270,10 +301,12 @@ struct QueueEntry {
     block_execution_generation: u64,
     continuation_cpu: Option<SchedulerCpuId>,
     continuation_generation: u64,
-    /// CPU attribution for DW1-A accounting only. The cooperative FIFO does
-    /// not consult this field when selecting work.
-    accounting_cpu: SchedulerCpuId,
+    target_cpu: SchedulerCpuId,
+    last_cpu: Option<SchedulerCpuId>,
+    eligibility_mask: u64,
     enqueue_generation: u64,
+    migration_generation: u64,
+    migration_eligibility_generation: u64,
     ready_at_ns: Option<u64>,
 }
 
@@ -341,10 +374,9 @@ pub(crate) struct SchedulerIdleAccountingToken {
 
 /// Bounded internal DW1-A telemetry for one logical CPU.
 ///
-/// `current_runnable` counts Runnable queue entries attributed to this CPU for
-/// instrumentation. Attribution does not constrain the cooperative FIFO's
-/// selection policy. Counters for later DW1 transitions remain zero until
-/// those transitions exist.
+/// `current_runnable` counts entries owned by this CPU's logical FIFO. Steal
+/// and migration counters advance together for the single C3 idle-migration
+/// transition; all fields remain checked and fail-stop on overflow.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct SchedulerCounters {
     pub(crate) current_runnable: u64,
@@ -373,6 +405,10 @@ enum SchedulerEvent {
     IdleEntry,
     QuantumExpiration,
     InvoluntaryPreemption,
+    StealIn,
+    StealOut,
+    MigrationIn,
+    MigrationOut,
 }
 
 impl SchedulerCounters {
@@ -385,6 +421,10 @@ impl SchedulerCounters {
             SchedulerEvent::IdleEntry => &mut self.idle_entries,
             SchedulerEvent::QuantumExpiration => &mut self.quantum_expirations,
             SchedulerEvent::InvoluntaryPreemption => &mut self.involuntary_preemptions,
+            SchedulerEvent::StealIn => &mut self.steals_in,
+            SchedulerEvent::StealOut => &mut self.steals_out,
+            SchedulerEvent::MigrationIn => &mut self.migrations_in,
+            SchedulerEvent::MigrationOut => &mut self.migrations_out,
         };
         let Some(next) = counter.checked_add(1) else {
             self.overflow_fault = true;
@@ -461,16 +501,10 @@ impl SchedulerAccounting {
 
     fn observe_ready_delay(
         &mut self,
-        ready_cpu: SchedulerCpuId,
         dispatch_cpu: SchedulerCpuId,
         ready_at_ns: Option<u64>,
         dispatch_at_ns: Option<u64>,
     ) -> Result<(), SchedulerError> {
-        // CPU-local watermarks establish order only within one CPU. A sample
-        // from another CPU is not a truthful ready-delay comparison.
-        if ready_cpu != dispatch_cpu {
-            return Ok(());
-        }
         match (ready_at_ns, dispatch_at_ns) {
             (Some(ready_at_ns), Some(dispatch_at_ns)) => self
                 .counters_mut(dispatch_cpu)
@@ -511,6 +545,8 @@ struct SchedulerState<const CAPACITY: usize> {
     next_token: u64,
     next_execution_generation: u64,
     next_enqueue_generation: u64,
+    next_migration_generation: u64,
+    next_migration_eligibility_generation: u64,
     next_idle_generation: u64,
     next_quantum_generation: [u64; H2_SCHEDULER_CPU_CAPACITY],
     queue: [Option<QueueEntry>; CAPACITY],
@@ -521,9 +557,11 @@ struct SchedulerState<const CAPACITY: usize> {
     accounting: SchedulerAccounting,
     active_idle: [Option<SchedulerIdleAccountingToken>; H2_SCHEDULER_CPU_CAPACITY],
     instrumentation_now_ns: [Option<u64>; H2_SCHEDULER_CPU_CAPACITY],
+    instrumentation_global_now_ns: Option<u64>,
     quantum: [Option<SchedulerQuantumTicket>; H2_SCHEDULER_CPU_CAPACITY],
     need_resched: [Option<SchedulerQuantumTicket>; H2_SCHEDULER_CPU_CAPACITY],
     preemption_disable_depth: [u32; H2_SCHEDULER_CPU_CAPACITY],
+    last_migration: Option<SchedulerMigrationRecord>,
     carrier_admission: CarrierAdmissionState,
     #[cfg(test)]
     trace: SchedulerTrace,
@@ -536,6 +574,8 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             next_token: 1,
             next_execution_generation: 1,
             next_enqueue_generation: 1,
+            next_migration_generation: 1,
+            next_migration_eligibility_generation: 1,
             next_idle_generation: 1,
             next_quantum_generation: [1; H2_SCHEDULER_CPU_CAPACITY],
             queue: [None; CAPACITY],
@@ -546,9 +586,11 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             accounting: SchedulerAccounting::default(),
             active_idle: [None; H2_SCHEDULER_CPU_CAPACITY],
             instrumentation_now_ns: [None; H2_SCHEDULER_CPU_CAPACITY],
+            instrumentation_global_now_ns: None,
             quantum: [None; H2_SCHEDULER_CPU_CAPACITY],
             need_resched: [None; H2_SCHEDULER_CPU_CAPACITY],
             preemption_disable_depth: [0; H2_SCHEDULER_CPU_CAPACITY],
+            last_migration: None,
             carrier_admission: CarrierAdmissionState::new(),
             #[cfg(test)]
             trace: SchedulerTrace::new(),
@@ -642,12 +684,94 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         removed
     }
 
-    fn claim_first_runnable(&mut self) -> Result<Option<RunningClaim>, SchedulerError> {
-        let Some(index) = self.queue[..self.len].iter().position(|entry| {
-            entry.is_some_and(|entry| {
-                entry.state == SchedulerThreadState::Runnable && entry.continuation_cpu.is_none()
+    fn schedulable_mask(&self) -> u64 {
+        if self.carrier_admission.enforced {
+            self.carrier_admission.schedulable_mask
+        } else {
+            (1_u64 << H2_SCHEDULER_CPU_CAPACITY) - 1
+        }
+    }
+
+    fn cpu_admissible(&self, cpu: SchedulerCpuId, eligibility_mask: u64) -> bool {
+        let bit = 1_u64 << cpu.index();
+        self.schedulable_mask() & eligibility_mask & bit != 0
+    }
+
+    fn select_placement(
+        &self,
+        entry: QueueEntry,
+        requester: SchedulerCpuId,
+    ) -> Option<SchedulerCpuId> {
+        if let Some(continuation_cpu) = entry.continuation_cpu {
+            return self
+                .cpu_admissible(continuation_cpu, entry.eligibility_mask)
+                .then_some(continuation_cpu);
+        }
+        entry
+            .last_cpu
+            .filter(|cpu| self.cpu_admissible(*cpu, entry.eligibility_mask))
+            .or_else(|| {
+                self.cpu_admissible(requester, entry.eligibility_mask)
+                    .then_some(requester)
             })
-        }) else {
+            .or_else(|| {
+                (0..H2_SCHEDULER_CPU_CAPACITY)
+                    .filter_map(SchedulerCpuId::new)
+                    .find(|cpu| self.cpu_admissible(*cpu, entry.eligibility_mask))
+            })
+    }
+
+    fn first_local_runnable_index(&self, cpu: SchedulerCpuId) -> Option<usize> {
+        self.queue[..self.len].iter().position(|entry| {
+            entry.is_some_and(|entry| {
+                entry.state == SchedulerThreadState::Runnable
+                    && entry.target_cpu == cpu
+                    && entry.continuation_cpu.is_none()
+            })
+        })
+    }
+
+    /// Revalidates every migration exclusion represented by scheduler state.
+    /// Root/scratch execution pins and rendezvous ownership are confined to a
+    /// Running or suspended generation, so the exact disjointness checks here
+    /// reject those states without acquiring their separate authorities.
+    fn entry_migratable(
+        &self,
+        entry: QueueEntry,
+        victim: SchedulerCpuId,
+        target: SchedulerCpuId,
+    ) -> bool {
+        entry.state == SchedulerThreadState::Runnable
+            && entry.target_cpu == victim
+            && entry.token == 0
+            && entry.block_cpu.is_none()
+            && entry.block_execution_generation == 0
+            && entry.continuation_cpu.is_none()
+            && entry.continuation_generation == 0
+            && entry.migration_eligibility_generation != 0
+            && self.cpu_admissible(target, entry.eligibility_mask)
+            && !self
+                .running
+                .iter()
+                .flatten()
+                .any(|claim| claim.thread == entry.thread)
+            && !self
+                .pending_block
+                .iter()
+                .flatten()
+                .any(|pending| pending.thread == entry.thread)
+            && !self
+                .suspended
+                .iter()
+                .flatten()
+                .any(|suspended| suspended.thread == entry.thread)
+    }
+
+    fn claim_first_runnable_on(
+        &mut self,
+        cpu: SchedulerCpuId,
+    ) -> Result<Option<RunningClaim>, SchedulerError> {
+        let Some(index) = self.first_local_runnable_index(cpu) else {
             return Ok(None);
         };
         let generation = self.mint_execution_generation()?;
@@ -666,6 +790,7 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         let Some(index) = self.queue[..self.len].iter().position(|entry| {
             entry.is_some_and(|entry| {
                 entry.state == SchedulerThreadState::Runnable
+                    && entry.target_cpu == cpu
                     && (entry.continuation_cpu.is_none() || entry.continuation_cpu == Some(cpu))
             })
         }) else {
@@ -689,6 +814,56 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         }))
     }
 
+    fn steal_oldest_for(&mut self, target: SchedulerCpuId) -> Result<bool, SchedulerError> {
+        let mask = self.schedulable_mask();
+        for offset in 1..H2_SCHEDULER_CPU_CAPACITY {
+            let victim_index = (target.index() + offset) % H2_SCHEDULER_CPU_CAPACITY;
+            if mask & (1_u64 << victim_index) == 0 {
+                continue;
+            }
+            let victim = SchedulerCpuId::new(victim_index).expect("bounded scheduler CPU index");
+            let Some(index) = self.queue[..self.len].iter().position(|entry| {
+                entry.is_some_and(|entry| self.entry_migratable(entry, victim, target))
+            }) else {
+                continue;
+            };
+
+            let generation = self.next_migration_generation;
+            let next_generation = generation
+                .checked_add(1)
+                .filter(|next| *next != 0)
+                .ok_or(SchedulerError::TokenExhausted)?;
+            let mut accounting = self.accounting;
+            let result = accounting
+                .decrement_runnable(victim)
+                .and_then(|()| accounting.increment_runnable(target))
+                .and_then(|()| accounting.increment(victim, SchedulerEvent::StealOut))
+                .and_then(|()| accounting.increment(target, SchedulerEvent::StealIn))
+                .and_then(|()| accounting.increment(victim, SchedulerEvent::MigrationOut))
+                .and_then(|()| accounting.increment(target, SchedulerEvent::MigrationIn));
+            if let Err(error) = result {
+                self.reject_accounting(accounting, error);
+                return Err(error);
+            }
+            let entry = self.queue[index]
+                .as_mut()
+                .expect("validated migration source remains queued");
+            entry.target_cpu = target;
+            entry.migration_generation = generation;
+            self.last_migration = Some(SchedulerMigrationRecord {
+                thread: entry.thread,
+                source: victim,
+                target,
+                generation,
+                enqueue_generation: entry.enqueue_generation,
+            });
+            self.next_migration_generation = next_generation;
+            self.accounting = accounting;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     fn running_cpu(&self, thread: ThreadKey) -> Option<SchedulerCpuId> {
         self.running
             .iter()
@@ -699,6 +874,15 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
     fn mint_execution_generation(&mut self) -> Result<u64, SchedulerError> {
         let generation = self.next_execution_generation;
         self.next_execution_generation = generation
+            .checked_add(1)
+            .filter(|next| *next != 0)
+            .ok_or(SchedulerError::TokenExhausted)?;
+        Ok(generation)
+    }
+
+    fn mint_migration_eligibility_generation(&mut self) -> Result<u64, SchedulerError> {
+        let generation = self.next_migration_eligibility_generation;
+        self.next_migration_eligibility_generation = generation
             .checked_add(1)
             .filter(|next| *next != 0)
             .ok_or(SchedulerError::TokenExhausted)?;
@@ -873,6 +1057,12 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             if entry.continuation_cpu.is_some() != (entry.continuation_generation != 0) {
                 return Err(SchedulerError::StaleExecutionClaim);
             }
+            if entry.state == SchedulerThreadState::Runnable
+                && entry.continuation_cpu.is_none()
+                && entry.migration_eligibility_generation == 0
+            {
+                return Err(SchedulerError::StaleExecutionClaim);
+            }
             if self
                 .running
                 .iter()
@@ -892,7 +1082,7 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
                 .iter()
                 .flatten()
                 .filter(|entry| {
-                    entry.state == SchedulerThreadState::Runnable && entry.accounting_cpu == cpu
+                    entry.state == SchedulerThreadState::Runnable && entry.target_cpu == cpu
                 })
                 .count() as u64;
             if self.accounting.cpu[cpu_index].current_runnable != runnable {
@@ -949,8 +1139,12 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             block_execution_generation: 0,
             continuation_cpu: None,
             continuation_generation: 0,
-            accounting_cpu: SchedulerCpuId::BOOTSTRAP,
+            target_cpu: SchedulerCpuId::BOOTSTRAP,
+            last_cpu: None,
+            eligibility_mask: (1_u64 << H2_SCHEDULER_CPU_CAPACITY) - 1,
             enqueue_generation: 0,
+            migration_generation: 0,
+            migration_eligibility_generation: 0,
             ready_at_ns: None,
         })?;
         state.next_token = next_token;
@@ -965,7 +1159,15 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     pub(crate) fn commit(
         &self,
         reservation: SchedulerReservation,
-    ) -> Result<(), SchedulerReservationFailure> {
+    ) -> Result<RunnablePublication, SchedulerReservationFailure> {
+        self.commit_on(SchedulerCpuId::BOOTSTRAP, reservation)
+    }
+
+    pub(crate) fn commit_on(
+        &self,
+        requester: SchedulerCpuId,
+        reservation: SchedulerReservation,
+    ) -> Result<RunnablePublication, SchedulerReservationFailure> {
         let mut state = self.state.lock();
         if reservation.domain != state.domain {
             return Err(SchedulerReservationFailure {
@@ -1002,30 +1204,54 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                     thread: reservation.thread,
                 },
             })?;
+        let reserved = state.queue[index].expect("validated scheduler reservation remains queued");
+        let Some(target) = state.select_placement(reserved, requester) else {
+            return Err(SchedulerReservationFailure {
+                error: SchedulerError::CarrierUnavailable,
+                reservation,
+            });
+        };
+        let eligibility_generation = state.next_migration_eligibility_generation;
+        let next_eligibility_generation = eligibility_generation
+            .checked_add(1)
+            .filter(|next| *next != 0)
+            .ok_or(SchedulerReservationFailure {
+                error: SchedulerError::TokenExhausted,
+                reservation: SchedulerReservation {
+                    domain: reservation.domain,
+                    token: reservation.token,
+                    thread: reservation.thread,
+                },
+            })?;
         let mut accounting = state.accounting;
-        if let Err(error) = accounting.increment_runnable(SchedulerCpuId::BOOTSTRAP) {
+        if let Err(error) = accounting.increment_runnable(target) {
             state.reject_accounting(accounting, error);
             return Err(SchedulerReservationFailure { error, reservation });
         }
-        let ready_at_ns = state.instrumentation_now_ns[SchedulerCpuId::BOOTSTRAP.index()];
+        let ready_at_ns = state.instrumentation_global_now_ns;
         let entry = state.queue[index]
             .as_mut()
             .expect("validated scheduler reservation remains queued");
         entry.state = SchedulerThreadState::Runnable;
         entry.token = 0;
-        entry.accounting_cpu = SchedulerCpuId::BOOTSTRAP;
+        entry.target_cpu = target;
         entry.enqueue_generation = enqueue_generation;
+        entry.migration_eligibility_generation = eligibility_generation;
         entry.ready_at_ns = ready_at_ns;
         state.next_enqueue_generation = next_enqueue_generation;
+        state.next_migration_eligibility_generation = next_eligibility_generation;
         state.accounting = accounting;
         state.record_trace(
             SchedulerTraceKind::Runnable,
-            SchedulerCpuId::BOOTSTRAP,
+            target,
             Some(reservation.thread),
             enqueue_generation,
         );
         state.assert_invariants();
-        Ok(())
+        Ok(RunnablePublication {
+            target,
+            continuation_bound: false,
+        })
     }
 
     pub(crate) fn cancel(
@@ -1056,7 +1282,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         Ok(())
     }
 
-    /// Atomically claims the oldest unowned Runnable Thread for `cpu`.
+    /// Atomically claims the oldest local Runnable Thread, stealing at most
+    /// one oldest eligible entry through one bounded cyclic victim scan.
     pub(crate) fn schedule_next_on(
         &self,
         cpu: SchedulerCpuId,
@@ -1077,23 +1304,27 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         if state.active_idle[cpu_index].is_some() {
             return Err(SchedulerError::IdleAccountingActive);
         }
+        if state.first_local_runnable_index(cpu).is_none() {
+            state.steal_oldest_for(cpu)?;
+        }
         let next_entry = state.queue[..state.len]
             .iter()
             .flatten()
             .find(|entry| {
-                entry.state == SchedulerThreadState::Runnable && entry.continuation_cpu.is_none()
+                entry.state == SchedulerThreadState::Runnable
+                    && entry.target_cpu == cpu
+                    && entry.continuation_cpu.is_none()
             })
             .copied();
         let mut accounting = state.accounting;
         let accounting_result = if let Some(entry) = next_entry {
             accounting
-                .decrement_runnable(entry.accounting_cpu)
+                .decrement_runnable(entry.target_cpu)
                 .and_then(|()| {
                     accounting.observe_ready_delay(
-                        entry.accounting_cpu,
                         cpu,
                         entry.ready_at_ns,
-                        state.instrumentation_now_ns[cpu_index],
+                        state.instrumentation_global_now_ns,
                     )
                 })
                 .and_then(|()| accounting.increment(cpu, SchedulerEvent::ContextSwitch))
@@ -1104,7 +1335,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             state.reject_accounting(accounting, error);
             return Err(error);
         }
-        let current = state.claim_first_runnable()?;
+        let current = state.claim_first_runnable_on(cpu)?;
         state.running[cpu_index] = current;
         state.accounting = accounting;
         if let Some(current) = current {
@@ -1154,7 +1385,9 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             .iter()
             .flatten()
             .find(|entry| {
-                entry.state == SchedulerThreadState::Runnable && entry.continuation_cpu.is_none()
+                entry.state == SchedulerThreadState::Runnable
+                    && entry.target_cpu == cpu
+                    && entry.continuation_cpu.is_none()
             })
             .copied();
         let mut accounting = state.accounting;
@@ -1177,13 +1410,12 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             .filter(|next| *next != 0)
             .ok_or(SchedulerError::TokenExhausted)?;
         let accounting_result = accounting
-            .decrement_runnable(next_entry.accounting_cpu)
+            .decrement_runnable(next_entry.target_cpu)
             .and_then(|()| {
                 accounting.observe_ready_delay(
-                    next_entry.accounting_cpu,
                     cpu,
                     next_entry.ready_at_ns,
-                    state.instrumentation_now_ns[cpu_index],
+                    state.instrumentation_global_now_ns,
                 )
             })
             .and_then(|()| accounting.increment_runnable(cpu))
@@ -1194,11 +1426,11 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             return Err(error);
         }
         let next = state
-            .claim_first_runnable()?
+            .claim_first_runnable_on(cpu)?
             .expect("validated Runnable entry remains claimable");
         let cancelled_quantum = state.clear_preemption_on(cpu);
         state.running[cpu_index] = Some(next);
-        let ready_at_ns = state.instrumentation_now_ns[cpu_index];
+        let ready_at_ns = state.instrumentation_global_now_ns;
         state
             .push(QueueEntry {
                 thread,
@@ -1208,8 +1440,12 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 block_execution_generation: 0,
                 continuation_cpu: Some(cpu),
                 continuation_generation: previous_claim.generation,
-                accounting_cpu: cpu,
+                target_cpu: cpu,
+                last_cpu: Some(cpu),
+                eligibility_mask: (1_u64 << H2_SCHEDULER_CPU_CAPACITY) - 1,
                 enqueue_generation,
+                migration_generation: 0,
+                migration_eligibility_generation: 0,
                 ready_at_ns,
             })
             .expect("replacing one Running Thread preserves scheduler capacity");
@@ -1383,7 +1619,9 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             .iter()
             .flatten()
             .find(|entry| {
-                entry.state == SchedulerThreadState::Runnable && entry.continuation_cpu.is_none()
+                entry.state == SchedulerThreadState::Runnable
+                    && entry.target_cpu == cpu
+                    && entry.continuation_cpu.is_none()
             })
             .copied()
         else {
@@ -1399,13 +1637,12 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             .ok_or(SchedulerError::TokenExhausted)?;
         let mut accounting = state.accounting;
         let accounting_result = accounting
-            .decrement_runnable(next_entry.accounting_cpu)
+            .decrement_runnable(next_entry.target_cpu)
             .and_then(|()| {
                 accounting.observe_ready_delay(
-                    next_entry.accounting_cpu,
                     cpu,
                     next_entry.ready_at_ns,
-                    state.instrumentation_now_ns[cpu_index],
+                    state.instrumentation_global_now_ns,
                 )
             })
             .and_then(|()| accounting.increment_runnable(cpu))
@@ -1415,10 +1652,10 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             return Err(error);
         }
         let next = state
-            .claim_first_runnable()?
+            .claim_first_runnable_on(cpu)?
             .expect("validated normal Runnable peer remains claimable");
         state.running[cpu_index] = Some(next);
-        let ready_at_ns = state.instrumentation_now_ns[cpu_index];
+        let ready_at_ns = state.instrumentation_global_now_ns;
         state
             .push(QueueEntry {
                 thread: current.thread,
@@ -1428,8 +1665,12 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 block_execution_generation: 0,
                 continuation_cpu: Some(cpu),
                 continuation_generation: current.generation,
-                accounting_cpu: cpu,
+                target_cpu: cpu,
+                last_cpu: Some(cpu),
+                eligibility_mask: (1_u64 << H2_SCHEDULER_CPU_CAPACITY) - 1,
                 enqueue_generation,
+                migration_generation: 0,
+                migration_eligibility_generation: 0,
                 ready_at_ns,
             })
             .expect("replacing one Running Thread preserves scheduler capacity");
@@ -1563,20 +1804,21 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             .iter()
             .flatten()
             .find(|entry| {
-                entry.state == SchedulerThreadState::Runnable && entry.continuation_cpu.is_none()
+                entry.state == SchedulerThreadState::Runnable
+                    && entry.target_cpu == cpu
+                    && entry.continuation_cpu.is_none()
             })
             .copied();
         let mut accounting = state.accounting;
         let mut accounting_result = accounting.increment(cpu, SchedulerEvent::VoluntaryBlock);
         if let Some(entry) = next_entry {
             accounting_result = accounting_result
-                .and_then(|()| accounting.decrement_runnable(entry.accounting_cpu))
+                .and_then(|()| accounting.decrement_runnable(entry.target_cpu))
                 .and_then(|()| {
                     accounting.observe_ready_delay(
-                        entry.accounting_cpu,
                         cpu,
                         entry.ready_at_ns,
-                        state.instrumentation_now_ns[cpu_index],
+                        state.instrumentation_global_now_ns,
                     )
                 });
         }
@@ -1586,7 +1828,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             state.reject_accounting(accounting, error);
             return Err(BlockReservationFailure { error, reservation });
         }
-        let current = match state.claim_first_runnable() {
+        let current = match state.claim_first_runnable_on(cpu) {
             Ok(current) => current,
             Err(error) => return Err(BlockReservationFailure { error, reservation }),
         };
@@ -1602,8 +1844,12 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 block_execution_generation: reservation.key.execution_generation,
                 continuation_cpu: Some(cpu),
                 continuation_generation: reservation.key.execution_generation,
-                accounting_cpu: cpu,
+                target_cpu: cpu,
+                last_cpu: Some(cpu),
+                eligibility_mask: (1_u64 << H2_SCHEDULER_CPU_CAPACITY) - 1,
                 enqueue_generation: 0,
+                migration_generation: 0,
+                migration_eligibility_generation: 0,
                 ready_at_ns: None,
             })
             .expect("moving one Running Thread to the queue preserves scheduler capacity");
@@ -1650,6 +1896,15 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         &self,
         key: BlockWakeKey,
     ) -> Result<Option<SchedulerCpuId>, SchedulerError> {
+        self.wake_on(key.cpu, key)
+            .map(RunnablePublication::wake_affinity)
+    }
+
+    pub(crate) fn wake_on(
+        &self,
+        requester: SchedulerCpuId,
+        key: BlockWakeKey,
+    ) -> Result<RunnablePublication, SchedulerError> {
         let mut state = self.state.lock();
         if key.domain != state.domain {
             return Err(SchedulerError::ForeignBlockToken);
@@ -1665,6 +1920,20 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         }) else {
             return Err(SchedulerError::StaleBlockToken);
         };
+        let blocked = state.queue[index].expect("validated blocked scheduler entry remains queued");
+        let Some(target) = state.select_placement(blocked, requester) else {
+            return Err(SchedulerError::CarrierUnavailable);
+        };
+        let eligibility = if blocked.continuation_cpu.is_none() {
+            let generation = state.next_migration_eligibility_generation;
+            let next = generation
+                .checked_add(1)
+                .filter(|next| *next != 0)
+                .ok_or(SchedulerError::TokenExhausted)?;
+            Some((generation, next))
+        } else {
+            None
+        };
         let mut accounting = state.accounting;
         let enqueue_generation = state.next_enqueue_generation;
         let next_enqueue_generation = enqueue_generation
@@ -1672,13 +1941,13 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             .filter(|next| *next != 0)
             .ok_or(SchedulerError::TokenExhausted)?;
         let accounting_result = accounting
-            .increment_runnable(key.cpu)
-            .and_then(|()| accounting.increment(key.cpu, SchedulerEvent::Wakeup));
+            .increment_runnable(target)
+            .and_then(|()| accounting.increment(requester, SchedulerEvent::Wakeup));
         if let Err(error) = accounting_result {
             state.reject_accounting(accounting, error);
             return Err(error);
         }
-        let ready_at_ns = state.instrumentation_now_ns[key.cpu.index()];
+        let ready_at_ns = state.instrumentation_global_now_ns;
         let entry = state.queue[index]
             .as_mut()
             .expect("validated blocked scheduler entry remains queued");
@@ -1686,20 +1955,26 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         entry.token = 0;
         entry.block_cpu = None;
         entry.block_execution_generation = 0;
-        entry.accounting_cpu = key.cpu;
+        entry.target_cpu = target;
         entry.enqueue_generation = enqueue_generation;
+        entry.migration_eligibility_generation = eligibility.map_or(0, |value| value.0);
         entry.ready_at_ns = ready_at_ns;
-        let affinity = entry.continuation_cpu;
         state.next_enqueue_generation = next_enqueue_generation;
+        if let Some((_, next)) = eligibility {
+            state.next_migration_eligibility_generation = next;
+        }
         state.accounting = accounting;
         state.record_trace(
             SchedulerTraceKind::Wake,
-            key.cpu,
+            requester,
             Some(key.thread),
             key.execution_generation,
         );
         state.assert_invariants();
-        Ok(affinity)
+        Ok(RunnablePublication {
+            target,
+            continuation_bound: blocked.continuation_cpu.is_some(),
+        })
     }
 
     pub(crate) fn wake(&self, key: BlockWakeKey) -> Result<(), SchedulerError> {
@@ -1773,11 +2048,22 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         {
             return Err(SchedulerError::ContinuationOwned);
         }
+        let local_runnable = state.queue[..state.len].iter().any(|entry| {
+            entry.is_some_and(|entry| {
+                entry.state == SchedulerThreadState::Runnable
+                    && entry.target_cpu == cpu
+                    && (entry.continuation_cpu.is_none() || entry.continuation_cpu == Some(cpu))
+            })
+        });
+        if !local_runnable {
+            state.steal_oldest_for(cpu)?;
+        }
         let next_entry = state.queue[..state.len]
             .iter()
             .flatten()
             .find(|entry| {
                 entry.state == SchedulerThreadState::Runnable
+                    && entry.target_cpu == cpu
                     && (entry.continuation_cpu.is_none() || entry.continuation_cpu == Some(cpu))
             })
             .copied();
@@ -1787,13 +2073,12 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             return Ok(IdleScheduleDecision::ContinueIdle);
         };
         let mut accounting_result = accounting
-            .decrement_runnable(next_entry.accounting_cpu)
+            .decrement_runnable(next_entry.target_cpu)
             .and_then(|()| {
                 accounting.observe_ready_delay(
-                    next_entry.accounting_cpu,
                     cpu,
                     next_entry.ready_at_ns,
-                    state.instrumentation_now_ns[cpu_index],
+                    state.instrumentation_global_now_ns,
                 )
             });
         if next_entry.thread != suspended {
@@ -1848,7 +2133,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     pub(crate) fn complete_switch_on_with_runnable_publication(
         &self,
         claim: SchedulerExecutionClaim,
-    ) -> Result<bool, SchedulerError> {
+    ) -> Result<Option<RunnablePublication>, SchedulerError> {
         let mut state = self.state.lock();
         if claim.domain != state.domain {
             return Err(SchedulerError::ForeignExecutionClaim);
@@ -1864,25 +2149,37 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             return Err(SchedulerError::StaleExecutionClaim);
         }
         let published_runnable = if suspended.publication == SuspendedPublication::Queued {
-            let len = state.len;
-            let Some(entry) = state.queue[..len]
-                .iter_mut()
-                .flatten()
-                .find(|entry| entry.thread == claim.thread)
+            let Some(index) = state.queue[..state.len]
+                .iter()
+                .position(|entry| entry.is_some_and(|entry| entry.thread == claim.thread))
             else {
                 return Err(SchedulerError::NotScheduled);
             };
+            let queued = state.queue[index].expect("suspended queue entry remains present");
+            let eligibility_generation = if queued.state == SchedulerThreadState::Runnable {
+                state.mint_migration_eligibility_generation()?
+            } else {
+                0
+            };
+            let entry = state.queue[index]
+                .as_mut()
+                .expect("suspended queue entry remains present");
             if entry.continuation_cpu != Some(claim.cpu)
                 || entry.continuation_generation != claim.generation
             {
                 return Err(SchedulerError::StaleExecutionClaim);
             }
-            let published_runnable = entry.state == SchedulerThreadState::Runnable;
+            let publication =
+                (entry.state == SchedulerThreadState::Runnable).then_some(RunnablePublication {
+                    target: entry.target_cpu,
+                    continuation_bound: false,
+                });
             entry.continuation_cpu = None;
             entry.continuation_generation = 0;
-            published_runnable
+            entry.migration_eligibility_generation = eligibility_generation;
+            publication
         } else {
-            false
+            None
         };
         if suspended.involuntary_preemption {
             let mut accounting = state.accounting;
@@ -1919,6 +2216,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 .flatten()
                 .find(|entry| {
                     entry.state == SchedulerThreadState::Runnable
+                        && entry.target_cpu == cpu
                         && entry.continuation_cpu.is_none()
                 })
                 .copied();
@@ -1926,13 +2224,12 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             let mut accounting_result = accounting.increment(cpu, SchedulerEvent::ContextSwitch);
             if let Some(entry) = next_entry {
                 accounting_result = accounting_result
-                    .and_then(|()| accounting.decrement_runnable(entry.accounting_cpu))
+                    .and_then(|()| accounting.decrement_runnable(entry.target_cpu))
                     .and_then(|()| {
                         accounting.observe_ready_delay(
-                            entry.accounting_cpu,
                             cpu,
                             entry.ready_at_ns,
-                            state.instrumentation_now_ns[cpu_index],
+                            state.instrumentation_global_now_ns,
                         )
                     });
             }
@@ -1940,7 +2237,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 state.reject_accounting(accounting, error);
                 return Err(error);
             }
-            let current = state.claim_first_runnable()?;
+            let current = state.claim_first_runnable_on(cpu)?;
             if state.pending_block[cpu_index].is_some_and(|pending| pending.thread == thread) {
                 state.pending_block[cpu_index] = None;
             }
@@ -1998,6 +2295,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 .filter_map(|(_, entry)| *entry)
                 .find(|entry| {
                     entry.state == SchedulerThreadState::Runnable
+                        && entry.target_cpu == cpu
                         && entry.continuation_cpu.is_none()
                 });
             let will_claim = state.running[cpu_index].is_none() && next_entry.is_some();
@@ -2007,17 +2305,16 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             let mut accounting = state.accounting;
             let mut accounting_result = Ok(());
             if removed.state == SchedulerThreadState::Runnable {
-                accounting_result = accounting.decrement_runnable(removed.accounting_cpu);
+                accounting_result = accounting.decrement_runnable(removed.target_cpu);
             }
             if let Some(entry) = next_entry.filter(|_| will_claim) {
                 accounting_result = accounting_result
-                    .and_then(|()| accounting.decrement_runnable(entry.accounting_cpu))
+                    .and_then(|()| accounting.decrement_runnable(entry.target_cpu))
                     .and_then(|()| {
                         accounting.observe_ready_delay(
-                            entry.accounting_cpu,
                             cpu,
                             entry.ready_at_ns,
-                            state.instrumentation_now_ns[cpu_index],
+                            state.instrumentation_global_now_ns,
                         )
                     })
                     .and_then(|()| accounting.increment(cpu, SchedulerEvent::ContextSwitch));
@@ -2037,7 +2334,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 involuntary_preemption: false,
             });
             if state.running[cpu_index].is_none() {
-                state.running[cpu_index] = state.claim_first_runnable()?;
+                state.running[cpu_index] = state.claim_first_runnable_on(cpu)?;
             }
             state.accounting = accounting;
             state.record_trace(
@@ -2065,7 +2362,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         let removed = state.queue[index].expect("validated scheduler entry remains queued");
         let mut accounting = state.accounting;
         if removed.state == SchedulerThreadState::Runnable
-            && let Err(error) = accounting.decrement_runnable(removed.accounting_cpu)
+            && let Err(error) = accounting.decrement_runnable(removed.target_cpu)
         {
             state.reject_accounting(accounting, error);
             return Err(error);
@@ -2176,7 +2473,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         }
         let mut accounting = state.accounting;
         if entry.state == SchedulerThreadState::Runnable
-            && let Err(error) = accounting.decrement_runnable(entry.accounting_cpu)
+            && let Err(error) = accounting.decrement_runnable(entry.target_cpu)
         {
             state.reject_accounting(accounting, error);
             return Err(error);
@@ -2226,6 +2523,11 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         self.state.lock().accounting.cpu[cpu.index()]
     }
 
+    #[cfg(test)]
+    pub(crate) fn last_migration(&self) -> Option<SchedulerMigrationRecord> {
+        self.state.lock().last_migration
+    }
+
     /// Supplies a sampled monotonic-active timestamp for the immediately
     /// following instrumented scheduler transition. Sampling remains outside
     /// scheduler authority; regression is rejected before publication.
@@ -2240,6 +2542,11 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             return Err(SchedulerError::TimeRegression);
         }
         state.instrumentation_now_ns[cpu_index] = Some(now_ns);
+        state.instrumentation_global_now_ns = Some(
+            state
+                .instrumentation_global_now_ns
+                .map_or(now_ns, |global| global.max(now_ns)),
+        );
         state.assert_invariants();
         Ok(())
     }
@@ -2283,6 +2590,11 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         state.next_idle_generation = next_generation;
         state.active_idle[cpu_index] = Some(token);
         state.instrumentation_now_ns[cpu_index] = Some(started_at_ns);
+        state.instrumentation_global_now_ns = Some(
+            state
+                .instrumentation_global_now_ns
+                .map_or(started_at_ns, |global| global.max(started_at_ns)),
+        );
         state.accounting = accounting;
         state.record_trace(SchedulerTraceKind::IdleBegin, cpu, None, generation);
         state.assert_invariants();
@@ -2321,6 +2633,11 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         }
         state.active_idle[cpu_index] = None;
         state.instrumentation_now_ns[cpu_index] = Some(finished_at_ns);
+        state.instrumentation_global_now_ns = Some(
+            state
+                .instrumentation_global_now_ns
+                .map_or(finished_at_ns, |global| global.max(finished_at_ns)),
+        );
         state.accounting = accounting;
         state.record_trace(
             SchedulerTraceKind::IdleEnd,

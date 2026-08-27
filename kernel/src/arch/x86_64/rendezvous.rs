@@ -542,6 +542,16 @@ impl RendezvousMailbox {
         self.wake_pending.store(true, Ordering::Release);
     }
 
+    /// Claims an otherwise-empty Wake slot for generic idle distribution.
+    /// Exact-affinity publications may still coalesce onto an existing slot,
+    /// while generic publishers use this result to continue to another idle
+    /// CPU instead of repeatedly selecting the same mailbox.
+    pub(crate) fn try_publish_wake(&self) -> bool {
+        self.wake_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
     /// Acquires the published request before returning it to the target CPU.
     pub(crate) fn take_notification(&self) -> MailboxNotification {
         match self.state.load(Ordering::Acquire) {

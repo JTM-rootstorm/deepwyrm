@@ -367,10 +367,12 @@ pub(crate) fn dispatch_native<H: NativeSyscallHandler>(
     id: DwSyscallId,
     arguments: RawSyscallArguments,
 ) -> NativeSyscallResult {
-    match decode_native(id, arguments) {
+    let result = match decode_native(id, arguments) {
         Ok(request) => handler.handle(request),
         Err(status) => NativeSyscallResult::returning(status),
-    }
+    };
+    crate::task::drain_runnable_work_notifications();
+    result
 }
 
 pub(crate) trait NativeSyscallServices {

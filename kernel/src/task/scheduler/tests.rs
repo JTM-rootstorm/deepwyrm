@@ -368,7 +368,11 @@ fn reordered_per_cpu_samples_preserve_idle_and_ready_delay_attribution() {
     same_cpu_scheduler
         .commit(same_cpu_scheduler.reserve(same_cpu_ready).unwrap())
         .unwrap();
-    same_cpu_scheduler.state.lock().instrumentation_now_ns[0] = Some(299);
+    {
+        let mut state = same_cpu_scheduler.state.lock();
+        state.instrumentation_now_ns[0] = Some(299);
+        state.instrumentation_global_now_ns = Some(299);
+    }
     assert_eq!(
         same_cpu_scheduler.schedule_next_on(cpu(0)),
         Err(SchedulerError::TimeRegression)
@@ -416,7 +420,7 @@ fn suspended_retire_generation_exhaustion_is_atomic_then_retryable() {
     assert_eq!(decision.current, None);
     scheduler.wake(blocked.into_wake_key()).unwrap();
     scheduler
-        .commit(scheduler.reserve(replacement).unwrap())
+        .commit_on(cpu(1), scheduler.reserve(replacement).unwrap())
         .unwrap();
     let before_cpu0 = scheduler.counters_on(cpu(0));
     let before_cpu1 = scheduler.counters_on(cpu(1));
@@ -504,10 +508,10 @@ fn cooperative_transitions_update_exact_cpu_accounting() {
     let second = thread_key(&mut registry);
     for thread in [first, second] {
         scheduler
-            .commit(scheduler.reserve(thread).unwrap())
+            .commit_on(cpu(1), scheduler.reserve(thread).unwrap())
             .unwrap();
     }
-    assert_eq!(scheduler.counters_on(cpu(0)).current_runnable, 2);
+    assert_eq!(scheduler.counters_on(cpu(1)).current_runnable, 2);
 
     scheduler.schedule_next_on(cpu(1)).unwrap();
     let first_claim = scheduler.running_claim_on(cpu(1)).unwrap();
@@ -651,9 +655,11 @@ fn dw1c2_four_cpu_quantum_sources_arm_expire_cancel_and_rearm_independently() {
         replacement
     });
 
-    for _ in 0..4 {
+    for cpu_index in 0..4 {
         let peer = thread_key(&mut registry);
-        scheduler.commit(scheduler.reserve(peer).unwrap()).unwrap();
+        scheduler
+            .commit_on(cpu(cpu_index), scheduler.reserve(peer).unwrap())
+            .unwrap();
     }
     for cpu_index in 0..4 {
         let decision = scheduler
@@ -1003,7 +1009,7 @@ fn completed_switch_makes_outgoing_continuation_claimable_by_an_idle_cpu() {
     let destination = thread_key(&mut registry);
     for key in [outgoing, destination] {
         let reservation = scheduler.reserve(key).unwrap();
-        scheduler.commit(reservation).unwrap();
+        scheduler.commit_on(cpu(0), reservation).unwrap();
     }
     scheduler.schedule_next_on(cpu(0)).unwrap();
     let outgoing_claim = scheduler.running_claim_on(cpu(0)).unwrap();
@@ -1461,7 +1467,7 @@ fn wake_reports_exact_continuation_owner_until_switch_completion() {
     let destination = thread_key(&mut registry);
     for thread in [blocked_thread, destination] {
         let reservation = scheduler.reserve(thread).unwrap();
-        scheduler.commit(reservation).unwrap();
+        scheduler.commit_on(cpu(2), reservation).unwrap();
     }
     scheduler.schedule_next_on(cpu(2)).unwrap();
     let (blocked, decision) = scheduler.block_current_on(cpu(2), blocked_thread).unwrap();
@@ -1474,9 +1480,18 @@ fn wake_reports_exact_continuation_owner_until_switch_completion() {
             .unwrap(),
         Some(cpu(2))
     );
+    assert_eq!(scheduler.schedule_next_on(cpu(3)).unwrap().current, None);
     assert_eq!(
-        scheduler.complete_switch_on_with_runnable_publication(suspended),
-        Ok(true)
+        scheduler
+            .complete_switch_on_with_runnable_publication(suspended)
+            .unwrap()
+            .expect("released Runnable reports its exact queue target")
+            .target(),
+        cpu(2)
+    );
+    assert_eq!(
+        scheduler.schedule_next_on(cpu(3)).unwrap().current,
+        Some(blocked_thread)
     );
     assert_eq!(scheduler.check_invariants(), Ok(()));
 }
@@ -1865,4 +1880,210 @@ fn dw0_f11_fixed_seed_scheduler_transaction_trace_preserves_queue_exclusivity() 
     assert_eq!(counters.voluntary_blocks, CYCLES as u64);
     assert_eq!(counters.wakeups, CYCLES as u64);
     assert!(!counters.overflow_fault);
+}
+
+#[test]
+fn dw1c3_placement_uses_schedulable_requester_then_lowest_fallback() {
+    let scheduler = CooperativeScheduler::<2>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    {
+        let mut state = scheduler.state.lock();
+        state.carrier_admission.enforced = true;
+        state.carrier_admission.schedulable_mask = (1_u64 << 1) | (1_u64 << 3);
+    }
+
+    let fallback = thread_key(&mut registry);
+    let fallback_publication = scheduler
+        .commit_on(cpu(2), scheduler.reserve(fallback).unwrap())
+        .unwrap();
+    assert_eq!(fallback_publication.target(), cpu(1));
+
+    let requested = thread_key(&mut registry);
+    let requested_publication = scheduler
+        .commit_on(cpu(3), scheduler.reserve(requested).unwrap())
+        .unwrap();
+    assert_eq!(requested_publication.target(), cpu(3));
+    assert_eq!(
+        scheduler.schedule_next_on(cpu(1)).unwrap().current,
+        Some(fallback)
+    );
+    assert_eq!(
+        scheduler.schedule_next_on(cpu(3)).unwrap().current,
+        Some(requested)
+    );
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn dw1c3_released_blocked_thread_prefers_its_last_cpu() {
+    let scheduler = CooperativeScheduler::<1>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let thread = thread_key(&mut registry);
+    scheduler
+        .commit_on(cpu(2), scheduler.reserve(thread).unwrap())
+        .unwrap();
+    scheduler.schedule_next_on(cpu(2)).unwrap();
+    let running = scheduler.running_claim_on(cpu(2)).unwrap();
+    let (blocked, decision) = scheduler.block_current_on(cpu(2), thread).unwrap();
+    assert_eq!(decision.current, None);
+    scheduler.complete_switch_on(running).unwrap();
+
+    let publication = scheduler.wake_on(cpu(0), blocked.into_wake_key()).unwrap();
+    assert_eq!(publication.target(), cpu(2));
+    assert_eq!(publication.wake_affinity(), None);
+    assert_eq!(
+        scheduler.schedule_next_on(cpu(2)).unwrap().current,
+        Some(thread)
+    );
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn dw1c3_unavailable_continuation_owner_never_falls_through_placement() {
+    let scheduler = CooperativeScheduler::<2>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let blocked_thread = thread_key(&mut registry);
+    let destination = thread_key(&mut registry);
+    for thread in [blocked_thread, destination] {
+        scheduler
+            .commit_on(cpu(1), scheduler.reserve(thread).unwrap())
+            .unwrap();
+    }
+    scheduler.schedule_next_on(cpu(1)).unwrap();
+    let (blocked, decision) = scheduler.block_current_on(cpu(1), blocked_thread).unwrap();
+    assert_eq!(decision.current, Some(destination));
+    {
+        let mut state = scheduler.state.lock();
+        state.carrier_admission.enforced = true;
+        state.carrier_admission.schedulable_mask = 1_u64 << 0;
+    }
+
+    assert_eq!(
+        scheduler.wake_on(cpu(0), blocked.into_wake_key()),
+        Err(SchedulerError::CarrierUnavailable)
+    );
+    assert_eq!(
+        scheduler.state(blocked_thread),
+        Some(SchedulerThreadState::Blocked)
+    );
+    assert_eq!(scheduler.running_cpu(blocked_thread), None);
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn dw1c3_more_than_cpu_capacity_distributes_semantic_fifo_targets() {
+    let scheduler = CooperativeScheduler::<8>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let mut threads = [None; 8];
+    for (index, slot) in threads.iter_mut().enumerate() {
+        let thread = thread_key(&mut registry);
+        *slot = Some(thread);
+        let target = cpu(index % H2_SCHEDULER_CPU_CAPACITY);
+        let publication = scheduler
+            .commit_on(target, scheduler.reserve(thread).unwrap())
+            .unwrap();
+        assert_eq!(publication.target(), target);
+    }
+    for cpu_index in 0..H2_SCHEDULER_CPU_CAPACITY {
+        assert_eq!(scheduler.counters_on(cpu(cpu_index)).current_runnable, 2);
+        assert_eq!(
+            scheduler.schedule_next_on(cpu(cpu_index)).unwrap().current,
+            threads[cpu_index]
+        );
+    }
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn dw1c3_idle_steal_is_cyclic_oldest_and_transactionally_accounted() {
+    let scheduler = CooperativeScheduler::<3>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let oldest = thread_key(&mut registry);
+    let same_victim_younger = thread_key(&mut registry);
+    let later_victim = thread_key(&mut registry);
+    scheduler
+        .commit_on(cpu(1), scheduler.reserve(oldest).unwrap())
+        .unwrap();
+    scheduler
+        .commit_on(cpu(1), scheduler.reserve(same_victim_younger).unwrap())
+        .unwrap();
+    scheduler
+        .commit_on(cpu(2), scheduler.reserve(later_victim).unwrap())
+        .unwrap();
+
+    assert_eq!(
+        scheduler.schedule_next_on(cpu(0)).unwrap().current,
+        Some(oldest)
+    );
+    let migration = scheduler
+        .last_migration()
+        .expect("idle dispatch records its steal");
+    assert_eq!(migration.thread, oldest);
+    assert_eq!(migration.source, cpu(1));
+    assert_eq!(migration.target, cpu(0));
+    assert_ne!(migration.generation, 0);
+    assert_ne!(migration.enqueue_generation, 0);
+    let source = scheduler.counters_on(cpu(1));
+    let target = scheduler.counters_on(cpu(0));
+    assert_eq!((source.steals_out, source.migrations_out), (1, 1));
+    assert_eq!((target.steals_in, target.migrations_in), (1, 1));
+    assert_eq!(source.current_runnable, 1);
+    assert_eq!(target.current_runnable, 0);
+    assert_eq!(scheduler.counters_on(cpu(2)).current_runnable, 1);
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn dw1c3_migrated_ready_delay_is_charged_on_destination_dispatch() {
+    let scheduler = CooperativeScheduler::<1>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let thread = thread_key(&mut registry);
+    scheduler
+        .observe_instrumentation_time_on(cpu(1), 100)
+        .unwrap();
+    scheduler
+        .commit_on(cpu(1), scheduler.reserve(thread).unwrap())
+        .unwrap();
+    scheduler
+        .observe_instrumentation_time_on(cpu(0), 150)
+        .unwrap();
+
+    assert_eq!(
+        scheduler.schedule_next_on(cpu(0)).unwrap().current,
+        Some(thread)
+    );
+    assert_eq!(scheduler.counters_on(cpu(0)).longest_ready_delay_ns, 50);
+    assert_eq!(scheduler.counters_on(cpu(1)).longest_ready_delay_ns, 0);
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn dw1c3_failed_migration_preserves_source_exactly_once() {
+    let scheduler = CooperativeScheduler::<1>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let thread = thread_key(&mut registry);
+    scheduler
+        .commit_on(cpu(1), scheduler.reserve(thread).unwrap())
+        .unwrap();
+    let source_before = scheduler.counters_on(cpu(1));
+    let target_before = scheduler.counters_on(cpu(0));
+    scheduler.state.lock().next_migration_generation = u64::MAX;
+
+    assert_eq!(
+        scheduler.schedule_next_on(cpu(0)),
+        Err(SchedulerError::TokenExhausted)
+    );
+    assert_eq!(
+        scheduler.state(thread),
+        Some(SchedulerThreadState::Runnable)
+    );
+    assert_eq!(scheduler.running_cpu(thread), None);
+    assert_eq!(scheduler.counters_on(cpu(1)), source_before);
+    assert_eq!(scheduler.counters_on(cpu(0)), target_before);
+    assert_eq!(scheduler.last_migration(), None);
+    assert_eq!(
+        scheduler.schedule_next_on(cpu(1)).unwrap().current,
+        Some(thread)
+    );
+    assert_eq!(scheduler.check_invariants(), Ok(()));
 }

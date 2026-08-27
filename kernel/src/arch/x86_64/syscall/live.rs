@@ -504,6 +504,14 @@ pub(crate) fn current_cpu_index_for_diagnostics() -> Option<usize> {
     (INSTALL_STATE.get(cpu_index)?.load(Ordering::Acquire) == INSTALLED).then_some(cpu_index)
 }
 
+/// Resolves the exact CPU that is publishing scheduler work. CPU0 is accepted
+/// without GS identity only before syscall-boundary installation has started;
+/// once any live boundary exists, malformed current-CPU state fails closed.
+pub(crate) fn current_cpu_index_for_scheduler_request() -> Option<usize> {
+    current_cpu_index_for_diagnostics()
+        .or_else(|| (INSTALL_STATE[0].load(Ordering::Acquire) == INSTALL_UNSTARTED).then_some(0))
+}
+
 /// Observes the carrier-local condition required before an e1 stop safe point:
 /// native dispatch has released every usercopy-capable adapter borrow, and the
 /// architectural AC flag remains clear.  This deliberately does not use

@@ -985,12 +985,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.pending_remote_termination.is_none(),
             "terminal exception crossed a pending remote termination"
         );
-        {
+        self.synchronize_scheduler_current_detached();
+        let published = {
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);
-            runtime.complete_physical_switch_handoff();
-        }
-        self.synchronize_scheduler_current_detached();
+            runtime.complete_physical_switch_handoff()
+        };
+        crate::task::notify_completed_switch_runnable(published);
         let pending = {
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);
@@ -3925,9 +3926,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// selection deliberately retains the suspended claim until this point so
     /// no other CPU can acquire a Runnable continuation before its saved RSP
     /// is visible.
-    fn complete_physical_switch_handoff(&mut self) {
+    fn complete_physical_switch_handoff(&mut self) -> Option<crate::task::RunnablePublication> {
         if let Some(outgoing) = self.shared.execution.suspended_claim_on(self.cpu) {
-            self.shared
+            let published = self
+                .shared
                 .execution
                 .complete_switch_on(outgoing)
                 .unwrap_or_else(|error| {
@@ -3948,6 +3950,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         crate::test_support::complete_fail(dw1b_evidence_detail(error))
                     });
             }
+            published
+        } else {
+            None
         }
     }
 
@@ -5167,8 +5172,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
     ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
-        self.complete_physical_switch_handoff();
         self.synchronize_scheduler_current();
+        let publication = self.complete_physical_switch_handoff();
+        crate::task::notify_completed_switch_runnable(publication);
         self.authorize_timer_return(frame)
     }
 
@@ -5176,8 +5182,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
-        self.complete_physical_switch_handoff();
         self.synchronize_scheduler_current();
+        let publication = self.complete_physical_switch_handoff();
+        crate::task::notify_completed_switch_runnable(publication);
         let current_binding_generation = crate::arch::x86_64::syscall::current_binding_generation();
         frame.rebind_after_kernel_resume(current_binding_generation)?;
         self.authorize_return(frame, current_binding_generation)
@@ -5387,8 +5394,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 
     fn invalid_return(&mut self, error: crate::arch::x86_64::syscall::UserReturnError) {
-        self.complete_physical_switch_handoff();
         self.synchronize_scheduler_current();
+        let publication = self.complete_physical_switch_handoff();
+        crate::task::notify_completed_switch_runnable(publication);
         self.terminate_exception(crate::task::TaskExceptionRecord::new(
             DW_EXCEPTION_GENERAL_PROTECTION,
             invalid_user_return_detail(error),
@@ -5397,8 +5405,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 
     fn user_exception(&mut self, record: crate::arch::x86_64::exceptions::UserExceptionRecord) {
-        self.complete_physical_switch_handoff();
         self.synchronize_scheduler_current();
+        let publication = self.complete_physical_switch_handoff();
+        crate::task::notify_completed_switch_runnable(publication);
         self.terminate_exception(record.task_exception());
     }
 
@@ -5415,7 +5424,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 
     fn enter_scheduled_fresh_thread(&mut self) -> ! {
-        self.complete_physical_switch_handoff();
+        self.synchronize_scheduler_current();
+        let publication = self.complete_physical_switch_handoff();
+        crate::task::notify_completed_switch_runnable(publication);
         let (state, stack) = self.prepare_fresh_user_entry();
         unsafe { crate::arch::x86_64::syscall::enter_bound_validated_user(&state, stack) }
     }
@@ -5457,8 +5468,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     ) -> crate::syscall::native::NativeResumeOutcome {
-        self.complete_physical_switch_handoff();
         self.synchronize_scheduler_current();
+        let publication = self.complete_physical_switch_handoff();
+        crate::task::notify_completed_switch_runnable(publication);
         #[cfg(feature = "test-support")]
         let owner = self.services.operation_owner(self.thread);
         let resumed = {
@@ -5772,6 +5784,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             runtime.service_pending_timer_expiries();
             runtime.handle(request)
         };
+        crate::task::drain_runnable_work_notifications();
         self.drain_quantum_cancellation_detached();
         result
     }
@@ -5904,12 +5917,13 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
     ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
-        {
+        self.synchronize_scheduler_current_detached();
+        let publication = {
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);
-            runtime.complete_physical_switch_handoff();
-        }
-        self.synchronize_scheduler_current_detached();
+            runtime.complete_physical_switch_handoff()
+        };
+        crate::task::notify_completed_switch_runnable(publication);
         let mut runtime = self.runtime.lock();
         runtime.switch_cpu(self.cpu);
         runtime.authorize_timer_return(frame)
@@ -5919,12 +5933,13 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
-        {
+        self.synchronize_scheduler_current_detached();
+        let publication = {
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);
-            runtime.complete_physical_switch_handoff();
-        }
-        self.synchronize_scheduler_current_detached();
+            runtime.complete_physical_switch_handoff()
+        };
+        crate::task::notify_completed_switch_runnable(publication);
         let mut runtime = self.runtime.lock();
         runtime.switch_cpu(self.cpu);
         let current_binding_generation = crate::arch::x86_64::syscall::current_binding_generation();
@@ -6118,12 +6133,13 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
     }
 
     fn enter_scheduled_fresh_thread(&mut self) -> ! {
-        {
+        self.synchronize_scheduler_current_detached();
+        let publication = {
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);
-            runtime.complete_physical_switch_handoff();
-        }
-        self.synchronize_scheduler_current_detached();
+            runtime.complete_physical_switch_handoff()
+        };
+        crate::task::notify_completed_switch_runnable(publication);
         let (state, stack) = {
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);
@@ -6264,6 +6280,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                     .unwrap_or_else(|error| panic!("AP scheduling failed: {error:?}"))
                     .current
             };
+            crate::task::drain_runnable_work_notifications();
             let entry = scheduled.map(|thread| {
                 self.synchronize_scheduler_current_detached();
                 let mut runtime = self.runtime.lock();
@@ -6391,10 +6408,14 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         &'owner mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     ) -> crate::syscall::native::NativeIdleSuspendPoll<'owner> {
-        let mut runtime = self.runtime.lock();
-        runtime.switch_cpu(self.cpu);
-        runtime.service_pending_timer_expiries();
-        unsafe { runtime.poll_idle_suspend_stationary() }
+        let poll = {
+            let mut runtime = self.runtime.lock();
+            runtime.switch_cpu(self.cpu);
+            runtime.service_pending_timer_expiries();
+            unsafe { runtime.poll_idle_suspend_stationary() }
+        };
+        crate::task::drain_runnable_work_notifications();
+        poll
     }
 
     fn resume_suspended(
@@ -6406,26 +6427,34 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         // An already-published local terminal owner must retain its suspended
         // claim until the terminal reaper actually abandons this stack; every
         // resumable path acknowledges destination-stack arrival first.
-        {
+        let terminal_current = {
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);
             let suspended_claim = runtime.shared.execution.suspended_claim_on(self.cpu);
-            if runtime
+            let no_current = runtime
                 .shared
                 .execution
                 .current_thread_on(self.cpu)
-                .is_none()
-                && let (Some(suspended), Some(deferred)) = (
-                    suspended_claim,
-                    runtime.deferred_currents[self.cpu.index()].as_ref(),
-                )
-                && suspended.thread() == deferred.thread()
-            {
-                return crate::syscall::native::NativeResumeOutcome::TerminateCurrent;
+                .is_none();
+            match (
+                no_current,
+                suspended_claim,
+                runtime.deferred_currents[self.cpu.index()].as_ref(),
+            ) {
+                (true, Some(suspended), Some(deferred)) => suspended.thread() == deferred.thread(),
+                _ => false,
             }
-            runtime.complete_physical_switch_handoff();
+        };
+        if terminal_current {
+            return crate::syscall::native::NativeResumeOutcome::TerminateCurrent;
         }
         self.synchronize_scheduler_current_detached();
+        let publication = {
+            let mut runtime = self.runtime.lock();
+            runtime.switch_cpu(self.cpu);
+            runtime.complete_physical_switch_handoff()
+        };
+        crate::task::notify_completed_switch_runnable(publication);
         let mut runtime = self.runtime.lock();
         runtime.switch_cpu(self.cpu);
         let notification = crate::arch::x86_64::idle::take_current_notification_at_safe_point();

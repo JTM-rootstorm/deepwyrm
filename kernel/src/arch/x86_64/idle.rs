@@ -233,9 +233,11 @@ impl IdleWakeSet {
             .map_err(|_| IdleWakeError::StalePreparation)
     }
 
-    /// Selects one eligible idle CPU and publishes a coalesced Wake before the
-    /// caller emits e1. The publisher is excluded: an interrupting publisher
-    /// is already executing and will rescan before returning to halt.
+    /// Selects one eligible idle CPU whose mailbox does not already hold Wake,
+    /// and publishes Wake before the caller emits e1. The publisher is
+    /// excluded: an interrupting publisher is already executing and will
+    /// rescan before returning to halt. Skipping claimed mailboxes lets a
+    /// bounded burst distribute rescans across all idle CPUs.
     pub(crate) fn publish_runnable(
         &self,
         publisher: CpuIndex,
@@ -244,8 +246,9 @@ impl IdleWakeSet {
         for offset in 1..CPU_CAPACITY {
             let index = (publisher.index() + offset) % CPU_CAPACITY;
             let state = self.cpus[index].state.load(Ordering::Acquire);
-            if matches!(state, CPU_PREPARING | CPU_HALTED) {
-                self.mailboxes[index].publish_wake();
+            if matches!(state, CPU_PREPARING | CPU_HALTED)
+                && self.mailboxes[index].try_publish_wake()
+            {
                 self.ensure_healthy()?;
                 return Ok(CpuIndex::new(index));
             }
@@ -710,7 +713,7 @@ mod tests {
         idle.enable(cpu(1)).unwrap();
         let preparation = idle.prepare(cpu(1)).unwrap();
         assert_eq!(idle.publish_runnable(cpu(0)), Ok(Some(cpu(1))));
-        assert_eq!(idle.publish_runnable(cpu(0)), Ok(Some(cpu(1))));
+        assert_eq!(idle.publish_runnable(cpu(0)), Ok(None));
         let halt = idle.commit(preparation).unwrap();
         assert_eq!(
             idle.take_notification(cpu(1)),
@@ -721,6 +724,32 @@ mod tests {
             Ok(MailboxNotification::None)
         );
         idle.finish(halt).unwrap();
+    }
+
+    #[test]
+    fn generic_wake_burst_claims_distinct_idle_mailboxes() {
+        let idle = IdleWakeSet::new();
+        for target in 0..CPU_CAPACITY {
+            idle.enable(cpu(target)).unwrap();
+        }
+        let cpu1 = idle.prepare(cpu(1)).unwrap();
+        let cpu2 = idle.prepare(cpu(2)).unwrap();
+        let cpu3 = idle.prepare(cpu(3)).unwrap();
+
+        assert_eq!(idle.publish_runnable(cpu(0)), Ok(Some(cpu(1))));
+        assert_eq!(idle.publish_runnable(cpu(0)), Ok(Some(cpu(2))));
+        assert_eq!(idle.publish_runnable(cpu(0)), Ok(Some(cpu(3))));
+        assert_eq!(idle.publish_runnable(cpu(0)), Ok(None));
+        for target in 1..CPU_CAPACITY {
+            assert_eq!(
+                idle.take_notification(cpu(target)),
+                Ok(MailboxNotification::Wake)
+            );
+        }
+
+        idle.cancel(cpu1).unwrap();
+        idle.cancel(cpu2).unwrap();
+        idle.cancel(cpu3).unwrap();
     }
 
     #[test]

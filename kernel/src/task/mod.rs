@@ -46,22 +46,83 @@ pub(crate) use scheduler::{
     BlockReservation, BlockReservationFailure, BlockToken, BlockWakeKey, CarrierAdmissionError,
     CarrierAdmissionLifecycle, CarrierAdmissionSnapshot, CarrierAdmissionTicket,
     CarrierDeadlineState, CarrierResourceTuple, CarrierRuntimeState, CooperativeScheduler,
-    DEFAULT_NORMAL_QUANTUM_NS, IdleScheduleDecision, ScheduleDecision, SchedulerCounters,
-    SchedulerCpuId, SchedulerError, SchedulerExecutionClaim, SchedulerIdleAccountingToken,
-    SchedulerPreemptionDecision, SchedulerPreemptionSnapshot, SchedulerQuantumTicket,
-    SchedulerReservation, SchedulerReservationFailure, SchedulerThreadState,
+    DEFAULT_NORMAL_QUANTUM_NS, IdleScheduleDecision, RunnablePublication, ScheduleDecision,
+    SchedulerCounters, SchedulerCpuId, SchedulerError, SchedulerExecutionClaim,
+    SchedulerIdleAccountingToken, SchedulerPreemptionDecision, SchedulerPreemptionSnapshot,
+    SchedulerQuantumTicket, SchedulerReservation, SchedulerReservationFailure,
+    SchedulerThreadState,
 };
 
-/// Notifies an exact continuation owner, or one eligible remote idle CPU for
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn scheduler_requester_cpu() -> SchedulerCpuId {
+    crate::arch::x86_64::syscall::current_cpu_index_for_scheduler_request()
+        .and_then(SchedulerCpuId::new)
+        .unwrap_or_else(|| panic!("scheduler runnable publication has no exact current CPU"))
+}
+
+#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+fn scheduler_requester_cpu() -> SchedulerCpuId {
+    SchedulerCpuId::BOOTSTRAP
+}
+
+/// Notifies an exact continuation owner, or eligible remote idle CPUs for
 /// unpinned Runnable work. This is intentionally a no-op in host/model builds;
 /// their deterministic idle-wake controller tests drive the protocol directly.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+static PENDING_RUNNABLE_WAKE_MASK: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+static PENDING_GENERIC_RUNNABLE_WAKES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 fn notify_runnable_work(affinity: Option<SchedulerCpuId>) {
-    crate::arch::x86_64::idle::notify_runnable_work(affinity);
+    match affinity {
+        Some(target) => {
+            PENDING_RUNNABLE_WAKE_MASK.fetch_or(
+                1_u64 << target.index(),
+                core::sync::atomic::Ordering::Release,
+            );
+        }
+        None => {
+            let _ = PENDING_GENERIC_RUNNABLE_WAKES.fetch_update(
+                core::sync::atomic::Ordering::Release,
+                core::sync::atomic::Ordering::Relaxed,
+                |pending| Some(pending.saturating_add(1).min(crate::cpu::CPU_CAPACITY)),
+            );
+        }
+    }
 }
 
 #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 fn notify_runnable_work(_affinity: Option<SchedulerCpuId>) {}
+
+/// Performs queued e1 delivery only after the caller has dropped stationary
+/// runtime authority. Queue ownership is already committed before staging.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn drain_runnable_work_notifications() {
+    let pending = PENDING_RUNNABLE_WAKE_MASK.swap(0, core::sync::atomic::Ordering::AcqRel);
+    for cpu_index in 0..crate::cpu::CPU_CAPACITY {
+        if pending & (1_u64 << cpu_index) != 0 {
+            let cpu = SchedulerCpuId::new(cpu_index).expect("bounded scheduler CPU index");
+            crate::arch::x86_64::idle::notify_runnable_work(Some(cpu));
+        }
+    }
+    let generic = PENDING_GENERIC_RUNNABLE_WAKES.swap(0, core::sync::atomic::Ordering::AcqRel);
+    for _ in 0..generic {
+        crate::arch::x86_64::idle::notify_runnable_work(None);
+    }
+}
+
+#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+pub(crate) fn drain_runnable_work_notifications() {}
+
+pub(crate) fn notify_completed_switch_runnable(publication: Option<RunnablePublication>) {
+    if let Some(publication) = publication {
+        notify_runnable_work(publication.wake_affinity());
+        drain_runnable_work_notifications();
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TaskExceptionRecord {

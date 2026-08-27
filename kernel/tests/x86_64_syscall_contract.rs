@@ -537,15 +537,18 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
         .expect("live fresh-thread entry boundary")
         .0;
     let fresh_ack = fresh
-        .find("runtime.complete_physical_switch_handoff();")
+        .find("runtime.complete_physical_switch_handoff()")
         .unwrap();
     let fresh_sync = fresh
         .find("self.synchronize_scheduler_current_detached();")
         .unwrap();
+    let fresh_notify = fresh
+        .find("crate::task::notify_completed_switch_runnable(publication);")
+        .unwrap();
     let fresh_prepare = fresh
         .find("runtime.prepare_fresh_user_entry_synchronized()")
         .unwrap();
-    assert!(fresh_ack < fresh_sync && fresh_sync < fresh_prepare);
+    assert!(fresh_sync < fresh_ack && fresh_ack < fresh_notify && fresh_notify < fresh_prepare);
     let resume = runtime
         .split_once("fn resume_suspended(")
         .expect("live suspended-resume facade")
@@ -561,7 +564,7 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
         .expect("direct user-exception boundary")
         .0;
     let direct_ack = direct_invalid
-        .find("self.complete_physical_switch_handoff();")
+        .find("self.complete_physical_switch_handoff()")
         .expect("direct invalid-return switch acknowledgement");
     let direct_sync = direct_invalid
         .find("self.synchronize_scheduler_current();")
@@ -569,7 +572,12 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
     let direct_terminal = direct_invalid
         .find("self.terminate_exception(")
         .expect("direct invalid-return termination");
-    assert!(direct_ack < direct_sync && direct_sync < direct_terminal);
+    let direct_notify = direct_invalid
+        .find("crate::task::notify_completed_switch_runnable(publication);")
+        .expect("direct invalid-return Runnable notification");
+    assert!(
+        direct_sync < direct_ack && direct_ack < direct_notify && direct_notify < direct_terminal
+    );
 
     let remote_terminal = runtime
         .split_once("fn terminate_exception_with_remote_stops(")
@@ -582,7 +590,7 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
         .find("runtime.switch_cpu(self.cpu);")
         .expect("remote terminal CPU restoration");
     let remote_ack = remote_terminal
-        .find("runtime.complete_physical_switch_handoff();")
+        .find("runtime.complete_physical_switch_handoff()")
         .expect("remote terminal switch acknowledgement");
     let remote_sync = remote_terminal
         .find("self.synchronize_scheduler_current_detached();")
@@ -590,7 +598,15 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
     let remote_prepare = remote_terminal
         .find("runtime.prepare_remote_process_exception(exception)")
         .expect("remote terminal preparation");
-    assert!(remote_switch < remote_ack && remote_ack < remote_sync && remote_sync < remote_prepare);
+    let remote_notify = remote_terminal
+        .find("crate::task::notify_completed_switch_runnable(published);")
+        .expect("remote terminal Runnable notification");
+    assert!(
+        remote_sync < remote_switch
+            && remote_switch < remote_ack
+            && remote_ack < remote_notify
+            && remote_notify < remote_prepare
+    );
 }
 
 #[test]
@@ -616,6 +632,9 @@ fn i2_suspended_resume_gives_remote_stop_priority_under_scheduler_authority() {
     let terminal = resume
         .find("NativeResumeOutcome::TerminateCurrent")
         .unwrap();
+    let runnable = resume
+        .find("crate::task::notify_completed_switch_runnable(publication);")
+        .unwrap();
     let mailbox = resume
         .find("take_current_notification_at_safe_point()")
         .unwrap();
@@ -623,9 +642,10 @@ fn i2_suspended_resume_gives_remote_stop_priority_under_scheduler_authority() {
     assert!(
         authority < carrier
             && carrier < terminal
-            && terminal < acknowledgement
-            && acknowledgement < synchronization
-            && synchronization < mailbox
+            && terminal < synchronization
+            && synchronization < acknowledgement
+            && acknowledgement < runnable
+            && runnable < mailbox
             && mailbox < current
     );
     assert!(resume.contains("NativeResumeOutcome::ServiceRendezvous"));

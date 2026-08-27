@@ -546,13 +546,13 @@ fn terminal_physical_claim_prefers_unpublished_suspended_generation_over_logical
     assert!(registry.release_internal(root_owner).unwrap().is_none());
 
     let domain = ExecutionDomain::<2>::new(stack_bounds::<2>()).unwrap();
-    domain
-        .start_thread(&mut tasks, outgoing, start_state(61))
-        .unwrap();
-    domain
-        .start_thread(&mut tasks, replacement, start_state(62))
-        .unwrap();
     let cpu1 = crate::cpu::CpuIndex::new(1).unwrap();
+    domain
+        .start_thread_on(cpu1, &mut tasks, outgoing, start_state(61))
+        .unwrap();
+    domain
+        .start_thread_on(cpu1, &mut tasks, replacement, start_state(62))
+        .unwrap();
     assert_eq!(
         domain.schedule_next_on(cpu1).unwrap().current,
         Some(outgoing)

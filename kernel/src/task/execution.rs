@@ -589,6 +589,24 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn start_thread_on<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &self,
+        requester: SchedulerCpuId,
+        tasks: &mut super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        thread: ThreadKey,
+        start: ThreadStartState,
+    ) -> Result<(), StartThreadError> {
+        self.prepare_thread_start(tasks, thread, start)?
+            .commit_on(tasks, requester);
+        Ok(())
+    }
+
     pub(crate) fn schedule_next(&self) -> Result<super::ScheduleDecision, SchedulerError> {
         self.scheduler.schedule_next()
     }
@@ -877,14 +895,9 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     pub(crate) fn complete_switch_on(
         &self,
         claim: SchedulerExecutionClaim,
-    ) -> Result<(), SchedulerError> {
-        let published_runnable = self
-            .scheduler
-            .complete_switch_on_with_runnable_publication(claim)?;
-        if published_runnable {
-            super::notify_runnable_work(None);
-        }
-        Ok(())
+    ) -> Result<Option<super::RunnablePublication>, SchedulerError> {
+        self.scheduler
+            .complete_switch_on_with_runnable_publication(claim)
     }
 
     pub(crate) fn running_claim_on(&self, cpu: SchedulerCpuId) -> Option<SchedulerExecutionClaim> {
@@ -935,8 +948,10 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     }
 
     pub(crate) fn wake(&self, key: BlockWakeKey) -> Result<(), SchedulerError> {
-        let affinity = self.scheduler.wake_with_affinity(key)?;
-        super::notify_runnable_work(affinity);
+        let publication = self
+            .scheduler
+            .wake_on(super::scheduler_requester_cpu(), key)?;
+        super::notify_runnable_work(publication.wake_affinity());
         Ok(())
     }
 
@@ -1757,15 +1772,30 @@ impl<const CAPACITY: usize> PreparedThreadStart<'_, CAPACITY> {
         const THREADS: usize,
         const HANDLES: usize,
     >(
+        self,
+        tasks: &mut super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    ) {
+        self.commit_on(tasks, super::scheduler_requester_cpu());
+    }
+
+    pub(crate) fn commit_on<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
         mut self,
         tasks: &mut super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        requester: SchedulerCpuId,
     ) {
         tasks
             .start_thread(self.thread)
             .unwrap_or_else(|error| panic!("prepared Thread task publication diverged: {error:?}"));
-        self.execution
+        let publication = self
+            .execution
             .scheduler
-            .commit(
+            .commit_on(
+                requester,
                 self.reservation
                     .take()
                     .expect("prepared Thread start retains its reservation"),
@@ -1776,7 +1806,7 @@ impl<const CAPACITY: usize> PreparedThreadStart<'_, CAPACITY> {
                     failure.error()
                 )
             });
-        super::notify_runnable_work(None);
+        super::notify_runnable_work(publication.wake_affinity());
         self.completed = true;
     }
 
