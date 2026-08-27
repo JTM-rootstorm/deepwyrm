@@ -17,6 +17,11 @@ formatting, and host tooling:
 tools/pinned-cargo host test --locked --workspace
 ```
 
+Host `build`, `check`, `clippy`, and `rustdoc` commands must select only
+`--lib`, `--tests`, `--test`, or `--doc` targets. Implicit workspace targets,
+`--all-targets`, binaries, and examples are rejected before Cargo so the
+freestanding kernel can never be admitted as a Linux-host binary by accident.
+
 Selector-configured kernel unit tests are the only host use of `test-support`.
 They must name the selector and use an explicit library-only test shape:
 

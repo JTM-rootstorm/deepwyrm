@@ -49,6 +49,10 @@ fn host_lane_rejects_freestanding_cargo_admission_before_target_creation() {
         vec!["host", "test", "--all-features"],
         vec!["host", "test", "--features", "native-payloads"],
         vec!["host", "build", "--bin", "wyrmroot-dw1b-progress"],
+        vec!["host", "build", "--workspace"],
+        vec!["host", "check", "--workspace"],
+        vec!["host", "clippy", "--workspace", "--all-targets"],
+        vec!["host", "rustdoc", "--workspace"],
         vec!["host", "build", "--target", "x86_64-unknown-wyrmroot"],
         vec!["host", "check", "--manifest-path", "../wyrmroot/Cargo.toml"],
         vec![

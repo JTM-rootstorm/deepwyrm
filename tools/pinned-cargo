@@ -98,6 +98,7 @@ esac
 
 test_support=false
 safe_host_test_support=false
+safe_host_targets=false
 expect_features=false
 for argument in "$@"; do
     if [ "$expect_features" = true ]; then
@@ -118,6 +119,10 @@ for argument in "$@"; do
             ;;
         --lib)
             safe_host_test_support=true
+            safe_host_targets=true
+            ;;
+        --tests|--test|--test=*|--doc)
+            safe_host_targets=true
             ;;
     esac
 done
@@ -129,7 +134,7 @@ if [ "$lane" = host ]; then
             --manifest-path|--manifest-path=*|--config|--config=*)
                 fail "host lane rejects manifest/config redirection"
                 ;;
-            --all-features|--bin|--bin=*|--bins|*native-*)
+            --all-features|--all-targets|--bin|--bin=*|--bins|--example|--example=*|--examples|*native-*)
                 fail "host lane rejects freestanding/native binary admission; use the target lane"
                 ;;
             --target|--target=x86_64-unknown-wyrmroot|--target=x86_64-unknown-none|x86_64-unknown-wyrmroot|x86_64-unknown-none)
@@ -141,6 +146,14 @@ if [ "$lane" = host ]; then
                 ;;
         esac
     done
+    if [ "$test_support" = false ]; then
+        case "$1" in
+            build|check|clippy|rustdoc)
+                [ "$safe_host_targets" = true ] || \
+                    fail "host lane rejects implicit $1 targets; select --lib, --tests, --test, or --doc"
+                ;;
+        esac
+    fi
 fi
 
 selector=${DEEPWYRM_GUEST_TEST_SELECTOR:-}
