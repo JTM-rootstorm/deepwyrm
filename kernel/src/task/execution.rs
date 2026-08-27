@@ -839,6 +839,25 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         Ok(published)
     }
 
+    #[cfg(deepwyrm_dw1c_evidence)]
+    fn observe_terminal_preemption_ticket(&self, ticket: super::SchedulerQuantumTicket) {
+        if !crate::test_support::DW1C_EVIDENCE.tracks_thread(ticket.thread()) {
+            return;
+        }
+        let absent_after_commit = self.scheduler.terminal_ticket_generation_absent(ticket);
+        crate::test_support::DW1C_EVIDENCE
+            .observe_terminal_preemption_claim(
+                ticket.cpu().index() as u8,
+                ticket.thread(),
+                ticket.execution_generation(),
+                ticket.source_arm_generation(),
+                absent_after_commit,
+            )
+            .unwrap_or_else(|error| {
+                panic!("selector-28 terminal preemption observation failed: {error:?}")
+            });
+    }
+
     pub(crate) fn has_reschedule_request_on(&self, cpu: SchedulerCpuId) -> bool {
         self.scheduler.has_reschedule_request_on(cpu)
     }
@@ -1037,7 +1056,12 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         &self,
         claim: SchedulerExecutionClaim,
     ) -> Result<Option<super::SchedulerQuantumTicket>, SchedulerError> {
-        self.scheduler.stop_running_claim_on(claim)
+        let cancelled = self.scheduler.stop_running_claim_on(claim)?;
+        #[cfg(deepwyrm_dw1c_evidence)]
+        if let Some(ticket) = cancelled {
+            self.observe_terminal_preemption_ticket(ticket);
+        }
+        Ok(cancelled)
     }
 
     /// Retires a blocked physical continuation by its exact CPU/thread/
@@ -1477,6 +1501,10 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                         .unwrap_or_else(|error| {
                             panic!("terminal thread was not removable from scheduler: {error:?}")
                         });
+                    #[cfg(deepwyrm_dw1c_evidence)]
+                    if let Some(ticket) = decision.cancelled_quantum {
+                        self.observe_terminal_preemption_ticket(ticket);
+                    }
                     if defer_current == Some(thread) {
                         assert!(
                             deferred.is_none(),

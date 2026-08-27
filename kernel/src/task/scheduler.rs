@@ -930,6 +930,22 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
                 .any(|suspended| suspended.thread == entry.thread)
     }
 
+    /// Selector-private final revalidation shared by idle stealing and the
+    /// explicit migration-attempt fixture.  It runs under the scheduler lock;
+    /// a rejection exposes no partial move.
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    fn selector_migration_attempt(
+        &self,
+        entry: QueueEntry,
+        victim: SchedulerCpuId,
+        target: SchedulerCpuId,
+    ) -> Result<(), SchedulerMigrationRejectionReason> {
+        if !self.entry_migratable_without_external_exclusion(entry, victim, target) {
+            return Err(SchedulerMigrationRejectionReason::NotRevalidatable);
+        }
+        entry.migration_exclusion.map_or(Ok(()), Err)
+    }
+
     fn claim_first_runnable_on(
         &mut self,
         cpu: SchedulerCpuId,
@@ -995,7 +1011,17 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             }
             let victim = SchedulerCpuId::new(victim_index).expect("bounded scheduler CPU index");
             let Some(index) = self.queue[..self.len].iter().position(|entry| {
-                entry.is_some_and(|entry| self.entry_migratable(entry, victim, target))
+                entry.is_some_and(|entry| {
+                    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+                    {
+                        self.selector_migration_attempt(entry, victim, target)
+                            .is_ok()
+                    }
+                    #[cfg(not(any(test, deepwyrm_dw1c_evidence)))]
+                    {
+                        self.entry_migratable(entry, victim, target)
+                    }
+                })
             }) else {
                 continue;
             };
@@ -2956,20 +2982,17 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             return Err(SchedulerError::StaleExecutionClaim);
         }
         let victim = entry.target_cpu;
-        if victim == target
-            || !state.entry_migratable_without_external_exclusion(*entry, victim, target)
-        {
+        if victim == target {
             return Err(SchedulerError::StaleExecutionClaim);
         }
         // `steal_oldest_for` calls the same predicate while holding this lock;
         // the test-only exclusion makes this exact candidate reject at its
         // final external-authority revalidation rather than moving it.
-        let reason = entry
-            .migration_exclusion
+        let reason = state
+            .selector_migration_attempt(*entry, victim, target)
+            .err()
+            .filter(|reason| *reason != SchedulerMigrationRejectionReason::NotRevalidatable)
             .ok_or(SchedulerError::StaleExecutionClaim)?;
-        if state.entry_migratable(*entry, victim, target) {
-            return Err(SchedulerError::StaleExecutionClaim);
-        }
         Ok(SchedulerMigrationRejection {
             thread,
             execution_generation,
@@ -3154,6 +3177,21 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             cpu,
             thread: claim.thread,
             generation: claim.generation,
+        })
+    }
+
+    /// Selector-private post-commit verification for a terminal race.  The
+    /// ticket was captured while retirement held the scheduler lock; this
+    /// check proves that exact execution is no longer Running or queued before
+    /// the observer is published outside scheduler authority.
+    #[cfg(deepwyrm_dw1c_evidence)]
+    pub(crate) fn terminal_ticket_generation_absent(&self, ticket: SchedulerQuantumTicket) -> bool {
+        let state = self.state.lock();
+        !state.running.iter().flatten().any(|claim| {
+            claim.thread == ticket.thread && claim.generation == ticket.execution_generation
+        }) && !state.queue[..state.len].iter().flatten().any(|entry| {
+            entry.thread == ticket.thread
+                && entry.started_execution_generation == ticket.execution_generation
         })
     }
 

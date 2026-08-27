@@ -165,6 +165,7 @@ struct State {
     token6_wait_joined: bool,
     token6_wake_seen: bool,
     token6_run_seen: bool,
+    token8_terminal: Option<(u8, u64, u64)>,
     token7: Option<Token7Flight>,
     facts: Dw1cKernelFacts,
     terminal: bool,
@@ -207,6 +208,7 @@ impl State {
             token6_wait_joined: false,
             token6_wake_seen: false,
             token6_run_seen: false,
+            token8_terminal: None,
             token7: None,
             facts: Dw1cKernelFacts {
                 cpu_ready: 0,
@@ -863,6 +865,44 @@ impl Dw1cEvidenceCollector {
         Ok(())
     }
 
+    /// Joins token 8's already-published expiry with the one terminal winner.
+    /// `absent_after_commit` is sampled by the scheduler while its retirement
+    /// transition is still exact; later RUN/requeue observations for this
+    /// generation are contradictions.
+    pub(crate) fn observe_terminal_preemption_claim(
+        &self,
+        cpu: u8,
+        thread: ThreadKey,
+        generation: u64,
+        source_arm_generation: u64,
+        absent_after_commit: bool,
+    ) -> Result<(), Dw1cEvidenceError> {
+        let mut state = self.state.lock();
+        if !state.installed || !actor_thread_bound(&state, thread, generation) {
+            return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
+        }
+        let Some(token) = actor_token_for_claim(&state, thread, generation) else {
+            return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
+        };
+        let Some(quantum) = cpu_bit(cpu).and_then(|_| state.quantum_payload[usize::from(cpu)])
+        else {
+            return Err(state.latch(Dw1cEvidenceError::MissingKernelFact));
+        };
+        if token != 8
+            || source_arm_generation == 0
+            || quantum.subject != 8
+            || quantum.generation != generation
+            || quantum.value != source_arm_generation
+            || !absent_after_commit
+            || state.token8_terminal.is_some()
+        {
+            return Err(state.latch(Dw1cEvidenceError::Contradiction));
+        }
+        state.token8_terminal = Some((cpu, generation, source_arm_generation));
+        state.facts.race_matrix |= 1 << 2;
+        Ok(())
+    }
+
     /// Records the normal Process-exit commit for lifecycle actors only. The
     /// terminal execution generation is sampled from the live claim before
     /// TaskAuthority commits, then joined here immediately after that commit.
@@ -1219,6 +1259,13 @@ fn retain_cpu_payload_after_race_checks(
         generation: execution_generation,
         value,
     };
+    if token == 8
+        && state
+            .token8_terminal
+            .is_some_and(|(_, generation, _)| generation == execution_generation)
+    {
+        return Err(state.latch(Dw1cEvidenceError::Contradiction));
+    }
     if kind == 2 {
         let Some(quantum) = state.quantum_payload[index] else {
             return Err(state.latch(Dw1cEvidenceError::MissingKernelFact));
@@ -1761,6 +1808,58 @@ mod tests {
         assert_eq!(
             collector.state.lock().failure,
             Some(Dw1cEvidenceError::WrongGeneration)
+        );
+    }
+
+    #[test]
+    fn token8_terminal_preemption_requires_matching_expiry_and_forbids_later_run() {
+        let (missing_expiry, actors) = armed_collector();
+        let token8 = actors[7];
+        assert_eq!(
+            missing_expiry.observe_terminal_preemption_claim(
+                2,
+                token8.thread,
+                token8.execution_generation,
+                0x88,
+                true,
+            ),
+            Err(Dw1cEvidenceError::MissingKernelFact)
+        );
+
+        let (collector, actors) = armed_collector();
+        let token8 = actors[7];
+        collector
+            .observe_quantum_claim(2, token8.thread, token8.execution_generation, 0x88)
+            .unwrap();
+        assert_eq!(
+            collector.observe_terminal_preemption_claim(
+                2,
+                token8.thread,
+                token8.execution_generation,
+                0x89,
+                true,
+            ),
+            Err(Dw1cEvidenceError::Contradiction)
+        );
+
+        let (collector, actors) = armed_collector();
+        let token8 = actors[7];
+        collector
+            .observe_quantum_claim(2, token8.thread, token8.execution_generation, 0x88)
+            .unwrap();
+        collector
+            .observe_terminal_preemption_claim(
+                2,
+                token8.thread,
+                token8.execution_generation,
+                0x88,
+                true,
+            )
+            .unwrap();
+        assert_eq!(collector.state.lock().facts.race_matrix & (1 << 2), 1 << 2);
+        assert_eq!(
+            collector.observe_running_claim(2, token8.thread, token8.execution_generation),
+            Err(Dw1cEvidenceError::Contradiction)
         );
     }
 
