@@ -55,6 +55,10 @@ pub(crate) use scheduler::{
 
 #[cfg(any(test, deepwyrm_dw1c_evidence))]
 #[allow(unused_imports)]
+pub(crate) use scheduler::Dw1cFinalSchedulerSnapshot;
+
+#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[allow(unused_imports)]
 pub(crate) use scheduler::SchedulerMigrationRejectionReason;
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]

@@ -408,6 +408,8 @@ pub(crate) struct RetiredExitPins<const THREADS: usize> {
 #[must_use = "current execution resources must be reclaimed after switching to a terminal stack"]
 pub(crate) struct DeferredCurrentExecutionResources {
     thread: ThreadKey,
+    #[cfg(deepwyrm_dw1c_evidence)]
+    execution_generation: u64,
     resources: Option<ThreadExecutionResources>,
     process_pin: Option<crate::object::InternalRef>,
     thread_pin: Option<crate::object::InternalRef>,
@@ -421,6 +423,11 @@ impl DeferredCurrentExecutionResources {
 
     pub(crate) const fn cancelled_quantum(&self) -> Option<super::SchedulerQuantumTicket> {
         self.cancelled_quantum
+    }
+
+    #[cfg(deepwyrm_dw1c_evidence)]
+    pub(crate) const fn execution_generation(&self) -> u64 {
+        self.execution_generation
     }
 }
 
@@ -680,6 +687,13 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     #[cfg(deepwyrm_dw1c_evidence)]
     pub(crate) fn current_execution_generation(&self, thread: ThreadKey) -> Option<u64> {
         self.scheduler.current_execution_generation(thread)
+    }
+
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    pub(crate) fn dw1c_final_scheduler_snapshot(
+        &self,
+    ) -> Result<super::Dw1cFinalSchedulerSnapshot, SchedulerError> {
+        self.scheduler.dw1c_final_snapshot()
     }
 
     pub(crate) fn prepare_bootstrap_carrier(
@@ -1460,6 +1474,12 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                     continue;
                 };
                 let thread = ThreadKey::from_object_id(pin.id());
+                #[cfg(deepwyrm_dw1c_evidence)]
+                let deferred_execution_generation = (defer_current == Some(thread)).then(|| {
+                    self.scheduler
+                        .current_execution_generation(thread)
+                        .expect("physical terminal current lost its exact execution generation")
+                });
                 if (defer_current == Some(thread)) != deferred_pass {
                     continue;
                 }
@@ -1522,6 +1542,9 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                         if defer_current == Some(thread) {
                             deferred = Some(DeferredCurrentExecutionResources {
                                 thread,
+                                #[cfg(deepwyrm_dw1c_evidence)]
+                                execution_generation: deferred_execution_generation
+                                    .expect("deferred current generation disappeared"),
                                 resources: Some(resources),
                                 process_pin: None,
                                 thread_pin: Some(pin),
@@ -1544,6 +1567,9 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                         );
                         deferred = Some(DeferredCurrentExecutionResources {
                             thread,
+                            #[cfg(deepwyrm_dw1c_evidence)]
+                            execution_generation: deferred_execution_generation
+                                .expect("deferred current generation disappeared"),
                             resources: Some(resources),
                             process_pin: None,
                             thread_pin: Some(pin),

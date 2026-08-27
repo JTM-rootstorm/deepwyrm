@@ -72,6 +72,10 @@ pub(crate) use wyr1_evidence::WYR1_EVIDENCE_RAW_SYSCALL;
 pub(crate) use wyr1b_evidence::WYR1B_EVIDENCE_RAW_SYSCALL;
 
 #[cfg(deepwyrm_dw1c_evidence)]
+#[allow(
+    unused_imports,
+    reason = "selector-28 target-only raw dispatch and terminal transport consume this private surface"
+)]
 pub(crate) use dw1c_evidence::{
     DW1C_ARM_BYTES, DW1C_EVIDENCE, DW1C_PROGRESS_MASK, Dw1cActor, Dw1cEvidenceError,
     Dw1cEvidenceFlushPermit,

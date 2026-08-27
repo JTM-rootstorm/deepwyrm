@@ -537,6 +537,52 @@ pub(crate) struct SchedulerCounters {
     pub(crate) overflow_fault: bool,
 }
 
+/// One selector-private, whole-scheduler accounting observation. Both
+/// identities are minted while the scheduler lock is held, after every
+/// retained ownership and accounting invariant has been validated.
+#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Dw1cFinalSchedulerSnapshot {
+    token: u64,
+    generation: u64,
+    max_ready_delay_ns: u64,
+    accounting_mask: u8,
+}
+
+#[cfg(any(test, deepwyrm_dw1c_evidence))]
+impl Dw1cFinalSchedulerSnapshot {
+    pub(crate) const fn token(self) -> u64 {
+        self.token
+    }
+
+    pub(crate) const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) const fn max_ready_delay_ns(self) -> u64 {
+        self.max_ready_delay_ns
+    }
+
+    pub(crate) const fn accounting_mask(self) -> u8 {
+        self.accounting_mask
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        token: u64,
+        generation: u64,
+        max_ready_delay_ns: u64,
+        accounting_mask: u8,
+    ) -> Self {
+        Self {
+            token,
+            generation,
+            max_ready_delay_ns,
+            accounting_mask,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum SchedulerEvent {
     ContextSwitch,
@@ -691,6 +737,10 @@ struct SchedulerState<const CAPACITY: usize> {
     next_idle_generation: u64,
     next_wake_generation: u64,
     next_completed_switch_generation: u64,
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    next_final_snapshot_token: u64,
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    next_final_snapshot_generation: u64,
     next_quantum_generation: [u64; H2_SCHEDULER_CPU_CAPACITY],
     queue: [Option<QueueEntry>; CAPACITY],
     len: usize,
@@ -706,6 +756,12 @@ struct SchedulerState<const CAPACITY: usize> {
     preemption_disable_depth: [u32; H2_SCHEDULER_CPU_CAPACITY],
     last_migration: Option<SchedulerMigrationRecord>,
     carrier_admission: CarrierAdmissionState,
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    accounting_underflow_fault: bool,
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    time_regression_fault: bool,
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    terminal_retired: [Option<ThreadKey>; CAPACITY],
     #[cfg(test)]
     trace: SchedulerTrace,
 }
@@ -722,6 +778,10 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             next_idle_generation: 1,
             next_wake_generation: 1,
             next_completed_switch_generation: 1,
+            #[cfg(any(test, deepwyrm_dw1c_evidence))]
+            next_final_snapshot_token: 1,
+            #[cfg(any(test, deepwyrm_dw1c_evidence))]
+            next_final_snapshot_generation: 1,
             next_quantum_generation: [1; H2_SCHEDULER_CPU_CAPACITY],
             queue: [None; CAPACITY],
             len: 0,
@@ -737,6 +797,12 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             preemption_disable_depth: [0; H2_SCHEDULER_CPU_CAPACITY],
             last_migration: None,
             carrier_admission: CarrierAdmissionState::new(),
+            #[cfg(any(test, deepwyrm_dw1c_evidence))]
+            accounting_underflow_fault: false,
+            #[cfg(any(test, deepwyrm_dw1c_evidence))]
+            time_regression_fault: false,
+            #[cfg(any(test, deepwyrm_dw1c_evidence))]
+            terminal_retired: [None; CAPACITY],
             #[cfg(test)]
             trace: SchedulerTrace::new(),
         }
@@ -757,13 +823,59 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         match error {
             SchedulerError::AccountingOverflow | SchedulerError::AccountingUnderflow => {
                 self.accounting.retain_faults_from(attempted);
+                #[cfg(any(test, deepwyrm_dw1c_evidence))]
+                if error == SchedulerError::AccountingUnderflow {
+                    self.accounting_underflow_fault = true;
+                }
             }
-            SchedulerError::TimeRegression => {}
+            SchedulerError::TimeRegression => {
+                #[cfg(any(test, deepwyrm_dw1c_evidence))]
+                {
+                    self.time_regression_fault = true;
+                }
+            }
             _ => panic!("unexpected scheduler telemetry rejection: {error:?}"),
         }
         #[cfg(not(test))]
         panic!("scheduler accounting invariant failed: {error:?}");
     }
+
+    fn reject_time_regression(&mut self) -> SchedulerError {
+        #[cfg(any(test, deepwyrm_dw1c_evidence))]
+        {
+            self.time_regression_fault = true;
+        }
+        SchedulerError::TimeRegression
+    }
+
+    #[cfg(deepwyrm_dw1c_evidence)]
+    fn validate_terminal_retirement(&self, thread: ThreadKey) -> Result<(), SchedulerError> {
+        if self.terminal_retired.contains(&Some(thread)) {
+            return Err(SchedulerError::DuplicateThread);
+        }
+        if self.terminal_retired.iter().all(Option::is_some) {
+            return Err(SchedulerError::Capacity);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(deepwyrm_dw1c_evidence))]
+    fn validate_terminal_retirement(&self, _thread: ThreadKey) -> Result<(), SchedulerError> {
+        Ok(())
+    }
+
+    #[cfg(deepwyrm_dw1c_evidence)]
+    fn record_terminal_retirement(&mut self, thread: ThreadKey) {
+        let slot = self
+            .terminal_retired
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .expect("validated terminal-retirement capacity disappeared");
+        *slot = Some(thread);
+    }
+
+    #[cfg(not(deepwyrm_dw1c_evidence))]
+    fn record_terminal_retirement(&mut self, _thread: ThreadKey) {}
 
     fn assert_invariants(&self) {
         if let Err(error) = self.check_invariants() {
@@ -2548,6 +2660,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         thread: ThreadKey,
     ) -> Result<ScheduleDecision, SchedulerError> {
         let mut state = self.state.lock();
+        state.validate_terminal_retirement(thread)?;
         let cpu_index = cpu.index();
         if let Some(running_cpu) = state.running_cpu(thread) {
             if running_cpu != cpu {
@@ -2597,6 +2710,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 involuntary_preemption: false,
             });
             state.accounting = accounting;
+            state.record_terminal_retirement(thread);
             state.record_trace(
                 SchedulerTraceKind::Retire,
                 cpu,
@@ -2683,6 +2797,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 state.running[cpu_index] = state.claim_first_runnable_on(cpu)?;
             }
             state.accounting = accounting;
+            state.record_terminal_retirement(thread);
             state.record_trace(
                 SchedulerTraceKind::Retire,
                 cpu,
@@ -2715,6 +2830,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         }
         state.remove_index(index);
         state.accounting = accounting;
+        state.record_terminal_retirement(thread);
         state.record_trace(
             SchedulerTraceKind::Retire,
             cpu,
@@ -2752,6 +2868,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         if running.thread != claim.thread || running.generation != claim.generation {
             return Err(SchedulerError::StaleExecutionClaim);
         }
+        state.validate_terminal_retirement(claim.thread)?;
         if state.suspended[cpu_index].is_some() {
             return Err(SchedulerError::SwitchPending);
         }
@@ -2772,6 +2889,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             involuntary_preemption: false,
         });
         state.accounting = accounting;
+        state.record_terminal_retirement(claim.thread);
         state.record_trace(
             SchedulerTraceKind::RemoteStop,
             claim.cpu,
@@ -2805,6 +2923,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         {
             return Err(SchedulerError::StaleExecutionClaim);
         }
+        state.validate_terminal_retirement(claim.thread)?;
         let Some(index) = state.queue[..state.len]
             .iter()
             .position(|entry| entry.is_some_and(|entry| entry.thread == claim.thread))
@@ -2832,6 +2951,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             involuntary_preemption: false,
         });
         state.accounting = accounting;
+        state.record_terminal_retirement(claim.thread);
         state.record_trace(
             SchedulerTraceKind::RemoteStop,
             claim.cpu,
@@ -2915,6 +3035,110 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 .find(|claim| claim.thread == thread)
                 .map(|claim| claim.generation),
         }
+    }
+
+    /// Captures selector 28's terminal accounting relation under one scheduler
+    /// lock. No payload is returned, and no snapshot identity is consumed,
+    /// unless the complete live state and every sticky diagnostic remain
+    /// sound.
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    pub(crate) fn dw1c_final_snapshot(&self) -> Result<Dw1cFinalSchedulerSnapshot, SchedulerError> {
+        const ACCOUNTING_SOUND_MASK: u8 = 0x3f;
+
+        let mut state = self.state.lock();
+        state.check_invariants()?;
+
+        if state.accounting.cpu.iter().any(|cpu| cpu.overflow_fault) {
+            return Err(SchedulerError::AccountingOverflow);
+        }
+        if state.accounting_underflow_fault {
+            return Err(SchedulerError::AccountingUnderflow);
+        }
+        if state.time_regression_fault
+            || state.instrumentation_now_ns.iter().flatten().any(|local| {
+                state
+                    .instrumentation_global_now_ns
+                    .is_some_and(|global| *local > global)
+            })
+        {
+            return Err(SchedulerError::TimeRegression);
+        }
+
+        for (index, claim) in state.running.iter().flatten().enumerate() {
+            if state
+                .running
+                .iter()
+                .flatten()
+                .skip(index + 1)
+                .any(|other| other.thread == claim.thread)
+            {
+                return Err(SchedulerError::DuplicateThread);
+            }
+            if state.queue[..state.len]
+                .iter()
+                .flatten()
+                .any(|entry| entry.thread == claim.thread)
+            {
+                return Err(SchedulerError::DuplicateThread);
+            }
+        }
+        for (index, entry) in state.queue[..state.len].iter().flatten().enumerate() {
+            if state.queue[..state.len]
+                .iter()
+                .flatten()
+                .skip(index + 1)
+                .any(|other| other.thread == entry.thread)
+            {
+                return Err(SchedulerError::DuplicateThread);
+            }
+        }
+        if state.terminal_retired.iter().flatten().any(|terminal| {
+            state
+                .running
+                .iter()
+                .flatten()
+                .any(|claim| claim.thread == *terminal)
+                || state.queue[..state.len]
+                    .iter()
+                    .flatten()
+                    .any(|entry| entry.thread == *terminal)
+                || state
+                    .suspended
+                    .iter()
+                    .flatten()
+                    .any(|claim| claim.thread == *terminal)
+        }) {
+            return Err(SchedulerError::StaleExecutionClaim);
+        }
+
+        let token = state.next_final_snapshot_token;
+        let generation = state.next_final_snapshot_generation;
+        let next_token = token
+            .checked_add(1)
+            .filter(|next| *next != 0)
+            .ok_or(SchedulerError::TokenExhausted)?;
+        let next_generation = generation
+            .checked_add(1)
+            .filter(|next| *next != 0)
+            .ok_or(SchedulerError::TokenExhausted)?;
+        if token == 0 || generation == 0 {
+            return Err(SchedulerError::TokenExhausted);
+        }
+        let max_ready_delay_ns = state
+            .accounting
+            .cpu
+            .iter()
+            .map(|cpu| cpu.longest_ready_delay_ns)
+            .max()
+            .unwrap_or(0);
+        state.next_final_snapshot_token = next_token;
+        state.next_final_snapshot_generation = next_generation;
+        Ok(Dw1cFinalSchedulerSnapshot {
+            token,
+            generation,
+            max_ready_delay_ns,
+            accounting_mask: ACCOUNTING_SOUND_MASK,
+        })
     }
 
     #[cfg(test)]
@@ -3039,7 +3263,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         let mut state = self.state.lock();
         let cpu_index = cpu.index();
         if state.instrumentation_now_ns[cpu_index].is_some_and(|previous| now_ns < previous) {
-            return Err(SchedulerError::TimeRegression);
+            return Err(state.reject_time_regression());
         }
         state.instrumentation_now_ns[cpu_index] = Some(now_ns);
         state.instrumentation_global_now_ns = Some(
@@ -3069,7 +3293,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         }
         if state.instrumentation_now_ns[cpu_index].is_some_and(|previous| started_at_ns < previous)
         {
-            return Err(SchedulerError::TimeRegression);
+            return Err(state.reject_time_regression());
         }
         let generation = state.next_idle_generation;
         let next_generation = generation
@@ -3118,11 +3342,12 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         let cpu_index = token.cpu.index();
         if state.instrumentation_now_ns[cpu_index].is_some_and(|previous| finished_at_ns < previous)
         {
-            return Err(SchedulerError::TimeRegression);
+            return Err(state.reject_time_regression());
         }
-        let elapsed_ns = finished_at_ns
-            .checked_sub(token.started_at_ns)
-            .ok_or(SchedulerError::TimeRegression)?;
+        let elapsed_ns = match finished_at_ns.checked_sub(token.started_at_ns) {
+            Some(elapsed_ns) => elapsed_ns,
+            None => return Err(state.reject_time_regression()),
+        };
         let mut accounting = state.accounting;
         if let Err(error) = accounting
             .counters_mut(token.cpu)

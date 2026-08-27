@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use crate::ipc::ChannelEndpointKey;
 use crate::object::ObjectId;
 use crate::sync::SpinMutex;
-use crate::task::{ProcessKey, ThreadKey};
+use crate::task::{Dw1cFinalSchedulerSnapshot, ProcessKey, ThreadKey};
 use deepwyrm_abi::DW_SIGNAL_WRITABLE;
 
 pub(crate) const DW1C_EVIDENCE_RAW_SYSCALL: u32 = 0xffff_ff1c;
@@ -21,6 +21,11 @@ pub(crate) const DW1C_EVIDENCE_RECORD_CAPACITY: usize = 46;
 pub(crate) const DW1C_ACTOR_COUNT: usize = 10;
 pub(crate) const DW1C_ARM_BYTES: usize = DW1C_ACTOR_COUNT * 24;
 pub(crate) const DW1C_ARM_TIMEOUT_SECONDS: u64 = 240;
+pub(crate) const DW1C_ARM_TIMEOUT_NS: u64 =
+    match DW1C_ARM_TIMEOUT_SECONDS.checked_mul(1_000_000_000) {
+        Some(timeout_ns) => timeout_ns,
+        None => panic!("DW1C ARM timeout does not fit nanoseconds"),
+    };
 /// A selector-private workload count is bounded to prevent a malformed raw
 /// request from turning a progress acknowledgement into an unbounded value.
 pub(crate) const DW1C_PROGRESS_MAX: u64 = u32::MAX as u64;
@@ -44,6 +49,8 @@ pub(crate) enum Dw1cEvidenceError {
     WrongActor,
     WrongGeneration,
     MissingKernelFact,
+    TimeRegression,
+    DeadlineExceeded,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,6 +159,8 @@ struct State {
     actors: [Option<Dw1cActor>; DW1C_ACTOR_COUNT],
     progress: [u64; 5],
     arm_timeout_seconds: u64,
+    arm_started_ns: Option<u64>,
+    workload_complete: bool,
     cpu_ready_payload: [Option<Dw1cRecordPayload>; 4],
     run_payload: [Option<Dw1cRecordPayload>; 4],
     quantum_payload: [Option<Dw1cRecordPayload>; 4],
@@ -159,9 +168,14 @@ struct State {
     remote_wake_payload: [Option<Dw1cRecordPayload>; 4],
     steal_migrate_payload: Option<Dw1cRecordPayload>,
     migration_reject_payload: Option<Dw1cRecordPayload>,
+    race_matrix_payload: Option<Dw1cRecordPayload>,
     exit_payload: [Option<Dw1cRecordPayload>; 2],
     reap_payload: [Option<Dw1cRecordPayload>; 2],
     lifecycle_process_generation: [Option<u64>; 2],
+    ready_delay_payload: Option<Dw1cRecordPayload>,
+    bootstrap_normal_payload: Option<Dw1cRecordPayload>,
+    accounting_sound_payload: Option<Dw1cRecordPayload>,
+    next_primordial_completion_token: u64,
     token6_wait_joined: bool,
     token6_wake_seen: bool,
     token6_run_seen: bool,
@@ -195,6 +209,8 @@ impl State {
             actors: [None; DW1C_ACTOR_COUNT],
             progress: [0; 5],
             arm_timeout_seconds: 0,
+            arm_started_ns: None,
+            workload_complete: false,
             cpu_ready_payload: [None; 4],
             run_payload: [None; 4],
             quantum_payload: [None; 4],
@@ -202,9 +218,14 @@ impl State {
             remote_wake_payload: [None; 4],
             steal_migrate_payload: None,
             migration_reject_payload: None,
+            race_matrix_payload: None,
             exit_payload: [None; 2],
             reap_payload: [None; 2],
             lifecycle_process_generation: [None; 2],
+            ready_delay_payload: None,
+            bootstrap_normal_payload: None,
+            accounting_sound_payload: None,
+            next_primordial_completion_token: 1,
             token6_wait_joined: false,
             token6_wake_seen: false,
             token6_run_seen: false,
@@ -450,6 +471,7 @@ impl Dw1cEvidenceCollector {
         &self,
         reporter: (ProcessKey, ThreadKey),
         actors: [Dw1cActor; DW1C_ACTOR_COUNT],
+        arm_started_ns: u64,
     ) -> Result<(), Dw1cEvidenceError> {
         let mut state = self.state.lock();
         if !state.installed {
@@ -497,6 +519,7 @@ impl Dw1cEvidenceCollector {
         }
         state.reporter = Some(reporter);
         state.arm_timeout_seconds = DW1C_ARM_TIMEOUT_SECONDS;
+        state.arm_started_ns = Some(arm_started_ns);
         state.token6_wait_joined = token6_wait_joined;
         state.lifecycle_process_generation = lifecycle_generations;
         for (slot, actor) in state.actors.iter_mut().zip(actors) {
@@ -1126,12 +1149,14 @@ impl Dw1cEvidenceCollector {
         Ok(())
     }
 
-    pub(crate) fn complete(
+    /// Accepts userspace's one correlation-only workload completion. This
+    /// never claims terminal authority and cannot serialize or debug-exit.
+    pub(crate) fn workload_complete(
         &self,
         caller: ProcessKey,
         mask: u64,
         digest: u64,
-    ) -> Result<Dw1cEvidenceFlushPermit<'_>, Dw1cEvidenceError> {
+    ) -> Result<(), Dw1cEvidenceError> {
         let mut state = self.state.lock();
         if let Some(error) = state.failure {
             return Err(error);
@@ -1142,12 +1167,110 @@ impl Dw1cEvidenceCollector {
         if state.arm_timeout_seconds != DW1C_ARM_TIMEOUT_SECONDS {
             return Err(state.latch(Dw1cEvidenceError::Malformed));
         }
-        if mask != u64::from(DW1C_PROGRESS_MASK)
-            || digest != self.digest
-            || state.progress.iter().any(|count| *count == 0)
-        {
+        if state.workload_complete || state.terminal {
+            return Err(state.latch(Dw1cEvidenceError::Duplicate));
+        }
+        if digest != self.digest {
+            return Err(state.latch(Dw1cEvidenceError::WrongDigest));
+        }
+        if mask != u64::from(DW1C_PROGRESS_MASK) {
             return Err(state.latch(Dw1cEvidenceError::Malformed));
         }
+        if state.progress.contains(&0) {
+            return Err(state.latch(Dw1cEvidenceError::MissingKernelFact));
+        }
+        state.workload_complete = true;
+        Ok(())
+    }
+
+    /// Joins the genuine normal primordial completion to the already accepted
+    /// workload and one exact scheduler snapshot. Only this path may claim the
+    /// terminal flush permit.
+    pub(crate) fn final_normal_completion(
+        &self,
+        completed_at_ns: u64,
+        product_execution_generation: u64,
+        snapshot: Dw1cFinalSchedulerSnapshot,
+    ) -> Result<Dw1cEvidenceFlushPermit<'_>, Dw1cEvidenceError> {
+        let mut state = self.state.lock();
+        if let Some(error) = state.failure {
+            return Err(error);
+        }
+        if state.terminal {
+            return Err(state.latch(Dw1cEvidenceError::Duplicate));
+        }
+        if !state.workload_complete {
+            return Err(state.latch(Dw1cEvidenceError::MissingKernelFact));
+        }
+        let Some(started_at_ns) = state.arm_started_ns else {
+            return Err(state.latch(Dw1cEvidenceError::Early));
+        };
+        let elapsed_ns = match completed_at_ns.checked_sub(started_at_ns) {
+            Some(elapsed_ns) => elapsed_ns,
+            None => return Err(state.latch(Dw1cEvidenceError::TimeRegression)),
+        };
+        if elapsed_ns > DW1C_ARM_TIMEOUT_NS {
+            return Err(state.latch(Dw1cEvidenceError::DeadlineExceeded));
+        }
+        if product_execution_generation == 0
+            || snapshot.token() == 0
+            || snapshot.generation() == 0
+            || snapshot.accounting_mask() != 0x3f
+            || state.facts.cpu_ready != 0x0f
+            || state.facts.run != 0x0f
+            || state.facts.quantum != 0x0f
+            || state.facts.preempt != 0x0f
+            || state.facts.remote_wake != 0x0f
+            || !state.facts.steal_migrate
+            || !state.facts.migration_reject_execution_pinned
+            || state.facts.race_matrix != 0x0f
+            || state.facts.lifecycle != 0x03
+            || state.facts.bootstrap_normal
+            || state.facts.accounting_sound
+            || state.facts.ready_delay_ns != 0
+            || state.race_matrix_payload.is_some()
+            || state.ready_delay_payload.is_some()
+            || state.bootstrap_normal_payload.is_some()
+            || state.accounting_sound_payload.is_some()
+        {
+            return Err(state.latch(Dw1cEvidenceError::MissingKernelFact));
+        }
+        let Some(token8) = state.actors[7] else {
+            return Err(state.latch(Dw1cEvidenceError::MissingKernelFact));
+        };
+        let completion_token = state.next_primordial_completion_token;
+        let Some(next_completion_token) = completion_token.checked_add(1).filter(|next| *next != 0)
+        else {
+            return Err(state.latch(Dw1cEvidenceError::Malformed));
+        };
+        if completion_token == 0 {
+            return Err(state.latch(Dw1cEvidenceError::Malformed));
+        }
+        state.race_matrix_payload = Some(Dw1cRecordPayload {
+            subject: 8,
+            generation: token8.execution_generation,
+            value: u64::from(DW1C_PROGRESS_MASK),
+        });
+        state.ready_delay_payload = Some(Dw1cRecordPayload {
+            subject: snapshot.token(),
+            generation: snapshot.generation(),
+            value: snapshot.max_ready_delay_ns(),
+        });
+        state.bootstrap_normal_payload = Some(Dw1cRecordPayload {
+            subject: completion_token,
+            generation: product_execution_generation,
+            value: 0,
+        });
+        state.accounting_sound_payload = Some(Dw1cRecordPayload {
+            subject: snapshot.token(),
+            generation: snapshot.generation(),
+            value: u64::from(snapshot.accounting_mask()),
+        });
+        state.next_primordial_completion_token = next_completion_token;
+        state.facts.race_matrix |= 1 << 4;
+        state.facts.ready_delay_ns = snapshot.max_ready_delay_ns();
+        state.facts.bootstrap_normal = true;
+        state.facts.accounting_sound = true;
         if !state.facts.complete() {
             return Err(state.latch(Dw1cEvidenceError::MissingKernelFact));
         }
@@ -1173,7 +1296,11 @@ impl Dw1cEvidenceCollector {
         write: impl FnMut(&[u8; DW1C_EVIDENCE_RECORD_LEN]) -> Result<(), ()>,
     ) -> Result<(), Dw1cEvidenceError> {
         let state = self.state.lock();
-        if state.failure.is_some() || !state.terminal || !state.facts.complete() {
+        if state.failure.is_some()
+            || !state.workload_complete
+            || !state.terminal
+            || !state.facts.complete()
+        {
             return Err(Dw1cEvidenceError::Incomplete);
         }
         let mut write = write;
@@ -1410,8 +1537,12 @@ fn payload_for(sequence: usize, state: &State) -> Result<Dw1cRecordPayload, Dw1c
         31..=34 => state.remote_wake_payload[sequence - 31],
         35 => state.steal_migrate_payload,
         36 => state.migration_reject_payload,
+        37 => state.race_matrix_payload,
         38..=39 => state.exit_payload[sequence - 38],
         40..=41 => state.reap_payload[sequence - 40],
+        42 => state.ready_delay_payload,
+        43 => state.bootstrap_normal_payload,
+        44 => state.accounting_sound_payload,
         45 => Some(Dw1cRecordPayload {
             subject: 0,
             generation: 0,
@@ -1551,7 +1682,7 @@ mod tests {
         let collector = Dw1cEvidenceCollector::new(1, 2);
         collector.install().unwrap();
         observe_prospective_actors(&collector, &actors);
-        collector.arm(reporter, actors).unwrap();
+        collector.arm(reporter, actors, 100).unwrap();
         (collector, actors)
     }
 
@@ -1597,6 +1728,86 @@ mod tests {
         }
     }
 
+    fn completion_ready_collector() -> (Dw1cEvidenceCollector, [Dw1cActor; DW1C_ACTOR_COUNT]) {
+        let (collector, actors) = armed_collector();
+        let reporter = collector.state.lock().reporter.unwrap().0;
+        {
+            let mut state = collector.state.lock();
+            state.progress = [11, 12, 13, 14, 15];
+            for cpu in 0..4 {
+                let actor = actors[cpu];
+                let payload = Dw1cRecordPayload {
+                    subject: u64::from(actor.token),
+                    generation: actor.execution_generation,
+                    value: cpu as u64,
+                };
+                state.cpu_ready_payload[cpu] = Some(Dw1cRecordPayload {
+                    subject: 0x100 + cpu as u64,
+                    generation: 0x200 + cpu as u64,
+                    value: 0x300 + cpu as u64,
+                });
+                state.run_payload[cpu] = Some(payload);
+                state.quantum_payload[cpu] = Some(Dw1cRecordPayload {
+                    value: 0x400 + cpu as u64,
+                    ..payload
+                });
+                state.preempt_payload[cpu] = Some(Dw1cRecordPayload {
+                    value: 0x500 + cpu as u64,
+                    ..payload
+                });
+                state.remote_wake_payload[cpu] = Some(Dw1cRecordPayload {
+                    value: cpu as u64 | (((cpu + 1) % 4) as u64) << 8 | (1_u64 << 16),
+                    ..payload
+                });
+            }
+            state.steal_migrate_payload = Some(Dw1cRecordPayload {
+                subject: 5,
+                generation: 0x8000,
+                value: 0x0203,
+            });
+            state.migration_reject_payload = Some(Dw1cRecordPayload {
+                subject: 6,
+                generation: actors[5].execution_generation,
+                value: 1 | (u64::from(DW1C_MIGRATION_REJECT_EXECUTION_PINNED) << 8),
+            });
+            for index in 0..2 {
+                let actor = actors[index + 8];
+                state.exit_payload[index] = Some(Dw1cRecordPayload {
+                    subject: u64::from(actor.token),
+                    generation: actor.execution_generation,
+                    value: 0,
+                });
+                state.reap_payload[index] = Some(Dw1cRecordPayload {
+                    subject: u64::from(actor.token),
+                    generation: actor.process.object_id().generation(),
+                    value: 1,
+                });
+            }
+            state.facts = Dw1cKernelFacts {
+                cpu_ready: 0x0f,
+                run: 0x0f,
+                quantum: 0x0f,
+                preempt: 0x0f,
+                remote_wake: 0x0f,
+                steal_migrate: true,
+                migration_reject_execution_pinned: true,
+                race_matrix: 0x0f,
+                lifecycle: 0x03,
+                bootstrap_normal: false,
+                accounting_sound: false,
+                ready_delay_ns: 0,
+            };
+        }
+        collector
+            .workload_complete(reporter, u64::from(DW1C_PROGRESS_MASK), 2)
+            .unwrap();
+        (collector, actors)
+    }
+
+    const fn final_snapshot(max_ready_delay_ns: u64) -> Dw1cFinalSchedulerSnapshot {
+        Dw1cFinalSchedulerSnapshot::for_test(0x91, 0x92, max_ready_delay_ns, 0x3f)
+    }
+
     #[test]
     fn fixed_stream_is_46_records_of_96_bytes() {
         let a = encode_record(
@@ -1621,6 +1832,206 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn source_contract_keeps_raw_op3_nonterminal_and_flushes_only_normal_completion() {
+        let source = include_str!("../arch/x86_64/mm/activation/primordial.rs");
+        let raw = source
+            .split("fn intercept_dw1c_evidence_raw(")
+            .nth(1)
+            .unwrap()
+            .split("fn authorize_return(")
+            .next()
+            .unwrap();
+        assert!(raw.contains(".workload_complete(self.process, values[1], values[2])"));
+        assert!(!raw.contains("complete_dw1c_evidence"));
+        assert!(!raw.contains("final_normal_completion"));
+        assert!(
+            raw.find("crate::time::monotonic_now()")
+                < raw.find("let phase = self.reserve_runtime_phase()")
+        );
+
+        assert_eq!(
+            source.matches("complete_primordial_launch(self);").count(),
+            2
+        );
+        assert_eq!(source.matches(".final_normal_completion(").count(), 2);
+        assert_eq!(
+            source
+                .matches("crate::test_support::complete_dw1c_evidence(permit)")
+                .count(),
+            2
+        );
+        for completion in source.split("complete_primordial_launch(self);").skip(1) {
+            let hook = completion
+                .split("#[cfg(all(feature = \"test-support\", deepwyrm_dw1b_evidence))]")
+                .next()
+                .unwrap();
+            let normal = hook.find("if completion.is_err()").unwrap();
+            let time = hook.find("crate::time::monotonic_now()").unwrap();
+            let snapshot = hook.find(".dw1c_final_scheduler_snapshot()").unwrap();
+            let join = hook.find(".final_normal_completion(").unwrap();
+            let flush = hook
+                .find("crate::test_support::complete_dw1c_evidence(permit)")
+                .unwrap();
+            assert!(normal < time && time < snapshot && snapshot < join && join < flush);
+        }
+    }
+
+    #[test]
+    fn workload_complete_is_one_time_correlation_and_never_flushes() {
+        let (early, _) = armed_collector();
+        let early_reporter = early.state.lock().reporter.unwrap().0;
+        assert_eq!(
+            early.workload_complete(early_reporter, u64::from(DW1C_PROGRESS_MASK), 2),
+            Err(Dw1cEvidenceError::MissingKernelFact)
+        );
+        let mut writes = 0;
+        assert_eq!(
+            early.flush(|_| {
+                writes += 1;
+                Ok(())
+            }),
+            Err(Dw1cEvidenceError::Incomplete)
+        );
+        assert_eq!(writes, 0);
+
+        let (replay, _) = completion_ready_collector();
+        let reporter = replay.state.lock().reporter.unwrap().0;
+        assert_eq!(replay.terminal.load(Ordering::Acquire), 0);
+        assert_eq!(
+            replay.workload_complete(reporter, u64::from(DW1C_PROGRESS_MASK), 2),
+            Err(Dw1cEvidenceError::Duplicate)
+        );
+        assert_eq!(replay.terminal.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn bounded_completion_accepts_exact_limit_and_rejects_one_ns_over_or_regression() {
+        let (exact, _) = completion_ready_collector();
+        assert!(
+            exact
+                .final_normal_completion(100 + DW1C_ARM_TIMEOUT_NS, 0xa1, final_snapshot(9))
+                .is_ok()
+        );
+        assert_eq!(exact.state.lock().facts.race_matrix, DW1C_PROGRESS_MASK);
+
+        let (over, _) = completion_ready_collector();
+        assert!(matches!(
+            over.final_normal_completion(101 + DW1C_ARM_TIMEOUT_NS, 0xa1, final_snapshot(9)),
+            Err(Dw1cEvidenceError::DeadlineExceeded)
+        ));
+        assert_eq!(over.terminal.load(Ordering::Acquire), 0);
+
+        let (regression, _) = completion_ready_collector();
+        assert!(matches!(
+            regression.final_normal_completion(99, 0xa1, final_snapshot(9)),
+            Err(Dw1cEvidenceError::TimeRegression)
+        ));
+        assert_eq!(regression.terminal.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn final_completion_requires_every_kernel_fact_and_each_preexisting_race_bit() {
+        for missing in 0..13 {
+            let (collector, _) = completion_ready_collector();
+            {
+                let mut state = collector.state.lock();
+                match missing {
+                    0 => state.facts.cpu_ready &= !1,
+                    1 => state.facts.run &= !1,
+                    2 => state.facts.quantum &= !1,
+                    3 => state.facts.preempt &= !1,
+                    4 => state.facts.remote_wake &= !1,
+                    5 => state.facts.steal_migrate = false,
+                    6 => state.facts.migration_reject_execution_pinned = false,
+                    7..=10 => state.facts.race_matrix &= !(1 << (missing - 7)),
+                    11 => state.facts.lifecycle &= !1,
+                    12 => state.facts.lifecycle &= !2,
+                    _ => unreachable!(),
+                }
+            }
+            assert!(matches!(
+                collector.final_normal_completion(101, 0xa1, final_snapshot(9)),
+                Err(Dw1cEvidenceError::MissingKernelFact)
+            ));
+            assert_eq!(collector.terminal.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn final_flush_decodes_all_46_exact_stored_payloads() {
+        let (collector, actors) = completion_ready_collector();
+        let permit = collector
+            .final_normal_completion(100 + DW1C_ARM_TIMEOUT_NS, 0xa1, final_snapshot(0x99))
+            .unwrap();
+        let expected: [Dw1cRecordPayload; DW1C_EVIDENCE_RECORD_CAPACITY] = {
+            let state = collector.state.lock();
+            core::array::from_fn(|sequence| payload_for(sequence, &state).unwrap())
+        };
+        let mut records = [EMPTY; DW1C_EVIDENCE_RECORD_CAPACITY];
+        let mut record_count = 0;
+        permit
+            .flush(|record| {
+                records[record_count] = *record;
+                record_count += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(record_count, DW1C_EVIDENCE_RECORD_CAPACITY);
+        for (sequence, record) in records.iter().enumerate() {
+            assert_eq!(
+                decoded_payload(record),
+                expected[sequence],
+                "sequence {sequence}"
+            );
+            assert_eq!(
+                u8::from_str_radix(core::str::from_utf8(&record[34..36]).unwrap(), 16).unwrap(),
+                event_for(sequence),
+                "event sequence {sequence}"
+            );
+        }
+        assert_eq!(
+            expected[37],
+            Dw1cRecordPayload {
+                subject: 8,
+                generation: actors[7].execution_generation,
+                value: 0x1f,
+            }
+        );
+        assert_eq!(
+            expected[42],
+            Dw1cRecordPayload {
+                subject: 0x91,
+                generation: 0x92,
+                value: 0x99,
+            }
+        );
+        assert_eq!(
+            expected[43],
+            Dw1cRecordPayload {
+                subject: 1,
+                generation: 0xa1,
+                value: 0,
+            }
+        );
+        assert_eq!(
+            expected[44],
+            Dw1cRecordPayload {
+                subject: 0x91,
+                generation: 0x92,
+                value: 0x3f,
+            }
+        );
+        assert_eq!(
+            expected[45],
+            Dw1cRecordPayload {
+                subject: 0,
+                generation: 0,
+                value: 0,
+            }
+        );
+    }
     #[test]
     fn arm_rejects_duplicate_subjects() {
         let c = Dw1cEvidenceCollector::new(1, 2);
@@ -1638,7 +2049,7 @@ mod tests {
             actor(10),
         ];
         assert!(
-            c.arm((actors[0].process, actors[0].thread), actors)
+            c.arm((actors[0].process, actors[0].thread), actors, 100)
                 .is_err()
         );
     }
@@ -1662,7 +2073,7 @@ mod tests {
         collector.install().unwrap();
 
         assert_eq!(
-            collector.arm(reporter, actors),
+            collector.arm(reporter, actors, 100),
             Err(Dw1cEvidenceError::MissingKernelFact)
         );
         assert!(
@@ -1697,7 +2108,7 @@ mod tests {
             .observe_bound_wait_claim(actors[5].thread, actors[5].execution_generation)
             .unwrap();
         assert_eq!(
-            missing_create.arm(reporter, actors),
+            missing_create.arm(reporter, actors, 100),
             Err(Dw1cEvidenceError::MissingKernelFact)
         );
 
@@ -1719,7 +2130,7 @@ mod tests {
             .observe_bound_wait_claim(actors[5].thread, actors[5].execution_generation)
             .unwrap();
         assert_eq!(
-            missing_start.arm(reporter, actors),
+            missing_start.arm(reporter, actors, 100),
             Err(Dw1cEvidenceError::MissingKernelFact)
         );
 
@@ -1739,7 +2150,7 @@ mod tests {
             .observe_bound_wait_claim(actors[5].thread, actors[5].execution_generation + 1)
             .unwrap();
         assert_eq!(
-            stale_wait.arm(reporter, actors),
+            stale_wait.arm(reporter, actors, 100),
             Err(Dw1cEvidenceError::MissingKernelFact)
         );
     }
@@ -1758,7 +2169,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            collector.arm(reporter, actors),
+            collector.arm(reporter, actors, 100),
             Err(Dw1cEvidenceError::MissingKernelFact)
         );
 
@@ -1774,7 +2185,7 @@ mod tests {
         unrelated.observe_thread_create(process, thread).unwrap();
         unrelated.observe_thread_start(process, thread, 99).unwrap();
         unrelated.observe_bound_wait_claim(thread, 99).unwrap();
-        unrelated.arm(reporter, actors).unwrap();
+        unrelated.arm(reporter, actors, 100).unwrap();
         assert_eq!(unrelated.state.lock().failure, None);
         assert_eq!(
             unrelated.observe_thread_create(actors[0].process, thread),
@@ -2528,7 +2939,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_fails_before_terminal_claim_when_later_payload_families_are_missing() {
+    fn final_completion_fails_before_terminal_claim_when_later_payload_families_are_missing() {
         let (collector, actors) = armed_collector();
         let reporter = collector.state.lock().reporter.unwrap();
         {
@@ -2578,17 +2989,24 @@ mod tests {
                 remote_wake: 0x0f,
                 steal_migrate: true,
                 migration_reject_execution_pinned: true,
-                race_matrix: DW1C_PROGRESS_MASK,
+                race_matrix: 0x0f,
                 lifecycle: 0x03,
-                bootstrap_normal: true,
-                accounting_sound: true,
-                ready_delay_ns: 1,
+                bootstrap_normal: false,
+                accounting_sound: false,
+                ready_delay_ns: 0,
             };
         }
 
-        assert!(collector.state.lock().facts.complete());
+        assert!(!collector.state.lock().facts.complete());
+        collector
+            .workload_complete(reporter.0, u64::from(DW1C_PROGRESS_MASK), 2)
+            .unwrap();
         assert!(matches!(
-            collector.complete(reporter.0, u64::from(DW1C_PROGRESS_MASK), 2),
+            collector.final_normal_completion(
+                101,
+                1,
+                Dw1cFinalSchedulerSnapshot::for_test(1, 1, 1, 0x3f),
+            ),
             Err(Dw1cEvidenceError::Incomplete)
         ));
         assert_eq!(collector.terminal.load(Ordering::Acquire), 0);

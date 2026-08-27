@@ -1121,6 +1121,8 @@ struct TerminalRetirementState {
     retired_process: ProcessKey,
     retired_root_key: crate::memory::address_region::AddressRegionObjectKey,
     retired_address_space: crate::memory::address_region::AddressSpaceKey,
+    #[cfg(deepwyrm_dw1c_evidence)]
+    product_execution_generation: u64,
     #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
     retiring_wyr1_primordial: bool,
     #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
@@ -2852,6 +2854,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     None => panic!("terminal handoff repeated after Thread retirement"),
                 }
             });
+        #[cfg(deepwyrm_dw1c_evidence)]
+        let product_execution_generation = deferred.execution_generation();
         crate::syscall::complete_deferred_current_reclaim_on(
             &mut self.registry,
             &self.shared.execution,
@@ -2896,6 +2900,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             retired_process,
             retired_root_key,
             retired_address_space,
+            #[cfg(deepwyrm_dw1c_evidence)]
+            product_execution_generation,
             #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
             retiring_wyr1_primordial,
             #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
@@ -3017,7 +3023,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             };
         }
 
-        PreparedTerminalStep::Final(self.finish_primordial_terminal_handoff())
+        PreparedTerminalStep::Final(self.finish_primordial_terminal_handoff(
+            #[cfg(deepwyrm_dw1c_evidence)]
+            retirement.product_execution_generation,
+        ))
     }
 
     fn finish_terminal_successor(
@@ -3180,8 +3189,28 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
-    fn finish_primordial_terminal_handoff(&mut self) -> PreparedTerminalHandoff {
+    fn finish_primordial_terminal_handoff(
+        &mut self,
+        #[cfg(deepwyrm_dw1c_evidence)] product_execution_generation: u64,
+    ) -> PreparedTerminalHandoff {
         let completion = complete_primordial_launch(self);
+        #[cfg(all(feature = "test-support", deepwyrm_dw1c_evidence))]
+        {
+            if completion.is_err() {
+                crate::test_support::complete_fail(self.g5_probe.failure_detail(&completion))
+            }
+            let completed_at_ns = crate::time::monotonic_now()
+                .unwrap_or_else(|_| crate::test_support::complete_fail(0x2810_e018));
+            let snapshot = self
+                .shared
+                .execution
+                .dw1c_final_scheduler_snapshot()
+                .unwrap_or_else(|_| crate::test_support::complete_fail(0x2810_e019));
+            let permit = crate::test_support::DW1C_EVIDENCE
+                .final_normal_completion(completed_at_ns, product_execution_generation, snapshot)
+                .unwrap_or_else(|_| crate::test_support::complete_fail(0x2810_e01a));
+            crate::test_support::complete_dw1c_evidence(permit)
+        }
         #[cfg(all(feature = "test-support", deepwyrm_dw1b_evidence))]
         {
             let primordial_normal = self.g5_probe.accepts_completion(&completion);
@@ -3195,7 +3224,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 Err(error) => crate::test_support::complete_fail(dw1b_evidence_detail(error)),
             }
         }
-        #[cfg(all(feature = "test-support", not(deepwyrm_dw1b_evidence)))]
+        #[cfg(all(
+            feature = "test-support",
+            not(any(deepwyrm_dw1b_evidence, deepwyrm_dw1c_evidence))
+        ))]
         if self.g5_probe.accepts_completion(&completion) {
             crate::test_support::complete_pass(0)
         } else {
@@ -3265,6 +3297,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     None => panic!("terminal handoff repeated after Thread retirement"),
                 }
             });
+        #[cfg(deepwyrm_dw1c_evidence)]
+        let product_execution_generation = deferred.execution_generation();
         crate::syscall::complete_deferred_current_reclaim_on(
             &mut self.registry,
             &self.shared.execution,
@@ -3582,6 +3616,23 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
 
         let completion = complete_primordial_launch(self);
+        #[cfg(all(feature = "test-support", deepwyrm_dw1c_evidence))]
+        {
+            if completion.is_err() {
+                crate::test_support::complete_fail(self.g5_probe.failure_detail(&completion))
+            }
+            let completed_at_ns = crate::time::monotonic_now()
+                .unwrap_or_else(|_| crate::test_support::complete_fail(0x2810_e018));
+            let snapshot = self
+                .shared
+                .execution
+                .dw1c_final_scheduler_snapshot()
+                .unwrap_or_else(|_| crate::test_support::complete_fail(0x2810_e019));
+            let permit = crate::test_support::DW1C_EVIDENCE
+                .final_normal_completion(completed_at_ns, product_execution_generation, snapshot)
+                .unwrap_or_else(|_| crate::test_support::complete_fail(0x2810_e01a));
+            crate::test_support::complete_dw1c_evidence(permit)
+        }
         #[cfg(all(feature = "test-support", deepwyrm_dw1b_evidence))]
         {
             let primordial_normal = self.g5_probe.accepts_completion(&completion);
@@ -3595,7 +3646,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 Err(error) => crate::test_support::complete_fail(dw1b_evidence_detail(error)),
             }
         }
-        #[cfg(all(feature = "test-support", not(deepwyrm_dw1b_evidence)))]
+        #[cfg(all(
+            feature = "test-support",
+            not(any(deepwyrm_dw1b_evidence, deepwyrm_dw1c_evidence))
+        ))]
         if self.g5_probe.accepts_completion(&completion) {
             crate::test_support::complete_pass(0)
         } else {
@@ -5455,6 +5509,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         };
 
         let values = arguments.as_array();
+        let arm_started_ns = if values[0] == 1 {
+            Some(
+                crate::time::monotonic_now()
+                    .unwrap_or_else(|_| crate::test_support::complete_fail(0x2810_e018)),
+            )
+        } else {
+            None
+        };
         let phase = self.reserve_runtime_phase();
         match values[0] {
             1 => {
@@ -5535,7 +5597,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                     }
                 });
                 DW1C_EVIDENCE
-                    .arm((self.process, self.thread), actors)
+                    .arm(
+                        (self.process, self.thread),
+                        actors,
+                        arm_started_ns.expect("ARM sampled time before runtime authority"),
+                    )
                     .unwrap_or_else(|_| crate::test_support::complete_fail(0x2810_e00c));
             }
             2 => {
@@ -5554,11 +5620,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                 if values[1] != u64::from(DW1C_PROGRESS_MASK) {
                     crate::test_support::complete_fail(0x2810_e013)
                 }
-                let permit = DW1C_EVIDENCE
-                    .complete(self.process, values[1], values[2])
+                DW1C_EVIDENCE
+                    .workload_complete(self.process, values[1], values[2])
                     .unwrap_or_else(|_| crate::test_support::complete_fail(0x2810_e014));
-                self.commit_runtime_phase(phase);
-                crate::test_support::complete_dw1c_evidence(permit)
             }
             _ => crate::test_support::complete_fail(0x2810_e015),
         }

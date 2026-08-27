@@ -180,6 +180,144 @@ fn checked_accounting_freezes_overflow_and_rejects_bad_gauges_and_time() {
 }
 
 #[test]
+fn dw1c_final_snapshot_is_one_lock_fresh_and_uses_maximum_cpu_ready_delay() {
+    let scheduler = CooperativeScheduler::<4>::new();
+    {
+        let mut state = scheduler.state.lock();
+        for (cpu, delay) in [7, 31, 19, 23].into_iter().enumerate() {
+            state.accounting.cpu[cpu].longest_ready_delay_ns = delay;
+        }
+    }
+
+    let first = scheduler.dw1c_final_snapshot().unwrap();
+    assert_eq!(first.token(), 1);
+    assert_eq!(first.generation(), 1);
+    assert_eq!(first.max_ready_delay_ns(), 31);
+    assert_eq!(first.accounting_mask(), 0x3f);
+    let second = scheduler.dw1c_final_snapshot().unwrap();
+    assert_eq!(second.token(), 2);
+    assert_eq!(second.generation(), 2);
+
+    let rollover = CooperativeScheduler::<1>::new();
+    {
+        let mut state = rollover.state.lock();
+        state.next_final_snapshot_token = u64::MAX;
+        state.next_final_snapshot_generation = 9;
+    }
+    assert_eq!(
+        rollover.dw1c_final_snapshot(),
+        Err(SchedulerError::TokenExhausted)
+    );
+    let state = rollover.state.lock();
+    assert_eq!(state.next_final_snapshot_token, u64::MAX);
+    assert_eq!(state.next_final_snapshot_generation, 9);
+}
+
+#[test]
+fn dw1c_final_snapshot_rejects_sticky_accounting_and_time_faults() {
+    let mut registry = ObjectRegistry::<16>::new();
+    let scheduler = CooperativeScheduler::<1>::new();
+    let thread = thread_key(&mut registry);
+    scheduler
+        .commit(scheduler.reserve(thread).unwrap())
+        .unwrap();
+    {
+        let mut state = scheduler.state.lock();
+        state.accounting.cpu[0].current_runnable = 0;
+    }
+    assert_eq!(
+        scheduler.retire(thread),
+        Err(SchedulerError::AccountingUnderflow)
+    );
+    {
+        let mut state = scheduler.state.lock();
+        state.accounting.cpu[0].current_runnable = 1;
+    }
+    assert_eq!(
+        scheduler.dw1c_final_snapshot(),
+        Err(SchedulerError::AccountingUnderflow)
+    );
+
+    let time = CooperativeScheduler::<1>::new();
+    time.observe_instrumentation_time_on(cpu(0), 10).unwrap();
+    assert_eq!(
+        time.observe_instrumentation_time_on(cpu(0), 9),
+        Err(SchedulerError::TimeRegression)
+    );
+    assert_eq!(
+        time.dw1c_final_snapshot(),
+        Err(SchedulerError::TimeRegression)
+    );
+
+    let overflow = CooperativeScheduler::<1>::new();
+    overflow.state.lock().accounting.cpu[0].overflow_fault = true;
+    assert_eq!(
+        overflow.dw1c_final_snapshot(),
+        Err(SchedulerError::AccountingOverflow)
+    );
+}
+
+#[test]
+fn dw1c_final_snapshot_rejects_duplicate_and_terminal_scheduler_ownership() {
+    let mut registry = ObjectRegistry::<16>::new();
+
+    let duplicate_running = CooperativeScheduler::<2>::new();
+    let running = thread_key(&mut registry);
+    let claim = RunningClaim {
+        thread: running,
+        generation: 1,
+    };
+    {
+        let mut state = duplicate_running.state.lock();
+        state.running[0] = Some(claim);
+        state.running[1] = Some(claim);
+    }
+    assert_eq!(
+        duplicate_running.dw1c_final_snapshot(),
+        Err(SchedulerError::DuplicateThread)
+    );
+
+    let running_and_queued = CooperativeScheduler::<2>::new();
+    let both = thread_key(&mut registry);
+    running_and_queued
+        .commit(running_and_queued.reserve(both).unwrap())
+        .unwrap();
+    running_and_queued.state.lock().running[0] = Some(RunningClaim {
+        thread: both,
+        generation: 1,
+    });
+    assert_eq!(
+        running_and_queued.dw1c_final_snapshot(),
+        Err(SchedulerError::DuplicateThread)
+    );
+
+    let duplicate_queue = CooperativeScheduler::<2>::new();
+    let queued = thread_key(&mut registry);
+    duplicate_queue
+        .commit(duplicate_queue.reserve(queued).unwrap())
+        .unwrap();
+    {
+        let mut state = duplicate_queue.state.lock();
+        state.queue[1] = state.queue[0];
+        state.len = 2;
+        state.accounting.cpu[0].current_runnable = 2;
+    }
+    assert_eq!(
+        duplicate_queue.dw1c_final_snapshot(),
+        Err(SchedulerError::DuplicateThread)
+    );
+
+    let terminal = CooperativeScheduler::<1>::new();
+    let retired = thread_key(&mut registry);
+    terminal.commit(terminal.reserve(retired).unwrap()).unwrap();
+    terminal.state.lock().terminal_retired[0] = Some(retired);
+    assert_eq!(
+        terminal.dw1c_final_snapshot(),
+        Err(SchedulerError::StaleExecutionClaim)
+    );
+}
+
+#[test]
 fn accounting_failure_cannot_grant_running_ownership() {
     let scheduler = CooperativeScheduler::<1>::new();
     let mut registry = ObjectRegistry::<16>::new();

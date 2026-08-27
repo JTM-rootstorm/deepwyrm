@@ -281,6 +281,8 @@ fn dw1c_failure_detail(error: Dw1cEvidenceError) -> u32 {
             Dw1cEvidenceError::WrongActor => 9,
             Dw1cEvidenceError::WrongGeneration => 10,
             Dw1cEvidenceError::MissingKernelFact => 11,
+            Dw1cEvidenceError::TimeRegression => 12,
+            Dw1cEvidenceError::DeadlineExceeded => 13,
         }
 }
 
