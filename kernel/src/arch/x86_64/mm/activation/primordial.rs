@@ -5544,6 +5544,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                 if !self.dw1c_controller_authorized() {
                     crate::test_support::complete_fail(0x2810_e003)
                 }
+                let product_execution_generation = self
+                    .shared
+                    .execution
+                    .running_claim_on(self.cpu)
+                    .filter(|claim| claim.thread() == self.thread)
+                    .map(|claim| claim.generation())
+                    .unwrap_or_else(|| crate::test_support::complete_fail(0x2810_e019));
                 let entries = crate::test_support::dw1c_evidence::decode_arm_entries(&bytes)
                     .unwrap_or_else(|_| crate::test_support::complete_fail(0x2810_e004));
                 let handles = self
@@ -5599,6 +5606,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                 DW1C_EVIDENCE
                     .arm(
                         (self.process, self.thread),
+                        product_execution_generation,
                         actors,
                         arm_started_ns.expect("ARM sampled time before runtime authority"),
                     )

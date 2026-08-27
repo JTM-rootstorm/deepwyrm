@@ -539,7 +539,9 @@ pub(crate) struct SchedulerCounters {
 
 /// One selector-private, whole-scheduler accounting observation. Both
 /// identities are minted while the scheduler lock is held, after every
-/// retained ownership and accounting invariant has been validated.
+/// retained ownership and accounting invariant has been validated. They are
+/// scheduler-snapshot identities for DW1-C records 42 and 44, not actor tokens
+/// or actor execution generations.
 #[cfg(any(test, deepwyrm_dw1c_evidence))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Dw1cFinalSchedulerSnapshot {
@@ -3046,12 +3048,26 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         const ACCOUNTING_SOUND_MASK: u8 = 0x3f;
 
         let mut state = self.state.lock();
-        state.check_invariants()?;
+        let mut accounting_mask = 0_u8;
 
         if state.accounting.cpu.iter().any(|cpu| cpu.overflow_fault) {
             return Err(SchedulerError::AccountingOverflow);
         }
-        if state.accounting_underflow_fault {
+        accounting_mask |= 1 << 0;
+
+        if state.accounting_underflow_fault
+            || (0..H2_SCHEDULER_CPU_CAPACITY).any(|cpu_index| {
+                let cpu = SchedulerCpuId::new(cpu_index).expect("bounded scheduler CPU index");
+                let runnable = state.queue[..state.len]
+                    .iter()
+                    .flatten()
+                    .filter(|entry| {
+                        entry.state == SchedulerThreadState::Runnable && entry.target_cpu == cpu
+                    })
+                    .count() as u64;
+                state.accounting.cpu[cpu_index].current_runnable != runnable
+            })
+        {
             return Err(SchedulerError::AccountingUnderflow);
         }
         if state.time_regression_fault
@@ -3063,6 +3079,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         {
             return Err(SchedulerError::TimeRegression);
         }
+        accounting_mask |= 1 << 1;
 
         for (index, claim) in state.running.iter().flatten().enumerate() {
             if state
@@ -3074,14 +3091,19 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             {
                 return Err(SchedulerError::DuplicateThread);
             }
-            if state.queue[..state.len]
+        }
+        accounting_mask |= 1 << 2;
+
+        if state.running.iter().flatten().any(|claim| {
+            state.queue[..state.len]
                 .iter()
                 .flatten()
                 .any(|entry| entry.thread == claim.thread)
-            {
-                return Err(SchedulerError::DuplicateThread);
-            }
+        }) {
+            return Err(SchedulerError::DuplicateThread);
         }
+        accounting_mask |= 1 << 3;
+
         for (index, entry) in state.queue[..state.len].iter().flatten().enumerate() {
             if state.queue[..state.len]
                 .iter()
@@ -3092,6 +3114,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 return Err(SchedulerError::DuplicateThread);
             }
         }
+        accounting_mask |= 1 << 4;
+
         if state.terminal_retired.iter().flatten().any(|terminal| {
             state
                 .running
@@ -3108,6 +3132,12 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                     .flatten()
                     .any(|claim| claim.thread == *terminal)
         }) {
+            return Err(SchedulerError::StaleExecutionClaim);
+        }
+        accounting_mask |= 1 << 5;
+
+        state.check_invariants()?;
+        if accounting_mask != ACCOUNTING_SOUND_MASK {
             return Err(SchedulerError::StaleExecutionClaim);
         }
 
@@ -3137,7 +3167,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             token,
             generation,
             max_ready_delay_ns,
-            accounting_mask: ACCOUNTING_SOUND_MASK,
+            accounting_mask,
         })
     }
 

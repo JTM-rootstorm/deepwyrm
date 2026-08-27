@@ -255,6 +255,13 @@ fn dw1c_final_snapshot_rejects_sticky_accounting_and_time_faults() {
         overflow.dw1c_final_snapshot(),
         Err(SchedulerError::AccountingOverflow)
     );
+
+    let inconsistent_gauge = CooperativeScheduler::<1>::new();
+    inconsistent_gauge.state.lock().accounting.cpu[0].current_runnable = 1;
+    assert_eq!(
+        inconsistent_gauge.dw1c_final_snapshot(),
+        Err(SchedulerError::AccountingUnderflow)
+    );
 }
 
 #[test]
@@ -313,6 +320,23 @@ fn dw1c_final_snapshot_rejects_duplicate_and_terminal_scheduler_ownership() {
     terminal.state.lock().terminal_retired[0] = Some(retired);
     assert_eq!(
         terminal.dw1c_final_snapshot(),
+        Err(SchedulerError::StaleExecutionClaim)
+    );
+
+    let terminal_suspended = CooperativeScheduler::<1>::new();
+    let suspended = thread_key(&mut registry);
+    {
+        let mut state = terminal_suspended.state.lock();
+        state.suspended[0] = Some(SuspendedContinuation {
+            thread: suspended,
+            generation: 1,
+            publication: SuspendedPublication::Retired,
+            involuntary_preemption: false,
+        });
+        state.terminal_retired[0] = Some(suspended);
+    }
+    assert_eq!(
+        terminal_suspended.dw1c_final_snapshot(),
         Err(SchedulerError::StaleExecutionClaim)
     );
 }

@@ -155,6 +155,7 @@ impl Dw1cKernelFacts {
 struct State {
     installed: bool,
     reporter: Option<(ProcessKey, ThreadKey)>,
+    product_execution_generation: Option<u64>,
     prospective: [Option<ProspectiveActor>; DW1C_ACTOR_COUNT],
     actors: [Option<Dw1cActor>; DW1C_ACTOR_COUNT],
     progress: [u64; 5],
@@ -205,6 +206,7 @@ impl State {
         Self {
             installed: false,
             reporter: None,
+            product_execution_generation: None,
             prospective: [None; DW1C_ACTOR_COUNT],
             actors: [None; DW1C_ACTOR_COUNT],
             progress: [0; 5],
@@ -470,6 +472,7 @@ impl Dw1cEvidenceCollector {
     pub(crate) fn arm(
         &self,
         reporter: (ProcessKey, ThreadKey),
+        product_execution_generation: u64,
         actors: [Dw1cActor; DW1C_ACTOR_COUNT],
         arm_started_ns: u64,
     ) -> Result<(), Dw1cEvidenceError> {
@@ -479,6 +482,9 @@ impl Dw1cEvidenceCollector {
         }
         if state.failure.is_some() || state.reporter.is_some() {
             return Err(state.latch(Dw1cEvidenceError::Duplicate));
+        }
+        if product_execution_generation == 0 {
+            return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
         }
         for (index, actor) in actors.iter().enumerate() {
             if actor.token as usize != index + 1
@@ -518,6 +524,7 @@ impl Dw1cEvidenceCollector {
             lifecycle_generations[lifecycle_index] = Some(prospective.process_generation);
         }
         state.reporter = Some(reporter);
+        state.product_execution_generation = Some(product_execution_generation);
         state.arm_timeout_seconds = DW1C_ARM_TIMEOUT_SECONDS;
         state.arm_started_ns = Some(arm_started_ns);
         state.token6_wait_joined = token6_wait_joined;
@@ -1212,8 +1219,10 @@ impl Dw1cEvidenceCollector {
         if elapsed_ns > DW1C_ARM_TIMEOUT_NS {
             return Err(state.latch(Dw1cEvidenceError::DeadlineExceeded));
         }
-        if product_execution_generation == 0
-            || snapshot.token() == 0
+        if state.product_execution_generation != Some(product_execution_generation) {
+            return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
+        }
+        if snapshot.token() == 0
             || snapshot.generation() == 0
             || snapshot.accounting_mask() != 0x3f
             || state.facts.cpu_ready != 0x0f
@@ -1251,6 +1260,8 @@ impl Dw1cEvidenceCollector {
             generation: token8.execution_generation,
             value: u64::from(DW1C_PROGRESS_MASK),
         });
+        // Records 42 and 44 share this selector-local scheduler-snapshot
+        // identity. It is deliberately not an actor token or generation.
         state.ready_delay_payload = Some(Dw1cRecordPayload {
             subject: snapshot.token(),
             generation: snapshot.generation(),
@@ -1682,7 +1693,7 @@ mod tests {
         let collector = Dw1cEvidenceCollector::new(1, 2);
         collector.install().unwrap();
         observe_prospective_actors(&collector, &actors);
-        collector.arm(reporter, actors, 100).unwrap();
+        collector.arm(reporter, 0xa1, actors, 100).unwrap();
         (collector, actors)
     }
 
@@ -1836,6 +1847,8 @@ mod tests {
     #[test]
     fn source_contract_keeps_raw_op3_nonterminal_and_flushes_only_normal_completion() {
         let source = include_str!("../arch/x86_64/mm/activation/primordial.rs");
+        let scheduler_source = include_str!("../task/scheduler.rs");
+        let collector_source = include_str!("dw1c_evidence.rs");
         let raw = source
             .split("fn intercept_dw1c_evidence_raw(")
             .nth(1)
@@ -1849,6 +1862,15 @@ mod tests {
         assert!(
             raw.find("crate::time::monotonic_now()")
                 < raw.find("let phase = self.reserve_runtime_phase()")
+        );
+        assert!(raw.contains(".running_claim_on(self.cpu)"));
+        assert!(raw.contains("product_execution_generation,"));
+        assert!(scheduler_source.contains(
+            "scheduler-snapshot identities for DW1-C records 42 and 44, not actor tokens"
+        ));
+        assert!(
+            collector_source
+                .contains("Records 42 and 44 share this selector-local scheduler-snapshot")
         );
 
         assert_eq!(
@@ -1929,6 +1951,17 @@ mod tests {
             Err(Dw1cEvidenceError::TimeRegression)
         ));
         assert_eq!(regression.terminal.load(Ordering::Acquire), 0);
+
+        let (wrong_product_generation, _) = completion_ready_collector();
+        assert!(matches!(
+            wrong_product_generation.final_normal_completion(
+                100 + DW1C_ARM_TIMEOUT_NS,
+                0xa2,
+                final_snapshot(9),
+            ),
+            Err(Dw1cEvidenceError::WrongGeneration)
+        ));
+        assert_eq!(wrong_product_generation.terminal.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -2023,6 +2056,9 @@ mod tests {
                 value: 0x3f,
             }
         );
+        assert_eq!(expected[42].subject, expected[44].subject);
+        assert_eq!(expected[42].generation, expected[44].generation);
+        assert!(!(1..=u64::try_from(DW1C_ACTOR_COUNT).unwrap()).contains(&expected[42].subject));
         assert_eq!(
             expected[45],
             Dw1cRecordPayload {
@@ -2049,9 +2085,25 @@ mod tests {
             actor(10),
         ];
         assert!(
-            c.arm((actors[0].process, actors[0].thread), actors, 100)
+            c.arm((actors[0].process, actors[0].thread), 0xa1, actors, 100,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn arm_rejects_zero_product_execution_generation_without_binding() {
+        let (reporter, actors) = distinct_actor_set();
+        let collector = Dw1cEvidenceCollector::new(1, 2);
+        collector.install().unwrap();
+        observe_prospective_actors(&collector, &actors);
+
+        assert_eq!(
+            collector.arm(reporter, 0, actors, 100),
+            Err(Dw1cEvidenceError::WrongGeneration)
+        );
+        let state = collector.state.lock();
+        assert_eq!(state.reporter, None);
+        assert_eq!(state.product_execution_generation, None);
     }
 
     #[test]
@@ -2073,7 +2125,7 @@ mod tests {
         collector.install().unwrap();
 
         assert_eq!(
-            collector.arm(reporter, actors, 100),
+            collector.arm(reporter, 0xa1, actors, 100),
             Err(Dw1cEvidenceError::MissingKernelFact)
         );
         assert!(
@@ -2108,7 +2160,7 @@ mod tests {
             .observe_bound_wait_claim(actors[5].thread, actors[5].execution_generation)
             .unwrap();
         assert_eq!(
-            missing_create.arm(reporter, actors, 100),
+            missing_create.arm(reporter, 0xa1, actors, 100),
             Err(Dw1cEvidenceError::MissingKernelFact)
         );
 
@@ -2130,7 +2182,7 @@ mod tests {
             .observe_bound_wait_claim(actors[5].thread, actors[5].execution_generation)
             .unwrap();
         assert_eq!(
-            missing_start.arm(reporter, actors, 100),
+            missing_start.arm(reporter, 0xa1, actors, 100),
             Err(Dw1cEvidenceError::MissingKernelFact)
         );
 
@@ -2150,7 +2202,7 @@ mod tests {
             .observe_bound_wait_claim(actors[5].thread, actors[5].execution_generation + 1)
             .unwrap();
         assert_eq!(
-            stale_wait.arm(reporter, actors, 100),
+            stale_wait.arm(reporter, 0xa1, actors, 100),
             Err(Dw1cEvidenceError::MissingKernelFact)
         );
     }
@@ -2169,7 +2221,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            collector.arm(reporter, actors, 100),
+            collector.arm(reporter, 0xa1, actors, 100),
             Err(Dw1cEvidenceError::MissingKernelFact)
         );
 
@@ -2185,7 +2237,7 @@ mod tests {
         unrelated.observe_thread_create(process, thread).unwrap();
         unrelated.observe_thread_start(process, thread, 99).unwrap();
         unrelated.observe_bound_wait_claim(thread, 99).unwrap();
-        unrelated.arm(reporter, actors, 100).unwrap();
+        unrelated.arm(reporter, 0xa1, actors, 100).unwrap();
         assert_eq!(unrelated.state.lock().failure, None);
         assert_eq!(
             unrelated.observe_thread_create(actors[0].process, thread),
@@ -3004,7 +3056,7 @@ mod tests {
         assert!(matches!(
             collector.final_normal_completion(
                 101,
-                1,
+                0xa1,
                 Dw1cFinalSchedulerSnapshot::for_test(1, 1, 1, 0x3f),
             ),
             Err(Dw1cEvidenceError::Incomplete)
