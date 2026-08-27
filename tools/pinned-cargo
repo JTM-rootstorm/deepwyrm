@@ -3,16 +3,18 @@ set -eu
 
 usage() {
     cat <<'EOF'
-Usage: DEEPWYRM_PINNED_TARGET_DIR=<absolute-isolated-path> tools/pinned-cargo <lane> <cargo-args...>
+Usage: tools/pinned-cargo <lane> <cargo-args...>
 
 Lanes:
   target  Accepted Wyrmroot 1.97.1/a92dc7f7 product and freestanding builds.
   host    Pinned stable 1.97.1 tests, Clippy, rustdoc, formatting, and xtask.
 
-The target directory must be beneath /tmp or deepwyrm/.tmp. The canonical
-deepwyrm/target directory is intentionally rejected so host and accepted
-toolchain artifacts cannot contaminate one another. CARGO_HOME is selected
-from the lane identity and must not be supplied by the caller.
+Each lane owns a pinned target directory beneath deepwyrm/.tmp so repeated
+commands reuse compatible artifacts. DEEPWYRM_PINNED_TARGET_DIR may select an
+absolute isolated directory beneath /tmp or deepwyrm/.tmp for concurrent/test
+lanes. The canonical deepwyrm/target directory is intentionally rejected.
+CARGO_HOME is selected from the lane identity and must not be supplied by the
+caller.
 EOF
 }
 
@@ -167,8 +169,14 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 workspace=$(CDPATH='' cd -- "$script_dir/.." && pwd -P)
 project_root=$(CDPATH='' cd -- "$workspace/.." && pwd -P)
 
+if [ "$lane" = host ]; then
+    identity="$workspace/tooling/host-rust-toolchain.toml"
+else
+    identity="$workspace/tooling/rust-toolchain.toml"
+fi
+
 target_dir=${DEEPWYRM_PINNED_TARGET_DIR:-}
-[ -n "$target_dir" ] || fail "DEEPWYRM_PINNED_TARGET_DIR is required"
+[ -n "$target_dir" ] || target_dir="$workspace/$(config_value "$identity" target_dir)"
 case "$target_dir" in
     /tmp/*|"$workspace"/.tmp/*) ;;
     *) fail "target directory must be beneath /tmp or $workspace/.tmp" ;;
@@ -184,7 +192,6 @@ unset CARGO_BUILD_TARGET CARGO_ENCODED_RUSTFLAGS RUSTDOCFLAGS CARGO_TARGET_DIR
 unset LD_LIBRARY_PATH LD_PRELOAD
 
 if [ "$lane" = host ]; then
-    identity="$workspace/tooling/host-rust-toolchain.toml"
     [ "$(config_value "$identity" schema)" = "deepwyrm-host-rust-toolchain-identity-v1" ] || \
         fail "unexpected host toolchain identity schema"
     cargo=$(config_value "$identity" cargo_binary)
@@ -216,7 +223,6 @@ if [ "$lane" = host ]; then
     export RUSTFMT="$rustfmt"
     export PATH="$tool_bin:$PATH"
 else
-    identity="$workspace/tooling/rust-toolchain.toml"
     [ "$(config_value "$identity" schema)" = "deepwyrm-rust-toolchain-identity-v1" ] || \
         fail "unexpected accepted toolchain identity schema"
     artifact_root=$(config_value "$identity" artifact_root)

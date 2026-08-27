@@ -233,7 +233,30 @@ fn both_toolchain_identities_pin_the_same_project_cargo_home() {
     ] {
         let text = std::fs::read_to_string(workspace().join(identity)).expect("read identity");
         assert!(text.contains("cargo_home = \".tmp/cargo-home/offline-v1\""));
+        assert!(text.contains("target_dir = \".tmp/cargo-target/"));
     }
+}
+
+#[test]
+fn canonical_invocation_owns_a_reusable_lane_target() {
+    let output = Command::new(workspace().join("tools/pinned-cargo"))
+        .args(["host", "--version"])
+        .current_dir(workspace())
+        .env_remove("CARGO_HOME")
+        .env_remove("DEEPWYRM_PINNED_TARGET_DIR")
+        .output()
+        .expect("run canonical pinned host Cargo");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("cargo 1.97.1"));
+    assert!(
+        workspace()
+            .join(".tmp/cargo-target/host-1.97.1/.deepwyrm-pinned-cargo-v1")
+            .is_file()
+    );
 }
 
 #[test]
