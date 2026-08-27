@@ -4747,7 +4747,7 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         channel_keys,
         ..
     } = monitor;
-    let mut runtime = PrimordialRuntimeCarrier {
+    let runtime = core::pin::pin!(RuntimeAuthorityLock::new(PrimordialRuntimeCarrier {
         cpu: crate::cpu::CpuIndex::BOOTSTRAP,
         local: per_cpu_live_carrier(crate::cpu::CpuIndex::BOOTSTRAP),
         active,
@@ -4795,34 +4795,42 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         rendezvous_cleanup: None,
         #[cfg(feature = "test-support")]
         g5_probe: G5PrimordialProbe::for_build(),
-    };
-    runtime
-        .local
-        .record_current(runtime.thread, runtime.stack_id, runtime.context_id);
-    let exception_binding =
-        crate::arch::x86_64::syscall::bind_native_runtime_user_exception_handler()
-            .unwrap_or_else(|error| panic!("could not bind primordial exceptions: {error:?}"));
-    let context = runtime
-        .shared
-        .execution
-        .load_context(runtime.context_id)
-        .unwrap_or_else(|error| panic!("could not load primordial context: {error:?}"));
-    let stack = runtime
-        .shared
-        .execution
-        .stack_bounds(runtime.stack_id)
-        .unwrap_or_else(|error| panic!("could not load primordial kernel stack: {error:?}"));
-    let state = {
-        let mut mappings = runtime.active.current_process_address_space(
-            runtime.active_root.as_ref().expect("active root"),
-            runtime.process,
-        );
-        crate::arch::x86_64::syscall::ValidatedUserReturn::initial(context, &mut mappings)
-            .unwrap_or_else(|error| panic!("invalid primordial initial return: {error:?}"))
-    };
-    let runtime = RuntimeAuthorityLock::new(runtime);
-    let runtime = core::pin::pin!(runtime);
+    }));
     let runtime_ref = runtime.as_ref().get_ref();
+    let (state, stack, exception_binding) = {
+        let mut runtime = runtime_ref.lock();
+        runtime
+            .local
+            .record_current(runtime.thread, runtime.stack_id, runtime.context_id);
+        let exception_binding =
+            crate::arch::x86_64::syscall::bind_native_runtime_user_exception_handler()
+                .unwrap_or_else(|error| panic!("could not bind primordial exceptions: {error:?}"));
+        let context = runtime
+            .shared
+            .execution
+            .load_context(runtime.context_id)
+            .unwrap_or_else(|error| panic!("could not load primordial context: {error:?}"));
+        let stack = runtime
+            .shared
+            .execution
+            .stack_bounds(runtime.stack_id)
+            .unwrap_or_else(|error| panic!("could not load primordial kernel stack: {error:?}"));
+        let state = {
+            let PrimordialRuntimeCarrier {
+                active,
+                active_root,
+                process,
+                ..
+            } = &mut *runtime;
+            let mut mappings = active.current_process_address_space(
+                active_root.as_ref().expect("active root"),
+                *process,
+            );
+            crate::arch::x86_64::syscall::ValidatedUserReturn::initial(context, &mut mappings)
+                .unwrap_or_else(|error| panic!("invalid primordial initial return: {error:?}"))
+        };
+        (state, stack, exception_binding)
+    };
     let facades = core::array::from_fn(|cpu_index| RuntimeCarrierFacade {
         cpu: crate::cpu::CpuIndex::new(cpu_index)
             .unwrap_or_else(|| panic!("native carrier CPU {cpu_index} is out of range")),

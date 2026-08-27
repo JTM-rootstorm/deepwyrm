@@ -1883,10 +1883,10 @@ impl Layout {
         {
             return Err("kernel boot stack alignment must equal the base page size".into());
         }
-        if kernel_boot_stack_size != 262_144
+        if kernel_boot_stack_size != 524_288
             || kernel_boot_stack_size % kernel_boot_stack_alignment != 0
         {
-            return Err("kernel boot stack must be an aligned 262144-byte range".into());
+            return Err("kernel boot stack must be an aligned 524288-byte range".into());
         }
         if max_normalized_memory_map_entries != 128 || max_module_entries != 16 {
             return Err("early intake limits must match the bounded BootInfo snapshots".into());

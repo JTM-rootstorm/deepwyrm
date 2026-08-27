@@ -25,6 +25,11 @@ const G5_PRIMORDIAL_SELECTORS: [&str; 3] = [
     "primordial-user-exception",
     "primordial-invalid-return",
 ];
+const WYR1_PRIMORDIAL_SELECTORS: [&str; 3] = [
+    "permanent-supervisor-rrc",
+    "normal-preemption-up",
+    "bootstrap-registry-launch",
+];
 const OWNED_WORKSPACE_CARGO_CONFIG: &str = ".cargo/config.toml";
 const LEGACY_WORKSPACE_CARGO_CONFIG: &str = ".cargo/config";
 
@@ -50,6 +55,7 @@ fn production_and_six_memory_selector_artifacts_are_separated() {
         .expect("kernel manifest has workspace parent")
         .to_path_buf();
     reject_ambient_build_overrides(&workspace);
+    let request_path = required_path("DEEPWYRM_ACCEPTED_REQUEST");
     let cargo_path = required_path("DEEPWYRM_ACCEPTED_CARGO");
     let rustc_path = required_path("DEEPWYRM_ACCEPTED_RUSTC");
     let rust_lld_path = required_path("DEEPWYRM_ACCEPTED_RUST_LLD");
@@ -66,6 +72,7 @@ fn production_and_six_memory_selector_artifacts_are_separated() {
         &toolchain_identity,
         &build_tools_identity,
         AcceptedToolPaths {
+            request: &request_path,
             cargo: &cargo_path,
             rustc: &rustc_path,
             rust_lld: &rust_lld_path,
@@ -200,6 +207,7 @@ fn production_and_six_memory_selector_artifacts_are_separated() {
         .into_iter()
         .chain(E7_SELECTORS)
         .chain(G5_PRIMORDIAL_SELECTORS)
+        .chain(WYR1_PRIMORDIAL_SELECTORS)
         .chain([
             "DWTEST1",
             "dw_test_",
@@ -270,6 +278,7 @@ fn production_and_six_memory_selector_artifacts_are_separated() {
             selector,
             &stack_sizes(&llvm_readelf, &stack_artifact),
             &resolved_read_only_indirect_disassembly(&llvm_objdump, &llvm_nm, &stack_artifact),
+            linked_boot_stack_payload_bytes(&symbols(&llvm_nm, &stack_artifact)),
         );
     }
     let build_input_after = build_input_manifest_sha256(&workspace);
@@ -282,6 +291,7 @@ fn production_and_six_memory_selector_artifacts_are_separated() {
         &toolchain_identity,
         &build_tools_identity,
         AcceptedToolPaths {
+            request: &request_path,
             cargo: cargo.source_path(),
             rustc: rustc.source_path(),
             rust_lld: rust_lld.source_path(),
@@ -319,6 +329,7 @@ fn e7_task_smoke_artifact_is_freestanding_and_separated() {
         .expect("kernel manifest has workspace parent")
         .to_path_buf();
     reject_ambient_build_overrides(&workspace);
+    let request_path = required_path("DEEPWYRM_ACCEPTED_REQUEST");
     let cargo_path = required_path("DEEPWYRM_ACCEPTED_CARGO");
     let rustc_path = required_path("DEEPWYRM_ACCEPTED_RUSTC");
     let rust_lld_path = required_path("DEEPWYRM_ACCEPTED_RUST_LLD");
@@ -335,6 +346,7 @@ fn e7_task_smoke_artifact_is_freestanding_and_separated() {
         &toolchain_identity,
         &build_tools_identity,
         AcceptedToolPaths {
+            request: &request_path,
             cargo: &cargo_path,
             rustc: &rustc_path,
             rust_lld: &rust_lld_path,
@@ -498,6 +510,7 @@ fn e7_task_smoke_artifact_is_freestanding_and_separated() {
     validate_e7_stack_margin(
         &stack_sizes(&llvm_readelf, &smoke_stack),
         &resolved_read_only_indirect_disassembly(&llvm_objdump, &llvm_nm, &smoke_stack),
+        linked_boot_stack_payload_bytes(&symbols(&llvm_nm, &smoke_stack)),
     );
 
     let build_input_after = build_input_manifest_sha256(&workspace);
@@ -510,6 +523,7 @@ fn e7_task_smoke_artifact_is_freestanding_and_separated() {
         &toolchain_identity,
         &build_tools_identity,
         AcceptedToolPaths {
+            request: &request_path,
             cargo: cargo.source_path(),
             rustc: rustc.source_path(),
             rust_lld: rust_lld.source_path(),
@@ -537,13 +551,14 @@ fn e7_task_smoke_artifact_is_freestanding_and_separated() {
 }
 
 #[test]
-#[ignore = "explicit accepted-toolchain DW0-F/G5 target-artifact gate"]
-fn implemented_f_and_g5_selector_artifacts_are_freestanding_and_separated() {
+#[ignore = "explicit accepted-toolchain WYR1 primordial stack-margin gate"]
+fn wyr1_primordial_selector_artifacts_fit_the_linked_boot_stack() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("kernel manifest has workspace parent")
         .to_path_buf();
     reject_ambient_build_overrides(&workspace);
+    let request_path = required_path("DEEPWYRM_ACCEPTED_REQUEST");
     let cargo_path = required_path("DEEPWYRM_ACCEPTED_CARGO");
     let rustc_path = required_path("DEEPWYRM_ACCEPTED_RUSTC");
     let rust_lld_path = required_path("DEEPWYRM_ACCEPTED_RUST_LLD");
@@ -560,6 +575,152 @@ fn implemented_f_and_g5_selector_artifacts_are_freestanding_and_separated() {
         &toolchain_identity,
         &build_tools_identity,
         AcceptedToolPaths {
+            request: &request_path,
+            cargo: &cargo_path,
+            rustc: &rustc_path,
+            rust_lld: &rust_lld_path,
+            clang: &clang_path,
+            llvm_nm: &llvm_nm_path,
+            llvm_objdump: &llvm_objdump_path,
+            llvm_readelf: &llvm_readelf_path,
+        },
+    );
+    let runtime_artifacts = accepted_runtime_artifacts(&toolchain_identity, &cargo_path);
+    let cargo = VerifiedExecutable::open(
+        &cargo_path,
+        manifest_value(&toolchain_identity, "cargo_sha256"),
+        "cargo",
+    );
+    let rustc = VerifiedExecutable::open(
+        &rustc_path,
+        manifest_value(&toolchain_identity, "rustc_sha256"),
+        "rustc",
+    );
+    let rust_lld = VerifiedExecutable::open(
+        &rust_lld_path,
+        manifest_value(&toolchain_identity, "rust_lld_sha256"),
+        "rust-lld",
+    );
+    let clang = VerifiedExecutable::open(
+        &clang_path,
+        manifest_value(&build_tools_identity, "clang_sha256"),
+        "clang",
+    );
+    let llvm_nm = VerifiedExecutable::open(
+        &llvm_nm_path,
+        manifest_value(&build_tools_identity, "llvm_nm_sha256"),
+        "llvm-nm",
+    );
+    let llvm_objdump = VerifiedExecutable::open(
+        &llvm_objdump_path,
+        manifest_value(&build_tools_identity, "llvm_objdump_sha256"),
+        "llvm-objdump",
+    );
+    let llvm_readelf = VerifiedExecutable::open(
+        &llvm_readelf_path,
+        manifest_value(&build_tools_identity, "llvm_readelf_sha256"),
+        "llvm-readelf/readobj",
+    );
+    let tools = BuildTools {
+        cargo: &cargo,
+        rustc: &rustc,
+        rust_lld: &rust_lld,
+        clang: &clang,
+        runtime_artifacts: &runtime_artifacts,
+    };
+    let output_root = ArtifactRoot::create();
+    let environment = BuildEnvironment::create(output_root.path());
+    let build_input_before = build_input_manifest_sha256(&workspace);
+    let mut hashes = BTreeSet::new();
+
+    for selector in WYR1_PRIMORDIAL_SELECTORS {
+        let target = output_root.path().join(format!("{selector}-release"));
+        let kernel = build_release_kernel(&workspace, &target, &environment, tools, selector);
+        validate_static_kernel_elf(&llvm_readelf, &kernel, "WYR1 primordial release");
+        let kernel_symbols = symbols(&llvm_nm, &kernel);
+        validate_kernel_stack_artifact_geometry(&kernel_symbols);
+        let kernel_disassembly = disassembly(&llvm_objdump, &kernel);
+        let kernel_hash = sha256(&kernel);
+        assert!(
+            hashes.insert(kernel_hash.clone()),
+            "{selector} release kernel is byte-identical to another WYR1 selector"
+        );
+        eprintln!("{selector} release kernel {kernel_hash}");
+
+        let stack_kernel = build_release_stack_kernel(
+            &workspace,
+            &output_root
+                .path()
+                .join(format!("{selector}-release-stack-sizes")),
+            &environment,
+            tools,
+            selector,
+        );
+        let stack_symbols = symbols(&llvm_nm, &stack_kernel);
+        validate_kernel_stack_artifact_geometry(&stack_symbols);
+        let stack_disassembly = disassembly(&llvm_objdump, &stack_kernel);
+        assert_eq!(
+            text_disassembly(&stack_disassembly),
+            text_disassembly(&kernel_disassembly),
+            "{selector} release stack-size carrier changed the selector machine code"
+        );
+        validate_primordial_boot_stack_margin(
+            selector,
+            &stack_sizes(&llvm_readelf, &stack_kernel),
+            linked_boot_stack_payload_bytes(&stack_symbols),
+        );
+    }
+
+    assert_eq!(
+        build_input_manifest_sha256(&workspace),
+        build_input_before,
+        "build-relevant source/configuration changed during WYR1 artifact builds"
+    );
+    validate_accepted_identities(
+        &workspace,
+        &toolchain_identity,
+        &build_tools_identity,
+        AcceptedToolPaths {
+            request: &request_path,
+            cargo: cargo.source_path(),
+            rustc: rustc.source_path(),
+            rust_lld: rust_lld.source_path(),
+            clang: clang.source_path(),
+            llvm_nm: llvm_nm.source_path(),
+            llvm_objdump: llvm_objdump.source_path(),
+            llvm_readelf: llvm_readelf.source_path(),
+        },
+    );
+    reject_ambient_build_overrides(&workspace);
+    output_root.cleanup();
+}
+
+#[test]
+#[ignore = "explicit accepted-toolchain DW0-F/G5 target-artifact gate"]
+fn implemented_f_and_g5_selector_artifacts_are_freestanding_and_separated() {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("kernel manifest has workspace parent")
+        .to_path_buf();
+    reject_ambient_build_overrides(&workspace);
+    let request_path = required_path("DEEPWYRM_ACCEPTED_REQUEST");
+    let cargo_path = required_path("DEEPWYRM_ACCEPTED_CARGO");
+    let rustc_path = required_path("DEEPWYRM_ACCEPTED_RUSTC");
+    let rust_lld_path = required_path("DEEPWYRM_ACCEPTED_RUST_LLD");
+    let clang_path = required_path("DEEPWYRM_CLANG");
+    let llvm_nm_path = required_path("DEEPWYRM_LLVM_NM");
+    let llvm_objdump_path = required_path("DEEPWYRM_LLVM_OBJDUMP");
+    let llvm_readelf_path = required_path("DEEPWYRM_LLVM_READELF");
+    let toolchain_identity = fs::read_to_string(workspace.join("tooling/rust-toolchain.toml"))
+        .expect("read trusted toolchain identity");
+    let build_tools_identity = fs::read_to_string(workspace.join("tooling/build-tools.toml"))
+        .expect("read trusted build-tools identity");
+    validate_accepted_identities(
+        &workspace,
+        &toolchain_identity,
+        &build_tools_identity,
+        AcceptedToolPaths {
+            request: &request_path,
             cargo: &cargo_path,
             rustc: &rustc_path,
             rust_lld: &rust_lld_path,
@@ -670,6 +831,7 @@ fn implemented_f_and_g5_selector_artifacts_are_freestanding_and_separated() {
         .into_iter()
         .chain(E7_SELECTORS)
         .chain(G5_PRIMORDIAL_SELECTORS)
+        .chain(WYR1_PRIMORDIAL_SELECTORS)
         .chain([
             "ipc-blocking-smoke",
             "atomic-wait-wake",
@@ -908,6 +1070,7 @@ fn implemented_f_and_g5_selector_artifacts_are_freestanding_and_separated() {
         &toolchain_identity,
         &build_tools_identity,
         AcceptedToolPaths {
+            request: &request_path,
             cargo: cargo.source_path(),
             rustc: rustc.source_path(),
             rust_lld: rust_lld.source_path(),

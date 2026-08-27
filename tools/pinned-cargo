@@ -15,6 +15,11 @@ absolute isolated directory beneath /tmp or deepwyrm/.tmp for concurrent/test
 lanes. The canonical deepwyrm/target directory is intentionally rejected.
 CARGO_HOME is selected from the lane identity and must not be supplied by the
 caller.
+
+In a Git worktree, the worktree's parent is the project root. Its accepted
+artifacts and offline-v1 Cargo home must be provisioned there as independent
+non-symlink trees. This wrapper never falls back to a canonical checkout's
+mutable Cargo cache.
 EOF
 }
 

@@ -5,8 +5,8 @@ pub(crate) fn validate_selector_stack_margin(
     selector: &str,
     sizes: &[StackSize],
     disassembly: &str,
+    boot_stack_bytes: usize,
 ) {
-    const BOOT_STACK_BYTES: usize = 256 * 1024;
     const REQUIRED_SPARE_BYTES: usize = 32 * 1024;
     const ARCHITECTURAL_HEADROOM_BYTES: usize = 4 * 1024;
     const RETURN_ADDRESS_COUNT: usize = 32;
@@ -273,22 +273,22 @@ pub(crate) fn validate_selector_stack_margin(
         .max(fault_terminal_chain);
     let total = measured_chain + RETURN_ADDRESS_BYTES + ARCHITECTURAL_HEADROOM_BYTES;
     assert!(
-        total <= BOOT_STACK_BYTES,
+        total <= boot_stack_bytes,
         "{selector} target stack bound exceeds the boot stack: measured chain {measured_chain}, \
          return addresses {RETURN_ADDRESS_BYTES}, required architectural headroom \
-         {ARCHITECTURAL_HEADROOM_BYTES}, total {total}, boot stack {BOOT_STACK_BYTES}"
+         {ARCHITECTURAL_HEADROOM_BYTES}, total {total}, boot stack {boot_stack_bytes}"
     );
     assert!(
-        BOOT_STACK_BYTES - total >= REQUIRED_SPARE_BYTES,
+        boot_stack_bytes - total >= REQUIRED_SPARE_BYTES,
         "{selector} target stack bound leaves less than the required {REQUIRED_SPARE_BYTES}-byte \
-         spare: total {total}, boot stack {BOOT_STACK_BYTES}"
+         spare: total {total}, boot stack {boot_stack_bytes}"
     );
     eprintln!(
         "{selector} stack publication={publication_chain} normal-terminal={normal_terminal_chain} \
          fault-terminal={fault_terminal_chain} measured={measured_chain} \
          returns={RETURN_ADDRESS_BYTES} headroom={ARCHITECTURAL_HEADROOM_BYTES} \
          total={total} spare={}",
-        BOOT_STACK_BYTES - total
+        boot_stack_bytes - total
     );
     validate_ist_stack_margin(selector, sizes, disassembly);
 }

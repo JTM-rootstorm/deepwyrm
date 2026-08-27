@@ -287,6 +287,12 @@ fn both_toolchain_identities_pin_the_same_project_cargo_home() {
         assert!(text.contains("cargo_home = \".tmp/cargo-home/offline-v1\""));
         assert!(text.contains("target_dir = \".tmp/cargo-target/"));
     }
+
+    let wrapper = std::fs::read_to_string(workspace().join("tools/pinned-cargo"))
+        .expect("read canonical pinned-Cargo wrapper");
+    assert!(wrapper.contains("the worktree's parent is the project root"));
+    assert!(wrapper.contains("independent\nnon-symlink trees"));
+    assert!(wrapper.contains("never falls back to a canonical checkout's\nmutable Cargo cache"));
 }
 
 #[test]

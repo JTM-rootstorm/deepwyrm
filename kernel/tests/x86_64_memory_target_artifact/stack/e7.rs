@@ -1,7 +1,10 @@
 use super::*;
 
-pub(crate) fn validate_e7_stack_margin(sizes: &[StackSize], disassembly: &str) {
-    const BOOT_STACK_BYTES: usize = 256 * 1024;
+pub(crate) fn validate_e7_stack_margin(
+    sizes: &[StackSize],
+    disassembly: &str,
+    boot_stack_bytes: usize,
+) {
     const THREAD_STACK_BYTES: usize = 256 * 1024;
     const REQUIRED_SPARE_BYTES: usize = 32 * 1024;
     const ARCHITECTURAL_HEADROOM_BYTES: usize = 4 * 1024;
@@ -161,9 +164,9 @@ pub(crate) fn validate_e7_stack_margin(sizes: &[StackSize], disassembly: &str) {
         .expect("E7 timer interrupt stack bound fits usize");
     let boot_total = boot_setup_total.max(timer_interrupt_total);
     assert!(
-        boot_total + REQUIRED_SPARE_BYTES <= BOOT_STACK_BYTES,
+        boot_total + REQUIRED_SPARE_BYTES <= boot_stack_bytes,
         "E7 bootstrap stack bound too small: used={boot_total} spare={} required={REQUIRED_SPARE_BYTES}",
-        BOOT_STACK_BYTES.saturating_sub(boot_total)
+        boot_stack_bytes.saturating_sub(boot_total)
     );
 
     let trampoline = one_stack_symbol(sizes, "E7 runtime trampoline", |symbol| {
@@ -210,7 +213,7 @@ pub(crate) fn validate_e7_stack_margin(sizes: &[StackSize], disassembly: &str) {
 
     eprintln!(
         "task-syscall-smoke stack bootstrap={boot_total} setup={boot_setup_total} timer-interrupt={timer_interrupt_total} thread={thread_total} bootstrap-spare={} thread-spare={} boot-terminal={} timer-terminal={} thread-terminal={}",
-        BOOT_STACK_BYTES - boot_total,
+        boot_stack_bytes - boot_total,
         THREAD_STACK_BYTES - thread_total,
         boot_setup.terminal,
         timer_interrupt.terminal,

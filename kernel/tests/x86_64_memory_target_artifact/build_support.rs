@@ -20,6 +20,7 @@ pub(super) fn build_kernel(
         "x86_64-unknown-none",
     ]);
     if let Some(selector) = selector {
+        apply_selector_environment(&mut command, selector);
         command
             .env("DEEPWYRM_GUEST_TEST_SELECTOR", selector)
             .args(["--features", "test-support"]);
@@ -99,6 +100,7 @@ pub(super) fn build_stack_kernel(
             "x86_64-unknown-none",
         ]);
     if let Some(selector) = selector {
+        apply_selector_environment(&mut command, selector);
         command
             .env("DEEPWYRM_GUEST_TEST_SELECTOR", selector)
             .args(["--features", "test-support"]);
@@ -112,6 +114,105 @@ pub(super) fn build_stack_kernel(
         artifact.display()
     );
     artifact
+}
+
+pub(super) fn build_release_kernel(
+    workspace: &Path,
+    target_dir: &Path,
+    environment: &BuildEnvironment,
+    tools: BuildTools<'_>,
+    selector: &str,
+) -> PathBuf {
+    let mut command = tools.cargo.command();
+    environment.apply(&mut command, tools, target_dir);
+    apply_selector_environment(&mut command, selector);
+    command
+        .current_dir(workspace)
+        .env("DEEPWYRM_GUEST_TEST_SELECTOR", selector)
+        .args([
+            "build",
+            "--locked",
+            "--release",
+            "--package",
+            "deepwyrm-kernel",
+            "--bin",
+            "deepwyrm-kernel",
+            "--target",
+            "x86_64-unknown-none",
+            "--features",
+            "test-support",
+        ]);
+    run_success(&mut command, &format!("{selector} release build"));
+    let artifact = target_dir.join("x86_64-unknown-none/release/deepwyrm-kernel");
+    assert!(
+        artifact.is_file(),
+        "release kernel artifact is missing: {}",
+        artifact.display()
+    );
+    artifact
+}
+
+pub(super) fn build_release_stack_kernel(
+    workspace: &Path,
+    target_dir: &Path,
+    environment: &BuildEnvironment,
+    tools: BuildTools<'_>,
+    selector: &str,
+) -> PathBuf {
+    let mut command = tools.cargo.command();
+    environment.apply(&mut command, tools, target_dir);
+    apply_selector_environment(&mut command, selector);
+    command
+        .current_dir(workspace)
+        .env("RUSTFLAGS", "-Z emit-stack-sizes")
+        .env("RUSTC_BOOTSTRAP", "1")
+        .env("DEEPWYRM_GUEST_TEST_SELECTOR", selector)
+        .args([
+            "build",
+            "--locked",
+            "--release",
+            "--package",
+            "deepwyrm-kernel",
+            "--bin",
+            "deepwyrm-kernel",
+            "--target",
+            "x86_64-unknown-none",
+            "--features",
+            "test-support",
+        ]);
+    run_success(
+        &mut command,
+        &format!("{selector} release stack-size build"),
+    );
+    let artifact = target_dir.join("x86_64-unknown-none/release/deepwyrm-kernel");
+    assert!(
+        artifact.is_file(),
+        "release stack-size kernel artifact is missing: {}",
+        artifact.display()
+    );
+    artifact
+}
+
+fn apply_selector_environment(command: &mut Command, selector: &str) {
+    match selector {
+        "permanent-supervisor-rrc" => {
+            command
+                .env("DEEPWYRM_WYR1_EVIDENCE_NONCE", "A025000000000001")
+                .env("DEEPWYRM_WYR1_EVIDENCE_SCENARIO", "normal");
+        }
+        "normal-preemption-up" => {
+            command
+                .env("DEEPWYRM_DW1B_EVIDENCE_NONCE", "D1B0A82600000001")
+                .env("DEEPWYRM_DW1B_CHALLENGE_DIGEST", "5E4E054B5C244ACE")
+                .env("DEEPWYRM_DW1B_BOOTFS_MAX_PAGES", "31");
+        }
+        "bootstrap-registry-launch" => {
+            command
+                .env("DEEPWYRM_WYR1B_EVIDENCE_NONCE", "0123456789ABCDEF")
+                .env("DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES", "117");
+        }
+        _ => {}
+    }
 }
 
 pub(super) fn find_e7_user_artifact(target_dir: &Path) -> PathBuf {

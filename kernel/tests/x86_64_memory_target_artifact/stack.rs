@@ -1278,6 +1278,8 @@ mod f9;
 mod geometry;
 #[path = "stack/ist.rs"]
 mod ist;
+#[path = "stack/primordial.rs"]
+mod primordial;
 #[path = "stack/production.rs"]
 mod production;
 #[path = "stack/selector.rs"]
@@ -1290,5 +1292,6 @@ pub(super) use geometry::linked_boot_stack_payload_bytes;
 pub(super) use geometry::linked_terminal_reaper_stack_payload_bytes;
 pub(super) use geometry::linked_thread_kernel_stack_payload_bytes;
 pub(super) use geometry::validate_kernel_stack_artifact_geometry;
+pub(super) use primordial::validate_primordial_boot_stack_margin;
 pub(super) use production::validate_production_ist_stack_margin;
 pub(super) use selector::validate_selector_stack_margin;

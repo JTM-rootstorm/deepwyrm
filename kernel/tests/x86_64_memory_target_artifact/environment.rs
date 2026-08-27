@@ -2,6 +2,7 @@ use super::*;
 
 #[derive(Clone, Copy)]
 pub(super) struct AcceptedToolPaths<'a> {
+    pub(super) request: &'a Path,
     pub(super) cargo: &'a Path,
     pub(super) rustc: &'a Path,
     pub(super) rust_lld: &'a Path,
@@ -18,6 +19,7 @@ pub(super) fn validate_accepted_identities(
     tools: AcceptedToolPaths<'_>,
 ) {
     let AcceptedToolPaths {
+        request,
         cargo,
         rustc,
         rust_lld,
@@ -34,6 +36,13 @@ pub(super) fn validate_accepted_identities(
         .parent()
         .and_then(Path::parent)
         .expect("toolchain root has an artifact root");
+    let request_metadata = fs::symlink_metadata(request)
+        .unwrap_or_else(|error| panic!("inspect accepted request {}: {error}", request.display()));
+    assert!(
+        request_metadata.file_type().is_file() && !request_metadata.file_type().is_symlink(),
+        "accepted request must be a regular non-symlink file: {}",
+        request.display()
+    );
     for (supplied, path_key, hash_key) in [
         (cargo, "cargo_binary", "cargo_sha256"),
         (rustc, "rustc_binary", "rustc_sha256"),
@@ -65,13 +74,7 @@ pub(super) fn validate_accepted_identities(
             artifact_root.join(manifest_value(rust_identity, "root_manifest")),
             "root_manifest_sha256",
         ),
-        (
-            workspace
-                .parent()
-                .expect("workspace has an OS-Project parent")
-                .join(manifest_value(rust_identity, "config")),
-            "config_sha256",
-        ),
+        (request.to_path_buf(), "config_sha256"),
         (
             workspace.join(manifest_value(rust_identity, "sysroot_manifest")),
             "sysroot_manifest_sha256",

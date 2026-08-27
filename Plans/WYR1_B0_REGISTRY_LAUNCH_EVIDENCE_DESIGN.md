@@ -107,6 +107,34 @@ topology. They are test-build storage limits, not public ABI or Wyrmroot
 service limits. Live evidence must still fail closed on resource exhaustion;
 host tests do not certify peak utilization.
 
+### 5.1 Bootstrap stack budget
+
+Deepwyrm's private x86_64 bootstrap stack is 512 KiB for WYR1-B. Thread kernel
+stacks remain 256 KiB. This is an internal bootstrap implementation budget,
+not a native ABI, boot ABI, or Wyrmroot platform ABI change.
+
+The increase preserves all selector capacities after the accepted selector-27
+release artifact measured 268,808 bytes of retained
+`kernel_main -> run_primordial -> primordial::enter` frames after direct
+final-location pinning. The three exact call/return words raise that chain to
+268,832 bytes. The prior 256 KiB stack could not contain it, even before the
+required 4 KiB architectural headroom and 32 KiB spare. The additional 256 KiB
+is explicit optimization debt: future work may reduce bootstrap frame
+pressure, but WYR1-B admission does not trade away registry, memory, task,
+Channel, wait, handle, or mapping-journal capacity to meet the old
+implementation budget.
+
+The accepted linked-artifact gate derives the boot-stack payload from linker
+symbols and checks selectors 25, 26, and 27 independently. For each selector,
+the retained bootstrap chain, exact call/return words, 4 KiB architectural
+headroom, and 32 KiB spare must fit the linked payload.
+
+Worktree execution supplies `DEEPWYRM_ACCEPTED_REQUEST` as an absolute path to
+the exact hash-pinned Rust007 request record. This keeps request provenance
+explicit when the lane is not adjacent to the Wyrmroot checkout; accepted
+artifacts and Cargo state still resolve only from separately provisioned,
+non-symlink lane-parent trees rather than a canonical mutable cache.
+
 ## 6. Evidence boundary
 
 Deepwyrm validates only transport facts: exact reporter authority, retirement,
