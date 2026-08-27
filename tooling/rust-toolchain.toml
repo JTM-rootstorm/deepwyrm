@@ -1,6 +1,7 @@
 # Trusted, repository-owned identity for the accepted shared Wyrmroot toolchain.
 # artifact_root is resolved from the OS-Project workspace parent, never from a request.
 schema = "deepwyrm-rust-toolchain-identity-v1"
+cargo_home = ".tmp/cargo-home/offline-v1"
 request_id = "RUST-WYR0-I-B-SYSROOTS-007"
 artifact_root = "artifacts/toolchains/accepted/RUST-WYR0-I-B-SYSROOTS-007"
 toolchain_root = "toolchains/wyrmroot-1.97.1-a92dc7f7"

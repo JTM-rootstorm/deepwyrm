@@ -4,6 +4,7 @@
 # product/target compiler. This installed stable toolchain owns host gates;
 # the two lanes must never share a Cargo target directory.
 schema = "deepwyrm-host-rust-toolchain-identity-v1"
+cargo_home = ".tmp/cargo-home/offline-v1"
 tool_bin_directory = "/opt/rust-bin-1.97.1/bin"
 cargo_binary = "/opt/rust-bin-1.97.1/bin/cargo"
 cargo_sha256 = "828980723df339d62434390e9fb8ef8831036583343ae2316b7ab5646b5c1953"

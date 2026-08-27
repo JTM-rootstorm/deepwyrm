@@ -11,7 +11,8 @@ Lanes:
 
 The target directory must be beneath /tmp or deepwyrm/.tmp. The canonical
 deepwyrm/target directory is intentionally rejected so host and accepted
-toolchain artifacts cannot contaminate one another.
+toolchain artifacts cannot contaminate one another. CARGO_HOME is selected
+from the lane identity and must not be supplied by the caller.
 EOF
 }
 
@@ -64,6 +65,26 @@ case "$1" in
         ;;
 esac
 [ "$#" -ge 1 ] || fail "missing Cargo arguments"
+
+if [ "$lane" = host ]; then
+    for argument in "$@"; do
+        case "$argument" in
+            --manifest-path|--manifest-path=*|--config|--config=*)
+                fail "host lane rejects manifest/config redirection"
+                ;;
+            --all-features|--bin|--bin=*|--bins|*native-*)
+                fail "host lane rejects freestanding/native binary admission; use the target lane"
+                ;;
+            --target|--target=x86_64-unknown-wyrmroot|--target=x86_64-unknown-none|x86_64-unknown-wyrmroot|x86_64-unknown-none)
+                fail "host lane rejects Wyrmroot/freestanding target selection; use the target lane"
+                ;;
+            --target=*)
+                [ "$argument" = "--target=x86_64-unknown-linux-gnu" ] || \
+                    fail "host lane rejects non-host target selection; use the target lane"
+                ;;
+        esac
+    done
+fi
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 workspace=$(CDPATH='' cd -- "$script_dir/.." && pwd -P)
@@ -136,6 +157,23 @@ else
     verify_file "$clang" "$(config_value "$host_identity" clang_sha256)" "host Clang"
     export DEEPWYRM_ACCEPTED_RUST_LLD="$rust_lld"
 fi
+
+[ -z "${CARGO_HOME:-}" ] || fail "CARGO_HOME is lane-owned; do not supply it"
+cargo_home_relative=$(config_value "$identity" cargo_home)
+case "$cargo_home_relative" in
+    /*|*..*) fail "lane Cargo home must be a non-traversing project-relative path" ;;
+esac
+cargo_home=$(realpath -m -- "$project_root/$cargo_home_relative")
+case "$cargo_home" in
+    "$project_root"/.tmp/*) ;;
+    *) fail "lane Cargo home must resolve beneath $project_root/.tmp" ;;
+esac
+[ -d "$cargo_home" ] && [ ! -L "$cargo_home" ] || \
+    fail "lane Cargo home is not a project-local non-symlink directory: $cargo_home"
+export CARGO_HOME="$cargo_home"
+
+"$cargo" metadata --locked --offline --format-version=1 >/dev/null || \
+    fail "lane Cargo home cannot resolve the locked offline dependency graph"
 
 mkdir -p -- "$normalized_target"
 target_marker="$normalized_target/.deepwyrm-pinned-cargo-v1"
