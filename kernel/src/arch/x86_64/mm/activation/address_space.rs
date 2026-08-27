@@ -189,6 +189,41 @@ impl<const CPUS: usize> KernelExecutionRoots<CPUS> {
         Ok(())
     }
 
+    pub(crate) fn prepare_entry(
+        &self,
+        cpu: CpuIndex,
+        expected_source_root: u64,
+    ) -> Result<PreparedKernelRootEntry, RootBindingError> {
+        let root = self.get(cpu)?;
+        if expected_source_root == 0 || expected_source_root == root.identity.physical_start() {
+            return Err(RootBindingError::RootMismatch);
+        }
+        Ok(PreparedKernelRootEntry {
+            cpu,
+            expected_source_root,
+            root: root.identity.physical_start(),
+            identity: root.identity,
+        })
+    }
+
+    pub(crate) fn commit_entry(
+        &self,
+        executed: ExecutedKernelRootEntry,
+    ) -> ActiveKernelExecutionRoot {
+        let ExecutedKernelRootEntry(prepared) = executed;
+        let root = self
+            .get(prepared.cpu)
+            .unwrap_or_else(|error| panic!("AP kernel execution root disappeared: {error:?}"));
+        if root.identity != prepared.identity || root.identity.physical_start() != prepared.root {
+            panic!("AP kernel execution root identity drifted before commit");
+        }
+        ActiveKernelExecutionRoot {
+            cpu: prepared.cpu,
+            root: prepared.root,
+            identity: prepared.identity,
+        }
+    }
+
     pub(crate) fn get(&self, cpu: CpuIndex) -> Result<&KernelExecutionRoot, RootBindingError> {
         self.roots
             .get(cpu.index())
@@ -197,6 +232,37 @@ impl<const CPUS: usize> KernelExecutionRoots<CPUS> {
             .ok_or(RootBindingError::Missing)
     }
 }
+
+#[must_use = "prepared AP kernel-root entry must be executed or cancelled"]
+pub(crate) struct PreparedKernelRootEntry {
+    cpu: CpuIndex,
+    expected_source_root: u64,
+    root: u64,
+    identity: TableIdentity,
+}
+
+impl PreparedKernelRootEntry {
+    pub(crate) fn execute<T: RootSwitchTarget>(
+        self,
+        target: &mut T,
+    ) -> Result<ExecutedKernelRootEntry, (RootBindingError, PreparedKernelRootEntry)> {
+        let error = if target.current_cpu() != Some(self.cpu) {
+            Some(RootBindingError::CpuMismatch)
+        } else if target.current_root_physical_start() != Some(self.expected_source_root) {
+            Some(RootBindingError::RootMismatch)
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err((error, self));
+        }
+        target.load_cr3_full_flush(self.root);
+        Ok(ExecutedKernelRootEntry(self))
+    }
+}
+
+#[must_use = "executed AP kernel-root entry must commit its CPU-private token"]
+pub(crate) struct ExecutedKernelRootEntry(PreparedKernelRootEntry);
 
 #[allow(
     clippy::too_many_arguments,
@@ -495,10 +561,17 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
         previous: Option<ActiveRootSelection>,
         target: &mut T,
     ) -> Result<ActiveRootSelection, RootSelectionFailure> {
+        let prepared = self.prepare_selection_switch(prepared, previous)?;
+        let executed = prepared.execute(target)?;
+        Ok(self.commit_selection_switch(executed))
+    }
+
+    pub(crate) fn prepare_selection_switch(
+        &self,
+        prepared: PreparedRootSelection,
+        previous: Option<ActiveRootSelection>,
+    ) -> Result<PreparedProcessRootSwitch, RootSelectionFailure> {
         let preflight = || {
-            if target.current_cpu() != Some(prepared.residency.cpu()) {
-                return Err(RootBindingError::CpuMismatch);
-            }
             let next = self.binding(prepared.process, prepared.address_space)?;
             if next.identity != prepared.identity
                 || next.identity.physical_start() != prepared.root
@@ -543,27 +616,53 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
                 });
             }
         };
+        debug_assert_eq!(previous.is_some(), previous_binding.is_some());
+        Ok(PreparedProcessRootSwitch { prepared, previous })
+    }
 
-        // All recoverable identity, CPU, and residency checks are complete.
-        // The sealed target is infallible. The only work after CR3 is clearing
-        // the exact preflighted old epoch; drift is an impossible kernel
-        // invariant failure and must not be reported as a recoverable switch.
-        target.load_cr3_full_flush(prepared.root);
-        if let (Some(previous), Some(old)) = (previous, previous_binding) {
+    pub(crate) fn commit_selection_switch(
+        &self,
+        executed: ExecutedProcessRootSwitch,
+    ) -> ActiveRootSelection {
+        let ExecutedProcessRootSwitch(PreparedProcessRootSwitch { prepared, previous }) = executed;
+        let next = self
+            .binding(prepared.process, prepared.address_space)
+            .unwrap_or_else(|error| panic!("executed destination root disappeared: {error:?}"));
+        if next.identity != prepared.identity
+            || next.identity.physical_start() != prepared.root
+            || next.generation != prepared.binding_generation
+        {
+            panic!("executed destination root identity drifted before commit");
+        }
+        next.coherency
+            .preflight_leave_after_local_flush(&prepared.residency)
+            .unwrap_or_else(|error| {
+                panic!("executed destination residency drifted before commit: {error:?}")
+            });
+        if let Some(previous) = previous {
+            let old = self
+                .binding(previous.process, previous.address_space)
+                .unwrap_or_else(|error| panic!("executed source root disappeared: {error:?}"));
+            if old.identity != previous.identity
+                || old.identity.physical_start() != previous.root
+                || old.generation != previous.binding_generation
+            {
+                panic!("executed source root identity drifted before commit");
+            }
             old.coherency
                 .leave_after_local_flush(previous.residency)
                 .unwrap_or_else(|error| {
                     panic!("preflighted old-root residency drifted after CR3: {error:?}")
                 });
         }
-        Ok(ActiveRootSelection {
+        ActiveRootSelection {
             process: prepared.process,
             address_space: prepared.address_space,
             root: prepared.root,
             identity: prepared.identity,
             residency: prepared.residency,
             binding_generation: prepared.binding_generation,
-        })
+        }
     }
 
     /// Switches one CPU from an exact Process root to its retained
@@ -579,12 +678,19 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
         previous: ActiveRootSelection,
         target: &mut T,
     ) -> Result<ActiveKernelExecutionRoot, (RootBindingError, ActiveRootSelection)> {
+        let prepared = self.prepare_kernel_execution_root_switch(kernel, previous)?;
+        let executed = prepared.execute(target)?;
+        Ok(self.commit_kernel_execution_root_switch(executed))
+    }
+
+    pub(crate) fn prepare_kernel_execution_root_switch(
+        &self,
+        kernel: &KernelExecutionRoot,
+        previous: ActiveRootSelection,
+    ) -> Result<PreparedKernelExecutionRootSwitch, (RootBindingError, ActiveRootSelection)> {
         let preflight = || {
-            if target.current_cpu() != Some(kernel.cpu) || previous.residency.cpu() != kernel.cpu {
+            if previous.residency.cpu() != kernel.cpu {
                 return Err(RootBindingError::CpuMismatch);
-            }
-            if target.current_root_physical_start() != Some(previous.root) {
-                return Err(RootBindingError::RootMismatch);
             }
             let binding = self.binding(previous.process, previous.address_space)?;
             if binding.identity != previous.identity
@@ -602,18 +708,45 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
             Ok(binding) => binding,
             Err(error) => return Err((error, previous)),
         };
-        target.load_cr3_full_flush(kernel.identity.physical_start());
+        debug_assert_eq!(binding.identity, previous.identity);
+        Ok(PreparedKernelExecutionRootSwitch {
+            cpu: kernel.cpu,
+            root: kernel.identity.physical_start(),
+            identity: kernel.identity,
+            previous,
+        })
+    }
+
+    pub(crate) fn commit_kernel_execution_root_switch(
+        &self,
+        executed: ExecutedKernelExecutionRootSwitch,
+    ) -> ActiveKernelExecutionRoot {
+        let ExecutedKernelExecutionRootSwitch(PreparedKernelExecutionRootSwitch {
+            cpu,
+            root,
+            identity,
+            previous,
+        }) = executed;
+        let binding = self
+            .binding(previous.process, previous.address_space)
+            .unwrap_or_else(|error| panic!("executed Process root disappeared: {error:?}"));
+        if binding.identity != previous.identity
+            || binding.identity.physical_start() != previous.root
+            || binding.generation != previous.binding_generation
+        {
+            panic!("executed Process root identity drifted before kernel-root commit");
+        }
         binding
             .coherency
             .leave_after_local_flush(previous.residency)
             .unwrap_or_else(|error| {
                 panic!("preflighted Process residency drifted after kernel-root CR3: {error:?}")
             });
-        Ok(ActiveKernelExecutionRoot {
-            cpu: kernel.cpu,
-            root: kernel.identity.physical_start(),
-            identity: kernel.identity,
-        })
+        ActiveKernelExecutionRoot {
+            cpu,
+            root,
+            identity,
+        }
     }
 
     /// Switches one CPU from its retained execution root to a prepared Process
@@ -629,14 +762,19 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
         previous: ActiveKernelExecutionRoot,
         target: &mut T,
     ) -> Result<ActiveRootSelection, KernelRootSelectionFailure> {
+        let prepared = self.prepare_from_kernel_execution_root_switch(prepared, previous)?;
+        let executed = prepared.execute(target)?;
+        Ok(self.commit_from_kernel_execution_root_switch(executed))
+    }
+
+    pub(crate) fn prepare_from_kernel_execution_root_switch(
+        &self,
+        prepared: PreparedRootSelection,
+        previous: ActiveKernelExecutionRoot,
+    ) -> Result<PreparedKernelToProcessRootSwitch, KernelRootSelectionFailure> {
         let preflight = || {
-            if target.current_cpu() != Some(previous.cpu)
-                || prepared.residency.cpu() != previous.cpu
-            {
+            if prepared.residency.cpu() != previous.cpu {
                 return Err(RootBindingError::CpuMismatch);
-            }
-            if target.current_root_physical_start() != Some(previous.root) {
-                return Err(RootBindingError::RootMismatch);
             }
             let binding = self.binding(prepared.process, prepared.address_space)?;
             if binding.identity != prepared.identity
@@ -657,15 +795,40 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
                 previous,
             });
         }
-        target.load_cr3_full_flush(prepared.root);
-        Ok(ActiveRootSelection {
+        Ok(PreparedKernelToProcessRootSwitch { prepared, previous })
+    }
+
+    pub(crate) fn commit_from_kernel_execution_root_switch(
+        &self,
+        executed: ExecutedKernelToProcessRootSwitch,
+    ) -> ActiveRootSelection {
+        let ExecutedKernelToProcessRootSwitch(PreparedKernelToProcessRootSwitch {
+            prepared,
+            previous: _,
+        }) = executed;
+        let binding = self
+            .binding(prepared.process, prepared.address_space)
+            .unwrap_or_else(|error| panic!("executed destination root disappeared: {error:?}"));
+        if binding.identity != prepared.identity
+            || binding.identity.physical_start() != prepared.root
+            || binding.generation != prepared.binding_generation
+        {
+            panic!("executed destination root identity drifted before kernel-root commit");
+        }
+        binding
+            .coherency
+            .preflight_leave_after_local_flush(&prepared.residency)
+            .unwrap_or_else(|error| {
+                panic!("executed destination residency drifted before commit: {error:?}")
+            });
+        ActiveRootSelection {
             process: prepared.process,
             address_space: prepared.address_space,
             root: prepared.root,
             identity: prepared.identity,
             residency: prepared.residency,
             binding_generation: prepared.binding_generation,
-        })
+        }
     }
 
     pub(crate) fn abandon_selection(
@@ -868,6 +1031,112 @@ impl PreparedRootSelection {
         self.binding_generation
     }
 }
+
+/// Move-only Process-root switch prepared while root-binding authority is
+/// held. It owns every residency token required to re-attest and execute the
+/// CR3 transition after that authority is dropped.
+#[must_use = "prepared Process root switch must be executed or its residency tokens recovered"]
+pub(crate) struct PreparedProcessRootSwitch {
+    prepared: PreparedRootSelection,
+    previous: Option<ActiveRootSelection>,
+}
+
+impl PreparedProcessRootSwitch {
+    pub(crate) fn execute<T: RootSwitchTarget>(
+        self,
+        target: &mut T,
+    ) -> Result<ExecutedProcessRootSwitch, RootSelectionFailure> {
+        let expected_cpu = self.prepared.residency.cpu();
+        let expected_source_root = self.previous.as_ref().map(|previous| previous.root);
+        if target.current_cpu() != Some(expected_cpu)
+            || expected_source_root
+                .is_some_and(|root| target.current_root_physical_start() != Some(root))
+        {
+            return Err(RootSelectionFailure {
+                error: if target.current_cpu() != Some(expected_cpu) {
+                    RootBindingError::CpuMismatch
+                } else {
+                    RootBindingError::RootMismatch
+                },
+                prepared: self.prepared,
+                previous: self.previous,
+            });
+        }
+        target.load_cr3_full_flush(self.prepared.root);
+        Ok(ExecutedProcessRootSwitch(self))
+    }
+}
+
+#[must_use = "executed Process root switch must commit its residency transition"]
+pub(crate) struct ExecutedProcessRootSwitch(PreparedProcessRootSwitch);
+
+/// Move-only Process-to-kernel execution-root switch prepared under binding
+/// authority and executable without retaining any authority borrow.
+#[must_use = "prepared kernel execution-root switch must be executed or recovered"]
+pub(crate) struct PreparedKernelExecutionRootSwitch {
+    cpu: CpuIndex,
+    root: u64,
+    identity: TableIdentity,
+    previous: ActiveRootSelection,
+}
+
+impl PreparedKernelExecutionRootSwitch {
+    pub(crate) fn execute<T: RootSwitchTarget>(
+        self,
+        target: &mut T,
+    ) -> Result<ExecutedKernelExecutionRootSwitch, (RootBindingError, ActiveRootSelection)> {
+        let error = if target.current_cpu() != Some(self.cpu) {
+            Some(RootBindingError::CpuMismatch)
+        } else if target.current_root_physical_start() != Some(self.previous.root) {
+            Some(RootBindingError::RootMismatch)
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err((error, self.previous));
+        }
+        target.load_cr3_full_flush(self.root);
+        Ok(ExecutedKernelExecutionRootSwitch(self))
+    }
+}
+
+#[must_use = "executed kernel execution-root switch must commit Process residency release"]
+pub(crate) struct ExecutedKernelExecutionRootSwitch(PreparedKernelExecutionRootSwitch);
+
+/// Move-only kernel-execution-root to Process-root switch prepared under
+/// binding authority and executable after that authority is dropped.
+#[must_use = "prepared kernel-to-Process root switch must be executed or recovered"]
+pub(crate) struct PreparedKernelToProcessRootSwitch {
+    prepared: PreparedRootSelection,
+    previous: ActiveKernelExecutionRoot,
+}
+
+impl PreparedKernelToProcessRootSwitch {
+    pub(crate) fn execute<T: RootSwitchTarget>(
+        self,
+        target: &mut T,
+    ) -> Result<ExecutedKernelToProcessRootSwitch, KernelRootSelectionFailure> {
+        let error = if target.current_cpu() != Some(self.previous.cpu) {
+            Some(RootBindingError::CpuMismatch)
+        } else if target.current_root_physical_start() != Some(self.previous.root) {
+            Some(RootBindingError::RootMismatch)
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err(KernelRootSelectionFailure {
+                error,
+                prepared: self.prepared,
+                previous: self.previous,
+            });
+        }
+        target.load_cr3_full_flush(self.prepared.root);
+        Ok(ExecutedKernelToProcessRootSwitch(self))
+    }
+}
+
+#[must_use = "executed kernel-to-Process root switch must commit its residency transition"]
+pub(crate) struct ExecutedKernelToProcessRootSwitch(PreparedKernelToProcessRootSwitch);
 
 /// Recoverable pre-CR3 rejection with every move-only residency token returned
 /// unchanged. No `RootSelectionFailure` can be constructed after CR3.

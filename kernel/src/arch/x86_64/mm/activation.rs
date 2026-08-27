@@ -55,8 +55,11 @@ mod user_access;
 )]
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 pub(crate) use address_space::{
-    ActiveKernelExecutionRoot, ActiveRootSelection, AddressSpaceRootBindings, KernelExecutionRoot,
-    KernelExecutionRoots, KernelHalfBinding, KernelRootSelectionFailure, PreparedRootSelection,
+    ActiveKernelExecutionRoot, ActiveRootSelection, AddressSpaceRootBindings,
+    ExecutedKernelExecutionRootSwitch, ExecutedKernelRootEntry, ExecutedKernelToProcessRootSwitch,
+    ExecutedProcessRootSwitch, KernelExecutionRoot, KernelExecutionRoots, KernelHalfBinding,
+    KernelRootSelectionFailure, PreparedKernelExecutionRootSwitch, PreparedKernelRootEntry,
+    PreparedKernelToProcessRootSwitch, PreparedProcessRootSwitch, PreparedRootSelection,
     RootBindingError, RootSelectionFailure, RootSwitchTarget,
 };
 use graph::*;
@@ -1827,6 +1830,21 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             })
     }
 
+    pub(crate) fn prepare_ap_kernel_root_entry(
+        &self,
+        cpu: crate::cpu::CpuIndex,
+    ) -> Result<PreparedKernelRootEntry, RootBindingError> {
+        self.kernel_execution_roots
+            .prepare_entry(cpu, self.root.frame().address())
+    }
+
+    pub(crate) fn commit_ap_kernel_root_entry(
+        &self,
+        executed: ExecutedKernelRootEntry,
+    ) -> ActiveKernelExecutionRoot {
+        self.kernel_execution_roots.commit_entry(executed)
+    }
+
     /// Audited Process->CPU-kernel-root transition. The move-only Process
     /// selection is consumed; callers must retain the returned kernel token
     /// before performing any reaper work.
@@ -1840,6 +1858,32 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         };
         self.root_bindings
             .activate_kernel_execution_root(kernel, active, &mut LiveRootSwitchTarget)
+    }
+
+    pub(crate) fn prepare_kernel_execution_root_switch(
+        &self,
+        active: ActiveRootSelection,
+    ) -> Result<PreparedKernelExecutionRootSwitch, (RootBindingError, ActiveRootSelection)> {
+        let kernel = match self.kernel_execution_root(active.cpu()) {
+            Ok(kernel) => kernel,
+            Err(error) => return Err((error, active)),
+        };
+        self.root_bindings
+            .prepare_kernel_execution_root_switch(kernel, active)
+    }
+
+    pub(crate) fn execute_kernel_execution_root_switch(
+        prepared: PreparedKernelExecutionRootSwitch,
+    ) -> Result<ExecutedKernelExecutionRootSwitch, (RootBindingError, ActiveRootSelection)> {
+        prepared.execute(&mut LiveRootSwitchTarget)
+    }
+
+    pub(crate) fn commit_kernel_execution_root_switch(
+        &self,
+        executed: ExecutedKernelExecutionRootSwitch,
+    ) -> ActiveKernelExecutionRoot {
+        self.root_bindings
+            .commit_kernel_execution_root_switch(executed)
     }
 
     /// Reserves a distinct child PML4, initializes only its supervisor half
@@ -1892,6 +1936,28 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .activate_selection(prepared, previous, &mut LiveRootSwitchTarget)
     }
 
+    pub(crate) fn prepare_process_root_switch(
+        &self,
+        prepared: PreparedRootSelection,
+        previous: Option<ActiveRootSelection>,
+    ) -> Result<PreparedProcessRootSwitch, RootSelectionFailure> {
+        self.root_bindings
+            .prepare_selection_switch(prepared, previous)
+    }
+
+    pub(crate) fn execute_process_root_switch(
+        prepared: PreparedProcessRootSwitch,
+    ) -> Result<ExecutedProcessRootSwitch, RootSelectionFailure> {
+        prepared.execute(&mut LiveRootSwitchTarget)
+    }
+
+    pub(crate) fn commit_process_root_switch(
+        &self,
+        executed: ExecutedProcessRootSwitch,
+    ) -> ActiveRootSelection {
+        self.root_bindings.commit_selection_switch(executed)
+    }
+
     /// Audited CPU-kernel-root -> Process transition. The kernel-root token is
     /// move-only and the live target observes both CPU identity and CR3 before
     /// accepting it, so a stale token cannot leak a different Process
@@ -1910,6 +1976,29 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             previous,
             &mut LiveRootSwitchTarget,
         )
+    }
+
+    pub(crate) fn prepare_from_kernel_execution_root_switch(
+        &self,
+        prepared: PreparedRootSelection,
+        previous: ActiveKernelExecutionRoot,
+    ) -> Result<PreparedKernelToProcessRootSwitch, KernelRootSelectionFailure> {
+        self.root_bindings
+            .prepare_from_kernel_execution_root_switch(prepared, previous)
+    }
+
+    pub(crate) fn execute_from_kernel_execution_root_switch(
+        prepared: PreparedKernelToProcessRootSwitch,
+    ) -> Result<ExecutedKernelToProcessRootSwitch, KernelRootSelectionFailure> {
+        prepared.execute(&mut LiveRootSwitchTarget)
+    }
+
+    pub(crate) fn commit_from_kernel_execution_root_switch(
+        &self,
+        executed: ExecutedKernelToProcessRootSwitch,
+    ) -> ActiveRootSelection {
+        self.root_bindings
+            .commit_from_kernel_execution_root_switch(executed)
     }
 
     pub(crate) fn abandon_process_root_selection(

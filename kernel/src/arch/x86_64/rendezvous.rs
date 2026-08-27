@@ -585,6 +585,17 @@ impl RendezvousMailbox {
         request: StopRequest,
         target: &mut T,
     ) -> Result<(), RemoteStopError> {
+        let witness = self.prepare_stop_at_safe_point(request, target)?;
+        target.release_root_residency();
+        self.commit_prepared_stop_at_safe_point(witness, target);
+        Ok(())
+    }
+
+    pub(crate) fn prepare_stop_at_safe_point<T: RemoteStopSafePoint>(
+        &self,
+        request: StopRequest,
+        target: &mut T,
+    ) -> Result<ExactSafeWitness, RemoteStopError> {
         match self.state.load(Ordering::Acquire) {
             MAILBOX_STOP_SAFE => return Err(RemoteStopError::AlreadyAcknowledged),
             MAILBOX_STOP_REQUESTED => {}
@@ -593,9 +604,14 @@ impl RendezvousMailbox {
         if self.current_request() != request {
             return Err(RemoteStopError::StaleRequest);
         }
-        let witness =
-            target.precommit_exact_stop(request.identity, ExactSafePrecommit { request })?;
-        target.release_root_residency();
+        target.precommit_exact_stop(request.identity, ExactSafePrecommit { request })
+    }
+
+    pub(crate) fn commit_prepared_stop_at_safe_point<T: RemoteStopSafePoint>(
+        &self,
+        witness: ExactSafeWitness,
+        target: &mut T,
+    ) {
         target.release_running_ownership();
         assert!(
             target.deferred_cleanup_is_quiescent(),
@@ -603,7 +619,6 @@ impl RendezvousMailbox {
         );
 
         self.acknowledge_committed_exact_safe(witness);
-        Ok(())
     }
 
     /// Consumes a precommit witness after the irreversible carrier release.

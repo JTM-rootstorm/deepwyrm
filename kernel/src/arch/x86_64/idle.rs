@@ -16,8 +16,8 @@ use super::rendezvous::{
     StopPublishFailure,
 };
 use super::rendezvous::{
-    MailboxNotification, RemoteStopError, RemoteStopSafePoint, RendezvousIpiLatches,
-    RendezvousMailbox, StopRequest,
+    ExactSafeWitness, MailboxNotification, RemoteStopError, RemoteStopSafePoint,
+    RendezvousIpiLatches, RendezvousMailbox, StopRequest,
 };
 
 const CPU_UNAVAILABLE: u8 = 0;
@@ -331,6 +331,29 @@ impl IdleWakeSet {
         self.mailboxes[cpu.index()].complete_stop_at_safe_point(request, target)
     }
 
+    fn prepare_stop_at_safe_point<T: RemoteStopSafePoint>(
+        &self,
+        cpu: CpuIndex,
+        request: StopRequest,
+        target: &mut T,
+    ) -> Result<ExactSafeWitness, RemoteStopError> {
+        if self.ensure_healthy().is_err()
+            || self.cpus[cpu.index()].state.load(Ordering::Acquire) == CPU_UNAVAILABLE
+        {
+            return Err(RemoteStopError::StaleRequest);
+        }
+        self.mailboxes[cpu.index()].prepare_stop_at_safe_point(request, target)
+    }
+
+    fn commit_prepared_stop_at_safe_point<T: RemoteStopSafePoint>(
+        &self,
+        cpu: CpuIndex,
+        witness: ExactSafeWitness,
+        target: &mut T,
+    ) {
+        self.mailboxes[cpu.index()].commit_prepared_stop_at_safe_point(witness, target);
+    }
+
     pub(crate) fn fail_transport(&self) {
         self.faulted.store(true, Ordering::Release);
     }
@@ -567,6 +590,26 @@ pub(crate) fn complete_current_rendezvous_stop<T: RemoteStopSafePoint>(
     LIVE_IDLE_WAKE
         .complete_stop_at_safe_point(cpu, request, target)
         .map_err(|_| RemoteStopError::StaleRequest)
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn prepare_current_rendezvous_stop<T: RemoteStopSafePoint>(
+    request: StopRequest,
+    target: &mut T,
+) -> Result<ExactSafeWitness, RemoteStopError> {
+    let cpu = current_cpu().map_err(|_| RemoteStopError::WrongIdentity)?;
+    LIVE_IDLE_WAKE
+        .prepare_stop_at_safe_point(cpu, request, target)
+        .map_err(|_| RemoteStopError::StaleRequest)
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn commit_current_rendezvous_stop<T: RemoteStopSafePoint>(
+    witness: ExactSafeWitness,
+    target: &mut T,
+) {
+    let cpu = current_cpu().unwrap_or_else(|_| fail_transport_and_halt());
+    LIVE_IDLE_WAKE.commit_prepared_stop_at_safe_point(cpu, witness, target);
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
