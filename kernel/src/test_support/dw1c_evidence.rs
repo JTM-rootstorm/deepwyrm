@@ -243,6 +243,18 @@ impl Dw1cEvidenceCollector {
         self.observe_cpu_actor(cpu, process, thread, generation, 0)
     }
 
+    /// Scheduler-facing variant: a scheduler owns only the exact Thread and
+    /// execution claim.  The collector resolves that tuple against its ARM
+    /// table, preserving Process ownership inside the test-private boundary.
+    pub(crate) fn observe_running_claim(
+        &self,
+        cpu: u8,
+        thread: ThreadKey,
+        generation: u64,
+    ) -> Result<(), Dw1cEvidenceError> {
+        self.observe_cpu_claim(cpu, thread, generation, 0)
+    }
+
     pub(crate) fn observe_quantum_expiry(
         &self,
         cpu: u8,
@@ -253,6 +265,15 @@ impl Dw1cEvidenceCollector {
         self.observe_cpu_actor(cpu, process, thread, generation, 1)
     }
 
+    pub(crate) fn observe_quantum_claim(
+        &self,
+        cpu: u8,
+        thread: ThreadKey,
+        generation: u64,
+    ) -> Result<(), Dw1cEvidenceError> {
+        self.observe_cpu_claim(cpu, thread, generation, 1)
+    }
+
     pub(crate) fn observe_preemption(
         &self,
         cpu: u8,
@@ -261,6 +282,36 @@ impl Dw1cEvidenceCollector {
         generation: u64,
     ) -> Result<(), Dw1cEvidenceError> {
         self.observe_cpu_actor(cpu, process, thread, generation, 2)
+    }
+
+    pub(crate) fn observe_preemption_claim(
+        &self,
+        cpu: u8,
+        thread: ThreadKey,
+        generation: u64,
+    ) -> Result<(), Dw1cEvidenceError> {
+        self.observe_cpu_claim(cpu, thread, generation, 2)
+    }
+
+    pub(crate) fn observe_remote_wake_claim(
+        &self,
+        target_cpu: u8,
+        thread: ThreadKey,
+        generation: u64,
+    ) -> Result<(), Dw1cEvidenceError> {
+        let mut state = self.state.lock();
+        let bit = cpu_bit(target_cpu).ok_or_else(|| state.latch(Dw1cEvidenceError::Malformed))?;
+        if !state.installed {
+            return Err(state.latch(Dw1cEvidenceError::Early));
+        }
+        if !actor_thread_known(&state, thread) {
+            return Ok(());
+        }
+        if !actor_thread_bound(&state, thread, generation) || state.facts.remote_wake & bit != 0 {
+            return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
+        }
+        state.facts.remote_wake |= bit;
+        Ok(())
     }
 
     pub(crate) fn observe_cpu_ready(&self, cpu: u8) -> Result<(), Dw1cEvidenceError> {
@@ -284,6 +335,36 @@ impl Dw1cEvidenceCollector {
         let mut state = self.state.lock();
         let bit = cpu_bit(cpu).ok_or_else(|| state.latch(Dw1cEvidenceError::Malformed))?;
         if !state.installed || !actor_bound(&state, process, thread, generation) {
+            return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
+        }
+        let destination = match kind {
+            0 => &mut state.facts.run,
+            1 => &mut state.facts.quantum,
+            _ => &mut state.facts.preempt,
+        };
+        if *destination & bit != 0 {
+            return Err(state.latch(Dw1cEvidenceError::Duplicate));
+        }
+        *destination |= bit;
+        Ok(())
+    }
+
+    fn observe_cpu_claim(
+        &self,
+        cpu: u8,
+        thread: ThreadKey,
+        generation: u64,
+        kind: u8,
+    ) -> Result<(), Dw1cEvidenceError> {
+        let mut state = self.state.lock();
+        let bit = cpu_bit(cpu).ok_or_else(|| state.latch(Dw1cEvidenceError::Malformed))?;
+        if !state.installed {
+            return Err(state.latch(Dw1cEvidenceError::Early));
+        }
+        if !actor_thread_known(&state, thread) {
+            return Ok(());
+        }
+        if !actor_thread_bound(&state, thread, generation) {
             return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
         }
         let destination = match kind {
@@ -385,6 +466,21 @@ fn actor_bound(state: &State, process: ProcessKey, thread: ThreadKey, generation
                 && actor.thread == thread
                 && actor.execution_generation == generation
         })
+}
+fn actor_thread_bound(state: &State, thread: ThreadKey, generation: u64) -> bool {
+    generation != 0
+        && state
+            .actors
+            .iter()
+            .flatten()
+            .any(|actor| actor.thread == thread && actor.execution_generation == generation)
+}
+fn actor_thread_known(state: &State, thread: ThreadKey) -> bool {
+    state
+        .actors
+        .iter()
+        .flatten()
+        .any(|actor| actor.thread == thread)
 }
 
 pub(crate) struct Dw1cEvidenceFlushPermit<'a> {

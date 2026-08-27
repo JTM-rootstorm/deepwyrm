@@ -641,7 +641,14 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         &self,
         cpu: SchedulerCpuId,
     ) -> Result<super::ScheduleDecision, SchedulerError> {
-        self.scheduler.schedule_next_on(cpu)
+        let decision = self.scheduler.schedule_next_on(cpu)?;
+        #[cfg(deepwyrm_dw1c_evidence)]
+        if let Some(claim) = self.scheduler.running_claim_on(cpu) {
+            crate::test_support::DW1C_EVIDENCE
+                .observe_running_claim(cpu.index() as u8, claim.thread(), claim.generation())
+                .unwrap_or_else(|error| panic!("selector-28 RUN observation failed: {error:?}"));
+        }
+        Ok(decision)
     }
 
     pub(crate) fn prepare_bootstrap_carrier(
@@ -668,7 +675,12 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         resources: super::CarrierResourceTuple,
     ) -> Result<(), super::CarrierAdmissionError> {
         self.scheduler
-            .commit_bootstrap_schedulable(ticket, resources)
+            .commit_bootstrap_schedulable(ticket, resources)?;
+        #[cfg(deepwyrm_dw1c_evidence)]
+        crate::test_support::DW1C_EVIDENCE
+            .observe_cpu_ready(ticket.cpu().index() as u8)
+            .unwrap_or_else(|error| panic!("selector-28 CPU admission failed: {error:?}"));
+        Ok(())
     }
 
     pub(crate) fn prepare_ap_carrier(
@@ -696,7 +708,12 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         enable_idle_wake: impl FnOnce() -> bool,
     ) -> Result<(), super::CarrierAdmissionError> {
         self.scheduler
-            .commit_ap_schedulable(ticket, resources, enable_idle_wake)
+            .commit_ap_schedulable(ticket, resources, enable_idle_wake)?;
+        #[cfg(deepwyrm_dw1c_evidence)]
+        crate::test_support::DW1C_EVIDENCE
+            .observe_cpu_ready(ticket.cpu().index() as u8)
+            .unwrap_or_else(|error| panic!("selector-28 AP admission failed: {error:?}"));
+        Ok(())
     }
 
     pub(crate) fn carrier_admission_snapshot(
@@ -764,7 +781,20 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         &self,
         ticket: super::SchedulerQuantumTicket,
     ) -> Result<bool, SchedulerError> {
-        self.scheduler.publish_quantum_expiry(ticket)
+        let published = self.scheduler.publish_quantum_expiry(ticket)?;
+        #[cfg(deepwyrm_dw1c_evidence)]
+        if published {
+            crate::test_support::DW1C_EVIDENCE
+                .observe_quantum_claim(
+                    ticket.cpu().index() as u8,
+                    ticket.thread(),
+                    ticket.execution_generation(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("selector-28 QUANTUM observation failed: {error:?}")
+                });
+        }
+        Ok(published)
     }
 
     pub(crate) fn has_reschedule_request_on(&self, cpu: SchedulerCpuId) -> bool {
@@ -782,7 +812,20 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         &self,
         cpu: SchedulerCpuId,
     ) -> Result<super::SchedulerPreemptionDecision, SchedulerError> {
-        self.scheduler.preempt_current_on(cpu)
+        let decision = self.scheduler.preempt_current_on(cpu)?;
+        #[cfg(deepwyrm_dw1c_evidence)]
+        if let super::SchedulerPreemptionDecision::Switch { outgoing, .. } = decision {
+            crate::test_support::DW1C_EVIDENCE
+                .observe_preemption_claim(
+                    cpu.index() as u8,
+                    outgoing.thread(),
+                    outgoing.generation(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("selector-28 PREEMPT observation failed: {error:?}")
+                });
+        }
+        Ok(decision)
     }
 
     pub(crate) fn preemption_disable_on(&self, cpu: SchedulerCpuId) -> Result<(), SchedulerError> {
@@ -993,6 +1036,16 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
             .scheduler
             .wake_on(super::scheduler_requester_cpu(), key)?;
         super::notify_runnable_work(publication.wake_affinity());
+        #[cfg(deepwyrm_dw1c_evidence)]
+        crate::test_support::DW1C_EVIDENCE
+            .observe_remote_wake_claim(
+                publication.target().index() as u8,
+                key.thread(),
+                key.execution_generation(),
+            )
+            .unwrap_or_else(|error| {
+                panic!("selector-28 REMOTE_WAKE observation failed: {error:?}")
+            });
         Ok(())
     }
 
