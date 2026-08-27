@@ -7,6 +7,9 @@
 
 use super::*;
 
+#[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
+use super::primordial_diagnostic::primordial_terminal_summary;
+
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
@@ -3953,72 +3956,6 @@ const fn supervisor_evidence_detail(case: u32) -> u32 {
     return 0x2510_0000 | case;
     #[cfg(deepwyrm_wyr1b_evidence)]
     return 0x2710_0000 | case;
-}
-
-#[cfg(any(test, deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
-const fn primordial_application_summary(application_code: u32) -> u32 {
-    if application_code == 0 {
-        0
-    } else if application_code == 0xaf01_0002 {
-        // Wyrmroot system-init's fatal-reboot-required status is the primary
-        // pre-bootstrap failure discriminator for these selectors.
-        0x02
-    } else if application_code & 0xffff_0000 == 0xaf01_0000 {
-        0x10 | (application_code & 0x0f)
-    } else if application_code & 0xffff_0000 == 0xaf11_0000 {
-        0x20 | (application_code & 0x1f)
-    } else if application_code & 0xff00_0000 == 0xb400_0000 {
-        // B4 terminal records dedicate four bits each to the saturated
-        // termination reason and exception type. Those two fields exactly
-        // fill the selector's remaining summary byte; retaining fault class,
-        // detail, or category too would make the diagnostic ambiguous.
-        let reason = (application_code >> 18) & 0x0f;
-        let exception_type = (application_code >> 14) & 0x0f;
-        (reason << 4) | exception_type
-    } else if application_code & 0xf000_0000 == 0xb000_0000 {
-        // Preserve the bootstrap family plus its bounded low-six-bit reason.
-        0x80 | (application_code & 0x3f)
-    } else {
-        0x40 | (application_code & 0x3f)
-    }
-}
-
-#[cfg(any(test, deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
-fn primordial_terminal_summary(info: Option<deepwyrm_abi::DwTaskTerminationInfoV1>) -> u32 {
-    let Some(info) = info else {
-        return 0xff;
-    };
-    if info.state != DW_TASK_STATE_EXITED {
-        return 0xfc;
-    }
-    if info.reason == DW_TERMINATION_NORMAL_EXIT {
-        primordial_application_summary(info.application_code)
-    } else if info.reason == deepwyrm_abi::DW_TERMINATION_UNHANDLED_EXCEPTION {
-        if info.exception_type == DW_EXCEPTION_GENERAL_PROTECTION {
-            // C0..DF is unused by current normal/B4 summaries, other
-            // exception types, and FC/FD/FF disposition markers. Its low five
-            // bits retain invalid-return details 1..7 exactly and raw #GP
-            // error codes through 31; larger architecture codes saturate.
-            let detail = if info.detail > 0x1f {
-                0x1f
-            } else {
-                info.detail
-            };
-            0xc0 | detail
-        } else {
-            // E0..EF retains every current generated exception type exactly
-            // (or F for a future out-of-range value). Detail and fault class
-            // cannot also fit without collapsing exception identities.
-            let exception_type = if info.exception_type.0 > 0x0f {
-                0x0f
-            } else {
-                info.exception_type.0
-            };
-            0xe0 | exception_type
-        }
-    } else {
-        0xfd
-    }
 }
 
 #[cfg(any(test, deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]

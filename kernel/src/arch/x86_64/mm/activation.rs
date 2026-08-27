@@ -35,6 +35,17 @@ mod graph;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 #[path = "activation/primordial.rs"]
 mod primordial;
+#[cfg(any(
+    test,
+    all(
+        deepwyrm_integrated,
+        target_os = "none",
+        target_arch = "x86_64",
+        any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence)
+    )
+))]
+#[path = "activation/primordial_diagnostic.rs"]
+mod primordial_diagnostic;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[path = "activation/user_access.rs"]
 mod user_access;

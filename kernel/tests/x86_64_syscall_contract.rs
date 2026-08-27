@@ -987,6 +987,7 @@ fn wyr1_terminal_child_after_primordial_retirement_uses_its_current_root() {
 #[test]
 fn wyr1_primordial_completion_failures_have_variant_specific_details() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let diagnostic = source("src/arch/x86_64/mm/activation/primordial_diagnostic.rs");
     let terminal = runtime
         .split_once("fn prepare_terminal_handoff(&mut self) -> PreparedTerminalHandoff")
         .expect("terminal handoff")
@@ -1033,23 +1034,25 @@ fn wyr1_primordial_completion_failures_have_variant_specific_details() {
     assert!(runtime.contains("0xe000"));
     assert!(runtime.contains("primordial_receive_failure_tag(code) << 8"));
     assert!(runtime.contains("primordial_terminal_summary(terminal_info)"));
-    assert!(runtime.contains("application_code == 0xaf01_0002"));
-    let b400_terminal = runtime
+    assert!(diagnostic.contains("application_code == 0xaf01_0002"));
+    assert!(diagnostic.contains("application_code & 0xffff_0000 == 0xaf11_0000"));
+    assert!(diagnostic.contains("0x20 | (application_code & 0x1f)"));
+    let b400_terminal = diagnostic
         .find("application_code & 0xff00_0000 == 0xb400_0000")
         .expect("B400 structured terminal summary");
-    let generic_bootstrap = runtime
+    let generic_bootstrap = diagnostic
         .find("application_code & 0xf000_0000 == 0xb000_0000")
         .expect("generic bootstrap summary");
     assert!(b400_terminal < generic_bootstrap);
-    assert!(runtime.contains("let reason = (application_code >> 18) & 0x0f;"));
-    assert!(runtime.contains("let exception_type = (application_code >> 14) & 0x0f;"));
-    assert!(runtime.contains("(reason << 4) | exception_type"));
-    assert!(runtime.contains("0x80 | (application_code & 0x3f)"));
-    let terminal_summary = runtime
-        .split_once("fn primordial_terminal_summary(")
+    assert!(diagnostic.contains("let reason = (application_code >> 18) & 0x0f;"));
+    assert!(diagnostic.contains("let exception_type = (application_code >> 14) & 0x0f;"));
+    assert!(diagnostic.contains("(reason << 4) | exception_type"));
+    assert!(diagnostic.contains("0x80 | (application_code & 0x3f)"));
+    let terminal_summary = diagnostic
+        .split_once("pub(super) fn primordial_terminal_summary(")
         .expect("primordial terminal summary")
         .1
-        .split_once("const fn primordial_receive_failure_tag(")
+        .split_once("#[cfg(test)]")
         .expect("terminal summary extent")
         .0;
     let gp = terminal_summary
