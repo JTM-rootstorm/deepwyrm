@@ -292,6 +292,10 @@ impl RawSyscallFrame {
         Ok(())
     }
 
+    pub(crate) fn revoke_authorized_return(&mut self) {
+        self.return_authorized = 0;
+    }
+
     pub(crate) fn authorize_return<M: UserReturnMappingValidation>(
         &mut self,
         current_binding_generation: u64,

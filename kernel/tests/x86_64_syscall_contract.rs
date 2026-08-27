@@ -789,6 +789,41 @@ fn live_return_boundary_publishes_final_release_effects_before_userspace_resume(
 }
 
 #[test]
+fn syscall_return_preemption_revokes_authorization_immediately_before_switch() {
+    let live = source("src/arch/x86_64/syscall/live.rs");
+    let frame = source("src/arch/x86_64/syscall/frame.rs");
+    let service = live
+        .split_once("fn service_syscall_return_preemption<")
+        .expect("syscall-return preemption service")
+        .1
+        .split_once("fn switch_kernel_context(")
+        .expect("syscall-return preemption extent")
+        .0;
+
+    assert!(
+        service.contains(
+            "frame.revoke_authorized_return();\n            switch_kernel_context(plan);"
+        )
+    );
+    let revoke = service.find("frame.revoke_authorized_return()").unwrap();
+    let switch = service.find("switch_kernel_context(plan)").unwrap();
+    let resume = service
+        .find("runtime.resume_syscall_preemption(frame)")
+        .unwrap();
+    assert!(revoke < switch && switch < resume);
+
+    let revoke_method = frame
+        .split_once("pub(crate) fn revoke_authorized_return(&mut self)")
+        .expect("return authorization revocation")
+        .1
+        .split_once("pub(crate) fn authorize_return")
+        .expect("revocation extent")
+        .0;
+    assert!(revoke_method.contains("self.return_authorized = 0;"));
+    assert!(frame.contains("current_binding_generation == 0 || self.return_authorized != 0"));
+}
+
+#[test]
 fn live_timer_expiry_is_bound_and_serviced_only_from_carrier_safe_points() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
 

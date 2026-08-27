@@ -328,7 +328,7 @@ fn dwstatus_is_sign_extended_into_rax() {
 }
 
 #[test]
-fn suspended_frame_rebinds_only_before_return_authorization() {
+fn authorized_frame_rebind_requires_explicit_revocation() {
     let mut frame = RawSyscallFrame::synthetic(1, [0; 6], 0x4000, 0x8000, 0x202, 9);
     let mut mappings = Mapping {
         executable: true,
@@ -345,6 +345,11 @@ fn suspended_frame_rebinds_only_before_return_authorization() {
         frame.rebind_after_kernel_resume(11),
         Err(UserReturnError::BindingChanged)
     );
+    frame.revoke_authorized_return();
+    assert_eq!(frame.test_return_authorized(), 0);
+    assert!(frame.rebind_after_kernel_resume(11).is_ok());
+    assert_eq!(frame.binding_generation(), 11);
+    assert!(frame.authorize_return(11, &mut mappings).is_ok());
 }
 
 #[test]

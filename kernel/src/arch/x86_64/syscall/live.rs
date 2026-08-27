@@ -1630,6 +1630,7 @@ fn service_syscall_return_preemption<
             unsafe { runtime.prepare_preemption() }
         };
         if let crate::syscall::native::NativePreemptionPlan::Switch(plan) = plan {
+            frame.revoke_authorized_return();
             switch_kernel_context(plan);
             *context = current_runtime_context::<R>().unwrap_or_else(|| halt_forever());
             let runtime = unsafe { &mut *(*context).cast::<R>() };
