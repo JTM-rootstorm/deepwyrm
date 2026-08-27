@@ -13,7 +13,7 @@ use super::frame::{PerCpuEntryState, RawSyscallFrame, ValidatedUserReturn};
 use super::msr::{
     CR0_TASK_SWITCHED, CR4_FSGSBASE, IA32_EFER, SyscallMsrAccess, SyscallMsrPlan,
     SyscallMsrPlanError, SyscallMsrProgramError, normalize_cr0_for_e5, normalize_cr4_for_e4,
-    program_and_verify, verify_live_boundary,
+    program_and_verify, verify,
 };
 use super::runtime_binding::{
     RuntimeCarrierClaimError, RuntimeCarrierClaims, RuntimeCarrierLifecycle,
@@ -702,7 +702,7 @@ pub(crate) fn validate_live_syscall_boundary() -> Result<(), SyscallInstallError
         return Err(SyscallInstallError::FpSimdPolicyNotEnforced);
     }
     let plan = unsafe { expected_plan(cpu_index) }.ok_or(SyscallInstallError::DescriptorState)?;
-    verify_live_boundary(&mut LiveMsrAccess, plan).map_err(map_program_error)
+    verify(&mut LiveMsrAccess, plan).map_err(map_program_error)
 }
 
 #[allow(

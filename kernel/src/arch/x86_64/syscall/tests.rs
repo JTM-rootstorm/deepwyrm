@@ -255,16 +255,13 @@ fn e4_msr_programming_enables_sce_last_and_verifies_readback() {
 }
 
 #[test]
-fn e4_live_boundary_accepts_only_the_two_exact_gs_orientations() {
+fn e4_live_validation_requires_strict_kernel_gs_orientation() {
     let plan = SyscallMsrPlan::new(0x100, 0xffff_ffff_8000_1000, 0xffff_ffff_8000_2000).unwrap();
     let mut access = FakeMsr::default();
     program_and_verify(&mut access, plan).unwrap();
 
-    verify_live_boundary(&mut access, plan).unwrap();
-
     access.values.insert(IA32_GS_BASE, 0);
     access.values.insert(IA32_KERNEL_GS_BASE, plan.gs_base);
-    verify_live_boundary(&mut access, plan).unwrap();
     assert!(matches!(
         verify(&mut access, plan),
         Err(SyscallMsrProgramError::Readback {
@@ -273,34 +270,15 @@ fn e4_live_boundary_accepts_only_the_two_exact_gs_orientations() {
         })
     ));
 
-    for (gs_base, kernel_gs_base) in [
-        (0, 0),
-        (plan.gs_base, plan.gs_base),
-        (plan.gs_base, 0x1000),
-        (0x1000, 0),
-        (0, 0x1000),
-        (0x1000, plan.gs_base),
-    ] {
-        access.values.insert(IA32_GS_BASE, gs_base);
-        access.values.insert(IA32_KERNEL_GS_BASE, kernel_gs_base);
-        assert!(
-            verify_live_boundary(&mut access, plan).is_err(),
-            "malformed GS pair ({gs_base:#x}, {kernel_gs_base:#x}) was accepted"
-        );
-    }
-}
-
-#[test]
-fn e4_live_boundary_keeps_every_non_gs_msr_exact() {
-    let plan = SyscallMsrPlan::new(0x100, 0xffff_ffff_8000_1000, 0xffff_ffff_8000_2000).unwrap();
-    let mut access = FakeMsr::default();
-    program_and_verify(&mut access, plan).unwrap();
+    access.values.insert(IA32_GS_BASE, plan.gs_base);
+    access.values.insert(IA32_KERNEL_GS_BASE, 0);
+    verify(&mut access, plan).unwrap();
 
     for msr in [IA32_STAR, IA32_LSTAR, IA32_FMASK, IA32_FS_BASE, IA32_EFER] {
         let expected = plan.expected(msr).unwrap();
         access.values.insert(msr, expected ^ 1);
         assert!(matches!(
-            verify_live_boundary(&mut access, plan),
+            verify(&mut access, plan),
             Err(SyscallMsrProgramError::Readback {
                 msr: observed_msr,
                 ..

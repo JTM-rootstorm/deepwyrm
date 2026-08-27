@@ -204,8 +204,9 @@ dw_x86_64_terminal_reaper_handoff:
      * A syscall-origin handoff has the CPU-private record in IA32_GS_BASE.
      * A CPL3 exception has not executed SWAPGS and retains it in
      * IA32_KERNEL_GS_BASE instead. The locked no-FSGSBASE/no-user-TLS policy
-     * makes the other base zero, so select the one nonzero private record
-     * without consulting the retiring Thread stack.
+     * makes the other base zero. Normalize the exception-origin pair with
+     * SWAPGS before entering Rust so every continuing kernel path observes the
+     * strict installation orientation.
      */
     movq %rdi, %r8
     movq %rsi, %r9
@@ -219,9 +220,10 @@ dw_x86_64_terminal_reaper_handoff:
     rdmsr
     shlq $32, %rdx
     orq %rdx, %rax
-.Le4_reaper_entry_state:
     testq %rax, %rax
     jz .Le4_entry_fail
+    swapgs
+.Le4_reaper_entry_state:
     movq E4_GS_TERMINAL_REAPER_TOP(%rax), %rsp
     testq %rsp, %rsp
     jz .Le4_entry_fail
@@ -240,6 +242,7 @@ dw_x86_64_terminal_reaper_handoff:
 .type dw_x86_64_rendezvous_reaper_handoff,@function
 dw_x86_64_rendezvous_reaper_handoff:
     cli
+    /* Preserve kernel-origin GS; normalize an unswapped CPL3 origin before Rust. */
     movl $IA32_GS_BASE, %ecx
     rdmsr
     shlq $32, %rdx
@@ -250,9 +253,10 @@ dw_x86_64_rendezvous_reaper_handoff:
     rdmsr
     shlq $32, %rdx
     orq %rdx, %rax
-.Le1_reaper_entry_state:
     testq %rax, %rax
     jz .Le4_entry_fail
+    swapgs
+.Le1_reaper_entry_state:
     movq E4_GS_TERMINAL_REAPER_TOP(%rax), %rsp
     testq %rsp, %rsp
     jz .Le4_entry_fail

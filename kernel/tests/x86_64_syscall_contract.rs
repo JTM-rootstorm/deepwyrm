@@ -37,7 +37,7 @@ fn syscall_entry_uses_iretq_with_balanced_swapgs_and_no_sysret() {
     let assembly = source("src/arch/x86_64/syscall_entry.S");
     let lowered = assembly.to_ascii_lowercase();
     assert!(!lowered.contains("sysret"));
-    assert_eq!(assembly.match_indices("    swapgs").count(), 3);
+    assert_eq!(assembly.match_indices("    swapgs").count(), 5);
     assert_eq!(assembly.match_indices("    swapgs\n    iretq").count(), 2);
     assert!(assembly.match_indices("iretq").count() >= 2);
     assert!(assembly.contains("pushq $0x2b"));
@@ -1041,9 +1041,22 @@ fn f12_terminal_control_abandons_the_retiring_stack_before_runtime_reclaim() {
     let gs_base = handoff
         .find("movl $IA32_GS_BASE, %ecx")
         .expect("kernel GS-base selection");
+    let preserve_kernel_orientation = handoff
+        .find("jnz .Le4_reaper_entry_state")
+        .expect("syscall-origin GS preservation branch");
     let kernel_gs_base = handoff
         .find("movl $IA32_KERNEL_GS_BASE, %ecx")
         .expect("unswapped CPL3 exception GS-base selection");
+    let reject_empty_exception = handoff[kernel_gs_base..]
+        .find("jz .Le4_entry_fail")
+        .map(|offset| kernel_gs_base + offset)
+        .expect("empty exception GS pair rejection");
+    let normalize_exception = handoff
+        .find("    swapgs")
+        .expect("exception-origin GS normalization");
+    let normalized_entry = handoff
+        .find(".Le4_reaper_entry_state:")
+        .expect("normalized terminal entry label");
     let switch = handoff
         .find("movq E4_GS_TERMINAL_REAPER_TOP(%rax), %rsp")
         .expect("CPU-private terminal stack switch");
@@ -1054,8 +1067,12 @@ fn f12_terminal_control_abandons_the_retiring_stack_before_runtime_reclaim() {
     let trap = handoff.find("    ud2").expect("callback return trap");
     assert!(
         clear_if < gs_base
-            && gs_base < kernel_gs_base
-            && kernel_gs_base < switch
+            && gs_base < preserve_kernel_orientation
+            && preserve_kernel_orientation < kernel_gs_base
+            && kernel_gs_base < reject_empty_exception
+            && reject_empty_exception < normalize_exception
+            && normalize_exception < normalized_entry
+            && normalized_entry < switch
             && switch < align
             && align < callback
             && callback < trap
@@ -1077,16 +1094,54 @@ fn f12_terminal_control_abandons_the_retiring_stack_before_runtime_reclaim() {
 }
 
 #[test]
-fn terminal_reaper_revalidation_accepts_only_the_exact_swapgs_pair() {
+fn reaper_handoffs_normalize_exception_gs_before_strict_revalidation() {
+    let assembly = source("src/arch/x86_64/syscall_entry.S");
     let live = source("src/arch/x86_64/syscall/live.rs");
-    let msr = source("src/arch/x86_64/syscall/msr.rs");
 
     assert!(live.contains("program_and_verify(&mut access, plan)"));
-    assert!(live.contains("verify_live_boundary(&mut LiveMsrAccess, plan)"));
-    assert!(msr.contains("pub(crate) fn verify_live_boundary"));
-    assert!(msr.contains("(observed, 0) if observed == entry_state_base"));
-    assert!(msr.contains("(0, observed) if observed == entry_state_base"));
-    assert!(msr.contains("verify_expected(access, plan, IA32_EFER)"));
+    assert!(live.contains("verify(&mut LiveMsrAccess, plan)"));
+    assert!(!live.contains("verify_live_boundary"));
+
+    for (symbol, label) in [
+        (
+            "dw_x86_64_terminal_reaper_handoff:",
+            ".Le4_reaper_entry_state:",
+        ),
+        (
+            "dw_x86_64_rendezvous_reaper_handoff:",
+            ".Le1_reaper_entry_state:",
+        ),
+    ] {
+        let body = assembly
+            .split_once(symbol)
+            .expect("reaper handoff symbol")
+            .1
+            .split_once(".size ")
+            .expect("reaper handoff extent")
+            .0;
+        let gs = body
+            .find("movl $IA32_GS_BASE, %ecx")
+            .expect("kernel-origin GS read");
+        let preserve_kernel = body
+            .find(&format!("jnz {}", label.trim_end_matches(':')))
+            .expect("kernel-origin preservation branch");
+        let kernel_gs = body
+            .find("movl $IA32_KERNEL_GS_BASE, %ecx")
+            .expect("exception-origin GS read");
+        let reject_empty = body[kernel_gs..]
+            .find("jz .Le4_entry_fail")
+            .map(|offset| kernel_gs + offset)
+            .expect("empty reversed pair rejection");
+        let swap = body.find("    swapgs").expect("GS normalization");
+        let normalized = body.find(label).expect("normalized entry label");
+        let stack = body
+            .find("movq E4_GS_TERMINAL_REAPER_TOP(%rax), %rsp")
+            .expect("reaper stack pivot");
+        assert!(gs < preserve_kernel && preserve_kernel < kernel_gs);
+        assert!(kernel_gs < reject_empty && reject_empty < swap);
+        assert!(swap < normalized && normalized < stack);
+        assert_eq!(body.match_indices("    swapgs").count(), 1);
+    }
 }
 
 #[test]
