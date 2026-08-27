@@ -1017,6 +1017,15 @@ fn wyr1_primordial_completion_failures_have_variant_specific_details() {
         .split_once("const fn primordial_receive_failure_tag(")
         .expect("terminal summary extent")
         .0;
+    let gp = terminal_summary
+        .find("info.exception_type == DW_EXCEPTION_GENERAL_PROTECTION")
+        .expect("GP detail summary");
+    let other_exception = terminal_summary
+        .find("info.exception_type.0 > 0x0f")
+        .expect("other exception summary");
+    assert!(gp < other_exception);
+    assert!(terminal_summary.contains("let detail = if info.detail > 0x1f"));
+    assert!(terminal_summary.contains("0xc0 | detail"));
     assert!(terminal_summary.contains("info.exception_type.0 > 0x0f"));
     assert!(terminal_summary.contains("0xe0 | exception_type"));
     assert!(terminal_summary.contains("return 0xfc;"));

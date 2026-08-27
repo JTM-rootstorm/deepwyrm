@@ -3994,17 +3994,28 @@ fn primordial_terminal_summary(info: Option<deepwyrm_abi::DwTaskTerminationInfoV
     if info.reason == DW_TERMINATION_NORMAL_EXIT {
         primordial_application_summary(info.application_code)
     } else if info.reason == deepwyrm_abi::DW_TERMINATION_UNHANDLED_EXCEPTION {
-        // E0..EF is distinct from every current normal/B4 summary and from
-        // the FC/FD/FF state, authorized, and unavailable markers. The low
-        // nibble retains the exact generated exception type (or F for a
-        // future out-of-range value). Detail and fault class cannot also fit
-        // without collapsing exception identities.
-        let exception_type = if info.exception_type.0 > 0x0f {
-            0x0f
+        if info.exception_type == DW_EXCEPTION_GENERAL_PROTECTION {
+            // C0..DF is unused by current normal/B4 summaries, other
+            // exception types, and FC/FD/FF disposition markers. Its low five
+            // bits retain invalid-return details 1..7 exactly and raw #GP
+            // error codes through 31; larger architecture codes saturate.
+            let detail = if info.detail > 0x1f {
+                0x1f
+            } else {
+                info.detail
+            };
+            0xc0 | detail
         } else {
-            info.exception_type.0
-        };
-        0xe0 | exception_type
+            // E0..EF retains every current generated exception type exactly
+            // (or F for a future out-of-range value). Detail and fault class
+            // cannot also fit without collapsing exception identities.
+            let exception_type = if info.exception_type.0 > 0x0f {
+                0x0f
+            } else {
+                info.exception_type.0
+            };
+            0xe0 | exception_type
+        }
     } else {
         0xfd
     }
