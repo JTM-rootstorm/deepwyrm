@@ -45,6 +45,30 @@ verify_file() {
     [ "$actual_sha" = "$expected_sha" ] || fail "$file_label hash mismatch: $file_path"
 }
 
+contains_feature() {
+    feature_list=$1
+    wanted=$2
+    printf '%s\n' "$feature_list" | awk -v wanted="$wanted" '
+        BEGIN { FS = "[[:space:],]+" }
+        {
+            for (field = 1; field <= NF; field++) {
+                if ($field == wanted) found = 1
+            }
+        }
+        END { exit found ? 0 : 1 }
+    '
+}
+
+require_upper_hex_u64() {
+    value_name=$1
+    value=$2
+    [ "${#value}" -eq 16 ] || fail "$value_name must be exactly 16 uppercase hexadecimal digits"
+    case "$value" in
+        *[!0-9A-F]*) fail "$value_name must be exactly 16 uppercase hexadecimal digits" ;;
+        0000000000000000) fail "$value_name must be nonzero" ;;
+    esac
+}
+
 [ "$#" -ge 1 ] || {
     usage >&2
     exit 2
@@ -66,6 +90,37 @@ case "$1" in
 esac
 [ "$#" -ge 1 ] || fail "missing Cargo arguments"
 
+[ -z "${CARGO_HOME:-}" ] || fail "CARGO_HOME is lane-owned; do not supply it"
+[ -z "${DEEPWYRM_GUEST_TEST_ID:-}" ] || \
+    fail "DEEPWYRM_GUEST_TEST_ID is build-owned; select a named guest test instead"
+
+test_support=false
+safe_host_test_support=false
+expect_features=false
+for argument in "$@"; do
+    if [ "$expect_features" = true ]; then
+        contains_feature "$argument" test-support && test_support=true
+        expect_features=false
+        continue
+    fi
+    case "$argument" in
+        --features)
+            expect_features=true
+            ;;
+        --features=*)
+            features=${argument#--features=}
+            contains_feature "$features" test-support && test_support=true
+            ;;
+        --all-features)
+            test_support=true
+            ;;
+        --lib)
+            safe_host_test_support=true
+            ;;
+    esac
+done
+[ "$expect_features" = false ] || fail "--features requires an explicit feature list"
+
 if [ "$lane" = host ]; then
     for argument in "$@"; do
         case "$argument" in
@@ -86,6 +141,28 @@ if [ "$lane" = host ]; then
     done
 fi
 
+selector=${DEEPWYRM_GUEST_TEST_SELECTOR:-}
+if [ "$test_support" = true ] && [ -z "$selector" ]; then
+    fail "test-support requires DEEPWYRM_GUEST_TEST_SELECTOR before Cargo admission"
+fi
+if [ "$test_support" = false ] && [ -n "$selector" ]; then
+    fail "DEEPWYRM_GUEST_TEST_SELECTOR requires explicit test-support admission"
+fi
+if [ "$lane" = host ] && [ "$test_support" = true ]; then
+    [ "$1" = test ] && [ "$safe_host_test_support" = true ] || \
+        fail "host test-support is restricted to an explicit Cargo test --lib gate"
+fi
+if [ "$selector" = normal-preemption-up ]; then
+    dw1b_nonce=${DEEPWYRM_DW1B_EVIDENCE_NONCE:-}
+    dw1b_digest=${DEEPWYRM_DW1B_CHALLENGE_DIGEST:-}
+    dw1b_pages=${DEEPWYRM_DW1B_BOOTFS_MAX_PAGES:-}
+    require_upper_hex_u64 DEEPWYRM_DW1B_EVIDENCE_NONCE "$dw1b_nonce"
+    require_upper_hex_u64 DEEPWYRM_DW1B_CHALLENGE_DIGEST "$dw1b_digest"
+    case "$dw1b_pages" in
+        ''|0|*[!0-9]*) fail "DEEPWYRM_DW1B_BOOTFS_MAX_PAGES must be a positive decimal page count" ;;
+    esac
+fi
+
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 workspace=$(CDPATH='' cd -- "$script_dir/.." && pwd -P)
 project_root=$(CDPATH='' cd -- "$workspace/.." && pwd -P)
@@ -103,6 +180,8 @@ normalized_target=$(realpath -m -- "$target_dir")
 unset RUSTUP_TOOLCHAIN RUSTC_BOOTSTRAP RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER
 unset CARGO_BUILD_RUSTC CARGO_BUILD_RUSTDOC CARGO_BUILD_RUSTC_WRAPPER
 unset CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTFLAGS RUSTFLAGS
+unset CARGO_BUILD_TARGET CARGO_ENCODED_RUSTFLAGS RUSTDOCFLAGS CARGO_TARGET_DIR
+unset LD_LIBRARY_PATH LD_PRELOAD
 
 if [ "$lane" = host ]; then
     identity="$workspace/tooling/host-rust-toolchain.toml"
@@ -154,11 +233,16 @@ else
     verify_file "$cargo" "$(config_value "$identity" cargo_sha256)" "accepted Cargo"
     verify_file "$rustc" "$(config_value "$identity" rustc_sha256)" "accepted rustc"
     verify_file "$rust_lld" "$(config_value "$identity" rust_lld_sha256)" "accepted rust-lld"
+    verify_file "$accepted_root/$(config_value "$identity" rustc_driver_internal_library)" \
+        "$(config_value "$identity" rustc_driver_internal_library_sha256)" \
+        "accepted rustc driver"
+    verify_file "$accepted_root/$(config_value "$identity" llvm_internal_library)" \
+        "$(config_value "$identity" llvm_internal_library_sha256)" \
+        "accepted LLVM library"
     verify_file "$clang" "$(config_value "$host_identity" clang_sha256)" "host Clang"
     export DEEPWYRM_ACCEPTED_RUST_LLD="$rust_lld"
 fi
 
-[ -z "${CARGO_HOME:-}" ] || fail "CARGO_HOME is lane-owned; do not supply it"
 cargo_home_relative=$(config_value "$identity" cargo_home)
 case "$cargo_home_relative" in
     /*|*..*) fail "lane Cargo home must be a non-traversing project-relative path" ;;
@@ -171,9 +255,6 @@ esac
 [ -d "$cargo_home" ] && [ ! -L "$cargo_home" ] || \
     fail "lane Cargo home is not a project-local non-symlink directory: $cargo_home"
 export CARGO_HOME="$cargo_home"
-
-"$cargo" metadata --locked --offline --format-version=1 >/dev/null || \
-    fail "lane Cargo home cannot resolve the locked offline dependency graph"
 
 mkdir -p -- "$normalized_target"
 target_marker="$normalized_target/.deepwyrm-pinned-cargo-v1"
@@ -197,4 +278,8 @@ export CARGO_INCREMENTAL=0
 export CARGO_NET_OFFLINE=true
 export RUSTC="$rustc"
 export DEEPWYRM_CLANG="$clang"
+
+"$cargo" metadata --locked --offline --format-version=1 >/dev/null || \
+    fail "lane Cargo home cannot resolve the locked offline dependency graph"
+
 exec "$cargo" "$@"
