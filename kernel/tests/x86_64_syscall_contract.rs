@@ -361,11 +361,15 @@ fn i1_remote_termination_waits_guard_free_for_exact_ack_before_reclaim() {
     let adapters = source("src/syscall/adapters.rs");
     assert!(adapters.contains("prepare_process_terminate("));
     assert!(adapters.contains("complete_prepared_process_termination_after_remote_stops"));
-    assert!(adapters.contains("retire_exit_pins_after_remote_stops("));
+    assert!(adapters.contains("execution.quiesce_terminal_threads(effects.pins.thread_keys())"));
+    assert!(adapters.contains("retire_quiesced_exit_pins_after_remote_stops("));
 
     let execution = source("src/task/execution.rs");
     assert!(execution.contains("acknowledged_remote_stop"));
-    assert!(execution.contains("remote-stop permit named a Thread still owned by the scheduler"));
+    assert!(execution.contains("scheduler_pre_retired"));
+    assert!(
+        execution.contains("terminal Thread retained multiple scheduler retirement authorities")
+    );
 }
 
 #[test]
@@ -520,7 +524,7 @@ fn i1_live_process_exit_retires_the_current_cpu_carrier() {
     assert!(adapters.contains("DeferredCurrentRetirement::Handoff"));
     assert!(adapters.contains("cpu: current_cpu"));
     assert!(runtime.contains("complete_deferred_current_reclaim_on("));
-    assert!(adapters.contains("retire_exit_pins_defer_current_after_remote_stops_on("));
+    assert!(adapters.contains("retire_quiesced_exit_pins_defer_current_after_remote_stops_on("));
 }
 
 #[test]
