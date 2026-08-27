@@ -377,7 +377,7 @@ fn selector27_binds_reporter_start_to_fixed_stack_root_and_guard() {
 
     for geometry in [
         "WYR1B_SYSTEM_INIT_STACK_TOP: u64 = 0x0000_7fff_ffff_0000",
-        "WYR1B_SYSTEM_INIT_STACK_BYTES: u64 = 64 * 1024",
+        "WYR1B_SYSTEM_INIT_STACK_BYTES: u64 = 128 * 1024",
         "WYR1B_SYSTEM_INIT_STACK_TOP - WYR1B_SYSTEM_INIT_STACK_BYTES",
         "WYR1B_SYSTEM_INIT_STACK_TOP - 4096",
         "WYR1B_SYSTEM_INIT_STACK_BOTTOM - 4096",

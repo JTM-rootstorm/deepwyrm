@@ -21,7 +21,7 @@ pub(crate) const WYR1B_EVIDENCE_RECORD_CAPACITY: usize = 14;
 // Private selector-27 mirror of Wyrmroot's fixed legacy-v1 system-init loader
 // geometry. This is a runtime acceptance invariant, not a platform ABI.
 pub(crate) const WYR1B_SYSTEM_INIT_STACK_TOP: u64 = 0x0000_7fff_ffff_0000;
-pub(crate) const WYR1B_SYSTEM_INIT_STACK_BYTES: u64 = 64 * 1024;
+pub(crate) const WYR1B_SYSTEM_INIT_STACK_BYTES: u64 = 128 * 1024;
 pub(crate) const WYR1B_SYSTEM_INIT_STACK_BOTTOM: u64 =
     WYR1B_SYSTEM_INIT_STACK_TOP - WYR1B_SYSTEM_INIT_STACK_BYTES;
 pub(crate) const WYR1B_SYSTEM_INIT_STACK_POINTER: u64 = WYR1B_SYSTEM_INIT_STACK_TOP - 4096;

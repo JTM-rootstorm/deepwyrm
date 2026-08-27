@@ -53,10 +53,10 @@ state and the Process's exact root AddressRegion, then requires:
 
 - the start RIP is nonzero and belongs to an RX mapping in that root;
 - the effective RSP is `0x0000_7fff_fffe_f000`;
-- the containing stack mapping is exactly the 64 KiB RW/NX span
-  `[0x0000_7fff_fffe_0000, 0x0000_7fff_ffff_0000)`; and
+- the containing stack mapping is exactly the 128 KiB RW/NX span
+  `[0x0000_7fff_fffd_0000, 0x0000_7fff_ffff_0000)`; and
 - the immediately lower 4 KiB guard span
-  `[0x0000_7fff_fffd_f000, 0x0000_7fff_fffe_0000)` has no mapping.
+  `[0x0000_7fff_fffc_f000, 0x0000_7fff_fffd_0000)` has no mapping.
 
 These constants mirror the reached Wyrmroot loader contract only inside the
 selector-specialized test artifact. They do not change the public ABI or
