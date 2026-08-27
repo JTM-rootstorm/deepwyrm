@@ -765,7 +765,7 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
         )
     );
     assert!(runtime.contains(
-        "#[cfg(deepwyrm_wyr1_evidence)]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 42;"
+        "#[cfg(deepwyrm_wyr1_evidence)]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 128;"
     ));
 }
 
