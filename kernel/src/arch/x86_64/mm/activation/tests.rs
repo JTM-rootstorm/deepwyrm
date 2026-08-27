@@ -2775,7 +2775,10 @@ fn terminal_reaper_reuses_replacement_selected_by_deferred_retirement() {
 
     let pins = tasks.exit_thread(current, 0).unwrap();
     let (retired, deferred) = execution.retire_exit_pins_defer_current(pins, current);
+    assert_eq!(execution.scheduler_state(current), None);
+    assert_eq!(execution.suspended_claim_on(CpuIndex::BOOTSTRAP), None);
     let deferred_pins = execution.reclaim_deferred_current(deferred);
+    assert_eq!(execution.suspended_claim_on(CpuIndex::BOOTSTRAP), None);
 
     // The old production path called `schedule_next` here and failed with
     // CurrentThreadRunning. The helper is the reaper's exact decision.
@@ -2823,6 +2826,7 @@ fn terminal_reaper_schedules_work_published_after_deferred_retirement() {
         execution.current_thread_on(crate::cpu::CpuIndex::BOOTSTRAP),
         None
     );
+    assert_eq!(execution.scheduler_state(current), None);
 
     // Model work published by the terminal EXITED cleanup before the reaper
     // chooses a fresh current Thread.
@@ -2830,6 +2834,7 @@ fn terminal_reaper_schedules_work_published_after_deferred_retirement() {
         .start_thread(&mut tasks, awakened, terminal_start_state(14))
         .unwrap();
     let deferred_pins = execution.reclaim_deferred_current(deferred);
+    assert_eq!(execution.suspended_claim_on(CpuIndex::BOOTSTRAP), None);
     assert_eq!(execution.terminal_reaper_next(), Some(awakened));
     assert_eq!(
         execution.scheduler_state(awakened),

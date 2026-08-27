@@ -2,8 +2,13 @@ extern crate std;
 
 use super::*;
 use crate::object::ObjectRegistry;
-use crate::task::{BlockedOperation, BlockedOperationWinner, TaskAuthority, TaskError};
-use deepwyrm_abi::DW_TASK_STATE_RUNNING;
+use crate::task::{
+    BlockedOperation, BlockedOperationWinner, SchedulerThreadState, TaskAuthority, TaskError,
+};
+use deepwyrm_abi::{
+    DW_EXCEPTION_PAGE_FAULT, DW_TASK_STATE_EXITED, DW_TASK_STATE_RUNNING,
+    DW_TERMINATION_AUTHORIZED, DW_TERMINATION_UNHANDLED_EXCEPTION,
+};
 use std::sync::{Arc, Barrier};
 
 const OBJECTS: usize = 16;
@@ -46,6 +51,41 @@ fn one_thread_fixture() -> (
     (registry, tasks, thread, thread_handle)
 }
 
+fn two_thread_process_fixture() -> (
+    ObjectRegistry<OBJECTS>,
+    Tasks,
+    crate::object::InternalRef,
+    crate::object::HandleRef,
+    crate::task::ProcessKey,
+    crate::task::ThreadKey,
+    crate::object::HandleRef,
+    crate::task::ThreadKey,
+    crate::object::HandleRef,
+) {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (process, process_handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let process_owner = registry
+        .retain_internal_from_handle(&process_handle)
+        .unwrap();
+    let (current, current_handle) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    let (replacement, replacement_handle) =
+        tasks.create_thread(&mut registry, &process_owner).unwrap();
+    assert!(registry.release_internal(process_owner).unwrap().is_none());
+    (
+        registry,
+        tasks,
+        root_owner,
+        process_handle,
+        process,
+        current,
+        current_handle,
+        replacement,
+        replacement_handle,
+    )
+}
+
 #[test]
 fn initial_context_is_explicit_and_does_not_invent_tls_or_fp_state() {
     let start = start_state(7);
@@ -57,6 +97,159 @@ fn initial_context_is_explicit_and_does_not_invent_tls_or_fp_state() {
     assert_eq!(context.startup_arguments, [7, 8]);
     assert_eq!(context.tls_policy, UserTlsPolicy::DisabledKernelGsOnly);
     assert_eq!(context.fp_simd_policy, FpSimdPolicy::Unavailable);
+}
+
+#[test]
+fn local_quantum_expiry_cannot_revive_a_normally_exited_thread() {
+    let (
+        mut registry,
+        mut tasks,
+        root_owner,
+        process_handle,
+        process,
+        current,
+        current_handle,
+        replacement,
+        replacement_handle,
+    ) = two_thread_process_fixture();
+    let domain = ExecutionDomain::<2>::new(stack_bounds::<2>()).unwrap();
+    domain
+        .start_thread(&mut tasks, current, start_state(80))
+        .unwrap();
+    domain
+        .start_thread(&mut tasks, replacement, start_state(81))
+        .unwrap();
+    let cpu = SchedulerCpuId::BOOTSTRAP;
+    assert_eq!(domain.schedule_next_on(cpu).unwrap().current, Some(current));
+    let ticket = domain
+        .prepare_quantum_if_needed_on(cpu, 1)
+        .unwrap()
+        .expect("current Thread receives one local quantum");
+
+    let pins = tasks.exit_thread(current, 0x80).unwrap();
+    assert_eq!(
+        tasks.thread_info(current).unwrap().state,
+        DW_TASK_STATE_EXITED
+    );
+    assert_eq!(
+        tasks.process_info(process).unwrap().state,
+        DW_TASK_STATE_RUNNING
+    );
+
+    // The timer event may win the race after task termination but before the
+    // terminal scheduler retirement. Retirement must consume that exact
+    // request and prevent a later stale event from changing ownership.
+    assert_eq!(domain.publish_quantum_expiry(ticket), Ok(true));
+    let (retired, deferred) = domain.retire_exit_pins_defer_current(pins, current);
+    assert_eq!(domain.preemption_snapshot_on(cpu).quantum, None);
+    assert_eq!(domain.preemption_snapshot_on(cpu).request, None);
+    let deferred_pins = domain.reclaim_deferred_current(deferred);
+    assert_eq!(domain.publish_quantum_expiry(ticket), Ok(false));
+    assert_eq!(domain.scheduler_state(current), None);
+    assert_eq!(
+        domain.scheduler_state(replacement),
+        Some(SchedulerThreadState::Running)
+    );
+    assert!(matches!(
+        tasks.exit_thread(current, 0x81),
+        Err(TaskError::BadState)
+    ));
+
+    let (process_pin, thread_pins) = retired.into_parts();
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        assert!(registry.release_internal(pin).unwrap().is_none());
+    }
+    let (process_pin, thread_pins) = deferred_pins.into_parts();
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        assert!(registry.release_internal(pin).unwrap().is_none());
+    }
+    for reference in [current_handle, replacement_handle, process_handle] {
+        let _ = registry.release_handle(reference).unwrap();
+    }
+    let _ = registry.release_internal(root_owner).unwrap();
+}
+
+#[test]
+fn authorized_process_termination_waits_for_exact_remote_stop_ack() {
+    let (
+        mut registry,
+        mut tasks,
+        root_owner,
+        process_handle,
+        process,
+        current,
+        current_handle,
+        remote,
+        remote_handle,
+    ) = two_thread_process_fixture();
+    let domain = ExecutionDomain::<2>::new(stack_bounds::<2>()).unwrap();
+    let cpu0 = SchedulerCpuId::BOOTSTRAP;
+    let cpu1 = SchedulerCpuId::new(1).unwrap();
+    domain
+        .start_thread_on(cpu0, &mut tasks, current, start_state(82))
+        .unwrap();
+    domain
+        .start_thread_on(cpu1, &mut tasks, remote, start_state(83))
+        .unwrap();
+    assert_eq!(
+        domain.schedule_next_on(cpu0).unwrap().current,
+        Some(current)
+    );
+    assert_eq!(domain.schedule_next_on(cpu1).unwrap().current, Some(remote));
+    let remote_claim = domain.running_claim_on(cpu1).unwrap();
+
+    let effects = tasks
+        .terminate_process_authorized(&mut registry, process, 0x707)
+        .unwrap();
+    assert_eq!(
+        tasks.thread_info(current).unwrap().state,
+        DW_TASK_STATE_EXITED
+    );
+    assert_eq!(
+        tasks.thread_info(remote).unwrap().state,
+        DW_TASK_STATE_EXITED
+    );
+    assert_eq!(
+        tasks.process_info(process).unwrap().reason,
+        DW_TERMINATION_AUTHORIZED
+    );
+
+    // Authorized termination may not remove a remote Running owner directly:
+    // the target CPU first abandons its exact generation, then acknowledges
+    // that continuation before the terminal batch can reclaim it.
+    assert_eq!(domain.stop_running_claim_on(remote_claim), Ok(None));
+    let remote_suspended = domain.suspended_claim_on(cpu1).unwrap();
+    assert_eq!(remote_suspended, remote_claim);
+    domain.complete_switch_on(remote_suspended).unwrap();
+    assert_eq!(domain.suspended_claim_on(cpu1), None);
+    assert_eq!(domain.scheduler_state(remote), None);
+
+    let (retired, deferred) = domain.retire_exit_pins_defer_current_after_remote_stops_on(
+        cpu0,
+        effects.pins,
+        current,
+        &[Some(remote)],
+    );
+    let deferred_pins = domain.reclaim_deferred_current_on(cpu0, deferred);
+    assert_eq!(domain.scheduler_state(current), None);
+    assert_eq!(domain.scheduler_state(remote), None);
+    assert_eq!(
+        domain.stop_running_claim_on(remote_claim),
+        Err(SchedulerError::StaleExecutionClaim)
+    );
+
+    let (process_pin, thread_pins) = retired.into_parts();
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        assert!(registry.release_internal(pin).unwrap().is_none());
+    }
+    let (process_pin, thread_pins) = deferred_pins.into_parts();
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        assert!(registry.release_internal(pin).unwrap().is_none());
+    }
+    for reference in [current_handle, remote_handle, process_handle] {
+        let _ = registry.release_handle(reference).unwrap();
+    }
+    let _ = registry.release_internal(root_owner).unwrap();
 }
 
 #[test]
@@ -469,6 +662,85 @@ fn process_fatal_exception_defers_current_ownership_until_divergent_reclaim() {
     let (process_pin, thread_pins) = deferred_pins.into_parts();
     for pin in thread_pins.into_iter().flatten().chain(process_pin) {
         assert!(registry.release_internal(pin).unwrap().is_none());
+    }
+}
+
+#[test]
+fn ap_exception_retires_exact_cpu_generation_before_reclaim() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (process, process_handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let process_owner = registry
+        .retain_internal_from_handle(&process_handle)
+        .unwrap();
+    let (faulting, faulting_handle) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    let (sibling, sibling_handle) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    assert!(registry.release_internal(process_owner).unwrap().is_none());
+    assert!(registry.release_internal(root_owner).unwrap().is_none());
+
+    let domain = ExecutionDomain::<2>::new(stack_bounds::<2>()).unwrap();
+    let cpu = SchedulerCpuId::new(1).unwrap();
+    domain
+        .start_thread_on(cpu, &mut tasks, faulting, start_state(84))
+        .unwrap();
+    domain
+        .start_thread_on(cpu, &mut tasks, sibling, start_state(85))
+        .unwrap();
+    assert_eq!(
+        domain.schedule_next_on(cpu).unwrap().current,
+        Some(faulting)
+    );
+    let faulting_claim = domain.running_claim_on(cpu).unwrap();
+
+    let effects = tasks
+        .terminate_process_exception(
+            &mut registry,
+            process,
+            faulting,
+            DW_EXCEPTION_PAGE_FAULT,
+            0x84,
+            0x0000_0000_4141_5000,
+        )
+        .unwrap();
+    assert_eq!(
+        tasks.process_info(process).unwrap().reason,
+        DW_TERMINATION_UNHANDLED_EXCEPTION
+    );
+    assert_eq!(
+        tasks.thread_info(faulting).unwrap().reason,
+        DW_TERMINATION_UNHANDLED_EXCEPTION
+    );
+    assert_eq!(
+        tasks.thread_info(sibling).unwrap().state,
+        DW_TASK_STATE_EXITED
+    );
+
+    // AP exception handling must retire the exact physical owner before any
+    // execution resources are reclaimed; the stale claim cannot stop or
+    // revive a later generation.
+    let (retired, deferred) = domain.retire_exit_pins_defer_current_on(cpu, effects.pins, faulting);
+    assert_eq!(deferred.thread(), faulting);
+    assert_eq!(domain.suspended_claim_on(cpu).unwrap().thread(), faulting);
+    let deferred_pins = domain.reclaim_deferred_current_on(cpu, deferred);
+    assert_eq!(domain.suspended_claim_on(cpu), None);
+    assert_eq!(domain.scheduler_state(faulting), None);
+    assert_eq!(domain.scheduler_state(sibling), None);
+    assert_eq!(
+        domain.stop_running_claim_on(faulting_claim),
+        Err(SchedulerError::StaleExecutionClaim)
+    );
+
+    let (process_pin, thread_pins) = retired.into_parts();
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        assert!(registry.release_internal(pin).unwrap().is_none());
+    }
+    let (process_pin, thread_pins) = deferred_pins.into_parts();
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        assert!(registry.release_internal(pin).unwrap().is_none());
+    }
+    for reference in [faulting_handle, sibling_handle, process_handle] {
+        let _ = registry.release_handle(reference).unwrap();
     }
 }
 
