@@ -853,7 +853,12 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
     #[cfg(deepwyrm_dw1c_evidence)]
     fn validate_terminal_retirement(&self, thread: ThreadKey) -> Result<(), SchedulerError> {
         if self.terminal_retired.contains(&Some(thread)) {
-            return Err(SchedulerError::DuplicateThread);
+            // Scheduler-level models may legitimately reserve and retire the
+            // same generation-safe key more than once.  The terminal history
+            // is a sticky set used only to reject a retired identity that is
+            // live again at the final selector snapshot, so recording the
+            // same key is idempotent rather than a second terminal fact.
+            return Ok(());
         }
         if self.terminal_retired.iter().all(Option::is_some) {
             return Err(SchedulerError::Capacity);
@@ -868,6 +873,9 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
 
     #[cfg(deepwyrm_dw1c_evidence)]
     fn record_terminal_retirement(&mut self, thread: ThreadKey) {
+        if self.terminal_retired.contains(&Some(thread)) {
+            return;
+        }
         let slot = self
             .terminal_retired
             .iter_mut()
