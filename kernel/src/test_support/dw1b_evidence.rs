@@ -11,7 +11,7 @@
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::sync::SpinMutex;
-use crate::task::{ProcessKey, SchedulerCounters, ThreadKey};
+use crate::task::{ProcessKey, SchedulerCounters, SchedulerThreadState, ThreadKey};
 
 pub(crate) const DW1B_EVIDENCE_RAW_SYSCALL: u32 = 0xffff_ff1a;
 pub(crate) const DW1B_EVIDENCE_RECORD_LEN: usize = 122;
@@ -87,6 +87,23 @@ pub(crate) fn exact_single_thread<const N: usize>(
         }
     }
     selected
+}
+
+pub(crate) fn arm_thread_states_valid(
+    hog: Option<SchedulerThreadState>,
+    progress: Option<SchedulerThreadState>,
+) -> bool {
+    matches!(
+        hog,
+        Some(SchedulerThreadState::Runnable | SchedulerThreadState::Running)
+    ) && matches!(
+        progress,
+        Some(
+            SchedulerThreadState::Runnable
+                | SchedulerThreadState::Running
+                | SchedulerThreadState::Blocked
+        )
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -678,5 +695,29 @@ mod tests {
             exact_single_thread([Some(subjects.hog_thread), Some(subjects.progress_thread)]),
             None
         );
+    }
+
+    #[test]
+    fn arm_requires_a_runnable_hog_but_accepts_a_live_waiting_progress_peer() {
+        assert!(arm_thread_states_valid(
+            Some(SchedulerThreadState::Running),
+            Some(SchedulerThreadState::Blocked),
+        ));
+        assert!(arm_thread_states_valid(
+            Some(SchedulerThreadState::Runnable),
+            Some(SchedulerThreadState::Runnable),
+        ));
+        assert!(!arm_thread_states_valid(
+            Some(SchedulerThreadState::Blocked),
+            Some(SchedulerThreadState::Runnable),
+        ));
+        assert!(!arm_thread_states_valid(
+            Some(SchedulerThreadState::Running),
+            Some(SchedulerThreadState::Reserved),
+        ));
+        assert!(!arm_thread_states_valid(
+            Some(SchedulerThreadState::Running),
+            None,
+        ));
     }
 }

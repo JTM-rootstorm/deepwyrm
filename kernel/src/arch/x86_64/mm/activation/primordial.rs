@@ -3479,7 +3479,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         arguments: crate::syscall::RawSyscallArguments,
     ) -> NativeSyscallResult {
         use crate::test_support::{
-            DW1B_EVIDENCE, Dw1bRawOperation, Dw1bSubjects, exact_single_thread,
+            DW1B_EVIDENCE, Dw1bRawOperation, Dw1bSubjects, arm_thread_states_valid,
+            exact_single_thread,
         };
 
         let operation = Dw1bRawOperation::decode(arguments.as_array())
@@ -3530,12 +3531,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                         .unwrap_or_else(|_| crate::test_support::complete_fail(0x2610_e009)),
                 )
                 .unwrap_or_else(|| crate::test_support::complete_fail(0x2610_e00a));
-                if !matches!(
+                if !arm_thread_states_valid(
                     self.shared.execution.scheduler_state(hog_thread),
-                    Some(SchedulerThreadState::Runnable | SchedulerThreadState::Running)
-                ) || !matches!(
                     self.shared.execution.scheduler_state(progress_thread),
-                    Some(SchedulerThreadState::Runnable | SchedulerThreadState::Running)
                 ) {
                     crate::test_support::complete_fail(0x2610_e00b)
                 }

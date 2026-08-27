@@ -340,11 +340,14 @@ challenge digest through `DEEPWYRM_DW1B_EVIDENCE_NONCE` and
 ARM is accepted only from the exact committed first child of primordial, the
 existing init0 Process. It resolves two distinct live Process handles, each
 with exactly one live Thread, and records their generation-safe kernel
-identities. PROGRESS is accepted once, after ARM, only from the exact bound
-progress Process. The Wyrmroot product freezes the challenge/reply digest and
-audits that this child submits PROGRESS only after its eight correlated Channel
-exchanges; Deepwyrm checks the exact count and digest without admitting them to
-the public ABI.
+identities. The hog Thread must be Runnable or Running. The progress Thread may
+also be Blocked; the paired Wyrmroot product audit establishes that it waits on
+its empty data Channel after READY and that the first post-ARM challenge wakes
+it. PROGRESS is accepted once, after ARM, only from the exact bound progress
+Process. The Wyrmroot product freezes the challenge/reply digest and audits that
+this child submits PROGRESS only after its eight correlated Channel exchanges;
+Deepwyrm checks the exact count and digest without admitting them to the public
+ABI.
 
 The selector collector observes scheduler transitions independently of
 userspace. It must see the exact registered hog Thread Running after ARM and at

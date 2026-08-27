@@ -57,7 +57,8 @@ pub(crate) use wyr1_evidence::WYR1_EVIDENCE_RAW_SYSCALL;
 
 #[cfg(all(deepwyrm_dw1b_evidence, target_arch = "x86_64", target_os = "none"))]
 pub(crate) use dw1b_evidence::{
-    DW1B_EVIDENCE, Dw1bEvidenceError, Dw1bRawOperation, Dw1bSubjects, exact_single_thread,
+    DW1B_EVIDENCE, Dw1bEvidenceError, Dw1bRawOperation, Dw1bSubjects, arm_thread_states_valid,
+    exact_single_thread,
 };
 
 #[cfg(all(deepwyrm_wyr1_evidence, target_arch = "x86_64", target_os = "none"))]
