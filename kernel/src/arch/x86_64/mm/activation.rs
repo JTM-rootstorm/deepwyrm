@@ -1815,6 +1815,18 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.kernel_execution_roots.get(cpu)
     }
 
+    pub(crate) fn validates_cpu_scratch_binding(&self, cpu: crate::cpu::CpuIndex) -> bool {
+        self.target
+            .scratch_bindings
+            .for_cpu(cpu)
+            .is_some_and(|binding| {
+                binding.cpu == cpu
+                    && binding.window_page != 0
+                    && binding.control_page == binding.window_page + PAGE_SIZE
+                    && binding.pt.physical_start() != 0
+            })
+    }
+
     /// Audited Process->CPU-kernel-root transition. The move-only Process
     /// selection is consumed; callers must retain the returned kernel token
     /// before performing any reaper work.

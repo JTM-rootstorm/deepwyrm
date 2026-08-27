@@ -788,6 +788,28 @@ pub(crate) unsafe fn bind_native_runtime_carrier_for_slot<
         .map_err(|_| SyscallRuntimeBindError::AlreadyBound)
 }
 
+/// Publishes CPU0's already-running native carrier without placing it in the
+/// AP holding protocol. The two one-shot lifecycle stores are adjacent: CPU0
+/// never waits in `Parked`, and scheduler normalization separately proves its
+/// existing Running claim before AP release.
+#[allow(
+    unsafe_code,
+    reason = "CPU0 uses the same stationary one-shot carrier publication as APs but has an already-running scheduler claim"
+)]
+pub(crate) unsafe fn bind_running_native_runtime_carrier_for_slot<
+    R: crate::syscall::native::NativeSyscallFrameRuntime
+        + crate::syscall::native::NativeRendezvousRuntime,
+>(
+    cpu: crate::cpu::CpuIndex,
+    runtime: Pin<&mut R>,
+) -> Result<(), SyscallRuntimeBindError> {
+    if cpu != crate::cpu::CpuIndex::BOOTSTRAP {
+        return Err(SyscallRuntimeBindError::InvalidCpu);
+    }
+    unsafe { bind_native_runtime_carrier_for_slot(cpu, runtime) }?;
+    release_native_runtime_carrier_for_slot(cpu)
+}
+
 /// Releases one already-bound carrier after the complete SMP runtime join.
 ///
 /// This intentionally does not wake an AP, choose runnable work, or publish
@@ -806,6 +828,12 @@ pub(crate) fn release_native_runtime_carrier_for_slot(
     RUNTIME_CARRIER_LIFECYCLES
         .release(cpu_index)
         .map_err(|_| SyscallRuntimeBindError::AlreadyBound)
+}
+
+pub(crate) fn native_runtime_carrier_lifecycle(
+    cpu: crate::cpu::CpuIndex,
+) -> Option<RuntimeCarrierLifecycle> {
+    RUNTIME_CARRIER_LIFECYCLES.lifecycle(cpu.index())
 }
 
 #[allow(
@@ -1810,27 +1838,49 @@ impl<
         // frame after its address is erased into this CPU's immutable binding.
         let context = unsafe { Pin::get_unchecked_mut(self.runtime.as_mut()) as *mut R };
         let cpu_index = current_cpu_index_for_diagnostics().unwrap_or_else(|| halt_forever());
-        unsafe {
-            publish_syscall_runtime(
-                cpu_index,
-                context.cast::<()>(),
-                native_runtime_trampoline::<R>,
-                native_runtime_fresh_thread::<R>,
-                native_runtime_idle_scheduler::<R>,
-                native_runtime_user_exception::<R>,
-                native_runtime_rendezvous_gate::<R>,
-                native_runtime_rendezvous_reaper::<R>,
-                native_runtime_quantum_expiry::<R>,
-                native_runtime_prepare_quantum::<R>,
-                native_runtime_timer_pre_iret::<R>,
-            )
-        }
-        .unwrap_or_else(|_| halt_forever());
-        RUNTIME_CARRIER_LIFECYCLES
-            .bind_parked(cpu_index)
+        if RUNTIME_STATE
+            .get(cpu_index)
+            .is_some_and(|slot| slot.load(Ordering::Acquire) == RUNTIME_UNBOUND)
+        {
+            unsafe {
+                publish_syscall_runtime(
+                    cpu_index,
+                    context.cast::<()>(),
+                    native_runtime_trampoline::<R>,
+                    native_runtime_fresh_thread::<R>,
+                    native_runtime_idle_scheduler::<R>,
+                    native_runtime_user_exception::<R>,
+                    native_runtime_rendezvous_gate::<R>,
+                    native_runtime_rendezvous_reaper::<R>,
+                    native_runtime_quantum_expiry::<R>,
+                    native_runtime_prepare_quantum::<R>,
+                    native_runtime_timer_pre_iret::<R>,
+                )
+            }
             .unwrap_or_else(|_| halt_forever());
-        let cpu = crate::cpu::CpuIndex::new(cpu_index).unwrap_or_else(|| halt_forever());
-        release_native_runtime_carrier_for_slot(cpu).unwrap_or_else(|_| halt_forever());
+            RUNTIME_CARRIER_LIFECYCLES
+                .bind_parked(cpu_index)
+                .unwrap_or_else(|_| halt_forever());
+            let cpu = crate::cpu::CpuIndex::new(cpu_index).unwrap_or_else(|| halt_forever());
+            release_native_runtime_carrier_for_slot(cpu).unwrap_or_else(|_| halt_forever());
+        } else {
+            let binding = RUNTIME
+                .get(cpu_index)
+                .filter(|_| {
+                    RUNTIME_STATE[cpu_index].load(Ordering::Acquire) == RUNTIME_BOUND
+                        && RUNTIME_CARRIER_LIFECYCLES.lifecycle(cpu_index)
+                            == Some(RuntimeCarrierLifecycle::Executing)
+                })
+                .map(|storage| unsafe { (*storage.0.get()).assume_init() })
+                .unwrap_or_else(|| halt_forever());
+            if binding.context != context.cast::<()>()
+                || binding.handler as usize != native_runtime_trampoline::<R> as *const () as usize
+                || binding.idle_scheduler_handler as usize
+                    != native_runtime_idle_scheduler::<R> as *const () as usize
+            {
+                halt_forever();
+            }
+        }
         unsafe { iret_validated_user(state) }
     }
 }

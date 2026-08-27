@@ -621,6 +621,83 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         self.scheduler.schedule_next_on(cpu)
     }
 
+    pub(crate) fn prepare_bootstrap_carrier(
+        &self,
+        resources: super::CarrierResourceTuple,
+        runtime: super::CarrierRuntimeState,
+    ) -> Result<super::CarrierAdmissionTicket, super::CarrierAdmissionError> {
+        self.scheduler.prepare_bootstrap_carrier(resources, runtime)
+    }
+
+    pub(crate) fn publish_bootstrap_carrier_ready(
+        &self,
+        ticket: super::CarrierAdmissionTicket,
+        resources: super::CarrierResourceTuple,
+        runtime: super::CarrierRuntimeState,
+    ) -> Result<(), super::CarrierAdmissionError> {
+        self.scheduler
+            .publish_bootstrap_carrier_ready(ticket, resources, runtime)
+    }
+
+    pub(crate) fn commit_bootstrap_schedulable(
+        &self,
+        ticket: super::CarrierAdmissionTicket,
+        resources: super::CarrierResourceTuple,
+    ) -> Result<(), super::CarrierAdmissionError> {
+        self.scheduler
+            .commit_bootstrap_schedulable(ticket, resources)
+    }
+
+    pub(crate) fn prepare_ap_carrier(
+        &self,
+        resources: super::CarrierResourceTuple,
+        runtime: super::CarrierRuntimeState,
+    ) -> Result<super::CarrierAdmissionTicket, super::CarrierAdmissionError> {
+        self.scheduler.prepare_ap_carrier(resources, runtime)
+    }
+
+    pub(crate) fn publish_ap_carrier_ready(
+        &self,
+        ticket: super::CarrierAdmissionTicket,
+        resources: super::CarrierResourceTuple,
+        runtime: super::CarrierRuntimeState,
+    ) -> Result<(), super::CarrierAdmissionError> {
+        self.scheduler
+            .publish_ap_carrier_ready(ticket, resources, runtime)
+    }
+
+    pub(crate) fn commit_ap_schedulable(
+        &self,
+        ticket: super::CarrierAdmissionTicket,
+        resources: super::CarrierResourceTuple,
+        enable_idle_wake: impl FnOnce() -> bool,
+    ) -> Result<(), super::CarrierAdmissionError> {
+        self.scheduler
+            .commit_ap_schedulable(ticket, resources, enable_idle_wake)
+    }
+
+    pub(crate) fn carrier_admission_snapshot(
+        &self,
+        cpu: SchedulerCpuId,
+    ) -> super::CarrierAdmissionSnapshot {
+        self.scheduler.carrier_admission_snapshot(cpu)
+    }
+
+    pub(crate) fn carrier_ticket_is_schedulable(
+        &self,
+        ticket: super::CarrierAdmissionTicket,
+    ) -> bool {
+        self.scheduler.carrier_ticket_is_schedulable(ticket)
+    }
+
+    pub(crate) fn carrier_accepts_runnable_target(&self, cpu: SchedulerCpuId) -> bool {
+        self.scheduler.carrier_accepts_runnable_target(cpu)
+    }
+
+    pub(crate) fn fail_carrier_admission(&self, cpu: SchedulerCpuId) {
+        self.scheduler.fail_carrier_admission(cpu)
+    }
+
     pub(crate) fn publish_idle_on(
         &self,
         cpu: SchedulerCpuId,

@@ -2,7 +2,7 @@
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use crate::arch::x86_64::apic::{
     ApicMode, IpiOperation, LocalApic, LocalApicDiscovery, XApicRegisterAccess,
@@ -54,6 +54,8 @@ const XAPIC_EOI_REGISTER: u32 = 0x0b0;
 /// after EOI and before it takes the time lock, so one delivery may safely
 /// cover any number of mutations already visible through that lock.
 static BSP_TIMER_SERVICE: TimerServiceSignal = TimerServiceSignal::new();
+static AP_SCHEDULER_TIMER_MASKED: [AtomicBool; CPU_CAPACITY] =
+    [const { AtomicBool::new(false) }; CPU_CAPACITY];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LiveTimeError {
@@ -1084,6 +1086,7 @@ pub(crate) fn initialize_ap_local_apic(
         .map_err(|_| LiveTimeError::ApicAccess)?;
     apic.configure_one_shot_timer(&mut registers)
         .map_err(|_| LiveTimeError::ApicAccess)?;
+    AP_SCHEDULER_TIMER_MASKED[cpu.index()].store(true, Ordering::Release);
     LOCAL_APIC_SLOTS[cpu.index()].publish(LiveLocalApicOwner {
         controller: apic,
         registers,
@@ -1091,6 +1094,10 @@ pub(crate) fn initialize_ap_local_apic(
     current_cpu_ipi_transport_ready(cpu_index)
         .then_some(())
         .ok_or(LiveTimeError::IpiTransport)
+}
+
+pub(crate) fn ap_scheduler_timer_is_masked(cpu: CpuIndex) -> bool {
+    cpu != CpuIndex::BOOTSTRAP && AP_SCHEDULER_TIMER_MASKED[cpu.index()].load(Ordering::Acquire)
 }
 
 /// Proves that the current CPU has its private IDT/GS identity, stationary

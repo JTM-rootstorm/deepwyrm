@@ -10,7 +10,7 @@ use crate::memory::usercopy::{
 };
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering};
 
 const TLB_MAILBOX_EMPTY: u8 = 0;
 const TLB_MAILBOX_PUBLISHING: u8 = 1;
@@ -140,6 +140,7 @@ unsafe impl Sync for LiveTlbMailbox {}
 
 static LIVE_TLB_MAILBOXES: [LiveTlbMailbox; crate::cpu::CPU_CAPACITY] =
     [const { LiveTlbMailbox::new() }; crate::cpu::CPU_CAPACITY];
+static LIVE_TLB_READY: AtomicBool = AtomicBool::new(false);
 
 /// Bounded e2 adapter for the live address-space publisher.
 ///
@@ -231,6 +232,13 @@ impl crate::memory::address_region::ShootdownDriver<{ crate::cpu::CPU_CAPACITY }
 pub(crate) fn initialize_live_tlb_shootdown() {
     crate::arch::x86_64::ipi::bind_live_tlb_shootdown_handler(live_tlb_shootdown_handler)
         .unwrap_or_else(|error| panic!("could not bind live TLB shootdown handler: {error:?}"));
+    LIVE_TLB_READY
+        .compare_exchange(false, true, Ordering::Release, Ordering::Acquire)
+        .unwrap_or_else(|_| panic!("live TLB shootdown initialized twice"));
+}
+
+pub(crate) fn live_tlb_shootdown_is_ready() -> bool {
+    LIVE_TLB_READY.load(Ordering::Acquire)
 }
 
 /// e2 runs after EOI with IF clear. It takes no runtime lock and no scheduler,

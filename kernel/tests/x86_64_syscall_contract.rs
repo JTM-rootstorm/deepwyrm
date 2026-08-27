@@ -1331,7 +1331,9 @@ fn h2_syscall_entry_and_native_runtime_carriers_are_fixed_per_cpu() {
     assert!(primordial.contains("struct PerCpuLiveCarrier"));
     assert!(primordial.contains("initialize_per_cpu_live_carriers()"));
     assert!(primordial.contains("bind_runtime_carrier_facades(facades.as_mut())"));
-    assert!(primordial.contains("release_runtime_carrier_facades()"));
+    assert!(
+        primordial.contains("release_runtime_carrier_facades(shared, runtime_ref, admissions)")
+    );
     assert!(primordial.contains("runtime.select_cpu(self.cpu)"));
     assert!(primordial.contains("runtime.prepare_fresh_user_entry()"));
     assert!(primordial.contains("enter_bound_validated_user(&state, stack)"));
@@ -1369,7 +1371,9 @@ fn i1_stationary_foundation_keeps_authority_and_carrier_boundaries_explicit() {
     assert!(primordial.contains("0..crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT"));
     assert!(primordial.contains("local: &'static PerCpuLiveCarrier"));
     assert!(primordial.contains("bind_runtime_carrier_facades(facades.as_mut())"));
-    assert!(primordial.contains("release_runtime_carrier_facades()"));
+    assert!(
+        primordial.contains("release_runtime_carrier_facades(shared, runtime_ref, admissions)")
+    );
     assert!(!primordial.contains("reject_entry"));
 }
 
@@ -1391,6 +1395,58 @@ fn i1_runtime_join_keeps_cpu_identity_and_dispatch_release_separate() {
     assert!(primordial.contains("idle::enable_live_cpu(cpu)"));
     assert!(execution.contains("pub(crate) fn terminal_reaper_next_on"));
     assert!(!primordial.contains("bind_parked_runtime_carriers"));
+}
+
+#[test]
+fn dw1c1_ap_carriers_cross_generation_bound_scheduler_admission_before_dispatch() {
+    let live = source("src/arch/x86_64/syscall/live.rs");
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let admission = source("src/task/scheduler/carrier_admission.rs");
+    let scheduler = source("src/task/scheduler.rs");
+
+    assert!(live.contains("bind_running_native_runtime_carrier_for_slot"));
+    assert!(primordial.contains("prepare_runtime_carrier_admission(facades_mut)"));
+    assert!(primordial.contains("normalize_bootstrap_carrier(&mut facades_mut[0])"));
+    assert!(primordial.contains("publish_ap_carrier_ready"));
+    assert!(primordial.contains("carrier_ticket_is_schedulable(ticket)"));
+    assert!(primordial.contains("commit_ap_schedulable(ticket, resources, ||"));
+    assert!(primordial.contains("idle::enable_live_cpu(cpu).is_ok()"));
+    assert!(primordial.contains("let revalidated ="));
+    assert!(primordial.contains("carrier_resource_tuple("));
+    assert!(primordial.contains("live_rendezvous_handler_is_bound()"));
+    assert!(primordial.contains("live_idle_wake_is_enabled(cpu)"));
+    assert!(primordial.contains("ap_scheduler_timer_is_masked(cpu)"));
+    assert!(primordial.contains("fail_live_carrier_admission("));
+    assert!(admission.contains("CarrierAdmissionLifecycle::Preparing"));
+    assert!(admission.contains("CarrierAdmissionLifecycle::CarrierReady"));
+    assert!(admission.contains("CarrierAdmissionLifecycle::Schedulable"));
+    assert!(admission.contains("Irreversible boundary"));
+    assert!(scheduler.contains("SchedulerError::CarrierUnavailable"));
+
+    let release_runtime = primordial
+        .find("release_native_runtime_carrier_for_slot(cpu)")
+        .expect("AP runtime release");
+    let release_cpu = primordial[release_runtime..]
+        .find("begin_execution(cpu_index)")
+        .map(|offset| release_runtime + offset)
+        .expect("AP CPU release");
+    let await_ready = primordial[release_cpu..]
+        .find("CarrierAdmissionLifecycle::CarrierReady")
+        .map(|offset| release_cpu + offset)
+        .expect("AP readiness acknowledgement wait");
+    let idle_commit = primordial[await_ready..]
+        .find("commit_ap_schedulable(ticket, resources")
+        .map(|offset| await_ready + offset)
+        .expect("AP scheduler admission commit");
+    assert!(release_runtime < release_cpu);
+    assert!(release_cpu < await_ready);
+    assert!(await_ready < idle_commit);
+    let final_revalidation = primordial[await_ready..idle_commit]
+        .find("let revalidated =")
+        .map(|offset| await_ready + offset)
+        .expect("final live tuple revalidation");
+    assert!(await_ready < final_revalidation);
+    assert!(final_revalidation < idle_commit);
 }
 
 #[test]

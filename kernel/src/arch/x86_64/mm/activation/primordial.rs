@@ -907,6 +907,12 @@ struct RuntimeCarrierFacade<
     runtime: &'runtime RuntimeAuthorityLock<
         PrimordialRuntimeCarrier<'roles, RANGE_CAPACITY, ROLE_CAPACITY>,
     >,
+    shared: &'static PrimordialRuntimeShared,
+    admission: Option<(
+        crate::task::CarrierAdmissionTicket,
+        crate::task::CarrierResourceTuple,
+    )>,
+    admission_entered: bool,
     pending_remote_termination: Option<PendingRemoteTermination>,
 }
 
@@ -999,13 +1005,12 @@ struct PerCpuCarrierLocal {
     current_stack: Option<crate::task::KernelStackId>,
     current_context: Option<crate::task::ThreadContextId>,
     scratch_cpu: crate::cpu::CpuIndex,
-    reaper_staged: bool,
 }
 
 impl PerCpuLiveCarrier {
     fn physically_executes(&self, thread: ThreadKey) -> bool {
         let local = self.local.lock();
-        local.current_thread == Some(thread) && !local.reaper_staged
+        local.current_thread == Some(thread)
     }
 
     fn record_current(
@@ -1016,10 +1021,6 @@ impl PerCpuLiveCarrier {
     ) {
         let mut local = self.local.lock();
         assert_eq!(local.scratch_cpu, self.cpu, "carrier scratch CPU drifted");
-        assert!(
-            !local.reaper_staged,
-            "reaper-staged carrier cannot resume a Thread"
-        );
         local.current_thread = Some(thread);
         local.current_stack = Some(stack);
         local.current_context = Some(context);
@@ -1028,10 +1029,6 @@ impl PerCpuLiveCarrier {
     fn record_idle(&self) {
         let mut local = self.local.lock();
         assert_eq!(local.scratch_cpu, self.cpu, "carrier scratch CPU drifted");
-        assert!(
-            !local.reaper_staged,
-            "reaper-staged carrier cannot enter ordinary idle"
-        );
         local.current_thread = None;
         local.current_stack = None;
         local.current_context = None;
@@ -1114,7 +1111,6 @@ fn initialize_per_cpu_live_carriers() {
                     current_stack: None,
                     current_context: None,
                     scratch_cpu: cpu,
-                    reaper_staged: false,
                 }),
             });
         }
@@ -1146,36 +1142,280 @@ fn bind_runtime_carrier_facades<
     >,
 ) {
     let registry = crate::arch::x86_64::smp::live_cpu_registry();
+    assert_eq!(
+        registry.len(),
+        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT,
+        "DW1-C1 requires the exact four-CPU runtime topology"
+    );
     let facades = unsafe { core::pin::Pin::get_unchecked_mut(facades) };
-    for cpu_index in 1..registry.len() {
+    for cpu_index in 0..registry.len() {
         let snapshot = registry
             .snapshot(cpu_index)
-            .unwrap_or_else(|error| panic!("could not inspect AP {cpu_index}: {error:?}"));
-        if snapshot.lifecycle != crate::arch::x86_64::smp::CpuLifecycle::Parked {
-            panic!("AP {cpu_index} was not parked before native carrier binding");
+            .unwrap_or_else(|error| panic!("could not inspect CPU {cpu_index}: {error:?}"));
+        let expected = if cpu_index == 0 {
+            crate::arch::x86_64::smp::CpuLifecycle::Executing
+        } else {
+            crate::arch::x86_64::smp::CpuLifecycle::Parked
+        };
+        if snapshot.lifecycle != expected {
+            panic!("CPU {cpu_index} had the wrong lifecycle before native carrier binding");
         }
         let cpu = crate::cpu::CpuIndex::new(cpu_index)
-            .unwrap_or_else(|| panic!("AP {cpu_index} exceeds the native carrier bound"));
+            .unwrap_or_else(|| panic!("CPU {cpu_index} exceeds the native carrier bound"));
         let carrier = unsafe { core::pin::Pin::new_unchecked(&mut facades[cpu_index]) };
-        unsafe { crate::arch::x86_64::syscall::bind_native_runtime_carrier_for_slot(cpu, carrier) }
+        if cpu_index == 0 {
+            unsafe {
+                crate::arch::x86_64::syscall::bind_running_native_runtime_carrier_for_slot(
+                    cpu, carrier,
+                )
+            }
             .unwrap_or_else(|error| {
+                facades[cpu_index]
+                    .shared
+                    .execution
+                    .fail_carrier_admission(cpu);
+                panic!("could not bind CPU0 running native carrier: {error:?}")
+            });
+        } else {
+            unsafe {
+                crate::arch::x86_64::syscall::bind_native_runtime_carrier_for_slot(cpu, carrier)
+            }
+            .unwrap_or_else(|error| {
+                facades[cpu_index]
+                    .shared
+                    .execution
+                    .fail_carrier_admission(cpu);
                 panic!("could not bind AP {cpu_index} native carrier: {error:?}")
             });
+        }
     }
 }
 
-fn release_runtime_carrier_facades() {
+fn carrier_resource_tuple<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
+    runtime: &PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>,
+    cpu: crate::cpu::CpuIndex,
+    expected_cpu_lifecycle: crate::arch::x86_64::smp::CpuLifecycle,
+    expected_runtime_lifecycle: crate::arch::x86_64::syscall::RuntimeCarrierLifecycle,
+    expected_idle_wake_enabled: bool,
+) -> crate::task::CarrierResourceTuple {
+    let snapshot = crate::arch::x86_64::smp::live_cpu_registry()
+        .snapshot(cpu.index())
+        .unwrap_or_else(|_| {
+            fail_live_carrier_admission(runtime.shared, cpu, "CPU registry unavailable")
+        });
+    if snapshot.lifecycle != expected_cpu_lifecycle
+        || snapshot.online_generation == 0
+        || crate::arch::x86_64::runtime_cpu_descriptor_lifecycle(cpu.index())
+            != Some(crate::arch::x86_64::RuntimeCpuDescriptorLifecycle::Online)
+        || crate::arch::x86_64::syscall::native_runtime_carrier_lifecycle(cpu)
+            != Some(expected_runtime_lifecycle)
+    {
+        fail_live_carrier_admission(
+            runtime.shared,
+            cpu,
+            "CPU lifecycle, descriptor, or runtime publication drifted",
+        );
+    }
+    let stacks = crate::arch::x86_64::linked_runtime_cpu_stack_layout().unwrap_or_else(|_| {
+        fail_live_carrier_admission(runtime.shared, cpu, "invalid runtime CPU stack layout")
+    });
+    let selected = stacks[cpu.index()];
+    if selected.privilege_entry == selected.terminal_reaper
+        || stacks[..cpu.index()].iter().any(|prior| {
+            prior.privilege_entry == selected.privilege_entry
+                || prior.terminal_reaper == selected.terminal_reaper
+        })
+    {
+        fail_live_carrier_admission(runtime.shared, cpu, "CPU admission stacks are not private");
+    }
+    let root = runtime
+        .active
+        .kernel_execution_root(cpu)
+        .unwrap_or_else(|_| {
+            fail_live_carrier_admission(runtime.shared, cpu, "CPU retained root unavailable")
+        });
+    if root.cpu() != cpu || root.root_physical_start() == 0 {
+        fail_live_carrier_admission(runtime.shared, cpu, "CPU retained root identity drifted");
+    }
+    if !runtime.active.validates_cpu_scratch_binding(cpu)
+        || !crate::arch::x86_64::ipi::live_ipi_transport_is_bound()
+        || !crate::arch::x86_64::ipi::live_rendezvous_handler_is_bound()
+        || !user_access::live_tlb_shootdown_is_ready()
+        || crate::arch::x86_64::idle::live_idle_wake_is_enabled(cpu) != expected_idle_wake_enabled
+        || (cpu == crate::cpu::CpuIndex::BOOTSTRAP && !crate::time::timer_service_is_healthy())
+        || (cpu != crate::cpu::CpuIndex::BOOTSTRAP
+            && !crate::time::ap_scheduler_timer_is_masked(cpu))
+    {
+        fail_live_carrier_admission(
+            runtime.shared,
+            cpu,
+            "CPU scratch, e1/e2, idle-wake, or deadline admission drifted",
+        );
+    }
+    crate::task::CarrierResourceTuple {
+        cpu,
+        local_apic_id: snapshot.local_apic_id,
+        online_generation: snapshot.online_generation,
+        root_generation: root.root_physical_start(),
+        descriptor_cpu: cpu,
+        runtime_cpu: cpu,
+        entry_stack_cpu: cpu,
+        reaper_stack_cpu: cpu,
+        root_cpu: cpu,
+        scratch_cpu: cpu,
+        idle_mailbox_cpu: cpu,
+        tlb_mailbox_cpu: cpu,
+        deadline: if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+            crate::task::CarrierDeadlineState::BootstrapArbiterReady
+        } else {
+            crate::task::CarrierDeadlineState::ApSchedulerTimerMasked
+        },
+    }
+}
+
+#[track_caller]
+fn fail_live_carrier_admission(
+    shared: &'static PrimordialRuntimeShared,
+    cpu: crate::cpu::CpuIndex,
+    reason: &'static str,
+) -> ! {
+    shared.execution.fail_carrier_admission(cpu);
+    panic!("CPU {} carrier admission failed: {reason}", cpu.index());
+}
+
+fn prepare_runtime_carrier_admission<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
+    facades: &mut [RuntimeCarrierFacade<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>;
+             crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+) {
+    let runtime = facades[0].runtime.lock();
+    for facade in facades.iter_mut().skip(1) {
+        let resources = carrier_resource_tuple(
+            &runtime,
+            facade.cpu,
+            crate::arch::x86_64::smp::CpuLifecycle::Parked,
+            crate::arch::x86_64::syscall::RuntimeCarrierLifecycle::Parked,
+            false,
+        );
+        let ticket = facade
+            .shared
+            .execution
+            .prepare_ap_carrier(resources, crate::task::CarrierRuntimeState::Parked)
+            .unwrap_or_else(|error| {
+                facade.shared.execution.fail_carrier_admission(facade.cpu);
+                panic!(
+                    "could not prepare AP {} admission: {error:?}",
+                    facade.cpu.index()
+                )
+            });
+        facade.admission = Some((ticket, resources));
+    }
+}
+
+fn normalize_bootstrap_carrier<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
+    facade: &mut RuntimeCarrierFacade<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>,
+) {
+    let resources = {
+        let runtime = facade.runtime.lock();
+        carrier_resource_tuple(
+            &runtime,
+            facade.cpu,
+            crate::arch::x86_64::smp::CpuLifecycle::Executing,
+            crate::arch::x86_64::syscall::RuntimeCarrierLifecycle::Executing,
+            true,
+        )
+    };
+    if crate::arch::x86_64::syscall::native_runtime_carrier_lifecycle(facade.cpu)
+        != Some(crate::arch::x86_64::syscall::RuntimeCarrierLifecycle::Executing)
+    {
+        panic!("CPU0 running runtime carrier was not published");
+    }
+    let ticket = facade
+        .shared
+        .execution
+        .prepare_bootstrap_carrier(resources, crate::task::CarrierRuntimeState::Running)
+        .unwrap_or_else(|error| {
+            facade.shared.execution.fail_carrier_admission(facade.cpu);
+            panic!("could not prepare CPU0 carrier: {error:?}")
+        });
+    facade
+        .shared
+        .execution
+        .publish_bootstrap_carrier_ready(
+            ticket,
+            resources,
+            crate::task::CarrierRuntimeState::Running,
+        )
+        .unwrap_or_else(|error| {
+            facade.shared.execution.fail_carrier_admission(facade.cpu);
+            panic!("could not ready CPU0 carrier: {error:?}")
+        });
+    facade
+        .shared
+        .execution
+        .commit_bootstrap_schedulable(ticket, resources)
+        .unwrap_or_else(|error| {
+            facade.shared.execution.fail_carrier_admission(facade.cpu);
+            panic!("could not commit CPU0 carrier: {error:?}")
+        });
+    facade.admission = Some((ticket, resources));
+    facade.admission_entered = true;
+}
+
+fn release_runtime_carrier_facades<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
+    shared: &'static PrimordialRuntimeShared,
+    runtime: &RuntimeAuthorityLock<PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>>,
+    admissions: [Option<(
+        crate::task::CarrierAdmissionTicket,
+        crate::task::CarrierResourceTuple,
+    )>; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+) {
     let registry = crate::arch::x86_64::smp::live_cpu_registry();
     for cpu_index in 1..registry.len() {
         let cpu = crate::cpu::CpuIndex::new(cpu_index)
             .unwrap_or_else(|| panic!("AP {cpu_index} exceeds the native carrier bound"));
-        crate::arch::x86_64::idle::enable_live_cpu(cpu)
-            .unwrap_or_else(|error| panic!("could not enable AP {cpu_index} idle wake: {error:?}"));
-        crate::arch::x86_64::syscall::release_native_runtime_carrier_for_slot(cpu)
-            .unwrap_or_else(|error| panic!("could not release AP {cpu_index}: {error:?}"));
-        registry
-            .begin_execution(cpu_index)
-            .unwrap_or_else(|error| panic!("could not execute AP {cpu_index}: {error:?}"));
+        if crate::arch::x86_64::syscall::release_native_runtime_carrier_for_slot(cpu).is_err() {
+            fail_live_carrier_admission(shared, cpu, "native runtime release failed");
+        }
+        if registry.begin_execution(cpu_index).is_err() {
+            fail_live_carrier_admission(shared, cpu, "CPU execution release failed");
+        }
+        let (ticket, resources) = admissions[cpu_index]
+            .unwrap_or_else(|| panic!("AP {cpu_index} omitted its admission ticket"));
+        loop {
+            let snapshot = shared.execution.carrier_admission_snapshot(cpu);
+            if snapshot.lifecycle == crate::task::CarrierAdmissionLifecycle::CarrierReady
+                && snapshot.admission_generation == ticket.admission_generation()
+                && snapshot.scheduler_slot_generation == ticket.scheduler_slot_generation()
+                && snapshot.online_generation == resources.online_generation
+            {
+                break;
+            }
+            if snapshot.lifecycle == crate::task::CarrierAdmissionLifecycle::Failed {
+                panic!("AP {cpu_index} failed before scheduler admission");
+            }
+            core::hint::spin_loop();
+        }
+        let revalidated = {
+            let runtime = runtime.lock();
+            carrier_resource_tuple(
+                &runtime,
+                cpu,
+                crate::arch::x86_64::smp::CpuLifecycle::Executing,
+                crate::arch::x86_64::syscall::RuntimeCarrierLifecycle::Executing,
+                false,
+            )
+        };
+        if revalidated != resources {
+            fail_live_carrier_admission(shared, cpu, "final carrier tuple changed");
+        }
+        shared
+            .execution
+            .commit_ap_schedulable(ticket, resources, || {
+                crate::arch::x86_64::idle::enable_live_cpu(cpu).is_ok()
+            })
+            .unwrap_or_else(|error| {
+                panic!("could not commit AP {cpu_index} scheduler admission: {error:?}")
+            });
     }
 }
 
@@ -4548,6 +4788,91 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
     }
 
     fn enter_idle_scheduler(&mut self) -> ! {
+        if !self.admission_entered {
+            let (ticket, resources) = self
+                .admission
+                .unwrap_or_else(|| panic!("AP carrier omitted scheduler admission identity"));
+            if ticket.cpu() != self.cpu
+                || crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
+                    != Some(self.cpu.index())
+                || crate::arch::x86_64::runtime_cpu_descriptor_lifecycle(self.cpu.index())
+                    != Some(crate::arch::x86_64::RuntimeCpuDescriptorLifecycle::Online)
+                || crate::arch::x86_64::syscall::native_runtime_carrier_lifecycle(self.cpu)
+                    != Some(crate::arch::x86_64::syscall::RuntimeCarrierLifecycle::Executing)
+                || !crate::arch::x86_64::ipi::live_ipi_transport_is_bound()
+                || !crate::arch::x86_64::ipi::live_rendezvous_handler_is_bound()
+                || !user_access::live_tlb_shootdown_is_ready()
+                || crate::arch::x86_64::idle::live_idle_wake_is_enabled(self.cpu)
+                || !crate::time::ap_scheduler_timer_is_masked(self.cpu)
+            {
+                fail_live_carrier_admission(
+                    self.shared,
+                    self.cpu,
+                    "AP carrier admission revalidation failed",
+                );
+            }
+            let snapshot = crate::arch::x86_64::smp::live_cpu_registry()
+                .snapshot(self.cpu.index())
+                .unwrap_or_else(|_| {
+                    fail_live_carrier_admission(
+                        self.shared,
+                        self.cpu,
+                        "AP registry revalidation failed",
+                    )
+                });
+            if snapshot.lifecycle != crate::arch::x86_64::smp::CpuLifecycle::Executing
+                || snapshot.local_apic_id != resources.local_apic_id
+                || snapshot.online_generation != resources.online_generation
+            {
+                fail_live_carrier_admission(self.shared, self.cpu, "AP execution identity drifted");
+            }
+            let observed_resources = {
+                let runtime = self.runtime.lock();
+                carrier_resource_tuple(
+                    &runtime,
+                    self.cpu,
+                    crate::arch::x86_64::smp::CpuLifecycle::Executing,
+                    crate::arch::x86_64::syscall::RuntimeCarrierLifecycle::Executing,
+                    false,
+                )
+            };
+            if observed_resources != resources {
+                fail_live_carrier_admission(
+                    self.shared,
+                    self.cpu,
+                    "AP private carrier resources drifted",
+                );
+            }
+            crate::arch::x86_64::syscall::validate_live_syscall_boundary().unwrap_or_else(|_| {
+                fail_live_carrier_admission(
+                    self.shared,
+                    self.cpu,
+                    "AP syscall boundary validation failed",
+                )
+            });
+            self.shared
+                .execution
+                .publish_ap_carrier_ready(
+                    ticket,
+                    resources,
+                    crate::task::CarrierRuntimeState::Executing,
+                )
+                .unwrap_or_else(|error| {
+                    self.shared.execution.fail_carrier_admission(self.cpu);
+                    panic!(
+                        "AP {} readiness publication failed: {error:?}",
+                        self.cpu.index()
+                    )
+                });
+            while !self.shared.execution.carrier_ticket_is_schedulable(ticket) {
+                let observed = self.shared.execution.carrier_admission_snapshot(self.cpu);
+                if observed.lifecycle == crate::task::CarrierAdmissionLifecycle::Failed {
+                    panic!("AP {} admission failed", self.cpu.index());
+                }
+                core::hint::spin_loop();
+            }
+            self.admission_entered = true;
+        }
         loop {
             enum Entry {
                 Fresh {
@@ -5061,16 +5386,23 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         cpu: crate::cpu::CpuIndex::new(cpu_index)
             .unwrap_or_else(|| panic!("native carrier CPU {cpu_index} is out of range")),
         runtime: runtime_ref,
+        shared,
+        admission: None,
+        admission_entered: false,
         pending_remote_termination: None,
     });
     let mut facades = core::pin::pin!(facades);
     bind_runtime_carrier_facades(facades.as_mut());
     user_access::initialize_live_tlb_shootdown();
+    let facades_mut = unsafe { core::pin::Pin::get_unchecked_mut(facades.as_mut()) };
+    prepare_runtime_carrier_admission(facades_mut);
+    normalize_bootstrap_carrier(&mut facades_mut[0]);
+    let admissions = core::array::from_fn(|cpu_index| facades_mut[cpu_index].admission);
     let bsp_carrier = unsafe {
-        let facade = &mut core::pin::Pin::get_unchecked_mut(facades.as_mut())[0];
+        let facade = &mut facades_mut[0];
         core::pin::Pin::new_unchecked(facade)
     };
-    release_runtime_carrier_facades();
+    release_runtime_carrier_facades(shared, runtime_ref, admissions);
     unsafe {
         crate::arch::x86_64::syscall::enter_native_syscall_runtime(
             bsp_carrier,

@@ -575,6 +575,14 @@ pub(crate) fn live_idle_wake_is_healthy() -> bool {
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn live_idle_wake_is_enabled(cpu: CpuIndex) -> bool {
+    LIVE_IDLE_WAKE.cpus[cpu.index()]
+        .state
+        .load(Ordering::Acquire)
+        != CPU_UNAVAILABLE
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 fn fail_transport_and_halt() -> ! {
     LIVE_IDLE_WAKE.fail_transport();
     loop {

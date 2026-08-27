@@ -43,7 +43,9 @@ pub(crate) use execution::{
     reason = "E3 scheduler surface is consumed by the execution coordinator added in this phase"
 )]
 pub(crate) use scheduler::{
-    BlockReservation, BlockReservationFailure, BlockToken, BlockWakeKey, CooperativeScheduler,
+    BlockReservation, BlockReservationFailure, BlockToken, BlockWakeKey, CarrierAdmissionError,
+    CarrierAdmissionLifecycle, CarrierAdmissionSnapshot, CarrierAdmissionTicket,
+    CarrierDeadlineState, CarrierResourceTuple, CarrierRuntimeState, CooperativeScheduler,
     DEFAULT_NORMAL_QUANTUM_NS, IdleScheduleDecision, ScheduleDecision, SchedulerCounters,
     SchedulerCpuId, SchedulerError, SchedulerExecutionClaim, SchedulerIdleAccountingToken,
     SchedulerPreemptionDecision, SchedulerPreemptionSnapshot, SchedulerQuantumTicket,

@@ -5,6 +5,14 @@ use crate::sync::IrqSpinMutex;
 
 use super::ThreadKey;
 
+#[path = "scheduler/carrier_admission.rs"]
+mod carrier_admission;
+use carrier_admission::CarrierAdmissionState;
+pub(crate) use carrier_admission::{
+    CarrierAdmissionError, CarrierAdmissionLifecycle, CarrierAdmissionSnapshot,
+    CarrierAdmissionTicket, CarrierDeadlineState, CarrierResourceTuple, CarrierRuntimeState,
+};
+
 static NEXT_SCHEDULER_DOMAIN: AtomicU64 = AtomicU64::new(1);
 
 /// DW0-H's bounded logical scheduler-CPU namespace.
@@ -44,6 +52,7 @@ pub(crate) enum SchedulerError {
     AccountingUnderflow,
     TimeRegression,
     IdleAccountingActive,
+    CarrierUnavailable,
     StaleIdleAccounting,
     QuantumUnavailable,
     StaleQuantum,
@@ -514,6 +523,7 @@ struct SchedulerState<const CAPACITY: usize> {
     quantum: [Option<SchedulerQuantumTicket>; H2_SCHEDULER_CPU_CAPACITY],
     need_resched: [Option<SchedulerQuantumTicket>; H2_SCHEDULER_CPU_CAPACITY],
     preemption_disable_depth: [u32; H2_SCHEDULER_CPU_CAPACITY],
+    carrier_admission: CarrierAdmissionState,
     #[cfg(test)]
     trace: SchedulerTrace,
 }
@@ -538,6 +548,7 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             quantum: [None; H2_SCHEDULER_CPU_CAPACITY],
             need_resched: [None; H2_SCHEDULER_CPU_CAPACITY],
             preemption_disable_depth: [0; H2_SCHEDULER_CPU_CAPACITY],
+            carrier_admission: CarrierAdmissionState::new(),
             #[cfg(test)]
             trace: SchedulerTrace::new(),
         }
@@ -1050,6 +1061,11 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     ) -> Result<ScheduleDecision, SchedulerError> {
         let mut state = self.state.lock();
         let cpu_index = cpu.index();
+        if state.carrier_admission.enforced
+            && state.carrier_admission.schedulable_mask & (1_u64 << cpu_index) == 0
+        {
+            return Err(SchedulerError::CarrierUnavailable);
+        }
         if state.running[cpu_index].is_some() {
             return Err(SchedulerError::CurrentThreadRunning);
         }
@@ -1740,6 +1756,11 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     ) -> Result<IdleScheduleDecision, SchedulerError> {
         let mut state = self.state.lock();
         let cpu_index = cpu.index();
+        if state.carrier_admission.enforced
+            && state.carrier_admission.schedulable_mask & (1_u64 << cpu_index) == 0
+        {
+            return Err(SchedulerError::CarrierUnavailable);
+        }
         if state.running[cpu_index].is_some() {
             return Err(SchedulerError::CurrentThreadRunning);
         }

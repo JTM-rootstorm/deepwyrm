@@ -121,6 +121,10 @@ pub(crate) fn live_ipi_transport_is_bound() -> bool {
     TRANSPORT.get().is_some()
 }
 
+pub(crate) fn live_rendezvous_handler_is_bound() -> bool {
+    RENDEZVOUS_HANDLER.get().is_some()
+}
+
 /// Publishes the persistent per-CPU-aware APIC transport exactly once.
 pub(crate) fn bind_live_ipi_transport<T: LiveIpiTransport + 'static>(
     transport: &'static T,
