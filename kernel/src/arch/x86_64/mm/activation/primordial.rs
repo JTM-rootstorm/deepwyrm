@@ -3967,6 +3967,14 @@ const fn primordial_application_summary(application_code: u32) -> u32 {
         0x10 | (application_code & 0x0f)
     } else if application_code & 0xffff_0000 == 0xaf11_0000 {
         0x20 | (application_code & 0x1f)
+    } else if application_code & 0xff00_0000 == 0xb400_0000 {
+        // B4 terminal records dedicate four bits each to the saturated
+        // termination reason and exception type. Those two fields exactly
+        // fill the selector's remaining summary byte; retaining fault class,
+        // detail, or category too would make the diagnostic ambiguous.
+        let reason = (application_code >> 18) & 0x0f;
+        let exception_type = (application_code >> 14) & 0x0f;
+        (reason << 4) | exception_type
     } else if application_code & 0xf000_0000 == 0xb000_0000 {
         // Preserve the bootstrap family plus its bounded low-six-bit reason.
         0x80 | (application_code & 0x3f)
