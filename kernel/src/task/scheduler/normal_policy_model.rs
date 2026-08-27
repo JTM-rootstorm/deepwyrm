@@ -43,6 +43,7 @@ enum ModelError {
     NotBlocked,
     Terminal,
     MigrationRejected,
+    RemoteStopPending,
     Overflow,
     TimeRegression,
 }
@@ -65,8 +66,10 @@ struct TaskRecord {
     last_cpu: Option<usize>,
     continuation_cpu: Option<usize>,
     execution_pins: u8,
+    scratch_pins: u8,
     root_switch: bool,
     remote_stop: bool,
+    rendezvous_pending: bool,
     migration_generation: u64,
 }
 
@@ -78,8 +81,10 @@ impl TaskRecord {
         last_cpu: None,
         continuation_cpu: None,
         execution_pins: 0,
+        scratch_pins: 0,
         root_switch: false,
         remote_stop: false,
+        rendezvous_pending: false,
         migration_generation: 0,
     };
 
@@ -87,8 +92,10 @@ impl TaskRecord {
         matches!(self.state, TaskState::Runnable { .. })
             && self.continuation_cpu.is_none()
             && self.execution_pins == 0
+            && self.scratch_pins == 0
             && !self.root_switch
             && !self.remote_stop
+            && !self.rendezvous_pending
     }
 }
 
@@ -317,6 +324,9 @@ impl NormalPolicyModel {
         ) {
             return Err(ModelError::BlockPreparing);
         }
+        if self.record(token.task)?.remote_stop || self.record(token.task)?.rendezvous_pending {
+            return Err(ModelError::RemoteStopPending);
+        }
         self.quantum_expirations = self.quantum_expirations.checked_add(1).ok_or_else(|| {
             self.overflow_fault = true;
             ModelError::Overflow
@@ -354,7 +364,7 @@ impl NormalPolicyModel {
             return Err(ModelError::Stale);
         }
         self.record_mut(token.task)?.state = TaskState::BlockPreparing { token };
-        Ok(())
+        self.check()
     }
 
     fn cancel_block(&mut self, token: RunToken) -> Result<(), ModelError> {
@@ -363,7 +373,7 @@ impl NormalPolicyModel {
             return Err(ModelError::Stale);
         }
         self.record_mut(token.task)?.state = TaskState::Running { token };
-        Ok(())
+        self.check()
     }
 
     fn commit_block(&mut self, token: RunToken) -> Result<WakeToken, ModelError> {
@@ -570,6 +580,13 @@ fn migration_is_transactional_and_rejects_every_frozen_guard() {
     );
     assert_eq!(model.queues[0].position(task(0, 1)), Some(0));
     model.tasks[0].execution_pins = 0;
+    model.tasks[0].scratch_pins = 1;
+    assert_eq!(
+        model.migrate(task(0, 1), 1),
+        Err(ModelError::MigrationRejected)
+    );
+    assert_eq!(model.queues[0].position(task(0, 1)), Some(0));
+    model.tasks[0].scratch_pins = 0;
     model.tasks[0].root_switch = true;
     assert_eq!(
         model.migrate(task(0, 1), 1),
@@ -588,6 +605,13 @@ fn migration_is_transactional_and_rejects_every_frozen_guard() {
         Err(ModelError::MigrationRejected)
     );
     model.tasks[0].remote_stop = false;
+    model.tasks[0].rendezvous_pending = true;
+    assert_eq!(
+        model.migrate(task(0, 1), 1),
+        Err(ModelError::MigrationRejected)
+    );
+    assert_eq!(model.queues[0].position(task(0, 1)), Some(0));
+    model.tasks[0].rendezvous_pending = false;
     model.migrate(task(0, 1), 1).unwrap();
     assert_eq!(model.tasks[0].migration_generation, 1);
     assert_eq!(model.check(), Ok(()));
@@ -614,7 +638,35 @@ fn stale_quantum_wake_and_generation_reuse_cannot_mutate_replacement() {
     model.tasks[0] = TaskRecord::EMPTY;
     model.add(task(0, 2), 1, 0).unwrap();
     assert_eq!(model.wake(wake, 0), Err(ModelError::Stale));
+    assert_eq!(model.migrate(task(0, 1), 0), Err(ModelError::Stale));
     assert!(matches!(model.tasks[0].state, TaskState::Runnable { .. }));
+    assert_eq!(model.check(), Ok(()));
+}
+
+#[test]
+fn remote_stop_and_rendezvous_pending_defer_expiry_without_mutating_the_running_token() {
+    let mut model = NormalPolicyModel::new(1);
+    model.add(task(0, 1), 1, 0).unwrap();
+    let running = model.dispatch(0, 0).unwrap().unwrap();
+    model.tasks[0].remote_stop = true;
+    assert_eq!(
+        model.expire(running, DEFAULT_QUANTUM_NS),
+        Err(ModelError::RemoteStopPending)
+    );
+    assert_eq!(model.running[0], Some(running));
+    model.tasks[0].remote_stop = false;
+    model.tasks[0].rendezvous_pending = true;
+    assert_eq!(
+        model.expire(running, DEFAULT_QUANTUM_NS),
+        Err(ModelError::RemoteStopPending)
+    );
+    assert_eq!(model.running[0], Some(running));
+    model.tasks[0].rendezvous_pending = false;
+    assert_eq!(
+        model.expire(running, DEFAULT_QUANTUM_NS).unwrap().task,
+        task(0, 1)
+    );
+    assert_eq!(model.check(), Ok(()));
 }
 
 #[test]

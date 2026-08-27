@@ -307,7 +307,21 @@ struct QueueEntry {
     enqueue_generation: u64,
     migration_generation: u64,
     migration_eligibility_generation: u64,
+    #[cfg(test)]
+    migration_test_exclusion: MigrationTestExclusion,
     ready_at_ns: Option<u64>,
+}
+
+/// Test-only representation of external authorities that C0 confines to a
+/// Running or suspended generation. It exercises the scheduler's exact
+/// migration revalidation without introducing a live cross-subsystem API.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MigrationTestExclusion {
+    None,
+    ExecutionPinned,
+    ScratchPinned,
+    TlbRendezvousPending,
 }
 
 const SCHEDULER_TRACE_CAPACITY: usize = 64;
@@ -749,6 +763,16 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             && entry.continuation_cpu.is_none()
             && entry.continuation_generation == 0
             && entry.migration_eligibility_generation != 0
+            && {
+                #[cfg(test)]
+                {
+                    entry.migration_test_exclusion == MigrationTestExclusion::None
+                }
+                #[cfg(not(test))]
+                {
+                    true
+                }
+            }
             && self.cpu_admissible(target, entry.eligibility_mask)
             && !self
                 .running
@@ -1145,6 +1169,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             enqueue_generation: 0,
             migration_generation: 0,
             migration_eligibility_generation: 0,
+            #[cfg(test)]
+            migration_test_exclusion: MigrationTestExclusion::None,
             ready_at_ns: None,
         })?;
         state.next_token = next_token;
@@ -1446,6 +1472,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 enqueue_generation,
                 migration_generation: 0,
                 migration_eligibility_generation: 0,
+                #[cfg(test)]
+                migration_test_exclusion: MigrationTestExclusion::None,
                 ready_at_ns,
             })
             .expect("replacing one Running Thread preserves scheduler capacity");
@@ -1541,7 +1569,10 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         match state.need_resched[cpu_index] {
             None => state.need_resched[cpu_index] = Some(ticket),
             Some(current) if current == ticket => {}
-            Some(_) => return Err(SchedulerError::StaleQuantum),
+            Some(_) => {
+                state.assert_invariants();
+                return Err(SchedulerError::StaleQuantum);
+            }
         }
         state.accounting = accounting;
         state.record_trace(
@@ -1607,6 +1638,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         let current = state.running[cpu_index].ok_or(SchedulerError::NotRunning)?;
         if current.thread != request.thread || current.generation != request.execution_generation {
             state.need_resched[cpu_index] = None;
+            state.assert_invariants();
             return Err(SchedulerError::StaleQuantum);
         }
         if state.preemption_disable_depth[cpu_index] != 0
@@ -1671,6 +1703,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 enqueue_generation,
                 migration_generation: 0,
                 migration_eligibility_generation: 0,
+                #[cfg(test)]
+                migration_test_exclusion: MigrationTestExclusion::None,
                 ready_at_ns,
             })
             .expect("replacing one Running Thread preserves scheduler capacity");
@@ -1850,6 +1884,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 enqueue_generation: 0,
                 migration_generation: 0,
                 migration_eligibility_generation: 0,
+                #[cfg(test)]
+                migration_test_exclusion: MigrationTestExclusion::None,
                 ready_at_ns: None,
             })
             .expect("moving one Running Thread to the queue preserves scheduler capacity");
@@ -2526,6 +2562,20 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     #[cfg(test)]
     pub(crate) fn last_migration(&self) -> Option<SchedulerMigrationRecord> {
         self.state.lock().last_migration
+    }
+
+    #[cfg(test)]
+    fn set_migration_test_exclusion(&self, thread: ThreadKey, exclusion: MigrationTestExclusion) {
+        let mut state = self.state.lock();
+        let len = state.len;
+        let entry = state.queue[..len]
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.thread == thread)
+            .expect("test migration exclusion names one queued Thread");
+        assert_eq!(entry.state, SchedulerThreadState::Runnable);
+        entry.migration_test_exclusion = exclusion;
+        state.assert_invariants();
     }
 
     /// Supplies a sampled monotonic-active timestamp for the immediately

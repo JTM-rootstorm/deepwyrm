@@ -2087,3 +2087,136 @@ fn dw1c3_failed_migration_preserves_source_exactly_once() {
     );
     assert_eq!(scheduler.check_invariants(), Ok(()));
 }
+
+#[test]
+fn dw1c4_external_authority_exclusions_leave_the_source_queued() {
+    for exclusion in [
+        MigrationTestExclusion::ExecutionPinned,
+        MigrationTestExclusion::ScratchPinned,
+        MigrationTestExclusion::TlbRendezvousPending,
+    ] {
+        let scheduler = CooperativeScheduler::<1>::new();
+        let mut registry = ObjectRegistry::<16>::new();
+        let subject = thread_key(&mut registry);
+        scheduler
+            .commit_on(cpu(1), scheduler.reserve(subject).unwrap())
+            .unwrap();
+        let source_before = scheduler.counters_on(cpu(1));
+        let target_before = scheduler.counters_on(cpu(0));
+        scheduler.set_migration_test_exclusion(subject, exclusion);
+
+        assert_eq!(scheduler.schedule_next_on(cpu(0)).unwrap().current, None);
+        assert_eq!(
+            scheduler.state(subject),
+            Some(SchedulerThreadState::Runnable)
+        );
+        assert_eq!(scheduler.running_cpu(subject), None);
+        assert_eq!(scheduler.counters_on(cpu(1)), source_before);
+        assert_eq!(scheduler.counters_on(cpu(0)), target_before);
+        assert_eq!(scheduler.last_migration(), None);
+        assert_eq!(scheduler.check_invariants(), Ok(()));
+    }
+}
+
+#[test]
+fn dw1c4_remote_stop_and_preemption_have_one_exact_winner_in_both_orders() {
+    let mut registry = ObjectRegistry::<16>::new();
+
+    let stop_first = CooperativeScheduler::<2>::new();
+    let stopped = thread_key(&mut registry);
+    let peer = thread_key(&mut registry);
+    for thread in [stopped, peer] {
+        stop_first
+            .commit_on(cpu(0), stop_first.reserve(thread).unwrap())
+            .unwrap();
+    }
+    stop_first.schedule_next_on(cpu(0)).unwrap();
+    let claim = stop_first.running_claim_on(cpu(0)).unwrap();
+    let ticket = stop_first.prepare_quantum_on(cpu(0), 10).unwrap();
+    assert_eq!(stop_first.stop_running_claim_on(claim), Ok(Some(ticket)));
+    assert_eq!(stop_first.publish_quantum_expiry(ticket), Ok(false));
+    assert_eq!(
+        stop_first.preempt_current_on(cpu(0)),
+        Err(SchedulerError::StaleQuantum)
+    );
+    stop_first.complete_switch_on(claim).unwrap();
+    assert_eq!(
+        stop_first.schedule_next_on(cpu(0)).unwrap().current,
+        Some(peer)
+    );
+    assert_eq!(stop_first.state(stopped), None);
+    assert_eq!(stop_first.check_invariants(), Ok(()));
+
+    let preempt_first = CooperativeScheduler::<2>::new();
+    let outgoing = thread_key(&mut registry);
+    let replacement = thread_key(&mut registry);
+    for thread in [outgoing, replacement] {
+        preempt_first
+            .commit_on(cpu(0), preempt_first.reserve(thread).unwrap())
+            .unwrap();
+    }
+    preempt_first.schedule_next_on(cpu(0)).unwrap();
+    let ticket = preempt_first.prepare_quantum_on(cpu(0), 20).unwrap();
+    assert_eq!(preempt_first.publish_quantum_expiry(ticket), Ok(true));
+    let outgoing_claim = match preempt_first.preempt_current_on(cpu(0)).unwrap() {
+        SchedulerPreemptionDecision::Switch { outgoing, .. } => outgoing,
+        decision => panic!("expected exact preemptive switch, got {decision:?}"),
+    };
+    preempt_first
+        .stop_suspended_claim_on(outgoing_claim)
+        .unwrap();
+    assert_eq!(preempt_first.publish_quantum_expiry(ticket), Ok(false));
+    assert_eq!(preempt_first.state(outgoing), None);
+    assert_eq!(preempt_first.current_on(cpu(0)), Some(replacement));
+    preempt_first.complete_switch_on(outgoing_claim).unwrap();
+    assert_eq!(preempt_first.check_invariants(), Ok(()));
+}
+
+#[test]
+fn dw1c4_stale_timer_wake_and_migration_records_cannot_alias_reused_thread_keys() {
+    let scheduler = CooperativeScheduler::<2>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let retired = thread_key(&mut registry);
+    scheduler
+        .commit_on(cpu(1), scheduler.reserve(retired).unwrap())
+        .unwrap();
+    scheduler.schedule_next_on(cpu(1)).unwrap();
+    let stale_timer = scheduler.prepare_quantum_on(cpu(1), 10).unwrap();
+    let (blocked, _) = scheduler.block_current_on(cpu(1), retired).unwrap();
+    let stale_wake = blocked.into_wake_key();
+    scheduler.retire_on(cpu(1), retired).unwrap();
+    scheduler
+        .complete_switch_on(scheduler.suspended_claim_on(cpu(1)).unwrap())
+        .unwrap();
+
+    let generations_before_reuse = registry.test_slot_generations();
+    let replacement = thread_key(&mut registry);
+    let generations_after_reuse = registry.test_slot_generations();
+    assert_ne!(
+        replacement, retired,
+        "ObjectRegistry generation reuse must change ThreadKey"
+    );
+    assert!(
+        generations_before_reuse
+            .iter()
+            .zip(generations_after_reuse)
+            .any(|(before, after)| after == before.checked_add(1).unwrap()),
+        "replacement must advance one released ObjectRegistry slot generation"
+    );
+    scheduler
+        .commit_on(cpu(1), scheduler.reserve(replacement).unwrap())
+        .unwrap();
+    let migrated = scheduler.schedule_next_on(cpu(0)).unwrap().current;
+    assert_eq!(migrated, Some(replacement));
+    let migration = scheduler.last_migration().unwrap();
+    assert_eq!(migration.thread, replacement);
+    assert_ne!(migration.thread, retired);
+    assert_ne!(migration.generation, 0);
+    assert_eq!(scheduler.publish_quantum_expiry(stale_timer), Ok(false));
+    assert_eq!(
+        scheduler.wake(stale_wake),
+        Err(SchedulerError::StaleBlockToken)
+    );
+    assert_eq!(scheduler.current_on(cpu(0)), Some(replacement));
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
