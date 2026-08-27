@@ -233,6 +233,7 @@ fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
         ("native-userspace-capability", 24),
         ("normal-preemption-up", 26),
         ("bootstrap-registry-launch", 27),
+        ("normal-preemption-smp", 28),
     ] {
         assert_eq!(
             kernel_build::select_guest_test(true, Some(selector), false, &harness),
@@ -246,7 +247,6 @@ fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
         "ipc-transfer-rollback",
         "wait-deadline-timer",
         "process-create-bootstrap",
-        "normal-preemption-smp",
     ] {
         assert!(
             kernel_build::select_guest_test(true, Some(selector), false, &harness).is_err(),

@@ -2209,7 +2209,10 @@ mod tests {
             assert!(validate_upper_nonzero_hex_nonce(invalid, "DW1C").is_err());
         }
         let manifest = include_str!("../tooling/guest-harness.toml");
-        assert!(select_guest_test(true, Some("normal-preemption-smp"), false, manifest).is_err());
+        assert_eq!(
+            select_guest_test(true, Some("normal-preemption-smp"), false, manifest),
+            Ok(Some(28))
+        );
         for value in ["", "0", "01", "+1", "8193", "not-pages"] {
             assert!(required_dw1c_bootfs_pages_for_test(value).is_err());
         }

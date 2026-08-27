@@ -164,8 +164,7 @@ state = "implemented"
 id = 27
 state = "implemented"
 
-# DW1-C's four-vCPU normal-preemption gate. DW1-C0 reserves the identity and
-# reached DW1C schema; target dispatch remains absent until DW1-C5.
+# DW1-C's selector-specialized four-vCPU normal-preemption gate.
 [guest_test.normal-preemption-smp]
 id = 28
-state = "reserved"
+state = "implemented"
