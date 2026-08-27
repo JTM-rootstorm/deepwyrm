@@ -156,13 +156,15 @@ fn i1_cpl3_rendezvous_gate_diverges_before_iret() {
         "let scheduler_current_matches =",
         "let suspended_carrier_matches =",
         "self.local.physically_executes(self.thread)",
-        "self.active.enter_kernel_execution_root(previous)",
+        "prepare_kernel_execution_root_switch(previous)",
         "stop_running_claim_on(claim)",
-        "complete_current_rendezvous_stop(request, self)",
+        "prepare_current_rendezvous_stop(request, self)",
+        "commit_current_rendezvous_stop(witness, self)",
         "prepare_after_rendezvous_stop()",
         "terminal_reaper_next_on(self.cpu)",
         "PreparedCarrierEntry::Idle => self.enter_idle_scheduler()",
-        "runtime.complete_rendezvous_stop(request, reaper)",
+        "runtime.prepare_rendezvous_stop(request, reaper)",
+        "runtime.commit_rendezvous_stop(witness, root_switch)",
     ] {
         assert!(
             primordial.contains(evidence),
