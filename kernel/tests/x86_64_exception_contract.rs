@@ -217,11 +217,29 @@ fn f3_timer_interrupt_is_returning_preserves_gprs_and_normalizes_user_gs() {
     let dispatch = user_origin
         .find("callq dw_x86_64_timer_interrupt_dispatch")
         .expect("CPL3 timer dispatch");
+    let thread_stack = user_origin
+        .find("movq %gs:DW_GS_CURRENT_STACK_TOP, %rsp")
+        .expect("bound Thread stack selection");
+    let copy = user_origin
+        .find("rep movsq")
+        .expect("complete timer-frame copy");
     let gate = user_origin
         .find("callq dw_x86_64_timer_pre_iret_gate")
         .expect("CPL3 pre-IRET gate");
     let second_swapgs = user_origin.rfind("swapgs").expect("CPL3 return swapgs");
-    assert!(dispatch < gate && gate < second_swapgs);
+    assert!(dispatch < thread_stack && thread_stack < copy && copy < gate && gate < second_swapgs);
+    assert!(user_origin.contains(
+        "movq %r12, %rsi\n\
+         \x20   movq %gs:DW_GS_CURRENT_STACK_TOP, %rsp\n\
+         \x20   testq %rsp, %rsp\n\
+         \x20   jz .Lapic_timer_entry_fail\n\
+         \x20   subq $DW_TIMER_FRAME_SIZE, %rsp\n\
+         \x20   movq %rsp, %rdi\n\
+         \x20   movl $(DW_TIMER_FRAME_SIZE / 8), %ecx\n\
+         \x20   cld\n\
+         \x20   rep movsq\n\
+         \x20   movq %rsp, %r12"
+    ));
 
     let kernel_origin = body
         .split_once(".Lapic_timer_kernel_origin:")
@@ -232,6 +250,8 @@ fn f3_timer_interrupt_is_returning_preserves_gprs_and_normalizes_user_gs() {
         .0;
     assert!(kernel_origin.contains("callq dw_x86_64_timer_interrupt_dispatch"));
     assert!(!kernel_origin.contains("dw_x86_64_timer_pre_iret_gate"));
+    assert!(!kernel_origin.contains("DW_GS_CURRENT_STACK_TOP"));
+    assert!(!kernel_origin.contains("rep movsq"));
 
     for exact_offset in [
         ".equ DW_TIMER_FRAME_SIZE, 160",
@@ -242,6 +262,7 @@ fn f3_timer_interrupt_is_returning_preserves_gprs_and_normalizes_user_gs() {
         ".equ DW_TIMER_FRAME_RFLAGS, 136",
         ".equ DW_TIMER_FRAME_RSP, 144",
         ".equ DW_TIMER_FRAME_SS, 152",
+        ".equ DW_GS_CURRENT_STACK_TOP, 8",
     ] {
         assert!(assembly.contains(exact_offset), "missing {exact_offset}");
     }

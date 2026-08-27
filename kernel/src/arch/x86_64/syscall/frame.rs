@@ -70,8 +70,11 @@ pub(crate) enum UserReturnError {
 pub(crate) const USER_CODE_SELECTOR: u64 = 0x33;
 pub(crate) const USER_DATA_SELECTOR: u64 = 0x2b;
 
-/// Complete CPL3-origin Local APIC timer stack image. It remains in place on
-/// the interrupted Thread's owned kernel stack across a preemptive switch.
+/// Complete CPL3-origin Local APIC timer return image. Hardware first lands the
+/// architectural image on the CPU-private privilege-entry stack; entry
+/// assembly copies it onto the interrupted Thread's owned kernel stack before
+/// Rust observes it. That Thread-owned copy remains in place across a
+/// preemptive switch.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RawCpl3TimerReturnFrame {

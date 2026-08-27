@@ -1509,7 +1509,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         {
             return Err(ExecutionSwitchError::WrongSchedulerState);
         }
-        let (_, previous_context) = tasks
+        let (previous_stack_id, previous_context) = tasks
             .thread_execution_resources(previous)
             .map_err(ExecutionSwitchError::Task)?
             .ok_or(ExecutionSwitchError::Resource(
@@ -1531,6 +1531,10 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
             .continuations
             .save_ptr(previous_context)
             .map_err(ExecutionSwitchError::Resource)?;
+        let current_stack = self
+            .stacks
+            .bounds(previous_stack_id)
+            .map_err(ExecutionSwitchError::Resource)?;
         let next_rsp = self
             .continuations
             .load(next_context)
@@ -1544,6 +1548,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                 crate::arch::x86_64::context::KernelSwitchPlan::new(
                     self,
                     current_rsp_out,
+                    current_stack,
                     next_rsp,
                     next_stack,
                 )
@@ -1564,6 +1569,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
             crate::arch::x86_64::context::KernelSwitchPlan::new_initial(
                 self,
                 current_rsp_out,
+                current_stack,
                 initial,
             )
         }

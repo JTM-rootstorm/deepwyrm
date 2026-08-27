@@ -110,6 +110,7 @@ NO_ERROR 31
 .equ DW_TIMER_FRAME_RFLAGS, 136
 .equ DW_TIMER_FRAME_RSP, 144
 .equ DW_TIMER_FRAME_SS, 152
+.equ DW_GS_CURRENT_STACK_TOP, 8
 .globl dw_x86_64_apic_timer_entry
 .type dw_x86_64_apic_timer_entry,@function
 dw_x86_64_apic_timer_entry:
@@ -138,7 +139,24 @@ dw_x86_64_apic_timer_entry:
     movq %rsp, %r12
     andq $-16, %rsp
     callq dw_x86_64_timer_interrupt_dispatch
-    movq %r12, %rsp
+
+    /*
+     * E0 requires CPL3 interrupts to land on the fixed CPU-private RSP0
+     * stack. Before the DW1-B preemption gate may retain this frame across a
+     * Thread switch, copy the complete image onto the interrupted Thread's
+     * currently bound kernel stack. The entry-stack image is abandoned after
+     * this point and may be reused by a later privilege transition.
+     */
+    movq %r12, %rsi
+    movq %gs:DW_GS_CURRENT_STACK_TOP, %rsp
+    testq %rsp, %rsp
+    jz .Lapic_timer_entry_fail
+    subq $DW_TIMER_FRAME_SIZE, %rsp
+    movq %rsp, %rdi
+    movl $(DW_TIMER_FRAME_SIZE / 8), %ecx
+    cld
+    rep movsq
+    movq %rsp, %r12
     movq %rsp, %rdi
     andq $-16, %rsp
     callq dw_x86_64_timer_pre_iret_gate
@@ -167,6 +185,8 @@ dw_x86_64_apic_timer_entry:
     popq %rbx
     popq %rax
     iretq
+.Lapic_timer_entry_fail:
+    ud2
 .size dw_x86_64_apic_timer_entry, .-dw_x86_64_apic_timer_entry
 
 .p2align 4

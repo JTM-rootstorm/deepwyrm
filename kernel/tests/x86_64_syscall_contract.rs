@@ -1345,8 +1345,29 @@ fn daybreak_switch_plan_brands_execution_owner_through_every_suspend_facade() {
     assert!(context.contains("pub(crate) struct KernelSwitchPlan<'owner>"));
     assert!(context.contains("_owner: PhantomData<&'owner ()>"));
     assert!(context.contains("_owner: &'owner Owner"));
-    assert!(context.contains("fn into_switch(self) -> (*mut u64, u64)"));
+    assert!(context.contains("fn into_switch(self) -> (*mut u64, KernelStackBounds, u64)"));
     assert!(context.contains("execute_kernel_switch(plan: KernelSwitchPlan<'_>)"));
+    assert!(
+        context.contains("switch_owned_kernel_context(current_rsp_out, next_rsp, current_stack)")
+    );
+
+    let switch_assembly = source("src/arch/x86_64/kernel_context.S");
+    let owned = switch_assembly
+        .split_once("dw_x86_64_switch_owned_kernel_context:")
+        .expect("owned switch entry")
+        .1
+        .split_once("dw_x86_64_switch_kernel_context:")
+        .expect("raw switch entry")
+        .0;
+    for exact in [
+        "subq $56, %r8",
+        "cmpq %rdx, %r8",
+        "addq $8, %r8",
+        "cmpq %rcx, %r8",
+        "jmp dw_x86_64_switch_kernel_context",
+    ] {
+        assert!(owned.contains(exact), "owned switch omitted {exact}");
+    }
 
     assert!(execution.contains("&'owner self,"));
     assert!(

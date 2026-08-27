@@ -147,6 +147,7 @@ pub(crate) enum KernelContextPlanError {
 #[derive(Debug)]
 pub(crate) struct KernelSwitchPlan<'owner> {
     current_rsp_out: *mut u64,
+    current_stack: KernelStackBounds,
     next_rsp: u64,
     next_stack: KernelStackBounds,
     _owner: PhantomData<&'owner ()>,
@@ -166,6 +167,7 @@ impl<'owner> KernelSwitchPlan<'owner> {
     pub(crate) unsafe fn new<Owner: ?Sized>(
         _owner: &'owner Owner,
         current_rsp_out: *mut u64,
+        current_stack: KernelStackBounds,
         next_rsp: u64,
         next_stack: KernelStackBounds,
     ) -> Result<Self, KernelContextPlanError> {
@@ -180,6 +182,7 @@ impl<'owner> KernelSwitchPlan<'owner> {
         }
         Ok(Self {
             current_rsp_out,
+            current_stack,
             next_rsp,
             next_stack,
             _owner: PhantomData,
@@ -200,6 +203,7 @@ impl<'owner> KernelSwitchPlan<'owner> {
     pub(crate) unsafe fn new_initial<Owner: ?Sized>(
         _owner: &'owner Owner,
         current_rsp_out: *mut u64,
+        current_stack: KernelStackBounds,
         initial: InitialKernelContinuation,
     ) -> Result<Self, KernelContextPlanError> {
         if current_rsp_out.is_null() {
@@ -214,6 +218,7 @@ impl<'owner> KernelSwitchPlan<'owner> {
         ));
         Ok(Self {
             current_rsp_out,
+            current_stack,
             next_rsp: initial.rsp,
             next_stack: initial.stack,
             _owner: PhantomData,
@@ -223,6 +228,9 @@ impl<'owner> KernelSwitchPlan<'owner> {
     pub(crate) const fn next_stack(&self) -> KernelStackBounds {
         self.next_stack
     }
+    pub(crate) const fn current_stack(&self) -> KernelStackBounds {
+        self.current_stack
+    }
     pub(crate) const fn next_rsp(&self) -> u64 {
         self.next_rsp
     }
@@ -230,8 +238,8 @@ impl<'owner> KernelSwitchPlan<'owner> {
         self.current_rsp_out
     }
 
-    const fn into_switch(self) -> (*mut u64, u64) {
-        (self.current_rsp_out, self.next_rsp)
+    const fn into_switch(self) -> (*mut u64, KernelStackBounds, u64) {
+        (self.current_rsp_out, self.current_stack, self.next_rsp)
     }
 }
 
@@ -250,6 +258,39 @@ pub(crate) unsafe fn switch_kernel_context(current_rsp_out: *mut u64, next_rsp: 
     );
     assert_ne!(next_rsp, 0, "next kernel continuation RSP is zero");
     unsafe { dw_x86_64_switch_kernel_context(current_rsp_out, next_rsp) };
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "the audited owned-switch assembly validates its exact saved frame against the outgoing Thread stack"
+)]
+unsafe fn switch_owned_kernel_context(
+    current_rsp_out: *mut u64,
+    next_rsp: u64,
+    current_stack: KernelStackBounds,
+) {
+    unsafe extern "sysv64" {
+        fn dw_x86_64_switch_owned_kernel_context(
+            current_rsp_out: *mut u64,
+            next_rsp: u64,
+            current_stack_bottom: u64,
+            current_stack_top: u64,
+        );
+    }
+    assert!(
+        !current_rsp_out.is_null(),
+        "kernel continuation output pointer is null"
+    );
+    assert_ne!(next_rsp, 0, "next kernel continuation RSP is zero");
+    unsafe {
+        dw_x86_64_switch_owned_kernel_context(
+            current_rsp_out,
+            next_rsp,
+            current_stack.bottom,
+            current_stack.top,
+        )
+    };
 }
 
 /// Leaves an architecture-owned terminal-reaper stack and resumes one already
@@ -279,8 +320,8 @@ pub(crate) unsafe fn abandon_to_kernel_continuation(next_rsp: u64) -> ! {
     reason = "consuming the lifetime-branded plan preserves its stationary owner through the immediate audited F2 assembly boundary"
 )]
 pub(crate) unsafe fn execute_kernel_switch(plan: KernelSwitchPlan<'_>) {
-    let (current_rsp_out, next_rsp) = plan.into_switch();
-    unsafe { switch_kernel_context(current_rsp_out, next_rsp) };
+    let (current_rsp_out, current_stack, next_rsp) = plan.into_switch();
+    unsafe { switch_owned_kernel_context(current_rsp_out, next_rsp, current_stack) };
 }
 
 #[cfg(all(test, target_arch = "x86_64", not(target_os = "none")))]

@@ -147,8 +147,12 @@ The frame is exactly 160 bytes and eight-byte aligned. Offsets are:
 | `ss` | 152 |
 
 Assembly constants and Rust compile-time/source-contract tests bind the same
-layout. The frame remains on the interrupted Thread's owned kernel stack. It is
-not copied into CPU-private storage or another Thread's memory.
+layout. As required by the locked E0 entry contract, the architectural frame
+initially lands on the CPU-private privilege-entry stack selected by TSS RSP0.
+After source dispatch and EOI, but before the pre-IRET gate can retain a kernel
+continuation, assembly copies the complete frame onto the interrupted Thread's
+owned kernel stack. The CPU-private image is then abandoned and may be reused;
+only the Thread-owned image may survive a preemptive switch.
 
 Kernel-origin timer interrupts retain the current bounded dispatch-and-return
 path and never call the CPL3 preemption gate.
@@ -158,10 +162,12 @@ For CPL3 origin, assembly:
 1. preserves all GPRs in the exact frame above;
 2. normalizes GS as it does today;
 3. calls the timer interrupt dispatcher, which services sources and EOI;
-4. restores the frame pointer and passes it to
+4. copies the complete frame from the E0 CPU-private landing stack to the
+   currently bound Thread kernel stack;
+5. restores the Thread-owned frame pointer and passes it to
    `dw_x86_64_timer_pre_iret_gate`;
-5. restores user GS and GPRs only after that gate returns; and
-6. executes `iretq`.
+6. restores user GS and GPRs only after that gate returns; and
+7. executes `iretq`.
 
 The gate returns normally only when the same frame belongs to the current
 Running Thread and is authorized for CPL3 return. If it switches away, the
