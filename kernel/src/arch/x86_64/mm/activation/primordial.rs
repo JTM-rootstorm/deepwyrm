@@ -1933,8 +1933,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
         let retiring_wyr1_primordial = retired_process == self.primordial_process;
         #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
-        if retiring_wyr1_primordial && validate_primordial_retirement_facts(self).is_err() {
-            crate::test_support::complete_fail(supervisor_evidence_detail(0xd001))
+        if retiring_wyr1_primordial {
+            if let Err(error) = validate_primordial_retirement_facts(self) {
+                crate::test_support::complete_fail(primordial_completion_detail(error))
+            }
         }
         #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
         let mut wyr1_primordial_teardown = if retiring_wyr1_primordial {
@@ -3929,6 +3931,32 @@ const fn supervisor_evidence_detail(case: u32) -> u32 {
     return 0x2510_0000 | case;
     #[cfg(deepwyrm_wyr1b_evidence)]
     return 0x2710_0000 | case;
+}
+
+#[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
+const fn primordial_completion_case(
+    error: crate::boot::primordial::construction::PrimordialCompletionError<u32>,
+) -> u32 {
+    use crate::boot::primordial::construction::PrimordialCompletionError;
+
+    // The selector and completion stage occupy the upper 24 bits. Preserve the
+    // backend/application code's low byte as the stable bounded discriminator.
+    match error {
+        PrimordialCompletionError::Receive(code) => 0xd100 | (code & 0xff),
+        PrimordialCompletionError::MalformedReady => 0xd200,
+        PrimordialCompletionError::ObserveExit(code) => 0xd300 | (code & 0xff),
+        PrimordialCompletionError::NonzeroExit(code) => 0xd400 | (code & 0xff),
+        PrimordialCompletionError::UnhandledException => 0xd500,
+        PrimordialCompletionError::AuthorizedTermination => 0xd600,
+        PrimordialCompletionError::NotQuiescent(code) => 0xd700 | (code & 0xff),
+    }
+}
+
+#[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
+const fn primordial_completion_detail(
+    error: crate::boot::primordial::construction::PrimordialCompletionError<u32>,
+) -> u32 {
+    supervisor_evidence_detail(primordial_completion_case(error))
 }
 
 impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandler

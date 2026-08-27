@@ -950,6 +950,38 @@ fn wyr1_terminal_child_after_primordial_retirement_uses_its_current_root() {
 }
 
 #[test]
+fn wyr1_primordial_completion_failures_have_variant_specific_details() {
+    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let terminal = runtime
+        .split_once("fn prepare_terminal_handoff(&mut self) -> PreparedTerminalHandoff")
+        .expect("terminal handoff")
+        .1
+        .split_once("fn reserve_runtime_phase")
+        .expect("terminal handoff extent")
+        .0;
+
+    assert!(terminal.contains("if let Err(error) = validate_primordial_retirement_facts(self)"));
+    assert!(terminal.contains("complete_fail(primordial_completion_detail(error))"));
+    assert!(!terminal.contains("supervisor_evidence_detail(0xd001)"));
+
+    for mapping in [
+        "PrimordialCompletionError::Receive(code) => 0xd100 | (code & 0xff)",
+        "PrimordialCompletionError::MalformedReady => 0xd200",
+        "PrimordialCompletionError::ObserveExit(code) => 0xd300 | (code & 0xff)",
+        "PrimordialCompletionError::NonzeroExit(code) => 0xd400 | (code & 0xff)",
+        "PrimordialCompletionError::UnhandledException => 0xd500",
+        "PrimordialCompletionError::AuthorizedTermination => 0xd600",
+        "PrimordialCompletionError::NotQuiescent(code) => 0xd700 | (code & 0xff)",
+    ] {
+        assert!(
+            runtime.contains(mapping),
+            "missing completion detail mapping {mapping}"
+        );
+    }
+    assert!(runtime.contains("supervisor_evidence_detail(primordial_completion_case(error))"));
+}
+
+#[test]
 fn final_external_thread_completion_retires_pins_before_process_root_teardown() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
     let completion = runtime
