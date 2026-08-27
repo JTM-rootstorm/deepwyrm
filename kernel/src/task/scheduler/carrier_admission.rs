@@ -102,6 +102,10 @@ impl CarrierAdmissionTicket {
         self.admission_generation
     }
 
+    pub(crate) const fn online_generation(self) -> u64 {
+        self.online_generation
+    }
+
     pub(crate) const fn scheduler_slot_generation(self) -> u64 {
         self.scheduler_slot_generation
     }

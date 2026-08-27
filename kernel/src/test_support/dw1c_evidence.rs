@@ -45,6 +45,15 @@ pub(crate) struct Dw1cActor {
     pub(crate) execution_generation: u64,
 }
 
+/// One private fixed-transcript payload. These values are retained exactly at
+/// the commit point; serialization never synthesizes a relation later.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Dw1cRecordPayload {
+    pub(crate) subject: u64,
+    pub(crate) generation: u64,
+    pub(crate) value: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Dw1cKernelFacts {
     /// One bit for each CPU 0..3 after ordinary scheduler admission.
@@ -87,6 +96,10 @@ struct State {
     reporter: Option<(ProcessKey, ThreadKey)>,
     actors: [Option<Dw1cActor>; DW1C_ACTOR_COUNT],
     progress: [u64; 5],
+    cpu_ready_payload: [Option<Dw1cRecordPayload>; 4],
+    run_payload: [Option<Dw1cRecordPayload>; 4],
+    quantum_payload: [Option<Dw1cRecordPayload>; 4],
+    preempt_payload: [Option<Dw1cRecordPayload>; 4],
     facts: Dw1cKernelFacts,
     terminal: bool,
     failure: Option<Dw1cEvidenceError>,
@@ -99,6 +112,10 @@ impl State {
             reporter: None,
             actors: [None; DW1C_ACTOR_COUNT],
             progress: [0; 5],
+            cpu_ready_payload: [None; 4],
+            run_payload: [None; 4],
+            quantum_payload: [None; 4],
+            preempt_payload: [None; 4],
             facts: Dw1cKernelFacts {
                 cpu_ready: 0,
                 run: 0,
@@ -320,6 +337,33 @@ impl Dw1cEvidenceCollector {
         if !state.installed || state.facts.cpu_ready & bit != 0 {
             return Err(state.latch(Dw1cEvidenceError::Duplicate));
         }
+        state.facts.cpu_ready |= bit;
+        Ok(())
+    }
+
+    pub(crate) fn observe_cpu_ready_payload(
+        &self,
+        cpu: u8,
+        subject: u64,
+        generation: u64,
+        value: u64,
+    ) -> Result<(), Dw1cEvidenceError> {
+        let mut state = self.state.lock();
+        let index = usize::from(cpu);
+        let bit = cpu_bit(cpu).ok_or_else(|| state.latch(Dw1cEvidenceError::Malformed))?;
+        if !state.installed
+            || subject == 0
+            || generation == 0
+            || value == 0
+            || state.cpu_ready_payload[index].is_some()
+        {
+            return Err(state.latch(Dw1cEvidenceError::Duplicate));
+        }
+        state.cpu_ready_payload[index] = Some(Dw1cRecordPayload {
+            subject,
+            generation,
+            value,
+        });
         state.facts.cpu_ready |= bit;
         Ok(())
     }

@@ -682,7 +682,12 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
             .commit_bootstrap_schedulable(ticket, resources)?;
         #[cfg(deepwyrm_dw1c_evidence)]
         crate::test_support::DW1C_EVIDENCE
-            .observe_cpu_ready(ticket.cpu().index() as u8)
+            .observe_cpu_ready_payload(
+                ticket.cpu().index() as u8,
+                ((ticket.cpu().index() as u64 + 1) << 32) | u64::from(resources.local_apic_id),
+                ticket.online_generation(),
+                ticket.admission_generation(),
+            )
             .unwrap_or_else(|error| panic!("selector-28 CPU admission failed: {error:?}"));
         Ok(())
     }
@@ -715,7 +720,12 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
             .commit_ap_schedulable(ticket, resources, enable_idle_wake)?;
         #[cfg(deepwyrm_dw1c_evidence)]
         crate::test_support::DW1C_EVIDENCE
-            .observe_cpu_ready(ticket.cpu().index() as u8)
+            .observe_cpu_ready_payload(
+                ticket.cpu().index() as u8,
+                ((ticket.cpu().index() as u64 + 1) << 32) | u64::from(resources.local_apic_id),
+                ticket.online_generation(),
+                ticket.admission_generation(),
+            )
             .unwrap_or_else(|error| panic!("selector-28 AP admission failed: {error:?}"));
         Ok(())
     }
