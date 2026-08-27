@@ -519,6 +519,12 @@ installation but before ARM. ARM must join their handles to the collector's
 exact CREATE and START observations; the fixed workload then drives their exit
 and reap in token order.
 
+A committed Runnable Thread retains one private, nonzero started-execution
+generation until its first Running claim consumes it. Placement, wake, steal,
+and transactional migration preserve that identity; later dispatches mint
+fresh execution generations as before. This is an internal scheduler invariant,
+not a userspace query or ABI field.
+
 ARM borrows handles for inspection. It does not MOVE, duplicate, close, retain,
 or otherwise change controller ownership. The collector retains only exact
 generation-safe keys/tokens, not object pins that would prevent later exit or

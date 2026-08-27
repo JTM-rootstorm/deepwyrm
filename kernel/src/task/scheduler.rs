@@ -297,6 +297,7 @@ struct QueueEntry {
     thread: ThreadKey,
     state: SchedulerThreadState,
     token: u64,
+    started_execution_generation: u64,
     block_cpu: Option<SchedulerCpuId>,
     block_execution_generation: u64,
     continuation_cpu: Option<SchedulerCpuId>,
@@ -798,8 +799,12 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         let Some(index) = self.first_local_runnable_index(cpu) else {
             return Ok(None);
         };
-        let generation = self.mint_execution_generation()?;
         let entry = self.remove_index(index);
+        let generation = if entry.started_execution_generation != 0 {
+            entry.started_execution_generation
+        } else {
+            self.mint_execution_generation()?
+        };
         Ok(Some(RunningClaim {
             thread: entry.thread,
             generation,
@@ -828,6 +833,8 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
                 return Err(SchedulerError::StaleExecutionClaim);
             }
             suspended.generation
+        } else if entry.started_execution_generation != 0 {
+            entry.started_execution_generation
         } else {
             self.mint_execution_generation()?
         };
@@ -1159,6 +1166,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             thread,
             state: SchedulerThreadState::Reserved,
             token,
+            started_execution_generation: 0,
             block_cpu: None,
             block_execution_generation: 0,
             continuation_cpu: None,
@@ -1218,6 +1226,10 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 reservation,
             });
         }
+        let started_execution_generation = match state.mint_execution_generation() {
+            Ok(generation) => generation,
+            Err(error) => return Err(SchedulerReservationFailure { error, reservation }),
+        };
         let enqueue_generation = state.next_enqueue_generation;
         let next_enqueue_generation = enqueue_generation
             .checked_add(1)
@@ -1260,6 +1272,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             .expect("validated scheduler reservation remains queued");
         entry.state = SchedulerThreadState::Runnable;
         entry.token = 0;
+        entry.started_execution_generation = started_execution_generation;
         entry.target_cpu = target;
         entry.enqueue_generation = enqueue_generation;
         entry.migration_eligibility_generation = eligibility_generation;
@@ -1462,6 +1475,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 thread,
                 state: SchedulerThreadState::Runnable,
                 token: 0,
+                started_execution_generation: 0,
                 block_cpu: None,
                 block_execution_generation: 0,
                 continuation_cpu: Some(cpu),
@@ -1696,6 +1710,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 thread: current.thread,
                 state: SchedulerThreadState::Runnable,
                 token: 0,
+                started_execution_generation: 0,
                 block_cpu: None,
                 block_execution_generation: 0,
                 continuation_cpu: Some(cpu),
@@ -1877,6 +1892,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 thread: reservation.key.thread,
                 state: SchedulerThreadState::Blocked,
                 token: reservation.key.token,
+                started_execution_generation: 0,
                 block_cpu: Some(cpu),
                 block_execution_generation: reservation.key.execution_generation,
                 continuation_cpu: Some(cpu),
@@ -2550,6 +2566,18 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             .flatten()
             .find(|entry| entry.thread == thread)
             .map(|entry| entry.state)
+    }
+
+    /// Internal start identity for a committed-but-not-yet-first-dispatched
+    /// Thread. It is intentionally not an ABI query.
+    pub(crate) fn runnable_start_generation(&self, thread: ThreadKey) -> Option<u64> {
+        let state = self.state.lock();
+        state.queue[..state.len].iter().flatten().find_map(|entry| {
+            (entry.thread == thread
+                && entry.state == SchedulerThreadState::Runnable
+                && entry.started_execution_generation != 0)
+                .then_some(entry.started_execution_generation)
+        })
     }
 
     #[cfg(test)]

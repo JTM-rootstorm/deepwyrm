@@ -651,6 +651,10 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         Ok(decision)
     }
 
+    pub(crate) fn runnable_start_generation(&self, thread: ThreadKey) -> Option<u64> {
+        self.scheduler.runnable_start_generation(thread)
+    }
+
     pub(crate) fn prepare_bootstrap_carrier(
         &self,
         resources: super::CarrierResourceTuple,
