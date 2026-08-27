@@ -508,3 +508,38 @@ fn completion_rejects_peer_failure_exception_nonzero_exit_and_residue() {
         ))
     );
 }
+
+#[test]
+fn retirement_fact_split_samples_exit_without_consuming_quiescence() {
+    let mut receive_failure = completion_host(PrimordialExitDisposition::Normal(0xaf01_0002));
+    receive_failure.ready = Err(CompletionFailure::Receive);
+    assert_eq!(
+        validate_primordial_retirement_facts(&mut receive_failure),
+        Err(PrimordialCompletionError::Receive(
+            CompletionFailure::Receive
+        ))
+    );
+    assert!(receive_failure.observed_exit);
+    assert!(!receive_failure.verified_quiescence);
+
+    let mut malformed = completion_host(PrimordialExitDisposition::Normal(0));
+    malformed.ready = Ok(vec![0; 40]);
+    malformed.exit = Err(CompletionFailure::Exit);
+    assert_eq!(
+        validate_primordial_retirement_facts(&mut malformed),
+        Err(PrimordialCompletionError::MalformedReady)
+    );
+    assert!(malformed.observed_exit);
+    assert!(!malformed.verified_quiescence);
+
+    let mut exit_failure = completion_host(PrimordialExitDisposition::Normal(0));
+    exit_failure.exit = Err(CompletionFailure::Exit);
+    assert_eq!(
+        validate_primordial_retirement_facts(&mut exit_failure),
+        Err(PrimordialCompletionError::ObserveExit(
+            CompletionFailure::Exit
+        ))
+    );
+    assert!(exit_failure.observed_exit);
+    assert!(!exit_failure.verified_quiescence);
+}

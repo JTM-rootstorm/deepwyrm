@@ -476,21 +476,22 @@ pub(crate) fn complete_primordial_launch<B: PrimordialCompletionBackend>(
 /// Selector-local split of the primordial completion contract. This validates
 /// the committed READY and structured zero exit without consuming the runtime
 /// authority that a live permanent-supervisor descendant still requires.
-#[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
+#[cfg(any(test, deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
 pub(crate) fn validate_primordial_retirement_facts<B: PrimordialCompletionBackend>(
     backend: &mut B,
 ) -> Result<(), PrimordialCompletionError<B::Error>> {
     let mut bytes = [0_u8; 40];
-    let actual = backend
-        .receive_ready(&mut bytes)
-        .map_err(PrimordialCompletionError::Receive)?;
+    // Snapshot both facts before applying the established READY-first error
+    // precedence. A failed receive must not erase the concurrent structured
+    // Process disposition needed by selector-local failure diagnostics.
+    let ready = backend.receive_ready(&mut bytes);
+    let exit = backend.observe_exit();
+
+    let actual = ready.map_err(PrimordialCompletionError::Receive)?;
     if actual != READY_BYTES.len() || bytes != READY_BYTES {
         return Err(PrimordialCompletionError::MalformedReady);
     }
-    match backend
-        .observe_exit()
-        .map_err(PrimordialCompletionError::ObserveExit)?
-    {
+    match exit.map_err(PrimordialCompletionError::ObserveExit)? {
         PrimordialExitDisposition::Normal(0) => Ok(()),
         PrimordialExitDisposition::Normal(code) => {
             Err(PrimordialCompletionError::NonzeroExit(code))

@@ -961,11 +961,12 @@ fn wyr1_primordial_completion_failures_have_variant_specific_details() {
         .0;
 
     assert!(terminal.contains("if let Err(error) = validate_primordial_retirement_facts(self)"));
-    assert!(terminal.contains("complete_fail(primordial_completion_detail(error))"));
+    assert!(terminal.contains("let terminal_info = self.g5_probe.terminal_info;"));
+    assert!(terminal.contains("complete_fail(primordial_completion_detail("));
+    assert!(terminal.contains("                    error,\n                    terminal_info,"));
     assert!(!terminal.contains("supervisor_evidence_detail(0xd001)"));
 
     for mapping in [
-        "PrimordialCompletionError::Receive(code) => 0xd100 | (code & 0xff)",
         "PrimordialCompletionError::MalformedReady => 0xd200",
         "PrimordialCompletionError::ObserveExit(code) => 0xd300 | (code & 0xff)",
         "PrimordialCompletionError::NonzeroExit(code) => 0xd400 | (code & 0xff)",
@@ -978,7 +979,29 @@ fn wyr1_primordial_completion_failures_have_variant_specific_details() {
             "missing completion detail mapping {mapping}"
         );
     }
-    assert!(runtime.contains("supervisor_evidence_detail(primordial_completion_case(error))"));
+    for mapping in [
+        "ChannelError::Capacity => 0x7100_0011",
+        "ChannelError::InvalidArgument => 0x7100_0012",
+        "ChannelError::InvalidEndpoint => 0x7100_0013",
+        "ChannelError::StalePair => 0x7100_0014",
+        "ChannelError::WouldBlock => 0x7100_0015",
+        "ChannelError::PeerClosed => 0x7100_0016",
+        "ChannelError::BufferTooSmall => 0x7100_0017",
+        "ChannelError::AccessDenied => 0x7100_0018",
+        "ChannelError::FinalizationMismatch => 0x7100_0019",
+    ] {
+        assert!(
+            runtime.contains(mapping),
+            "missing Channel mapping {mapping}"
+        );
+    }
+    assert!(runtime.contains("0xe000"));
+    assert!(runtime.contains("primordial_receive_failure_tag(code) << 8"));
+    assert!(runtime.contains("primordial_terminal_summary(terminal_info)"));
+    assert!(runtime.contains("application_code == 0xaf01_0002"));
+    assert!(runtime.contains("application_code & 0xf000_0000 == 0xb000_0000"));
+    assert!(runtime.contains("0x80 | (application_code & 0x3f)"));
+    assert!(runtime.contains("primordial_completion_case(error, terminal_info)"));
 }
 
 #[test]

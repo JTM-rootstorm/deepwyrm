@@ -21,9 +21,7 @@ use crate::boot::primordial::construction::{
     PrimordialCompletionBackend, PrimordialExitDisposition, complete_primordial_launch,
     construct_primordial,
 };
-use crate::ipc::ChannelAuthority;
-#[cfg(all(feature = "test-support", deepwyrm_wrcap_relay))]
-use crate::ipc::ChannelError;
+use crate::ipc::{ChannelAuthority, ChannelError};
 use crate::memory::address_region::{
     AddressRegion, AddressRegionObjectAuthority, AddressSpaceAuthority, Protection,
 };
@@ -431,6 +429,7 @@ struct G5PrimordialProbe {
     atomic_resumed_timed_out: bool,
     terminal_oracle_passed: bool,
     terminal_application_code: u32,
+    terminal_info: Option<deepwyrm_abi::DwTaskTerminationInfoV1>,
 }
 
 #[cfg(feature = "test-support")]
@@ -477,6 +476,7 @@ impl G5PrimordialProbe {
             atomic_resumed_timed_out: false,
             terminal_oracle_passed: false,
             terminal_application_code: 0,
+            terminal_info: None,
         }
     }
 
@@ -578,6 +578,7 @@ impl G5PrimordialProbe {
 
     fn observe_terminal(&mut self, info: deepwyrm_abi::DwTaskTerminationInfoV1) {
         self.terminal_application_code = info.application_code;
+        self.terminal_info = Some(info);
         let (exception_type, detail) = match self.expectation {
             G5PrimordialExpectation::UserException => {
                 (deepwyrm_abi::DW_EXCEPTION_ILLEGAL_INSTRUCTION, 6)
@@ -1935,7 +1936,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
         if retiring_wyr1_primordial {
             if let Err(error) = validate_primordial_retirement_facts(self) {
-                crate::test_support::complete_fail(primordial_completion_detail(error))
+                #[cfg(feature = "test-support")]
+                let terminal_info = self.g5_probe.terminal_info;
+                #[cfg(not(feature = "test-support"))]
+                let terminal_info = None;
+                crate::test_support::complete_fail(primordial_completion_detail(
+                    error,
+                    terminal_info,
+                ))
             }
         }
         #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
@@ -3284,6 +3292,20 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 }
 
+const fn primordial_channel_receive_error(error: ChannelError) -> u32 {
+    match error {
+        ChannelError::Capacity => 0x7100_0011,
+        ChannelError::InvalidArgument => 0x7100_0012,
+        ChannelError::InvalidEndpoint => 0x7100_0013,
+        ChannelError::StalePair => 0x7100_0014,
+        ChannelError::WouldBlock => 0x7100_0015,
+        ChannelError::PeerClosed => 0x7100_0016,
+        ChannelError::BufferTooSmall => 0x7100_0017,
+        ChannelError::AccessDenied => 0x7100_0018,
+        ChannelError::FinalizationMismatch => 0x7100_0019,
+    }
+}
+
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialCompletionBackend
     for PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
@@ -3294,7 +3316,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialCompleti
             .shared
             .channels
             .receive_into(self.channel_keys[0], output, &self.shared.waits)
-            .map_err(|_| 0x7100_0001_u32)?;
+            .map_err(primordial_channel_receive_error)?;
         let (wake_intents, pins) = wakes.into_parts();
         if wake_intents.into_iter().flatten().next().is_some()
             || pins.into_iter().flatten().next().is_some()
@@ -3933,16 +3955,78 @@ const fn supervisor_evidence_detail(case: u32) -> u32 {
     return 0x2710_0000 | case;
 }
 
-#[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
-const fn primordial_completion_case(
+#[cfg(any(test, deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
+const fn primordial_application_summary(application_code: u32) -> u32 {
+    if application_code == 0 {
+        0
+    } else if application_code == 0xaf01_0002 {
+        // Wyrmroot system-init's fatal-reboot-required status is the primary
+        // pre-bootstrap failure discriminator for these selectors.
+        0x02
+    } else if application_code & 0xffff_0000 == 0xaf01_0000 {
+        0x10 | (application_code & 0x0f)
+    } else if application_code & 0xffff_0000 == 0xaf11_0000 {
+        0x20 | (application_code & 0x1f)
+    } else if application_code & 0xf000_0000 == 0xb000_0000 {
+        // Preserve the bootstrap family plus its bounded low-six-bit reason.
+        0x80 | (application_code & 0x3f)
+    } else {
+        0x40 | (application_code & 0x3f)
+    }
+}
+
+#[cfg(any(test, deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
+fn primordial_terminal_summary(info: Option<deepwyrm_abi::DwTaskTerminationInfoV1>) -> u32 {
+    let Some(info) = info else {
+        return 0xff;
+    };
+    if info.state != DW_TASK_STATE_EXITED {
+        return 0xfc;
+    }
+    if info.reason == DW_TERMINATION_NORMAL_EXIT {
+        primordial_application_summary(info.application_code)
+    } else if info.reason == deepwyrm_abi::DW_TERMINATION_UNHANDLED_EXCEPTION {
+        0xfe
+    } else {
+        0xfd
+    }
+}
+
+#[cfg(any(test, deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
+const fn primordial_receive_failure_tag(code: u32) -> u32 {
+    match code {
+        0x7100_0011 => 1,
+        0x7100_0012 => 2,
+        0x7100_0013 => 3,
+        0x7100_0014 => 4,
+        0x7100_0015 => 5,
+        0x7100_0016 => 6,
+        0x7100_0017 => 7,
+        0x7100_0018 => 8,
+        0x7100_0019 => 9,
+        0x7100_0002 => 0xa,
+        _ => 0xf,
+    }
+}
+
+#[cfg(any(test, deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
+fn primordial_completion_case(
     error: crate::boot::primordial::construction::PrimordialCompletionError<u32>,
+    terminal_info: Option<deepwyrm_abi::DwTaskTerminationInfoV1>,
 ) -> u32 {
     use crate::boot::primordial::construction::PrimordialCompletionError;
 
-    // The selector and completion stage occupy the upper 24 bits. Preserve the
-    // backend/application code's low byte as the stable bounded discriminator.
+    // The canonical detail has only sixteen selector-local bits, so it cannot
+    // retain both arbitrary u32 values losslessly. Receive failures use ETVV:
+    // T is the exact bounded Channel/wake tag and VV is the most actionable
+    // terminal category (including exact AF01_0002 versus bootstrap-family).
+    // Other completion stages retain their existing stable low-byte detail.
     match error {
-        PrimordialCompletionError::Receive(code) => 0xd100 | (code & 0xff),
+        PrimordialCompletionError::Receive(code) => {
+            0xe000
+                | (primordial_receive_failure_tag(code) << 8)
+                | primordial_terminal_summary(terminal_info)
+        }
         PrimordialCompletionError::MalformedReady => 0xd200,
         PrimordialCompletionError::ObserveExit(code) => 0xd300 | (code & 0xff),
         PrimordialCompletionError::NonzeroExit(code) => 0xd400 | (code & 0xff),
@@ -3953,10 +4037,11 @@ const fn primordial_completion_case(
 }
 
 #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
-const fn primordial_completion_detail(
+fn primordial_completion_detail(
     error: crate::boot::primordial::construction::PrimordialCompletionError<u32>,
+    terminal_info: Option<deepwyrm_abi::DwTaskTerminationInfoV1>,
 ) -> u32 {
-    supervisor_evidence_detail(primordial_completion_case(error))
+    supervisor_evidence_detail(primordial_completion_case(error, terminal_info))
 }
 
 impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandler
