@@ -31,9 +31,9 @@ use crate::wait::{
 
 use super::adapters::{
     CleanupQueue, NativeWaitControl, TerminalWaitCleanup, WaitSuspendError, atomic_wake_with,
-    channel_create, channel_receive, channel_send, clock_get_with, event_create, event_signal,
-    process_create, resume_wait_thread_syscall, timer_cancel, timer_create, timer_set,
-    wait_many_syscall_on, wait_one_syscall_on,
+    channel_create, channel_receive, channel_send_from_thread, clock_get_with, event_create,
+    event_signal, process_create, resume_wait_thread_syscall, timer_cancel, timer_create,
+    timer_set, wait_many_syscall_on, wait_one_syscall_on,
 };
 use super::native::{
     NativeIdleSuspendPoll, NativeSuspendPlan, NativeSyscallRequest, NativeSyscallResult,
@@ -298,7 +298,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
                 transfers,
                 transfer_count,
                 flags,
-            } => FServiceRoute::Handled(NativeSyscallResult::returning(channel_send(
+            } => FServiceRoute::Handled(NativeSyscallResult::returning(channel_send_from_thread(
                 user,
                 channel_staging,
                 registry,
@@ -307,6 +307,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
                 tasks,
                 execution,
                 current_process,
+                Some(current_thread),
                 channel,
                 bytes,
                 byte_len,

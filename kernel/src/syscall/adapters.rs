@@ -2018,6 +2018,60 @@ pub(crate) fn channel_send<
     flags: u64,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> DwStatus {
+    channel_send_from_thread(
+        user,
+        staging,
+        registry,
+        channels,
+        waits,
+        tasks,
+        execution,
+        current_process,
+        None,
+        channel,
+        bytes,
+        byte_len,
+        transfers,
+        transfer_count,
+        flags,
+        cleanup,
+    )
+}
+
+/// F-service dispatch carries the exact current Thread. The legacy
+/// crate-private adapter facade remains useful to host tests that model a
+/// Channel transaction without a live syscall caller.
+pub(crate) fn channel_send_from_thread<
+    U: UserPageAccess,
+    const OBJECTS: usize,
+    const PAIRS: usize,
+    const DEPTH: usize,
+    const WAITERS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EXECUTION: usize,
+>(
+    user: &mut U,
+    staging: &mut [u8],
+    registry: &mut ObjectRegistry<OBJECTS>,
+    channels: &ChannelAuthority<PAIRS, DEPTH>,
+    waits: &WaitRegistry<WAITERS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    current_process: ProcessKey,
+    #[cfg_attr(not(deepwyrm_dw1c_evidence), allow(unused_variables))] current_thread: Option<
+        ThreadKey,
+    >,
+    channel: DwHandle,
+    bytes: DwUserAddress,
+    byte_len: u32,
+    transfers: DwUserAddress,
+    transfer_count: u32,
+    flags: u64,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
     if byte_len > DW_CHANNEL_MAX_PAYLOAD || transfer_count > DW_CHANNEL_MAX_HANDLES || flags != 0 {
         return DW_STATUS_INVALID_ARGUMENT;
     }
@@ -2147,8 +2201,22 @@ pub(crate) fn channel_send<
     let send_reservation = match channels.reserve_send(endpoint, &staging[..byte_len]) {
         Ok(reservation) => reservation,
         Err(error) => {
+            #[cfg(deepwyrm_dw1c_evidence)]
+            let token7_full_send = error == ChannelError::WouldBlock
+                && current_thread.is_some_and(|thread| {
+                    crate::test_support::DW1C_EVIDENCE.tracks_token7_actor(current_process, thread)
+                });
             drop(prepared);
             release_lookup_pin(registry, pin, cleanup);
+            #[cfg(deepwyrm_dw1c_evidence)]
+            if token7_full_send {
+                let thread = current_thread.expect("token-7 filter retained caller Thread");
+                crate::test_support::DW1C_EVIDENCE
+                    .observe_token7_full_send(current_process, thread, endpoint, peer_object)
+                    .unwrap_or_else(|error| {
+                        panic!("selector-28 token-7 full-send observation failed: {error:?}")
+                    });
+            }
             return channel_status(error);
         }
     };
@@ -2414,8 +2482,25 @@ pub(crate) fn channel_receive<
         Some(&result_bytes),
     ]);
     release_lookup_pin(registry, pin, cleanup);
-    complete_wait_wakes(registry, execution, wakes, cleanup);
+    complete_channel_receive_wait_wakes(registry, execution, endpoint, wakes, cleanup);
     DW_STATUS_SUCCESS
+}
+
+/// A Channel receive is the one wake producer which can prove that capacity
+/// was restored on the peer endpoint.  Keep this provenance private to the
+/// adapter; generic Event/Timer/exit wake batches retain their existing path.
+fn complete_channel_receive_wait_wakes<
+    const OBJECTS: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    execution: &ExecutionDomain<EXECUTION>,
+    drained_peer: ChannelEndpointKey,
+    wakes: WakeBatch<WAITERS>,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) {
+    complete_wait_wakes_with_channel_drain(registry, execution, wakes, cleanup, Some(drained_peer));
 }
 
 pub(crate) fn complete_wait_wakes<
@@ -2427,6 +2512,22 @@ pub(crate) fn complete_wait_wakes<
     execution: &ExecutionDomain<EXECUTION>,
     wakes: WakeBatch<WAITERS>,
     cleanup: &mut CleanupQueue<OBJECTS>,
+) {
+    complete_wait_wakes_with_channel_drain(registry, execution, wakes, cleanup, None);
+}
+
+fn complete_wait_wakes_with_channel_drain<
+    const OBJECTS: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    execution: &ExecutionDomain<EXECUTION>,
+    wakes: WakeBatch<WAITERS>,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+    #[cfg_attr(not(deepwyrm_dw1c_evidence), allow(unused_variables))] drained_peer: Option<
+        ChannelEndpointKey,
+    >,
 ) {
     let (wake_intents, wait_pins) = wakes.into_parts();
     for wake in wake_intents.into_iter().flatten() {
@@ -2444,7 +2545,26 @@ pub(crate) fn complete_wait_wakes<
             .try_claim_winner(wake.wake_key(), winner)
         {
             Ok(true) => match execution.wake(wake.wake_key()) {
-                Ok(()) | Err(SchedulerError::StaleBlockToken) => {}
+                Ok(()) => {
+                    #[cfg(deepwyrm_dw1c_evidence)]
+                    if let Some(peer) = drained_peer.filter(|_| {
+                        crate::test_support::DW1C_EVIDENCE
+                            .tracks_token7_thread(wake.wake_key().thread())
+                    }) {
+                        crate::test_support::DW1C_EVIDENCE
+                            .observe_token7_peer_drain_wake(
+                                wake.wake_key().thread(),
+                                wake.wake_key().execution_generation(),
+                                peer,
+                                wake.wake_key().token(),
+                                wake.observed().0,
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!("selector-28 token-7 wake observation failed: {error:?}")
+                            });
+                    }
+                }
+                Err(SchedulerError::StaleBlockToken) => {}
                 Err(error) => {
                     panic!("waiter wake violated scheduler ownership: {error:?}")
                 }

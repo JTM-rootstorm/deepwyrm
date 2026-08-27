@@ -9,8 +9,11 @@
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
+use crate::ipc::ChannelEndpointKey;
+use crate::object::ObjectId;
 use crate::sync::SpinMutex;
 use crate::task::{ProcessKey, ThreadKey};
+use deepwyrm_abi::DW_SIGNAL_WRITABLE;
 
 pub(crate) const DW1C_EVIDENCE_RAW_SYSCALL: u32 = 0xffff_ff1c;
 pub(crate) const DW1C_EVIDENCE_RECORD_LEN: usize = 96;
@@ -162,9 +165,24 @@ struct State {
     token6_wait_joined: bool,
     token6_wake_seen: bool,
     token6_run_seen: bool,
+    token7: Option<Token7Flight>,
     facts: Dw1cKernelFacts,
     terminal: bool,
     failure: Option<Dw1cEvidenceError>,
+}
+
+/// The selector-owned Channel is deliberately bound only after ARM, from the
+/// exact token-7 caller's first failed capacity reservation.  The raw ARM
+/// table names actors, not arbitrary object IDs, so retaining this small
+/// generation-safe join avoids adding a selector ABI object-id encoding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Token7Flight {
+    endpoint: ChannelEndpointKey,
+    peer: ObjectId,
+    wake_token: Option<u64>,
+    blocked: bool,
+    wake_seen: bool,
+    run_seen: bool,
 }
 
 impl State {
@@ -189,6 +207,7 @@ impl State {
             token6_wait_joined: false,
             token6_wake_seen: false,
             token6_run_seen: false,
+            token7: None,
             facts: Dw1cKernelFacts {
                 cpu_ready: 0,
                 run: 0,
@@ -538,6 +557,134 @@ impl Dw1cEvidenceCollector {
     pub(crate) fn tracks_thread(&self, thread: ThreadKey) -> bool {
         let state = self.state.lock();
         state.installed && actor_thread_known(&state, thread)
+    }
+
+    /// Global IPC activity is intentionally filtered before the strict
+    /// token-7 observers below.  Only the exact post-ARM actor may bind or
+    /// advance the selector-owned Channel flight.
+    pub(crate) fn tracks_token7_actor(&self, process: ProcessKey, thread: ThreadKey) -> bool {
+        let state = self.state.lock();
+        state.installed
+            && state
+                .actors
+                .get(6)
+                .and_then(|actor| *actor)
+                .is_some_and(|actor| actor.process == process && actor.thread == thread)
+    }
+
+    pub(crate) fn tracks_token7_thread(&self, thread: ThreadKey) -> bool {
+        let state = self.state.lock();
+        state.installed
+            && state
+                .actors
+                .get(6)
+                .and_then(|actor| *actor)
+                .is_some_and(|actor| actor.thread == thread)
+    }
+
+    /// Binds the selector-owned endpoint on the exact token-7 Process/Thread
+    /// first post-ARM send that fails solely because its peer queue is full.
+    /// The caller has already released Channel and object-authority pins.
+    pub(crate) fn observe_token7_full_send(
+        &self,
+        process: ProcessKey,
+        thread: ThreadKey,
+        endpoint: ChannelEndpointKey,
+        peer: ObjectId,
+    ) -> Result<(), Dw1cEvidenceError> {
+        let mut state = self.state.lock();
+        if !state.installed || state.reporter.is_none() {
+            return Err(state.latch(Dw1cEvidenceError::Early));
+        }
+        if !state
+            .actors
+            .get(6)
+            .and_then(|actor| *actor)
+            .is_some_and(|actor| actor.process == process && actor.thread == thread)
+        {
+            return Err(state.latch(Dw1cEvidenceError::WrongActor));
+        }
+        if endpoint.object_id() == peer || state.token7.is_some() {
+            return Err(state.latch(Dw1cEvidenceError::Duplicate));
+        }
+        state.token7 = Some(Token7Flight {
+            endpoint,
+            peer,
+            wake_token: None,
+            blocked: false,
+            wake_seen: false,
+            run_seen: false,
+        });
+        Ok(())
+    }
+
+    /// Records the scheduler-committed blocked state for the one registered,
+    /// exact-WRITABLE wait on token 7's bound endpoint.  `begin_registered_wait`
+    /// calls this only after both WaitSet registration and scheduler block
+    /// commit have completed.
+    pub(crate) fn observe_token7_writable_block(
+        &self,
+        thread: ThreadKey,
+        generation: u64,
+        endpoint: ChannelEndpointKey,
+        wake_token: u64,
+    ) -> Result<(), Dw1cEvidenceError> {
+        let mut state = self.state.lock();
+        let Some(actor) = state.actors.get(6).and_then(|actor| *actor) else {
+            return Err(state.latch(Dw1cEvidenceError::Early));
+        };
+        if actor.thread != thread || actor.execution_generation != generation {
+            return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
+        }
+        let Some(flight) = state.token7.as_mut() else {
+            return Err(state.latch(Dw1cEvidenceError::MissingKernelFact));
+        };
+        if flight.endpoint != endpoint
+            || wake_token == 0
+            || flight.blocked
+            || flight.wake_token.is_some()
+            || flight.run_seen
+        {
+            return Err(state.latch(Dw1cEvidenceError::Contradiction));
+        }
+        flight.wake_token = Some(wake_token);
+        flight.blocked = true;
+        Ok(())
+    }
+
+    /// Records only a capacity-producing receive on token 7's exact peer,
+    /// after it won the exact blocked-operation generation and scheduler wake
+    /// mutation succeeded.  A close, an unrelated peer, signal, or wake key
+    /// cannot advance this join.
+    pub(crate) fn observe_token7_peer_drain_wake(
+        &self,
+        thread: ThreadKey,
+        generation: u64,
+        drained_peer: ChannelEndpointKey,
+        wake_token: u64,
+        observed: u64,
+    ) -> Result<(), Dw1cEvidenceError> {
+        let mut state = self.state.lock();
+        let Some(actor) = state.actors.get(6).and_then(|actor| *actor) else {
+            return Err(state.latch(Dw1cEvidenceError::Early));
+        };
+        if actor.thread != thread || actor.execution_generation != generation {
+            return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
+        }
+        let Some(flight) = state.token7.as_mut() else {
+            return Err(state.latch(Dw1cEvidenceError::MissingKernelFact));
+        };
+        if !flight.blocked
+            || flight.wake_token != Some(wake_token)
+            || flight.peer != drained_peer.object_id()
+            || observed & DW_SIGNAL_WRITABLE.0 == 0
+            || flight.wake_seen
+            || flight.run_seen
+        {
+            return Err(state.latch(Dw1cEvidenceError::Contradiction));
+        }
+        flight.wake_seen = true;
+        Ok(())
     }
 
     pub(crate) fn observe_quantum_expiry(
@@ -1026,6 +1173,47 @@ fn retain_cpu_payload(
     if kind == 0 && token == 6 && !state.token6_wake_seen {
         return Err(state.latch(Dw1cEvidenceError::MissingKernelFact));
     }
+    if kind == 0 && token == 7 {
+        let Some(flight) = state.token7.as_mut() else {
+            // Token 7 may execute normally before its selector-owned
+            // backpressure transaction begins.  Only a RUN after binding is
+            // part of bit 1's strict ordering relation.
+            return retain_cpu_payload_after_race_checks(
+                state,
+                bit,
+                index,
+                token,
+                execution_generation,
+                value,
+                kind,
+            );
+        };
+        if !flight.wake_seen || flight.run_seen {
+            return Err(state.latch(Dw1cEvidenceError::Contradiction));
+        }
+        flight.run_seen = true;
+        update_race_bit_one(state);
+    }
+    retain_cpu_payload_after_race_checks(
+        state,
+        bit,
+        index,
+        token,
+        execution_generation,
+        value,
+        kind,
+    )
+}
+
+fn retain_cpu_payload_after_race_checks(
+    state: &mut State,
+    bit: u8,
+    index: usize,
+    token: u8,
+    execution_generation: u64,
+    value: u64,
+    kind: u8,
+) -> Result<(), Dw1cEvidenceError> {
     let payload = Dw1cRecordPayload {
         subject: u64::from(token),
         generation: execution_generation,
@@ -1075,6 +1263,14 @@ fn update_race_bit_zero(state: &mut State) {
         && state.progress.iter().any(|count| *count != 0)
     {
         state.facts.race_matrix |= 1;
+    }
+}
+
+fn update_race_bit_one(state: &mut State) {
+    if state.token7.is_some_and(|flight| {
+        flight.blocked && flight.wake_seen && flight.run_seen && flight.wake_token.is_some()
+    }) {
+        state.facts.race_matrix |= 1 << 1;
     }
 }
 
@@ -1247,7 +1443,7 @@ pub(crate) static DW1C_EVIDENCE: Dw1cEvidenceCollector = Dw1cEvidenceCollector::
 mod tests {
     use super::*;
     use crate::object::ObjectRegistry;
-    use deepwyrm_abi::{DW_OBJECT_TYPE_PROCESS, DW_OBJECT_TYPE_THREAD};
+    use deepwyrm_abi::{DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_PROCESS, DW_OBJECT_TYPE_THREAD};
     fn actor(n: u8) -> Dw1cActor {
         let mut r = ObjectRegistry::<2>::new();
         let p = ProcessKey::from_object_id(r.create(DW_OBJECT_TYPE_PROCESS).unwrap().id());
@@ -1310,6 +1506,37 @@ mod tests {
         observe_prospective_actors(&collector, &actors);
         collector.arm(reporter, actors).unwrap();
         (collector, actors)
+    }
+
+    fn channel_endpoints() -> (ChannelEndpointKey, ChannelEndpointKey) {
+        let mut registry = ObjectRegistry::<2>::new();
+        let endpoint = ChannelEndpointKey::from_object_id(
+            registry.create(DW_OBJECT_TYPE_CHANNEL).unwrap().id(),
+        );
+        let peer = ChannelEndpointKey::from_object_id(
+            registry.create(DW_OBJECT_TYPE_CHANNEL).unwrap().id(),
+        );
+        (endpoint, peer)
+    }
+
+    fn token7_full_blocked(
+        collector: &Dw1cEvidenceCollector,
+        actors: &[Dw1cActor; DW1C_ACTOR_COUNT],
+        endpoint: ChannelEndpointKey,
+        peer: ChannelEndpointKey,
+    ) {
+        let token7 = actors[6];
+        collector
+            .observe_token7_full_send(token7.process, token7.thread, endpoint, peer.object_id())
+            .unwrap();
+        collector
+            .observe_token7_writable_block(
+                token7.thread,
+                token7.execution_generation,
+                endpoint,
+                0x71,
+            )
+            .unwrap();
     }
 
     fn decoded_payload(record: &[u8; DW1C_EVIDENCE_RECORD_LEN]) -> Dw1cRecordPayload {
@@ -1534,6 +1761,118 @@ mod tests {
         assert_eq!(
             collector.state.lock().failure,
             Some(Dw1cEvidenceError::WrongGeneration)
+        );
+    }
+
+    #[test]
+    fn token7_full_registered_writable_peer_drain_wake_then_run_sets_only_bit_one() {
+        let (collector, actors) = armed_collector();
+        let token7 = actors[6];
+        let (endpoint, peer) = channel_endpoints();
+        token7_full_blocked(&collector, &actors, endpoint, peer);
+        collector
+            .observe_token7_peer_drain_wake(
+                token7.thread,
+                token7.execution_generation,
+                peer,
+                0x71,
+                DW_SIGNAL_WRITABLE.0,
+            )
+            .unwrap();
+        collector
+            .observe_running_claim(0, token7.thread, token7.execution_generation)
+            .unwrap();
+        assert_eq!(collector.state.lock().facts.race_matrix & (1 << 1), 1 << 1);
+    }
+
+    #[test]
+    fn token7_rejects_block_without_full_send_and_ready_registration_without_block() {
+        let (no_full, actors) = armed_collector();
+        let token7 = actors[6];
+        let (endpoint, _peer) = channel_endpoints();
+        assert_eq!(
+            no_full.observe_token7_writable_block(
+                token7.thread,
+                token7.execution_generation,
+                endpoint,
+                0x71,
+            ),
+            Err(Dw1cEvidenceError::MissingKernelFact)
+        );
+
+        let (ready, actors) = armed_collector();
+        let token7 = actors[6];
+        let (endpoint, peer) = channel_endpoints();
+        ready
+            .observe_token7_full_send(token7.process, token7.thread, endpoint, peer.object_id())
+            .unwrap();
+        assert_eq!(
+            ready.observe_token7_peer_drain_wake(
+                token7.thread,
+                token7.execution_generation,
+                peer,
+                0x71,
+                DW_SIGNAL_WRITABLE.0,
+            ),
+            Err(Dw1cEvidenceError::Contradiction)
+        );
+    }
+
+    #[test]
+    fn token7_rejects_wrong_peer_signals_or_wake_key_and_run_before_wake() {
+        let (wrong_peer, actors) = armed_collector();
+        let token7 = actors[6];
+        let (endpoint, peer) = channel_endpoints();
+        let (_other_endpoint, other_peer) = channel_endpoints();
+        token7_full_blocked(&wrong_peer, &actors, endpoint, peer);
+        assert_eq!(
+            wrong_peer.observe_token7_peer_drain_wake(
+                token7.thread,
+                token7.execution_generation,
+                other_peer,
+                0x71,
+                DW_SIGNAL_WRITABLE.0,
+            ),
+            Err(Dw1cEvidenceError::Contradiction)
+        );
+
+        let (wrong_signals, actors) = armed_collector();
+        let token7 = actors[6];
+        let (endpoint, peer) = channel_endpoints();
+        token7_full_blocked(&wrong_signals, &actors, endpoint, peer);
+        assert_eq!(
+            wrong_signals.observe_token7_peer_drain_wake(
+                token7.thread,
+                token7.execution_generation,
+                peer,
+                0x72,
+                DW_SIGNAL_WRITABLE.0,
+            ),
+            Err(Dw1cEvidenceError::Contradiction)
+        );
+
+        let (missing_writable, actors) = armed_collector();
+        let token7 = actors[6];
+        let (endpoint, peer) = channel_endpoints();
+        token7_full_blocked(&missing_writable, &actors, endpoint, peer);
+        assert_eq!(
+            missing_writable.observe_token7_peer_drain_wake(
+                token7.thread,
+                token7.execution_generation,
+                peer,
+                0x71,
+                0,
+            ),
+            Err(Dw1cEvidenceError::Contradiction)
+        );
+
+        let (run_first, actors) = armed_collector();
+        let token7 = actors[6];
+        let (endpoint, peer) = channel_endpoints();
+        token7_full_blocked(&run_first, &actors, endpoint, peer);
+        assert_eq!(
+            run_first.observe_running_claim(0, token7.thread, token7.execution_generation),
+            Err(Dw1cEvidenceError::Contradiction)
         );
     }
 

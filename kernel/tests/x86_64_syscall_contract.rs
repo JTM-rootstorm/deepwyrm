@@ -230,6 +230,61 @@ fn i1_native_adapter_phases_revalidate_exact_identity_after_guard_free_work() {
 }
 
 #[test]
+fn dw1c_token7_channel_flight_is_capacity_only_and_post_authority() {
+    let adapters = source("src/syscall/adapters.rs");
+    let send = adapters
+        .split_once("pub(crate) fn channel_send_from_thread<")
+        .expect("threaded Channel send adapter")
+        .1
+        .split_once("pub(crate) fn channel_receive<")
+        .expect("threaded Channel send extent")
+        .0;
+    let would_block = send
+        .find("error == ChannelError::WouldBlock")
+        .expect("token-7 requires capacity failure");
+    let release = send[would_block..]
+        .find("release_lookup_pin(registry, pin, cleanup);")
+        .map(|offset| would_block + offset)
+        .expect("Channel send releases lookup pin");
+    let observe = send[release..]
+        .find(".observe_token7_full_send(")
+        .map(|offset| release + offset)
+        .expect("token-7 full-send observer");
+    assert!(would_block < release && release < observe);
+    assert!(send.contains("tracks_token7_actor(current_process, thread)"));
+    assert!(!send[..observe].contains("ChannelError::PeerClosed"));
+
+    let wait = source("src/wait/engine.rs");
+    let exact = wait
+        .split_once("fn exact_writable_channel(&self)")
+        .expect("token-7 exact wait helper")
+        .1
+        .split_once("pub(crate) fn select_ready")
+        .expect("token-7 exact wait helper extent")
+        .0;
+    assert!(exact.contains("if self.len != 1"));
+    assert!(exact.contains("item.desired == DW_SIGNAL_WRITABLE"));
+    let commit = wait.find(".commit_published_block_on(cpu, block)").unwrap();
+    let block_observe = wait.find(".observe_token7_writable_block(").unwrap();
+    assert!(commit < block_observe);
+
+    let receive = adapters
+        .split_once("fn complete_wait_wakes_with_channel_drain<")
+        .expect("provenance-preserving wake helper")
+        .1;
+    let success = receive.find("Ok(()) => {").unwrap();
+    let wake_observe = receive.find(".observe_token7_peer_drain_wake(").unwrap();
+    let stale = receive
+        .find("Err(SchedulerError::StaleBlockToken) => {}")
+        .unwrap();
+    let prior_winner = receive
+        .find("Ok(false) | Err(crate::task::BlockedOperationError::StaleReservation)")
+        .unwrap();
+    assert!(success < wake_observe && wake_observe < stale && wake_observe < prior_winner);
+    assert!(adapters.contains("Some(drained_peer)"));
+}
+
+#[test]
 fn address_region_adapter_source_contract_tracks_the_private_module() {
     let facade = source("src/syscall/adapters.rs");
     let address_region = source("src/syscall/adapters/address_region.rs");

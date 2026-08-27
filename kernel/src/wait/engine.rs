@@ -4,6 +4,8 @@ use deepwyrm_abi::{
 };
 
 use crate::handle::{AcceptedObjectTypes, HandleTableError, ResolvedHandle};
+#[cfg(deepwyrm_dw1c_evidence)]
+use crate::ipc::ChannelEndpointKey;
 use crate::ipc::{ChannelAuthority, ChannelError, ChannelWaitOutcome};
 use crate::object::{FinalRelease, ObjectRegistry};
 use crate::task::{
@@ -11,6 +13,8 @@ use crate::task::{
     ProcessKey, ScheduleDecision, SchedulerError, TaskAuthority, TaskError, ThreadKey,
 };
 use crate::time::{DeadlineRegistration, TimerAuthority, TimerError, TimerWaitOutcome};
+#[cfg(deepwyrm_dw1c_evidence)]
+use deepwyrm_abi::DW_SIGNAL_WRITABLE;
 
 use super::operation::{WaitOperation, WaitOperationError, WaitOperationRegistry};
 use super::{
@@ -221,6 +225,19 @@ impl ResolvedWaitSet {
 
     pub(crate) const fn len(&self) -> usize {
         self.len
+    }
+
+    /// Selector-28's token-7 flight accepts precisely one registered
+    /// WRITABLE Channel item.  This is sampled before registration consumes
+    /// the set; its fact is published only after the scheduler commits Blocked.
+    #[cfg(deepwyrm_dw1c_evidence)]
+    fn exact_writable_channel(&self) -> Option<ChannelEndpointKey> {
+        if self.len != 1 {
+            return None;
+        }
+        let item = self.items[0].as_ref()?;
+        (item.target.object_type() == DW_OBJECT_TYPE_CHANNEL && item.desired == DW_SIGNAL_WRITABLE)
+            .then(|| ChannelEndpointKey::from_object_id(item.target.object_id()))
     }
 
     pub(crate) fn select_ready<
@@ -614,6 +631,9 @@ pub(crate) fn begin_registered_wait<
         thread,
     } = context;
 
+    #[cfg(deepwyrm_dw1c_evidence)]
+    let token7_writable_channel = set.exact_writable_channel();
+
     match set.select_ready(tasks, &sources) {
         Ok(Some(selection)) => {
             set.release(registry);
@@ -904,6 +924,21 @@ pub(crate) fn begin_registered_wait<
                         .unwrap_or_else(|failure| {
                             panic!("F7 registered block commit drifted: {:?}", failure.error())
                         });
+                    #[cfg(deepwyrm_dw1c_evidence)]
+                    if let Some(endpoint) = token7_writable_channel
+                        .filter(|_| crate::test_support::DW1C_EVIDENCE.tracks_token7_thread(thread))
+                    {
+                        crate::test_support::DW1C_EVIDENCE
+                            .observe_token7_writable_block(
+                                thread,
+                                wake.execution_generation(),
+                                endpoint,
+                                wake.token(),
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!("selector-28 token-7 block observation failed: {error:?}")
+                            });
+                    }
                     Ok(WaitBeginOutcome::Suspended { wake, decision })
                 }
                 Err(error) => panic!("fresh F7 winner ledger disappeared: {error:?}"),
