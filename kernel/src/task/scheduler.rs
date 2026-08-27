@@ -1613,6 +1613,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         state.preemption_disable_depth[cpu.index()] = state.preemption_disable_depth[cpu.index()]
             .checked_add(1)
             .ok_or(SchedulerError::PreemptionDepthOverflow)?;
+        state.assert_invariants();
         Ok(())
     }
 
@@ -1621,8 +1622,10 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         state.preemption_disable_depth[cpu.index()] = state.preemption_disable_depth[cpu.index()]
             .checked_sub(1)
             .ok_or(SchedulerError::PreemptionDepthUnderflow)?;
-        Ok(state.preemption_disable_depth[cpu.index()] == 0
-            && state.need_resched[cpu.index()].is_some())
+        let ready = state.preemption_disable_depth[cpu.index()] == 0
+            && state.need_resched[cpu.index()].is_some();
+        state.assert_invariants();
+        Ok(ready)
     }
 
     /// Consumes the current CPU's exact request at a guard-free CPL3 return boundary.
