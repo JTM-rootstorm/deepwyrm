@@ -1485,6 +1485,7 @@ fn wake_reports_exact_continuation_owner_until_switch_completion() {
         scheduler
             .complete_switch_on_with_runnable_publication(suspended)
             .unwrap()
+            .runnable_publication()
             .expect("released Runnable reports its exact queue target")
             .target(),
         cpu(2)
@@ -1493,6 +1494,106 @@ fn wake_reports_exact_continuation_owner_until_switch_completion() {
         scheduler.schedule_next_on(cpu(3)).unwrap().current,
         Some(blocked_thread)
     );
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn completed_switch_generation_is_exact_and_stale_completion_cannot_advance_it() {
+    let scheduler = CooperativeScheduler::<2>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let first = thread_key(&mut registry);
+    let second = thread_key(&mut registry);
+    for thread in [first, second] {
+        scheduler
+            .commit_on(cpu(1), scheduler.reserve(thread).unwrap())
+            .unwrap();
+    }
+    assert_eq!(
+        scheduler.schedule_next_on(cpu(1)).unwrap().current,
+        Some(first)
+    );
+
+    let first_ticket = scheduler.prepare_quantum_on(cpu(1), 1).unwrap();
+    assert_eq!(scheduler.publish_quantum_expiry(first_ticket), Ok(true));
+    let first_outgoing = match scheduler.preempt_current_on(cpu(1)).unwrap() {
+        SchedulerPreemptionDecision::Switch { outgoing, .. } => outgoing,
+        decision => panic!("exact expiry did not prepare a switch: {decision:?}"),
+    };
+    let first_completed = scheduler
+        .complete_switch_on_with_runnable_publication(first_outgoing)
+        .unwrap();
+    assert_eq!(first_completed.generation(), 1);
+    assert!(first_completed.involuntary_preemption());
+    assert_eq!(
+        scheduler.complete_switch_on_with_runnable_publication(first_outgoing),
+        Err(SchedulerError::StaleExecutionClaim)
+    );
+
+    let second_ticket = scheduler.prepare_quantum_on(cpu(1), 2).unwrap();
+    assert_eq!(scheduler.publish_quantum_expiry(second_ticket), Ok(true));
+    let second_outgoing = match scheduler.preempt_current_on(cpu(1)).unwrap() {
+        SchedulerPreemptionDecision::Switch { outgoing, .. } => outgoing,
+        decision => panic!("replacement expiry did not prepare a switch: {decision:?}"),
+    };
+    let second_completed = scheduler
+        .complete_switch_on_with_runnable_publication(second_outgoing)
+        .unwrap();
+    assert_eq!(second_completed.generation(), 2);
+    assert!(second_completed.involuntary_preemption());
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn completed_switch_generation_rollover_is_atomic_and_retryable() {
+    let scheduler = CooperativeScheduler::<2>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let first = thread_key(&mut registry);
+    let second = thread_key(&mut registry);
+    for thread in [first, second] {
+        scheduler
+            .commit_on(cpu(2), scheduler.reserve(thread).unwrap())
+            .unwrap();
+    }
+    assert_eq!(
+        scheduler.schedule_next_on(cpu(2)).unwrap().current,
+        Some(first)
+    );
+    let ticket = scheduler.prepare_quantum_on(cpu(2), 1).unwrap();
+    assert_eq!(scheduler.publish_quantum_expiry(ticket), Ok(true));
+    let outgoing = match scheduler.preempt_current_on(cpu(2)).unwrap() {
+        SchedulerPreemptionDecision::Switch { outgoing, .. } => outgoing,
+        decision => panic!("exact expiry did not prepare a switch: {decision:?}"),
+    };
+    {
+        scheduler.state.lock().next_completed_switch_generation = u64::MAX;
+    }
+
+    assert_eq!(
+        scheduler.complete_switch_on_with_runnable_publication(outgoing),
+        Err(SchedulerError::TokenExhausted)
+    );
+    assert_eq!(scheduler.suspended_claim_on(cpu(2)), Some(outgoing));
+    assert_eq!(scheduler.current_on(cpu(2)), Some(second));
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+
+    {
+        scheduler.state.lock().next_completed_switch_generation = 0;
+    }
+    assert_eq!(
+        scheduler.complete_switch_on_with_runnable_publication(outgoing),
+        Err(SchedulerError::TokenExhausted)
+    );
+    assert_eq!(scheduler.suspended_claim_on(cpu(2)), Some(outgoing));
+
+    {
+        scheduler.state.lock().next_completed_switch_generation = 41;
+    }
+    let completed = scheduler
+        .complete_switch_on_with_runnable_publication(outgoing)
+        .unwrap();
+    assert_eq!(completed.generation(), 41);
+    assert!(completed.involuntary_preemption());
+    assert_eq!(scheduler.suspended_claim_on(cpu(2)), None);
     assert_eq!(scheduler.check_invariants(), Ok(()));
 }
 

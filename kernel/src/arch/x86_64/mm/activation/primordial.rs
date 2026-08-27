@@ -5430,6 +5430,119 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         NativeSyscallResult::returning(DW_STATUS_SUCCESS)
     }
 
+    #[cfg(deepwyrm_dw1c_evidence)]
+    fn intercept_dw1c_evidence_raw(
+        &mut self,
+        arguments: crate::syscall::RawSyscallArguments,
+    ) -> NativeSyscallResult {
+        use crate::test_support::{DW1C_ARM_BYTES, DW1C_EVIDENCE, DW1C_PROGRESS_MASK, Dw1cActor};
+
+        let values = arguments.as_array();
+        let controller = self.evidence_init_process == Some(self.process)
+            && self.shared.execution.current_thread_on(self.cpu) == Some(self.thread)
+            && self.tasks.thread_process(self.thread) == Ok(self.process)
+            && self.shared.execution.scheduler_state(self.thread)
+                == Some(SchedulerThreadState::Running);
+        let phase = self.reserve_runtime_phase();
+        match values[0] {
+            1 => {
+                if !controller
+                    || values[2] != 10
+                    || values[3] != DW1C_ARM_BYTES as u64
+                    || values[4] != 0
+                    || values[5] != 0
+                {
+                    crate::test_support::complete_fail(0x2810_e001)
+                }
+                // Authority is checked before usercopy.  The copied handles are
+                // inspected only; no handle/object reference is retained.
+                let bytes = {
+                    let mut user = self.active.current_process_address_space(
+                        self.active_root.as_ref().expect("active root"),
+                        self.process,
+                    );
+                    crate::syscall::copy_dw1c_evidence_input::<_, DW1C_ARM_BYTES>(
+                        &mut user,
+                        deepwyrm_abi::DwUserAddress(values[1]),
+                    )
+                    .unwrap_or_else(|_| crate::test_support::complete_fail(0x2810_e002))
+                };
+                if !controller {
+                    crate::test_support::complete_fail(0x2810_e003)
+                }
+                let entries = crate::test_support::dw1c_evidence::decode_arm_entries(&bytes)
+                    .unwrap_or_else(|_| crate::test_support::complete_fail(0x2810_e004));
+                let handles = self
+                    .tasks
+                    .process_handles(self.process)
+                    .unwrap_or_else(|_| crate::test_support::complete_fail(0x2810_e005));
+                let actors = core::array::from_fn(|index| {
+                    let (token, role, handle) = entries[index];
+                    let process = handles
+                        .process_target_for_dw1c_evidence(deepwyrm_abi::DwHandle(handle))
+                        .map(ProcessKey::from_object_id)
+                        .unwrap_or_else(|| crate::test_support::complete_fail(0x2810_e006));
+                    if self.tasks.process_lifecycle(process)
+                        != Ok(ProcessLifecycleState::AcceptingOperations)
+                    {
+                        crate::test_support::complete_fail(0x2810_e007)
+                    }
+                    let threads = self
+                        .tasks
+                        .process_thread_keys(process)
+                        .unwrap_or_else(|_| crate::test_support::complete_fail(0x2810_e008));
+                    let mut exact = None;
+                    for thread in threads.into_iter().flatten() {
+                        if exact.replace(thread).is_some() {
+                            crate::test_support::complete_fail(0x2810_e009)
+                        }
+                    }
+                    let thread =
+                        exact.unwrap_or_else(|| crate::test_support::complete_fail(0x2810_e00a));
+                    let generation = self
+                        .shared
+                        .execution
+                        .runnable_start_generation(thread)
+                        .unwrap_or_else(|| crate::test_support::complete_fail(0x2810_e00b));
+                    Dw1cActor {
+                        token: token as u8,
+                        role: role as u8,
+                        process,
+                        thread,
+                        execution_generation: generation,
+                    }
+                });
+                DW1C_EVIDENCE
+                    .arm((self.process, self.thread), actors)
+                    .unwrap_or_else(|_| crate::test_support::complete_fail(0x2810_e00c));
+            }
+            2 => {
+                if values[4] != 0 || values[5] != 0 {
+                    crate::test_support::complete_fail(0x2810_e010)
+                }
+                DW1C_EVIDENCE
+                    .progress(self.process, values[1], values[2], values[3])
+                    .unwrap_or_else(|_| crate::test_support::complete_fail(0x2810_e011));
+            }
+            3 => {
+                if !controller || values[3..].iter().any(|value| *value != 0) {
+                    crate::test_support::complete_fail(0x2810_e012)
+                }
+                if values[1] != u64::from(DW1C_PROGRESS_MASK) {
+                    crate::test_support::complete_fail(0x2810_e013)
+                }
+                let permit = DW1C_EVIDENCE
+                    .complete(self.process, values[1], values[2])
+                    .unwrap_or_else(|_| crate::test_support::complete_fail(0x2810_e014));
+                self.commit_runtime_phase(phase);
+                crate::test_support::complete_dw1c_evidence(permit)
+            }
+            _ => crate::test_support::complete_fail(0x2810_e015),
+        }
+        self.commit_runtime_phase(phase);
+        NativeSyscallResult::returning(DW_STATUS_SUCCESS)
+    }
+
     fn authorize_return(
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,

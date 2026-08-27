@@ -803,6 +803,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                     ticket.cpu().index() as u8,
                     ticket.thread(),
                     ticket.execution_generation(),
+                    ticket.source_arm_generation(),
                 )
                 .unwrap_or_else(|error| {
                     panic!("selector-28 QUANTUM observation failed: {error:?}")
@@ -826,20 +827,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         &self,
         cpu: SchedulerCpuId,
     ) -> Result<super::SchedulerPreemptionDecision, SchedulerError> {
-        let decision = self.scheduler.preempt_current_on(cpu)?;
-        #[cfg(deepwyrm_dw1c_evidence)]
-        if let super::SchedulerPreemptionDecision::Switch { outgoing, .. } = decision {
-            crate::test_support::DW1C_EVIDENCE
-                .observe_preemption_claim(
-                    cpu.index() as u8,
-                    outgoing.thread(),
-                    outgoing.generation(),
-                )
-                .unwrap_or_else(|error| {
-                    panic!("selector-28 PREEMPT observation failed: {error:?}")
-                });
-        }
-        Ok(decision)
+        self.scheduler.preempt_current_on(cpu)
     }
 
     pub(crate) fn preemption_disable_on(&self, cpu: SchedulerCpuId) -> Result<(), SchedulerError> {
@@ -953,8 +941,23 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         &self,
         claim: SchedulerExecutionClaim,
     ) -> Result<Option<super::RunnablePublication>, SchedulerError> {
-        self.scheduler
-            .complete_switch_on_with_runnable_publication(claim)
+        let completed = self
+            .scheduler
+            .complete_switch_on_with_runnable_publication(claim)?;
+        #[cfg(deepwyrm_dw1c_evidence)]
+        if completed.involuntary_preemption() {
+            crate::test_support::DW1C_EVIDENCE
+                .observe_preemption_claim(
+                    claim.cpu().index() as u8,
+                    claim.thread(),
+                    claim.generation(),
+                    completed.generation(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("selector-28 PREEMPT observation failed: {error:?}")
+                });
+        }
+        Ok(completed.runnable_publication())
     }
 
     pub(crate) fn running_claim_on(&self, cpu: SchedulerCpuId) -> Option<SchedulerExecutionClaim> {

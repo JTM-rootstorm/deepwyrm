@@ -245,6 +245,30 @@ pub(crate) struct RunnablePublication {
     continuation_bound: bool,
 }
 
+/// Exact successful continuation-release commit returned after scheduler
+/// authority has been dropped. Selector-private evidence consumes the
+/// generation only outside the scheduler lock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SchedulerCompletedSwitch {
+    runnable_publication: Option<RunnablePublication>,
+    generation: u64,
+    involuntary_preemption: bool,
+}
+
+impl SchedulerCompletedSwitch {
+    pub(crate) const fn runnable_publication(self) -> Option<RunnablePublication> {
+        self.runnable_publication
+    }
+
+    pub(crate) const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) const fn involuntary_preemption(self) -> bool {
+        self.involuntary_preemption
+    }
+}
+
 /// Exact identity of the most recently committed idle-steal migration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SchedulerMigrationRecord {
@@ -563,6 +587,7 @@ struct SchedulerState<const CAPACITY: usize> {
     next_migration_generation: u64,
     next_migration_eligibility_generation: u64,
     next_idle_generation: u64,
+    next_completed_switch_generation: u64,
     next_quantum_generation: [u64; H2_SCHEDULER_CPU_CAPACITY],
     queue: [Option<QueueEntry>; CAPACITY],
     len: usize,
@@ -592,6 +617,7 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             next_migration_generation: 1,
             next_migration_eligibility_generation: 1,
             next_idle_generation: 1,
+            next_completed_switch_generation: 1,
             next_quantum_generation: [1; H2_SCHEDULER_CPU_CAPACITY],
             queue: [None; CAPACITY],
             len: 0,
@@ -920,6 +946,18 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         Ok(generation)
     }
 
+    fn checked_completed_switch_generation(&self) -> Result<(u64, u64), SchedulerError> {
+        let generation = self.next_completed_switch_generation;
+        if generation == 0 {
+            return Err(SchedulerError::TokenExhausted);
+        }
+        let next = generation
+            .checked_add(1)
+            .filter(|next| *next != 0)
+            .ok_or(SchedulerError::TokenExhausted)?;
+        Ok((generation, next))
+    }
+
     fn clear_preemption_on(&mut self, cpu: SchedulerCpuId) -> Option<SchedulerQuantumTicket> {
         let cancelled = self.quantum[cpu.index()].take();
         self.need_resched[cpu.index()] = None;
@@ -961,6 +999,9 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
     fn check_invariants(&self) -> Result<(), SchedulerError> {
         if self.accounting.cpu.iter().any(|cpu| cpu.overflow_fault) {
             return Err(SchedulerError::AccountingOverflow);
+        }
+        if self.next_completed_switch_generation == 0 {
+            return Err(SchedulerError::TokenExhausted);
         }
         if self.len > CAPACITY || self.queue[self.len..].iter().any(Option::is_some) {
             return Err(SchedulerError::Capacity);
@@ -2188,7 +2229,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     pub(crate) fn complete_switch_on_with_runnable_publication(
         &self,
         claim: SchedulerExecutionClaim,
-    ) -> Result<Option<RunnablePublication>, SchedulerError> {
+    ) -> Result<SchedulerCompletedSwitch, SchedulerError> {
         let mut state = self.state.lock();
         if claim.domain != state.domain {
             return Err(SchedulerError::ForeignExecutionClaim);
@@ -2203,6 +2244,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         if suspended.thread != claim.thread || suspended.generation != claim.generation {
             return Err(SchedulerError::StaleExecutionClaim);
         }
+        let (completed_switch_generation, next_completed_switch_generation) =
+            state.checked_completed_switch_generation()?;
         let published_runnable = if suspended.publication == SuspendedPublication::Queued {
             let Some(index) = state.queue[..state.len]
                 .iter()
@@ -2246,9 +2289,14 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             }
             state.accounting = accounting;
         }
+        state.next_completed_switch_generation = next_completed_switch_generation;
         state.suspended[cpu_index] = None;
         state.assert_invariants();
-        Ok(published_runnable)
+        Ok(SchedulerCompletedSwitch {
+            runnable_publication: published_runnable,
+            generation: completed_switch_generation,
+            involuntary_preemption: suspended.involuntary_preemption,
+        })
     }
 
     pub(crate) fn retire_on(
