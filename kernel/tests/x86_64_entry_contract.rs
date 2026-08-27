@@ -246,6 +246,7 @@ fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
         "ipc-transfer-rollback",
         "wait-deadline-timer",
         "process-create-bootstrap",
+        "normal-preemption-smp",
     ] {
         assert!(
             kernel_build::select_guest_test(true, Some(selector), false, &harness).is_err(),

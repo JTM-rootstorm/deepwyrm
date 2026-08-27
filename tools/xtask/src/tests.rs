@@ -392,6 +392,23 @@ fn dw0f_selectors_distinguish_implemented_and_reserved_identities() {
 }
 
 #[test]
+fn dw1c_selector_28_is_reserved_until_live_implementation() {
+    let config = workspace_root().join(HARNESS_CONFIG);
+    let request_path = temp_file(
+        &request("guest-test", "normal-preemption-smp").replace("test_id = 1", "test_id = 28"),
+    );
+    let parsed = load_harness_request(&request_path).unwrap();
+    let error = validate_guest_selector_metadata(&config, &parsed)
+        .expect_err("reserved DW1-C selector must not produce a runnable artifact");
+    assert!(
+        error
+            .to_string()
+            .contains("is reserved and has no runnable artifact")
+    );
+    fs::remove_file(request_path).unwrap();
+}
+
+#[test]
 fn dw0g_primordial_selectors_have_stable_runnable_identities() {
     let config = workspace_root().join(HARNESS_CONFIG);
     for (selector, test_id) in [
