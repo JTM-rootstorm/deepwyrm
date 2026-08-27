@@ -1,0 +1,32 @@
+# Trusted host-only Rust identity for tests, Clippy, rustdoc, and xtask.
+#
+# The accepted Wyrmroot toolchain in rust-toolchain.toml remains the only
+# product/target compiler. This installed stable toolchain owns host gates;
+# the two lanes must never share a Cargo target directory.
+schema = "deepwyrm-host-rust-toolchain-identity-v1"
+tool_bin_directory = "/opt/rust-bin-1.97.1/bin"
+cargo_binary = "/opt/rust-bin-1.97.1/bin/cargo"
+cargo_sha256 = "828980723df339d62434390e9fb8ef8831036583343ae2316b7ab5646b5c1953"
+cargo_version = "cargo 1.97.1 (c980f4866 2026-06-30)"
+rustc_binary = "/opt/rust-bin-1.97.1/bin/rustc"
+rustc_sha256 = "d3a664c970a9fd8361b64194861bebc1ae37b9054e5ee3400dc1c9e691797eea"
+rustc_commit = "8bab26f4f68e0e26f0bb7960be334d5b520ea452"
+rustdoc_binary = "/opt/rust-bin-1.97.1/bin/rustdoc"
+rustdoc_sha256 = "3b0c7aef20e0dfdfe2dd19ddb0b40d3b744f76318a44031813f501e1912934df"
+rustfmt_binary = "/opt/rust-bin-1.97.1/bin/rustfmt"
+rustfmt_sha256 = "30de9e1efcd8f8fe7750e00d0c45ff8f4c480608ef1be5baf9ab6f1b4556e8f8"
+cargo_fmt_binary = "/opt/rust-bin-1.97.1/bin/cargo-fmt"
+cargo_fmt_sha256 = "07ce638a5be73e97defbf0864f32a64ed40a0b7682b85625e68790f9e68d19e9"
+cargo_clippy_binary = "/opt/rust-bin-1.97.1/bin/cargo-clippy"
+cargo_clippy_sha256 = "a0a3808dddb32f525601e608740ee7c1c5df86db4a7183ea945449f60d29509d"
+clippy_driver_binary = "/opt/rust-bin-1.97.1/bin/clippy-driver"
+clippy_driver_sha256 = "e8fa6ad666c353e4c9248fc67074cf160ff2a5dbd97debd20416b81d7f917373"
+rust_analyzer_binary = "/opt/rust-bin-1.97.1/bin/rust-analyzer"
+rust_analyzer_sha256 = "ee29a71ff067766ef636e36bc61d7caf529691486e3682ae3e3e3f0d3f739d6e"
+rust_src_root = "/opt/rust-bin-1.97.1/lib/rustlib/src/rust"
+rust_src_std_entry = "/opt/rust-bin-1.97.1/lib/rustlib/src/rust/library/std/src/lib.rs"
+rust_src_std_entry_sha256 = "5fc980c8807ac2e1489c36396812a509872ec55601b5a6dd36cbc33963a75969"
+rust_src_core_entry = "/opt/rust-bin-1.97.1/lib/rustlib/src/rust/library/core/src/lib.rs"
+rust_src_core_entry_sha256 = "0a92c00fda2d6e87aa5851941b19091e958a8eb979bec68e911de6b97ada3f3f"
+clang_binary = "/usr/lib/llvm/22/bin/clang-22"
+clang_sha256 = "02ee323c47e4647fec0ecafe250d96597d41826a56507fb2d6fcc553393d5d7c"

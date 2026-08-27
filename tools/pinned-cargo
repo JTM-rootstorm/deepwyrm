@@ -1,0 +1,162 @@
+#!/bin/sh
+set -eu
+
+usage() {
+    cat <<'EOF'
+Usage: DEEPWYRM_PINNED_TARGET_DIR=<absolute-isolated-path> tools/pinned-cargo <lane> <cargo-args...>
+
+Lanes:
+  target  Accepted Wyrmroot 1.97.1/a92dc7f7 product and freestanding builds.
+  host    Pinned stable 1.97.1 tests, Clippy, rustdoc, formatting, and xtask.
+
+The target directory must be beneath /tmp or deepwyrm/.tmp. The canonical
+deepwyrm/target directory is intentionally rejected so host and accepted
+toolchain artifacts cannot contaminate one another.
+EOF
+}
+
+fail() {
+    printf 'pinned-cargo: %s\n' "$*" >&2
+    exit 2
+}
+
+config_value() {
+    config_path=$1
+    config_key=$2
+    awk -F ' = ' -v key="$config_key" '
+        $1 == key {
+            value = $2
+            sub(/^"/, "", value)
+            sub(/"$/, "", value)
+            print value
+            found = 1
+        }
+        END { if (!found) exit 1 }
+    ' "$config_path" || fail "$config_path omits $config_key"
+}
+
+verify_file() {
+    file_path=$1
+    expected_sha=$2
+    file_label=$3
+    [ -f "$file_path" ] || fail "$file_label is not a regular file: $file_path"
+    actual_sha=$(sha256sum -- "$file_path" | awk '{ print $1 }')
+    [ "$actual_sha" = "$expected_sha" ] || fail "$file_label hash mismatch: $file_path"
+}
+
+[ "$#" -ge 1 ] || {
+    usage >&2
+    exit 2
+}
+
+case "$1" in
+    -h|--help|help)
+        usage
+        exit 0
+        ;;
+    host|target)
+        lane=$1
+        shift
+        ;;
+    *)
+        usage >&2
+        fail "unknown lane: $1"
+        ;;
+esac
+[ "$#" -ge 1 ] || fail "missing Cargo arguments"
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+workspace=$(CDPATH='' cd -- "$script_dir/.." && pwd -P)
+project_root=$(CDPATH='' cd -- "$workspace/.." && pwd -P)
+
+target_dir=${DEEPWYRM_PINNED_TARGET_DIR:-}
+[ -n "$target_dir" ] || fail "DEEPWYRM_PINNED_TARGET_DIR is required"
+case "$target_dir" in
+    /tmp/*|"$workspace"/.tmp/*) ;;
+    *) fail "target directory must be beneath /tmp or $workspace/.tmp" ;;
+esac
+normalized_target=$(realpath -m -- "$target_dir")
+[ "$normalized_target" = "$target_dir" ] || fail "target directory must already be normalized"
+[ "$normalized_target" != "$workspace/target" ] || fail "canonical target/ is forbidden"
+
+unset RUSTUP_TOOLCHAIN RUSTC_BOOTSTRAP RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER
+unset CARGO_BUILD_RUSTC CARGO_BUILD_RUSTDOC CARGO_BUILD_RUSTC_WRAPPER
+unset CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTFLAGS RUSTFLAGS
+
+if [ "$lane" = host ]; then
+    identity="$workspace/tooling/host-rust-toolchain.toml"
+    [ "$(config_value "$identity" schema)" = "deepwyrm-host-rust-toolchain-identity-v1" ] || \
+        fail "unexpected host toolchain identity schema"
+    cargo=$(config_value "$identity" cargo_binary)
+    rustc=$(config_value "$identity" rustc_binary)
+    rustdoc=$(config_value "$identity" rustdoc_binary)
+    rustfmt=$(config_value "$identity" rustfmt_binary)
+    tool_bin=$(config_value "$identity" tool_bin_directory)
+    clang=$(config_value "$identity" clang_binary)
+    verify_file "$cargo" "$(config_value "$identity" cargo_sha256)" "host Cargo"
+    verify_file "$rustc" "$(config_value "$identity" rustc_sha256)" "host rustc"
+    verify_file "$rustdoc" "$(config_value "$identity" rustdoc_sha256)" "host rustdoc"
+    verify_file "$rustfmt" "$(config_value "$identity" rustfmt_sha256)" "host rustfmt"
+    verify_file "$(config_value "$identity" cargo_fmt_binary)" \
+        "$(config_value "$identity" cargo_fmt_sha256)" "host cargo-fmt"
+    verify_file "$(config_value "$identity" cargo_clippy_binary)" \
+        "$(config_value "$identity" cargo_clippy_sha256)" "host cargo-clippy"
+    verify_file "$(config_value "$identity" clippy_driver_binary)" \
+        "$(config_value "$identity" clippy_driver_sha256)" "host clippy-driver"
+    verify_file "$(config_value "$identity" rust_analyzer_binary)" \
+        "$(config_value "$identity" rust_analyzer_sha256)" "host rust-analyzer"
+    rust_src_root=$(config_value "$identity" rust_src_root)
+    [ -d "$rust_src_root" ] || fail "host rust-src root is not a directory: $rust_src_root"
+    verify_file "$(config_value "$identity" rust_src_std_entry)" \
+        "$(config_value "$identity" rust_src_std_entry_sha256)" "host rust-src std entry"
+    verify_file "$(config_value "$identity" rust_src_core_entry)" \
+        "$(config_value "$identity" rust_src_core_entry_sha256)" "host rust-src core entry"
+    verify_file "$clang" "$(config_value "$identity" clang_sha256)" "host Clang"
+    export RUSTDOC="$rustdoc"
+    export RUSTFMT="$rustfmt"
+    export PATH="$tool_bin:$PATH"
+else
+    identity="$workspace/tooling/rust-toolchain.toml"
+    [ "$(config_value "$identity" schema)" = "deepwyrm-rust-toolchain-identity-v1" ] || \
+        fail "unexpected accepted toolchain identity schema"
+    artifact_root=$(config_value "$identity" artifact_root)
+    toolchain_root=$(config_value "$identity" toolchain_root)
+    case "$artifact_root/$toolchain_root" in
+        *..*) fail "accepted toolchain identity contains traversal" ;;
+    esac
+    accepted_root="$project_root/$artifact_root/$toolchain_root"
+    cargo="$accepted_root/$(config_value "$identity" cargo_binary)"
+    rustc="$accepted_root/$(config_value "$identity" rustc_binary)"
+    rust_lld="$accepted_root/$(config_value "$identity" rust_lld_binary)"
+    host_identity="$workspace/tooling/host-rust-toolchain.toml"
+    clang=$(config_value "$host_identity" clang_binary)
+    verify_file "$cargo" "$(config_value "$identity" cargo_sha256)" "accepted Cargo"
+    verify_file "$rustc" "$(config_value "$identity" rustc_sha256)" "accepted rustc"
+    verify_file "$rust_lld" "$(config_value "$identity" rust_lld_sha256)" "accepted rust-lld"
+    verify_file "$clang" "$(config_value "$host_identity" clang_sha256)" "host Clang"
+    export DEEPWYRM_ACCEPTED_RUST_LLD="$rust_lld"
+fi
+
+mkdir -p -- "$normalized_target"
+target_marker="$normalized_target/.deepwyrm-pinned-cargo-v1"
+lane_identity="lane=$lane
+cargo_sha256=$(config_value "$identity" cargo_sha256)
+rustc_sha256=$(config_value "$identity" rustc_sha256)"
+if [ -e "$target_marker" ]; then
+    [ -f "$target_marker" ] && [ ! -L "$target_marker" ] || \
+        fail "target identity marker is not a regular non-symlink file"
+    [ "$(cat -- "$target_marker")" = "$lane_identity" ] || \
+        fail "target directory belongs to another pinned Cargo lane or toolchain"
+else
+    if find "$normalized_target" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+        fail "target directory is nonempty but has no pinned Cargo identity marker"
+    fi
+    printf '%s\n' "$lane_identity" >"$target_marker"
+fi
+
+export CARGO_TARGET_DIR="$normalized_target"
+export CARGO_INCREMENTAL=0
+export CARGO_NET_OFFLINE=true
+export RUSTC="$rustc"
+export DEEPWYRM_CLANG="$clang"
+exec "$cargo" "$@"
