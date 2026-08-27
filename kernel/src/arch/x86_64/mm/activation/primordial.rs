@@ -1041,6 +1041,54 @@ enum PreparedTerminalHandoff {
     IdleScheduler,
 }
 
+struct TerminalRetirementState {
+    retired_process: ProcessKey,
+    retired_root_key: crate::memory::address_region::AddressRegionObjectKey,
+    retired_address_space: crate::memory::address_region::AddressSpaceKey,
+    #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
+    retiring_wyr1_primordial: bool,
+    #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
+    wyr1_primordial_teardown: Option<(
+        crate::task::ProcessQuiescenceProof,
+        crate::task::BlockedOperationsDrained,
+    )>,
+}
+
+struct TerminalSuccessorState {
+    retirement: TerminalRetirementState,
+    stack: crate::memory::kernel_stack::KernelStackBounds,
+    continuation: u64,
+}
+
+enum TerminalKernelContinuation {
+    #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
+    RetireWyr1Primordial(TerminalRetirementState),
+    #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
+    RetireWyr1Child {
+        retirement: TerminalRetirementState,
+        proof: crate::task::ProcessQuiescenceProof,
+        drained: crate::task::BlockedOperationsDrained,
+    },
+    EnterPrimordialPublisher(TerminalRetirementState),
+    FinishGenericChild(TerminalRetirementState),
+}
+
+enum PreparedTerminalStep {
+    SchedulerRoot {
+        prepared: PreparedSchedulerRootSwitch,
+        state: TerminalSuccessorState,
+    },
+    KernelRoot {
+        prepared: PreparedTerminalKernelRootSwitch,
+        continuation: TerminalKernelContinuation,
+    },
+    PrimordialRoot {
+        prepared: PreparedTerminalProcessRootSwitch,
+        retirement: TerminalRetirementState,
+    },
+    Final(PreparedTerminalHandoff),
+}
+
 /// Fixed CPU-local façade over the stationary runtime authorities.
 ///
 /// The live runtime façades serialize shared authority access separately; this
@@ -1923,6 +1971,37 @@ struct FailedStopRootSwitch {
     previous: super::ActiveRootSelection,
 }
 
+struct PreparedTerminalKernelRootSwitch {
+    flight: RootSwitchFlight,
+    prepared: super::PreparedKernelExecutionRootSwitch,
+}
+
+struct ExecutedTerminalKernelRootSwitch {
+    flight: RootSwitchFlight,
+    executed: super::ExecutedKernelExecutionRootSwitch,
+}
+
+struct FailedTerminalKernelRootSwitch {
+    flight: RootSwitchFlight,
+    error: super::RootBindingError,
+    previous: super::ActiveRootSelection,
+}
+
+struct PreparedTerminalProcessRootSwitch {
+    flight: RootSwitchFlight,
+    prepared: super::PreparedKernelToProcessRootSwitch,
+}
+
+struct ExecutedTerminalProcessRootSwitch {
+    flight: RootSwitchFlight,
+    executed: super::ExecutedKernelToProcessRootSwitch,
+}
+
+struct FailedTerminalProcessRootSwitch {
+    flight: RootSwitchFlight,
+    failure: super::KernelRootSelectionFailure,
+}
+
 struct PreparedApKernelRootEntry {
     flight: RootSwitchFlight,
     prepared: super::PreparedKernelRootEntry,
@@ -1966,6 +2045,37 @@ impl PreparedStopRootSwitch {
                 flight: self.flight,
                 error,
                 previous,
+            }),
+        }
+    }
+}
+
+impl PreparedTerminalKernelRootSwitch {
+    fn execute(self) -> Result<ExecutedTerminalKernelRootSwitch, FailedTerminalKernelRootSwitch> {
+        match self.prepared.execute(&mut super::LiveRootSwitchTarget) {
+            Ok(executed) => Ok(ExecutedTerminalKernelRootSwitch {
+                flight: self.flight,
+                executed,
+            }),
+            Err((error, previous)) => Err(FailedTerminalKernelRootSwitch {
+                flight: self.flight,
+                error,
+                previous,
+            }),
+        }
+    }
+}
+
+impl PreparedTerminalProcessRootSwitch {
+    fn execute(self) -> Result<ExecutedTerminalProcessRootSwitch, FailedTerminalProcessRootSwitch> {
+        match self.prepared.execute(&mut super::LiveRootSwitchTarget) {
+            Ok(executed) => Ok(ExecutedTerminalProcessRootSwitch {
+                flight: self.flight,
+                executed,
+            }),
+            Err(failure) => Err(FailedTerminalProcessRootSwitch {
+                flight: self.flight,
+                failure,
             }),
         }
     }
@@ -2273,6 +2383,99 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         failure.error
     }
 
+    fn prepare_terminal_kernel_root_switch(&mut self) -> PreparedTerminalKernelRootSwitch {
+        let previous = self.active_root.take_process();
+        let prepared = self
+            .active
+            .prepare_kernel_execution_root_switch(previous)
+            .unwrap_or_else(|(error, recovered)| {
+                self.active_root = CarrierActiveRoot::Process(recovered);
+                panic!("terminal kernel-root preflight failed: {error:?}")
+            });
+        let flight = self.begin_root_switch_flight();
+        PreparedTerminalKernelRootSwitch { flight, prepared }
+    }
+
+    fn commit_terminal_kernel_root_switch(&mut self, executed: ExecutedTerminalKernelRootSwitch) {
+        self.select_root_switch_flight(executed.flight);
+        let kernel = self
+            .active
+            .commit_kernel_execution_root_switch(executed.executed);
+        self.active_root = CarrierActiveRoot::Kernel(kernel);
+        self.finish_root_switch_flight(executed.flight);
+    }
+
+    fn cancel_terminal_kernel_root_switch(
+        &mut self,
+        failure: FailedTerminalKernelRootSwitch,
+    ) -> super::RootBindingError {
+        self.select_root_switch_flight(failure.flight);
+        self.active_root = CarrierActiveRoot::Process(failure.previous);
+        self.finish_root_switch_flight(failure.flight);
+        failure.error
+    }
+
+    fn prepare_terminal_primordial_root_switch(&mut self) -> PreparedTerminalProcessRootSwitch {
+        let prepared = self
+            .active
+            .prepare_process_root_selection(
+                self.cpu,
+                self.primordial_process,
+                self.primordial_address_space,
+            )
+            .unwrap_or_else(|error| {
+                panic!("terminal idle publisher-root preparation failed: {error:?}")
+            });
+        let previous =
+            match core::mem::replace(&mut self.active_root, CarrierActiveRoot::Transitioning) {
+                CarrierActiveRoot::Kernel(root) => root,
+                _ => panic!("terminal idle lost its kernel execution root"),
+            };
+        let prepared = self
+            .active
+            .prepare_from_kernel_execution_root_switch(prepared, previous)
+            .unwrap_or_else(|failure| {
+                let (error, prepared, previous) = failure.into_parts();
+                self.active
+                    .abandon_process_root_selection(prepared)
+                    .unwrap_or_else(|abandon| {
+                        panic!("terminal publisher-root abandonment failed: {abandon:?}")
+                    });
+                self.active_root = CarrierActiveRoot::Kernel(previous);
+                panic!("terminal publisher-root preflight failed: {error:?}")
+            });
+        let flight = self.begin_root_switch_flight();
+        PreparedTerminalProcessRootSwitch { flight, prepared }
+    }
+
+    fn commit_terminal_primordial_root_switch(
+        &mut self,
+        executed: ExecutedTerminalProcessRootSwitch,
+    ) {
+        self.select_root_switch_flight(executed.flight);
+        let selected = self
+            .active
+            .commit_from_kernel_execution_root_switch(executed.executed);
+        self.active_root = CarrierActiveRoot::Process(selected);
+        self.finish_root_switch_flight(executed.flight);
+    }
+
+    fn cancel_terminal_primordial_root_switch(
+        &mut self,
+        failure: FailedTerminalProcessRootSwitch,
+    ) -> super::RootBindingError {
+        self.select_root_switch_flight(failure.flight);
+        let (error, prepared, previous) = failure.failure.into_parts();
+        self.active
+            .abandon_process_root_selection(prepared)
+            .unwrap_or_else(|abandon| {
+                panic!("cancelled terminal publisher switch lost residency: {abandon:?}")
+            });
+        self.active_root = CarrierActiveRoot::Kernel(previous);
+        self.finish_root_switch_flight(failure.flight);
+        error
+    }
+
     fn prepare_ap_kernel_root_entry(&mut self) -> PreparedApKernelRootEntry {
         if self.cpu == crate::cpu::CpuIndex::BOOTSTRAP
             || !matches!(self.active_root, CarrierActiveRoot::Unselected)
@@ -2459,6 +2662,419 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .unwrap_or_else(|error| panic!("invalid fresh Thread return: {error:?}"))
         };
         (state, stack)
+    }
+
+    fn prepare_terminal_retirement_state(&mut self) -> TerminalRetirementState {
+        let retired_process = self.process;
+        let retired_root_key = self.root_key;
+        let retired_address_space = self
+            .regions
+            .region(retired_root_key)
+            .unwrap_or_else(|error| panic!("terminal Process root disappeared: {error:?}"))
+            .address_space_key();
+        let deferred = self.deferred_currents[self.cpu.index()]
+            .take()
+            .unwrap_or_else(|| {
+                if self.deferred_currents.iter().any(Option::is_some) {
+                    panic!("terminal deferred resources migrated to another CPU")
+                }
+                if self.shared.execution.current_thread_on(self.cpu).is_some() {
+                    panic!("terminal handoff retained a scheduler-current Thread")
+                }
+                if self.shared.execution.suspended_claim_on(self.cpu).is_some() {
+                    panic!("terminal handoff retained a suspended claim without resources")
+                }
+                if self.shared.execution.running_claim_on(self.cpu).is_some() {
+                    panic!("terminal handoff retained a Running claim without resources")
+                }
+                match self.shared.execution.scheduler_state(self.thread) {
+                    Some(SchedulerThreadState::Reserved) => {
+                        panic!("terminal handoff reached a reserved Thread without resources")
+                    }
+                    Some(SchedulerThreadState::Runnable) => {
+                        panic!("terminal handoff reached a runnable Thread without resources")
+                    }
+                    Some(SchedulerThreadState::Running) => {
+                        panic!("terminal handoff reached a Running Thread without resources")
+                    }
+                    Some(SchedulerThreadState::Blocked) => {
+                        panic!("terminal handoff reached a blocked Thread without resources")
+                    }
+                    None => panic!("terminal handoff repeated after Thread retirement"),
+                }
+            });
+        crate::syscall::complete_deferred_current_reclaim_on(
+            &mut self.registry,
+            &self.shared.execution,
+            &self.shared.waits,
+            self.cpu,
+            deferred,
+            &mut self.cleanup,
+        );
+        #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
+        let retiring_wyr1_primordial = retired_process == self.primordial_process;
+        #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
+        if retiring_wyr1_primordial && let Err(error) = validate_primordial_retirement_facts(self) {
+            #[cfg(feature = "test-support")]
+            let terminal_info = self.g5_probe.terminal_info;
+            #[cfg(not(feature = "test-support"))]
+            let terminal_info = None;
+            crate::test_support::complete_fail(primordial_completion_detail(error, terminal_info))
+        }
+        #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
+        let wyr1_primordial_teardown = if retiring_wyr1_primordial {
+            let proof = self
+                .tasks
+                .process_quiescence_proof(retired_process)
+                .unwrap_or_else(|_| {
+                    crate::test_support::complete_fail(supervisor_evidence_detail(0xd009))
+                });
+            let drained = self
+                .shared
+                .execution
+                .blocked_operations_drained(&self.tasks, &proof)
+                .unwrap_or_else(|_| {
+                    crate::test_support::complete_fail(supervisor_evidence_detail(0xd00a))
+                });
+            self.unmap_primordial_userspace(&proof).unwrap_or_else(|_| {
+                crate::test_support::complete_fail(supervisor_evidence_detail(0xd00b))
+            });
+            Some((proof, drained))
+        } else {
+            None
+        };
+        TerminalRetirementState {
+            retired_process,
+            retired_root_key,
+            retired_address_space,
+            #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
+            retiring_wyr1_primordial,
+            #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
+            wyr1_primordial_teardown,
+        }
+    }
+
+    fn prepare_terminal_handoff_detached(&mut self) -> PreparedTerminalStep {
+        let retirement = self.prepare_terminal_retirement_state();
+        if let Some(next) = self.shared.execution.terminal_reaper_next_on(self.cpu) {
+            let (stack_id, context_id) = self
+                .tasks
+                .thread_execution_resources(next)
+                .unwrap_or_else(|error| panic!("terminal next resources failed: {error:?}"))
+                .unwrap_or_else(|| panic!("terminal next Thread has no execution resources"));
+            let stack = self
+                .shared
+                .execution
+                .stack_bounds(stack_id)
+                .unwrap_or_else(|error| panic!("terminal next stack failed: {error:?}"));
+            let continuation = self
+                .shared
+                .execution
+                .kernel_continuation_rsp(context_id)
+                .unwrap_or_else(|error| panic!("terminal next continuation failed: {error:?}"));
+            let state = TerminalSuccessorState {
+                retirement,
+                stack,
+                continuation,
+            };
+            return match self.prepare_scheduler_root_switch() {
+                Some(prepared) => PreparedTerminalStep::SchedulerRoot { prepared, state },
+                None => PreparedTerminalStep::Final(self.finish_terminal_successor(state)),
+            };
+        }
+
+        #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
+        if retirement.retiring_wyr1_primordial {
+            let prepared = self.prepare_terminal_kernel_root_switch();
+            return PreparedTerminalStep::KernelRoot {
+                prepared,
+                continuation: TerminalKernelContinuation::RetireWyr1Primordial(retirement),
+            };
+        }
+
+        #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
+        let primordial_retired = match self.tasks.root_region(self.primordial_process) {
+            Ok(None) | Err(crate::task::TaskError::InvalidTask) => true,
+            Ok(Some(_)) => false,
+            Err(_) => crate::test_support::complete_fail(supervisor_evidence_detail(0xd00d)),
+        };
+        #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
+        if retirement.retired_process != self.primordial_process && primordial_retired {
+            let retiring_reporter = self.evidence_init_process == Some(retirement.retired_process);
+            if retiring_reporter {
+                let info = self
+                    .tasks
+                    .process_info(retirement.retired_process)
+                    .unwrap_or_else(|_| {
+                        crate::test_support::complete_fail(supervisor_evidence_detail(0xd013))
+                    });
+                let detail = if info.application_code == 0 {
+                    supervisor_evidence_detail(0xd014)
+                } else {
+                    info.application_code
+                };
+                crate::test_support::complete_fail(detail)
+            }
+            let proof = self
+                .tasks
+                .process_quiescence_proof(retirement.retired_process)
+                .unwrap_or_else(|_| {
+                    crate::test_support::complete_fail(supervisor_evidence_detail(0xd00e))
+                });
+            let drained = self
+                .shared
+                .execution
+                .blocked_operations_drained(&self.tasks, &proof)
+                .unwrap_or_else(|_| {
+                    crate::test_support::complete_fail(supervisor_evidence_detail(0xd00f))
+                });
+            self.unmap_current_userspace(
+                retirement.retired_process,
+                retirement.retired_root_key,
+                retirement.retired_address_space,
+                &proof,
+            )
+            .unwrap_or_else(|_| {
+                crate::test_support::complete_fail(supervisor_evidence_detail(0xd010))
+            });
+            let prepared = self.prepare_terminal_kernel_root_switch();
+            return PreparedTerminalStep::KernelRoot {
+                prepared,
+                continuation: TerminalKernelContinuation::RetireWyr1Child {
+                    retirement,
+                    proof,
+                    drained,
+                },
+            };
+        }
+
+        if retirement.retired_process != self.primordial_process {
+            if crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
+                != Some(self.cpu.index())
+            {
+                panic!("terminal idle facade resumed on another physical CPU")
+            }
+            if self
+                .active_root
+                .as_ref()
+                .is_none_or(|previous| previous.cpu() != self.cpu)
+            {
+                panic!("terminal idle carrier retained another CPU's Process root")
+            }
+            let prepared = self.prepare_terminal_kernel_root_switch();
+            return PreparedTerminalStep::KernelRoot {
+                prepared,
+                continuation: TerminalKernelContinuation::EnterPrimordialPublisher(retirement),
+            };
+        }
+
+        PreparedTerminalStep::Final(self.finish_primordial_terminal_handoff())
+    }
+
+    fn finish_terminal_successor(
+        &mut self,
+        state: TerminalSuccessorState,
+    ) -> PreparedTerminalHandoff {
+        if state.retirement.retired_process != self.process {
+            #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
+            if state.retirement.retiring_wyr1_primordial {
+                let (proof, drained) = state
+                    .retirement
+                    .wyr1_primordial_teardown
+                    .take()
+                    .unwrap_or_else(|| {
+                        crate::test_support::complete_fail(supervisor_evidence_detail(0xd00c))
+                    });
+                self.finish_quiesced_process_root_retirement(
+                    state.retirement.retired_process,
+                    state.retirement.retired_address_space,
+                    &proof,
+                    drained,
+                )
+                .unwrap_or_else(|_| {
+                    crate::test_support::complete_fail(supervisor_evidence_detail(0xd002))
+                });
+            } else if self
+                .tasks
+                .process_quiescence_proof(state.retirement.retired_process)
+                .is_ok()
+            {
+                self.finish_inactive_process_teardown(
+                    state.retirement.retired_process,
+                    state.retirement.retired_root_key,
+                    state.retirement.retired_address_space,
+                )
+                .unwrap_or_else(|_| panic!("inactive exited Process teardown drifted"));
+            }
+            #[cfg(not(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence)))]
+            if self
+                .tasks
+                .process_quiescence_proof(state.retirement.retired_process)
+                .is_ok()
+            {
+                self.finish_inactive_process_teardown(
+                    state.retirement.retired_process,
+                    state.retirement.retired_root_key,
+                    state.retirement.retired_address_space,
+                )
+                .unwrap_or_else(|_| panic!("inactive exited Process teardown drifted"));
+            }
+        }
+        #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
+        if state.retirement.retiring_wyr1_primordial {
+            self.enable_wyr1_reporter_after_retirement()
+                .unwrap_or_else(|_| {
+                    crate::test_support::complete_fail(supervisor_evidence_detail(0xd003))
+                });
+        }
+        unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(state.stack) }
+            .unwrap_or_else(|error| panic!("terminal next stack binding failed: {error:?}"));
+        let continuation = if state.continuation == 0 {
+            unsafe {
+                crate::arch::x86_64::context::prepare_initial_kernel_continuation(
+                    state.stack,
+                    crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
+                )
+            }
+            .unwrap_or_else(|error| {
+                panic!("terminal fresh continuation preparation failed: {error:?}")
+            })
+            .rsp()
+        } else {
+            state.continuation
+        };
+        crate::arch::x86_64::syscall::validate_live_syscall_boundary().unwrap_or_else(|error| {
+            panic!("terminal next syscall boundary validation failed: {error:?}")
+        });
+        PreparedTerminalHandoff::Continuation(continuation)
+    }
+
+    fn continue_terminal_after_kernel_root(
+        &mut self,
+        continuation: TerminalKernelContinuation,
+    ) -> PreparedTerminalStep {
+        match continuation {
+            #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
+            TerminalKernelContinuation::RetireWyr1Primordial(mut retirement) => {
+                let (proof, drained) =
+                    retirement
+                        .wyr1_primordial_teardown
+                        .take()
+                        .unwrap_or_else(|| {
+                            crate::test_support::complete_fail(supervisor_evidence_detail(0xd00c))
+                        });
+                self.finish_quiesced_process_root_retirement(
+                    retirement.retired_process,
+                    retirement.retired_address_space,
+                    &proof,
+                    drained,
+                )
+                .unwrap_or_else(|_| {
+                    crate::test_support::complete_fail(supervisor_evidence_detail(0xd007))
+                });
+                self.enable_wyr1_reporter_after_retirement()
+                    .unwrap_or_else(|_| {
+                        crate::test_support::complete_fail(supervisor_evidence_detail(0xd008))
+                    });
+                self.local.record_idle();
+                PreparedTerminalStep::Final(PreparedTerminalHandoff::IdleScheduler)
+            }
+            #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
+            TerminalKernelContinuation::RetireWyr1Child {
+                retirement,
+                proof,
+                drained,
+            } => {
+                self.finish_quiesced_process_root_retirement(
+                    retirement.retired_process,
+                    retirement.retired_address_space,
+                    &proof,
+                    drained,
+                )
+                .unwrap_or_else(|_| {
+                    crate::test_support::complete_fail(supervisor_evidence_detail(0xd012))
+                });
+                self.local.record_idle();
+                PreparedTerminalStep::Final(PreparedTerminalHandoff::IdleScheduler)
+            }
+            TerminalKernelContinuation::EnterPrimordialPublisher(retirement) => {
+                let prepared = self.prepare_terminal_primordial_root_switch();
+                PreparedTerminalStep::PrimordialRoot {
+                    prepared,
+                    retirement,
+                }
+            }
+            TerminalKernelContinuation::FinishGenericChild(retirement) => {
+                self.process = self.primordial_process;
+                self.root_key = self.primordial_root_key;
+                self.local.record_idle();
+                drop(retirement);
+                PreparedTerminalStep::Final(PreparedTerminalHandoff::IdleScheduler)
+            }
+        }
+    }
+
+    fn continue_terminal_after_primordial_root(
+        &mut self,
+        retirement: TerminalRetirementState,
+    ) -> PreparedTerminalStep {
+        self.finish_inactive_process_teardown(
+            retirement.retired_process,
+            retirement.retired_root_key,
+            retirement.retired_address_space,
+        )
+        .unwrap_or_else(|_| panic!("idle exited Process teardown drifted"));
+        let prepared = self.prepare_terminal_kernel_root_switch();
+        PreparedTerminalStep::KernelRoot {
+            prepared,
+            continuation: TerminalKernelContinuation::FinishGenericChild(retirement),
+        }
+    }
+
+    fn finish_primordial_terminal_handoff(&mut self) -> PreparedTerminalHandoff {
+        let completion = complete_primordial_launch(self);
+        #[cfg(all(feature = "test-support", deepwyrm_dw1b_evidence))]
+        {
+            let primordial_normal = self.g5_probe.accepts_completion(&completion);
+            let counters = self
+                .shared
+                .execution
+                .preemption_snapshot_on(crate::cpu::CpuIndex::BOOTSTRAP)
+                .counters;
+            match crate::test_support::DW1B_EVIDENCE.finish(counters, primordial_normal) {
+                Ok(permit) => crate::test_support::complete_dw1b_evidence(permit),
+                Err(error) => crate::test_support::complete_fail(dw1b_evidence_detail(error)),
+            }
+        }
+        #[cfg(all(feature = "test-support", not(deepwyrm_dw1b_evidence)))]
+        if self.g5_probe.accepts_completion(&completion) {
+            crate::test_support::complete_pass(0)
+        } else {
+            crate::test_support::complete_fail(self.g5_probe.failure_detail(&completion))
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            let (level, message) = match completion {
+                Ok(()) => (
+                    crate::debug::DiagnosticLevel::Info,
+                    "Wyrmroot bootstrap completed normally",
+                ),
+                Err(crate::boot::primordial::construction::PrimordialCompletionError::UnhandledException) => (
+                    crate::debug::DiagnosticLevel::Error,
+                    "Wyrmroot bootstrap terminated after an unhandled userspace exception",
+                ),
+                Err(_) => (
+                    crate::debug::DiagnosticLevel::Error,
+                    "Wyrmroot bootstrap terminated with a structured completion failure",
+                ),
+            };
+            let _ = crate::debug::emit_early_record(level, "primordial", message);
+            loop {
+                unsafe {
+                    core::arch::asm!("sti", "hlt", options(nomem, nostack));
+                }
+            }
+        }
     }
 
     fn prepare_terminal_handoff(&mut self) -> PreparedTerminalHandoff {
@@ -5305,18 +5921,67 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
     }
 
     fn terminate_current(&mut self) -> ! {
-        let handoff = {
+        let mut step = {
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);
-            runtime.prepare_terminal_handoff()
+            runtime.prepare_terminal_handoff_detached()
         };
-        match handoff {
-            PreparedTerminalHandoff::Continuation(continuation) => unsafe {
-                crate::arch::x86_64::context::abandon_to_kernel_continuation(continuation)
-            },
-            PreparedTerminalHandoff::IdleScheduler => {
-                crate::arch::x86_64::syscall::enter_bound_idle_scheduler()
-            }
+        loop {
+            step = match step {
+                PreparedTerminalStep::SchedulerRoot { prepared, state } => {
+                    let executed = match prepared.execute() {
+                        Ok(executed) => executed,
+                        Err(failure) => {
+                            let mut runtime = self.runtime.lock();
+                            let error = runtime.cancel_scheduler_root_switch(failure);
+                            panic!("terminal scheduler root switch failed before CR3: {error:?}")
+                        }
+                    };
+                    let mut runtime = self.runtime.lock();
+                    runtime.commit_scheduler_root_switch(executed);
+                    PreparedTerminalStep::Final(runtime.finish_terminal_successor(state))
+                }
+                PreparedTerminalStep::KernelRoot {
+                    prepared,
+                    continuation,
+                } => {
+                    let executed = match prepared.execute() {
+                        Ok(executed) => executed,
+                        Err(failure) => {
+                            let mut runtime = self.runtime.lock();
+                            let error = runtime.cancel_terminal_kernel_root_switch(failure);
+                            panic!("terminal kernel-root switch failed before CR3: {error:?}")
+                        }
+                    };
+                    let mut runtime = self.runtime.lock();
+                    runtime.commit_terminal_kernel_root_switch(executed);
+                    runtime.continue_terminal_after_kernel_root(continuation)
+                }
+                PreparedTerminalStep::PrimordialRoot {
+                    prepared,
+                    retirement,
+                } => {
+                    let executed = match prepared.execute() {
+                        Ok(executed) => executed,
+                        Err(failure) => {
+                            let mut runtime = self.runtime.lock();
+                            let error = runtime.cancel_terminal_primordial_root_switch(failure);
+                            panic!("terminal publisher-root switch failed before CR3: {error:?}")
+                        }
+                    };
+                    let mut runtime = self.runtime.lock();
+                    runtime.commit_terminal_primordial_root_switch(executed);
+                    runtime.continue_terminal_after_primordial_root(retirement)
+                }
+                PreparedTerminalStep::Final(handoff) => match handoff {
+                    PreparedTerminalHandoff::Continuation(continuation) => unsafe {
+                        crate::arch::x86_64::context::abandon_to_kernel_continuation(continuation)
+                    },
+                    PreparedTerminalHandoff::IdleScheduler => {
+                        crate::arch::x86_64::syscall::enter_bound_idle_scheduler()
+                    }
+                },
+            };
         }
     }
 

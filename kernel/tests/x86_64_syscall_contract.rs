@@ -258,7 +258,7 @@ fn address_region_adapter_source_contract_tracks_the_private_module() {
 fn i1_post_ack_carrier_never_reuses_a_retired_frame_for_late_holdsafe() {
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
     let continuation = primordial
-        .split_once("fn prepare_after_rendezvous_stop(&mut self) -> PreparedCarrierEntry")
+        .split_once("fn prepare_after_rendezvous_stop(&mut self) -> PreparedRendezvousNext")
         .expect("post-ack carrier continuation")
         .1
         .split_once("fn terminate_exception")
@@ -529,9 +529,23 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
 
     assert!(runtime.contains("fn complete_physical_switch_handoff(&mut self)"));
     assert!(runtime.contains(".complete_switch_on(outgoing)"));
-    assert!(runtime.contains(
-        "runtime.switch_cpu(self.cpu);\n            runtime.complete_physical_switch_handoff();\n            runtime.prepare_fresh_user_entry()"
-    ));
+    let fresh = runtime
+        .rsplit_once("fn enter_scheduled_fresh_thread(&mut self) -> !")
+        .expect("live fresh-thread entry")
+        .1
+        .split_once("fn publish_scheduler_idle")
+        .expect("live fresh-thread entry boundary")
+        .0;
+    let fresh_ack = fresh
+        .find("runtime.complete_physical_switch_handoff();")
+        .unwrap();
+    let fresh_sync = fresh
+        .find("self.synchronize_scheduler_current_detached();")
+        .unwrap();
+    let fresh_prepare = fresh
+        .find("runtime.prepare_fresh_user_entry_synchronized()")
+        .unwrap();
+    assert!(fresh_ack < fresh_sync && fresh_sync < fresh_prepare);
     let resume = runtime
         .split_once("fn resume_suspended(")
         .expect("live suspended-resume facade")
@@ -571,7 +585,7 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
         .find("runtime.complete_physical_switch_handoff();")
         .expect("remote terminal switch acknowledgement");
     let remote_sync = remote_terminal
-        .find("runtime.synchronize_scheduler_current();")
+        .find("self.synchronize_scheduler_current_detached();")
         .expect("remote terminal scheduler synchronization");
     let remote_prepare = remote_terminal
         .find("runtime.prepare_remote_process_exception(exception)")
@@ -597,7 +611,7 @@ fn i2_suspended_resume_gives_remote_stop_priority_under_scheduler_authority() {
         .find("runtime.complete_physical_switch_handoff()")
         .unwrap();
     let synchronization = resume
-        .find("runtime.synchronize_scheduler_current()")
+        .find("self.synchronize_scheduler_current_detached()")
         .unwrap();
     let terminal = resume
         .find("NativeResumeOutcome::TerminateCurrent")
@@ -1334,8 +1348,8 @@ fn h2_syscall_entry_and_native_runtime_carriers_are_fixed_per_cpu() {
     assert!(
         primordial.contains("release_runtime_carrier_facades(shared, runtime_ref, admissions)")
     );
-    assert!(primordial.contains("runtime.select_cpu(self.cpu)"));
-    assert!(primordial.contains("runtime.prepare_fresh_user_entry()"));
+    assert!(primordial.contains("runtime.switch_cpu(self.cpu)"));
+    assert!(primordial.contains("runtime.prepare_fresh_user_entry_synchronized()"));
     assert!(primordial.contains("enter_bound_validated_user(&state, stack)"));
     assert!(!primordial.contains("reject_entry"));
 }
@@ -1756,6 +1770,73 @@ fn dw1c1_ap_carrier_enters_its_exact_kernel_root_before_ready_publication() {
     assert!(primordial.contains("runtime.prepare_ap_kernel_root_entry()"));
     assert!(primordial.contains("runtime.commit_ap_kernel_root_entry(executed)"));
     assert!(primordial.contains("CarrierActiveRoot::Kernel(kernel)"));
+}
+
+#[test]
+fn dw1c1_terminal_handoff_executes_every_root_switch_outside_the_runtime_guard() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    for exact in [
+        "enum PreparedTerminalStep",
+        "fn prepare_terminal_handoff_detached(",
+        "fn prepare_terminal_kernel_root_switch(",
+        "fn commit_terminal_kernel_root_switch(",
+        "fn prepare_terminal_primordial_root_switch(",
+        "fn commit_terminal_primordial_root_switch(",
+        "TerminalKernelContinuation::EnterPrimordialPublisher",
+        "TerminalKernelContinuation::FinishGenericChild",
+    ] {
+        assert!(
+            primordial.contains(exact),
+            "terminal transaction omitted {exact}"
+        );
+    }
+
+    let facade = primordial
+        .rsplit_once("fn terminate_current(&mut self) -> !")
+        .expect("runtime facade terminal path")
+        .1
+        .split_once("fn enter_scheduled_fresh_thread")
+        .expect("runtime facade terminal boundary")
+        .0;
+    assert!(facade.contains("runtime.prepare_terminal_handoff_detached()"));
+    assert!(!facade.contains("runtime.prepare_terminal_handoff()"));
+    for commit in [
+        "runtime.commit_scheduler_root_switch(executed)",
+        "runtime.commit_terminal_kernel_root_switch(executed)",
+        "runtime.commit_terminal_primordial_root_switch(executed)",
+    ] {
+        let execute = facade.find("prepared.execute()").unwrap();
+        let commit = facade.find(commit).unwrap();
+        assert!(
+            execute < commit,
+            "terminal root commit preceded detached execute"
+        );
+        assert!(
+            facade[execute..commit].contains("let mut runtime = self.runtime.lock()"),
+            "terminal root commit did not reacquire serialized authority"
+        );
+        let reacquire = facade[execute..commit]
+            .rfind("let mut runtime = self.runtime.lock()")
+            .unwrap()
+            + execute;
+        assert!(
+            !facade[reacquire..commit].contains("runtime.switch_cpu(self.cpu)"),
+            "terminal root commit bypassed its exact in-flight selector"
+        );
+    }
+    for cancel in [
+        "runtime.cancel_scheduler_root_switch(failure)",
+        "runtime.cancel_terminal_kernel_root_switch(failure)",
+        "runtime.cancel_terminal_primordial_root_switch(failure)",
+    ] {
+        let cancel = facade.find(cancel).unwrap();
+        let reacquire = facade[..cancel]
+            .rfind("let mut runtime = self.runtime.lock()")
+            .unwrap();
+        assert!(!facade[reacquire..cancel].contains("runtime.switch_cpu(self.cpu)"));
+    }
+    assert!(primordial.contains("self.select_root_switch_flight(executed.flight)"));
+    assert!(primordial.contains("self.select_root_switch_flight(failure.flight)"));
 }
 
 #[test]
