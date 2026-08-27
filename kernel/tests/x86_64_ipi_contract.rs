@@ -632,9 +632,20 @@ fn h4_idle_publication_brackets_rescan_and_uses_only_coalesced_e1_wake() {
     assert!(timer_dispatch.contains("live_idle_wake_is_healthy()"));
 
     let execution = source("src/task/execution.rs");
-    assert!(
-        execution.contains(".wake_on(super::scheduler_requester_cpu(), key)?;\n        super::notify_runnable_work(publication.wake_affinity());")
-    );
+    let wake = execution
+        .split_once("pub(crate) fn wake(&self, key: BlockWakeKey)")
+        .expect("blocked-operation wake implementation")
+        .1
+        .split_once("pub(crate) fn validate_issued_wake_key")
+        .expect("blocked-operation wake extent")
+        .0;
+    let publication = wake
+        .find(".wake_on(super::scheduler_requester_cpu(), key)?;")
+        .expect("scheduler wake publication");
+    let notification = wake
+        .find("super::notify_runnable_work(publication.wake_affinity());")
+        .expect("runnable-work notification");
+    assert!(publication < notification);
     assert!(
         execution.contains(".commit_on(\n                requester,")
             && execution.contains(
