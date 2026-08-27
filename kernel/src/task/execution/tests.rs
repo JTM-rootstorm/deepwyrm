@@ -2,7 +2,7 @@ extern crate std;
 
 use super::*;
 use crate::object::ObjectRegistry;
-use crate::task::{TaskAuthority, TaskError};
+use crate::task::{BlockedOperation, BlockedOperationWinner, TaskAuthority, TaskError};
 use deepwyrm_abi::DW_TASK_STATE_RUNNING;
 use std::sync::{Arc, Barrier};
 
@@ -823,6 +823,67 @@ fn idle_switch_plan_can_save_a_woken_waiter_behind_an_earlier_fifo_winner() {
     let plan = unsafe { domain.prepare_idle_kernel_switch(&tasks, decision) }.unwrap();
     assert_eq!(plan.next_stack(), first_bounds);
     assert_eq!(plan.next_rsp(), first_rsp);
+}
+
+#[test]
+fn published_winner_between_check_and_commit_is_replayed_after_block_publication() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (process, process_handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let process_owner = registry
+        .retain_internal_from_handle(&process_handle)
+        .unwrap();
+    let (thread, _thread_handle) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    assert!(registry.release_internal(process_owner).unwrap().is_none());
+    assert!(registry.release_internal(root_owner).unwrap().is_none());
+
+    let domain = ExecutionDomain::<1>::new(stack_bounds::<1>()).unwrap();
+    domain
+        .start_thread(&mut tasks, thread, start_state(43))
+        .unwrap();
+    assert_eq!(domain.schedule_next().unwrap().current, Some(thread));
+
+    let cpu = crate::cpu::CpuIndex::BOOTSTRAP;
+    let block = domain.prepare_block_current_on(cpu, thread).unwrap();
+    let wake = block.wake_key();
+    let operation = BlockedOperation::publish_for_process(
+        domain.blocked_operations(),
+        &mut tasks,
+        process,
+        thread,
+        wake,
+        (),
+    )
+    .unwrap();
+    assert_eq!(domain.blocked_operations().winner(wake), Ok(None));
+
+    assert_eq!(
+        domain
+            .blocked_operations()
+            .try_claim_winner(wake, BlockedOperationWinner::AtomicWake),
+        Ok(true)
+    );
+    assert_eq!(domain.wake(wake), Err(SchedulerError::StaleBlockToken));
+
+    let decision = domain.commit_published_block_on(cpu, block).unwrap();
+    assert_eq!(decision.current, None);
+    assert_eq!(
+        domain.scheduler_state(thread),
+        Some(crate::task::SchedulerThreadState::Runnable)
+    );
+    assert_eq!(
+        domain.blocked_operations().winner(wake),
+        Ok(Some(BlockedOperationWinner::AtomicWake))
+    );
+    operation
+        .complete_for_process(
+            domain.blocked_operations(),
+            &mut tasks,
+            BlockedOperationWinner::AtomicWake,
+            |()| (),
+        )
+        .unwrap();
 }
 
 #[test]

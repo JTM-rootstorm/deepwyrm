@@ -3426,10 +3426,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     fn resume_syscall_preemption(
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
-        current_binding_generation: u64,
     ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
         self.complete_physical_switch_handoff();
         self.synchronize_scheduler_current();
+        let current_binding_generation = crate::arch::x86_64::syscall::current_binding_generation();
+        frame.rebind_after_kernel_resume(current_binding_generation)?;
         self.authorize_return(frame, current_binding_generation)
     }
 
@@ -3970,11 +3971,10 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
     fn resume_syscall_preemption(
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
-        current_binding_generation: u64,
     ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
         let mut runtime = self.runtime.lock();
         runtime.switch_cpu(self.cpu);
-        runtime.resume_syscall_preemption(frame, current_binding_generation)
+        runtime.resume_syscall_preemption(frame)
     }
 
     #[cfg(deepwyrm_wyr1_evidence)]
@@ -4272,19 +4272,11 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
     ) -> crate::syscall::native::NativeResumeOutcome {
         let mut runtime = self.runtime.lock();
         // A suspended continuation may resume after another physical CPU used
-        // the shared carrier. Restore this CPU's exact carrier/root token
-        // and acknowledge destination-stack arrival before inspecting any
-        // scheduler or terminal ownership associated with the resumed frame.
+        // the shared carrier. Restore this CPU's exact carrier/root token.
+        // An already-published local terminal owner must retain its suspended
+        // claim until the terminal reaper actually abandons this stack; every
+        // resumable path acknowledges destination-stack arrival first.
         runtime.switch_cpu(self.cpu);
-        runtime.complete_physical_switch_handoff();
-        runtime.synchronize_scheduler_current();
-        let notification = crate::arch::x86_64::idle::take_current_notification_at_safe_point();
-        if matches!(
-            notification,
-            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
-        ) {
-            return crate::syscall::native::NativeResumeOutcome::ServiceRendezvous;
-        }
         let suspended_claim = runtime.shared.execution.suspended_claim_on(self.cpu);
         if runtime
             .shared
@@ -4299,6 +4291,16 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         {
             return crate::syscall::native::NativeResumeOutcome::TerminateCurrent;
         }
+        runtime.complete_physical_switch_handoff();
+        runtime.synchronize_scheduler_current();
+        let notification = crate::arch::x86_64::idle::take_current_notification_at_safe_point();
+        if matches!(
+            notification,
+            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
+        ) {
+            return crate::syscall::native::NativeResumeOutcome::ServiceRendezvous;
+        }
+        let suspended_claim = runtime.shared.execution.suspended_claim_on(self.cpu);
         #[cfg(feature = "test-support")]
         if runtime
             .shared

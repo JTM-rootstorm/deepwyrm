@@ -599,13 +599,17 @@ fn i2_suspended_resume_gives_remote_stop_priority_under_scheduler_authority() {
     let synchronization = resume
         .find("runtime.synchronize_scheduler_current()")
         .unwrap();
+    let terminal = resume
+        .find("NativeResumeOutcome::TerminateCurrent")
+        .unwrap();
     let mailbox = resume
         .find("take_current_notification_at_safe_point()")
         .unwrap();
     let current = resume.find("runtime.resume_suspended(frame)").unwrap();
     assert!(
         authority < carrier
-            && carrier < acknowledgement
+            && carrier < terminal
+            && terminal < acknowledgement
             && acknowledgement < synchronization
             && synchronization < mailbox
             && mailbox < current
@@ -623,6 +627,9 @@ fn i2_suspended_resume_gives_remote_stop_priority_under_scheduler_authority() {
     let rebind = suspended
         .find("current_runtime_context::<R>()")
         .expect("destination runtime carrier rebind");
+    let frame_rebind = suspended
+        .find("frame.rebind_after_kernel_resume(generation)")
+        .expect("resumed frame generation rebind");
     let handoff = suspended[outcome..]
         .find("handoff_to_rendezvous_reaper(context)")
         .unwrap()
@@ -630,7 +637,16 @@ fn i2_suspended_resume_gives_remote_stop_priority_under_scheduler_authority() {
     let authorize = suspended
         .find("runtime.authorize_return(frame, generation)")
         .unwrap();
-    assert!(rebind < outcome && outcome < handoff && handoff < authorize);
+    assert!(rebind < outcome && outcome < frame_rebind && frame_rebind < authorize);
+    assert!(outcome < handoff);
+    let rendezvous = suspended
+        .split_once("NativeResumeOutcome::ServiceRendezvous")
+        .expect("remote rendezvous outcome")
+        .1
+        .split_once("NativeResumeOutcome::TerminateCurrent")
+        .expect("remote rendezvous outcome extent")
+        .0;
+    assert!(!rendezvous.contains("rebind_after_kernel_resume"));
 }
 
 #[test]
@@ -665,10 +681,18 @@ fn i2_terminal_reclaim_handoff_is_owned_by_the_exact_physical_cpu() {
         .find("handoff_to_terminal_reaper::<R>(context)")
         .unwrap()
         + terminal;
+    let stage = suspended[terminal..]
+        .find("stage_terminal_action(TerminalAction::CompleteCurrent)")
+        .unwrap()
+        + terminal;
     let authorize = suspended
         .find("runtime.authorize_return(frame, generation)")
         .unwrap();
-    assert!(terminal < handoff && handoff < authorize);
+    let rebind = suspended
+        .find("frame.rebind_after_kernel_resume(generation)")
+        .unwrap();
+    assert!(authorize < terminal && rebind < terminal);
+    assert!(terminal < stage && stage < handoff);
 }
 
 #[test]
@@ -973,7 +997,7 @@ fn i1_live_wait_suspension_uses_the_physical_current_cpu() {
     assert!(services.contains("current_cpu,"));
     assert!(waits.contains("prepare_block_current_on(cpu, thread)"));
     assert!(waits.contains("cancel_block_on(cpu, block)"));
-    assert!(waits.contains("commit_block_on(cpu, block)"));
+    assert!(waits.contains("commit_published_block_on(cpu, block)"));
     assert!(runtime.contains("self.services.prepare_suspend_on("));
     assert!(runtime.contains("self.services.poll_idle_suspend_on("));
     assert!(services.contains("control.prepare_suspend_on(cpu"));

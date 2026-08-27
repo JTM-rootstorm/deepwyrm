@@ -899,12 +899,11 @@ pub(crate) fn begin_registered_wait<
                 Ok(Some(other)) => panic!("unexpected F7 winner before block commit: {other:?}"),
                 Ok(None) => {
                     set.release(registry);
-                    let decision =
-                        execution
-                            .commit_block_on(cpu, block)
-                            .unwrap_or_else(|failure| {
-                                panic!("F7 registered block commit drifted: {:?}", failure.error())
-                            });
+                    let decision = execution
+                        .commit_published_block_on(cpu, block)
+                        .unwrap_or_else(|failure| {
+                            panic!("F7 registered block commit drifted: {:?}", failure.error())
+                        });
                     Ok(WaitBeginOutcome::Suspended { wake, decision })
                 }
                 Err(error) => panic!("fresh F7 winner ledger disappeared: {error:?}"),

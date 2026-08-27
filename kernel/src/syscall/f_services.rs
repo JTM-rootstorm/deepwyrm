@@ -434,6 +434,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
                 address,
                 expected,
                 deadline,
+                current_cpu,
                 wait_deadlines,
             )),
             NativeSyscallRequest::AtomicWake {
@@ -530,6 +531,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         address: DwUserAddress,
         expected: u32,
         deadline: DwDeadline,
+        cpu: crate::cpu::CpuIndex,
         wait_deadlines: Option<&mut dyn WaitDeadlineAuthority>,
     ) -> NativeSyscallResult
     where
@@ -575,6 +577,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
             execution,
             &mut self.atomic_operations,
             wait_deadlines,
+            cpu,
             process,
             thread,
             |pin| user.load_atomic_u32_acquire(pin),

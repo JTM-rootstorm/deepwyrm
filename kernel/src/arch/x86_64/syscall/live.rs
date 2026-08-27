@@ -1144,7 +1144,6 @@ unsafe fn native_runtime_timer_pre_iret<
             crate::syscall::native::NativePreemptionPlan::Switch(plan) => {
                 switch_kernel_context(plan);
                 context = current_runtime_context::<R>().unwrap_or_else(|| halt_forever());
-                poll_timer_return_stop(context);
                 let runtime = unsafe { &mut *context.cast::<R>() };
                 if let Err(error) = runtime.resume_timer_preemption(frame) {
                     invalid_bound_return::<R>(context, error);
@@ -1564,14 +1563,16 @@ unsafe fn native_runtime_trampoline<
             // reacquire the destination's one-shot published carrier before
             // any scheduler, terminal, mapping, or user-return operation.
             context = current_runtime_context::<R>().unwrap_or_else(|| halt_forever());
-            let generation = current_binding_generation();
-            if let Err(error) = frame.rebind_after_kernel_resume(generation) {
-                invalid_bound_return::<R>(context, error);
-            }
             let result = {
                 let runtime = unsafe { &mut *context.cast::<R>() };
                 match runtime.resume_suspended(frame) {
-                    crate::syscall::native::NativeResumeOutcome::Resumed => {}
+                    crate::syscall::native::NativeResumeOutcome::Resumed => {
+                        let generation = current_binding_generation();
+                        if let Err(error) = frame.rebind_after_kernel_resume(generation) {
+                            invalid_bound_return::<R>(context, error);
+                        }
+                        runtime.authorize_return(frame, generation)
+                    }
                     crate::syscall::native::NativeResumeOutcome::ServiceRendezvous => {
                         match crate::arch::x86_64::idle::take_current_notification_at_safe_point() {
                             crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request) => {
@@ -1592,7 +1593,6 @@ unsafe fn native_runtime_trampoline<
                         handoff_to_terminal_reaper::<R>(context)
                     }
                 }
-                runtime.authorize_return(frame, generation)
             };
             if let Err(error) = result {
                 invalid_bound_return::<R>(context, error);
@@ -1632,13 +1632,8 @@ fn service_syscall_return_preemption<
         if let crate::syscall::native::NativePreemptionPlan::Switch(plan) = plan {
             switch_kernel_context(plan);
             *context = current_runtime_context::<R>().unwrap_or_else(|| halt_forever());
-            poll_timer_return_stop(*context);
-            let generation = current_binding_generation();
-            if let Err(error) = frame.rebind_after_kernel_resume(generation) {
-                invalid_bound_return::<R>(*context, error);
-            }
             let runtime = unsafe { &mut *(*context).cast::<R>() };
-            if let Err(error) = runtime.resume_syscall_preemption(frame, generation) {
+            if let Err(error) = runtime.resume_syscall_preemption(frame) {
                 invalid_bound_return::<R>(*context, error);
             }
         }

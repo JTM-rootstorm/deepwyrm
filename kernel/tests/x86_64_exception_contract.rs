@@ -302,10 +302,20 @@ fn dw1b_timer_return_validation_is_fail_closed_before_resume_or_rearm() {
     let resume = gate
         .find("runtime.resume_timer_preemption(frame)")
         .expect("resume selected timer continuation");
+    let post_switch_stop = gate[resume..]
+        .find("poll_timer_return_stop(context)")
+        .expect("post-switch Stop poll after physical handoff")
+        + resume;
     let rearm = gate
         .find("arm_current_normal_quantum()")
         .expect("arm fresh selected-thread quantum");
-    assert!(stop < validate && validate < prepare && prepare < resume && resume < rearm);
+    assert!(
+        stop < validate
+            && validate < prepare
+            && prepare < resume
+            && resume < post_switch_stop
+            && post_switch_stop < rearm
+    );
     assert!(gate.contains("poll_timer_return_stop(context)"));
     assert!(gate.contains("runtime.has_reschedule_request()"));
 
@@ -339,10 +349,28 @@ fn dw1b_syscall_return_accounts_due_budget_before_preemption_and_rearm() {
     let prepare = service
         .find("runtime.prepare_preemption()")
         .expect("normal preemption preparation");
+    let resume = service
+        .find("runtime.resume_syscall_preemption(frame)")
+        .expect("acknowledged syscall continuation resume");
+    let post_switch_stop = service
+        .rfind("poll_timer_return_stop(*context)")
+        .expect("post-switch Stop poll after physical handoff");
     let rearm = service
         .rfind("arm_current_normal_quantum()")
         .expect("selected execution quantum preparation");
-    assert!(stop < due && due < request && request < prepare && prepare < rearm);
+    assert!(
+        stop < due
+            && due < request
+            && request < prepare
+            && prepare < resume
+            && resume < post_switch_stop
+            && post_switch_stop < rearm
+    );
+    let switched = service
+        .split_once("switch_kernel_context(plan)")
+        .expect("syscall-return physical switch")
+        .1;
+    assert!(!switched.contains("frame.rebind_after_kernel_resume"));
 
     let arm = live
         .split_once("fn arm_current_normal_quantum()")

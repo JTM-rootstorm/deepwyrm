@@ -753,6 +753,30 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         self.scheduler.commit_block_on(cpu, reservation)
     }
 
+    /// Commits one block whose durable operation was already published, then
+    /// replays a winner that raced between the caller's final winner check and
+    /// the scheduler transition. The two authorities are sampled in sequence;
+    /// no blocked-operation guard crosses scheduler mutation.
+    pub(crate) fn commit_published_block_on(
+        &self,
+        cpu: SchedulerCpuId,
+        reservation: BlockReservation,
+    ) -> Result<super::ScheduleDecision, BlockReservationFailure> {
+        let wake = reservation.wake_key();
+        let decision = self.scheduler.commit_block_on(cpu, reservation)?;
+        if self
+            .blocked_operations
+            .winner(wake)
+            .is_ok_and(|winner| winner.is_some())
+        {
+            match self.wake(wake) {
+                Ok(()) | Err(SchedulerError::StaleBlockToken) => {}
+                Err(error) => panic!("post-commit blocked-operation wake replay failed: {error:?}"),
+            }
+        }
+        Ok(decision)
+    }
+
     pub(crate) fn block_current(
         &self,
         thread: ThreadKey,

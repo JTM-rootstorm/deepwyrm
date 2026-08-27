@@ -803,7 +803,6 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
     fn resume_syscall_preemption(
         &mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
-        _current_binding_generation: u64,
     ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
         panic!("native runtime does not admit syscall-return preemption resume")
     }
@@ -915,9 +914,11 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
     ) -> NativeIdleSuspendPoll<'owner>;
 
     /// Resumes a logically selected suspended Thread while holding the
-    /// runtime's scheduler authority. Implementations must poll the
-    /// authoritative rendezvous mailbox before consulting current task state;
-    /// a published Stop wins this edge and is returned to the raw trampoline.
+    /// runtime's scheduler authority. An already-published local terminal
+    /// owner retains its suspended claim for reaper abandonment. Otherwise,
+    /// implementations must acknowledge physical arrival and poll the
+    /// authoritative rendezvous mailbox before consulting resumable task
+    /// state; a published Stop wins that edge and returns to the trampoline.
     fn resume_suspended(
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,

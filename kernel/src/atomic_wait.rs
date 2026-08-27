@@ -568,6 +568,7 @@ pub(crate) fn begin_atomic_wait<
     execution: &ExecutionDomain<EXECUTION>,
     operations: &mut AtomicWaitOperationRegistry<PIN, EXECUTION>,
     mut deadline_authority: Option<&mut dyn WaitDeadlineAuthority>,
+    cpu: crate::cpu::CpuIndex,
     process: ProcessKey,
     thread: ThreadKey,
     mut load: impl FnMut(&PIN) -> u32,
@@ -579,7 +580,7 @@ pub(crate) fn begin_atomic_wait<
         return Ok(AtomicWaitBegin::TimedOut(pin));
     }
 
-    let block = match execution.prepare_block_current(thread) {
+    let block = match execution.prepare_block_current_on(cpu, thread) {
         Ok(block) => block,
         Err(error) => {
             return Err(AtomicWaitBeginFailure {
@@ -600,7 +601,7 @@ pub(crate) fn begin_atomic_wait<
         Ok(blocked) => blocked,
         Err((error, ())) => {
             execution
-                .cancel_block(block)
+                .cancel_block_on(cpu, block)
                 .expect("fresh F9 block reservation remains cancellable");
             return Err(AtomicWaitBeginFailure {
                 error: AtomicWaitBeginError::Blocked(error),
@@ -623,7 +624,7 @@ pub(crate) fn begin_atomic_wait<
                     )
                     .expect("F9 missing-deadline cleanup remains exact");
                 execution
-                    .cancel_block(block)
+                    .cancel_block_on(cpu, block)
                     .expect("F9 missing-deadline block remains cancellable");
                 return Err(AtomicWaitBeginFailure {
                     error: AtomicWaitBeginError::Deadline(WaitDeadlineError::Fault),
@@ -642,7 +643,7 @@ pub(crate) fn begin_atomic_wait<
                         )
                         .expect("F9 expired deadline cleanup remains exact");
                     execution
-                        .cancel_block(block)
+                        .cancel_block_on(cpu, block)
                         .expect("F9 expired-deadline block remains cancellable");
                     return Ok(AtomicWaitBegin::TimedOut(pin));
                 }
@@ -656,7 +657,7 @@ pub(crate) fn begin_atomic_wait<
                         )
                         .expect("F9 deadline failure cleanup remains exact");
                     execution
-                        .cancel_block(block)
+                        .cancel_block_on(cpu, block)
                         .expect("F9 deadline-failure block remains cancellable");
                     return Err(AtomicWaitBeginFailure {
                         error: AtomicWaitBeginError::Deadline(error),
@@ -681,7 +682,7 @@ pub(crate) fn begin_atomic_wait<
             cancel_deadline(&mut deadline_authority, deadline_registration)
                 .expect("F9 reread mismatch deadline remains cancellable");
             execution
-                .cancel_block(block)
+                .cancel_block_on(cpu, block)
                 .expect("F9 reread mismatch block remains cancellable");
             return Ok(AtomicWaitBegin::Mismatch(pin));
         }
@@ -697,7 +698,7 @@ pub(crate) fn begin_atomic_wait<
             cancel_deadline(&mut deadline_authority, deadline_registration)
                 .expect("F9 registration failure deadline remains cancellable");
             execution
-                .cancel_block(block)
+                .cancel_block_on(cpu, block)
                 .expect("F9 registration failure block remains cancellable");
             return Err(AtomicWaitBeginFailure {
                 error: AtomicWaitBeginError::Registry(error),
@@ -731,7 +732,7 @@ pub(crate) fn begin_atomic_wait<
         cancel_deadline(&mut deadline_authority, deadline)
             .expect("unpublished F9 deadline remains cancellable");
         execution
-            .cancel_block(block)
+            .cancel_block_on(cpu, block)
             .expect("unpublished F9 block remains cancellable");
         return Err(AtomicWaitBeginFailure {
             error: AtomicWaitBeginError::Registry(error),
@@ -742,7 +743,7 @@ pub(crate) fn begin_atomic_wait<
     match execution.blocked_operations().winner(wake) {
         Ok(None) => {
             let decision = execution
-                .commit_block(block)
+                .commit_published_block_on(cpu, block)
                 .expect("registered F9 block commit remains valid");
             Ok(AtomicWaitBegin::Suspended { wake, decision })
         }
@@ -761,7 +762,7 @@ pub(crate) fn begin_atomic_wait<
             cancel_deadline(&mut deadline_authority, deadline)
                 .expect("pre-block F9 deadline remains cancellable");
             execution
-                .cancel_block(block)
+                .cancel_block_on(cpu, block)
                 .expect("pre-block F9 reservation remains cancellable");
             if winner == BlockedOperationWinner::AtomicWake {
                 Ok(AtomicWaitBegin::Ready(pin))
@@ -1405,7 +1406,9 @@ mod tests {
         assert!(registrations.cancel_if_live(registration).unwrap());
     }
 
-    fn running_fixture() -> (
+    fn running_fixture_on(
+        cpu: crate::cpu::CpuIndex,
+    ) -> (
         TaskAuthority<1, 1, 1, 2>,
         ExecutionDomain<1>,
         ProcessKey,
@@ -1447,8 +1450,21 @@ mod tests {
                 ),
             )
             .unwrap();
-        assert_eq!(execution.schedule_next().unwrap().current, Some(thread));
+        assert_eq!(
+            execution.schedule_next_on(cpu).unwrap().current,
+            Some(thread)
+        );
         (tasks, execution, process, thread, key)
+    }
+
+    fn running_fixture() -> (
+        TaskAuthority<1, 1, 1, 2>,
+        ExecutionDomain<1>,
+        ProcessKey,
+        ThreadKey,
+        AtomicWaitKey,
+    ) {
+        running_fixture_on(crate::cpu::CpuIndex::BOOTSTRAP)
     }
 
     struct ExpiredDeadline;
@@ -1471,6 +1487,62 @@ mod tests {
     }
 
     #[test]
+    fn matching_wait_on_cpu1_retains_the_exact_physical_suspended_claim() {
+        let cpu = crate::cpu::CpuIndex::new(1).unwrap();
+        let (mut tasks, execution, process, thread, key) = running_fixture_on(cpu);
+        let registrations = AtomicWaitRegistry::<1>::new();
+        let mut operations = AtomicWaitOperationRegistry::<u32, 1>::new();
+        let outcome = begin_atomic_wait(
+            0x44,
+            key,
+            7,
+            WaitDeadline::Infinite,
+            &registrations,
+            &mut tasks,
+            &execution,
+            &mut operations,
+            None,
+            cpu,
+            process,
+            thread,
+            |_| 7,
+        )
+        .unwrap_or_else(|failure| panic!("CPU1 atomic wait failed: {:?}", failure.error));
+        let AtomicWaitBegin::Suspended { wake, decision } = outcome else {
+            panic!("matching CPU1 atomic wait did not suspend")
+        };
+        assert_eq!(decision.current, None);
+        assert_eq!(
+            execution.scheduler_state(thread),
+            Some(SchedulerThreadState::Blocked)
+        );
+        assert_eq!(execution.suspended_claim_on(cpu).unwrap().thread(), thread);
+        assert!(
+            execution
+                .suspended_claim_on(crate::cpu::CpuIndex::BOOTSTRAP)
+                .is_none()
+        );
+        assert_eq!(
+            execution
+                .blocked_operations()
+                .try_claim_winner(wake, BlockedOperationWinner::AtomicWake),
+            Ok(true)
+        );
+        execution.wake(wake).unwrap();
+        let (pin, winner) = finish_atomic_wait(
+            &registrations,
+            &mut tasks,
+            &execution,
+            &mut operations,
+            None,
+            wake,
+        )
+        .unwrap();
+        assert_eq!(pin, 0x44);
+        assert_eq!(winner, BlockedOperationWinner::AtomicWake);
+    }
+
+    #[test]
     fn initial_mismatch_precedes_now_deadline() {
         let (mut tasks, execution, process, thread, key) = running_fixture();
         let registrations = AtomicWaitRegistry::<1>::new();
@@ -1485,6 +1557,7 @@ mod tests {
             &execution,
             &mut operations,
             None,
+            crate::cpu::CpuIndex::BOOTSTRAP,
             process,
             thread,
             |_| 6,
@@ -1515,6 +1588,7 @@ mod tests {
             &execution,
             &mut operations,
             Some(&mut deadlines),
+            crate::cpu::CpuIndex::BOOTSTRAP,
             process,
             thread,
             |_| 6,
@@ -1545,6 +1619,7 @@ mod tests {
             &execution,
             &mut operations,
             None,
+            crate::cpu::CpuIndex::BOOTSTRAP,
             process,
             thread,
             |_| {
@@ -1580,6 +1655,7 @@ mod tests {
             &execution,
             &mut operations,
             Some(&mut deadlines),
+            crate::cpu::CpuIndex::BOOTSTRAP,
             process,
             thread,
             |_| 7,

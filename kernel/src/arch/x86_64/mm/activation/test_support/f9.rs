@@ -737,6 +737,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     &self.execution,
                     &mut self.atomic_operations,
                     Some(&mut deadlines),
+                    crate::cpu::CpuIndex::BOOTSTRAP,
                     process,
                     thread,
                     |word| {
@@ -1013,6 +1014,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         reason = "F9 enters the scheduler-selected fresh Thread through its validated bound context"
     )]
     fn enter_scheduled_fresh_thread(&mut self) -> ! {
+        let outgoing = self
+            .execution
+            .suspended_claim_on(crate::cpu::CpuIndex::BOOTSTRAP)
+            .unwrap_or_else(|| fail(0xb8));
+        self.execution
+            .complete_switch_on(outgoing)
+            .unwrap_or_else(|_| fail(0xb8));
         if self.current_index() != 1 || !self.waiter_wait_seen {
             fail(0xb8);
         }
@@ -1039,7 +1047,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     ) -> crate::syscall::native::NativeSuspendPlan<'owner> {
         unsafe {
-            self.control.prepare_suspend(
+            self.control.prepare_suspend_on(
+                crate::cpu::CpuIndex::BOOTSTRAP,
                 &self.tasks,
                 &self.execution,
                 crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
@@ -1053,7 +1062,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     ) -> crate::syscall::native::NativeIdleSuspendPoll<'owner> {
         unsafe {
-            self.control.poll_idle(
+            self.control.poll_idle_on(
+                crate::cpu::CpuIndex::BOOTSTRAP,
                 &self.tasks,
                 &self.execution,
                 crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
@@ -1066,6 +1076,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     ) -> crate::syscall::native::NativeResumeOutcome {
+        let outgoing = self
+            .execution
+            .suspended_claim_on(crate::cpu::CpuIndex::BOOTSTRAP)
+            .unwrap_or_else(|| fail(0xbe));
+        self.execution
+            .complete_switch_on(outgoing)
+            .unwrap_or_else(|_| fail(0xbe));
         let current = self.current_thread();
         if current != self.threads[0] || self.waiter_resumed {
             fail(0xbe);
