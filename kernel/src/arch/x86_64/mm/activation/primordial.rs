@@ -4687,7 +4687,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok(())
     }
 
-    fn service_pending_timer_expiries(&mut self) {
+    fn service_pending_timer_expiries_on_bootstrap(&mut self) {
+        assert_eq!(
+            self.cpu,
+            crate::cpu::CpuIndex::BOOTSTRAP,
+            "general Timer expiry service escaped CPU0 ownership"
+        );
         let pending = {
             let mut inbox = self.shared.timer_expiries.lock();
             core::mem::replace(&mut *inbox, [None; crate::time::DEADLINE_QUEUE_CAPACITY])
@@ -5781,7 +5786,9 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         let result = {
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);
-            runtime.service_pending_timer_expiries();
+            if self.cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                runtime.service_pending_timer_expiries_on_bootstrap();
+            }
             runtime.handle(request)
         };
         crate::task::drain_runnable_work_notifications();
@@ -6272,7 +6279,6 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
 
             let scheduled = {
                 let mut runtime = self.runtime.lock();
-                runtime.service_pending_timer_expiries();
                 runtime
                     .shared
                     .execution
@@ -6411,7 +6417,9 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         let poll = {
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);
-            runtime.service_pending_timer_expiries();
+            if self.cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                runtime.service_pending_timer_expiries_on_bootstrap();
+            }
             unsafe { runtime.poll_idle_suspend_stationary() }
         };
         crate::task::drain_runnable_work_notifications();

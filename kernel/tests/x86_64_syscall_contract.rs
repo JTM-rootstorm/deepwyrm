@@ -863,14 +863,21 @@ fn live_timer_expiry_is_bound_and_serviced_only_from_carrier_safe_points() {
 
     assert!(runtime.contains("impl crate::time::TimerExpiryTarget for PrimordialRuntimeShared"));
     assert!(runtime.contains("crate::time::bind_timer_expiry_target(target)"));
-    assert!(runtime.contains("fn service_pending_timer_expiries(&mut self)"));
+    assert!(runtime.contains("fn service_pending_timer_expiries_on_bootstrap(&mut self)"));
+    assert!(runtime.contains("general Timer expiry service escaped CPU0 ownership"));
     assert!(runtime.contains(".expire(token, &self.shared.waits)"));
     assert!(runtime.contains("timer_expiries:\n        IrqSpinMutex<"));
+    assert_eq!(
+        runtime
+            .matches("runtime.service_pending_timer_expiries_on_bootstrap();")
+            .count(),
+        2
+    );
     assert!(
         runtime
-            .matches("runtime.service_pending_timer_expiries();")
+            .matches("self.cpu == crate::cpu::CpuIndex::BOOTSTRAP")
             .count()
-            >= 3
+            >= 2
     );
 }
 

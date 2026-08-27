@@ -646,9 +646,14 @@ fn h4_idle_publication_brackets_rescan_and_uses_only_coalesced_e1_wake() {
     assert!(scheduler.contains("complete_switch_on_with_runnable_publication"));
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
     assert!(primordial.contains("crate::task::notify_completed_switch_runnable(published);"));
-    assert!(primordial.contains(
-        "runtime.service_pending_timer_expiries();\n                runtime\n                    .shared\n                    .execution\n                    .schedule_next_on(self.cpu)"
-    ));
+    let ap_schedule = primordial
+        .split_once("fn enter_idle_scheduler(&mut self) -> !")
+        .expect("AP scheduling loop")
+        .1
+        .split_once("unsafe fn prepare_suspend")
+        .expect("AP scheduling loop extent")
+        .0;
+    assert!(!ap_schedule.contains("service_pending_timer_expiries_on_bootstrap"));
     assert!(primordial.contains(
         ".current\n            };\n            crate::task::drain_runnable_work_notifications();"
     ));
