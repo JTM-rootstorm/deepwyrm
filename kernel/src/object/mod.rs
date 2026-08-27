@@ -35,6 +35,10 @@ impl ObjectId {
     const fn new(domain: u64, raw: u64) -> Self {
         Self { domain, raw }
     }
+
+    pub(crate) const fn generation(self) -> u64 {
+        self.raw >> 32
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

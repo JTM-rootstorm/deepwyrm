@@ -20,6 +20,7 @@ pub(crate) const DW1C_ARM_BYTES: usize = DW1C_ACTOR_COUNT * 24;
 pub(crate) const DW1C_PROGRESS_MASK: u8 = 0x1f;
 pub(crate) const DW1C_MIGRATION_REJECT_EXECUTION_PINNED: u8 = 0x04;
 const DW1C_WAKE_GENERATION_MAX: u64 = 0x0000_ffff_ffff_ffff;
+const DW1C_LIFECYCLE_ACTOR_FIRST: usize = 8;
 const TERMINAL_EVENT: u8 = 0xff;
 const EMPTY: [u8; DW1C_EVIDENCE_RECORD_LEN] = [0; DW1C_EVIDENCE_RECORD_LEN];
 
@@ -54,6 +55,50 @@ pub(crate) struct Dw1cRecordPayload {
     pub(crate) subject: u64,
     pub(crate) generation: u64,
     pub(crate) value: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProspectiveActor {
+    process: ProcessKey,
+    process_generation: u64,
+    thread: Option<ThreadKey>,
+    start_generation: Option<u64>,
+    wait_generation: Option<u64>,
+    process_ambiguous: bool,
+    thread_ambiguous: bool,
+    start_ambiguous: bool,
+    wait_ambiguous: bool,
+}
+
+impl ProspectiveActor {
+    const fn new(process: ProcessKey, process_generation: u64) -> Self {
+        Self {
+            process,
+            process_generation,
+            thread: None,
+            start_generation: None,
+            wait_generation: None,
+            process_ambiguous: false,
+            thread_ambiguous: false,
+            start_ambiguous: false,
+            wait_ambiguous: false,
+        }
+    }
+
+    fn exact_started_identity(self, actor: Dw1cActor) -> bool {
+        !self.process_ambiguous
+            && !self.thread_ambiguous
+            && !self.start_ambiguous
+            && self.process == actor.process
+            && self.thread == Some(actor.thread)
+            && self.start_generation == Some(actor.execution_generation)
+    }
+
+    fn exact_pending_wait(self, actor: Dw1cActor) -> bool {
+        self.exact_started_identity(actor)
+            && !self.wait_ambiguous
+            && self.wait_generation == Some(actor.execution_generation)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,6 +141,7 @@ impl Dw1cKernelFacts {
 struct State {
     installed: bool,
     reporter: Option<(ProcessKey, ThreadKey)>,
+    prospective: [Option<ProspectiveActor>; DW1C_ACTOR_COUNT],
     actors: [Option<Dw1cActor>; DW1C_ACTOR_COUNT],
     progress: [u64; 5],
     cpu_ready_payload: [Option<Dw1cRecordPayload>; 4],
@@ -105,6 +151,12 @@ struct State {
     remote_wake_payload: [Option<Dw1cRecordPayload>; 4],
     steal_migrate_payload: Option<Dw1cRecordPayload>,
     migration_reject_payload: Option<Dw1cRecordPayload>,
+    exit_payload: [Option<Dw1cRecordPayload>; 2],
+    reap_payload: [Option<Dw1cRecordPayload>; 2],
+    lifecycle_process_generation: [Option<u64>; 2],
+    token6_wait_joined: bool,
+    token6_wake_seen: bool,
+    token6_run_seen: bool,
     facts: Dw1cKernelFacts,
     terminal: bool,
     failure: Option<Dw1cEvidenceError>,
@@ -115,6 +167,7 @@ impl State {
         Self {
             installed: false,
             reporter: None,
+            prospective: [None; DW1C_ACTOR_COUNT],
             actors: [None; DW1C_ACTOR_COUNT],
             progress: [0; 5],
             cpu_ready_payload: [None; 4],
@@ -124,6 +177,12 @@ impl State {
             remote_wake_payload: [None; 4],
             steal_migrate_payload: None,
             migration_reject_payload: None,
+            exit_payload: [None; 2],
+            reap_payload: [None; 2],
+            lifecycle_process_generation: [None; 2],
+            token6_wait_joined: false,
+            token6_wake_seen: false,
+            token6_run_seen: false,
             facts: Dw1cKernelFacts {
                 cpu_ready: 0,
                 run: 0,
@@ -200,6 +259,166 @@ impl Dw1cEvidenceCollector {
         Ok(())
     }
 
+    /// Retains a bounded prospective Process identity only after selector
+    /// installation. Capacity overflow is ignored here and therefore fails
+    /// closed later if ARM names an identity whose CREATE fact was not kept.
+    pub(crate) fn observe_process_create(
+        &self,
+        process: ProcessKey,
+    ) -> Result<(), Dw1cEvidenceError> {
+        let mut state = self.state.lock();
+        if !state.installed {
+            return Ok(());
+        }
+        let bound_actor = state
+            .actors
+            .iter()
+            .flatten()
+            .any(|actor| actor.process == process);
+        if let Some(prospective) = state
+            .prospective
+            .iter_mut()
+            .flatten()
+            .find(|prospective| prospective.process == process)
+        {
+            if bound_actor {
+                return Err(state.latch(Dw1cEvidenceError::Duplicate));
+            }
+            prospective.process_ambiguous = true;
+            return Ok(());
+        }
+        let Some(slot) = state.prospective.iter_mut().find(|slot| slot.is_none()) else {
+            return Ok(());
+        };
+        let generation = process.object_id().generation();
+        if generation == 0 {
+            return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
+        }
+        *slot = Some(ProspectiveActor::new(process, generation));
+        Ok(())
+    }
+
+    /// Joins a committed Thread CREATE to an already observed Process. A
+    /// second Thread does not poison unrelated work globally, but makes that
+    /// Process ineligible for exact selector ARM binding.
+    pub(crate) fn observe_thread_create(
+        &self,
+        process: ProcessKey,
+        thread: ThreadKey,
+    ) -> Result<(), Dw1cEvidenceError> {
+        let mut state = self.state.lock();
+        if !state.installed {
+            return Ok(());
+        }
+        if state.reporter.is_some() {
+            if state
+                .actors
+                .iter()
+                .flatten()
+                .any(|actor| actor.process == process)
+            {
+                return Err(state.latch(Dw1cEvidenceError::Contradiction));
+            }
+            return Ok(());
+        }
+        let Some(prospective) = state
+            .prospective
+            .iter_mut()
+            .flatten()
+            .find(|prospective| prospective.process == process)
+        else {
+            return Ok(());
+        };
+        if prospective.thread.is_some() {
+            prospective.thread_ambiguous = true;
+        } else {
+            prospective.thread = Some(thread);
+        }
+        Ok(())
+    }
+
+    /// Retains the exact scheduler-owned generation only after START has
+    /// committed. Unknown production Threads remain invisible to the selector.
+    pub(crate) fn observe_thread_start(
+        &self,
+        process: ProcessKey,
+        thread: ThreadKey,
+        execution_generation: u64,
+    ) -> Result<(), Dw1cEvidenceError> {
+        let mut state = self.state.lock();
+        if !state.installed {
+            return Ok(());
+        }
+        if state.reporter.is_some() {
+            if let Some(actor) = state
+                .actors
+                .iter()
+                .flatten()
+                .find(|actor| actor.process == process)
+            {
+                let error = if actor.thread == thread
+                    && actor.execution_generation == execution_generation
+                {
+                    Dw1cEvidenceError::Duplicate
+                } else {
+                    Dw1cEvidenceError::WrongGeneration
+                };
+                return Err(state.latch(error));
+            }
+            return Ok(());
+        }
+        let Some(prospective) = state
+            .prospective
+            .iter_mut()
+            .flatten()
+            .find(|prospective| prospective.process == process)
+        else {
+            return Ok(());
+        };
+        if prospective.thread != Some(thread)
+            || execution_generation == 0
+            || prospective.start_generation.is_some()
+        {
+            prospective.start_ambiguous = true;
+        } else {
+            prospective.start_generation = Some(execution_generation);
+        }
+        Ok(())
+    }
+
+    /// Remembers a committed pre-ARM Blocked claim. The identity is retained
+    /// without a task pin, so ARM can later prove token 6 names that existing
+    /// GO wait rather than a userspace-supplied generation.
+    pub(crate) fn observe_bound_wait_claim(
+        &self,
+        thread: ThreadKey,
+        execution_generation: u64,
+    ) -> Result<(), Dw1cEvidenceError> {
+        let mut state = self.state.lock();
+        if !state.installed {
+            return Ok(());
+        }
+        if state.reporter.is_some() {
+            return Ok(());
+        }
+        let Some(prospective) = state
+            .prospective
+            .iter_mut()
+            .flatten()
+            .find(|prospective| prospective.thread == Some(thread))
+        else {
+            return Ok(());
+        };
+        if prospective.start_generation != Some(execution_generation)
+            || prospective.wait_generation.is_some()
+        {
+            prospective.wait_ambiguous = true;
+        } else {
+            prospective.wait_generation = Some(execution_generation);
+        }
+        Ok(())
+    }
+
     pub(crate) fn arm(
         &self,
         reporter: (ProcessKey, ThreadKey),
@@ -224,7 +443,34 @@ impl Dw1cEvidenceCollector {
                 return Err(state.latch(Dw1cEvidenceError::Malformed));
             }
         }
+        let token6 = actors[5];
+        let token6_wait_joined = state
+            .prospective
+            .iter()
+            .flatten()
+            .any(|prospective| prospective.exact_pending_wait(token6));
+        if !token6_wait_joined {
+            return Err(state.latch(Dw1cEvidenceError::MissingKernelFact));
+        }
+        let mut lifecycle_generations = [None; 2];
+        for (lifecycle_index, actor) in actors[DW1C_LIFECYCLE_ACTOR_FIRST..]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let Some(prospective) = state
+                .prospective
+                .iter()
+                .flatten()
+                .find(|prospective| prospective.exact_started_identity(actor))
+            else {
+                return Err(state.latch(Dw1cEvidenceError::MissingKernelFact));
+            };
+            lifecycle_generations[lifecycle_index] = Some(prospective.process_generation);
+        }
         state.reporter = Some(reporter);
+        state.token6_wait_joined = token6_wait_joined;
+        state.lifecycle_process_generation = lifecycle_generations;
         for (slot, actor) in state.actors.iter_mut().zip(actors) {
             *slot = Some(actor);
         }
@@ -361,6 +607,14 @@ impl Dw1cEvidenceCollector {
         }
         let token = actor_token_for_claim(&state, thread, generation)
             .expect("bound remote wake retains its selector token");
+        if token == 6 && (!state.token6_wait_joined || state.token6_wake_seen) {
+            let error = if state.token6_wake_seen {
+                Dw1cEvidenceError::Duplicate
+            } else {
+                Dw1cEvidenceError::MissingKernelFact
+            };
+            return Err(state.latch(error));
+        }
         let value = u64::from(target_cpu) | (u64::from(source_cpu) << 8) | (wake_generation << 16);
         state.remote_wake_payload[index] = Some(Dw1cRecordPayload {
             subject: u64::from(token),
@@ -368,6 +622,10 @@ impl Dw1cEvidenceCollector {
             value,
         });
         state.facts.remote_wake |= bit;
+        if token == 6 {
+            state.token6_wake_seen = true;
+            update_race_bit_zero(&mut state);
+        }
         Ok(Some(token))
     }
 
@@ -441,6 +699,125 @@ impl Dw1cEvidenceCollector {
             value: u64::from(cpu) | (u64::from(reason) << 8),
         });
         state.facts.migration_reject_execution_pinned = true;
+        Ok(())
+    }
+
+    /// Records the normal Process-exit commit for lifecycle actors only. The
+    /// terminal execution generation is sampled from the live claim before
+    /// TaskAuthority commits, then joined here immediately after that commit.
+    pub(crate) fn observe_process_exit(
+        &self,
+        process: ProcessKey,
+        thread: ThreadKey,
+        terminal_thread_generation: u64,
+        code: u32,
+    ) -> Result<(), Dw1cEvidenceError> {
+        let mut state = self.state.lock();
+        if !state.installed {
+            return Ok(());
+        }
+        let Some(actor) = state
+            .actors
+            .iter()
+            .flatten()
+            .copied()
+            .find(|actor| actor.process == process)
+        else {
+            return Ok(());
+        };
+        if actor.token < 9 {
+            return Ok(());
+        }
+        if actor.token > 10 || code != 0 {
+            return Err(state.latch(Dw1cEvidenceError::Malformed));
+        }
+        if actor.thread != thread
+            || actor.execution_generation != terminal_thread_generation
+            || terminal_thread_generation == 0
+        {
+            return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
+        }
+        let index = usize::from(actor.token - 9);
+        if state.exit_payload[index].is_some() {
+            return Err(state.latch(Dw1cEvidenceError::Duplicate));
+        }
+        let expected = state
+            .exit_payload
+            .iter()
+            .position(Option::is_none)
+            .ok_or_else(|| state.latch(Dw1cEvidenceError::Duplicate))?;
+        if index != expected {
+            return Err(state.latch(Dw1cEvidenceError::Contradiction));
+        }
+        state.exit_payload[index] = Some(Dw1cRecordPayload {
+            subject: u64::from(actor.token),
+            generation: terminal_thread_generation,
+            value: 0,
+        });
+        if state.exit_payload.iter().all(Option::is_some) {
+            state.facts.lifecycle |= 0x01;
+        }
+        Ok(())
+    }
+
+    /// Records one final root retirement only after teardown and finalizer
+    /// drain. Process generation is checked against the private CREATE/ARM
+    /// bind, and the stream order is EXIT(9,10) then REAP(9,10).
+    pub(crate) fn observe_process_reap(
+        &self,
+        process: ProcessKey,
+        process_generation: u64,
+        count: u64,
+    ) -> Result<(), Dw1cEvidenceError> {
+        let mut state = self.state.lock();
+        if !state.installed {
+            return Ok(());
+        }
+        let Some(actor) = state
+            .actors
+            .iter()
+            .flatten()
+            .copied()
+            .find(|actor| actor.process == process)
+        else {
+            return Ok(());
+        };
+        if actor.token < 9 {
+            return Ok(());
+        }
+        if actor.token > 10 || count != 1 {
+            return Err(state.latch(Dw1cEvidenceError::Malformed));
+        }
+        if process.object_id().generation() != process_generation {
+            return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
+        }
+        let index = usize::from(actor.token - 9);
+        if state.reap_payload[index].is_some() {
+            return Err(state.latch(Dw1cEvidenceError::Duplicate));
+        }
+        if state.exit_payload.iter().any(Option::is_none) {
+            return Err(state.latch(Dw1cEvidenceError::MissingKernelFact));
+        }
+        let expected = state
+            .reap_payload
+            .iter()
+            .position(Option::is_none)
+            .ok_or_else(|| state.latch(Dw1cEvidenceError::Duplicate))?;
+        if index != expected {
+            return Err(state.latch(Dw1cEvidenceError::Contradiction));
+        }
+        if state.lifecycle_process_generation[index] != Some(process_generation) {
+            return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
+        }
+        state.reap_payload[index] = Some(Dw1cRecordPayload {
+            subject: u64::from(actor.token),
+            generation: process_generation,
+            value: count,
+        });
+        if state.reap_payload.iter().all(Option::is_some) {
+            state.facts.lifecycle |= 0x02;
+            state.facts.race_matrix |= 1 << 3;
+        }
         Ok(())
     }
 
@@ -544,6 +921,7 @@ impl Dw1cEvidenceCollector {
             return Err(state.latch(Dw1cEvidenceError::Malformed));
         }
         state.progress[index] = count;
+        update_race_bit_zero(&mut state);
         Ok(())
     }
 
@@ -628,6 +1006,9 @@ fn retain_cpu_payload(
         .find(|actor| actor.thread == thread && actor.execution_generation == execution_generation)
         .expect("bound actor retains its selector token")
         .token;
+    if kind == 0 && token == 6 && !state.token6_wake_seen {
+        return Err(state.latch(Dw1cEvidenceError::MissingKernelFact));
+    }
     let payload = Dw1cRecordPayload {
         subject: u64::from(token),
         generation: execution_generation,
@@ -653,6 +1034,10 @@ fn retain_cpu_payload(
         0 => {
             state.facts.run |= bit;
             state.run_payload[index] = Some(payload);
+            if token == 6 {
+                state.token6_run_seen = true;
+                update_race_bit_zero(state);
+            }
         }
         1 => {
             state.facts.quantum |= bit;
@@ -664,6 +1049,16 @@ fn retain_cpu_payload(
         }
     }
     Ok(())
+}
+
+fn update_race_bit_zero(state: &mut State) {
+    if state.token6_wait_joined
+        && state.token6_wake_seen
+        && state.token6_run_seen
+        && state.progress.iter().any(|count| *count != 0)
+    {
+        state.facts.race_matrix |= 1;
+    }
 }
 
 fn actor_bound(state: &State, process: ProcessKey, thread: ThreadKey, generation: u64) -> bool {
@@ -755,6 +1150,8 @@ fn payload_for(sequence: usize, state: &State) -> Result<Dw1cRecordPayload, Dw1c
         31..=34 => state.remote_wake_payload[sequence - 31],
         35 => state.steal_migrate_payload,
         36 => state.migration_reject_payload,
+        38..=39 => state.exit_payload[sequence - 38],
+        40..=41 => state.reap_payload[sequence - 40],
         45 => Some(Dw1cRecordPayload {
             subject: 0,
             generation: 0,
@@ -870,10 +1267,30 @@ mod tests {
         ((reporter_process, reporter_thread), actors)
     }
 
+    fn observe_prospective_actors(
+        collector: &Dw1cEvidenceCollector,
+        actors: &[Dw1cActor; DW1C_ACTOR_COUNT],
+    ) {
+        for actor in actors {
+            collector.observe_process_create(actor.process).unwrap();
+            collector
+                .observe_thread_create(actor.process, actor.thread)
+                .unwrap();
+            collector
+                .observe_thread_start(actor.process, actor.thread, actor.execution_generation)
+                .unwrap();
+        }
+        let token6 = actors[5];
+        collector
+            .observe_bound_wait_claim(token6.thread, token6.execution_generation)
+            .unwrap();
+    }
+
     fn armed_collector() -> (Dw1cEvidenceCollector, [Dw1cActor; DW1C_ACTOR_COUNT]) {
         let (reporter, actors) = distinct_actor_set();
         let collector = Dw1cEvidenceCollector::new(1, 2);
         collector.install().unwrap();
+        observe_prospective_actors(&collector, &actors);
         collector.arm(reporter, actors).unwrap();
         (collector, actors)
     }
@@ -933,6 +1350,335 @@ mod tests {
             c.arm((actors[0].process, actors[0].thread), actors)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn preinstall_lifecycle_and_wait_observations_cannot_satisfy_arm() {
+        let (reporter, actors) = distinct_actor_set();
+        let collector = Dw1cEvidenceCollector::new(1, 2);
+        for actor in actors {
+            collector.observe_process_create(actor.process).unwrap();
+            collector
+                .observe_thread_create(actor.process, actor.thread)
+                .unwrap();
+            collector
+                .observe_thread_start(actor.process, actor.thread, actor.execution_generation)
+                .unwrap();
+        }
+        collector
+            .observe_bound_wait_claim(actors[5].thread, actors[5].execution_generation)
+            .unwrap();
+        collector.install().unwrap();
+
+        assert_eq!(
+            collector.arm(reporter, actors),
+            Err(Dw1cEvidenceError::MissingKernelFact)
+        );
+        assert!(
+            collector
+                .state
+                .lock()
+                .prospective
+                .iter()
+                .all(Option::is_none)
+        );
+    }
+
+    #[test]
+    fn arm_requires_exact_lifecycle_create_start_and_token6_pending_wait() {
+        let (reporter, actors) = distinct_actor_set();
+        let missing_create = Dw1cEvidenceCollector::new(1, 2);
+        missing_create.install().unwrap();
+        for (index, actor) in actors.iter().copied().enumerate() {
+            if index != 8 {
+                missing_create
+                    .observe_process_create(actor.process)
+                    .unwrap();
+                missing_create
+                    .observe_thread_create(actor.process, actor.thread)
+                    .unwrap();
+                missing_create
+                    .observe_thread_start(actor.process, actor.thread, actor.execution_generation)
+                    .unwrap();
+            }
+        }
+        missing_create
+            .observe_bound_wait_claim(actors[5].thread, actors[5].execution_generation)
+            .unwrap();
+        assert_eq!(
+            missing_create.arm(reporter, actors),
+            Err(Dw1cEvidenceError::MissingKernelFact)
+        );
+
+        let (reporter, actors) = distinct_actor_set();
+        let missing_start = Dw1cEvidenceCollector::new(1, 2);
+        missing_start.install().unwrap();
+        for (index, actor) in actors.iter().copied().enumerate() {
+            missing_start.observe_process_create(actor.process).unwrap();
+            missing_start
+                .observe_thread_create(actor.process, actor.thread)
+                .unwrap();
+            if index != 9 {
+                missing_start
+                    .observe_thread_start(actor.process, actor.thread, actor.execution_generation)
+                    .unwrap();
+            }
+        }
+        missing_start
+            .observe_bound_wait_claim(actors[5].thread, actors[5].execution_generation)
+            .unwrap();
+        assert_eq!(
+            missing_start.arm(reporter, actors),
+            Err(Dw1cEvidenceError::MissingKernelFact)
+        );
+
+        let (reporter, actors) = distinct_actor_set();
+        let stale_wait = Dw1cEvidenceCollector::new(1, 2);
+        stale_wait.install().unwrap();
+        for actor in actors {
+            stale_wait.observe_process_create(actor.process).unwrap();
+            stale_wait
+                .observe_thread_create(actor.process, actor.thread)
+                .unwrap();
+            stale_wait
+                .observe_thread_start(actor.process, actor.thread, actor.execution_generation)
+                .unwrap();
+        }
+        stale_wait
+            .observe_bound_wait_claim(actors[5].thread, actors[5].execution_generation + 1)
+            .unwrap();
+        assert_eq!(
+            stale_wait.arm(reporter, actors),
+            Err(Dw1cEvidenceError::MissingKernelFact)
+        );
+    }
+
+    #[test]
+    fn duplicate_prospective_transitions_fail_only_if_arm_names_that_identity() {
+        let (reporter, actors) = distinct_actor_set();
+        let collector = Dw1cEvidenceCollector::new(1, 2);
+        collector.install().unwrap();
+        observe_prospective_actors(&collector, &actors);
+        collector
+            .observe_thread_start(
+                actors[8].process,
+                actors[8].thread,
+                actors[8].execution_generation,
+            )
+            .unwrap();
+        assert_eq!(
+            collector.arm(reporter, actors),
+            Err(Dw1cEvidenceError::MissingKernelFact)
+        );
+
+        let (reporter, actors) = distinct_actor_set();
+        let unrelated = Dw1cEvidenceCollector::new(1, 2);
+        unrelated.install().unwrap();
+        observe_prospective_actors(&unrelated, &actors);
+        let mut registry = ObjectRegistry::<2>::new();
+        let process =
+            ProcessKey::from_object_id(registry.create(DW_OBJECT_TYPE_PROCESS).unwrap().id());
+        let thread =
+            ThreadKey::from_object_id(registry.create(DW_OBJECT_TYPE_THREAD).unwrap().id());
+        unrelated.observe_thread_create(process, thread).unwrap();
+        unrelated.observe_thread_start(process, thread, 99).unwrap();
+        unrelated.observe_bound_wait_claim(thread, 99).unwrap();
+        unrelated.arm(reporter, actors).unwrap();
+        assert_eq!(unrelated.state.lock().failure, None);
+        assert_eq!(
+            unrelated.observe_thread_create(actors[0].process, thread),
+            Err(Dw1cEvidenceError::Contradiction)
+        );
+    }
+
+    #[test]
+    fn lifecycle_exit_and_reap_retain_exact_ordered_payloads() {
+        let (collector, actors) = armed_collector();
+        let token9 = actors[8];
+        let token10 = actors[9];
+        collector
+            .observe_process_exit(
+                token9.process,
+                token9.thread,
+                token9.execution_generation,
+                0,
+            )
+            .unwrap();
+        collector
+            .observe_process_exit(
+                token10.process,
+                token10.thread,
+                token10.execution_generation,
+                0,
+            )
+            .unwrap();
+        collector
+            .observe_process_reap(token9.process, token9.process.object_id().generation(), 1)
+            .unwrap();
+        collector
+            .observe_process_reap(token10.process, token10.process.object_id().generation(), 1)
+            .unwrap();
+
+        let state = collector.state.lock();
+        assert_eq!(state.facts.lifecycle, 0x03);
+        assert_eq!(state.facts.race_matrix & (1 << 3), 1 << 3);
+        assert_eq!(payload_for(38, &state).unwrap().subject, 9);
+        assert_eq!(
+            payload_for(38, &state).unwrap().generation,
+            token9.execution_generation
+        );
+        assert_eq!(payload_for(39, &state).unwrap().subject, 10);
+        assert_eq!(
+            payload_for(40, &state).unwrap().generation,
+            token9.process.object_id().generation()
+        );
+        assert_eq!(payload_for(40, &state).unwrap().value, 1);
+        assert_eq!(payload_for(41, &state).unwrap().subject, 10);
+    }
+
+    #[test]
+    fn lifecycle_rejects_stale_duplicate_and_out_of_order_terminal_facts() {
+        let (out_of_order, actors) = armed_collector();
+        assert_eq!(
+            out_of_order.observe_process_exit(
+                actors[9].process,
+                actors[9].thread,
+                actors[9].execution_generation,
+                0,
+            ),
+            Err(Dw1cEvidenceError::Contradiction)
+        );
+
+        let (stale, actors) = armed_collector();
+        assert_eq!(
+            stale.observe_process_exit(
+                actors[8].process,
+                actors[8].thread,
+                actors[8].execution_generation + 1,
+                0,
+            ),
+            Err(Dw1cEvidenceError::WrongGeneration)
+        );
+
+        let (duplicate, actors) = armed_collector();
+        duplicate
+            .observe_process_exit(
+                actors[8].process,
+                actors[8].thread,
+                actors[8].execution_generation,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            duplicate.observe_process_exit(
+                actors[8].process,
+                actors[8].thread,
+                actors[8].execution_generation,
+                0,
+            ),
+            Err(Dw1cEvidenceError::Duplicate)
+        );
+
+        let (early_reap, actors) = armed_collector();
+        assert_eq!(
+            early_reap.observe_process_reap(
+                actors[8].process,
+                actors[8].process.object_id().generation(),
+                1,
+            ),
+            Err(Dw1cEvidenceError::MissingKernelFact)
+        );
+
+        let (bad_count, actors) = armed_collector();
+        assert_eq!(
+            bad_count.observe_process_reap(
+                actors[8].process,
+                actors[8].process.object_id().generation(),
+                2,
+            ),
+            Err(Dw1cEvidenceError::Malformed)
+        );
+
+        let (bad_code, actors) = armed_collector();
+        assert_eq!(
+            bad_code.observe_process_exit(
+                actors[8].process,
+                actors[8].thread,
+                actors[8].execution_generation,
+                1,
+            ),
+            Err(Dw1cEvidenceError::Malformed)
+        );
+
+        let (reap_out_of_order, actors) = armed_collector();
+        for actor in actors[8..].iter().copied() {
+            reap_out_of_order
+                .observe_process_exit(actor.process, actor.thread, actor.execution_generation, 0)
+                .unwrap();
+        }
+        assert_eq!(
+            reap_out_of_order.observe_process_reap(
+                actors[9].process,
+                actors[9].process.object_id().generation(),
+                1,
+            ),
+            Err(Dw1cEvidenceError::Contradiction)
+        );
+
+        let (stale_reap, actors) = armed_collector();
+        for actor in actors[8..].iter().copied() {
+            stale_reap
+                .observe_process_exit(actor.process, actor.thread, actor.execution_generation, 0)
+                .unwrap();
+        }
+        assert_eq!(
+            stale_reap.observe_process_reap(
+                actors[8].process,
+                actors[8].process.object_id().generation() + 1,
+                1,
+            ),
+            Err(Dw1cEvidenceError::WrongGeneration)
+        );
+
+        let (duplicate_reap, actors) = armed_collector();
+        for actor in actors[8..].iter().copied() {
+            duplicate_reap
+                .observe_process_exit(actor.process, actor.thread, actor.execution_generation, 0)
+                .unwrap();
+        }
+        duplicate_reap
+            .observe_process_reap(
+                actors[8].process,
+                actors[8].process.object_id().generation(),
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            duplicate_reap.observe_process_reap(
+                actors[8].process,
+                actors[8].process.object_id().generation(),
+                1,
+            ),
+            Err(Dw1cEvidenceError::Duplicate)
+        );
+    }
+
+    #[test]
+    fn pending_wait_wake_run_and_independent_progress_form_race_zero() {
+        let (collector, actors) = armed_collector();
+        let token6 = actors[5];
+        collector.progress(actors[0].process, 1, 7, 2).unwrap();
+        collector
+            .observe_remote_wake_claim(1, 0, token6.thread, token6.execution_generation, 3)
+            .unwrap();
+        collector
+            .observe_running_claim(0, token6.thread, token6.execution_generation)
+            .unwrap();
+        let state = collector.state.lock();
+        assert!(state.token6_wait_joined);
+        assert!(state.token6_wake_seen);
+        assert!(state.token6_run_seen);
+        assert_eq!(state.facts.race_matrix & 1, 1);
     }
 
     #[test]
@@ -1271,6 +2017,16 @@ mod tests {
                 DW1C_MIGRATION_REJECT_EXECUTION_PINNED,
             )
             .unwrap();
+        for actor in actors[8..].iter().copied() {
+            collector
+                .observe_process_exit(actor.process, actor.thread, actor.execution_generation, 0)
+                .unwrap();
+        }
+        for actor in actors[8..].iter().copied() {
+            collector
+                .observe_process_reap(actor.process, actor.process.object_id().generation(), 1)
+                .unwrap();
+        }
 
         let state = collector.state.lock();
         for sequence in 0..=36 {
@@ -1279,6 +2035,11 @@ mod tests {
             assert_eq!(decoded_payload(&record), expected, "sequence {sequence}");
         }
         assert_eq!(payload_for(37, &state), Err(Dw1cEvidenceError::Incomplete));
+        for sequence in 38..=41 {
+            let expected = payload_for(sequence, &state).unwrap();
+            let record = encode_record(1, sequence as u32, event_for(sequence), expected);
+            assert_eq!(decoded_payload(&record), expected, "sequence {sequence}");
+        }
         assert_eq!(payload_for(45, &state).unwrap().generation, 0);
     }
 

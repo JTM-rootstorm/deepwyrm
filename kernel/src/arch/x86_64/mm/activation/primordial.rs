@@ -4509,6 +4509,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.cleanup
             .push_optional(self.registry.release_internal(root_pin).map_err(|_| ())?);
         self.drain_finalizers()?;
+        #[cfg(deepwyrm_dw1c_evidence)]
+        crate::test_support::DW1C_EVIDENCE
+            .observe_process_reap(process, process.object_id().generation(), 1)
+            .unwrap_or_else(|error| {
+                panic!("selector-28 Process REAP observation failed: {error:?}")
+            });
         Ok(())
     }
 
@@ -5512,6 +5518,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                         .execution
                         .current_execution_generation(thread)
                         .unwrap_or_else(|| crate::test_support::complete_fail(0x2810_e00b));
+                    if token == 6
+                        && self.shared.execution.scheduler_state(thread)
+                            != Some(SchedulerThreadState::Blocked)
+                    {
+                        crate::test_support::complete_fail(0x2810_e017)
+                    }
                     Dw1cActor {
                         token: token as u8,
                         role: role as u8,
@@ -7105,7 +7117,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                 #[cfg(any(
                     deepwyrm_wyr1_evidence,
                     deepwyrm_dw1b_evidence,
-                    deepwyrm_wyr1b_evidence
+                    deepwyrm_wyr1b_evidence,
+                    deepwyrm_dw1c_evidence
                 ))]
                 let status = crate::syscall::process_create_with_root_observed(
                     &mut user,
@@ -7119,7 +7132,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     out_result,
                     result_size,
                     &mut self.cleanup,
-                    |child| committed_child = Some(child),
+                    |child| {
+                        committed_child = Some(child);
+                        #[cfg(deepwyrm_dw1c_evidence)]
+                        crate::test_support::DW1C_EVIDENCE
+                            .observe_process_create(child)
+                            .unwrap_or_else(|error| {
+                                panic!("selector-28 Process CREATE observation failed: {error:?}")
+                            });
+                    },
                 );
                 #[cfg(not(any(
                     deepwyrm_wyr1_evidence,

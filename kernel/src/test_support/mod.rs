@@ -71,7 +71,7 @@ pub(crate) use wyr1_evidence::WYR1_EVIDENCE_RAW_SYSCALL;
 #[cfg(deepwyrm_wyr1b_evidence)]
 pub(crate) use wyr1b_evidence::WYR1B_EVIDENCE_RAW_SYSCALL;
 
-#[cfg(all(deepwyrm_dw1c_evidence, target_arch = "x86_64", target_os = "none"))]
+#[cfg(deepwyrm_dw1c_evidence)]
 pub(crate) use dw1c_evidence::{
     DW1C_ARM_BYTES, DW1C_EVIDENCE, DW1C_PROGRESS_MASK, Dw1cActor, Dw1cEvidenceError,
     Dw1cEvidenceFlushPermit,

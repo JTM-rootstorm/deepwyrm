@@ -953,6 +953,12 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     ) -> Result<super::ScheduleDecision, BlockReservationFailure> {
         let wake = reservation.wake_key();
         let decision = self.scheduler.commit_block_on(cpu, reservation)?;
+        #[cfg(deepwyrm_dw1c_evidence)]
+        crate::test_support::DW1C_EVIDENCE
+            .observe_bound_wait_claim(wake.thread(), wake.execution_generation())
+            .unwrap_or_else(|error| {
+                panic!("selector-28 pre-ARM wait observation failed: {error:?}")
+            });
         if self
             .blocked_operations
             .winner(wake)
@@ -2069,6 +2075,10 @@ impl<const CAPACITY: usize> PreparedThreadStart<'_, CAPACITY> {
         tasks
             .start_thread(self.thread)
             .unwrap_or_else(|error| panic!("prepared Thread task publication diverged: {error:?}"));
+        #[cfg(deepwyrm_dw1c_evidence)]
+        let process = tasks
+            .thread_process(self.thread)
+            .unwrap_or_else(|error| panic!("selector-28 started Thread lost Process: {error:?}"));
         let publication = self
             .execution
             .scheduler
@@ -2084,6 +2094,19 @@ impl<const CAPACITY: usize> PreparedThreadStart<'_, CAPACITY> {
                     failure.error()
                 )
             });
+        #[cfg(deepwyrm_dw1c_evidence)]
+        {
+            let generation = self
+                .execution
+                .scheduler
+                .runnable_start_generation(self.thread)
+                .unwrap_or_else(|| panic!("selector-28 START omitted Runnable generation"));
+            crate::test_support::DW1C_EVIDENCE
+                .observe_thread_start(process, self.thread, generation)
+                .unwrap_or_else(|error| {
+                    panic!("selector-28 Thread START observation failed: {error:?}")
+                });
+        }
         super::notify_runnable_work(publication.wake_affinity());
         self.completed = true;
     }

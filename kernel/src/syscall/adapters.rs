@@ -1868,7 +1868,8 @@ pub(crate) fn process_create_with_root<
 #[cfg(any(
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
-    deepwyrm_wyr1b_evidence
+    deepwyrm_wyr1b_evidence,
+    deepwyrm_dw1c_evidence
 ))]
 #[allow(
     clippy::too_many_arguments,
@@ -3863,12 +3864,20 @@ pub(crate) fn thread_create<
         Ok(pin) => pin,
         Err(status) => return status,
     };
+    #[cfg(deepwyrm_dw1c_evidence)]
+    let target_process = ProcessKey::from_object_id(process_pin.id());
     let created = tasks.create_thread(registry, &process_pin);
     release_lookup_pin(registry, process_pin, cleanup);
-    let (_key, reference) = match created {
+    let (key, reference) = match created {
         Ok(created) => created,
         Err(error) => return task_create_status(error),
     };
+    #[cfg(deepwyrm_dw1c_evidence)]
+    crate::test_support::DW1C_EVIDENCE
+        .observe_thread_create(target_process, key)
+        .unwrap_or_else(|error| panic!("selector-28 Thread CREATE observation failed: {error:?}"));
+    #[cfg(not(deepwyrm_dw1c_evidence))]
+    let _ = key;
     let handle = match tasks.process_handles_mut(current_process) {
         Ok(table) => {
             match install_created_handle(table, registry, reference, requested_rights, cleanup) {
@@ -4335,6 +4344,10 @@ pub(crate) fn prepare_process_exit<
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> Result<PreparedProcessTermination<HANDLES, THREADS>, DwStatus> {
     validate_running_caller(tasks, execution, current_process, current_thread)?;
+    #[cfg(deepwyrm_dw1c_evidence)]
+    let terminal_thread_generation = execution
+        .current_execution_generation(current_thread)
+        .unwrap_or_else(|| panic!("selector-28 exiting Thread has no exact execution claim"));
     let effects = match tasks.exit_process(registry, current_process, current_thread, code) {
         Ok(effects) => effects,
         Err(TaskError::OperationsInFlight) => {
@@ -4353,6 +4366,15 @@ pub(crate) fn prepare_process_exit<
         }
         Err(error) => return Err(task_status(error)),
     };
+    #[cfg(deepwyrm_dw1c_evidence)]
+    crate::test_support::DW1C_EVIDENCE
+        .observe_process_exit(
+            current_process,
+            current_thread,
+            terminal_thread_generation,
+            code,
+        )
+        .unwrap_or_else(|error| panic!("selector-28 Process EXIT observation failed: {error:?}"));
     let pre_retired = PreRetiredTerminalThreads::new(
         execution.quiesce_terminal_threads(effects.pins.thread_keys()),
     );
