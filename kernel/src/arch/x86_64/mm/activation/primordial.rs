@@ -277,11 +277,11 @@ const PRIMORDIAL_TABLE_CANDIDATES: usize = 6;
     deepwyrm_dw1b_evidence,
     deepwyrm_wyr1b_evidence
 )))]
-const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 17;
+const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 17;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
-const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 32;
+const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 32;
 #[cfg(deepwyrm_wrcap_relay)]
-const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 39;
+const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 39;
 // Selector 25 measured integration inputs establish a 42-page admission
 // ceiling: normal is 170,496 bytes (42 pages), and degraded recovery is
 // 169,896 bytes (42 pages). Deepwyrm owns this page ceiling and its rejection
@@ -290,11 +290,22 @@ const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 39;
 // would make the Deepwyrm revision recursively determine its own bootfs hash.
 // This selector-local bound remains separate from the accepted WYR0 bounds.
 #[cfg(deepwyrm_wyr1_evidence)]
-const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 42;
+const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 42;
 #[cfg(deepwyrm_dw1b_evidence)]
-const PRIMORDIAL_MAX_MAPPING_PAGES: usize = parse_dw1b_bootfs_pages();
+const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_dw1b_bootfs_pages();
 #[cfg(deepwyrm_wyr1b_evidence)]
-const PRIMORDIAL_MAX_MAPPING_PAGES: usize = parse_wyr1b_bootfs_pages();
+const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_wyr1b_bootfs_pages();
+const PRIMORDIAL_STACK_MAPPING_PAGES: usize =
+    crate::boot::primordial::construction::STACK_BYTES as usize / 4096;
+const _: () = assert!(crate::boot::primordial::construction::STACK_BYTES % 4096 == 0);
+// Mapping machinery must fit both the selector-local bootfs ceiling and the
+// independently owned primordial stack without widening bootfs admission.
+const PRIMORDIAL_MAX_MAPPING_PAGES: usize =
+    if PRIMORDIAL_BOOTFS_MAX_PAGES > PRIMORDIAL_STACK_MAPPING_PAGES {
+        PRIMORDIAL_BOOTFS_MAX_PAGES
+    } else {
+        PRIMORDIAL_STACK_MAPPING_PAGES
+    };
 const PRIMORDIAL_JOURNAL_ENTRIES: usize =
     PRIMORDIAL_MAX_MAPPING_PAGES + PRIMORDIAL_TABLE_CANDIDATES;
 const PRIMORDIAL_INVALIDATIONS: usize = PRIMORDIAL_MAX_MAPPING_PAGES;
@@ -4863,21 +4874,21 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     #[cfg(deepwyrm_wyr1_evidence)]
     if !matches!(
         integration_bootfs_page_count(bootfs.len()),
-        Some(1..=PRIMORDIAL_MAX_MAPPING_PAGES)
+        Some(1..=PRIMORDIAL_BOOTFS_MAX_PAGES)
     ) {
         crate::test_support::complete_fail(0x2510_b001)
     }
     #[cfg(deepwyrm_dw1b_evidence)]
     if !matches!(
         integration_bootfs_page_count(bootfs.len()),
-        Some(1..=PRIMORDIAL_MAX_MAPPING_PAGES)
+        Some(1..=PRIMORDIAL_BOOTFS_MAX_PAGES)
     ) {
         crate::test_support::complete_fail(0x2610_b001)
     }
     #[cfg(deepwyrm_wyr1b_evidence)]
     if !matches!(
         integration_bootfs_page_count(bootfs.len()),
-        Some(1..=PRIMORDIAL_MAX_MAPPING_PAGES)
+        Some(1..=PRIMORDIAL_BOOTFS_MAX_PAGES)
     ) {
         crate::test_support::complete_fail(0x2710_b001)
     }
@@ -5084,12 +5095,12 @@ mod wyr1_capacity_tests {
         assert_eq!(integration_bootfs_page_count(42 * 4096), Some(42));
         assert!(matches!(
             integration_bootfs_page_count(42 * 4096),
-            Some(1..=PRIMORDIAL_MAX_MAPPING_PAGES)
+            Some(1..=PRIMORDIAL_BOOTFS_MAX_PAGES)
         ));
         assert_eq!(integration_bootfs_page_count(42 * 4096 + 1), Some(43));
         assert!(!matches!(
             integration_bootfs_page_count(42 * 4096 + 1),
-            Some(1..=PRIMORDIAL_MAX_MAPPING_PAGES)
+            Some(1..=PRIMORDIAL_BOOTFS_MAX_PAGES)
         ));
         assert_eq!(integration_bootfs_page_count(usize::MAX), None);
     }

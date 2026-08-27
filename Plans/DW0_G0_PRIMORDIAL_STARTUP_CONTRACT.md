@@ -92,9 +92,11 @@ These are ABI-0 G implementation limits, not a stable general ELF ABI. Wyrmroot 
 
 ## 5. Primordial user stack and startup registers
 
-The primordial stack has one 4 KiB unmapped guard page followed by exactly 64 KiB of RW/NX user mapping. No executable-stack transition is permitted.
+The primordial stack has one 4 KiB unmapped guard page followed by exactly 128 KiB of RW/NX user mapping. No executable-stack transition is permitted.
 
-The highest mapped 4 KiB page is the **Wyrmroot startup block**. Deepwyrm zeroes the full stack allocation, writes startup metadata only into that top page, and sets `RSP` to the base of the startup block (`stack_top - 4096`). The 60 KiB below `RSP` remains ordinary downward-growing stack space, so the existing return validator can require a writable byte immediately below `RSP`.
+The highest mapped 4 KiB page is the **Wyrmroot startup block**. Deepwyrm zeroes the full stack allocation, writes startup metadata only into that top page at MemoryObject offset 124 KiB, and sets `RSP` to the base of the startup block (`stack_top - 4096`). The 124 KiB below `RSP` remains ordinary downward-growing stack space, so the existing return validator can require a writable byte immediately below `RSP`. The guard remains the immediately adjacent lower page.
+
+This is a functional-first increase to Deepwyrm's internal primordial-bootstrap budget, not a platform ABI change. Wyrmroot independently owns stacks for loader-created child Processes. The coordinated revision currently gives both the primordial bootstrap and Wyrmroot's legacy-v1 system-init child 128 KiB, but their stack tops, placement rules, and source constants remain distinct; changing one does not implicitly change the other.
 
 The startup block is an array of little-endian 64-bit words beginning at `RSP`:
 

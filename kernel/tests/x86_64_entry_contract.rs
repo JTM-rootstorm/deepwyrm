@@ -384,7 +384,7 @@ fn selector27_binds_reporter_start_to_fixed_stack_root_and_guard() {
     ] {
         assert!(
             evidence.contains(geometry),
-            "missing fixed loader geometry {geometry}"
+            "missing fixed Wyrmroot child geometry {geometry}"
         );
     }
     for invariant in [
@@ -735,28 +735,31 @@ fn g3_primordial_mapping_failures_remain_recoverable_and_rollback_owned_candidat
     );
     assert!(primordial.contains("cancel_zeroed(failure.into_grant())"));
     assert!(user_access.contains("cancel_zeroed(failure.into_grant())"));
-    assert!(primordial.contains("const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 17;"));
+    assert!(primordial.contains("const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 17;"));
     assert!(primordial.contains("deepwyrm_wyr1b_evidence"));
     assert!(
         primordial
-            .contains("const PRIMORDIAL_MAX_MAPPING_PAGES: usize = parse_wyr1b_bootfs_pages();")
+            .contains("const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_wyr1b_bootfs_pages();")
     );
     assert!(
         primordial.contains(
-            "#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 32;"
+            "#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 32;"
         )
     );
     assert!(
         primordial.contains(
-            "#[cfg(deepwyrm_wrcap_relay)]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 39;"
+            "#[cfg(deepwyrm_wrcap_relay)]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 39;"
         )
     );
     assert!(primordial.contains(
-        "#[cfg(deepwyrm_wyr1_evidence)]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 42;"
+        "#[cfg(deepwyrm_wyr1_evidence)]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 42;"
     ));
     assert!(primordial.contains(
-        "#[cfg(deepwyrm_dw1b_evidence)]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = parse_dw1b_bootfs_pages();"
+        "#[cfg(deepwyrm_dw1b_evidence)]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_dw1b_bootfs_pages();"
     ));
+    assert!(primordial.contains("const PRIMORDIAL_STACK_MAPPING_PAGES: usize ="));
+    assert!(primordial.contains("const PRIMORDIAL_MAX_MAPPING_PAGES: usize ="));
+    assert!(primordial.contains("if PRIMORDIAL_BOOTFS_MAX_PAGES > PRIMORDIAL_STACK_MAPPING_PAGES"));
     assert!(primordial.contains("PRIMORDIAL_MAX_MAPPING_PAGES + PRIMORDIAL_TABLE_CANDIDATES"));
     assert!(primordial.contains("PRIMORDIAL_INVALIDATIONS: usize = PRIMORDIAL_MAX_MAPPING_PAGES"));
 }
@@ -781,7 +784,7 @@ fn wyr1_bootfs_capacity_owns_the_page_ceiling_without_recursive_media_identity()
     let primordial =
         fs::read_to_string(kernel_root().join("src/arch/x86_64/mm/activation/primordial.rs"))
             .expect("read primordial runtime source");
-    assert!(primordial.contains("const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 42;"));
+    assert!(primordial.contains("const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 42;"));
     assert!(primordial.contains("170,496 bytes (42 pages)"));
     assert!(primordial.contains("169,896 bytes (42 pages)"));
     assert!(primordial.contains("Deepwyrm owns this page ceiling and its rejection"));
@@ -789,7 +792,7 @@ fn wyr1_bootfs_capacity_owns_the_page_ceiling_without_recursive_media_identity()
     assert!(primordial.contains("integration_bootfs_page_count(42 * 4096), Some(42)"));
     assert!(primordial.contains("integration_bootfs_page_count(42 * 4096 + 1), Some(43)"));
     assert!(primordial.contains("integration_bootfs_page_count(usize::MAX), None"));
-    assert!(primordial.contains("Some(1..=PRIMORDIAL_MAX_MAPPING_PAGES)"));
+    assert!(primordial.contains("Some(1..=PRIMORDIAL_BOOTFS_MAX_PAGES)"));
     assert!(primordial.contains("crate::test_support::complete_fail(0x2510_b001)"));
 }
 

@@ -70,6 +70,9 @@ struct HostBackend {
     rolled_back: bool,
     committed: bool,
     handle: DwHandle,
+    stack_object_bytes: Option<u64>,
+    stack_layout: Option<PrimordialStackLayout>,
+    startup_object_offset: Option<u64>,
     startup: Option<[u8; STARTUP_BLOCK_BYTES]>,
     capabilities: Option<[PrimordialCapabilitySpec; 3]>,
     init: Option<[u8; 64]>,
@@ -85,6 +88,9 @@ impl HostBackend {
             rolled_back: false,
             committed: false,
             handle: DwHandle(handle),
+            stack_object_bytes: None,
+            stack_layout: None,
+            startup_object_offset: None,
             startup: None,
             capabilities: None,
             init: None,
@@ -137,6 +143,7 @@ impl PrimordialConstructionBackend for HostBackend {
 
     fn create_stack_object(&mut self, byte_len: u64) -> Result<(), Self::Error> {
         assert_eq!(byte_len, STACK_BYTES);
+        self.stack_object_bytes = Some(byte_len);
         self.boundary(PrimordialConstructionStage::StackObject)
     }
 
@@ -146,6 +153,7 @@ impl PrimordialConstructionBackend for HostBackend {
             layout.mapped_end_exclusive - layout.mapped_start,
             STACK_BYTES
         );
+        self.stack_layout = Some(layout);
         self.boundary(PrimordialConstructionStage::StackMap)
     }
 
@@ -155,6 +163,7 @@ impl PrimordialConstructionBackend for HostBackend {
         bytes: &[u8; STARTUP_BLOCK_BYTES],
     ) -> Result<(), Self::Error> {
         assert_eq!(object_offset, STACK_BYTES - STARTUP_BLOCK_BYTES as u64);
+        self.startup_object_offset = Some(object_offset);
         self.startup = Some(*bytes);
         self.boundary(PrimordialConstructionStage::StartupCopy)
     }
@@ -217,6 +226,9 @@ impl PrimordialConstructionBackend for HostBackend {
     fn rollback(&mut self) {
         self.rolled_back = true;
         self.live_resources = 0;
+        self.stack_object_bytes = None;
+        self.stack_layout = None;
+        self.startup_object_offset = None;
         self.startup = None;
         self.capabilities = None;
         self.init = None;
@@ -300,6 +312,26 @@ fn constructs_exact_startup_init_and_capability_contract_before_commit() {
     assert_eq!(start[2], backend.handle.0);
     assert_eq!(start[3], STARTUP_ABI_VERSION);
     assert!(start[1].is_multiple_of(16));
+
+    assert_eq!(STACK_BYTES, 128 * 1024);
+    assert_eq!(backend.stack_object_bytes, Some(128 * 1024));
+    let stack_layout = backend.stack_layout.unwrap();
+    assert_eq!(
+        stack_layout,
+        PrimordialStackLayout {
+            guard_start: 0x0000_7fff_fffd_f000,
+            mapped_start: 0x0000_7fff_fffe_0000,
+            mapped_end_exclusive: 0x0000_8000_0000_0000,
+            startup_block_start: 0x0000_7fff_ffff_f000,
+        }
+    );
+    assert_eq!(stack_layout.mapped_start - stack_layout.guard_start, 4096);
+    assert_eq!(
+        stack_layout.mapped_end_exclusive - stack_layout.mapped_start,
+        128 * 1024
+    );
+    assert_eq!(backend.startup_object_offset, Some(124 * 1024));
+    assert_eq!(start[1], stack_layout.startup_block_start);
 
     let startup = backend.startup.unwrap();
     assert_eq!(u64::from_le_bytes(startup[0..8].try_into().unwrap()), 1);

@@ -750,22 +750,22 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
         "#[cfg(deepwyrm_wrcap_relay)]\nconst CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;"
     ));
     assert!(runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst REGISTRY_OBJECTS: usize = 48;"));
-    assert!(runtime.contains("const PRIMORDIAL_MAX_MAPPING_PAGES: usize = 17;"));
+    assert!(runtime.contains("const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 17;"));
     assert!(runtime.contains(
-        "#[cfg(deepwyrm_wyr1b_evidence)]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = parse_wyr1b_bootfs_pages();"
+        "#[cfg(deepwyrm_wyr1b_evidence)]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_wyr1b_bootfs_pages();"
     ));
     assert!(
         runtime.contains(
-            "#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 32;"
+            "#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 32;"
         )
     );
     assert!(
         runtime.contains(
-            "#[cfg(deepwyrm_wrcap_relay)]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 39;"
+            "#[cfg(deepwyrm_wrcap_relay)]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 39;"
         )
     );
     assert!(runtime.contains(
-        "#[cfg(deepwyrm_wyr1_evidence)]\nconst PRIMORDIAL_MAX_MAPPING_PAGES: usize = 42;"
+        "#[cfg(deepwyrm_wyr1_evidence)]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 42;"
     ));
 }
 

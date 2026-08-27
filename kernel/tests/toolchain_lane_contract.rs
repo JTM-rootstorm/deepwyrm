@@ -227,6 +227,32 @@ fn selector_26_environment_is_validated_before_cargo_admission() {
     assert!(String::from_utf8_lossy(&output.stderr).contains(
         "DEEPWYRM_DW1B_CHALLENGE_DIGEST must be exactly 16 uppercase hexadecimal digits"
     ));
+
+    for invalid_pages in ["01", "8193"] {
+        let output = rejected_with_env(
+            &[
+                "host",
+                "test",
+                "-p",
+                "deepwyrm-kernel",
+                "--features",
+                "test-support",
+                "--lib",
+            ],
+            &[
+                ("DEEPWYRM_GUEST_TEST_SELECTOR", "normal-preemption-up"),
+                ("DEEPWYRM_DW1B_EVIDENCE_NONCE", "D1B0A82600000001"),
+                ("DEEPWYRM_DW1B_CHALLENGE_DIGEST", "5E4E054B5C244ACE"),
+                ("DEEPWYRM_DW1B_BOOTFS_MAX_PAGES", invalid_pages),
+            ],
+        );
+        assert_eq!(output.status.code(), Some(2), "pages={invalid_pages}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("DEEPWYRM_DW1B_BOOTFS_MAX_PAGES must be canonical decimal in 1..=8192"),
+            "pages={invalid_pages}"
+        );
+    }
 }
 
 #[test]

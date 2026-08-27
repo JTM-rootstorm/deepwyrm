@@ -48,7 +48,7 @@ reporter exit before terminal evidence latches failure and reaches selector
 
 Before reporter authority is enabled, selector 27 also binds the first
 successfully started Thread in that exact Process to Wyrmroot's fixed legacy-v1
-system-init loader geometry. Deepwyrm samples the committed effective start
+system-init child geometry. Deepwyrm samples the committed effective start
 state and the Process's exact root AddressRegion, then requires:
 
 - the start RIP is nonzero and belongs to an RX mapping in that root;
@@ -58,9 +58,13 @@ state and the Process's exact root AddressRegion, then requires:
 - the immediately lower 4 KiB guard span
   `[0x0000_7fff_fffc_f000, 0x0000_7fff_fffd_0000)` has no mapping.
 
-These constants mirror the reached Wyrmroot loader contract only inside the
-selector-specialized test artifact. They do not change the public ABI or
-production behavior. A missing, duplicate, wrong-root, unbound-entry,
+These constants mirror the Wyrmroot-owned child stack only inside the
+selector-specialized test artifact. The child stack is distinct from the
+Deepwyrm-owned primordial bootstrap stack. A coordinated functional-first
+revision currently gives both mappings 128 KiB, but their tops, placement
+rules, and owners remain separate; neither constant is inferred from the
+other. This selector binder does not change the public ABI or production
+behavior. A missing, duplicate, wrong-root, unbound-entry,
 wrong-RSP, wrong-span, executable/wrong-protection stack, or mapped-guard
 observation fails closed with a distinct selector-private detail before WRB1
 reporting. Deepwyrm can bind the executable entry to the exact reporter root,

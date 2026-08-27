@@ -179,8 +179,9 @@ if [ "$selector" = normal-preemption-up ]; then
     require_upper_hex_u64 DEEPWYRM_DW1B_EVIDENCE_NONCE "$dw1b_nonce"
     require_upper_hex_u64 DEEPWYRM_DW1B_CHALLENGE_DIGEST "$dw1b_digest"
     case "$dw1b_pages" in
-        ''|0|*[!0-9]*) fail "DEEPWYRM_DW1B_BOOTFS_MAX_PAGES must be a positive decimal page count" ;;
+        ''|0|0*|*[!0-9]*) fail "DEEPWYRM_DW1B_BOOTFS_MAX_PAGES must be canonical decimal in 1..=8192" ;;
     esac
+    [ "$dw1b_pages" -le 8192 ] || fail "DEEPWYRM_DW1B_BOOTFS_MAX_PAGES must be canonical decimal in 1..=8192"
 fi
 if [ "$selector" = bootstrap-registry-launch ]; then
     wyr1b_nonce=${DEEPWYRM_WYR1B_EVIDENCE_NONCE:-}

@@ -18,8 +18,10 @@ use crate::task::{ProcessKey, ThreadKey};
 pub(crate) const WYR1B_EVIDENCE_RAW_SYSCALL: u32 = 0xffff_ff1b;
 pub(crate) const WYR1B_EVIDENCE_RECORD_LEN: usize = 96;
 pub(crate) const WYR1B_EVIDENCE_RECORD_CAPACITY: usize = 14;
-// Private selector-27 mirror of Wyrmroot's fixed legacy-v1 system-init loader
-// geometry. This is a runtime acceptance invariant, not a platform ABI.
+// Private selector-27 mirror of Wyrmroot's fixed legacy-v1 system-init child
+// geometry. This test invariant is separate from Deepwyrm's primordial
+// bootstrap stack: both are 128 KiB by coordinated revision, but their owners
+// and placements remain distinct.
 pub(crate) const WYR1B_SYSTEM_INIT_STACK_TOP: u64 = 0x0000_7fff_ffff_0000;
 pub(crate) const WYR1B_SYSTEM_INIT_STACK_BYTES: u64 = 128 * 1024;
 pub(crate) const WYR1B_SYSTEM_INIT_STACK_BOTTOM: u64 =
