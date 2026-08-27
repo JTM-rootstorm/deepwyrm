@@ -5431,6 +5431,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 
     #[cfg(deepwyrm_dw1c_evidence)]
+    fn dw1c_controller_authorized(&self) -> bool {
+        self.evidence_init_process == Some(self.process)
+            && self.shared.execution.current_thread_on(self.cpu) == Some(self.thread)
+            && self.tasks.thread_process(self.thread) == Ok(self.process)
+            && self.shared.execution.scheduler_state(self.thread)
+                == Some(SchedulerThreadState::Running)
+    }
+
+    #[cfg(deepwyrm_dw1c_evidence)]
     fn intercept_dw1c_evidence_raw(
         &mut self,
         arguments: crate::syscall::RawSyscallArguments,
@@ -5438,15 +5447,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         use crate::test_support::{DW1C_ARM_BYTES, DW1C_EVIDENCE, DW1C_PROGRESS_MASK, Dw1cActor};
 
         let values = arguments.as_array();
-        let controller = self.evidence_init_process == Some(self.process)
-            && self.shared.execution.current_thread_on(self.cpu) == Some(self.thread)
-            && self.tasks.thread_process(self.thread) == Ok(self.process)
-            && self.shared.execution.scheduler_state(self.thread)
-                == Some(SchedulerThreadState::Running);
         let phase = self.reserve_runtime_phase();
         match values[0] {
             1 => {
-                if !controller
+                if !self.dw1c_controller_authorized()
                     || values[2] != 10
                     || values[3] != DW1C_ARM_BYTES as u64
                     || values[4] != 0
@@ -5467,7 +5471,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                     )
                     .unwrap_or_else(|_| crate::test_support::complete_fail(0x2810_e002))
                 };
-                if !controller {
+                if !self.dw1c_controller_authorized() {
                     crate::test_support::complete_fail(0x2810_e003)
                 }
                 let entries = crate::test_support::dw1c_evidence::decode_arm_entries(&bytes)
@@ -5478,10 +5482,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                     .unwrap_or_else(|_| crate::test_support::complete_fail(0x2810_e005));
                 let actors = core::array::from_fn(|index| {
                     let (token, role, handle) = entries[index];
+                    let expected = (index + 1) as u64;
+                    if token != expected || role != expected {
+                        crate::test_support::complete_fail(0x2810_e006)
+                    }
                     let process = handles
                         .process_target_for_dw1c_evidence(deepwyrm_abi::DwHandle(handle))
                         .map(ProcessKey::from_object_id)
-                        .unwrap_or_else(|| crate::test_support::complete_fail(0x2810_e006));
+                        .unwrap_or_else(|| crate::test_support::complete_fail(0x2810_e016));
                     if self.tasks.process_lifecycle(process)
                         != Ok(ProcessLifecycleState::AcceptingOperations)
                     {
@@ -5502,7 +5510,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                     let generation = self
                         .shared
                         .execution
-                        .runnable_start_generation(thread)
+                        .current_execution_generation(thread)
                         .unwrap_or_else(|| crate::test_support::complete_fail(0x2810_e00b));
                     Dw1cActor {
                         token: token as u8,
@@ -5525,7 +5533,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                     .unwrap_or_else(|_| crate::test_support::complete_fail(0x2810_e011));
             }
             3 => {
-                if !controller || values[3..].iter().any(|value| *value != 0) {
+                if !self.dw1c_controller_authorized() || values[3..].iter().any(|value| *value != 0)
+                {
                     crate::test_support::complete_fail(0x2810_e012)
                 }
                 if values[1] != u64::from(DW1C_PROGRESS_MASK) {

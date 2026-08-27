@@ -2026,15 +2026,107 @@ fn dw1c3_released_blocked_thread_prefers_its_last_cpu() {
     scheduler.schedule_next_on(cpu(2)).unwrap();
     let running = scheduler.running_claim_on(cpu(2)).unwrap();
     let (blocked, decision) = scheduler.block_current_on(cpu(2), thread).unwrap();
+    let wake_key = blocked.wake_key();
     assert_eq!(decision.current, None);
     scheduler.complete_switch_on(running).unwrap();
 
     let publication = scheduler.wake_on(cpu(0), blocked.into_wake_key()).unwrap();
+    assert_eq!(publication.source(), cpu(0));
     assert_eq!(publication.target(), cpu(2));
+    assert_eq!(publication.generation(), 1);
     assert_eq!(publication.wake_affinity(), None);
+    assert_eq!(
+        scheduler.current_execution_generation(thread),
+        Some(wake_key.execution_generation())
+    );
     assert_eq!(
         scheduler.schedule_next_on(cpu(2)).unwrap().current,
         Some(thread)
+    );
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn wake_generation_is_exact_and_rollover_rejects_without_publication() {
+    let scheduler = CooperativeScheduler::<1>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let thread = thread_key(&mut registry);
+    scheduler
+        .commit_on(cpu(2), scheduler.reserve(thread).unwrap())
+        .unwrap();
+    scheduler.schedule_next_on(cpu(2)).unwrap();
+    let running = scheduler.running_claim_on(cpu(2)).unwrap();
+    let (blocked, decision) = scheduler.block_current_on(cpu(2), thread).unwrap();
+    let key = blocked.wake_key();
+    assert_eq!(decision.current, None);
+    scheduler.complete_switch_on(running).unwrap();
+    let accounting_before = scheduler.counters_on(cpu(2));
+
+    scheduler.state.lock().next_wake_generation = u64::MAX;
+    assert_eq!(
+        scheduler.wake_on(cpu(0), key),
+        Err(SchedulerError::TokenExhausted)
+    );
+    assert_eq!(scheduler.state(thread), Some(SchedulerThreadState::Blocked));
+    assert_eq!(scheduler.counters_on(cpu(2)), accounting_before);
+    assert_eq!(scheduler.state.lock().next_wake_generation, u64::MAX);
+
+    scheduler.state.lock().next_wake_generation = 0;
+    assert_eq!(
+        scheduler.wake_on(cpu(0), key),
+        Err(SchedulerError::TokenExhausted)
+    );
+    assert_eq!(scheduler.state(thread), Some(SchedulerThreadState::Blocked));
+
+    scheduler.state.lock().next_wake_generation = 41;
+    let publication = scheduler.wake_on(cpu(0), key).unwrap();
+    assert_eq!(publication.source(), cpu(0));
+    assert_eq!(publication.target(), cpu(2));
+    assert_eq!(publication.generation(), 41);
+    assert_eq!(scheduler.state.lock().next_wake_generation, 42);
+    assert_eq!(
+        scheduler.wake_on(cpu(0), key),
+        Err(SchedulerError::StaleBlockToken)
+    );
+    assert_eq!(scheduler.state.lock().next_wake_generation, 42);
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn current_execution_generation_joins_runnable_running_blocked_and_woken_states() {
+    let scheduler = CooperativeScheduler::<1>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let thread = thread_key(&mut registry);
+    scheduler
+        .commit_on(cpu(1), scheduler.reserve(thread).unwrap())
+        .unwrap();
+    let generation = scheduler.runnable_start_generation(thread).unwrap();
+    assert_eq!(
+        scheduler.current_execution_generation(thread),
+        Some(generation)
+    );
+
+    scheduler.schedule_next_on(cpu(1)).unwrap();
+    assert_eq!(
+        scheduler.current_execution_generation(thread),
+        Some(generation)
+    );
+    let running = scheduler.running_claim_on(cpu(1)).unwrap();
+    let (blocked, decision) = scheduler.block_current_on(cpu(1), thread).unwrap();
+    assert_eq!(decision.current, None);
+    assert_eq!(
+        scheduler.current_execution_generation(thread),
+        Some(running.generation())
+    );
+    scheduler.complete_switch_on(running).unwrap();
+    assert_eq!(
+        scheduler.current_execution_generation(thread),
+        Some(running.generation())
+    );
+    scheduler.wake_on(cpu(0), blocked.into_wake_key()).unwrap();
+    assert_eq!(
+        scheduler.current_execution_generation(thread),
+        Some(running.generation())
     );
     assert_eq!(scheduler.check_invariants(), Ok(()));
 }
@@ -2112,14 +2204,19 @@ fn dw1c3_idle_steal_is_cyclic_oldest_and_transactionally_accounted() {
         .commit_on(cpu(2), scheduler.reserve(later_victim).unwrap())
         .unwrap();
 
-    assert_eq!(
-        scheduler.schedule_next_on(cpu(0)).unwrap().current,
-        Some(oldest)
-    );
-    let migration = scheduler
-        .last_migration()
-        .expect("idle dispatch records its steal");
+    let expected_execution_generation = scheduler.runnable_start_generation(oldest).unwrap();
+    let dispatch = scheduler.schedule_next_on_with_migration(cpu(0)).unwrap();
+    let decision = dispatch.decision();
+    assert_eq!(decision.current, Some(oldest));
+    let migration = dispatch
+        .migration()
+        .expect("idle dispatch carries its exact steal");
+    assert_eq!(scheduler.last_migration(), Some(migration));
     assert_eq!(migration.thread, oldest);
+    assert_eq!(
+        migration.execution_generation,
+        expected_execution_generation
+    );
     assert_eq!(migration.source, cpu(1));
     assert_eq!(migration.target, cpu(0));
     assert_ne!(migration.generation, 0);
@@ -2192,9 +2289,9 @@ fn dw1c3_failed_migration_preserves_source_exactly_once() {
 #[test]
 fn dw1c4_external_authority_exclusions_leave_the_source_queued() {
     for exclusion in [
-        MigrationTestExclusion::ExecutionPinned,
-        MigrationTestExclusion::ScratchPinned,
-        MigrationTestExclusion::TlbRendezvousPending,
+        SchedulerMigrationRejectionReason::ExecutionPinned,
+        SchedulerMigrationRejectionReason::ScratchPinned,
+        SchedulerMigrationRejectionReason::RendezvousPending,
     ] {
         let scheduler = CooperativeScheduler::<1>::new();
         let mut registry = ObjectRegistry::<16>::new();
@@ -2204,7 +2301,22 @@ fn dw1c4_external_authority_exclusions_leave_the_source_queued() {
             .unwrap();
         let source_before = scheduler.counters_on(cpu(1));
         let target_before = scheduler.counters_on(cpu(0));
-        scheduler.set_migration_test_exclusion(subject, exclusion);
+        let generation = scheduler.runnable_start_generation(subject).unwrap();
+        scheduler
+            .set_migration_exclusion(subject, generation, exclusion)
+            .unwrap();
+
+        assert_eq!(
+            scheduler
+                .probe_migration_rejection_on(cpu(0), subject, generation)
+                .unwrap(),
+            SchedulerMigrationRejection {
+                thread: subject,
+                execution_generation: generation,
+                cpu: cpu(0),
+                reason: exclusion,
+            }
+        );
 
         assert_eq!(scheduler.schedule_next_on(cpu(0)).unwrap().current, None);
         assert_eq!(
@@ -2215,8 +2327,58 @@ fn dw1c4_external_authority_exclusions_leave_the_source_queued() {
         assert_eq!(scheduler.counters_on(cpu(1)), source_before);
         assert_eq!(scheduler.counters_on(cpu(0)), target_before);
         assert_eq!(scheduler.last_migration(), None);
+        scheduler
+            .clear_migration_exclusion(subject, generation, exclusion)
+            .unwrap();
         assert_eq!(scheduler.check_invariants(), Ok(()));
     }
+}
+
+#[test]
+fn selector_migration_exclusion_set_probe_clear_is_generation_exact_and_retryable() {
+    let scheduler = CooperativeScheduler::<1>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let subject = thread_key(&mut registry);
+    scheduler
+        .commit_on(cpu(1), scheduler.reserve(subject).unwrap())
+        .unwrap();
+    let generation = scheduler.runnable_start_generation(subject).unwrap();
+    let reason = SchedulerMigrationRejectionReason::ExecutionPinned;
+
+    assert_eq!(
+        scheduler.set_migration_exclusion(subject, generation + 1, reason),
+        Err(SchedulerError::StaleExecutionClaim)
+    );
+    scheduler
+        .set_migration_exclusion(subject, generation, reason)
+        .unwrap();
+    assert_eq!(
+        scheduler.probe_migration_rejection_on(cpu(1), subject, generation),
+        Err(SchedulerError::StaleExecutionClaim)
+    );
+    assert_eq!(
+        scheduler.clear_migration_exclusion(
+            subject,
+            generation,
+            SchedulerMigrationRejectionReason::ScratchPinned,
+        ),
+        Err(SchedulerError::StaleExecutionClaim)
+    );
+    assert_eq!(
+        scheduler
+            .probe_migration_rejection_on(cpu(0), subject, generation)
+            .unwrap()
+            .reason,
+        reason
+    );
+    scheduler
+        .clear_migration_exclusion(subject, generation, reason)
+        .unwrap();
+    let dispatch = scheduler.schedule_next_on_with_migration(cpu(0)).unwrap();
+    let decision = dispatch.decision();
+    assert_eq!(decision.current, Some(subject));
+    assert!(dispatch.migration().is_some());
+    assert_eq!(scheduler.check_invariants(), Ok(()));
 }
 
 #[test]

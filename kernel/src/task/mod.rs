@@ -53,6 +53,10 @@ pub(crate) use scheduler::{
     SchedulerThreadState,
 };
 
+#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[allow(unused_imports)]
+pub(crate) use scheduler::SchedulerMigrationRejectionReason;
+
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 fn scheduler_requester_cpu() -> SchedulerCpuId {
     crate::arch::x86_64::syscall::current_cpu_index_for_scheduler_request()

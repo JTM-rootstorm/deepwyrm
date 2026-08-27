@@ -245,6 +245,33 @@ pub(crate) struct RunnablePublication {
     continuation_bound: bool,
 }
 
+/// Exact successful blocked-to-Runnable wake publication. The wake generation
+/// is scheduler-owned and advances only with this committed transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SchedulerWakePublication {
+    runnable: RunnablePublication,
+    source: SchedulerCpuId,
+    generation: u64,
+}
+
+impl SchedulerWakePublication {
+    pub(crate) const fn target(self) -> SchedulerCpuId {
+        self.runnable.target()
+    }
+
+    pub(crate) const fn source(self) -> SchedulerCpuId {
+        self.source
+    }
+
+    pub(crate) const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) const fn wake_affinity(self) -> Option<SchedulerCpuId> {
+        self.runnable.wake_affinity()
+    }
+}
+
 /// Exact successful continuation-release commit returned after scheduler
 /// authority has been dropped. Selector-private evidence consumes the
 /// generation only outside the scheduler lock.
@@ -273,10 +300,83 @@ impl SchedulerCompletedSwitch {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SchedulerMigrationRecord {
     pub(crate) thread: ThreadKey,
+    pub(crate) execution_generation: u64,
     pub(crate) source: SchedulerCpuId,
     pub(crate) target: SchedulerCpuId,
     pub(crate) generation: u64,
     pub(crate) enqueue_generation: u64,
+}
+
+/// Scheduler dispatch result that carries an exact committed migration to the
+/// execution facade without enlarging the common scheduling decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SchedulerDispatch {
+    decision: ScheduleDecision,
+    migration: Option<SchedulerMigrationRecord>,
+}
+
+impl SchedulerDispatch {
+    pub(crate) const fn decision(self) -> ScheduleDecision {
+        self.decision
+    }
+
+    pub(crate) const fn migration(self) -> Option<SchedulerMigrationRecord> {
+        self.migration
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SchedulerIdleDispatch {
+    decision: IdleScheduleDecision,
+    migration: Option<SchedulerMigrationRecord>,
+}
+
+impl SchedulerIdleDispatch {
+    pub(crate) const fn decision(self) -> IdleScheduleDecision {
+        self.decision
+    }
+
+    pub(crate) const fn migration(self) -> Option<SchedulerMigrationRecord> {
+        self.migration
+    }
+}
+
+/// Selector-private migration exclusions use the same fixed reason ordering
+/// as the DW1-A contract. They are absent from ordinary production kernels.
+#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[allow(
+    dead_code,
+    reason = "the fixed rejection code set is validated across phased selector fixtures"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum SchedulerMigrationRejectionReason {
+    Running = 0x01,
+    BlockPreparing = 0x02,
+    ContinuationBound = 0x03,
+    ExecutionPinned = 0x04,
+    ScratchPinned = 0x05,
+    RootSwitching = 0x06,
+    StopPending = 0x07,
+    RendezvousPending = 0x08,
+    Terminal = 0x09,
+    NotRevalidatable = 0x0a,
+}
+
+#[cfg(any(test, deepwyrm_dw1c_evidence))]
+impl SchedulerMigrationRejectionReason {
+    pub(crate) const fn code(self) -> u8 {
+        self as u8
+    }
+}
+
+#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SchedulerMigrationRejection {
+    pub(crate) thread: ThreadKey,
+    pub(crate) execution_generation: u64,
+    pub(crate) cpu: SchedulerCpuId,
+    pub(crate) reason: SchedulerMigrationRejectionReason,
 }
 
 impl RunnablePublication {
@@ -332,21 +432,9 @@ struct QueueEntry {
     enqueue_generation: u64,
     migration_generation: u64,
     migration_eligibility_generation: u64,
-    #[cfg(test)]
-    migration_test_exclusion: MigrationTestExclusion,
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    migration_exclusion: Option<SchedulerMigrationRejectionReason>,
     ready_at_ns: Option<u64>,
-}
-
-/// Test-only representation of external authorities that C0 confines to a
-/// Running or suspended generation. It exercises the scheduler's exact
-/// migration revalidation without introducing a live cross-subsystem API.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MigrationTestExclusion {
-    None,
-    ExecutionPinned,
-    ScratchPinned,
-    TlbRendezvousPending,
 }
 
 const SCHEDULER_TRACE_CAPACITY: usize = 64;
@@ -587,6 +675,7 @@ struct SchedulerState<const CAPACITY: usize> {
     next_migration_generation: u64,
     next_migration_eligibility_generation: u64,
     next_idle_generation: u64,
+    next_wake_generation: u64,
     next_completed_switch_generation: u64,
     next_quantum_generation: [u64; H2_SCHEDULER_CPU_CAPACITY],
     queue: [Option<QueueEntry>; CAPACITY],
@@ -617,6 +706,7 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             next_migration_generation: 1,
             next_migration_eligibility_generation: 1,
             next_idle_generation: 1,
+            next_wake_generation: 1,
             next_completed_switch_generation: 1,
             next_quantum_generation: [1; H2_SCHEDULER_CPU_CAPACITY],
             queue: [None; CAPACITY],
@@ -782,6 +872,24 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         victim: SchedulerCpuId,
         target: SchedulerCpuId,
     ) -> bool {
+        self.entry_migratable_without_external_exclusion(entry, victim, target) && {
+            #[cfg(any(test, deepwyrm_dw1c_evidence))]
+            {
+                entry.migration_exclusion.is_none()
+            }
+            #[cfg(not(any(test, deepwyrm_dw1c_evidence)))]
+            {
+                true
+            }
+        }
+    }
+
+    fn entry_migratable_without_external_exclusion(
+        &self,
+        entry: QueueEntry,
+        victim: SchedulerCpuId,
+        target: SchedulerCpuId,
+    ) -> bool {
         entry.state == SchedulerThreadState::Runnable
             && entry.target_cpu == victim
             && entry.token == 0
@@ -790,16 +898,6 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             && entry.continuation_cpu.is_none()
             && entry.continuation_generation == 0
             && entry.migration_eligibility_generation != 0
-            && {
-                #[cfg(test)]
-                {
-                    entry.migration_test_exclusion == MigrationTestExclusion::None
-                }
-                #[cfg(not(test))]
-                {
-                    true
-                }
-            }
             && self.cpu_admissible(target, entry.eligibility_mask)
             && !self
                 .running
@@ -871,7 +969,10 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         }))
     }
 
-    fn steal_oldest_for(&mut self, target: SchedulerCpuId) -> Result<bool, SchedulerError> {
+    fn steal_oldest_for(
+        &mut self,
+        target: SchedulerCpuId,
+    ) -> Result<Option<SchedulerMigrationRecord>, SchedulerError> {
         let mask = self.schedulable_mask();
         for offset in 1..H2_SCHEDULER_CPU_CAPACITY {
             let victim_index = (target.index() + offset) % H2_SCHEDULER_CPU_CAPACITY;
@@ -907,18 +1008,20 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
                 .expect("validated migration source remains queued");
             entry.target_cpu = target;
             entry.migration_generation = generation;
-            self.last_migration = Some(SchedulerMigrationRecord {
+            let migration = SchedulerMigrationRecord {
                 thread: entry.thread,
+                execution_generation: entry.started_execution_generation,
                 source: victim,
                 target,
                 generation,
                 enqueue_generation: entry.enqueue_generation,
-            });
+            };
+            self.last_migration = Some(migration);
             self.next_migration_generation = next_generation;
             self.accounting = accounting;
-            return Ok(true);
+            return Ok(Some(migration));
         }
-        Ok(false)
+        Ok(None)
     }
 
     fn running_cpu(&self, thread: ThreadKey) -> Option<SchedulerCpuId> {
@@ -948,6 +1051,18 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
 
     fn checked_completed_switch_generation(&self) -> Result<(u64, u64), SchedulerError> {
         let generation = self.next_completed_switch_generation;
+        if generation == 0 {
+            return Err(SchedulerError::TokenExhausted);
+        }
+        let next = generation
+            .checked_add(1)
+            .filter(|next| *next != 0)
+            .ok_or(SchedulerError::TokenExhausted)?;
+        Ok((generation, next))
+    }
+
+    fn checked_wake_generation(&self) -> Result<(u64, u64), SchedulerError> {
+        let generation = self.next_wake_generation;
         if generation == 0 {
             return Err(SchedulerError::TokenExhausted);
         }
@@ -1001,6 +1116,9 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             return Err(SchedulerError::AccountingOverflow);
         }
         if self.next_completed_switch_generation == 0 {
+            return Err(SchedulerError::TokenExhausted);
+        }
+        if self.next_wake_generation == 0 {
             return Err(SchedulerError::TokenExhausted);
         }
         if self.len > CAPACITY || self.queue[self.len..].iter().any(Option::is_some) {
@@ -1218,8 +1336,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             enqueue_generation: 0,
             migration_generation: 0,
             migration_eligibility_generation: 0,
-            #[cfg(test)]
-            migration_test_exclusion: MigrationTestExclusion::None,
+            #[cfg(any(test, deepwyrm_dw1c_evidence))]
+            migration_exclusion: None,
             ready_at_ns: None,
         })?;
         state.next_token = next_token;
@@ -1368,6 +1486,14 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         &self,
         cpu: SchedulerCpuId,
     ) -> Result<ScheduleDecision, SchedulerError> {
+        self.schedule_next_on_with_migration(cpu)
+            .map(SchedulerDispatch::decision)
+    }
+
+    pub(crate) fn schedule_next_on_with_migration(
+        &self,
+        cpu: SchedulerCpuId,
+    ) -> Result<SchedulerDispatch, SchedulerError> {
         let mut state = self.state.lock();
         let cpu_index = cpu.index();
         if state.carrier_admission.enforced
@@ -1384,9 +1510,11 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         if state.active_idle[cpu_index].is_some() {
             return Err(SchedulerError::IdleAccountingActive);
         }
-        if state.first_local_runnable_index(cpu).is_none() {
-            state.steal_oldest_for(cpu)?;
-        }
+        let migration = if state.first_local_runnable_index(cpu).is_none() {
+            state.steal_oldest_for(cpu)?
+        } else {
+            None
+        };
         let next_entry = state.queue[..state.len]
             .iter()
             .flatten()
@@ -1427,10 +1555,13 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             );
         }
         state.assert_invariants();
-        Ok(ScheduleDecision {
-            previous: None,
-            current: current.map(|claim| claim.thread),
-            cancelled_quantum: None,
+        Ok(SchedulerDispatch {
+            decision: ScheduleDecision {
+                previous: None,
+                current: current.map(|claim| claim.thread),
+                cancelled_quantum: None,
+            },
+            migration,
         })
     }
 
@@ -1527,8 +1658,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 enqueue_generation,
                 migration_generation: 0,
                 migration_eligibility_generation: 0,
-                #[cfg(test)]
-                migration_test_exclusion: MigrationTestExclusion::None,
+                #[cfg(any(test, deepwyrm_dw1c_evidence))]
+                migration_exclusion: None,
                 ready_at_ns,
             })
             .expect("replacing one Running Thread preserves scheduler capacity");
@@ -1762,8 +1893,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 enqueue_generation,
                 migration_generation: 0,
                 migration_eligibility_generation: 0,
-                #[cfg(test)]
-                migration_test_exclusion: MigrationTestExclusion::None,
+                #[cfg(any(test, deepwyrm_dw1c_evidence))]
+                migration_exclusion: None,
                 ready_at_ns,
             })
             .expect("replacing one Running Thread preserves scheduler capacity");
@@ -1944,8 +2075,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 enqueue_generation: 0,
                 migration_generation: 0,
                 migration_eligibility_generation: 0,
-                #[cfg(test)]
-                migration_test_exclusion: MigrationTestExclusion::None,
+                #[cfg(any(test, deepwyrm_dw1c_evidence))]
+                migration_exclusion: None,
                 ready_at_ns: None,
             })
             .expect("moving one Running Thread to the queue preserves scheduler capacity");
@@ -1993,14 +2124,14 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         key: BlockWakeKey,
     ) -> Result<Option<SchedulerCpuId>, SchedulerError> {
         self.wake_on(key.cpu, key)
-            .map(RunnablePublication::wake_affinity)
+            .map(SchedulerWakePublication::wake_affinity)
     }
 
     pub(crate) fn wake_on(
         &self,
         requester: SchedulerCpuId,
         key: BlockWakeKey,
-    ) -> Result<RunnablePublication, SchedulerError> {
+    ) -> Result<SchedulerWakePublication, SchedulerError> {
         let mut state = self.state.lock();
         if key.domain != state.domain {
             return Err(SchedulerError::ForeignBlockToken);
@@ -2020,6 +2151,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         let Some(target) = state.select_placement(blocked, requester) else {
             return Err(SchedulerError::CarrierUnavailable);
         };
+        let (wake_generation, next_wake_generation) = state.checked_wake_generation()?;
         let eligibility = if blocked.continuation_cpu.is_none() {
             let generation = state.next_migration_eligibility_generation;
             let next = generation
@@ -2049,6 +2181,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             .expect("validated blocked scheduler entry remains queued");
         entry.state = SchedulerThreadState::Runnable;
         entry.token = 0;
+        entry.started_execution_generation = key.execution_generation;
         entry.block_cpu = None;
         entry.block_execution_generation = 0;
         entry.target_cpu = target;
@@ -2059,6 +2192,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         if let Some((_, next)) = eligibility {
             state.next_migration_eligibility_generation = next;
         }
+        state.next_wake_generation = next_wake_generation;
         state.accounting = accounting;
         state.record_trace(
             SchedulerTraceKind::Wake,
@@ -2067,9 +2201,13 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             key.execution_generation,
         );
         state.assert_invariants();
-        Ok(RunnablePublication {
-            target,
-            continuation_bound: blocked.continuation_cpu.is_some(),
+        Ok(SchedulerWakePublication {
+            runnable: RunnablePublication {
+                target,
+                continuation_bound: blocked.continuation_cpu.is_some(),
+            },
+            source: requester,
+            generation: wake_generation,
         })
     }
 
@@ -2123,6 +2261,15 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         cpu: SchedulerCpuId,
         suspended: ThreadKey,
     ) -> Result<IdleScheduleDecision, SchedulerError> {
+        self.schedule_from_idle_on_with_migration(cpu, suspended)
+            .map(SchedulerIdleDispatch::decision)
+    }
+
+    pub(crate) fn schedule_from_idle_on_with_migration(
+        &self,
+        cpu: SchedulerCpuId,
+        suspended: ThreadKey,
+    ) -> Result<SchedulerIdleDispatch, SchedulerError> {
         let mut state = self.state.lock();
         let cpu_index = cpu.index();
         if state.carrier_admission.enforced
@@ -2151,9 +2298,11 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                     && (entry.continuation_cpu.is_none() || entry.continuation_cpu == Some(cpu))
             })
         });
-        if !local_runnable {
-            state.steal_oldest_for(cpu)?;
-        }
+        let migration = if !local_runnable {
+            state.steal_oldest_for(cpu)?
+        } else {
+            None
+        };
         let next_entry = state.queue[..state.len]
             .iter()
             .flatten()
@@ -2166,7 +2315,10 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         let mut accounting = state.accounting;
         let Some(next_entry) = next_entry else {
             state.assert_invariants();
-            return Ok(IdleScheduleDecision::ContinueIdle);
+            return Ok(SchedulerIdleDispatch {
+                decision: IdleScheduleDecision::ContinueIdle,
+                migration,
+            });
         };
         let mut accounting_result = accounting
             .decrement_runnable(next_entry.target_cpu)
@@ -2199,14 +2351,20 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         if next.thread == suspended {
             state.suspended[cpu_index] = None;
             state.assert_invariants();
-            Ok(IdleScheduleDecision::ResumeCurrent)
+            Ok(SchedulerIdleDispatch {
+                decision: IdleScheduleDecision::ResumeCurrent,
+                migration,
+            })
         } else {
             state.assert_invariants();
-            Ok(IdleScheduleDecision::Switch(ScheduleDecision {
-                previous: Some(suspended),
-                current: Some(next.thread),
-                cancelled_quantum: None,
-            }))
+            Ok(SchedulerIdleDispatch {
+                decision: IdleScheduleDecision::Switch(ScheduleDecision {
+                    previous: Some(suspended),
+                    current: Some(next.thread),
+                    cancelled_quantum: None,
+                }),
+                migration,
+            })
         }
     }
 
@@ -2628,6 +2786,52 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         })
     }
 
+    /// Selector-private exact identity resolver used while ARM inspects a
+    /// started actor. The scheduler lock joins Running, queued Runnable, and
+    /// Blocked/suspended ownership without exposing this identity as ABI.
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    pub(crate) fn current_execution_generation(&self, thread: ThreadKey) -> Option<u64> {
+        let state = self.state.lock();
+        if let Some(claim) = state
+            .running
+            .iter()
+            .flatten()
+            .find(|claim| claim.thread == thread)
+        {
+            return Some(claim.generation);
+        }
+        let entry = state.queue[..state.len]
+            .iter()
+            .flatten()
+            .find(|entry| entry.thread == thread);
+        match entry {
+            Some(entry)
+                if entry.state == SchedulerThreadState::Runnable
+                    && entry.started_execution_generation != 0 =>
+            {
+                Some(entry.started_execution_generation)
+            }
+            Some(entry)
+                if entry.state == SchedulerThreadState::Runnable
+                    && entry.continuation_generation != 0 =>
+            {
+                Some(entry.continuation_generation)
+            }
+            Some(entry)
+                if entry.state == SchedulerThreadState::Blocked
+                    && entry.block_execution_generation != 0 =>
+            {
+                Some(entry.block_execution_generation)
+            }
+            _ => state
+                .suspended
+                .iter()
+                .flatten()
+                .find(|claim| claim.thread == thread)
+                .map(|claim| claim.generation),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn check_invariants(&self) -> Result<(), SchedulerError> {
         self.state.lock().check_invariants()
@@ -2643,18 +2847,92 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         self.state.lock().last_migration
     }
 
-    #[cfg(test)]
-    fn set_migration_test_exclusion(&self, thread: ThreadKey, exclusion: MigrationTestExclusion) {
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    pub(crate) fn set_migration_exclusion(
+        &self,
+        thread: ThreadKey,
+        execution_generation: u64,
+        exclusion: SchedulerMigrationRejectionReason,
+    ) -> Result<(), SchedulerError> {
         let mut state = self.state.lock();
         let len = state.len;
-        let entry = state.queue[..len]
+        let Some(entry) = state.queue[..len]
             .iter_mut()
             .flatten()
             .find(|entry| entry.thread == thread)
-            .expect("test migration exclusion names one queued Thread");
-        assert_eq!(entry.state, SchedulerThreadState::Runnable);
-        entry.migration_test_exclusion = exclusion;
+        else {
+            return Err(SchedulerError::NotScheduled);
+        };
+        if execution_generation == 0
+            || entry.state != SchedulerThreadState::Runnable
+            || entry.started_execution_generation != execution_generation
+            || entry.migration_exclusion.is_some()
+        {
+            return Err(SchedulerError::StaleExecutionClaim);
+        }
+        entry.migration_exclusion = Some(exclusion);
         state.assert_invariants();
+        Ok(())
+    }
+
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    pub(crate) fn probe_migration_rejection_on(
+        &self,
+        cpu: SchedulerCpuId,
+        thread: ThreadKey,
+        execution_generation: u64,
+    ) -> Result<SchedulerMigrationRejection, SchedulerError> {
+        let state = self.state.lock();
+        let Some(entry) = state.queue[..state.len]
+            .iter()
+            .flatten()
+            .find(|entry| entry.thread == thread)
+        else {
+            return Err(SchedulerError::NotScheduled);
+        };
+        if execution_generation == 0
+            || entry.started_execution_generation != execution_generation
+            || entry.target_cpu == cpu
+            || !state.entry_migratable_without_external_exclusion(*entry, entry.target_cpu, cpu)
+        {
+            return Err(SchedulerError::StaleExecutionClaim);
+        }
+        let reason = entry
+            .migration_exclusion
+            .ok_or(SchedulerError::StaleExecutionClaim)?;
+        Ok(SchedulerMigrationRejection {
+            thread,
+            execution_generation,
+            cpu,
+            reason,
+        })
+    }
+
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    pub(crate) fn clear_migration_exclusion(
+        &self,
+        thread: ThreadKey,
+        execution_generation: u64,
+        exclusion: SchedulerMigrationRejectionReason,
+    ) -> Result<(), SchedulerError> {
+        let mut state = self.state.lock();
+        let len = state.len;
+        let Some(entry) = state.queue[..len]
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.thread == thread)
+        else {
+            return Err(SchedulerError::NotScheduled);
+        };
+        if entry.state != SchedulerThreadState::Runnable
+            || entry.started_execution_generation != execution_generation
+            || entry.migration_exclusion != Some(exclusion)
+        {
+            return Err(SchedulerError::StaleExecutionClaim);
+        }
+        entry.migration_exclusion = None;
+        state.assert_invariants();
+        Ok(())
     }
 
     /// Supplies a sampled monotonic-active timestamp for the immediately

@@ -18,6 +18,8 @@ pub(crate) const DW1C_EVIDENCE_RECORD_CAPACITY: usize = 46;
 pub(crate) const DW1C_ACTOR_COUNT: usize = 10;
 pub(crate) const DW1C_ARM_BYTES: usize = DW1C_ACTOR_COUNT * 24;
 pub(crate) const DW1C_PROGRESS_MASK: u8 = 0x1f;
+pub(crate) const DW1C_MIGRATION_REJECT_EXECUTION_PINNED: u8 = 0x04;
+const DW1C_WAKE_GENERATION_MAX: u64 = 0x0000_ffff_ffff_ffff;
 const TERMINAL_EVENT: u8 = 0xff;
 const EMPTY: [u8; DW1C_EVIDENCE_RECORD_LEN] = [0; DW1C_EVIDENCE_RECORD_LEN];
 
@@ -100,6 +102,9 @@ struct State {
     run_payload: [Option<Dw1cRecordPayload>; 4],
     quantum_payload: [Option<Dw1cRecordPayload>; 4],
     preempt_payload: [Option<Dw1cRecordPayload>; 4],
+    remote_wake_payload: [Option<Dw1cRecordPayload>; 4],
+    steal_migrate_payload: Option<Dw1cRecordPayload>,
+    migration_reject_payload: Option<Dw1cRecordPayload>,
     facts: Dw1cKernelFacts,
     terminal: bool,
     failure: Option<Dw1cEvidenceError>,
@@ -116,6 +121,9 @@ impl State {
             run_payload: [None; 4],
             quantum_payload: [None; 4],
             preempt_payload: [None; 4],
+            remote_wake_payload: [None; 4],
+            steal_migrate_payload: None,
+            migration_reject_payload: None,
             facts: Dw1cKernelFacts {
                 cpu_ready: 0,
                 run: 0,
@@ -323,22 +331,116 @@ impl Dw1cEvidenceCollector {
 
     pub(crate) fn observe_remote_wake_claim(
         &self,
+        source_cpu: u8,
         target_cpu: u8,
         thread: ThreadKey,
         generation: u64,
-    ) -> Result<(), Dw1cEvidenceError> {
+        wake_generation: u64,
+    ) -> Result<Option<u8>, Dw1cEvidenceError> {
         let mut state = self.state.lock();
         let bit = cpu_bit(target_cpu).ok_or_else(|| state.latch(Dw1cEvidenceError::Malformed))?;
         if !state.installed {
             return Err(state.latch(Dw1cEvidenceError::Early));
         }
         if !actor_thread_known(&state, thread) {
-            return Ok(());
+            return Ok(None);
         }
-        if !actor_thread_bound(&state, thread, generation) || state.facts.remote_wake & bit != 0 {
+        if !actor_thread_bound(&state, thread, generation) {
             return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
         }
+        if source_cpu == target_cpu
+            || cpu_bit(source_cpu).is_none()
+            || wake_generation == 0
+            || wake_generation > DW1C_WAKE_GENERATION_MAX
+        {
+            return Err(state.latch(Dw1cEvidenceError::Malformed));
+        }
+        let index = usize::from(target_cpu);
+        if state.facts.remote_wake & bit != 0 || state.remote_wake_payload[index].is_some() {
+            return Err(state.latch(Dw1cEvidenceError::Duplicate));
+        }
+        let token = actor_token_for_claim(&state, thread, generation)
+            .expect("bound remote wake retains its selector token");
+        let value = u64::from(target_cpu) | (u64::from(source_cpu) << 8) | (wake_generation << 16);
+        state.remote_wake_payload[index] = Some(Dw1cRecordPayload {
+            subject: u64::from(token),
+            generation,
+            value,
+        });
         state.facts.remote_wake |= bit;
+        Ok(Some(token))
+    }
+
+    pub(crate) fn observe_steal_migration_claim(
+        &self,
+        source_cpu: u8,
+        target_cpu: u8,
+        thread: ThreadKey,
+        execution_generation: u64,
+        migration_generation: u64,
+    ) -> Result<(), Dw1cEvidenceError> {
+        let mut state = self.state.lock();
+        if !state.installed {
+            return Err(state.latch(Dw1cEvidenceError::Early));
+        }
+        if !actor_thread_known(&state, thread) {
+            return Ok(());
+        }
+        if !actor_thread_bound(&state, thread, execution_generation) {
+            return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
+        }
+        if source_cpu == target_cpu
+            || cpu_bit(source_cpu).is_none()
+            || cpu_bit(target_cpu).is_none()
+            || migration_generation == 0
+        {
+            return Err(state.latch(Dw1cEvidenceError::Malformed));
+        }
+        if state.facts.steal_migrate || state.steal_migrate_payload.is_some() {
+            return Err(state.latch(Dw1cEvidenceError::Duplicate));
+        }
+        let token = actor_token_for_claim(&state, thread, execution_generation)
+            .expect("bound migration retains its selector token");
+        state.steal_migrate_payload = Some(Dw1cRecordPayload {
+            subject: u64::from(token),
+            generation: migration_generation,
+            value: u64::from(target_cpu) | (u64::from(source_cpu) << 8),
+        });
+        state.facts.steal_migrate = true;
+        Ok(())
+    }
+
+    pub(crate) fn observe_migration_rejection_claim(
+        &self,
+        cpu: u8,
+        thread: ThreadKey,
+        execution_generation: u64,
+        reason: u8,
+    ) -> Result<(), Dw1cEvidenceError> {
+        let mut state = self.state.lock();
+        if !state.installed {
+            return Err(state.latch(Dw1cEvidenceError::Early));
+        }
+        if !actor_thread_known(&state, thread) {
+            return Ok(());
+        }
+        let Some(token) = actor_token_for_claim(&state, thread, execution_generation) else {
+            return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
+        };
+        if token != 6 || cpu_bit(cpu).is_none() || reason != DW1C_MIGRATION_REJECT_EXECUTION_PINNED
+        {
+            return Err(state.latch(Dw1cEvidenceError::Malformed));
+        }
+        if state.facts.migration_reject_execution_pinned || state.migration_reject_payload.is_some()
+        {
+            return Err(state.latch(Dw1cEvidenceError::Duplicate));
+        }
+        state.migration_reject_payload = Some(Dw1cRecordPayload {
+            subject: u64::from(token),
+            generation: execution_generation,
+            value: u64::from(cpu) | (u64::from(reason) << 8),
+        });
+        state.facts.migration_reject_execution_pinned = true;
         Ok(())
     }
 
@@ -452,6 +554,9 @@ impl Dw1cEvidenceCollector {
         digest: u64,
     ) -> Result<Dw1cEvidenceFlushPermit<'_>, Dw1cEvidenceError> {
         let mut state = self.state.lock();
+        if let Some(error) = state.failure {
+            return Err(error);
+        }
         if state.reporter.map(|reporter| reporter.0) != Some(caller) {
             return Err(state.latch(Dw1cEvidenceError::WrongReporter));
         }
@@ -463,6 +568,11 @@ impl Dw1cEvidenceCollector {
         }
         if !state.facts.complete() {
             return Err(state.latch(Dw1cEvidenceError::MissingKernelFact));
+        }
+        for sequence in 0..DW1C_EVIDENCE_RECORD_CAPACITY {
+            if payload_for(sequence, &state).is_err() {
+                return Err(state.latch(Dw1cEvidenceError::Incomplete));
+            }
         }
         if self
             .terminal
@@ -481,12 +591,13 @@ impl Dw1cEvidenceCollector {
         write: impl FnMut(&[u8; DW1C_EVIDENCE_RECORD_LEN]) -> Result<(), ()>,
     ) -> Result<(), Dw1cEvidenceError> {
         let state = self.state.lock();
-        if !state.terminal || !state.facts.complete() {
+        if state.failure.is_some() || !state.terminal || !state.facts.complete() {
             return Err(Dw1cEvidenceError::Incomplete);
         }
         let mut write = write;
         for sequence in 0..DW1C_EVIDENCE_RECORD_CAPACITY {
-            let record = encode_record(self.nonce, sequence as u32, event_for(sequence));
+            let payload = payload_for(sequence, &state)?;
+            let record = encode_record(self.nonce, sequence as u32, event_for(sequence), payload);
             write(&record).map_err(|_| Dw1cEvidenceError::Full)?;
         }
         Ok(())
@@ -564,12 +675,19 @@ fn actor_bound(state: &State, process: ProcessKey, thread: ThreadKey, generation
         })
 }
 fn actor_thread_bound(state: &State, thread: ThreadKey, generation: u64) -> bool {
-    generation != 0
-        && state
-            .actors
-            .iter()
-            .flatten()
-            .any(|actor| actor.thread == thread && actor.execution_generation == generation)
+    actor_token_for_claim(state, thread, generation).is_some()
+}
+
+fn actor_token_for_claim(state: &State, thread: ThreadKey, generation: u64) -> Option<u8> {
+    if generation == 0 {
+        return None;
+    }
+    state
+        .actors
+        .iter()
+        .flatten()
+        .find(|actor| actor.thread == thread && actor.execution_generation == generation)
+        .map(|actor| actor.token)
 }
 fn actor_thread_known(state: &State, thread: ThreadKey) -> bool {
     state
@@ -613,7 +731,46 @@ const fn event_for(sequence: usize) -> u8 {
     }
 }
 
-fn encode_record(nonce: u64, sequence: u32, event: u8) -> [u8; DW1C_EVIDENCE_RECORD_LEN] {
+fn payload_for(sequence: usize, state: &State) -> Result<Dw1cRecordPayload, Dw1cEvidenceError> {
+    let payload = match sequence {
+        0..=3 => state.cpu_ready_payload[sequence],
+        4..=13 => state.actors[sequence - 4].map(|actor| Dw1cRecordPayload {
+            subject: u64::from(actor.token),
+            generation: actor.execution_generation,
+            value: u64::from(actor.role),
+        }),
+        14..=17 => state.run_payload[sequence - 14],
+        18..=21 => state.quantum_payload[sequence - 18],
+        22..=25 => state.preempt_payload[sequence - 22],
+        26..=30 => {
+            let index = sequence - 26;
+            state.actors[index].and_then(|actor| {
+                (state.progress[index] != 0).then_some(Dw1cRecordPayload {
+                    subject: u64::from(actor.token),
+                    generation: actor.execution_generation,
+                    value: state.progress[index],
+                })
+            })
+        }
+        31..=34 => state.remote_wake_payload[sequence - 31],
+        35 => state.steal_migrate_payload,
+        36 => state.migration_reject_payload,
+        45 => Some(Dw1cRecordPayload {
+            subject: 0,
+            generation: 0,
+            value: 0,
+        }),
+        _ => None,
+    };
+    payload.ok_or(Dw1cEvidenceError::Incomplete)
+}
+
+fn encode_record(
+    nonce: u64,
+    sequence: u32,
+    event: u8,
+    payload: Dw1cRecordPayload,
+) -> [u8; DW1C_EVIDENCE_RECORD_LEN] {
     let mut out = [b'0'; DW1C_EVIDENCE_RECORD_LEN];
     out[..8].copy_from_slice(b"DW1C|01|");
     put_hex(&mut out[8..24], nonce);
@@ -622,11 +779,11 @@ fn encode_record(nonce: u64, sequence: u32, event: u8) -> [u8; DW1C_EVIDENCE_REC
     out[33] = b'|';
     put_hex(&mut out[34..36], u64::from(event));
     out[36] = b'|';
-    put_hex(&mut out[37..53], 0);
+    put_hex(&mut out[37..53], payload.subject);
     out[53] = b'|';
-    put_hex(&mut out[54..70], 1);
+    put_hex(&mut out[54..70], payload.generation);
     out[70] = b'|';
-    put_hex(&mut out[71..87], 0);
+    put_hex(&mut out[71..87], payload.value);
     out[87] = b'|';
     let checksum = fnv1a(&out[..88]);
     put_hex(&mut out[88..96], u64::from(checksum));
@@ -720,12 +877,41 @@ mod tests {
         collector.arm(reporter, actors).unwrap();
         (collector, actors)
     }
+
+    fn decoded_payload(record: &[u8; DW1C_EVIDENCE_RECORD_LEN]) -> Dw1cRecordPayload {
+        let read = |range: core::ops::Range<usize>| {
+            u64::from_str_radix(core::str::from_utf8(&record[range]).unwrap(), 16).unwrap()
+        };
+        Dw1cRecordPayload {
+            subject: read(37..53),
+            generation: read(54..70),
+            value: read(71..87),
+        }
+    }
+
     #[test]
     fn fixed_stream_is_46_records_of_96_bytes() {
-        let a = encode_record(1, 45, TERMINAL_EVENT);
+        let a = encode_record(
+            1,
+            45,
+            TERMINAL_EVENT,
+            Dw1cRecordPayload {
+                subject: 0,
+                generation: 0,
+                value: 0,
+            },
+        );
         assert_eq!(a.len(), 96);
         assert_eq!(&a[..8], b"DW1C|01|");
         assert_eq!(event_for(45), TERMINAL_EVENT);
+        assert_eq!(
+            decoded_payload(&a),
+            Dw1cRecordPayload {
+                subject: 0,
+                generation: 0,
+                value: 0,
+            }
+        );
     }
     #[test]
     fn arm_rejects_duplicate_subjects() {
@@ -853,5 +1039,316 @@ mod tests {
         let state = mismatch.state.lock();
         assert_eq!(state.facts.preempt, 0);
         assert_eq!(state.preempt_payload[1], None);
+    }
+
+    #[test]
+    fn remote_wake_migration_and_rejection_retain_exact_payloads() {
+        let (collector, actors) = armed_collector();
+        let remote = actors[4];
+        assert_eq!(
+            collector
+                .observe_remote_wake_claim(
+                    3,
+                    1,
+                    remote.thread,
+                    remote.execution_generation,
+                    0x1234_5678,
+                )
+                .unwrap(),
+            Some(remote.token)
+        );
+        collector
+            .observe_steal_migration_claim(1, 2, remote.thread, remote.execution_generation, 0x9988)
+            .unwrap();
+        let pinned = actors[5];
+        collector
+            .observe_migration_rejection_claim(
+                3,
+                pinned.thread,
+                pinned.execution_generation,
+                DW1C_MIGRATION_REJECT_EXECUTION_PINNED,
+            )
+            .unwrap();
+
+        let state = collector.state.lock();
+        assert_eq!(
+            state.remote_wake_payload[1],
+            Some(Dw1cRecordPayload {
+                subject: u64::from(remote.token),
+                generation: remote.execution_generation,
+                value: 1 | (3 << 8) | (0x1234_5678 << 16),
+            })
+        );
+        assert_eq!(
+            state.steal_migrate_payload,
+            Some(Dw1cRecordPayload {
+                subject: u64::from(remote.token),
+                generation: 0x9988,
+                value: 2 | (1 << 8),
+            })
+        );
+        assert_eq!(
+            state.migration_reject_payload,
+            Some(Dw1cRecordPayload {
+                subject: 6,
+                generation: pinned.execution_generation,
+                value: 3 | (u64::from(DW1C_MIGRATION_REJECT_EXECUTION_PINNED) << 8),
+            })
+        );
+    }
+
+    #[test]
+    fn stale_duplicate_and_overflowed_migration_relations_do_not_replace_payloads() {
+        let (stale, actors) = armed_collector();
+        assert_eq!(
+            stale.observe_remote_wake_claim(
+                0,
+                1,
+                actors[0].thread,
+                actors[0].execution_generation + 1,
+                7,
+            ),
+            Err(Dw1cEvidenceError::WrongGeneration)
+        );
+        assert_eq!(stale.state.lock().remote_wake_payload[1], None);
+
+        let (overflow, actors) = armed_collector();
+        assert_eq!(
+            overflow.observe_remote_wake_claim(
+                0,
+                1,
+                actors[0].thread,
+                actors[0].execution_generation,
+                DW1C_WAKE_GENERATION_MAX + 1,
+            ),
+            Err(Dw1cEvidenceError::Malformed)
+        );
+        assert_eq!(overflow.state.lock().remote_wake_payload[1], None);
+
+        let (duplicate, actors) = armed_collector();
+        let actor = actors[0];
+        duplicate
+            .observe_remote_wake_claim(0, 1, actor.thread, actor.execution_generation, 7)
+            .unwrap();
+        assert_eq!(
+            duplicate.observe_remote_wake_claim(
+                2,
+                1,
+                actors[1].thread,
+                actors[1].execution_generation,
+                8,
+            ),
+            Err(Dw1cEvidenceError::Duplicate)
+        );
+        let state = duplicate.state.lock();
+        assert_eq!(state.remote_wake_payload[1].unwrap().value, 1 | (7 << 16));
+        assert_eq!(state.failure, Some(Dw1cEvidenceError::Duplicate));
+        drop(state);
+
+        let (stale_migration, actors) = armed_collector();
+        assert_eq!(
+            stale_migration.observe_steal_migration_claim(
+                1,
+                2,
+                actors[2].thread,
+                actors[2].execution_generation + 1,
+                9,
+            ),
+            Err(Dw1cEvidenceError::WrongGeneration)
+        );
+        assert_eq!(stale_migration.state.lock().steal_migrate_payload, None);
+
+        let (duplicate_migration, actors) = armed_collector();
+        duplicate_migration
+            .observe_steal_migration_claim(
+                1,
+                2,
+                actors[2].thread,
+                actors[2].execution_generation,
+                9,
+            )
+            .unwrap();
+        assert_eq!(
+            duplicate_migration.observe_steal_migration_claim(
+                2,
+                3,
+                actors[3].thread,
+                actors[3].execution_generation,
+                10,
+            ),
+            Err(Dw1cEvidenceError::Duplicate)
+        );
+        assert_eq!(
+            duplicate_migration
+                .state
+                .lock()
+                .steal_migrate_payload
+                .unwrap()
+                .generation,
+            9
+        );
+
+        let (wrong_rejection, actors) = armed_collector();
+        assert_eq!(
+            wrong_rejection.observe_migration_rejection_claim(
+                0,
+                actors[4].thread,
+                actors[4].execution_generation,
+                DW1C_MIGRATION_REJECT_EXECUTION_PINNED,
+            ),
+            Err(Dw1cEvidenceError::Malformed)
+        );
+        assert_eq!(wrong_rejection.state.lock().migration_reject_payload, None);
+    }
+
+    #[test]
+    fn implemented_fixed_stream_records_decode_exact_retained_values() {
+        let (collector, actors) = armed_collector();
+        for cpu in 0_u8..4 {
+            collector
+                .observe_cpu_ready_payload(
+                    cpu,
+                    0x1000 + u64::from(cpu),
+                    0x2000 + u64::from(cpu),
+                    0x3000 + u64::from(cpu),
+                )
+                .unwrap();
+            let actor = actors[usize::from(cpu)];
+            collector
+                .observe_running_claim(cpu, actor.thread, actor.execution_generation)
+                .unwrap();
+            collector
+                .observe_quantum_claim(
+                    cpu,
+                    actor.thread,
+                    actor.execution_generation,
+                    0x4000 + u64::from(cpu),
+                )
+                .unwrap();
+            collector
+                .observe_preemption_claim(
+                    cpu,
+                    actor.thread,
+                    actor.execution_generation,
+                    0x5000 + u64::from(cpu),
+                )
+                .unwrap();
+            let wake_actor = actors[usize::from(cpu) + 4];
+            collector
+                .observe_remote_wake_claim(
+                    (cpu + 1) % 4,
+                    cpu,
+                    wake_actor.thread,
+                    wake_actor.execution_generation,
+                    0x6000 + u64::from(cpu),
+                )
+                .unwrap();
+        }
+        for (index, actor) in actors[..5].iter().copied().enumerate() {
+            collector
+                .progress(
+                    actor.process,
+                    u64::from(actor.token),
+                    0x7000 + index as u64,
+                    2,
+                )
+                .unwrap();
+        }
+        collector
+            .observe_steal_migration_claim(
+                2,
+                3,
+                actors[4].thread,
+                actors[4].execution_generation,
+                0x8000,
+            )
+            .unwrap();
+        collector
+            .observe_migration_rejection_claim(
+                1,
+                actors[5].thread,
+                actors[5].execution_generation,
+                DW1C_MIGRATION_REJECT_EXECUTION_PINNED,
+            )
+            .unwrap();
+
+        let state = collector.state.lock();
+        for sequence in 0..=36 {
+            let expected = payload_for(sequence, &state).unwrap();
+            let record = encode_record(1, sequence as u32, event_for(sequence), expected);
+            assert_eq!(decoded_payload(&record), expected, "sequence {sequence}");
+        }
+        assert_eq!(payload_for(37, &state), Err(Dw1cEvidenceError::Incomplete));
+        assert_eq!(payload_for(45, &state).unwrap().generation, 0);
+    }
+
+    #[test]
+    fn complete_fails_before_terminal_claim_when_later_payload_families_are_missing() {
+        let (collector, actors) = armed_collector();
+        let reporter = collector.state.lock().reporter.unwrap();
+        {
+            let mut state = collector.state.lock();
+            state.progress = [1, 2, 3, 4, 5];
+            for cpu in 0..4 {
+                let actor = actors[cpu];
+                let payload = Dw1cRecordPayload {
+                    subject: u64::from(actor.token),
+                    generation: actor.execution_generation,
+                    value: cpu as u64,
+                };
+                state.cpu_ready_payload[cpu] = Some(Dw1cRecordPayload {
+                    subject: 0x100 + cpu as u64,
+                    generation: 0x200 + cpu as u64,
+                    value: 0x300 + cpu as u64,
+                });
+                state.run_payload[cpu] = Some(payload);
+                state.quantum_payload[cpu] = Some(Dw1cRecordPayload {
+                    value: 0x400 + cpu as u64,
+                    ..payload
+                });
+                state.preempt_payload[cpu] = Some(Dw1cRecordPayload {
+                    value: 0x500 + cpu as u64,
+                    ..payload
+                });
+                state.remote_wake_payload[cpu] = Some(Dw1cRecordPayload {
+                    value: cpu as u64 | (((cpu + 1) % 4) as u64) << 8 | (1_u64 << 16),
+                    ..payload
+                });
+            }
+            state.steal_migrate_payload = Some(Dw1cRecordPayload {
+                subject: 5,
+                generation: 1,
+                value: 0x0102,
+            });
+            state.migration_reject_payload = Some(Dw1cRecordPayload {
+                subject: 6,
+                generation: actors[5].execution_generation,
+                value: 1 | (u64::from(DW1C_MIGRATION_REJECT_EXECUTION_PINNED) << 8),
+            });
+            state.facts = Dw1cKernelFacts {
+                cpu_ready: 0x0f,
+                run: 0x0f,
+                quantum: 0x0f,
+                preempt: 0x0f,
+                remote_wake: 0x0f,
+                steal_migrate: true,
+                migration_reject_execution_pinned: true,
+                race_matrix: DW1C_PROGRESS_MASK,
+                lifecycle: 0x03,
+                bootstrap_normal: true,
+                accounting_sound: true,
+                ready_delay_ns: 1,
+            };
+        }
+
+        assert!(collector.state.lock().facts.complete());
+        assert!(matches!(
+            collector.complete(reporter.0, u64::from(DW1C_PROGRESS_MASK), 2),
+            Err(Dw1cEvidenceError::Incomplete)
+        ));
+        assert_eq!(collector.terminal.load(Ordering::Acquire), 0);
+        let state = collector.state.lock();
+        assert!(!state.terminal);
+        assert_eq!(state.failure, Some(Dw1cEvidenceError::Incomplete));
     }
 }
