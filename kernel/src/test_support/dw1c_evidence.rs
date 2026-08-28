@@ -804,6 +804,27 @@ impl Dw1cEvidenceCollector {
         consume_published_quantum(&mut state, cpu, token, generation, source_arm_generation)
     }
 
+    /// Resolves a scheduler-published expiry when its exact Running claim was
+    /// retained. This is one global scheduler-hook transaction: activity
+    /// outside the installed ARM actor table is inert, while a tracked exact
+    /// QUANTUM becomes the same RUN without dispatch or private-wake effects.
+    pub(crate) fn observe_retained_current_quantum_claim(
+        &self,
+        cpu: u8,
+        thread: ThreadKey,
+        generation: u64,
+        source_arm_generation: u64,
+    ) -> Result<(), Dw1cEvidenceError> {
+        let mut state = self.state.lock();
+        if !state.installed || state.scheduler_observation_closed() {
+            return Ok(());
+        }
+        let Some(token) = actor_token_for_thread(&state, thread) else {
+            return Ok(());
+        };
+        retain_published_quantum(&mut state, cpu, token, generation, source_arm_generation)
+    }
+
     pub(crate) fn observe_remote_wake_claim(
         &self,
         source_cpu: u8,
@@ -1498,6 +1519,48 @@ fn consume_published_quantum(
         return Err(state.latch(Dw1cEvidenceError::Contradiction));
     }
     state.cpu_chain[index] = CpuChain::Empty;
+    if token == 8 {
+        state.token8_pending_expiry = None;
+    }
+    Ok(())
+}
+
+fn retain_published_quantum(
+    state: &mut State,
+    cpu: u8,
+    token: u8,
+    execution_generation: u64,
+    source_arm_generation: u64,
+) -> Result<(), Dw1cEvidenceError> {
+    cpu_bit(cpu).ok_or_else(|| state.latch(Dw1cEvidenceError::Malformed))?;
+    if execution_generation == 0 || source_arm_generation == 0 {
+        return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
+    }
+    let index = usize::from(cpu);
+    let serializable = match state.cpu_chain[index] {
+        CpuChain::Quantum {
+            token: quantum_token,
+            execution_generation: quantum_generation,
+            source_arm_generation: quantum_source,
+            serializable,
+        } if quantum_token == token
+            && quantum_generation == execution_generation
+            && quantum_source == source_arm_generation =>
+        {
+            serializable
+        }
+        _ => return Err(state.latch(Dw1cEvidenceError::Contradiction)),
+    };
+    if token == 8
+        && state.token8_pending_expiry != Some((cpu, execution_generation, source_arm_generation))
+    {
+        return Err(state.latch(Dw1cEvidenceError::Contradiction));
+    }
+    state.cpu_chain[index] = CpuChain::Run {
+        token,
+        execution_generation,
+        serializable,
+    };
     if token == 8 {
         state.token8_pending_expiry = None;
     }
@@ -2243,10 +2306,9 @@ mod tests {
             .split("fn observe_terminal_after_expiry_ticket(")
             .next()
             .unwrap();
-        assert!(
-            retained.find("self.observe_consumed_published_expiry(Some(ticket))")
-                < retained.find(".observe_running_claim(")
-        );
+        assert!(retained.contains(".observe_retained_current_quantum_claim("));
+        assert!(!retained.contains("observe_consumed_published_expiry"));
+        assert!(!retained.contains("observe_running_claim"));
         let preempt = execution_source
             .split("pub(crate) fn preempt_current_on(")
             .nth(1)
@@ -3069,10 +3131,12 @@ mod tests {
             .observe_quantum_claim(2, actor.thread, actor.execution_generation, 0x81)
             .unwrap();
         collector
-            .observe_consumed_quantum_claim(2, actor.thread, actor.execution_generation, 0x81)
-            .unwrap();
-        collector
-            .observe_running_claim(2, actor.thread, actor.execution_generation)
+            .observe_retained_current_quantum_claim(
+                2,
+                actor.thread,
+                actor.execution_generation,
+                0x81,
+            )
             .unwrap();
         collector
             .observe_quantum_claim(2, actor.thread, actor.execution_generation, 0x82)
@@ -3101,10 +3165,7 @@ mod tests {
             .observe_quantum_claim(3, actor.thread, later_generation, 0x91)
             .unwrap();
         collector
-            .observe_consumed_quantum_claim(3, actor.thread, later_generation, 0x91)
-            .unwrap();
-        collector
-            .observe_running_claim(3, actor.thread, later_generation)
+            .observe_retained_current_quantum_claim(3, actor.thread, later_generation, 0x91)
             .unwrap();
         collector
             .observe_quantum_claim(3, actor.thread, later_generation, 0x92)
@@ -3121,6 +3182,56 @@ mod tests {
         assert_eq!(state.facts.run & 0x08, 0);
         assert_eq!(state.facts.quantum & 0x08, 0);
         assert_eq!(state.facts.preempt & 0x08, 0);
+        assert_eq!(state.failure, None);
+    }
+
+    #[test]
+    fn retained_current_global_hook_ignores_pre_arm_and_untracked_threads() {
+        let collector = Dw1cEvidenceCollector::new(1, 2);
+        let unknown = actor(1);
+        collector
+            .observe_retained_current_quantum_claim(0, unknown.thread, 1, 1)
+            .unwrap();
+        assert_eq!(collector.state.lock().failure, None);
+
+        let (collector, _actors) = armed_collector();
+        collector
+            .observe_retained_current_quantum_claim(0, unknown.thread, 1, 1)
+            .unwrap();
+        assert_eq!(collector.state.lock().failure, None);
+    }
+
+    #[test]
+    fn retained_current_is_atomic_and_does_not_claim_token7_wake_resume() {
+        let (collector, actors) = armed_collector();
+        let token7 = actors[6];
+        let (endpoint, peer) = channel_endpoints();
+        collector
+            .observe_token7_full_send(token7.process, token7.thread, endpoint, peer.object_id())
+            .unwrap();
+        collector
+            .observe_quantum_claim(0, token7.thread, token7.execution_generation, 0x71)
+            .unwrap();
+        collector
+            .observe_retained_current_quantum_claim(
+                0,
+                token7.thread,
+                token7.execution_generation,
+                0x71,
+            )
+            .unwrap();
+
+        let state = collector.state.lock();
+        assert_eq!(
+            state.cpu_chain[0],
+            CpuChain::Run {
+                token: 7,
+                execution_generation: token7.execution_generation,
+                serializable: true,
+            }
+        );
+        assert_eq!(state.facts.race_matrix & (1 << 1), 0);
+        assert_eq!(state.token7.unwrap().run_seen, false);
         assert_eq!(state.failure, None);
     }
 

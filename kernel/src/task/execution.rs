@@ -881,15 +881,15 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
 
     #[cfg(deepwyrm_dw1c_evidence)]
     fn observe_retained_current_published_expiry(&self, ticket: super::SchedulerQuantumTicket) {
-        self.observe_consumed_published_expiry(Some(ticket));
         crate::test_support::DW1C_EVIDENCE
-            .observe_running_claim(
+            .observe_retained_current_quantum_claim(
                 ticket.cpu().index() as u8,
                 ticket.thread(),
                 ticket.execution_generation(),
+                ticket.source_arm_generation(),
             )
             .unwrap_or_else(|error| {
-                panic!("selector-28 retained-current RUN observation failed: {error:?}")
+                panic!("selector-28 retained-current QUANTUM observation failed: {error:?}")
             });
     }
 
