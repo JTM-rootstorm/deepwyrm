@@ -2789,7 +2789,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             crate::task::SchedulerPreemptionDecision::Deferred => {
                 panic!("DW1-B CPL3 return reached with preemption still disabled")
             }
-            crate::task::SchedulerPreemptionDecision::RetainCurrent => {
+            crate::task::SchedulerPreemptionDecision::RetainCurrent { .. } => {
                 crate::syscall::native::NativePreemptionPlan::Return
             }
             crate::task::SchedulerPreemptionDecision::Switch { decision, outgoing } => {

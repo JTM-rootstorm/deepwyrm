@@ -813,7 +813,10 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         &self,
         thread: ThreadKey,
     ) -> Result<super::ScheduleDecision, SchedulerError> {
-        self.scheduler.yield_current(thread)
+        let decision = self.scheduler.yield_current(thread)?;
+        #[cfg(deepwyrm_dw1c_evidence)]
+        self.observe_consumed_published_expiry(decision.consumed_published_expiry);
+        Ok(decision)
     }
 
     pub(crate) fn yield_current_on(
@@ -821,7 +824,10 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         cpu: SchedulerCpuId,
         thread: ThreadKey,
     ) -> Result<super::ScheduleDecision, SchedulerError> {
-        self.scheduler.yield_current_on(cpu, thread)
+        let decision = self.scheduler.yield_current_on(cpu, thread)?;
+        #[cfg(deepwyrm_dw1c_evidence)]
+        self.observe_consumed_published_expiry(decision.consumed_published_expiry);
+        Ok(decision)
     }
 
     pub(crate) fn prepare_quantum_if_needed_on(
@@ -851,6 +857,26 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                 });
         }
         Ok(published)
+    }
+
+    #[cfg(deepwyrm_dw1c_evidence)]
+    fn observe_consumed_published_expiry(&self, ticket: Option<super::SchedulerQuantumTicket>) {
+        let Some(ticket) = ticket else {
+            return;
+        };
+        if !crate::test_support::DW1C_EVIDENCE.tracks_thread(ticket.thread()) {
+            return;
+        }
+        crate::test_support::DW1C_EVIDENCE
+            .observe_consumed_quantum_claim(
+                ticket.cpu().index() as u8,
+                ticket.thread(),
+                ticket.execution_generation(),
+                ticket.source_arm_generation(),
+            )
+            .unwrap_or_else(|error| {
+                panic!("selector-28 consumed QUANTUM observation failed: {error:?}")
+            });
     }
 
     #[cfg(deepwyrm_dw1c_evidence)]
@@ -887,7 +913,15 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         &self,
         cpu: SchedulerCpuId,
     ) -> Result<super::SchedulerPreemptionDecision, SchedulerError> {
-        self.scheduler.preempt_current_on(cpu)
+        let decision = self.scheduler.preempt_current_on(cpu)?;
+        #[cfg(deepwyrm_dw1c_evidence)]
+        if let super::SchedulerPreemptionDecision::RetainCurrent {
+            consumed_published_expiry,
+        } = decision
+        {
+            self.observe_consumed_published_expiry(Some(consumed_published_expiry));
+        }
+        Ok(decision)
     }
 
     pub(crate) fn preemption_disable_on(&self, cpu: SchedulerCpuId) -> Result<(), SchedulerError> {
@@ -978,7 +1012,10 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         &self,
         reservation: BlockReservation,
     ) -> Result<super::ScheduleDecision, BlockReservationFailure> {
-        self.scheduler.commit_block(reservation)
+        let decision = self.scheduler.commit_block(reservation)?;
+        #[cfg(deepwyrm_dw1c_evidence)]
+        self.observe_consumed_published_expiry(decision.consumed_published_expiry);
+        Ok(decision)
     }
 
     pub(crate) fn commit_block_on(
@@ -986,7 +1023,10 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         cpu: SchedulerCpuId,
         reservation: BlockReservation,
     ) -> Result<super::ScheduleDecision, BlockReservationFailure> {
-        self.scheduler.commit_block_on(cpu, reservation)
+        let decision = self.scheduler.commit_block_on(cpu, reservation)?;
+        #[cfg(deepwyrm_dw1c_evidence)]
+        self.observe_consumed_published_expiry(decision.consumed_published_expiry);
+        Ok(decision)
     }
 
     /// Commits one block whose durable operation was already published, then
@@ -1000,6 +1040,8 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     ) -> Result<super::ScheduleDecision, BlockReservationFailure> {
         let wake = reservation.wake_key();
         let decision = self.scheduler.commit_block_on(cpu, reservation)?;
+        #[cfg(deepwyrm_dw1c_evidence)]
+        self.observe_consumed_published_expiry(decision.consumed_published_expiry);
         #[cfg(deepwyrm_dw1c_evidence)]
         crate::test_support::DW1C_EVIDENCE
             .observe_bound_wait_claim(wake.thread(), wake.execution_generation())
@@ -1072,7 +1114,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     ) -> Result<Option<super::SchedulerQuantumTicket>, SchedulerError> {
         let stopped = self.scheduler.stop_running_claim_on(claim)?;
         #[cfg(deepwyrm_dw1c_evidence)]
-        if let Some(ticket) = stopped.terminal_published_expiry {
+        if let Some(ticket) = stopped.consumed_published_expiry {
             self.observe_terminal_after_expiry_ticket(ticket);
         }
         Ok(stopped.cancelled_quantum)
@@ -1522,7 +1564,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                             panic!("terminal thread was not removable from scheduler: {error:?}")
                         });
                     #[cfg(deepwyrm_dw1c_evidence)]
-                    if let Some(ticket) = decision.terminal_published_expiry {
+                    if let Some(ticket) = decision.consumed_published_expiry {
                         self.observe_terminal_after_expiry_ticket(ticket);
                     }
                     if defer_current == Some(thread) {

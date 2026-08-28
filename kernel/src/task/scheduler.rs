@@ -102,7 +102,9 @@ pub(crate) enum SchedulerPreemptionDecision {
     /// The exact request remains pending until the checked depth reaches zero.
     Deferred,
     /// The request was consumed, but no eligible local peer existed.
-    RetainCurrent,
+    RetainCurrent {
+        consumed_published_expiry: SchedulerQuantumTicket,
+    },
     /// The outgoing continuation must be saved before the decision completes.
     Switch {
         decision: ScheduleDecision,
@@ -237,7 +239,7 @@ pub(crate) struct ScheduleDecision {
     pub(crate) current: Option<ThreadKey>,
     pub(crate) cancelled_quantum: Option<SchedulerQuantumTicket>,
     #[cfg(deepwyrm_dw1c_evidence)]
-    pub(crate) terminal_published_expiry: Option<SchedulerQuantumTicket>,
+    pub(crate) consumed_published_expiry: Option<SchedulerQuantumTicket>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -250,7 +252,7 @@ struct ClearedPreemption {
 pub(crate) struct SchedulerTerminalStop {
     pub(crate) cancelled_quantum: Option<SchedulerQuantumTicket>,
     #[cfg(deepwyrm_dw1c_evidence)]
-    pub(crate) terminal_published_expiry: Option<SchedulerQuantumTicket>,
+    pub(crate) consumed_published_expiry: Option<SchedulerQuantumTicket>,
 }
 
 /// Scheduler-authoritative ownership published before an architecture wake.
@@ -1780,7 +1782,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 current: current.map(|claim| claim.thread),
                 cancelled_quantum: None,
                 #[cfg(deepwyrm_dw1c_evidence)]
-                terminal_published_expiry: None,
+                consumed_published_expiry: None,
             },
             migration: pending_migration.map(|pending| pending.record),
         })
@@ -1835,7 +1837,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 current: Some(thread),
                 cancelled_quantum: None,
                 #[cfg(deepwyrm_dw1c_evidence)]
-                terminal_published_expiry: None,
+                consumed_published_expiry: None,
             });
         };
         let enqueue_generation = state.next_enqueue_generation;
@@ -1862,7 +1864,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         let next = state
             .claim_first_runnable_on(cpu)?
             .expect("validated Runnable entry remains claimable");
-        let cancelled_quantum = state.clear_preemption_on(cpu).cancelled_quantum;
+        let cleared_preemption = state.clear_preemption_on(cpu);
+        let cancelled_quantum = cleared_preemption.cancelled_quantum;
         state.running[cpu_index] = Some(next);
         let ready_at_ns = state.instrumentation_global_now_ns;
         state
@@ -1906,7 +1909,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             current: Some(next.thread),
             cancelled_quantum,
             #[cfg(deepwyrm_dw1c_evidence)]
-            terminal_published_expiry: None,
+            consumed_published_expiry: cleared_preemption.published_expiry,
         })
     }
 
@@ -2073,7 +2076,9 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         else {
             state.need_resched[cpu_index] = None;
             state.assert_invariants();
-            return Ok(SchedulerPreemptionDecision::RetainCurrent);
+            return Ok(SchedulerPreemptionDecision::RetainCurrent {
+                consumed_published_expiry: request,
+            });
         };
 
         let enqueue_generation = state.next_enqueue_generation;
@@ -2146,7 +2151,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 current: Some(next.thread),
                 cancelled_quantum: None,
                 #[cfg(deepwyrm_dw1c_evidence)]
-                terminal_published_expiry: None,
+                consumed_published_expiry: None,
             },
             outgoing: SchedulerExecutionClaim {
                 domain: state.domain,
@@ -2284,7 +2289,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             Err(error) => return Err(BlockReservationFailure { error, reservation }),
         };
         state.pending_block[cpu_index] = None;
-        let cancelled_quantum = state.clear_preemption_on(cpu).cancelled_quantum;
+        let cleared_preemption = state.clear_preemption_on(cpu);
+        let cancelled_quantum = cleared_preemption.cancelled_quantum;
         state.running[cpu_index] = None;
         state
             .push(QueueEntry {
@@ -2327,7 +2333,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             current: current.map(|claim| claim.thread),
             cancelled_quantum,
             #[cfg(deepwyrm_dw1c_evidence)]
-            terminal_published_expiry: None,
+            consumed_published_expiry: cleared_preemption.published_expiry,
         })
     }
 
@@ -2605,7 +2611,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                     current: Some(next.thread),
                     cancelled_quantum: None,
                     #[cfg(deepwyrm_dw1c_evidence)]
-                    terminal_published_expiry: None,
+                    consumed_published_expiry: None,
                 }),
                 migration: pending_migration.map(|pending| pending.record),
             })
@@ -2779,7 +2785,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 current: current.map(|claim| claim.thread),
                 cancelled_quantum,
                 #[cfg(deepwyrm_dw1c_evidence)]
-                terminal_published_expiry: cleared_preemption.published_expiry,
+                consumed_published_expiry: cleared_preemption.published_expiry,
             });
         }
         if let Some(owner_cpu) = state
@@ -2860,7 +2866,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 current: state.running[cpu_index].map(|claim| claim.thread),
                 cancelled_quantum: None,
                 #[cfg(deepwyrm_dw1c_evidence)]
-                terminal_published_expiry: None,
+                consumed_published_expiry: None,
             });
         }
         let Some(index) = state.queue[..state.len]
@@ -2895,7 +2901,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             current: state.running[cpu_index].map(|claim| claim.thread),
             cancelled_quantum: None,
             #[cfg(deepwyrm_dw1c_evidence)]
-            terminal_published_expiry: None,
+            consumed_published_expiry: None,
         })
     }
 
@@ -2954,7 +2960,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         Ok(SchedulerTerminalStop {
             cancelled_quantum: cleared_preemption.cancelled_quantum,
             #[cfg(deepwyrm_dw1c_evidence)]
-            terminal_published_expiry: cleared_preemption.published_expiry,
+            consumed_published_expiry: cleared_preemption.published_expiry,
         })
     }
 
@@ -3566,14 +3572,14 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                     current: None,
                     cancelled_quantum: None,
                     #[cfg(deepwyrm_dw1c_evidence)]
-                    terminal_published_expiry: None,
+                    consumed_published_expiry: None,
                 }),
                 IdleScheduleDecision::ResumeCurrent => Ok(ScheduleDecision {
                     previous: Some(suspended),
                     current: Some(suspended),
                     cancelled_quantum: None,
                     #[cfg(deepwyrm_dw1c_evidence)]
-                    terminal_published_expiry: None,
+                    consumed_published_expiry: None,
                 }),
                 IdleScheduleDecision::Switch(decision) => Ok(decision),
             };
