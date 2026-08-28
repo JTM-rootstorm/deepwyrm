@@ -20,8 +20,8 @@ pub(crate) const WYR1B_EVIDENCE_RECORD_LEN: usize = 96;
 pub(crate) const WYR1B_EVIDENCE_RECORD_CAPACITY: usize = 14;
 // Private selector-27 mirror of Wyrmroot's fixed legacy-v1 system-init child
 // geometry. This test invariant is separate from Deepwyrm's primordial
-// bootstrap stack: both are 128 KiB by coordinated revision, but their owners
-// and placements remain distinct.
+// bootstrap stack: system-init remains 128 KiB while Deepwyrm's independently
+// owned primordial stack is 256 KiB after the DW1-C functional-first revision.
 pub(crate) const WYR1B_SYSTEM_INIT_STACK_TOP: u64 = 0x0000_7fff_ffff_0000;
 pub(crate) const WYR1B_SYSTEM_INIT_STACK_BYTES: u64 = 128 * 1024;
 pub(crate) const WYR1B_SYSTEM_INIT_STACK_BOTTOM: u64 =
