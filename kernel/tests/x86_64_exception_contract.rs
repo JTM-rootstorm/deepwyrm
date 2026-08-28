@@ -357,12 +357,16 @@ fn dw1b_syscall_return_accounts_due_budget_before_preemption_and_rearm() {
     let resume = service
         .find("runtime.resume_syscall_preemption(frame)")
         .expect("acknowledged syscall continuation resume");
-    let post_switch_stop = service
-        .rfind("poll_timer_return_stop(*context)")
-        .expect("post-switch Stop poll after physical handoff");
+    let post_switch_stop = resume
+        + service[resume..]
+            .find("poll_timer_return_stop(*context)")
+            .expect("post-switch Stop poll after physical handoff");
     let rearm = service
         .rfind("arm_current_normal_quantum()")
         .expect("selected execution quantum preparation");
+    let post_rearm_stop = service
+        .rfind("poll_timer_return_stop(*context)")
+        .expect("post-switch Stop poll after physical handoff");
     assert!(
         stop < due
             && due < request
@@ -370,6 +374,7 @@ fn dw1b_syscall_return_accounts_due_budget_before_preemption_and_rearm() {
             && prepare < resume
             && resume < post_switch_stop
             && post_switch_stop < rearm
+            && rearm < post_rearm_stop
     );
     let switched = service
         .split_once("switch_kernel_context(plan)")

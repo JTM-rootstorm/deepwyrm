@@ -7,6 +7,7 @@ use crate::cpu::CpuIndex;
 use crate::memory::frame_roles::{FrameRoleManager, TableOwnerKey, synthetic_frame_role_manager};
 use crate::memory::kernel_stack::KernelStackBounds;
 use crate::memory::physical::PhysicalRange;
+use crate::memory::user_range::{EmptyAddressRule, UserAccess, UserAddressSpace, UserRange};
 use crate::memory::usercopy::UserPinTracker;
 use crate::object::ObjectRegistry;
 use crate::task::{ExecutionDomain, SchedulerThreadState, TaskAuthority, ThreadStartState};
@@ -31,6 +32,47 @@ fn terminal_start_state(seed: u64) -> ThreadStartState {
         seed,
         seed + 1,
     )
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the synthetic address-space authority supplies one typed scope for the live-capacity model"
+)]
+fn live_user_pin_capacity_covers_dw1c_retained_receives_and_channel_create_batch() {
+    let mut spaces = unsafe { crate::memory::address_region::AddressSpaceAuthority::<1, 1>::new() };
+    let address_space = spaces.create_address_space().unwrap();
+    let user_space = UserAddressSpace::x86_64_four_level(PAGE_SIZE).unwrap();
+    let tracker = UserPinTracker::<E5_USER_PIN_CAPACITY>::new();
+    let range = |index: usize| {
+        UserRange::new(
+            user_space,
+            PAGE_SIZE * (u64::try_from(index).unwrap() + 1),
+            8,
+            8,
+            UserAccess::WRITE,
+            EmptyAddressRule::Reject,
+        )
+        .unwrap()
+    };
+
+    let mut retained = Vec::with_capacity(DW1C_RETAINED_RECEIVE_PINS);
+    for index in 0..DW1C_RETAINED_RECEIVE_PINS {
+        retained.push(tracker.pin_owned(address_space, range(index)).unwrap());
+    }
+
+    let first_output = tracker
+        .pin(address_space, range(DW1C_RETAINED_RECEIVE_PINS))
+        .unwrap();
+    let second_output = tracker
+        .pin(address_space, range(DW1C_RETAINED_RECEIVE_PINS + 1))
+        .unwrap();
+
+    drop(second_output);
+    drop(first_output);
+    for pin in retained {
+        tracker.release_owned(address_space, pin).unwrap();
+    }
 }
 
 fn terminal_two_thread_fixture() -> (

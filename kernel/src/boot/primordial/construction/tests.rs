@@ -313,14 +313,14 @@ fn constructs_exact_startup_init_and_capability_contract_before_commit() {
     assert_eq!(start[3], STARTUP_ABI_VERSION);
     assert!(start[1].is_multiple_of(16));
 
-    assert_eq!(STACK_BYTES, 256 * 1024);
-    assert_eq!(backend.stack_object_bytes, Some(256 * 1024));
+    assert_eq!(STACK_BYTES, 128 * 1024);
+    assert_eq!(backend.stack_object_bytes, Some(128 * 1024));
     let stack_layout = backend.stack_layout.unwrap();
     assert_eq!(
         stack_layout,
         PrimordialStackLayout {
-            guard_start: 0x0000_7fff_fffb_f000,
-            mapped_start: 0x0000_7fff_fffc_0000,
+            guard_start: 0x0000_7fff_fffd_f000,
+            mapped_start: 0x0000_7fff_fffe_0000,
             mapped_end_exclusive: 0x0000_8000_0000_0000,
             startup_block_start: 0x0000_7fff_ffff_f000,
         }
@@ -328,9 +328,9 @@ fn constructs_exact_startup_init_and_capability_contract_before_commit() {
     assert_eq!(stack_layout.mapped_start - stack_layout.guard_start, 4096);
     assert_eq!(
         stack_layout.mapped_end_exclusive - stack_layout.mapped_start,
-        256 * 1024
+        128 * 1024
     );
-    assert_eq!(backend.startup_object_offset, Some(252 * 1024));
+    assert_eq!(backend.startup_object_offset, Some(124 * 1024));
     assert_eq!(start[1], stack_layout.startup_block_start);
 
     let startup = backend.startup.unwrap();

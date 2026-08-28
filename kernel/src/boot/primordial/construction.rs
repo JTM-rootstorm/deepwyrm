@@ -18,13 +18,7 @@ pub(crate) mod authority;
 
 const PAGE_SIZE: u64 = 4096;
 const USER_END_EXCLUSIVE: u64 = 0x0000_8000_0000_0000;
-// DW1-C's real init0 actor-loader path nests the bootfs archive, ELF
-// materialization, failure-atomic loader transaction, and native syscall
-// adapter.  The former 128 KiB payload let the deepest ChannelCreate outputs
-// fall below the mapped stack and be rejected as BAD_ADDRESS.  Keep useful
-// functional headroom instead of making this boot-critical path depend on
-// incidental compiler frame packing.
-pub(crate) const STACK_BYTES: u64 = 256 * 1024;
+pub(crate) const STACK_BYTES: u64 = 128 * 1024;
 const STARTUP_BLOCK_BYTES: usize = 4096;
 const STARTUP_ABI_VERSION: u64 = 1;
 

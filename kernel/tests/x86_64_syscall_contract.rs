@@ -652,19 +652,31 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
         .find("runtime.complete_physical_switch_handoff()")
         .expect("remote terminal switch acknowledgement");
     let remote_sync = remote_terminal
-        .find("self.synchronize_scheduler_current_detached();")
-        .expect("remote terminal scheduler synchronization");
+        .find("self.synchronize_scheduler_current_at_safe_point_detached()")
+        .expect("remote terminal scheduler safe-point synchronization");
     let remote_prepare = remote_terminal
         .find("runtime.prepare_remote_process_exception(exception)")
         .expect("remote terminal preparation");
     let remote_notify = remote_terminal
         .find("crate::task::notify_completed_switch_runnable(published);")
         .expect("remote terminal Runnable notification");
+    let remote_wait = remote_terminal
+        .find("await_remote_stop_permits(pending.deferred)")
+        .expect("remote terminal acknowledgement wait");
+    let remote_final_sync = remote_terminal
+        .rfind("self.synchronize_scheduler_current_detached();")
+        .expect("remote terminal post-acknowledgement synchronization");
+    let remote_complete = remote_terminal
+        .find("runtime.complete_process_termination(")
+        .expect("remote terminal completion");
     assert!(
         remote_sync < remote_switch
             && remote_switch < remote_ack
             && remote_ack < remote_notify
             && remote_notify < remote_prepare
+            && remote_prepare < remote_wait
+            && remote_wait < remote_final_sync
+            && remote_final_sync < remote_complete
     );
 }
 
@@ -686,7 +698,7 @@ fn i2_suspended_resume_gives_remote_stop_priority_under_scheduler_authority() {
         .find("runtime.complete_physical_switch_handoff()")
         .unwrap();
     let synchronization = resume
-        .find("self.synchronize_scheduler_current_detached()")
+        .find("self.synchronize_scheduler_current_at_safe_point_detached()")
         .unwrap();
     let terminal = resume
         .find("NativeResumeOutcome::TerminateCurrent")

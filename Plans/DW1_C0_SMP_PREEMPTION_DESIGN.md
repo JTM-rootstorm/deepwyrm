@@ -732,6 +732,21 @@ physical-memory, native ABI, boot ABI, or Wyrmroot ABI change. Reducing the
 metadata footprint after measuring a complete successful campaign remains
 optimization debt.
 
+The next corrected candidate reached the ninth actor's `ChannelCreate` and
+returned `DW_STATUS_BAD_ADDRESS` even though both output addresses were valid,
+mapped, and identical to the preceding seven successful calls. A bounded live
+GDB trace proved that those seven actors were blocked on launch Channels and
+each retained one owned mapping-stability pin. The ninth load atomically needed
+two additional pins for its two `ChannelCreate` outputs, exceeding the former
+kernel-global eight-slot user-pin tracker. The complete ten-actor workload has
+a twelve-pin floor before accounting for other overlapping pinned outputs or
+atomic words. The tracker therefore carries 32 bounded slots in the integrated
+kernel, with a selector-28 geometry assertion and host regression covering ten
+retained receive pins plus the two-output batch. This changes no pointer,
+usercopy, mapping-mutation, native ABI, boot ABI, or Wyrmroot ABI rule. Reducing
+the fixed metadata footprint after measuring the complete successful campaign
+remains optimization debt.
+
 DW1-C implementation must add host/source/model coverage for:
 
 - every Parked-to-Schedulable step, reordered/omitted publication, stale

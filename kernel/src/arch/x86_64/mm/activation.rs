@@ -80,7 +80,25 @@ use super::private::{
 };
 
 const ENTRY_COUNT: usize = 512;
-const E5_USER_PIN_CAPACITY: usize = 8;
+// Mapping-stability pins are a kernel-global resource shared by every live
+// Process address space.  A designated-VM trace proved that the former capacity
+// of eight rejected the ninth actor load after seven blocked receives retained
+// pins and ChannelCreate atomically requested two more for valid output ranges.
+// Keep bounded production headroom for overlapping blocked outputs and atomic
+// words rather than making the real kernel depend on selector-local capacity.
+const E5_USER_PIN_CAPACITY: usize = 32;
+#[cfg(any(test, deepwyrm_dw1c_evidence))]
+const DW1C_RETAINED_RECEIVE_PINS: usize = 10;
+#[cfg(any(test, deepwyrm_dw1c_evidence))]
+const DW1C_CHANNEL_CREATE_OUTPUT_PINS: usize = 2;
+#[cfg(any(test, deepwyrm_dw1c_evidence))]
+const DW1C_LIVE_USER_PIN_FLOOR: usize =
+    DW1C_RETAINED_RECEIVE_PINS + DW1C_CHANNEL_CREATE_OUTPUT_PINS;
+#[cfg(deepwyrm_dw1c_evidence)]
+const _: () = {
+    assert!(DW1C_RETAINED_RECEIVE_PINS == crate::test_support::dw1c_evidence::DW1C_ACTOR_COUNT);
+    assert!(E5_USER_PIN_CAPACITY >= DW1C_LIVE_USER_PIN_FLOOR);
+};
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 #[cfg(not(any(
     deepwyrm_i2_stress,
