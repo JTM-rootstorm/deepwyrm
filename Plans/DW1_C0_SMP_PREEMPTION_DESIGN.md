@@ -761,13 +761,17 @@ involuntarily preempted; token 7 remains a real runnable peer. No synthetic or
 cancelled ticket is eligible.
 
 The live `ProcessTerminate` path checks this gate before TaskAuthority mutates
-token 8. If the gate is awaiting the timer, it drops the shared runtime lock and
-polls with no runtime, task, registry, object, wait, or collector authority
-held; after readiness it reacquires runtime authority and re-resolves and
-revalidates the Process handle. Terminal stop then consumes the exact held
-ticket through the existing terminal observer, selects the expiry-first winner,
-and atomically clears the gate. Wrong-identity, wrong-generation, duplicate,
-stop-first, timeout, and post-terminal running/requeue paths fail the selector.
+token 8. If the gate is awaiting the timer, it returns `WOULD_BLOCK` without
+mutating task state. Native syscalls run with interrupts disabled, so an
+in-kernel poll on token 8's assigned CPU would prevent the return-time
+preemption and timer progress needed to open the gate. The controller retries
+the complete operation against its fixed active-monotonic deadline; every
+return releases runtime authority and preserves the ordinary scheduling
+boundary. A later retry re-resolves and revalidates the Process handle before
+terminal stop consumes the exact held ticket through the existing terminal
+observer, selects the expiry-first winner, and atomically clears the gate.
+Wrong-identity, wrong-generation, duplicate, stop-first, timeout, and
+post-terminal running/requeue paths fail the selector.
 Generic yield, block, preemption, and quantum-cancellation paths cannot consume
 the held ticket. The scheduler never acquires the collector, so lock order
 remains runtime to scheduler and observer callbacks run after scheduler unlock.
@@ -834,7 +838,8 @@ PASS requires the complete fixed transcript and all of these joins:
   token 9 then token 10;
 - bit 4 only after the kernel's monotonic interval from accepted ARM to the
   complete terminal fact set is at most the ARM bound of 240 seconds; the host
-  verifier additionally requires completion inside the frozen request deadline;
+  verifier additionally requires completion inside the frozen 300-second
+  capture deadline, leaving a 60-second terminal-diagnostic margin;
 - exact per-actor EXIT-before-REAP order and one reap for each lifecycle actor;
 - normal primordial/Wyrmroot bootstrap completion;
 - checked accounting and ownership facts; and

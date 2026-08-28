@@ -6023,47 +6023,15 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             }
             #[cfg(deepwyrm_dw1c_evidence)]
             if let NativeSyscallRequest::ProcessTerminate { process, .. } = request
-                && let Some((token8_thread, gate)) = runtime.dw1c_process_termination_gate(process)
+                && let Some((_token8_thread, gate)) = runtime.dw1c_process_termination_gate(process)
                 && gate == crate::task::Dw1cTerminalGate::AwaitingExpiry
             {
-                let deadline = crate::time::monotonic_now()
-                    .ok()
-                    .and_then(|now| now.checked_add(240_000_000_000))
-                    .unwrap_or_else(|| crate::test_support::complete_fail(0x2810_e01b));
-                drop(runtime);
-                loop {
-                    match self.shared.execution.dw1c_terminal_gate(token8_thread) {
-                        crate::task::Dw1cTerminalGate::Ready => break,
-                        crate::task::Dw1cTerminalGate::AwaitingExpiry => {}
-                        crate::task::Dw1cTerminalGate::NotFixture => {
-                            crate::test_support::complete_fail(0x2810_e01c)
-                        }
-                    }
-                    let timed_out = match crate::time::monotonic_now() {
-                        Ok(now) => now >= deadline,
-                        Err(_) => true,
-                    };
-                    if timed_out {
-                        crate::test_support::complete_fail(0x2810_e01d)
-                    }
-                    core::hint::spin_loop();
-                }
-                runtime = self.runtime.lock();
-                runtime.switch_cpu(self.cpu);
-                if matches!(
-                    crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
-                    crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
-                ) {
-                    return NativeSyscallResult {
-                        status: DW_STATUS_SUCCESS,
-                        control: SyscallControl::ServiceRendezvous,
-                    };
-                }
-                if runtime.dw1c_process_termination_gate(process)
-                    != Some((token8_thread, crate::task::Dw1cTerminalGate::Ready))
-                {
-                    crate::test_support::complete_fail(0x2810_e01e)
-                }
+                // Syscalls run with IF clear. Polling here would monopolize
+                // token 8's assigned CPU and prevent the very quantum expiry
+                // that opens this gate. Return through the ordinary syscall
+                // boundary so return-time preemption can dispatch token 8;
+                // the selector controller retries the complete operation.
+                return NativeSyscallResult::returning(DW_STATUS_WOULD_BLOCK);
             }
             let prepared = match request {
                 NativeSyscallRequest::ProcessExit { exit_code } => {

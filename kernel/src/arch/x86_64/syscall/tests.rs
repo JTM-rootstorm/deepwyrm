@@ -417,3 +417,19 @@ fn dw1_a_idle_accounting_is_bound_to_successful_halted_publication() {
     assert!(accounting_finish < rescan);
     assert!(!primordial[rescan..].contains("publish_scheduler_idle"));
 }
+
+#[test]
+fn dw1c_token8_gate_returns_before_waiting_with_interrupts_disabled() {
+    let source = include_str!("../mm/activation/primordial.rs");
+    let start = source
+        .find("if let NativeSyscallRequest::ProcessTerminate { process, .. } = request")
+        .expect("selector-28 token-8 termination gate must remain explicit");
+    let end = source[start..]
+        .find("            let prepared = match request")
+        .map(|offset| start + offset)
+        .expect("termination preparation must follow the selector-private gate");
+    let gate = &source[start..end];
+    assert!(gate.contains("NativeSyscallResult::returning(DW_STATUS_WOULD_BLOCK)"));
+    assert!(!gate.contains("spin_loop"));
+    assert!(!gate.contains("240_000_000_000"));
+}
