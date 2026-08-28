@@ -269,8 +269,6 @@ fn with_current_cpu_identity<'a>(
 }
 
 static EARLY_OUTPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
-#[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
-static EARLY_COM1_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 struct OutputGuard;
 
@@ -505,12 +503,11 @@ impl PortIo for X86PortIo {
 /// Initializes the kernel's COM1 diagnostic writer.
 #[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
 pub(crate) fn initialize_early_com1() {
-    let Some(_guard) = OutputGuard::acquire() else {
-        return;
-    };
-    if EARLY_COM1_INITIALIZED.swap(true, Ordering::AcqRel) {
-        return;
-    }
+    // This runs once on the BSP before AP startup and before any serial
+    // reporter can exist. Keep it independent of BSS-backed output state: the
+    // loader-owned bootstrap page tables need only cover the fixed early
+    // entry/descriptor contract, while normal output serialization begins
+    // after Deep-owned paging is active.
     let mut serial = Com1::new(X86PortIo);
     serial.initialize();
 }
@@ -573,7 +570,6 @@ pub(crate) fn handle_early_panic(info: &PanicInfo<'_>) -> ! {
         backtrace_frames: &[],
     };
 
-    initialize_early_com1();
     let _ = emit_early_panic_record(&record);
 
     // The test-support completion transport is deliberately only provided for

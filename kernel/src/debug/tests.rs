@@ -267,6 +267,29 @@ fn reentrant_output_fails_fast() {
 }
 
 #[test]
+fn bootstrap_com1_initialization_does_not_depend_on_output_guard_state() {
+    let source = include_str!("mod.rs");
+    let initializer = source
+        .split("pub(crate) fn initialize_early_com1()")
+        .nth(1)
+        .unwrap()
+        .split("/// Emits a structured record")
+        .next()
+        .unwrap();
+    assert!(!initializer.contains("OutputGuard"));
+    assert!(!initializer.contains("EARLY_OUTPUT_ACTIVE"));
+
+    let panic_handler = source
+        .split("pub(crate) fn handle_early_panic(")
+        .nth(1)
+        .unwrap()
+        .split("fn test_panic_location_detail")
+        .next()
+        .unwrap();
+    assert!(!panic_handler.contains("initialize_early_com1"));
+}
+
+#[test]
 fn ordinary_records_have_bounded_fields() {
     let _test_lock = lock_output_guard_test();
     let mut serial = Com1::new(FakePort::ready());

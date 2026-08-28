@@ -787,7 +787,11 @@ terminal in one transaction. If any evidence write fails after a prefix has
 escaped, it halts without appending `DWTEST1`, because serial bytes cannot be
 rolled back into an atomic certificate. Runtime panic handling never
 reinitializes an already initialized UART while another terminal owner may be
-transmitting.
+transmitting. The one-shot BSP UART initialization also remains independent of
+BSS-backed output arbitration: it runs before AP startup under loader-owned
+bootstrap paging, while `OutputGuard` begins governing actual record and
+terminal writers only after that initialization. This prevents early entry
+from depending on far-BSS coverage merely to program the fixed UART.
 
 The selector-private rejection codes are fixed for validation and diagnostics:
 `01 RUNNING`, `02 BLOCK_PREPARING`, `03 CONTINUATION_BOUND`,
