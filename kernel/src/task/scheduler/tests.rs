@@ -919,6 +919,8 @@ fn dw1b_repeated_syscall_returns_preserve_budget_until_exact_expiry() {
                 previous: Some(previous),
                 current: Some(current),
                 cancelled_quantum: None,
+                #[cfg(deepwyrm_dw1c_evidence)]
+                terminal_published_expiry: None,
             },
             outgoing: switched,
         }) if previous == first && current == second && switched == outgoing
@@ -954,6 +956,8 @@ fn dw1b_no_peer_yield_preserves_budget_until_due_retain_consumes_it() {
             previous: Some(running),
             current: Some(running),
             cancelled_quantum: None,
+            #[cfg(deepwyrm_dw1c_evidence)]
+            terminal_published_expiry: None,
         }
     );
     assert_eq!(
@@ -1009,6 +1013,8 @@ fn dw1b_matching_expiry_rotates_fifo_and_retains_exact_continuation() {
                 previous: Some(first),
                 current: Some(second),
                 cancelled_quantum: None,
+                #[cfg(deepwyrm_dw1c_evidence)]
+                terminal_published_expiry: None,
             },
             outgoing,
         }
@@ -1101,7 +1107,11 @@ fn dw1b_block_commit_and_terminal_retirement_win_over_pending_expiry() {
     let second_claim = scheduler.running_claim_on(cpu(0)).unwrap();
     let ticket = scheduler.prepare_quantum_on(cpu(0), 2).unwrap();
     scheduler.publish_quantum_expiry(ticket).unwrap();
-    assert_eq!(scheduler.retire_on(cpu(0), second).unwrap().current, None);
+    let decision = scheduler.retire_on(cpu(0), second).unwrap();
+    assert_eq!(decision.current, None);
+    assert_eq!(decision.cancelled_quantum, None);
+    #[cfg(deepwyrm_dw1c_evidence)]
+    assert_eq!(decision.terminal_published_expiry, Some(ticket));
     assert!(!scheduler.has_reschedule_request_on(cpu(0)));
     assert_eq!(scheduler.publish_quantum_expiry(ticket), Ok(false));
     scheduler.complete_switch_on(second_claim).unwrap();
@@ -1477,7 +1487,14 @@ fn remote_stop_removes_only_the_exact_running_claim_without_replacement() {
     assert_eq!(claim.thread(), stopped);
     let ticket = scheduler.prepare_quantum_on(cpu(1), 30).unwrap();
 
-    assert_eq!(scheduler.stop_running_claim_on(claim), Ok(Some(ticket)));
+    assert_eq!(
+        scheduler.stop_running_claim_on(claim),
+        Ok(SchedulerTerminalStop {
+            cancelled_quantum: Some(ticket),
+            #[cfg(deepwyrm_dw1c_evidence)]
+            terminal_published_expiry: None,
+        })
+    );
     assert_eq!(scheduler.current_on(cpu(1)), None);
     assert_eq!(scheduler.running_cpu(stopped), None);
     assert_eq!(scheduler.suspended_claim_on(cpu(1)), Some(claim));
@@ -1783,6 +1800,8 @@ fn idle_scheduler_preserves_fifo_when_other_work_wakes_first() {
             previous: Some(suspended),
             current: Some(first),
             cancelled_quantum: None,
+            #[cfg(deepwyrm_dw1c_evidence)]
+            terminal_published_expiry: None,
         })
     );
     assert_eq!(scheduler.state(first), Some(SchedulerThreadState::Running));
@@ -1950,6 +1969,8 @@ fn dw0_f11_fixed_seed_scheduler_transaction_trace_preserves_queue_exclusivity() 
                 previous: None,
                 current: Some(first_thread),
                 cancelled_quantum: None,
+                #[cfg(deepwyrm_dw1c_evidence)]
+                terminal_published_expiry: None,
             },
             "DW0-F11 seed={SEED:#x} step={step} operation=schedule"
         );
@@ -1971,6 +1992,8 @@ fn dw0_f11_fixed_seed_scheduler_transaction_trace_preserves_queue_exclusivity() 
                 previous: Some(first_thread),
                 current: Some(second_thread),
                 cancelled_quantum: None,
+                #[cfg(deepwyrm_dw1c_evidence)]
+                terminal_published_expiry: None,
             },
             "DW0-F11 seed={SEED:#x} step={step} operation=yield"
         );
@@ -2029,6 +2052,8 @@ fn dw0_f11_fixed_seed_scheduler_transaction_trace_preserves_queue_exclusivity() 
                 previous: Some(second_thread),
                 current: Some(first_thread),
                 cancelled_quantum: None,
+                #[cfg(deepwyrm_dw1c_evidence)]
+                terminal_published_expiry: None,
             },
             "DW0-F11 seed={SEED:#x} step={step} operation=commit-block"
         );
@@ -2096,6 +2121,8 @@ fn dw0_f11_fixed_seed_scheduler_transaction_trace_preserves_queue_exclusivity() 
                 previous: Some(first_thread),
                 current: Some(first_thread),
                 cancelled_quantum: None,
+                #[cfg(deepwyrm_dw1c_evidence)]
+                terminal_published_expiry: None,
             },
             "DW0-F11 seed={SEED:#x} step={step} operation=retire-runnable"
         );
@@ -2117,6 +2144,8 @@ fn dw0_f11_fixed_seed_scheduler_transaction_trace_preserves_queue_exclusivity() 
                 previous: Some(first_thread),
                 current: None,
                 cancelled_quantum: None,
+                #[cfg(deepwyrm_dw1c_evidence)]
+                terminal_published_expiry: None,
             },
             "DW0-F11 seed={SEED:#x} step={step} operation=retire-running"
         );
@@ -2608,7 +2637,7 @@ fn selector_migration_exclusion_set_probe_clear_is_generation_exact_and_retryabl
 }
 
 #[test]
-fn dw1c4_remote_stop_and_preemption_have_one_exact_winner_in_both_orders() {
+fn dw1c4_remote_stop_and_quantum_expiry_preserve_the_exact_winner_in_both_orders() {
     let mut registry = ObjectRegistry::<16>::new();
 
     let stop_first = CooperativeScheduler::<2>::new();
@@ -2622,7 +2651,14 @@ fn dw1c4_remote_stop_and_preemption_have_one_exact_winner_in_both_orders() {
     stop_first.schedule_next_on(cpu(0)).unwrap();
     let claim = stop_first.running_claim_on(cpu(0)).unwrap();
     let ticket = stop_first.prepare_quantum_on(cpu(0), 10).unwrap();
-    assert_eq!(stop_first.stop_running_claim_on(claim), Ok(Some(ticket)));
+    assert_eq!(
+        stop_first.stop_running_claim_on(claim),
+        Ok(SchedulerTerminalStop {
+            cancelled_quantum: Some(ticket),
+            #[cfg(deepwyrm_dw1c_evidence)]
+            terminal_published_expiry: None,
+        })
+    );
     assert_eq!(stop_first.publish_quantum_expiry(ticket), Ok(false));
     assert_eq!(
         stop_first.preempt_current_on(cpu(0)),
@@ -2636,29 +2672,64 @@ fn dw1c4_remote_stop_and_preemption_have_one_exact_winner_in_both_orders() {
     assert_eq!(stop_first.state(stopped), None);
     assert_eq!(stop_first.check_invariants(), Ok(()));
 
-    let preempt_first = CooperativeScheduler::<2>::new();
+    let expiry_first = CooperativeScheduler::<2>::new();
     let outgoing = thread_key(&mut registry);
     let replacement = thread_key(&mut registry);
     for thread in [outgoing, replacement] {
-        preempt_first
-            .commit_on(cpu(0), preempt_first.reserve(thread).unwrap())
+        expiry_first
+            .commit_on(cpu(0), expiry_first.reserve(thread).unwrap())
             .unwrap();
     }
-    preempt_first.schedule_next_on(cpu(0)).unwrap();
-    let ticket = preempt_first.prepare_quantum_on(cpu(0), 20).unwrap();
-    assert_eq!(preempt_first.publish_quantum_expiry(ticket), Ok(true));
-    let outgoing_claim = match preempt_first.preempt_current_on(cpu(0)).unwrap() {
+    expiry_first.schedule_next_on(cpu(0)).unwrap();
+    let claim = expiry_first.running_claim_on(cpu(0)).unwrap();
+    let ticket = expiry_first.prepare_quantum_on(cpu(0), 20).unwrap();
+    assert_eq!(expiry_first.publish_quantum_expiry(ticket), Ok(true));
+    assert_eq!(
+        expiry_first.stop_running_claim_on(claim),
+        Ok(SchedulerTerminalStop {
+            cancelled_quantum: None,
+            #[cfg(deepwyrm_dw1c_evidence)]
+            terminal_published_expiry: Some(ticket),
+        })
+    );
+    assert_eq!(expiry_first.publish_quantum_expiry(ticket), Ok(false));
+    assert_eq!(
+        expiry_first.preempt_current_on(cpu(0)),
+        Err(SchedulerError::StaleQuantum)
+    );
+    expiry_first.complete_switch_on(claim).unwrap();
+    assert_eq!(
+        expiry_first.schedule_next_on(cpu(0)).unwrap().current,
+        Some(replacement)
+    );
+    assert_eq!(expiry_first.state(outgoing), None);
+    assert_eq!(expiry_first.check_invariants(), Ok(()));
+}
+
+#[test]
+fn dw1c4_preemption_winner_cannot_be_revived_by_terminal_stop_or_late_expiry() {
+    let scheduler = CooperativeScheduler::<2>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let outgoing = thread_key(&mut registry);
+    let replacement = thread_key(&mut registry);
+    for thread in [outgoing, replacement] {
+        scheduler
+            .commit_on(cpu(0), scheduler.reserve(thread).unwrap())
+            .unwrap();
+    }
+    scheduler.schedule_next_on(cpu(0)).unwrap();
+    let ticket = scheduler.prepare_quantum_on(cpu(0), 20).unwrap();
+    assert_eq!(scheduler.publish_quantum_expiry(ticket), Ok(true));
+    let outgoing_claim = match scheduler.preempt_current_on(cpu(0)).unwrap() {
         SchedulerPreemptionDecision::Switch { outgoing, .. } => outgoing,
         decision => panic!("expected exact preemptive switch, got {decision:?}"),
     };
-    preempt_first
-        .stop_suspended_claim_on(outgoing_claim)
-        .unwrap();
-    assert_eq!(preempt_first.publish_quantum_expiry(ticket), Ok(false));
-    assert_eq!(preempt_first.state(outgoing), None);
-    assert_eq!(preempt_first.current_on(cpu(0)), Some(replacement));
-    preempt_first.complete_switch_on(outgoing_claim).unwrap();
-    assert_eq!(preempt_first.check_invariants(), Ok(()));
+    scheduler.stop_suspended_claim_on(outgoing_claim).unwrap();
+    assert_eq!(scheduler.publish_quantum_expiry(ticket), Ok(false));
+    assert_eq!(scheduler.state(outgoing), None);
+    assert_eq!(scheduler.current_on(cpu(0)), Some(replacement));
+    scheduler.complete_switch_on(outgoing_claim).unwrap();
+    assert_eq!(scheduler.check_invariants(), Ok(()));
 }
 
 #[test]

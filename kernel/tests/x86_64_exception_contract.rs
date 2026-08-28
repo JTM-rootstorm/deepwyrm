@@ -469,8 +469,9 @@ fn dw1b_syscall_return_accounts_due_budget_before_preemption_and_rearm() {
         .split_once("fn mint_quantum_on(")
         .expect("DW1-C2 exact quantum transition cancellation extent")
         .0;
-    assert!(clear.contains("let cancelled = self.quantum[cpu.index()].take()"));
-    assert!(clear.contains("cancelled"));
+    assert!(clear.contains("let cancelled_quantum = self.quantum[cpu.index()].take()"));
+    assert!(clear.contains("let published_expiry = self.need_resched[cpu.index()].take()"));
+    assert!(clear.contains("cancelled_quantum.is_none() || published_expiry.is_none()"));
 }
 
 #[test]

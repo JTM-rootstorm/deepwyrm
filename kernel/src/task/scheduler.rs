@@ -236,6 +236,21 @@ pub(crate) struct ScheduleDecision {
     pub(crate) previous: Option<ThreadKey>,
     pub(crate) current: Option<ThreadKey>,
     pub(crate) cancelled_quantum: Option<SchedulerQuantumTicket>,
+    #[cfg(deepwyrm_dw1c_evidence)]
+    pub(crate) terminal_published_expiry: Option<SchedulerQuantumTicket>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClearedPreemption {
+    cancelled_quantum: Option<SchedulerQuantumTicket>,
+    published_expiry: Option<SchedulerQuantumTicket>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SchedulerTerminalStop {
+    pub(crate) cancelled_quantum: Option<SchedulerQuantumTicket>,
+    #[cfg(deepwyrm_dw1c_evidence)]
+    pub(crate) terminal_published_expiry: Option<SchedulerQuantumTicket>,
 }
 
 /// Scheduler-authoritative ownership published before an architecture wake.
@@ -1256,10 +1271,17 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         Ok((generation, next))
     }
 
-    fn clear_preemption_on(&mut self, cpu: SchedulerCpuId) -> Option<SchedulerQuantumTicket> {
-        let cancelled = self.quantum[cpu.index()].take();
-        self.need_resched[cpu.index()] = None;
-        cancelled
+    fn clear_preemption_on(&mut self, cpu: SchedulerCpuId) -> ClearedPreemption {
+        let cancelled_quantum = self.quantum[cpu.index()].take();
+        let published_expiry = self.need_resched[cpu.index()].take();
+        debug_assert!(
+            cancelled_quantum.is_none() || published_expiry.is_none(),
+            "a CPU quantum cannot be both armed and already published"
+        );
+        ClearedPreemption {
+            cancelled_quantum,
+            published_expiry,
+        }
     }
 
     fn mint_quantum_on(
@@ -1339,6 +1361,9 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         for cpu_index in 0..H2_SCHEDULER_CPU_CAPACITY {
             let cpu = SchedulerCpuId::new(cpu_index).expect("bounded scheduler CPU index");
             let current = self.running[cpu_index];
+            if self.quantum[cpu_index].is_some() && self.need_resched[cpu_index].is_some() {
+                return Err(SchedulerError::StaleQuantum);
+            }
             for ticket in [self.quantum[cpu_index], self.need_resched[cpu_index]]
                 .into_iter()
                 .flatten()
@@ -1754,6 +1779,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 previous: None,
                 current: current.map(|claim| claim.thread),
                 cancelled_quantum: None,
+                #[cfg(deepwyrm_dw1c_evidence)]
+                terminal_published_expiry: None,
             },
             migration: pending_migration.map(|pending| pending.record),
         })
@@ -1807,6 +1834,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 previous: Some(thread),
                 current: Some(thread),
                 cancelled_quantum: None,
+                #[cfg(deepwyrm_dw1c_evidence)]
+                terminal_published_expiry: None,
             });
         };
         let enqueue_generation = state.next_enqueue_generation;
@@ -1833,7 +1862,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         let next = state
             .claim_first_runnable_on(cpu)?
             .expect("validated Runnable entry remains claimable");
-        let cancelled_quantum = state.clear_preemption_on(cpu);
+        let cancelled_quantum = state.clear_preemption_on(cpu).cancelled_quantum;
         state.running[cpu_index] = Some(next);
         let ready_at_ns = state.instrumentation_global_now_ns;
         state
@@ -1876,6 +1905,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             previous: Some(thread),
             current: Some(next.thread),
             cancelled_quantum,
+            #[cfg(deepwyrm_dw1c_evidence)]
+            terminal_published_expiry: None,
         })
     }
 
@@ -2114,6 +2145,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 previous: Some(current.thread),
                 current: Some(next.thread),
                 cancelled_quantum: None,
+                #[cfg(deepwyrm_dw1c_evidence)]
+                terminal_published_expiry: None,
             },
             outgoing: SchedulerExecutionClaim {
                 domain: state.domain,
@@ -2251,7 +2284,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             Err(error) => return Err(BlockReservationFailure { error, reservation }),
         };
         state.pending_block[cpu_index] = None;
-        let cancelled_quantum = state.clear_preemption_on(cpu);
+        let cancelled_quantum = state.clear_preemption_on(cpu).cancelled_quantum;
         state.running[cpu_index] = None;
         state
             .push(QueueEntry {
@@ -2293,6 +2326,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             previous: Some(reservation.key.thread),
             current: current.map(|claim| claim.thread),
             cancelled_quantum,
+            #[cfg(deepwyrm_dw1c_evidence)]
+            terminal_published_expiry: None,
         })
     }
 
@@ -2569,6 +2604,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                     previous: Some(suspended),
                     current: Some(next.thread),
                     cancelled_quantum: None,
+                    #[cfg(deepwyrm_dw1c_evidence)]
+                    terminal_published_expiry: None,
                 }),
                 migration: pending_migration.map(|pending| pending.record),
             })
@@ -2710,7 +2747,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             if state.pending_block[cpu_index].is_some_and(|pending| pending.thread == thread) {
                 state.pending_block[cpu_index] = None;
             }
-            let cancelled_quantum = state.clear_preemption_on(cpu);
+            let cleared_preemption = state.clear_preemption_on(cpu);
+            let cancelled_quantum = cleared_preemption.cancelled_quantum;
             state.running[cpu_index] = None;
             state.running[cpu_index] = current;
             state.suspended[cpu_index] = Some(SuspendedContinuation {
@@ -2740,6 +2778,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 previous: Some(thread),
                 current: current.map(|claim| claim.thread),
                 cancelled_quantum,
+                #[cfg(deepwyrm_dw1c_evidence)]
+                terminal_published_expiry: cleared_preemption.published_expiry,
             });
         }
         if let Some(owner_cpu) = state
@@ -2819,6 +2859,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 previous: Some(thread),
                 current: state.running[cpu_index].map(|claim| claim.thread),
                 cancelled_quantum: None,
+                #[cfg(deepwyrm_dw1c_evidence)]
+                terminal_published_expiry: None,
             });
         }
         let Some(index) = state.queue[..state.len]
@@ -2852,6 +2894,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             previous: state.running[cpu_index].map(|claim| claim.thread),
             current: state.running[cpu_index].map(|claim| claim.thread),
             cancelled_quantum: None,
+            #[cfg(deepwyrm_dw1c_evidence)]
+            terminal_published_expiry: None,
         })
     }
 
@@ -2863,7 +2907,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     pub(crate) fn stop_running_claim_on(
         &self,
         claim: SchedulerExecutionClaim,
-    ) -> Result<Option<SchedulerQuantumTicket>, SchedulerError> {
+    ) -> Result<SchedulerTerminalStop, SchedulerError> {
         let mut state = self.state.lock();
         if claim.domain != state.domain {
             return Err(SchedulerError::ForeignExecutionClaim);
@@ -2890,7 +2934,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         if state.pending_block[cpu_index].is_some_and(|pending| pending.thread == claim.thread) {
             state.pending_block[cpu_index] = None;
         }
-        let cancelled_quantum = state.clear_preemption_on(claim.cpu);
+        let cleared_preemption = state.clear_preemption_on(claim.cpu);
         state.running[cpu_index] = None;
         state.suspended[cpu_index] = Some(SuspendedContinuation {
             thread: claim.thread,
@@ -2907,7 +2951,11 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             claim.generation,
         );
         state.assert_invariants();
-        Ok(cancelled_quantum)
+        Ok(SchedulerTerminalStop {
+            cancelled_quantum: cleared_preemption.cancelled_quantum,
+            #[cfg(deepwyrm_dw1c_evidence)]
+            terminal_published_expiry: cleared_preemption.published_expiry,
+        })
     }
 
     /// Retires the exact blocked continuation that is still physically active
@@ -3517,11 +3565,15 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                     previous: Some(suspended),
                     current: None,
                     cancelled_quantum: None,
+                    #[cfg(deepwyrm_dw1c_evidence)]
+                    terminal_published_expiry: None,
                 }),
                 IdleScheduleDecision::ResumeCurrent => Ok(ScheduleDecision {
                     previous: Some(suspended),
                     current: Some(suspended),
                     cancelled_quantum: None,
+                    #[cfg(deepwyrm_dw1c_evidence)]
+                    terminal_published_expiry: None,
                 }),
                 IdleScheduleDecision::Switch(decision) => Ok(decision),
             };

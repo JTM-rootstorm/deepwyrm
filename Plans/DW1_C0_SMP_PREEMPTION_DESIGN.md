@@ -611,11 +611,23 @@ by canonical `DWTEST1` test ID 28/detail zero:
 | 45 | `FF TERMINAL` | 1 | Subject, generation, and value are all zero. It atomically claims terminal authority only after every prior relation succeeds. |
 
 The kernel may observe additional diagnostic transitions internally, but it
-retains only the first exact relation needed for each fixed record. The table is
-the terminal serialization order, not permission to infer a later fact early:
-the collector buffers the bounded relations and serializes the 46 records only
-after every fact is joined. Original transition generations and ordering remain
-part of those relations. A distinct generation-valid wake to an already-filled
+retains only one exact relation needed for each fixed record. The table is the
+terminal serialization order, not permission to infer a later fact early. For
+each CPU, the collector first buffers a bounded RUN candidate, advances it with
+an exact same-identity QUANTUM, and commits all three fixed RUN/QUANTUM/PREEMPT
+records atomically only after the matching involuntary switch completes. A
+later RUN may replace an incomplete RUN candidate, and a later exact arm for
+the same Running generation may replace a QUANTUM whose request was consumed
+without a switch. A RUN after an uncompleted QUANTUM, a QUANTUM without its
+RUN, or a PREEMPT without its exact QUANTUM remains out of order and latches a
+failure. The first completed chain whose RUN identity is not already retained
+for another CPU owns that CPU's fixed records; later distinct completed chains
+are valid surplus and cannot replace them. This selection preserves the host
+requirement that all four retained RUN identities are distinct.
+
+The collector serializes the 46 records only after every fact is joined.
+Original transition generations and ordering remain part of those relations.
+A distinct generation-valid wake to an already-filled
 target slot, or a local wake which is not a remote-wake record candidate, is one
 such additional transition: it cannot replace the retained payload or latch a
 selector failure. A later distinct generation-valid idle-steal migration is
@@ -626,9 +638,19 @@ that scheduler publication is local; its wait/wake/run and migration-rejection
 proof does not substitute for any of the four distinct remote-wake records.
 Exact replay of a retained wake or migration relation remains a duplicate,
 while reuse of its retained scheduler generation for a different relation is
-contradictory. Any incomplete, exact-duplicate, stale, out-of-order, malformed,
-overflowed, or contradictory observation latches one selector failure and
-cannot be repaired by later activity.
+contradictory. Any terminally incomplete transcript, exact duplicate, stale,
+out-of-order, malformed, overflowed, or contradictory observation latches one
+selector failure and cannot be repaired by later activity.
+
+Token 8's terminal-versus-expiry join is independent of the one fixed
+per-CPU transcript chain. Publishing an expiry consumes the physical timer
+source and leaves an exact scheduler request; terminal cleanup carries that
+already-published ticket to selector evidence separately from any still-armed
+ticket that must be physically cancelled. A nonterminal no-peer resolution may
+replace the pending selector candidate with a later exact arm for the same
+Running generation. Only an exact still-published ticket joined to the
+terminal winner sets race bit 2; a physically cancelled terminal-first ticket
+or an expiry already consumed by a normal preemption cannot do so.
 
 The selector-private rejection codes are fixed for validation and diagnostics:
 `01 RUNNING`, `02 BLOCK_PREPARING`, `03 CONTINUATION_BOUND`,

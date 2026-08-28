@@ -854,7 +854,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     }
 
     #[cfg(deepwyrm_dw1c_evidence)]
-    fn observe_terminal_preemption_ticket(&self, ticket: super::SchedulerQuantumTicket) {
+    fn observe_terminal_after_expiry_ticket(&self, ticket: super::SchedulerQuantumTicket) {
         if !crate::test_support::DW1C_EVIDENCE.tracks_thread(ticket.thread()) {
             return;
         }
@@ -1070,12 +1070,12 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         &self,
         claim: SchedulerExecutionClaim,
     ) -> Result<Option<super::SchedulerQuantumTicket>, SchedulerError> {
-        let cancelled = self.scheduler.stop_running_claim_on(claim)?;
+        let stopped = self.scheduler.stop_running_claim_on(claim)?;
         #[cfg(deepwyrm_dw1c_evidence)]
-        if let Some(ticket) = cancelled {
-            self.observe_terminal_preemption_ticket(ticket);
+        if let Some(ticket) = stopped.terminal_published_expiry {
+            self.observe_terminal_after_expiry_ticket(ticket);
         }
-        Ok(cancelled)
+        Ok(stopped.cancelled_quantum)
     }
 
     /// Retires a blocked physical continuation by its exact CPU/thread/
@@ -1522,8 +1522,8 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                             panic!("terminal thread was not removable from scheduler: {error:?}")
                         });
                     #[cfg(deepwyrm_dw1c_evidence)]
-                    if let Some(ticket) = decision.cancelled_quantum {
-                        self.observe_terminal_preemption_ticket(ticket);
+                    if let Some(ticket) = decision.terminal_published_expiry {
+                        self.observe_terminal_after_expiry_ticket(ticket);
                     }
                     if defer_current == Some(thread) {
                         assert!(
