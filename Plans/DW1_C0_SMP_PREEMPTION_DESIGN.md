@@ -628,8 +628,10 @@ fact rather than an inference from userspace. The allowance closes after that
 quantum or any observed RUN; later missing-RUN transitions remain failures. A
 later RUN may replace an incomplete RUN candidate. Every scheduler transition
 that consumes a published expiry without an involuntary switch explicitly
-clears that live QUANTUM chain; this includes no-peer retention, voluntary
-yield/block, and ordinary terminal cleanup. Only token 8's terminal consumer
+resolves that live QUANTUM chain. No-peer retention republishes the exact
+unchanged Thread/generation as RUN because the scheduler proves it remained
+current and may rearm it without another dispatch. Voluntary yield/block and
+ordinary terminal cleanup clear the outgoing chain. Only token 8's terminal consumer
 may additionally select the terminal-versus-expiry race fact. A RUN after a
 still-unconsumed QUANTUM, a QUANTUM without its RUN, or a PREEMPT without its
 exact QUANTUM remains out of order and latches a failure. The first completed

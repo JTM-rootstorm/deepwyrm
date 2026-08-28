@@ -880,6 +880,20 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     }
 
     #[cfg(deepwyrm_dw1c_evidence)]
+    fn observe_retained_current_published_expiry(&self, ticket: super::SchedulerQuantumTicket) {
+        self.observe_consumed_published_expiry(Some(ticket));
+        crate::test_support::DW1C_EVIDENCE
+            .observe_running_claim(
+                ticket.cpu().index() as u8,
+                ticket.thread(),
+                ticket.execution_generation(),
+            )
+            .unwrap_or_else(|error| {
+                panic!("selector-28 retained-current RUN observation failed: {error:?}")
+            });
+    }
+
+    #[cfg(deepwyrm_dw1c_evidence)]
     fn observe_terminal_after_expiry_ticket(&self, ticket: super::SchedulerQuantumTicket) {
         if !crate::test_support::DW1C_EVIDENCE.tracks_thread(ticket.thread()) {
             return;
@@ -919,7 +933,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
             consumed_published_expiry,
         } = decision
         {
-            self.observe_consumed_published_expiry(Some(consumed_published_expiry));
+            self.observe_retained_current_published_expiry(consumed_published_expiry);
         }
         Ok(decision)
     }

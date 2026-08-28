@@ -2211,6 +2211,7 @@ mod tests {
     fn source_contract_keeps_raw_op3_nonterminal_and_flushes_only_normal_completion() {
         let source = include_str!("../arch/x86_64/mm/activation/primordial.rs");
         let scheduler_source = include_str!("../task/scheduler.rs");
+        let execution_source = include_str!("../task/execution.rs");
         let collector_source = include_str!("dw1c_evidence.rs");
         let raw = source
             .split("fn intercept_dw1c_evidence_raw(")
@@ -2234,6 +2235,29 @@ mod tests {
         assert!(
             collector_source
                 .contains("Records 42 and 44 share this selector-local scheduler-snapshot")
+        );
+        let retained = execution_source
+            .split("fn observe_retained_current_published_expiry(")
+            .nth(1)
+            .unwrap()
+            .split("fn observe_terminal_after_expiry_ticket(")
+            .next()
+            .unwrap();
+        assert!(
+            retained.find("self.observe_consumed_published_expiry(Some(ticket))")
+                < retained.find(".observe_running_claim(")
+        );
+        let preempt = execution_source
+            .split("pub(crate) fn preempt_current_on(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn preemption_disable_on(")
+            .next()
+            .unwrap();
+        assert!(
+            preempt.contains(
+                "self.observe_retained_current_published_expiry(consumed_published_expiry)"
+            )
         );
 
         assert_eq!(
@@ -3033,6 +3057,70 @@ mod tests {
         assert_eq!(state.token8_pending_expiry, None);
         assert_eq!(state.token8_terminal, None);
         assert_eq!(state.facts.race_matrix & (1 << 2), 0);
+        assert_eq!(state.failure, None);
+    }
+
+    #[test]
+    fn retained_current_republishes_run_before_the_rearmed_quantum() {
+        let (collector, actors) = armed_collector();
+        let actor = actors[2];
+
+        collector
+            .observe_quantum_claim(2, actor.thread, actor.execution_generation, 0x81)
+            .unwrap();
+        collector
+            .observe_consumed_quantum_claim(2, actor.thread, actor.execution_generation, 0x81)
+            .unwrap();
+        collector
+            .observe_running_claim(2, actor.thread, actor.execution_generation)
+            .unwrap();
+        collector
+            .observe_quantum_claim(2, actor.thread, actor.execution_generation, 0x82)
+            .unwrap();
+        collector
+            .observe_preemption_claim(2, actor.thread, actor.execution_generation, 0x182)
+            .unwrap();
+
+        let state = collector.state.lock();
+        assert_eq!(
+            state.run_payload[2].unwrap().subject,
+            u64::from(actor.token)
+        );
+        assert_eq!(state.quantum_payload[2].unwrap().value, 0x82);
+        assert_eq!(state.preempt_payload[2].unwrap().value, 0x182);
+        assert_eq!(state.failure, None);
+    }
+
+    #[test]
+    fn retained_current_republishes_a_nonserializing_later_generation() {
+        let (collector, actors) = armed_collector();
+        let actor = actors[3];
+        let later_generation = actor.execution_generation + 0x100;
+
+        collector
+            .observe_quantum_claim(3, actor.thread, later_generation, 0x91)
+            .unwrap();
+        collector
+            .observe_consumed_quantum_claim(3, actor.thread, later_generation, 0x91)
+            .unwrap();
+        collector
+            .observe_running_claim(3, actor.thread, later_generation)
+            .unwrap();
+        collector
+            .observe_quantum_claim(3, actor.thread, later_generation, 0x92)
+            .unwrap();
+        collector
+            .observe_preemption_claim(3, actor.thread, later_generation, 0x192)
+            .unwrap();
+
+        let state = collector.state.lock();
+        assert_eq!(state.cpu_chain[3], CpuChain::Empty);
+        assert_eq!(state.run_payload[3], None);
+        assert_eq!(state.quantum_payload[3], None);
+        assert_eq!(state.preempt_payload[3], None);
+        assert_eq!(state.facts.run & 0x08, 0);
+        assert_eq!(state.facts.quantum & 0x08, 0);
+        assert_eq!(state.facts.preempt & 0x08, 0);
         assert_eq!(state.failure, None);
     }
 
