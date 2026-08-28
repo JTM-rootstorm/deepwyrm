@@ -2339,11 +2339,11 @@ fn dw1c3_more_than_cpu_capacity_distributes_semantic_fifo_targets() {
             .unwrap();
         assert_eq!(publication.target(), target);
     }
-    for cpu_index in 0..H2_SCHEDULER_CPU_CAPACITY {
+    for (cpu_index, thread) in threads.iter().enumerate().take(H2_SCHEDULER_CPU_CAPACITY) {
         assert_eq!(scheduler.counters_on(cpu(cpu_index)).current_runnable, 2);
         assert_eq!(
             scheduler.schedule_next_on(cpu(cpu_index)).unwrap().current,
-            threads[cpu_index]
+            *thread
         );
     }
     assert_eq!(scheduler.check_invariants(), Ok(()));
