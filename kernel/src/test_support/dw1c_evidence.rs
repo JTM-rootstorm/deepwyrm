@@ -182,6 +182,7 @@ struct State {
     token6_wake_identity: Option<(u8, u8, u64, u64)>,
     token6_run_seen: bool,
     cpu_chain: [CpuChain; 4],
+    arm_boundary_quantum_allowed: [bool; 4],
     token8_pending_expiry: Option<(u8, u64, u64)>,
     token8_terminal: Option<(u8, u64, u64)>,
     token7: Option<Token7Flight>,
@@ -256,6 +257,7 @@ impl State {
             token6_wake_identity: None,
             token6_run_seen: false,
             cpu_chain: [CpuChain::Empty; 4],
+            arm_boundary_quantum_allowed: [false; 4],
             token8_pending_expiry: None,
             token8_terminal: None,
             token7: None,
@@ -569,6 +571,7 @@ impl Dw1cEvidenceCollector {
         state.arm_started_ns = Some(arm_started_ns);
         state.token6_wait_joined = token6_wait_joined;
         state.lifecycle_process_generation = lifecycle_generations;
+        state.arm_boundary_quantum_allowed = [true; 4];
         for (slot, actor) in state.actors.iter_mut().zip(actors) {
             *slot = Some(actor);
         }
@@ -1582,6 +1585,7 @@ fn retain_cpu_chain(
                 }
                 CpuChain::Empty | CpuChain::Run { .. } => {}
             }
+            state.arm_boundary_quantum_allowed[index] = false;
             state.cpu_chain[index] = CpuChain::Run {
                 token,
                 execution_generation,
@@ -1620,6 +1624,17 @@ fn retain_cpu_chain(
                 } if quantum_token == token && quantum_generation == execution_generation => {
                     serializable
                 }
+                CpuChain::Empty if state.arm_boundary_quantum_allowed[index] => {
+                    // ARM binds actors while the other CPUs continue running.
+                    // A tracked actor may therefore already own this CPU, or
+                    // may dispatch between its generation sample and the ARM
+                    // commit, before the collector can observe a separate RUN
+                    // callback. A successfully published quantum ticket is
+                    // scheduler-authoritative proof of that exact current
+                    // Thread/generation. Admit this only once per CPU at the
+                    // ARM boundary; later missing-RUN transitions stay strict.
+                    exact_bound_generation
+                }
                 CpuChain::Empty if state.run_payload[index].is_some() => false,
                 CpuChain::Empty => {
                     return Err(state.latch(Dw1cEvidenceError::MissingKernelFact));
@@ -1641,6 +1656,7 @@ fn retain_cpu_chain(
                 source_arm_generation: value,
                 serializable,
             };
+            state.arm_boundary_quantum_allowed[index] = false;
             if token == 8 {
                 state.token8_pending_expiry = Some((cpu, execution_generation, value));
             }
@@ -1986,6 +2002,30 @@ mod tests {
                 actor.thread,
                 actor.execution_generation,
                 completed_switch_generation,
+            )
+            .unwrap();
+    }
+
+    fn consume_arm_boundary_quantum(
+        collector: &Dw1cEvidenceCollector,
+        cpu: u8,
+        actor: Dw1cActor,
+        source_arm_generation: u64,
+    ) {
+        collector
+            .observe_quantum_claim(
+                cpu,
+                actor.thread,
+                actor.execution_generation,
+                source_arm_generation,
+            )
+            .unwrap();
+        collector
+            .observe_consumed_quantum_claim(
+                cpu,
+                actor.thread,
+                actor.execution_generation,
+                source_arm_generation,
             )
             .unwrap();
     }
@@ -2905,6 +2945,7 @@ mod tests {
         let (collector, actors) = armed_collector();
         let actor = actors[0];
         assert!(collector.tracks_thread(actor.thread));
+        consume_arm_boundary_quantum(&collector, 0, actor, 6);
         assert_eq!(
             collector.observe_quantum_claim(0, actor.thread, actor.execution_generation + 1, 7),
             Err(Dw1cEvidenceError::MissingKernelFact)
@@ -3612,6 +3653,52 @@ mod tests {
     }
 
     #[test]
+    fn first_post_arm_quantum_joins_a_preexisting_running_actor_once() {
+        let (collector, actors) = armed_collector();
+        let actor = actors[2];
+
+        collector
+            .observe_quantum_claim(2, actor.thread, actor.execution_generation, 0x15)
+            .unwrap();
+        assert_eq!(
+            collector.state.lock().cpu_chain[2],
+            CpuChain::Quantum {
+                token: actor.token,
+                execution_generation: actor.execution_generation,
+                source_arm_generation: 0x15,
+                serializable: true,
+            }
+        );
+        collector
+            .observe_preemption_claim(2, actor.thread, actor.execution_generation, 0x105)
+            .unwrap();
+        let state = collector.state.lock();
+        assert_eq!(
+            state.run_payload[2],
+            Some(Dw1cRecordPayload {
+                subject: u64::from(actor.token),
+                generation: actor.execution_generation,
+                value: 2,
+            })
+        );
+        assert_eq!(state.failure, None);
+        drop(state);
+
+        let (one_shot, actors) = armed_collector();
+        let actor = actors[2];
+        consume_arm_boundary_quantum(&one_shot, 2, actor, 0x15);
+        let later_generation = actor.execution_generation + 0x100;
+        assert_eq!(
+            one_shot.observe_quantum_claim(2, actor.thread, later_generation, 0x16),
+            Err(Dw1cEvidenceError::MissingKernelFact)
+        );
+        assert_eq!(
+            one_shot.state.lock().failure,
+            Some(Dw1cEvidenceError::MissingKernelFact)
+        );
+    }
+
+    #[test]
     fn incomplete_cpu_consumes_later_generation_chain_without_filling_fixed_records() {
         let (collector, actors) = armed_collector();
         let actor = actors[3];
@@ -3886,6 +3973,7 @@ mod tests {
 
         let (unjoined, actors) = armed_collector();
         let actor = actors[1];
+        consume_arm_boundary_quantum(&unjoined, 1, actor, 8);
         assert_eq!(
             unjoined.observe_quantum_claim(1, actor.thread, actor.execution_generation + 1, 9,),
             Err(Dw1cEvidenceError::MissingKernelFact)

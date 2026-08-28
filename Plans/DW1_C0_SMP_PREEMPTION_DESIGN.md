@@ -615,9 +615,17 @@ retains only one exact relation needed for each fixed record. The table is the
 terminal serialization order, not a chronological scheduler trace and not
 permission to infer a later fact early. Actor Process and Thread identities are
 each unique in the ARM table; a Thread cannot name two actor tokens. For
-each CPU, the collector first buffers a bounded RUN candidate, advances it with
-an exact same-identity QUANTUM, and commits all three fixed RUN/QUANTUM/PREEMPT
-records atomically only after the matching involuntary switch completes. A
+each CPU, the collector normally first buffers a bounded RUN candidate,
+advances it with an exact same-identity QUANTUM, and commits all three fixed
+RUN/QUANTUM/PREEMPT records atomically only after the matching involuntary
+switch completes. ARM is concurrent with the other CPUs: an actor may already
+be Running, or dispatch between its generation sample and the ARM commit,
+before a separate RUN callback can be observed. Each CPU therefore has one
+ARM-boundary allowance for its first scheduler-validated published quantum to
+establish that exact current Thread/generation. The scheduler accepts that
+ticket only while the same claim is still current, so this is a retained kernel
+fact rather than an inference from userspace. The allowance closes after that
+quantum or any observed RUN; later missing-RUN transitions remain failures. A
 later RUN may replace an incomplete RUN candidate. Every scheduler transition
 that consumes a published expiry without an involuntary switch explicitly
 clears that live QUANTUM chain; this includes no-peer retention, voluntary
@@ -642,8 +650,9 @@ candidate and cannot by itself fill a fixed record. Unique quantum-arm and
 completed-switch generations remain replay-checked. A later token-8 CPU chain
 is non-serializing for the fixed CPU records, but its pending quantum may
 independently win the terminal-expiry join at that same later execution
-generation. A QUANTUM without either its observed RUN or an already-complete
-fixed CPU slot remains a hard missing fact. Later token-6 and token-7 scheduler
+generation. Outside the one-shot ARM boundary, a QUANTUM without either its
+observed RUN or an already-complete fixed CPU slot remains a hard missing fact.
+Later token-6 and token-7 scheduler
 surplus cannot advance their independent private race joins; those joins retain
 their own exact wake/block generation rules. This selection preserves the host
 requirement that all four retained RUN identities are distinct.
