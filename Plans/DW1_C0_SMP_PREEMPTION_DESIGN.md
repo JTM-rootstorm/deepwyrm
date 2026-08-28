@@ -752,9 +752,13 @@ transcript chain. After token 8's lane has completed, the fixture arms one exact
 terminal gate for that Thread and its next Running generation. A physical timer
 expiry is consumed and published through the ordinary timer path, but its exact
 scheduler ticket is retained in a selector-private held slot rather than placed
-in the ordinary reschedule request. While held, that claim is neither rearmed
-nor involuntarily preempted; token 7 remains a real runnable peer. No synthetic
-or cancelled ticket is eligible.
+in the ordinary reschedule request. The held slot alone does not open the gate:
+only after the post-scheduler QUANTUM observer accepts that exact ticket does a
+second scheduler acknowledgement make the gate ready. This prevents a remote
+terminal stop from consuming the ticket before the collector has installed its
+matching QUANTUM chain. While held, that claim is neither rearmed nor
+involuntarily preempted; token 7 remains a real runnable peer. No synthetic or
+cancelled ticket is eligible.
 
 The live `ProcessTerminate` path checks this gate before TaskAuthority mutates
 token 8. If the gate is awaiting the timer, it drops the shared runtime lock and
@@ -767,6 +771,23 @@ stop-first, timeout, and post-terminal running/requeue paths fail the selector.
 Generic yield, block, preemption, and quantum-cancellation paths cannot consume
 the held ticket. The scheduler never acquires the collector, so lock order
 remains runtime to scheduler and observer callbacks run after scheduler unlock.
+
+Token 6's required `EXECUTION_PINNED` rejection is one selector-private
+scheduler transaction with its real wake. Under the same scheduler ownership,
+the blocked generation becomes Runnable, receives the temporary exact external
+exclusion, runs the ordinary migration revalidation predicate, retains the
+rejection record, and clears the exclusion. The actor cannot dispatch between
+wake publication and the probe. The collector observes both retained scheduler
+results only after the lock is released.
+
+Selector 28 also has one global terminal arbiter shared by successful flush,
+FAIL, and PANIC paths. A winner owns both COM1 and debug-exit; losing CPUs halt
+without either effect. A successful owner writes all 46 records and the PASS
+terminal in one transaction. If any evidence write fails after a prefix has
+escaped, it halts without appending `DWTEST1`, because serial bytes cannot be
+rolled back into an atomic certificate. Runtime panic handling never
+reinitializes an already initialized UART while another terminal owner may be
+transmitting.
 
 The selector-private rejection codes are fixed for validation and diagnostics:
 `01 RUNNING`, `02 BLOCK_PREPARING`, `03 CONTINUATION_BOUND`,
@@ -796,10 +817,11 @@ PASS requires the complete fixed transcript and all of these joins:
 - bit 1 only after the kernel observes token 7 block on a full selector-owned
   Channel, the peer drain that creates capacity, its matching block-generation
   wake, and a later Running claim for that same generation;
-- bit 2 only after the real token-8 timer publication opens the selector-private
-  terminal gate, the ordinary terminal transition consumes that exact held
-  ticket as the single expiry-first winner, and no requeue or Running claim for
-  that generation is observed afterward;
+- bit 2 only after the real token-8 timer publication is accepted by the
+  QUANTUM observer, the scheduler acknowledges that exact held ticket and opens
+  the selector-private terminal gate, the ordinary terminal transition consumes
+  it as the single expiry-first winner, and no requeue or Running claim for that
+  generation is observed afterward;
 - bit 3 only after ARM correlates tokens 9 and 10 to two distinct
   kernel-observed CREATE and START transitions and the kernel then observes
   each exact Process identity, authoritative terminal Thread generation, and

@@ -269,6 +269,8 @@ fn with_current_cpu_identity<'a>(
 }
 
 static EARLY_OUTPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
+static EARLY_COM1_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 struct OutputGuard;
 
@@ -503,6 +505,12 @@ impl PortIo for X86PortIo {
 /// Initializes the kernel's COM1 diagnostic writer.
 #[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
 pub(crate) fn initialize_early_com1() {
+    let Some(_guard) = OutputGuard::acquire() else {
+        return;
+    };
+    if EARLY_COM1_INITIALIZED.swap(true, Ordering::AcqRel) {
+        return;
+    }
     let mut serial = Com1::new(X86PortIo);
     serial.initialize();
 }

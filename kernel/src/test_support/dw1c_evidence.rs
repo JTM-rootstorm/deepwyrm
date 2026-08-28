@@ -605,6 +605,15 @@ impl Dw1cEvidenceCollector {
             && actor_thread_known(&state, thread)
     }
 
+    /// Selects the one ARM-bound actor whose real wake also drives the
+    /// selector-private migration-rejection transaction.
+    pub(crate) fn tracks_token6_thread(&self, thread: ThreadKey) -> bool {
+        let state = self.state.lock();
+        state.installed
+            && !state.scheduler_observation_closed()
+            && actor_token_for_thread(&state, thread) == Some(6)
+    }
+
     /// Global IPC activity is intentionally filtered before the strict
     /// token-7 observers below.  Only the exact post-ARM actor may bind or
     /// advance the selector-owned Channel flight.
@@ -2275,6 +2284,7 @@ mod tests {
         let source = include_str!("../arch/x86_64/mm/activation/primordial.rs");
         let scheduler_source = include_str!("../task/scheduler.rs");
         let execution_source = include_str!("../task/execution.rs");
+        let terminal_source = include_str!("x86_64.rs");
         let collector_source = include_str!("dw1c_evidence.rs");
         let raw = source
             .split("fn intercept_dw1c_evidence_raw(")
@@ -2337,6 +2347,25 @@ mod tests {
                 < completed_switch.find(".observe_running_claim(")
         );
         assert!(!completed_switch.contains("self.scheduler.running_claim_on"));
+        let completion = terminal_source
+            .split("pub(crate) fn complete_dw1c_evidence(")
+            .nth(1)
+            .unwrap()
+            .split("fn claim_dw1c_terminal(")
+            .next()
+            .unwrap();
+        assert!(
+            completion.find("claim_dw1c_terminal(DW1C_TERMINAL_SUCCESS)")
+                < completion.find("begin_test_serial_transaction()")
+        );
+        assert!(completion.contains("if permit"));
+        assert!(completion.contains(".is_err()"));
+        assert!(completion.contains("halt_after_completion()"));
+        assert!(!completion.contains("CompletionOutcome::Fail"));
+        assert!(
+            terminal_source
+                .contains("complete_dw1c_failure_terminal(CompletionOutcome::Panic, detail)")
+        );
 
         assert_eq!(
             source.matches("complete_primordial_launch(self);").count(),

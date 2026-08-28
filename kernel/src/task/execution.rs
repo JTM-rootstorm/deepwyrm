@@ -874,6 +874,11 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                 .unwrap_or_else(|error| {
                     panic!("selector-28 QUANTUM observation failed: {error:?}")
                 });
+            self.scheduler
+                .acknowledge_dw1c_quantum_observation(ticket)
+                .unwrap_or_else(|error| {
+                    panic!("selector-28 QUANTUM acknowledgement failed: {error:?}")
+                });
         }
         Ok(published)
     }
@@ -1243,9 +1248,22 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     }
 
     pub(crate) fn wake(&self, key: BlockWakeKey) -> Result<(), SchedulerError> {
-        let publication = self
-            .scheduler
-            .wake_on(super::scheduler_requester_cpu(), key)?;
+        let requester = super::scheduler_requester_cpu();
+        #[cfg(deepwyrm_dw1c_evidence)]
+        let token6 = crate::test_support::DW1C_EVIDENCE.tracks_token6_thread(key.thread());
+        #[cfg(deepwyrm_dw1c_evidence)]
+        let (publication, migration_rejection) = if token6 {
+            let (publication, rejection) = self.scheduler.wake_with_migration_rejection_on(
+                requester,
+                key,
+                super::SchedulerMigrationRejectionReason::ExecutionPinned,
+            )?;
+            (publication, Some(rejection))
+        } else {
+            (self.scheduler.wake_on(requester, key)?, None)
+        };
+        #[cfg(not(deepwyrm_dw1c_evidence))]
+        let publication = self.scheduler.wake_on(requester, key)?;
         #[cfg(deepwyrm_dw1c_evidence)]
         let actor_token = if crate::test_support::DW1C_EVIDENCE.tracks_thread(key.thread()) {
             crate::test_support::DW1C_EVIDENCE
@@ -1264,27 +1282,8 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         };
         #[cfg(deepwyrm_dw1c_evidence)]
         if actor_token == Some(6) {
-            let reason = super::SchedulerMigrationRejectionReason::ExecutionPinned;
-            self.scheduler
-                .set_migration_exclusion(key.thread(), key.execution_generation(), reason)
-                .unwrap_or_else(|error| {
-                    panic!("selector-28 migration exclusion publication failed: {error:?}")
-                });
-            let rejection = self
-                .scheduler
-                .attempt_migration_revalidation_on(
-                    publication.source(),
-                    key.thread(),
-                    key.execution_generation(),
-                )
-                .unwrap_or_else(|error| {
-                    panic!("selector-28 migration rejection probe failed: {error:?}")
-                });
-            self.scheduler
-                .clear_migration_exclusion(key.thread(), key.execution_generation(), reason)
-                .unwrap_or_else(|error| {
-                    panic!("selector-28 migration exclusion clear failed: {error:?}")
-                });
+            let rejection = migration_rejection
+                .expect("token-6 wake atomically returns its migration rejection");
             crate::test_support::DW1C_EVIDENCE
                 .observe_migration_rejection_claim(
                     rejection.cpu.index() as u8,

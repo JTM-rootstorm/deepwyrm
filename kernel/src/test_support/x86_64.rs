@@ -20,10 +20,10 @@ use crate::debug::emit_early_raw_record;
 ))]
 use crate::debug::{TestSerialTransaction, begin_test_serial_transaction};
 
+#[cfg(deepwyrm_dw1c_evidence)]
+use super::Dw1cEvidenceFlushPermit;
 #[cfg(deepwyrm_dw1b_evidence)]
 use super::dw1b_evidence::Dw1bEvidenceFlushPermit;
-#[cfg(deepwyrm_dw1c_evidence)]
-use super::{Dw1cEvidenceError, Dw1cEvidenceFlushPermit};
 #[cfg(deepwyrm_i1_evidence)]
 use super::{EvidenceFlushError, I1_EVIDENCE};
 #[cfg(deepwyrm_wrcap_relay)]
@@ -54,6 +54,13 @@ static EXPECTED_FAULT_ADDRESS: AtomicU64 = AtomicU64::new(0);
 static EXPECTED_FAULT_RIP: AtomicU64 = AtomicU64::new(0);
 static EXPECTED_FAULT_ERROR: AtomicU64 = AtomicU64::new(0);
 static EXPECTED_FAULT_PROCESSOR: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(deepwyrm_dw1c_evidence)]
+const DW1C_TERMINAL_SUCCESS: u8 = 1;
+#[cfg(deepwyrm_dw1c_evidence)]
+const DW1C_TERMINAL_FAILURE: u8 = 2;
+#[cfg(deepwyrm_dw1c_evidence)]
+static DW1C_TERMINAL_OWNER: AtomicU8 = AtomicU8::new(0);
 
 core::arch::global_asm!(
     r#"
@@ -248,45 +255,60 @@ pub(crate) fn complete_wyr1b_evidence(permit: Wyr1bEvidenceFlushPermit<'_>) -> !
 /// DW1C records, then canonical DWTEST1 28/0, then the matching debug exit.
 #[cfg(deepwyrm_dw1c_evidence)]
 pub(crate) fn complete_dw1c_evidence(permit: Dw1cEvidenceFlushPermit<'_>) -> ! {
+    if !claim_dw1c_terminal(DW1C_TERMINAL_SUCCESS) {
+        halt_after_completion()
+    }
     let mut transport = unsafe { QemuCompletionTransport::new() };
-    let outcome = match begin_test_serial_transaction() {
-        Ok(transaction) => {
-            transport.transaction = Some(transaction);
-            match permit.flush(|record| {
-                transport
-                    .transaction
-                    .as_mut()
-                    .expect("DW1C owns serial transaction")
-                    .write_evidence(record)
-                    .map_err(|_| ())
-            }) {
-                Ok(()) => (CompletionOutcome::Pass, 0),
-                Err(error) => (CompletionOutcome::Fail, dw1c_failure_detail(error)),
-            }
-        }
-        Err(_) => halt_after_completion(),
+    let Ok(transaction) = begin_test_serial_transaction() else {
+        halt_after_completion()
     };
-    complete(&mut transport, completion_record(outcome.0, outcome.1))
+    transport.transaction = Some(transaction);
+    if permit
+        .flush(|record| {
+            transport
+                .transaction
+                .as_mut()
+                .expect("DW1C owns serial transaction")
+                .write_evidence(record)
+                .map_err(|_| ())
+        })
+        .is_err()
+    {
+        // A transmitted prefix cannot be rolled back. Never append a terminal
+        // that could make a partial certificate look like a coherent failure
+        // transaction; the host records the bounded serial and timeout.
+        halt_after_completion()
+    }
+    complete(
+        &mut transport,
+        completion_record(CompletionOutcome::Pass, 0),
+    )
 }
 
 #[cfg(deepwyrm_dw1c_evidence)]
-fn dw1c_failure_detail(error: Dw1cEvidenceError) -> u32 {
-    0x2810_f000
-        | match error {
-            Dw1cEvidenceError::Early => 1,
-            Dw1cEvidenceError::WrongReporter => 2,
-            Dw1cEvidenceError::Malformed => 3,
-            Dw1cEvidenceError::Duplicate => 4,
-            Dw1cEvidenceError::Full => 5,
-            Dw1cEvidenceError::Incomplete => 6,
-            Dw1cEvidenceError::Contradiction => 7,
-            Dw1cEvidenceError::WrongDigest => 8,
-            Dw1cEvidenceError::WrongActor => 9,
-            Dw1cEvidenceError::WrongGeneration => 10,
-            Dw1cEvidenceError::MissingKernelFact => 11,
-            Dw1cEvidenceError::TimeRegression => 12,
-            Dw1cEvidenceError::DeadlineExceeded => 13,
-        }
+fn claim_dw1c_terminal(owner: u8) -> bool {
+    claim_dw1c_terminal_on(&DW1C_TERMINAL_OWNER, owner)
+}
+
+#[cfg(any(test, deepwyrm_dw1c_evidence))]
+fn claim_dw1c_terminal_on(state: &AtomicU8, owner: u8) -> bool {
+    state
+        .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+#[cfg(deepwyrm_dw1c_evidence)]
+fn complete_dw1c_failure_terminal(outcome: CompletionOutcome, detail: u32) -> ! {
+    debug_assert!(outcome != CompletionOutcome::Pass);
+    if !claim_dw1c_terminal(DW1C_TERMINAL_FAILURE) {
+        halt_after_completion()
+    }
+    let mut transport = unsafe { QemuCompletionTransport::new() };
+    let Ok(transaction) = begin_test_serial_transaction() else {
+        halt_after_completion()
+    };
+    transport.transaction = Some(transaction);
+    complete(&mut transport, completion_record(outcome, detail))
 }
 
 /// Selector-25's sole kernel terminal for failures and panics. One atomic
@@ -390,6 +412,11 @@ fn wyr1b_failure_detail(error: Wyr1bEvidenceFlushError) -> u32 {
 
 /// Emit the build-selected test's PASS terminal record and stop.
 pub(crate) fn complete_pass(detail: u32) -> ! {
+    #[cfg(deepwyrm_dw1c_evidence)]
+    {
+        let _ = detail;
+        complete_dw1c_failure_terminal(CompletionOutcome::Fail, 0x2810_ffff)
+    }
     #[cfg(deepwyrm_wyr1_evidence)]
     {
         let _ = detail;
@@ -408,18 +435,23 @@ pub(crate) fn complete_pass(detail: u32) -> ! {
     #[cfg(not(any(
         deepwyrm_wyr1_evidence,
         deepwyrm_dw1b_evidence,
-        deepwyrm_wyr1b_evidence
+        deepwyrm_wyr1b_evidence,
+        deepwyrm_dw1c_evidence
     )))]
     complete_known_outcome(CompletionOutcome::Pass, detail)
 }
 
 /// Emit the build-selected test's FAIL terminal record and stop.
 pub(crate) fn complete_fail(detail: u32) -> ! {
+    #[cfg(deepwyrm_dw1c_evidence)]
+    {
+        complete_dw1c_failure_terminal(CompletionOutcome::Fail, detail)
+    }
     #[cfg(deepwyrm_wyr1_evidence)]
     {
         complete_wyr1_evidence_kernel_terminal(CompletionOutcome::Fail, detail)
     }
-    #[cfg(not(deepwyrm_wyr1_evidence))]
+    #[cfg(not(any(deepwyrm_wyr1_evidence, deepwyrm_dw1c_evidence)))]
     {
         #[cfg(deepwyrm_wyr1b_evidence)]
         complete_wyr1b_evidence_kernel_terminal(CompletionOutcome::Fail, detail);
@@ -430,11 +462,15 @@ pub(crate) fn complete_fail(detail: u32) -> ! {
 
 /// Emit the build-selected test's PANIC terminal record and stop.
 pub(crate) fn complete_panic(detail: u32) -> ! {
+    #[cfg(deepwyrm_dw1c_evidence)]
+    {
+        complete_dw1c_failure_terminal(CompletionOutcome::Panic, detail)
+    }
     #[cfg(deepwyrm_wyr1_evidence)]
     {
         complete_wyr1_evidence_kernel_terminal(CompletionOutcome::Panic, detail)
     }
-    #[cfg(not(deepwyrm_wyr1_evidence))]
+    #[cfg(not(any(deepwyrm_wyr1_evidence, deepwyrm_dw1c_evidence)))]
     {
         #[cfg(deepwyrm_wyr1b_evidence)]
         complete_wyr1b_evidence_kernel_terminal(CompletionOutcome::Panic, detail);
@@ -598,7 +634,11 @@ pub(crate) fn trigger_expected_invalid_opcode() -> ! {
     unsafe_code,
     reason = "compile-time test identity confines construction to the QEMU test image"
 )]
-#[cfg(not(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence)))]
+#[cfg(not(any(
+    deepwyrm_wyr1_evidence,
+    deepwyrm_wyr1b_evidence,
+    deepwyrm_dw1c_evidence
+)))]
 fn complete_known_outcome(outcome: CompletionOutcome, detail: u32) -> ! {
     // SAFETY: this function exists only in an x86_64-none `test-support` build
     // whose compile-time selector was resolved by the central QEMU harness
@@ -730,5 +770,23 @@ fn halt_after_completion() -> ! {
         unsafe {
             asm!("cli; hlt", options(nomem, nostack));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dw1c_terminal_arbitration_has_one_success_or_failure_winner() {
+        let success_first = AtomicU8::new(0);
+        assert!(claim_dw1c_terminal_on(&success_first, 1));
+        assert!(!claim_dw1c_terminal_on(&success_first, 2));
+        assert_eq!(success_first.load(Ordering::Acquire), 1);
+
+        let failure_first = AtomicU8::new(0);
+        assert!(claim_dw1c_terminal_on(&failure_first, 2));
+        assert!(!claim_dw1c_terminal_on(&failure_first, 1));
+        assert_eq!(failure_first.load(Ordering::Acquire), 2);
     }
 }

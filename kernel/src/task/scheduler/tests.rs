@@ -442,6 +442,37 @@ fn dw1c_fixture_preserves_explicit_migration_rejection_precedence() {
 }
 
 #[test]
+fn dw1c_fixture_wakes_and_rejects_token6_in_one_scheduler_transaction() {
+    let seed = installed_dw1c_fixture(cpu(0));
+    let token6 = seed.actors[5];
+    let generation = seed.identities[5].execution_generation;
+    let (publication, rejection) = seed
+        .scheduler
+        .wake_with_migration_rejection_on(
+            cpu(0),
+            seed.arm_wakes[5],
+            SchedulerMigrationRejectionReason::ExecutionPinned,
+        )
+        .unwrap();
+    assert_eq!(publication.target(), cpu(2));
+    assert_eq!(
+        rejection,
+        SchedulerMigrationRejection {
+            thread: token6,
+            execution_generation: generation,
+            cpu: cpu(0),
+            reason: SchedulerMigrationRejectionReason::ExecutionPinned,
+        }
+    );
+    assert_eq!(
+        seed.scheduler.state(token6),
+        Some(SchedulerThreadState::Runnable)
+    );
+    assert_eq!(seed.scheduler.running_cpu(token6), None);
+    assert_eq!(seed.scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
 fn dw1c_fixture_releases_completed_lane_and_holds_token8_terminal_expiry() {
     let seed = installed_dw1c_fixture(cpu(0));
 
@@ -518,6 +549,17 @@ fn dw1c_fixture_releases_completed_lane_and_holds_token8_terminal_expiry() {
         .unwrap()
         .expect("token8 receives one real quantum");
     assert_eq!(seed.scheduler.publish_quantum_expiry(ticket), Ok(true));
+    assert_eq!(
+        seed.scheduler.dw1c_terminal_gate(seed.actors[7]),
+        Dw1cTerminalGate::AwaitingExpiry
+    );
+    assert_eq!(
+        seed.scheduler.stop_running_claim_on(token8_claim),
+        Err(SchedulerError::QuantumUnavailable)
+    );
+    seed.scheduler
+        .acknowledge_dw1c_quantum_observation(ticket)
+        .unwrap();
     assert_eq!(
         seed.scheduler.dw1c_terminal_gate(seed.actors[7]),
         Dw1cTerminalGate::Ready

@@ -448,6 +448,7 @@ struct Dw1cSchedulerFixture {
     lane_complete_mask: u64,
     token8_gate_claim: Option<RunningClaim>,
     held_token8_expiry: Option<SchedulerQuantumTicket>,
+    token8_expiry_observed: bool,
     token8_terminal_consumed: bool,
 }
 
@@ -1744,6 +1745,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             lane_complete_mask: 0,
             token8_gate_claim: None,
             held_token8_expiry: None,
+            token8_expiry_observed: false,
             token8_terminal_consumed: false,
         });
         state.assert_invariants();
@@ -1759,11 +1761,38 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         if fixture.token8().thread != thread || fixture.token8_terminal_consumed {
             return Dw1cTerminalGate::NotFixture;
         }
-        if fixture.held_token8_expiry.is_some() {
+        if fixture.held_token8_expiry.is_some() && fixture.token8_expiry_observed {
             Dw1cTerminalGate::Ready
         } else {
             Dw1cTerminalGate::AwaitingExpiry
         }
+    }
+
+    /// Opens selector 28's token-8 terminal gate only after the collector has
+    /// accepted the exact scheduler-published expiry. Publication and evidence
+    /// observation intentionally occur on opposite sides of scheduler
+    /// ownership, so holding the ticket alone is not yet a terminal permit.
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    pub(crate) fn acknowledge_dw1c_quantum_observation(
+        &self,
+        ticket: SchedulerQuantumTicket,
+    ) -> Result<(), SchedulerError> {
+        let mut state = self.state.lock();
+        let Some(fixture) = state.dw1c_fixture.as_mut() else {
+            return Ok(());
+        };
+        let Some(held) = fixture.held_token8_expiry else {
+            return Ok(());
+        };
+        if held != ticket {
+            return Ok(());
+        }
+        if fixture.token8_terminal_consumed || fixture.token8_expiry_observed {
+            return Err(SchedulerError::StaleQuantum);
+        }
+        fixture.token8_expiry_observed = true;
+        state.assert_invariants();
+        Ok(())
     }
 
     #[cfg(any(test, deepwyrm_dw1c_evidence))]
@@ -2675,6 +2704,14 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         key: BlockWakeKey,
     ) -> Result<SchedulerWakePublication, SchedulerError> {
         let mut state = self.state.lock();
+        Self::wake_on_locked(&mut state, requester, key)
+    }
+
+    fn wake_on_locked(
+        state: &mut SchedulerState<CAPACITY>,
+        requester: SchedulerCpuId,
+        key: BlockWakeKey,
+    ) -> Result<SchedulerWakePublication, SchedulerError> {
         if key.domain != state.domain {
             return Err(SchedulerError::ForeignBlockToken);
         }
@@ -2758,6 +2795,60 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             source: requester,
             generation: wake_generation,
         })
+    }
+
+    /// Performs selector 28's token-6 wake and deliberate migration rejection
+    /// under one scheduler acquisition. The woken generation cannot dispatch
+    /// between Runnable publication and the exact exclusion probe.
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    pub(crate) fn wake_with_migration_rejection_on(
+        &self,
+        requester: SchedulerCpuId,
+        key: BlockWakeKey,
+        reason: SchedulerMigrationRejectionReason,
+    ) -> Result<(SchedulerWakePublication, SchedulerMigrationRejection), SchedulerError> {
+        let mut state = self.state.lock();
+        let publication = Self::wake_on_locked(&mut state, requester, key)?;
+        let Some(index) = state.queue[..state.len]
+            .iter()
+            .position(|entry| entry.is_some_and(|entry| entry.thread == key.thread))
+        else {
+            return Err(SchedulerError::NotScheduled);
+        };
+        let entry = state.queue[index]
+            .as_mut()
+            .expect("located DW1C wake entry remains queued");
+        if entry.state != SchedulerThreadState::Runnable
+            || entry.started_execution_generation != key.execution_generation
+            || entry.migration_exclusion.is_some()
+        {
+            return Err(SchedulerError::StaleExecutionClaim);
+        }
+        entry.migration_exclusion = Some(reason);
+        let candidate = *entry;
+        let victim = candidate.target_cpu;
+        let target = publication.source();
+        let attempt = if victim == target {
+            Err(SchedulerError::StaleExecutionClaim)
+        } else {
+            state
+                .selector_migration_attempt(candidate, victim, target)
+                .err()
+                .filter(|observed| *observed == reason)
+                .map(|observed| SchedulerMigrationRejection {
+                    thread: key.thread,
+                    execution_generation: key.execution_generation,
+                    cpu: target,
+                    reason: observed,
+                })
+                .ok_or(SchedulerError::StaleExecutionClaim)
+        };
+        state.queue[index]
+            .as_mut()
+            .expect("DW1C rejection candidate remains queued")
+            .migration_exclusion = None;
+        state.assert_invariants();
+        Ok((publication, attempt?))
     }
 
     pub(crate) fn wake(&self, key: BlockWakeKey) -> Result<(), SchedulerError> {
@@ -3289,6 +3380,9 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         #[cfg(any(test, deepwyrm_dw1c_evidence))]
         let held_dw1c_expiry = if let Some(fixture) = state.dw1c_fixture.as_mut() {
             if fixture.token8().thread == claim.thread && !fixture.token8_terminal_consumed {
+                if !fixture.token8_expiry_observed {
+                    return Err(SchedulerError::QuantumUnavailable);
+                }
                 let ticket = fixture
                     .held_token8_expiry
                     .take()
@@ -3306,6 +3400,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                     return Err(SchedulerError::StaleQuantum);
                 }
                 fixture.token8_gate_claim = None;
+                fixture.token8_expiry_observed = false;
                 fixture.token8_terminal_consumed = true;
                 Some(ticket)
             } else {
