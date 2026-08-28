@@ -692,11 +692,14 @@ PASS requires the complete fixed transcript and all of these joins:
   no requeue or Running claim for that generation afterward;
 - bit 3 only after ARM correlates tokens 9 and 10 to two distinct
   kernel-observed CREATE and START transitions and the kernel then observes each
-  exact Process/Thread generation exit and reap once in token order;
+  exact Process/Thread generation exit and reap once. EXIT observations advance
+  in token order, REAP observations independently advance in token order, and
+  each actor's EXIT must precede its REAP; token 9 may therefore reap before
+  token 10 exits without changing fixed serialization;
 - bit 4 only after the kernel's monotonic interval from accepted ARM to the
   complete terminal fact set is at most the ARM bound of 240 seconds; the host
   verifier additionally requires completion inside the frozen request deadline;
-- exact EXIT-before-REAP order and one reap for each lifecycle actor;
+- exact per-actor EXIT-before-REAP order and one reap for each lifecycle actor;
 - normal primordial/Wyrmroot bootstrap completion;
 - checked accounting and ownership facts; and
 - a matching terminal/debug-exit/request/product evidence join.

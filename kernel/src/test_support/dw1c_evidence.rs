@@ -987,7 +987,9 @@ impl Dw1cEvidenceCollector {
 
     /// Records one final root retirement only after teardown and finalizer
     /// drain. Process generation is checked against the private CREATE/ARM
-    /// bind, and the stream order is EXIT(9,10) then REAP(9,10).
+    /// bind. Each reap requires that same actor's exit; the two independent
+    /// families retain token order before fixed EXIT(9,10), REAP(9,10)
+    /// serialization.
     pub(crate) fn observe_process_reap(
         &self,
         process: ProcessKey,
@@ -1020,7 +1022,7 @@ impl Dw1cEvidenceCollector {
         if state.reap_payload[index].is_some() {
             return Err(state.latch(Dw1cEvidenceError::Duplicate));
         }
-        if state.exit_payload.iter().any(Option::is_none) {
+        if state.exit_payload[index].is_none() {
             return Err(state.latch(Dw1cEvidenceError::MissingKernelFact));
         }
         let expected = state
@@ -2649,7 +2651,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_exit_and_reap_retain_exact_ordered_payloads() {
+    fn interleaved_lifecycle_observation_retains_grouped_ordered_payloads() {
         let (collector, actors) = armed_collector();
         let token9 = actors[8];
         let token10 = actors[9];
@@ -2662,15 +2664,15 @@ mod tests {
             )
             .unwrap();
         collector
+            .observe_process_reap(token9.process, token9.process.object_id().generation(), 1)
+            .unwrap();
+        collector
             .observe_process_exit(
                 token10.process,
                 token10.thread,
                 token10.execution_generation,
                 0,
             )
-            .unwrap();
-        collector
-            .observe_process_reap(token9.process, token9.process.object_id().generation(), 1)
             .unwrap();
         collector
             .observe_process_reap(token10.process, token10.process.object_id().generation(), 1)
