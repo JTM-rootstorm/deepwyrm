@@ -659,6 +659,45 @@ surplus cannot advance their independent private race joins; those joins retain
 their own exact wake/block generation rules. This selection preserves the host
 requirement that all four retained RUN identities are distinct.
 
+Selector 28 makes that required scheduler activity deterministic with a
+selector-private fixture installed from the already validated ARM table. The
+fixture is compiled only under `deepwyrm_dw1c_evidence`; it is not affinity or
+scheduling-policy ABI, and it cannot call the evidence collector or create an
+evidence record. Let `S` be the reporter's ARM CPU. Tokens 1 and 2 form the
+actor lane on `S`; tokens 3/4, 5/6, and 7/8 form two-actor lanes on the other
+three CPUs in CPU-index order. Actor wake placement and
+idle-steal eligibility remain restricted to the assigned lane only until that
+lane completes a real involuntary RUN/QUANTUM/PREEMPT switch. The ordinary
+scheduler wake, timer, dispatch, switch-completion, and observer paths remain
+the sole sources of retained facts.
+
+The controller first launches token 1 and creates a selector-private relay
+Channel. It transfers the read endpoint to token 2 in place of that actor's
+ordinary GO, then launches tokens 3 and 5 while Running on `S`. A fourth
+selector-private operation returns `WOULD_BLOCK` until token 2 has consumed the
+endpoint and committed a second, continuation-released wait distinct from its
+ARM wait. Only then does the controller transfer the relay's write endpoint to
+token 7. The controller-to-actor wakes for tokens 3, 5, and 7 genuinely target
+the three other CPU lanes. Token 7, genuinely Running on its assigned remote
+CPU, sends token 2's GO through the relay; the ordinary Channel wake is
+therefore the fourth exact remote relation, targeting `S`. Both actors close
+their narrowed relay endpoint after the one message. The controller then
+launches tokens 4 and 6, and launches token 8 after the existing token-7
+capacity choreography. No observer or userspace claim supplies placement or
+wake evidence.
+
+After resolving the exact actor table, ARM returns the
+selector-private `WOULD_BLOCK` retry result until all eight actors are Blocked
+and their continuations have been released. The controller cannot send GO
+before ARM succeeds, so bounded retries allow the actors to finish their waits
+without holding runtime or scheduler authority. Every retry re-resolves and
+revalidates the handle table, topology, reporter, actor identities and
+generations, lifecycle, and scheduler state; a contradiction fails rather than
+being treated as transient. The successful attempt installs the fixture and
+arms the collector as one controller-visible operation. Lane restrictions
+release only after the corresponding completed involuntary switch, and every
+restriction releases before the ordinary idle-steal relation is admitted.
+
 The collector serializes the 46 records only after every fact is joined.
 Original transition generations and ordering remain part of those relations.
 A distinct scheduler-originated wake carrying either the exact bound execution
@@ -708,18 +747,26 @@ rather than requiring the earlier ARM generation or ARM-bound Thread.
 primordial deferred-current claim; ARM's live product generation authenticates
 ARM itself but is not assumed to survive intervening blocking or preemption.
 
-Token 8's terminal-versus-expiry join is independent of the one fixed
-per-CPU transcript chain. Publishing an expiry consumes the physical timer
-source and leaves an exact scheduler request; terminal cleanup carries that
-already-published ticket to selector evidence separately from any still-armed
-ticket that must be physically cancelled. A nonterminal no-peer resolution,
-voluntary yield/block, or ordinary actor termination explicitly consumes the
-pending selector candidate without selecting token 8's race fact. A later
-expiry ticket may carry either the ARM generation or a later nonzero execution
-generation; it remains non-serializing for fixed CPU records but may join token
-8's terminal winner and set race bit 2. A physically cancelled terminal-first
-ticket or an expiry already consumed by another committed transition cannot do
-so.
+Token 8's terminal-versus-expiry join is independent of the one fixed per-CPU
+transcript chain. After token 8's lane has completed, the fixture arms one exact
+terminal gate for that Thread and its next Running generation. A physical timer
+expiry is consumed and published through the ordinary timer path, but its exact
+scheduler ticket is retained in a selector-private held slot rather than placed
+in the ordinary reschedule request. While held, that claim is neither rearmed
+nor involuntarily preempted; token 7 remains a real runnable peer. No synthetic
+or cancelled ticket is eligible.
+
+The live `ProcessTerminate` path checks this gate before TaskAuthority mutates
+token 8. If the gate is awaiting the timer, it drops the shared runtime lock and
+polls with no runtime, task, registry, object, wait, or collector authority
+held; after readiness it reacquires runtime authority and re-resolves and
+revalidates the Process handle. Terminal stop then consumes the exact held
+ticket through the existing terminal observer, selects the expiry-first winner,
+and atomically clears the gate. Wrong-identity, wrong-generation, duplicate,
+stop-first, timeout, and post-terminal running/requeue paths fail the selector.
+Generic yield, block, preemption, and quantum-cancellation paths cannot consume
+the held ticket. The scheduler never acquires the collector, so lock order
+remains runtime to scheduler and observer callbacks run after scheduler unlock.
 
 The selector-private rejection codes are fixed for validation and diagnostics:
 `01 RUNNING`, `02 BLOCK_PREPARING`, `03 CONTINUATION_BOUND`,
@@ -738,7 +785,8 @@ PASS requires the complete fixed transcript and all of these joins:
   CPU, which is stronger than the minimum beyond-CPU0 relation;
 - nonzero progress for all five CPU-bound actors before the selector-local
   generous bounded-progress deadline;
-- one exact remote wake targeting every CPU;
+- one exact remote wake targeting every CPU, produced by the real selector
+  lane/relay choreography with distinct source and target CPUs;
 - one exact bounded idle steal/migration with distinct source/target and a
   nonzero migration generation;
 - one deliberate migration rejection for an A0 non-migratable state;
@@ -748,9 +796,10 @@ PASS requires the complete fixed transcript and all of these joins:
 - bit 1 only after the kernel observes token 7 block on a full selector-owned
   Channel, the peer drain that creates capacity, its matching block-generation
   wake, and a later Running claim for that same generation;
-- bit 2 only after the kernel joins token 8's exact quantum expiry with the
-  competing terminal transition, proves a single terminal winner, and observes
-  no requeue or Running claim for that generation afterward;
+- bit 2 only after the real token-8 timer publication opens the selector-private
+  terminal gate, the ordinary terminal transition consumes that exact held
+  ticket as the single expiry-first winner, and no requeue or Running claim for
+  that generation is observed afterward;
 - bit 3 only after ARM correlates tokens 9 and 10 to two distinct
   kernel-observed CREATE and START transitions and the kernel then observes
   each exact Process identity, authoritative terminal Thread generation, and

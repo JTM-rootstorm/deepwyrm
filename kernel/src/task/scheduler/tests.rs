@@ -17,6 +17,74 @@ fn cpu(index: usize) -> SchedulerCpuId {
     SchedulerCpuId::new(index).expect("test CPU is inside the H2 bound")
 }
 
+struct Dw1cFixtureSeed {
+    scheduler: CooperativeScheduler<16>,
+    reporter_claim: SchedulerExecutionClaim,
+    actors: [ThreadKey; 8],
+    identities: [Dw1cSchedulerActorIdentity; 8],
+    arm_wakes: [BlockWakeKey; 8],
+}
+
+fn dw1c_fixture_seed(reporter_cpu: SchedulerCpuId) -> Dw1cFixtureSeed {
+    let scheduler = CooperativeScheduler::<16>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let actors = core::array::from_fn::<_, 8, _>(|_| thread_key(&mut registry));
+    let mut identities = [Dw1cSchedulerActorIdentity {
+        thread: actors[0],
+        execution_generation: 0,
+    }; 8];
+    let mut arm_wakes = [BlockWakeKey {
+        domain: 0,
+        token: 0,
+        thread: actors[0],
+        cpu: SchedulerCpuId::BOOTSTRAP,
+        execution_generation: 0,
+    }; 8];
+    for (index, actor) in actors.iter().copied().enumerate() {
+        scheduler
+            .commit_on(cpu(0), scheduler.reserve(actor).unwrap())
+            .unwrap();
+        assert_eq!(
+            scheduler.schedule_next_on(cpu(0)).unwrap().current,
+            Some(actor)
+        );
+        let claim = scheduler.running_claim_on(cpu(0)).unwrap();
+        identities[index] = Dw1cSchedulerActorIdentity {
+            thread: actor,
+            execution_generation: claim.generation(),
+        };
+        let block = scheduler.prepare_block_current_on(cpu(0), actor).unwrap();
+        arm_wakes[index] = block.wake_key();
+        scheduler.commit_block_on(cpu(0), block).unwrap();
+        scheduler.complete_switch_on(claim).unwrap();
+    }
+
+    let reporter = thread_key(&mut registry);
+    scheduler
+        .commit_on(reporter_cpu, scheduler.reserve(reporter).unwrap())
+        .unwrap();
+    assert_eq!(
+        scheduler.schedule_next_on(reporter_cpu).unwrap().current,
+        Some(reporter)
+    );
+    let reporter_claim = scheduler.running_claim_on(reporter_cpu).unwrap();
+    Dw1cFixtureSeed {
+        scheduler,
+        reporter_claim,
+        actors,
+        identities,
+        arm_wakes,
+    }
+}
+
+fn installed_dw1c_fixture(reporter_cpu: SchedulerCpuId) -> Dw1cFixtureSeed {
+    let seed = dw1c_fixture_seed(reporter_cpu);
+    seed.scheduler
+        .install_dw1c_fixture(seed.reporter_claim, seed.identities)
+        .unwrap();
+    seed
+}
+
 #[test]
 fn four_competing_cpus_claim_distinct_fifo_work_once() {
     let scheduler = Arc::new(CooperativeScheduler::<8>::new());
@@ -262,6 +330,167 @@ fn dw1c_final_snapshot_rejects_sticky_accounting_and_time_faults() {
         inconsistent_gauge.dw1c_final_snapshot(),
         Err(SchedulerError::AccountingUnderflow)
     );
+}
+
+#[test]
+fn dw1c_fixture_arm_waits_for_every_released_blocked_actor() {
+    let seed = dw1c_fixture_seed(cpu(1));
+    let actor = seed.actors[7];
+    let wake = seed.arm_wakes[7];
+    assert_eq!(
+        seed.scheduler.wake_on(cpu(0), wake).unwrap().target(),
+        cpu(0)
+    );
+    assert_eq!(
+        seed.scheduler.schedule_next_on(cpu(0)).unwrap().current,
+        Some(actor)
+    );
+    assert_eq!(
+        seed.scheduler
+            .install_dw1c_fixture(seed.reporter_claim, seed.identities),
+        Err(SchedulerError::ContinuationOwned)
+    );
+
+    let claim = seed.scheduler.running_claim_on(cpu(0)).unwrap();
+    let block = seed
+        .scheduler
+        .prepare_block_current_on(cpu(0), actor)
+        .unwrap();
+    seed.scheduler.commit_block_on(cpu(0), block).unwrap();
+    seed.scheduler.complete_switch_on(claim).unwrap();
+    seed.scheduler
+        .install_dw1c_fixture(seed.reporter_claim, seed.identities)
+        .unwrap();
+    assert_eq!(seed.scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn dw1c_fixture_accepts_local_setup_wake_and_requires_token2_second_block() {
+    let seed = installed_dw1c_fixture(cpu(0));
+    assert!(!seed.scheduler.dw1c_token2_relay_ready());
+    assert_eq!(
+        seed.scheduler
+            .wake_on(cpu(0), seed.arm_wakes[1])
+            .unwrap()
+            .target(),
+        cpu(0)
+    );
+
+    let ticket = seed.scheduler.prepare_quantum_on(cpu(0), 10).unwrap();
+    assert_eq!(seed.scheduler.publish_quantum_expiry(ticket), Ok(true));
+    let reporter = match seed.scheduler.preempt_current_on(cpu(0)).unwrap() {
+        SchedulerPreemptionDecision::Switch { outgoing, .. } => outgoing,
+        decision => panic!("token2 did not replace the reporter: {decision:?}"),
+    };
+    assert_eq!(seed.scheduler.current_on(cpu(0)), Some(seed.actors[1]));
+    seed.scheduler.complete_switch_on(reporter).unwrap();
+    assert!(!seed.scheduler.dw1c_token2_relay_ready());
+
+    let token2_claim = seed.scheduler.running_claim_on(cpu(0)).unwrap();
+    let second_block = seed
+        .scheduler
+        .prepare_block_current_on(cpu(0), seed.actors[1])
+        .unwrap();
+    assert_ne!(second_block.wake_key().token, seed.arm_wakes[1].token);
+    seed.scheduler
+        .commit_block_on(cpu(0), second_block)
+        .unwrap();
+    seed.scheduler.complete_switch_on(token2_claim).unwrap();
+    assert!(seed.scheduler.dw1c_token2_relay_ready());
+    assert_eq!(seed.scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn dw1c_fixture_releases_completed_lane_and_holds_token8_terminal_expiry() {
+    let seed = installed_dw1c_fixture(cpu(0));
+
+    for index in [2, 3] {
+        assert_eq!(
+            seed.scheduler
+                .wake_on(cpu(0), seed.arm_wakes[index])
+                .unwrap()
+                .target(),
+            cpu(1)
+        );
+    }
+    assert_eq!(
+        seed.scheduler
+            .schedule_next_on_with_migration(cpu(2))
+            .unwrap()
+            .decision()
+            .current,
+        None
+    );
+    assert_eq!(
+        seed.scheduler.schedule_next_on(cpu(1)).unwrap().current,
+        Some(seed.actors[2])
+    );
+    let ticket = seed.scheduler.prepare_quantum_on(cpu(1), 20).unwrap();
+    assert_eq!(seed.scheduler.publish_quantum_expiry(ticket), Ok(true));
+    let token3 = match seed.scheduler.preempt_current_on(cpu(1)).unwrap() {
+        SchedulerPreemptionDecision::Switch { outgoing, .. } => outgoing,
+        decision => panic!("token4 did not replace token3: {decision:?}"),
+    };
+    assert_eq!(seed.scheduler.current_on(cpu(1)), Some(seed.actors[3]));
+    seed.scheduler.complete_switch_on(token3).unwrap();
+    let migrated = seed
+        .scheduler
+        .schedule_next_on_with_migration(cpu(2))
+        .unwrap();
+    assert_eq!(migrated.decision().current, Some(seed.actors[2]));
+    assert!(migrated.migration().is_some());
+
+    for index in [6, 7] {
+        assert_eq!(
+            seed.scheduler
+                .wake_on(cpu(0), seed.arm_wakes[index])
+                .unwrap()
+                .target(),
+            cpu(3)
+        );
+    }
+    assert_eq!(
+        seed.scheduler.schedule_next_on(cpu(3)).unwrap().current,
+        Some(seed.actors[6])
+    );
+    let ticket = seed.scheduler.prepare_quantum_on(cpu(3), 30).unwrap();
+    assert_eq!(seed.scheduler.publish_quantum_expiry(ticket), Ok(true));
+    let token7 = match seed.scheduler.preempt_current_on(cpu(3)).unwrap() {
+        SchedulerPreemptionDecision::Switch { outgoing, .. } => outgoing,
+        decision => panic!("token8 did not replace token7: {decision:?}"),
+    };
+    assert_eq!(seed.scheduler.current_on(cpu(3)), Some(seed.actors[7]));
+    seed.scheduler.complete_switch_on(token7).unwrap();
+    assert_eq!(
+        seed.scheduler.dw1c_terminal_gate(seed.actors[7]),
+        Dw1cTerminalGate::AwaitingExpiry
+    );
+    let token8_claim = seed.scheduler.running_claim_on(cpu(3)).unwrap();
+    assert_eq!(
+        seed.scheduler.stop_running_claim_on(token8_claim),
+        Err(SchedulerError::QuantumUnavailable)
+    );
+
+    let ticket = seed
+        .scheduler
+        .prepare_quantum_if_needed_on(cpu(3), 40)
+        .unwrap()
+        .expect("token8 receives one real quantum");
+    assert_eq!(seed.scheduler.publish_quantum_expiry(ticket), Ok(true));
+    assert_eq!(
+        seed.scheduler.dw1c_terminal_gate(seed.actors[7]),
+        Dw1cTerminalGate::Ready
+    );
+    assert_eq!(
+        seed.scheduler.preempt_current_on(cpu(3)),
+        Err(SchedulerError::StaleQuantum)
+    );
+    seed.scheduler.stop_running_claim_on(token8_claim).unwrap();
+    assert_eq!(
+        seed.scheduler.dw1c_terminal_gate(seed.actors[7]),
+        Dw1cTerminalGate::NotFixture
+    );
+    assert_eq!(seed.scheduler.check_invariants(), Ok(()));
 }
 
 #[test]

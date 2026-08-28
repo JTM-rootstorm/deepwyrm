@@ -415,6 +415,89 @@ pub(crate) struct SchedulerMigrationRejection {
     pub(crate) reason: SchedulerMigrationRejectionReason,
 }
 
+/// Selector-private identity used to install DW1-C's deterministic scheduler
+/// fixture from the already validated ARM table. This is not affinity ABI.
+#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Dw1cSchedulerActorIdentity {
+    pub(crate) thread: ThreadKey,
+    pub(crate) execution_generation: u64,
+}
+
+#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Dw1cTerminalGate {
+    NotFixture,
+    AwaitingExpiry,
+    Ready,
+}
+
+#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[derive(Clone, Copy)]
+struct Dw1cSchedulerActor {
+    thread: ThreadKey,
+    arm_generation: u64,
+    arm_block_token: u64,
+    lane_cpu: SchedulerCpuId,
+}
+
+#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[derive(Clone, Copy)]
+struct Dw1cSchedulerFixture {
+    actors: [Dw1cSchedulerActor; 8],
+    lane_complete_mask: u64,
+    token8_gate_claim: Option<RunningClaim>,
+    held_token8_expiry: Option<SchedulerQuantumTicket>,
+    token8_terminal_consumed: bool,
+}
+
+#[cfg(any(test, deepwyrm_dw1c_evidence))]
+impl Dw1cSchedulerFixture {
+    fn actor(&self, thread: ThreadKey) -> Option<(usize, Dw1cSchedulerActor)> {
+        self.actors
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, actor)| actor.thread == thread)
+    }
+
+    fn lane_complete(&self, cpu: SchedulerCpuId) -> bool {
+        self.lane_complete_mask & (1_u64 << cpu.index()) != 0
+    }
+
+    fn restricted_target(&self, thread: ThreadKey) -> Option<SchedulerCpuId> {
+        self.actor(thread)
+            .and_then(|(_, actor)| (!self.lane_complete(actor.lane_cpu)).then_some(actor.lane_cpu))
+    }
+
+    fn exact_actor(&self, thread: ThreadKey, generation: u64) -> Option<Dw1cSchedulerActor> {
+        self.actor(thread)
+            .map(|(_, actor)| actor)
+            .filter(|actor| actor.arm_generation == generation)
+    }
+
+    fn lane_pair_completed(
+        &self,
+        cpu: SchedulerCpuId,
+        outgoing: ThreadKey,
+        outgoing_generation: u64,
+        incoming: ThreadKey,
+        incoming_generation: u64,
+    ) -> bool {
+        outgoing != incoming
+            && self
+                .exact_actor(outgoing, outgoing_generation)
+                .is_some_and(|actor| actor.lane_cpu == cpu)
+            && self
+                .exact_actor(incoming, incoming_generation)
+                .is_some_and(|actor| actor.lane_cpu == cpu)
+    }
+
+    fn token8(&self) -> Dw1cSchedulerActor {
+        self.actors[7]
+    }
+}
+
 impl RunnablePublication {
     pub(crate) const fn target(self) -> SchedulerCpuId {
         self.target
@@ -781,6 +864,8 @@ struct SchedulerState<const CAPACITY: usize> {
     last_migration: Option<SchedulerMigrationRecord>,
     carrier_admission: CarrierAdmissionState,
     #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    dw1c_fixture: Option<Dw1cSchedulerFixture>,
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
     accounting_underflow_fault: bool,
     #[cfg(any(test, deepwyrm_dw1c_evidence))]
     time_regression_fault: bool,
@@ -821,6 +906,8 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             preemption_disable_depth: [0; H2_SCHEDULER_CPU_CAPACITY],
             last_migration: None,
             carrier_admission: CarrierAdmissionState::new(),
+            #[cfg(any(test, deepwyrm_dw1c_evidence))]
+            dw1c_fixture: None,
             #[cfg(any(test, deepwyrm_dw1c_evidence))]
             accounting_underflow_fault: false,
             #[cfg(any(test, deepwyrm_dw1c_evidence))]
@@ -1030,16 +1117,29 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         victim: SchedulerCpuId,
         target: SchedulerCpuId,
     ) -> bool {
-        self.entry_migratable_without_external_exclusion(entry, victim, target) && {
-            #[cfg(any(test, deepwyrm_dw1c_evidence))]
-            {
-                entry.migration_exclusion.is_none()
+        self.entry_migratable_without_external_exclusion(entry, victim, target)
+            && {
+                #[cfg(any(test, deepwyrm_dw1c_evidence))]
+                {
+                    self.dw1c_fixture
+                        .and_then(|fixture| fixture.restricted_target(entry.thread))
+                        .is_none()
+                }
+                #[cfg(not(any(test, deepwyrm_dw1c_evidence)))]
+                {
+                    true
+                }
             }
-            #[cfg(not(any(test, deepwyrm_dw1c_evidence)))]
-            {
-                true
+            && {
+                #[cfg(any(test, deepwyrm_dw1c_evidence))]
+                {
+                    entry.migration_exclusion.is_none()
+                }
+                #[cfg(not(any(test, deepwyrm_dw1c_evidence)))]
+                {
+                    true
+                }
             }
-        }
     }
 
     fn entry_migratable_without_external_exclusion(
@@ -1084,6 +1184,13 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         victim: SchedulerCpuId,
         target: SchedulerCpuId,
     ) -> Result<(), SchedulerMigrationRejectionReason> {
+        if self
+            .dw1c_fixture
+            .and_then(|fixture| fixture.restricted_target(entry.thread))
+            .is_some()
+        {
+            return Err(SchedulerMigrationRejectionReason::NotRevalidatable);
+        }
         if !self.entry_migratable_without_external_exclusion(entry, victim, target) {
             return Err(SchedulerMigrationRejectionReason::NotRevalidatable);
         }
@@ -1371,9 +1478,25 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             if self.quantum[cpu_index].is_some() && self.need_resched[cpu_index].is_some() {
                 return Err(SchedulerError::StaleQuantum);
             }
-            for ticket in [self.quantum[cpu_index], self.need_resched[cpu_index]]
-                .into_iter()
-                .flatten()
+            #[cfg(any(test, deepwyrm_dw1c_evidence))]
+            let held_dw1c_expiry = self
+                .dw1c_fixture
+                .and_then(|fixture| fixture.held_token8_expiry)
+                .filter(|ticket| ticket.cpu == cpu);
+            #[cfg(not(any(test, deepwyrm_dw1c_evidence)))]
+            let held_dw1c_expiry: Option<SchedulerQuantumTicket> = None;
+            if held_dw1c_expiry.is_some()
+                && (self.quantum[cpu_index].is_some() || self.need_resched[cpu_index].is_some())
+            {
+                return Err(SchedulerError::StaleQuantum);
+            }
+            for ticket in [
+                self.quantum[cpu_index],
+                self.need_resched[cpu_index],
+                held_dw1c_expiry,
+            ]
+            .into_iter()
+            .flatten()
             {
                 if ticket.domain != self.domain
                     || ticket.cpu != cpu
@@ -1517,6 +1640,149 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         Self {
             state: IrqSpinMutex::new(SchedulerState::new()),
         }
+    }
+
+    /// Installs selector 28's deterministic placement fixture after ARM has
+    /// authenticated the exact reporter and actor table. No evidence observer
+    /// is invoked while scheduler authority is held.
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    pub(crate) fn install_dw1c_fixture(
+        &self,
+        reporter: SchedulerExecutionClaim,
+        actors: [Dw1cSchedulerActorIdentity; 8],
+    ) -> Result<(), SchedulerError> {
+        let mut state = self.state.lock();
+        if reporter.domain != state.domain || reporter.generation == 0 {
+            return Err(SchedulerError::ForeignExecutionClaim);
+        }
+        if state.dw1c_fixture.is_some()
+            || state.running[reporter.cpu.index()]
+                != Some(RunningClaim {
+                    thread: reporter.thread,
+                    generation: reporter.generation,
+                })
+            || state.suspended[reporter.cpu.index()].is_some()
+            || state.pending_block[reporter.cpu.index()].is_some()
+        {
+            return Err(SchedulerError::StaleExecutionClaim);
+        }
+        let schedulable = state.schedulable_mask();
+        if schedulable.count_ones() != 4 || schedulable & (1_u64 << reporter.cpu.index()) == 0 {
+            return Err(SchedulerError::CarrierUnavailable);
+        }
+        for (index, actor) in actors.iter().copied().enumerate() {
+            if actor.execution_generation == 0
+                || actors[..index]
+                    .iter()
+                    .any(|prior| prior.thread == actor.thread)
+                || actor.thread == reporter.thread
+            {
+                return Err(SchedulerError::DuplicateThread);
+            }
+            let Some(entry) = state.queue[..state.len]
+                .iter()
+                .flatten()
+                .find(|entry| entry.thread == actor.thread)
+            else {
+                if state.running.iter().flatten().any(|claim| {
+                    claim.thread == actor.thread && claim.generation == actor.execution_generation
+                }) || state.suspended.iter().flatten().any(|claim| {
+                    claim.thread == actor.thread && claim.generation == actor.execution_generation
+                }) {
+                    return Err(SchedulerError::ContinuationOwned);
+                }
+                return Err(SchedulerError::NotScheduled);
+            };
+            if entry.state != SchedulerThreadState::Blocked
+                || entry.block_execution_generation != actor.execution_generation
+                || entry.continuation_cpu.is_some()
+                || entry.continuation_generation != 0
+                || state
+                    .suspended
+                    .iter()
+                    .flatten()
+                    .any(|suspended| suspended.thread == actor.thread)
+            {
+                return Err(SchedulerError::ContinuationOwned);
+            }
+        }
+        let mut other_cpus = [SchedulerCpuId::BOOTSTRAP; 3];
+        let mut other_count = 0;
+        for cpu_index in 0..H2_SCHEDULER_CPU_CAPACITY {
+            let cpu = SchedulerCpuId::new(cpu_index).expect("bounded scheduler CPU index");
+            if schedulable & (1_u64 << cpu_index) != 0 && cpu != reporter.cpu {
+                if other_count >= other_cpus.len() {
+                    return Err(SchedulerError::CarrierUnavailable);
+                }
+                other_cpus[other_count] = cpu;
+                other_count += 1;
+            }
+        }
+        if other_count != other_cpus.len() {
+            return Err(SchedulerError::CarrierUnavailable);
+        }
+        let fixture_actors = core::array::from_fn(|index| Dw1cSchedulerActor {
+            thread: actors[index].thread,
+            arm_generation: actors[index].execution_generation,
+            arm_block_token: state.queue[..state.len]
+                .iter()
+                .flatten()
+                .find(|entry| entry.thread == actors[index].thread)
+                .expect("validated DW1C actor remains queued")
+                .token,
+            lane_cpu: if index < 2 {
+                reporter.cpu
+            } else {
+                other_cpus[(index - 2) / 2]
+            },
+        });
+        state.dw1c_fixture = Some(Dw1cSchedulerFixture {
+            actors: fixture_actors,
+            lane_complete_mask: 0,
+            token8_gate_claim: None,
+            held_token8_expiry: None,
+            token8_terminal_consumed: false,
+        });
+        state.assert_invariants();
+        Ok(())
+    }
+
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    pub(crate) fn dw1c_terminal_gate(&self, thread: ThreadKey) -> Dw1cTerminalGate {
+        let state = self.state.lock();
+        let Some(fixture) = state.dw1c_fixture else {
+            return Dw1cTerminalGate::NotFixture;
+        };
+        if fixture.token8().thread != thread || fixture.token8_terminal_consumed {
+            return Dw1cTerminalGate::NotFixture;
+        }
+        if fixture.held_token8_expiry.is_some() {
+            Dw1cTerminalGate::Ready
+        } else {
+            Dw1cTerminalGate::AwaitingExpiry
+        }
+    }
+
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    pub(crate) fn dw1c_token2_relay_ready(&self) -> bool {
+        let state = self.state.lock();
+        let Some(fixture) = state.dw1c_fixture else {
+            return false;
+        };
+        let actor = fixture.actors[1];
+        state.queue[..state.len].iter().flatten().any(|entry| {
+            entry.thread == actor.thread
+                && entry.state == SchedulerThreadState::Blocked
+                && entry.token != 0
+                && entry.token != actor.arm_block_token
+                && entry.block_execution_generation != 0
+                && entry.continuation_cpu.is_none()
+                && entry.continuation_generation == 0
+        }) && !state
+            .suspended
+            .iter()
+            .flatten()
+            .any(|suspended| suspended.thread == actor.thread)
     }
 
     pub(crate) fn reserve(
@@ -1945,6 +2211,17 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     ) -> Result<Option<SchedulerQuantumTicket>, SchedulerError> {
         let mut state = self.state.lock();
         let claim = state.running[cpu.index()].ok_or(SchedulerError::NotRunning)?;
+        #[cfg(any(test, deepwyrm_dw1c_evidence))]
+        if state.dw1c_fixture.is_some_and(|fixture| {
+            fixture.held_token8_expiry.is_some_and(|ticket| {
+                ticket.cpu == cpu
+                    && ticket.thread == claim.thread
+                    && ticket.execution_generation == claim.generation
+            })
+        }) {
+            state.assert_invariants();
+            return Ok(None);
+        }
         if state.suspended[cpu.index()].is_some()
             || state.pending_block[cpu.index()].is_some()
             || state.need_resched[cpu.index()].is_some()
@@ -1985,12 +2262,34 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             return Err(error);
         }
         state.quantum[cpu_index] = None;
-        match state.need_resched[cpu_index] {
-            None => state.need_resched[cpu_index] = Some(ticket),
-            Some(current) if current == ticket => {}
-            Some(_) => {
+        #[cfg(any(test, deepwyrm_dw1c_evidence))]
+        let hold_for_dw1c = state.dw1c_fixture.is_some_and(|fixture| {
+            !fixture.token8_terminal_consumed
+                && fixture.token8_gate_claim.is_some_and(|claim| {
+                    ticket.cpu == fixture.token8().lane_cpu
+                        && ticket.thread == claim.thread
+                        && ticket.execution_generation == claim.generation
+                })
+        });
+        #[cfg(not(any(test, deepwyrm_dw1c_evidence)))]
+        let hold_for_dw1c = false;
+        if hold_for_dw1c {
+            let fixture = state
+                .dw1c_fixture
+                .as_mut()
+                .expect("DW1C held expiry requires the installed fixture");
+            if fixture.held_token8_expiry.replace(ticket).is_some() {
                 state.assert_invariants();
                 return Err(SchedulerError::StaleQuantum);
+            }
+        } else {
+            match state.need_resched[cpu_index] {
+                None => state.need_resched[cpu_index] = Some(ticket),
+                Some(current) if current == ticket => {}
+                Some(_) => {
+                    state.assert_invariants();
+                    return Err(SchedulerError::StaleQuantum);
+                }
             }
         }
         state.accounting = accounting;
@@ -2388,7 +2687,14 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             return Err(SchedulerError::StaleBlockToken);
         };
         let blocked = state.queue[index].expect("validated blocked scheduler entry remains queued");
-        let Some(target) = state.select_placement(blocked, requester) else {
+        #[cfg(any(test, deepwyrm_dw1c_evidence))]
+        let fixture_target = state
+            .dw1c_fixture
+            .and_then(|fixture| fixture.restricted_target(blocked.thread));
+        #[cfg(not(any(test, deepwyrm_dw1c_evidence)))]
+        let fixture_target: Option<SchedulerCpuId> = None;
+        let Some(target) = fixture_target.or_else(|| state.select_placement(blocked, requester))
+        else {
             return Err(SchedulerError::CarrierUnavailable);
         };
         let (wake_generation, next_wake_generation) = state.checked_wake_generation()?;
@@ -2680,14 +2986,14 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             {
                 return Err(SchedulerError::StaleExecutionClaim);
             }
+            entry.continuation_cpu = None;
+            entry.continuation_generation = 0;
+            entry.migration_eligibility_generation = eligibility_generation;
             let publication =
                 (entry.state == SchedulerThreadState::Runnable).then_some(RunnablePublication {
                     target: entry.target_cpu,
                     continuation_bound: false,
                 });
-            entry.continuation_cpu = None;
-            entry.continuation_generation = 0;
-            entry.migration_eligibility_generation = eligibility_generation;
             publication
         } else {
             None
@@ -2710,6 +3016,31 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             thread: incoming.thread,
             generation: incoming.generation,
         });
+        #[cfg(any(test, deepwyrm_dw1c_evidence))]
+        if let Some(incoming) = incoming_claim
+            && let Some(fixture) = state.dw1c_fixture.as_mut()
+        {
+            if suspended.involuntary_preemption
+                && fixture.lane_pair_completed(
+                    claim.cpu,
+                    claim.thread,
+                    claim.generation,
+                    incoming.thread,
+                    incoming.generation,
+                )
+            {
+                fixture.lane_complete_mask |= 1_u64 << claim.cpu.index();
+            }
+            if fixture.token8_gate_claim.is_none()
+                && fixture.lane_complete(fixture.token8().lane_cpu)
+                && fixture.token8().thread == incoming.thread
+            {
+                fixture.token8_gate_claim = Some(RunningClaim {
+                    thread: incoming.thread,
+                    generation: incoming.generation,
+                });
+            }
+        }
         state.assert_invariants();
         Ok(SchedulerCompletedSwitch {
             runnable_publication: published_runnable,
@@ -2952,6 +3283,36 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         if state.pending_block[cpu_index].is_some_and(|pending| pending.thread == claim.thread) {
             state.pending_block[cpu_index] = None;
         }
+        #[cfg(any(test, deepwyrm_dw1c_evidence))]
+        let held_dw1c_expiry = if let Some(fixture) = state.dw1c_fixture.as_mut() {
+            if fixture.token8().thread == claim.thread && !fixture.token8_terminal_consumed {
+                let ticket = fixture
+                    .held_token8_expiry
+                    .take()
+                    .ok_or(SchedulerError::QuantumUnavailable)?;
+                if fixture.token8_gate_claim
+                    != Some(RunningClaim {
+                        thread: claim.thread,
+                        generation: claim.generation,
+                    })
+                    || ticket.cpu != claim.cpu
+                    || ticket.thread != claim.thread
+                    || ticket.execution_generation != claim.generation
+                {
+                    fixture.held_token8_expiry = Some(ticket);
+                    return Err(SchedulerError::StaleQuantum);
+                }
+                fixture.token8_gate_claim = None;
+                fixture.token8_terminal_consumed = true;
+                Some(ticket)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        #[cfg(all(test, not(deepwyrm_dw1c_evidence)))]
+        let _ = held_dw1c_expiry;
         let cleared_preemption = state.clear_preemption_on(claim.cpu);
         state.running[cpu_index] = None;
         state.suspended[cpu_index] = Some(SuspendedContinuation {
@@ -2972,7 +3333,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         Ok(SchedulerTerminalStop {
             cancelled_quantum: cleared_preemption.cancelled_quantum,
             #[cfg(deepwyrm_dw1c_evidence)]
-            consumed_published_expiry: cleared_preemption.published_expiry,
+            consumed_published_expiry: held_dw1c_expiry.or(cleared_preemption.published_expiry),
         })
     }
 

@@ -690,6 +690,25 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     }
 
     #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    pub(crate) fn install_dw1c_scheduler_fixture(
+        &self,
+        reporter: super::SchedulerExecutionClaim,
+        actors: [super::Dw1cSchedulerActorIdentity; 8],
+    ) -> Result<(), SchedulerError> {
+        self.scheduler.install_dw1c_fixture(reporter, actors)
+    }
+
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    pub(crate) fn dw1c_terminal_gate(&self, thread: ThreadKey) -> super::Dw1cTerminalGate {
+        self.scheduler.dw1c_terminal_gate(thread)
+    }
+
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    pub(crate) fn dw1c_token2_relay_ready(&self) -> bool {
+        self.scheduler.dw1c_token2_relay_ready()
+    }
+
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
     pub(crate) fn dw1c_final_scheduler_snapshot(
         &self,
     ) -> Result<super::Dw1cFinalSchedulerSnapshot, SchedulerError> {

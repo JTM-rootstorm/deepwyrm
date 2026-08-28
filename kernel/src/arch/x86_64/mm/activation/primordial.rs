@@ -5612,13 +5612,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                 if !self.dw1c_controller_authorized() {
                     crate::test_support::complete_fail(0x2810_e003)
                 }
-                let product_execution_generation = self
+                let product_claim = self
                     .shared
                     .execution
                     .running_claim_on(self.cpu)
                     .filter(|claim| claim.thread() == self.thread)
-                    .map(|claim| claim.generation())
                     .unwrap_or_else(|| crate::test_support::complete_fail(0x2810_e019));
+                let product_execution_generation = product_claim.generation();
                 let entries = crate::test_support::decode_dw1c_arm_entries(&bytes)
                     .unwrap_or_else(|_| crate::test_support::complete_fail(0x2810_e004));
                 let handles = self
@@ -5657,12 +5657,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                         .execution
                         .current_execution_generation(thread)
                         .unwrap_or_else(|| crate::test_support::complete_fail(0x2810_e00b));
-                    if token == 6
-                        && self.shared.execution.scheduler_state(thread)
-                            != Some(SchedulerThreadState::Blocked)
-                    {
-                        crate::test_support::complete_fail(0x2810_e017)
-                    }
                     Dw1cActor {
                         token: token as u8,
                         role: role as u8,
@@ -5671,6 +5665,23 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                         execution_generation: generation,
                     }
                 });
+                let fixture_actors =
+                    core::array::from_fn(|index| crate::task::Dw1cSchedulerActorIdentity {
+                        thread: actors[index].thread,
+                        execution_generation: actors[index].execution_generation,
+                    });
+                match self
+                    .shared
+                    .execution
+                    .install_dw1c_scheduler_fixture(product_claim, fixture_actors)
+                {
+                    Ok(()) => {}
+                    Err(crate::task::SchedulerError::ContinuationOwned) => {
+                        self.commit_runtime_phase(phase);
+                        return NativeSyscallResult::returning(DW_STATUS_WOULD_BLOCK);
+                    }
+                    Err(_) => crate::test_support::complete_fail(0x2810_e017),
+                }
                 DW1C_EVIDENCE
                     .arm(
                         (self.process, self.thread),
@@ -5699,6 +5710,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                 DW1C_EVIDENCE
                     .workload_complete(self.process, values[1], values[2])
                     .unwrap_or_else(|_| crate::test_support::complete_fail(0x2810_e014));
+            }
+            4 => {
+                if !self.dw1c_controller_authorized() || values[1..].iter().any(|value| *value != 0)
+                {
+                    crate::test_support::complete_fail(0x2810_e01a)
+                }
+                if !self.shared.execution.dw1c_token2_relay_ready() {
+                    self.commit_runtime_phase(phase);
+                    return NativeSyscallResult::returning(DW_STATUS_WOULD_BLOCK);
+                }
             }
             _ => crate::test_support::complete_fail(0x2810_e015),
         }
@@ -5997,6 +6018,46 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                     status: DW_STATUS_SUCCESS,
                     control: SyscallControl::ServiceRendezvous,
                 };
+            }
+            #[cfg(deepwyrm_dw1c_evidence)]
+            if let NativeSyscallRequest::ProcessTerminate { process, .. } = request
+                && let Some((token8_thread, gate)) = runtime.dw1c_process_termination_gate(process)
+                && gate == crate::task::Dw1cTerminalGate::AwaitingExpiry
+            {
+                let deadline = crate::time::monotonic_now()
+                    .ok()
+                    .and_then(|now| now.checked_add(240_000_000_000))
+                    .unwrap_or_else(|| crate::test_support::complete_fail(0x2810_e01b));
+                drop(runtime);
+                loop {
+                    match self.shared.execution.dw1c_terminal_gate(token8_thread) {
+                        crate::task::Dw1cTerminalGate::Ready => break,
+                        crate::task::Dw1cTerminalGate::AwaitingExpiry => {}
+                        crate::task::Dw1cTerminalGate::NotFixture => {
+                            crate::test_support::complete_fail(0x2810_e01c)
+                        }
+                    }
+                    if crate::time::monotonic_now().is_err_or(|now| now >= deadline) {
+                        crate::test_support::complete_fail(0x2810_e01d)
+                    }
+                    core::hint::spin_loop();
+                }
+                runtime = self.runtime.lock();
+                runtime.switch_cpu(self.cpu);
+                if matches!(
+                    crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
+                    crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
+                ) {
+                    return NativeSyscallResult {
+                        status: DW_STATUS_SUCCESS,
+                        control: SyscallControl::ServiceRendezvous,
+                    };
+                }
+                if runtime.dw1c_process_termination_gate(process)
+                    != Some((token8_thread, crate::task::Dw1cTerminalGate::Ready))
+                {
+                    crate::test_support::complete_fail(0x2810_e01e)
+                }
             }
             let prepared = match request {
                 NativeSyscallRequest::ProcessExit { exit_code } => {
@@ -7436,6 +7497,41 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             && self.tasks.thread_process(self.thread) == Ok(self.process)
             && self.shared.execution.scheduler_state(self.thread)
                 == Some(SchedulerThreadState::Running)
+    }
+
+    #[cfg(deepwyrm_dw1c_evidence)]
+    fn dw1c_process_termination_gate(
+        &self,
+        handle: deepwyrm_abi::DwHandle,
+    ) -> Option<(ThreadKey, crate::task::Dw1cTerminalGate)> {
+        if !self.dw1c_controller_authorized() {
+            return None;
+        }
+        let process = self
+            .tasks
+            .process_handles(self.process)
+            .ok()?
+            .process_target_for_dw1c_evidence(handle)
+            .map(ProcessKey::from_object_id)?;
+        if self.tasks.process_lifecycle(process).ok()? != ProcessLifecycleState::AcceptingOperations
+        {
+            return None;
+        }
+        let mut exact = None;
+        for thread in self
+            .tasks
+            .process_thread_keys(process)
+            .ok()?
+            .into_iter()
+            .flatten()
+        {
+            if exact.replace(thread).is_some() {
+                return None;
+            }
+        }
+        let thread = exact?;
+        let gate = self.shared.execution.dw1c_terminal_gate(thread);
+        (gate != crate::task::Dw1cTerminalGate::NotFixture).then_some((thread, gate))
     }
 
     fn handle_fallthrough(&mut self, request: NativeSyscallRequest) -> NativeSyscallResult {
