@@ -138,7 +138,7 @@ fn task_layout_manifest_is_kernel_private_exact_and_fails_closed_on_drift() {
     assert_eq!(layout.privilege_entry_stack_guard_size, 4_096);
     assert_eq!(layout.privilege_entry_stack_alignment, 4_096);
     assert_eq!(layout.terminal_reaper_stack_count, 1);
-    assert_eq!(layout.terminal_reaper_stack_size, 135_168);
+    assert_eq!(layout.terminal_reaper_stack_size, 262_144);
     assert_eq!(layout.terminal_reaper_stack_guard_size, 4_096);
     assert_eq!(layout.terminal_reaper_stack_alignment, 4_096);
     for malformed in [
@@ -169,7 +169,7 @@ fn task_layout_manifest_is_kernel_private_exact_and_fails_closed_on_drift() {
             "terminal_reaper_stack_count = 2",
         ),
         source.replace(
-            "terminal_reaper_stack_size = 135168",
+            "terminal_reaper_stack_size = 262144",
             "terminal_reaper_stack_size = 65536",
         ),
         source.replace(

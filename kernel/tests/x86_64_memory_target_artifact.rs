@@ -673,9 +673,10 @@ fn wyr1_primordial_selector_artifacts_fit_the_linked_boot_stack() {
             linked_boot_stack_payload_bytes(&stack_symbols),
         );
         if selector == "normal-preemption-smp" {
-            validate_dw1c_thread_stack_margin(
+            validate_dw1c_stack_margins(
                 &stack_sizes(&llvm_readelf, &stack_kernel),
                 linked_thread_kernel_stack_payload_bytes(&stack_symbols),
+                linked_terminal_reaper_stack_payload_bytes(&stack_symbols),
             );
         }
     }

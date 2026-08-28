@@ -1547,13 +1547,13 @@ impl TaskLayout {
             return Err("DW0-E4 BSP privilege-entry stack must be one guarded 16384-byte stack on a 4096-byte boundary".into());
         }
         if terminal_count != 1
-            || terminal_size != 135_168
+            || terminal_size != 262_144
             || terminal_guard != 4_096
             || terminal_alignment != 4_096
             || !terminal_size.is_multiple_of(terminal_alignment)
             || !terminal_guard.is_multiple_of(terminal_alignment)
         {
-            return Err("terminal reaper carrier must be one guarded 135168-byte stack on a 4096-byte boundary".into());
+            return Err("terminal reaper carrier must be one guarded 262144-byte stack on a 4096-byte boundary".into());
         }
         Ok(Self {
             thread_kernel_stack_count: count,

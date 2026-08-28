@@ -703,6 +703,21 @@ It is a regression for the observed overflow path rather than a whole-program
 call-graph proof. Retained large-frame pressure remains explicit optimization
 debt.
 
+The next frozen candidate progressed through that per-Thread path and exposed
+an independent terminal-reaper budget defect during real selector-28 process
+teardown. The first page fault was the stack probe in
+`MemoryObjectAuthority::prepare_replace`, with `RSP == CR2` 3,416 bytes inside
+CPU0's terminal-reaper guard. The live terminal chain had descended 138,584
+bytes from the reaper top, beyond the old 132 KiB payload, before the exception
+frame faulted again as vector 8. This was kernel execution, not an artifact or
+verifier failure. The guarded terminal-reaper payload is therefore 256 KiB per
+runtime CPU, leaving useful functional headroom rather than preserving the old
+soft budget through another packing iteration. The selector-28 accepted-target
+gate binds this observed high-water mark to the linked terminal payload and
+charges growth in the exact target-emitted teardown anchors. Large teardown
+frames remain explicit optimization debt; no native, boot, or Wyrmroot ABI is
+changed.
+
 DW1-C implementation must add host/source/model coverage for:
 
 - every Parked-to-Schedulable step, reordered/omitted publication, stale

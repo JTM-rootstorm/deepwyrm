@@ -1222,7 +1222,7 @@ fn terminal_reaper_layout_is_independent_guarded_and_conflict_free() {
 #[test]
 fn h1_runtime_cpu_arena_validates_every_private_stack_and_guard() {
     let arena_start = 0xffff_8000_0400_0000;
-    let arena_end = arena_start + 4 * 71 * PAGE_SIZE;
+    let arena_end = arena_start + 4 * 102 * PAGE_SIZE;
     let slots =
         crate::arch::x86_64::runtime_cpu_stack_layout_from_arena(arena_start, arena_end).unwrap();
     let segments = [

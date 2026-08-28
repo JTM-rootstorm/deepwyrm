@@ -236,8 +236,8 @@ ASSERT((__dw_privilege_entry_stack_top - __dw_privilege_entry_stack_bottom) ==
 
 ASSERT(DW_KERNEL_TERMINAL_REAPER_STACK_COUNT == 1,
        "terminal reaper stack count must remain one for the BSP-only runtime")
-ASSERT(DW_KERNEL_TERMINAL_REAPER_STACK_SIZE == 135168,
-       "terminal reaper stack must remain independently bounded at 132 KiB")
+ASSERT(DW_KERNEL_TERMINAL_REAPER_STACK_SIZE == 262144,
+       "terminal reaper stack must remain independently bounded at 256 KiB")
 ASSERT(DW_KERNEL_TERMINAL_REAPER_STACK_GUARD_SIZE == DW_KERNEL_BASE_PAGE_SIZE,
        "terminal reaper stack must have one base-page guard")
 ASSERT(DW_KERNEL_TERMINAL_REAPER_STACK_ALIGNMENT == DW_KERNEL_BASE_PAGE_SIZE,
@@ -254,8 +254,8 @@ ASSERT((__dw_runtime_cpu_stack_arena_start & (DW_KERNEL_BASE_PAGE_SIZE - 1)) == 
 ASSERT(__dw_terminal_reaper_stack_top <= __dw_runtime_cpu_stack_arena_start,
        "H1 runtime CPU stack arena must not overlap the early BSP carriers")
 ASSERT((__dw_runtime_cpu_stack_arena_end - __dw_runtime_cpu_stack_arena_start) ==
-       4 * 71 * DW_KERNEL_BASE_PAGE_SIZE,
-       "H1 runtime CPU stack arena must contain four exact 71-page slots")
+       4 * 102 * DW_KERNEL_BASE_PAGE_SIZE,
+       "H1 runtime CPU stack arena must contain four exact 102-page slots")
 ASSERT(((__dw_runtime_cpu_stack_arena_end - __dw_runtime_cpu_stack_arena_start) / 4) ==
        (3 * (DW_KERNEL_BASE_PAGE_SIZE + 4 * DW_KERNEL_BASE_PAGE_SIZE) +
         (DW_KERNEL_BASE_PAGE_SIZE + DW_KERNEL_PRIVILEGE_ENTRY_STACK_SIZE) +
