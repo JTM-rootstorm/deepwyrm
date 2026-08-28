@@ -1428,6 +1428,7 @@ fn retain_cpu_chain(
                     execution_generation: quantum_generation,
                     ..
                 } if quantum_token == token && quantum_generation == execution_generation => {}
+                CpuChain::Empty if state.run_payload[index].is_some() => {}
                 CpuChain::Empty => {
                     return Err(state.latch(Dw1cEvidenceError::MissingKernelFact));
                 }
@@ -2887,6 +2888,39 @@ mod tests {
         };
 
         complete_cpu_chain(&collector, 0, actors[1], 0x12, 0x102);
+        let state = collector.state.lock();
+        assert_eq!(
+            (
+                state.run_payload[0],
+                state.quantum_payload[0],
+                state.preempt_payload[0],
+            ),
+            retained
+        );
+        assert_eq!(state.cpu_chain[0], CpuChain::Empty);
+        assert_eq!(state.failure, None);
+    }
+
+    #[test]
+    fn completed_cpu_accepts_later_quantum_preempt_surplus_without_an_observed_run() {
+        let (collector, actors) = armed_collector();
+        complete_cpu_chain(&collector, 0, actors[0], 0x13, 0x103);
+        let retained = {
+            let state = collector.state.lock();
+            (
+                state.run_payload[0],
+                state.quantum_payload[0],
+                state.preempt_payload[0],
+            )
+        };
+
+        collector
+            .observe_quantum_claim(0, actors[1].thread, actors[1].execution_generation, 0x14)
+            .unwrap();
+        collector
+            .observe_preemption_claim(0, actors[1].thread, actors[1].execution_generation, 0x104)
+            .unwrap();
+
         let state = collector.state.lock();
         assert_eq!(
             (

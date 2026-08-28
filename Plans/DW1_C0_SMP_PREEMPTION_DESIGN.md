@@ -622,8 +622,13 @@ without a switch. A RUN after an uncompleted QUANTUM, a QUANTUM without its
 RUN, or a PREEMPT without its exact QUANTUM remains out of order and latches a
 failure. The first completed chain whose RUN identity is not already retained
 for another CPU owns that CPU's fixed records; later distinct completed chains
-are valid surplus and cannot replace them. This selection preserves the host
-requirement that all four retained RUN identities are distinct.
+are valid surplus and cannot replace them. Once a CPU's fixed chain is
+complete, later scheduler-validated unique QUANTUM/PREEMPT callbacks may also
+advance and clear a non-serializing surplus candidate without another retained
+RUN callback; this exception never fills a missing fixed record. Before a CPU
+chain is complete, QUANTUM without RUN remains a hard missing fact. This
+selection preserves the host requirement that all four retained RUN identities
+are distinct.
 
 The collector serializes the 46 records only after every fact is joined.
 Original transition generations and ordering remain part of those relations.
