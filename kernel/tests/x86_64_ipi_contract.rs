@@ -599,7 +599,19 @@ fn h4_idle_publication_brackets_rescan_and_uses_only_coalesced_e1_wake() {
     let halt = suspension.find("wait_for_suspend_interrupt()").unwrap();
     let finish = suspension.find("finish_current_idle(halt)").unwrap();
     assert!(prepare < poll && poll < commit && commit < halt && halt < finish);
-    assert_eq!(suspension.matches("cancel_current_idle(idle)").count(), 2);
+    assert_eq!(suspension.matches("cancel_current_idle(idle)").count(), 3);
+    let detach = suspension
+        .find("NativeIdleSuspendPoll::Detach")
+        .expect("DW1C continuation-detach idle cancellation");
+    let detach_cancel = suspension[detach..]
+        .find("cancel_current_idle(idle)")
+        .expect("DW1C continuation-detach idle cancellation")
+        + detach;
+    let detach_switch = suspension[detach..]
+        .find("switch_kernel_context(plan)")
+        .expect("DW1C continuation-detach physical handoff")
+        + detach;
+    assert!(detach < detach_cancel && detach_cancel < detach_switch);
     assert!(suspension.contains("SYSCALL FMASK keeps IF clear"));
     assert!(suspension.contains("service_current_rendezvous_latch()"));
     assert!(suspension.contains("MailboxNotification::Stop(request)"));
@@ -640,7 +652,7 @@ fn h4_idle_publication_brackets_rescan_and_uses_only_coalesced_e1_wake() {
         .expect("blocked-operation wake extent")
         .0;
     let publication = wake
-        .find(".wake_on(super::scheduler_requester_cpu(), key)?;")
+        .find("self.scheduler.wake_on(requester, key)?")
         .expect("scheduler wake publication");
     let notification = wake
         .find("super::notify_runnable_work(publication.wake_affinity());")

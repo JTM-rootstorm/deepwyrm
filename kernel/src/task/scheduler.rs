@@ -2413,8 +2413,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                         && ticket.execution_generation == claim.generation
                 })
         });
-        #[cfg(not(any(test, deepwyrm_dw1c_evidence)))]
-        let hold_for_dw1c = false;
+        #[cfg(any(test, deepwyrm_dw1c_evidence))]
         if hold_for_dw1c {
             let fixture = state
                 .dw1c_fixture
@@ -2432,6 +2431,15 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                     state.assert_invariants();
                     return Err(SchedulerError::StaleQuantum);
                 }
+            }
+        }
+        #[cfg(not(any(test, deepwyrm_dw1c_evidence)))]
+        match state.need_resched[cpu_index] {
+            None => state.need_resched[cpu_index] = Some(ticket),
+            Some(current) if current == ticket => {}
+            Some(_) => {
+                state.assert_invariants();
+                return Err(SchedulerError::StaleQuantum);
             }
         }
         state.accounting = accounting;
