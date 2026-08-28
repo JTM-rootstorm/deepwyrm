@@ -2302,6 +2302,17 @@ mod tests {
         );
         assert!(raw.contains(".running_claim_on(self.cpu)"));
         assert!(raw.contains("product_execution_generation,"));
+        let facade = source
+            .split("fn intercept_dw1c_evidence_raw(")
+            .nth(2)
+            .unwrap()
+            .split("fn complete_remote_stop(")
+            .next()
+            .unwrap();
+        assert!(
+            facade.find("with_synchronized_runtime_at_safe_point(")
+                < facade.find("crate::task::drain_runnable_work_notifications();")
+        );
         assert!(scheduler_source.contains(
             "scheduler-snapshot identities for DW1-C records 42 and 44, not actor tokens"
         ));
