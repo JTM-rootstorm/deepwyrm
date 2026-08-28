@@ -153,6 +153,8 @@ const USERSPACE_CHAIN_PROCESSES: usize = 3;
 // artifact geometry, not a production process limit.
 #[cfg(deepwyrm_dw1c_evidence)]
 const USERSPACE_CHAIN_PROCESSES: usize = 12;
+#[cfg(deepwyrm_dw1c_evidence)]
+const _: () = assert!(super::LIVE_ADDRESS_SPACE_CAPACITY >= USERSPACE_CHAIN_PROCESSES);
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const USERSPACE_CHAIN_PROCESSES: usize = 6;
 #[cfg(deepwyrm_wrcap_relay)]
@@ -1031,6 +1033,64 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         runtime.commit_scheduler_root_switch(executed);
     }
 
+    /// Synchronizes the scheduler-current root without crossing an already
+    /// published remote Stop. Terminal preparation deliberately moves a
+    /// remote current's execution resources while retaining its scheduler
+    /// claim until the target acknowledges that Stop, so the mailbox must win
+    /// before `prepare_scheduler_root_switch` consults those resources.
+    fn synchronize_scheduler_current_at_safe_point_detached(&mut self) -> bool {
+        let prepared = {
+            let mut runtime = self.runtime.lock();
+            runtime.switch_cpu(self.cpu);
+            if matches!(
+                crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
+                crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
+            ) {
+                return false;
+            }
+            runtime.prepare_scheduler_root_switch()
+        };
+        let Some(prepared) = prepared else {
+            return true;
+        };
+        let executed = match prepared.execute() {
+            Ok(executed) => executed,
+            Err(failure) => {
+                let mut runtime = self.runtime.lock();
+                let error = runtime.cancel_scheduler_root_switch(failure);
+                panic!("detached scheduler root switch failed before CR3: {error:?}")
+            }
+        };
+        let mut runtime = self.runtime.lock();
+        runtime.commit_scheduler_root_switch(executed);
+        !matches!(
+            crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
+            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
+        )
+    }
+
+    /// Runs one scheduler-current transaction under the same runtime guard as
+    /// the final Stop arbitration. This closes both detached windows: a Stop
+    /// published before root synchronization and one published after the CR3
+    /// operation but before the caller reacquires runtime authority.
+    fn with_synchronized_runtime_at_safe_point<T>(
+        &mut self,
+        operation: impl FnOnce(&mut PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>) -> T,
+    ) -> Result<T, ()> {
+        if !self.synchronize_scheduler_current_at_safe_point_detached() {
+            return Err(());
+        }
+        let mut runtime = self.runtime.lock();
+        runtime.switch_cpu(self.cpu);
+        if matches!(
+            crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
+            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
+        ) {
+            return Err(());
+        }
+        Ok(operation(&mut runtime))
+    }
+
     fn enter_ap_kernel_root_detached(&mut self) {
         let prepared = {
             let mut runtime = self.runtime.lock();
@@ -1057,7 +1117,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.pending_remote_termination.is_none(),
             "terminal exception crossed a pending remote termination"
         );
-        self.synchronize_scheduler_current_detached();
+        if !self.synchronize_scheduler_current_at_safe_point_detached() {
+            return;
+        }
         let published = {
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);
@@ -5919,9 +5981,23 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 self.pending_remote_termination.is_none(),
                 "CPU-local carrier already owns a pending remote termination"
             );
-            self.synchronize_scheduler_current_detached();
+            if !self.synchronize_scheduler_current_at_safe_point_detached() {
+                return NativeSyscallResult {
+                    status: DW_STATUS_SUCCESS,
+                    control: SyscallControl::ServiceRendezvous,
+                };
+            }
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);
+            if matches!(
+                crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
+                crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
+            ) {
+                return NativeSyscallResult {
+                    status: DW_STATUS_SUCCESS,
+                    control: SyscallControl::ServiceRendezvous,
+                };
+            }
             let prepared = match request {
                 NativeSyscallRequest::ProcessExit { exit_code } => {
                     match runtime.prepare_remote_process_exit(exit_code) {
@@ -6044,23 +6120,20 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 control: SyscallControl::CompleteRemoteStop,
             };
         }
-        if matches!(
-            crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
-            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
-        ) {
-            return NativeSyscallResult {
-                status: DW_STATUS_SUCCESS,
-                control: SyscallControl::ServiceRendezvous,
-            };
-        }
-        self.synchronize_scheduler_current_detached();
-        let result = {
-            let mut runtime = self.runtime.lock();
-            runtime.switch_cpu(self.cpu);
-            if self.cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+        let cpu = self.cpu;
+        let result = match self.with_synchronized_runtime_at_safe_point(|runtime| {
+            if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
                 runtime.service_pending_timer_expiries_on_bootstrap();
             }
             runtime.handle(request)
+        }) {
+            Ok(result) => result,
+            Err(()) => {
+                return NativeSyscallResult {
+                    status: DW_STATUS_SUCCESS,
+                    control: SyscallControl::ServiceRendezvous,
+                };
+            }
         };
         crate::task::drain_runnable_work_notifications();
         self.drain_quantum_cancellation_detached();
@@ -6160,27 +6233,27 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         &mut self,
         now_ns: u64,
     ) -> Result<Option<crate::task::SchedulerQuantumTicket>, crate::task::SchedulerError> {
-        self.synchronize_scheduler_current_detached();
-        let mut runtime = self.runtime.lock();
-        runtime.switch_cpu(self.cpu);
-        runtime.prepare_quantum(now_ns)
+        match self
+            .with_synchronized_runtime_at_safe_point(|runtime| runtime.prepare_quantum(now_ns))
+        {
+            Ok(result) => result,
+            Err(()) => Ok(None),
+        }
     }
 
     fn has_reschedule_request(&mut self) -> bool {
-        self.synchronize_scheduler_current_detached();
-        let mut runtime = self.runtime.lock();
-        runtime.switch_cpu(self.cpu);
-        runtime.has_reschedule_request()
+        self.with_synchronized_runtime_at_safe_point(|runtime| runtime.has_reschedule_request())
+            .unwrap_or(false)
     }
 
     fn authorize_timer_return(
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
     ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
-        self.synchronize_scheduler_current_detached();
-        let mut runtime = self.runtime.lock();
-        runtime.switch_cpu(self.cpu);
-        runtime.authorize_timer_return(frame)
+        self.with_synchronized_runtime_at_safe_point(|runtime| {
+            runtime.authorize_timer_return(frame)
+        })
+        .unwrap_or(Ok(()))
     }
 
     unsafe fn prepare_preemption<'owner>(
@@ -6195,7 +6268,9 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
     ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
-        self.synchronize_scheduler_current_detached();
+        if !self.synchronize_scheduler_current_at_safe_point_detached() {
+            return Ok(());
+        }
         let publication = {
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);
@@ -6211,7 +6286,9 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
-        self.synchronize_scheduler_current_detached();
+        if !self.synchronize_scheduler_current_at_safe_point_detached() {
+            return Ok(());
+        }
         let publication = {
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);
@@ -6230,10 +6307,13 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         &mut self,
         arguments: crate::syscall::RawSyscallArguments,
     ) -> NativeSyscallResult {
-        self.synchronize_scheduler_current_detached();
-        let mut runtime = self.runtime.lock();
-        runtime.switch_cpu(self.cpu);
-        runtime.intercept_wyr1_evidence_raw(arguments)
+        self.with_synchronized_runtime_at_safe_point(|runtime| {
+            runtime.intercept_wyr1_evidence_raw(arguments)
+        })
+        .unwrap_or(NativeSyscallResult {
+            status: DW_STATUS_SUCCESS,
+            control: SyscallControl::ServiceRendezvous,
+        })
     }
 
     #[cfg(deepwyrm_dw1b_evidence)]
@@ -6241,10 +6321,13 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         &mut self,
         arguments: crate::syscall::RawSyscallArguments,
     ) -> NativeSyscallResult {
-        self.synchronize_scheduler_current_detached();
-        let mut runtime = self.runtime.lock();
-        runtime.switch_cpu(self.cpu);
-        runtime.intercept_dw1b_evidence_raw(arguments)
+        self.with_synchronized_runtime_at_safe_point(|runtime| {
+            runtime.intercept_dw1b_evidence_raw(arguments)
+        })
+        .unwrap_or(NativeSyscallResult {
+            status: DW_STATUS_SUCCESS,
+            control: SyscallControl::ServiceRendezvous,
+        })
     }
 
     #[cfg(deepwyrm_wyr1b_evidence)]
@@ -6252,10 +6335,27 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         &mut self,
         arguments: crate::syscall::RawSyscallArguments,
     ) -> NativeSyscallResult {
-        self.synchronize_scheduler_current_detached();
-        let mut runtime = self.runtime.lock();
-        runtime.switch_cpu(self.cpu);
-        runtime.intercept_wyr1b_evidence_raw(arguments)
+        self.with_synchronized_runtime_at_safe_point(|runtime| {
+            runtime.intercept_wyr1b_evidence_raw(arguments)
+        })
+        .unwrap_or(NativeSyscallResult {
+            status: DW_STATUS_SUCCESS,
+            control: SyscallControl::ServiceRendezvous,
+        })
+    }
+
+    #[cfg(deepwyrm_dw1c_evidence)]
+    fn intercept_dw1c_evidence_raw(
+        &mut self,
+        arguments: crate::syscall::RawSyscallArguments,
+    ) -> NativeSyscallResult {
+        self.with_synchronized_runtime_at_safe_point(|runtime| {
+            runtime.intercept_dw1c_evidence_raw(arguments)
+        })
+        .unwrap_or(NativeSyscallResult {
+            status: DW_STATUS_SUCCESS,
+            control: SyscallControl::ServiceRendezvous,
+        })
     }
 
     fn complete_remote_stop(
@@ -6326,10 +6426,10 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             // minted from the terminal task state observed here.
             return Ok(());
         }
-        self.synchronize_scheduler_current_detached();
-        let mut runtime = self.runtime.lock();
-        runtime.switch_cpu(self.cpu);
-        runtime.authorize_return(frame, current_binding_generation)
+        self.with_synchronized_runtime_at_safe_point(|runtime| {
+            runtime.authorize_return(frame, current_binding_generation)
+        })
+        .unwrap_or(Ok(()))
     }
 
     fn invalid_return(&mut self, error: crate::arch::x86_64::syscall::UserReturnError) {
@@ -6727,7 +6827,9 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         if terminal_current {
             return crate::syscall::native::NativeResumeOutcome::TerminateCurrent;
         }
-        self.synchronize_scheduler_current_detached();
+        if !self.synchronize_scheduler_current_at_safe_point_detached() {
+            return crate::syscall::native::NativeResumeOutcome::ServiceRendezvous;
+        }
         let publication = {
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);

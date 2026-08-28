@@ -87,7 +87,8 @@ const E5_USER_PIN_CAPACITY: usize = 8;
     deepwyrm_wrcap_relay,
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
-    deepwyrm_wyr1b_evidence
+    deepwyrm_wyr1b_evidence,
+    deepwyrm_dw1c_evidence
 )))]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;
 // Selector 24 keeps bootstrap, init0, the controller, and one bounded worker
@@ -107,6 +108,10 @@ const LIVE_ADDRESS_SPACE_CAPACITY: usize = 5;
 // launched job generation live in addition to the retiring primordial root.
 #[cfg(deepwyrm_wyr1b_evidence)]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;
+// Selector 28 keeps primordial, the controller, and all ten workload actors
+// resident through READY, ARM, remote termination, and final observation.
+#[cfg(deepwyrm_dw1c_evidence)]
+const LIVE_ADDRESS_SPACE_CAPACITY: usize = 12;
 // Selector 22 keeps bootstrap, init0, the controller, and multiple stress
 // descendants live together. This is a bounded test-artifact capacity, not a
 // production policy or a new ABI limit.

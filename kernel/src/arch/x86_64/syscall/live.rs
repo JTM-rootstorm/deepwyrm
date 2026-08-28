@@ -1186,6 +1186,7 @@ unsafe fn native_runtime_timer_pre_iret<
     }
     poll_timer_return_stop(context);
     arm_current_normal_quantum();
+    poll_timer_return_stop(context);
 }
 
 /// Fixed assembly seam for CPL3-origin Local APIC timer return. Returning from
@@ -1671,6 +1672,7 @@ fn service_syscall_return_preemption<
     }
     poll_timer_return_stop(*context);
     arm_current_normal_quantum();
+    poll_timer_return_stop(*context);
 }
 
 #[allow(
