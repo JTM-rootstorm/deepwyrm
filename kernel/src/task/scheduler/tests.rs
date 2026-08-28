@@ -351,7 +351,7 @@ fn dw1c_fixture_arm_waits_for_every_released_blocked_actor() {
         Err(SchedulerError::ContinuationOwned)
     );
     assert_eq!(
-        seed.scheduler.dw1c_arm_retry_wake_target(seed.identities),
+        seed.scheduler.stage_dw1c_arm_retry_detach(seed.identities),
         None
     );
 
@@ -367,15 +367,29 @@ fn dw1c_fixture_arm_waits_for_every_released_blocked_actor() {
         Err(SchedulerError::ContinuationOwned)
     );
     assert_eq!(
-        seed.scheduler.dw1c_arm_retry_wake_target(seed.identities),
+        seed.scheduler.stage_dw1c_arm_retry_detach(seed.identities),
         Some(cpu(0))
     );
+    let detach = seed
+        .scheduler
+        .dw1c_continuation_detach_request_on(cpu(0), actor)
+        .unwrap();
+    assert_eq!(detach.cpu(), cpu(0));
+    assert_eq!(detach.thread(), actor);
+    assert_eq!(detach.execution_generation(), claim.generation());
+    assert_eq!(
+        seed.scheduler.schedule_from_idle_on(cpu(0), actor),
+        Ok(IdleScheduleDecision::Detach(detach))
+    );
     seed.scheduler.complete_switch_on(claim).unwrap();
+    seed.scheduler
+        .complete_dw1c_continuation_detach(detach)
+        .unwrap();
     seed.scheduler
         .install_dw1c_fixture(seed.reporter_claim, seed.identities)
         .unwrap();
     assert_eq!(
-        seed.scheduler.dw1c_arm_retry_wake_target(seed.identities),
+        seed.scheduler.stage_dw1c_arm_retry_detach(seed.identities),
         None
     );
     assert_eq!(seed.scheduler.check_invariants(), Ok(()));

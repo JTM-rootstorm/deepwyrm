@@ -424,6 +424,33 @@ pub(crate) struct Dw1cSchedulerActorIdentity {
     pub(crate) execution_generation: u64,
 }
 
+/// Selector-private request for one CPU to leave a blocked actor's suspended
+/// continuation on its ordinary detached idle carrier.  The exact execution
+/// generation prevents a late ARM retry from detaching a later run of the
+/// same Thread.
+#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Dw1cContinuationDetachRequest {
+    cpu: SchedulerCpuId,
+    thread: ThreadKey,
+    execution_generation: u64,
+}
+
+#[cfg(any(test, deepwyrm_dw1c_evidence))]
+impl Dw1cContinuationDetachRequest {
+    pub(crate) const fn cpu(self) -> SchedulerCpuId {
+        self.cpu
+    }
+
+    pub(crate) const fn thread(self) -> ThreadKey {
+        self.thread
+    }
+
+    pub(crate) const fn execution_generation(self) -> u64 {
+        self.execution_generation
+    }
+}
+
 #[cfg(any(test, deepwyrm_dw1c_evidence))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Dw1cTerminalGate {
@@ -518,6 +545,8 @@ pub(crate) enum IdleScheduleDecision {
     ContinueIdle,
     ResumeCurrent,
     Switch(ScheduleDecision),
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    Detach(Dw1cContinuationDetachRequest),
 }
 
 #[derive(Debug)]
@@ -867,6 +896,8 @@ struct SchedulerState<const CAPACITY: usize> {
     #[cfg(any(test, deepwyrm_dw1c_evidence))]
     dw1c_fixture: Option<Dw1cSchedulerFixture>,
     #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    dw1c_continuation_detach: [Option<Dw1cContinuationDetachRequest>; H2_SCHEDULER_CPU_CAPACITY],
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
     accounting_underflow_fault: bool,
     #[cfg(any(test, deepwyrm_dw1c_evidence))]
     time_regression_fault: bool,
@@ -909,6 +940,8 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             carrier_admission: CarrierAdmissionState::new(),
             #[cfg(any(test, deepwyrm_dw1c_evidence))]
             dw1c_fixture: None,
+            #[cfg(any(test, deepwyrm_dw1c_evidence))]
+            dw1c_continuation_detach: [None; H2_SCHEDULER_CPU_CAPACITY],
             #[cfg(any(test, deepwyrm_dw1c_evidence))]
             accounting_underflow_fault: false,
             #[cfg(any(test, deepwyrm_dw1c_evidence))]
@@ -1758,12 +1791,12 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     /// `WOULD_BLOCK` alone cannot wake that carrier, so the caller stages one
     /// ordinary affine idle-wake after dropping runtime authority.
     #[cfg(any(test, deepwyrm_dw1c_evidence))]
-    pub(crate) fn dw1c_arm_retry_wake_target(
+    pub(crate) fn stage_dw1c_arm_retry_detach(
         &self,
         actors: [Dw1cSchedulerActorIdentity; 8],
     ) -> Option<SchedulerCpuId> {
-        let state = self.state.lock();
-        actors.into_iter().find_map(|actor| {
+        let mut state = self.state.lock();
+        let request = actors.into_iter().find_map(|actor| {
             let entry = state.queue[..state.len].iter().flatten().find(|entry| {
                 entry.thread == actor.thread
                     && entry.block_execution_generation == actor.execution_generation
@@ -1775,8 +1808,58 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                         && suspended.generation == actor.execution_generation
                         && suspended.publication == SuspendedPublication::Queued
                 })
-                .map(|_| cpu)
-        })
+                .map(|_| Dw1cContinuationDetachRequest {
+                    cpu,
+                    thread: actor.thread,
+                    execution_generation: actor.execution_generation,
+                })
+        })?;
+        let slot = &mut state.dw1c_continuation_detach[request.cpu.index()];
+        match *slot {
+            None => *slot = Some(request),
+            Some(existing) if existing == request => {}
+            Some(_) => return None,
+        }
+        state.assert_invariants();
+        Some(request.cpu)
+    }
+
+    /// Returns the exact selector-private detach request only while the named
+    /// generation still owns this CPU's physically suspended continuation.
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    pub(crate) fn dw1c_continuation_detach_request_on(
+        &self,
+        cpu: SchedulerCpuId,
+        suspended: ThreadKey,
+    ) -> Option<Dw1cContinuationDetachRequest> {
+        let state = self.state.lock();
+        let request = state.dw1c_continuation_detach[cpu.index()]?;
+        let continuation = state.suspended[cpu.index()]?;
+        (request.cpu == cpu
+            && request.thread == suspended
+            && continuation.thread == request.thread
+            && continuation.generation == request.execution_generation
+            && continuation.publication == SuspendedPublication::Queued)
+            .then_some(request)
+    }
+
+    /// Clears only the request that has already completed its physical switch
+    /// to the CPU-private detached idle carrier.
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    pub(crate) fn complete_dw1c_continuation_detach(
+        &self,
+        request: Dw1cContinuationDetachRequest,
+    ) -> Result<(), SchedulerError> {
+        let mut state = self.state.lock();
+        let cpu_index = request.cpu.index();
+        if state.dw1c_continuation_detach[cpu_index] != Some(request)
+            || state.suspended[cpu_index].is_some()
+        {
+            return Err(SchedulerError::StaleExecutionClaim);
+        }
+        state.dw1c_continuation_detach[cpu_index] = None;
+        state.assert_invariants();
+        Ok(())
     }
 
     #[cfg(any(test, deepwyrm_dw1c_evidence))]
@@ -2958,6 +3041,17 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         {
             return Err(SchedulerError::ContinuationOwned);
         }
+        #[cfg(any(test, deepwyrm_dw1c_evidence))]
+        if let Some(request) = state.dw1c_continuation_detach[cpu_index]
+            && request.thread == suspended_claim.thread
+            && request.execution_generation == suspended_claim.generation
+        {
+            state.assert_invariants();
+            return Ok(SchedulerIdleDispatch {
+                decision: IdleScheduleDecision::Detach(request),
+                migration: None,
+            });
+        }
         let local_runnable = state.queue[..state.len].iter().any(|entry| {
             entry.is_some_and(|entry| {
                 entry.state == SchedulerThreadState::Runnable
@@ -4080,6 +4174,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                     consumed_published_expiry: None,
                 }),
                 IdleScheduleDecision::Switch(decision) => Ok(decision),
+                #[cfg(any(test, deepwyrm_dw1c_evidence))]
+                IdleScheduleDecision::Detach(_) => Err(SchedulerError::ContinuationOwned),
             };
         }
         self.schedule_next_on(SchedulerCpuId::BOOTSTRAP)

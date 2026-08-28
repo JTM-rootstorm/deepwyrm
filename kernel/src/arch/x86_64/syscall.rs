@@ -36,6 +36,8 @@ pub(crate) use msr::{E4_FMASK, SyscallMsrPlan, normalize_cr0_for_e5, normalize_c
 pub(crate) use super::exceptions::{
     UserExceptionBindError, UserExceptionBinding, UserExceptionHandler, bind_user_exception_handler,
 };
+#[cfg(all(target_os = "none", target_arch = "x86_64", deepwyrm_dw1c_evidence))]
+pub(crate) use live::detached_idle_entry_rip;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[allow(
     unused_imports,

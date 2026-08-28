@@ -739,6 +739,40 @@ pub(crate) unsafe fn bind_current_thread_stack(
     Ok(next)
 }
 
+/// Binds a context-switch destination that is either an owned Thread stack or
+/// this exact CPU's private bootstrap/idle carrier.  The latter is admitted
+/// only for the selector-private blocked-continuation detach path.
+#[cfg(deepwyrm_dw1c_evidence)]
+#[allow(
+    unsafe_code,
+    reason = "the current CPU exclusively updates its GS-selected entry record while IF remains clear"
+)]
+fn bind_current_switch_stack(stack: KernelStackBounds) -> Result<u64, EntryBindingError> {
+    let (cpu_index, state) =
+        unsafe { current_entry_state_mut() }.ok_or(EntryBindingError::BoundaryNotInstalled)?;
+    if INSTALL_STATE[cpu_index].load(Ordering::Acquire) != INSTALLED {
+        return Err(EntryBindingError::BoundaryNotInstalled);
+    }
+    let thread_stack = crate::arch::x86_64::linked_thread_kernel_stack_layout()
+        .map_err(|_| EntryBindingError::ForeignKernelStack)?
+        .contains(&stack);
+    let idle_stack = crate::arch::x86_64::linked_runtime_cpu_stack_layout()
+        .map_err(|_| EntryBindingError::ForeignKernelStack)?
+        .get(cpu_index)
+        .is_some_and(|layout| layout.ap_bootstrap == stack);
+    if !thread_stack && !idle_stack {
+        return Err(EntryBindingError::ForeignKernelStack);
+    }
+    let next = state
+        .binding_generation
+        .checked_add(1)
+        .filter(|generation| *generation != 0)
+        .ok_or(EntryBindingError::GenerationExhausted)?;
+    state.current_kernel_stack_top = stack.top;
+    state.binding_generation = next;
+    Ok(next)
+}
+
 /// Publishes a stationary carrier for an installed CPU while it remains parked
 /// in CPL0.
 ///
@@ -1588,6 +1622,18 @@ unsafe fn native_runtime_trampoline<
                                 switch_kernel_context(plan);
                                 break;
                             }
+                            #[cfg(deepwyrm_dw1c_evidence)]
+                            crate::syscall::native::NativeIdleSuspendPoll::Detach {
+                                plan, ..
+                            } => {
+                                crate::arch::x86_64::idle::cancel_current_idle(idle)
+                                    .unwrap_or_else(|_| halt_forever());
+                                switch_kernel_context(plan);
+                                // The synthetic idle destination diverges, but
+                                // this call returns later when the saved actor
+                                // continuation is normally woken and resumed.
+                                break;
+                            }
                         }
                     }
                 }
@@ -1680,6 +1726,9 @@ fn service_syscall_return_preemption<
     reason = "the lifetime-branded switch plan keeps execution-owner save storage stationary through immediate authenticated switch consumption"
 )]
 fn switch_kernel_context(plan: crate::arch::x86_64::context::KernelSwitchPlan<'_>) {
+    #[cfg(deepwyrm_dw1c_evidence)]
+    bind_current_switch_stack(plan.next_stack()).unwrap_or_else(|_| halt_forever());
+    #[cfg(not(deepwyrm_dw1c_evidence))]
     unsafe { bind_current_thread_stack(plan.next_stack()) }.unwrap_or_else(|_| halt_forever());
     if !live_fp_simd_unavailable_is_enforced() {
         halt_forever();
@@ -1730,6 +1779,19 @@ pub(crate) fn enter_bound_idle_scheduler() -> ! {
     validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
     let binding = runtime_binding().unwrap_or_else(|| halt_forever());
     unsafe { (binding.idle_scheduler_handler)(binding.context) }
+}
+
+/// Fixed destination for a blocked-continuation detach.  The synthetic
+/// context lands here on the CPU-private bootstrap stack before the bound
+/// runtime releases scheduler ownership of the outgoing actor.
+#[cfg(deepwyrm_dw1c_evidence)]
+extern "sysv64" fn dw_x86_64_detached_idle_entry() -> ! {
+    enter_bound_idle_scheduler()
+}
+
+#[cfg(deepwyrm_dw1c_evidence)]
+pub(crate) fn detached_idle_entry_rip() -> u64 {
+    dw_x86_64_detached_idle_entry as *const () as usize as u64
 }
 
 #[allow(

@@ -2316,6 +2316,9 @@ struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_
     stopping_claim_was_suspended: bool,
     #[cfg(deepwyrm_dw1b_evidence)]
     dw1b_preemption_outgoing: [Option<ThreadKey>; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+    #[cfg(deepwyrm_dw1c_evidence)]
+    dw1c_pending_detach: [Option<crate::task::Dw1cContinuationDetachRequest>;
+        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
     rendezvous_reaper: Option<crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry>,
     registry: Registry,
     memory: Memory,
@@ -2838,6 +2841,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             )
         }
         .unwrap_or_else(|error| panic!("primordial idle-suspend poll drifted: {error:?}"));
+        #[cfg(deepwyrm_dw1c_evidence)]
+        if let crate::syscall::native::NativeIdleSuspendPoll::Detach { request, .. } = &poll {
+            let slot = &mut self.dw1c_pending_detach[self.cpu.index()];
+            assert!(slot.is_none(), "selector-28 idle detach overlapped");
+            *slot = Some(*request);
+        }
         #[cfg(feature = "test-support")]
         self.g5_probe.observe_poll(
             owner,
@@ -6594,6 +6603,45 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
     }
 
     fn enter_idle_scheduler(&mut self) -> ! {
+        #[cfg(deepwyrm_dw1c_evidence)]
+        {
+            let pending = {
+                let runtime = self.runtime.lock();
+                runtime.dw1c_pending_detach[self.cpu.index()]
+            };
+            if let Some(request) = pending {
+                let prepared = {
+                    let mut runtime = self.runtime.lock();
+                    runtime.switch_cpu(self.cpu);
+                    runtime.prepare_terminal_kernel_root_switch()
+                };
+                let executed = match prepared.execute() {
+                    Ok(executed) => executed,
+                    Err(failure) => {
+                        let mut runtime = self.runtime.lock();
+                        let error = runtime.cancel_terminal_kernel_root_switch(failure);
+                        panic!("selector-28 idle-detach root switch failed: {error:?}")
+                    }
+                };
+                let publication = {
+                    let mut runtime = self.runtime.lock();
+                    runtime.switch_cpu(self.cpu);
+                    runtime.commit_terminal_kernel_root_switch(executed);
+                    let publication = runtime.complete_physical_switch_handoff();
+                    runtime
+                        .shared
+                        .execution
+                        .complete_dw1c_continuation_detach(request)
+                        .unwrap_or_else(|error| {
+                            panic!("selector-28 idle-detach completion drifted: {error:?}")
+                        });
+                    runtime.dw1c_pending_detach[self.cpu.index()] = None;
+                    runtime.local.record_idle();
+                    publication
+                };
+                crate::task::notify_completed_switch_runnable(publication);
+            }
+        }
         if !self.admission_entered {
             let (ticket, resources) = self
                 .admission
@@ -7155,6 +7203,8 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         stopping_claim_was_suspended: false,
         #[cfg(deepwyrm_dw1b_evidence)]
         dw1b_preemption_outgoing: core::array::from_fn(|_| None),
+        #[cfg(deepwyrm_dw1c_evidence)]
+        dw1c_pending_detach: core::array::from_fn(|_| None),
         rendezvous_reaper: None,
         registry,
         memory,

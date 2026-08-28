@@ -700,9 +700,92 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
 
     #[cfg(any(test, deepwyrm_dw1c_evidence))]
     pub(crate) fn stage_dw1c_arm_retry_wake(&self, actors: [super::Dw1cSchedulerActorIdentity; 8]) {
-        if let Some(target) = self.scheduler.dw1c_arm_retry_wake_target(actors) {
+        if let Some(target) = self.scheduler.stage_dw1c_arm_retry_detach(actors) {
             super::notify_runnable_work(Some(target));
         }
+    }
+
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    pub(crate) fn dw1c_continuation_detach_request_on(
+        &self,
+        cpu: SchedulerCpuId,
+        suspended: ThreadKey,
+    ) -> Option<super::Dw1cContinuationDetachRequest> {
+        self.scheduler
+            .dw1c_continuation_detach_request_on(cpu, suspended)
+    }
+
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    pub(crate) fn complete_dw1c_continuation_detach(
+        &self,
+        request: super::Dw1cContinuationDetachRequest,
+    ) -> Result<(), SchedulerError> {
+        self.scheduler.complete_dw1c_continuation_detach(request)
+    }
+
+    /// Builds the physical switch from a blocked actor continuation to this
+    /// CPU's private detached idle carrier.  The actor continuation is saved
+    /// in its ordinary execution slot and remains scheduler-owned until the
+    /// destination entry acknowledges arrival.
+    #[cfg(deepwyrm_dw1c_evidence)]
+    #[allow(
+        unsafe_code,
+        reason = "the exact scheduler request and lifetime-branded execution owner authenticate the physical blocked-continuation switch"
+    )]
+    pub(crate) unsafe fn prepare_dw1c_continuation_detach_on<
+        'owner,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &'owner self,
+        tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        request: super::Dw1cContinuationDetachRequest,
+        idle_stack: crate::memory::kernel_stack::KernelStackBounds,
+        detached_idle_entry: u64,
+    ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan<'owner>, ExecutionSwitchError> {
+        let cpu = request.cpu();
+        if self
+            .scheduler
+            .dw1c_continuation_detach_request_on(cpu, request.thread())
+            != Some(request)
+        {
+            return Err(ExecutionSwitchError::WrongSchedulerState);
+        }
+        let (stack_id, context_id) = tasks
+            .thread_execution_resources(request.thread())
+            .map_err(ExecutionSwitchError::Task)?
+            .ok_or(ExecutionSwitchError::Resource(
+                ExecutionResourceError::StaleId,
+            ))?;
+        self.contexts
+            .load(context_id)
+            .map_err(ExecutionSwitchError::Resource)?;
+        let current_rsp_out = self
+            .continuations
+            .save_ptr(context_id)
+            .map_err(ExecutionSwitchError::Resource)?;
+        let current_stack = self
+            .stacks
+            .bounds(stack_id)
+            .map_err(ExecutionSwitchError::Resource)?;
+        let initial = unsafe {
+            crate::arch::x86_64::context::prepare_initial_kernel_continuation(
+                idle_stack,
+                detached_idle_entry,
+            )
+        }
+        .map_err(ExecutionSwitchError::InitialContext)?;
+        unsafe {
+            crate::arch::x86_64::context::KernelSwitchPlan::new_initial(
+                self,
+                current_rsp_out,
+                current_stack,
+                initial,
+            )
+        }
+        .map_err(ExecutionSwitchError::Context)
     }
 
     #[cfg(any(test, deepwyrm_dw1c_evidence))]

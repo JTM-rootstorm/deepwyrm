@@ -56,7 +56,8 @@ pub(crate) use scheduler::{
 #[cfg(any(test, deepwyrm_dw1c_evidence))]
 #[allow(unused_imports)]
 pub(crate) use scheduler::{
-    Dw1cFinalSchedulerSnapshot, Dw1cSchedulerActorIdentity, Dw1cTerminalGate,
+    Dw1cContinuationDetachRequest, Dw1cFinalSchedulerSnapshot, Dw1cSchedulerActorIdentity,
+    Dw1cTerminalGate,
 };
 
 #[cfg(any(test, deepwyrm_dw1c_evidence))]

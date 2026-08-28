@@ -2944,6 +2944,26 @@ pub(crate) unsafe fn poll_wait_idle_suspend<
             .map_err(WaitSuspendError::Switch)?;
             Ok(NativeIdleSuspendPoll::Switch(plan))
         }
+        #[cfg(deepwyrm_dw1c_evidence)]
+        IdleScheduleDecision::Detach(request) => {
+            let idle_stack = crate::arch::x86_64::linked_runtime_cpu_stack_layout()
+                .map_err(|_| WaitSuspendError::InvalidDecision)?
+                .get(request.cpu().index())
+                .map(|layout| layout.ap_bootstrap)
+                .ok_or(WaitSuspendError::InvalidDecision)?;
+            let plan = unsafe {
+                execution.prepare_dw1c_continuation_detach_on(
+                    tasks,
+                    request,
+                    idle_stack,
+                    crate::arch::x86_64::syscall::detached_idle_entry_rip(),
+                )
+            }
+            .map_err(WaitSuspendError::Switch)?;
+            Ok(NativeIdleSuspendPoll::Detach { plan, request })
+        }
+        #[cfg(all(test, not(deepwyrm_dw1c_evidence)))]
+        IdleScheduleDecision::Detach(_) => Err(WaitSuspendError::InvalidDecision),
     }
 }
 
@@ -2987,6 +3007,26 @@ pub(crate) unsafe fn poll_wait_idle_suspend_on<
             .map_err(WaitSuspendError::Switch)?;
             Ok(NativeIdleSuspendPoll::Switch(plan))
         }
+        #[cfg(deepwyrm_dw1c_evidence)]
+        IdleScheduleDecision::Detach(request) => {
+            let idle_stack = crate::arch::x86_64::linked_runtime_cpu_stack_layout()
+                .map_err(|_| WaitSuspendError::InvalidDecision)?
+                .get(cpu.index())
+                .map(|layout| layout.ap_bootstrap)
+                .ok_or(WaitSuspendError::InvalidDecision)?;
+            let plan = unsafe {
+                execution.prepare_dw1c_continuation_detach_on(
+                    tasks,
+                    request,
+                    idle_stack,
+                    crate::arch::x86_64::syscall::detached_idle_entry_rip(),
+                )
+            }
+            .map_err(WaitSuspendError::Switch)?;
+            Ok(NativeIdleSuspendPoll::Detach { plan, request })
+        }
+        #[cfg(all(test, not(deepwyrm_dw1c_evidence)))]
+        IdleScheduleDecision::Detach(_) => Err(WaitSuspendError::InvalidDecision),
     }
 }
 

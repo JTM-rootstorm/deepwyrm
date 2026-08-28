@@ -738,6 +738,11 @@ pub(crate) enum NativeIdleSuspendPoll<'owner> {
     Continue,
     ResumeCurrent,
     Switch(crate::arch::x86_64::context::KernelSwitchPlan<'owner>),
+    #[cfg(deepwyrm_dw1c_evidence)]
+    Detach {
+        plan: crate::arch::x86_64::context::KernelSwitchPlan<'owner>,
+        request: crate::task::Dw1cContinuationDetachRequest,
+    },
 }
 
 #[must_use = "a resumed syscall either owns a live current Thread or must service the published rendezvous"]
