@@ -1526,14 +1526,14 @@ impl TaskLayout {
         let terminal_alignment =
             parse_u64(required_value(&values, "terminal_reaper_stack_alignment")?)?;
         if count != 16
-            || size != 262_144
+            || size != 524_288
             || guard != 4_096
             || alignment != 4_096
             || !size.is_multiple_of(alignment)
             || !guard.is_multiple_of(alignment)
         {
             return Err(
-                "DW0-E3 thread stack pool must be 16 guarded 262144-byte stacks on 4096-byte boundaries"
+                "DW0-E3 thread stack pool must be 16 guarded 524288-byte stacks on 4096-byte boundaries"
                     .into(),
             );
         }

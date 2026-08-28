@@ -4,8 +4,8 @@ pub(crate) fn validate_e7_stack_margin(
     sizes: &[StackSize],
     disassembly: &str,
     boot_stack_bytes: usize,
+    thread_stack_bytes: usize,
 ) {
-    const THREAD_STACK_BYTES: usize = 256 * 1024;
     const REQUIRED_SPARE_BYTES: usize = 32 * 1024;
     const ARCHITECTURAL_HEADROOM_BYTES: usize = 4 * 1024;
     const RAW_SYSCALL_FRAME_BYTES: usize = 144;
@@ -206,15 +206,15 @@ pub(crate) fn validate_e7_stack_margin(
         .and_then(|bytes| bytes.checked_add(ARCHITECTURAL_HEADROOM_BYTES))
         .expect("E7 Thread stack bound fits usize");
     assert!(
-        thread_total + REQUIRED_SPARE_BYTES <= THREAD_STACK_BYTES,
+        thread_total + REQUIRED_SPARE_BYTES <= thread_stack_bytes,
         "E7 Thread stack bound too small: used={thread_total} spare={} required={REQUIRED_SPARE_BYTES}",
-        THREAD_STACK_BYTES.saturating_sub(thread_total)
+        thread_stack_bytes.saturating_sub(thread_total)
     );
 
     eprintln!(
         "task-syscall-smoke stack bootstrap={boot_total} setup={boot_setup_total} timer-interrupt={timer_interrupt_total} thread={thread_total} bootstrap-spare={} thread-spare={} boot-terminal={} timer-terminal={} thread-terminal={}",
         boot_stack_bytes - boot_total,
-        THREAD_STACK_BYTES - thread_total,
+        thread_stack_bytes - thread_total,
         boot_setup.terminal,
         timer_interrupt.terminal,
         thread.terminal,

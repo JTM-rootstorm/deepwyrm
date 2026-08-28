@@ -678,9 +678,9 @@ wrong `DWTEST1` ID/detail, and serial/QEMU result mismatch.
 ### 10.1 Bootstrap stack budget
 
 Selector 28 raises Deepwyrm's private x86_64 bootstrap stack from 512 KiB to
-1 MiB. Thread kernel stacks remain 256 KiB. This is an internal bootstrap
-implementation budget, not a native ABI, boot ABI, or Wyrmroot platform ABI
-change.
+1 MiB and the guarded per-Thread kernel stacks from 256 KiB to 512 KiB. These
+are internal kernel implementation budgets, not native ABI, boot ABI, or
+Wyrmroot platform ABI changes.
 
 The first frozen C5 release artifact measured 493,816 bytes in the retained
 `kernel_main -> run_primordial -> primordial::enter` frame chain. The prior
@@ -690,6 +690,18 @@ headroom without reducing selector capacities merely to preserve the earlier
 budget. Retained bootstrap-frame pressure remains explicit optimization debt.
 Selector 28 is included in the accepted-target primordial stack-margin gate so
 future capacity or compiler-layout growth fails before live acceptance.
+
+The first corrected live admission candidate then reached CPL3 and exposed a
+separate per-Thread stack overflow. QEMU recorded the first fault as a kernel
+write through `RSP` into the first Thread stack's guard page while selector
+28's address-region commit path was active; the exception-frame push faulted
+again and became vector 8. The 512 KiB Thread stack restores functional
+headroom. Selector 28's accepted-target gate therefore also binds the exact
+target-emitted frames in that trace-witnessed syscall chain and requires 4 KiB
+architectural headroom plus 32 KiB spare against the linked per-Thread payload.
+It is a regression for the observed overflow path rather than a whole-program
+call-graph proof. Retained large-frame pressure remains explicit optimization
+debt.
 
 DW1-C implementation must add host/source/model coverage for:
 

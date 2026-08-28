@@ -1268,6 +1268,8 @@ fn direct_call_stack_path_accepts_only_the_complete_local_relative_jump_table_id
     assert!(failed.is_err());
 }
 
+#[path = "stack/dw1c.rs"]
+mod dw1c;
 #[path = "stack/e7.rs"]
 mod e7;
 #[path = "stack/f12.rs"]
@@ -1285,6 +1287,7 @@ mod production;
 #[path = "stack/selector.rs"]
 mod selector;
 
+pub(super) use dw1c::validate_dw1c_thread_stack_margin;
 pub(super) use e7::validate_e7_stack_margin;
 pub(super) use f9::validate_f9_stack_context_evidence;
 pub(super) use f12::validate_f12_stack_context_evidence;

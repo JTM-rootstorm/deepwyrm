@@ -508,10 +508,12 @@ fn e7_task_smoke_artifact_is_freestanding_and_separated() {
         text_disassembly(&smoke_disassembly),
         "E7 stack-size carrier changed task-syscall-smoke machine code"
     );
+    let smoke_stack_symbols = symbols(&llvm_nm, &smoke_stack);
     validate_e7_stack_margin(
         &stack_sizes(&llvm_readelf, &smoke_stack),
         &resolved_read_only_indirect_disassembly(&llvm_objdump, &llvm_nm, &smoke_stack),
-        linked_boot_stack_payload_bytes(&symbols(&llvm_nm, &smoke_stack)),
+        linked_boot_stack_payload_bytes(&smoke_stack_symbols),
+        linked_thread_kernel_stack_payload_bytes(&smoke_stack_symbols),
     );
 
     let build_input_after = build_input_manifest_sha256(&workspace);
@@ -670,6 +672,12 @@ fn wyr1_primordial_selector_artifacts_fit_the_linked_boot_stack() {
             &stack_sizes(&llvm_readelf, &stack_kernel),
             linked_boot_stack_payload_bytes(&stack_symbols),
         );
+        if selector == "normal-preemption-smp" {
+            validate_dw1c_thread_stack_margin(
+                &stack_sizes(&llvm_readelf, &stack_kernel),
+                linked_thread_kernel_stack_payload_bytes(&stack_symbols),
+            );
+        }
     }
 
     assert_eq!(

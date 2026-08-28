@@ -566,6 +566,10 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
         Ok(self.commit_selection_switch(executed))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "the allocation-free failure path must return both move-only residency owners unchanged"
+    )]
     pub(crate) fn prepare_selection_switch(
         &self,
         prepared: PreparedRootSelection,
@@ -683,6 +687,10 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
         Ok(self.commit_kernel_execution_root_switch(executed))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "the allocation-free failure path must return the move-only Process residency owner unchanged"
+    )]
     pub(crate) fn prepare_kernel_execution_root_switch(
         &self,
         kernel: &KernelExecutionRoot,
@@ -767,6 +775,10 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
         Ok(self.commit_from_kernel_execution_root_switch(executed))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "the allocation-free failure path must return both move-only selection tokens"
+    )]
     pub(crate) fn prepare_from_kernel_execution_root_switch(
         &self,
         prepared: PreparedRootSelection,
@@ -1042,6 +1054,10 @@ pub(crate) struct PreparedProcessRootSwitch {
 }
 
 impl PreparedProcessRootSwitch {
+    #[allow(
+        clippy::result_large_err,
+        reason = "the allocation-free failure path must return both move-only residency owners unchanged"
+    )]
     pub(crate) fn execute<T: RootSwitchTarget>(
         self,
         target: &mut T,
@@ -1081,6 +1097,10 @@ pub(crate) struct PreparedKernelExecutionRootSwitch {
 }
 
 impl PreparedKernelExecutionRootSwitch {
+    #[allow(
+        clippy::result_large_err,
+        reason = "the allocation-free failure path must return the move-only Process residency owner unchanged"
+    )]
     pub(crate) fn execute<T: RootSwitchTarget>(
         self,
         target: &mut T,
@@ -1112,6 +1132,10 @@ pub(crate) struct PreparedKernelToProcessRootSwitch {
 }
 
 impl PreparedKernelToProcessRootSwitch {
+    #[allow(
+        clippy::result_large_err,
+        reason = "the allocation-free failure path must return both move-only selection tokens"
+    )]
     pub(crate) fn execute<T: RootSwitchTarget>(
         self,
         target: &mut T,

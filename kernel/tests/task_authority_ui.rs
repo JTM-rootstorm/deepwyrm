@@ -91,7 +91,7 @@ fn run_compile_fail_case(
         .arg("--out-dir")
         .arg(output_dir)
         .env("DEEPWYRM_E3_THREAD_STACK_COUNT", "16")
-        .env("DEEPWYRM_E3_THREAD_STACK_SIZE", "262144")
+        .env("DEEPWYRM_E3_THREAD_STACK_SIZE", "524288")
         .env("DEEPWYRM_E3_THREAD_STACK_GUARD_SIZE", "4096")
         .env("DEEPWYRM_E3_THREAD_STACK_ALIGNMENT", "4096")
         .arg(&fixture)

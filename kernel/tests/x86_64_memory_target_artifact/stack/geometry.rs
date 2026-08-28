@@ -69,7 +69,7 @@ pub(crate) fn validate_kernel_stack_artifact_geometry(symbols: &str) {
     let thread_start = address("__dw_thread_kernel_stack_region_start");
     let thread_end = address("__dw_thread_kernel_stack_region_end");
     assert_eq!(thread_start & 0xfff, 0, "thread stack arena alignment");
-    assert_eq!(thread_end - thread_start, 16 * (4096 + 262144));
+    assert_eq!(thread_end - thread_start, 16 * (4096 + 524288));
     assert!(
         address("__dw_ist_region_end") <= thread_start && thread_end <= address("__dw_data_end"),
         "linked E3 thread stack arena escapes the writable data PT_LOAD bounds"
