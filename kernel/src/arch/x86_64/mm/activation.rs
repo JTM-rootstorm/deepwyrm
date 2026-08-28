@@ -96,7 +96,7 @@ const DW1C_LIVE_USER_PIN_FLOOR: usize =
     DW1C_RETAINED_RECEIVE_PINS + DW1C_CHANNEL_CREATE_OUTPUT_PINS;
 #[cfg(deepwyrm_dw1c_evidence)]
 const _: () = {
-    assert!(DW1C_RETAINED_RECEIVE_PINS == crate::test_support::dw1c_evidence::DW1C_ACTOR_COUNT);
+    assert!(DW1C_RETAINED_RECEIVE_PINS == crate::test_support::DW1C_ACTOR_COUNT);
     assert!(E5_USER_PIN_CAPACITY >= DW1C_LIVE_USER_PIN_FLOOR);
 };
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
