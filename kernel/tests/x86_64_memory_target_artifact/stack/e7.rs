@@ -14,7 +14,7 @@ pub(crate) fn validate_e7_stack_margin(
         3 * size_of::<u64>() + 15 * size_of::<u64>() + 15 + size_of::<u64>();
     const F2_PROBE_STACK_BYTES: usize = 16 * 1024;
     const F2_SWITCH_FRAME_BYTES: usize = 7 * size_of::<u64>();
-    const E7_RUNTIME: &str = "deepwyrm_kernel::arch::x86_64::mm::transition::activation::test_support::e7::E7SmokeRuntime<128, 544>";
+    const E7_RUNTIME: &str = "deepwyrm_kernel::arch::x86_64::mm::transition::activation::test_support::e7::E7SmokeRuntime<128, 4096>";
 
     let plain = |description: &str, needle: &str| {
         one_stack_size(sizes, description, |symbol| {
@@ -41,12 +41,12 @@ pub(crate) fn validate_e7_stack_margin(
         }),
         plain(
             "E7 task runner",
-            "test_support::task::run_task_guest_test::<128, 544>",
+            "test_support::task::run_task_guest_test::<128, 4096>",
         ),
         plain("E7 active runner", ">>::run_task_userspace_test"),
         plain(
             "E7 selector runner",
-            "test_support::e7::run_task_userspace_test::<128, 544>",
+            "test_support::e7::run_task_userspace_test::<128, 4096>",
         ),
     ];
     let send_live_ipi = one_stack_symbol(sizes, "live IPI send boundary", |symbol| {
@@ -103,7 +103,7 @@ pub(crate) fn validate_e7_stack_margin(
     let boot_setup = graph
         .with_resolutions(&resolutions)
         .stack_bound("E7 setup path", |symbol| {
-            symbol.ends_with("test_support::e7::enter_smoke::<128, 544>")
+            symbol.ends_with("test_support::e7::enter_smoke::<128, 4096>")
                 && !symbol.contains("::{closure")
         });
     let boot_prefix_bytes = boot_prefix
@@ -121,7 +121,7 @@ pub(crate) fn validate_e7_stack_margin(
         .expect("E7 bootstrap stack bound fits usize");
     let enter_smoke = plain(
         "E7 enter-smoke interrupt prefix",
-        "test_support::e7::enter_smoke::<128, 544>",
+        "test_support::e7::enter_smoke::<128, 4096>",
     );
     let probe_prefix = plain(
         "F3 target deadline probe",

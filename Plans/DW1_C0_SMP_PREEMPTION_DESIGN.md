@@ -718,6 +718,20 @@ charges growth in the exact target-emitted teardown anchors. Large teardown
 frames remain explicit optimization debt; no native, boot, or Wyrmroot ABI is
 changed.
 
+The corrected twelve-entry bootfs then exposed a fourth independent kernel
+budget defect before ARM: the live `ProcessCreate` transaction for the next
+actor returned `DW_STATUS_NO_RESOURCES`. A designated-VM GDB trace proved that
+the process shell, child bootstrap slot, and portable root-region preparation
+all succeeded, while the transaction stopped in the live child-root
+reservation before parent result slots. The 544-entry frame-role registry was
+exhausted there even though selector 28 was only creating its fourth process
+transaction. The registry now carries 4,096 role entries, enough useful
+headroom for the complete primordial/controller/ten-actor resident image and
+its mapping transactions. This is bounded kernel bookkeeping capacity, not a
+physical-memory, native ABI, boot ABI, or Wyrmroot ABI change. Reducing the
+metadata footprint after measuring a complete successful campaign remains
+optimization debt.
+
 DW1-C implementation must add host/source/model coverage for:
 
 - every Parked-to-Schedulable step, reordered/omitted publication, stale

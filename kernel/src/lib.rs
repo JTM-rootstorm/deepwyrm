@@ -77,7 +77,12 @@ const MAX_X86_PHYSICAL_ADDRESS_EXCLUSIVE: u64 = 1_u64 << 52;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 const BOOTSTRAP_FRAME_RANGE_CAPACITY: usize = memory::boot_map::MAX_SANITIZED_USABLE_RANGES;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-const BOOTSTRAP_FRAME_ROLE_CAPACITY: usize = 544;
+// Selector 28 keeps the bootstrap/controller pair and ten actor address spaces
+// resident together.  The former 544-slot registry exhausted while reserving
+// the fourth live child root, before the workload could be armed.  Keep useful
+// headroom for the complete twelve-process image and its mapping transactions;
+// this is role-metadata capacity, not a physical-memory or ABI limit.
+const BOOTSTRAP_FRAME_ROLE_CAPACITY: usize = 4096;
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 struct BootstrapStorage<T>(core::cell::UnsafeCell<core::mem::MaybeUninit<T>>);

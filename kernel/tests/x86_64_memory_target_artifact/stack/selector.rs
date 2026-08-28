@@ -32,7 +32,7 @@ pub(crate) fn validate_selector_stack_margin(
     let kernel_main = exact("deepwyrm_kernel::kernel_main");
     let memory_guest_runner = suffix(
         "memory guest runner",
-        "deepwyrm_kernel::test_support::memory::run_memory_guest_test::<128, 544>",
+        "deepwyrm_kernel::test_support::memory::run_memory_guest_test::<128, 4096>",
     );
     let memory_foundation_runner =
         contains_plain("memory foundation runner", ">::run_memory_foundation_test");

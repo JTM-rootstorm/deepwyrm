@@ -29,11 +29,11 @@ pub(crate) fn validate_dw1c_stack_margins(
     });
     let dispatch_frame = one_stack_size(sizes, "DW1C runtime dispatch frame", |symbol| {
         symbol.contains("syscall::native::dispatch_frame::<")
-            && symbol.contains("RuntimeCarrierFacade<128, 544>")
+            && symbol.contains("RuntimeCarrierFacade<128, 4096>")
             && !symbol.contains("::{closure")
     });
     let runtime_handler = one_stack_size(sizes, "DW1C runtime handler", |symbol| {
-        symbol.contains("RuntimeCarrierFacade<128, 544>")
+        symbol.contains("RuntimeCarrierFacade<128, 4096>")
             && symbol
                 .ends_with("as deepwyrm_kernel::syscall::native::NativeSyscallHandler>::handle")
     });
@@ -41,13 +41,13 @@ pub(crate) fn validate_dw1c_stack_margins(
         symbol.contains("FServiceState<")
             && symbol.contains(", 256, 24, 12>>::dispatch_prepared::<")
             && symbol.contains("::dispatch_prepared::<")
-            && symbol.contains("PrimordialRuntimeCarrier<128, 544>")
+            && symbol.contains("PrimordialRuntimeCarrier<128, 4096>")
             && symbol.contains("NativeSyscallHandler>::handle::{closure#3}")
     });
     let coherent_commit = one_stack_size(sizes, "DW1C coherent AddressRegion commit", |symbol| {
         symbol.contains("AddressRegion<10>>::commit_specs::<40, 40, 256,")
             && symbol.contains("CoherentAddressSpacePublisher<")
-            && symbol.contains("TrackedActiveTarget, 128, 544, 6, 59, 53>")
+            && symbol.contains("TrackedActiveTarget, 128, 4096, 6, 59, 53>")
             && symbol.contains("LiveTlbShootdownDriver")
     });
     let frames = [
@@ -94,34 +94,34 @@ pub(crate) fn validate_dw1c_stack_margins(
     const TERMINAL_ANCHOR_BASELINE_BYTES: usize = 131_760;
     let terminal_reaper = one_stack_size(sizes, "DW1C terminal reaper", |symbol| {
         symbol.contains("syscall::live::native_runtime_terminal_reaper::<")
-            && symbol.contains("RuntimeCarrierFacade<128, 544>")
+            && symbol.contains("RuntimeCarrierFacade<128, 4096>")
     });
     let terminate_current = one_stack_size(sizes, "DW1C terminal runtime", |symbol| {
-        symbol.contains("RuntimeCarrierFacade<128, 544>")
+        symbol.contains("RuntimeCarrierFacade<128, 4096>")
             && symbol.ends_with(
                 "as deepwyrm_kernel::syscall::native::NativeSyscallFrameRuntime>::terminate_current",
             )
     });
     let finish_inactive = one_stack_size(sizes, "DW1C inactive process teardown", |symbol| {
-        symbol.contains("PrimordialRuntimeCarrier<128, 544>>::finish_inactive_process_teardown")
+        symbol.contains("PrimordialRuntimeCarrier<128, 4096>>::finish_inactive_process_teardown")
     });
     let unmap_inactive = one_stack_size(sizes, "DW1C inactive userspace unmap", |symbol| {
-        symbol.contains("PrimordialRuntimeCarrier<128, 544>>::unmap_inactive_userspace")
+        symbol.contains("PrimordialRuntimeCarrier<128, 4096>>::unmap_inactive_userspace")
     });
     let platform_unmap = one_stack_size(sizes, "DW1C live platform unmap", |symbol| {
-        symbol.contains("LivePlatform<128, 544>")
+        symbol.contains("LivePlatform<128, 4096>")
             && symbol.contains("PrimordialPlatform>::unmap::<10, 40, 40, 256>")
     });
     let region_unmap = one_stack_size(sizes, "DW1C coherent AddressRegion unmap", |symbol| {
         symbol.contains("AddressRegion<10>>::unmap::<40, 40, 256,")
             && symbol.contains("CoherentAddressSpacePublisher<")
-            && symbol.contains("TrackedActiveTarget, 128, 544, 6, 59, 53>")
+            && symbol.contains("TrackedActiveTarget, 128, 4096, 6, 59, 53>")
             && symbol.contains("LiveTlbShootdownDriver")
     });
     let terminal_commit = one_stack_size(sizes, "DW1C terminal AddressRegion commit", |symbol| {
         symbol.contains("AddressRegion<10>>::commit_specs::<40, 40, 256,")
             && symbol.contains("CoherentAddressSpacePublisher<")
-            && symbol.contains("TrackedActiveTarget, 128, 544, 6, 59, 53>")
+            && symbol.contains("TrackedActiveTarget, 128, 4096, 6, 59, 53>")
             && symbol.contains("LiveTlbShootdownDriver")
     });
     let prepare_replace = one_stack_size(sizes, "DW1C terminal MemoryObject replace", |symbol| {
