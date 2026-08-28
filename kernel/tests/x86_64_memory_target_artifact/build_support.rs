@@ -211,6 +211,12 @@ fn apply_selector_environment(command: &mut Command, selector: &str) {
                 .env("DEEPWYRM_WYR1B_EVIDENCE_NONCE", "0123456789ABCDEF")
                 .env("DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES", "117");
         }
+        "normal-preemption-smp" => {
+            command
+                .env("DEEPWYRM_DW1C_EVIDENCE_NONCE", "D1C5000000000001")
+                .env("DEEPWYRM_DW1C_PROGRESS_DIGEST", "D1C5A11CE5EED001")
+                .env("DEEPWYRM_DW1C_BOOTFS_MAX_PAGES", "53");
+        }
         _ => {}
     }
 }

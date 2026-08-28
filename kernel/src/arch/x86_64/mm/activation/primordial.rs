@@ -3055,13 +3055,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if state.retirement.retired_process != self.process {
             #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
             if state.retirement.retiring_wyr1_primordial {
-                let (proof, drained) = state
-                    .retirement
-                    .wyr1_primordial_teardown
-                    .take()
-                    .unwrap_or_else(|| {
-                        crate::test_support::complete_fail(supervisor_evidence_detail(0xd00c))
-                    });
+                let (proof, drained) =
+                    state
+                        .retirement
+                        .wyr1_primordial_teardown
+                        .unwrap_or_else(|| {
+                            crate::test_support::complete_fail(supervisor_evidence_detail(0xd00c))
+                        });
                 self.finish_quiesced_process_root_retirement(
                     state.retirement.retired_process,
                     state.retirement.retired_address_space,

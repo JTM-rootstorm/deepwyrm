@@ -21,7 +21,7 @@ fn layout_manifest_is_exact_and_fails_closed_on_drift() {
     let layout = kernel_build::Layout::parse(&source).expect("parse canonical layout manifest");
     assert_eq!(layout.link_base, 0xffff_ffff_8000_0000);
     assert_eq!(layout.base_page_size, 4_096);
-    assert_eq!(layout.kernel_boot_stack_size, 524_288);
+    assert_eq!(layout.kernel_boot_stack_size, 1_048_576);
     assert_eq!(layout.kernel_boot_stack_alignment, 4_096);
     assert_eq!(layout.temporary_virtual_address, 0xffff_ff00_0000_0000);
     assert_eq!(layout.temporary_indices, [510, 0, 0, 0]);
@@ -70,7 +70,7 @@ fn layout_manifest_is_exact_and_fails_closed_on_drift() {
         source.replacen("version = 2", "version = 2\nversion = 2", 1),
         source.replace("version = 2", "version = 1"),
         source.replace(
-            "kernel_boot_stack_size = 524288",
+            "kernel_boot_stack_size = 1048576",
             "kernel_boot_stack_size = 65536",
         ),
         source.replace(

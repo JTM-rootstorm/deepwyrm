@@ -299,8 +299,9 @@ impl Dw1cEvidenceCollector {
     }
 
     /// Installed before the selector's controller is allowed to return to
-    /// userspace.  No callback accepts a pre-install relation, and a second
-    /// installation is a terminal selector failure.
+    /// userspace. CPU admission is the one pre-install relation because all
+    /// carriers become scheduler-capable before the first selector process can
+    /// install workload observation. A second installation is terminal.
     pub(crate) fn install(&self) -> Result<(), Dw1cEvidenceError> {
         let mut state = self.state.lock();
         if state.installed || state.failure.is_some() {
@@ -1002,11 +1003,7 @@ impl Dw1cEvidenceCollector {
         let mut state = self.state.lock();
         let index = usize::from(cpu);
         let bit = cpu_bit(cpu).ok_or_else(|| state.latch(Dw1cEvidenceError::Malformed))?;
-        if !state.installed
-            || subject == 0
-            || generation == 0
-            || value == 0
-            || state.cpu_ready_payload[index].is_some()
+        if subject == 0 || generation == 0 || value == 0 || state.cpu_ready_payload[index].is_some()
         {
             return Err(state.latch(Dw1cEvidenceError::Duplicate));
         }
@@ -2041,6 +2038,44 @@ mod tests {
                 .prospective
                 .iter()
                 .all(Option::is_none)
+        );
+    }
+
+    #[test]
+    fn preinstall_cpu_admission_is_retained_without_admitting_actor_facts() {
+        let (reporter, actors) = distinct_actor_set();
+        let collector = Dw1cEvidenceCollector::new(1, 2);
+        for cpu in 0_u8..4 {
+            collector
+                .observe_cpu_ready_payload(
+                    cpu,
+                    0x1000 + u64::from(cpu),
+                    0x2000 + u64::from(cpu),
+                    0x3000 + u64::from(cpu),
+                )
+                .unwrap();
+        }
+        collector.observe_process_create(actors[0].process).unwrap();
+        collector
+            .observe_thread_create(actors[0].process, actors[0].thread)
+            .unwrap();
+        collector
+            .observe_thread_start(
+                actors[0].process,
+                actors[0].thread,
+                actors[0].execution_generation,
+            )
+            .unwrap();
+
+        collector.install().unwrap();
+        let state = collector.state.lock();
+        assert_eq!(state.facts.cpu_ready, 0x0f);
+        assert!(state.cpu_ready_payload.iter().all(Option::is_some));
+        assert!(state.prospective.iter().all(Option::is_none));
+        drop(state);
+        assert_eq!(
+            collector.arm(reporter, 0xa1, actors, 100),
+            Err(Dw1cEvidenceError::MissingKernelFact)
         );
     }
 

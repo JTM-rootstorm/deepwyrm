@@ -1,0 +1,93 @@
+#!/bin/sh
+set -eu
+
+fail() {
+    printf 'accepted-primordial-stack-gate: %s\n' "$*" >&2
+    exit 2
+}
+
+config_value() {
+    config_path=$1
+    config_key=$2
+    awk -F ' = ' -v key="$config_key" '
+        $1 == key {
+            value = $2
+            sub(/^"/, "", value)
+            sub(/"$/, "", value)
+            print value
+            found = 1
+        }
+        END { if (!found) exit 1 }
+    ' "$config_path" || fail "$config_path omits $config_key"
+}
+
+[ "$#" -eq 0 ] || fail "this gate accepts no arguments"
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+workspace=$(CDPATH='' cd -- "$script_dir/.." && pwd -P)
+project_root=$(CDPATH='' cd -- "$workspace/.." && pwd -P)
+host_identity="$workspace/tooling/host-rust-toolchain.toml"
+accepted_identity="$workspace/tooling/rust-toolchain.toml"
+build_identity="$workspace/tooling/build-tools.toml"
+test_name=wyr1_primordial_selector_artifacts_fit_the_linked_boot_stack
+
+[ "$(stat -c %u /usr/bin/gtar)" -eq 0 ] || fail \
+    "execution context masks root ownership of pinned system tools; run this gate outside that sandbox"
+
+build_json=$(
+    "$script_dir/pinned-cargo" host test --locked -p deepwyrm-kernel \
+        --test x86_64_memory_target_artifact --no-run --message-format=json
+)
+test_binary=$(
+    printf '%s\n' "$build_json" | /usr/bin/python3 -c '
+import json
+import sys
+
+matches = []
+for line in sys.stdin:
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if (
+        record.get("reason") == "compiler-artifact"
+        and record.get("target", {}).get("name") == "x86_64_memory_target_artifact"
+        and record.get("executable")
+    ):
+        matches.append(record["executable"])
+matches = sorted(set(matches))
+if len(matches) != 1:
+    raise SystemExit(f"expected one accepted stack-gate executable, found {len(matches)}")
+print(matches[0])
+'
+)
+case "$test_binary" in
+    "$workspace"/.tmp/cargo-target/host-*/*) ;;
+    *) fail "compiled test executable escaped the pinned host target tree" ;;
+esac
+[ -f "$test_binary" ] && [ ! -L "$test_binary" ] && [ -x "$test_binary" ] || \
+    fail "compiled test executable is not an executable regular non-symlink file"
+
+artifact_root=$(config_value "$accepted_identity" artifact_root)
+toolchain_root=$(config_value "$accepted_identity" toolchain_root)
+accepted_root="$project_root/$artifact_root/$toolchain_root"
+accepted_request="$project_root/$(config_value "$accepted_identity" config)"
+accepted_cargo="$accepted_root/$(config_value "$accepted_identity" cargo_binary)"
+accepted_rustc="$accepted_root/$(config_value "$accepted_identity" rustc_binary)"
+accepted_rust_lld="$accepted_root/$(config_value "$accepted_identity" rust_lld_binary)"
+clang=$(config_value "$host_identity" clang_binary)
+llvm_dir=$(dirname -- "$clang")
+llvm_nm="$llvm_dir/$(basename -- "$(config_value "$build_identity" llvm_nm_binary)")"
+llvm_objdump="$llvm_dir/$(basename -- "$(config_value "$build_identity" llvm_objdump_binary)")"
+llvm_readelf="$llvm_dir/$(basename -- "$(config_value "$build_identity" llvm_readelf_binary)")"
+
+env -i PATH=/usr/bin:/bin \
+    DEEPWYRM_ACCEPTED_REQUEST="$accepted_request" \
+    DEEPWYRM_ACCEPTED_CARGO="$accepted_cargo" \
+    DEEPWYRM_ACCEPTED_RUSTC="$accepted_rustc" \
+    DEEPWYRM_ACCEPTED_RUST_LLD="$accepted_rust_lld" \
+    DEEPWYRM_CLANG="$clang" \
+    DEEPWYRM_LLVM_NM="$llvm_nm" \
+    DEEPWYRM_LLVM_OBJDUMP="$llvm_objdump" \
+    DEEPWYRM_LLVM_READELF="$llvm_readelf" \
+    "$test_binary" "$test_name" --ignored --exact --nocapture

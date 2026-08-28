@@ -474,6 +474,9 @@ returns to userspace. Its fixed ten-entry task-transition table records exact
 Process creation and first-Thread start keys/generations for later ARM
 correlation; it is not populated from controller claims. Overflow, a second
 Thread, or an actor created before collector installation fails the selector.
+`CPU_READY` is the sole pre-install relation: carrier admission retains it
+before the selector process exists, while actor, ARM, raw-operation, and
+workload facts cannot satisfy the collector before installation.
 
 ### 9.2 Raw operation and reporter authority
 
@@ -671,6 +674,22 @@ REAP before EXIT, duplicate terminal, text inserted inside the atomic stream,
 wrong `DWTEST1` ID/detail, and serial/QEMU result mismatch.
 
 ## 10. Required tests before selector admission
+
+### 10.1 Bootstrap stack budget
+
+Selector 28 raises Deepwyrm's private x86_64 bootstrap stack from 512 KiB to
+1 MiB. Thread kernel stacks remain 256 KiB. This is an internal bootstrap
+implementation budget, not a native ABI, boot ABI, or Wyrmroot platform ABI
+change.
+
+The first frozen C5 release artifact measured 493,816 bytes in the retained
+`kernel_main -> run_primordial -> primordial::enter` frame chain. The prior
+512 KiB allocation left 30,472 bytes, below the existing 4 KiB architectural
+headroom plus 32 KiB required spare. The 1 MiB allocation restores useful
+headroom without reducing selector capacities merely to preserve the earlier
+budget. Retained bootstrap-frame pressure remains explicit optimization debt.
+Selector 28 is included in the accepted-target primordial stack-margin gate so
+future capacity or compiler-layout growth fails before live acceptance.
 
 DW1-C implementation must add host/source/model coverage for:
 
