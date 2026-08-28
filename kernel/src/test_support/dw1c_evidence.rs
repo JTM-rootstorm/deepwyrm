@@ -1084,10 +1084,19 @@ impl Dw1cEvidenceCollector {
         if !actor_thread_known(&state, thread) {
             return Err(state.latch(Dw1cEvidenceError::WrongActor));
         }
-        if !actor_thread_bound(&state, thread, generation) {
+        let token = actor_token_for_claim(&state, thread, generation).or_else(|| {
+            let fixed_cpu_chain_complete = state
+                .run_payload
+                .get(usize::from(cpu))
+                .is_some_and(Option::is_some);
+            (generation != 0 && fixed_cpu_chain_complete)
+                .then(|| actor_token_for_thread(&state, thread))
+                .flatten()
+        });
+        let Some(token) = token else {
             return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
-        }
-        retain_cpu_payload(&mut state, cpu, thread, generation, value, kind)
+        };
+        retain_cpu_payload(&mut state, cpu, token, generation, value, kind)
     }
 
     pub(crate) fn progress(
@@ -1312,7 +1321,7 @@ fn observe_token6_wake(state: &mut State, token: u8) -> Result<bool, Dw1cEvidenc
 fn retain_cpu_payload(
     state: &mut State,
     cpu: u8,
-    thread: ThreadKey,
+    token: u8,
     execution_generation: u64,
     value: u64,
     kind: u8,
@@ -1322,13 +1331,6 @@ fn retain_cpu_payload(
     if kind > 2 || (kind == 0 && value != u64::from(cpu)) || (kind != 0 && value == 0) {
         return Err(state.latch(Dw1cEvidenceError::Malformed));
     }
-    let token = state
-        .actors
-        .iter()
-        .flatten()
-        .find(|actor| actor.thread == thread && actor.execution_generation == execution_generation)
-        .expect("bound actor retains its selector token")
-        .token;
     if kind == 0 {
         if token == 6 && !state.token6_wake_seen {
             return Err(state.latch(Dw1cEvidenceError::MissingKernelFact));
@@ -1540,6 +1542,14 @@ fn actor_token_for_claim(state: &State, thread: ThreadKey, generation: u64) -> O
         .iter()
         .flatten()
         .find(|actor| actor.thread == thread && actor.execution_generation == generation)
+        .map(|actor| actor.token)
+}
+fn actor_token_for_thread(state: &State, thread: ThreadKey) -> Option<u8> {
+    state
+        .actors
+        .iter()
+        .flatten()
+        .find(|actor| actor.thread == thread)
         .map(|actor| actor.token)
 }
 fn actor_thread_known(state: &State, thread: ThreadKey) -> bool {
@@ -2902,9 +2912,10 @@ mod tests {
     }
 
     #[test]
-    fn completed_cpu_accepts_later_quantum_preempt_surplus_without_an_observed_run() {
+    fn completed_cpu_accepts_later_generation_surplus_without_an_observed_run() {
         let (collector, actors) = armed_collector();
         complete_cpu_chain(&collector, 0, actors[0], 0x13, 0x103);
+        let later_execution_generation = actors[0].execution_generation + 0x100;
         let retained = {
             let state = collector.state.lock();
             (
@@ -2915,10 +2926,10 @@ mod tests {
         };
 
         collector
-            .observe_quantum_claim(0, actors[1].thread, actors[1].execution_generation, 0x14)
+            .observe_quantum_claim(0, actors[0].thread, later_execution_generation, 0x14)
             .unwrap();
         collector
-            .observe_preemption_claim(0, actors[1].thread, actors[1].execution_generation, 0x104)
+            .observe_preemption_claim(0, actors[0].thread, later_execution_generation, 0x104)
             .unwrap();
 
         let state = collector.state.lock();

@@ -625,8 +625,11 @@ for another CPU owns that CPU's fixed records; later distinct completed chains
 are valid surplus and cannot replace them. Once a CPU's fixed chain is
 complete, later scheduler-validated unique QUANTUM/PREEMPT callbacks may also
 advance and clear a non-serializing surplus candidate without another retained
-RUN callback; this exception never fills a missing fixed record. Before a CPU
-chain is complete, QUANTUM without RUN remains a hard missing fact. This
+RUN callback, including when a later dispatch has minted a newer execution
+generation for the same bound Thread. The newer generation is accepted only
+for an already-complete CPU slot and never replaces or fills a fixed record.
+Before a CPU chain is complete, every actor relation remains bound to the exact
+ARM generation and QUANTUM without RUN remains a hard missing fact. This
 selection preserves the host requirement that all four retained RUN identities
 are distinct.
 
