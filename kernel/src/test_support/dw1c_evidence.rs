@@ -804,16 +804,27 @@ impl Dw1cEvidenceCollector {
         {
             return Err(state.latch(Dw1cEvidenceError::Malformed));
         }
-        if state.facts.steal_migrate || state.steal_migrate_payload.is_some() {
-            return Err(state.latch(Dw1cEvidenceError::Duplicate));
-        }
         let token = actor_token_for_claim(&state, thread, execution_generation)
             .expect("bound migration retains its selector token");
-        state.steal_migrate_payload = Some(Dw1cRecordPayload {
+        let payload = Dw1cRecordPayload {
             subject: u64::from(token),
             generation: migration_generation,
             value: u64::from(target_cpu) | (u64::from(source_cpu) << 8),
-        });
+        };
+        match (state.facts.steal_migrate, state.steal_migrate_payload) {
+            (true, Some(existing)) => {
+                if existing == payload {
+                    return Err(state.latch(Dw1cEvidenceError::Duplicate));
+                }
+                if existing.generation == migration_generation {
+                    return Err(state.latch(Dw1cEvidenceError::Contradiction));
+                }
+                return Ok(());
+            }
+            (false, None) => {}
+            _ => return Err(state.latch(Dw1cEvidenceError::Contradiction)),
+        }
+        state.steal_migrate_payload = Some(payload);
         state.facts.steal_migrate = true;
         Ok(())
     }
@@ -2962,8 +2973,8 @@ mod tests {
         );
         assert_eq!(stale_migration.state.lock().steal_migrate_payload, None);
 
-        let (duplicate_migration, actors) = armed_collector();
-        duplicate_migration
+        let (surplus_migration, actors) = armed_collector();
+        surplus_migration
             .observe_steal_migration_claim(
                 1,
                 2,
@@ -2973,17 +2984,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            duplicate_migration.observe_steal_migration_claim(
+            surplus_migration.observe_steal_migration_claim(
                 2,
                 3,
                 actors[3].thread,
                 actors[3].execution_generation,
                 10,
             ),
-            Err(Dw1cEvidenceError::Duplicate)
+            Ok(())
         );
         assert_eq!(
-            duplicate_migration
+            surplus_migration
                 .state
                 .lock()
                 .steal_migrate_payload
@@ -2991,6 +3002,122 @@ mod tests {
                 .generation,
             9
         );
+        assert_eq!(surplus_migration.state.lock().failure, None);
+
+        let (duplicate_migration, actors) = armed_collector();
+        let actor = actors[2];
+        duplicate_migration
+            .observe_steal_migration_claim(1, 2, actor.thread, actor.execution_generation, 9)
+            .unwrap();
+        let retained = duplicate_migration
+            .state
+            .lock()
+            .steal_migrate_payload
+            .unwrap();
+        assert_eq!(
+            duplicate_migration.observe_steal_migration_claim(
+                1,
+                2,
+                actor.thread,
+                actor.execution_generation,
+                9,
+            ),
+            Err(Dw1cEvidenceError::Duplicate)
+        );
+        let state = duplicate_migration.state.lock();
+        assert_eq!(state.steal_migrate_payload, Some(retained));
+        assert_eq!(state.failure, Some(Dw1cEvidenceError::Duplicate));
+        drop(state);
+
+        let (reused_migration_generation, actors) = armed_collector();
+        reused_migration_generation
+            .observe_steal_migration_claim(
+                1,
+                2,
+                actors[2].thread,
+                actors[2].execution_generation,
+                9,
+            )
+            .unwrap();
+        let retained = reused_migration_generation
+            .state
+            .lock()
+            .steal_migrate_payload
+            .unwrap();
+        assert_eq!(
+            reused_migration_generation.observe_steal_migration_claim(
+                2,
+                3,
+                actors[3].thread,
+                actors[3].execution_generation,
+                9,
+            ),
+            Err(Dw1cEvidenceError::Contradiction)
+        );
+        let state = reused_migration_generation.state.lock();
+        assert_eq!(state.steal_migrate_payload, Some(retained));
+        assert_eq!(state.failure, Some(Dw1cEvidenceError::Contradiction));
+        drop(state);
+
+        let (occupied_stale_migration, actors) = armed_collector();
+        occupied_stale_migration
+            .observe_steal_migration_claim(
+                1,
+                2,
+                actors[2].thread,
+                actors[2].execution_generation,
+                9,
+            )
+            .unwrap();
+        let retained = occupied_stale_migration
+            .state
+            .lock()
+            .steal_migrate_payload
+            .unwrap();
+        assert_eq!(
+            occupied_stale_migration.observe_steal_migration_claim(
+                2,
+                3,
+                actors[3].thread,
+                actors[3].execution_generation + 1,
+                10,
+            ),
+            Err(Dw1cEvidenceError::WrongGeneration)
+        );
+        let state = occupied_stale_migration.state.lock();
+        assert_eq!(state.steal_migrate_payload, Some(retained));
+        assert_eq!(state.failure, Some(Dw1cEvidenceError::WrongGeneration));
+        drop(state);
+
+        let (occupied_malformed_migration, actors) = armed_collector();
+        occupied_malformed_migration
+            .observe_steal_migration_claim(
+                1,
+                2,
+                actors[2].thread,
+                actors[2].execution_generation,
+                9,
+            )
+            .unwrap();
+        let retained = occupied_malformed_migration
+            .state
+            .lock()
+            .steal_migrate_payload
+            .unwrap();
+        assert_eq!(
+            occupied_malformed_migration.observe_steal_migration_claim(
+                3,
+                3,
+                actors[3].thread,
+                actors[3].execution_generation,
+                10,
+            ),
+            Err(Dw1cEvidenceError::Malformed)
+        );
+        let state = occupied_malformed_migration.state.lock();
+        assert_eq!(state.steal_migrate_payload, Some(retained));
+        assert_eq!(state.failure, Some(Dw1cEvidenceError::Malformed));
+        drop(state);
 
         let (wrong_rejection, actors) = armed_collector();
         assert_eq!(

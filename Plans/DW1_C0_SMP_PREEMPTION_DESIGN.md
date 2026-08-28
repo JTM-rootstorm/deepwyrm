@@ -618,15 +618,17 @@ after every fact is joined. Original transition generations and ordering remain
 part of those relations. A distinct generation-valid wake to an already-filled
 target slot, or a local wake which is not a remote-wake record candidate, is one
 such additional transition: it cannot replace the retained payload or latch a
-selector failure. Token 6's independently required wait/wake join still advances
-when its valid wake does not own a target slot, including when that scheduler
-publication is local; its wait/wake/run and migration-rejection proof does not
-substitute for any of the four distinct remote-wake records. Exact replay of a
-retained relation remains a duplicate, while reuse of a retained scheduler wake
-generation for a different relation is contradictory. Any incomplete,
-exact-duplicate, stale, out-of-order, malformed, overflowed, or contradictory
-observation latches one selector failure and cannot be repaired by later
-activity.
+selector failure. A later distinct generation-valid idle-steal migration is
+likewise additional scheduler activity after the one fixed `STEAL_MIGRATE`
+relation has been retained. Token 6's independently required wait/wake join
+still advances when its valid wake does not own a target slot, including when
+that scheduler publication is local; its wait/wake/run and migration-rejection
+proof does not substitute for any of the four distinct remote-wake records.
+Exact replay of a retained wake or migration relation remains a duplicate,
+while reuse of its retained scheduler generation for a different relation is
+contradictory. Any incomplete, exact-duplicate, stale, out-of-order, malformed,
+overflowed, or contradictory observation latches one selector failure and
+cannot be repaired by later activity.
 
 The selector-private rejection codes are fixed for validation and diagnostics:
 `01 RUNNING`, `02 BLOCK_PREPARING`, `03 CONTINUATION_BOUND`,

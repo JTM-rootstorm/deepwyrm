@@ -2390,6 +2390,30 @@ fn dw1c3_idle_steal_is_cyclic_oldest_and_transactionally_accounted() {
     assert_eq!(source.current_runnable, 1);
     assert_eq!(target.current_runnable, 0);
     assert_eq!(scheduler.counters_on(cpu(2)).current_runnable, 1);
+
+    let second_dispatch = scheduler.schedule_next_on_with_migration(cpu(3)).unwrap();
+    assert_eq!(
+        second_dispatch.decision().current,
+        Some(same_victim_younger)
+    );
+    let second_migration = second_dispatch
+        .migration()
+        .expect("later idle dispatch carries a distinct exact steal");
+    assert_eq!(second_migration.thread, same_victim_younger);
+    assert_eq!(second_migration.source, cpu(1));
+    assert_eq!(second_migration.target, cpu(3));
+    assert_ne!(second_migration.generation, 0);
+    assert_ne!(second_migration.generation, migration.generation);
+    let source = scheduler.counters_on(cpu(1));
+    let second_target = scheduler.counters_on(cpu(3));
+    assert_eq!((source.steals_out, source.migrations_out), (2, 2));
+    assert_eq!(
+        (second_target.steals_in, second_target.migrations_in),
+        (1, 1)
+    );
+    assert_eq!(source.current_runnable, 0);
+    assert_eq!(second_target.current_runnable, 0);
+    assert_eq!(scheduler.counters_on(cpu(2)).current_runnable, 1);
     assert_eq!(scheduler.check_invariants(), Ok(()));
 }
 
