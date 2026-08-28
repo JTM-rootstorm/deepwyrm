@@ -690,13 +690,29 @@ After resolving the exact actor table, ARM returns the
 selector-private `WOULD_BLOCK` retry result until all eight actors are Blocked
 and their continuations have been released. The controller cannot send GO
 before ARM succeeds. If a blocked actor still owns a physically suspended
-continuation, the failed attempt stages one ordinary affine idle-wake for that
-exact carrier; because selector-private raw calls bypass ordinary native
-dispatch, the private-raw facade drains that staged notification only after
-runtime and scheduler authority have been released. This does not invent
-Runnable work or relax the released-continuation requirement. It makes an
-already-published unowned Runnable Thread visible to the quiescent carrier so a
-real switch can publish the actor continuation before the next bounded retry.
+continuation, the failed attempt publishes one exact selector-private detach
+request for that CPU, Thread, and execution generation, then stages one
+ordinary affine idle-wake for that carrier. Because selector-private raw calls
+bypass ordinary native dispatch, the private-raw facade drains that staged
+notification only after runtime and scheduler authority have been released.
+
+The target revalidates that it still physically executes the exact queued
+blocked continuation with no scheduler current, pending stop, root flight, or
+competing successor. It saves the Thread continuation, prepares the existing
+Process-to-kernel-root transaction, drops all coarse guards, and switches onto
+that CPU's guarded `ap_bootstrap` idle-carrier stack. Only the fixed
+destination entry may publish `complete_switch_on` and clear the detach
+request, after verifying the retained kernel root, CPU identity, stack bounds,
+and suspended generation. The Thread remains logically Blocked and becomes
+continuation-unowned. A later ordinary wake makes it Runnable and resumes the
+saved syscall continuation through the normal scheduler path.
+
+This transition does not invent Runnable work, treat e1 as ownership, or relax
+the released-continuation requirement. An ordinary real successor switch may
+still release the continuation first; in that race the exact detach request is
+stale and must be cancelled without affecting the newer state. A rescan that
+returns `ContinueIdle` while remaining on the blocked Thread's stack is not
+progress and cannot satisfy ARM.
 Every retry re-resolves and revalidates the handle table, topology, reporter,
 actor identities and generations, lifecycle, and scheduler state; a
 contradiction fails rather than being treated as transient. The successful
@@ -782,6 +798,14 @@ post-terminal running/requeue paths fail the selector.
 Generic yield, block, preemption, and quantum-cancellation paths cannot consume
 the held ticket. The scheduler never acquires the collector, so lock order
 remains runtime to scheduler and observer callbacks run after scheduler unlock.
+
+Selector-private readiness, ARM, and completion retries use absolute
+active-monotonic deadlines, not instruction/iteration counts. Every
+`WOULD_BLOCK` return crosses an ordinary syscall return boundary and the next
+attempt samples the active clock before retrying. The setup/ARM deadline is
+finite and distinct from the fresh 240-second ARM-to-completion deadline; error
+cleanup has its own finite deadline and preserves the primary failing stage.
+The host's frozen 300-second capture remains the outer diagnostic envelope.
 
 Token 6's required `EXECUTION_PINNED` rejection is one selector-private
 scheduler transaction with its real wake. Under the same scheduler ownership,

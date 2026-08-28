@@ -50,6 +50,21 @@ The physical continuation state used during blocking, remote stop, context
 switch, root handoff, and reaping refines this logical state; it does not create
 a second runnable or Running identity.
 
+A committed no-peer block may therefore pass through two physical substates
+without changing its logical `Blocked` state:
+
+```text
+Blocked + suspended on Thread stack
+    -> Blocked + detached on the CPU-private idle-carrier stack
+```
+
+The first state is transient.  Before that CPU may remain idle indefinitely,
+the carrier must save the exact Thread continuation, move through the retained
+CPU kernel root onto its CPU-private idle-carrier stack, and only then publish
+switch completion.  The detached state has no Running owner and does not make
+the blocked Thread Runnable.  An idle-wake IPI may request this rescan and
+handoff, but it never performs or proves the ownership transfer.
+
 The following remain hard invariants:
 
 1. one CPU owns zero or one Running claim;
@@ -65,6 +80,11 @@ The following remain hard invariants:
    state never migrate with a Thread; and
 9. task/execution pins are released exactly once, after the corresponding
    terminal or ownership transition makes execution impossible.
+
+For a no-peer detach, safe suspension means physical arrival on the exact
+CPU-private idle-carrier stack under the retained CPU kernel root.  Merely
+publishing `Blocked`, waking the CPU, rescanning the run queue, or observing
+that no peer is Runnable is not switch completion.
 
 An invariant failure in live kernel state means the scheduler substrate cannot
 be trusted. It is a fail-stop kernel error, not a recoverable userspace status.
@@ -283,6 +303,13 @@ No scheduler lock crosses steps 3 through 6.
   registration commits. Quantum expiry during preparation is deferred.
 - A committed block removes Running ownership once and transfers its exact wake
   token to the waiter. A simultaneous timer cannot requeue it.
+- A committed block with no selected Runnable successor must not idle forever
+  on the blocked Thread's stack.  It prepares one generation-bound detach,
+  drops scheduler/runtime/root guards, switches to the exact CPU-private
+  idle-carrier stack and kernel root, and publishes continuation release only
+  after destination arrival.  Failure or a competing stop before commit leaves
+  the original suspended claim intact; a stale detach cannot clear a later
+  claim.
 - Wake consumes one matching blocked generation and enqueues it once. A stale
   or competing wake is rejected and does not consume another waiter's budget.
 - Terminal retirement wins monotonically over wake, timer, steal, and migration
