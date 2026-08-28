@@ -1349,11 +1349,7 @@ fn bind_runtime_carrier_facades<
         let snapshot = registry
             .snapshot(cpu_index)
             .unwrap_or_else(|error| panic!("could not inspect CPU {cpu_index}: {error:?}"));
-        let expected = if cpu_index == 0 {
-            crate::arch::x86_64::smp::CpuLifecycle::Executing
-        } else {
-            crate::arch::x86_64::smp::CpuLifecycle::Parked
-        };
+        let expected = crate::arch::x86_64::smp::runtime_pre_admission_lifecycle(cpu_index);
         if snapshot.lifecycle != expected {
             panic!("CPU {cpu_index} had the wrong lifecycle before native carrier binding");
         }
@@ -1516,7 +1512,7 @@ fn normalize_bootstrap_carrier<const RANGE_CAPACITY: usize, const ROLE_CAPACITY:
         carrier_resource_tuple(
             &runtime,
             facade.cpu,
-            crate::arch::x86_64::smp::CpuLifecycle::Executing,
+            crate::arch::x86_64::smp::runtime_pre_admission_lifecycle(facade.cpu.index()),
             crate::arch::x86_64::syscall::RuntimeCarrierLifecycle::Executing,
             true,
         )

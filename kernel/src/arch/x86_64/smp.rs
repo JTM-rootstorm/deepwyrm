@@ -58,6 +58,17 @@ impl CpuLifecycle {
     }
 }
 
+/// Returns the CPU-registry state required before the native scheduler binds
+/// its runtime carrier. CPU0 is already executing the primordial carrier and
+/// therefore remains Online; only application processors wait Parked.
+pub(crate) const fn runtime_pre_admission_lifecycle(cpu_index: usize) -> CpuLifecycle {
+    if cpu_index == 0 {
+        CpuLifecycle::Online
+    } else {
+        CpuLifecycle::Parked
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct CpuSlotState {
     lifecycle: AtomicU8,
@@ -724,6 +735,17 @@ mod tests {
     extern crate std;
 
     use super::*;
+
+    #[test]
+    fn runtime_pre_admission_keeps_bsp_online_and_aps_parked() {
+        assert_eq!(runtime_pre_admission_lifecycle(0), CpuLifecycle::Online);
+        for cpu_index in 1..H1_RUNTIME_CPU_CAPACITY {
+            assert_eq!(
+                runtime_pre_admission_lifecycle(cpu_index),
+                CpuLifecycle::Parked
+            );
+        }
+    }
 
     #[test]
     fn lifecycle_publication_is_monotonic_and_generation_bound() {
