@@ -3212,12 +3212,10 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             entry.continuation_cpu = None;
             entry.continuation_generation = 0;
             entry.migration_eligibility_generation = eligibility_generation;
-            let publication =
-                (entry.state == SchedulerThreadState::Runnable).then_some(RunnablePublication {
-                    target: entry.target_cpu,
-                    continuation_bound: false,
-                });
-            publication
+            (entry.state == SchedulerThreadState::Runnable).then_some(RunnablePublication {
+                target: entry.target_cpu,
+                continuation_bound: false,
+            })
         } else {
             None
         };
