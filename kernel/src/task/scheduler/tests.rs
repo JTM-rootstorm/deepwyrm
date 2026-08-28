@@ -1194,11 +1194,20 @@ fn completed_switch_makes_outgoing_continuation_claimable_by_an_idle_cpu() {
     // Models the post-assembly Release edge. The CPU-1 claim acquires the same
     // scheduler lock before it can observe the continuation as eligible.
     scheduler.complete_switch_on(outgoing_claim).unwrap();
-    assert_eq!(
-        scheduler.schedule_next_on(cpu(1)).unwrap().current,
-        Some(outgoing)
-    );
+    let dispatch = scheduler.schedule_next_on_with_migration(cpu(1)).unwrap();
+    assert_eq!(dispatch.decision().current, Some(outgoing));
+    let migration = dispatch.migration().unwrap();
+    assert_eq!(migration.thread, outgoing);
+    assert_eq!(migration.execution_generation, 0);
+    assert_eq!(migration.source, cpu(0));
+    assert_eq!(migration.target, cpu(1));
+    assert_ne!(migration.generation, 0);
+    assert_ne!(migration.enqueue_generation, 0);
     assert_eq!(scheduler.running_cpu(outgoing), Some(cpu(1)));
+    let migrated_claim = scheduler.running_claim_on(cpu(1)).unwrap();
+    assert_eq!(migrated_claim.thread(), outgoing);
+    assert_ne!(migrated_claim.generation(), 0);
+    assert_ne!(migrated_claim.generation(), outgoing_claim.generation());
     assert_eq!(scheduler.check_invariants(), Ok(()));
 }
 

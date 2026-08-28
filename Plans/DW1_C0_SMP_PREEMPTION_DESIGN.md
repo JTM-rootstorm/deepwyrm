@@ -606,13 +606,15 @@ by canonical `DWTEST1` test ID 28/detail zero:
 | 38..39 | `0B EXIT` | 2 | Actor token order 9..10; generation matches the terminal Thread generation; value is normal exit code zero. |
 | 40..41 | `0C REAP` | 2 | Actor token order 9..10; generation matches the reaped Process generation privately joined at bind/exit; value is exact reap count one. |
 | 42 | `0D READY_DELAY` | 1 | Subject is a nonzero scheduler snapshot token; generation is its nonzero snapshot generation; value is maximum ready-to-run delay in ns. |
-| 43 | `0E BOOTSTRAP_NORMAL` | 1 | Subject is the primordial completion token; generation is the exact product execution generation; value is zero only at genuine normal bootstrap completion. |
+| 43 | `0E BOOTSTRAP_NORMAL` | 1 | Subject is the primordial completion token; generation is the exact terminal product execution generation sampled from its deferred current claim; value is zero only at genuine normal bootstrap completion. |
 | 44 | `0F ACCOUNTING_SOUND` | 1 | Subject is the scheduler snapshot token; generation matches record 42; value is exact fact mask `0x3f` for no overflow, no underflow/regression, no duplicate Running, no Running-plus-queued, no duplicate queue entry, and no terminal runnable identity. |
 | 45 | `FF TERMINAL` | 1 | Subject, generation, and value are all zero. It atomically claims terminal authority only after every prior relation succeeds. |
 
 The kernel may observe additional diagnostic transitions internally, but it
 retains only one exact relation needed for each fixed record. The table is the
-terminal serialization order, not permission to infer a later fact early. For
+terminal serialization order, not a chronological scheduler trace and not
+permission to infer a later fact early. Actor Process and Thread identities are
+each unique in the ARM table; a Thread cannot name two actor tokens. For
 each CPU, the collector first buffers a bounded RUN candidate, advances it with
 an exact same-identity QUANTUM, and commits all three fixed RUN/QUANTUM/PREEMPT
 records atomically only after the matching involuntary switch completes. A
@@ -628,6 +630,13 @@ advance and clear a non-serializing surplus candidate without another retained
 RUN callback, including when a later dispatch has minted a newer execution
 generation for the same bound Thread. The newer generation is accepted only
 for an already-complete CPU slot and never replaces or fills a fixed record.
+RUN has no separate dispatch-event generation with which the collector could
+distinguish callback replay from a valid continuation resume, so an exact RUN
+re-observation is idempotent: it may retain or resume only the same bounded
+candidate and cannot by itself fill a fixed record. Unique quantum-arm and
+completed-switch generations remain replay-checked. A later unbound token-8
+CPU chain may be consumed as surplus for an already-complete CPU slot but
+cannot create or replace token 8's independent terminal-expiry candidate.
 Before a CPU chain is complete, every actor relation remains bound to the exact
 ARM generation and QUANTUM without RUN remains a hard missing fact. This
 selection preserves the host requirement that all four retained RUN identities
@@ -635,20 +644,48 @@ are distinct.
 
 The collector serializes the 46 records only after every fact is joined.
 Original transition generations and ordering remain part of those relations.
-A distinct generation-valid wake to an already-filled
-target slot, or a local wake which is not a remote-wake record candidate, is one
-such additional transition: it cannot replace the retained payload or latch a
-selector failure. A later distinct generation-valid idle-steal migration is
+A distinct scheduler-originated wake carrying either the exact bound execution
+generation or a nonzero later continuation generation to an already-filled
+target slot, or a local wake which is not a remote-wake record candidate, is
+one such additional transition: it cannot replace the retained payload or
+latch a selector failure. A later distinct committed idle-steal migration is
 likewise additional scheduler activity after the one fixed `STEAL_MIGRATE`
-relation has been retained. Token 6's independently required wait/wake join
+relation has been retained. The scheduler's committed migration identity is
+the bound Thread, distinct source/target CPUs, and nonzero migration generation;
+a migrated continuation may legitimately carry execution generation zero
+before its destination dispatch mints the next execution claim. The first
+retained steal still requires the exact ARM-bound execution identity, while a
+distinct later committed migration generation is non-serializing surplus even
+when that auxiliary execution field is zero or newer. Token 6's independently
+required wait/wake join
 still advances when its valid wake does not own a target slot, including when
 that scheduler publication is local; its wait/wake/run and migration-rejection
 proof does not substitute for any of the four distinct remote-wake records.
+After that one wake/rejection join is selected, a distinct later token-6 wake
+or execution-pinned rejection is valid scheduler surplus and cannot retrigger
+the selector's synthetic rejection probe or replace record 36. Exact selected
+wake or rejection identity replay remains a failure.
 Exact replay of a retained wake or migration relation remains a duplicate,
 while reuse of its retained scheduler generation for a different relation is
 contradictory. Any terminally incomplete transcript, exact duplicate, stale,
 out-of-order, malformed, overflowed, or contradictory observation latches one
-selector failure and cannot be repaired by later activity.
+selector failure and cannot be repaired by later activity. Once failure is
+latched or the normal terminal permit seals the immutable certificate, all
+observer callbacks stop admitting further observations; activity racing with
+the serial flush cannot mutate or invalidate the selected 46 records.
+
+Token 7's full-send observation binds the selector-owned Channel flight to its
+fixed actor identity. The later block binds the authoritative nonzero execution
+generation carried by that registered wait, which may be newer than ARM after
+ordinary preemption. Its peer-drain wake and resumed RUN must match that same
+block generation. A newer-generation RUN advances only this private race join;
+it cannot fill or replace a fixed per-CPU RUN record that requires the ARM
+generation. Likewise, lifecycle EXIT records retain the exact nonzero terminal
+Thread generation sampled from the committed exit rather than requiring the
+earlier ARM generation. `BOOTSTRAP_NORMAL` retains the exact terminal product
+generation from the primordial deferred-current claim; ARM's live product
+generation authenticates ARM itself but is not assumed to survive intervening
+blocking or preemption.
 
 Token 8's terminal-versus-expiry join is independent of the one fixed
 per-CPU transcript chain. Publishing an expiry consumes the physical timer
@@ -685,14 +722,15 @@ PASS requires the complete fixed transcript and all of these joins:
   become Runnable from the matching wake source, and run while at least one of
   tokens 1..5 makes separately bound progress;
 - bit 1 only after the kernel observes token 7 block on a full selector-owned
-  Channel, the peer drain that creates capacity, its matching wake, and a later
-  Running claim;
+  Channel, the peer drain that creates capacity, its matching block-generation
+  wake, and a later Running claim for that same generation;
 - bit 2 only after the kernel joins token 8's exact quantum expiry with the
   competing terminal transition, proves a single terminal winner, and observes
   no requeue or Running claim for that generation afterward;
 - bit 3 only after ARM correlates tokens 9 and 10 to two distinct
   kernel-observed CREATE and START transitions and the kernel then observes each
-  exact Process/Thread generation exit and reap once. EXIT observations advance
+  exact Process/Thread identity, terminal Thread generation, and reap once.
+  EXIT observations advance
   in token order, REAP observations independently advance in token order, and
   each actor's EXIT must precede its REAP; token 9 may therefore reap before
   token 10 exits without changing fixed serialization;
