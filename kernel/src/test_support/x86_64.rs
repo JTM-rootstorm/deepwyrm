@@ -103,7 +103,8 @@ struct QemuCompletionTransport {
         deepwyrm_wrcap_relay,
         deepwyrm_wyr1_evidence,
         deepwyrm_dw1b_evidence,
-        deepwyrm_wyr1b_evidence
+        deepwyrm_wyr1b_evidence,
+        deepwyrm_dw1c_evidence
     ))]
     transaction: Option<TestSerialTransaction>,
 }
@@ -129,7 +130,8 @@ impl QemuCompletionTransport {
                 deepwyrm_wrcap_relay,
                 deepwyrm_wyr1_evidence,
                 deepwyrm_dw1b_evidence,
-                deepwyrm_wyr1b_evidence
+                deepwyrm_wyr1b_evidence,
+                deepwyrm_dw1c_evidence
             ))]
             transaction: None,
         }
@@ -148,7 +150,8 @@ impl CompletionTransport for QemuCompletionTransport {
             deepwyrm_wrcap_relay,
             deepwyrm_wyr1_evidence,
             deepwyrm_dw1b_evidence,
-            deepwyrm_wyr1b_evidence
+            deepwyrm_wyr1b_evidence,
+            deepwyrm_dw1c_evidence
         ))]
         if let Some(transaction) = self.transaction.as_mut() {
             return transaction

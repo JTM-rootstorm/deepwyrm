@@ -77,8 +77,8 @@ pub(crate) use wyr1b_evidence::WYR1B_EVIDENCE_RAW_SYSCALL;
     reason = "selector-28 target-only raw dispatch and terminal transport consume this private surface"
 )]
 pub(crate) use dw1c_evidence::{
-    DW1C_ARM_BYTES, DW1C_EVIDENCE, DW1C_PROGRESS_MASK, Dw1cActor, Dw1cEvidenceError,
-    Dw1cEvidenceFlushPermit,
+    DW1C_ARM_BYTES, DW1C_ARM_TIMEOUT_SECONDS, DW1C_EVIDENCE, DW1C_PROGRESS_MASK, Dw1cActor,
+    Dw1cEvidenceError, Dw1cEvidenceFlushPermit, decode_arm_entries as decode_dw1c_arm_entries,
 };
 
 #[cfg(all(deepwyrm_dw1b_evidence, target_arch = "x86_64", target_os = "none"))]

@@ -18,6 +18,8 @@ use deepwyrm_abi::DW_SIGNAL_WRITABLE;
 pub(crate) const DW1C_EVIDENCE_RAW_SYSCALL: u32 = 0xffff_ff1c;
 pub(crate) const DW1C_EVIDENCE_RECORD_LEN: usize = 96;
 pub(crate) const DW1C_EVIDENCE_RECORD_CAPACITY: usize = 46;
+#[cfg(test)]
+const EMPTY: [u8; DW1C_EVIDENCE_RECORD_LEN] = [0; DW1C_EVIDENCE_RECORD_LEN];
 pub(crate) const DW1C_ACTOR_COUNT: usize = 10;
 pub(crate) const DW1C_ARM_BYTES: usize = DW1C_ACTOR_COUNT * 24;
 pub(crate) const DW1C_ARM_TIMEOUT_SECONDS: u64 = 240;
@@ -34,7 +36,6 @@ pub(crate) const DW1C_MIGRATION_REJECT_EXECUTION_PINNED: u8 = 0x04;
 const DW1C_WAKE_GENERATION_MAX: u64 = 0x0000_ffff_ffff_ffff;
 const DW1C_LIFECYCLE_ACTOR_FIRST: usize = 8;
 const TERMINAL_EVENT: u8 = 0xff;
-const EMPTY: [u8; DW1C_EVIDENCE_RECORD_LEN] = [0; DW1C_EVIDENCE_RECORD_LEN];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Dw1cEvidenceError {
@@ -535,43 +536,11 @@ impl Dw1cEvidenceCollector {
         Ok(())
     }
 
-    /// Hooks are supplied by the kernel scheduler, never by raw userspace data.
-    pub(crate) fn observe_kernel_facts(
-        &self,
-        facts: Dw1cKernelFacts,
-    ) -> Result<(), Dw1cEvidenceError> {
-        let mut state = self.state.lock();
-        if !state.installed || state.reporter.is_none() || state.terminal {
-            return Err(state.latch(Dw1cEvidenceError::Early));
-        }
-        if state.facts.cpu_ready & !facts.cpu_ready != 0
-            || state.facts.run & !facts.run != 0
-            || state.facts.quantum & !facts.quantum != 0
-            || state.facts.preempt & !facts.preempt != 0
-            || state.facts.remote_wake & !facts.remote_wake != 0
-            || state.facts.race_matrix & !facts.race_matrix != 0
-        {
-            return Err(state.latch(Dw1cEvidenceError::Contradiction));
-        }
-        state.facts = facts;
-        Ok(())
-    }
-
     /// Concrete scheduler commit-point callbacks.  They accept only a bound
     /// `(ProcessKey, ThreadKey, execution_generation)` tuple and latch on an
     /// unbound/stale subject or a repeated per-CPU fact.  The scheduler keeps
     /// its lock; this collector takes its own bounded lock only after the
     /// scheduler transition has committed.
-    pub(crate) fn observe_running(
-        &self,
-        cpu: u8,
-        process: ProcessKey,
-        thread: ThreadKey,
-        generation: u64,
-    ) -> Result<(), Dw1cEvidenceError> {
-        self.observe_cpu_actor(cpu, process, thread, generation, u64::from(cpu), 0)
-    }
-
     /// Scheduler-facing variant: a scheduler owns only the exact Thread and
     /// execution claim.  The collector resolves that tuple against its ARM
     /// table, preserving Process ownership inside the test-private boundary.
@@ -719,17 +688,6 @@ impl Dw1cEvidenceCollector {
         Ok(())
     }
 
-    pub(crate) fn observe_quantum_expiry(
-        &self,
-        cpu: u8,
-        process: ProcessKey,
-        thread: ThreadKey,
-        generation: u64,
-        source_arm_generation: u64,
-    ) -> Result<(), Dw1cEvidenceError> {
-        self.observe_cpu_actor(cpu, process, thread, generation, source_arm_generation, 1)
-    }
-
     pub(crate) fn observe_quantum_claim(
         &self,
         cpu: u8,
@@ -738,24 +696,6 @@ impl Dw1cEvidenceCollector {
         source_arm_generation: u64,
     ) -> Result<(), Dw1cEvidenceError> {
         self.observe_cpu_claim(cpu, thread, generation, source_arm_generation, 1)
-    }
-
-    pub(crate) fn observe_preemption(
-        &self,
-        cpu: u8,
-        process: ProcessKey,
-        thread: ThreadKey,
-        generation: u64,
-        completed_switch_generation: u64,
-    ) -> Result<(), Dw1cEvidenceError> {
-        self.observe_cpu_actor(
-            cpu,
-            process,
-            thread,
-            generation,
-            completed_switch_generation,
-            2,
-        )
     }
 
     pub(crate) fn observe_preemption_claim(
@@ -1052,16 +992,6 @@ impl Dw1cEvidenceCollector {
         Ok(())
     }
 
-    pub(crate) fn observe_cpu_ready(&self, cpu: u8) -> Result<(), Dw1cEvidenceError> {
-        let mut state = self.state.lock();
-        let bit = cpu_bit(cpu).ok_or_else(|| state.latch(Dw1cEvidenceError::Malformed))?;
-        if !state.installed || state.facts.cpu_ready & bit != 0 {
-            return Err(state.latch(Dw1cEvidenceError::Duplicate));
-        }
-        state.facts.cpu_ready |= bit;
-        Ok(())
-    }
-
     pub(crate) fn observe_cpu_ready_payload(
         &self,
         cpu: u8,
@@ -1087,22 +1017,6 @@ impl Dw1cEvidenceCollector {
         });
         state.facts.cpu_ready |= bit;
         Ok(())
-    }
-
-    fn observe_cpu_actor(
-        &self,
-        cpu: u8,
-        process: ProcessKey,
-        thread: ThreadKey,
-        generation: u64,
-        value: u64,
-        kind: u8,
-    ) -> Result<(), Dw1cEvidenceError> {
-        let mut state = self.state.lock();
-        if !state.installed || !actor_bound(&state, process, thread, generation) {
-            return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
-        }
-        retain_cpu_payload(&mut state, cpu, thread, generation, value, kind)
     }
 
     fn observe_cpu_claim(
@@ -1459,14 +1373,6 @@ fn update_race_bit_one(state: &mut State) {
     }
 }
 
-fn actor_bound(state: &State, process: ProcessKey, thread: ThreadKey, generation: u64) -> bool {
-    generation != 0
-        && state.actors.iter().flatten().any(|actor| {
-            actor.process == process
-                && actor.thread == thread
-                && actor.execution_generation == generation
-        })
-}
 fn actor_thread_bound(state: &State, thread: ThreadKey, generation: u64) -> bool {
     actor_token_for_claim(state, thread, generation).is_some()
 }

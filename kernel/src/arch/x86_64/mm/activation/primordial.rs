@@ -45,7 +45,8 @@ use crate::syscall::{
 #[cfg(any(
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
-    deepwyrm_wyr1b_evidence
+    deepwyrm_wyr1b_evidence,
+    deepwyrm_dw1c_evidence
 ))]
 use crate::task::ProcessLifecycleState;
 use crate::task::{ExecutionDomain, ProcessKey, SchedulerThreadState, TaskAuthority, ThreadKey};
@@ -344,7 +345,11 @@ const PRIMORDIAL_INVALIDATIONS: usize = PRIMORDIAL_MAX_MAPPING_PAGES;
 // same bounded carrier set; a capacity drift is a compile-time error.
 const _: [(); crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] = [(); crate::cpu::CPU_CAPACITY];
 const _: [(); PROCESSES] = [(); THREADS];
-#[cfg(all(not(deepwyrm_i2_stress), not(deepwyrm_wyr1b_evidence)))]
+#[cfg(all(
+    not(deepwyrm_i2_stress),
+    not(deepwyrm_wyr1b_evidence),
+    not(deepwyrm_dw1c_evidence)
+))]
 const _: [(); PROCESSES] = [(); CHANNEL_PAIRS];
 const _: [(); PROCESSES] = [(); SPACES];
 const _: [(); PROCESSES] = [(); REGIONS];
@@ -355,7 +360,8 @@ const _: [(); PROCESSES] = [(); EXECUTION_THREADS];
     deepwyrm_wrcap_relay,
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
-    deepwyrm_wyr1b_evidence
+    deepwyrm_wyr1b_evidence,
+    deepwyrm_dw1c_evidence
 )))]
 const _: [(); 10] = [(); HANDLES];
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
@@ -402,6 +408,18 @@ const _: [(); 28] = [(); MEMORY_OBJECTS];
 const _: [(); 28] = [(); MEMORY_LEASES];
 #[cfg(deepwyrm_wyr1b_evidence)]
 const _: [(); 160] = [(); REGISTRY_OBJECTS];
+#[cfg(deepwyrm_dw1c_evidence)]
+const _: [(); 12] = [(); USERSPACE_CHAIN_PROCESSES];
+#[cfg(deepwyrm_dw1c_evidence)]
+const _: [(); 32] = [(); CHANNEL_PAIRS];
+#[cfg(deepwyrm_dw1c_evidence)]
+const _: [(); 64] = [(); HANDLES];
+#[cfg(deepwyrm_dw1c_evidence)]
+const _: [(); 40] = [(); MEMORY_OBJECTS];
+#[cfg(deepwyrm_dw1c_evidence)]
+const _: [(); 40] = [(); MEMORY_LEASES];
+#[cfg(deepwyrm_dw1c_evidence)]
+const _: [(); 256] = [(); REGISTRY_OBJECTS];
 const _: [(); 7] = [(); BOOTSTRAP_HANDLE_PEAK - INIT_MOVED_HANDLES];
 
 #[cfg(deepwyrm_dw1b_evidence)]
@@ -512,6 +530,7 @@ impl G5PrimordialProbe {
             BuildGuestTest::NativeUserspaceCapability => G5PrimordialExpectation::Baseline,
             BuildGuestTest::PermanentSupervisorRrc => G5PrimordialExpectation::Baseline,
             BuildGuestTest::NormalPreemptionUp => G5PrimordialExpectation::Baseline,
+            BuildGuestTest::NormalPreemptionSmp => G5PrimordialExpectation::Baseline,
             BuildGuestTest::BootstrapRegistryLaunch => G5PrimordialExpectation::Baseline,
             BuildGuestTest::PrimordialBlockingCleanup => G5PrimordialExpectation::BlockingCleanup,
             BuildGuestTest::PrimordialUserException => G5PrimordialExpectation::UserException,
@@ -5491,15 +5510,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 
     #[cfg(deepwyrm_dw1c_evidence)]
-    fn dw1c_controller_authorized(&self) -> bool {
-        self.evidence_init_process == Some(self.process)
-            && self.shared.execution.current_thread_on(self.cpu) == Some(self.thread)
-            && self.tasks.thread_process(self.thread) == Ok(self.process)
-            && self.shared.execution.scheduler_state(self.thread)
-                == Some(SchedulerThreadState::Running)
-    }
-
-    #[cfg(deepwyrm_dw1c_evidence)]
     fn intercept_dw1c_evidence_raw(
         &mut self,
         arguments: crate::syscall::RawSyscallArguments,
@@ -5551,7 +5561,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                     .filter(|claim| claim.thread() == self.thread)
                     .map(|claim| claim.generation())
                     .unwrap_or_else(|| crate::test_support::complete_fail(0x2810_e019));
-                let entries = crate::test_support::dw1c_evidence::decode_arm_entries(&bytes)
+                let entries = crate::test_support::decode_dw1c_arm_entries(&bytes)
                     .unwrap_or_else(|_| crate::test_support::complete_fail(0x2810_e004));
                 let handles = self
                     .tasks
@@ -5834,6 +5844,8 @@ const fn evidence_process_create_detail(case: u32) -> u32 {
     return 0x2610_c000 | case;
     #[cfg(deepwyrm_wyr1b_evidence)]
     return 0x2710_c000 | case;
+    #[cfg(deepwyrm_dw1c_evidence)]
+    return 0x2810_c000 | case;
 }
 
 #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
@@ -6541,7 +6553,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             }
 
             let scheduled = {
-                let mut runtime = self.runtime.lock();
+                let runtime = self.runtime.lock();
                 runtime
                     .shared
                     .execution
@@ -7022,7 +7034,8 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         #[cfg(any(
             deepwyrm_wyr1_evidence,
             deepwyrm_dw1b_evidence,
-            deepwyrm_wyr1b_evidence
+            deepwyrm_wyr1b_evidence,
+            deepwyrm_dw1c_evidence
         ))]
         evidence_init_process: None,
         #[cfg(deepwyrm_wyr1b_evidence)]
@@ -7318,6 +7331,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
+    #[cfg(deepwyrm_dw1c_evidence)]
+    fn dw1c_controller_authorized(&self) -> bool {
+        self.evidence_init_process == Some(self.process)
+            && self.shared.execution.current_thread_on(self.cpu) == Some(self.thread)
+            && self.tasks.thread_process(self.thread) == Ok(self.process)
+            && self.shared.execution.scheduler_state(self.thread)
+                == Some(SchedulerThreadState::Running)
+    }
+
     fn handle_fallthrough(&mut self, request: NativeSyscallRequest) -> NativeSyscallResult {
         self.assert_guard_free_external_work();
         match request {
