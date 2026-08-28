@@ -728,38 +728,54 @@ impl Dw1cEvidenceCollector {
         if !actor_thread_bound(&state, thread, generation) {
             return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
         }
-        if source_cpu == target_cpu
-            || cpu_bit(source_cpu).is_none()
+        if cpu_bit(source_cpu).is_none()
             || wake_generation == 0
             || wake_generation > DW1C_WAKE_GENERATION_MAX
         {
             return Err(state.latch(Dw1cEvidenceError::Malformed));
         }
-        let index = usize::from(target_cpu);
-        if state.facts.remote_wake & bit != 0 || state.remote_wake_payload[index].is_some() {
-            return Err(state.latch(Dw1cEvidenceError::Duplicate));
-        }
         let token = actor_token_for_claim(&state, thread, generation)
             .expect("bound remote wake retains its selector token");
-        if token == 6 && (!state.token6_wait_joined || state.token6_wake_seen) {
-            let error = if state.token6_wake_seen {
-                Dw1cEvidenceError::Duplicate
-            } else {
-                Dw1cEvidenceError::MissingKernelFact
-            };
-            return Err(state.latch(error));
+        // The scheduler may publish many independent actor wakes to the same
+        // CPU, and a requester may wake an actor locally.  Those are valid
+        // scheduler transitions, while the fixed transcript retains only the
+        // first distinct remote relation for each target CPU.  Token 6's race
+        // join remains independent of whether its wake owns that record slot.
+        if source_cpu == target_cpu {
+            return observe_token6_wake(&mut state, token)
+                .map(|observed| observed.then_some(token));
         }
+        let index = usize::from(target_cpu);
         let value = u64::from(target_cpu) | (u64::from(source_cpu) << 8) | (wake_generation << 16);
-        state.remote_wake_payload[index] = Some(Dw1cRecordPayload {
+        let payload = Dw1cRecordPayload {
             subject: u64::from(token),
             generation,
             value,
-        });
-        state.facts.remote_wake |= bit;
-        if token == 6 {
-            state.token6_wake_seen = true;
-            update_race_bit_zero(&mut state);
+        };
+        if let Some(existing) = state
+            .remote_wake_payload
+            .iter()
+            .flatten()
+            .find(|existing| existing.value >> 16 == wake_generation)
+        {
+            let error = if *existing == payload {
+                Dw1cEvidenceError::Duplicate
+            } else {
+                Dw1cEvidenceError::Contradiction
+            };
+            return Err(state.latch(error));
         }
+        let token6_observed = observe_token6_wake(&mut state, token)?;
+        match (
+            state.facts.remote_wake & bit != 0,
+            state.remote_wake_payload[index],
+        ) {
+            (true, Some(_)) => return Ok(token6_observed.then_some(token)),
+            (false, None) => {}
+            _ => return Err(state.latch(Dw1cEvidenceError::Contradiction)),
+        }
+        state.remote_wake_payload[index] = Some(payload);
+        state.facts.remote_wake |= bit;
         Ok(Some(token))
     }
 
@@ -1237,6 +1253,23 @@ impl Dw1cEvidenceCollector {
 
 fn cpu_bit(cpu: u8) -> Option<u8> {
     (cpu < 4).then(|| 1_u8 << cpu)
+}
+
+fn observe_token6_wake(state: &mut State, token: u8) -> Result<bool, Dw1cEvidenceError> {
+    if token != 6 {
+        return Ok(false);
+    }
+    if !state.token6_wait_joined || state.token6_wake_seen {
+        let error = if state.token6_wake_seen {
+            Dw1cEvidenceError::Duplicate
+        } else {
+            Dw1cEvidenceError::MissingKernelFact
+        };
+        return Err(state.latch(error));
+    }
+    state.token6_wake_seen = true;
+    update_race_bit_zero(state);
+    Ok(true)
 }
 
 fn retain_cpu_payload(
@@ -2732,7 +2765,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_duplicate_and_overflowed_migration_relations_do_not_replace_payloads() {
+    fn stale_surplus_and_overflowed_migration_relations_do_not_replace_payloads() {
         let (stale, actors) = armed_collector();
         assert_eq!(
             stale.observe_remote_wake_claim(
@@ -2759,24 +2792,161 @@ mod tests {
         );
         assert_eq!(overflow.state.lock().remote_wake_payload[1], None);
 
-        let (duplicate, actors) = armed_collector();
+        let (surplus, actors) = armed_collector();
         let actor = actors[0];
-        duplicate
+        surplus
             .observe_remote_wake_claim(0, 1, actor.thread, actor.execution_generation, 7)
             .unwrap();
         assert_eq!(
-            duplicate.observe_remote_wake_claim(
+            surplus.observe_remote_wake_claim(
                 2,
                 1,
                 actors[1].thread,
                 actors[1].execution_generation,
                 8,
             ),
+            Ok(None)
+        );
+        assert_eq!(
+            surplus.observe_remote_wake_claim(
+                1,
+                1,
+                actors[2].thread,
+                actors[2].execution_generation,
+                9,
+            ),
+            Ok(None)
+        );
+        let state = surplus.state.lock();
+        assert_eq!(state.remote_wake_payload[1].unwrap().value, 1 | (7 << 16));
+        assert_eq!(state.failure, None);
+        drop(state);
+
+        let (occupied_stale, actors) = armed_collector();
+        let first = actors[0];
+        occupied_stale
+            .observe_remote_wake_claim(0, 1, first.thread, first.execution_generation, 7)
+            .unwrap();
+        assert_eq!(
+            occupied_stale.observe_remote_wake_claim(
+                2,
+                1,
+                actors[1].thread,
+                actors[1].execution_generation + 1,
+                8,
+            ),
+            Err(Dw1cEvidenceError::WrongGeneration)
+        );
+        let state = occupied_stale.state.lock();
+        assert_eq!(state.remote_wake_payload[1].unwrap().subject, 1);
+        assert_eq!(state.failure, Some(Dw1cEvidenceError::WrongGeneration));
+        drop(state);
+
+        let (occupied_malformed, actors) = armed_collector();
+        let first = actors[0];
+        occupied_malformed
+            .observe_remote_wake_claim(0, 1, first.thread, first.execution_generation, 7)
+            .unwrap();
+        assert_eq!(
+            occupied_malformed.observe_remote_wake_claim(
+                4,
+                1,
+                actors[1].thread,
+                actors[1].execution_generation,
+                8,
+            ),
+            Err(Dw1cEvidenceError::Malformed)
+        );
+        let state = occupied_malformed.state.lock();
+        assert_eq!(state.remote_wake_payload[1].unwrap().subject, 1);
+        assert_eq!(state.failure, Some(Dw1cEvidenceError::Malformed));
+        drop(state);
+
+        let (reused_generation, actors) = armed_collector();
+        let first = actors[0];
+        reused_generation
+            .observe_remote_wake_claim(0, 1, first.thread, first.execution_generation, 7)
+            .unwrap();
+        assert_eq!(
+            reused_generation.observe_remote_wake_claim(
+                2,
+                1,
+                actors[1].thread,
+                actors[1].execution_generation,
+                7,
+            ),
+            Err(Dw1cEvidenceError::Contradiction)
+        );
+        let state = reused_generation.state.lock();
+        assert_eq!(state.remote_wake_payload[1].unwrap().subject, 1);
+        assert_eq!(state.failure, Some(Dw1cEvidenceError::Contradiction));
+        drop(state);
+
+        let (token6_surplus, actors) = armed_collector();
+        let first = actors[0];
+        token6_surplus
+            .observe_remote_wake_claim(0, 1, first.thread, first.execution_generation, 7)
+            .unwrap();
+        let token6 = actors[5];
+        assert_eq!(
+            token6_surplus.observe_remote_wake_claim(
+                2,
+                1,
+                token6.thread,
+                token6.execution_generation,
+                8,
+            ),
+            Ok(Some(6))
+        );
+        let state = token6_surplus.state.lock();
+        assert!(state.token6_wake_seen);
+        assert_eq!(state.remote_wake_payload[1].unwrap().subject, 1);
+        assert_eq!(state.failure, None);
+        drop(state);
+        assert_eq!(
+            token6_surplus.observe_remote_wake_claim(
+                3,
+                2,
+                token6.thread,
+                token6.execution_generation,
+                9,
+            ),
             Err(Dw1cEvidenceError::Duplicate)
         );
-        let state = duplicate.state.lock();
-        assert_eq!(state.remote_wake_payload[1].unwrap().value, 1 | (7 << 16));
-        assert_eq!(state.failure, Some(Dw1cEvidenceError::Duplicate));
+
+        let (exact_duplicate, actors) = armed_collector();
+        let actor = actors[0];
+        exact_duplicate
+            .observe_remote_wake_claim(0, 1, actor.thread, actor.execution_generation, 7)
+            .unwrap();
+        assert_eq!(
+            exact_duplicate.observe_remote_wake_claim(
+                0,
+                1,
+                actor.thread,
+                actor.execution_generation,
+                7,
+            ),
+            Err(Dw1cEvidenceError::Duplicate)
+        );
+
+        let (local_token6, actors) = armed_collector();
+        let token6 = actors[5];
+        assert_eq!(
+            local_token6.observe_remote_wake_claim(
+                2,
+                2,
+                token6.thread,
+                token6.execution_generation,
+                10,
+            ),
+            Ok(Some(6))
+        );
+        let state = local_token6.state.lock();
+        assert!(state.token6_wake_seen);
+        assert_eq!(state.facts.remote_wake, 0);
+        assert_eq!(state.remote_wake_payload, [None; 4]);
+        assert_eq!(state.failure, None);
         drop(state);
 
         let (stale_migration, actors) = armed_collector();
