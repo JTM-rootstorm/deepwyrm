@@ -401,6 +401,47 @@ fn dw1c_fixture_accepts_local_setup_wake_and_requires_token2_second_block() {
 }
 
 #[test]
+fn dw1c_fixture_preserves_explicit_migration_rejection_precedence() {
+    let seed = installed_dw1c_fixture(cpu(0));
+    let token6 = seed.actors[5];
+    let generation = seed.identities[5].execution_generation;
+    assert_eq!(
+        seed.scheduler
+            .wake_on(cpu(0), seed.arm_wakes[5])
+            .unwrap()
+            .target(),
+        cpu(2)
+    );
+    let reason = SchedulerMigrationRejectionReason::ExecutionPinned;
+    seed.scheduler
+        .set_migration_exclusion(token6, generation, reason)
+        .unwrap();
+    assert_eq!(
+        seed.scheduler
+            .attempt_migration_revalidation_on(cpu(0), token6, generation)
+            .unwrap(),
+        SchedulerMigrationRejection {
+            thread: token6,
+            execution_generation: generation,
+            cpu: cpu(0),
+            reason,
+        }
+    );
+    seed.scheduler
+        .clear_migration_exclusion(token6, generation, reason)
+        .unwrap();
+    assert_eq!(
+        seed.scheduler
+            .schedule_next_on_with_migration(cpu(1))
+            .unwrap()
+            .decision()
+            .current,
+        None
+    );
+    assert_eq!(seed.scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
 fn dw1c_fixture_releases_completed_lane_and_holds_token8_terminal_expiry() {
     let seed = installed_dw1c_fixture(cpu(0));
 

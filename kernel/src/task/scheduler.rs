@@ -1184,6 +1184,12 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         victim: SchedulerCpuId,
         target: SchedulerCpuId,
     ) -> Result<(), SchedulerMigrationRejectionReason> {
+        if !self.entry_migratable_without_external_exclusion(entry, victim, target) {
+            return Err(SchedulerMigrationRejectionReason::NotRevalidatable);
+        }
+        if let Some(exclusion) = entry.migration_exclusion {
+            return Err(exclusion);
+        }
         if self
             .dw1c_fixture
             .and_then(|fixture| fixture.restricted_target(entry.thread))
@@ -1191,10 +1197,7 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         {
             return Err(SchedulerMigrationRejectionReason::NotRevalidatable);
         }
-        if !self.entry_migratable_without_external_exclusion(entry, victim, target) {
-            return Err(SchedulerMigrationRejectionReason::NotRevalidatable);
-        }
-        entry.migration_exclusion.map_or(Ok(()), Err)
+        Ok(())
     }
 
     fn claim_first_runnable_on(
