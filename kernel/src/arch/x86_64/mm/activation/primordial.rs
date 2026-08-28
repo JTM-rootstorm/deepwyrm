@@ -52,6 +52,8 @@ use crate::task::ProcessLifecycleState;
 use crate::task::{ExecutionDomain, ProcessKey, SchedulerThreadState, TaskAuthority, ThreadKey};
 use crate::time::TimerAuthority;
 use crate::wait::{EventAuthority, WaitRegistry};
+#[cfg(deepwyrm_dw1c_evidence)]
+use deepwyrm_abi::DW_STATUS_WOULD_BLOCK;
 use deepwyrm_abi::{
     DW_CHANNEL_MAX_PAYLOAD, DW_EXCEPTION_GENERAL_PROTECTION, DW_STATUS_BAD_STATE,
     DW_STATUS_NO_RESOURCES, DW_STATUS_NOT_SUPPORTED, DW_STATUS_SUCCESS, DW_TASK_STATE_EXITED,
@@ -6037,7 +6039,11 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                             crate::test_support::complete_fail(0x2810_e01c)
                         }
                     }
-                    if crate::time::monotonic_now().is_err_or(|now| now >= deadline) {
+                    let timed_out = match crate::time::monotonic_now() {
+                        Ok(now) => now >= deadline,
+                        Err(_) => true,
+                    };
+                    if timed_out {
                         crate::test_support::complete_fail(0x2810_e01d)
                     }
                     core::hint::spin_loop();
