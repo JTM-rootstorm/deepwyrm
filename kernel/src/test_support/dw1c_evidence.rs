@@ -2321,6 +2321,22 @@ mod tests {
                 "self.observe_retained_current_published_expiry(consumed_published_expiry)"
             )
         );
+        let completed_switch = execution_source
+            .split("pub(crate) fn complete_switch_on(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn running_claim_on(")
+            .next()
+            .unwrap();
+        assert!(
+            completed_switch.find(".observe_preemption_claim(")
+                < completed_switch.find(".incoming_claim()")
+        );
+        assert!(
+            completed_switch.find(".incoming_claim()")
+                < completed_switch.find(".observe_running_claim(")
+        );
+        assert!(!completed_switch.contains("self.scheduler.running_claim_on"));
 
         assert_eq!(
             source.matches("complete_primordial_launch(self);").count(),

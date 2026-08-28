@@ -1112,6 +1112,21 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                     panic!("selector-28 PREEMPT observation failed: {error:?}")
                 });
         }
+        #[cfg(deepwyrm_dw1c_evidence)]
+        if let Some(incoming) = completed
+            .incoming_claim()
+            .filter(|incoming| crate::test_support::DW1C_EVIDENCE.tracks_thread(incoming.thread()))
+        {
+            crate::test_support::DW1C_EVIDENCE
+                .observe_running_claim(
+                    incoming.cpu().index() as u8,
+                    incoming.thread(),
+                    incoming.generation(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("selector-28 incoming RUN observation failed: {error:?}")
+                });
+        }
         Ok(completed.runnable_publication())
     }
 

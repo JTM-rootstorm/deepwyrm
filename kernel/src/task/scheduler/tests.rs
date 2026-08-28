@@ -1719,11 +1719,13 @@ fn completed_switch_generation_is_exact_and_stale_completion_cannot_advance_it()
         SchedulerPreemptionDecision::Switch { outgoing, .. } => outgoing,
         decision => panic!("exact expiry did not prepare a switch: {decision:?}"),
     };
+    let first_incoming = scheduler.running_claim_on(cpu(1)).unwrap();
     let first_completed = scheduler
         .complete_switch_on_with_runnable_publication(first_outgoing)
         .unwrap();
     assert_eq!(first_completed.generation(), 1);
     assert!(first_completed.involuntary_preemption());
+    assert_eq!(first_completed.incoming_claim(), Some(first_incoming));
     assert_eq!(
         scheduler.complete_switch_on_with_runnable_publication(first_outgoing),
         Err(SchedulerError::StaleExecutionClaim)
@@ -1735,11 +1737,13 @@ fn completed_switch_generation_is_exact_and_stale_completion_cannot_advance_it()
         SchedulerPreemptionDecision::Switch { outgoing, .. } => outgoing,
         decision => panic!("replacement expiry did not prepare a switch: {decision:?}"),
     };
+    let second_incoming = scheduler.running_claim_on(cpu(1)).unwrap();
     let second_completed = scheduler
         .complete_switch_on_with_runnable_publication(second_outgoing)
         .unwrap();
     assert_eq!(second_completed.generation(), 2);
     assert!(second_completed.involuntary_preemption());
+    assert_eq!(second_completed.incoming_claim(), Some(second_incoming));
     assert_eq!(scheduler.check_invariants(), Ok(()));
 }
 

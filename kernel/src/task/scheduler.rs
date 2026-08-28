@@ -295,6 +295,7 @@ impl SchedulerWakePublication {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SchedulerCompletedSwitch {
     runnable_publication: Option<RunnablePublication>,
+    incoming_claim: Option<SchedulerExecutionClaim>,
     generation: u64,
     involuntary_preemption: bool,
 }
@@ -306,6 +307,10 @@ impl SchedulerCompletedSwitch {
 
     pub(crate) const fn generation(self) -> u64 {
         self.generation
+    }
+
+    pub(crate) const fn incoming_claim(self) -> Option<SchedulerExecutionClaim> {
+        self.incoming_claim
     }
 
     pub(crate) const fn involuntary_preemption(self) -> bool {
@@ -2699,9 +2704,16 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         }
         state.next_completed_switch_generation = next_completed_switch_generation;
         state.suspended[cpu_index] = None;
+        let incoming_claim = state.running[cpu_index].map(|incoming| SchedulerExecutionClaim {
+            domain: state.domain,
+            cpu: claim.cpu,
+            thread: incoming.thread,
+            generation: incoming.generation,
+        });
         state.assert_invariants();
         Ok(SchedulerCompletedSwitch {
             runnable_publication: published_runnable,
+            incoming_claim,
             generation: completed_switch_generation,
             involuntary_preemption: suspended.involuntary_preemption,
         })
