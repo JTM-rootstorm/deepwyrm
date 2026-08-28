@@ -689,14 +689,20 @@ wake evidence.
 After resolving the exact actor table, ARM returns the
 selector-private `WOULD_BLOCK` retry result until all eight actors are Blocked
 and their continuations have been released. The controller cannot send GO
-before ARM succeeds, so bounded retries allow the actors to finish their waits
-without holding runtime or scheduler authority. Every retry re-resolves and
-revalidates the handle table, topology, reporter, actor identities and
-generations, lifecycle, and scheduler state; a contradiction fails rather than
-being treated as transient. The successful attempt installs the fixture and
-arms the collector as one controller-visible operation. Lane restrictions
-release only after the corresponding completed involuntary switch, and every
-restriction releases before the ordinary idle-steal relation is admitted.
+before ARM succeeds. If a blocked actor still owns a physically suspended
+continuation, the failed attempt stages one ordinary affine idle-wake for that
+exact carrier; dispatch drains the notification only after runtime and
+scheduler authority have been released. This does not invent Runnable work or
+relax the released-continuation requirement. It makes an already-published
+unowned Runnable Thread visible to the quiescent carrier so a real switch can
+publish the actor continuation before the next bounded retry. Every retry
+re-resolves and revalidates the handle table, topology, reporter, actor
+identities and generations, lifecycle, and scheduler state; a contradiction
+fails rather than being treated as transient. The successful attempt installs
+the fixture and arms the collector as one controller-visible operation. Lane
+restrictions release only after the corresponding completed involuntary
+switch, and every restriction releases before the ordinary idle-steal relation
+is admitted.
 
 The collector serializes the 46 records only after every fact is joined.
 Original transition generations and ordering remain part of those relations.

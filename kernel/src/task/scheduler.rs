@@ -1752,6 +1752,33 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         Ok(())
     }
 
+    /// Selects the exact carrier that must rescan before selector 28 can retry
+    /// ARM.  A blocked actor may still own its physically suspended syscall
+    /// continuation after the remaining CPUs become quiescent.  Returning
+    /// `WOULD_BLOCK` alone cannot wake that carrier, so the caller stages one
+    /// ordinary affine idle-wake after dropping runtime authority.
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    pub(crate) fn dw1c_arm_retry_wake_target(
+        &self,
+        actors: [Dw1cSchedulerActorIdentity; 8],
+    ) -> Option<SchedulerCpuId> {
+        let state = self.state.lock();
+        actors.into_iter().find_map(|actor| {
+            let entry = state.queue[..state.len].iter().flatten().find(|entry| {
+                entry.thread == actor.thread
+                    && entry.block_execution_generation == actor.execution_generation
+            })?;
+            let cpu = entry.continuation_cpu?;
+            state.suspended[cpu.index()]
+                .filter(|suspended| {
+                    suspended.thread == actor.thread
+                        && suspended.generation == actor.execution_generation
+                        && suspended.publication == SuspendedPublication::Queued
+                })
+                .map(|_| cpu)
+        })
+    }
+
     #[cfg(any(test, deepwyrm_dw1c_evidence))]
     pub(crate) fn dw1c_terminal_gate(&self, thread: ThreadKey) -> Dw1cTerminalGate {
         let state = self.state.lock();

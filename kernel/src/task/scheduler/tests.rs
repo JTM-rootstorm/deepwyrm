@@ -350,6 +350,10 @@ fn dw1c_fixture_arm_waits_for_every_released_blocked_actor() {
             .install_dw1c_fixture(seed.reporter_claim, seed.identities),
         Err(SchedulerError::ContinuationOwned)
     );
+    assert_eq!(
+        seed.scheduler.dw1c_arm_retry_wake_target(seed.identities),
+        None
+    );
 
     let claim = seed.scheduler.running_claim_on(cpu(0)).unwrap();
     let block = seed
@@ -357,10 +361,23 @@ fn dw1c_fixture_arm_waits_for_every_released_blocked_actor() {
         .prepare_block_current_on(cpu(0), actor)
         .unwrap();
     seed.scheduler.commit_block_on(cpu(0), block).unwrap();
+    assert_eq!(
+        seed.scheduler
+            .install_dw1c_fixture(seed.reporter_claim, seed.identities),
+        Err(SchedulerError::ContinuationOwned)
+    );
+    assert_eq!(
+        seed.scheduler.dw1c_arm_retry_wake_target(seed.identities),
+        Some(cpu(0))
+    );
     seed.scheduler.complete_switch_on(claim).unwrap();
     seed.scheduler
         .install_dw1c_fixture(seed.reporter_claim, seed.identities)
         .unwrap();
+    assert_eq!(
+        seed.scheduler.dw1c_arm_retry_wake_target(seed.identities),
+        None
+    );
     assert_eq!(seed.scheduler.check_invariants(), Ok(()));
 }
 

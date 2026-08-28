@@ -699,6 +699,13 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     }
 
     #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    pub(crate) fn stage_dw1c_arm_retry_wake(&self, actors: [super::Dw1cSchedulerActorIdentity; 8]) {
+        if let Some(target) = self.scheduler.dw1c_arm_retry_wake_target(actors) {
+            super::notify_runnable_work(Some(target));
+        }
+    }
+
+    #[cfg(any(test, deepwyrm_dw1c_evidence))]
     pub(crate) fn dw1c_terminal_gate(&self, thread: ThreadKey) -> super::Dw1cTerminalGate {
         self.scheduler.dw1c_terminal_gate(thread)
     }

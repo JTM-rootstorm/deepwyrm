@@ -5679,6 +5679,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                 {
                     Ok(()) => {}
                     Err(crate::task::SchedulerError::ContinuationOwned) => {
+                        self.shared
+                            .execution
+                            .stage_dw1c_arm_retry_wake(fixture_actors);
                         self.commit_runtime_phase(phase);
                         return NativeSyscallResult::returning(DW_STATUS_WOULD_BLOCK);
                     }
