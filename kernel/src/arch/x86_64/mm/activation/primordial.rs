@@ -6276,7 +6276,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         let outcome = {
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);
-            runtime.publish_quantum_expiry(ticket)?
+            runtime.shared.execution.publish_quantum_expiry(ticket)?
         };
         crate::task::notify_completed_switch_runnable(outcome.runnable_publication());
         Ok(outcome.published())
