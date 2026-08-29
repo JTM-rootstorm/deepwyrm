@@ -5337,9 +5337,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         &mut self,
         ticket: crate::task::SchedulerQuantumTicket,
     ) -> Result<bool, crate::task::SchedulerError> {
-        let outcome = self.shared.execution.publish_quantum_expiry(ticket)?;
-        crate::task::notify_completed_switch_runnable(outcome.runnable_publication());
-        Ok(outcome.published())
+        self.shared.execution.publish_quantum_expiry(ticket)
     }
 
     fn prepare_quantum(
@@ -6273,13 +6271,12 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         &mut self,
         ticket: crate::task::SchedulerQuantumTicket,
     ) -> Result<bool, crate::task::SchedulerError> {
-        let outcome = {
+        let published = {
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);
             runtime.shared.execution.publish_quantum_expiry(ticket)?
         };
-        crate::task::notify_completed_switch_runnable(outcome.runnable_publication());
-        Ok(outcome.published())
+        Ok(published)
     }
 
     fn prepare_quantum(

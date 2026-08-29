@@ -667,9 +667,13 @@ evidence record. Let `S` be the reporter's ARM CPU. Tokens 1 and 2 form the
 actor lane on `S`; tokens 3/4, 5/6, and 7/8 form two-actor lanes on the other
 three CPUs in CPU-index order. Actor wake placement and
 idle-steal eligibility remain restricted to the assigned lane only until that
-lane completes a real involuntary RUN/QUANTUM/PREEMPT switch. The ordinary
-scheduler wake, timer, dispatch, switch-completion, and observer paths remain
-the sole sources of retained facts.
+lane completes a real involuntary RUN/QUANTUM/PREEMPT switch. The reporter
+remains confined to `S` for the fixture lifetime so its token-3, token-5, and
+token-7 wakes genuinely cross into the three remote actor lanes; unlike actor
+lane release, completing a lane cannot make the reporter an idle-steal
+candidate. This is selector-private placement, not affinity or scheduling
+policy ABI. The ordinary scheduler wake, timer, dispatch, switch-completion,
+and observer paths remain the sole sources of retained facts.
 
 The controller first launches token 1 and creates a selector-private relay
 Channel. It transfers the read endpoint to token 2 in place of that actor's
@@ -785,24 +789,16 @@ matching QUANTUM chain. While held, that claim is neither rearmed nor
 involuntarily preempted; token 7 remains a real runnable peer. No synthetic or
 cancelled ticket is eligible.
 
-The acknowledgement also closes one selector-private liveness edge. If the
-controller/reporter issued its retries from token 8's CPU, token 8's dispatch
-leaves that reporter as a released Runnable continuation queued behind the
-claim which the held ticket intentionally pins. The acknowledgement revalidates
-the exact ARM-authenticated reporter, its released queue entry, the token-8
-source CPU, migration eligibility, and the original reporter CPU under the
-scheduler lock. It then moves only that queued reporter back to its original
-ARM CPU through one migration-generation and per-CPU runnable/migration
-accounting transaction. This is an explicit selector-fixture transition, not
-affinity ABI: a reporter already Running or queued away from token 8's CPU is
-unchanged, token 8 remains Running with the same held ticket, and no synthetic
-reschedule request is created. The next ordinary quantum on the reporter CPU
-can dispatch the controller so its userspace retry observes the ready gate.
-The scheduler returns the resulting Runnable publication through the execution
-and live-carrier layers; only after the carrier releases coarse runtime
-authority may the established post-lock notification helper drain idle/IPI
-work. The timer callback therefore cannot introduce a runtime-to-rendezvous
-lock-order edge.
+The acknowledgement also closes the selector-private terminal gate without
+moving Runnable work. The fixture-lifetime reporter confinement keeps every
+released reporter continuation targeted at `S` and excludes it from idle
+stealing, so the exact acknowledgement only marks the held token-8 ticket as
+observed and returns no reporter publication or migration. Token 8 remains
+Running with the same held ticket, and no synthetic reschedule request is
+created. The next ordinary quantum on `S` can dispatch the controller so its
+userspace retry observes the ready gate. Because the timer callback neither
+publishes reporter work nor drains an idle/IPI notification, it introduces no
+runtime-to-rendezvous lock-order edge.
 
 The live `ProcessTerminate` path checks this gate before TaskAuthority mutates
 token 8. If the gate is awaiting the timer, it returns `WOULD_BLOCK` without
