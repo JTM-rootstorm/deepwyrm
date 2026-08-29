@@ -6625,7 +6625,9 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 };
                 let publication = {
                     let mut runtime = self.runtime.lock();
-                    runtime.switch_cpu(self.cpu);
+                    // The executed flight is the authority that reselects its
+                    // originating CPU. Ordinary selection is forbidden while
+                    // that flight remains in progress.
                     runtime.commit_terminal_kernel_root_switch(executed);
                     let publication = runtime.complete_physical_switch_handoff();
                     runtime

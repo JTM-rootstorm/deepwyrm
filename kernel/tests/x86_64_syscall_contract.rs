@@ -1855,6 +1855,35 @@ fn dw1c1_root_switches_are_move_only_prepare_execute_commit_transactions() {
 }
 
 #[test]
+fn dw1c_detach_commits_its_root_flight_without_ordinary_cpu_reselection() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let detach = primordial
+        .split_once("fn enter_idle_scheduler(&mut self) -> !")
+        .expect("live idle scheduler")
+        .1
+        .split_once("if !self.admission_entered")
+        .expect("AP admission boundary")
+        .0;
+    let prepare = detach
+        .find("runtime.prepare_terminal_kernel_root_switch()")
+        .expect("detach prepares its root-switch flight");
+    let execute = detach[prepare..]
+        .find("prepared.execute()")
+        .map(|offset| prepare + offset)
+        .expect("detach executes its root-switch flight");
+    let commit = detach[execute..]
+        .find("runtime.commit_terminal_kernel_root_switch(executed)")
+        .map(|offset| execute + offset)
+        .expect("detach commits its root-switch flight");
+
+    assert!(prepare < execute && execute < commit);
+    assert!(
+        !detach[execute..commit].contains("runtime.switch_cpu(self.cpu)"),
+        "the executed root-switch flight must reselect its authenticated CPU"
+    );
+}
+
+#[test]
 fn dw1c1_ap_carrier_enters_its_exact_kernel_root_before_ready_publication() {
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
     let idle = primordial
