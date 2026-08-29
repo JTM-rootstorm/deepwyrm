@@ -779,6 +779,7 @@ static BOOTFS_BYTES: ByteStorage<MAX_BOOTFS_BYTES> = ByteStorage::new();
 struct PrimordialRuntimeShared {
     execution: ExecutionDomain<EXECUTION_THREADS>,
     channels: Channels,
+    device_resources: crate::device::DeviceResourceAuthority<8>,
     events: EventAuthority<EVENTS>,
     timers: TimerAuthority<TIMERS>,
     timer_expiries:
@@ -1366,6 +1367,7 @@ fn publish_runtime_shared() -> &'static PrimordialRuntimeShared {
         (*SHARED_RUNTIME_STORAGE.0.get()).write(PrimordialRuntimeShared {
             execution,
             channels: Channels::new(),
+            device_resources: crate::device::DeviceResourceAuthority::new(),
             events: EventAuthority::new(),
             timers: TimerAuthority::new(),
             timer_expiries: IrqSpinMutex::new([None; crate::time::DEADLINE_QUEUE_CAPACITY]),
@@ -4934,7 +4936,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         &mut self.tasks,
                         &mut self.spaces,
                         &mut self.regions,
-                    );
+                    )
+                    .with_device_resources(&self.shared.device_resources);
                     finalizer.finalize_chain(release)
                 };
                 crate::syscall::complete_wait_wakes(
@@ -7714,11 +7717,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     self.active_root.as_ref().expect("active root"),
                     self.process,
                 );
-                NativeSyscallResult::returning(crate::syscall::object_get_info_v1(
+                NativeSyscallResult::returning(crate::syscall::object_get_info_v1_with_devices(
                     &mut user,
                     &mut self.registry,
                     &self.memory,
                     &self.tasks,
+                    &self.shared.device_resources,
                     self.process,
                     handle,
                     topic,

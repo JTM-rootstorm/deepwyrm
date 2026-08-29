@@ -155,6 +155,14 @@ impl FinalRelease {
     pub(crate) const fn object_type(&self) -> DwObjectType {
         self.object_type
     }
+
+    #[cfg(test)]
+    pub(crate) const fn duplicate_for_negative_test(&self) -> Self {
+        Self {
+            id: self.id,
+            object_type: self.object_type,
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -759,6 +767,24 @@ impl payload_cleanup_seal::Sealed for crate::time::TimerPayloadCleanup {
 }
 #[cfg(deepwyrm_integrated)]
 impl PayloadCleanupProof for crate::time::TimerPayloadCleanup {}
+
+#[cfg(deepwyrm_integrated)]
+impl payload_binding_seal::Sealed for crate::device::DeviceResourceBinding {
+    fn into_creation(self) -> CreationRef {
+        self.into_creation()
+    }
+}
+#[cfg(deepwyrm_integrated)]
+impl PayloadBindingProof for crate::device::DeviceResourceBinding {}
+
+#[cfg(deepwyrm_integrated)]
+impl payload_cleanup_seal::Sealed for crate::device::DeviceResourceCleanup {
+    fn into_final_release(self) -> FinalRelease {
+        self.into_final_release()
+    }
+}
+#[cfg(deepwyrm_integrated)]
+impl PayloadCleanupProof for crate::device::DeviceResourceCleanup {}
 
 #[cfg(deepwyrm_integrated)]
 impl payload_binding_seal::Sealed for crate::ipc::ChannelPayloadBinding {

@@ -4,11 +4,12 @@
 )]
 
 use deepwyrm_abi::{
-    DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_EVENT,
-    DW_OBJECT_TYPE_MEMORY_OBJECT, DW_OBJECT_TYPE_PROCESS, DW_OBJECT_TYPE_TASK_GROUP,
-    DW_OBJECT_TYPE_THREAD, DW_OBJECT_TYPE_TIMER,
+    DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_DEVICE_RESOURCE,
+    DW_OBJECT_TYPE_EVENT, DW_OBJECT_TYPE_MEMORY_OBJECT, DW_OBJECT_TYPE_PROCESS,
+    DW_OBJECT_TYPE_TASK_GROUP, DW_OBJECT_TYPE_THREAD, DW_OBJECT_TYPE_TIMER,
 };
 
+use crate::device::{DeviceResourceFinalizer, complete_device_resource_finalization};
 use crate::ipc::{ChannelAuthority, complete_channel_finalization};
 use crate::memory::address_region::{
     AddressRegionObjectAuthority, AddressSpaceAuthority, complete_address_region_finalization,
@@ -55,6 +56,7 @@ pub(crate) struct PayloadFinalizer<
     tasks: &'a mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     spaces: &'a mut AddressSpaceAuthority<SPACES, REGIONS>,
     regions: &'a mut AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
+    device_resources: Option<&'a dyn DeviceResourceFinalizer>,
 }
 
 impl<
@@ -129,7 +131,16 @@ impl<
             tasks,
             spaces,
             regions,
+            device_resources: None,
         }
+    }
+
+    pub(crate) fn with_device_resources(
+        mut self,
+        device_resources: &'a dyn DeviceResourceFinalizer,
+    ) -> Self {
+        self.device_resources = Some(device_resources);
+        self
     }
 
     #[must_use = "typed finalization may return waiter wake intents and pins"]
@@ -219,6 +230,21 @@ impl<
                     push_pending(pending, pending_len, release);
                 }
                 wakes
+            }
+            DW_OBJECT_TYPE_DEVICE_RESOURCE => {
+                let finalization = self
+                    .device_resources
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "DeviceResource final release reached a finalizer without D2 authority"
+                        )
+                    })
+                    .take_finalization(final_release)
+                    .unwrap_or_else(|(error, _)| {
+                        panic!("DeviceResource final release bypassed its typed payload: {error:?}")
+                    });
+                complete_device_resource_finalization(self.registry, finalization);
+                WakeBatch::empty()
             }
             DW_OBJECT_TYPE_TASK_GROUP | DW_OBJECT_TYPE_PROCESS | DW_OBJECT_TYPE_THREAD => {
                 let finalization =
@@ -328,6 +354,65 @@ mod tests {
     use super::*;
     use crate::memory::address_region::{AddressRegionObjectAuthority, AddressSpaceAuthority};
     use crate::memory::frame_roles::synthetic_frame_role_manager;
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "test-local AddressSpaceAuthority uniquely owns its synthetic root identities"
+    )]
+    fn device_resource_finalization_routes_through_central_payload_finalizer() {
+        let mut registry = ObjectRegistry::<8>::new();
+        let mut roles = synthetic_frame_role_manager::<1, 8>(0x38_000, 4);
+        let mut memory = MemoryObjectAuthority::<1, 1>::new();
+        let events = EventAuthority::<1>::new();
+        let timers = TimerAuthority::<1>::new();
+        let mut timer_deadlines = TestTimerDeadlines::<2>::new(0);
+        let channels = ChannelAuthority::<1, 2>::new();
+        let waits = WaitRegistry::<4>::new();
+        let mut tasks = TaskAuthority::<1, 1, 1, 1>::new();
+        let mut spaces = unsafe { AddressSpaceAuthority::<1, 1>::new() };
+        let mut regions = AddressRegionObjectAuthority::<1, 1>::new();
+        let (domain, _owner) = tasks.create_root_group(&mut registry).unwrap();
+        let devices = crate::device::DeviceResourceAuthority::<1>::new();
+        let mut device_handles = crate::handle::HandleTable::<1>::new();
+        let (_, handle) = devices
+            .create(
+                &mut registry,
+                &mut device_handles,
+                crate::device::DeviceResourceDescriptor {
+                    resource_id: 1,
+                    lease_generation: 1,
+                    kind: deepwyrm_abi::DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT,
+                    pio_base: 0x2f8,
+                    pio_length: 8,
+                    interrupt_source: 3,
+                    resource_domain: domain,
+                },
+                deepwyrm_abi::DW_RIGHT_INSPECT,
+            )
+            .unwrap();
+        let final_release = device_handles
+            .close(&mut registry, handle)
+            .unwrap()
+            .unwrap();
+
+        let mut finalizer = PayloadFinalizer::new(
+            &mut registry,
+            &mut roles,
+            &mut memory,
+            &events,
+            &timers,
+            &mut timer_deadlines,
+            &channels,
+            &waits,
+            &mut tasks,
+            &mut spaces,
+            &mut regions,
+        )
+        .with_device_resources(&devices);
+        assert_eq!(finalizer.finalize_chain(final_release).len(), 0);
+        assert_eq!(devices.live_count(), 0);
+    }
 
     #[test]
     #[allow(

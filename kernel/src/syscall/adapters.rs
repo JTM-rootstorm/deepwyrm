@@ -11,11 +11,12 @@
 
 use deepwyrm_abi::{
     DW_ABI_INFO_V1_SIZE, DW_BASE_PAGE_SIZE, DW_CHANNEL_MAX_HANDLES, DW_CHANNEL_MAX_PAYLOAD,
-    DW_CHANNEL_RECEIVE_RESULT_V1_SIZE, DW_CLOCK_MONOTONIC_ACTIVE, DW_HANDLE_TRANSFER_MOVE,
-    DW_HANDLE_TRANSFER_V1_SIZE, DW_MEMORY_OBJECT_INFO_V1_SIZE, DW_OBJECT_INFO_BASIC_V1,
-    DW_OBJECT_INFO_MEMORY_OBJECT_V1, DW_OBJECT_INFO_TASK_STATE_V1, DW_OBJECT_INFO_V1_SIZE,
-    DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_PROCESS,
-    DW_OBJECT_TYPE_TASK_GROUP, DW_PROCESS_CREATE_ARGS_V1_SIZE, DW_PROCESS_CREATE_RESULT_V1_SIZE,
+    DW_CHANNEL_RECEIVE_RESULT_V1_SIZE, DW_CLOCK_MONOTONIC_ACTIVE, DW_DEVICE_RESOURCE_INFO_V1_SIZE,
+    DW_HANDLE_TRANSFER_MOVE, DW_HANDLE_TRANSFER_V1_SIZE, DW_MEMORY_OBJECT_INFO_V1_SIZE,
+    DW_OBJECT_INFO_BASIC_V1, DW_OBJECT_INFO_DEVICE_RESOURCE_V1, DW_OBJECT_INFO_MEMORY_OBJECT_V1,
+    DW_OBJECT_INFO_TASK_STATE_V1, DW_OBJECT_INFO_V1_SIZE, DW_OBJECT_TYPE_ADDRESS_REGION,
+    DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_PROCESS, DW_OBJECT_TYPE_TASK_GROUP,
+    DW_PROCESS_CREATE_ARGS_V1_SIZE, DW_PROCESS_CREATE_RESULT_V1_SIZE,
     DW_RECEIVED_HANDLE_INFO_V1_SIZE, DW_RIGHT_EXECUTE, DW_RIGHT_MODIFY, DW_RIGHT_READ,
     DW_RIGHT_SIGNAL, DW_RIGHT_TRANSFER, DW_RIGHT_WRITE, DW_STATUS_ACCESS_DENIED,
     DW_STATUS_BAD_ADDRESS, DW_STATUS_BAD_HANDLE, DW_STATUS_BAD_STATE, DW_STATUS_BUFFER_TOO_SMALL,
@@ -746,6 +747,80 @@ pub(crate) fn object_get_info_v1<
     out_size: u64,
     out_required_size: DwUserAddress,
 ) -> DwStatus {
+    object_get_info_v1_impl(
+        user,
+        registry,
+        memory,
+        tasks,
+        None,
+        current_process,
+        handle,
+        topic,
+        out_info,
+        out_size,
+        out_required_size,
+    )
+}
+
+pub(crate) fn object_get_info_v1_with_devices<
+    U: UserPageAccess,
+    const OBJECTS: usize,
+    const MEMORY_OBJECTS: usize,
+    const LEASES: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    user: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    memory: &MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    devices: &dyn crate::device::DeviceResourceInfoProvider,
+    current_process: ProcessKey,
+    handle: DwHandle,
+    topic: u32,
+    out_info: DwUserAddress,
+    out_size: u64,
+    out_required_size: DwUserAddress,
+) -> DwStatus {
+    object_get_info_v1_impl(
+        user,
+        registry,
+        memory,
+        tasks,
+        Some(devices),
+        current_process,
+        handle,
+        topic,
+        out_info,
+        out_size,
+        out_required_size,
+    )
+}
+
+fn object_get_info_v1_impl<
+    U: UserPageAccess,
+    const OBJECTS: usize,
+    const MEMORY_OBJECTS: usize,
+    const LEASES: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    user: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    memory: &MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    devices: Option<&dyn crate::device::DeviceResourceInfoProvider>,
+    current_process: ProcessKey,
+    handle: DwHandle,
+    topic: u32,
+    out_info: DwUserAddress,
+    out_size: u64,
+    out_required_size: DwUserAddress,
+) -> DwStatus {
     let required_range = match user_range(out_required_size, 8, 8, UserAccess::WRITE) {
         Ok(range) => range,
         Err(status) => return status,
@@ -757,9 +832,15 @@ pub(crate) fn object_get_info_v1<
         Ok(table) => table,
         Err(error) => return task_status(error),
     };
-    let result = match crate::service::object_get_info_v1_with_tasks(
-        table, registry, memory, tasks, handle, topic,
-    ) {
+    let result = match devices {
+        Some(devices) => crate::service::object_get_info_v1_with_tasks_and_devices(
+            table, registry, memory, tasks, devices, handle, topic,
+        ),
+        None => crate::service::object_get_info_v1_with_tasks(
+            table, registry, memory, tasks, handle, topic,
+        ),
+    };
+    let result = match result {
         Ok(result) => result,
         Err(status) => return status,
     };
@@ -795,6 +876,7 @@ pub(crate) const fn object_info_required_size(topic: u32) -> Option<u64> {
         DW_OBJECT_INFO_BASIC_V1 => Some(DW_OBJECT_INFO_V1_SIZE as u64),
         DW_OBJECT_INFO_TASK_STATE_V1 => Some(64),
         DW_OBJECT_INFO_MEMORY_OBJECT_V1 => Some(DW_MEMORY_OBJECT_INFO_V1_SIZE as u64),
+        DW_OBJECT_INFO_DEVICE_RESOURCE_V1 => Some(DW_DEVICE_RESOURCE_INFO_V1_SIZE as u64),
         _ => None,
     }
 }

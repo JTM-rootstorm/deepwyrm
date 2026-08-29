@@ -45,7 +45,7 @@ pub(super) fn validate_ist_stack_margin(selector: &str, sizes: &[StackSize], dis
     let hardware_byte = suffix("IST COM1 hardware byte", ">::write_hardware_byte");
     let port_read = suffix(
         "IST COM1 port read",
-        " as deepwyrm_kernel::debug::PortIo>::read_u8",
+        " as deepwyrm_kernel::arch::x86_64::io_port::BytePortIo>::read_u8",
     );
     let output_guard = exact("<deepwyrm_kernel::debug::OutputGuard>::acquire");
     let panic_common = [
@@ -79,13 +79,13 @@ pub(super) fn validate_ist_stack_margin(selector: &str, sizes: &[StackSize], dis
         frame("ist-com1-port-read", port_read),
     ];
     let fmt_write = exact(
-        "<deepwyrm_kernel::debug::Com1<deepwyrm_kernel::debug::X86PortIo> as core::fmt::Write>::write_fmt",
+        "<deepwyrm_kernel::debug::Com1<deepwyrm_kernel::arch::x86_64::io_port::X86PortIo> as core::fmt::Write>::write_fmt",
     );
     let fmt_spec = exact(
-        "<&mut deepwyrm_kernel::debug::Com1<deepwyrm_kernel::debug::X86PortIo> as core::fmt::Write::write_fmt::SpecWriteFmt>::spec_write_fmt",
+        "<&mut deepwyrm_kernel::debug::Com1<deepwyrm_kernel::arch::x86_64::io_port::X86PortIo> as core::fmt::Write::write_fmt::SpecWriteFmt>::spec_write_fmt",
     );
     let fmt_write_str = exact(
-        "<deepwyrm_kernel::debug::Com1<deepwyrm_kernel::debug::X86PortIo> as core::fmt::Write>::write_str",
+        "<deepwyrm_kernel::debug::Com1<deepwyrm_kernel::arch::x86_64::io_port::X86PortIo> as core::fmt::Write>::write_str",
     );
     let fmt_arguments = fixed_x86_64_stack_frame(
         disassembly,
@@ -103,7 +103,7 @@ pub(super) fn validate_ist_stack_margin(selector: &str, sizes: &[StackSize], dis
     );
     let fmt_padding_branch = ist_padding_branch(
         exact(
-            "<deepwyrm_kernel::debug::Com1<deepwyrm_kernel::debug::X86PortIo> as core::fmt::Write>::write_char",
+            "<deepwyrm_kernel::debug::Com1<deepwyrm_kernel::arch::x86_64::io_port::X86PortIo> as core::fmt::Write>::write_char",
         ),
         exact("core::char::methods::encode_utf8_raw"),
         exact("core::slice::raw::from_raw_parts_mut::precondition_check"),

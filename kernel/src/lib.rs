@@ -18,6 +18,11 @@ pub(crate) mod cpu;
 pub mod debug;
 #[allow(
     dead_code,
+    reason = "DW1-D2 DeviceResource payload and PIO authority precede D5 boot-grant publication"
+)]
+pub(crate) mod device;
+#[allow(
+    dead_code,
     reason = "DW0-D5 exposes handle/object services ahead of DW0-E syscall consumers"
 )]
 pub(crate) mod handle;

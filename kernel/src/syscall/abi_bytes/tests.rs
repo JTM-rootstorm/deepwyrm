@@ -1,11 +1,13 @@
 use super::*;
 use deepwyrm_abi::{
     DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT, DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE,
-    DW_CHANNEL_RECEIVE_RESULT_V1_SIZE, DW_HANDLE_TRANSFER_MOVE, DW_HANDLE_TRANSFER_V1_SIZE,
-    DW_OBJECT_TYPE_EVENT, DW_OBJECT_TYPE_PROCESS, DW_PROCESS_CREATE_ARGS_V1_SIZE,
-    DW_PROCESS_CREATE_RESULT_V1_SIZE, DW_RECEIVED_HANDLE_INFO_V1_SIZE, DW_RIGHT_INSPECT,
-    DW_SIGNAL_READABLE, DW_TASK_STATE_EXITED, DW_TERMINATION_AUTHORIZED, DW_WAIT_ITEM_V1_SIZE,
-    DW_WAIT_RESULT_V1_SIZE, DwAddressRegionMapFlags, DwChannelReceiveResultV1, DwExceptionType,
+    DW_CHANNEL_RECEIVE_RESULT_V1_SIZE, DW_DEVICE_RESOURCE_INFO_V1_SIZE,
+    DW_DEVICE_RESOURCE_INFO_V1_VERSION, DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT,
+    DW_HANDLE_TRANSFER_MOVE, DW_HANDLE_TRANSFER_V1_SIZE, DW_OBJECT_TYPE_EVENT,
+    DW_OBJECT_TYPE_PROCESS, DW_PROCESS_CREATE_ARGS_V1_SIZE, DW_PROCESS_CREATE_RESULT_V1_SIZE,
+    DW_RECEIVED_HANDLE_INFO_V1_SIZE, DW_RIGHT_INSPECT, DW_SIGNAL_READABLE, DW_TASK_STATE_EXITED,
+    DW_TERMINATION_AUTHORIZED, DW_WAIT_ITEM_V1_SIZE, DW_WAIT_RESULT_V1_SIZE,
+    DwAddressRegionMapFlags, DwChannelReceiveResultV1, DwDeviceResourceInfoV1, DwExceptionType,
     DwHandleTransferV1, DwMemoryProtection, DwObjectType, DwOffset, DwProcessCreateResultV1,
     DwReceivedHandleInfoV1, DwRights, DwSize, DwTaskState, DwTerminationReason, DwUserAddress,
     DwWaitResultV1,
@@ -52,6 +54,33 @@ fn task_object_info_encoding_has_no_padding_leak() {
     }));
     assert_eq!(task.len(), 64);
     assert_eq!(&task.bytes()[40..], &[0; 24]);
+}
+
+#[test]
+fn device_resource_info_encoding_is_exact_and_padding_free() {
+    let info = encode_object_info(ObjectInfoResult::DeviceResource(DwDeviceResourceInfoV1 {
+        size: DW_DEVICE_RESOURCE_INFO_V1_SIZE,
+        version: DW_DEVICE_RESOURCE_INFO_V1_VERSION,
+        kind: DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT,
+        flags: 0,
+        resource_id: 0x1122_3344_5566_7788,
+        lease_generation: 0x8877_6655_4433_2211,
+        pio_base: 0x2f8,
+        pio_length: 8,
+        interrupt_source: 3,
+        reserved: 0,
+    }));
+    assert_eq!(info.len(), 48);
+    assert_eq!(&info.bytes()[0..4], &48_u32.to_le_bytes());
+    assert_eq!(&info.bytes()[8..12], &1_u32.to_le_bytes());
+    assert_eq!(
+        &info.bytes()[16..24],
+        &0x1122_3344_5566_7788_u64.to_le_bytes()
+    );
+    assert_eq!(&info.bytes()[32..34], &0x2f8_u16.to_le_bytes());
+    assert_eq!(&info.bytes()[34..36], &8_u16.to_le_bytes());
+    assert_eq!(&info.bytes()[36..40], &3_u32.to_le_bytes());
+    assert_eq!(&info.bytes()[40..48], &[0; 8]);
 }
 
 #[test]

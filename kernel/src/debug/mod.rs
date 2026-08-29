@@ -10,15 +10,19 @@
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-#[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 use core::panic::PanicInfo;
 
 #[cfg(all(
     not(feature = "test-support"),
     target_os = "none",
-    any(target_arch = "x86", target_arch = "x86_64")
+    target_arch = "x86_64"
 ))]
 use core::arch::asm;
+
+use crate::arch::x86_64::io_port::BytePortIo;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+use crate::arch::x86_64::io_port::X86PortIo;
 
 /// The reference-machine COM1 base port.
 const COM1_BASE: u16 = 0x03f8;
@@ -59,17 +63,8 @@ const MAX_PANIC_REASON_BYTES: usize = 192;
 const MAX_BACKTRACE_FRAMES: usize = 16;
 #[cfg(any(test, feature = "test-support"))]
 const MAX_RAW_RECORD_BYTES: usize = 64;
-/// Minimal byte-port interface used by the early serial writer.
-///
-/// The trait keeps formatting and polling testable without permitting tests to
-/// execute privileged port I/O.
-trait PortIo {
-    fn read_u8(&mut self, port: u16) -> u8;
-    fn write_u8(&mut self, port: u16, value: u8);
-}
-
 /// A bounded early COM1 writer.
-struct Com1<P> {
+struct Com1<P: BytePortIo> {
     io: P,
     poll_limit: u32,
 }
@@ -119,7 +114,7 @@ pub(crate) enum SerialError {
     RecordTooLong,
 }
 
-impl<P: PortIo> Com1<P> {
+impl<P: BytePortIo> Com1<P> {
     pub const fn new(io: P) -> Self {
         Self::with_poll_limit(io, DEFAULT_POLL_LIMIT)
     }
@@ -185,7 +180,7 @@ impl<P: PortIo> Com1<P> {
     }
 }
 
-impl<P: PortIo> Write for Com1<P> {
+impl<P: BytePortIo> Write for Com1<P> {
     fn write_str(&mut self, value: &str) -> fmt::Result {
         self.write_bytes(value.as_bytes()).map_err(|_| fmt::Error)
     }
@@ -299,7 +294,7 @@ impl Drop for OutputGuard {
         reason = "production diagnostics are omitted from test images"
     )
 )]
-fn emit_record<P: PortIo>(
+fn emit_record<P: BytePortIo>(
     serial: &mut Com1<P>,
     level: DiagnosticLevel,
     subsystem: &str,
@@ -325,7 +320,7 @@ fn emit_record<P: PortIo>(
         reason = "production CPU lifecycle diagnostics are omitted from test images"
     )
 )]
-fn emit_cpu_state_record<P: PortIo>(
+fn emit_cpu_state_record<P: BytePortIo>(
     serial: &mut Com1<P>,
     cpu_index: usize,
     local_apic_id: u8,
@@ -349,7 +344,7 @@ fn emit_cpu_state_record<P: PortIo>(
     test,
     allow(dead_code, reason = "target wrapper exercises the renderer indirectly")
 )]
-fn emit_panic_record<P: PortIo>(
+fn emit_panic_record<P: BytePortIo>(
     serial: &mut Com1<P>,
     record: &PanicRecord<'_>,
 ) -> Result<(), SerialError> {
@@ -357,7 +352,7 @@ fn emit_panic_record<P: PortIo>(
     render_panic_record(serial, record, cfg!(debug_assertions))
 }
 
-fn render_panic_record<P: PortIo>(
+fn render_panic_record<P: BytePortIo>(
     serial: &mut Com1<P>,
     record: &PanicRecord<'_>,
     expose_addresses: bool,
@@ -410,7 +405,7 @@ fn render_panic_record<P: PortIo>(
         .map_err(|_| SerialError::TransmitTimeout)
 }
 
-fn write_limited<P: PortIo>(
+fn write_limited<P: BytePortIo>(
     serial: &mut Com1<P>,
     bytes: &[u8],
     limit: usize,
@@ -427,7 +422,7 @@ fn write_limited<P: PortIo>(
     Ok(())
 }
 
-fn write_optional_u32<P: PortIo>(
+fn write_optional_u32<P: BytePortIo>(
     serial: &mut Com1<P>,
     value: Option<u32>,
 ) -> Result<(), SerialError> {
@@ -439,7 +434,7 @@ fn write_optional_u32<P: PortIo>(
     }
 }
 
-fn write_address<P: PortIo>(
+fn write_address<P: BytePortIo>(
     serial: &mut Com1<P>,
     value: Option<u64>,
     expose: bool,
@@ -457,51 +452,8 @@ fn write_address<P: PortIo>(
     }
 }
 
-/// Direct x86 port I/O for the freestanding kernel target.
-#[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
-struct X86PortIo;
-
-#[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
-impl PortIo for X86PortIo {
-    #[allow(
-        unsafe_code,
-        reason = "x86 COM1 port I/O boundary for freestanding kernel diagnostics"
-    )]
-    fn read_u8(&mut self, port: u16) -> u8 {
-        let value: u8;
-        // SAFETY: this is the sole x86 I/O-port boundary. Callers use only
-        // COM1's fixed legacy ports on the freestanding x86 kernel target.
-        unsafe {
-            core::arch::asm!(
-                "in al, dx",
-                in("dx") port,
-                out("al") value,
-                options(nomem, nostack, preserves_flags)
-            );
-        }
-        value
-    }
-
-    #[allow(
-        unsafe_code,
-        reason = "x86 COM1 port I/O boundary for freestanding kernel diagnostics"
-    )]
-    fn write_u8(&mut self, port: u16, value: u8) {
-        // SAFETY: this is the sole x86 I/O-port boundary. Callers use only
-        // COM1's fixed legacy ports on the freestanding x86 kernel target.
-        unsafe {
-            core::arch::asm!(
-                "out dx, al",
-                in("dx") port,
-                in("al") value,
-                options(nomem, nostack, preserves_flags)
-            );
-        }
-    }
-}
-
 /// Initializes the kernel's COM1 diagnostic writer.
-#[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) fn initialize_early_com1() {
     // This runs once on the BSP before AP startup and before any serial
     // reporter can exist. Keep it independent of BSS-backed output state: the
@@ -516,7 +468,7 @@ pub(crate) fn initialize_early_com1() {
 #[cfg(all(
     not(feature = "test-support"),
     target_os = "none",
-    any(target_arch = "x86", target_arch = "x86_64")
+    target_arch = "x86_64"
 ))]
 pub(crate) fn emit_early_record(
     level: DiagnosticLevel,
@@ -531,7 +483,7 @@ pub(crate) fn emit_early_record(
 #[cfg(all(
     not(feature = "test-support"),
     target_os = "none",
-    any(target_arch = "x86", target_arch = "x86_64")
+    target_arch = "x86_64"
 ))]
 pub(crate) fn emit_early_cpu_state_record(
     cpu_index: usize,
@@ -543,7 +495,7 @@ pub(crate) fn emit_early_cpu_state_record(
 }
 
 /// Emits a panic record through the kernel's COM1 diagnostic writer.
-#[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) fn emit_early_panic_record(record: &PanicRecord<'_>) -> Result<(), SerialError> {
     let mut serial = Com1::new(X86PortIo);
     let record = with_current_cpu_identity(record, current_cpu_id_for_diagnostics());
@@ -558,7 +510,7 @@ pub(crate) fn emit_early_panic_record(record: &PanicRecord<'_>) -> Result<(), Se
 /// as unavailable. Once an H1 GS-selected entry record is installed, the
 /// emitter attaches the faulting CPU's logical identity without consulting
 /// shared runtime state.
-#[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) fn handle_early_panic(info: &PanicInfo<'_>) -> ! {
     let mut reason = PanicReasonBuffer::new();
     let _ = write!(&mut reason, "{}", info.message());
@@ -573,8 +525,8 @@ pub(crate) fn handle_early_panic(info: &PanicInfo<'_>) -> ! {
     let _ = emit_early_panic_record(&record);
 
     // The test-support completion transport is deliberately only provided for
-    // the canonical x86_64 guest target. Other freestanding x86 builds retain
-    // the production halt path below.
+    // the canonical x86_64 guest target. Production builds retain the halt
+    // path below.
     #[cfg(all(feature = "test-support", target_arch = "x86_64"))]
     {
         crate::test_support::complete_panic(test_panic_location_detail(info));
@@ -604,7 +556,7 @@ fn test_panic_location_detail(info: &PanicInfo<'_>) -> u32 {
 #[cfg(all(
     not(feature = "test-support"),
     target_os = "none",
-    any(target_arch = "x86", target_arch = "x86_64")
+    target_arch = "x86_64"
 ))]
 #[allow(
     unsafe_code,
@@ -625,11 +577,7 @@ fn halt_after_early_panic() -> ! {
 /// This deliberately bypasses the CRLF formatting used for human diagnostics.
 /// It is crate-private so only the kernel's explicit test-support seam can use
 /// it; it does not expose a general hardware-port operation to callers.
-#[cfg(all(
-    feature = "test-support",
-    target_os = "none",
-    any(target_arch = "x86", target_arch = "x86_64")
-))]
+#[cfg(all(feature = "test-support", target_os = "none", target_arch = "x86_64"))]
 pub(crate) fn emit_early_raw_record(record: &[u8]) -> Result<(), SerialError> {
     let _guard = OutputGuard::acquire().ok_or(SerialError::Busy)?;
     let mut serial = Com1::new(X86PortIo);
@@ -650,7 +598,7 @@ pub(crate) fn emit_early_raw_record(record: &[u8]) -> Result<(), SerialError> {
         deepwyrm_dw1c_evidence
     ),
     target_os = "none",
-    any(target_arch = "x86", target_arch = "x86_64")
+    target_arch = "x86_64"
 ))]
 pub(crate) struct TestSerialTransaction {
     _guard: OutputGuard,
@@ -668,7 +616,7 @@ pub(crate) struct TestSerialTransaction {
         deepwyrm_dw1c_evidence
     ),
     target_os = "none",
-    any(target_arch = "x86", target_arch = "x86_64")
+    target_arch = "x86_64"
 ))]
 pub(crate) fn begin_test_serial_transaction() -> Result<TestSerialTransaction, SerialError> {
     Ok(TestSerialTransaction {
@@ -688,7 +636,7 @@ pub(crate) fn begin_test_serial_transaction() -> Result<TestSerialTransaction, S
         deepwyrm_dw1c_evidence
     ),
     target_os = "none",
-    any(target_arch = "x86", target_arch = "x86_64")
+    target_arch = "x86_64"
 ))]
 impl TestSerialTransaction {
     pub(crate) fn write_evidence<const BYTES: usize>(
@@ -704,7 +652,7 @@ impl TestSerialTransaction {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn write_bounded_raw_record<P: PortIo>(
+fn write_bounded_raw_record<P: BytePortIo>(
     serial: &mut Com1<P>,
     record: &[u8],
 ) -> Result<(), SerialError> {
@@ -727,7 +675,7 @@ fn write_bounded_raw_record<P: PortIo>(
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence
 ))]
-fn write_bounded_test_evidence_record<P: PortIo, const BYTES: usize>(
+fn write_bounded_test_evidence_record<P: BytePortIo, const BYTES: usize>(
     serial: &mut Com1<P>,
     record: &[u8; BYTES],
 ) -> Result<(), SerialError> {

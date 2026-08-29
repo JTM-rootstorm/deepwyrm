@@ -1,14 +1,14 @@
 use deepwyrm_abi::{
     DW_ABI_INFO_V1_SIZE, DW_ABI_VERSION, DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE, DW_BASE_PAGE_SIZE,
     DW_CHANNEL_MAX_HANDLES, DW_CHANNEL_MAX_PAYLOAD, DW_CHANNEL_RECEIVE_RESULT_V1_SIZE,
-    DW_HANDLE_TRANSFER_V1_SIZE, DW_MEMORY_OBJECT_INFO_V1_SIZE, DW_OBJECT_INFO_V1_SIZE,
-    DW_PROCESS_CREATE_ARGS_V1_SIZE, DW_PROCESS_CREATE_RESULT_V1_SIZE,
+    DW_DEVICE_RESOURCE_INFO_V1_SIZE, DW_HANDLE_TRANSFER_V1_SIZE, DW_MEMORY_OBJECT_INFO_V1_SIZE,
+    DW_OBJECT_INFO_V1_SIZE, DW_PROCESS_CREATE_ARGS_V1_SIZE, DW_PROCESS_CREATE_RESULT_V1_SIZE,
     DW_RECEIVED_HANDLE_INFO_V1_SIZE, DW_TASK_TERMINATION_INFO_V1_SIZE,
     DW_THREAD_START_ARGS_V1_SIZE, DW_WAIT_ITEM_V1_SIZE, DW_WAIT_RESULT_V1_SIZE, DwAbiInfoV1,
-    DwAddressRegionMapArgsV1, DwChannelReceiveResultV1, DwHandle, DwHandleTransferOperation,
-    DwHandleTransferV1, DwMemoryObjectInfoV1, DwObjectInfoV1, DwProcessCreateArgsV1,
-    DwProcessCreateResultV1, DwReceivedHandleInfoV1, DwRights, DwSignals, DwTaskTerminationInfoV1,
-    DwThreadStartArgsV1, DwWaitItemV1, DwWaitResultV1,
+    DwAddressRegionMapArgsV1, DwChannelReceiveResultV1, DwDeviceResourceInfoV1, DwHandle,
+    DwHandleTransferOperation, DwHandleTransferV1, DwMemoryObjectInfoV1, DwObjectInfoV1,
+    DwProcessCreateArgsV1, DwProcessCreateResultV1, DwReceivedHandleInfoV1, DwRights, DwSignals,
+    DwTaskTerminationInfoV1, DwThreadStartArgsV1, DwWaitItemV1, DwWaitResultV1,
 };
 
 use crate::service::ObjectInfoResult;
@@ -93,6 +93,10 @@ pub(crate) fn encode_object_info(result: ObjectInfoResult) -> EncodedObjectInfo 
             encode_memory_info(&mut bytes, info);
             DW_MEMORY_OBJECT_INFO_V1_SIZE as usize
         }
+        ObjectInfoResult::DeviceResource(info) => {
+            encode_device_resource_info(&mut bytes, info);
+            DW_DEVICE_RESOURCE_INFO_V1_SIZE as usize
+        }
     };
     EncodedObjectInfo { bytes, len }
 }
@@ -130,6 +134,22 @@ fn encode_memory_info(bytes: &mut [u8; MAX_OBJECT_INFO_BYTES], info: DwMemoryObj
     for (index, value) in info.reserved.into_iter().enumerate() {
         put_u64(bytes, 16 + index * 8, value);
     }
+}
+
+fn encode_device_resource_info(
+    bytes: &mut [u8; MAX_OBJECT_INFO_BYTES],
+    info: DwDeviceResourceInfoV1,
+) {
+    put_u32(bytes, 0, info.size);
+    put_u32(bytes, 4, info.version);
+    put_u32(bytes, 8, info.kind.0);
+    put_u32(bytes, 12, info.flags);
+    put_u64(bytes, 16, info.resource_id);
+    put_u64(bytes, 24, info.lease_generation);
+    bytes[32..34].copy_from_slice(&info.pio_base.to_le_bytes());
+    bytes[34..36].copy_from_slice(&info.pio_length.to_le_bytes());
+    put_u32(bytes, 36, info.interrupt_source);
+    put_u64(bytes, 40, info.reserved);
 }
 
 fn get_u32(bytes: &[u8], offset: usize) -> u32 {

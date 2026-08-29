@@ -75,9 +75,9 @@ pub(crate) use adapters::{
     complete_prepared_thread_termination_after_remote_stops_on, complete_wait_wakes,
     decode_map_args, handle_close, handle_duplicate, inspect_process_termination_threads,
     inspect_task_group_termination_threads, inspect_thread_termination_threads, object_get_info_v1,
-    prepare_address_region_mutation, prepare_process_exit, prepare_process_terminate,
-    prepare_process_unhandled_exception, prepare_task_group_terminate, prepare_thread_terminate,
-    process_exit_on, process_unhandled_exception_on, task_group_create,
+    object_get_info_v1_with_devices, prepare_address_region_mutation, prepare_process_exit,
+    prepare_process_terminate, prepare_process_unhandled_exception, prepare_task_group_terminate,
+    prepare_thread_terminate, process_exit_on, process_unhandled_exception_on, task_group_create,
 };
 #[cfg(all(
     not(deepwyrm_integrated),

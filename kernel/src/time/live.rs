@@ -1643,21 +1643,11 @@ pub(crate) extern "sysv64" fn dw_x86_64_timer_interrupt_dispatch() {
     }
 }
 
-#[allow(
-    unsafe_code,
-    reason = "F3 reads the validated ACPI PM timer through its architectural System-I/O DWORD port"
-)]
 fn read_pm_timer(descriptor: PmTimerDescriptor) -> u32 {
-    let value: u32;
-    unsafe {
-        core::arch::asm!(
-            "in eax, dx",
-            in("dx") descriptor.port(),
-            out("eax") value,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-    value
+    use crate::arch::x86_64::io_port::ScalarPortIo;
+
+    let mut io = crate::arch::x86_64::io_port::X86PortIo;
+    io.read_u32(descriptor.port())
 }
 
 #[allow(

@@ -162,7 +162,7 @@ pub(crate) fn validate_selector_stack_margin(
     let hardware_byte = suffix("COM1 hardware byte", ">::write_hardware_byte");
     let port_read = suffix(
         "COM1 port read",
-        " as deepwyrm_kernel::debug::PortIo>::read_u8",
+        " as deepwyrm_kernel::arch::x86_64::io_port::BytePortIo>::read_u8",
     );
     let completion_path = [
         frame("complete-pass", complete_pass),

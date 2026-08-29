@@ -4,14 +4,16 @@
 //! conventions, but it must not duplicate their validation or authority rules.
 
 use deepwyrm_abi::{
-    DW_MEMORY_OBJECT_INFO_V1_SIZE, DW_OBJECT_INFO_BASIC_V1, DW_OBJECT_INFO_MEMORY_OBJECT_V1,
-    DW_OBJECT_INFO_TASK_STATE_V1, DW_OBJECT_INFO_V1_SIZE, DW_OBJECT_TYPE_MEMORY_OBJECT,
-    DW_OBJECT_TYPE_PROCESS, DW_OBJECT_TYPE_THREAD, DW_RIGHT_INSPECT, DW_STATUS_ACCESS_DENIED,
-    DW_STATUS_BAD_HANDLE, DW_STATUS_INVALID_ARGUMENT, DW_STATUS_NO_RESOURCES,
-    DW_STATUS_NOT_SUPPORTED, DW_STATUS_WRONG_OBJECT_TYPE, DwHandle, DwMemoryObjectInfoV1,
+    DW_MEMORY_OBJECT_INFO_V1_SIZE, DW_OBJECT_INFO_BASIC_V1, DW_OBJECT_INFO_DEVICE_RESOURCE_V1,
+    DW_OBJECT_INFO_MEMORY_OBJECT_V1, DW_OBJECT_INFO_TASK_STATE_V1, DW_OBJECT_INFO_V1_SIZE,
+    DW_OBJECT_TYPE_DEVICE_RESOURCE, DW_OBJECT_TYPE_MEMORY_OBJECT, DW_OBJECT_TYPE_PROCESS,
+    DW_OBJECT_TYPE_THREAD, DW_RIGHT_INSPECT, DW_STATUS_ACCESS_DENIED, DW_STATUS_BAD_HANDLE,
+    DW_STATUS_INVALID_ARGUMENT, DW_STATUS_NO_RESOURCES, DW_STATUS_NOT_SUPPORTED,
+    DW_STATUS_WRONG_OBJECT_TYPE, DwDeviceResourceInfoV1, DwHandle, DwMemoryObjectInfoV1,
     DwObjectInfoV1, DwRights, DwStatus, DwTaskTerminationInfoV1,
 };
 
+use crate::device::DeviceResourceInfoProvider;
 use crate::memory::object::MemoryObjectAuthority;
 use crate::object::{FinalRelease, ObjectRegistry};
 
@@ -22,6 +24,7 @@ pub(crate) enum ObjectInfoResult {
     Basic(DwObjectInfoV1),
     TaskState(DwTaskTerminationInfoV1),
     MemoryObject(DwMemoryObjectInfoV1),
+    DeviceResource(DwDeviceResourceInfoV1),
 }
 
 pub(crate) fn handle_close<const HANDLES: usize, const OBJECTS: usize>(
@@ -55,7 +58,15 @@ pub(crate) fn object_get_info_v1<
     handle: DwHandle,
     topic: u32,
 ) -> Result<ObjectInfoResult, DwStatus> {
-    object_get_info_v1_impl(table, registry, memory, handle, topic, task_state_reserved)
+    object_get_info_v1_impl(
+        table,
+        registry,
+        memory,
+        None,
+        handle,
+        topic,
+        task_state_reserved,
+    )
 }
 
 pub(crate) fn object_get_info_v1_with_tasks<
@@ -74,9 +85,37 @@ pub(crate) fn object_get_info_v1_with_tasks<
     handle: DwHandle,
     topic: u32,
 ) -> Result<ObjectInfoResult, DwStatus> {
-    object_get_info_v1_impl(table, registry, memory, handle, topic, |resolved| {
+    object_get_info_v1_impl(table, registry, memory, None, handle, topic, |resolved| {
         task_state_info(tasks, resolved)
     })
+}
+
+pub(crate) fn object_get_info_v1_with_tasks_and_devices<
+    const HANDLES: usize,
+    const OBJECTS: usize,
+    const MEMORY_OBJECTS: usize,
+    const LEASES: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+>(
+    table: &HandleTable<HANDLES>,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    memory: &MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
+    tasks: &crate::task::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    devices: &dyn DeviceResourceInfoProvider,
+    handle: DwHandle,
+    topic: u32,
+) -> Result<ObjectInfoResult, DwStatus> {
+    object_get_info_v1_impl(
+        table,
+        registry,
+        memory,
+        Some(devices),
+        handle,
+        topic,
+        |resolved| task_state_info(tasks, resolved),
+    )
 }
 
 fn object_get_info_v1_impl<
@@ -89,6 +128,7 @@ fn object_get_info_v1_impl<
     table: &HandleTable<HANDLES>,
     registry: &mut ObjectRegistry<OBJECTS>,
     memory: &MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
+    devices: Option<&dyn DeviceResourceInfoProvider>,
     handle: DwHandle,
     topic: u32,
     task_state: F,
@@ -103,12 +143,29 @@ where
     let result = match topic {
         DW_OBJECT_INFO_BASIC_V1 => Ok(ObjectInfoResult::Basic(basic_info(&resolved))),
         DW_OBJECT_INFO_MEMORY_OBJECT_V1 => memory_info(memory, &resolved),
+        DW_OBJECT_INFO_DEVICE_RESOURCE_V1 => device_resource_info(devices, &resolved),
         DW_OBJECT_INFO_TASK_STATE_V1 => task_state(&resolved),
         _ => Err(DW_STATUS_NOT_SUPPORTED),
     };
 
     release_query_pin(registry, resolved);
     result
+}
+
+fn device_resource_info(
+    devices: Option<&dyn DeviceResourceInfoProvider>,
+    resolved: &ResolvedHandle,
+) -> Result<ObjectInfoResult, DwStatus> {
+    if resolved.object_type() != DW_OBJECT_TYPE_DEVICE_RESOURCE {
+        return Err(DW_STATUS_WRONG_OBJECT_TYPE);
+    }
+    let devices = devices.ok_or(DW_STATUS_NOT_SUPPORTED)?;
+    let info = devices
+        .object_info_for_resolved(resolved)
+        .unwrap_or_else(|error| {
+            panic!("live DeviceResource handle has no matching payload record: {error:?}")
+        });
+    Ok(ObjectInfoResult::DeviceResource(info))
 }
 
 fn basic_info(resolved: &ResolvedHandle) -> DwObjectInfoV1 {

@@ -68,7 +68,7 @@ impl FakePort {
     }
 }
 
-impl PortIo for FakePort {
+impl crate::arch::x86_64::io_port::BytePortIo for FakePort {
     fn read_u8(&mut self, port: u16) -> u8 {
         assert_eq!(port, COM1_BASE + LINE_STATUS);
         if !self.ready {

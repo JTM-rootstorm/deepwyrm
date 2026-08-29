@@ -8,6 +8,8 @@ mod boot;
 mod cpu;
 #[path = "../../src/debug/mod.rs"]
 mod debug;
+#[path = "../../src/device/mod.rs"]
+mod device;
 #[path = "../../src/handle/mod.rs"]
 mod handle;
 #[path = "../../src/interrupt/mod.rs"]
