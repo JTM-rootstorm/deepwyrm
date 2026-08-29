@@ -1263,6 +1263,18 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         Ok(stopped.cancelled_quantum)
     }
 
+    pub(crate) fn retire_unentered_running_claim_on(
+        &self,
+        claim: SchedulerExecutionClaim,
+    ) -> Result<Option<super::SchedulerQuantumTicket>, SchedulerError> {
+        let retired = self.scheduler.retire_unentered_running_claim_on(claim)?;
+        #[cfg(deepwyrm_dw1c_evidence)]
+        if let Some(ticket) = retired.consumed_published_expiry {
+            self.observe_terminal_after_expiry_ticket(ticket);
+        }
+        Ok(retired.cancelled_quantum)
+    }
+
     /// Retires a blocked physical continuation by its exact CPU/thread/
     /// execution-generation claim for the e1 delivery-after-block safe point.
     pub(crate) fn stop_suspended_claim_on(

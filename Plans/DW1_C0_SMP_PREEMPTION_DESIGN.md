@@ -192,6 +192,23 @@ The direct mailbox poll and post-EOI latch poll cover different IF-clear race
 windows and both remain required. e2 remains a separate mailbox and may
 acknowledge only its exact invalidation generation after local serialization.
 
+A scheduler `Running` claim is a logical selection, not by itself proof that
+the named Thread already owns the physical carrier. Terminal preparation first
+authenticates and snapshots the complete target Thread set while the runtime
+authority is held, then admits an e1 Stop only when the exact claim also matches
+the saved physical carrier, a stable Process root, and an idle root-switch
+flight. Kernel-root, transitioning, and mismatched-carrier states are retryable
+handoff windows: external termination returns `WOULD_BLOCK` before mutating
+task state, while ProcessExit and exception termination retry internally after
+dropping the fair ticket-ordered runtime authority. When the same terminal
+batch contains both the still-physical suspended continuation and its distinct
+not-yet-entered logical replacement, successful terminal preparation retires
+only that exact replacement and records it in the prepared pin batch before e1
+targets the suspended generation. The exact Stop plan is revalidated after
+cleanup/quiescence and this transactional replacement retirement, before
+mailbox publication. This rule is shared by Process, TaskGroup, and Thread
+termination; no path may infer physical ownership from scheduler state alone.
+
 ## 4. Exact current ownership map
 
 | Concern | Current owner and DW1-C disposition |

@@ -2114,6 +2114,7 @@ fn remote_stop_removes_only_the_exact_running_claim_without_replacement() {
             consumed_published_expiry: None,
         })
     );
+    assert_eq!(scheduler.publish_quantum_expiry(ticket), Ok(false));
     assert_eq!(scheduler.current_on(cpu(1)), None);
     assert_eq!(scheduler.running_cpu(stopped), None);
     assert_eq!(scheduler.suspended_claim_on(cpu(1)), Some(claim));

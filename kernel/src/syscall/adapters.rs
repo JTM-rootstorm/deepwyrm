@@ -851,6 +851,26 @@ fn resolve_current_handle<
     .map(ResolvedHandle::into_internal)
 }
 
+fn inspect_current_object_id<
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    current_process: ProcessKey,
+    handle: DwHandle,
+    object_type: deepwyrm_abi::DwObjectType,
+    rights: DwRights,
+) -> Result<crate::object::ObjectId, DwStatus> {
+    let table = tasks
+        .process_handles(current_process)
+        .map_err(task_status)?;
+    table
+        .inspect_object_id(handle, AcceptedObjectTypes::One(object_type), rights)
+        .map_err(handle_status)
+}
+
 fn release_lookup_pin<const OBJECTS: usize>(
     registry: &mut ObjectRegistry<OBJECTS>,
     pin: InternalRef,
@@ -1057,6 +1077,17 @@ impl<const THREADS: usize> PreRetiredTerminalThreads<THREADS> {
         &mut self.threads
     }
 
+    fn insert(&mut self, thread: ThreadKey) {
+        if self.threads.contains(&Some(thread)) {
+            return;
+        }
+        *self
+            .threads
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .expect("prepared scheduler retirement batch overflow") = Some(thread);
+    }
+
     fn assert_consumed(self) {
         assert!(
             self.threads.into_iter().all(|thread| thread.is_none()),
@@ -1109,6 +1140,11 @@ impl<const PROCESSES: usize, const HANDLES: usize, const THREADS: usize>
     pub(crate) fn contains_thread(&self, thread: ThreadKey) -> bool {
         self.thread_keys().contains(&Some(thread))
     }
+
+    pub(crate) fn record_pre_retired(&mut self, thread: ThreadKey) {
+        assert!(self.contains_thread(thread));
+        self.pre_retired.insert(thread);
+    }
 }
 
 impl<const HANDLES: usize, const THREADS: usize> PreparedProcessTermination<HANDLES, THREADS> {
@@ -1118,6 +1154,11 @@ impl<const HANDLES: usize, const THREADS: usize> PreparedProcessTermination<HAND
 
     pub(crate) fn thread_keys(&self) -> [Option<ThreadKey>; THREADS] {
         self.effects.pins.thread_keys()
+    }
+
+    pub(crate) fn record_pre_retired(&mut self, thread: ThreadKey) {
+        assert!(self.thread_keys().contains(&Some(thread)));
+        self.pre_retired.insert(thread);
     }
 }
 
@@ -1144,6 +1185,11 @@ impl<const THREADS: usize> PreparedThreadTermination<THREADS> {
 
     pub(crate) fn thread_keys(&self) -> [Option<ThreadKey>; THREADS] {
         self.pins.thread_keys()
+    }
+
+    pub(crate) fn record_pre_retired(&mut self, thread: ThreadKey) {
+        assert!(self.thread_keys().contains(&Some(thread)));
+        self.pre_retired.insert(thread);
     }
 }
 
@@ -4179,6 +4225,98 @@ fn authorized_reason(reason: DwTerminationReason) -> Result<(), DwStatus> {
     } else {
         Err(DW_STATUS_INVALID_ARGUMENT)
     }
+}
+
+/// Authenticates an external Process termination target and snapshots its
+/// current Thread identities without starting terminal task mutation. The
+/// caller must retain the runtime authority that keeps the HandleTable and
+/// task topology stationary until the real preparation begins.
+pub(crate) fn inspect_process_termination_threads<
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EXECUTION: usize,
+>(
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    current_process: ProcessKey,
+    current_thread: ThreadKey,
+    process: DwHandle,
+    reason: DwTerminationReason,
+) -> Result<[Option<ThreadKey>; THREADS], DwStatus> {
+    authorized_reason(reason)?;
+    validate_running_caller(tasks, execution, current_process, current_thread)?;
+    let target = ProcessKey::from_object_id(inspect_current_object_id(
+        tasks,
+        current_process,
+        process,
+        deepwyrm_abi::DW_OBJECT_TYPE_PROCESS,
+        DW_RIGHT_MODIFY,
+    )?);
+    tasks.process_thread_keys(target).map_err(task_status)
+}
+
+/// Authenticates an external TaskGroup termination target and snapshots its
+/// recursive Thread set before terminal task mutation begins.
+pub(crate) fn inspect_task_group_termination_threads<
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EXECUTION: usize,
+>(
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    current_process: ProcessKey,
+    current_thread: ThreadKey,
+    task_group: DwHandle,
+    reason: DwTerminationReason,
+) -> Result<[Option<ThreadKey>; THREADS], DwStatus> {
+    authorized_reason(reason)?;
+    validate_running_caller(tasks, execution, current_process, current_thread)?;
+    let target = TaskGroupKey::from_object_id(inspect_current_object_id(
+        tasks,
+        current_process,
+        task_group,
+        deepwyrm_abi::DW_OBJECT_TYPE_TASK_GROUP,
+        DW_RIGHT_MODIFY,
+    )?);
+    tasks.task_group_thread_keys(target).map_err(task_status)
+}
+
+/// Authenticates an external Thread termination target without changing its
+/// lifecycle. The single-key array shares the remote carrier preflight used by
+/// Process and TaskGroup termination.
+pub(crate) fn inspect_thread_termination_threads<
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EXECUTION: usize,
+>(
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    current_process: ProcessKey,
+    current_thread: ThreadKey,
+    thread: DwHandle,
+    reason: DwTerminationReason,
+) -> Result<[Option<ThreadKey>; THREADS], DwStatus> {
+    authorized_reason(reason)?;
+    validate_running_caller(tasks, execution, current_process, current_thread)?;
+    let target = ThreadKey::from_object_id(inspect_current_object_id(
+        tasks,
+        current_process,
+        thread,
+        deepwyrm_abi::DW_OBJECT_TYPE_THREAD,
+        DW_RIGHT_MODIFY,
+    )?);
+    tasks.thread_process(target).map_err(task_status)?;
+    let mut threads = [None; THREADS];
+    *threads
+        .first_mut()
+        .expect("TaskAuthority Thread capacity is nonzero") = Some(target);
+    Ok(threads)
 }
 
 fn control_after_process_state<

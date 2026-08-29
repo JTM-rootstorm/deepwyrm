@@ -2616,6 +2616,23 @@ fn live_current_process_termination_preserves_the_exact_ap_execution_bundle() {
         Some(current)
     );
     let (stack, context) = tasks.thread_execution_resources(current).unwrap().unwrap();
+    let before = tasks.process_info(process).unwrap();
+    let inspected = inspect_process_termination_threads(
+        &tasks,
+        &execution,
+        process,
+        current,
+        process_handle,
+        DW_TERMINATION_AUTHORIZED,
+    )
+    .unwrap();
+    assert_eq!(inspected[0], Some(current));
+    assert!(inspected[1..].iter().all(Option::is_none));
+    assert_eq!(tasks.process_info(process).unwrap(), before);
+    assert_eq!(
+        execution.scheduler_state(current),
+        Some(SchedulerThreadState::Running)
+    );
 
     let prepared = prepare_process_terminate(
         &mut registry,

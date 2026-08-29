@@ -291,6 +291,50 @@ fn lookup_checks_type_and_rights_then_holds_a_pin() {
 }
 
 #[test]
+fn object_identity_inspection_checks_type_and_rights_without_a_pin() {
+    let mut registry = ObjectRegistry::<1>::new();
+    let mut table = HandleTable::<1>::new();
+    let held = rights(&[DW_RIGHT_READ, DW_RIGHT_MAP]);
+    let handle = install_object(
+        &mut registry,
+        &mut table,
+        DW_OBJECT_TYPE_MEMORY_OBJECT,
+        held,
+    );
+    assert_eq!(
+        table.inspect_object_id(
+            handle,
+            AcceptedObjectTypes::One(DW_OBJECT_TYPE_PROCESS),
+            DW_RIGHT_READ,
+        ),
+        Err(HandleTableError::WrongObjectType)
+    );
+    assert_eq!(
+        table.inspect_object_id(handle, AcceptedObjectTypes::Any, DW_RIGHT_WRITE),
+        Err(HandleTableError::AccessDenied)
+    );
+    assert_eq!(
+        table.inspect_object_id(
+            handle,
+            AcceptedObjectTypes::Any,
+            rights(&[DW_RIGHT_READ, DW_RIGHT_MAP]),
+        ),
+        Ok(table.slots[0]
+            .entry
+            .as_ref()
+            .expect("installed Handle remains live")
+            .reference
+            .id())
+    );
+
+    // Unlike lookup, inspection retained no InternalRef. Closing the only
+    // Handle therefore returns the final release immediately.
+    let final_release = table.close(&mut registry, handle).unwrap();
+    assert!(final_release.is_some());
+    complete(&mut registry, final_release);
+}
+
+#[test]
 fn basic_info_requires_inspect_without_creating_a_pin() {
     let mut registry = ObjectRegistry::<1>::new();
     let mut table = HandleTable::<1>::new();

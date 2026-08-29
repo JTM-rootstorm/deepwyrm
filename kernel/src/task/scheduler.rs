@@ -3574,6 +3574,54 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         })
     }
 
+    /// Retires an exact logical replacement that has not entered its CPU
+    /// because an older suspended continuation still owns the physical
+    /// carrier. Architecture runtime authority must prove that physical fact;
+    /// the scheduler requires the queued suspended generation and never
+    /// manufactures another continuation for the unentered claim.
+    pub(crate) fn retire_unentered_running_claim_on(
+        &self,
+        claim: SchedulerExecutionClaim,
+    ) -> Result<SchedulerTerminalStop, SchedulerError> {
+        let mut state = self.state.lock();
+        if claim.domain != state.domain || claim.generation == 0 {
+            return Err(SchedulerError::StaleExecutionClaim);
+        }
+        let cpu_index = claim.cpu.index();
+        let Some(running) = state.running[cpu_index] else {
+            return Err(SchedulerError::StaleExecutionClaim);
+        };
+        if running.thread != claim.thread || running.generation != claim.generation {
+            return Err(SchedulerError::StaleExecutionClaim);
+        }
+        let Some(suspended) = state.suspended[cpu_index] else {
+            return Err(SchedulerError::SwitchPending);
+        };
+        if suspended.publication != SuspendedPublication::Queued || suspended.thread == claim.thread
+        {
+            return Err(SchedulerError::SwitchPending);
+        }
+        state.validate_terminal_retirement(claim.thread)?;
+        if state.pending_block[cpu_index].is_some_and(|pending| pending.thread == claim.thread) {
+            state.pending_block[cpu_index] = None;
+        }
+        let cleared_preemption = state.clear_preemption_on(claim.cpu);
+        state.running[cpu_index] = None;
+        state.record_terminal_retirement(claim.thread);
+        state.record_trace(
+            SchedulerTraceKind::Retire,
+            claim.cpu,
+            Some(claim.thread),
+            claim.generation,
+        );
+        state.assert_invariants();
+        Ok(SchedulerTerminalStop {
+            cancelled_quantum: cleared_preemption.cancelled_quantum,
+            #[cfg(deepwyrm_dw1c_evidence)]
+            consumed_published_expiry: cleared_preemption.published_expiry,
+        })
+    }
+
     /// Retires the exact blocked continuation that is still physically active
     /// on `claim.cpu`. This is the e1 delivery-after-block case: the logical
     /// Running claim was already exchanged for a generation-bound suspended

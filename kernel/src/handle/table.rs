@@ -717,6 +717,26 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
         })
     }
 
+    /// Validates a live Handle's type and rights without retaining a lookup
+    /// pin. Callers may use the returned identity only while a stronger
+    /// authority prevents the HandleTable and referenced object from changing.
+    pub(crate) fn inspect_object_id(
+        &self,
+        handle: DwHandle,
+        accepted: AcceptedObjectTypes<'_>,
+        required_rights: DwRights,
+    ) -> Result<ObjectId, HandleTableError> {
+        validate_required_syntax(required_rights).map_err(rights_error)?;
+        let entry = self.resolve_entry(handle)?;
+        let object_type = entry.reference.object_type();
+        if !accepted.accepts(object_type) {
+            return Err(HandleTableError::WrongObjectType);
+        }
+        validate_compatible(object_type, required_rights).map_err(rights_error)?;
+        require_held(entry.rights, required_rights).map_err(rights_error)?;
+        Ok(entry.reference.id())
+    }
+
     pub(crate) fn inspect_basic(
         &self,
         handle: DwHandle,

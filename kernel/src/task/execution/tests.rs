@@ -843,6 +843,16 @@ fn terminal_physical_claim_prefers_unpublished_suspended_generation_over_logical
         domain.terminal_physical_claim_on(cpu1, &[Some(replacement), None]),
         Some(running)
     );
+
+    assert_eq!(domain.retire_unentered_running_claim_on(running), Ok(None));
+    assert_eq!(domain.suspended_claim_on(cpu1), Some(suspended));
+    assert_eq!(domain.running_claim_on(cpu1), None);
+    assert_eq!(domain.scheduler_state(replacement), None);
+    assert_eq!(
+        domain.scheduler_state(outgoing),
+        Some(super::super::SchedulerThreadState::Blocked)
+    );
+    assert_eq!(domain.scheduler.check_invariants(), Ok(()));
 }
 
 #[test]
