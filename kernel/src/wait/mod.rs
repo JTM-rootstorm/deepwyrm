@@ -12,6 +12,7 @@ use deepwyrm_abi::{
     DW_TASK_STATE_EXITED, DwSignals, dw_signals_are_compatible,
 };
 
+use crate::device::InterruptWaitSource;
 use crate::handle::ResolvedHandle;
 use crate::ipc::{ChannelAuthority, ChannelEndpointKey};
 use crate::object::{
@@ -357,6 +358,7 @@ pub(crate) fn current_signals_for<
     events: &EventAuthority<EVENTS>,
     timers: &TimerAuthority<TIMERS>,
     channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
+    interrupts: Option<&dyn InterruptWaitSource>,
     target: &ResolvedHandle,
 ) -> Result<DwSignals, WaitError> {
     match target.object_type() {
@@ -388,6 +390,10 @@ pub(crate) fn current_signals_for<
             .map_err(|_| WaitError::InvalidObject),
         DW_OBJECT_TYPE_CHANNEL => channels
             .current_signals(ChannelEndpointKey::from_object_id(target.object_id()))
+            .map_err(|_| WaitError::InvalidObject),
+        deepwyrm_abi::DW_OBJECT_TYPE_INTERRUPT => interrupts
+            .ok_or(WaitError::UnsupportedSource)?
+            .current_signals_for_resolved(target)
             .map_err(|_| WaitError::InvalidObject),
         object_type if deepwyrm_abi::dw_object_compatible_signals(object_type).0 != 0 => {
             Err(WaitError::UnsupportedSource)
@@ -427,6 +433,17 @@ pub(crate) struct WaitRegistration {
 pub(crate) struct WaitRegistrationFailure {
     error: WaitError,
     pin: InternalRef,
+}
+
+pub(crate) trait WaitRegistrationSink {
+    fn register(
+        &self,
+        pin: InternalRef,
+        desired: DwSignals,
+        item_index: u32,
+        thread: ThreadKey,
+        wake: BlockWakeKey,
+    ) -> Result<WaitRegistration, WaitRegistrationFailure>;
 }
 
 impl WaitRegistrationFailure {
@@ -780,6 +797,19 @@ impl<const CAPACITY: usize> WaitRegistry<CAPACITY> {
             .iter()
             .filter(|slot| slot.entry.is_some())
             .count()
+    }
+}
+
+impl<const CAPACITY: usize> WaitRegistrationSink for WaitRegistry<CAPACITY> {
+    fn register(
+        &self,
+        pin: InternalRef,
+        desired: DwSignals,
+        item_index: u32,
+        thread: ThreadKey,
+        wake: BlockWakeKey,
+    ) -> Result<WaitRegistration, WaitRegistrationFailure> {
+        WaitRegistry::register(self, pin, desired, item_index, thread, wake)
     }
 }
 

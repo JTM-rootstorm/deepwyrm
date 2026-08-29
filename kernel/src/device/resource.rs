@@ -280,6 +280,13 @@ impl<const RESOURCES: usize> DeviceResourceAuthority<RESOURCES> {
         Ok(resource.descriptor)
     }
 
+    pub(super) fn descriptor_for_interrupt(
+        &self,
+        resolved: &ResolvedHandle,
+    ) -> Result<DeviceResourceDescriptor, DeviceResourceError> {
+        self.descriptor_for_resolved(resolved)
+    }
+
     fn access_for_resolved(
         &self,
         resolved: &ResolvedHandle,

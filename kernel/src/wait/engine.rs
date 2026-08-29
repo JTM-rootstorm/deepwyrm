@@ -1,8 +1,10 @@
 use deepwyrm_abi::{
-    DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_EVENT, DW_OBJECT_TYPE_PROCESS, DW_OBJECT_TYPE_THREAD,
-    DW_OBJECT_TYPE_TIMER, DW_RIGHT_WAIT, DW_WAIT_MANY_MAX_ITEMS, DwSignals, DwWaitItemV1,
+    DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_EVENT, DW_OBJECT_TYPE_INTERRUPT, DW_OBJECT_TYPE_PROCESS,
+    DW_OBJECT_TYPE_THREAD, DW_OBJECT_TYPE_TIMER, DW_RIGHT_WAIT, DW_WAIT_MANY_MAX_ITEMS, DwSignals,
+    DwWaitItemV1,
 };
 
+use crate::device::{InterruptWaitOutcome, InterruptWaitSource};
 use crate::handle::{AcceptedObjectTypes, HandleTableError, ResolvedHandle};
 #[cfg(deepwyrm_dw1c_evidence)]
 use crate::ipc::ChannelEndpointKey;
@@ -163,6 +165,7 @@ pub(crate) struct WaitSources<
     pub(crate) events: &'a EventAuthority<EVENTS>,
     pub(crate) timers: &'a TimerAuthority<TIMERS>,
     pub(crate) channels: &'a ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
+    pub(crate) interrupts: Option<&'a dyn InterruptWaitSource>,
     pub(crate) waits: &'a WaitRegistry<WAITERS>,
 }
 
@@ -272,6 +275,7 @@ impl ResolvedWaitSet {
                 sources.events,
                 sources.timers,
                 sources.channels,
+                sources.interrupts,
                 &item.target,
             )
             .map_err(WaitSetError::Wait)?;
@@ -451,12 +455,29 @@ fn register_one<
             Ok(ChannelWaitOutcome::Registered(_registration)) => Ok(RegisterOutcome::Registered),
             Err(failure) => Err((WaitSetError::Channel(failure.error), failure.pin)),
         },
+        DW_OBJECT_TYPE_INTERRUPT => {
+            let Some(interrupts) = sources.interrupts else {
+                return Err((
+                    WaitSetError::Wait(WaitError::UnsupportedSource),
+                    target.into_internal(),
+                ));
+            };
+            match interrupts.register_wait(sources.waits, target, desired, item_index, thread, wake)
+            {
+                Ok(InterruptWaitOutcome::Ready { pin, .. }) => Ok(RegisterOutcome::Ready(pin)),
+                Ok(InterruptWaitOutcome::Registered(_registration)) => {
+                    Ok(RegisterOutcome::Registered)
+                }
+                Err(failure) => Err((WaitSetError::Wait(failure.error), failure.pin)),
+            }
+        }
         DW_OBJECT_TYPE_PROCESS | DW_OBJECT_TYPE_THREAD => {
             let observed = match current_signals_for(
                 tasks,
                 sources.events,
                 sources.timers,
                 sources.channels,
+                sources.interrupts,
                 &target,
             ) {
                 Ok(observed) => observed,
@@ -1264,6 +1285,7 @@ mod tests {
                     events: &events,
                     timers: &timers,
                     channels: &channels,
+                    interrupts: None,
                     waits: &waits
                 }
             )
@@ -1298,6 +1320,7 @@ mod tests {
                     events: &events,
                     timers: &timers,
                     channels: &channels,
+                    interrupts: None,
                     waits: &waits
                 }
             )
@@ -1326,6 +1349,7 @@ mod tests {
                     events: &events,
                     timers: &timers,
                     channels: &channels,
+                    interrupts: None,
                     waits: &waits,
                 },
                 execution: &execution,
@@ -1375,6 +1399,7 @@ mod tests {
                     events: &events,
                     timers: &timers,
                     channels: &channels,
+                    interrupts: None,
                     waits: &waits
                 }
             )
@@ -1393,6 +1418,7 @@ mod tests {
                     events: &events,
                     timers: &timers,
                     channels: &channels,
+                    interrupts: None,
                     waits: &waits,
                 },
                 execution: &execution,
@@ -1463,6 +1489,146 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_wait_uses_generic_engine_and_irq_completion_without_pin_leak() {
+        let (mut registry, mut tasks, execution, process, thread) = running_fixture();
+        let events = Events::new();
+        let timers = Timers::new();
+        let channels = Channels::new();
+        let waits = Waits::new();
+        let resources = crate::device::DeviceResourceAuthority::<1>::new();
+        let interrupts = crate::device::InterruptAuthority::<1>::new();
+        let platform = crate::device::InterruptPlatformModel::<1>::new();
+        let mut handles = crate::handle::HandleTable::<2>::new();
+
+        let domain_creation = registry
+            .create(deepwyrm_abi::DW_OBJECT_TYPE_TASK_GROUP)
+            .unwrap();
+        let resource_domain = crate::task::TaskGroupKey::from_object_id(domain_creation.id());
+        registry.cancel_creation(domain_creation).unwrap();
+        let (_, resource) = resources
+            .create(
+                &mut registry,
+                &mut handles,
+                crate::device::DeviceResourceDescriptor {
+                    resource_id: 1,
+                    lease_generation: 1,
+                    kind: deepwyrm_abi::DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT,
+                    pio_base: 0x2f8,
+                    pio_length: 8,
+                    interrupt_source: 3,
+                    resource_domain,
+                },
+                deepwyrm_abi::dw_object_compatible_rights(
+                    deepwyrm_abi::DW_OBJECT_TYPE_DEVICE_RESOURCE,
+                ),
+            )
+            .unwrap();
+        let (interrupt_key, interrupt) = crate::device::interrupt_create(
+            &mut handles,
+            &mut registry,
+            &resources,
+            &interrupts,
+            &platform,
+            resource,
+            deepwyrm_abi::dw_object_compatible_rights(deepwyrm_abi::DW_OBJECT_TYPE_INTERRUPT),
+        )
+        .unwrap();
+        let target = handles
+            .lookup(
+                &mut registry,
+                interrupt,
+                crate::handle::AcceptedObjectTypes::One(deepwyrm_abi::DW_OBJECT_TYPE_INTERRUPT),
+                deepwyrm_abi::DW_RIGHT_WAIT,
+            )
+            .unwrap();
+        let mut items = core::array::from_fn(|_| None);
+        items[0] = Some(ResolvedWaitItem {
+            target,
+            desired: DW_SIGNAL_SIGNALED,
+            item_index: 0,
+        });
+        let set = ResolvedWaitSet { items, len: 1 };
+        let mut operations = WaitOperationRegistry::<u32, 1>::new();
+        let wake = match begin_registered_wait(
+            set,
+            0x93,
+            WaitDeadline::Infinite,
+            WaitBeginContext {
+                registry: &mut registry,
+                tasks: &mut tasks,
+                sources: WaitSources {
+                    events: &events,
+                    timers: &timers,
+                    channels: &channels,
+                    interrupts: Some(&interrupts),
+                    waits: &waits,
+                },
+                execution: &execution,
+                operations: &mut operations,
+                cpu: crate::cpu::CpuIndex::BOOTSTRAP,
+                process,
+                thread,
+            },
+            None,
+        )
+        .unwrap_or_else(|failure| panic!("Interrupt wait begin failed: {:?}", failure.error))
+        {
+            WaitBeginOutcome::Suspended { wake, .. } => wake,
+            WaitBeginOutcome::Ready { .. } => panic!("armed Interrupt was unexpectedly ready"),
+            WaitBeginOutcome::TimedOut { .. } => panic!("infinite Interrupt wait timed out"),
+        };
+        assert_eq!(waits.len(), 1);
+
+        let binding = interrupts.binding(interrupt_key);
+        let delivery = platform.prepare_delivery(binding).unwrap();
+        let (accepted, wakes) = interrupts.deliver(delivery, &waits);
+        assert!(accepted);
+        assert_eq!(wakes.len(), 1);
+        crate::wait::complete_irq_signal_wakes(&execution, wakes);
+        let (output, winner, releases) = finish_wait_operation(
+            &mut registry,
+            &mut tasks,
+            &waits,
+            &execution,
+            &mut operations,
+            None,
+            wake,
+        )
+        .unwrap();
+        assert_eq!(output, 0x93);
+        assert_eq!(
+            winner,
+            BlockedOperationWinner::Signal {
+                item_index: 0,
+                observed: DW_SIGNAL_SIGNALED,
+            }
+        );
+        assert!(releases.is_empty());
+        assert_eq!(waits.len(), 0);
+
+        let repeated = platform.prepare_delivery(binding).unwrap();
+        let (accepted, wakes) = interrupts.deliver(repeated, &waits);
+        assert!(accepted);
+        assert_eq!(wakes.len(), 0);
+
+        let interrupt_release = handles.close(&mut registry, interrupt).unwrap().unwrap();
+        let finalization = crate::device::InterruptFinalizer::take_finalization(
+            &interrupts,
+            interrupt_release,
+            &platform,
+        )
+        .unwrap();
+        assert!(
+            crate::device::complete_interrupt_finalization(&mut registry, finalization).is_none()
+        );
+        let resource_release = handles.close(&mut registry, resource).unwrap().unwrap();
+        let finalization =
+            crate::device::DeviceResourceFinalizer::take_finalization(&resources, resource_release)
+                .unwrap();
+        crate::device::complete_device_resource_finalization(&mut registry, finalization);
+    }
+
+    #[test]
     fn dw1c4_wait_many_block_commit_consumes_a_due_quantum_before_signal_wake() {
         let (mut registry, mut tasks, execution, process, thread) = running_fixture();
         let events = Events::new();
@@ -1502,6 +1668,7 @@ mod tests {
                     events: &events,
                     timers: &timers,
                     channels: &channels,
+                    interrupts: None,
                     waits: &waits,
                 },
                 execution: &execution,
@@ -1608,6 +1775,7 @@ mod tests {
                     events: &events,
                     timers: &timers,
                     channels: &channels,
+                    interrupts: None,
                     waits: &waits,
                 },
                 execution: &execution,
@@ -1698,6 +1866,7 @@ mod tests {
                     events: &events,
                     timers: &timers,
                     channels: &channels,
+                    interrupts: None,
                     waits: &waits,
                 },
                 execution: &execution,
@@ -1875,6 +2044,7 @@ mod tests {
                     events: &events,
                     timers: &timers,
                     channels: &channels,
+                    interrupts: None,
                     waits: &waits,
                 },
                 execution: &execution,
@@ -1910,6 +2080,7 @@ mod tests {
                     events: &events,
                     timers: &timers,
                     channels: &channels,
+                    interrupts: None,
                     waits: &waits,
                 },
                 execution: &execution,
@@ -1960,6 +2131,7 @@ mod tests {
                     events: &events,
                     timers: &timers,
                     channels: &channels,
+                    interrupts: None,
                     waits: &waits,
                 },
                 execution: &execution,
@@ -2033,6 +2205,7 @@ mod tests {
                     events: &events,
                     timers: &timers,
                     channels: &channels,
+                    interrupts: None,
                     waits: &waits,
                 },
                 execution: &execution,
@@ -2118,6 +2291,7 @@ mod tests {
                     events: &events,
                     timers: &timers,
                     channels: &channels,
+                    interrupts: None,
                     waits: &waits,
                 },
                 execution: &execution,

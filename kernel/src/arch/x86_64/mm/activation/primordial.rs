@@ -780,6 +780,8 @@ struct PrimordialRuntimeShared {
     execution: ExecutionDomain<EXECUTION_THREADS>,
     channels: Channels,
     device_resources: crate::device::DeviceResourceAuthority<8>,
+    interrupts: crate::device::InterruptAuthority<8>,
+    interrupt_platform: crate::device::InterruptPlatformModel<8>,
     events: EventAuthority<EVENTS>,
     timers: TimerAuthority<TIMERS>,
     timer_expiries:
@@ -1368,6 +1370,8 @@ fn publish_runtime_shared() -> &'static PrimordialRuntimeShared {
             execution,
             channels: Channels::new(),
             device_resources: crate::device::DeviceResourceAuthority::new(),
+            interrupts: crate::device::InterruptAuthority::new(),
+            interrupt_platform: crate::device::InterruptPlatformModel::new(),
             events: EventAuthority::new(),
             timers: TimerAuthority::new(),
             timer_expiries: IrqSpinMutex::new([None; crate::time::DEADLINE_QUEUE_CAPACITY]),
@@ -4937,7 +4941,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         &mut self.spaces,
                         &mut self.regions,
                     )
-                    .with_device_resources(&self.shared.device_resources);
+                    .with_device_resources(&self.shared.device_resources)
+                    .with_interrupts(&self.shared.interrupts, &self.shared.interrupt_platform);
                     finalizer.finalize_chain(release)
                 };
                 crate::syscall::complete_wait_wakes(
@@ -7567,6 +7572,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                         &self.shared.channels,
                         &self.shared.events,
                         &self.shared.timers,
+                        Some(&self.shared.interrupts),
                         &self.shared.waits,
                         &mut self.regions,
                         &mut self.spaces,
@@ -7717,19 +7723,22 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     self.active_root.as_ref().expect("active root"),
                     self.process,
                 );
-                NativeSyscallResult::returning(crate::syscall::object_get_info_v1_with_devices(
-                    &mut user,
-                    &mut self.registry,
-                    &self.memory,
-                    &self.tasks,
-                    &self.shared.device_resources,
-                    self.process,
-                    handle,
-                    topic,
-                    out_info,
-                    out_size,
-                    out_required_size,
-                ))
+                NativeSyscallResult::returning(
+                    crate::syscall::object_get_info_v1_with_device_objects(
+                        &mut user,
+                        &mut self.registry,
+                        &self.memory,
+                        &self.tasks,
+                        &self.shared.device_resources,
+                        &self.shared.interrupts,
+                        self.process,
+                        handle,
+                        topic,
+                        out_info,
+                        out_size,
+                        out_required_size,
+                    ),
+                )
             }
             NativeSyscallRequest::TaskGroupCreate {
                 parent,

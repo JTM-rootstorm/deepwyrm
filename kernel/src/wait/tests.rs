@@ -335,21 +335,21 @@ fn process_and_thread_exited_signals_are_observed_from_task_authority() {
         deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_THREAD),
     );
     assert_eq!(
-        current_signals_for(&tasks, &events, &timers, &channels, &process_target).unwrap(),
+        current_signals_for(&tasks, &events, &timers, &channels, None, &process_target).unwrap(),
         DwSignals(0)
     );
     assert_eq!(
-        current_signals_for(&tasks, &events, &timers, &channels, &thread_target).unwrap(),
+        current_signals_for(&tasks, &events, &timers, &channels, None, &thread_target).unwrap(),
         DwSignals(0)
     );
 
     let exit_pins = tasks.terminate_thread_authorized(thread, 0x44).unwrap();
     assert_eq!(
-        current_signals_for(&tasks, &events, &timers, &channels, &process_target).unwrap(),
+        current_signals_for(&tasks, &events, &timers, &channels, None, &process_target).unwrap(),
         DW_SIGNAL_EXITED
     );
     assert_eq!(
-        current_signals_for(&tasks, &events, &timers, &channels, &thread_target).unwrap(),
+        current_signals_for(&tasks, &events, &timers, &channels, None, &thread_target).unwrap(),
         DW_SIGNAL_EXITED
     );
     assert_eq!(process_target.object_id(), process.object_id());

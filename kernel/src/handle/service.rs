@@ -5,15 +5,16 @@
 
 use deepwyrm_abi::{
     DW_MEMORY_OBJECT_INFO_V1_SIZE, DW_OBJECT_INFO_BASIC_V1, DW_OBJECT_INFO_DEVICE_RESOURCE_V1,
-    DW_OBJECT_INFO_MEMORY_OBJECT_V1, DW_OBJECT_INFO_TASK_STATE_V1, DW_OBJECT_INFO_V1_SIZE,
-    DW_OBJECT_TYPE_DEVICE_RESOURCE, DW_OBJECT_TYPE_MEMORY_OBJECT, DW_OBJECT_TYPE_PROCESS,
-    DW_OBJECT_TYPE_THREAD, DW_RIGHT_INSPECT, DW_STATUS_ACCESS_DENIED, DW_STATUS_BAD_HANDLE,
-    DW_STATUS_INVALID_ARGUMENT, DW_STATUS_NO_RESOURCES, DW_STATUS_NOT_SUPPORTED,
-    DW_STATUS_WRONG_OBJECT_TYPE, DwDeviceResourceInfoV1, DwHandle, DwMemoryObjectInfoV1,
-    DwObjectInfoV1, DwRights, DwStatus, DwTaskTerminationInfoV1,
+    DW_OBJECT_INFO_INTERRUPT_V1, DW_OBJECT_INFO_MEMORY_OBJECT_V1, DW_OBJECT_INFO_TASK_STATE_V1,
+    DW_OBJECT_INFO_V1_SIZE, DW_OBJECT_TYPE_DEVICE_RESOURCE, DW_OBJECT_TYPE_INTERRUPT,
+    DW_OBJECT_TYPE_MEMORY_OBJECT, DW_OBJECT_TYPE_PROCESS, DW_OBJECT_TYPE_THREAD, DW_RIGHT_INSPECT,
+    DW_STATUS_ACCESS_DENIED, DW_STATUS_BAD_HANDLE, DW_STATUS_INVALID_ARGUMENT,
+    DW_STATUS_NO_RESOURCES, DW_STATUS_NOT_SUPPORTED, DW_STATUS_WRONG_OBJECT_TYPE,
+    DwDeviceResourceInfoV1, DwHandle, DwInterruptInfoV1, DwMemoryObjectInfoV1, DwObjectInfoV1,
+    DwRights, DwStatus, DwTaskTerminationInfoV1,
 };
 
-use crate::device::DeviceResourceInfoProvider;
+use crate::device::{DeviceResourceInfoProvider, InterruptInfoProvider};
 use crate::memory::object::MemoryObjectAuthority;
 use crate::object::{FinalRelease, ObjectRegistry};
 
@@ -25,6 +26,7 @@ pub(crate) enum ObjectInfoResult {
     TaskState(DwTaskTerminationInfoV1),
     MemoryObject(DwMemoryObjectInfoV1),
     DeviceResource(DwDeviceResourceInfoV1),
+    Interrupt(DwInterruptInfoV1),
 }
 
 pub(crate) fn handle_close<const HANDLES: usize, const OBJECTS: usize>(
@@ -63,6 +65,7 @@ pub(crate) fn object_get_info_v1<
         registry,
         memory,
         None,
+        None,
         handle,
         topic,
         task_state_reserved,
@@ -85,9 +88,16 @@ pub(crate) fn object_get_info_v1_with_tasks<
     handle: DwHandle,
     topic: u32,
 ) -> Result<ObjectInfoResult, DwStatus> {
-    object_get_info_v1_impl(table, registry, memory, None, handle, topic, |resolved| {
-        task_state_info(tasks, resolved)
-    })
+    object_get_info_v1_impl(
+        table,
+        registry,
+        memory,
+        None,
+        None,
+        handle,
+        topic,
+        |resolved| task_state_info(tasks, resolved),
+    )
 }
 
 pub(crate) fn object_get_info_v1_with_tasks_and_devices<
@@ -112,12 +122,51 @@ pub(crate) fn object_get_info_v1_with_tasks_and_devices<
         registry,
         memory,
         Some(devices),
+        None,
         handle,
         topic,
         |resolved| task_state_info(tasks, resolved),
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the object-info service keeps each typed authority explicit"
+)]
+pub(crate) fn object_get_info_v1_with_tasks_and_device_objects<
+    const HANDLES: usize,
+    const OBJECTS: usize,
+    const MEMORY_OBJECTS: usize,
+    const LEASES: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+>(
+    table: &HandleTable<HANDLES>,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    memory: &MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
+    tasks: &crate::task::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    devices: &dyn DeviceResourceInfoProvider,
+    interrupts: &dyn InterruptInfoProvider,
+    handle: DwHandle,
+    topic: u32,
+) -> Result<ObjectInfoResult, DwStatus> {
+    object_get_info_v1_impl(
+        table,
+        registry,
+        memory,
+        Some(devices),
+        Some(interrupts),
+        handle,
+        topic,
+        |resolved| task_state_info(tasks, resolved),
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the internal object-info dispatcher keeps authority availability explicit"
+)]
 fn object_get_info_v1_impl<
     const HANDLES: usize,
     const OBJECTS: usize,
@@ -129,6 +178,7 @@ fn object_get_info_v1_impl<
     registry: &mut ObjectRegistry<OBJECTS>,
     memory: &MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
     devices: Option<&dyn DeviceResourceInfoProvider>,
+    interrupts: Option<&dyn InterruptInfoProvider>,
     handle: DwHandle,
     topic: u32,
     task_state: F,
@@ -144,12 +194,29 @@ where
         DW_OBJECT_INFO_BASIC_V1 => Ok(ObjectInfoResult::Basic(basic_info(&resolved))),
         DW_OBJECT_INFO_MEMORY_OBJECT_V1 => memory_info(memory, &resolved),
         DW_OBJECT_INFO_DEVICE_RESOURCE_V1 => device_resource_info(devices, &resolved),
+        DW_OBJECT_INFO_INTERRUPT_V1 => interrupt_info(interrupts, &resolved),
         DW_OBJECT_INFO_TASK_STATE_V1 => task_state(&resolved),
         _ => Err(DW_STATUS_NOT_SUPPORTED),
     };
 
     release_query_pin(registry, resolved);
     result
+}
+
+fn interrupt_info(
+    interrupts: Option<&dyn InterruptInfoProvider>,
+    resolved: &ResolvedHandle,
+) -> Result<ObjectInfoResult, DwStatus> {
+    if resolved.object_type() != DW_OBJECT_TYPE_INTERRUPT {
+        return Err(DW_STATUS_WRONG_OBJECT_TYPE);
+    }
+    let interrupts = interrupts.ok_or(DW_STATUS_NOT_SUPPORTED)?;
+    let info = interrupts
+        .object_info_for_resolved(resolved)
+        .unwrap_or_else(|error| {
+            panic!("live Interrupt handle has no matching payload record: {error:?}")
+        });
+    Ok(ObjectInfoResult::Interrupt(info))
 }
 
 fn device_resource_info(

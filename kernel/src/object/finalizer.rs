@@ -5,11 +5,14 @@
 
 use deepwyrm_abi::{
     DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_DEVICE_RESOURCE,
-    DW_OBJECT_TYPE_EVENT, DW_OBJECT_TYPE_MEMORY_OBJECT, DW_OBJECT_TYPE_PROCESS,
-    DW_OBJECT_TYPE_TASK_GROUP, DW_OBJECT_TYPE_THREAD, DW_OBJECT_TYPE_TIMER,
+    DW_OBJECT_TYPE_EVENT, DW_OBJECT_TYPE_INTERRUPT, DW_OBJECT_TYPE_MEMORY_OBJECT,
+    DW_OBJECT_TYPE_PROCESS, DW_OBJECT_TYPE_TASK_GROUP, DW_OBJECT_TYPE_THREAD, DW_OBJECT_TYPE_TIMER,
 };
 
-use crate::device::{DeviceResourceFinalizer, complete_device_resource_finalization};
+use crate::device::{
+    DeviceResourceFinalizer, InterruptFinalizer, InterruptPlatform,
+    complete_device_resource_finalization, complete_interrupt_finalization,
+};
 use crate::ipc::{ChannelAuthority, complete_channel_finalization};
 use crate::memory::address_region::{
     AddressRegionObjectAuthority, AddressSpaceAuthority, complete_address_region_finalization,
@@ -57,6 +60,8 @@ pub(crate) struct PayloadFinalizer<
     spaces: &'a mut AddressSpaceAuthority<SPACES, REGIONS>,
     regions: &'a mut AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
     device_resources: Option<&'a dyn DeviceResourceFinalizer>,
+    interrupts: Option<&'a dyn InterruptFinalizer>,
+    interrupt_platform: Option<&'a dyn InterruptPlatform>,
 }
 
 impl<
@@ -132,6 +137,8 @@ impl<
             spaces,
             regions,
             device_resources: None,
+            interrupts: None,
+            interrupt_platform: None,
         }
     }
 
@@ -140,6 +147,16 @@ impl<
         device_resources: &'a dyn DeviceResourceFinalizer,
     ) -> Self {
         self.device_resources = Some(device_resources);
+        self
+    }
+
+    pub(crate) fn with_interrupts(
+        mut self,
+        interrupts: &'a dyn InterruptFinalizer,
+        platform: &'a dyn InterruptPlatform,
+    ) -> Self {
+        self.interrupts = Some(interrupts);
+        self.interrupt_platform = Some(platform);
         self
     }
 
@@ -244,6 +261,30 @@ impl<
                         panic!("DeviceResource final release bypassed its typed payload: {error:?}")
                     });
                 complete_device_resource_finalization(self.registry, finalization);
+                WakeBatch::empty()
+            }
+            DW_OBJECT_TYPE_INTERRUPT => {
+                let finalization = self
+                    .interrupts
+                    .unwrap_or_else(|| {
+                        panic!("Interrupt final release reached a finalizer without D3 authority")
+                    })
+                    .take_finalization(
+                        final_release,
+                        self.interrupt_platform.unwrap_or_else(|| {
+                            panic!(
+                                "Interrupt final release reached a finalizer without D3 platform"
+                            )
+                        }),
+                    )
+                    .unwrap_or_else(|(error, _)| {
+                        panic!("Interrupt final release bypassed its typed payload: {error:?}")
+                    });
+                push_pending(
+                    pending,
+                    pending_len,
+                    complete_interrupt_finalization(self.registry, finalization),
+                );
                 WakeBatch::empty()
             }
             DW_OBJECT_TYPE_TASK_GROUP | DW_OBJECT_TYPE_PROCESS | DW_OBJECT_TYPE_THREAD => {
@@ -412,6 +453,81 @@ mod tests {
         .with_device_resources(&devices);
         assert_eq!(finalizer.finalize_chain(final_release).len(), 0);
         assert_eq!(devices.live_count(), 0);
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "test-local AddressSpaceAuthority uniquely owns its synthetic root identities"
+    )]
+    fn interrupt_finalization_unbinds_then_chains_parent_resource_iteratively() {
+        let mut registry = ObjectRegistry::<8>::new();
+        let mut roles = synthetic_frame_role_manager::<1, 8>(0x39_000, 4);
+        let mut memory = MemoryObjectAuthority::<1, 1>::new();
+        let events = EventAuthority::<1>::new();
+        let timers = TimerAuthority::<1>::new();
+        let mut timer_deadlines = TestTimerDeadlines::<2>::new(0);
+        let channels = ChannelAuthority::<1, 2>::new();
+        let waits = WaitRegistry::<4>::new();
+        let mut tasks = TaskAuthority::<1, 1, 1, 1>::new();
+        let mut spaces = unsafe { AddressSpaceAuthority::<1, 1>::new() };
+        let mut regions = AddressRegionObjectAuthority::<1, 1>::new();
+        let (domain, _owner) = tasks.create_root_group(&mut registry).unwrap();
+        let devices = crate::device::DeviceResourceAuthority::<1>::new();
+        let interrupts = crate::device::InterruptAuthority::<1>::new();
+        let platform = crate::device::InterruptPlatformModel::<1>::new();
+        let mut handles = crate::handle::HandleTable::<2>::new();
+        let (_, resource) = devices
+            .create(
+                &mut registry,
+                &mut handles,
+                crate::device::DeviceResourceDescriptor {
+                    resource_id: 1,
+                    lease_generation: 1,
+                    kind: deepwyrm_abi::DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT,
+                    pio_base: 0x2f8,
+                    pio_length: 8,
+                    interrupt_source: 3,
+                    resource_domain: domain,
+                },
+                deepwyrm_abi::dw_object_compatible_rights(
+                    deepwyrm_abi::DW_OBJECT_TYPE_DEVICE_RESOURCE,
+                ),
+            )
+            .unwrap();
+        let (interrupt_key, interrupt) = crate::device::interrupt_create(
+            &mut handles,
+            &mut registry,
+            &devices,
+            &interrupts,
+            &platform,
+            resource,
+            deepwyrm_abi::dw_object_compatible_rights(deepwyrm_abi::DW_OBJECT_TYPE_INTERRUPT),
+        )
+        .unwrap();
+        let binding = interrupts.binding(interrupt_key);
+
+        assert!(handles.close(&mut registry, resource).unwrap().is_none());
+        let first = handles.close(&mut registry, interrupt).unwrap().unwrap();
+        let mut finalizer = PayloadFinalizer::new(
+            &mut registry,
+            &mut roles,
+            &mut memory,
+            &events,
+            &timers,
+            &mut timer_deadlines,
+            &channels,
+            &waits,
+            &mut tasks,
+            &mut spaces,
+            &mut regions,
+        )
+        .with_device_resources(&devices)
+        .with_interrupts(&interrupts, &platform);
+        assert_eq!(finalizer.finalize_chain(first).len(), 0);
+        assert_eq!(interrupts.live_count(), 0);
+        assert_eq!(devices.live_count(), 0);
+        assert!(!platform.is_bound(binding));
     }
 
     #[test]

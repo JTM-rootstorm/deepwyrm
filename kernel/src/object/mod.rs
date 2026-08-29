@@ -751,6 +751,24 @@ impl payload_cleanup_seal::Sealed for crate::wait::EventPayloadCleanup {
 impl PayloadCleanupProof for crate::wait::EventPayloadCleanup {}
 
 #[cfg(deepwyrm_integrated)]
+impl payload_binding_seal::Sealed for crate::device::InterruptPayloadBinding {
+    fn into_creation(self) -> CreationRef {
+        self.into_creation()
+    }
+}
+#[cfg(deepwyrm_integrated)]
+impl PayloadBindingProof for crate::device::InterruptPayloadBinding {}
+
+#[cfg(deepwyrm_integrated)]
+impl payload_cleanup_seal::Sealed for crate::device::InterruptCleanup {
+    fn into_final_release(self) -> FinalRelease {
+        self.into_final_release()
+    }
+}
+#[cfg(deepwyrm_integrated)]
+impl PayloadCleanupProof for crate::device::InterruptCleanup {}
+
+#[cfg(deepwyrm_integrated)]
 impl payload_binding_seal::Sealed for crate::time::TimerPayloadBinding {
     fn into_creation(self) -> CreationRef {
         self.into_creation()

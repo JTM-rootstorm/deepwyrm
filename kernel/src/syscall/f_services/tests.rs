@@ -415,6 +415,7 @@ impl Fixture {
             &self.channels,
             &self.events,
             &self.timers,
+            None,
             &self.waits,
             &mut self.regions,
             &mut self.spaces,

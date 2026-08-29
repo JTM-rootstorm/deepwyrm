@@ -1058,6 +1058,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                 &self.channels,
                 &self.events,
                 &self.timers,
+                None,
                 &self.waits,
                 &mut self.regions,
                 &mut self.spaces,

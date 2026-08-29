@@ -1,14 +1,15 @@
 use deepwyrm_abi::{
     DW_ABI_INFO_V1_SIZE, DW_ABI_VERSION, DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE, DW_BASE_PAGE_SIZE,
     DW_CHANNEL_MAX_HANDLES, DW_CHANNEL_MAX_PAYLOAD, DW_CHANNEL_RECEIVE_RESULT_V1_SIZE,
-    DW_DEVICE_RESOURCE_INFO_V1_SIZE, DW_HANDLE_TRANSFER_V1_SIZE, DW_MEMORY_OBJECT_INFO_V1_SIZE,
-    DW_OBJECT_INFO_V1_SIZE, DW_PROCESS_CREATE_ARGS_V1_SIZE, DW_PROCESS_CREATE_RESULT_V1_SIZE,
-    DW_RECEIVED_HANDLE_INFO_V1_SIZE, DW_TASK_TERMINATION_INFO_V1_SIZE,
-    DW_THREAD_START_ARGS_V1_SIZE, DW_WAIT_ITEM_V1_SIZE, DW_WAIT_RESULT_V1_SIZE, DwAbiInfoV1,
-    DwAddressRegionMapArgsV1, DwChannelReceiveResultV1, DwDeviceResourceInfoV1, DwHandle,
-    DwHandleTransferOperation, DwHandleTransferV1, DwMemoryObjectInfoV1, DwObjectInfoV1,
-    DwProcessCreateArgsV1, DwProcessCreateResultV1, DwReceivedHandleInfoV1, DwRights, DwSignals,
-    DwTaskTerminationInfoV1, DwThreadStartArgsV1, DwWaitItemV1, DwWaitResultV1,
+    DW_DEVICE_RESOURCE_INFO_V1_SIZE, DW_HANDLE_TRANSFER_V1_SIZE, DW_INTERRUPT_INFO_V1_SIZE,
+    DW_MEMORY_OBJECT_INFO_V1_SIZE, DW_OBJECT_INFO_V1_SIZE, DW_PROCESS_CREATE_ARGS_V1_SIZE,
+    DW_PROCESS_CREATE_RESULT_V1_SIZE, DW_RECEIVED_HANDLE_INFO_V1_SIZE,
+    DW_TASK_TERMINATION_INFO_V1_SIZE, DW_THREAD_START_ARGS_V1_SIZE, DW_WAIT_ITEM_V1_SIZE,
+    DW_WAIT_RESULT_V1_SIZE, DwAbiInfoV1, DwAddressRegionMapArgsV1, DwChannelReceiveResultV1,
+    DwDeviceResourceInfoV1, DwHandle, DwHandleTransferOperation, DwHandleTransferV1,
+    DwInterruptInfoV1, DwMemoryObjectInfoV1, DwObjectInfoV1, DwProcessCreateArgsV1,
+    DwProcessCreateResultV1, DwReceivedHandleInfoV1, DwRights, DwSignals, DwTaskTerminationInfoV1,
+    DwThreadStartArgsV1, DwWaitItemV1, DwWaitResultV1,
 };
 
 use crate::service::ObjectInfoResult;
@@ -97,6 +98,10 @@ pub(crate) fn encode_object_info(result: ObjectInfoResult) -> EncodedObjectInfo 
             encode_device_resource_info(&mut bytes, info);
             DW_DEVICE_RESOURCE_INFO_V1_SIZE as usize
         }
+        ObjectInfoResult::Interrupt(info) => {
+            encode_interrupt_info(&mut bytes, info);
+            DW_INTERRUPT_INFO_V1_SIZE as usize
+        }
     };
     EncodedObjectInfo { bytes, len }
 }
@@ -150,6 +155,20 @@ fn encode_device_resource_info(
     bytes[34..36].copy_from_slice(&info.pio_length.to_le_bytes());
     put_u32(bytes, 36, info.interrupt_source);
     put_u64(bytes, 40, info.reserved);
+}
+
+fn encode_interrupt_info(bytes: &mut [u8; MAX_OBJECT_INFO_BYTES], info: DwInterruptInfoV1) {
+    put_u32(bytes, 0, info.size);
+    put_u32(bytes, 4, info.version);
+    put_u32(bytes, 8, info.source);
+    put_u32(bytes, 12, info.state.0);
+    put_u64(bytes, 16, info.object_generation);
+    put_u64(bytes, 24, info.binding_generation);
+    put_u64(bytes, 32, info.parent_resource_id);
+    put_u64(bytes, 40, info.parent_lease_generation);
+    put_u32(bytes, 48, info.flags.0);
+    put_u32(bytes, 52, info.reserved0);
+    put_u64(bytes, 56, info.reserved);
 }
 
 fn get_u32(bytes: &[u8], offset: usize) -> u32 {

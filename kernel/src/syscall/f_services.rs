@@ -17,6 +17,7 @@ use crate::atomic_wait::{
     AtomicWaitBegin, AtomicWaitBeginError, AtomicWaitOperationRegistry, AtomicWaitRegistry,
     begin_atomic_wait, finish_atomic_wait, finish_terminal_atomic_wait, wake_atomic_waiters,
 };
+use crate::device::InterruptWaitSource;
 use crate::ipc::ChannelAuthority;
 use crate::memory::address_region::{AddressRegionObjectAuthority, AddressSpaceAuthority};
 use crate::memory::usercopy::{OwnedUserOutputAccess, UserPageBatchAccess};
@@ -239,6 +240,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         channels: &ChannelAuthority<PAIRS, DEPTH>,
         events: &EventAuthority<EVENTS>,
         timers: &TimerAuthority<TIMERS>,
+        interrupts: Option<&dyn InterruptWaitSource>,
         waits: &WaitRegistry<WAITERS>,
         regions: &mut AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
         spaces: &mut AddressSpaceAuthority<SPACES, REGIONS>,
@@ -352,6 +354,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
                 events,
                 timers,
                 channels,
+                interrupts,
                 waits,
                 execution,
                 &mut self.wait_operations,
@@ -377,6 +380,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
                 events,
                 timers,
                 channels,
+                interrupts,
                 waits,
                 execution,
                 &mut self.wait_operations,

@@ -12,23 +12,25 @@
 use deepwyrm_abi::{
     DW_ABI_INFO_V1_SIZE, DW_BASE_PAGE_SIZE, DW_CHANNEL_MAX_HANDLES, DW_CHANNEL_MAX_PAYLOAD,
     DW_CHANNEL_RECEIVE_RESULT_V1_SIZE, DW_CLOCK_MONOTONIC_ACTIVE, DW_DEVICE_RESOURCE_INFO_V1_SIZE,
-    DW_HANDLE_TRANSFER_MOVE, DW_HANDLE_TRANSFER_V1_SIZE, DW_MEMORY_OBJECT_INFO_V1_SIZE,
-    DW_OBJECT_INFO_BASIC_V1, DW_OBJECT_INFO_DEVICE_RESOURCE_V1, DW_OBJECT_INFO_MEMORY_OBJECT_V1,
-    DW_OBJECT_INFO_TASK_STATE_V1, DW_OBJECT_INFO_V1_SIZE, DW_OBJECT_TYPE_ADDRESS_REGION,
-    DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_PROCESS, DW_OBJECT_TYPE_TASK_GROUP,
-    DW_PROCESS_CREATE_ARGS_V1_SIZE, DW_PROCESS_CREATE_RESULT_V1_SIZE,
-    DW_RECEIVED_HANDLE_INFO_V1_SIZE, DW_RIGHT_EXECUTE, DW_RIGHT_MODIFY, DW_RIGHT_READ,
-    DW_RIGHT_SIGNAL, DW_RIGHT_TRANSFER, DW_RIGHT_WRITE, DW_STATUS_ACCESS_DENIED,
-    DW_STATUS_BAD_ADDRESS, DW_STATUS_BAD_HANDLE, DW_STATUS_BAD_STATE, DW_STATUS_BUFFER_TOO_SMALL,
-    DW_STATUS_INVALID_ARGUMENT, DW_STATUS_NO_RESOURCES, DW_STATUS_NOT_SUPPORTED,
-    DW_STATUS_PEER_CLOSED, DW_STATUS_SUCCESS, DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK,
-    DW_STATUS_WRONG_OBJECT_TYPE, DW_TASK_STATE_EXITED, DW_TERMINATION_AUTHORIZED,
-    DW_WAIT_MANY_MAX_ITEMS, DW_WAIT_MODE_ALL, DW_WAIT_MODE_ANY, DW_WAIT_RESULT_V1_SIZE,
-    DwChannelReceiveResultV1, DwClockId, DwDeadline, DwHandle, DwHandleTransferV1,
-    DwProcessCreateArgsV1, DwProcessCreateResultV1, DwReceivedHandleInfoV1, DwRights, DwSignals,
-    DwStatus, DwTerminationReason, DwUserAddress, DwWaitItemV1, DwWaitResultV1,
+    DW_HANDLE_TRANSFER_MOVE, DW_HANDLE_TRANSFER_V1_SIZE, DW_INTERRUPT_INFO_V1_SIZE,
+    DW_MEMORY_OBJECT_INFO_V1_SIZE, DW_OBJECT_INFO_BASIC_V1, DW_OBJECT_INFO_DEVICE_RESOURCE_V1,
+    DW_OBJECT_INFO_INTERRUPT_V1, DW_OBJECT_INFO_MEMORY_OBJECT_V1, DW_OBJECT_INFO_TASK_STATE_V1,
+    DW_OBJECT_INFO_V1_SIZE, DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL,
+    DW_OBJECT_TYPE_PROCESS, DW_OBJECT_TYPE_TASK_GROUP, DW_PROCESS_CREATE_ARGS_V1_SIZE,
+    DW_PROCESS_CREATE_RESULT_V1_SIZE, DW_RECEIVED_HANDLE_INFO_V1_SIZE, DW_RIGHT_EXECUTE,
+    DW_RIGHT_MODIFY, DW_RIGHT_READ, DW_RIGHT_SIGNAL, DW_RIGHT_TRANSFER, DW_RIGHT_WRITE,
+    DW_STATUS_ACCESS_DENIED, DW_STATUS_BAD_ADDRESS, DW_STATUS_BAD_HANDLE, DW_STATUS_BAD_STATE,
+    DW_STATUS_BUFFER_TOO_SMALL, DW_STATUS_INVALID_ARGUMENT, DW_STATUS_NO_RESOURCES,
+    DW_STATUS_NOT_SUPPORTED, DW_STATUS_PEER_CLOSED, DW_STATUS_SUCCESS, DW_STATUS_TIMED_OUT,
+    DW_STATUS_WOULD_BLOCK, DW_STATUS_WRONG_OBJECT_TYPE, DW_TASK_STATE_EXITED,
+    DW_TERMINATION_AUTHORIZED, DW_WAIT_MANY_MAX_ITEMS, DW_WAIT_MODE_ALL, DW_WAIT_MODE_ANY,
+    DW_WAIT_RESULT_V1_SIZE, DwChannelReceiveResultV1, DwClockId, DwDeadline, DwHandle,
+    DwHandleTransferV1, DwProcessCreateArgsV1, DwProcessCreateResultV1, DwReceivedHandleInfoV1,
+    DwRights, DwSignals, DwStatus, DwTerminationReason, DwUserAddress, DwWaitItemV1,
+    DwWaitResultV1,
 };
 
+use crate::device::InterruptWaitSource;
 use crate::handle::{
     AcceptedObjectTypes, HANDLE_TRANSFER_LIMIT, HandleMovePrepareError, HandleMoveRequest,
     HandlePairReservation, HandleReservationSpec, HandleTableError, HandleTransferReservation,
@@ -753,6 +755,7 @@ pub(crate) fn object_get_info_v1<
         memory,
         tasks,
         None,
+        None,
         current_process,
         handle,
         topic,
@@ -790,6 +793,46 @@ pub(crate) fn object_get_info_v1_with_devices<
         memory,
         tasks,
         Some(devices),
+        None,
+        current_process,
+        handle,
+        topic,
+        out_info,
+        out_size,
+        out_required_size,
+    )
+}
+
+pub(crate) fn object_get_info_v1_with_device_objects<
+    U: UserPageAccess,
+    const OBJECTS: usize,
+    const MEMORY_OBJECTS: usize,
+    const LEASES: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    user: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    memory: &MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    devices: &dyn crate::device::DeviceResourceInfoProvider,
+    interrupts: &dyn crate::device::InterruptInfoProvider,
+    current_process: ProcessKey,
+    handle: DwHandle,
+    topic: u32,
+    out_info: DwUserAddress,
+    out_size: u64,
+    out_required_size: DwUserAddress,
+) -> DwStatus {
+    object_get_info_v1_impl(
+        user,
+        registry,
+        memory,
+        tasks,
+        Some(devices),
+        Some(interrupts),
         current_process,
         handle,
         topic,
@@ -814,6 +857,7 @@ fn object_get_info_v1_impl<
     memory: &MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
     tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     devices: Option<&dyn crate::device::DeviceResourceInfoProvider>,
+    interrupts: Option<&dyn crate::device::InterruptInfoProvider>,
     current_process: ProcessKey,
     handle: DwHandle,
     topic: u32,
@@ -832,13 +876,21 @@ fn object_get_info_v1_impl<
         Ok(table) => table,
         Err(error) => return task_status(error),
     };
-    let result = match devices {
-        Some(devices) => crate::service::object_get_info_v1_with_tasks_and_devices(
+    let result = match (devices, interrupts) {
+        (Some(devices), Some(interrupts)) => {
+            crate::service::object_get_info_v1_with_tasks_and_device_objects(
+                table, registry, memory, tasks, devices, interrupts, handle, topic,
+            )
+        }
+        (Some(devices), None) => crate::service::object_get_info_v1_with_tasks_and_devices(
             table, registry, memory, tasks, devices, handle, topic,
         ),
-        None => crate::service::object_get_info_v1_with_tasks(
+        (None, None) => crate::service::object_get_info_v1_with_tasks(
             table, registry, memory, tasks, handle, topic,
         ),
+        (None, Some(_)) => {
+            panic!("Interrupt object info cannot be wired without DeviceResource info")
+        }
     };
     let result = match result {
         Ok(result) => result,
@@ -877,6 +929,7 @@ pub(crate) const fn object_info_required_size(topic: u32) -> Option<u64> {
         DW_OBJECT_INFO_TASK_STATE_V1 => Some(64),
         DW_OBJECT_INFO_MEMORY_OBJECT_V1 => Some(DW_MEMORY_OBJECT_INFO_V1_SIZE as u64),
         DW_OBJECT_INFO_DEVICE_RESOURCE_V1 => Some(DW_DEVICE_RESOURCE_INFO_V1_SIZE as u64),
+        DW_OBJECT_INFO_INTERRUPT_V1 => Some(DW_INTERRUPT_INFO_V1_SIZE as u64),
         _ => None,
     }
 }
@@ -3242,6 +3295,7 @@ fn begin_wait_set<
     events: &EventAuthority<EVENTS>,
     timers: &TimerAuthority<TIMERS>,
     channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
+    interrupts: Option<&dyn InterruptWaitSource>,
     waits: &WaitRegistry<WAITERS>,
     execution: &ExecutionDomain<EXECUTION>,
     operations: &mut WaitOperationRegistry<OUTPUT, EXECUTION>,
@@ -3261,6 +3315,7 @@ fn begin_wait_set<
                 events,
                 timers,
                 channels,
+                interrupts,
                 waits,
             },
             execution,
@@ -3287,6 +3342,66 @@ fn begin_wait_set<
         Err(failure) => WaitSyscallBegin::Returning {
             status: wait_begin_status(failure.error),
             output: failure.output,
+            result: None,
+        },
+    }
+}
+
+fn wait_one_begin_with_interrupts<
+    OUTPUT,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EVENTS: usize,
+    const TIMERS: usize,
+    const CHANNEL_PAIRS: usize,
+    const CHANNEL_DEPTH: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    output: OUTPUT,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    events: &EventAuthority<EVENTS>,
+    timers: &TimerAuthority<TIMERS>,
+    channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
+    interrupts: Option<&dyn InterruptWaitSource>,
+    waits: &WaitRegistry<WAITERS>,
+    execution: &ExecutionDomain<EXECUTION>,
+    operations: &mut WaitOperationRegistry<OUTPUT, EXECUTION>,
+    deadline_authority: Option<&mut dyn WaitDeadlineAuthority>,
+    current_cpu: crate::cpu::CpuIndex,
+    process: ProcessKey,
+    thread: ThreadKey,
+    handle: DwHandle,
+    signals: DwSignals,
+    deadline: DwDeadline,
+) -> WaitSyscallBegin<OUTPUT> {
+    let request = [DwWaitItemV1 { handle, signals }];
+    match ResolvedWaitSet::resolve(tasks, registry, process, &request) {
+        Ok(set) => begin_wait_set(
+            set,
+            output,
+            deadline,
+            registry,
+            tasks,
+            events,
+            timers,
+            channels,
+            interrupts,
+            waits,
+            execution,
+            operations,
+            deadline_authority,
+            current_cpu,
+            process,
+            thread,
+        ),
+        Err(error) => WaitSyscallBegin::Returning {
+            status: wait_set_status(error),
+            output,
             result: None,
         },
     }
@@ -3323,31 +3438,25 @@ pub(crate) fn wait_one_begin<
     signals: DwSignals,
     deadline: DwDeadline,
 ) -> WaitSyscallBegin<OUTPUT> {
-    let request = [DwWaitItemV1 { handle, signals }];
-    match ResolvedWaitSet::resolve(tasks, registry, process, &request) {
-        Ok(set) => begin_wait_set(
-            set,
-            output,
-            deadline,
-            registry,
-            tasks,
-            events,
-            timers,
-            channels,
-            waits,
-            execution,
-            operations,
-            deadline_authority,
-            current_cpu,
-            process,
-            thread,
-        ),
-        Err(error) => WaitSyscallBegin::Returning {
-            status: wait_set_status(error),
-            output,
-            result: None,
-        },
-    }
+    wait_one_begin_with_interrupts(
+        output,
+        registry,
+        tasks,
+        events,
+        timers,
+        channels,
+        None,
+        waits,
+        execution,
+        operations,
+        deadline_authority,
+        current_cpu,
+        process,
+        thread,
+        handle,
+        signals,
+        deadline,
+    )
 }
 
 fn validate_wait_many_shape(item_count: u32, mode: u32) -> Result<usize, DwStatus> {
@@ -3409,6 +3518,7 @@ fn wait_many_requests_begin<
     events: &EventAuthority<EVENTS>,
     timers: &TimerAuthority<TIMERS>,
     channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
+    interrupts: Option<&dyn InterruptWaitSource>,
     waits: &WaitRegistry<WAITERS>,
     execution: &ExecutionDomain<EXECUTION>,
     operations: &mut WaitOperationRegistry<OUTPUT, EXECUTION>,
@@ -3429,6 +3539,7 @@ fn wait_many_requests_begin<
             events,
             timers,
             channels,
+            interrupts,
             waits,
             execution,
             operations,
@@ -3443,6 +3554,71 @@ fn wait_many_requests_begin<
             result: None,
         },
     }
+}
+
+fn wait_many_begin_with_interrupts<
+    U: UserPageAccess,
+    OUTPUT,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EVENTS: usize,
+    const TIMERS: usize,
+    const CHANNEL_PAIRS: usize,
+    const CHANNEL_DEPTH: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    user: &mut U,
+    output: OUTPUT,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    events: &EventAuthority<EVENTS>,
+    timers: &TimerAuthority<TIMERS>,
+    channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
+    interrupts: Option<&dyn InterruptWaitSource>,
+    waits: &WaitRegistry<WAITERS>,
+    execution: &ExecutionDomain<EXECUTION>,
+    operations: &mut WaitOperationRegistry<OUTPUT, EXECUTION>,
+    deadline_authority: Option<&mut dyn WaitDeadlineAuthority>,
+    current_cpu: crate::cpu::CpuIndex,
+    process: ProcessKey,
+    thread: ThreadKey,
+    items: DwUserAddress,
+    item_count: u32,
+    mode: u32,
+    deadline: DwDeadline,
+) -> WaitSyscallBegin<OUTPUT> {
+    let (requests, count) = match snapshot_wait_many_requests(user, items, item_count, mode) {
+        Ok(requests) => requests,
+        Err(status) => {
+            return WaitSyscallBegin::Returning {
+                status,
+                output,
+                result: None,
+            };
+        }
+    };
+    wait_many_requests_begin(
+        output,
+        registry,
+        tasks,
+        events,
+        timers,
+        channels,
+        interrupts,
+        waits,
+        execution,
+        operations,
+        deadline_authority,
+        current_cpu,
+        process,
+        thread,
+        &requests[..count],
+        deadline,
+    )
 }
 
 pub(crate) fn wait_many_begin<
@@ -3479,23 +3655,15 @@ pub(crate) fn wait_many_begin<
     mode: u32,
     deadline: DwDeadline,
 ) -> WaitSyscallBegin<OUTPUT> {
-    let (requests, count) = match snapshot_wait_many_requests(user, items, item_count, mode) {
-        Ok(requests) => requests,
-        Err(status) => {
-            return WaitSyscallBegin::Returning {
-                status,
-                output,
-                result: None,
-            };
-        }
-    };
-    wait_many_requests_begin(
+    wait_many_begin_with_interrupts(
+        user,
         output,
         registry,
         tasks,
         events,
         timers,
         channels,
+        None,
         waits,
         execution,
         operations,
@@ -3503,7 +3671,9 @@ pub(crate) fn wait_many_begin<
         current_cpu,
         process,
         thread,
-        &requests[..count],
+        items,
+        item_count,
+        mode,
         deadline,
     )
 }
@@ -3585,6 +3755,7 @@ pub(crate) fn wait_one_syscall<
         events,
         timers,
         channels,
+        None,
         waits,
         execution,
         operations,
@@ -3619,6 +3790,7 @@ pub(crate) fn wait_one_syscall_on<
     events: &EventAuthority<EVENTS>,
     timers: &TimerAuthority<TIMERS>,
     channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
+    interrupts: Option<&dyn InterruptWaitSource>,
     waits: &WaitRegistry<WAITERS>,
     execution: &ExecutionDomain<EXECUTION>,
     operations: &mut WaitOperationRegistry<U::OwnedOutput, EXECUTION>,
@@ -3640,13 +3812,14 @@ pub(crate) fn wait_one_syscall_on<
     };
     finish_wait_begin(
         user,
-        wait_one_begin(
+        wait_one_begin_with_interrupts(
             output,
             registry,
             tasks,
             events,
             timers,
             channels,
+            interrupts,
             waits,
             execution,
             operations,
@@ -3700,6 +3873,7 @@ pub(crate) fn wait_many_syscall<
         events,
         timers,
         channels,
+        None,
         waits,
         execution,
         operations,
@@ -3735,6 +3909,7 @@ pub(crate) fn wait_many_syscall_on<
     events: &EventAuthority<EVENTS>,
     timers: &TimerAuthority<TIMERS>,
     channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
+    interrupts: Option<&dyn InterruptWaitSource>,
     waits: &WaitRegistry<WAITERS>,
     execution: &ExecutionDomain<EXECUTION>,
     operations: &mut WaitOperationRegistry<U::OwnedOutput, EXECUTION>,
@@ -3763,6 +3938,7 @@ pub(crate) fn wait_many_syscall_on<
         events,
         timers,
         channels,
+        interrupts,
         waits,
         execution,
         operations,
