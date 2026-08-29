@@ -52,12 +52,10 @@ use crate::task::ProcessLifecycleState;
 use crate::task::{ExecutionDomain, ProcessKey, SchedulerThreadState, TaskAuthority, ThreadKey};
 use crate::time::TimerAuthority;
 use crate::wait::{EventAuthority, WaitRegistry};
-#[cfg(deepwyrm_dw1c_evidence)]
-use deepwyrm_abi::DW_STATUS_WOULD_BLOCK;
 use deepwyrm_abi::{
     DW_CHANNEL_MAX_PAYLOAD, DW_EXCEPTION_GENERAL_PROTECTION, DW_STATUS_BAD_STATE,
-    DW_STATUS_NO_RESOURCES, DW_STATUS_NOT_SUPPORTED, DW_STATUS_SUCCESS, DW_TASK_STATE_EXITED,
-    DW_TERMINATION_NORMAL_EXIT,
+    DW_STATUS_NO_RESOURCES, DW_STATUS_NOT_SUPPORTED, DW_STATUS_SUCCESS, DW_STATUS_WOULD_BLOCK,
+    DW_TASK_STATE_EXITED, DW_TERMINATION_NORMAL_EXIT,
 };
 
 const MAX_BOOTFS_BYTES: usize = 32 * 1024 * 1024;

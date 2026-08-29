@@ -230,6 +230,43 @@ fn i1_native_adapter_phases_revalidate_exact_identity_after_guard_free_work() {
 }
 
 #[test]
+fn common_terminal_retry_paths_use_an_unconditionally_imported_status() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    assert!(
+        !primordial
+            .contains("#[cfg(deepwyrm_dw1c_evidence)]\nuse deepwyrm_abi::DW_STATUS_WOULD_BLOCK;")
+    );
+    let abi_import = primordial
+        .split_once("use deepwyrm_abi::{")
+        .expect("common primordial ABI import")
+        .1
+        .split_once("};")
+        .expect("end of common primordial ABI import")
+        .0;
+    assert!(abi_import.contains("DW_STATUS_WOULD_BLOCK"));
+
+    for helper in [
+        "prepare_remote_process_termination",
+        "prepare_remote_task_group_termination",
+        "prepare_remote_thread_termination",
+    ] {
+        let helper = primordial
+            .split_once(&format!("fn {helper}("))
+            .unwrap_or_else(|| panic!("missing common terminal helper {helper}"))
+            .1;
+        let helper = helper
+            .split_once("\n    fn ")
+            .map_or(helper, |(body, _)| body);
+        assert!(
+            helper.contains(
+                "NativeSyscallResult::returning(\n                    DW_STATUS_WOULD_BLOCK,"
+            ),
+            "{helper} lost its ordinary retry status"
+        );
+    }
+}
+
+#[test]
 fn dw1c_token7_channel_flight_is_capacity_only_and_post_authority() {
     let adapters = source("src/syscall/adapters.rs");
     let send = adapters
