@@ -13,6 +13,7 @@ pub enum DwSyscallImplementationPhase {
     Dw0F = 5,
     Dw0G = 6,
     Dw0H = 7,
+    Dw1D = 8,
 }
 
 impl DwSyscallImplementationPhase {
@@ -52,6 +53,11 @@ pub enum DwKnownSyscall {
     TimerCreate,
     TimerSet,
     TimerCancel,
+    DeviceResourceClaim,
+    DevicePioRead,
+    DevicePioWrite,
+    InterruptCreate,
+    InterruptAck,
 }
 
 impl DwKnownSyscall {
@@ -87,6 +93,11 @@ impl DwKnownSyscall {
             0x00050010 => Some(Self::TimerCreate),
             0x00050011 => Some(Self::TimerSet),
             0x00050012 => Some(Self::TimerCancel),
+            0x00060001 => Some(Self::DeviceResourceClaim),
+            0x00060002 => Some(Self::DevicePioRead),
+            0x00060003 => Some(Self::DevicePioWrite),
+            0x00060010 => Some(Self::InterruptCreate),
+            0x00060011 => Some(Self::InterruptAck),
             _ => None,
         }
     }
@@ -123,6 +134,11 @@ impl DwKnownSyscall {
             Self::TimerCreate => DwSyscallId(0x00050010),
             Self::TimerSet => DwSyscallId(0x00050011),
             Self::TimerCancel => DwSyscallId(0x00050012),
+            Self::DeviceResourceClaim => DwSyscallId(0x00060001),
+            Self::DevicePioRead => DwSyscallId(0x00060002),
+            Self::DevicePioWrite => DwSyscallId(0x00060003),
+            Self::InterruptCreate => DwSyscallId(0x00060010),
+            Self::InterruptAck => DwSyscallId(0x00060011),
         }
     }
 
@@ -158,6 +174,11 @@ impl DwKnownSyscall {
             Self::TimerCreate => DwSyscallImplementationPhase::Dw0F,
             Self::TimerSet => DwSyscallImplementationPhase::Dw0F,
             Self::TimerCancel => DwSyscallImplementationPhase::Dw0F,
+            Self::DeviceResourceClaim => DwSyscallImplementationPhase::Dw1D,
+            Self::DevicePioRead => DwSyscallImplementationPhase::Dw1D,
+            Self::DevicePioWrite => DwSyscallImplementationPhase::Dw1D,
+            Self::InterruptCreate => DwSyscallImplementationPhase::Dw1D,
+            Self::InterruptAck => DwSyscallImplementationPhase::Dw1D,
         }
     }
 
@@ -193,6 +214,11 @@ impl DwKnownSyscall {
             Self::TimerCreate => 2,
             Self::TimerSet => 2,
             Self::TimerCancel => 1,
+            Self::DeviceResourceClaim => 4,
+            Self::DevicePioRead => 4,
+            Self::DevicePioWrite => 4,
+            Self::InterruptCreate => 3,
+            Self::InterruptAck => 1,
         }
     }
 }

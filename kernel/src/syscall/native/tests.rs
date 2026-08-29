@@ -57,6 +57,22 @@ fn unknown_syscalls_remain_not_supported() {
 }
 
 #[test]
+fn d1_device_syscalls_remain_inactive_before_runtime_implementation() {
+    for syscall in [
+        DwKnownSyscall::DeviceResourceClaim,
+        DwKnownSyscall::DevicePioRead,
+        DwKnownSyscall::DevicePioWrite,
+        DwKnownSyscall::InterruptCreate,
+        DwKnownSyscall::InterruptAck,
+    ] {
+        assert_eq!(
+            decode_native(syscall.id(), args([0; 6])),
+            Err(DW_STATUS_NOT_SUPPORTED)
+        );
+    }
+}
+
+#[test]
 fn narrow_scalar_arguments_reject_nonzero_upper_bits() {
     assert_eq!(
         decode_native(

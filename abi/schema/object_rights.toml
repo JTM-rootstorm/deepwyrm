@@ -2,7 +2,7 @@ schema_version = 1
 
 [[object_rights]]
 object = "TASK_GROUP"
-rights = "MODIFY,DUPLICATE,TRANSFER,INSPECT"
+rights = "MODIFY,DUPLICATE,TRANSFER,INSPECT,RESOURCE"
 
 [[object_rights]]
 object = "PROCESS"
@@ -31,3 +31,11 @@ rights = "WAIT,SIGNAL,DUPLICATE,TRANSFER,INSPECT"
 [[object_rights]]
 object = "TIMER"
 rights = "WAIT,MODIFY,DUPLICATE,TRANSFER,INSPECT"
+
+[[object_rights]]
+object = "INTERRUPT"
+rights = "WAIT,MODIFY,TRANSFER,INSPECT"
+
+[[object_rights]]
+object = "DEVICE_RESOURCE"
+rights = "READ,WRITE,MODIFY,DUPLICATE,TRANSFER,INSPECT"

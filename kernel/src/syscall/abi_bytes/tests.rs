@@ -1,17 +1,19 @@
 use super::*;
 use deepwyrm_abi::{
-    DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE, DW_CHANNEL_RECEIVE_RESULT_V1_SIZE, DW_HANDLE_TRANSFER_MOVE,
-    DW_HANDLE_TRANSFER_V1_SIZE, DW_OBJECT_TYPE_EVENT, DW_OBJECT_TYPE_PROCESS,
-    DW_PROCESS_CREATE_ARGS_V1_SIZE, DW_PROCESS_CREATE_RESULT_V1_SIZE,
-    DW_RECEIVED_HANDLE_INFO_V1_SIZE, DW_RIGHT_INSPECT, DW_SIGNAL_READABLE, DW_TASK_STATE_EXITED,
-    DW_TERMINATION_AUTHORIZED, DW_WAIT_ITEM_V1_SIZE, DW_WAIT_RESULT_V1_SIZE,
-    DwAddressRegionMapFlags, DwChannelReceiveResultV1, DwExceptionType, DwHandleTransferV1,
-    DwMemoryProtection, DwObjectType, DwOffset, DwProcessCreateResultV1, DwReceivedHandleInfoV1,
-    DwRights, DwSize, DwTaskState, DwTerminationReason, DwUserAddress, DwWaitResultV1,
+    DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT, DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE,
+    DW_CHANNEL_RECEIVE_RESULT_V1_SIZE, DW_HANDLE_TRANSFER_MOVE, DW_HANDLE_TRANSFER_V1_SIZE,
+    DW_OBJECT_TYPE_EVENT, DW_OBJECT_TYPE_PROCESS, DW_PROCESS_CREATE_ARGS_V1_SIZE,
+    DW_PROCESS_CREATE_RESULT_V1_SIZE, DW_RECEIVED_HANDLE_INFO_V1_SIZE, DW_RIGHT_INSPECT,
+    DW_SIGNAL_READABLE, DW_TASK_STATE_EXITED, DW_TERMINATION_AUTHORIZED, DW_WAIT_ITEM_V1_SIZE,
+    DW_WAIT_RESULT_V1_SIZE, DwAddressRegionMapFlags, DwChannelReceiveResultV1, DwExceptionType,
+    DwHandleTransferV1, DwMemoryProtection, DwObjectType, DwOffset, DwProcessCreateResultV1,
+    DwReceivedHandleInfoV1, DwRights, DwSize, DwTaskState, DwTerminationReason, DwUserAddress,
+    DwWaitResultV1,
 };
 
 #[test]
 fn abi_info_encoding_is_padding_free_and_exact() {
+    assert_eq!(DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT, 1);
     let bytes = encode_abi_info();
     assert_eq!(bytes.len(), 64);
     assert_eq!(&bytes[0..4], &64_u32.to_le_bytes());

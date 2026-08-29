@@ -57,14 +57,14 @@ doc = "Absolute-monotonic-deadline timer."
 [[object]]
 name = "INTERRUPT"
 value = 16
-phase = "reserved"
-doc = "Reserved for a future interrupt-delivery object."
+phase = "DW1-D"
+doc = "Exclusive, waitable, explicitly acknowledged interrupt-delivery object."
 
 [[object]]
 name = "DEVICE_RESOURCE"
 value = 17
-phase = "reserved"
-doc = "Reserved for future rights-scoped device resources."
+phase = "DW1-D"
+doc = "Rights-scoped kernel-managed device resource."
 
 [[object]]
 name = "EXCEPTION"
@@ -99,5 +99,5 @@ doc = "The process or thread reached its terminal state."
 [[signal]]
 name = "SIGNALED"
 value = 0x0000000000000010
-applies_to = "EVENT,TIMER"
-doc = "The event or timer is signaled."
+applies_to = "EVENT,TIMER,INTERRUPT"
+doc = "The event, timer, or interrupt is signaled."

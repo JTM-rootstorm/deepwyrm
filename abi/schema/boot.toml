@@ -19,6 +19,48 @@ value = 1
 doc = "Required version value for DwBootModuleV1 records."
 
 [[constant]]
+name = "DW_BOOT_DEVICE_TABLE_V1_VERSION"
+type = "u32"
+value = 1
+doc = "Required version value for the kernel-internal DwBootDeviceTableV1 carrier."
+
+[[constant]]
+name = "DW_BOOT_DEVICE_TABLE_FLAGS_SUPPORTED_MASK"
+type = "u32"
+value = 0
+doc = "DwBootDeviceTableV1 supports no nonzero flags."
+
+[[constant]]
+name = "DW_BOOT_DEVICE_TABLE_RECORD_STRIDE"
+type = "u32"
+value = 48
+doc = "Required byte stride of each DwBootDeviceResourceV1 record."
+
+[[constant]]
+name = "DW_BOOT_DEVICE_TABLE_MAX_RESOURCES"
+type = "u32"
+value = 8
+doc = "Maximum number of immutable resource records accepted from one boot-device table."
+
+[[constant]]
+name = "DW_BOOT_DEVICE_RESOURCE_V1_VERSION"
+type = "u32"
+value = 1
+doc = "Required version value for DwBootDeviceResourceV1 records."
+
+[[constant]]
+name = "DW_BOOT_DEVICE_RESOURCE_FLAGS_SUPPORTED_MASK"
+type = "u32"
+value = 0
+doc = "DwBootDeviceResourceV1 supports no nonzero flags."
+
+[[constant]]
+name = "DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT"
+type = "DwDeviceResourceKind"
+value = 1
+doc = "One bounded x86 port-I/O range paired with one platform interrupt source."
+
+[[constant]]
 name = "DW_BOOT_X86_64_PAGING_HANDOFF_V1_VERSION"
 type = "u32"
 value = 1
@@ -191,6 +233,11 @@ name = "DEEPWYRM_X86_64_PAGING_HANDOFF_V1"
 value = 3
 doc = "Exactly one READ_ONLY kernel-internal DwBootX86_64PagingHandoffV1 carrier; it must never be transferred to userspace."
 
+[[module_kind]]
+name = "DEEPWYRM_BOOT_DEVICE_TABLE_V1"
+value = 4
+doc = "Optional unique READ_ONLY kernel-internal DwBootDeviceTableV1 carrier; it must never be transferred to userspace."
+
 [[module_flag]]
 name = "READ_ONLY"
 value = 0x00000001
@@ -268,6 +315,31 @@ field3 = "flags|DwBootModuleFlags|Supported module properties."
 field4 = "physical_start|u64|Physical start address of module bytes."
 field5 = "byte_len|u64|Exact module byte length."
 field6 = "reserved|[u64;4]|Reserved; all elements must be zero."
+
+[[record]]
+name = "DwBootDeviceTableV1"
+doc = "Fixed header for an optional unique READ_ONLY kernel-internal boot-device resource table. The containing module consists exactly of this header followed by resource_count fixed-stride DwBootDeviceResourceV1 records."
+field0 = "size|u32|Fixed header byte size; must equal DW_BOOT_DEVICE_TABLE_V1_SIZE."
+field1 = "version|u32|Structure version; must equal DW_BOOT_DEVICE_TABLE_V1_VERSION."
+field2 = "resource_count|u32|Nonzero record count bounded by DW_BOOT_DEVICE_TABLE_MAX_RESOURCES."
+field3 = "flags|u32|Must contain only supported bits; V1 requires zero."
+field4 = "record_stride|u32|Record byte stride; must equal DW_BOOT_DEVICE_TABLE_RECORD_STRIDE."
+field5 = "reserved0|u32|Reserved; producer sets zero and consumer rejects nonzero."
+field6 = "total_byte_len|u64|Exact complete carrier extent: header plus resource_count records."
+
+[[record]]
+name = "DwBootDeviceResourceV1"
+doc = "One immutable numeric kernel-facing boot-device resource descriptor; policy names and userspace identities are excluded."
+field0 = "size|u32|Fixed record byte size; must equal DW_BOOT_DEVICE_RESOURCE_V1_SIZE."
+field1 = "version|u32|Structure version; must equal DW_BOOT_DEVICE_RESOURCE_V1_VERSION."
+field2 = "kind|DwDeviceResourceKind|Admitted device-resource kind."
+field3 = "flags|u32|Must contain only supported bits; V1 requires zero."
+field4 = "resource_id|u64|Nonzero immutable kernel resource identity."
+field5 = "device_correlation_id|u64|Optional non-authoritative policy correlation; zero means absent."
+field6 = "pio_base|u16|Exact x86 port-range base."
+field7 = "pio_length|u16|Nonzero bounded port-range byte length."
+field8 = "interrupt_source|u32|Nonzero platform interrupt-source identity."
+field9 = "reserved|u64|Reserved; producer sets zero and consumer rejects nonzero."
 
 [[record]]
 name = "DwBootX86_64PagingHandoffV1"

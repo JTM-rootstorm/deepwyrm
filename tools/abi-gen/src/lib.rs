@@ -595,7 +595,15 @@ impl Model {
             let phase = table.text("phase")?;
             if !matches!(
                 phase.as_str(),
-                "DW0-A" | "DW0-B" | "DW0-C" | "DW0-D" | "DW0-E" | "DW0-F" | "DW0-G" | "DW0-H"
+                "DW0-A"
+                    | "DW0-B"
+                    | "DW0-C"
+                    | "DW0-D"
+                    | "DW0-E"
+                    | "DW0-F"
+                    | "DW0-G"
+                    | "DW0-H"
+                    | "DW1-D"
             ) {
                 return Err(Error::new(format!(
                     "{}: syscall `{name}` uses unsupported implementation phase `{phase}`",

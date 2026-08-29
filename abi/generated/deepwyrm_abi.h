@@ -101,6 +101,24 @@ typedef uint32_t DwAddressRegionMapFlags;
 DW_STATIC_ASSERT(sizeof(DwAddressRegionMapFlags) == 4, "DwAddressRegionMapFlags size");
 DW_STATIC_ASSERT(DW_ALIGNOF(DwAddressRegionMapFlags) == 4, "DwAddressRegionMapFlags alignment");
 
+/* Open numeric namespace identifying a kernel-managed device-resource kind. */
+typedef uint32_t DwDeviceResourceKind;
+
+DW_STATIC_ASSERT(sizeof(DwDeviceResourceKind) == 4, "DwDeviceResourceKind size");
+DW_STATIC_ASSERT(DW_ALIGNOF(DwDeviceResourceKind) == 4, "DwDeviceResourceKind alignment");
+
+/* Open numeric namespace describing public Interrupt lifecycle state. */
+typedef uint32_t DwInterruptState;
+
+DW_STATIC_ASSERT(sizeof(DwInterruptState) == 4, "DwInterruptState size");
+DW_STATIC_ASSERT(DW_ALIGNOF(DwInterruptState) == 4, "DwInterruptState alignment");
+
+/* Bitset reporting bounded Interrupt state facts. */
+typedef uint32_t DwInterruptInfoFlags;
+
+DW_STATIC_ASSERT(sizeof(DwInterruptInfoFlags) == 4, "DwInterruptInfoFlags size");
+DW_STATIC_ASSERT(DW_ALIGNOF(DwInterruptInfoFlags) == 4, "DwInterruptInfoFlags alignment");
+
 /* Explicit native clock-domain identifier. */
 typedef uint32_t DwClockId;
 
@@ -234,6 +252,8 @@ DW_STATIC_ASSERT(DW_ALIGNOF(DwBootEntropyFlags) == 4, "DwBootEntropyFlags alignm
 #define DW_RIGHT_INSPECT ((DwRights)(256))
 /* Change object configuration or lifecycle state. */
 #define DW_RIGHT_MODIFY ((DwRights)(512))
+/* Claim or derive kernel-managed resource authority explicitly attached to an object, subject to its additional ownership and membership rules. */
+#define DW_RIGHT_RESOURCE ((DwRights)(1024))
 
 /* No object type; never identifies a live kernel object. */
 #define DW_OBJECT_TYPE_NONE ((DwObjectType)(0))
@@ -253,9 +273,9 @@ DW_STATIC_ASSERT(DW_ALIGNOF(DwBootEntropyFlags) == 4, "DwBootEntropyFlags alignm
 #define DW_OBJECT_TYPE_EVENT ((DwObjectType)(7))
 /* Absolute-monotonic-deadline timer. */
 #define DW_OBJECT_TYPE_TIMER ((DwObjectType)(8))
-/* Reserved for a future interrupt-delivery object. */
+/* Exclusive, waitable, explicitly acknowledged interrupt-delivery object. */
 #define DW_OBJECT_TYPE_INTERRUPT ((DwObjectType)(16))
-/* Reserved for future rights-scoped device resources. */
+/* Rights-scoped kernel-managed device resource. */
 #define DW_OBJECT_TYPE_DEVICE_RESOURCE ((DwObjectType)(17))
 /* Reserved for future structured exception delivery. */
 #define DW_OBJECT_TYPE_EXCEPTION ((DwObjectType)(18))
@@ -268,7 +288,7 @@ DW_STATIC_ASSERT(DW_ALIGNOF(DwBootEntropyFlags) == 4, "DwBootEntropyFlags alignm
 #define DW_SIGNAL_PEER_CLOSED ((DwSignals)(4))
 /* The process or thread reached its terminal state. */
 #define DW_SIGNAL_EXITED ((DwSignals)(8))
-/* The event or timer is signaled. */
+/* The event, timer, or interrupt is signaled. */
 #define DW_SIGNAL_SIGNALED ((DwSignals)(16))
 
 /* The embedded framebuffer descriptor is present and must validate. */
@@ -299,6 +319,8 @@ DW_STATIC_ASSERT(DW_ALIGNOF(DwBootEntropyFlags) == 4, "DwBootEntropyFlags alignm
 #define DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS ((DwBootModuleKind)(2))
 /* Exactly one READ_ONLY kernel-internal DwBootX86_64PagingHandoffV1 carrier; it must never be transferred to userspace. */
 #define DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1 ((DwBootModuleKind)(3))
+/* Optional unique READ_ONLY kernel-internal DwBootDeviceTableV1 carrier; it must never be transferred to userspace. */
+#define DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1 ((DwBootModuleKind)(4))
 
 /* The module must only be exposed to userspace with read-only authority. */
 #define DW_BOOT_MODULE_FLAG_READ_ONLY ((DwBootModuleFlags)(1))
@@ -328,9 +350,9 @@ DW_STATIC_ASSERT(DW_ALIGNOF(DwBootEntropyFlags) == 4, "DwBootEntropyFlags alignm
 #define DW_BOOT_ENTROPY_FLAG_CONDITIONED ((DwBootEntropyFlags)(1))
 
 /* Mask of every DwRights bit known to ABI 0. */
-#define DW_RIGHTS_KNOWN_MASK ((DwRights)(1023))
+#define DW_RIGHTS_KNOWN_MASK ((DwRights)(2047))
 /* Compatible rights for the TASK_GROUP object type. */
-#define DW_OBJECT_COMPATIBLE_RIGHTS_TASK_GROUP ((DwRights)(960))
+#define DW_OBJECT_COMPATIBLE_RIGHTS_TASK_GROUP ((DwRights)(1984))
 /* Compatible rights for the PROCESS object type. */
 #define DW_OBJECT_COMPATIBLE_RIGHTS_PROCESS ((DwRights)(976))
 /* Compatible rights for the THREAD object type. */
@@ -345,6 +367,10 @@ DW_STATIC_ASSERT(DW_ALIGNOF(DwBootEntropyFlags) == 4, "DwBootEntropyFlags alignm
 #define DW_OBJECT_COMPATIBLE_RIGHTS_EVENT ((DwRights)(496))
 /* Compatible rights for the TIMER object type. */
 #define DW_OBJECT_COMPATIBLE_RIGHTS_TIMER ((DwRights)(976))
+/* Compatible rights for the INTERRUPT object type. */
+#define DW_OBJECT_COMPATIBLE_RIGHTS_INTERRUPT ((DwRights)(912))
+/* Compatible rights for the DEVICE_RESOURCE object type. */
+#define DW_OBJECT_COMPATIBLE_RIGHTS_DEVICE_RESOURCE ((DwRights)(963))
 
 static inline DwRights dw_object_compatible_rights(DwObjectType object_type) {
     switch (object_type) {
@@ -356,6 +382,8 @@ static inline DwRights dw_object_compatible_rights(DwObjectType object_type) {
     case DW_OBJECT_TYPE_CHANNEL: return DW_OBJECT_COMPATIBLE_RIGHTS_CHANNEL;
     case DW_OBJECT_TYPE_EVENT: return DW_OBJECT_COMPATIBLE_RIGHTS_EVENT;
     case DW_OBJECT_TYPE_TIMER: return DW_OBJECT_COMPATIBLE_RIGHTS_TIMER;
+    case DW_OBJECT_TYPE_INTERRUPT: return DW_OBJECT_COMPATIBLE_RIGHTS_INTERRUPT;
+    case DW_OBJECT_TYPE_DEVICE_RESOURCE: return DW_OBJECT_COMPATIBLE_RIGHTS_DEVICE_RESOURCE;
     default: return (DwRights)0;
     }
 }
@@ -387,6 +415,10 @@ static inline int dw_rights_are_compatible(DwObjectType object_type, DwRights ri
 #define DW_OBJECT_COMPATIBLE_SIGNALS_EVENT ((DwSignals)(16))
 /* Applicable wait signals for the TIMER object type. */
 #define DW_OBJECT_COMPATIBLE_SIGNALS_TIMER ((DwSignals)(16))
+/* Applicable wait signals for the INTERRUPT object type. */
+#define DW_OBJECT_COMPATIBLE_SIGNALS_INTERRUPT ((DwSignals)(16))
+/* Applicable wait signals for the DEVICE_RESOURCE object type. */
+#define DW_OBJECT_COMPATIBLE_SIGNALS_DEVICE_RESOURCE ((DwSignals)(0))
 
 static inline DwSignals dw_object_compatible_signals(DwObjectType object_type) {
     switch (object_type) {
@@ -398,6 +430,8 @@ static inline DwSignals dw_object_compatible_signals(DwObjectType object_type) {
     case DW_OBJECT_TYPE_CHANNEL: return DW_OBJECT_COMPATIBLE_SIGNALS_CHANNEL;
     case DW_OBJECT_TYPE_EVENT: return DW_OBJECT_COMPATIBLE_SIGNALS_EVENT;
     case DW_OBJECT_TYPE_TIMER: return DW_OBJECT_COMPATIBLE_SIGNALS_TIMER;
+    case DW_OBJECT_TYPE_INTERRUPT: return DW_OBJECT_COMPATIBLE_SIGNALS_INTERRUPT;
+    case DW_OBJECT_TYPE_DEVICE_RESOURCE: return DW_OBJECT_COMPATIBLE_SIGNALS_DEVICE_RESOURCE;
     default: return (DwSignals)0;
     }
 }
@@ -417,6 +451,20 @@ static inline int dw_signals_are_compatible(DwObjectType object_type, DwSignals 
 #define DW_BOOT_MEMORY_RANGE_V1_VERSION ((uint32_t)(1))
 /* Required version value for DwBootModuleV1 records. */
 #define DW_BOOT_MODULE_V1_VERSION ((uint32_t)(1))
+/* Required version value for the kernel-internal DwBootDeviceTableV1 carrier. */
+#define DW_BOOT_DEVICE_TABLE_V1_VERSION ((uint32_t)(1))
+/* DwBootDeviceTableV1 supports no nonzero flags. */
+#define DW_BOOT_DEVICE_TABLE_FLAGS_SUPPORTED_MASK ((uint32_t)(0))
+/* Required byte stride of each DwBootDeviceResourceV1 record. */
+#define DW_BOOT_DEVICE_TABLE_RECORD_STRIDE ((uint32_t)(48))
+/* Maximum number of immutable resource records accepted from one boot-device table. */
+#define DW_BOOT_DEVICE_TABLE_MAX_RESOURCES ((uint32_t)(8))
+/* Required version value for DwBootDeviceResourceV1 records. */
+#define DW_BOOT_DEVICE_RESOURCE_V1_VERSION ((uint32_t)(1))
+/* DwBootDeviceResourceV1 supports no nonzero flags. */
+#define DW_BOOT_DEVICE_RESOURCE_FLAGS_SUPPORTED_MASK ((uint32_t)(0))
+/* One bounded x86 port-I/O range paired with one platform interrupt source. */
+#define DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT ((DwDeviceResourceKind)(1))
 /* Required version value for DwBootX86_64PagingHandoffV1. */
 #define DW_BOOT_X86_64_PAGING_HANDOFF_V1_VERSION ((uint32_t)(1))
 /* DwBootX86_64PagingHandoffV1 supports no nonzero flags. */
@@ -469,6 +517,8 @@ static inline int dw_signals_are_compatible(DwObjectType object_type, DwSignals 
 #define DW_WAIT_MANY_MAX_ITEMS ((uint32_t)(64))
 /* Wake every waiter eligible for atomic_wake. */
 #define DW_ATOMIC_WAKE_ALL ((uint32_t)(4294967295))
+/* Discovery identity for the complete DeviceResource and Interrupt runtime; kernels report this bit only after the DW1-D runtime gate is reached. */
+#define DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT ((uint64_t)(1))
 /* Move a handle on commit; no duplicate transfer operation exists in ABI 0. */
 #define DW_HANDLE_TRANSFER_MOVE ((DwHandleTransferOperation)(1))
 /* Return the lowest-index ready item. */
@@ -485,6 +535,26 @@ static inline int dw_signals_are_compatible(DwObjectType object_type, DwSignals 
 #define DW_OBJECT_INFO_TASK_STATE_V1 ((uint32_t)(65537))
 /* Typed object_get_info topic for exact logical MemoryObject byte size. */
 #define DW_OBJECT_INFO_MEMORY_OBJECT_V1 ((uint32_t)(131073))
+/* Typed object_get_info topic for immutable DeviceResource identity and range metadata. */
+#define DW_OBJECT_INFO_DEVICE_RESOURCE_V1 ((uint32_t)(196609))
+/* Typed object_get_info topic for bounded Interrupt state and generation metadata. */
+#define DW_OBJECT_INFO_INTERRUPT_V1 ((uint32_t)(196610))
+/* Required version value for DwDeviceResourceInfoV1. */
+#define DW_DEVICE_RESOURCE_INFO_V1_VERSION ((uint32_t)(1))
+/* DwDeviceResourceInfoV1 supports no nonzero flags. */
+#define DW_DEVICE_RESOURCE_INFO_FLAGS_SUPPORTED_MASK ((uint32_t)(0))
+/* Required version value for DwInterruptInfoV1. */
+#define DW_INTERRUPT_INFO_V1_VERSION ((uint32_t)(1))
+/* The Interrupt is bound, unsignaled, and ready for delivery. */
+#define DW_INTERRUPT_STATE_ARMED ((DwInterruptState)(1))
+/* The Interrupt has a pending level-observable delivery fact. */
+#define DW_INTERRUPT_STATE_PENDING ((DwInterruptState)(2))
+/* The Interrupt is terminal and its source is being masked and unbound. */
+#define DW_INTERRUPT_STATE_FINALIZING ((DwInterruptState)(3))
+/* At least one additional delivery fact must survive one acknowledgement. */
+#define DW_INTERRUPT_INFO_FLAG_COALESCED ((DwInterruptInfoFlags)(1))
+/* All Interrupt information flags recognized by V1. */
+#define DW_INTERRUPT_INFO_FLAGS_SUPPORTED_MASK ((DwInterruptInfoFlags)(1))
 /* Permit userspace reads from a mapping. */
 #define DW_MEMORY_PROTECTION_READ ((DwMemoryProtection)(1))
 /* Permit userspace writes to a mapping. */
@@ -590,8 +660,18 @@ static inline int dw_signals_are_compatible(DwObjectType object_type, DwSignals 
 #define DW_SYSCALL_TIMER_CREATE ((DwSyscallId)(UINT32_C(0x00050010)))
 /* Arm or replace a one-shot timer, atomically clearing prior signal state; INFINITE is invalid and cancel is explicit. */
 #define DW_SYSCALL_TIMER_SET ((DwSyscallId)(UINT32_C(0x00050011)))
-/* Cancel a one-shot timer and clear its signaled state. */
+/* Cancel a one-shot monotonic timer and clear its signaled state. */
 #define DW_SYSCALL_TIMER_CANCEL ((DwSyscallId)(UINT32_C(0x00050012)))
+/* Claim one exact available boot resource through TASK_GROUP RESOURCE authority plus caller membership; the runtime remains unavailable until the DW1-D implementation gate is reached. */
+#define DW_SYSCALL_DEVICE_RESOURCE_CLAIM ((DwSyscallId)(UINT32_C(0x00060001)))
+/* Read one checked scalar value from a live DeviceResource PIO range. */
+#define DW_SYSCALL_DEVICE_PIO_READ ((DwSyscallId)(UINT32_C(0x00060002)))
+/* Write one checked scalar value to a live DeviceResource PIO range without truncation. */
+#define DW_SYSCALL_DEVICE_PIO_WRITE ((DwSyscallId)(UINT32_C(0x00060003)))
+/* Create one exclusive Interrupt derived from a live DeviceResource after platform binding reaches Armed. */
+#define DW_SYSCALL_INTERRUPT_CREATE ((DwSyscallId)(UINT32_C(0x00060010)))
+/* Acknowledge one pending Interrupt fact and rearm its exact source binding when no coalesced fact remains. */
+#define DW_SYSCALL_INTERRUPT_ACK ((DwSyscallId)(UINT32_C(0x00060011)))
 
 /* One normalized physical memory-map entry. */
 typedef struct DwBootMemoryRangeV1 {
@@ -651,6 +731,71 @@ DW_STATIC_ASSERT(offsetof(DwBootModuleV1, flags) == 12, "DwBootModuleV1.flags of
 DW_STATIC_ASSERT(offsetof(DwBootModuleV1, physical_start) == 16, "DwBootModuleV1.physical_start offset");
 DW_STATIC_ASSERT(offsetof(DwBootModuleV1, byte_len) == 24, "DwBootModuleV1.byte_len offset");
 DW_STATIC_ASSERT(offsetof(DwBootModuleV1, reserved) == 32, "DwBootModuleV1.reserved offset");
+
+/* Fixed header for an optional unique READ_ONLY kernel-internal boot-device resource table. The containing module consists exactly of this header followed by resource_count fixed-stride DwBootDeviceResourceV1 records. */
+typedef struct DwBootDeviceTableV1 {
+    /* Fixed header byte size; must equal DW_BOOT_DEVICE_TABLE_V1_SIZE. */
+    uint32_t size;
+    /* Structure version; must equal DW_BOOT_DEVICE_TABLE_V1_VERSION. */
+    uint32_t version;
+    /* Nonzero record count bounded by DW_BOOT_DEVICE_TABLE_MAX_RESOURCES. */
+    uint32_t resource_count;
+    /* Must contain only supported bits; V1 requires zero. */
+    uint32_t flags;
+    /* Record byte stride; must equal DW_BOOT_DEVICE_TABLE_RECORD_STRIDE. */
+    uint32_t record_stride;
+    /* Reserved; producer sets zero and consumer rejects nonzero. */
+    uint32_t reserved0;
+    /* Exact complete carrier extent: header plus resource_count records. */
+    uint64_t total_byte_len;
+} DwBootDeviceTableV1;
+#define DW_BOOT_DEVICE_TABLE_V1_SIZE ((uint32_t)(32))
+DW_STATIC_ASSERT(sizeof(DwBootDeviceTableV1) == 32, "DwBootDeviceTableV1 size");
+DW_STATIC_ASSERT(DW_ALIGNOF(DwBootDeviceTableV1) == 8, "DwBootDeviceTableV1 alignment");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceTableV1, size) == 0, "DwBootDeviceTableV1.size offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceTableV1, version) == 4, "DwBootDeviceTableV1.version offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceTableV1, resource_count) == 8, "DwBootDeviceTableV1.resource_count offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceTableV1, flags) == 12, "DwBootDeviceTableV1.flags offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceTableV1, record_stride) == 16, "DwBootDeviceTableV1.record_stride offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceTableV1, reserved0) == 20, "DwBootDeviceTableV1.reserved0 offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceTableV1, total_byte_len) == 24, "DwBootDeviceTableV1.total_byte_len offset");
+
+/* One immutable numeric kernel-facing boot-device resource descriptor; policy names and userspace identities are excluded. */
+typedef struct DwBootDeviceResourceV1 {
+    /* Fixed record byte size; must equal DW_BOOT_DEVICE_RESOURCE_V1_SIZE. */
+    uint32_t size;
+    /* Structure version; must equal DW_BOOT_DEVICE_RESOURCE_V1_VERSION. */
+    uint32_t version;
+    /* Admitted device-resource kind. */
+    DwDeviceResourceKind kind;
+    /* Must contain only supported bits; V1 requires zero. */
+    uint32_t flags;
+    /* Nonzero immutable kernel resource identity. */
+    uint64_t resource_id;
+    /* Optional non-authoritative policy correlation; zero means absent. */
+    uint64_t device_correlation_id;
+    /* Exact x86 port-range base. */
+    uint16_t pio_base;
+    /* Nonzero bounded port-range byte length. */
+    uint16_t pio_length;
+    /* Nonzero platform interrupt-source identity. */
+    uint32_t interrupt_source;
+    /* Reserved; producer sets zero and consumer rejects nonzero. */
+    uint64_t reserved;
+} DwBootDeviceResourceV1;
+#define DW_BOOT_DEVICE_RESOURCE_V1_SIZE ((uint32_t)(48))
+DW_STATIC_ASSERT(sizeof(DwBootDeviceResourceV1) == 48, "DwBootDeviceResourceV1 size");
+DW_STATIC_ASSERT(DW_ALIGNOF(DwBootDeviceResourceV1) == 8, "DwBootDeviceResourceV1 alignment");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV1, size) == 0, "DwBootDeviceResourceV1.size offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV1, version) == 4, "DwBootDeviceResourceV1.version offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV1, kind) == 8, "DwBootDeviceResourceV1.kind offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV1, flags) == 12, "DwBootDeviceResourceV1.flags offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV1, resource_id) == 16, "DwBootDeviceResourceV1.resource_id offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV1, device_correlation_id) == 24, "DwBootDeviceResourceV1.device_correlation_id offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV1, pio_base) == 32, "DwBootDeviceResourceV1.pio_base offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV1, pio_length) == 34, "DwBootDeviceResourceV1.pio_length offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV1, interrupt_source) == 36, "DwBootDeviceResourceV1.interrupt_source offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV1, reserved) == 40, "DwBootDeviceResourceV1.reserved offset");
 
 /* Fixed header for the sole READ_ONLY kernel-internal x86_64 transition-page-table carrier. The containing module's physical_start is 4096-byte aligned, begins with this header, and is followed at table_frames_offset by a flat u64 list. The list is strictly ascending and unique, contains the distinct CR3 root and three temporary-path child frames, and enumerates every current transition page-table frame exactly once with no data frames. Every physical address is nonzero, 4096-byte aligned, has no bits outside physical_address_width, and remains reserved until Deepwyrm replaces CR3. The containing module's byte_len, total_byte_len, and table_frames_offset plus table_frame_count times table_frame_stride must be exactly equal. */
 typedef struct DwBootX86_64PagingHandoffV1 {
@@ -968,6 +1113,83 @@ DW_STATIC_ASSERT(offsetof(DwMemoryObjectInfoV1, size) == 0, "DwMemoryObjectInfoV
 DW_STATIC_ASSERT(offsetof(DwMemoryObjectInfoV1, version) == 4, "DwMemoryObjectInfoV1.version offset");
 DW_STATIC_ASSERT(offsetof(DwMemoryObjectInfoV1, byte_size) == 8, "DwMemoryObjectInfoV1.byte_size offset");
 DW_STATIC_ASSERT(offsetof(DwMemoryObjectInfoV1, reserved) == 16, "DwMemoryObjectInfoV1.reserved offset");
+
+/* Read-only immutable DeviceResource identity, lease, port range, and interrupt-source information. */
+typedef struct DwDeviceResourceInfoV1 {
+    /* Fixed byte size; must equal DW_DEVICE_RESOURCE_INFO_V1_SIZE. */
+    uint32_t size;
+    /* Structure version; must equal DW_DEVICE_RESOURCE_INFO_V1_VERSION. */
+    uint32_t version;
+    /* Admitted device-resource kind. */
+    DwDeviceResourceKind kind;
+    /* Must contain only supported bits; V1 requires zero. */
+    uint32_t flags;
+    /* Nonzero immutable boot-resource identity. */
+    uint64_t resource_id;
+    /* Nonzero kernel-minted lease generation. */
+    uint64_t lease_generation;
+    /* Exact x86 port-range base. */
+    uint16_t pio_base;
+    /* Nonzero bounded port-range byte length. */
+    uint16_t pio_length;
+    /* Exact platform interrupt-source identity. */
+    uint32_t interrupt_source;
+    /* Reserved; must be zero. */
+    uint64_t reserved;
+} DwDeviceResourceInfoV1;
+#define DW_DEVICE_RESOURCE_INFO_V1_SIZE ((uint32_t)(48))
+DW_STATIC_ASSERT(sizeof(DwDeviceResourceInfoV1) == 48, "DwDeviceResourceInfoV1 size");
+DW_STATIC_ASSERT(DW_ALIGNOF(DwDeviceResourceInfoV1) == 8, "DwDeviceResourceInfoV1 alignment");
+DW_STATIC_ASSERT(offsetof(DwDeviceResourceInfoV1, size) == 0, "DwDeviceResourceInfoV1.size offset");
+DW_STATIC_ASSERT(offsetof(DwDeviceResourceInfoV1, version) == 4, "DwDeviceResourceInfoV1.version offset");
+DW_STATIC_ASSERT(offsetof(DwDeviceResourceInfoV1, kind) == 8, "DwDeviceResourceInfoV1.kind offset");
+DW_STATIC_ASSERT(offsetof(DwDeviceResourceInfoV1, flags) == 12, "DwDeviceResourceInfoV1.flags offset");
+DW_STATIC_ASSERT(offsetof(DwDeviceResourceInfoV1, resource_id) == 16, "DwDeviceResourceInfoV1.resource_id offset");
+DW_STATIC_ASSERT(offsetof(DwDeviceResourceInfoV1, lease_generation) == 24, "DwDeviceResourceInfoV1.lease_generation offset");
+DW_STATIC_ASSERT(offsetof(DwDeviceResourceInfoV1, pio_base) == 32, "DwDeviceResourceInfoV1.pio_base offset");
+DW_STATIC_ASSERT(offsetof(DwDeviceResourceInfoV1, pio_length) == 34, "DwDeviceResourceInfoV1.pio_length offset");
+DW_STATIC_ASSERT(offsetof(DwDeviceResourceInfoV1, interrupt_source) == 36, "DwDeviceResourceInfoV1.interrupt_source offset");
+DW_STATIC_ASSERT(offsetof(DwDeviceResourceInfoV1, reserved) == 40, "DwDeviceResourceInfoV1.reserved offset");
+
+/* Read-only Interrupt source, lifecycle, parent-resource, and bounded pending-state information. */
+typedef struct DwInterruptInfoV1 {
+    /* Fixed byte size; must equal DW_INTERRUPT_INFO_V1_SIZE. */
+    uint32_t size;
+    /* Structure version; must equal DW_INTERRUPT_INFO_V1_VERSION. */
+    uint32_t version;
+    /* Exact platform interrupt-source identity. */
+    uint32_t source;
+    /* Public bounded lifecycle state. */
+    DwInterruptState state;
+    /* Nonzero Interrupt object generation. */
+    uint64_t object_generation;
+    /* Nonzero source-binding generation. */
+    uint64_t binding_generation;
+    /* Immutable parent DeviceResource identity. */
+    uint64_t parent_resource_id;
+    /* Exact parent DeviceResource lease generation. */
+    uint64_t parent_lease_generation;
+    /* Bounded pending-state facts. */
+    DwInterruptInfoFlags flags;
+    /* Reserved; must be zero. */
+    uint32_t reserved0;
+    /* Reserved; must be zero. */
+    uint64_t reserved;
+} DwInterruptInfoV1;
+#define DW_INTERRUPT_INFO_V1_SIZE ((uint32_t)(64))
+DW_STATIC_ASSERT(sizeof(DwInterruptInfoV1) == 64, "DwInterruptInfoV1 size");
+DW_STATIC_ASSERT(DW_ALIGNOF(DwInterruptInfoV1) == 8, "DwInterruptInfoV1 alignment");
+DW_STATIC_ASSERT(offsetof(DwInterruptInfoV1, size) == 0, "DwInterruptInfoV1.size offset");
+DW_STATIC_ASSERT(offsetof(DwInterruptInfoV1, version) == 4, "DwInterruptInfoV1.version offset");
+DW_STATIC_ASSERT(offsetof(DwInterruptInfoV1, source) == 8, "DwInterruptInfoV1.source offset");
+DW_STATIC_ASSERT(offsetof(DwInterruptInfoV1, state) == 12, "DwInterruptInfoV1.state offset");
+DW_STATIC_ASSERT(offsetof(DwInterruptInfoV1, object_generation) == 16, "DwInterruptInfoV1.object_generation offset");
+DW_STATIC_ASSERT(offsetof(DwInterruptInfoV1, binding_generation) == 24, "DwInterruptInfoV1.binding_generation offset");
+DW_STATIC_ASSERT(offsetof(DwInterruptInfoV1, parent_resource_id) == 32, "DwInterruptInfoV1.parent_resource_id offset");
+DW_STATIC_ASSERT(offsetof(DwInterruptInfoV1, parent_lease_generation) == 40, "DwInterruptInfoV1.parent_lease_generation offset");
+DW_STATIC_ASSERT(offsetof(DwInterruptInfoV1, flags) == 48, "DwInterruptInfoV1.flags offset");
+DW_STATIC_ASSERT(offsetof(DwInterruptInfoV1, reserved0) == 52, "DwInterruptInfoV1.reserved0 offset");
+DW_STATIC_ASSERT(offsetof(DwInterruptInfoV1, reserved) == 56, "DwInterruptInfoV1.reserved offset");
 
 /* Versioned arguments selecting one page-aligned MemoryObject mapping. */
 typedef struct DwAddressRegionMapArgsV1 {

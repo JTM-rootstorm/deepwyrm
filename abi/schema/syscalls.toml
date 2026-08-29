@@ -49,6 +49,12 @@ value = 0xffffffff
 doc = "Wake every waiter eligible for atomic_wake."
 
 [[constant]]
+name = "DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT"
+type = "u64"
+value = 0x0000000000000001
+doc = "Discovery identity for the complete DeviceResource and Interrupt runtime; kernels report this bit only after the DW1-D runtime gate is reached."
+
+[[constant]]
 name = "DW_HANDLE_TRANSFER_MOVE"
 type = "DwHandleTransferOperation"
 value = 1
@@ -95,6 +101,66 @@ name = "DW_OBJECT_INFO_MEMORY_OBJECT_V1"
 type = "u32"
 value = 0x00020001
 doc = "Typed object_get_info topic for exact logical MemoryObject byte size."
+
+[[constant]]
+name = "DW_OBJECT_INFO_DEVICE_RESOURCE_V1"
+type = "u32"
+value = 0x00030001
+doc = "Typed object_get_info topic for immutable DeviceResource identity and range metadata."
+
+[[constant]]
+name = "DW_OBJECT_INFO_INTERRUPT_V1"
+type = "u32"
+value = 0x00030002
+doc = "Typed object_get_info topic for bounded Interrupt state and generation metadata."
+
+[[constant]]
+name = "DW_DEVICE_RESOURCE_INFO_V1_VERSION"
+type = "u32"
+value = 1
+doc = "Required version value for DwDeviceResourceInfoV1."
+
+[[constant]]
+name = "DW_DEVICE_RESOURCE_INFO_FLAGS_SUPPORTED_MASK"
+type = "u32"
+value = 0
+doc = "DwDeviceResourceInfoV1 supports no nonzero flags."
+
+[[constant]]
+name = "DW_INTERRUPT_INFO_V1_VERSION"
+type = "u32"
+value = 1
+doc = "Required version value for DwInterruptInfoV1."
+
+[[constant]]
+name = "DW_INTERRUPT_STATE_ARMED"
+type = "DwInterruptState"
+value = 1
+doc = "The Interrupt is bound, unsignaled, and ready for delivery."
+
+[[constant]]
+name = "DW_INTERRUPT_STATE_PENDING"
+type = "DwInterruptState"
+value = 2
+doc = "The Interrupt has a pending level-observable delivery fact."
+
+[[constant]]
+name = "DW_INTERRUPT_STATE_FINALIZING"
+type = "DwInterruptState"
+value = 3
+doc = "The Interrupt is terminal and its source is being masked and unbound."
+
+[[constant]]
+name = "DW_INTERRUPT_INFO_FLAG_COALESCED"
+type = "DwInterruptInfoFlags"
+value = 0x00000001
+doc = "At least one additional delivery fact must survive one acknowledgement."
+
+[[constant]]
+name = "DW_INTERRUPT_INFO_FLAGS_SUPPORTED_MASK"
+type = "DwInterruptInfoFlags"
+value = 0x00000001
+doc = "All Interrupt information flags recognized by V1."
 
 [[constant]]
 name = "DW_MEMORY_PROTECTION_READ"
@@ -279,6 +345,35 @@ field2 = "byte_size|u64|Exact logical content byte size, fixed for the object li
 field3 = "reserved|[u64;2]|Reserved; all elements must be zero."
 
 [[record]]
+name = "DwDeviceResourceInfoV1"
+doc = "Read-only immutable DeviceResource identity, lease, port range, and interrupt-source information."
+field0 = "size|u32|Fixed byte size; must equal DW_DEVICE_RESOURCE_INFO_V1_SIZE."
+field1 = "version|u32|Structure version; must equal DW_DEVICE_RESOURCE_INFO_V1_VERSION."
+field2 = "kind|DwDeviceResourceKind|Admitted device-resource kind."
+field3 = "flags|u32|Must contain only supported bits; V1 requires zero."
+field4 = "resource_id|u64|Nonzero immutable boot-resource identity."
+field5 = "lease_generation|u64|Nonzero kernel-minted lease generation."
+field6 = "pio_base|u16|Exact x86 port-range base."
+field7 = "pio_length|u16|Nonzero bounded port-range byte length."
+field8 = "interrupt_source|u32|Exact platform interrupt-source identity."
+field9 = "reserved|u64|Reserved; must be zero."
+
+[[record]]
+name = "DwInterruptInfoV1"
+doc = "Read-only Interrupt source, lifecycle, parent-resource, and bounded pending-state information."
+field0 = "size|u32|Fixed byte size; must equal DW_INTERRUPT_INFO_V1_SIZE."
+field1 = "version|u32|Structure version; must equal DW_INTERRUPT_INFO_V1_VERSION."
+field2 = "source|u32|Exact platform interrupt-source identity."
+field3 = "state|DwInterruptState|Public bounded lifecycle state."
+field4 = "object_generation|u64|Nonzero Interrupt object generation."
+field5 = "binding_generation|u64|Nonzero source-binding generation."
+field6 = "parent_resource_id|u64|Immutable parent DeviceResource identity."
+field7 = "parent_lease_generation|u64|Exact parent DeviceResource lease generation."
+field8 = "flags|DwInterruptInfoFlags|Bounded pending-state facts."
+field9 = "reserved0|u32|Reserved; must be zero."
+field10 = "reserved|u64|Reserved; must be zero."
+
+[[record]]
 name = "DwAddressRegionMapArgsV1"
 doc = "Versioned arguments selecting one page-aligned MemoryObject mapping."
 field0 = "size|u32|Byte size of this structure; must equal the V1 size in ABI 0."
@@ -391,6 +486,20 @@ accepted_objects = "MEMORY_OBJECT"
 result = "DwMemoryObjectInfoV1"
 incompatible_status = "WRONG_OBJECT_TYPE"
 doc = "Reports exact logical byte_size; mappable capacity is checked align_up(byte_size, DW_BASE_PAGE_SIZE)."
+
+[[object_info]]
+topic = "DW_OBJECT_INFO_DEVICE_RESOURCE_V1"
+accepted_objects = "DEVICE_RESOURCE"
+result = "DwDeviceResourceInfoV1"
+incompatible_status = "WRONG_OBJECT_TYPE"
+doc = "Reports immutable resource identity, lease generation, range, and source metadata."
+
+[[object_info]]
+topic = "DW_OBJECT_INFO_INTERRUPT_V1"
+accepted_objects = "INTERRUPT"
+result = "DwInterruptInfoV1"
+incompatible_status = "WRONG_OBJECT_TYPE"
+doc = "Reports bounded Interrupt state and exact generation correlations."
 
 [[syscall]]
 name = "abi_get_info"
@@ -661,5 +770,51 @@ arg1 = "deadline|DwDeadline|in|NONE|NONE"
 name = "timer_cancel"
 number = 0x00050012
 phase = "DW0-F"
-doc = "Cancel a one-shot timer and clear its signaled state."
+doc = "Cancel a one-shot monotonic timer and clear its signaled state."
 arg0 = "timer|DwHandle|in|TIMER|MODIFY"
+
+[[syscall]]
+name = "device_resource_claim"
+number = 0x00060001
+phase = "DW1-D"
+doc = "Claim one exact available boot resource through TASK_GROUP RESOURCE authority plus caller membership; the runtime remains unavailable until the DW1-D implementation gate is reached."
+arg0 = "resource_domain|DwHandle|in|TASK_GROUP|RESOURCE"
+arg1 = "resource_id|u64|in|NONE|NONE"
+arg2 = "requested_rights|DwRights|in|NONE|NONE"
+arg3 = "out_resource|DwUserAddress|out|NONE|NONE"
+
+[[syscall]]
+name = "device_pio_read"
+number = 0x00060002
+phase = "DW1-D"
+doc = "Read one checked scalar value from a live DeviceResource PIO range."
+arg0 = "resource|DwHandle|in|DEVICE_RESOURCE|READ"
+arg1 = "offset|u32|in|NONE|NONE"
+arg2 = "width|u32|in|NONE|NONE"
+arg3 = "out_value|DwUserAddress|out|NONE|NONE"
+
+[[syscall]]
+name = "device_pio_write"
+number = 0x00060003
+phase = "DW1-D"
+doc = "Write one checked scalar value to a live DeviceResource PIO range without truncation."
+arg0 = "resource|DwHandle|in|DEVICE_RESOURCE|WRITE"
+arg1 = "offset|u32|in|NONE|NONE"
+arg2 = "width|u32|in|NONE|NONE"
+arg3 = "value|u32|in|NONE|NONE"
+
+[[syscall]]
+name = "interrupt_create"
+number = 0x00060010
+phase = "DW1-D"
+doc = "Create one exclusive Interrupt derived from a live DeviceResource after platform binding reaches Armed."
+arg0 = "resource|DwHandle|in|DEVICE_RESOURCE|MODIFY"
+arg1 = "requested_rights|DwRights|in|NONE|NONE"
+arg2 = "out_interrupt|DwUserAddress|out|NONE|NONE"
+
+[[syscall]]
+name = "interrupt_ack"
+number = 0x00060011
+phase = "DW1-D"
+doc = "Acknowledge one pending Interrupt fact and rearm its exact source binding when no coalesced fact remains."
+arg0 = "interrupt|DwHandle|in|INTERRUPT|MODIFY"

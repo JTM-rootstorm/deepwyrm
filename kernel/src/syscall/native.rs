@@ -327,6 +327,11 @@ fn decode_decoded(decoded: DecodedSyscall) -> Result<NativeSyscallRequest, DwSta
         DwKnownSyscall::TimerCancel => NativeSyscallRequest::TimerCancel {
             timer: DwHandle(a[0]),
         },
+        DwKnownSyscall::DeviceResourceClaim
+        | DwKnownSyscall::DevicePioRead
+        | DwKnownSyscall::DevicePioWrite
+        | DwKnownSyscall::InterruptCreate
+        | DwKnownSyscall::InterruptAck => return Err(DW_STATUS_NOT_SUPPORTED),
     };
     Ok(request)
 }

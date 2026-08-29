@@ -74,6 +74,21 @@ pub struct DwMemoryObjectCreateFlags(pub u32);
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DwAddressRegionMapFlags(pub u32);
 
+/// Open numeric namespace identifying a kernel-managed device-resource kind.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DwDeviceResourceKind(pub u32);
+
+/// Open numeric namespace describing public Interrupt lifecycle state.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DwInterruptState(pub u32);
+
+/// Bitset reporting bounded Interrupt state facts.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DwInterruptInfoFlags(pub u32);
+
 /// Explicit native clock-domain identifier.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -220,6 +235,9 @@ pub const DW_RIGHT_INSPECT: DwRights = DwRights(256);
 /// Change object configuration or lifecycle state.
 pub const DW_RIGHT_MODIFY: DwRights = DwRights(512);
 
+/// Claim or derive kernel-managed resource authority explicitly attached to an object, subject to its additional ownership and membership rules.
+pub const DW_RIGHT_RESOURCE: DwRights = DwRights(1024);
+
 /// No object type; never identifies a live kernel object.
 pub const DW_OBJECT_TYPE_NONE: DwObjectType = DwObjectType(0);
 
@@ -247,10 +265,10 @@ pub const DW_OBJECT_TYPE_EVENT: DwObjectType = DwObjectType(7);
 /// Absolute-monotonic-deadline timer.
 pub const DW_OBJECT_TYPE_TIMER: DwObjectType = DwObjectType(8);
 
-/// Reserved for a future interrupt-delivery object.
+/// Exclusive, waitable, explicitly acknowledged interrupt-delivery object.
 pub const DW_OBJECT_TYPE_INTERRUPT: DwObjectType = DwObjectType(16);
 
-/// Reserved for future rights-scoped device resources.
+/// Rights-scoped kernel-managed device resource.
 pub const DW_OBJECT_TYPE_DEVICE_RESOURCE: DwObjectType = DwObjectType(17);
 
 /// Reserved for future structured exception delivery.
@@ -268,7 +286,7 @@ pub const DW_SIGNAL_PEER_CLOSED: DwSignals = DwSignals(4);
 /// The process or thread reached its terminal state.
 pub const DW_SIGNAL_EXITED: DwSignals = DwSignals(8);
 
-/// The event or timer is signaled.
+/// The event, timer, or interrupt is signaled.
 pub const DW_SIGNAL_SIGNALED: DwSignals = DwSignals(16);
 
 /// The embedded framebuffer descriptor is present and must validate.
@@ -310,6 +328,9 @@ pub const DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS: DwBootModuleKind = DwBootModuleKi
 /// Exactly one READ_ONLY kernel-internal DwBootX86_64PagingHandoffV1 carrier; it must never be transferred to userspace.
 pub const DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1: DwBootModuleKind = DwBootModuleKind(3);
 
+/// Optional unique READ_ONLY kernel-internal DwBootDeviceTableV1 carrier; it must never be transferred to userspace.
+pub const DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1: DwBootModuleKind = DwBootModuleKind(4);
+
 /// The module must only be exposed to userspace with read-only authority.
 pub const DW_BOOT_MODULE_FLAG_READ_ONLY: DwBootModuleFlags = DwBootModuleFlags(1);
 
@@ -344,10 +365,10 @@ pub const DW_BOOT_ENTROPY_SOURCE_MIXED_FIRMWARE: DwBootEntropySource = DwBootEnt
 pub const DW_BOOT_ENTROPY_FLAG_CONDITIONED: DwBootEntropyFlags = DwBootEntropyFlags(1);
 
 /// Mask of every DwRights bit known to ABI 0.
-pub const DW_RIGHTS_KNOWN_MASK: DwRights = DwRights(1023);
+pub const DW_RIGHTS_KNOWN_MASK: DwRights = DwRights(2047);
 
 /// Compatible rights for the TASK_GROUP object type.
-pub const DW_OBJECT_COMPATIBLE_RIGHTS_TASK_GROUP: DwRights = DwRights(960);
+pub const DW_OBJECT_COMPATIBLE_RIGHTS_TASK_GROUP: DwRights = DwRights(1984);
 
 /// Compatible rights for the PROCESS object type.
 pub const DW_OBJECT_COMPATIBLE_RIGHTS_PROCESS: DwRights = DwRights(976);
@@ -370,6 +391,12 @@ pub const DW_OBJECT_COMPATIBLE_RIGHTS_EVENT: DwRights = DwRights(496);
 /// Compatible rights for the TIMER object type.
 pub const DW_OBJECT_COMPATIBLE_RIGHTS_TIMER: DwRights = DwRights(976);
 
+/// Compatible rights for the INTERRUPT object type.
+pub const DW_OBJECT_COMPATIBLE_RIGHTS_INTERRUPT: DwRights = DwRights(912);
+
+/// Compatible rights for the DEVICE_RESOURCE object type.
+pub const DW_OBJECT_COMPATIBLE_RIGHTS_DEVICE_RESOURCE: DwRights = DwRights(963);
+
 /// Returns the compatible-rights mask for one object type; sentinel, reserved, and unknown types return zero.
 pub const fn dw_object_compatible_rights(object_type: DwObjectType) -> DwRights {
     match object_type.0 {
@@ -381,6 +408,8 @@ pub const fn dw_object_compatible_rights(object_type: DwObjectType) -> DwRights 
         6 => DW_OBJECT_COMPATIBLE_RIGHTS_CHANNEL,
         7 => DW_OBJECT_COMPATIBLE_RIGHTS_EVENT,
         8 => DW_OBJECT_COMPATIBLE_RIGHTS_TIMER,
+        16 => DW_OBJECT_COMPATIBLE_RIGHTS_INTERRUPT,
+        17 => DW_OBJECT_COMPATIBLE_RIGHTS_DEVICE_RESOURCE,
         _ => DwRights(0),
     }
 }
@@ -423,6 +452,12 @@ pub const DW_OBJECT_COMPATIBLE_SIGNALS_EVENT: DwSignals = DwSignals(16);
 /// Applicable wait signals for the TIMER object type.
 pub const DW_OBJECT_COMPATIBLE_SIGNALS_TIMER: DwSignals = DwSignals(16);
 
+/// Applicable wait signals for the INTERRUPT object type.
+pub const DW_OBJECT_COMPATIBLE_SIGNALS_INTERRUPT: DwSignals = DwSignals(16);
+
+/// Applicable wait signals for the DEVICE_RESOURCE object type.
+pub const DW_OBJECT_COMPATIBLE_SIGNALS_DEVICE_RESOURCE: DwSignals = DwSignals(0);
+
 /// Returns the applicable wait-signal mask for one object type; sentinel, reserved, and unknown types return zero.
 pub const fn dw_object_compatible_signals(object_type: DwObjectType) -> DwSignals {
     match object_type.0 {
@@ -434,6 +469,8 @@ pub const fn dw_object_compatible_signals(object_type: DwObjectType) -> DwSignal
         6 => DW_OBJECT_COMPATIBLE_SIGNALS_CHANNEL,
         7 => DW_OBJECT_COMPATIBLE_SIGNALS_EVENT,
         8 => DW_OBJECT_COMPATIBLE_SIGNALS_TIMER,
+        16 => DW_OBJECT_COMPATIBLE_SIGNALS_INTERRUPT,
+        17 => DW_OBJECT_COMPATIBLE_SIGNALS_DEVICE_RESOURCE,
         _ => DwSignals(0),
     }
 }
@@ -457,6 +494,27 @@ pub const DW_BOOT_MEMORY_RANGE_V1_VERSION: u32 = 1;
 
 /// Required version value for DwBootModuleV1 records.
 pub const DW_BOOT_MODULE_V1_VERSION: u32 = 1;
+
+/// Required version value for the kernel-internal DwBootDeviceTableV1 carrier.
+pub const DW_BOOT_DEVICE_TABLE_V1_VERSION: u32 = 1;
+
+/// DwBootDeviceTableV1 supports no nonzero flags.
+pub const DW_BOOT_DEVICE_TABLE_FLAGS_SUPPORTED_MASK: u32 = 0;
+
+/// Required byte stride of each DwBootDeviceResourceV1 record.
+pub const DW_BOOT_DEVICE_TABLE_RECORD_STRIDE: u32 = 48;
+
+/// Maximum number of immutable resource records accepted from one boot-device table.
+pub const DW_BOOT_DEVICE_TABLE_MAX_RESOURCES: u32 = 8;
+
+/// Required version value for DwBootDeviceResourceV1 records.
+pub const DW_BOOT_DEVICE_RESOURCE_V1_VERSION: u32 = 1;
+
+/// DwBootDeviceResourceV1 supports no nonzero flags.
+pub const DW_BOOT_DEVICE_RESOURCE_FLAGS_SUPPORTED_MASK: u32 = 0;
+
+/// One bounded x86 port-I/O range paired with one platform interrupt source.
+pub const DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT: DwDeviceResourceKind = DwDeviceResourceKind(1);
 
 /// Required version value for DwBootX86_64PagingHandoffV1.
 pub const DW_BOOT_X86_64_PAGING_HANDOFF_V1_VERSION: u32 = 1;
@@ -536,6 +594,9 @@ pub const DW_WAIT_MANY_MAX_ITEMS: u32 = 64;
 /// Wake every waiter eligible for atomic_wake.
 pub const DW_ATOMIC_WAKE_ALL: u32 = 4294967295;
 
+/// Discovery identity for the complete DeviceResource and Interrupt runtime; kernels report this bit only after the DW1-D runtime gate is reached.
+pub const DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT: u64 = 1;
+
 /// Move a handle on commit; no duplicate transfer operation exists in ABI 0.
 pub const DW_HANDLE_TRANSFER_MOVE: DwHandleTransferOperation = DwHandleTransferOperation(1);
 
@@ -559,6 +620,36 @@ pub const DW_OBJECT_INFO_TASK_STATE_V1: u32 = 65537;
 
 /// Typed object_get_info topic for exact logical MemoryObject byte size.
 pub const DW_OBJECT_INFO_MEMORY_OBJECT_V1: u32 = 131073;
+
+/// Typed object_get_info topic for immutable DeviceResource identity and range metadata.
+pub const DW_OBJECT_INFO_DEVICE_RESOURCE_V1: u32 = 196609;
+
+/// Typed object_get_info topic for bounded Interrupt state and generation metadata.
+pub const DW_OBJECT_INFO_INTERRUPT_V1: u32 = 196610;
+
+/// Required version value for DwDeviceResourceInfoV1.
+pub const DW_DEVICE_RESOURCE_INFO_V1_VERSION: u32 = 1;
+
+/// DwDeviceResourceInfoV1 supports no nonzero flags.
+pub const DW_DEVICE_RESOURCE_INFO_FLAGS_SUPPORTED_MASK: u32 = 0;
+
+/// Required version value for DwInterruptInfoV1.
+pub const DW_INTERRUPT_INFO_V1_VERSION: u32 = 1;
+
+/// The Interrupt is bound, unsignaled, and ready for delivery.
+pub const DW_INTERRUPT_STATE_ARMED: DwInterruptState = DwInterruptState(1);
+
+/// The Interrupt has a pending level-observable delivery fact.
+pub const DW_INTERRUPT_STATE_PENDING: DwInterruptState = DwInterruptState(2);
+
+/// The Interrupt is terminal and its source is being masked and unbound.
+pub const DW_INTERRUPT_STATE_FINALIZING: DwInterruptState = DwInterruptState(3);
+
+/// At least one additional delivery fact must survive one acknowledgement.
+pub const DW_INTERRUPT_INFO_FLAG_COALESCED: DwInterruptInfoFlags = DwInterruptInfoFlags(1);
+
+/// All Interrupt information flags recognized by V1.
+pub const DW_INTERRUPT_INFO_FLAGS_SUPPORTED_MASK: DwInterruptInfoFlags = DwInterruptInfoFlags(1);
 
 /// Permit userspace reads from a mapping.
 pub const DW_MEMORY_PROTECTION_READ: DwMemoryProtection = DwMemoryProtection(1);
@@ -716,8 +807,23 @@ pub const DW_SYSCALL_TIMER_CREATE: DwSyscallId = DwSyscallId(0x00050010);
 /// Arm or replace a one-shot timer, atomically clearing prior signal state; INFINITE is invalid and cancel is explicit.
 pub const DW_SYSCALL_TIMER_SET: DwSyscallId = DwSyscallId(0x00050011);
 
-/// Cancel a one-shot timer and clear its signaled state.
+/// Cancel a one-shot monotonic timer and clear its signaled state.
 pub const DW_SYSCALL_TIMER_CANCEL: DwSyscallId = DwSyscallId(0x00050012);
+
+/// Claim one exact available boot resource through TASK_GROUP RESOURCE authority plus caller membership; the runtime remains unavailable until the DW1-D implementation gate is reached.
+pub const DW_SYSCALL_DEVICE_RESOURCE_CLAIM: DwSyscallId = DwSyscallId(0x00060001);
+
+/// Read one checked scalar value from a live DeviceResource PIO range.
+pub const DW_SYSCALL_DEVICE_PIO_READ: DwSyscallId = DwSyscallId(0x00060002);
+
+/// Write one checked scalar value to a live DeviceResource PIO range without truncation.
+pub const DW_SYSCALL_DEVICE_PIO_WRITE: DwSyscallId = DwSyscallId(0x00060003);
+
+/// Create one exclusive Interrupt derived from a live DeviceResource after platform binding reaches Armed.
+pub const DW_SYSCALL_INTERRUPT_CREATE: DwSyscallId = DwSyscallId(0x00060010);
+
+/// Acknowledge one pending Interrupt fact and rearm its exact source binding when no coalesced fact remains.
+pub const DW_SYSCALL_INTERRUPT_ACK: DwSyscallId = DwSyscallId(0x00060011);
 
 /// One normalized physical memory-map entry.
 #[repr(C)]
@@ -764,6 +870,56 @@ pub struct DwBootModuleV1 {
 }
 
 pub const DW_BOOT_MODULE_V1_SIZE: u32 = 64;
+
+/// Fixed header for an optional unique READ_ONLY kernel-internal boot-device resource table. The containing module consists exactly of this header followed by resource_count fixed-stride DwBootDeviceResourceV1 records.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DwBootDeviceTableV1 {
+    /// Fixed header byte size; must equal DW_BOOT_DEVICE_TABLE_V1_SIZE.
+    pub size: u32,
+    /// Structure version; must equal DW_BOOT_DEVICE_TABLE_V1_VERSION.
+    pub version: u32,
+    /// Nonzero record count bounded by DW_BOOT_DEVICE_TABLE_MAX_RESOURCES.
+    pub resource_count: u32,
+    /// Must contain only supported bits; V1 requires zero.
+    pub flags: u32,
+    /// Record byte stride; must equal DW_BOOT_DEVICE_TABLE_RECORD_STRIDE.
+    pub record_stride: u32,
+    /// Reserved; producer sets zero and consumer rejects nonzero.
+    pub reserved0: u32,
+    /// Exact complete carrier extent: header plus resource_count records.
+    pub total_byte_len: u64,
+}
+
+pub const DW_BOOT_DEVICE_TABLE_V1_SIZE: u32 = 32;
+
+/// One immutable numeric kernel-facing boot-device resource descriptor; policy names and userspace identities are excluded.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DwBootDeviceResourceV1 {
+    /// Fixed record byte size; must equal DW_BOOT_DEVICE_RESOURCE_V1_SIZE.
+    pub size: u32,
+    /// Structure version; must equal DW_BOOT_DEVICE_RESOURCE_V1_VERSION.
+    pub version: u32,
+    /// Admitted device-resource kind.
+    pub kind: DwDeviceResourceKind,
+    /// Must contain only supported bits; V1 requires zero.
+    pub flags: u32,
+    /// Nonzero immutable kernel resource identity.
+    pub resource_id: u64,
+    /// Optional non-authoritative policy correlation; zero means absent.
+    pub device_correlation_id: u64,
+    /// Exact x86 port-range base.
+    pub pio_base: u16,
+    /// Nonzero bounded port-range byte length.
+    pub pio_length: u16,
+    /// Nonzero platform interrupt-source identity.
+    pub interrupt_source: u32,
+    /// Reserved; producer sets zero and consumer rejects nonzero.
+    pub reserved: u64,
+}
+
+pub const DW_BOOT_DEVICE_RESOURCE_V1_SIZE: u32 = 48;
 
 /// Fixed header for the sole READ_ONLY kernel-internal x86_64 transition-page-table carrier. The containing module's physical_start is 4096-byte aligned, begins with this header, and is followed at table_frames_offset by a flat u64 list. The list is strictly ascending and unique, contains the distinct CR3 root and three temporary-path child frames, and enumerates every current transition page-table frame exactly once with no data frames. Every physical address is nonzero, 4096-byte aligned, has no bits outside physical_address_width, and remains reserved until Deepwyrm replaces CR3. The containing module's byte_len, total_byte_len, and table_frames_offset plus table_frame_count times table_frame_stride must be exactly equal.
 #[repr(C)]
@@ -1003,6 +1159,64 @@ pub struct DwMemoryObjectInfoV1 {
 
 pub const DW_MEMORY_OBJECT_INFO_V1_SIZE: u32 = 32;
 
+/// Read-only immutable DeviceResource identity, lease, port range, and interrupt-source information.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DwDeviceResourceInfoV1 {
+    /// Fixed byte size; must equal DW_DEVICE_RESOURCE_INFO_V1_SIZE.
+    pub size: u32,
+    /// Structure version; must equal DW_DEVICE_RESOURCE_INFO_V1_VERSION.
+    pub version: u32,
+    /// Admitted device-resource kind.
+    pub kind: DwDeviceResourceKind,
+    /// Must contain only supported bits; V1 requires zero.
+    pub flags: u32,
+    /// Nonzero immutable boot-resource identity.
+    pub resource_id: u64,
+    /// Nonzero kernel-minted lease generation.
+    pub lease_generation: u64,
+    /// Exact x86 port-range base.
+    pub pio_base: u16,
+    /// Nonzero bounded port-range byte length.
+    pub pio_length: u16,
+    /// Exact platform interrupt-source identity.
+    pub interrupt_source: u32,
+    /// Reserved; must be zero.
+    pub reserved: u64,
+}
+
+pub const DW_DEVICE_RESOURCE_INFO_V1_SIZE: u32 = 48;
+
+/// Read-only Interrupt source, lifecycle, parent-resource, and bounded pending-state information.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DwInterruptInfoV1 {
+    /// Fixed byte size; must equal DW_INTERRUPT_INFO_V1_SIZE.
+    pub size: u32,
+    /// Structure version; must equal DW_INTERRUPT_INFO_V1_VERSION.
+    pub version: u32,
+    /// Exact platform interrupt-source identity.
+    pub source: u32,
+    /// Public bounded lifecycle state.
+    pub state: DwInterruptState,
+    /// Nonzero Interrupt object generation.
+    pub object_generation: u64,
+    /// Nonzero source-binding generation.
+    pub binding_generation: u64,
+    /// Immutable parent DeviceResource identity.
+    pub parent_resource_id: u64,
+    /// Exact parent DeviceResource lease generation.
+    pub parent_lease_generation: u64,
+    /// Bounded pending-state facts.
+    pub flags: DwInterruptInfoFlags,
+    /// Reserved; must be zero.
+    pub reserved0: u32,
+    /// Reserved; must be zero.
+    pub reserved: u64,
+}
+
+pub const DW_INTERRUPT_INFO_V1_SIZE: u32 = 64;
+
 /// Versioned arguments selecting one page-aligned MemoryObject mapping.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1224,6 +1438,12 @@ mod generated_layout_tests {
         assert_eq!(align_of::<DwMemoryObjectCreateFlags>(), 4);
         assert_eq!(size_of::<DwAddressRegionMapFlags>(), 4);
         assert_eq!(align_of::<DwAddressRegionMapFlags>(), 4);
+        assert_eq!(size_of::<DwDeviceResourceKind>(), 4);
+        assert_eq!(align_of::<DwDeviceResourceKind>(), 4);
+        assert_eq!(size_of::<DwInterruptState>(), 4);
+        assert_eq!(align_of::<DwInterruptState>(), 4);
+        assert_eq!(size_of::<DwInterruptInfoFlags>(), 4);
+        assert_eq!(align_of::<DwInterruptInfoFlags>(), 4);
         assert_eq!(size_of::<DwClockId>(), 4);
         assert_eq!(align_of::<DwClockId>(), 4);
         assert_eq!(size_of::<DwTaskState>(), 4);
@@ -1273,6 +1493,27 @@ mod generated_layout_tests {
         assert_eq!(offset_of!(DwBootModuleV1, physical_start), 16);
         assert_eq!(offset_of!(DwBootModuleV1, byte_len), 24);
         assert_eq!(offset_of!(DwBootModuleV1, reserved), 32);
+        assert_eq!(size_of::<DwBootDeviceTableV1>(), 32);
+        assert_eq!(align_of::<DwBootDeviceTableV1>(), 8);
+        assert_eq!(offset_of!(DwBootDeviceTableV1, size), 0);
+        assert_eq!(offset_of!(DwBootDeviceTableV1, version), 4);
+        assert_eq!(offset_of!(DwBootDeviceTableV1, resource_count), 8);
+        assert_eq!(offset_of!(DwBootDeviceTableV1, flags), 12);
+        assert_eq!(offset_of!(DwBootDeviceTableV1, record_stride), 16);
+        assert_eq!(offset_of!(DwBootDeviceTableV1, reserved0), 20);
+        assert_eq!(offset_of!(DwBootDeviceTableV1, total_byte_len), 24);
+        assert_eq!(size_of::<DwBootDeviceResourceV1>(), 48);
+        assert_eq!(align_of::<DwBootDeviceResourceV1>(), 8);
+        assert_eq!(offset_of!(DwBootDeviceResourceV1, size), 0);
+        assert_eq!(offset_of!(DwBootDeviceResourceV1, version), 4);
+        assert_eq!(offset_of!(DwBootDeviceResourceV1, kind), 8);
+        assert_eq!(offset_of!(DwBootDeviceResourceV1, flags), 12);
+        assert_eq!(offset_of!(DwBootDeviceResourceV1, resource_id), 16);
+        assert_eq!(offset_of!(DwBootDeviceResourceV1, device_correlation_id), 24);
+        assert_eq!(offset_of!(DwBootDeviceResourceV1, pio_base), 32);
+        assert_eq!(offset_of!(DwBootDeviceResourceV1, pio_length), 34);
+        assert_eq!(offset_of!(DwBootDeviceResourceV1, interrupt_source), 36);
+        assert_eq!(offset_of!(DwBootDeviceResourceV1, reserved), 40);
         assert_eq!(size_of::<DwBootX86_64PagingHandoffV1>(), 112);
         assert_eq!(align_of::<DwBootX86_64PagingHandoffV1>(), 8);
         assert_eq!(offset_of!(DwBootX86_64PagingHandoffV1, size), 0);
@@ -1376,6 +1617,31 @@ mod generated_layout_tests {
         assert_eq!(offset_of!(DwMemoryObjectInfoV1, version), 4);
         assert_eq!(offset_of!(DwMemoryObjectInfoV1, byte_size), 8);
         assert_eq!(offset_of!(DwMemoryObjectInfoV1, reserved), 16);
+        assert_eq!(size_of::<DwDeviceResourceInfoV1>(), 48);
+        assert_eq!(align_of::<DwDeviceResourceInfoV1>(), 8);
+        assert_eq!(offset_of!(DwDeviceResourceInfoV1, size), 0);
+        assert_eq!(offset_of!(DwDeviceResourceInfoV1, version), 4);
+        assert_eq!(offset_of!(DwDeviceResourceInfoV1, kind), 8);
+        assert_eq!(offset_of!(DwDeviceResourceInfoV1, flags), 12);
+        assert_eq!(offset_of!(DwDeviceResourceInfoV1, resource_id), 16);
+        assert_eq!(offset_of!(DwDeviceResourceInfoV1, lease_generation), 24);
+        assert_eq!(offset_of!(DwDeviceResourceInfoV1, pio_base), 32);
+        assert_eq!(offset_of!(DwDeviceResourceInfoV1, pio_length), 34);
+        assert_eq!(offset_of!(DwDeviceResourceInfoV1, interrupt_source), 36);
+        assert_eq!(offset_of!(DwDeviceResourceInfoV1, reserved), 40);
+        assert_eq!(size_of::<DwInterruptInfoV1>(), 64);
+        assert_eq!(align_of::<DwInterruptInfoV1>(), 8);
+        assert_eq!(offset_of!(DwInterruptInfoV1, size), 0);
+        assert_eq!(offset_of!(DwInterruptInfoV1, version), 4);
+        assert_eq!(offset_of!(DwInterruptInfoV1, source), 8);
+        assert_eq!(offset_of!(DwInterruptInfoV1, state), 12);
+        assert_eq!(offset_of!(DwInterruptInfoV1, object_generation), 16);
+        assert_eq!(offset_of!(DwInterruptInfoV1, binding_generation), 24);
+        assert_eq!(offset_of!(DwInterruptInfoV1, parent_resource_id), 32);
+        assert_eq!(offset_of!(DwInterruptInfoV1, parent_lease_generation), 40);
+        assert_eq!(offset_of!(DwInterruptInfoV1, flags), 48);
+        assert_eq!(offset_of!(DwInterruptInfoV1, reserved0), 52);
+        assert_eq!(offset_of!(DwInterruptInfoV1, reserved), 56);
         assert_eq!(size_of::<DwAddressRegionMapArgsV1>(), 72);
         assert_eq!(align_of::<DwAddressRegionMapArgsV1>(), 8);
         assert_eq!(offset_of!(DwAddressRegionMapArgsV1, size), 0);
@@ -1484,6 +1750,7 @@ mod generated_layout_tests {
         assert_eq!(DW_RIGHT_TRANSFER.0, 128);
         assert_eq!(DW_RIGHT_INSPECT.0, 256);
         assert_eq!(DW_RIGHT_MODIFY.0, 512);
+        assert_eq!(DW_RIGHT_RESOURCE.0, 1024);
         assert_eq!(DW_OBJECT_TYPE_NONE.0, 0);
         assert_eq!(DW_OBJECT_TYPE_TASK_GROUP.0, 1);
         assert_eq!(DW_OBJECT_TYPE_PROCESS.0, 2);
@@ -1514,6 +1781,7 @@ mod generated_layout_tests {
         assert_eq!(DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP.0, 1);
         assert_eq!(DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS.0, 2);
         assert_eq!(DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1.0, 3);
+        assert_eq!(DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1.0, 4);
         assert_eq!(DW_BOOT_MODULE_FLAG_READ_ONLY.0, 1);
         assert_eq!(DW_BOOT_PIXEL_FORMAT_UNSPECIFIED.0, 0);
         assert_eq!(DW_BOOT_PIXEL_FORMAT_RGBX8.0, 1);
@@ -1525,9 +1793,9 @@ mod generated_layout_tests {
         assert_eq!(DW_BOOT_ENTROPY_SOURCE_FIRMWARE_PLATFORM.0, 2);
         assert_eq!(DW_BOOT_ENTROPY_SOURCE_MIXED_FIRMWARE.0, 3);
         assert_eq!(DW_BOOT_ENTROPY_FLAG_CONDITIONED.0, 1);
-        assert_eq!(DW_RIGHTS_KNOWN_MASK.0, 1023);
-        assert_eq!(DW_OBJECT_COMPATIBLE_RIGHTS_TASK_GROUP.0, 960);
-        assert_eq!(dw_object_compatible_rights(DW_OBJECT_TYPE_TASK_GROUP).0, 960);
+        assert_eq!(DW_RIGHTS_KNOWN_MASK.0, 2047);
+        assert_eq!(DW_OBJECT_COMPATIBLE_RIGHTS_TASK_GROUP.0, 1984);
+        assert_eq!(dw_object_compatible_rights(DW_OBJECT_TYPE_TASK_GROUP).0, 1984);
         assert_eq!(DW_OBJECT_COMPATIBLE_RIGHTS_PROCESS.0, 976);
         assert_eq!(dw_object_compatible_rights(DW_OBJECT_TYPE_PROCESS).0, 976);
         assert_eq!(DW_OBJECT_COMPATIBLE_RIGHTS_THREAD.0, 980);
@@ -1542,6 +1810,10 @@ mod generated_layout_tests {
         assert_eq!(dw_object_compatible_rights(DW_OBJECT_TYPE_EVENT).0, 496);
         assert_eq!(DW_OBJECT_COMPATIBLE_RIGHTS_TIMER.0, 976);
         assert_eq!(dw_object_compatible_rights(DW_OBJECT_TYPE_TIMER).0, 976);
+        assert_eq!(DW_OBJECT_COMPATIBLE_RIGHTS_INTERRUPT.0, 912);
+        assert_eq!(dw_object_compatible_rights(DW_OBJECT_TYPE_INTERRUPT).0, 912);
+        assert_eq!(DW_OBJECT_COMPATIBLE_RIGHTS_DEVICE_RESOURCE.0, 963);
+        assert_eq!(dw_object_compatible_rights(DW_OBJECT_TYPE_DEVICE_RESOURCE).0, 963);
         assert_eq!(dw_object_compatible_rights(DW_OBJECT_TYPE_NONE).0, 0);
         assert!(dw_rights_are_known(DW_RIGHTS_KNOWN_MASK));
         assert!(dw_rights_are_compatible(DW_OBJECT_TYPE_MEMORY_OBJECT, DW_RIGHT_MAP));
@@ -1563,6 +1835,10 @@ mod generated_layout_tests {
         assert_eq!(dw_object_compatible_signals(DW_OBJECT_TYPE_EVENT).0, 16);
         assert_eq!(DW_OBJECT_COMPATIBLE_SIGNALS_TIMER.0, 16);
         assert_eq!(dw_object_compatible_signals(DW_OBJECT_TYPE_TIMER).0, 16);
+        assert_eq!(DW_OBJECT_COMPATIBLE_SIGNALS_INTERRUPT.0, 16);
+        assert_eq!(dw_object_compatible_signals(DW_OBJECT_TYPE_INTERRUPT).0, 16);
+        assert_eq!(DW_OBJECT_COMPATIBLE_SIGNALS_DEVICE_RESOURCE.0, 0);
+        assert_eq!(dw_object_compatible_signals(DW_OBJECT_TYPE_DEVICE_RESOURCE).0, 0);
         assert_eq!(dw_object_compatible_signals(DW_OBJECT_TYPE_NONE).0, 0);
         assert!(dw_signals_are_known(DW_SIGNALS_KNOWN_MASK));
         assert!(dw_signals_are_compatible(DW_OBJECT_TYPE_CHANNEL, DW_SIGNAL_READABLE));
@@ -1570,6 +1846,13 @@ mod generated_layout_tests {
         assert_eq!(DW_BOOT_BASE_PAGE_SIZE, 4096);
         assert_eq!(DW_BOOT_MEMORY_RANGE_V1_VERSION, 1);
         assert_eq!(DW_BOOT_MODULE_V1_VERSION, 1);
+        assert_eq!(DW_BOOT_DEVICE_TABLE_V1_VERSION, 1);
+        assert_eq!(DW_BOOT_DEVICE_TABLE_FLAGS_SUPPORTED_MASK, 0);
+        assert_eq!(DW_BOOT_DEVICE_TABLE_RECORD_STRIDE, 48);
+        assert_eq!(DW_BOOT_DEVICE_TABLE_MAX_RESOURCES, 8);
+        assert_eq!(DW_BOOT_DEVICE_RESOURCE_V1_VERSION, 1);
+        assert_eq!(DW_BOOT_DEVICE_RESOURCE_FLAGS_SUPPORTED_MASK, 0);
+        assert_eq!(DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT.0, 1);
         assert_eq!(DW_BOOT_X86_64_PAGING_HANDOFF_V1_VERSION, 1);
         assert_eq!(DW_BOOT_X86_64_PAGING_HANDOFF_FLAGS_SUPPORTED_MASK.0, 0);
         assert_eq!(DW_BOOT_X86_64_PAGING_HANDOFF_LAYOUT_VERSION, 2);
@@ -1596,6 +1879,7 @@ mod generated_layout_tests {
         assert_eq!(DW_CHANNEL_MAX_HANDLES, 16);
         assert_eq!(DW_WAIT_MANY_MAX_ITEMS, 64);
         assert_eq!(DW_ATOMIC_WAKE_ALL, 4294967295);
+        assert_eq!(DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT, 1);
         assert_eq!(DW_HANDLE_TRANSFER_MOVE.0, 1);
         assert_eq!(DW_WAIT_MODE_ANY, 0);
         assert_eq!(DW_WAIT_MODE_ALL, 1);
@@ -1604,6 +1888,16 @@ mod generated_layout_tests {
         assert_eq!(DW_OBJECT_INFO_BASIC_V1, 1);
         assert_eq!(DW_OBJECT_INFO_TASK_STATE_V1, 65537);
         assert_eq!(DW_OBJECT_INFO_MEMORY_OBJECT_V1, 131073);
+        assert_eq!(DW_OBJECT_INFO_DEVICE_RESOURCE_V1, 196609);
+        assert_eq!(DW_OBJECT_INFO_INTERRUPT_V1, 196610);
+        assert_eq!(DW_DEVICE_RESOURCE_INFO_V1_VERSION, 1);
+        assert_eq!(DW_DEVICE_RESOURCE_INFO_FLAGS_SUPPORTED_MASK, 0);
+        assert_eq!(DW_INTERRUPT_INFO_V1_VERSION, 1);
+        assert_eq!(DW_INTERRUPT_STATE_ARMED.0, 1);
+        assert_eq!(DW_INTERRUPT_STATE_PENDING.0, 2);
+        assert_eq!(DW_INTERRUPT_STATE_FINALIZING.0, 3);
+        assert_eq!(DW_INTERRUPT_INFO_FLAG_COALESCED.0, 1);
+        assert_eq!(DW_INTERRUPT_INFO_FLAGS_SUPPORTED_MASK.0, 1);
         assert_eq!(DW_MEMORY_PROTECTION_READ.0, 1);
         assert_eq!(DW_MEMORY_PROTECTION_WRITE.0, 2);
         assert_eq!(DW_MEMORY_PROTECTION_EXECUTE.0, 4);
@@ -1657,5 +1951,10 @@ mod generated_layout_tests {
         assert_eq!(DW_SYSCALL_TIMER_CREATE.0, 0x00050010);
         assert_eq!(DW_SYSCALL_TIMER_SET.0, 0x00050011);
         assert_eq!(DW_SYSCALL_TIMER_CANCEL.0, 0x00050012);
+        assert_eq!(DW_SYSCALL_DEVICE_RESOURCE_CLAIM.0, 0x00060001);
+        assert_eq!(DW_SYSCALL_DEVICE_PIO_READ.0, 0x00060002);
+        assert_eq!(DW_SYSCALL_DEVICE_PIO_WRITE.0, 0x00060003);
+        assert_eq!(DW_SYSCALL_INTERRUPT_CREATE.0, 0x00060010);
+        assert_eq!(DW_SYSCALL_INTERRUPT_ACK.0, 0x00060011);
     }
 }

@@ -695,6 +695,7 @@ fn rust_phase_variant(phase: &str) -> Result<&'static str> {
         "DW0-F" => Ok("Dw0F"),
         "DW0-G" => Ok("Dw0G"),
         "DW0-H" => Ok("Dw0H"),
+        "DW1-D" => Ok("Dw1D"),
         other => Err(Error::new(format!(
             "unsupported syscall implementation phase `{other}`"
         ))),
@@ -716,7 +717,7 @@ pub(super) fn render_kernel_dispatch(model: &Model) -> Result<String> {
     .unwrap();
     writeln!(out, "pub enum DwSyscallImplementationPhase {{").unwrap();
     for (index, variant) in [
-        "Dw0A", "Dw0B", "Dw0C", "Dw0D", "Dw0E", "Dw0F", "Dw0G", "Dw0H",
+        "Dw0A", "Dw0B", "Dw0C", "Dw0D", "Dw0E", "Dw0F", "Dw0G", "Dw0H", "Dw1D",
     ]
     .into_iter()
     .enumerate()

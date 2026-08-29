@@ -1,8 +1,9 @@
 extern crate std;
 
 use deepwyrm_abi::{
-    DW_OBJECT_TYPE_INTERRUPT, DW_OBJECT_TYPE_MEMORY_OBJECT, DW_OBJECT_TYPE_NONE,
-    DW_OBJECT_TYPE_PROCESS, DW_OBJECT_TYPE_TASK_GROUP,
+    DW_OBJECT_TYPE_DEVICE_RESOURCE, DW_OBJECT_TYPE_EXCEPTION, DW_OBJECT_TYPE_INTERRUPT,
+    DW_OBJECT_TYPE_MEMORY_OBJECT, DW_OBJECT_TYPE_NONE, DW_OBJECT_TYPE_PROCESS,
+    DW_OBJECT_TYPE_TASK_GROUP,
 };
 
 use super::*;
@@ -23,20 +24,28 @@ fn finish<const CAPACITY: usize>(
 }
 
 #[test]
-fn create_rejects_nonlive_types_and_honors_fixed_capacity() {
+fn create_activates_only_schema_live_types_and_honors_fixed_capacity() {
     let mut registry = ObjectRegistry::<1>::new();
     assert_eq!(
         registry.create(DW_OBJECT_TYPE_NONE),
         Err(ObjectRegistryError::InvalidObjectType)
     );
     assert_eq!(
-        registry.create(DW_OBJECT_TYPE_INTERRUPT),
+        registry.create(DW_OBJECT_TYPE_EXCEPTION),
         Err(ObjectRegistryError::InvalidObjectType)
     );
     assert_eq!(
         registry.create(DwObjectType(0xfeed)),
         Err(ObjectRegistryError::InvalidObjectType)
     );
+
+    for object_type in [DW_OBJECT_TYPE_INTERRUPT, DW_OBJECT_TYPE_DEVICE_RESOURCE] {
+        let creation = registry.create(object_type).unwrap();
+        assert_eq!(counts(&registry, creation.id()), (0, 1));
+        let final_release = registry.release_creation(creation).unwrap().unwrap();
+        finish(&mut registry, final_release);
+    }
+
     let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
     assert_eq!(counts(&registry, creation.id()), (0, 1));
     assert_eq!(

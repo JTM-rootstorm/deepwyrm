@@ -23,11 +23,11 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 
 ## Object-right compatibility
 
-`DW_RIGHTS_KNOWN_MASK` is `1023`. Zero is structurally known/compatible; operations that request new authority apply the separate nonzero-rights rule. Sentinel, reserved, and unknown object types have a compatible-rights mask of zero.
+`DW_RIGHTS_KNOWN_MASK` is `2047`. Zero is structurally known/compatible; operations that request new authority apply the separate nonzero-rights rule. Sentinel, reserved, and unknown object types have a compatible-rights mask of zero.
 
 | Object | Generated mask | Rights | Value |
 |---|---|---|---:|
-| `DW_OBJECT_TYPE_TASK_GROUP` | `DW_OBJECT_COMPATIBLE_RIGHTS_TASK_GROUP` | `DW_RIGHT_MODIFY + DW_RIGHT_DUPLICATE + DW_RIGHT_TRANSFER + DW_RIGHT_INSPECT` | `960` |
+| `DW_OBJECT_TYPE_TASK_GROUP` | `DW_OBJECT_COMPATIBLE_RIGHTS_TASK_GROUP` | `DW_RIGHT_MODIFY + DW_RIGHT_DUPLICATE + DW_RIGHT_TRANSFER + DW_RIGHT_INSPECT + DW_RIGHT_RESOURCE` | `1984` |
 | `DW_OBJECT_TYPE_PROCESS` | `DW_OBJECT_COMPATIBLE_RIGHTS_PROCESS` | `DW_RIGHT_WAIT + DW_RIGHT_MODIFY + DW_RIGHT_DUPLICATE + DW_RIGHT_TRANSFER + DW_RIGHT_INSPECT` | `976` |
 | `DW_OBJECT_TYPE_THREAD` | `DW_OBJECT_COMPATIBLE_RIGHTS_THREAD` | `DW_RIGHT_EXECUTE + DW_RIGHT_WAIT + DW_RIGHT_MODIFY + DW_RIGHT_DUPLICATE + DW_RIGHT_TRANSFER + DW_RIGHT_INSPECT` | `980` |
 | `DW_OBJECT_TYPE_MEMORY_OBJECT` | `DW_OBJECT_COMPATIBLE_RIGHTS_MEMORY_OBJECT` | `DW_RIGHT_READ + DW_RIGHT_WRITE + DW_RIGHT_EXECUTE + DW_RIGHT_MAP + DW_RIGHT_DUPLICATE + DW_RIGHT_TRANSFER + DW_RIGHT_INSPECT` | `463` |
@@ -35,6 +35,8 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_OBJECT_TYPE_CHANNEL` | `DW_OBJECT_COMPATIBLE_RIGHTS_CHANNEL` | `DW_RIGHT_READ + DW_RIGHT_WRITE + DW_RIGHT_WAIT + DW_RIGHT_DUPLICATE + DW_RIGHT_TRANSFER + DW_RIGHT_INSPECT` | `467` |
 | `DW_OBJECT_TYPE_EVENT` | `DW_OBJECT_COMPATIBLE_RIGHTS_EVENT` | `DW_RIGHT_WAIT + DW_RIGHT_SIGNAL + DW_RIGHT_DUPLICATE + DW_RIGHT_TRANSFER + DW_RIGHT_INSPECT` | `496` |
 | `DW_OBJECT_TYPE_TIMER` | `DW_OBJECT_COMPATIBLE_RIGHTS_TIMER` | `DW_RIGHT_WAIT + DW_RIGHT_MODIFY + DW_RIGHT_DUPLICATE + DW_RIGHT_TRANSFER + DW_RIGHT_INSPECT` | `976` |
+| `DW_OBJECT_TYPE_INTERRUPT` | `DW_OBJECT_COMPATIBLE_RIGHTS_INTERRUPT` | `DW_RIGHT_WAIT + DW_RIGHT_MODIFY + DW_RIGHT_TRANSFER + DW_RIGHT_INSPECT` | `912` |
+| `DW_OBJECT_TYPE_DEVICE_RESOURCE` | `DW_OBJECT_COMPATIBLE_RIGHTS_DEVICE_RESOURCE` | `DW_RIGHT_READ + DW_RIGHT_WRITE + DW_RIGHT_MODIFY + DW_RIGHT_DUPLICATE + DW_RIGHT_TRANSFER + DW_RIGHT_INSPECT` | `963` |
 
 ## Object-signal compatibility
 
@@ -50,6 +52,8 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_OBJECT_TYPE_CHANNEL` | `DW_OBJECT_COMPATIBLE_SIGNALS_CHANNEL` | `DW_SIGNAL_READABLE + DW_SIGNAL_WRITABLE + DW_SIGNAL_PEER_CLOSED` | `7` |
 | `DW_OBJECT_TYPE_EVENT` | `DW_OBJECT_COMPATIBLE_SIGNALS_EVENT` | `DW_SIGNAL_SIGNALED` | `16` |
 | `DW_OBJECT_TYPE_TIMER` | `DW_OBJECT_COMPATIBLE_SIGNALS_TIMER` | `DW_SIGNAL_SIGNALED` | `16` |
+| `DW_OBJECT_TYPE_INTERRUPT` | `DW_OBJECT_COMPATIBLE_SIGNALS_INTERRUPT` | `DW_SIGNAL_SIGNALED` | `16` |
+| `DW_OBJECT_TYPE_DEVICE_RESOURCE` | `DW_OBJECT_COMPATIBLE_SIGNALS_DEVICE_RESOURCE` | `NONE` | `0` |
 
 ## Status
 
@@ -87,6 +91,7 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_RIGHT_TRANSFER` | `128` | Transfer the handle through an operation that accepts handles. |  |
 | `DW_RIGHT_INSPECT` | `256` | Query structured object information. |  |
 | `DW_RIGHT_MODIFY` | `512` | Change object configuration or lifecycle state. |  |
+| `DW_RIGHT_RESOURCE` | `1024` | Claim or derive kernel-managed resource authority explicitly attached to an object, subject to its additional ownership and membership rules. |  |
 
 ## Object
 
@@ -101,8 +106,8 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_OBJECT_TYPE_CHANNEL` | `6` | One endpoint of a buffered bidirectional channel. | DW0 |
 | `DW_OBJECT_TYPE_EVENT` | `7` | Explicitly signaled waitable event. | DW0 |
 | `DW_OBJECT_TYPE_TIMER` | `8` | Absolute-monotonic-deadline timer. | DW0 |
-| `DW_OBJECT_TYPE_INTERRUPT` | `16` | Reserved for a future interrupt-delivery object. | reserved |
-| `DW_OBJECT_TYPE_DEVICE_RESOURCE` | `17` | Reserved for future rights-scoped device resources. | reserved |
+| `DW_OBJECT_TYPE_INTERRUPT` | `16` | Exclusive, waitable, explicitly acknowledged interrupt-delivery object. | DW1-D |
+| `DW_OBJECT_TYPE_DEVICE_RESOURCE` | `17` | Rights-scoped kernel-managed device resource. | DW1-D |
 | `DW_OBJECT_TYPE_EXCEPTION` | `18` | Reserved for future structured exception delivery. | reserved |
 
 ## Signal
@@ -113,7 +118,7 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_SIGNAL_WRITABLE` | `2` | Some queue capacity exists; this level signal does not reserve space or guarantee that an arbitrary racing send will fit. | CHANNEL |
 | `DW_SIGNAL_PEER_CLOSED` | `4` | The peer channel endpoint has closed. | CHANNEL |
 | `DW_SIGNAL_EXITED` | `8` | The process or thread reached its terminal state. | PROCESS,THREAD |
-| `DW_SIGNAL_SIGNALED` | `16` | The event or timer is signaled. | EVENT,TIMER |
+| `DW_SIGNAL_SIGNALED` | `16` | The event, timer, or interrupt is signaled. | EVENT,TIMER,INTERRUPT |
 
 ## Boot Info Flag
 
@@ -142,6 +147,7 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP` | `1` | Primordial fully-static Wyrmroot bootstrap ELF. |  |
 | `DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS` | `2` | Read-only Wyrmroot bootfs image. |  |
 | `DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1` | `3` | Exactly one READ_ONLY kernel-internal DwBootX86_64PagingHandoffV1 carrier; it must never be transferred to userspace. |  |
+| `DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1` | `4` | Optional unique READ_ONLY kernel-internal DwBootDeviceTableV1 carrier; it must never be transferred to userspace. |  |
 
 ## Module Flag
 
@@ -186,6 +192,13 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_BOOT_BASE_PAGE_SIZE` | `u32` | `4096` | DW0 base page size in bytes for BootInfo memory ranges and handoff mappings. |
 | `DW_BOOT_MEMORY_RANGE_V1_VERSION` | `u32` | `1` | Required version value for DwBootMemoryRangeV1 records. |
 | `DW_BOOT_MODULE_V1_VERSION` | `u32` | `1` | Required version value for DwBootModuleV1 records. |
+| `DW_BOOT_DEVICE_TABLE_V1_VERSION` | `u32` | `1` | Required version value for the kernel-internal DwBootDeviceTableV1 carrier. |
+| `DW_BOOT_DEVICE_TABLE_FLAGS_SUPPORTED_MASK` | `u32` | `0` | DwBootDeviceTableV1 supports no nonzero flags. |
+| `DW_BOOT_DEVICE_TABLE_RECORD_STRIDE` | `u32` | `48` | Required byte stride of each DwBootDeviceResourceV1 record. |
+| `DW_BOOT_DEVICE_TABLE_MAX_RESOURCES` | `u32` | `8` | Maximum number of immutable resource records accepted from one boot-device table. |
+| `DW_BOOT_DEVICE_RESOURCE_V1_VERSION` | `u32` | `1` | Required version value for DwBootDeviceResourceV1 records. |
+| `DW_BOOT_DEVICE_RESOURCE_FLAGS_SUPPORTED_MASK` | `u32` | `0` | DwBootDeviceResourceV1 supports no nonzero flags. |
+| `DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT` | `DwDeviceResourceKind` | `1` | One bounded x86 port-I/O range paired with one platform interrupt source. |
 | `DW_BOOT_X86_64_PAGING_HANDOFF_V1_VERSION` | `u32` | `1` | Required version value for DwBootX86_64PagingHandoffV1. |
 | `DW_BOOT_X86_64_PAGING_HANDOFF_FLAGS_SUPPORTED_MASK` | `DwBootX86_64PagingHandoffFlags` | `0` | DwBootX86_64PagingHandoffV1 supports no nonzero flags. |
 | `DW_BOOT_X86_64_PAGING_HANDOFF_LAYOUT_VERSION` | `u32` | `2` | Deepwyrm x86_64 paging-layout contract version bound by the V1 carrier. |
@@ -212,6 +225,7 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_CHANNEL_MAX_HANDLES` | `u32` | `16` | Maximum DW0 channel handles per message. |
 | `DW_WAIT_MANY_MAX_ITEMS` | `u32` | `64` | Maximum handles accepted by one ABI-0 wait_many operation. |
 | `DW_ATOMIC_WAKE_ALL` | `u32` | `4294967295` | Wake every waiter eligible for atomic_wake. |
+| `DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT` | `u64` | `1` | Discovery identity for the complete DeviceResource and Interrupt runtime; kernels report this bit only after the DW1-D runtime gate is reached. |
 | `DW_HANDLE_TRANSFER_MOVE` | `DwHandleTransferOperation` | `1` | Move a handle on commit; no duplicate transfer operation exists in ABI 0. |
 | `DW_WAIT_MODE_ANY` | `u32` | `0` | Return the lowest-index ready item. |
 | `DW_WAIT_MODE_ALL` | `u32` | `1` | Reserved in ABI 0; operations return NOT_SUPPORTED. |
@@ -220,6 +234,16 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_OBJECT_INFO_BASIC_V1` | `u32` | `1` | Typed object_get_info topic for basic type and rights metadata. |
 | `DW_OBJECT_INFO_TASK_STATE_V1` | `u32` | `65537` | Typed object_get_info topic for process or thread termination state. |
 | `DW_OBJECT_INFO_MEMORY_OBJECT_V1` | `u32` | `131073` | Typed object_get_info topic for exact logical MemoryObject byte size. |
+| `DW_OBJECT_INFO_DEVICE_RESOURCE_V1` | `u32` | `196609` | Typed object_get_info topic for immutable DeviceResource identity and range metadata. |
+| `DW_OBJECT_INFO_INTERRUPT_V1` | `u32` | `196610` | Typed object_get_info topic for bounded Interrupt state and generation metadata. |
+| `DW_DEVICE_RESOURCE_INFO_V1_VERSION` | `u32` | `1` | Required version value for DwDeviceResourceInfoV1. |
+| `DW_DEVICE_RESOURCE_INFO_FLAGS_SUPPORTED_MASK` | `u32` | `0` | DwDeviceResourceInfoV1 supports no nonzero flags. |
+| `DW_INTERRUPT_INFO_V1_VERSION` | `u32` | `1` | Required version value for DwInterruptInfoV1. |
+| `DW_INTERRUPT_STATE_ARMED` | `DwInterruptState` | `1` | The Interrupt is bound, unsignaled, and ready for delivery. |
+| `DW_INTERRUPT_STATE_PENDING` | `DwInterruptState` | `2` | The Interrupt has a pending level-observable delivery fact. |
+| `DW_INTERRUPT_STATE_FINALIZING` | `DwInterruptState` | `3` | The Interrupt is terminal and its source is being masked and unbound. |
+| `DW_INTERRUPT_INFO_FLAG_COALESCED` | `DwInterruptInfoFlags` | `1` | At least one additional delivery fact must survive one acknowledgement. |
+| `DW_INTERRUPT_INFO_FLAGS_SUPPORTED_MASK` | `DwInterruptInfoFlags` | `1` | All Interrupt information flags recognized by V1. |
 | `DW_MEMORY_PROTECTION_READ` | `DwMemoryProtection` | `1` | Permit userspace reads from a mapping. |
 | `DW_MEMORY_PROTECTION_WRITE` | `DwMemoryProtection` | `2` | Permit userspace writes to a mapping. |
 | `DW_MEMORY_PROTECTION_EXECUTE` | `DwMemoryProtection` | `4` | Permit userspace instruction fetches from a mapping. |
@@ -274,6 +298,37 @@ One loaded boot module supplied by the Wyrmroot EFI loader. Size 64, alignment 8
 | 16 | `physical_start` | `u64` | Physical start address of module bytes. |
 | 24 | `byte_len` | `u64` | Exact module byte length. |
 | 32 | `reserved` | `[u64; 4]` | Reserved; all elements must be zero. |
+
+### `DwBootDeviceTableV1`
+
+Fixed header for an optional unique READ_ONLY kernel-internal boot-device resource table. The containing module consists exactly of this header followed by resource_count fixed-stride DwBootDeviceResourceV1 records. Size 32, alignment 8.
+
+| Offset | Field | Type | Meaning |
+|---:|---|---|---|
+| 0 | `size` | `u32` | Fixed header byte size; must equal DW_BOOT_DEVICE_TABLE_V1_SIZE. |
+| 4 | `version` | `u32` | Structure version; must equal DW_BOOT_DEVICE_TABLE_V1_VERSION. |
+| 8 | `resource_count` | `u32` | Nonzero record count bounded by DW_BOOT_DEVICE_TABLE_MAX_RESOURCES. |
+| 12 | `flags` | `u32` | Must contain only supported bits; V1 requires zero. |
+| 16 | `record_stride` | `u32` | Record byte stride; must equal DW_BOOT_DEVICE_TABLE_RECORD_STRIDE. |
+| 20 | `reserved0` | `u32` | Reserved; producer sets zero and consumer rejects nonzero. |
+| 24 | `total_byte_len` | `u64` | Exact complete carrier extent: header plus resource_count records. |
+
+### `DwBootDeviceResourceV1`
+
+One immutable numeric kernel-facing boot-device resource descriptor; policy names and userspace identities are excluded. Size 48, alignment 8.
+
+| Offset | Field | Type | Meaning |
+|---:|---|---|---|
+| 0 | `size` | `u32` | Fixed record byte size; must equal DW_BOOT_DEVICE_RESOURCE_V1_SIZE. |
+| 4 | `version` | `u32` | Structure version; must equal DW_BOOT_DEVICE_RESOURCE_V1_VERSION. |
+| 8 | `kind` | `DwDeviceResourceKind` | Admitted device-resource kind. |
+| 12 | `flags` | `u32` | Must contain only supported bits; V1 requires zero. |
+| 16 | `resource_id` | `u64` | Nonzero immutable kernel resource identity. |
+| 24 | `device_correlation_id` | `u64` | Optional non-authoritative policy correlation; zero means absent. |
+| 32 | `pio_base` | `u16` | Exact x86 port-range base. |
+| 34 | `pio_length` | `u16` | Nonzero bounded port-range byte length. |
+| 36 | `interrupt_source` | `u32` | Nonzero platform interrupt-source identity. |
+| 40 | `reserved` | `u64` | Reserved; producer sets zero and consumer rejects nonzero. |
 
 ### `DwBootX86_64PagingHandoffV1`
 
@@ -418,6 +473,41 @@ Read-only exact logical MemoryObject size information. Size 32, alignment 8.
 | 8 | `byte_size` | `u64` | Exact logical content byte size, fixed for the object lifetime; APIs report this value rather than page-rounded mappable capacity. |
 | 16 | `reserved` | `[u64; 2]` | Reserved; all elements must be zero. |
 
+### `DwDeviceResourceInfoV1`
+
+Read-only immutable DeviceResource identity, lease, port range, and interrupt-source information. Size 48, alignment 8.
+
+| Offset | Field | Type | Meaning |
+|---:|---|---|---|
+| 0 | `size` | `u32` | Fixed byte size; must equal DW_DEVICE_RESOURCE_INFO_V1_SIZE. |
+| 4 | `version` | `u32` | Structure version; must equal DW_DEVICE_RESOURCE_INFO_V1_VERSION. |
+| 8 | `kind` | `DwDeviceResourceKind` | Admitted device-resource kind. |
+| 12 | `flags` | `u32` | Must contain only supported bits; V1 requires zero. |
+| 16 | `resource_id` | `u64` | Nonzero immutable boot-resource identity. |
+| 24 | `lease_generation` | `u64` | Nonzero kernel-minted lease generation. |
+| 32 | `pio_base` | `u16` | Exact x86 port-range base. |
+| 34 | `pio_length` | `u16` | Nonzero bounded port-range byte length. |
+| 36 | `interrupt_source` | `u32` | Exact platform interrupt-source identity. |
+| 40 | `reserved` | `u64` | Reserved; must be zero. |
+
+### `DwInterruptInfoV1`
+
+Read-only Interrupt source, lifecycle, parent-resource, and bounded pending-state information. Size 64, alignment 8.
+
+| Offset | Field | Type | Meaning |
+|---:|---|---|---|
+| 0 | `size` | `u32` | Fixed byte size; must equal DW_INTERRUPT_INFO_V1_SIZE. |
+| 4 | `version` | `u32` | Structure version; must equal DW_INTERRUPT_INFO_V1_VERSION. |
+| 8 | `source` | `u32` | Exact platform interrupt-source identity. |
+| 12 | `state` | `DwInterruptState` | Public bounded lifecycle state. |
+| 16 | `object_generation` | `u64` | Nonzero Interrupt object generation. |
+| 24 | `binding_generation` | `u64` | Nonzero source-binding generation. |
+| 32 | `parent_resource_id` | `u64` | Immutable parent DeviceResource identity. |
+| 40 | `parent_lease_generation` | `u64` | Exact parent DeviceResource lease generation. |
+| 48 | `flags` | `DwInterruptInfoFlags` | Bounded pending-state facts. |
+| 52 | `reserved0` | `u32` | Reserved; must be zero. |
+| 56 | `reserved` | `u64` | Reserved; must be zero. |
+
 ### `DwAddressRegionMapArgsV1`
 
 Versioned arguments selecting one page-aligned MemoryObject mapping. Size 72, alignment 8.
@@ -547,6 +637,8 @@ Unknown topics return `DW_STATUS_NOT_SUPPORTED`.
 | `DW_OBJECT_INFO_BASIC_V1` | `ANY` | `DwObjectInfoV1` | `DW_STATUS_WRONG_OBJECT_TYPE` | Available for every live handle carrying INSPECT. |
 | `DW_OBJECT_INFO_TASK_STATE_V1` | `PROCESS,THREAD` | `DwTaskTerminationInfoV1` | `DW_STATUS_WRONG_OBJECT_TYPE` | Reports structured process or thread lifecycle and termination state. |
 | `DW_OBJECT_INFO_MEMORY_OBJECT_V1` | `MEMORY_OBJECT` | `DwMemoryObjectInfoV1` | `DW_STATUS_WRONG_OBJECT_TYPE` | Reports exact logical byte_size; mappable capacity is checked align_up(byte_size, DW_BASE_PAGE_SIZE). |
+| `DW_OBJECT_INFO_DEVICE_RESOURCE_V1` | `DEVICE_RESOURCE` | `DwDeviceResourceInfoV1` | `DW_STATUS_WRONG_OBJECT_TYPE` | Reports immutable resource identity, lease generation, range, and source metadata. |
+| `DW_OBJECT_INFO_INTERRUPT_V1` | `INTERRUPT` | `DwInterruptInfoV1` | `DW_STATUS_WRONG_OBJECT_TYPE` | Reports bounded Interrupt state and exact generation correlations. |
 
 ## Syscalls
 
@@ -848,8 +940,59 @@ Arm or replace a one-shot timer, atomically clearing prior signal state; INFINIT
 
 ### `0x00050012` `timer_cancel` (DW0-F)
 
-Cancel a one-shot timer and clear its signaled state.
+Cancel a one-shot monotonic timer and clear its signaled state.
 
 | Register | Argument | Type | Direction | Object | Rights |
 |---|---|---|---|---|---|
 | `RDI` | `timer` | `DwHandle` | in | TIMER | MODIFY |
+
+### `0x00060001` `device_resource_claim` (DW1-D)
+
+Claim one exact available boot resource through TASK_GROUP RESOURCE authority plus caller membership; the runtime remains unavailable until the DW1-D implementation gate is reached.
+
+| Register | Argument | Type | Direction | Object | Rights |
+|---|---|---|---|---|---|
+| `RDI` | `resource_domain` | `DwHandle` | in | TASK_GROUP | RESOURCE |
+| `RSI` | `resource_id` | `u64` | in | NONE | NONE |
+| `RDX` | `requested_rights` | `DwRights` | in | NONE | NONE |
+| `R10` | `out_resource` | `DwUserAddress` | out | NONE | NONE |
+
+### `0x00060002` `device_pio_read` (DW1-D)
+
+Read one checked scalar value from a live DeviceResource PIO range.
+
+| Register | Argument | Type | Direction | Object | Rights |
+|---|---|---|---|---|---|
+| `RDI` | `resource` | `DwHandle` | in | DEVICE_RESOURCE | READ |
+| `RSI` | `offset` | `u32` | in | NONE | NONE |
+| `RDX` | `width` | `u32` | in | NONE | NONE |
+| `R10` | `out_value` | `DwUserAddress` | out | NONE | NONE |
+
+### `0x00060003` `device_pio_write` (DW1-D)
+
+Write one checked scalar value to a live DeviceResource PIO range without truncation.
+
+| Register | Argument | Type | Direction | Object | Rights |
+|---|---|---|---|---|---|
+| `RDI` | `resource` | `DwHandle` | in | DEVICE_RESOURCE | WRITE |
+| `RSI` | `offset` | `u32` | in | NONE | NONE |
+| `RDX` | `width` | `u32` | in | NONE | NONE |
+| `R10` | `value` | `u32` | in | NONE | NONE |
+
+### `0x00060010` `interrupt_create` (DW1-D)
+
+Create one exclusive Interrupt derived from a live DeviceResource after platform binding reaches Armed.
+
+| Register | Argument | Type | Direction | Object | Rights |
+|---|---|---|---|---|---|
+| `RDI` | `resource` | `DwHandle` | in | DEVICE_RESOURCE | MODIFY |
+| `RSI` | `requested_rights` | `DwRights` | in | NONE | NONE |
+| `RDX` | `out_interrupt` | `DwUserAddress` | out | NONE | NONE |
+
+### `0x00060011` `interrupt_ack` (DW1-D)
+
+Acknowledge one pending Interrupt fact and rearm its exact source binding when no coalesced fact remains.
+
+| Register | Argument | Type | Direction | Object | Rights |
+|---|---|---|---|---|---|
+| `RDI` | `interrupt` | `DwHandle` | in | INTERRUPT | MODIFY |

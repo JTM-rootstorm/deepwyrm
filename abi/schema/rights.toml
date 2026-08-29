@@ -49,3 +49,8 @@ doc = "Query structured object information."
 name = "MODIFY"
 value = 0x0000000000000200
 doc = "Change object configuration or lifecycle state."
+
+[[right]]
+name = "RESOURCE"
+value = 0x0000000000000400
+doc = "Claim or derive kernel-managed resource authority explicitly attached to an object, subject to its additional ownership and membership rules."

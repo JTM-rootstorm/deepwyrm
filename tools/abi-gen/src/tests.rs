@@ -92,6 +92,10 @@ fn canonical_schema_renders_deterministically() {
         "DW_BOOT_MEMORY_RANGE_V1_VERSION",
         "DW_BOOT_MODULE_V1_VERSION",
         "DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1",
+        "DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1",
+        "DW_BOOT_DEVICE_TABLE_V1_VERSION",
+        "DW_BOOT_DEVICE_TABLE_MAX_RESOURCES",
+        "DW_BOOT_DEVICE_RESOURCE_V1_SIZE",
         "DW_BOOT_X86_64_PAGING_HANDOFF_V1_VERSION",
         "DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS",
         "DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT",
@@ -104,11 +108,21 @@ fn canonical_schema_renders_deterministically() {
         "DW_HANDLE_TRANSFER_MOVE",
         "DW_CLOCK_MONOTONIC_ACTIVE",
         "DW_OBJECT_INFO_TASK_STATE_V1",
+        "DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT",
+        "DW_OBJECT_INFO_DEVICE_RESOURCE_V1",
+        "DW_OBJECT_INFO_INTERRUPT_V1",
+        "DW_INTERRUPT_INFO_FLAG_COALESCED",
+        "device_resource_claim",
+        "interrupt_ack",
         "DW_RIGHTS_KNOWN_MASK",
+        "DW_RIGHT_RESOURCE",
         "DW_OBJECT_COMPATIBLE_RIGHTS_MEMORY_OBJECT",
+        "DW_OBJECT_COMPATIBLE_RIGHTS_DEVICE_RESOURCE",
+        "DW_OBJECT_COMPATIBLE_RIGHTS_INTERRUPT",
         "DW_SIGNALS_KNOWN_MASK",
         "DW_OBJECT_COMPATIBLE_SIGNALS_CHANNEL",
         "DW_OBJECT_COMPATIBLE_SIGNALS_TIMER",
+        "DW_OBJECT_COMPATIBLE_SIGNALS_INTERRUPT",
     ] {
         assert!(documentation.contains(name), "ABI.md omitted {name}");
     }
@@ -246,8 +260,8 @@ fn wait_right_and_signal_applicability_must_agree() {
     let root = TempRoot::copy_schema();
     root.rewrite("object_rights.toml", |text| {
         text.replacen(
-            "MODIFY,DUPLICATE,TRANSFER,INSPECT",
-            "WAIT,MODIFY,DUPLICATE,TRANSFER,INSPECT",
+            "MODIFY,DUPLICATE,TRANSFER,INSPECT,RESOURCE",
+            "WAIT,MODIFY,DUPLICATE,TRANSFER,INSPECT,RESOURCE",
             1,
         )
     });
@@ -280,7 +294,7 @@ fn rejects_invalid_object_rights_relations() {
     let root = TempRoot::copy_schema();
     root.rewrite("object_rights.toml", |text| {
         text.replacen(
-            "rights = \"MODIFY,DUPLICATE,TRANSFER,INSPECT\"",
+            "rights = \"MODIFY,DUPLICATE,TRANSFER,INSPECT,RESOURCE\"",
             "rights = \"\"",
             1,
         )
@@ -298,11 +312,11 @@ fn rejects_invalid_object_rights_relations() {
 
     let root = TempRoot::copy_schema();
     root.rewrite("object_rights.toml", |text| {
-        format!("{text}\n[[object_rights]]\nobject = \"INTERRUPT\"\nrights = \"INSPECT\"\n")
+        format!("{text}\n[[object_rights]]\nobject = \"EXCEPTION\"\nrights = \"INSPECT\"\n")
     });
     assert!(
         load_error(&root)
-            .contains("sentinel/reserved object `INTERRUPT` must not declare compatible rights")
+            .contains("sentinel/reserved object `EXCEPTION` must not declare compatible rights")
     );
 
     let root = TempRoot::copy_schema();
@@ -522,7 +536,7 @@ fn generated_c_header_passes_clang_when_available() {
     let probe = root.path().join("abi/generated/header_probe.c");
     fs::write(
             &probe,
-            "#include \"deepwyrm_abi.h\"\n_Static_assert(DW_STATUS_BAD_ADDRESS == -16, \"status parity\");\n_Static_assert(DW_RIGHT_MODIFY == 512, \"rights parity\");\n_Static_assert(DW_RIGHTS_KNOWN_MASK == 1023, \"known-rights parity\");\n_Static_assert(DW_OBJECT_COMPATIBLE_RIGHTS_MEMORY_OBJECT == 463, \"object-rights parity\");\n_Static_assert(DW_OBJECT_TYPE_TIMER == 8, \"object parity\");\n_Static_assert(DW_SYSCALL_TIMER_CANCEL == 0x00050012, \"syscall parity\");\n_Static_assert(DW_DEADLINE_INFINITE == UINT64_MAX, \"deadline parity\");\n_Static_assert(DW_BOOT_BASE_PAGE_SIZE == UINT32_C(4096), \"boot page parity\");\n_Static_assert(DW_BOOT_INFO_V1_VERSION == UINT32_C(1), \"boot version parity\");\n_Static_assert(DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1 == 3, \"paging module kind parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_V1_SIZE == UINT32_C(112), \"paging header size parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS == UINT64_C(0xffffff0000000000), \"paging temporary address parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_PML4_INDEX == UINT16_C(510), \"paging PML4 parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_MIN_TABLE_FRAME_COUNT == UINT32_C(4), \"paging minimum frames parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT == UINT32_C(256), \"paging maximum frames parity\");\nint main(void) {\n    DwDeadline deadline = DW_DEADLINE_INFINITE;\n    uint32_t payload = DW_CHANNEL_MAX_PAYLOAD;\n    DwStatus status = DW_STATUS_SUCCESS;\n    return (deadline == 0 || payload == 0 || status != 0 || dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT) != DW_OBJECT_COMPATIBLE_RIGHTS_MEMORY_OBJECT || !dw_rights_are_known(DW_RIGHTS_KNOWN_MASK) || !dw_rights_are_compatible(DW_OBJECT_TYPE_MEMORY_OBJECT, DW_RIGHT_MAP) || dw_rights_are_compatible(DW_OBJECT_TYPE_TASK_GROUP, DW_RIGHT_READ));\n}\n",
+            "#include \"deepwyrm_abi.h\"\n_Static_assert(DW_STATUS_BAD_ADDRESS == -16, \"status parity\");\n_Static_assert(DW_RIGHT_RESOURCE == 1024, \"resource-right parity\");\n_Static_assert(DW_RIGHTS_KNOWN_MASK == 2047, \"known-rights parity\");\n_Static_assert(DW_OBJECT_COMPATIBLE_RIGHTS_MEMORY_OBJECT == 463, \"object-rights parity\");\n_Static_assert(DW_OBJECT_COMPATIBLE_RIGHTS_DEVICE_RESOURCE == 963, \"device-resource rights parity\");\n_Static_assert(DW_OBJECT_COMPATIBLE_RIGHTS_INTERRUPT == 912, \"interrupt rights parity\");\n_Static_assert(DW_OBJECT_TYPE_INTERRUPT == 16, \"interrupt object parity\");\n_Static_assert(DW_OBJECT_TYPE_DEVICE_RESOURCE == 17, \"device-resource object parity\");\n_Static_assert(DW_SYSCALL_TIMER_CANCEL == 0x00050012, \"timer syscall parity\");\n_Static_assert(DW_SYSCALL_DEVICE_RESOURCE_CLAIM == 0x00060001, \"device syscall parity\");\n_Static_assert(DW_SYSCALL_INTERRUPT_ACK == 0x00060011, \"interrupt syscall parity\");\n_Static_assert(DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT == UINT64_C(1), \"feature parity\");\n_Static_assert(DW_DEVICE_RESOURCE_INFO_V1_SIZE == UINT32_C(48), \"device info size parity\");\n_Static_assert(DW_INTERRUPT_INFO_V1_SIZE == UINT32_C(64), \"interrupt info size parity\");\n_Static_assert(DW_DEADLINE_INFINITE == UINT64_MAX, \"deadline parity\");\n_Static_assert(DW_BOOT_BASE_PAGE_SIZE == UINT32_C(4096), \"boot page parity\");\n_Static_assert(DW_BOOT_INFO_V1_VERSION == UINT32_C(1), \"boot version parity\");\n_Static_assert(DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1 == 3, \"paging module kind parity\");\n_Static_assert(DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1 == 4, \"device module kind parity\");\n_Static_assert(DW_BOOT_DEVICE_TABLE_V1_SIZE == UINT32_C(32), \"device table size parity\");\n_Static_assert(DW_BOOT_DEVICE_RESOURCE_V1_SIZE == UINT32_C(48), \"device record size parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_V1_SIZE == UINT32_C(112), \"paging header size parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS == UINT64_C(0xffffff0000000000), \"paging temporary address parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_PML4_INDEX == UINT16_C(510), \"paging PML4 parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_MIN_TABLE_FRAME_COUNT == UINT32_C(4), \"paging minimum frames parity\");\n_Static_assert(DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT == UINT32_C(256), \"paging maximum frames parity\");\nint main(void) {\n    DwDeadline deadline = DW_DEADLINE_INFINITE;\n    uint32_t payload = DW_CHANNEL_MAX_PAYLOAD;\n    DwStatus status = DW_STATUS_SUCCESS;\n    return (deadline == 0 || payload == 0 || status != 0 || dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT) != DW_OBJECT_COMPATIBLE_RIGHTS_MEMORY_OBJECT || !dw_rights_are_known(DW_RIGHTS_KNOWN_MASK) || !dw_rights_are_compatible(DW_OBJECT_TYPE_MEMORY_OBJECT, DW_RIGHT_MAP) || dw_rights_are_compatible(DW_OBJECT_TYPE_TASK_GROUP, DW_RIGHT_READ));\n}\n",
         )
         .unwrap();
     let output = Command::new("clang")

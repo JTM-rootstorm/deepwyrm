@@ -190,6 +190,36 @@ pub const DW_SYSCALL_DISPATCH_METADATA: &[DwSyscallDispatchMetadata] = &[
         implementation_phase: "DW0-F",
         argument_count: 1,
     },
+    DwSyscallDispatchMetadata {
+        number: 0x00060001,
+        name: "device_resource_claim",
+        implementation_phase: "DW1-D",
+        argument_count: 4,
+    },
+    DwSyscallDispatchMetadata {
+        number: 0x00060002,
+        name: "device_pio_read",
+        implementation_phase: "DW1-D",
+        argument_count: 4,
+    },
+    DwSyscallDispatchMetadata {
+        number: 0x00060003,
+        name: "device_pio_write",
+        implementation_phase: "DW1-D",
+        argument_count: 4,
+    },
+    DwSyscallDispatchMetadata {
+        number: 0x00060010,
+        name: "interrupt_create",
+        implementation_phase: "DW1-D",
+        argument_count: 3,
+    },
+    DwSyscallDispatchMetadata {
+        number: 0x00060011,
+        name: "interrupt_ack",
+        implementation_phase: "DW1-D",
+        argument_count: 1,
+    },
 ];
 
 pub const DW_UNKNOWN_SYSCALL_STATUS_NAME: &str = "NOT_SUPPORTED";

@@ -1,8 +1,9 @@
 use deepwyrm_abi::{
-    DW_SYSCALL_HANDLE_CLOSE, DW_SYSCALL_PROCESS_CREATE, DW_SYSCALL_PROCESS_EXIT,
-    DW_SYSCALL_PROCESS_TERMINATE, DW_SYSCALL_TASK_GROUP_CREATE, DW_SYSCALL_TASK_GROUP_TERMINATE,
-    DW_SYSCALL_THREAD_CREATE, DW_SYSCALL_THREAD_EXIT, DW_SYSCALL_THREAD_START,
-    DW_SYSCALL_THREAD_TERMINATE, DwKnownSyscall, DwSyscallId, DwSyscallImplementationPhase,
+    DW_SYSCALL_DEVICE_RESOURCE_CLAIM, DW_SYSCALL_HANDLE_CLOSE, DW_SYSCALL_INTERRUPT_ACK,
+    DW_SYSCALL_PROCESS_CREATE, DW_SYSCALL_PROCESS_EXIT, DW_SYSCALL_PROCESS_TERMINATE,
+    DW_SYSCALL_TASK_GROUP_CREATE, DW_SYSCALL_TASK_GROUP_TERMINATE, DW_SYSCALL_THREAD_CREATE,
+    DW_SYSCALL_THREAD_EXIT, DW_SYSCALL_THREAD_START, DW_SYSCALL_THREAD_TERMINATE, DwKnownSyscall,
+    DwSyscallId, DwSyscallImplementationPhase,
 };
 
 #[allow(dead_code)]
@@ -44,6 +45,15 @@ fn string_free_kernel_dispatch_decodes_ids_and_phases() {
         DwKnownSyscall::ProcessCreate.id(),
         DW_SYSCALL_PROCESS_CREATE
     );
+    assert_eq!(
+        DwKnownSyscall::DeviceResourceClaim.implementation_phase(),
+        DwSyscallImplementationPhase::Dw1D
+    );
+    assert!(
+        !DwKnownSyscall::DeviceResourceClaim
+            .implementation_phase()
+            .is_active_through(DwSyscallImplementationPhase::Dw0H)
+    );
 }
 
 #[test]
@@ -69,6 +79,26 @@ fn wrapper_metadata_locks_e_argument_registers_and_authority() {
     assert_eq!(start_size.index, 1);
     assert_eq!(start_size.register, "RSI");
     assert_eq!(start_size.abi_type, "u64");
+
+    let claim_domain = wrapper_metadata::DW_SYSCALL_ARGUMENT_METADATA
+        .iter()
+        .find(|argument| {
+            argument.syscall_number == DW_SYSCALL_DEVICE_RESOURCE_CLAIM.0
+                && argument.name == "resource_domain"
+        })
+        .unwrap();
+    assert_eq!(claim_domain.index, 0);
+    assert_eq!(claim_domain.required_object_type, "TASK_GROUP");
+    assert_eq!(claim_domain.required_rights, "RESOURCE");
+
+    let interrupt = wrapper_metadata::DW_SYSCALL_ARGUMENT_METADATA
+        .iter()
+        .find(|argument| {
+            argument.syscall_number == DW_SYSCALL_INTERRUPT_ACK.0 && argument.name == "interrupt"
+        })
+        .unwrap();
+    assert_eq!(interrupt.required_object_type, "INTERRUPT");
+    assert_eq!(interrupt.required_rights, "MODIFY");
 }
 
 #[test]

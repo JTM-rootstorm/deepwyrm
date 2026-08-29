@@ -82,6 +82,21 @@ base = "u32"
 doc = "Bitset controlling AddressRegion mapping placement."
 
 [[newtype]]
+name = "DwDeviceResourceKind"
+base = "u32"
+doc = "Open numeric namespace identifying a kernel-managed device-resource kind."
+
+[[newtype]]
+name = "DwInterruptState"
+base = "u32"
+doc = "Open numeric namespace describing public Interrupt lifecycle state."
+
+[[newtype]]
+name = "DwInterruptInfoFlags"
+base = "u32"
+doc = "Bitset reporting bounded Interrupt state facts."
+
+[[newtype]]
 name = "DwClockId"
 base = "u32"
 doc = "Explicit native clock-domain identifier."
