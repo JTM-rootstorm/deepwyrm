@@ -608,6 +608,105 @@ fn dw1c_fixture_releases_completed_lane_and_holds_token8_terminal_expiry() {
 }
 
 #[test]
+fn dw1c_fixture_completes_a_lane_after_its_first_actor_generation_advances() {
+    let seed = installed_dw1c_fixture(cpu(0));
+    let mut registry = ObjectRegistry::<16>::new();
+    let peer = loop {
+        let candidate = thread_key(&mut registry);
+        if !seed.actors.contains(&candidate) && candidate != seed.reporter_claim.thread() {
+            break candidate;
+        }
+    };
+
+    assert_eq!(
+        seed.scheduler
+            .wake_on(cpu(0), seed.arm_wakes[6])
+            .unwrap()
+            .target(),
+        cpu(3)
+    );
+    assert_eq!(
+        seed.scheduler.schedule_next_on(cpu(3)).unwrap().current,
+        Some(seed.actors[6])
+    );
+    let armed_generation = seed.identities[6].execution_generation;
+    assert_eq!(
+        seed.scheduler
+            .running_claim_on(cpu(3))
+            .unwrap()
+            .generation(),
+        armed_generation
+    );
+
+    seed.scheduler
+        .commit_on(cpu(3), seed.scheduler.reserve(peer).unwrap())
+        .unwrap();
+    let ticket = seed.scheduler.prepare_quantum_on(cpu(3), 20).unwrap();
+    assert_eq!(seed.scheduler.publish_quantum_expiry(ticket), Ok(true));
+    let token7 = match seed.scheduler.preempt_current_on(cpu(3)).unwrap() {
+        SchedulerPreemptionDecision::Switch { outgoing, .. } => outgoing,
+        decision => panic!("peer did not replace token7: {decision:?}"),
+    };
+    seed.scheduler.complete_switch_on(token7).unwrap();
+    assert!(
+        !seed
+            .scheduler
+            .state
+            .lock()
+            .dw1c_fixture
+            .expect("DW1C fixture remains installed")
+            .lane_complete(cpu(3)),
+        "a fixture-to-nonfixture switch must not complete the lane"
+    );
+
+    let ticket = seed.scheduler.prepare_quantum_on(cpu(3), 30).unwrap();
+    assert_eq!(seed.scheduler.publish_quantum_expiry(ticket), Ok(true));
+    let peer_claim = match seed.scheduler.preempt_current_on(cpu(3)).unwrap() {
+        SchedulerPreemptionDecision::Switch { outgoing, .. } => outgoing,
+        decision => panic!("token7 did not replace the peer: {decision:?}"),
+    };
+    seed.scheduler.complete_switch_on(peer_claim).unwrap();
+    assert!(
+        !seed
+            .scheduler
+            .state
+            .lock()
+            .dw1c_fixture
+            .expect("DW1C fixture remains installed")
+            .lane_complete(cpu(3)),
+        "a nonfixture-to-fixture switch must not complete the lane"
+    );
+    let advanced_token7 = seed.scheduler.running_claim_on(cpu(3)).unwrap();
+    assert_eq!(advanced_token7.thread(), seed.actors[6]);
+    assert_ne!(advanced_token7.generation(), armed_generation);
+
+    assert_eq!(
+        seed.scheduler
+            .wake_on(cpu(0), seed.arm_wakes[7])
+            .unwrap()
+            .target(),
+        cpu(3)
+    );
+    let ticket = seed.scheduler.prepare_quantum_on(cpu(3), 40).unwrap();
+    assert_eq!(seed.scheduler.publish_quantum_expiry(ticket), Ok(true));
+    let token7 = match seed.scheduler.preempt_current_on(cpu(3)).unwrap() {
+        SchedulerPreemptionDecision::Switch { outgoing, .. } => outgoing,
+        decision => panic!("token8 did not replace advanced token7: {decision:?}"),
+    };
+    seed.scheduler.complete_switch_on(token7).unwrap();
+
+    let state = seed.scheduler.state.lock();
+    let fixture = state.dw1c_fixture.expect("DW1C fixture remains installed");
+    assert!(fixture.lane_complete(cpu(3)));
+    assert_eq!(
+        fixture.token8_gate_claim, state.running[3],
+        "the completed live switch must arm token8's exact current claim"
+    );
+    drop(state);
+    assert_eq!(seed.scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
 fn dw1c_final_snapshot_rejects_duplicate_and_terminal_scheduler_ownership() {
     let mut registry = ObjectRegistry::<16>::new();
 

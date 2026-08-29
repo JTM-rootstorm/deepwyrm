@@ -498,12 +498,6 @@ impl Dw1cSchedulerFixture {
             .and_then(|(_, actor)| (!self.lane_complete(actor.lane_cpu)).then_some(actor.lane_cpu))
     }
 
-    fn exact_actor(&self, thread: ThreadKey, generation: u64) -> Option<Dw1cSchedulerActor> {
-        self.actor(thread)
-            .map(|(_, actor)| actor)
-            .filter(|actor| actor.arm_generation == generation)
-    }
-
     fn lane_pair_completed(
         &self,
         cpu: SchedulerCpuId,
@@ -512,13 +506,24 @@ impl Dw1cSchedulerFixture {
         incoming: ThreadKey,
         incoming_generation: u64,
     ) -> bool {
-        outgoing != incoming
-            && self
-                .exact_actor(outgoing, outgoing_generation)
-                .is_some_and(|actor| actor.lane_cpu == cpu)
-            && self
-                .exact_actor(incoming, incoming_generation)
-                .is_some_and(|actor| actor.lane_cpu == cpu)
+        // `complete_switch_on` has already authenticated `outgoing` against
+        // the exact suspended execution generation and obtains `incoming`
+        // from the exact current Running claim. A later generation is valid
+        // because either actor may be preempted again before its lane peer
+        // becomes eligible. Retaining the ARM generation as a lower bound,
+        // and requiring the fixed adjacent actor pair, keeps completion tied
+        // to this fixture's post-ARM lane lineage rather than stale snapshots.
+        let Some((outgoing_index, outgoing_actor)) = self.actor(outgoing) else {
+            return false;
+        };
+        let Some((incoming_index, incoming_actor)) = self.actor(incoming) else {
+            return false;
+        };
+        outgoing_index ^ 1 == incoming_index
+            && outgoing_actor.lane_cpu == cpu
+            && incoming_actor.lane_cpu == cpu
+            && outgoing_generation >= outgoing_actor.arm_generation
+            && incoming_generation >= incoming_actor.arm_generation
     }
 
     fn token8(&self) -> Dw1cSchedulerActor {
