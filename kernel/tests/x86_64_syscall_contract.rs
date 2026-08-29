@@ -1479,7 +1479,9 @@ fn h2_syscall_entry_and_native_runtime_carriers_are_fixed_per_cpu() {
     assert!(primordial.contains("struct RuntimeAuthorityLock"));
     assert!(primordial.contains("struct PerCpuLiveCarrier"));
     assert!(primordial.contains("initialize_per_cpu_live_carriers()"));
-    assert!(primordial.contains("bind_runtime_carrier_facades(facades.as_mut())"));
+    assert!(
+        primordial.contains("let live_cpu_count = bind_runtime_carrier_facades(facades.as_mut())")
+    );
     assert!(
         primordial.contains("release_runtime_carrier_facades(shared, runtime_ref, admissions)")
     );
@@ -1519,7 +1521,9 @@ fn i1_stationary_foundation_keeps_authority_and_carrier_boundaries_explicit() {
     assert!(primordial.contains("initialize_per_cpu_live_carriers"));
     assert!(primordial.contains("0..crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT"));
     assert!(primordial.contains("local: &'static PerCpuLiveCarrier"));
-    assert!(primordial.contains("bind_runtime_carrier_facades(facades.as_mut())"));
+    assert!(
+        primordial.contains("let live_cpu_count = bind_runtime_carrier_facades(facades.as_mut())")
+    );
     assert!(
         primordial.contains("release_runtime_carrier_facades(shared, runtime_ref, admissions)")
     );
@@ -1554,7 +1558,9 @@ fn dw1c1_ap_carriers_cross_generation_bound_scheduler_admission_before_dispatch(
     let scheduler = source("src/task/scheduler.rs");
 
     assert!(live.contains("bind_running_native_runtime_carrier_for_slot"));
-    assert!(primordial.contains("prepare_runtime_carrier_admission(facades_mut)"));
+    assert!(primordial.contains("prepare_runtime_carrier_admission(facades_mut, live_cpu_count)"));
+    assert!(primordial.contains("#[cfg(deepwyrm_dw1c_evidence)]\n    assert_eq!("));
+    assert!(primordial.contains("for facade in facades[..live_cpu_count].iter_mut().skip(1)"));
     assert!(primordial.contains("normalize_bootstrap_carrier(&mut facades_mut[0])"));
     assert!(primordial.contains("publish_ap_carrier_ready"));
     assert!(primordial.contains("carrier_ticket_is_schedulable(ticket)"));

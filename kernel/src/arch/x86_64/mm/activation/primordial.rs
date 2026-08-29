@@ -1426,15 +1426,21 @@ fn bind_runtime_carrier_facades<
         &'borrow mut [RuntimeCarrierFacade<'runtime, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>;
                          crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
     >,
-) {
+) -> usize {
     let registry = crate::arch::x86_64::smp::live_cpu_registry();
+    let live_cpu_count = registry.len();
+    assert!(
+        (1..=crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT).contains(&live_cpu_count),
+        "native runtime topology must fit the fixed carrier capacity"
+    );
+    #[cfg(deepwyrm_dw1c_evidence)]
     assert_eq!(
-        registry.len(),
+        live_cpu_count,
         crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT,
         "DW1-C1 requires the exact four-CPU runtime topology"
     );
     let facades = unsafe { core::pin::Pin::get_unchecked_mut(facades) };
-    for cpu_index in 0..registry.len() {
+    for cpu_index in 0..live_cpu_count {
         let snapshot = registry
             .snapshot(cpu_index)
             .unwrap_or_else(|error| panic!("could not inspect CPU {cpu_index}: {error:?}"));
@@ -1471,6 +1477,7 @@ fn bind_runtime_carrier_facades<
             });
         }
     }
+    live_cpu_count
 }
 
 fn carrier_resource_tuple<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
@@ -1568,9 +1575,10 @@ fn fail_live_carrier_admission(
 fn prepare_runtime_carrier_admission<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     facades: &mut [RuntimeCarrierFacade<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>;
              crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+    live_cpu_count: usize,
 ) {
     let runtime = facades[0].runtime.lock();
-    for facade in facades.iter_mut().skip(1) {
+    for facade in facades[..live_cpu_count].iter_mut().skip(1) {
         let resources = carrier_resource_tuple(
             &runtime,
             facade.cpu,
@@ -7361,10 +7369,10 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         pending_remote_termination: None,
     });
     let mut facades = core::pin::pin!(facades);
-    bind_runtime_carrier_facades(facades.as_mut());
+    let live_cpu_count = bind_runtime_carrier_facades(facades.as_mut());
     user_access::initialize_live_tlb_shootdown();
     let facades_mut = unsafe { core::pin::Pin::get_unchecked_mut(facades.as_mut()) };
-    prepare_runtime_carrier_admission(facades_mut);
+    prepare_runtime_carrier_admission(facades_mut, live_cpu_count);
     normalize_bootstrap_carrier(&mut facades_mut[0]);
     let admissions = core::array::from_fn(|cpu_index| facades_mut[cpu_index].admission);
     let bsp_carrier = unsafe {
