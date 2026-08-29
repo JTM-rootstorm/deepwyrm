@@ -785,6 +785,25 @@ matching QUANTUM chain. While held, that claim is neither rearmed nor
 involuntarily preempted; token 7 remains a real runnable peer. No synthetic or
 cancelled ticket is eligible.
 
+The acknowledgement also closes one selector-private liveness edge. If the
+controller/reporter issued its retries from token 8's CPU, token 8's dispatch
+leaves that reporter as a released Runnable continuation queued behind the
+claim which the held ticket intentionally pins. The acknowledgement revalidates
+the exact ARM-authenticated reporter, its released queue entry, the token-8
+source CPU, migration eligibility, and the original reporter CPU under the
+scheduler lock. It then moves only that queued reporter back to its original
+ARM CPU through one migration-generation and per-CPU runnable/migration
+accounting transaction. This is an explicit selector-fixture transition, not
+affinity ABI: a reporter already Running or queued away from token 8's CPU is
+unchanged, token 8 remains Running with the same held ticket, and no synthetic
+reschedule request is created. The next ordinary quantum on the reporter CPU
+can dispatch the controller so its userspace retry observes the ready gate.
+The scheduler returns the resulting Runnable publication through the execution
+and live-carrier layers; only after the carrier releases coarse runtime
+authority may the established post-lock notification helper drain idle/IPI
+work. The timer callback therefore cannot introduce a runtime-to-rendezvous
+lock-order edge.
+
 The live `ProcessTerminate` path checks this gate before TaskAuthority mutates
 token 8. If the gate is awaiting the timer, it returns `WOULD_BLOCK` without
 mutating task state. Native syscalls run with interrupts disabled, so an
@@ -800,6 +819,13 @@ post-terminal running/requeue paths fail the selector.
 Generic yield, block, preemption, and quantum-cancellation paths cannot consume
 the held ticket. The scheduler never acquires the collector, so lock order
 remains runtime to scheduler and observer callbacks run after scheduler unlock.
+
+The pinned Zircon scheduler comparison continues to inform the explicit
+queue-ownership, target-CPU, and post-lock runnable-publication shape of this
+transition; the xv6 scheduler/trap comparison remains useful only as the small
+negative model in which timer yield naturally returns to a global Runnable
+scan. No source was copied or adapted. Deepwyrm retains its stronger exact
+generation, per-CPU queue, continuation-release, and accounted-migration rules.
 
 Selector-private readiness, ARM, and completion retries use absolute
 active-monotonic deadlines, not instruction/iteration counts. Every

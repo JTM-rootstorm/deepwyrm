@@ -16,6 +16,23 @@ pub(crate) const E3_INITIAL_USER_RFLAGS: u64 = 0x202;
 use crate::memory::kernel_stack::E3_THREAD_STACK_COUNT;
 use crate::memory::kernel_stack::{KernelStackBounds, KernelStackLayoutError};
 
+#[must_use = "quantum-expiry publication must be delivered after runtime authority is released"]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct QuantumExpiryOutcome {
+    published: bool,
+    runnable_publication: Option<super::RunnablePublication>,
+}
+
+impl QuantumExpiryOutcome {
+    pub(crate) const fn published(self) -> bool {
+        self.published
+    }
+
+    pub(crate) const fn runnable_publication(self) -> Option<super::RunnablePublication> {
+        self.runnable_publication
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExecutionResourceError {
     Capacity,
@@ -950,27 +967,35 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     pub(crate) fn publish_quantum_expiry(
         &self,
         ticket: super::SchedulerQuantumTicket,
-    ) -> Result<bool, SchedulerError> {
+    ) -> Result<QuantumExpiryOutcome, SchedulerError> {
         let published = self.scheduler.publish_quantum_expiry(ticket)?;
         #[cfg(deepwyrm_dw1c_evidence)]
-        if published && crate::test_support::DW1C_EVIDENCE.tracks_thread(ticket.thread()) {
-            crate::test_support::DW1C_EVIDENCE
-                .observe_quantum_claim(
-                    ticket.cpu().index() as u8,
-                    ticket.thread(),
-                    ticket.execution_generation(),
-                    ticket.source_arm_generation(),
-                )
-                .unwrap_or_else(|error| {
-                    panic!("selector-28 QUANTUM observation failed: {error:?}")
-                });
-            self.scheduler
-                .acknowledge_dw1c_quantum_observation(ticket)
-                .unwrap_or_else(|error| {
-                    panic!("selector-28 QUANTUM acknowledgement failed: {error:?}")
-                });
-        }
-        Ok(published)
+        let runnable_publication =
+            if published && crate::test_support::DW1C_EVIDENCE.tracks_thread(ticket.thread()) {
+                crate::test_support::DW1C_EVIDENCE
+                    .observe_quantum_claim(
+                        ticket.cpu().index() as u8,
+                        ticket.thread(),
+                        ticket.execution_generation(),
+                        ticket.source_arm_generation(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("selector-28 QUANTUM observation failed: {error:?}")
+                    });
+                self.scheduler
+                    .acknowledge_dw1c_quantum_observation(ticket)
+                    .unwrap_or_else(|error| {
+                        panic!("selector-28 QUANTUM acknowledgement failed: {error:?}")
+                    })
+            } else {
+                None
+            };
+        #[cfg(not(deepwyrm_dw1c_evidence))]
+        let runnable_publication: Option<super::RunnablePublication> = None;
+        Ok(QuantumExpiryOutcome {
+            published,
+            runnable_publication,
+        })
     }
 
     #[cfg(deepwyrm_dw1c_evidence)]

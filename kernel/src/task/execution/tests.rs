@@ -139,12 +139,12 @@ fn local_quantum_expiry_cannot_revive_a_normally_exited_thread() {
     // The timer event may win the race after task termination but before the
     // terminal scheduler retirement. Retirement must consume that exact
     // request and prevent a later stale event from changing ownership.
-    assert_eq!(domain.publish_quantum_expiry(ticket), Ok(true));
+    assert!(domain.publish_quantum_expiry(ticket).unwrap().published());
     let (retired, deferred) = domain.retire_exit_pins_defer_current(pins, current);
     assert_eq!(domain.preemption_snapshot_on(cpu).quantum, None);
     assert_eq!(domain.preemption_snapshot_on(cpu).request, None);
     let deferred_pins = domain.reclaim_deferred_current(deferred);
-    assert_eq!(domain.publish_quantum_expiry(ticket), Ok(false));
+    assert!(!domain.publish_quantum_expiry(ticket).unwrap().published());
     assert_eq!(domain.scheduler_state(current), None);
     assert_eq!(
         domain.scheduler_state(replacement),

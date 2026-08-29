@@ -595,9 +595,10 @@ fn dw1c_fixture_releases_completed_lane_and_holds_token8_terminal_expiry() {
         seed.scheduler.stop_running_claim_on(token8_claim),
         Err(SchedulerError::QuantumUnavailable)
     );
-    seed.scheduler
-        .acknowledge_dw1c_quantum_observation(ticket)
-        .unwrap();
+    assert_eq!(
+        seed.scheduler.acknowledge_dw1c_quantum_observation(ticket),
+        Ok(None)
+    );
     assert_eq!(
         seed.scheduler.dw1c_terminal_gate(seed.actors[7]),
         Dw1cTerminalGate::Ready
@@ -607,6 +608,163 @@ fn dw1c_fixture_releases_completed_lane_and_holds_token8_terminal_expiry() {
         Err(SchedulerError::StaleQuantum)
     );
     seed.scheduler.stop_running_claim_on(token8_claim).unwrap();
+    assert_eq!(
+        seed.scheduler.dw1c_terminal_gate(seed.actors[7]),
+        Dw1cTerminalGate::NotFixture
+    );
+    assert_eq!(seed.scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn dw1c_acknowledgement_rehomes_a_reporter_stranded_behind_token8() {
+    let seed = installed_dw1c_fixture(cpu(0));
+
+    // Move the reporter through an ordinary completed switch and idle steal so
+    // it issues token 8's controller retries from CPU 3, matching the live
+    // candidate-28 topology.
+    assert_eq!(
+        seed.scheduler
+            .wake_on(cpu(0), seed.arm_wakes[0])
+            .unwrap()
+            .target(),
+        cpu(0)
+    );
+    let reporter_ticket = seed.scheduler.prepare_quantum_on(cpu(0), 10).unwrap();
+    assert_eq!(
+        seed.scheduler.publish_quantum_expiry(reporter_ticket),
+        Ok(true)
+    );
+    let reporter_cpu0 = match seed.scheduler.preempt_current_on(cpu(0)).unwrap() {
+        SchedulerPreemptionDecision::Switch { outgoing, .. } => outgoing,
+        decision => panic!("token1 did not replace the reporter: {decision:?}"),
+    };
+    seed.scheduler.complete_switch_on(reporter_cpu0).unwrap();
+    let reporter_steal = seed
+        .scheduler
+        .schedule_next_on_with_migration(cpu(3))
+        .unwrap();
+    assert_eq!(
+        reporter_steal.decision().current,
+        Some(seed.reporter_claim.thread())
+    );
+    assert_eq!(
+        reporter_steal
+            .migration()
+            .expect("released reporter can be stolen onto token 8's lane")
+            .thread,
+        seed.reporter_claim.thread()
+    );
+
+    for index in [6, 7] {
+        assert_eq!(
+            seed.scheduler
+                .wake_on(cpu(0), seed.arm_wakes[index])
+                .unwrap()
+                .target(),
+            cpu(3)
+        );
+    }
+    let reporter_ticket = seed.scheduler.prepare_quantum_on(cpu(3), 20).unwrap();
+    assert_eq!(
+        seed.scheduler.publish_quantum_expiry(reporter_ticket),
+        Ok(true)
+    );
+    let reporter_cpu3 = match seed.scheduler.preempt_current_on(cpu(3)).unwrap() {
+        SchedulerPreemptionDecision::Switch { outgoing, .. } => outgoing,
+        decision => panic!("token7 did not replace the reporter: {decision:?}"),
+    };
+    assert_eq!(seed.scheduler.current_on(cpu(3)), Some(seed.actors[6]));
+    seed.scheduler.complete_switch_on(reporter_cpu3).unwrap();
+
+    let token7_ticket = seed.scheduler.prepare_quantum_on(cpu(3), 30).unwrap();
+    assert_eq!(
+        seed.scheduler.publish_quantum_expiry(token7_ticket),
+        Ok(true)
+    );
+    let token7 = match seed.scheduler.preempt_current_on(cpu(3)).unwrap() {
+        SchedulerPreemptionDecision::Switch { outgoing, .. } => outgoing,
+        decision => panic!("token8 did not replace token7: {decision:?}"),
+    };
+    assert_eq!(seed.scheduler.current_on(cpu(3)), Some(seed.actors[7]));
+    seed.scheduler.complete_switch_on(token7).unwrap();
+    let token8_claim = seed.scheduler.running_claim_on(cpu(3)).unwrap();
+
+    let ticket = seed
+        .scheduler
+        .prepare_quantum_if_needed_on(cpu(3), 40)
+        .unwrap()
+        .expect("token8 receives one exact terminal quantum");
+    assert_eq!(seed.scheduler.publish_quantum_expiry(ticket), Ok(true));
+    let wrong_ticket = SchedulerQuantumTicket {
+        deadline_ns: ticket.deadline_ns + 1,
+        ..ticket
+    };
+    let before_cpu0 = seed.scheduler.preemption_snapshot_on(cpu(0)).counters;
+    let before_cpu3 = seed.scheduler.preemption_snapshot_on(cpu(3)).counters;
+    assert_eq!(
+        seed.scheduler
+            .acknowledge_dw1c_quantum_observation(wrong_ticket),
+        Ok(None)
+    );
+    assert_eq!(
+        seed.scheduler.dw1c_terminal_gate(seed.actors[7]),
+        Dw1cTerminalGate::AwaitingExpiry
+    );
+    assert_eq!(
+        seed.scheduler.preemption_snapshot_on(cpu(0)).counters,
+        before_cpu0
+    );
+    assert_eq!(
+        seed.scheduler.preemption_snapshot_on(cpu(3)).counters,
+        before_cpu3
+    );
+
+    let publication = seed
+        .scheduler
+        .acknowledge_dw1c_quantum_observation(ticket)
+        .unwrap()
+        .expect("exact ACK rehomes the stranded reporter");
+    assert_eq!(publication.target(), cpu(0));
+    assert_eq!(publication.wake_affinity(), None);
+    let after_cpu0 = seed.scheduler.preemption_snapshot_on(cpu(0)).counters;
+    let after_cpu3 = seed.scheduler.preemption_snapshot_on(cpu(3)).counters;
+    assert_eq!(
+        after_cpu0.current_runnable,
+        before_cpu0.current_runnable + 1
+    );
+    assert_eq!(
+        after_cpu3.current_runnable + 1,
+        before_cpu3.current_runnable
+    );
+    assert_eq!(after_cpu0.migrations_in, before_cpu0.migrations_in + 1);
+    assert_eq!(after_cpu3.migrations_out, before_cpu3.migrations_out + 1);
+    assert_eq!(after_cpu0.steals_in, before_cpu0.steals_in);
+    assert_eq!(after_cpu3.steals_out, before_cpu3.steals_out);
+    assert_eq!(seed.scheduler.current_on(cpu(3)), Some(seed.actors[7]));
+    assert_eq!(seed.scheduler.preemption_snapshot_on(cpu(3)).request, None);
+    assert_eq!(
+        seed.scheduler.dw1c_terminal_gate(seed.actors[7]),
+        Dw1cTerminalGate::Ready
+    );
+
+    // CPU0's next ordinary quantum dispatches the rehomed controller. Its
+    // existing retry can then perform the remote token-8 terminal stop.
+    let token1_ticket = seed.scheduler.prepare_quantum_on(cpu(0), 50).unwrap();
+    assert_eq!(
+        seed.scheduler.publish_quantum_expiry(token1_ticket),
+        Ok(true)
+    );
+    let token1 = match seed.scheduler.preempt_current_on(cpu(0)).unwrap() {
+        SchedulerPreemptionDecision::Switch { outgoing, .. } => outgoing,
+        decision => panic!("rehomed reporter did not replace token1: {decision:?}"),
+    };
+    assert_eq!(
+        seed.scheduler.current_on(cpu(0)),
+        Some(seed.reporter_claim.thread())
+    );
+    seed.scheduler.complete_switch_on(token1).unwrap();
+    seed.scheduler.stop_running_claim_on(token8_claim).unwrap();
+    assert_eq!(seed.scheduler.current_on(cpu(3)), None);
     assert_eq!(
         seed.scheduler.dw1c_terminal_gate(seed.actors[7]),
         Dw1cTerminalGate::NotFixture

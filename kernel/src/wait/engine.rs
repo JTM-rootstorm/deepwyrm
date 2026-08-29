@@ -1488,7 +1488,12 @@ mod tests {
             .prepare_quantum_if_needed_on(cpu, 100)
             .unwrap()
             .unwrap();
-        assert!(execution.publish_quantum_expiry(ticket).unwrap());
+        assert!(
+            execution
+                .publish_quantum_expiry(ticket)
+                .unwrap()
+                .published()
+        );
 
         let mut operations = WaitOperationRegistry::<u32, 1>::new();
         let wake = match begin_registered_wait(

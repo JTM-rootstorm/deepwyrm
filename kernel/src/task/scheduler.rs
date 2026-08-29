@@ -471,6 +471,8 @@ struct Dw1cSchedulerActor {
 #[cfg(any(test, deepwyrm_dw1c_evidence))]
 #[derive(Clone, Copy)]
 struct Dw1cSchedulerFixture {
+    reporter_thread: ThreadKey,
+    reporter_cpu: SchedulerCpuId,
     actors: [Dw1cSchedulerActor; 8],
     lane_complete_mask: u64,
     token8_gate_claim: Option<RunningClaim>,
@@ -1779,6 +1781,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             },
         });
         state.dw1c_fixture = Some(Dw1cSchedulerFixture {
+            reporter_thread: reporter.thread,
+            reporter_cpu: reporter.cpu,
             actors: fixture_actors,
             lane_complete_mask: 0,
             token8_gate_claim: None,
@@ -1891,23 +1895,88 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     pub(crate) fn acknowledge_dw1c_quantum_observation(
         &self,
         ticket: SchedulerQuantumTicket,
-    ) -> Result<(), SchedulerError> {
+    ) -> Result<Option<RunnablePublication>, SchedulerError> {
         let mut state = self.state.lock();
-        let Some(fixture) = state.dw1c_fixture.as_mut() else {
-            return Ok(());
+        let (reporter_thread, reporter_cpu) = {
+            let Some(fixture) = state.dw1c_fixture else {
+                return Ok(None);
+            };
+            let Some(held) = fixture.held_token8_expiry else {
+                return Ok(None);
+            };
+            if held != ticket {
+                return Ok(None);
+            }
+            if fixture.token8_terminal_consumed || fixture.token8_expiry_observed {
+                return Err(SchedulerError::StaleQuantum);
+            }
+            (fixture.reporter_thread, fixture.reporter_cpu)
         };
-        let Some(held) = fixture.held_token8_expiry else {
-            return Ok(());
-        };
-        if held != ticket {
-            return Ok(());
+
+        // The userspace reporter may have issued its retry from token 8's CPU.
+        // Once token 8 owns the exact held expiry, that CPU intentionally cannot
+        // preempt it again. If the reporter is the released Runnable peer queued
+        // behind token 8, move that exact entry back to its authenticated ARM
+        // CPU through one ordinary accounted migration transaction. A reporter
+        // already Running or queued elsewhere needs no selector assistance.
+        let reporter_running = state
+            .running
+            .iter()
+            .flatten()
+            .any(|claim| claim.thread == reporter_thread);
+        let mut publication = None;
+        if !reporter_running {
+            let Some(index) = state.queue[..state.len]
+                .iter()
+                .position(|entry| entry.is_some_and(|entry| entry.thread == reporter_thread))
+            else {
+                return Err(SchedulerError::NotScheduled);
+            };
+            let candidate = state.queue[index].expect("located DW1C reporter entry remains queued");
+            if candidate.target_cpu == ticket.cpu {
+                if reporter_cpu == ticket.cpu
+                    || state
+                        .selector_migration_attempt(candidate, ticket.cpu, reporter_cpu)
+                        .is_err()
+                {
+                    return Err(SchedulerError::StaleExecutionClaim);
+                }
+
+                let generation = state.next_migration_generation;
+                let next_generation = generation
+                    .checked_add(1)
+                    .filter(|next| *next != 0)
+                    .ok_or(SchedulerError::TokenExhausted)?;
+                let mut accounting = state.accounting;
+                let accounting_result = accounting
+                    .decrement_runnable(ticket.cpu)
+                    .and_then(|()| accounting.increment_runnable(reporter_cpu))
+                    .and_then(|()| accounting.increment(ticket.cpu, SchedulerEvent::MigrationOut))
+                    .and_then(|()| accounting.increment(reporter_cpu, SchedulerEvent::MigrationIn));
+                if let Err(error) = accounting_result {
+                    state.reject_accounting(accounting, error);
+                    return Err(error);
+                }
+                let entry = state.queue[index]
+                    .as_mut()
+                    .expect("validated DW1C reporter entry remains queued");
+                entry.target_cpu = reporter_cpu;
+                entry.migration_generation = generation;
+                state.next_migration_generation = next_generation;
+                state.accounting = accounting;
+                publication = Some(RunnablePublication {
+                    target: reporter_cpu,
+                    continuation_bound: false,
+                });
+            }
         }
-        if fixture.token8_terminal_consumed || fixture.token8_expiry_observed {
-            return Err(SchedulerError::StaleQuantum);
-        }
-        fixture.token8_expiry_observed = true;
+        state
+            .dw1c_fixture
+            .as_mut()
+            .expect("validated DW1C acknowledgement retains its fixture")
+            .token8_expiry_observed = true;
         state.assert_invariants();
-        Ok(())
+        Ok(publication)
     }
 
     #[cfg(any(test, deepwyrm_dw1c_evidence))]

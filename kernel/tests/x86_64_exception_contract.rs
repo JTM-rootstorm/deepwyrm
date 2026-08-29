@@ -282,6 +282,19 @@ fn dw1b_timer_return_validation_is_fail_closed_before_resume_or_rearm() {
     assert!(expiry.contains("runtime.switch_cpu(self.cpu);"));
     assert!(!expiry.contains("runtime.select_cpu(self.cpu);"));
     assert!(expiry.contains("runtime.publish_quantum_expiry(ticket)"));
+    assert!(expiry.contains(
+        "runtime.publish_quantum_expiry(ticket)?\n        };\n        crate::task::notify_completed_switch_runnable(outcome.runnable_publication());"
+    ));
+    let runtime_lock = expiry
+        .find("let mut runtime = self.runtime.lock();")
+        .unwrap();
+    let publish = expiry
+        .find("runtime.publish_quantum_expiry(ticket)?")
+        .unwrap();
+    let notify = expiry
+        .find("crate::task::notify_completed_switch_runnable(outcome.runnable_publication());")
+        .unwrap();
+    assert!(runtime_lock < publish && publish < notify);
 
     let gate = live
         .split_once("unsafe fn native_runtime_timer_pre_iret")
