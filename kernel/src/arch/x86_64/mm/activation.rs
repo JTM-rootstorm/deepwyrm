@@ -2057,8 +2057,9 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     pub(crate) fn run_primordial(
         self,
         modules: crate::boot::primordial::PrimordialBootModules,
+        boot_resource_grants: crate::boot::BootResourceGrants,
     ) -> ! {
-        primordial::enter(self, modules)
+        primordial::enter(self, modules, boot_resource_grants)
     }
 }
 

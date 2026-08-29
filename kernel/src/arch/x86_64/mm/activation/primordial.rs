@@ -779,6 +779,11 @@ static BOOTFS_BYTES: ByteStorage<MAX_BOOTFS_BYTES> = ByteStorage::new();
 struct PrimordialRuntimeShared {
     execution: ExecutionDomain<EXECUTION_THREADS>,
     channels: Channels,
+    #[allow(
+        dead_code,
+        reason = "D4 persists unclaimed boot grants for D5 resource-domain binding"
+    )]
+    boot_resource_grants: crate::boot::BootResourceGrants,
     device_resources: crate::device::DeviceResourceAuthority<8>,
     interrupts: crate::device::InterruptAuthority<8>,
     interrupt_platform: crate::device::InterruptPlatformModel<8>,
@@ -1356,7 +1361,9 @@ static CHANNEL_STAGING: [ChannelStaging; crate::arch::x86_64::H1_RUNTIME_CPU_SLO
     [const { ChannelStaging(UnsafeCell::new([0; DW_CHANNEL_MAX_PAYLOAD as usize])) };
         crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT];
 
-fn publish_runtime_shared() -> &'static PrimordialRuntimeShared {
+fn publish_runtime_shared(
+    boot_resource_grants: crate::boot::BootResourceGrants,
+) -> &'static PrimordialRuntimeShared {
     SHARED_RUNTIME_STATE
         .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
         .unwrap_or_else(|_| panic!("primordial shared runtime was initialized twice"));
@@ -1369,6 +1376,7 @@ fn publish_runtime_shared() -> &'static PrimordialRuntimeShared {
         (*SHARED_RUNTIME_STORAGE.0.get()).write(PrimordialRuntimeShared {
             execution,
             channels: Channels::new(),
+            boot_resource_grants,
             device_resources: crate::device::DeviceResourceAuthority::new(),
             interrupts: crate::device::InterruptAuthority::new(),
             interrupt_platform: crate::device::InterruptPlatformModel::new(),
@@ -7156,6 +7164,7 @@ const fn integration_bootfs_page_count(byte_len: usize) -> Option<usize> {
 pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     mut active: ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
     modules: crate::boot::primordial::PrimordialBootModules,
+    boot_resource_grants: crate::boot::BootResourceGrants,
 ) -> ! {
     let cpu_index = crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
         .unwrap_or_else(|| panic!("primordial runtime entered without an installed CPU slot"));
@@ -7205,7 +7214,7 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     let mut tasks = Tasks::new();
     let mut spaces = unsafe { Spaces::new() };
     let mut regions = Regions::new();
-    let shared = publish_runtime_shared();
+    let shared = publish_runtime_shared(boot_resource_grants);
     initialize_per_cpu_live_carriers();
     let (_root_group, root_owner) = tasks
         .create_root_group(&mut registry)

@@ -250,6 +250,7 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
     let reader = IdentityMappedBootInfoReader;
     let boot_info = boot::validate_boot_info(&reader, boot_info_physical)
         .unwrap_or_else(|error| panic!("invalid DwBootInfoV1 handoff: {error:?}"));
+    let boot_resource_grants = boot_info.boot_resource_grants();
 
     #[cfg(not(feature = "test-support"))]
     let primordial_modules = boot_info
@@ -485,12 +486,14 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             test if test.is_f12_userspace() => {
                 active_paging.run_ipc_blocking_userspace_test(test_support::BUILD_GUEST_TEST)
             }
-            test if test.is_primordial() => active_paging
-                .run_primordial(primordial_modules.expect("primordial test selected its modules")),
+            test if test.is_primordial() => active_paging.run_primordial(
+                primordial_modules.expect("primordial test selected its modules"),
+                boot_resource_grants,
+            ),
             _ => unreachable!("post-activation selector lacks an explicit runtime"),
         }
         #[cfg(not(feature = "test-support"))]
-        active_paging.run_primordial(primordial_modules)
+        active_paging.run_primordial(primordial_modules, boot_resource_grants)
     }
 }
 

@@ -16,6 +16,7 @@ use deepwyrm_abi::{
     DW_BOOT_MEMORY_KIND_RESERVED, DW_BOOT_MEMORY_KIND_RUNTIME_SERVICES,
     DW_BOOT_MEMORY_KIND_UNUSABLE, DW_BOOT_MEMORY_KIND_USABLE, DW_BOOT_MEMORY_RANGE_V1_SIZE,
     DW_BOOT_MEMORY_RANGE_V1_VERSION, DW_BOOT_MODULE_FLAG_READ_ONLY,
+    DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1,
     DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1, DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS,
     DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP, DW_BOOT_MODULE_V1_SIZE, DW_BOOT_MODULE_V1_VERSION,
     DW_BOOT_PIXEL_FORMAT_BGRX8, DW_BOOT_PIXEL_FORMAT_BITMASK, DW_BOOT_PIXEL_FORMAT_RGBX8,
@@ -157,9 +158,18 @@ pub struct ValidatedBootInfo {
     memory_ranges: [DwBootMemoryRangeV1; MAX_BOOT_MEMORY_MAP_ENTRIES],
     module_entries: [DwBootModuleV1; MAX_BOOT_MODULE_ENTRIES],
     paging_handoff: ValidatedPagingHandoff,
+    boot_resource_grants: BootResourceGrants,
 }
 
+mod boot_grant;
+mod device_table;
 pub mod primordial;
+
+#[cfg(test)]
+pub(crate) use boot_grant::BootResourceGrantState;
+pub(crate) use boot_grant::{
+    BootResourceDescriptor, BootResourceGrantError, BootResourceGrants, MAX_BOOT_RESOURCE_GRANTS,
+};
 
 /// Owned, one-snapshot structural interpretation of the loader's internal
 /// paging carrier.
@@ -272,6 +282,15 @@ impl ValidatedBootInfo {
         &self.paging_handoff
     }
 
+    /// Returns the copied kernel-internal grants admitted from optional kind 4.
+    #[allow(
+        dead_code,
+        reason = "the freestanding primordial path consumes D4 grants; host tests inspect them directly"
+    )]
+    pub(crate) const fn boot_resource_grants(&self) -> BootResourceGrants {
+        self.boot_resource_grants
+    }
+
     /// Selects the two modules consumed by the DW0-G primordial path.
     ///
     /// This view is deliberately narrower than the retained module snapshot:
@@ -305,12 +324,20 @@ pub enum BootInfoValidationError {
     EntryCountLimitExceeded,
     MissingRequiredModule,
     DuplicateRequiredModule,
+    DuplicateBootDeviceModule,
     OverlappingModules,
     InvalidModuleFlags,
     InvalidFramebuffer,
     InvalidEntropy,
     InvalidCommandLine,
     InvalidPagingHandoff,
+    InvalidBootDeviceTable,
+    InvalidBootDeviceResource,
+    ProtectedBootDeviceResource,
+    DuplicateBootDeviceResourceId,
+    DuplicateBootDeviceInterruptSource,
+    OverlappingBootDeviceResources,
+    BootResourceGrantGenerationExhausted,
     PagingHandoffFrameRoleOverlap,
     PagingHandoffFrameNotReserved,
     ModuleNotDelegable,
@@ -415,6 +442,7 @@ pub fn validate_boot_info_with_limits<R: BootInfoByteReader>(
     let mut bootstrap = None;
     let mut bootfs = None;
     let mut paging_handoff_module = None;
+    let mut boot_device_module = None;
     let mut module_entries = core::array::from_fn(|_| DwBootModuleV1::default());
     for (index, module) in module_entries
         .iter_mut()
@@ -452,6 +480,14 @@ pub fn validate_boot_info_with_limits<R: BootInfoByteReader>(
                     return Err(BootInfoValidationError::DuplicateRequiredModule);
                 }
             }
+            kind if kind == DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1.0 => {
+                if module.flags != DW_BOOT_MODULE_FLAG_READ_ONLY {
+                    return Err(BootInfoValidationError::InvalidModuleFlags);
+                }
+                if boot_device_module.replace(*module).is_some() {
+                    return Err(BootInfoValidationError::DuplicateBootDeviceModule);
+                }
+            }
             _ => return Err(BootInfoValidationError::UnknownModuleKind),
         }
     }
@@ -484,6 +520,14 @@ pub fn validate_boot_info_with_limits<R: BootInfoByteReader>(
         framebuffer,
         header.acpi_rsdp_physical_address,
     )?;
+    let boot_resource_grants = match boot_device_module {
+        Some(module) => device_table::parse_boot_resource_grants(
+            reader,
+            module.physical_start,
+            module.byte_len,
+        )?,
+        None => BootResourceGrants::empty(),
+    };
 
     Ok(ValidatedBootInfo {
         header,
@@ -495,6 +539,7 @@ pub fn validate_boot_info_with_limits<R: BootInfoByteReader>(
         memory_ranges,
         module_entries,
         paging_handoff,
+        boot_resource_grants,
     })
 }
 

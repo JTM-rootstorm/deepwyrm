@@ -700,7 +700,7 @@ fn production_entry_dispatches_primordial_runtime_and_keeps_test_hooks_feature_g
     let gated_dispatch = &kernel[gated_start..production_start];
     assert!(gated_dispatch.contains("test_support::run_memory_guest_test(active_paging)"));
     assert!(kernel.contains(
-        "#[cfg(not(feature = \"test-support\"))]\n        active_paging.run_primordial(primordial_modules)"
+        "#[cfg(not(feature = \"test-support\"))]\n        active_paging.run_primordial(primordial_modules, boot_resource_grants)"
     ));
     assert!(!kernel.contains("#[cfg(not(feature = \"test-support\"))]\n        loop {"));
 }
