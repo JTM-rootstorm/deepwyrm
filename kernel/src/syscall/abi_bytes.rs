@@ -45,13 +45,13 @@ fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-pub(crate) fn encode_abi_info() -> [u8; DW_ABI_INFO_V1_SIZE as usize] {
+pub(crate) fn encode_abi_info(feature_bits: u64) -> [u8; DW_ABI_INFO_V1_SIZE as usize] {
     let info = DwAbiInfoV1 {
         size: DW_ABI_INFO_V1_SIZE,
         version: 1,
         abi_version: DW_ABI_VERSION,
         page_size: DW_BASE_PAGE_SIZE,
-        feature_bits: 0,
+        feature_bits,
         max_channel_payload: DW_CHANNEL_MAX_PAYLOAD,
         max_channel_handles: DW_CHANNEL_MAX_HANDLES,
         reserved: [0; 4],

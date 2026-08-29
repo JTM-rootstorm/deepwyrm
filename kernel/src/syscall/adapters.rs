@@ -31,6 +31,10 @@ use deepwyrm_abi::{
 };
 
 use crate::device::InterruptWaitSource;
+use crate::device::{
+    DeviceResourceAuthority, DeviceResourceDescriptor, DeviceResourceFinalizer, InterruptAuthority,
+    InterruptCreateError, InterruptError, InterruptPlatform,
+};
 use crate::handle::{
     AcceptedObjectTypes, HANDLE_TRANSFER_LIMIT, HandleMovePrepareError, HandleMoveRequest,
     HandlePairReservation, HandleReservationSpec, HandleTableError, HandleTransferReservation,
@@ -51,9 +55,9 @@ use crate::object::{FinalRelease, HandleRef, InternalRef, ObjectRegistry, Object
 use crate::task::{
     BlockWakeKey, DeferredCurrentExecutionResources, ExecutionDomain, ExecutionResourceError,
     ExecutionSwitchError, IdleScheduleDecision, PreparedProcess, ProcessExitEffects, ProcessKey,
-    RetiredExitPins, ScheduleDecision, SchedulerError, SchedulerThreadState, StartThreadError,
-    TaskAuthority, TaskCreateError, TaskError, TaskExceptionRecord, TaskGroupKey,
-    TaskGroupTerminationEffects, ThreadKey, ThreadStartState,
+    ResourceClaimMembershipError, RetiredExitPins, ScheduleDecision, SchedulerError,
+    SchedulerThreadState, StartThreadError, TaskAuthority, TaskCreateError, TaskError,
+    TaskExceptionRecord, TaskGroupKey, TaskGroupTerminationEffects, ThreadKey, ThreadStartState,
 };
 use crate::time::{TimerAuthority, TimerCreateError, TimerDeadlineAuthority, TimerError, TimerKey};
 use crate::wait::{
@@ -390,6 +394,16 @@ pub(crate) fn abi_get_info<U: UserPageAccess>(
     out_size: u64,
     out_required_size: DwUserAddress,
 ) -> DwStatus {
+    abi_get_info_with_features(user, out_info, out_size, out_required_size, 0)
+}
+
+pub(crate) fn abi_get_info_with_features<U: UserPageAccess>(
+    user: &mut U,
+    out_info: DwUserAddress,
+    out_size: u64,
+    out_required_size: DwUserAddress,
+    feature_bits: u64,
+) -> DwStatus {
     let required = u64::from(DW_ABI_INFO_V1_SIZE);
     let required_range = match user_range(out_required_size, 8, 8, UserAccess::WRITE) {
         Ok(range) => range,
@@ -414,7 +428,7 @@ pub(crate) fn abi_get_info<U: UserPageAccess>(
     if let Err(error) = preflight_user_output(user, required_range, 8) {
         return usercopy_status(error);
     }
-    if let Err(error) = copy_to_user(user, info_range, &encode_abi_info()) {
+    if let Err(error) = copy_to_user(user, info_range, &encode_abi_info(feature_bits)) {
         return usercopy_status(error);
     }
     match copy_to_user(user, required_range, &encode_u64(required)) {
@@ -1350,6 +1364,9 @@ pub(crate) fn task_group_create<
     {
         return status;
     }
+    if requested_rights.0 & deepwyrm_abi::DW_RIGHT_RESOURCE.0 != 0 {
+        return DW_STATUS_ACCESS_DENIED;
+    }
     let output = match preflight_output(user, out_handle, 8, 8) {
         Ok(output) => output,
         Err(status) => return status,
@@ -1394,6 +1411,512 @@ pub(crate) fn task_group_create<
     };
     output.commit(&encode_handle(handle));
     DW_STATUS_SUCCESS
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "D5 claim keeps user memory, task membership, grant, registry, and typed authority ownership explicit"
+)]
+pub(crate) fn device_resource_claim<
+    U: UserPageAccess,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const RESOURCES: usize,
+>(
+    user: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    grants: &crate::boot::BootResourceGrantAuthority,
+    resources: &DeviceResourceAuthority<RESOURCES>,
+    current_process: ProcessKey,
+    resource_domain: DwHandle,
+    resource_id: u64,
+    requested_rights: DwRights,
+    out_resource: DwUserAddress,
+) -> DwStatus {
+    if resource_id == 0 {
+        return DW_STATUS_INVALID_ARGUMENT;
+    }
+    if let Err(status) = validate_created_handle_rights(
+        deepwyrm_abi::DW_OBJECT_TYPE_DEVICE_RESOURCE,
+        requested_rights,
+    ) {
+        return status;
+    }
+    let output = match preflight_output(user, out_resource, 8, 8) {
+        Ok(output) => output,
+        Err(status) => return status,
+    };
+    // Public handle validation outranks caller lifecycle state. This first
+    // resolution is deliberately read-only; the operation-held path resolves
+    // the same handle again before reserving any grant or object authority.
+    let resolved = match tasks.process_handles(current_process) {
+        Ok(handles) => handles.lookup(
+            registry,
+            resource_domain,
+            AcceptedObjectTypes::One(deepwyrm_abi::DW_OBJECT_TYPE_TASK_GROUP),
+            deepwyrm_abi::DW_RIGHT_RESOURCE,
+        ),
+        Err(error) => return task_status(error),
+    };
+    let resolved = match resolved {
+        Ok(resolved) => resolved,
+        Err(error) => return handle_status(error),
+    };
+    assert!(
+        registry
+            .release_internal(resolved.into_internal())
+            .unwrap_or_else(|failure| {
+                panic!("D5 precedence lookup pin drifted: {:?}", failure.error())
+            })
+            .is_none(),
+        "D5 precedence lookup pin became final while its handle remained owned"
+    );
+    let lease = match tasks.acquire_process_operation(current_process) {
+        Ok(lease) => lease,
+        Err(_) => return DW_STATUS_BAD_STATE,
+    };
+    let result = device_resource_claim_under_operation(
+        registry,
+        tasks,
+        grants,
+        resources,
+        &lease,
+        current_process,
+        resource_domain,
+        resource_id,
+        requested_rights,
+        None,
+    );
+    tasks
+        .release_process_operation(lease)
+        .unwrap_or_else(|(error, _)| panic!("D5 claim leaked process operation: {error:?}"));
+    match result {
+        Ok(handle) => {
+            output.commit(&encode_handle(handle));
+            DW_STATUS_SUCCESS
+        }
+        Err(status) => status,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "D5 host injection exercises the two sides of the public-handle commit boundary"
+)]
+enum DeviceResourceClaimCommitFailure {
+    Publication,
+    PostPublication,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn device_resource_claim_under_operation<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const RESOURCES: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    grants: &crate::boot::BootResourceGrantAuthority,
+    resources: &DeviceResourceAuthority<RESOURCES>,
+    operation: &crate::task::ProcessOperationLease,
+    current_process: ProcessKey,
+    resource_domain: DwHandle,
+    resource_id: u64,
+    requested_rights: DwRights,
+    fail_at: Option<DeviceResourceClaimCommitFailure>,
+) -> Result<DwHandle, DwStatus> {
+    let resolved = tasks
+        .process_handles(current_process)
+        .map_err(task_status)?
+        .lookup(
+            registry,
+            resource_domain,
+            AcceptedObjectTypes::One(deepwyrm_abi::DW_OBJECT_TYPE_TASK_GROUP),
+            deepwyrm_abi::DW_RIGHT_RESOURCE,
+        )
+        .map_err(handle_status)?;
+    let supplied_domain = TaskGroupKey::from_object_id(resolved.object_id());
+    assert!(
+        registry
+            .release_internal(resolved.into_internal())
+            .unwrap_or_else(|failure| panic!("D5 domain lookup pin drifted: {:?}", failure.error()))
+            .is_none(),
+        "D5 domain lookup pin became final while its handle remained owned"
+    );
+    let owner = grants.owner_key().map_err(|_| DW_STATUS_BAD_STATE)?;
+    if supplied_domain != owner {
+        return Err(DW_STATUS_ACCESS_DENIED);
+    }
+    let membership = tasks
+        .prepare_resource_claim_membership(current_process, owner)
+        .map_err(resource_membership_status)?;
+    let (boot, reservation) = grants.reserve(resource_id).map_err(boot_grant_status)?;
+    let descriptor = DeviceResourceDescriptor {
+        resource_id,
+        lease_generation: reservation.lease_generation(),
+        kind: boot.kind,
+        pio_base: boot.pio_base,
+        pio_length: boot.pio_length,
+        interrupt_source: boot.interrupt_source,
+        resource_domain: owner,
+    };
+    let creation = match registry.create(deepwyrm_abi::DW_OBJECT_TYPE_DEVICE_RESOURCE) {
+        Ok(creation) => creation,
+        Err(error) => {
+            grants.cancel(reservation).unwrap_or_else(|rollback| {
+                panic!("D5 grant rollback drifted after registry failure: {rollback:?}")
+            });
+            return Err(match error {
+                ObjectRegistryError::Capacity | ObjectRegistryError::ReferenceCountExhausted => {
+                    DW_STATUS_NO_RESOURCES
+                }
+                _ => DW_STATUS_BAD_STATE,
+            });
+        }
+    };
+    let binding = match resources.bind_claim(creation, descriptor, reservation.grant_generation()) {
+        Ok(binding) => binding,
+        Err((error, creation)) => {
+            registry
+                .cancel_creation(creation)
+                .unwrap_or_else(|failure| {
+                    panic!(
+                        "D5 generic rollback drifted after typed bind failure: {:?}",
+                        failure.error()
+                    )
+                });
+            grants.cancel(reservation).unwrap_or_else(|rollback| {
+                panic!("D5 grant rollback drifted after typed bind failure: {rollback:?}")
+            });
+            return Err(match error {
+                crate::device::DeviceResourceError::Capacity => DW_STATUS_NO_RESOURCES,
+                _ => DW_STATUS_BAD_STATE,
+            });
+        }
+    };
+    let key = binding.key();
+    let bound = registry
+        .finish_payload_binding(binding)
+        .unwrap_or_else(|failure| {
+            panic!(
+                "D5 fresh DeviceResource binding could not seal: {:?}",
+                failure.error()
+            )
+        });
+    let reference = registry.bound_into_handle(bound).unwrap_or_else(|failure| {
+        panic!(
+            "D5 fresh DeviceResource could not become a handle: {:?}",
+            failure.error()
+        )
+    });
+    let mut destination = match tasks
+        .process_handles_mut_for_operation(operation, current_process)
+        .map_err(task_status)?
+        .reserve_transfer_destination()
+    {
+        Ok(destination) => destination,
+        Err(error) => {
+            rollback_unpublished_claim(registry, resources, grants, reservation, reference);
+            return Err(handle_status(error));
+        }
+    };
+    if let Err(error) = tasks.validate_resource_claim_membership(&membership) {
+        destination
+            .cancel(
+                tasks
+                    .process_handles_mut_for_operation(operation, current_process)
+                    .expect("D5 operation keeps caller HandleTable live"),
+            )
+            .unwrap_or_else(|rollback| panic!("D5 destination rollback drifted: {rollback:?}"));
+        rollback_unpublished_claim(registry, resources, grants, reservation, reference);
+        return Err(resource_membership_status(error));
+    }
+    let published = destination
+        .try_publish_reference(
+            tasks
+                .process_handles_mut_for_operation(operation, current_process)
+                .expect("D5 operation keeps caller HandleTable live"),
+            reference,
+            requested_rights,
+        )
+        .unwrap_or_else(|failure| {
+            panic!(
+                "D5 prevalidated handle publication diverged at commit: {:?}",
+                failure.error()
+            )
+        });
+    if fail_at == Some(DeviceResourceClaimCommitFailure::Publication) {
+        let final_release = tasks
+            .process_handles_mut_for_operation(operation, current_process)
+            .expect("D5 operation keeps caller HandleTable live")
+            .close(registry, published.handle)
+            .unwrap_or_else(|error| panic!("D5 injected publication close drifted: {error:?}"))
+            .expect("D5 injected publication owns the only public reference");
+        let finalization =
+            resources
+                .take_finalization(final_release)
+                .unwrap_or_else(|(error, _)| {
+                    panic!("D5 injected publication lost typed authority: {error:?}")
+                });
+        crate::device::cancel_unpublished_device_resource_claim(registry, finalization);
+        grants
+            .cancel(reservation)
+            .unwrap_or_else(|error| panic!("D5 injected publication lost grant: {error:?}"));
+        return Err(DW_STATUS_NO_RESOURCES);
+    }
+    grants.commit(reservation, key.object_id());
+    if fail_at == Some(DeviceResourceClaimCommitFailure::PostPublication) {
+        let final_release = tasks
+            .process_handles_mut_for_operation(operation, current_process)
+            .expect("D5 operation keeps caller HandleTable live")
+            .close(registry, published.handle)
+            .unwrap_or_else(|error| panic!("D5 injected post-publication close drifted: {error:?}"))
+            .expect("D5 injected post-publication owns the only public reference");
+        let finalization =
+            resources
+                .take_finalization(final_release)
+                .unwrap_or_else(|(error, _)| {
+                    panic!("D5 injected post-publication lost typed authority: {error:?}")
+                });
+        crate::device::complete_device_resource_finalization_with_grants(
+            registry,
+            grants,
+            finalization,
+        );
+        return Err(DW_STATUS_NO_RESOURCES);
+    }
+    Ok(published.handle)
+}
+
+fn rollback_unpublished_claim<const OBJECTS: usize, const RESOURCES: usize>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    resources: &DeviceResourceAuthority<RESOURCES>,
+    grants: &crate::boot::BootResourceGrantAuthority,
+    reservation: crate::boot::BootResourceLeaseReservation,
+    reference: HandleRef,
+) {
+    let final_release = registry
+        .release_handle(reference)
+        .unwrap_or_else(|failure| {
+            panic!(
+                "D5 claim rollback lost generic authority: {:?}",
+                failure.error()
+            )
+        })
+        .expect("unpublished D5 DeviceResource owns its only generic reference");
+    let finalization = resources
+        .take_finalization(final_release)
+        .unwrap_or_else(|(error, _)| panic!("D5 claim rollback lost typed authority: {error:?}"));
+    crate::device::cancel_unpublished_device_resource_claim(registry, finalization);
+    grants
+        .cancel(reservation)
+        .unwrap_or_else(|error| panic!("D5 claim rollback lost grant reservation: {error:?}"));
+}
+
+fn resource_membership_status(error: ResourceClaimMembershipError) -> DwStatus {
+    match error {
+        ResourceClaimMembershipError::AccessDenied => DW_STATUS_ACCESS_DENIED,
+        ResourceClaimMembershipError::BadState => DW_STATUS_BAD_STATE,
+    }
+}
+
+fn boot_grant_status(error: crate::boot::BootResourceLeaseError) -> DwStatus {
+    match error {
+        crate::boot::BootResourceLeaseError::UnknownResource => deepwyrm_abi::DW_STATUS_NOT_FOUND,
+        crate::boot::BootResourceLeaseError::AlreadyLeased => {
+            deepwyrm_abi::DW_STATUS_ALREADY_EXISTS
+        }
+        crate::boot::BootResourceLeaseError::GenerationExhausted => DW_STATUS_NO_RESOURCES,
+        crate::boot::BootResourceLeaseError::OwnerNotBound => DW_STATUS_BAD_STATE,
+        crate::boot::BootResourceLeaseError::OwnerAlreadyBound
+        | crate::boot::BootResourceLeaseError::StaleReservation
+        | crate::boot::BootResourceLeaseError::FinalizationMismatch => DW_STATUS_BAD_STATE,
+    }
+}
+
+pub(crate) fn device_pio_read<
+    U: UserPageAccess,
+    I: crate::arch::x86_64::io_port::ScalarPortIo,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const RESOURCES: usize,
+>(
+    user: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    resources: &DeviceResourceAuthority<RESOURCES>,
+    io: &mut I,
+    current_process: ProcessKey,
+    resource: DwHandle,
+    offset: u32,
+    width: u32,
+    out_value: DwUserAddress,
+) -> DwStatus {
+    let output = match preflight_output(user, out_value, 4, 4) {
+        Ok(output) => output,
+        Err(status) => return status,
+    };
+    let result = process_handle_operation!(tasks, current_process, table, {
+        crate::device::pio_read(table, registry, resources, io, resource, offset, width)
+    });
+    match result {
+        Ok(Ok(value)) => {
+            output.commit(&encode_u32(value));
+            DW_STATUS_SUCCESS
+        }
+        Ok(Err(status)) => status,
+        Err(error) => task_status(error),
+    }
+}
+
+pub(crate) fn device_pio_write<
+    I: crate::arch::x86_64::io_port::ScalarPortIo,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const RESOURCES: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    resources: &DeviceResourceAuthority<RESOURCES>,
+    io: &mut I,
+    current_process: ProcessKey,
+    resource: DwHandle,
+    offset: u32,
+    width: u32,
+    value: u32,
+) -> DwStatus {
+    match process_handle_operation!(tasks, current_process, table, {
+        crate::device::pio_write(
+            table, registry, resources, io, resource, offset, width, value,
+        )
+    }) {
+        Ok(Ok(())) => DW_STATUS_SUCCESS,
+        Ok(Err(status)) => status,
+        Err(error) => task_status(error),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn interrupt_create<
+    U: UserPageAccess,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const RESOURCES: usize,
+    const INTERRUPTS: usize,
+>(
+    user: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    resources: &DeviceResourceAuthority<RESOURCES>,
+    interrupts: &InterruptAuthority<INTERRUPTS>,
+    platform: &dyn InterruptPlatform,
+    current_process: ProcessKey,
+    resource: DwHandle,
+    requested_rights: DwRights,
+    out_interrupt: DwUserAddress,
+) -> DwStatus {
+    if let Err(status) =
+        validate_created_handle_rights(deepwyrm_abi::DW_OBJECT_TYPE_INTERRUPT, requested_rights)
+    {
+        return status;
+    }
+    let output = match preflight_output(user, out_interrupt, 8, 8) {
+        Ok(output) => output,
+        Err(status) => return status,
+    };
+    let result = process_handle_operation!(tasks, current_process, table, {
+        crate::device::interrupt_create(
+            table,
+            registry,
+            resources,
+            interrupts,
+            platform,
+            resource,
+            requested_rights,
+        )
+    });
+    match result {
+        Ok(Ok((_key, handle))) => {
+            output.commit(&encode_handle(handle));
+            DW_STATUS_SUCCESS
+        }
+        Ok(Err(error)) => interrupt_create_status(error),
+        Err(error) => task_status(error),
+    }
+}
+
+pub(crate) fn interrupt_ack<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const INTERRUPTS: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    interrupts: &InterruptAuthority<INTERRUPTS>,
+    platform: &dyn InterruptPlatform,
+    current_process: ProcessKey,
+    interrupt: DwHandle,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
+    match process_handle_operation!(tasks, current_process, table, {
+        crate::device::interrupt_ack(table, registry, interrupts, platform, interrupt)
+    }) {
+        Ok(Ok(release)) => {
+            cleanup.push_optional(release);
+            DW_STATUS_SUCCESS
+        }
+        Ok(Err(status)) => status,
+        Err(error) => task_status(error),
+    }
+}
+
+fn interrupt_create_status(error: InterruptCreateError) -> DwStatus {
+    match error {
+        InterruptCreateError::Handle(error) => handle_status(error),
+        InterruptCreateError::Registry(ObjectRegistryError::Capacity)
+        | InterruptCreateError::Registry(ObjectRegistryError::ReferenceCountExhausted) => {
+            DW_STATUS_NO_RESOURCES
+        }
+        InterruptCreateError::Registry(_) | InterruptCreateError::Publication(_) => {
+            DW_STATUS_BAD_STATE
+        }
+        InterruptCreateError::Interrupt(error) => match error {
+            InterruptError::InvalidRights => DW_STATUS_INVALID_ARGUMENT,
+            InterruptError::Capacity => DW_STATUS_NO_RESOURCES,
+            InterruptError::InvalidObject => DW_STATUS_BAD_STATE,
+            InterruptError::IdentityInUse => deepwyrm_abi::DW_STATUS_ALREADY_EXISTS,
+            InterruptError::BadState | InterruptError::FinalizationMismatch => DW_STATUS_BAD_STATE,
+            InterruptError::Platform(error) => match error {
+                crate::device::InterruptPlatformError::SourceInUse => {
+                    deepwyrm_abi::DW_STATUS_ALREADY_EXISTS
+                }
+                crate::device::InterruptPlatformError::Capacity => DW_STATUS_NO_RESOURCES,
+                crate::device::InterruptPlatformError::InvalidSource => DW_STATUS_INVALID_ARGUMENT,
+                crate::device::InterruptPlatformError::StaleBinding
+                | crate::device::InterruptPlatformError::BadState => DW_STATUS_BAD_STATE,
+            },
+        },
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

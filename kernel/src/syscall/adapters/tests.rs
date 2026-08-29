@@ -1,6 +1,7 @@
 extern crate std;
 
 use super::*;
+use crate::device::InterruptFinalizer;
 use crate::memory::address_region::{
     AddressRegionObjectAuthority, AddressSpaceAuthority, complete_address_region_finalization,
 };
@@ -4875,6 +4876,471 @@ fn task_create_output_preflight_precedes_generation_and_handle_mutation() {
     let mut root_cleanup = CleanupQueue::<16>::new();
     root_cleanup.push(root_final);
     finish_task_cleanup(&mut registry, &mut tasks, root_cleanup);
+}
+
+#[test]
+fn task_group_create_cannot_manufacture_resource_authority() {
+    let mut registry = ObjectRegistry::<16>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let root_pin = registry.retain_internal(&root_owner).unwrap();
+    let root_handle = registry.internal_into_handle(root_pin).unwrap();
+    let (process, _process_ref) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let parent = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(
+            root_handle,
+            DwRights(DW_RIGHT_MODIFY.0 | deepwyrm_abi::DW_RIGHT_RESOURCE.0),
+        )
+        .unwrap();
+    let mut user = FakeUserMemory::new();
+    let mut cleanup = CleanupQueue::<16>::new();
+    let before = tasks.process_handle_count(process).unwrap();
+    assert_eq!(
+        task_group_create(
+            &mut user,
+            &mut registry,
+            &mut tasks,
+            process,
+            parent,
+            DwRights(DW_RIGHT_INSPECT.0 | deepwyrm_abi::DW_RIGHT_RESOURCE.0),
+            DwUserAddress(BASE),
+            &mut cleanup,
+        ),
+        DW_STATUS_ACCESS_DENIED
+    );
+    assert_eq!(tasks.process_handle_count(process).unwrap(), before);
+    assert!(
+        tasks
+            .process_handles_mut(process)
+            .unwrap()
+            .close(&mut registry, parent)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn device_resource_claim_requires_domain_membership_and_reclaims_exact_lease() {
+    let mut registry = ObjectRegistry::<16>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (domain, domain_handle) = tasks
+        .create_child_group(&mut registry, &root_owner)
+        .unwrap();
+    let init_domain_handle = registry.retain_handle(&domain_handle).unwrap();
+    let domain_parent = registry
+        .retain_internal_from_handle(&domain_handle)
+        .unwrap();
+    let owner = registry
+        .retain_internal_from_handle(&domain_handle)
+        .unwrap();
+    let (member, _member_ref) = tasks.create_process(&mut registry, &domain_parent).unwrap();
+    let (init, _init_ref) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let domain_cap = tasks
+        .process_handles_mut(member)
+        .unwrap()
+        .install(
+            domain_handle,
+            DwRights(deepwyrm_abi::DW_RIGHT_RESOURCE.0 | DW_RIGHT_INSPECT.0),
+        )
+        .unwrap();
+    let snapshot =
+        crate::boot::BootResourceGrants::materialize(&[crate::boot::BootResourceDescriptor {
+            resource_id: 77,
+            device_correlation_id: 77,
+            kind: deepwyrm_abi::DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT,
+            pio_base: 0x2f8,
+            pio_length: 8,
+            interrupt_source: 3,
+        }])
+        .unwrap();
+    let grants = crate::boot::BootResourceGrantAuthority::new(snapshot);
+    grants.bind_owner(domain, owner).unwrap();
+    let resources = DeviceResourceAuthority::<2>::new();
+    let mut user = FakeUserMemory::new();
+    let rights =
+        deepwyrm_abi::dw_object_compatible_rights(deepwyrm_abi::DW_OBJECT_TYPE_DEVICE_RESOURCE);
+    let init_cap = tasks
+        .process_handles_mut(init)
+        .unwrap()
+        .install(
+            init_domain_handle,
+            DwRights(
+                deepwyrm_abi::DW_RIGHT_RESOURCE.0
+                    | DW_RIGHT_MODIFY.0
+                    | DW_RIGHT_DUPLICATE.0
+                    | deepwyrm_abi::DW_RIGHT_TRANSFER.0
+                    | DW_RIGHT_INSPECT.0,
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        device_resource_claim(
+            &mut user,
+            &mut registry,
+            &mut tasks,
+            &grants,
+            &resources,
+            init,
+            init_cap,
+            77,
+            rights,
+            DwUserAddress(BASE + 32),
+        ),
+        DW_STATUS_ACCESS_DENIED
+    );
+    assert!(
+        tasks
+            .process_handles_mut(init)
+            .unwrap()
+            .close(&mut registry, init_cap)
+            .unwrap()
+            .is_none()
+    );
+
+    assert_eq!(
+        device_resource_claim(
+            &mut user,
+            &mut registry,
+            &mut tasks,
+            &grants,
+            &resources,
+            member,
+            domain_cap,
+            77,
+            rights,
+            DwUserAddress(BASE),
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let first = DwHandle(u64::from_le_bytes(user.bytes[..8].try_into().unwrap()));
+    let interrupts = InterruptAuthority::<1>::new();
+    let platform = crate::device::InterruptPlatformModel::<1>::new();
+    let (_, interrupt) = crate::device::interrupt_create(
+        tasks.process_handles_mut(member).unwrap(),
+        &mut registry,
+        &resources,
+        &interrupts,
+        &platform,
+        first,
+        deepwyrm_abi::dw_object_compatible_rights(deepwyrm_abi::DW_OBJECT_TYPE_INTERRUPT),
+    )
+    .unwrap();
+    assert!(
+        tasks
+            .process_handles_mut(member)
+            .unwrap()
+            .close(&mut registry, first)
+            .unwrap()
+            .is_none(),
+        "derived Interrupt retains the exact DeviceResource parent"
+    );
+    assert_eq!(
+        device_resource_claim(
+            &mut user,
+            &mut registry,
+            &mut tasks,
+            &grants,
+            &resources,
+            member,
+            domain_cap,
+            77,
+            rights,
+            DwUserAddress(BASE + 8),
+        ),
+        deepwyrm_abi::DW_STATUS_ALREADY_EXISTS
+    );
+    let interrupt_release = tasks
+        .process_handles_mut(member)
+        .unwrap()
+        .close(&mut registry, interrupt)
+        .unwrap()
+        .unwrap();
+    let interrupt_finalization = interrupts
+        .take_finalization(interrupt_release, &platform)
+        .unwrap();
+    let final_release =
+        crate::device::complete_interrupt_finalization(&mut registry, interrupt_finalization)
+            .expect("Interrupt finalization releases the last DeviceResource parent pin");
+    let finalization = resources.take_finalization(final_release).unwrap();
+    crate::device::complete_device_resource_finalization_with_grants(
+        &mut registry,
+        &grants,
+        finalization,
+    );
+    assert_eq!(
+        device_resource_claim(
+            &mut user,
+            &mut registry,
+            &mut tasks,
+            &grants,
+            &resources,
+            member,
+            domain_cap,
+            77,
+            rights,
+            DwUserAddress(BASE + 16),
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let second = DwHandle(u64::from_le_bytes(user.bytes[16..24].try_into().unwrap()));
+    let final_release = tasks
+        .process_handles_mut(member)
+        .unwrap()
+        .close(&mut registry, second)
+        .unwrap()
+        .unwrap();
+    let finalization = resources.take_finalization(final_release).unwrap();
+    crate::device::complete_device_resource_finalization_with_grants(
+        &mut registry,
+        &grants,
+        finalization,
+    );
+    assert!(
+        tasks
+            .process_handles_mut(member)
+            .unwrap()
+            .close(&mut registry, domain_cap)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn device_resource_claim_handle_errors_precede_terminating_caller_state() {
+    let mut registry = ObjectRegistry::<16>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (domain, domain_handle) = tasks
+        .create_child_group(&mut registry, &root_owner)
+        .unwrap();
+    let domain_parent = registry
+        .retain_internal_from_handle(&domain_handle)
+        .unwrap();
+    let owner = registry
+        .retain_internal_from_handle(&domain_handle)
+        .unwrap();
+    let (process, process_ref) = tasks.create_process(&mut registry, &domain_parent).unwrap();
+    let domain_cap = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(
+            domain_handle,
+            DwRights(deepwyrm_abi::DW_RIGHT_RESOURCE.0 | DW_RIGHT_INSPECT.0),
+        )
+        .unwrap();
+    let wrong_type = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(process_ref, DW_RIGHT_INSPECT)
+        .unwrap();
+    let snapshot =
+        crate::boot::BootResourceGrants::materialize(&[crate::boot::BootResourceDescriptor {
+            resource_id: 91,
+            device_correlation_id: 91,
+            kind: deepwyrm_abi::DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT,
+            pio_base: 0x2f8,
+            pio_length: 8,
+            interrupt_source: 3,
+        }])
+        .unwrap();
+    let grants = crate::boot::BootResourceGrantAuthority::new(snapshot);
+    grants.bind_owner(domain, owner).unwrap();
+    let resources = DeviceResourceAuthority::<1>::new();
+    let rights =
+        deepwyrm_abi::dw_object_compatible_rights(deepwyrm_abi::DW_OBJECT_TYPE_DEVICE_RESOURCE);
+    let mut user = FakeUserMemory::new();
+
+    let in_flight = tasks.acquire_process_operation(process).unwrap();
+    assert!(matches!(
+        tasks.terminate_process_authorized(&mut registry, process, 0x51),
+        Err(crate::task::TaskError::OperationsInFlight)
+    ));
+    assert_eq!(
+        device_resource_claim(
+            &mut user,
+            &mut registry,
+            &mut tasks,
+            &grants,
+            &resources,
+            process,
+            DwHandle(u64::MAX),
+            91,
+            rights,
+            DwUserAddress(BASE),
+        ),
+        DW_STATUS_BAD_HANDLE
+    );
+    assert_eq!(
+        device_resource_claim(
+            &mut user,
+            &mut registry,
+            &mut tasks,
+            &grants,
+            &resources,
+            process,
+            wrong_type,
+            91,
+            rights,
+            DwUserAddress(BASE),
+        ),
+        DW_STATUS_WRONG_OBJECT_TYPE
+    );
+    assert_eq!(
+        device_resource_claim(
+            &mut user,
+            &mut registry,
+            &mut tasks,
+            &grants,
+            &resources,
+            process,
+            domain_cap,
+            91,
+            rights,
+            DwUserAddress(BASE),
+        ),
+        DW_STATUS_BAD_STATE
+    );
+    let mut cleanup = CleanupQueue::<16>::new();
+    for handle in [domain_cap, wrong_type] {
+        cleanup.push_optional(
+            tasks
+                .process_handles_mut_for_operation(&in_flight, process)
+                .unwrap()
+                .close(&mut registry, handle)
+                .unwrap(),
+        );
+    }
+    tasks.release_process_operation(in_flight).unwrap();
+    let effects = tasks
+        .terminate_process_authorized(&mut registry, process, 0x51)
+        .unwrap();
+    assert_eq!(effects.drained.final_release_count(), 0);
+    let (process_pin, thread_pins, resources) = effects.pins.into_parts();
+    assert!(thread_pins.into_iter().flatten().next().is_none());
+    assert!(resources.into_iter().flatten().next().is_none());
+    cleanup.push_optional(registry.release_internal(process_pin.unwrap()).unwrap());
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+#[test]
+fn device_resource_claim_publication_failures_use_typed_close_and_restore_capacity() {
+    let mut registry = ObjectRegistry::<16>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (domain, domain_handle) = tasks
+        .create_child_group(&mut registry, &root_owner)
+        .unwrap();
+    let domain_parent = registry
+        .retain_internal_from_handle(&domain_handle)
+        .unwrap();
+    let owner = registry
+        .retain_internal_from_handle(&domain_handle)
+        .unwrap();
+    let (process, _process_ref) = tasks.create_process(&mut registry, &domain_parent).unwrap();
+    let domain_cap = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(
+            domain_handle,
+            DwRights(deepwyrm_abi::DW_RIGHT_RESOURCE.0 | DW_RIGHT_INSPECT.0),
+        )
+        .unwrap();
+    let snapshot =
+        crate::boot::BootResourceGrants::materialize(&[crate::boot::BootResourceDescriptor {
+            resource_id: 101,
+            device_correlation_id: 101,
+            kind: deepwyrm_abi::DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT,
+            pio_base: 0x2f8,
+            pio_length: 8,
+            interrupt_source: 3,
+        }])
+        .unwrap();
+    let grants = crate::boot::BootResourceGrantAuthority::new(snapshot);
+    grants.bind_owner(domain, owner).unwrap();
+    let resources = DeviceResourceAuthority::<1>::new();
+    let rights =
+        deepwyrm_abi::dw_object_compatible_rights(deepwyrm_abi::DW_OBJECT_TYPE_DEVICE_RESOURCE);
+    let baseline_handles = tasks.process_handle_count(process).unwrap();
+
+    for failure in [
+        DeviceResourceClaimCommitFailure::Publication,
+        DeviceResourceClaimCommitFailure::PostPublication,
+    ] {
+        let operation = tasks.acquire_process_operation(process).unwrap();
+        assert_eq!(
+            device_resource_claim_under_operation(
+                &mut registry,
+                &mut tasks,
+                &grants,
+                &resources,
+                &operation,
+                process,
+                domain_cap,
+                101,
+                rights,
+                Some(failure),
+            ),
+            Err(DW_STATUS_NO_RESOURCES)
+        );
+        tasks.release_process_operation(operation).unwrap();
+        assert_eq!(
+            grants.state_for(101).unwrap().1,
+            crate::boot::BootResourceGrantState::Available
+        );
+        assert_eq!(resources.live_count(), 0);
+        assert_eq!(
+            tasks.process_handle_count(process).unwrap(),
+            baseline_handles
+        );
+    }
+
+    let operation = tasks.acquire_process_operation(process).unwrap();
+    let resource = device_resource_claim_under_operation(
+        &mut registry,
+        &mut tasks,
+        &grants,
+        &resources,
+        &operation,
+        process,
+        domain_cap,
+        101,
+        rights,
+        None,
+    )
+    .unwrap();
+    let final_release = tasks
+        .process_handles_mut_for_operation(&operation, process)
+        .unwrap()
+        .close(&mut registry, resource)
+        .unwrap()
+        .unwrap();
+    let finalization = resources.take_finalization(final_release).unwrap();
+    crate::device::complete_device_resource_finalization_with_grants(
+        &mut registry,
+        &grants,
+        finalization,
+    );
+    let mut cleanup = CleanupQueue::<16>::new();
+    cleanup.push_optional(
+        tasks
+            .process_handles_mut_for_operation(&operation, process)
+            .unwrap()
+            .close(&mut registry, domain_cap)
+            .unwrap(),
+    );
+    tasks.release_process_operation(operation).unwrap();
+    let effects = tasks
+        .terminate_process_authorized(&mut registry, process, 0x52)
+        .unwrap();
+    assert_eq!(effects.drained.final_release_count(), 0);
+    let (process_pin, thread_pins, retired_resources) = effects.pins.into_parts();
+    assert!(thread_pins.into_iter().flatten().next().is_none());
+    assert!(retired_resources.into_iter().flatten().next().is_none());
+    cleanup.push_optional(registry.release_internal(process_pin.unwrap()).unwrap());
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
 }
 
 #[test]

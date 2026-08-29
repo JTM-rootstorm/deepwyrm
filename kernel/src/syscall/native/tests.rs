@@ -7,7 +7,7 @@ fn args(values: [u64; 6]) -> RawSyscallArguments {
 }
 
 #[test]
-fn every_schema_active_through_f_has_a_typed_request() {
+fn every_schema_active_through_d1_has_a_typed_request() {
     let active = [
         DwKnownSyscall::AbiGetInfo,
         DwKnownSyscall::HandleClose,
@@ -39,6 +39,11 @@ fn every_schema_active_through_f_has_a_typed_request() {
         DwKnownSyscall::TimerCreate,
         DwKnownSyscall::TimerSet,
         DwKnownSyscall::TimerCancel,
+        DwKnownSyscall::DeviceResourceClaim,
+        DwKnownSyscall::DevicePioRead,
+        DwKnownSyscall::DevicePioWrite,
+        DwKnownSyscall::InterruptCreate,
+        DwKnownSyscall::InterruptAck,
     ];
     for syscall in active {
         assert!(
@@ -57,7 +62,7 @@ fn unknown_syscalls_remain_not_supported() {
 }
 
 #[test]
-fn d1_device_syscalls_remain_inactive_before_runtime_implementation() {
+fn d1_device_syscalls_decode_after_runtime_activation() {
     for syscall in [
         DwKnownSyscall::DeviceResourceClaim,
         DwKnownSyscall::DevicePioRead,
@@ -65,10 +70,7 @@ fn d1_device_syscalls_remain_inactive_before_runtime_implementation() {
         DwKnownSyscall::InterruptCreate,
         DwKnownSyscall::InterruptAck,
     ] {
-        assert_eq!(
-            decode_native(syscall.id(), args([0; 6])),
-            Err(DW_STATUS_NOT_SUPPORTED)
-        );
+        assert!(decode_native(syscall.id(), args([0; 6])).is_ok());
     }
 }
 

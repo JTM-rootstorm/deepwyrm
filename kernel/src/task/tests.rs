@@ -149,6 +149,41 @@ fn child_to_parent_lifetime_chain_finalizes_without_cycles() {
 }
 
 #[test]
+fn resource_claim_membership_is_exact_or_descendant_not_ancestor_possession() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (domain, domain_handle) = tasks
+        .create_child_group(&mut registry, &root_owner)
+        .unwrap();
+    let domain_parent = registry
+        .retain_internal_from_handle(&domain_handle)
+        .unwrap();
+    let (attempt, attempt_handle) = tasks
+        .create_child_group(&mut registry, &domain_parent)
+        .unwrap();
+    let attempt_parent = registry
+        .retain_internal_from_handle(&attempt_handle)
+        .unwrap();
+    let (process, _process_handle) = tasks
+        .create_process(&mut registry, &attempt_parent)
+        .unwrap();
+
+    let proof = tasks
+        .prepare_resource_claim_membership(process, domain)
+        .expect("descendant process belongs to exact resource domain");
+    assert_eq!(tasks.validate_resource_claim_membership(&proof), Ok(()));
+    let (unrelated, unrelated_owner) = tasks.create_root_group(&mut registry).unwrap();
+    assert_eq!(
+        tasks.prepare_resource_claim_membership(process, unrelated),
+        Err(ResourceClaimMembershipError::AccessDenied)
+    );
+    assert_ne!(root, domain);
+    assert_ne!(attempt, domain);
+    drop(unrelated_owner);
+}
+
+#[test]
 fn process_exit_drains_handles_and_records_per_thread_reason() {
     let mut registry = ObjectRegistry::<OBJECTS>::new();
     let mut tasks = Tasks::new();

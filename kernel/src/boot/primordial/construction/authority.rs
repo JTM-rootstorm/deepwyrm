@@ -28,7 +28,8 @@ use crate::wait::WaitRegistry;
 use super::{
     BOOTFS_RIGHTS, CHILD_CHANNEL_RIGHTS, INIT_BYTES, INITIAL_CAPABILITIES,
     PrimordialCapabilitySpec, PrimordialConstructionBackend, PrimordialLaunch,
-    PrimordialLoadSegment, PrimordialStackLayout, SELF_ROOT_RIGHTS, STACK_BYTES,
+    PrimordialLoadSegment, PrimordialStackLayout, RESOURCE_DOMAIN_TASK_GROUP_RIGHTS,
+    RESOURCE_INIT_BYTES, RESOURCE_INITIAL_CAPABILITIES, SELF_ROOT_RIGHTS, STACK_BYTES,
     STARTUP_BLOCK_BYTES,
 };
 
@@ -156,6 +157,8 @@ pub(crate) struct AuthorityPrimordialBackend<
     child_handle: Option<DwHandle>,
     bootfs: Option<HandleRef>,
     loader_task_group: Option<HandleRef>,
+    resource_domain: Option<HandleRef>,
+    resource_profile: bool,
     capability_stage_ready: bool,
     init_reservation: Option<ChannelSendReservation>,
     thread: Option<PreparedThread>,
@@ -246,6 +249,8 @@ where
             child_handle: None,
             bootfs: None,
             loader_task_group: None,
+            resource_domain: None,
+            resource_profile: false,
             capability_stage_ready: false,
             init_reservation: None,
             thread: None,
@@ -257,6 +262,37 @@ where
             process_monitor: None,
             committed_process_key: None,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_resource_domain(
+        platform: &'a mut P,
+        registry: &'a mut ObjectRegistry<REGISTRY_OBJECTS>,
+        memory: &'a mut MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
+        channels: &'a ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
+        waits: &'a WaitRegistry<WAITERS>,
+        tasks: &'a mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        spaces: &'a mut AddressSpaceAuthority<SPACES, REGIONS>,
+        regions: &'a mut AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
+        execution: &'a ExecutionDomain<EXECUTION>,
+        root_group_owner: &'a crate::object::InternalRef,
+        resource_domain: HandleRef,
+    ) -> Self {
+        let mut backend = Self::new(
+            platform,
+            registry,
+            memory,
+            channels,
+            waits,
+            tasks,
+            spaces,
+            regions,
+            execution,
+            root_group_owner,
+        );
+        backend.resource_domain = Some(resource_domain);
+        backend.resource_profile = true;
+        backend
     }
 
     fn process(&self) -> Result<&PreparedProcess, AuthorityPrimordialError<P::Error>> {
@@ -677,9 +713,14 @@ where
 
     fn stage_init_capabilities(
         &mut self,
-        capabilities: &[PrimordialCapabilitySpec; 3],
+        capabilities: &[PrimordialCapabilitySpec],
     ) -> Result<(), Self::Error> {
-        if capabilities != &INITIAL_CAPABILITIES {
+        let expected = if self.resource_profile {
+            RESOURCE_INITIAL_CAPABILITIES.as_slice()
+        } else {
+            INITIAL_CAPABILITIES.as_slice()
+        };
+        if capabilities != expected {
             return Err(AuthorityPrimordialError::State);
         }
         let retained = self
@@ -706,8 +747,13 @@ where
         Ok(())
     }
 
-    fn publish_init(&mut self, bytes: &[u8; 64]) -> Result<(), Self::Error> {
-        if bytes != &INIT_BYTES || !self.capability_stage_ready {
+    fn publish_init(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        let expected = if self.resource_profile {
+            RESOURCE_INIT_BYTES.as_slice()
+        } else {
+            INIT_BYTES.as_slice()
+        };
+        if bytes != expected || !self.capability_stage_ready {
             return Err(AuthorityPrimordialError::State);
         }
         let keys = self.channel_keys.ok_or(AuthorityPrimordialError::State)?;
@@ -797,7 +843,7 @@ where
                 )
             });
 
-        let mut stager = HandleTable::<3>::new();
+        let mut stager = HandleTable::<4>::new();
         let root_handle = stager
             .install(
                 root_reference,
@@ -818,7 +864,7 @@ where
                 super::LOADER_TASK_GROUP_RIGHTS,
             )
             .expect("fresh three-slot stager accepts TaskGroup capability");
-        let requests = [
+        let mut requests = [
             HandleMoveRequest {
                 handle: root_handle,
                 requested_rights: SELF_ROOT_RIGHTS,
@@ -831,9 +877,25 @@ where
                 handle: task_group_handle,
                 requested_rights: super::LOADER_TASK_GROUP_RIGHTS,
             },
+            HandleMoveRequest {
+                handle: deepwyrm_abi::DW_HANDLE_INVALID,
+                requested_rights: DwRights(0),
+            },
         ];
+        let request_count = if let Some(resource_domain) = self.resource_domain.take() {
+            let resource_handle = stager
+                .install(resource_domain, RESOURCE_DOMAIN_TASK_GROUP_RIGHTS)
+                .expect("fresh four-slot stager accepts resource-domain capability");
+            requests[3] = HandleMoveRequest {
+                handle: resource_handle,
+                requested_rights: RESOURCE_DOMAIN_TASK_GROUP_RIGHTS,
+            };
+            4
+        } else {
+            3
+        };
         let prepared = stager
-            .prepare_move_batch(&requests)
+            .prepare_move_batch(&requests[..request_count])
             .expect("validated primordial stager moves remain admissible");
         let (rollback, transfers) = prepared.extract();
         let wakes = match self.channels.commit_send(
@@ -946,6 +1008,15 @@ where
                     .expect("staged primordial TaskGroup reference releases")
                     .is_none(),
                 "live root TaskGroup finalized during primordial rollback"
+            );
+        }
+        if let Some(reference) = self.resource_domain.take() {
+            assert!(
+                self.registry
+                    .release_handle(reference)
+                    .expect("staged resource-domain TaskGroup reference releases")
+                    .is_none(),
+                "live resource-domain TaskGroup finalized during primordial rollback"
             );
         }
         if let Some(reference) = self.bootfs.take() {

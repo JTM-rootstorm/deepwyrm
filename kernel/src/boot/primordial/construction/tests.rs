@@ -74,8 +74,8 @@ struct HostBackend {
     stack_layout: Option<PrimordialStackLayout>,
     startup_object_offset: Option<u64>,
     startup: Option<[u8; STARTUP_BLOCK_BYTES]>,
-    capabilities: Option<[PrimordialCapabilitySpec; 3]>,
-    init: Option<[u8; 64]>,
+    capabilities: Option<Vec<PrimordialCapabilitySpec>>,
+    init: Option<Vec<u8>>,
     start: Option<[u64; 4]>,
 }
 
@@ -192,14 +192,14 @@ impl PrimordialConstructionBackend for HostBackend {
 
     fn stage_init_capabilities(
         &mut self,
-        capabilities: &[PrimordialCapabilitySpec; 3],
+        capabilities: &[PrimordialCapabilitySpec],
     ) -> Result<(), Self::Error> {
-        self.capabilities = Some(*capabilities);
+        self.capabilities = Some(capabilities.to_vec());
         self.boundary(PrimordialConstructionStage::CapabilityStaging)
     }
 
-    fn publish_init(&mut self, bytes: &[u8; 64]) -> Result<(), Self::Error> {
-        self.init = Some(*bytes);
+    fn publish_init(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.init = Some(bytes.to_vec());
         self.boundary(PrimordialConstructionStage::InitPublication)
     }
 
@@ -285,8 +285,8 @@ fn constructs_exact_startup_init_and_capability_contract_before_commit() {
     assert!(backend.committed);
     assert!(!backend.rolled_back);
     assert_eq!(launch, PrimordialLaunch);
-    assert_eq!(backend.init, Some(INIT_BYTES));
-    assert_eq!(backend.capabilities, Some(INITIAL_CAPABILITIES));
+    assert_eq!(backend.init, Some(INIT_BYTES.to_vec()));
+    assert_eq!(backend.capabilities, Some(INITIAL_CAPABILITIES.to_vec()));
     assert_eq!(
         INITIAL_CAPABILITIES,
         [
@@ -341,6 +341,44 @@ fn constructs_exact_startup_init_and_capability_contract_before_commit() {
     );
     assert_eq!(&startup[48..67], b"wyrmroot-bootstrap\0");
     assert!(startup[67..].iter().all(|byte| *byte == 0));
+}
+
+#[test]
+fn resource_domain_profile_adds_one_exact_role_without_changing_historical_init() {
+    let elf = elf_fixture();
+    let plan = parse_primordial_elf(&elf).unwrap();
+    let mut backend = HostBackend::new(0x1_0000_0011);
+    construct_primordial_with_profile(
+        &plan,
+        &elf,
+        b"bootfs",
+        PrimordialInitProfile::ResourceDomain,
+        &mut backend,
+        |_| false,
+    )
+    .unwrap();
+
+    assert_eq!(backend.init, Some(RESOURCE_INIT_BYTES.to_vec()));
+    assert_eq!(
+        backend.capabilities,
+        Some(RESOURCE_INITIAL_CAPABILITIES.to_vec())
+    );
+    assert_eq!(RESOURCE_INIT_BYTES.len(), 72);
+    assert_eq!(&RESOURCE_INIT_BYTES[..4], b"WRBP");
+    assert_eq!(&RESOURCE_INIT_BYTES[4..8], &[1, 0, 2, 0]);
+    assert_eq!(&RESOURCE_INIT_BYTES[16..20], &72_u32.to_le_bytes());
+    assert_eq!(&RESOURCE_INIT_BYTES[20..24], &4_u32.to_le_bytes());
+    assert_eq!(&RESOURCE_INIT_BYTES[64..68], &4_u32.to_le_bytes());
+    assert_eq!(
+        RESOURCE_INITIAL_CAPABILITIES[3],
+        PrimordialCapabilitySpec {
+            role: 4,
+            object_type: DW_OBJECT_TYPE_TASK_GROUP,
+            rights: RESOURCE_DOMAIN_TASK_GROUP_RIGHTS,
+        }
+    );
+    assert_eq!(INIT_BYTES.len(), 64);
+    assert_eq!(INITIAL_CAPABILITIES.len(), 3);
 }
 
 #[test]

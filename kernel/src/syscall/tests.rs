@@ -43,6 +43,14 @@ fn schema_known_syscalls_through_f_decode_without_private_number_tables() {
         (DW_SYSCALL_TIMER_CREATE, DwKnownSyscall::TimerCreate),
         (DW_SYSCALL_TIMER_SET, DwKnownSyscall::TimerSet),
         (DW_SYSCALL_TIMER_CANCEL, DwKnownSyscall::TimerCancel),
+        (
+            DW_SYSCALL_DEVICE_RESOURCE_CLAIM,
+            DwKnownSyscall::DeviceResourceClaim,
+        ),
+        (DW_SYSCALL_DEVICE_PIO_READ, DwKnownSyscall::DevicePioRead),
+        (DW_SYSCALL_DEVICE_PIO_WRITE, DwKnownSyscall::DevicePioWrite),
+        (DW_SYSCALL_INTERRUPT_CREATE, DwKnownSyscall::InterruptCreate),
+        (DW_SYSCALL_INTERRUPT_ACK, DwKnownSyscall::InterruptAck),
     ] {
         let decoded = decode(id, ARGUMENTS).unwrap();
         assert_eq!(decoded.identity(), expected);
@@ -62,7 +70,7 @@ fn unknown_syscalls_fail_with_not_supported() {
 }
 
 #[test]
-fn d1_device_identities_are_known_but_inactive_through_the_current_runtime() {
+fn d1_device_identities_are_active_through_the_current_runtime() {
     for id in [
         DW_SYSCALL_DEVICE_RESOURCE_CLAIM,
         DW_SYSCALL_DEVICE_PIO_READ,
@@ -71,7 +79,7 @@ fn d1_device_identities_are_known_but_inactive_through_the_current_runtime() {
         DW_SYSCALL_INTERRUPT_ACK,
     ] {
         assert!(DwKnownSyscall::from_id(id).is_some());
-        assert_eq!(decode(id, ARGUMENTS), Err(DW_STATUS_NOT_SUPPORTED));
+        assert!(decode(id, ARGUMENTS).is_ok());
     }
 }
 

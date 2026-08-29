@@ -170,6 +170,10 @@ pub(crate) use boot_grant::BootResourceGrantState;
 pub(crate) use boot_grant::{
     BootResourceDescriptor, BootResourceGrantError, BootResourceGrants, MAX_BOOT_RESOURCE_GRANTS,
 };
+#[cfg(deepwyrm_integrated)]
+pub(crate) use boot_grant::{
+    BootResourceGrantAuthority, BootResourceLeaseError, BootResourceLeaseReservation,
+};
 
 /// Owned, one-snapshot structural interpretation of the loader's internal
 /// paging carrier.

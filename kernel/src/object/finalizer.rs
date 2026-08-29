@@ -11,7 +11,8 @@ use deepwyrm_abi::{
 
 use crate::device::{
     DeviceResourceFinalizer, InterruptFinalizer, InterruptPlatform,
-    complete_device_resource_finalization, complete_interrupt_finalization,
+    complete_device_resource_finalization, complete_device_resource_finalization_with_grants,
+    complete_interrupt_finalization,
 };
 use crate::ipc::{ChannelAuthority, complete_channel_finalization};
 use crate::memory::address_region::{
@@ -60,6 +61,7 @@ pub(crate) struct PayloadFinalizer<
     spaces: &'a mut AddressSpaceAuthority<SPACES, REGIONS>,
     regions: &'a mut AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
     device_resources: Option<&'a dyn DeviceResourceFinalizer>,
+    boot_resource_grants: Option<&'a crate::boot::BootResourceGrantAuthority>,
     interrupts: Option<&'a dyn InterruptFinalizer>,
     interrupt_platform: Option<&'a dyn InterruptPlatform>,
 }
@@ -137,6 +139,7 @@ impl<
             spaces,
             regions,
             device_resources: None,
+            boot_resource_grants: None,
             interrupts: None,
             interrupt_platform: None,
         }
@@ -147,6 +150,14 @@ impl<
         device_resources: &'a dyn DeviceResourceFinalizer,
     ) -> Self {
         self.device_resources = Some(device_resources);
+        self
+    }
+
+    pub(crate) fn with_boot_resource_grants(
+        mut self,
+        grants: &'a crate::boot::BootResourceGrantAuthority,
+    ) -> Self {
+        self.boot_resource_grants = Some(grants);
         self
     }
 
@@ -260,7 +271,15 @@ impl<
                     .unwrap_or_else(|(error, _)| {
                         panic!("DeviceResource final release bypassed its typed payload: {error:?}")
                     });
-                complete_device_resource_finalization(self.registry, finalization);
+                if let Some(grants) = self.boot_resource_grants {
+                    complete_device_resource_finalization_with_grants(
+                        self.registry,
+                        grants,
+                        finalization,
+                    );
+                } else {
+                    complete_device_resource_finalization(self.registry, finalization);
+                }
                 WakeBatch::empty()
             }
             DW_OBJECT_TYPE_INTERRUPT => {

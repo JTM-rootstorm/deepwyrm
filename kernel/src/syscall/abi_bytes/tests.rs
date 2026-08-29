@@ -17,13 +17,20 @@ use deepwyrm_abi::{
 #[test]
 fn abi_info_encoding_is_padding_free_and_exact() {
     assert_eq!(DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT, 1);
-    let bytes = encode_abi_info();
+    let bytes = encode_abi_info(DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT);
     assert_eq!(bytes.len(), 64);
     assert_eq!(&bytes[0..4], &64_u32.to_le_bytes());
     assert_eq!(&bytes[8..12], &DW_ABI_VERSION.to_le_bytes());
     assert_eq!(&bytes[12..16], &DW_BASE_PAGE_SIZE.to_le_bytes());
-    assert_eq!(&bytes[16..24], &[0; 8]);
+    assert_eq!(
+        &bytes[16..24],
+        &DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT.to_le_bytes()
+    );
     assert_eq!(&bytes[32..64], &[0; 32]);
+
+    let historical = encode_abi_info(0);
+    assert_eq!(&historical[16..24], &0_u64.to_le_bytes());
+    assert_eq!(&historical[32..64], &[0; 32]);
 }
 
 #[test]

@@ -29,6 +29,14 @@ const INIT_BYTES: [u8; 64] = [
     0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
+const RESOURCE_INIT_BYTES: [u8; 72] = [
+    0x57, 0x52, 0x42, 0x50, 0x01, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x48, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
 const READY_BYTES: [u8; 40] = [
     0x57, 0x52, 0x42, 0x50, 0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -48,6 +56,13 @@ const BOOTFS_RIGHTS: DwRights = DwRights(
 );
 const LOADER_TASK_GROUP_RIGHTS: DwRights =
     DwRights(DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0 | DW_RIGHT_DUPLICATE.0 | DW_RIGHT_TRANSFER.0);
+const RESOURCE_DOMAIN_TASK_GROUP_RIGHTS: DwRights = DwRights(
+    DW_RIGHT_MODIFY.0
+        | DW_RIGHT_INSPECT.0
+        | DW_RIGHT_DUPLICATE.0
+        | DW_RIGHT_TRANSFER.0
+        | deepwyrm_abi::DW_RIGHT_RESOURCE.0,
+);
 
 /// One exact capability descriptor transferred in `BOOTSTRAP_INIT_V1`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +89,23 @@ const INITIAL_CAPABILITIES: [PrimordialCapabilitySpec; 3] = [
         rights: LOADER_TASK_GROUP_RIGHTS,
     },
 ];
+
+const RESOURCE_INITIAL_CAPABILITIES: [PrimordialCapabilitySpec; 4] = [
+    INITIAL_CAPABILITIES[0],
+    INITIAL_CAPABILITIES[1],
+    INITIAL_CAPABILITIES[2],
+    PrimordialCapabilitySpec {
+        role: 4,
+        object_type: DW_OBJECT_TYPE_TASK_GROUP,
+        rights: RESOURCE_DOMAIN_TASK_GROUP_RIGHTS,
+    },
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PrimordialInitProfile {
+    Historical,
+    ResourceDomain,
+}
 
 /// Deterministic guarded-stack placement and startup-block location.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,9 +186,9 @@ pub(crate) trait PrimordialConstructionBackend {
     ) -> Result<(), Self::Error>;
     fn stage_init_capabilities(
         &mut self,
-        capabilities: &[PrimordialCapabilitySpec; 3],
+        capabilities: &[PrimordialCapabilitySpec],
     ) -> Result<(), Self::Error>;
-    fn publish_init(&mut self, bytes: &[u8; 64]) -> Result<(), Self::Error>;
+    fn publish_init(&mut self, bytes: &[u8]) -> Result<(), Self::Error>;
     fn create_initial_thread(
         &mut self,
         entry: u64,
@@ -180,6 +212,28 @@ pub(crate) fn construct_primordial<B, I>(
     plan: &PrimordialElfLoadPlan,
     bootstrap: &[u8],
     bootfs: &[u8],
+    backend: &mut B,
+    inject: I,
+) -> Result<PrimordialLaunch, PrimordialConstructionError<B::Error>>
+where
+    B: PrimordialConstructionBackend,
+    I: FnMut(PrimordialConstructionStage) -> bool,
+{
+    construct_primordial_with_profile(
+        plan,
+        bootstrap,
+        bootfs,
+        PrimordialInitProfile::Historical,
+        backend,
+        inject,
+    )
+}
+
+pub(crate) fn construct_primordial_with_profile<B, I>(
+    plan: &PrimordialElfLoadPlan,
+    bootstrap: &[u8],
+    bootfs: &[u8],
+    profile: PrimordialInitProfile,
     backend: &mut B,
     mut inject: I,
 ) -> Result<PrimordialLaunch, PrimordialConstructionError<B::Error>>
@@ -285,13 +339,23 @@ where
         backend,
         PrimordialConstructionStage::CapabilityStaging,
         &mut inject,
-        |backend| backend.stage_init_capabilities(&INITIAL_CAPABILITIES),
+        |backend| match profile {
+            PrimordialInitProfile::Historical => {
+                backend.stage_init_capabilities(&INITIAL_CAPABILITIES)
+            }
+            PrimordialInitProfile::ResourceDomain => {
+                backend.stage_init_capabilities(&RESOURCE_INITIAL_CAPABILITIES)
+            }
+        },
     )?;
     step(
         backend,
         PrimordialConstructionStage::InitPublication,
         &mut inject,
-        |backend| backend.publish_init(&INIT_BYTES),
+        |backend| match profile {
+            PrimordialInitProfile::Historical => backend.publish_init(&INIT_BYTES),
+            PrimordialInitProfile::ResourceDomain => backend.publish_init(&RESOURCE_INIT_BYTES),
+        },
     )?;
     step(
         backend,

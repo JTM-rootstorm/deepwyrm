@@ -159,6 +159,32 @@ pub(crate) enum NativeSyscallRequest {
     TimerCancel {
         timer: DwHandle,
     },
+    DeviceResourceClaim {
+        resource_domain: DwHandle,
+        resource_id: u64,
+        requested_rights: DwRights,
+        out_resource: DwUserAddress,
+    },
+    DevicePioRead {
+        resource: DwHandle,
+        offset: u32,
+        width: u32,
+        out_value: DwUserAddress,
+    },
+    DevicePioWrite {
+        resource: DwHandle,
+        offset: u32,
+        width: u32,
+        value: u32,
+    },
+    InterruptCreate {
+        resource: DwHandle,
+        requested_rights: DwRights,
+        out_interrupt: DwUserAddress,
+    },
+    InterruptAck {
+        interrupt: DwHandle,
+    },
 }
 
 fn u32_arg(value: u64) -> Result<u32, DwStatus> {
@@ -327,11 +353,32 @@ fn decode_decoded(decoded: DecodedSyscall) -> Result<NativeSyscallRequest, DwSta
         DwKnownSyscall::TimerCancel => NativeSyscallRequest::TimerCancel {
             timer: DwHandle(a[0]),
         },
-        DwKnownSyscall::DeviceResourceClaim
-        | DwKnownSyscall::DevicePioRead
-        | DwKnownSyscall::DevicePioWrite
-        | DwKnownSyscall::InterruptCreate
-        | DwKnownSyscall::InterruptAck => return Err(DW_STATUS_NOT_SUPPORTED),
+        DwKnownSyscall::DeviceResourceClaim => NativeSyscallRequest::DeviceResourceClaim {
+            resource_domain: DwHandle(a[0]),
+            resource_id: a[1],
+            requested_rights: DwRights(a[2]),
+            out_resource: DwUserAddress(a[3]),
+        },
+        DwKnownSyscall::DevicePioRead => NativeSyscallRequest::DevicePioRead {
+            resource: DwHandle(a[0]),
+            offset: u32_arg(a[1])?,
+            width: u32_arg(a[2])?,
+            out_value: DwUserAddress(a[3]),
+        },
+        DwKnownSyscall::DevicePioWrite => NativeSyscallRequest::DevicePioWrite {
+            resource: DwHandle(a[0]),
+            offset: u32_arg(a[1])?,
+            width: u32_arg(a[2])?,
+            value: u32_arg(a[3])?,
+        },
+        DwKnownSyscall::InterruptCreate => NativeSyscallRequest::InterruptCreate {
+            resource: DwHandle(a[0]),
+            requested_rights: DwRights(a[1]),
+            out_interrupt: DwUserAddress(a[2]),
+        },
+        DwKnownSyscall::InterruptAck => NativeSyscallRequest::InterruptAck {
+            interrupt: DwHandle(a[0]),
+        },
     };
     Ok(request)
 }
@@ -571,6 +618,44 @@ pub(crate) trait NativeSyscallServices {
     fn timer_cancel(&mut self, _timer: DwHandle) -> NativeSyscallResult {
         unsupported_f()
     }
+    fn device_resource_claim(
+        &mut self,
+        _resource_domain: DwHandle,
+        _resource_id: u64,
+        _requested_rights: DwRights,
+        _out_resource: DwUserAddress,
+    ) -> NativeSyscallResult {
+        unsupported_f()
+    }
+    fn device_pio_read(
+        &mut self,
+        _resource: DwHandle,
+        _offset: u32,
+        _width: u32,
+        _out_value: DwUserAddress,
+    ) -> NativeSyscallResult {
+        unsupported_f()
+    }
+    fn device_pio_write(
+        &mut self,
+        _resource: DwHandle,
+        _offset: u32,
+        _width: u32,
+        _value: u32,
+    ) -> NativeSyscallResult {
+        unsupported_f()
+    }
+    fn interrupt_create(
+        &mut self,
+        _resource: DwHandle,
+        _requested_rights: DwRights,
+        _out_interrupt: DwUserAddress,
+    ) -> NativeSyscallResult {
+        unsupported_f()
+    }
+    fn interrupt_ack(&mut self, _interrupt: DwHandle) -> NativeSyscallResult {
+        unsupported_f()
+    }
 }
 
 const fn unsupported_f() -> NativeSyscallResult {
@@ -728,6 +813,35 @@ impl<T: NativeSyscallServices> NativeSyscallHandler for T {
             } => self.timer_create(requested_rights, out_timer),
             NativeSyscallRequest::TimerSet { timer, deadline } => self.timer_set(timer, deadline),
             NativeSyscallRequest::TimerCancel { timer } => self.timer_cancel(timer),
+            NativeSyscallRequest::DeviceResourceClaim {
+                resource_domain,
+                resource_id,
+                requested_rights,
+                out_resource,
+            } => self.device_resource_claim(
+                resource_domain,
+                resource_id,
+                requested_rights,
+                out_resource,
+            ),
+            NativeSyscallRequest::DevicePioRead {
+                resource,
+                offset,
+                width,
+                out_value,
+            } => self.device_pio_read(resource, offset, width, out_value),
+            NativeSyscallRequest::DevicePioWrite {
+                resource,
+                offset,
+                width,
+                value,
+            } => self.device_pio_write(resource, offset, width, value),
+            NativeSyscallRequest::InterruptCreate {
+                resource,
+                requested_rights,
+                out_interrupt,
+            } => self.interrupt_create(resource, requested_rights, out_interrupt),
+            NativeSyscallRequest::InterruptAck { interrupt } => self.interrupt_ack(interrupt),
         }
     }
 }

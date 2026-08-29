@@ -69,15 +69,18 @@ pub(crate) use adapters::{NoTerminalWaitCleanup, abi_get_info};
 pub(crate) use adapters::{
     PreparedProcessTermination, PreparedTaskGroupTermination, PreparedThreadTermination,
     address_region_map_prepared_model, address_region_protect_prepared,
-    address_region_unmap_prepared, complete_deferred_current_reclaim_on,
+    address_region_unmap_prepared, abi_get_info_with_features,
+    complete_deferred_current_reclaim_on,
     complete_prepared_process_termination_after_remote_stops_on,
     complete_prepared_task_group_termination_after_remote_stops_on,
     complete_prepared_thread_termination_after_remote_stops_on, complete_wait_wakes,
-    decode_map_args, handle_close, handle_duplicate, inspect_process_termination_threads,
-    inspect_task_group_termination_threads, inspect_thread_termination_threads, object_get_info_v1,
-    object_get_info_v1_with_devices, prepare_address_region_mutation, prepare_process_exit,
-    prepare_process_terminate, prepare_process_unhandled_exception, prepare_task_group_terminate,
-    prepare_thread_terminate, process_exit_on, process_unhandled_exception_on, task_group_create,
+    decode_map_args, device_pio_read, device_pio_write, device_resource_claim, handle_close,
+    handle_duplicate, inspect_process_termination_threads, inspect_task_group_termination_threads,
+    inspect_thread_termination_threads, interrupt_ack, interrupt_create, object_get_info_v1,
+    object_get_info_v1_with_device_objects, object_get_info_v1_with_devices,
+    prepare_address_region_mutation, prepare_process_exit, prepare_process_terminate,
+    prepare_process_unhandled_exception, prepare_task_group_terminate, prepare_thread_terminate,
+    process_exit_on, process_unhandled_exception_on, task_group_create,
 };
 #[cfg(all(
     not(deepwyrm_integrated),
@@ -91,7 +94,7 @@ use deepwyrm_abi::{
     DW_STATUS_NOT_SUPPORTED, DwKnownSyscall, DwStatus, DwSyscallId, DwSyscallImplementationPhase,
 };
 
-const ACTIVE_PHASE: DwSyscallImplementationPhase = DwSyscallImplementationPhase::Dw0F;
+const ACTIVE_PHASE: DwSyscallImplementationPhase = DwSyscallImplementationPhase::Dw1D;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RawSyscallArguments([u64; 6]);

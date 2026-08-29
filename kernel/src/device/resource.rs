@@ -85,6 +85,15 @@ impl DeviceResourceCleanup {
 
 pub(crate) struct DeviceResourceFinalization {
     final_release: FinalRelease,
+    grant: Option<DeviceResourceGrantLease>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DeviceResourceGrantLease {
+    pub(crate) resource_id: u64,
+    pub(crate) grant_generation: u64,
+    pub(crate) lease_generation: u64,
+    pub(crate) object: ObjectId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,6 +107,7 @@ struct DeviceResourceRecord {
     object: ObjectId,
     descriptor: DeviceResourceDescriptor,
     state: DeviceResourceState,
+    grant: Option<DeviceResourceGrantLease>,
 }
 
 pub(crate) trait DeviceResourceFinalizer {
@@ -146,7 +156,7 @@ impl<const RESOURCES: usize> DeviceResourceAuthority<RESOURCES> {
                 return Err(DeviceResourceCreateError::Registry(error));
             }
         };
-        let binding = match self.bind(creation, descriptor) {
+        let binding = match self.bind(creation, descriptor, None) {
             Ok(binding) => binding,
             Err((error, creation)) => {
                 registry
@@ -212,10 +222,33 @@ impl<const RESOURCES: usize> DeviceResourceAuthority<RESOURCES> {
         }
     }
 
+    pub(crate) fn bind_claim(
+        &self,
+        creation: CreationRef,
+        descriptor: DeviceResourceDescriptor,
+        grant_generation: u64,
+    ) -> Result<DeviceResourceBinding, (DeviceResourceError, CreationRef)> {
+        if grant_generation == 0 {
+            return Err((DeviceResourceError::InvalidDescriptor, creation));
+        }
+        let object = creation.id();
+        self.bind(
+            creation,
+            descriptor,
+            Some(DeviceResourceGrantLease {
+                resource_id: descriptor.resource_id,
+                grant_generation,
+                lease_generation: descriptor.lease_generation,
+                object,
+            }),
+        )
+    }
+
     fn bind(
         &self,
         creation: CreationRef,
         descriptor: DeviceResourceDescriptor,
+        grant: Option<DeviceResourceGrantLease>,
     ) -> Result<DeviceResourceBinding, (DeviceResourceError, CreationRef)> {
         if creation.object_type() != DW_OBJECT_TYPE_DEVICE_RESOURCE {
             return Err((DeviceResourceError::InvalidObject, creation));
@@ -238,6 +271,7 @@ impl<const RESOURCES: usize> DeviceResourceAuthority<RESOURCES> {
             object: key.object_id(),
             descriptor,
             state: DeviceResourceState::Live,
+            grant,
         });
         Ok(DeviceResourceBinding { creation, key })
     }
@@ -357,12 +391,56 @@ impl<const RESOURCES: usize> DeviceResourceFinalizer for DeviceResourceAuthority
             return Err((DeviceResourceError::FinalizationMismatch, final_release));
         }
         resource.state = DeviceResourceState::Finalizing;
+        let grant = resource.grant;
         *slot = None;
-        Ok(DeviceResourceFinalization { final_release })
+        Ok(DeviceResourceFinalization {
+            final_release,
+            grant,
+        })
     }
 }
 
 pub(crate) fn complete_device_resource_finalization<const OBJECTS: usize>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    finalization: DeviceResourceFinalization,
+) {
+    assert!(
+        finalization.grant.is_none(),
+        "boot-backed DeviceResource requires grant-aware finalization"
+    );
+    complete_device_resource_payload_finalization(registry, finalization);
+}
+
+pub(crate) fn complete_device_resource_finalization_with_grants<const OBJECTS: usize>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    grants: &crate::boot::BootResourceGrantAuthority,
+    finalization: DeviceResourceFinalization,
+) {
+    if let Some(grant) = finalization.grant {
+        grants
+            .release_lease(
+                grant.resource_id,
+                grant.grant_generation,
+                grant.object,
+                grant.lease_generation,
+            )
+            .unwrap_or_else(|error| panic!("DeviceResource grant return drifted: {error:?}"));
+    }
+    complete_device_resource_payload_finalization(registry, finalization);
+}
+
+pub(crate) fn cancel_unpublished_device_resource_claim<const OBJECTS: usize>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    finalization: DeviceResourceFinalization,
+) {
+    assert!(
+        finalization.grant.is_some(),
+        "claim rollback requires exact reserved grant identity"
+    );
+    complete_device_resource_payload_finalization(registry, finalization);
+}
+
+fn complete_device_resource_payload_finalization<const OBJECTS: usize>(
     registry: &mut ObjectRegistry<OBJECTS>,
     finalization: DeviceResourceFinalization,
 ) {

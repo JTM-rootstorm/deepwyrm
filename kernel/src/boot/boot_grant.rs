@@ -2,6 +2,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use deepwyrm_abi::DwDeviceResourceKind;
 
+use crate::object::{InternalRef, ObjectId};
+use crate::sync::SpinMutex;
+#[cfg(deepwyrm_integrated)]
+use crate::task::TaskGroupKey;
+
 pub(crate) const MAX_BOOT_RESOURCE_GRANTS: usize = 8;
 
 static NEXT_GRANT_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -20,6 +25,13 @@ pub(crate) struct BootResourceDescriptor {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BootResourceGrantState {
     Available,
+    Reserved {
+        lease_generation: u64,
+    },
+    Leased {
+        object: ObjectId,
+        lease_generation: u64,
+    },
 }
 
 /// One kernel-internal grant. D5 supplies its owner and lease transition.
@@ -114,7 +126,6 @@ impl BootResourceGrants {
         self.count
     }
 
-    #[cfg(test)]
     pub(crate) const fn is_empty(self) -> bool {
         self.count == 0
     }
@@ -128,9 +139,251 @@ impl BootResourceGrants {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "owner binding is consumed by the freestanding primordial profile"
+)]
+#[cfg(deepwyrm_integrated)]
+pub(crate) enum BootResourceLeaseError {
+    OwnerAlreadyBound,
+    OwnerNotBound,
+    UnknownResource,
+    AlreadyLeased,
+    GenerationExhausted,
+    StaleReservation,
+    FinalizationMismatch,
+}
+
+#[must_use = "a reserved boot-resource grant must be committed or cancelled"]
+#[cfg(deepwyrm_integrated)]
+pub(crate) struct BootResourceLeaseReservation {
+    resource_id: u64,
+    grant_generation: u64,
+    lease_generation: u64,
+}
+
+#[cfg(deepwyrm_integrated)]
+impl BootResourceLeaseReservation {
+    pub(crate) const fn grant_generation(&self) -> u64 {
+        self.grant_generation
+    }
+
+    pub(crate) const fn lease_generation(&self) -> u64 {
+        self.lease_generation
+    }
+}
+
+#[cfg(deepwyrm_integrated)]
+struct BootResourceGrantAuthorityState {
+    grants: BootResourceGrants,
+    owner: Option<(TaskGroupKey, InternalRef)>,
+    next_lease_generation: u64,
+}
+
+/// Kernel-lifetime owner of validated boot grants and their exact leases.
+#[cfg(deepwyrm_integrated)]
+pub(crate) struct BootResourceGrantAuthority {
+    state: SpinMutex<BootResourceGrantAuthorityState>,
+}
+
+#[cfg(deepwyrm_integrated)]
+impl BootResourceGrantAuthority {
+    #[allow(
+        dead_code,
+        reason = "constructed by the freestanding primordial runtime and focused host tests"
+    )]
+    pub(crate) fn new(grants: BootResourceGrants) -> Self {
+        Self {
+            state: SpinMutex::new(BootResourceGrantAuthorityState {
+                grants,
+                owner: None,
+                next_lease_generation: 1,
+            }),
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed by the freestanding primordial profile selector"
+    )]
+    pub(crate) fn has_grants(&self) -> bool {
+        !self.state.lock().grants.is_empty()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "bound by the freestanding primordial resource-domain constructor"
+    )]
+    pub(crate) fn bind_owner(
+        &self,
+        key: TaskGroupKey,
+        owner: InternalRef,
+    ) -> Result<(), (BootResourceLeaseError, InternalRef)> {
+        if owner.id() != key.object_id()
+            || owner.object_type() != deepwyrm_abi::DW_OBJECT_TYPE_TASK_GROUP
+        {
+            return Err((BootResourceLeaseError::FinalizationMismatch, owner));
+        }
+        let mut state = self.state.lock();
+        if state.owner.is_some() {
+            return Err((BootResourceLeaseError::OwnerAlreadyBound, owner));
+        }
+        state.owner = Some((key, owner));
+        Ok(())
+    }
+
+    pub(crate) fn owner_key(&self) -> Result<TaskGroupKey, BootResourceLeaseError> {
+        self.state
+            .lock()
+            .owner
+            .as_ref()
+            .map(|(key, _)| *key)
+            .ok_or(BootResourceLeaseError::OwnerNotBound)
+    }
+
+    pub(crate) fn reserve(
+        &self,
+        resource_id: u64,
+    ) -> Result<(BootResourceDescriptor, BootResourceLeaseReservation), BootResourceLeaseError>
+    {
+        let mut state = self.state.lock();
+        if state.owner.is_none() {
+            return Err(BootResourceLeaseError::OwnerNotBound);
+        }
+        let index = (0..state.grants.count)
+            .find(|index| {
+                state.grants.grants[*index]
+                    .is_some_and(|grant| grant.descriptor.resource_id == resource_id)
+            })
+            .ok_or(BootResourceLeaseError::UnknownResource)?;
+        let grant = state.grants.grants[index]
+            .as_ref()
+            .expect("matched boot-resource grant remains populated");
+        if grant.state != BootResourceGrantState::Available {
+            return Err(BootResourceLeaseError::AlreadyLeased);
+        }
+        let descriptor = grant.descriptor;
+        let grant_generation = grant.grant_generation;
+        let lease_generation = state.next_lease_generation;
+        if lease_generation == 0 {
+            return Err(BootResourceLeaseError::GenerationExhausted);
+        }
+        state.next_lease_generation = lease_generation
+            .checked_add(1)
+            .filter(|next| *next != 0)
+            .ok_or(BootResourceLeaseError::GenerationExhausted)?;
+        state.grants.grants[index]
+            .as_mut()
+            .expect("matched boot-resource grant remains populated")
+            .state = BootResourceGrantState::Reserved { lease_generation };
+        Ok((
+            descriptor,
+            BootResourceLeaseReservation {
+                resource_id,
+                grant_generation,
+                lease_generation,
+            },
+        ))
+    }
+
+    pub(crate) fn cancel(
+        &self,
+        reservation: BootResourceLeaseReservation,
+    ) -> Result<(), BootResourceLeaseError> {
+        let mut state = self.state.lock();
+        let grant = exact_grant_mut(&mut state.grants, &reservation)
+            .ok_or(BootResourceLeaseError::StaleReservation)?;
+        if grant.state
+            != (BootResourceGrantState::Reserved {
+                lease_generation: reservation.lease_generation,
+            })
+        {
+            return Err(BootResourceLeaseError::StaleReservation);
+        }
+        grant.state = BootResourceGrantState::Available;
+        Ok(())
+    }
+
+    /// Infallible after exact reservation validation at the claim commit point.
+    pub(crate) fn commit(&self, reservation: BootResourceLeaseReservation, object: ObjectId) {
+        let mut state = self.state.lock();
+        let grant = exact_grant_mut(&mut state.grants, &reservation)
+            .expect("boot-resource lease reservation remained exact until commit");
+        assert_eq!(
+            grant.state,
+            BootResourceGrantState::Reserved {
+                lease_generation: reservation.lease_generation,
+            },
+            "boot-resource lease reservation drifted before commit"
+        );
+        grant.state = BootResourceGrantState::Leased {
+            object,
+            lease_generation: reservation.lease_generation,
+        };
+    }
+
+    pub(crate) fn release_lease(
+        &self,
+        resource_id: u64,
+        grant_generation: u64,
+        object: ObjectId,
+        lease_generation: u64,
+    ) -> Result<(), BootResourceLeaseError> {
+        let mut state = self.state.lock();
+        let count = state.grants.count;
+        let grant = state.grants.grants[..count]
+            .iter_mut()
+            .flatten()
+            .find(|grant| {
+                grant.descriptor.resource_id == resource_id
+                    && grant.grant_generation == grant_generation
+            })
+            .ok_or(BootResourceLeaseError::FinalizationMismatch)?;
+        if grant.state
+            != (BootResourceGrantState::Leased {
+                object,
+                lease_generation,
+            })
+        {
+            return Err(BootResourceLeaseError::FinalizationMismatch);
+        }
+        grant.state = BootResourceGrantState::Available;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn state_for(&self, resource_id: u64) -> Option<(u64, BootResourceGrantState)> {
+        let state = self.state.lock();
+        state.grants.grants[..state.grants.count]
+            .iter()
+            .flatten()
+            .find(|grant| grant.descriptor.resource_id == resource_id)
+            .map(|grant| (grant.grant_generation, grant.state))
+    }
+}
+
+#[cfg(deepwyrm_integrated)]
+fn exact_grant_mut<'a>(
+    grants: &'a mut BootResourceGrants,
+    reservation: &BootResourceLeaseReservation,
+) -> Option<&'a mut BootResourceGrant> {
+    grants.grants[..grants.count]
+        .iter_mut()
+        .flatten()
+        .find(|grant| {
+            grant.descriptor.resource_id == reservation.resource_id
+                && grant.grant_generation == reservation.grant_generation
+        })
+}
+
 #[cfg(test)]
 mod tests {
-    use deepwyrm_abi::DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT;
+    use crate::object::ObjectRegistry;
+    use crate::task::TaskAuthority;
+    use deepwyrm_abi::{
+        DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT, DW_OBJECT_TYPE_EVENT,
+    };
 
     use super::*;
 
@@ -166,5 +419,76 @@ mod tests {
         let grants = BootResourceGrants::materialize(&[]).expect("empty grant set");
         assert!(grants.is_empty());
         assert_eq!(grants.grant(0), None);
+    }
+
+    #[test]
+    fn exact_owner_lease_reclaims_and_mints_a_fresh_generation() {
+        let grants = BootResourceGrants::materialize(&[descriptor(7)]).unwrap();
+        let authority = BootResourceGrantAuthority::new(grants);
+        let mut registry = ObjectRegistry::<4>::new();
+        let mut tasks = TaskAuthority::<2, 1, 1, 1>::new();
+        let (domain, owner) = tasks.create_root_group(&mut registry).unwrap();
+        authority.bind_owner(domain, owner).unwrap();
+
+        let (_descriptor, first) = authority.reserve(7).unwrap();
+        let first_generation = first.lease_generation();
+        let grant_generation = first.grant_generation();
+        assert_eq!(
+            authority.state_for(7),
+            Some((
+                grant_generation,
+                BootResourceGrantState::Reserved {
+                    lease_generation: first_generation,
+                },
+            ))
+        );
+        let creation = registry.create(DW_OBJECT_TYPE_EVENT).unwrap();
+        let object = creation.id();
+        authority.commit(first, object);
+        assert_eq!(
+            authority.reserve(7).err(),
+            Some(BootResourceLeaseError::AlreadyLeased)
+        );
+        authority
+            .release_lease(7, grant_generation, object, first_generation)
+            .unwrap();
+        registry.cancel_creation(creation).unwrap();
+
+        let (_, second) = authority.reserve(7).unwrap();
+        assert_ne!(second.lease_generation(), first_generation);
+        authority.cancel(second).unwrap();
+        assert_eq!(
+            authority.state_for(7),
+            Some((grant_generation, BootResourceGrantState::Available))
+        );
+    }
+
+    #[test]
+    fn stale_or_wrong_finalization_cannot_free_a_live_lease() {
+        let authority = BootResourceGrantAuthority::new(
+            BootResourceGrants::materialize(&[descriptor(9)]).unwrap(),
+        );
+        let mut registry = ObjectRegistry::<4>::new();
+        let mut tasks = TaskAuthority::<1, 1, 1, 1>::new();
+        let (domain, owner) = tasks.create_root_group(&mut registry).unwrap();
+        authority.bind_owner(domain, owner).unwrap();
+        let (_, reservation) = authority.reserve(9).unwrap();
+        let grant_generation = reservation.grant_generation();
+        let lease_generation = reservation.lease_generation();
+        let creation = registry.create(DW_OBJECT_TYPE_EVENT).unwrap();
+        let object = creation.id();
+        authority.commit(reservation, object);
+        assert_eq!(
+            authority.release_lease(9, grant_generation, object, lease_generation + 1),
+            Err(BootResourceLeaseError::FinalizationMismatch)
+        );
+        assert_eq!(
+            authority.reserve(9).err(),
+            Some(BootResourceLeaseError::AlreadyLeased)
+        );
+        authority
+            .release_lease(9, grant_generation, object, lease_generation)
+            .unwrap();
+        registry.cancel_creation(creation).unwrap();
     }
 }

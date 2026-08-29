@@ -22,7 +22,6 @@ use crate::boot::primordial::construction::authority::{
 use crate::boot::primordial::construction::validate_primordial_retirement_facts;
 use crate::boot::primordial::construction::{
     PrimordialCompletionBackend, PrimordialExitDisposition, complete_primordial_launch,
-    construct_primordial,
 };
 use crate::ipc::{ChannelAuthority, ChannelError};
 use crate::memory::address_region::{
@@ -779,11 +778,7 @@ static BOOTFS_BYTES: ByteStorage<MAX_BOOTFS_BYTES> = ByteStorage::new();
 struct PrimordialRuntimeShared {
     execution: ExecutionDomain<EXECUTION_THREADS>,
     channels: Channels,
-    #[allow(
-        dead_code,
-        reason = "D4 persists unclaimed boot grants for D5 resource-domain binding"
-    )]
-    boot_resource_grants: crate::boot::BootResourceGrants,
+    boot_resource_grants: crate::boot::BootResourceGrantAuthority,
     device_resources: crate::device::DeviceResourceAuthority<8>,
     interrupts: crate::device::InterruptAuthority<8>,
     interrupt_platform: crate::device::InterruptPlatformModel<8>,
@@ -1376,7 +1371,9 @@ fn publish_runtime_shared(
         (*SHARED_RUNTIME_STORAGE.0.get()).write(PrimordialRuntimeShared {
             execution,
             channels: Channels::new(),
-            boot_resource_grants,
+            boot_resource_grants: crate::boot::BootResourceGrantAuthority::new(
+                boot_resource_grants,
+            ),
             device_resources: crate::device::DeviceResourceAuthority::new(),
             interrupts: crate::device::InterruptAuthority::new(),
             interrupt_platform: crate::device::InterruptPlatformModel::new(),
@@ -4950,6 +4947,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         &mut self.regions,
                     )
                     .with_device_resources(&self.shared.device_resources)
+                    .with_boot_resource_grants(&self.shared.boot_resource_grants)
                     .with_interrupts(&self.shared.interrupts, &self.shared.interrupt_platform);
                     finalizer.finalize_chain(release)
                 };
@@ -7220,24 +7218,72 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         .create_root_group(&mut registry)
         .unwrap_or_else(|error| panic!("could not create primordial root TaskGroup: {error:?}"));
 
+    let resource_domain = if shared.boot_resource_grants.has_grants() {
+        let (key, handle) = tasks
+            .create_child_group(&mut registry, &root_owner)
+            .unwrap_or_else(|error| {
+                panic!("could not create boot resource-domain TaskGroup: {error:?}")
+            });
+        let owner = registry
+            .retain_internal_from_handle(&handle)
+            .unwrap_or_else(|error| {
+                panic!("could not retain resource-domain ownership: {error:?}")
+            });
+        shared
+            .boot_resource_grants
+            .bind_owner(key, owner)
+            .unwrap_or_else(|(error, _)| {
+                panic!("could not bind boot resource-domain owner: {error:?}")
+            });
+        Some(handle)
+    } else {
+        None
+    };
+
     let monitor = {
         let mut platform = LivePlatform {
             active: &mut active,
         };
-        let mut backend = AuthorityPrimordialBackend::new(
-            &mut platform,
-            &mut registry,
-            &mut memory,
-            &shared.channels,
-            &shared.waits,
-            &mut tasks,
-            &mut spaces,
-            &mut regions,
-            &shared.execution,
-            &root_owner,
-        );
-        construct_primordial(&plan, bootstrap, bootfs, &mut backend, |_| false)
-            .unwrap_or_else(|error| panic!("primordial construction failed: {error:?}"));
+        let mut backend = match resource_domain {
+            Some(resource_domain) => AuthorityPrimordialBackend::new_with_resource_domain(
+                &mut platform,
+                &mut registry,
+                &mut memory,
+                &shared.channels,
+                &shared.waits,
+                &mut tasks,
+                &mut spaces,
+                &mut regions,
+                &shared.execution,
+                &root_owner,
+                resource_domain,
+            ),
+            None => AuthorityPrimordialBackend::new(
+                &mut platform,
+                &mut registry,
+                &mut memory,
+                &shared.channels,
+                &shared.waits,
+                &mut tasks,
+                &mut spaces,
+                &mut regions,
+                &shared.execution,
+                &root_owner,
+            ),
+        };
+        crate::boot::primordial::construction::construct_primordial_with_profile(
+            &plan,
+            bootstrap,
+            bootfs,
+            if shared.boot_resource_grants.has_grants() {
+                crate::boot::primordial::construction::PrimordialInitProfile::ResourceDomain
+            } else {
+                crate::boot::primordial::construction::PrimordialInitProfile::Historical
+            },
+            &mut backend,
+            |_| false,
+        )
+        .unwrap_or_else(|error| panic!("primordial construction failed: {error:?}"));
         backend.take_monitor()
     };
     let primordial_address_space = regions
@@ -7669,6 +7715,23 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     fn handle_fallthrough(&mut self, request: NativeSyscallRequest) -> NativeSyscallResult {
         self.assert_guard_free_external_work();
         match request {
+            NativeSyscallRequest::AbiGetInfo {
+                out_info,
+                out_size,
+                out_required_size,
+            } => {
+                let mut user = self.active.current_process_address_space(
+                    self.active_root.as_ref().expect("active root"),
+                    self.process,
+                );
+                NativeSyscallResult::returning(crate::syscall::abi_get_info_with_features(
+                    &mut user,
+                    out_info,
+                    out_size,
+                    out_required_size,
+                    deepwyrm_abi::DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT,
+                ))
+            }
             NativeSyscallRequest::HandleClose { handle } => {
                 #[cfg(deepwyrm_i1_evidence)]
                 let closed_process = self
@@ -7893,6 +7956,105 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 protections,
             )),
             NativeSyscallRequest::ProcessExit { exit_code } => self.exit_process(exit_code),
+            NativeSyscallRequest::DeviceResourceClaim {
+                resource_domain,
+                resource_id,
+                requested_rights,
+                out_resource,
+            } => {
+                let mut user = self.active.current_process_address_space(
+                    self.active_root.as_ref().expect("active root"),
+                    self.process,
+                );
+                NativeSyscallResult::returning(crate::syscall::device_resource_claim(
+                    &mut user,
+                    &mut self.registry,
+                    &mut self.tasks,
+                    &self.shared.boot_resource_grants,
+                    &self.shared.device_resources,
+                    self.process,
+                    resource_domain,
+                    resource_id,
+                    requested_rights,
+                    out_resource,
+                ))
+            }
+            NativeSyscallRequest::DevicePioRead {
+                resource,
+                offset,
+                width,
+                out_value,
+            } => {
+                let mut user = self.active.current_process_address_space(
+                    self.active_root.as_ref().expect("active root"),
+                    self.process,
+                );
+                let mut io = crate::arch::x86_64::io_port::X86PortIo;
+                NativeSyscallResult::returning(crate::syscall::device_pio_read(
+                    &mut user,
+                    &mut self.registry,
+                    &mut self.tasks,
+                    &self.shared.device_resources,
+                    &mut io,
+                    self.process,
+                    resource,
+                    offset,
+                    width,
+                    out_value,
+                ))
+            }
+            NativeSyscallRequest::DevicePioWrite {
+                resource,
+                offset,
+                width,
+                value,
+            } => {
+                let mut io = crate::arch::x86_64::io_port::X86PortIo;
+                NativeSyscallResult::returning(crate::syscall::device_pio_write(
+                    &mut self.registry,
+                    &mut self.tasks,
+                    &self.shared.device_resources,
+                    &mut io,
+                    self.process,
+                    resource,
+                    offset,
+                    width,
+                    value,
+                ))
+            }
+            NativeSyscallRequest::InterruptCreate {
+                resource,
+                requested_rights,
+                out_interrupt,
+            } => {
+                let mut user = self.active.current_process_address_space(
+                    self.active_root.as_ref().expect("active root"),
+                    self.process,
+                );
+                NativeSyscallResult::returning(crate::syscall::interrupt_create(
+                    &mut user,
+                    &mut self.registry,
+                    &mut self.tasks,
+                    &self.shared.device_resources,
+                    &self.shared.interrupts,
+                    &self.shared.interrupt_platform,
+                    self.process,
+                    resource,
+                    requested_rights,
+                    out_interrupt,
+                ))
+            }
+            NativeSyscallRequest::InterruptAck { interrupt } => {
+                NativeSyscallResult::returning(crate::syscall::interrupt_ack(
+                    &mut self.registry,
+                    &mut self.tasks,
+                    &self.shared.interrupts,
+                    &self.shared.interrupt_platform,
+                    self.process,
+                    interrupt,
+                    &mut self.cleanup,
+                ))
+            }
             _ => NativeSyscallResult::returning(DW_STATUS_NOT_SUPPORTED),
         }
     }

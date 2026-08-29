@@ -37,9 +37,14 @@ struct ClaimCapability {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ClaimFailurePoint {
-    Grant,
-    Object,
-    Handle,
+    GrantLookup,
+    ClaimAuthority,
+    GrantReserve,
+    ObjectReserve,
+    PayloadBind,
+    HandleReserve,
+    Publication,
+    PostPublication,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -224,26 +229,38 @@ impl CustodyModel {
         if !self.belongs_to(actor, self.owner_domain) {
             return Err(ModelError::AccessDenied);
         }
+        if fail_at == Some(ClaimFailurePoint::GrantLookup)
+            || fail_at == Some(ClaimFailurePoint::ClaimAuthority)
+        {
+            return Err(ModelError::NoResources);
+        }
         if !matches!(self.grant, GrantState::Available) {
             return Err(ModelError::AlreadyLeased);
         }
         let generation = self.next_lease_generation;
         self.next_lease_generation += 1;
         self.grant = GrantState::Reserved;
-        if fail_at == Some(ClaimFailurePoint::Grant) {
+        if fail_at == Some(ClaimFailurePoint::GrantReserve) {
             self.grant = GrantState::Available;
             return Err(ModelError::NoResources);
         }
 
         self.reserved_objects += 1;
-        if fail_at == Some(ClaimFailurePoint::Object) {
+        if fail_at == Some(ClaimFailurePoint::ObjectReserve) {
+            self.reserved_objects -= 1;
+            self.grant = GrantState::Available;
+            return Err(ModelError::NoResources);
+        }
+        if fail_at == Some(ClaimFailurePoint::PayloadBind) {
             self.reserved_objects -= 1;
             self.grant = GrantState::Available;
             return Err(ModelError::NoResources);
         }
 
         self.reserved_handles += 1;
-        if fail_at == Some(ClaimFailurePoint::Handle) {
+        if fail_at == Some(ClaimFailurePoint::HandleReserve)
+            || fail_at == Some(ClaimFailurePoint::Publication)
+        {
             self.reserved_handles -= 1;
             self.reserved_objects -= 1;
             self.grant = GrantState::Available;
@@ -268,6 +285,11 @@ impl CustodyModel {
             parent_pins: 0,
             interrupt: None,
         });
+        if fail_at == Some(ClaimFailurePoint::PostPublication) {
+            self.close_resource(handle_id)
+                .expect("post-publication cleanup uses ordinary close/finalization");
+            return Err(ModelError::NoResources);
+        }
         Ok((generation, handle_id))
     }
 
@@ -720,9 +742,14 @@ fn custody_survives_owner_death_and_reclaims_one_fresh_generation() {
 #[test]
 fn claim_failures_restore_available_and_domain_teardown_is_terminal() {
     for point in [
-        ClaimFailurePoint::Grant,
-        ClaimFailurePoint::Object,
-        ClaimFailurePoint::Handle,
+        ClaimFailurePoint::GrantLookup,
+        ClaimFailurePoint::ClaimAuthority,
+        ClaimFailurePoint::GrantReserve,
+        ClaimFailurePoint::ObjectReserve,
+        ClaimFailurePoint::PayloadBind,
+        ClaimFailurePoint::HandleReserve,
+        ClaimFailurePoint::Publication,
+        ClaimFailurePoint::PostPublication,
     ] {
         let mut model = CustodyModel::new();
         let claim = ClaimCapability {
@@ -736,11 +763,22 @@ fn claim_failures_restore_available_and_domain_teardown_is_terminal() {
         assert!(matches!(model.grant, GrantState::Available));
         assert_eq!(model.reserved_objects, 0);
         assert_eq!(model.reserved_handles, 0);
-        assert_eq!(model.release_count, 0);
+        assert_eq!(
+            model.release_count,
+            u32::from(point == ClaimFailurePoint::PostPublication)
+        );
         let (generation, _) = model
             .claim("devmgr-1", claim, DEVICE_RESOURCE_RIGHTS, None)
             .unwrap();
-        assert_eq!(generation, 2, "failed reservation publishes no lease");
+        let expected_generation = if matches!(
+            point,
+            ClaimFailurePoint::GrantLookup | ClaimFailurePoint::ClaimAuthority
+        ) {
+            1
+        } else {
+            2
+        };
+        assert_eq!(generation, expected_generation);
     }
 
     let mut model = CustodyModel::new();

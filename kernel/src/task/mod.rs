@@ -189,6 +189,19 @@ pub(crate) enum TaskGroupState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResourceClaimMembershipError {
+    AccessDenied,
+    BadState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResourceClaimMembershipProof {
+    authority_domain: u64,
+    process: ProcessKey,
+    owner: TaskGroupKey,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TaskGroupKey(ObjectId);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ProcessKey(ObjectId);

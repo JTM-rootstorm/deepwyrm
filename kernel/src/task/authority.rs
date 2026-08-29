@@ -677,6 +677,100 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             .state)
     }
 
+    /// Proves that `process` is an active member of `owner` or one of its
+    /// retained descendants. Authority possession alone is deliberately not
+    /// enough; callers outside the subtree receive AccessDenied before any
+    /// lifecycle state is disclosed.
+    pub(crate) fn prepare_resource_claim_membership(
+        &self,
+        process: ProcessKey,
+        owner: TaskGroupKey,
+    ) -> Result<ResourceClaimMembershipProof, ResourceClaimMembershipError> {
+        self.validate_resource_claim_membership_relation(process, owner)?;
+        self.validate_resource_claim_membership_lifecycle(process, owner)?;
+        Ok(ResourceClaimMembershipProof {
+            authority_domain: self.operation_domain,
+            process,
+            owner,
+        })
+    }
+
+    pub(crate) fn validate_resource_claim_membership(
+        &self,
+        proof: &ResourceClaimMembershipProof,
+    ) -> Result<(), ResourceClaimMembershipError> {
+        if proof.authority_domain != self.operation_domain {
+            return Err(ResourceClaimMembershipError::AccessDenied);
+        }
+        self.validate_resource_claim_membership_relation(proof.process, proof.owner)?;
+        self.validate_resource_claim_membership_lifecycle(proof.process, proof.owner)
+    }
+
+    fn validate_resource_claim_membership_relation(
+        &self,
+        process: ProcessKey,
+        owner: TaskGroupKey,
+    ) -> Result<(), ResourceClaimMembershipError> {
+        let process = self
+            .process(process)
+            .map_err(|_| ResourceClaimMembershipError::AccessDenied)?;
+        let mut group = TaskGroupKey(process.parent.id());
+        for _ in 0..GROUPS {
+            if group == owner {
+                return Ok(());
+            }
+            let slot = self
+                .group_slot(group)
+                .map_err(|_| ResourceClaimMembershipError::AccessDenied)?;
+            let Some(parent) = self.groups[slot]
+                .as_ref()
+                .expect("validated resource-claim group remains populated")
+                .parent
+                .as_ref()
+            else {
+                return Err(ResourceClaimMembershipError::AccessDenied);
+            };
+            group = TaskGroupKey(parent.id());
+        }
+        Err(ResourceClaimMembershipError::AccessDenied)
+    }
+
+    fn validate_resource_claim_membership_lifecycle(
+        &self,
+        process: ProcessKey,
+        owner: TaskGroupKey,
+    ) -> Result<(), ResourceClaimMembershipError> {
+        let process = self
+            .process(process)
+            .map_err(|_| ResourceClaimMembershipError::BadState)?;
+        if process.operations.phase != ProcessLifecycleState::AcceptingOperations {
+            return Err(ResourceClaimMembershipError::BadState);
+        }
+        let mut group = TaskGroupKey(process.parent.id());
+        for _ in 0..GROUPS {
+            let slot = self
+                .group_slot(group)
+                .map_err(|_| ResourceClaimMembershipError::BadState)?;
+            let record = self.groups[slot]
+                .as_ref()
+                .expect("validated resource-claim group remains populated");
+            if record.state != TaskGroupState::Active {
+                return Err(ResourceClaimMembershipError::BadState);
+            }
+            if group == owner {
+                return Ok(());
+            }
+            group = TaskGroupKey(
+                record
+                    .parent
+                    .as_ref()
+                    .ok_or(ResourceClaimMembershipError::BadState)?
+                    .id(),
+            );
+        }
+        Err(ResourceClaimMembershipError::BadState)
+    }
+
     fn group_subtree_slots(&self, key: TaskGroupKey) -> Result<[bool; GROUPS], TaskError> {
         let root_slot = self.group_slot(key)?;
         let mut selected = [false; GROUPS];
