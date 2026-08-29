@@ -541,7 +541,14 @@ fn dw1c_fixture_releases_completed_lane_and_holds_token8_terminal_expiry() {
         .schedule_next_on_with_migration(cpu(2))
         .unwrap();
     assert_eq!(migrated.decision().current, Some(seed.actors[2]));
-    assert!(migrated.migration().is_some());
+    let migration = migrated
+        .migration()
+        .expect("the released lane permits an idle steal");
+    assert_eq!(migration.thread, seed.actors[2]);
+    assert_eq!(migration.execution_generation, 0);
+    assert_eq!(migration.source, cpu(1));
+    assert_eq!(migration.target, cpu(2));
+    assert_ne!(migration.generation, 0);
 
     for index in [6, 7] {
         assert_eq!(

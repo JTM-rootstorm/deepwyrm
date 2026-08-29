@@ -977,11 +977,23 @@ impl Dw1cEvidenceCollector {
             (false, None) => {}
             _ => return Err(state.latch(Dw1cEvidenceError::Contradiction)),
         }
-        if !actor_thread_bound(&state, thread, execution_generation) {
-            // A valid later continuation may migrate before the one fixed ARM
-            // witness has been selected. It is non-serializing surplus.
-            return Ok(());
+        let arm_generation = state
+            .actors
+            .iter()
+            .flatten()
+            .find(|actor| actor.thread == thread)
+            .expect("known migration Thread retains its actor binding")
+            .execution_generation;
+        if execution_generation != 0 && execution_generation < arm_generation {
+            return Err(state.latch(Dw1cEvidenceError::WrongGeneration));
         }
+        // The fixture forbids migration until this actor's lane completes a
+        // real pair switch. That switch consumes both ARM-generation claims:
+        // its outgoing Runnable publication carries generation zero until the
+        // next dispatch, while the incoming peer is Running and not stealable.
+        // ThreadKey plus the scheduler-owned migration generation and exact
+        // source/target CPUs therefore authenticate the first possible steal;
+        // the auxiliary execution generation may be zero or later than ARM.
         state.steal_migrate_payload = Some(payload);
         state.facts.steal_migrate = true;
         Ok(())
@@ -4701,6 +4713,24 @@ mod tests {
         assert_eq!(state.failure, None);
         drop(state);
 
+        let (undispatched_migration, actors) = armed_collector();
+        assert_eq!(
+            undispatched_migration.observe_steal_migration_claim(1, 2, actors[2].thread, 0, 8,),
+            Ok(())
+        );
+        let state = undispatched_migration.state.lock();
+        assert_eq!(
+            state.steal_migrate_payload,
+            Some(Dw1cRecordPayload {
+                subject: 3,
+                generation: 8,
+                value: 0x0102,
+            })
+        );
+        assert!(state.facts.steal_migrate);
+        assert_eq!(state.failure, None);
+        drop(state);
+
         let (later_migration, actors) = armed_collector();
         assert_eq!(
             later_migration.observe_steal_migration_claim(
@@ -4713,8 +4743,33 @@ mod tests {
             Ok(())
         );
         let state = later_migration.state.lock();
-        assert_eq!(state.steal_migrate_payload, None);
+        assert_eq!(
+            state.steal_migrate_payload,
+            Some(Dw1cRecordPayload {
+                subject: 3,
+                generation: 9,
+                value: 0x0102,
+            })
+        );
+        assert!(state.facts.steal_migrate);
         assert_eq!(state.failure, None);
+        drop(state);
+
+        let (stale_migration, actors) = armed_collector();
+        assert_eq!(
+            stale_migration.observe_steal_migration_claim(
+                1,
+                2,
+                actors[2].thread,
+                actors[2].execution_generation - 1,
+                10,
+            ),
+            Err(Dw1cEvidenceError::WrongGeneration)
+        );
+        let state = stale_migration.state.lock();
+        assert_eq!(state.steal_migrate_payload, None);
+        assert!(!state.facts.steal_migrate);
+        assert_eq!(state.failure, Some(Dw1cEvidenceError::WrongGeneration));
         drop(state);
 
         let (later_rejection, actors) = armed_collector();

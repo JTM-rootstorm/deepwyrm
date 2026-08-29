@@ -727,15 +727,17 @@ A distinct scheduler-originated wake carrying either the exact bound execution
 generation or a nonzero later continuation generation, or a local wake which
 is not a remote-wake record candidate, is one such additional transition: a
 later generation cannot fill an empty fixed slot, replace a retained payload,
-or latch a selector failure. A later committed idle-steal migration is likewise
-non-serializing activity even before the one fixed `STEAL_MIGRATE` relation has
-been retained. The scheduler's committed migration identity is
+or latch a selector failure. A later committed idle-steal migration is
+non-serializing after the one fixed `STEAL_MIGRATE` relation has been retained.
+The scheduler's committed migration identity is
 the bound Thread, distinct source/target CPUs, and nonzero migration generation;
 a migrated continuation may legitimately carry execution generation zero
 before its destination dispatch mints the next execution claim. The first
-retained steal still requires the exact ARM-bound execution identity, while a
-distinct later committed migration generation is non-serializing surplus even
-when that auxiliary execution field is zero or newer. Token 6's independently
+retained steal requires that exact bound Thread and scheduler-owned migration
+identity, while its auxiliary execution generation may be zero or newer than
+ARM: lane completion necessarily consumes both ARM-generation claims before
+the fixture permits migration. A distinct later committed migration generation
+is non-serializing surplus. Token 6's independently
 required wait/wake join
 still advances when its valid wake does not own a target slot, including when
 that scheduler publication is local; its wait/wake/run and migration-rejection
