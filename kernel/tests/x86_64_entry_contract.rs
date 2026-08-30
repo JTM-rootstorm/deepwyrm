@@ -234,6 +234,7 @@ fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
         ("normal-preemption-up", 26),
         ("bootstrap-registry-launch", 27),
         ("normal-preemption-smp", 28),
+        ("device-coordinator-restart", 29),
     ] {
         assert_eq!(
             kernel_build::select_guest_test(true, Some(selector), false, &harness),
@@ -474,6 +475,47 @@ fn selector27_binds_reporter_start_to_fixed_stack_root_and_guard() {
             "missing distinct live detail {detail}"
         );
     }
+}
+
+#[test]
+fn selector29_wrc6_restart_relay_is_private_bounded_and_atomic() {
+    let root = kernel_root();
+    let build = fs::read_to_string(root.join("build.rs")).expect("read kernel build");
+    let support =
+        fs::read_to_string(root.join("src/test_support/mod.rs")).expect("read selector-29 support");
+    let evidence = fs::read_to_string(root.join("src/test_support/wyr1c_evidence.rs"))
+        .expect("read selector-29 evidence");
+    let terminal = fs::read_to_string(root.join("src/test_support/x86_64.rs"))
+        .expect("read selector-29 terminal");
+    let primordial = fs::read_to_string(root.join("src/arch/x86_64/mm/activation/primordial.rs"))
+        .expect("read primordial runtime");
+    let public_abi = fs::read_to_string(root.join("../abi/generated/deepwyrm_abi.rs"))
+        .expect("read generated ABI");
+
+    assert!(build.contains("selector == \"device-coordinator-restart\""));
+    assert!(build.contains("deepwyrm_wyr1c_evidence"));
+    assert!(support.contains("mod wyr1c_evidence;"));
+    assert!(evidence.contains("WYR1C_EVIDENCE_RAW_SYSCALL: u32 = 0xffff_ff1e"));
+    assert!(evidence.contains("WYR1C_EVIDENCE_RECORD_LEN: usize = 113"));
+    assert!(evidence.contains("WYR1C_EVIDENCE_RECORD_CAPACITY: usize = 27"));
+    assert!(evidence.contains("WRC6"));
+    assert!(evidence.contains("WYR1C_EVIDENCE_TERMINAL_EVENT"));
+    assert!(!public_abi.contains("FFFF_FF1C"));
+    assert!(!public_abi.contains("ffff_ff1e"));
+    assert!(primordial.contains("WYR1C_EVIDENCE\n            .authorize_submission(self.process)"));
+    assert!(primordial.contains("WYR1C_EVIDENCE\n            .observe_reporter_start"));
+    assert!(primordial.contains("WYR1C_EVIDENCE\n            .bind_reporter_after_retirement"));
+
+    let completion = terminal
+        .find("pub(crate) fn complete_wyr1c_evidence")
+        .expect("selector-29 terminal exists");
+    let evidence_write = terminal[completion..]
+        .find("write_evidence(record)")
+        .expect("WRC6 evidence write exists");
+    let pass = terminal[completion..]
+        .find("completion_record(CompletionOutcome::Pass, 0)")
+        .expect("selector-29 PASS exists");
+    assert!(evidence_write < pass, "WRC6 must precede PASS DWTEST1");
 }
 
 #[test]

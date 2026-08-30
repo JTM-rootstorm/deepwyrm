@@ -104,6 +104,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1C_BOOTFS_MAX_PAGES");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1D_EVIDENCE_NONCE");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1D_EVIDENCE_CHALLENGE");
+    println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1C_EVIDENCE_NONCE");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_c3_one_shot_ui)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_memory_guest)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_e7_guest)");
@@ -117,6 +118,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1b_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1c_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1d_evidence)");
+    println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1c_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_integrated)");
     println!("cargo:rustc-cfg=deepwyrm_integrated");
 
@@ -214,6 +216,13 @@ fn run() -> Result<(), String> {
         .is_some_and(is_dw1d_evidence_selector)
     {
         println!("cargo:rustc-cfg=deepwyrm_dw1d_evidence");
+    }
+    if env::var("DEEPWYRM_GUEST_TEST_SELECTOR")
+        .ok()
+        .as_deref()
+        .is_some_and(is_wyr1c_evidence_selector)
+    {
+        println!("cargo:rustc-cfg=deepwyrm_wyr1c_evidence");
     }
 
     if required_env("TARGET")? != KERNEL_TARGET {
@@ -360,6 +369,10 @@ fn is_dw1c_evidence_selector(selector: &str) -> bool {
 
 fn is_dw1d_evidence_selector(selector: &str) -> bool {
     selector == "device-resource-interrupt-synthetic"
+}
+
+fn is_wyr1c_evidence_selector(selector: &str) -> bool {
+    selector == "device-coordinator-restart"
 }
 
 fn emit_e7_user_env(elf: &Path) {
@@ -963,6 +976,10 @@ fn configure_guest_test(harness_path: &Path) -> Result<(), String> {
             println!("cargo:rustc-env=DEEPWYRM_DW1D_EVIDENCE_NONCE={nonce}");
             println!("cargo:rustc-env=DEEPWYRM_DW1D_EVIDENCE_CHALLENGE={challenge}");
         }
+        if is_wyr1c_evidence_selector(&selector) {
+            let nonce = required_wyr1c_hex("DEEPWYRM_WYR1C_EVIDENCE_NONCE")?;
+            println!("cargo:rustc-env=DEEPWYRM_WYR1C_EVIDENCE_NONCE={nonce}");
+        }
     }
     Ok(())
 }
@@ -1007,6 +1024,13 @@ fn required_dw1c_hex(name: &str) -> Result<String, String> {
 fn required_dw1d_hex(name: &str) -> Result<String, String> {
     let value = env::var(name)
         .map_err(|_| format!("device-resource-interrupt-synthetic requires {name}"))?;
+    validate_upper_nonzero_hex_nonce(&value, name)?;
+    Ok(value)
+}
+
+fn required_wyr1c_hex(name: &str) -> Result<String, String> {
+    let value =
+        env::var(name).map_err(|_| format!("device-coordinator-restart requires {name}"))?;
     validate_upper_nonzero_hex_nonce(&value, name)?;
     Ok(value)
 }
@@ -2243,6 +2267,30 @@ mod tests {
         for value in ["", "0", "01", "+1", "8193", "not-pages"] {
             assert!(required_dw1c_bootfs_pages_for_test(value).is_err());
         }
+    }
+
+    #[test]
+    fn wyr1c_selector_and_nonce_are_exact() {
+        assert!(is_wyr1c_evidence_selector("device-coordinator-restart"));
+        assert!(!is_wyr1c_evidence_selector(
+            "device-resource-interrupt-synthetic"
+        ));
+        for valid in ["0000000000000001", "0123456789ABCDEF", "FFFFFFFFFFFFFFFF"] {
+            assert!(validate_upper_nonzero_hex_nonce(valid, "WYR1C").is_ok());
+        }
+        for invalid in [
+            "0000000000000000",
+            "0123456789abcdef",
+            "0123456789ABCDE",
+            "G123456789ABCDEF",
+        ] {
+            assert!(validate_upper_nonzero_hex_nonce(invalid, "WYR1C").is_err());
+        }
+        let manifest = include_str!("../tooling/guest-harness.toml");
+        assert_eq!(
+            select_guest_test(true, Some("device-coordinator-restart"), false, manifest),
+            Ok(Some(29))
+        );
     }
 
     fn required_dw1c_bootfs_pages_for_test(value: &str) -> Result<(), String> {

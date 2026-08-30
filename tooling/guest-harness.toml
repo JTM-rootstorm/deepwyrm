@@ -169,6 +169,13 @@ state = "implemented"
 id = 28
 state = "implemented"
 
+# WYR1-C's selector-29 device-coordinator restart evidence relay. The
+# userspace controller owns device identity and lifecycle joins; Deepwyrm
+# validates only the private bounded transcript and reporter custody.
+[guest_test.device-coordinator-restart]
+id = 29
+state = "implemented"
+
 # DW1-D's selector-local ring-3 DeviceResource/Interrupt proof. The private
 # raw trigger protocol is compiled only for this selector and is not native ABI.
 [guest_test.device-resource-interrupt-synthetic]

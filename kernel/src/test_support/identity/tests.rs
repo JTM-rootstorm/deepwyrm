@@ -102,6 +102,11 @@ fn implemented_central_selectors_have_exact_kernel_identities() {
             BuildGuestTest::BootstrapRegistryLaunch,
             27,
         ),
+        (
+            "device-coordinator-restart",
+            BuildGuestTest::DeviceCoordinatorRestart,
+            29,
+        ),
     ];
     for (selector, identity, id) in cases {
         assert_eq!(parse_known_selector(selector), identity);

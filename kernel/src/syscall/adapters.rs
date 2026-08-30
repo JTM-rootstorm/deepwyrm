@@ -372,8 +372,16 @@ pub(crate) fn copy_wyr1_evidence_input<U: UserPageAccess, const N: usize>(
     copy_input(user, address, 1)
 }
 
-#[cfg(deepwyrm_wyr1b_evidence)]
+#[cfg(any(deepwyrm_wyr1b_evidence, deepwyrm_wyr1c_evidence))]
 pub(crate) fn copy_wyr1b_evidence_input<U: UserPageAccess, const N: usize>(
+    user: &mut U,
+    address: DwUserAddress,
+) -> Result<[u8; N], DwStatus> {
+    copy_input(user, address, 1)
+}
+
+#[cfg(deepwyrm_wyr1c_evidence)]
+pub(crate) fn copy_wyr1c_evidence_input<U: UserPageAccess, const N: usize>(
     user: &mut U,
     address: DwUserAddress,
 ) -> Result<[u8; N], DwStatus> {

@@ -217,6 +217,9 @@ fn apply_selector_environment(command: &mut Command, selector: &str) {
                 .env("DEEPWYRM_DW1C_PROGRESS_DIGEST", "D1C5A11CE5EED001")
                 .env("DEEPWYRM_DW1C_BOOTFS_MAX_PAGES", "53");
         }
+        "device-coordinator-restart" => {
+            command.env("DEEPWYRM_WYR1C_EVIDENCE_NONCE", "C6C4000000000001");
+        }
         _ => {}
     }
 }

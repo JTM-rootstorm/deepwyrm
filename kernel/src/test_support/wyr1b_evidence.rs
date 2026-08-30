@@ -93,7 +93,7 @@ pub(crate) struct Wyr1bRetirementFacts {
 }
 
 impl Wyr1bRetirementFacts {
-    const fn complete(self) -> bool {
+    pub(crate) const fn complete(self) -> bool {
         self.process_quiesced
             && self.root_region_retired
             && self.monitor_and_kernel_peer_released
@@ -121,7 +121,7 @@ pub(crate) struct Wyr1bReporterStartFacts {
 }
 
 impl Wyr1bReporterStartFacts {
-    const fn validate(self) -> Result<(), Wyr1bEvidenceError> {
+    pub(crate) const fn validate(self) -> Result<(), Wyr1bEvidenceError> {
         if !self.root_owned_by_reporter {
             return Err(Wyr1bEvidenceError::StartupRoot);
         }

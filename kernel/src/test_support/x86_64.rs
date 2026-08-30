@@ -17,7 +17,8 @@ use crate::debug::emit_early_raw_record;
     deepwyrm_dw1b_evidence,
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
-    deepwyrm_dw1d_evidence
+    deepwyrm_dw1d_evidence,
+    deepwyrm_wyr1c_evidence
 ))]
 use crate::debug::{TestSerialTransaction, begin_test_serial_transaction};
 
@@ -70,6 +71,10 @@ const DW1D_TERMINAL_SUCCESS: u8 = 1;
 const DW1D_TERMINAL_FAILURE: u8 = 2;
 #[cfg(deepwyrm_dw1d_evidence)]
 static DW1D_TERMINAL_OWNER: AtomicU8 = AtomicU8::new(0);
+#[cfg(deepwyrm_wyr1c_evidence)]
+const WYR1C_TERMINAL_SUCCESS: u8 = 1;
+#[cfg(deepwyrm_wyr1c_evidence)]
+static WYR1C_TERMINAL_OWNER: AtomicU8 = AtomicU8::new(0);
 
 core::arch::global_asm!(
     r#"
@@ -121,7 +126,8 @@ struct QemuCompletionTransport {
         deepwyrm_dw1b_evidence,
         deepwyrm_wyr1b_evidence,
         deepwyrm_dw1c_evidence,
-        deepwyrm_dw1d_evidence
+        deepwyrm_dw1d_evidence,
+        deepwyrm_wyr1c_evidence
     ))]
     transaction: Option<TestSerialTransaction>,
 }
@@ -149,7 +155,8 @@ impl QemuCompletionTransport {
                 deepwyrm_dw1b_evidence,
                 deepwyrm_wyr1b_evidence,
                 deepwyrm_dw1c_evidence,
-                deepwyrm_dw1d_evidence
+                deepwyrm_dw1d_evidence,
+                deepwyrm_wyr1c_evidence
             ))]
             transaction: None,
         }
@@ -170,7 +177,8 @@ impl CompletionTransport for QemuCompletionTransport {
             deepwyrm_dw1b_evidence,
             deepwyrm_wyr1b_evidence,
             deepwyrm_dw1c_evidence,
-            deepwyrm_dw1d_evidence
+            deepwyrm_dw1d_evidence,
+            deepwyrm_wyr1c_evidence
         ))]
         if let Some(transaction) = self.transaction.as_mut() {
             return transaction
@@ -328,6 +336,39 @@ pub(crate) fn complete_dw1d_evidence(permit: Dw1dEvidenceFlushPermit<'_>) -> ! {
     )
 }
 
+/// Selector 29 owns one uninterrupted transaction: all WRC6 records,
+/// canonical DWTEST1 29/0, and the matching debug exit.
+#[cfg(deepwyrm_wyr1c_evidence)]
+pub(crate) fn complete_wyr1c_evidence(
+    permit: super::wyr1c_evidence::Wyr1cEvidenceFlushPermit<'_>,
+) -> ! {
+    if !claim_wyr1c_terminal(WYR1C_TERMINAL_SUCCESS) {
+        halt_after_completion()
+    }
+    let mut transport = unsafe { QemuCompletionTransport::new() };
+    let Ok(transaction) = begin_test_serial_transaction() else {
+        halt_after_completion()
+    };
+    transport.transaction = Some(transaction);
+    if permit
+        .flush(|record| {
+            transport
+                .transaction
+                .as_mut()
+                .expect("WRC6 owns serial transaction")
+                .write_evidence(record)
+                .map_err(|_| ())
+        })
+        .is_err()
+    {
+        halt_after_completion()
+    }
+    complete(
+        &mut transport,
+        completion_record(CompletionOutcome::Pass, 0),
+    )
+}
+
 #[cfg(deepwyrm_dw1c_evidence)]
 fn claim_dw1c_terminal(owner: u8) -> bool {
     claim_dw1c_terminal_on(&DW1C_TERMINAL_OWNER, owner)
@@ -336,6 +377,13 @@ fn claim_dw1c_terminal(owner: u8) -> bool {
 #[cfg(deepwyrm_dw1d_evidence)]
 fn claim_dw1d_terminal(owner: u8) -> bool {
     DW1D_TERMINAL_OWNER
+        .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+#[cfg(deepwyrm_wyr1c_evidence)]
+fn claim_wyr1c_terminal(owner: u8) -> bool {
+    WYR1C_TERMINAL_OWNER
         .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
 }
@@ -365,6 +413,20 @@ fn complete_dw1c_failure_terminal(outcome: CompletionOutcome, detail: u32) -> ! 
 fn complete_dw1d_failure_terminal(outcome: CompletionOutcome, detail: u32) -> ! {
     debug_assert!(outcome != CompletionOutcome::Pass);
     if !claim_dw1d_terminal(DW1D_TERMINAL_FAILURE) {
+        halt_after_completion()
+    }
+    let mut transport = unsafe { QemuCompletionTransport::new() };
+    let Ok(transaction) = begin_test_serial_transaction() else {
+        halt_after_completion()
+    };
+    transport.transaction = Some(transaction);
+    complete(&mut transport, completion_record(outcome, detail))
+}
+
+#[cfg(deepwyrm_wyr1c_evidence)]
+fn complete_wyr1c_failure_terminal(outcome: CompletionOutcome, detail: u32) -> ! {
+    debug_assert!(outcome != CompletionOutcome::Pass);
+    if !claim_wyr1c_terminal(2) {
         halt_after_completion()
     }
     let mut transport = unsafe { QemuCompletionTransport::new() };
@@ -486,6 +548,10 @@ pub(crate) fn complete_pass(detail: u32) -> ! {
         let _ = detail;
         complete_dw1d_failure_terminal(CompletionOutcome::Fail, 0x3010_ffff)
     }
+    #[cfg(deepwyrm_wyr1c_evidence)]
+    {
+        complete_wyr1c_failure_terminal(CompletionOutcome::Fail, 0x2910_ffff)
+    }
     #[cfg(deepwyrm_wyr1_evidence)]
     {
         let _ = detail;
@@ -506,7 +572,8 @@ pub(crate) fn complete_pass(detail: u32) -> ! {
         deepwyrm_dw1b_evidence,
         deepwyrm_wyr1b_evidence,
         deepwyrm_dw1c_evidence,
-        deepwyrm_dw1d_evidence
+        deepwyrm_dw1d_evidence,
+        deepwyrm_wyr1c_evidence
     )))]
     complete_known_outcome(CompletionOutcome::Pass, detail)
 }
@@ -521,11 +588,20 @@ pub(crate) fn complete_fail(detail: u32) -> ! {
     {
         complete_dw1d_failure_terminal(CompletionOutcome::Fail, detail)
     }
+    #[cfg(deepwyrm_wyr1c_evidence)]
+    {
+        complete_wyr1c_failure_terminal(CompletionOutcome::Fail, detail)
+    }
     #[cfg(deepwyrm_wyr1_evidence)]
     {
         complete_wyr1_evidence_kernel_terminal(CompletionOutcome::Fail, detail)
     }
-    #[cfg(not(any(deepwyrm_wyr1_evidence, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence)))]
+    #[cfg(not(any(
+        deepwyrm_wyr1_evidence,
+        deepwyrm_dw1c_evidence,
+        deepwyrm_dw1d_evidence,
+        deepwyrm_wyr1c_evidence
+    )))]
     {
         #[cfg(deepwyrm_wyr1b_evidence)]
         complete_wyr1b_evidence_kernel_terminal(CompletionOutcome::Fail, detail);
@@ -544,11 +620,20 @@ pub(crate) fn complete_panic(detail: u32) -> ! {
     {
         complete_dw1d_failure_terminal(CompletionOutcome::Panic, detail)
     }
+    #[cfg(deepwyrm_wyr1c_evidence)]
+    {
+        complete_wyr1c_failure_terminal(CompletionOutcome::Panic, detail)
+    }
     #[cfg(deepwyrm_wyr1_evidence)]
     {
         complete_wyr1_evidence_kernel_terminal(CompletionOutcome::Panic, detail)
     }
-    #[cfg(not(any(deepwyrm_wyr1_evidence, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence)))]
+    #[cfg(not(any(
+        deepwyrm_wyr1_evidence,
+        deepwyrm_dw1c_evidence,
+        deepwyrm_dw1d_evidence,
+        deepwyrm_wyr1c_evidence
+    )))]
     {
         #[cfg(deepwyrm_wyr1b_evidence)]
         complete_wyr1b_evidence_kernel_terminal(CompletionOutcome::Panic, detail);
@@ -716,7 +801,8 @@ pub(crate) fn trigger_expected_invalid_opcode() -> ! {
     deepwyrm_wyr1_evidence,
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
-    deepwyrm_dw1d_evidence
+    deepwyrm_dw1d_evidence,
+    deepwyrm_wyr1c_evidence
 )))]
 fn complete_known_outcome(outcome: CompletionOutcome, detail: u32) -> ! {
     // SAFETY: this function exists only in an x86_64-none `test-support` build

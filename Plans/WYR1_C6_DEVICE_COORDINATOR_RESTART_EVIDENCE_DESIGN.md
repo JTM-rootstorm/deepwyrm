@@ -1,0 +1,93 @@
+# WYR1-C6 selector-29 evidence seam
+
+Status: Deepwyrm evidence half implemented in selector `device-coordinator-restart` (ID 29).
+
+This document defines the test-build-only transport consumed by the Wyrmroot
+C6 controller. It is not a native ABI addition and does not claim physical
+IRQ3, PIO, UART, stream, console, or shell behavior. Those boundaries remain
+in `wyrmroot/Plans/WYR1_C_DEVICE_HANDOFF_CONTRACT.md`; physical IRQ routing is
+deferred to DW1-E.
+
+## Exact private seam
+
+The selector registry is `tooling/guest-harness.toml`, with ID 29. The kernel
+build emits `cfg(deepwyrm_wyr1c_evidence)` only for that selector and requires
+`DEEPWYRM_WYR1C_EVIDENCE_NONCE`, exactly 16 uppercase hexadecimal digits and
+nonzero. The raw operation is `0xffff_ff1e`; it is routed only by the selected
+test kernel and is intentionally absent from `abi/generated/deepwyrm_abi.rs`.
+
+Each submission is a fixed 113-byte ASCII record:
+
+```
+WRC6|01|NNNNNNNNNNNNNNNN|SSSSSSSS|EE|LLLLLLLLLLLLLLLL|BBBBBBBBBBBBBBBB|VVVVVVVVVVVVVVVV|AAAAAAAAAAAAAAAA|CCCCCCCC
+```
+
+`N` is the build nonce, `S` is the zero-based sequence, `E` is the event,
+`L/B/V/A` are opaque Wyrmroot lease, binding, value, and auxiliary fields,
+and `C` is uppercase FNV-1a-32 over bytes 0..104. A nonterminal event requires
+nonzero `L`; terminal event `FF` requires all four tuple fields to be zero.
+The collector accepts exactly 27 records and rejects malformed, out-of-order,
+wrong-nonce, checksum-invalid, duplicate, early, full, or post-terminal input.
+
+The ordered events are:
+
+1. `D1_BEGIN`
+2. `D1_LEASE`
+3. `U1_START`
+4. `U1_READY`
+5. `P1_PUBLISH`
+6. `U1_FAILURE`
+7. `P1_RETIRE`
+8. `U1_REAP`
+9. `OLD_IRQ_RELEASED`
+10. `U2_START` (same D1 lease)
+11. `U2_READY` (same D1 lease)
+12. `P2_PUBLISH` (same D1 lease)
+13. `STALE_REJECT`
+14. `D1_FAILURE`
+15. `P2_RETIRE`
+16. `U2_REAP`
+17. `D1_GENERATION_CLEAN`
+18. `D1_GRANT_AVAILABLE`
+19. `D2_LEASE` (different lease generation)
+20. `D2_START`
+21. `D2_CLAIM`
+22. `D2_READY`
+23. `NO_AUTHORITY`
+24. `NO_IO`
+25. `ACCOUNTING`
+26. `BOUNDED`
+27. `FF` terminal
+
+Deepwyrm preserves the opaque fields and validates framing/order only;
+Wyrmroot proves rights, custody/reclaim, generation relations, stale rejection,
+authority absence, no-I/O, and accounting semantics.
+
+## Reporter and terminal invariants
+
+The reporter is the exact first child created by the primordial process (the
+permanent system-init/controller). Its root, executable entry mapping, fixed
+stack geometry, RW/NX stack protection, and guard absence are checked using the
+selector-27 startup facts. The one-shot bind occurs only after primordial
+quiescence, root retirement, kernel/monitor peer release, finalizer drain, and
+retention of the private primordial PML4. Authority is checked before usercopy.
+
+The terminal reporter claims one atomic COM1 transaction, writes all 27 WRC6
+records, appends `DWTEST1` 29/0, flushes, and issues the matching debug exit.
+Failure paths claim the same one-shot terminal owner and publish only a bounded
+completion failure; no partial WRC6 prefix is relabeled as PASS.
+
+## Required-source and provenance disposition
+
+The seam follows `Plans/WYR1_B0_REGISTRY_LAUNCH_EVIDENCE_DESIGN.md` for
+selector registry identity, exact permanent-controller authority, fixed startup
+facts, private raw-operation routing, and atomic terminal transport. It follows
+`Plans/DW1_D0_DEVICE_RESOURCE_INTERRUPT_CONTRACT.md` and
+`docs/DW1_D_VALIDATION.md` for DeviceResource/Interrupt ownership boundaries
+and the no-physical-I/O stop line. The Wyrmroot event order and nonclaims are
+from `wyrmroot/Plans/DW1C_WYR1C_IMPLEMENTATION_PLAN.md` and
+`wyrmroot/Plans/WYR1_C_DEVICE_HANDOFF_CONTRACT.md`.
+
+No external code was copied. The collector is a selector-local adaptation of
+the existing first-party WRB1 framing/terminal pattern. C5 bundle wire shapes,
+physical IRQ/PIO, and C6 Wyrmroot lifecycle execution remain owned by Wyrmroot.
