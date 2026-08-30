@@ -26,12 +26,10 @@ use crate::boot::primordial::construction::authority::{
 use crate::boot::primordial::construction::complete_primordial_launch;
 #[cfg(any(deepwyrm_dw1d_evidence, deepwyrm_wyr1c_evidence))]
 use crate::boot::primordial::construction::complete_resource_primordial_launch;
-#[cfg(any(
-    deepwyrm_wyr1_evidence,
-    deepwyrm_wyr1b_evidence,
-    deepwyrm_wyr1c_evidence
-))]
+#[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
 use crate::boot::primordial::construction::validate_primordial_retirement_facts;
+#[cfg(deepwyrm_wyr1c_evidence)]
+use crate::boot::primordial::construction::validate_resource_primordial_retirement_facts as validate_primordial_retirement_facts;
 use crate::boot::primordial::construction::{
     PrimordialCompletionBackend, PrimordialExitDisposition,
 };

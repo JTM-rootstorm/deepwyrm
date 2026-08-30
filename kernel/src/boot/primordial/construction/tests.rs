@@ -638,4 +638,16 @@ fn retirement_fact_split_samples_exit_without_consuming_quiescence() {
     );
     assert!(exit_failure.observed_exit);
     assert!(!exit_failure.verified_quiescence);
+
+    let mut resource = completion_host(PrimordialExitDisposition::Normal(0));
+    resource.ready = Ok(RESOURCE_READY_BYTES.to_vec());
+    validate_resource_primordial_retirement_facts(&mut resource).unwrap();
+    assert!(resource.observed_exit);
+    assert!(!resource.verified_quiescence);
+
+    let mut resource_on_historical = completion_host(PrimordialExitDisposition::Normal(0));
+    assert_eq!(
+        validate_resource_primordial_retirement_facts(&mut resource_on_historical),
+        Err(PrimordialCompletionError::MalformedReady)
+    );
 }

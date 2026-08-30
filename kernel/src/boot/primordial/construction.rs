@@ -570,6 +570,23 @@ fn complete_primordial_launch_with_ready<B: PrimordialCompletionBackend>(
 pub(crate) fn validate_primordial_retirement_facts<B: PrimordialCompletionBackend>(
     backend: &mut B,
 ) -> Result<(), PrimordialCompletionError<B::Error>> {
+    validate_primordial_retirement_facts_with_ready(backend, &READY_BYTES)
+}
+
+/// Selector-local retirement validation for the four-capability resource
+/// primordial profile. This preserves the READY/exit split while requiring
+/// the same profile-aware READY accepted by the initial construction path.
+#[cfg(any(test, deepwyrm_wyr1c_evidence))]
+pub(crate) fn validate_resource_primordial_retirement_facts<B: PrimordialCompletionBackend>(
+    backend: &mut B,
+) -> Result<(), PrimordialCompletionError<B::Error>> {
+    validate_primordial_retirement_facts_with_ready(backend, &RESOURCE_READY_BYTES)
+}
+
+fn validate_primordial_retirement_facts_with_ready<B: PrimordialCompletionBackend>(
+    backend: &mut B,
+    expected_ready: &[u8; 40],
+) -> Result<(), PrimordialCompletionError<B::Error>> {
     let mut bytes = [0_u8; 40];
     // Snapshot both facts before applying the established READY-first error
     // precedence. A failed receive must not erase the concurrent structured
@@ -578,7 +595,7 @@ pub(crate) fn validate_primordial_retirement_facts<B: PrimordialCompletionBacken
     let exit = backend.observe_exit();
 
     let actual = ready.map_err(PrimordialCompletionError::Receive)?;
-    if actual != READY_BYTES.len() || bytes != READY_BYTES {
+    if actual != expected_ready.len() || bytes != *expected_ready {
         return Err(PrimordialCompletionError::MalformedReady);
     }
     match exit.map_err(PrimordialCompletionError::ObserveExit)? {
