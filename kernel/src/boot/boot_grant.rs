@@ -160,6 +160,7 @@ impl BootResourceGrants {
 pub(crate) enum BootResourceLeaseError {
     OwnerAlreadyBound,
     OwnerNotBound,
+    GrantNotAvailable,
     UnknownResource,
     AlreadyLeased,
     GenerationExhausted,
@@ -251,6 +252,30 @@ impl BootResourceGrantAuthority {
             .owner
             .as_ref()
             .map(|(key, _)| *key)
+            .ok_or(BootResourceLeaseError::OwnerNotBound)
+    }
+
+    /// Returns the one-shot resource-domain owner only after every boot grant
+    /// has completed its typed finalization and returned to `Available`.
+    #[allow(
+        dead_code,
+        reason = "terminal owner release is consumed by the freestanding primordial runtime"
+    )]
+    pub(crate) fn take_owner_if_all_grants_available(
+        &self,
+    ) -> Result<InternalRef, BootResourceLeaseError> {
+        let mut state = self.state.lock();
+        if state.grants.grants[..state.grants.count]
+            .iter()
+            .flatten()
+            .any(|grant| grant.state != BootResourceGrantState::Available)
+        {
+            return Err(BootResourceLeaseError::GrantNotAvailable);
+        }
+        state
+            .owner
+            .take()
+            .map(|(_, owner)| owner)
             .ok_or(BootResourceLeaseError::OwnerNotBound)
     }
 
@@ -506,5 +531,50 @@ mod tests {
             .release_lease(9, grant_generation, object, lease_generation)
             .unwrap();
         registry.cancel_creation(creation).unwrap();
+    }
+
+    #[test]
+    fn terminal_owner_release_waits_for_available_grants_and_restores_capacity() {
+        let authority = BootResourceGrantAuthority::new(
+            BootResourceGrants::materialize(&[descriptor(11)]).unwrap(),
+        );
+        let mut registry = ObjectRegistry::<4>::new();
+        let mut tasks = TaskAuthority::<2, 1, 1, 1>::new();
+        let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+        let (domain, domain_handle) = tasks
+            .create_child_group(&mut registry, &root_owner)
+            .unwrap();
+        let domain_owner = registry
+            .retain_internal_from_handle(&domain_handle)
+            .unwrap();
+        authority.bind_owner(domain, domain_owner).unwrap();
+
+        let (_, reservation) = authority.reserve(11).unwrap();
+        assert_eq!(
+            authority.take_owner_if_all_grants_available().err(),
+            Some(BootResourceLeaseError::GrantNotAvailable)
+        );
+        authority.cancel(reservation).unwrap();
+
+        assert!(registry.release_handle(domain_handle).unwrap().is_none());
+        assert!(registry.release_internal(root_owner).unwrap().is_none());
+        let domain_owner = authority.take_owner_if_all_grants_available().unwrap();
+        let mut pending = registry.release_internal(domain_owner).unwrap();
+        while let Some(release) = pending.take() {
+            let finalization = tasks.take_finalization(release).unwrap();
+            pending = crate::task::complete_task_finalization(&mut registry, finalization);
+        }
+        assert_eq!(
+            authority.take_owner_if_all_grants_available().err(),
+            Some(BootResourceLeaseError::OwnerNotBound)
+        );
+
+        let mut probes = [const { None }; 4];
+        for probe in &mut probes {
+            *probe = Some(registry.create(DW_OBJECT_TYPE_EVENT).unwrap());
+        }
+        for probe in probes.into_iter().flatten() {
+            registry.cancel_creation(probe).unwrap();
+        }
     }
 }

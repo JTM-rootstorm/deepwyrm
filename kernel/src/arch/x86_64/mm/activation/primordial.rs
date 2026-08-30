@@ -5176,6 +5176,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.release_terminal_authority()
             .map_err(|_| 0x7000_000d_u32)?;
         self.drain_finalizers().map_err(|_| 0x7000_000e_u32)?;
+        if self.shared.boot_resource_grants.has_grants() {
+            let owner = self
+                .shared
+                .boot_resource_grants
+                .take_owner_if_all_grants_available()
+                .map_err(|_| 0x7000_000e_u32)?;
+            self.cleanup.push_optional(
+                self.registry
+                    .release_internal(owner)
+                    .map_err(|_| 0x7000_000e_u32)?,
+            );
+            self.drain_finalizers().map_err(|_| 0x7000_000e_u32)?;
+        }
         let trailing = core::mem::replace(&mut self.cleanup, CleanupQueue::new());
         if self.memory.active_lease_count() != 0
             || self.tasks.process_info(self.process).is_ok()

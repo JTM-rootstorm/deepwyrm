@@ -1746,6 +1746,7 @@ fn boot_grant_status(error: crate::boot::BootResourceLeaseError) -> DwStatus {
         crate::boot::BootResourceLeaseError::GenerationExhausted => DW_STATUS_NO_RESOURCES,
         crate::boot::BootResourceLeaseError::OwnerNotBound => DW_STATUS_BAD_STATE,
         crate::boot::BootResourceLeaseError::OwnerAlreadyBound
+        | crate::boot::BootResourceLeaseError::GrantNotAvailable
         | crate::boot::BootResourceLeaseError::StaleReservation
         | crate::boot::BootResourceLeaseError::FinalizationMismatch => DW_STATUS_BAD_STATE,
     }

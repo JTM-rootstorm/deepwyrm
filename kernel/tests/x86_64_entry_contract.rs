@@ -867,6 +867,7 @@ fn g5_terminal_completion_drains_all_primordial_authority_before_capacity_proof(
         "retire_quiesced_root(",
         "release_terminal_authority()",
         "drain_finalizers()",
+        "take_owner_if_all_grants_available()",
         "prove_registry_capacity()",
     ] {
         assert!(
@@ -883,6 +884,25 @@ fn g5_terminal_completion_drains_all_primordial_authority_before_capacity_proof(
         .unwrap();
     let portable_root_retire = terminal.find("retire_quiesced_root(").unwrap();
     assert!(child_unmap < child_root_reclaim && child_root_reclaim < portable_root_retire);
+    let terminal_authority = terminal.find("release_terminal_authority()").unwrap();
+    let first_drain = terminal[terminal_authority..]
+        .find("drain_finalizers()")
+        .map(|offset| terminal_authority + offset)
+        .unwrap();
+    let grant_owner = terminal
+        .find("take_owner_if_all_grants_available()")
+        .unwrap();
+    let second_drain = terminal[grant_owner..]
+        .find("drain_finalizers()")
+        .map(|offset| grant_owner + offset)
+        .unwrap();
+    let registry_proof = terminal.find("prove_registry_capacity()").unwrap();
+    assert!(
+        terminal_authority < first_drain
+            && first_drain < grant_owner
+            && grant_owner < second_drain
+            && second_drain < registry_proof
+    );
     let observe = completion
         .find("let exit = backend.observe_exit();")
         .unwrap();
