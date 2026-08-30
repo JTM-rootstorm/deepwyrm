@@ -146,9 +146,16 @@ const MEMORY_LEASES: usize = 28;
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
     deepwyrm_wyr1b_evidence,
-    deepwyrm_dw1c_evidence
+    deepwyrm_dw1c_evidence,
+    deepwyrm_dw1d_evidence
 )))]
 const USERSPACE_CHAIN_PROCESSES: usize = 3;
+// Selector 30 has three simultaneously live userspace Processes, but four
+// lifetime-distinct generations: bootstrap, first owner, trigger, and the
+// replacement owner.  The shared bounded geometry also sizes the scheduler's
+// sticky terminal-retirement history, so it must retain all four identities.
+#[cfg(deepwyrm_dw1d_evidence)]
+const USERSPACE_CHAIN_PROCESSES: usize = 4;
 // Primordial, controller, and the fixed ten workload actors.  This is test
 // artifact geometry, not a production process limit.
 #[cfg(deepwyrm_dw1c_evidence)]
@@ -440,6 +447,8 @@ const _: [(); 28] = [(); MEMORY_LEASES];
 const _: [(); 160] = [(); REGISTRY_OBJECTS];
 #[cfg(deepwyrm_dw1c_evidence)]
 const _: [(); 12] = [(); USERSPACE_CHAIN_PROCESSES];
+#[cfg(deepwyrm_dw1d_evidence)]
+const _: [(); 4] = [(); USERSPACE_CHAIN_PROCESSES];
 #[cfg(deepwyrm_dw1c_evidence)]
 const _: [(); 32] = [(); CHANNEL_PAIRS];
 #[cfg(deepwyrm_dw1c_evidence)]

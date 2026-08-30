@@ -876,6 +876,11 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
     );
     assert!(runtime.contains("const USERSPACE_CHAIN_PROCESSES: usize = 3;"));
     assert!(
+        runtime.contains(
+            "#[cfg(deepwyrm_dw1d_evidence)]\nconst USERSPACE_CHAIN_PROCESSES: usize = 4;"
+        )
+    );
+    assert!(
         runtime
             .contains("#[cfg(deepwyrm_wrcap_relay)]\nconst USERSPACE_CHAIN_PROCESSES: usize = 4;")
     );
