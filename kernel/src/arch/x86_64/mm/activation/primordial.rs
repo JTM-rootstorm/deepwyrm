@@ -262,7 +262,8 @@ const BOOTSTRAP_HANDLE_PEAK: usize = INITIAL_BOOTSTRAP_HANDLES
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
     deepwyrm_wyr1b_evidence,
-    deepwyrm_dw1c_evidence
+    deepwyrm_dw1c_evidence,
+    deepwyrm_dw1d_evidence
 )))]
 const HANDLES: usize = BOOTSTRAP_HANDLE_PEAK;
 #[cfg(deepwyrm_dw1c_evidence)]
@@ -278,6 +279,26 @@ const HANDLES: usize = BOOTSTRAP_HANDLE_PEAK + 1;
 // handles + the ordinary six-handle loader delta produce the exact peak 13.
 #[cfg(deepwyrm_wyr1_evidence)]
 const HANDLES: usize = BOOTSTRAP_HANDLE_PEAK + 3;
+// Selector 30 receives the ordinary four bootstrap capabilities plus the
+// boot-resource domain.  After the first owner exits, bootstrap retains the
+// trigger's Process and launch Channel while the replacement owner loader
+// holds its net Channel, Process+root, Thread, and resource-domain staging
+// duplicate.  That exact replacement-launch peak is twelve handles.
+#[cfg(deepwyrm_dw1d_evidence)]
+const D6_INITIAL_HANDLES: usize = INITIAL_BOOTSTRAP_HANDLES + 1;
+#[cfg(deepwyrm_dw1d_evidence)]
+const D6_RETAINED_TRIGGER_HANDLES: usize = 2;
+#[cfg(deepwyrm_dw1d_evidence)]
+const D6_RESOURCE_DOMAIN_DUPLICATE_HANDLES: usize = 1;
+#[cfg(deepwyrm_dw1d_evidence)]
+const D6_HANDLE_PEAK: usize = D6_INITIAL_HANDLES
+    + D6_RETAINED_TRIGGER_HANDLES
+    + CHANNEL_CREATE_REDUCE_NET_HANDLES
+    + PROCESS_ROOT_HANDLES
+    + THREAD_HANDLES
+    + D6_RESOURCE_DOMAIN_DUPLICATE_HANDLES;
+#[cfg(deepwyrm_dw1d_evidence)]
+const HANDLES: usize = D6_HANDLE_PEAK;
 #[cfg(deepwyrm_dw1b_evidence)]
 const HANDLES: usize = 16;
 #[cfg(deepwyrm_wyr1b_evidence)]
@@ -367,7 +388,8 @@ const _: [(); PROCESSES] = [(); EXECUTION_THREADS];
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
     deepwyrm_wyr1b_evidence,
-    deepwyrm_dw1c_evidence
+    deepwyrm_dw1c_evidence,
+    deepwyrm_dw1d_evidence
 )))]
 const _: [(); 10] = [(); HANDLES];
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
@@ -376,6 +398,8 @@ const _: [(); 16] = [(); HANDLES];
 const _: [(); 11] = [(); HANDLES];
 #[cfg(deepwyrm_wyr1_evidence)]
 const _: [(); 13] = [(); HANDLES];
+#[cfg(deepwyrm_dw1d_evidence)]
+const _: [(); 12] = [(); HANDLES];
 #[cfg(deepwyrm_wyr1_evidence)]
 const _: [(); 4] = [(); USERSPACE_CHAIN_PROCESSES];
 #[cfg(deepwyrm_wyr1_evidence)]

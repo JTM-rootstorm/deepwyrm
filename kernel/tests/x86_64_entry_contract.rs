@@ -937,6 +937,11 @@ fn i0_live_handle_capacity_covers_both_init_duplicates_before_three_moves() {
         "const _: [(); 10] = [(); HANDLES];",
         "const HANDLES: usize = BOOTSTRAP_HANDLE_PEAK + 1;",
         "const _: [(); 11] = [(); HANDLES];",
+        "const D6_INITIAL_HANDLES: usize = INITIAL_BOOTSTRAP_HANDLES + 1;",
+        "const D6_RETAINED_TRIGGER_HANDLES: usize = 2;",
+        "const D6_RESOURCE_DOMAIN_DUPLICATE_HANDLES: usize = 1;",
+        "const HANDLES: usize = D6_HANDLE_PEAK;",
+        "const _: [(); 12] = [(); HANDLES];",
         "const _: [(); 7] = [(); BOOTSTRAP_HANDLE_PEAK - INIT_MOVED_HANDLES];",
     ] {
         assert!(
@@ -948,6 +953,11 @@ fn i0_live_handle_capacity_covers_both_init_duplicates_before_three_moves() {
         "const BOOTSTRAP_HANDLE_PEAK: usize = INITIAL_BOOTSTRAP_HANDLES + \
          CHANNEL_CREATE_REDUCE_NET_HANDLES + PROCESS_ROOT_HANDLES + THREAD_HANDLES + \
          INIT_DUPLICATE_HANDLES;"
+    ));
+    assert!(normalized_primordial.contains(
+        "const D6_HANDLE_PEAK: usize = D6_INITIAL_HANDLES + D6_RETAINED_TRIGGER_HANDLES + \
+         CHANNEL_CREATE_REDUCE_NET_HANDLES + PROCESS_ROOT_HANDLES + THREAD_HANDLES + \
+         D6_RESOURCE_DOMAIN_DUPLICATE_HANDLES;"
     ));
 
     let mut old_capacity = occupancy_before_init_duplicates(8);
@@ -963,6 +973,28 @@ fn i0_live_handle_capacity_covers_both_init_duplicates_before_three_moves() {
     assert_eq!(chosen_capacity, 10, "full table must not overclaim");
     assert!(move_out(&mut chosen_capacity, 3));
     assert_eq!(chosen_capacity, 7);
+
+    // D6 begins with five bootstrap handles and retains the trigger Process
+    // plus launch Channel while constructing the replacement owner.  Eleven
+    // slots admit the transient Thread but reject its staged resource-domain
+    // duplicate; the exact twelve-slot selector geometry admits the MOVE and
+    // closes the parent root and Thread back to the two returned handles.
+    let mut undersized_d6 = 5;
+    for count in [2, 1, 2, 1] {
+        assert!(claim(&mut undersized_d6, 11, count));
+    }
+    assert_eq!(undersized_d6, 11);
+    assert!(!claim(&mut undersized_d6, 11, 1));
+
+    let mut chosen_d6 = 5;
+    for count in [2, 1, 2, 1, 1] {
+        assert!(claim(&mut chosen_d6, 12, count));
+    }
+    assert_eq!(chosen_d6, 12);
+    assert!(move_out(&mut chosen_d6, 1));
+    assert!(move_out(&mut chosen_d6, 1));
+    assert!(move_out(&mut chosen_d6, 1));
+    assert_eq!(chosen_d6, 9);
 }
 
 #[test]
