@@ -16,6 +16,10 @@ const fn primordial_application_summary(application_code: u32) -> u32 {
         0x10 | (application_code & 0x0f)
     } else if application_code & 0xffff_0000 == 0xaf11_0000 {
         0x20 | (application_code & 0x1f)
+    } else if application_code & 0xffff_0000 == 0xaf1c_0000 {
+        // Selector 29 preserves the bounded system-init pre-READY failure
+        // category without exposing a production application-status ABI.
+        0x20 | (application_code & 0x1f)
     } else if application_code & 0xff00_0000 == 0xb400_0000 {
         // B4 terminal records dedicate four bits each to the saturated
         // termination reason and exception type. Those two fields exactly
@@ -88,6 +92,20 @@ mod tests {
         for (index, summary) in observed.iter_mut().enumerate() {
             let ordinal = u32::try_from(index + 1).unwrap();
             *summary = primordial_terminal_summary(Some(normal_exit(0xaf11_0000 | ordinal)));
+            assert_eq!(*summary, 0x20 | ordinal);
+        }
+
+        for (index, summary) in observed.iter().enumerate() {
+            assert!(observed[..index].iter().all(|prior| prior != summary));
+        }
+    }
+
+    #[test]
+    fn selector29_terminal_summary_preserves_af1c_mapping_ordinals() {
+        let mut observed = [0_u32; 31];
+        for (index, summary) in observed.iter_mut().enumerate() {
+            let ordinal = u32::try_from(index + 1).unwrap();
+            *summary = primordial_terminal_summary(Some(normal_exit(0xaf1c_0000 | ordinal)));
             assert_eq!(*summary, 0x20 | ordinal);
         }
 
