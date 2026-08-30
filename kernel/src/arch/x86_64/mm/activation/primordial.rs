@@ -1102,10 +1102,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// Synchronizes the scheduler-current root without crossing an already
     /// published remote Stop. Terminal preparation deliberately moves a
     /// remote current's execution resources while retaining its scheduler
-    /// claim until the target acknowledges that Stop, so the mailbox must win
-    /// before `prepare_scheduler_root_switch` consults those resources.
+    /// claim until the target acknowledges that Stop. Preparation and mailbox
+    /// publication straddle the shared runtime guard, so a target that enters
+    /// that narrow gap waits for publication before root synchronization.
     fn synchronize_scheduler_current_at_safe_point_detached(&mut self) -> bool {
-        let prepared = {
+        let prepared = loop {
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);
             if matches!(
@@ -1114,7 +1115,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             ) {
                 return false;
             }
-            runtime.prepare_scheduler_root_switch()
+            if runtime
+                .shared
+                .execution
+                .terminal_stop_publication_pending_on(&runtime.tasks, self.cpu)
+                .unwrap_or_else(|error| {
+                    panic!("scheduler-current terminal state lookup failed: {error:?}")
+                })
+            {
+                drop(runtime);
+                core::hint::spin_loop();
+                continue;
+            }
+            break runtime.prepare_scheduler_root_switch();
         };
         let Some(prepared) = prepared else {
             return true;
