@@ -51,6 +51,8 @@ pub(crate) use adapters::{
 
 #[cfg(all(target_os = "none", target_arch = "x86_64", deepwyrm_e7_guest))]
 pub(crate) use adapters::clock_get;
+#[cfg(all(deepwyrm_dw1d_evidence, target_os = "none", target_arch = "x86_64"))]
+pub(crate) use adapters::interrupt_ack_dw1d;
 #[cfg(all(deepwyrm_f12_guest, not(deepwyrm_integrated)))]
 pub(crate) use adapters::process_terminate;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
@@ -75,8 +77,7 @@ pub(crate) use adapters::{
     complete_prepared_thread_termination_after_remote_stops_on, complete_wait_wakes,
     decode_map_args, device_pio_read, device_pio_write, device_resource_claim, handle_close,
     handle_duplicate, inspect_process_termination_threads, inspect_task_group_termination_threads,
-    inspect_thread_termination_threads, interrupt_ack, interrupt_create, object_get_info_v1,
-    object_get_info_v1_with_device_objects, object_get_info_v1_with_devices,
+    inspect_thread_termination_threads, interrupt_create, object_get_info_v1_with_device_objects,
     prepare_address_region_mutation, prepare_process_exit, prepare_process_terminate,
     prepare_process_unhandled_exception, prepare_task_group_terminate, prepare_thread_terminate,
     process_exit_on, process_unhandled_exception_on, task_group_create,
@@ -88,6 +89,13 @@ pub(crate) use adapters::{
 pub(crate) use adapters::{complete_deferred_current_reclaim_on, process_exit_on};
 #[cfg(all(deepwyrm_f12_guest, not(deepwyrm_integrated)))]
 pub(crate) use adapters::{handle_close, handle_duplicate, object_get_info_v1};
+#[cfg(all(
+    deepwyrm_integrated,
+    target_os = "none",
+    target_arch = "x86_64",
+    not(deepwyrm_dw1d_evidence)
+))]
+pub(crate) use adapters::{interrupt_ack, object_get_info_v1, object_get_info_v1_with_devices};
 
 use deepwyrm_abi::{
     DW_STATUS_NOT_SUPPORTED, DwKnownSyscall, DwStatus, DwSyscallId, DwSyscallImplementationPhase,

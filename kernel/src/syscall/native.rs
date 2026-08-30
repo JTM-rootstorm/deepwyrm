@@ -967,6 +967,16 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
         panic!("native runtime does not admit selector-28 evidence")
     }
 
+    /// Selector-30-only private synthetic D6 authority protocol. It is not
+    /// part of generated ABI decode and exists only in the selected test build.
+    #[cfg(deepwyrm_dw1d_evidence)]
+    fn intercept_dw1d_evidence_raw(
+        &mut self,
+        _arguments: RawSyscallArguments,
+    ) -> NativeSyscallResult {
+        panic!("native runtime does not admit selector-30 evidence")
+    }
+
     fn authorize_return(
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
@@ -1092,7 +1102,8 @@ pub(crate) fn dispatch_frame<R: NativeSyscallFrameRuntime>(
         deepwyrm_wyr1_evidence,
         deepwyrm_dw1b_evidence,
         deepwyrm_wyr1b_evidence,
-        deepwyrm_dw1c_evidence
+        deepwyrm_dw1c_evidence,
+        deepwyrm_dw1d_evidence
     ))]
     let result = match frame.request() {
         #[cfg(deepwyrm_wyr1_evidence)]
@@ -1111,6 +1122,10 @@ pub(crate) fn dispatch_frame<R: NativeSyscallFrameRuntime>(
         Some((id, arguments)) if id.0 == crate::test_support::DW1C_EVIDENCE_RAW_SYSCALL => {
             runtime.intercept_dw1c_evidence_raw(arguments)
         }
+        #[cfg(deepwyrm_dw1d_evidence)]
+        Some((id, arguments)) if id.0 == crate::test_support::DW1D_EVIDENCE_RAW_SYSCALL => {
+            runtime.intercept_dw1d_evidence_raw(arguments)
+        }
         Some((id, arguments)) => dispatch_native(runtime, id, arguments),
         None => NativeSyscallResult::returning(DW_STATUS_INVALID_ARGUMENT),
     };
@@ -1118,7 +1133,8 @@ pub(crate) fn dispatch_frame<R: NativeSyscallFrameRuntime>(
         deepwyrm_wyr1_evidence,
         deepwyrm_dw1b_evidence,
         deepwyrm_wyr1b_evidence,
-        deepwyrm_dw1c_evidence
+        deepwyrm_dw1c_evidence,
+        deepwyrm_dw1d_evidence
     )))]
     let result = match frame.request() {
         Some((id, arguments)) => dispatch_native(runtime, id, arguments),

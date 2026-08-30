@@ -16,6 +16,13 @@ pub(crate) use interrupt::{
     interrupt_create, prepare_interrupt_ack,
 };
 
+#[cfg(any(test, deepwyrm_dw1d_evidence))]
+#[allow(
+    unused_imports,
+    reason = "selector-30 collector and target runtime consume the private binding identity"
+)]
+pub(crate) use interrupt::InterruptBinding;
+
 pub(crate) use resource::DeviceResourceBinding;
 #[allow(
     unused_imports,

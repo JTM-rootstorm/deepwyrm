@@ -88,6 +88,16 @@ pub(crate) struct DeviceResourceFinalization {
     grant: Option<DeviceResourceGrantLease>,
 }
 
+impl DeviceResourceFinalization {
+    #[cfg(deepwyrm_dw1d_evidence)]
+    pub(crate) const fn dw1d_grant_identity(&self) -> Option<(u64, ObjectId, u64)> {
+        match self.grant {
+            Some(grant) => Some((grant.resource_id, grant.object, grant.lease_generation)),
+            None => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DeviceResourceGrantLease {
     pub(crate) resource_id: u64,
@@ -354,7 +364,7 @@ impl<const RESOURCES: usize> DeviceResourceAuthority<RESOURCES> {
         Ok(access)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, deepwyrm_dw1d_evidence))]
     pub(crate) fn live_count(&self) -> usize {
         self.resources.lock().iter().flatten().count()
     }

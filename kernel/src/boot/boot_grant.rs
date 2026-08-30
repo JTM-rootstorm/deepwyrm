@@ -43,7 +43,11 @@ pub(crate) struct BootResourceGrant {
 }
 
 impl BootResourceGrant {
-    #[cfg(test)]
+    #[cfg(any(test, deepwyrm_dw1d_evidence))]
+    #[allow(
+        dead_code,
+        reason = "selector-30 consumes this only in the target runtime"
+    )]
     pub(crate) const fn descriptor(self) -> BootResourceDescriptor {
         self.descriptor
     }
@@ -121,7 +125,11 @@ impl BootResourceGrants {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, deepwyrm_dw1d_evidence))]
+    #[allow(
+        dead_code,
+        reason = "selector-30 consumes this only in the target runtime"
+    )]
     pub(crate) const fn len(self) -> usize {
         self.count
     }
@@ -130,7 +138,11 @@ impl BootResourceGrants {
         self.count == 0
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, deepwyrm_dw1d_evidence))]
+    #[allow(
+        dead_code,
+        reason = "selector-30 consumes this only in the target runtime"
+    )]
     pub(crate) fn grant(self, index: usize) -> Option<BootResourceGrant> {
         if index >= self.count {
             return None;
@@ -352,7 +364,11 @@ impl BootResourceGrantAuthority {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, deepwyrm_dw1d_evidence))]
+    #[allow(
+        dead_code,
+        reason = "selector-30 consumes this only in the target runtime"
+    )]
     pub(crate) fn state_for(&self, resource_id: u64) -> Option<(u64, BootResourceGrantState)> {
         let state = self.state.lock();
         state.grants.grants[..state.grants.count]

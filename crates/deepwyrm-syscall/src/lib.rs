@@ -182,6 +182,36 @@ pub fn object_get_memory_object_info_v1(
     )
 }
 
+/// Query immutable DeviceResource identity, lease, PIO range, and source metadata.
+#[inline]
+pub fn object_get_device_resource_info_v1(
+    handle: DwHandle,
+    out_info: &mut DwDeviceResourceInfoV1,
+    out_required_size: &mut u64,
+) -> DwStatus {
+    object_get_info_v1(
+        handle,
+        DW_OBJECT_INFO_DEVICE_RESOURCE_V1,
+        out_info,
+        out_required_size,
+    )
+}
+
+/// Query exact Interrupt source, parent lease, generation, and pending state.
+#[inline]
+pub fn object_get_interrupt_info_v1(
+    handle: DwHandle,
+    out_info: &mut DwInterruptInfoV1,
+    out_required_size: &mut u64,
+) -> DwStatus {
+    object_get_info_v1(
+        handle,
+        DW_OBJECT_INFO_INTERRUPT_V1,
+        out_info,
+        out_required_size,
+    )
+}
+
 /// Query generated Process or Thread lifecycle and termination state.
 #[inline]
 pub fn object_get_task_state_v1(
@@ -327,6 +357,95 @@ pub fn memory_object_create(
             0,
         )
     }
+}
+
+/// Claim one exact available boot DeviceResource in a resource-domain TaskGroup.
+#[inline]
+pub fn device_resource_claim(
+    resource_domain: DwHandle,
+    resource_id: u64,
+    requested_rights: DwRights,
+    out_resource: &mut DwHandle,
+) -> DwStatus {
+    // SAFETY: scalar ABI values are copied and the output handle remains uniquely borrowed.
+    unsafe {
+        syscall6(
+            DW_SYSCALL_DEVICE_RESOURCE_CLAIM,
+            resource_domain.0,
+            resource_id,
+            requested_rights.0,
+            output_address(out_resource),
+            0,
+            0,
+        )
+    }
+}
+
+/// Read one checked scalar value from a DeviceResource PIO range.
+#[inline]
+pub fn device_pio_read(
+    resource: DwHandle,
+    offset: u32,
+    width: u32,
+    out_value: &mut u32,
+) -> DwStatus {
+    // SAFETY: scalar ABI values are copied and the output remains uniquely borrowed.
+    unsafe {
+        syscall6(
+            DW_SYSCALL_DEVICE_PIO_READ,
+            resource.0,
+            u64::from(offset),
+            u64::from(width),
+            output_address(out_value),
+            0,
+            0,
+        )
+    }
+}
+
+/// Write one checked scalar value to a DeviceResource PIO range.
+#[inline]
+pub fn device_pio_write(resource: DwHandle, offset: u32, width: u32, value: u32) -> DwStatus {
+    // SAFETY: all arguments are generated scalar ABI values.
+    unsafe {
+        syscall6(
+            DW_SYSCALL_DEVICE_PIO_WRITE,
+            resource.0,
+            u64::from(offset),
+            u64::from(width),
+            u64::from(value),
+            0,
+            0,
+        )
+    }
+}
+
+/// Create one exclusive Interrupt derived from a live DeviceResource.
+#[inline]
+pub fn interrupt_create(
+    resource: DwHandle,
+    requested_rights: DwRights,
+    out_interrupt: &mut DwHandle,
+) -> DwStatus {
+    // SAFETY: scalar ABI values are copied and the output remains uniquely borrowed.
+    unsafe {
+        syscall6(
+            DW_SYSCALL_INTERRUPT_CREATE,
+            resource.0,
+            requested_rights.0,
+            output_address(out_interrupt),
+            0,
+            0,
+            0,
+        )
+    }
+}
+
+/// Acknowledge one pending Interrupt fact and rearm its exact binding when possible.
+#[inline]
+pub fn interrupt_ack(interrupt: DwHandle) -> DwStatus {
+    // SAFETY: `interrupt` is a generated scalar ABI argument.
+    unsafe { syscall6(DW_SYSCALL_INTERRUPT_ACK, interrupt.0, 0, 0, 0, 0, 0) }
 }
 
 /// Atomically send one native Channel datagram and optional moved handles.

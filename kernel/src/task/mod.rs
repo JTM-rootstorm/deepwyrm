@@ -53,11 +53,14 @@ pub(crate) use scheduler::{
     SchedulerThreadState,
 };
 
+#[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
+#[allow(unused_imports)]
+pub(crate) use scheduler::Dw1cFinalSchedulerSnapshot;
+
 #[cfg(any(test, deepwyrm_dw1c_evidence))]
 #[allow(unused_imports)]
 pub(crate) use scheduler::{
-    Dw1cContinuationDetachRequest, Dw1cFinalSchedulerSnapshot, Dw1cSchedulerActorIdentity,
-    Dw1cTerminalGate,
+    Dw1cContinuationDetachRequest, Dw1cSchedulerActorIdentity, Dw1cTerminalGate,
 };
 
 #[cfg(any(test, deepwyrm_dw1c_evidence))]

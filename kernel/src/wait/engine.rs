@@ -243,6 +243,17 @@ impl ResolvedWaitSet {
             .then(|| ChannelEndpointKey::from_object_id(item.target.object_id()))
     }
 
+    #[cfg(deepwyrm_dw1d_evidence)]
+    fn exact_signaled_interrupt(&self) -> Option<crate::object::ObjectId> {
+        if self.len != 1 {
+            return None;
+        }
+        let item = self.items[0].as_ref()?;
+        (item.target.object_type() == DW_OBJECT_TYPE_INTERRUPT
+            && item.desired == deepwyrm_abi::DW_SIGNAL_SIGNALED)
+            .then(|| item.target.object_id())
+    }
+
     pub(crate) fn select_ready<
         const GROUPS: usize,
         const PROCESSES: usize,
@@ -654,6 +665,8 @@ pub(crate) fn begin_registered_wait<
 
     #[cfg(deepwyrm_dw1c_evidence)]
     let token7_writable_channel = set.exact_writable_channel();
+    #[cfg(deepwyrm_dw1d_evidence)]
+    let dw1d_interrupt = set.exact_signaled_interrupt();
 
     match set.select_ready(tasks, &sources) {
         Ok(Some(selection)) => {
@@ -960,6 +973,22 @@ pub(crate) fn begin_registered_wait<
                                 panic!("selector-28 token-7 block observation failed: {error:?}")
                             });
                     }
+                    #[cfg(deepwyrm_dw1d_evidence)]
+                    if let Some(interrupt) = dw1d_interrupt.filter(|interrupt| {
+                        crate::test_support::DW1D_EVIDENCE
+                            .tracks_interrupt_wait(process, *interrupt)
+                    }) {
+                        crate::test_support::DW1D_EVIDENCE
+                            .observe_wait_blocked(
+                                process,
+                                interrupt,
+                                wake.execution_generation(),
+                                wake.token(),
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!("selector-30 wait block observation failed: {error:?}")
+                            });
+                    }
                     Ok(WaitBeginOutcome::Suspended { wake, decision })
                 }
                 Err(error) => panic!("fresh F7 winner ledger disappeared: {error:?}"),
@@ -1040,6 +1069,8 @@ pub(crate) fn finish_wait_operation<
     let operation = operations
         .take_wake(wake)
         .map_err(WaitFinishError::Operation)?;
+    #[cfg(deepwyrm_dw1d_evidence)]
+    let process = operation.process();
     let winner = operation
         .winner(execution.blocked_operations())
         .map_err(WaitFinishError::Blocked)?
@@ -1048,6 +1079,20 @@ pub(crate) fn finish_wait_operation<
     let (output, deadline) = operation
         .complete(execution.blocked_operations(), tasks, winner)
         .map_err(WaitFinishError::Blocked)?;
+    #[cfg(deepwyrm_dw1d_evidence)]
+    if let BlockedOperationWinner::Signal { observed, .. } = winner
+        && crate::test_support::DW1D_EVIDENCE.tracks_wait_completion(
+            process,
+            wake.execution_generation(),
+            wake.token(),
+        )
+    {
+        crate::test_support::DW1D_EVIDENCE
+            .observe_wait_completion(process, wake.execution_generation(), wake.token(), observed)
+            .unwrap_or_else(|error| {
+                panic!("selector-30 wait completion observation failed: {error:?}")
+            });
+    }
     cancel_deadline_exact(&mut deadline_authority, deadline).map_err(WaitFinishError::Deadline)?;
     Ok((output, winner, releases))
 }
@@ -1089,11 +1134,17 @@ pub(crate) fn finish_terminal_wait<
     let Some(operation) = operations.take_thread(thread) else {
         return Ok(None);
     };
+    #[cfg(deepwyrm_dw1d_evidence)]
+    let process = operation.process();
     let wake = operation.wake_key();
     let releases = release_cancelled_generation(registry, waits.cancel_generation(wake));
     let (output, deadline) = operation
         .complete_terminal(execution.blocked_operations(), tasks)
         .map_err(WaitFinishError::Blocked)?;
+    #[cfg(deepwyrm_dw1d_evidence)]
+    crate::test_support::DW1D_EVIDENCE
+        .observe_terminal_wait_cancelled(process, wake.execution_generation(), wake.token())
+        .unwrap_or_else(|error| panic!("selector-30 terminal wait observation failed: {error:?}"));
     cancel_deadline_exact(&mut deadline_authority, deadline).map_err(WaitFinishError::Deadline)?;
     Ok(Some((output, releases)))
 }

@@ -687,7 +687,7 @@ pub(crate) struct SchedulerCounters {
 /// retained ownership and accounting invariant has been validated. They are
 /// scheduler-snapshot identities for DW1-C records 42 and 44, not actor tokens
 /// or actor execution generations.
-#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Dw1cFinalSchedulerSnapshot {
     token: u64,
@@ -696,7 +696,7 @@ pub(crate) struct Dw1cFinalSchedulerSnapshot {
     accounting_mask: u8,
 }
 
-#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
 impl Dw1cFinalSchedulerSnapshot {
     pub(crate) const fn token(self) -> u64 {
         self.token
@@ -884,9 +884,9 @@ struct SchedulerState<const CAPACITY: usize> {
     next_idle_generation: u64,
     next_wake_generation: u64,
     next_completed_switch_generation: u64,
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
     next_final_snapshot_token: u64,
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
     next_final_snapshot_generation: u64,
     next_quantum_generation: [u64; H2_SCHEDULER_CPU_CAPACITY],
     queue: [Option<QueueEntry>; CAPACITY],
@@ -907,11 +907,11 @@ struct SchedulerState<const CAPACITY: usize> {
     dw1c_fixture: Option<Dw1cSchedulerFixture>,
     #[cfg(any(test, deepwyrm_dw1c_evidence))]
     dw1c_continuation_detach: [Option<Dw1cContinuationDetachRequest>; H2_SCHEDULER_CPU_CAPACITY],
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
     accounting_underflow_fault: bool,
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
     time_regression_fault: bool,
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
     terminal_retired: [Option<ThreadKey>; CAPACITY],
     #[cfg(test)]
     trace: SchedulerTrace,
@@ -929,9 +929,9 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             next_idle_generation: 1,
             next_wake_generation: 1,
             next_completed_switch_generation: 1,
-            #[cfg(any(test, deepwyrm_dw1c_evidence))]
+            #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
             next_final_snapshot_token: 1,
-            #[cfg(any(test, deepwyrm_dw1c_evidence))]
+            #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
             next_final_snapshot_generation: 1,
             next_quantum_generation: [1; H2_SCHEDULER_CPU_CAPACITY],
             queue: [None; CAPACITY],
@@ -952,11 +952,11 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             dw1c_fixture: None,
             #[cfg(any(test, deepwyrm_dw1c_evidence))]
             dw1c_continuation_detach: [None; H2_SCHEDULER_CPU_CAPACITY],
-            #[cfg(any(test, deepwyrm_dw1c_evidence))]
+            #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
             accounting_underflow_fault: false,
-            #[cfg(any(test, deepwyrm_dw1c_evidence))]
+            #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
             time_regression_fault: false,
-            #[cfg(any(test, deepwyrm_dw1c_evidence))]
+            #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
             terminal_retired: [None; CAPACITY],
             #[cfg(test)]
             trace: SchedulerTrace::new(),
@@ -978,13 +978,13 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         match error {
             SchedulerError::AccountingOverflow | SchedulerError::AccountingUnderflow => {
                 self.accounting.retain_faults_from(attempted);
-                #[cfg(any(test, deepwyrm_dw1c_evidence))]
+                #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
                 if error == SchedulerError::AccountingUnderflow {
                     self.accounting_underflow_fault = true;
                 }
             }
             SchedulerError::TimeRegression => {
-                #[cfg(any(test, deepwyrm_dw1c_evidence))]
+                #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
                 {
                     self.time_regression_fault = true;
                 }
@@ -996,14 +996,14 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
     }
 
     fn reject_time_regression(&mut self) -> SchedulerError {
-        #[cfg(any(test, deepwyrm_dw1c_evidence))]
+        #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
         {
             self.time_regression_fault = true;
         }
         SchedulerError::TimeRegression
     }
 
-    #[cfg(deepwyrm_dw1c_evidence)]
+    #[cfg(any(deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
     fn validate_terminal_retirement(&self, thread: ThreadKey) -> Result<(), SchedulerError> {
         if self.terminal_retired.contains(&Some(thread)) {
             // Scheduler-level models may legitimately reserve and retire the
@@ -1019,12 +1019,12 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         Ok(())
     }
 
-    #[cfg(not(deepwyrm_dw1c_evidence))]
+    #[cfg(not(any(deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence)))]
     fn validate_terminal_retirement(&self, _thread: ThreadKey) -> Result<(), SchedulerError> {
         Ok(())
     }
 
-    #[cfg(deepwyrm_dw1c_evidence)]
+    #[cfg(any(deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
     fn record_terminal_retirement(&mut self, thread: ThreadKey) {
         if self.terminal_retired.contains(&Some(thread)) {
             return;
@@ -1037,7 +1037,7 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         *slot = Some(thread);
     }
 
-    #[cfg(not(deepwyrm_dw1c_evidence))]
+    #[cfg(not(any(deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence)))]
     fn record_terminal_retirement(&mut self, _thread: ThreadKey) {}
 
     fn assert_invariants(&self) {
@@ -3763,7 +3763,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     /// lock. No payload is returned, and no snapshot identity is consumed,
     /// unless the complete live state and every sticky diagnostic remain
     /// sound.
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
     pub(crate) fn dw1c_final_snapshot(&self) -> Result<Dw1cFinalSchedulerSnapshot, SchedulerError> {
         const ACCOUNTING_SOUND_MASK: u8 = 0x3f;
 

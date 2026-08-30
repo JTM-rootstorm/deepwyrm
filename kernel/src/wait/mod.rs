@@ -790,7 +790,7 @@ impl<const CAPACITY: usize> WaitRegistry<CAPACITY> {
         batch
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, deepwyrm_dw1d_evidence))]
     pub(crate) fn len(&self) -> usize {
         self.slots
             .lock()

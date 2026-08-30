@@ -316,9 +316,11 @@ fn both_toolchain_identities_pin_the_same_project_cargo_home() {
 
     let wrapper = std::fs::read_to_string(workspace().join("tools/pinned-cargo"))
         .expect("read canonical pinned-Cargo wrapper");
-    assert!(wrapper.contains("the worktree's parent is the project root"));
-    assert!(wrapper.contains("independent\nnon-symlink trees"));
-    assert!(wrapper.contains("never falls back to a canonical checkout's\nmutable Cargo cache"));
+    assert!(wrapper.contains(".worktrees/deepwyrm/<lane>"));
+    assert!(wrapper.contains("common_git_dir=$(git -C \"$workspace\" rev-parse"));
+    assert!(wrapper.contains("lane worktree is not registered to canonical deepwyrm"));
+    assert!(wrapper.contains("project_root=$lane_project_root"));
+    assert!(wrapper.contains("The lane still owns an isolated target directory"));
 }
 
 #[test]

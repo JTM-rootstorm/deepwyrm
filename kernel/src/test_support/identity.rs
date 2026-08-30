@@ -39,6 +39,7 @@ pub(crate) enum BuildGuestTest {
     NormalPreemptionUp,
     BootstrapRegistryLaunch,
     NormalPreemptionSmp,
+    DeviceResourceInterruptSynthetic,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,6 +107,7 @@ impl BuildGuestTest {
             Self::NormalPreemptionUp => 26,
             Self::BootstrapRegistryLaunch => 27,
             Self::NormalPreemptionSmp => 28,
+            Self::DeviceResourceInterruptSynthetic => 30,
         }
     }
 
@@ -146,6 +148,7 @@ impl BuildGuestTest {
                 | Self::NormalPreemptionUp
                 | Self::BootstrapRegistryLaunch
                 | Self::NormalPreemptionSmp
+                | Self::DeviceResourceInterruptSynthetic
         )
     }
 
@@ -261,6 +264,8 @@ const fn parse_known_selector(value: &str) -> BuildGuestTest {
         BuildGuestTest::BootstrapRegistryLaunch
     } else if string_equals(value, "normal-preemption-smp") {
         BuildGuestTest::NormalPreemptionSmp
+    } else if string_equals(value, "device-resource-interrupt-synthetic") {
+        BuildGuestTest::DeviceResourceInterruptSynthetic
     } else {
         panic!("unknown build-selected guest test")
     }

@@ -436,7 +436,7 @@ fn delivery_racing_prepared_ack_survives_and_source_remains_masked() {
         handle,
     )
     .unwrap();
-    assert_eq!(transaction.binding_for_test(), Some(binding));
+    assert_eq!(transaction.binding_for_evidence(), Some(binding));
     assert_eq!(fixture.deliver(binding).len(), 0);
     assert_eq!(
         transaction.complete(

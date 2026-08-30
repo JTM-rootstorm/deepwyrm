@@ -168,3 +168,9 @@ state = "implemented"
 [guest_test.normal-preemption-smp]
 id = 28
 state = "implemented"
+
+# DW1-D's selector-local ring-3 DeviceResource/Interrupt proof. The private
+# raw trigger protocol is compiled only for this selector and is not native ABI.
+[guest_test.device-resource-interrupt-synthetic]
+id = 30
+state = "implemented"

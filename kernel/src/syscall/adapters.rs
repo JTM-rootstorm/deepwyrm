@@ -1673,6 +1673,15 @@ fn device_resource_claim_under_operation<
         return Err(DW_STATUS_NO_RESOURCES);
     }
     grants.commit(reservation, key.object_id());
+    #[cfg(deepwyrm_dw1d_evidence)]
+    crate::test_support::DW1D_EVIDENCE
+        .observe_claim(
+            current_process,
+            descriptor.resource_id,
+            key.object_id(),
+            descriptor.lease_generation,
+        )
+        .unwrap_or_else(|error| panic!("selector-30 claim observation failed: {error:?}"));
     if fail_at == Some(DeviceResourceClaimCommitFailure::PostPublication) {
         let final_release = tasks
             .process_handles_mut_for_operation(operation, current_process)
@@ -1888,6 +1897,72 @@ pub(crate) fn interrupt_ack<
         Ok(Err(status)) => status,
         Err(error) => task_status(error),
     }
+}
+
+#[cfg(deepwyrm_dw1d_evidence)]
+pub(crate) fn interrupt_ack_dw1d<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const INTERRUPTS: usize,
+    const SOURCES: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    interrupts: &InterruptAuthority<INTERRUPTS>,
+    platform: &crate::device::InterruptPlatformModel<SOURCES>,
+    waits: &WaitRegistry<WAITERS>,
+    execution: &ExecutionDomain<EXECUTION>,
+    current_process: ProcessKey,
+    interrupt: DwHandle,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
+    let transaction = match process_handle_operation!(tasks, current_process, table, {
+        crate::device::prepare_interrupt_ack(table, registry, interrupts, interrupt)
+    }) {
+        Ok(Ok(transaction)) => transaction,
+        Ok(Err(status)) => return status,
+        Err(error) => return task_status(error),
+    };
+    let binding = transaction
+        .binding_for_evidence()
+        .unwrap_or_else(|| panic!("selector-30 ack unexpectedly entered coalesced completion"));
+    let plan = crate::test_support::DW1D_EVIDENCE
+        .ack_prepared(current_process, binding)
+        .unwrap_or_else(|error| {
+            panic!("selector-30 ack preparation observation failed: {error:?}")
+        });
+    let mut race_wakes = WakeBatch::empty();
+    if let crate::test_support::Dw1dAckPlan::InjectRace(expected) = plan {
+        assert_eq!(expected, binding, "selector-30 race permit changed binding");
+        let delivery = platform.prepare_delivery(binding).unwrap_or_else(|error| {
+            panic!("selector-30 race delivery preparation failed: {error:?}")
+        });
+        let (accepted, wakes) = interrupts.deliver(delivery, waits);
+        crate::test_support::DW1D_EVIDENCE
+            .observe_race_injected(binding, accepted)
+            .unwrap_or_else(|error| {
+                panic!("selector-30 race injection observation failed: {error:?}")
+            });
+        race_wakes = wakes;
+    }
+    let release = transaction
+        .complete(registry, interrupts, platform)
+        .unwrap_or_else(|status| panic!("selector-30 public ack transaction failed: {status:?}"));
+    cleanup.push_optional(release);
+    complete_wait_wakes(registry, execution, race_wakes, cleanup);
+    crate::test_support::DW1D_EVIDENCE
+        .observe_ack_complete(
+            current_process,
+            binding,
+            interrupts.pending_for_binding(binding),
+        )
+        .unwrap_or_else(|error| panic!("selector-30 ack completion observation failed: {error:?}"));
+    DW_STATUS_SUCCESS
 }
 
 fn interrupt_create_status(error: InterruptCreateError) -> DwStatus {

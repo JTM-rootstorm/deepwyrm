@@ -271,6 +271,8 @@ impl<
                     .unwrap_or_else(|(error, _)| {
                         panic!("DeviceResource final release bypassed its typed payload: {error:?}")
                     });
+                #[cfg(deepwyrm_dw1d_evidence)]
+                let dw1d_grant = finalization.dw1d_grant_identity();
                 if let Some(grants) = self.boot_resource_grants {
                     complete_device_resource_finalization_with_grants(
                         self.registry,
@@ -279,6 +281,14 @@ impl<
                     );
                 } else {
                     complete_device_resource_finalization(self.registry, finalization);
+                }
+                #[cfg(deepwyrm_dw1d_evidence)]
+                if let Some((resource_id, object, lease)) = dw1d_grant {
+                    crate::test_support::DW1D_EVIDENCE
+                        .observe_grant_returned(resource_id, object, lease)
+                        .unwrap_or_else(|error| {
+                            panic!("selector-30 grant-return observation failed: {error:?}")
+                        });
                 }
                 WakeBatch::empty()
             }
@@ -299,11 +309,19 @@ impl<
                     .unwrap_or_else(|(error, _)| {
                         panic!("Interrupt final release bypassed its typed payload: {error:?}")
                     });
+                #[cfg(deepwyrm_dw1d_evidence)]
+                let (dw1d_object, dw1d_binding, dw1d_lease) = finalization.dw1d_identity();
                 push_pending(
                     pending,
                     pending_len,
                     complete_interrupt_finalization(self.registry, finalization),
                 );
+                #[cfg(deepwyrm_dw1d_evidence)]
+                crate::test_support::DW1D_EVIDENCE
+                    .observe_interrupt_finalized(dw1d_object, dw1d_binding, dw1d_lease)
+                    .unwrap_or_else(|error| {
+                        panic!("selector-30 Interrupt finalization observation failed: {error:?}")
+                    });
                 WakeBatch::empty()
             }
             DW_OBJECT_TYPE_TASK_GROUP | DW_OBJECT_TYPE_PROCESS | DW_OBJECT_TYPE_THREAD => {

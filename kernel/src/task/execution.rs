@@ -798,7 +798,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         self.scheduler.dw1c_token2_relay_ready()
     }
 
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
     pub(crate) fn dw1c_final_scheduler_snapshot(
         &self,
     ) -> Result<super::Dw1cFinalSchedulerSnapshot, SchedulerError> {

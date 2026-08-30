@@ -45,7 +45,8 @@ use crate::syscall::{
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
     deepwyrm_wyr1b_evidence,
-    deepwyrm_dw1c_evidence
+    deepwyrm_dw1c_evidence,
+    deepwyrm_dw1d_evidence
 ))]
 use crate::task::ProcessLifecycleState;
 use crate::task::{ExecutionDomain, ProcessKey, SchedulerThreadState, TaskAuthority, ThreadKey};
@@ -533,6 +534,7 @@ impl G5PrimordialProbe {
             BuildGuestTest::NormalPreemptionUp => G5PrimordialExpectation::Baseline,
             BuildGuestTest::NormalPreemptionSmp => G5PrimordialExpectation::Baseline,
             BuildGuestTest::BootstrapRegistryLaunch => G5PrimordialExpectation::Baseline,
+            BuildGuestTest::DeviceResourceInterruptSynthetic => G5PrimordialExpectation::Baseline,
             BuildGuestTest::PrimordialBlockingCleanup => G5PrimordialExpectation::BlockingCleanup,
             BuildGuestTest::PrimordialUserException => G5PrimordialExpectation::UserException,
             BuildGuestTest::PrimordialInvalidReturn => G5PrimordialExpectation::InvalidReturn,
@@ -3361,9 +3363,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 Err(error) => crate::test_support::complete_fail(dw1b_evidence_detail(error)),
             }
         }
+        #[cfg(all(feature = "test-support", deepwyrm_dw1d_evidence))]
+        {
+            if completion.is_err() {
+                crate::test_support::complete_fail(self.g5_probe.failure_detail(&completion))
+            }
+            let permit = crate::test_support::DW1D_EVIDENCE
+                .final_normal_completion()
+                .unwrap_or_else(|_| crate::test_support::complete_fail(0x3010_e001));
+            crate::test_support::complete_dw1d_evidence(permit)
+        }
         #[cfg(all(
             feature = "test-support",
-            not(any(deepwyrm_dw1b_evidence, deepwyrm_dw1c_evidence))
+            not(any(deepwyrm_dw1b_evidence, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))
         ))]
         if self.g5_probe.accepts_completion(&completion) {
             crate::test_support::complete_pass(0)
@@ -3783,9 +3795,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 Err(error) => crate::test_support::complete_fail(dw1b_evidence_detail(error)),
             }
         }
+        #[cfg(all(feature = "test-support", deepwyrm_dw1d_evidence))]
+        {
+            if completion.is_err() {
+                crate::test_support::complete_fail(self.g5_probe.failure_detail(&completion))
+            }
+            let permit = crate::test_support::DW1D_EVIDENCE
+                .final_normal_completion()
+                .unwrap_or_else(|_| crate::test_support::complete_fail(0x3010_e001));
+            crate::test_support::complete_dw1d_evidence(permit)
+        }
         #[cfg(all(
             feature = "test-support",
-            not(any(deepwyrm_dw1b_evidence, deepwyrm_dw1c_evidence))
+            not(any(deepwyrm_dw1b_evidence, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))
         ))]
         if self.g5_probe.accepts_completion(&completion) {
             crate::test_support::complete_pass(0)
@@ -4721,6 +4743,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.cleanup
             .push_optional(self.registry.release_internal(root_pin).map_err(|_| ())?);
         self.drain_finalizers()?;
+        #[cfg(deepwyrm_dw1d_evidence)]
+        crate::test_support::DW1D_EVIDENCE
+            .observe_process_reaped(process)
+            .unwrap_or_else(|error| {
+                panic!("selector-30 Process reap observation failed: {error:?}")
+            });
         #[cfg(deepwyrm_dw1c_evidence)]
         crate::test_support::DW1C_EVIDENCE
             .observe_process_reap(process, process.object_id().generation(), 1)
@@ -5814,6 +5842,212 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         NativeSyscallResult::returning(DW_STATUS_SUCCESS)
     }
 
+    #[cfg(deepwyrm_dw1d_evidence)]
+    fn intercept_dw1d_evidence_raw(
+        &mut self,
+        arguments: crate::syscall::RawSyscallArguments,
+    ) -> NativeSyscallResult {
+        use crate::test_support::{DW1D_EVIDENCE, Dw1dDeliverPlan, Dw1dRawOperation};
+
+        let operation = DW1D_EVIDENCE
+            .decode_raw(arguments.as_array())
+            .unwrap_or_else(|error| crate::test_support::complete_fail(0x3010_e100 | error as u32));
+        let phase = self.reserve_runtime_phase();
+        let status = match operation {
+            Dw1dRawOperation::Arm {
+                owner_handle,
+                trigger_handle,
+            } => {
+                if !self.dw1d_controller_authorized() {
+                    crate::test_support::complete_fail(0x3010_e101)
+                }
+                let owner = self.dw1d_process_handle(owner_handle);
+                let trigger = self.dw1d_process_handle(trigger_handle);
+                if self.tasks.process_lifecycle(owner)
+                    != Ok(ProcessLifecycleState::AcceptingOperations)
+                    || self.tasks.process_lifecycle(trigger)
+                        != Ok(ProcessLifecycleState::AcceptingOperations)
+                {
+                    crate::test_support::complete_fail(0x3010_e102)
+                }
+                let resource_domain = self
+                    .shared
+                    .boot_resource_grants
+                    .owner_key()
+                    .unwrap_or_else(|_| crate::test_support::complete_fail(0x3010_e103));
+                let owner_in_resource_domain = self
+                    .tasks
+                    .prepare_resource_claim_membership(owner, resource_domain)
+                    .is_ok();
+                let trigger_outside_resource_domain = self
+                    .tasks
+                    .prepare_resource_claim_membership(trigger, resource_domain)
+                    == Err(crate::task::ResourceClaimMembershipError::AccessDenied);
+                DW1D_EVIDENCE
+                    .arm(
+                        self.process,
+                        owner,
+                        trigger,
+                        owner_in_resource_domain,
+                        trigger_outside_resource_domain,
+                    )
+                    .unwrap_or_else(|error| {
+                        crate::test_support::complete_fail(0x3010_e110 | error as u32)
+                    });
+                DW_STATUS_SUCCESS
+            }
+            Dw1dRawOperation::Bind {
+                interrupt_handle,
+                lease_generation,
+            } => {
+                let resolved = self
+                    .tasks
+                    .process_handles(self.process)
+                    .unwrap_or_else(|_| crate::test_support::complete_fail(0x3010_e120))
+                    .lookup(
+                        &mut self.registry,
+                        deepwyrm_abi::DwHandle(interrupt_handle),
+                        crate::handle::AcceptedObjectTypes::One(
+                            deepwyrm_abi::DW_OBJECT_TYPE_INTERRUPT,
+                        ),
+                        deepwyrm_abi::DW_RIGHT_INSPECT,
+                    )
+                    .unwrap_or_else(|_| crate::test_support::complete_fail(0x3010_e121));
+                let object = resolved.object_id();
+                let info = crate::device::InterruptInfoProvider::object_info_for_resolved(
+                    &self.shared.interrupts,
+                    &resolved,
+                )
+                .unwrap_or_else(|_| crate::test_support::complete_fail(0x3010_e122));
+                let binding = self
+                    .shared
+                    .interrupts
+                    .binding_for_resolved(&resolved)
+                    .unwrap_or_else(|_| crate::test_support::complete_fail(0x3010_e123));
+                assert!(
+                    self.registry
+                        .release_internal(resolved.into_internal())
+                        .unwrap_or_else(|failure| panic!(
+                            "selector-30 BIND lookup release failed: {:?}",
+                            failure.error()
+                        ))
+                        .is_none(),
+                    "selector-30 BIND lookup unexpectedly finalized its object"
+                );
+                if info.source != 3
+                    || info.parent_resource_id != 1
+                    || info.parent_lease_generation != lease_generation
+                    || info.binding_generation != binding.generation()
+                {
+                    crate::test_support::complete_fail(0x3010_e124)
+                }
+                DW1D_EVIDENCE
+                    .bind(self.process, object, binding, lease_generation)
+                    .unwrap_or_else(|error| {
+                        crate::test_support::complete_fail(0x3010_e130 | error as u32)
+                    });
+                DW_STATUS_SUCCESS
+            }
+            Dw1dRawOperation::Deliver { sequence } => {
+                match DW1D_EVIDENCE
+                    .authorize_deliver(self.process, sequence)
+                    .unwrap_or_else(|error| {
+                        crate::test_support::complete_fail(0x3010_e140 | error as u32)
+                    }) {
+                    Dw1dDeliverPlan::WaitRegistrationPending => DW_STATUS_WOULD_BLOCK,
+                    Dw1dDeliverPlan::Live(binding) => {
+                        let delivery = self
+                            .shared
+                            .interrupt_platform
+                            .prepare_delivery(binding)
+                            .unwrap_or_else(|error| {
+                                panic!("selector-30 live delivery preparation failed: {error:?}")
+                            });
+                        let (accepted, wakes) =
+                            self.shared.interrupts.deliver(delivery, &self.shared.waits);
+                        DW1D_EVIDENCE
+                            .observe_delivery(sequence, binding, accepted)
+                            .unwrap_or_else(|error| {
+                                crate::test_support::complete_fail(0x3010_e150 | error as u32)
+                            });
+                        crate::syscall::complete_wait_wakes(
+                            &mut self.registry,
+                            &self.shared.execution,
+                            wakes,
+                            &mut self.cleanup,
+                        );
+                        DW_STATUS_SUCCESS
+                    }
+                    Dw1dDeliverPlan::RacePermit => DW_STATUS_SUCCESS,
+                    Dw1dDeliverPlan::Stale(binding) => {
+                        match self.shared.interrupt_platform.prepare_delivery(binding) {
+                            Err(crate::device::InterruptPlatformError::StaleBinding) => {}
+                            Err(error) => panic!(
+                                "selector-30 stale delivery returned wrong platform error: {error:?}"
+                            ),
+                            Ok(_) => crate::test_support::complete_fail(0x3010_e160),
+                        }
+                        DW1D_EVIDENCE
+                            .observe_stale_delivery(
+                                self.process,
+                                sequence,
+                                binding,
+                                DW_STATUS_BAD_STATE,
+                            )
+                            .unwrap_or_else(|error| {
+                                crate::test_support::complete_fail(0x3010_e170 | error as u32)
+                            });
+                        DW_STATUS_BAD_STATE
+                    }
+                }
+            }
+            Dw1dRawOperation::Report {
+                event,
+                value,
+                auxiliary,
+            } => {
+                if event == 0x17 {
+                    if !self.services.is_quiescent()
+                        || self.wait_controls.iter().any(|control| !control.is_clear())
+                    {
+                        crate::test_support::complete_fail(0x3010_e180)
+                    }
+                    let snapshot = self
+                        .shared
+                        .execution
+                        .dw1c_final_scheduler_snapshot()
+                        .unwrap_or_else(|_| crate::test_support::complete_fail(0x3010_e181));
+                    let grant_available = self
+                        .shared
+                        .boot_resource_grants
+                        .state_for(1)
+                        .is_some_and(|(_, state)| {
+                            state == crate::boot::BootResourceGrantState::Available
+                        });
+                    DW1D_EVIDENCE
+                        .observe_accounting(
+                            self.shared.device_resources.live_count(),
+                            self.shared.interrupts.live_count(),
+                            self.shared.waits.len(),
+                            grant_available,
+                            snapshot.accounting_mask(),
+                        )
+                        .unwrap_or_else(|error| {
+                            crate::test_support::complete_fail(0x3010_e190 | error as u32)
+                        });
+                }
+                DW1D_EVIDENCE
+                    .report(self.process, event, value, auxiliary)
+                    .unwrap_or_else(|error| {
+                        crate::test_support::complete_fail(0x3010_e1a0 | error as u32)
+                    });
+                DW_STATUS_SUCCESS
+            }
+        };
+        self.commit_runtime_phase(phase);
+        NativeSyscallResult::returning(status)
+    }
+
     fn authorize_return(
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
@@ -6001,7 +6235,8 @@ const fn dw1b_evidence_detail(error: crate::test_support::Dw1bEvidenceError) -> 
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
     deepwyrm_wyr1b_evidence,
-    deepwyrm_dw1c_evidence
+    deepwyrm_dw1c_evidence,
+    deepwyrm_dw1d_evidence
 ))]
 const fn evidence_process_create_detail(case: u32) -> u32 {
     #[cfg(deepwyrm_wyr1_evidence)]
@@ -6012,6 +6247,8 @@ const fn evidence_process_create_detail(case: u32) -> u32 {
     return 0x2710_c000 | case;
     #[cfg(deepwyrm_dw1c_evidence)]
     return 0x2810_c000 | case;
+    #[cfg(deepwyrm_dw1d_evidence)]
+    return 0x3010_c000 | case;
 }
 
 #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
@@ -6118,6 +6355,18 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                     // that opens this gate. Return through the ordinary syscall
                     // boundary so return-time preemption can dispatch token 8;
                     // the selector controller retries the complete operation.
+                    return NativeSyscallResult::returning(DW_STATUS_WOULD_BLOCK);
+                }
+                #[cfg(deepwyrm_dw1d_evidence)]
+                if let NativeSyscallRequest::ProcessTerminate { process, .. } = request
+                    && let Some(ready) = runtime.dw1d_replacement_termination_gate(process)
+                    && !ready
+                {
+                    // The controller can observe userspace's replacement-wait
+                    // intent before the replacement commits its real wait.
+                    // Leave the public termination operation untouched and
+                    // return through the ordinary boundary so userspace can
+                    // yield and retry after event 0A's registration exists.
                     return NativeSyscallResult::returning(DW_STATUS_WOULD_BLOCK);
                 }
                 let prepared = match request {
@@ -6500,6 +6749,25 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         // Selector-private raw calls bypass `dispatch_native`, so publish any
         // scheduler wake staged while the synchronized runtime was held only
         // after that authority has been released.
+        crate::task::drain_runnable_work_notifications();
+        result
+    }
+
+    #[cfg(deepwyrm_dw1d_evidence)]
+    fn intercept_dw1d_evidence_raw(
+        &mut self,
+        arguments: crate::syscall::RawSyscallArguments,
+    ) -> NativeSyscallResult {
+        let result = self
+            .with_synchronized_runtime_at_safe_point(|runtime| {
+                runtime.intercept_dw1d_evidence_raw(arguments)
+            })
+            .unwrap_or(NativeSyscallResult {
+                status: DW_STATUS_SUCCESS,
+                control: SyscallControl::ServiceRendezvous,
+            });
+        // Selector-private delivery can publish waiter wakes while the
+        // synchronized runtime is held. Notify CPUs only after releasing it.
         crate::task::drain_runnable_work_notifications();
         result
     }
@@ -7143,7 +7411,8 @@ fn copy_module<'a, const BYTES: usize, const RANGE_CAPACITY: usize, const ROLE_C
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
     deepwyrm_wyr1b_evidence,
-    deepwyrm_dw1c_evidence
+    deepwyrm_dw1c_evidence,
+    deepwyrm_dw1d_evidence
 ))]
 const fn integration_bootfs_page_count(byte_len: usize) -> Option<usize> {
     if byte_len == 0 {
@@ -7204,6 +7473,13 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     ) {
         crate::test_support::complete_fail(0x2810_b001)
     }
+    #[cfg(deepwyrm_dw1d_evidence)]
+    if !matches!(
+        integration_bootfs_page_count(bootfs.len()),
+        Some(1..=PRIMORDIAL_BOOTFS_MAX_PAGES)
+    ) {
+        crate::test_support::complete_fail(0x3010_b001)
+    }
     let plan = crate::boot::primordial::parse_primordial_elf(bootstrap)
         .unwrap_or_else(|error| panic!("invalid primordial bootstrap ELF: {error:?}"));
 
@@ -7212,6 +7488,27 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     let mut tasks = Tasks::new();
     let mut spaces = unsafe { Spaces::new() };
     let mut regions = Regions::new();
+    #[cfg(deepwyrm_dw1d_evidence)]
+    {
+        let grant = (boot_resource_grants.len() == 1)
+            .then(|| boot_resource_grants.grant(0))
+            .flatten()
+            .unwrap_or_else(|| crate::test_support::complete_fail(0x3010_b002));
+        let descriptor = grant.descriptor();
+        if descriptor.kind != deepwyrm_abi::DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT
+        {
+            crate::test_support::complete_fail(0x3010_b003)
+        }
+        crate::test_support::DW1D_EVIDENCE
+            .observe_boot(
+                boot_resource_grants.len(),
+                descriptor.resource_id,
+                descriptor.pio_base,
+                descriptor.pio_length,
+                descriptor.interrupt_source,
+            )
+            .unwrap_or_else(|_| crate::test_support::complete_fail(0x3010_b004));
+    }
     let shared = publish_runtime_shared(boot_resource_grants);
     initialize_per_cpu_live_carriers();
     let (_root_group, root_owner) = tasks
@@ -7677,6 +7974,48 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 == Some(SchedulerThreadState::Running)
     }
 
+    #[cfg(deepwyrm_dw1d_evidence)]
+    fn dw1d_controller_authorized(&self) -> bool {
+        self.process == self.primordial_process
+            && self.shared.execution.current_thread_on(self.cpu) == Some(self.thread)
+            && self.tasks.thread_process(self.thread) == Ok(self.process)
+            && self.shared.execution.scheduler_state(self.thread)
+                == Some(SchedulerThreadState::Running)
+    }
+
+    #[cfg(deepwyrm_dw1d_evidence)]
+    fn dw1d_process_handle(&self, handle: u64) -> ProcessKey {
+        self.tasks
+            .process_handles(self.process)
+            .ok()
+            .and_then(|handles| {
+                handles.process_target_for_dw1d_evidence(deepwyrm_abi::DwHandle(handle))
+            })
+            .map(ProcessKey::from_object_id)
+            .unwrap_or_else(|| crate::test_support::complete_fail(0x3010_e104))
+    }
+
+    #[cfg(deepwyrm_dw1d_evidence)]
+    fn dw1d_replacement_termination_gate(&self, handle: deepwyrm_abi::DwHandle) -> Option<bool> {
+        if !self.dw1d_controller_authorized() {
+            return None;
+        }
+        let target = self
+            .tasks
+            .process_handles(self.process)
+            .ok()
+            .and_then(|handles| handles.process_target_for_dw1d_evidence(handle))
+            .map(ProcessKey::from_object_id)
+            .unwrap_or_else(|| crate::test_support::complete_fail(0x3010_e1b0));
+        Some(
+            crate::test_support::DW1D_EVIDENCE
+                .replacement_termination_ready(self.process, target)
+                .unwrap_or_else(|error| {
+                    crate::test_support::complete_fail(0x3010_e1c0 | error as u32)
+                }),
+        )
+    }
+
     #[cfg(deepwyrm_dw1c_evidence)]
     fn dw1c_process_termination_gate(
         &self,
@@ -8045,6 +8384,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 ))
             }
             NativeSyscallRequest::InterruptAck { interrupt } => {
+                #[cfg(deepwyrm_dw1d_evidence)]
+                return NativeSyscallResult::returning(crate::syscall::interrupt_ack_dw1d(
+                    &mut self.registry,
+                    &mut self.tasks,
+                    &self.shared.interrupts,
+                    &self.shared.interrupt_platform,
+                    &self.shared.waits,
+                    &self.shared.execution,
+                    self.process,
+                    interrupt,
+                    &mut self.cleanup,
+                ));
+                #[cfg(not(deepwyrm_dw1d_evidence))]
                 NativeSyscallResult::returning(crate::syscall::interrupt_ack(
                     &mut self.registry,
                     &mut self.tasks,

@@ -47,6 +47,15 @@ impl InterruptBinding {
     pub(crate) const fn generation(self) -> u64 {
         self.generation
     }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(domain: u64, source: u32, generation: u64) -> Self {
+        Self {
+            domain,
+            source,
+            generation,
+        }
+    }
 }
 
 #[must_use = "reserved Interrupt sources must be committed or cancelled"]
@@ -366,6 +375,21 @@ impl InterruptCleanup {
 pub(crate) struct InterruptFinalization {
     final_release: FinalRelease,
     parent: InternalRef,
+    #[cfg(deepwyrm_dw1d_evidence)]
+    binding: InterruptBinding,
+    #[cfg(deepwyrm_dw1d_evidence)]
+    parent_descriptor: DeviceResourceDescriptor,
+}
+
+impl InterruptFinalization {
+    #[cfg(deepwyrm_dw1d_evidence)]
+    pub(crate) const fn dw1d_identity(&self) -> (ObjectId, InterruptBinding, u64) {
+        (
+            self.final_release.id(),
+            self.binding,
+            self.parent_descriptor.lease_generation,
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -620,6 +644,32 @@ impl<const INTERRUPTS: usize> InterruptAuthority<INTERRUPTS> {
         })
     }
 
+    /// Returns the exact live source binding after ordinary handle validation.
+    /// The selector-private D6 trigger consumes this only to inject the one
+    /// already-authorized synthetic source; it cannot select an arbitrary IRQ.
+    #[cfg(deepwyrm_dw1d_evidence)]
+    pub(crate) fn binding_for_resolved(
+        &self,
+        resolved: &ResolvedHandle,
+    ) -> Result<InterruptBinding, InterruptError> {
+        if resolved.object_type() != DW_OBJECT_TYPE_INTERRUPT {
+            return Err(InterruptError::InvalidObject);
+        }
+        self.interrupts
+            .lock()
+            .iter()
+            .flatten()
+            .find(|interrupt| {
+                interrupt.object == resolved.object_id()
+                    && !matches!(
+                        interrupt.state,
+                        InterruptState::Creating | InterruptState::Finalizing
+                    )
+            })
+            .map(|interrupt| interrupt.binding)
+            .ok_or(InterruptError::InvalidObject)
+    }
+
     #[cfg(test)]
     pub(crate) fn binding(&self, key: InterruptKey) -> InterruptBinding {
         self.interrupts
@@ -631,9 +681,24 @@ impl<const INTERRUPTS: usize> InterruptAuthority<INTERRUPTS> {
             .binding
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, deepwyrm_dw1d_evidence))]
     pub(crate) fn live_count(&self) -> usize {
         self.interrupts.lock().iter().flatten().count()
+    }
+
+    #[cfg(deepwyrm_dw1d_evidence)]
+    pub(crate) fn pending_for_binding(&self, binding: InterruptBinding) -> bool {
+        self.interrupts
+            .lock()
+            .iter()
+            .flatten()
+            .find(|interrupt| interrupt.binding == binding)
+            .is_some_and(|interrupt| {
+                matches!(
+                    interrupt.state,
+                    InterruptState::Pending { .. } | InterruptState::AckPrepared { .. }
+                )
+            })
     }
 }
 
@@ -791,7 +856,7 @@ impl<const INTERRUPTS: usize> InterruptFinalizer for InterruptAuthority<INTERRUP
         platform.mask_source(binding);
         platform.release_source(binding);
 
-        let parent = {
+        let finalized_interrupt = {
             let mut interrupts = self.interrupts.lock();
             let Some(slot) = interrupts.iter_mut().find(|slot| {
                 slot.as_ref().is_some_and(|interrupt| {
@@ -804,11 +869,17 @@ impl<const INTERRUPTS: usize> InterruptFinalizer for InterruptAuthority<INTERRUP
             };
             slot.take()
                 .expect("validated Interrupt finalization slot remains populated")
-                .parent
         };
+        let parent = finalized_interrupt.parent;
+        #[cfg(deepwyrm_dw1d_evidence)]
+        let parent_descriptor = finalized_interrupt.parent_descriptor;
         Ok(InterruptFinalization {
             final_release,
             parent,
+            #[cfg(deepwyrm_dw1d_evidence)]
+            binding,
+            #[cfg(deepwyrm_dw1d_evidence)]
+            parent_descriptor,
         })
     }
 }
@@ -882,8 +953,8 @@ impl InterruptAckTransaction {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) const fn binding_for_test(&self) -> Option<InterruptBinding> {
+    #[cfg(any(test, deepwyrm_dw1d_evidence))]
+    pub(crate) const fn binding_for_evidence(&self) -> Option<InterruptBinding> {
         match self.operation {
             InterruptAckOperation::Coalesced => None,
             InterruptAckOperation::Rearm { binding, .. } => Some(binding),

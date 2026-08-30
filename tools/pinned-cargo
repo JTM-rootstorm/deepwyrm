@@ -16,10 +16,10 @@ lanes. The canonical deepwyrm/target directory is intentionally rejected.
 CARGO_HOME is selected from the lane identity and must not be supplied by the
 caller.
 
-In a Git worktree, the worktree's parent is the project root. Its accepted
-artifacts and offline-v1 Cargo home must be provisioned there as independent
-non-symlink trees. This wrapper never falls back to a canonical checkout's
-mutable Cargo cache.
+In a coordinator-owned .worktrees/deepwyrm/<lane> worktree, the canonical
+OS-Project root supplies the accepted immutable toolchain and offline-v1 Cargo
+home. The lane still owns an isolated target directory and must share the
+canonical deepwyrm Git directory.
 EOF
 }
 
@@ -212,6 +212,19 @@ fi
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 workspace=$(CDPATH='' cd -- "$script_dir/.." && pwd -P)
 project_root=$(CDPATH='' cd -- "$workspace/.." && pwd -P)
+workspace_parent=$(basename -- "$(dirname -- "$workspace")")
+workspace_grandparent=$(basename -- "$(dirname -- "$(dirname -- "$workspace")")")
+if [ "$workspace_parent" = "deepwyrm" ] && [ "$workspace_grandparent" = ".worktrees" ]; then
+    lane_project_root=$(CDPATH='' cd -- "$workspace/../../.." && pwd -P)
+    canonical_git_dir="$lane_project_root/deepwyrm/.git"
+    [ -d "$canonical_git_dir" ] && [ ! -L "$canonical_git_dir" ] || \
+        fail "lane layout has no canonical deepwyrm git directory"
+    common_git_dir=$(git -C "$workspace" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || \
+        fail "lane worktree does not expose a common git directory"
+    [ "$common_git_dir" = "$canonical_git_dir" ] || \
+        fail "lane worktree is not registered to canonical deepwyrm"
+    project_root=$lane_project_root
+fi
 
 if [ "$lane" = host ]; then
     identity="$workspace/tooling/host-rust-toolchain.toml"

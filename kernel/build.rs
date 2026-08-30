@@ -102,6 +102,8 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1C_EVIDENCE_NONCE");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1C_PROGRESS_DIGEST");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1C_BOOTFS_MAX_PAGES");
+    println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1D_EVIDENCE_NONCE");
+    println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1D_EVIDENCE_CHALLENGE");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_c3_one_shot_ui)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_memory_guest)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_e7_guest)");
@@ -114,6 +116,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1b_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1b_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1c_evidence)");
+    println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1d_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_integrated)");
     println!("cargo:rustc-cfg=deepwyrm_integrated");
 
@@ -204,6 +207,13 @@ fn run() -> Result<(), String> {
         .is_some_and(is_dw1c_evidence_selector)
     {
         println!("cargo:rustc-cfg=deepwyrm_dw1c_evidence");
+    }
+    if env::var("DEEPWYRM_GUEST_TEST_SELECTOR")
+        .ok()
+        .as_deref()
+        .is_some_and(is_dw1d_evidence_selector)
+    {
+        println!("cargo:rustc-cfg=deepwyrm_dw1d_evidence");
     }
 
     if required_env("TARGET")? != KERNEL_TARGET {
@@ -346,6 +356,10 @@ fn is_wyr1b_evidence_selector(selector: &str) -> bool {
 
 fn is_dw1c_evidence_selector(selector: &str) -> bool {
     selector == "normal-preemption-smp"
+}
+
+fn is_dw1d_evidence_selector(selector: &str) -> bool {
+    selector == "device-resource-interrupt-synthetic"
 }
 
 fn emit_e7_user_env(elf: &Path) {
@@ -943,6 +957,12 @@ fn configure_guest_test(harness_path: &Path) -> Result<(), String> {
             println!("cargo:rustc-env=DEEPWYRM_DW1C_PROGRESS_DIGEST={digest}");
             println!("cargo:rustc-env=DEEPWYRM_DW1C_BOOTFS_MAX_PAGES={bootfs_pages}");
         }
+        if is_dw1d_evidence_selector(&selector) {
+            let nonce = required_dw1d_hex("DEEPWYRM_DW1D_EVIDENCE_NONCE")?;
+            let challenge = required_dw1d_hex("DEEPWYRM_DW1D_EVIDENCE_CHALLENGE")?;
+            println!("cargo:rustc-env=DEEPWYRM_DW1D_EVIDENCE_NONCE={nonce}");
+            println!("cargo:rustc-env=DEEPWYRM_DW1D_EVIDENCE_CHALLENGE={challenge}");
+        }
     }
     Ok(())
 }
@@ -980,6 +1000,13 @@ fn required_wyr1b_hex(name: &str) -> Result<String, String> {
 
 fn required_dw1c_hex(name: &str) -> Result<String, String> {
     let value = env::var(name).map_err(|_| format!("normal-preemption-smp requires {name}"))?;
+    validate_upper_nonzero_hex_nonce(&value, name)?;
+    Ok(value)
+}
+
+fn required_dw1d_hex(name: &str) -> Result<String, String> {
+    let value = env::var(name)
+        .map_err(|_| format!("device-resource-interrupt-synthetic requires {name}"))?;
     validate_upper_nonzero_hex_nonce(&value, name)?;
     Ok(value)
 }
