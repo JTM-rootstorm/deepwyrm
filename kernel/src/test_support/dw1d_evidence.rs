@@ -1712,11 +1712,237 @@ mod tests {
             .collector
             .report(fixture.controller, EVENT_READY, 0, 0)
             .unwrap();
+        let first_binding = fixture.first_binding.generation();
+        let replacement_binding = fixture.replacement_binding.generation();
+        let mut expected = [EvidenceRecord {
+            event: 0,
+            actor: 0,
+            lease: 0,
+            binding: 0,
+            value: 0,
+            auxiliary: 0,
+        }; DW1D_EVIDENCE_RECORD_COUNT];
+        let mut expected_count = 0;
+        let mut push_expected = |record| {
+            expected[expected_count] = record;
+            expected_count += 1;
+        };
+        for record in [
+            EvidenceRecord {
+                event: EVENT_BOOT,
+                actor: ACTOR_KERNEL,
+                lease: 0,
+                binding: 0,
+                value: 1,
+                auxiliary: (1_u64 << 63) | (0x2f8_u64 << 32) | (8_u64 << 16) | 3,
+            },
+            EvidenceRecord {
+                event: EVENT_ARM,
+                actor: ACTOR_CONTROLLER,
+                lease: 0,
+                binding: 0,
+                value: fixture.owner.object_id().evidence_identity(),
+                auxiliary: fixture.trigger.object_id().evidence_identity(),
+            },
+            EvidenceRecord {
+                event: EVENT_DENIED,
+                actor: ACTOR_CONTROLLER,
+                lease: 0,
+                binding: 0,
+                value: 1,
+                auxiliary: 0,
+            },
+            EvidenceRecord {
+                event: EVENT_FIRST_CLAIM,
+                actor: ACTOR_FIRST_OWNER,
+                lease: 1,
+                binding: 0,
+                value: 1,
+                auxiliary: 0,
+            },
+            EvidenceRecord {
+                event: EVENT_PIO_SAVE,
+                actor: ACTOR_FIRST_OWNER,
+                lease: 1,
+                binding: 0,
+                value: 0x55,
+                auxiliary: 0,
+            },
+            EvidenceRecord {
+                event: EVENT_PIO_WRITE,
+                actor: ACTOR_FIRST_OWNER,
+                lease: 1,
+                binding: 0,
+                value: 0x73,
+                auxiliary: 0,
+            },
+            EvidenceRecord {
+                event: EVENT_PIO_READ,
+                actor: ACTOR_FIRST_OWNER,
+                lease: 1,
+                binding: 0,
+                value: 0x73,
+                auxiliary: 0,
+            },
+            EvidenceRecord {
+                event: EVENT_PIO_RESTORE,
+                actor: ACTOR_FIRST_OWNER,
+                lease: 1,
+                binding: 0,
+                value: 0x55,
+                auxiliary: 0,
+            },
+            EvidenceRecord {
+                event: EVENT_FIRST_BIND,
+                actor: ACTOR_FIRST_OWNER,
+                lease: 1,
+                binding: first_binding,
+                value: 3,
+                auxiliary: 0,
+            },
+        ] {
+            push_expected(record);
+        }
+        for delivery_sequence in 1..=5 {
+            for record in [
+                EvidenceRecord {
+                    event: EVENT_WAIT_BLOCKED,
+                    actor: ACTOR_FIRST_OWNER,
+                    lease: 1,
+                    binding: first_binding,
+                    value: delivery_sequence,
+                    auxiliary: 0,
+                },
+                EvidenceRecord {
+                    event: EVENT_DELIVERED,
+                    actor: ACTOR_TRIGGER,
+                    lease: 1,
+                    binding: first_binding,
+                    value: delivery_sequence,
+                    auxiliary: 0,
+                },
+                EvidenceRecord {
+                    event: EVENT_WAIT_WOKE,
+                    actor: ACTOR_FIRST_OWNER,
+                    lease: 1,
+                    binding: first_binding,
+                    value: delivery_sequence,
+                    auxiliary: 0,
+                },
+                EvidenceRecord {
+                    event: EVENT_ACKED,
+                    actor: ACTOR_FIRST_OWNER,
+                    lease: 1,
+                    binding: first_binding,
+                    value: delivery_sequence,
+                    auxiliary: 0,
+                },
+            ] {
+                push_expected(record);
+            }
+        }
+        for record in [
+            EvidenceRecord {
+                event: EVENT_ACK_RACE,
+                actor: ACTOR_TRIGGER,
+                lease: 1,
+                binding: first_binding,
+                value: 7,
+                auxiliary: 6,
+            },
+            EvidenceRecord {
+                event: EVENT_FIRST_INTERRUPT_FINAL,
+                actor: ACTOR_KERNEL,
+                lease: 1,
+                binding: first_binding,
+                value: 0,
+                auxiliary: 0,
+            },
+            EvidenceRecord {
+                event: EVENT_FIRST_GRANT_RETURN,
+                actor: ACTOR_KERNEL,
+                lease: 1,
+                binding: first_binding,
+                value: 0,
+                auxiliary: 0,
+            },
+            EvidenceRecord {
+                event: EVENT_STALE_REJECTED,
+                actor: ACTOR_TRIGGER,
+                lease: 1,
+                binding: first_binding,
+                value: 8,
+                auxiliary: 5,
+            },
+            EvidenceRecord {
+                event: EVENT_REPLACEMENT_CLAIM,
+                actor: ACTOR_REPLACEMENT_OWNER,
+                lease: 2,
+                binding: 0,
+                value: 1,
+                auxiliary: 0,
+            },
+            EvidenceRecord {
+                event: EVENT_REPLACEMENT_BIND,
+                actor: ACTOR_REPLACEMENT_OWNER,
+                lease: 2,
+                binding: replacement_binding,
+                value: 3,
+                auxiliary: 0,
+            },
+            EvidenceRecord {
+                event: EVENT_REPLACEMENT_INTERRUPT_FINAL,
+                actor: ACTOR_REPLACEMENT_OWNER,
+                lease: 2,
+                binding: replacement_binding,
+                value: 1,
+                auxiliary: 0,
+            },
+            EvidenceRecord {
+                event: EVENT_REPLACEMENT_REAP,
+                actor: ACTOR_KERNEL,
+                lease: 2,
+                binding: replacement_binding,
+                value: 1,
+                auxiliary: 0,
+            },
+            EvidenceRecord {
+                event: EVENT_ACCOUNTING,
+                actor: ACTOR_KERNEL,
+                lease: 0,
+                binding: 0,
+                value: 0,
+                auxiliary: 0x3f,
+            },
+            EvidenceRecord {
+                event: EVENT_READY,
+                actor: ACTOR_CONTROLLER,
+                lease: 0,
+                binding: 0,
+                value: 0,
+                auxiliary: 0,
+            },
+            EvidenceRecord {
+                event: EVENT_TERMINAL,
+                actor: ACTOR_KERNEL,
+                lease: 0,
+                binding: 0,
+                value: 0,
+                auxiliary: 0,
+            },
+        ] {
+            push_expected(record);
+        }
+        drop(push_expected);
+        assert_eq!(expected_count, DW1D_EVIDENCE_RECORD_COUNT);
         let permit = fixture.collector.final_normal_completion().unwrap();
         let mut records = 0;
         permit
             .flush(|record| {
-                assert_eq!(record.len(), 117);
+                assert_eq!(
+                    *record,
+                    encode_record(records as u32, expected[records], 0x1111)
+                );
                 records += 1;
                 Ok(())
             })

@@ -219,11 +219,15 @@ const WAITERS: usize = 16;
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
     deepwyrm_wyr1b_evidence,
-    deepwyrm_dw1c_evidence
+    deepwyrm_dw1c_evidence,
+    deepwyrm_dw1d_evidence
 )))]
 const TASK_GROUPS: usize = 1;
 #[cfg(deepwyrm_dw1c_evidence)]
 const TASK_GROUPS: usize = 12;
+// Root plus the exact boot-resource domain used by selector 30.
+#[cfg(deepwyrm_dw1d_evidence)]
+const TASK_GROUPS: usize = 2;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const TASK_GROUPS: usize = 4;
 #[cfg(deepwyrm_wrcap_relay)]
