@@ -26,6 +26,8 @@ use crate::debug::{TestSerialTransaction, begin_test_serial_transaction};
 use super::Dw1cEvidenceFlushPermit;
 #[cfg(deepwyrm_dw1d_evidence)]
 use super::Dw1dEvidenceFlushPermit;
+#[cfg(deepwyrm_wyr1c_evidence)]
+use super::Wyr1cEvidenceFlushError;
 #[cfg(deepwyrm_dw1b_evidence)]
 use super::dw1b_evidence::Dw1bEvidenceFlushPermit;
 #[cfg(deepwyrm_i1_evidence)]
@@ -357,7 +359,7 @@ pub(crate) fn complete_wyr1c_evidence(
                 .as_mut()
                 .expect("WRC6 owns serial transaction")
                 .write_evidence(record)
-                .map_err(|_| ())
+                .map_err(|_| Wyr1cEvidenceFlushError::Transport)
         })
         .is_err()
     {
@@ -550,6 +552,7 @@ pub(crate) fn complete_pass(detail: u32) -> ! {
     }
     #[cfg(deepwyrm_wyr1c_evidence)]
     {
+        let _ = detail;
         complete_wyr1c_failure_terminal(CompletionOutcome::Fail, 0x2910_ffff)
     }
     #[cfg(deepwyrm_wyr1_evidence)]

@@ -1,6 +1,6 @@
 # WYR1-C6 selector-29 evidence seam
 
-Status: Deepwyrm evidence half implemented in selector `device-coordinator-restart` (ID 29).
+Status: Deepwyrm selector integration implemented; live Wyrmroot acceptance pending.
 
 This document defines the test-build-only transport consumed by the Wyrmroot
 C6 controller. It is not a native ABI addition and does not claim physical
@@ -91,3 +91,29 @@ from `wyrmroot/Plans/DW1C_WYR1C_IMPLEMENTATION_PLAN.md` and
 No external code was copied. The collector is a selector-local adaptation of
 the existing first-party WRB1 framing/terminal pattern. C5 bundle wire shapes,
 physical IRQ/PIO, and C6 Wyrmroot lifecycle execution remain owned by Wyrmroot.
+
+## Target integration validation
+
+Selector 29 is a resource-domain product profile, not only a host collector
+model. Its freestanding build therefore selects the canonical name (the build
+script derives ID 29), supplies the WRC6 nonce, admits exactly one boot resource,
+uses resource READY, and compiles the permanent-reporter and resource syscalls
+together. The profile has explicit bounded capacities: eight live Process
+identities, 24 Channel pairs, 32 handles per Process, 28 memory objects and
+leases, 160 registry objects, and a 256-page bootfs ceiling. These bounds do not
+apply to ordinary production or other selectors.
+
+The accepted product compiler gate is:
+
+```text
+RUSTFLAGS="-D warnings" DEEPWYRM_GUEST_TEST_SELECTOR=device-coordinator-restart \
+DEEPWYRM_WYR1C_EVIDENCE_NONCE=<16 uppercase nonzero hex> \
+tools/pinned-cargo target build --locked --offline --release \
+  --target x86_64-unknown-none --package deepwyrm-kernel \
+  --bin deepwyrm-kernel --features test-support
+```
+
+The separately installed host Clippy cannot validate the custom freestanding
+sysroot and must not be treated as a target product result. Use warnings denied
+on the accepted target build plus the pinned host collector/source tests; do not
+install or substitute a host target during closure.

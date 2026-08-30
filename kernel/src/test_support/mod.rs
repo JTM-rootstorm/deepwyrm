@@ -132,9 +132,13 @@ pub(crate) use wyr1_evidence::{
     target_os = "none"
 ))]
 pub(crate) use wyr1b_evidence::{
-    WYR1B_EVIDENCE, WYR1B_EVIDENCE_RECORD_LEN, WYR1B_SYSTEM_INIT_GUARD_START,
-    WYR1B_SYSTEM_INIT_STACK_BOTTOM, Wyr1bEvidenceError, Wyr1bEvidenceFlushError,
-    Wyr1bEvidenceSubmit, Wyr1bReporterStartFacts, Wyr1bRetirementFacts,
+    WYR1B_SYSTEM_INIT_GUARD_START, WYR1B_SYSTEM_INIT_STACK_BOTTOM, Wyr1bEvidenceError,
+    Wyr1bReporterStartFacts, Wyr1bRetirementFacts,
+};
+
+#[cfg(all(deepwyrm_wyr1b_evidence, target_arch = "x86_64", target_os = "none"))]
+pub(crate) use wyr1b_evidence::{
+    WYR1B_EVIDENCE, WYR1B_EVIDENCE_RECORD_LEN, Wyr1bEvidenceFlushError, Wyr1bEvidenceSubmit,
 };
 
 #[cfg(all(deepwyrm_wyr1c_evidence, target_arch = "x86_64", target_os = "none"))]

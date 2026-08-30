@@ -41,7 +41,11 @@ mod primordial;
         deepwyrm_integrated,
         target_os = "none",
         target_arch = "x86_64",
-        any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence)
+        any(
+            deepwyrm_wyr1_evidence,
+            deepwyrm_wyr1b_evidence,
+            deepwyrm_wyr1c_evidence
+        )
     )
 ))]
 #[path = "activation/primordial_diagnostic.rs"]
@@ -106,7 +110,8 @@ const _: () = {
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
     deepwyrm_wyr1b_evidence,
-    deepwyrm_dw1c_evidence
+    deepwyrm_dw1c_evidence,
+    deepwyrm_wyr1c_evidence
 )))]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;
 // Selector 24 keeps bootstrap, init0, the controller, and one bounded worker
@@ -125,6 +130,10 @@ const LIVE_ADDRESS_SPACE_CAPACITY: usize = 5;
 // Selector 27 keeps the permanent controller, registry, gate actors, and one
 // launched job generation live in addition to the retiring primordial root.
 #[cfg(deepwyrm_wyr1b_evidence)]
+const LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;
+// Selector 29 reuses the bounded eight-Process permanent-controller geometry
+// while adding resource-domain ownership and restart evidence.
+#[cfg(deepwyrm_wyr1c_evidence)]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;
 // Selector 28 keeps primordial, the controller, and all ten workload actors
 // resident through READY, ARM, remote termination, and final observation.

@@ -43,7 +43,7 @@ pub(crate) struct BootResourceGrant {
 }
 
 impl BootResourceGrant {
-    #[cfg(any(test, deepwyrm_dw1d_evidence))]
+    #[cfg(any(test, deepwyrm_dw1d_evidence, deepwyrm_wyr1c_evidence))]
     #[allow(
         dead_code,
         reason = "selector-30 consumes this only in the target runtime"
@@ -125,7 +125,7 @@ impl BootResourceGrants {
         })
     }
 
-    #[cfg(any(test, deepwyrm_dw1d_evidence))]
+    #[cfg(any(test, deepwyrm_dw1d_evidence, deepwyrm_wyr1c_evidence))]
     #[allow(
         dead_code,
         reason = "selector-30 consumes this only in the target runtime"
@@ -138,7 +138,7 @@ impl BootResourceGrants {
         self.count == 0
     }
 
-    #[cfg(any(test, deepwyrm_dw1d_evidence))]
+    #[cfg(any(test, deepwyrm_dw1d_evidence, deepwyrm_wyr1c_evidence))]
     #[allow(
         dead_code,
         reason = "selector-30 consumes this only in the target runtime"

@@ -2657,7 +2657,8 @@ pub(crate) fn process_create_with_root<
     deepwyrm_wyr1_evidence,
     deepwyrm_dw1b_evidence,
     deepwyrm_wyr1b_evidence,
-    deepwyrm_dw1c_evidence
+    deepwyrm_dw1c_evidence,
+    deepwyrm_wyr1c_evidence
 ))]
 #[allow(
     clippy::too_many_arguments,

@@ -21,7 +21,6 @@ use super::wyr1b_evidence::{Wyr1bReporterStartFacts, Wyr1bRetirementFacts};
 pub(crate) const WYR1C_EVIDENCE_RAW_SYSCALL: u32 = 0xffff_ff1e;
 pub(crate) const WYR1C_EVIDENCE_RECORD_LEN: usize = 113;
 pub(crate) const WYR1C_EVIDENCE_RECORD_CAPACITY: usize = 27;
-pub(crate) const WYR1C_EVIDENCE_EVENT_COUNT: usize = 26;
 pub(crate) const WYR1C_EVIDENCE_TERMINAL_EVENT: u8 = 0xff;
 const CHECKSUM_OFFSET: usize = 105;
 const EMPTY_RECORD: [u8; WYR1C_EVIDENCE_RECORD_LEN] = [0; WYR1C_EVIDENCE_RECORD_LEN];
@@ -78,22 +77,6 @@ pub(crate) enum Wyr1cEvidenceError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Wyr1cEvidenceFlushError {
     Incomplete,
-    Early,
-    Retirement,
-    WrongReporter,
-    Malformed,
-    OutOfOrder,
-    Full,
-    DuplicateTerminal,
-    ReporterClaimed,
-    StartupMissing,
-    StartupDuplicate,
-    StartupRoot,
-    StartupEntry,
-    StartupStackPointer,
-    StartupStackMapping,
-    StartupStackProtection,
-    StartupGuard,
     Busy,
     Transport,
 }
@@ -101,16 +84,6 @@ pub(crate) enum Wyr1cEvidenceFlushError {
 pub(crate) enum Wyr1cEvidenceSubmit<'a> {
     Accepted,
     Terminal(Wyr1cEvidenceFlushPermit<'a>),
-}
-
-/// One opaque Wyrmroot identity tuple carried by each ordered event.
-/// Deepwyrm preserves these fields but deliberately does not interpret them.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Wyr1cEvidenceFields {
-    pub(crate) lease: u64,
-    pub(crate) binding: u64,
-    pub(crate) value: u64,
-    pub(crate) auxiliary: u64,
 }
 
 struct Transcript {
@@ -245,13 +218,6 @@ impl Wyr1cEvidenceCollector {
             Ok(Wyr1cEvidenceSubmit::Accepted)
         }
     }
-
-    pub(crate) fn claim_failure(&self) -> Option<Wyr1cEvidenceFailurePermit<'_>> {
-        self.terminal_claimed
-            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| Wyr1cEvidenceFailurePermit { collector: self })
-    }
 }
 
 fn authorize_locked(
@@ -279,28 +245,6 @@ fn authorize_locked(
 #[must_use]
 pub(crate) struct Wyr1cEvidenceFlushPermit<'a> {
     collector: &'a Wyr1cEvidenceCollector,
-}
-
-#[must_use]
-pub(crate) struct Wyr1cEvidenceFailurePermit<'a> {
-    collector: &'a Wyr1cEvidenceCollector,
-}
-
-impl Wyr1cEvidenceFailurePermit<'_> {
-    pub(crate) fn flush_prefix(
-        self,
-        mut emit: impl FnMut(&[u8; WYR1C_EVIDENCE_RECORD_LEN]) -> Result<(), Wyr1cEvidenceFlushError>,
-    ) -> Result<(), Wyr1cEvidenceFlushError> {
-        let transcript = self
-            .collector
-            .transcript
-            .try_lock()
-            .ok_or(Wyr1cEvidenceFlushError::Busy)?;
-        for record in &transcript.records[..transcript.count] {
-            emit(record)?;
-        }
-        Ok(())
-    }
 }
 
 impl Wyr1cEvidenceFlushPermit<'_> {
