@@ -43,6 +43,13 @@ const READY_BYTES: [u8; 40] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
+#[cfg(any(test, deepwyrm_dw1d_evidence))]
+const RESOURCE_READY_BYTES: [u8; 40] = [
+    0x57, 0x52, 0x42, 0x50, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
 const CHILD_CHANNEL_RIGHTS: DwRights =
     DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_WAIT.0 | DW_RIGHT_INSPECT.0);
 const SELF_ROOT_RIGHTS: DwRights =
@@ -511,6 +518,20 @@ pub(crate) trait PrimordialCompletionBackend {
 pub(crate) fn complete_primordial_launch<B: PrimordialCompletionBackend>(
     backend: &mut B,
 ) -> Result<(), PrimordialCompletionError<B::Error>> {
+    complete_primordial_launch_with_ready(backend, &READY_BYTES)
+}
+
+#[cfg(any(test, deepwyrm_dw1d_evidence))]
+pub(crate) fn complete_resource_primordial_launch<B: PrimordialCompletionBackend>(
+    backend: &mut B,
+) -> Result<(), PrimordialCompletionError<B::Error>> {
+    complete_primordial_launch_with_ready(backend, &RESOURCE_READY_BYTES)
+}
+
+fn complete_primordial_launch_with_ready<B: PrimordialCompletionBackend>(
+    backend: &mut B,
+    expected_ready: &[u8; 40],
+) -> Result<(), PrimordialCompletionError<B::Error>> {
     let mut bytes = [0_u8; 40];
     let ready = backend.receive_ready(&mut bytes);
     let exit = backend.observe_exit();
@@ -518,7 +539,7 @@ pub(crate) fn complete_primordial_launch<B: PrimordialCompletionBackend>(
 
     quiescent.map_err(PrimordialCompletionError::NotQuiescent)?;
     let actual = ready.map_err(PrimordialCompletionError::Receive)?;
-    if actual != READY_BYTES.len() || bytes != READY_BYTES {
+    if actual != expected_ready.len() || bytes != *expected_ready {
         return Err(PrimordialCompletionError::MalformedReady);
     }
     let disposition = exit.map_err(PrimordialCompletionError::ObserveExit)?;

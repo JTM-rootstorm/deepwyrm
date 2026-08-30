@@ -270,8 +270,14 @@ fn locked_protocol_vectors_are_exact() {
         0x00, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
+    let expected_resource_ready = [
+        0x57, 0x52, 0x42, 0x50, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
     assert_eq!(INIT_BYTES, expected_init);
     assert_eq!(READY_BYTES, expected_ready);
+    assert_eq!(RESOURCE_READY_BYTES, expected_resource_ready);
 }
 
 #[test]
@@ -516,6 +522,26 @@ fn committed_ready_is_consumed_before_normal_exit_and_quiescence() {
     );
     assert!(malformed.observed_exit);
     assert!(malformed.verified_quiescence);
+}
+
+#[test]
+fn resource_completion_requires_v3_ready_without_widening_v2() {
+    let mut resource = completion_host(PrimordialExitDisposition::Normal(0));
+    resource.ready = Ok(RESOURCE_READY_BYTES.to_vec());
+    complete_resource_primordial_launch(&mut resource).unwrap();
+
+    let mut historical = completion_host(PrimordialExitDisposition::Normal(0));
+    assert_eq!(
+        complete_resource_primordial_launch(&mut historical),
+        Err(PrimordialCompletionError::MalformedReady)
+    );
+
+    let mut resource_on_historical = completion_host(PrimordialExitDisposition::Normal(0));
+    resource_on_historical.ready = Ok(RESOURCE_READY_BYTES.to_vec());
+    assert_eq!(
+        complete_primordial_launch(&mut resource_on_historical),
+        Err(PrimordialCompletionError::MalformedReady)
+    );
 }
 
 #[test]

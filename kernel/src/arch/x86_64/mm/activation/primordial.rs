@@ -18,10 +18,14 @@ use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use crate::boot::primordial::construction::authority::{
     AuthorityPrimordialBackend, AuthorityPrimordialMonitor, PrimordialPlatform,
 };
+#[cfg(not(deepwyrm_dw1d_evidence))]
+use crate::boot::primordial::construction::complete_primordial_launch;
+#[cfg(deepwyrm_dw1d_evidence)]
+use crate::boot::primordial::construction::complete_resource_primordial_launch;
 #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
 use crate::boot::primordial::construction::validate_primordial_retirement_facts;
 use crate::boot::primordial::construction::{
-    PrimordialCompletionBackend, PrimordialExitDisposition, complete_primordial_launch,
+    PrimordialCompletionBackend, PrimordialExitDisposition,
 };
 use crate::ipc::{ChannelAuthority, ChannelError};
 use crate::memory::address_region::{
@@ -3369,7 +3373,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
         #[cfg(deepwyrm_dw1c_evidence)] product_execution_generation: u64,
     ) -> PreparedTerminalHandoff {
+        #[cfg(not(deepwyrm_dw1d_evidence))]
         let completion = complete_primordial_launch(self);
+        #[cfg(deepwyrm_dw1d_evidence)]
+        let completion = complete_resource_primordial_launch(self);
         #[cfg(all(feature = "test-support", deepwyrm_dw1c_evidence))]
         {
             if completion.is_err() {
@@ -3801,7 +3808,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             return PreparedTerminalHandoff::IdleScheduler;
         }
 
+        #[cfg(not(deepwyrm_dw1d_evidence))]
         let completion = complete_primordial_launch(self);
+        #[cfg(deepwyrm_dw1d_evidence)]
+        let completion = complete_resource_primordial_launch(self);
         #[cfg(all(feature = "test-support", deepwyrm_dw1c_evidence))]
         {
             if completion.is_err() {
