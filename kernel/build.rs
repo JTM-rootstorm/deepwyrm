@@ -119,8 +119,22 @@ fn run() -> Result<(), String> {
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1c_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1d_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1c_evidence)");
+    println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1e_platform)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_integrated)");
     println!("cargo:rustc-cfg=deepwyrm_integrated");
+
+    // Selector 31 remains reserved until E3 adds its evidence actor. E2B
+    // nevertheless needs the selected q35 product to carry the returning
+    // vector gate from early descriptor installation. This is a compile-time
+    // product shape only: `configure_guest_test` still rejects the reserved
+    // selector as a runnable target.
+    if env::var("DEEPWYRM_GUEST_TEST_SELECTOR")
+        .ok()
+        .as_deref()
+        .is_some_and(is_dw1e_platform_selector)
+    {
+        println!("cargo:rustc-cfg=deepwyrm_dw1e_platform");
+    }
 
     let layout_source = fs::read_to_string(&layout_path)
         .map_err(|error| format!("{}: {error}", layout_path.display()))?;
@@ -373,6 +387,10 @@ fn is_dw1d_evidence_selector(selector: &str) -> bool {
 
 fn is_wyr1c_evidence_selector(selector: &str) -> bool {
     selector == "device-coordinator-restart"
+}
+
+fn is_dw1e_platform_selector(selector: &str) -> bool {
+    selector == "q35-com2-interrupt"
 }
 
 fn emit_e7_user_env(elf: &Path) {
@@ -2291,6 +2309,16 @@ mod tests {
             select_guest_test(true, Some("device-coordinator-restart"), false, manifest),
             Ok(Some(29))
         );
+    }
+
+    #[test]
+    fn dw1e_platform_shape_is_keyed_to_reserved_selector_but_not_runnable() {
+        let manifest = include_str!("../tooling/guest-harness.toml");
+        assert!(is_dw1e_platform_selector("q35-com2-interrupt"));
+        assert!(!is_dw1e_platform_selector(
+            "device-resource-interrupt-synthetic"
+        ));
+        assert!(select_guest_test(true, Some("q35-com2-interrupt"), false, manifest).is_err());
     }
 
     fn required_dw1c_bootfs_pages_for_test(value: &str) -> Result<(), String> {

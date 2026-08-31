@@ -193,16 +193,25 @@ pub(crate) fn send_live_ipi(
     }
 }
 
-fn dispatch(vector: LiveIpiVector) {
+/// Acknowledges the current local-APIC interrupt through the immutable
+/// CPU-private transport. Returning external entries use this after their
+/// narrow platform dispatch; E2C owns all route/controller decisions before
+/// this EOI seam.
+pub(crate) fn end_current_live_interrupt() -> bool {
     let Some(transport) = TRANSPORT.get() else {
-        halt_without_return();
+        return false;
     };
     #[allow(
         unsafe_code,
         reason = "the immutable binding pairs its static context with the matching EOI trampoline"
     )]
-    let eoi_completed = unsafe { (transport.eoi)(transport.context) };
-    if !eoi_completed {
+    unsafe {
+        (transport.eoi)(transport.context)
+    }
+}
+
+fn dispatch(vector: LiveIpiVector) {
+    if !end_current_live_interrupt() {
         halt_without_return();
     }
 

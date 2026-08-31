@@ -14,6 +14,15 @@ pub const EXTERNAL_VECTOR_RANGE: core::ops::RangeInclusive<u8> = 0x30..=0xdf;
 pub const INTERNAL_VECTOR_RANGE: core::ops::RangeInclusive<u8> = 0xe0..=0xfd;
 
 pub const LOCAL_APIC_TIMER_VECTOR: u8 = 0xe0;
+/// DW1-E's single selected q35 COM2 interrupt vector.
+///
+/// This is a fixed milestone assignment, not a general external-vector
+/// allocator. IDT presence remains product-gated by the E2B build hook.
+#[allow(
+    dead_code,
+    reason = "the fixed vector is consumed only by the selected DW1-E IDT product"
+)]
+pub const Q35_COM2_EXTERNAL_VECTOR: u8 = 0x30;
 pub const SMP_RENDEZVOUS_VECTOR: u8 = 0xe1;
 pub const TLB_SHOOTDOWN_VECTOR: u8 = 0xe2;
 pub const LOCAL_APIC_ERROR_VECTOR: u8 = 0xfe;

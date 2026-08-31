@@ -1,0 +1,190 @@
+//! Returning DW1-E external-vector dispatch seam.
+//!
+//! The selected q35 product installs only vector `0x30`. E2B owns the
+//! complete ephemeral assembly frame and the EOI boundary; E2C later binds
+//! the generation-exact q35 platform handler before it may unmask a route.
+
+use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
+use core::sync::atomic::{AtomicU8, Ordering};
+
+use super::ipi::end_current_live_interrupt;
+
+const UNBOUND: u8 = 0;
+const BINDING: u8 = 1;
+const BOUND: u8 = 2;
+
+/// The only policy authority lent to the returning vector entry.
+///
+/// The implementation must perform its bounded source snapshot, logical
+/// delivery, and IRQ-safe wake publication before returning. It must not
+/// retain the assembly frame or call finalization/object-registry paths.
+pub(crate) trait Q35ExternalInterruptHandler: Sync {
+    fn handle_q35_com2_interrupt(&self);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Q35ExternalInterruptBindError {
+    AlreadyBindingOrBound,
+}
+
+#[derive(Clone, Copy)]
+struct HandlerBinding {
+    context: *const (),
+    dispatch: unsafe fn(*const ()),
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the erased pointer retains an immutable reference to a static Sync handler"
+)]
+unsafe impl Sync for HandlerBinding {}
+
+struct BindingSlot<T> {
+    state: AtomicU8,
+    value: UnsafeCell<MaybeUninit<T>>,
+}
+
+impl<T> BindingSlot<T> {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(UNBOUND),
+            value: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+
+    fn bind(&self, value: T) -> Result<(), Q35ExternalInterruptBindError> {
+        self.state
+            .compare_exchange(UNBOUND, BINDING, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| Q35ExternalInterruptBindError::AlreadyBindingOrBound)?;
+        #[allow(
+            unsafe_code,
+            reason = "the successful one-shot binder exclusively initializes this slot before release publication"
+        )]
+        unsafe {
+            (*self.value.get()).write(value);
+        }
+        self.state.store(BOUND, Ordering::Release);
+        Ok(())
+    }
+
+    fn get(&self) -> Option<&T> {
+        if self.state.load(Ordering::Acquire) != BOUND {
+            return None;
+        }
+        #[allow(
+            unsafe_code,
+            reason = "Acquire observes the immutable value fully initialized before BOUND publication"
+        )]
+        Some(unsafe { (*self.value.get()).assume_init_ref() })
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "one-shot release publication makes immutable Sync binding values safe to share"
+)]
+unsafe impl<T: Sync> Sync for BindingSlot<T> {}
+
+static HANDLER: BindingSlot<HandlerBinding> = BindingSlot::new();
+
+/// Publishes E2C's immutable q35 handler exactly once before route unmask.
+pub(crate) fn bind_q35_external_interrupt_handler<T: Q35ExternalInterruptHandler + 'static>(
+    handler: &'static T,
+) -> Result<(), Q35ExternalInterruptBindError> {
+    HANDLER.bind(HandlerBinding {
+        context: core::ptr::from_ref(handler).cast::<()>(),
+        dispatch: dispatch_handler::<T>,
+    })
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the context was erased together with the matching shared-reference dispatch trampoline"
+)]
+unsafe fn dispatch_handler<T: Q35ExternalInterruptHandler>(context: *const ()) {
+    let handler = unsafe { &*context.cast::<T>() };
+    handler.handle_q35_com2_interrupt();
+}
+
+/// Performs the bounded E2B order: optional exact platform dispatch, then
+/// local-APIC EOI. An absent binding is an unexpected/masked-source delivery;
+/// it wakes no userspace and is still EOIed before return.
+fn dispatch_and_eoi() -> bool {
+    if let Some(handler) = HANDLER.get() {
+        #[allow(
+            unsafe_code,
+            reason = "the immutable binding pairs its static context with the matching dispatch trampoline"
+        )]
+        unsafe {
+            (handler.dispatch)(handler.context);
+        }
+    }
+    end_current_live_interrupt()
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "fixed symbol required by the audited returning q35 external-vector assembly boundary"
+)]
+#[unsafe(no_mangle)]
+pub(crate) extern "sysv64" fn dw_x86_64_q35_com2_interrupt_dispatch() {
+    if !dispatch_and_eoi() {
+        halt_without_return();
+    }
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn halt_without_return() -> ! {
+    loop {
+        #[allow(
+            unsafe_code,
+            reason = "an unacknowledgeable external interrupt cannot safely resume the interrupted context"
+        )]
+        unsafe {
+            core::arch::asm!("cli", "hlt", options(nomem, nostack));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    struct MockHandler;
+
+    impl Q35ExternalInterruptHandler for MockHandler {
+        fn handle_q35_com2_interrupt(&self) {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    static MOCK_HANDLER: MockHandler = MockHandler;
+
+    #[allow(
+        unsafe_code,
+        reason = "the test exercises the same erased immutable dispatch trampoline without target-only LAPIC EOI"
+    )]
+    fn invoke_bound_handler_for_test() {
+        let binding = HANDLER.get().unwrap();
+        unsafe { (binding.dispatch)(binding.context) };
+    }
+
+    #[test]
+    fn handler_binding_is_exactly_once_before_route_unmask() {
+        assert!(HANDLER.get().is_none());
+        bind_q35_external_interrupt_handler(&MOCK_HANDLER).unwrap();
+        assert!(HANDLER.get().is_some());
+        assert_eq!(
+            bind_q35_external_interrupt_handler(&MOCK_HANDLER),
+            Err(Q35ExternalInterruptBindError::AlreadyBindingOrBound)
+        );
+
+        invoke_bound_handler_for_test();
+        assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+    }
+}

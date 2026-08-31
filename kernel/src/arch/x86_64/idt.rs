@@ -10,8 +10,8 @@ use core::mem::size_of;
 
 use crate::interrupt::{
     EXCEPTION_VECTOR_RANGE, LOCAL_APIC_ERROR_VECTOR, LOCAL_APIC_SPURIOUS_VECTOR,
-    LOCAL_APIC_TIMER_VECTOR, SMP_RENDEZVOUS_VECTOR, TLB_SHOOTDOWN_VECTOR, VectorClass,
-    classify_vector,
+    LOCAL_APIC_TIMER_VECTOR, Q35_COM2_EXTERNAL_VECTOR, SMP_RENDEZVOUS_VECTOR, TLB_SHOOTDOWN_VECTOR,
+    VectorClass, classify_vector,
 };
 
 use super::exceptions::EXCEPTION_HANDLER_COUNT;
@@ -63,6 +63,7 @@ impl ExceptionHandlerTable {
 pub struct EarlyIdtHandlers {
     pub exceptions: ExceptionHandlerTable,
     pub local_apic_timer: HandlerAddress,
+    pub q35_com2: HandlerAddress,
     pub rendezvous_ipi: HandlerAddress,
     pub tlb_shootdown_ipi: HandlerAddress,
     pub local_apic_error: HandlerAddress,
@@ -76,14 +77,35 @@ pub struct InterruptDescriptorTable {
 }
 
 impl InterruptDescriptorTable {
-    /// Builds a DW0-B IDT from assembly entry stubs.
+    /// Builds the selected product's IDT from assembly entry stubs.
     ///
     /// #DF, NMI, and #MC use separate configured IST stacks. No gate is
-    /// present for masked PIC, unallocated external, or future
-    /// internal vectors. This prevents accidentally accepting an interrupt
-    /// source before its ownership and entry convention are defined.
+    /// present for masked PIC, unallocated external, or future internal
+    /// vectors. The one exception is q35 COM2 vector `0x30`, which is present
+    /// only in the compile-time-selected DW1-E product. This prevents
+    /// accidentally accepting an interrupt source before its ownership and
+    /// entry convention are defined.
     pub fn new(handlers: EarlyIdtHandlers) -> Self {
-        Self::with_selector(handlers, KERNEL_CODE_SELECTOR, true)
+        Self::with_selector(
+            handlers,
+            KERNEL_CODE_SELECTOR,
+            true,
+            if cfg!(deepwyrm_dw1e_platform) {
+                Some(handlers.q35_com2)
+            } else {
+                None
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn q35_selected_for_test(handlers: EarlyIdtHandlers) -> Self {
+        Self::with_selector(
+            handlers,
+            KERNEL_CODE_SELECTOR,
+            true,
+            Some(handlers.q35_com2),
+        )
     }
 
     #[cfg_attr(not(any(test, target_os = "none")), allow(dead_code))]
@@ -91,13 +113,14 @@ impl InterruptDescriptorTable {
         handlers: EarlyIdtHandlers,
         selector: super::gdt::SegmentSelector,
     ) -> Self {
-        Self::with_selector(handlers, selector, false)
+        Self::with_selector(handlers, selector, false, None)
     }
 
     fn with_selector(
         handlers: EarlyIdtHandlers,
         selector: super::gdt::SegmentSelector,
         use_ist: bool,
+        q35_com2: Option<HandlerAddress>,
     ) -> Self {
         let mut entries = [InterruptGate::missing(); 256];
         for vector in EXCEPTION_VECTOR_RANGE {
@@ -124,6 +147,10 @@ impl InterruptDescriptorTable {
             InterruptGate::kernel_interrupt(handlers.local_apic_error, None, selector);
         entries[usize::from(LOCAL_APIC_SPURIOUS_VECTOR)] =
             InterruptGate::kernel_interrupt(handlers.local_apic_spurious, None, selector);
+        if let Some(handler) = q35_com2 {
+            entries[usize::from(Q35_COM2_EXTERNAL_VECTOR)] =
+                InterruptGate::kernel_interrupt(handler, None, selector);
+        }
         Self { entries }
     }
 
@@ -276,6 +303,7 @@ mod tests {
         EarlyIdtHandlers {
             exceptions: ExceptionHandlerTable::new([HANDLER; EXCEPTION_HANDLER_COUNT]),
             local_apic_timer: HANDLER,
+            q35_com2: HANDLER,
             rendezvous_ipi: HANDLER,
             tlb_shootdown_ipi: HANDLER,
             local_apic_error: HANDLER,
@@ -315,6 +343,19 @@ mod tests {
                     vector,
                     LOCAL_APIC_TIMER_VECTOR | SMP_RENDEZVOUS_VECTOR | TLB_SHOOTDOWN_VECTOR
                 )
+            );
+        }
+    }
+
+    #[test]
+    fn selected_dw1e_product_has_only_the_fixed_q35_external_gate() {
+        let idt = InterruptDescriptorTable::q35_selected_for_test(handlers());
+        assert!(idt.is_present(Q35_COM2_EXTERNAL_VECTOR));
+        for vector in EXTERNAL_VECTOR_RANGE {
+            assert_eq!(
+                idt.is_present(vector),
+                vector == Q35_COM2_EXTERNAL_VECTOR,
+                "unexpected selected-product external gate {vector:#x}",
             );
         }
     }
