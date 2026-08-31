@@ -22,9 +22,17 @@ use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use crate::boot::primordial::construction::authority::{
     AuthorityPrimordialBackend, AuthorityPrimordialMonitor, PrimordialPlatform,
 };
-#[cfg(not(any(deepwyrm_dw1d_evidence, deepwyrm_wyr1c_evidence)))]
+#[cfg(not(any(
+    deepwyrm_dw1d_evidence,
+    deepwyrm_dw1e_evidence,
+    deepwyrm_wyr1c_evidence
+)))]
 use crate::boot::primordial::construction::complete_primordial_launch;
-#[cfg(any(deepwyrm_dw1d_evidence, deepwyrm_wyr1c_evidence))]
+#[cfg(any(
+    deepwyrm_dw1d_evidence,
+    deepwyrm_dw1e_evidence,
+    deepwyrm_wyr1c_evidence
+))]
 use crate::boot::primordial::construction::complete_resource_primordial_launch;
 #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
 use crate::boot::primordial::construction::validate_primordial_retirement_facts;
@@ -78,6 +86,7 @@ const MAX_BOOTFS_BYTES: usize = 32 * 1024 * 1024;
     deepwyrm_dw1b_evidence,
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
+    deepwyrm_dw1e_evidence,
     deepwyrm_wyr1c_evidence
 )))]
 const REGISTRY_OBJECTS: usize = 32;
@@ -101,7 +110,11 @@ const REGISTRY_OBJECTS: usize = 48;
 const REGISTRY_OBJECTS: usize = 64;
 #[cfg(deepwyrm_wyr1b_evidence)]
 const REGISTRY_OBJECTS: usize = 160;
-#[cfg(deepwyrm_wyr1c_evidence)]
+// Selector 31 boots the reached resource-domain platform service graph plus
+// its bounded raw-stream probe. Reuse selector 29's functional headroom for
+// that eight-Process product instead of falling through to the three-Process
+// historical bootstrap geometry.
+#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
 const REGISTRY_OBJECTS: usize = 160;
 #[cfg(not(any(
     deepwyrm_i2_stress,
@@ -110,6 +123,7 @@ const REGISTRY_OBJECTS: usize = 160;
     deepwyrm_dw1b_evidence,
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
+    deepwyrm_dw1e_evidence,
     deepwyrm_wyr1c_evidence
 )))]
 const MEMORY_OBJECTS: usize = 10;
@@ -130,7 +144,7 @@ const MEMORY_OBJECTS: usize = 13;
 const MEMORY_OBJECTS: usize = 16;
 #[cfg(deepwyrm_wyr1b_evidence)]
 const MEMORY_OBJECTS: usize = 28;
-#[cfg(deepwyrm_wyr1c_evidence)]
+#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
 const MEMORY_OBJECTS: usize = 28;
 #[cfg(not(any(
     deepwyrm_i2_stress,
@@ -139,6 +153,7 @@ const MEMORY_OBJECTS: usize = 28;
     deepwyrm_dw1b_evidence,
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
+    deepwyrm_dw1e_evidence,
     deepwyrm_wyr1c_evidence
 )))]
 const MEMORY_LEASES: usize = 10;
@@ -156,7 +171,7 @@ const MEMORY_LEASES: usize = 13;
 const MEMORY_LEASES: usize = 16;
 #[cfg(deepwyrm_wyr1b_evidence)]
 const MEMORY_LEASES: usize = 28;
-#[cfg(deepwyrm_wyr1c_evidence)]
+#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
 const MEMORY_LEASES: usize = 28;
 // I0 keeps the complete bootstrap -> init0 -> hello chain live while each
 // parent performs bounded READY/exit supervision of its direct child. The
@@ -169,6 +184,7 @@ const MEMORY_LEASES: usize = 28;
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
     deepwyrm_dw1d_evidence,
+    deepwyrm_dw1e_evidence,
     deepwyrm_wyr1c_evidence
 )))]
 const USERSPACE_CHAIN_PROCESSES: usize = 3;
@@ -194,7 +210,7 @@ const USERSPACE_CHAIN_PROCESSES: usize = 4;
 const USERSPACE_CHAIN_PROCESSES: usize = 5;
 #[cfg(deepwyrm_wyr1b_evidence)]
 const USERSPACE_CHAIN_PROCESSES: usize = 8;
-#[cfg(deepwyrm_wyr1c_evidence)]
+#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
 const USERSPACE_CHAIN_PROCESSES: usize = 8;
 #[cfg(not(any(
     deepwyrm_i2_stress,
@@ -203,6 +219,7 @@ const USERSPACE_CHAIN_PROCESSES: usize = 8;
     deepwyrm_dw1b_evidence,
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
+    deepwyrm_dw1e_evidence,
     deepwyrm_wyr1c_evidence
 )))]
 const CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;
@@ -218,7 +235,7 @@ const CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;
 const CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;
 #[cfg(deepwyrm_wyr1b_evidence)]
 const CHANNEL_PAIRS: usize = 24;
-#[cfg(deepwyrm_wyr1c_evidence)]
+#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
 const CHANNEL_PAIRS: usize = 24;
 const CHANNEL_DEPTH: usize = 2;
 #[cfg(not(any(
@@ -228,6 +245,7 @@ const CHANNEL_DEPTH: usize = 2;
     deepwyrm_dw1b_evidence,
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
+    deepwyrm_dw1e_evidence,
     deepwyrm_wyr1c_evidence
 )))]
 const WAITERS: usize = 4;
@@ -248,7 +266,7 @@ const WAITERS: usize = 4;
 const WAITERS: usize = 6;
 #[cfg(deepwyrm_wyr1b_evidence)]
 const WAITERS: usize = 16;
-#[cfg(deepwyrm_wyr1c_evidence)]
+#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
 const WAITERS: usize = 16;
 #[cfg(not(any(
     deepwyrm_i2_stress,
@@ -258,6 +276,7 @@ const WAITERS: usize = 16;
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
     deepwyrm_dw1d_evidence,
+    deepwyrm_dw1e_evidence,
     deepwyrm_wyr1c_evidence
 )))]
 const TASK_GROUPS: usize = 1;
@@ -277,7 +296,7 @@ const TASK_GROUPS: usize = 4;
 const TASK_GROUPS: usize = 1;
 #[cfg(deepwyrm_wyr1b_evidence)]
 const TASK_GROUPS: usize = 8;
-#[cfg(deepwyrm_wyr1c_evidence)]
+#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
 const TASK_GROUPS: usize = 8;
 const PROCESSES: usize = USERSPACE_CHAIN_PROCESSES;
 const THREADS: usize = USERSPACE_CHAIN_PROCESSES;
@@ -304,6 +323,7 @@ const BOOTSTRAP_HANDLE_PEAK: usize = INITIAL_BOOTSTRAP_HANDLES
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
     deepwyrm_dw1d_evidence,
+    deepwyrm_dw1e_evidence,
     deepwyrm_wyr1c_evidence
 )))]
 const HANDLES: usize = BOOTSTRAP_HANDLE_PEAK;
@@ -344,7 +364,7 @@ const HANDLES: usize = D6_HANDLE_PEAK;
 const HANDLES: usize = 16;
 #[cfg(deepwyrm_wyr1b_evidence)]
 const HANDLES: usize = 32;
-#[cfg(deepwyrm_wyr1c_evidence)]
+#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
 const HANDLES: usize = 32;
 const SPACES: usize = USERSPACE_CHAIN_PROCESSES;
 const REGIONS: usize = USERSPACE_CHAIN_PROCESSES;
@@ -374,6 +394,7 @@ const PRIMORDIAL_TABLE_CANDIDATES: usize = 6;
     deepwyrm_dw1b_evidence,
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
+    deepwyrm_dw1e_evidence,
     deepwyrm_wyr1c_evidence
 )))]
 const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 17;
@@ -400,7 +421,7 @@ const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_dw1c_bootfs_pages();
 // Selector 29 consumes a frozen archive whose byte identity is recorded by
 // Wyrmroot. Keep bounded functional headroom above selector 27 without
 // widening the ordinary production profile or the 32 MiB loader intake.
-#[cfg(deepwyrm_wyr1c_evidence)]
+#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
 const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 256;
 const PRIMORDIAL_STACK_MAPPING_PAGES: usize =
     crate::boot::primordial::construction::STACK_BYTES as usize / 4096;
@@ -425,6 +446,7 @@ const _: [(); PROCESSES] = [(); THREADS];
     not(deepwyrm_i2_stress),
     not(deepwyrm_wyr1b_evidence),
     not(deepwyrm_dw1c_evidence),
+    not(deepwyrm_dw1e_evidence),
     not(deepwyrm_wyr1c_evidence)
 ))]
 const _: [(); PROCESSES] = [(); CHANNEL_PAIRS];
@@ -489,18 +511,24 @@ const _: [(); 28] = [(); MEMORY_OBJECTS];
 const _: [(); 28] = [(); MEMORY_LEASES];
 #[cfg(deepwyrm_wyr1b_evidence)]
 const _: [(); 160] = [(); REGISTRY_OBJECTS];
-#[cfg(deepwyrm_wyr1c_evidence)]
+#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
 const _: [(); 8] = [(); USERSPACE_CHAIN_PROCESSES];
-#[cfg(deepwyrm_wyr1c_evidence)]
+#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
 const _: [(); 24] = [(); CHANNEL_PAIRS];
-#[cfg(deepwyrm_wyr1c_evidence)]
+#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
 const _: [(); 32] = [(); HANDLES];
-#[cfg(deepwyrm_wyr1c_evidence)]
+#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
 const _: [(); 28] = [(); MEMORY_OBJECTS];
-#[cfg(deepwyrm_wyr1c_evidence)]
+#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
 const _: [(); 28] = [(); MEMORY_LEASES];
-#[cfg(deepwyrm_wyr1c_evidence)]
+#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
 const _: [(); 160] = [(); REGISTRY_OBJECTS];
+#[cfg(deepwyrm_dw1e_evidence)]
+const _: [(); 16] = [(); WAITERS];
+#[cfg(deepwyrm_dw1e_evidence)]
+const _: [(); 8] = [(); TASK_GROUPS];
+#[cfg(deepwyrm_dw1e_evidence)]
+const _: [(); 256] = [(); PRIMORDIAL_BOOTFS_MAX_PAGES];
 #[cfg(deepwyrm_dw1c_evidence)]
 const _: [(); 12] = [(); USERSPACE_CHAIN_PROCESSES];
 #[cfg(deepwyrm_dw1d_evidence)]
@@ -3630,9 +3658,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
         #[cfg(deepwyrm_dw1c_evidence)] product_execution_generation: u64,
     ) -> PreparedTerminalHandoff {
-        #[cfg(not(any(deepwyrm_dw1d_evidence, deepwyrm_wyr1c_evidence)))]
+        #[cfg(not(any(
+            deepwyrm_dw1d_evidence,
+            deepwyrm_dw1e_evidence,
+            deepwyrm_wyr1c_evidence
+        )))]
         let completion = complete_primordial_launch(self);
-        #[cfg(any(deepwyrm_dw1d_evidence, deepwyrm_wyr1c_evidence))]
+        #[cfg(any(
+            deepwyrm_dw1d_evidence,
+            deepwyrm_dw1e_evidence,
+            deepwyrm_wyr1c_evidence
+        ))]
         let completion = complete_resource_primordial_launch(self);
         #[cfg(all(feature = "test-support", deepwyrm_dw1c_evidence))]
         {
@@ -4115,9 +4151,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             return PreparedTerminalHandoff::IdleScheduler;
         }
 
-        #[cfg(not(any(deepwyrm_dw1d_evidence, deepwyrm_wyr1c_evidence)))]
+        #[cfg(not(any(
+            deepwyrm_dw1d_evidence,
+            deepwyrm_dw1e_evidence,
+            deepwyrm_wyr1c_evidence
+        )))]
         let completion = complete_primordial_launch(self);
-        #[cfg(any(deepwyrm_dw1d_evidence, deepwyrm_wyr1c_evidence))]
+        #[cfg(any(
+            deepwyrm_dw1d_evidence,
+            deepwyrm_dw1e_evidence,
+            deepwyrm_wyr1c_evidence
+        ))]
         let completion = complete_resource_primordial_launch(self);
         #[cfg(all(feature = "test-support", deepwyrm_dw1c_evidence))]
         {
