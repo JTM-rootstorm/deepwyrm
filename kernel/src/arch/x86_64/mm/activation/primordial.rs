@@ -1136,6 +1136,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             runtime.switch_cpu(self.cpu);
             runtime.prepare_scheduler_root_switch()
         };
+        self.finish_scheduler_root_switch_detached(prepared);
+    }
+
+    fn finish_scheduler_root_switch_detached(
+        &mut self,
+        prepared: Option<PreparedSchedulerRootSwitch>,
+    ) {
         let Some(prepared) = prepared else {
             return;
         };
@@ -1153,39 +1160,33 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     /// Reconciles the logical scheduler root after acknowledged remote Stops.
     /// The local syscall continuation may already be the exact unpublished
-    /// suspended owner while its logical Running slot is empty. In that case
-    /// the active Process root is still authoritative until terminal
-    /// retirement installs the divergent handoff token.
+    /// suspended owner while its logical Running slot is empty or names a
+    /// not-yet-entered replacement. The suspended physical claim is
+    /// authoritative in either case, and its active Process root remains live
+    /// until terminal retirement installs the divergent handoff token.
     fn synchronize_scheduler_current_after_remote_stops_detached(&mut self) {
-        let has_logical_current = {
+        let prepared = {
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);
-            if runtime
-                .shared
-                .execution
-                .current_thread_on(self.cpu)
-                .is_some()
-            {
-                true
-            } else {
-                let suspended = runtime
-                    .shared
-                    .execution
-                    .suspended_claim_on(self.cpu)
-                    .unwrap_or_else(|| {
-                        panic!("remote-stop completion lost its physical scheduler claim")
-                    });
-                assert_eq!(
-                    suspended.thread(),
-                    runtime.thread,
-                    "remote-stop completion retained another physical scheduler claim"
-                );
-                false
+            match runtime.shared.execution.suspended_claim_on(self.cpu) {
+                Some(suspended) => {
+                    assert_eq!(
+                        suspended.thread(),
+                        runtime.thread,
+                        "remote-stop completion retained another physical scheduler claim"
+                    );
+                    assert!(
+                        runtime.active_root.as_ref().is_some(),
+                        "remote-stop completion lost the physical caller Process root"
+                    );
+                    None
+                }
+                None => Some(runtime.prepare_scheduler_root_switch().unwrap_or_else(|| {
+                    panic!("remote-stop completion lost its physical scheduler claim")
+                })),
             }
         };
-        if has_logical_current {
-            self.synchronize_scheduler_current_detached();
-        }
+        self.finish_scheduler_root_switch_detached(prepared);
     }
 
     /// Synchronizes the scheduler-current root without crossing an already
@@ -7702,17 +7703,29 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);
             let suspended_claim = runtime.shared.execution.suspended_claim_on(self.cpu);
-            let no_current = runtime
-                .shared
-                .execution
-                .current_thread_on(self.cpu)
-                .is_none();
             match (
-                no_current,
                 suspended_claim,
                 runtime.deferred_currents[self.cpu.index()].as_ref(),
             ) {
-                (true, Some(suspended), Some(deferred)) => suspended.thread() == deferred.thread(),
+                (Some(suspended), Some(deferred)) => {
+                    assert_eq!(
+                        suspended.thread(),
+                        runtime.thread,
+                        "terminal resume retained another physical scheduler claim"
+                    );
+                    assert_eq!(
+                        suspended.thread(),
+                        deferred.thread(),
+                        "terminal resume deferred a different physical Thread"
+                    );
+                    #[cfg(deepwyrm_dw1c_evidence)]
+                    assert_eq!(
+                        suspended.generation(),
+                        deferred.execution_generation(),
+                        "terminal resume deferred a stale execution generation"
+                    );
+                    true
+                }
                 _ => false,
             }
         };

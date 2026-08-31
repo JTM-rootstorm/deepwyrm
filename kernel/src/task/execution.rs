@@ -1739,7 +1739,6 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                 assert!(
                     usize::from(scheduled)
                         + usize::from(acknowledged_remote_stop)
-                        + usize::from(suspended_physical_current)
                         + usize::from(scheduler_pre_retired)
                         <= 1,
                     "terminal Thread retained multiple scheduler retirement authorities"

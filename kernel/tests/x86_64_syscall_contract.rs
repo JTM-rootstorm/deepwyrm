@@ -715,6 +715,54 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
             && remote_wait < remote_final_sync
             && remote_final_sync < remote_complete
     );
+
+    let remote_completion = runtime
+        .split_once("fn complete_remote_stop(")
+        .expect("remote-stop completion facade")
+        .1
+        .split_once("fn authorize_return(")
+        .expect("remote-stop completion boundary")
+        .0;
+    assert_eq!(
+        remote_completion
+            .matches("self.synchronize_scheduler_current_after_remote_stops_detached();")
+            .count(),
+        3
+    );
+    for completion in [
+        "runtime.complete_process_termination(",
+        "runtime.complete_task_group_termination(",
+        "runtime.complete_thread_termination(",
+    ] {
+        let wait = remote_completion
+            .find("await_remote_stop_permits(pending.deferred)")
+            .unwrap();
+        let sync = remote_completion[wait..]
+            .find("self.synchronize_scheduler_current_after_remote_stops_detached();")
+            .unwrap()
+            + wait;
+        let complete = remote_completion[sync..].find(completion).unwrap() + sync;
+        assert!(wait < sync && sync < complete);
+    }
+
+    let post_ack_helper = runtime
+        .split_once("fn synchronize_scheduler_current_after_remote_stops_detached(")
+        .expect("post-ack scheduler synchronization helper")
+        .1
+        .split_once("fn synchronize_scheduler_current_at_safe_point_detached(")
+        .expect("post-ack scheduler synchronization boundary")
+        .0;
+    let suspended = post_ack_helper
+        .find(".suspended_claim_on(self.cpu)")
+        .unwrap();
+    let physical = post_ack_helper
+        .find("suspended.thread(),\n                        runtime.thread")
+        .unwrap();
+    let prepare = post_ack_helper
+        .find(".prepare_scheduler_root_switch()")
+        .unwrap();
+    assert!(suspended < physical && physical < prepare);
+    assert!(!post_ack_helper.contains("current_thread_on(self.cpu)"));
 }
 
 #[test]
@@ -757,6 +805,9 @@ fn i2_suspended_resume_gives_remote_stop_priority_under_scheduler_authority() {
             && mailbox < current
     );
     assert!(resume.contains("NativeResumeOutcome::ServiceRendezvous"));
+    assert!(!resume.contains("let no_current"));
+    assert!(resume.contains("suspended.thread(),\n                        runtime.thread"));
+    assert!(resume.contains("suspended.thread(),\n                        deferred.thread()"));
 
     let suspended = live
         .split_once("SyscallControl::SuspendCurrent =>")

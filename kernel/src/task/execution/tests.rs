@@ -332,6 +332,94 @@ fn remote_stop_completion_retires_exact_suspended_physical_current() {
 }
 
 #[test]
+fn remote_stop_completion_preserves_suspended_caller_with_logical_replacement() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (outgoing_process, outgoing_process_handle) =
+        tasks.create_process(&mut registry, &root_owner).unwrap();
+    let outgoing_owner = registry
+        .retain_internal_from_handle(&outgoing_process_handle)
+        .unwrap();
+    let (outgoing, outgoing_handle) = tasks.create_thread(&mut registry, &outgoing_owner).unwrap();
+    let (replacement_process, replacement_process_handle) =
+        tasks.create_process(&mut registry, &root_owner).unwrap();
+    let replacement_owner = registry
+        .retain_internal_from_handle(&replacement_process_handle)
+        .unwrap();
+    let (replacement, replacement_handle) = tasks
+        .create_thread(&mut registry, &replacement_owner)
+        .unwrap();
+    assert!(registry.release_internal(outgoing_owner).unwrap().is_none());
+    assert!(
+        registry
+            .release_internal(replacement_owner)
+            .unwrap()
+            .is_none()
+    );
+
+    let domain = ExecutionDomain::<2>::new(stack_bounds::<2>()).unwrap();
+    let cpu0 = SchedulerCpuId::BOOTSTRAP;
+    domain
+        .start_thread_on(cpu0, &mut tasks, outgoing, start_state(86))
+        .unwrap();
+    domain
+        .start_thread_on(cpu0, &mut tasks, replacement, start_state(87))
+        .unwrap();
+    assert_eq!(
+        domain.schedule_next_on(cpu0).unwrap().current,
+        Some(outgoing)
+    );
+    let (_block, decision) = domain.block_current_on(cpu0, outgoing).unwrap();
+    assert_eq!(decision.current, Some(replacement));
+    let suspended = domain.suspended_claim_on(cpu0).unwrap();
+    assert_eq!(suspended.thread(), outgoing);
+    assert_eq!(domain.running_claim_on(cpu0).unwrap().thread(), replacement);
+
+    let effects = tasks
+        .terminate_process_authorized(&mut registry, outgoing_process, 0x709)
+        .unwrap();
+    let (retired, deferred) = domain.retire_exit_pins_defer_current_after_remote_stops_on(
+        cpu0,
+        effects.pins,
+        outgoing,
+        &[],
+    );
+    assert_eq!(domain.suspended_claim_on(cpu0), Some(suspended));
+    assert_eq!(domain.running_claim_on(cpu0).unwrap().thread(), replacement);
+    let deferred_pins = domain.reclaim_deferred_current_on(cpu0, deferred);
+    assert_eq!(domain.suspended_claim_on(cpu0), None);
+    assert_eq!(domain.running_claim_on(cpu0).unwrap().thread(), replacement);
+    assert_eq!(domain.scheduler_state(outgoing), None);
+    assert_eq!(
+        domain.scheduler_state(replacement),
+        Some(SchedulerThreadState::Running)
+    );
+    assert_eq!(
+        tasks.process_info(replacement_process).unwrap().state,
+        DW_TASK_STATE_RUNNING
+    );
+
+    let (process_pin, thread_pins) = retired.into_parts();
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        assert!(registry.release_internal(pin).unwrap().is_none());
+    }
+    let (process_pin, thread_pins) = deferred_pins.into_parts();
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        assert!(registry.release_internal(pin).unwrap().is_none());
+    }
+    for reference in [
+        outgoing_handle,
+        outgoing_process_handle,
+        replacement_handle,
+        replacement_process_handle,
+    ] {
+        let _ = registry.release_handle(reference).unwrap();
+    }
+    let _ = registry.release_internal(root_owner).unwrap();
+}
+
+#[test]
 fn stack_pool_rejects_overlap_and_stale_ids() {
     let valid = stack_bounds::<2>();
     let mut overlap = valid;
