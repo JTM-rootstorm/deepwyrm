@@ -26,12 +26,20 @@ const MADT_LOCAL_APIC_ADDRESS: usize = SDT_HEADER_BYTES;
 const MADT_FLAGS: usize = SDT_HEADER_BYTES + 4;
 const MADT_PCAT_COMPAT: u32 = 1;
 const MADT_ENTRY_PROCESSOR_LOCAL_APIC: u8 = 0;
+const MADT_ENTRY_IOAPIC: u8 = 1;
+const MADT_ENTRY_INTERRUPT_SOURCE_OVERRIDE: u8 = 2;
 const MADT_ENTRY_LOCAL_APIC_ADDRESS_OVERRIDE: u8 = 5;
 const MADT_ENTRY_PROCESSOR_LOCAL_X2APIC: u8 = 9;
 const MADT_PROCESSOR_LOCAL_APIC_BYTES: usize = 8;
+const MADT_IOAPIC_BYTES: usize = 12;
+const MADT_INTERRUPT_SOURCE_OVERRIDE_BYTES: usize = 10;
 const MADT_LOCAL_APIC_ADDRESS_OVERRIDE_BYTES: usize = 12;
 const MADT_PROCESSOR_LOCAL_X2APIC_BYTES: usize = 16;
 const MADT_PROCESSOR_ENABLED: u32 = 1;
+const MAX_MADT_IOAPICS: usize = 8;
+const MAX_MADT_ISO_OVERRIDES: usize = 16;
+const Q35_COM2_ISA_IRQ: u8 = 3;
+const Q35_COM2_VECTOR: u8 = 0x30;
 const FADT_PM_TMR_BLK: usize = 76;
 const FADT_PM_TMR_LEN: usize = 91;
 const FADT_FLAGS: usize = 112;
@@ -138,6 +146,414 @@ pub(crate) enum CpuTopologyError {
     LiveCpuIsNotBootstrapProcessor,
     MissingBootstrapProcessor(u8),
     CpuCapacity { observed: usize, capacity: usize },
+}
+
+/// A firmware-proposed IOAPIC.  The redirection count is deliberately absent:
+/// E2 obtains it from the controller version register before publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IoApicDescriptor {
+    id: u8,
+    physical_address: u64,
+    gsi_base: u32,
+}
+
+impl IoApicDescriptor {
+    pub(crate) const fn id(self) -> u8 {
+        self.id
+    }
+
+    pub(crate) const fn physical_address(self) -> u64 {
+        self.physical_address
+    }
+
+    pub(crate) const fn gsi_base(self) -> u32 {
+        self.gsi_base
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IoApicProbe {
+    descriptor: IoApicDescriptor,
+    redirection_entries: u32,
+}
+
+impl IoApicProbe {
+    pub(crate) const fn new(descriptor: IoApicDescriptor, redirection_entries: u32) -> Self {
+        Self {
+            descriptor,
+            redirection_entries,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PlatformIrqPolarity {
+    ActiveHigh,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PlatformIrqTrigger {
+    Edge,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PlatformIrqRoute {
+    gsi: u32,
+    polarity: PlatformIrqPolarity,
+    trigger: PlatformIrqTrigger,
+    vector: u8,
+    bsp_local_apic_id: u8,
+    controller: IoApicDescriptor,
+}
+
+impl PlatformIrqRoute {
+    pub(crate) const fn gsi(self) -> u32 {
+        self.gsi
+    }
+
+    pub(crate) const fn polarity(self) -> PlatformIrqPolarity {
+        self.polarity
+    }
+
+    pub(crate) const fn trigger(self) -> PlatformIrqTrigger {
+        self.trigger
+    }
+
+    pub(crate) const fn vector(self) -> u8 {
+        self.vector
+    }
+
+    pub(crate) const fn bsp_local_apic_id(self) -> u8 {
+        self.bsp_local_apic_id
+    }
+
+    pub(crate) const fn controller(self) -> IoApicDescriptor {
+        self.controller
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Q35Com2RouteError {
+    InvalidMadt,
+    Topology(CpuTopologyError),
+    IoApicCapacity,
+    DuplicateIoApicId(u8),
+    DuplicateIoApicAddress(u64),
+    DuplicateIoApicGsiBase(u32),
+    InvalidIoApicAddress(u64),
+    IoApicCapacityExceeded,
+    IsoCapacityExceeded,
+    DuplicateIrq3Override,
+    ReservedPolarity,
+    ReservedTrigger,
+    UnsupportedPolarity,
+    UnsupportedTrigger,
+    MissingIoApic,
+    ProbeDoesNotMatchMadt,
+    InvalidProbeCapacity,
+    GsiRangeOverflow,
+    UncoveredGsi(u32),
+    AmbiguousGsi(u32),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InterruptSourceOverride {
+    gsi: u32,
+    flags: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Q35Com2MadtSnapshot {
+    topology: CpuTopology,
+    ioapics: [Option<IoApicDescriptor>; MAX_MADT_IOAPICS],
+    ioapic_len: usize,
+    irq3_override: Option<InterruptSourceOverride>,
+}
+
+/// Snapshot and resolve only the q35 COM2 route.  This function is deliberately
+/// independent of target MMIO and is not invoked by the live BSP in E1.
+pub(crate) fn discover_q35_com2_route<R: AcpiByteReader>(
+    reader: &mut R,
+    rsdp_physical: u64,
+    live_bsp_local_apic_id: u8,
+    live_cpu_is_bsp: bool,
+    probes: &[IoApicProbe],
+    workspace: &mut AcpiSnapshotWorkspace,
+) -> Result<PlatformIrqRoute, Q35Com2RouteError> {
+    if !live_cpu_is_bsp {
+        return Err(Q35Com2RouteError::Topology(
+            CpuTopologyError::LiveCpuIsNotBootstrapProcessor,
+        ));
+    }
+    let madt_len = snapshot_selected_madt(reader, rsdp_physical, workspace)?;
+    let snapshot = parse_q35_com2_madt(&workspace.table[..madt_len], live_bsp_local_apic_id)?;
+    resolve_q35_com2_route(snapshot, probes)
+}
+
+fn resolve_q35_com2_route(
+    snapshot: Q35Com2MadtSnapshot,
+    probes: &[IoApicProbe],
+) -> Result<PlatformIrqRoute, Q35Com2RouteError> {
+    if snapshot.ioapic_len == 0 {
+        return Err(Q35Com2RouteError::MissingIoApic);
+    }
+    if probes.len() != snapshot.ioapic_len {
+        return Err(Q35Com2RouteError::ProbeDoesNotMatchMadt);
+    }
+    let gsi = snapshot
+        .irq3_override
+        .map_or(u32::from(Q35_COM2_ISA_IRQ), |override_| override_.gsi);
+    if let Some(override_) = snapshot.irq3_override {
+        validate_irq3_override(override_.flags)?;
+    }
+
+    let mut covering = None;
+    for descriptor in snapshot.ioapics[..snapshot.ioapic_len].iter().flatten() {
+        let probe = probes
+            .iter()
+            .find(|probe| probe.descriptor == *descriptor)
+            .ok_or(Q35Com2RouteError::ProbeDoesNotMatchMadt)?;
+        if probe.redirection_entries == 0 {
+            return Err(Q35Com2RouteError::InvalidProbeCapacity);
+        }
+        let end = descriptor
+            .gsi_base
+            .checked_add(probe.redirection_entries)
+            .ok_or(Q35Com2RouteError::GsiRangeOverflow)?;
+        if gsi >= descriptor.gsi_base && gsi < end && covering.replace(*descriptor).is_some() {
+            return Err(Q35Com2RouteError::AmbiguousGsi(gsi));
+        }
+    }
+    let controller = covering.ok_or(Q35Com2RouteError::UncoveredGsi(gsi))?;
+    Ok(PlatformIrqRoute {
+        gsi,
+        polarity: PlatformIrqPolarity::ActiveHigh,
+        trigger: PlatformIrqTrigger::Edge,
+        vector: Q35_COM2_VECTOR,
+        bsp_local_apic_id: snapshot.topology.entries().next().unwrap().local_apic_id(),
+        controller,
+    })
+}
+
+fn validate_irq3_override(flags: u16) -> Result<(), Q35Com2RouteError> {
+    if flags & !0x000f != 0 {
+        return Err(Q35Com2RouteError::InvalidMadt);
+    }
+    match flags & 0b11 {
+        0 | 1 => {}
+        2 => return Err(Q35Com2RouteError::ReservedPolarity),
+        3 => return Err(Q35Com2RouteError::UnsupportedPolarity),
+        _ => unreachable!(),
+    }
+    match (flags >> 2) & 0b11 {
+        0 | 1 => Ok(()),
+        2 => Err(Q35Com2RouteError::ReservedTrigger),
+        3 => Err(Q35Com2RouteError::UnsupportedTrigger),
+        _ => unreachable!(),
+    }
+}
+
+const IOAPIC_REDIR_VECTOR_MASK: u64 = 0xff;
+const IOAPIC_REDIR_DELIVERY_STATUS: u64 = 1 << 12;
+const IOAPIC_REDIR_MASK: u64 = 1 << 16;
+const IOAPIC_REDIR_DESTINATION_SHIFT: u32 = 56;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IoApicDeliveryStatus {
+    Idle,
+    SendPending,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IoApicRedirectionEntry(u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DecodedIoApicRedirectionEntry {
+    vector: u8,
+    masked: bool,
+    destination: u8,
+    delivery_status: IoApicDeliveryStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IoApicRedirectionError {
+    UnsupportedBits(u64),
+    WrongVector(u8),
+}
+
+impl IoApicRedirectionEntry {
+    pub(crate) const fn encode_q35_com2(masked: bool, destination: u8) -> Self {
+        let mask = if masked { IOAPIC_REDIR_MASK } else { 0 };
+        Self(
+            (Q35_COM2_VECTOR as u64)
+                | mask
+                | ((destination as u64) << IOAPIC_REDIR_DESTINATION_SHIFT),
+        )
+    }
+
+    pub(crate) const fn bits(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) fn decode(self) -> Result<DecodedIoApicRedirectionEntry, IoApicRedirectionError> {
+        let allowed = IOAPIC_REDIR_VECTOR_MASK
+            | IOAPIC_REDIR_DELIVERY_STATUS
+            | IOAPIC_REDIR_MASK
+            | (0xff_u64 << IOAPIC_REDIR_DESTINATION_SHIFT);
+        let unsupported = self.0 & !allowed;
+        if unsupported != 0 {
+            return Err(IoApicRedirectionError::UnsupportedBits(unsupported));
+        }
+        let vector = self.0 as u8;
+        if vector != Q35_COM2_VECTOR {
+            return Err(IoApicRedirectionError::WrongVector(vector));
+        }
+        Ok(DecodedIoApicRedirectionEntry {
+            vector,
+            masked: self.0 & IOAPIC_REDIR_MASK != 0,
+            destination: (self.0 >> IOAPIC_REDIR_DESTINATION_SHIFT) as u8,
+            delivery_status: if self.0 & IOAPIC_REDIR_DELIVERY_STATUS == 0 {
+                IoApicDeliveryStatus::Idle
+            } else {
+                IoApicDeliveryStatus::SendPending
+            },
+        })
+    }
+}
+
+impl DecodedIoApicRedirectionEntry {
+    pub(crate) const fn vector(self) -> u8 {
+        self.vector
+    }
+
+    pub(crate) const fn masked(self) -> bool {
+        self.masked
+    }
+
+    pub(crate) const fn destination(self) -> u8 {
+        self.destination
+    }
+
+    pub(crate) const fn delivery_status(self) -> IoApicDeliveryStatus {
+        self.delivery_status
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IoApicRouteState {
+    Vacant,
+    ReservedMasked { generation: u64 },
+    LiveUnmasked { generation: u64 },
+    Retiring { generation: u64 },
+    RetiringMasked { generation: u64 },
+    Exhausted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IoApicRouteTransitionError {
+    Busy,
+    WrongGeneration,
+    WrongState,
+    GenerationExhausted,
+}
+
+/// A pure, single-route lifecycle.  E2 couples these transitions to masked
+/// MMIO transactions; E1 intentionally does not own volatile controller state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IoApicRouteLifecycle {
+    state: IoApicRouteState,
+    next_generation: u64,
+}
+
+impl IoApicRouteLifecycle {
+    pub(crate) const fn new() -> Self {
+        Self {
+            state: IoApicRouteState::Vacant,
+            next_generation: 1,
+        }
+    }
+
+    pub(crate) const fn state(self) -> IoApicRouteState {
+        self.state
+    }
+
+    pub(crate) fn reserve(&mut self) -> Result<u64, IoApicRouteTransitionError> {
+        if self.state != IoApicRouteState::Vacant {
+            return Err(IoApicRouteTransitionError::Busy);
+        }
+        if self.next_generation == 0 {
+            self.state = IoApicRouteState::Exhausted;
+            return Err(IoApicRouteTransitionError::GenerationExhausted);
+        }
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.checked_add(1).unwrap_or(0);
+        self.state = IoApicRouteState::ReservedMasked { generation };
+        Ok(generation)
+    }
+
+    pub(crate) fn commit(&mut self, generation: u64) -> Result<(), IoApicRouteTransitionError> {
+        match self.state {
+            IoApicRouteState::ReservedMasked {
+                generation: current,
+            } if current == generation => {
+                self.state = IoApicRouteState::LiveUnmasked { generation };
+                Ok(())
+            }
+            IoApicRouteState::ReservedMasked { .. } => {
+                Err(IoApicRouteTransitionError::WrongGeneration)
+            }
+            _ => Err(IoApicRouteTransitionError::WrongState),
+        }
+    }
+
+    pub(crate) fn begin_retire(
+        &mut self,
+        generation: u64,
+    ) -> Result<(), IoApicRouteTransitionError> {
+        match self.state {
+            IoApicRouteState::LiveUnmasked {
+                generation: current,
+            } if current == generation => {
+                self.state = IoApicRouteState::Retiring { generation };
+                Ok(())
+            }
+            IoApicRouteState::LiveUnmasked { .. } => {
+                Err(IoApicRouteTransitionError::WrongGeneration)
+            }
+            _ => Err(IoApicRouteTransitionError::WrongState),
+        }
+    }
+
+    pub(crate) fn mask(&mut self, generation: u64) -> Result<(), IoApicRouteTransitionError> {
+        match self.state {
+            IoApicRouteState::Retiring {
+                generation: current,
+            } if current == generation => {
+                self.state = IoApicRouteState::RetiringMasked { generation };
+                Ok(())
+            }
+            IoApicRouteState::Retiring { .. } => Err(IoApicRouteTransitionError::WrongGeneration),
+            _ => Err(IoApicRouteTransitionError::WrongState),
+        }
+    }
+
+    pub(crate) fn release(&mut self, generation: u64) -> Result<(), IoApicRouteTransitionError> {
+        match self.state {
+            IoApicRouteState::ReservedMasked {
+                generation: current,
+            }
+            | IoApicRouteState::RetiringMasked {
+                generation: current,
+            } if current == generation => {
+                self.state = IoApicRouteState::Vacant;
+                Ok(())
+            }
+            IoApicRouteState::ReservedMasked { .. } | IoApicRouteState::RetiringMasked { .. } => {
+                Err(IoApicRouteTransitionError::WrongGeneration)
+            }
+            _ => Err(IoApicRouteTransitionError::WrongState),
+        }
+    }
 }
 
 impl PmTimerProposal {
@@ -338,6 +754,177 @@ pub(crate) fn discover_cpu_topology<R: AcpiByteReader>(
         )?);
     }
     topology.ok_or(CpuTopologyError::MissingMadt)
+}
+
+fn snapshot_selected_madt<R: AcpiByteReader>(
+    reader: &mut R,
+    rsdp_physical: u64,
+    workspace: &mut AcpiSnapshotWorkspace,
+) -> Result<usize, Q35Com2RouteError> {
+    if rsdp_physical == 0 {
+        return Err(Q35Com2RouteError::InvalidMadt);
+    }
+    let root = snapshot_rsdp(reader, rsdp_physical, &mut workspace.rsdp)
+        .map_err(|_| Q35Com2RouteError::InvalidMadt)?;
+    let (root_physical, entry_bytes, expected_signature) = match root {
+        RootTable::Xsdt(address) => (address, 8_usize, *b"XSDT"),
+        RootTable::Rsdt(address) => (address, 4_usize, *b"RSDT"),
+    };
+    let root_len = snapshot_sdt(
+        reader,
+        root_physical,
+        &mut workspace.table,
+        AcpiTimeError::InvalidRootTable,
+    )
+    .map_err(|_| Q35Com2RouteError::InvalidMadt)?;
+    let root_bytes = &workspace.table[..root_len];
+    if root_bytes[..4] != expected_signature {
+        return Err(Q35Com2RouteError::InvalidMadt);
+    }
+    let payload = root_len
+        .checked_sub(SDT_HEADER_BYTES)
+        .ok_or(Q35Com2RouteError::InvalidMadt)?;
+    if payload % entry_bytes != 0 {
+        return Err(Q35Com2RouteError::InvalidMadt);
+    }
+    let count = payload / entry_bytes;
+    if count == 0 || count > MAX_ROOT_ENTRIES {
+        return Err(Q35Com2RouteError::InvalidMadt);
+    }
+    for index in 0..count {
+        let start = SDT_HEADER_BYTES + index * entry_bytes;
+        workspace.root_entries[index] = if entry_bytes == 8 {
+            u64::from_le_bytes(root_bytes[start..start + 8].try_into().unwrap())
+        } else {
+            u64::from(u32::from_le_bytes(
+                root_bytes[start..start + 4].try_into().unwrap(),
+            ))
+        };
+    }
+    let mut selected = None;
+    for index in 0..count {
+        let physical = workspace.root_entries[index];
+        if physical == 0 {
+            continue;
+        }
+        let header_len = snapshot_sdt_header(reader, physical, &mut workspace.table)
+            .map_err(|_| Q35Com2RouteError::InvalidMadt)?;
+        if workspace.table[..4] != *b"APIC" {
+            continue;
+        }
+        if selected.is_some() {
+            return Err(Q35Com2RouteError::InvalidMadt);
+        }
+        selected = Some(
+            finish_sdt_snapshot(
+                reader,
+                physical,
+                header_len,
+                &mut workspace.table,
+                AcpiTimeError::InvalidRootTable,
+            )
+            .map_err(|_| Q35Com2RouteError::InvalidMadt)?,
+        );
+    }
+    selected.ok_or(Q35Com2RouteError::InvalidMadt)
+}
+
+fn parse_q35_com2_madt(
+    bytes: &[u8],
+    live_bsp_local_apic_id: u8,
+) -> Result<Q35Com2MadtSnapshot, Q35Com2RouteError> {
+    let topology =
+        parse_madt(bytes, live_bsp_local_apic_id).map_err(Q35Com2RouteError::Topology)?;
+    let mut ioapics: [Option<IoApicDescriptor>; MAX_MADT_IOAPICS] = [None; MAX_MADT_IOAPICS];
+    let mut ioapic_len = 0;
+    let mut irq3_override = None;
+    let mut ignored_iso_count = 0;
+    let mut cursor = MADT_HEADER_BYTES;
+    while cursor < bytes.len() {
+        let entry_len = usize::from(
+            *bytes
+                .get(cursor + 1)
+                .ok_or(Q35Com2RouteError::InvalidMadt)?,
+        );
+        if entry_len < 2 {
+            return Err(Q35Com2RouteError::InvalidMadt);
+        }
+        let end = cursor
+            .checked_add(entry_len)
+            .ok_or(Q35Com2RouteError::InvalidMadt)?;
+        if end > bytes.len() {
+            return Err(Q35Com2RouteError::InvalidMadt);
+        }
+        let entry = &bytes[cursor..end];
+        match entry[0] {
+            MADT_ENTRY_IOAPIC => {
+                if entry_len != MADT_IOAPIC_BYTES {
+                    return Err(Q35Com2RouteError::InvalidMadt);
+                }
+                let descriptor = IoApicDescriptor {
+                    id: entry[2],
+                    physical_address: u64::from(u32::from_le_bytes(
+                        entry[4..8].try_into().unwrap(),
+                    )),
+                    gsi_base: u32::from_le_bytes(entry[8..12].try_into().unwrap()),
+                };
+                if descriptor.physical_address == 0 || descriptor.physical_address & 0xfff != 0 {
+                    return Err(Q35Com2RouteError::InvalidIoApicAddress(
+                        descriptor.physical_address,
+                    ));
+                }
+                for existing in ioapics[..ioapic_len].iter().flatten() {
+                    if existing.id == descriptor.id {
+                        return Err(Q35Com2RouteError::DuplicateIoApicId(descriptor.id));
+                    }
+                    if existing.physical_address == descriptor.physical_address {
+                        return Err(Q35Com2RouteError::DuplicateIoApicAddress(
+                            descriptor.physical_address,
+                        ));
+                    }
+                    if existing.gsi_base == descriptor.gsi_base {
+                        return Err(Q35Com2RouteError::DuplicateIoApicGsiBase(
+                            descriptor.gsi_base,
+                        ));
+                    }
+                }
+                if ioapic_len == MAX_MADT_IOAPICS {
+                    return Err(Q35Com2RouteError::IoApicCapacityExceeded);
+                }
+                ioapics[ioapic_len] = Some(descriptor);
+                ioapic_len += 1;
+            }
+            MADT_ENTRY_INTERRUPT_SOURCE_OVERRIDE => {
+                if entry_len != MADT_INTERRUPT_SOURCE_OVERRIDE_BYTES {
+                    return Err(Q35Com2RouteError::InvalidMadt);
+                }
+                let bus = entry[2];
+                let source = entry[3];
+                if bus == 0 && source == Q35_COM2_ISA_IRQ {
+                    if irq3_override.is_some() {
+                        return Err(Q35Com2RouteError::DuplicateIrq3Override);
+                    }
+                    irq3_override = Some(InterruptSourceOverride {
+                        gsi: u32::from_le_bytes(entry[4..8].try_into().unwrap()),
+                        flags: u16::from_le_bytes(entry[8..10].try_into().unwrap()),
+                    });
+                } else {
+                    ignored_iso_count += 1;
+                    if ignored_iso_count > MAX_MADT_ISO_OVERRIDES {
+                        return Err(Q35Com2RouteError::IsoCapacityExceeded);
+                    }
+                }
+            }
+            _ => {}
+        }
+        cursor = end;
+    }
+    Ok(Q35Com2MadtSnapshot {
+        topology,
+        ioapics,
+        ioapic_len,
+        irq3_override,
+    })
 }
 
 fn map_topology_acpi_error(error: AcpiTimeError) -> CpuTopologyError {
@@ -814,6 +1401,40 @@ mod tests {
         entry
     }
 
+    fn ioapic(id: u8, address: u32, gsi_base: u32) -> [u8; MADT_IOAPIC_BYTES] {
+        let mut entry = [0_u8; MADT_IOAPIC_BYTES];
+        entry[0] = MADT_ENTRY_IOAPIC;
+        entry[1] = MADT_IOAPIC_BYTES as u8;
+        entry[2] = id;
+        entry[4..8].copy_from_slice(&address.to_le_bytes());
+        entry[8..12].copy_from_slice(&gsi_base.to_le_bytes());
+        entry
+    }
+
+    fn iso(
+        bus: u8,
+        source: u8,
+        gsi: u32,
+        flags: u16,
+    ) -> [u8; MADT_INTERRUPT_SOURCE_OVERRIDE_BYTES] {
+        let mut entry = [0_u8; MADT_INTERRUPT_SOURCE_OVERRIDE_BYTES];
+        entry[0] = MADT_ENTRY_INTERRUPT_SOURCE_OVERRIDE;
+        entry[1] = MADT_INTERRUPT_SOURCE_OVERRIDE_BYTES as u8;
+        entry[2] = bus;
+        entry[3] = source;
+        entry[4..8].copy_from_slice(&gsi.to_le_bytes());
+        entry[8..10].copy_from_slice(&flags.to_le_bytes());
+        entry
+    }
+
+    fn q35_route(
+        memory: &mut impl AcpiByteReader,
+        rsdp: u64,
+        probes: &[IoApicProbe],
+    ) -> Result<PlatformIrqRoute, Q35Com2RouteError> {
+        discover_q35_com2_route(memory, rsdp, 2, true, probes, &mut workspace())
+    }
+
     fn topology(
         memory: &mut impl AcpiByteReader,
         rsdp: u64,
@@ -1024,6 +1645,203 @@ mod tests {
                 .unwrap()
                 .local_apic_physical_address(),
             0x0000_0001_fee0_0000
+        );
+    }
+
+    #[test]
+    fn q35_com2_route_snapshots_topology_and_resolves_default_or_explicit_edge_high() {
+        let bsp = local_apic(0, 2, MADT_PROCESSOR_ENABLED);
+        let ap = local_apic(1, 7, MADT_PROCESSOR_ENABLED);
+        let controller = ioapic(1, 0xfec0_0000, 0);
+        let table = madt(&[&ap, &bsp, &controller]);
+        let (mut memory, rsdp) = topology_fixture(&[table]);
+        let descriptor = IoApicDescriptor {
+            id: 1,
+            physical_address: 0xfec0_0000,
+            gsi_base: 0,
+        };
+        let route = q35_route(&mut memory, rsdp, &[IoApicProbe::new(descriptor, 24)]).unwrap();
+        assert_eq!(route.gsi(), 3);
+        assert_eq!(route.polarity(), PlatformIrqPolarity::ActiveHigh);
+        assert_eq!(route.trigger(), PlatformIrqTrigger::Edge);
+        assert_eq!(route.vector(), Q35_COM2_VECTOR);
+        assert_eq!(route.bsp_local_apic_id(), 2);
+        assert_eq!(route.controller(), descriptor);
+
+        let override_ = iso(0, Q35_COM2_ISA_IRQ, 19, 0b0101);
+        let table = madt(&[&bsp, &controller, &override_]);
+        let (mut memory, rsdp) = topology_fixture(&[table]);
+        let route = q35_route(&mut memory, rsdp, &[IoApicProbe::new(descriptor, 24)]).unwrap();
+        assert_eq!(route.gsi(), 19);
+    }
+
+    #[test]
+    fn q35_com2_route_rejects_controller_and_coverage_nasties() {
+        let bsp = local_apic(0, 2, MADT_PROCESSOR_ENABLED);
+        let valid = ioapic(1, 0xfec0_0000, 0);
+        let descriptor = IoApicDescriptor {
+            id: 1,
+            physical_address: 0xfec0_0000,
+            gsi_base: 0,
+        };
+        let table = madt(&[&bsp]);
+        let (mut memory, rsdp) = topology_fixture(&[table]);
+        assert_eq!(
+            q35_route(&mut memory, rsdp, &[]),
+            Err(Q35Com2RouteError::MissingIoApic)
+        );
+
+        for (address, expected) in [
+            (0, Q35Com2RouteError::InvalidIoApicAddress(0)),
+            (
+                0xfec0_0001,
+                Q35Com2RouteError::InvalidIoApicAddress(0xfec0_0001),
+            ),
+        ] {
+            let bad = ioapic(1, address, 0);
+            let table = madt(&[&bsp, &bad]);
+            let (mut memory, rsdp) = topology_fixture(&[table]);
+            assert_eq!(q35_route(&mut memory, rsdp, &[]), Err(expected));
+        }
+
+        let table = madt(&[&bsp, &valid]);
+        let (mut memory, rsdp) = topology_fixture(&[table]);
+        assert_eq!(
+            q35_route(&mut memory, rsdp, &[IoApicProbe::new(descriptor, 3)]),
+            Err(Q35Com2RouteError::UncoveredGsi(3))
+        );
+        let overflow = ioapic(1, 0xfec0_0000, u32::MAX - 1);
+        let overflow_descriptor = IoApicDescriptor {
+            id: 1,
+            physical_address: 0xfec0_0000,
+            gsi_base: u32::MAX - 1,
+        };
+        let table = madt(&[&bsp, &overflow]);
+        let (mut memory, rsdp) = topology_fixture(&[table]);
+        assert_eq!(
+            q35_route(
+                &mut memory,
+                rsdp,
+                &[IoApicProbe::new(overflow_descriptor, 3)]
+            ),
+            Err(Q35Com2RouteError::GsiRangeOverflow)
+        );
+
+        let second = ioapic(2, 0xfec0_1000, 2);
+        let second_descriptor = IoApicDescriptor {
+            id: 2,
+            physical_address: 0xfec0_1000,
+            gsi_base: 2,
+        };
+        let table = madt(&[&bsp, &valid, &second]);
+        let (mut memory, rsdp) = topology_fixture(&[table]);
+        assert_eq!(
+            q35_route(
+                &mut memory,
+                rsdp,
+                &[
+                    IoApicProbe::new(descriptor, 24),
+                    IoApicProbe::new(second_descriptor, 24)
+                ],
+            ),
+            Err(Q35Com2RouteError::AmbiguousGsi(3))
+        );
+
+        let duplicate_id = ioapic(1, 0xfec0_1000, 24);
+        let table = madt(&[&bsp, &valid, &duplicate_id]);
+        let (mut memory, rsdp) = topology_fixture(&[table]);
+        assert_eq!(
+            q35_route(&mut memory, rsdp, &[]),
+            Err(Q35Com2RouteError::DuplicateIoApicId(1))
+        );
+    }
+
+    #[test]
+    fn q35_com2_route_rejects_override_flags_duplicates_and_malformed_records() {
+        let bsp = local_apic(0, 2, MADT_PROCESSOR_ENABLED);
+        let controller = ioapic(1, 0xfec0_0000, 0);
+        let descriptor = IoApicDescriptor {
+            id: 1,
+            physical_address: 0xfec0_0000,
+            gsi_base: 0,
+        };
+        let probes = [IoApicProbe::new(descriptor, 24)];
+        for (flags, expected) in [
+            (0b0010, Q35Com2RouteError::ReservedPolarity),
+            (0b1000, Q35Com2RouteError::ReservedTrigger),
+            (0b0011, Q35Com2RouteError::UnsupportedPolarity),
+            (0b1100, Q35Com2RouteError::UnsupportedTrigger),
+        ] {
+            let override_ = iso(0, Q35_COM2_ISA_IRQ, 3, flags);
+            let table = madt(&[&bsp, &controller, &override_]);
+            let (mut memory, rsdp) = topology_fixture(&[table]);
+            assert_eq!(q35_route(&mut memory, rsdp, &probes), Err(expected));
+        }
+        let first = iso(0, Q35_COM2_ISA_IRQ, 3, 0);
+        let second = iso(0, Q35_COM2_ISA_IRQ, 3, 0);
+        let table = madt(&[&bsp, &controller, &first, &second]);
+        let (mut memory, rsdp) = topology_fixture(&[table]);
+        assert_eq!(
+            q35_route(&mut memory, rsdp, &probes),
+            Err(Q35Com2RouteError::DuplicateIrq3Override)
+        );
+
+        let malformed_ioapic = [MADT_ENTRY_IOAPIC, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let table = madt(&[&bsp, &malformed_ioapic]);
+        let (mut memory, rsdp) = topology_fixture(&[table]);
+        assert_eq!(
+            q35_route(&mut memory, rsdp, &[]),
+            Err(Q35Com2RouteError::InvalidMadt)
+        );
+        let malformed_iso = [MADT_ENTRY_INTERRUPT_SOURCE_OVERRIDE, 9, 0, 3, 0, 0, 0, 0, 0];
+        let table = madt(&[&bsp, &malformed_iso]);
+        let (mut memory, rsdp) = topology_fixture(&[table]);
+        assert_eq!(
+            q35_route(&mut memory, rsdp, &[]),
+            Err(Q35Com2RouteError::InvalidMadt)
+        );
+    }
+
+    #[test]
+    fn q35_redirection_encoding_and_route_lifecycle_are_pure_and_exact() {
+        let masked = IoApicRedirectionEntry::encode_q35_com2(true, 2);
+        assert_eq!(masked.bits(), 0x0200_0000_0001_0030);
+        let decoded = masked.decode().unwrap();
+        assert_eq!(decoded.vector(), Q35_COM2_VECTOR);
+        assert!(decoded.masked());
+        assert_eq!(decoded.destination(), 2);
+        assert_eq!(decoded.delivery_status(), IoApicDeliveryStatus::Idle);
+        let unmasked = IoApicRedirectionEntry::encode_q35_com2(false, 2);
+        assert_eq!(unmasked.bits(), 0x0200_0000_0000_0030);
+        assert!(!unmasked.decode().unwrap().masked());
+        assert_eq!(
+            IoApicRedirectionEntry(unmasked.bits() | IOAPIC_REDIR_DELIVERY_STATUS)
+                .decode()
+                .unwrap()
+                .delivery_status(),
+            IoApicDeliveryStatus::SendPending
+        );
+        assert_eq!(
+            IoApicRedirectionEntry(unmasked.bits() | (1 << 13)).decode(),
+            Err(IoApicRedirectionError::UnsupportedBits(1 << 13))
+        );
+
+        let mut lifecycle = IoApicRouteLifecycle::new();
+        let generation = lifecycle.reserve().unwrap();
+        assert_eq!(
+            lifecycle.state(),
+            IoApicRouteState::ReservedMasked { generation }
+        );
+        lifecycle.commit(generation).unwrap();
+        lifecycle.begin_retire(generation).unwrap();
+        lifecycle.mask(generation).unwrap();
+        lifecycle.release(generation).unwrap();
+        assert_eq!(lifecycle.state(), IoApicRouteState::Vacant);
+        let replacement = lifecycle.reserve().unwrap();
+        assert_ne!(replacement, generation);
+        assert_eq!(
+            lifecycle.commit(generation),
+            Err(IoApicRouteTransitionError::WrongGeneration)
         );
     }
 }
