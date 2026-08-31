@@ -894,7 +894,7 @@ fn snapshot_selected_madt<R: AcpiByteReader>(
         if physical == 0 {
             continue;
         }
-        let header_len = snapshot_sdt_header(reader, physical, &mut workspace.table)
+        snapshot_sdt_header(reader, physical, &mut workspace.table)
             .map_err(|_| Q35Com2RouteError::InvalidMadt)?;
         if workspace.table[..4] != *b"APIC" {
             continue;
@@ -902,18 +902,16 @@ fn snapshot_selected_madt<R: AcpiByteReader>(
         if selected.is_some() {
             return Err(Q35Com2RouteError::InvalidMadt);
         }
-        selected = Some(
-            finish_sdt_snapshot(
-                reader,
-                physical,
-                header_len,
-                &mut workspace.table,
-                AcpiTimeError::InvalidRootTable,
-            )
-            .map_err(|_| Q35Com2RouteError::InvalidMadt)?,
-        );
+        selected = Some(physical);
     }
-    selected.ok_or(Q35Com2RouteError::InvalidMadt)
+    let physical = selected.ok_or(Q35Com2RouteError::InvalidMadt)?;
+    snapshot_sdt(
+        reader,
+        physical,
+        &mut workspace.table,
+        AcpiTimeError::InvalidRootTable,
+    )
+    .map_err(|_| Q35Com2RouteError::InvalidMadt)
 }
 
 fn parse_q35_com2_madt(
@@ -1782,6 +1780,20 @@ mod tests {
         let (mut memory, rsdp) = topology_fixture(&[table]);
         let route = q35_route(&mut memory, rsdp, &[IoApicProbe::new(descriptor, 24)]).unwrap();
         assert_eq!(route.gsi(), 19);
+
+        // QEMU's q35 XSDT contains tables after APIC. Header discovery must
+        // not leave the shared snapshot buffer holding the final non-APIC
+        // header when the selected MADT is parsed.
+        let table = madt(&[&ap, &bsp, &controller]);
+        let mut trailing = sdt(*b"FACP", SDT_HEADER_BYTES);
+        fix_checksum(&mut trailing, 9);
+        let (mut memory, rsdp) = topology_fixture(&[table, trailing]);
+        assert_eq!(
+            q35_route(&mut memory, rsdp, &[IoApicProbe::new(descriptor, 24)])
+                .unwrap()
+                .controller(),
+            descriptor
+        );
     }
 
     #[test]
