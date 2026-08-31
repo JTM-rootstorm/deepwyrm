@@ -252,6 +252,7 @@ pub(crate) enum Q35Com2RouteError {
     ProbeDoesNotMatchMadt,
     InvalidProbeCapacity,
     GsiRangeOverflow,
+    OverlappingIoApicGsiRanges,
     UncoveredGsi(u32),
     AmbiguousGsi(u32),
 }
@@ -307,19 +308,24 @@ fn resolve_q35_com2_route(
         validate_irq3_override(override_.flags)?;
     }
 
+    // Validate every probed interval before selecting IRQ3.  A non-selected
+    // overlap is still ambiguous firmware topology and must never become an
+    // order-dependent controller choice in E2.
+    for left_index in 0..snapshot.ioapic_len {
+        let left = snapshot.ioapics[left_index].unwrap();
+        let left_end = probed_gsi_end(left, probes)?;
+        for right_index in left_index + 1..snapshot.ioapic_len {
+            let right = snapshot.ioapics[right_index].unwrap();
+            let right_end = probed_gsi_end(right, probes)?;
+            if left.gsi_base < right_end && right.gsi_base < left_end {
+                return Err(Q35Com2RouteError::OverlappingIoApicGsiRanges);
+            }
+        }
+    }
+
     let mut covering = None;
     for descriptor in snapshot.ioapics[..snapshot.ioapic_len].iter().flatten() {
-        let probe = probes
-            .iter()
-            .find(|probe| probe.descriptor == *descriptor)
-            .ok_or(Q35Com2RouteError::ProbeDoesNotMatchMadt)?;
-        if probe.redirection_entries == 0 {
-            return Err(Q35Com2RouteError::InvalidProbeCapacity);
-        }
-        let end = descriptor
-            .gsi_base
-            .checked_add(probe.redirection_entries)
-            .ok_or(Q35Com2RouteError::GsiRangeOverflow)?;
+        let end = probed_gsi_end(*descriptor, probes)?;
         if gsi >= descriptor.gsi_base && gsi < end && covering.replace(*descriptor).is_some() {
             return Err(Q35Com2RouteError::AmbiguousGsi(gsi));
         }
@@ -333,6 +339,23 @@ fn resolve_q35_com2_route(
         bsp_local_apic_id: snapshot.topology.entries().next().unwrap().local_apic_id(),
         controller,
     })
+}
+
+fn probed_gsi_end(
+    descriptor: IoApicDescriptor,
+    probes: &[IoApicProbe],
+) -> Result<u32, Q35Com2RouteError> {
+    let probe = probes
+        .iter()
+        .find(|probe| probe.descriptor == descriptor)
+        .ok_or(Q35Com2RouteError::ProbeDoesNotMatchMadt)?;
+    if probe.redirection_entries == 0 {
+        return Err(Q35Com2RouteError::InvalidProbeCapacity);
+    }
+    descriptor
+        .gsi_base
+        .checked_add(probe.redirection_entries)
+        .ok_or(Q35Com2RouteError::GsiRangeOverflow)
 }
 
 fn validate_irq3_override(flags: u16) -> Result<(), Q35Com2RouteError> {
@@ -1668,6 +1691,28 @@ mod tests {
         assert_eq!(route.bsp_local_apic_id(), 2);
         assert_eq!(route.controller(), descriptor);
 
+        let disjoint = ioapic(2, 0xfec0_1000, 24);
+        let disjoint_descriptor = IoApicDescriptor {
+            id: 2,
+            physical_address: 0xfec0_1000,
+            gsi_base: 24,
+        };
+        let table = madt(&[&ap, &bsp, &controller, &disjoint]);
+        let (mut memory, rsdp) = topology_fixture(&[table]);
+        assert_eq!(
+            q35_route(
+                &mut memory,
+                rsdp,
+                &[
+                    IoApicProbe::new(descriptor, 24),
+                    IoApicProbe::new(disjoint_descriptor, 24),
+                ],
+            )
+            .unwrap()
+            .controller(),
+            descriptor
+        );
+
         let override_ = iso(0, Q35_COM2_ISA_IRQ, 19, 0b0101);
         let table = madt(&[&bsp, &controller, &override_]);
         let (mut memory, rsdp) = topology_fixture(&[table]);
@@ -1727,11 +1772,13 @@ mod tests {
             Err(Q35Com2RouteError::GsiRangeOverflow)
         );
 
-        let second = ioapic(2, 0xfec0_1000, 2);
+        // This second table does not cover IRQ3 but overlaps the first table's
+        // probed [0, 24) interval at GSIs 20..=23.  It must still fail closed.
+        let second = ioapic(2, 0xfec0_1000, 20);
         let second_descriptor = IoApicDescriptor {
             id: 2,
             physical_address: 0xfec0_1000,
-            gsi_base: 2,
+            gsi_base: 20,
         };
         let table = madt(&[&bsp, &valid, &second]);
         let (mut memory, rsdp) = topology_fixture(&[table]);
@@ -1744,7 +1791,7 @@ mod tests {
                     IoApicProbe::new(second_descriptor, 24)
                 ],
             ),
-            Err(Q35Com2RouteError::AmbiguousGsi(3))
+            Err(Q35Com2RouteError::OverlappingIoApicGsiRanges)
         );
 
         let duplicate_id = ioapic(1, 0xfec0_1000, 24);

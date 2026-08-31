@@ -30,8 +30,11 @@ The model preserves the reached CPU-topology parser and fixtures while adding:
 
 Malformed records, zero/unaligned MMIO proposals, duplicate controller facts,
 duplicate IRQ3 overrides, reserved polarity/trigger fields, active-low/level
-IRQ3, empty/overflowing or ambiguous coverage, and mismatched probes fail
-closed.  Firmware remains a proposal; E2 still owns mapping, controller ID/
+IRQ3, empty/overflowing coverage, **any pairwise overlap among probed IOAPIC
+GSI intervals**, and mismatched probes fail closed.  The overlap check runs
+before selecting IRQ3, so a second interval that overlaps another table but
+does not itself cover GSI3 cannot create an order-dependent E2 controller
+choice. Firmware remains a proposal; E2 still owns mapping, controller ID/
 version verification, and route publication.
 
 ## Changed files
@@ -53,8 +56,11 @@ All commands used `tools/pinned-cargo` with lane-owned target directories.
 | `tools/pinned-cargo host fmt --all -- --check` | passed. |
 | `tools/pinned-cargo target check -p deepwyrm-kernel` | passed. |
 
-The E1 corpus covers normal q35 default and explicit edge/high routes; no
-IOAPIC; zero/unaligned address; range overflow; no and overlapping coverage;
+The E1 corpus covers normal q35 default and explicit edge/high routes; a
+positive disjoint two-IOAPIC topology; no IOAPIC; zero/unaligned address;
+range overflow; no coverage; any overlapping coverage (including a second
+`base=20`, `capacity=24` controller which does not cover IRQ3 but overlaps the
+first `base=0`, `capacity=24` controller);
 duplicate controller identity; reserved/unsupported polarity/trigger;
 duplicate IRQ3 override; malformed type-1/type-2 records; masked/unmasked
 redirection encoding; delivery-status decoding; and generation-exact pure
