@@ -7003,8 +7003,19 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
     }
 
     fn has_reschedule_request(&mut self) -> bool {
-        self.with_synchronized_runtime_at_safe_point(|runtime| runtime.has_reschedule_request())
-            .unwrap_or(false)
+        let cpu = self.cpu;
+        self.with_synchronized_runtime_at_safe_point(|runtime| {
+            // A general Timer deadline publishes its completion token from the
+            // Local APIC interrupt before the scheduler may return a woken
+            // Thread to userspace. Drain that token at this carrier-owned safe
+            // point so the Thread cannot close/rearm the Timer while its prior
+            // completion remains buffered in the bounded IRQ inbox.
+            if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                runtime.service_pending_timer_expiries_on_bootstrap();
+            }
+            runtime.has_reschedule_request()
+        })
+        .unwrap_or(false)
     }
 
     fn authorize_timer_return(

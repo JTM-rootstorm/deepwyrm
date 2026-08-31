@@ -984,8 +984,28 @@ fn live_timer_expiry_is_bound_and_serviced_only_from_carrier_safe_points() {
         runtime
             .matches("runtime.service_pending_timer_expiries_on_bootstrap();")
             .count(),
-        2
+        3
     );
+    let shared_carrier = runtime
+        .split_once(
+            "impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrameRuntime\n    for RuntimeCarrierFacade",
+        )
+        .expect("shared native carrier callbacks")
+        .1;
+    let timer_return = shared_carrier
+        .split_once("fn has_reschedule_request(&mut self) -> bool {")
+        .expect("shared native carrier reschedule callback")
+        .1
+        .split_once("fn authorize_timer_return")
+        .expect("shared native carrier reschedule callback extent")
+        .0;
+    let expiry_service = timer_return
+        .find("runtime.service_pending_timer_expiries_on_bootstrap();")
+        .expect("timer-return expiry service");
+    let reschedule = timer_return
+        .find("runtime.has_reschedule_request()")
+        .expect("timer-return reschedule decision");
+    assert!(expiry_service < reschedule);
     assert!(
         runtime
             .matches("self.cpu == crate::cpu::CpuIndex::BOOTSTRAP")
