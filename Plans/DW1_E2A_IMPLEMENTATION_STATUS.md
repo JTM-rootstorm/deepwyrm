@@ -22,7 +22,10 @@ enough to read ID and version/max-redirection registers, resolves E1's exact
 route using those measured capacities, then permanently maps and re-probes
 only the selected controller. The published `ValidatedQ35IoApic` retains the
 exact route/probe fact and serializes every IOREGSEL/IOWIN 32-bit volatile
-transaction through an `IrqSpinMutex`.
+transaction through an `IrqSpinMutex`. After permanent reprobe, E2A computes
+the selected redirection low-register index from checked `GSI - GSI base`
+arithmetic, reads it through that serialized owner, and rejects the platform
+unless the existing mask bit is set.
 
 No redirection entry is written in E2A. Therefore a validated route remains
 whatever masked firmware/default state E2A observed; E2C alone owns reserve,
@@ -57,7 +60,7 @@ The lane used separate pinned host/target directories:
 
 | Command | Result |
 | --- | --- |
-| `tools/pinned-cargo host test -p deepwyrm-kernel --lib` | 776 passed. |
+| `tools/pinned-cargo host test -p deepwyrm-kernel --lib` | 779 passed. |
 | `tools/pinned-cargo host clippy -p deepwyrm-kernel --lib --tests -- -D warnings` | passed. |
 | `tools/pinned-cargo host fmt --all -- --check` | passed. |
 | `tools/pinned-cargo target check -p deepwyrm-kernel` | passed. |

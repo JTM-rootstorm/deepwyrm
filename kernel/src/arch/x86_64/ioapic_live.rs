@@ -29,6 +29,8 @@ const IOREGSEL: u32 = 0x00;
 const IOWIN: u32 = 0x10;
 const IOAPIC_REG_ID: u32 = 0x00;
 const IOAPIC_REG_VERSION: u32 = 0x01;
+const IOAPIC_REG_REDIR_BASE: u32 = 0x10;
+const IOAPIC_REDIR_MASK: u32 = 1 << 16;
 const SLOT_EMPTY: u8 = 0;
 const SLOT_PUBLISHING: u8 = 1;
 const SLOT_READY: u8 = 2;
@@ -39,10 +41,22 @@ pub(crate) enum LiveIoApicError {
     Mapping,
     InvalidMmioBase,
     InvalidRegisterOffset,
-    ControllerId { expected: u8, observed: u8 },
+    ControllerId {
+        expected: u8,
+        observed: u8,
+    },
     InvalidVersion,
     InvalidCapacity,
     ProbeDrift,
+    SelectedGsiOutsideController {
+        gsi: u32,
+        gsi_base: u32,
+        redirection_entries: u32,
+    },
+    RedirectionRegisterOverflow,
+    SelectedRedirectionUnmasked {
+        register: u32,
+    },
     Route(Q35Com2RouteError),
     AlreadyInitialized,
 }
@@ -234,18 +248,51 @@ fn initialize_q35_ioapic_inner<'root, const RANGE_CAPACITY: usize, const ROLE_CA
     {
         return Err(LiveIoApicError::ProbeDrift);
     }
-    if route.gsi() < route.controller().gsi_base()
-        || route.gsi() - route.controller().gsi_base() >= measured.redirection_entries()
-    {
-        return Err(LiveIoApicError::Route(Q35Com2RouteError::UncoveredGsi(
-            route.gsi(),
-        )));
-    }
-    Q35_IOAPIC.publish(ValidatedQ35IoApic {
+    let selected_low_register = selected_redirection_low_register(
+        route.gsi(),
+        route.controller().gsi_base(),
+        measured.redirection_entries(),
+    )?;
+    let owner = ValidatedQ35IoApic {
         route,
         probe: measured,
         registers: IrqSpinMutex::new(controller),
-    })
+    };
+    let selected_low = owner.read_register(selected_low_register)?;
+    require_masked_redirection(selected_low_register, selected_low)?;
+    Q35_IOAPIC.publish(owner)
+}
+
+fn selected_redirection_low_register(
+    gsi: u32,
+    gsi_base: u32,
+    redirection_entries: u32,
+) -> Result<u32, LiveIoApicError> {
+    let index = gsi
+        .checked_sub(gsi_base)
+        .ok_or(LiveIoApicError::SelectedGsiOutsideController {
+            gsi,
+            gsi_base,
+            redirection_entries,
+        })?;
+    if index >= redirection_entries {
+        return Err(LiveIoApicError::SelectedGsiOutsideController {
+            gsi,
+            gsi_base,
+            redirection_entries,
+        });
+    }
+    index
+        .checked_mul(2)
+        .and_then(|offset| IOAPIC_REG_REDIR_BASE.checked_add(offset))
+        .ok_or(LiveIoApicError::RedirectionRegisterOverflow)
+}
+
+fn require_masked_redirection(register: u32, redirection_low: u32) -> Result<(), LiveIoApicError> {
+    if redirection_low & IOAPIC_REDIR_MASK == 0 {
+        return Err(LiveIoApicError::SelectedRedirectionUnmasked { register });
+    }
+    Ok(())
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -398,6 +445,32 @@ mod tests {
                 expected: 2,
                 observed: 3,
             })
+        );
+    }
+
+    #[test]
+    fn selected_redirection_low_register_uses_the_exact_gsi_relative_boundary() {
+        assert_eq!(selected_redirection_low_register(27, 4, 24), Ok(0x3e));
+        assert_eq!(
+            selected_redirection_low_register(28, 4, 24),
+            Err(LiveIoApicError::SelectedGsiOutsideController {
+                gsi: 28,
+                gsi_base: 4,
+                redirection_entries: 24,
+            })
+        );
+    }
+
+    #[test]
+    fn selected_redirection_readback_accepts_a_masked_route() {
+        assert_eq!(require_masked_redirection(0x16, 0x0001_0030), Ok(()));
+    }
+
+    #[test]
+    fn selected_redirection_readback_rejects_an_unmasked_route() {
+        assert_eq!(
+            require_masked_redirection(0x16, 0x0000_0030),
+            Err(LiveIoApicError::SelectedRedirectionUnmasked { register: 0x16 })
         );
     }
 }
