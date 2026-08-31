@@ -151,6 +151,37 @@ Every designated-domain run ended with `OS-Project` shut off and restored the
 exact inactive definition SHA-256
 `a823095e2182f848be0c15fe1a88728fce9f126fbc55e7d9aab30d84a6c5d3c3`.
 
+## 2026-08-31 exact-current WYR1-C regression
+
+WYR1-C6 subsequently exercised selector 28 against current Deepwyrm
+`6ba05d6706a0f376c0af0b4ce86305af01748cce` and Wyrmroot
+`b872e3bd465e3f6d9c9e90adbceb3756dc490dc2`. This is a post-acceptance
+current-product regression; it does not replace DW1-C's original frozen
+candidate above.
+
+The first stronger terminal-root synchronization candidate failed selector 28
+at `primordial.rs:1185`. Active GDB was attached before any retry or source
+change. It showed a valid exact-root no-op after the remote stop completed,
+with another CPU still inside `complete_remote_stop`; the helper had mistaken
+that valid state for a lost terminal-root claim. The exact GDB trace SHA-256 is
+`113a41b65e2c007564cd2b917b9c65588e7b00429cf05fab65ce706f5a0cdcae`
+and its exact symbols SHA-256 is
+`d9ecb019a3bf3d23e56b8e729fd1b6dcbe3823311e8c545a75291deb4e76223f`.
+
+Revision `6ba05d67...` accepts only that exact-root no-op while retaining the
+physical terminal-owner invariant. Its fresh selector-28 request SHA-256 is
+`f9f021ab8deab107e60272314ce9c250ca3bb479301c0f75ee190645ed132619`,
+with progress digest `D1C6A11CE5EED041`. The verified designated-VM
+campaign then passed one smoke and five consecutive stress boots, each with
+exactly 46 ordered records and a selector-28 PASS terminal. The campaign-result
+SHA-256 is
+`b78b8e06d4738e4058597a56768dd5e9471ba7c70a809beab14dcea1b610c7b1`.
+
+The same Deepwyrm revision then passed WYR1-C selector 29 on both one-vCPU and
+four-vCPU profiles. That separate device-coordinator acceptance is recorded in
+`wyrmroot/Plans/WYR1_C_VALIDATION.md`; it does not broaden DW1-C into device or
+physical-I/O ownership.
+
 ## Required sources and provenance
 
 The root DW1-C/WYR1-C plan, Deepwyrm architecture index, reached DW1-A0
