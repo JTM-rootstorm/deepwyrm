@@ -126,12 +126,16 @@ accepts only:
 - physical destination mode;
 - active-high polarity;
 - edge trigger;
+- a zeroed delivery-status template bit, decoded separately as the read-only
+  redirection Delivery Status bit on hardware readback;
 - a zeroed remote-IRR bit on construction;
 - BSP xAPIC destination in the high dword; and
 - the explicit mask bit selected by the lifecycle state.
 
 All reserved or unsupported fields remain zero. Decode/re-encode tests must
-prove both the masked and unmasked forms exactly.
+prove both the masked and unmasked forms exactly and must expose Delivery
+Status bit 12 as `Idle` for zero and `SendPending` for one without treating the
+read-only observation as a writable route field.
 
 E2 maps one validated IOAPIC page permanently with the reached UC/PAT
 invariants. IOREGSEL and IOWIN are volatile aligned 32-bit accesses behind one
@@ -140,11 +144,16 @@ state. The version/maximum-redirection register is probed before route
 publication, and controller ID/version/capacity must agree with the selected
 descriptor. Mapping or probe drift fails closed.
 
-Every reserve, reprogram, rollback, retirement, and release begins with the
-exact selected redirection entry masked. A committed live edge route is
-unmasked once and stays unmasked until rollback, terminal fault, or retirement.
-Write completion required by retirement is established by reading the same
-redirection entry back through the serialized selector/window boundary.
+Every reserve, reprogram, rollback, and physical release operation begins with
+the exact selected redirection entry masked. Retirement first removes the
+binding from live delivery classification, then masks the physical entry as
+specified in section 7. A committed live edge route is unmasked once and stays
+unmasked until rollback, terminal fault, or retirement. Write completion
+required by retirement is established by reading the same redirection entry
+back through the serialized selector/window boundary. That mask readback alone
+does not establish that an interrupt message accepted just before the write is
+no longer in transit; section 7 separately requires the read-only Delivery
+Status bit to become idle.
 
 ## 5. Platform binding lifecycle
 
@@ -155,6 +164,7 @@ and this private state:
 Vacant
   -> ReservedMasked(exact generation)
   -> LiveUnmasked(exact generation)
+  -> Retiring(exact generation)
   -> RetiringMasked(exact generation)
   -> Vacant
 ```
@@ -163,8 +173,12 @@ Generation exhaustion retains the slot unavailable and fails closed. A
 reservation is invisible to userspace and may be cancelled only while its
 exact entry remains masked. Commit programs and verifies the exact route,
 publishes the exact binding, and unmasks only at the no-fail creation commit.
-Publication rollback enters the same masked retirement/release rules; it may
-not make a published or replacement generation observe an old vector.
+`Retiring` is a logical quarantine state: it prevents new user delivery
+snapshots but makes no claim yet about the physical mask bit. Only successful
+mask write/readback advances it to `RetiringMasked`. Publication rollback from
+an entry already proved masked may enter `RetiringMasked` directly. Both
+retirement paths use the remaining release proof and may not make a published
+or replacement generation observe an old vector.
 
 `InterruptBinding` remains generation-exact. The q35 backend rejects any
 domain/source/generation mismatch. Source number 3 alone is never enough to
@@ -191,7 +205,8 @@ The vector-`0x30` ISR performs this bounded order with IF clear:
 3. for `LiveUnmasked`, construct the exact `InterruptDelivery`, call
    `InterruptAuthority::deliver()`, and drain its IRQ-safe `WakeBatch` through
    the existing blocked-operation/scheduler wake path;
-4. for `RetiringMasked`, stale, or unresolved state, publish no userspace wake;
+4. for logical `Retiring`, `RetiringMasked`, stale, or unresolved state,
+   publish no userspace wake;
 5. issue local xAPIC EOI in the kernel;
 6. decrement the exact generation's in-handler count with release ordering;
    and
@@ -243,20 +258,30 @@ it never guesses from numeric source 3.
 
 Release of source 3 uses this exact quarantine:
 
-1. atomically change the exact live binding to `RetiringMasked`, preventing
-   new delivery snapshots from being classified live;
-2. mask the selected IOAPIC entry and read it back masked;
-3. poll boundedly for that generation's in-handler count to become zero;
-4. on BSP/CPU0, after the mask readback and handler quiescence, read the xAPIC
-   IRR and ISR banks for vector `0x30` and require both bits clear;
-5. if retirement runs on another CPU, publish one generation-bound private
+1. atomically change the exact live binding to logical `Retiring`, preventing
+   new delivery snapshots from being classified live without yet asserting a
+   physical mask state;
+2. mask the selected IOAPIC entry, read back mask bit 16 as one, and only then
+   advance the unchanged generation to `RetiringMasked`;
+3. after the masked readback, perform at most
+   `DELIVERY_STATUS_POLL_LIMIT = 65_536` serialized volatile reads of that
+   entry's low dword and require read-only Delivery Status bit 12 to be zero
+   (`Idle`); bit one is `SendPending` and means an old edge may still be in
+   transit;
+4. poll boundedly for that generation's in-handler count to become zero;
+5. reacquire the IOAPIC selector/window lock and revalidate the unchanged
+   redirection entry with mask bit 16 one and Delivery Status bit 12 zero;
+6. on BSP/CPU0, strictly after that delivery-status revalidation and handler
+   quiescence, read the xAPIC IRR and ISR banks for vector `0x30` and require
+   both bits clear;
+7. if retirement runs on another CPU, publish one generation-bound private
    check to CPU0 using the reached e1 rendezvous transport, and let CPU0 perform
    the check at its post-EOI carrier-safe point;
-6. acquire the exact check result and revalidate the unchanged retiring
-   generation and masked redirection entry;
-7. consume and EOI any vector observed while retiring without forwarding it;
-   then repeat the bounded quiescence/check; and
-8. only after a clear result remove the old binding and make the slot
+8. acquire the exact check result and revalidate the unchanged retiring
+   generation plus mask-one/Delivery-Status-idle redirection entry;
+9. consume and EOI any vector observed while retiring without forwarding it;
+   then repeat the bounded delivery-status, handler, and BSP checks; and
+10. only after a clear result remove the old binding and make the slot
    reservable with a later generation.
 
 Retirement must not spin indefinitely with IF clear. In particular, a vector
@@ -281,15 +306,21 @@ module.
 The private rendezvous request contains the source, vector, platform
 generation, and a nonzero request generation. A stale or duplicate response
 cannot complete another retirement. It allocates no memory and admits at most
-one outstanding request because WYR1 has only one source. Timeout, controller
-fault, failed mask readback, a nonzero IRR/ISR bit after the bounded retry, or
-generation drift leaves the route masked and the binding retained in
-`RetiringMasked`. It does not release or replace optimistically.
+one outstanding request because WYR1 has only one source. A Delivery Status
+poll timeout, controller fault after successful mask readback, status returning
+`SendPending` during revalidation, a nonzero IRR/ISR bit after the bounded
+retry, or generation drift leaves the route and binding quarantined in
+`RetiringMasked`. Failure before mask readback succeeds leaves logical
+`Retiring` quarantined and does not falsely claim a physical mask. Neither
+state releases or replaces optimistically.
 
-This is the required fixed-vector reuse proof. E2 must switch to a separately
-documented bounded vector-generation/quarantine design before landing if the
-live xAPIC model cannot make the proof reliable; hoping that an old vector has
-drained is forbidden.
+This is the required fixed-vector reuse proof. E2 live q35 validation must
+establish that redirection Delivery Status is implemented and reliable for
+this route. If the bit cannot be relied upon, or if either the IOAPIC
+Delivery-Status observation or the live xAPIC observation cannot make the
+ordered proof reliable, E2 must stop and switch to the already admitted,
+separately documented bounded vector-generation/quarantine design before E2
+lands. Hoping that an old vector has drained is forbidden.
 
 ## 8. Returning entry and scheduler rule
 
@@ -379,7 +410,7 @@ E1 must add pure host/model coverage for:
 - reserved polarity/trigger encodings, active-low, and level trigger;
 - malformed MADT type-1/type-2 lengths without CPU-topology drift; and
 - exact masked/unmasked redirection encoding for vector `0x30` and the BSP
-  physical destination.
+  physical destination, plus Delivery Status decode as idle/send-pending.
 
 E2 must add model/source/target coverage for:
 
@@ -390,7 +421,15 @@ E2 must add model/source/target coverage for:
   refactor;
 - no wake for stale, unresolved, retiring, wrong-domain, wrong-source, or
   wrong-generation delivery;
-- mask/readback before `RetiringMasked` release;
+- logical `Retiring` before the physical mask write, and no
+  `RetiringMasked` state until mask/readback succeeds;
+- mask/readback followed by Delivery Status idle before handler/BSP proof;
+- Delivery Status clearing within the 65,536-read bound, followed by an exact
+  mask/idle revalidation and successful release;
+- Delivery Status remaining send-pending through the bound retaining
+  quarantine with no release or vector reuse;
+- Delivery Status returning send-pending on the post-handler revalidation
+  retaining quarantine without taking an early IRR/ISR snapshot;
 - an in-flight old handler delaying release;
 - a BSP IRR-pending close staging exact finalization, returning without source
   reuse, consuming/EOIing the retiring vector, and completing later at the
@@ -501,9 +540,9 @@ The 26 events are:
 | 8 | `09 C1_RESPONSE` | raw probe `02` | probe/host observed exact deterministic COM2 response bytes/hash in `V/X` |
 | 9 | `0A U1_PEER_CLOSED` | controller `03` | old raw stream closed after intentional U1 termination; `V = G1`, `X = 0` |
 | 10 | `0B U1_RETIRE_BEGIN` | kernel `00` | exact U1 binding is Retiring, never reusable |
-| 11 | `0C U1_ROUTE_MASKED` | kernel `00` | masked redirection readback for R1; `V = 1`, `X = 0` |
+| 11 | `0C U1_ROUTE_MASKED` | kernel `00` | R1 mask readback followed by Delivery Status idle; exact bit-defined `V` and bounded poll count `X` below |
 | 12 | `0D U1_HANDLER_QUIESCENT` | kernel `00` | R1 in-handler count is zero; `V = X = 0` |
-| 13 | `0E U1_LAPIC_CLEAR` | kernel `00` | CPU0 IRR/ISR vector-`0x30` bits are clear; `V = X = 0` |
+| 13 | `0E U1_LAPIC_CLEAR` | kernel `00` | final R1 mask/Delivery-Status revalidation followed by clear CPU0 IRR/ISR; exact bit-defined `V/X` below |
 | 14 | `0F U1_RELEASED` | kernel `00` | exact R1 release completed after the preceding proof; `V = 1`, `X = 0` |
 | 15 | `10 U2_RESERVED` | kernel `00` | fresh `R2/O2/B2/T2`; same `L1`, stream/challenge zero |
 | 16 | `11 U2_COMMITTED` | kernel `00` | exact U2 tuple, committed/unmasked |
@@ -532,6 +571,20 @@ The 26 events are:
 - bits `20..27`: validated IOAPIC ID;
 - bits `28..59`: that controller's GSI base; and
 - bits `60..63`: zero.
+
+`U1_ROUTE_MASKED` is emitted only after the physical mask readback and the
+first subsequent idle Delivery Status observation. Its `V` bit 0 is the
+mask-one readback, bit 1 is Delivery-Status-idle, and bits `2..63` are zero, so
+the accepted value is exactly 3. Its `X` is the number of low-dword reads up to
+and including the idle observation in `1..=65_536`; send-pending through the
+bound emits no success event and retains quarantine.
+
+`U1_LAPIC_CLEAR` is emitted only after handler quiescence, a fresh serialized
+redirection readback, and the later BSP snapshot. Its `V` uses the same mask
+and Delivery-Status bits and is exactly 3. Its `X` bit 0 is the BSP IRR
+vector-`0x30` bit, bit 1 is the BSP ISR vector-`0x30` bit, and bits `2..63` are
+zero; the only accepted value is zero. A revalidated send-pending bit prevents
+the BSP snapshot and emits no success event.
 
 For one devmgr lease, `L2 = L1`; replacement generations satisfy
 `R2 > R1`, `O2 != O1`, `B2 > B1`, `T2 > T1`, `G2 > G1`, and `Q2 > Q1`.
@@ -615,6 +668,13 @@ Pinned external sources were read at the exact plan revisions:
 | same revision, `kernel/plic.c` | `125fc60925cae8cfff87450c88faa30634e4406f1e5a16234ff49ffba5dca7ab` | **concept** controller-owned enable/claim/complete sequence; PLIC per-hart semantics are not IOAPIC/xAPIC semantics |
 | same revision, `kernel/uart.c` | `6c284f94eb8fcca9c723015f366a849a441f462b99d16e3cca5880439df6a493` | **not-applicable** to E0 hardware policy except as a negative reminder that cause drain belongs to WYR1-D userspace, not the kernel ISR |
 | same revision, `kernel/console.c` | `d3088059d9591e367b7b15706590e472fe38cc505b22d7d8cf03b8da5de5d699` | **not-applicable** to E0; monolithic console parsing/echo and Unix device state remain outside Deepwyrm |
+
+The retirement review also required this supplemental official hardware
+source:
+
+| Source | Version/date | Disposition |
+| --- | --- | --- |
+| Intel 400 Series Chipset On-Package Platform Controller Hub Online Register Database, ID 615146, [Redirection Table Entry 0 (RTE0)](https://edc.intel.com/content/www/it/it/design/products-and-solutions/processors-and-chipsets/comet-lake-u/intel-400-series-chipset-on-package-platform-controller-hub-register-database/1.2/redirection-table-entry-0-rte0-offset-10/) | version 1.2; published date `08/09/2019`; accessed `2026-08-31` | **concept** bit 12 is RO/V Delivery Status: zero is idle and one is an injected interrupt whose delivery remains pending; masking does not retroactively cancel an already accepted message, so E0 adds the ordered idle observation before LAPIC-clear reuse proof; chipset-specific register naming is not imported |
 
 The pinned rust-osdev `uart_16550` and linenoise sources are not E0
 interrupt-controller inputs. Their register/UART and terminal/editing
