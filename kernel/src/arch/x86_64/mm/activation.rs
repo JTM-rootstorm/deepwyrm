@@ -84,6 +84,10 @@ use super::private::{
 };
 
 const ENTRY_COUNT: usize = 512;
+// The permanent xAPIC and q35 IOAPIC controllers each receive a distinct
+// kernel-only UC/NX leaf.  These are stationary mappings, never a reusable
+// temporary window and never a userspace capability.
+const PER_CPU_SCRATCH_MMIO_LEAF_COUNT: u64 = 2;
 // Mapping-stability pins are a kernel-global resource shared by every live
 // Process address space.  A designated-VM trace proved that the former capacity
 // of eight rejected the ninth actor load after seven blocked receives retained
@@ -216,7 +220,7 @@ struct ScratchBinding {
 }
 
 impl PerCpuScratchBindings {
-    const SLOT_PAGES: u64 = 3;
+    const SLOT_PAGES: u64 = 2 + PER_CPU_SCRATCH_MMIO_LEAF_COUNT;
 
     fn new(base: DeepScratchBinding) -> Self {
         Self { base }
@@ -226,11 +230,12 @@ impl PerCpuScratchBindings {
         let offset = (cpu.index() as u64).checked_mul(Self::SLOT_PAGES * PAGE_SIZE)?;
         let window_page = self.base.window_page.checked_add(offset)?;
         let control_page = window_page.checked_add(PAGE_SIZE)?;
-        let mmio_page = control_page.checked_add(PAGE_SIZE)?;
+        let last_mmio_page =
+            control_page.checked_add(PER_CPU_SCRATCH_MMIO_LEAF_COUNT.checked_mul(PAGE_SIZE)?)?;
         if window_page >> 21 != self.base.window_page >> 21
             || control_page >> 21 != self.base.window_page >> 21
-            || mmio_page >> 21 != self.base.window_page >> 21
-            || ((mmio_page >> 12) & 0x1ff) >= 0x1fe
+            || last_mmio_page >> 21 != self.base.window_page >> 21
+            || ((last_mmio_page >> 12) & 0x1ff) >= 0x1fe
         {
             return None;
         }
@@ -807,12 +812,13 @@ impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
         ((self.scratch.control_page >> 12) & 0x1ff) as usize
     }
 
-    fn mmio_page(&self) -> u64 {
-        self.scratch.control_page + PAGE_SIZE
+    fn mmio_page(&self, slot: u64) -> u64 {
+        debug_assert!(slot < PER_CPU_SCRATCH_MMIO_LEAF_COUNT);
+        self.scratch.control_page + (slot + 1) * PAGE_SIZE
     }
 
-    fn mmio_leaf_index(&self) -> usize {
-        ((self.mmio_page() >> 12) & 0x1ff) as usize
+    fn mmio_leaf_index(&self, slot: u64) -> usize {
+        ((self.mmio_page(slot) >> 12) & 0x1ff) as usize
     }
 
     fn scratch_leaf_address(&self) -> u64 {
@@ -983,14 +989,43 @@ impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
         if frame.address() == self.scratch.pt.physical_start() {
             return Err(LiveActiveTargetError::ReservedScratchEntry);
         }
-        let leaf = self.scratch.control_page + (self.mmio_leaf_index() as u64) * 8;
         let installed =
             frame.address() | PRESENT | WRITABLE | WRITE_THROUGH | CACHE_DISABLE | NO_EXECUTE;
+        for slot in 0..PER_CPU_SCRATCH_MMIO_LEAF_COUNT {
+            let leaf = self.scratch.control_page + (self.mmio_leaf_index(slot) as u64) * 8;
+            if self.io.compare_exchange(leaf, 0, installed).is_ok() {
+                let page = self.mmio_page(slot);
+                self.io.invalidate(page);
+                return Ok(page);
+            }
+        }
+        Err(LiveActiveTargetError::Busy)
+    }
+
+    /// Performs one bounded UC/NX controller probe through the CPU-private
+    /// transient leaf.  The mapping is removed before this function returns;
+    /// callers must install a separate permanent MMIO leaf before retaining a
+    /// controller owner.
+    fn with_temporary_mmio_frame<T>(
+        &mut self,
+        frame: FrameAddress,
+        operation: impl FnOnce(u64) -> T,
+    ) -> Result<T, LiveActiveTargetError> {
+        assert!(!self.poisoned, "active Deep scratch mapper is poisoned");
+        self.require_owning_cpu()?;
+        if frame.address() == self.scratch.pt.physical_start() {
+            return Err(LiveActiveTargetError::ReservedScratchEntry);
+        }
+        let installed =
+            frame.address() | PRESENT | WRITABLE | WRITE_THROUGH | CACHE_DISABLE | NO_EXECUTE;
+        let leaf = self.scratch_leaf_address();
         if self.io.compare_exchange(leaf, 0, installed).is_err() {
             return Err(LiveActiveTargetError::Busy);
         }
-        self.io.invalidate(self.mmio_page());
-        Ok(self.mmio_page())
+        self.io.invalidate(self.scratch.window_page);
+        let result = operation(self.scratch.window_page);
+        self.restore_scratch_mapping(installed);
+        Ok(result)
     }
 
     fn validate_location(
@@ -1702,6 +1737,19 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.target
             .bootstrap_scratch_target()?
             .install_mmio_frame(frame)
+    }
+
+    /// Makes a one-shot UC/NX probe mapping while the early BSP still owns the
+    /// bootstrap scratch binding.  It intentionally cannot return a raw
+    /// controller pointer beyond `operation`.
+    pub(crate) fn with_bootstrap_kernel_mmio_page<T>(
+        &mut self,
+        frame: FrameAddress,
+        operation: impl FnOnce(u64) -> T,
+    ) -> Result<T, LiveActiveTargetError> {
+        self.target
+            .bootstrap_scratch_target()?
+            .with_temporary_mmio_frame(frame, operation)
     }
 
     #[allow(

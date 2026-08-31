@@ -13,9 +13,10 @@ instead reserves one disjoint three-page window per fixed `CpuIndex`:
 
 1. an initially empty transient mapping leaf;
 2. a read/write/NX control alias of the shared scratch PT; and
-3. an initially empty MMIO leaf.
+3. two initially empty permanent MMIO leaves.
 
-The four windows occupy distinct PTE indexes in the existing scratch PT.  They
+The four windows occupy distinct PTE indexes in the existing scratch PT.  Each
+window's two permanent MMIO leaves are distinct as well. They
 therefore need no process-specific PML4 entries and no new upper-level
 subtree: every Process root and retained kernel execution root receives the
 same typed kernel-half mapping, while CPU-local selection chooses only that
@@ -60,6 +61,16 @@ before suspension/release.  Kernel execution roots expose the identical four
 slot addresses, but no CPU may select another slot.
 
 AP execution release and e2 functionality remain outside this change.
+
+## Permanent MMIO leaves
+
+The first permanent MMIO leaf is retained by the xAPIC owner. The second is
+reserved for the one validated q35 IOAPIC controller admitted by DW1-E2A. Both
+are kernel-only, writable, NX, PWT/PCD UC mappings. The transient scratch leaf
+may perform a bounded probe of an ACPI-proposed controller before a controller
+is selected, but it is cleared before returning and never exports a pointer.
+Only the selected controller obtains a permanent leaf. No Process, resource
+handle, or userspace mapping reaches either leaf.
 
 ## Required evidence
 

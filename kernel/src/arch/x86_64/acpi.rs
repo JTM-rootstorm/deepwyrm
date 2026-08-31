@@ -36,7 +36,7 @@ const MADT_INTERRUPT_SOURCE_OVERRIDE_BYTES: usize = 10;
 const MADT_LOCAL_APIC_ADDRESS_OVERRIDE_BYTES: usize = 12;
 const MADT_PROCESSOR_LOCAL_X2APIC_BYTES: usize = 16;
 const MADT_PROCESSOR_ENABLED: u32 = 1;
-const MAX_MADT_IOAPICS: usize = 8;
+pub(crate) const MAX_MADT_IOAPICS: usize = 8;
 const MAX_MADT_ISO_OVERRIDES: usize = 16;
 const Q35_COM2_ISA_IRQ: u8 = 3;
 const Q35_COM2_VECTOR: u8 = 0x30;
@@ -158,6 +158,15 @@ pub(crate) struct IoApicDescriptor {
 }
 
 impl IoApicDescriptor {
+    #[cfg(test)]
+    pub(crate) const fn test_descriptor(id: u8, physical_address: u64, gsi_base: u32) -> Self {
+        Self {
+            id,
+            physical_address,
+            gsi_base,
+        }
+    }
+
     pub(crate) const fn id(self) -> u8 {
         self.id
     }
@@ -183,6 +192,14 @@ impl IoApicProbe {
             descriptor,
             redirection_entries,
         }
+    }
+
+    pub(crate) const fn descriptor(self) -> IoApicDescriptor {
+        self.descriptor
+    }
+
+    pub(crate) const fn redirection_entries(self) -> u32 {
+        self.redirection_entries
     }
 }
 
@@ -264,11 +281,23 @@ struct InterruptSourceOverride {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Q35Com2MadtSnapshot {
+pub(crate) struct Q35Com2MadtSnapshot {
     topology: CpuTopology,
     ioapics: [Option<IoApicDescriptor>; MAX_MADT_IOAPICS],
     ioapic_len: usize,
     irq3_override: Option<InterruptSourceOverride>,
+}
+
+impl Q35Com2MadtSnapshot {
+    pub(crate) const fn controller_count(self) -> usize {
+        self.ioapic_len
+    }
+
+    pub(crate) fn controller(self, index: usize) -> Option<IoApicDescriptor> {
+        (index < self.ioapic_len)
+            .then(|| self.ioapics[index])
+            .flatten()
+    }
 }
 
 /// Snapshot and resolve only the q35 COM2 route.  This function is deliberately
@@ -281,17 +310,36 @@ pub(crate) fn discover_q35_com2_route<R: AcpiByteReader>(
     probes: &[IoApicProbe],
     workspace: &mut AcpiSnapshotWorkspace,
 ) -> Result<PlatformIrqRoute, Q35Com2RouteError> {
+    let snapshot = snapshot_q35_com2_madt(
+        reader,
+        rsdp_physical,
+        live_bsp_local_apic_id,
+        live_cpu_is_bsp,
+        workspace,
+    )?;
+    resolve_q35_com2_route_snapshot(snapshot, probes)
+}
+
+/// Captures the selected q35 controller facts before E2 maps and probes any
+/// controller. Firmware supplies only candidate descriptors here; capacity and
+/// route publication remain separate target-only steps.
+pub(crate) fn snapshot_q35_com2_madt<R: AcpiByteReader>(
+    reader: &mut R,
+    rsdp_physical: u64,
+    live_bsp_local_apic_id: u8,
+    live_cpu_is_bsp: bool,
+    workspace: &mut AcpiSnapshotWorkspace,
+) -> Result<Q35Com2MadtSnapshot, Q35Com2RouteError> {
     if !live_cpu_is_bsp {
         return Err(Q35Com2RouteError::Topology(
             CpuTopologyError::LiveCpuIsNotBootstrapProcessor,
         ));
     }
     let madt_len = snapshot_selected_madt(reader, rsdp_physical, workspace)?;
-    let snapshot = parse_q35_com2_madt(&workspace.table[..madt_len], live_bsp_local_apic_id)?;
-    resolve_q35_com2_route(snapshot, probes)
+    parse_q35_com2_madt(&workspace.table[..madt_len], live_bsp_local_apic_id)
 }
 
-fn resolve_q35_com2_route(
+pub(crate) fn resolve_q35_com2_route_snapshot(
     snapshot: Q35Com2MadtSnapshot,
     probes: &[IoApicProbe],
 ) -> Result<PlatformIrqRoute, Q35Com2RouteError> {

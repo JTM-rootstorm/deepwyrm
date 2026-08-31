@@ -381,6 +381,33 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
         if cpu_topology.local_apic_physical_address() != bsp_local_apic_base {
             panic!("MADT Local APIC base contradicts the BSP APIC MSR");
         }
+        #[allow(
+            unexpected_cfgs,
+            reason = "E2B owns registration of the reserved DW1-E product cfg in kernel/build.rs"
+        )]
+        #[cfg(deepwyrm_dw1e_platform)]
+        {
+            // E2A re-snapshots only the bounded MADT facts needed to probe
+            // candidate IOAPICs.  It publishes no binding, programs no route,
+            // and leaves the validated redirection entry untouched/masked.
+            let q35_snapshot = {
+                let workspace = unsafe { &mut *(*BOOTSTRAP_ACPI_WORKSPACE.slot()).as_mut_ptr() };
+                let mut acpi =
+                    arch::x86_64::acpi::AcpiScratchReader::new(&mut active_paging, &boot_info);
+                arch::x86_64::acpi::snapshot_q35_com2_madt(
+                    &mut acpi,
+                    boot_info.header().acpi_rsdp_physical_address,
+                    bsp_local_apic_id,
+                    true,
+                    workspace,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("DW1-E2A q35 IOAPIC MADT snapshot failed: {error:?}")
+                })
+            };
+            arch::x86_64::ioapic_live::initialize_q35_ioapic(&mut active_paging, q35_snapshot)
+                .unwrap_or_else(|error| panic!("DW1-E2A q35 IOAPIC probe failed: {error:?}"));
+        }
         arch::x86_64::smp::configure_live_cpu_registry(&cpu_topology)
             .unwrap_or_else(|error| panic!("failed to configure the H1 CPU registry: {error:?}"));
         let cpu_registry = arch::x86_64::smp::live_cpu_registry();

@@ -864,7 +864,7 @@ fn active_scratch_reserves_the_entire_shared_control_pt_without_io() {
         0,
         target.scratch_leaf_index(),
         target.scratch_control_index(),
-        target.mmio_leaf_index(),
+        target.mmio_leaf_index(0),
         ((cpu1.window_page >> 12) & 0x1ff) as usize,
     ] {
         assert_eq!(
@@ -909,13 +909,13 @@ fn cpu0_cannot_journal_cpu1_scratch_leaf_or_control_entries() {
 }
 
 #[test]
-fn active_scratch_installs_one_uc_nx_mmio_leaf_without_consuming_window() {
+fn active_scratch_installs_two_uc_nx_mmio_leaves_without_consuming_window() {
     let fixture = graph_fixture();
     let mut target = fake_active_scratch(fixture.scratch_pt, None);
     let frame = FrameAddress::new(0xfee0_0000, fixture.capabilities.physical_limit()).unwrap();
     let page = target.install_mmio_frame(frame).unwrap();
     assert_eq!(page, FIXTURE_SCRATCH + 2 * PAGE_SIZE);
-    let leaf = target.scratch.control_page + (target.mmio_leaf_index() as u64) * 8;
+    let leaf = target.scratch.control_page + (target.mmio_leaf_index(0) as u64) * 8;
     assert_eq!(
         target.io.memory.get(&leaf).copied(),
         Some(0xfee0_0000 | PRESENT | WRITABLE | WRITE_THROUGH | CACHE_DISABLE | NO_EXECUTE)
@@ -924,6 +924,15 @@ fn active_scratch_installs_one_uc_nx_mmio_leaf_without_consuming_window() {
         target.io.events.iter().any(|event| {
             matches!(event, ScratchIoEvent::Invalidate(address) if *address == page)
         })
+    );
+    let second_frame =
+        FrameAddress::new(0xfec0_0000, fixture.capabilities.physical_limit()).unwrap();
+    let second_page = target.install_mmio_frame(second_frame).unwrap();
+    assert_eq!(second_page, FIXTURE_SCRATCH + 3 * PAGE_SIZE);
+    let second_leaf = target.scratch.control_page + (target.mmio_leaf_index(1) as u64) * 8;
+    assert_eq!(
+        target.io.memory.get(&second_leaf).copied(),
+        Some(0xfec0_0000 | PRESENT | WRITABLE | WRITE_THROUGH | CACHE_DISABLE | NO_EXECUTE)
     );
     assert_eq!(
         target.install_mmio_frame(frame),
@@ -1421,7 +1430,7 @@ fn graph_rejects_second_scratch_control_alias() {
         (
             fixture.scratch_pt.physical_start(),
             page_index(
-                FIXTURE_SCRATCH + 3 * crate::cpu::CPU_CAPACITY as u64 * PAGE_SIZE,
+                FIXTURE_SCRATCH + 4 * crate::cpu::CPU_CAPACITY as u64 * PAGE_SIZE,
                 0,
             ),
         ),

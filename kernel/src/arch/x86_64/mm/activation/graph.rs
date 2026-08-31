@@ -244,7 +244,9 @@ pub(super) fn validate_runtime_cpu_stack_layout<T: RuntimeCpuStackFacts>(
     if runtime_slots.len() != H1_RUNTIME_CPU_SLOT_COUNT {
         return Err(InactiveGraphError::InvalidSegmentLayout);
     }
-    let scratch_mmio_page = scratch_control_page.checked_add(PAGE_SIZE).unwrap_or(0);
+    let scratch_mmio_end = scratch_control_page
+        .checked_add((PER_CPU_SCRATCH_MMIO_LEAF_COUNT + 1) * PAGE_SIZE)
+        .unwrap_or(0);
     let mut previous_top = None;
     for slot in runtime_slots {
         for (index, stack) in slot.stacks().into_iter().enumerate() {
@@ -263,7 +265,8 @@ pub(super) fn validate_runtime_cpu_stack_layout<T: RuntimeCpuStackFacts>(
                 || previous_top.is_some_and(|top| top != stack.guard_page)
                 || (scratch_window_page >= stack.guard_page && scratch_window_page < stack.top)
                 || (scratch_control_page >= stack.guard_page && scratch_control_page < stack.top)
-                || (scratch_mmio_page >= stack.guard_page && scratch_mmio_page < stack.top)
+                || (scratch_control_page.checked_add(PAGE_SIZE).unwrap_or(0) < stack.top
+                    && scratch_mmio_end > stack.guard_page)
             {
                 return Err(InactiveGraphError::InvalidSegmentLayout);
             }
@@ -286,17 +289,21 @@ pub(super) fn validate_ist_layout(
     else {
         return Err(InactiveGraphError::InvalidSegmentLayout);
     };
-    let scratch_mmio_page = scratch_control_page.checked_add(PAGE_SIZE).unwrap_or(0);
+    let scratch_mmio_end = scratch_control_page
+        .checked_add((PER_CPU_SCRATCH_MMIO_LEAF_COUNT + 1) * PAGE_SIZE)
+        .unwrap_or(0);
     if !ist.has_exact_shape()
         || ist.stacks().iter().any(|stack| {
             !writable.contains(stack.guard_page)
                 || stack.top > writable.end
                 || stack.guard_page == scratch_window_page
                 || stack.guard_page == scratch_control_page
-                || stack.guard_page == scratch_mmio_page
+                || (stack.guard_page >= scratch_control_page.checked_add(PAGE_SIZE).unwrap_or(0)
+                    && stack.guard_page < scratch_mmio_end)
                 || (scratch_window_page >= stack.bottom && scratch_window_page < stack.top)
                 || (scratch_control_page >= stack.bottom && scratch_control_page < stack.top)
-                || (scratch_mmio_page >= stack.bottom && scratch_mmio_page < stack.top)
+                || (scratch_control_page.checked_add(PAGE_SIZE).unwrap_or(0) < stack.top
+                    && scratch_mmio_end > stack.bottom)
         })
     {
         return Err(InactiveGraphError::InvalidSegmentLayout);
@@ -317,7 +324,9 @@ pub(super) fn validate_thread_stack_layout(
     else {
         return Err(InactiveGraphError::InvalidSegmentLayout);
     };
-    let scratch_mmio_page = scratch_control_page.checked_add(PAGE_SIZE).unwrap_or(0);
+    let scratch_mmio_end = scratch_control_page
+        .checked_add((PER_CPU_SCRATCH_MMIO_LEAF_COUNT + 1) * PAGE_SIZE)
+        .unwrap_or(0);
     for (index, stack) in thread_stacks.iter().copied().enumerate() {
         if stack.bottom.checked_sub(stack.guard_page)
             != Some(crate::memory::kernel_stack::E3_THREAD_STACK_GUARD_SIZE)
@@ -329,7 +338,8 @@ pub(super) fn validate_thread_stack_layout(
             || stack.top > writable.end
             || (scratch_window_page >= stack.guard_page && scratch_window_page < stack.top)
             || (scratch_control_page >= stack.guard_page && scratch_control_page < stack.top)
-            || (scratch_mmio_page >= stack.guard_page && scratch_mmio_page < stack.top)
+            || (scratch_control_page.checked_add(PAGE_SIZE).unwrap_or(0) < stack.top
+                && scratch_mmio_end > stack.guard_page)
             || thread_stacks[..index]
                 .iter()
                 .any(|prior| stack.guard_page < prior.top && prior.guard_page < stack.top)
@@ -355,7 +365,9 @@ pub(super) fn validate_privilege_entry_stack_layout(
     else {
         return Err(InactiveGraphError::InvalidSegmentLayout);
     };
-    let scratch_mmio_page = scratch_control_page.checked_add(PAGE_SIZE).unwrap_or(0);
+    let scratch_mmio_end = scratch_control_page
+        .checked_add((PER_CPU_SCRATCH_MMIO_LEAF_COUNT + 1) * PAGE_SIZE)
+        .unwrap_or(0);
     let overlaps_thread = thread_stacks.iter().any(|stack| {
         privilege_entry.guard_page < stack.top && stack.guard_page < privilege_entry.top
     });
@@ -376,8 +388,8 @@ pub(super) fn validate_privilege_entry_stack_layout(
             && scratch_window_page < privilege_entry.top)
         || (scratch_control_page >= privilege_entry.guard_page
             && scratch_control_page < privilege_entry.top)
-        || (scratch_mmio_page >= privilege_entry.guard_page
-            && scratch_mmio_page < privilege_entry.top)
+        || (scratch_control_page.checked_add(PAGE_SIZE).unwrap_or(0) < privilege_entry.top
+            && scratch_mmio_end > privilege_entry.guard_page)
         || overlaps_thread
         || overlaps_ist
     {
@@ -402,7 +414,9 @@ pub(super) fn validate_terminal_reaper_stack_layout(
     else {
         return Err(InactiveGraphError::InvalidSegmentLayout);
     };
-    let scratch_mmio_page = scratch_control_page.checked_add(PAGE_SIZE).unwrap_or(0);
+    let scratch_mmio_end = scratch_control_page
+        .checked_add((PER_CPU_SCRATCH_MMIO_LEAF_COUNT + 1) * PAGE_SIZE)
+        .unwrap_or(0);
     let overlaps_thread = thread_stacks.iter().any(|stack| {
         terminal_reaper.guard_page < stack.top && stack.guard_page < terminal_reaper.top
     });
@@ -425,8 +439,8 @@ pub(super) fn validate_terminal_reaper_stack_layout(
             && scratch_window_page < terminal_reaper.top)
         || (scratch_control_page >= terminal_reaper.guard_page
             && scratch_control_page < terminal_reaper.top)
-        || (scratch_mmio_page >= terminal_reaper.guard_page
-            && scratch_mmio_page < terminal_reaper.top)
+        || (scratch_control_page.checked_add(PAGE_SIZE).unwrap_or(0) < terminal_reaper.top
+            && scratch_mmio_end > terminal_reaper.guard_page)
         || overlaps_thread
         || overlaps_ist
         || overlaps_privilege
@@ -472,13 +486,16 @@ pub(super) fn validate_segment_layout(
     privilege_entry: crate::memory::kernel_stack::KernelStackBounds,
 ) -> Result<(), InactiveGraphError<core::convert::Infallible>> {
     let scratch_page = scratch.window_page;
-    let scratch_mmio_page = scratch.control_page.checked_add(PAGE_SIZE).unwrap_or(0);
+    let scratch_mmio_end = scratch
+        .control_page
+        .checked_add((PER_CPU_SCRATCH_MMIO_LEAF_COUNT + 1) * PAGE_SIZE)
+        .unwrap_or(0);
     if scratch_page & ADDRESS_OFFSET_MASK != 0
         || scratch_page < 0xffff_8000_0000_0000
         || scratch.control_page != scratch_page.checked_add(PAGE_SIZE).unwrap_or(0)
         || scratch.control_page >> 21 != scratch_page >> 21
-        || scratch_mmio_page >> 21 != scratch_page >> 21
-        || ((scratch_page >> 12) & 0x1ff) >= 0x1fe
+        || scratch_mmio_end.saturating_sub(PAGE_SIZE) >> 21 != scratch_page >> 21
+        || ((scratch_mmio_end.saturating_sub(PAGE_SIZE) >> 12) & 0x1ff) >= 0x1fe
         || segments.iter().any(|segment| {
             segment.start & ADDRESS_OFFSET_MASK != 0
                 || segment.end & ADDRESS_OFFSET_MASK != 0
@@ -486,7 +503,8 @@ pub(super) fn validate_segment_layout(
                 || segment.start < 0xffff_8000_0000_0000
                 || segment.contains(scratch_page)
                 || segment.contains(scratch.control_page)
-                || segment.contains(scratch_mmio_page)
+                || (scratch.control_page.checked_add(PAGE_SIZE).unwrap_or(0) < segment.end
+                    && scratch_mmio_end > segment.start)
         })
         || segments[0].end > segments[1].start
         || segments[1].end > segments[2].start
@@ -616,13 +634,15 @@ pub(super) fn validate_scratch_path<A: ActivationGraphAccess>(
     }
     let control_index = ((scratch.control_page >> 12) & 0x1ff) as usize;
     let control = read_entry(access, false, table, control_index)?;
-    let mmio_page = scratch
-        .control_page
-        .checked_add(PAGE_SIZE)
-        .ok_or(InactiveGraphError::InvalidScratchPath)?;
-    let mmio_index = ((mmio_page >> 12) & 0x1ff) as usize;
-    if read_entry(access, false, table, mmio_index)? != 0 {
-        return Err(InactiveGraphError::InvalidScratchPath);
+    for slot in 0..PER_CPU_SCRATCH_MMIO_LEAF_COUNT {
+        let mmio_page = scratch
+            .control_page
+            .checked_add((slot + 1) * PAGE_SIZE)
+            .ok_or(InactiveGraphError::InvalidScratchPath)?;
+        let mmio_index = ((mmio_page >> 12) & 0x1ff) as usize;
+        if read_entry(access, false, table, mmio_index)? != 0 {
+            return Err(InactiveGraphError::InvalidScratchPath);
+        }
     }
     if control & physical_mask(capabilities) != scratch.pt.physical_start()
         || control & !(physical_mask(capabilities) | HARDWARE_MUTABLE)

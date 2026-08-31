@@ -21,6 +21,8 @@ pub mod gdt;
 pub(crate) mod idle;
 pub mod idt;
 pub(crate) mod io_port;
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+pub(crate) mod ioapic_live;
 #[allow(
     dead_code,
     reason = "H2/H3 fixed-IPI entry and transport precede root protocol/APIC ownership convergence"
