@@ -43,7 +43,12 @@ const READY_BYTES: [u8; 40] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
-#[cfg(any(test, deepwyrm_dw1d_evidence, deepwyrm_wyr1c_evidence))]
+#[cfg(any(
+    test,
+    deepwyrm_dw1d_evidence,
+    deepwyrm_dw1e_evidence,
+    deepwyrm_wyr1c_evidence
+))]
 const RESOURCE_READY_BYTES: [u8; 40] = [
     0x57, 0x52, 0x42, 0x50, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -521,7 +526,12 @@ pub(crate) fn complete_primordial_launch<B: PrimordialCompletionBackend>(
     complete_primordial_launch_with_ready(backend, &READY_BYTES)
 }
 
-#[cfg(any(test, deepwyrm_dw1d_evidence, deepwyrm_wyr1c_evidence))]
+#[cfg(any(
+    test,
+    deepwyrm_dw1d_evidence,
+    deepwyrm_dw1e_evidence,
+    deepwyrm_wyr1c_evidence
+))]
 pub(crate) fn complete_resource_primordial_launch<B: PrimordialCompletionBackend>(
     backend: &mut B,
 ) -> Result<(), PrimordialCompletionError<B::Error>> {

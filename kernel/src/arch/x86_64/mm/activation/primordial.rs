@@ -462,6 +462,7 @@ const _: [(); PROCESSES] = [(); EXECUTION_THREADS];
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
     deepwyrm_dw1d_evidence,
+    deepwyrm_dw1e_evidence,
     deepwyrm_wyr1c_evidence
 )))]
 const _: [(); 10] = [(); HANDLES];
