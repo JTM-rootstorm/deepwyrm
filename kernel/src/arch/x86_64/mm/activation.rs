@@ -44,7 +44,8 @@ mod primordial;
         any(
             deepwyrm_wyr1_evidence,
             deepwyrm_wyr1b_evidence,
-            deepwyrm_wyr1c_evidence
+            deepwyrm_wyr1c_evidence,
+            deepwyrm_dw1e_evidence
         )
     )
 ))]

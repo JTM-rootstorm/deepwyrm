@@ -586,7 +586,7 @@ pub(crate) fn validate_primordial_retirement_facts<B: PrimordialCompletionBacken
 /// Selector-local retirement validation for the four-capability resource
 /// primordial profile. This preserves the READY/exit split while requiring
 /// the same profile-aware READY accepted by the initial construction path.
-#[cfg(any(test, deepwyrm_wyr1c_evidence))]
+#[cfg(any(test, deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
 pub(crate) fn validate_resource_primordial_retirement_facts<B: PrimordialCompletionBackend>(
     backend: &mut B,
 ) -> Result<(), PrimordialCompletionError<B::Error>> {
