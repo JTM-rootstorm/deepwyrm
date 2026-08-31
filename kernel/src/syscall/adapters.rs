@@ -1908,6 +1908,48 @@ pub(crate) fn interrupt_ack<
     }
 }
 
+#[cfg(deepwyrm_dw1e_evidence)]
+pub(crate) fn interrupt_ack_dw1e<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const INTERRUPTS: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    interrupts: &InterruptAuthority<INTERRUPTS>,
+    platform: &dyn InterruptPlatform,
+    current_process: ProcessKey,
+    interrupt: DwHandle,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
+    let transaction = match process_handle_operation!(tasks, current_process, table, {
+        crate::device::prepare_interrupt_ack(table, registry, interrupts, interrupt)
+    }) {
+        Ok(Ok(transaction)) => transaction,
+        Ok(Err(status)) => return status,
+        Err(error) => return task_status(error),
+    };
+    let binding = transaction
+        .binding_for_evidence()
+        .expect("selector-31 ack retains its exact binding");
+    let release = match transaction.complete(registry, interrupts, platform) {
+        Ok(release) => release,
+        Err(status) => return status,
+    };
+    cleanup.push_optional(release);
+    crate::test_support::DW1E_EVIDENCE
+        .observe_ack(
+            current_process,
+            binding,
+            interrupts.pending_for_binding(binding),
+        )
+        .unwrap_or_else(|error| panic!("selector-31 ack observation failed: {error:?}"));
+    DW_STATUS_SUCCESS
+}
+
 #[cfg(deepwyrm_dw1d_evidence)]
 pub(crate) fn interrupt_ack_dw1d<
     const OBJECTS: usize,

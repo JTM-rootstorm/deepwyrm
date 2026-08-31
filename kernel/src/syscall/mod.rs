@@ -58,11 +58,13 @@ pub(crate) use adapters::clock_get;
     deepwyrm_integrated,
     target_os = "none",
     target_arch = "x86_64",
-    not(deepwyrm_dw1d_evidence)
+    not(any(deepwyrm_dw1d_evidence, deepwyrm_dw1e_evidence))
 ))]
 pub(crate) use adapters::interrupt_ack;
 #[cfg(all(deepwyrm_dw1d_evidence, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use adapters::interrupt_ack_dw1d;
+#[cfg(all(deepwyrm_dw1e_evidence, target_os = "none", target_arch = "x86_64"))]
+pub(crate) use adapters::interrupt_ack_dw1e;
 #[cfg(all(deepwyrm_f12_guest, not(deepwyrm_integrated)))]
 pub(crate) use adapters::process_terminate;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
@@ -103,7 +105,11 @@ pub(crate) use adapters::{handle_close, handle_duplicate, object_get_info_v1};
     deepwyrm_integrated,
     target_os = "none",
     target_arch = "x86_64",
-    not(any(deepwyrm_dw1d_evidence, deepwyrm_wyr1c_evidence))
+    not(any(
+        deepwyrm_dw1d_evidence,
+        deepwyrm_dw1e_evidence,
+        deepwyrm_wyr1c_evidence
+    ))
 ))]
 pub(crate) use adapters::{object_get_info_v1, object_get_info_v1_with_devices};
 

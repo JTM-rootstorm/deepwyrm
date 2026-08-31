@@ -243,7 +243,7 @@ impl ResolvedWaitSet {
             .then(|| ChannelEndpointKey::from_object_id(item.target.object_id()))
     }
 
-    #[cfg(deepwyrm_dw1d_evidence)]
+    #[cfg(any(deepwyrm_dw1d_evidence, deepwyrm_dw1e_evidence))]
     fn exact_signaled_interrupt(&self) -> Option<crate::object::ObjectId> {
         if self.len != 1 {
             return None;
@@ -665,8 +665,8 @@ pub(crate) fn begin_registered_wait<
 
     #[cfg(deepwyrm_dw1c_evidence)]
     let token7_writable_channel = set.exact_writable_channel();
-    #[cfg(deepwyrm_dw1d_evidence)]
-    let dw1d_interrupt = set.exact_signaled_interrupt();
+    #[cfg(any(deepwyrm_dw1d_evidence, deepwyrm_dw1e_evidence))]
+    let evidence_interrupt = set.exact_signaled_interrupt();
 
     match set.select_ready(tasks, &sources) {
         Ok(Some(selection)) => {
@@ -974,7 +974,7 @@ pub(crate) fn begin_registered_wait<
                             });
                     }
                     #[cfg(deepwyrm_dw1d_evidence)]
-                    if let Some(interrupt) = dw1d_interrupt.filter(|interrupt| {
+                    if let Some(interrupt) = evidence_interrupt.filter(|interrupt| {
                         crate::test_support::DW1D_EVIDENCE
                             .tracks_interrupt_wait(process, *interrupt)
                     }) {
@@ -987,6 +987,22 @@ pub(crate) fn begin_registered_wait<
                             )
                             .unwrap_or_else(|error| {
                                 panic!("selector-30 wait block observation failed: {error:?}")
+                            });
+                    }
+                    #[cfg(deepwyrm_dw1e_evidence)]
+                    if let Some(interrupt) = evidence_interrupt.filter(|interrupt| {
+                        crate::test_support::DW1E_EVIDENCE
+                            .tracks_interrupt_wait(process, *interrupt)
+                    }) {
+                        crate::test_support::DW1E_EVIDENCE
+                            .observe_wait_blocked(
+                                process,
+                                interrupt,
+                                wake.execution_generation(),
+                                wake.token(),
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!("selector-31 wait block observation failed: {error:?}")
                             });
                     }
                     Ok(WaitBeginOutcome::Suspended { wake, decision })
@@ -1069,7 +1085,7 @@ pub(crate) fn finish_wait_operation<
     let operation = operations
         .take_wake(wake)
         .map_err(WaitFinishError::Operation)?;
-    #[cfg(deepwyrm_dw1d_evidence)]
+    #[cfg(any(deepwyrm_dw1d_evidence, deepwyrm_dw1e_evidence))]
     let process = operation.process();
     let winner = operation
         .winner(execution.blocked_operations())
@@ -1091,6 +1107,20 @@ pub(crate) fn finish_wait_operation<
             .observe_wait_completion(process, wake.execution_generation(), wake.token(), observed)
             .unwrap_or_else(|error| {
                 panic!("selector-30 wait completion observation failed: {error:?}")
+            });
+    }
+    #[cfg(deepwyrm_dw1e_evidence)]
+    if let BlockedOperationWinner::Signal { observed, .. } = winner
+        && crate::test_support::DW1E_EVIDENCE.tracks_wait_completion(
+            process,
+            wake.execution_generation(),
+            wake.token(),
+        )
+    {
+        crate::test_support::DW1E_EVIDENCE
+            .observe_wait_completion(process, wake.execution_generation(), wake.token(), observed)
+            .unwrap_or_else(|error| {
+                panic!("selector-31 wait completion observation failed: {error:?}")
             });
     }
     cancel_deadline_exact(&mut deadline_authority, deadline).map_err(WaitFinishError::Deadline)?;

@@ -182,11 +182,11 @@ state = "implemented"
 id = 30
 state = "implemented"
 
-# DW1-E's q35 COM2 physical interrupt route. E0 reserves the identity only;
-# E3 adds the selector-specialized kernel route and evidence collector.
+# DW1-E's q35 COM2 physical interrupt route and selector-private E3 evidence
+# collector. E3A makes the identity runnable without claiming final acceptance.
 [guest_test.q35-com2-interrupt]
 id = 31
-state = "reserved"
+state = "implemented"
 
 # WYR1-D's native serial-stream/consoled acceptance product. The paired D0
 # contract reserves this identity; no Deepwyrm dispatch exists at E0/D0.

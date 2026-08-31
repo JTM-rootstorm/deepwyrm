@@ -9,7 +9,7 @@
 #![allow(
     dead_code,
     unused_imports,
-    reason = "the reserved DW1-E product cfg reaches this target-only boundary after E2B registers it"
+    reason = "the selected DW1-E product cfg reaches this target-only boundary after build registration"
 )]
 
 use core::cell::UnsafeCell;
@@ -310,7 +310,7 @@ fn probe_candidate<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
     let frame = frame_for(active, descriptor)?;
     active
         .with_bootstrap_kernel_mmio_page(frame, |base| {
-            let controller = LiveIoApicMmio::new(base)?;
+            let mut controller = LiveIoApicMmio::new(base)?;
             controller.probe(descriptor)
         })
         .map_err(|_| LiveIoApicError::Mapping)?

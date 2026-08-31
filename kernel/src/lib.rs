@@ -383,7 +383,7 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
         }
         #[allow(
             unexpected_cfgs,
-            reason = "E2B owns registration of the reserved DW1-E product cfg in kernel/build.rs"
+            reason = "kernel/build.rs owns registration of the selected DW1-E product cfg"
         )]
         #[cfg(deepwyrm_dw1e_platform)]
         {

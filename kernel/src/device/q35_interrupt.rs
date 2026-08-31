@@ -503,9 +503,12 @@ impl InterruptPlatform for Q35InterruptPlatform {
         if generation > 1 {
             Q35InterruptCounters::increment(&self.counters.generation_replacements);
         }
-        Ok(InterruptSourceReservation {
-            binding: InterruptBinding::new_private(self.domain, source, generation),
-        })
+        let binding = InterruptBinding::new_private(self.domain, source, generation);
+        #[cfg(all(deepwyrm_dw1e_evidence, target_os = "none"))]
+        crate::test_support::DW1E_EVIDENCE
+            .observe_reserved(binding)
+            .unwrap_or_else(|error| panic!("selector-31 reserve observation failed: {error:?}"));
+        Ok(InterruptSourceReservation { binding })
     }
 
     fn cancel_source(

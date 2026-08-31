@@ -9,7 +9,6 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::arch::x86_64::exceptions::{EarlyException, ExceptionVector};
-use crate::debug::emit_early_raw_record;
 #[cfg(any(
     deepwyrm_i1_evidence,
     deepwyrm_wrcap_relay,
@@ -20,7 +19,20 @@ use crate::debug::emit_early_raw_record;
     deepwyrm_dw1d_evidence,
     deepwyrm_wyr1c_evidence
 ))]
-use crate::debug::{TestSerialTransaction, begin_test_serial_transaction};
+use crate::debug::TestSerialTransaction;
+#[cfg(any(
+    deepwyrm_i1_evidence,
+    deepwyrm_wrcap_relay,
+    deepwyrm_wyr1_evidence,
+    deepwyrm_dw1b_evidence,
+    deepwyrm_wyr1b_evidence,
+    deepwyrm_dw1c_evidence,
+    deepwyrm_dw1d_evidence,
+    deepwyrm_dw1e_evidence,
+    deepwyrm_wyr1c_evidence
+))]
+use crate::debug::begin_test_serial_transaction;
+use crate::debug::emit_early_raw_record;
 
 #[cfg(deepwyrm_dw1c_evidence)]
 use super::Dw1cEvidenceFlushPermit;
@@ -30,6 +42,8 @@ use super::Dw1dEvidenceFlushPermit;
 use super::Wyr1cEvidenceFlushError;
 #[cfg(deepwyrm_dw1b_evidence)]
 use super::dw1b_evidence::Dw1bEvidenceFlushPermit;
+#[cfg(deepwyrm_dw1e_evidence)]
+use super::{DW1E_E3A_READY_LEN, Dw1eEvidencePartialPermit};
 #[cfg(deepwyrm_i1_evidence)]
 use super::{EvidenceFlushError, I1_EVIDENCE};
 #[cfg(deepwyrm_wrcap_relay)]
@@ -338,6 +352,31 @@ pub(crate) fn complete_dw1d_evidence(permit: Dw1dEvidenceFlushPermit<'_>) -> ! {
     )
 }
 
+/// Publish the E3A operational readiness marker after action 3 commits. This
+/// is deliberately outside both DWE3E1 and DWTEST1 and carries no acceptance
+/// meaning.
+#[cfg(deepwyrm_dw1e_evidence)]
+pub(crate) fn emit_dw1e_e3a_ready(marker: &[u8; DW1E_E3A_READY_LEN]) -> Result<(), ()> {
+    let mut transaction = begin_test_serial_transaction().map_err(|_| ())?;
+    transaction.write_evidence(marker).map_err(|_| ())
+}
+
+/// E3A's host-extraction gate emits only records 0 through 8, then halts. It
+/// never emits a selector PASS or writes the QEMU debug-exit device.
+#[cfg(deepwyrm_dw1e_evidence)]
+pub(crate) fn flush_dw1e_e3a_partial(permit: Dw1eEvidencePartialPermit<'_>) -> ! {
+    let Ok(mut transaction) = begin_test_serial_transaction() else {
+        halt_after_completion()
+    };
+    if permit
+        .flush(|record| transaction.write_evidence(record).map_err(|_| ()))
+        .is_err()
+    {
+        halt_after_completion()
+    }
+    halt_after_completion()
+}
+
 /// Selector 29 owns one uninterrupted transaction: all WRC6 records,
 /// canonical DWTEST1 29/0, and the matching debug exit.
 #[cfg(deepwyrm_wyr1c_evidence)]
@@ -550,6 +589,11 @@ pub(crate) fn complete_pass(detail: u32) -> ! {
         let _ = detail;
         complete_dw1d_failure_terminal(CompletionOutcome::Fail, 0x3010_ffff)
     }
+    #[cfg(deepwyrm_dw1e_evidence)]
+    {
+        let _ = detail;
+        complete_known_outcome(CompletionOutcome::Fail, 0x3110_ffff)
+    }
     #[cfg(deepwyrm_wyr1c_evidence)]
     {
         let _ = detail;
@@ -576,6 +620,7 @@ pub(crate) fn complete_pass(detail: u32) -> ! {
         deepwyrm_wyr1b_evidence,
         deepwyrm_dw1c_evidence,
         deepwyrm_dw1d_evidence,
+        deepwyrm_dw1e_evidence,
         deepwyrm_wyr1c_evidence
     )))]
     complete_known_outcome(CompletionOutcome::Pass, detail)

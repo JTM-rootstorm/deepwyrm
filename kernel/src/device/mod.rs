@@ -20,12 +20,16 @@ pub(crate) use interrupt::{
 };
 
 #[cfg(deepwyrm_dw1e_platform)]
-pub(crate) use q35_interrupt::{Q35DeliverySnapshot, Q35InterruptPlatform};
-
-#[cfg(any(test, deepwyrm_dw1d_evidence))]
 #[allow(
     unused_imports,
-    reason = "selector-30 collector and target runtime consume the private binding identity"
+    reason = "the q35 live platform exports are consumed only by target activation"
+)]
+pub(crate) use q35_interrupt::{Q35DeliverySnapshot, Q35InterruptPlatform};
+
+#[cfg(any(test, deepwyrm_dw1d_evidence, deepwyrm_dw1e_evidence))]
+#[allow(
+    unused_imports,
+    reason = "selector-private collectors consume the exact binding identity"
 )]
 pub(crate) use interrupt::InterruptBinding;
 

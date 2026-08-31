@@ -41,6 +41,7 @@ pub(crate) enum BuildGuestTest {
     NormalPreemptionSmp,
     DeviceCoordinatorRestart,
     DeviceResourceInterruptSynthetic,
+    Q35Com2Interrupt,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,6 +111,7 @@ impl BuildGuestTest {
             Self::NormalPreemptionSmp => 28,
             Self::DeviceCoordinatorRestart => 29,
             Self::DeviceResourceInterruptSynthetic => 30,
+            Self::Q35Com2Interrupt => 31,
         }
     }
 
@@ -152,6 +154,7 @@ impl BuildGuestTest {
                 | Self::NormalPreemptionSmp
                 | Self::DeviceCoordinatorRestart
                 | Self::DeviceResourceInterruptSynthetic
+                | Self::Q35Com2Interrupt
         )
     }
 
@@ -271,6 +274,8 @@ const fn parse_known_selector(value: &str) -> BuildGuestTest {
         BuildGuestTest::DeviceCoordinatorRestart
     } else if string_equals(value, "device-resource-interrupt-synthetic") {
         BuildGuestTest::DeviceResourceInterruptSynthetic
+    } else if string_equals(value, "q35-com2-interrupt") {
+        BuildGuestTest::Q35Com2Interrupt
     } else {
         panic!("unknown build-selected guest test")
     }

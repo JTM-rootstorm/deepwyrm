@@ -977,6 +977,16 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
         panic!("native runtime does not admit selector-30 evidence")
     }
 
+    /// Selector-31-only private q35 COM2 evidence protocol. It is absent from
+    /// generated ABI decode and preserves the six-u64 raw-call boundary.
+    #[cfg(deepwyrm_dw1e_evidence)]
+    fn intercept_dw1e_evidence_raw(
+        &mut self,
+        _arguments: RawSyscallArguments,
+    ) -> NativeSyscallResult {
+        panic!("native runtime does not admit selector-31 evidence")
+    }
+
     /// Selector-29-only private WRC6 device-coordinator restart evidence.
     /// This operation is deliberately absent from generated ABI decode.
     #[cfg(deepwyrm_wyr1c_evidence)]
@@ -1114,6 +1124,7 @@ pub(crate) fn dispatch_frame<R: NativeSyscallFrameRuntime>(
         deepwyrm_wyr1b_evidence,
         deepwyrm_dw1c_evidence,
         deepwyrm_dw1d_evidence,
+        deepwyrm_dw1e_evidence,
         deepwyrm_wyr1c_evidence
     ))]
     let result = match frame.request() {
@@ -1137,6 +1148,10 @@ pub(crate) fn dispatch_frame<R: NativeSyscallFrameRuntime>(
         Some((id, arguments)) if id.0 == crate::test_support::DW1D_EVIDENCE_RAW_SYSCALL => {
             runtime.intercept_dw1d_evidence_raw(arguments)
         }
+        #[cfg(deepwyrm_dw1e_evidence)]
+        Some((id, arguments)) if id.0 == crate::test_support::DW1E_EVIDENCE_RAW_SYSCALL => {
+            runtime.intercept_dw1e_evidence_raw(arguments)
+        }
         #[cfg(deepwyrm_wyr1c_evidence)]
         Some((id, arguments)) if id.0 == crate::test_support::WYR1C_EVIDENCE_RAW_SYSCALL => {
             runtime.intercept_wyr1c_evidence_raw(arguments)
@@ -1150,6 +1165,7 @@ pub(crate) fn dispatch_frame<R: NativeSyscallFrameRuntime>(
         deepwyrm_wyr1b_evidence,
         deepwyrm_dw1c_evidence,
         deepwyrm_dw1d_evidence,
+        deepwyrm_dw1e_evidence,
         deepwyrm_wyr1c_evidence
     )))]
     let result = match frame.request() {

@@ -31,7 +31,20 @@
     all(deepwyrm_wyr1c_evidence, deepwyrm_dw1b_evidence),
     all(deepwyrm_wyr1c_evidence, deepwyrm_wyr1b_evidence),
     all(deepwyrm_wyr1c_evidence, deepwyrm_dw1c_evidence),
-    all(deepwyrm_wyr1c_evidence, deepwyrm_dw1d_evidence)
+    all(deepwyrm_wyr1c_evidence, deepwyrm_dw1d_evidence),
+    all(
+        deepwyrm_dw1e_evidence,
+        any(
+            deepwyrm_i1_evidence,
+            deepwyrm_wrcap_relay,
+            deepwyrm_wyr1_evidence,
+            deepwyrm_dw1b_evidence,
+            deepwyrm_wyr1b_evidence,
+            deepwyrm_dw1c_evidence,
+            deepwyrm_dw1d_evidence,
+            deepwyrm_wyr1c_evidence
+        )
+    )
 ))]
 compile_error!("selector-specific terminal reporters are selector-exclusive");
 
@@ -41,6 +54,8 @@ mod dw1b_evidence;
 mod dw1c_evidence;
 #[cfg(any(test, deepwyrm_dw1d_evidence))]
 mod dw1d_evidence;
+#[cfg(any(test, deepwyrm_dw1e_evidence))]
+mod dw1e_evidence;
 #[cfg(deepwyrm_i1_evidence)]
 mod evidence;
 mod identity;
@@ -95,6 +110,15 @@ pub(crate) use dw1d_evidence::DW1D_EVIDENCE_RAW_SYSCALL;
 pub(crate) use dw1d_evidence::{
     DW1D_EVIDENCE, Dw1dAckPlan, Dw1dDeliverPlan, Dw1dEvidenceError, Dw1dEvidenceFlushPermit,
     Dw1dRawOperation,
+};
+#[cfg(deepwyrm_dw1e_evidence)]
+#[allow(
+    unused_imports,
+    reason = "selector-31 target hooks consume the private collector across cfg-specialized modules"
+)]
+pub(crate) use dw1e_evidence::{
+    DW1E_E3A_READY_LEN, DW1E_EVIDENCE, DW1E_EVIDENCE_RAW_SYSCALL, Dw1eEvidencePartialPermit,
+    Dw1eRawOperation, EVENT_C1_RESPONSE,
 };
 #[cfg(deepwyrm_wyr1_evidence)]
 pub(crate) use wyr1_evidence::WYR1_EVIDENCE_RAW_SYSCALL;
@@ -184,6 +208,8 @@ pub(crate) use x86_64::{
     complete_exception, complete_fail, complete_panic, complete_pass, expect_terminal_page_fault,
     read_user_alias_word, trigger_expected_invalid_opcode, write_then_read_user_alias,
 };
+#[cfg(all(deepwyrm_dw1e_evidence, target_arch = "x86_64", target_os = "none"))]
+pub(crate) use x86_64::{emit_dw1e_e3a_ready, flush_dw1e_e3a_partial};
 
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 pub(crate) use identity::ExpectedPageFaultKind;

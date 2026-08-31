@@ -80,6 +80,13 @@ pub(crate) struct InterruptDelivery {
     pub(super) binding: InterruptBinding,
 }
 
+impl InterruptDelivery {
+    #[cfg(deepwyrm_dw1e_evidence)]
+    pub(crate) const fn binding_for_evidence(self) -> InterruptBinding {
+        self.binding
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InterruptDeliveryDisposition {
     Rejected,
@@ -632,7 +639,9 @@ impl<const INTERRUPTS: usize> InterruptAuthority<INTERRUPTS> {
             InterruptState::Pending { coalesced: true } => {
                 interrupt.state = InterruptState::Pending { coalesced: false };
                 Ok(InterruptAckTransaction {
-                    operation: InterruptAckOperation::Coalesced,
+                    operation: InterruptAckOperation::Coalesced {
+                        binding: interrupt.binding,
+                    },
                     pin,
                 })
             }
@@ -714,7 +723,7 @@ impl<const INTERRUPTS: usize> InterruptAuthority<INTERRUPTS> {
     /// Returns the exact live source binding after ordinary handle validation.
     /// The selector-private D6 trigger consumes this only to inject the one
     /// already-authorized synthetic source; it cannot select an arbitrary IRQ.
-    #[cfg(deepwyrm_dw1d_evidence)]
+    #[cfg(any(deepwyrm_dw1d_evidence, deepwyrm_dw1e_evidence))]
     pub(crate) fn binding_for_resolved(
         &self,
         resolved: &ResolvedHandle,
@@ -748,12 +757,12 @@ impl<const INTERRUPTS: usize> InterruptAuthority<INTERRUPTS> {
             .binding
     }
 
-    #[cfg(any(test, deepwyrm_dw1d_evidence))]
+    #[cfg(any(test, deepwyrm_dw1d_evidence, deepwyrm_dw1e_evidence))]
     pub(crate) fn live_count(&self) -> usize {
         self.interrupts.lock().iter().flatten().count()
     }
 
-    #[cfg(deepwyrm_dw1d_evidence)]
+    #[cfg(any(deepwyrm_dw1d_evidence, deepwyrm_dw1e_evidence))]
     pub(crate) fn pending_for_binding(&self, binding: InterruptBinding) -> bool {
         self.interrupts
             .lock()
@@ -1036,7 +1045,9 @@ pub(crate) struct InterruptAckTransaction {
 }
 
 enum InterruptAckOperation {
-    Coalesced,
+    Coalesced {
+        binding: InterruptBinding,
+    },
     Rearm {
         object: ObjectId,
         binding: InterruptBinding,
@@ -1078,10 +1089,10 @@ impl InterruptAckTransaction {
         })
     }
 
-    #[cfg(any(test, deepwyrm_dw1d_evidence))]
+    #[cfg(any(test, deepwyrm_dw1d_evidence, deepwyrm_dw1e_evidence))]
     pub(crate) const fn binding_for_evidence(&self) -> Option<InterruptBinding> {
         match self.operation {
-            InterruptAckOperation::Coalesced => None,
+            InterruptAckOperation::Coalesced { binding } => Some(binding),
             InterruptAckOperation::Rearm { binding, .. } => Some(binding),
         }
     }
@@ -1208,6 +1219,10 @@ pub(crate) fn interrupt_create<
     interrupts.commit_armed(key, binding);
     let committed = platform.commit_source(source_reservation);
     assert_eq!(committed, binding, "platform commit changed exact binding");
+    #[cfg(all(deepwyrm_dw1e_evidence, target_os = "none"))]
+    crate::test_support::DW1E_EVIDENCE
+        .observe_committed(key.object_id(), binding, parent_descriptor.lease_generation)
+        .unwrap_or_else(|error| panic!("selector-31 commit observation failed: {error:?}"));
     let published = destination
         .try_publish_reference(table, reference, requested_rights)
         .unwrap_or_else(|failure| {

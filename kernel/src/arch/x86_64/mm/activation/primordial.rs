@@ -57,7 +57,8 @@ use crate::syscall::{
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
     deepwyrm_wyr1c_evidence,
-    deepwyrm_dw1d_evidence
+    deepwyrm_dw1d_evidence,
+    deepwyrm_dw1e_evidence
 ))]
 use crate::task::ProcessLifecycleState;
 use crate::task::{ExecutionDomain, ProcessKey, SchedulerThreadState, TaskAuthority, ThreadKey};
@@ -628,6 +629,7 @@ impl G5PrimordialProbe {
             BuildGuestTest::BootstrapRegistryLaunch => G5PrimordialExpectation::Baseline,
             BuildGuestTest::DeviceCoordinatorRestart => G5PrimordialExpectation::Baseline,
             BuildGuestTest::DeviceResourceInterruptSynthetic => G5PrimordialExpectation::Baseline,
+            BuildGuestTest::Q35Com2Interrupt => G5PrimordialExpectation::Baseline,
             BuildGuestTest::PrimordialBlockingCleanup => G5PrimordialExpectation::BlockingCleanup,
             BuildGuestTest::PrimordialUserException => G5PrimordialExpectation::UserException,
             BuildGuestTest::PrimordialInvalidReturn => G5PrimordialExpectation::InvalidReturn,
@@ -1541,11 +1543,15 @@ fn publish_runtime_shared(
         ExecutionDomain::<EXECUTION_THREADS>::new(core::array::from_fn(|index| stacks[index]))
             .unwrap_or_else(|error| panic!("invalid primordial execution domain: {error:?}"));
     #[cfg(deepwyrm_dw1e_platform)]
-    let interrupt_platform = crate::device::Q35InterruptPlatform::new(
-        crate::arch::x86_64::ioapic_live::q35_ioapic()
-            .unwrap_or_else(|| panic!("DW1-E2C runtime requires the validated q35 IOAPIC owner")),
-    )
-    .unwrap_or_else(|error| panic!("DW1-E2C q35 platform initialization failed: {error:?}"));
+    let q35_ioapic = crate::arch::x86_64::ioapic_live::q35_ioapic()
+        .unwrap_or_else(|| panic!("DW1-E2C runtime requires the validated q35 IOAPIC owner"));
+    #[cfg(deepwyrm_dw1e_platform)]
+    let interrupt_platform = crate::device::Q35InterruptPlatform::new(q35_ioapic)
+        .unwrap_or_else(|error| panic!("DW1-E2C q35 platform initialization failed: {error:?}"));
+    #[cfg(deepwyrm_dw1e_evidence)]
+    crate::test_support::DW1E_EVIDENCE
+        .observe_route(q35_ioapic.route())
+        .unwrap_or_else(|error| panic!("selector-31 route observation failed: {error:?}"));
     #[cfg(not(deepwyrm_dw1e_platform))]
     let interrupt_platform = crate::device::InterruptPlatformModel::new();
     unsafe {
@@ -1588,8 +1594,20 @@ impl crate::arch::x86_64::external_interrupt::Q35ExternalInterruptHandler
                 delivery,
                 generation,
             } => {
+                #[cfg(deepwyrm_dw1e_evidence)]
+                crate::test_support::DW1E_EVIDENCE
+                    .observe_physical(delivery.binding_for_evidence())
+                    .unwrap_or_else(|error| {
+                        panic!("selector-31 physical observation failed: {error:?}")
+                    });
                 let (disposition, wakes) =
                     self.interrupts.deliver_classified(delivery, &self.waits);
+                #[cfg(deepwyrm_dw1e_evidence)]
+                crate::test_support::DW1E_EVIDENCE
+                    .observe_delivery(delivery.binding_for_evidence(), disposition)
+                    .unwrap_or_else(|error| {
+                        panic!("selector-31 pending observation failed: {error:?}")
+                    });
                 if matches!(
                     disposition,
                     crate::device::InterruptDeliveryDisposition::CoalescedPending
@@ -6505,6 +6523,141 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         NativeSyscallResult::returning(status)
     }
 
+    #[cfg(deepwyrm_dw1e_evidence)]
+    fn intercept_dw1e_evidence_raw(
+        &mut self,
+        arguments: crate::syscall::RawSyscallArguments,
+    ) -> NativeSyscallResult {
+        use crate::test_support::{DW1E_EVIDENCE, Dw1eRawOperation, EVENT_C1_RESPONSE};
+
+        let operation = DW1E_EVIDENCE
+            .decode_raw(arguments.as_array())
+            .unwrap_or_else(|error| crate::test_support::complete_fail(0x3110_e100 | error as u32));
+        let phase = self.reserve_runtime_phase();
+        match operation {
+            Dw1eRawOperation::BindDriver {
+                interrupt_handle,
+                attempt_generation,
+            } => {
+                let resolved = self
+                    .tasks
+                    .process_handles(self.process)
+                    .unwrap_or_else(|_| crate::test_support::complete_fail(0x3110_e101))
+                    .lookup(
+                        &mut self.registry,
+                        deepwyrm_abi::DwHandle(interrupt_handle),
+                        crate::handle::AcceptedObjectTypes::One(
+                            deepwyrm_abi::DW_OBJECT_TYPE_INTERRUPT,
+                        ),
+                        deepwyrm_abi::DW_RIGHT_INSPECT,
+                    )
+                    .unwrap_or_else(|_| crate::test_support::complete_fail(0x3110_e102));
+                let object = resolved.object_id();
+                let info = crate::device::InterruptInfoProvider::object_info_for_resolved(
+                    &self.shared.interrupts,
+                    &resolved,
+                )
+                .unwrap_or_else(|_| crate::test_support::complete_fail(0x3110_e103));
+                let binding = self
+                    .shared
+                    .interrupts
+                    .binding_for_resolved(&resolved)
+                    .unwrap_or_else(|_| crate::test_support::complete_fail(0x3110_e104));
+                assert!(
+                    self.registry
+                        .release_internal(resolved.into_internal())
+                        .unwrap_or_else(|failure| panic!(
+                            "selector-31 BIND_DRIVER lookup release failed: {:?}",
+                            failure.error()
+                        ))
+                        .is_none(),
+                    "selector-31 BIND_DRIVER lookup unexpectedly finalized its object"
+                );
+                if info.source != 3
+                    || info.parent_resource_id != 1
+                    || info.parent_lease_generation == 0
+                    || info.object_generation != object.generation()
+                    || info.binding_generation != binding.generation()
+                {
+                    crate::test_support::complete_fail(0x3110_e105)
+                }
+                DW1E_EVIDENCE
+                    .bind_driver(
+                        self.process,
+                        object,
+                        binding,
+                        info.parent_lease_generation,
+                        attempt_generation,
+                    )
+                    .unwrap_or_else(|error| {
+                        crate::test_support::complete_fail(0x3110_e110 | error as u32)
+                    });
+                self.commit_runtime_phase(phase);
+                NativeSyscallResult::returning(DW_STATUS_SUCCESS)
+            }
+            Dw1eRawOperation::BindProbe => {
+                if self.process == self.primordial_process
+                    || self.tasks.process_lifecycle(self.process)
+                        != Ok(ProcessLifecycleState::AcceptingOperations)
+                {
+                    crate::test_support::complete_fail(0x3110_e120)
+                }
+                DW1E_EVIDENCE
+                    .bind_probe(self.primordial_process, self.process)
+                    .unwrap_or_else(|error| {
+                        crate::test_support::complete_fail(0x3110_e130 | error as u32)
+                    });
+                self.commit_runtime_phase(phase);
+                NativeSyscallResult::returning(DW_STATUS_SUCCESS)
+            }
+            Dw1eRawOperation::ArmChallenge {
+                stream_generation,
+                challenge_generation,
+                expected_length,
+                expected_hash,
+            } => {
+                DW1E_EVIDENCE
+                    .arm_challenge(
+                        self.process,
+                        stream_generation,
+                        challenge_generation,
+                        expected_length,
+                        expected_hash,
+                    )
+                    .unwrap_or_else(|error| {
+                        crate::test_support::complete_fail(0x3110_e140 | error as u32)
+                    });
+                let marker = DW1E_EVIDENCE.ready_marker().unwrap_or_else(|error| {
+                    crate::test_support::complete_fail(0x3110_e150 | error as u32)
+                });
+                self.commit_runtime_phase(phase);
+                crate::test_support::emit_dw1e_e3a_ready(&marker)
+                    .unwrap_or_else(|_| crate::test_support::complete_fail(0x3110_e151));
+                NativeSyscallResult::returning(DW_STATUS_SUCCESS)
+            }
+            Dw1eRawOperation::Submit {
+                event,
+                value,
+                auxiliary,
+            } => {
+                DW1E_EVIDENCE
+                    .submit(self.process, event, value, auxiliary)
+                    .unwrap_or_else(|error| {
+                        crate::test_support::complete_fail(0x3110_e160 | error as u32)
+                    });
+                if event == EVENT_C1_RESPONSE {
+                    let permit = DW1E_EVIDENCE.partial_permit().unwrap_or_else(|error| {
+                        crate::test_support::complete_fail(0x3110_e170 | error as u32)
+                    });
+                    self.commit_runtime_phase(phase);
+                    crate::test_support::flush_dw1e_e3a_partial(permit)
+                }
+                self.commit_runtime_phase(phase);
+                NativeSyscallResult::returning(DW_STATUS_SUCCESS)
+            }
+        }
+    }
+
     fn authorize_return(
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
@@ -7301,6 +7454,20 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         // synchronized runtime is held. Notify CPUs only after releasing it.
         crate::task::drain_runnable_work_notifications();
         result
+    }
+
+    #[cfg(deepwyrm_dw1e_evidence)]
+    fn intercept_dw1e_evidence_raw(
+        &mut self,
+        arguments: crate::syscall::RawSyscallArguments,
+    ) -> NativeSyscallResult {
+        self.with_synchronized_runtime_at_safe_point(|runtime| {
+            runtime.intercept_dw1e_evidence_raw(arguments)
+        })
+        .unwrap_or(NativeSyscallResult {
+            status: DW_STATUS_SUCCESS,
+            control: SyscallControl::ServiceRendezvous,
+        })
     }
 
     fn complete_remote_stop(
@@ -8966,7 +9133,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     interrupt,
                     &mut self.cleanup,
                 ));
-                #[cfg(not(deepwyrm_dw1d_evidence))]
+                #[cfg(deepwyrm_dw1e_evidence)]
+                return NativeSyscallResult::returning(crate::syscall::interrupt_ack_dw1e(
+                    &mut self.registry,
+                    &mut self.tasks,
+                    &self.shared.interrupts,
+                    &self.shared.interrupt_platform,
+                    self.process,
+                    interrupt,
+                    &mut self.cleanup,
+                ));
+                #[cfg(not(any(deepwyrm_dw1d_evidence, deepwyrm_dw1e_evidence)))]
                 NativeSyscallResult::returning(crate::syscall::interrupt_ack(
                     &mut self.registry,
                     &mut self.tasks,

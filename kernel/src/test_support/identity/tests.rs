@@ -107,6 +107,12 @@ fn implemented_central_selectors_have_exact_kernel_identities() {
             BuildGuestTest::DeviceCoordinatorRestart,
             29,
         ),
+        (
+            "device-resource-interrupt-synthetic",
+            BuildGuestTest::DeviceResourceInterruptSynthetic,
+            30,
+        ),
+        ("q35-com2-interrupt", BuildGuestTest::Q35Com2Interrupt, 31),
     ];
     for (selector, identity, id) in cases {
         assert_eq!(parse_known_selector(selector), identity);
@@ -148,6 +154,8 @@ fn only_expected_invalid_opcode_is_classified_as_fail() {
         (BuildGuestTest::NativeUserspaceCapability, 6),
         (BuildGuestTest::PermanentSupervisorRrc, 6),
         (BuildGuestTest::NormalPreemptionUp, 6),
+        (BuildGuestTest::DeviceResourceInterruptSynthetic, 6),
+        (BuildGuestTest::Q35Com2Interrupt, 6),
     ] {
         assert_eq!(
             exception_outcome_for(test, vector),
@@ -205,6 +213,8 @@ fn memory_and_task_selectors_have_distinct_post_activation_dispatch() {
         BuildGuestTest::PrimordialUserException,
         BuildGuestTest::PrimordialInvalidReturn,
         BuildGuestTest::NativeUserspaceCapability,
+        BuildGuestTest::DeviceResourceInterruptSynthetic,
+        BuildGuestTest::Q35Com2Interrupt,
     ] {
         assert!(test.is_primordial());
         assert!(!test.is_memory_foundation());

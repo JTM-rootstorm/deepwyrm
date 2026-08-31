@@ -104,6 +104,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1C_BOOTFS_MAX_PAGES");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1D_EVIDENCE_NONCE");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1D_EVIDENCE_CHALLENGE");
+    println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1E_EVIDENCE_NONCE");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1C_EVIDENCE_NONCE");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_c3_one_shot_ui)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_memory_guest)");
@@ -120,14 +121,13 @@ fn run() -> Result<(), String> {
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1d_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1c_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1e_platform)");
+    println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1e_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_integrated)");
     println!("cargo:rustc-cfg=deepwyrm_integrated");
 
-    // Selector 31 remains reserved until E3 adds its evidence actor. E2B
-    // nevertheless needs the selected q35 product to carry the returning
-    // vector gate from early descriptor installation. This is a compile-time
-    // product shape only: `configure_guest_test` still rejects the reserved
-    // selector as a runnable target.
+    // Selector 31 carries the q35 platform surface in the same selected
+    // product as E3's private evidence collector. The platform cfg remains
+    // distinct so ordinary q35 code does not depend on the collector module.
     if env::var("DEEPWYRM_GUEST_TEST_SELECTOR")
         .ok()
         .as_deref()
@@ -230,6 +230,13 @@ fn run() -> Result<(), String> {
         .is_some_and(is_dw1d_evidence_selector)
     {
         println!("cargo:rustc-cfg=deepwyrm_dw1d_evidence");
+    }
+    if env::var("DEEPWYRM_GUEST_TEST_SELECTOR")
+        .ok()
+        .as_deref()
+        .is_some_and(is_dw1e_evidence_selector)
+    {
+        println!("cargo:rustc-cfg=deepwyrm_dw1e_evidence");
     }
     if env::var("DEEPWYRM_GUEST_TEST_SELECTOR")
         .ok()
@@ -390,6 +397,10 @@ fn is_wyr1c_evidence_selector(selector: &str) -> bool {
 }
 
 fn is_dw1e_platform_selector(selector: &str) -> bool {
+    selector == "q35-com2-interrupt"
+}
+
+fn is_dw1e_evidence_selector(selector: &str) -> bool {
     selector == "q35-com2-interrupt"
 }
 
@@ -994,6 +1005,10 @@ fn configure_guest_test(harness_path: &Path) -> Result<(), String> {
             println!("cargo:rustc-env=DEEPWYRM_DW1D_EVIDENCE_NONCE={nonce}");
             println!("cargo:rustc-env=DEEPWYRM_DW1D_EVIDENCE_CHALLENGE={challenge}");
         }
+        if is_dw1e_evidence_selector(&selector) {
+            let nonce = required_dw1e_hex("DEEPWYRM_DW1E_EVIDENCE_NONCE")?;
+            println!("cargo:rustc-env=DEEPWYRM_DW1E_EVIDENCE_NONCE={nonce}");
+        }
         if is_wyr1c_evidence_selector(&selector) {
             let nonce = required_wyr1c_hex("DEEPWYRM_WYR1C_EVIDENCE_NONCE")?;
             println!("cargo:rustc-env=DEEPWYRM_WYR1C_EVIDENCE_NONCE={nonce}");
@@ -1004,6 +1019,12 @@ fn configure_guest_test(harness_path: &Path) -> Result<(), String> {
 
 fn required_dw1b_hex(name: &str) -> Result<String, String> {
     let value = env::var(name).map_err(|_| format!("normal-preemption-up requires {name}"))?;
+    validate_upper_nonzero_hex_nonce(&value, name)?;
+    Ok(value)
+}
+
+fn required_dw1e_hex(name: &str) -> Result<String, String> {
+    let value = env::var(name).map_err(|_| format!("q35-com2-interrupt requires {name}"))?;
     validate_upper_nonzero_hex_nonce(&value, name)?;
     Ok(value)
 }
@@ -2312,13 +2333,28 @@ mod tests {
     }
 
     #[test]
-    fn dw1e_platform_shape_is_keyed_to_reserved_selector_but_not_runnable() {
+    fn dw1e_selector_and_nonce_are_exact() {
         let manifest = include_str!("../tooling/guest-harness.toml");
         assert!(is_dw1e_platform_selector("q35-com2-interrupt"));
+        assert!(is_dw1e_evidence_selector("q35-com2-interrupt"));
         assert!(!is_dw1e_platform_selector(
             "device-resource-interrupt-synthetic"
         ));
-        assert!(select_guest_test(true, Some("q35-com2-interrupt"), false, manifest).is_err());
+        assert_eq!(
+            select_guest_test(true, Some("q35-com2-interrupt"), false, manifest),
+            Ok(Some(31))
+        );
+        for valid in ["0000000000000001", "0123456789ABCDEF", "FFFFFFFFFFFFFFFF"] {
+            assert!(validate_upper_nonzero_hex_nonce(valid, "DW1E").is_ok());
+        }
+        for invalid in [
+            "0000000000000000",
+            "0123456789abcdef",
+            "0123456789ABCDE",
+            "G123456789ABCDEF",
+        ] {
+            assert!(validate_upper_nonzero_hex_nonce(invalid, "DW1E").is_err());
+        }
     }
 
     fn required_dw1c_bootfs_pages_for_test(value: &str) -> Result<(), String> {
