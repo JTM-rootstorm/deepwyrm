@@ -26,6 +26,10 @@ const APIC_VERSION: u32 = 0x030;
 const APIC_TASK_PRIORITY: u32 = 0x080;
 const APIC_EOI: u32 = 0x0b0;
 const APIC_SPURIOUS: u32 = 0x0f0;
+#[allow(dead_code, reason = "DW1-E2C target-only BSP vector retirement proof")]
+const APIC_IN_SERVICE_BASE: u32 = 0x100;
+#[allow(dead_code, reason = "DW1-E2C target-only BSP vector retirement proof")]
+const APIC_INTERRUPT_REQUEST_BASE: u32 = 0x200;
 const APIC_ERROR_STATUS: u32 = 0x280;
 const APIC_INTERRUPT_COMMAND_LOW: u32 = 0x300;
 const APIC_INTERRUPT_COMMAND_HIGH: u32 = 0x310;
@@ -239,6 +243,13 @@ pub enum IpiOperation {
     InitDeassert,
     Startup { trampoline_page: u64 },
     Fixed { vector: u8 },
+}
+
+#[allow(dead_code, reason = "DW1-E2C target-only BSP vector retirement proof")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LocalApicVectorState {
+    pub(crate) pending: bool,
+    pub(crate) in_service: bool,
 }
 
 /// Per-CPU local-APIC bring-up state.
@@ -582,6 +593,31 @@ impl LocalApic {
             return Err(LocalApicError::Access(error));
         }
         Ok(())
+    }
+
+    /// Reads the architectural IRR/ISR bank bits for one fixed vector.
+    ///
+    /// DW1-E2C uses this only on CPU0 after the IOAPIC route has been proved
+    /// masked and Delivery Status idle. Raw xAPIC offsets remain private here.
+    #[allow(dead_code, reason = "DW1-E2C target-only BSP vector retirement proof")]
+    pub(crate) fn vector_state<R: XApicRegisterAccess>(
+        &mut self,
+        registers: &mut R,
+        vector: u8,
+    ) -> Result<LocalApicVectorState, LocalApicError<R::Error>> {
+        self.require_state(ControllerState::Online)?;
+        let bank = u32::from(vector / 32) * 0x10;
+        let bit = 1_u32 << (vector % 32);
+        let irr = registers
+            .read(APIC_INTERRUPT_REQUEST_BASE + bank)
+            .map_err(LocalApicError::Access)?;
+        let isr = registers
+            .read(APIC_IN_SERVICE_BASE + bank)
+            .map_err(LocalApicError::Access)?;
+        Ok(LocalApicVectorState {
+            pending: irr & bit != 0,
+            in_service: isr & bit != 0,
+        })
     }
 
     fn require_state<E>(&self, expected: ControllerState) -> Result<(), LocalApicError<E>> {

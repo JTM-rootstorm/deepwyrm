@@ -13,6 +13,7 @@ use crate::handle::{AcceptedObjectTypes, HandleTable, HandleTableError};
 use crate::object::{FinalRelease, ObjectRegistry};
 use crate::task::{CooperativeScheduler, TaskAuthority, ThreadKey};
 use crate::wait::{WaitRegistry, WakeBatch};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 type Registry = ObjectRegistry<32>;
 type Table = HandleTable<12>;
@@ -20,6 +21,135 @@ type Resources = DeviceResourceAuthority<4>;
 type Interrupts = InterruptAuthority<4>;
 type Platform = InterruptPlatformModel<4>;
 type Waits = WaitRegistry<8>;
+
+struct DeferredOncePlatform {
+    inner: Platform,
+    defer: AtomicBool,
+}
+
+struct CommitBoundaryPlatform<'a> {
+    inner: Platform,
+    interrupts: &'a Interrupts,
+    waits: &'a Waits,
+    accepted: AtomicBool,
+}
+
+impl<'a> CommitBoundaryPlatform<'a> {
+    fn new(interrupts: &'a Interrupts, waits: &'a Waits) -> Self {
+        Self {
+            inner: Platform::new(),
+            interrupts,
+            waits,
+            accepted: AtomicBool::new(false),
+        }
+    }
+}
+
+impl InterruptPlatform for CommitBoundaryPlatform<'_> {
+    fn reserve_source(
+        &self,
+        source: u32,
+    ) -> Result<super::interrupt::InterruptSourceReservation, InterruptPlatformError> {
+        self.inner.reserve_source(source)
+    }
+
+    fn cancel_source(
+        &self,
+        reservation: super::interrupt::InterruptSourceReservation,
+    ) -> Result<(), InterruptPlatformError> {
+        self.inner.cancel_source(reservation)
+    }
+
+    fn commit_source(
+        &self,
+        reservation: super::interrupt::InterruptSourceReservation,
+    ) -> InterruptBinding {
+        let binding = self.inner.commit_source(reservation);
+        let delivery = self.inner.prepare_delivery(binding).unwrap();
+        let (accepted, _) = self.interrupts.deliver(delivery, self.waits);
+        self.accepted.store(accepted, Ordering::Release);
+        binding
+    }
+
+    fn mask_source(&self, binding: InterruptBinding) {
+        self.inner.mask_source(binding);
+    }
+
+    fn acknowledge_source(
+        &self,
+        binding: InterruptBinding,
+    ) -> Result<InterruptPlatformAck, InterruptPlatformError> {
+        self.inner.acknowledge_source(binding)
+    }
+
+    fn complete_ack(&self, ack: InterruptPlatformAck, outcome: InterruptAckOutcome) {
+        self.inner.complete_ack(ack, outcome);
+    }
+
+    fn release_source(&self, binding: InterruptBinding) {
+        self.inner.release_source(binding);
+    }
+}
+
+impl DeferredOncePlatform {
+    fn new() -> Self {
+        Self {
+            inner: Platform::new(),
+            defer: AtomicBool::new(true),
+        }
+    }
+}
+
+impl InterruptPlatform for DeferredOncePlatform {
+    fn reserve_source(
+        &self,
+        source: u32,
+    ) -> Result<super::interrupt::InterruptSourceReservation, InterruptPlatformError> {
+        self.inner.reserve_source(source)
+    }
+
+    fn cancel_source(
+        &self,
+        reservation: super::interrupt::InterruptSourceReservation,
+    ) -> Result<(), InterruptPlatformError> {
+        self.inner.cancel_source(reservation)
+    }
+
+    fn commit_source(
+        &self,
+        reservation: super::interrupt::InterruptSourceReservation,
+    ) -> InterruptBinding {
+        self.inner.commit_source(reservation)
+    }
+
+    fn mask_source(&self, binding: InterruptBinding) {
+        self.inner.mask_source(binding);
+    }
+
+    fn acknowledge_source(
+        &self,
+        binding: InterruptBinding,
+    ) -> Result<InterruptPlatformAck, InterruptPlatformError> {
+        self.inner.acknowledge_source(binding)
+    }
+
+    fn complete_ack(&self, ack: InterruptPlatformAck, outcome: InterruptAckOutcome) {
+        self.inner.complete_ack(ack, outcome);
+    }
+
+    fn release_source(&self, binding: InterruptBinding) {
+        self.inner.release_source(binding);
+    }
+
+    fn retire_source(&self, binding: InterruptBinding) -> super::interrupt::InterruptRetirement {
+        if self.defer.swap(false, Ordering::AcqRel) {
+            return super::interrupt::InterruptRetirement::Deferred;
+        }
+        self.inner.mask_source(binding);
+        self.inner.release_source(binding);
+        super::interrupt::InterruptRetirement::Complete
+    }
+}
 
 struct Fixture {
     registry: Registry,
@@ -186,6 +316,59 @@ fn creation_binds_exact_parent_source_and_immutable_info() {
     );
 
     assert!(fixture.close_interrupt(handle).is_none());
+    fixture.finish_resource(None);
+}
+
+#[test]
+fn delivery_at_platform_commit_boundary_observes_typed_armed_state() {
+    let mut fixture = Fixture::broad();
+    let platform = CommitBoundaryPlatform::new(&fixture.interrupts, &fixture.waits);
+    let (key, handle) = interrupt_create(
+        &mut fixture.table,
+        &mut fixture.registry,
+        &fixture.resources,
+        &fixture.interrupts,
+        &platform,
+        fixture.resource,
+        dw_object_compatible_rights(DW_OBJECT_TYPE_INTERRUPT),
+    )
+    .unwrap();
+    assert!(platform.accepted.load(Ordering::Acquire));
+    let binding = fixture.interrupts.binding(key);
+    let resolved = fixture
+        .table
+        .lookup(
+            &mut fixture.registry,
+            handle,
+            AcceptedObjectTypes::One(DW_OBJECT_TYPE_INTERRUPT),
+            DW_RIGHT_INSPECT,
+        )
+        .unwrap();
+    assert_eq!(
+        fixture
+            .interrupts
+            .current_signals_for_resolved(&resolved)
+            .unwrap(),
+        DW_SIGNAL_SIGNALED
+    );
+    assert!(
+        fixture
+            .registry
+            .release_internal(resolved.into_internal())
+            .unwrap()
+            .is_none()
+    );
+    let final_release = fixture
+        .table
+        .close(&mut fixture.registry, handle)
+        .unwrap()
+        .unwrap();
+    let finalization = fixture
+        .interrupts
+        .take_finalization(final_release, &platform)
+        .unwrap();
+    assert!(complete_interrupt_finalization(&mut fixture.registry, finalization).is_none());
+    assert!(!platform.inner.is_bound(binding));
     fixture.finish_resource(None);
 }
 
@@ -566,6 +749,44 @@ fn parent_resource_finalizes_only_after_interrupt_unbind() {
     let parent_release = fixture.close_interrupt(handle).unwrap();
     assert!(!fixture.platform.is_bound(binding));
     fixture.finish_resource(Some(parent_release));
+}
+
+#[test]
+fn deferred_retirement_retains_final_release_and_parent_until_safe_point_retry() {
+    let mut fixture = Fixture::broad();
+    let platform = DeferredOncePlatform::new();
+    let (key, handle) = interrupt_create(
+        &mut fixture.table,
+        &mut fixture.registry,
+        &fixture.resources,
+        &fixture.interrupts,
+        &platform,
+        fixture.resource,
+        dw_object_compatible_rights(DW_OBJECT_TYPE_INTERRUPT),
+    )
+    .unwrap();
+    let binding = fixture.interrupts.binding(key);
+    let final_release = fixture
+        .table
+        .close(&mut fixture.registry, handle)
+        .unwrap()
+        .unwrap();
+    let staged = fixture
+        .interrupts
+        .take_finalization(final_release, &platform)
+        .unwrap();
+    assert!(complete_interrupt_finalization(&mut fixture.registry, staged).is_none());
+    assert!(platform.inner.is_bound(binding));
+    assert_eq!(fixture.interrupts.live_count(), 1);
+
+    let ready = fixture
+        .interrupts
+        .retry_deferred_finalization(&platform)
+        .expect("safe-point retry completes the exact staged generation");
+    assert!(complete_interrupt_finalization(&mut fixture.registry, ready).is_none());
+    assert!(!platform.inner.is_bound(binding));
+    assert_eq!(fixture.interrupts.live_count(), 0);
+    fixture.finish_resource(None);
 }
 
 #[test]

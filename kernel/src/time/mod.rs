@@ -55,7 +55,8 @@ pub(crate) use live::{
     TimerExpiryTarget, ap_scheduler_timer_is_masked, arm_scheduler_quantum,
     bind_deadline_wake_target, bind_timer_expiry_target, bsp_local_apic_identity,
     busy_wait_nanoseconds, cancel_deadline, cancel_scheduler_quantum, initialize,
-    initialize_ap_local_apic, monotonic_now, register_deadline, send_bsp_ipi,
+    initialize_ap_local_apic, monotonic_now, q35_bsp_vector_is_clear, q35_current_cpu_is_bsp,
+    register_deadline, request_q35_bsp_retirement_check, send_bsp_ipi,
     service_current_rendezvous_latch, service_current_scheduler_quantum_deadline,
     timer_service_is_healthy,
 };

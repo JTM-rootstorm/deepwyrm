@@ -224,6 +224,22 @@ pub(crate) struct PlatformIrqRoute {
 }
 
 impl PlatformIrqRoute {
+    #[cfg(test)]
+    pub(crate) const fn test_q35(
+        controller: IoApicDescriptor,
+        gsi: u32,
+        bsp_local_apic_id: u8,
+    ) -> Self {
+        Self {
+            gsi,
+            polarity: PlatformIrqPolarity::ActiveHigh,
+            trigger: PlatformIrqTrigger::Edge,
+            vector: Q35_COM2_VECTOR,
+            bsp_local_apic_id,
+            controller,
+        }
+    }
+
     pub(crate) const fn gsi(self) -> u32 {
         self.gsi
     }

@@ -514,6 +514,44 @@ fn with_bootstrap_local_apic<T>(
     LOCAL_APIC_SLOTS[CpuIndex::BOOTSTRAP.index()].with_owner(operation)
 }
 
+/// Performs DW1-E2C's ordered CPU0 IRR/ISR observation for vector `0x30`.
+/// Callers must already have proved the IOAPIC route masked and Delivery
+/// Status idle; this helper rejects execution on every non-bootstrap CPU.
+pub(crate) fn q35_bsp_vector_is_clear() -> Result<bool, LiveTimeError> {
+    with_bootstrap_local_apic(|controller, registers| {
+        let state = controller
+            .vector_state(registers, 0x30)
+            .map_err(|_| LiveTimeError::ApicAccess)?;
+        Ok(!state.pending && !state.in_service)
+    })
+}
+
+pub(crate) fn q35_current_cpu_is_bsp() -> Result<bool, LiveTimeError> {
+    Ok(installed_current_cpu_index()? == CpuIndex::BOOTSTRAP)
+}
+
+/// Requests one CPU0 carrier safe-point when q35 retirement was initiated on
+/// another CPU. The existing e1 rendezvous transport is coalescing and its
+/// post-EOI latch performs no finalization in interrupt context.
+pub(crate) fn request_q35_bsp_retirement_check(
+    source: u32,
+    vector: u8,
+    platform_generation: u64,
+    request_generation: u64,
+) -> Result<(), LiveTimeError> {
+    if source != 3 || vector != 0x30 || platform_generation == 0 || request_generation == 0 {
+        return Err(LiveTimeError::Faulted);
+    }
+    if installed_current_cpu_index()? == CpuIndex::BOOTSTRAP {
+        return Ok(());
+    }
+    let bsp = LOCAL_APIC_SLOTS[CpuIndex::BOOTSTRAP.index()]
+        .identity()
+        .ok_or(LiveTimeError::ApicAccess)?;
+    send_live_ipi(bsp.local_apic_id, LiveIpiVector::Rendezvous)
+        .map_err(|_| LiveTimeError::IpiTransport)
+}
+
 fn current_cpu_is_timer_service() -> Result<bool, LiveTimeError> {
     Ok(installed_current_cpu_index()? == CpuIndex::BOOTSTRAP)
 }

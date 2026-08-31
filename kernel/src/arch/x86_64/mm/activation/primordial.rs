@@ -851,6 +851,10 @@ type Channels = ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>;
 type Tasks = TaskAuthority<TASK_GROUPS, PROCESSES, THREADS, HANDLES>;
 type Spaces = AddressSpaceAuthority<SPACES, REGIONS>;
 type Regions = AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>;
+#[cfg(deepwyrm_dw1e_platform)]
+type RuntimeInterruptPlatform = crate::device::Q35InterruptPlatform;
+#[cfg(not(deepwyrm_dw1e_platform))]
+type RuntimeInterruptPlatform = crate::device::InterruptPlatformModel<8>;
 
 struct ByteStorage<const BYTES: usize>(UnsafeCell<MaybeUninit<[u8; BYTES]>>);
 
@@ -876,7 +880,7 @@ struct PrimordialRuntimeShared {
     boot_resource_grants: crate::boot::BootResourceGrantAuthority,
     device_resources: crate::device::DeviceResourceAuthority<8>,
     interrupts: crate::device::InterruptAuthority<8>,
-    interrupt_platform: crate::device::InterruptPlatformModel<8>,
+    interrupt_platform: RuntimeInterruptPlatform,
     events: EventAuthority<EVENTS>,
     timers: TimerAuthority<TIMERS>,
     timer_expiries:
@@ -1255,6 +1259,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         ) {
             return Err(());
         }
+        #[cfg(deepwyrm_dw1e_platform)]
+        if self.cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+            // The e1 rendezvous may have been a generation-bound q35
+            // retirement request. Retry only here, outside interrupt context
+            // and while the ordinary carrier finalizer authority is held.
+            runtime
+                .drain_finalizers()
+                .unwrap_or_else(|_| panic!("DW1-E2C deferred finalizer safe-point drifted"));
+        }
         Ok(operation(&mut runtime))
     }
 
@@ -1527,6 +1540,14 @@ fn publish_runtime_shared(
     let execution =
         ExecutionDomain::<EXECUTION_THREADS>::new(core::array::from_fn(|index| stacks[index]))
             .unwrap_or_else(|error| panic!("invalid primordial execution domain: {error:?}"));
+    #[cfg(deepwyrm_dw1e_platform)]
+    let interrupt_platform = crate::device::Q35InterruptPlatform::new(
+        crate::arch::x86_64::ioapic_live::q35_ioapic()
+            .unwrap_or_else(|| panic!("DW1-E2C runtime requires the validated q35 IOAPIC owner")),
+    )
+    .unwrap_or_else(|error| panic!("DW1-E2C q35 platform initialization failed: {error:?}"));
+    #[cfg(not(deepwyrm_dw1e_platform))]
+    let interrupt_platform = crate::device::InterruptPlatformModel::new();
     unsafe {
         (*SHARED_RUNTIME_STORAGE.0.get()).write(PrimordialRuntimeShared {
             execution,
@@ -1536,7 +1557,7 @@ fn publish_runtime_shared(
             ),
             device_resources: crate::device::DeviceResourceAuthority::new(),
             interrupts: crate::device::InterruptAuthority::new(),
-            interrupt_platform: crate::device::InterruptPlatformModel::new(),
+            interrupt_platform,
             events: EventAuthority::new(),
             timers: TimerAuthority::new(),
             timer_expiries: IrqSpinMutex::new([None; crate::time::DEADLINE_QUEUE_CAPACITY]),
@@ -1545,11 +1566,59 @@ fn publish_runtime_shared(
     }
     SHARED_RUNTIME_STATE.store(2, Ordering::Release);
     let target = unsafe { &*(*SHARED_RUNTIME_STORAGE.0.get()).as_ptr() };
+    #[cfg(deepwyrm_dw1e_platform)]
+    crate::arch::x86_64::external_interrupt::bind_q35_external_interrupt_handler(target)
+        .unwrap_or_else(|error| panic!("could not bind DW1-E2C q35 vector handler: {error:?}"));
     crate::time::bind_deadline_wake_target(target)
         .unwrap_or_else(|error| panic!("could not bind primordial deadline wakes: {error:?}"));
     crate::time::bind_timer_expiry_target(target)
         .unwrap_or_else(|error| panic!("could not bind primordial timer expiries: {error:?}"));
     target
+}
+
+#[cfg(deepwyrm_dw1e_platform)]
+impl crate::arch::x86_64::external_interrupt::Q35ExternalInterruptHandler
+    for PrimordialRuntimeShared
+{
+    fn handle_q35_com2_interrupt(
+        &self,
+    ) -> crate::arch::x86_64::external_interrupt::Q35ExternalInterruptCompletion {
+        let generation = match self.interrupt_platform.snapshot_delivery() {
+            crate::device::Q35DeliverySnapshot::Live {
+                delivery,
+                generation,
+            } => {
+                let (disposition, wakes) =
+                    self.interrupts.deliver_classified(delivery, &self.waits);
+                if matches!(
+                    disposition,
+                    crate::device::InterruptDeliveryDisposition::CoalescedPending
+                        | crate::device::InterruptDeliveryDisposition::AckRace
+                ) {
+                    self.interrupt_platform.record_pending_delivery();
+                }
+                crate::wait::complete_irq_signal_wakes(&self.execution, wakes);
+                generation
+            }
+            crate::device::Q35DeliverySnapshot::Retiring { generation } => generation,
+            crate::device::Q35DeliverySnapshot::Orphan => {
+                return crate::arch::x86_64::external_interrupt::Q35ExternalInterruptCompletion::none();
+            }
+        };
+        crate::arch::x86_64::external_interrupt::Q35ExternalInterruptCompletion::generation_bound(
+            generation,
+            complete_q35_handler_after_eoi,
+        )
+    }
+}
+
+#[cfg(deepwyrm_dw1e_platform)]
+fn complete_q35_handler_after_eoi(generation: u64) {
+    if SHARED_RUNTIME_STATE.load(Ordering::Acquire) != 2 {
+        panic!("DW1-E2C handler completion preceded shared-runtime publication");
+    }
+    let shared = unsafe { &*(*SHARED_RUNTIME_STORAGE.0.get()).as_ptr() };
+    shared.interrupt_platform.complete_handler(generation);
 }
 
 fn initialize_per_cpu_live_carriers() {
@@ -5265,36 +5334,62 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn drain_finalizers(&mut self) -> Result<(), ()> {
-        while !self.cleanup.is_empty() {
-            let cleanup = core::mem::replace(&mut self.cleanup, CleanupQueue::new());
-            for release in cleanup.into_releases().into_iter().flatten() {
-                let batch = {
-                    let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
-                    let mut finalizer = crate::object::PayloadFinalizer::new(
+        loop {
+            while !self.cleanup.is_empty() {
+                let cleanup = core::mem::replace(&mut self.cleanup, CleanupQueue::new());
+                for release in cleanup.into_releases().into_iter().flatten() {
+                    let batch = {
+                        let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
+                        let mut finalizer = crate::object::PayloadFinalizer::new(
+                            &mut self.registry,
+                            &mut *self.active.target.roles,
+                            &mut self.memory,
+                            &self.shared.events,
+                            &self.shared.timers,
+                            &mut timer_deadlines,
+                            &self.shared.channels,
+                            &self.shared.waits,
+                            &mut self.tasks,
+                            &mut self.spaces,
+                            &mut self.regions,
+                        )
+                        .with_device_resources(&self.shared.device_resources)
+                        .with_boot_resource_grants(&self.shared.boot_resource_grants)
+                        .with_interrupts(&self.shared.interrupts, &self.shared.interrupt_platform);
+                        finalizer.finalize_chain(release)
+                    };
+                    crate::syscall::complete_wait_wakes(
                         &mut self.registry,
-                        &mut *self.active.target.roles,
-                        &mut self.memory,
-                        &self.shared.events,
-                        &self.shared.timers,
-                        &mut timer_deadlines,
-                        &self.shared.channels,
-                        &self.shared.waits,
-                        &mut self.tasks,
-                        &mut self.spaces,
-                        &mut self.regions,
-                    )
-                    .with_device_resources(&self.shared.device_resources)
-                    .with_boot_resource_grants(&self.shared.boot_resource_grants)
-                    .with_interrupts(&self.shared.interrupts, &self.shared.interrupt_platform);
-                    finalizer.finalize_chain(release)
-                };
-                crate::syscall::complete_wait_wakes(
-                    &mut self.registry,
-                    &self.shared.execution,
-                    batch,
-                    &mut self.cleanup,
-                );
+                        &self.shared.execution,
+                        batch,
+                        &mut self.cleanup,
+                    );
+                }
             }
+            let parent_release = {
+                let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
+                let mut finalizer = crate::object::PayloadFinalizer::new(
+                    &mut self.registry,
+                    &mut *self.active.target.roles,
+                    &mut self.memory,
+                    &self.shared.events,
+                    &self.shared.timers,
+                    &mut timer_deadlines,
+                    &self.shared.channels,
+                    &self.shared.waits,
+                    &mut self.tasks,
+                    &mut self.spaces,
+                    &mut self.regions,
+                )
+                .with_device_resources(&self.shared.device_resources)
+                .with_boot_resource_grants(&self.shared.boot_resource_grants)
+                .with_interrupts(&self.shared.interrupts, &self.shared.interrupt_platform);
+                finalizer.retry_deferred_interrupt()
+            };
+            let Some(parent_release) = parent_release else {
+                break;
+            };
+            self.cleanup.push(parent_release);
         }
         Ok(())
     }

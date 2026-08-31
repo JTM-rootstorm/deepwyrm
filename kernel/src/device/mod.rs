@@ -1,6 +1,8 @@
 //! DW1-D typed device-resource and synthetic Interrupt authorities.
 
 mod interrupt;
+#[cfg(any(test, deepwyrm_dw1e_platform))]
+mod q35_interrupt;
 mod resource;
 
 pub(crate) use interrupt::InterruptPayloadBinding;
@@ -9,12 +11,16 @@ pub(crate) use interrupt::InterruptPayloadBinding;
     reason = "D3 exports the complete typed Interrupt seam before D5 production publication"
 )]
 pub(crate) use interrupt::{
-    InterruptAckTransaction, InterruptAuthority, InterruptCleanup, InterruptCreateError,
-    InterruptError, InterruptFinalization, InterruptFinalizer, InterruptInfoProvider, InterruptKey,
-    InterruptPlatform, InterruptPlatformError, InterruptPlatformModel, InterruptWaitFailure,
+    InterruptAckOutcome, InterruptAckTransaction, InterruptAuthority, InterruptCleanup,
+    InterruptCreateError, InterruptDeliveryDisposition, InterruptError, InterruptFinalization,
+    InterruptFinalizer, InterruptInfoProvider, InterruptKey, InterruptPlatform,
+    InterruptPlatformAck, InterruptPlatformError, InterruptPlatformModel, InterruptWaitFailure,
     InterruptWaitOutcome, InterruptWaitSource, complete_interrupt_finalization, interrupt_ack,
     interrupt_create, prepare_interrupt_ack,
 };
+
+#[cfg(deepwyrm_dw1e_platform)]
+pub(crate) use q35_interrupt::{Q35DeliverySnapshot, Q35InterruptPlatform};
 
 #[cfg(any(test, deepwyrm_dw1d_evidence))]
 #[allow(

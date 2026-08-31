@@ -24,7 +24,7 @@ use super::{DeviceResourceAuthority, DeviceResourceDescriptor, DeviceResourceErr
 
 static NEXT_PLATFORM_DOMAIN: AtomicU64 = AtomicU64::new(1);
 
-fn mint_platform_domain() -> u64 {
+pub(super) fn mint_platform_domain() -> u64 {
     NEXT_PLATFORM_DOMAIN
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |domain| {
             domain.checked_add(1).filter(|next| *next != 0)
@@ -40,6 +40,18 @@ pub(crate) struct InterruptBinding {
 }
 
 impl InterruptBinding {
+    pub(super) const fn new_private(domain: u64, source: u32, generation: u64) -> Self {
+        Self {
+            domain,
+            source,
+            generation,
+        }
+    }
+
+    pub(super) const fn domain(self) -> u64 {
+        self.domain
+    }
+
     pub(crate) const fn source(self) -> u32 {
         self.source
     }
@@ -60,12 +72,37 @@ impl InterruptBinding {
 
 #[must_use = "reserved Interrupt sources must be committed or cancelled"]
 pub(crate) struct InterruptSourceReservation {
-    binding: InterruptBinding,
+    pub(super) binding: InterruptBinding,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct InterruptDelivery {
-    binding: InterruptBinding,
+    pub(super) binding: InterruptBinding,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InterruptDeliveryDisposition {
+    Rejected,
+    FirstPending,
+    CoalescedPending,
+    AckRace,
+}
+
+#[must_use = "prepared platform acknowledgements must be completed with the exact object outcome"]
+pub(crate) struct InterruptPlatformAck {
+    pub(super) binding: InterruptBinding,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InterruptAckOutcome {
+    Armed,
+    PendingAfterRace,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InterruptRetirement {
+    Complete,
+    Deferred,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,12 +134,26 @@ pub(crate) trait InterruptPlatform {
     /// binding is retained by an Interrupt payload this operation is no-fail.
     fn mask_source(&self, binding: InterruptBinding);
 
-    fn acknowledge_source(&self, binding: InterruptBinding) -> Result<(), InterruptPlatformError>;
+    fn acknowledge_source(
+        &self,
+        binding: InterruptBinding,
+    ) -> Result<InterruptPlatformAck, InterruptPlatformError>;
 
-    fn unmask_or_rearm(&self, binding: InterruptBinding) -> Result<(), InterruptPlatformError>;
+    /// Completes a validated acknowledgement after the Interrupt authority
+    /// has committed its exact raced/non-raced outcome.
+    fn complete_ack(&self, ack: InterruptPlatformAck, outcome: InterruptAckOutcome);
 
     /// Releases an exact masked source at the final no-fail ownership point.
     fn release_source(&self, binding: InterruptBinding);
+
+    /// Begins and, where possible, completes physical retirement. Real fixed-
+    /// vector platforms may retain an exact quarantined generation for a
+    /// later carrier safe-point; synthetic platforms complete synchronously.
+    fn retire_source(&self, binding: InterruptBinding) -> InterruptRetirement {
+        self.mask_source(binding);
+        self.release_source(binding);
+        InterruptRetirement::Complete
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -252,23 +303,26 @@ impl<const SOURCES: usize> InterruptPlatform for InterruptPlatformModel<SOURCES>
         }
     }
 
-    fn acknowledge_source(&self, binding: InterruptBinding) -> Result<(), InterruptPlatformError> {
+    fn acknowledge_source(
+        &self,
+        binding: InterruptBinding,
+    ) -> Result<InterruptPlatformAck, InterruptPlatformError> {
         let mut slots = self.sources.lock();
         let record = exact_platform_record_mut(self.domain, &mut slots, binding)?;
         if record.state != PlatformSourceState::Masked {
             return Err(InterruptPlatformError::BadState);
         }
-        Ok(())
+        Ok(InterruptPlatformAck { binding })
     }
 
-    fn unmask_or_rearm(&self, binding: InterruptBinding) -> Result<(), InterruptPlatformError> {
+    fn complete_ack(&self, ack: InterruptPlatformAck, outcome: InterruptAckOutcome) {
         let mut slots = self.sources.lock();
-        let record = exact_platform_record_mut(self.domain, &mut slots, binding)?;
-        if record.state != PlatformSourceState::Masked {
-            return Err(InterruptPlatformError::BadState);
+        let record = exact_platform_record_mut(self.domain, &mut slots, ack.binding)
+            .expect("prepared synthetic acknowledgement retains its exact binding");
+        assert_eq!(record.state, PlatformSourceState::Masked);
+        if outcome == InterruptAckOutcome::Armed {
+            record.state = PlatformSourceState::Armed;
         }
-        record.state = PlatformSourceState::Armed;
-        Ok(())
     }
 
     fn release_source(&self, binding: InterruptBinding) {
@@ -372,9 +426,16 @@ impl InterruptCleanup {
     }
 }
 
+enum InterruptFinalizationState {
+    Ready {
+        final_release: FinalRelease,
+        parent: InternalRef,
+    },
+    Deferred,
+}
+
 pub(crate) struct InterruptFinalization {
-    final_release: FinalRelease,
-    parent: InternalRef,
+    state: InterruptFinalizationState,
     #[cfg(deepwyrm_dw1d_evidence)]
     binding: InterruptBinding,
     #[cfg(deepwyrm_dw1d_evidence)]
@@ -384,8 +445,11 @@ pub(crate) struct InterruptFinalization {
 impl InterruptFinalization {
     #[cfg(deepwyrm_dw1d_evidence)]
     pub(crate) const fn dw1d_identity(&self) -> (ObjectId, InterruptBinding, u64) {
+        let InterruptFinalizationState::Ready { final_release, .. } = &self.state else {
+            panic!("selector-30 synthetic finalization cannot be deferred");
+        };
         (
-            self.final_release.id(),
+            final_release.id(),
             self.binding,
             self.parent_descriptor.lease_generation,
         )
@@ -407,6 +471,7 @@ struct InterruptRecord {
     parent_descriptor: DeviceResourceDescriptor,
     parent: InternalRef,
     state: InterruptState,
+    pending_final_release: Option<FinalRelease>,
 }
 
 pub(crate) trait InterruptInfoProvider {
@@ -439,6 +504,11 @@ pub(crate) trait InterruptFinalizer {
         final_release: FinalRelease,
         platform: &dyn InterruptPlatform,
     ) -> Result<InterruptFinalization, (InterruptError, FinalRelease)>;
+
+    fn retry_deferred_finalization(
+        &self,
+        platform: &dyn InterruptPlatform,
+    ) -> Option<InterruptFinalization>;
 }
 
 pub(crate) struct InterruptAuthority<const INTERRUPTS: usize> {
@@ -482,6 +552,7 @@ impl<const INTERRUPTS: usize> InterruptAuthority<INTERRUPTS> {
             parent_descriptor,
             parent,
             state: InterruptState::Creating,
+            pending_final_release: None,
         });
         Ok(InterruptPayloadBinding { creation, key })
     }
@@ -494,37 +565,21 @@ impl<const INTERRUPTS: usize> InterruptAuthority<INTERRUPTS> {
         interrupt.state = InterruptState::Armed;
     }
 
-    fn cancel_unpublished(
-        &self,
-        final_release: FinalRelease,
-    ) -> Result<(InterruptCleanup, InternalRef), (InterruptError, FinalRelease)> {
-        if final_release.object_type() != DW_OBJECT_TYPE_INTERRUPT {
-            return Err((InterruptError::FinalizationMismatch, final_release));
-        }
-        let mut interrupts = self.interrupts.lock();
-        let Some(slot) = interrupts.iter_mut().find(|slot| {
-            slot.as_ref().is_some_and(|interrupt| {
-                interrupt.object == final_release.id()
-                    && matches!(
-                        interrupt.state,
-                        InterruptState::Creating | InterruptState::Armed
-                    )
-            })
-        }) else {
-            return Err((InterruptError::FinalizationMismatch, final_release));
-        };
-        let interrupt = slot
-            .take()
-            .expect("validated unpublished Interrupt slot remains populated");
-        Ok((InterruptCleanup { final_release }, interrupt.parent))
-    }
-
     pub(crate) fn deliver<const WAITERS: usize>(
         &self,
         delivery: InterruptDelivery,
         waits: &crate::wait::WaitRegistry<WAITERS>,
     ) -> (bool, WakeBatch<WAITERS>) {
-        let object = {
+        let (disposition, wakes) = self.deliver_classified(delivery, waits);
+        (disposition != InterruptDeliveryDisposition::Rejected, wakes)
+    }
+
+    pub(crate) fn deliver_classified<const WAITERS: usize>(
+        &self,
+        delivery: InterruptDelivery,
+        waits: &crate::wait::WaitRegistry<WAITERS>,
+    ) -> (InterruptDeliveryDisposition, WakeBatch<WAITERS>) {
+        let (object, disposition) = {
             let mut interrupts = self.interrupts.lock();
             let Some(interrupt) = interrupts.iter_mut().flatten().find(|interrupt| {
                 interrupt.binding == delivery.binding
@@ -533,19 +588,26 @@ impl<const INTERRUPTS: usize> InterruptAuthority<INTERRUPTS> {
                         InterruptState::Creating | InterruptState::Finalizing
                     )
             }) else {
-                return (false, WakeBatch::empty());
+                return (InterruptDeliveryDisposition::Rejected, WakeBatch::empty());
             };
-            match &mut interrupt.state {
+            let disposition = match &mut interrupt.state {
                 InterruptState::Armed => {
                     interrupt.state = InterruptState::Pending { coalesced: false };
+                    InterruptDeliveryDisposition::FirstPending
                 }
-                InterruptState::Pending { coalesced } => *coalesced = true,
-                InterruptState::AckPrepared { raced_delivery } => *raced_delivery = true,
+                InterruptState::Pending { coalesced } => {
+                    *coalesced = true;
+                    InterruptDeliveryDisposition::CoalescedPending
+                }
+                InterruptState::AckPrepared { raced_delivery } => {
+                    *raced_delivery = true;
+                    InterruptDeliveryDisposition::AckRace
+                }
                 InterruptState::Creating | InterruptState::Finalizing => unreachable!(),
-            }
-            interrupt.object
+            };
+            (interrupt.object, disposition)
         };
-        (true, waits.ready_wakes(object, DW_SIGNAL_SIGNALED))
+        (disposition, waits.ready_wakes(object, DW_SIGNAL_SIGNALED))
     }
 
     fn prepare_ack_for_resolved(
@@ -592,18 +654,23 @@ impl<const INTERRUPTS: usize> InterruptAuthority<INTERRUPTS> {
         }
     }
 
-    fn finish_ack(&self, object: ObjectId, binding: InterruptBinding) {
+    fn finish_ack(&self, object: ObjectId, binding: InterruptBinding) -> InterruptAckOutcome {
         let mut interrupts = self.interrupts.lock();
         let interrupt = exact_interrupt_mut(&mut interrupts, object, binding)
             .expect("ack transaction retained exact Interrupt lifetime");
         let InterruptState::AckPrepared { raced_delivery } = interrupt.state else {
             panic!("ack transaction lost its prepared typed state");
         };
-        interrupt.state = if raced_delivery {
-            InterruptState::Pending { coalesced: false }
+        let outcome = if raced_delivery {
+            InterruptAckOutcome::PendingAfterRace
         } else {
-            InterruptState::Armed
+            InterruptAckOutcome::Armed
         };
+        interrupt.state = match outcome {
+            InterruptAckOutcome::Armed => InterruptState::Armed,
+            InterruptAckOutcome::PendingAfterRace => InterruptState::Pending { coalesced: false },
+        };
+        outcome
     }
 
     fn restore_pending_after_platform_failure(&self, object: ObjectId, binding: InterruptBinding) {
@@ -853,35 +920,98 @@ impl<const INTERRUPTS: usize> InterruptFinalizer for InterruptAuthority<INTERRUP
             interrupt.binding
         };
 
-        platform.mask_source(binding);
-        platform.release_source(binding);
-
-        let finalized_interrupt = {
+        if platform.retire_source(binding) == InterruptRetirement::Deferred {
             let mut interrupts = self.interrupts.lock();
-            let Some(slot) = interrupts.iter_mut().find(|slot| {
-                slot.as_ref().is_some_and(|interrupt| {
-                    interrupt.object == final_release.id()
-                        && interrupt.binding == binding
-                        && matches!(interrupt.state, InterruptState::Finalizing)
-                })
-            }) else {
-                panic!("Interrupt finalization lost its exact typed record after platform unbind");
-            };
-            slot.take()
-                .expect("validated Interrupt finalization slot remains populated")
-        };
+            let interrupt = exact_interrupt_mut(&mut interrupts, final_release.id(), binding)
+                .expect("deferred Interrupt finalization retains its exact typed record");
+            assert!(matches!(interrupt.state, InterruptState::Finalizing));
+            assert!(
+                interrupt
+                    .pending_final_release
+                    .replace(final_release)
+                    .is_none()
+            );
+            return Ok(InterruptFinalization {
+                state: InterruptFinalizationState::Deferred,
+                #[cfg(deepwyrm_dw1d_evidence)]
+                binding,
+                #[cfg(deepwyrm_dw1d_evidence)]
+                parent_descriptor: interrupt.parent_descriptor,
+            });
+        }
+
+        let finalized_interrupt =
+            take_finalized_interrupt(&self.interrupts, final_release.id(), binding);
         let parent = finalized_interrupt.parent;
         #[cfg(deepwyrm_dw1d_evidence)]
         let parent_descriptor = finalized_interrupt.parent_descriptor;
         Ok(InterruptFinalization {
-            final_release,
-            parent,
+            state: InterruptFinalizationState::Ready {
+                final_release,
+                parent,
+            },
             #[cfg(deepwyrm_dw1d_evidence)]
             binding,
             #[cfg(deepwyrm_dw1d_evidence)]
             parent_descriptor,
         })
     }
+
+    fn retry_deferred_finalization(
+        &self,
+        platform: &dyn InterruptPlatform,
+    ) -> Option<InterruptFinalization> {
+        let (object, binding) = self
+            .interrupts
+            .lock()
+            .iter()
+            .flatten()
+            .find_map(|interrupt| {
+                (matches!(interrupt.state, InterruptState::Finalizing)
+                    && interrupt.pending_final_release.is_some())
+                .then_some((interrupt.object, interrupt.binding))
+            })?;
+        if platform.retire_source(binding) == InterruptRetirement::Deferred {
+            return None;
+        }
+        let finalized_interrupt = take_finalized_interrupt(&self.interrupts, object, binding);
+        let final_release = finalized_interrupt
+            .pending_final_release
+            .expect("ready deferred Interrupt retained its exact final release");
+        let parent = finalized_interrupt.parent;
+        #[cfg(deepwyrm_dw1d_evidence)]
+        let parent_descriptor = finalized_interrupt.parent_descriptor;
+        Some(InterruptFinalization {
+            state: InterruptFinalizationState::Ready {
+                final_release,
+                parent,
+            },
+            #[cfg(deepwyrm_dw1d_evidence)]
+            binding,
+            #[cfg(deepwyrm_dw1d_evidence)]
+            parent_descriptor,
+        })
+    }
+}
+
+fn take_finalized_interrupt<const INTERRUPTS: usize>(
+    interrupts: &IrqSpinMutex<[Option<InterruptRecord>; INTERRUPTS]>,
+    object: ObjectId,
+    binding: InterruptBinding,
+) -> InterruptRecord {
+    let mut interrupts = interrupts.lock();
+    let slot = interrupts
+        .iter_mut()
+        .find(|slot| {
+            slot.as_ref().is_some_and(|interrupt| {
+                interrupt.object == object
+                    && interrupt.binding == binding
+                    && matches!(interrupt.state, InterruptState::Finalizing)
+            })
+        })
+        .unwrap_or_else(|| panic!("Interrupt finalization lost its exact typed record"));
+    slot.take()
+        .expect("validated Interrupt finalization slot remains populated")
 }
 
 #[must_use = "Interrupt wait outcomes retain one exact generic pin"]
@@ -921,29 +1051,24 @@ impl InterruptAckTransaction {
         platform: &dyn InterruptPlatform,
     ) -> Result<Option<FinalRelease>, DwStatus> {
         if let InterruptAckOperation::Rearm { object, binding } = self.operation {
-            if let Err(error) = platform
-                .acknowledge_source(binding)
-                .and_then(|()| platform.unmask_or_rearm(binding))
-            {
-                interrupts.restore_pending_after_platform_failure(object, binding);
-                let release = registry
-                    .release_internal(self.pin)
-                    .unwrap_or_else(|failure| {
-                        panic!(
-                            "failed Interrupt ack lost its operation pin: {:?}",
-                            failure.error()
-                        )
-                    });
-                assert!(release.is_none(), "failed ack unexpectedly became final");
-                return Err(platform_status(error));
-            }
-            interrupts.finish_ack(object, binding);
-            if interrupts
-                .current_signals_for_object(object)
-                .is_some_and(|signals| signals == DW_SIGNAL_SIGNALED)
-            {
-                platform.mask_source(binding);
-            }
+            let ack = match platform.acknowledge_source(binding) {
+                Ok(ack) => ack,
+                Err(error) => {
+                    interrupts.restore_pending_after_platform_failure(object, binding);
+                    let release = registry
+                        .release_internal(self.pin)
+                        .unwrap_or_else(|failure| {
+                            panic!(
+                                "failed Interrupt ack lost its operation pin: {:?}",
+                                failure.error()
+                            )
+                        });
+                    assert!(release.is_none(), "failed ack unexpectedly became final");
+                    return Err(platform_status(error));
+                }
+            };
+            let outcome = interrupts.finish_ack(object, binding);
+            platform.complete_ack(ack, outcome);
         }
         registry.release_internal(self.pin).map_err(|failure| {
             panic!(
@@ -959,22 +1084,6 @@ impl InterruptAckTransaction {
             InterruptAckOperation::Coalesced => None,
             InterruptAckOperation::Rearm { binding, .. } => Some(binding),
         }
-    }
-}
-
-impl<const INTERRUPTS: usize> InterruptAuthority<INTERRUPTS> {
-    fn current_signals_for_object(&self, object: ObjectId) -> Option<DwSignals> {
-        self.interrupts
-            .lock()
-            .iter()
-            .flatten()
-            .find(|interrupt| interrupt.object == object)
-            .map(|interrupt| match interrupt.state {
-                InterruptState::Pending { .. } | InterruptState::AckPrepared { .. } => {
-                    DW_SIGNAL_SIGNALED
-                }
-                _ => DwSignals(0),
-            })
     }
 }
 
@@ -1089,50 +1198,24 @@ pub(crate) fn interrupt_create<
             failure.error()
         )
     });
-    // The destination, object, typed payload, rights, and source reservation
-    // have all been validated. Commit the exact source at this no-fail point,
-    // then publish the already-guaranteed handle so no userspace-visible
-    // Interrupt can observe Creating or an unarmed platform source.
+    // Every fallible destination/object/typed/reference step completed while
+    // the platform reservation remained masked. Publish the exact typed Armed
+    // state first, then perform the platform's no-fail commit/unmask. A real
+    // edge at any later boundary therefore finds an exact deliverable object.
+    // The owned destination permit, compatible rights, and same-table mutable
+    // borrow make the final handle publication no-fail; treating drift as a
+    // kernel invariant avoids an unsafe post-unmask rollback path.
+    interrupts.commit_armed(key, binding);
     let committed = platform.commit_source(source_reservation);
-    interrupts.commit_armed(key, committed);
-    let published = match destination.try_publish_reference(table, reference, requested_rights) {
-        Ok(published) => published,
-        Err(failure) => {
-            let error = failure.error();
-            let final_release = registry
-                .release_handle(failure.into_reference())
-                .unwrap_or_else(|release| {
-                    panic!(
-                        "Interrupt publication rollback lost generic authority: {:?}",
-                        release.error()
-                    )
-                })
-                .expect("unpublished Interrupt owns its only generic reference");
-            let (cleanup, parent) =
-                interrupts
-                    .cancel_unpublished(final_release)
-                    .unwrap_or_else(|(typed, _)| {
-                        panic!("Interrupt publication rollback lost typed authority: {typed:?}")
-                    });
-            registry
-                .complete_payload_finalization(cleanup)
-                .unwrap_or_else(|failure| {
-                    panic!(
-                        "Interrupt publication rollback lost finalization authority: {:?}",
-                        failure.error()
-                    )
-                });
-            release_parent_pin_exact(registry, parent);
-            platform.mask_source(committed);
-            platform.release_source(committed);
-            destination.cancel(table).unwrap_or_else(|rollback| {
-                panic!(
-                    "Interrupt destination rollback drifted after publication failure: {rollback:?}"
-                )
-            });
-            return Err(InterruptCreateError::Publication(error));
-        }
-    };
+    assert_eq!(committed, binding, "platform commit changed exact binding");
+    let published = destination
+        .try_publish_reference(table, reference, requested_rights)
+        .unwrap_or_else(|failure| {
+            panic!(
+                "validated Interrupt destination drifted after no-fail route commit: {:?}",
+                failure.error()
+            )
+        });
     Ok((key, published.handle))
 }
 
@@ -1178,18 +1261,21 @@ pub(crate) fn complete_interrupt_finalization<const OBJECTS: usize>(
     registry: &mut ObjectRegistry<OBJECTS>,
     finalization: InterruptFinalization,
 ) -> Option<FinalRelease> {
-    let parent_release = registry
-        .release_internal(finalization.parent)
-        .unwrap_or_else(|failure| {
-            panic!(
-                "Interrupt finalization lost its parent DeviceResource pin: {:?}",
-                failure.error()
-            )
-        });
+    let InterruptFinalizationState::Ready {
+        final_release,
+        parent,
+    } = finalization.state
+    else {
+        return None;
+    };
+    let parent_release = registry.release_internal(parent).unwrap_or_else(|failure| {
+        panic!(
+            "Interrupt finalization lost its parent DeviceResource pin: {:?}",
+            failure.error()
+        )
+    });
     registry
-        .complete_payload_finalization(InterruptCleanup {
-            final_release: finalization.final_release,
-        })
+        .complete_payload_finalization(InterruptCleanup { final_release })
         .unwrap_or_else(|failure| {
             panic!(
                 "generic Interrupt finalization became invalid after typed cleanup: {:?}",
