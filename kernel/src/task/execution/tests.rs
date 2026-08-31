@@ -265,6 +265,73 @@ fn authorized_process_termination_waits_for_exact_remote_stop_ack() {
 }
 
 #[test]
+fn remote_stop_completion_retires_exact_suspended_physical_current() {
+    let (
+        mut registry,
+        mut tasks,
+        root_owner,
+        process_handle,
+        process,
+        current,
+        current_handle,
+        remote,
+        remote_handle,
+    ) = two_thread_process_fixture();
+    let domain = ExecutionDomain::<2>::new(stack_bounds::<2>()).unwrap();
+    let cpu0 = SchedulerCpuId::BOOTSTRAP;
+    let cpu1 = SchedulerCpuId::new(1).unwrap();
+    domain
+        .start_thread_on(cpu0, &mut tasks, current, start_state(84))
+        .unwrap();
+    domain
+        .start_thread_on(cpu1, &mut tasks, remote, start_state(85))
+        .unwrap();
+    assert_eq!(
+        domain.schedule_next_on(cpu0).unwrap().current,
+        Some(current)
+    );
+    assert_eq!(domain.schedule_next_on(cpu1).unwrap().current, Some(remote));
+
+    let effects = tasks
+        .terminate_process_authorized(&mut registry, process, 0x708)
+        .unwrap();
+    let current_claim = domain.running_claim_on(cpu0).unwrap();
+    assert_eq!(domain.stop_running_claim_on(current_claim), Ok(None));
+    assert_eq!(domain.running_claim_on(cpu0), None);
+    assert_eq!(domain.suspended_claim_on(cpu0), Some(current_claim));
+
+    let remote_claim = domain.running_claim_on(cpu1).unwrap();
+    assert_eq!(domain.stop_running_claim_on(remote_claim), Ok(None));
+    domain
+        .complete_switch_on(domain.suspended_claim_on(cpu1).unwrap())
+        .unwrap();
+
+    let (retired, deferred) = domain.retire_exit_pins_defer_current_after_remote_stops_on(
+        cpu0,
+        effects.pins,
+        current,
+        &[Some(remote)],
+    );
+    assert_eq!(domain.suspended_claim_on(cpu0).unwrap().thread(), current);
+    let deferred_pins = domain.reclaim_deferred_current_on(cpu0, deferred);
+    assert_eq!(domain.scheduler_state(current), None);
+    assert_eq!(domain.scheduler_state(remote), None);
+
+    let (process_pin, thread_pins) = retired.into_parts();
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        assert!(registry.release_internal(pin).unwrap().is_none());
+    }
+    let (process_pin, thread_pins) = deferred_pins.into_parts();
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        assert!(registry.release_internal(pin).unwrap().is_none());
+    }
+    for reference in [current_handle, remote_handle, process_handle] {
+        let _ = registry.release_handle(reference).unwrap();
+    }
+    let _ = registry.release_internal(root_owner).unwrap();
+}
+
+#[test]
 fn stack_pool_rejects_overlap_and_stale_ids() {
     let valid = stack_bounds::<2>();
     let mut overlap = valid;

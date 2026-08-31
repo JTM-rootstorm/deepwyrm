@@ -1151,6 +1151,43 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         runtime.commit_scheduler_root_switch(executed);
     }
 
+    /// Reconciles the logical scheduler root after acknowledged remote Stops.
+    /// The local syscall continuation may already be the exact unpublished
+    /// suspended owner while its logical Running slot is empty. In that case
+    /// the active Process root is still authoritative until terminal
+    /// retirement installs the divergent handoff token.
+    fn synchronize_scheduler_current_after_remote_stops_detached(&mut self) {
+        let has_logical_current = {
+            let mut runtime = self.runtime.lock();
+            runtime.switch_cpu(self.cpu);
+            if runtime
+                .shared
+                .execution
+                .current_thread_on(self.cpu)
+                .is_some()
+            {
+                true
+            } else {
+                let suspended = runtime
+                    .shared
+                    .execution
+                    .suspended_claim_on(self.cpu)
+                    .unwrap_or_else(|| {
+                        panic!("remote-stop completion lost its physical scheduler claim")
+                    });
+                assert_eq!(
+                    suspended.thread(),
+                    runtime.thread,
+                    "remote-stop completion retained another physical scheduler claim"
+                );
+                false
+            }
+        };
+        if has_logical_current {
+            self.synchronize_scheduler_current_detached();
+        }
+    }
+
     /// Synchronizes the scheduler-current root without crossing an already
     /// published remote Stop. Terminal preparation deliberately moves a
     /// remote current's execution resources while retaining its scheduler
@@ -1299,7 +1336,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
         };
         let permits = await_remote_stop_permits(pending.deferred);
-        self.synchronize_scheduler_current_detached();
+        self.synchronize_scheduler_current_after_remote_stops_detached();
         let result = {
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);
@@ -7184,7 +7221,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         let result = match pending {
             PendingRemoteTermination::Process(pending) => {
                 let permits = await_remote_stop_permits(pending.deferred);
-                self.synchronize_scheduler_current_detached();
+                self.synchronize_scheduler_current_after_remote_stops_detached();
                 {
                     let mut runtime = self.runtime.lock();
                     runtime.switch_cpu(self.cpu);
@@ -7193,7 +7230,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             }
             PendingRemoteTermination::TaskGroup(pending) => {
                 let permits = await_remote_stop_permits(pending.deferred);
-                self.synchronize_scheduler_current_detached();
+                self.synchronize_scheduler_current_after_remote_stops_detached();
                 {
                     let mut runtime = self.runtime.lock();
                     runtime.switch_cpu(self.cpu);
@@ -7206,7 +7243,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             }
             PendingRemoteTermination::Thread(pending) => {
                 let permits = await_remote_stop_permits(pending.deferred);
-                self.synchronize_scheduler_current_detached();
+                self.synchronize_scheduler_current_after_remote_stops_detached();
                 {
                     let mut runtime = self.runtime.lock();
                     runtime.switch_cpu(self.cpu);

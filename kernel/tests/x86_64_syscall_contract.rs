@@ -701,7 +701,7 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
         .find("await_remote_stop_permits(pending.deferred)")
         .expect("remote terminal acknowledgement wait");
     let remote_final_sync = remote_terminal
-        .rfind("self.synchronize_scheduler_current_detached();")
+        .rfind("self.synchronize_scheduler_current_after_remote_stops_detached();")
         .expect("remote terminal post-acknowledgement synchronization");
     let remote_complete = remote_terminal
         .find("runtime.complete_process_termination(")

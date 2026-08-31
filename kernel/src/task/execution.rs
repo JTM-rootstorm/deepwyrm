@@ -1642,12 +1642,13 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         remote_stopped: &[Option<ThreadKey>],
         pre_retired: &mut [Option<ThreadKey>; THREADS],
     ) -> (RetiredExitPins<THREADS>, DeferredCurrentExecutionResources) {
+        let terminal_threads = pins.thread_keys();
         assert_eq!(
-            self.scheduler.current_on(cpu),
+            self.terminal_physical_claim_on(cpu, &terminal_threads)
+                .map(|claim| claim.thread()),
             Some(current),
             "deferred terminal retirement did not name the physical current Thread"
         );
-        let terminal_threads = pins.thread_keys();
         assert!(
             terminal_threads.contains(&Some(current)),
             "deferred terminal retirement batch did not contain the physical current Thread"
@@ -1713,6 +1714,11 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                 );
                 let scheduled = self.scheduler.state(thread).is_some();
                 let acknowledged_remote_stop = remote_stopped.contains(&Some(thread));
+                let suspended_physical_current = defer_current == Some(thread)
+                    && self
+                        .scheduler
+                        .suspended_claim_on(cpu)
+                        .is_some_and(|claim| claim.thread() == thread);
                 let scheduler_pre_retired = if let Some(index) = pre_retired
                     .iter()
                     .position(|candidate| *candidate == Some(thread))
@@ -1724,12 +1730,16 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                 };
                 assert!(
                     resources.is_some()
-                        == (scheduled || acknowledged_remote_stop || scheduler_pre_retired),
+                        == (scheduled
+                            || acknowledged_remote_stop
+                            || suspended_physical_current
+                            || scheduler_pre_retired),
                     "scheduler/resource/remote-stop/pre-retirement ownership diverged at terminal retirement"
                 );
                 assert!(
                     usize::from(scheduled)
                         + usize::from(acknowledged_remote_stop)
+                        + usize::from(suspended_physical_current)
                         + usize::from(scheduler_pre_retired)
                         <= 1,
                     "terminal Thread retained multiple scheduler retirement authorities"
