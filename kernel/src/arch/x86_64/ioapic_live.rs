@@ -31,6 +31,8 @@ const IOAPIC_REG_ID: u32 = 0x00;
 const IOAPIC_REG_VERSION: u32 = 0x01;
 const IOAPIC_REG_REDIR_BASE: u32 = 0x10;
 const IOAPIC_REDIR_MASK: u32 = 1 << 16;
+const IOAPIC_MAX_SELECTOR: u32 = 0xff;
+const IOAPIC_MAX_REDIRECTION_ENTRIES: u32 = 120;
 const SLOT_EMPTY: u8 = 0;
 const SLOT_PUBLISHING: u8 = 1;
 const SLOT_READY: u8 = 2;
@@ -41,6 +43,7 @@ pub(crate) enum LiveIoApicError {
     Mapping,
     InvalidMmioBase,
     InvalidRegisterOffset,
+    InvalidRegisterSelector(u32),
     ControllerId {
         expected: u8,
         observed: u8,
@@ -268,6 +271,9 @@ fn selected_redirection_low_register(
     gsi_base: u32,
     redirection_entries: u32,
 ) -> Result<u32, LiveIoApicError> {
+    if redirection_entries == 0 || redirection_entries > IOAPIC_MAX_REDIRECTION_ENTRIES {
+        return Err(LiveIoApicError::InvalidCapacity);
+    }
     let index = gsi
         .checked_sub(gsi_base)
         .ok_or(LiveIoApicError::SelectedGsiOutsideController {
@@ -285,6 +291,7 @@ fn selected_redirection_low_register(
     index
         .checked_mul(2)
         .and_then(|offset| IOAPIC_REG_REDIR_BASE.checked_add(offset))
+        .filter(|register| *register <= IOAPIC_MAX_SELECTOR)
         .ok_or(LiveIoApicError::RedirectionRegisterOverflow)
 }
 
@@ -357,6 +364,7 @@ impl LiveIoApicMmio {
         reason = "the E2A UC/NX IOAPIC mapping permits only aligned volatile IOREGSEL/IOWIN u32 transactions"
     )]
     pub(crate) fn read_register(&mut self, register: u32) -> Result<u32, LiveIoApicError> {
+        validate_register_selector(register)?;
         let selector = self.address(IOREGSEL)?;
         let window = self.address(IOWIN)?;
         unsafe {
@@ -374,6 +382,7 @@ impl LiveIoApicMmio {
         register: u32,
         value: u32,
     ) -> Result<(), LiveIoApicError> {
+        validate_register_selector(register)?;
         let selector = self.address(IOREGSEL)?;
         let window = self.address(IOWIN)?;
         unsafe {
@@ -409,7 +418,7 @@ fn decode_probe(
     if revision == 0 {
         return Err(LiveIoApicError::InvalidVersion);
     }
-    if redirection_entries == 0 {
+    if redirection_entries == 0 || redirection_entries > IOAPIC_MAX_REDIRECTION_ENTRIES {
         return Err(LiveIoApicError::InvalidCapacity);
     }
     Ok(LiveIoApicProbe {
@@ -417,6 +426,13 @@ fn decode_probe(
         version: revision,
         redirection_entries,
     })
+}
+
+fn validate_register_selector(register: u32) -> Result<(), LiveIoApicError> {
+    if register > IOAPIC_MAX_SELECTOR {
+        return Err(LiveIoApicError::InvalidRegisterSelector(register));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -445,6 +461,41 @@ mod tests {
                 expected: 2,
                 observed: 3,
             })
+        );
+    }
+
+    #[test]
+    fn probe_accepts_the_largest_selector_representable_redirection_table() {
+        let descriptor = IoApicDescriptor::test_descriptor(2, 0xfec0_0000, 0);
+        assert_eq!(
+            decode_probe(descriptor, 2 << 24, 0x0077_0011),
+            Ok(LiveIoApicProbe {
+                id: 2,
+                version: 0x11,
+                redirection_entries: 120,
+            })
+        );
+    }
+
+    #[test]
+    fn probe_rejects_a_redirection_table_beyond_the_selector_width() {
+        let descriptor = IoApicDescriptor::test_descriptor(2, 0xfec0_0000, 0);
+        assert_eq!(
+            decode_probe(descriptor, 2 << 24, 0x0078_0011),
+            Err(LiveIoApicError::InvalidCapacity)
+        );
+    }
+
+    #[test]
+    fn selector_validation_accepts_the_eight_bit_upper_bound() {
+        assert_eq!(validate_register_selector(0xff), Ok(()));
+    }
+
+    #[test]
+    fn selector_validation_rejects_reserved_selector_bits() {
+        assert_eq!(
+            validate_register_selector(0x100),
+            Err(LiveIoApicError::InvalidRegisterSelector(0x100))
         );
     }
 

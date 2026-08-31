@@ -27,6 +27,12 @@ the selected redirection low-register index from checked `GSI - GSI base`
 arithmetic, reads it through that serialized owner, and rejects the platform
 unless the existing mask bit is set.
 
+IOREGSEL is an 8-bit selector. E2A admits only one through 120 redirection
+entries: the final 120th entry occupies selectors `0xfe` and `0xff`. It rejects
+a reported 121st entry and any read/write selector above `0xff` before volatile
+MMIO, so malformed capacity facts cannot set reserved selector bits or alias a
+different register.
+
 No redirection entry is written in E2A. Therefore a validated route remains
 whatever masked firmware/default state E2A observed; E2C alone owns reserve,
 route programming, unmask, acknowledgement, quarantine, and final release.
@@ -60,7 +66,7 @@ The lane used separate pinned host/target directories:
 
 | Command | Result |
 | --- | --- |
-| `tools/pinned-cargo host test -p deepwyrm-kernel --lib` | 779 passed. |
+| `tools/pinned-cargo host test -p deepwyrm-kernel --lib` | 783 passed. |
 | `tools/pinned-cargo host clippy -p deepwyrm-kernel --lib --tests -- -D warnings` | passed. |
 | `tools/pinned-cargo host fmt --all -- --check` | passed. |
 | `tools/pinned-cargo target check -p deepwyrm-kernel` | passed. |
