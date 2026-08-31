@@ -23,9 +23,12 @@ claiming q35 controller ownership or a userspace `Interrupt` transition.
   timer pre-IRET scheduler gate.
 - E2C receives one immutable, one-shot q35 dispatch binding. The entry calls
   it with IF clear, then uses the current CPU's already-published local-APIC
-  transport for EOI. An unexpected delivery without a bound handler wakes no
-  userspace but is still EOIed; failed EOI stops rather than returning with an
-  in-service interrupt.
+  transport for EOI. The pre-EOI handler returns only an opaque,
+  generation-bound scalar completion token; its exact post-EOI callback runs
+  only after a successful EOI, allowing E2C to close in-handler accounting
+  without retaining the frame. An unexpected delivery without a bound handler
+  has no completion, wakes no userspace, and is still EOIed; failed EOI stops
+  rather than returning with an in-service interrupt.
 
 The exact E2 dispatch order is therefore:
 
@@ -33,6 +36,7 @@ The exact E2 dispatch order is therefore:
 ephemeral returning frame
   -> E2C exact q35 binding snapshot/delivery/WakeBatch publication
   -> local-APIC EOI
+  -> E2C exact generation completion / in-handler decrement
   -> restore same frame / iretq
 ```
 
@@ -49,7 +53,7 @@ All commands use lane-local pinned target directories.
 | --- | --- |
 | `tools/pinned-cargo host fmt --all -- --check` | passed |
 | `tools/pinned-cargo host test -p deepwyrm-kernel arch::x86_64::idt::tests --lib` | 7 passed |
-| `tools/pinned-cargo host test -p deepwyrm-kernel arch::x86_64::external_interrupt::tests --lib` | 1 passed |
+| `tools/pinned-cargo host test -p deepwyrm-kernel arch::x86_64::external_interrupt::tests --lib` | 1 passed; unbound EOI and pre-handler -> EOI -> post-completion ordering |
 | `tools/pinned-cargo host test -p deepwyrm-kernel arch::x86_64::ipi::tests --lib` | 2 passed |
 | `tools/pinned-cargo target check -p deepwyrm-kernel` | passed; assembles the returning entry |
 | `RUSTFLAGS=--cfg=deepwyrm_dw1e_platform tools/pinned-cargo target check -p deepwyrm-kernel` | passed; type-checks the selected IDT shape without making reserved selector 31 runnable |
@@ -79,5 +83,6 @@ E2B does not claim IOAPIC mapping/probe, MADT live consumption, q35 route
 installation, `InterruptPlatform` lifecycle, an `Interrupt` pending
 transition, WakeBatch behavior, stale/orphan diagnostics, IRR/ISR proof,
 selector-31 actor/evidence, UART initialization, VM acceptance, or a complete
-UART driver. E2C consumes `Q35ExternalInterruptHandler` and must bind it before
-unmasking the exact validated q35 route.
+UART driver. E2C consumes `Q35ExternalInterruptHandler`, returns one
+`Q35ExternalInterruptCompletion` for every accepted exact snapshot, and must
+bind it before unmasking the exact validated q35 route.

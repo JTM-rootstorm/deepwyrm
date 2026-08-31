@@ -18,9 +18,47 @@ const BOUND: u8 = 2;
 ///
 /// The implementation must perform its bounded source snapshot, logical
 /// delivery, and IRQ-safe wake publication before returning. It must not
-/// retain the assembly frame or call finalization/object-registry paths.
+/// retain the assembly frame or call finalization/object-registry paths. Its
+/// returned completion retains only a generation-bound scalar token and runs
+/// immediately after successful local-APIC EOI.
 pub(crate) trait Q35ExternalInterruptHandler: Sync {
-    fn handle_q35_com2_interrupt(&self);
+    fn handle_q35_com2_interrupt(&self) -> Q35ExternalInterruptCompletion;
+}
+
+/// One bounded post-EOI action for the exact source snapshot accepted by an
+/// external-vector handler.
+///
+/// E2C uses this to decrement its generation-bound in-handler accounting only
+/// after EOI. The entry keeps neither the interrupted assembly frame nor any
+/// object reference across the EOI boundary.
+#[derive(Clone, Copy)]
+pub(crate) struct Q35ExternalInterruptCompletion {
+    token: u64,
+    complete: Option<fn(u64)>,
+}
+
+impl Q35ExternalInterruptCompletion {
+    /// Represents an unbound/stale path with no in-handler snapshot to close.
+    pub(crate) const fn none() -> Self {
+        Self {
+            token: 0,
+            complete: None,
+        }
+    }
+
+    /// Creates the completion for one exact E2C source/generation snapshot.
+    pub(crate) const fn generation_bound(token: u64, complete: fn(u64)) -> Self {
+        Self {
+            token,
+            complete: Some(complete),
+        }
+    }
+
+    fn complete_after_eoi(self) {
+        if let Some(complete) = self.complete {
+            complete(self.token);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,7 +69,7 @@ pub(crate) enum Q35ExternalInterruptBindError {
 #[derive(Clone, Copy)]
 struct HandlerBinding {
     context: *const (),
-    dispatch: unsafe fn(*const ()),
+    dispatch: unsafe fn(*const ()) -> Q35ExternalInterruptCompletion,
 }
 
 #[allow(
@@ -102,25 +140,37 @@ pub(crate) fn bind_q35_external_interrupt_handler<T: Q35ExternalInterruptHandler
     unsafe_code,
     reason = "the context was erased together with the matching shared-reference dispatch trampoline"
 )]
-unsafe fn dispatch_handler<T: Q35ExternalInterruptHandler>(context: *const ()) {
+unsafe fn dispatch_handler<T: Q35ExternalInterruptHandler>(
+    context: *const (),
+) -> Q35ExternalInterruptCompletion {
     let handler = unsafe { &*context.cast::<T>() };
-    handler.handle_q35_com2_interrupt();
+    handler.handle_q35_com2_interrupt()
 }
 
 /// Performs the bounded E2B order: optional exact platform dispatch, then
 /// local-APIC EOI. An absent binding is an unexpected/masked-source delivery;
 /// it wakes no userspace and is still EOIed before return.
-fn dispatch_and_eoi() -> bool {
-    if let Some(handler) = HANDLER.get() {
+fn dispatch_and_eoi_with(eoi: impl FnOnce() -> bool) -> bool {
+    let completion = if let Some(handler) = HANDLER.get() {
         #[allow(
             unsafe_code,
             reason = "the immutable binding pairs its static context with the matching dispatch trampoline"
         )]
         unsafe {
-            (handler.dispatch)(handler.context);
+            (handler.dispatch)(handler.context)
         }
+    } else {
+        Q35ExternalInterruptCompletion::none()
+    };
+    if !eoi() {
+        return false;
     }
-    end_current_live_interrupt()
+    completion.complete_after_eoi();
+    true
+}
+
+fn dispatch_and_eoi() -> bool {
+    dispatch_and_eoi_with(end_current_live_interrupt)
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -153,30 +203,39 @@ mod tests {
     use super::*;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    static PRE_EOI_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EOI_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static POST_EOI_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static LAST_TOKEN: AtomicUsize = AtomicUsize::new(0);
 
     struct MockHandler;
 
     impl Q35ExternalInterruptHandler for MockHandler {
-        fn handle_q35_com2_interrupt(&self) {
-            CALLS.fetch_add(1, Ordering::Relaxed);
+        fn handle_q35_com2_interrupt(&self) -> Q35ExternalInterruptCompletion {
+            assert_eq!(EOI_CALLS.load(Ordering::Relaxed), 1);
+            PRE_EOI_CALLS.fetch_add(1, Ordering::Relaxed);
+            Q35ExternalInterruptCompletion::generation_bound(0x31, complete_mock_snapshot)
         }
     }
 
     static MOCK_HANDLER: MockHandler = MockHandler;
 
-    #[allow(
-        unsafe_code,
-        reason = "the test exercises the same erased immutable dispatch trampoline without target-only LAPIC EOI"
-    )]
-    fn invoke_bound_handler_for_test() {
-        let binding = HANDLER.get().unwrap();
-        unsafe { (binding.dispatch)(binding.context) };
+    fn complete_mock_snapshot(token: u64) {
+        assert_eq!(EOI_CALLS.load(Ordering::Relaxed), 2);
+        LAST_TOKEN.store(token as usize, Ordering::Relaxed);
+        POST_EOI_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
     #[test]
-    fn handler_binding_is_exactly_once_before_route_unmask() {
+    fn handler_binding_and_completion_are_exactly_once_and_post_eoi() {
         assert!(HANDLER.get().is_none());
+        assert!(dispatch_and_eoi_with(|| {
+            EOI_CALLS.fetch_add(1, Ordering::Relaxed);
+            true
+        }));
+        assert_eq!(PRE_EOI_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(POST_EOI_CALLS.load(Ordering::Relaxed), 0);
+
         bind_q35_external_interrupt_handler(&MOCK_HANDLER).unwrap();
         assert!(HANDLER.get().is_some());
         assert_eq!(
@@ -184,7 +243,13 @@ mod tests {
             Err(Q35ExternalInterruptBindError::AlreadyBindingOrBound)
         );
 
-        invoke_bound_handler_for_test();
-        assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+        assert!(dispatch_and_eoi_with(|| {
+            assert_eq!(PRE_EOI_CALLS.load(Ordering::Relaxed), 1);
+            assert_eq!(POST_EOI_CALLS.load(Ordering::Relaxed), 0);
+            EOI_CALLS.fetch_add(1, Ordering::Relaxed);
+            true
+        }));
+        assert_eq!(POST_EOI_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(LAST_TOKEN.load(Ordering::Relaxed), 0x31);
     }
 }
