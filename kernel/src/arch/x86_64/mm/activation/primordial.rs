@@ -1181,9 +1181,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     );
                     None
                 }
-                None => Some(runtime.prepare_scheduler_root_switch().unwrap_or_else(|| {
-                    panic!("remote-stop completion lost its physical scheduler claim")
-                })),
+                None => runtime.prepare_scheduler_root_switch(),
             }
         };
         self.finish_scheduler_root_switch_detached(prepared);

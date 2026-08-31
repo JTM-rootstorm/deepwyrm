@@ -763,6 +763,8 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
         .unwrap();
     assert!(suspended < physical && physical < prepare);
     assert!(!post_ack_helper.contains("current_thread_on(self.cpu)"));
+    assert!(post_ack_helper.contains("None => runtime.prepare_scheduler_root_switch(),"));
+    assert!(!post_ack_helper.contains("lost its physical scheduler claim"));
 }
 
 #[test]
