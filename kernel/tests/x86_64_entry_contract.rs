@@ -333,7 +333,9 @@ fn selector27_private_wrb1_relay_is_exact_and_outside_public_abi() {
 
     assert!(build.contains("selector == \"bootstrap-registry-launch\""));
     assert!(build.contains("cargo:rustc-cfg=deepwyrm_wyr1b_evidence"));
-    assert!(support.contains("#[cfg(any(test, deepwyrm_wyr1b_evidence))]\nmod wyr1b_evidence;"));
+    assert!(support.contains(
+        "#[cfg(any(test, deepwyrm_wyr1b_evidence, deepwyrm_wyr1c_evidence))]\nmod wyr1b_evidence;"
+    ));
     assert!(evidence.contains("pub(crate) const WYR1B_EVIDENCE_RAW_SYSCALL: u32 = 0xffff_ff1b;"));
     assert!(evidence.contains("WYR1B_EVIDENCE_RECORD_LEN: usize = 96"));
     assert!(evidence.contains("WYR1B_EVIDENCE_RECORD_CAPACITY: usize = 14"));
@@ -625,7 +627,7 @@ fn wrcap_relay_is_selector_only_bounded_and_precedes_terminal_completion() {
     assert!(build.contains("cfg(deepwyrm_wrcap_relay)"));
     assert!(build.contains("selector == \"native-userspace-capability\""));
     assert!(support.contains(
-        "DWEVID1, WRCAP1, WYR1EVID1, DWPRE1, WRB1, and DWD6E1 terminal reporters are selector-exclusive"
+        "compile_error!(\"selector-specific terminal reporters are selector-exclusive\")"
     ));
     assert!(support.contains("#[cfg(any(test, deepwyrm_wrcap_relay))]\nmod wrcap;"));
     assert!(relay.contains("const WRCAP_RECORD_COUNT: usize = 15;"));
