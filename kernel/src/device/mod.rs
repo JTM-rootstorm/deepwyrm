@@ -12,19 +12,21 @@ pub(crate) use interrupt::InterruptPayloadBinding;
 )]
 pub(crate) use interrupt::{
     InterruptAckOutcome, InterruptAckTransaction, InterruptAuthority, InterruptCleanup,
-    InterruptCreateError, InterruptDeliveryDisposition, InterruptError, InterruptFinalization,
-    InterruptFinalizer, InterruptInfoProvider, InterruptKey, InterruptPlatform,
-    InterruptPlatformAck, InterruptPlatformError, InterruptPlatformModel, InterruptWaitFailure,
-    InterruptWaitOutcome, InterruptWaitSource, complete_interrupt_finalization, interrupt_ack,
-    interrupt_create, prepare_interrupt_ack,
+    InterruptCreateError, InterruptDelivery, InterruptDeliveryDisposition, InterruptError,
+    InterruptFinalization, InterruptFinalizer, InterruptInfoProvider, InterruptKey,
+    InterruptPlatform, InterruptPlatformAck, InterruptPlatformError, InterruptPlatformModel,
+    InterruptWaitFailure, InterruptWaitOutcome, InterruptWaitSource,
+    complete_interrupt_finalization, interrupt_ack, interrupt_create, prepare_interrupt_ack,
 };
 
-#[cfg(deepwyrm_dw1e_platform)]
+#[cfg(any(test, deepwyrm_dw1e_platform))]
 #[allow(
     unused_imports,
     reason = "the q35 live platform exports are consumed only by target activation"
 )]
-pub(crate) use q35_interrupt::{Q35DeliverySnapshot, Q35InterruptPlatform};
+pub(crate) use q35_interrupt::{
+    Q35DeliverySnapshot, Q35InterruptCounterSnapshot, Q35InterruptPlatform,
+};
 
 #[cfg(any(test, deepwyrm_dw1d_evidence, deepwyrm_dw1e_evidence))]
 #[allow(

@@ -7,9 +7,11 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(test)]
+use crate::arch::x86_64::acpi::IoApicRedirectionEntry;
 use crate::arch::x86_64::acpi::{
-    IoApicRedirectionEntry, IoApicRouteLifecycle, IoApicRouteState, PlatformIrqPolarity,
-    PlatformIrqRoute, PlatformIrqTrigger,
+    IoApicRouteLifecycle, IoApicRouteState, PlatformIrqPolarity, PlatformIrqRoute,
+    PlatformIrqTrigger,
 };
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 use crate::arch::x86_64::ioapic_live::{LiveIoApicError, ValidatedQ35IoApic};
@@ -61,9 +63,11 @@ impl Q35InterruptController for ValidatedQ35IoApic {
 
     fn program_and_verify(&self, masked: bool) -> Result<(), Q35ControllerError> {
         let (low_register, high_register) = selected_registers(self.route())?;
-        let bits =
-            IoApicRedirectionEntry::encode_q35_com2(masked, self.route().bsp_local_apic_id())
-                .bits();
+        let bits = crate::arch::x86_64::acpi::IoApicRedirectionEntry::encode_q35_com2(
+            masked,
+            self.route().bsp_local_apic_id(),
+        )
+        .bits();
         self.with_registers(|registers| {
             // The low dword is masked before destination programming, then is
             // the final publication write. Readback serializes completion.
@@ -113,8 +117,11 @@ impl Q35InterruptController for ValidatedQ35IoApic {
 
     fn revalidate_masked_idle(&self) -> Result<(), Q35ControllerError> {
         let (low_register, high_register) = selected_registers(self.route())?;
-        let expected =
-            IoApicRedirectionEntry::encode_q35_com2(true, self.route().bsp_local_apic_id()).bits();
+        let expected = crate::arch::x86_64::acpi::IoApicRedirectionEntry::encode_q35_com2(
+            true,
+            self.route().bsp_local_apic_id(),
+        )
+        .bits();
         self.with_registers(|registers| {
             let low = registers
                 .read_register(low_register)
@@ -231,6 +238,19 @@ pub(crate) struct Q35InterruptCounters {
     generation_replacements: AtomicU64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Q35InterruptCounterSnapshot {
+    pub(crate) physical_entries: u64,
+    pub(crate) exact_deliveries: u64,
+    pub(crate) pending_deliveries: u64,
+    pub(crate) acknowledgements: u64,
+    pub(crate) stale_orphans: u64,
+    pub(crate) route_masks: u64,
+    pub(crate) route_unmasks: u64,
+    pub(crate) final_releases: u64,
+    pub(crate) generation_replacements: u64,
+}
+
 impl Q35InterruptCounters {
     const fn new() -> Self {
         Self {
@@ -338,6 +358,29 @@ impl Q35InterruptPlatform {
         Q35InterruptCounters::increment(&self.counters.pending_deliveries);
     }
 
+    #[cfg(deepwyrm_dw1e_evidence)]
+    pub(crate) fn record_stale_delivery_replay(&self) {
+        Q35InterruptCounters::increment(&self.counters.stale_orphans);
+    }
+
+    #[cfg(any(test, deepwyrm_dw1e_evidence))]
+    pub(crate) fn counter_snapshot(&self) -> Q35InterruptCounterSnapshot {
+        Q35InterruptCounterSnapshot {
+            physical_entries: self.counters.physical_entries.load(Ordering::Relaxed),
+            exact_deliveries: self.counters.exact_deliveries.load(Ordering::Relaxed),
+            pending_deliveries: self.counters.pending_deliveries.load(Ordering::Relaxed),
+            acknowledgements: self.counters.acknowledgements.load(Ordering::Relaxed),
+            stale_orphans: self.counters.stale_orphans.load(Ordering::Relaxed),
+            route_masks: self.counters.route_masks.load(Ordering::Relaxed),
+            route_unmasks: self.counters.route_unmasks.load(Ordering::Relaxed),
+            final_releases: self.counters.final_releases.load(Ordering::Relaxed),
+            generation_replacements: self
+                .counters
+                .generation_replacements
+                .load(Ordering::Relaxed),
+        }
+    }
+
     pub(crate) fn complete_handler(&self, generation: u64) {
         let mut source = self.source.lock();
         assert_eq!(source.in_handler_generation, generation);
@@ -357,7 +400,7 @@ impl Q35InterruptPlatform {
         binding: InterruptBinding,
     ) -> Result<bool, Q35ControllerError> {
         validate_binding(self.domain, binding)?;
-        {
+        let began_retirement = {
             let mut source = self.source.lock();
             match source.lifecycle.state() {
                 IoApicRouteState::LiveUnmasked { generation }
@@ -367,13 +410,27 @@ impl Q35InterruptPlatform {
                         .lifecycle
                         .begin_retire(generation)
                         .map_err(|_| Q35ControllerError::RouteDrift)?;
+                    true
                 }
                 IoApicRouteState::Retiring { generation }
                 | IoApicRouteState::RetiringMasked { generation }
-                    if generation == binding.generation() => {}
+                    if generation == binding.generation() =>
+                {
+                    false
+                }
                 _ => return Err(Q35ControllerError::RouteDrift),
             }
+        };
+        #[cfg(all(deepwyrm_dw1e_evidence, target_os = "none"))]
+        if began_retirement {
+            crate::test_support::DW1E_EVIDENCE
+                .observe_retire_begin(binding)
+                .unwrap_or_else(|error| {
+                    panic!("selector-31 retirement-begin observation failed: {error:?}")
+                });
         }
+        #[cfg(not(all(deepwyrm_dw1e_evidence, target_os = "none")))]
+        let _ = began_retirement;
 
         if matches!(
             self.source.lock().lifecycle.state(),
@@ -389,7 +446,13 @@ impl Q35InterruptPlatform {
         }
 
         let mut idle = false;
-        for _ in 0..DELIVERY_STATUS_POLL_LIMIT {
+        #[cfg(all(deepwyrm_dw1e_evidence, target_os = "none"))]
+        let mut idle_reads = 0_u64;
+        for _attempt in 1..=DELIVERY_STATUS_POLL_LIMIT {
+            #[cfg(all(deepwyrm_dw1e_evidence, target_os = "none"))]
+            {
+                idle_reads = _attempt as u64;
+            }
             if self.controller.delivery_status_idle()? {
                 idle = true;
                 break;
@@ -398,9 +461,19 @@ impl Q35InterruptPlatform {
         if !idle {
             return Ok(false);
         }
+        #[cfg(all(deepwyrm_dw1e_evidence, target_os = "none"))]
+        crate::test_support::DW1E_EVIDENCE
+            .observe_route_masked(binding, idle_reads)
+            .unwrap_or_else(|error| panic!("selector-31 route-mask observation failed: {error:?}"));
         if self.source.lock().in_handler != 0 {
             return Ok(false);
         }
+        #[cfg(all(deepwyrm_dw1e_evidence, target_os = "none"))]
+        crate::test_support::DW1E_EVIDENCE
+            .observe_handler_quiescent(binding)
+            .unwrap_or_else(|error| {
+                panic!("selector-31 handler-quiescent observation failed: {error:?}")
+            });
         self.controller.revalidate_masked_idle()?;
         let request = {
             let mut source = self.source.lock();
@@ -439,6 +512,12 @@ impl Q35InterruptPlatform {
             return Ok(false);
         }
         self.controller.revalidate_masked_idle()?;
+        #[cfg(all(deepwyrm_dw1e_evidence, target_os = "none"))]
+        crate::test_support::DW1E_EVIDENCE
+            .observe_lapic_clear(binding)
+            .unwrap_or_else(|error| {
+                panic!("selector-31 LAPIC-clear observation failed: {error:?}")
+            });
         let mut source = self.source.lock();
         if source.in_handler != 0 || source.outstanding_request != Some(request) {
             return Ok(false);
@@ -449,6 +528,10 @@ impl Q35InterruptPlatform {
             .release(binding.generation())
             .map_err(|_| Q35ControllerError::RouteDrift)?;
         Q35InterruptCounters::increment(&self.counters.final_releases);
+        #[cfg(all(deepwyrm_dw1e_evidence, target_os = "none"))]
+        crate::test_support::DW1E_EVIDENCE
+            .observe_released(binding)
+            .unwrap_or_else(|error| panic!("selector-31 release observation failed: {error:?}"));
         Ok(true)
     }
 }
@@ -500,6 +583,7 @@ impl InterruptPlatform for Q35InterruptPlatform {
                 .expect("failed q35 reserve reprobe rolls back its exact generation");
             return Err(InterruptPlatformError::BadState);
         }
+        Q35InterruptCounters::increment(&self.counters.route_masks);
         if generation > 1 {
             Q35InterruptCounters::increment(&self.counters.generation_replacements);
         }

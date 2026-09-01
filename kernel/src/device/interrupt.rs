@@ -85,6 +85,11 @@ impl InterruptDelivery {
     pub(crate) const fn binding_for_evidence(self) -> InterruptBinding {
         self.binding
     }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(binding: InterruptBinding) -> Self {
+        Self { binding }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -1632,7 +1632,7 @@ impl crate::arch::x86_64::external_interrupt::Q35ExternalInterruptHandler
             } => {
                 #[cfg(deepwyrm_dw1e_evidence)]
                 crate::test_support::DW1E_EVIDENCE
-                    .observe_physical(delivery.binding_for_evidence())
+                    .observe_physical(delivery)
                     .unwrap_or_else(|error| {
                         panic!("selector-31 physical observation failed: {error:?}")
                     });
@@ -6604,7 +6604,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         &mut self,
         arguments: crate::syscall::RawSyscallArguments,
     ) -> NativeSyscallResult {
-        use crate::test_support::{DW1E_EVIDENCE, Dw1eRawOperation, EVENT_C1_RESPONSE};
+        use crate::test_support::{DW1E_EVIDENCE, Dw1eRawOperation};
 
         let operation = DW1E_EVIDENCE
             .decode_raw(arguments.as_array())
@@ -6765,16 +6765,40 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                     .unwrap_or_else(|error| {
                         crate::test_support::complete_fail(0x3110_e160 | error as u32)
                     });
-                if event == EVENT_C1_RESPONSE {
-                    let permit = DW1E_EVIDENCE.partial_permit().unwrap_or_else(|error| {
-                        crate::test_support::complete_fail(0x3110_e170 | error as u32)
-                    });
-                    self.commit_runtime_phase(phase);
-                    crate::test_support::flush_dw1e_e3a_partial(permit);
-                    return NativeSyscallResult::returning(DW_STATUS_SUCCESS);
-                }
                 self.commit_runtime_phase(phase);
                 NativeSyscallResult::returning(DW_STATUS_SUCCESS)
+            }
+            Dw1eRawOperation::TerminalClaim => {
+                let stale = DW1E_EVIDENCE
+                    .claim_terminal(self.process)
+                    .unwrap_or_else(|error| {
+                        crate::test_support::complete_fail(0x3110_e170 | error as u32)
+                    });
+                let (disposition, wakes) = self
+                    .shared
+                    .interrupts
+                    .deliver_classified(stale, &self.shared.waits);
+                let wake_count = wakes.len();
+                crate::wait::complete_irq_signal_wakes(&self.shared.execution, wakes);
+                if disposition != crate::device::InterruptDeliveryDisposition::Rejected
+                    || wake_count != 0
+                {
+                    crate::test_support::complete_fail(0x3110_e180)
+                }
+                self.shared
+                    .interrupt_platform
+                    .record_stale_delivery_replay();
+                let permit = DW1E_EVIDENCE
+                    .complete_stale_and_accounting(
+                        disposition,
+                        wake_count,
+                        self.shared.interrupt_platform.counter_snapshot(),
+                    )
+                    .unwrap_or_else(|error| {
+                        crate::test_support::complete_fail(0x3110_e190 | error as u32)
+                    });
+                self.commit_runtime_phase(phase);
+                crate::test_support::complete_dw1e_evidence(permit)
             }
         }
     }

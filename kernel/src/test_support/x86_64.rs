@@ -17,6 +17,7 @@ use crate::arch::x86_64::exceptions::{EarlyException, ExceptionVector};
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
     deepwyrm_dw1d_evidence,
+    deepwyrm_dw1e_evidence,
     deepwyrm_wyr1c_evidence
 ))]
 use crate::debug::TestSerialTransaction;
@@ -43,7 +44,7 @@ use super::Wyr1cEvidenceFlushError;
 #[cfg(deepwyrm_dw1b_evidence)]
 use super::dw1b_evidence::Dw1bEvidenceFlushPermit;
 #[cfg(deepwyrm_dw1e_evidence)]
-use super::{DW1E_E3A_READY_LEN, Dw1eEvidencePartialPermit};
+use super::{DW1E_E3A_READY_LEN, Dw1eEvidenceFullPermit, Dw1eEvidencePartialPermit};
 #[cfg(deepwyrm_i1_evidence)]
 use super::{EvidenceFlushError, I1_EVIDENCE};
 #[cfg(deepwyrm_wrcap_relay)]
@@ -87,6 +88,8 @@ const DW1D_TERMINAL_SUCCESS: u8 = 1;
 const DW1D_TERMINAL_FAILURE: u8 = 2;
 #[cfg(deepwyrm_dw1d_evidence)]
 static DW1D_TERMINAL_OWNER: AtomicU8 = AtomicU8::new(0);
+#[cfg(deepwyrm_dw1e_evidence)]
+static DW1E_TERMINAL_OWNER: AtomicU8 = AtomicU8::new(0);
 #[cfg(deepwyrm_wyr1c_evidence)]
 const WYR1C_TERMINAL_SUCCESS: u8 = 1;
 #[cfg(deepwyrm_wyr1c_evidence)]
@@ -143,6 +146,7 @@ struct QemuCompletionTransport {
         deepwyrm_wyr1b_evidence,
         deepwyrm_dw1c_evidence,
         deepwyrm_dw1d_evidence,
+        deepwyrm_dw1e_evidence,
         deepwyrm_wyr1c_evidence
     ))]
     transaction: Option<TestSerialTransaction>,
@@ -376,6 +380,40 @@ pub(crate) fn flush_dw1e_e3a_partial(permit: Dw1eEvidencePartialPermit<'_>) {
     {
         halt_after_completion()
     }
+}
+
+/// Selector 31 owns one uninterrupted transaction: all 26 DWE3E1 records,
+/// canonical `DWTEST1 31 0`, and the matching debug exit.
+#[cfg(deepwyrm_dw1e_evidence)]
+pub(crate) fn complete_dw1e_evidence(permit: Dw1eEvidenceFullPermit<'_>) -> ! {
+    if DW1E_TERMINAL_OWNER
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        halt_after_completion()
+    }
+    let mut transport = unsafe { QemuCompletionTransport::new() };
+    let Ok(transaction) = begin_test_serial_transaction() else {
+        halt_after_completion()
+    };
+    transport.transaction = Some(transaction);
+    if permit
+        .flush(|record| {
+            transport
+                .transaction
+                .as_mut()
+                .expect("DWE3E1 owns serial transaction")
+                .write_evidence(record)
+                .map_err(|_| ())
+        })
+        .is_err()
+    {
+        halt_after_completion()
+    }
+    complete(
+        &mut transport,
+        completion_record(CompletionOutcome::Pass, 0),
+    )
 }
 
 /// Selector 29 owns one uninterrupted transaction: all WRC6 records,
