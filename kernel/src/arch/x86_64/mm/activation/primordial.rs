@@ -7776,13 +7776,19 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         &mut self,
         arguments: crate::syscall::RawSyscallArguments,
     ) -> NativeSyscallResult {
-        self.with_synchronized_runtime_at_safe_point(|runtime| {
-            runtime.intercept_dw1e_evidence_raw(arguments)
-        })
-        .unwrap_or(NativeSyscallResult {
-            status: DW_STATUS_SUCCESS,
-            control: SyscallControl::ServiceRendezvous,
-        })
+        let result = self
+            .with_synchronized_runtime_at_safe_point(|runtime| {
+                runtime.intercept_dw1e_evidence_raw(arguments)
+            })
+            .unwrap_or(NativeSyscallResult {
+                status: DW_STATUS_SUCCESS,
+                control: SyscallControl::ServiceRendezvous,
+            });
+        // Selector-private raw calls bypass `dispatch_native`. Publish waiter
+        // and scheduler wakes only after releasing synchronized runtime
+        // authority, matching the adjacent DW1-C/D/Evidence wrappers.
+        crate::task::drain_runnable_work_notifications();
+        result
     }
 
     fn complete_remote_stop(

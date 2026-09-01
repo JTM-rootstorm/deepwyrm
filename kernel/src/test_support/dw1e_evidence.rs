@@ -2708,6 +2708,20 @@ mod tests {
         assert!(!response_branch.contains("deliver_classified"));
         assert!(!response_branch.contains("complete_pass"));
         assert!(!response_branch.contains("write_debug_exit"));
+        let outer_wrapper = runtime
+            .rsplit("fn intercept_dw1e_evidence_raw(")
+            .next()
+            .unwrap()
+            .split("fn complete_remote_stop(")
+            .next()
+            .unwrap();
+        let intercept = outer_wrapper
+            .find("runtime.intercept_dw1e_evidence_raw(arguments)")
+            .unwrap();
+        let notify = outer_wrapper
+            .find("crate::task::drain_runnable_work_notifications();")
+            .unwrap();
+        assert!(intercept < notify);
         assert!(
             terminal
                 .contains("complete_dw1e_failure_terminal(CompletionOutcome::Fail, 0x3110_ffff)")
