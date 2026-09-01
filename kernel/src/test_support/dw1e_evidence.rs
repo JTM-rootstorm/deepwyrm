@@ -1001,7 +1001,7 @@ impl Dw1eEvidenceCollector {
         ))
     }
 
-    pub(crate) fn claim_terminal(
+    pub(crate) fn prepare_terminal(
         &self,
         caller: ProcessKey,
     ) -> Result<(InterruptDelivery, InterruptBinding), Dw1eEvidenceError> {
@@ -1018,7 +1018,13 @@ impl Dw1eEvidenceCollector {
         if state.record_count != 17 {
             return Err(state.latch(Dw1eEvidenceError::OutOfOrder));
         }
-        materialize_leg(&mut state)?;
+        if state.response.is_none()
+            || !state.wait_woke
+            || state.drain.is_none()
+            || !state.ack_complete
+        {
+            return Err(state.latch(Dw1eEvidenceError::Incomplete));
+        }
         let delivery = state
             .saved_u1_delivery
             .ok_or_else(|| state.latch(Dw1eEvidenceError::Incomplete))?;
@@ -1028,6 +1034,46 @@ impl Dw1eEvidenceCollector {
             .binding;
         state.terminal_claimed = true;
         Ok((delivery, current))
+    }
+
+    pub(crate) fn pending_terminal(
+        &self,
+    ) -> Result<Option<(InterruptDelivery, InterruptBinding)>, Dw1eEvidenceError> {
+        let mut state = self.state.lock();
+        if let Some(failure) = state.failure {
+            return Err(failure);
+        }
+        if !state.terminal_claimed || state.record_count != 17 {
+            return Ok(None);
+        }
+        let delivery = state
+            .saved_u1_delivery
+            .ok_or_else(|| state.latch(Dw1eEvidenceError::Incomplete))?;
+        let current = state
+            .committed
+            .ok_or_else(|| state.latch(Dw1eEvidenceError::Incomplete))?
+            .binding;
+        Ok(Some((delivery, current)))
+    }
+
+    pub(crate) fn materialize_terminal(
+        &self,
+        current_u2: InterruptBinding,
+    ) -> Result<(), Dw1eEvidenceError> {
+        let mut state = self.state.lock();
+        if let Some(failure) = state.failure {
+            return Err(failure);
+        }
+        if !state.terminal_claimed || state.record_count != 17 {
+            return Err(state.latch(Dw1eEvidenceError::OutOfOrder));
+        }
+        if state
+            .committed
+            .is_none_or(|committed| committed.binding != current_u2)
+        {
+            return Err(state.latch(Dw1eEvidenceError::WrongRelation));
+        }
+        materialize_leg(&mut state)
     }
 
     pub(crate) fn complete_stale_and_accounting(
@@ -2279,16 +2325,35 @@ mod tests {
             collector.observe_ack(driver2, binding2, false).unwrap();
         }
         collector.submit(probe2, EVENT_C2_RESPONSE, 8, 42).unwrap();
-        collector
-            .observe_physical(InterruptDelivery::for_test(binding2))
-            .unwrap();
-        collector
-            .observe_delivery(binding2, InterruptDeliveryDisposition::FirstPending)
-            .unwrap();
-        collector.observe_ack(driver2, binding2, false).unwrap();
-        let (saved, current) = collector.claim_terminal(controller).unwrap();
+        let claim_ready = Barrier::new(2);
+        let allow_claim_return = Barrier::new(2);
+        let (saved, current) = std::thread::scope(|scope| {
+            let claim = scope.spawn(|| {
+                let prepared = collector.prepare_terminal(controller).unwrap();
+                claim_ready.wait();
+                allow_claim_return.wait();
+                prepared
+            });
+            claim_ready.wait();
+            assert_eq!(collector.state.lock().record_count, 17);
+            collector
+                .observe_physical(InterruptDelivery::for_test(binding2))
+                .unwrap();
+            collector
+                .observe_delivery(binding2, InterruptDeliveryDisposition::FirstPending)
+                .unwrap();
+            collector.observe_ack(driver2, binding2, false).unwrap();
+            allow_claim_return.wait();
+            claim.join().unwrap()
+        });
         assert_eq!(saved, InterruptDelivery::for_test(binding1));
         assert_eq!(current, binding2);
+        assert_eq!(
+            collector.pending_terminal().unwrap(),
+            Some((saved, current))
+        );
+        collector.materialize_terminal(current).unwrap();
+        assert_eq!(collector.pending_terminal().unwrap(), None);
         let permit = collector
             .complete_stale_and_accounting(
                 InterruptDeliveryDisposition::Rejected,
@@ -2318,7 +2383,7 @@ mod tests {
         assert_eq!(count, 26);
         assert_eq!(validate_e3b_transcript(&transcript, 0x1234), Ok(()));
         assert_eq!(
-            collector.claim_terminal(controller),
+            collector.prepare_terminal(controller),
             Err(Dw1eEvidenceError::Duplicate)
         );
 
@@ -2368,13 +2433,13 @@ mod tests {
 
         let (early, controller, _) = collector_bound_through_u1();
         assert_eq!(
-            early.claim_terminal(controller),
+            early.prepare_terminal(controller),
             Err(Dw1eEvidenceError::OutOfOrder)
         );
 
         let (wrong_actor, _, probe) = collector_bound_through_u1();
         assert_eq!(
-            wrong_actor.claim_terminal(probe),
+            wrong_actor.prepare_terminal(probe),
             Err(Dw1eEvidenceError::WrongActor)
         );
     }
@@ -2496,25 +2561,47 @@ mod tests {
             .split("Dw1eRawOperation::TerminalClaim =>")
             .nth(1)
             .unwrap()
-            .split("self.commit_runtime_phase(phase);")
+            .split("fn authorize_return(")
             .next()
             .unwrap();
-        let saved = terminal.find(".claim_terminal(self.process)").unwrap();
+        let saved = terminal.find(".prepare_terminal(self.process)").unwrap();
         let freeze = terminal
-            .find(".freeze_dw1e_terminal(stale, current,")
+            .find(".try_freeze_dw1e_terminal(stale, current)")
             .unwrap();
-        let classified = terminal.find(".deliver_classified(saved_u1,").unwrap();
-        let zero_wake = terminal.find("!wakes.is_empty()").unwrap();
+        let freeze_helper = runtime
+            .split("fn try_freeze_dw1e_terminal(")
+            .nth(1)
+            .unwrap()
+            .split("fn service_pending_dw1e_terminal(")
+            .next()
+            .unwrap();
+        let materialize = freeze_helper
+            .find(".materialize_terminal(current)")
+            .unwrap();
+        let classified = freeze_helper.find(".deliver_classified(saved_u1,").unwrap();
+        let zero_wake = freeze_helper.find("!wakes.is_empty()").unwrap();
         let accounting = terminal.find(".complete_stale_and_accounting(").unwrap();
         assert!(saved < freeze);
-        assert!(freeze < classified);
+        assert!(materialize < classified);
         assert!(classified < zero_wake);
-        assert!(zero_wake < accounting);
-        assert!(zero_wake < terminal.find("return Err(())").unwrap());
-        assert!(!terminal.contains("complete_irq_signal_wakes"));
+        assert!(freeze < accounting);
+        assert!(!freeze_helper.contains("complete_irq_signal_wakes"));
         assert!(!terminal.contains("counter_snapshot()"));
         assert!(!terminal.contains("record_stale_delivery_replay"));
         assert!(!terminal.contains("InterruptDelivery::for_test"));
+
+        let safe_point = runtime
+            .split("fn with_synchronized_runtime_at_safe_point<T>(")
+            .nth(1)
+            .unwrap()
+            .split("fn enter_ap_kernel_root_detached(")
+            .next()
+            .unwrap();
+        let bsp_guard = safe_point
+            .find("self.cpu == crate::cpu::CpuIndex::BOOTSTRAP")
+            .unwrap();
+        let pending_terminal = safe_point.find("service_pending_dw1e_terminal()").unwrap();
+        assert!(bsp_guard < pending_terminal);
 
         let completion = include_str!("x86_64.rs");
         let full = completion

@@ -197,19 +197,33 @@ pub(crate) use x86_64::complete_dw1b_evidence;
 pub(crate) use x86_64::complete_dw1c_evidence;
 #[cfg(all(deepwyrm_dw1d_evidence, target_arch = "x86_64", target_os = "none"))]
 pub(crate) use x86_64::complete_dw1d_evidence;
+#[cfg(all(
+    deepwyrm_dw1e_evidence,
+    deepwyrm_dw1e_e3b_full,
+    target_arch = "x86_64",
+    target_os = "none"
+))]
+pub(crate) use x86_64::complete_dw1e_evidence;
 #[cfg(all(deepwyrm_wyr1_evidence, target_arch = "x86_64", target_os = "none"))]
 pub(crate) use x86_64::complete_wyr1_evidence;
 #[cfg(all(deepwyrm_wyr1b_evidence, target_arch = "x86_64", target_os = "none"))]
 pub(crate) use x86_64::complete_wyr1b_evidence;
 #[cfg(all(deepwyrm_wyr1c_evidence, target_arch = "x86_64", target_os = "none"))]
 pub(crate) use x86_64::complete_wyr1c_evidence;
+#[cfg(all(deepwyrm_dw1e_evidence, target_arch = "x86_64", target_os = "none"))]
+pub(crate) use x86_64::emit_dw1e_e3a_ready;
+#[cfg(all(
+    deepwyrm_dw1e_evidence,
+    not(deepwyrm_dw1e_e3b_full),
+    target_arch = "x86_64",
+    target_os = "none"
+))]
+pub(crate) use x86_64::flush_dw1e_e3a_partial;
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 pub(crate) use x86_64::{
     complete_exception, complete_fail, complete_panic, complete_pass, expect_terminal_page_fault,
     read_user_alias_word, trigger_expected_invalid_opcode, write_then_read_user_alias,
 };
-#[cfg(all(deepwyrm_dw1e_evidence, target_arch = "x86_64", target_os = "none"))]
-pub(crate) use x86_64::{emit_dw1e_e3a_ready, flush_dw1e_e3a_partial};
 
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 pub(crate) use identity::ExpectedPageFaultKind;

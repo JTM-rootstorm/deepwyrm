@@ -27,9 +27,12 @@ In E3B full mode, a probe response stores the response relation but does not
 materialize an immutable leg while a later valid transmit IRQ/ack epoch can
 still arrive. The exact controller's U1 peer-close/TEMT barrier materializes
 records 3-8 and appends record 9 under one collector lock. The terminal claim,
-after Wyrmroot's U2 TEMT barrier, materializes records 17-22 and claims the
-saved/current pair under the same lock. Focused models include a valid
-post-response transmit epoch on both legs.
+after Wyrmroot's U2 TEMT barrier, authenticates and claims the saved/current
+pair without materializing records 17-22. The platform first freezes U2, then
+materializes those records under the frozen source serialization immediately
+before stale replay and accounting. Focused models include a valid
+post-response transmit epoch on both legs, including a coordinated U2 IRQ in
+the interval after terminal preparation and before the platform freeze.
 
 Records 9 through 14 join the controller-observed U1 peer close to
 the actual q35 retirement transitions: logical Retiring publication, physical
@@ -48,7 +51,13 @@ source lock while any handler that started before the freeze completes its
 pending bookkeeping and handler accounting. It boundedly observes Delivery
 Status idle, reacquires the source lock, and revalidates the exact frozen/live
 generation, zero in-handler count, masked/idle route, BSP execution, and clear
-LAPIC vector before replay and snapshot.
+LAPIC vector before replay and snapshot. A claim received on a migrated
+non-BSP carrier publishes one exact generation-bound BSP rendezvous request
+and returns as deferred work; the CPU0 carrier safe point retries the already
+frozen generation and alone performs materialization, replay, and completion.
+An IRQ handler that snapshotted the same live generation before retirement or
+terminal freeze may finish its pending accounting while that generation is
+Retiring/RetiringMasked, but a frozen generation admits no new snapshot.
 
 Under that final source serialization, the kernel replays the saved U1 value
 through `InterruptAuthority::deliver_classified`, requires `Rejected` and a
@@ -99,11 +108,11 @@ Fresh lane-local pinned targets established:
 | --- | --- |
 | focused selector-31 E3A model/source/private-authority tests | **pass**, 9 passed |
 | focused selector-31 E3B-full model/source/private-authority tests | **pass**, 11 passed |
-| full selector-31 E3A host library tests | **pass**, 911 passed |
-| full selector-31 E3B-full host library tests | **pass**, 913 passed |
-| focused q35 platform tests | **pass**, 4 passed, including pre-freeze-handler interleaving |
+| full selector-31 E3A host library tests | **pass**, 913 passed |
+| full selector-31 E3B-full host library tests | **pass**, 915 passed |
+| focused q35 platform tests | **pass**, 6 passed, including retirement-after-snapshot, pre-freeze-handler drain, and off-BSP deferred completion |
 | focused Interrupt authority tests | **pass**, 14 passed, including two-carrier retry |
-| full default host library tests | **pass**, 792 passed |
+| full default host library tests | **pass**, 794 passed |
 | host Clippy for library/tests with warnings denied | **pass** |
 | host formatting and diff checks | **pass** |
 | default freestanding target check | **pass** |

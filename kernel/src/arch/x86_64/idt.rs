@@ -289,9 +289,11 @@ const fn is_kernel_handler_address(address: u64) -> bool {
 mod tests {
     use super::super::gdt::SegmentSelector;
     use super::*;
+    use crate::interrupt::EXTERNAL_VECTOR_RANGE;
+    #[cfg(not(deepwyrm_dw1e_platform))]
     use crate::interrupt::{
-        EXTERNAL_VECTOR_RANGE, INTERNAL_VECTOR_RANGE, LEGACY_PIC_VECTOR_RANGE,
-        LOCAL_APIC_TIMER_VECTOR, SMP_RENDEZVOUS_VECTOR, TLB_SHOOTDOWN_VECTOR,
+        INTERNAL_VECTOR_RANGE, LEGACY_PIC_VECTOR_RANGE, LOCAL_APIC_TIMER_VECTOR,
+        SMP_RENDEZVOUS_VECTOR, TLB_SHOOTDOWN_VECTOR,
     };
 
     const HANDLER: HandlerAddress = match HandlerAddress::new(0xffff_ffff_8000_0100) {
@@ -351,6 +353,7 @@ mod tests {
     #[test]
     fn selected_dw1e_product_has_only_the_fixed_q35_external_gate() {
         let idt = InterruptDescriptorTable::q35_selected_for_test(handlers());
+        assert!(idt.has_exact_terminal_ist_assignment());
         assert!(idt.is_present(Q35_COM2_EXTERNAL_VECTOR));
         for vector in EXTERNAL_VECTOR_RANGE {
             assert_eq!(

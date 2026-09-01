@@ -35,16 +35,20 @@ use crate::debug::TestSerialTransaction;
 use crate::debug::begin_test_serial_transaction;
 use crate::debug::emit_early_raw_record;
 
+#[cfg(deepwyrm_dw1e_evidence)]
+use super::DW1E_E3A_READY_LEN;
 #[cfg(deepwyrm_dw1c_evidence)]
 use super::Dw1cEvidenceFlushPermit;
 #[cfg(deepwyrm_dw1d_evidence)]
 use super::Dw1dEvidenceFlushPermit;
+#[cfg(all(deepwyrm_dw1e_evidence, deepwyrm_dw1e_e3b_full))]
+use super::Dw1eEvidenceFullPermit;
+#[cfg(all(deepwyrm_dw1e_evidence, not(deepwyrm_dw1e_e3b_full)))]
+use super::Dw1eEvidencePartialPermit;
 #[cfg(deepwyrm_wyr1c_evidence)]
 use super::Wyr1cEvidenceFlushError;
 #[cfg(deepwyrm_dw1b_evidence)]
 use super::dw1b_evidence::Dw1bEvidenceFlushPermit;
-#[cfg(deepwyrm_dw1e_evidence)]
-use super::{DW1E_E3A_READY_LEN, Dw1eEvidenceFullPermit, Dw1eEvidencePartialPermit};
 #[cfg(deepwyrm_i1_evidence)]
 use super::{EvidenceFlushError, I1_EVIDENCE};
 #[cfg(deepwyrm_wrcap_relay)]
@@ -180,6 +184,7 @@ impl QemuCompletionTransport {
                 deepwyrm_wyr1b_evidence,
                 deepwyrm_dw1c_evidence,
                 deepwyrm_dw1d_evidence,
+                deepwyrm_dw1e_evidence,
                 deepwyrm_wyr1c_evidence
             ))]
             transaction: None,
@@ -373,7 +378,7 @@ pub(crate) fn emit_dw1e_e3a_ready(marker: &[u8; DW1E_E3A_READY_LEN]) -> Result<(
 /// the partial transcript so the production driver can finish draining the
 /// queued WRST response to physical COM2. It never emits a selector PASS or
 /// writes the QEMU debug-exit device.
-#[cfg(deepwyrm_dw1e_evidence)]
+#[cfg(all(deepwyrm_dw1e_evidence, not(deepwyrm_dw1e_e3b_full)))]
 pub(crate) fn flush_dw1e_e3a_partial(permit: Dw1eEvidencePartialPermit<'_>) {
     let Ok(mut transaction) = begin_test_serial_transaction() else {
         halt_after_completion()
@@ -388,7 +393,7 @@ pub(crate) fn flush_dw1e_e3a_partial(permit: Dw1eEvidencePartialPermit<'_>) {
 
 /// Selector 31 owns one uninterrupted transaction: all 26 DWE3E1 records,
 /// canonical `DWTEST1 31 0`, and the matching debug exit.
-#[cfg(deepwyrm_dw1e_evidence)]
+#[cfg(all(deepwyrm_dw1e_evidence, deepwyrm_dw1e_e3b_full))]
 pub(crate) fn complete_dw1e_evidence(permit: Dw1eEvidenceFullPermit<'_>) -> ! {
     if !claim_dw1e_terminal(DW1E_TERMINAL_SUCCESS) {
         halt_after_completion()

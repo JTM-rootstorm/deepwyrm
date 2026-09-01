@@ -25,7 +25,7 @@ pub(crate) use interrupt::{
     reason = "the q35 live platform exports are consumed only by target activation"
 )]
 pub(crate) use q35_interrupt::{
-    Q35DeliverySnapshot, Q35InterruptCounterSnapshot, Q35InterruptPlatform,
+    Q35DeliverySnapshot, Q35InterruptCounterSnapshot, Q35InterruptPlatform, Q35TerminalFreeze,
 };
 
 #[cfg(any(test, deepwyrm_dw1d_evidence, deepwyrm_dw1e_evidence))]
