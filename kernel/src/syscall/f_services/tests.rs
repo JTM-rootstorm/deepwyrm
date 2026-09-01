@@ -13,8 +13,8 @@ use deepwyrm_abi::{
     DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_EVENT,
     DW_PROCESS_CREATE_ARGS_V1_SIZE, DW_PROCESS_CREATE_RESULT_V1_SIZE, DW_RIGHT_INSPECT,
     DW_RIGHT_MODIFY, DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE,
-    DW_SIGNAL_SIGNALED, DW_STATUS_SUCCESS, DW_STATUS_TIMED_OUT, DW_TASK_STATE_CREATED, DwHandle,
-    DwHandleTransferV1, DwRights,
+    DW_SIGNAL_READABLE, DW_SIGNAL_SIGNALED, DW_STATUS_SUCCESS, DW_STATUS_TIMED_OUT,
+    DW_TASK_STATE_CREATED, DwHandle, DwHandleTransferV1, DwRights,
 };
 use std::vec;
 use std::vec::Vec;
@@ -336,6 +336,7 @@ struct Fixture {
     control: NativeWaitControl,
     process: ProcessKey,
     thread: ThreadKey,
+    sender: Option<ThreadKey>,
 }
 
 impl Fixture {
@@ -344,6 +345,18 @@ impl Fixture {
         reason = "the test fixture uniquely owns synthetic AddressSpaceAuthority identities"
     )]
     fn new() -> Self {
+        Self::new_with_sender(false)
+    }
+
+    fn with_runnable_sender() -> Self {
+        Self::new_with_sender(true)
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "the test fixture uniquely owns synthetic AddressSpaceAuthority identities"
+    )]
+    fn new_with_sender(with_sender: bool) -> Self {
         let mut registry = ObjectRegistry::new();
         let mut tasks = Tasks::new();
         let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
@@ -354,7 +367,16 @@ impl Fixture {
             .unwrap();
         let (thread, thread_reference) =
             tasks.create_thread(&mut registry, &process_owner).unwrap();
+        let (sender, sender_reference) = if with_sender {
+            let (thread, reference) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+            (Some(thread), Some(reference))
+        } else {
+            (None, None)
+        };
         assert!(registry.release_handle(thread_reference).unwrap().is_none());
+        if let Some(reference) = sender_reference {
+            assert!(registry.release_handle(reference).unwrap().is_none());
+        }
         assert!(
             registry
                 .release_handle(process_reference)
@@ -377,6 +399,20 @@ impl Fixture {
                 ),
             )
             .unwrap();
+        if let Some(sender) = sender {
+            execution
+                .start_thread(
+                    &mut tasks,
+                    sender,
+                    ThreadStartState::from_validated_user_state(
+                        0x0000_0000_4000_1000,
+                        0x0000_0000_5000_1000,
+                        1,
+                        1,
+                    ),
+                )
+                .unwrap();
+        }
         assert_eq!(execution.schedule_next().unwrap().current, Some(thread));
 
         Self {
@@ -397,14 +433,21 @@ impl Fixture {
             control: NativeWaitControl::new(),
             process,
             thread,
+            sender,
         }
     }
 
     fn dispatch(&mut self, request: NativeSyscallRequest) -> FServiceDispatch<OBJECTS> {
-        let prepared = self
-            .services
-            .prepare_dispatch(request, self.thread, 1)
-            .unwrap();
+        self.dispatch_as(self.thread, crate::cpu::CpuIndex::BOOTSTRAP, request)
+    }
+
+    fn dispatch_as(
+        &mut self,
+        thread: ThreadKey,
+        cpu: crate::cpu::CpuIndex,
+        request: NativeSyscallRequest,
+    ) -> FServiceDispatch<OBJECTS> {
+        let prepared = self.services.prepare_dispatch(request, thread, 1).unwrap();
         self.services.dispatch_prepared(
             &mut self.control,
             prepared,
@@ -420,8 +463,8 @@ impl Fixture {
             &mut self.regions,
             &mut self.spaces,
             self.process,
-            self.thread,
-            crate::cpu::CpuIndex::BOOTSTRAP,
+            thread,
+            cpu,
             1,
             Some(&mut self.wait_deadlines),
             &mut self.timer_deadlines,
@@ -432,6 +475,20 @@ impl Fixture {
 
     fn handled(&mut self, request: NativeSyscallRequest) -> NativeSyscallResult {
         let (route, cleanup) = self.dispatch(request).into_parts();
+        Self::handled_route(route, cleanup)
+    }
+
+    fn handled_as(
+        &mut self,
+        thread: ThreadKey,
+        cpu: crate::cpu::CpuIndex,
+        request: NativeSyscallRequest,
+    ) -> NativeSyscallResult {
+        let (route, cleanup) = self.dispatch_as(thread, cpu, request).into_parts();
+        Self::handled_route(route, cleanup)
+    }
+
+    fn handled_route(route: FServiceRoute, cleanup: CleanupQueue<OBJECTS>) -> NativeSyscallResult {
         assert_empty_cleanup(cleanup);
         match route {
             FServiceRoute::Handled(result) => result,
@@ -784,6 +841,125 @@ fn channel_dispatch_moves_a_reduced_right_event_and_receives_it() {
     close_event(&mut fixture, received);
     close_channel(&mut fixture, sender);
     close_channel(&mut fixture, receiver);
+}
+
+#[test]
+fn channel_send_wakes_blocked_peer_then_sender_immediately_dispatches() {
+    let mut fixture = Fixture::with_runnable_sender();
+    let sender = fixture.sender.expect("two-thread fixture retains sender");
+    let channel_rights =
+        DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_TRANSFER.0 | DW_RIGHT_WAIT.0);
+
+    assert_eq!(
+        fixture
+            .handled(NativeSyscallRequest::ChannelCreate {
+                requested_rights: channel_rights,
+                out_endpoint0: DwUserAddress(BASE + 0x100),
+                out_endpoint1: DwUserAddress(BASE + 0x108),
+            })
+            .status,
+        DW_STATUS_SUCCESS
+    );
+    let sender_channel = DwHandle(u64_at(&fixture.user, BASE + 0x100));
+    let receiver_channel = DwHandle(u64_at(&fixture.user, BASE + 0x108));
+
+    let wait = fixture.handled(NativeSyscallRequest::WaitOne {
+        handle: receiver_channel,
+        signals: DW_SIGNAL_READABLE,
+        deadline: DW_DEADLINE_INFINITE,
+        out_result: DwUserAddress(BASE + 0x180),
+    });
+    assert_eq!(wait.status, DW_STATUS_SUCCESS);
+    assert_eq!(
+        wait.control,
+        super::super::native::SyscallControl::SuspendCurrent
+    );
+    assert_eq!(
+        fixture.services.operation_owner(fixture.thread),
+        Ok(FServiceOperationOwner::GenericWait)
+    );
+    assert_eq!(
+        fixture.execution.scheduler_state(fixture.thread),
+        Some(SchedulerThreadState::Blocked)
+    );
+
+    assert_eq!(
+        fixture.execution.scheduler_state(sender),
+        Some(SchedulerThreadState::Running)
+    );
+
+    fixture.user.bytes[FakeUserMemory::offset(BASE + 0x280, 1)] = 0xa5;
+    let sent = fixture.handled_as(
+        sender,
+        crate::cpu::CpuIndex::BOOTSTRAP,
+        NativeSyscallRequest::ChannelSend {
+            channel: sender_channel,
+            bytes: DwUserAddress(BASE + 0x280),
+            byte_len: 1,
+            transfers: DwUserAddress(BASE + 0x200),
+            transfer_count: 0,
+            flags: 0,
+        },
+    );
+    assert_eq!(sent.status, DW_STATUS_SUCCESS);
+    assert_eq!(
+        sent.control,
+        super::super::native::SyscallControl::ReturnToCaller
+    );
+    assert_eq!(
+        fixture.execution.scheduler_state(fixture.thread),
+        Some(SchedulerThreadState::Runnable)
+    );
+    assert_eq!(
+        fixture.execution.scheduler_state(sender),
+        Some(SchedulerThreadState::Running)
+    );
+
+    let clock = fixture.handled_as(
+        sender,
+        crate::cpu::CpuIndex::BOOTSTRAP,
+        NativeSyscallRequest::ClockGet {
+            clock_id: deepwyrm_abi::DW_CLOCK_MONOTONIC_ACTIVE,
+            out_nanoseconds: DwUserAddress(BASE + 0x300),
+        },
+    );
+    assert_eq!(clock.status, DW_STATUS_SUCCESS);
+    assert_eq!(
+        clock.control,
+        super::super::native::SyscallControl::ReturnToCaller
+    );
+    assert_eq!(u64_at(&fixture.user, BASE + 0x300), 0x1122_3344_5566_7788);
+    assert_eq!(
+        fixture.execution.scheduler_state(sender),
+        Some(SchedulerThreadState::Running)
+    );
+
+    let mut cleanup = CleanupQueue::<OBJECTS>::new();
+    {
+        let user = &mut fixture.user;
+        let mut terminal = fixture.services.terminal_cleanup(
+            Some(&mut fixture.wait_deadlines),
+            |output| user.discard_owned_output(output),
+            |_| panic!("channel wait terminal cleanup cannot own an atomic pin"),
+        );
+        terminal.cleanup_terminal_wait(
+            &mut fixture.registry,
+            &mut fixture.tasks,
+            &fixture.waits,
+            &fixture.execution,
+            fixture.thread,
+            &mut cleanup,
+        );
+    }
+    assert_empty_cleanup(cleanup);
+    assert_eq!(
+        fixture.services.operation_owner(fixture.thread),
+        Err(FServiceOwnerError::Missing)
+    );
+    assert_eq!(fixture.user.owned_outputs, 0);
+
+    close_channel(&mut fixture, sender_channel);
+    close_channel(&mut fixture, receiver_channel);
 }
 
 #[test]
