@@ -1373,6 +1373,35 @@ mod tests {
         assert!(!partial.contains("completion_record"));
         assert!(!partial.contains("write_debug_exit"));
         assert!(!partial.contains("DebugExitValue::PASS"));
+        assert!(!partial.contains("Dw1eEvidencePartialPermit<'_>) -> !"));
+        assert!(!partial.trim_end().ends_with("halt_after_completion()\n}"));
+
+        let runtime = include_str!("../arch/x86_64/mm/activation/primordial.rs");
+        let response_branch = runtime
+            .split("if event == EVENT_C1_RESPONSE {")
+            .nth(1)
+            .unwrap()
+            .split("\n                }\n                self.commit_runtime_phase(phase);")
+            .next()
+            .unwrap();
+        let commit = response_branch
+            .find("self.commit_runtime_phase(phase);")
+            .unwrap();
+        let flush = response_branch
+            .find("flush_dw1e_e3a_partial(permit);")
+            .unwrap();
+        let returning = response_branch
+            .find("return NativeSyscallResult::returning(DW_STATUS_SUCCESS);")
+            .unwrap();
+        assert!(commit < flush && flush < returning);
+        assert_eq!(
+            response_branch
+                .matches("self.commit_runtime_phase(phase);")
+                .count(),
+            1
+        );
+        assert!(!response_branch.contains("complete_pass"));
+        assert!(!response_branch.contains("write_debug_exit"));
         assert!(terminal.contains("complete_known_outcome(CompletionOutcome::Fail, 0x3110_ffff)"));
     }
 }

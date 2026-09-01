@@ -63,9 +63,16 @@ Its checksum covers the 81-byte prefix through the final separator. This line
 only synchronizes the host's first COM2 transmission; it is not a DWE3E1
 record, certificate evidence, or terminal acceptance.
 
-E3A's response path emits the nine-record partial transcript and halts. It
+E3A's response path emits the nine-record partial transcript, then returns to
+userspace so the production driver can finish draining the queued WRST response
+to physical COM2. This ordering is required because a successful Channel send
+only commits the WRST record to the driver; it is not evidence that the driver
+has serviced its transmit interrupt or that the host observed the response.
+The host runner independently joins the exact post-prelude COM2 response; the
+partial nine-record transcript is not a certificate. The partial path still
 does not call the QEMU debug-exit device or append `DWTEST1 31 PASS`. Any
-accidental generic PASS request is converted to selector failure.
+accidental generic PASS request is converted to selector failure, and the host
+runner remains responsible for stopping the non-accepting E3A extraction run.
 
 ## Validation and nonclaims
 

@@ -361,10 +361,12 @@ pub(crate) fn emit_dw1e_e3a_ready(marker: &[u8; DW1E_E3A_READY_LEN]) -> Result<(
     transaction.write_evidence(marker).map_err(|_| ())
 }
 
-/// E3A's host-extraction gate emits only records 0 through 8, then halts. It
-/// never emits a selector PASS or writes the QEMU debug-exit device.
+/// E3A's host-extraction gate emits only records 0 through 8. It returns after
+/// the partial transcript so the production driver can finish draining the
+/// queued WRST response to physical COM2. It never emits a selector PASS or
+/// writes the QEMU debug-exit device.
 #[cfg(deepwyrm_dw1e_evidence)]
-pub(crate) fn flush_dw1e_e3a_partial(permit: Dw1eEvidencePartialPermit<'_>) -> ! {
+pub(crate) fn flush_dw1e_e3a_partial(permit: Dw1eEvidencePartialPermit<'_>) {
     let Ok(mut transaction) = begin_test_serial_transaction() else {
         halt_after_completion()
     };
@@ -374,7 +376,6 @@ pub(crate) fn flush_dw1e_e3a_partial(permit: Dw1eEvidencePartialPermit<'_>) -> !
     {
         halt_after_completion()
     }
-    halt_after_completion()
 }
 
 /// Selector 29 owns one uninterrupted transaction: all WRC6 records,

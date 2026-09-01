@@ -6770,7 +6770,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                         crate::test_support::complete_fail(0x3110_e170 | error as u32)
                     });
                     self.commit_runtime_phase(phase);
-                    crate::test_support::flush_dw1e_e3a_partial(permit)
+                    crate::test_support::flush_dw1e_e3a_partial(permit);
+                    return NativeSyscallResult::returning(DW_STATUS_SUCCESS);
                 }
                 self.commit_runtime_phase(phase);
                 NativeSyscallResult::returning(DW_STATUS_SUCCESS)
