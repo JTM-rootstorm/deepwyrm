@@ -33,6 +33,9 @@ materializes those records under the frozen source serialization immediately
 before stale replay and accounting. Focused models include a valid
 post-response transmit epoch on both legs, including a coordinated U2 IRQ in
 the interval after terminal preparation and before the platform freeze.
+The claim is an opaque selector-private saved-U1/current-U2 authority rather
+than a reconstructible tuple; it survives an exact deferred BSP retry and is
+consumed only by the matching terminal materialization/accounting path.
 
 Records 9 through 14 join the controller-observed U1 peer close to
 the actual q35 retirement transitions: logical Retiring publication, physical
@@ -58,15 +61,31 @@ frozen generation and alone performs materialization, replay, and completion.
 An IRQ handler that snapshotted the same live generation before retirement or
 terminal freeze may finish its pending accounting while that generation is
 Retiring/RetiringMasked, but a frozen generation admits no new snapshot.
+Vectors that arrive after terminal `Masking` therefore take the normal EOI-only
+orphan disposition without incrementing selector-31's accepted physical or
+stale/orphan counters.
+
+Terminal preparation is not a typed-Interrupt quiescence claim. If a U2
+delivery becomes `Pending` or `AckPrepared` between controller admission and
+terminal `Masking`, the exact masked U2 acknowledgement remains admitted while
+the freeze is `Masking`, `Masked`, or `Checking`. The selector retains its
+opaque terminal claim and returns deferred without materializing any U2 tail
+until the exact typed U2 record is positively live `Armed` (absence,
+`Creating`, `Finalizing`, `Pending`, and `AckPrepared` all defer) and the
+collector acknowledgement is quiescent.
+The successful CPU0 acknowledgement immediately retries that durable claim;
+the same generation-bound request is coalesced across any preceding deferrals.
 
 Under that final source serialization, the kernel replays the saved U1 value
 through `InterruptAuthority::deliver_classified`, requires `Rejected` and a
 fully empty wake-and-pin batch before any scheduler publication, credits the
 bounded stale/orphan counter, and returns one coherent counter snapshot. This
 avoids the invalid physical-orphan construction when physical entries and
-exact deliveries must remain equal. The terminal U2 mask is selector-private
-quiescence, not U2 retirement, release, or a reusable-source claim; selector
-31 halts after its single terminal outcome.
+exact deliveries must remain equal. That snapshot is stored on the one
+`Replaying -> Complete` transition and later safe-point retries reuse it rather
+than sampling live counters or replaying the saved delivery again. The terminal
+U2 mask is selector-private quiescence, not U2 retirement, release, or a
+reusable-source claim; selector 31 halts after its single terminal outcome.
 
 The accounting record is admitted only when its byte-packed counters and both
 per-leg sums satisfy the frozen ranges. The stale result carries the complete

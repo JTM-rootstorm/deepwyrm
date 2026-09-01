@@ -356,7 +356,9 @@ struct Q35SourceState {
     next_request_generation: u64,
     retirement_request: Option<Q35RetirementRequestState>,
     terminal_request: Option<Q35BspCheckRequest>,
+    terminal_request_published: bool,
     terminal_freeze: Option<Q35TerminalFreezeState>,
+    terminal_snapshot: Option<Q35InterruptCounterSnapshot>,
     retirement_idle_proof: Option<Q35RetirementIdleProof>,
 }
 
@@ -369,9 +371,26 @@ impl Q35SourceState {
             next_request_generation: 1,
             retirement_request: None,
             terminal_request: None,
+            terminal_request_published: false,
             terminal_freeze: None,
+            terminal_snapshot: None,
             retirement_idle_proof: None,
         }
+    }
+}
+
+/// A terminal mask blocks new snapshots but must not strand an exact
+/// pre-Masking typed acknowledgement. Replaying and completion are terminal
+/// boundaries: by then the typed state was observed quiescent.
+fn terminal_ack_permitted(source: &Q35SourceState, generation: u64) -> bool {
+    match source.terminal_freeze {
+        None => true,
+        Some(
+            Q35TerminalFreezeState::Masking(current)
+            | Q35TerminalFreezeState::Masked(current)
+            | Q35TerminalFreezeState::Checking(current),
+        ) => current == generation,
+        Some(Q35TerminalFreezeState::Replaying(_) | Q35TerminalFreezeState::Complete(_)) => false,
     }
 }
 
@@ -458,8 +477,11 @@ impl Q35InterruptPlatform {
     pub(crate) fn snapshot_delivery(&self) -> Q35DeliverySnapshot {
         let mut source = self.source.lock();
         if source.terminal_freeze.is_some() {
-            Q35InterruptCounters::increment(&self.counters.physical_entries);
-            Q35InterruptCounters::increment(&self.counters.stale_orphans);
+            // A terminal-masked vector has no live generation snapshot. It
+            // still receives the ordinary bounded EOI-only disposition, but
+            // it is deliberately outside selector-31's immutable accounting
+            // snapshot: adding it to physical/orphan totals after Masking
+            // would violate E0's required physical == exact relation.
             return Q35DeliverySnapshot::Orphan;
         }
         Q35InterruptCounters::increment(&self.counters.physical_entries);
@@ -580,6 +602,7 @@ impl Q35InterruptPlatform {
         &self,
         stale_u1: InterruptDelivery,
         current_u2: InterruptBinding,
+        terminal_quiescent: impl Fn() -> bool,
         replay: impl FnOnce(InterruptDelivery) -> Result<(), ()>,
     ) -> Result<Q35TerminalFreeze, Q35ControllerError> {
         let stale_binding = stale_u1.binding_for_evidence();
@@ -590,7 +613,8 @@ impl Q35InterruptPlatform {
         }
 
         let generation = current_u2.generation();
-        let needs_mask = {
+        let current_cpu_is_bsp = self.controller.current_cpu_is_bsp()?;
+        let (needs_mask, request) = {
             let mut source = self.source.lock();
             match source.terminal_freeze {
                 None => {
@@ -601,12 +625,42 @@ impl Q35InterruptPlatform {
                     ) {
                         return Err(Q35ControllerError::RouteDrift);
                     }
+                    source.terminal_snapshot = None;
+                    let request_generation = source.next_request_generation;
+                    if request_generation == 0 {
+                        return Err(Q35ControllerError::RouteDrift);
+                    }
+                    source.next_request_generation = request_generation.checked_add(1).unwrap_or(0);
+                    let request = Q35BspCheckRequest::new(
+                        current_u2.source(),
+                        0x30,
+                        generation,
+                        request_generation,
+                    );
+                    source.terminal_request = Some(request);
+                    source.terminal_request_published = false;
                     source.terminal_freeze = Some(Q35TerminalFreezeState::Masking(generation));
-                    true
+                    (true, request)
                 }
-                Some(Q35TerminalFreezeState::Masked(current)) if current == generation => false,
+                Some(Q35TerminalFreezeState::Masked(current)) if current == generation => {
+                    // CPU0 has consumed any prior remote wake by reaching this
+                    // safe point. A later exact ack on another carrier may
+                    // publish the still-pending request again.
+                    if current_cpu_is_bsp {
+                        source.terminal_request_published = false;
+                    }
+                    (
+                        false,
+                        source
+                            .terminal_request
+                            .ok_or(Q35ControllerError::RouteDrift)?,
+                    )
+                }
                 Some(Q35TerminalFreezeState::Complete(current)) if current == generation => {
-                    return Ok(Q35TerminalFreeze::Complete(self.counter_snapshot_locked()));
+                    return source
+                        .terminal_snapshot
+                        .map(Q35TerminalFreeze::Complete)
+                        .ok_or(Q35ControllerError::RouteDrift);
                 }
                 Some(state) if state.generation() == generation => {
                     return Ok(Q35TerminalFreeze::Deferred);
@@ -642,10 +696,18 @@ impl Q35InterruptPlatform {
             core::hint::spin_loop();
         }
         if !quiescent {
+            self.request_terminal_retry(request)?;
+            return Ok(Q35TerminalFreeze::Deferred);
+        }
+        // This runs without the source guard. A pending or AckPrepared typed
+        // Interrupt is allowed to complete its exact pre-Masking ack while
+        // the route stays masked; do not materialize a partial U2 leg.
+        if !terminal_quiescent() {
+            self.request_terminal_retry(request)?;
             return Ok(Q35TerminalFreeze::Deferred);
         }
 
-        let request = {
+        let ready_to_check = {
             let mut source = self.source.lock();
             if source.terminal_freeze != Some(Q35TerminalFreezeState::Masked(generation))
                 || source.in_handler != 0
@@ -655,29 +717,18 @@ impl Q35InterruptPlatform {
                         if live == generation
                 )
             {
-                return Ok(Q35TerminalFreeze::Deferred);
+                false
+            } else if source.terminal_request != Some(request) {
+                return Err(Q35ControllerError::RouteDrift);
+            } else {
+                source.terminal_freeze = Some(Q35TerminalFreezeState::Checking(generation));
+                true
             }
-            let request = match source.terminal_request {
-                Some(request) => request,
-                None => {
-                    let request_generation = source.next_request_generation;
-                    if request_generation == 0 {
-                        return Err(Q35ControllerError::RouteDrift);
-                    }
-                    source.next_request_generation = request_generation.checked_add(1).unwrap_or(0);
-                    let request = Q35BspCheckRequest::new(
-                        current_u2.source(),
-                        0x30,
-                        generation,
-                        request_generation,
-                    );
-                    source.terminal_request = Some(request);
-                    request
-                }
-            };
-            source.terminal_freeze = Some(Q35TerminalFreezeState::Checking(generation));
-            request
         };
+        if !ready_to_check {
+            self.request_terminal_retry(request)?;
+            return Ok(Q35TerminalFreeze::Deferred);
+        }
         if request.source != Q35_COM2_SOURCE
             || request.vector != 0x30
             || request.platform_generation != current_u2.generation()
@@ -687,22 +738,25 @@ impl Q35InterruptPlatform {
         }
         if self.controller.revalidate_masked_idle().is_err() {
             self.restore_terminal_masked(generation);
+            self.request_terminal_retry(request)?;
             return Ok(Q35TerminalFreeze::Deferred);
         }
         if !self.controller.current_cpu_is_bsp()? {
             self.restore_terminal_masked(generation);
-            self.controller.request_terminal_bsp_check(request)?;
+            self.request_terminal_retry(request)?;
             return Ok(Q35TerminalFreeze::Deferred);
         }
         if !self.controller.bsp_vector_clear()? {
             self.restore_terminal_masked(generation);
+            self.request_terminal_retry(request)?;
             return Ok(Q35TerminalFreeze::Deferred);
         }
         if self.controller.revalidate_masked_idle().is_err() {
             self.restore_terminal_masked(generation);
+            self.request_terminal_retry(request)?;
             return Ok(Q35TerminalFreeze::Deferred);
         }
-        {
+        let ready_to_replay = {
             let mut source = self.source.lock();
             if source.terminal_freeze != Some(Q35TerminalFreezeState::Checking(generation))
                 || source.in_handler != 0
@@ -713,9 +767,15 @@ impl Q35InterruptPlatform {
                         if live == generation
                 )
             {
-                return Ok(Q35TerminalFreeze::Deferred);
+                false
+            } else {
+                source.terminal_freeze = Some(Q35TerminalFreezeState::Replaying(generation));
+                true
             }
-            source.terminal_freeze = Some(Q35TerminalFreezeState::Replaying(generation));
+        };
+        if !ready_to_replay {
+            self.request_terminal_retry(request)?;
+            return Ok(Q35TerminalFreeze::Deferred);
         }
         replay(stale_u1).map_err(|()| Q35ControllerError::RouteDrift)?;
         Q35InterruptCounters::increment(&self.counters.stale_orphans);
@@ -726,8 +786,11 @@ impl Q35InterruptPlatform {
             return Err(Q35ControllerError::RouteDrift);
         }
         source.terminal_request = None;
+        source.terminal_request_published = false;
+        let snapshot = self.counter_snapshot_locked();
+        source.terminal_snapshot = Some(snapshot);
         source.terminal_freeze = Some(Q35TerminalFreezeState::Complete(generation));
-        Ok(Q35TerminalFreeze::Complete(self.counter_snapshot_locked()))
+        Ok(Q35TerminalFreeze::Complete(snapshot))
     }
 
     #[cfg(any(test, deepwyrm_dw1e_evidence))]
@@ -736,6 +799,48 @@ impl Q35InterruptPlatform {
         if source.terminal_freeze == Some(Q35TerminalFreezeState::Checking(generation)) {
             source.terminal_freeze = Some(Q35TerminalFreezeState::Masked(generation));
         }
+    }
+
+    #[cfg(any(test, deepwyrm_dw1e_evidence))]
+    fn request_terminal_retry(
+        &self,
+        request: Q35BspCheckRequest,
+    ) -> Result<(), Q35ControllerError> {
+        // CPU0 already owns an ordinary durable safe-point retry. Do not mark
+        // the remote notification as consumed there: a later exact ack may
+        // complete on another carrier and must still be able to wake CPU0.
+        if self.controller.current_cpu_is_bsp()? {
+            return Ok(());
+        }
+        let publish = {
+            let mut source = self.source.lock();
+            if source.terminal_request != Some(request)
+                || source.terminal_freeze.is_none()
+                || matches!(
+                    source.terminal_freeze,
+                    Some(Q35TerminalFreezeState::Complete(_))
+                )
+            {
+                return Err(Q35ControllerError::RouteDrift);
+            }
+            if source.terminal_request_published {
+                false
+            } else {
+                source.terminal_request_published = true;
+                true
+            }
+        };
+        if !publish {
+            return Ok(());
+        }
+        if let Err(error) = self.controller.request_terminal_bsp_check(request) {
+            let mut source = self.source.lock();
+            if source.terminal_request == Some(request) {
+                source.terminal_request_published = false;
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(crate) fn complete_handler(&self, generation: u64) {
@@ -1106,7 +1211,7 @@ impl InterruptPlatform for Q35InterruptPlatform {
     ) -> Result<InterruptPlatformAck, InterruptPlatformError> {
         validate_binding(self.domain, binding).map_err(|_| InterruptPlatformError::StaleBinding)?;
         let source = self.source.lock();
-        if source.terminal_freeze.is_some() {
+        if !terminal_ack_permitted(&source, binding.generation()) {
             return Err(InterruptPlatformError::BadState);
         }
         match source.lifecycle.state() {
@@ -1122,7 +1227,7 @@ impl InterruptPlatform for Q35InterruptPlatform {
         validate_binding(self.domain, ack.binding)
             .expect("prepared q35 acknowledgement retains exact domain/source");
         let source = self.source.lock();
-        assert!(source.terminal_freeze.is_none());
+        assert!(terminal_ack_permitted(&source, ack.binding.generation()));
         assert!(matches!(
             source.lifecycle.state(),
             IoApicRouteState::LiveUnmasked { generation }
@@ -1133,14 +1238,21 @@ impl InterruptPlatform for Q35InterruptPlatform {
     fn record_userspace_ack(&self, binding: InterruptBinding) {
         validate_binding(self.domain, binding)
             .expect("completed q35 acknowledgement retains exact domain/source");
-        let source = self.source.lock();
-        assert!(source.terminal_freeze.is_none());
-        assert!(matches!(
-            source.lifecycle.state(),
-            IoApicRouteState::LiveUnmasked { generation }
-                if generation == binding.generation()
-        ));
-        Q35InterruptCounters::increment(&self.counters.acknowledgements);
+        let retry = {
+            let source = self.source.lock();
+            assert!(terminal_ack_permitted(&source, binding.generation()));
+            assert!(matches!(
+                source.lifecycle.state(),
+                IoApicRouteState::LiveUnmasked { generation }
+                    if generation == binding.generation()
+            ));
+            Q35InterruptCounters::increment(&self.counters.acknowledgements);
+            source.terminal_request
+        };
+        if let Some(request) = retry {
+            self.request_terminal_retry(request)
+                .expect("exact masked terminal acknowledgement must retain retry authority");
+        }
     }
 
     fn begin_retirement(&self, binding: InterruptBinding) {
@@ -1338,6 +1450,7 @@ mod tests {
     static FAKE_POST_EOI_RETRY: FakeController = FakeController::new();
     static FAKE_REMOTE_RETRY: FakeController = FakeController::new();
     static FAKE_RETIREMENT_BOUNDARY: FakeController = FakeController::new();
+    static FAKE_TERMINAL_PENDING: FakeController = FakeController::new();
 
     struct PublishingRaceController {
         controller: FakeController,
@@ -1905,9 +2018,12 @@ mod tests {
         let binding2 = reservation2.binding;
         platform.commit_source(reservation2);
         let Q35TerminalFreeze::Complete(snapshot) = platform
-            .freeze_dw1e_terminal(saved_u1, binding2, |replayed| {
-                (replayed == saved_u1).then_some(()).ok_or(())
-            })
+            .freeze_dw1e_terminal(
+                saved_u1,
+                binding2,
+                || true,
+                |replayed| (replayed == saved_u1).then_some(()).ok_or(()),
+            )
             .unwrap()
         else {
             panic!("BSP terminal freeze unexpectedly deferred");
@@ -1922,12 +2038,19 @@ mod tests {
 
         assert_eq!(platform.snapshot_delivery(), Q35DeliverySnapshot::Orphan);
         let after_terminal_orphan = platform.counter_snapshot_locked();
-        assert_eq!(after_terminal_orphan.physical_entries, 2);
-        assert_eq!(after_terminal_orphan.stale_orphans, 2);
-        assert_eq!(
-            after_terminal_orphan.exact_deliveries,
-            snapshot.exact_deliveries
-        );
+        assert_eq!(after_terminal_orphan, snapshot);
+        let Q35TerminalFreeze::Complete(retried) = platform
+            .freeze_dw1e_terminal(
+                saved_u1,
+                binding2,
+                || true,
+                |_| panic!("terminal replay repeated"),
+            )
+            .unwrap()
+        else {
+            panic!("completed terminal freeze unexpectedly deferred");
+        };
+        assert_eq!(retried, snapshot);
         assert!(matches!(
             platform.reserve_source(Q35_COM2_SOURCE),
             Err(InterruptPlatformError::SourceInUse)
@@ -1972,11 +2095,18 @@ mod tests {
 
         let snapshot = std::thread::scope(|scope| {
             let freeze = scope.spawn(|| {
-                platform.freeze_dw1e_terminal(saved_u1, binding2, |replayed| {
-                    (replayed == saved_u1).then_some(()).ok_or(())
-                })
+                platform.freeze_dw1e_terminal(
+                    saved_u1,
+                    binding2,
+                    || true,
+                    |replayed| (replayed == saved_u1).then_some(()).ok_or(()),
+                )
             });
             INTERLEAVED_FREEZE.freeze_entered.wait();
+            // This vector arrives after the terminal freeze has reached
+            // Masking but before the pre-freeze handler finishes. It must be
+            // EOI-only, not an extra selector accounting entry.
+            assert_eq!(platform.snapshot_delivery(), Q35DeliverySnapshot::Orphan);
             platform.record_pending_delivery(generation2);
             platform.complete_handler(generation2);
             INTERLEAVED_FREEZE.allow_idle_read.wait();
@@ -1992,6 +2122,113 @@ mod tests {
         assert_eq!(snapshot.stale_orphans, 1);
         assert_eq!(platform.counter_snapshot_locked(), snapshot);
         assert_eq!(platform.snapshot_delivery(), Q35DeliverySnapshot::Orphan);
+        assert_eq!(platform.counter_snapshot_locked(), snapshot);
+    }
+
+    #[test]
+    fn terminal_freeze_defers_for_pending_u2_then_allows_the_exact_masked_ack() {
+        let platform = Q35InterruptPlatform::new(&FAKE_TERMINAL_PENDING).unwrap();
+        let reservation1 = platform.reserve_source(Q35_COM2_SOURCE).unwrap();
+        let binding1 = reservation1.binding;
+        platform.commit_source(reservation1);
+        let Q35DeliverySnapshot::Live {
+            delivery: saved_u1,
+            generation: generation1,
+        } = platform.snapshot_delivery()
+        else {
+            panic!("U1 did not produce the saved real delivery");
+        };
+        platform.complete_handler(generation1);
+        assert_eq!(
+            platform.retire_source(binding1),
+            InterruptRetirement::Complete
+        );
+
+        let reservation2 = platform.reserve_source(Q35_COM2_SOURCE).unwrap();
+        let binding2 = reservation2.binding;
+        platform.commit_source(reservation2);
+        let Q35DeliverySnapshot::Live {
+            generation: generation2,
+            ..
+        } = platform.snapshot_delivery()
+        else {
+            panic!("U2 did not enter its exact pending state");
+        };
+        platform.complete_handler(generation2);
+
+        let replayed = AtomicU32::new(0);
+        assert_eq!(
+            platform
+                .freeze_dw1e_terminal(
+                    saved_u1,
+                    binding2,
+                    || false,
+                    |_| {
+                        replayed.fetch_add(1, Ordering::AcqRel);
+                        Ok(())
+                    },
+                )
+                .unwrap(),
+            Q35TerminalFreeze::Deferred
+        );
+        assert_eq!(replayed.load(Ordering::Acquire), 0);
+        // CPU0 owns the durable masked claim and does not self-notify merely
+        // because U2 still needs its exact acknowledgement.
+        assert_eq!(FAKE_TERMINAL_PENDING.requests.load(Ordering::Acquire), 0);
+
+        // A remote carrier may publish one wake, which CPU0 consumes at its
+        // safe point while typed U2 is still pending. The later exact ack must
+        // publish again rather than stranding the terminal claim behind the
+        // already-consumed notification.
+        FAKE_TERMINAL_PENDING
+            .current_bsp
+            .store(false, Ordering::Release);
+        assert_eq!(
+            platform
+                .freeze_dw1e_terminal(saved_u1, binding2, || false, |_| Ok(()))
+                .unwrap(),
+            Q35TerminalFreeze::Deferred
+        );
+        assert_eq!(FAKE_TERMINAL_PENDING.requests.load(Ordering::Acquire), 1);
+        FAKE_TERMINAL_PENDING
+            .current_bsp
+            .store(true, Ordering::Release);
+        assert_eq!(
+            platform
+                .freeze_dw1e_terminal(saved_u1, binding2, || false, |_| Ok(()))
+                .unwrap(),
+            Q35TerminalFreeze::Deferred
+        );
+        assert_eq!(FAKE_TERMINAL_PENDING.requests.load(Ordering::Acquire), 1);
+
+        FAKE_TERMINAL_PENDING
+            .current_bsp
+            .store(false, Ordering::Release);
+        let ack = platform.acknowledge_source(binding2).unwrap();
+        platform.complete_ack(ack, InterruptAckOutcome::Armed);
+        platform.record_userspace_ack(binding2);
+        assert_eq!(FAKE_TERMINAL_PENDING.requests.load(Ordering::Acquire), 2);
+        FAKE_TERMINAL_PENDING
+            .current_bsp
+            .store(true, Ordering::Release);
+
+        let Q35TerminalFreeze::Complete(snapshot) = platform
+            .freeze_dw1e_terminal(
+                saved_u1,
+                binding2,
+                || true,
+                |_| {
+                    replayed.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                },
+            )
+            .unwrap()
+        else {
+            panic!("terminal freeze did not retry after the exact masked ack");
+        };
+        assert_eq!(replayed.load(Ordering::Acquire), 1);
+        assert_eq!(snapshot.acknowledgements, 1);
+        assert_eq!(FAKE_TERMINAL_PENDING.requests.load(Ordering::Acquire), 2);
     }
 
     #[test]
@@ -2022,10 +2259,15 @@ mod tests {
             .store(false, Ordering::Release);
         assert_eq!(
             platform
-                .freeze_dw1e_terminal(saved_u1, binding2, |_| {
-                    replayed.fetch_add(1, Ordering::AcqRel);
-                    Ok(())
-                })
+                .freeze_dw1e_terminal(
+                    saved_u1,
+                    binding2,
+                    || true,
+                    |_| {
+                        replayed.fetch_add(1, Ordering::AcqRel);
+                        Ok(())
+                    }
+                )
                 .unwrap(),
             Q35TerminalFreeze::Deferred
         );
@@ -2036,10 +2278,15 @@ mod tests {
             .current_bsp
             .store(true, Ordering::Release);
         let Q35TerminalFreeze::Complete(snapshot) = platform
-            .freeze_dw1e_terminal(saved_u1, binding2, |_| {
-                replayed.fetch_add(1, Ordering::AcqRel);
-                Ok(())
-            })
+            .freeze_dw1e_terminal(
+                saved_u1,
+                binding2,
+                || true,
+                |_| {
+                    replayed.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                },
+            )
             .unwrap()
         else {
             panic!("CPU0 retry did not complete the exact frozen generation");

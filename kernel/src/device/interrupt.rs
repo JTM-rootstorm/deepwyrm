@@ -808,6 +808,20 @@ impl<const INTERRUPTS: usize> InterruptAuthority<INTERRUPTS> {
                 )
             })
     }
+
+    /// Selector-31 terminal admission is a positive exact-state check: a
+    /// missing, Creating, Finalizing, Pending, or AckPrepared record is never
+    /// quiescent. Only the current live binding in `Armed` may cross the
+    /// terminal materialization boundary.
+    #[cfg(any(test, deepwyrm_dw1e_evidence))]
+    pub(crate) fn terminal_quiescent_for_binding(&self, binding: InterruptBinding) -> bool {
+        self.interrupts
+            .lock()
+            .iter()
+            .flatten()
+            .find(|interrupt| interrupt.binding == binding)
+            .is_some_and(|interrupt| matches!(interrupt.state, InterruptState::Armed))
+    }
 }
 
 fn exact_interrupt_mut<const INTERRUPTS: usize>(

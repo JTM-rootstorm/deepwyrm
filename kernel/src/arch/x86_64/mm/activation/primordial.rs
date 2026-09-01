@@ -5565,27 +5565,42 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     #[cfg(deepwyrm_dw1e_e3b_full)]
     fn try_freeze_dw1e_terminal(
         &self,
-        stale: crate::device::InterruptDelivery,
-        current: crate::device::InterruptBinding,
+        claim: crate::test_support::Dw1eTerminalClaim,
     ) -> Result<Option<crate::device::Q35InterruptCounterSnapshot>, ()> {
+        let stale = claim.saved_u1();
+        let current = claim.current_u2();
         match self
             .shared
             .interrupt_platform
-            .freeze_dw1e_terminal(stale, current, |saved_u1| {
-                crate::test_support::DW1E_EVIDENCE
-                    .materialize_terminal(current)
-                    .map_err(|_| ())?;
-                let (disposition, wakes) = self
-                    .shared
-                    .interrupts
-                    .deliver_classified(saved_u1, &self.shared.waits);
-                if disposition != crate::device::InterruptDeliveryDisposition::Rejected
-                    || !wakes.is_empty()
-                {
-                    return Err(());
-                }
-                Ok(())
-            })
+            .freeze_dw1e_terminal(
+                stale,
+                current,
+                || {
+                    self.shared
+                        .interrupts
+                        .terminal_quiescent_for_binding(current)
+                        && crate::test_support::DW1E_EVIDENCE
+                            .terminal_ready(claim)
+                            .unwrap_or_else(|error| {
+                                crate::test_support::complete_fail(0x3110_e1a3 | error as u32)
+                            })
+                },
+                |saved_u1| {
+                    crate::test_support::DW1E_EVIDENCE
+                        .materialize_terminal(claim)
+                        .map_err(|_| ())?;
+                    let (disposition, wakes) = self
+                        .shared
+                        .interrupts
+                        .deliver_classified(saved_u1, &self.shared.waits);
+                    if disposition != crate::device::InterruptDeliveryDisposition::Rejected
+                        || !wakes.is_empty()
+                    {
+                        return Err(());
+                    }
+                    Ok(())
+                },
+            )
             .map_err(|_| ())?
         {
             crate::device::Q35TerminalFreeze::Deferred => Ok(None),
@@ -5595,20 +5610,21 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     #[cfg(deepwyrm_dw1e_e3b_full)]
     fn service_pending_dw1e_terminal(&mut self) {
-        let Some((stale, current)) = crate::test_support::DW1E_EVIDENCE
+        let Some(claim) = crate::test_support::DW1E_EVIDENCE
             .pending_terminal()
             .unwrap_or_else(|error| crate::test_support::complete_fail(0x3110_e1a0 | error as u32))
         else {
             return;
         };
         let Some(counters) = self
-            .try_freeze_dw1e_terminal(stale, current)
+            .try_freeze_dw1e_terminal(claim)
             .unwrap_or_else(|()| crate::test_support::complete_fail(0x3110_e1a1))
         else {
             return;
         };
         let permit = crate::test_support::DW1E_EVIDENCE
             .complete_stale_and_accounting(
+                claim,
                 crate::device::InterruptDeliveryDisposition::Rejected,
                 0,
                 counters,
@@ -6911,13 +6927,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                 crate::test_support::complete_fail(0x3110_e16f);
                 #[cfg(deepwyrm_dw1e_e3b_full)]
                 {
-                    let (stale, current) = DW1E_EVIDENCE
-                        .prepare_terminal(self.process)
-                        .unwrap_or_else(|error| {
-                            crate::test_support::complete_fail(0x3110_e170 | error as u32)
-                        });
+                    let claim =
+                        DW1E_EVIDENCE
+                            .prepare_terminal(self.process)
+                            .unwrap_or_else(|error| {
+                                crate::test_support::complete_fail(0x3110_e170 | error as u32)
+                            });
                     let Some(counters) = self
-                        .try_freeze_dw1e_terminal(stale, current)
+                        .try_freeze_dw1e_terminal(claim)
                         .unwrap_or_else(|()| crate::test_support::complete_fail(0x3110_e180))
                     else {
                         self.commit_runtime_phase(phase);
@@ -6925,6 +6942,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                     };
                     let permit = DW1E_EVIDENCE
                         .complete_stale_and_accounting(
+                            claim,
                             crate::device::InterruptDeliveryDisposition::Rejected,
                             0,
                             counters,
@@ -9446,15 +9464,26 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     &mut self.cleanup,
                 ));
                 #[cfg(deepwyrm_dw1e_evidence)]
-                return NativeSyscallResult::returning(crate::syscall::interrupt_ack_dw1e(
-                    &mut self.registry,
-                    &mut self.tasks,
-                    &self.shared.interrupts,
-                    &self.shared.interrupt_platform,
-                    self.process,
-                    interrupt,
-                    &mut self.cleanup,
-                ));
+                {
+                    let status = crate::syscall::interrupt_ack_dw1e(
+                        &mut self.registry,
+                        &mut self.tasks,
+                        &self.shared.interrupts,
+                        &self.shared.interrupt_platform,
+                        self.process,
+                        interrupt,
+                        &mut self.cleanup,
+                    );
+                    // A terminal claim can have masked U2 while this exact
+                    // pre-Masking acknowledgement was Pending/AckPrepared.
+                    // Retry immediately after a successful CPU0 ack instead
+                    // of relying on an unrelated later carrier safe point.
+                    if status == DW_STATUS_SUCCESS && self.cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                        #[cfg(deepwyrm_dw1e_e3b_full)]
+                        self.service_pending_dw1e_terminal();
+                    }
+                    return NativeSyscallResult::returning(status);
+                }
                 #[cfg(not(any(deepwyrm_dw1d_evidence, deepwyrm_dw1e_evidence)))]
                 NativeSyscallResult::returning(crate::syscall::interrupt_ack(
                     &mut self.registry,

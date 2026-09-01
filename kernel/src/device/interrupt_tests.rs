@@ -830,6 +830,45 @@ fn ack_consumes_coalesced_fact_then_rearms_and_rejects_empty_state() {
 }
 
 #[test]
+fn terminal_quiescence_requires_the_exact_live_armed_binding() {
+    let mut fixture = Fixture::broad();
+    let (key, handle) = fixture.create_interrupt();
+    let binding = fixture.interrupts.binding(key);
+    assert!(fixture.interrupts.terminal_quiescent_for_binding(binding));
+
+    let missing = InterruptBinding::for_test(
+        binding.domain(),
+        binding.source(),
+        binding.generation().checked_add(1).unwrap(),
+    );
+    assert!(!fixture.interrupts.terminal_quiescent_for_binding(missing));
+
+    assert_eq!(fixture.deliver(binding).len(), 0);
+    assert!(!fixture.interrupts.terminal_quiescent_for_binding(binding));
+
+    let transaction = prepare_interrupt_ack(
+        &fixture.table,
+        &mut fixture.registry,
+        &fixture.interrupts,
+        handle,
+    )
+    .unwrap();
+    assert!(!fixture.interrupts.terminal_quiescent_for_binding(binding));
+    assert_eq!(
+        transaction.complete(
+            &mut fixture.registry,
+            &fixture.interrupts,
+            &fixture.platform,
+        ),
+        Ok(None)
+    );
+    assert!(fixture.interrupts.terminal_quiescent_for_binding(binding));
+
+    assert!(fixture.close_interrupt(handle).is_none());
+    fixture.finish_resource(None);
+}
+
+#[test]
 fn delivery_racing_prepared_ack_survives_and_source_remains_masked() {
     let mut fixture = Fixture::broad();
     let (key, handle) = fixture.create_interrupt();
