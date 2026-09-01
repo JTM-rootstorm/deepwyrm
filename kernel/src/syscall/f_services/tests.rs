@@ -14,7 +14,7 @@ use deepwyrm_abi::{
     DW_PROCESS_CREATE_ARGS_V1_SIZE, DW_PROCESS_CREATE_RESULT_V1_SIZE, DW_RIGHT_INSPECT,
     DW_RIGHT_MODIFY, DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE,
     DW_SIGNAL_READABLE, DW_SIGNAL_SIGNALED, DW_STATUS_SUCCESS, DW_STATUS_TIMED_OUT,
-    DW_TASK_STATE_CREATED, DwHandle, DwHandleTransferV1, DwRights,
+    DW_TASK_STATE_CREATED, DW_WAIT_MODE_ANY, DwHandle, DwHandleTransferV1, DwRights,
 };
 use std::vec;
 use std::vec::Vec;
@@ -28,6 +28,9 @@ const ATOMIC_WAITERS: usize = 4;
 
 type Tasks = TaskAuthority<3, 3, 2, 16>;
 type Services = FServiceState<FakeOwnedOutput, FakeAtomicPin, OBJECTS, ATOMIC_WAITERS, EXECUTION>;
+
+#[repr(align(4096))]
+struct TestStackRegion([u8; 0x12_000]);
 
 struct FakeUserMemory {
     bytes: [u8; USER_BYTES],
@@ -337,6 +340,7 @@ struct Fixture {
     process: ProcessKey,
     thread: ThreadKey,
     sender: Option<ThreadKey>,
+    _stack_regions: [std::boxed::Box<TestStackRegion>; EXECUTION],
 }
 
 impl Fixture {
@@ -386,7 +390,18 @@ impl Fixture {
         assert!(registry.release_internal(process_owner).unwrap().is_none());
         assert!(registry.release_internal(root_owner).unwrap().is_none());
 
-        let execution = ExecutionDomain::new(test_stack_bounds()).unwrap();
+        let mut stack_regions =
+            core::array::from_fn(|_| std::boxed::Box::new(TestStackRegion([0; 0x12_000])));
+        let stack_bounds = core::array::from_fn(|index| {
+            let guard = stack_regions[index].0.as_mut_ptr() as u64;
+            crate::memory::kernel_stack::KernelStackBounds::new(
+                guard,
+                guard + 0x1000,
+                guard + 0x11_000,
+            )
+            .unwrap()
+        });
+        let execution = ExecutionDomain::new(stack_bounds).unwrap();
         execution
             .start_thread(
                 &mut tasks,
@@ -434,6 +449,7 @@ impl Fixture {
             process,
             thread,
             sender,
+            _stack_regions: stack_regions,
         }
     }
 
@@ -958,6 +974,210 @@ fn channel_send_wakes_blocked_peer_then_sender_immediately_dispatches() {
     );
     assert_eq!(fixture.user.owned_outputs, 0);
 
+    close_channel(&mut fixture, sender_channel);
+    close_channel(&mut fixture, receiver_channel);
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the fixture completes each synthetic same-CPU continuation handoff before resuming its exact wait owner"
+)]
+fn channel_send_resumes_same_cpu_wait_many_peer_without_an_unrelated_interrupt() {
+    let mut fixture = Fixture::with_runnable_sender();
+    let sender = fixture.sender.expect("two-thread fixture retains sender");
+    let channel_rights =
+        DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_TRANSFER.0 | DW_RIGHT_WAIT.0);
+
+    assert_eq!(
+        fixture
+            .handled(NativeSyscallRequest::ChannelCreate {
+                requested_rights: channel_rights,
+                out_endpoint0: DwUserAddress(BASE + 0x100),
+                out_endpoint1: DwUserAddress(BASE + 0x108),
+            })
+            .status,
+        DW_STATUS_SUCCESS
+    );
+    let sender_channel = DwHandle(u64_at(&fixture.user, BASE + 0x100));
+    let receiver_channel = DwHandle(u64_at(&fixture.user, BASE + 0x108));
+    assert_eq!(
+        fixture
+            .handled(NativeSyscallRequest::EventCreate {
+                requested_rights: DW_RIGHT_WAIT,
+                out_event: DwUserAddress(BASE + 0x110),
+            })
+            .status,
+        DW_STATUS_SUCCESS
+    );
+    let sender_idle_event = DwHandle(u64_at(&fixture.user, BASE + 0x110));
+
+    let receiver_items = FakeUserMemory::offset(BASE + 0x180, 16);
+    fixture.user.bytes[receiver_items..receiver_items + 8]
+        .copy_from_slice(&receiver_channel.0.to_le_bytes());
+    fixture.user.bytes[receiver_items + 8..receiver_items + 16]
+        .copy_from_slice(&DW_SIGNAL_READABLE.0.to_le_bytes());
+    let receiver_wait = fixture.handled(NativeSyscallRequest::WaitMany {
+        items: DwUserAddress(BASE + 0x180),
+        item_count: 1,
+        mode: DW_WAIT_MODE_ANY,
+        deadline: DW_DEADLINE_INFINITE,
+        out_result: DwUserAddress(BASE + 0x200),
+    });
+    assert_eq!(receiver_wait.status, DW_STATUS_SUCCESS);
+    assert_eq!(
+        receiver_wait.control,
+        super::super::native::SyscallControl::SuspendCurrent
+    );
+    let receiver_switch = unsafe {
+        fixture.services.prepare_suspend(
+            &mut fixture.control,
+            &fixture.tasks,
+            &fixture.execution,
+            0xffff_8000_0012_3000,
+        )
+    }
+    .unwrap();
+    assert!(matches!(receiver_switch, NativeSuspendPlan::Switch(_)));
+    drop(receiver_switch);
+    let receiver_claim = fixture
+        .execution
+        .suspended_claim_on(crate::cpu::CpuIndex::BOOTSTRAP)
+        .expect("receiver handoff retains its outgoing continuation claim");
+    assert_eq!(receiver_claim.thread(), fixture.thread);
+    assert_eq!(
+        fixture.execution.complete_switch_on(receiver_claim),
+        Ok(None)
+    );
+    assert_eq!(
+        fixture.execution.scheduler_state(sender),
+        Some(SchedulerThreadState::Running)
+    );
+
+    let marker = core::array::from_fn::<u8, 80, _>(|index| 0x40 + (index % 0x20) as u8);
+    let marker_offset = FakeUserMemory::offset(BASE + 0x280, marker.len());
+    fixture.user.bytes[marker_offset..marker_offset + marker.len()].copy_from_slice(&marker);
+    let sent = fixture.handled_as(
+        sender,
+        crate::cpu::CpuIndex::BOOTSTRAP,
+        NativeSyscallRequest::ChannelSend {
+            channel: sender_channel,
+            bytes: DwUserAddress(BASE + 0x280),
+            byte_len: marker.len() as u32,
+            transfers: DwUserAddress(BASE + 0x300),
+            transfer_count: 0,
+            flags: 0,
+        },
+    );
+    assert_eq!(sent.status, DW_STATUS_SUCCESS);
+    assert_eq!(
+        sent.control,
+        super::super::native::SyscallControl::ReturnToCaller
+    );
+    assert_eq!(
+        fixture.execution.scheduler_state(fixture.thread),
+        Some(SchedulerThreadState::Runnable)
+    );
+
+    let sender_items = FakeUserMemory::offset(BASE + 0x380, 16);
+    fixture.user.bytes[sender_items..sender_items + 8]
+        .copy_from_slice(&sender_idle_event.0.to_le_bytes());
+    fixture.user.bytes[sender_items + 8..sender_items + 16]
+        .copy_from_slice(&DW_SIGNAL_SIGNALED.0.to_le_bytes());
+    let sender_wait = fixture.handled_as(
+        sender,
+        crate::cpu::CpuIndex::BOOTSTRAP,
+        NativeSyscallRequest::WaitMany {
+            items: DwUserAddress(BASE + 0x380),
+            item_count: 1,
+            mode: DW_WAIT_MODE_ANY,
+            deadline: DW_DEADLINE_INFINITE,
+            out_result: DwUserAddress(BASE + 0x400),
+        },
+    );
+    assert_eq!(sender_wait.status, DW_STATUS_SUCCESS);
+    assert_eq!(
+        sender_wait.control,
+        super::super::native::SyscallControl::SuspendCurrent
+    );
+    assert_eq!(
+        fixture.execution.scheduler_state(fixture.thread),
+        Some(SchedulerThreadState::Running)
+    );
+    let sender_switch = unsafe {
+        fixture.services.prepare_suspend(
+            &mut fixture.control,
+            &fixture.tasks,
+            &fixture.execution,
+            0xffff_8000_0012_3000,
+        )
+    }
+    .unwrap();
+    assert!(matches!(sender_switch, NativeSuspendPlan::Switch(_)));
+    drop(sender_switch);
+    let sender_claim = fixture
+        .execution
+        .suspended_claim_on(crate::cpu::CpuIndex::BOOTSTRAP)
+        .expect("sender handoff retains its outgoing continuation claim");
+    assert_eq!(sender_claim.thread(), sender);
+    assert_eq!(fixture.execution.complete_switch_on(sender_claim), Ok(None));
+
+    let resumed = fixture
+        .services
+        .resume_suspended(
+            &mut fixture.user,
+            &mut fixture.registry,
+            &mut fixture.tasks,
+            &fixture.waits,
+            &fixture.execution,
+            fixture.thread,
+            Some(&mut fixture.wait_deadlines),
+        )
+        .unwrap();
+    let (status, cleanup) = resumed.into_parts();
+    assert_eq!(status, DW_STATUS_SUCCESS);
+    assert_empty_cleanup(cleanup);
+    assert_eq!(u32_at(&fixture.user, BASE + 0x200 + 8), 0);
+    assert_ne!(
+        u64_at(&fixture.user, BASE + 0x200 + 16) & DW_SIGNAL_READABLE.0,
+        0
+    );
+
+    let received = fixture.handled(NativeSyscallRequest::ChannelReceive {
+        channel: receiver_channel,
+        out_bytes: DwUserAddress(BASE + 0x500),
+        byte_capacity: marker.len() as u32,
+        out_handles: DwUserAddress(BASE + 0x600),
+        handle_capacity: 0,
+        out_result: DwUserAddress(BASE + 0x680),
+    });
+    assert_eq!(received.status, DW_STATUS_SUCCESS);
+    let received_offset = FakeUserMemory::offset(BASE + 0x500, marker.len());
+    assert_eq!(
+        &fixture.user.bytes[received_offset..received_offset + marker.len()],
+        &marker
+    );
+
+    let mut cleanup = CleanupQueue::<OBJECTS>::new();
+    {
+        let user = &mut fixture.user;
+        let mut terminal = fixture.services.terminal_cleanup(
+            Some(&mut fixture.wait_deadlines),
+            |output| user.discard_owned_output(output),
+            |_| panic!("sender idle wait cannot own an atomic pin"),
+        );
+        terminal.cleanup_terminal_wait(
+            &mut fixture.registry,
+            &mut fixture.tasks,
+            &fixture.waits,
+            &fixture.execution,
+            sender,
+            &mut cleanup,
+        );
+    }
+    assert_empty_cleanup(cleanup);
+
+    close_event(&mut fixture, sender_idle_event);
     close_channel(&mut fixture, sender_channel);
     close_channel(&mut fixture, receiver_channel);
 }

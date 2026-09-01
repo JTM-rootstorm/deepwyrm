@@ -110,6 +110,7 @@ pub(crate) struct IdleWakeSet {
     cpus: [IdleCpuSlot; CPU_CAPACITY],
     mailboxes: [RendezvousMailbox; CPU_CAPACITY],
     ipi_latches: RendezvousIpiLatches,
+    local_rescan_pending: [AtomicBool; CPU_CAPACITY],
     faulted: AtomicBool,
 }
 
@@ -124,6 +125,7 @@ impl IdleWakeSet {
                 RendezvousMailbox::for_cpu(cpu(3)),
             ],
             ipi_latches: RendezvousIpiLatches::new(),
+            local_rescan_pending: [const { AtomicBool::new(false) }; CPU_CAPACITY],
             faulted: AtomicBool::new(false),
         }
     }
@@ -194,11 +196,13 @@ impl IdleWakeSet {
         }
         let cpu = preparation.cpu;
         let generation = preparation.generation;
-        // An EOI-completed e1 may already have published its CPU-local latch
-        // before we reach the architectural `sti; hlt`. Consume/rescan it in
-        // the carrier path rather than entering HALTED and depending on a
-        // second interrupt that need never arrive.
-        if self.ipi_latches.is_pending(cpu) {
+        // An EOI-completed e1 or a same-CPU Runnable publication may already
+        // have published its CPU-local latch before we reach the architectural
+        // `sti; hlt`. Consume/rescan it in the carrier path rather than entering
+        // HALTED and depending on an interrupt that need never arrive.
+        if self.local_rescan_pending[cpu.index()].swap(false, Ordering::AcqRel)
+            || self.ipi_latches.is_pending(cpu)
+        {
             return Err(IdleCommitFailure {
                 error: IdleWakeError::RescanRequired,
                 preparation,
@@ -256,10 +260,30 @@ impl IdleWakeSet {
         Ok(None)
     }
 
+    /// Preserves generic remote distribution for unpinned work and also
+    /// records the publisher's local rescan obligation. The latter closes the
+    /// window where work is published after the final scheduler poll but
+    /// before this CPU commits `sti; hlt`.
+    pub(crate) fn publish_unpinned_runnable(
+        &self,
+        publisher: CpuIndex,
+    ) -> Result<Option<CpuIndex>, IdleWakeError> {
+        let remote = self.publish_runnable(publisher)?;
+        self.publish_local_runnable(publisher)?;
+        Ok(remote)
+    }
+
+    fn publish_local_runnable(&self, publisher: CpuIndex) -> Result<(), IdleWakeError> {
+        self.ensure_healthy()?;
+        if self.cpus[publisher.index()].state.load(Ordering::Acquire) == CPU_UNAVAILABLE {
+            return Err(IdleWakeError::Unavailable);
+        }
+        self.local_rescan_pending[publisher.index()].store(true, Ordering::Release);
+        self.ensure_healthy()
+    }
+
     /// Publishes Wake only to the CPU that still owns a Runnable Thread's
-    /// physically suspended continuation. An active owner needs no IPI; an
-    /// unavailable owner is a broken scheduler/carrier binding and fails
-    /// closed rather than waking a non-owner that cannot claim the Thread.
+    /// physically suspended continuation.
     pub(crate) fn publish_affine_runnable(
         &self,
         publisher: CpuIndex,
@@ -267,6 +291,7 @@ impl IdleWakeSet {
     ) -> Result<Option<CpuIndex>, IdleWakeError> {
         self.ensure_healthy()?;
         if owner == publisher {
+            self.publish_local_runnable(publisher)?;
             return Ok(None);
         }
         match self.cpus[owner.index()].state.load(Ordering::Acquire) {
@@ -426,10 +451,12 @@ pub(crate) fn finish_current_idle(halt: IdleHalt) -> Result<(), IdleWakeError> {
     LIVE_IDLE_WAKE.finish(halt)
 }
 
-/// Publishes one coalesced e1 Wake to an eligible remote idle CPU. The
-/// rendezvous mailbox is updated before transport send; a transport failure is
-/// fail-stop because Runnable publication has already committed and cannot be
-/// rolled back without violating the wait/start winner contract.
+/// Publishes one coalesced e1 Wake to an exact continuation owner or eligible
+/// remote idle CPU. Unpinned work also records a local rescan obligation so a
+/// post-poll publication cannot be slept through. The rendezvous mailbox is
+/// updated before transport send; a transport failure is fail-stop because
+/// Runnable publication has already committed and cannot be rolled back
+/// without violating the wait/start winner contract.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) fn notify_runnable_work(affinity: Option<CpuIndex>) {
     let Ok(publisher) = current_cpu() else {
@@ -437,7 +464,7 @@ pub(crate) fn notify_runnable_work(affinity: Option<CpuIndex>) {
     };
     let target = match affinity {
         Some(owner) => LIVE_IDLE_WAKE.publish_affine_runnable(publisher, owner),
-        None => LIVE_IDLE_WAKE.publish_runnable(publisher),
+        None => LIVE_IDLE_WAKE.publish_unpinned_runnable(publisher),
     };
     let Ok(target) = target else {
         fail_transport_and_halt();
@@ -677,17 +704,33 @@ mod tests {
     }
 
     #[test]
-    fn runnable_publisher_is_never_its_own_wake_target() {
+    fn same_cpu_runnable_after_scheduler_poll_forces_pre_halt_rescan() {
         let idle = IdleWakeSet::new();
         idle.enable(cpu(0)).unwrap();
         let preparation = idle.prepare(cpu(0)).unwrap();
-        assert_eq!(idle.publish_runnable(cpu(0)), Ok(None));
-        assert_eq!(idle.publish_affine_runnable(cpu(0), cpu(0)), Ok(None));
+        assert_eq!(idle.publish_unpinned_runnable(cpu(0)), Ok(None));
+        let failure = idle.commit(preparation).unwrap_err();
+        assert_eq!(failure.error(), IdleWakeError::RescanRequired);
         assert_eq!(
-            idle.take_notification(cpu(0)),
+            idle.take_latched_notification(cpu(0)),
             Ok(MailboxNotification::None)
         );
-        idle.cancel(preparation).unwrap();
+        idle.cancel(failure.into_preparation()).unwrap();
+    }
+
+    #[test]
+    fn same_cpu_affine_wake_before_switch_completion_forces_pre_halt_rescan() {
+        let idle = IdleWakeSet::new();
+        idle.enable(cpu(0)).unwrap();
+        let preparation = idle.prepare(cpu(0)).unwrap();
+        assert_eq!(idle.publish_affine_runnable(cpu(0), cpu(0)), Ok(None));
+        let failure = idle.commit(preparation).unwrap_err();
+        assert_eq!(failure.error(), IdleWakeError::RescanRequired);
+        assert_eq!(
+            idle.take_latched_notification(cpu(0)),
+            Ok(MailboxNotification::None)
+        );
+        idle.cancel(failure.into_preparation()).unwrap();
     }
 
     #[test]
