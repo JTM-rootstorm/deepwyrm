@@ -66,6 +66,30 @@ const EVENT_STALE_U1_REJECTED: u8 = 0x18;
 const EVENT_ACCOUNTING: u8 = 0x19;
 const EVENT_TERMINAL: u8 = 0xff;
 
+pub(crate) struct Dw1eTerminalArbiter {
+    owner: AtomicU8,
+}
+
+impl Dw1eTerminalArbiter {
+    pub(crate) const fn new() -> Self {
+        Self {
+            owner: AtomicU8::new(0),
+        }
+    }
+
+    pub(crate) fn claim(&self, owner: u8) -> bool {
+        assert!(matches!(owner, 1 | 2));
+        self.owner
+            .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    #[cfg(test)]
+    fn owner(&self) -> u8 {
+        self.owner.load(Ordering::Acquire)
+    }
+}
+
 // E3A consumes only the first nine entries. Keeping the complete contract
 // order here prevents E3B from renumbering or repurposing the reserved tail.
 const EVIDENCE_EVENT_ORDER: [u8; DW1E_EVIDENCE_RECORD_COUNT] = [
@@ -796,22 +820,34 @@ impl Dw1eEvidenceCollector {
                     return Err(state.latch(Dw1eEvidenceError::WrongRelation));
                 }
                 state.response = Some((value, auxiliary));
-                materialize_leg(&mut state)
+                #[cfg(not(deepwyrm_dw1e_e3b_full))]
+                if event == EVENT_C1_RESPONSE {
+                    materialize_leg(&mut state)?;
+                }
+                Ok(())
             }
+            #[cfg(deepwyrm_dw1e_e3b_full)]
             EVENT_U1_PEER_CLOSED => {
-                let first = state
-                    .first_committed
-                    .ok_or_else(|| state.latch(Dw1eEvidenceError::Early))?;
+                if state.record_count != 3 {
+                    return Err(state.latch(Dw1eEvidenceError::OutOfOrder));
+                }
                 let challenge = state
-                    .first_challenge
+                    .challenge
                     .ok_or_else(|| state.latch(Dw1eEvidenceError::Early))?;
                 if state.controller != Some(caller)
-                    || state.record_count != 9
                     || value != challenge.stream_generation
                     || auxiliary != 0
                 {
                     return Err(state.latch(Dw1eEvidenceError::WrongRelation));
                 }
+                materialize_leg(&mut state)?;
+                assert_eq!(state.record_count, DW1E_E3A_RECORD_COUNT);
+                let first = state
+                    .first_committed
+                    .expect("first-leg materialization retains its committed tuple");
+                let challenge = state
+                    .first_challenge
+                    .expect("first-leg materialization retains its challenge tuple");
                 let attempt_generation = state.first_attempt_generation;
                 state.push(tuple_record(
                     EVENT_U1_PEER_CLOSED,
@@ -885,10 +921,6 @@ impl Dw1eEvidenceCollector {
         binding: InterruptBinding,
         idle_reads: u64,
     ) -> Result<(), Dw1eEvidenceError> {
-        let count = self.state.lock().record_count;
-        if count > 11 {
-            return Ok(());
-        }
         if !(1..=65_536).contains(&idle_reads) {
             let mut state = self.state.lock();
             return Err(state.latch(Dw1eEvidenceError::WrongRelation));
@@ -900,10 +932,6 @@ impl Dw1eEvidenceCollector {
         &self,
         binding: InterruptBinding,
     ) -> Result<(), Dw1eEvidenceError> {
-        let count = self.state.lock().record_count;
-        if count > 12 {
-            return Ok(());
-        }
         self.push_u1_retirement(EVENT_U1_HANDLER_QUIESCENT, binding, 0, 0, 12)
     }
 
@@ -911,10 +939,6 @@ impl Dw1eEvidenceCollector {
         &self,
         binding: InterruptBinding,
     ) -> Result<(), Dw1eEvidenceError> {
-        let count = self.state.lock().record_count;
-        if count > 13 {
-            return Ok(());
-        }
         self.push_u1_retirement(EVENT_U1_LAPIC_CLEAR, binding, 3, 0, 13)
     }
 
@@ -934,14 +958,36 @@ impl Dw1eEvidenceCollector {
         expected_count: usize,
     ) -> Result<(), Dw1eEvidenceError> {
         let mut state = self.state.lock();
+        if let Some(failure) = state.failure {
+            return Err(failure);
+        }
         let first = state
             .first_committed
             .ok_or_else(|| state.latch(Dw1eEvidenceError::Early))?;
         let challenge = state
             .first_challenge
             .ok_or_else(|| state.latch(Dw1eEvidenceError::Early))?;
-        if binding != first.binding || state.record_count != expected_count {
+        if binding != first.binding {
             return Err(state.latch(Dw1eEvidenceError::WrongRelation));
+        }
+        if state.record_count > expected_count {
+            let expected = tuple_record(
+                event,
+                ACTOR_KERNEL,
+                first,
+                state.first_attempt_generation,
+                Some(challenge),
+                value,
+                auxiliary,
+            );
+            return if state.records[expected_count] == Some(expected) {
+                Ok(())
+            } else {
+                Err(state.latch(Dw1eEvidenceError::WrongRelation))
+            };
+        }
+        if state.record_count != expected_count {
+            return Err(state.latch(Dw1eEvidenceError::OutOfOrder));
         }
         let attempt_generation = state.first_attempt_generation;
         state.push(tuple_record(
@@ -955,21 +1001,10 @@ impl Dw1eEvidenceCollector {
         ))
     }
 
-    #[cfg(test)]
-    pub(crate) fn saved_u1_delivery(&self) -> Result<InterruptDelivery, Dw1eEvidenceError> {
-        let mut state = self.state.lock();
-        if state.record_count != 23 {
-            return Err(state.latch(Dw1eEvidenceError::OutOfOrder));
-        }
-        state
-            .saved_u1_delivery
-            .ok_or_else(|| state.latch(Dw1eEvidenceError::Incomplete))
-    }
-
     pub(crate) fn claim_terminal(
         &self,
         caller: ProcessKey,
-    ) -> Result<InterruptDelivery, Dw1eEvidenceError> {
+    ) -> Result<(InterruptDelivery, InterruptBinding), Dw1eEvidenceError> {
         let mut state = self.state.lock();
         if let Some(failure) = state.failure {
             return Err(failure);
@@ -980,14 +1015,19 @@ impl Dw1eEvidenceCollector {
         if state.controller != Some(caller) {
             return Err(state.latch(Dw1eEvidenceError::WrongActor));
         }
-        if state.record_count != 23 {
+        if state.record_count != 17 {
             return Err(state.latch(Dw1eEvidenceError::OutOfOrder));
         }
+        materialize_leg(&mut state)?;
         let delivery = state
             .saved_u1_delivery
             .ok_or_else(|| state.latch(Dw1eEvidenceError::Incomplete))?;
+        let current = state
+            .committed
+            .ok_or_else(|| state.latch(Dw1eEvidenceError::Incomplete))?
+            .binding;
         state.terminal_claimed = true;
-        Ok(delivery)
+        Ok((delivery, current))
     }
 
     pub(crate) fn complete_stale_and_accounting(
@@ -1755,9 +1795,12 @@ pub(crate) static DW1E_EVIDENCE: Dw1eEvidenceCollector =
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
     use crate::object::ObjectRegistry;
     use deepwyrm_abi::{DW_OBJECT_TYPE_INTERRUPT, DW_OBJECT_TYPE_PROCESS};
+    use std::sync::Barrier;
 
     fn sample_record() -> Dw1eEvidenceRecord {
         Dw1eEvidenceRecord {
@@ -1928,7 +1971,131 @@ mod tests {
     }
 
     #[test]
-    fn first_leg_model_extracts_exact_records_without_a_terminal() {
+    fn terminal_arbiter_success_first_blocks_failure_and_panic_racers() {
+        let arbiter = Dw1eTerminalArbiter::new();
+        let claimed = Barrier::new(2);
+        std::thread::scope(|scope| {
+            let success = scope.spawn(|| {
+                assert!(arbiter.claim(1));
+                claimed.wait();
+            });
+            claimed.wait();
+            let failure = scope.spawn(|| arbiter.claim(2));
+            let panic = scope.spawn(|| arbiter.claim(2));
+            success.join().unwrap();
+            assert!(!failure.join().unwrap());
+            assert!(!panic.join().unwrap());
+        });
+        assert_eq!(arbiter.owner(), 1);
+    }
+
+    #[test]
+    fn terminal_arbiter_failure_first_blocks_success_and_panic_racers() {
+        let arbiter = Dw1eTerminalArbiter::new();
+        let claimed = Barrier::new(2);
+        std::thread::scope(|scope| {
+            let failure = scope.spawn(|| {
+                assert!(arbiter.claim(2));
+                claimed.wait();
+            });
+            claimed.wait();
+            let success = scope.spawn(|| arbiter.claim(1));
+            let panic = scope.spawn(|| arbiter.claim(2));
+            failure.join().unwrap();
+            assert!(!success.join().unwrap());
+            assert!(!panic.join().unwrap());
+        });
+        assert_eq!(arbiter.owner(), 2);
+    }
+
+    #[test]
+    #[cfg(not(deepwyrm_dw1e_e3b_full))]
+    fn e3a_response_materializes_and_extracts_exact_records_without_a_terminal() {
+        let collector = Dw1eEvidenceCollector::new(0x1234);
+        let route = PlatformIrqRoute::test_q35(
+            crate::arch::x86_64::acpi::IoApicDescriptor::test_descriptor(2, 0xfec0_0000, 0),
+            3,
+            7,
+        );
+        collector.observe_route(route).unwrap();
+        let binding = InterruptBinding::for_test(9, 3, 11);
+        collector.observe_reserved(binding).unwrap();
+        let mut registry = ObjectRegistry::<8>::new();
+        let object = registry.create(DW_OBJECT_TYPE_INTERRUPT).unwrap().id();
+        let driver =
+            ProcessKey::from_object_id(registry.create(DW_OBJECT_TYPE_PROCESS).unwrap().id());
+        let probe =
+            ProcessKey::from_object_id(registry.create(DW_OBJECT_TYPE_PROCESS).unwrap().id());
+        let controller =
+            ProcessKey::from_object_id(registry.create(DW_OBJECT_TYPE_PROCESS).unwrap().id());
+        collector.observe_committed(object, binding, 13).unwrap();
+        collector
+            .bind_driver(driver, object, binding, 13, 17)
+            .unwrap();
+        collector.bind_probe(controller, probe).unwrap();
+        collector
+            .arm_challenge(driver, 19, 23, 5, 29, driver, object, 31, 37)
+            .unwrap();
+        collector
+            .observe_physical(InterruptDelivery::for_test(binding))
+            .unwrap();
+        collector
+            .observe_delivery(binding, InterruptDeliveryDisposition::FirstPending)
+            .unwrap();
+        collector
+            .observe_wait_completion(driver, 31, 37, DW_SIGNAL_SIGNALED)
+            .unwrap();
+        collector
+            .submit(driver, EVENT_C1_UART_DRAIN, 5, 29)
+            .unwrap();
+        collector.observe_ack(driver, binding, false).unwrap();
+
+        // The response itself is transmitted through one exact U1 THRI
+        // epoch before the probe reports that it received the bytes.
+        collector
+            .observe_physical(InterruptDelivery::for_test(binding))
+            .unwrap();
+        collector
+            .observe_delivery(binding, InterruptDeliveryDisposition::FirstPending)
+            .unwrap();
+        collector.observe_ack(driver, binding, false).unwrap();
+        collector.submit(probe, EVENT_C1_RESPONSE, 7, 41).unwrap();
+
+        let permit = collector.partial_permit().unwrap();
+        let mut transcript = [[0_u8; DW1E_EVIDENCE_RECORD_LEN]; DW1E_E3A_RECORD_COUNT];
+        let mut count = 0;
+        permit
+            .flush(|record| {
+                transcript[count] = *record;
+                count += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(count, DW1E_E3A_RECORD_COUNT);
+        assert_eq!(validate_e3a_transcript(&transcript, 0x1234), Ok(()));
+        assert!(matches!(
+            collector.partial_permit(),
+            Err(Dw1eEvidenceError::PartialClaimed)
+        ));
+
+        // E3A's immutable extraction remains tolerant of a late, exact THRI
+        // completion in the still-live U1 generation.
+        collector
+            .observe_physical(InterruptDelivery::for_test(binding))
+            .unwrap();
+        collector
+            .observe_delivery(binding, InterruptDeliveryDisposition::FirstPending)
+            .unwrap();
+        collector.observe_ack(driver, binding, false).unwrap();
+        assert_eq!(
+            collector.submit(controller, EVENT_U1_PEER_CLOSED, 19, 0),
+            Err(Dw1eEvidenceError::Malformed)
+        );
+    }
+
+    #[test]
+    #[cfg(deepwyrm_dw1e_e3b_full)]
+    fn e3b_first_leg_materializes_only_at_the_peer_close_barrier() {
         let collector = Dw1eEvidenceCollector::new(0x1234);
         let route = PlatformIrqRoute::test_q35(
             crate::arch::x86_64::acpi::IoApicDescriptor::test_descriptor(2, 0xfec0_0000, 0),
@@ -1983,26 +2150,14 @@ mod tests {
         collector.observe_ack(driver, binding, false).unwrap();
         collector.submit(probe, EVENT_C1_RESPONSE, 7, 41).unwrap();
 
-        let permit = collector.partial_permit().unwrap();
-        let mut transcript = [[0_u8; DW1E_EVIDENCE_RECORD_LEN]; DW1E_E3A_RECORD_COUNT];
-        let mut count = 0;
-        permit
-            .flush(|record| {
-                transcript[count] = *record;
-                count += 1;
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(count, DW1E_E3A_RECORD_COUNT);
-        assert_eq!(validate_e3a_transcript(&transcript, 0x1234), Ok(()));
         assert!(matches!(
             collector.partial_permit(),
-            Err(Dw1eEvidenceError::PartialClaimed)
+            Err(Dw1eEvidenceError::Incomplete)
         ));
 
-        // E3A flushes before the host has necessarily observed the queued
-        // response. A late but exact transmit epoch may still finish after
-        // the immutable nine-record extraction without panicking the guest.
+        // The probe response does not freeze the leg. A late valid transmit
+        // interrupt and ack remain part of C1 until the controller's
+        // peer-close/TEMT barrier materializes records 3 through 8.
         collector
             .observe_physical(InterruptDelivery::for_test(binding))
             .unwrap();
@@ -2010,9 +2165,25 @@ mod tests {
             .observe_delivery(binding, InterruptDeliveryDisposition::FirstPending)
             .unwrap();
         collector.observe_ack(driver, binding, false).unwrap();
+        collector
+            .submit(controller, EVENT_U1_PEER_CLOSED, 19, 0)
+            .unwrap();
+
+        let mut transcript = [[0_u8; DW1E_EVIDENCE_RECORD_LEN]; DW1E_E3A_RECORD_COUNT];
+        let state = collector.state.lock();
+        for (sequence, output) in transcript.iter_mut().enumerate() {
+            *output = encode_record(sequence as u32, state.records[sequence].unwrap(), 0x1234);
+        }
+        drop(state);
+        assert_eq!(validate_e3a_transcript(&transcript, 0x1234), Ok(()));
+        assert!(matches!(
+            collector.partial_permit(),
+            Err(Dw1eEvidenceError::Incomplete)
+        ));
     }
 
     #[test]
+    #[cfg(deepwyrm_dw1e_e3b_full)]
     fn full_e3b_model_retires_replaces_and_rejects_saved_u1_delivery() {
         let collector = Dw1eEvidenceCollector::new(0x1234);
         let route = PlatformIrqRoute::test_q35(
@@ -2065,6 +2236,13 @@ mod tests {
         }
         collector.submit(probe1, EVENT_C1_RESPONSE, 7, 41).unwrap();
         collector
+            .observe_physical(InterruptDelivery::for_test(binding1))
+            .unwrap();
+        collector
+            .observe_delivery(binding1, InterruptDeliveryDisposition::FirstPending)
+            .unwrap();
+        collector.observe_ack(driver1, binding1, false).unwrap();
+        collector
             .submit(controller, EVENT_U1_PEER_CLOSED, 19, 0)
             .unwrap();
         collector.observe_retire_begin(binding1).unwrap();
@@ -2101,25 +2279,27 @@ mod tests {
             collector.observe_ack(driver2, binding2, false).unwrap();
         }
         collector.submit(probe2, EVENT_C2_RESPONSE, 8, 42).unwrap();
-        assert_eq!(
-            collector.saved_u1_delivery().unwrap(),
-            InterruptDelivery::for_test(binding1)
-        );
-        assert_eq!(
-            collector.claim_terminal(controller).unwrap(),
-            InterruptDelivery::for_test(binding1)
-        );
+        collector
+            .observe_physical(InterruptDelivery::for_test(binding2))
+            .unwrap();
+        collector
+            .observe_delivery(binding2, InterruptDeliveryDisposition::FirstPending)
+            .unwrap();
+        collector.observe_ack(driver2, binding2, false).unwrap();
+        let (saved, current) = collector.claim_terminal(controller).unwrap();
+        assert_eq!(saved, InterruptDelivery::for_test(binding1));
+        assert_eq!(current, binding2);
         let permit = collector
             .complete_stale_and_accounting(
                 InterruptDeliveryDisposition::Rejected,
                 0,
                 Q35InterruptCounterSnapshot {
-                    physical_entries: 4,
-                    exact_deliveries: 4,
+                    physical_entries: 6,
+                    exact_deliveries: 6,
                     pending_deliveries: 0,
-                    acknowledgements: 4,
+                    acknowledgements: 6,
                     stale_orphans: 1,
-                    route_masks: 3,
+                    route_masks: 4,
                     route_unmasks: 2,
                     final_releases: 1,
                     generation_replacements: 1,
@@ -2158,6 +2338,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(deepwyrm_dw1e_e3b_full)]
     fn terminal_claim_requires_the_bound_controller_and_complete_c2() {
         fn collector_bound_through_u1() -> (Dw1eEvidenceCollector, ProcessKey, ProcessKey) {
             let collector = Dw1eEvidenceCollector::new(0x1234);
@@ -2241,18 +2422,42 @@ mod tests {
             response_branch
                 .matches("self.commit_runtime_phase(phase);")
                 .count(),
-            1
+            2
         );
-        assert!(!response_branch.contains("flush_dw1e_e3a_partial"));
+        assert!(response_branch.contains("#[cfg(not(deepwyrm_dw1e_e3b_full))]"));
+        assert!(response_branch.contains("event == crate::test_support::EVENT_C1_RESPONSE"));
+        assert!(response_branch.contains("DW1E_EVIDENCE.partial_permit()"));
+        assert!(response_branch.contains("flush_dw1e_e3a_partial(permit)"));
         assert!(!response_branch.contains("complete_dw1e_evidence"));
         assert!(!response_branch.contains("deliver_classified"));
         assert!(!response_branch.contains("complete_pass"));
         assert!(!response_branch.contains("write_debug_exit"));
-        assert!(terminal.contains("complete_known_outcome(CompletionOutcome::Fail, 0x3110_ffff)"));
+        assert!(
+            terminal
+                .contains("complete_dw1e_failure_terminal(CompletionOutcome::Fail, 0x3110_ffff)")
+        );
+
+        let build = include_str!("../../build.rs");
+        assert!(build.contains("cargo:rerun-if-env-changed=DEEPWYRM_DW1E_E3B_FULL"));
+        assert!(build.contains("cargo:rustc-check-cfg=cfg(deepwyrm_dw1e_e3b_full)"));
+        assert!(build.contains("cargo:rustc-cfg=deepwyrm_dw1e_e3b_full"));
+        assert!(build.contains("Some(\"1\") if selected => Ok(true)"));
     }
 
     #[test]
     fn e3b_source_contract_joins_retirement_replay_and_atomic_terminal_seams() {
+        let collector = include_str!("dw1e_evidence.rs");
+        let peer_close = collector
+            .split("EVENT_U1_PEER_CLOSED =>")
+            .nth(1)
+            .unwrap()
+            .split("_ => Err(state.latch(Dw1eEvidenceError::Malformed))")
+            .next()
+            .unwrap();
+        let controller_auth = peer_close.find("state.controller != Some(caller)").unwrap();
+        let materialize = peer_close.find("materialize_leg(&mut state)?").unwrap();
+        assert!(controller_auth < materialize);
+
         let platform = include_str!("../device/q35_interrupt.rs");
         let retirement = platform
             .split("pub(crate) fn try_finish_retirement(")
@@ -2295,14 +2500,20 @@ mod tests {
             .next()
             .unwrap();
         let saved = terminal.find(".claim_terminal(self.process)").unwrap();
-        let classified = terminal.find(".deliver_classified(stale,").unwrap();
-        let zero_wake = terminal.find("wake_count != 0").unwrap();
-        let stale_counter = terminal.find(".record_stale_delivery_replay()").unwrap();
+        let freeze = terminal
+            .find(".freeze_dw1e_terminal(stale, current,")
+            .unwrap();
+        let classified = terminal.find(".deliver_classified(saved_u1,").unwrap();
+        let zero_wake = terminal.find("!wakes.is_empty()").unwrap();
         let accounting = terminal.find(".complete_stale_and_accounting(").unwrap();
-        assert!(saved < classified);
+        assert!(saved < freeze);
+        assert!(freeze < classified);
         assert!(classified < zero_wake);
-        assert!(zero_wake < stale_counter);
-        assert!(stale_counter < accounting);
+        assert!(zero_wake < accounting);
+        assert!(zero_wake < terminal.find("return Err(())").unwrap());
+        assert!(!terminal.contains("complete_irq_signal_wakes"));
+        assert!(!terminal.contains("counter_snapshot()"));
+        assert!(!terminal.contains("record_stale_delivery_replay"));
         assert!(!terminal.contains("InterruptDelivery::for_test"));
 
         let completion = include_str!("x86_64.rs");
@@ -2317,5 +2528,35 @@ mod tests {
             .unwrap();
         assert!(transaction < transcript);
         assert!(transcript < pass);
+
+        assert!(completion.contains("static DW1E_TERMINAL_OWNER: super::Dw1eTerminalArbiter ="));
+        assert!(full.contains("claim_dw1e_terminal(DW1E_TERMINAL_SUCCESS)"));
+        let failure = completion
+            .split("fn complete_dw1e_failure_terminal(")
+            .nth(1)
+            .unwrap()
+            .split("#[cfg(deepwyrm_wyr1c_evidence)]")
+            .next()
+            .unwrap();
+        assert!(failure.contains("claim_dw1e_terminal(DW1E_TERMINAL_FAILURE)"));
+        let fail_dispatch = completion
+            .split("pub(crate) fn complete_fail(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn complete_panic(")
+            .next()
+            .unwrap();
+        let panic_dispatch = completion
+            .split("pub(crate) fn complete_panic(")
+            .nth(1)
+            .unwrap();
+        assert!(
+            fail_dispatch
+                .contains("complete_dw1e_failure_terminal(CompletionOutcome::Fail, detail)")
+        );
+        assert!(
+            panic_dispatch
+                .contains("complete_dw1e_failure_terminal(CompletionOutcome::Panic, detail)")
+        );
     }
 }

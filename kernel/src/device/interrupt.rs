@@ -81,7 +81,7 @@ pub(crate) struct InterruptDelivery {
 }
 
 impl InterruptDelivery {
-    #[cfg(deepwyrm_dw1e_evidence)]
+    #[cfg(any(test, deepwyrm_dw1e_evidence))]
     pub(crate) const fn binding_for_evidence(self) -> InterruptBinding {
         self.binding
     }
@@ -484,6 +484,7 @@ struct InterruptRecord {
     parent: InternalRef,
     state: InterruptState,
     pending_final_release: Option<FinalRelease>,
+    finalization_retry_in_progress: bool,
 }
 
 pub(crate) trait InterruptInfoProvider {
@@ -565,6 +566,7 @@ impl<const INTERRUPTS: usize> InterruptAuthority<INTERRUPTS> {
             parent,
             state: InterruptState::Creating,
             pending_final_release: None,
+            finalization_retry_in_progress: false,
         });
         Ok(InterruptPayloadBinding { creation, key })
     }
@@ -975,17 +977,22 @@ impl<const INTERRUPTS: usize> InterruptFinalizer for InterruptAuthority<INTERRUP
         &self,
         platform: &dyn InterruptPlatform,
     ) -> Option<InterruptFinalization> {
-        let (object, binding) = self
-            .interrupts
-            .lock()
-            .iter()
-            .flatten()
-            .find_map(|interrupt| {
-                (matches!(interrupt.state, InterruptState::Finalizing)
-                    && interrupt.pending_final_release.is_some())
-                .then_some((interrupt.object, interrupt.binding))
+        let (object, binding) = {
+            let mut interrupts = self.interrupts.lock();
+            let interrupt = interrupts.iter_mut().flatten().find(|interrupt| {
+                matches!(interrupt.state, InterruptState::Finalizing)
+                    && interrupt.pending_final_release.is_some()
+                    && !interrupt.finalization_retry_in_progress
             })?;
+            interrupt.finalization_retry_in_progress = true;
+            (interrupt.object, interrupt.binding)
+        };
         if platform.retire_source(binding) == InterruptRetirement::Deferred {
+            let mut interrupts = self.interrupts.lock();
+            let interrupt = exact_interrupt_mut(&mut interrupts, object, binding)
+                .expect("deferred retry retains its exact Interrupt record");
+            assert!(interrupt.finalization_retry_in_progress);
+            interrupt.finalization_retry_in_progress = false;
             return None;
         }
         let finalized_interrupt = take_finalized_interrupt(&self.interrupts, object, binding);

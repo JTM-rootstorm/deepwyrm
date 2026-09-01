@@ -512,6 +512,10 @@ impl<const CAPACITY: usize> WakeBatch<CAPACITY> {
         self.wake_len
     }
 
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.wake_len == 0 && self.pin_len == 0
+    }
+
     pub(crate) fn append(&mut self, other: Self) {
         let (wakes, pins) = other.into_parts();
         for wake in wakes.into_iter().flatten() {

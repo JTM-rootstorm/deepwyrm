@@ -1085,8 +1085,7 @@ mod tests {
             timers
                 .set(key, DwDeadline(100), &mut deadlines, &waits)
                 .unwrap()
-                .len()
-                == 0
+                .is_empty()
         );
         assert_eq!(timers.current_signals(key), Ok(DwSignals(0)));
         assert_eq!(deadlines.queue.earliest(), Some(100));
@@ -1111,8 +1110,7 @@ mod tests {
             timers
                 .set(key, DwDeadline(200), &mut deadlines, &waits)
                 .unwrap()
-                .len()
-                == 0
+                .is_empty()
         );
         assert_eq!(timers.expire(old, &waits).unwrap().len(), 0);
         assert_eq!(timers.current_signals(key), Ok(DwSignals(0)));
@@ -1128,8 +1126,7 @@ mod tests {
             timers
                 .set(key, DwDeadline(300), &mut deadlines, &waits)
                 .unwrap()
-                .len()
-                == 0
+                .is_empty()
         );
         assert_eq!(timers.current_signals(key), Ok(DwSignals(0)));
         let (cancelled, count) = deadlines.expire(300);

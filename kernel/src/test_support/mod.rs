@@ -118,7 +118,7 @@ pub(crate) use dw1d_evidence::{
 )]
 pub(crate) use dw1e_evidence::{
     DW1E_E3A_READY_LEN, DW1E_EVIDENCE, DW1E_EVIDENCE_RAW_SYSCALL, Dw1eEvidenceFullPermit,
-    Dw1eEvidencePartialPermit, Dw1eRawOperation,
+    Dw1eEvidencePartialPermit, Dw1eRawOperation, Dw1eTerminalArbiter, EVENT_C1_RESPONSE,
 };
 #[cfg(deepwyrm_wyr1_evidence)]
 pub(crate) use wyr1_evidence::WYR1_EVIDENCE_RAW_SYSCALL;

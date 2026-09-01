@@ -89,7 +89,11 @@ const DW1D_TERMINAL_FAILURE: u8 = 2;
 #[cfg(deepwyrm_dw1d_evidence)]
 static DW1D_TERMINAL_OWNER: AtomicU8 = AtomicU8::new(0);
 #[cfg(deepwyrm_dw1e_evidence)]
-static DW1E_TERMINAL_OWNER: AtomicU8 = AtomicU8::new(0);
+const DW1E_TERMINAL_SUCCESS: u8 = 1;
+#[cfg(deepwyrm_dw1e_evidence)]
+const DW1E_TERMINAL_FAILURE: u8 = 2;
+#[cfg(deepwyrm_dw1e_evidence)]
+static DW1E_TERMINAL_OWNER: super::Dw1eTerminalArbiter = super::Dw1eTerminalArbiter::new();
 #[cfg(deepwyrm_wyr1c_evidence)]
 const WYR1C_TERMINAL_SUCCESS: u8 = 1;
 #[cfg(deepwyrm_wyr1c_evidence)]
@@ -386,10 +390,7 @@ pub(crate) fn flush_dw1e_e3a_partial(permit: Dw1eEvidencePartialPermit<'_>) {
 /// canonical `DWTEST1 31 0`, and the matching debug exit.
 #[cfg(deepwyrm_dw1e_evidence)]
 pub(crate) fn complete_dw1e_evidence(permit: Dw1eEvidenceFullPermit<'_>) -> ! {
-    if DW1E_TERMINAL_OWNER
-        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
+    if !claim_dw1e_terminal(DW1E_TERMINAL_SUCCESS) {
         halt_after_completion()
     }
     let mut transport = unsafe { QemuCompletionTransport::new() };
@@ -461,6 +462,11 @@ fn claim_dw1d_terminal(owner: u8) -> bool {
         .is_ok()
 }
 
+#[cfg(deepwyrm_dw1e_evidence)]
+fn claim_dw1e_terminal(owner: u8) -> bool {
+    DW1E_TERMINAL_OWNER.claim(owner)
+}
+
 #[cfg(deepwyrm_wyr1c_evidence)]
 fn claim_wyr1c_terminal(owner: u8) -> bool {
     WYR1C_TERMINAL_OWNER
@@ -493,6 +499,20 @@ fn complete_dw1c_failure_terminal(outcome: CompletionOutcome, detail: u32) -> ! 
 fn complete_dw1d_failure_terminal(outcome: CompletionOutcome, detail: u32) -> ! {
     debug_assert!(outcome != CompletionOutcome::Pass);
     if !claim_dw1d_terminal(DW1D_TERMINAL_FAILURE) {
+        halt_after_completion()
+    }
+    let mut transport = unsafe { QemuCompletionTransport::new() };
+    let Ok(transaction) = begin_test_serial_transaction() else {
+        halt_after_completion()
+    };
+    transport.transaction = Some(transaction);
+    complete(&mut transport, completion_record(outcome, detail))
+}
+
+#[cfg(deepwyrm_dw1e_evidence)]
+fn complete_dw1e_failure_terminal(outcome: CompletionOutcome, detail: u32) -> ! {
+    debug_assert!(outcome != CompletionOutcome::Pass);
+    if !claim_dw1e_terminal(DW1E_TERMINAL_FAILURE) {
         halt_after_completion()
     }
     let mut transport = unsafe { QemuCompletionTransport::new() };
@@ -631,7 +651,7 @@ pub(crate) fn complete_pass(detail: u32) -> ! {
     #[cfg(deepwyrm_dw1e_evidence)]
     {
         let _ = detail;
-        complete_known_outcome(CompletionOutcome::Fail, 0x3110_ffff)
+        complete_dw1e_failure_terminal(CompletionOutcome::Fail, 0x3110_ffff)
     }
     #[cfg(deepwyrm_wyr1c_evidence)]
     {
@@ -675,6 +695,10 @@ pub(crate) fn complete_fail(detail: u32) -> ! {
     {
         complete_dw1d_failure_terminal(CompletionOutcome::Fail, detail)
     }
+    #[cfg(deepwyrm_dw1e_evidence)]
+    {
+        complete_dw1e_failure_terminal(CompletionOutcome::Fail, detail)
+    }
     #[cfg(deepwyrm_wyr1c_evidence)]
     {
         complete_wyr1c_failure_terminal(CompletionOutcome::Fail, detail)
@@ -687,6 +711,7 @@ pub(crate) fn complete_fail(detail: u32) -> ! {
         deepwyrm_wyr1_evidence,
         deepwyrm_dw1c_evidence,
         deepwyrm_dw1d_evidence,
+        deepwyrm_dw1e_evidence,
         deepwyrm_wyr1c_evidence
     )))]
     {
@@ -707,6 +732,10 @@ pub(crate) fn complete_panic(detail: u32) -> ! {
     {
         complete_dw1d_failure_terminal(CompletionOutcome::Panic, detail)
     }
+    #[cfg(deepwyrm_dw1e_evidence)]
+    {
+        complete_dw1e_failure_terminal(CompletionOutcome::Panic, detail)
+    }
     #[cfg(deepwyrm_wyr1c_evidence)]
     {
         complete_wyr1c_failure_terminal(CompletionOutcome::Panic, detail)
@@ -719,6 +748,7 @@ pub(crate) fn complete_panic(detail: u32) -> ! {
         deepwyrm_wyr1_evidence,
         deepwyrm_dw1c_evidence,
         deepwyrm_dw1d_evidence,
+        deepwyrm_dw1e_evidence,
         deepwyrm_wyr1c_evidence
     )))]
     {

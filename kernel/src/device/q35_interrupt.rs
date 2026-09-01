@@ -212,6 +212,7 @@ struct Q35SourceState {
     in_handler: u32,
     next_request_generation: u64,
     outstanding_request: Option<Q35BspCheckRequest>,
+    terminal_frozen_generation: Option<u64>,
 }
 
 impl Q35SourceState {
@@ -222,6 +223,7 @@ impl Q35SourceState {
             in_handler: 0,
             next_request_generation: 1,
             outstanding_request: None,
+            terminal_frozen_generation: None,
         }
     }
 }
@@ -307,8 +309,11 @@ impl Q35InterruptPlatform {
     }
 
     pub(crate) fn snapshot_delivery(&self) -> Q35DeliverySnapshot {
-        Q35InterruptCounters::increment(&self.counters.physical_entries);
         let mut source = self.source.lock();
+        if source.terminal_frozen_generation.is_some() {
+            return Q35DeliverySnapshot::Orphan;
+        }
+        Q35InterruptCounters::increment(&self.counters.physical_entries);
         match source.lifecycle.state() {
             IoApicRouteState::LiveUnmasked { generation } => {
                 if !begin_handler(&mut source, generation) {
@@ -354,17 +359,21 @@ impl Q35InterruptPlatform {
         }
     }
 
-    pub(crate) fn record_pending_delivery(&self) {
+    pub(crate) fn record_pending_delivery(&self, generation: u64) {
+        let source = self.source.lock();
+        assert!(
+            source.terminal_frozen_generation.is_none()
+                || source.terminal_frozen_generation == Some(generation)
+        );
+        assert!(source.in_handler != 0 && source.in_handler_generation == generation);
+        assert!(matches!(
+            source.lifecycle.state(),
+            IoApicRouteState::LiveUnmasked { generation: live } if live == generation
+        ));
         Q35InterruptCounters::increment(&self.counters.pending_deliveries);
     }
 
-    #[cfg(deepwyrm_dw1e_evidence)]
-    pub(crate) fn record_stale_delivery_replay(&self) {
-        Q35InterruptCounters::increment(&self.counters.stale_orphans);
-    }
-
-    #[cfg(any(test, deepwyrm_dw1e_evidence))]
-    pub(crate) fn counter_snapshot(&self) -> Q35InterruptCounterSnapshot {
+    fn counter_snapshot_locked(&self) -> Q35InterruptCounterSnapshot {
         Q35InterruptCounterSnapshot {
             physical_entries: self.counters.physical_entries.load(Ordering::Relaxed),
             exact_deliveries: self.counters.exact_deliveries.load(Ordering::Relaxed),
@@ -379,6 +388,74 @@ impl Q35InterruptPlatform {
                 .generation_replacements
                 .load(Ordering::Relaxed),
         }
+    }
+
+    /// Selector-31's terminal-only U2 freeze. This is not U2 retirement or
+    /// release: it masks the exact current route and serializes every live
+    /// accounting source before replaying the saved U1 delivery.
+    #[cfg(any(test, deepwyrm_dw1e_evidence))]
+    pub(crate) fn freeze_dw1e_terminal(
+        &self,
+        stale_u1: InterruptDelivery,
+        current_u2: InterruptBinding,
+        replay: impl FnOnce(InterruptDelivery) -> Result<(), ()>,
+    ) -> Result<Q35InterruptCounterSnapshot, Q35ControllerError> {
+        let stale_binding = stale_u1.binding_for_evidence();
+        validate_binding(self.domain, stale_binding)?;
+        validate_binding(self.domain, current_u2)?;
+        if stale_binding.generation() >= current_u2.generation() {
+            return Err(Q35ControllerError::RouteDrift);
+        }
+
+        {
+            let mut source = self.source.lock();
+            if source.terminal_frozen_generation.is_some()
+                || !matches!(
+                    source.lifecycle.state(),
+                    IoApicRouteState::LiveUnmasked { generation }
+                        if generation == current_u2.generation()
+                )
+            {
+                return Err(Q35ControllerError::RouteDrift);
+            }
+            self.controller.mask_and_verify()?;
+            Q35InterruptCounters::increment(&self.counters.route_masks);
+            source.terminal_frozen_generation = Some(current_u2.generation());
+        }
+
+        let mut quiescent = false;
+        for _ in 0..DELIVERY_STATUS_POLL_LIMIT {
+            let delivery_idle = self.controller.delivery_status_idle()?;
+            let handler_idle = self.source.lock().in_handler == 0;
+            if delivery_idle && handler_idle {
+                quiescent = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if !quiescent {
+            return Err(Q35ControllerError::RouteDrift);
+        }
+
+        let source = self.source.lock();
+        if source.terminal_frozen_generation != Some(current_u2.generation())
+            || source.in_handler != 0
+            || !matches!(
+                source.lifecycle.state(),
+                IoApicRouteState::LiveUnmasked { generation }
+                    if generation == current_u2.generation()
+            )
+        {
+            return Err(Q35ControllerError::RouteDrift);
+        }
+        self.controller.revalidate_masked_idle()?;
+        if !self.controller.current_cpu_is_bsp()? || !self.controller.bsp_vector_clear()? {
+            return Err(Q35ControllerError::RouteDrift);
+        }
+        self.controller.revalidate_masked_idle()?;
+        replay(stale_u1).map_err(|()| Q35ControllerError::RouteDrift)?;
+        Q35InterruptCounters::increment(&self.counters.stale_orphans);
+        Ok(self.counter_snapshot_locked())
     }
 
     pub(crate) fn complete_handler(&self, generation: u64) {
@@ -666,7 +743,11 @@ impl InterruptPlatform for Q35InterruptPlatform {
         binding: InterruptBinding,
     ) -> Result<InterruptPlatformAck, InterruptPlatformError> {
         validate_binding(self.domain, binding).map_err(|_| InterruptPlatformError::StaleBinding)?;
-        match self.source.lock().lifecycle.state() {
+        let source = self.source.lock();
+        if source.terminal_frozen_generation.is_some() {
+            return Err(InterruptPlatformError::BadState);
+        }
+        match source.lifecycle.state() {
             IoApicRouteState::LiveUnmasked { generation } if generation == binding.generation() => {
                 Ok(InterruptPlatformAck { binding })
             }
@@ -678,8 +759,10 @@ impl InterruptPlatform for Q35InterruptPlatform {
     fn complete_ack(&self, ack: InterruptPlatformAck, _outcome: InterruptAckOutcome) {
         validate_binding(self.domain, ack.binding)
             .expect("prepared q35 acknowledgement retains exact domain/source");
+        let source = self.source.lock();
+        assert!(source.terminal_frozen_generation.is_none());
         assert!(matches!(
-            self.source.lock().lifecycle.state(),
+            source.lifecycle.state(),
             IoApicRouteState::LiveUnmasked { generation }
                 if generation == ack.binding.generation()
         ));
@@ -705,9 +788,12 @@ impl InterruptPlatform for Q35InterruptPlatform {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::super::interrupt::InterruptRetirement;
     use super::*;
     use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+    use std::sync::Barrier;
 
     struct FakeController {
         route_bits: AtomicU64,
@@ -787,6 +873,67 @@ mod tests {
     }
 
     static FAKE: FakeController = FakeController::new();
+    static FAKE_TERMINAL: FakeController = FakeController::new();
+
+    struct InterleavedFreezeController {
+        controller: FakeController,
+        armed: AtomicBool,
+        waited: AtomicBool,
+        freeze_entered: Barrier,
+        allow_idle_read: Barrier,
+    }
+
+    impl InterleavedFreezeController {
+        const fn new() -> Self {
+            Self {
+                controller: FakeController::new(),
+                armed: AtomicBool::new(false),
+                waited: AtomicBool::new(false),
+                freeze_entered: Barrier::new(2),
+                allow_idle_read: Barrier::new(2),
+            }
+        }
+    }
+
+    impl Q35InterruptController for InterleavedFreezeController {
+        fn route(&self) -> PlatformIrqRoute {
+            self.controller.route()
+        }
+
+        fn program_and_verify(&self, masked: bool) -> Result<(), Q35ControllerError> {
+            self.controller.program_and_verify(masked)
+        }
+
+        fn mask_and_verify(&self) -> Result<(), Q35ControllerError> {
+            self.controller.mask_and_verify()
+        }
+
+        fn delivery_status_idle(&self) -> Result<bool, Q35ControllerError> {
+            if self.armed.load(Ordering::Acquire) && !self.waited.swap(true, Ordering::AcqRel) {
+                self.freeze_entered.wait();
+                self.allow_idle_read.wait();
+            }
+            self.controller.delivery_status_idle()
+        }
+
+        fn revalidate_masked_idle(&self) -> Result<(), Q35ControllerError> {
+            self.controller.revalidate_masked_idle()
+        }
+
+        fn bsp_vector_clear(&self) -> Result<bool, Q35ControllerError> {
+            self.controller.bsp_vector_clear()
+        }
+
+        fn current_cpu_is_bsp(&self) -> Result<bool, Q35ControllerError> {
+            self.controller.current_cpu_is_bsp()
+        }
+
+        fn request_bsp_check(&self, request: Q35BspCheckRequest) -> Result<(), Q35ControllerError> {
+            self.controller.request_bsp_check(request)
+        }
+    }
+
+    static INTERLEAVED_FREEZE: InterleavedFreezeController = InterleavedFreezeController::new();
 
     // Full controller/finalizer fault injection is exercised through the
     // state-machine tests in the adjacent Interrupt suite. Keep this module's
@@ -902,10 +1049,107 @@ mod tests {
             .counters
             .pending_deliveries
             .store(u64::MAX, Ordering::Relaxed);
-        platform.record_pending_delivery();
+        Q35InterruptCounters::increment(&platform.counters.pending_deliveries);
         assert_eq!(
             platform.counters.pending_deliveries.load(Ordering::Relaxed),
             u64::MAX
         );
+    }
+
+    #[test]
+    fn selector_terminal_freeze_masks_u2_and_returns_one_stable_snapshot() {
+        let platform = Q35InterruptPlatform::new(&FAKE_TERMINAL).unwrap();
+
+        let reservation1 = platform.reserve_source(Q35_COM2_SOURCE).unwrap();
+        let binding1 = reservation1.binding;
+        platform.commit_source(reservation1);
+        let Q35DeliverySnapshot::Live {
+            delivery: saved_u1,
+            generation,
+        } = platform.snapshot_delivery()
+        else {
+            panic!("U1 did not produce the saved real delivery");
+        };
+        platform.complete_handler(generation);
+        assert_eq!(
+            platform.retire_source(binding1),
+            InterruptRetirement::Complete
+        );
+
+        let reservation2 = platform.reserve_source(Q35_COM2_SOURCE).unwrap();
+        let binding2 = reservation2.binding;
+        platform.commit_source(reservation2);
+        let snapshot = platform
+            .freeze_dw1e_terminal(saved_u1, binding2, |replayed| {
+                (replayed == saved_u1).then_some(()).ok_or(())
+            })
+            .unwrap();
+        assert_eq!(snapshot.physical_entries, 1);
+        assert_eq!(snapshot.exact_deliveries, 1);
+        assert_eq!(snapshot.stale_orphans, 1);
+        assert_eq!(snapshot.route_masks, 4);
+        assert_eq!(snapshot.route_unmasks, 2);
+        assert_eq!(snapshot.final_releases, 1);
+        assert_eq!(snapshot.generation_replacements, 1);
+
+        assert_eq!(platform.snapshot_delivery(), Q35DeliverySnapshot::Orphan);
+        assert_eq!(platform.counter_snapshot_locked(), snapshot);
+        assert!(matches!(
+            platform.acknowledge_source(binding2),
+            Err(InterruptPlatformError::BadState)
+        ));
+    }
+
+    #[test]
+    fn terminal_freeze_allows_a_pre_freeze_handler_to_complete() {
+        let platform = Q35InterruptPlatform::new(&INTERLEAVED_FREEZE).unwrap();
+
+        let reservation1 = platform.reserve_source(Q35_COM2_SOURCE).unwrap();
+        let binding1 = reservation1.binding;
+        platform.commit_source(reservation1);
+        let Q35DeliverySnapshot::Live {
+            delivery: saved_u1,
+            generation: generation1,
+        } = platform.snapshot_delivery()
+        else {
+            panic!("U1 did not produce the saved real delivery");
+        };
+        platform.complete_handler(generation1);
+        assert_eq!(
+            platform.retire_source(binding1),
+            InterruptRetirement::Complete
+        );
+
+        let reservation2 = platform.reserve_source(Q35_COM2_SOURCE).unwrap();
+        let binding2 = reservation2.binding;
+        platform.commit_source(reservation2);
+        let Q35DeliverySnapshot::Live {
+            generation: generation2,
+            ..
+        } = platform.snapshot_delivery()
+        else {
+            panic!("U2 did not enter its handler before terminal freeze");
+        };
+        INTERLEAVED_FREEZE.armed.store(true, Ordering::Release);
+
+        let snapshot = std::thread::scope(|scope| {
+            let freeze = scope.spawn(|| {
+                platform.freeze_dw1e_terminal(saved_u1, binding2, |replayed| {
+                    (replayed == saved_u1).then_some(()).ok_or(())
+                })
+            });
+            INTERLEAVED_FREEZE.freeze_entered.wait();
+            platform.record_pending_delivery(generation2);
+            platform.complete_handler(generation2);
+            INTERLEAVED_FREEZE.allow_idle_read.wait();
+            freeze.join().unwrap().unwrap()
+        });
+
+        assert_eq!(snapshot.physical_entries, 2);
+        assert_eq!(snapshot.exact_deliveries, 2);
+        assert_eq!(snapshot.pending_deliveries, 1);
+        assert_eq!(snapshot.stale_orphans, 1);
+        assert_eq!(platform.counter_snapshot_locked(), snapshot);
+        assert_eq!(platform.snapshot_delivery(), Q35DeliverySnapshot::Orphan);
     }
 }

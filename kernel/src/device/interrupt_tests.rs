@@ -1,5 +1,7 @@
 use super::*;
 
+extern crate std;
+
 use deepwyrm_abi::{
     DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT, DW_INTERRUPT_INFO_FLAG_COALESCED,
     DW_INTERRUPT_STATE_ARMED, DW_INTERRUPT_STATE_PENDING, DW_OBJECT_INFO_INTERRUPT_V1,
@@ -13,7 +15,8 @@ use crate::handle::{AcceptedObjectTypes, HandleTable, HandleTableError};
 use crate::object::{FinalRelease, ObjectRegistry};
 use crate::task::{CooperativeScheduler, TaskAuthority, ThreadKey};
 use crate::wait::{WaitRegistry, WakeBatch};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Barrier;
 
 type Registry = ObjectRegistry<32>;
 type Table = HandleTable<12>;
@@ -25,6 +28,13 @@ type Waits = WaitRegistry<8>;
 struct DeferredOncePlatform {
     inner: Platform,
     defer: AtomicBool,
+}
+
+struct CoordinatedRetryPlatform {
+    inner: Platform,
+    retire_calls: AtomicU32,
+    retry_entered: Barrier,
+    release_retry: Barrier,
 }
 
 struct CommitBoundaryPlatform<'a> {
@@ -96,6 +106,73 @@ impl DeferredOncePlatform {
         Self {
             inner: Platform::new(),
             defer: AtomicBool::new(true),
+        }
+    }
+}
+
+impl CoordinatedRetryPlatform {
+    fn new() -> Self {
+        Self {
+            inner: Platform::new(),
+            retire_calls: AtomicU32::new(0),
+            retry_entered: Barrier::new(2),
+            release_retry: Barrier::new(2),
+        }
+    }
+}
+
+impl InterruptPlatform for CoordinatedRetryPlatform {
+    fn reserve_source(
+        &self,
+        source: u32,
+    ) -> Result<super::interrupt::InterruptSourceReservation, InterruptPlatformError> {
+        self.inner.reserve_source(source)
+    }
+
+    fn cancel_source(
+        &self,
+        reservation: super::interrupt::InterruptSourceReservation,
+    ) -> Result<(), InterruptPlatformError> {
+        self.inner.cancel_source(reservation)
+    }
+
+    fn commit_source(
+        &self,
+        reservation: super::interrupt::InterruptSourceReservation,
+    ) -> InterruptBinding {
+        self.inner.commit_source(reservation)
+    }
+
+    fn mask_source(&self, binding: InterruptBinding) {
+        self.inner.mask_source(binding);
+    }
+
+    fn acknowledge_source(
+        &self,
+        binding: InterruptBinding,
+    ) -> Result<InterruptPlatformAck, InterruptPlatformError> {
+        self.inner.acknowledge_source(binding)
+    }
+
+    fn complete_ack(&self, ack: InterruptPlatformAck, outcome: InterruptAckOutcome) {
+        self.inner.complete_ack(ack, outcome);
+    }
+
+    fn release_source(&self, binding: InterruptBinding) {
+        self.inner.release_source(binding);
+    }
+
+    fn retire_source(&self, binding: InterruptBinding) -> super::interrupt::InterruptRetirement {
+        match self.retire_calls.fetch_add(1, Ordering::AcqRel) {
+            0 => super::interrupt::InterruptRetirement::Deferred,
+            1 => {
+                self.retry_entered.wait();
+                self.release_retry.wait();
+                self.inner.mask_source(binding);
+                self.inner.release_source(binding);
+                super::interrupt::InterruptRetirement::Complete
+            }
+            _ => panic!("two carriers entered the same deferred finalizer retry"),
         }
     }
 }
@@ -785,6 +862,49 @@ fn deferred_retirement_retains_final_release_and_parent_until_safe_point_retry()
         .expect("safe-point retry completes the exact staged generation");
     assert!(complete_interrupt_finalization(&mut fixture.registry, ready).is_none());
     assert!(!platform.inner.is_bound(binding));
+    assert_eq!(fixture.interrupts.live_count(), 0);
+    fixture.finish_resource(None);
+}
+
+#[test]
+fn two_carriers_cannot_select_the_same_deferred_finalizer_retry() {
+    let mut fixture = Fixture::broad();
+    let platform = CoordinatedRetryPlatform::new();
+    let (_, handle) = interrupt_create(
+        &mut fixture.table,
+        &mut fixture.registry,
+        &fixture.resources,
+        &fixture.interrupts,
+        &platform,
+        fixture.resource,
+        dw_object_compatible_rights(DW_OBJECT_TYPE_INTERRUPT),
+    )
+    .unwrap();
+    let final_release = fixture
+        .table
+        .close(&mut fixture.registry, handle)
+        .unwrap()
+        .unwrap();
+    let staged = fixture
+        .interrupts
+        .take_finalization(final_release, &platform)
+        .unwrap();
+    assert!(complete_interrupt_finalization(&mut fixture.registry, staged).is_none());
+
+    let ready = std::thread::scope(|scope| {
+        let winner = scope.spawn(|| fixture.interrupts.retry_deferred_finalization(&platform));
+        platform.retry_entered.wait();
+        assert!(
+            fixture
+                .interrupts
+                .retry_deferred_finalization(&platform)
+                .is_none()
+        );
+        platform.release_retry.wait();
+        winner.join().unwrap().unwrap()
+    });
+    assert!(complete_interrupt_finalization(&mut fixture.registry, ready).is_none());
+    assert_eq!(platform.retire_calls.load(Ordering::Acquire), 2);
     assert_eq!(fixture.interrupts.live_count(), 0);
     fixture.finish_resource(None);
 }
