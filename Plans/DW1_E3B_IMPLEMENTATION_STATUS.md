@@ -15,7 +15,23 @@ E1/E2A/E2B/E2C statuses.
 ## Reached kernel scope
 
 The selector-private collector now completes the exact 26-record DWE3E1
-sequence. Records 9 through 14 join the controller-observed U1 peer close to
+sequence. E3B full mode is selected only by exact build environment
+`DEEPWYRM_DW1E_E3B_FULL=1`, which emits the checked private cfg
+`deepwyrm_dw1e_e3b_full` only for `q35-com2-interrupt`. The variable must be
+absent for E3A; any other value, or setting it for another selector, fails
+build admission. This preserves E3A's response-time records 0-8 materialize,
+partial flush, and return behavior while keeping E3B's additional lifecycle
+authority compile-time explicit.
+
+In E3B full mode, a probe response stores the response relation but does not
+materialize an immutable leg while a later valid transmit IRQ/ack epoch can
+still arrive. The exact controller's U1 peer-close/TEMT barrier materializes
+records 3-8 and appends record 9 under one collector lock. The terminal claim,
+after Wyrmroot's U2 TEMT barrier, materializes records 17-22 and claims the
+saved/current pair under the same lock. Focused models include a valid
+post-response transmit epoch on both legs.
+
+Records 9 through 14 join the controller-observed U1 peer close to
 the actual q35 retirement transitions: logical Retiring publication, physical
 mask/readback plus bounded Delivery Status polling, zero in-handler proof,
 fresh mask/idle revalidation plus CPU0 IRR/ISR-clear proof, and final source
@@ -25,19 +41,34 @@ retaining the exact parent lease.
 
 The first real U1 `InterruptDelivery` is saved at the physical-entry hook.
 After U1 release and complete U2 response, only the permanently bound
-controller may claim terminal completion. The kernel replays that saved value
-through `InterruptAuthority::deliver_classified`, requires `Rejected` and an
-empty wake batch, then credits the bounded stale/orphan counter. This avoids
-the invalid physical-orphan construction when physical entries and exact
-deliveries must remain equal.
+controller may claim terminal completion. A selector-private terminal freeze
+authenticates the saved U1 and current U2 generations, masks and reads back the
+current U2 route, prevents new delivery snapshots, and then releases the
+source lock while any handler that started before the freeze completes its
+pending bookkeeping and handler accounting. It boundedly observes Delivery
+Status idle, reacquires the source lock, and revalidates the exact frozen/live
+generation, zero in-handler count, masked/idle route, BSP execution, and clear
+LAPIC vector before replay and snapshot.
+
+Under that final source serialization, the kernel replays the saved U1 value
+through `InterruptAuthority::deliver_classified`, requires `Rejected` and a
+fully empty wake-and-pin batch before any scheduler publication, credits the
+bounded stale/orphan counter, and returns one coherent counter snapshot. This
+avoids the invalid physical-orphan construction when physical entries and
+exact deliveries must remain equal. The terminal U2 mask is selector-private
+quiescence, not U2 retirement, release, or a reusable-source claim; selector
+31 halts after its single terminal outcome.
 
 The accounting record is admitted only when its byte-packed counters and both
 per-leg sums satisfy the frozen ranges. The stale result carries the complete
 U1 tuple with current B2/O2 in `V/X`; accounting carries the complete U2
 tuple; the final record is the all-zero-generation kernel `FF TERMINAL`.
 One COM1 transaction emits all 26 records followed by exact `DWTEST1 31 0`
-and the matching PASS debug exit. No E3B runtime path exposes the E3A
-nine-record partial transcript.
+and the matching PASS debug exit. Success, failure, and panic contend for one
+atomic selector-31 terminal owner before serial or debug-exit output. Deferred
+Interrupt finalization also has an exact in-progress claim, so two carrier
+safe points cannot retry the same retirement concurrently. No E3B-full runtime
+path exposes the E3A nine-record partial transcript.
 
 ## Private raw contract for paired Wyrmroot work
 
@@ -66,14 +97,17 @@ Fresh lane-local pinned targets established:
 
 | Gate | Result |
 | --- | --- |
-| focused selector-31 model/source/private-authority tests | **pass**, 9 passed |
-| focused q35 platform tests | **pass**, 2 passed |
-| focused Interrupt authority tests | **pass**, 13 passed |
-| full default host library tests | **pass**, 789 passed |
+| focused selector-31 E3A model/source/private-authority tests | **pass**, 9 passed |
+| focused selector-31 E3B-full model/source/private-authority tests | **pass**, 11 passed |
+| focused q35 platform tests | **pass**, 4 passed, including pre-freeze-handler interleaving |
+| focused Interrupt authority tests | **pass**, 14 passed, including two-carrier retry |
+| full default host library tests | **pass**, 792 passed |
 | host Clippy for library/tests with warnings denied | **pass** |
 | host formatting and diff checks | **pass** |
 | default freestanding target check | **pass** |
-| selector-31 freestanding target check with exact nonce | **pass** |
+| selector-31 E3A freestanding target check with exact nonce and full mode absent | **pass** |
+| selector-31 E3B freestanding target check with exact nonce and `DEEPWYRM_DW1E_E3B_FULL=1` | **pass** |
+| ambient E3B-full variable without selector 31 | **expected rejection**, build fails closed |
 
 No VM, libvirt, QEMU, network, or remote operation was performed. These
 results do not prove live COM2 delivery, real Wyrmroot replacement, UP/SMP
