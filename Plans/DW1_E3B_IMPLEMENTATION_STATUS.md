@@ -79,6 +79,46 @@ Interrupt finalization also has an exact in-progress claim, so two carrier
 safe points cannot retry the same retirement concurrently. No E3B-full runtime
 path exposes the E3A nine-record partial transcript.
 
+## Live integration ordering correction
+
+Live selector-31 integration against Wyrmroot
+`3670439f2ba600c68b4a0da3c74d267c7efd7f09` exposed an order-sensitive
+admission bug in the E3B-full response path. The probe queues its response to
+the UART driver and immediately submits its actor-owned response relation. If
+the response-TX interrupt begins before the probe runs again, the collector
+correctly clears `ack_complete` for that new physical epoch, but previously
+rejected and latched the otherwise exact probe response.
+
+After the challenge's exact wait wake, UART drain, and first acknowledgement
+establish causal progress, response submission now records the exact
+probe-owned relation independently of the current IRQ-ack epoch. A response
+immediately after arm remains rejected. This does not weaken terminal
+acceptance: `materialize_leg` still requires the final exact epoch to be
+acknowledged, and Wyrmroot's TEMT barrier remains the controller-side guard
+before peer-close or terminal claim. The E3B-full model now submits the U2
+response while the latest TX epoch is deliberately unacknowledged, then proves
+that the later exact ack and terminal freeze complete the unchanged 26-record
+transcript.
+
+The canonical focused host invocations are:
+
+```sh
+DEEPWYRM_GUEST_TEST_SELECTOR=q35-com2-interrupt \
+DEEPWYRM_DW1E_EVIDENCE_NONCE=<16-uppercase-hex-nonce> \
+cargo test -p deepwyrm-kernel --features test-support --lib \
+  test_support::dw1e_evidence::tests
+
+DEEPWYRM_GUEST_TEST_SELECTOR=q35-com2-interrupt \
+DEEPWYRM_DW1E_EVIDENCE_NONCE=<16-uppercase-hex-nonce> \
+DEEPWYRM_DW1E_E3B_FULL=1 \
+cargo test -p deepwyrm-kernel --features test-support --lib \
+  test_support::dw1e_evidence::tests
+```
+
+`DEEPWYRM_GUEST_TEST_ID` is build-owned and must remain unset; selector test
+builds require `--features test-support` and derive test ID 31 from the exact
+selector name.
+
 ## Private raw contract for paired Wyrmroot work
 
 The public ABI/schema and generated definitions are unchanged. Private raw ID
@@ -107,9 +147,10 @@ Fresh lane-local pinned targets established:
 | Gate | Result |
 | --- | --- |
 | focused selector-31 E3A model/source/private-authority tests | **pass**, 9 passed |
-| focused selector-31 E3B-full model/source/private-authority tests | **pass**, 11 passed |
-| full selector-31 E3A host library tests | **pass**, 913 passed |
-| full selector-31 E3B-full host library tests | **pass**, 915 passed |
+| focused selector-31 E3B-full model/source/private-authority tests | **pass**, 12 passed |
+| focused E3B response ordering regressions | **pass**, includes response-before-final-ack acceptance and response-before-causal-progress rejection |
+| full selector-31 E3A host library tests | **pass**, 919 passed |
+| full selector-31 E3B-full host library tests | **pass**, 922 passed |
 | focused q35 platform tests | **pass**, 6 passed, including retirement-after-snapshot, pre-freeze-handler drain, and off-BSP deferred completion |
 | focused Interrupt authority tests | **pass**, 14 passed, including two-carrier retry |
 | full default host library tests | **pass**, 794 passed |

@@ -812,7 +812,9 @@ impl Dw1eEvidenceCollector {
                 };
                 if state.probe != Some(caller)
                     || event != expected_event
-                    || !state.ack_complete
+                    || !state.wait_woke
+                    || state.drain.is_none()
+                    || state.acknowledgement_delta == 0
                     || state.response.is_some()
                     || value == 0
                     || auxiliary == 0
@@ -821,6 +823,14 @@ impl Dw1eEvidenceCollector {
                 {
                     return Err(state.latch(Dw1eEvidenceError::WrongRelation));
                 }
+                // The probe queues its response to the driver before it can
+                // report this relation. A response-TX interrupt may therefore
+                // begin and clear `ack_complete` before the probe runs again.
+                // Once the prior challenge wake, drain, and acknowledgement
+                // establish causality, preserve the actor-owned response
+                // independently of the current epoch. The TEMT barrier and
+                // `materialize_leg` still require the final exact interrupt
+                // epoch to be acknowledged before acceptance.
                 state.response = Some((value, auxiliary));
                 #[cfg(not(deepwyrm_dw1e_e3b_full))]
                 if event == EVENT_C1_RESPONSE {
@@ -2369,7 +2379,7 @@ mod tests {
         collector
             .arm_challenge(driver2, 20, 24, 6, 30, driver2, object2, 32, 38)
             .unwrap();
-        for _ in 0..2 {
+        for epoch in 0..2 {
             collector
                 .observe_physical(InterruptDelivery::for_test(binding2))
                 .unwrap();
@@ -2384,9 +2394,15 @@ mod tests {
                     .submit(driver2, EVENT_C2_UART_DRAIN, 6, 30)
                     .unwrap();
             }
+            if epoch == 1 {
+                // The response relation races with the response-TX interrupt:
+                // admit it while the latest physical epoch is not yet acked,
+                // then let the terminal/TEMT join enforce exact completion.
+                assert!(!collector.state.lock().ack_complete);
+                collector.submit(probe2, EVENT_C2_RESPONSE, 8, 42).unwrap();
+            }
             collector.observe_ack(driver2, binding2, false).unwrap();
         }
-        collector.submit(probe2, EVENT_C2_RESPONSE, 8, 42).unwrap();
         let claim_ready = Barrier::new(2);
         let allow_claim_return = Barrier::new(2);
         let (saved, current) = std::thread::scope(|scope| {
@@ -2460,6 +2476,41 @@ mod tests {
         );
         assert_eq!(
             validate_e3b_transcript(&stale, 0x1234),
+            Err(Dw1eEvidenceError::WrongRelation)
+        );
+    }
+
+    #[test]
+    #[cfg(deepwyrm_dw1e_e3b_full)]
+    fn probe_response_requires_prior_challenge_progress() {
+        let collector = Dw1eEvidenceCollector::new(0x1234);
+        let route = PlatformIrqRoute::test_q35(
+            crate::arch::x86_64::acpi::IoApicDescriptor::test_descriptor(2, 0xfec0_0000, 0),
+            3,
+            7,
+        );
+        collector.observe_route(route).unwrap();
+        let binding = InterruptBinding::for_test(9, 3, 11);
+        collector.observe_reserved(binding).unwrap();
+        let mut registry = ObjectRegistry::<8>::new();
+        let object = registry.create(DW_OBJECT_TYPE_INTERRUPT).unwrap().id();
+        let driver =
+            ProcessKey::from_object_id(registry.create(DW_OBJECT_TYPE_PROCESS).unwrap().id());
+        let probe =
+            ProcessKey::from_object_id(registry.create(DW_OBJECT_TYPE_PROCESS).unwrap().id());
+        let controller =
+            ProcessKey::from_object_id(registry.create(DW_OBJECT_TYPE_PROCESS).unwrap().id());
+        collector.observe_committed(object, binding, 13).unwrap();
+        collector
+            .bind_driver(driver, object, binding, 13, 17)
+            .unwrap();
+        collector.bind_probe(controller, probe).unwrap();
+        collector
+            .arm_challenge(driver, 19, 23, 5, 29, driver, object, 31, 37)
+            .unwrap();
+
+        assert_eq!(
+            collector.submit(probe, EVENT_C1_RESPONSE, 7, 41),
             Err(Dw1eEvidenceError::WrongRelation)
         );
     }
