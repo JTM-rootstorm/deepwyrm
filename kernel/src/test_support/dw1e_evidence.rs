@@ -564,6 +564,8 @@ impl Dw1eEvidenceCollector {
                 .committed
                 .is_some_and(|committed| committed.object == object)
             && state.challenge.is_some()
+            && state.blocked_wait.is_none()
+            && !state.wait_woke
     }
 
     pub(crate) fn observe_wait_blocked(
@@ -1317,6 +1319,7 @@ mod tests {
         collector
             .arm_challenge(driver, 19, 23, 5, 29, driver, object, 31, 37)
             .unwrap();
+        assert!(!collector.tracks_interrupt_wait(driver, object));
         collector.observe_physical(binding).unwrap();
         collector
             .observe_delivery(binding, InterruptDeliveryDisposition::FirstPending)
@@ -1324,6 +1327,7 @@ mod tests {
         collector
             .observe_wait_completion(driver, 31, 37, DW_SIGNAL_SIGNALED)
             .unwrap();
+        assert!(!collector.tracks_interrupt_wait(driver, object));
         collector
             .submit(driver, EVENT_C1_UART_DRAIN, 5, 29)
             .unwrap();
