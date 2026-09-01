@@ -213,6 +213,8 @@ const USERSPACE_CHAIN_PROCESSES: usize = 5;
 const USERSPACE_CHAIN_PROCESSES: usize = 8;
 #[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
 const USERSPACE_CHAIN_PROCESSES: usize = 8;
+#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
+const _: () = assert!(super::LIVE_ADDRESS_SPACE_CAPACITY >= USERSPACE_CHAIN_PROCESSES);
 #[cfg(not(any(
     deepwyrm_i2_stress,
     deepwyrm_wrcap_relay,

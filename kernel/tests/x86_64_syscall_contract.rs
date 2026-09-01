@@ -923,6 +923,14 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
         "#[cfg(deepwyrm_wyr1b_evidence)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;"
     ));
     assert!(
+        activation.contains(
+            "#[cfg(deepwyrm_dw1e_evidence)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;"
+        )
+    );
+    assert!(runtime.contains(
+        "#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]\nconst _: () = assert!(super::LIVE_ADDRESS_SPACE_CAPACITY >= USERSPACE_CHAIN_PROCESSES);"
+    ));
+    assert!(
         runtime.contains(
             "#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]\nconst USERSPACE_CHAIN_PROCESSES: usize = 6;"
         )

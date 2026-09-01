@@ -116,6 +116,7 @@ const _: () = {
     deepwyrm_dw1b_evidence,
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
+    deepwyrm_dw1e_evidence,
     deepwyrm_wyr1c_evidence
 )))]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;
@@ -139,6 +140,11 @@ const LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;
 // Selector 29 reuses the bounded eight-Process permanent-controller geometry
 // while adding resource-domain ownership and restart evidence.
 #[cfg(deepwyrm_wyr1c_evidence)]
+const LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;
+// Selector 31 extends selector 29's permanent resource-domain service graph
+// with one bounded raw-stream probe and therefore needs the same eight-root
+// functional headroom as its eight-Process runtime geometry.
+#[cfg(deepwyrm_dw1e_evidence)]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;
 // Selector 28 keeps primordial, the controller, and all ten workload actors
 // resident through READY, ARM, remote termination, and final observation.
