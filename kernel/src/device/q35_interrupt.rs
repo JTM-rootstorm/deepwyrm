@@ -44,6 +44,96 @@ pub(crate) struct Q35BspCheckRequest {
     request_generation: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Q35RetirementRequestState {
+    Prepared(Q35BspCheckRequest),
+    Publishing(Q35BspCheckRequest),
+    Published(Q35BspCheckRequest),
+    Completing(Q35BspCheckRequest),
+}
+
+impl Q35RetirementRequestState {
+    const fn request(self) -> Q35BspCheckRequest {
+        match self {
+            Self::Prepared(request)
+            | Self::Publishing(request)
+            | Self::Published(request)
+            | Self::Completing(request) => request,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Q35RetirementRequestStatus {
+    Publishing,
+    Published(InterruptBinding),
+    Stale,
+}
+
+pub(crate) struct Q35BspRetirementCarrier {
+    pending: Option<Q35BspCheckRequest>,
+}
+
+impl Q35BspRetirementCarrier {
+    pub(crate) const fn new() -> Self {
+        Self { pending: None }
+    }
+
+    pub(crate) fn publish_exact(
+        &mut self,
+        request: Q35BspCheckRequest,
+    ) -> Result<(), Q35ControllerError> {
+        if request.source != Q35_COM2_SOURCE
+            || request.vector != 0x30
+            || request.platform_generation == 0
+            || request.request_generation == 0
+        {
+            return Err(Q35ControllerError::RouteDrift);
+        }
+        match self.pending {
+            None => {
+                self.pending = Some(request);
+                Ok(())
+            }
+            Some(current) if current == request => Ok(()),
+            Some(_) => Err(Q35ControllerError::RouteDrift),
+        }
+    }
+
+    pub(crate) const fn pending(&self) -> Option<Q35BspCheckRequest> {
+        self.pending
+    }
+
+    pub(crate) fn complete_exact(
+        &mut self,
+        request: Q35BspCheckRequest,
+    ) -> Result<(), Q35ControllerError> {
+        match self.pending {
+            Some(current) if current == request => {
+                self.pending = None;
+                Ok(())
+            }
+            _ => Err(Q35ControllerError::RouteDrift),
+        }
+    }
+}
+
+impl Q35BspCheckRequest {
+    pub(crate) const fn new(
+        source: u32,
+        vector: u8,
+        platform_generation: u64,
+        request_generation: u64,
+    ) -> Self {
+        Self {
+            source,
+            vector,
+            platform_generation,
+            request_generation,
+        }
+    }
+}
+
 pub(crate) trait Q35InterruptController: Sync {
     fn route(&self) -> PlatformIrqRoute;
     fn program_and_verify(&self, masked: bool) -> Result<(), Q35ControllerError>;
@@ -51,7 +141,15 @@ pub(crate) trait Q35InterruptController: Sync {
     fn delivery_status_idle(&self) -> Result<bool, Q35ControllerError>;
     fn revalidate_masked_idle(&self) -> Result<(), Q35ControllerError>;
     fn current_cpu_is_bsp(&self) -> Result<bool, Q35ControllerError>;
-    fn request_bsp_check(&self, request: Q35BspCheckRequest) -> Result<(), Q35ControllerError>;
+    fn publish_bsp_check(&self, request: Q35BspCheckRequest) -> Result<(), Q35ControllerError>;
+    fn notify_bsp_check(&self, request: Q35BspCheckRequest) -> Result<(), Q35ControllerError>;
+    fn request_terminal_bsp_check(
+        &self,
+        request: Q35BspCheckRequest,
+    ) -> Result<(), Q35ControllerError>;
+    fn complete_bsp_check(&self, _request: Q35BspCheckRequest) -> Result<(), Q35ControllerError> {
+        Ok(())
+    }
     fn bsp_vector_clear(&self) -> Result<bool, Q35ControllerError>;
 }
 
@@ -144,14 +242,26 @@ impl Q35InterruptController for ValidatedQ35IoApic {
         crate::time::q35_current_cpu_is_bsp().map_err(|_| Q35ControllerError::Access)
     }
 
-    fn request_bsp_check(&self, request: Q35BspCheckRequest) -> Result<(), Q35ControllerError> {
-        crate::time::request_q35_bsp_retirement_check(
-            request.source,
-            request.vector,
-            request.platform_generation,
-            request.request_generation,
-        )
-        .map_err(|_| Q35ControllerError::Access)
+    fn publish_bsp_check(&self, request: Q35BspCheckRequest) -> Result<(), Q35ControllerError> {
+        crate::time::publish_q35_bsp_retirement_check(request)
+            .map_err(|_| Q35ControllerError::Access)
+    }
+
+    fn notify_bsp_check(&self, request: Q35BspCheckRequest) -> Result<(), Q35ControllerError> {
+        crate::time::notify_q35_bsp_retirement_check(request)
+            .map_err(|_| Q35ControllerError::Access)
+    }
+
+    fn request_terminal_bsp_check(
+        &self,
+        request: Q35BspCheckRequest,
+    ) -> Result<(), Q35ControllerError> {
+        crate::time::request_q35_bsp_terminal_check(request).map_err(|_| Q35ControllerError::Access)
+    }
+
+    fn complete_bsp_check(&self, request: Q35BspCheckRequest) -> Result<(), Q35ControllerError> {
+        crate::time::complete_q35_bsp_retirement_check(request)
+            .map_err(|_| Q35ControllerError::Access)
     }
 }
 
@@ -217,14 +327,36 @@ struct Q35RetirementIdleProof {
     reads: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Q35TerminalFreezeState {
+    Masking(u64),
+    Masked(u64),
+    Checking(u64),
+    Replaying(u64),
+    Complete(u64),
+}
+
+impl Q35TerminalFreezeState {
+    const fn generation(self) -> u64 {
+        match self {
+            Self::Masking(generation)
+            | Self::Masked(generation)
+            | Self::Checking(generation)
+            | Self::Replaying(generation)
+            | Self::Complete(generation) => generation,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Q35SourceState {
     lifecycle: IoApicRouteLifecycle,
     in_handler_generation: u64,
     in_handler: u32,
     next_request_generation: u64,
-    outstanding_request: Option<Q35BspCheckRequest>,
-    terminal_frozen_generation: Option<u64>,
+    retirement_request: Option<Q35RetirementRequestState>,
+    terminal_request: Option<Q35BspCheckRequest>,
+    terminal_freeze: Option<Q35TerminalFreezeState>,
     retirement_idle_proof: Option<Q35RetirementIdleProof>,
 }
 
@@ -235,8 +367,9 @@ impl Q35SourceState {
             in_handler_generation: 0,
             in_handler: 0,
             next_request_generation: 1,
-            outstanding_request: None,
-            terminal_frozen_generation: None,
+            retirement_request: None,
+            terminal_request: None,
+            terminal_freeze: None,
             retirement_idle_proof: None,
         }
     }
@@ -324,7 +457,9 @@ impl Q35InterruptPlatform {
 
     pub(crate) fn snapshot_delivery(&self) -> Q35DeliverySnapshot {
         let mut source = self.source.lock();
-        if source.terminal_frozen_generation.is_some() {
+        if source.terminal_freeze.is_some() {
+            Q35InterruptCounters::increment(&self.counters.physical_entries);
+            Q35InterruptCounters::increment(&self.counters.stale_orphans);
             return Q35DeliverySnapshot::Orphan;
         }
         Q35InterruptCounters::increment(&self.counters.physical_entries);
@@ -332,8 +467,6 @@ impl Q35InterruptPlatform {
             IoApicRouteState::LiveUnmasked { generation } => {
                 if !begin_handler(&mut source, generation) {
                     Q35InterruptCounters::increment(&self.counters.stale_orphans);
-                    drop(source);
-                    self.fail_safe_mask();
                     return Q35DeliverySnapshot::Orphan;
                 }
                 Q35InterruptCounters::increment(&self.counters.exact_deliveries);
@@ -352,32 +485,28 @@ impl Q35InterruptPlatform {
             | IoApicRouteState::RetiringMasked { generation } => {
                 if !begin_handler(&mut source, generation) {
                     Q35InterruptCounters::increment(&self.counters.stale_orphans);
-                    drop(source);
-                    self.fail_safe_mask();
                     return Q35DeliverySnapshot::Orphan;
                 }
                 Q35DeliverySnapshot::Retiring { generation }
             }
             _ => {
                 Q35InterruptCounters::increment(&self.counters.stale_orphans);
-                drop(source);
-                self.fail_safe_mask();
+                // The shared fixed entry cannot be masked after dropping the
+                // slot guard: a replacement generation could commit in that
+                // window. With no exact binding snapshot, bounded EOI-only
+                // orphan handling is the E0-safe disposition.
                 Q35DeliverySnapshot::Orphan
             }
-        }
-    }
-
-    fn fail_safe_mask(&self) {
-        if self.controller.mask_and_verify().is_ok() {
-            Q35InterruptCounters::increment(&self.counters.route_masks);
         }
     }
 
     pub(crate) fn record_pending_delivery(&self, generation: u64) {
         let source = self.source.lock();
         assert!(
-            source.terminal_frozen_generation.is_none()
-                || source.terminal_frozen_generation == Some(generation)
+            source.terminal_freeze.is_none()
+                || source
+                    .terminal_freeze
+                    .is_some_and(|state| state.generation() == generation)
         );
         assert!(source.in_handler != 0 && source.in_handler_generation == generation);
         assert!(matches!(
@@ -424,57 +553,75 @@ impl Q35InterruptPlatform {
             return Err(Q35ControllerError::RouteDrift);
         }
 
-        let newly_frozen = {
+        let generation = current_u2.generation();
+        let needs_mask = {
             let mut source = self.source.lock();
-            match source.terminal_frozen_generation {
+            match source.terminal_freeze {
                 None => {
                     if !matches!(
                         source.lifecycle.state(),
-                        IoApicRouteState::LiveUnmasked { generation }
-                            if generation == current_u2.generation()
+                        IoApicRouteState::LiveUnmasked { generation: live }
+                            if live == generation
                     ) {
                         return Err(Q35ControllerError::RouteDrift);
                     }
-                    self.controller.mask_and_verify()?;
-                    Q35InterruptCounters::increment(&self.counters.route_masks);
-                    source.terminal_frozen_generation = Some(current_u2.generation());
+                    source.terminal_freeze = Some(Q35TerminalFreezeState::Masking(generation));
                     true
                 }
-                Some(generation) if generation == current_u2.generation() => false,
+                Some(Q35TerminalFreezeState::Masked(current)) if current == generation => false,
+                Some(Q35TerminalFreezeState::Complete(current)) if current == generation => {
+                    return Ok(Q35TerminalFreeze::Complete(self.counter_snapshot_locked()));
+                }
+                Some(state) if state.generation() == generation => {
+                    return Ok(Q35TerminalFreeze::Deferred);
+                }
                 Some(_) => return Err(Q35ControllerError::RouteDrift),
             }
         };
 
-        if newly_frozen {
-            let mut quiescent = false;
-            for _ in 0..DELIVERY_STATUS_POLL_LIMIT {
-                let delivery_idle = self.controller.delivery_status_idle()?;
-                let handler_idle = self.source.lock().in_handler == 0;
-                if delivery_idle && handler_idle {
-                    quiescent = true;
-                    break;
-                }
-                core::hint::spin_loop();
-            }
-            if !quiescent {
-                return Err(Q35ControllerError::RouteDrift);
-            }
-        }
-
-        let request = {
+        if needs_mask {
+            self.controller.mask_and_verify()?;
+            Q35InterruptCounters::increment(&self.counters.route_masks);
             let mut source = self.source.lock();
-            if source.terminal_frozen_generation != Some(current_u2.generation())
-                || source.in_handler != 0
+            if source.terminal_freeze != Some(Q35TerminalFreezeState::Masking(generation))
                 || !matches!(
                     source.lifecycle.state(),
-                    IoApicRouteState::LiveUnmasked { generation }
-                        if generation == current_u2.generation()
+                    IoApicRouteState::LiveUnmasked { generation: live }
+                        if live == generation
                 )
             {
                 return Err(Q35ControllerError::RouteDrift);
             }
-            self.controller.revalidate_masked_idle()?;
-            match source.outstanding_request {
+            source.terminal_freeze = Some(Q35TerminalFreezeState::Masked(generation));
+        }
+
+        let mut quiescent = false;
+        for _ in 0..DELIVERY_STATUS_POLL_LIMIT {
+            let delivery_idle = self.controller.delivery_status_idle()?;
+            let handler_idle = self.source.lock().in_handler == 0;
+            if delivery_idle && handler_idle {
+                quiescent = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if !quiescent {
+            return Ok(Q35TerminalFreeze::Deferred);
+        }
+
+        let request = {
+            let mut source = self.source.lock();
+            if source.terminal_freeze != Some(Q35TerminalFreezeState::Masked(generation))
+                || source.in_handler != 0
+                || !matches!(
+                    source.lifecycle.state(),
+                    IoApicRouteState::LiveUnmasked { generation: live }
+                        if live == generation
+                )
+            {
+                return Ok(Q35TerminalFreeze::Deferred);
+            }
+            let request = match source.terminal_request {
                 Some(request) => request,
                 None => {
                     let request_generation = source.next_request_generation;
@@ -482,16 +629,18 @@ impl Q35InterruptPlatform {
                         return Err(Q35ControllerError::RouteDrift);
                     }
                     source.next_request_generation = request_generation.checked_add(1).unwrap_or(0);
-                    let request = Q35BspCheckRequest {
-                        source: current_u2.source(),
-                        vector: 0x30,
-                        platform_generation: current_u2.generation(),
+                    let request = Q35BspCheckRequest::new(
+                        current_u2.source(),
+                        0x30,
+                        generation,
                         request_generation,
-                    };
-                    source.outstanding_request = Some(request);
+                    );
+                    source.terminal_request = Some(request);
                     request
                 }
-            }
+            };
+            source.terminal_freeze = Some(Q35TerminalFreezeState::Checking(generation));
+            request
         };
         if request.source != Q35_COM2_SOURCE
             || request.vector != 0x30
@@ -500,31 +649,57 @@ impl Q35InterruptPlatform {
         {
             return Err(Q35ControllerError::RouteDrift);
         }
+        if self.controller.revalidate_masked_idle().is_err() {
+            self.restore_terminal_masked(generation);
+            return Ok(Q35TerminalFreeze::Deferred);
+        }
         if !self.controller.current_cpu_is_bsp()? {
-            self.controller.request_bsp_check(request)?;
+            self.restore_terminal_masked(generation);
+            self.controller.request_terminal_bsp_check(request)?;
             return Ok(Q35TerminalFreeze::Deferred);
         }
         if !self.controller.bsp_vector_clear()? {
+            self.restore_terminal_masked(generation);
             return Ok(Q35TerminalFreeze::Deferred);
         }
-        self.controller.revalidate_masked_idle()?;
+        if self.controller.revalidate_masked_idle().is_err() {
+            self.restore_terminal_masked(generation);
+            return Ok(Q35TerminalFreeze::Deferred);
+        }
+        {
+            let mut source = self.source.lock();
+            if source.terminal_freeze != Some(Q35TerminalFreezeState::Checking(generation))
+                || source.in_handler != 0
+                || source.terminal_request != Some(request)
+                || !matches!(
+                    source.lifecycle.state(),
+                    IoApicRouteState::LiveUnmasked { generation: live }
+                        if live == generation
+                )
+            {
+                return Ok(Q35TerminalFreeze::Deferred);
+            }
+            source.terminal_freeze = Some(Q35TerminalFreezeState::Replaying(generation));
+        }
+        replay(stale_u1).map_err(|()| Q35ControllerError::RouteDrift)?;
+        Q35InterruptCounters::increment(&self.counters.stale_orphans);
         let mut source = self.source.lock();
-        if source.terminal_frozen_generation != Some(current_u2.generation())
-            || source.in_handler != 0
-            || source.outstanding_request != Some(request)
-            || !matches!(
-                source.lifecycle.state(),
-                IoApicRouteState::LiveUnmasked { generation }
-                    if generation == current_u2.generation()
-            )
+        if source.terminal_freeze != Some(Q35TerminalFreezeState::Replaying(generation))
+            || source.terminal_request != Some(request)
         {
             return Err(Q35ControllerError::RouteDrift);
         }
-        self.controller.revalidate_masked_idle()?;
-        replay(stale_u1).map_err(|()| Q35ControllerError::RouteDrift)?;
-        Q35InterruptCounters::increment(&self.counters.stale_orphans);
-        source.outstanding_request = None;
+        source.terminal_request = None;
+        source.terminal_freeze = Some(Q35TerminalFreezeState::Complete(generation));
         Ok(Q35TerminalFreeze::Complete(self.counter_snapshot_locked()))
+    }
+
+    #[cfg(any(test, deepwyrm_dw1e_evidence))]
+    fn restore_terminal_masked(&self, generation: u64) {
+        let mut source = self.source.lock();
+        if source.terminal_freeze == Some(Q35TerminalFreezeState::Checking(generation)) {
+            source.terminal_freeze = Some(Q35TerminalFreezeState::Masked(generation));
+        }
     }
 
     pub(crate) fn complete_handler(&self, generation: u64) {
@@ -536,6 +711,33 @@ impl Q35InterruptPlatform {
             .expect("q35 handler completion underflow");
         if source.in_handler == 0 {
             source.in_handler_generation = 0;
+        }
+    }
+
+    pub(crate) fn retirement_request_status(
+        &self,
+        request: Q35BspCheckRequest,
+    ) -> Q35RetirementRequestStatus {
+        let source = self.source.lock();
+        if !matches!(
+            source.lifecycle.state(),
+            IoApicRouteState::RetiringMasked { generation }
+                if generation == request.platform_generation
+        ) {
+            return Q35RetirementRequestStatus::Stale;
+        }
+        match source.retirement_request {
+            Some(Q35RetirementRequestState::Publishing(current)) if current == request => {
+                Q35RetirementRequestStatus::Publishing
+            }
+            Some(Q35RetirementRequestState::Published(current)) if current == request => {
+                Q35RetirementRequestStatus::Published(InterruptBinding::new_private(
+                    self.domain,
+                    request.source,
+                    request.platform_generation,
+                ))
+            }
+            _ => Q35RetirementRequestStatus::Stale,
         }
     }
 
@@ -645,23 +847,32 @@ impl Q35InterruptPlatform {
                 panic!("selector-31 handler-quiescent observation failed: {error:?}")
             });
         self.controller.revalidate_masked_idle()?;
-        let request = {
+        if !self.controller.current_cpu_is_bsp()? {
             let mut source = self.source.lock();
-            let request = match source.outstanding_request {
-                Some(request) => request,
+            if source.in_handler != 0
+                || !matches!(
+                    source.lifecycle.state(),
+                    IoApicRouteState::RetiringMasked { generation }
+                        if generation == binding.generation()
+                )
+            {
+                return Ok(false);
+            }
+            let request = match source.retirement_request {
+                Some(state) => state.request(),
                 None => {
                     let request_generation = source.next_request_generation;
                     if request_generation == 0 {
                         return Ok(false);
                     }
                     source.next_request_generation = request_generation.checked_add(1).unwrap_or(0);
-                    let request = Q35BspCheckRequest {
-                        source: binding.source(),
-                        vector: 0x30,
-                        platform_generation: binding.generation(),
+                    let request = Q35BspCheckRequest::new(
+                        binding.source(),
+                        0x30,
+                        binding.generation(),
                         request_generation,
-                    };
-                    source.outstanding_request = Some(request);
+                    );
+                    source.retirement_request = Some(Q35RetirementRequestState::Prepared(request));
                     request
                 }
             };
@@ -670,12 +881,8 @@ impl Q35InterruptPlatform {
                 || request.platform_generation != binding.generation()
                 || request.request_generation == 0
             {
-                return Ok(false);
+                return Err(Q35ControllerError::RouteDrift);
             }
-            request
-        };
-        if !self.controller.current_cpu_is_bsp()? {
-            self.controller.request_bsp_check(request)?;
             return Ok(false);
         }
         if !self.controller.bsp_vector_clear()? {
@@ -688,11 +895,63 @@ impl Q35InterruptPlatform {
             .unwrap_or_else(|error| {
                 panic!("selector-31 LAPIC-clear observation failed: {error:?}")
             });
-        let mut source = self.source.lock();
-        if source.in_handler != 0 || source.outstanding_request != Some(request) {
+        let carrier_request = {
+            let mut source = self.source.lock();
+            if source.in_handler != 0
+                || !matches!(
+                    source.lifecycle.state(),
+                    IoApicRouteState::RetiringMasked { generation }
+                        if generation == binding.generation()
+                )
+            {
+                return Ok(false);
+            }
+            match source.retirement_request {
+                None => None,
+                Some(Q35RetirementRequestState::Prepared(request)) => {
+                    source.retirement_request =
+                        Some(Q35RetirementRequestState::Completing(request));
+                    None
+                }
+                Some(Q35RetirementRequestState::Published(request)) => {
+                    source.retirement_request =
+                        Some(Q35RetirementRequestState::Completing(request));
+                    Some(request)
+                }
+                Some(
+                    Q35RetirementRequestState::Publishing(_)
+                    | Q35RetirementRequestState::Completing(_),
+                ) => return Ok(false),
+            }
+        };
+        if let Some(request) = carrier_request
+            && self.controller.complete_bsp_check(request).is_err()
+        {
+            let mut source = self.source.lock();
+            if source.retirement_request == Some(Q35RetirementRequestState::Completing(request)) {
+                source.retirement_request = Some(Q35RetirementRequestState::Published(request));
+            }
             return Ok(false);
         }
-        source.outstanding_request = None;
+        let mut source = self.source.lock();
+        if source.in_handler != 0
+            || !matches!(
+                source.lifecycle.state(),
+                IoApicRouteState::RetiringMasked { generation }
+                    if generation == binding.generation()
+            )
+            || !matches!(
+                source.retirement_request,
+                None | Some(Q35RetirementRequestState::Completing(_))
+            )
+        {
+            if let Some(Q35RetirementRequestState::Completing(request)) = source.retirement_request
+            {
+                source.retirement_request = Some(Q35RetirementRequestState::Prepared(request));
+            }
+            return Ok(false);
+        }
+        source.retirement_request = None;
         source
             .lifecycle
             .release(binding.generation())
@@ -735,6 +994,9 @@ impl InterruptPlatform for Q35InterruptPlatform {
         }
         let generation = {
             let mut state = self.source.lock();
+            if state.terminal_freeze.is_some() {
+                return Err(InterruptPlatformError::SourceInUse);
+            }
             let generation = state.lifecycle.reserve().map_err(|error| match error {
                 crate::arch::x86_64::acpi::IoApicRouteTransitionError::Busy => {
                     InterruptPlatformError::SourceInUse
@@ -839,7 +1101,7 @@ impl InterruptPlatform for Q35InterruptPlatform {
     ) -> Result<InterruptPlatformAck, InterruptPlatformError> {
         validate_binding(self.domain, binding).map_err(|_| InterruptPlatformError::StaleBinding)?;
         let source = self.source.lock();
-        if source.terminal_frozen_generation.is_some() {
+        if source.terminal_freeze.is_some() {
             return Err(InterruptPlatformError::BadState);
         }
         match source.lifecycle.state() {
@@ -855,7 +1117,7 @@ impl InterruptPlatform for Q35InterruptPlatform {
         validate_binding(self.domain, ack.binding)
             .expect("prepared q35 acknowledgement retains exact domain/source");
         let source = self.source.lock();
-        assert!(source.terminal_frozen_generation.is_none());
+        assert!(source.terminal_freeze.is_none());
         assert!(matches!(
             source.lifecycle.state(),
             IoApicRouteState::LiveUnmasked { generation }
@@ -879,6 +1141,60 @@ impl InterruptPlatform for Q35InterruptPlatform {
             Ok(false) | Err(_) => super::interrupt::InterruptRetirement::Deferred,
         }
     }
+
+    fn stage_retirement_retry(&self, binding: InterruptBinding) {
+        if validate_binding(self.domain, binding).is_err() {
+            return;
+        }
+        if !matches!(self.controller.current_cpu_is_bsp(), Ok(false)) {
+            return;
+        }
+        let request = {
+            let mut source = self.source.lock();
+            if !matches!(
+                source.lifecycle.state(),
+                IoApicRouteState::RetiringMasked { generation }
+                    if generation == binding.generation()
+            ) {
+                return;
+            }
+            match source.retirement_request {
+                Some(Q35RetirementRequestState::Prepared(request))
+                    if request.platform_generation == binding.generation() =>
+                {
+                    source.retirement_request =
+                        Some(Q35RetirementRequestState::Publishing(request));
+                    request
+                }
+                Some(
+                    Q35RetirementRequestState::Publishing(request)
+                    | Q35RetirementRequestState::Published(request)
+                    | Q35RetirementRequestState::Completing(request),
+                ) if request.platform_generation == binding.generation() => {
+                    return;
+                }
+                _ => return,
+            }
+        };
+        if self.controller.publish_bsp_check(request).is_err() {
+            let mut source = self.source.lock();
+            if source.retirement_request == Some(Q35RetirementRequestState::Publishing(request)) {
+                source.retirement_request = Some(Q35RetirementRequestState::Prepared(request));
+            }
+            return;
+        }
+        {
+            let mut source = self.source.lock();
+            if source.retirement_request != Some(Q35RetirementRequestState::Publishing(request)) {
+                return;
+            }
+            source.retirement_request = Some(Q35RetirementRequestState::Published(request));
+        }
+        // The durable exact carrier is visible before the e1 notification.
+        // Transport failure retains Published quarantine for a later existing
+        // CPU0 safe point; it never turns into optimistic release or a panic.
+        let _ = self.controller.notify_bsp_check(request);
+    }
 }
 
 #[cfg(test)]
@@ -896,6 +1212,8 @@ mod tests {
         bsp_clear: AtomicBool,
         current_bsp: AtomicBool,
         requests: AtomicU32,
+        last_request: IrqSpinMutex<Option<Q35BspCheckRequest>>,
+        carrier: IrqSpinMutex<Q35BspRetirementCarrier>,
     }
 
     impl FakeController {
@@ -906,6 +1224,8 @@ mod tests {
                 bsp_clear: AtomicBool::new(true),
                 current_bsp: AtomicBool::new(true),
                 requests: AtomicU32::new(0),
+                last_request: IrqSpinMutex::new(None),
+                carrier: IrqSpinMutex::new(Q35BspRetirementCarrier::new()),
             }
         }
     }
@@ -957,13 +1277,35 @@ mod tests {
             Ok(self.current_bsp.load(Ordering::Acquire))
         }
 
-        fn request_bsp_check(&self, request: Q35BspCheckRequest) -> Result<(), Q35ControllerError> {
+        fn publish_bsp_check(&self, request: Q35BspCheckRequest) -> Result<(), Q35ControllerError> {
             assert_eq!(request.source, Q35_COM2_SOURCE);
             assert_eq!(request.vector, 0x30);
             assert_ne!(request.platform_generation, 0);
             assert_ne!(request.request_generation, 0);
+            *self.last_request.lock() = Some(request);
+            self.carrier.lock().publish_exact(request)
+        }
+
+        fn notify_bsp_check(&self, request: Q35BspCheckRequest) -> Result<(), Q35ControllerError> {
+            assert_eq!(*self.last_request.lock(), Some(request));
             self.requests.fetch_add(1, Ordering::Relaxed);
             Ok(())
+        }
+
+        fn request_terminal_bsp_check(
+            &self,
+            request: Q35BspCheckRequest,
+        ) -> Result<(), Q35ControllerError> {
+            *self.last_request.lock() = Some(request);
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn complete_bsp_check(
+            &self,
+            request: Q35BspCheckRequest,
+        ) -> Result<(), Q35ControllerError> {
+            self.carrier.lock().complete_exact(request)
         }
     }
 
@@ -971,6 +1313,80 @@ mod tests {
     static FAKE_TERMINAL: FakeController = FakeController::new();
     static FAKE_PENDING_RETIRE: FakeController = FakeController::new();
     static FAKE_TERMINAL_MIGRATION: FakeController = FakeController::new();
+    static FAKE_POST_EOI_RETRY: FakeController = FakeController::new();
+    static FAKE_REMOTE_RETRY: FakeController = FakeController::new();
+
+    struct PublishingRaceController {
+        controller: FakeController,
+        publish_entered: Barrier,
+        allow_publish: Barrier,
+    }
+
+    impl PublishingRaceController {
+        const fn new() -> Self {
+            Self {
+                controller: FakeController::new(),
+                publish_entered: Barrier::new(2),
+                allow_publish: Barrier::new(2),
+            }
+        }
+    }
+
+    impl Q35InterruptController for PublishingRaceController {
+        fn route(&self) -> PlatformIrqRoute {
+            self.controller.route()
+        }
+
+        fn program_and_verify(&self, masked: bool) -> Result<(), Q35ControllerError> {
+            self.controller.program_and_verify(masked)
+        }
+
+        fn mask_and_verify(&self) -> Result<(), Q35ControllerError> {
+            self.controller.mask_and_verify()
+        }
+
+        fn delivery_status_idle(&self) -> Result<bool, Q35ControllerError> {
+            self.controller.delivery_status_idle()
+        }
+
+        fn revalidate_masked_idle(&self) -> Result<(), Q35ControllerError> {
+            self.controller.revalidate_masked_idle()
+        }
+
+        fn bsp_vector_clear(&self) -> Result<bool, Q35ControllerError> {
+            self.controller.bsp_vector_clear()
+        }
+
+        fn current_cpu_is_bsp(&self) -> Result<bool, Q35ControllerError> {
+            self.controller.current_cpu_is_bsp()
+        }
+
+        fn publish_bsp_check(&self, request: Q35BspCheckRequest) -> Result<(), Q35ControllerError> {
+            self.publish_entered.wait();
+            self.allow_publish.wait();
+            self.controller.publish_bsp_check(request)
+        }
+
+        fn notify_bsp_check(&self, request: Q35BspCheckRequest) -> Result<(), Q35ControllerError> {
+            self.controller.notify_bsp_check(request)
+        }
+
+        fn request_terminal_bsp_check(
+            &self,
+            request: Q35BspCheckRequest,
+        ) -> Result<(), Q35ControllerError> {
+            self.controller.request_terminal_bsp_check(request)
+        }
+
+        fn complete_bsp_check(
+            &self,
+            request: Q35BspCheckRequest,
+        ) -> Result<(), Q35ControllerError> {
+            self.controller.complete_bsp_check(request)
+        }
+    }
+
+    static PUBLISHING_RACE: PublishingRaceController = PublishingRaceController::new();
 
     struct InterleavedFreezeController {
         controller: FakeController,
@@ -1025,8 +1441,26 @@ mod tests {
             self.controller.current_cpu_is_bsp()
         }
 
-        fn request_bsp_check(&self, request: Q35BspCheckRequest) -> Result<(), Q35ControllerError> {
-            self.controller.request_bsp_check(request)
+        fn publish_bsp_check(&self, request: Q35BspCheckRequest) -> Result<(), Q35ControllerError> {
+            self.controller.publish_bsp_check(request)
+        }
+
+        fn notify_bsp_check(&self, request: Q35BspCheckRequest) -> Result<(), Q35ControllerError> {
+            self.controller.notify_bsp_check(request)
+        }
+
+        fn request_terminal_bsp_check(
+            &self,
+            request: Q35BspCheckRequest,
+        ) -> Result<(), Q35ControllerError> {
+            self.controller.request_terminal_bsp_check(request)
+        }
+
+        fn complete_bsp_check(
+            &self,
+            request: Q35BspCheckRequest,
+        ) -> Result<(), Q35ControllerError> {
+            self.controller.complete_bsp_check(request)
         }
     }
 
@@ -1065,6 +1499,92 @@ mod tests {
             ),
             Err(Q35ControllerError::RouteDrift)
         );
+    }
+
+    #[test]
+    fn retirement_carrier_coalesces_exact_tokens_and_rejects_stale_completion() {
+        let u1 = Q35BspCheckRequest::new(Q35_COM2_SOURCE, 0x30, 1, 1);
+        let u2 = Q35BspCheckRequest::new(Q35_COM2_SOURCE, 0x30, 2, 2);
+        let mut carrier = Q35BspRetirementCarrier::new();
+
+        assert_eq!(carrier.publish_exact(u1), Ok(()));
+        assert_eq!(carrier.publish_exact(u1), Ok(()));
+        assert_eq!(
+            carrier.publish_exact(u2),
+            Err(Q35ControllerError::RouteDrift)
+        );
+        assert_eq!(carrier.pending(), Some(u1));
+        assert_eq!(
+            carrier.complete_exact(u2),
+            Err(Q35ControllerError::RouteDrift)
+        );
+        assert_eq!(carrier.pending(), Some(u1));
+        assert_eq!(carrier.complete_exact(u1), Ok(()));
+        assert_eq!(carrier.pending(), None);
+        assert_eq!(carrier.publish_exact(u2), Ok(()));
+        assert_eq!(carrier.pending(), Some(u2));
+    }
+
+    #[test]
+    fn unresolved_orphan_never_masks_a_later_generation() {
+        let controller: &'static FakeController =
+            std::boxed::Box::leak(std::boxed::Box::new(FakeController::new()));
+        let platform = Q35InterruptPlatform::new(controller).unwrap();
+
+        assert_eq!(platform.snapshot_delivery(), Q35DeliverySnapshot::Orphan);
+        assert_eq!(platform.counters.route_masks.load(Ordering::Acquire), 0);
+        let replacement = platform.reserve_source(Q35_COM2_SOURCE).unwrap();
+        platform.commit_source(replacement);
+        assert_eq!(
+            controller.route_bits.load(Ordering::Acquire) & u64::from(IOAPIC_REDIR_MASK),
+            0
+        );
+    }
+
+    #[test]
+    fn publication_in_progress_blocks_release_and_cannot_resurrect_into_u2() {
+        let platform = Q35InterruptPlatform::new(&PUBLISHING_RACE).unwrap();
+        let reservation = platform.reserve_source(Q35_COM2_SOURCE).unwrap();
+        let binding = reservation.binding;
+        platform.commit_source(reservation);
+        PUBLISHING_RACE
+            .controller
+            .current_bsp
+            .store(false, Ordering::Release);
+        assert_eq!(
+            platform.retire_source(binding),
+            InterruptRetirement::Deferred
+        );
+
+        std::thread::scope(|scope| {
+            let publisher = scope.spawn(|| {
+                InterruptPlatform::stage_retirement_retry(&platform, binding);
+            });
+            PUBLISHING_RACE.publish_entered.wait();
+            PUBLISHING_RACE
+                .controller
+                .current_bsp
+                .store(true, Ordering::Release);
+            assert_eq!(
+                platform.retire_source(binding),
+                InterruptRetirement::Deferred
+            );
+            assert!(matches!(
+                platform.source.lock().retirement_request,
+                Some(Q35RetirementRequestState::Publishing(_))
+            ));
+            PUBLISHING_RACE.allow_publish.wait();
+            publisher.join().unwrap();
+        });
+
+        assert_eq!(
+            platform.retire_source(binding),
+            InterruptRetirement::Complete
+        );
+        assert_eq!(PUBLISHING_RACE.controller.carrier.lock().pending(), None);
+        let replacement = platform.reserve_source(Q35_COM2_SOURCE).unwrap();
+        assert!(replacement.binding.generation() > binding.generation());
+        platform.cancel_source(replacement).unwrap();
     }
 
     #[test]
@@ -1121,6 +1641,7 @@ mod tests {
                 reads: 3,
             })
         );
+        InterruptPlatform::stage_retirement_retry(&platform, binding);
         assert_eq!(FAKE.requests.load(Ordering::Acquire), 1);
         FAKE.current_bsp.store(true, Ordering::Release);
         FAKE.bsp_clear.store(false, Ordering::Release);
@@ -1168,6 +1689,98 @@ mod tests {
         assert_eq!(
             platform.counters.pending_deliveries.load(Ordering::Relaxed),
             u64::MAX
+        );
+    }
+
+    #[test]
+    fn post_eoi_handler_completion_does_not_publish_retirement_transport() {
+        let platform = Q35InterruptPlatform::new(&FAKE_POST_EOI_RETRY).unwrap();
+        let reservation = platform.reserve_source(Q35_COM2_SOURCE).unwrap();
+        let binding = reservation.binding;
+        platform.commit_source(reservation);
+        let Q35DeliverySnapshot::Live { generation, .. } = platform.snapshot_delivery() else {
+            panic!("live route did not produce an exact delivery snapshot");
+        };
+        FAKE_POST_EOI_RETRY
+            .current_bsp
+            .store(false, Ordering::Release);
+
+        assert_eq!(
+            platform.retire_source(binding),
+            InterruptRetirement::Deferred
+        );
+        assert!(platform.source.lock().retirement_request.is_none());
+        assert_eq!(FAKE_POST_EOI_RETRY.requests.load(Ordering::Acquire), 0);
+
+        InterruptPlatform::stage_retirement_retry(&platform, binding);
+        assert_eq!(FAKE_POST_EOI_RETRY.requests.load(Ordering::Acquire), 0);
+
+        platform.complete_handler(generation);
+        assert_eq!(FAKE_POST_EOI_RETRY.requests.load(Ordering::Acquire), 0);
+        assert_eq!(
+            platform.retire_source(binding),
+            InterruptRetirement::Deferred
+        );
+        let request = platform
+            .source
+            .lock()
+            .retirement_request
+            .expect("post-handler retry prepared its exact remote request")
+            .request();
+        InterruptPlatform::stage_retirement_retry(&platform, binding);
+        assert_eq!(FAKE_POST_EOI_RETRY.requests.load(Ordering::Acquire), 1);
+        assert_eq!(*FAKE_POST_EOI_RETRY.last_request.lock(), Some(request));
+
+        FAKE_POST_EOI_RETRY
+            .current_bsp
+            .store(true, Ordering::Release);
+        assert_eq!(
+            platform.retire_source(binding),
+            InterruptRetirement::Complete
+        );
+        assert_eq!(
+            platform.retirement_request_status(request),
+            Q35RetirementRequestStatus::Stale
+        );
+        let replacement = platform.reserve_source(Q35_COM2_SOURCE).unwrap();
+        assert!(replacement.binding.generation() > binding.generation());
+        platform.cancel_source(replacement).unwrap();
+    }
+
+    #[test]
+    fn remote_deferred_finalization_stages_one_generation_exact_bsp_request() {
+        let platform = Q35InterruptPlatform::new(&FAKE_REMOTE_RETRY).unwrap();
+        let reservation = platform.reserve_source(Q35_COM2_SOURCE).unwrap();
+        let binding = reservation.binding;
+        platform.commit_source(reservation);
+        FAKE_REMOTE_RETRY
+            .current_bsp
+            .store(false, Ordering::Release);
+
+        assert_eq!(
+            platform.retire_source(binding),
+            InterruptRetirement::Deferred
+        );
+        let request = platform
+            .source
+            .lock()
+            .retirement_request
+            .expect("remote retirement retained an exact BSP request")
+            .request();
+        assert_eq!(request.source, Q35_COM2_SOURCE);
+        assert_eq!(request.vector, 0x30);
+        assert_eq!(request.platform_generation, binding.generation());
+        assert_ne!(request.request_generation, 0);
+        assert_eq!(FAKE_REMOTE_RETRY.requests.load(Ordering::Acquire), 0);
+
+        InterruptPlatform::stage_retirement_retry(&platform, binding);
+        assert_eq!(FAKE_REMOTE_RETRY.requests.load(Ordering::Acquire), 1);
+        assert_eq!(*FAKE_REMOTE_RETRY.last_request.lock(), Some(request));
+
+        FAKE_REMOTE_RETRY.current_bsp.store(true, Ordering::Release);
+        assert_eq!(
+            platform.retire_source(binding),
+            InterruptRetirement::Complete
         );
     }
 
@@ -1242,7 +1855,17 @@ mod tests {
         assert_eq!(snapshot.generation_replacements, 1);
 
         assert_eq!(platform.snapshot_delivery(), Q35DeliverySnapshot::Orphan);
-        assert_eq!(platform.counter_snapshot_locked(), snapshot);
+        let after_terminal_orphan = platform.counter_snapshot_locked();
+        assert_eq!(after_terminal_orphan.physical_entries, 2);
+        assert_eq!(after_terminal_orphan.stale_orphans, 2);
+        assert_eq!(
+            after_terminal_orphan.exact_deliveries,
+            snapshot.exact_deliveries
+        );
+        assert!(matches!(
+            platform.reserve_source(Q35_COM2_SOURCE),
+            Err(InterruptPlatformError::SourceInUse)
+        ));
         assert!(matches!(
             platform.acknowledge_source(binding2),
             Err(InterruptPlatformError::BadState)

@@ -25,13 +25,13 @@ pub(crate) use interrupt::{
     reason = "the q35 live platform exports are consumed only by target activation"
 )]
 pub(crate) use q35_interrupt::{
-    Q35DeliverySnapshot, Q35InterruptCounterSnapshot, Q35InterruptPlatform, Q35TerminalFreeze,
+    Q35BspCheckRequest, Q35BspRetirementCarrier, Q35DeliverySnapshot, Q35InterruptCounterSnapshot,
+    Q35InterruptPlatform, Q35RetirementRequestStatus, Q35TerminalFreeze,
 };
 
-#[cfg(any(test, deepwyrm_dw1d_evidence, deepwyrm_dw1e_evidence))]
 #[allow(
     unused_imports,
-    reason = "selector-private collectors consume the exact binding identity"
+    reason = "typed finalization and selector-private collectors consume the exact binding identity"
 )]
 pub(crate) use interrupt::InterruptBinding;
 

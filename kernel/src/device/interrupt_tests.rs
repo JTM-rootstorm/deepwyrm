@@ -44,6 +44,66 @@ struct CommitBoundaryPlatform<'a> {
     accepted: AtomicBool,
 }
 
+struct FailingAckPlatform {
+    inner: Platform,
+    fail_ack: AtomicBool,
+}
+
+impl FailingAckPlatform {
+    fn new() -> Self {
+        Self {
+            inner: Platform::new(),
+            fail_ack: AtomicBool::new(true),
+        }
+    }
+}
+
+impl InterruptPlatform for FailingAckPlatform {
+    fn reserve_source(
+        &self,
+        source: u32,
+    ) -> Result<super::interrupt::InterruptSourceReservation, InterruptPlatformError> {
+        self.inner.reserve_source(source)
+    }
+
+    fn cancel_source(
+        &self,
+        reservation: super::interrupt::InterruptSourceReservation,
+    ) -> Result<(), InterruptPlatformError> {
+        self.inner.cancel_source(reservation)
+    }
+
+    fn commit_source(
+        &self,
+        reservation: super::interrupt::InterruptSourceReservation,
+    ) -> InterruptBinding {
+        self.inner.commit_source(reservation)
+    }
+
+    fn mask_source(&self, binding: InterruptBinding) {
+        self.inner.mask_source(binding);
+    }
+
+    fn acknowledge_source(
+        &self,
+        binding: InterruptBinding,
+    ) -> Result<InterruptPlatformAck, InterruptPlatformError> {
+        if self.fail_ack.load(Ordering::Acquire) {
+            Err(InterruptPlatformError::BadState)
+        } else {
+            self.inner.acknowledge_source(binding)
+        }
+    }
+
+    fn complete_ack(&self, ack: InterruptPlatformAck, outcome: InterruptAckOutcome) {
+        self.inner.complete_ack(ack, outcome);
+    }
+
+    fn release_source(&self, binding: InterruptBinding) {
+        self.inner.release_source(binding);
+    }
+}
+
 impl<'a> CommitBoundaryPlatform<'a> {
     fn new(interrupts: &'a Interrupts, waits: &'a Waits) -> Self {
         Self {
@@ -736,6 +796,95 @@ fn delivery_racing_prepared_ack_survives_and_source_remains_masked() {
 }
 
 #[test]
+fn failed_platform_ack_preserves_a_delivery_that_raced_the_prepared_ack() {
+    let mut fixture = Fixture::broad();
+    let platform = FailingAckPlatform::new();
+    let (key, handle) = interrupt_create(
+        &mut fixture.table,
+        &mut fixture.registry,
+        &fixture.resources,
+        &fixture.interrupts,
+        &platform,
+        fixture.resource,
+        dw_object_compatible_rights(DW_OBJECT_TYPE_INTERRUPT),
+    )
+    .unwrap();
+    let binding = fixture.interrupts.binding(key);
+    let delivery = platform.inner.prepare_delivery(binding).unwrap();
+    assert!(fixture.interrupts.deliver(delivery, &fixture.waits).0);
+    let transaction = prepare_interrupt_ack(
+        &fixture.table,
+        &mut fixture.registry,
+        &fixture.interrupts,
+        handle,
+    )
+    .unwrap();
+    let raced = platform.inner.prepare_delivery(binding).unwrap();
+    assert!(fixture.interrupts.deliver(raced, &fixture.waits).0);
+    assert_eq!(
+        transaction.complete(&mut fixture.registry, &fixture.interrupts, &platform),
+        Err(DW_STATUS_BAD_STATE)
+    );
+
+    platform.fail_ack.store(false, Ordering::Release);
+    assert_eq!(
+        interrupt_ack(
+            &fixture.table,
+            &mut fixture.registry,
+            &fixture.interrupts,
+            &platform,
+            handle,
+        ),
+        Ok(None)
+    );
+    let resolved = fixture
+        .table
+        .lookup(
+            &mut fixture.registry,
+            handle,
+            AcceptedObjectTypes::One(DW_OBJECT_TYPE_INTERRUPT),
+            DW_RIGHT_INSPECT,
+        )
+        .unwrap();
+    assert_eq!(
+        fixture
+            .interrupts
+            .current_signals_for_resolved(&resolved)
+            .unwrap(),
+        DW_SIGNAL_SIGNALED
+    );
+    assert!(
+        fixture
+            .registry
+            .release_internal(resolved.into_internal())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        interrupt_ack(
+            &fixture.table,
+            &mut fixture.registry,
+            &fixture.interrupts,
+            &platform,
+            handle,
+        ),
+        Ok(None)
+    );
+
+    let final_release = fixture
+        .table
+        .close(&mut fixture.registry, handle)
+        .unwrap()
+        .unwrap();
+    let finalization = fixture
+        .interrupts
+        .take_finalization(final_release, &platform)
+        .unwrap();
+    assert!(complete_interrupt_finalization(&mut fixture.registry, finalization).is_none());
+    fixture.finish_resource(None);
+}
+
+#[test]
 fn waiter_and_ack_pins_defer_finalization_until_exact_release() {
     let mut fixture = Fixture::broad();
     let (key, handle) = fixture.create_interrupt();
@@ -856,13 +1005,25 @@ fn deferred_retirement_retains_final_release_and_parent_until_safe_point_retry()
     assert!(platform.inner.is_bound(binding));
     assert_eq!(fixture.interrupts.live_count(), 1);
 
+    let other_platform = Platform::new();
+    let other_reservation = other_platform.reserve_source(3).unwrap();
+    let other_binding = other_platform.commit_source(other_reservation);
+    assert!(
+        fixture
+            .interrupts
+            .retry_deferred_finalization_exact(&platform, other_binding)
+            .is_none()
+    );
+    assert_eq!(fixture.interrupts.live_count(), 1);
     let ready = fixture
         .interrupts
-        .retry_deferred_finalization(&platform)
+        .retry_deferred_finalization_exact(&platform, binding)
         .expect("safe-point retry completes the exact staged generation");
     assert!(complete_interrupt_finalization(&mut fixture.registry, ready).is_none());
     assert!(!platform.inner.is_bound(binding));
     assert_eq!(fixture.interrupts.live_count(), 0);
+    other_platform.mask_source(other_binding);
+    other_platform.release_source(other_binding);
     fixture.finish_resource(None);
 }
 

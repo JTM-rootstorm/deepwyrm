@@ -1295,16 +1295,27 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         #[cfg(deepwyrm_dw1e_platform)]
         if self.cpu == crate::cpu::CpuIndex::BOOTSTRAP {
-            // The e1 rendezvous may have been a generation-bound q35
-            // retirement request. Retry only here, outside interrupt context
-            // and while the ordinary carrier finalizer authority is held.
             runtime
-                .drain_finalizers()
+                .service_q35_retirement_at_bsp_safe_point()
                 .unwrap_or_else(|_| panic!("DW1-E2C deferred finalizer safe-point drifted"));
             #[cfg(deepwyrm_dw1e_e3b_full)]
             runtime.service_pending_dw1e_terminal();
         }
         Ok(operation(&mut runtime))
+    }
+
+    #[cfg(deepwyrm_dw1e_platform)]
+    fn service_q35_retirement_at_bsp_safe_point(&mut self) {
+        if self.cpu != crate::cpu::CpuIndex::BOOTSTRAP {
+            return;
+        }
+        let mut runtime = self.runtime.lock();
+        runtime.switch_cpu(self.cpu);
+        runtime
+            .service_q35_retirement_at_bsp_safe_point()
+            .unwrap_or_else(|_| panic!("DW1-E2C deferred finalizer safe-point drifted"));
+        #[cfg(deepwyrm_dw1e_e3b_full)]
+        runtime.service_pending_dw1e_terminal();
     }
 
     fn enter_ap_kernel_root_detached(&mut self) {
@@ -5429,6 +5440,62 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok(())
     }
 
+    #[cfg(deepwyrm_dw1e_platform)]
+    fn retry_q35_finalizer_exact(
+        &mut self,
+        binding: crate::device::InterruptBinding,
+    ) -> Result<(), ()> {
+        let parent_release = {
+            let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
+            let mut finalizer = crate::object::PayloadFinalizer::new(
+                &mut self.registry,
+                &mut *self.active.target.roles,
+                &mut self.memory,
+                &self.shared.events,
+                &self.shared.timers,
+                &mut timer_deadlines,
+                &self.shared.channels,
+                &self.shared.waits,
+                &mut self.tasks,
+                &mut self.spaces,
+                &mut self.regions,
+            )
+            .with_device_resources(&self.shared.device_resources)
+            .with_boot_resource_grants(&self.shared.boot_resource_grants)
+            .with_interrupts(&self.shared.interrupts, &self.shared.interrupt_platform);
+            finalizer.retry_deferred_interrupt_exact(binding)
+        };
+        if let Some(parent_release) = parent_release {
+            self.cleanup.push(parent_release);
+            self.drain_finalizers()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(deepwyrm_dw1e_platform)]
+    fn service_q35_retirement_at_bsp_safe_point(&mut self) -> Result<(), ()> {
+        if self.cpu != crate::cpu::CpuIndex::BOOTSTRAP {
+            return Ok(());
+        }
+        let pending = crate::time::pending_q35_bsp_retirement_check().map_err(|_| ())?;
+        match pending {
+            None => self.drain_finalizers(),
+            Some(request) => match self
+                .shared
+                .interrupt_platform
+                .retirement_request_status(request)
+            {
+                crate::device::Q35RetirementRequestStatus::Publishing => Ok(()),
+                crate::device::Q35RetirementRequestStatus::Published(binding) => {
+                    self.retry_q35_finalizer_exact(binding)
+                }
+                crate::device::Q35RetirementRequestStatus::Stale => {
+                    crate::time::complete_q35_bsp_retirement_check(request).map_err(|_| ())
+                }
+            },
+        }
+    }
+
     fn drain_finalizers(&mut self) -> Result<(), ()> {
         loop {
             while !self.cleanup.is_empty() {
@@ -6957,6 +7024,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         &'owner mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     ) -> crate::syscall::native::NativeIdleSuspendPoll<'owner> {
+        #[cfg(deepwyrm_dw1e_platform)]
+        if self.cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+            self.service_q35_retirement_at_bsp_safe_point()
+                .unwrap_or_else(|_| panic!("DW1-E2C deferred finalizer safe-point drifted"));
+            #[cfg(deepwyrm_dw1e_e3b_full)]
+            self.service_pending_dw1e_terminal();
+        }
         unsafe { self.poll_idle_suspend_stationary() }
     }
 
@@ -8134,6 +8208,8 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                             panic!("kernel-root idle carrier received an unexpected stop request")
                         }
                     }
+                    #[cfg(deepwyrm_dw1e_platform)]
+                    self.service_q35_retirement_at_bsp_safe_point();
                 }
             }
         }
@@ -8161,6 +8237,12 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             runtime.switch_cpu(self.cpu);
             if self.cpu == crate::cpu::CpuIndex::BOOTSTRAP {
                 runtime.service_pending_timer_expiries_on_bootstrap();
+                #[cfg(deepwyrm_dw1e_platform)]
+                runtime
+                    .service_q35_retirement_at_bsp_safe_point()
+                    .unwrap_or_else(|_| panic!("DW1-E2C deferred finalizer safe-point drifted"));
+                #[cfg(deepwyrm_dw1e_e3b_full)]
+                runtime.service_pending_dw1e_terminal();
             }
             unsafe { runtime.poll_idle_suspend_stationary() }
         };

@@ -166,6 +166,11 @@ pub(crate) trait InterruptPlatform {
         self.release_source(binding);
         InterruptRetirement::Complete
     }
+
+    /// Publishes the private carrier work that can retry an exact deferred
+    /// retirement after its move-only final release has been staged. Synthetic
+    /// platforms complete synchronously and need no carrier notification.
+    fn stage_retirement_retry(&self, _binding: InterruptBinding) {}
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -522,6 +527,12 @@ pub(crate) trait InterruptFinalizer {
         &self,
         platform: &dyn InterruptPlatform,
     ) -> Option<InterruptFinalization>;
+
+    fn retry_deferred_finalization_exact(
+        &self,
+        platform: &dyn InterruptPlatform,
+        binding: InterruptBinding,
+    ) -> Option<InterruptFinalization>;
 }
 
 pub(crate) struct InterruptAuthority<const INTERRUPTS: usize> {
@@ -693,8 +704,10 @@ impl<const INTERRUPTS: usize> InterruptAuthority<INTERRUPTS> {
         let mut interrupts = self.interrupts.lock();
         let interrupt = exact_interrupt_mut(&mut interrupts, object, binding)
             .expect("failed ack transaction retained exact Interrupt lifetime");
-        if matches!(interrupt.state, InterruptState::AckPrepared { .. }) {
-            interrupt.state = InterruptState::Pending { coalesced: false };
+        if let InterruptState::AckPrepared { raced_delivery } = interrupt.state {
+            interrupt.state = InterruptState::Pending {
+                coalesced: raced_delivery,
+            };
         }
     }
 
@@ -947,12 +960,16 @@ impl<const INTERRUPTS: usize> InterruptFinalizer for InterruptAuthority<INTERRUP
                     .replace(final_release)
                     .is_none()
             );
+            #[cfg(deepwyrm_dw1d_evidence)]
+            let parent_descriptor = interrupt.parent_descriptor;
+            drop(interrupts);
+            platform.stage_retirement_retry(binding);
             return Ok(InterruptFinalization {
                 state: InterruptFinalizationState::Deferred,
                 #[cfg(deepwyrm_dw1d_evidence)]
                 binding,
                 #[cfg(deepwyrm_dw1d_evidence)]
-                parent_descriptor: interrupt.parent_descriptor,
+                parent_descriptor,
             });
         }
 
@@ -993,12 +1010,59 @@ impl<const INTERRUPTS: usize> InterruptFinalizer for InterruptAuthority<INTERRUP
                 .expect("deferred retry retains its exact Interrupt record");
             assert!(interrupt.finalization_retry_in_progress);
             interrupt.finalization_retry_in_progress = false;
+            drop(interrupts);
+            platform.stage_retirement_retry(binding);
             return None;
         }
         let finalized_interrupt = take_finalized_interrupt(&self.interrupts, object, binding);
         let final_release = finalized_interrupt
             .pending_final_release
             .expect("ready deferred Interrupt retained its exact final release");
+        let parent = finalized_interrupt.parent;
+        #[cfg(deepwyrm_dw1d_evidence)]
+        let parent_descriptor = finalized_interrupt.parent_descriptor;
+        Some(InterruptFinalization {
+            state: InterruptFinalizationState::Ready {
+                final_release,
+                parent,
+            },
+            #[cfg(deepwyrm_dw1d_evidence)]
+            binding,
+            #[cfg(deepwyrm_dw1d_evidence)]
+            parent_descriptor,
+        })
+    }
+
+    fn retry_deferred_finalization_exact(
+        &self,
+        platform: &dyn InterruptPlatform,
+        binding: InterruptBinding,
+    ) -> Option<InterruptFinalization> {
+        let object = {
+            let mut interrupts = self.interrupts.lock();
+            let interrupt = interrupts.iter_mut().flatten().find(|interrupt| {
+                interrupt.binding == binding
+                    && matches!(interrupt.state, InterruptState::Finalizing)
+                    && interrupt.pending_final_release.is_some()
+                    && !interrupt.finalization_retry_in_progress
+            })?;
+            interrupt.finalization_retry_in_progress = true;
+            interrupt.object
+        };
+        if platform.retire_source(binding) == InterruptRetirement::Deferred {
+            let mut interrupts = self.interrupts.lock();
+            let interrupt = exact_interrupt_mut(&mut interrupts, object, binding)
+                .expect("exact deferred retry retains its Interrupt record");
+            assert!(interrupt.finalization_retry_in_progress);
+            interrupt.finalization_retry_in_progress = false;
+            drop(interrupts);
+            platform.stage_retirement_retry(binding);
+            return None;
+        }
+        let finalized_interrupt = take_finalized_interrupt(&self.interrupts, object, binding);
+        let final_release = finalized_interrupt
+            .pending_final_release
+            .expect("ready exact deferred Interrupt retained its final release");
         let parent = finalized_interrupt.parent;
         #[cfg(deepwyrm_dw1d_evidence)]
         let parent_descriptor = finalized_interrupt.parent_descriptor;

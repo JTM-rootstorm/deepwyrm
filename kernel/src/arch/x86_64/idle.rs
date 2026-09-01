@@ -567,6 +567,16 @@ pub(crate) fn take_current_latched_notification() -> MailboxNotification {
         .unwrap_or_else(|_| fail_transport_and_halt())
 }
 
+/// Publishes one coalesced BSP carrier wake before a private service emits e1.
+/// The mailbox remains authoritative if the IPI is delayed until after the
+/// next IF-clear carrier boundary.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn publish_bsp_service_wake() -> Result<(), IdleWakeError> {
+    LIVE_IDLE_WAKE.ensure_healthy()?;
+    LIVE_IDLE_WAKE.mailboxes[CpuIndex::BOOTSTRAP.index()].publish_wake();
+    LIVE_IDLE_WAKE.ensure_healthy()
+}
+
 /// Acquires the current CPU's mailbox directly at a carrier-owned safe point.
 /// This closes the syscall-entry race where e1 is pending in the local APIC
 /// while IF is already clear: the mailbox publication remains authoritative

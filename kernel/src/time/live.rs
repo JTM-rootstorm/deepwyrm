@@ -58,6 +58,8 @@ const XAPIC_EOI_REGISTER: u32 = 0x0b0;
 /// after EOI and before it takes the time lock, so one delivery may safely
 /// cover any number of mutations already visible through that lock.
 static BSP_TIMER_SERVICE: TimerServiceSignal = TimerServiceSignal::new();
+static Q35_BSP_RETIREMENT_REQUEST: IrqSpinMutex<crate::device::Q35BspRetirementCarrier> =
+    IrqSpinMutex::new(crate::device::Q35BspRetirementCarrier::new());
 static AP_SCHEDULER_TIMER_MASKED: [AtomicBool; CPU_CAPACITY] =
     [const { AtomicBool::new(false) }; CPU_CAPACITY];
 
@@ -530,26 +532,67 @@ pub(crate) fn q35_current_cpu_is_bsp() -> Result<bool, LiveTimeError> {
     Ok(installed_current_cpu_index()? == CpuIndex::BOOTSTRAP)
 }
 
-/// Requests one CPU0 carrier safe-point when q35 retirement was initiated on
-/// another CPU. The existing e1 rendezvous transport is coalescing and its
-/// post-EOI latch performs no finalization in interrupt context.
-pub(crate) fn request_q35_bsp_retirement_check(
-    source: u32,
-    vector: u8,
-    platform_generation: u64,
-    request_generation: u64,
+/// Publishes the exact q35 retirement token without notifying CPU0. The q35
+/// source remains in `Publishing` until this durable store succeeds, so a
+/// concurrent CPU0 retry cannot release the generation ahead of publication.
+pub(crate) fn publish_q35_bsp_retirement_check(
+    request: crate::device::Q35BspCheckRequest,
 ) -> Result<(), LiveTimeError> {
-    if source != 3 || vector != 0x30 || platform_generation == 0 || request_generation == 0 {
-        return Err(LiveTimeError::Faulted);
-    }
+    Q35_BSP_RETIREMENT_REQUEST
+        .lock()
+        .publish_exact(request)
+        .map_err(|_| LiveTimeError::Faulted)
+}
+
+/// Notifies CPU0 only after the q35 source and carrier both expose the same
+/// Published token. A failed notification leaves that durable token pending
+/// for the next ordinary CPU0 carrier safe point.
+pub(crate) fn notify_q35_bsp_retirement_check(
+    _request: crate::device::Q35BspCheckRequest,
+) -> Result<(), LiveTimeError> {
     if installed_current_cpu_index()? == CpuIndex::BOOTSTRAP {
         return Ok(());
     }
+    crate::arch::x86_64::idle::publish_bsp_service_wake().map_err(|_| LiveTimeError::Faulted)?;
     let bsp = LOCAL_APIC_SLOTS[CpuIndex::BOOTSTRAP.index()]
         .identity()
         .ok_or(LiveTimeError::ApicAccess)?;
     send_live_ipi(bsp.local_apic_id, LiveIpiVector::Rendezvous)
         .map_err(|_| LiveTimeError::IpiTransport)
+}
+
+/// Terminal freeze is selector-private work, not Interrupt retirement. Its
+/// exact state remains in the q35 source/evidence authorities; e1 is only a
+/// remote wake and never occupies the retirement carrier.
+pub(crate) fn request_q35_bsp_terminal_check(
+    _request: crate::device::Q35BspCheckRequest,
+) -> Result<(), LiveTimeError> {
+    if installed_current_cpu_index()? == CpuIndex::BOOTSTRAP {
+        return Ok(());
+    }
+    crate::arch::x86_64::idle::publish_bsp_service_wake().map_err(|_| LiveTimeError::Faulted)?;
+    let bsp = LOCAL_APIC_SLOTS[CpuIndex::BOOTSTRAP.index()]
+        .identity()
+        .ok_or(LiveTimeError::ApicAccess)?;
+    send_live_ipi(bsp.local_apic_id, LiveIpiVector::Rendezvous)
+        .map_err(|_| LiveTimeError::IpiTransport)
+}
+
+pub(crate) fn pending_q35_bsp_retirement_check()
+-> Result<Option<crate::device::Q35BspCheckRequest>, LiveTimeError> {
+    if installed_current_cpu_index()? != CpuIndex::BOOTSTRAP {
+        return Err(LiveTimeError::CpuIdentity);
+    }
+    Ok(Q35_BSP_RETIREMENT_REQUEST.lock().pending())
+}
+
+pub(crate) fn complete_q35_bsp_retirement_check(
+    request: crate::device::Q35BspCheckRequest,
+) -> Result<(), LiveTimeError> {
+    Q35_BSP_RETIREMENT_REQUEST
+        .lock()
+        .complete_exact(request)
+        .map_err(|_| LiveTimeError::Faulted)
 }
 
 fn current_cpu_is_timer_service() -> Result<bool, LiveTimeError> {

@@ -210,6 +210,25 @@ impl<
         parent
     }
 
+    pub(crate) fn retry_deferred_interrupt_exact(
+        &mut self,
+        binding: crate::device::InterruptBinding,
+    ) -> Option<FinalRelease> {
+        let interrupts = self.interrupts?;
+        let platform = self.interrupt_platform?;
+        let finalization = interrupts.retry_deferred_finalization_exact(platform, binding)?;
+        #[cfg(deepwyrm_dw1d_evidence)]
+        let (dw1d_object, dw1d_binding, dw1d_lease) = finalization.dw1d_identity();
+        let parent = complete_interrupt_finalization(self.registry, finalization);
+        #[cfg(deepwyrm_dw1d_evidence)]
+        crate::test_support::DW1D_EVIDENCE
+            .observe_interrupt_finalized(dw1d_object, dw1d_binding, dw1d_lease)
+            .unwrap_or_else(|error| {
+                panic!("selector-30 exact deferred Interrupt observation failed: {error:?}")
+            });
+        parent
+    }
+
     fn finalize_one(
         &mut self,
         final_release: FinalRelease,
