@@ -442,6 +442,19 @@ impl Dw1eEvidenceCollector {
         Ok(())
     }
 
+    pub(crate) fn challenge_wait_target(
+        &self,
+    ) -> Result<(ProcessKey, ObjectId), Dw1eEvidenceError> {
+        let mut state = self.state.lock();
+        let Some(driver) = state.driver else {
+            return Err(state.latch(Dw1eEvidenceError::Early));
+        };
+        let Some(committed) = state.committed else {
+            return Err(state.latch(Dw1eEvidenceError::Early));
+        };
+        Ok((driver, committed.object))
+    }
+
     pub(crate) fn arm_challenge(
         &self,
         caller: ProcessKey,
@@ -449,6 +462,10 @@ impl Dw1eEvidenceCollector {
         challenge_generation: u64,
         expected_length: u64,
         expected_hash: u64,
+        blocked_process: ProcessKey,
+        blocked_object: ObjectId,
+        execution_generation: u64,
+        token: u64,
     ) -> Result<(), Dw1eEvidenceError> {
         let mut state = self.state.lock();
         if state.driver != Some(caller) && state.controller != Some(caller) {
@@ -457,11 +474,27 @@ impl Dw1eEvidenceCollector {
         if state.probe.is_none() || state.challenge.is_some() || state.record_count != 3 {
             return Err(state.latch(Dw1eEvidenceError::OutOfOrder));
         }
+        if state.driver != Some(blocked_process)
+            || state
+                .committed
+                .is_none_or(|committed| committed.object != blocked_object)
+            || state.blocked_wait.is_some()
+            || execution_generation == 0
+            || token == 0
+        {
+            return Err(state.latch(Dw1eEvidenceError::WrongRelation));
+        }
         state.challenge = Some(Challenge {
             stream_generation,
             challenge_generation,
             expected_length,
             expected_hash,
+        });
+        state.blocked_wait = Some(BlockedWait {
+            process: blocked_process,
+            object: blocked_object,
+            execution_generation,
+            token,
         });
         Ok(())
     }
@@ -1281,9 +1314,8 @@ mod tests {
             .bind_driver(driver, object, binding, 13, 17)
             .unwrap();
         collector.bind_probe(controller, probe).unwrap();
-        collector.arm_challenge(driver, 19, 23, 5, 29).unwrap();
         collector
-            .observe_wait_blocked(driver, object, 31, 37)
+            .arm_challenge(driver, 19, 23, 5, 29, driver, object, 31, 37)
             .unwrap();
         collector.observe_physical(binding).unwrap();
         collector

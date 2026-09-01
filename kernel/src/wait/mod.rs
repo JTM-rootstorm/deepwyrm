@@ -693,6 +693,32 @@ impl<const CAPACITY: usize> WaitRegistry<CAPACITY> {
         batch
     }
 
+    /// Selector 31 arms only after the production UART driver's already
+    /// published wait-many generation owns the exact committed Interrupt.
+    /// Duplicate views of that Interrupt are one generation; distinct
+    /// generations are ambiguous and cannot become evidence.
+    #[cfg(deepwyrm_dw1e_evidence)]
+    pub(crate) fn unique_wait_generation(
+        &self,
+        object: ObjectId,
+        desired: DwSignals,
+    ) -> Option<(ThreadKey, BlockWakeKey)> {
+        let slots = self.slots.lock();
+        let mut found = None;
+        for entry in slots.iter().filter_map(|slot| slot.entry.as_ref()) {
+            if entry.identity.object != object || entry.desired != desired {
+                continue;
+            }
+            let candidate = (entry.identity.thread, entry.identity.wake);
+            match found {
+                None => found = Some(candidate),
+                Some(existing) if existing == candidate => {}
+                Some(_) => return None,
+            }
+        }
+        found
+    }
+
     /// Returns eligible signal wake intents without consuming registrations.
     ///
     /// Timer expiry uses this IRQ-safe snapshot after committing `SIGNALED`.

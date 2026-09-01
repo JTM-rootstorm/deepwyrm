@@ -243,7 +243,7 @@ impl ResolvedWaitSet {
             .then(|| ChannelEndpointKey::from_object_id(item.target.object_id()))
     }
 
-    #[cfg(any(deepwyrm_dw1d_evidence, deepwyrm_dw1e_evidence))]
+    #[cfg(deepwyrm_dw1d_evidence)]
     fn exact_signaled_interrupt(&self) -> Option<crate::object::ObjectId> {
         if self.len != 1 {
             return None;
@@ -252,6 +252,28 @@ impl ResolvedWaitSet {
         (item.target.object_type() == DW_OBJECT_TYPE_INTERRUPT
             && item.desired == deepwyrm_abi::DW_SIGNAL_SIGNALED)
             .then(|| item.target.object_id())
+    }
+
+    /// Selector 31 observes the production driver's wait-many generation.
+    /// Other control/stream items may coexist, but only one Interrupt object
+    /// may carry the exact SIGNALED request.
+    #[cfg(deepwyrm_dw1e_evidence)]
+    fn unique_signaled_interrupt(&self) -> Option<crate::object::ObjectId> {
+        let mut found = None;
+        for item in self.items[..self.len].iter().flatten() {
+            if item.target.object_type() != DW_OBJECT_TYPE_INTERRUPT
+                || item.desired != deepwyrm_abi::DW_SIGNAL_SIGNALED
+            {
+                continue;
+            }
+            let object = item.target.object_id();
+            match found {
+                None => found = Some(object),
+                Some(existing) if existing == object => {}
+                Some(_) => return None,
+            }
+        }
+        found
     }
 
     pub(crate) fn select_ready<
@@ -665,8 +687,10 @@ pub(crate) fn begin_registered_wait<
 
     #[cfg(deepwyrm_dw1c_evidence)]
     let token7_writable_channel = set.exact_writable_channel();
-    #[cfg(any(deepwyrm_dw1d_evidence, deepwyrm_dw1e_evidence))]
-    let evidence_interrupt = set.exact_signaled_interrupt();
+    #[cfg(deepwyrm_dw1d_evidence)]
+    let dw1d_evidence_interrupt = set.exact_signaled_interrupt();
+    #[cfg(deepwyrm_dw1e_evidence)]
+    let dw1e_evidence_interrupt = set.unique_signaled_interrupt();
 
     match set.select_ready(tasks, &sources) {
         Ok(Some(selection)) => {
@@ -974,7 +998,7 @@ pub(crate) fn begin_registered_wait<
                             });
                     }
                     #[cfg(deepwyrm_dw1d_evidence)]
-                    if let Some(interrupt) = evidence_interrupt.filter(|interrupt| {
+                    if let Some(interrupt) = dw1d_evidence_interrupt.filter(|interrupt| {
                         crate::test_support::DW1D_EVIDENCE
                             .tracks_interrupt_wait(process, *interrupt)
                     }) {
@@ -990,7 +1014,7 @@ pub(crate) fn begin_registered_wait<
                             });
                     }
                     #[cfg(deepwyrm_dw1e_evidence)]
-                    if let Some(interrupt) = evidence_interrupt.filter(|interrupt| {
+                    if let Some(interrupt) = dw1e_evidence_interrupt.filter(|interrupt| {
                         crate::test_support::DW1E_EVIDENCE
                             .tracks_interrupt_wait(process, *interrupt)
                     }) {

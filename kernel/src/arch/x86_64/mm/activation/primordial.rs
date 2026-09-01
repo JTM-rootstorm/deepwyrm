@@ -6718,6 +6718,20 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                 expected_length,
                 expected_hash,
             } => {
+                let (driver, interrupt) =
+                    DW1E_EVIDENCE
+                        .challenge_wait_target()
+                        .unwrap_or_else(|error| {
+                            crate::test_support::complete_fail(0x3110_e141 | error as u32)
+                        });
+                let (thread, wake) = self
+                    .shared
+                    .waits
+                    .unique_wait_generation(interrupt, deepwyrm_abi::DW_SIGNAL_SIGNALED)
+                    .unwrap_or_else(|| crate::test_support::complete_fail(0x3110_e142));
+                if self.tasks.thread_process(thread) != Ok(driver) {
+                    crate::test_support::complete_fail(0x3110_e143)
+                }
                 DW1E_EVIDENCE
                     .arm_challenge(
                         self.process,
@@ -6725,6 +6739,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                         challenge_generation,
                         expected_length,
                         expected_hash,
+                        driver,
+                        interrupt,
+                        wake.execution_generation(),
+                        wake.token(),
                     )
                     .unwrap_or_else(|error| {
                         crate::test_support::complete_fail(0x3110_e140 | error as u32)
