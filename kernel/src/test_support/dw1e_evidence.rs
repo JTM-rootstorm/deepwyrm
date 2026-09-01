@@ -87,7 +87,9 @@ pub(crate) enum Dw1eRawOperation {
         interrupt_handle: u64,
         attempt_generation: u64,
     },
-    BindProbe,
+    BindProbe {
+        probe_handle: u64,
+    },
     ArmChallenge {
         stream_generation: u64,
         challenge_generation: u64,
@@ -117,8 +119,10 @@ impl Dw1eRawOperation {
                     attempt_generation,
                 })
             }
-            [RAW_ACTION_BIND_PROBE, supplied_nonce, 0, 0, 0, 0] if supplied_nonce == nonce => {
-                Ok(Self::BindProbe)
+            [RAW_ACTION_BIND_PROBE, probe_handle, supplied_nonce, 0, 0, 0]
+                if probe_handle != 0 && supplied_nonce == nonce =>
+            {
+                Ok(Self::BindProbe { probe_handle })
             }
             [
                 RAW_ACTION_ARM_CHALLENGE,
@@ -425,7 +429,12 @@ impl Dw1eEvidenceCollector {
         probe: ProcessKey,
     ) -> Result<(), Dw1eEvidenceError> {
         let mut state = self.state.lock();
-        if state.driver.is_none() || controller == probe || state.probe.is_some() {
+        if state.driver.is_none()
+            || state.driver == Some(controller)
+            || state.driver == Some(probe)
+            || controller == probe
+            || state.probe.is_some()
+        {
             return Err(state.latch(Dw1eEvidenceError::WrongActor));
         }
         state.controller = Some(controller);
@@ -1159,8 +1168,8 @@ mod tests {
             })
         );
         assert_eq!(
-            collector.decode_raw([2, 9, 0, 0, 0, 0]),
-            Ok(Dw1eRawOperation::BindProbe)
+            collector.decode_raw([2, 13, 9, 0, 0, 0]),
+            Ok(Dw1eRawOperation::BindProbe { probe_handle: 13 })
         );
         assert_eq!(
             collector.decode_raw([3, 14, 15, 16, 17, 9]),
@@ -1184,8 +1193,9 @@ mod tests {
             [1, 0, 12, 9, 0, 0],
             [1, 11, 0, 9, 0, 0],
             [1, 11, 12, 9, 1, 0],
-            [2, 0, 0, 0, 0, 0],
-            [2, 9, 0, 0, 0, 1],
+            [2, 0, 9, 0, 0, 0],
+            [2, 13, 0, 0, 0, 0],
+            [2, 13, 9, 0, 0, 1],
             [3, 0, 15, 16, 17, 9],
             [3, 14, 0, 16, 17, 9],
             [3, 14, 15, 0, 17, 9],

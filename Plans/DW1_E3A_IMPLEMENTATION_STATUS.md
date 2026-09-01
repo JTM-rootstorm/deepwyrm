@@ -25,14 +25,17 @@ but accepts exactly four nonce-bound actions:
 
 1. bind the caller to an exact resolved Interrupt handle and nonzero driver
    attempt generation;
-2. bind the caller's Process identity as the raw probe;
+2. bind the controller caller plus the exact raw-probe Process resolved from
+   its retained handle;
 3. arm one nonzero stream/challenge/length/FNV-1a-64 tuple; and
 4. submit only the driver UART-drain or probe response event admitted by E3A.
 
 Reserved words must be zero. Required values are nonzero. Driver binding
 derives object, binding, route, and parent-lease generations from the resolved
-kernel object; probe identity comes from the dispatch caller. Userspace cannot
-supply those kernel generations by value.
+kernel object. Probe binding resolves the controller's retained Process handle
+in the controller caller's table and requires both processes to remain live;
+userspace cannot supply either process generation or any kernel object
+generation by value.
 
 The collector reserves all 26 E3B slots while E3A can materialize and flush
 only records 0 through 8. Route discovery, U1 source reserve/commit, physical

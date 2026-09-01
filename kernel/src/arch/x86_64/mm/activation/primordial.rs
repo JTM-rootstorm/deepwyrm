@@ -6671,15 +6671,41 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                 self.commit_runtime_phase(phase);
                 NativeSyscallResult::returning(DW_STATUS_SUCCESS)
             }
-            Dw1eRawOperation::BindProbe => {
-                if self.process == self.primordial_process
+            Dw1eRawOperation::BindProbe { probe_handle } => {
+                let resolved = self
+                    .tasks
+                    .process_handles(self.process)
+                    .unwrap_or_else(|_| crate::test_support::complete_fail(0x3110_e121))
+                    .lookup(
+                        &mut self.registry,
+                        deepwyrm_abi::DwHandle(probe_handle),
+                        crate::handle::AcceptedObjectTypes::One(
+                            deepwyrm_abi::DW_OBJECT_TYPE_PROCESS,
+                        ),
+                        deepwyrm_abi::DW_RIGHT_INSPECT,
+                    )
+                    .unwrap_or_else(|_| crate::test_support::complete_fail(0x3110_e122));
+                let probe = crate::task::ProcessKey::from_object_id(resolved.object_id());
+                assert!(
+                    self.registry
+                        .release_internal(resolved.into_internal())
+                        .unwrap_or_else(|failure| panic!(
+                            "selector-31 BIND_PROBE lookup release failed: {:?}",
+                            failure.error()
+                        ))
+                        .is_none(),
+                    "selector-31 BIND_PROBE lookup unexpectedly finalized its Process"
+                );
+                if self.process == probe
                     || self.tasks.process_lifecycle(self.process)
+                        != Ok(ProcessLifecycleState::AcceptingOperations)
+                    || self.tasks.process_lifecycle(probe)
                         != Ok(ProcessLifecycleState::AcceptingOperations)
                 {
                     crate::test_support::complete_fail(0x3110_e120)
                 }
                 DW1E_EVIDENCE
-                    .bind_probe(self.primordial_process, self.process)
+                    .bind_probe(self.process, probe)
                     .unwrap_or_else(|error| {
                         crate::test_support::complete_fail(0x3110_e130 | error as u32)
                     });
