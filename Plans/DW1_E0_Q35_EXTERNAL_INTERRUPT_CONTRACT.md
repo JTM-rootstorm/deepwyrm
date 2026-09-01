@@ -369,15 +369,20 @@ Execution/scheduler wake publication
   -> drop before EOI and return
 ```
 
-Finalization first marks the typed Interrupt finalizing and invalidates live
-delivery, then performs platform retirement without holding wait, scheduler,
-Process, handle-table, ObjectRegistry, or typed-object locks. The platform
-binding remains retained until mask, in-handler quiescence, IRR/ISR proof, and
-release all succeed. If proof cannot complete synchronously, the one source's
-bounded deferred-finalization slot retains the exact generic/typed ownership;
-it is polled only at existing runtime/finalizer safe points and never in a
-busy-wait loop with IF clear. Parent `DeviceResource` release and grant return
-remain after exact Interrupt platform release as in DW1-D.
+Finalization first validates the exact typed Interrupt, drops that lock, and
+publishes the platform binding's logical `Retiring` quarantine. Only after the
+platform can no longer issue a live delivery snapshot does finalization
+reacquire the exact typed record and mark it `Finalizing`. It then performs the
+physical platform-retirement proof without holding wait, scheduler, Process,
+handle-table, ObjectRegistry, or typed-object locks. This ordering prevents a
+crossing delivery from observing a live platform generation paired with a
+typed object that has already become non-live. The platform binding remains
+retained until mask, in-handler quiescence, IRR/ISR proof, and release all
+succeed. If proof cannot complete synchronously, the one source's bounded
+deferred-finalization slot retains the exact generic/typed ownership; it is
+polled only at existing runtime/finalizer safe points and never in a busy-wait
+loop with IF clear. Parent `DeviceResource` release and grant return remain
+after exact Interrupt platform release as in DW1-D.
 
 No interrupt or retirement path allocates, usercopies, blocks on userspace,
 logs without a bound, recursively finalizes, or grows a queue. ISR loops,
