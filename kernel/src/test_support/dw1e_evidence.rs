@@ -510,9 +510,16 @@ impl Dw1eEvidenceCollector {
         if state
             .committed
             .is_none_or(|committed| committed.binding != binding)
-            || state.ack_complete
         {
             return Err(state.latch(Dw1eEvidenceError::WrongGeneration));
+        }
+        // A UART receive epoch can become quiescent before userspace queues
+        // the deterministic response. Enabling THRI then begins another real
+        // epoch on the same exact binding. Preserve the completed accounting
+        // as the prior quiescent point, but reopen the per-leg interval so
+        // transmit progress remains observable and acknowledgeable.
+        if state.ack_complete {
+            state.ack_complete = false;
         }
         state.physical_delta = state
             .physical_delta
@@ -688,7 +695,6 @@ impl Dw1eEvidenceCollector {
                 .committed
                 .is_none_or(|committed| committed.binding != binding)
             || state.drain.is_none()
-            || state.ack_complete
         {
             return Err(state.latch(Dw1eEvidenceError::WrongRelation));
         }
@@ -1332,6 +1338,16 @@ mod tests {
             .submit(driver, EVENT_C1_UART_DRAIN, 5, 29)
             .unwrap();
         collector.observe_ack(driver, binding, false).unwrap();
+
+        // The response is transmitted by the same UART after the receive
+        // epoch's clean ack. A fresh THRI epoch must remain inside the exact
+        // U1 generation instead of being misclassified as post-generation
+        // traffic.
+        collector.observe_physical(binding).unwrap();
+        collector
+            .observe_delivery(binding, InterruptDeliveryDisposition::FirstPending)
+            .unwrap();
+        collector.observe_ack(driver, binding, false).unwrap();
         collector.submit(probe, EVENT_C1_RESPONSE, 7, 41).unwrap();
 
         let permit = collector.partial_permit().unwrap();
@@ -1350,6 +1366,15 @@ mod tests {
             collector.partial_permit(),
             Err(Dw1eEvidenceError::PartialClaimed)
         ));
+
+        // E3A flushes before the host has necessarily observed the queued
+        // response. A late but exact transmit epoch may still finish after
+        // the immutable nine-record extraction without panicking the guest.
+        collector.observe_physical(binding).unwrap();
+        collector
+            .observe_delivery(binding, InterruptDeliveryDisposition::FirstPending)
+            .unwrap();
+        collector.observe_ack(driver, binding, false).unwrap();
     }
 
     #[test]
