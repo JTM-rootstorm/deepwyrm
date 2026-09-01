@@ -37,6 +37,15 @@ struct CoordinatedRetryPlatform {
     release_retry: Barrier,
 }
 
+struct RetirementBoundaryPlatform {
+    inner: Platform,
+    retiring: AtomicBool,
+    begin_entered: Barrier,
+    allow_begin: Barrier,
+    retire_entered: Barrier,
+    allow_retire: Barrier,
+}
+
 struct CommitBoundaryPlatform<'a> {
     inner: Platform,
     interrupts: &'a Interrupts,
@@ -185,6 +194,76 @@ impl CoordinatedRetryPlatform {
             retry_entered: Barrier::new(2),
             release_retry: Barrier::new(2),
         }
+    }
+}
+
+impl RetirementBoundaryPlatform {
+    fn new() -> Self {
+        Self {
+            inner: Platform::new(),
+            retiring: AtomicBool::new(false),
+            begin_entered: Barrier::new(2),
+            allow_begin: Barrier::new(2),
+            retire_entered: Barrier::new(2),
+            allow_retire: Barrier::new(2),
+        }
+    }
+}
+
+impl InterruptPlatform for RetirementBoundaryPlatform {
+    fn reserve_source(
+        &self,
+        source: u32,
+    ) -> Result<super::interrupt::InterruptSourceReservation, InterruptPlatformError> {
+        self.inner.reserve_source(source)
+    }
+
+    fn cancel_source(
+        &self,
+        reservation: super::interrupt::InterruptSourceReservation,
+    ) -> Result<(), InterruptPlatformError> {
+        self.inner.cancel_source(reservation)
+    }
+
+    fn commit_source(
+        &self,
+        reservation: super::interrupt::InterruptSourceReservation,
+    ) -> InterruptBinding {
+        self.inner.commit_source(reservation)
+    }
+
+    fn mask_source(&self, binding: InterruptBinding) {
+        self.inner.mask_source(binding);
+    }
+
+    fn acknowledge_source(
+        &self,
+        binding: InterruptBinding,
+    ) -> Result<InterruptPlatformAck, InterruptPlatformError> {
+        self.inner.acknowledge_source(binding)
+    }
+
+    fn complete_ack(&self, ack: InterruptPlatformAck, outcome: InterruptAckOutcome) {
+        self.inner.complete_ack(ack, outcome);
+    }
+
+    fn begin_retirement(&self, binding: InterruptBinding) {
+        self.begin_entered.wait();
+        self.allow_begin.wait();
+        self.inner.mask_source(binding);
+        assert!(!self.retiring.swap(true, Ordering::Release));
+    }
+
+    fn release_source(&self, binding: InterruptBinding) {
+        self.inner.release_source(binding);
+    }
+
+    fn retire_source(&self, binding: InterruptBinding) -> super::interrupt::InterruptRetirement {
+        assert!(self.retiring.load(Ordering::Acquire));
+        self.retire_entered.wait();
+        self.allow_retire.wait();
+        self.inner.release_source(binding);
+        super::interrupt::InterruptRetirement::Complete
     }
 }
 
@@ -1045,6 +1124,66 @@ fn deferred_retirement_retains_final_release_and_parent_until_safe_point_retry()
     assert_eq!(fixture.interrupts.live_count(), 0);
     other_platform.mask_source(other_binding);
     other_platform.release_source(other_binding);
+    fixture.finish_resource(None);
+}
+
+#[test]
+fn retirement_publication_precedes_typed_finalizing_during_concurrent_delivery() {
+    let mut fixture = Fixture::broad();
+    let platform = RetirementBoundaryPlatform::new();
+    let (key, handle) = interrupt_create(
+        &mut fixture.table,
+        &mut fixture.registry,
+        &fixture.resources,
+        &fixture.interrupts,
+        &platform,
+        fixture.resource,
+        dw_object_compatible_rights(DW_OBJECT_TYPE_INTERRUPT),
+    )
+    .unwrap();
+    let binding = fixture.interrupts.binding(key);
+    let before_publication = platform.inner.prepare_delivery(binding).unwrap();
+    let crossing_publication = platform.inner.prepare_delivery(binding).unwrap();
+    let final_release = fixture
+        .table
+        .close(&mut fixture.registry, handle)
+        .unwrap()
+        .unwrap();
+
+    let finalization = std::thread::scope(|scope| {
+        let finalizer = scope.spawn(|| {
+            fixture
+                .interrupts
+                .take_finalization(final_release, &platform)
+                .unwrap()
+        });
+
+        platform.begin_entered.wait();
+        assert!(!platform.retiring.load(Ordering::Acquire));
+        assert_eq!(
+            fixture
+                .interrupts
+                .deliver_classified(before_publication, &fixture.waits)
+                .0,
+            InterruptDeliveryDisposition::FirstPending
+        );
+
+        platform.allow_begin.wait();
+        platform.retire_entered.wait();
+        assert!(platform.retiring.load(Ordering::Acquire));
+        assert_eq!(
+            fixture
+                .interrupts
+                .deliver_classified(crossing_publication, &fixture.waits)
+                .0,
+            InterruptDeliveryDisposition::Rejected
+        );
+        platform.allow_retire.wait();
+        finalizer.join().unwrap()
+    });
+
+    assert!(complete_interrupt_finalization(&mut fixture.registry, finalization).is_none());
+    assert!(!platform.inner.is_bound(binding));
     fixture.finish_resource(None);
 }
 

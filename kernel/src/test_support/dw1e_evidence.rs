@@ -2698,6 +2698,19 @@ mod tests {
         assert!(controller_auth < materialize);
 
         let platform = include_str!("../device/q35_interrupt.rs");
+        let retirement_begin = platform
+            .split("fn begin_retirement_exact(")
+            .nth(1)
+            .unwrap()
+            .split("fn counter_snapshot_locked(")
+            .next()
+            .unwrap();
+        assert_eq!(
+            retirement_begin
+                .matches("observe_retire_begin(binding)")
+                .count(),
+            1
+        );
         let retirement = platform
             .split("pub(crate) fn try_finish_retirement(")
             .nth(1)
@@ -2706,7 +2719,6 @@ mod tests {
             .next()
             .unwrap();
         for observation in [
-            "observe_retire_begin(binding)",
             "observe_route_masked(binding, proof.reads)",
             "observe_handler_quiescent(binding)",
             "observe_lapic_clear(binding)",
@@ -2733,6 +2745,26 @@ mod tests {
         assert!(bsp_clear < lapic_clear);
         assert!(lapic_clear < release);
         assert!(release < released);
+
+        let interrupts = include_str!("../device/interrupt.rs");
+        let finalization = interrupts
+            .split("impl<const INTERRUPTS: usize> InterruptFinalizer")
+            .nth(1)
+            .unwrap()
+            .split("fn retry_deferred_finalization(")
+            .next()
+            .unwrap();
+        let platform_retiring = finalization
+            .find("platform.begin_retirement(binding);")
+            .unwrap();
+        let typed_finalizing = finalization
+            .find("interrupt.state = InterruptState::Finalizing;")
+            .unwrap();
+        let finish_retirement = finalization
+            .find("platform.retire_source(binding)")
+            .unwrap();
+        assert!(platform_retiring < typed_finalizing);
+        assert!(typed_finalizing < finish_retirement);
 
         let runtime = include_str!("../arch/x86_64/mm/activation/primordial.rs");
         let terminal = runtime

@@ -159,12 +159,20 @@ pub(crate) trait InterruptPlatform {
     /// transaction, including a transaction satisfied by a coalesced fact.
     fn record_userspace_ack(&self, _binding: InterruptBinding) {}
 
+    /// Quarantines an exact live source before its typed Interrupt becomes
+    /// Finalizing. This no-fail boundary must prevent every later platform
+    /// delivery snapshot from being classified live.
+    fn begin_retirement(&self, binding: InterruptBinding) {
+        self.mask_source(binding);
+    }
+
     /// Releases an exact masked source at the final no-fail ownership point.
     fn release_source(&self, binding: InterruptBinding);
 
-    /// Begins and, where possible, completes physical retirement. Real fixed-
-    /// vector platforms may retain an exact quarantined generation for a
-    /// later carrier safe-point; synthetic platforms complete synchronously.
+    /// Continues and, where possible, completes physical retirement after
+    /// logical quarantine. Real fixed-vector platforms may retain an exact
+    /// generation for a later carrier safe-point; synthetic platforms
+    /// complete synchronously.
     fn retire_source(&self, binding: InterruptBinding) -> InterruptRetirement {
         self.mask_source(binding);
         self.release_source(binding);
@@ -949,9 +957,21 @@ impl<const INTERRUPTS: usize> InterruptFinalizer for InterruptAuthority<INTERRUP
             ) {
                 return Err((InterruptError::FinalizationMismatch, final_release));
             }
-            interrupt.state = InterruptState::Finalizing;
             interrupt.binding
         };
+
+        platform.begin_retirement(binding);
+
+        {
+            let mut interrupts = self.interrupts.lock();
+            let interrupt = exact_interrupt_mut(&mut interrupts, final_release.id(), binding)
+                .expect("quarantined Interrupt finalization retains its exact typed record");
+            assert!(!matches!(
+                interrupt.state,
+                InterruptState::Creating | InterruptState::Finalizing
+            ));
+            interrupt.state = InterruptState::Finalizing;
+        }
 
         if platform.retire_source(binding) == InterruptRetirement::Deferred {
             let mut interrupts = self.interrupts.lock();

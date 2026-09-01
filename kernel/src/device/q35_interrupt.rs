@@ -519,6 +519,42 @@ impl Q35InterruptPlatform {
         Q35InterruptCounters::increment(&self.counters.pending_deliveries);
     }
 
+    fn begin_retirement_exact(&self, binding: InterruptBinding) -> Result<(), Q35ControllerError> {
+        validate_binding(self.domain, binding)?;
+        let began_retirement = {
+            let mut source = self.source.lock();
+            match source.lifecycle.state() {
+                IoApicRouteState::LiveUnmasked { generation }
+                    if generation == binding.generation() =>
+                {
+                    source
+                        .lifecycle
+                        .begin_retire(generation)
+                        .map_err(|_| Q35ControllerError::RouteDrift)?;
+                    true
+                }
+                IoApicRouteState::Retiring { generation }
+                | IoApicRouteState::RetiringMasked { generation }
+                    if generation == binding.generation() =>
+                {
+                    false
+                }
+                _ => return Err(Q35ControllerError::RouteDrift),
+            }
+        };
+        #[cfg(all(deepwyrm_dw1e_evidence, target_os = "none"))]
+        if began_retirement {
+            crate::test_support::DW1E_EVIDENCE
+                .observe_retire_begin(binding)
+                .unwrap_or_else(|error| {
+                    panic!("selector-31 retirement-begin observation failed: {error:?}")
+                });
+        }
+        #[cfg(not(all(deepwyrm_dw1e_evidence, target_os = "none")))]
+        let _ = began_retirement;
+        Ok(())
+    }
+
     fn counter_snapshot_locked(&self) -> Q35InterruptCounterSnapshot {
         Q35InterruptCounterSnapshot {
             physical_entries: self.counters.physical_entries.load(Ordering::Relaxed),
@@ -747,38 +783,7 @@ impl Q35InterruptPlatform {
         &self,
         binding: InterruptBinding,
     ) -> Result<bool, Q35ControllerError> {
-        validate_binding(self.domain, binding)?;
-        let began_retirement = {
-            let mut source = self.source.lock();
-            match source.lifecycle.state() {
-                IoApicRouteState::LiveUnmasked { generation }
-                    if generation == binding.generation() =>
-                {
-                    source
-                        .lifecycle
-                        .begin_retire(generation)
-                        .map_err(|_| Q35ControllerError::RouteDrift)?;
-                    true
-                }
-                IoApicRouteState::Retiring { generation }
-                | IoApicRouteState::RetiringMasked { generation }
-                    if generation == binding.generation() =>
-                {
-                    false
-                }
-                _ => return Err(Q35ControllerError::RouteDrift),
-            }
-        };
-        #[cfg(all(deepwyrm_dw1e_evidence, target_os = "none"))]
-        if began_retirement {
-            crate::test_support::DW1E_EVIDENCE
-                .observe_retire_begin(binding)
-                .unwrap_or_else(|error| {
-                    panic!("selector-31 retirement-begin observation failed: {error:?}")
-                });
-        }
-        #[cfg(not(all(deepwyrm_dw1e_evidence, target_os = "none")))]
-        let _ = began_retirement;
+        self.begin_retirement_exact(binding)?;
 
         if matches!(
             self.source.lock().lifecycle.state(),
@@ -1138,6 +1143,11 @@ impl InterruptPlatform for Q35InterruptPlatform {
         Q35InterruptCounters::increment(&self.counters.acknowledgements);
     }
 
+    fn begin_retirement(&self, binding: InterruptBinding) {
+        self.begin_retirement_exact(binding)
+            .expect("owned q35 binding begins exact retirement");
+    }
+
     fn release_source(&self, binding: InterruptBinding) {
         if !self
             .try_finish_retirement(binding)
@@ -1327,6 +1337,7 @@ mod tests {
     static FAKE_TERMINAL_MIGRATION: FakeController = FakeController::new();
     static FAKE_POST_EOI_RETRY: FakeController = FakeController::new();
     static FAKE_REMOTE_RETRY: FakeController = FakeController::new();
+    static FAKE_RETIREMENT_BOUNDARY: FakeController = FakeController::new();
 
     struct PublishingRaceController {
         controller: FakeController,
@@ -1597,6 +1608,46 @@ mod tests {
         let replacement = platform.reserve_source(Q35_COM2_SOURCE).unwrap();
         assert!(replacement.binding.generation() > binding.generation());
         platform.cancel_source(replacement).unwrap();
+    }
+
+    #[test]
+    fn logical_retirement_stops_live_snapshots_before_physical_masking() {
+        let platform = Q35InterruptPlatform::new(&FAKE_RETIREMENT_BOUNDARY).unwrap();
+        let reservation = platform.reserve_source(Q35_COM2_SOURCE).unwrap();
+        let binding = reservation.binding;
+        platform.commit_source(reservation);
+        assert_eq!(
+            FAKE_RETIREMENT_BOUNDARY.route_bits.load(Ordering::Acquire)
+                & u64::from(IOAPIC_REDIR_MASK),
+            0
+        );
+
+        platform.begin_retirement(binding);
+        assert!(matches!(
+            platform.source.lock().lifecycle.state(),
+            IoApicRouteState::Retiring { generation }
+                if generation == binding.generation()
+        ));
+        assert_eq!(
+            FAKE_RETIREMENT_BOUNDARY.route_bits.load(Ordering::Acquire)
+                & u64::from(IOAPIC_REDIR_MASK),
+            0
+        );
+        let Q35DeliverySnapshot::Retiring { generation } = platform.snapshot_delivery() else {
+            panic!("logically retiring q35 source produced a live delivery snapshot");
+        };
+        assert_eq!(generation, binding.generation());
+        platform.complete_handler(generation);
+
+        assert_eq!(
+            platform.retire_source(binding),
+            InterruptRetirement::Complete
+        );
+        assert_ne!(
+            FAKE_RETIREMENT_BOUNDARY.route_bits.load(Ordering::Acquire)
+                & u64::from(IOAPIC_REDIR_MASK),
+            0
+        );
     }
 
     #[test]
