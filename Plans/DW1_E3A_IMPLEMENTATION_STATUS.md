@@ -1,8 +1,8 @@
 # Deepwyrm DW1-E3A Implementation Status
 
 **Status:** Selector-31 kernel foundation and first raw COM2 challenge path
-implemented; live cross-repository extraction remains coordinator acceptance
-work and selector PASS remains deliberately absent.
+implemented and live-extracted on the exact UP/SMP pair; selector PASS remains
+deliberately absent.
 
 **Date:** 2026-08-31
 
@@ -88,17 +88,35 @@ Lane-local pinned outputs established:
 | host formatting check | **pass** |
 | default freestanding target check | **pass** |
 | selector-31 freestanding target check with exact nonce | **pass** |
+| exact selector-31 default/UP VM extraction | **PARTIAL_PASS**, nine records plus exact 24-byte COM2 response |
+| exact selector-31 four-vCPU/SMP VM extraction | **PARTIAL_PASS**, nine records plus exact 24-byte COM2 response |
 
 The freestanding checks retain pre-existing dead-code warnings in the staged
 q35 ACPI surface; the new selector-private module adds no target warning.
 
-E3A does not prove live COM2 delivery, one-/four-vCPU progress, restart,
-retirement quarantine evidence, U2 replacement, stale-U1 rejection, final
-accounting, the complete atomic 26-record transaction, or selector 31 PASS.
-Those remain E3B and coordinator-owned live acceptance work. Wyrmroot still
-must provide the exact caller sequencing, binary-safe deterministic payloads,
-COM2 response reporter, readiness wait, and partial-host extraction against an
-exact Deepwyrm revision.
+The accepted E3A extraction used Deepwyrm
+`6b00f82ca075571581532bb3c15f5b2ff57d3ec3` with Wyrmroot
+`6587baa0c999e4db089338f8707099e11298fe34` and request SHA-256
+`bcf434bd24608e748ad8ae5b8c4b1be5a02bc1bf745d66e2ac54d703f333bbf3`.
+Both profiles independently joined the same COM2 raw transcript SHA-256
+`f4ae130048d01363a990d335564042b2b7771cdbf345bd321615732d68e64977`
+and response SHA-256
+`3e6d96cb77a7aadea4a092f52d2d9e277814f08e07f4493c127f047e05ad0c9e`.
+The default evidence SHA-256 is
+`b4ee0b4750e46ec424aa8b6ca4a86fe7e5e2a8978eb5fb79d2ff84dd794678f8`;
+the SMP evidence SHA-256 is
+`b21ab0800a4ebfabdf9f36041989036cad5529b590a73a6bd346bc1e8bb54750`.
+The runner restored the persistent `OS-Project` domain to its canonical
+shutoff XML baseline SHA-256
+`a823095e2182f848be0c15fe1a88728fce9f126fbc55e7d9aab30d84a6c5d3c3`
+after each profile. Preserved evidence lives under root project path
+`.tmp/dw1e3a-6b00f82-6587baa-selector31/`.
+
+E3A still does not prove restart, retirement quarantine evidence, U2
+replacement, stale-U1 rejection, final accounting, the complete atomic
+26-record transaction, or selector 31 PASS. Those remain E3B and
+coordinator-owned full live acceptance work. `PARTIAL_PASS` is deliberately a
+non-acceptance result.
 
 ## Required-source and provenance receipt
 
