@@ -99,6 +99,8 @@ Fresh lane-local pinned targets established:
 | --- | --- |
 | focused selector-31 E3A model/source/private-authority tests | **pass**, 9 passed |
 | focused selector-31 E3B-full model/source/private-authority tests | **pass**, 11 passed |
+| full selector-31 E3A host library tests | **pass**, 911 passed |
+| full selector-31 E3B-full host library tests | **pass**, 913 passed |
 | focused q35 platform tests | **pass**, 4 passed, including pre-freeze-handler interleaving |
 | focused Interrupt authority tests | **pass**, 14 passed, including two-carrier retry |
 | full default host library tests | **pass**, 792 passed |

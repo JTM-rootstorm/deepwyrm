@@ -2394,7 +2394,14 @@ mod tests {
             source.matches("complete_primordial_launch(self);").count(),
             2
         );
-        assert_eq!(source.matches(".final_normal_completion(").count(), 2);
+        assert_eq!(
+            source
+                .matches(
+                    "crate::test_support::DW1C_EVIDENCE\n                .final_normal_completion("
+                )
+                .count(),
+            2
+        );
         assert_eq!(
             source
                 .matches("crate::test_support::complete_dw1c_evidence(permit)")

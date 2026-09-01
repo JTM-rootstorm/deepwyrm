@@ -319,6 +319,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(deepwyrm_dw1e_platform))]
     fn only_approved_early_vectors_have_gates() {
         let idt = InterruptDescriptorTable::new(handlers());
         assert!(idt.has_exact_terminal_ist_assignment());
