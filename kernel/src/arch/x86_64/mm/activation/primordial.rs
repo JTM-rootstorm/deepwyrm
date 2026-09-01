@@ -378,9 +378,12 @@ const EXECUTION_THREADS: usize = USERSPACE_CHAIN_PROCESSES;
 const EVENTS: usize = 1;
 #[cfg(deepwyrm_i2_stress)]
 const EVENTS: usize = 2;
-#[cfg(not(deepwyrm_i2_stress))]
+#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_dw1e_evidence)))]
 const TIMERS: usize = 1;
-#[cfg(deepwyrm_i2_stress)]
+// Selector 31 overlaps system-init's resident control-tick Timer with one
+// production UART driver's bounded TEMT-pacing Timer. Keep that exact
+// product peak separate from the ordinary single-Timer geometry.
+#[cfg(any(deepwyrm_i2_stress, deepwyrm_dw1e_evidence))]
 const TIMERS: usize = 2;
 // A bounded mapping can cross one boundary at each non-root level. Keep two
 // candidates for PDPT, PD, and PT creation so the live publisher can construct
@@ -529,6 +532,8 @@ const _: [(); 28] = [(); MEMORY_LEASES];
 const _: [(); 160] = [(); REGISTRY_OBJECTS];
 #[cfg(deepwyrm_dw1e_evidence)]
 const _: [(); 16] = [(); WAITERS];
+#[cfg(deepwyrm_dw1e_evidence)]
+const _: [(); 2] = [(); TIMERS];
 #[cfg(deepwyrm_dw1e_evidence)]
 const _: [(); 8] = [(); TASK_GROUPS];
 #[cfg(deepwyrm_dw1e_evidence)]

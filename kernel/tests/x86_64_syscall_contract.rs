@@ -978,6 +978,19 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
 }
 
 #[test]
+fn dw1e_live_selector_provisions_overlapping_control_and_temt_timers() {
+    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+
+    assert!(runtime.contains(
+        "#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_dw1e_evidence)))]\nconst TIMERS: usize = 1;"
+    ));
+    assert!(runtime.contains(
+        "#[cfg(any(deepwyrm_i2_stress, deepwyrm_dw1e_evidence))]\nconst TIMERS: usize = 2;"
+    ));
+    assert!(runtime.contains("#[cfg(deepwyrm_dw1e_evidence)]\nconst _: [(); 2] = [(); TIMERS];"));
+}
+
+#[test]
 fn live_return_boundary_publishes_final_release_effects_before_userspace_resume() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
     let dispatch = runtime
