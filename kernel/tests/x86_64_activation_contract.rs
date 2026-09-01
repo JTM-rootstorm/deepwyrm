@@ -114,6 +114,8 @@ fn c2_linker_bounds_and_linearity_markers_are_unique() {
         .expect("read live C2 activation source");
     let linker = fs::read_to_string(manifest_dir.join("arch/x86_64/linker.ld"))
         .expect("read live linker script");
+    let build =
+        fs::read_to_string(manifest_dir.join("build.rs")).expect("read live kernel build script");
     let entry = fs::read_to_string(manifest_dir.join("src/arch/x86_64/entry.S"))
         .expect("read live entry assembly");
 
@@ -131,6 +133,13 @@ fn c2_linker_bounds_and_linearity_markers_are_unique() {
             "linker segment bound must be unique: {symbol}"
         );
     }
+    assert_eq!(
+        build
+            .match_indices("\"--no-eh-frame-hdr\".to_owned()")
+            .count(),
+        1,
+        "kernel link must suppress synthetic unwind headers outside the canonical segment bounds"
+    );
     for symbol in ["__dw_boot_stack_bottom:", "__dw_boot_stack_top:"] {
         assert_eq!(
             entry.match_indices(symbol).count(),

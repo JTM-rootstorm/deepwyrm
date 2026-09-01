@@ -1281,6 +1281,7 @@ pub(crate) fn linker_arguments(
         "-no-pie".to_owned(),
         "--no-dynamic-linker".to_owned(),
         "--build-id=none".to_owned(),
+        "--no-eh-frame-hdr".to_owned(),
         "--gc-sections".to_owned(),
         "-z".to_owned(),
         "noexecstack".to_owned(),

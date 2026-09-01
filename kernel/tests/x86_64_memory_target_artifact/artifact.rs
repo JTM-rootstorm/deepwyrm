@@ -334,7 +334,7 @@ pub(super) fn validate_static_kernel_elf(
 ) {
     let mut readelf = verified_helper_command_as(llvm_readelf, "llvm-readelf");
     let headers = run_output(
-        readelf.args(["-h", "-l", "-d"]).arg(artifact),
+        readelf.args(["-h", "-l", "-S", "-d"]).arg(artifact),
         &format!("{label} ELF headers"),
     );
     let headers = String::from_utf8(headers.stdout).expect("llvm-readelf output is UTF-8");
@@ -344,6 +344,10 @@ pub(super) fn validate_static_kernel_elf(
             "{label} kernel gained dynamic runtime evidence {forbidden}"
         );
     }
+    assert!(
+        !headers.contains(".eh_frame_hdr"),
+        "{label} kernel gained a synthetic unwind header outside the canonical segment bounds"
+    );
 }
 
 pub(super) fn validate_static_native_user_elf(
