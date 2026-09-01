@@ -1123,6 +1123,18 @@ impl InterruptPlatform for Q35InterruptPlatform {
             IoApicRouteState::LiveUnmasked { generation }
                 if generation == ack.binding.generation()
         ));
+    }
+
+    fn record_userspace_ack(&self, binding: InterruptBinding) {
+        validate_binding(self.domain, binding)
+            .expect("completed q35 acknowledgement retains exact domain/source");
+        let source = self.source.lock();
+        assert!(source.terminal_freeze.is_none());
+        assert!(matches!(
+            source.lifecycle.state(),
+            IoApicRouteState::LiveUnmasked { generation }
+                if generation == binding.generation()
+        ));
         Q35InterruptCounters::increment(&self.counters.acknowledgements);
     }
 
@@ -1603,6 +1615,9 @@ mod tests {
         };
         let ack = platform.acknowledge_source(binding).unwrap();
         platform.complete_ack(ack, InterruptAckOutcome::PendingAfterRace);
+        assert_eq!(platform.counter_snapshot_locked().acknowledgements, 0);
+        platform.record_userspace_ack(binding);
+        assert_eq!(platform.counter_snapshot_locked().acknowledgements, 1);
         assert_eq!(
             FAKE.route_bits.load(Ordering::Acquire) & u64::from(IOAPIC_REDIR_MASK),
             0

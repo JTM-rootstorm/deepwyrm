@@ -155,6 +155,10 @@ pub(crate) trait InterruptPlatform {
     /// has committed its exact raced/non-raced outcome.
     fn complete_ack(&self, ack: InterruptPlatformAck, outcome: InterruptAckOutcome);
 
+    /// Records one successfully completed userspace acknowledgement
+    /// transaction, including a transaction satisfied by a coalesced fact.
+    fn record_userspace_ack(&self, _binding: InterruptBinding) {}
+
     /// Releases an exact masked source at the final no-fail ownership point.
     fn release_source(&self, binding: InterruptBinding);
 
@@ -1137,32 +1141,39 @@ impl InterruptAckTransaction {
         interrupts: &InterruptAuthority<INTERRUPTS>,
         platform: &dyn InterruptPlatform,
     ) -> Result<Option<FinalRelease>, DwStatus> {
-        if let InterruptAckOperation::Rearm { object, binding } = self.operation {
-            let ack = match platform.acknowledge_source(binding) {
-                Ok(ack) => ack,
-                Err(error) => {
-                    interrupts.restore_pending_after_platform_failure(object, binding);
-                    let release = registry
-                        .release_internal(self.pin)
-                        .unwrap_or_else(|failure| {
-                            panic!(
-                                "failed Interrupt ack lost its operation pin: {:?}",
-                                failure.error()
-                            )
-                        });
-                    assert!(release.is_none(), "failed ack unexpectedly became final");
-                    return Err(platform_status(error));
-                }
-            };
-            let outcome = interrupts.finish_ack(object, binding);
-            platform.complete_ack(ack, outcome);
-        }
-        registry.release_internal(self.pin).map_err(|failure| {
+        let binding = match self.operation {
+            InterruptAckOperation::Coalesced { binding } => binding,
+            InterruptAckOperation::Rearm { object, binding } => {
+                let ack = match platform.acknowledge_source(binding) {
+                    Ok(ack) => ack,
+                    Err(error) => {
+                        interrupts.restore_pending_after_platform_failure(object, binding);
+                        let release =
+                            registry
+                                .release_internal(self.pin)
+                                .unwrap_or_else(|failure| {
+                                    panic!(
+                                        "failed Interrupt ack lost its operation pin: {:?}",
+                                        failure.error()
+                                    )
+                                });
+                        assert!(release.is_none(), "failed ack unexpectedly became final");
+                        return Err(platform_status(error));
+                    }
+                };
+                let outcome = interrupts.finish_ack(object, binding);
+                platform.complete_ack(ack, outcome);
+                binding
+            }
+        };
+        let release = registry.release_internal(self.pin).map_err(|failure| {
             panic!(
                 "completed Interrupt ack lost its operation pin: {:?}",
                 failure.error()
             )
-        })
+        })?;
+        platform.record_userspace_ack(binding);
+        Ok(release)
     }
 
     #[cfg(any(test, deepwyrm_dw1d_evidence, deepwyrm_dw1e_evidence))]

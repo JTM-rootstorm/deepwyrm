@@ -47,6 +47,7 @@ struct CommitBoundaryPlatform<'a> {
 struct FailingAckPlatform {
     inner: Platform,
     fail_ack: AtomicBool,
+    userspace_acknowledgements: AtomicU32,
 }
 
 impl FailingAckPlatform {
@@ -54,6 +55,7 @@ impl FailingAckPlatform {
         Self {
             inner: Platform::new(),
             fail_ack: AtomicBool::new(true),
+            userspace_acknowledgements: AtomicU32::new(0),
         }
     }
 }
@@ -97,6 +99,11 @@ impl InterruptPlatform for FailingAckPlatform {
 
     fn complete_ack(&self, ack: InterruptPlatformAck, outcome: InterruptAckOutcome) {
         self.inner.complete_ack(ack, outcome);
+    }
+
+    fn record_userspace_ack(&self, _binding: InterruptBinding) {
+        self.userspace_acknowledgements
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn release_source(&self, binding: InterruptBinding) {
@@ -796,7 +803,7 @@ fn delivery_racing_prepared_ack_survives_and_source_remains_masked() {
 }
 
 #[test]
-fn failed_platform_ack_preserves_a_delivery_that_raced_the_prepared_ack() {
+fn failed_platform_ack_preserves_race_and_counts_coalesced_then_rearm_successes() {
     let mut fixture = Fixture::broad();
     let platform = FailingAckPlatform::new();
     let (key, handle) = interrupt_create(
@@ -825,6 +832,10 @@ fn failed_platform_ack_preserves_a_delivery_that_raced_the_prepared_ack() {
         transaction.complete(&mut fixture.registry, &fixture.interrupts, &platform),
         Err(DW_STATUS_BAD_STATE)
     );
+    assert_eq!(
+        platform.userspace_acknowledgements.load(Ordering::Relaxed),
+        0
+    );
 
     platform.fail_ack.store(false, Ordering::Release);
     assert_eq!(
@@ -837,6 +848,11 @@ fn failed_platform_ack_preserves_a_delivery_that_raced_the_prepared_ack() {
         ),
         Ok(None)
     );
+    assert_eq!(
+        platform.userspace_acknowledgements.load(Ordering::Relaxed),
+        1
+    );
+    assert!(platform.inner.is_masked(binding));
     let resolved = fixture
         .table
         .lookup(
@@ -870,6 +886,11 @@ fn failed_platform_ack_preserves_a_delivery_that_raced_the_prepared_ack() {
         ),
         Ok(None)
     );
+    assert_eq!(
+        platform.userspace_acknowledgements.load(Ordering::Relaxed),
+        2
+    );
+    assert!(!platform.inner.is_masked(binding));
 
     let final_release = fixture
         .table
