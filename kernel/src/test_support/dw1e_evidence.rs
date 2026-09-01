@@ -297,6 +297,7 @@ struct State {
     acknowledgement_delta: u8,
     ack_complete: bool,
     response: Option<(u64, u64)>,
+    pending_u1_retirement: [Option<Dw1eEvidenceRecord>; 5],
     failure: Option<Dw1eEvidenceError>,
 }
 
@@ -329,6 +330,7 @@ impl State {
             acknowledgement_delta: 0,
             ack_complete: false,
             response: None,
+            pending_u1_retirement: [None; 5],
             failure: None,
         }
     }
@@ -857,7 +859,8 @@ impl Dw1eEvidenceCollector {
                     Some(challenge),
                     value,
                     0,
-                ))
+                ))?;
+                materialize_pending_u1_retirement(&mut state)
             }
             _ => Err(state.latch(Dw1eEvidenceError::Malformed)),
         }
@@ -960,6 +963,51 @@ impl Dw1eEvidenceCollector {
         let mut state = self.state.lock();
         if let Some(failure) = state.failure {
             return Err(failure);
+        }
+        if state.first_committed.is_none() {
+            if state.record_count != 3 {
+                return Err(state.latch(Dw1eEvidenceError::OutOfOrder));
+            }
+            let Some(committed) = state.committed else {
+                return Err(state.latch(Dw1eEvidenceError::Early));
+            };
+            let Some(challenge) = state.challenge else {
+                return Err(state.latch(Dw1eEvidenceError::Early));
+            };
+            if binding != committed.binding
+                || state.response.is_none()
+                || !state.wait_woke
+                || state.drain.is_none()
+                || !state.ack_complete
+            {
+                return Err(state.latch(Dw1eEvidenceError::WrongRelation));
+            }
+            let Some(index) = expected_count.checked_sub(10).filter(|index| *index < 5) else {
+                return Err(state.latch(Dw1eEvidenceError::OutOfOrder));
+            };
+            if state.pending_u1_retirement[..index]
+                .iter()
+                .any(Option::is_none)
+            {
+                return Err(state.latch(Dw1eEvidenceError::OutOfOrder));
+            }
+            let record = tuple_record(
+                event,
+                ACTOR_KERNEL,
+                committed,
+                state.attempt_generation,
+                Some(challenge),
+                value,
+                auxiliary,
+            );
+            return match state.pending_u1_retirement[index] {
+                None => {
+                    state.pending_u1_retirement[index] = Some(record);
+                    Ok(())
+                }
+                Some(existing) if existing == record => Ok(()),
+                Some(_) => Err(state.latch(Dw1eEvidenceError::WrongRelation)),
+            };
         }
         let first = state
             .first_committed
@@ -1617,6 +1665,20 @@ fn materialize_leg(state: &mut State) -> Result<(), Dw1eEvidenceError> {
         state.first_attempt_generation = state.attempt_generation;
         state.first_challenge = Some(challenge);
         state.first_response = Some(response);
+    }
+    Ok(())
+}
+
+fn materialize_pending_u1_retirement(state: &mut State) -> Result<(), Dw1eEvidenceError> {
+    for index in 0..state.pending_u1_retirement.len() {
+        let Some(record) = state.pending_u1_retirement[index] else {
+            break;
+        };
+        if state.record_count != 10 + index {
+            return Err(state.latch(Dw1eEvidenceError::OutOfOrder));
+        }
+        state.push(record)?;
+        state.pending_u1_retirement[index] = None;
     }
     Ok(())
 }
@@ -2288,14 +2350,19 @@ mod tests {
             .observe_delivery(binding1, InterruptDeliveryDisposition::FirstPending)
             .unwrap();
         collector.observe_ack(driver1, binding1, false).unwrap();
-        collector
-            .submit(controller, EVENT_U1_PEER_CLOSED, 19, 0)
-            .unwrap();
+        // Kernel finalization may complete before the controller observes the
+        // same termination as a stream peer-close. Preserve the actual facts
+        // while retaining peer-close first in the canonical transcript.
         collector.observe_retire_begin(binding1).unwrap();
         collector.observe_route_masked(binding1, 3).unwrap();
         collector.observe_handler_quiescent(binding1).unwrap();
         collector.observe_lapic_clear(binding1).unwrap();
         collector.observe_released(binding1).unwrap();
+        assert_eq!(collector.state.lock().record_count, 3);
+        collector
+            .submit(controller, EVENT_U1_PEER_CLOSED, 19, 0)
+            .unwrap();
+        assert_eq!(collector.state.lock().record_count, 15);
 
         let binding2 = InterruptBinding::for_test(9, 3, 12);
         collector.observe_reserved(binding2).unwrap();
