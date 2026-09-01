@@ -974,12 +974,7 @@ impl Dw1eEvidenceCollector {
             let Some(challenge) = state.challenge else {
                 return Err(state.latch(Dw1eEvidenceError::Early));
             };
-            if binding != committed.binding
-                || state.response.is_none()
-                || !state.wait_woke
-                || state.drain.is_none()
-                || !state.ack_complete
-            {
+            if binding != committed.binding {
                 return Err(state.latch(Dw1eEvidenceError::WrongRelation));
             }
             let Some(index) = expected_count.checked_sub(10).filter(|index| *index < 5) else {
@@ -2342,23 +2337,23 @@ mod tests {
             }
             collector.observe_ack(driver1, binding1, false).unwrap();
         }
-        collector.submit(probe1, EVENT_C1_RESPONSE, 7, 41).unwrap();
         collector
             .observe_physical(InterruptDelivery::for_test(binding1))
             .unwrap();
         collector
             .observe_delivery(binding1, InterruptDeliveryDisposition::FirstPending)
             .unwrap();
-        collector.observe_ack(driver1, binding1, false).unwrap();
         // Kernel finalization may complete before the controller observes the
-        // same termination as a stream peer-close. Preserve the actual facts
-        // while retaining peer-close first in the canonical transcript.
+        // response and peer-close, and before the last IRQ acknowledgement
+        // settles. Preserve the facts while retaining the canonical transcript.
         collector.observe_retire_begin(binding1).unwrap();
         collector.observe_route_masked(binding1, 3).unwrap();
         collector.observe_handler_quiescent(binding1).unwrap();
         collector.observe_lapic_clear(binding1).unwrap();
         collector.observe_released(binding1).unwrap();
         assert_eq!(collector.state.lock().record_count, 3);
+        collector.observe_ack(driver1, binding1, false).unwrap();
+        collector.submit(probe1, EVENT_C1_RESPONSE, 7, 41).unwrap();
         collector
             .submit(controller, EVENT_U1_PEER_CLOSED, 19, 0)
             .unwrap();
@@ -2600,15 +2595,18 @@ mod tests {
             .unwrap();
         for observation in [
             "observe_retire_begin(binding)",
-            "observe_route_masked(binding, idle_reads)",
+            "observe_route_masked(binding, proof.reads)",
             "observe_handler_quiescent(binding)",
             "observe_lapic_clear(binding)",
             "observe_released(binding)",
         ] {
             assert_eq!(retirement.matches(observation).count(), 1);
         }
+        let first_idle = retirement
+            .find("if let Some(proof) = first_idle_proof")
+            .unwrap();
         let masked = retirement
-            .find("observe_route_masked(binding, idle_reads)")
+            .find("observe_route_masked(binding, proof.reads)")
             .unwrap();
         let quiescent = retirement
             .find("observe_handler_quiescent(binding)")
@@ -2617,6 +2615,7 @@ mod tests {
         let lapic_clear = retirement.find("observe_lapic_clear(binding)").unwrap();
         let release = retirement.find(".release(binding.generation())").unwrap();
         let released = retirement.find("observe_released(binding)").unwrap();
+        assert!(first_idle < masked);
         assert!(masked < quiescent);
         assert!(quiescent < bsp_clear);
         assert!(bsp_clear < lapic_clear);

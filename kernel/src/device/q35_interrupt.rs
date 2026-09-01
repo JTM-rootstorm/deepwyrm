@@ -211,6 +211,12 @@ pub(crate) enum Q35TerminalFreeze {
     Complete(Q35InterruptCounterSnapshot),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Q35RetirementIdleProof {
+    generation: u64,
+    reads: u64,
+}
+
 #[derive(Clone, Copy)]
 struct Q35SourceState {
     lifecycle: IoApicRouteLifecycle,
@@ -219,6 +225,7 @@ struct Q35SourceState {
     next_request_generation: u64,
     outstanding_request: Option<Q35BspCheckRequest>,
     terminal_frozen_generation: Option<u64>,
+    retirement_idle_proof: Option<Q35RetirementIdleProof>,
 }
 
 impl Q35SourceState {
@@ -230,6 +237,7 @@ impl Q35SourceState {
             next_request_generation: 1,
             outstanding_request: None,
             terminal_frozen_generation: None,
+            retirement_idle_proof: None,
         }
     }
 }
@@ -584,13 +592,9 @@ impl Q35InterruptPlatform {
         }
 
         let mut idle = false;
-        #[cfg(all(deepwyrm_dw1e_evidence, target_os = "none"))]
         let mut idle_reads = 0_u64;
-        for _attempt in 1..=DELIVERY_STATUS_POLL_LIMIT {
-            #[cfg(all(deepwyrm_dw1e_evidence, target_os = "none"))]
-            {
-                idle_reads = _attempt as u64;
-            }
+        for attempt in 1..=DELIVERY_STATUS_POLL_LIMIT {
+            idle_reads = attempt as u64;
             if self.controller.delivery_status_idle()? {
                 idle = true;
                 break;
@@ -599,10 +603,38 @@ impl Q35InterruptPlatform {
         if !idle {
             return Ok(false);
         }
+        let first_idle_proof = {
+            let mut source = self.source.lock();
+            if !matches!(
+                source.lifecycle.state(),
+                IoApicRouteState::RetiringMasked { generation }
+                    if generation == binding.generation()
+            ) {
+                return Err(Q35ControllerError::RouteDrift);
+            }
+            match source.retirement_idle_proof {
+                None => {
+                    let proof = Q35RetirementIdleProof {
+                        generation: binding.generation(),
+                        reads: idle_reads,
+                    };
+                    source.retirement_idle_proof = Some(proof);
+                    Some(proof)
+                }
+                Some(proof) if proof.generation == binding.generation() => None,
+                Some(_) => return Err(Q35ControllerError::RouteDrift),
+            }
+        };
         #[cfg(all(deepwyrm_dw1e_evidence, target_os = "none"))]
-        crate::test_support::DW1E_EVIDENCE
-            .observe_route_masked(binding, idle_reads)
-            .unwrap_or_else(|error| panic!("selector-31 route-mask observation failed: {error:?}"));
+        if let Some(proof) = first_idle_proof {
+            crate::test_support::DW1E_EVIDENCE
+                .observe_route_masked(binding, proof.reads)
+                .unwrap_or_else(|error| {
+                    panic!("selector-31 route-mask observation failed: {error:?}")
+                });
+        }
+        #[cfg(not(all(deepwyrm_dw1e_evidence, target_os = "none")))]
+        let _ = first_idle_proof;
         if self.source.lock().in_handler != 0 {
             return Ok(false);
         }
@@ -703,7 +735,7 @@ impl InterruptPlatform for Q35InterruptPlatform {
         }
         let generation = {
             let mut state = self.source.lock();
-            state.lifecycle.reserve().map_err(|error| match error {
+            let generation = state.lifecycle.reserve().map_err(|error| match error {
                 crate::arch::x86_64::acpi::IoApicRouteTransitionError::Busy => {
                     InterruptPlatformError::SourceInUse
                 }
@@ -711,7 +743,9 @@ impl InterruptPlatform for Q35InterruptPlatform {
                     InterruptPlatformError::Capacity
                 }
                 _ => InterruptPlatformError::BadState,
-            })?
+            })?;
+            state.retirement_idle_proof = None;
+            generation
         };
         if self.controller.program_and_verify(true).is_err() {
             self.source
@@ -1054,20 +1088,38 @@ mod tests {
             0
         );
 
-        // Logical retirement and physical mask precede handler/BSP proof.
+        // Logical retirement and the first physical idle proof precede
+        // handler/BSP proof. Later retries must retain that first proof even
+        // if the volatile Delivery Status needs a different number of reads.
+        FAKE.pending_reads.store(2, Ordering::Release);
         assert_eq!(
             platform.retire_source(binding),
             InterruptRetirement::Deferred
+        );
+        assert_eq!(
+            platform.source.lock().retirement_idle_proof,
+            Some(Q35RetirementIdleProof {
+                generation,
+                reads: 3,
+            })
         );
         assert_ne!(
             FAKE.route_bits.load(Ordering::Acquire) & u64::from(IOAPIC_REDIR_MASK),
             0
         );
         platform.complete_handler(generation);
+        FAKE.pending_reads.store(0, Ordering::Release);
         FAKE.current_bsp.store(false, Ordering::Release);
         assert_eq!(
             platform.retire_source(binding),
             InterruptRetirement::Deferred
+        );
+        assert_eq!(
+            platform.source.lock().retirement_idle_proof,
+            Some(Q35RetirementIdleProof {
+                generation,
+                reads: 3,
+            })
         );
         assert_eq!(FAKE.requests.load(Ordering::Acquire), 1);
         FAKE.current_bsp.store(true, Ordering::Release);
