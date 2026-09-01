@@ -803,6 +803,10 @@ impl Dw1eEvidenceCollector {
                 Ok(())
             }
             EVENT_C1_RESPONSE | EVENT_C2_RESPONSE => {
+                #[cfg(not(deepwyrm_dw1e_e3b_full))]
+                let response_requires_current_ack = !state.ack_complete;
+                #[cfg(deepwyrm_dw1e_e3b_full)]
+                let response_requires_current_ack = false;
                 let expected_event = if state.record_count == 3 {
                     EVENT_C1_RESPONSE
                 } else if state.record_count == 17 {
@@ -815,6 +819,7 @@ impl Dw1eEvidenceCollector {
                     || !state.wait_woke
                     || state.drain.is_none()
                     || state.acknowledgement_delta == 0
+                    || response_requires_current_ack
                     || state.response.is_some()
                     || value == 0
                     || auxiliary == 0
@@ -823,14 +828,16 @@ impl Dw1eEvidenceCollector {
                 {
                     return Err(state.latch(Dw1eEvidenceError::WrongRelation));
                 }
-                // The probe queues its response to the driver before it can
-                // report this relation. A response-TX interrupt may therefore
-                // begin and clear `ack_complete` before the probe runs again.
-                // Once the prior challenge wake, drain, and acknowledgement
-                // establish causality, preserve the actor-owned response
-                // independently of the current epoch. The TEMT barrier and
-                // `materialize_leg` still require the final exact interrupt
-                // epoch to be acknowledged before acceptance.
+                // In E3B-full mode the probe queues its response to the driver
+                // before it can report this relation. A response-TX interrupt
+                // may therefore begin and clear `ack_complete` before the
+                // probe runs again. Once the prior challenge wake, drain, and
+                // acknowledgement establish causality, preserve the
+                // actor-owned response independently of the current epoch.
+                // E3A still materializes immediately below and therefore keeps
+                // its original current-ack admission requirement. The E3B TEMT
+                // barrier and `materialize_leg` still require the final exact
+                // interrupt epoch to be acknowledged before acceptance.
                 state.response = Some((value, auxiliary));
                 #[cfg(not(deepwyrm_dw1e_e3b_full))]
                 if event == EVENT_C1_RESPONSE {
@@ -2203,6 +2210,60 @@ mod tests {
         assert_eq!(
             collector.submit(controller, EVENT_U1_PEER_CLOSED, 19, 0),
             Err(Dw1eEvidenceError::Malformed)
+        );
+    }
+
+    #[test]
+    #[cfg(not(deepwyrm_dw1e_e3b_full))]
+    fn e3a_response_still_requires_the_current_interrupt_ack() {
+        let collector = Dw1eEvidenceCollector::new(0x1234);
+        let route = PlatformIrqRoute::test_q35(
+            crate::arch::x86_64::acpi::IoApicDescriptor::test_descriptor(2, 0xfec0_0000, 0),
+            3,
+            7,
+        );
+        collector.observe_route(route).unwrap();
+        let binding = InterruptBinding::for_test(9, 3, 11);
+        collector.observe_reserved(binding).unwrap();
+        let mut registry = ObjectRegistry::<8>::new();
+        let object = registry.create(DW_OBJECT_TYPE_INTERRUPT).unwrap().id();
+        let driver =
+            ProcessKey::from_object_id(registry.create(DW_OBJECT_TYPE_PROCESS).unwrap().id());
+        let probe =
+            ProcessKey::from_object_id(registry.create(DW_OBJECT_TYPE_PROCESS).unwrap().id());
+        let controller =
+            ProcessKey::from_object_id(registry.create(DW_OBJECT_TYPE_PROCESS).unwrap().id());
+        collector.observe_committed(object, binding, 13).unwrap();
+        collector
+            .bind_driver(driver, object, binding, 13, 17)
+            .unwrap();
+        collector.bind_probe(controller, probe).unwrap();
+        collector
+            .arm_challenge(driver, 19, 23, 5, 29, driver, object, 31, 37)
+            .unwrap();
+        collector
+            .observe_physical(InterruptDelivery::for_test(binding))
+            .unwrap();
+        collector
+            .observe_delivery(binding, InterruptDeliveryDisposition::FirstPending)
+            .unwrap();
+        collector
+            .observe_wait_completion(driver, 31, 37, DW_SIGNAL_SIGNALED)
+            .unwrap();
+        collector
+            .submit(driver, EVENT_C1_UART_DRAIN, 5, 29)
+            .unwrap();
+        collector.observe_ack(driver, binding, false).unwrap();
+
+        collector
+            .observe_physical(InterruptDelivery::for_test(binding))
+            .unwrap();
+        collector
+            .observe_delivery(binding, InterruptDeliveryDisposition::FirstPending)
+            .unwrap();
+        assert_eq!(
+            collector.submit(probe, EVENT_C1_RESPONSE, 7, 41),
+            Err(Dw1eEvidenceError::WrongRelation)
         );
     }
 
