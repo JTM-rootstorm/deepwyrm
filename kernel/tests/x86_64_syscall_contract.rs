@@ -1058,7 +1058,7 @@ fn live_timer_expiry_is_bound_and_serviced_only_from_carrier_safe_points() {
         runtime
             .matches("runtime.service_pending_timer_expiries_on_bootstrap();")
             .count(),
-        3
+        4
     );
     let shared_carrier = runtime
         .split_once(
@@ -1080,6 +1080,24 @@ fn live_timer_expiry_is_bound_and_serviced_only_from_carrier_safe_points() {
         .find("runtime.has_reschedule_request()")
         .expect("timer-return reschedule decision");
     assert!(expiry_service < reschedule);
+    let idle_scheduler = shared_carrier
+        .split_once("fn enter_idle_scheduler(&mut self) -> !")
+        .expect("shared native carrier idle scheduler")
+        .1
+        .split_once("unsafe fn prepare_suspend")
+        .expect("shared native carrier idle scheduler extent")
+        .0;
+    let idle_expiry_service = idle_scheduler
+        .find("runtime.service_pending_timer_expiries_on_bootstrap();")
+        .expect("kernel-root idle expiry service");
+    let idle_schedule = idle_scheduler
+        .find(".schedule_next_on(self.cpu)")
+        .expect("kernel-root idle scheduler decision");
+    assert!(idle_scheduler.contains("self.cpu == crate::cpu::CpuIndex::BOOTSTRAP"));
+    assert!(idle_expiry_service < idle_schedule);
+    assert!(idle_scheduler.contains(
+        ".current\n            };\n            crate::task::drain_runnable_work_notifications();"
+    ));
     assert!(
         runtime
             .matches("self.cpu == crate::cpu::CpuIndex::BOOTSTRAP")

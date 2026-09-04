@@ -8123,7 +8123,19 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             }
 
             let scheduled = {
-                let runtime = self.runtime.lock();
+                let mut runtime = self.runtime.lock();
+                runtime.switch_cpu(self.cpu);
+                // A Timer owned by a Thread running on an AP still expires on
+                // the BSP's unified timer service.  CPU0 may have no current
+                // Thread and remain in this kernel-root idle loop while that
+                // AP continues creating timers, so the ordinary syscall and
+                // suspended-Thread safe points are not sufficient consumers.
+                // Drain before choosing the next runnable Thread; the
+                // existing post-lock notification drain publishes any remote
+                // wake without extending the shared authority critical path.
+                if self.cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                    runtime.service_pending_timer_expiries_on_bootstrap();
+                }
                 runtime
                     .shared
                     .execution

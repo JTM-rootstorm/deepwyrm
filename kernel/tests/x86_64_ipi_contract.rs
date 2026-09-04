@@ -686,7 +686,14 @@ fn h4_idle_publication_brackets_rescan_and_uses_only_coalesced_e1_wake() {
         .split_once("unsafe fn prepare_suspend")
         .expect("AP scheduling loop extent")
         .0;
-    assert!(!ap_schedule.contains("service_pending_timer_expiries_on_bootstrap"));
+    let timer_service = ap_schedule
+        .find("runtime.service_pending_timer_expiries_on_bootstrap();")
+        .expect("CPU0 kernel-root idle timer-expiry service");
+    let schedule = ap_schedule
+        .find(".schedule_next_on(self.cpu)")
+        .expect("kernel-root idle scheduler decision");
+    assert!(ap_schedule.contains("self.cpu == crate::cpu::CpuIndex::BOOTSTRAP"));
+    assert!(timer_service < schedule);
     assert!(primordial.contains(
         ".current\n            };\n            crate::task::drain_runnable_work_notifications();"
     ));
