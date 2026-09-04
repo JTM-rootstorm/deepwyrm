@@ -1,7 +1,7 @@
 # Deepwyrm DW1-E3B Implementation Status
 
-**Status:** Selector-31 kernel collector and terminal path implemented; paired
-Wyrmroot integration and live UP/SMP acceptance remain coordinator work.
+**Status:** Implementation complete; paired Wyrmroot integration and live
+UP/SMP evidence are accepted in [`../docs/DW1_E_VALIDATION.md`](../docs/DW1_E_VALIDATION.md).
 
 **Date:** 2026-09-01
 
@@ -11,6 +11,12 @@ Wyrmroot integration and live UP/SMP acceptance remain coordinator work.
 `DW1_E0_Q35_EXTERNAL_INTERRUPT_CONTRACT.md`, sections 11-13;
 `ARCHITECTURE_INDEX.md`; `DW1_E3A_IMPLEMENTATION_STATUS.md`; and the reached
 E1/E2A/E2B/E2C statuses.
+
+**Closure update (2026-09-04):** The phase-local host/model gate recorded
+below was subsequently integrated, debugged and accepted on the exact
+Deepwyrm/Wyrmroot/Rust tuple in the validation record. Its original no-VM and
+pending-E4 statements are retained as historical evidence of this
+implementation checkpoint, not current milestone status.
 
 ## Reached kernel scope
 
@@ -159,7 +165,7 @@ Every action repeats the exact build nonce and preserves its frozen reserved
 zero words. Wyrmroot-private TEMT, reap, and connector observations are causal
 guards only; they must not become new kernel action or evidence tags.
 
-## Validation and nonclaims
+## Historical phase-local validation and nonclaims
 
 Fresh lane-local pinned targets established:
 
@@ -180,11 +186,12 @@ Fresh lane-local pinned targets established:
 | selector-31 E3B freestanding target check with exact nonce and `DEEPWYRM_DW1E_E3B_FULL=1` | **pass** |
 | ambient E3B-full variable without selector 31 | **expected rejection**, build fails closed |
 
-No VM, libvirt, QEMU, network, or remote operation was performed. These
-results do not prove live COM2 delivery, real Wyrmroot replacement, UP/SMP
-selector acceptance, host transcript extraction, selector-30/29/28
-regression, final ABI drift, or DW1-E closure. Those remain E3B integration
-and E4 acceptance work owned by the coordinator.
+At this phase-local checkpoint, no VM, libvirt, QEMU, network, or remote
+operation was performed. These results did not then prove live COM2 delivery,
+real Wyrmroot replacement, UP/SMP selector acceptance, host transcript
+extraction, selector-30/29/28 regression, final ABI drift, or DW1-E closure.
+Those gates are now superseded by the accepted E4 validation record linked at
+the top of this document.
 
 ## Required-source and provenance receipt
 
