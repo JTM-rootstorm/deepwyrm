@@ -214,6 +214,14 @@ fn i1_cpl3_rendezvous_gate_diverges_before_iret() {
 #[test]
 fn h2_h3_receive_seam_eois_before_capability_free_protocol_callbacks() {
     let ipi = source("src/arch/x86_64/ipi.rs");
+    let eoi_helper = ipi
+        .split_once("pub(crate) fn end_current_live_interrupt() -> bool")
+        .expect("shared live interrupt EOI helper")
+        .1
+        .split_once("fn dispatch(vector: LiveIpiVector)")
+        .expect("shared live interrupt EOI helper end")
+        .0;
+    assert!(eoi_helper.contains("transport.eoi"));
     let dispatch = ipi
         .split_once("fn dispatch(vector: LiveIpiVector)")
         .expect("fixed IPI Rust dispatch")
@@ -221,7 +229,9 @@ fn h2_h3_receive_seam_eois_before_capability_free_protocol_callbacks() {
         .split_once("dw_x86_64_rendezvous_ipi_dispatch")
         .expect("fixed IPI Rust dispatch end")
         .0;
-    let eoi = dispatch.find("transport.eoi").expect("EOI trampoline call");
+    let eoi = dispatch
+        .find("end_current_live_interrupt()")
+        .expect("shared EOI helper call");
     let handler = dispatch
         .find("RENDEZVOUS_HANDLER.get()")
         .expect("rendezvous callback");
