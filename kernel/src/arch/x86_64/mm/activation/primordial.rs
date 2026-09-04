@@ -11,6 +11,7 @@ use super::*;
     deepwyrm_wyr1_evidence,
     deepwyrm_wyr1b_evidence,
     deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
     deepwyrm_dw1e_evidence
 ))]
 use super::primordial_diagnostic::primordial_terminal_summary;
@@ -26,18 +27,24 @@ use crate::boot::primordial::construction::authority::{
 #[cfg(not(any(
     deepwyrm_dw1d_evidence,
     deepwyrm_dw1e_evidence,
-    deepwyrm_wyr1c_evidence
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence
 )))]
 use crate::boot::primordial::construction::complete_primordial_launch;
 #[cfg(any(
     deepwyrm_dw1d_evidence,
     deepwyrm_dw1e_evidence,
-    deepwyrm_wyr1c_evidence
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence
 ))]
 use crate::boot::primordial::construction::complete_resource_primordial_launch;
 #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
 use crate::boot::primordial::construction::validate_primordial_retirement_facts;
-#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
+#[cfg(any(
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
+    deepwyrm_dw1e_evidence
+))]
 use crate::boot::primordial::construction::validate_resource_primordial_retirement_facts as validate_primordial_retirement_facts;
 use crate::boot::primordial::construction::{
     PrimordialCompletionBackend, PrimordialExitDisposition,
@@ -66,6 +73,7 @@ use crate::syscall::{
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
     deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
     deepwyrm_dw1d_evidence,
     deepwyrm_dw1e_evidence
 ))]
@@ -88,7 +96,8 @@ const MAX_BOOTFS_BYTES: usize = 32 * 1024 * 1024;
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
     deepwyrm_dw1e_evidence,
-    deepwyrm_wyr1c_evidence
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence
 )))]
 const REGISTRY_OBJECTS: usize = 32;
 #[cfg(deepwyrm_dw1c_evidence)]
@@ -115,7 +124,11 @@ const REGISTRY_OBJECTS: usize = 160;
 // its bounded raw-stream probe. Reuse selector 29's functional headroom for
 // that eight-Process product instead of falling through to the three-Process
 // historical bootstrap geometry.
-#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
+#[cfg(any(
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
+    deepwyrm_dw1e_evidence
+))]
 const REGISTRY_OBJECTS: usize = 160;
 #[cfg(not(any(
     deepwyrm_i2_stress,
@@ -125,7 +138,8 @@ const REGISTRY_OBJECTS: usize = 160;
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
     deepwyrm_dw1e_evidence,
-    deepwyrm_wyr1c_evidence
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence
 )))]
 const MEMORY_OBJECTS: usize = 10;
 #[cfg(deepwyrm_dw1c_evidence)]
@@ -145,7 +159,11 @@ const MEMORY_OBJECTS: usize = 13;
 const MEMORY_OBJECTS: usize = 16;
 #[cfg(deepwyrm_wyr1b_evidence)]
 const MEMORY_OBJECTS: usize = 28;
-#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
+#[cfg(any(
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
+    deepwyrm_dw1e_evidence
+))]
 const MEMORY_OBJECTS: usize = 28;
 #[cfg(not(any(
     deepwyrm_i2_stress,
@@ -155,7 +173,8 @@ const MEMORY_OBJECTS: usize = 28;
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
     deepwyrm_dw1e_evidence,
-    deepwyrm_wyr1c_evidence
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence
 )))]
 const MEMORY_LEASES: usize = 10;
 #[cfg(deepwyrm_dw1c_evidence)]
@@ -172,7 +191,11 @@ const MEMORY_LEASES: usize = 13;
 const MEMORY_LEASES: usize = 16;
 #[cfg(deepwyrm_wyr1b_evidence)]
 const MEMORY_LEASES: usize = 28;
-#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
+#[cfg(any(
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
+    deepwyrm_dw1e_evidence
+))]
 const MEMORY_LEASES: usize = 28;
 // I0 keeps the complete bootstrap -> init0 -> hello chain live while each
 // parent performs bounded READY/exit supervision of its direct child. The
@@ -186,7 +209,8 @@ const MEMORY_LEASES: usize = 28;
     deepwyrm_dw1c_evidence,
     deepwyrm_dw1d_evidence,
     deepwyrm_dw1e_evidence,
-    deepwyrm_wyr1c_evidence
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence
 )))]
 const USERSPACE_CHAIN_PROCESSES: usize = 3;
 // Selector 30 has three simultaneously live userspace Processes, but four
@@ -211,9 +235,17 @@ const USERSPACE_CHAIN_PROCESSES: usize = 4;
 const USERSPACE_CHAIN_PROCESSES: usize = 5;
 #[cfg(deepwyrm_wyr1b_evidence)]
 const USERSPACE_CHAIN_PROCESSES: usize = 8;
-#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
+#[cfg(any(
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
+    deepwyrm_dw1e_evidence
+))]
 const USERSPACE_CHAIN_PROCESSES: usize = 8;
-#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
+#[cfg(any(
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
+    deepwyrm_dw1e_evidence
+))]
 const _: () = assert!(super::LIVE_ADDRESS_SPACE_CAPACITY >= USERSPACE_CHAIN_PROCESSES);
 #[cfg(not(any(
     deepwyrm_i2_stress,
@@ -223,7 +255,8 @@ const _: () = assert!(super::LIVE_ADDRESS_SPACE_CAPACITY >= USERSPACE_CHAIN_PROC
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
     deepwyrm_dw1e_evidence,
-    deepwyrm_wyr1c_evidence
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence
 )))]
 const CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;
 #[cfg(deepwyrm_dw1c_evidence)]
@@ -238,7 +271,11 @@ const CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;
 const CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;
 #[cfg(deepwyrm_wyr1b_evidence)]
 const CHANNEL_PAIRS: usize = 24;
-#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
+#[cfg(any(
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
+    deepwyrm_dw1e_evidence
+))]
 const CHANNEL_PAIRS: usize = 24;
 const CHANNEL_DEPTH: usize = 2;
 #[cfg(not(any(
@@ -249,7 +286,8 @@ const CHANNEL_DEPTH: usize = 2;
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
     deepwyrm_dw1e_evidence,
-    deepwyrm_wyr1c_evidence
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence
 )))]
 const WAITERS: usize = 4;
 #[cfg(deepwyrm_dw1c_evidence)]
@@ -269,7 +307,11 @@ const WAITERS: usize = 4;
 const WAITERS: usize = 6;
 #[cfg(deepwyrm_wyr1b_evidence)]
 const WAITERS: usize = 16;
-#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
+#[cfg(any(
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
+    deepwyrm_dw1e_evidence
+))]
 const WAITERS: usize = 16;
 #[cfg(not(any(
     deepwyrm_i2_stress,
@@ -280,7 +322,8 @@ const WAITERS: usize = 16;
     deepwyrm_dw1c_evidence,
     deepwyrm_dw1d_evidence,
     deepwyrm_dw1e_evidence,
-    deepwyrm_wyr1c_evidence
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence
 )))]
 const TASK_GROUPS: usize = 1;
 #[cfg(deepwyrm_dw1c_evidence)]
@@ -299,7 +342,11 @@ const TASK_GROUPS: usize = 4;
 const TASK_GROUPS: usize = 1;
 #[cfg(deepwyrm_wyr1b_evidence)]
 const TASK_GROUPS: usize = 8;
-#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
+#[cfg(any(
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
+    deepwyrm_dw1e_evidence
+))]
 const TASK_GROUPS: usize = 8;
 const PROCESSES: usize = USERSPACE_CHAIN_PROCESSES;
 const THREADS: usize = USERSPACE_CHAIN_PROCESSES;
@@ -327,7 +374,8 @@ const BOOTSTRAP_HANDLE_PEAK: usize = INITIAL_BOOTSTRAP_HANDLES
     deepwyrm_dw1c_evidence,
     deepwyrm_dw1d_evidence,
     deepwyrm_dw1e_evidence,
-    deepwyrm_wyr1c_evidence
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence
 )))]
 const HANDLES: usize = BOOTSTRAP_HANDLE_PEAK;
 #[cfg(deepwyrm_dw1c_evidence)]
@@ -367,7 +415,11 @@ const HANDLES: usize = D6_HANDLE_PEAK;
 const HANDLES: usize = 16;
 #[cfg(deepwyrm_wyr1b_evidence)]
 const HANDLES: usize = 32;
-#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
+#[cfg(any(
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
+    deepwyrm_dw1e_evidence
+))]
 const HANDLES: usize = 32;
 const SPACES: usize = USERSPACE_CHAIN_PROCESSES;
 const REGIONS: usize = USERSPACE_CHAIN_PROCESSES;
@@ -378,12 +430,12 @@ const EXECUTION_THREADS: usize = USERSPACE_CHAIN_PROCESSES;
 const EVENTS: usize = 1;
 #[cfg(deepwyrm_i2_stress)]
 const EVENTS: usize = 2;
-#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_dw1e_evidence)))]
+#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_dw1e_evidence, deepwyrm_wyr1d_evidence)))]
 const TIMERS: usize = 1;
 // Selector 31 overlaps system-init's resident control-tick Timer with one
 // production UART driver's bounded TEMT-pacing Timer. Keep that exact
 // product peak separate from the ordinary single-Timer geometry.
-#[cfg(any(deepwyrm_i2_stress, deepwyrm_dw1e_evidence))]
+#[cfg(any(deepwyrm_i2_stress, deepwyrm_dw1e_evidence, deepwyrm_wyr1d_evidence))]
 const TIMERS: usize = 2;
 // A bounded mapping can cross one boundary at each non-root level. Keep two
 // candidates for PDPT, PD, and PT creation so the live publisher can construct
@@ -401,7 +453,8 @@ const PRIMORDIAL_TABLE_CANDIDATES: usize = 6;
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
     deepwyrm_dw1e_evidence,
-    deepwyrm_wyr1c_evidence
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence
 )))]
 const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 17;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
@@ -427,7 +480,11 @@ const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_dw1c_bootfs_pages();
 // Selector 29 consumes a frozen archive whose byte identity is recorded by
 // Wyrmroot. Keep bounded functional headroom above selector 27 without
 // widening the ordinary production profile or the 32 MiB loader intake.
-#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
+#[cfg(any(
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
+    deepwyrm_dw1e_evidence
+))]
 const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 256;
 const PRIMORDIAL_STACK_MAPPING_PAGES: usize =
     crate::boot::primordial::construction::STACK_BYTES as usize / 4096;
@@ -453,7 +510,8 @@ const _: [(); PROCESSES] = [(); THREADS];
     not(deepwyrm_wyr1b_evidence),
     not(deepwyrm_dw1c_evidence),
     not(deepwyrm_dw1e_evidence),
-    not(deepwyrm_wyr1c_evidence)
+    not(deepwyrm_wyr1c_evidence),
+    not(deepwyrm_wyr1d_evidence)
 ))]
 const _: [(); PROCESSES] = [(); CHANNEL_PAIRS];
 const _: [(); PROCESSES] = [(); SPACES];
@@ -469,7 +527,8 @@ const _: [(); PROCESSES] = [(); EXECUTION_THREADS];
     deepwyrm_dw1c_evidence,
     deepwyrm_dw1d_evidence,
     deepwyrm_dw1e_evidence,
-    deepwyrm_wyr1c_evidence
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence
 )))]
 const _: [(); 10] = [(); HANDLES];
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
@@ -518,25 +577,49 @@ const _: [(); 28] = [(); MEMORY_OBJECTS];
 const _: [(); 28] = [(); MEMORY_LEASES];
 #[cfg(deepwyrm_wyr1b_evidence)]
 const _: [(); 160] = [(); REGISTRY_OBJECTS];
-#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
+#[cfg(any(
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
+    deepwyrm_dw1e_evidence
+))]
 const _: [(); 8] = [(); USERSPACE_CHAIN_PROCESSES];
-#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
+#[cfg(any(
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
+    deepwyrm_dw1e_evidence
+))]
 const _: [(); 24] = [(); CHANNEL_PAIRS];
-#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
+#[cfg(any(
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
+    deepwyrm_dw1e_evidence
+))]
 const _: [(); 32] = [(); HANDLES];
-#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
+#[cfg(any(
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
+    deepwyrm_dw1e_evidence
+))]
 const _: [(); 28] = [(); MEMORY_OBJECTS];
-#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
+#[cfg(any(
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
+    deepwyrm_dw1e_evidence
+))]
 const _: [(); 28] = [(); MEMORY_LEASES];
-#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
+#[cfg(any(
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
+    deepwyrm_dw1e_evidence
+))]
 const _: [(); 160] = [(); REGISTRY_OBJECTS];
-#[cfg(deepwyrm_dw1e_evidence)]
+#[cfg(any(deepwyrm_dw1e_evidence, deepwyrm_wyr1d_evidence))]
 const _: [(); 16] = [(); WAITERS];
-#[cfg(deepwyrm_dw1e_evidence)]
+#[cfg(any(deepwyrm_dw1e_evidence, deepwyrm_wyr1d_evidence))]
 const _: [(); 2] = [(); TIMERS];
-#[cfg(deepwyrm_dw1e_evidence)]
+#[cfg(any(deepwyrm_dw1e_evidence, deepwyrm_wyr1d_evidence))]
 const _: [(); 8] = [(); TASK_GROUPS];
-#[cfg(deepwyrm_dw1e_evidence)]
+#[cfg(any(deepwyrm_dw1e_evidence, deepwyrm_wyr1d_evidence))]
 const _: [(); 256] = [(); PRIMORDIAL_BOOTFS_MAX_PAGES];
 #[cfg(deepwyrm_dw1c_evidence)]
 const _: [(); 12] = [(); USERSPACE_CHAIN_PROCESSES];
@@ -667,6 +750,7 @@ impl G5PrimordialProbe {
             BuildGuestTest::DeviceCoordinatorRestart => G5PrimordialExpectation::Baseline,
             BuildGuestTest::DeviceResourceInterruptSynthetic => G5PrimordialExpectation::Baseline,
             BuildGuestTest::Q35Com2Interrupt => G5PrimordialExpectation::Baseline,
+            BuildGuestTest::NativeConsoleStreams => G5PrimordialExpectation::Baseline,
             BuildGuestTest::PrimordialBlockingCleanup => G5PrimordialExpectation::BlockingCleanup,
             BuildGuestTest::PrimordialUserException => G5PrimordialExpectation::UserException,
             BuildGuestTest::PrimordialInvalidReturn => G5PrimordialExpectation::InvalidReturn,
@@ -1475,6 +1559,7 @@ struct TerminalRetirementState {
         deepwyrm_wyr1_evidence,
         deepwyrm_wyr1b_evidence,
         deepwyrm_wyr1c_evidence,
+        deepwyrm_wyr1d_evidence,
         deepwyrm_dw1e_evidence
     ))]
     retiring_wyr1_primordial: bool,
@@ -1482,6 +1567,7 @@ struct TerminalRetirementState {
         deepwyrm_wyr1_evidence,
         deepwyrm_wyr1b_evidence,
         deepwyrm_wyr1c_evidence,
+        deepwyrm_wyr1d_evidence,
         deepwyrm_dw1e_evidence
     ))]
     wyr1_primordial_teardown: Option<(
@@ -1501,6 +1587,7 @@ enum TerminalKernelContinuation {
         deepwyrm_wyr1_evidence,
         deepwyrm_wyr1b_evidence,
         deepwyrm_wyr1c_evidence,
+        deepwyrm_wyr1d_evidence,
         deepwyrm_dw1e_evidence
     ))]
     RetireWyr1Primordial(TerminalRetirementState),
@@ -1508,6 +1595,7 @@ enum TerminalKernelContinuation {
         deepwyrm_wyr1_evidence,
         deepwyrm_wyr1b_evidence,
         deepwyrm_wyr1c_evidence,
+        deepwyrm_wyr1d_evidence,
         deepwyrm_dw1e_evidence
     ))]
     RetireWyr1Child {
@@ -2725,10 +2813,15 @@ struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_
         deepwyrm_wyr1b_evidence,
         deepwyrm_dw1c_evidence,
         deepwyrm_wyr1c_evidence,
+        deepwyrm_wyr1d_evidence,
         deepwyrm_dw1e_evidence
     ))]
     evidence_init_process: Option<ProcessKey>,
-    #[cfg(any(deepwyrm_wyr1b_evidence, deepwyrm_wyr1c_evidence))]
+    #[cfg(any(
+        deepwyrm_wyr1b_evidence,
+        deepwyrm_wyr1c_evidence,
+        deepwyrm_wyr1d_evidence
+    ))]
     evidence_init_thread: Option<ThreadKey>,
     channel_keys: [crate::ipc::ChannelEndpointKey; 2],
     kernel_peer: Option<HandleRef>,
@@ -3336,6 +3429,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1_evidence,
             deepwyrm_wyr1b_evidence,
             deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence,
             deepwyrm_dw1e_evidence
         ))]
         let retiring_wyr1_primordial = retired_process == self.primordial_process;
@@ -3343,6 +3437,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1_evidence,
             deepwyrm_wyr1b_evidence,
             deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence,
             deepwyrm_dw1e_evidence
         ))]
         if retiring_wyr1_primordial && let Err(error) = validate_primordial_retirement_facts(self) {
@@ -3356,6 +3451,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1_evidence,
             deepwyrm_wyr1b_evidence,
             deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence,
             deepwyrm_dw1e_evidence
         ))]
         let wyr1_primordial_teardown = if retiring_wyr1_primordial {
@@ -3389,6 +3485,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 deepwyrm_wyr1_evidence,
                 deepwyrm_wyr1b_evidence,
                 deepwyrm_wyr1c_evidence,
+                deepwyrm_wyr1d_evidence,
                 deepwyrm_dw1e_evidence
             ))]
             retiring_wyr1_primordial,
@@ -3396,6 +3493,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 deepwyrm_wyr1_evidence,
                 deepwyrm_wyr1b_evidence,
                 deepwyrm_wyr1c_evidence,
+                deepwyrm_wyr1d_evidence,
                 deepwyrm_dw1e_evidence
             ))]
             wyr1_primordial_teardown,
@@ -3435,6 +3533,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1_evidence,
             deepwyrm_wyr1b_evidence,
             deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence,
             deepwyrm_dw1e_evidence
         ))]
         if retirement.retiring_wyr1_primordial {
@@ -3449,6 +3548,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1_evidence,
             deepwyrm_wyr1b_evidence,
             deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence,
             deepwyrm_dw1e_evidence
         ))]
         let primordial_retired = match self.tasks.root_region(self.primordial_process) {
@@ -3460,6 +3560,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1_evidence,
             deepwyrm_wyr1b_evidence,
             deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence,
             deepwyrm_dw1e_evidence
         ))]
         if retirement.retired_process != self.primordial_process && primordial_retired {
@@ -3546,6 +3647,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 deepwyrm_wyr1_evidence,
                 deepwyrm_wyr1b_evidence,
                 deepwyrm_wyr1c_evidence,
+                deepwyrm_wyr1d_evidence,
                 deepwyrm_dw1e_evidence
             ))]
             if state.retirement.retiring_wyr1_primordial {
@@ -3581,6 +3683,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 deepwyrm_wyr1_evidence,
                 deepwyrm_wyr1b_evidence,
                 deepwyrm_wyr1c_evidence,
+                deepwyrm_wyr1d_evidence,
                 deepwyrm_dw1e_evidence
             )))]
             if self
@@ -3600,6 +3703,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1_evidence,
             deepwyrm_wyr1b_evidence,
             deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence,
             deepwyrm_dw1e_evidence
         ))]
         if state.retirement.retiring_wyr1_primordial {
@@ -3639,6 +3743,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 deepwyrm_wyr1_evidence,
                 deepwyrm_wyr1b_evidence,
                 deepwyrm_wyr1c_evidence,
+                deepwyrm_wyr1d_evidence,
                 deepwyrm_dw1e_evidence
             ))]
             TerminalKernelContinuation::RetireWyr1Primordial(mut retirement) => {
@@ -3669,6 +3774,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 deepwyrm_wyr1_evidence,
                 deepwyrm_wyr1b_evidence,
                 deepwyrm_wyr1c_evidence,
+                deepwyrm_wyr1d_evidence,
                 deepwyrm_dw1e_evidence
             ))]
             TerminalKernelContinuation::RetireWyr1Child {
@@ -3729,13 +3835,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         #[cfg(not(any(
             deepwyrm_dw1d_evidence,
             deepwyrm_dw1e_evidence,
-            deepwyrm_wyr1c_evidence
+            deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence
         )))]
         let completion = complete_primordial_launch(self);
         #[cfg(any(
             deepwyrm_dw1d_evidence,
             deepwyrm_dw1e_evidence,
-            deepwyrm_wyr1c_evidence
+            deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence
         ))]
         let completion = complete_resource_primordial_launch(self);
         #[cfg(all(feature = "test-support", deepwyrm_dw1c_evidence))]
@@ -3778,7 +3886,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .unwrap_or_else(|_| crate::test_support::complete_fail(0x3010_e001));
             crate::test_support::complete_dw1d_evidence(permit)
         }
-        #[cfg(all(feature = "test-support", deepwyrm_wyr1c_evidence))]
+        #[cfg(all(
+            feature = "test-support",
+            any(deepwyrm_wyr1c_evidence, deepwyrm_wyr1d_evidence)
+        ))]
         {
             let detail = if self.g5_probe.accepts_completion(&completion) {
                 supervisor_evidence_detail(0xd015)
@@ -3793,7 +3904,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 deepwyrm_dw1b_evidence,
                 deepwyrm_dw1c_evidence,
                 deepwyrm_dw1d_evidence,
-                deepwyrm_wyr1c_evidence
+                deepwyrm_wyr1c_evidence,
+                deepwyrm_wyr1d_evidence
             ))
         ))]
         if self.g5_probe.accepts_completion(&completion) {
@@ -3879,6 +3991,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1_evidence,
             deepwyrm_wyr1b_evidence,
             deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence,
             deepwyrm_dw1e_evidence
         ))]
         let retiring_wyr1_primordial = retired_process == self.primordial_process;
@@ -3886,6 +3999,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1_evidence,
             deepwyrm_wyr1b_evidence,
             deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence,
             deepwyrm_dw1e_evidence
         ))]
         if retiring_wyr1_primordial {
@@ -3904,6 +4018,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1_evidence,
             deepwyrm_wyr1b_evidence,
             deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence,
             deepwyrm_dw1e_evidence
         ))]
         let mut wyr1_primordial_teardown = if retiring_wyr1_primordial {
@@ -3952,6 +4067,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     deepwyrm_wyr1_evidence,
                     deepwyrm_wyr1b_evidence,
                     deepwyrm_wyr1c_evidence,
+                    deepwyrm_wyr1d_evidence,
                     deepwyrm_dw1e_evidence
                 ))]
                 if retiring_wyr1_primordial {
@@ -3979,6 +4095,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     deepwyrm_wyr1_evidence,
                     deepwyrm_wyr1b_evidence,
                     deepwyrm_wyr1c_evidence,
+                    deepwyrm_wyr1d_evidence,
                     deepwyrm_dw1e_evidence
                 )))]
                 if self.tasks.process_quiescence_proof(retired_process).is_ok() {
@@ -3994,6 +4111,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 deepwyrm_wyr1_evidence,
                 deepwyrm_wyr1b_evidence,
                 deepwyrm_wyr1c_evidence,
+                deepwyrm_wyr1d_evidence,
                 deepwyrm_dw1e_evidence
             ))]
             if retiring_wyr1_primordial {
@@ -4028,6 +4146,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1_evidence,
             deepwyrm_wyr1b_evidence,
             deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence,
             deepwyrm_dw1e_evidence
         ))]
         if retiring_wyr1_primordial {
@@ -4072,6 +4191,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1_evidence,
             deepwyrm_wyr1b_evidence,
             deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence,
             deepwyrm_dw1e_evidence
         ))]
         let primordial_retired = match self.tasks.root_region(self.primordial_process) {
@@ -4083,6 +4203,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1_evidence,
             deepwyrm_wyr1b_evidence,
             deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence,
             deepwyrm_dw1e_evidence
         ))]
         if retired_process != self.primordial_process && primordial_retired {
@@ -4231,13 +4352,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         #[cfg(not(any(
             deepwyrm_dw1d_evidence,
             deepwyrm_dw1e_evidence,
-            deepwyrm_wyr1c_evidence
+            deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence
         )))]
         let completion = complete_primordial_launch(self);
         #[cfg(any(
             deepwyrm_dw1d_evidence,
             deepwyrm_dw1e_evidence,
-            deepwyrm_wyr1c_evidence
+            deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence
         ))]
         let completion = complete_resource_primordial_launch(self);
         #[cfg(all(feature = "test-support", deepwyrm_dw1c_evidence))]
@@ -4280,7 +4403,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .unwrap_or_else(|_| crate::test_support::complete_fail(0x3010_e001));
             crate::test_support::complete_dw1d_evidence(permit)
         }
-        #[cfg(all(feature = "test-support", deepwyrm_wyr1c_evidence))]
+        #[cfg(all(
+            feature = "test-support",
+            any(deepwyrm_wyr1c_evidence, deepwyrm_wyr1d_evidence)
+        ))]
         {
             let detail = if self.g5_probe.accepts_completion(&completion) {
                 supervisor_evidence_detail(0xd015)
@@ -4295,7 +4421,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 deepwyrm_dw1b_evidence,
                 deepwyrm_dw1c_evidence,
                 deepwyrm_dw1d_evidence,
-                deepwyrm_wyr1c_evidence
+                deepwyrm_wyr1c_evidence,
+                deepwyrm_wyr1d_evidence
             ))
         ))]
         if self.g5_probe.accepts_completion(&completion) {
@@ -5265,17 +5392,26 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         deepwyrm_wyr1_evidence,
         deepwyrm_wyr1b_evidence,
         deepwyrm_wyr1c_evidence,
+        deepwyrm_wyr1d_evidence,
         deepwyrm_dw1e_evidence
     ))]
     fn enable_wyr1_reporter_after_retirement(&mut self) -> Result<(), ()> {
         let reporter = self.evidence_init_process.ok_or(())?;
-        #[cfg(any(deepwyrm_wyr1b_evidence, deepwyrm_wyr1c_evidence))]
+        #[cfg(any(
+            deepwyrm_wyr1b_evidence,
+            deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence
+        ))]
         let reporter_thread = self.evidence_init_thread.unwrap_or_else(|| {
             crate::test_support::complete_fail(wyr1b_submit_detail(
                 crate::test_support::Wyr1bEvidenceError::StartupMissing,
             ))
         });
-        #[cfg(any(deepwyrm_wyr1b_evidence, deepwyrm_wyr1c_evidence))]
+        #[cfg(any(
+            deepwyrm_wyr1b_evidence,
+            deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence
+        ))]
         let reporter_root = self
             .tasks
             .root_region(reporter)
@@ -5362,10 +5498,30 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 },
             )
             .unwrap_or_else(|_| crate::test_support::complete_fail(0x2910_e010));
+        #[cfg(deepwyrm_wyr1d_evidence)]
+        crate::test_support::WYR1D_EVIDENCE
+            .bind_reporter_after_retirement(
+                reporter,
+                reporter_thread,
+                reporter_root,
+                crate::test_support::Wyr1bRetirementFacts {
+                    process_quiesced: true,
+                    root_region_retired: true,
+                    monitor_and_kernel_peer_released: self.kernel_peer.is_none()
+                        && self.process_monitor.is_none(),
+                    finalizers_drained: self.cleanup.is_empty(),
+                    private_primordial_pml4_retained: true,
+                },
+            )
+            .unwrap_or_else(|_| crate::test_support::complete_fail(0x3210_e010));
         Ok(())
     }
 
-    #[cfg(any(deepwyrm_wyr1b_evidence, deepwyrm_wyr1c_evidence))]
+    #[cfg(any(
+        deepwyrm_wyr1b_evidence,
+        deepwyrm_wyr1c_evidence,
+        deepwyrm_wyr1d_evidence
+    ))]
     fn observe_wyr1b_system_init_start(
         &mut self,
     ) -> Result<(), crate::test_support::Wyr1bEvidenceError> {
@@ -5467,6 +5623,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         WYR1B_EVIDENCE.observe_reporter_start(facts)?;
         #[cfg(deepwyrm_wyr1c_evidence)]
         crate::test_support::WYR1C_EVIDENCE
+            .observe_reporter_start(facts)
+            .map_err(|_| Wyr1bEvidenceError::StartupRoot)?;
+        #[cfg(deepwyrm_wyr1d_evidence)]
+        crate::test_support::WYR1D_EVIDENCE
             .observe_reporter_start(facts)
             .map_err(|_| Wyr1bEvidenceError::StartupRoot)?;
         self.evidence_init_thread = Some(reporter_thread);
@@ -6299,6 +6459,79 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
                 crate::test_support::complete_wyr1c_evidence(permit)
             }
             Err(error) => crate::test_support::complete_fail(wyr1c_submit_detail(error)),
+        }
+    }
+
+    #[cfg(deepwyrm_wyr1d_evidence)]
+    fn intercept_wyr1d_evidence_raw(
+        &mut self,
+        arguments: crate::syscall::RawSyscallArguments,
+    ) -> NativeSyscallResult {
+        use crate::test_support::{
+            WYR1D_EVIDENCE, WYR1D_EVIDENCE_RECORD_LEN, WYR1D_READY_RECORD_LEN, Wyr1dEvidenceSubmit,
+        };
+
+        let values = arguments.as_array();
+        let mode = values[2];
+        let expected_len = match mode {
+            0 => WYR1D_EVIDENCE_RECORD_LEN,
+            1 => WYR1D_READY_RECORD_LEN,
+            _ => crate::test_support::complete_fail(0x3210_e001),
+        };
+        if values[1] != expected_len as u64 || values[3..].iter().any(|value| *value != 0) {
+            crate::test_support::complete_fail(0x3210_e001)
+        }
+        let phase = self.reserve_runtime_phase();
+        WYR1D_EVIDENCE
+            .authorize_submission(self.process)
+            .unwrap_or_else(|error| crate::test_support::complete_fail(wyr1d_submit_detail(error)));
+        if mode == 0 {
+            let record = {
+                let mut user = self.active.current_process_address_space(
+                    self.active_root.as_ref().expect("active root"),
+                    self.process,
+                );
+                match crate::syscall::copy_wyr1d_evidence_input::<_, WYR1D_EVIDENCE_RECORD_LEN>(
+                    &mut user,
+                    deepwyrm_abi::DwUserAddress(values[0]),
+                ) {
+                    Ok(record) => record,
+                    Err(_) => crate::test_support::complete_fail(0x3210_e002),
+                }
+            };
+            self.commit_runtime_phase(phase);
+            match WYR1D_EVIDENCE.submit(self.process, &record) {
+                Ok(Wyr1dEvidenceSubmit::Accepted) => {
+                    NativeSyscallResult::returning(DW_STATUS_SUCCESS)
+                }
+                Ok(Wyr1dEvidenceSubmit::Terminal(permit)) => {
+                    crate::test_support::complete_wyr1d_evidence(permit)
+                }
+                Err(error) => crate::test_support::complete_fail(wyr1d_submit_detail(error)),
+            }
+        } else {
+            let readiness = {
+                let mut user = self.active.current_process_address_space(
+                    self.active_root.as_ref().expect("active root"),
+                    self.process,
+                );
+                match crate::syscall::copy_wyr1d_evidence_input::<_, WYR1D_READY_RECORD_LEN>(
+                    &mut user,
+                    deepwyrm_abi::DwUserAddress(values[0]),
+                ) {
+                    Ok(record) => record,
+                    Err(_) => crate::test_support::complete_fail(0x3210_e002),
+                }
+            };
+            self.commit_runtime_phase(phase);
+            WYR1D_EVIDENCE
+                .submit_readiness(self.process, &readiness)
+                .unwrap_or_else(|error| {
+                    crate::test_support::complete_fail(wyr1d_submit_detail(error))
+                });
+            crate::test_support::emit_wyr1d_ready(&readiness)
+                .unwrap_or_else(|_| crate::test_support::complete_fail(0x3210_e013));
+            NativeSyscallResult::returning(DW_STATUS_SUCCESS)
         }
     }
 
@@ -7135,7 +7368,11 @@ const fn wyr1_submit_detail(error: crate::test_support::Wyr1EvidenceError) -> u3
     }
 }
 
-#[cfg(any(deepwyrm_wyr1b_evidence, deepwyrm_wyr1c_evidence))]
+#[cfg(any(
+    deepwyrm_wyr1b_evidence,
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence
+))]
 const fn wyr1b_submit_detail(error: crate::test_support::Wyr1bEvidenceError) -> u32 {
     use crate::test_support::Wyr1bEvidenceError;
     match error {
@@ -7181,6 +7418,32 @@ const fn wyr1c_submit_detail(error: crate::test_support::Wyr1cEvidenceError) -> 
     }
 }
 
+#[cfg(deepwyrm_wyr1d_evidence)]
+const fn wyr1d_submit_detail(error: crate::test_support::Wyr1dEvidenceError) -> u32 {
+    use crate::test_support::Wyr1dEvidenceError;
+    match error {
+        Wyr1dEvidenceError::Early => 0x3210_e003,
+        Wyr1dEvidenceError::Retirement => 0x3210_e004,
+        Wyr1dEvidenceError::WrongReporter => 0x3210_e005,
+        Wyr1dEvidenceError::Malformed => 0x3210_e006,
+        Wyr1dEvidenceError::WrongNonce => 0x3210_e007,
+        Wyr1dEvidenceError::OutOfOrder => 0x3210_e008,
+        Wyr1dEvidenceError::Relation => 0x3210_e009,
+        Wyr1dEvidenceError::ReadinessOrder => 0x3210_e00a,
+        Wyr1dEvidenceError::Full => 0x3210_e00b,
+        Wyr1dEvidenceError::DuplicateTerminal => 0x3210_e00c,
+        Wyr1dEvidenceError::ReporterClaimed => 0x3210_e00d,
+        Wyr1dEvidenceError::StartupMissing => 0x3210_e00e,
+        Wyr1dEvidenceError::StartupDuplicate => 0x3210_e00f,
+        Wyr1dEvidenceError::StartupRoot => 0x3210_e010,
+        Wyr1dEvidenceError::StartupEntry => 0x3210_e011,
+        Wyr1dEvidenceError::StartupStackPointer => 0x3210_e012,
+        Wyr1dEvidenceError::StartupStackMapping => 0x3210_e014,
+        Wyr1dEvidenceError::StartupStackProtection => 0x3210_e015,
+        Wyr1dEvidenceError::StartupGuard => 0x3210_e016,
+    }
+}
+
 #[cfg(deepwyrm_dw1b_evidence)]
 const fn dw1b_evidence_detail(error: crate::test_support::Dw1bEvidenceError) -> u32 {
     use crate::test_support::Dw1bEvidenceError;
@@ -7205,6 +7468,7 @@ const fn dw1b_evidence_detail(error: crate::test_support::Dw1bEvidenceError) -> 
     deepwyrm_dw1c_evidence,
     deepwyrm_dw1d_evidence,
     deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
     deepwyrm_dw1e_evidence
 ))]
 const fn evidence_process_create_detail(case: u32) -> u32 {
@@ -7222,12 +7486,15 @@ const fn evidence_process_create_detail(case: u32) -> u32 {
     return 0x2910_c000 | case;
     #[cfg(deepwyrm_dw1e_evidence)]
     return 0x3110_c000 | case;
+    #[cfg(deepwyrm_wyr1d_evidence)]
+    return 0x3210_c000 | case;
 }
 
 #[cfg(any(
     deepwyrm_wyr1_evidence,
     deepwyrm_wyr1b_evidence,
     deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
     deepwyrm_dw1e_evidence
 ))]
 const fn supervisor_evidence_detail(case: u32) -> u32 {
@@ -7239,6 +7506,8 @@ const fn supervisor_evidence_detail(case: u32) -> u32 {
     return 0x2910_0000 | case;
     #[cfg(deepwyrm_dw1e_evidence)]
     return 0x3110_0000 | case;
+    #[cfg(deepwyrm_wyr1d_evidence)]
+    return 0x3210_0000 | case;
 }
 
 #[cfg(any(
@@ -7246,6 +7515,7 @@ const fn supervisor_evidence_detail(case: u32) -> u32 {
     deepwyrm_wyr1_evidence,
     deepwyrm_wyr1b_evidence,
     deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
     deepwyrm_dw1e_evidence
 ))]
 const fn primordial_receive_failure_tag(code: u32) -> u32 {
@@ -7269,6 +7539,7 @@ const fn primordial_receive_failure_tag(code: u32) -> u32 {
     deepwyrm_wyr1_evidence,
     deepwyrm_wyr1b_evidence,
     deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
     deepwyrm_dw1e_evidence
 ))]
 fn primordial_completion_case(
@@ -7301,6 +7572,7 @@ fn primordial_completion_case(
     deepwyrm_wyr1_evidence,
     deepwyrm_wyr1b_evidence,
     deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
     deepwyrm_dw1e_evidence
 ))]
 fn primordial_completion_detail(
@@ -7751,6 +8023,23 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         let result = self
             .with_synchronized_runtime_at_safe_point(|runtime| {
                 runtime.intercept_wyr1c_evidence_raw(arguments)
+            })
+            .unwrap_or(NativeSyscallResult {
+                status: DW_STATUS_SUCCESS,
+                control: SyscallControl::ServiceRendezvous,
+            });
+        crate::task::drain_runnable_work_notifications();
+        result
+    }
+
+    #[cfg(deepwyrm_wyr1d_evidence)]
+    fn intercept_wyr1d_evidence_raw(
+        &mut self,
+        arguments: crate::syscall::RawSyscallArguments,
+    ) -> NativeSyscallResult {
+        let result = self
+            .with_synchronized_runtime_at_safe_point(|runtime| {
+                runtime.intercept_wyr1d_evidence_raw(arguments)
             })
             .unwrap_or(NativeSyscallResult {
                 status: DW_STATUS_SUCCESS,
@@ -8492,7 +8781,8 @@ fn copy_module<'a, const BYTES: usize, const RANGE_CAPACITY: usize, const ROLE_C
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
     deepwyrm_dw1d_evidence,
-    deepwyrm_wyr1c_evidence
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence
 ))]
 const fn integration_bootfs_page_count(byte_len: usize) -> Option<usize> {
     if byte_len == 0 {
@@ -8769,10 +9059,15 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
             deepwyrm_wyr1b_evidence,
             deepwyrm_dw1c_evidence,
             deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence,
             deepwyrm_dw1e_evidence
         ))]
         evidence_init_process: None,
-        #[cfg(any(deepwyrm_wyr1b_evidence, deepwyrm_wyr1c_evidence))]
+        #[cfg(any(
+            deepwyrm_wyr1b_evidence,
+            deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence
+        ))]
         evidence_init_thread: None,
         channel_keys,
         kernel_peer: Some(kernel_peer),
@@ -8918,6 +9213,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     deepwyrm_wyr1b_evidence,
                     deepwyrm_dw1c_evidence,
                     deepwyrm_wyr1c_evidence,
+                    deepwyrm_wyr1d_evidence,
                     deepwyrm_dw1e_evidence
                 ))]
                 let creating_evidence_init = self.process == self.primordial_process;
@@ -8927,6 +9223,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     deepwyrm_wyr1b_evidence,
                     deepwyrm_dw1c_evidence,
                     deepwyrm_wyr1c_evidence,
+                    deepwyrm_wyr1d_evidence,
                     deepwyrm_dw1e_evidence
                 ))]
                 if creating_evidence_init && self.evidence_init_process.is_some() {
@@ -8938,6 +9235,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     deepwyrm_wyr1b_evidence,
                     deepwyrm_dw1c_evidence,
                     deepwyrm_wyr1c_evidence,
+                    deepwyrm_wyr1d_evidence,
                     deepwyrm_dw1e_evidence
                 ))]
                 let mut committed_child = None;
@@ -8947,6 +9245,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     deepwyrm_wyr1b_evidence,
                     deepwyrm_dw1c_evidence,
                     deepwyrm_wyr1c_evidence,
+                    deepwyrm_wyr1d_evidence,
                     deepwyrm_dw1e_evidence
                 ))]
                 let status = crate::syscall::process_create_with_root_observed(
@@ -8977,6 +9276,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     deepwyrm_wyr1b_evidence,
                     deepwyrm_dw1c_evidence,
                     deepwyrm_wyr1c_evidence,
+                    deepwyrm_wyr1d_evidence,
                     deepwyrm_dw1e_evidence
                 )))]
                 let status = crate::syscall::process_create_with_root(
@@ -8998,6 +9298,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     deepwyrm_wyr1b_evidence,
                     deepwyrm_dw1c_evidence,
                     deepwyrm_wyr1c_evidence,
+                    deepwyrm_wyr1d_evidence,
                     deepwyrm_dw1e_evidence
                 ))]
                 if creating_evidence_init && status == DW_STATUS_SUCCESS {
@@ -9323,7 +9624,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     &mut self.cleanup,
                 );
                 drop(user);
-                #[cfg(any(deepwyrm_wyr1b_evidence, deepwyrm_wyr1c_evidence))]
+                #[cfg(any(
+                    deepwyrm_wyr1b_evidence,
+                    deepwyrm_wyr1c_evidence,
+                    deepwyrm_wyr1d_evidence
+                ))]
                 if status == DW_STATUS_SUCCESS {
                     self.observe_wyr1b_system_init_start()
                         .unwrap_or_else(|error| {

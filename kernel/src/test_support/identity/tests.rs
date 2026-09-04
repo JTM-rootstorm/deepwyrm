@@ -113,6 +113,11 @@ fn implemented_central_selectors_have_exact_kernel_identities() {
             30,
         ),
         ("q35-com2-interrupt", BuildGuestTest::Q35Com2Interrupt, 31),
+        (
+            "native-console-streams",
+            BuildGuestTest::NativeConsoleStreams,
+            32,
+        ),
     ];
     for (selector, identity, id) in cases {
         assert_eq!(parse_known_selector(selector), identity);
@@ -156,6 +161,7 @@ fn only_expected_invalid_opcode_is_classified_as_fail() {
         (BuildGuestTest::NormalPreemptionUp, 6),
         (BuildGuestTest::DeviceResourceInterruptSynthetic, 6),
         (BuildGuestTest::Q35Com2Interrupt, 6),
+        (BuildGuestTest::NativeConsoleStreams, 6),
     ] {
         assert_eq!(
             exception_outcome_for(test, vector),
@@ -215,6 +221,7 @@ fn memory_and_task_selectors_have_distinct_post_activation_dispatch() {
         BuildGuestTest::NativeUserspaceCapability,
         BuildGuestTest::DeviceResourceInterruptSynthetic,
         BuildGuestTest::Q35Com2Interrupt,
+        BuildGuestTest::NativeConsoleStreams,
     ] {
         assert!(test.is_primordial());
         assert!(!test.is_memory_foundation());

@@ -801,7 +801,6 @@ impl Q35InterruptPlatform {
         }
     }
 
-    #[cfg(any(test, deepwyrm_dw1e_evidence))]
     fn request_terminal_retry(
         &self,
         request: Q35BspCheckRequest,

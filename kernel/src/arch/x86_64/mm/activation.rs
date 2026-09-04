@@ -45,6 +45,7 @@ mod primordial;
             deepwyrm_wyr1_evidence,
             deepwyrm_wyr1b_evidence,
             deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence,
             deepwyrm_dw1e_evidence
         )
     )
@@ -117,7 +118,8 @@ const _: () = {
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
     deepwyrm_dw1e_evidence,
-    deepwyrm_wyr1c_evidence
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence
 )))]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;
 // Selector 24 keeps bootstrap, init0, the controller, and one bounded worker
@@ -140,6 +142,10 @@ const LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;
 // Selector 29 reuses the bounded eight-Process permanent-controller geometry
 // while adding resource-domain ownership and restart evidence.
 #[cfg(deepwyrm_wyr1c_evidence)]
+const LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;
+// Selector 32 extends the same permanent-controller service graph through
+// production UART, console, and bounded replacement generations.
+#[cfg(deepwyrm_wyr1d_evidence)]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;
 // Selector 31 extends selector 29's permanent resource-domain service graph
 // with one bounded raw-stream probe and therefore needs the same eight-root

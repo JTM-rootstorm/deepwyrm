@@ -107,6 +107,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1E_EVIDENCE_NONCE");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1E_E3B_FULL");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1C_EVIDENCE_NONCE");
+    println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1D_EVIDENCE_NONCE");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_c3_one_shot_ui)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_memory_guest)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_e7_guest)");
@@ -121,15 +122,16 @@ fn run() -> Result<(), String> {
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1c_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1d_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1c_evidence)");
+    println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1d_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1e_platform)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1e_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1e_e3b_full)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_integrated)");
     println!("cargo:rustc-cfg=deepwyrm_integrated");
 
-    // Selector 31 carries the q35 platform surface in the same selected
-    // product as E3's private evidence collector. The platform cfg remains
-    // distinct so ordinary q35 code does not depend on the collector module.
+    // Selectors 31 and 32 share the q35 platform surface while selecting
+    // distinct private evidence collectors. Ordinary q35 code must not
+    // depend on either collector module.
     if env::var("DEEPWYRM_GUEST_TEST_SELECTOR")
         .ok()
         .as_deref()
@@ -249,6 +251,13 @@ fn run() -> Result<(), String> {
         .is_some_and(is_wyr1c_evidence_selector)
     {
         println!("cargo:rustc-cfg=deepwyrm_wyr1c_evidence");
+    }
+    if env::var("DEEPWYRM_GUEST_TEST_SELECTOR")
+        .ok()
+        .as_deref()
+        .is_some_and(is_wyr1d_evidence_selector)
+    {
+        println!("cargo:rustc-cfg=deepwyrm_wyr1d_evidence");
     }
 
     if required_env("TARGET")? != KERNEL_TARGET {
@@ -401,8 +410,12 @@ fn is_wyr1c_evidence_selector(selector: &str) -> bool {
     selector == "device-coordinator-restart"
 }
 
+fn is_wyr1d_evidence_selector(selector: &str) -> bool {
+    selector == "native-console-streams"
+}
+
 fn is_dw1e_platform_selector(selector: &str) -> bool {
-    selector == "q35-com2-interrupt"
+    matches!(selector, "q35-com2-interrupt" | "native-console-streams")
 }
 
 fn is_dw1e_evidence_selector(selector: &str) -> bool {
@@ -1018,6 +1031,10 @@ fn configure_guest_test(harness_path: &Path) -> Result<(), String> {
             let nonce = required_wyr1c_hex("DEEPWYRM_WYR1C_EVIDENCE_NONCE")?;
             println!("cargo:rustc-env=DEEPWYRM_WYR1C_EVIDENCE_NONCE={nonce}");
         }
+        if is_wyr1d_evidence_selector(&selector) {
+            let nonce = required_wyr1d_hex("DEEPWYRM_WYR1D_EVIDENCE_NONCE")?;
+            println!("cargo:rustc-env=DEEPWYRM_WYR1D_EVIDENCE_NONCE={nonce}");
+        }
     }
     Ok(())
 }
@@ -1030,6 +1047,12 @@ fn required_dw1b_hex(name: &str) -> Result<String, String> {
 
 fn required_dw1e_hex(name: &str) -> Result<String, String> {
     let value = env::var(name).map_err(|_| format!("q35-com2-interrupt requires {name}"))?;
+    validate_upper_nonzero_hex_nonce(&value, name)?;
+    Ok(value)
+}
+
+fn required_wyr1d_hex(name: &str) -> Result<String, String> {
+    let value = env::var(name).map_err(|_| format!("native-console-streams requires {name}"))?;
     validate_upper_nonzero_hex_nonce(&value, name)?;
     Ok(value)
 }
@@ -2393,6 +2416,29 @@ mod tests {
             assert!(validate_dw1e_e3b_full(Some(malformed), true).is_err());
         }
         assert!(validate_dw1e_e3b_full(Some("1"), false).is_err());
+    }
+
+    #[test]
+    fn wyr1d_selector_nonce_and_platform_without_dw1e_evidence_are_exact() {
+        let manifest = include_str!("../tooling/guest-harness.toml");
+        assert!(is_wyr1d_evidence_selector("native-console-streams"));
+        assert!(is_dw1e_platform_selector("native-console-streams"));
+        assert!(!is_dw1e_evidence_selector("native-console-streams"));
+        assert_eq!(
+            select_guest_test(true, Some("native-console-streams"), false, manifest),
+            Ok(Some(32))
+        );
+        for valid in ["0000000000000001", "0123456789ABCDEF", "FFFFFFFFFFFFFFFF"] {
+            assert!(validate_upper_nonzero_hex_nonce(valid, "WYR1D").is_ok());
+        }
+        for invalid in [
+            "0000000000000000",
+            "0123456789abcdef",
+            "0123456789ABCDE",
+            "G123456789ABCDEF",
+        ] {
+            assert!(validate_upper_nonzero_hex_nonce(invalid, "WYR1D").is_err());
+        }
     }
 
     fn required_dw1c_bootfs_pages_for_test(value: &str) -> Result<(), String> {

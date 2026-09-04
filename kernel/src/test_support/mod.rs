@@ -33,6 +33,20 @@
     all(deepwyrm_wyr1c_evidence, deepwyrm_dw1c_evidence),
     all(deepwyrm_wyr1c_evidence, deepwyrm_dw1d_evidence),
     all(
+        deepwyrm_wyr1d_evidence,
+        any(
+            deepwyrm_i1_evidence,
+            deepwyrm_wrcap_relay,
+            deepwyrm_wyr1_evidence,
+            deepwyrm_dw1b_evidence,
+            deepwyrm_wyr1b_evidence,
+            deepwyrm_dw1c_evidence,
+            deepwyrm_dw1d_evidence,
+            deepwyrm_wyr1c_evidence,
+            deepwyrm_dw1e_evidence
+        )
+    ),
+    all(
         deepwyrm_dw1e_evidence,
         any(
             deepwyrm_i1_evidence,
@@ -69,10 +83,17 @@ mod transport;
 mod wrcap;
 #[cfg(any(test, deepwyrm_wyr1_evidence))]
 mod wyr1_evidence;
-#[cfg(any(test, deepwyrm_wyr1b_evidence, deepwyrm_wyr1c_evidence))]
+#[cfg(any(
+    test,
+    deepwyrm_wyr1b_evidence,
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence
+))]
 mod wyr1b_evidence;
 #[cfg(any(test, deepwyrm_wyr1c_evidence))]
 mod wyr1c_evidence;
+#[cfg(any(test, deepwyrm_wyr1d_evidence))]
+mod wyr1d_evidence;
 
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 mod x86_64;
@@ -127,6 +148,8 @@ pub(crate) use wyr1_evidence::WYR1_EVIDENCE_RAW_SYSCALL;
 pub(crate) use wyr1b_evidence::WYR1B_EVIDENCE_RAW_SYSCALL;
 #[cfg(deepwyrm_wyr1c_evidence)]
 pub(crate) use wyr1c_evidence::WYR1C_EVIDENCE_RAW_SYSCALL;
+#[cfg(deepwyrm_wyr1d_evidence)]
+pub(crate) use wyr1d_evidence::WYR1D_EVIDENCE_RAW_SYSCALL;
 
 #[cfg(deepwyrm_dw1c_evidence)]
 #[allow(
@@ -152,7 +175,11 @@ pub(crate) use wyr1_evidence::{
 };
 
 #[cfg(all(
-    any(deepwyrm_wyr1b_evidence, deepwyrm_wyr1c_evidence),
+    any(
+        deepwyrm_wyr1b_evidence,
+        deepwyrm_wyr1c_evidence,
+        deepwyrm_wyr1d_evidence
+    ),
     target_arch = "x86_64",
     target_os = "none"
 ))]
@@ -170,6 +197,12 @@ pub(crate) use wyr1b_evidence::{
 pub(crate) use wyr1c_evidence::{
     WYR1C_EVIDENCE, WYR1C_EVIDENCE_RECORD_LEN, Wyr1cEvidenceError, Wyr1cEvidenceFlushError,
     Wyr1cEvidenceSubmit,
+};
+
+#[cfg(all(deepwyrm_wyr1d_evidence, target_arch = "x86_64", target_os = "none"))]
+pub(crate) use wyr1d_evidence::{
+    WYR1D_EVIDENCE, WYR1D_EVIDENCE_RECORD_LEN, WYR1D_READY_RECORD_LEN, Wyr1dEvidenceError,
+    Wyr1dEvidenceFlushError, Wyr1dEvidenceSubmit,
 };
 
 #[cfg(deepwyrm_i1_evidence)]
@@ -211,8 +244,12 @@ pub(crate) use x86_64::complete_wyr1_evidence;
 pub(crate) use x86_64::complete_wyr1b_evidence;
 #[cfg(all(deepwyrm_wyr1c_evidence, target_arch = "x86_64", target_os = "none"))]
 pub(crate) use x86_64::complete_wyr1c_evidence;
+#[cfg(all(deepwyrm_wyr1d_evidence, target_arch = "x86_64", target_os = "none"))]
+pub(crate) use x86_64::complete_wyr1d_evidence;
 #[cfg(all(deepwyrm_dw1e_evidence, target_arch = "x86_64", target_os = "none"))]
 pub(crate) use x86_64::emit_dw1e_e3a_ready;
+#[cfg(all(deepwyrm_wyr1d_evidence, target_arch = "x86_64", target_os = "none"))]
+pub(crate) use x86_64::emit_wyr1d_ready;
 #[cfg(all(
     deepwyrm_dw1e_evidence,
     not(deepwyrm_dw1e_e3b_full),

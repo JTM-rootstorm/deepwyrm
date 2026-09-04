@@ -334,7 +334,7 @@ fn selector27_private_wrb1_relay_is_exact_and_outside_public_abi() {
     assert!(build.contains("selector == \"bootstrap-registry-launch\""));
     assert!(build.contains("cargo:rustc-cfg=deepwyrm_wyr1b_evidence"));
     assert!(support.contains(
-        "#[cfg(any(test, deepwyrm_wyr1b_evidence, deepwyrm_wyr1c_evidence))]\nmod wyr1b_evidence;"
+        "#[cfg(any(\n    test,\n    deepwyrm_wyr1b_evidence,\n    deepwyrm_wyr1c_evidence,\n    deepwyrm_wyr1d_evidence\n))]\nmod wyr1b_evidence;"
     ));
     assert!(evidence.contains("pub(crate) const WYR1B_EVIDENCE_RAW_SYSCALL: u32 = 0xffff_ff1b;"));
     assert!(evidence.contains("WYR1B_EVIDENCE_RECORD_LEN: usize = 96"));
@@ -518,6 +518,51 @@ fn selector29_wrc6_restart_relay_is_private_bounded_and_atomic() {
         .find("completion_record(CompletionOutcome::Pass, 0)")
         .expect("selector-29 PASS exists");
     assert!(evidence_write < pass, "WRC6 must precede PASS DWTEST1");
+}
+
+#[test]
+fn selector32_wrd1_console_relay_is_private_bounded_joined_and_atomic() {
+    let root = kernel_root();
+    let build = fs::read_to_string(root.join("build.rs")).expect("read kernel build");
+    let support =
+        fs::read_to_string(root.join("src/test_support/mod.rs")).expect("read selector-32 support");
+    let evidence = fs::read_to_string(root.join("src/test_support/wyr1d_evidence.rs"))
+        .expect("read selector-32 evidence");
+    let terminal = fs::read_to_string(root.join("src/test_support/x86_64.rs"))
+        .expect("read selector-32 terminal");
+    let primordial = fs::read_to_string(root.join("src/arch/x86_64/mm/activation/primordial.rs"))
+        .expect("read primordial runtime");
+    let public_abi = fs::read_to_string(root.join("../abi/generated/deepwyrm_abi.rs"))
+        .expect("read generated ABI");
+
+    assert!(build.contains("selector == \"native-console-streams\""));
+    assert!(build.contains("deepwyrm_wyr1d_evidence"));
+    assert!(
+        build.contains("matches!(selector, \"q35-com2-interrupt\" | \"native-console-streams\")")
+    );
+    assert!(support.contains("mod wyr1d_evidence;"));
+    assert!(evidence.contains("WYR1D_EVIDENCE_RAW_SYSCALL: u32 = 0xffff_ff20"));
+    assert!(evidence.contains("WYR1D_EVIDENCE_RECORD_LEN: usize = 192"));
+    assert!(evidence.contains("WYR1D_EVIDENCE_RECORD_CAPACITY: usize = 12"));
+    assert!(evidence.contains("WYR1D_READY_RECORD_LEN: usize = 178"));
+    assert!(evidence.contains("b\"D5READY|\""));
+    assert!(evidence.contains("expected_observation_value"));
+    assert!(!public_abi.contains("ffff_ff20"));
+    assert!(primordial.contains("WYR1D_EVIDENCE\n            .authorize_submission(self.process)"));
+    assert!(primordial.contains("WYR1D_EVIDENCE\n            .observe_reporter_start"));
+    assert!(primordial.contains("WYR1D_EVIDENCE\n            .bind_reporter_after_retirement"));
+    assert!(primordial.contains("copy_wyr1d_evidence_input::<_, WYR1D_READY_RECORD_LEN>"));
+
+    let completion = terminal
+        .find("pub(crate) fn complete_wyr1d_evidence")
+        .expect("selector-32 terminal exists");
+    let evidence_write = terminal[completion..]
+        .find("write_evidence(record)")
+        .expect("WRD1 evidence write exists");
+    let pass = terminal[completion..]
+        .find("completion_record(CompletionOutcome::Pass, 0)")
+        .expect("selector-32 PASS exists");
+    assert!(evidence_write < pass, "WRD1 must precede PASS DWTEST1");
 }
 
 #[test]
