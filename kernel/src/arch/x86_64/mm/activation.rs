@@ -55,6 +55,9 @@ mod primordial_diagnostic;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[path = "activation/user_access.rs"]
 mod user_access;
+#[cfg(any(test, all(target_os = "none", deepwyrm_wyr1d_evidence)))]
+#[path = "activation/wyr1d_wait_geometry.rs"]
+mod wyr1d_wait_geometry;
 #[allow(
     unused_imports,
     reason = "I0 root-binding typestates are consumed by the integrated carrier and focused host models"

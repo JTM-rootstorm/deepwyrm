@@ -552,6 +552,12 @@ fn selector32_wrd1_console_relay_is_private_bounded_joined_and_atomic() {
     assert!(primordial.contains("WYR1D_EVIDENCE\n            .observe_reporter_start"));
     assert!(primordial.contains("WYR1D_EVIDENCE\n            .bind_reporter_after_retirement"));
     assert!(primordial.contains("copy_wyr1d_evidence_input::<_, WYR1D_READY_RECORD_LEN>"));
+    assert!(primordial.contains(
+        "#[cfg(deepwyrm_wyr1d_evidence)]\nconst WAITERS: usize = super::wyr1d_wait_geometry::WAITERS;"
+    ));
+    assert!(primordial.contains(
+        "#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]\nconst WAITERS: usize = 16;"
+    ));
 
     let completion = terminal
         .find("pub(crate) fn complete_wyr1d_evidence")

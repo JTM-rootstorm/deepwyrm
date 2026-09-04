@@ -307,12 +307,10 @@ const WAITERS: usize = 4;
 const WAITERS: usize = 6;
 #[cfg(deepwyrm_wyr1b_evidence)]
 const WAITERS: usize = 16;
-#[cfg(any(
-    deepwyrm_wyr1c_evidence,
-    deepwyrm_wyr1d_evidence,
-    deepwyrm_dw1e_evidence
-))]
+#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
 const WAITERS: usize = 16;
+#[cfg(deepwyrm_wyr1d_evidence)]
+const WAITERS: usize = super::wyr1d_wait_geometry::WAITERS;
 #[cfg(not(any(
     deepwyrm_i2_stress,
     deepwyrm_wrcap_relay,
@@ -613,8 +611,10 @@ const _: [(); 28] = [(); MEMORY_LEASES];
     deepwyrm_dw1e_evidence
 ))]
 const _: [(); 160] = [(); REGISTRY_OBJECTS];
-#[cfg(any(deepwyrm_dw1e_evidence, deepwyrm_wyr1d_evidence))]
+#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
 const _: [(); 16] = [(); WAITERS];
+#[cfg(deepwyrm_wyr1d_evidence)]
+const _: [(); 32] = [(); WAITERS];
 #[cfg(any(deepwyrm_dw1e_evidence, deepwyrm_wyr1d_evidence))]
 const _: [(); 2] = [(); TIMERS];
 #[cfg(any(deepwyrm_dw1e_evidence, deepwyrm_wyr1d_evidence))]

@@ -28,6 +28,38 @@ endpoint `(id, generation)` pair changes; a fresh ID can retain generation 1.
 Child-only replacement preserves the complete driver/raw-stream/console tuple,
 including the attach transaction, and advances only child generation.
 
+## Selector-local wait capacity
+
+Selector 32 uses 32 wait-registration slots. Selectors 29 and 31 retain 16.
+Each wait item consumes a slot, including duplicate views of one Channel in a
+single wait-many operation. The joined graph has a demonstrated lower bound
+of 20 simultaneous items: consoled 9, UART 3, devmgr 3, registryd at least 3,
+console-echo 1, and system-init's Timer 1. Queued stdin adds one consoled item,
+raising the lower bound to 21. This bound comes from the first-party product
+actor graph; it is not a numeric quota imported from external prior art.
+
+The selector-private geometry asserts that capacity covers the 21-item bound.
+Its host regression exercises the real WaitRegistry with six distinct blocked
+Thread generations and inert Channel lifetime pins standing in for the actors'
+wait sources. Both 20- and 21-item graphs exhaust a 16-slot registry and fit in
+32. Three successive generations verify exact cancellation, no leftover
+registrations, and final release of every source pin. This is a registration
+capacity test, not an execution of the userspace actors or IRQ/readiness path.
+The additional slots provide headroom; 21 is not claimed as a maximum across
+all recovery interleavings. Other resource budgets and the public ABI remain
+unchanged. This correction does not identify wait exhaustion as the cause of
+the early `AF010006` failure; the coordinator's frozen-A1 investigation caught
+a separate publication-generation mismatch before wait exhaustion.
+
+Validation of this capacity correction passed all 934 selector-32 kernel
+library tests, 35 entry/build contract tests, host library/test Clippy with
+warnings denied, formatting, and `git diff --check`. The accepted-toolchain
+freestanding checks passed selector 32, selector 29, and selector 31 in E3B
+full mode, with their existing 9, 25, and 13 unused-code warnings respectively.
+These checks used `tools/pinned-cargo` with isolated `.tmp/wait-budget-host`
+and `.tmp/wait-budget-target-{32,29,31}` output in the assigned worktree.
+No VM or security-gate result is claimed for this correction.
+
 ## Source disposition
 
 The active root D5 plan, Wyrmroot serial-stream contract section 9, Deepwyrm
