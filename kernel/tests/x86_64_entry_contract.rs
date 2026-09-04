@@ -521,6 +521,60 @@ fn selector29_wrc6_restart_relay_is_private_bounded_and_atomic() {
 }
 
 #[test]
+fn dw1e_q35_time_surface_is_selected_platform_only() {
+    let root = kernel_root();
+    let live = fs::read_to_string(root.join("src/time/live.rs")).expect("read live time source");
+    for item in [
+        "static Q35_BSP_RETIREMENT_REQUEST",
+        "pub(crate) fn q35_bsp_vector_is_clear",
+        "pub(crate) fn q35_current_cpu_is_bsp",
+        "pub(crate) fn publish_q35_bsp_retirement_check",
+        "pub(crate) fn notify_q35_bsp_retirement_check",
+        "pub(crate) fn request_q35_bsp_terminal_check",
+        "pub(crate) fn pending_q35_bsp_retirement_check",
+        "pub(crate) fn complete_q35_bsp_retirement_check",
+    ] {
+        assert!(
+            live.contains(&format!("#[cfg(deepwyrm_dw1e_platform)]\n{item}")),
+            "q35 time item escaped the selected platform cfg: {item}"
+        );
+    }
+
+    let time = fs::read_to_string(root.join("src/time/mod.rs")).expect("read time module");
+    let gate = r#"#[cfg(all(target_os = "none", target_arch = "x86_64", deepwyrm_dw1e_platform))]
+#[allow(
+    unused_imports,
+    reason = "DW1-E q35 runtime exports exist only in the selected platform product"
+)]"#;
+    let exports = time
+        .split_once(gate)
+        .expect("selected q35 time export gate")
+        .1
+        .split_once("};")
+        .expect("selected q35 time export extent")
+        .0;
+    for export in [
+        "complete_q35_bsp_retirement_check",
+        "notify_q35_bsp_retirement_check",
+        "pending_q35_bsp_retirement_check",
+        "publish_q35_bsp_retirement_check",
+        "q35_bsp_vector_is_clear",
+        "q35_current_cpu_is_bsp",
+        "request_q35_bsp_terminal_check",
+    ] {
+        assert!(
+            exports.contains(export),
+            "missing gated q35 export: {export}"
+        );
+        assert_eq!(
+            time.matches(export).count(),
+            1,
+            "q35 export leaked outside its selected platform group: {export}"
+        );
+    }
+}
+
+#[test]
 fn i1_evidence_nonce_is_build_owned_and_strict() {
     assert!(kernel_build::validate_i1_evidence_nonce("0123456789ABCDEF").is_ok());
     for nonce in [

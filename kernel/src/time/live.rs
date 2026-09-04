@@ -58,6 +58,7 @@ const XAPIC_EOI_REGISTER: u32 = 0x0b0;
 /// after EOI and before it takes the time lock, so one delivery may safely
 /// cover any number of mutations already visible through that lock.
 static BSP_TIMER_SERVICE: TimerServiceSignal = TimerServiceSignal::new();
+#[cfg(deepwyrm_dw1e_platform)]
 static Q35_BSP_RETIREMENT_REQUEST: IrqSpinMutex<crate::device::Q35BspRetirementCarrier> =
     IrqSpinMutex::new(crate::device::Q35BspRetirementCarrier::new());
 static AP_SCHEDULER_TIMER_MASKED: [AtomicBool; CPU_CAPACITY] =
@@ -519,6 +520,7 @@ fn with_bootstrap_local_apic<T>(
 /// Performs DW1-E2C's ordered CPU0 IRR/ISR observation for vector `0x30`.
 /// Callers must already have proved the IOAPIC route masked and Delivery
 /// Status idle; this helper rejects execution on every non-bootstrap CPU.
+#[cfg(deepwyrm_dw1e_platform)]
 pub(crate) fn q35_bsp_vector_is_clear() -> Result<bool, LiveTimeError> {
     with_bootstrap_local_apic(|controller, registers| {
         let state = controller
@@ -528,6 +530,7 @@ pub(crate) fn q35_bsp_vector_is_clear() -> Result<bool, LiveTimeError> {
     })
 }
 
+#[cfg(deepwyrm_dw1e_platform)]
 pub(crate) fn q35_current_cpu_is_bsp() -> Result<bool, LiveTimeError> {
     Ok(installed_current_cpu_index()? == CpuIndex::BOOTSTRAP)
 }
@@ -535,6 +538,7 @@ pub(crate) fn q35_current_cpu_is_bsp() -> Result<bool, LiveTimeError> {
 /// Publishes the exact q35 retirement token without notifying CPU0. The q35
 /// source remains in `Publishing` until this durable store succeeds, so a
 /// concurrent CPU0 retry cannot release the generation ahead of publication.
+#[cfg(deepwyrm_dw1e_platform)]
 pub(crate) fn publish_q35_bsp_retirement_check(
     request: crate::device::Q35BspCheckRequest,
 ) -> Result<(), LiveTimeError> {
@@ -547,6 +551,7 @@ pub(crate) fn publish_q35_bsp_retirement_check(
 /// Notifies CPU0 only after the q35 source and carrier both expose the same
 /// Published token. A failed notification leaves that durable token pending
 /// for the next ordinary CPU0 carrier safe point.
+#[cfg(deepwyrm_dw1e_platform)]
 pub(crate) fn notify_q35_bsp_retirement_check(
     _request: crate::device::Q35BspCheckRequest,
 ) -> Result<(), LiveTimeError> {
@@ -564,6 +569,7 @@ pub(crate) fn notify_q35_bsp_retirement_check(
 /// Terminal freeze is selector-private work, not Interrupt retirement. Its
 /// exact state remains in the q35 source/evidence authorities; e1 is only a
 /// remote wake and never occupies the retirement carrier.
+#[cfg(deepwyrm_dw1e_platform)]
 pub(crate) fn request_q35_bsp_terminal_check(
     _request: crate::device::Q35BspCheckRequest,
 ) -> Result<(), LiveTimeError> {
@@ -578,6 +584,7 @@ pub(crate) fn request_q35_bsp_terminal_check(
         .map_err(|_| LiveTimeError::IpiTransport)
 }
 
+#[cfg(deepwyrm_dw1e_platform)]
 pub(crate) fn pending_q35_bsp_retirement_check()
 -> Result<Option<crate::device::Q35BspCheckRequest>, LiveTimeError> {
     if installed_current_cpu_index()? != CpuIndex::BOOTSTRAP {
@@ -586,6 +593,7 @@ pub(crate) fn pending_q35_bsp_retirement_check()
     Ok(Q35_BSP_RETIREMENT_REQUEST.lock().pending())
 }
 
+#[cfg(deepwyrm_dw1e_platform)]
 pub(crate) fn complete_q35_bsp_retirement_check(
     request: crate::device::Q35BspCheckRequest,
 ) -> Result<(), LiveTimeError> {

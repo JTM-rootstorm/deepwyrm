@@ -54,11 +54,8 @@ pub(crate) use live::{
     DeadlineRegistrationFailure, DeadlineWakeTarget, LiveTimeError, LiveTimerDeadlineAuthority,
     TimerExpiryTarget, ap_scheduler_timer_is_masked, arm_scheduler_quantum,
     bind_deadline_wake_target, bind_timer_expiry_target, bsp_local_apic_identity,
-    busy_wait_nanoseconds, cancel_deadline, cancel_scheduler_quantum,
-    complete_q35_bsp_retirement_check, initialize, initialize_ap_local_apic, monotonic_now,
-    notify_q35_bsp_retirement_check, pending_q35_bsp_retirement_check,
-    publish_q35_bsp_retirement_check, q35_bsp_vector_is_clear, q35_current_cpu_is_bsp,
-    register_deadline, request_q35_bsp_terminal_check, send_bsp_ipi,
+    busy_wait_nanoseconds, cancel_deadline, cancel_scheduler_quantum, initialize,
+    initialize_ap_local_apic, monotonic_now, register_deadline, send_bsp_ipi,
     service_current_rendezvous_latch, service_current_scheduler_quantum_deadline,
     timer_service_is_healthy,
 };
@@ -70,4 +67,14 @@ pub(crate) use live::{
 pub(crate) use live::{
     F3TargetProbe, F8TargetTimerProbe, calibrated_apic_timer_hz, run_target_deadline_probe,
     run_target_timer_probe,
+};
+#[cfg(all(target_os = "none", target_arch = "x86_64", deepwyrm_dw1e_platform))]
+#[allow(
+    unused_imports,
+    reason = "DW1-E q35 runtime exports exist only in the selected platform product"
+)]
+pub(crate) use live::{
+    complete_q35_bsp_retirement_check, notify_q35_bsp_retirement_check,
+    pending_q35_bsp_retirement_check, publish_q35_bsp_retirement_check, q35_bsp_vector_is_clear,
+    q35_current_cpu_is_bsp, request_q35_bsp_terminal_check,
 };
