@@ -486,6 +486,9 @@ pub(crate) fn complete_wyr1d_evidence(
     if !claim_wyr1d_terminal(WYR1D_TERMINAL_SUCCESS) {
         halt_after_completion()
     }
+    // SAFETY: this function exists only in the centrally selected
+    // `native-console-streams` QEMU test image. Its verified handoff profile
+    // supplies `isa-debug-exit`; it is not a production or physical image.
     let mut transport = unsafe { QemuCompletionTransport::new() };
     let Ok(transaction) = begin_test_serial_transaction() else {
         halt_after_completion()
@@ -610,6 +613,9 @@ fn complete_wyr1d_failure_terminal(outcome: CompletionOutcome, detail: u32) -> !
     if !claim_wyr1d_terminal(2) {
         halt_after_completion()
     }
+    // SAFETY: this function exists only in the centrally selected
+    // `native-console-streams` QEMU test image. Its verified handoff profile
+    // supplies `isa-debug-exit`; it is not a production or physical image.
     let mut transport = unsafe { QemuCompletionTransport::new() };
     let Ok(transaction) = begin_test_serial_transaction() else {
         halt_after_completion()
