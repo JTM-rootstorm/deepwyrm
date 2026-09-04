@@ -1174,12 +1174,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn synchronize_scheduler_current_detached(&mut self) {
-        let prepared = {
-            let mut runtime = self.runtime.lock();
-            runtime.switch_cpu(self.cpu);
-            runtime.prepare_scheduler_root_switch()
-        };
-        self.finish_scheduler_root_switch_detached(prepared);
+        if !self.synchronize_scheduler_current_at_safe_point_detached() {
+            crate::arch::x86_64::syscall::handoff_current_rendezvous_from_carrier()
+        }
     }
 
     fn finish_scheduler_root_switch_detached(
@@ -1224,7 +1221,37 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     );
                     None
                 }
-                None => runtime.prepare_scheduler_root_switch(),
+                None => match runtime
+                    .shared
+                    .execution
+                    .terminal_scheduler_current_on(&runtime.tasks, self.cpu)
+                    .unwrap_or_else(|error| {
+                        panic!("scheduler-current terminal state lookup failed: {error:?}")
+                    }) {
+                    Some(terminal) => {
+                        assert_eq!(
+                            terminal, runtime.thread,
+                            "remote-stop completion found another terminal scheduler current"
+                        );
+                        let owner =
+                            runtime
+                                .tasks
+                                .thread_process(terminal)
+                                .unwrap_or_else(|error| {
+                                    panic!("terminal scheduler-current lost its Process: {error:?}")
+                                });
+                        let active_root = runtime.active_root.as_ref().unwrap_or_else(|| {
+                            panic!("remote-stop completion lost the terminal caller Process root")
+                        });
+                        assert_eq!(
+                            active_root.process(),
+                            owner,
+                            "remote-stop completion retained another Process root"
+                        );
+                        None
+                    }
+                    None => runtime.prepare_scheduler_root_switch(),
+                },
             }
         };
         self.finish_scheduler_root_switch_detached(prepared);
@@ -1249,10 +1276,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             if runtime
                 .shared
                 .execution
-                .terminal_stop_publication_pending_on(&runtime.tasks, self.cpu)
+                .terminal_scheduler_current_on(&runtime.tasks, self.cpu)
                 .unwrap_or_else(|error| {
                     panic!("scheduler-current terminal state lookup failed: {error:?}")
                 })
+                .is_some()
             {
                 drop(runtime);
                 core::hint::spin_loop();

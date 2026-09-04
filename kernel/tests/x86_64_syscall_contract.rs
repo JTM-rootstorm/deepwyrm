@@ -761,10 +761,80 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
     let prepare = post_ack_helper
         .find(".prepare_scheduler_root_switch()")
         .unwrap();
-    assert!(suspended < physical && physical < prepare);
-    assert!(!post_ack_helper.contains("current_thread_on(self.cpu)"));
+    let terminal = post_ack_helper
+        .find(".terminal_scheduler_current_on(&runtime.tasks, self.cpu)")
+        .unwrap();
+    let terminal_owner = post_ack_helper.find("terminal, runtime.thread").unwrap();
+    let process_root = post_ack_helper.find("active_root.process(),").unwrap();
+    assert!(suspended < physical && physical < terminal && terminal < terminal_owner);
+    assert!(terminal_owner < process_root && process_root < prepare);
     assert!(post_ack_helper.contains("None => runtime.prepare_scheduler_root_switch(),"));
     assert!(!post_ack_helper.contains("lost its physical scheduler claim"));
+}
+
+#[test]
+fn i1_detached_scheduler_sync_honors_terminal_stop_publication() {
+    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let live = source("src/arch/x86_64/syscall/live.rs");
+    let syscall = source("src/arch/x86_64/syscall.rs");
+
+    let detached = runtime
+        .split_once("fn synchronize_scheduler_current_detached(&mut self)")
+        .expect("detached scheduler synchronization")
+        .1
+        .split_once("fn finish_scheduler_root_switch_detached(")
+        .expect("detached scheduler synchronization boundary")
+        .0;
+    assert!(detached.contains("self.synchronize_scheduler_current_at_safe_point_detached()"));
+    assert!(
+        detached
+            .contains("crate::arch::x86_64::syscall::handoff_current_rendezvous_from_carrier()")
+    );
+    assert!(!detached.contains("runtime.prepare_scheduler_root_switch()"));
+    assert_eq!(
+        runtime
+            .matches("self.synchronize_scheduler_current_detached();")
+            .count(),
+        3,
+        "every detached scheduler-root entry must share Stop arbitration"
+    );
+
+    let safe = runtime
+        .split_once("fn synchronize_scheduler_current_at_safe_point_detached(")
+        .expect("safe-point scheduler synchronization")
+        .1
+        .split_once("fn with_synchronized_runtime_at_safe_point")
+        .expect("safe-point scheduler synchronization boundary")
+        .0;
+    let mailbox = safe
+        .find("take_current_notification_at_safe_point()")
+        .expect("preparation-time Stop arbitration");
+    let barrier = safe
+        .find("terminal_scheduler_current_on(&runtime.tasks, self.cpu)")
+        .expect("terminal Stop publication barrier");
+    let prepare = safe
+        .find("runtime.prepare_scheduler_root_switch()")
+        .expect("scheduler-root preparation");
+    assert!(mailbox < barrier && barrier < prepare);
+
+    let handoff = live
+        .split_once("pub(crate) fn handoff_current_rendezvous_from_carrier() -> !")
+        .expect("detached carrier rendezvous handoff")
+        .1
+        .split_once("/// Called by the CPL3-origin e1 assembly boundary")
+        .expect("detached carrier rendezvous handoff boundary")
+        .0;
+    let take = handoff
+        .find("take_current_notification_at_safe_point()")
+        .expect("exact Stop acquisition");
+    let stage = handoff
+        .find("stage_rendezvous_action(RendezvousAction(request))")
+        .expect("exact Stop staging");
+    let pivot = handoff
+        .find("handoff_to_rendezvous_reaper(core::ptr::null_mut())")
+        .expect("dedicated reaper pivot");
+    assert!(take < stage && stage < pivot);
+    assert!(syscall.contains("handoff_current_rendezvous_from_carrier"));
 }
 
 #[test]
@@ -1983,11 +2053,11 @@ fn dw1c1_root_switches_are_move_only_prepare_execute_commit_transactions() {
     assert!(primordial.contains("fn cancel_ap_kernel_root_entry("));
 
     let detached = primordial
-        .split_once("fn synchronize_scheduler_current_detached")
-        .expect("detached scheduler root switch")
+        .split_once("fn synchronize_scheduler_current_at_safe_point_detached")
+        .expect("safe-point detached scheduler root switch")
         .1
-        .split_once("fn enter_ap_kernel_root_detached")
-        .expect("AP kernel-root entry boundary")
+        .split_once("fn with_synchronized_runtime_at_safe_point")
+        .expect("safe-point scheduler root switch boundary")
         .0;
     let prepare = detached
         .find("runtime.prepare_scheduler_root_switch()")

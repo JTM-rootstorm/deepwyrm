@@ -644,12 +644,12 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         }
     }
 
-    /// Detects the narrow terminal-preparation window in which TaskAuthority
-    /// has detached the scheduler-current Thread's execution resources but
-    /// the initiator has not yet published that Thread's exact remote Stop.
-    /// Runtime entry must wait for the mailbox instead of consulting the
-    /// detached stack/context tuple.
-    pub(crate) fn terminal_stop_publication_pending_on<
+    /// Returns the scheduler-current Thread after TaskAuthority has made it
+    /// terminal and detached its execution resources. A remote target must
+    /// wait for its exact Stop publication before root synchronization; the
+    /// local terminal initiator instead retains its active root until the
+    /// prepared terminal handoff completes.
+    pub(crate) fn terminal_scheduler_current_on<
         const GROUPS: usize,
         const PROCESSES: usize,
         const THREADS: usize,
@@ -658,19 +658,19 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         &self,
         tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         cpu: SchedulerCpuId,
-    ) -> Result<bool, super::TaskError> {
+    ) -> Result<Option<ThreadKey>, super::TaskError> {
         let Some(thread) = self.current_thread_on(cpu) else {
-            return Ok(false);
+            return Ok(None);
         };
         if tasks.thread_execution_resources(thread)?.is_some() {
-            return Ok(false);
+            return Ok(None);
         }
         assert_eq!(
             tasks.thread_info(thread)?.state,
             deepwyrm_abi::DW_TASK_STATE_EXITED,
             "live scheduler-current Thread lost its execution resources"
         );
-        Ok(true)
+        Ok(Some(thread))
     }
 
     pub(crate) fn schedule_next_on(

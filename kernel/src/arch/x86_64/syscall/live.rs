@@ -1089,6 +1089,22 @@ fn handoff_to_rendezvous_reaper(context: *mut ()) -> ! {
     }
 }
 
+/// Pivots a detached carrier entry onto the dedicated rendezvous reaper after
+/// scheduler synchronization observes an exact remote Stop. Detached entries
+/// have no syscall/timer frame to return through, so they must consume the
+/// same stationary mailbox authority directly and abandon their carrier stack.
+pub(crate) fn handoff_current_rendezvous_from_carrier() -> ! {
+    match crate::arch::x86_64::idle::take_current_notification_at_safe_point() {
+        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request) => {
+            stage_rendezvous_action(RendezvousAction(request)).unwrap_or_else(|_| halt_forever());
+            handoff_to_rendezvous_reaper(core::ptr::null_mut())
+        }
+        crate::arch::x86_64::rendezvous::MailboxNotification::None
+        | crate::arch::x86_64::rendezvous::MailboxNotification::Wake
+        | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => halt_forever(),
+    }
+}
+
 /// Called by the CPL3-origin e1 assembly boundary after EOI/latch and before
 /// GS restoration/IRET. Zero permits return; one enters the dedicated reaper.
 #[allow(

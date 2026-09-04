@@ -197,10 +197,7 @@ fn authorized_process_termination_waits_for_exact_remote_stop_ack() {
     );
     assert_eq!(domain.schedule_next_on(cpu1).unwrap().current, Some(remote));
     let remote_claim = domain.running_claim_on(cpu1).unwrap();
-    assert_eq!(
-        domain.terminal_stop_publication_pending_on(&tasks, cpu1),
-        Ok(false)
-    );
+    assert_eq!(domain.terminal_scheduler_current_on(&tasks, cpu1), Ok(None));
 
     let effects = tasks
         .terminate_process_authorized(&mut registry, process, 0x707)
@@ -218,8 +215,12 @@ fn authorized_process_termination_waits_for_exact_remote_stop_ack() {
         DW_TERMINATION_AUTHORIZED
     );
     assert_eq!(
-        domain.terminal_stop_publication_pending_on(&tasks, cpu1),
-        Ok(true)
+        domain.terminal_scheduler_current_on(&tasks, cpu0),
+        Ok(Some(current))
+    );
+    assert_eq!(
+        domain.terminal_scheduler_current_on(&tasks, cpu1),
+        Ok(Some(remote))
     );
 
     // Authorized termination may not remove a remote Running owner directly:
@@ -231,10 +232,7 @@ fn authorized_process_termination_waits_for_exact_remote_stop_ack() {
     domain.complete_switch_on(remote_suspended).unwrap();
     assert_eq!(domain.suspended_claim_on(cpu1), None);
     assert_eq!(domain.scheduler_state(remote), None);
-    assert_eq!(
-        domain.terminal_stop_publication_pending_on(&tasks, cpu1),
-        Ok(false)
-    );
+    assert_eq!(domain.terminal_scheduler_current_on(&tasks, cpu1), Ok(None));
 
     let (retired, deferred) = domain.retire_exit_pins_defer_current_after_remote_stops_on(
         cpu0,
