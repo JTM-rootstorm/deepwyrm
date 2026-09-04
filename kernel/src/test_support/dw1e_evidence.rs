@@ -2892,6 +2892,22 @@ mod tests {
         assert!(transaction < transcript);
         assert!(transcript < pass);
 
+        let serial_completion = completion
+            .split("fn write_serial_record(")
+            .nth(1)
+            .unwrap()
+            .split("fn write_debug_exit(")
+            .next()
+            .unwrap();
+        assert!(serial_completion.contains("deepwyrm_dw1e_evidence"));
+        let held_transaction = serial_completion
+            .find("if let Some(transaction) = self.transaction.as_mut()")
+            .unwrap();
+        let unlocked_fallback = serial_completion
+            .find("emit_early_raw_record(record)")
+            .unwrap();
+        assert!(held_transaction < unlocked_fallback);
+
         assert!(completion.contains("static DW1E_TERMINAL_OWNER: super::Dw1eTerminalArbiter ="));
         assert!(full.contains("claim_dw1e_terminal(DW1E_TERMINAL_SUCCESS)"));
         let failure = completion

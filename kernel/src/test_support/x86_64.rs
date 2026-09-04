@@ -207,6 +207,7 @@ impl CompletionTransport for QemuCompletionTransport {
             deepwyrm_wyr1b_evidence,
             deepwyrm_dw1c_evidence,
             deepwyrm_dw1d_evidence,
+            deepwyrm_dw1e_evidence,
             deepwyrm_wyr1c_evidence
         ))]
         if let Some(transaction) = self.transaction.as_mut() {
