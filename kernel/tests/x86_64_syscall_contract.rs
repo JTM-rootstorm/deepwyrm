@@ -992,13 +992,16 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
     assert!(activation.contains(
         "#[cfg(deepwyrm_wyr1b_evidence)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;"
     ));
+    assert!(activation.contains(
+        "#[cfg(deepwyrm_wyr1d_evidence)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;"
+    ));
     assert!(
         activation.contains(
             "#[cfg(deepwyrm_dw1e_evidence)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;"
         )
     );
     assert!(runtime.contains(
-        "#[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]\nconst _: () = assert!(super::LIVE_ADDRESS_SPACE_CAPACITY >= USERSPACE_CHAIN_PROCESSES);"
+        "#[cfg(any(\n    deepwyrm_wyr1c_evidence,\n    deepwyrm_wyr1d_evidence,\n    deepwyrm_dw1e_evidence\n))]\nconst _: () = assert!(super::LIVE_ADDRESS_SPACE_CAPACITY >= USERSPACE_CHAIN_PROCESSES);"
     ));
     assert!(
         runtime.contains(
@@ -1048,16 +1051,18 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
 }
 
 #[test]
-fn dw1e_live_selector_provisions_overlapping_control_and_temt_timers() {
+fn live_uart_selectors_provision_overlapping_control_and_temt_timers() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
 
     assert!(runtime.contains(
-        "#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_dw1e_evidence)))]\nconst TIMERS: usize = 1;"
+        "#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_dw1e_evidence, deepwyrm_wyr1d_evidence)))]\nconst TIMERS: usize = 1;"
     ));
     assert!(runtime.contains(
-        "#[cfg(any(deepwyrm_i2_stress, deepwyrm_dw1e_evidence))]\nconst TIMERS: usize = 2;"
+        "#[cfg(any(deepwyrm_i2_stress, deepwyrm_dw1e_evidence, deepwyrm_wyr1d_evidence))]\nconst TIMERS: usize = 2;"
     ));
-    assert!(runtime.contains("#[cfg(deepwyrm_dw1e_evidence)]\nconst _: [(); 2] = [(); TIMERS];"));
+    assert!(runtime.contains(
+        "#[cfg(any(deepwyrm_dw1e_evidence, deepwyrm_wyr1d_evidence))]\nconst _: [(); 2] = [(); TIMERS];"
+    ));
 }
 
 #[test]
