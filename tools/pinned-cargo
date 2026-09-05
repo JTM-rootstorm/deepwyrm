@@ -7,7 +7,7 @@ Usage: tools/pinned-cargo <lane> <cargo-args...>
 
 Lanes:
   target  Accepted Wyrmroot 1.97.1/a92dc7f7 product and freestanding builds.
-  host    Pinned stable 1.97.1 tests, Clippy, rustdoc, formatting, and xtask.
+  host    Pinned stable 1.98.1 tests, Clippy, rustdoc, formatting, and xtask.
 
 Each lane owns a pinned target directory beneath deepwyrm/.tmp so repeated
 commands reuse compatible artifacts. DEEPWYRM_PINNED_TARGET_DIR may select an

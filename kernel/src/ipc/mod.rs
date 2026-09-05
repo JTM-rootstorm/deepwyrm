@@ -118,6 +118,10 @@ struct PayloadSlot {
     bytes: [u8; PAYLOAD_BYTES],
 }
 
+#[allow(
+    clippy::large_const_arrays,
+    reason = "Copied const initializer for the statically allocated payload pool."
+)]
 const EMPTY_PAYLOAD_SLOT: PayloadSlot = PayloadSlot {
     generation: 0,
     in_use: false,

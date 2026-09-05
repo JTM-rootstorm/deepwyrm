@@ -1,6 +1,9 @@
 # Deepwyrm Rust toolchain lanes
 
-Deepwyrm has two repository-owned Cargo lanes. Always invoke Cargo through
+Deepwyrm has two repository-owned Cargo lanes. Run from the selected Deepwyrm
+checkout: the launcher verifies offline metadata in the caller's working
+directory, so invoking it from the coordination root fails before compilation.
+Always invoke Cargo through
 `tools/pinned-cargo`; do not call an ambient `cargo`, export `CARGO_HOME`, or
 reuse the repository's canonical `target/` directory.
 
@@ -17,12 +20,17 @@ supplies the regular, non-symlink `.tmp/cargo-home/offline-v1` and the immutable
 worktree-parent caches or weaken the wrapper's identity checks. Keep mutable
 target output lane-local with `DEEPWYRM_PINNED_TARGET_DIR`.
 
-The `host` lane is stable Rust 1.97.1 for host tests, Clippy, rustdoc,
+The `host` lane is stable Rust 1.98.1 for host tests, Clippy, rustdoc,
 formatting, and host tooling:
 
 ```sh
 tools/pinned-cargo host test --locked --workspace
 ```
+
+The installed host package must include matching `rust-src` and
+`rust-analyzer` components as well as Clippy and rustfmt. All component hashes
+remain mandatory; an incomplete host update is an installation blocker, not
+permission to skip identity checks or substitute the accepted guest compiler.
 
 Host `build`, `check`, `clippy`, and `rustdoc` commands must select only
 `--lib`, `--tests`, `--test`, or `--doc` targets. Implicit workspace targets,

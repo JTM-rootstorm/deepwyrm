@@ -88,7 +88,7 @@ fn host_lane_owns_the_project_cargo_home() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("cargo 1.97.1"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("cargo 1.98.1"));
     std::fs::remove_dir_all(&target).expect("remove test-owned target lane");
 
     let output = Command::new(workspace().join("tools/pinned-cargo"))
@@ -337,10 +337,10 @@ fn canonical_invocation_owns_a_reusable_lane_target() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("cargo 1.97.1"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("cargo 1.98.1"));
     assert!(
         workspace()
-            .join(".tmp/cargo-target/host-1.97.1/.deepwyrm-pinned-cargo-v1")
+            .join(".tmp/cargo-target/host-1.98.1/.deepwyrm-pinned-cargo-v1")
             .is_file()
     );
 }

@@ -390,12 +390,10 @@ impl Sha256 {
                 return Ok(());
             }
         }
-        let mut chunks = input.chunks_exact(64);
-        for chunk in &mut chunks {
-            let block: &[u8; 64] = chunk.try_into().expect("exact SHA-256 block");
+        let (blocks, remainder) = input.as_chunks::<64>();
+        for block in blocks {
             sha256_compress(&mut self.state, block);
         }
-        let remainder = chunks.remainder();
         self.tail[..remainder.len()].copy_from_slice(remainder);
         self.tail_len = remainder.len();
         Ok(())

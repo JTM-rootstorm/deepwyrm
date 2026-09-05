@@ -262,10 +262,10 @@ fn mapper_initializes_every_byte_before_architecture_role_publication() {
     mapper
         .initialize_allocation(&roles, &allocation, &source)
         .unwrap();
-    for (index, bytes) in source.chunks_exact(8).enumerate() {
+    for (index, bytes) in source.as_chunks::<8>().0.iter().enumerate() {
         assert_eq!(
             mapper.backend.entries.get(&(0x8000, index)),
-            Some(&u64::from_le_bytes(bytes.try_into().unwrap()))
+            Some(&u64::from_le_bytes(*bytes))
         );
     }
     assert_eq!(mapper.backend.entries.get(&(0x4000, 0)), Some(&0));

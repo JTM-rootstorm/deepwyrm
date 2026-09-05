@@ -410,8 +410,8 @@ impl<'a, B: TransitionScratchBackend> TransitionScratchMapper<'a, B> {
     ) -> Result<(), TransitionScratchError<B::Error>> {
         debug_assert_eq!(source.len(), PAGE_SIZE as usize);
         self.with_frame(frame, |backend| {
-            for (index, bytes) in source.chunks_exact(8).enumerate() {
-                backend.write_window_u64(index, u64::from_le_bytes(bytes.try_into().unwrap()));
+            for (index, bytes) in source.as_chunks::<8>().0.iter().enumerate() {
+                backend.write_window_u64(index, u64::from_le_bytes(*bytes));
             }
         })
     }

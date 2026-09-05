@@ -248,7 +248,7 @@ impl<'a> Elf<'a> {
             symbols.size as usize,
             "symbol table",
         );
-        for entry in symbols_bytes.chunks_exact(ELF64_SYMBOL_SIZE) {
+        for entry in symbols_bytes.as_chunks::<ELF64_SYMBOL_SIZE>().0 {
             if string_at(strings, u32_at(entry, 0) as usize, "symbol name") == expected {
                 return Symbol {
                     section_index: u16_at(entry, 6),
