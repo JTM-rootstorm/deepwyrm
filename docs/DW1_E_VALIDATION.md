@@ -367,3 +367,68 @@ a console, consoled, a shell or real `wyrmsh`; physical-hardware support;
 general IOAPIC routing or allocation; MSI/MSI-X; balanced IRQ steering; a
 POSIX TTY/fd layer; WYR1-D completion; the final WYR1 security gate; or DW1
 completion. No repository was pushed, tagged, signed or published.
+
+## WYR1-D6 exact-current regression addendum
+
+**Accepted:** 2026-09-04 (America/Chicago). This addendum preserves the
+historical DW1-E closure above and records the later compatible regression
+pair: Deepwyrm `784adb253ff4c0065b8b85e05b938f374a139e96` / Wyrmroot
+`f95262f832f0efbe42cf9359462bca261a6a5b58`. The generated ABI revision/tree
+and Rust revision remain those recorded above. Publication commits are
+documentation-only descendants, not replacement frozen source identities.
+
+All WYR1-D6 gates pass: selector31 and32 UP/SMP; selector30 one-vCPU smoke
+and four-vCPU coexist; selector29 UP/SMP; selector28's six-run SMP campaign;
+and selector27's canonical one-vCPU registry/launch run. Actual normal and
+degraded selector25 products retain stub consoled, so their conditional D6
+live gate is not triggered. The full product/receipt matrix and independent
+raw audits are in [Wyrmroot's WYR1-D validation](../../wyrmroot/Plans/WYR1_D_VALIDATION.md).
+
+The fresh accepted selector31 pair is
+`../../artifacts/wyr1d6-20260904-a2/s31`, evidence nonce
+`D600000000000111`, challenge nonces `D600000000000112` and
+`D600000000000113`.
+
+| Item | SHA-256 |
+| --- | --- |
+| request | `53bb5cd2afd6ce65bf4389928263b3386eb3469523ffe509160f824a8d0ca35b` |
+| pair result | `0d8107b0a99708d34e2a82b659958217fb481e01f2806248ecb7e666c73a2dbf` |
+| kernel and symbols | `642bcbfd9eb1a7be2367384434b9e79f5ff7feade0b37cccd32b1f357d15e36e` |
+| bootfs | `85fbda805efe87a36cb8b127d620e268662352dd213647008220f9d6e2bfc284` |
+| ESP | `e76d26363ac9e640d6fec6e1e2f207d663e090b48b022038ba8e95787e6d6d27` |
+| UP certificate | `353327a51b51d211d3ad590831193e54d3c5712c46420f2e8c9af63bee7cbccc` |
+| SMP certificate | `775ded79eab8206d6afee042c45a0eb4176a0e8e96e274b8ef0909f74946bf3e` |
+| COM2 both profiles | `e4d6c1b04f9edb207cdff315e64781a967774885f7f5b246a097f886c5832bf0` |
+| UP observed-send audit | `62feef09b96a6a7d34c86bc97612f425c6376e08c0dc6052554bbd4a6a421738` |
+| SMP observed-send audit | `fc43a03dba94b7f5023aa5eca67e36b8bd64291a14b45c2e5e8c4217ec0fefac` |
+
+Each profile has all 26 ordered DWE3E1 records, both readiness/generation joins,
+two observed 24-byte sends, both exact responses, valid accounting and
+`DWTEST1 31 0`. Full raw COM1 includes the host's exact closing CRLF; it is
+retained in the raw hashes, not treated as guest certificate content.
+
+D6's kernel deltas are comment/test-only: `31fa345` adds two local SAFETY
+proofs for selector32 completion calls; `784adb2` repairs stale cfg/source
+tests and adds the exact selector32 capacity assertion. Final kernel gates
+pass: 1116 workspace tests (4 accepted ignores), 934 selector32 and 936 selector31
+library tests, ABI drift, formatting, warnings-denied workspace Clippy and
+target31/32/29 checks (13/9/25 existing target warnings respectively).
+
+The initial a1 selector31 pair's SMP capture failed on a 28/38-byte terminal
+fragment. Its evidence is preserved, not promoted. Broad host-reader review
+repaired complete-frame guards, independent response/readiness and EOF
+ordering, and exact libvirt12.0.0 footer handling in root `e78f087` and
+`77f5ca4`. Root 222 tests pass; the fresh pair above replaces that failed attempt.
+No guest runtime fix was needed during D6.
+
+The exact scoped Daybreak review is recorded in
+[`WYR1D_D6_BOUNDARY_REVIEW.md`](../../validations/WYR1D_D6_BOUNDARY_REVIEW.md).
+The final leased VM audit confirmed shutdown and the same baseline XML hash
+above; the lease is released and test COM2 sockets are absent. All registered
+worker lanes are retired; the pre-existing unregistered
+`.worktrees/deepwyrm/.tmp` is preserved and remains the sole strict-audit
+exception. No push, signing, tag or external publication occurred.
+
+WYR1-D's native byte-transport seam is now accepted and released to WYR1-E.
+This does not claim real wyrmsh, an interactive shell, POSIX TTY/fds, physical
+hardware, general IOAPIC/MSI, final WYR1 security closure, or all of DW1/WYR1.
