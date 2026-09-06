@@ -273,7 +273,7 @@ fn e3_e4_kernel_stacks_are_private_linker_carriers_with_first_root_guards() {
         "thread_kernel_stack_guard_size = 4096",
         "thread_kernel_stack_alignment = 4096",
         "privilege_entry_stack_count = 1",
-        "privilege_entry_stack_size = 16384",
+        "privilege_entry_stack_size = 65536",
         "privilege_entry_stack_guard_size = 4096",
         "privilege_entry_stack_alignment = 4096",
         "terminal_reaper_stack_count = 1",

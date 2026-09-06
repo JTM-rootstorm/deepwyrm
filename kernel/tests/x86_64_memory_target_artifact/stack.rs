@@ -1286,15 +1286,19 @@ mod primordial;
 mod production;
 #[path = "stack/selector.rs"]
 mod selector;
+#[path = "stack/wyr1e.rs"]
+mod wyr1e;
 
 pub(super) use dw1c::validate_dw1c_stack_margins;
 pub(super) use e7::validate_e7_stack_margin;
 pub(super) use f9::validate_f9_stack_context_evidence;
 pub(super) use f12::validate_f12_stack_context_evidence;
 pub(super) use geometry::linked_boot_stack_payload_bytes;
+pub(super) use geometry::linked_privilege_entry_stack_payload_bytes;
 pub(super) use geometry::linked_terminal_reaper_stack_payload_bytes;
 pub(super) use geometry::linked_thread_kernel_stack_payload_bytes;
 pub(super) use geometry::validate_kernel_stack_artifact_geometry;
 pub(super) use primordial::validate_primordial_boot_stack_margin;
 pub(super) use production::validate_production_ist_stack_margin;
 pub(super) use selector::validate_selector_stack_margin;
+pub(super) use wyr1e::validate_wyr1e_privilege_entry_stack_margin;

@@ -442,7 +442,7 @@ fn graph_fixture() -> GraphFixture {
     let privilege_entry = crate::memory::kernel_stack::KernelStackBounds::new(
         FIXTURE_DATA + 16 * PAGE_SIZE,
         FIXTURE_DATA + 17 * PAGE_SIZE,
-        FIXTURE_DATA + 21 * PAGE_SIZE,
+        FIXTURE_DATA + 33 * PAGE_SIZE,
     )
     .unwrap();
     let segments = [
@@ -458,7 +458,7 @@ fn graph_fixture() -> GraphFixture {
         },
         KernelSegment {
             start: FIXTURE_DATA,
-            end: FIXTURE_DATA + 21 * PAGE_SIZE,
+            end: FIXTURE_DATA + 33 * PAGE_SIZE,
             kind: SegmentKind::Writable,
         },
     ];
@@ -499,7 +499,7 @@ fn graph_fixture() -> GraphFixture {
         );
         add_path(&mut access.inactive, page, kernel_tables, physical | flags);
     }
-    for offset in 0..21 {
+    for offset in 0..33 {
         let page = FIXTURE_DATA + offset * PAGE_SIZE;
         let physical = 0x22_0000 + offset * PAGE_SIZE;
         let flags = PRESENT | WRITABLE | NO_EXECUTE;
@@ -545,7 +545,7 @@ fn graph_fixture() -> GraphFixture {
                 KernelImageSegment::ReadOnlyData,
             ),
             (
-                PhysicalRange::new(0x22_0000, 21 * PAGE_SIZE).unwrap(),
+                PhysicalRange::new(0x22_0000, 33 * PAGE_SIZE).unwrap(),
                 KernelImageSegment::WritableData,
             ),
         ])
@@ -1273,7 +1273,7 @@ fn terminal_reaper_layout_is_independent_guarded_and_conflict_free() {
 #[test]
 fn h1_runtime_cpu_arena_validates_every_private_stack_and_guard() {
     let arena_start = 0xffff_8000_0400_0000;
-    let arena_end = arena_start + 4 * 102 * PAGE_SIZE;
+    let arena_end = arena_start + 4 * 114 * PAGE_SIZE;
     let slots =
         crate::arch::x86_64::runtime_cpu_stack_layout_from_arena(arena_start, arena_end).unwrap();
     let segments = [
@@ -1552,7 +1552,7 @@ fn graph_capacity_rejects_before_any_leaf_or_scratch_access() {
             crate::memory::kernel_stack::KernelStackBounds::new(
                 MID_TWO + 15 * PAGE_SIZE,
                 MID_TWO + 16 * PAGE_SIZE,
-                MID_TWO + 20 * PAGE_SIZE
+                MID_TWO + 32 * PAGE_SIZE
             )
             .unwrap(),
             capabilities,

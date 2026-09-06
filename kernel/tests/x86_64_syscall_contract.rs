@@ -1182,6 +1182,59 @@ fn live_timer_expiry_is_bound_and_serviced_only_from_carrier_safe_points() {
 }
 
 #[test]
+fn q35_external_entry_binds_the_selector_runtime_and_live_eoi_targets() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let external = source("src/arch/x86_64/external_interrupt.rs");
+    let ipi = source("src/arch/x86_64/ipi.rs");
+    let live_time = source("src/time/live.rs");
+
+    let publish = primordial
+        .split_once("fn publish_runtime_shared(")
+        .expect("primordial shared-runtime publication")
+        .1
+        .split_once("impl crate::arch::x86_64::external_interrupt::Q35ExternalInterruptHandler")
+        .expect("primordial q35 handler boundary")
+        .0;
+    assert!(publish.contains("bind_q35_external_interrupt_handler(target)"));
+
+    let handler = primordial
+        .split_once("impl crate::arch::x86_64::external_interrupt::Q35ExternalInterruptHandler")
+        .expect("primordial q35 handler")
+        .1
+        .split_once("fn complete_q35_handler_after_eoi")
+        .expect("primordial post-EOI callback boundary")
+        .0;
+    assert!(handler.contains("complete_q35_handler_after_eoi,"));
+
+    let handler_binding = external
+        .split_once("pub(crate) fn bind_q35_external_interrupt_handler<")
+        .expect("generic q35 handler binding")
+        .1
+        .split_once("unsafe fn dispatch_handler<")
+        .expect("generic q35 handler trampoline boundary")
+        .0;
+    assert!(handler_binding.contains("dispatch: dispatch_handler::<T>,"));
+
+    let time_initialize = live_time
+        .split_once("pub(crate) fn initialize<")
+        .expect("live-time initialization")
+        .1
+        .split_once("struct TimeInitPlan")
+        .expect("live-time plan boundary")
+        .0;
+    assert!(time_initialize.contains("bind_live_ipi_transport(&LIVE_IPI_TRANSPORT)"));
+
+    let transport_binding = ipi
+        .split_once("pub(crate) fn bind_live_ipi_transport<")
+        .expect("generic live IPI binding")
+        .1
+        .split_once("unsafe fn transport_send<")
+        .expect("generic live IPI send boundary")
+        .0;
+    assert!(transport_binding.contains("eoi: transport_eoi::<T>,"));
+}
+
+#[test]
 fn i2_live_dispatch_covers_every_stress_payload_syscall_family() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
     let adapters = source("src/syscall/adapters.rs");

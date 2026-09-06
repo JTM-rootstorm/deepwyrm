@@ -344,6 +344,13 @@ and an already-running CPU retains the reached timer-driven scheduling
 boundary. Therefore a device wake need not retain or switch away from the
 external frame merely for lower latency.
 
+WYR1-E7 target evidence measured the admitted COM2 delivery and wake chain at
+20,583 bytes including entry state, alignment, and return words. Each guarded
+privilege-entry payload is therefore 64 KiB, leaving 4 KiB architectural
+headroom and at least 32 KiB spare on the emitted accepted path. This larger
+internal budget is retained until the by-value wake and invariant-check frames
+are optimized and a replacement target gate proves the same margins.
+
 E2 target evidence must nevertheless prove progress in both one-CPU and
 four-CPU profiles. If a runnable driver can remain indefinitely stranded after
 a correctly committed wake, E2 stops and factors the smallest generic

@@ -310,6 +310,14 @@ On syscall entry:
 After a complete entry frame exists, the dispatcher/scheduler may move execution
 to the current Thread's kernel stack. The per-CPU entry stack is an architecture
 landing pad, not the scheduler's long-lived execution stack.
+
+The reached WYR1-E7 q35 external-interrupt path requires a 64 KiB payload for
+each guarded privilege-entry stack. This is an internal resource-budget
+increase: the 4 KiB nonpresent guard, ownership, entry ABI, and frame ordering
+do not change. The large by-value wake batches and scheduler invariant frames
+remain explicit optimization debt. A later reduction must use target-emitted
+stack evidence and retain the required architectural headroom and spare; it
+must not pack or weaken this allocation merely to recover the former budget.
 ### 6.3 SYSCALL MSRs and entry flags
 
 Before CPL3 execution, E verifies architectural SYSCALL support and programs:

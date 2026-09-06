@@ -8,10 +8,11 @@ thread_kernel_stack_size = 524288
 thread_kernel_stack_guard_size = 4096
 thread_kernel_stack_alignment = 4096
 
-# BSP-only DW0-E4 privilege-entry landing stack. SMP bring-up must allocate one
-# equivalent guarded carrier per CPU before bringing that CPU online.
+# BSP-only DW0-E4 privilege-entry landing stack. WYR1-E7 raises the internal
+# payload budget for the admitted external-interrupt wake chain; SMP bring-up
+# still allocates one guarded carrier per CPU before bringing that CPU online.
 privilege_entry_stack_count = 1
-privilege_entry_stack_size = 16384
+privilege_entry_stack_size = 65536
 privilege_entry_stack_guard_size = 4096
 privilege_entry_stack_alignment = 4096
 

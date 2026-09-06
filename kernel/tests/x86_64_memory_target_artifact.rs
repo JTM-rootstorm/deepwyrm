@@ -25,12 +25,13 @@ const G5_PRIMORDIAL_SELECTORS: [&str; 3] = [
     "primordial-user-exception",
     "primordial-invalid-return",
 ];
-const WYR1_PRIMORDIAL_SELECTORS: [&str; 5] = [
+const WYR1_PRIMORDIAL_SELECTORS: [&str; 6] = [
     "permanent-supervisor-rrc",
     "normal-preemption-up",
     "bootstrap-registry-launch",
     "normal-preemption-smp",
     "device-coordinator-restart",
+    "interactive-wyrmsh",
 ];
 const OWNED_WORKSPACE_CARGO_CONFIG: &str = ".cargo/config.toml";
 const LEGACY_WORKSPACE_CARGO_CONFIG: &str = ".cargo/config";
@@ -673,6 +674,13 @@ fn wyr1_primordial_selector_artifacts_fit_the_linked_boot_stack() {
             &stack_sizes(&llvm_readelf, &stack_kernel),
             linked_boot_stack_payload_bytes(&stack_symbols),
         );
+        if selector == "interactive-wyrmsh" {
+            validate_wyr1e_privilege_entry_stack_margin(
+                &stack_sizes(&llvm_readelf, &stack_kernel),
+                &stack_disassembly,
+                linked_privilege_entry_stack_payload_bytes(&stack_symbols),
+            );
+        }
         if selector == "normal-preemption-smp" {
             validate_dw1c_stack_margins(
                 &stack_sizes(&llvm_readelf, &stack_kernel),
@@ -686,6 +694,146 @@ fn wyr1_primordial_selector_artifacts_fit_the_linked_boot_stack() {
         build_input_manifest_sha256(&workspace),
         build_input_before,
         "build-relevant source/configuration changed during WYR1 artifact builds"
+    );
+    validate_accepted_identities(
+        &workspace,
+        &toolchain_identity,
+        &build_tools_identity,
+        AcceptedToolPaths {
+            request: &request_path,
+            cargo: cargo.source_path(),
+            rustc: rustc.source_path(),
+            rust_lld: rust_lld.source_path(),
+            clang: clang.source_path(),
+            llvm_nm: llvm_nm.source_path(),
+            llvm_objdump: llvm_objdump.source_path(),
+            llvm_readelf: llvm_readelf.source_path(),
+        },
+    );
+    reject_ambient_build_overrides(&workspace);
+    output_root.cleanup();
+}
+
+#[test]
+#[ignore = "explicit accepted-toolchain WYR1-E7 privilege-entry stack gate"]
+fn wyr1e_external_interrupt_entry_stack_fits_the_linked_payload() {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("kernel manifest has workspace parent")
+        .to_path_buf();
+    reject_ambient_build_overrides(&workspace);
+    let request_path = required_path("DEEPWYRM_ACCEPTED_REQUEST");
+    let cargo_path = required_path("DEEPWYRM_ACCEPTED_CARGO");
+    let rustc_path = required_path("DEEPWYRM_ACCEPTED_RUSTC");
+    let rust_lld_path = required_path("DEEPWYRM_ACCEPTED_RUST_LLD");
+    let clang_path = required_path("DEEPWYRM_CLANG");
+    let llvm_nm_path = required_path("DEEPWYRM_LLVM_NM");
+    let llvm_objdump_path = required_path("DEEPWYRM_LLVM_OBJDUMP");
+    let llvm_readelf_path = required_path("DEEPWYRM_LLVM_READELF");
+    let toolchain_identity = fs::read_to_string(workspace.join("tooling/rust-toolchain.toml"))
+        .expect("read trusted toolchain identity");
+    let build_tools_identity = fs::read_to_string(workspace.join("tooling/build-tools.toml"))
+        .expect("read trusted build-tools identity");
+    validate_accepted_identities(
+        &workspace,
+        &toolchain_identity,
+        &build_tools_identity,
+        AcceptedToolPaths {
+            request: &request_path,
+            cargo: &cargo_path,
+            rustc: &rustc_path,
+            rust_lld: &rust_lld_path,
+            clang: &clang_path,
+            llvm_nm: &llvm_nm_path,
+            llvm_objdump: &llvm_objdump_path,
+            llvm_readelf: &llvm_readelf_path,
+        },
+    );
+    let runtime_artifacts = accepted_runtime_artifacts(&toolchain_identity, &cargo_path);
+    let cargo = VerifiedExecutable::open(
+        &cargo_path,
+        manifest_value(&toolchain_identity, "cargo_sha256"),
+        "cargo",
+    );
+    let rustc = VerifiedExecutable::open(
+        &rustc_path,
+        manifest_value(&toolchain_identity, "rustc_sha256"),
+        "rustc",
+    );
+    let rust_lld = VerifiedExecutable::open(
+        &rust_lld_path,
+        manifest_value(&toolchain_identity, "rust_lld_sha256"),
+        "rust-lld",
+    );
+    let clang = VerifiedExecutable::open(
+        &clang_path,
+        manifest_value(&build_tools_identity, "clang_sha256"),
+        "clang",
+    );
+    let llvm_nm = VerifiedExecutable::open(
+        &llvm_nm_path,
+        manifest_value(&build_tools_identity, "llvm_nm_sha256"),
+        "llvm-nm",
+    );
+    let llvm_objdump = VerifiedExecutable::open(
+        &llvm_objdump_path,
+        manifest_value(&build_tools_identity, "llvm_objdump_sha256"),
+        "llvm-objdump",
+    );
+    let llvm_readelf = VerifiedExecutable::open(
+        &llvm_readelf_path,
+        manifest_value(&build_tools_identity, "llvm_readelf_sha256"),
+        "llvm-readelf/readobj",
+    );
+    let tools = BuildTools {
+        cargo: &cargo,
+        rustc: &rustc,
+        rust_lld: &rust_lld,
+        clang: &clang,
+        runtime_artifacts: &runtime_artifacts,
+    };
+    let output_root = ArtifactRoot::create();
+    let environment = BuildEnvironment::create(output_root.path());
+    let build_input_before = build_input_manifest_sha256(&workspace);
+    let selector = "interactive-wyrmsh";
+
+    let kernel = build_release_kernel(
+        &workspace,
+        &output_root.path().join("wyr1e-release"),
+        &environment,
+        tools,
+        selector,
+    );
+    validate_static_kernel_elf(&llvm_readelf, &kernel, "WYR1-E7 release");
+    let kernel_symbols = symbols(&llvm_nm, &kernel);
+    validate_kernel_stack_artifact_geometry(&kernel_symbols);
+    let kernel_disassembly = disassembly(&llvm_objdump, &kernel);
+
+    let stack_kernel = build_release_stack_kernel(
+        &workspace,
+        &output_root.path().join("wyr1e-release-stack-sizes"),
+        &environment,
+        tools,
+        selector,
+    );
+    let stack_symbols = symbols(&llvm_nm, &stack_kernel);
+    validate_kernel_stack_artifact_geometry(&stack_symbols);
+    let stack_disassembly = disassembly(&llvm_objdump, &stack_kernel);
+    assert_eq!(
+        text_disassembly(&stack_disassembly),
+        text_disassembly(&kernel_disassembly),
+        "interactive-wyrmsh stack-size carrier changed the release machine code"
+    );
+    validate_wyr1e_privilege_entry_stack_margin(
+        &stack_sizes(&llvm_readelf, &stack_kernel),
+        &stack_disassembly,
+        linked_privilege_entry_stack_payload_bytes(&stack_symbols),
+    );
+
+    assert_eq!(
+        build_input_manifest_sha256(&workspace),
+        build_input_before,
+        "build-relevant source/configuration changed during WYR1-E7 artifact builds"
     );
     validate_accepted_identities(
         &workspace,

@@ -18,7 +18,7 @@ pub(crate) const AP_TRAMPOLINE_LIMIT: u64 = super::mm::AP_TRAMPOLINE_LIMIT;
 pub(crate) const AP_TRAMPOLINE_MAX_BYTES: u64 = PAGE_SIZE;
 pub(crate) const AP_BOOTSTRAP_STACK_BYTES: u64 = 64 * 1024;
 pub(crate) const IST_STACK_BYTES: u64 = 16 * 1024;
-pub(crate) const PRIVILEGE_ENTRY_STACK_BYTES: u64 = 16 * 1024;
+pub(crate) const PRIVILEGE_ENTRY_STACK_BYTES: u64 = 64 * 1024;
 pub(crate) const TERMINAL_REAPER_STACK_BYTES: u64 = 256 * 1024;
 
 const STACKS_PER_CPU_BYTES: u64 = 3 * (PAGE_SIZE + IST_STACK_BYTES)
