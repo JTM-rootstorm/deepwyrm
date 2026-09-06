@@ -29,7 +29,6 @@ project_root=$(CDPATH='' cd -- "$workspace/.." && pwd -P)
 host_identity="$workspace/tooling/host-rust-toolchain.toml"
 accepted_identity="$workspace/tooling/rust-toolchain.toml"
 build_identity="$workspace/tooling/build-tools.toml"
-test_name=wyr1_primordial_selector_artifacts_fit_the_linked_boot_stack
 
 [ "$(stat -c %u /usr/bin/gtar)" -eq 0 ] || fail \
     "execution context masks root ownership of pinned system tools; run this gate outside that sandbox"
@@ -90,4 +89,7 @@ env -i PATH=/usr/bin:/bin \
     DEEPWYRM_LLVM_NM="$llvm_nm" \
     DEEPWYRM_LLVM_OBJDUMP="$llvm_objdump" \
     DEEPWYRM_LLVM_READELF="$llvm_readelf" \
-    "$test_binary" "$test_name" --ignored --exact --nocapture
+    "$test_binary" \
+        wyr1_primordial_selector_artifacts_fit_the_linked_boot_stack \
+        wyr1e8_external_interrupt_entry_stack_fits_the_linked_payload \
+        --ignored --exact --nocapture --test-threads=1
