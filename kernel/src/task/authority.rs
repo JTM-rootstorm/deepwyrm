@@ -482,9 +482,50 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         Ok(threads.map(|thread| thread.map(ThreadKey)))
     }
 
+    /// Snapshots the Threads for which Process termination will emit terminal
+    /// execution effects. Exited siblings remain attached for inspection, but
+    /// `terminate_process_common` deliberately skips them.
+    pub(crate) fn process_termination_thread_keys(
+        &self,
+        key: ProcessKey,
+    ) -> Result<[Option<ThreadKey>; THREADS], TaskError> {
+        let thread_ids = self.process(key)?.threads;
+        let mut threads = [None; THREADS];
+        let mut count = 0;
+        for object in thread_ids.into_iter().flatten() {
+            let thread = ThreadKey(object);
+            if self.thread(thread)?.state.state == DW_TASK_STATE_EXITED {
+                continue;
+            }
+            assert!(count < THREADS, "Process termination thread list overflow");
+            threads[count] = Some(thread);
+            count += 1;
+        }
+        Ok(threads)
+    }
+
     pub(crate) fn task_group_thread_keys(
         &self,
         key: TaskGroupKey,
+    ) -> Result<[Option<ThreadKey>; THREADS], TaskError> {
+        self.task_group_thread_keys_matching(key, true)
+    }
+
+    /// Snapshots only Threads for which TaskGroup termination will emit
+    /// terminal execution effects. Exited descendants and exited siblings in
+    /// otherwise-live Processes remain inspectable, but the terminal mutation
+    /// deliberately skips them.
+    pub(crate) fn task_group_termination_thread_keys(
+        &self,
+        key: TaskGroupKey,
+    ) -> Result<[Option<ThreadKey>; THREADS], TaskError> {
+        self.task_group_thread_keys_matching(key, false)
+    }
+
+    fn task_group_thread_keys_matching(
+        &self,
+        key: TaskGroupKey,
+        include_exited: bool,
     ) -> Result<[Option<ThreadKey>; THREADS], TaskError> {
         let selected = self.group_subtree_slots(key)?;
         let mut threads = [None; THREADS];
@@ -493,13 +534,20 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             if !matches!(process.hierarchy, ProcessHierarchyState::Attached(_)) {
                 continue;
             }
+            if !include_exited && process.state.state == DW_TASK_STATE_EXITED {
+                continue;
+            }
             let parent_slot = self.group_slot(TaskGroupKey(process.parent.id()))?;
             if !selected[parent_slot] {
                 continue;
             }
             for object in process.threads.into_iter().flatten() {
+                let thread = ThreadKey(object);
+                if !include_exited && self.thread(thread)?.state.state == DW_TASK_STATE_EXITED {
+                    continue;
+                }
                 assert!(count < THREADS, "selected TaskGroup thread list overflow");
-                threads[count] = Some(ThreadKey(object));
+                threads[count] = Some(thread);
                 count += 1;
             }
         }

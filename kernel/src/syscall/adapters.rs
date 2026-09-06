@@ -5158,8 +5158,8 @@ fn authorized_reason(reason: DwTerminationReason) -> Result<(), DwStatus> {
     }
 }
 
-/// Authenticates an external Process termination target and snapshots its
-/// current Thread identities without starting terminal task mutation. The
+/// Authenticates an external Process termination target and snapshots the
+/// Thread set for which termination will emit terminal execution effects. The
 /// caller must retain the runtime authority that keeps the HandleTable and
 /// task topology stationary until the real preparation begins.
 pub(crate) fn inspect_process_termination_threads<
@@ -5185,11 +5185,14 @@ pub(crate) fn inspect_process_termination_threads<
         deepwyrm_abi::DW_OBJECT_TYPE_PROCESS,
         DW_RIGHT_MODIFY,
     )?);
-    tasks.process_thread_keys(target).map_err(task_status)
+    tasks
+        .process_termination_thread_keys(target)
+        .map_err(task_status)
 }
 
-/// Authenticates an external TaskGroup termination target and snapshots its
-/// recursive Thread set before terminal task mutation begins.
+/// Authenticates an external TaskGroup termination target and snapshots the
+/// recursive Thread set for which termination will emit terminal execution
+/// effects. Retained exited descendants stay inspectable but require no stop.
 pub(crate) fn inspect_task_group_termination_threads<
     const GROUPS: usize,
     const PROCESSES: usize,
@@ -5213,7 +5216,9 @@ pub(crate) fn inspect_task_group_termination_threads<
         deepwyrm_abi::DW_OBJECT_TYPE_TASK_GROUP,
         DW_RIGHT_MODIFY,
     )?);
-    tasks.task_group_thread_keys(target).map_err(task_status)
+    tasks
+        .task_group_termination_thread_keys(target)
+        .map_err(task_status)
 }
 
 /// Authenticates an external Thread termination target without changing its

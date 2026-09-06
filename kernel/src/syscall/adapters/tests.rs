@@ -4294,6 +4294,452 @@ fn prepared_group_termination_waits_for_remote_owners_before_reclaim() {
 }
 
 #[test]
+fn process_termination_inspection_omits_exited_sibling_from_live_target() {
+    type TerminationTasks = TaskAuthority<1, 2, 3, 8>;
+
+    let mut registry = ObjectRegistry::<16>::new();
+    let mut tasks = TerminationTasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (current_process, current_process_ref) =
+        tasks.create_process(&mut registry, &root_owner).unwrap();
+    let (target_process, target_process_ref) =
+        tasks.create_process(&mut registry, &root_owner).unwrap();
+    let current_owner = registry
+        .retain_internal_from_handle(&current_process_ref)
+        .unwrap();
+    let target_owner = registry
+        .retain_internal_from_handle(&target_process_ref)
+        .unwrap();
+    let (current_thread, current_thread_ref) =
+        tasks.create_thread(&mut registry, &current_owner).unwrap();
+    let (exited_thread, exited_thread_ref) =
+        tasks.create_thread(&mut registry, &target_owner).unwrap();
+    let (live_thread, live_thread_ref) = tasks.create_thread(&mut registry, &target_owner).unwrap();
+    assert!(registry.release_internal(current_owner).unwrap().is_none());
+    assert!(registry.release_internal(target_owner).unwrap().is_none());
+    let target_handle = tasks
+        .process_handles_mut(current_process)
+        .unwrap()
+        .install(target_process_ref, DW_RIGHT_MODIFY)
+        .unwrap();
+
+    let execution = ExecutionDomain::<3>::new(test_stack_bounds::<3>()).unwrap();
+    let waits = WaitRegistry::<2>::new();
+    let mut terminal_waits = NoTerminalWaitCleanup;
+    let mut cleanup = CleanupQueue::<16>::new();
+    execution
+        .start_thread(&mut tasks, current_thread, test_start(0x40))
+        .unwrap();
+    execution
+        .start_thread(&mut tasks, exited_thread, test_start(0x41))
+        .unwrap();
+    execution
+        .start_thread(&mut tasks, live_thread, test_start(0x42))
+        .unwrap();
+    let exited = tasks
+        .terminate_thread_authorized(exited_thread, 0x70)
+        .unwrap();
+    let retired = execution.retire_exit_pins(exited);
+    let (process_pin, thread_pins) = retired.into_parts();
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        cleanup.push_optional(registry.release_internal(pin).unwrap());
+    }
+    assert_eq!(
+        execution.schedule_next().unwrap().current,
+        Some(current_thread)
+    );
+
+    assert_eq!(
+        tasks.process_thread_keys(target_process).unwrap(),
+        [Some(exited_thread), Some(live_thread), None]
+    );
+    let inspected = inspect_process_termination_threads(
+        &tasks,
+        &execution,
+        current_process,
+        current_thread,
+        target_handle,
+        deepwyrm_abi::DW_TERMINATION_AUTHORIZED,
+    )
+    .unwrap();
+    assert_eq!(inspected, [Some(live_thread), None, None]);
+
+    let prepared = prepare_process_terminate(
+        &mut registry,
+        &mut tasks,
+        &execution,
+        &waits,
+        &mut terminal_waits,
+        current_process,
+        current_thread,
+        target_handle,
+        deepwyrm_abi::DW_TERMINATION_AUTHORIZED,
+        0x71,
+        &mut cleanup,
+    )
+    .unwrap();
+    assert_eq!(prepared.target(), target_process);
+    assert_eq!(prepared.thread_keys(), inspected);
+    assert!(
+        terminal_outcome(
+            complete_prepared_process_termination(
+                &mut registry,
+                &mut tasks,
+                &execution,
+                &waits,
+                &mut terminal_waits,
+                current_process,
+                current_thread,
+                prepared,
+                &mut cleanup,
+            ),
+            DW_STATUS_SUCCESS,
+            SyscallControl::ReturnToCaller,
+        )
+        .is_none()
+    );
+
+    let deferred = terminal_outcome(
+        process_exit_on(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut terminal_waits,
+            crate::cpu::CpuIndex::BOOTSTRAP,
+            current_process,
+            current_thread,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        crate::cpu::CpuIndex::BOOTSTRAP,
+        deferred,
+        &mut cleanup,
+    );
+    for handle in [
+        current_thread_ref,
+        exited_thread_ref,
+        live_thread_ref,
+        current_process_ref,
+    ] {
+        cleanup.push_optional(registry.release_handle(handle).unwrap());
+    }
+    cleanup.push_optional(registry.release_internal(root_owner).unwrap());
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+#[test]
+fn task_group_termination_inspection_omits_exited_sibling_in_nested_live_process() {
+    type TerminationTasks = TaskAuthority<3, 2, 3, 8>;
+
+    let mut registry = ObjectRegistry::<16>::new();
+    let mut tasks = TerminationTasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (target_group, target_group_ref) = tasks
+        .create_child_group(&mut registry, &root_owner)
+        .unwrap();
+    let target_group_owner = registry
+        .retain_internal_from_handle(&target_group_ref)
+        .unwrap();
+    let (_nested_group, nested_group_ref) = tasks
+        .create_child_group(&mut registry, &target_group_owner)
+        .unwrap();
+    assert!(
+        registry
+            .release_internal(target_group_owner)
+            .unwrap()
+            .is_none()
+    );
+    let nested_group_owner = registry
+        .retain_internal_from_handle(&nested_group_ref)
+        .unwrap();
+    let (current_process, current_process_ref) =
+        tasks.create_process(&mut registry, &root_owner).unwrap();
+    let (target_process, target_process_ref) = tasks
+        .create_process(&mut registry, &nested_group_owner)
+        .unwrap();
+    assert!(
+        registry
+            .release_internal(nested_group_owner)
+            .unwrap()
+            .is_none()
+    );
+    let current_owner = registry
+        .retain_internal_from_handle(&current_process_ref)
+        .unwrap();
+    let target_owner = registry
+        .retain_internal_from_handle(&target_process_ref)
+        .unwrap();
+    let (current_thread, current_thread_ref) =
+        tasks.create_thread(&mut registry, &current_owner).unwrap();
+    let (exited_thread, exited_thread_ref) =
+        tasks.create_thread(&mut registry, &target_owner).unwrap();
+    let (live_thread, live_thread_ref) = tasks.create_thread(&mut registry, &target_owner).unwrap();
+    assert!(registry.release_internal(current_owner).unwrap().is_none());
+    assert!(registry.release_internal(target_owner).unwrap().is_none());
+    let group_handle = tasks
+        .process_handles_mut(current_process)
+        .unwrap()
+        .install(target_group_ref, DW_RIGHT_MODIFY)
+        .unwrap();
+
+    let execution = ExecutionDomain::<3>::new(test_stack_bounds::<3>()).unwrap();
+    let waits = WaitRegistry::<2>::new();
+    let mut terminal_waits = NoTerminalWaitCleanup;
+    let mut cleanup = CleanupQueue::<16>::new();
+    execution
+        .start_thread(&mut tasks, current_thread, test_start(0x43))
+        .unwrap();
+    execution
+        .start_thread(&mut tasks, exited_thread, test_start(0x44))
+        .unwrap();
+    execution
+        .start_thread(&mut tasks, live_thread, test_start(0x45))
+        .unwrap();
+    let exited = tasks
+        .terminate_thread_authorized(exited_thread, 0x72)
+        .unwrap();
+    let retired = execution.retire_exit_pins(exited);
+    let (process_pin, thread_pins) = retired.into_parts();
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        cleanup.push_optional(registry.release_internal(pin).unwrap());
+    }
+    assert_eq!(
+        execution.schedule_next().unwrap().current,
+        Some(current_thread)
+    );
+
+    assert_eq!(
+        tasks.task_group_thread_keys(target_group).unwrap(),
+        [Some(exited_thread), Some(live_thread), None]
+    );
+    let inspected = inspect_task_group_termination_threads(
+        &tasks,
+        &execution,
+        current_process,
+        current_thread,
+        group_handle,
+        deepwyrm_abi::DW_TERMINATION_AUTHORIZED,
+    )
+    .unwrap();
+    assert_eq!(inspected, [Some(live_thread), None, None]);
+
+    let prepared = prepare_task_group_terminate(
+        &mut registry,
+        &mut tasks,
+        &execution,
+        &waits,
+        &mut terminal_waits,
+        current_process,
+        current_thread,
+        group_handle,
+        deepwyrm_abi::DW_TERMINATION_AUTHORIZED,
+        &mut cleanup,
+    )
+    .unwrap();
+    assert_eq!(prepared.process_keys(), [Some(target_process), None]);
+    assert_eq!(prepared.thread_keys(), inspected);
+    assert!(
+        terminal_outcome(
+            complete_prepared_task_group_termination(
+                &mut registry,
+                &mut tasks,
+                &execution,
+                &waits,
+                &mut terminal_waits,
+                current_process,
+                current_thread,
+                prepared,
+                &mut cleanup,
+            ),
+            DW_STATUS_SUCCESS,
+            SyscallControl::ReturnToCaller,
+        )
+        .is_none()
+    );
+
+    let deferred = terminal_outcome(
+        process_exit_on(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut terminal_waits,
+            crate::cpu::CpuIndex::BOOTSTRAP,
+            current_process,
+            current_thread,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        crate::cpu::CpuIndex::BOOTSTRAP,
+        deferred,
+        &mut cleanup,
+    );
+    for handle in [
+        current_thread_ref,
+        exited_thread_ref,
+        live_thread_ref,
+        current_process_ref,
+        target_process_ref,
+        nested_group_ref,
+    ] {
+        cleanup.push_optional(registry.release_handle(handle).unwrap());
+    }
+    cleanup.push_optional(registry.release_internal(root_owner).unwrap());
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+#[test]
+fn task_group_termination_inspection_omits_retained_exited_descendants() {
+    type TerminationTasks = TaskAuthority<3, 2, 2, 8>;
+
+    let mut registry = ObjectRegistry::<16>::new();
+    let mut tasks = TerminationTasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (target_group, target_group_ref) = tasks
+        .create_child_group(&mut registry, &root_owner)
+        .unwrap();
+    let target_group_owner = registry
+        .retain_internal_from_handle(&target_group_ref)
+        .unwrap();
+    let (_nested_group, nested_group_ref) = tasks
+        .create_child_group(&mut registry, &target_group_owner)
+        .unwrap();
+    let nested_group_owner = registry
+        .retain_internal_from_handle(&nested_group_ref)
+        .unwrap();
+    let (current_process, current_process_ref) =
+        tasks.create_process(&mut registry, &root_owner).unwrap();
+    let (exited_process, exited_process_ref) = tasks
+        .create_process(&mut registry, &nested_group_owner)
+        .unwrap();
+    assert!(
+        registry
+            .release_internal(target_group_owner)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        registry
+            .release_internal(nested_group_owner)
+            .unwrap()
+            .is_none()
+    );
+    let current_owner = registry
+        .retain_internal_from_handle(&current_process_ref)
+        .unwrap();
+    let exited_owner = registry
+        .retain_internal_from_handle(&exited_process_ref)
+        .unwrap();
+    let (current_thread, current_thread_ref) =
+        tasks.create_thread(&mut registry, &current_owner).unwrap();
+    let (exited_thread, exited_thread_ref) =
+        tasks.create_thread(&mut registry, &exited_owner).unwrap();
+    assert!(registry.release_internal(current_owner).unwrap().is_none());
+    assert!(registry.release_internal(exited_owner).unwrap().is_none());
+    let group_handle = tasks
+        .process_handles_mut(current_process)
+        .unwrap()
+        .install(target_group_ref, DW_RIGHT_MODIFY)
+        .unwrap();
+
+    let exited = tasks
+        .terminate_process_authorized(&mut registry, exited_process, 0)
+        .unwrap();
+    assert_eq!(exited.drained.final_release_count(), 0);
+    assert_eq!(exited.pins.thread_keys(), [Some(exited_thread), None]);
+    assert!(exited.pins.exits_process());
+    let (process_pin, thread_pins, resources) = exited.pins.into_parts();
+    assert!(resources.into_iter().all(|resource| resource.is_none()));
+    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+        assert!(registry.release_internal(pin).unwrap().is_none());
+    }
+
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let waits = WaitRegistry::<2>::new();
+    let mut terminal_waits = NoTerminalWaitCleanup;
+    let mut cleanup = CleanupQueue::<16>::new();
+    execution
+        .start_thread(&mut tasks, current_thread, test_start(0x40))
+        .unwrap();
+    assert_eq!(
+        execution.schedule_next().unwrap().current,
+        Some(current_thread)
+    );
+
+    let inspected = inspect_task_group_termination_threads(
+        &tasks,
+        &execution,
+        current_process,
+        current_thread,
+        group_handle,
+        deepwyrm_abi::DW_TERMINATION_AUTHORIZED,
+    )
+    .unwrap();
+    assert_eq!(inspected, [None; 2]);
+    assert_eq!(
+        tasks.task_group_thread_keys(target_group).unwrap(),
+        [Some(exited_thread), None]
+    );
+    let prepared = tasks.terminate_group(&mut registry, target_group).unwrap();
+    assert_eq!(prepared.len(), 0);
+    assert_eq!(prepared.thread_keys(), inspected);
+
+    let deferred = terminal_outcome(
+        process_exit_on(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut terminal_waits,
+            crate::cpu::CpuIndex::BOOTSTRAP,
+            current_process,
+            current_thread,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        crate::cpu::CpuIndex::BOOTSTRAP,
+        deferred,
+        &mut cleanup,
+    );
+    for handle in [
+        current_thread_ref,
+        exited_thread_ref,
+        current_process_ref,
+        exited_process_ref,
+        nested_group_ref,
+    ] {
+        cleanup.push_optional(registry.release_handle(handle).unwrap());
+    }
+    cleanup.push_optional(registry.release_internal(root_owner).unwrap());
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+#[test]
 fn task_group_termination_drains_blocked_descendant_wait_before_terminal_batches() {
     use deepwyrm_abi::{
         DW_DEADLINE_INFINITE, DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED, DW_TERMINATION_AUTHORIZED,

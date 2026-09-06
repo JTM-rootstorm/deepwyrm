@@ -493,6 +493,195 @@ fn task_group_teardown_is_iterative_and_marks_all_live_descendants() {
 }
 
 #[test]
+fn task_group_termination_threads_exclude_retained_exited_descendants() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (target_group, target_group_handle) = tasks
+        .create_child_group(&mut registry, &root_owner)
+        .unwrap();
+    let target_owner = registry
+        .retain_internal_from_handle(&target_group_handle)
+        .unwrap();
+
+    let (exited_process, exited_process_handle) =
+        tasks.create_process(&mut registry, &target_owner).unwrap();
+    let exited_owner = process_parent_pin(&mut registry, &exited_process_handle);
+    let (exited_thread, exited_thread_handle) =
+        tasks.create_thread(&mut registry, &exited_owner).unwrap();
+    release_nonfinal_pin(&mut registry, exited_owner);
+    prepare_thread(&mut tasks, exited_thread, 7);
+    tasks.start_thread(exited_thread).unwrap();
+    let exited = tasks
+        .exit_process(&mut registry, exited_process, exited_thread, 0)
+        .unwrap();
+    assert_eq!(exited.drained.final_release_count(), 0);
+    assert!(
+        release_pins(&mut registry, exited.pins)
+            .into_iter()
+            .flatten()
+            .next()
+            .is_none()
+    );
+
+    let (live_process, live_process_handle) =
+        tasks.create_process(&mut registry, &target_owner).unwrap();
+    let live_owner = process_parent_pin(&mut registry, &live_process_handle);
+    let (exited_sibling, exited_sibling_handle) =
+        tasks.create_thread(&mut registry, &live_owner).unwrap();
+    let (live_thread, live_thread_handle) =
+        tasks.create_thread(&mut registry, &live_owner).unwrap();
+    release_nonfinal_pin(&mut registry, live_owner);
+    prepare_thread(&mut tasks, exited_sibling, 8);
+    tasks.start_thread(exited_sibling).unwrap();
+    prepare_thread(&mut tasks, live_thread, 9);
+    tasks.start_thread(live_thread).unwrap();
+    let exited_sibling_pins = tasks.exit_thread(exited_sibling, 7).unwrap();
+    assert!(!exited_sibling_pins.exits_process());
+    assert!(
+        release_pins(&mut registry, exited_sibling_pins)
+            .into_iter()
+            .flatten()
+            .next()
+            .is_none()
+    );
+    release_nonfinal_pin(&mut registry, target_owner);
+
+    assert_eq!(
+        tasks.task_group_thread_keys(target_group).unwrap(),
+        [
+            Some(exited_thread),
+            Some(exited_sibling),
+            Some(live_thread),
+            None,
+            None,
+            None,
+            None,
+            None
+        ]
+    );
+    assert_eq!(
+        tasks.process_thread_keys(live_process).unwrap(),
+        [
+            Some(exited_sibling),
+            Some(live_thread),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None
+        ]
+    );
+    assert_eq!(
+        tasks.process_termination_thread_keys(live_process).unwrap(),
+        [Some(live_thread), None, None, None, None, None, None, None]
+    );
+    let termination_threads = tasks
+        .task_group_termination_thread_keys(target_group)
+        .unwrap();
+    assert_eq!(
+        termination_threads,
+        [Some(live_thread), None, None, None, None, None, None, None]
+    );
+
+    let effects = tasks.terminate_group(&mut registry, target_group).unwrap();
+    assert_eq!(effects.len(), 1);
+    assert_eq!(
+        effects.process_keys(),
+        [Some(live_process), None, None, None]
+    );
+    assert_eq!(effects.thread_keys(), termination_threads);
+    for process_effect in effects.into_processes().into_iter().flatten() {
+        assert_eq!(process_effect.drained.final_release_count(), 0);
+        assert!(
+            release_pins(&mut registry, process_effect.pins)
+                .into_iter()
+                .flatten()
+                .next()
+                .is_none()
+        );
+    }
+
+    for handle in [
+        exited_thread_handle,
+        exited_sibling_handle,
+        live_thread_handle,
+        exited_process_handle,
+        live_process_handle,
+        target_group_handle,
+    ] {
+        let final_release = registry.release_handle(handle).unwrap().unwrap();
+        finish_task_release(&mut tasks, &mut registry, final_release);
+    }
+    let root_final = registry.release_internal(root_owner).unwrap().unwrap();
+    finish_task_release(&mut tasks, &mut registry, root_final);
+}
+
+#[test]
+fn task_group_termination_threads_are_empty_when_all_descendants_exited() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (target_group, target_group_handle) = tasks
+        .create_child_group(&mut registry, &root_owner)
+        .unwrap();
+    let target_owner = registry
+        .retain_internal_from_handle(&target_group_handle)
+        .unwrap();
+    let (_nested_group, nested_group_handle) = tasks
+        .create_child_group(&mut registry, &target_owner)
+        .unwrap();
+    release_nonfinal_pin(&mut registry, target_owner);
+    let nested_owner = registry
+        .retain_internal_from_handle(&nested_group_handle)
+        .unwrap();
+    let (process, process_handle) = tasks.create_process(&mut registry, &nested_owner).unwrap();
+    release_nonfinal_pin(&mut registry, nested_owner);
+    let process_owner = process_parent_pin(&mut registry, &process_handle);
+    let (thread, thread_handle) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    release_nonfinal_pin(&mut registry, process_owner);
+    prepare_thread(&mut tasks, thread, 9);
+    tasks.start_thread(thread).unwrap();
+    let exited = tasks
+        .exit_process(&mut registry, process, thread, 0)
+        .unwrap();
+    assert_eq!(exited.drained.final_release_count(), 0);
+    assert!(
+        release_pins(&mut registry, exited.pins)
+            .into_iter()
+            .flatten()
+            .next()
+            .is_none()
+    );
+
+    assert_eq!(
+        tasks.task_group_thread_keys(target_group).unwrap(),
+        [Some(thread), None, None, None, None, None, None, None]
+    );
+    assert_eq!(
+        tasks
+            .task_group_termination_thread_keys(target_group)
+            .unwrap(),
+        [None; 8]
+    );
+    let effects = tasks.terminate_group(&mut registry, target_group).unwrap();
+    assert_eq!(effects.len(), 0);
+
+    for handle in [
+        thread_handle,
+        process_handle,
+        nested_group_handle,
+        target_group_handle,
+    ] {
+        let final_release = registry.release_handle(handle).unwrap().unwrap();
+        finish_task_release(&mut tasks, &mut registry, final_release);
+    }
+    let root_final = registry.release_internal(root_owner).unwrap().unwrap();
+    finish_task_release(&mut tasks, &mut registry, root_final);
+}
+
+#[test]
 fn failed_child_creation_rolls_back_generic_slot_and_parent_pin() {
     type TinyTasks = TaskAuthority<1, 1, 1, 1>;
     let mut registry = ObjectRegistry::<2>::new();
