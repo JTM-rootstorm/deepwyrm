@@ -47,7 +47,8 @@ impl BootResourceGrant {
         test,
         deepwyrm_dw1d_evidence,
         deepwyrm_wyr1c_evidence,
-        deepwyrm_wyr1d_evidence
+        deepwyrm_wyr1d_evidence,
+        deepwyrm_wyr1e_evidence,
     ))]
     #[allow(
         dead_code,
@@ -134,7 +135,8 @@ impl BootResourceGrants {
         test,
         deepwyrm_dw1d_evidence,
         deepwyrm_wyr1c_evidence,
-        deepwyrm_wyr1d_evidence
+        deepwyrm_wyr1d_evidence,
+        deepwyrm_wyr1e_evidence,
     ))]
     #[allow(
         dead_code,
@@ -152,7 +154,8 @@ impl BootResourceGrants {
         test,
         deepwyrm_dw1d_evidence,
         deepwyrm_wyr1c_evidence,
-        deepwyrm_wyr1d_evidence
+        deepwyrm_wyr1d_evidence,
+        deepwyrm_wyr1e_evidence,
     ))]
     #[allow(
         dead_code,

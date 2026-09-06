@@ -43,6 +43,7 @@ pub(crate) enum BuildGuestTest {
     DeviceResourceInterruptSynthetic,
     Q35Com2Interrupt,
     NativeConsoleStreams,
+    InteractiveWyrmsh,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,6 +115,7 @@ impl BuildGuestTest {
             Self::DeviceResourceInterruptSynthetic => 30,
             Self::Q35Com2Interrupt => 31,
             Self::NativeConsoleStreams => 32,
+            Self::InteractiveWyrmsh => 33,
         }
     }
 
@@ -158,6 +160,7 @@ impl BuildGuestTest {
                 | Self::DeviceResourceInterruptSynthetic
                 | Self::Q35Com2Interrupt
                 | Self::NativeConsoleStreams
+                | Self::InteractiveWyrmsh
         )
     }
 
@@ -281,6 +284,8 @@ const fn parse_known_selector(value: &str) -> BuildGuestTest {
         BuildGuestTest::Q35Com2Interrupt
     } else if string_equals(value, "native-console-streams") {
         BuildGuestTest::NativeConsoleStreams
+    } else if string_equals(value, "interactive-wyrmsh") {
+        BuildGuestTest::InteractiveWyrmsh
     } else {
         panic!("unknown build-selected guest test")
     }

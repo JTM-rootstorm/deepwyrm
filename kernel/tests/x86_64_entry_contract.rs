@@ -235,6 +235,7 @@ fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
         ("bootstrap-registry-launch", 27),
         ("normal-preemption-smp", 28),
         ("device-coordinator-restart", 29),
+        ("interactive-wyrmsh", 33),
     ] {
         assert_eq!(
             kernel_build::select_guest_test(true, Some(selector), false, &harness),
@@ -334,7 +335,7 @@ fn selector27_private_wrb1_relay_is_exact_and_outside_public_abi() {
     assert!(build.contains("selector == \"bootstrap-registry-launch\""));
     assert!(build.contains("cargo:rustc-cfg=deepwyrm_wyr1b_evidence"));
     assert!(support.contains(
-        "#[cfg(any(\n    test,\n    deepwyrm_wyr1b_evidence,\n    deepwyrm_wyr1c_evidence,\n    deepwyrm_wyr1d_evidence\n))]\nmod wyr1b_evidence;"
+        "#[cfg(any(\n    test,\n    deepwyrm_wyr1b_evidence,\n    deepwyrm_wyr1c_evidence,\n    deepwyrm_wyr1d_evidence,\n    deepwyrm_wyr1e_evidence,\n))]\nmod wyr1b_evidence;"
     ));
     assert!(evidence.contains("pub(crate) const WYR1B_EVIDENCE_RAW_SYSCALL: u32 = 0xffff_ff1b;"));
     assert!(evidence.contains("WYR1B_EVIDENCE_RECORD_LEN: usize = 96"));
@@ -537,9 +538,7 @@ fn selector32_wrd1_console_relay_is_private_bounded_joined_and_atomic() {
 
     assert!(build.contains("selector == \"native-console-streams\""));
     assert!(build.contains("deepwyrm_wyr1d_evidence"));
-    assert!(
-        build.contains("matches!(selector, \"q35-com2-interrupt\" | \"native-console-streams\")")
-    );
+    assert!(build.contains("\"q35-com2-interrupt\" | \"native-console-streams\""));
     assert!(support.contains("mod wyr1d_evidence;"));
     assert!(evidence.contains("WYR1D_EVIDENCE_RAW_SYSCALL: u32 = 0xffff_ff20"));
     assert!(evidence.contains("WYR1D_EVIDENCE_RECORD_LEN: usize = 192"));
@@ -569,6 +568,60 @@ fn selector32_wrd1_console_relay_is_private_bounded_joined_and_atomic() {
         .find("completion_record(CompletionOutcome::Pass, 0)")
         .expect("selector-32 PASS exists");
     assert!(evidence_write < pass, "WRD1 must precede PASS DWTEST1");
+}
+
+#[test]
+fn selector33_wre1_shell_relay_is_private_bounded_and_atomic() {
+    let root = kernel_root();
+    let build = fs::read_to_string(root.join("build.rs")).expect("read kernel build");
+    let support =
+        fs::read_to_string(root.join("src/test_support/mod.rs")).expect("read selector-33 support");
+    let evidence = fs::read_to_string(root.join("src/test_support/wyr1e_evidence.rs"))
+        .expect("read selector-33 evidence");
+    let terminal = fs::read_to_string(root.join("src/test_support/x86_64.rs"))
+        .expect("read selector-33 terminal");
+    let primordial = fs::read_to_string(root.join("src/arch/x86_64/mm/activation/primordial.rs"))
+        .expect("read primordial runtime");
+    let public_abi = fs::read_to_string(root.join("../abi/generated/deepwyrm_abi.rs"))
+        .expect("read generated ABI");
+
+    assert!(build.contains("selector == \"interactive-wyrmsh\""));
+    assert!(build.contains("deepwyrm_wyr1e_evidence"));
+    assert!(build.contains("DEEPWYRM_WYR1E7_EVIDENCE_NONCE"));
+    assert!(support.contains("mod wyr1e_evidence;"));
+    assert!(evidence.contains("WYR1E_EVIDENCE_RAW_SYSCALL: u32 = 0xffff_ff21"));
+    assert!(evidence.contains("WYR1E_EVIDENCE_RECORD_LEN: usize = 192"));
+    assert!(evidence.contains("WYR1E_EVIDENCE_RECORD_CAPACITY: usize = 128"));
+    assert!(evidence.contains("RECORD_SHELL_READY: u32 = 1"));
+    assert!(evidence.contains("RECORD_SHELL_EXITED: u32 = 3"));
+    assert!(evidence.contains("RECORD_TERMINAL: u32 = 255"));
+    assert!(!public_abi.contains("ffff_ff21"));
+
+    let authorize = primordial
+        .find("WYR1E_EVIDENCE\n            .authorize_submission(self.process)")
+        .expect("selector-33 authority check before usercopy");
+    let copy = primordial
+        .find("copy_wyr1e_evidence_input::<_, WYR1E_EVIDENCE_RECORD_LEN>")
+        .expect("selector-33 bounded usercopy");
+    let submit = primordial
+        .find("match WYR1E_EVIDENCE.submit(self.process, &record)")
+        .expect("selector-33 authority recheck and commit");
+    assert!(authorize < copy && copy < submit);
+    assert!(primordial.contains("WYR1E_EVIDENCE\n            .observe_reporter_start"));
+    assert!(primordial.contains("WYR1E_EVIDENCE\n            .bind_reporter_after_retirement"));
+    assert!(primordial.contains("values[1] != WYR1E_EVIDENCE_RECORD_LEN as u64"));
+    assert!(primordial.contains("values[2..].iter().any(|value| *value != 0)"));
+
+    let completion = terminal
+        .find("pub(crate) fn complete_wyr1e_evidence")
+        .expect("selector-33 terminal exists");
+    let evidence_write = terminal[completion..]
+        .find("write_evidence(record)")
+        .expect("WRE1 evidence write exists");
+    let pass = terminal[completion..]
+        .find("completion_record(CompletionOutcome::Pass, 0)")
+        .expect("selector-33 PASS exists");
+    assert!(evidence_write < pass, "WRE1 must precede PASS DWTEST1");
 }
 
 #[test]

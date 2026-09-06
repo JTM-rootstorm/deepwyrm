@@ -193,3 +193,10 @@ state = "implemented"
 [guest_test.native-console-streams]
 id = 32
 state = "implemented"
+
+# WYR1-E's selector-private interactive shell certificate relay. The kernel
+# validates bounded WRE1 transport and reporter custody only; application
+# policy remains in Wyrmroot and the independent host decoder.
+[guest_test.interactive-wyrmsh]
+id = 33
+state = "implemented"

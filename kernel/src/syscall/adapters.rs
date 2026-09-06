@@ -400,6 +400,14 @@ pub(crate) fn copy_wyr1d_evidence_input<U: UserPageAccess, const N: usize>(
     copy_input(user, address, 1)
 }
 
+#[cfg(deepwyrm_wyr1e_evidence)]
+pub(crate) fn copy_wyr1e_evidence_input<U: UserPageAccess, const N: usize>(
+    user: &mut U,
+    address: DwUserAddress,
+) -> Result<[u8; N], DwStatus> {
+    copy_input(user, address, 1)
+}
+
 #[cfg(deepwyrm_dw1c_evidence)]
 pub(crate) fn copy_dw1c_evidence_input<U: UserPageAccess, const N: usize>(
     user: &mut U,
@@ -2714,6 +2722,7 @@ pub(crate) fn process_create_with_root<
     deepwyrm_dw1c_evidence,
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
+    deepwyrm_wyr1e_evidence,
     deepwyrm_dw1e_evidence
 ))]
 #[allow(

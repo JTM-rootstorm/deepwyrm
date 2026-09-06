@@ -108,6 +108,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1E_E3B_FULL");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1C_EVIDENCE_NONCE");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1D_EVIDENCE_NONCE");
+    println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1E7_EVIDENCE_NONCE");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_c3_one_shot_ui)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_memory_guest)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_e7_guest)");
@@ -123,6 +124,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1d_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1c_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1d_evidence)");
+    println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1e_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1e_platform)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1e_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1e_e3b_full)");
@@ -258,6 +260,13 @@ fn run() -> Result<(), String> {
         .is_some_and(is_wyr1d_evidence_selector)
     {
         println!("cargo:rustc-cfg=deepwyrm_wyr1d_evidence");
+    }
+    if env::var("DEEPWYRM_GUEST_TEST_SELECTOR")
+        .ok()
+        .as_deref()
+        .is_some_and(is_wyr1e_evidence_selector)
+    {
+        println!("cargo:rustc-cfg=deepwyrm_wyr1e_evidence");
     }
 
     if required_env("TARGET")? != KERNEL_TARGET {
@@ -414,8 +423,15 @@ fn is_wyr1d_evidence_selector(selector: &str) -> bool {
     selector == "native-console-streams"
 }
 
+fn is_wyr1e_evidence_selector(selector: &str) -> bool {
+    selector == "interactive-wyrmsh"
+}
+
 fn is_dw1e_platform_selector(selector: &str) -> bool {
-    matches!(selector, "q35-com2-interrupt" | "native-console-streams")
+    matches!(
+        selector,
+        "q35-com2-interrupt" | "native-console-streams" | "interactive-wyrmsh"
+    )
 }
 
 fn is_dw1e_evidence_selector(selector: &str) -> bool {
@@ -1035,6 +1051,10 @@ fn configure_guest_test(harness_path: &Path) -> Result<(), String> {
             let nonce = required_wyr1d_hex("DEEPWYRM_WYR1D_EVIDENCE_NONCE")?;
             println!("cargo:rustc-env=DEEPWYRM_WYR1D_EVIDENCE_NONCE={nonce}");
         }
+        if is_wyr1e_evidence_selector(&selector) {
+            let nonce = required_wyr1e_hex("DEEPWYRM_WYR1E7_EVIDENCE_NONCE")?;
+            println!("cargo:rustc-env=DEEPWYRM_WYR1E7_EVIDENCE_NONCE={nonce}");
+        }
     }
     Ok(())
 }
@@ -1053,6 +1073,12 @@ fn required_dw1e_hex(name: &str) -> Result<String, String> {
 
 fn required_wyr1d_hex(name: &str) -> Result<String, String> {
     let value = env::var(name).map_err(|_| format!("native-console-streams requires {name}"))?;
+    validate_upper_nonzero_hex_nonce(&value, name)?;
+    Ok(value)
+}
+
+fn required_wyr1e_hex(name: &str) -> Result<String, String> {
+    let value = env::var(name).map_err(|_| format!("interactive-wyrmsh requires {name}"))?;
     validate_upper_nonzero_hex_nonce(&value, name)?;
     Ok(value)
 }
@@ -2438,6 +2464,30 @@ mod tests {
             "G123456789ABCDEF",
         ] {
             assert!(validate_upper_nonzero_hex_nonce(invalid, "WYR1D").is_err());
+        }
+    }
+
+    #[test]
+    fn wyr1e_selector_nonce_and_platform_without_older_collectors_are_exact() {
+        let manifest = include_str!("../tooling/guest-harness.toml");
+        assert!(is_wyr1e_evidence_selector("interactive-wyrmsh"));
+        assert!(is_dw1e_platform_selector("interactive-wyrmsh"));
+        assert!(!is_wyr1d_evidence_selector("interactive-wyrmsh"));
+        assert!(!is_dw1e_evidence_selector("interactive-wyrmsh"));
+        assert_eq!(
+            select_guest_test(true, Some("interactive-wyrmsh"), false, manifest),
+            Ok(Some(33))
+        );
+        for valid in ["0000000000000001", "0123456789ABCDEF", "FFFFFFFFFFFFFFFF"] {
+            assert!(validate_upper_nonzero_hex_nonce(valid, "WYR1E").is_ok());
+        }
+        for invalid in [
+            "0000000000000000",
+            "0123456789abcdef",
+            "0123456789ABCDE",
+            "G123456789ABCDEF",
+        ] {
+            assert!(validate_upper_nonzero_hex_nonce(invalid, "WYR1E").is_err());
         }
     }
 

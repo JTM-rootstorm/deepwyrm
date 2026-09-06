@@ -32,6 +32,8 @@ pub(crate) use adapters::copy_wyr1b_evidence_input;
 pub(crate) use adapters::copy_wyr1c_evidence_input;
 #[cfg(all(deepwyrm_wyr1d_evidence, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use adapters::copy_wyr1d_evidence_input;
+#[cfg(all(deepwyrm_wyr1e_evidence, target_os = "none", target_arch = "x86_64"))]
+pub(crate) use adapters::copy_wyr1e_evidence_input;
 #[cfg(all(
     any(
         deepwyrm_wyr1_evidence,
@@ -40,6 +42,7 @@ pub(crate) use adapters::copy_wyr1d_evidence_input;
         deepwyrm_dw1c_evidence,
         deepwyrm_wyr1c_evidence,
         deepwyrm_wyr1d_evidence,
+        deepwyrm_wyr1e_evidence,
         deepwyrm_dw1e_evidence
     ),
     target_os = "none",
@@ -113,7 +116,8 @@ pub(crate) use adapters::{handle_close, handle_duplicate, object_get_info_v1};
         deepwyrm_dw1d_evidence,
         deepwyrm_dw1e_evidence,
         deepwyrm_wyr1c_evidence,
-        deepwyrm_wyr1d_evidence
+        deepwyrm_wyr1d_evidence,
+        deepwyrm_wyr1e_evidence,
     ))
 ))]
 pub(crate) use adapters::{object_get_info_v1, object_get_info_v1_with_devices};

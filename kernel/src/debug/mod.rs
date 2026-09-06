@@ -599,7 +599,8 @@ pub(crate) fn emit_early_raw_record(record: &[u8]) -> Result<(), SerialError> {
         deepwyrm_dw1d_evidence,
         deepwyrm_dw1e_evidence,
         deepwyrm_wyr1c_evidence,
-        deepwyrm_wyr1d_evidence
+        deepwyrm_wyr1d_evidence,
+        deepwyrm_wyr1e_evidence,
     ),
     target_os = "none",
     target_arch = "x86_64"
@@ -621,7 +622,8 @@ pub(crate) struct TestSerialTransaction {
         deepwyrm_dw1d_evidence,
         deepwyrm_dw1e_evidence,
         deepwyrm_wyr1c_evidence,
-        deepwyrm_wyr1d_evidence
+        deepwyrm_wyr1d_evidence,
+        deepwyrm_wyr1e_evidence,
     ),
     target_os = "none",
     target_arch = "x86_64"
@@ -645,7 +647,8 @@ pub(crate) fn begin_test_serial_transaction() -> Result<TestSerialTransaction, S
         deepwyrm_dw1d_evidence,
         deepwyrm_dw1e_evidence,
         deepwyrm_wyr1c_evidence,
-        deepwyrm_wyr1d_evidence
+        deepwyrm_wyr1d_evidence,
+        deepwyrm_wyr1e_evidence,
     ),
     target_os = "none",
     target_arch = "x86_64"
@@ -696,7 +699,8 @@ fn write_bounded_raw_record<P: BytePortIo>(
     deepwyrm_dw1d_evidence,
     deepwyrm_dw1e_evidence,
     deepwyrm_wyr1c_evidence,
-    deepwyrm_wyr1d_evidence
+    deepwyrm_wyr1d_evidence,
+    deepwyrm_wyr1e_evidence,
 ))]
 fn write_bounded_test_evidence_record<P: BytePortIo, const BYTES: usize>(
     serial: &mut Com1<P>,

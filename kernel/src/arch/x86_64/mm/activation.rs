@@ -46,6 +46,7 @@ mod primordial;
             deepwyrm_wyr1b_evidence,
             deepwyrm_wyr1c_evidence,
             deepwyrm_wyr1d_evidence,
+            deepwyrm_wyr1e_evidence,
             deepwyrm_dw1e_evidence
         )
     )
@@ -58,6 +59,9 @@ mod user_access;
 #[cfg(any(test, all(target_os = "none", deepwyrm_wyr1d_evidence)))]
 #[path = "activation/wyr1d_wait_geometry.rs"]
 mod wyr1d_wait_geometry;
+#[cfg(any(test, all(target_os = "none", deepwyrm_wyr1e_evidence)))]
+#[path = "activation/wyr1e_wait_geometry.rs"]
+mod wyr1e_wait_geometry;
 #[allow(
     unused_imports,
     reason = "I0 root-binding typestates are consumed by the integrated carrier and focused host models"
@@ -122,7 +126,8 @@ const _: () = {
     deepwyrm_dw1c_evidence,
     deepwyrm_dw1e_evidence,
     deepwyrm_wyr1c_evidence,
-    deepwyrm_wyr1d_evidence
+    deepwyrm_wyr1d_evidence,
+    deepwyrm_wyr1e_evidence,
 )))]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;
 // Selector 24 keeps bootstrap, init0, the controller, and one bounded worker
@@ -150,6 +155,10 @@ const LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;
 // production UART, console, and bounded replacement generations.
 #[cfg(deepwyrm_wyr1d_evidence)]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;
+// Selector 33 retains the E6 product plus the selected shell and bounded job
+// actor generations under the permanent controller.
+#[cfg(deepwyrm_wyr1e_evidence)]
+const LIVE_ADDRESS_SPACE_CAPACITY: usize = 16;
 // Selector 31 extends selector 29's permanent resource-domain service graph
 // with one bounded raw-stream probe and therefore needs the same eight-root
 // functional headroom as its eight-Process runtime geometry.

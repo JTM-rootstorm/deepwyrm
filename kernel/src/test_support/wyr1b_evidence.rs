@@ -9,10 +9,17 @@
     allow(dead_code, reason = "host tests exercise the target-only relay")
 )]
 #![cfg_attr(
-    all(any(deepwyrm_wyr1c_evidence, deepwyrm_wyr1d_evidence), not(test)),
+    all(
+        any(
+            deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence,
+            deepwyrm_wyr1e_evidence
+        ),
+        not(test)
+    ),
     allow(
         dead_code,
-        reason = "selectors 29 and 32 reuse only the permanent-reporter startup and retirement facts"
+        reason = "selectors 29, 32, and 33 reuse only the permanent-reporter startup and retirement facts"
     )
 )]
 
