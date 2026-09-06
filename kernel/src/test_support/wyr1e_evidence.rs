@@ -576,12 +576,74 @@ fn forced_retirement_result(outcome: u32, values: [u64; 3]) -> bool {
         || (outcome == 1 && values[0] == 0x5745_0104 && values[1] == 0 && values[2] == 0)
 }
 
-const S1_KINDS: [u32; 18] = [13, 1, 5, 9, 1, 1, 1, 5, 9, 1, 5, 9, 1, 13, 7, 5, 9, 13];
-const TRIGGER_KINDS: [u32; 1] = [1];
-const S4_UP_KINDS: [u32; 4] = [1, 5, 9, 13];
+const KIND_LAUNCH: u32 = 1;
+const KIND_WAIT: u32 = 5;
+const KIND_TERMINATE: u32 = 7;
+const KIND_LIST: u32 = 9;
+const KIND_CLOSE: u32 = 13;
+const S1_KINDS: [u32; 18] = [
+    KIND_LIST,
+    KIND_LAUNCH,
+    KIND_WAIT,
+    KIND_CLOSE,
+    KIND_LAUNCH,
+    KIND_LAUNCH,
+    KIND_LAUNCH,
+    KIND_WAIT,
+    KIND_CLOSE,
+    KIND_LAUNCH,
+    KIND_WAIT,
+    KIND_CLOSE,
+    KIND_LAUNCH,
+    KIND_LIST,
+    KIND_TERMINATE,
+    KIND_WAIT,
+    KIND_CLOSE,
+    KIND_LIST,
+];
+const TRIGGER_KINDS: [u32; 1] = [KIND_LAUNCH];
+const S4_UP_KINDS: [u32; 4] = [KIND_LAUNCH, KIND_WAIT, KIND_CLOSE, KIND_LIST];
 const S4_SMP_KINDS: [u32; 40] = [
-    1, 1, 1, 1, 1, 1, 13, 1, 5, 9, 13, 1, 5, 9, 13, 1, 5, 9, 7, 7, 7, 7, 7, 7, 5, 9, 5, 9, 5, 9, 5,
-    9, 5, 9, 5, 9, 1, 5, 9, 13,
+    KIND_LAUNCH,
+    KIND_LAUNCH,
+    KIND_LAUNCH,
+    KIND_LAUNCH,
+    KIND_LAUNCH,
+    KIND_LAUNCH,
+    KIND_LIST,
+    KIND_LAUNCH,
+    KIND_WAIT,
+    KIND_CLOSE,
+    KIND_LIST,
+    KIND_LAUNCH,
+    KIND_WAIT,
+    KIND_CLOSE,
+    KIND_LIST,
+    KIND_LAUNCH,
+    KIND_WAIT,
+    KIND_CLOSE,
+    KIND_TERMINATE,
+    KIND_TERMINATE,
+    KIND_TERMINATE,
+    KIND_TERMINATE,
+    KIND_TERMINATE,
+    KIND_TERMINATE,
+    KIND_WAIT,
+    KIND_CLOSE,
+    KIND_WAIT,
+    KIND_CLOSE,
+    KIND_WAIT,
+    KIND_CLOSE,
+    KIND_WAIT,
+    KIND_CLOSE,
+    KIND_WAIT,
+    KIND_CLOSE,
+    KIND_WAIT,
+    KIND_CLOSE,
+    KIND_LAUNCH,
+    KIND_WAIT,
+    KIND_CLOSE,
+    KIND_LIST,
 ];
 const _: () = assert!(
     1 + S1_KINDS.len() + 1 + 2 * (1 + TRIGGER_KINDS.len() + 1) + 1 + S4_UP_KINDS.len() + 1 + 1
@@ -903,7 +965,12 @@ mod tests {
         record
     }
 
-    fn submit_e8_profile(collector: &Wyr1eEvidenceCollector, reporter: ProcessKey, smp: bool) {
+    fn submit_e8_profile_with_semantic_kinds(
+        collector: &Wyr1eEvidenceCollector,
+        reporter: ProcessKey,
+        stage1_kinds: &[u32],
+        stage4_kinds: &[u32],
+    ) {
         let shells = [
             [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
             [1, 12, 13, 14, 15, 6, 17, 18, 19, 20],
@@ -932,10 +999,9 @@ mod tests {
                 .unwrap();
             sequence += 1;
             let kinds: &[u32] = match stage {
-                1 => &S1_KINDS,
+                1 => stage1_kinds,
                 2 | 3 => &TRIGGER_KINDS,
-                4 if smp => &S4_SMP_KINDS,
-                4 => &S4_UP_KINDS,
+                4 => stage4_kinds,
                 _ => unreachable!(),
             };
             let mut launch = (0_u64, 0_u64);
@@ -1000,7 +1066,16 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(emitted, if smp { E8_SMP_RECORDS } else { E8_UP_RECORDS });
+        assert_eq!(emitted, 29 + stage4_kinds.len());
+    }
+
+    fn submit_e8_profile(collector: &Wyr1eEvidenceCollector, reporter: ProcessKey, smp: bool) {
+        submit_e8_profile_with_semantic_kinds(
+            collector,
+            reporter,
+            &S1_KINDS,
+            if smp { &S4_SMP_KINDS } else { &S4_UP_KINDS },
+        );
     }
 
     fn collector_after_stage1() -> (Wyr1eEvidenceCollector, ProcessKey, [u64; 10]) {
@@ -1110,6 +1185,22 @@ mod tests {
     }
 
     #[test]
+    fn e8_accepts_actual_wrlj_semantic_kind_sequences() {
+        let stage1 = [9, 1, 5, 13, 1, 1, 1, 5, 13, 1, 5, 13, 1, 9, 7, 5, 13, 9];
+        let stage4_up = [1, 5, 13, 9];
+        let stage4_smp = [
+            1, 1, 1, 1, 1, 1, 9, 1, 5, 13, 9, 1, 5, 13, 9, 1, 5, 13, 7, 7, 7, 7, 7, 7, 5, 13, 5,
+            13, 5, 13, 5, 13, 5, 13, 5, 13, 1, 5, 13, 9,
+        ];
+        for stage4 in [&stage4_up[..], &stage4_smp[..]] {
+            let collector = Wyr1eEvidenceCollector::new_v1_1(NONCE);
+            let (reporter, thread, root) = subject();
+            arm(&collector, reporter, thread, root);
+            submit_e8_profile_with_semantic_kinds(&collector, reporter, &stage1, stage4);
+        }
+    }
+
+    #[test]
     fn e8_forced_retirement_results_are_exact_and_source_complete() {
         assert!(forced_retirement_result(1, [0x5745_0104, 0, 0]));
         assert!(forced_retirement_result(5, [0; 3]));
@@ -1197,11 +1288,22 @@ mod tests {
                 &encode_e8(RECORD_SHELL_READY, 1, shell, 11, 12, 1, 0, [13, 14, 15]),
             )
             .unwrap();
-        let wrong_first = encode_e8(RECORD_SHELLJOBS_TRANSACTION, 2, shell, 21, 0, 1, 0, [0; 3]);
+        let wrong_first = encode_e8(RECORD_SHELLJOBS_TRANSACTION, 2, shell, 21, 0, 13, 0, [0; 3]);
         assert_eq!(
             collector.submit(reporter, &wrong_first).err(),
             Some(Wyr1eEvidenceError::Relation)
         );
+
+        let collector = Wyr1eEvidenceCollector::new_v1_1(NONCE);
+        arm(&collector, reporter, thread, root);
+        collector
+            .submit(
+                reporter,
+                &encode_e8(RECORD_SHELL_READY, 1, shell, 11, 12, 1, 0, [13, 14, 15]),
+            )
+            .unwrap();
+        let actual_first = encode_e8(RECORD_SHELLJOBS_TRANSACTION, 2, shell, 21, 0, 9, 0, [0; 3]);
+        collector.submit(reporter, &actual_first).unwrap();
     }
 
     #[test]
