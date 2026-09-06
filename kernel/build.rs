@@ -109,6 +109,8 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1C_EVIDENCE_NONCE");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1D_EVIDENCE_NONCE");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1E7_EVIDENCE_NONCE");
+    println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1E8_EVIDENCE");
+    println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1E8_EVIDENCE_NONCE");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_c3_one_shot_ui)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_memory_guest)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_e7_guest)");
@@ -125,6 +127,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1c_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1d_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1e_evidence)");
+    println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1e8_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1e_platform)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1e_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1e_e3b_full)");
@@ -150,6 +153,8 @@ fn run() -> Result<(), String> {
         .map_err(|error| format!("{}: {error}", task_layout_path.display()))?;
     let task_layout = TaskLayout::parse(&task_layout_source)
         .map_err(|error| format!("{}: {error}", task_layout_path.display()))?;
+    let wyr1e8 = optional_wyr1e8_evidence()?;
+    let task_layout = select_task_layout(task_layout, wyr1e8);
     emit_task_layout_env(task_layout);
 
     configure_guest_test(&guest_harness_path)?;
@@ -349,7 +354,7 @@ fn run() -> Result<(), String> {
         link_objects.push(f12_user_object.as_path());
     }
 
-    for argument in linker_arguments(layout, task_layout, &linker_path, &link_objects) {
+    for argument in linker_arguments(layout, task_layout, wyr1e8, &linker_path, &link_objects) {
         println!("cargo:rustc-link-arg={argument}");
     }
 
@@ -985,6 +990,13 @@ fn configure_guest_test(harness_path: &Path) -> Result<(), String> {
         }
     };
     let direct_id_present = env::var_os("DEEPWYRM_GUEST_TEST_ID").is_some();
+    let wyr1e8 = optional_wyr1e8_evidence()?;
+    if wyr1e8 && selector.as_deref() != Some("interactive-wyrmsh") {
+        return Err("DEEPWYRM_WYR1E8_EVIDENCE=1 requires selector interactive-wyrmsh".into());
+    }
+    if env::var_os("DEEPWYRM_WYR1E8_EVIDENCE_NONCE").is_some() && !wyr1e8 {
+        return Err("DEEPWYRM_WYR1E8_EVIDENCE_NONCE requires DEEPWYRM_WYR1E8_EVIDENCE=1".into());
+    }
     let harness_source = if feature_enabled {
         fs::read_to_string(harness_path)
             .map_err(|error| format!("{}: {error}", harness_path.display()))?
@@ -1052,11 +1064,43 @@ fn configure_guest_test(harness_path: &Path) -> Result<(), String> {
             println!("cargo:rustc-env=DEEPWYRM_WYR1D_EVIDENCE_NONCE={nonce}");
         }
         if is_wyr1e_evidence_selector(&selector) {
-            let nonce = required_wyr1e_hex("DEEPWYRM_WYR1E7_EVIDENCE_NONCE")?;
-            println!("cargo:rustc-env=DEEPWYRM_WYR1E7_EVIDENCE_NONCE={nonce}");
+            if wyr1e8 {
+                if env::var_os("DEEPWYRM_WYR1E7_EVIDENCE_NONCE").is_some() {
+                    return Err(
+                        "E8 evidence rejects the E7 nonce variable; use DEEPWYRM_WYR1E8_EVIDENCE_NONCE"
+                            .into(),
+                    );
+                }
+                let nonce = required_wyr1e_hex("DEEPWYRM_WYR1E8_EVIDENCE_NONCE")?;
+                println!("cargo:rustc-cfg=deepwyrm_wyr1e8_evidence");
+                println!("cargo:rustc-env=DEEPWYRM_WYR1E8_EVIDENCE_NONCE={nonce}");
+            } else {
+                let nonce = required_wyr1e_hex("DEEPWYRM_WYR1E7_EVIDENCE_NONCE")?;
+                println!("cargo:rustc-env=DEEPWYRM_WYR1E7_EVIDENCE_NONCE={nonce}");
+            }
         }
     }
     Ok(())
+}
+
+fn optional_wyr1e8_evidence() -> Result<bool, String> {
+    match env::var("DEEPWYRM_WYR1E8_EVIDENCE") {
+        Ok(value) => validate_wyr1e8_evidence(Some(&value)),
+        Err(env::VarError::NotPresent) => validate_wyr1e8_evidence(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err("DEEPWYRM_WYR1E8_EVIDENCE must be valid UTF-8".into())
+        }
+    }
+}
+
+fn validate_wyr1e8_evidence(value: Option<&str>) -> Result<bool, String> {
+    match value {
+        None => Ok(false),
+        Some("1") => Ok(true),
+        Some(value) => Err(format!(
+            "DEEPWYRM_WYR1E8_EVIDENCE must be absent or exactly 1, found `{value}`"
+        )),
+    }
 }
 
 fn required_dw1b_hex(name: &str) -> Result<String, String> {
@@ -1319,9 +1363,20 @@ fn emit_task_layout_env(layout: TaskLayout) {
     );
 }
 
+fn select_task_layout(mut layout: TaskLayout, wyr1e8: bool) -> TaskLayout {
+    if wyr1e8 {
+        // E8 has 64 schedulable Thread identities and therefore requires one
+        // guarded physical kernel stack for every execution slot. Keep the
+        // frozen E3 layout unchanged for every other product.
+        layout.thread_kernel_stack_count = 64;
+    }
+    layout
+}
+
 pub(crate) fn linker_arguments(
     layout: Layout,
     task_layout: TaskLayout,
+    wyr1e8: bool,
     linker_path: &Path,
     objects: &[&Path],
 ) -> Vec<String> {
@@ -1352,6 +1407,10 @@ pub(crate) fn linker_arguments(
         format!(
             "--defsym=DW_KERNEL_THREAD_STACK_COUNT={}",
             task_layout.thread_kernel_stack_count
+        ),
+        format!(
+            "--defsym=DW_KERNEL_WYR1E8_STACK_LAYOUT={}",
+            u8::from(wyr1e8)
         ),
         format!(
             "--defsym=DW_KERNEL_THREAD_STACK_SIZE={}",
@@ -2309,6 +2368,35 @@ mod tests {
     }
 
     #[test]
+    fn wyr1e8_selects_sixty_four_thread_stacks_without_changing_base_geometry() {
+        let base = TaskLayout::parse(include_str!("arch/x86_64/task_layout.toml")).unwrap();
+        let ordinary = select_task_layout(base, false);
+        let e8 = select_task_layout(base, true);
+        assert_eq!(ordinary.thread_kernel_stack_count, 16);
+        assert_eq!(e8.thread_kernel_stack_count, 64);
+        assert_eq!(
+            e8.thread_kernel_stack_size,
+            ordinary.thread_kernel_stack_size
+        );
+        assert_eq!(
+            e8.thread_kernel_stack_guard_size,
+            ordinary.thread_kernel_stack_guard_size
+        );
+        assert_eq!(
+            e8.thread_kernel_stack_alignment,
+            ordinary.thread_kernel_stack_alignment
+        );
+        assert_eq!(
+            e8.privilege_entry_stack_count,
+            ordinary.privilege_entry_stack_count
+        );
+        assert_eq!(
+            e8.terminal_reaper_stack_count,
+            ordinary.terminal_reaper_stack_count
+        );
+    }
+
+    #[test]
     fn dw1b_selector_and_build_owned_hex_are_exact() {
         assert!(is_dw1b_evidence_selector("normal-preemption-up"));
         assert!(!is_dw1b_evidence_selector("permanent-supervisor-rrc"));
@@ -2488,6 +2576,11 @@ mod tests {
             "G123456789ABCDEF",
         ] {
             assert!(validate_upper_nonzero_hex_nonce(invalid, "WYR1E").is_err());
+        }
+        assert_eq!(validate_wyr1e8_evidence(None), Ok(false));
+        assert_eq!(validate_wyr1e8_evidence(Some("1")), Ok(true));
+        for invalid in ["", "0", "01", "true", " 1"] {
+            assert!(validate_wyr1e8_evidence(Some(invalid)).is_err());
         }
     }
 

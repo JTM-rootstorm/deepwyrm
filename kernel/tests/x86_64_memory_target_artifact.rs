@@ -679,6 +679,7 @@ fn wyr1_primordial_selector_artifacts_fit_the_linked_boot_stack() {
                 &stack_sizes(&llvm_readelf, &stack_kernel),
                 &stack_disassembly,
                 linked_privilege_entry_stack_payload_bytes(&stack_symbols),
+                16,
             );
         }
         if selector == "normal-preemption-smp" {
@@ -717,6 +718,16 @@ fn wyr1_primordial_selector_artifacts_fit_the_linked_boot_stack() {
 #[test]
 #[ignore = "explicit accepted-toolchain WYR1-E7 privilege-entry stack gate"]
 fn wyr1e_external_interrupt_entry_stack_fits_the_linked_payload() {
+    run_wyr1e_external_interrupt_entry_stack_gate(false);
+}
+
+#[test]
+#[ignore = "explicit accepted-toolchain WYR1-E8 privilege-entry stack gate"]
+fn wyr1e8_external_interrupt_entry_stack_fits_the_linked_payload() {
+    run_wyr1e_external_interrupt_entry_stack_gate(true);
+}
+
+fn run_wyr1e_external_interrupt_entry_stack_gate(wyr1e8: bool) {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("kernel manifest has workspace parent")
@@ -797,27 +808,54 @@ fn wyr1e_external_interrupt_entry_stack_fits_the_linked_payload() {
     let build_input_before = build_input_manifest_sha256(&workspace);
     let selector = "interactive-wyrmsh";
 
-    let kernel = build_release_kernel(
-        &workspace,
-        &output_root.path().join("wyr1e-release"),
-        &environment,
-        tools,
-        selector,
-    );
-    validate_static_kernel_elf(&llvm_readelf, &kernel, "WYR1-E7 release");
+    let kernel = if wyr1e8 {
+        build_release_wyr1e8_kernel(
+            &workspace,
+            &output_root.path().join("wyr1e8-release"),
+            &environment,
+            tools,
+            selector,
+        )
+    } else {
+        build_release_kernel(
+            &workspace,
+            &output_root.path().join("wyr1e-release"),
+            &environment,
+            tools,
+            selector,
+        )
+    };
+    let milestone = if wyr1e8 { "WYR1-E8" } else { "WYR1-E7" };
+    validate_static_kernel_elf(&llvm_readelf, &kernel, &format!("{milestone} release"));
     let kernel_symbols = symbols(&llvm_nm, &kernel);
-    validate_kernel_stack_artifact_geometry(&kernel_symbols);
+    validate_kernel_stack_artifact_geometry_for_threads(
+        &kernel_symbols,
+        if wyr1e8 { 64 } else { 16 },
+    );
     let kernel_disassembly = disassembly(&llvm_objdump, &kernel);
 
-    let stack_kernel = build_release_stack_kernel(
-        &workspace,
-        &output_root.path().join("wyr1e-release-stack-sizes"),
-        &environment,
-        tools,
-        selector,
-    );
+    let stack_kernel = if wyr1e8 {
+        build_release_wyr1e8_stack_kernel(
+            &workspace,
+            &output_root.path().join("wyr1e8-release-stack-sizes"),
+            &environment,
+            tools,
+            selector,
+        )
+    } else {
+        build_release_stack_kernel(
+            &workspace,
+            &output_root.path().join("wyr1e-release-stack-sizes"),
+            &environment,
+            tools,
+            selector,
+        )
+    };
     let stack_symbols = symbols(&llvm_nm, &stack_kernel);
-    validate_kernel_stack_artifact_geometry(&stack_symbols);
+    validate_kernel_stack_artifact_geometry_for_threads(
+        &stack_symbols,
+        if wyr1e8 { 64 } else { 16 },
+    );
     let stack_disassembly = disassembly(&llvm_objdump, &stack_kernel);
     assert_eq!(
         text_disassembly(&stack_disassembly),
@@ -828,6 +866,7 @@ fn wyr1e_external_interrupt_entry_stack_fits_the_linked_payload() {
         &stack_sizes(&llvm_readelf, &stack_kernel),
         &stack_disassembly,
         linked_privilege_entry_stack_payload_bytes(&stack_symbols),
+        if wyr1e8 { 64 } else { 16 },
     );
 
     assert_eq!(

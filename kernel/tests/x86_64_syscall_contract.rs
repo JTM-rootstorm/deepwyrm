@@ -1001,7 +1001,7 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
         )
     );
     assert!(runtime.contains(
-        "#[cfg(any(\n    deepwyrm_wyr1c_evidence,\n    deepwyrm_wyr1d_evidence,\n    deepwyrm_dw1e_evidence\n))]\nconst _: () = assert!(super::LIVE_ADDRESS_SPACE_CAPACITY >= USERSPACE_CHAIN_PROCESSES);"
+        "#[cfg(any(\n    deepwyrm_wyr1c_evidence,\n    deepwyrm_wyr1d_evidence,\n    deepwyrm_wyr1e_evidence,\n    deepwyrm_dw1e_evidence\n))]\nconst _: () = assert!(super::LIVE_ADDRESS_SPACE_CAPACITY >= USERSPACE_CHAIN_PROCESSES);"
     ));
     assert!(
         runtime.contains(
@@ -1055,13 +1055,13 @@ fn live_uart_selectors_provision_overlapping_control_and_temt_timers() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
 
     assert!(runtime.contains(
-        "#[cfg(not(any(deepwyrm_i2_stress, deepwyrm_dw1e_evidence, deepwyrm_wyr1d_evidence)))]\nconst TIMERS: usize = 1;"
+        "#[cfg(not(any(\n    deepwyrm_i2_stress,\n    deepwyrm_dw1e_evidence,\n    deepwyrm_wyr1d_evidence,\n    deepwyrm_wyr1e_evidence\n)))]\nconst TIMERS: usize = 1;"
     ));
     assert!(runtime.contains(
-        "#[cfg(any(deepwyrm_i2_stress, deepwyrm_dw1e_evidence, deepwyrm_wyr1d_evidence))]\nconst TIMERS: usize = 2;"
+        "#[cfg(any(\n    deepwyrm_i2_stress,\n    deepwyrm_dw1e_evidence,\n    deepwyrm_wyr1d_evidence,\n    deepwyrm_wyr1e_evidence\n))]\nconst TIMERS: usize = 2;"
     ));
     assert!(runtime.contains(
-        "#[cfg(any(deepwyrm_dw1e_evidence, deepwyrm_wyr1d_evidence))]\nconst _: [(); 2] = [(); TIMERS];"
+        "#[cfg(any(\n    deepwyrm_dw1e_evidence,\n    deepwyrm_wyr1d_evidence,\n    deepwyrm_wyr1e_evidence\n))]\nconst _: [(); 2] = [(); TIMERS];"
     ));
 }
 

@@ -625,6 +625,82 @@ fn selector33_wre1_shell_relay_is_private_bounded_and_atomic() {
 }
 
 #[test]
+fn selector33_e8_profile_is_additive_exact_and_private() {
+    let root = kernel_root();
+    let build = fs::read_to_string(root.join("build.rs")).expect("read kernel build");
+    let activation = fs::read_to_string(root.join("src/arch/x86_64/mm/activation.rs"))
+        .expect("read activation geometry");
+    let primordial = fs::read_to_string(root.join("src/arch/x86_64/mm/activation/primordial.rs"))
+        .expect("read primordial geometry");
+    let kernel_stack = fs::read_to_string(root.join("src/memory/kernel_stack.rs"))
+        .expect("read kernel-stack geometry");
+    let evidence = fs::read_to_string(root.join("src/test_support/wyr1e_evidence.rs"))
+        .expect("read selector-33 evidence");
+    let artifact_gate = fs::read_to_string(root.join("tests/x86_64_memory_target_artifact.rs"))
+        .expect("read selector-33 artifact gate");
+    let stack_gate =
+        fs::read_to_string(root.join("tests/x86_64_memory_target_artifact/stack/wyr1e.rs"))
+            .expect("read selector-33 stack gate");
+    let build_support =
+        fs::read_to_string(root.join("tests/x86_64_memory_target_artifact/build_support.rs"))
+            .expect("read selector-33 build support");
+    let public_abi = fs::read_to_string(root.join("../abi/generated/deepwyrm_abi.rs"))
+        .expect("read generated ABI");
+
+    for exact in [
+        "cargo:rerun-if-env-changed=DEEPWYRM_WYR1E8_EVIDENCE",
+        "cargo:rerun-if-env-changed=DEEPWYRM_WYR1E8_EVIDENCE_NONCE",
+        "cargo:rustc-check-cfg=cfg(deepwyrm_wyr1e8_evidence)",
+        "cargo:rustc-cfg=deepwyrm_wyr1e8_evidence",
+        "DEEPWYRM_WYR1E8_EVIDENCE must be absent or exactly 1",
+        "E8 evidence rejects the E7 nonce variable",
+        "layout.thread_kernel_stack_count = 64;",
+    ] {
+        assert!(build.contains(exact), "E8 build contract lost `{exact}`");
+    }
+    assert!(activation.contains(
+        "#[cfg(deepwyrm_wyr1e8_evidence)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 64;"
+    ));
+    assert!(kernel_stack.contains(
+        "#[cfg(not(deepwyrm_wyr1e8_evidence))]\npub(crate) const E3_THREAD_STACK_COUNT: usize = 16;"
+    ));
+    assert!(kernel_stack.contains(
+        "#[cfg(deepwyrm_wyr1e8_evidence)]\npub(crate) const E3_THREAD_STACK_COUNT: usize = 64;"
+    ));
+    assert!(build.contains("--defsym=DW_KERNEL_WYR1E8_STACK_LAYOUT={}"));
+    assert!(build.contains("u8::from(wyr1e8)"));
+    for exact in [
+        "#[cfg(deepwyrm_wyr1e8_evidence)]\nconst USERSPACE_CHAIN_PROCESSES: usize = 64;",
+        "#[cfg(deepwyrm_wyr1e8_evidence)]\nconst CHANNEL_PAIRS: usize = 32;",
+        "#[cfg(deepwyrm_wyr1e8_evidence)]\nconst TASK_GROUPS: usize = 64;",
+        "const _: [(); 64] = [(); WAITERS];",
+    ] {
+        assert!(primordial.contains(exact), "E8 geometry lost `{exact}`");
+    }
+    for exact in [
+        "EvidenceVersion::V1_1",
+        "const E8_UP_RECORDS: usize = 33;",
+        "const E8_SMP_RECORDS: usize = 69;",
+        "0x5745_0104 | 0x5745_0106",
+        "const S1_KINDS: [u32; 18]",
+        "const S4_SMP_KINDS: [u32; 40]",
+    ] {
+        assert!(evidence.contains(exact), "E8 relay lost `{exact}`");
+    }
+    assert!(!public_abi.contains("WYR1E8"));
+    assert!(!public_abi.contains("deepwyrm_wyr1e8_evidence"));
+    assert!(
+        artifact_gate.contains("wyr1e8_external_interrupt_entry_stack_fits_the_linked_payload")
+    );
+    assert!(artifact_gate.contains("if wyr1e8 { 64 } else { 16 }"));
+    assert!(stack_gate.contains("ExecutionDomain<{execution_threads}>"));
+    assert!(primordial.contains("external_interrupt::bind_q35_external_interrupt_handler(target)"));
+    assert!(primordial.contains("Q35ExternalInterruptHandler\n    for PrimordialRuntimeShared"));
+    assert!(build_support.contains("build_release_wyr1e8_stack_kernel"));
+    assert!(build_support.contains(".env_remove(\"DEEPWYRM_WYR1E7_EVIDENCE_NONCE\")"));
+}
+
+#[test]
 fn dw1e_q35_time_surface_is_selected_platform_only() {
     let root = kernel_root();
     let live = fs::read_to_string(root.join("src/time/live.rs")).expect("read live time source");
@@ -1422,6 +1498,7 @@ dw_test_bss_probe:
     let link_arguments = kernel_build::linker_arguments(
         layout,
         task_layout,
+        false,
         &linker_path(),
         &[
             entry_object.as_path(),

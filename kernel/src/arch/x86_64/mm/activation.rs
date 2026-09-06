@@ -157,8 +157,13 @@ const LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;
 // Selector 33 retains the E6 product plus the selected shell and bounded job
 // actor generations under the permanent controller.
-#[cfg(deepwyrm_wyr1e_evidence)]
+#[cfg(all(deepwyrm_wyr1e_evidence, not(deepwyrm_wyr1e8_evidence)))]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 16;
+// E8 retains every replaced product generation and runs six concurrent hogs.
+// The selector-local 64-root geometry covers the enumerated 30-identity
+// lifetime floor with useful recovery and cleanup headroom.
+#[cfg(deepwyrm_wyr1e8_evidence)]
+const LIVE_ADDRESS_SPACE_CAPACITY: usize = 64;
 // Selector 31 extends selector 29's permanent resource-domain service graph
 // with one bounded raw-stream probe and therefore needs the same eight-root
 // functional headroom as its eight-Process runtime geometry.

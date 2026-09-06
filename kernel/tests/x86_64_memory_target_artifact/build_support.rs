@@ -123,9 +123,31 @@ pub(super) fn build_release_kernel(
     tools: BuildTools<'_>,
     selector: &str,
 ) -> PathBuf {
+    build_release_wyr1e_kernel(workspace, target_dir, environment, tools, selector, false)
+}
+
+pub(super) fn build_release_wyr1e8_kernel(
+    workspace: &Path,
+    target_dir: &Path,
+    environment: &BuildEnvironment,
+    tools: BuildTools<'_>,
+    selector: &str,
+) -> PathBuf {
+    build_release_wyr1e_kernel(workspace, target_dir, environment, tools, selector, true)
+}
+
+fn build_release_wyr1e_kernel(
+    workspace: &Path,
+    target_dir: &Path,
+    environment: &BuildEnvironment,
+    tools: BuildTools<'_>,
+    selector: &str,
+    wyr1e8: bool,
+) -> PathBuf {
     let mut command = tools.cargo.command();
     environment.apply(&mut command, tools, target_dir);
     apply_selector_environment(&mut command, selector);
+    apply_wyr1e8_environment(&mut command, wyr1e8);
     command
         .current_dir(workspace)
         .env("DEEPWYRM_GUEST_TEST_SELECTOR", selector)
@@ -159,9 +181,31 @@ pub(super) fn build_release_stack_kernel(
     tools: BuildTools<'_>,
     selector: &str,
 ) -> PathBuf {
+    build_release_wyr1e_stack_kernel(workspace, target_dir, environment, tools, selector, false)
+}
+
+pub(super) fn build_release_wyr1e8_stack_kernel(
+    workspace: &Path,
+    target_dir: &Path,
+    environment: &BuildEnvironment,
+    tools: BuildTools<'_>,
+    selector: &str,
+) -> PathBuf {
+    build_release_wyr1e_stack_kernel(workspace, target_dir, environment, tools, selector, true)
+}
+
+fn build_release_wyr1e_stack_kernel(
+    workspace: &Path,
+    target_dir: &Path,
+    environment: &BuildEnvironment,
+    tools: BuildTools<'_>,
+    selector: &str,
+    wyr1e8: bool,
+) -> PathBuf {
     let mut command = tools.cargo.command();
     environment.apply(&mut command, tools, target_dir);
     apply_selector_environment(&mut command, selector);
+    apply_wyr1e8_environment(&mut command, wyr1e8);
     command
         .current_dir(workspace)
         .env("RUSTFLAGS", "-Z emit-stack-sizes")
@@ -191,6 +235,15 @@ pub(super) fn build_release_stack_kernel(
         artifact.display()
     );
     artifact
+}
+
+fn apply_wyr1e8_environment(command: &mut Command, wyr1e8: bool) {
+    if wyr1e8 {
+        command
+            .env_remove("DEEPWYRM_WYR1E7_EVIDENCE_NONCE")
+            .env("DEEPWYRM_WYR1E8_EVIDENCE", "1")
+            .env("DEEPWYRM_WYR1E8_EVIDENCE_NONCE", "E800000000000001");
+    }
 }
 
 fn apply_selector_environment(command: &mut Command, selector: &str) {

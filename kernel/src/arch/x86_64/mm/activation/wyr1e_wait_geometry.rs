@@ -5,7 +5,16 @@
 // maxima of: consoled 12, UART 3, devmgr 4, registryd 6, wyrmsh 7, and the
 // system-init controller 7. This is a demonstrated product-graph bound, not a
 // production-wide quota; retain headroom for scheduling overlap at cleanup.
+const E7_ACTOR_ITEMS: [usize; 6] = [12, 3, 4, 6, 7, 7];
+// E8 retains one additional consoled bootstrap-control registration and the
+// pressure actor can hold one WRITABLE registration concurrently. The six
+// CPU hogs remain runnable, the completed silent trigger is reaped before
+// quiescence, and the controller reuses its existing consoled-bootstrap wait.
+const E8_ACTOR_ITEMS: [usize; 7] = [13, 3, 4, 6, 7, 7, 1];
+#[cfg(not(deepwyrm_wyr1e8_evidence))]
 const REQUIRED_GRAPH_ITEMS: usize = 12 + 3 + 4 + 6 + 7 + 7;
+#[cfg(deepwyrm_wyr1e8_evidence)]
+const REQUIRED_GRAPH_ITEMS: usize = 13 + 3 + 4 + 6 + 7 + 7 + 1;
 pub(super) const WAITERS: usize = 64;
 const _: () = assert!(WAITERS >= REQUIRED_GRAPH_ITEMS);
 
@@ -19,15 +28,14 @@ mod tests {
     use crate::wait::{WaitError, WaitRegistry};
     use deepwyrm_abi::{DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_THREAD, DW_SIGNAL_READABLE};
 
-    fn exercise_graph<const CAPACITY: usize>() -> bool {
-        let item_counts = [12, 3, 4, 6, 7, 7];
+    fn exercise_graph<const CAPACITY: usize>(item_counts: &[usize]) -> bool {
         let expected_items: usize = item_counts.iter().sum();
         let mut objects = ObjectRegistry::<64>::new();
         let waits = WaitRegistry::<CAPACITY>::new();
-        let scheduler = CooperativeScheduler::<6>::new();
+        let scheduler = CooperativeScheduler::<8>::new();
         let mut sources = std::vec::Vec::new();
         let mut threads = std::vec::Vec::new();
-        for count in item_counts {
+        for &count in item_counts {
             let thread = objects.create(DW_OBJECT_TYPE_THREAD).unwrap();
             let key = ThreadKey::from_object_id(thread.id());
             let reservation = scheduler.reserve(key).unwrap();
@@ -104,7 +112,13 @@ mod tests {
 
     #[test]
     fn selector33_whole_wait_graph_exceeds_32_and_fits_with_cleanup() {
-        assert!(!exercise_graph::<32>());
-        assert!(exercise_graph::<WAITERS>());
+        assert!(!exercise_graph::<32>(&E7_ACTOR_ITEMS));
+        assert!(exercise_graph::<WAITERS>(&E7_ACTOR_ITEMS));
+    }
+
+    #[test]
+    fn selector33_e8_control_and_pressure_overlap_fit_with_headroom() {
+        assert!(!exercise_graph::<40>(&E8_ACTOR_ITEMS));
+        assert!(exercise_graph::<WAITERS>(&E8_ACTOR_ITEMS));
     }
 }

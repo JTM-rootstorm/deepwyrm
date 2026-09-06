@@ -256,8 +256,15 @@ const USERSPACE_CHAIN_PROCESSES: usize = 8;
 // Selector 33 adds four lifetime-distinct job actors to the resident E6
 // service graph. The scheduler retains terminal identities for the boot, so
 // size this selector-local test artifact for the full interactive sequence.
-#[cfg(deepwyrm_wyr1e_evidence)]
+#[cfg(all(deepwyrm_wyr1e_evidence, not(deepwyrm_wyr1e8_evidence)))]
 const USERSPACE_CHAIN_PROCESSES: usize = 16;
+// E8 keeps the accepted E7 actors, two silent triggers, all replacement
+// service generations, six simultaneous hogs, three later hello actors, and
+// the pressure actor in the scheduler's terminal-retirement history. The
+// exact scenario has at least 30 lifetime identities; 64 avoids a near-bound
+// packing target while keeping the expansion selector-private.
+#[cfg(deepwyrm_wyr1e8_evidence)]
+const USERSPACE_CHAIN_PROCESSES: usize = 64;
 #[cfg(any(
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
@@ -293,10 +300,15 @@ const CHANNEL_PAIRS: usize = 24;
 #[cfg(any(
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
-    deepwyrm_wyr1e_evidence,
     deepwyrm_dw1e_evidence
 ))]
 const CHANNEL_PAIRS: usize = 24;
+#[cfg(all(deepwyrm_wyr1e_evidence, not(deepwyrm_wyr1e8_evidence)))]
+const CHANNEL_PAIRS: usize = 24;
+// E8 adds the retained consoled control endpoint and overlapping job actors.
+// Thirty-two pairs give bounded headroom without changing production ABI.
+#[cfg(deepwyrm_wyr1e8_evidence)]
+const CHANNEL_PAIRS: usize = 32;
 const CHANNEL_DEPTH: usize = 2;
 #[cfg(not(any(
     deepwyrm_i2_stress,
@@ -367,10 +379,13 @@ const TASK_GROUPS: usize = 8;
 #[cfg(any(
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
-    deepwyrm_wyr1e_evidence,
     deepwyrm_dw1e_evidence
 ))]
 const TASK_GROUPS: usize = 8;
+#[cfg(all(deepwyrm_wyr1e_evidence, not(deepwyrm_wyr1e8_evidence)))]
+const TASK_GROUPS: usize = 8;
+#[cfg(deepwyrm_wyr1e8_evidence)]
+const TASK_GROUPS: usize = 64;
 const PROCESSES: usize = USERSPACE_CHAIN_PROCESSES;
 const THREADS: usize = USERSPACE_CHAIN_PROCESSES;
 // Exact live bootstrap peak per Process: four inherited handles, one net
@@ -622,15 +637,20 @@ const _: [(); 160] = [(); REGISTRY_OBJECTS];
     deepwyrm_dw1e_evidence
 ))]
 const _: [(); 8] = [(); USERSPACE_CHAIN_PROCESSES];
-#[cfg(deepwyrm_wyr1e_evidence)]
+#[cfg(all(deepwyrm_wyr1e_evidence, not(deepwyrm_wyr1e8_evidence)))]
 const _: [(); 16] = [(); USERSPACE_CHAIN_PROCESSES];
+#[cfg(deepwyrm_wyr1e8_evidence)]
+const _: [(); 64] = [(); USERSPACE_CHAIN_PROCESSES];
 #[cfg(any(
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
-    deepwyrm_wyr1e_evidence,
     deepwyrm_dw1e_evidence
 ))]
 const _: [(); 24] = [(); CHANNEL_PAIRS];
+#[cfg(all(deepwyrm_wyr1e_evidence, not(deepwyrm_wyr1e8_evidence)))]
+const _: [(); 24] = [(); CHANNEL_PAIRS];
+#[cfg(deepwyrm_wyr1e8_evidence)]
+const _: [(); 32] = [(); CHANNEL_PAIRS];
 #[cfg(any(
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
@@ -671,12 +691,12 @@ const _: [(); 64] = [(); WAITERS];
     deepwyrm_wyr1e_evidence
 ))]
 const _: [(); 2] = [(); TIMERS];
-#[cfg(any(
-    deepwyrm_dw1e_evidence,
-    deepwyrm_wyr1d_evidence,
-    deepwyrm_wyr1e_evidence
-))]
+#[cfg(any(deepwyrm_dw1e_evidence, deepwyrm_wyr1d_evidence))]
 const _: [(); 8] = [(); TASK_GROUPS];
+#[cfg(all(deepwyrm_wyr1e_evidence, not(deepwyrm_wyr1e8_evidence)))]
+const _: [(); 8] = [(); TASK_GROUPS];
+#[cfg(deepwyrm_wyr1e8_evidence)]
+const _: [(); 64] = [(); TASK_GROUPS];
 #[cfg(any(
     deepwyrm_dw1e_evidence,
     deepwyrm_wyr1d_evidence,

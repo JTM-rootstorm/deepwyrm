@@ -4,6 +4,7 @@ pub(crate) fn validate_wyr1e_privilege_entry_stack_margin(
     sizes: &[StackSize],
     disassembly: &str,
     privilege_entry_stack_bytes: usize,
+    execution_threads: usize,
 ) {
     const ARCHITECTURAL_HEADROOM_BYTES: usize = 4 * 1024;
     const REQUIRED_SPARE_BYTES: usize = 32 * 1024;
@@ -64,20 +65,33 @@ pub(crate) fn validate_wyr1e_privilege_entry_stack_margin(
             == "<deepwyrm_kernel::device::q35_interrupt::Q35InterruptPlatform>::record_pending_delivery"
     });
     let (complete_wakes, complete_wakes_bytes) = select("q35 wake completion", &|symbol| {
-        symbol == "deepwyrm_kernel::wait::complete_irq_signal_wakes::<64, 16>"
+        symbol
+            == format!(
+                "deepwyrm_kernel::wait::complete_irq_signal_wakes::<64, {execution_threads}>"
+            )
     });
     let (wake, wake_bytes) = select("q35 execution wake", &|symbol| {
-        symbol == "<deepwyrm_kernel::task::execution::ExecutionDomain<16>>::wake"
+        symbol
+            == format!(
+                "<deepwyrm_kernel::task::execution::ExecutionDomain<{execution_threads}>>::wake"
+            )
     });
     let (wake_on, wake_on_bytes) = select("q35 scheduler wake", &|symbol| {
-        symbol == "<deepwyrm_kernel::task::scheduler::CooperativeScheduler<16>>::wake_on"
-    });
-    let (assert_invariants, assert_invariants_bytes) =
-        select("q35 scheduler invariant check", &|symbol| {
-            symbol.contains(
-                "<deepwyrm_kernel::task::scheduler::SchedulerState<16>>::assert_invariants",
+        symbol
+            == format!(
+                "<deepwyrm_kernel::task::scheduler::CooperativeScheduler<{execution_threads}>>::wake_on"
             )
-        });
+    });
+    let (assert_invariants, assert_invariants_bytes) = select(
+        "q35 scheduler invariant check",
+        &|symbol| {
+            symbol.contains(
+                &format!(
+                    "<deepwyrm_kernel::task::scheduler::SchedulerState<{execution_threads}>>::assert_invariants"
+                ),
+            )
+        },
+    );
     let (_eoi, eoi_bytes) = select("q35 EOI transport", &|symbol| {
         symbol.contains("arch::x86_64::ipi::transport_eoi::<")
             && symbol.contains("StationaryLiveIpiTransport")
