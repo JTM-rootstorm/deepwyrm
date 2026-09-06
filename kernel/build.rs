@@ -1365,10 +1365,12 @@ fn emit_task_layout_env(layout: TaskLayout) {
 
 fn select_task_layout(mut layout: TaskLayout, wyr1e8: bool) -> TaskLayout {
     if wyr1e8 {
-        // E8 has 64 schedulable Thread identities and therefore requires one
-        // guarded physical kernel stack for every execution slot. Keep the
-        // frozen E3 layout unchanged for every other product.
+        // E8 has 64 schedulable Thread identities and its fixed scenario
+        // retains the production syscall handler with 64-capacity task-group
+        // helpers. Keep the frozen E3 layout unchanged for every other
+        // product.
         layout.thread_kernel_stack_count = 64;
+        layout.thread_kernel_stack_size = 4 * 1024 * 1024;
     }
     layout
 }
@@ -2368,16 +2370,14 @@ mod tests {
     }
 
     #[test]
-    fn wyr1e8_selects_sixty_four_thread_stacks_without_changing_base_geometry() {
+    fn wyr1e8_selects_sixty_four_four_mib_thread_stacks() {
         let base = TaskLayout::parse(include_str!("arch/x86_64/task_layout.toml")).unwrap();
         let ordinary = select_task_layout(base, false);
         let e8 = select_task_layout(base, true);
         assert_eq!(ordinary.thread_kernel_stack_count, 16);
         assert_eq!(e8.thread_kernel_stack_count, 64);
-        assert_eq!(
-            e8.thread_kernel_stack_size,
-            ordinary.thread_kernel_stack_size
-        );
+        assert_eq!(ordinary.thread_kernel_stack_size, 524_288);
+        assert_eq!(e8.thread_kernel_stack_size, 4 * 1024 * 1024);
         assert_eq!(
             e8.thread_kernel_stack_guard_size,
             ordinary.thread_kernel_stack_guard_size

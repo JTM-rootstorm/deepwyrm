@@ -869,6 +869,11 @@ fn run_wyr1e_external_interrupt_entry_stack_gate(wyr1e8: bool) {
             &stack_sizes,
             linked_boot_stack_payload_bytes(&stack_symbols),
         );
+        validate_wyr1e8_thread_stack_margin(
+            &stack_sizes,
+            &stack_disassembly,
+            linked_thread_kernel_stack_payload_bytes_for_threads(&stack_symbols, 64),
+        );
     }
     validate_wyr1e_privilege_entry_stack_margin(
         &stack_sizes,

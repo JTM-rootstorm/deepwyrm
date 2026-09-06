@@ -9,6 +9,11 @@ pub(crate) fn validate_kernel_stack_artifact_geometry_for_threads(
     thread_count: u64,
 ) {
     assert!(matches!(thread_count, 16 | 64));
+    let thread_stack_bytes = match thread_count {
+        16 => 512 * 1024,
+        64 => 4 * 1024 * 1024,
+        _ => unreachable!(),
+    };
     let addresses = symbols
         .lines()
         .filter_map(|line| {
@@ -77,7 +82,10 @@ pub(crate) fn validate_kernel_stack_artifact_geometry_for_threads(
     let thread_start = address("__dw_thread_kernel_stack_region_start");
     let thread_end = address("__dw_thread_kernel_stack_region_end");
     assert_eq!(thread_start & 0xfff, 0, "thread stack arena alignment");
-    assert_eq!(thread_end - thread_start, thread_count * (4096 + 524288));
+    assert_eq!(
+        thread_end - thread_start,
+        thread_count * (4096 + thread_stack_bytes)
+    );
     assert!(
         address("__dw_ist_region_end") <= thread_start && thread_end <= address("__dw_data_end"),
         "linked E3 thread stack arena escapes the writable data PT_LOAD bounds"
@@ -109,6 +117,14 @@ pub(crate) fn validate_kernel_stack_artifact_geometry_for_threads(
 }
 
 pub(crate) fn linked_thread_kernel_stack_payload_bytes(symbols: &str) -> usize {
+    linked_thread_kernel_stack_payload_bytes_for_threads(symbols, 16)
+}
+
+pub(crate) fn linked_thread_kernel_stack_payload_bytes_for_threads(
+    symbols: &str,
+    thread_count: u64,
+) -> usize {
+    assert!(matches!(thread_count, 16 | 64));
     let addresses = symbols
         .lines()
         .filter_map(|line| {
@@ -125,14 +141,13 @@ pub(crate) fn linked_thread_kernel_stack_payload_bytes(symbols: &str) -> usize {
     };
     let start = address("__dw_thread_kernel_stack_region_start");
     let end = address("__dw_thread_kernel_stack_region_end");
-    const THREAD_STACKS: u64 = 16;
     const GUARD_BYTES: u64 = 4096;
     let per_thread = (end - start)
-        .checked_div(THREAD_STACKS)
+        .checked_div(thread_count)
         .expect("thread stack count is nonzero");
     assert_eq!(
         end - start,
-        per_thread * THREAD_STACKS,
+        per_thread * thread_count,
         "thread kernel stack region has fractional per-thread geometry"
     );
     let payload = per_thread

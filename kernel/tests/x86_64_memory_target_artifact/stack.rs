@@ -1288,6 +1288,8 @@ mod production;
 mod selector;
 #[path = "stack/wyr1e.rs"]
 mod wyr1e;
+#[path = "stack/wyr1e_thread.rs"]
+mod wyr1e_thread;
 
 pub(super) use dw1c::validate_dw1c_stack_margins;
 pub(super) use e7::validate_e7_stack_margin;
@@ -1297,9 +1299,11 @@ pub(super) use geometry::linked_boot_stack_payload_bytes;
 pub(super) use geometry::linked_privilege_entry_stack_payload_bytes;
 pub(super) use geometry::linked_terminal_reaper_stack_payload_bytes;
 pub(super) use geometry::linked_thread_kernel_stack_payload_bytes;
+pub(super) use geometry::linked_thread_kernel_stack_payload_bytes_for_threads;
 pub(super) use geometry::validate_kernel_stack_artifact_geometry;
 pub(super) use geometry::validate_kernel_stack_artifact_geometry_for_threads;
 pub(super) use primordial::validate_primordial_boot_stack_margin;
 pub(super) use production::validate_production_ist_stack_margin;
 pub(super) use selector::validate_selector_stack_margin;
 pub(super) use wyr1e::validate_wyr1e_privilege_entry_stack_margin;
+pub(super) use wyr1e_thread::validate_wyr1e8_thread_stack_margin;

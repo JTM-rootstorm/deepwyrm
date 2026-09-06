@@ -659,6 +659,7 @@ fn selector33_e8_profile_is_additive_exact_and_private() {
         "DEEPWYRM_WYR1E8_EVIDENCE must be absent or exactly 1",
         "E8 evidence rejects the E7 nonce variable",
         "layout.thread_kernel_stack_count = 64;",
+        "layout.thread_kernel_stack_size = 4 * 1024 * 1024;",
     ] {
         assert!(build.contains(exact), "E8 build contract lost `{exact}`");
     }
@@ -670,6 +671,12 @@ fn selector33_e8_profile_is_additive_exact_and_private() {
     ));
     assert!(kernel_stack.contains(
         "#[cfg(deepwyrm_wyr1e8_evidence)]\npub(crate) const E3_THREAD_STACK_COUNT: usize = 64;"
+    ));
+    assert!(kernel_stack.contains(
+        "#[cfg(not(deepwyrm_wyr1e8_evidence))]\npub(crate) const E3_THREAD_STACK_SIZE: u64 = 524_288;"
+    ));
+    assert!(kernel_stack.contains(
+        "#[cfg(deepwyrm_wyr1e8_evidence)]\npub(crate) const E3_THREAD_STACK_SIZE: u64 = 4 * 1024 * 1024;"
     ));
     assert!(build.contains("--defsym=DW_KERNEL_WYR1E8_STACK_LAYOUT={}"));
     assert!(build.contains("u8::from(wyr1e8)"));
