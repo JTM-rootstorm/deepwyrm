@@ -573,10 +573,7 @@ fn validate_v1_1_retired(
 
 fn forced_retirement_result(outcome: u32, values: [u64; 3]) -> bool {
     (outcome == 5 && values == [0; 3])
-        || (outcome == 1
-            && values[0] == 0x5745_0104
-            && values[1] == 0
-            && values[2] == 0)
+        || (outcome == 1 && values[0] == 0x5745_0104 && values[1] == 0 && values[2] == 0)
 }
 
 const S1_KINDS: [u32; 18] = [13, 1, 5, 9, 1, 1, 1, 5, 9, 1, 5, 9, 1, 13, 7, 5, 9, 13];

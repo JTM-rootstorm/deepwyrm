@@ -1221,6 +1221,285 @@ fn channel_send_reports_peer_closed_after_peer_finalization() {
 }
 
 #[test]
+fn retired_channel_generations_cannot_mutate_reused_endpoint_state() {
+    use deepwyrm_abi::{
+        DW_DEADLINE_NOW, DW_HANDLE_INVALID, DW_RIGHT_READ, DW_RIGHT_WAIT, DW_RIGHT_WRITE,
+        DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE,
+    };
+
+    let (mut registry, mut tasks, execution, process, thread, process_handle) =
+        wait_running_fixture();
+    let events = EventAuthority::<1>::new();
+    let timers = TimerAuthority::<1>::new();
+    let channels = ChannelAuthority::<1, 4>::new();
+    let waits = WaitRegistry::<8>::new();
+    let mut operations = WaitOperationRegistry::<FakeOwnedOutput, 1>::new();
+    let mut user = FakeUserMemory::new();
+    let mut staging = std::vec![0_u8; DW_CHANNEL_MAX_PAYLOAD as usize];
+    let requested = DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_WAIT.0);
+    let retired_payloads = [
+        std::vec![0x31_u8; 48],
+        std::vec![0x52_u8; 160],
+        std::vec![0x73_u8; 192],
+    ];
+    let replacement_probe = std::vec![0x94_u8; 64];
+    let mut retired: std::vec::Vec<([DwHandle; 2], [ChannelEndpointKey; 2], [u64; 2])> =
+        std::vec::Vec::new();
+
+    for generation_index in 0..=retired_payloads.len() {
+        let payload = retired_payloads
+            .get(generation_index)
+            .unwrap_or(&replacement_probe);
+        let output = BASE + 0x180;
+        assert_eq!(
+            channel_create(
+                &mut user,
+                &mut registry,
+                &channels,
+                &mut tasks,
+                process,
+                requested,
+                DwUserAddress(output),
+                DwUserAddress(output + 8),
+            ),
+            DW_STATUS_SUCCESS
+        );
+        let handles = [
+            DwHandle(u64_at(&user, output)),
+            DwHandle(u64_at(&user, output + 8)),
+        ];
+        let objects = handles.map(|handle| {
+            inspect_current_object_id(&tasks, process, handle, DW_OBJECT_TYPE_CHANNEL, DwRights(0))
+                .unwrap()
+        });
+        let keys = objects.map(ChannelEndpointKey::from_object_id);
+        let identities = objects.map(|object| object.evidence_identity());
+
+        if let Some((prior_handles, _, prior_identities)) = retired.last() {
+            for side in 0..2 {
+                assert_eq!(handles[side].0 as u32, prior_handles[side].0 as u32);
+                assert!(handles[side].0 >> 32 > prior_handles[side].0 >> 32);
+                assert_eq!(identities[side] as u32, prior_identities[side] as u32);
+                assert!(identities[side] >> 32 > prior_identities[side] >> 32);
+            }
+        }
+
+        let empty_signals = [
+            channels.current_signals(keys[0]).unwrap(),
+            channels.current_signals(keys[1]).unwrap(),
+        ];
+        assert_eq!(empty_signals, [DW_SIGNAL_WRITABLE, DW_SIGNAL_WRITABLE]);
+        assert_eq!(
+            channels.peek_receive(keys[1]),
+            Err(ChannelError::WouldBlock)
+        );
+        let handle_count = tasks.process_handle_count(process).unwrap();
+        let object_generations = registry.test_slot_generations();
+
+        for (retired_handles, retired_keys, _) in &retired {
+            let input = BASE + 0x300;
+            let input_start = FakeUserMemory::offset(input, payload.len());
+            user.bytes[input_start..input_start + payload.len()].copy_from_slice(payload);
+            let mut stale_cleanup = CleanupQueue::<16>::new();
+            assert_eq!(
+                channel_send(
+                    &mut user,
+                    &mut staging,
+                    &mut registry,
+                    &channels,
+                    &waits,
+                    &mut tasks,
+                    &execution,
+                    process,
+                    retired_handles[0],
+                    DwUserAddress(input),
+                    u32::try_from(payload.len()).unwrap(),
+                    DwUserAddress(0),
+                    0,
+                    0,
+                    &mut stale_cleanup,
+                ),
+                DW_STATUS_BAD_HANDLE
+            );
+
+            let receive_result = BASE + 0x600;
+            let receive_start =
+                FakeUserMemory::offset(receive_result, DW_CHANNEL_RECEIVE_RESULT_V1_SIZE as usize);
+            user.bytes[receive_start..receive_start + DW_CHANNEL_RECEIVE_RESULT_V1_SIZE as usize]
+                .fill(0xa5);
+            assert_eq!(
+                channel_receive(
+                    &mut user,
+                    &mut staging,
+                    &mut registry,
+                    &channels,
+                    &waits,
+                    &mut tasks,
+                    &execution,
+                    process,
+                    retired_handles[1],
+                    DwUserAddress(BASE + 0x800),
+                    DW_CHANNEL_MAX_PAYLOAD,
+                    DwUserAddress(0),
+                    0,
+                    DwUserAddress(receive_result),
+                    &mut stale_cleanup,
+                ),
+                DW_STATUS_BAD_HANDLE
+            );
+            assert!(
+                user.bytes
+                    [receive_start..receive_start + DW_CHANNEL_RECEIVE_RESULT_V1_SIZE as usize]
+                    .iter()
+                    .all(|byte| *byte == 0xa5)
+            );
+
+            let wait_result = BASE + 0x700;
+            let wait_start = FakeUserMemory::offset(wait_result, DW_WAIT_RESULT_V1_SIZE as usize);
+            user.bytes[wait_start..wait_start + DW_WAIT_RESULT_V1_SIZE as usize].fill(0x5a);
+            assert_eq!(
+                wait_one_syscall(
+                    &mut user,
+                    &mut registry,
+                    &mut tasks,
+                    &events,
+                    &timers,
+                    &channels,
+                    &waits,
+                    &execution,
+                    &mut operations,
+                    None,
+                    process,
+                    thread,
+                    retired_handles[1],
+                    DW_SIGNAL_READABLE,
+                    DW_DEADLINE_NOW,
+                    DwUserAddress(wait_result),
+                ),
+                WaitSyscallAction::Returning(DW_STATUS_BAD_HANDLE)
+            );
+            assert!(
+                user.bytes[wait_start..wait_start + DW_WAIT_RESULT_V1_SIZE as usize]
+                    .iter()
+                    .all(|byte| *byte == 0x5a)
+            );
+            assert_eq!(user.owned_outputs, 0);
+            assert!(!operations.contains_thread(thread));
+            assert_eq!(waits.len(), 0);
+
+            assert!(matches!(
+                channels.send(retired_keys[0], payload, &waits),
+                Err(ChannelError::InvalidEndpoint)
+            ));
+            assert_eq!(
+                channels.current_signals(retired_keys[1]),
+                Err(ChannelError::InvalidEndpoint)
+            );
+            assert_eq!(
+                channels.peek_receive(keys[1]),
+                Err(ChannelError::WouldBlock)
+            );
+            assert_eq!(channels.current_signals(keys[0]).unwrap(), empty_signals[0]);
+            assert_eq!(channels.current_signals(keys[1]).unwrap(), empty_signals[1]);
+            assert_eq!(tasks.process_handle_count(process).unwrap(), handle_count);
+            assert_eq!(registry.test_slot_generations(), object_generations);
+            assert!(
+                stale_cleanup
+                    .into_releases()
+                    .into_iter()
+                    .flatten()
+                    .next()
+                    .is_none()
+            );
+        }
+
+        if generation_index < retired_payloads.len() {
+            let input = BASE + 0x300;
+            let input_start = FakeUserMemory::offset(input, payload.len());
+            user.bytes[input_start..input_start + payload.len()].copy_from_slice(payload);
+            let mut cleanup = CleanupQueue::<16>::new();
+            assert_eq!(
+                channel_send(
+                    &mut user,
+                    &mut staging,
+                    &mut registry,
+                    &channels,
+                    &waits,
+                    &mut tasks,
+                    &execution,
+                    process,
+                    handles[0],
+                    DwUserAddress(input),
+                    u32::try_from(payload.len()).unwrap(),
+                    DwUserAddress(0),
+                    0,
+                    0,
+                    &mut cleanup,
+                ),
+                DW_STATUS_SUCCESS
+            );
+            assert_ne!(
+                channels.current_signals(keys[1]).unwrap().0 & DW_SIGNAL_READABLE.0,
+                0
+            );
+            assert!(
+                cleanup
+                    .into_releases()
+                    .into_iter()
+                    .flatten()
+                    .next()
+                    .is_none()
+            );
+            retired.push((handles, keys, identities));
+        }
+        close_channel_for_test(
+            &mut registry,
+            &mut tasks,
+            process,
+            &channels,
+            &waits,
+            handles[1],
+        );
+        close_channel_for_test(
+            &mut registry,
+            &mut tasks,
+            process,
+            &channels,
+            &waits,
+            handles[0],
+        );
+        assert_eq!(
+            retired.len(),
+            generation_index.min(retired_payloads.len() - 1) + 1
+        );
+    }
+
+    assert_eq!(retired.len(), 3);
+    assert!(retired.iter().all(|(handles, _, _)| {
+        handles[0] != DW_HANDLE_INVALID && handles[1] != DW_HANDLE_INVALID
+    }));
+    let mut cleanup = CleanupQueue::<16>::new();
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert!(
+        cleanup
+            .into_releases()
+            .into_iter()
+            .flatten()
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
 fn timer_syscalls_preserve_validation_rights_and_level_state() {
     use deepwyrm_abi::{
         DW_DEADLINE_INFINITE, DW_OBJECT_TYPE_TIMER, DW_RIGHT_MODIFY, DW_RIGHT_WAIT,
