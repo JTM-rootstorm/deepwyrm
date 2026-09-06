@@ -26,7 +26,7 @@ pub(crate) fn validate_kernel_stack_artifact_geometry_for_threads(
     let boot_bottom = address("__dw_boot_stack_bottom");
     let boot_top = address("__dw_boot_stack_top");
     assert_eq!(boot_bottom & 0xfff, 0, "boot stack alignment");
-    assert_eq!(boot_top - boot_bottom, 1024 * 1024);
+    assert_eq!(boot_top - boot_bottom, 4 * 1024 * 1024);
     assert!(
         address("__dw_data_start") <= boot_bottom && boot_top <= address("__dw_data_end"),
         "linked boot stack escapes the writable data PT_LOAD bounds"

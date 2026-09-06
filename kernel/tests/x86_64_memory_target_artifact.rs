@@ -862,8 +862,16 @@ fn run_wyr1e_external_interrupt_entry_stack_gate(wyr1e8: bool) {
         text_disassembly(&kernel_disassembly),
         "interactive-wyrmsh stack-size carrier changed the release machine code"
     );
+    let stack_sizes = stack_sizes(&llvm_readelf, &stack_kernel);
+    if wyr1e8 {
+        validate_primordial_boot_stack_margin(
+            "interactive-wyrmsh-e8",
+            &stack_sizes,
+            linked_boot_stack_payload_bytes(&stack_symbols),
+        );
+    }
     validate_wyr1e_privilege_entry_stack_margin(
-        &stack_sizes(&llvm_readelf, &stack_kernel),
+        &stack_sizes,
         &stack_disassembly,
         linked_privilege_entry_stack_payload_bytes(&stack_symbols),
         if wyr1e8 { 64 } else { 16 },
@@ -872,7 +880,7 @@ fn run_wyr1e_external_interrupt_entry_stack_gate(wyr1e8: bool) {
     assert_eq!(
         build_input_manifest_sha256(&workspace),
         build_input_before,
-        "build-relevant source/configuration changed during WYR1-E7 artifact builds"
+        "build-relevant source/configuration changed during {milestone} artifact builds"
     );
     validate_accepted_identities(
         &workspace,

@@ -21,7 +21,7 @@ fn layout_manifest_is_exact_and_fails_closed_on_drift() {
     let layout = kernel_build::Layout::parse(&source).expect("parse canonical layout manifest");
     assert_eq!(layout.link_base, 0xffff_ffff_8000_0000);
     assert_eq!(layout.base_page_size, 4_096);
-    assert_eq!(layout.kernel_boot_stack_size, 1_048_576);
+    assert_eq!(layout.kernel_boot_stack_size, 4_194_304);
     assert_eq!(layout.kernel_boot_stack_alignment, 4_096);
     assert_eq!(layout.temporary_virtual_address, 0xffff_ff00_0000_0000);
     assert_eq!(layout.temporary_indices, [510, 0, 0, 0]);
@@ -70,8 +70,12 @@ fn layout_manifest_is_exact_and_fails_closed_on_drift() {
         source.replacen("version = 2", "version = 2\nversion = 2", 1),
         source.replace("version = 2", "version = 1"),
         source.replace(
+            "kernel_boot_stack_size = 4194304",
             "kernel_boot_stack_size = 1048576",
-            "kernel_boot_stack_size = 65536",
+        ),
+        source.replace(
+            "kernel_boot_stack_size = 4194304",
+            "kernel_boot_stack_size = 4190208",
         ),
         source.replace(
             "allowed_program_header_types = [\"PT_LOAD\"]",
@@ -681,7 +685,9 @@ fn selector33_e8_profile_is_additive_exact_and_private() {
         "EvidenceVersion::V1_1",
         "const E8_UP_RECORDS: usize = 33;",
         "const E8_SMP_RECORDS: usize = 69;",
-        "0x5745_0104 | 0x5745_0106",
+        "outcome == 5 && values == [0; 3]",
+        "values[0] == 0x5745_0104",
+        "(1, [0x5745_0106, 0, 0])",
         "const S1_KINDS: [u32; 18]",
         "const S4_SMP_KINDS: [u32; 40]",
     ] {

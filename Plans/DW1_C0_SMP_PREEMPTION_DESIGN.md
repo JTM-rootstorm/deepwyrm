@@ -947,6 +947,18 @@ budget. Retained bootstrap-frame pressure remains explicit optimization debt.
 Selector 28 is included in the accepted-target primordial stack-margin gate so
 future capacity or compiler-layout growth fails before live acceptance.
 
+WYR1-E8 later expanded the selector-33 retained Process, Thread, root, and
+TaskGroup capacities to 64. Its first exact product measured 2,900,584 bytes in
+the retained `kernel_main -> run_primordial -> primordial::enter` chain. The
+1 MiB boot stack crossed its lower bound in the `primordial::enter` page probe;
+the first exception-frame push faulted again and reached vector 8. The 4 MiB
+allocation leaves 1,256,832 bytes after the measured chain, three retained
+return words, 4 KiB architectural headroom, and 32 KiB required spare. The E8
+accepted-target path applies this same primordial margin gate to the actual E8
+stack-size carrier in addition to its privilege-entry stack proof. This is a
+functional-first internal allocation increase, not a native or boot ABI change;
+retained large-frame pressure remains explicit optimization debt.
+
 The first corrected live admission candidate then reached CPL3 and exposed a
 separate per-Thread stack overflow. QEMU recorded the first fault as a kernel
 write through `RSP` into the first Thread stack's guard page while selector
