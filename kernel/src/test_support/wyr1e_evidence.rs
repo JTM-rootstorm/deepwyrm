@@ -574,7 +574,7 @@ fn validate_v1_1_retired(
 fn forced_retirement_result(outcome: u32, values: [u64; 3]) -> bool {
     (outcome == 5 && values == [0; 3])
         || (outcome == 1
-            && matches!(values[0], 0x5745_0104 | 0x5745_0106)
+            && values[0] == 0x5745_0104
             && values[1] == 0
             && values[2] == 0)
 }
@@ -966,7 +966,7 @@ mod tests {
                 sequence += 1;
             }
             let (aux0, aux1, outcome, values) = if matches!(stage, 2 | 3) {
-                (launch.0 + 1, launch.1, 1, [0x5745_0106, 0, 0])
+                (launch.0 + 1, launch.1, 1, [0x5745_0104, 0, 0])
             } else {
                 (900 + stage as u64, shells[index][4], 1, [0; 3])
             };
@@ -1113,11 +1113,11 @@ mod tests {
     }
 
     #[test]
-    fn e8_forced_retirement_results_are_exact_and_priority_complete() {
+    fn e8_forced_retirement_results_are_exact_and_source_complete() {
         assert!(forced_retirement_result(1, [0x5745_0104, 0, 0]));
-        assert!(forced_retirement_result(1, [0x5745_0106, 0, 0]));
         assert!(forced_retirement_result(5, [0; 3]));
         for rejected in [
+            (1, [0x5745_0106, 0, 0]),
             (1, [0x5745_0105, 0, 0]),
             (1, [0x5745_0104, 1, 0]),
             (2, [0; 3]),
@@ -1145,7 +1145,7 @@ mod tests {
                     1_101,
                     2,
                     1,
-                    [0x5745_0106, 0, 0],
+                    [0x5745_0104, 0, 0],
                 ),
             );
             if accepted {
