@@ -58,6 +58,47 @@ pub(crate) enum Wyr1eEvidenceError {
     StartupGuard,
 }
 
+/// Selector-33-only explanation for the first rejected v1.1 transaction
+/// relation. Acceptance remains owned by the ordinary validator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Wyr1eTransactionRelationPredicate {
+    CurrentShell,
+    StageSlotKind,
+    ZeroTransaction,
+    TransactionWatermark,
+    ZeroDigest,
+    ZeroTriggerJob,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Wyr1eEvidenceSubmitFailure {
+    error: Wyr1eEvidenceError,
+    transaction_relation: Option<Wyr1eTransactionRelationPredicate>,
+}
+
+impl Wyr1eEvidenceSubmitFailure {
+    pub(crate) const fn error(self) -> Wyr1eEvidenceError {
+        self.error
+    }
+
+    pub(crate) const fn transaction_relation_detail(self) -> Option<u32> {
+        match self.transaction_relation {
+            Some(Wyr1eTransactionRelationPredicate::CurrentShell) => Some(0x3310_e015),
+            Some(Wyr1eTransactionRelationPredicate::StageSlotKind) => Some(0x3310_e016),
+            Some(Wyr1eTransactionRelationPredicate::ZeroTransaction) => Some(0x3310_e017),
+            Some(Wyr1eTransactionRelationPredicate::TransactionWatermark) => Some(0x3310_e018),
+            Some(Wyr1eTransactionRelationPredicate::ZeroDigest) => Some(0x3310_e019),
+            Some(Wyr1eTransactionRelationPredicate::ZeroTriggerJob) => Some(0x3310_e01a),
+            None => None,
+        }
+    }
+
+    #[cfg(test)]
+    const fn transaction_relation(self) -> Option<Wyr1eTransactionRelationPredicate> {
+        self.transaction_relation
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Wyr1eEvidenceFlushError {
     Incomplete,
@@ -224,22 +265,49 @@ impl Wyr1eEvidenceCollector {
         process: ProcessKey,
         record: &[u8; WYR1E_EVIDENCE_RECORD_LEN],
     ) -> Result<Wyr1eEvidenceSubmit<'_>, Wyr1eEvidenceError> {
+        self.submit_with_diagnostic(process, record)
+            .map_err(Wyr1eEvidenceSubmitFailure::error)
+    }
+
+    /// Reuses the exact rejected record and locked collector prestate to
+    /// identify the first v1.1 transaction relation predicate. This does not
+    /// change the validation result or commit any rejected record.
+    pub(crate) fn submit_with_diagnostic(
+        &self,
+        process: ProcessKey,
+        record: &[u8; WYR1E_EVIDENCE_RECORD_LEN],
+    ) -> Result<Wyr1eEvidenceSubmit<'_>, Wyr1eEvidenceSubmitFailure> {
         let mut transcript = self.transcript.lock();
-        authorize_locked(&mut transcript, process)?;
+        authorize_locked(&mut transcript, process).map_err(|error| Wyr1eEvidenceSubmitFailure {
+            error,
+            transaction_relation: None,
+        })?;
         let decoded =
-            decode_record(record, self.version).map_err(|error| transcript.latch(error))?;
-        if let Err(error) = validate_record(&transcript, decoded, self.nonce, self.version) {
-            return Err(transcript.latch(error));
+            decode_record(record, self.version).map_err(|error| Wyr1eEvidenceSubmitFailure {
+                error: transcript.latch(error),
+                transaction_relation: None,
+            })?;
+        if let Err(failure) = validate_record(&transcript, decoded, self.nonce, self.version) {
+            return Err(Wyr1eEvidenceSubmitFailure {
+                error: transcript.latch(failure.error),
+                transaction_relation: failure.transaction_relation,
+            });
         }
         if decoded.record_type != RECORD_TERMINAL
             && transcript.count + 1 == WYR1E_EVIDENCE_RECORD_CAPACITY
         {
-            return Err(transcript.latch(Wyr1eEvidenceError::Full));
+            return Err(Wyr1eEvidenceSubmitFailure {
+                error: transcript.latch(Wyr1eEvidenceError::Full),
+                transaction_relation: None,
+            });
         }
         if decoded.record_type == RECORD_TERMINAL {
             self.terminal_claimed
                 .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-                .map_err(|_| transcript.latch(Wyr1eEvidenceError::ReporterClaimed))?;
+                .map_err(|_| Wyr1eEvidenceSubmitFailure {
+                    error: transcript.latch(Wyr1eEvidenceError::ReporterClaimed),
+                    transaction_relation: None,
+                })?;
         }
         commit_record(&mut transcript, decoded, self.version);
         let index = transcript.count;
@@ -327,26 +395,41 @@ struct DecodedRecord {
     digest: [u8; 32],
 }
 
+#[derive(Clone, Copy)]
+struct Wyr1eEvidenceValidationFailure {
+    error: Wyr1eEvidenceError,
+    transaction_relation: Option<Wyr1eTransactionRelationPredicate>,
+}
+
+impl From<Wyr1eEvidenceError> for Wyr1eEvidenceValidationFailure {
+    fn from(error: Wyr1eEvidenceError) -> Self {
+        Self {
+            error,
+            transaction_relation: None,
+        }
+    }
+}
+
 fn validate_record(
     transcript: &Transcript,
     record: DecodedRecord,
     nonce: u64,
     version: EvidenceVersion,
-) -> Result<(), Wyr1eEvidenceError> {
+) -> Result<(), Wyr1eEvidenceValidationFailure> {
     let expected_sequence =
         u64::try_from(transcript.count + 1).map_err(|_| Wyr1eEvidenceError::OutOfOrder)?;
     if record.sequence != expected_sequence {
-        return Err(Wyr1eEvidenceError::OutOfOrder);
+        return Err(Wyr1eEvidenceError::OutOfOrder.into());
     }
     if record.nonce != nonce {
-        return Err(Wyr1eEvidenceError::WrongNonce);
+        return Err(Wyr1eEvidenceError::WrongNonce.into());
     }
     if !record.shell.all_nonzero() {
-        return Err(Wyr1eEvidenceError::Relation);
+        return Err(Wyr1eEvidenceError::Relation.into());
     }
 
     return match version {
-        EvidenceVersion::V1_0 => validate_v1_0_record(transcript, record),
+        EvidenceVersion::V1_0 => validate_v1_0_record(transcript, record).map_err(Into::into),
         EvidenceVersion::V1_1 => validate_v1_1_record(transcript, record),
     };
 }
@@ -411,7 +494,7 @@ fn validate_v1_0_record(
 fn validate_v1_1_record(
     transcript: &Transcript,
     record: DecodedRecord,
-) -> Result<(), Wyr1eEvidenceError> {
+) -> Result<(), Wyr1eEvidenceValidationFailure> {
     let semantic_zero = record.operation_transaction == 0
         && record.operation_job == 0
         && record.message_kind == 0
@@ -419,10 +502,10 @@ fn validate_v1_1_record(
         && record.values == [0; 3]
         && record.digest == [0; 32];
     match record.record_type {
-        RECORD_SHELL_READY => validate_v1_1_ready(transcript, record),
+        RECORD_SHELL_READY => validate_v1_1_ready(transcript, record).map_err(Into::into),
         RECORD_SHELLJOBS_TRANSACTION => validate_v1_1_transaction(transcript, record),
-        RECORD_SHELL_EXITED => validate_v1_1_retired(transcript, record),
-        RECORD_TERMINAL if transcript.terminal => Err(Wyr1eEvidenceError::DuplicateTerminal),
+        RECORD_SHELL_EXITED => validate_v1_1_retired(transcript, record).map_err(Into::into),
+        RECORD_TERMINAL if transcript.terminal => Err(Wyr1eEvidenceError::DuplicateTerminal.into()),
         RECORD_TERMINAL
             if transcript.stage == 4
                 && transcript.shell.is_none()
@@ -433,7 +516,7 @@ fn validate_v1_1_record(
         {
             Ok(())
         }
-        _ => Err(Wyr1eEvidenceError::OutOfOrder),
+        _ => Err(Wyr1eEvidenceError::OutOfOrder.into()),
     }
 }
 
@@ -507,27 +590,43 @@ fn validate_v1_1_ready(
 fn validate_v1_1_transaction(
     transcript: &Transcript,
     record: DecodedRecord,
-) -> Result<(), Wyr1eEvidenceError> {
-    let Some(shell) = transcript.shell else {
-        return Err(Wyr1eEvidenceError::OutOfOrder);
-    };
-    if record.shell != shell
-        || !transaction_kind_matches(
-            transcript.stage,
-            transcript.epoch_transactions,
-            record.message_kind,
-            transcript.stage4_profile,
-        )
-        || record.operation_transaction == 0
-        || record.operation_transaction <= transcript.last_transaction
-        || record.digest == [0; 32]
-    {
-        return Err(Wyr1eEvidenceError::Relation);
+) -> Result<(), Wyr1eEvidenceValidationFailure> {
+    if transcript.shell.is_none() {
+        return Err(Wyr1eEvidenceError::OutOfOrder.into());
     }
-    if matches!(transcript.stage, 2 | 3) && record.operation_job == 0 {
-        return Err(Wyr1eEvidenceError::Relation);
+    if let Some(transaction_relation) = first_transaction_relation_failure(transcript, record) {
+        return Err(Wyr1eEvidenceValidationFailure {
+            error: Wyr1eEvidenceError::Relation,
+            transaction_relation: Some(transaction_relation),
+        });
     }
     Ok(())
+}
+
+fn first_transaction_relation_failure(
+    transcript: &Transcript,
+    record: DecodedRecord,
+) -> Option<Wyr1eTransactionRelationPredicate> {
+    if Some(record.shell) != transcript.shell {
+        Some(Wyr1eTransactionRelationPredicate::CurrentShell)
+    } else if !transaction_kind_matches(
+        transcript.stage,
+        transcript.epoch_transactions,
+        record.message_kind,
+        transcript.stage4_profile,
+    ) {
+        Some(Wyr1eTransactionRelationPredicate::StageSlotKind)
+    } else if record.operation_transaction == 0 {
+        Some(Wyr1eTransactionRelationPredicate::ZeroTransaction)
+    } else if record.operation_transaction <= transcript.last_transaction {
+        Some(Wyr1eTransactionRelationPredicate::TransactionWatermark)
+    } else if record.digest == [0; 32] {
+        Some(Wyr1eTransactionRelationPredicate::ZeroDigest)
+    } else if matches!(transcript.stage, 2 | 3) && record.operation_job == 0 {
+        Some(Wyr1eTransactionRelationPredicate::ZeroTriggerJob)
+    } else {
+        None
+    }
 }
 
 fn validate_v1_1_retired(
@@ -1138,9 +1237,7 @@ mod tests {
         (collector, reporter, first_shell)
     }
 
-    fn collector_at_stage2_trigger(
-        trigger_launch_transaction: u64,
-    ) -> (Wyr1eEvidenceCollector, ProcessKey, [u64; 10]) {
+    fn collector_at_stage2_before_trigger() -> (Wyr1eEvidenceCollector, ProcessKey, [u64; 10]) {
         let (collector, reporter, _) = collector_after_stage1();
         let second_shell = [1, 12, 13, 14, 15, 6, 17, 18, 19, 20];
         collector
@@ -1158,6 +1255,13 @@ mod tests {
                 ),
             )
             .unwrap();
+        (collector, reporter, second_shell)
+    }
+
+    fn collector_at_stage2_trigger(
+        trigger_launch_transaction: u64,
+    ) -> (Wyr1eEvidenceCollector, ProcessKey, [u64; 10]) {
+        let (collector, reporter, second_shell) = collector_at_stage2_before_trigger();
         collector
             .submit(
                 reporter,
@@ -1244,6 +1348,105 @@ mod tests {
                 assert_eq!(result.err(), Some(Wyr1eEvidenceError::Relation));
             }
         }
+    }
+
+    #[test]
+    fn e8_transaction_relation_diagnostic_names_the_first_failed_predicate() {
+        use Wyr1eTransactionRelationPredicate::{
+            CurrentShell, StageSlotKind, TransactionWatermark, ZeroDigest, ZeroTransaction,
+            ZeroTriggerJob,
+        };
+
+        for expected in [
+            CurrentShell,
+            StageSlotKind,
+            ZeroTransaction,
+            ZeroDigest,
+            ZeroTriggerJob,
+        ] {
+            let (collector, reporter, shell) = collector_at_stage2_before_trigger();
+            let mut record = encode_e8(
+                RECORD_SHELLJOBS_TRANSACTION,
+                22,
+                shell,
+                101,
+                1_101,
+                1,
+                0,
+                [0; 3],
+            );
+            match expected {
+                CurrentShell => write_u64(&mut record, 32, shell[0] + 1),
+                StageSlotKind => write_u32(&mut record, 128, 5),
+                ZeroTransaction => write_u64(&mut record, 112, 0),
+                ZeroDigest => record[160..192].fill(0),
+                ZeroTriggerJob => write_u64(&mut record, 120, 0),
+                TransactionWatermark => unreachable!(),
+            }
+            let failure = collector
+                .submit_with_diagnostic(reporter, &record)
+                .err()
+                .expect("mutated transaction must be rejected");
+            assert_eq!(failure.error(), Wyr1eEvidenceError::Relation);
+            assert_eq!(failure.transaction_relation(), Some(expected));
+            assert_eq!(
+                failure.transaction_relation_detail(),
+                Some(match expected {
+                    CurrentShell => 0x3310_e015,
+                    StageSlotKind => 0x3310_e016,
+                    ZeroTransaction => 0x3310_e017,
+                    TransactionWatermark => 0x3310_e018,
+                    ZeroDigest => 0x3310_e019,
+                    ZeroTriggerJob => 0x3310_e01a,
+                })
+            );
+        }
+
+        let collector = Wyr1eEvidenceCollector::new_v1_1(NONCE);
+        let (reporter, thread, root) = subject();
+        arm(&collector, reporter, thread, root);
+        let shell = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        collector
+            .submit(
+                reporter,
+                &encode_e8(RECORD_SHELL_READY, 1, shell, 41, 42, 1, 0, [71, 72, 73]),
+            )
+            .unwrap();
+        collector
+            .submit(
+                reporter,
+                &encode_e8(RECORD_SHELLJOBS_TRANSACTION, 2, shell, 101, 0, 9, 0, [0; 3]),
+            )
+            .unwrap();
+        let failure = collector
+            .submit_with_diagnostic(
+                reporter,
+                &encode_e8(RECORD_SHELLJOBS_TRANSACTION, 3, shell, 101, 0, 1, 0, [0; 3]),
+            )
+            .err()
+            .expect("reused transaction must be rejected");
+        assert_eq!(failure.error(), Wyr1eEvidenceError::Relation);
+        assert_eq!(failure.transaction_relation(), Some(TransactionWatermark));
+        assert_eq!(failure.transaction_relation_detail(), Some(0x3310_e018));
+    }
+
+    #[test]
+    fn v1_0_relation_rejection_has_no_e8_transaction_diagnostic() {
+        let collector = Wyr1eEvidenceCollector::new(NONCE);
+        let (reporter, thread, root) = subject();
+        arm(&collector, reporter, thread, root);
+        collector
+            .submit(reporter, &encode(RECORD_SHELL_READY, 1))
+            .unwrap();
+        let mut changed = encode(RECORD_SHELLJOBS_TRANSACTION, 2);
+        write_u64(&mut changed, 104, 99);
+        let failure = collector
+            .submit_with_diagnostic(reporter, &changed)
+            .err()
+            .expect("v1.0 shell mismatch must be rejected");
+        assert_eq!(failure.error(), Wyr1eEvidenceError::Relation);
+        assert_eq!(failure.transaction_relation(), None);
+        assert_eq!(failure.transaction_relation_detail(), None);
     }
 
     #[test]

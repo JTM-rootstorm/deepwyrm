@@ -231,7 +231,7 @@ pub(crate) use wyr1d_evidence::{
 #[cfg(all(deepwyrm_wyr1e_evidence, target_arch = "x86_64", target_os = "none"))]
 pub(crate) use wyr1e_evidence::{
     WYR1E_EVIDENCE, WYR1E_EVIDENCE_RECORD_LEN, Wyr1eEvidenceError, Wyr1eEvidenceFlushError,
-    Wyr1eEvidenceSubmit,
+    Wyr1eEvidenceSubmit, Wyr1eEvidenceSubmitFailure,
 };
 
 #[cfg(deepwyrm_i1_evidence)]

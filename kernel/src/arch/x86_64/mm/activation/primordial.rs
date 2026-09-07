@@ -6715,12 +6715,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
             }
         };
         self.commit_runtime_phase(phase);
-        match WYR1E_EVIDENCE.submit(self.process, &record) {
+        match WYR1E_EVIDENCE.submit_with_diagnostic(self.process, &record) {
             Ok(Wyr1eEvidenceSubmit::Accepted) => NativeSyscallResult::returning(DW_STATUS_SUCCESS),
             Ok(Wyr1eEvidenceSubmit::Terminal(permit)) => {
                 crate::test_support::complete_wyr1e_evidence(permit)
             }
-            Err(error) => crate::test_support::complete_fail(wyr1e_submit_detail(error)),
+            Err(failure) => {
+                crate::test_support::complete_fail(wyr1e_submit_failure_detail(failure))
+            }
         }
     }
 
@@ -7656,6 +7658,16 @@ const fn wyr1e_submit_detail(error: crate::test_support::Wyr1eEvidenceError) -> 
         Wyr1eEvidenceError::StartupStackMapping => 0x3310_e012,
         Wyr1eEvidenceError::StartupStackProtection => 0x3310_e013,
         Wyr1eEvidenceError::StartupGuard => 0x3310_e014,
+    }
+}
+
+#[cfg(deepwyrm_wyr1e_evidence)]
+const fn wyr1e_submit_failure_detail(
+    failure: crate::test_support::Wyr1eEvidenceSubmitFailure,
+) -> u32 {
+    match failure.transaction_relation_detail() {
+        Some(detail) => detail,
+        None => wyr1e_submit_detail(failure.error()),
     }
 }
 
