@@ -838,6 +838,8 @@ mod tests {
         DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_PROCESS, DW_OBJECT_TYPE_THREAD,
     };
 
+    include!("wyr1e8_producer_fixture.rs");
+
     const NONCE: u64 = 0x0123_4567_89ab_cdef;
     const RETIRED: Wyr1bRetirementFacts = Wyr1bRetirementFacts {
         process_quiesced: true,
