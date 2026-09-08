@@ -7,7 +7,7 @@ fn e8_imported_producer_prefix() {
     extern crate std;
     use std::io::Read;
 
-    const PREFIX_BYTES: usize = 22 * WYR1E_EVIDENCE_RECORD_LEN;
+    const PREFIX_BYTES: usize = 24 * WYR1E_EVIDENCE_RECORD_LEN;
     let path = std::path::PathBuf::from(
         std::env::var_os("DEEPWYRM_E8_PRODUCER_PREFIX")
             .expect("DEEPWYRM_E8_PRODUCER_PREFIX is required"),
@@ -60,6 +60,20 @@ fn e8_imported_producer_prefix() {
                 assert_eq!(state.shell, Some(ready.shell));
                 assert_eq!(state.failure, None);
                 assert_eq!(decoded.record_type, RECORD_SHELLJOBS_TRANSACTION);
+            } else if index == 22 {
+                assert_eq!(
+                    (state.count, state.stage, state.epoch_transactions),
+                    (22, 2, 1)
+                );
+                assert!(state.shell.is_some());
+                assert_eq!(decoded.record_type, RECORD_SHELL_EXITED);
+            } else if index == 23 {
+                assert_eq!(
+                    (state.count, state.stage, state.epoch_transactions),
+                    (23, 2, 1)
+                );
+                assert!(state.shell.is_none());
+                assert_eq!(decoded.record_type, RECORD_SHELL_READY);
             }
             std::println!(
                 "E8FIXTURE_PRESTATE index={} stage={} epoch_transactions={} last_transaction={} shell={:?}",
@@ -77,7 +91,7 @@ fn e8_imported_producer_prefix() {
             } else if !decoded.shell.all_nonzero() {
                 "shell tuple contains zero"
             } else if decoded.record_type != RECORD_SHELLJOBS_TRANSACTION {
-                "non-transaction framing or lifecycle"
+                "lifecycle record; collector relation is authoritative"
             } else if Some(decoded.shell) != state.shell {
                 "current shell tuple"
             } else if !transaction_kind_matches(
@@ -111,9 +125,9 @@ fn e8_imported_producer_prefix() {
     let state = collector.transcript.lock();
     assert_eq!(
         (state.count, state.stage, state.epoch_transactions),
-        (22, 2, 1)
+        (24, 3, 0)
     );
     assert!(!state.terminal);
     assert_eq!(state.failure, None);
-    std::println!("E8FIXTURE_COLLECTOR accepted=22 stage=2 epoch_transactions=1 terminal=false");
+    std::println!("E8FIXTURE_COLLECTOR accepted=24 stage=3 epoch_transactions=0 terminal=false");
 }

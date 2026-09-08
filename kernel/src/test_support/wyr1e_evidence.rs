@@ -566,10 +566,11 @@ fn validate_v1_1_ready(
         3 => {
             new[5] == old[5]
                 && common_fresh
-                && record.operation_transaction != transcript.ready_aux0
-                && record.operation_job != transcript.ready_aux1
-                && record.values[0] != transcript.ready_values[0]
-                && record.values[1] != transcript.ready_values[1]
+                && record.operation_transaction > transcript.ready_aux0
+                && record.operation_job > transcript.ready_aux1
+                && record.values[0] > transcript.ready_values[0]
+                && record.values[1] > transcript.ready_values[1]
+                && record.values[2] == transcript.ready_values[2]
         }
         4 => {
             new[5] != old[5]
@@ -1079,7 +1080,7 @@ mod tests {
             [31, 32, 33, 34, 35, 36, 37, 38, 39, 40],
         ];
         let ready_aux = [(41, 42), (41, 42), (51, 52), (61, 62)];
-        let ready_values = [[71, 72, 73], [71, 72, 73], [81, 82, 83], [91, 82, 83]];
+        let ready_values = [[71, 72, 73], [71, 72, 73], [81, 82, 73], [91, 82, 83]];
         let mut sequence = 1_u64;
         for stage in 1..=4_u32 {
             let index = (stage - 1) as usize;
@@ -1464,6 +1465,53 @@ mod tests {
                 2,
                 0,
                 [71, 72, 73],
+            );
+            assert_eq!(
+                collector.submit(reporter, &ready).err(),
+                Some(Wyr1eEvidenceError::Relation)
+            );
+        }
+    }
+
+    #[test]
+    fn e8_driver_replacement_advances_persistent_wire_owners_and_retains_supervisor() {
+        for mutation in 0..5 {
+            let (collector, reporter, old_shell) = collector_at_stage2_trigger(101);
+            collector
+                .submit(
+                    reporter,
+                    &encode_e8(
+                        RECORD_SHELL_EXITED,
+                        23,
+                        old_shell,
+                        102,
+                        1_101,
+                        2,
+                        1,
+                        [0x5745_0104, 0, 0],
+                    ),
+                )
+                .unwrap();
+            let new_shell = [21, 22, 23, 24, 25, 6, 27, 28, 29, 30];
+            let mut aux = [51, 52];
+            let mut values = [81, 82, 73];
+            match mutation {
+                0 => aux[0] = 40,
+                1 => aux[1] = 41,
+                2 => values[0] = 70,
+                3 => values[1] = 71,
+                4 => values[2] = 74,
+                _ => unreachable!(),
+            }
+            let ready = encode_e8(
+                RECORD_SHELL_READY,
+                24,
+                new_shell,
+                aux[0],
+                aux[1],
+                3,
+                0,
+                values,
             );
             assert_eq!(
                 collector.submit(reporter, &ready).err(),
