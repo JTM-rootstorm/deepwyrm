@@ -573,11 +573,13 @@ fn validate_v1_1_ready(
                 && record.values[2] == transcript.ready_values[2]
         }
         4 => {
-            new[5] != old[5]
+            new[5] > old[5]
                 && common_fresh
-                && record.operation_transaction != transcript.ready_aux0
-                && record.operation_job != transcript.ready_aux1
-                && record.values[0] != transcript.ready_values[0]
+                && record.operation_transaction > transcript.ready_aux0
+                && record.operation_job > transcript.ready_aux1
+                && record.values[0] > transcript.ready_values[0]
+                && record.values[1] == transcript.ready_values[1]
+                && record.values[2] == transcript.ready_values[2]
         }
         _ => false,
     };
@@ -1080,7 +1082,7 @@ mod tests {
             [31, 32, 33, 34, 35, 36, 37, 38, 39, 40],
         ];
         let ready_aux = [(41, 42), (41, 42), (51, 52), (61, 62)];
-        let ready_values = [[71, 72, 73], [71, 72, 73], [81, 82, 73], [91, 82, 83]];
+        let ready_values = [[71, 72, 73], [71, 72, 73], [81, 82, 73], [91, 82, 73]];
         let mut sequence = 1_u64;
         for stage in 1..=4_u32 {
             let index = (stage - 1) as usize;
@@ -1304,6 +1306,38 @@ mod tests {
             let (reporter, thread, root) = subject();
             arm(&collector, reporter, thread, root);
             submit_e8_profile_with_semantic_kinds(&collector, reporter, &stage1, stage4);
+        }
+    }
+
+    #[test]
+    fn e8_registry_ready_retains_driver_and_supervisor_while_rebinding_owners() {
+        let old_shell = ShellTuple([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let new_shell = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
+        let mut transcript = Transcript::new();
+        transcript.previous_shell = Some(old_shell);
+        transcript.stage = 3;
+        transcript.ready_aux0 = 30;
+        transcript.ready_aux1 = 31;
+        transcript.ready_values = [40, 41, 42];
+        let valid = encode_e8(RECORD_SHELL_READY, 1, new_shell, 50, 51, 4, 0, [60, 41, 42]);
+        let decoded = decode_record(&valid, EvidenceVersion::V1_1).unwrap();
+        assert_eq!(validate_v1_1_ready(&transcript, decoded), Ok(()));
+
+        for (offset, value) in [
+            (32 + 5 * 8, old_shell.0[5]),
+            (112, transcript.ready_aux0),
+            (120, transcript.ready_aux1),
+            (136, transcript.ready_values[0]),
+            (144, transcript.ready_values[1] + 1),
+            (152, transcript.ready_values[2] + 1),
+        ] {
+            let mut candidate = valid;
+            write_u64(&mut candidate, offset, value);
+            let decoded = decode_record(&candidate, EvidenceVersion::V1_1).unwrap();
+            assert_eq!(
+                validate_v1_1_ready(&transcript, decoded),
+                Err(Wyr1eEvidenceError::Relation)
+            );
         }
     }
 
