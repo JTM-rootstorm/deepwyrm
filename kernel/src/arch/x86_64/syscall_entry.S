@@ -183,6 +183,43 @@ dw_x86_64_iret_to_user:
     movq E4_UR_RCX(%r12), %rcx
     movq E4_UR_R11(%r12), %r11
     movq E4_UR_R12(%r12), %r12
+    /* Complete a RawCpl3TimerReturnFrame only after the physical stack pivot.
+     * All source-context reads finish before these additional stack writes.
+     * A quantum that expires during its arm must be serviced before IRET;
+     * an AP otherwise has no armed timer to preempt an uncooperative Thread.
+     */
+    pushq %rax
+    pushq %rbx
+    pushq %rcx
+    pushq %rdx
+    pushq %rsi
+    pushq %rdi
+    pushq %rbp
+    pushq %r8
+    pushq %r9
+    pushq %r10
+    pushq %r11
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    movq %rsp, %rdi
+    callq dw_x86_64_timer_pre_iret_gate
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %r11
+    popq %r10
+    popq %r9
+    popq %r8
+    popq %rbp
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    popq %rcx
+    popq %rbx
+    popq %rax
     /* First CPL3 entry moves the kernel entry-state base behind KERNEL_GS_BASE. */
     swapgs
     iretq

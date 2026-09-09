@@ -1096,11 +1096,12 @@ fn syscall_return_preemption_revokes_authorization_immediately_before_switch() {
         .expect("syscall-return preemption extent")
         .0;
 
-    assert!(
-        service.contains(
-            "frame.revoke_authorized_return();\n            switch_kernel_context(plan);"
-        )
-    );
+    let statements: Vec<_> = service.lines().map(str::trim).collect();
+    assert!(statements.windows(2).any(|pair| pair
+        == [
+            "frame.revoke_authorized_return();",
+            "switch_kernel_context(plan);"
+        ]));
     let revoke = service.find("frame.revoke_authorized_return()").unwrap();
     let switch = service.find("switch_kernel_context(plan)").unwrap();
     let resume = service

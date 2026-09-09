@@ -269,6 +269,78 @@ fn f3_timer_interrupt_is_returning_preserves_gprs_and_normalizes_user_gs() {
 }
 
 #[test]
+fn every_user_entry_consumes_a_quantum_that_expires_during_arming() {
+    let time = source("src/time/live.rs");
+    let arm = time
+        .split_once("pub(crate) fn arm_scheduler_quantum(")
+        .unwrap()
+        .1
+        .split_once("pub(crate) fn cancel_scheduler_quantum(")
+        .unwrap()
+        .0;
+    let publish = arm.find("publish_current_quantum_expiry(due)").unwrap();
+    let return_expiry = arm.find("Ok(due.is_some())").unwrap();
+    assert!(publish < return_expiry);
+
+    let live = source("src/arch/x86_64/syscall/live.rs");
+    for (start, end) in [
+        (
+            "unsafe fn native_runtime_timer_pre_iret",
+            "pub(crate) unsafe extern \"sysv64\" fn dw_x86_64_timer_pre_iret_gate",
+        ),
+        (
+            "fn service_syscall_return_preemption",
+            "fn switch_kernel_context",
+        ),
+    ] {
+        let gate = live.split_once(start).unwrap().1.split_once(end).unwrap().0;
+        let retry = gate.find("loop {").unwrap();
+        let consume = gate.find("runtime.prepare_preemption()").unwrap();
+        let arm = gate
+            .find("let expired_during_arm = arm_current_normal_quantum();")
+            .unwrap();
+        let done = gate.find("if !expired_during_arm {").unwrap();
+        assert!(retry < consume && consume < arm && arm < done);
+        assert!(gate[done..].contains("break;"));
+        assert!(!gate[..done].contains("break;") && !gate.contains("return;"));
+    }
+    let assembly = source("src/arch/x86_64/syscall_entry.S");
+    let initial = assembly
+        .split_once("dw_x86_64_iret_to_user:")
+        .unwrap()
+        .1
+        .split_once(".size dw_x86_64_iret_to_user")
+        .unwrap()
+        .0;
+    let pivot = initial
+        .find("movq %gs:E4_GS_CURRENT_STACK_TOP, %rsp")
+        .unwrap();
+    let source_read = initial.find("movq E4_UR_R12(%r12), %r12").unwrap();
+    let frame = initial.find("pushq %rax").unwrap();
+    let gate = initial.find("callq dw_x86_64_timer_pre_iret_gate").unwrap();
+    let entry = initial.find("    iretq").unwrap();
+    assert!(pivot < source_read && source_read < frame && frame < gate && gate < entry);
+    let saved: Vec<_> = initial[frame..gate]
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("pushq "))
+        .collect();
+    assert_eq!(
+        saved,
+        [
+            "%rax", "%rbx", "%rcx", "%rdx", "%rsi", "%rdi", "%rbp", "%r8", "%r9", "%r10", "%r11",
+            "%r12", "%r13", "%r14", "%r15"
+        ]
+    );
+    let restored: Vec<_> = initial[gate..entry]
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("popq "))
+        .collect();
+    assert_eq!(restored, saved.into_iter().rev().collect::<Vec<_>>());
+    assert_eq!(initial[..gate].matches("    pushq ").count(), 20);
+    assert!(initial[gate..entry].contains("    swapgs"));
+}
+
+#[test]
 fn dw1b_timer_return_validation_is_fail_closed_before_resume_or_rearm() {
     let live = source("src/arch/x86_64/syscall/live.rs");
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");

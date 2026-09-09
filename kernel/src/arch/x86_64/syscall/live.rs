@@ -1169,17 +1169,19 @@ pub(crate) fn publish_current_quantum_expiry(
 
 /// Begins a fresh exact quantum only after all runtime/scheduler guards have
 /// been released. The time service performs LAPIC MMIO through its own
-/// guard-free prepare/program/revalidate sequence.
+/// guard-free prepare/program/revalidate sequence. A synchronous expiry is
+/// returned to the caller; it must be consumed before returning to CPL3.
 #[allow(
     unsafe_code,
     reason = "the immutable CPU-local binding briefly reborrows its unique carrier to mint one exact scheduler ticket"
 )]
-fn arm_current_normal_quantum() {
+fn arm_current_normal_quantum() -> bool {
     let binding = runtime_binding().unwrap_or_else(|| halt_forever());
     let now_ns = crate::time::monotonic_now().unwrap_or_else(|_| halt_forever());
     if let Some(ticket) = unsafe { (binding.prepare_quantum_handler)(binding.context, now_ns) } {
-        crate::time::arm_scheduler_quantum(ticket).unwrap_or_else(|_| halt_forever());
+        return crate::time::arm_scheduler_quantum(ticket).unwrap_or_else(|_| halt_forever());
     }
+    false
 }
 
 fn poll_timer_return_stop(context: *mut ()) {
@@ -1205,38 +1207,43 @@ unsafe fn native_runtime_timer_pre_iret<
     mut context: *mut (),
     frame: &mut super::frame::RawCpl3TimerReturnFrame,
 ) {
-    poll_timer_return_stop(context);
-    validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
-    {
-        let runtime = unsafe { &mut *context.cast::<R>() };
-        if let Err(error) = runtime.authorize_timer_return(frame) {
-            invalid_bound_return::<R>(context, error);
-        }
-    }
-    let has_request = {
-        let runtime = unsafe { &mut *context.cast::<R>() };
-        runtime.has_reschedule_request()
-    };
-    if has_request {
-        let plan = {
+    loop {
+        poll_timer_return_stop(context);
+        validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
+        {
             let runtime = unsafe { &mut *context.cast::<R>() };
-            unsafe { runtime.prepare_preemption() }
+            if let Err(error) = runtime.authorize_timer_return(frame) {
+                invalid_bound_return::<R>(context, error);
+            }
+        }
+        let has_request = {
+            let runtime = unsafe { &mut *context.cast::<R>() };
+            runtime.has_reschedule_request()
         };
-        match plan {
-            crate::syscall::native::NativePreemptionPlan::Return => {}
-            crate::syscall::native::NativePreemptionPlan::Switch(plan) => {
-                switch_kernel_context(plan);
-                context = current_runtime_context::<R>().unwrap_or_else(|| halt_forever());
+        if has_request {
+            let plan = {
                 let runtime = unsafe { &mut *context.cast::<R>() };
-                if let Err(error) = runtime.resume_timer_preemption(frame) {
-                    invalid_bound_return::<R>(context, error);
+                unsafe { runtime.prepare_preemption() }
+            };
+            match plan {
+                crate::syscall::native::NativePreemptionPlan::Return => {}
+                crate::syscall::native::NativePreemptionPlan::Switch(plan) => {
+                    switch_kernel_context(plan);
+                    context = current_runtime_context::<R>().unwrap_or_else(|| halt_forever());
+                    let runtime = unsafe { &mut *context.cast::<R>() };
+                    if let Err(error) = runtime.resume_timer_preemption(frame) {
+                        invalid_bound_return::<R>(context, error);
+                    }
                 }
             }
         }
+        poll_timer_return_stop(context);
+        let expired_during_arm = arm_current_normal_quantum();
+        poll_timer_return_stop(context);
+        if !expired_during_arm {
+            break;
+        }
     }
-    poll_timer_return_stop(context);
-    arm_current_normal_quantum();
-    poll_timer_return_stop(context);
 }
 
 /// Fixed assembly seam for CPL3-origin Local APIC timer return. Returning from
@@ -1711,30 +1718,36 @@ fn service_syscall_return_preemption<
     context: &mut *mut (),
     frame: &mut RawSyscallFrame,
 ) {
-    poll_timer_return_stop(*context);
-    crate::time::service_current_scheduler_quantum_deadline().unwrap_or_else(|_| halt_forever());
-    let has_request = {
-        let runtime = unsafe { &mut *(*context).cast::<R>() };
-        runtime.has_reschedule_request()
-    };
-    if has_request {
-        let plan = {
+    loop {
+        poll_timer_return_stop(*context);
+        crate::time::service_current_scheduler_quantum_deadline()
+            .unwrap_or_else(|_| halt_forever());
+        let has_request = {
             let runtime = unsafe { &mut *(*context).cast::<R>() };
-            unsafe { runtime.prepare_preemption() }
+            runtime.has_reschedule_request()
         };
-        if let crate::syscall::native::NativePreemptionPlan::Switch(plan) = plan {
-            frame.revoke_authorized_return();
-            switch_kernel_context(plan);
-            *context = current_runtime_context::<R>().unwrap_or_else(|| halt_forever());
-            let runtime = unsafe { &mut *(*context).cast::<R>() };
-            if let Err(error) = runtime.resume_syscall_preemption(frame) {
-                invalid_bound_return::<R>(*context, error);
+        if has_request {
+            let plan = {
+                let runtime = unsafe { &mut *(*context).cast::<R>() };
+                unsafe { runtime.prepare_preemption() }
+            };
+            if let crate::syscall::native::NativePreemptionPlan::Switch(plan) = plan {
+                frame.revoke_authorized_return();
+                switch_kernel_context(plan);
+                *context = current_runtime_context::<R>().unwrap_or_else(|| halt_forever());
+                let runtime = unsafe { &mut *(*context).cast::<R>() };
+                if let Err(error) = runtime.resume_syscall_preemption(frame) {
+                    invalid_bound_return::<R>(*context, error);
+                }
             }
         }
+        poll_timer_return_stop(*context);
+        let expired_during_arm = arm_current_normal_quantum();
+        poll_timer_return_stop(*context);
+        if !expired_during_arm {
+            break;
+        }
     }
-    poll_timer_return_stop(*context);
-    arm_current_normal_quantum();
-    poll_timer_return_stop(*context);
 }
 
 #[allow(
@@ -1866,7 +1879,8 @@ unsafe fn iret_validated_user(state: &ValidatedUserReturn) -> ! {
     unsafe extern "sysv64" {
         fn dw_x86_64_iret_to_user(state: *const super::frame::RawUserReturnContext) -> !;
     }
-    arm_current_normal_quantum();
+    // The assembly helper first pivots from the bootstrap/idle/reaper carrier
+    // to the bound Thread stack, then runs the ordinary pre-IRET gate there.
     unsafe { dw_x86_64_iret_to_user(state.raw()) }
 }
 

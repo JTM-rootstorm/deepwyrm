@@ -185,6 +185,83 @@ mod tests {
     use super::*;
 
     #[test]
+    fn delayed_quantum_arm_requires_rescheduling_before_an_ap_can_return_to_userspace() {
+        use crate::cpu::CpuIndex;
+        use crate::object::ObjectRegistry;
+        use crate::task::{CooperativeScheduler, SchedulerPreemptionDecision, ThreadKey};
+        use deepwyrm_abi::DW_OBJECT_TYPE_THREAD;
+
+        for cpu_index in 0..4 {
+            for peer_is_runnable in [false, true] {
+                let cpu = CpuIndex::new(cpu_index).unwrap();
+                let scheduler = CooperativeScheduler::<2>::new();
+                let mut registry = ObjectRegistry::<16>::new();
+                let mut new_thread = || {
+                    let creation = registry.create(DW_OBJECT_TYPE_THREAD).unwrap();
+                    let key = ThreadKey::from_object_id(creation.id());
+                    registry.cancel_creation(creation).unwrap();
+                    key
+                };
+                let hog = new_thread();
+                let peer = new_thread();
+                scheduler
+                    .commit_on(cpu, scheduler.reserve(hog).unwrap())
+                    .unwrap();
+                scheduler.schedule_next_on(cpu).unwrap();
+                if peer_is_runnable {
+                    scheduler
+                        .commit_on(cpu, scheduler.reserve(peer).unwrap())
+                        .unwrap();
+                }
+
+                let ticket = scheduler
+                    .prepare_quantum_if_needed_on(cpu, 100)
+                    .unwrap()
+                    .unwrap();
+                let mut source = LocalDeadlineSource::new();
+                source
+                    .replace(ticket.source_arm_generation(), ticket.deadline_ns(), ticket)
+                    .unwrap();
+                // Runtime contention can consume the entire quantum before
+                // the first physical arm. AP reconciliation then stops the
+                // timer and publishes this exact request synchronously.
+                let now = ticket.deadline_ns() + 1;
+                let expired = source.take_due(now).unwrap();
+                assert_eq!(source.earliest(), None);
+                assert_eq!(scheduler.publish_quantum_expiry(expired), Ok(true));
+                assert!(scheduler.has_reschedule_request_on(cpu));
+
+                // There is no remaining AP source and the hog makes no kernel
+                // calls. Its return gate must consume this request now.
+                match scheduler.preempt_current_on(cpu).unwrap() {
+                    SchedulerPreemptionDecision::Switch { decision, outgoing } => {
+                        assert!(peer_is_runnable);
+                        assert_eq!(decision.current, Some(peer));
+                        scheduler.complete_switch_on(outgoing).unwrap();
+                    }
+                    SchedulerPreemptionDecision::RetainCurrent { .. } => {
+                        assert!(!peer_is_runnable);
+                    }
+                    SchedulerPreemptionDecision::Deferred => panic!("safe return was deferred"),
+                }
+                assert!(!scheduler.has_reschedule_request_on(cpu));
+                let next = scheduler
+                    .prepare_quantum_if_needed_on(cpu, now)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(next.thread(), if peer_is_runnable { peer } else { hog });
+                source
+                    .replace(next.source_arm_generation(), next.deadline_ns(), next)
+                    .unwrap();
+                assert_eq!(source.take_due(now), None);
+                assert_eq!(source.earliest(), Some(next.deadline_ns()));
+                assert_eq!(scheduler.publish_quantum_expiry(expired), Ok(false));
+                assert_eq!(scheduler.check_invariants(), Ok(()));
+            }
+        }
+    }
+
+    #[test]
     fn source_replace_cancel_and_due_are_exact_generation_operations() {
         let mut source = LocalDeadlineSource::new();
         assert_eq!(source.replace(1, 100, 7_u8), Ok(()));

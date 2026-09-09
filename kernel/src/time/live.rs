@@ -1561,10 +1561,12 @@ fn reconcile_ap_scheduler_hardware(
 
 /// Replaces the current CPU's scheduler source. CPU0 retains its unified
 /// Timer/wait arbiter; each AP mutates only its private quantum source and
-/// physical-arm generation.
+/// physical-arm generation. Returns true when the source expired during arm
+/// preparation and the caller must revisit its safe-return scheduling gate.
+/// In that case an AP has no remaining physical timer to force a later entry.
 pub(crate) fn arm_scheduler_quantum(
     ticket: crate::task::SchedulerQuantumTicket,
-) -> Result<(), LiveTimeError> {
+) -> Result<bool, LiveTimeError> {
     let cpu = installed_current_cpu_index()?;
     if ticket.cpu() != cpu {
         return Err(LiveTimeError::CpuIdentity);
@@ -1583,7 +1585,7 @@ pub(crate) fn arm_scheduler_quantum(
         crate::arch::x86_64::syscall::publish_current_quantum_expiry(due)
             .map_err(|_| LiveTimeError::Faulted)?;
     }
-    Ok(())
+    Ok(due.is_some())
 }
 
 pub(crate) fn cancel_scheduler_quantum(

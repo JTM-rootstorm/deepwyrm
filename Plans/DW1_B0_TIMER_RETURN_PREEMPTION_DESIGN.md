@@ -257,6 +257,26 @@ guards. This prevents an expiry during kernel work from waiting for a second
 hardware interrupt. Both syscall-origin and timer-origin paths use the same
 scheduler preparation and physical completion rules.
 
+Quantum arming can itself consume a complete quantum: the monotonic sample
+precedes synchronized carrier preparation and hardware reconciliation. When
+that reconciliation finds the new ticket already due, it publishes the exact
+request synchronously. On an AP the consumed scheduler source was its only
+timer source, so this path masks the physical timer. Returning directly to a
+CPU-bound userspace Thread would then leave no timer to cause the next safe
+boundary.
+
+The arm seam therefore reports synchronous expiry to its caller. Both timer
+and syscall return repeat the established Stop, validation, scheduling, and
+arm sequence until arming leaves a live source instead of publishing another
+request. First entry's existing IRET helper pivots from the bootstrap, idle, or
+reaper carrier onto the bound Thread stack before saving all initial registers
+as the same 160-byte asynchronous-return frame. Only then may its shared gate
+retain a preempted continuation; restoration consumes the gate-authorized
+values. An already-due ticket is never silently replaced with a later
+deadline, and repeated syscall return still preserves the current budget.
+This closes the arm-to-return liveness gap without changing the quantum,
+scheduling policy, interrupt entry, or native ABI.
+
 ## 9. Validation
 
 Host/model tests must cover:
