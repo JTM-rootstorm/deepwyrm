@@ -341,6 +341,86 @@ fn every_user_entry_consumes_a_quantum_that_expires_during_arming() {
 }
 
 #[test]
+fn quantum_clock_is_sampled_only_inside_synchronized_preparation() {
+    let live = source("src/arch/x86_64/syscall/live.rs");
+    let prepare = live
+        .split_once("unsafe fn native_runtime_prepare_quantum<")
+        .unwrap()
+        .1
+        .split_once("pub(crate) fn publish_current_quantum_expiry(")
+        .unwrap()
+        .0;
+    assert!(prepare.contains(".prepare_quantum(|| crate::time::monotonic_now()"));
+    let arm = live
+        .split_once("fn arm_current_normal_quantum()")
+        .unwrap()
+        .1
+        .split_once("fn poll_timer_return_stop")
+        .unwrap()
+        .0;
+    assert!(!arm.contains("monotonic_now"));
+    assert!(arm.contains("(binding.prepare_quantum_handler)(binding.context)"));
+
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let carrier = primordial.split_once("fn prepare_quantum(").unwrap().1;
+    let carrier = carrier.split_once("fn has_reschedule_request").unwrap().0;
+    assert!(carrier.contains("sample_now_ns: impl FnOnce() -> u64"));
+    assert_eq!(carrier.matches("sample_now_ns()").count(), 1);
+    let sample = carrier.find("let now_ns = sample_now_ns();").unwrap();
+    let prepare = carrier
+        .find(".prepare_quantum_if_needed_on(self.cpu, now_ns)")
+        .unwrap();
+    assert!(sample < prepare);
+    let facade = primordial.rsplit_once("fn prepare_quantum(").unwrap().1;
+    let facade = facade.split_once("fn has_reschedule_request").unwrap().0;
+    assert!(!facade.contains("sample_now_ns()"));
+    assert!(facade.contains(".with_synchronized_runtime_at_safe_point(|runtime| {"));
+    assert!(facade.contains("runtime.prepare_quantum(sample_now_ns)"));
+    let synchronized = primordial
+        .split_once("fn with_synchronized_runtime_at_safe_point<T>(")
+        .unwrap()
+        .1
+        .split_once("fn service_q35_retirement_at_bsp_safe_point")
+        .unwrap()
+        .0;
+    assert!(
+        synchronized
+            .find("let mut runtime = self.runtime.lock();")
+            .unwrap()
+            < synchronized.find("Ok(operation(&mut runtime))").unwrap()
+    );
+
+    let execution = source("src/task/execution.rs");
+    let prepare = execution
+        .split_once("pub(crate) fn prepare_quantum_if_needed_on(")
+        .unwrap()
+        .1
+        .split_once("pub(crate) fn publish_quantum_expiry(")
+        .unwrap()
+        .0;
+    assert!(prepare.contains(".prepare_quantum_if_needed_on(cpu, now_ns)"));
+    assert!(!prepare.contains("sample_now_ns"));
+
+    let scheduler = source("src/task/scheduler.rs");
+    let prepare = scheduler
+        .split_once("pub(crate) fn prepare_quantum_if_needed_on(")
+        .unwrap()
+        .1
+        .split_once("pub(crate) fn publish_quantum_expiry(")
+        .unwrap()
+        .0;
+    let lock = prepare.find("let mut state = self.state.lock();").unwrap();
+    let existing = prepare
+        .find("if state.quantum[cpu.index()].is_some()")
+        .unwrap();
+    let mint = prepare
+        .find("state.mint_quantum_on(cpu, claim, now_ns)")
+        .unwrap();
+    assert!(lock < existing && existing < mint);
+    assert!(!prepare.contains("sample_now_ns"));
+}
+
+#[test]
 fn dw1b_timer_return_validation_is_fail_closed_before_resume_or_rearm() {
     let live = source("src/arch/x86_64/syscall/live.rs");
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");

@@ -89,9 +89,13 @@ QuantumTicket {
 ```
 
 All identities and generations are exact and nonzero. A quantum begins
-immediately before each permitted CPL3 return, including first entry, syscall
-resume, and timer-origin resume. Dispatch deadline construction uses checked
-addition from a fresh monotonic-active sample.
+immediately before the selected execution's first permitted CPL3 return,
+including first entry, syscall resume, and timer-origin resume. Returns within
+an existing quantum preserve its exact budget. Dispatch deadline construction
+uses checked addition from a fresh monotonic-active sample taken only after
+the carrier's synchronized runtime preparation, immediately before calling
+scheduler quantum preparation. Waiting to acquire the coarse runtime guard
+does not consume a budget that has not yet begun.
 
 The timer source may publish one coalescing request only when the ticket, CPU0
 Running claim, and execution generation still match. Repeated matching vectors
@@ -257,10 +261,20 @@ guards. This prevents an expiry during kernel work from waiting for a second
 hardware interrupt. Both syscall-origin and timer-origin paths use the same
 scheduler preparation and physical completion rules.
 
-Quantum arming can itself consume a complete quantum: the monotonic sample
-precedes synchronized carrier preparation and hardware reconciliation. When
-that reconciliation finds the new ticket already due, it publishes the exact
-request synchronously. On an AP the consumed scheduler source was its only
+The live return seam supplies a deferred one-shot clock sampler through the
+native runtime interface. The facade forwards it into the synchronized
+operation without invoking it. The carrier samples after acquiring runtime
+authority, releases the independent clock guard, then enters scheduler
+preparation with the fresh timestamp. Clock and scheduler guards are never
+nested. The scheduler still mints only a genuinely absent quantum; preserved
+budgets and pending requests do not refresh their deadlines. Stopped return
+preparation does not invoke the sampler. All runtime/scheduler guards are
+dropped before hardware reconciliation.
+
+A delay after quantum minting can still consume a complete quantum before
+hardware reconciliation. When that reconciliation finds the new ticket
+already due, it publishes the exact request synchronously. On an AP the
+consumed scheduler source was its only
 timer source, so this path masks the physical timer. Returning directly to a
 CPU-bound userspace Thread would then leave no timer to cause the next safe
 boundary.
@@ -274,8 +288,11 @@ as the same 160-byte asynchronous-return frame. Only then may its shared gate
 retain a preempted continuation; restoration consumes the gate-authorized
 values. An already-due ticket is never silently replaced with a later
 deadline, and repeated syscall return still preserves the current budget.
-This closes the arm-to-return liveness gap without changing the quantum,
-scheduling policy, interrupt entry, or native ABI.
+The fresh sample excludes pre-runtime-lock preparation contention from the new
+budget; it does not bound subsequent scheduler-lock or post-mint delays, or
+prove the retry loop always ends.
+The exact immediate-expiry rule, quantum, scheduling policy, interrupt entry,
+and native ABI remain unchanged.
 
 ## 9. Validation
 
@@ -290,7 +307,9 @@ Host/model tests must cover:
 - matching and stale request coalescing;
 - peer switch, no-peer retain/rearm, block/terminal/Stop precedence;
 - continuation ownership and Thread-generation reuse;
-- first entry, syscall resume, and timer resume quantum arms; and
+- first entry, syscall resume, and timer resume quantum arms;
+- delayed synchronized preparation starting a fresh full budget, while
+  preserved budgets and unconsumed expiry requests retain their deadlines; and
 - source/lock-order assertions that no forbidden guard spans APIC MMIO,
   context switch, or userspace return.
 

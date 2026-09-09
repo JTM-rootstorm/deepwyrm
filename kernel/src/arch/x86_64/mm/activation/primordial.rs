@@ -6436,8 +6436,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
 
     fn prepare_quantum(
         &mut self,
-        now_ns: u64,
+        sample_now_ns: impl FnOnce() -> u64,
     ) -> Result<Option<crate::task::SchedulerQuantumTicket>, crate::task::SchedulerError> {
+        // The facade already holds runtime authority. Finish the independent
+        // clock sample before acquiring scheduler authority; component locks
+        // remain sequential and no pre-runtime-lock sample spends this budget.
+        let now_ns = sample_now_ns();
         self.shared
             .execution
             .prepare_quantum_if_needed_on(self.cpu, now_ns)
@@ -8127,11 +8131,11 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
 
     fn prepare_quantum(
         &mut self,
-        now_ns: u64,
+        sample_now_ns: impl FnOnce() -> u64,
     ) -> Result<Option<crate::task::SchedulerQuantumTicket>, crate::task::SchedulerError> {
-        match self
-            .with_synchronized_runtime_at_safe_point(|runtime| runtime.prepare_quantum(now_ns))
-        {
+        match self.with_synchronized_runtime_at_safe_point(|runtime| {
+            runtime.prepare_quantum(sample_now_ns)
+        }) {
             Ok(result) => result,
             Err(()) => Ok(None),
         }

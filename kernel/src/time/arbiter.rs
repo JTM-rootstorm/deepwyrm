@@ -222,7 +222,7 @@ mod tests {
                 source
                     .replace(ticket.source_arm_generation(), ticket.deadline_ns(), ticket)
                     .unwrap();
-                // Runtime contention can consume the entire quantum before
+                // A delay after minting can consume the entire quantum before
                 // the first physical arm. AP reconciliation then stops the
                 // timer and publishes this exact request synchronously.
                 let now = ticket.deadline_ns() + 1;

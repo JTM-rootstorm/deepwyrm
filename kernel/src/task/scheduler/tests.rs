@@ -1475,6 +1475,76 @@ fn dw1c2_cross_cpu_ticket_identity_cannot_mutate_another_local_source() {
 }
 
 #[test]
+fn quantum_budget_starts_after_synchronized_preparation_delay() {
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    for cpu_index in 0..H2_SCHEDULER_CPU_CAPACITY {
+        for delay_ns in [
+            0,
+            DEFAULT_NORMAL_QUANTUM_NS,
+            100 * DEFAULT_NORMAL_QUANTUM_NS,
+        ] {
+            let scheduler = CooperativeScheduler::<1>::new();
+            let mut registry = ObjectRegistry::<16>::new();
+            let running = thread_key(&mut registry);
+            scheduler
+                .commit_on(cpu(cpu_index), scheduler.reserve(running).unwrap())
+                .unwrap();
+            scheduler.schedule_next_on(cpu(cpu_index)).unwrap();
+
+            // Model the facade's contended authority boundary with the real
+            // scheduler inside it. Time advances only while that boundary is
+            // held, before the pending preparation can acquire it.
+            let authority = Mutex::new(scheduler);
+            let clock = AtomicU64::new(100);
+            let samples = AtomicUsize::new(0);
+            let queued = Barrier::new(2);
+            let ticket = thread::scope(|scope| {
+                let guard = authority.lock().unwrap();
+                let preparation = scope.spawn(|| {
+                    let sample_now_ns = || {
+                        assert!(authority.try_lock().is_err());
+                        samples.fetch_add(1, Ordering::Relaxed);
+                        clock.load(Ordering::Relaxed)
+                    };
+                    queued.wait();
+                    let scheduler = authority.lock().unwrap();
+                    scheduler
+                        .prepare_quantum_if_needed_on(cpu(cpu_index), sample_now_ns())
+                        .unwrap()
+                        .unwrap()
+                });
+                queued.wait();
+                clock.store(100 + delay_ns, Ordering::Relaxed);
+                drop(guard);
+                preparation.join().unwrap()
+            });
+
+            assert_eq!(samples.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                ticket.deadline_ns(),
+                100 + delay_ns + DEFAULT_NORMAL_QUANTUM_NS
+            );
+            let scheduler = authority.lock().unwrap();
+            assert_eq!(
+                scheduler.prepare_quantum_if_needed_on(cpu(cpu_index), ticket.deadline_ns() - 1),
+                Ok(None)
+            );
+            assert_eq!(
+                scheduler.preemption_snapshot_on(cpu(cpu_index)).quantum,
+                Some(ticket)
+            );
+            assert!(scheduler.publish_quantum_expiry(ticket).unwrap());
+            assert_eq!(
+                scheduler.prepare_quantum_if_needed_on(cpu(cpu_index), ticket.deadline_ns()),
+                Err(SchedulerError::QuantumUnavailable)
+            );
+        }
+    }
+}
+
+#[test]
 fn dw1b_repeated_syscall_returns_preserve_budget_until_exact_expiry() {
     let scheduler = CooperativeScheduler::<2>::new();
     let mut registry = ObjectRegistry::<16>::new();

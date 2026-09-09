@@ -106,7 +106,7 @@ type UserExceptionRuntimeHandler =
 type RendezvousGateHandler = unsafe fn(*mut ()) -> u8;
 type RendezvousReaperHandler = unsafe fn(*mut ()) -> !;
 type QuantumExpiryHandler = unsafe fn(*mut (), crate::task::SchedulerQuantumTicket) -> bool;
-type PrepareQuantumHandler = unsafe fn(*mut (), u64) -> Option<crate::task::SchedulerQuantumTicket>;
+type PrepareQuantumHandler = unsafe fn(*mut ()) -> Option<crate::task::SchedulerQuantumTicket>;
 type TimerPreIretHandler = unsafe fn(*mut (), &mut super::frame::RawCpl3TimerReturnFrame);
 
 #[derive(Clone, Copy)]
@@ -1148,11 +1148,10 @@ unsafe fn native_runtime_quantum_expiry<R: crate::syscall::native::NativeSyscall
 )]
 unsafe fn native_runtime_prepare_quantum<R: crate::syscall::native::NativeSyscallFrameRuntime>(
     context: *mut (),
-    now_ns: u64,
 ) -> Option<crate::task::SchedulerQuantumTicket> {
     let runtime = unsafe { &mut *context.cast::<R>() };
     runtime
-        .prepare_quantum(now_ns)
+        .prepare_quantum(|| crate::time::monotonic_now().unwrap_or_else(|_| halt_forever()))
         .unwrap_or_else(|_| halt_forever())
 }
 
@@ -1177,8 +1176,7 @@ pub(crate) fn publish_current_quantum_expiry(
 )]
 fn arm_current_normal_quantum() -> bool {
     let binding = runtime_binding().unwrap_or_else(|| halt_forever());
-    let now_ns = crate::time::monotonic_now().unwrap_or_else(|_| halt_forever());
-    if let Some(ticket) = unsafe { (binding.prepare_quantum_handler)(binding.context, now_ns) } {
+    if let Some(ticket) = unsafe { (binding.prepare_quantum_handler)(binding.context) } {
         return crate::time::arm_scheduler_quantum(ticket).unwrap_or_else(|_| halt_forever());
     }
     false

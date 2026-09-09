@@ -890,9 +890,12 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
         Ok(false)
     }
 
+    /// Samples a new dispatch budget only inside synchronized preparation,
+    /// immediately before scheduler preparation. The sampler must not acquire
+    /// runtime authority; it runs while that guard is held by the live carrier.
     fn prepare_quantum(
         &mut self,
-        _now_ns: u64,
+        _sample_now_ns: impl FnOnce() -> u64,
     ) -> Result<Option<crate::task::SchedulerQuantumTicket>, crate::task::SchedulerError> {
         panic!("native runtime does not admit DW1-B quantum arming")
     }
