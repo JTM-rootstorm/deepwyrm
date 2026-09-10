@@ -41,12 +41,12 @@ pub(crate) fn validate_wyr1e8_thread_stack_margin(
             symbol.contains("syscall::adapters::prepare_task_group_terminate::<")
                 && symbol.contains("FServiceTerminalCleanup<")
                 && symbol.contains("PrimordialRuntimeCarrier<128, 4096>")
-                && symbol.contains(", 160, 64, 64, 64, 32, 64, 64>")
+                && symbol.contains(", 160, 64, 64, 64, 64, 64, 64>")
         });
     let (terminate_group, terminate_group_bytes) =
         select("E8 task-group authority termination", &|symbol| {
             symbol
-                == "<deepwyrm_kernel::task::TaskAuthority<64, 64, 64, 32>>::terminate_group::<160>"
+                == "<deepwyrm_kernel::task::TaskAuthority<64, 64, 64, 64>>::terminate_group::<160>"
         });
 
     let syscall_entry = function_body(disassembly, "dw_x86_64_syscall_entry");
@@ -105,9 +105,12 @@ pub(crate) fn validate_wyr1e8_thread_stack_margin(
         .and_then(|bytes| bytes.checked_add(REQUIRED_SPARE_BYTES))
         .expect("E8 Thread stack requirement fits usize");
 
-    assert_eq!(common, 1_239_600);
-    assert_eq!(normal, 2_452_576);
-    assert_eq!(required, 2_489_440);
+    // E8's 64-handle per-Process tables widen the existing termination path's
+    // frames. These exact values are recomputed from emitted .stack_sizes;
+    // the call-edge and release-machine-code equivalence checks remain intact.
+    assert_eq!(common, 1_501_744);
+    assert_eq!(normal, 2_977_888);
+    assert_eq!(required, 3_014_752);
     assert!(
         required <= thread_stack_bytes,
         "WYR1-E8 Thread stack too small: common={common} task-group-terminate={normal} architectural-headroom={ARCHITECTURAL_HEADROOM_BYTES} required-spare={REQUIRED_SPARE_BYTES} required={required} capacity={thread_stack_bytes}"
@@ -120,10 +123,10 @@ pub(crate) fn validate_wyr1e8_thread_stack_margin(
 
 #[test]
 fn e8_thread_capacity_rejects_a5_layout_and_accepts_functional_allocation() {
-    const REQUIRED: usize = 2_489_440;
+    const REQUIRED: usize = 3_014_752;
     const {
         assert!(REQUIRED > 512 * 1024);
         assert!(REQUIRED <= 4 * 1024 * 1024);
     }
-    assert_eq!(4 * 1024 * 1024 - REQUIRED, 1_704_864);
+    assert_eq!(4 * 1024 * 1024 - REQUIRED, 1_179_552);
 }
