@@ -17,6 +17,8 @@ const REQUIRED_GRAPH_ITEMS: usize = 12 + 3 + 4 + 6 + 7 + 7;
 const REQUIRED_GRAPH_ITEMS: usize = 13 + 3 + 4 + 6 + 7 + 7 + 1;
 pub(super) const WAITERS: usize = 64;
 const _: () = assert!(WAITERS >= REQUIRED_GRAPH_ITEMS);
+#[cfg(deepwyrm_wyr1e8_evidence)]
+const _: () = assert!(REQUIRED_GRAPH_ITEMS == super::wyr1e8_resource_geometry::WAIT_PEAK);
 
 #[cfg(test)]
 mod tests {
@@ -120,5 +122,21 @@ mod tests {
     fn selector33_e8_control_and_pressure_overlap_fit_with_headroom() {
         assert!(!exercise_graph::<40>(&E8_ACTOR_ITEMS));
         assert!(exercise_graph::<WAITERS>(&E8_ACTOR_ITEMS));
+    }
+
+    #[test]
+    fn selector33_e8_trigger_join_and_six_runnable_hogs_do_not_add_waiters() {
+        // The shell's held trigger WAIT and controller's recovery join reuse
+        // their existing seven-item bounds. Each hog is runnable, not waiting;
+        // pressure is the only extra actor registration. Model every phase,
+        // including the conservative pressure overlap, with actual registers.
+        for actor_items in [
+            [13, 3, 4, 6, 7, 7, 0], // S1 and S2 trigger WAIT
+            [13, 3, 4, 6, 7, 7, 0], // S3 trigger WAIT/recovery join
+            [13, 3, 4, 6, 7, 7, 0], // S4 six runnable hogs/hello
+            E8_ACTOR_ITEMS,         // pressure WRITABLE wait after hog retirement
+        ] {
+            assert!(exercise_graph::<WAITERS>(&actor_items));
+        }
     }
 }

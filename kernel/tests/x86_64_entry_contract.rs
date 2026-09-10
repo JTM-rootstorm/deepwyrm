@@ -608,7 +608,7 @@ fn selector33_wre1_shell_relay_is_private_bounded_and_atomic() {
         .find("copy_wyr1e_evidence_input::<_, WYR1E_EVIDENCE_RECORD_LEN>")
         .expect("selector-33 bounded usercopy");
     let submit = primordial
-        .find("match WYR1E_EVIDENCE.submit(self.process, &record)")
+        .find("match WYR1E_EVIDENCE.submit_with_diagnostic(self.process, &record)")
         .expect("selector-33 authority recheck and commit");
     assert!(authorize < copy && copy < submit);
     assert!(primordial.contains("WYR1E_EVIDENCE\n            .observe_reporter_start"));
@@ -684,12 +684,20 @@ fn selector33_e8_profile_is_additive_exact_and_private() {
         "#[cfg(deepwyrm_wyr1e8_evidence)]\nconst USERSPACE_CHAIN_PROCESSES: usize = 64;",
         "#[cfg(deepwyrm_wyr1e8_evidence)]\nconst CHANNEL_PAIRS: usize = 32;",
         "#[cfg(deepwyrm_wyr1e8_evidence)]\nconst TASK_GROUPS: usize = 64;",
+        "#[cfg(deepwyrm_wyr1e8_evidence)]\nconst REGISTRY_OBJECTS: usize = 160;",
+        "#[cfg(deepwyrm_wyr1e8_evidence)]\nconst HANDLES: usize = 64;",
+        "#[cfg(deepwyrm_wyr1e8_evidence)]\nconst MEMORY_OBJECTS: usize = 64;",
+        "#[cfg(deepwyrm_wyr1e8_evidence)]\nconst MEMORY_LEASES: usize = 64;",
+        "assert!(HANDLES == SELECTED.handles);",
+        "assert!(MEMORY_OBJECTS == SELECTED.memory);",
+        "assert!(MEMORY_LEASES == SELECTED.mappings);",
         "const _: [(); 64] = [(); WAITERS];",
     ] {
         assert!(primordial.contains(exact), "E8 geometry lost `{exact}`");
     }
     for exact in [
         "EvidenceVersion::V1_1",
+        "const WYR1E_EVIDENCE_RECORD_CAPACITY: usize = 128;",
         "const E8_UP_RECORDS: usize = 33;",
         "const E8_SMP_RECORDS: usize = 69;",
         "outcome == 5 && values == [0; 3]",
@@ -711,6 +719,34 @@ fn selector33_e8_profile_is_additive_exact_and_private() {
     assert!(primordial.contains("Q35ExternalInterruptHandler\n    for PrimordialRuntimeShared"));
     assert!(build_support.contains("build_release_wyr1e8_stack_kernel"));
     assert!(build_support.contains(".env_remove(\"DEEPWYRM_WYR1E7_EVIDENCE_NONCE\")"));
+}
+
+#[test]
+fn selector33_e8_resource_expansion_preserves_non_e8_pool_selections() {
+    let root = kernel_root();
+    let primordial = fs::read_to_string(root.join("src/arch/x86_64/mm/activation/primordial.rs"))
+        .expect("read selected capacities");
+    for (pool, old_capacity) in [
+        ("HANDLES", 32),
+        ("MEMORY_OBJECTS", 28),
+        ("MEMORY_LEASES", 28),
+    ] {
+        let declaration = format!("const {pool}: usize = {old_capacity};");
+        let position = primordial
+            .rfind(&declaration)
+            .expect("historical pool still exists");
+        let guard = &primordial[..position];
+        let guard = &guard[guard.rfind("#[cfg(").expect("pool has an explicit cfg")..];
+        assert!(guard.contains("not(deepwyrm_wyr1e8_evidence)"));
+        for selector in [
+            "deepwyrm_wyr1c_evidence",
+            "deepwyrm_wyr1d_evidence",
+            "deepwyrm_wyr1e_evidence",
+            "deepwyrm_dw1e_evidence",
+        ] {
+            assert!(guard.contains(selector), "old {pool} lost {selector}");
+        }
+    }
 }
 
 #[test]

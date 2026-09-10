@@ -130,12 +130,19 @@ const REGISTRY_OBJECTS: usize = 160;
 // its bounded raw-stream probe. Reuse selector 29's functional headroom for
 // that eight-Process product instead of falling through to the three-Process
 // historical bootstrap geometry.
-#[cfg(any(
-    deepwyrm_wyr1c_evidence,
-    deepwyrm_wyr1d_evidence,
-    deepwyrm_wyr1e_evidence,
-    deepwyrm_dw1e_evidence
+#[cfg(all(
+    not(deepwyrm_wyr1e8_evidence),
+    any(
+        deepwyrm_wyr1c_evidence,
+        deepwyrm_wyr1d_evidence,
+        deepwyrm_wyr1e_evidence,
+        deepwyrm_dw1e_evidence
+    )
 ))]
+const REGISTRY_OBJECTS: usize = 160;
+// Full E8 graph: 136 registry objects, including one-sided hog startup
+// endpoints. Select explicitly even though this bound also serves E7.
+#[cfg(deepwyrm_wyr1e8_evidence)]
 const REGISTRY_OBJECTS: usize = 160;
 #[cfg(not(any(
     deepwyrm_i2_stress,
@@ -167,13 +174,18 @@ const MEMORY_OBJECTS: usize = 13;
 const MEMORY_OBJECTS: usize = 16;
 #[cfg(deepwyrm_wyr1b_evidence)]
 const MEMORY_OBJECTS: usize = 28;
-#[cfg(any(
-    deepwyrm_wyr1c_evidence,
-    deepwyrm_wyr1d_evidence,
-    deepwyrm_wyr1e_evidence,
-    deepwyrm_dw1e_evidence
+#[cfg(all(
+    not(deepwyrm_wyr1e8_evidence),
+    any(
+        deepwyrm_wyr1c_evidence,
+        deepwyrm_wyr1d_evidence,
+        deepwyrm_wyr1e_evidence,
+        deepwyrm_dw1e_evidence
+    )
 ))]
 const MEMORY_OBJECTS: usize = 28;
+#[cfg(deepwyrm_wyr1e8_evidence)]
+const MEMORY_OBJECTS: usize = 64;
 #[cfg(not(any(
     deepwyrm_i2_stress,
     deepwyrm_wrcap_relay,
@@ -201,13 +213,18 @@ const MEMORY_LEASES: usize = 13;
 const MEMORY_LEASES: usize = 16;
 #[cfg(deepwyrm_wyr1b_evidence)]
 const MEMORY_LEASES: usize = 28;
-#[cfg(any(
-    deepwyrm_wyr1c_evidence,
-    deepwyrm_wyr1d_evidence,
-    deepwyrm_wyr1e_evidence,
-    deepwyrm_dw1e_evidence
+#[cfg(all(
+    not(deepwyrm_wyr1e8_evidence),
+    any(
+        deepwyrm_wyr1c_evidence,
+        deepwyrm_wyr1d_evidence,
+        deepwyrm_wyr1e_evidence,
+        deepwyrm_dw1e_evidence
+    )
 ))]
 const MEMORY_LEASES: usize = 28;
+#[cfg(deepwyrm_wyr1e8_evidence)]
+const MEMORY_LEASES: usize = 64;
 // I0 keeps the complete bootstrap -> init0 -> hello chain live while each
 // parent performs bounded READY/exit supervision of its direct child. The
 // selector-24 controller adds exactly one temporary supervised child.
@@ -258,11 +275,10 @@ const USERSPACE_CHAIN_PROCESSES: usize = 8;
 // size this selector-local test artifact for the full interactive sequence.
 #[cfg(all(deepwyrm_wyr1e_evidence, not(deepwyrm_wyr1e8_evidence)))]
 const USERSPACE_CHAIN_PROCESSES: usize = 16;
-// E8 keeps the accepted E7 actors, two silent triggers, all replacement
-// service generations, six simultaneous hogs, three later hello actors, and
-// the pressure actor in the scheduler's terminal-retirement history. The
-// exact scenario has at least 30 lifetime identities; 64 avoids a near-bound
-// packing target while keeping the expansion selector-private.
+// E8 includes thirty lifetime identities across actors and replacement service
+// generations, with thirteen simultaneously live Processes at S4's peak.
+// Unlike DW1C/D, E8 does not select sticky terminal-retirement storage. Keep
+// the accepted selector-private 64 task-family headroom for the full scenario.
 #[cfg(deepwyrm_wyr1e8_evidence)]
 const USERSPACE_CHAIN_PROCESSES: usize = 64;
 #[cfg(any(
@@ -454,18 +470,56 @@ const HANDLES: usize = D6_HANDLE_PEAK;
 const HANDLES: usize = 16;
 #[cfg(deepwyrm_wyr1b_evidence)]
 const HANDLES: usize = 32;
-#[cfg(any(
-    deepwyrm_wyr1c_evidence,
-    deepwyrm_wyr1d_evidence,
-    deepwyrm_wyr1e_evidence,
-    deepwyrm_dw1e_evidence
+#[cfg(all(
+    not(deepwyrm_wyr1e8_evidence),
+    any(
+        deepwyrm_wyr1c_evidence,
+        deepwyrm_wyr1d_evidence,
+        deepwyrm_wyr1e_evidence,
+        deepwyrm_dw1e_evidence
+    )
 ))]
 const HANDLES: usize = 32;
+#[cfg(deepwyrm_wyr1e8_evidence)]
+const HANDLES: usize = 64;
 const SPACES: usize = USERSPACE_CHAIN_PROCESSES;
 const REGIONS: usize = USERSPACE_CHAIN_PROCESSES;
 const REGION_OBJECTS: usize = USERSPACE_CHAIN_PROCESSES;
 const REGION_SLOTS: usize = 10;
 const EXECUTION_THREADS: usize = USERSPACE_CHAIN_PROCESSES;
+// E8 is selected explicitly: its full scenario must not inherit the older
+// interactive graph's per-Process handle or image/mapping pools. The same
+// executable demand model drives host fixtures and these target assertions.
+#[cfg(deepwyrm_wyr1e8_evidence)]
+const _: () = {
+    use super::wyr1e8_resource_geometry::{Capacity, SELECTED, fits};
+    assert!(HANDLES == SELECTED.handles);
+    assert!(MEMORY_OBJECTS == SELECTED.memory);
+    assert!(MEMORY_LEASES == SELECTED.mappings);
+    assert!(PROCESSES == SELECTED.identities);
+    assert!(THREADS == SELECTED.identities);
+    assert!(SPACES == SELECTED.identities);
+    assert!(REGIONS == SELECTED.identities);
+    assert!(REGION_OBJECTS == SELECTED.identities);
+    assert!(TASK_GROUPS == SELECTED.identities);
+    assert!(EXECUTION_THREADS == SELECTED.identities);
+    assert!(REGISTRY_OBJECTS == SELECTED.registry);
+    assert!(CHANNEL_PAIRS == SELECTED.channel_pairs);
+    assert!(WAITERS == SELECTED.waits);
+    assert!(TIMERS >= super::wyr1e8_resource_geometry::TIMER_PEAK);
+    assert!(EVENTS >= super::wyr1e8_resource_geometry::EVENT_PEAK);
+    assert!(REGION_SLOTS >= super::wyr1e8_resource_geometry::REGION_MAPPING_PEAK);
+    assert!(fits(Capacity {
+        handles: HANDLES,
+        memory: MEMORY_OBJECTS,
+        mappings: MEMORY_LEASES,
+        identities: PROCESSES,
+        registry: REGISTRY_OBJECTS,
+        channel_pairs: CHANNEL_PAIRS,
+        waits: WAITERS,
+        evidence: SELECTED.evidence,
+    }));
+};
 #[cfg(not(deepwyrm_i2_stress))]
 const EVENTS: usize = 1;
 #[cfg(deepwyrm_i2_stress)]
@@ -651,25 +705,34 @@ const _: [(); 24] = [(); CHANNEL_PAIRS];
 const _: [(); 24] = [(); CHANNEL_PAIRS];
 #[cfg(deepwyrm_wyr1e8_evidence)]
 const _: [(); 32] = [(); CHANNEL_PAIRS];
-#[cfg(any(
-    deepwyrm_wyr1c_evidence,
-    deepwyrm_wyr1d_evidence,
-    deepwyrm_wyr1e_evidence,
-    deepwyrm_dw1e_evidence
+#[cfg(all(
+    not(deepwyrm_wyr1e8_evidence),
+    any(
+        deepwyrm_wyr1c_evidence,
+        deepwyrm_wyr1d_evidence,
+        deepwyrm_wyr1e_evidence,
+        deepwyrm_dw1e_evidence
+    )
 ))]
 const _: [(); 32] = [(); HANDLES];
-#[cfg(any(
-    deepwyrm_wyr1c_evidence,
-    deepwyrm_wyr1d_evidence,
-    deepwyrm_wyr1e_evidence,
-    deepwyrm_dw1e_evidence
+#[cfg(all(
+    not(deepwyrm_wyr1e8_evidence),
+    any(
+        deepwyrm_wyr1c_evidence,
+        deepwyrm_wyr1d_evidence,
+        deepwyrm_wyr1e_evidence,
+        deepwyrm_dw1e_evidence
+    )
 ))]
 const _: [(); 28] = [(); MEMORY_OBJECTS];
-#[cfg(any(
-    deepwyrm_wyr1c_evidence,
-    deepwyrm_wyr1d_evidence,
-    deepwyrm_wyr1e_evidence,
-    deepwyrm_dw1e_evidence
+#[cfg(all(
+    not(deepwyrm_wyr1e8_evidence),
+    any(
+        deepwyrm_wyr1c_evidence,
+        deepwyrm_wyr1d_evidence,
+        deepwyrm_wyr1e_evidence,
+        deepwyrm_dw1e_evidence
+    )
 ))]
 const _: [(); 28] = [(); MEMORY_LEASES];
 #[cfg(any(

@@ -59,6 +59,9 @@ mod user_access;
 #[cfg(any(test, all(target_os = "none", deepwyrm_wyr1d_evidence)))]
 #[path = "activation/wyr1d_wait_geometry.rs"]
 mod wyr1d_wait_geometry;
+#[cfg(any(test, all(target_os = "none", deepwyrm_wyr1e8_evidence)))]
+#[path = "activation/wyr1e8_resource_geometry.rs"]
+mod wyr1e8_resource_geometry;
 #[cfg(any(test, all(target_os = "none", deepwyrm_wyr1e_evidence)))]
 #[path = "activation/wyr1e_wait_geometry.rs"]
 mod wyr1e_wait_geometry;
