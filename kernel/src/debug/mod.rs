@@ -7,6 +7,10 @@
 
 #![cfg_attr(not(any(test, target_os = "none")), allow(dead_code))]
 
+/// Reset-card R1B structured liveness snapshot: lock-free per-CPU identity
+/// mirroring plus the runtime-authority address host GDB needs.
+pub(crate) mod liveness;
+
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};
 

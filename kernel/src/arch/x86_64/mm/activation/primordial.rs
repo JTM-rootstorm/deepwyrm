@@ -3090,7 +3090,24 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 self.root_key = self.cpu_root_keys[current].expect("CPU state omitted root");
             }
             self.channel_staging = take_channel_staging_once(cpu.index(), true);
+            self.mirror_current_identity(crate::debug::liveness::LivenessEvent::CarrierSelected);
         }
+    }
+
+    /// Mirrors this CPU's current identity into the lock-free R1B liveness
+    /// snapshot. Diagnostic only: nothing reads the mirror to make a decision,
+    /// and it exists so a stalled runtime can name its current Process, Thread,
+    /// root, context, and stack without acquiring this authority.
+    fn mirror_current_identity(&self, event: crate::debug::liveness::LivenessEvent) {
+        crate::debug::liveness::publish_current(
+            self.cpu,
+            self.thread.object_id().diagnostic_identity(),
+            self.process.object_id().diagnostic_identity(),
+            self.root_key.object_id().diagnostic_identity(),
+            self.context_id.diagnostic_identity(),
+            self.stack_id.diagnostic_identity(),
+            event,
+        );
     }
 
     fn begin_root_switch_flight(&mut self) -> RootSwitchFlight {
@@ -3410,6 +3427,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
     ) -> crate::syscall::native::NativePreemptionPlan<'static> {
         self.assert_guard_free_external_work();
+        crate::debug::liveness::note_event(
+            self.cpu,
+            crate::debug::liveness::LivenessEvent::Preempted,
+        );
         match self
             .shared
             .execution
@@ -6494,6 +6515,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         &mut self,
         ticket: crate::task::SchedulerQuantumTicket,
     ) -> Result<bool, crate::task::SchedulerError> {
+        crate::debug::liveness::note_event(
+            self.cpu,
+            crate::debug::liveness::LivenessEvent::QuantumExpired,
+        );
         self.shared.execution.publish_quantum_expiry(ticket)
     }
 
@@ -7900,6 +7925,10 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 self.pending_remote_termination.is_none(),
                 "CPU-local carrier already owns a pending remote termination"
             );
+            crate::debug::liveness::note_event(
+                self.cpu,
+                crate::debug::liveness::LivenessEvent::TerminationPrepared,
+            );
             if !self.synchronize_scheduler_current_at_safe_point_detached() {
                 return NativeSyscallResult {
                     status: DW_STATUS_SUCCESS,
@@ -8617,6 +8646,10 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
     }
 
     fn enter_idle_scheduler(&mut self) -> ! {
+        crate::debug::liveness::note_event(
+            self.cpu,
+            crate::debug::liveness::LivenessEvent::IdleEntered,
+        );
         #[cfg(deepwyrm_dw1c_evidence)]
         {
             let pending = {
@@ -9400,6 +9433,13 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         #[cfg(feature = "test-support")]
         g5_probe: G5PrimordialProbe::for_build(),
     }));
+
+    // Reset card R1B: record the live authority address once so host GDB over
+    // the QEMU gdbstub can read the ticket pair and the carrier behind it
+    // without executing guest code. The carrier is pinned to the boot stack,
+    // so this is the only fixed handle a debugger has; card R2D removes that
+    // boot-stack lifetime and this publication stays valid wherever it moves.
+    crate::debug::liveness::publish_runtime_authority(core::ptr::from_ref(&*runtime).cast::<()>());
     let runtime_ref = runtime.as_ref().get_ref();
     let (state, stack, exception_binding) = {
         let mut runtime = runtime_ref.lock();

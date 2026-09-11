@@ -245,6 +245,12 @@ impl KernelStackId {
         if raw == 0 { None } else { Some(Self(raw)) }
     }
 
+    /// Identity word for diagnostic reporting only; see
+    /// `ObjectId::diagnostic_identity`. Never an authority token.
+    pub(crate) const fn diagnostic_identity(self) -> u64 {
+        self.0
+    }
+
     pub(in crate::task) const fn raw(self) -> u64 {
         self.0
     }
@@ -255,6 +261,12 @@ pub(crate) struct ThreadContextId(u64);
 impl ThreadContextId {
     pub(in crate::task) const fn from_raw(raw: u64) -> Option<Self> {
         if raw == 0 { None } else { Some(Self(raw)) }
+    }
+
+    /// Identity word for diagnostic reporting only; see
+    /// `ObjectId::diagnostic_identity`. Never an authority token.
+    pub(crate) const fn diagnostic_identity(self) -> u64 {
+        self.0
     }
 
     pub(in crate::task) const fn raw(self) -> u64 {
