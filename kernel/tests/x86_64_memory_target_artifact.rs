@@ -25,13 +25,14 @@ const G5_PRIMORDIAL_SELECTORS: [&str; 3] = [
     "primordial-user-exception",
     "primordial-invalid-return",
 ];
-const WYR1_PRIMORDIAL_SELECTORS: [&str; 6] = [
+const WYR1_PRIMORDIAL_SELECTORS: [&str; 7] = [
     "permanent-supervisor-rrc",
     "normal-preemption-up",
     "bootstrap-registry-launch",
     "normal-preemption-smp",
     "device-coordinator-restart",
     "interactive-wyrmsh",
+    "dynamic-launch-saturation",
 ];
 const OWNED_WORKSPACE_CARGO_CONFIG: &str = ".cargo/config.toml";
 const LEGACY_WORKSPACE_CARGO_CONFIG: &str = ".cargo/config";
