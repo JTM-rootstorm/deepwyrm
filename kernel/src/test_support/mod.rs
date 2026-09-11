@@ -185,6 +185,10 @@ pub(crate) use dw1e_evidence::{
 };
 #[cfg(deepwyrm_r1_evidence)]
 pub(crate) use r1_evidence::R1_EVIDENCE_RAW_SYSCALL;
+// The selector's resource ledger sizes the probe's report against this bound,
+// so export it rather than letting the two carry independent copies of 64.
+#[cfg(any(test, deepwyrm_r1_evidence))]
+pub(crate) use r1_evidence::R1_EVIDENCE_RECORD_CAPACITY;
 #[cfg(deepwyrm_wyr1_evidence)]
 pub(crate) use wyr1_evidence::WYR1_EVIDENCE_RAW_SYSCALL;
 #[cfg(deepwyrm_wyr1b_evidence)]

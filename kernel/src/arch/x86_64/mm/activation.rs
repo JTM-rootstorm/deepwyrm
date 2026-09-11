@@ -56,6 +56,12 @@ mod primordial_diagnostic;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[path = "activation/user_access.rs"]
 mod user_access;
+// Not target-gated like the other geometry modules: `LIVE_ADDRESS_SPACE_CAPACITY`
+// below is compiled in every lane, so the ledger must resolve wherever the
+// selector's cfg is set. Matches `test_support`'s own `r1_evidence` gate.
+#[cfg(any(test, deepwyrm_r1_evidence))]
+#[path = "activation/r1_resource_geometry.rs"]
+mod r1_resource_geometry;
 #[cfg(any(test, all(target_os = "none", deepwyrm_wyr1d_evidence)))]
 #[path = "activation/wyr1d_wait_geometry.rs"]
 mod wyr1d_wait_geometry;
@@ -131,8 +137,15 @@ const _: () = {
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
+    deepwyrm_r1_evidence,
 )))]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;
+// Selector 34 keeps four residents, every hog up to the scenario's eight-hog
+// ceiling, and one progress child live together, plus the retiring primordial
+// root. Matched to the selector's lifetime-identity pool so root bindings and
+// Process identities cannot drift apart.
+#[cfg(deepwyrm_r1_evidence)]
+const LIVE_ADDRESS_SPACE_CAPACITY: usize = r1_resource_geometry::SELECTED.identities;
 // Selector 24 keeps bootstrap, init0, the controller, and one bounded worker
 // live together. The controller tears each worker down before starting the
 // next case, so the relay artifact needs exactly one additional binding.

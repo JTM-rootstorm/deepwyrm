@@ -104,6 +104,7 @@ const MAX_BOOTFS_BYTES: usize = 32 * 1024 * 1024;
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
+    deepwyrm_r1_evidence,
 )))]
 const REGISTRY_OBJECTS: usize = 32;
 #[cfg(deepwyrm_dw1c_evidence)]
@@ -144,6 +145,11 @@ const REGISTRY_OBJECTS: usize = 160;
 // endpoints. Select explicitly even though this bound also serves E7.
 #[cfg(deepwyrm_wyr1e8_evidence)]
 const REGISTRY_OBJECTS: usize = 160;
+// Selector 34's live graph: thirteen Process/Thread/root triples, fourteen
+// TaskGroups, the image MemoryObject peak, the Channel endpoint peak, devmgr's
+// boot resource domain, and init's control tick. Exact peak 115.
+#[cfg(deepwyrm_r1_evidence)]
+const REGISTRY_OBJECTS: usize = super::r1_resource_geometry::SELECTED.registry;
 #[cfg(not(any(
     deepwyrm_i2_stress,
     deepwyrm_wrcap_relay,
@@ -155,6 +161,7 @@ const REGISTRY_OBJECTS: usize = 160;
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
+    deepwyrm_r1_evidence,
 )))]
 const MEMORY_OBJECTS: usize = 10;
 #[cfg(deepwyrm_dw1c_evidence)]
@@ -186,6 +193,10 @@ const MEMORY_OBJECTS: usize = 28;
 const MEMORY_OBJECTS: usize = 28;
 #[cfg(deepwyrm_wyr1e8_evidence)]
 const MEMORY_OBJECTS: usize = 64;
+// Four resident three-object images plus the shared bootfs, each hog's single
+// PT_LOAD and stack at the eight-hog ceiling, and one live progress child.
+#[cfg(deepwyrm_r1_evidence)]
+const MEMORY_OBJECTS: usize = super::r1_resource_geometry::SELECTED.memory;
 #[cfg(not(any(
     deepwyrm_i2_stress,
     deepwyrm_wrcap_relay,
@@ -197,6 +208,7 @@ const MEMORY_OBJECTS: usize = 64;
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
+    deepwyrm_r1_evidence,
 )))]
 const MEMORY_LEASES: usize = 10;
 #[cfg(deepwyrm_dw1c_evidence)]
@@ -225,6 +237,10 @@ const MEMORY_LEASES: usize = 28;
 const MEMORY_LEASES: usize = 28;
 #[cfg(deepwyrm_wyr1e8_evidence)]
 const MEMORY_LEASES: usize = 64;
+// Every live image object is mapped exactly once; the loader unmaps its
+// scratch view before mapping the child, so leases track objects.
+#[cfg(deepwyrm_r1_evidence)]
+const MEMORY_LEASES: usize = super::r1_resource_geometry::SELECTED.mappings;
 // I0 keeps the complete bootstrap -> init0 -> hello chain live while each
 // parent performs bounded READY/exit supervision of its direct child. The
 // selector-24 controller adds exactly one temporary supervised child.
@@ -240,8 +256,15 @@ const MEMORY_LEASES: usize = 64;
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
+    deepwyrm_r1_evidence,
 )))]
 const USERSPACE_CHAIN_PROCESSES: usize = 3;
+// Selector 34's lifetime census: primordial, four residents, and one hog plus
+// one progress child per hog at the scenario's eight-hog ceiling. The probe
+// never terminates a hog until every hog has launched and been proved, so all
+// hogs are live at once. Sized at the ceiling, not the six-hog SMP plan.
+#[cfg(deepwyrm_r1_evidence)]
+const USERSPACE_CHAIN_PROCESSES: usize = super::r1_resource_geometry::SELECTED.identities;
 // Selector 30 has three simultaneously live userspace Processes, but four
 // lifetime-distinct generations: bootstrap, first owner, trigger, and the
 // replacement owner.  The shared bounded geometry also sizes the scheduler's
@@ -299,6 +322,7 @@ const _: () = assert!(super::LIVE_ADDRESS_SPACE_CAPACITY >= USERSPACE_CHAIN_PROC
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
+    deepwyrm_r1_evidence,
 )))]
 const CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;
 #[cfg(deepwyrm_dw1c_evidence)]
@@ -325,6 +349,10 @@ const CHANNEL_PAIRS: usize = 24;
 // Thirty-two pairs give bounded headroom without changing production ABI.
 #[cfg(deepwyrm_wyr1e8_evidence)]
 const CHANNEL_PAIRS: usize = 32;
+// Nine baseline startup/service pairs, one retained one-sided startup pair per
+// hog at the ceiling, and the live progress child's pair: exact peak 18.
+#[cfg(deepwyrm_r1_evidence)]
+const CHANNEL_PAIRS: usize = super::r1_resource_geometry::SELECTED.channel_pairs;
 const CHANNEL_DEPTH: usize = 2;
 #[cfg(not(any(
     deepwyrm_i2_stress,
@@ -337,8 +365,14 @@ const CHANNEL_DEPTH: usize = 2;
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
+    deepwyrm_r1_evidence,
 )))]
 const WAITERS: usize = 4;
+// Two registrations per WAIT_ANY: init's four resident supervisions, the one
+// in-flight synchronous READY wait this probe exists to stress, an exit wait
+// per live hog and the live progress child, and the probe's own reply wait.
+#[cfg(deepwyrm_r1_evidence)]
+const WAITERS: usize = super::r1_resource_geometry::SELECTED.waits;
 #[cfg(deepwyrm_dw1c_evidence)]
 const WAITERS: usize = 24;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
@@ -374,6 +408,7 @@ const WAITERS: usize = super::wyr1e_wait_geometry::WAITERS;
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
+    deepwyrm_r1_evidence,
 )))]
 const TASK_GROUPS: usize = 1;
 #[cfg(deepwyrm_dw1c_evidence)]
@@ -402,6 +437,10 @@ const TASK_GROUPS: usize = 8;
 const TASK_GROUPS: usize = 8;
 #[cfg(deepwyrm_wyr1e8_evidence)]
 const TASK_GROUPS: usize = 64;
+// One attempt TaskGroup per launched identity plus root. Held to the same
+// lifetime pool as Processes so a launch cannot outlive its group accounting.
+#[cfg(deepwyrm_r1_evidence)]
+const TASK_GROUPS: usize = super::r1_resource_geometry::SELECTED.identities;
 const PROCESSES: usize = USERSPACE_CHAIN_PROCESSES;
 const THREADS: usize = USERSPACE_CHAIN_PROCESSES;
 // Exact live bootstrap peak per Process: four inherited handles, one net
@@ -431,6 +470,7 @@ const BOOTSTRAP_HANDLE_PEAK: usize = INITIAL_BOOTSTRAP_HANDLES
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
+    deepwyrm_r1_evidence,
 )))]
 const HANDLES: usize = BOOTSTRAP_HANDLE_PEAK;
 #[cfg(deepwyrm_dw1c_evidence)]
@@ -482,6 +522,12 @@ const HANDLES: usize = 32;
 const HANDLES: usize = 32;
 #[cfg(deepwyrm_wyr1e8_evidence)]
 const HANDLES: usize = 64;
+// init's fourteen-handle resident baseline, two retained handles per hog at the
+// eight-hog ceiling, and the zero-stream loader's additive seven: exact peak
+// 37. Deliberately below E8's 64 — its widened tables are why E8's termination
+// path needed a 4 MiB per-thread stack, and this product's demand does not.
+#[cfg(deepwyrm_r1_evidence)]
+const HANDLES: usize = super::r1_resource_geometry::SELECTED.handles;
 const SPACES: usize = USERSPACE_CHAIN_PROCESSES;
 const REGIONS: usize = USERSPACE_CHAIN_PROCESSES;
 const REGION_OBJECTS: usize = USERSPACE_CHAIN_PROCESSES;
@@ -509,6 +555,40 @@ const _: () = {
     assert!(TIMERS >= super::wyr1e8_resource_geometry::TIMER_PEAK);
     assert!(EVENTS >= super::wyr1e8_resource_geometry::EVENT_PEAK);
     assert!(REGION_SLOTS >= super::wyr1e8_resource_geometry::REGION_MAPPING_PEAK);
+    assert!(fits(Capacity {
+        handles: HANDLES,
+        memory: MEMORY_OBJECTS,
+        mappings: MEMORY_LEASES,
+        identities: PROCESSES,
+        registry: REGISTRY_OBJECTS,
+        channel_pairs: CHANNEL_PAIRS,
+        waits: WAITERS,
+        evidence: SELECTED.evidence,
+    }));
+};
+// Selector 34 is selected explicitly for the same reason E8 is: its probe must
+// not inherit the bootstrap-era three-Process geometry it silently used before
+// this ledger existed. The same demand model drives the host fixtures and
+// these target assertions.
+#[cfg(deepwyrm_r1_evidence)]
+const _: () = {
+    use super::r1_resource_geometry::{Capacity, SELECTED, fits};
+    assert!(HANDLES == SELECTED.handles);
+    assert!(MEMORY_OBJECTS == SELECTED.memory);
+    assert!(MEMORY_LEASES == SELECTED.mappings);
+    assert!(PROCESSES == SELECTED.identities);
+    assert!(THREADS == SELECTED.identities);
+    assert!(SPACES == SELECTED.identities);
+    assert!(REGIONS == SELECTED.identities);
+    assert!(REGION_OBJECTS == SELECTED.identities);
+    assert!(TASK_GROUPS == SELECTED.identities);
+    assert!(EXECUTION_THREADS == SELECTED.identities);
+    assert!(REGISTRY_OBJECTS == SELECTED.registry);
+    assert!(CHANNEL_PAIRS == SELECTED.channel_pairs);
+    assert!(WAITERS == SELECTED.waits);
+    assert!(TIMERS >= super::r1_resource_geometry::TIMER_PEAK);
+    assert!(EVENTS >= super::r1_resource_geometry::EVENT_PEAK);
+    assert!(REGION_SLOTS >= super::r1_resource_geometry::REGION_MAPPING_PEAK);
     assert!(fits(Capacity {
         handles: HANDLES,
         memory: MEMORY_OBJECTS,
@@ -618,7 +698,11 @@ const _: [(); PROCESSES] = [(); THREADS];
     not(deepwyrm_dw1e_evidence),
     not(deepwyrm_wyr1c_evidence),
     not(deepwyrm_wyr1d_evidence),
-    not(deepwyrm_wyr1e_evidence)
+    not(deepwyrm_wyr1e_evidence),
+    // Selector 34 sizes Channel pairs from its own enumerated topology — nine
+    // baseline pairs plus one per live hog — which is deliberately smaller
+    // than its lifetime-identity pool.
+    not(deepwyrm_r1_evidence)
 ))]
 const _: [(); PROCESSES] = [(); CHANNEL_PAIRS];
 const _: [(); PROCESSES] = [(); SPACES];
@@ -637,8 +721,11 @@ const _: [(); PROCESSES] = [(); EXECUTION_THREADS];
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
+    deepwyrm_r1_evidence,
 )))]
 const _: [(); 10] = [(); HANDLES];
+#[cfg(deepwyrm_r1_evidence)]
+const _: [(); 48] = [(); HANDLES];
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const _: [(); 16] = [(); HANDLES];
 #[cfg(deepwyrm_wrcap_relay)]
