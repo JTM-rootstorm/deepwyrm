@@ -87,6 +87,61 @@ pub(crate) struct R1EvidenceRecord {
     pub(crate) bytes: [u8; R1_EVIDENCE_RECORD_LEN],
 }
 
+/// Why a terminal flush could not emit the transcript.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum R1EvidenceFlushError {
+    /// Another CPU holds the collector; the sole terminal owner must not spin
+    /// here, so this is reported rather than waited on.
+    Busy,
+    /// No terminal record was accepted, so the transcript cannot say whether
+    /// the probe passed. Emitting it would misreport a truncated run.
+    Incomplete,
+    /// The serial transport rejected a record.
+    Transport,
+}
+
+/// Outcome of a submission that the caller must act on. `Terminal` carries the
+/// sole permit to flush the transcript, so the terminal path cannot be entered
+/// twice or entered by a non-terminal record.
+pub(crate) enum R1EvidenceSubmit<'a> {
+    Accepted,
+    Terminal(R1EvidenceFlushPermit<'a>),
+}
+
+/// Capability to flush the bounded transcript exactly once. Only `submit_once`
+/// mints one, and only on the accepted terminal record.
+pub(crate) struct R1EvidenceFlushPermit<'a> {
+    collector: &'a R1EvidenceCollector,
+}
+
+impl R1EvidenceFlushPermit<'_> {
+    /// Emits every retained record in sequence order. The bounded transcript
+    /// stays in static storage: the emitter borrows each record in place rather
+    /// than copying the whole buffer onto the terminal kernel stack, matching
+    /// how the selector-33 relay flushes its certificate.
+    pub(crate) fn flush(
+        self,
+        mut emit: impl FnMut(&[u8; R1_EVIDENCE_RECORD_LEN]) -> Result<(), R1EvidenceFlushError>,
+    ) -> Result<(), R1EvidenceFlushError> {
+        let state = self
+            .collector
+            .state
+            .try_lock()
+            .ok_or(R1EvidenceFlushError::Busy)?;
+        if !state.terminal_seen || state.len == 0 || state.len > R1_EVIDENCE_RECORD_CAPACITY {
+            return Err(R1EvidenceFlushError::Incomplete);
+        }
+        for slot in &state.records[..state.len] {
+            // `len` counts consecutively filled slots, so each is populated;
+            // treat a hole as a framing failure rather than skipping it
+            // silently, which would emit a short transcript as if complete.
+            let record = slot.as_ref().ok_or(R1EvidenceFlushError::Incomplete)?;
+            emit(&record.bytes)?;
+        }
+        Ok(())
+    }
+}
+
 struct R1EvidenceState {
     nonce: u64,
     reporter: Option<ProcessKey>,
@@ -235,6 +290,25 @@ impl R1EvidenceCollector {
             _ => {}
         }
         Ok(sequence)
+    }
+
+    /// Submits one record and reports whether it closed the stream. The
+    /// terminal record mints the single flush permit, so the caller cannot
+    /// reach the terminal serial path without having actually accepted a
+    /// terminal record, and cannot reach it twice: a second terminal record is
+    /// refused by `submit` with `AfterTerminal`.
+    pub(crate) fn submit_once(
+        &self,
+        reporter: ProcessKey,
+        bytes: &[u8; R1_EVIDENCE_RECORD_LEN],
+    ) -> Result<R1EvidenceSubmit<'_>, R1EvidenceError> {
+        self.submit(reporter, bytes)?;
+        if read_u32(bytes, 8) == RECORD_TERMINAL {
+            return Ok(R1EvidenceSubmit::Terminal(R1EvidenceFlushPermit {
+                collector: self,
+            }));
+        }
+        Ok(R1EvidenceSubmit::Accepted)
     }
 
     pub(crate) fn len(&self) -> usize {

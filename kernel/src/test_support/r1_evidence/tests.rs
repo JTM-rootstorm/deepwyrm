@@ -268,3 +268,130 @@ fn the_private_syscall_id_does_not_collide_with_another_selector() {
         assert_ne!(R1_EVIDENCE_RAW_SYSCALL, taken);
     }
 }
+
+/// The terminal record is what says whether the probe passed, so a transcript
+/// without one must not be emitted as if it were complete.
+#[test]
+fn a_transcript_without_a_terminal_record_refuses_to_flush() {
+    let (collector, reporter) = ready();
+    match collector
+        .submit_once(reporter, &record(RECORD_STEP, 1, NONCE))
+        .expect("step accepted")
+    {
+        R1EvidenceSubmit::Accepted => {}
+        R1EvidenceSubmit::Terminal(_) => panic!("a step must not mint a flush permit"),
+    }
+    // Reach the guard directly: only a terminal record mints a permit, so this
+    // is the one path that can observe an incomplete transcript.
+    let permit = R1EvidenceFlushPermit {
+        collector: &collector,
+    };
+    assert_eq!(
+        permit.flush(|_| Ok(())).unwrap_err(),
+        R1EvidenceFlushError::Incomplete
+    );
+}
+
+#[test]
+fn the_terminal_record_mints_a_permit_that_flushes_every_record_in_order() {
+    let (collector, reporter) = ready();
+    collector
+        .submit_once(reporter, &record(RECORD_STEP, 1, NONCE))
+        .expect("step accepted");
+    let permit = match collector
+        .submit_once(reporter, &record(RECORD_TERMINAL, 2, NONCE))
+        .expect("terminal accepted")
+    {
+        R1EvidenceSubmit::Terminal(permit) => permit,
+        R1EvidenceSubmit::Accepted => panic!("the terminal record must mint a flush permit"),
+    };
+    let mut emitted = std::vec::Vec::new();
+    permit
+        .flush(|bytes| {
+            emitted.push(*bytes);
+            Ok(())
+        })
+        .expect("flush succeeds");
+    assert_eq!(emitted.len(), 2);
+    let sequences = emitted
+        .iter()
+        .map(|bytes| u64::from_le_bytes(bytes[16..24].try_into().unwrap()))
+        .collect::<std::vec::Vec<_>>();
+    assert_eq!(sequences, std::vec![1, 2]);
+    let kinds = emitted
+        .iter()
+        .map(|bytes| u32::from_le_bytes(bytes[8..12].try_into().unwrap()))
+        .collect::<std::vec::Vec<_>>();
+    assert_eq!(kinds, std::vec![RECORD_STEP, RECORD_TERMINAL]);
+}
+
+/// A transport refusal must surface, not be swallowed into a partial emission
+/// that the host would read as a complete certificate.
+#[test]
+fn a_transport_failure_stops_the_flush_and_is_reported() {
+    let (collector, reporter) = ready();
+    collector
+        .submit_once(reporter, &record(RECORD_STEP, 1, NONCE))
+        .expect("step accepted");
+    let permit = match collector
+        .submit_once(reporter, &record(RECORD_TERMINAL, 2, NONCE))
+        .expect("terminal accepted")
+    {
+        R1EvidenceSubmit::Terminal(permit) => permit,
+        R1EvidenceSubmit::Accepted => panic!("terminal mints a permit"),
+    };
+    let mut seen = 0_usize;
+    let failure = permit
+        .flush(|_| {
+            seen += 1;
+            Err(R1EvidenceFlushError::Transport)
+        })
+        .unwrap_err();
+    assert_eq!(failure, R1EvidenceFlushError::Transport);
+    assert_eq!(seen, 1, "the flush stops at the first refused record");
+}
+
+/// A failure record is retained and flushed alongside the terminal record, so a
+/// failing run still reports which classification stopped it.
+#[test]
+fn a_failed_run_flushes_its_failure_record_with_the_terminal_record() {
+    let (collector, reporter) = ready();
+    collector
+        .submit_once(reporter, &record(RECORD_STEP, 1, NONCE))
+        .expect("step accepted");
+    collector
+        .submit_once(reporter, &record(RECORD_FAILED, 2, NONCE))
+        .expect("failure accepted");
+    let permit = match collector
+        .submit_once(reporter, &record(RECORD_TERMINAL, 3, NONCE))
+        .expect("terminal accepted")
+    {
+        R1EvidenceSubmit::Terminal(permit) => permit,
+        R1EvidenceSubmit::Accepted => panic!("terminal mints a permit"),
+    };
+    let mut kinds = std::vec::Vec::new();
+    permit
+        .flush(|bytes| {
+            kinds.push(u32::from_le_bytes(bytes[8..12].try_into().unwrap()));
+            Ok(())
+        })
+        .expect("flush succeeds");
+    assert_eq!(
+        kinds,
+        std::vec![RECORD_STEP, RECORD_FAILED, RECORD_TERMINAL]
+    );
+}
+
+/// The permit is the only way in, and `submit` already refuses a second
+/// terminal record, so the terminal serial path cannot be entered twice.
+#[test]
+fn a_second_terminal_record_is_refused_so_the_flush_path_is_single_entry() {
+    let (collector, reporter) = ready();
+    collector
+        .submit_once(reporter, &record(RECORD_TERMINAL, 1, NONCE))
+        .expect("terminal accepted");
+    match collector.submit_once(reporter, &record(RECORD_TERMINAL, 2, NONCE)) {
+        Err(error) => assert_eq!(error, R1EvidenceError::AfterTerminal),
+        Ok(_) => panic!("a second terminal record must be refused"),
+    }
+}
