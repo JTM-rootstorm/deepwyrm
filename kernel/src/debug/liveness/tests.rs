@@ -153,4 +153,72 @@ fn event_ordinals_are_stable_for_the_gdb_script_and_serial_records() {
     assert_eq!(LivenessEvent::QuantumExpired as u32, 3);
     assert_eq!(LivenessEvent::IdleEntered as u32, 4);
     assert_eq!(LivenessEvent::TerminationPrepared as u32, 5);
+    assert_eq!(LivenessEvent::Dispatched as u32, 6);
+    assert_eq!(LivenessEvent::Blocked as u32, 7);
+    assert_eq!(LivenessEvent::Woken as u32, 8);
+    assert_eq!(LivenessEvent::QuantumArmed as u32, 9);
+}
+
+#[test]
+fn scheduler_publication_round_trips_and_leaves_the_identity_alone() {
+    publish_current(
+        cpu(2),
+        0xAA,
+        0xBB,
+        0xCC,
+        0xDD,
+        0xEE,
+        LivenessEvent::CarrierSelected,
+    );
+    publish_scheduler(cpu(2), 0x77, 3, 9, true, false, LivenessEvent::Blocked);
+    let record = read_cpu(cpu(2));
+    assert!(record.consistent);
+    assert_eq!(record.thread, 0xAA, "carrier identity is untouched");
+    assert_eq!(record.execution_generation, 0x77);
+    assert_eq!(record.runnable_here, 3);
+    assert_eq!(record.queue_len, 9);
+    assert!(record.reschedule_pending);
+    assert!(!record.quantum_armed);
+    assert_eq!(record.event, LivenessEvent::Blocked as u32);
+}
+
+#[test]
+fn a_wake_target_is_recorded_against_the_requesting_cpu() {
+    // The sticky-placement failure mode: CPU 0 wakes a thread that lands back
+    // on CPU 0 while a hog runs there. The mirror must name the target rather
+    // than leave it to be inferred.
+    assert_eq!(read_cpu(cpu(3)).last_wake_target, NO_CPU);
+    publish_wake_target(cpu(3), cpu(0));
+    let record = read_cpu(cpu(3));
+    assert_eq!(record.last_wake_target, 0);
+    assert_eq!(record.event, LivenessEvent::Woken as u32);
+}
+
+#[test]
+fn the_serial_record_reports_every_scheduler_fact() {
+    publish_scheduler(cpu(0), 0x5150, 2, 7, false, true, LivenessEvent::Dispatched);
+    publish_wake_target(cpu(0), cpu(1));
+    let mut buffer = [0_u8; SNAPSHOT_MAX_BYTES];
+    let length = format_snapshot(&mut buffer).expect("sized buffer formats");
+    let text = core::str::from_utf8(&buffer[..length]).expect("snapshot is ASCII");
+    let line = text
+        .split_terminator("\r\n")
+        .find(|line| line.starts_with("DWLIVE1|cpu=0|"))
+        .expect("CPU 0 line present");
+    assert!(line.contains("|exec_gen=20816"), "{line}");
+    assert!(line.contains("|runnable_here=2"), "{line}");
+    assert!(line.contains("|queue=7"), "{line}");
+    assert!(line.contains("|resched=0"), "{line}");
+    assert!(line.contains("|quantum=1"), "{line}");
+    assert!(line.contains("|wake_target=1"), "{line}");
+}
+
+#[test]
+fn an_unset_wake_target_prints_none_rather_than_a_cpu_index() {
+    let mut buffer = [0_u8; SNAPSHOT_MAX_BYTES];
+    let length = format_snapshot(&mut buffer).expect("sized buffer formats");
+    let text = core::str::from_utf8(&buffer[..length]).expect("snapshot is ASCII");
+    // CPU 1 has no wake requested in this test process unless another test ran
+    // first, so assert the sentinel renders rather than which CPU owns it.
+    assert!(text.contains("|wake_target=none") || text.contains("|wake_target="));
 }

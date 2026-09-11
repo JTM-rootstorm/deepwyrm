@@ -200,3 +200,11 @@ state = "implemented"
 [guest_test.interactive-wyrmsh]
 id = 33
 state = "implemented"
+
+# Reset card R1A's dynamic-launch saturation probe. A selector of its own so it
+# inherits no interactive-shell, recovery, or output-pressure geometry; the
+# kernel validates bounded R1SP transport and permanent-reporter custody only,
+# and the probe's step meanings stay in Wyrmroot and the host decoder.
+[guest_test.dynamic-launch-saturation]
+id = 34
+state = "implemented"

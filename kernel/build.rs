@@ -127,6 +127,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1c_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1d_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1e_evidence)");
+    println!("cargo:rustc-check-cfg=cfg(deepwyrm_r1_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1e8_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1e_platform)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1e_evidence)");
@@ -272,6 +273,13 @@ fn run() -> Result<(), String> {
         .is_some_and(is_wyr1e_evidence_selector)
     {
         println!("cargo:rustc-cfg=deepwyrm_wyr1e_evidence");
+    }
+    if env::var("DEEPWYRM_GUEST_TEST_SELECTOR")
+        .ok()
+        .as_deref()
+        .is_some_and(is_r1_evidence_selector)
+    {
+        println!("cargo:rustc-cfg=deepwyrm_r1_evidence");
     }
 
     if required_env("TARGET")? != KERNEL_TARGET {
@@ -430,6 +438,12 @@ fn is_wyr1d_evidence_selector(selector: &str) -> bool {
 
 fn is_wyr1e_evidence_selector(selector: &str) -> bool {
     selector == "interactive-wyrmsh"
+}
+
+/// Reset card R1's dynamic-launch saturation probe. Deliberately a selector of
+/// its own: it must not inherit any interactive-shell or recovery geometry.
+fn is_r1_evidence_selector(selector: &str) -> bool {
+    selector == "dynamic-launch-saturation"
 }
 
 fn is_dw1e_platform_selector(selector: &str) -> bool {

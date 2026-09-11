@@ -897,6 +897,7 @@ impl G5PrimordialProbe {
             BuildGuestTest::Q35Com2Interrupt => G5PrimordialExpectation::Baseline,
             BuildGuestTest::NativeConsoleStreams => G5PrimordialExpectation::Baseline,
             BuildGuestTest::InteractiveWyrmsh => G5PrimordialExpectation::Baseline,
+            BuildGuestTest::DynamicLaunchSaturation => G5PrimordialExpectation::Baseline,
             BuildGuestTest::PrimordialBlockingCleanup => G5PrimordialExpectation::BlockingCleanup,
             BuildGuestTest::PrimordialUserException => G5PrimordialExpectation::UserException,
             BuildGuestTest::PrimordialInvalidReturn => G5PrimordialExpectation::InvalidReturn,

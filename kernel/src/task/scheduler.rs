@@ -1141,6 +1141,30 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             })
     }
 
+    /// Mirrors this CPU's scheduler-owned facts into the reset-card-R1 liveness
+    /// snapshot. Called from inside the scheduler authority, which already holds
+    /// every field, so it performs no lookups and takes no further lock. The
+    /// mirror is diagnostic: nothing reads it to make a scheduling decision.
+    fn mirror_liveness(&self, cpu: SchedulerCpuId, event: crate::debug::liveness::LivenessEvent) {
+        let index = cpu.index();
+        let runnable_here = self.queue[..self.len]
+            .iter()
+            .flatten()
+            .filter(|entry| {
+                entry.state == SchedulerThreadState::Runnable && entry.target_cpu == cpu
+            })
+            .count();
+        crate::debug::liveness::publish_scheduler(
+            crate::cpu::CpuIndex::new(index).expect("bounded scheduler CPU index"),
+            self.running[index].map_or(0, |claim| claim.generation),
+            runnable_here as u32,
+            self.len as u32,
+            self.need_resched[index].is_some(),
+            self.quantum[index].is_some(),
+            event,
+        );
+    }
+
     fn first_local_runnable_index(&self, cpu: SchedulerCpuId) -> Option<usize> {
         self.queue[..self.len].iter().position(|entry| {
             entry.is_some_and(|entry| {
@@ -2352,6 +2376,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         }
         let ticket = state.mint_quantum_on(cpu, claim, now_ns)?;
         state.need_resched[cpu.index()] = None;
+        state.mirror_liveness(cpu, crate::debug::liveness::LivenessEvent::QuantumArmed);
         state.assert_invariants();
         Ok(ticket)
     }
@@ -2387,6 +2412,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             return Ok(None);
         }
         let ticket = state.mint_quantum_on(cpu, claim, now_ns)?;
+        state.mirror_liveness(cpu, crate::debug::liveness::LivenessEvent::QuantumArmed);
         state.assert_invariants();
         Ok(Some(ticket))
     }
@@ -2793,6 +2819,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             Some(reservation.key.thread),
             reservation.key.execution_generation,
         );
+        state.mirror_liveness(cpu, crate::debug::liveness::LivenessEvent::Blocked);
         state.assert_invariants();
         Ok(ScheduleDecision {
             previous: Some(reservation.key.thread),
@@ -2916,6 +2943,14 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             Some(key.thread),
             key.execution_generation,
         );
+        // Record where the wake actually landed. A wake that returns to a
+        // saturated CPU is the sticky-placement failure mode; naming the target
+        // makes it observable instead of inferred.
+        crate::debug::liveness::publish_wake_target(
+            crate::cpu::CpuIndex::new(requester.index()).expect("bounded requester CPU index"),
+            crate::cpu::CpuIndex::new(target.index()).expect("bounded target CPU index"),
+        );
+        state.mirror_liveness(target, crate::debug::liveness::LivenessEvent::Woken);
         state.assert_invariants();
         Ok(SchedulerWakePublication {
             runnable: RunnablePublication {
@@ -3274,6 +3309,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 });
             }
         }
+        state.mirror_liveness(claim.cpu, crate::debug::liveness::LivenessEvent::Dispatched);
         state.assert_invariants();
         Ok(SchedulerCompletedSwitch {
             runnable_publication: published_runnable,

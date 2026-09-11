@@ -63,6 +63,24 @@
 compile_error!("selector-specific terminal reporters are selector-exclusive");
 
 #[cfg(all(
+    deepwyrm_r1_evidence,
+    any(
+        deepwyrm_i1_evidence,
+        deepwyrm_wrcap_relay,
+        deepwyrm_wyr1_evidence,
+        deepwyrm_dw1b_evidence,
+        deepwyrm_wyr1b_evidence,
+        deepwyrm_dw1c_evidence,
+        deepwyrm_dw1d_evidence,
+        deepwyrm_wyr1c_evidence,
+        deepwyrm_dw1e_evidence,
+        deepwyrm_wyr1d_evidence,
+        deepwyrm_wyr1e_evidence
+    )
+))]
+compile_error!("selector-specific terminal reporters are selector-exclusive");
+
+#[cfg(all(
     deepwyrm_wyr1e_evidence,
     any(
         deepwyrm_i1_evidence,
@@ -93,6 +111,9 @@ mod identity;
 #[cfg(all(deepwyrm_memory_guest, target_arch = "x86_64", target_os = "none"))]
 mod memory;
 mod protocol;
+/// Reset-card R1 relay for the dynamic-launch saturation probe.
+#[cfg(any(test, deepwyrm_r1_evidence))]
+mod r1_evidence;
 #[cfg(all(deepwyrm_e7_guest, target_arch = "x86_64", target_os = "none"))]
 mod task;
 mod transport;
@@ -162,6 +183,8 @@ pub(crate) use dw1e_evidence::{
     Dw1eEvidencePartialPermit, Dw1eRawOperation, Dw1eTerminalArbiter, Dw1eTerminalClaim,
     EVENT_C1_RESPONSE,
 };
+#[cfg(deepwyrm_r1_evidence)]
+pub(crate) use r1_evidence::R1_EVIDENCE_RAW_SYSCALL;
 #[cfg(deepwyrm_wyr1_evidence)]
 pub(crate) use wyr1_evidence::WYR1_EVIDENCE_RAW_SYSCALL;
 #[cfg(deepwyrm_wyr1b_evidence)]
