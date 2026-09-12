@@ -408,6 +408,17 @@ pub(crate) fn copy_wyr1e_evidence_input<U: UserPageAccess, const N: usize>(
     copy_input(user, address, 1)
 }
 
+/// Reset-card-R1 `R1SP` record input. One page of alignment slack is enough:
+/// the record is 64 bytes and the reporter submits it from ordinary stack or
+/// static storage, exactly as the selector-33 relay does.
+#[cfg(deepwyrm_r1_evidence)]
+pub(crate) fn copy_r1_evidence_input<U: UserPageAccess, const N: usize>(
+    user: &mut U,
+    address: DwUserAddress,
+) -> Result<[u8; N], DwStatus> {
+    copy_input(user, address, 1)
+}
+
 #[cfg(deepwyrm_dw1c_evidence)]
 pub(crate) fn copy_dw1c_evidence_input<U: UserPageAccess, const N: usize>(
     user: &mut U,

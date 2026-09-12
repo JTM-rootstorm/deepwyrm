@@ -5830,6 +5830,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 },
             )
             .unwrap_or_else(|_| crate::test_support::complete_fail(0x3310_e010));
+        // Reporter custody for reset card R1. Binding it here rather than on
+        // first submission is what makes the custody meaningful: this site runs
+        // only once primordial has actually retired and `reporter` is permanent
+        // init, so a dynamically launched probe can never become the reporter.
+        #[cfg(deepwyrm_r1_evidence)]
+        crate::test_support::R1_EVIDENCE
+            .claim_reporter(reporter)
+            .unwrap_or_else(|error| crate::test_support::complete_fail(r1_submit_detail(error)));
         Ok(())
     }
 
@@ -6906,6 +6914,45 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         }
     }
 
+    #[cfg(deepwyrm_r1_evidence)]
+    fn intercept_r1_evidence_raw(
+        &mut self,
+        arguments: crate::syscall::RawSyscallArguments,
+    ) -> NativeSyscallResult {
+        use crate::test_support::{R1_EVIDENCE, R1_EVIDENCE_RECORD_LEN, R1EvidenceSubmit};
+
+        let values = arguments.as_array();
+        if values[1] != R1_EVIDENCE_RECORD_LEN as u64 || values[2..].iter().any(|value| *value != 0)
+        {
+            crate::test_support::complete_fail(0x3410_e001)
+        }
+        let phase = self.reserve_runtime_phase();
+        let record = {
+            let mut user = self.active.current_process_address_space(
+                self.active_root.as_ref().expect("active root"),
+                self.process,
+            );
+            match crate::syscall::copy_r1_evidence_input::<_, R1_EVIDENCE_RECORD_LEN>(
+                &mut user,
+                deepwyrm_abi::DwUserAddress(values[0]),
+            ) {
+                Ok(record) => record,
+                Err(_) => crate::test_support::complete_fail(0x3410_e002),
+            }
+        };
+        self.commit_runtime_phase(phase);
+        // Reporter custody is rechecked inside `submit_once` against the key
+        // bound at primordial retirement, so a launched child cannot report on
+        // permanent init's behalf even though it can reach this operation.
+        match R1_EVIDENCE.submit_once(self.process, &record) {
+            Ok(R1EvidenceSubmit::Accepted) => NativeSyscallResult::returning(DW_STATUS_SUCCESS),
+            Ok(R1EvidenceSubmit::Terminal(permit)) => {
+                crate::test_support::complete_r1_evidence(permit)
+            }
+            Err(error) => crate::test_support::complete_fail(r1_submit_detail(error)),
+        }
+    }
+
     #[cfg(deepwyrm_dw1b_evidence)]
     fn intercept_dw1b_evidence_raw(
         &mut self,
@@ -7816,6 +7863,25 @@ const fn wyr1d_submit_detail(error: crate::test_support::Wyr1dEvidenceError) -> 
     }
 }
 
+/// Distinct detail codes per rejection, so a failing run names which transport
+/// predicate refused the record rather than reporting a generic failure.
+#[cfg(deepwyrm_r1_evidence)]
+const fn r1_submit_detail(error: crate::test_support::R1EvidenceError) -> u32 {
+    use crate::test_support::R1EvidenceError;
+    match error {
+        R1EvidenceError::Early => 0x3410_e003,
+        R1EvidenceError::WrongReporter => 0x3410_e004,
+        R1EvidenceError::Malformed => 0x3410_e005,
+        R1EvidenceError::WrongNonce => 0x3410_e006,
+        R1EvidenceError::OutOfOrder => 0x3410_e007,
+        R1EvidenceError::AfterTerminal => 0x3410_e008,
+        R1EvidenceError::DuplicateTerminal => 0x3410_e009,
+        R1EvidenceError::Full => 0x3410_e00a,
+        R1EvidenceError::ReporterClaimed => 0x3410_e00b,
+        R1EvidenceError::Framing => 0x3410_e00c,
+    }
+}
+
 #[cfg(deepwyrm_wyr1e_evidence)]
 const fn wyr1e_submit_detail(error: crate::test_support::Wyr1eEvidenceError) -> u32 {
     use crate::test_support::Wyr1eEvidenceError;
@@ -8476,6 +8542,20 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
     ) -> NativeSyscallResult {
         self.with_synchronized_runtime_at_safe_point(|runtime| {
             runtime.intercept_wyr1e_evidence_raw(arguments)
+        })
+        .unwrap_or(NativeSyscallResult {
+            status: DW_STATUS_SUCCESS,
+            control: SyscallControl::ServiceRendezvous,
+        })
+    }
+
+    #[cfg(deepwyrm_r1_evidence)]
+    fn intercept_r1_evidence_raw(
+        &mut self,
+        arguments: crate::syscall::RawSyscallArguments,
+    ) -> NativeSyscallResult {
+        self.with_synchronized_runtime_at_safe_point(|runtime| {
+            runtime.intercept_r1_evidence_raw(arguments)
         })
         .unwrap_or(NativeSyscallResult {
             status: DW_STATUS_SUCCESS,

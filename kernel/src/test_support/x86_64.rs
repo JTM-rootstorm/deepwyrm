@@ -21,6 +21,7 @@ use crate::arch::x86_64::exceptions::{EarlyException, ExceptionVector};
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
+    deepwyrm_r1_evidence,
 ))]
 use crate::debug::TestSerialTransaction;
 #[cfg(any(
@@ -35,6 +36,7 @@ use crate::debug::TestSerialTransaction;
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
+    deepwyrm_r1_evidence,
 ))]
 use crate::debug::begin_test_serial_transaction;
 use crate::debug::emit_early_raw_record;
@@ -118,6 +120,10 @@ static WYR1D_TERMINAL_OWNER: AtomicU8 = AtomicU8::new(0);
 const WYR1E_TERMINAL_SUCCESS: u8 = 1;
 #[cfg(deepwyrm_wyr1e_evidence)]
 static WYR1E_TERMINAL_OWNER: AtomicU8 = AtomicU8::new(0);
+#[cfg(deepwyrm_r1_evidence)]
+const R1_TERMINAL_SUCCESS: u8 = 1;
+#[cfg(deepwyrm_r1_evidence)]
+static R1_TERMINAL_OWNER: AtomicU8 = AtomicU8::new(0);
 
 core::arch::global_asm!(
     r#"
@@ -174,6 +180,7 @@ struct QemuCompletionTransport {
         deepwyrm_wyr1c_evidence,
         deepwyrm_wyr1d_evidence,
         deepwyrm_wyr1e_evidence,
+        deepwyrm_r1_evidence,
     ))]
     transaction: Option<TestSerialTransaction>,
 }
@@ -206,6 +213,7 @@ impl QemuCompletionTransport {
                 deepwyrm_wyr1c_evidence,
                 deepwyrm_wyr1d_evidence,
                 deepwyrm_wyr1e_evidence,
+                deepwyrm_r1_evidence,
             ))]
             transaction: None,
         }
@@ -231,6 +239,7 @@ impl CompletionTransport for QemuCompletionTransport {
             deepwyrm_wyr1c_evidence,
             deepwyrm_wyr1d_evidence,
             deepwyrm_wyr1e_evidence,
+            deepwyrm_r1_evidence,
         ))]
         if let Some(transaction) = self.transaction.as_mut() {
             return transaction
@@ -558,6 +567,55 @@ pub(crate) fn complete_wyr1e_evidence(
         &mut transport,
         completion_record(CompletionOutcome::Pass, 0),
     )
+}
+
+/// Reset-card-R1 terminal certificate. The sole terminal owner flushes the
+/// bounded `R1SP` transcript over the COM1 test transaction and then completes,
+/// which is how the probe's per-step outcomes reach the host: card R1's product
+/// omits the userspace UART driver and consoled, not the kernel's own COM1
+/// diagnostic path.
+#[cfg(deepwyrm_r1_evidence)]
+pub(crate) fn complete_r1_evidence(permit: super::r1_evidence::R1EvidenceFlushPermit<'_>) -> ! {
+    use super::r1_evidence::R1EvidenceFlushError;
+
+    if !claim_r1_terminal(R1_TERMINAL_SUCCESS) {
+        halt_after_completion()
+    }
+    // SAFETY: this function exists only in the centrally selected
+    // `dynamic-launch-saturation` QEMU test image. Its verified handoff profile
+    // supplies `isa-debug-exit`; it is not a production or physical image.
+    let mut transport = unsafe { QemuCompletionTransport::new() };
+    let Ok(transaction) = begin_test_serial_transaction() else {
+        halt_after_completion()
+    };
+    transport.transaction = Some(transaction);
+    if permit
+        .flush(|record| {
+            transport
+                .transaction
+                .as_mut()
+                .expect("R1SP owns serial transaction")
+                .write_evidence(record)
+                .map_err(|_| R1EvidenceFlushError::Transport)
+        })
+        .is_err()
+    {
+        // An incomplete or refused transcript must not be reported as a pass:
+        // halt without a completion record so the run reads as a timeout rather
+        // than a false certificate.
+        halt_after_completion()
+    }
+    complete(
+        &mut transport,
+        completion_record(CompletionOutcome::Pass, 0),
+    )
+}
+
+#[cfg(deepwyrm_r1_evidence)]
+fn claim_r1_terminal(owner: u8) -> bool {
+    R1_TERMINAL_OWNER
+        .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
 }
 
 #[cfg(deepwyrm_dw1c_evidence)]

@@ -185,6 +185,10 @@ pub(crate) use dw1e_evidence::{
 };
 #[cfg(deepwyrm_r1_evidence)]
 pub(crate) use r1_evidence::R1_EVIDENCE_RAW_SYSCALL;
+#[cfg(deepwyrm_r1_evidence)]
+pub(crate) use r1_evidence::{
+    R1_EVIDENCE, R1_EVIDENCE_RECORD_LEN, R1EvidenceError, R1EvidenceSubmit,
+};
 // The selector's resource ledger sizes the probe's report against this bound,
 // so export it rather than letting the two carry independent copies of 64.
 #[cfg(any(test, deepwyrm_r1_evidence))]
@@ -294,6 +298,8 @@ pub(crate) use x86_64::complete_dw1d_evidence;
     target_os = "none"
 ))]
 pub(crate) use x86_64::complete_dw1e_evidence;
+#[cfg(all(deepwyrm_r1_evidence, target_arch = "x86_64", target_os = "none"))]
+pub(crate) use x86_64::complete_r1_evidence;
 #[cfg(all(deepwyrm_wyr1_evidence, target_arch = "x86_64", target_os = "none"))]
 pub(crate) use x86_64::complete_wyr1_evidence;
 #[cfg(all(deepwyrm_wyr1b_evidence, target_arch = "x86_64", target_os = "none"))]
