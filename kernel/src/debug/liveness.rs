@@ -187,7 +187,11 @@ static LIVENESS: LivenessSnapshot = LivenessSnapshot::new();
 /// card R2D removes the boot-stack lifetime; this publication remains valid
 /// wherever the authority ends up living.
 pub(crate) fn publish_runtime_authority(authority: *const ()) {
-    LIVENESS
+    publish_runtime_authority_on(&LIVENESS, authority);
+}
+
+fn publish_runtime_authority_on(snapshot: &LivenessSnapshot, authority: *const ()) {
+    snapshot
         .runtime_authority
         .store(authority.cast_mut(), Ordering::Release);
 }
@@ -195,7 +199,11 @@ pub(crate) fn publish_runtime_authority(authority: *const ()) {
 /// Returns the published runtime-authority address, or null if the primordial
 /// path has not reached its publication point yet.
 pub(crate) fn runtime_authority() -> *const () {
-    LIVENESS
+    runtime_authority_on(&LIVENESS)
+}
+
+fn runtime_authority_on(snapshot: &LivenessSnapshot) -> *const () {
+    snapshot
         .runtime_authority
         .load(Ordering::Acquire)
         .cast_const()
@@ -216,7 +224,23 @@ pub(crate) fn publish_current(
     stack_id: u64,
     event: LivenessEvent,
 ) {
-    let cell = &LIVENESS.cpus[cpu.index()];
+    publish_current_on(
+        &LIVENESS, cpu, thread, process, root_key, context_id, stack_id, event,
+    );
+}
+
+#[allow(clippy::too_many_arguments, reason = "one mirrored fact per parameter")]
+fn publish_current_on(
+    snapshot: &LivenessSnapshot,
+    cpu: CpuIndex,
+    thread: u64,
+    process: u64,
+    root_key: u64,
+    context_id: u64,
+    stack_id: u64,
+    event: LivenessEvent,
+) {
+    let cell = &snapshot.cpus[cpu.index()];
     let start = cell.sequence.load(Ordering::Relaxed).wrapping_add(1);
     cell.sequence.store(start, Ordering::Relaxed);
     cell.thread.store(thread, Ordering::Relaxed);
@@ -246,7 +270,30 @@ pub(crate) fn publish_scheduler(
     quantum_armed: bool,
     event: LivenessEvent,
 ) {
-    let cell = &LIVENESS.cpus[cpu.index()];
+    publish_scheduler_on(
+        &LIVENESS,
+        cpu,
+        execution_generation,
+        runnable_here,
+        queue_len,
+        reschedule_pending,
+        quantum_armed,
+        event,
+    );
+}
+
+#[allow(clippy::too_many_arguments, reason = "one mirrored fact per parameter")]
+fn publish_scheduler_on(
+    snapshot: &LivenessSnapshot,
+    cpu: CpuIndex,
+    execution_generation: u64,
+    runnable_here: u32,
+    queue_len: u32,
+    reschedule_pending: bool,
+    quantum_armed: bool,
+    event: LivenessEvent,
+) {
+    let cell = &snapshot.cpus[cpu.index()];
     cell.execution_generation
         .store(execution_generation, Ordering::Relaxed);
     cell.runnable_here.store(runnable_here, Ordering::Relaxed);
@@ -263,10 +310,14 @@ pub(crate) fn publish_scheduler(
 /// A wake that lands back on a saturated CPU is the sticky-placement failure
 /// mode; recording the target makes that visible without inferring it.
 pub(crate) fn publish_wake_target(requester: CpuIndex, target: CpuIndex) {
-    LIVENESS.cpus[requester.index()]
+    publish_wake_target_on(&LIVENESS, requester, target);
+}
+
+fn publish_wake_target_on(snapshot: &LivenessSnapshot, requester: CpuIndex, target: CpuIndex) {
+    snapshot.cpus[requester.index()]
         .last_wake_target
         .store(target.index() as u32, Ordering::Relaxed);
-    LIVENESS.cpus[requester.index()]
+    snapshot.cpus[requester.index()]
         .event
         .store(LivenessEvent::Woken as u32, Ordering::Relaxed);
 }
@@ -275,7 +326,11 @@ pub(crate) fn publish_wake_target(requester: CpuIndex, target: CpuIndex) {
 /// identity. Used on paths that change scheduling state but not the current
 /// thread, so a stall can still be attributed to its last transition.
 pub(crate) fn note_event(cpu: CpuIndex, event: LivenessEvent) {
-    LIVENESS.cpus[cpu.index()]
+    note_event_on(&LIVENESS, cpu, event);
+}
+
+fn note_event_on(snapshot: &LivenessSnapshot, cpu: CpuIndex, event: LivenessEvent) {
+    snapshot.cpus[cpu.index()]
         .event
         .store(event as u32, Ordering::Relaxed);
 }
@@ -283,8 +338,12 @@ pub(crate) fn note_event(cpu: CpuIndex, event: LivenessEvent) {
 /// Reads one CPU's mirrored identity, retrying a bounded number of times when a
 /// publication is in flight.
 pub(crate) fn read_cpu(cpu: CpuIndex) -> CpuLivenessRecord {
+    read_cpu_on(&LIVENESS, cpu)
+}
+
+fn read_cpu_on(snapshot: &LivenessSnapshot, cpu: CpuIndex) -> CpuLivenessRecord {
     const ATTEMPTS: usize = 8;
-    let cell = &LIVENESS.cpus[cpu.index()];
+    let cell = &snapshot.cpus[cpu.index()];
     for _ in 0..ATTEMPTS {
         let before = cell.sequence.load(Ordering::Acquire);
         if !before.is_multiple_of(2) {
@@ -396,6 +455,10 @@ impl Cursor<'_> {
 /// ticket pair and the carrier behind it with full type information while the
 /// guest stays out of the stalled lock entirely.
 pub(crate) fn format_snapshot(buffer: &mut [u8]) -> Option<usize> {
+    format_snapshot_on(&LIVENESS, buffer)
+}
+
+fn format_snapshot_on(snapshot: &LivenessSnapshot, buffer: &mut [u8]) -> Option<usize> {
     if buffer.len() < SNAPSHOT_MAX_BYTES {
         return None;
     }
@@ -405,7 +468,7 @@ pub(crate) fn format_snapshot(buffer: &mut [u8]) -> Option<usize> {
         overflowed: false,
     };
     cursor.literal("DWLIVE1|authority=");
-    cursor.hex64(runtime_authority() as u64);
+    cursor.hex64(runtime_authority_on(snapshot) as u64);
     cursor.literal("|cpus=");
     cursor.decimal(CPU_CAPACITY as u64);
     cursor.literal("\r\n");
@@ -413,7 +476,7 @@ pub(crate) fn format_snapshot(buffer: &mut [u8]) -> Option<usize> {
         let Some(cpu) = CpuIndex::new(index) else {
             continue;
         };
-        let record = read_cpu(cpu);
+        let record = read_cpu_on(snapshot, cpu);
         cursor.literal("DWLIVE1|cpu=");
         cursor.decimal(record.cpu as u64);
         cursor.literal(if record.consistent {
