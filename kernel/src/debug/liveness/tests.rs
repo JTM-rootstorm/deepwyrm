@@ -273,7 +273,7 @@ fn the_global_entry_points_target_the_shared_mirror() {
         0x55,
         LivenessEvent::CarrierSelected,
     );
-    assert!(read_cpu(cpu(3)).publications >= before + 1);
+    assert!(read_cpu(cpu(3)).publications > before);
     publish_scheduler(cpu(3), 9, 1, 2, true, true, LivenessEvent::Dispatched);
     publish_wake_target(cpu(3), cpu(0));
     note_event(cpu(3), LivenessEvent::IdleEntered);

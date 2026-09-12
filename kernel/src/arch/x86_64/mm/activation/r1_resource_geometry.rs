@@ -267,10 +267,12 @@ mod tests {
     // plans sit strictly inside it so neither can silently exceed the pools.
     #[test]
     fn selector34_r1_selected_plans_fit_inside_the_sized_ceiling() {
-        assert!(SMP_PLAN_HOGS <= MAX_HOGS);
-        assert!(CONTROL_PLAN_HOGS < SMP_PLAN_HOGS);
-        assert!(EVIDENCE_SMP_PEAK < EVIDENCE_CEILING_PEAK);
-        assert!(EVIDENCE_CEILING_PEAK <= SELECTED.evidence);
+        const {
+            assert!(SMP_PLAN_HOGS <= MAX_HOGS);
+            assert!(CONTROL_PLAN_HOGS < SMP_PLAN_HOGS);
+            assert!(EVIDENCE_SMP_PEAK < EVIDENCE_CEILING_PEAK);
+            assert!(EVIDENCE_CEILING_PEAK <= SELECTED.evidence);
+        }
         for hogs in [CONTROL_PLAN_HOGS, SMP_PLAN_HOGS, MAX_HOGS] {
             let handles = INIT_BASELINE_HANDLES + hogs * 2 + ZERO_STREAM_LOADER_HANDLES;
             let memory = BASELINE_MEMORY + hogs * HOG_IMAGE_OBJECTS + PROGRESS_IMAGE_OBJECTS;
@@ -435,7 +437,7 @@ mod tests {
     #[test]
     fn selector34_r1_real_memory_pool_rejects_the_inherited_ten_object_default() {
         assert_eq!(admit_memory::<10>(MEMORY_PEAK), 10);
-        assert!(BASELINE_MEMORY > 10);
+        const { assert!(BASELINE_MEMORY > 10) };
         assert_eq!(
             admit_memory::<{ SELECTED.memory }>(MEMORY_PEAK),
             MEMORY_PEAK
@@ -478,7 +480,7 @@ mod tests {
     // launch is impossible; the selected table admits the full peak.
     #[test]
     fn selector34_r1_real_handle_table_rejects_the_inherited_ten_slot_default() {
-        assert!(INIT_BASELINE_HANDLES > 10);
+        const { assert!(INIT_BASELINE_HANDLES > 10) };
         assert_eq!(admit_handles::<10>(HANDLE_PEAK), 10);
         let first_hog_launch =
             INIT_BASELINE_HANDLES + HOG_RETAINED_HANDLES + ZERO_STREAM_LOADER_HANDLES;

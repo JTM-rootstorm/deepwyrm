@@ -690,6 +690,12 @@ fn wyr1_primordial_selector_artifacts_fit_the_linked_boot_stack() {
                 linked_terminal_reaper_stack_payload_bytes(&stack_symbols),
             );
         }
+        if selector == "dynamic-launch-saturation" {
+            validate_r1_thread_stack_readiness(
+                &stack_sizes(&llvm_readelf, &stack_kernel),
+                linked_thread_kernel_stack_payload_bytes(&stack_symbols),
+            );
+        }
     }
 
     assert_eq!(
