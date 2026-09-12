@@ -276,6 +276,9 @@ fn apply_selector_environment(command: &mut Command, selector: &str) {
         "interactive-wyrmsh" => {
             command.env("DEEPWYRM_WYR1E7_EVIDENCE_NONCE", "E700000000000001");
         }
+        "dynamic-launch-saturation" => {
+            command.env("DEEPWYRM_R1_EVIDENCE_NONCE", "8100000000000001");
+        }
         _ => {}
     }
 }

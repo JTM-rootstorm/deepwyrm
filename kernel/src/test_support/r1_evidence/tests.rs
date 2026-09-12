@@ -395,3 +395,33 @@ fn a_second_terminal_record_is_refused_so_the_flush_path_is_single_entry() {
         Ok(_) => panic!("a second terminal record must be refused"),
     }
 }
+
+/// A configured collector is ready without a boot-time `configure` call, so a
+/// product cannot boot with a collector that silently accepts nothing.
+#[test]
+fn a_build_configured_collector_is_ready_and_rejects_a_foreign_nonce() {
+    let collector = R1EvidenceCollector::new_configured(NONCE);
+    // Already READY: configure is refused rather than able to replace the nonce.
+    assert_eq!(
+        collector.configure(NONCE ^ 0xFF),
+        Err(R1EvidenceError::ReporterClaimed)
+    );
+    let (reporter, _other) = processes();
+    collector.claim_reporter(reporter).expect("claim once");
+    assert_eq!(
+        collector.submit(reporter, &record(RECORD_STEP, 1, NONCE ^ 0xFF)),
+        Err(R1EvidenceError::WrongNonce)
+    );
+    assert_eq!(
+        collector.submit(reporter, &record(RECORD_STEP, 1, NONCE)),
+        Ok(1)
+    );
+}
+
+/// The build nonce is parsed at compile time from an uppercase 16-digit string.
+#[test]
+fn the_build_nonce_parser_accepts_the_canonical_form() {
+    const { assert!(parse_build_nonce("8100000000000001") == 0x8100_0000_0000_0001) };
+    const { assert!(parse_build_nonce("FFFFFFFFFFFFFFFF") == u64::MAX) };
+    assert_eq!(parse_build_nonce("00000000000000FF"), 0xFF);
+}

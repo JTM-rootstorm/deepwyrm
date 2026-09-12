@@ -208,6 +208,10 @@ if [ "$selector" = normal-preemption-smp ]; then
     esac
     [ "$dw1c_pages" -le 8192 ] || fail "DEEPWYRM_DW1C_BOOTFS_MAX_PAGES must be canonical decimal in 1..=8192"
 fi
+if [ "$selector" = dynamic-launch-saturation ]; then
+    r1_nonce=${DEEPWYRM_R1_EVIDENCE_NONCE:-}
+    require_upper_hex_u64 DEEPWYRM_R1_EVIDENCE_NONCE "$r1_nonce"
+fi
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 workspace=$(CDPATH='' cd -- "$script_dir/.." && pwd -P)

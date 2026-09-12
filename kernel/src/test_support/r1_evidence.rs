@@ -191,11 +191,49 @@ fn read_u64(bytes: &[u8; R1_EVIDENCE_RECORD_LEN], offset: usize) -> u64 {
     u64::from_le_bytes(word)
 }
 
+/// Parses the build-supplied nonce at compile time. `build.rs` has already
+/// rejected a malformed or zero value, so a failure here is a build-plumbing
+/// defect rather than bad input, and stopping the compile is the right response.
+const fn parse_build_nonce(value: &str) -> u64 {
+    let bytes = value.as_bytes();
+    assert!(
+        bytes.len() == 16,
+        "selector-34 nonce must contain 16 digits"
+    );
+    let mut parsed = 0_u64;
+    let mut index = 0;
+    while index < bytes.len() {
+        let digit = match bytes[index] {
+            b'0'..=b'9' => bytes[index] - b'0',
+            b'A'..=b'F' => bytes[index] - b'A' + 10,
+            _ => panic!("selector-34 nonce must be uppercase hexadecimal"),
+        };
+        parsed = (parsed << 4) | digit as u64;
+        index += 1;
+    }
+    assert!(parsed != 0, "selector-34 nonce must be nonzero");
+    parsed
+}
+
 impl R1EvidenceCollector {
     pub(crate) const fn new() -> Self {
         Self {
             state: SpinMutex::new(R1EvidenceState::new()),
             configured: AtomicU8::new(STATE_UNSET),
+        }
+    }
+
+    /// Constructs an already-configured collector from the build nonce, so the
+    /// booted singleton needs no boot-time configure call and cannot be left
+    /// accepting nothing because a call site was missed. `configure` remains for
+    /// host tests, which need to drive the unconfigured state machine.
+    const fn new_configured(nonce: u64) -> Self {
+        assert!(nonce != 0, "a configured collector needs a nonzero nonce");
+        let mut state = R1EvidenceState::new();
+        state.nonce = nonce;
+        Self {
+            state: SpinMutex::new(state),
+            configured: AtomicU8::new(STATE_READY),
         }
     }
 
@@ -327,6 +365,13 @@ impl R1EvidenceCollector {
         state.records[index]
     }
 }
+
+/// The booted singleton. Reporter custody is claimed by permanent system-init
+/// once it is identified; the nonce is fixed at build time so a product cannot
+/// boot with an unconfigured collector.
+#[cfg(deepwyrm_r1_evidence)]
+pub(crate) static R1_EVIDENCE: R1EvidenceCollector =
+    R1EvidenceCollector::new_configured(parse_build_nonce(env!("DEEPWYRM_R1_EVIDENCE_NONCE")));
 
 #[cfg(test)]
 mod tests;

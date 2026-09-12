@@ -111,6 +111,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1E7_EVIDENCE_NONCE");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1E8_EVIDENCE");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1E8_EVIDENCE_NONCE");
+    println!("cargo:rerun-if-env-changed=DEEPWYRM_R1_EVIDENCE_NONCE");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_c3_one_shot_ui)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_memory_guest)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_e7_guest)");
@@ -1077,6 +1078,10 @@ fn configure_guest_test(harness_path: &Path) -> Result<(), String> {
             let nonce = required_wyr1d_hex("DEEPWYRM_WYR1D_EVIDENCE_NONCE")?;
             println!("cargo:rustc-env=DEEPWYRM_WYR1D_EVIDENCE_NONCE={nonce}");
         }
+        if is_r1_evidence_selector(&selector) {
+            let nonce = required_r1_hex("DEEPWYRM_R1_EVIDENCE_NONCE")?;
+            println!("cargo:rustc-env=DEEPWYRM_R1_EVIDENCE_NONCE={nonce}");
+        }
         if is_wyr1e_evidence_selector(&selector) {
             if wyr1e8 {
                 if env::var_os("DEEPWYRM_WYR1E7_EVIDENCE_NONCE").is_some() {
@@ -1137,6 +1142,12 @@ fn required_wyr1d_hex(name: &str) -> Result<String, String> {
 
 fn required_wyr1e_hex(name: &str) -> Result<String, String> {
     let value = env::var(name).map_err(|_| format!("interactive-wyrmsh requires {name}"))?;
+    validate_upper_nonzero_hex_nonce(&value, name)?;
+    Ok(value)
+}
+
+fn required_r1_hex(name: &str) -> Result<String, String> {
+    let value = env::var(name).map_err(|_| format!("dynamic-launch-saturation requires {name}"))?;
     validate_upper_nonzero_hex_nonce(&value, name)?;
     Ok(value)
 }
