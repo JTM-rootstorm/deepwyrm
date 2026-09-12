@@ -38,10 +38,17 @@ pub(super) const CONTROL_PLAN_HOGS: usize = 3;
 /// then terminate and result. Mirrors `ProbePlan::step_budget`.
 pub(super) const STEPS_PER_HOG: usize = 6;
 
-// Enumerate every lifetime identity, including finalized generations. Like E8,
-// this is a conservative task-family sizing envelope rather than a count of
-// simultaneously live registry graphs. Rejected launches never publish a
-// Process, so a `HogRejected` or `ProgressRejected` run consumes fewer.
+// Enumerate every lifetime identity, including finalized generations. Rejected
+// launches never publish a Process, so a `HogRejected` or `ProgressRejected`
+// run consumes fewer.
+//
+// **This census sizes no capacity.** It is a record of the task families the
+// run creates over its whole lifetime, used only to check that the scenario was
+// enumerated rather than estimated. Every pool below is sized from a
+// *simultaneous* peak instead, because the kernel's identity tables are
+// occupancy bounds and a finalized generation releases its slot. Treating this
+// number as a capacity is what the split recorded at `LIVE_IDENTITY_PEAK`
+// exists to prevent.
 pub(super) const LIFETIME_IDENTITIES: [&str; 21] = [
     "primordial",
     "system-init",
@@ -95,6 +102,17 @@ pub(super) const BASELINE_MEMORY: usize = RESIDENT_IMAGES * RESIDENT_IMAGE_OBJEC
 // `progress_job` is set per cycle and cleared on its terminal result.
 pub(super) const LIVE_PROCESSES: usize = RESIDENT_IMAGES + MAX_HOGS + 1;
 pub(super) const LIVE_TASK_GROUPS: usize = LIVE_PROCESSES + 1; // Plus root.
+
+// Every pool indexed by identity — Process, Thread, address space, region,
+// region object, TaskGroup and execution thread — is bounded by simultaneous
+// occupancy, so the peak is the larger of the two live counts above. Primordial
+// is absent from it deliberately: it has retired long before the first hog
+// launches, so charging it here would reserve a slot nothing can occupy.
+pub(super) const LIVE_IDENTITY_PEAK: usize = if LIVE_PROCESSES > LIVE_TASK_GROUPS {
+    LIVE_PROCESSES
+} else {
+    LIVE_TASK_GROUPS
+};
 
 pub(super) const HANDLE_PEAK: usize =
     INIT_BASELINE_HANDLES + MAX_HOGS * HOG_RETAINED_HANDLES + ZERO_STREAM_LOADER_HANDLES;
@@ -167,6 +185,9 @@ pub(super) struct Capacity {
     pub handles: usize,
     pub memory: usize,
     pub mappings: usize,
+    /// Simultaneous identity capacity, **not** a lifetime count. It becomes
+    /// `THREADS`, and a `THREADS` above the linked thread-stack arena makes
+    /// thread creation statically impossible; see the assertion below.
     pub identities: usize,
     pub registry: usize,
     pub channel_pairs: usize,
@@ -179,7 +200,7 @@ pub(super) const SELECTED: Capacity = Capacity {
     handles: 48,
     memory: 48,
     mappings: 48,
-    identities: 32,
+    identities: 16,
     registry: 160,
     channel_pairs: 24,
     waits: 48,
@@ -190,7 +211,7 @@ pub(super) const fn fits(capacity: Capacity) -> bool {
     capacity.handles >= HANDLE_PEAK
         && capacity.memory >= MEMORY_PEAK
         && capacity.mappings >= MAPPING_PEAK
-        && capacity.identities >= LIFETIME_IDENTITIES.len()
+        && capacity.identities >= LIVE_IDENTITY_PEAK
         && capacity.registry >= REGISTRY_PEAK
         && capacity.channel_pairs >= CHANNEL_PAIR_PEAK
         && capacity.waits >= WAIT_PEAK
@@ -198,6 +219,25 @@ pub(super) const fn fits(capacity: Capacity) -> bool {
 }
 
 const _: () = assert!(fits(SELECTED));
+// The ceiling that the first selection of this ledger missed, with the failure
+// mode spelled out because it is silent and does not look like a capacity bug.
+//
+// `identities` becomes `THREADS`, and every Thread needs one of the linked
+// per-thread kernel stacks. Selecting more Threads than the arena has stacks
+// does not fail a bounds check at run time: it makes thread creation
+// unsatisfiable for constants the optimizer can see, so a release build folds
+// `primordial::enter` to a panic, `--gc-sections` drops every subsystem the
+// folded continuation no longer reaches, and the artifact boots no product at
+// all. The first selection here was 32 against an arena of 16, and the
+// resulting kernel carried 584 symbols with no scheduler, IPC or syscall
+// surface, while a debug build of the same source carried 13,878 and the full
+// runtime. Measured 2026-09-12; see `DW1_WYR1_RESET_R1C_VM_REQUEST.md` §8.
+//
+// Raising the arena instead is not the remedy. The alternative linked geometry
+// is E8's 64 x 4 MiB, whose widened tables are why its termination path needed
+// a 4 MiB per-thread stack, and plan §12 forbids growing a multi-megabyte stack
+// in place of reducing frames.
+const _: () = assert!(SELECTED.identities <= crate::memory::kernel_stack::E3_THREAD_STACK_COUNT);
 // The ledger does not get its own opinion about how many records the collector
 // can hold. A capacity change on either side must be reconciled here. Gated on
 // the feature that admits `test_support` at all; the collector cannot exist
@@ -294,8 +334,17 @@ mod tests {
             1 + RESIDENT_IMAGES + 2 * MAX_HOGS
         );
         assert_eq!(LIFETIME_IDENTITIES.len(), 21);
+        // The census exceeds every identity pool on purpose, and that must not
+        // read as an undersized ledger: it counts retired generations, which
+        // hold no slot. A capacity one below the *simultaneous* peak is the
+        // thing that fails.
+        assert!(LIFETIME_IDENTITIES.len() > SELECTED.identities);
+        assert!(fits(Capacity {
+            identities: LIVE_IDENTITY_PEAK,
+            ..SELECTED
+        }));
         assert!(!fits(Capacity {
-            identities: 20,
+            identities: LIVE_IDENTITY_PEAK - 1,
             ..SELECTED
         }));
         assert!(fits(SELECTED));
@@ -359,7 +408,7 @@ mod tests {
                 ..SELECTED
             },
             Capacity {
-                identities: LIFETIME_IDENTITIES.len() - 1,
+                identities: LIVE_IDENTITY_PEAK - 1,
                 ..SELECTED
             },
             Capacity {
@@ -386,7 +435,7 @@ mod tests {
             handles: HANDLE_PEAK,
             memory: MEMORY_PEAK,
             mappings: MAPPING_PEAK,
-            identities: LIFETIME_IDENTITIES.len(),
+            identities: LIVE_IDENTITY_PEAK,
             registry: REGISTRY_PEAK,
             channel_pairs: CHANNEL_PAIR_PEAK,
             waits: WAIT_PEAK,
@@ -538,5 +587,47 @@ mod tests {
         assert_eq!(admit::<32>(&census), 32);
         assert_eq!(admit::<{ REGISTRY_PEAK }>(&census), REGISTRY_PEAK);
         assert_eq!(admit::<{ SELECTED.registry }>(&census), REGISTRY_PEAK);
+    }
+}
+
+#[cfg(test)]
+mod thread_arena {
+    use super::*;
+
+    /// The regression this ledger's first selection shipped.
+    ///
+    /// A selection above the linked arena is not caught by any run-time bound;
+    /// it removes the whole runtime from the release artifact. So the ledger
+    /// asserts the ceiling in `const` context, and this test states what the
+    /// ceiling is and that the selection has real headroom under it.
+    #[test]
+    fn selector34_r1_identity_capacity_stays_inside_the_linked_thread_arena() {
+        const ARENA: usize = crate::memory::kernel_stack::E3_THREAD_STACK_COUNT;
+        assert_eq!(ARENA, 16);
+        const {
+            assert!(SELECTED.identities <= ARENA);
+            // The simultaneous peak must fit with room to spare, or the next
+            // actor the scenario gains would push the ledger straight back over.
+            assert!(LIVE_IDENTITY_PEAK < ARENA);
+        }
+        assert_eq!(LIVE_IDENTITY_PEAK, 14);
+        assert_eq!(LIVE_PROCESSES, 13);
+        assert_eq!(LIVE_TASK_GROUPS, 14);
+    }
+
+    /// Every identity-indexed pool must be the same number, because they are
+    /// all one occupancy bound wearing different names in `primordial.rs`. A
+    /// split between them would let one overflow while the ledger proved the
+    /// others.
+    #[test]
+    fn selector34_r1_identity_peak_covers_both_live_counts() {
+        const {
+            assert!(LIVE_IDENTITY_PEAK >= LIVE_PROCESSES);
+            assert!(LIVE_IDENTITY_PEAK >= LIVE_TASK_GROUPS);
+            // Sized from the eight-hog ceiling, not the six-hog SMP plan, so a
+            // plan change cannot silently require a kernel capacity change.
+            assert!(LIVE_PROCESSES > RESIDENT_IMAGES + SMP_PLAN_HOGS + 1);
+        }
+        assert_eq!(LIVE_PROCESSES, RESIDENT_IMAGES + MAX_HOGS + 1);
     }
 }

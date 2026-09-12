@@ -1306,7 +1306,7 @@ pub(super) use geometry::validate_kernel_stack_artifact_geometry;
 pub(super) use geometry::validate_kernel_stack_artifact_geometry_for_threads;
 pub(super) use primordial::validate_primordial_boot_stack_margin;
 pub(super) use production::validate_production_ist_stack_margin;
-pub(super) use r1::validate_r1_thread_stack_readiness;
+pub(super) use r1::validate_r1_thread_stack_margin;
 pub(super) use selector::validate_selector_stack_margin;
 pub(super) use wyr1e::validate_wyr1e_privilege_entry_stack_margin;
 pub(super) use wyr1e_thread::validate_wyr1e8_thread_stack_margin;

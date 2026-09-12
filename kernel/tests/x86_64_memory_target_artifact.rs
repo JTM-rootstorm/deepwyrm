@@ -691,8 +691,9 @@ fn wyr1_primordial_selector_artifacts_fit_the_linked_boot_stack() {
             );
         }
         if selector == "dynamic-launch-saturation" {
-            validate_r1_thread_stack_readiness(
+            validate_r1_thread_stack_margin(
                 &stack_sizes(&llvm_readelf, &stack_kernel),
+                &stack_disassembly,
                 linked_thread_kernel_stack_payload_bytes(&stack_symbols),
             );
         }
