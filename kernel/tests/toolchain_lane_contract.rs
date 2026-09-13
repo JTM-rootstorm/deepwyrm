@@ -304,6 +304,83 @@ fn selector_27_environment_is_validated_before_cargo_admission() {
 }
 
 #[test]
+fn selector_34_environment_is_validated_before_cargo_admission() {
+    // Card R1's mapping journal is sized from this ceiling, so an absent or
+    // malformed page count must be refused before Cargo admission rather than
+    // producing a kernel whose journal is too small for the archive it maps.
+    for (pages, expected) in [
+        (
+            None,
+            "DEEPWYRM_R1_BOOTFS_MAX_PAGES must be canonical decimal in 1..=8192",
+        ),
+        (
+            Some("not-pages"),
+            "DEEPWYRM_R1_BOOTFS_MAX_PAGES must be canonical decimal in 1..=8192",
+        ),
+        (
+            Some("0"),
+            "DEEPWYRM_R1_BOOTFS_MAX_PAGES must be canonical decimal in 1..=8192",
+        ),
+        (
+            Some("0145"),
+            "DEEPWYRM_R1_BOOTFS_MAX_PAGES must be canonical decimal in 1..=8192",
+        ),
+        (
+            Some("8193"),
+            "DEEPWYRM_R1_BOOTFS_MAX_PAGES must be canonical decimal in 1..=8192",
+        ),
+    ] {
+        let mut environment = vec![
+            ("DEEPWYRM_GUEST_TEST_SELECTOR", "dynamic-launch-saturation"),
+            ("DEEPWYRM_R1_EVIDENCE_NONCE", "8100000000000001"),
+        ];
+        if let Some(pages) = pages {
+            environment.push(("DEEPWYRM_R1_BOOTFS_MAX_PAGES", pages));
+        }
+        let output = rejected_with_env(
+            &[
+                "host",
+                "test",
+                "-p",
+                "deepwyrm-kernel",
+                "--features",
+                "test-support",
+                "--lib",
+            ],
+            &environment,
+        );
+        assert_eq!(output.status.code(), Some(2), "pages={pages:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "pages={pages:?}"
+        );
+    }
+
+    // The nonce remains validated alongside it.
+    let output = rejected_with_env(
+        &[
+            "host",
+            "test",
+            "-p",
+            "deepwyrm-kernel",
+            "--features",
+            "test-support",
+            "--lib",
+        ],
+        &[
+            ("DEEPWYRM_GUEST_TEST_SELECTOR", "dynamic-launch-saturation"),
+            ("DEEPWYRM_R1_EVIDENCE_NONCE", "8100000000abcdef"),
+            ("DEEPWYRM_R1_BOOTFS_MAX_PAGES", "145"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("DEEPWYRM_R1_EVIDENCE_NONCE must be exactly 16 uppercase hexadecimal digits")
+    );
+}
+
+#[test]
 fn both_toolchain_identities_pin_the_same_project_cargo_home() {
     for identity in [
         "tooling/host-rust-toolchain.toml",

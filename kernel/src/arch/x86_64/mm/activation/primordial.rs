@@ -640,6 +640,7 @@ const PRIMORDIAL_TABLE_CANDIDATES: usize = 6;
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
+    deepwyrm_r1_evidence,
 )))]
 const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 17;
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
@@ -662,6 +663,15 @@ const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_dw1b_bootfs_pages();
 const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_wyr1b_bootfs_pages();
 #[cfg(deepwyrm_dw1c_evidence)]
 const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_dw1c_bootfs_pages();
+// Selector 34's archive carries the probe, the permanent controller, the hog
+// and progress payloads, and card R1's gate and policy artifacts, so its exact
+// size is a property of the Wyrmroot product rather than of this revision.
+// Deriving the ceiling from the producer's measured page count keeps the
+// mapping journal sized to the archive that will actually be mapped: a guessed
+// constant is what made an oversized archive surface as an opaque
+// NO_RESOURCES from the bootstrap's bootfs mapping instead of a build error.
+#[cfg(deepwyrm_r1_evidence)]
+const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_r1_bootfs_pages();
 // Selector 29 consumes a frozen archive whose byte identity is recorded by
 // Wyrmroot. Keep bounded functional headroom above selector 27 without
 // widening the ordinary production profile or the 32 MiB loader intake.
@@ -913,6 +923,30 @@ const fn parse_wyr1b_bootfs_pages() -> usize {
     assert!(
         value > 0 && value <= 8192,
         "selector-27 bootfs page ceiling is out of range"
+    );
+    value
+}
+
+#[cfg(deepwyrm_r1_evidence)]
+const fn parse_r1_bootfs_pages() -> usize {
+    let bytes = env!("DEEPWYRM_R1_BOOTFS_MAX_PAGES").as_bytes();
+    let mut value = 0_usize;
+    let mut index = 0;
+    assert!(
+        !bytes.is_empty(),
+        "selector-34 bootfs page ceiling is empty"
+    );
+    while index < bytes.len() {
+        assert!(
+            bytes[index].is_ascii_digit(),
+            "selector-34 bootfs page ceiling is not decimal"
+        );
+        value = value * 10 + (bytes[index] - b'0') as usize;
+        index += 1;
+    }
+    assert!(
+        value > 0 && value <= 8192,
+        "selector-34 bootfs page ceiling is out of range"
     );
     value
 }

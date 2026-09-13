@@ -112,6 +112,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1E8_EVIDENCE");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1E8_EVIDENCE_NONCE");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_R1_EVIDENCE_NONCE");
+    println!("cargo:rerun-if-env-changed=DEEPWYRM_R1_BOOTFS_MAX_PAGES");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_c3_one_shot_ui)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_memory_guest)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_e7_guest)");
@@ -1080,7 +1081,9 @@ fn configure_guest_test(harness_path: &Path) -> Result<(), String> {
         }
         if is_r1_evidence_selector(&selector) {
             let nonce = required_r1_hex("DEEPWYRM_R1_EVIDENCE_NONCE")?;
+            let bootfs_pages = required_r1_bootfs_pages()?;
             println!("cargo:rustc-env=DEEPWYRM_R1_EVIDENCE_NONCE={nonce}");
+            println!("cargo:rustc-env=DEEPWYRM_R1_BOOTFS_MAX_PAGES={bootfs_pages}");
         }
         if is_wyr1e_evidence_selector(&selector) {
             if wyr1e8 {
@@ -1176,6 +1179,25 @@ fn validate_dw1e_e3b_full(value: Option<&str>, selected: bool) -> Result<bool, S
         }
         Some(_) => Err("DEEPWYRM_DW1E_E3B_FULL must be absent or exact ASCII 1".to_owned()),
     }
+}
+
+fn required_r1_bootfs_pages() -> Result<String, String> {
+    let name = "DEEPWYRM_R1_BOOTFS_MAX_PAGES";
+    let value = env::var(name)
+        .map_err(|_| format!("dynamic-launch-saturation requires measured {name}"))?;
+    validate_r1_bootfs_pages(&value)?;
+    Ok(value)
+}
+
+fn validate_r1_bootfs_pages(value: &str) -> Result<usize, String> {
+    let name = "DEEPWYRM_R1_BOOTFS_MAX_PAGES";
+    let pages = value
+        .parse::<usize>()
+        .map_err(|_| format!("{name} must be canonical decimal"))?;
+    if pages == 0 || pages > 8192 || pages.to_string() != value {
+        return Err(format!("{name} must be canonical decimal in 1..=8192"));
+    }
+    Ok(pages)
 }
 
 fn required_dw1b_bootfs_pages() -> Result<String, String> {
@@ -2446,6 +2468,22 @@ mod tests {
         }
         for invalid in ["", "0", "01", "+1", "8193", "not-pages"] {
             assert!(validate_dw1b_bootfs_pages(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn r1_selector_bootfs_bound_is_exact_and_measured() {
+        assert!(is_r1_evidence_selector("dynamic-launch-saturation"));
+        assert!(!is_r1_evidence_selector("normal-preemption-smp"));
+        // 145 is card R1's real measured archive; the bound must accept it and
+        // the whole 1..=8192 range Deepwyrm's const parser asserts.
+        for (value, pages) in [("1", 1), ("145", 145), ("8192", 8192)] {
+            assert_eq!(validate_r1_bootfs_pages(value), Ok(pages));
+        }
+        // A non-canonical or out-of-range count must fail the build rather than
+        // compile a journal that cannot map the archive it is sized for.
+        for invalid in ["", "0", "0145", "+145", "8193", "not-pages"] {
+            assert!(validate_r1_bootfs_pages(invalid).is_err());
         }
     }
 
