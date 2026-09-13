@@ -896,6 +896,17 @@ pub(crate) fn complete_pass(detail: u32) -> ! {
         let _ = detail;
         complete_wyr1b_evidence_kernel_terminal(CompletionOutcome::Fail, 0x2710_ffff)
     }
+    // Selector 34 must never pass through this path. Its only legitimate pass is
+    // `complete_r1_evidence`, which builds the record directly after flushing a
+    // complete `R1SP` transcript; anything reaching here has produced no evidence,
+    // and a PASS without evidence is a false certificate -- strictly worse for a
+    // diagnostic card than any failure. Every sibling live-supervisor selector is
+    // converted the same way, and selector 34 was simply absent from the list.
+    #[cfg(deepwyrm_r1_evidence)]
+    {
+        let _ = detail;
+        complete_known_outcome(CompletionOutcome::Fail, 0x3410_ffff)
+    }
     #[cfg(not(any(
         deepwyrm_wyr1_evidence,
         deepwyrm_dw1b_evidence,
@@ -906,6 +917,7 @@ pub(crate) fn complete_pass(detail: u32) -> ! {
         deepwyrm_wyr1c_evidence,
         deepwyrm_wyr1d_evidence,
         deepwyrm_wyr1e_evidence,
+        deepwyrm_r1_evidence,
     )))]
     complete_known_outcome(CompletionOutcome::Pass, detail)
 }
