@@ -45,7 +45,8 @@ pub(crate) use adapters::copy_wyr1e_evidence_input;
         deepwyrm_wyr1c_evidence,
         deepwyrm_wyr1d_evidence,
         deepwyrm_wyr1e_evidence,
-        deepwyrm_dw1e_evidence
+        deepwyrm_dw1e_evidence,
+        deepwyrm_r1_evidence
     ),
     target_os = "none",
     target_arch = "x86_64"

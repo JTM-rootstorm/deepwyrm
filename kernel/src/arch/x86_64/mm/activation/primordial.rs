@@ -13,7 +13,8 @@ use super::*;
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
-    deepwyrm_dw1e_evidence
+    deepwyrm_dw1e_evidence,
+    deepwyrm_r1_evidence,
 ))]
 use super::primordial_diagnostic::primordial_terminal_summary;
 
@@ -31,6 +32,7 @@ use crate::boot::primordial::construction::authority::{
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
+    deepwyrm_r1_evidence,
 )))]
 use crate::boot::primordial::construction::complete_primordial_launch;
 #[cfg(any(
@@ -39,6 +41,7 @@ use crate::boot::primordial::construction::complete_primordial_launch;
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
+    deepwyrm_r1_evidence,
 ))]
 use crate::boot::primordial::construction::complete_resource_primordial_launch;
 #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence))]
@@ -47,7 +50,8 @@ use crate::boot::primordial::construction::validate_primordial_retirement_facts;
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
-    deepwyrm_dw1e_evidence
+    deepwyrm_dw1e_evidence,
+    deepwyrm_r1_evidence,
 ))]
 use crate::boot::primordial::construction::validate_resource_primordial_retirement_facts as validate_primordial_retirement_facts;
 use crate::boot::primordial::construction::{
@@ -80,7 +84,8 @@ use crate::syscall::{
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
     deepwyrm_dw1d_evidence,
-    deepwyrm_dw1e_evidence
+    deepwyrm_dw1e_evidence,
+    deepwyrm_r1_evidence,
 ))]
 use crate::task::ProcessLifecycleState;
 use crate::task::{ExecutionDomain, ProcessKey, SchedulerThreadState, TaskAuthority, ThreadKey};
@@ -1829,7 +1834,8 @@ struct TerminalRetirementState {
         deepwyrm_wyr1c_evidence,
         deepwyrm_wyr1d_evidence,
         deepwyrm_wyr1e_evidence,
-        deepwyrm_dw1e_evidence
+        deepwyrm_dw1e_evidence,
+        deepwyrm_r1_evidence,
     ))]
     retiring_wyr1_primordial: bool,
     #[cfg(any(
@@ -1838,7 +1844,8 @@ struct TerminalRetirementState {
         deepwyrm_wyr1c_evidence,
         deepwyrm_wyr1d_evidence,
         deepwyrm_wyr1e_evidence,
-        deepwyrm_dw1e_evidence
+        deepwyrm_dw1e_evidence,
+        deepwyrm_r1_evidence,
     ))]
     wyr1_primordial_teardown: Option<(
         crate::task::ProcessQuiescenceProof,
@@ -1859,7 +1866,8 @@ enum TerminalKernelContinuation {
         deepwyrm_wyr1c_evidence,
         deepwyrm_wyr1d_evidence,
         deepwyrm_wyr1e_evidence,
-        deepwyrm_dw1e_evidence
+        deepwyrm_dw1e_evidence,
+        deepwyrm_r1_evidence,
     ))]
     RetireWyr1Primordial(TerminalRetirementState),
     #[cfg(any(
@@ -1868,7 +1876,8 @@ enum TerminalKernelContinuation {
         deepwyrm_wyr1c_evidence,
         deepwyrm_wyr1d_evidence,
         deepwyrm_wyr1e_evidence,
-        deepwyrm_dw1e_evidence
+        deepwyrm_dw1e_evidence,
+        deepwyrm_r1_evidence,
     ))]
     RetireWyr1Child {
         retirement: TerminalRetirementState,
@@ -3087,7 +3096,8 @@ struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_
         deepwyrm_wyr1c_evidence,
         deepwyrm_wyr1d_evidence,
         deepwyrm_wyr1e_evidence,
-        deepwyrm_dw1e_evidence
+        deepwyrm_dw1e_evidence,
+        deepwyrm_r1_evidence,
     ))]
     evidence_init_process: Option<ProcessKey>,
     #[cfg(any(
@@ -3726,7 +3736,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1c_evidence,
             deepwyrm_wyr1d_evidence,
             deepwyrm_wyr1e_evidence,
-            deepwyrm_dw1e_evidence
+            deepwyrm_dw1e_evidence,
+            deepwyrm_r1_evidence,
         ))]
         let retiring_wyr1_primordial = retired_process == self.primordial_process;
         #[cfg(any(
@@ -3735,7 +3746,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1c_evidence,
             deepwyrm_wyr1d_evidence,
             deepwyrm_wyr1e_evidence,
-            deepwyrm_dw1e_evidence
+            deepwyrm_dw1e_evidence,
+            deepwyrm_r1_evidence,
         ))]
         if retiring_wyr1_primordial && let Err(error) = validate_primordial_retirement_facts(self) {
             #[cfg(feature = "test-support")]
@@ -3750,7 +3762,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1c_evidence,
             deepwyrm_wyr1d_evidence,
             deepwyrm_wyr1e_evidence,
-            deepwyrm_dw1e_evidence
+            deepwyrm_dw1e_evidence,
+            deepwyrm_r1_evidence,
         ))]
         let wyr1_primordial_teardown = if retiring_wyr1_primordial {
             let proof = self
@@ -3785,7 +3798,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 deepwyrm_wyr1c_evidence,
                 deepwyrm_wyr1d_evidence,
                 deepwyrm_wyr1e_evidence,
-                deepwyrm_dw1e_evidence
+                deepwyrm_dw1e_evidence,
+                deepwyrm_r1_evidence,
             ))]
             retiring_wyr1_primordial,
             #[cfg(any(
@@ -3794,7 +3808,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 deepwyrm_wyr1c_evidence,
                 deepwyrm_wyr1d_evidence,
                 deepwyrm_wyr1e_evidence,
-                deepwyrm_dw1e_evidence
+                deepwyrm_dw1e_evidence,
+                deepwyrm_r1_evidence,
             ))]
             wyr1_primordial_teardown,
         }
@@ -3835,7 +3850,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1c_evidence,
             deepwyrm_wyr1d_evidence,
             deepwyrm_wyr1e_evidence,
-            deepwyrm_dw1e_evidence
+            deepwyrm_dw1e_evidence,
+            deepwyrm_r1_evidence,
         ))]
         if retirement.retiring_wyr1_primordial {
             let prepared = self.prepare_terminal_kernel_root_switch();
@@ -3851,7 +3867,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1c_evidence,
             deepwyrm_wyr1d_evidence,
             deepwyrm_wyr1e_evidence,
-            deepwyrm_dw1e_evidence
+            deepwyrm_dw1e_evidence,
+            deepwyrm_r1_evidence,
         ))]
         let primordial_retired = match self.tasks.root_region(self.primordial_process) {
             Ok(None) | Err(crate::task::TaskError::InvalidTask) => true,
@@ -3864,7 +3881,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1c_evidence,
             deepwyrm_wyr1d_evidence,
             deepwyrm_wyr1e_evidence,
-            deepwyrm_dw1e_evidence
+            deepwyrm_dw1e_evidence,
+            deepwyrm_r1_evidence,
         ))]
         if retirement.retired_process != self.primordial_process && primordial_retired {
             let retiring_reporter = self.evidence_init_process == Some(retirement.retired_process);
@@ -3952,7 +3970,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 deepwyrm_wyr1c_evidence,
                 deepwyrm_wyr1d_evidence,
                 deepwyrm_wyr1e_evidence,
-                deepwyrm_dw1e_evidence
+                deepwyrm_dw1e_evidence,
+                deepwyrm_r1_evidence,
             ))]
             if state.retirement.retiring_wyr1_primordial {
                 let (proof, drained) =
@@ -3989,7 +4008,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 deepwyrm_wyr1c_evidence,
                 deepwyrm_wyr1d_evidence,
                 deepwyrm_wyr1e_evidence,
-                deepwyrm_dw1e_evidence
+                deepwyrm_dw1e_evidence,
+                deepwyrm_r1_evidence,
             )))]
             if self
                 .tasks
@@ -4010,7 +4030,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1c_evidence,
             deepwyrm_wyr1d_evidence,
             deepwyrm_wyr1e_evidence,
-            deepwyrm_dw1e_evidence
+            deepwyrm_dw1e_evidence,
+            deepwyrm_r1_evidence,
         ))]
         if state.retirement.retiring_wyr1_primordial {
             self.enable_wyr1_reporter_after_retirement()
@@ -4051,7 +4072,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 deepwyrm_wyr1c_evidence,
                 deepwyrm_wyr1d_evidence,
                 deepwyrm_wyr1e_evidence,
-                deepwyrm_dw1e_evidence
+                deepwyrm_dw1e_evidence,
+                deepwyrm_r1_evidence,
             ))]
             TerminalKernelContinuation::RetireWyr1Primordial(mut retirement) => {
                 let (proof, drained) =
@@ -4083,7 +4105,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 deepwyrm_wyr1c_evidence,
                 deepwyrm_wyr1d_evidence,
                 deepwyrm_wyr1e_evidence,
-                deepwyrm_dw1e_evidence
+                deepwyrm_dw1e_evidence,
+                deepwyrm_r1_evidence,
             ))]
             TerminalKernelContinuation::RetireWyr1Child {
                 retirement,
@@ -4146,6 +4169,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1c_evidence,
             deepwyrm_wyr1d_evidence,
             deepwyrm_wyr1e_evidence,
+            deepwyrm_r1_evidence,
         )))]
         let completion = complete_primordial_launch(self);
         #[cfg(any(
@@ -4154,6 +4178,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1c_evidence,
             deepwyrm_wyr1d_evidence,
             deepwyrm_wyr1e_evidence,
+            deepwyrm_r1_evidence,
         ))]
         let completion = complete_resource_primordial_launch(self);
         #[cfg(all(feature = "test-support", deepwyrm_dw1c_evidence))]
@@ -4308,7 +4333,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1c_evidence,
             deepwyrm_wyr1d_evidence,
             deepwyrm_wyr1e_evidence,
-            deepwyrm_dw1e_evidence
+            deepwyrm_dw1e_evidence,
+            deepwyrm_r1_evidence,
         ))]
         let retiring_wyr1_primordial = retired_process == self.primordial_process;
         #[cfg(any(
@@ -4317,7 +4343,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1c_evidence,
             deepwyrm_wyr1d_evidence,
             deepwyrm_wyr1e_evidence,
-            deepwyrm_dw1e_evidence
+            deepwyrm_dw1e_evidence,
+            deepwyrm_r1_evidence,
         ))]
         if retiring_wyr1_primordial {
             if let Err(error) = validate_primordial_retirement_facts(self) {
@@ -4337,7 +4364,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1c_evidence,
             deepwyrm_wyr1d_evidence,
             deepwyrm_wyr1e_evidence,
-            deepwyrm_dw1e_evidence
+            deepwyrm_dw1e_evidence,
+            deepwyrm_r1_evidence,
         ))]
         let mut wyr1_primordial_teardown = if retiring_wyr1_primordial {
             // Primordial is still this CPU's hardware-active Process root.
@@ -4387,7 +4415,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     deepwyrm_wyr1c_evidence,
                     deepwyrm_wyr1d_evidence,
                     deepwyrm_wyr1e_evidence,
-                    deepwyrm_dw1e_evidence
+                    deepwyrm_dw1e_evidence,
+                    deepwyrm_r1_evidence,
                 ))]
                 if retiring_wyr1_primordial {
                     let (proof, drained) = wyr1_primordial_teardown.take().unwrap_or_else(|| {
@@ -4416,7 +4445,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     deepwyrm_wyr1c_evidence,
                     deepwyrm_wyr1d_evidence,
                     deepwyrm_wyr1e_evidence,
-                    deepwyrm_dw1e_evidence
+                    deepwyrm_dw1e_evidence,
+                    deepwyrm_r1_evidence,
                 )))]
                 if self.tasks.process_quiescence_proof(retired_process).is_ok() {
                     self.finish_inactive_process_teardown(
@@ -4433,7 +4463,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 deepwyrm_wyr1c_evidence,
                 deepwyrm_wyr1d_evidence,
                 deepwyrm_wyr1e_evidence,
-                deepwyrm_dw1e_evidence
+                deepwyrm_dw1e_evidence,
+                deepwyrm_r1_evidence,
             ))]
             if retiring_wyr1_primordial {
                 self.enable_wyr1_reporter_after_retirement()
@@ -4469,7 +4500,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1c_evidence,
             deepwyrm_wyr1d_evidence,
             deepwyrm_wyr1e_evidence,
-            deepwyrm_dw1e_evidence
+            deepwyrm_dw1e_evidence,
+            deepwyrm_r1_evidence,
         ))]
         if retiring_wyr1_primordial {
             // A permanent supervisor may already be Running on another CPU,
@@ -4515,7 +4547,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1c_evidence,
             deepwyrm_wyr1d_evidence,
             deepwyrm_wyr1e_evidence,
-            deepwyrm_dw1e_evidence
+            deepwyrm_dw1e_evidence,
+            deepwyrm_r1_evidence,
         ))]
         let primordial_retired = match self.tasks.root_region(self.primordial_process) {
             Ok(None) | Err(crate::task::TaskError::InvalidTask) => true,
@@ -4528,7 +4561,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1c_evidence,
             deepwyrm_wyr1d_evidence,
             deepwyrm_wyr1e_evidence,
-            deepwyrm_dw1e_evidence
+            deepwyrm_dw1e_evidence,
+            deepwyrm_r1_evidence,
         ))]
         if retired_process != self.primordial_process && primordial_retired {
             // Once WYR1 has retired primordial, its retained boot-lifetime
@@ -4679,6 +4713,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1c_evidence,
             deepwyrm_wyr1d_evidence,
             deepwyrm_wyr1e_evidence,
+            deepwyrm_r1_evidence,
         )))]
         let completion = complete_primordial_launch(self);
         #[cfg(any(
@@ -4687,6 +4722,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             deepwyrm_wyr1c_evidence,
             deepwyrm_wyr1d_evidence,
             deepwyrm_wyr1e_evidence,
+            deepwyrm_r1_evidence,
         ))]
         let completion = complete_resource_primordial_launch(self);
         #[cfg(all(feature = "test-support", deepwyrm_dw1c_evidence))]
@@ -5725,7 +5761,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         deepwyrm_wyr1c_evidence,
         deepwyrm_wyr1d_evidence,
         deepwyrm_wyr1e_evidence,
-        deepwyrm_dw1e_evidence
+        deepwyrm_dw1e_evidence,
+        deepwyrm_r1_evidence,
     ))]
     fn enable_wyr1_reporter_after_retirement(&mut self) -> Result<(), ()> {
         let reporter = self.evidence_init_process.ok_or(())?;
@@ -7977,7 +8014,8 @@ const fn dw1b_evidence_detail(error: crate::test_support::Dw1bEvidenceError) -> 
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
-    deepwyrm_dw1e_evidence
+    deepwyrm_dw1e_evidence,
+    deepwyrm_r1_evidence,
 ))]
 const fn evidence_process_create_detail(case: u32) -> u32 {
     #[cfg(deepwyrm_wyr1_evidence)]
@@ -7998,6 +8036,8 @@ const fn evidence_process_create_detail(case: u32) -> u32 {
     return 0x3210_c000 | case;
     #[cfg(deepwyrm_wyr1e_evidence)]
     return 0x3310_c000 | case;
+    #[cfg(deepwyrm_r1_evidence)]
+    return 0x3410_c000 | case;
 }
 
 #[cfg(any(
@@ -8006,7 +8046,8 @@ const fn evidence_process_create_detail(case: u32) -> u32 {
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
-    deepwyrm_dw1e_evidence
+    deepwyrm_dw1e_evidence,
+    deepwyrm_r1_evidence,
 ))]
 const fn supervisor_evidence_detail(case: u32) -> u32 {
     #[cfg(deepwyrm_wyr1_evidence)]
@@ -8021,6 +8062,8 @@ const fn supervisor_evidence_detail(case: u32) -> u32 {
     return 0x3210_0000 | case;
     #[cfg(deepwyrm_wyr1e_evidence)]
     return 0x3310_0000 | case;
+    #[cfg(deepwyrm_r1_evidence)]
+    return 0x3410_0000 | case;
 }
 
 #[cfg(any(
@@ -8030,7 +8073,8 @@ const fn supervisor_evidence_detail(case: u32) -> u32 {
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
-    deepwyrm_dw1e_evidence
+    deepwyrm_dw1e_evidence,
+    deepwyrm_r1_evidence,
 ))]
 const fn primordial_receive_failure_tag(code: u32) -> u32 {
     match code {
@@ -8055,7 +8099,8 @@ const fn primordial_receive_failure_tag(code: u32) -> u32 {
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
-    deepwyrm_dw1e_evidence
+    deepwyrm_dw1e_evidence,
+    deepwyrm_r1_evidence,
 ))]
 fn primordial_completion_case(
     error: crate::boot::primordial::construction::PrimordialCompletionError<u32>,
@@ -8089,7 +8134,8 @@ fn primordial_completion_case(
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
-    deepwyrm_dw1e_evidence
+    deepwyrm_dw1e_evidence,
+    deepwyrm_r1_evidence,
 ))]
 fn primordial_completion_detail(
     error: crate::boot::primordial::construction::PrimordialCompletionError<u32>,
@@ -9614,7 +9660,8 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
             deepwyrm_wyr1c_evidence,
             deepwyrm_wyr1d_evidence,
             deepwyrm_wyr1e_evidence,
-            deepwyrm_dw1e_evidence
+            deepwyrm_dw1e_evidence,
+            deepwyrm_r1_evidence,
         ))]
         evidence_init_process: None,
         #[cfg(any(
@@ -9777,7 +9824,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     deepwyrm_wyr1c_evidence,
                     deepwyrm_wyr1d_evidence,
                     deepwyrm_wyr1e_evidence,
-                    deepwyrm_dw1e_evidence
+                    deepwyrm_dw1e_evidence,
+                    deepwyrm_r1_evidence,
                 ))]
                 let creating_evidence_init = self.process == self.primordial_process;
                 #[cfg(any(
@@ -9788,7 +9836,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     deepwyrm_wyr1c_evidence,
                     deepwyrm_wyr1d_evidence,
                     deepwyrm_wyr1e_evidence,
-                    deepwyrm_dw1e_evidence
+                    deepwyrm_dw1e_evidence,
+                    deepwyrm_r1_evidence,
                 ))]
                 if creating_evidence_init && self.evidence_init_process.is_some() {
                     crate::test_support::complete_fail(evidence_process_create_detail(1))
@@ -9801,7 +9850,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     deepwyrm_wyr1c_evidence,
                     deepwyrm_wyr1d_evidence,
                     deepwyrm_wyr1e_evidence,
-                    deepwyrm_dw1e_evidence
+                    deepwyrm_dw1e_evidence,
+                    deepwyrm_r1_evidence,
                 ))]
                 let mut committed_child = None;
                 #[cfg(any(
@@ -9812,7 +9862,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     deepwyrm_wyr1c_evidence,
                     deepwyrm_wyr1d_evidence,
                     deepwyrm_wyr1e_evidence,
-                    deepwyrm_dw1e_evidence
+                    deepwyrm_dw1e_evidence,
+                    deepwyrm_r1_evidence,
                 ))]
                 let status = crate::syscall::process_create_with_root_observed(
                     &mut user,
@@ -9844,7 +9895,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     deepwyrm_wyr1c_evidence,
                     deepwyrm_wyr1d_evidence,
                     deepwyrm_wyr1e_evidence,
-                    deepwyrm_dw1e_evidence
+                    deepwyrm_dw1e_evidence,
+                    deepwyrm_r1_evidence,
                 )))]
                 let status = crate::syscall::process_create_with_root(
                     &mut user,
@@ -9867,7 +9919,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                     deepwyrm_wyr1c_evidence,
                     deepwyrm_wyr1d_evidence,
                     deepwyrm_wyr1e_evidence,
-                    deepwyrm_dw1e_evidence
+                    deepwyrm_dw1e_evidence,
+                    deepwyrm_r1_evidence,
                 ))]
                 if creating_evidence_init && status == DW_STATUS_SUCCESS {
                     self.evidence_init_process = Some(committed_child.unwrap_or_else(|| {
