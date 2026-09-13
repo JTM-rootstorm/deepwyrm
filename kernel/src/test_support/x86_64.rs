@@ -719,6 +719,32 @@ fn complete_wyr1c_failure_terminal(outcome: CompletionOutcome, detail: u32) -> !
     complete(&mut transport, completion_record(outcome, detail))
 }
 
+/// Selector 34's kernel-side failure terminal.
+///
+/// Its value is the contention, not the record. `complete_r1_evidence` claims
+/// `R1_TERMINAL_OWNER` with `R1_TERMINAL_SUCCESS` before flushing the `R1SP`
+/// transcript; this claims the same cell as owner 2. Whichever arrives first
+/// emits, and the loser halts without a record, so the guest cannot report both a
+/// generic `DWTEST1` failure and an evidence terminal for one run. Selector 34
+/// previously routed failures through `complete_known_outcome`, which claims
+/// nothing, and so had no structural guard against exactly that.
+#[cfg(deepwyrm_r1_evidence)]
+fn complete_r1_failure_terminal(outcome: CompletionOutcome, detail: u32) -> ! {
+    debug_assert!(outcome != CompletionOutcome::Pass);
+    if !claim_r1_terminal(2) {
+        halt_after_completion()
+    }
+    // SAFETY: this function exists only in the centrally selected
+    // `dynamic-launch-saturation` QEMU test image. Its verified handoff profile
+    // supplies `isa-debug-exit`; it is not a production or physical image.
+    let mut transport = unsafe { QemuCompletionTransport::new() };
+    let Ok(transaction) = begin_test_serial_transaction() else {
+        halt_after_completion()
+    };
+    transport.transaction = Some(transaction);
+    complete(&mut transport, completion_record(outcome, detail))
+}
+
 #[cfg(deepwyrm_wyr1d_evidence)]
 fn complete_wyr1d_failure_terminal(outcome: CompletionOutcome, detail: u32) -> ! {
     debug_assert!(outcome != CompletionOutcome::Pass);
@@ -905,7 +931,7 @@ pub(crate) fn complete_pass(detail: u32) -> ! {
     #[cfg(deepwyrm_r1_evidence)]
     {
         let _ = detail;
-        complete_known_outcome(CompletionOutcome::Fail, 0x3410_ffff)
+        complete_r1_failure_terminal(CompletionOutcome::Fail, 0x3410_ffff)
     }
     #[cfg(not(any(
         deepwyrm_wyr1_evidence,
@@ -952,6 +978,10 @@ pub(crate) fn complete_fail(detail: u32) -> ! {
     {
         complete_wyr1_evidence_kernel_terminal(CompletionOutcome::Fail, detail)
     }
+    #[cfg(deepwyrm_r1_evidence)]
+    {
+        complete_r1_failure_terminal(CompletionOutcome::Fail, detail)
+    }
     #[cfg(not(any(
         deepwyrm_wyr1_evidence,
         deepwyrm_dw1c_evidence,
@@ -960,6 +990,7 @@ pub(crate) fn complete_fail(detail: u32) -> ! {
         deepwyrm_wyr1c_evidence,
         deepwyrm_wyr1d_evidence,
         deepwyrm_wyr1e_evidence,
+        deepwyrm_r1_evidence,
     )))]
     {
         #[cfg(deepwyrm_wyr1b_evidence)]
@@ -999,6 +1030,10 @@ pub(crate) fn complete_panic(detail: u32) -> ! {
     {
         complete_wyr1_evidence_kernel_terminal(CompletionOutcome::Panic, detail)
     }
+    #[cfg(deepwyrm_r1_evidence)]
+    {
+        complete_r1_failure_terminal(CompletionOutcome::Panic, detail)
+    }
     #[cfg(not(any(
         deepwyrm_wyr1_evidence,
         deepwyrm_dw1c_evidence,
@@ -1007,6 +1042,7 @@ pub(crate) fn complete_panic(detail: u32) -> ! {
         deepwyrm_wyr1c_evidence,
         deepwyrm_wyr1d_evidence,
         deepwyrm_wyr1e_evidence,
+        deepwyrm_r1_evidence,
     )))]
     {
         #[cfg(deepwyrm_wyr1b_evidence)]
