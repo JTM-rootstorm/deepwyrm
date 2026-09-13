@@ -161,7 +161,14 @@ pub(super) const WAIT_PEAK: usize = INIT_RESIDENT_SUPERVISION_WAITS
 
 // Wyrmroot owns the archive parser, whose selected record limit is 4096. R1 is
 // the ten-entry C1 base plus policy and the six actor files.
-pub(super) const BOOTFS_ENTRY_PEAK: usize = 10 + 1 + 6;
+// Reconciled against the built archive, 2026-09-12 (`wyrmroot` `build_r1`):
+// WYR1-C1's ten entries, the launch policy and the WRR1 probe configuration,
+// and three payloads — the probe, the reused `bin/cpu-hog` and `bin/hello`. The
+// earlier estimate of 10 + 1 + 6 predated the product and over-counted the
+// payloads by two; it was safe because this is checked against a 4096-entry
+// capacity, but an estimate that no longer matches the product is worth less
+// than the product's own composition.
+pub(super) const BOOTFS_ENTRY_PEAK: usize = 10 + 2 + 3;
 pub(super) const BOOTFS_ENTRY_CAPACITY: usize = 4096;
 
 // One R1SP record per observed step, plus at most one failure record and
@@ -291,7 +298,7 @@ mod tests {
         assert_eq!(CHANNEL_ENDPOINT_PEAK, 28);
         assert_eq!(REGISTRY_PEAK, 115);
         assert_eq!(WAIT_PEAK, 30);
-        assert_eq!(BOOTFS_ENTRY_PEAK, 17);
+        assert_eq!(BOOTFS_ENTRY_PEAK, 15);
         const { assert!(BOOTFS_ENTRY_PEAK < BOOTFS_ENTRY_CAPACITY) };
         assert_eq!(
             (
