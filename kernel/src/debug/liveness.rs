@@ -21,10 +21,9 @@
 //! * [`publish_current`] mirrors the per-CPU identity facts into lock-free
 //!   per-CPU cells as they are established, so a stalled guest can report them
 //!   without acquiring the runtime authority; and
-//! * [`publish_runtime_authority`] records the address of the live
-//!   `RuntimeAuthorityLock` once, so host GDB over the QEMU gdbstub can read
-//!   the lock's ticket pair and the carrier behind it directly from memory
-//!   without executing guest code at all.
+//! * [`publish_runtime_authority`] records the address of the live authority's
+//!   ticket pair once, so host GDB over the QEMU gdbstub can read it directly
+//!   from memory without executing guest code at all.
 //!
 //! The mirror is diagnostic state, never authority. Nothing reads it to make a
 //! scheduling, capability, or lifetime decision, and a torn or stale cell can
@@ -183,9 +182,15 @@ static LIVENESS: LivenessSnapshot = LivenessSnapshot::new();
 /// Records the address of the live runtime authority exactly once.
 ///
 /// The carrier is currently pinned to the boot stack, so this is the only way a
-/// debugger can locate the lock's ticket pair and the carrier behind it. Reset
-/// card R2D removes the boot-stack lifetime; this publication remains valid
-/// wherever the authority ends up living.
+/// debugger can locate the lock's ticket pair. Reset card R2D removes the
+/// boot-stack lifetime; this publication remains valid wherever the authority
+/// ends up living.
+///
+/// `authority` is the address of the pair's first word, **not** the lock's base.
+/// The lock is `repr(Rust)` and the compiler puts its value first, so a reader
+/// given the base address reads carrier bytes and calls them a ticket pair --
+/// which is what card R1's run 10 did. The caller asserts that the two words are
+/// adjacent, so one read covers both.
 pub(crate) fn publish_runtime_authority(authority: *const ()) {
     publish_runtime_authority_on(&LIVENESS, authority);
 }

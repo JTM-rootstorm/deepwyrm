@@ -1329,6 +1329,25 @@ struct RuntimeAuthorityLock<T> {
     value: UnsafeCell<T>,
 }
 
+// `serving` must sit exactly one word after `next_ticket`.
+//
+// `publish_runtime_authority` hands a debugger the address of `next_ticket` and
+// `tools/gdb/r1-liveness.gdb` reads two words from it, so the pair has to be
+// contiguous in that order. This is not guaranteed by `repr(Rust)` -- the
+// compiler already reorders this struct, putting `value` first -- so it is
+// asserted here rather than assumed by a script that cannot check it. A future
+// layout change fails this build instead of silently making every published
+// ticket pair two words of carrier data.
+const _: () = {
+    let next = core::mem::offset_of!(RuntimeAuthorityLock<PrimordialRuntimeCarrier<128, 4096>>, next_ticket);
+    let serving = core::mem::offset_of!(RuntimeAuthorityLock<PrimordialRuntimeCarrier<128, 4096>>, serving);
+    assert!(
+        serving == next + 8,
+        "the runtime authority's ticket pair is no longer two adjacent words, so \
+         the address published for GDB no longer locates it"
+    );
+};
+
 impl<T> RuntimeAuthorityLock<T> {
     const fn new(value: T) -> Self {
         Self {
@@ -9683,12 +9702,23 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         g5_probe: G5PrimordialProbe::for_build(),
     }));
 
-    // Reset card R1B: record the live authority address once so host GDB over
-    // the QEMU gdbstub can read the ticket pair and the carrier behind it
-    // without executing guest code. The carrier is pinned to the boot stack,
-    // so this is the only fixed handle a debugger has; card R2D removes that
-    // boot-stack lifetime and this publication stays valid wherever it moves.
-    crate::debug::liveness::publish_runtime_authority(core::ptr::from_ref(&*runtime).cast::<()>());
+    // Reset card R1B: record the live authority's ticket pair once so host GDB
+    // over the QEMU gdbstub can read it without executing guest code. The
+    // carrier is pinned to the boot stack, so this is the only fixed handle a
+    // debugger has; card R2D removes that boot-stack lifetime and this
+    // publication stays valid wherever it moves.
+    //
+    // The *ticket pair's* address, not the lock's. `RuntimeAuthorityLock` is
+    // `repr(Rust)` and the compiler puts `value` first, so card R1's run 10 read
+    // the sixteen bytes at the lock's base and got the leading bytes of the
+    // carrier while labelling them a ticket pair. They were self-evidently wrong
+    // -- a ticket lock cannot serve more tickets than it has issued -- but a
+    // plausible-looking pair would have been reported as contention that was
+    // never there. the adjacency assertion by the lock's definition keeps the two words contiguous so
+    // one read still covers both.
+    crate::debug::liveness::publish_runtime_authority(
+        core::ptr::from_ref(&runtime.next_ticket).cast::<()>(),
+    );
     let runtime_ref = runtime.as_ref().get_ref();
     let (state, stack, exception_binding) = {
         let mut runtime = runtime_ref.lock();
