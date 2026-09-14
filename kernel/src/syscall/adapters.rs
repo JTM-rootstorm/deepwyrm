@@ -589,7 +589,11 @@ fn handle_move_status(error: HandleMovePrepareError) -> DwStatus {
     }
 }
 
-fn task_status(error: TaskError) -> DwStatus {
+/// Canonical `TaskError` to status mapping.
+///
+/// `pub(super)` so a sibling syscall module reaches it instead of inventing a
+/// blind `Err(_) =>` arm, which is what `f_services` did.
+pub(super) fn task_status(error: TaskError) -> DwStatus {
     match error {
         TaskError::Capacity => DW_STATUS_NO_RESOURCES,
         TaskError::WrongObjectType => DW_STATUS_WRONG_OBJECT_TYPE,
@@ -662,9 +666,12 @@ fn channel_status(error: ChannelError) -> DwStatus {
         // Both are "try again", and the ABI says exactly that. They are distinct
         // inside the kernel because they clear on different events -- a full peer
         // queue on that peer receiving, an exhausted payload pool on any channel
-        // releasing a slot -- and a diagnosis needs to name which. Giving them
-        // separate ABI statuses is a deliberate ABI decision, not a side effect
-        // of this split.
+        // releasing a slot -- and a diagnosis needs to name which. *Not* giving
+        // them separate ABI statuses is the deliberate decision, not a side
+        // effect of this split: a caller waits and retries for both, so one
+        // status is correct for it. The reader of a stalled run is not that
+        // caller, and `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.2 puts the
+        // instance in the refusal counters rather than here.
         ChannelError::WouldBlock | ChannelError::PayloadExhausted => DW_STATUS_WOULD_BLOCK,
         ChannelError::PeerClosed => DW_STATUS_PEER_CLOSED,
         ChannelError::BufferTooSmall => DW_STATUS_BUFFER_TOO_SMALL,
@@ -1522,7 +1529,10 @@ pub(crate) fn device_resource_claim<
     );
     let lease = match tasks.acquire_process_operation(current_process) {
         Ok(lease) => lease,
-        Err(_) => return DW_STATUS_BAD_STATE,
+        // `Err(_) => DW_STATUS_BAD_STATE` reported a stale or foreign process
+        // handle as "not accepting operations". `task_status` distinguishes
+        // them, and was already in this file.
+        Err(error) => return task_status(error),
     };
     let result = device_resource_claim_under_operation(
         registry,

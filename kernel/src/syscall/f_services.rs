@@ -34,7 +34,7 @@ use super::adapters::{
     CleanupQueue, NativeWaitControl, TerminalWaitCleanup, WaitSuspendError, atomic_wake_with,
     channel_create, channel_receive, channel_send_from_thread, clock_get_with, event_create,
     event_signal, process_create, resume_wait_thread_syscall, timer_cancel, timer_create,
-    timer_set, wait_many_syscall_on, wait_one_syscall_on,
+    timer_set, task_status, wait_many_syscall_on, wait_one_syscall_on,
 };
 use super::native::{
     NativeIdleSuspendPoll, NativeSuspendPlan, NativeSyscallRequest, NativeSyscallResult,
@@ -548,9 +548,11 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         };
         let lease = match tasks.acquire_process_operation(process) {
             Ok(lease) => lease,
-            Err(_) => {
+            // As in `adapters.rs`: the blind arm this replaces reported a stale
+            // handle as "not accepting operations".
+            Err(error) => {
                 user.release_atomic_u32(pin);
-                return NativeSyscallResult::returning(DW_STATUS_BAD_STATE);
+                return NativeSyscallResult::returning(task_status(error));
             }
         };
         let key = match regions
