@@ -122,8 +122,47 @@ struct EndpointRecord {
 const PAYLOAD_POOL_SLOTS: usize = 16;
 const PAYLOAD_BYTES: usize = DW_CHANNEL_MAX_PAYLOAD as usize;
 
+/// A second, small size class, and the reason the pool stopped being the thing
+/// that decides how many datagrams may be in flight.
+///
+/// Every non-empty send used to take one of sixteen slots of
+/// `DW_CHANNEL_MAX_PAYLOAD`, so a 64-byte record reserved 64 KiB. The pool was
+/// therefore exhausted by *count*, not by bytes, and one busy channel could deny
+/// an unrelated one: card R1's probe was refused at its report-send site while
+/// the pool held a megabyte for sixteen tiny records.
+///
+/// Sizing the large class to match the queues would cost 6 MiB. Sizing a small
+/// class to match them costs 128 KiB, because the largest configured
+/// `CHANNEL_PAIRS` is 32 and each pair has two queues of `DEPTH` 2: at most 128
+/// datagrams can be in flight at once, so 128 small slots cannot be exhausted by
+/// small traffic at all. Cross-channel denial for such traffic is removed rather
+/// than made less likely.
+///
+/// 1 KiB is chosen against real payloads, not by round number: an `R1SP` record
+/// is 64 bytes and the launch/job frame is 416. A send larger than this still
+/// takes a large slot, and a small send falls back to one if the small class is
+/// somehow full, so nothing that used to be admitted is refused now.
+const SMALL_PAYLOAD_BYTES: usize = 1024;
+const SMALL_PAYLOAD_SLOTS: usize = 128;
+
+/// The bound the small class is sized against. If a product ever configures more
+/// pairs or a deeper queue, this fails the build rather than quietly restoring
+/// the exhaustion this class exists to remove.
+const _: () = assert!(
+    SMALL_PAYLOAD_SLOTS >= 32 * 2 * 2,
+    "the small payload class must cover every datagram the largest configured \
+     channel authority can hold in flight"
+);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PayloadClass {
+    Small,
+    Large,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PayloadToken {
+    class: PayloadClass,
     slot: u8,
     generation: u32,
 }
@@ -133,6 +172,13 @@ struct PayloadSlot {
     generation: u32,
     in_use: bool,
     bytes: [u8; PAYLOAD_BYTES],
+}
+
+#[derive(Clone, Copy)]
+struct SmallPayloadSlot {
+    generation: u32,
+    in_use: bool,
+    bytes: [u8; SMALL_PAYLOAD_BYTES],
 }
 
 #[allow(
@@ -145,20 +191,57 @@ const EMPTY_PAYLOAD_SLOT: PayloadSlot = PayloadSlot {
     bytes: [0; PAYLOAD_BYTES],
 };
 
+const EMPTY_SMALL_PAYLOAD_SLOT: SmallPayloadSlot = SmallPayloadSlot {
+    generation: 0,
+    in_use: false,
+    bytes: [0; SMALL_PAYLOAD_BYTES],
+};
+
 struct PayloadPool {
     slots: SpinMutex<[PayloadSlot; PAYLOAD_POOL_SLOTS]>,
+    small: SpinMutex<[SmallPayloadSlot; SMALL_PAYLOAD_SLOTS]>,
 }
 
 impl PayloadPool {
     const fn new() -> Self {
         Self {
             slots: SpinMutex::new([EMPTY_PAYLOAD_SLOT; PAYLOAD_POOL_SLOTS]),
+            small: SpinMutex::new([EMPTY_SMALL_PAYLOAD_SLOT; SMALL_PAYLOAD_SLOTS]),
         }
+    }
+
+    /// Takes a small slot, or reports that the class is full so the caller can
+    /// fall back. Never refuses the send on its own.
+    fn allocate_small(&self, payload: &[u8]) -> Option<PayloadToken> {
+        let mut slots = self.small.lock();
+        for (index, slot) in slots.iter_mut().enumerate() {
+            if slot.in_use {
+                continue;
+            }
+            let generation = slot
+                .generation
+                .checked_add(1)
+                .filter(|generation| *generation != 0)?;
+            slot.generation = generation;
+            slot.bytes[..payload.len()].copy_from_slice(payload);
+            slot.in_use = true;
+            return Some(PayloadToken {
+                class: PayloadClass::Small,
+                slot: u8::try_from(index).expect("small payload pool fits u8 token"),
+                generation,
+            });
+        }
+        None
     }
 
     fn allocate(&self, payload: &[u8]) -> Result<Option<PayloadToken>, ChannelError> {
         if payload.is_empty() {
             return Ok(None);
+        }
+        if payload.len() <= SMALL_PAYLOAD_BYTES
+            && let Some(token) = self.allocate_small(payload)
+        {
+            return Ok(Some(token));
         }
         let mut slots = self.slots.lock();
         for (index, slot) in slots.iter_mut().enumerate() {
@@ -176,6 +259,7 @@ impl PayloadPool {
             slot.bytes[..payload.len()].copy_from_slice(payload);
             slot.in_use = true;
             return Ok(Some(PayloadToken {
+                class: PayloadClass::Large,
                 slot: u8::try_from(index).expect("payload pool fits u8 token"),
                 generation,
             }));
@@ -187,6 +271,19 @@ impl PayloadPool {
     }
 
     fn copy_and_release(&self, token: PayloadToken, byte_len: usize, output: &mut [u8]) {
+        if token.class == PayloadClass::Small {
+            let mut slots = self.small.lock();
+            let slot = slots
+                .get_mut(usize::from(token.slot))
+                .expect("queued small payload token slot remains in range");
+            assert!(
+                slot.in_use && slot.generation == token.generation,
+                "queued payload token became stale before receive"
+            );
+            output[..byte_len].copy_from_slice(&slot.bytes[..byte_len]);
+            slot.in_use = false;
+            return;
+        }
         let mut slots = self.slots.lock();
         let slot = slots
             .get_mut(usize::from(token.slot))
@@ -200,6 +297,18 @@ impl PayloadPool {
     }
 
     fn release(&self, token: PayloadToken) {
+        if token.class == PayloadClass::Small {
+            let mut slots = self.small.lock();
+            let slot = slots
+                .get_mut(usize::from(token.slot))
+                .expect("queued small payload token slot remains in range");
+            assert!(
+                slot.in_use && slot.generation == token.generation,
+                "queued payload token became stale before queue drain"
+            );
+            slot.in_use = false;
+            return;
+        }
         let mut slots = self.slots.lock();
         let slot = slots
             .get_mut(usize::from(token.slot))

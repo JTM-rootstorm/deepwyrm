@@ -1093,6 +1093,71 @@ fn queue_full_and_payload_exhaustion_are_distinct_within_the_kernel() {
     assert_eq!(PAYLOAD_POOL.allocate(&[]), Ok(None));
 }
 
+/// The small class exists so the pool stops deciding how many datagrams may be
+/// in flight. Every non-empty send used to take one of sixteen 64 KiB slots, so
+/// a 64-byte record reserved 64 KiB and one busy channel could deny an unrelated
+/// one -- card R1's probe was refused at its report-send site while the pool held
+/// a megabyte for sixteen tiny records.
+#[test]
+fn small_payloads_do_not_consume_the_large_class() {
+    // More small sends than the large class has slots, all admitted.
+    let mut tokens = std::vec::Vec::new();
+    for _ in 0..(PAYLOAD_POOL_SLOTS * 4) {
+        let token = PAYLOAD_POOL
+            .allocate(&[0xab; 64])
+            .expect("a small payload is admitted")
+            .expect("a non-empty payload takes a slot");
+        tokens.push(token);
+    }
+    // The large class is untouched, so a maximum-size send still fits.
+    let large = PAYLOAD_POOL
+        .allocate(&[0xcd; PAYLOAD_BYTES])
+        .expect("the large class is still free")
+        .expect("a non-empty payload takes a slot");
+    PAYLOAD_POOL.release(large);
+    for token in tokens {
+        PAYLOAD_POOL.release(token);
+    }
+}
+
+/// Round-tripping must read back what was written, for both classes, and a
+/// released slot must be reusable.
+#[test]
+fn both_classes_round_trip_their_bytes() {
+    for len in [1_usize, 64, SMALL_PAYLOAD_BYTES, SMALL_PAYLOAD_BYTES + 1] {
+        let mut payload = std::vec::Vec::new();
+        for index in 0..len {
+            payload.push((index % 251) as u8);
+        }
+        let token = PAYLOAD_POOL
+            .allocate(&payload)
+            .expect("payload is admitted")
+            .expect("a non-empty payload takes a slot");
+        let mut output = std::vec![0_u8; len];
+        PAYLOAD_POOL.copy_and_release(token, len, &mut output);
+        assert_eq!(output, payload, "payload of {len} bytes round-tripped");
+    }
+}
+
+/// A send just over the small bound belongs to the large class, and one at the
+/// bound does not. The boundary is the whole reason the class is safe to add.
+#[test]
+fn the_small_bound_is_exact() {
+    let at_bound = PAYLOAD_POOL
+        .allocate(&[0_u8; SMALL_PAYLOAD_BYTES])
+        .unwrap()
+        .unwrap();
+    assert_eq!(at_bound.class, PayloadClass::Small);
+    PAYLOAD_POOL.release(at_bound);
+
+    let over_bound = PAYLOAD_POOL
+        .allocate(&[0_u8; SMALL_PAYLOAD_BYTES + 1])
+        .unwrap()
+        .unwrap();
+    assert_eq!(over_bound.class, PayloadClass::Large);
+    PAYLOAD_POOL.release(over_bound);
+}
+
 /// The two refusals share one ABI status on purpose -- a caller must wait and
 /// retry for both, so branching on the difference would be a mistake to invite --
 /// but whoever is diagnosing a run that waited and never got room is not the
