@@ -1232,6 +1232,24 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         primary: Option<(ThreadKey, TerminationRecord)>,
         sibling_termination: TerminationRecord,
     ) -> Result<ExitPins<THREADS>, TaskError> {
+        self.terminate_process_state(key, process_termination, primary, sibling_termination)?;
+        self.take_exited_process_exit_pins(key)
+    }
+
+    /// Makes `key` and every live Thread in it terminal, leaving each execution
+    /// pin and its paired resources where they are.
+    ///
+    /// Splitting the state transition from pin capture is what lets TaskGroup
+    /// teardown terminate `PROCESSES` Processes without `PROCESSES` pin batches
+    /// existing at once: it drives this, and takes the pins one Process at a
+    /// time when it is ready to retire them.
+    fn terminate_process_state(
+        &mut self,
+        key: ProcessKey,
+        process_termination: TerminationRecord,
+        primary: Option<(ThreadKey, TerminationRecord)>,
+        sibling_termination: TerminationRecord,
+    ) -> Result<(), TaskError> {
         let quiescence = self
             .begin_process_termination(key, process_termination)
             .map_err(|error| match error {
@@ -1243,7 +1261,6 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             .as_ref()
             .expect("validated process slot")
             .threads;
-        let mut pins = ExitPins::empty();
         for object in thread_ids.into_iter().flatten() {
             let thread_key = ThreadKey(object);
             let thread_slot = self.thread_slot(thread_key)?;
@@ -1258,6 +1275,41 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
                 _ => sibling_termination,
             };
             thread.state.terminate(termination)?;
+        }
+        self.finish_process_exit(&quiescence, process_termination)?;
+        Ok(())
+    }
+
+    /// Takes the terminal execution pins an exited Process and its Threads still
+    /// hold.
+    ///
+    /// Nothing can be lost while they wait: finalizing a Process or a Thread
+    /// that still owns an execution pin is a panic, so a pin left in a terminal
+    /// record blocks that record's finalization until this takes it. The pin and
+    /// the kernel stack and context it retires travel together, because they
+    /// were never separated in the record.
+    pub(crate) fn take_exited_process_exit_pins(
+        &mut self,
+        key: ProcessKey,
+    ) -> Result<ExitPins<THREADS>, TaskError> {
+        if self.process(key)?.state.state != DW_TASK_STATE_EXITED {
+            return Err(TaskError::BadState);
+        }
+        let process_slot = self.process_slot(key)?;
+        let thread_ids = self.processes[process_slot]
+            .as_ref()
+            .expect("validated process slot")
+            .threads;
+        let mut pins = ExitPins::empty();
+        for object in thread_ids.into_iter().flatten() {
+            let thread_slot = self.thread_slot(ThreadKey(object))?;
+            let thread = self.threads[thread_slot]
+                .as_mut()
+                .expect("validated thread slot");
+            assert!(
+                thread.state.state == DW_TASK_STATE_EXITED,
+                "exited Process still names a live Thread"
+            );
             let resources = take_thread_execution_resources(thread);
             if let Some(pin) = thread.execution_pin.take() {
                 pins.push_thread(pin, resources);
@@ -1268,7 +1320,6 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
                 );
             }
         }
-        self.finish_process_exit(&quiescence, process_termination)?;
         pins.process = self.process_mut(key)?.execution_pin.take();
         Ok(pins)
     }
@@ -1956,11 +2007,18 @@ fn release_nonfinal_parent<const OBJECTS: usize>(
 impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HANDLES: usize>
     TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>
 {
-    pub(crate) fn terminate_group<const OBJECTS: usize>(
+    /// Gates and makes terminal every Process in `key`'s subtree, reporting
+    /// which Processes and Threads went terminal.
+    ///
+    /// Terminal execution pins and undrained handles stay in the task records.
+    /// The caller retires them one Process at a time through
+    /// [`Self::take_exited_process_exit_pins`] and
+    /// [`Self::drain_exited_process_handle_window`], so no frame holds
+    /// `PROCESSES` batches of either.
+    pub(crate) fn terminate_group(
         &mut self,
-        registry: &mut ObjectRegistry<OBJECTS>,
         key: TaskGroupKey,
-    ) -> Result<TaskGroupTerminationEffects<PROCESSES, HANDLES, THREADS>, TaskError> {
+    ) -> Result<GroupTeardown<PROCESSES, THREADS>, TaskError> {
         let root_slot = self.group_slot(key)?;
         if !matches!(
             self.groups[root_slot]
@@ -1997,7 +2055,6 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             }
         }
 
-        let mut effects = TaskGroupTerminationEffects::empty();
         for process_key in process_keys.into_iter().flatten() {
             if self.process(process_key)?.state.state != DW_TASK_STATE_EXITED {
                 self.begin_process_termination(
@@ -2010,18 +2067,29 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
                 })?;
             }
         }
+        let mut teardown = GroupTeardown::empty();
         for process_key in process_keys.into_iter().flatten() {
             if self.process(process_key)?.state.state == DW_TASK_STATE_EXITED {
                 continue;
             }
-            let pins = self.terminate_process_common(
+            // Snapshot the Threads this teardown is about to make terminal,
+            // before it does. Siblings that had already exited stay attached for
+            // inspection but hold no scheduler claim and no pin, so naming them
+            // would ask the caller to stop something with nothing to stop.
+            for thread in self
+                .process_termination_thread_keys(process_key)?
+                .into_iter()
+                .flatten()
+            {
+                teardown.push_thread(thread);
+            }
+            self.terminate_process_state(
                 process_key,
                 TerminationRecord::task_group_teardown(),
                 None,
                 TerminationRecord::task_group_teardown(),
             )?;
-            let drained = self.drain_process_handles(registry, process_key)?;
-            effects.push(process_key, ProcessExitEffects { drained, pins });
+            teardown.push_process(process_key);
         }
 
         for (slot, is_selected) in selected.iter().copied().enumerate().rev() {
@@ -2032,6 +2100,6 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
                     .state = TaskGroupState::Terminated;
             }
         }
-        Ok(effects)
+        Ok(teardown)
     }
 }

@@ -1421,14 +1421,14 @@ impl<T> Drop for RuntimeAuthorityGuard<'_, T> {
 /// CPU-local immutable identity over the stationary synchronized runtime.
 struct PendingRemoteProcessTermination {
     phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
-    prepared: crate::syscall::PreparedProcessTermination<HANDLES, THREADS>,
+    prepared: crate::syscall::PreparedProcessTermination<THREADS>,
     deferred: [Option<crate::arch::x86_64::rendezvous::DeferredReclaim<()>>;
         crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
 }
 
 struct PendingRemoteTaskGroupTermination {
     phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
-    prepared: crate::syscall::PreparedTaskGroupTermination<PROCESSES, HANDLES, THREADS>,
+    prepared: crate::syscall::PreparedTaskGroupTermination<PROCESSES, THREADS>,
     deferred: [Option<crate::arch::x86_64::rendezvous::DeferredReclaim<()>>;
         crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
 }
@@ -1448,14 +1448,14 @@ enum PendingRemoteTermination {
 
 struct PreparedRemoteProcessTermination {
     phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
-    prepared: crate::syscall::PreparedProcessTermination<HANDLES, THREADS>,
+    prepared: crate::syscall::PreparedProcessTermination<THREADS>,
     identities: [Option<crate::arch::x86_64::rendezvous::StopIdentity>;
         crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
 }
 
 struct PreparedRemoteTaskGroupTermination {
     phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
-    prepared: crate::syscall::PreparedTaskGroupTermination<PROCESSES, HANDLES, THREADS>,
+    prepared: crate::syscall::PreparedTaskGroupTermination<PROCESSES, THREADS>,
     identities: [Option<crate::arch::x86_64::rendezvous::StopIdentity>;
         crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
 }
@@ -5490,8 +5490,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     fn prepare_process_exception_with_wait_cleanup(
         &mut self,
         exception: crate::task::TaskExceptionRecord,
-    ) -> Result<crate::syscall::PreparedProcessTermination<HANDLES, THREADS>, deepwyrm_abi::DwStatus>
-    {
+    ) -> Result<crate::syscall::PreparedProcessTermination<THREADS>, deepwyrm_abi::DwStatus> {
         let mut discarded: [Option<user_access::OwnedLiveUserOutput>; THREADS] =
             core::array::from_fn(|_| None);
         let mut atomic_pins: [Option<user_access::OwnedLiveAtomicU32>; THREADS] =
@@ -10943,8 +10942,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     fn prepare_process_exit_with_wait_cleanup(
         &mut self,
         exit_code: u32,
-    ) -> Result<crate::syscall::PreparedProcessTermination<HANDLES, THREADS>, deepwyrm_abi::DwStatus>
-    {
+    ) -> Result<crate::syscall::PreparedProcessTermination<THREADS>, deepwyrm_abi::DwStatus> {
         let mut discarded: [Option<user_access::OwnedLiveUserOutput>; THREADS] =
             core::array::from_fn(|_| None);
         let mut atomic_pins: [Option<user_access::OwnedLiveAtomicU32>; THREADS] =
@@ -11226,8 +11224,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         process: deepwyrm_abi::DwHandle,
         reason: deepwyrm_abi::DwTerminationReason,
         code: u32,
-    ) -> Result<crate::syscall::PreparedProcessTermination<HANDLES, THREADS>, deepwyrm_abi::DwStatus>
-    {
+    ) -> Result<crate::syscall::PreparedProcessTermination<THREADS>, deepwyrm_abi::DwStatus> {
         let mut discarded: [Option<user_access::OwnedLiveUserOutput>; THREADS] =
             core::array::from_fn(|_| None);
         let mut atomic_pins: [Option<user_access::OwnedLiveAtomicU32>; THREADS] =
@@ -11352,7 +11349,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         task_group: deepwyrm_abi::DwHandle,
         reason: deepwyrm_abi::DwTerminationReason,
     ) -> Result<
-        crate::syscall::PreparedTaskGroupTermination<PROCESSES, HANDLES, THREADS>,
+        crate::syscall::PreparedTaskGroupTermination<PROCESSES, THREADS>,
         deepwyrm_abi::DwStatus,
     > {
         let mut discarded: [Option<user_access::OwnedLiveUserOutput>; THREADS] =
@@ -11406,7 +11403,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     fn complete_task_group_termination(
         &mut self,
         phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
-        prepared: crate::syscall::PreparedTaskGroupTermination<PROCESSES, HANDLES, THREADS>,
+        prepared: crate::syscall::PreparedTaskGroupTermination<PROCESSES, THREADS>,
         permits: [Option<crate::arch::x86_64::rendezvous::RemoteStopReclaimPermit>;
             crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
     ) -> NativeSyscallResult {
@@ -11484,7 +11481,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     fn complete_process_termination(
         &mut self,
         phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
-        prepared: crate::syscall::PreparedProcessTermination<HANDLES, THREADS>,
+        prepared: crate::syscall::PreparedProcessTermination<THREADS>,
         permits: [Option<crate::arch::x86_64::rendezvous::RemoteStopReclaimPermit>;
             crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
     ) -> NativeSyscallResult {

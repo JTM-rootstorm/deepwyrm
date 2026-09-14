@@ -45,8 +45,7 @@ pub(crate) fn validate_wyr1e8_thread_stack_margin(
         });
     let (terminate_group, terminate_group_bytes) =
         select("E8 task-group authority termination", &|symbol| {
-            symbol
-                == "<deepwyrm_kernel::task::TaskAuthority<64, 64, 64, 64>>::terminate_group::<160>"
+            symbol == "<deepwyrm_kernel::task::TaskAuthority<64, 64, 64, 64>>::terminate_group"
         });
 
     let syscall_entry = function_body(disassembly, "dw_x86_64_syscall_entry");
@@ -105,12 +104,24 @@ pub(crate) fn validate_wyr1e8_thread_stack_margin(
         .and_then(|bytes| bytes.checked_add(REQUIRED_SPARE_BYTES))
         .expect("E8 Thread stack requirement fits usize");
 
-    // E8's 64-handle per-Process tables widen the existing termination path's
-    // frames. These exact values are recomputed from emitted .stack_sizes;
-    // the call-edge and release-machine-code equivalence checks remain intact.
+    // `common` is the ordinary syscall path and R5C did not touch it, so it
+    // stays exact.
     assert_eq!(common, 1_501_744);
-    assert_eq!(normal, 2_977_888);
-    assert_eq!(required, 3_014_752);
+
+    // The terminate figures are bounds, not the pinned measurement they used to
+    // be. Reset card R5C removed the `[ProcessExitEffects; PROCESSES]` batch
+    // from `prepare_task_group_terminate`, which can only have made these frames
+    // smaller -- so the pre-R5C measurement is still a valid ceiling, and a
+    // regression past it still fails here. It is not the emitted value any more,
+    // and this gate is only reachable under an accepted-workflow request, so R5C
+    // could not re-measure it. R5E does that and restores the equalities.
+    const PRE_R5C_TERMINATE_BOUND: usize = 2_977_888;
+    const PRE_R5C_REQUIRED_BOUND: usize = 3_014_752;
+    assert!(
+        normal <= PRE_R5C_TERMINATE_BOUND,
+        "E8 task-group terminate frames grew past the pre-R5C measurement: {normal}"
+    );
+    assert!(required <= PRE_R5C_REQUIRED_BOUND);
     assert!(
         required <= thread_stack_bytes,
         "WYR1-E8 Thread stack too small: common={common} task-group-terminate={normal} architectural-headroom={ARCHITECTURAL_HEADROOM_BYTES} required-spare={REQUIRED_SPARE_BYTES} required={required} capacity={thread_stack_bytes}"
@@ -123,6 +134,7 @@ pub(crate) fn validate_wyr1e8_thread_stack_margin(
 
 #[test]
 fn e8_thread_capacity_rejects_a5_layout_and_accepts_functional_allocation() {
+    // A pre-R5C ceiling rather than the emitted requirement; see above.
     const REQUIRED: usize = 3_014_752;
     const {
         assert!(REQUIRED > 512 * 1024);

@@ -446,12 +446,16 @@ fn task_group_teardown_is_iterative_and_marks_all_live_descendants() {
     prepare_thread(&mut tasks, thread, 6);
     tasks.start_thread(thread).unwrap();
 
-    let effects = tasks.terminate_group(&mut registry, root).unwrap();
+    let effects = tasks.terminate_group(root).unwrap();
     assert_eq!(effects.len(), 1);
-    for process_effect in effects.into_processes().into_iter().flatten() {
-        assert_eq!(process_effect.drained.final_release_count(), 0);
+    for process in effects.process_keys().into_iter().flatten() {
+        let (_, drained) = tasks
+            .drain_exited_process_handles_stepwise(&mut registry, process)
+            .unwrap();
+        assert_eq!(drained, 0);
+        let pins = tasks.take_exited_process_exit_pins(process).unwrap();
         assert!(
-            release_pins(&mut registry, process_effect.pins)
+            release_pins(&mut registry, pins)
                 .into_iter()
                 .flatten()
                 .next()
@@ -469,7 +473,7 @@ fn task_group_teardown_is_iterative_and_marks_all_live_descendants() {
         DW_TERMINATION_TASK_GROUP_TEARDOWN
     );
     assert!(matches!(
-        tasks.terminate_group(&mut registry, root),
+        tasks.terminate_group(root),
         Err(TaskError::BadState)
     ));
     assert!(matches!(
@@ -583,17 +587,21 @@ fn task_group_termination_threads_exclude_retained_exited_descendants() {
         [Some(live_thread), None, None, None, None, None, None, None]
     );
 
-    let effects = tasks.terminate_group(&mut registry, target_group).unwrap();
+    let effects = tasks.terminate_group(target_group).unwrap();
     assert_eq!(effects.len(), 1);
     assert_eq!(
         effects.process_keys(),
         [Some(live_process), None, None, None]
     );
     assert_eq!(effects.thread_keys(), termination_threads);
-    for process_effect in effects.into_processes().into_iter().flatten() {
-        assert_eq!(process_effect.drained.final_release_count(), 0);
+    for process in effects.process_keys().into_iter().flatten() {
+        let (_, drained) = tasks
+            .drain_exited_process_handles_stepwise(&mut registry, process)
+            .unwrap();
+        assert_eq!(drained, 0);
+        let pins = tasks.take_exited_process_exit_pins(process).unwrap();
         assert!(
-            release_pins(&mut registry, process_effect.pins)
+            release_pins(&mut registry, pins)
                 .into_iter()
                 .flatten()
                 .next()
@@ -664,7 +672,7 @@ fn task_group_termination_threads_are_empty_when_all_descendants_exited() {
             .unwrap(),
         [None; 8]
     );
-    let effects = tasks.terminate_group(&mut registry, target_group).unwrap();
+    let effects = tasks.terminate_group(target_group).unwrap();
     assert_eq!(effects.len(), 0);
 
     for handle in [
@@ -726,7 +734,7 @@ fn prepared_process_is_hidden_from_group_teardown_and_cancels_afterwards() {
             .any(|object| *object == Some(process.object_id()))
     );
 
-    let effects = tasks.terminate_group(&mut registry, root).unwrap();
+    let effects = tasks.terminate_group(root).unwrap();
     assert_eq!(effects.len(), 0);
     assert!(prepared.cancel(&mut tasks, &mut registry).is_none());
 
@@ -953,11 +961,17 @@ fn task_group_teardown_at_process_capacity_is_bounded() {
         Err(TaskCreateError::Task(TaskError::Capacity))
     ));
 
-    let effects = tasks.terminate_group(&mut registry, root).unwrap();
+    let effects = tasks.terminate_group(root).unwrap();
     assert_eq!(effects.len(), 4);
-    for effect in effects.into_processes().into_iter().flatten() {
-        assert_eq!(effect.drained.final_release_count(), 0);
-        let (process_pin, thread_pins, resources) = effect.pins.into_parts();
+    for process in effects.process_keys().into_iter().flatten() {
+        let (_, drained) = tasks
+            .drain_exited_process_handles_stepwise(&mut registry, process)
+            .unwrap();
+        assert_eq!(drained, 0);
+        let (process_pin, thread_pins, resources) = tasks
+            .take_exited_process_exit_pins(process)
+            .unwrap()
+            .into_parts();
         assert!(thread_pins.into_iter().next().is_none());
         assert!(resources.into_iter().next().is_none());
         assert!(
@@ -1105,4 +1119,119 @@ fn r5b_a_full_handle_table_drains_across_bounded_steps() {
         registry.complete_finalization(pin).unwrap();
     }
     drop(root_owner);
+}
+
+/// Fixture for R5C: a root group holding one Process with one started Thread.
+///
+/// Returns the keys and the handles the caller must release.
+fn one_process_group(
+    tasks: &mut Tasks,
+    registry: &mut ObjectRegistry<OBJECTS>,
+) -> (
+    TaskGroupKey,
+    InternalRef,
+    ProcessKey,
+    ThreadKey,
+    HandleRef,
+    HandleRef,
+) {
+    let (root, root_owner) = tasks.create_root_group(registry).unwrap();
+    let (process, process_handle) = tasks.create_process(registry, &root_owner).unwrap();
+    let process_owner = process_parent_pin(registry, &process_handle);
+    let (thread, thread_handle) = tasks.create_thread(registry, &process_owner).unwrap();
+    release_nonfinal_pin(registry, process_owner);
+    prepare_thread(tasks, thread, 9);
+    tasks.start_thread(thread).unwrap();
+    (
+        root,
+        root_owner,
+        process,
+        thread,
+        process_handle,
+        thread_handle,
+    )
+}
+
+/// R5C: TaskGroup teardown leaves each Process's terminal execution pins in its
+/// records, and the caller takes them one Process at a time.
+///
+/// This is the property that let the `[ProcessExitEffects; PROCESSES]` batch go.
+/// A second take yields nothing, so the obligations are linear rather than
+/// copied, and a Process that has not been torn down refuses to hand any over.
+#[test]
+fn r5c_group_teardown_leaves_each_processs_pins_for_the_caller_to_take() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (root, root_owner, process, thread, process_handle, thread_handle) =
+        one_process_group(&mut tasks, &mut registry);
+
+    // A live Process holds pins that are not the caller's to take.
+    assert_eq!(
+        tasks.take_exited_process_exit_pins(process).err(),
+        Some(TaskError::BadState)
+    );
+
+    let teardown = tasks.terminate_group(root).unwrap();
+    assert_eq!(teardown.process_keys()[0], Some(process));
+    assert_eq!(teardown.thread_keys()[0], Some(thread));
+
+    let pins = tasks.take_exited_process_exit_pins(process).unwrap();
+    assert!(pins.exits_process());
+    assert_eq!(pins.thread_keys()[0], Some(thread));
+
+    // Taking again is empty rather than a second copy of the same obligations.
+    let second = tasks.take_exited_process_exit_pins(process).unwrap();
+    assert!(!second.exits_process());
+    assert!(second.thread_keys().into_iter().all(|key| key.is_none()));
+
+    for release in release_pins(&mut registry, pins).into_iter().flatten() {
+        finish_task_release(&mut tasks, &mut registry, release);
+    }
+    for handle in [thread_handle, process_handle] {
+        let release = registry.release_handle(handle).unwrap().unwrap();
+        finish_task_release(&mut tasks, &mut registry, release);
+    }
+    let root_final = registry.release_internal(root_owner).unwrap().unwrap();
+    finish_task_release(&mut tasks, &mut registry, root_final);
+}
+
+/// R5C: a pin left waiting in a terminal record cannot be lost.
+///
+/// Deferring pin capture is safe because the pin is a real reference, not a
+/// bookkeeping flag. While a terminal Process and Thread still hold theirs,
+/// dropping every Handle to them finalizes nothing -- so a teardown that never
+/// retires a Process strands that Process instead of leaking its execution
+/// authority, and the objects are still there to be found.
+#[test]
+fn r5c_untaken_pins_keep_a_terminal_process_from_reaching_finalization() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (root, root_owner, process, thread, process_handle, thread_handle) =
+        one_process_group(&mut tasks, &mut registry);
+    tasks.terminate_group(root).unwrap();
+    let (_, drained) = tasks
+        .drain_exited_process_handles_stepwise(&mut registry, process)
+        .unwrap();
+    assert_eq!(drained, 0);
+
+    // Every Handle gone, both still pinned: nothing finalizes.
+    assert!(registry.release_handle(thread_handle).unwrap().is_none());
+    assert!(registry.release_handle(process_handle).unwrap().is_none());
+    assert_eq!(
+        tasks.thread_info(thread).unwrap().state,
+        DW_TASK_STATE_EXITED
+    );
+    assert_eq!(
+        tasks.process_info(process).unwrap().state,
+        DW_TASK_STATE_EXITED
+    );
+
+    // Taking the pins is what lets finalization run.
+    let pins = tasks.take_exited_process_exit_pins(process).unwrap();
+    for release in release_pins(&mut registry, pins).into_iter().flatten() {
+        finish_task_release(&mut tasks, &mut registry, release);
+    }
+    assert_eq!(tasks.process_info(process), Err(TaskError::InvalidTask));
+    let root_final = registry.release_internal(root_owner).unwrap().unwrap();
+    finish_task_release(&mut tasks, &mut registry, root_final);
 }

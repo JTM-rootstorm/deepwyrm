@@ -26,7 +26,7 @@
 //! R5's gate is that no hot syscall frame scales as
 //! `process_capacity x handles_per_process`. A batch that size cannot be made
 //! to fit by shrinking it; the shape has to change. This module is the storage
-//! the changed shape needs, and R5C and R5D migrate onto it.
+//! the changed shape needs; R5D decides whether the finalizer traversal uses it.
 //!
 //! # What replaces it
 //!
@@ -49,7 +49,7 @@
 //!
 //! R5A adds storage and changes no behaviour, so nothing calls this yet.
 //!
-//! # What R5B did not use this for
+//! # What R5B and R5C did not use this for
 //!
 //! R5B converted the Process handle drain to bounded steps without opening a
 //! transaction here. What this arena adds over a plain loop is a record that
@@ -57,13 +57,27 @@
 //! suspension. The Process handle drain suspends across nothing -- it runs to
 //! completion inside one syscall, and its finalizers go straight to the
 //! caller's `CleanupQueue` -- so routing it through a slot would have cost a
-//! copy and a lock per window and bought no property the loop lacks. R5C's
-//! per-Process progress across remote-stop acknowledgement and R5D's finalizer
-//! traversal are the migrations this storage exists for.
+//! copy and a lock per window and bought no property the loop lacks.
+//!
+//! R5C then removed the `[ProcessExitEffects; PROCESSES]` batch without a
+//! transaction either, and for a sharper reason: the obligations it needed to
+//! hold across the remote-stop boundary were already in durable storage. A
+//! terminal Thread's execution pin sits in its own `ThreadRecord` until someone
+//! takes it, and because the pin is a real object reference the record cannot
+//! reach finalization while it is there. Moving those pins into an arena slot
+//! would have copied them out of one static home into another and added a
+//! bound -- `SLOTS x WINDOW` -- that the records do not have.
+//!
+//! That leaves R5D's finalizer traversal as the migration this storage exists
+//! for, and leaves a fair question against it: if the task records can hold
+//! obligations across a boundary, what does a transaction add? Its distinct
+//! properties are an explicit *stage* and *cursor* for work that has no record
+//! of its own to live in, and a refusal to close while holding any. R5D decides
+//! whether the traversal needs them.
 
 #![allow(
     dead_code,
-    reason = "R5C and R5D migrate the termination paths onto this storage"
+    reason = "R5D decides whether the finalizer traversal migrates onto this storage"
 )]
 
 use super::{ProcessKey, TaskGroupKey, ThreadExecutionResources};

@@ -54,10 +54,10 @@ use crate::memory::usercopy::{
 use crate::object::{FinalRelease, HandleRef, InternalRef, ObjectRegistry, ObjectRegistryError};
 use crate::task::{
     BlockWakeKey, DeferredCurrentExecutionResources, ExecutionDomain, ExecutionResourceError,
-    ExecutionSwitchError, IdleScheduleDecision, PreparedProcess, ProcessExitEffects, ProcessKey,
+    ExecutionSwitchError, GroupTeardown, IdleScheduleDecision, PreparedProcess, ProcessKey,
     ResourceClaimMembershipError, RetiredExitPins, ScheduleDecision, SchedulerError,
     SchedulerThreadState, StartThreadError, TaskAuthority, TaskCreateError, TaskError,
-    TaskExceptionRecord, TaskGroupKey, TaskGroupTerminationEffects, ThreadKey, ThreadStartState,
+    TaskExceptionRecord, TaskGroupKey, ThreadKey, ThreadStartState,
 };
 use crate::time::{TimerAuthority, TimerCreateError, TimerDeadlineAuthority, TimerError, TimerKey};
 use crate::wait::{
@@ -1363,24 +1363,20 @@ pub(crate) struct PreparedThreadTermination<const THREADS: usize> {
 /// acknowledgement. Logical task state is already terminal, but no execution
 /// resources in this batch may be reclaimed until completion consumes it.
 #[must_use = "prepared TaskGroup termination must be completed after remote execution owners are stopped"]
-pub(crate) struct PreparedTaskGroupTermination<
-    const PROCESSES: usize,
-    const HANDLES: usize,
-    const THREADS: usize,
-> {
-    effects: TaskGroupTerminationEffects<PROCESSES, HANDLES, THREADS>,
+pub(crate) struct PreparedTaskGroupTermination<const PROCESSES: usize, const THREADS: usize> {
+    teardown: GroupTeardown<PROCESSES, THREADS>,
     pre_retired: PreRetiredTerminalThreads<THREADS>,
 }
 
-impl<const PROCESSES: usize, const HANDLES: usize, const THREADS: usize>
-    PreparedTaskGroupTermination<PROCESSES, HANDLES, THREADS>
+impl<const PROCESSES: usize, const THREADS: usize>
+    PreparedTaskGroupTermination<PROCESSES, THREADS>
 {
     pub(crate) const fn process_keys(&self) -> [Option<ProcessKey>; PROCESSES] {
-        self.effects.process_keys()
+        self.teardown.process_keys()
     }
 
-    pub(crate) fn thread_keys(&self) -> [Option<ThreadKey>; THREADS] {
-        self.effects.thread_keys()
+    pub(crate) const fn thread_keys(&self) -> [Option<ThreadKey>; THREADS] {
+        self.teardown.thread_keys()
     }
 
     pub(crate) fn contains_thread(&self, thread: ThreadKey) -> bool {
@@ -5127,7 +5123,7 @@ fn collect_group_effects<
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
     waits: &WaitRegistry<WAITERS>,
-    effects: TaskGroupTerminationEffects<PROCESSES, HANDLES, THREADS>,
+    teardown: GroupTeardown<PROCESSES, THREADS>,
     pre_retired: &mut PreRetiredTerminalThreads<THREADS>,
     defer_current: DeferredCurrentRetirement,
     remotely_stopped: &[Option<ThreadKey>],
@@ -5135,7 +5131,7 @@ fn collect_group_effects<
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> Option<DeferredCurrentExecutionResources> {
     let current_thread = defer_current.thread();
-    let terminal_threads = effects.thread_keys();
+    let terminal_threads = teardown.thread_keys();
     assert!(
         remotely_stopped
             .iter()
@@ -5143,92 +5139,122 @@ fn collect_group_effects<
             .all(|thread| terminal_threads.contains(&Some(*thread))),
         "remote-stop permit named a Thread outside the TaskGroup terminal batch"
     );
-    let mut processes = effects.into_processes();
-    let mut current_process = None;
-    for process in &mut processes {
-        let contains_current = process.as_ref().is_some_and(|effects| {
-            effects
-                .pins
-                .thread_keys()
-                .into_iter()
-                .flatten()
-                .any(|thread| thread == current_thread)
-        });
-        if contains_current {
-            assert!(
-                current_process.is_none(),
-                "group retirement produced duplicate current-Thread process batches"
-            );
-            current_process = process.take();
-        }
-    }
+    let processes = teardown.process_keys();
 
-    // Retire every non-current batch first so scheduler.current() continues to
-    // identify the physical Thread whose stack is executing this syscall.  The
-    // current batch must be the final scheduler mutation before architecture
+    // The Process the calling Thread belongs to is retired last, and only when
+    // this teardown actually made that Thread terminal. Asking the authority
+    // which Process owns the Thread replaces scanning per-Process pin batches
+    // for it, and is exact rather than inferred from a batch's contents.
+    let current_owner = terminal_threads
+        .contains(&Some(current_thread))
+        .then(|| tasks.thread_process(current_thread).ok())
+        .flatten()
+        .filter(|process| processes.contains(&Some(*process)));
+
+    // Retire every non-current Process first so scheduler.current() continues to
+    // identify the physical Thread whose stack is executing this syscall. The
+    // current Process must be the final scheduler mutation before architecture
     // code diverges onto the terminal reaper stack.
     for process in processes.into_iter().flatten() {
-        let terminal_threads = process.pins.thread_keys();
-        let mut batch_remote = [None; THREADS];
-        let mut remote_count = 0;
-        for thread in remotely_stopped.iter().flatten() {
-            if terminal_threads.contains(&Some(*thread)) {
-                assert!(remote_count < THREADS, "group remote-stop batch overflow");
-                batch_remote[remote_count] = Some(*thread);
-                remote_count += 1;
-            }
+        if Some(process) == current_owner {
+            continue;
         }
-        let ProcessExitEffects { drained, pins } = process;
-        for release in drained.into_final_releases().into_iter().flatten() {
-            cleanup.push(release);
-        }
-        let deferred = collect_process_effects(
+        let deferred = retire_one_group_process(
             registry,
             tasks,
             execution,
             waits,
-            pins,
+            process,
             pre_retired,
-            Some(defer_current),
-            &batch_remote,
+            defer_current,
+            remotely_stopped,
             terminal_waits,
             cleanup,
         );
         assert!(
             deferred.is_none(),
-            "non-current group batch produced deferred current resources"
+            "non-current group Process produced deferred current resources"
         );
     }
 
-    current_process.map(|process| {
-        let terminal_threads = process.pins.thread_keys();
-        let mut batch_remote = [None; THREADS];
-        let mut remote_count = 0;
-        for thread in remotely_stopped.iter().flatten() {
-            if terminal_threads.contains(&Some(*thread)) {
-                assert!(remote_count < THREADS, "group remote-stop batch overflow");
-                batch_remote[remote_count] = Some(*thread);
-                remote_count += 1;
-            }
-        }
-        let ProcessExitEffects { drained, pins } = process;
-        for release in drained.into_final_releases().into_iter().flatten() {
-            cleanup.push(release);
-        }
-        collect_process_effects(
+    current_owner.map(|process| {
+        retire_one_group_process(
             registry,
             tasks,
             execution,
             waits,
-            pins,
+            process,
             pre_retired,
-            Some(defer_current),
-            &batch_remote,
+            defer_current,
+            remotely_stopped,
             terminal_waits,
             cleanup,
         )
-        .expect("current group batch did not preserve deferred execution ownership")
+        .expect("current group Process did not preserve deferred execution ownership")
     })
+}
+
+/// Drains and retires exactly one terminal Process of a TaskGroup teardown.
+///
+/// Only this Process's pins and one drain window occupy a frame, which is what
+/// replaced the `PROCESSES`-wide batch.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the terminal path's authorities are deliberately separate borrows"
+)]
+fn retire_one_group_process<
+    C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const HANDLES: usize,
+    const THREADS: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
+    process: ProcessKey,
+    pre_retired: &mut PreRetiredTerminalThreads<THREADS>,
+    defer_current: DeferredCurrentRetirement,
+    remotely_stopped: &[Option<ThreadKey>],
+    terminal_waits: &mut C,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> Option<DeferredCurrentExecutionResources> {
+    let pins = tasks
+        .take_exited_process_exit_pins(process)
+        .unwrap_or_else(|error| {
+            panic!("TaskGroup teardown lost a terminal Process's execution pins: {error:?}")
+        });
+    drain_exited_process_handles_staged(registry, tasks, process, cleanup).unwrap_or_else(
+        |error| {
+            panic!("TaskGroup teardown could not drain a terminal Process's handles: {error:?}")
+        },
+    );
+    let terminal_threads = pins.thread_keys();
+    let mut batch_remote = [None; THREADS];
+    let mut remote_count = 0;
+    for thread in remotely_stopped.iter().flatten() {
+        if terminal_threads.contains(&Some(*thread)) {
+            assert!(remote_count < THREADS, "group remote-stop batch overflow");
+            batch_remote[remote_count] = Some(*thread);
+            remote_count += 1;
+        }
+    }
+    collect_process_effects(
+        registry,
+        tasks,
+        execution,
+        waits,
+        pins,
+        pre_retired,
+        Some(defer_current),
+        &batch_remote,
+        terminal_waits,
+        cleanup,
+    )
 }
 
 fn authorized_reason(reason: DwTerminationReason) -> Result<(), DwStatus> {
@@ -5425,7 +5451,7 @@ pub(crate) fn prepare_task_group_terminate<
     task_group: DwHandle,
     reason: DwTerminationReason,
     cleanup: &mut CleanupQueue<OBJECTS>,
-) -> Result<PreparedTaskGroupTermination<PROCESSES, HANDLES, THREADS>, DwStatus> {
+) -> Result<PreparedTaskGroupTermination<PROCESSES, THREADS>, DwStatus> {
     authorized_reason(reason)?;
     validate_running_caller(tasks, execution, current_process, current_thread)?;
     let pin = resolve_current_handle(
@@ -5437,8 +5463,8 @@ pub(crate) fn prepare_task_group_terminate<
         DW_RIGHT_MODIFY,
     )?;
     let key = TaskGroupKey::from_object_id(pin.id());
-    let effects = match tasks.terminate_group(registry, key) {
-        Ok(effects) => effects,
+    let teardown = match tasks.terminate_group(key) {
+        Ok(teardown) => teardown,
         Err(TaskError::OperationsInFlight) => {
             let threads = match tasks.task_group_thread_keys(key) {
                 Ok(threads) => threads,
@@ -5451,8 +5477,8 @@ pub(crate) fn prepare_task_group_terminate<
                 terminal_waits
                     .cleanup_terminal_wait(registry, tasks, waits, execution, thread, cleanup);
             }
-            match tasks.terminate_group(registry, key) {
-                Ok(effects) => effects,
+            match tasks.terminate_group(key) {
+                Ok(teardown) => teardown,
                 Err(error) => {
                     release_lookup_pin(registry, pin, cleanup);
                     return Err(task_status(error));
@@ -5465,10 +5491,10 @@ pub(crate) fn prepare_task_group_terminate<
         }
     };
     let pre_retired =
-        PreRetiredTerminalThreads::new(execution.quiesce_terminal_threads(effects.thread_keys()));
+        PreRetiredTerminalThreads::new(execution.quiesce_terminal_threads(teardown.thread_keys()));
     release_lookup_pin(registry, pin, cleanup);
     Ok(PreparedTaskGroupTermination {
-        effects,
+        teardown,
         pre_retired,
     })
 }
@@ -5490,7 +5516,7 @@ pub(crate) fn complete_prepared_task_group_termination<
     terminal_waits: &mut C,
     current_process: ProcessKey,
     current_thread: ThreadKey,
-    prepared: PreparedTaskGroupTermination<PROCESSES, HANDLES, THREADS>,
+    prepared: PreparedTaskGroupTermination<PROCESSES, THREADS>,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> (
     DwStatus,
@@ -5498,7 +5524,7 @@ pub(crate) fn complete_prepared_task_group_termination<
     Option<DeferredCurrentExecutionResources>,
 ) {
     let PreparedTaskGroupTermination {
-        effects,
+        teardown,
         mut pre_retired,
     } = prepared;
     let deferred = collect_group_effects(
@@ -5506,7 +5532,7 @@ pub(crate) fn complete_prepared_task_group_termination<
         tasks,
         execution,
         waits,
-        effects,
+        teardown,
         &mut pre_retired,
         DeferredCurrentRetirement::Model(current_thread),
         &[],
@@ -5541,7 +5567,7 @@ pub(crate) fn complete_prepared_task_group_termination_after_remote_stops_on<
     current_cpu: crate::cpu::CpuIndex,
     current_process: ProcessKey,
     current_thread: ThreadKey,
-    prepared: PreparedTaskGroupTermination<PROCESSES, HANDLES, THREADS>,
+    prepared: PreparedTaskGroupTermination<PROCESSES, THREADS>,
     permits: [Option<crate::arch::x86_64::rendezvous::RemoteStopReclaimPermit>;
         crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
     cleanup: &mut CleanupQueue<OBJECTS>,
@@ -5554,7 +5580,7 @@ pub(crate) fn complete_prepared_task_group_termination_after_remote_stops_on<
         .each_ref()
         .map(|permit| permit.as_ref().map(|permit| permit.thread()));
     let PreparedTaskGroupTermination {
-        effects,
+        teardown,
         mut pre_retired,
     } = prepared;
     let deferred = collect_group_effects(
@@ -5562,7 +5588,7 @@ pub(crate) fn complete_prepared_task_group_termination_after_remote_stops_on<
         tasks,
         execution,
         waits,
-        effects,
+        teardown,
         &mut pre_retired,
         DeferredCurrentRetirement::Handoff {
             cpu: current_cpu,

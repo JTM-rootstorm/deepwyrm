@@ -4980,7 +4980,7 @@ fn task_group_termination_inspection_omits_retained_exited_descendants() {
         tasks.task_group_thread_keys(target_group).unwrap(),
         [Some(exited_thread), None]
     );
-    let prepared = tasks.terminate_group(&mut registry, target_group).unwrap();
+    let prepared = tasks.terminate_group(target_group).unwrap();
     assert_eq!(prepared.len(), 0);
     assert_eq!(prepared.thread_keys(), inspected);
 
@@ -10627,14 +10627,7 @@ fn process_create_resolves_authorities_in_contract_order_without_publication() {
     .unwrap();
     let parent = TaskGroupKey::from_object_id(parent_pin.id());
     release_lookup_pin(&mut fixture.registry, parent_pin, &mut cleanup);
-    assert_eq!(
-        fixture
-            .tasks
-            .terminate_group(&mut fixture.registry, parent)
-            .unwrap()
-            .len(),
-        0
-    );
+    assert_eq!(fixture.tasks.terminate_group(parent).unwrap().len(), 0);
     assert_eq!(
         process_create(
             &mut fixture.user,
@@ -11159,4 +11152,48 @@ fn r5b_the_prepared_process_record_no_longer_scales_with_handle_capacity() {
             + size_of::<ProcessKey>()
     );
     assert_eq!(size_of::<crate::handle::DrainResult<128>>(), 4_104);
+}
+
+/// R5C: what crosses the TaskGroup teardown's prepare/complete boundary, and
+/// that it no longer scales as `PROCESSES x HANDLES`.
+///
+/// `PreparedTaskGroupTermination` used to carry a
+/// `TaskGroupTerminationEffects<PROCESSES, HANDLES, THREADS>` -- every Process's
+/// handle finalizers and execution pins, by value -- and was moved through
+/// `prepare`, the completion, and `collect_group_effects`. Measured at the E8
+/// geometry (`PROCESSES = THREADS = HANDLES = 64`):
+///
+/// | | Bytes |
+/// | --- | ---: |
+/// | the batch it carried, before | 365,064 |
+/// | `PreparedTaskGroupTermination`, before | 366,600 |
+/// | `PreparedTaskGroupTermination`, after | 4,624 |
+/// | `GroupTeardown<64, 64>` | 3,088 |
+///
+/// The obligations did not move to another frame: they stay in the task records
+/// until `retire_one_group_process` takes one Process's worth at a time, so the
+/// live cost is `GroupTeardown` plus a single `ExitPins` plus one drain window.
+#[test]
+fn r5c_the_prepared_group_record_no_longer_scales_with_process_capacity() {
+    assert_eq!(size_of::<crate::task::GroupTeardown<64, 64>>(), 3_088);
+    assert_eq!(
+        size_of::<super::PreparedTaskGroupTermination<64, 64>>(),
+        4_624
+    );
+    assert_eq!(
+        size_of::<super::PreparedTaskGroupTermination<64, 64>>(),
+        size_of::<crate::task::GroupTeardown<64, 64>>()
+            + size_of::<super::PreRetiredTerminalThreads<64>>()
+    );
+
+    // Handle capacity cannot reach the record at all: it is no longer one of the
+    // record's parameters. Process capacity reaches only a key list.
+    assert_eq!(
+        size_of::<super::PreparedTaskGroupTermination<128, 64>>()
+            - size_of::<super::PreparedTaskGroupTermination<64, 64>>(),
+        64 * size_of::<Option<ProcessKey>>()
+    );
+
+    // One Process's worth of live obligations, which is the peak the loop holds.
+    assert_eq!(size_of::<crate::task::ExitPins<64>>(), 3_624);
 }

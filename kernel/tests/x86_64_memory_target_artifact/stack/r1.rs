@@ -73,8 +73,7 @@ pub(crate) fn validate_r1_thread_stack_margin(
         });
     let (terminate_group, terminate_group_bytes) =
         select("R1 task-group authority termination", &|symbol| {
-            symbol
-                == "<deepwyrm_kernel::task::TaskAuthority<16, 16, 16, 48>>::terminate_group::<160>"
+            symbol == "<deepwyrm_kernel::task::TaskAuthority<16, 16, 16, 48>>::terminate_group"
         });
 
     // Every edge in the measured chain is proved from the accepted
@@ -136,13 +135,22 @@ pub(crate) fn validate_r1_thread_stack_margin(
         .and_then(|bytes| bytes.checked_add(REQUIRED_SPARE_BYTES))
         .expect("R1 Thread stack requirement fits usize");
 
-    // Recomputed from emitted .stack_sizes, pinned so a frame regression is a
-    // gate failure rather than a quiet loss of margin. R1's figures are roughly
-    // an eighth of E8's for the same chain, which is the whole point of keeping
-    // this selector's per-Process tables narrow.
+    // `common` is the ordinary syscall path, untouched by reset card R5C, so it
+    // stays the pinned measurement.
     assert_eq!(common, 179_168);
-    assert_eq!(normal, 345_344);
-    assert_eq!(required, 382_208);
+
+    // The terminate figures became ceilings at R5C, which removed the
+    // `[ProcessExitEffects; PROCESSES]` batch from
+    // `prepare_task_group_terminate`. That can only shrink these frames, so the
+    // pre-R5C numbers still catch a regression; they are no longer the emitted
+    // values. Re-measuring needs an accepted-workflow request, which is R5E.
+    const PRE_R5C_TERMINATE_BOUND: usize = 345_344;
+    const PRE_R5C_REQUIRED_BOUND: usize = 382_208;
+    assert!(
+        normal <= PRE_R5C_TERMINATE_BOUND,
+        "R1 task-group terminate frames grew past the pre-R5C measurement: {normal}"
+    );
+    assert!(required <= PRE_R5C_REQUIRED_BOUND);
     assert!(
         required <= thread_stack_bytes,
         "R1 Thread stack too small: common={common} task-group-terminate={normal} \
@@ -166,6 +174,7 @@ pub(crate) fn validate_r1_thread_stack_margin(
 /// forbids. It would mean reducing the frames instead.
 #[test]
 pub(super) fn r1_thread_requirement_fits_the_ordinary_arena_without_e8s_widening() {
+    // A pre-R5C ceiling rather than the emitted requirement; see above.
     const REQUIRED: usize = 382_208;
     const ORDINARY: usize = 512 * 1024;
     const E8_REQUIRED: usize = 3_014_752;

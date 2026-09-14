@@ -699,11 +699,6 @@ impl<const THREADS: usize> ExitPins<THREADS> {
     }
 }
 
-pub(crate) struct ProcessExitEffects<const HANDLES: usize, const THREADS: usize> {
-    pub(crate) drained: DrainResult<HANDLES>,
-    pub(crate) pins: ExitPins<THREADS>,
-}
-
 pub(crate) struct TaskAuthority<
     const GROUPS: usize,
     const PROCESSES: usize,
@@ -769,62 +764,60 @@ pub(crate) enum TaskCreateError {
     Task(TaskError),
 }
 
-#[must_use = "TaskGroup teardown effects contain handle finalizers and execution pins to release outside task ownership"]
-pub(crate) struct TaskGroupTerminationEffects<
-    const PROCESSES: usize,
-    const HANDLES: usize,
-    const THREADS: usize,
-> {
-    process_keys: [Option<ProcessKey>; PROCESSES],
-    processes: [Option<ProcessExitEffects<HANDLES, THREADS>>; PROCESSES],
-    count: usize,
+/// The Processes and Threads one TaskGroup teardown made terminal.
+///
+/// This replaces the `[ProcessExitEffects; PROCESSES]` batch reset card R5C
+/// removed. That batch carried every Process's handle finalizers and execution
+/// pins by value, so it measured 365,064 bytes at the E8 geometry and was moved
+/// through four frames. What a caller actually needs across the prepare/complete
+/// boundary is *which* Processes and Threads went terminal: the obligations
+/// themselves stay in the task records, and the caller takes them one Process at
+/// a time when it retires that Process.
+#[must_use = "a gated TaskGroup teardown must be driven to completion or its terminal records keep their execution pins"]
+pub(crate) struct GroupTeardown<const PROCESSES: usize, const THREADS: usize> {
+    processes: [Option<ProcessKey>; PROCESSES],
+    threads: [Option<ThreadKey>; THREADS],
+    process_count: usize,
+    thread_count: usize,
 }
 
-impl<const PROCESSES: usize, const HANDLES: usize, const THREADS: usize>
-    TaskGroupTerminationEffects<PROCESSES, HANDLES, THREADS>
-{
+impl<const PROCESSES: usize, const THREADS: usize> GroupTeardown<PROCESSES, THREADS> {
     fn empty() -> Self {
         Self {
-            process_keys: [None; PROCESSES],
-            processes: core::array::from_fn(|_| None),
-            count: 0,
+            processes: [None; PROCESSES],
+            threads: [None; THREADS],
+            process_count: 0,
+            thread_count: 0,
         }
     }
 
-    fn push(&mut self, process: ProcessKey, effects: ProcessExitEffects<HANDLES, THREADS>) {
+    fn push_process(&mut self, process: ProcessKey) {
         assert!(
-            self.count < PROCESSES,
-            "TaskGroup process-effect batch overflow"
+            self.process_count < PROCESSES,
+            "TaskGroup teardown Process list overflow"
         );
-        self.process_keys[self.count] = Some(process);
-        self.processes[self.count] = Some(effects);
-        self.count += 1;
+        self.processes[self.process_count] = Some(process);
+        self.process_count += 1;
+    }
+
+    fn push_thread(&mut self, thread: ThreadKey) {
+        assert!(
+            self.thread_count < THREADS,
+            "TaskGroup teardown Thread list overflow"
+        );
+        self.threads[self.thread_count] = Some(thread);
+        self.thread_count += 1;
     }
 
     pub(crate) const fn len(&self) -> usize {
-        self.count
+        self.process_count
     }
 
     pub(crate) const fn process_keys(&self) -> [Option<ProcessKey>; PROCESSES] {
-        self.process_keys
-    }
-
-    pub(crate) fn thread_keys(&self) -> [Option<ThreadKey>; THREADS] {
-        let mut keys = [None; THREADS];
-        let mut count = 0;
-        for effects in self.processes.iter().flatten() {
-            for thread in effects.pins.thread_keys().into_iter().flatten() {
-                assert!(count < THREADS, "TaskGroup thread-key batch overflow");
-                keys[count] = Some(thread);
-                count += 1;
-            }
-        }
-        keys
-    }
-
-    pub(crate) fn into_processes(
-        self,
-    ) -> [Option<ProcessExitEffects<HANDLES, THREADS>>; PROCESSES] {
         self.processes
+    }
+
+    pub(crate) const fn thread_keys(&self) -> [Option<ThreadKey>; THREADS] {
+        self.threads
     }
 }
