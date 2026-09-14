@@ -1732,6 +1732,21 @@ pub(crate) extern "sysv64" fn dw_x86_64_timer_interrupt_dispatch() {
         crate::arch::x86_64::syscall::publish_current_quantum_expiry(ticket)
             .unwrap_or_else(|_| halt_forever());
     }
+    // A wake resolved above only *stages* its runnable-work notification; the
+    // e1 IPI that actually reaches a halted target CPU is sent by
+    // `drain_runnable_work_notifications`. Every other staging path drains on
+    // its own return -- `dispatch_native` for syscalls, `poll_idle_suspend` for
+    // the kernel root, the selector-private raw wrappers for theirs -- but this
+    // interrupt has no such return. It resumes whatever CPU0 was doing, which
+    // may be ring 3 for an unbounded time, so nothing else on this CPU is
+    // guaranteed to reach a drain. Without this one a `Timeout` winner can be
+    // claimed, its Thread published Runnable against an idle CPU, and that CPU
+    // never woken: reset card R1C's stall, where two APs sat `hlt` with
+    // `runnable_here: 1` and no reschedule pending for 300 seconds.
+    //
+    // This runs after EOI and after every handler has released the time,
+    // scheduler and blocked-operation locks, and the drain itself is lock-free.
+    crate::task::drain_runnable_work_notifications();
 }
 
 fn read_pm_timer(descriptor: PmTimerDescriptor) -> u32 {

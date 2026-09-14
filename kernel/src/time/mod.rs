@@ -78,3 +78,80 @@ pub(crate) use live::{
     pending_q35_bsp_retirement_check, publish_q35_bsp_retirement_check, q35_bsp_vector_is_clear,
     q35_current_cpu_is_bsp, request_q35_bsp_terminal_check,
 };
+
+/// Source contract for the one wake-delivery seam no host test can execute.
+///
+/// `live.rs` compiles only for the bare x86-64 target, so nothing here runs the
+/// timer interrupt. What this gate can do is hold the ordering the interrupt
+/// depends on: a wake resolved inside it stages a runnable-work notification,
+/// and only `drain_runnable_work_notifications` turns that staging into the e1
+/// IPI a halted CPU needs. The interrupt has no syscall or idle-poll return to
+/// inherit a drain from, so it must perform its own, after the handlers. Reset
+/// card R1C's 300-second stall was exactly this drain being absent.
+#[cfg(test)]
+mod live_wake_delivery_contract {
+    const DISPATCH: &str = "pub(crate) extern \"sysv64\" fn dw_x86_64_timer_interrupt_dispatch()";
+    const DRAIN: &str = "crate::task::drain_runnable_work_notifications();";
+
+    fn dispatch_body() -> &'static str {
+        let source = include_str!("live.rs");
+        let start = source
+            .find(DISPATCH)
+            .expect("the live timer interrupt dispatch is still named as the assembly entry calls it");
+        let body = &source[start..];
+        let end = body
+            .find("\nfn read_pm_timer(")
+            .expect("the timer dispatch is still followed by read_pm_timer");
+        &body[..end]
+    }
+
+    #[test]
+    fn the_timer_interrupt_publishes_the_wakes_it_stages() {
+        let body = dispatch_body();
+        let drain = body
+            .find(DRAIN)
+            .expect("the timer interrupt must drain the runnable-work notifications it stages");
+        assert_eq!(
+            body.matches(DRAIN).count(),
+            1,
+            "one drain at the end of the dispatch covers every staging path inside it"
+        );
+        for handler in [
+            "(binding.handler)(binding.context, key);",
+            "(binding.handler)(binding.context, token);",
+        ] {
+            let invocation = body.split(handler).next().unwrap().len();
+            assert!(
+                invocation < drain,
+                "the drain must follow {handler}, not precede it"
+            );
+        }
+        let quantum = body
+            .find("publish_current_quantum_expiry(ticket)")
+            .expect("the dispatch still publishes a due scheduler quantum");
+        assert!(
+            quantum < drain,
+            "the drain belongs at the end of the dispatch, after quantum publication"
+        );
+    }
+
+    #[test]
+    fn the_deadline_wake_target_does_not_drain_for_the_interrupt() {
+        // The wake target runs inside the interrupt with the scheduler and
+        // blocked-operation locks live. If a drain is ever added there instead,
+        // this gate fails rather than letting an IPI be sent under those locks.
+        let source = include_str!("live.rs");
+        let target = source
+            .split("pub(crate) trait DeadlineWakeTarget")
+            .nth(1)
+            .expect("the deadline wake-target trait still declares the interrupt callback");
+        let trampoline = target
+            .split("fn wake_binding()")
+            .next()
+            .expect("the wake trampoline still precedes the binding accessor");
+        assert!(
+            !trampoline.contains(DRAIN),
+            "notification delivery belongs to the dispatch, outside the handler's locks"
+        );
+    }
+}
