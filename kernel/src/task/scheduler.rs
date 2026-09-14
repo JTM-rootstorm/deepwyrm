@@ -1372,10 +1372,47 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         &mut self,
         target: SchedulerCpuId,
     ) -> Result<Option<PendingMigration>, SchedulerError> {
+        self.pull_oldest_for(target, false)
+    }
+
+    /// Bounded load recovery for a CPU that is *not* idle, per
+    /// `DW1_A0_PREEMPTIVE_SCHEDULER_CONTRACT.md` §5 as amended by R4C.
+    ///
+    /// §5 offers stealing only to a CPU that reaches idle, and R4A measured
+    /// that a saturated system never offers it at all, so an imbalance among
+    /// busy CPUs was permanent. This runs at quantum expiry instead.
+    ///
+    /// It moves at most one entry, and only from a victim carrying at least two
+    /// more than this CPU. That threshold is what makes it converge: after the
+    /// move the victim still carries at least as much as this CPU, so a move
+    /// that would merely swap the imbalance is refused. This is a repair, not a
+    /// rotation, and it grants no fairness or latency guarantee.
+    fn rebalance_pull_for(
+        &mut self,
+        target: SchedulerCpuId,
+    ) -> Result<Option<PendingMigration>, SchedulerError> {
+        self.pull_oldest_for(target, true)
+    }
+
+    fn pull_oldest_for(
+        &mut self,
+        target: SchedulerCpuId,
+        rebalance: bool,
+    ) -> Result<Option<PendingMigration>, SchedulerError> {
         let mask = self.schedulable_mask();
+        let threshold = rebalance
+            .then(|| self.runnable_depths()[target.index()].checked_add(2))
+            .flatten();
+        if rebalance && threshold.is_none() {
+            return Ok(None);
+        }
+        let depths = self.runnable_depths();
         for offset in 1..H2_SCHEDULER_CPU_CAPACITY {
             let victim_index = (target.index() + offset) % H2_SCHEDULER_CPU_CAPACITY;
             if mask & (1_u64 << victim_index) == 0 {
+                continue;
+            }
+            if threshold.is_some_and(|threshold| depths[victim_index] < threshold) {
                 continue;
             }
             let victim = SchedulerCpuId::new(victim_index).expect("bounded scheduler CPU index");
@@ -2603,6 +2640,11 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         {
             return Ok(SchedulerPreemptionDecision::Deferred);
         }
+        // R4C: quantum expiry is the only recurring scheduling point a
+        // saturated CPU reaches, so load recovery is offered here as well as at
+        // the idle path §5 describes. A refused pull costs one bounded victim
+        // scan under a lock this transition already holds.
+        let pulled = state.rebalance_pull_for(cpu)?;
         let Some(next_entry) = state.queue[..state.len]
             .iter()
             .flatten()
@@ -2613,6 +2655,9 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             })
             .copied()
         else {
+            if let Some(pending) = pulled {
+                state.rollback_pending_migration(pending);
+            }
             state.need_resched[cpu_index] = None;
             state.assert_invariants();
             return Ok(SchedulerPreemptionDecision::RetainCurrent {
@@ -2621,10 +2666,15 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         };
 
         let enqueue_generation = state.next_enqueue_generation;
-        let next_enqueue_generation = enqueue_generation
+        let Some(next_enqueue_generation) = enqueue_generation
             .checked_add(1)
             .filter(|next| *next != 0)
-            .ok_or(SchedulerError::TokenExhausted)?;
+        else {
+            if let Some(pending) = pulled {
+                state.rollback_pending_migration(pending);
+            }
+            return Err(SchedulerError::TokenExhausted);
+        };
         let mut accounting = state.accounting;
         let accounting_result = accounting
             .decrement_runnable(next_entry.target_cpu)
@@ -2638,12 +2688,21 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             .and_then(|()| accounting.increment_runnable(cpu))
             .and_then(|()| accounting.increment(cpu, SchedulerEvent::ContextSwitch));
         if let Err(error) = accounting_result {
+            if let Some(pending) = pulled {
+                state.rollback_pending_migration(pending);
+            }
             state.reject_accounting(accounting, error);
             return Err(error);
         }
-        let next = state
-            .claim_first_runnable_on(cpu)?
-            .expect("validated normal Runnable peer remains claimable");
+        let next = match state.claim_first_runnable_on(cpu) {
+            Ok(next) => next.expect("validated normal Runnable peer remains claimable"),
+            Err(error) => {
+                if let Some(pending) = pulled {
+                    state.rollback_pending_migration(pending);
+                }
+                return Err(error);
+            }
+        };
         state.running[cpu_index] = Some(next);
         let ready_at_ns = state.instrumentation_global_now_ns;
         state

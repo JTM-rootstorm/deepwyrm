@@ -191,6 +191,18 @@ DW1 scan deadlock-free. A failed/stale candidate is skipped or rejected without
 moving another identity. Stealing is load recovery for idle CPUs, not a
 fairness, NUMA, or long-term balancing ABI.
 
+R4C adds the same bounded scan at quantum expiry, so idle stealing is no longer
+the sole load-recovery path. A CPU whose quantum expires performs one victim
+scan of the same shape, under the same lock, with the same migratability
+guards, and moves at most one entry. It differs only in admitting a victim: a
+CPU must carry at least two more runnable entries than the expiring CPU. That
+threshold is what makes the mechanism converge -- after the move the victim
+still carries at least as much as the puller, so a move that would only swap the
+imbalance is refused. An expiry pull is therefore a repair of a measurably worse
+shape, not a rotation, and like stealing it grants no fairness, NUMA, or latency
+guarantee. It is offered only from quantum expiry, which is the only recurring
+scheduling point a continuously busy CPU reaches.
+
 Under bounded runnable load, repeated local dispatch and bounded idle stealing
 must ensure every continuously eligible normal Thread eventually runs. No hard
 real-time or fixed worst-case latency follows from this property.
@@ -203,12 +215,12 @@ idle. Once saturated, no CPU reaches idle again, so an imbalance was permanent:
 every Thread still ran, and its share of a CPU never converged toward its peers'.
 
 R4B closed the half of that a placement decision can close, by qualifying §4
-above. The remaining half is this section's: an imbalance that placement never
-caused -- threads blocking, exiting, or a second launch wave -- still cannot be
-repaired while every CPU is busy, because stealing is offered only to an idle
-CPU. R4C decides what replaces that and amends this paragraph when it does.
-Until then, a saturated share imbalance that outlives its placement is expected
-behavior, recorded in `normal_policy_model.rs` as a test that must be inverted.
+above; R4C closed the rest by offering the bounded scan at quantum expiry as
+well as at idle. What neither closes, and what this section still does not
+promise, is equal share: `n` continuously runnable Threads on `c` CPUs cannot
+divide evenly unless `c` divides `n`, and the residue is granularity rather than
+an imbalance. R4C moves work only when a strictly better shape exists, so an
+allocation that is already the best its thread count admits is left alone.
 
 ## 6. Quantum accounting and timer identity
 
@@ -402,7 +414,7 @@ changing policy:
 | Local APIC one-shot programming | `LocalApic::program_one_shot_timer`/`stop_timer` in `kernel/src/arch/x86_64/apic.rs`, called by `LiveTimeState::reprogram` and time initialization in `kernel/src/time/live.rs` | The future unified arbiter must become the sole programmer before DW1-B adds a quantum source. |
 | stationary runtime/root guards and root switch | depth/phase witnesses in `kernel/src/arch/x86_64/syscall/stationary_runtime.rs`; runtime binding in `kernel/src/arch/x86_64/syscall/runtime_binding.rs`; root selection in `kernel/src/arch/x86_64/mm/activation/` | No stationary/paging guard or root-switch transaction may cross a scheduler switch/preemption boundary. |
 | scratch and execution-pin migration exclusion | CPU-local scratch sessions under `kernel/src/arch/x86_64/mm/`; task exit pins in `kernel/src/task/mod.rs` and `kernel/src/task/execution.rs` | Live scratch, execution pins, root switch, suspended continuation, block preparation, and unacknowledged stop all reject migration. |
-| DW1 future-policy host model | `kernel/src/task/scheduler/normal_policy_model.rs`, compiled only under `cfg(test)` | Fixed-capacity model covers placement, per-CPU FIFO rotation, eligibility/offline rejection, bounded cyclic idle stealing, migration guards, quantum generations/arithmetic, and block/wake/terminal races without changing cooperative production behavior, plus the saturated four-CPU liveness case of §5 and the load-qualified placement of §4. |
+| DW1 future-policy host model | `kernel/src/task/scheduler/normal_policy_model.rs`, compiled only under `cfg(test)` | Fixed-capacity model covers placement, per-CPU FIFO rotation, eligibility/offline rejection, bounded cyclic idle stealing, migration guards, quantum generations/arithmetic, and block/wake/terminal races without changing cooperative production behavior, plus the saturated four-CPU liveness case of §5, the load-qualified placement of §4, and expiry-time rebalancing with its convergence bound. |
 
 New transition surfaces must be added to this inventory or to the DW1
 validation record before their behavior is accepted.
@@ -422,8 +434,9 @@ The allocation-free host/model suite must cover, at minimum:
 - bounded idle stealing;
 - eligibility and offline-CPU rejection;
 - accounting overflow/regression;
-- saturated placement, wake, rotation, per-Thread share, and the reachability of
-  load recovery while every CPU is busy; and
+- saturated placement, wake, rotation, per-Thread share, the reachability of
+  load recovery while every CPU is busy, and that rebalancing converges rather
+  than rotating; and
 - fixed-seed state-machine traces with invariant checks after every operation.
 
 DW1-A closes only when this contract is indexed, the transition inventory and

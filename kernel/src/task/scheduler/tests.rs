@@ -3565,3 +3565,113 @@ fn r4b_a_wake_under_full_load_leaves_the_deepest_queue() {
     );
     assert_eq!(scheduler.check_invariants(), Ok(()));
 }
+
+/// Builds depths of `3,1,1,1` with no CPU able to reach idle: three threads
+/// launched from CPU 0 while its peers are still idle, then one thread each on
+/// the peers. Placement cannot prevent this shape -- R4B's load rule only
+/// applies once no CPU can idle, and CPUs 1 to 3 still could -- so it is the
+/// imbalance §5 stealing was never offered a chance to repair.
+fn imbalanced_busy_scheduler(
+    scheduler: &CooperativeScheduler<8>,
+    registry: &mut ObjectRegistry<16>,
+) {
+    for _ in 0..3 {
+        let thread = thread_key(registry);
+        assert_eq!(
+            scheduler
+                .commit_on(cpu(0), scheduler.reserve(thread).unwrap())
+                .unwrap()
+                .target(),
+            cpu(0)
+        );
+    }
+    assert!(scheduler.schedule_next_on(cpu(0)).unwrap().current.is_some());
+    for index in 1..H2_SCHEDULER_CPU_CAPACITY {
+        let thread = thread_key(registry);
+        scheduler
+            .commit_on(cpu(index), scheduler.reserve(thread).unwrap())
+            .unwrap();
+        assert_eq!(
+            scheduler.schedule_next_on(cpu(index)).unwrap().current,
+            Some(thread)
+        );
+    }
+}
+
+#[test]
+fn r4c_quantum_expiry_pulls_from_an_overloaded_peer() {
+    let scheduler = CooperativeScheduler::<8>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    imbalanced_busy_scheduler(&scheduler, &mut registry);
+    assert_eq!(scheduler.last_migration(), None);
+
+    let ticket = scheduler.prepare_quantum_on(cpu(1), 10).unwrap();
+    assert_eq!(scheduler.publish_quantum_expiry(ticket), Ok(true));
+    match scheduler.preempt_current_on(cpu(1)).unwrap() {
+        SchedulerPreemptionDecision::Switch { .. } => {}
+        decision => panic!("CPU 1 kept its lone thread instead of pulling: {decision:?}"),
+    }
+    let migration = scheduler
+        .last_migration()
+        .expect("a busy CPU recovered load without reaching idle");
+    assert_eq!(migration.source, cpu(0));
+    assert_eq!(migration.target, cpu(1));
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn r4c_rebalancing_converges_and_then_stops() {
+    let scheduler = CooperativeScheduler::<8>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    imbalanced_busy_scheduler(&scheduler, &mut registry);
+
+    // 3,1,1,1 admits exactly one improving move, to 2,2,1,1. Every further
+    // expiry must refuse: a second pull would only swap the imbalance.
+    let mut pulls = 0;
+    for round in 0..8 {
+        for index in 1..H2_SCHEDULER_CPU_CAPACITY {
+            let before = scheduler.last_migration();
+            let ticket = scheduler.prepare_quantum_on(cpu(index), 10 + round).unwrap();
+            assert_eq!(scheduler.publish_quantum_expiry(ticket), Ok(true));
+            if let SchedulerPreemptionDecision::Switch { outgoing, .. } =
+                scheduler.preempt_current_on(cpu(index)).unwrap()
+            {
+                scheduler.complete_switch_on(outgoing).unwrap();
+            }
+            if scheduler.last_migration() != before {
+                pulls += 1;
+            }
+        }
+    }
+    assert_eq!(
+        pulls, 1,
+        "rebalancing is a repair, not a rotation: one improving move, then quiet"
+    );
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn r4c_a_balanced_system_is_never_disturbed() {
+    let scheduler = CooperativeScheduler::<8>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    for index in 0..H2_SCHEDULER_CPU_CAPACITY {
+        let thread = thread_key(&mut registry);
+        scheduler
+            .commit_on(cpu(index), scheduler.reserve(thread).unwrap())
+            .unwrap();
+        assert_eq!(
+            scheduler.schedule_next_on(cpu(index)).unwrap().current,
+            Some(thread)
+        );
+    }
+    for index in 0..H2_SCHEDULER_CPU_CAPACITY {
+        let ticket = scheduler.prepare_quantum_on(cpu(index), 10).unwrap();
+        assert_eq!(scheduler.publish_quantum_expiry(ticket), Ok(true));
+        match scheduler.preempt_current_on(cpu(index)).unwrap() {
+            SchedulerPreemptionDecision::RetainCurrent { .. } => {}
+            decision => panic!("a balanced CPU moved work: {decision:?}"),
+        }
+    }
+    assert_eq!(scheduler.last_migration(), None);
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}

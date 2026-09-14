@@ -153,6 +153,7 @@ struct NormalPolicyModel {
     quanta_served: [u64; TASK_CAPACITY],
     recovery_offers: u64,
     recovery_refusals: u64,
+    rebalance_pulls: u64,
     now_ns: u64,
     overflow_fault: bool,
 }
@@ -172,6 +173,7 @@ impl NormalPolicyModel {
             quanta_served: [0; TASK_CAPACITY],
             recovery_offers: 0,
             recovery_refusals: 0,
+            rebalance_pulls: 0,
             now_ns: 0,
             overflow_fault: false,
         }
@@ -551,6 +553,10 @@ impl NormalPolicyModel {
             if self.online & (1 << cpu) == 0 {
                 continue;
             }
+            // R4C first: quantum expiry is the recovery point a saturated CPU
+            // actually reaches, and a pulled entry must be selectable by the
+            // rotation that follows.
+            self.rebalance_pull(cpu)?;
             if let Some(token) = self.running[cpu] {
                 self.expire(token, now_ns)?;
             }
@@ -580,6 +586,39 @@ impl NormalPolicyModel {
             self.advance_one_quantum()?;
         }
         Ok(())
+    }
+
+    /// R4C: bounded load recovery for a CPU that is not idle, offered at
+    /// quantum expiry. Moves at most one entry, and only from a victim carrying
+    /// at least two more, so a move that would merely swap the imbalance is
+    /// refused and the mechanism converges.
+    fn rebalance_pull(&mut self, target: usize) -> Result<Option<TaskId>, ModelError> {
+        self.validate_cpu(target)?;
+        // Production reaches this only from quantum expiry, so only from a CPU
+        // that is running something. An idle CPU's recovery is §5 stealing,
+        // which has no depth threshold to satisfy.
+        if self.running[target].is_none() {
+            return Ok(None);
+        }
+        let threshold = self.runnable_depth(target) + 2;
+        for offset in 1..CPU_COUNT {
+            let victim = (target + offset) % CPU_COUNT;
+            if self.online & (1 << victim) == 0 || self.runnable_depth(victim) < threshold {
+                continue;
+            }
+            for index in 0..self.queues[victim].len {
+                let task = self.queues[victim].entries[index].expect("bounded queue entry");
+                if self.eligible(task, target) && self.record(task)?.migratable() {
+                    self.migrate(task, target)?;
+                    self.rebalance_pulls = self
+                        .rebalance_pulls
+                        .checked_add(1)
+                        .ok_or(ModelError::Overflow)?;
+                    return Ok(Some(task));
+                }
+            }
+        }
+        Ok(None)
     }
 
     fn check(&self) -> Result<(), ModelError> {
@@ -1000,67 +1039,95 @@ fn every_thread_gets_an_equal_share_once_placement_can_balance_it() {
     );
 }
 
-/// R4C oracle. Placement cannot prevent an imbalance that arises after the
-/// placement decision, and §5 stealing cannot repair one while every CPU is
-/// busy. Invert these when R4C lands; do not delete them.
-#[test]
-fn idle_stealing_cannot_reach_an_imbalance_placement_did_not_cause() {
-    let mut model = saturated_four_cpu_model();
-    add_from_the_launching_cpu(&mut model, CPU_COUNT..TASK_CAPACITY);
-    for slot in CPU_COUNT + 1..TASK_CAPACITY {
-        model.terminate(task(slot, 1)).unwrap();
+/// Depths of `3,1,1,1` with no CPU able to reach idle: three threads launched
+/// from CPU 0 while its peers are still idle, then one thread each on the peers.
+/// R4B's load rule does not apply to those launches, because CPUs 1 to 3 could
+/// still idle at the time, so this is an imbalance placement cannot prevent.
+///
+/// Six threads on four CPUs: `2,2,1,1` is the best reachable shape and `3,1,1,1`
+/// is strictly worse. R4B's commit message offered `2,1,1,1` as the R4C case,
+/// which was wrong -- five threads on four CPUs cannot do better than one CPU
+/// carrying two, so that spread was optimal granularity rather than a defect,
+/// and the tests asserting it were not oracles for anything.
+fn imbalanced_busy_model() -> NormalPolicyModel {
+    let mut model = NormalPolicyModel::new(0b1111);
+    for slot in 0..3 {
+        assert_eq!(model.add(task(slot, 1), 0b1111, 0), Ok(0));
     }
-    assert_eq!(model.runnable_depth(0), 2);
+    model.dispatch(0, 0).unwrap().expect("CPU 0 has work");
+    for cpu in 1..CPU_COUNT {
+        assert_eq!(model.add(task(2 + cpu, 1), 0b1111, cpu), Ok(cpu));
+        model.dispatch(cpu, 0).unwrap().expect("each peer has work");
+    }
+    assert_eq!(model.runnable_depth(0), 3);
     for cpu in 1..CPU_COUNT {
         assert_eq!(model.runnable_depth(cpu), 1);
     }
+    assert!(model.every_cpu_is_busy());
+    model
+}
+
+#[test]
+fn idle_stealing_alone_still_cannot_reach_a_busy_imbalance() {
+    let mut model = imbalanced_busy_model();
     for cpu in 0..CPU_COUNT {
         assert_eq!(
             model.steal_idle(cpu),
             Err(ModelError::CpuBusy),
-            "load recovery is still gated on an idleness that never arrives"
+            "§5 load recovery is still gated on an idleness that never arrives"
         );
     }
-    model.run_for(64).unwrap();
-    assert!(model.every_cpu_is_busy());
-    assert_eq!(model.runnable_depth(0), 2, "the imbalance is permanent");
 }
 
-/// R4C oracle. See above.
 #[test]
-fn a_share_imbalance_created_after_placement_still_never_recovers() {
-    let mut model = saturated_four_cpu_model();
-    add_from_the_launching_cpu(&mut model, CPU_COUNT..TASK_CAPACITY);
-    for slot in CPU_COUNT + 1..TASK_CAPACITY {
-        model.terminate(task(slot, 1)).unwrap();
+fn rebalancing_repairs_an_imbalance_placement_could_not_prevent() {
+    let mut model = imbalanced_busy_model();
+    model.run_for(1).unwrap();
+    let mut depths = [0; CPU_COUNT];
+    for (cpu, depth) in depths.iter_mut().enumerate() {
+        *depth = model.runnable_depth(cpu);
     }
-    let baseline = model.quanta_served;
-    let offered = model.recovery_offers;
-    let refused = model.recovery_refusals;
-    model.run_for(100).unwrap();
-
+    depths.sort_unstable();
     assert_eq!(
-        model.recovery_offers - offered,
-        model.recovery_refusals - refused,
-        "load recovery was offered on every CPU every quantum and refused every time"
+        depths,
+        [1, 1, 2, 2],
+        "one bounded pull reaches the best shape six threads admit on four CPUs"
     );
-    for slot in [0, CPU_COUNT] {
-        assert_eq!(
-            model.quanta_served(task(slot, 1)) - baseline[slot],
-            50,
-            "CPU 0's pair still take half a CPU each"
-        );
-    }
-    for slot in 1..CPU_COUNT {
-        assert_eq!(
-            model.quanta_served(task(slot, 1)) - baseline[slot],
-            100,
-            "while a sole occupant takes every quantum of its CPU"
-        );
-    }
+    assert!(model.every_cpu_is_busy());
+}
+
+#[test]
+fn rebalancing_stops_once_no_move_improves_the_spread() {
+    let mut model = imbalanced_busy_model();
+    model.run_for(64).unwrap();
+    assert_eq!(
+        model.rebalance_pulls, 1,
+        "a repair, not a rotation: one improving move, then quiet"
+    );
+
+    let baseline = model.quanta_served;
+    model.run_for(100).unwrap();
     let (min, max) = served_bounds(&model, baseline);
-    assert!(
-        max / min > BALANCED_SHARE_SPREAD,
-        "R4C must close this; invert the assertion when it does"
+    assert_eq!(
+        (min, max),
+        (50, 100),
+        "the two CPUs carrying a pair give each half, the sole occupants give all"
+    );
+    assert_eq!(
+        max / min,
+        2,
+        "six threads on four CPUs cannot be equal; R4C reaches the spread they admit, \
+         down from the 3:1 the unrepaired imbalance held"
+    );
+}
+
+#[test]
+fn an_already_optimal_spread_is_left_alone() {
+    let mut model = saturated_four_cpu_model();
+    add_from_the_launching_cpu(&mut model, CPU_COUNT..TASK_CAPACITY - 3);
+    model.run_for(64).unwrap();
+    assert_eq!(
+        model.rebalance_pulls, 0,
+        "five threads on four CPUs are already as even as they can be"
     );
 }
