@@ -186,6 +186,15 @@ Under bounded runnable load, repeated local dispatch and bounded idle stealing
 must ensure every continuously eligible normal Thread eventually runs. No hard
 real-time or fixed worst-case latency follows from this property.
 
+R4A measured that property against the saturated four-CPU shape R1 ran. It
+holds, and it is weaker than the DW1 runtime reset needs. With every CPU busy,
+§4 places each newly created or woken Thread by requesting CPU and last CPU
+without consulting load, and §5 offers load recovery only to a CPU that reaches
+idle. Once saturated, no CPU reaches idle again, so an imbalance created at
+launch is permanent: every Thread still runs, and its share of a CPU never
+converges toward its peers'. `normal_policy_model.rs` records this; R4B and R4C
+decide what replaces it, and amend this section when they do.
+
 ## 6. Quantum accounting and timer identity
 
 The default normal quantum is exactly `5_000_000 ns`. A dispatch records:
@@ -378,7 +387,7 @@ changing policy:
 | Local APIC one-shot programming | `LocalApic::program_one_shot_timer`/`stop_timer` in `kernel/src/arch/x86_64/apic.rs`, called by `LiveTimeState::reprogram` and time initialization in `kernel/src/time/live.rs` | The future unified arbiter must become the sole programmer before DW1-B adds a quantum source. |
 | stationary runtime/root guards and root switch | depth/phase witnesses in `kernel/src/arch/x86_64/syscall/stationary_runtime.rs`; runtime binding in `kernel/src/arch/x86_64/syscall/runtime_binding.rs`; root selection in `kernel/src/arch/x86_64/mm/activation/` | No stationary/paging guard or root-switch transaction may cross a scheduler switch/preemption boundary. |
 | scratch and execution-pin migration exclusion | CPU-local scratch sessions under `kernel/src/arch/x86_64/mm/`; task exit pins in `kernel/src/task/mod.rs` and `kernel/src/task/execution.rs` | Live scratch, execution pins, root switch, suspended continuation, block preparation, and unacknowledged stop all reject migration. |
-| DW1 future-policy host model | `kernel/src/task/scheduler/normal_policy_model.rs`, compiled only under `cfg(test)` | Fixed-capacity model covers placement, per-CPU FIFO rotation, eligibility/offline rejection, bounded cyclic idle stealing, migration guards, quantum generations/arithmetic, and block/wake/terminal races without changing cooperative production behavior. |
+| DW1 future-policy host model | `kernel/src/task/scheduler/normal_policy_model.rs`, compiled only under `cfg(test)` | Fixed-capacity model covers placement, per-CPU FIFO rotation, eligibility/offline rejection, bounded cyclic idle stealing, migration guards, quantum generations/arithmetic, and block/wake/terminal races without changing cooperative production behavior, plus the saturated four-CPU liveness case of §5. |
 
 New transition surfaces must be added to this inventory or to the DW1
 validation record before their behavior is accepted.
@@ -397,7 +406,9 @@ The allocation-free host/model suite must cover, at minimum:
 - continuation-bound migration rejection;
 - bounded idle stealing;
 - eligibility and offline-CPU rejection;
-- accounting overflow/regression; and
+- accounting overflow/regression;
+- saturated placement, wake, rotation, per-Thread share, and the reachability of
+  load recovery while every CPU is busy; and
 - fixed-seed state-machine traces with invariant checks after every operation.
 
 DW1-A closes only when this contract is indexed, the transition inventory and
