@@ -49,7 +49,10 @@
 //!
 //! R5A adds storage and changes no behaviour, so nothing calls this yet.
 
-#![allow(dead_code, reason = "R5B through R5D migrate the termination paths onto this storage")]
+#![allow(
+    dead_code,
+    reason = "R5B through R5D migrate the termination paths onto this storage"
+)]
 
 use super::{ProcessKey, TaskGroupKey, ThreadExecutionResources};
 use crate::object::{FinalRelease, InternalRef};

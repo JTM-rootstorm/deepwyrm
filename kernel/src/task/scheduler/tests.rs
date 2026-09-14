@@ -3585,7 +3585,13 @@ fn imbalanced_busy_scheduler(
             cpu(0)
         );
     }
-    assert!(scheduler.schedule_next_on(cpu(0)).unwrap().current.is_some());
+    assert!(
+        scheduler
+            .schedule_next_on(cpu(0))
+            .unwrap()
+            .current
+            .is_some()
+    );
     for index in 1..H2_SCHEDULER_CPU_CAPACITY {
         let thread = thread_key(registry);
         scheduler
@@ -3631,7 +3637,9 @@ fn r4c_rebalancing_converges_and_then_stops() {
     for round in 0..8 {
         for index in 1..H2_SCHEDULER_CPU_CAPACITY {
             let before = scheduler.last_migration();
-            let ticket = scheduler.prepare_quantum_on(cpu(index), 10 + round).unwrap();
+            let ticket = scheduler
+                .prepare_quantum_on(cpu(index), 10 + round)
+                .unwrap();
             assert_eq!(scheduler.publish_quantum_expiry(ticket), Ok(true));
             if let SchedulerPreemptionDecision::Switch { outgoing, .. } =
                 scheduler.preempt_current_on(cpu(index)).unwrap()

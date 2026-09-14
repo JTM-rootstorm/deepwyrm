@@ -906,7 +906,11 @@ fn add_from_the_launching_cpu(
 ) -> [Option<usize>; TASK_CAPACITY] {
     let mut placed = [None; TASK_CAPACITY];
     for slot in slots {
-        placed[slot] = Some(model.add(task(slot, 1), 0b1111, 0).expect("admissible launch"));
+        placed[slot] = Some(
+            model
+                .add(task(slot, 1), 0b1111, 0)
+                .expect("admissible launch"),
+        );
     }
     placed
 }

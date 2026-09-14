@@ -95,9 +95,9 @@ mod live_wake_delivery_contract {
 
     fn dispatch_body() -> &'static str {
         let source = include_str!("live.rs");
-        let start = source
-            .find(DISPATCH)
-            .expect("the live timer interrupt dispatch is still named as the assembly entry calls it");
+        let start = source.find(DISPATCH).expect(
+            "the live timer interrupt dispatch is still named as the assembly entry calls it",
+        );
         let body = &source[start..];
         let end = body
             .find("\nfn read_pm_timer(")

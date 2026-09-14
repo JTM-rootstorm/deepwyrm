@@ -1176,9 +1176,7 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         };
         let depths = self.runnable_depths();
         if admissible().any(|cpu| depths[cpu.index()] == 0) {
-            return retained
-                .or(requested)
-                .or_else(|| admissible().next());
+            return retained.or(requested).or_else(|| admissible().next());
         }
         let shallowest = admissible().min_by_key(|cpu| (depths[cpu.index()], cpu.index()))?;
         let least = depths[shallowest.index()];
@@ -2666,9 +2664,8 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         };
 
         let enqueue_generation = state.next_enqueue_generation;
-        let Some(next_enqueue_generation) = enqueue_generation
-            .checked_add(1)
-            .filter(|next| *next != 0)
+        let Some(next_enqueue_generation) =
+            enqueue_generation.checked_add(1).filter(|next| *next != 0)
         else {
             if let Some(pending) = pulled {
                 state.rollback_pending_migration(pending);
