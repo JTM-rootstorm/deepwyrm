@@ -1117,6 +1117,42 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         self.schedulable_mask() & eligibility_mask & bit != 0
     }
 
+    /// Runnable work each CPU is carrying: its queued Runnable entries plus the
+    /// entry it is running. Derived from the queue rather than read from
+    /// `SchedulerAccounting`, which is telemetry; a counter defect must not be
+    /// able to become a placement defect.
+    ///
+    /// An entry being placed is `Reserved` or `Blocked` at both call sites, so
+    /// it never counts toward the depth of the CPU it is about to join.
+    fn runnable_depths(&self) -> [usize; H2_SCHEDULER_CPU_CAPACITY] {
+        let mut depths = [0; H2_SCHEDULER_CPU_CAPACITY];
+        for entry in self.queue[..self.len].iter().flatten() {
+            if entry.state == SchedulerThreadState::Runnable {
+                depths[entry.target_cpu.index()] += 1;
+            }
+        }
+        for (index, claim) in self.running.iter().enumerate() {
+            if claim.is_some() {
+                depths[index] += 1;
+            }
+        }
+        depths
+    }
+
+    /// Initial and wake placement, per `DW1_A0_PREEMPTIVE_SCHEDULER_CONTRACT.md`
+    /// §4 as amended by R4B.
+    ///
+    /// A continuation-bound Thread is still placed by its binding alone. For
+    /// everything else the frozen preference order -- retained last CPU, then
+    /// requesting CPU, then lowest admissible index -- applies whenever some
+    /// admissible CPU can still reach idle, because §5 idle stealing recovers
+    /// whatever imbalance that order creates.
+    ///
+    /// When no admissible CPU can reach idle, it cannot: R4A measured that a
+    /// saturated imbalance is permanent, since stealing is offered only to a
+    /// CPU that idles and none ever does. Placement then selects among the
+    /// least-loaded admissible CPUs, and the frozen order breaks the tie, so
+    /// retention and requester locality survive wherever they cost no balance.
     fn select_placement(
         &self,
         entry: QueueEntry,
@@ -1127,18 +1163,29 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
                 .cpu_admissible(continuation_cpu, entry.eligibility_mask)
                 .then_some(continuation_cpu);
         }
-        entry
+        let retained = entry
             .last_cpu
-            .filter(|cpu| self.cpu_admissible(*cpu, entry.eligibility_mask))
-            .or_else(|| {
-                self.cpu_admissible(requester, entry.eligibility_mask)
-                    .then_some(requester)
-            })
-            .or_else(|| {
-                (0..H2_SCHEDULER_CPU_CAPACITY)
-                    .filter_map(SchedulerCpuId::new)
-                    .find(|cpu| self.cpu_admissible(*cpu, entry.eligibility_mask))
-            })
+            .filter(|cpu| self.cpu_admissible(*cpu, entry.eligibility_mask));
+        let requested = self
+            .cpu_admissible(requester, entry.eligibility_mask)
+            .then_some(requester);
+        let admissible = || {
+            (0..H2_SCHEDULER_CPU_CAPACITY)
+                .filter_map(SchedulerCpuId::new)
+                .filter(|cpu| self.cpu_admissible(*cpu, entry.eligibility_mask))
+        };
+        let depths = self.runnable_depths();
+        if admissible().any(|cpu| depths[cpu.index()] == 0) {
+            return retained
+                .or(requested)
+                .or_else(|| admissible().next());
+        }
+        let shallowest = admissible().min_by_key(|cpu| (depths[cpu.index()], cpu.index()))?;
+        let least = depths[shallowest.index()];
+        retained
+            .filter(|cpu| depths[cpu.index()] == least)
+            .or(requested.filter(|cpu| depths[cpu.index()] == least))
+            .or(Some(shallowest))
     }
 
     /// Mirrors this CPU's scheduler-owned facts into the reset-card-R1 liveness

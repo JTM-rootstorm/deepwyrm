@@ -3474,3 +3474,94 @@ fn dw1c4_stale_timer_wake_and_migration_records_cannot_alias_reused_thread_keys(
     assert_eq!(scheduler.current_on(cpu(0)), Some(replacement));
     assert_eq!(scheduler.check_invariants(), Ok(()));
 }
+
+/// R4B, production side. `normal_policy_model.rs` measures the policy; these
+/// two bind the live `select_placement` to the same amended §4 rule.
+#[test]
+fn r4b_placement_under_full_load_spreads_across_the_least_loaded_cpus() {
+    let scheduler = CooperativeScheduler::<8>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    for index in 0..H2_SCHEDULER_CPU_CAPACITY {
+        let thread = thread_key(&mut registry);
+        let publication = scheduler
+            .commit_on(cpu(index), scheduler.reserve(thread).unwrap())
+            .unwrap();
+        assert_eq!(
+            publication.target(),
+            cpu(index),
+            "an idle CPU still takes its own request"
+        );
+        assert_eq!(
+            scheduler.schedule_next_on(cpu(index)).unwrap().current,
+            Some(thread)
+        );
+    }
+
+    // Every CPU is now running a thread, so none can reach the idle path that
+    // §5 stealing needs. Four further threads created from CPU 0 must not all
+    // land there.
+    for index in 0..H2_SCHEDULER_CPU_CAPACITY {
+        let thread = thread_key(&mut registry);
+        let publication = scheduler
+            .commit_on(cpu(0), scheduler.reserve(thread).unwrap())
+            .unwrap();
+        assert_eq!(
+            publication.target(),
+            cpu(index),
+            "placement consults load once no admissible CPU can idle"
+        );
+    }
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn r4b_a_wake_under_full_load_leaves_the_deepest_queue() {
+    let scheduler = CooperativeScheduler::<8>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let mut deep = [None; 4];
+    for slot in deep.iter_mut() {
+        let thread = thread_key(&mut registry);
+        let publication = scheduler
+            .commit_on(cpu(0), scheduler.reserve(thread).unwrap())
+            .unwrap();
+        assert_eq!(
+            publication.target(),
+            cpu(0),
+            "the frozen order still deepens CPU 0 while its peers can steal"
+        );
+        *slot = Some(thread);
+    }
+    let blocking = deep[0].expect("seeded thread");
+    assert_eq!(
+        scheduler.schedule_next_on(cpu(0)).unwrap().current,
+        Some(blocking)
+    );
+    for index in 1..H2_SCHEDULER_CPU_CAPACITY {
+        let thread = thread_key(&mut registry);
+        scheduler
+            .commit_on(cpu(index), scheduler.reserve(thread).unwrap())
+            .unwrap();
+        assert_eq!(
+            scheduler.schedule_next_on(cpu(index)).unwrap().current,
+            Some(thread)
+        );
+    }
+
+    let running = scheduler.running_claim_on(cpu(0)).unwrap();
+    let (blocked, _) = scheduler.block_current_on(cpu(0), blocking).unwrap();
+    scheduler.complete_switch_on(running).unwrap();
+    let publication = scheduler
+        .wake_on(cpu(H2_SCHEDULER_CPU_CAPACITY - 1), blocked.into_wake_key())
+        .unwrap();
+    assert_ne!(
+        publication.target(),
+        cpu(0),
+        "retention yields once the last CPU is the deepest queue"
+    );
+    assert_eq!(
+        publication.target(),
+        cpu(H2_SCHEDULER_CPU_CAPACITY - 1),
+        "the requesting CPU breaks the tie among the least loaded"
+    );
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}

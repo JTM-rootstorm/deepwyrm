@@ -237,15 +237,27 @@ impl NormalPolicyModel {
                 Err(ModelError::IneligibleCpu)
             };
         }
-        if let Some(cpu) = record.last_cpu.filter(|cpu| usable & (1 << cpu) != 0) {
-            return Ok(cpu);
+        let retained = record.last_cpu.filter(|cpu| usable & (1 << cpu) != 0);
+        let requested = (usable & (1 << requester) != 0).then_some(requester);
+        let admissible = || (0..CPU_COUNT).filter(|cpu| usable & (1 << cpu) != 0);
+        // R4B: the frozen order holds while some admissible CPU can still reach
+        // idle, because §5 stealing recovers what it does. Once none can, it
+        // recovers nothing, so the least-loaded CPU wins and the frozen order
+        // only breaks the tie.
+        if admissible().any(|cpu| self.runnable_depth(cpu) == 0) {
+            return retained
+                .or(requested)
+                .or_else(|| admissible().next())
+                .ok_or(ModelError::IneligibleCpu);
         }
-        if usable & (1 << requester) != 0 {
-            return Ok(requester);
-        }
-        (0..CPU_COUNT)
-            .find(|cpu| usable & (1 << cpu) != 0)
-            .ok_or(ModelError::IneligibleCpu)
+        let shallowest = admissible()
+            .min_by_key(|cpu| (self.runnable_depth(*cpu), *cpu))
+            .ok_or(ModelError::IneligibleCpu)?;
+        let least = self.runnable_depth(shallowest);
+        Ok(retained
+            .filter(|cpu| self.runnable_depth(*cpu) == least)
+            .or(requested.filter(|cpu| self.runnable_depth(*cpu) == least))
+            .unwrap_or(shallowest))
     }
 
     fn add(
@@ -805,24 +817,23 @@ fn fixed_seed_transition_trace_preserves_unique_running_and_queued_identity() {
 }
 
 // ---------------------------------------------------------------------------
-// R4A: saturation liveness.
+// R4A/R4B: saturation liveness.
 //
 // `DW1_A0_PREEMPTIVE_SCHEDULER_CONTRACT.md` §5 claims that "under bounded
 // runnable load, repeated local dispatch and bounded idle stealing must ensure
-// every continuously eligible normal Thread eventually runs", and §4 freezes a
-// placement order that consults continuation, last CPU, and requesting CPU --
-// never load. The tests below make both statements executable against the same
-// shape R1 ran in the VM: four continuously runnable hogs on four CPUs, plus
-// further threads created from one launching CPU while every CPU is busy.
+// every continuously eligible normal Thread eventually runs". R4A measured that
+// claim against the shape R1 ran in the VM -- four continuously runnable hogs on
+// four CPUs, plus further threads created from one launching CPU while every CPU
+// is busy -- and found it true and weaker than this reset needs: every thread
+// ran, and no thread's share ever converged toward its peers'.
 //
-// They record what the frozen policy does, not what it should do. Where a test
-// asserts an imbalance, that assertion is the R4B/R4C oracle: the fix must make
-// it fail, and the test must then be inverted rather than deleted.
+// R4B amended §4 so that placement consults load exactly where idle stealing
+// cannot recover it. These tests now state the amended policy. Two of them
+// remain R4C oracles: an imbalance that placement never caused is still
+// permanent, and must be inverted rather than deleted when R4C lands.
 
-/// Share spread a load-aware placement would leave: with every thread
-/// continuously runnable and equally eligible, each should receive the same
-/// number of quanta, so `max / min` should converge toward one. R4B/R4C are
-/// complete when the saturated case below reaches this, not before.
+/// Share spread a balanced placement leaves: with every thread continuously
+/// runnable and equally eligible, each receives the same number of quanta.
 const BALANCED_SHARE_SPREAD: u64 = 1;
 
 /// Four hogs launched from CPU 0, then spread one per CPU by the idle path.
@@ -833,7 +844,7 @@ fn saturated_four_cpu_model() -> NormalPolicyModel {
         assert_eq!(
             model.add(task(slot, 1), 0b1111, 0),
             Ok(0),
-            "every launch lands on the launching CPU"
+            "CPUs can still idle, so the frozen order sends every launch to the launching CPU"
         );
     }
     model.advance_one_quantum().unwrap();
@@ -848,74 +859,97 @@ fn saturated_four_cpu_model() -> NormalPolicyModel {
     model
 }
 
-/// Adds `slots` further continuously runnable threads from CPU 0 with every
-/// CPU already busy.
-fn add_from_the_launching_cpu(model: &mut NormalPolicyModel, slots: core::ops::Range<usize>) {
+/// Adds further continuously runnable threads from CPU 0, returning where each
+/// was placed.
+fn add_from_the_launching_cpu(
+    model: &mut NormalPolicyModel,
+    slots: core::ops::Range<usize>,
+) -> [Option<usize>; TASK_CAPACITY] {
+    let mut placed = [None; TASK_CAPACITY];
     for slot in slots {
-        assert_eq!(model.add(task(slot, 1), 0b1111, 0), Ok(0));
+        placed[slot] = Some(model.add(task(slot, 1), 0b1111, 0).expect("admissible launch"));
     }
+    placed
 }
 
+/// Quanta served over a window, bounded across the threads that were live for
+/// it. A terminated slot serves none and would otherwise floor the minimum.
 fn served_bounds(model: &NormalPolicyModel, baseline: [u64; TASK_CAPACITY]) -> (u64, u64) {
     let mut min = u64::MAX;
     let mut max = 0;
     for slot in 0..TASK_CAPACITY {
+        if !matches!(
+            model.tasks[slot].state,
+            TaskState::Runnable { .. } | TaskState::Running { .. }
+        ) {
+            continue;
+        }
         let served = model.quanta_served[slot] - baseline[slot];
         min = min.min(served);
         max = max.max(served);
     }
+    assert_ne!(min, u64::MAX, "the window had at least one live thread");
     (min, max)
 }
 
 #[test]
-fn placement_under_full_load_consults_no_queue_depth() {
-    let mut model = saturated_four_cpu_model();
-    add_from_the_launching_cpu(&mut model, CPU_COUNT..TASK_CAPACITY);
+fn placement_while_a_cpu_can_still_idle_keeps_the_frozen_order() {
+    let mut model = NormalPolicyModel::new(0b1111);
+    assert_eq!(model.add(task(0, 1), 0b1111, 0), Ok(0));
     assert_eq!(
-        model.runnable_depth(0),
-        1 + (TASK_CAPACITY - CPU_COUNT),
-        "the launching CPU absorbs every new thread"
+        model.add(task(1, 1), 0b1111, 0),
+        Ok(0),
+        "the requesting CPU still wins while an idle peer can steal the excess"
     );
-    for cpu in 1..CPU_COUNT {
-        assert_eq!(
-            model.runnable_depth(cpu),
-            1,
-            "no peer receives work it is equally eligible to run"
-        );
-    }
+    assert_eq!(model.runnable_depth(0), 2);
+    assert_eq!(model.runnable_depth(1), 0);
+    model.advance_one_quantum().unwrap();
+    assert_eq!(
+        (model.runnable_depth(0), model.runnable_depth(1)),
+        (1, 1),
+        "and the idle path recovers it, which is why R4B left this case alone"
+    );
 }
 
 #[test]
-fn idle_stealing_cannot_reach_a_saturated_imbalance() {
+fn placement_under_full_load_spreads_across_the_least_loaded_cpus() {
     let mut model = saturated_four_cpu_model();
-    add_from_the_launching_cpu(&mut model, CPU_COUNT..TASK_CAPACITY);
+    let placed = add_from_the_launching_cpu(&mut model, CPU_COUNT..TASK_CAPACITY);
+    assert_eq!(
+        placed[CPU_COUNT],
+        Some(0),
+        "the requesting CPU still breaks a tie among equally loaded peers"
+    );
     for cpu in 0..CPU_COUNT {
         assert_eq!(
-            model.steal_idle(cpu),
-            Err(ModelError::CpuBusy),
-            "contract §5 load recovery is gated on idleness that never arrives"
+            model.runnable_depth(cpu),
+            TASK_CAPACITY / CPU_COUNT,
+            "no CPU absorbs work its peers are equally eligible to run"
         );
     }
-    model.run_for(64).unwrap();
-    assert!(model.every_cpu_is_busy());
-    assert_eq!(model.runnable_depth(0), 1 + (TASK_CAPACITY - CPU_COUNT));
 }
 
 #[test]
-fn a_wake_under_full_load_returns_to_the_deepest_queue() {
+fn a_wake_under_full_load_leaves_the_deepest_queue() {
     let mut model = saturated_four_cpu_model();
-    add_from_the_launching_cpu(&mut model, CPU_COUNT..TASK_CAPACITY - 1);
+    for slot in CPU_COUNT..TASK_CAPACITY - 1 {
+        assert_eq!(
+            model.add(task(slot, 1), 0b0001, 0),
+            Ok(0),
+            "eligibility, not placement, deepens CPU 0"
+        );
+    }
     let running = model.running[0].expect("the launching CPU is busy");
     model.prepare_block(running).unwrap();
     let wake = model.commit_block(running).unwrap();
-    assert_eq!(
-        model.wake(wake, CPU_COUNT - 1),
-        Ok(0),
-        "the last CPU wins wake placement however deep its queue"
+    let placed = model.wake(wake, CPU_COUNT - 1).expect("admissible wake");
+    assert_ne!(
+        placed, 0,
+        "retention yields once the last CPU is the deepest queue"
     );
     assert!(
-        model.runnable_depth(0) > model.runnable_depth(CPU_COUNT - 1),
-        "a woken thread rejoins the queue it will wait longest in"
+        model.runnable_depth(placed) < model.runnable_depth(0),
+        "a woken thread no longer rejoins the queue it would wait longest in"
     );
 }
 
@@ -924,6 +958,7 @@ fn quantum_expiry_rotates_a_saturated_queue_in_fifo_age_order() {
     let mut model = saturated_four_cpu_model();
     add_from_the_launching_cpu(&mut model, CPU_COUNT..TASK_CAPACITY);
     let depth = model.runnable_depth(0);
+    assert!(depth > 1, "CPU 0 carries a queue to rotate");
     let mut observed = [None; TASK_CAPACITY];
     for step in 0..depth {
         observed[step] = model.running[0].map(|token| token.task);
@@ -946,9 +981,59 @@ fn quantum_expiry_rotates_a_saturated_queue_in_fifo_age_order() {
 }
 
 #[test]
-fn every_thread_runs_yet_the_saturated_imbalance_never_recovers() {
+fn every_thread_gets_an_equal_share_once_placement_can_balance_it() {
     let mut model = saturated_four_cpu_model();
     add_from_the_launching_cpu(&mut model, CPU_COUNT..TASK_CAPACITY);
+    let baseline = model.quanta_served;
+    model.run_for(100).unwrap();
+
+    let (min, max) = served_bounds(&model, baseline);
+    assert_eq!(
+        (min, max),
+        (50, 50),
+        "eight threads across four CPUs each take half a CPU"
+    );
+    assert_eq!(
+        max / min,
+        BALANCED_SHARE_SPREAD,
+        "R4B closes the share spread R4A measured at 5:1"
+    );
+}
+
+/// R4C oracle. Placement cannot prevent an imbalance that arises after the
+/// placement decision, and §5 stealing cannot repair one while every CPU is
+/// busy. Invert these when R4C lands; do not delete them.
+#[test]
+fn idle_stealing_cannot_reach_an_imbalance_placement_did_not_cause() {
+    let mut model = saturated_four_cpu_model();
+    add_from_the_launching_cpu(&mut model, CPU_COUNT..TASK_CAPACITY);
+    for slot in CPU_COUNT + 1..TASK_CAPACITY {
+        model.terminate(task(slot, 1)).unwrap();
+    }
+    assert_eq!(model.runnable_depth(0), 2);
+    for cpu in 1..CPU_COUNT {
+        assert_eq!(model.runnable_depth(cpu), 1);
+    }
+    for cpu in 0..CPU_COUNT {
+        assert_eq!(
+            model.steal_idle(cpu),
+            Err(ModelError::CpuBusy),
+            "load recovery is still gated on an idleness that never arrives"
+        );
+    }
+    model.run_for(64).unwrap();
+    assert!(model.every_cpu_is_busy());
+    assert_eq!(model.runnable_depth(0), 2, "the imbalance is permanent");
+}
+
+/// R4C oracle. See above.
+#[test]
+fn a_share_imbalance_created_after_placement_still_never_recovers() {
+    let mut model = saturated_four_cpu_model();
+    add_from_the_launching_cpu(&mut model, CPU_COUNT..TASK_CAPACITY);
+    for slot in CPU_COUNT + 1..TASK_CAPACITY {
+        model.terminate(task(slot, 1)).unwrap();
+    }
     let baseline = model.quanta_served;
     let offered = model.recovery_offers;
     let refused = model.recovery_refusals;
@@ -959,26 +1044,23 @@ fn every_thread_runs_yet_the_saturated_imbalance_never_recovers() {
         model.recovery_refusals - refused,
         "load recovery was offered on every CPU every quantum and refused every time"
     );
-    let (min, max) = served_bounds(&model, baseline);
-    assert_eq!(min, 20, "the launching CPU's five threads take a fifth each");
-    assert_eq!(max, 100, "a sole occupant takes every quantum of its CPU");
-    for slot in 0..TASK_CAPACITY {
-        assert!(
-            model.quanta_served(task(slot, 1)) > 0,
-            "contract §5 eventual progress holds: slot {slot} ran"
+    for slot in [0, CPU_COUNT] {
+        assert_eq!(
+            model.quanta_served(task(slot, 1)) - baseline[slot],
+            50,
+            "CPU 0's pair still take half a CPU each"
         );
     }
-
-    let settled = model.quanta_served;
-    model.run_for(100).unwrap();
-    let (min, max) = served_bounds(&model, settled);
-    assert_eq!(
-        (min, max),
-        (20, 100),
-        "the 5:1 split is stable, not transient"
-    );
+    for slot in 1..CPU_COUNT {
+        assert_eq!(
+            model.quanta_served(task(slot, 1)) - baseline[slot],
+            100,
+            "while a sole occupant takes every quantum of its CPU"
+        );
+    }
+    let (min, max) = served_bounds(&model, baseline);
     assert!(
         max / min > BALANCED_SHARE_SPREAD,
-        "R4B/R4C must close this; invert the assertion when they do"
+        "R4C must close this; invert the assertion when it does"
     );
 }
