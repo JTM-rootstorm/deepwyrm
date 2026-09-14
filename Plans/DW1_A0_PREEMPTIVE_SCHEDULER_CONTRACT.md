@@ -414,7 +414,7 @@ changing policy:
 | Local APIC one-shot programming | `LocalApic::program_one_shot_timer`/`stop_timer` in `kernel/src/arch/x86_64/apic.rs`, called by `LiveTimeState::reprogram` and time initialization in `kernel/src/time/live.rs` | The future unified arbiter must become the sole programmer before DW1-B adds a quantum source. |
 | stationary runtime/root guards and root switch | depth/phase witnesses in `kernel/src/arch/x86_64/syscall/stationary_runtime.rs`; runtime binding in `kernel/src/arch/x86_64/syscall/runtime_binding.rs`; root selection in `kernel/src/arch/x86_64/mm/activation/` | No stationary/paging guard or root-switch transaction may cross a scheduler switch/preemption boundary. |
 | scratch and execution-pin migration exclusion | CPU-local scratch sessions under `kernel/src/arch/x86_64/mm/`; task exit pins in `kernel/src/task/mod.rs` and `kernel/src/task/execution.rs` | Live scratch, execution pins, root switch, suspended continuation, block preparation, and unacknowledged stop all reject migration. |
-| DW1 future-policy host model | `kernel/src/task/scheduler/normal_policy_model.rs`, compiled only under `cfg(test)` | Fixed-capacity model covers placement, per-CPU FIFO rotation, eligibility/offline rejection, bounded cyclic idle stealing, migration guards, quantum generations/arithmetic, and block/wake/terminal races without changing cooperative production behavior, plus the saturated four-CPU liveness case of §5, the load-qualified placement of §4, and expiry-time rebalancing with its convergence bound. |
+| DW1 future-policy host model | `kernel/src/task/scheduler/normal_policy_model.rs`, compiled only under `cfg(test)` | Fixed-capacity model covers placement, per-CPU FIFO rotation, eligibility/offline rejection, bounded cyclic idle stealing, migration guards, quantum generations/arithmetic, and block/wake/terminal races without changing cooperative production behavior, plus the saturated four-CPU liveness case of §5, the load-qualified placement of §4, expiry-time rebalancing with its convergence bound, and entrant progress against no-yield workloads. |
 
 New transition surfaces must be added to this inventory or to the DW1
 validation record before their behavior is accepted.
@@ -436,7 +436,10 @@ The allocation-free host/model suite must cover, at minimum:
 - accounting overflow/regression;
 - saturated placement, wake, rotation, per-Thread share, the reachability of
   load recovery while every CPU is busy, and that rebalancing converges rather
-  than rotating; and
+  than rotating;
+- newly created and deadline-woken Threads reaching execution against workloads
+  that never yield and never block, with every deadline wake requested from the
+  timer owner; and
 - fixed-seed state-machine traces with invariant checks after every operation.
 
 DW1-A closes only when this contract is indexed, the transition inventory and

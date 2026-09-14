@@ -1131,3 +1131,111 @@ fn an_already_optimal_spread_is_left_alone() {
         "five threads on four CPUs are already as even as they can be"
     );
 }
+
+// ---------------------------------------------------------------------------
+// R4D: entrants against no-yield workloads.
+//
+// The hogs in this model never yield and never block -- the model has no
+// voluntary yield at all -- so every switch below is involuntary. What R4D
+// validates is that a thread arriving into that workload still runs, and runs
+// soon: a newly created one, and one woken by a deadline.
+//
+// Deadline wakes matter on their own because §11 makes CPU 0 the sole live
+// timer and wait-service owner, so every deadline wake is requested from CPU 0.
+// Under the unqualified §4 order, a waiter whose last CPU was also CPU 0 --
+// which is the common case, since it blocked there -- returned to CPU 0 however
+// loaded it was, and so did the next, and the next.
+
+/// Three threads that ran on CPU 0 and blocked there, as a deadline waiter
+/// does, with four no-yield hogs then saturating every CPU.
+fn deadline_waiters_then_saturation() -> (NormalPolicyModel, [WakeToken; 3]) {
+    let mut model = NormalPolicyModel::new(0b1111);
+    for slot in 0..3 {
+        assert_eq!(model.add(task(slot, 1), 0b1111, 0), Ok(0));
+    }
+    let mut wakes = [None; 3];
+    for wake in wakes.iter_mut() {
+        let running = model.dispatch(0, 0).unwrap().expect("a waiter to run");
+        model.prepare_block(running).unwrap();
+        *wake = Some(model.commit_block(running).unwrap());
+    }
+    for slot in 0..3 {
+        assert_eq!(
+            model.tasks[slot].last_cpu,
+            Some(0),
+            "a waiter blocks on the CPU it ran on, which is the timer owner"
+        );
+    }
+
+    for slot in 3..3 + CPU_COUNT {
+        model.add(task(slot, 1), 0b1111, 0).unwrap();
+    }
+    model.advance_one_quantum().unwrap();
+    assert!(model.every_cpu_is_busy());
+    for cpu in 0..CPU_COUNT {
+        assert_eq!(model.runnable_depth(cpu), 1, "one hog per CPU");
+    }
+    (model, wakes.map(|wake| wake.expect("blocked waiter")))
+}
+
+#[test]
+fn a_thread_created_under_saturation_runs_at_the_first_expiry_of_its_cpu() {
+    let mut model = saturated_four_cpu_model();
+    // One thread per CPU, all created from CPU 0, the launching CPU.
+    for cpu in 0..CPU_COUNT {
+        assert_eq!(
+            model.add(task(CPU_COUNT + cpu, 1), 0b1111, 0),
+            Ok(cpu),
+            "no entrant queues behind another while a peer carries less"
+        );
+    }
+    model.advance_one_quantum().unwrap();
+    for cpu in 0..CPU_COUNT {
+        assert_eq!(
+            model.quanta_served(task(CPU_COUNT + cpu, 1)),
+            1,
+            "no hog yielded or blocked, and every entrant still ran"
+        );
+    }
+    for slot in 0..CPU_COUNT {
+        assert!(
+            matches!(
+                model.tasks[slot].state,
+                TaskState::Runnable { .. } | TaskState::Running { .. }
+            ),
+            "every hog is still continuously runnable"
+        );
+    }
+}
+
+#[test]
+fn deadline_wakes_all_requested_from_cpu0_do_not_pile_onto_it() {
+    let (mut model, wakes) = deadline_waiters_then_saturation();
+    let mut placed = [0; 3];
+    for (slot, wake) in wakes.into_iter().enumerate() {
+        placed[slot] = model.wake(wake, 0).expect("admissible deadline wake");
+    }
+    assert_eq!(
+        placed,
+        [0, 1, 2],
+        "the first waiter is retained on the timer owner; the rest are not"
+    );
+    assert_eq!(model.runnable_depth(0), 2);
+}
+
+#[test]
+fn every_deadline_waiter_runs_at_the_first_expiry_after_its_wake() {
+    let (mut model, wakes) = deadline_waiters_then_saturation();
+    for wake in wakes {
+        model.wake(wake, 0).expect("admissible deadline wake");
+    }
+    let baseline = model.quanta_served;
+    model.advance_one_quantum().unwrap();
+    for slot in 0..3 {
+        assert_eq!(
+            model.quanta_served(task(slot, 1)) - baseline[slot],
+            1,
+            "waiter {slot} ran one quantum after its wake, against no-yield hogs"
+        );
+    }
+}

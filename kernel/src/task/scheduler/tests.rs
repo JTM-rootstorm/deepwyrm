@@ -3675,3 +3675,100 @@ fn r4c_a_balanced_system_is_never_disturbed() {
     assert_eq!(scheduler.last_migration(), None);
     assert_eq!(scheduler.check_invariants(), Ok(()));
 }
+
+/// Four no-yield hogs, one per CPU, every CPU running.
+fn saturating_hogs(scheduler: &CooperativeScheduler<8>, registry: &mut ObjectRegistry<16>) {
+    for index in 0..H2_SCHEDULER_CPU_CAPACITY {
+        let hog = thread_key(registry);
+        scheduler
+            .commit_on(cpu(index), scheduler.reserve(hog).unwrap())
+            .unwrap();
+        assert_eq!(
+            scheduler.schedule_next_on(cpu(index)).unwrap().current,
+            Some(hog)
+        );
+    }
+}
+
+/// R4D. Nothing below calls `yield_current_on` or blocks a hog: every switch is
+/// involuntary, which is the workload the card names.
+#[test]
+fn r4d_a_thread_created_under_saturation_reaches_running() {
+    let scheduler = CooperativeScheduler::<8>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    saturating_hogs(&scheduler, &mut registry);
+
+    // One thread per CPU, all created from CPU 0, the launching CPU.
+    let mut entrants = [None; H2_SCHEDULER_CPU_CAPACITY];
+    for (index, slot) in entrants.iter_mut().enumerate() {
+        let entrant = thread_key(&mut registry);
+        assert_eq!(
+            scheduler
+                .commit_on(cpu(0), scheduler.reserve(entrant).unwrap())
+                .unwrap()
+                .target(),
+            cpu(index),
+            "no entrant queues behind another while a peer carries less"
+        );
+        *slot = Some(entrant);
+    }
+    for (index, entrant) in entrants.into_iter().enumerate() {
+        let ticket = scheduler.prepare_quantum_on(cpu(index), 10).unwrap();
+        assert_eq!(scheduler.publish_quantum_expiry(ticket), Ok(true));
+        match scheduler.preempt_current_on(cpu(index)).unwrap() {
+            SchedulerPreemptionDecision::Switch { decision, .. } => {
+                assert_eq!(
+                    decision.current, entrant,
+                    "each entrant runs at the first expiry of the CPU it joined"
+                );
+            }
+            decision => panic!("a hog kept its CPU against a new thread: {decision:?}"),
+        }
+    }
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+/// R4D. CPU 0 is the sole live timer and wait-service owner, so every deadline
+/// wake is requested from CPU 0, and a waiter's last CPU is usually CPU 0 too
+/// because that is where it blocked. Under the unqualified §4 order every such
+/// waiter returned to CPU 0 however loaded it already was.
+#[test]
+fn r4d_deadline_wakes_from_cpu0_do_not_pile_onto_it() {
+    let scheduler = CooperativeScheduler::<8>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+
+    let mut wakes = [None; 3];
+    for slot in wakes.iter_mut() {
+        let waiter = thread_key(&mut registry);
+        assert_eq!(
+            scheduler
+                .commit_on(cpu(0), scheduler.reserve(waiter).unwrap())
+                .unwrap()
+                .target(),
+            cpu(0)
+        );
+        assert_eq!(
+            scheduler.schedule_next_on(cpu(0)).unwrap().current,
+            Some(waiter)
+        );
+        let running = scheduler.running_claim_on(cpu(0)).unwrap();
+        let (blocked, _) = scheduler.block_current_on(cpu(0), waiter).unwrap();
+        scheduler.complete_switch_on(running).unwrap();
+        *slot = Some(blocked.into_wake_key());
+    }
+
+    saturating_hogs(&scheduler, &mut registry);
+    let mut placed = [cpu(0); 3];
+    for (slot, wake) in wakes.into_iter().enumerate() {
+        placed[slot] = scheduler
+            .wake_on(cpu(0), wake.expect("blocked waiter"))
+            .unwrap()
+            .target();
+    }
+    assert_eq!(
+        placed,
+        [cpu(0), cpu(1), cpu(2)],
+        "the first waiter is retained on the timer owner; the rest are not"
+    );
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
