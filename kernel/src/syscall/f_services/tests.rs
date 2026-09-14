@@ -680,10 +680,14 @@ fn retire_created_process(
     }
     let effects = fixture
         .tasks
-        .terminate_process_authorized(&mut fixture.registry, child, 0x10)
+        .terminate_process_authorized(child, 0x10)
         .unwrap();
-    assert_eq!(effects.drained.final_release_count(), 0);
-    let (process_pin, thread_pins, resources) = effects.pins.into_parts();
+    let (_, drained) = fixture
+        .tasks
+        .drain_exited_process_handles_stepwise(&mut fixture.registry, child)
+        .unwrap();
+    assert_eq!(drained, 0);
+    let (process_pin, thread_pins, resources) = effects.into_parts();
     assert!(thread_pins.into_iter().flatten().next().is_none());
     assert!(resources.into_iter().flatten().next().is_none());
     cleanup.push_optional(

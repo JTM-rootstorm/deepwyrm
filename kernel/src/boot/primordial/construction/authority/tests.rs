@@ -519,13 +519,16 @@ fn concrete_authority_adapter_commits_real_init_transfer_and_exact_start_state()
     drop(backend);
 
     let effects = tasks
-        .exit_process(&mut registry, monitor.process_key, monitor.thread_key, 0)
+        .exit_process(monitor.process_key, monitor.thread_key, 0)
         .unwrap();
     let info = tasks.process_info(monitor.process_key).unwrap();
     assert_eq!(info.state, DW_TASK_STATE_EXITED);
     assert_eq!(info.reason, DW_TERMINATION_NORMAL_EXIT);
     assert_eq!(info.application_code, 0);
-    for release in effects.drained.into_final_releases().into_iter().flatten() {
+    let (drained, _) = tasks
+        .drain_exited_process_handles_stepwise(&mut registry, monitor.process_key)
+        .unwrap();
+    for release in drained.into_iter().flatten() {
         finalize_known(
             &mut platform,
             &mut registry,
@@ -538,7 +541,7 @@ fn concrete_authority_adapter_commits_real_init_transfer_and_exact_start_state()
             release,
         );
     }
-    let retired = execution.retire_exit_pins(effects.pins);
+    let retired = execution.retire_exit_pins(effects);
     let (process_pin, thread_pins) = retired.into_parts();
     for pin in thread_pins.into_iter().flatten().chain(process_pin) {
         if let Some(release) = registry.release_internal(pin).unwrap() {

@@ -2572,7 +2572,7 @@ fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
     // region model or publisher sees another mutation.
     let child_operation = tasks.acquire_process_operation(child).unwrap();
     assert!(matches!(
-        tasks.terminate_process_authorized(&mut registry, child, 0x71),
+        tasks.terminate_process_authorized(child, 0x71),
         Err(crate::task::TaskError::OperationsInFlight)
     ));
     assert_eq!(
@@ -2594,11 +2594,12 @@ fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
     assert_eq!(publisher.replacements, 2);
     tasks.release_process_operation(child_operation).unwrap();
 
-    let effects = tasks
-        .terminate_process_authorized(&mut registry, child, 0x71)
+    let effects = tasks.terminate_process_authorized(child, 0x71).unwrap();
+    let (_, drained) = tasks
+        .drain_exited_process_handles_stepwise(&mut registry, child)
         .unwrap();
-    assert_eq!(effects.drained.final_release_count(), 0);
-    let (process_pin, thread_pins, resources) = effects.pins.into_parts();
+    assert_eq!(drained, 0);
+    let (process_pin, thread_pins, resources) = effects.into_parts();
     assert!(thread_pins.into_iter().flatten().next().is_none());
     assert!(resources.into_iter().flatten().next().is_none());
     cleanup.push_optional(registry.release_internal(process_pin.unwrap()).unwrap());
@@ -4939,12 +4940,15 @@ fn task_group_termination_inspection_omits_retained_exited_descendants() {
         .unwrap();
 
     let exited = tasks
-        .terminate_process_authorized(&mut registry, exited_process, 0)
+        .terminate_process_authorized(exited_process, 0)
         .unwrap();
-    assert_eq!(exited.drained.final_release_count(), 0);
-    assert_eq!(exited.pins.thread_keys(), [Some(exited_thread), None]);
-    assert!(exited.pins.exits_process());
-    let (process_pin, thread_pins, resources) = exited.pins.into_parts();
+    let (_, drained) = tasks
+        .drain_exited_process_handles_stepwise(&mut registry, exited_process)
+        .unwrap();
+    assert_eq!(drained, 0);
+    assert_eq!(exited.thread_keys(), [Some(exited_thread), None]);
+    assert!(exited.exits_process());
+    let (process_pin, thread_pins, resources) = exited.into_parts();
     assert!(resources.into_iter().all(|resource| resource.is_none()));
     for pin in thread_pins.into_iter().flatten().chain(process_pin) {
         assert!(registry.release_internal(pin).unwrap().is_none());
@@ -5588,11 +5592,12 @@ fn task_create_output_preflight_precedes_generation_and_handle_mutation() {
             DW_STATUS_SUCCESS
         );
     }
-    let effects = tasks
-        .terminate_process_authorized(&mut registry, process, 0x40)
+    let effects = tasks.terminate_process_authorized(process, 0x40).unwrap();
+    let (_, drained) = tasks
+        .drain_exited_process_handles_stepwise(&mut registry, process)
         .unwrap();
-    assert_eq!(effects.drained.final_release_count(), 0);
-    let (process_pin, thread_pins, resources) = effects.pins.into_parts();
+    assert_eq!(drained, 0);
+    let (process_pin, thread_pins, resources) = effects.into_parts();
     assert!(thread_pins.into_iter().flatten().next().is_none());
     assert!(resources.into_iter().flatten().next().is_none());
     cleanup.push_optional(registry.release_internal(process_pin.unwrap()).unwrap());
@@ -5880,7 +5885,7 @@ fn device_resource_claim_handle_errors_precede_terminating_caller_state() {
 
     let in_flight = tasks.acquire_process_operation(process).unwrap();
     assert!(matches!(
-        tasks.terminate_process_authorized(&mut registry, process, 0x51),
+        tasks.terminate_process_authorized(process, 0x51),
         Err(crate::task::TaskError::OperationsInFlight)
     ));
     assert_eq!(
@@ -5939,11 +5944,12 @@ fn device_resource_claim_handle_errors_precede_terminating_caller_state() {
         );
     }
     tasks.release_process_operation(in_flight).unwrap();
-    let effects = tasks
-        .terminate_process_authorized(&mut registry, process, 0x51)
+    let effects = tasks.terminate_process_authorized(process, 0x51).unwrap();
+    let (_, drained) = tasks
+        .drain_exited_process_handles_stepwise(&mut registry, process)
         .unwrap();
-    assert_eq!(effects.drained.final_release_count(), 0);
-    let (process_pin, thread_pins, resources) = effects.pins.into_parts();
+    assert_eq!(drained, 0);
+    let (process_pin, thread_pins, resources) = effects.into_parts();
     assert!(thread_pins.into_iter().flatten().next().is_none());
     assert!(resources.into_iter().flatten().next().is_none());
     cleanup.push_optional(registry.release_internal(process_pin.unwrap()).unwrap());
@@ -6057,11 +6063,12 @@ fn device_resource_claim_publication_failures_use_typed_close_and_restore_capaci
             .unwrap(),
     );
     tasks.release_process_operation(operation).unwrap();
-    let effects = tasks
-        .terminate_process_authorized(&mut registry, process, 0x52)
+    let effects = tasks.terminate_process_authorized(process, 0x52).unwrap();
+    let (_, drained) = tasks
+        .drain_exited_process_handles_stepwise(&mut registry, process)
         .unwrap();
-    assert_eq!(effects.drained.final_release_count(), 0);
-    let (process_pin, thread_pins, retired_resources) = effects.pins.into_parts();
+    assert_eq!(drained, 0);
+    let (process_pin, thread_pins, retired_resources) = effects.into_parts();
     assert!(thread_pins.into_iter().flatten().next().is_none());
     assert!(retired_resources.into_iter().flatten().next().is_none());
     cleanup.push_optional(registry.release_internal(process_pin.unwrap()).unwrap());
@@ -10122,10 +10129,14 @@ fn retire_f10_created_process(
 
     let effects = fixture
         .tasks
-        .terminate_process_authorized(&mut fixture.registry, child, 0x10)
+        .terminate_process_authorized(child, 0x10)
         .unwrap();
-    assert_eq!(effects.drained.final_release_count(), 0);
-    let (process_pin, thread_pins, resources) = effects.pins.into_parts();
+    let (_, drained) = fixture
+        .tasks
+        .drain_exited_process_handles_stepwise(&mut fixture.registry, child)
+        .unwrap();
+    assert_eq!(drained, 0);
+    let (process_pin, thread_pins, resources) = effects.into_parts();
     assert!(thread_pins.into_iter().flatten().next().is_none());
     assert!(resources.into_iter().flatten().next().is_none());
     cleanup.push_optional(
@@ -11108,4 +11119,44 @@ fn process_create_commits_typed_results_and_child_bootstrap_metadata() {
         &mut cleanup,
     );
     close_f10_fixture_with_open_channels(fixture, false, false, true);
+}
+
+/// R5B: what the Process termination path costs a frame, and that the cost no
+/// longer tracks `HANDLES`.
+///
+/// Before this card `PreparedProcessTermination` carried a `DrainResult<HANDLES>`
+/// alongside the pins and was moved through three frames -- `prepare`, the
+/// completion, and `collect_process_effects`. Measured at the E8 geometry
+/// (`HANDLES = THREADS = 64`):
+///
+/// | | Bytes |
+/// | --- | ---: |
+/// | `ExitPins<64>` | 3,624 |
+/// | `PreRetiredTerminalThreads<64>` | 1,536 |
+/// | `PreparedProcessTermination<64>` | 5,176 |
+/// | the `DrainResult<64>` it no longer carries | 2,056 |
+/// | one staged drain window | 1,024 |
+///
+/// The second assertion is the one that matters: doubling `HANDLES` leaves both
+/// the prepared record and the drain window exactly where they were.
+#[test]
+fn r5b_the_prepared_process_record_no_longer_scales_with_handle_capacity() {
+    assert_eq!(size_of::<crate::task::ExitPins<64>>(), 3_624);
+    assert_eq!(size_of::<super::PreRetiredTerminalThreads<64>>(), 1_536);
+    assert_eq!(size_of::<super::PreparedProcessTermination<64>>(), 5_176);
+    assert_eq!(size_of::<crate::handle::DrainResult<64>>(), 2_056);
+    assert_eq!(
+        size_of::<[Option<crate::object::FinalRelease>; super::TERMINAL_DRAIN_WINDOW]>(),
+        1_024
+    );
+
+    // The record is generic in THREADS alone, and the window is a constant, so
+    // handle capacity cannot reach either one.
+    assert_eq!(
+        size_of::<super::PreparedProcessTermination<64>>(),
+        size_of::<crate::task::ExitPins<64>>()
+            + size_of::<super::PreRetiredTerminalThreads<64>>()
+            + size_of::<ProcessKey>()
+    );
+    assert_eq!(size_of::<crate::handle::DrainResult<128>>(), 4_104);
 }

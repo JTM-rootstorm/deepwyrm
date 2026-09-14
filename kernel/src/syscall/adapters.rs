@@ -1187,6 +1187,56 @@ impl DeferredCurrentRetirement {
     }
 }
 
+/// Handle finalizers one bounded drain step hands back.
+///
+/// Deliberately not `HANDLES`: this constant is what stops a terminal frame's
+/// cost from tracking per-Process handle capacity. A Process with more handles
+/// than this takes more steps.
+const TERMINAL_DRAIN_WINDOW: usize = 32;
+
+/// Drains an exited Process's handles into `cleanup` one bounded window at a
+/// time.
+///
+/// `CleanupQueue` is push-only and is consumed once, after the syscall's pins
+/// and locks are dropped, so routing finalizers into it in several steps
+/// instead of one array cannot change when they are actually released.
+fn drain_exited_process_handles_staged<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    process: ProcessKey,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> Result<(), TaskError> {
+    let mut window: [Option<FinalRelease>; TERMINAL_DRAIN_WINDOW] = core::array::from_fn(|_| None);
+    let mut cursor = 0;
+    loop {
+        let step =
+            tasks.drain_exited_process_handle_window(registry, process, cursor, &mut window)?;
+        for release in window
+            .iter_mut()
+            .take(step.written())
+            .filter_map(Option::take)
+        {
+            cleanup.push(release);
+        }
+        if step.done() {
+            return Ok(());
+        }
+        // A step whose window is at least one wide always consumes at least one
+        // slot before it can report full, so the cursor cannot stand still.
+        assert!(
+            step.resume() > cursor,
+            "a bounded Process handle drain step made no progress"
+        );
+        cursor = step.resume();
+    }
+}
+
 fn collect_process_effects<
     C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
     const OBJECTS: usize,
@@ -1201,7 +1251,7 @@ fn collect_process_effects<
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
     waits: &WaitRegistry<WAITERS>,
-    effects: ProcessExitEffects<HANDLES, THREADS>,
+    pins: crate::task::ExitPins<THREADS>,
     pre_retired: &mut PreRetiredTerminalThreads<THREADS>,
     defer_current: Option<DeferredCurrentRetirement>,
     remotely_stopped: &[Option<ThreadKey>],
@@ -1209,23 +1259,18 @@ fn collect_process_effects<
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> Option<DeferredCurrentExecutionResources> {
     let deferred_thread = defer_current.filter(|current| {
-        effects
-            .pins
-            .thread_keys()
+        pins.thread_keys()
             .into_iter()
             .flatten()
             .any(|thread| thread == current.thread())
     });
-    for release in effects.drained.into_final_releases().into_iter().flatten() {
-        cleanup.push(release);
-    }
-    for thread in effects.pins.thread_keys().into_iter().flatten() {
+    for thread in pins.thread_keys().into_iter().flatten() {
         terminal_waits.cleanup_terminal_wait(registry, tasks, waits, execution, thread, cleanup);
     }
     let (pins, deferred) = match deferred_thread {
         Some(DeferredCurrentRetirement::Model(current)) => {
             let (pins, deferred) = execution.retire_quiesced_exit_pins_defer_current(
-                effects.pins,
+                pins,
                 current,
                 pre_retired.as_mut(),
             );
@@ -1235,7 +1280,7 @@ fn collect_process_effects<
             let (pins, deferred) = execution
                 .retire_quiesced_exit_pins_defer_current_after_remote_stops_on(
                     cpu,
-                    effects.pins,
+                    pins,
                     thread,
                     remotely_stopped,
                     pre_retired.as_mut(),
@@ -1243,12 +1288,12 @@ fn collect_process_effects<
             (pins, Some(deferred))
         }
         None if remotely_stopped.is_empty() => (
-            execution.retire_quiesced_exit_pins(effects.pins, pre_retired.as_mut()),
+            execution.retire_quiesced_exit_pins(pins, pre_retired.as_mut()),
             None,
         ),
         None => (
             execution.retire_quiesced_exit_pins_after_remote_stops(
-                effects.pins,
+                pins,
                 remotely_stopped,
                 pre_retired.as_mut(),
             ),
@@ -1298,9 +1343,9 @@ impl<const THREADS: usize> PreRetiredTerminalThreads<THREADS> {
 }
 
 #[must_use = "prepared Process termination must be completed after remote execution owners are stopped"]
-pub(crate) struct PreparedProcessTermination<const HANDLES: usize, const THREADS: usize> {
+pub(crate) struct PreparedProcessTermination<const THREADS: usize> {
     target: ProcessKey,
-    effects: ProcessExitEffects<HANDLES, THREADS>,
+    pins: crate::task::ExitPins<THREADS>,
     pre_retired: PreRetiredTerminalThreads<THREADS>,
 }
 
@@ -1348,13 +1393,13 @@ impl<const PROCESSES: usize, const HANDLES: usize, const THREADS: usize>
     }
 }
 
-impl<const HANDLES: usize, const THREADS: usize> PreparedProcessTermination<HANDLES, THREADS> {
+impl<const THREADS: usize> PreparedProcessTermination<THREADS> {
     pub(crate) const fn target(&self) -> ProcessKey {
         self.target
     }
 
     pub(crate) fn thread_keys(&self) -> [Option<ThreadKey>; THREADS] {
-        self.effects.pins.thread_keys()
+        self.pins.thread_keys()
     }
 
     pub(crate) fn record_pre_retired(&mut self, thread: ThreadKey) {
@@ -5133,12 +5178,16 @@ fn collect_group_effects<
                 remote_count += 1;
             }
         }
+        let ProcessExitEffects { drained, pins } = process;
+        for release in drained.into_final_releases().into_iter().flatten() {
+            cleanup.push(release);
+        }
         let deferred = collect_process_effects(
             registry,
             tasks,
             execution,
             waits,
-            process,
+            pins,
             pre_retired,
             Some(defer_current),
             &batch_remote,
@@ -5162,12 +5211,16 @@ fn collect_group_effects<
                 remote_count += 1;
             }
         }
+        let ProcessExitEffects { drained, pins } = process;
+        for release in drained.into_final_releases().into_iter().flatten() {
+            cleanup.push(release);
+        }
         collect_process_effects(
             registry,
             tasks,
             execution,
             waits,
-            process,
+            pins,
             pre_retired,
             Some(defer_current),
             &batch_remote,
@@ -5604,14 +5657,14 @@ pub(crate) fn prepare_process_exit<
     current_thread: ThreadKey,
     code: u32,
     cleanup: &mut CleanupQueue<OBJECTS>,
-) -> Result<PreparedProcessTermination<HANDLES, THREADS>, DwStatus> {
+) -> Result<PreparedProcessTermination<THREADS>, DwStatus> {
     validate_running_caller(tasks, execution, current_process, current_thread)?;
     #[cfg(deepwyrm_dw1c_evidence)]
     let terminal_thread_generation = execution
         .current_execution_generation(current_thread)
         .unwrap_or_else(|| panic!("selector-28 exiting Thread has no exact execution claim"));
-    let effects = match tasks.exit_process(registry, current_process, current_thread, code) {
-        Ok(effects) => effects,
+    let pins = match tasks.exit_process(current_process, current_thread, code) {
+        Ok(pins) => pins,
         Err(TaskError::OperationsInFlight) => {
             let threads = match tasks.process_thread_keys(current_process) {
                 Ok(threads) => threads,
@@ -5621,13 +5674,15 @@ pub(crate) fn prepare_process_exit<
                 terminal_waits
                     .cleanup_terminal_wait(registry, tasks, waits, execution, thread, cleanup);
             }
-            match tasks.exit_process(registry, current_process, current_thread, code) {
-                Ok(effects) => effects,
+            match tasks.exit_process(current_process, current_thread, code) {
+                Ok(pins) => pins,
                 Err(error) => return Err(task_status(error)),
             }
         }
         Err(error) => return Err(task_status(error)),
     };
+    drain_exited_process_handles_staged(registry, tasks, current_process, cleanup)
+        .unwrap_or_else(|error| panic!("exiting Process could not drain its handles: {error:?}"));
     #[cfg(deepwyrm_dw1c_evidence)]
     crate::test_support::DW1C_EVIDENCE
         .observe_process_exit(
@@ -5637,12 +5692,11 @@ pub(crate) fn prepare_process_exit<
             code,
         )
         .unwrap_or_else(|error| panic!("selector-28 Process EXIT observation failed: {error:?}"));
-    let pre_retired = PreRetiredTerminalThreads::new(
-        execution.quiesce_terminal_threads(effects.pins.thread_keys()),
-    );
+    let pre_retired =
+        PreRetiredTerminalThreads::new(execution.quiesce_terminal_threads(pins.thread_keys()));
     Ok(PreparedProcessTermination {
         target: current_process,
-        effects,
+        pins,
         pre_retired,
     })
 }
@@ -5774,17 +5828,16 @@ pub(crate) fn prepare_process_unhandled_exception<
     current_thread: ThreadKey,
     exception: TaskExceptionRecord,
     cleanup: &mut CleanupQueue<OBJECTS>,
-) -> Result<PreparedProcessTermination<HANDLES, THREADS>, DwStatus> {
+) -> Result<PreparedProcessTermination<THREADS>, DwStatus> {
     validate_running_caller(tasks, execution, current_process, current_thread)?;
-    let effects = match tasks.terminate_process_exception(
-        registry,
+    let pins = match tasks.terminate_process_exception(
         current_process,
         current_thread,
         exception.exception_type,
         exception.detail,
         exception.fault_address,
     ) {
-        Ok(effects) => effects,
+        Ok(pins) => pins,
         Err(TaskError::OperationsInFlight) => {
             let threads = match tasks.process_thread_keys(current_process) {
                 Ok(threads) => threads,
@@ -5795,25 +5848,25 @@ pub(crate) fn prepare_process_unhandled_exception<
                     .cleanup_terminal_wait(registry, tasks, waits, execution, thread, cleanup);
             }
             match tasks.terminate_process_exception(
-                registry,
                 current_process,
                 current_thread,
                 exception.exception_type,
                 exception.detail,
                 exception.fault_address,
             ) {
-                Ok(effects) => effects,
+                Ok(pins) => pins,
                 Err(error) => return Err(task_status(error)),
             }
         }
         Err(error) => return Err(task_status(error)),
     };
-    let pre_retired = PreRetiredTerminalThreads::new(
-        execution.quiesce_terminal_threads(effects.pins.thread_keys()),
-    );
+    drain_exited_process_handles_staged(registry, tasks, current_process, cleanup)
+        .unwrap_or_else(|error| panic!("faulting Process could not drain its handles: {error:?}"));
+    let pre_retired =
+        PreRetiredTerminalThreads::new(execution.quiesce_terminal_threads(pins.thread_keys()));
     Ok(PreparedProcessTermination {
         target: current_process,
-        effects,
+        pins,
         pre_retired,
     })
 }
@@ -5894,7 +5947,7 @@ pub(crate) fn prepare_process_terminate<
     reason: DwTerminationReason,
     detail: u32,
     cleanup: &mut CleanupQueue<OBJECTS>,
-) -> Result<PreparedProcessTermination<HANDLES, THREADS>, DwStatus> {
+) -> Result<PreparedProcessTermination<THREADS>, DwStatus> {
     authorized_reason(reason)?;
     validate_running_caller(tasks, execution, current_process, current_thread)?;
     let pin = resolve_current_handle(
@@ -5906,8 +5959,8 @@ pub(crate) fn prepare_process_terminate<
         DW_RIGHT_MODIFY,
     )?;
     let target = ProcessKey::from_object_id(pin.id());
-    let effects = match tasks.terminate_process_authorized(registry, target, detail) {
-        Ok(effects) => effects,
+    let pins = match tasks.terminate_process_authorized(target, detail) {
+        Ok(pins) => pins,
         Err(TaskError::OperationsInFlight) => {
             let threads = match tasks.process_thread_keys(target) {
                 Ok(threads) => threads,
@@ -5920,8 +5973,8 @@ pub(crate) fn prepare_process_terminate<
                 terminal_waits
                     .cleanup_terminal_wait(registry, tasks, waits, execution, thread, cleanup);
             }
-            match tasks.terminate_process_authorized(registry, target, detail) {
-                Ok(effects) => effects,
+            match tasks.terminate_process_authorized(target, detail) {
+                Ok(pins) => pins,
                 Err(error) => {
                     release_lookup_pin(registry, pin, cleanup);
                     return Err(task_status(error));
@@ -5933,16 +5986,18 @@ pub(crate) fn prepare_process_terminate<
             return Err(task_status(error));
         }
     };
-    let pre_retired = PreRetiredTerminalThreads::new(
-        execution.quiesce_terminal_threads(effects.pins.thread_keys()),
-    );
+    drain_exited_process_handles_staged(registry, tasks, target, cleanup).unwrap_or_else(|error| {
+        panic!("terminated Process could not drain its handles: {error:?}")
+    });
+    let pre_retired =
+        PreRetiredTerminalThreads::new(execution.quiesce_terminal_threads(pins.thread_keys()));
     // The Process identity is now captured by the terminal effects and the
     // caller's Handle may be released before a potentially blocking remote
     // stop. No HandleTable/registry borrow crosses that wait.
     release_lookup_pin(registry, pin, cleanup);
     Ok(PreparedProcessTermination {
         target,
-        effects,
+        pins,
         pre_retired,
     })
 }
@@ -5964,7 +6019,7 @@ pub(crate) fn complete_prepared_process_termination<
     terminal_waits: &mut C,
     current_process: ProcessKey,
     current_thread: ThreadKey,
-    prepared: PreparedProcessTermination<HANDLES, THREADS>,
+    prepared: PreparedProcessTermination<THREADS>,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> (
     DwStatus,
@@ -6002,7 +6057,7 @@ pub(crate) fn complete_prepared_process_termination_after_remote_stops<
     terminal_waits: &mut C,
     current_process: ProcessKey,
     current_thread: ThreadKey,
-    prepared: PreparedProcessTermination<HANDLES, THREADS>,
+    prepared: PreparedProcessTermination<THREADS>,
     permits: [Option<crate::arch::x86_64::rendezvous::RemoteStopReclaimPermit>;
         crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
     cleanup: &mut CleanupQueue<OBJECTS>,
@@ -6046,7 +6101,7 @@ pub(crate) fn complete_prepared_process_termination_after_remote_stops_on<
     current_cpu: crate::cpu::CpuIndex,
     current_process: ProcessKey,
     current_thread: ThreadKey,
-    prepared: PreparedProcessTermination<HANDLES, THREADS>,
+    prepared: PreparedProcessTermination<THREADS>,
     permits: [Option<crate::arch::x86_64::rendezvous::RemoteStopReclaimPermit>;
         crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
     cleanup: &mut CleanupQueue<OBJECTS>,
@@ -6091,7 +6146,7 @@ fn complete_prepared_process_termination_with_remote_threads<
     waits: &WaitRegistry<WAITERS>,
     terminal_waits: &mut C,
     current_process: ProcessKey,
-    prepared: PreparedProcessTermination<HANDLES, THREADS>,
+    prepared: PreparedProcessTermination<THREADS>,
     retirement: DeferredCurrentRetirement,
     remote_threads: &[Option<ThreadKey>],
     cleanup: &mut CleanupQueue<OBJECTS>,
@@ -6102,7 +6157,7 @@ fn complete_prepared_process_termination_with_remote_threads<
 ) {
     let PreparedProcessTermination {
         target: _,
-        effects,
+        pins,
         mut pre_retired,
     } = prepared;
     let deferred = collect_process_effects(
@@ -6110,7 +6165,7 @@ fn complete_prepared_process_termination_with_remote_threads<
         tasks,
         execution,
         waits,
-        effects,
+        pins,
         &mut pre_retired,
         Some(retirement),
         remote_threads,
@@ -6162,14 +6217,9 @@ pub(crate) fn thread_exit<
         .process_info(process)
         .is_ok_and(|info| info.state == DW_TASK_STATE_EXITED)
     {
-        let drained = tasks
-            .drain_exited_process_handles(registry, process)
-            .unwrap_or_else(|error| {
-                panic!("final Thread exit could not drain Process handles: {error:?}")
-            });
-        for release in drained.into_final_releases().into_iter().flatten() {
-            cleanup.push(release);
-        }
+        drain_exited_process_handles_staged(registry, tasks, process, cleanup).unwrap_or_else(
+            |error| panic!("final Thread exit could not drain Process handles: {error:?}"),
+        );
     }
     let (pins, deferred) = execution.retire_exit_pins_defer_current(pins, current_thread);
     collect_retired_pins(registry, execution, waits, pins, cleanup);
@@ -6311,16 +6361,12 @@ pub(crate) fn prepare_thread_terminate<
         .process_info(target_process)
         .is_ok_and(|info| info.state == DW_TASK_STATE_EXITED)
     {
-        let drained = tasks
-            .drain_exited_process_handles(registry, target_process)
+        drain_exited_process_handles_staged(registry, tasks, target_process, cleanup)
             .unwrap_or_else(|error| {
                 panic!(
                     "final authorized Thread termination could not drain Process handles: {error:?}"
                 )
             });
-        for release in drained.into_final_releases().into_iter().flatten() {
-            cleanup.push(release);
-        }
     }
     release_lookup_pin(registry, pin, cleanup);
     Ok(PreparedThreadTermination {

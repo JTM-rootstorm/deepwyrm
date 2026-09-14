@@ -26,7 +26,7 @@
 //! R5's gate is that no hot syscall frame scales as
 //! `process_capacity x handles_per_process`. A batch that size cannot be made
 //! to fit by shrinking it; the shape has to change. This module is the storage
-//! the changed shape needs, and R5B through R5D migrate onto it.
+//! the changed shape needs, and R5C and R5D migrate onto it.
 //!
 //! # What replaces it
 //!
@@ -48,10 +48,22 @@
 //! can discharge them.
 //!
 //! R5A adds storage and changes no behaviour, so nothing calls this yet.
+//!
+//! # What R5B did not use this for
+//!
+//! R5B converted the Process handle drain to bounded steps without opening a
+//! transaction here. What this arena adds over a plain loop is a record that
+//! *survives* a boundary: a stage, a cursor, and obligations held across a
+//! suspension. The Process handle drain suspends across nothing -- it runs to
+//! completion inside one syscall, and its finalizers go straight to the
+//! caller's `CleanupQueue` -- so routing it through a slot would have cost a
+//! copy and a lock per window and bought no property the loop lacks. R5C's
+//! per-Process progress across remote-stop acknowledgement and R5D's finalizer
+//! traversal are the migrations this storage exists for.
 
 #![allow(
     dead_code,
-    reason = "R5B through R5D migrate the termination paths onto this storage"
+    reason = "R5C and R5D migrate the termination paths onto this storage"
 )]
 
 use super::{ProcessKey, TaskGroupKey, ThreadExecutionResources};

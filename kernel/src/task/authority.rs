@@ -404,6 +404,65 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         self.drain_process_handles(registry, key)
     }
 
+    /// Releases the finalizers of an exited Process's handles that fit in
+    /// `out`, resuming from slot `from`.
+    ///
+    /// The terminal state is rechecked on every step rather than trusted from
+    /// the first: a step is a separate authority call, and nothing in a cursor
+    /// proves the subject is still exited.
+    pub(crate) fn drain_exited_process_handle_window<const OBJECTS: usize>(
+        &mut self,
+        registry: &mut ObjectRegistry<OBJECTS>,
+        key: ProcessKey,
+        from: usize,
+        out: &mut [Option<FinalRelease>],
+    ) -> Result<crate::handle::DrainWindow, TaskError> {
+        if self.process(key)?.state.state != DW_TASK_STATE_EXITED {
+            return Err(TaskError::BadState);
+        }
+        Ok(self
+            .process_mut(key)?
+            .handles
+            .drain_window(registry, from, out))
+    }
+
+    /// Drains an exited Process's handles through the bounded window path and
+    /// collects everything it produced.
+    ///
+    /// Tests that only need to observe a Process's finalizer set still drive the
+    /// same stepping the syscall path drives -- deliberately with a window far
+    /// narrower than `HANDLES`, so a multi-step drain is the ordinary case in
+    /// the suite rather than an untested edge.
+    #[cfg(test)]
+    pub(crate) fn drain_exited_process_handles_stepwise<const OBJECTS: usize>(
+        &mut self,
+        registry: &mut ObjectRegistry<OBJECTS>,
+        key: ProcessKey,
+    ) -> Result<([Option<FinalRelease>; HANDLES], usize), TaskError> {
+        const STEP: usize = 2;
+        let mut collected: [Option<FinalRelease>; HANDLES] = core::array::from_fn(|_| None);
+        let mut count = 0;
+        let mut window: [Option<FinalRelease>; STEP] = core::array::from_fn(|_| None);
+        let mut cursor = 0;
+        loop {
+            let step =
+                self.drain_exited_process_handle_window(registry, key, cursor, &mut window)?;
+            for release in window
+                .iter_mut()
+                .take(step.written())
+                .filter_map(Option::take)
+            {
+                collected[count] = Some(release);
+                count += 1;
+            }
+            if step.done() {
+                return Ok((collected, count));
+            }
+            assert!(step.resume() > cursor, "stepwise drain made no progress");
+            cursor = step.resume();
+        }
+    }
+
     fn drain_process_handles<const OBJECTS: usize>(
         &mut self,
         registry: &mut ObjectRegistry<OBJECTS>,
@@ -1103,49 +1162,54 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         Ok(pins)
     }
 
-    pub(crate) fn exit_process<const OBJECTS: usize>(
+    /// Makes `key` and every live Thread in it terminal, returning only the
+    /// execution pins.
+    ///
+    /// The Process's handles are deliberately *not* drained here. Draining them
+    /// into a `DrainResult<HANDLES>` made every frame between this call and the
+    /// cleanup queue cost one array per Process; the caller now drains in
+    /// bounded windows through
+    /// [`Self::drain_exited_process_handle_window`], which the terminal state
+    /// this call leaves behind admits. The same two-phase shape already serves
+    /// `exit_thread`, whose caller drains after the last Thread exits.
+    pub(crate) fn exit_process(
         &mut self,
-        registry: &mut ObjectRegistry<OBJECTS>,
         key: ProcessKey,
         calling_thread: ThreadKey,
         code: u32,
-    ) -> Result<ProcessExitEffects<HANDLES, THREADS>, TaskError> {
+    ) -> Result<ExitPins<THREADS>, TaskError> {
         let normal = TerminationRecord::normal(code);
-        let pins = self.terminate_process_common(
+        self.terminate_process_common(
             key,
             normal,
             Some((calling_thread, normal)),
             TerminationRecord::authorized(0),
-        )?;
-        let drained = self.drain_process_handles(registry, key)?;
-        Ok(ProcessExitEffects { drained, pins })
+        )
     }
 
-    pub(crate) fn terminate_process_authorized<const OBJECTS: usize>(
+    /// See [`Self::exit_process`] for why no handle drain happens here.
+    pub(crate) fn terminate_process_authorized(
         &mut self,
-        registry: &mut ObjectRegistry<OBJECTS>,
         key: ProcessKey,
         detail: u32,
-    ) -> Result<ProcessExitEffects<HANDLES, THREADS>, TaskError> {
-        let pins = self.terminate_process_common(
+    ) -> Result<ExitPins<THREADS>, TaskError> {
+        self.terminate_process_common(
             key,
             TerminationRecord::authorized(detail),
             None,
             TerminationRecord::authorized(0),
-        )?;
-        let drained = self.drain_process_handles(registry, key)?;
-        Ok(ProcessExitEffects { drained, pins })
+        )
     }
 
-    pub(crate) fn terminate_process_exception<const OBJECTS: usize>(
+    /// See [`Self::exit_process`] for why no handle drain happens here.
+    pub(crate) fn terminate_process_exception(
         &mut self,
-        registry: &mut ObjectRegistry<OBJECTS>,
         key: ProcessKey,
         faulting_thread: ThreadKey,
         exception_type: DwExceptionType,
         detail: u32,
         fault_address: u64,
-    ) -> Result<ProcessExitEffects<HANDLES, THREADS>, TaskError> {
+    ) -> Result<ExitPins<THREADS>, TaskError> {
         let fault = TerminationRecord {
             reason: deepwyrm_abi::DW_TERMINATION_UNHANDLED_EXCEPTION,
             application_code: 0,
@@ -1153,14 +1217,12 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             detail,
             fault_address,
         };
-        let pins = self.terminate_process_common(
+        self.terminate_process_common(
             key,
             fault,
             Some((faulting_thread, fault)),
             TerminationRecord::authorized(0),
-        )?;
-        let drained = self.drain_process_handles(registry, key)?;
-        Ok(ProcessExitEffects { drained, pins })
+        )
     }
 
     fn terminate_process_common(

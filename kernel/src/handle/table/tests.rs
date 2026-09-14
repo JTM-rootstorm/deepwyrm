@@ -1187,3 +1187,97 @@ fn owned_typed_pair_rejects_type_drift_before_partial_publication() {
     complete(&mut registry, region_release);
     complete(&mut registry, process_release);
 }
+
+/// R5B: the bounded drain releases exactly the same set as the whole-table
+/// drain, in as many steps as the caller's window forces.
+///
+/// The window is one entry wide so every finalizer costs its own step. A step
+/// that restarted its scan, or one that resumed past an unprocessed slot, would
+/// either double-release into the registry -- which panics -- or leave the table
+/// non-empty with finalizers unaccounted for.
+#[test]
+fn a_one_wide_drain_window_retires_every_handle_in_separate_steps() {
+    let mut registry = ObjectRegistry::<4>::new();
+    let mut table = HandleTable::<4>::new();
+    for object_type in [
+        DW_OBJECT_TYPE_MEMORY_OBJECT,
+        DW_OBJECT_TYPE_EVENT,
+        DW_OBJECT_TYPE_TIMER,
+        DW_OBJECT_TYPE_CHANNEL,
+    ] {
+        install_object(
+            &mut registry,
+            &mut table,
+            object_type,
+            dw_object_compatible_rights(object_type),
+        );
+    }
+    assert_eq!(table.len(), 4);
+
+    let mut window: [Option<FinalRelease>; 1] = [None];
+    let mut cursor = 0;
+    let mut steps = 0;
+    let mut collected = 0;
+    loop {
+        let step = table.drain_window(&mut registry, cursor, &mut window);
+        steps += 1;
+        for release in window
+            .iter_mut()
+            .take(step.written())
+            .filter_map(Option::take)
+        {
+            registry.complete_finalization(release).unwrap();
+            collected += 1;
+        }
+        if step.done() {
+            break;
+        }
+        assert!(step.resume() > cursor, "a drain step made no progress");
+        cursor = step.resume();
+    }
+    assert_eq!(collected, 4);
+    assert_eq!(steps, 4);
+    assert!(table.is_empty());
+    assert_eq!(table.len(), 0);
+}
+
+/// R5B: a window wider than the table takes one step, which is what lets the
+/// whole-table `drain` keep its single-pass shape on top of the same code.
+#[test]
+fn a_drain_window_wider_than_the_table_finishes_in_one_step() {
+    let mut registry = ObjectRegistry::<2>::new();
+    let mut table = HandleTable::<4>::new();
+    let memory = install_object(
+        &mut registry,
+        &mut table,
+        DW_OBJECT_TYPE_MEMORY_OBJECT,
+        dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT),
+    );
+    let _duplicate = table
+        .duplicate(
+            &mut registry,
+            memory,
+            dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT),
+        )
+        .unwrap();
+    let mut window: [Option<FinalRelease>; 8] = core::array::from_fn(|_| None);
+    let step = table.drain_window(&mut registry, 0, &mut window);
+    assert!(step.done());
+    assert_eq!(step.resume(), 4);
+    // Two handles, one object: only the last release finalizes.
+    assert_eq!(step.written(), 1);
+    assert!(table.is_empty());
+    complete(&mut registry, window[0].take());
+}
+
+/// R5B: a zero-wide window would make the cursor stand still forever rather
+/// than fail, so it is refused at the boundary instead.
+#[test]
+#[should_panic = "a bounded drain needs somewhere to put a finalizer"]
+fn a_zero_wide_drain_window_is_refused() {
+    // Empty, so unwinding out of the refusal does not trip the table's own
+    // live-drop assertion and hide which panic the test is about.
+    let mut registry = ObjectRegistry::<1>::new();
+    let mut table = HandleTable::<4>::new();
+    let _ = table.drain_window(&mut registry, 0, &mut []);
+}

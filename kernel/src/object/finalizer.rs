@@ -695,11 +695,12 @@ mod tests {
             .unwrap();
         assert!(registry.release_handle(region_handle).unwrap().is_none());
 
-        let effects = tasks
-            .terminate_process_authorized(&mut registry, process, 0x44)
+        let effects = tasks.terminate_process_authorized(process, 0x44).unwrap();
+        let (_, drained) = tasks
+            .drain_exited_process_handles_stepwise(&mut registry, process)
             .unwrap();
-        assert_eq!(effects.drained.final_release_count(), 0);
-        let (process_pin, thread_pins, resources) = effects.pins.into_parts();
+        assert_eq!(drained, 0);
+        let (process_pin, thread_pins, resources) = effects.into_parts();
         assert!(thread_pins.into_iter().flatten().next().is_none());
         assert!(resources.into_iter().flatten().next().is_none());
         assert!(

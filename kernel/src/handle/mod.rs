@@ -11,7 +11,7 @@ mod model_tests;
     reason = "DW0-D4/D5 consume core table types while process ownership arrives in DW0-E"
 )]
 pub(crate) use table::{
-    AcceptedObjectTypes, BasicHandleInfo, DrainResult, HANDLE_TRANSFER_LIMIT,
+    AcceptedObjectTypes, BasicHandleInfo, DrainResult, DrainWindow, HANDLE_TRANSFER_LIMIT,
     HandleBatchReservation, HandleMovePrepareError, HandleMoveRequest, HandlePairPublishError,
     HandlePairReservation, HandleReferencePublishError, HandleReservationError,
     HandleReservationSpec, HandleTable, HandleTableError, HandleTransferBatch,

@@ -199,9 +199,7 @@ fn authorized_process_termination_waits_for_exact_remote_stop_ack() {
     let remote_claim = domain.running_claim_on(cpu1).unwrap();
     assert_eq!(domain.terminal_scheduler_current_on(&tasks, cpu1), Ok(None));
 
-    let effects = tasks
-        .terminate_process_authorized(&mut registry, process, 0x707)
-        .unwrap();
+    let effects = tasks.terminate_process_authorized(process, 0x707).unwrap();
     assert_eq!(
         tasks.thread_info(current).unwrap().state,
         DW_TASK_STATE_EXITED
@@ -236,7 +234,7 @@ fn authorized_process_termination_waits_for_exact_remote_stop_ack() {
 
     let (retired, deferred) = domain.retire_exit_pins_defer_current_after_remote_stops_on(
         cpu0,
-        effects.pins,
+        effects,
         current,
         &[Some(remote)],
     );
@@ -290,9 +288,7 @@ fn remote_stop_completion_retires_exact_suspended_physical_current() {
     );
     assert_eq!(domain.schedule_next_on(cpu1).unwrap().current, Some(remote));
 
-    let effects = tasks
-        .terminate_process_authorized(&mut registry, process, 0x708)
-        .unwrap();
+    let effects = tasks.terminate_process_authorized(process, 0x708).unwrap();
     let current_claim = domain.running_claim_on(cpu0).unwrap();
     assert_eq!(domain.stop_running_claim_on(current_claim), Ok(None));
     assert_eq!(domain.running_claim_on(cpu0), None);
@@ -306,7 +302,7 @@ fn remote_stop_completion_retires_exact_suspended_physical_current() {
 
     let (retired, deferred) = domain.retire_exit_pins_defer_current_after_remote_stops_on(
         cpu0,
-        effects.pins,
+        effects,
         current,
         &[Some(remote)],
     );
@@ -375,14 +371,10 @@ fn remote_stop_completion_preserves_suspended_caller_with_logical_replacement() 
     assert_eq!(domain.running_claim_on(cpu0).unwrap().thread(), replacement);
 
     let effects = tasks
-        .terminate_process_authorized(&mut registry, outgoing_process, 0x709)
+        .terminate_process_authorized(outgoing_process, 0x709)
         .unwrap();
-    let (retired, deferred) = domain.retire_exit_pins_defer_current_after_remote_stops_on(
-        cpu0,
-        effects.pins,
-        outgoing,
-        &[],
-    );
+    let (retired, deferred) =
+        domain.retire_exit_pins_defer_current_after_remote_stops_on(cpu0, effects, outgoing, &[]);
     assert_eq!(domain.suspended_claim_on(cpu0), Some(suspended));
     assert_eq!(domain.running_claim_on(cpu0).unwrap().thread(), replacement);
     let deferred_pins = domain.reclaim_deferred_current_on(cpu0, deferred);
@@ -596,10 +588,8 @@ fn current_terminal_resources_remain_allocated_until_linear_token_is_consumed() 
     let (sibling_stack, sibling_context) =
         tasks.thread_execution_resources(sibling).unwrap().unwrap();
 
-    let effects = tasks
-        .exit_process(&mut registry, process, current, 0)
-        .unwrap();
-    let (retired, deferred) = domain.retire_exit_pins_defer_current(effects.pins, current);
+    let effects = tasks.exit_process(process, current, 0).unwrap();
+    let (retired, deferred) = domain.retire_exit_pins_defer_current(effects, current);
 
     assert_eq!(deferred.thread(), current);
     assert_eq!(domain.scheduler_state(current), None);
@@ -860,7 +850,6 @@ fn ap_exception_retires_exact_cpu_generation_before_reclaim() {
 
     let effects = tasks
         .terminate_process_exception(
-            &mut registry,
             process,
             faulting,
             DW_EXCEPTION_PAGE_FAULT,
@@ -884,7 +873,7 @@ fn ap_exception_retires_exact_cpu_generation_before_reclaim() {
     // AP exception handling must retire the exact physical owner before any
     // execution resources are reclaimed; the stale claim cannot stop or
     // revive a later generation.
-    let (retired, deferred) = domain.retire_exit_pins_defer_current_on(cpu, effects.pins, faulting);
+    let (retired, deferred) = domain.retire_exit_pins_defer_current_on(cpu, effects, faulting);
     assert_eq!(deferred.thread(), faulting);
     assert_eq!(domain.suspended_claim_on(cpu).unwrap().thread(), faulting);
     let deferred_pins = domain.reclaim_deferred_current_on(cpu, deferred);
@@ -1054,11 +1043,8 @@ fn destination_acknowledges_prior_suspension_before_terminal_process_retirement(
     domain.complete_switch_on(outgoing_claim).unwrap();
     assert_eq!(domain.suspended_claim_on(cpu0), None);
 
-    let effects = tasks
-        .exit_process(&mut registry, process, replacement, 0)
-        .unwrap();
-    let (retired, deferred) =
-        domain.retire_exit_pins_defer_current_on(cpu0, effects.pins, replacement);
+    let effects = tasks.exit_process(process, replacement, 0).unwrap();
+    let (retired, deferred) = domain.retire_exit_pins_defer_current_on(cpu0, effects, replacement);
     let terminal_claim = domain.suspended_claim_on(cpu0).unwrap();
     assert_eq!(terminal_claim.thread(), replacement);
     let deferred_pins = domain.reclaim_deferred_current_on(cpu0, deferred);

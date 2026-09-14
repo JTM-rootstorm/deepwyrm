@@ -211,17 +211,12 @@ fn process_exit_drains_handles_and_records_per_thread_reason() {
         .unwrap();
     assert_ne!(event_handle.0, 0);
 
-    let effects = tasks
-        .exit_process(&mut registry, process, thread0, 0x55aa)
+    let effects = tasks.exit_process(process, thread0, 0x55aa).unwrap();
+    let (releases, drained) = tasks
+        .drain_exited_process_handles_stepwise(&mut registry, process)
         .unwrap();
-    assert_eq!(effects.drained.final_release_count(), 1);
-    let event_final = effects
-        .drained
-        .into_final_releases()
-        .into_iter()
-        .flatten()
-        .next()
-        .unwrap();
+    assert_eq!(drained, 1);
+    let event_final = releases.into_iter().flatten().next().unwrap();
     registry.complete_finalization(event_final).unwrap();
     assert_eq!(tasks.process_handle_count(process), Ok(0));
     assert!(matches!(
@@ -229,7 +224,7 @@ fn process_exit_drains_handles_and_records_per_thread_reason() {
         Err(TaskError::BadState)
     ));
     assert!(
-        release_pins(&mut registry, effects.pins)
+        release_pins(&mut registry, effects)
             .into_iter()
             .flatten()
             .next()
@@ -248,7 +243,7 @@ fn process_exit_drains_handles_and_records_per_thread_reason() {
     assert_eq!(sibling.application_code, 0);
     assert_eq!(sibling.detail, 0);
     assert!(matches!(
-        tasks.exit_process(&mut registry, process, thread0, 1),
+        tasks.exit_process(process, thread0, 1),
         Err(TaskError::BadState)
     ));
 
@@ -271,7 +266,7 @@ fn process_gate_selects_one_termination_and_drains_preexisting_operations() {
 
     let lease = tasks.acquire_process_operation(process).unwrap();
     assert!(matches!(
-        tasks.terminate_process_authorized(&mut registry, process, 0x11),
+        tasks.terminate_process_authorized(process, 0x11),
         Err(TaskError::OperationsInFlight)
     ));
     assert_eq!(
@@ -292,17 +287,15 @@ fn process_gate_selects_one_termination_and_drains_preexisting_operations() {
     // A competing reason cannot replace the winner selected when the gate
     // first closed, either before or after the old operation drains.
     assert!(matches!(
-        tasks.terminate_process_authorized(&mut registry, process, 0x22),
+        tasks.terminate_process_authorized(process, 0x22),
         Err(TaskError::BadState)
     ));
     tasks.release_process_operation(lease).unwrap();
     assert!(matches!(
-        tasks.terminate_process_authorized(&mut registry, process, 0x22),
+        tasks.terminate_process_authorized(process, 0x22),
         Err(TaskError::BadState)
     ));
-    let effects = tasks
-        .terminate_process_authorized(&mut registry, process, 0x11)
-        .unwrap();
+    let effects = tasks.terminate_process_authorized(process, 0x11).unwrap();
     assert_eq!(
         tasks.process_lifecycle(process),
         Ok(ProcessLifecycleState::Exited)
@@ -311,7 +304,7 @@ fn process_gate_selects_one_termination_and_drains_preexisting_operations() {
     assert!(tasks.validate_process_quiescence(&proof, process).is_ok());
     assert_eq!(tasks.process_info(process).unwrap().detail, 0x11);
     assert!(
-        release_pins(&mut registry, effects.pins)
+        release_pins(&mut registry, effects)
             .into_iter()
             .flatten()
             .next()
@@ -342,9 +335,9 @@ fn wyr1_monitor_retains_exited_process_through_root_retirement_enablement_model(
     ));
 
     let effects = tasks
-        .terminate_process_authorized(&mut registry, primordial, 0x2510)
+        .terminate_process_authorized(primordial, 0x2510)
         .unwrap();
-    let (process_pin, thread_pins, resources) = effects.pins.into_parts();
+    let (process_pin, thread_pins, resources) = effects.into_parts();
     assert!(thread_pins.into_iter().all(|pin| pin.is_none()));
     assert!(resources.into_iter().all(|resource| resource.is_none()));
     assert!(
@@ -393,7 +386,6 @@ fn userspace_exception_is_process_fatal_and_siblings_do_not_claim_fault() {
 
     let effects = tasks
         .terminate_process_exception(
-            &mut registry,
             process,
             faulting,
             DW_EXCEPTION_PAGE_FAULT,
@@ -401,9 +393,12 @@ fn userspace_exception_is_process_fatal_and_siblings_do_not_claim_fault() {
             0x0000_0000_4141_5000,
         )
         .unwrap();
-    assert_eq!(effects.drained.final_release_count(), 0);
+    let (_, drained) = tasks
+        .drain_exited_process_handles_stepwise(&mut registry, process)
+        .unwrap();
+    assert_eq!(drained, 0);
     assert!(
-        release_pins(&mut registry, effects.pins)
+        release_pins(&mut registry, effects)
             .into_iter()
             .flatten()
             .next()
@@ -513,11 +508,14 @@ fn task_group_termination_threads_exclude_retained_exited_descendants() {
     prepare_thread(&mut tasks, exited_thread, 7);
     tasks.start_thread(exited_thread).unwrap();
     let exited = tasks
-        .exit_process(&mut registry, exited_process, exited_thread, 0)
+        .exit_process(exited_process, exited_thread, 0)
         .unwrap();
-    assert_eq!(exited.drained.final_release_count(), 0);
+    let (_, drained) = tasks
+        .drain_exited_process_handles_stepwise(&mut registry, exited_process)
+        .unwrap();
+    assert_eq!(drained, 0);
     assert!(
-        release_pins(&mut registry, exited.pins)
+        release_pins(&mut registry, exited)
             .into_iter()
             .flatten()
             .next()
@@ -643,12 +641,13 @@ fn task_group_termination_threads_are_empty_when_all_descendants_exited() {
     release_nonfinal_pin(&mut registry, process_owner);
     prepare_thread(&mut tasks, thread, 9);
     tasks.start_thread(thread).unwrap();
-    let exited = tasks
-        .exit_process(&mut registry, process, thread, 0)
+    let exited = tasks.exit_process(process, thread, 0).unwrap();
+    let (_, drained) = tasks
+        .drain_exited_process_handles_stepwise(&mut registry, process)
         .unwrap();
-    assert_eq!(exited.drained.final_release_count(), 0);
+    assert_eq!(drained, 0);
     assert!(
-        release_pins(&mut registry, exited.pins)
+        release_pins(&mut registry, exited)
             .into_iter()
             .flatten()
             .next()
@@ -772,12 +771,13 @@ fn prepared_thread_cancel_removes_parent_attachment_and_recovers_capacity() {
     assert_ne!(replacement.key(), prepared_key);
     assert!(replacement.cancel(&mut tasks, &mut registry).is_none());
     assert!(registry.release_internal(process_owner).unwrap().is_none());
-    let effects = tasks
-        .terminate_process_authorized(&mut registry, process, 0)
+    let effects = tasks.terminate_process_authorized(process, 0).unwrap();
+    let (_, drained) = tasks
+        .drain_exited_process_handles_stepwise(&mut registry, process)
         .unwrap();
-    assert_eq!(effects.drained.final_release_count(), 0);
+    assert_eq!(drained, 0);
     assert!(
-        release_pins(&mut registry, effects.pins)
+        release_pins(&mut registry, effects)
             .into_iter()
             .flatten()
             .next()
@@ -914,12 +914,13 @@ fn process_owned_handle_tables_isolate_colliding_raw_handles() {
     registry.complete_finalization(event1_final).unwrap();
 
     for process in [process0, process1] {
-        let effects = tasks
-            .terminate_process_authorized(&mut registry, process, 0x61)
+        let effects = tasks.terminate_process_authorized(process, 0x61).unwrap();
+        let (_, drained) = tasks
+            .drain_exited_process_handles_stepwise(&mut registry, process)
             .unwrap();
-        assert_eq!(effects.drained.final_release_count(), 0);
+        assert_eq!(drained, 0);
         assert!(
-            release_pins(&mut registry, effects.pins)
+            release_pins(&mut registry, effects)
                 .into_iter()
                 .flatten()
                 .next()
@@ -1043,4 +1044,65 @@ fn deterministic_start_close_terminate_finalize_interleavings_preserve_lifetime(
         let root_final = registry.release_internal(root_owner).unwrap().unwrap();
         finish_task_release(&mut tasks, &mut registry, root_final);
     }
+}
+
+/// R5B: an exited Process's handles reach their finalizers across several
+/// bounded steps, not in one `HANDLES`-wide array.
+///
+/// The table is filled to capacity and the window is narrower than it, so a
+/// step that resumed from the wrong slot would either skip a finalizer -- the
+/// count would fall short -- or revisit one, which the registry refuses.
+#[test]
+fn r5b_a_full_handle_table_drains_across_bounded_steps() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (process, process_handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let temporary_process_pin = process_parent_pin(&mut registry, &process_handle);
+    let (thread, thread_handle) = tasks
+        .create_thread(&mut registry, &temporary_process_pin)
+        .unwrap();
+    release_nonfinal_pin(&mut registry, temporary_process_pin);
+    prepare_thread(&mut tasks, thread, 2);
+    tasks.start_thread(thread).unwrap();
+
+    for object_type in [
+        DW_OBJECT_TYPE_EVENT,
+        DW_OBJECT_TYPE_EVENT,
+        DW_OBJECT_TYPE_EVENT,
+        DW_OBJECT_TYPE_EVENT,
+    ] {
+        let creation = registry.create(object_type).unwrap();
+        let reference = registry.creation_into_handle(creation).unwrap();
+        tasks
+            .process_handles_mut(process)
+            .unwrap()
+            .install(reference, DW_RIGHT_INSPECT)
+            .unwrap();
+    }
+    assert_eq!(tasks.process_handle_count(process), Ok(4));
+
+    // A live Process may not be drained: nothing in a cursor proves the subject
+    // is terminal, so every step rechecks.
+    let mut window: [Option<FinalRelease>; 2] = [None, None];
+    assert_eq!(
+        tasks
+            .drain_exited_process_handle_window(&mut registry, process, 0, &mut window)
+            .err(),
+        Some(TaskError::BadState)
+    );
+
+    let pins = tasks.exit_process(process, thread, 0).unwrap();
+    let (releases, drained) = tasks
+        .drain_exited_process_handles_stepwise(&mut registry, process)
+        .unwrap();
+    assert_eq!(drained, 4);
+    assert_eq!(tasks.process_handle_count(process), Ok(0));
+    for release in releases.into_iter().flatten() {
+        registry.complete_finalization(release).unwrap();
+    }
+    for pin in release_pins(&mut registry, pins).into_iter().flatten() {
+        registry.complete_finalization(pin).unwrap();
+    }
+    drop(root_owner);
 }

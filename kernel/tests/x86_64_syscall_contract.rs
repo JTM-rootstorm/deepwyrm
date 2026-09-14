@@ -453,7 +453,7 @@ fn i1_remote_termination_waits_guard_free_for_exact_ack_before_reclaim() {
     let adapters = source("src/syscall/adapters.rs");
     assert!(adapters.contains("prepare_process_terminate("));
     assert!(adapters.contains("complete_prepared_process_termination_after_remote_stops"));
-    assert!(adapters.contains("execution.quiesce_terminal_threads(effects.pins.thread_keys())"));
+    assert!(adapters.contains("execution.quiesce_terminal_threads(pins.thread_keys())"));
     assert!(adapters.contains("retire_quiesced_exit_pins_after_remote_stops("));
 
     let execution = source("src/task/execution.rs");

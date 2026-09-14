@@ -1077,7 +1077,7 @@ fn root_region_handle_close_preserves_address_space_until_process_exit() {
             .is_err()
     );
     assert!(matches!(
-        tasks.terminate_process_authorized(&mut registry, process, 0x77),
+        tasks.terminate_process_authorized(process, 0x77),
         Err(TaskError::OperationsInFlight)
     ));
     assert_eq!(
@@ -1097,11 +1097,12 @@ fn root_region_handle_close_preserves_address_space_until_process_exit() {
     );
     tasks.release_process_operation(operation).unwrap();
 
-    let effects = tasks
-        .terminate_process_authorized(&mut registry, process, 0x77)
+    let effects = tasks.terminate_process_authorized(process, 0x77).unwrap();
+    let (_, drained) = tasks
+        .drain_exited_process_handles_stepwise(&mut registry, process)
         .unwrap();
-    assert_eq!(effects.drained.final_release_count(), 0);
-    let (process_pin, thread_pins, resources) = effects.pins.into_parts();
+    assert_eq!(drained, 0);
+    let (process_pin, thread_pins, resources) = effects.into_parts();
     assert!(thread_pins.into_iter().flatten().next().is_none());
     assert!(resources.into_iter().flatten().next().is_none());
     assert!(

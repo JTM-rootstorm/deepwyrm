@@ -1894,18 +1894,18 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         faulting_thread: ThreadKey,
         exception: super::TaskExceptionRecord,
     ) -> Result<RetiredProcessException<HANDLES, THREADS>, super::TaskError> {
-        let effects = tasks.terminate_process_exception(
-            registry,
+        let exit_pins = tasks.terminate_process_exception(
             process,
             faulting_thread,
             exception.exception_type,
             exception.detail,
             exception.fault_address,
         )?;
+        let drained = tasks.drain_exited_process_handles(registry, process)?;
         let (pins, deferred_current) =
-            self.retire_exit_pins_defer_current(effects.pins, faulting_thread);
+            self.retire_exit_pins_defer_current(exit_pins, faulting_thread);
         Ok(RetiredProcessException {
-            drained: effects.drained,
+            drained,
             pins,
             deferred_current,
         })

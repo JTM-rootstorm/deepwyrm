@@ -154,6 +154,31 @@ impl<const CAPACITY: usize> DrainResult<CAPACITY> {
     }
 }
 
+/// How far one bounded drain step got.
+#[must_use = "a drain step that has not reported `done` leaves live handles in the table"]
+pub(crate) struct DrainWindow {
+    written: usize,
+    resume: usize,
+    done: bool,
+}
+
+impl DrainWindow {
+    /// Finalizers written to the front of the caller's window.
+    pub(crate) const fn written(&self) -> usize {
+        self.written
+    }
+
+    /// The slot the next step must resume from.
+    pub(crate) const fn resume(&self) -> usize {
+        self.resume
+    }
+
+    /// Whether the scan reached the end of the table.
+    pub(crate) const fn done(&self) -> bool {
+        self.done
+    }
+}
+
 #[derive(Debug)]
 struct HandleEntry {
     reference: HandleRef,
@@ -855,17 +880,40 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
         Ok(reservation.handle)
     }
 
-    pub(crate) fn drain<const OBJECTS: usize>(
+    /// Releases every handle whose finalizer fits in `out`, resuming from
+    /// `from`.
+    ///
+    /// The window is the caller's, so a terminal frame's cost stops tracking
+    /// `CAPACITY`: the caller sizes `out` by how much stack it is willing to
+    /// spend and takes as many steps as that requires. A step that fills the
+    /// window reports the slot it stopped before; a step that reaches the end
+    /// of the table reports `done`.
+    pub(crate) fn drain_window<const OBJECTS: usize>(
         &mut self,
         registry: &mut ObjectRegistry<OBJECTS>,
-    ) -> DrainResult<CAPACITY> {
-        let mut final_releases = core::array::from_fn(|_| None);
-        let mut final_release_count = 0;
-        for slot in 0..CAPACITY {
+        from: usize,
+        out: &mut [Option<FinalRelease>],
+    ) -> DrainWindow {
+        assert!(
+            !out.is_empty(),
+            "a bounded drain needs somewhere to put a finalizer"
+        );
+        let mut written = 0;
+        let mut slot = from;
+        while slot < CAPACITY {
+            if written == out.len() {
+                return DrainWindow {
+                    written,
+                    resume: slot,
+                    done: false,
+                };
+            }
             if self.slots[slot].reservation.is_some() {
+                slot += 1;
                 continue;
             }
             let Some(entry) = self.slots[slot].entry.take() else {
+                slot += 1;
                 continue;
             };
             self.live_count = self
@@ -877,8 +925,8 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
             }
             match registry.release_handle(entry.reference) {
                 Ok(Some(final_release)) => {
-                    final_releases[final_release_count] = Some(final_release);
-                    final_release_count += 1;
+                    out[written] = Some(final_release);
+                    written += 1;
                 }
                 Ok(None) => {}
                 Err(failure) => panic!(
@@ -886,11 +934,32 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
                     failure.error()
                 ),
             }
+            slot += 1;
         }
+        DrainWindow {
+            written,
+            resume: CAPACITY,
+            done: true,
+        }
+    }
+
+    pub(crate) fn drain<const OBJECTS: usize>(
+        &mut self,
+        registry: &mut ObjectRegistry<OBJECTS>,
+    ) -> DrainResult<CAPACITY> {
+        let mut final_releases = core::array::from_fn(|_| None);
+        // A table can produce at most one finalizer per slot, so a window as
+        // wide as the table cannot fill before the scan ends. One release
+        // policy therefore serves both the whole-table and the bounded drain.
+        let window = self.drain_window(registry, 0, &mut final_releases);
+        assert!(
+            window.done(),
+            "a capacity-wide drain window filled before the table ended"
+        );
         debug_assert_eq!(self.live_count, 0);
         DrainResult {
             final_releases,
-            final_release_count,
+            final_release_count: window.written(),
         }
     }
 
