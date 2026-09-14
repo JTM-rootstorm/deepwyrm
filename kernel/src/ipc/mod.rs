@@ -37,6 +37,23 @@ pub(crate) enum ChannelError {
     InvalidEndpoint,
     StalePair,
     WouldBlock,
+    /// The shared payload pool had no free slot, which is **not** the same
+    /// condition as the peer's queue being full.
+    ///
+    /// Card R1 could not tell which of the two refused a report send, because
+    /// both arrived as `WouldBlock`. They call for different responses: a full
+    /// peer queue clears when that peer receives, while pool exhaustion clears
+    /// when *any* channel in the system releases a slot. The pool is one
+    /// `static` of `PAYLOAD_POOL_SLOTS` entries shared by every pair, and each
+    /// entry is `DW_CHANNEL_MAX_PAYLOAD` (64 KiB) wide, so it cannot simply be
+    /// sized to cover every queueable datagram: selector 34's geometry alone
+    /// admits 24 pairs x 2 queues x 2 depth = 96, which at 64 KiB a slot would be
+    /// 6 MiB of static memory against the 1 MiB the pool costs today.
+    ///
+    /// This maps to the same ABI status as `WouldBlock` deliberately. Splitting
+    /// it at the ABI is a separate, deliberate decision; splitting it inside the
+    /// kernel is what lets a diagnosis name the resource that ran out.
+    PayloadExhausted,
     PeerClosed,
     BufferTooSmall,
     AccessDenied,
@@ -163,7 +180,7 @@ impl PayloadPool {
                 generation,
             }));
         }
-        Err(ChannelError::WouldBlock)
+        Err(ChannelError::PayloadExhausted)
     }
 
     fn copy_and_release(&self, token: PayloadToken, byte_len: usize, output: &mut [u8]) {

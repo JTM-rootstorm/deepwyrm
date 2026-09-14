@@ -659,7 +659,13 @@ fn channel_status(error: ChannelError) -> DwStatus {
     match error {
         ChannelError::Capacity => DW_STATUS_NO_RESOURCES,
         ChannelError::InvalidArgument => DW_STATUS_INVALID_ARGUMENT,
-        ChannelError::WouldBlock => DW_STATUS_WOULD_BLOCK,
+        // Both are "try again", and the ABI says exactly that. They are distinct
+        // inside the kernel because they clear on different events -- a full peer
+        // queue on that peer receiving, an exhausted payload pool on any channel
+        // releasing a slot -- and a diagnosis needs to name which. Giving them
+        // separate ABI statuses is a deliberate ABI decision, not a side effect
+        // of this split.
+        ChannelError::WouldBlock | ChannelError::PayloadExhausted => DW_STATUS_WOULD_BLOCK,
         ChannelError::PeerClosed => DW_STATUS_PEER_CLOSED,
         ChannelError::BufferTooSmall => DW_STATUS_BUFFER_TOO_SMALL,
         ChannelError::AccessDenied => DW_STATUS_ACCESS_DENIED,

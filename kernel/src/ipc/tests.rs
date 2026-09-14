@@ -1068,3 +1068,27 @@ fn exhausted_vacant_pair_slot_does_not_mask_later_slots() {
         assert!(releases.into_iter().flatten().next().is_none());
     }
 }
+
+/// The two "try again" refusals must stay distinguishable inside the kernel.
+///
+/// Card R1 spent three VM runs unable to say which resource refused a report
+/// send, because a full peer queue and an exhausted payload pool both arrived as
+/// `WouldBlock`. They clear on different events -- a full peer queue when that
+/// peer receives, an exhausted pool when *any* channel releases a slot -- so they
+/// are different answers to "when should I retry".
+///
+/// The exhaustion path itself is deliberately not exercised here. `PayloadPool`
+/// is `PAYLOAD_POOL_SLOTS` entries of `DW_CHANNEL_MAX_PAYLOAD` bytes, so a local
+/// instance is a megabyte and overflows the test thread's stack, while the real
+/// pool is a `static` shared by every test in this binary -- draining it would
+/// make unrelated IPC tests fail by resource starvation rather than by defect.
+/// Covering it needs the pool to become an owned instance with a caller-chosen
+/// capacity, which is a refactor and not a test.
+#[test]
+fn queue_full_and_payload_exhaustion_are_distinct_within_the_kernel() {
+    assert_ne!(ChannelError::WouldBlock, ChannelError::PayloadExhausted);
+    // An empty payload takes no slot at all, which is why folding pool
+    // availability into DW_SIGNAL_WRITABLE would be wrong as a blanket rule: it
+    // would deny a zero-length send that can in fact always proceed.
+    assert_eq!(PAYLOAD_POOL.allocate(&[]), Ok(None));
+}

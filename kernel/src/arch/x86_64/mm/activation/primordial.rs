@@ -6476,6 +6476,10 @@ const fn primordial_channel_receive_error(error: ChannelError) -> u32 {
         ChannelError::BufferTooSmall => 0x7100_0017,
         ChannelError::AccessDenied => 0x7100_0018,
         ChannelError::FinalizationMismatch => 0x7100_0019,
+        // Its own code, not `WouldBlock`'s. This encoder exists so a primordial
+        // receive failure names its cause, and "the shared payload pool was
+        // empty" is a different cause from "the peer's queue was full".
+        ChannelError::PayloadExhausted => 0x7100_001a,
     }
 }
 
