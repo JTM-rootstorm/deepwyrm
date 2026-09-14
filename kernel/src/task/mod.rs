@@ -744,6 +744,8 @@ pub(crate) fn complete_task_finalization<const OBJECTS: usize>(
     parent_final
 }
 
+pub(crate) mod termination;
+
 #[cfg(test)]
 mod tests;
 
