@@ -52,6 +52,11 @@ const RECORD_STEP: u32 = 1;
 const RECORD_FAILED: u32 = 2;
 const RECORD_TERMINAL: u32 = 255;
 
+/// Where the probe writes its terminal outcome word: zero for a pass, otherwise
+/// the failure ordinal. Fixed by `r1-saturation`'s `encode_terminal`, which
+/// places it last on purpose so a truncated capture still says which.
+const TERMINAL_OUTCOME_OFFSET: usize = 56;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum R1EvidenceError {
     /// Submitted before the reporter was established.
@@ -115,6 +120,28 @@ pub(crate) struct R1EvidenceFlushPermit<'a> {
 }
 
 impl R1EvidenceFlushPermit<'_> {
+    /// The failure ordinal the probe wrote into its terminal record, if any.
+    ///
+    /// The collector deliberately does not interpret step meanings -- those are
+    /// the probe crate's and the host decoder's -- but "did this run succeed"
+    /// is not a step meaning, it is the terminal verdict, and the kernel is the
+    /// only thing that can refuse to certify a pass over it. Selector 34
+    /// previously emitted `DWTEST1|01|` for any transcript that merely arrived
+    /// intact, so run 12 reported a pass while its terminal record carried
+    /// ordinal 9. Zero is the probe's pass value; anything else is a failure
+    /// this kernel must not overwrite with `Pass`.
+    /// Contention is an error rather than "no failure": defaulting an
+    /// unreadable verdict to a pass is the same false certificate by another
+    /// route.
+    pub(crate) fn declared_failure(&self) -> Result<Option<u32>, R1EvidenceFlushError> {
+        let state = self
+            .collector
+            .state
+            .try_lock()
+            .ok_or(R1EvidenceFlushError::Busy)?;
+        Ok((state.terminal_outcome != 0).then_some(state.terminal_outcome))
+    }
+
     /// Emits every retained record in sequence order. The bounded transcript
     /// stays in static storage: the emitter borrows each record in place rather
     /// than copying the whole buffer onto the terminal kernel stack, matching
@@ -147,6 +174,9 @@ struct R1EvidenceState {
     reporter: Option<ProcessKey>,
     next_sequence: u64,
     terminal_seen: bool,
+    /// The terminal record's outcome word, retained verbatim. Never inspected
+    /// for meaning here; only compared against zero.
+    terminal_outcome: u32,
     failure_seen: bool,
     len: usize,
     records: [Option<R1EvidenceRecord>; R1_EVIDENCE_RECORD_CAPACITY],
@@ -159,6 +189,7 @@ impl R1EvidenceState {
             reporter: None,
             next_sequence: 1,
             terminal_seen: false,
+            terminal_outcome: 0,
             failure_seen: false,
             len: 0,
             records: [None; R1_EVIDENCE_RECORD_CAPACITY],
@@ -324,7 +355,10 @@ impl R1EvidenceCollector {
         state.next_sequence = sequence.checked_add(1).ok_or(R1EvidenceError::OutOfOrder)?;
         match kind {
             RECORD_FAILED => state.failure_seen = true,
-            RECORD_TERMINAL => state.terminal_seen = true,
+            RECORD_TERMINAL => {
+                state.terminal_seen = true;
+                state.terminal_outcome = read_u32(bytes, TERMINAL_OUTCOME_OFFSET);
+            }
             _ => {}
         }
         Ok(sequence)

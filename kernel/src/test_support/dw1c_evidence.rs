@@ -2370,13 +2370,27 @@ mod tests {
                 < completed_switch.find(".observe_running_claim(")
         );
         assert!(!completed_switch.contains("self.scheduler.running_claim_on"));
+        // Bounded by the function's own closing brace, not by a helper far
+        // below it. `fn claim_dw1c_terminal(` sits eight terminal functions
+        // later in the file, so this slice used to cover every selector's
+        // terminal at once: the `contains`/ordering assertions below could be
+        // satisfied by a different selector's code, and the `!contains` one
+        // failed the moment any unrelated terminal mentioned Fail.
         let completion = terminal_source
             .split("pub(crate) fn complete_dw1c_evidence(")
             .nth(1)
             .unwrap()
-            .split("fn claim_dw1c_terminal(")
+            .split("\n}\n")
             .next()
             .unwrap();
+        assert!(
+            completion.contains("DW1C_TERMINAL_SUCCESS"),
+            "the sliced body is no longer selector 28's evidence terminal"
+        );
+        assert!(
+            !completion.contains("pub(crate) fn "),
+            "the slice reaches past complete_dw1c_evidence into another function"
+        );
         assert!(
             completion.find("claim_dw1c_terminal(DW1C_TERMINAL_SUCCESS)")
                 < completion.find("begin_test_serial_transaction()")

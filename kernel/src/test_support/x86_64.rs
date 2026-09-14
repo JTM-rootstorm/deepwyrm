@@ -589,6 +589,15 @@ pub(crate) fn complete_r1_evidence(permit: super::r1_evidence::R1EvidenceFlushPe
         halt_after_completion()
     };
     transport.transaction = Some(transaction);
+    // Read the probe's own verdict before the flush consumes the permit. A
+    // transcript that arrives intact proves the transport worked; it says
+    // nothing about whether the scenario succeeded, and those are not the same
+    // certificate. Run 12 emitted `DWTEST1|01|` over a terminal record whose
+    // outcome word was 9, because this path reported transport integrity as a
+    // pass.
+    let Ok(declared_failure) = permit.declared_failure() else {
+        halt_after_completion()
+    };
     if permit
         .flush(|record| {
             transport
@@ -605,10 +614,15 @@ pub(crate) fn complete_r1_evidence(permit: super::r1_evidence::R1EvidenceFlushPe
         // than a false certificate.
         halt_after_completion()
     }
-    complete(
-        &mut transport,
-        completion_record(CompletionOutcome::Pass, 0),
-    )
+    // The transcript is emitted either way: a failing run's records are the
+    // evidence, and withholding them would leave the host with a bare status.
+    let record = match declared_failure {
+        None => completion_record(CompletionOutcome::Pass, 0),
+        Some(ordinal) => {
+            completion_record(CompletionOutcome::Fail, 0x3411_0000 | (ordinal & 0xffff))
+        }
+    };
+    complete(&mut transport, record)
 }
 
 #[cfg(deepwyrm_r1_evidence)]

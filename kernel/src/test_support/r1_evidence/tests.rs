@@ -425,3 +425,120 @@ fn the_build_nonce_parser_accepts_the_canonical_form() {
     const { assert!(parse_build_nonce("FFFFFFFFFFFFFFFF") == u64::MAX) };
     assert_eq!(parse_build_nonce("00000000000000FF"), 0xFF);
 }
+
+/// A terminal record that declares zero is the probe's pass value.
+#[test]
+fn a_passing_terminal_record_declares_no_failure() {
+    let (collector, reporter) = ready();
+    let permit = match collector
+        .submit_once(reporter, &record(RECORD_TERMINAL, 1, NONCE))
+        .expect("terminal accepted")
+    {
+        R1EvidenceSubmit::Terminal(permit) => permit,
+        R1EvidenceSubmit::Accepted => panic!("the terminal record must mint a flush permit"),
+    };
+    assert_eq!(permit.declared_failure(), Ok(None));
+}
+
+/// The run-12 case. The transcript is well-formed and complete, and the probe
+/// still says it failed. Reporting transport integrity as a pass here is what
+/// let `DWTEST1|01|` certify a run whose terminal record carried ordinal 9.
+#[test]
+fn a_terminal_record_that_declares_a_failure_is_not_a_pass() {
+    let (collector, reporter) = ready();
+    collector
+        .submit_once(reporter, &record(RECORD_STEP, 1, NONCE))
+        .expect("step accepted");
+    let mut terminal = record(RECORD_TERMINAL, 2, NONCE);
+    terminal[TERMINAL_OUTCOME_OFFSET..TERMINAL_OUTCOME_OFFSET + 4]
+        .copy_from_slice(&9_u32.to_le_bytes());
+    let permit = match collector
+        .submit_once(reporter, &terminal)
+        .expect("terminal accepted")
+    {
+        R1EvidenceSubmit::Terminal(permit) => permit,
+        R1EvidenceSubmit::Accepted => panic!("the terminal record must mint a flush permit"),
+    };
+    assert_eq!(permit.declared_failure(), Ok(Some(9)));
+    // The records are still emitted: a failing run's transcript is the evidence.
+    let mut emitted = 0_usize;
+    permit
+        .flush(|_| {
+            emitted += 1;
+            Ok(())
+        })
+        .expect("a declared failure still flushes its transcript");
+    assert_eq!(emitted, 2);
+}
+
+/// The verdict is read from the terminal record, not from an earlier one.
+#[test]
+fn an_earlier_records_outcome_word_is_not_the_verdict() {
+    let (collector, reporter) = ready();
+    let mut step = record(RECORD_STEP, 1, NONCE);
+    step[TERMINAL_OUTCOME_OFFSET..TERMINAL_OUTCOME_OFFSET + 4]
+        .copy_from_slice(&7_u32.to_le_bytes());
+    collector
+        .submit_once(reporter, &step)
+        .expect("step accepted");
+    let permit = match collector
+        .submit_once(reporter, &record(RECORD_TERMINAL, 2, NONCE))
+        .expect("terminal accepted")
+    {
+        R1EvidenceSubmit::Terminal(permit) => permit,
+        R1EvidenceSubmit::Accepted => panic!("the terminal record must mint a flush permit"),
+    };
+    assert_eq!(permit.declared_failure(), Ok(None));
+}
+
+/// Source contract for the terminal that no host test can execute.
+///
+/// `test_support/x86_64.rs` compiles only for the bare target, so the branch
+/// that turns a declared failure into `DWTEST1|02|` cannot be run here. The
+/// collector tests above prove the verdict is readable; this proves the
+/// terminal actually reads it, in the shape the DW1-C/D/E gates already use.
+#[test]
+fn the_selector_34_terminal_refuses_to_certify_a_declared_failure() {
+    const SOURCE: &str = include_str!("../x86_64.rs");
+    let body = SOURCE
+        .split("pub(crate) fn complete_r1_evidence(")
+        .nth(1)
+        .expect("selector 34 still has its evidence terminal")
+        .split("\nfn claim_r1_terminal(")
+        .next()
+        .expect("the evidence terminal is still followed by its claim helper");
+
+    let verdict = body
+        .find("permit.declared_failure()")
+        .expect("the terminal must read the probe's own verdict before certifying");
+    let flush = body
+        .find(".flush(")
+        .expect("the terminal still flushes the transcript");
+    assert!(
+        verdict < flush,
+        "the verdict must be read before the flush consumes the permit"
+    );
+
+    // The pass record must be reachable only through the no-failure arm. An
+    // unconditional `completion_record(CompletionOutcome::Pass, 0)` is exactly
+    // what certified run 12.
+    assert!(
+        body.contains("None => completion_record(CompletionOutcome::Pass, 0)"),
+        "selector 34's pass record is no longer guarded by the absent-failure arm"
+    );
+    assert_eq!(
+        body.matches("CompletionOutcome::Pass").count(),
+        1,
+        "selector 34's evidence terminal names Pass more than once, so one of \
+         them is not the guarded arm"
+    );
+    assert!(
+        body.contains("CompletionOutcome::Fail, 0x3411_0000"),
+        "a declared failure must reach DWTEST1 as a Fail carrying its ordinal"
+    );
+    // Contention on the verdict must not read as a pass.
+    assert!(
+        body.contains("let Ok(declared_failure) = permit.declared_failure() else {"),
+        "an unreadable verdict must fail stop rather than default to a pass"
+    );
+}
