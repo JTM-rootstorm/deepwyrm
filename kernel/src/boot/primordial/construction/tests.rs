@@ -594,14 +594,34 @@ fn completion_rejects_peer_failure_exception_nonzero_exit_and_residue() {
         ))
     );
 
+    // Both facts fail at once, which is the only case where the precedence is
+    // observable -- and selector 34 deliberately inverts it.
+    //
+    // `complete_primordial_launch_with_ready` reports the kernel-side quiescence
+    // invariant first for every selector except `deepwyrm_r1_evidence`, where the
+    // child-observable facts come first because run 4 failed on a quiescence
+    // invariant that erased the supervised child's own terminal status. This
+    // assertion predates that split and asserted only the majority order, so it
+    // failed under selector 34's own cfg while the implementation was behaving
+    // exactly as its comment says it should.
     let mut peer_failure_with_residue = completion_host(PrimordialExitDisposition::Normal(0));
     peer_failure_with_residue.ready = Err(CompletionFailure::Receive);
     peer_failure_with_residue.quiescent = Err(CompletionFailure::Quiescence);
+    #[cfg(not(deepwyrm_r1_evidence))]
     assert_eq!(
         complete_primordial_launch(&mut peer_failure_with_residue),
         Err(PrimordialCompletionError::NotQuiescent(
             CompletionFailure::Quiescence
         ))
+    );
+    #[cfg(deepwyrm_r1_evidence)]
+    assert_eq!(
+        complete_primordial_launch(&mut peer_failure_with_residue),
+        Err(PrimordialCompletionError::Receive(
+            CompletionFailure::Receive
+        )),
+        "selector 34 reports the child's own failure ahead of the kernel-side \
+         residue invariant; see complete_primordial_launch_with_ready"
     );
 }
 
