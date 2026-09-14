@@ -180,6 +180,9 @@ impl PayloadPool {
                 generation,
             }));
         }
+        crate::debug::liveness::note_channel_refusal(
+            crate::debug::liveness::ChannelRefusal::PayloadExhausted,
+        );
         Err(ChannelError::PayloadExhausted)
     }
 
@@ -262,6 +265,9 @@ impl<const DEPTH: usize> ByteQueue<DEPTH> {
 
     fn reserve_send(&mut self) -> Result<u64, ChannelError> {
         if !self.can_admit() {
+            crate::debug::liveness::note_channel_refusal(
+                crate::debug::liveness::ChannelRefusal::QueueFull,
+            );
             return Err(ChannelError::WouldBlock);
         }
         let generation = self
@@ -269,11 +275,16 @@ impl<const DEPTH: usize> ByteQueue<DEPTH> {
             .checked_add(1)
             .filter(|generation| *generation != 0)
             .ok_or(ChannelError::Capacity)?;
-        let slot = self
+        let Some(slot) = self
             .send_reservations
             .iter_mut()
             .find(|reservation| reservation.is_none())
-            .ok_or(ChannelError::WouldBlock)?;
+        else {
+            crate::debug::liveness::note_channel_refusal(
+                crate::debug::liveness::ChannelRefusal::QueueFull,
+            );
+            return Err(ChannelError::WouldBlock);
+        };
         self.next_send_generation = generation;
         *slot = Some(generation);
         Ok(generation)

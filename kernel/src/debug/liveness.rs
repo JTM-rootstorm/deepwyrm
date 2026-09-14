@@ -154,6 +154,17 @@ struct LivenessSnapshot {
     /// Address of the live `RuntimeAuthorityLock`, for host GDB. Null until the
     /// primordial path publishes it.
     runtime_authority: AtomicPtr<()>,
+    /// Sends refused because the peer's queue had no descriptor room.
+    queue_full_refusals: AtomicU64,
+    /// Sends refused because the shared payload pool had no free slot.
+    ///
+    /// These two exist because `WouldBlock` and `PayloadExhausted` deliberately
+    /// map to one ABI status: a caller must do the same thing for both -- wait
+    /// and retry -- so branching on the difference would be a mistake to invite.
+    /// The difference still matters to whoever is diagnosing a run that waited
+    /// and never got room, and that reader is not the caller. Counting them here
+    /// keeps the distinction recoverable without widening the ABI.
+    payload_exhausted_refusals: AtomicU64,
 }
 
 impl LivenessSnapshot {
@@ -166,8 +177,45 @@ impl LivenessSnapshot {
                 PerCpuLiveness::new(),
             ],
             runtime_authority: AtomicPtr::new(core::ptr::null_mut()),
+            queue_full_refusals: AtomicU64::new(0),
+            payload_exhausted_refusals: AtomicU64::new(0),
         }
     }
+}
+
+/// Which resource refused a send. The kernel has always known; only the ABI
+/// cannot say.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChannelRefusal {
+    QueueFull,
+    PayloadExhausted,
+}
+
+/// Counts one refused send. Relaxed: these are diagnostic totals, never read to
+/// make a decision, and a lost increment under contention costs a count rather
+/// than correctness.
+pub(crate) fn note_channel_refusal(refusal: ChannelRefusal) {
+    note_channel_refusal_on(&LIVENESS, refusal);
+}
+
+fn note_channel_refusal_on(snapshot: &LivenessSnapshot, refusal: ChannelRefusal) {
+    let counter = match refusal {
+        ChannelRefusal::QueueFull => &snapshot.queue_full_refusals,
+        ChannelRefusal::PayloadExhausted => &snapshot.payload_exhausted_refusals,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Both totals, for a host debugger and for tests.
+pub(crate) fn channel_refusals() -> (u64, u64) {
+    channel_refusals_on(&LIVENESS)
+}
+
+fn channel_refusals_on(snapshot: &LivenessSnapshot) -> (u64, u64) {
+    (
+        snapshot.queue_full_refusals.load(Ordering::Relaxed),
+        snapshot.payload_exhausted_refusals.load(Ordering::Relaxed),
+    )
 }
 
 const _: () = assert!(
@@ -549,3 +597,23 @@ pub(crate) fn emit_snapshot() -> Result<(), super::SerialError> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::{ChannelRefusal, LivenessSnapshot, channel_refusals_on, note_channel_refusal_on};
+
+    /// Against a local snapshot, so this says nothing about and is unaffected by
+    /// whatever the process-global counters have already seen.
+    #[test]
+    fn each_refusal_lands_in_its_own_counter() {
+        let snapshot = LivenessSnapshot::new();
+        assert_eq!(channel_refusals_on(&snapshot), (0, 0));
+
+        note_channel_refusal_on(&snapshot, ChannelRefusal::QueueFull);
+        assert_eq!(channel_refusals_on(&snapshot), (1, 0));
+
+        note_channel_refusal_on(&snapshot, ChannelRefusal::PayloadExhausted);
+        note_channel_refusal_on(&snapshot, ChannelRefusal::PayloadExhausted);
+        assert_eq!(channel_refusals_on(&snapshot), (1, 2));
+    }
+}

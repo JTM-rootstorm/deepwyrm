@@ -1092,3 +1092,55 @@ fn queue_full_and_payload_exhaustion_are_distinct_within_the_kernel() {
     // would deny a zero-length send that can in fact always proceed.
     assert_eq!(PAYLOAD_POOL.allocate(&[]), Ok(None));
 }
+
+/// The two refusals share one ABI status on purpose -- a caller must wait and
+/// retry for both, so branching on the difference would be a mistake to invite --
+/// but whoever is diagnosing a run that waited and never got room is not the
+/// caller. The counters are how that reader tells them apart without widening
+/// the ABI; card R1's run 13 exited on `WOULD_BLOCK` at the probe's report-send
+/// site and could not say which resource had refused.
+///
+/// This reads the source rather than exercising the counters, because the
+/// counters are process-global and the pool is a shared `static`: a test that
+/// exhausted either to observe a count would race every other test in this
+/// module, which is exactly what the first version of it did. The counting
+/// logic itself is covered in `debug::liveness`, against a local snapshot.
+#[test]
+fn both_refusal_sites_name_their_own_resource() {
+    const SOURCE: &str = include_str!("mod.rs");
+
+    let allocate = SOURCE
+        .split("fn allocate(&self, payload: &[u8])")
+        .nth(1)
+        .expect("the payload pool still has its allocator")
+        .split("\n    }")
+        .next()
+        .expect("the allocator is still a bounded function body");
+    assert!(
+        allocate.contains("ChannelRefusal::PayloadExhausted"),
+        "an exhausted payload pool is no longer counted, so a run that waited \
+         and never got room cannot say which resource refused"
+    );
+    assert!(
+        !allocate.contains("ChannelRefusal::QueueFull"),
+        "the allocator counts a payload refusal as a full queue"
+    );
+
+    let reserve = SOURCE
+        .split("fn reserve_send(&mut self)")
+        .nth(1)
+        .expect("the queue still has its send reservation")
+        .split("\n    }")
+        .next()
+        .expect("reserve_send is still a bounded function body");
+    assert_eq!(
+        reserve.matches("ChannelRefusal::QueueFull").count(),
+        reserve.matches("ChannelError::WouldBlock").count(),
+        "every WouldBlock in reserve_send must be counted, and counted as a \
+         full queue"
+    );
+    assert!(
+        !reserve.contains("ChannelRefusal::PayloadExhausted"),
+        "reserve_send counts a queue refusal as an exhausted pool"
+    );
+}
