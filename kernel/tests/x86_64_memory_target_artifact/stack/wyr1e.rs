@@ -56,10 +56,19 @@ pub(crate) fn validate_wyr1e_privilege_entry_stack_margin(
     let (ready, ready_bytes) = select("q35 ready wakes", &|symbol| {
         symbol == "<deepwyrm_kernel::wait::WaitRegistry<64>>::ready_wakes"
     });
-    let (_ready_fold, ready_fold_bytes) = select("q35 ready-wakes fold", &|symbol| {
-        symbol.contains("<deepwyrm_kernel::wait::WaitRegistry<64>>::ready_wakes::{closure#2}")
-            && symbol.contains("Iterator>::fold::<u32")
-    });
+    // R5E: the winning-index fold no longer has its own frame. It used to be
+    // emitted as `ready_wakes::{closure#2}`'s `Iterator>::fold::<u32` and
+    // called from `ready_wakes`; it is now folded into `ready_wakes` itself,
+    // whose frame absorbed it. Assert the fold rather than tolerate a missing
+    // anchor, so re-emitting it fails here and forces a re-measurement.
+    assert!(
+        !sizes.iter().any(|entry| {
+            entry
+                .symbol
+                .contains("<deepwyrm_kernel::wait::WaitRegistry<64>>::ready_wakes::{closure#2}")
+        }),
+        "selector-33 ready-wakes fold is emitted again; re-measure the ready-wakes phase"
+    );
     let (record_pending, record_pending_bytes) = select("q35 coalesced record", &|symbol| {
         symbol
             == "<deepwyrm_kernel::device::q35_interrupt::Q35InterruptPlatform>::record_pending_delivery"
@@ -118,9 +127,8 @@ pub(crate) fn validate_wyr1e_privilege_entry_stack_margin(
     }
     let ready_body = function_body(disassembly, &ready);
     assert!(
-        ready_body.contains("<deepwyrm_kernel::wait::WaitRegistry<64>>::ready_wakes::{closure#2}")
-            && ready_body.contains("Iterator>::fold::<u32"),
-        "selector-33 ready-wakes frame omitted its exact zero-frame fold target"
+        !ready_body.contains("Iterator>::fold::<u32"),
+        "selector-33 ready-wakes frame calls an out-of-line fold again"
     );
     assert!(
         function_body(disassembly, &handler).contains(&format!(" <{after_eoi}>")),
@@ -132,18 +140,22 @@ pub(crate) fn validate_wyr1e_privilege_entry_stack_margin(
         .lines()
         .filter(|line| line.contains("\tcall\tqword ptr [rip + "))
         .collect::<Vec<_>>();
-    assert_eq!(dynamic_calls.len(), 3);
+    // `dispatch_and_eoi_with` has one source-level `eoi()` call, reached by
+    // both the bound-handler and absent-binding paths. It used to be emitted
+    // twice, once per path, with the completion tail between the copies; the
+    // two paths now merge before the shared call. The order this oracle exists
+    // to prove is unchanged and still read off the emitted body: the platform
+    // dispatch slot, then the EOI, then the post-EOI completion tail.
+    assert_eq!(dynamic_calls.len(), 2);
     assert!(dynamic_calls[0].contains("external_interrupt::HANDLER>"));
     assert!(dynamic_calls[1].contains("arch::x86_64::ipi::TRANSPORT"));
-    assert!(dynamic_calls[2].contains("arch::x86_64::ipi::TRANSPORT"));
     let handler_slot = dispatcher.find(dynamic_calls[0]).unwrap();
-    let first_eoi = dispatcher.find(dynamic_calls[1]).unwrap();
-    let second_eoi = dispatcher.find(dynamic_calls[2]).unwrap();
+    let eoi_slot = dispatcher.find(dynamic_calls[1]).unwrap();
     let completion_tail = dispatcher
         .find("\tjmp\trcx")
         .expect("q35 dispatcher omitted the post-EOI completion tail");
-    assert!(handler_slot < first_eoi);
-    assert!(first_eoi < completion_tail && completion_tail < second_eoi);
+    assert!(handler_slot < eoi_slot);
+    assert!(eoi_slot < completion_tail);
     assert_eq!(dispatcher.matches("\tjmp\trcx").count(), 1);
 
     let phase_total = |frames: &[usize]| {
@@ -162,13 +174,7 @@ pub(crate) fn validate_wyr1e_privilege_entry_stack_margin(
             .and_then(|bytes| bytes.checked_add(return_bytes))
             .expect("selector-33 phase stack bound fits usize")
     };
-    let ready_total = phase_total(&[
-        dispatch_bytes,
-        handler_bytes,
-        deliver_bytes,
-        ready_bytes,
-        ready_fold_bytes,
-    ]);
+    let ready_total = phase_total(&[dispatch_bytes, handler_bytes, deliver_bytes, ready_bytes]);
     let wake_total = phase_total(&[
         dispatch_bytes,
         handler_bytes,

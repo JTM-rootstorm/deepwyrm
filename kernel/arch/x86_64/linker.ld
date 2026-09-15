@@ -211,9 +211,8 @@ ASSERT((__dw_thread_kernel_stack_region_start & (DW_KERNEL_THREAD_STACK_ALIGNMEN
 ASSERT((DW_KERNEL_WYR1E8_STACK_LAYOUT == 0 && DW_KERNEL_THREAD_STACK_COUNT == 16) ||
        (DW_KERNEL_WYR1E8_STACK_LAYOUT == 1 && DW_KERNEL_THREAD_STACK_COUNT == 64),
        "thread kernel-stack count must be 16 ordinarily or 64 only for WYR1-E8")
-ASSERT((DW_KERNEL_WYR1E8_STACK_LAYOUT == 0 && DW_KERNEL_THREAD_STACK_SIZE == 524288) ||
-       (DW_KERNEL_WYR1E8_STACK_LAYOUT == 1 && DW_KERNEL_THREAD_STACK_SIZE == 4194304),
-       "thread kernel-stack size must be 512 KiB ordinarily or 4 MiB only for WYR1-E8")
+ASSERT(DW_KERNEL_THREAD_STACK_SIZE == 524288,
+       "thread kernel-stack size must be the frozen E3 512 KiB for every product")
 ASSERT(DW_KERNEL_THREAD_STACK_GUARD_SIZE == DW_KERNEL_BASE_PAGE_SIZE,
        "each E3 thread kernel stack must have exactly one base-page guard")
 ASSERT(DW_KERNEL_THREAD_STACK_ALIGNMENT == DW_KERNEL_BASE_PAGE_SIZE,

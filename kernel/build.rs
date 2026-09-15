@@ -1412,12 +1412,13 @@ fn emit_task_layout_env(layout: TaskLayout) {
 
 fn select_task_layout(mut layout: TaskLayout, wyr1e8: bool) -> TaskLayout {
     if wyr1e8 {
-        // E8 has 64 schedulable Thread identities and its fixed scenario
-        // retains the production syscall handler with 64-capacity task-group
-        // helpers. Keep the frozen E3 layout unchanged for every other
-        // product.
+        // E8 has 64 schedulable Thread identities. It used to widen the stack
+        // itself to 4 MiB as well, because its termination path carried
+        // by-value batches that scaled as PROCESSES x (HANDLES + 2 x THREADS).
+        // Reset cards R5B to R5D removed those batches and R5E re-measured the
+        // chain, so only the count differs now; the frozen E3 size is
+        // unchanged for every product, E8 included.
         layout.thread_kernel_stack_count = 64;
-        layout.thread_kernel_stack_size = 4 * 1024 * 1024;
     }
     layout
 }
@@ -2417,14 +2418,14 @@ mod tests {
     }
 
     #[test]
-    fn wyr1e8_selects_sixty_four_four_mib_thread_stacks() {
+    fn wyr1e8_selects_sixty_four_frozen_size_thread_stacks() {
         let base = TaskLayout::parse(include_str!("arch/x86_64/task_layout.toml")).unwrap();
         let ordinary = select_task_layout(base, false);
         let e8 = select_task_layout(base, true);
         assert_eq!(ordinary.thread_kernel_stack_count, 16);
         assert_eq!(e8.thread_kernel_stack_count, 64);
         assert_eq!(ordinary.thread_kernel_stack_size, 524_288);
-        assert_eq!(e8.thread_kernel_stack_size, 4 * 1024 * 1024);
+        assert_eq!(e8.thread_kernel_stack_size, 524_288);
         assert_eq!(
             e8.thread_kernel_stack_guard_size,
             ordinary.thread_kernel_stack_guard_size

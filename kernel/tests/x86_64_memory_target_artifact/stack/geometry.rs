@@ -9,11 +9,9 @@ pub(crate) fn validate_kernel_stack_artifact_geometry_for_threads(
     thread_count: u64,
 ) {
     assert!(matches!(thread_count, 16 | 64));
-    let thread_stack_bytes = match thread_count {
-        16 => 512 * 1024,
-        64 => 4 * 1024 * 1024,
-        _ => unreachable!(),
-    };
+    // R5E returned E8 to the frozen E3 stack size, so the arena differs only
+    // in how many stacks it holds.
+    const THREAD_STACK_BYTES: u64 = 512 * 1024;
     let addresses = symbols
         .lines()
         .filter_map(|line| {
@@ -84,7 +82,7 @@ pub(crate) fn validate_kernel_stack_artifact_geometry_for_threads(
     assert_eq!(thread_start & 0xfff, 0, "thread stack arena alignment");
     assert_eq!(
         thread_end - thread_start,
-        thread_count * (4096 + thread_stack_bytes)
+        thread_count * (4096 + THREAD_STACK_BYTES)
     );
     assert!(
         address("__dw_ist_region_end") <= thread_start && thread_end <= address("__dw_data_end"),

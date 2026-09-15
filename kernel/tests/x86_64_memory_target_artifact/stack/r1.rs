@@ -1,5 +1,10 @@
 use super::*;
 
+/// The R5E-measured selector-34 syscall chain, restored to exact equalities.
+pub(crate) const EXPECTED_COMMON: usize = 14_560;
+pub(crate) const EXPECTED_TERMINATE: usize = 20_384;
+pub(crate) const EXPECTED_REQUIRED: usize = 57_248;
+
 /// Reset-card-R1 thread-stack bound for selector 34 (`dynamic-launch-saturation`).
 ///
 /// Item 4 of `DW1_WYR1_RESET_R1C_VM_REQUEST.md`. This replaces the readiness
@@ -135,34 +140,27 @@ pub(crate) fn validate_r1_thread_stack_margin(
         .and_then(|bytes| bytes.checked_add(REQUIRED_SPARE_BYTES))
         .expect("R1 Thread stack requirement fits usize");
 
-    // `common` is the ordinary syscall path, untouched by reset card R5C, so it
-    // stays the pinned measurement.
-    assert_eq!(common, 179_168);
-
-    // The terminate figures became ceilings at R5C, which removed the
-    // `[ProcessExitEffects; PROCESSES]` batch from
-    // `prepare_task_group_terminate`. That can only shrink these frames, so the
-    // pre-R5C numbers still catch a regression; they are no longer the emitted
-    // values. Re-measuring needs an accepted-workflow request, which is R5E.
-    const PRE_R5C_TERMINATE_BOUND: usize = 345_344;
-    const PRE_R5C_REQUIRED_BOUND: usize = 382_208;
-    assert!(
-        normal <= PRE_R5C_TERMINATE_BOUND,
-        "R1 task-group terminate frames grew past the pre-R5C measurement: {normal}"
+    // Emit the measurement before asserting on it, so a re-measurement reads
+    // the emitted figures out of a failing run instead of one number at a time.
+    eprintln!(
+        "dynamic-launch-saturation thread-stack common={common} \
+         task-group-terminate={normal} required={required} \
+         capacity={thread_stack_bytes} remaining={}",
+        thread_stack_bytes.saturating_sub(required)
     );
-    assert!(required <= PRE_R5C_REQUIRED_BOUND);
+
+    // R5E re-measured this chain under the accepted workflow and restored the
+    // equalities R5C had to leave as ceilings. Before R5, common was 179,168,
+    // the terminate path 345,344, and the requirement 382,208.
+    assert_eq!(common, EXPECTED_COMMON);
+    assert_eq!(normal, EXPECTED_TERMINATE);
+    assert_eq!(required, EXPECTED_REQUIRED);
     assert!(
         required <= thread_stack_bytes,
         "R1 Thread stack too small: common={common} task-group-terminate={normal} \
          architectural-headroom={ARCHITECTURAL_HEADROOM_BYTES} \
          required-spare={REQUIRED_SPARE_BYTES} required={required} \
          capacity={thread_stack_bytes}"
-    );
-    eprintln!(
-        "dynamic-launch-saturation thread-stack common={common} \
-         task-group-terminate={normal} required={required} \
-         capacity={thread_stack_bytes} remaining={}",
-        thread_stack_bytes - required
     );
 }
 
@@ -174,17 +172,17 @@ pub(crate) fn validate_r1_thread_stack_margin(
 /// forbids. It would mean reducing the frames instead.
 #[test]
 pub(super) fn r1_thread_requirement_fits_the_ordinary_arena_without_e8s_widening() {
-    // A pre-R5C ceiling rather than the emitted requirement; see above.
-    const REQUIRED: usize = 382_208;
     const ORDINARY: usize = 512 * 1024;
-    const E8_REQUIRED: usize = 3_014_752;
+    // Both selectors now fit the ordinary arena, so the comparison that used to
+    // justify R1's narrow tables is no longer a fit-versus-not-fit one. It is
+    // still the reason R1's requirement is a fraction of E8's: R1's per-Process
+    // tables are narrower, and the ratio survives R5.
     const {
-        assert!(REQUIRED <= ORDINARY);
+        assert!(EXPECTED_REQUIRED <= ORDINARY);
         // Real margin, not a hairline fit: a single added frame must not need a
         // new arena.
-        assert!(REQUIRED + 64 * 1024 <= ORDINARY);
-        // And the reason the narrow tables matter, stated as arithmetic.
-        assert!(REQUIRED * 7 < E8_REQUIRED);
+        assert!(EXPECTED_REQUIRED + 64 * 1024 <= ORDINARY);
+        assert!(EXPECTED_REQUIRED < super::wyr1e_thread::EXPECTED_REQUIRED);
     }
-    assert_eq!(ORDINARY - REQUIRED, 142_080);
+    assert_eq!(ORDINARY - EXPECTED_REQUIRED, 467_040);
 }

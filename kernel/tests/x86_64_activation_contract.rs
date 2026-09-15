@@ -288,16 +288,7 @@ fn e3_e4_kernel_stacks_are_private_linker_carriers_with_first_root_guards() {
     }
     assert!(linker.contains("__dw_thread_kernel_stack_region_start = .;"));
     assert!(linker.contains("__dw_thread_kernel_stack_region_end = .;"));
-    assert!(
-        linker.contains(
-            "DW_KERNEL_WYR1E8_STACK_LAYOUT == 0 && DW_KERNEL_THREAD_STACK_SIZE == 524288"
-        )
-    );
-    assert!(
-        linker.contains(
-            "DW_KERNEL_WYR1E8_STACK_LAYOUT == 1 && DW_KERNEL_THREAD_STACK_SIZE == 4194304"
-        )
-    );
+    assert!(linker.contains("ASSERT(DW_KERNEL_THREAD_STACK_SIZE == 524288,"));
     assert!(linker.contains("__dw_privilege_entry_stack_guard = .;"));
     assert!(linker.contains("__dw_privilege_entry_stack_top = .;"));
     assert!(linker.contains("__dw_terminal_reaper_stack_guard = .;"));

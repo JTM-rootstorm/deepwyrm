@@ -1,5 +1,16 @@
 use super::*;
 
+/// The R5E-measured E8 syscall chain, restored to exact equalities.
+///
+/// `EXPECTED_COMMON` is the ordinary native syscall path: the architectural
+/// entry frame plus the dispatcher, the bound dispatcher, the trampoline that
+/// now carries the folded dispatch frame, and the production handler.
+/// `EXPECTED_TERMINATE` adds the task-group terminate helpers, and
+/// `EXPECTED_REQUIRED` adds architectural headroom and required spare.
+pub(crate) const EXPECTED_COMMON: usize = 50_528;
+pub(crate) const EXPECTED_TERMINATE: usize = 72_608;
+pub(crate) const EXPECTED_REQUIRED: usize = 109_472;
+
 pub(crate) fn validate_wyr1e8_thread_stack_margin(
     sizes: &[StackSize],
     disassembly: &str,
@@ -26,11 +37,21 @@ pub(crate) fn validate_wyr1e8_thread_stack_margin(
                 && symbol.contains("RuntimeCarrierFacade<128, 4096>")
                 && !symbol.contains("::{closure")
         });
-    let (dispatch_frame, dispatch_frame_bytes) = select("E8 dispatch frame", &|symbol| {
-        symbol.contains("syscall::native::dispatch_frame::<")
-            && symbol.contains("RuntimeCarrierFacade<128, 4096>")
-            && !symbol.contains("::{closure")
-    });
+    // R5E: `dispatch_frame` is no longer emitted as its own function. R5B to
+    // R5D took the by-value termination batches out of the frames below it,
+    // and the remaining body is small enough that LLVM folds it into its one
+    // caller, the trampoline. Its slots are therefore already inside
+    // `runtime_trampoline_bytes`, and the trampoline calls the handler
+    // directly, one return word shallower than before. Assert the fold rather
+    // than tolerate it: if a later change re-emits the frame, this fails and
+    // the chain must be re-measured instead of silently losing a level.
+    assert!(
+        !sizes.iter().any(|entry| {
+            entry.symbol.contains("syscall::native::dispatch_frame::<")
+                && entry.symbol.contains("RuntimeCarrierFacade<128, 4096>")
+        }),
+        "E8 dispatch_frame is emitted again; re-measure the common syscall chain"
+    );
     let (runtime_handler, runtime_handler_bytes) = select("E8 runtime handler", &|symbol| {
         symbol.contains("RuntimeCarrierFacade<128, 4096>")
             && symbol
@@ -57,9 +78,9 @@ pub(crate) fn validate_wyr1e8_thread_stack_margin(
     assert_eq!(bound_body.matches("\tjmp\trcx").count(), 1);
     assert!(bound_body.contains("syscall::live::RUNTIME"));
     assert!(
-        function_body(disassembly, &runtime_trampoline).contains(&format!(" <{dispatch_frame}>"))
+        function_body(disassembly, &runtime_trampoline).contains(&format!(" <{runtime_handler}>")),
+        "E8 trampoline no longer reaches the production handler directly"
     );
-    assert!(function_body(disassembly, &dispatch_frame).contains(&format!(" <{runtime_handler}>")));
     assert!(
         function_body(disassembly, &runtime_handler).contains(&format!(" <{prepare_terminate}>"))
     );
@@ -70,9 +91,10 @@ pub(crate) fn validate_wyr1e8_thread_stack_margin(
     // The entry copies a 144-byte frame onto the Thread stack and calls the
     // dispatcher. The dispatcher pushes one word before calling the bound
     // runtime. That function tail-jumps into the installed trampoline, so it
-    // adds no second return word. Three further calls reach dispatch_frame,
-    // the production handler, and the selected terminate helper.
-    const COMMON_RETURN_WORDS: usize = 4;
+    // adds no second return word. The trampoline, which now carries the
+    // folded dispatch frame, calls the production handler, and the handler
+    // calls the selected terminate helper.
+    const COMMON_RETURN_WORDS: usize = 3;
     const TERMINATE_RETURN_WORDS: usize = 2;
     assert_eq!(syscall_dispatch_bytes, size_of::<u64>());
     assert_eq!(bound_dispatch_bytes, 0);
@@ -80,7 +102,6 @@ pub(crate) fn validate_wyr1e8_thread_stack_margin(
         syscall_dispatch_bytes,
         bound_dispatch_bytes,
         runtime_trampoline_bytes,
-        dispatch_frame_bytes,
         runtime_handler_bytes,
     ]
     .into_iter()
@@ -104,24 +125,14 @@ pub(crate) fn validate_wyr1e8_thread_stack_margin(
         .and_then(|bytes| bytes.checked_add(REQUIRED_SPARE_BYTES))
         .expect("E8 Thread stack requirement fits usize");
 
-    // `common` is the ordinary syscall path and R5C did not touch it, so it
-    // stays exact.
-    assert_eq!(common, 1_501_744);
-
-    // The terminate figures are bounds, not the pinned measurement they used to
-    // be. Reset card R5C removed the `[ProcessExitEffects; PROCESSES]` batch
-    // from `prepare_task_group_terminate`, which can only have made these frames
-    // smaller -- so the pre-R5C measurement is still a valid ceiling, and a
-    // regression past it still fails here. It is not the emitted value any more,
-    // and this gate is only reachable under an accepted-workflow request, so R5C
-    // could not re-measure it. R5E does that and restores the equalities.
-    const PRE_R5C_TERMINATE_BOUND: usize = 2_977_888;
-    const PRE_R5C_REQUIRED_BOUND: usize = 3_014_752;
-    assert!(
-        normal <= PRE_R5C_TERMINATE_BOUND,
-        "E8 task-group terminate frames grew past the pre-R5C measurement: {normal}"
-    );
-    assert!(required <= PRE_R5C_REQUIRED_BOUND);
+    // R5E re-measured this chain under the accepted workflow and restored the
+    // equalities R5C had to leave as ceilings. The pre-R5C figures are kept in
+    // the comment because they are what the reduced budget is justified
+    // against: common was 1,501,744, the terminate path 2,977,888, and the
+    // requirement 3,014,752, which is why the arena was widened to 4 MiB.
+    assert_eq!(common, EXPECTED_COMMON);
+    assert_eq!(normal, EXPECTED_TERMINATE);
+    assert_eq!(required, EXPECTED_REQUIRED);
     assert!(
         required <= thread_stack_bytes,
         "WYR1-E8 Thread stack too small: common={common} task-group-terminate={normal} architectural-headroom={ARCHITECTURAL_HEADROOM_BYTES} required-spare={REQUIRED_SPARE_BYTES} required={required} capacity={thread_stack_bytes}"
@@ -133,12 +144,17 @@ pub(crate) fn validate_wyr1e8_thread_stack_margin(
 }
 
 #[test]
-fn e8_thread_capacity_rejects_a5_layout_and_accepts_functional_allocation() {
-    // A pre-R5C ceiling rather than the emitted requirement; see above.
-    const REQUIRED: usize = 3_014_752;
+fn e8_thread_capacity_fits_the_ordinary_thread_stack_after_r5() {
+    // Before R5 this requirement was 3,014,752 bytes, which is why E8 alone
+    // linked a 4 MiB Thread stack: the pre-R5 figure did not fit the ordinary
+    // 512 KiB arena, and 64 of them cost 256 MiB of linked BSS. R5B to R5D
+    // took the by-value termination batches out of the chain, so R5E returns
+    // E8 to the frozen E3 size; only the count still differs.
+    const PRE_R5_REQUIRED: usize = 3_014_752;
+    const ORDINARY: usize = 512 * 1024;
     const {
-        assert!(REQUIRED > 512 * 1024);
-        assert!(REQUIRED <= 4 * 1024 * 1024);
+        assert!(PRE_R5_REQUIRED > ORDINARY);
+        assert!(EXPECTED_REQUIRED <= ORDINARY);
     }
-    assert_eq!(4 * 1024 * 1024 - REQUIRED, 1_179_552);
+    assert_eq!(ORDINARY - EXPECTED_REQUIRED, 414_816);
 }
