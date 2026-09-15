@@ -3137,7 +3137,8 @@ struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_
     cleanup: CleanupQueue<REGISTRY_OBJECTS>,
     // Pending final releases are moved before the irreversible stop commit.
     // They are drained only by the post-ack kernel-root continuation.
-    rendezvous_cleanup: Option<CleanupQueue<REGISTRY_OBJECTS>>,
+    rendezvous_cleanup: CleanupQueue<REGISTRY_OBJECTS>,
+    rendezvous_cleanup_staged: bool,
     #[cfg(feature = "test-support")]
     g5_probe: G5PrimordialProbe,
 }
@@ -5225,18 +5226,23 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
-    fn merge_cleanup(&mut self, cleanup: CleanupQueue<REGISTRY_OBJECTS>) {
-        for release in cleanup.into_releases().into_iter().flatten() {
-            self.cleanup.push(release);
-        }
+    fn merge_cleanup(&mut self, cleanup: &mut CleanupQueue<REGISTRY_OBJECTS>) {
+        cleanup.drain_into(&mut self.cleanup);
+    }
+
+    /// Moves the F-service carrier's queued finalizers into this carrier's
+    /// queue, without either queue leaving its owner.
+    fn absorb_service_cleanup(&mut self) {
+        self.services.drain_cleanup_into(&mut self.cleanup);
     }
 
     fn stage_rendezvous_cleanup(&mut self) {
         assert!(
-            self.rendezvous_cleanup.is_none(),
+            !self.rendezvous_cleanup_staged,
             "remote stop staged cleanup twice"
         );
-        self.rendezvous_cleanup = Some(core::mem::replace(&mut self.cleanup, CleanupQueue::new()));
+        self.cleanup.drain_into(&mut self.rendezvous_cleanup);
+        self.rendezvous_cleanup_staged = true;
     }
 
     /// Moves a suspended F-service operation out of the stopped carrier before
@@ -5281,8 +5287,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             user.release_atomic_u32(pin)
                 .unwrap_or_else(|_| panic!("rendezvous suspended atomic pin drifted"));
         }
-        let cleanup = self.services.take_cleanup();
-        self.merge_cleanup(cleanup);
+        self.absorb_service_cleanup();
     }
 
     fn service_state_is_quiescent(&self) -> bool {
@@ -5297,11 +5302,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn drain_staged_rendezvous_cleanup(&mut self) {
-        let cleanup = self
-            .rendezvous_cleanup
-            .take()
-            .unwrap_or_else(|| panic!("post-ack carrier omitted staged cleanup"));
-        self.merge_cleanup(cleanup);
+        assert!(
+            self.rendezvous_cleanup_staged,
+            "post-ack carrier omitted staged cleanup"
+        );
+        self.rendezvous_cleanup_staged = false;
+        self.rendezvous_cleanup.drain_into(&mut self.cleanup);
         self.drain_finalizers()
             .unwrap_or_else(|_| panic!("post-ack rendezvous cleanup drifted"));
     }
@@ -5432,8 +5438,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             pin.release_terminal(&self.active.user_pins)
                 .unwrap_or_else(|_| panic!("primordial exception atomic pin drifted"));
         }
-        let cleanup = self.services.take_cleanup();
-        self.merge_cleanup(cleanup);
+        self.absorb_service_cleanup();
     }
 
     fn prepare_remote_process_exception(
@@ -5533,8 +5538,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             pin.release_terminal(&self.active.user_pins)
                 .unwrap_or_else(|_| panic!("exception terminal atomic pin drifted"));
         }
-        let cleanup = self.services.take_cleanup();
-        self.merge_cleanup(cleanup);
+        self.absorb_service_cleanup();
         result
     }
 
@@ -6109,9 +6113,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     fn drain_finalizers(&mut self) -> Result<(), ()> {
         loop {
-            while !self.cleanup.is_empty() {
-                let cleanup = core::mem::replace(&mut self.cleanup, CleanupQueue::new());
-                for release in cleanup.into_releases().into_iter().flatten() {
+            // Popping in place is what allows the cascade: finalizing one
+            // release pushes its parents back onto this same queue, and they are
+            // reached later in this loop rather than by a second pass over a
+            // snapshot.
+            while let Some(release) = self.cleanup.pop() {
+                {
                     let batch = {
                         let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
                         let mut finalizer = crate::object::PayloadFinalizer::new(
@@ -6401,17 +6408,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             );
             self.drain_finalizers().map_err(|_| 0x7000_000e_u32)?;
         }
-        let trailing = core::mem::replace(&mut self.cleanup, CleanupQueue::new());
         if self.memory.active_lease_count() != 0
             || self.tasks.process_info(self.process).is_ok()
             || self.tasks.thread_info(self.thread).is_ok()
             || self.regions.region(self.root_key).is_ok()
-            || trailing
-                .into_releases()
-                .into_iter()
-                .flatten()
-                .next()
-                .is_some()
+            || !self.cleanup.is_empty()
         {
             return Err(0x7000_000f_u32);
         }
@@ -6682,7 +6683,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .stopping_claim
             .unwrap_or_else(|| panic!("remote stop cleanup omitted its exact stopped claim"));
         self.cleanup.is_empty()
-            && self.rendezvous_cleanup.is_some()
+            && self.rendezvous_cleanup_staged
             && self.stopped_service_state_is_quiescent()
             && self.deferred_currents[self.cpu.index()].is_none()
             && self
@@ -7855,8 +7856,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
             )
         }
         .unwrap_or_else(|error| panic!("primordial suspended syscall resume drifted: {error:?}"));
-        let (status, cleanup) = resumed.into_parts();
-        self.merge_cleanup(cleanup);
+        let status = resumed.status();
+        self.absorb_service_cleanup();
         #[cfg(feature = "test-support")]
         self.g5_probe.observe_resume(owner, status);
         frame.set_status(status);
@@ -9700,7 +9701,8 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         deferred_currents: core::array::from_fn(|_| None),
         pending_quantum_cancellations: core::array::from_fn(|_| None),
         cleanup: CleanupQueue::new(),
-        rendezvous_cleanup: None,
+        rendezvous_cleanup: CleanupQueue::new(),
+        rendezvous_cleanup_staged: false,
         #[cfg(feature = "test-support")]
         g5_probe: G5PrimordialProbe::for_build(),
     }));
@@ -10009,8 +10011,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                         },
                     )
                 };
-                let (route, cleanup) = dispatch.into_parts();
-                self.merge_cleanup(cleanup);
+                let route = dispatch.into_route();
+                self.absorb_service_cleanup();
                 match route {
                     FServiceRoute::Handled(result) => result,
                     FServiceRoute::Fallthrough(request) => self.handle_fallthrough(request),
@@ -10876,8 +10878,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             pin.release_terminal(&self.active.user_pins)
                 .unwrap_or_else(|_| panic!("primordial exit atomic pin drifted"));
         }
-        let cleanup = self.services.take_cleanup();
-        self.merge_cleanup(cleanup);
+        self.absorb_service_cleanup();
         let result = NativeSyscallResult { status, control };
         self.commit_runtime_phase(phase);
         result
@@ -10985,8 +10986,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             pin.release_terminal(&self.active.user_pins)
                 .unwrap_or_else(|_| panic!("process-exit atomic pin drifted"));
         }
-        let cleanup = self.services.take_cleanup();
-        self.merge_cleanup(cleanup);
+        self.absorb_service_cleanup();
         result
     }
 
@@ -11269,8 +11269,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             pin.release_terminal(&self.active.user_pins)
                 .unwrap_or_else(|_| panic!("process termination atomic pin drifted"));
         }
-        let cleanup = self.services.take_cleanup();
-        self.merge_cleanup(cleanup);
+        self.absorb_service_cleanup();
         result
     }
 
@@ -11395,8 +11394,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             pin.release_terminal(&self.active.user_pins)
                 .unwrap_or_else(|_| panic!("TaskGroup termination atomic pin drifted"));
         }
-        let cleanup = self.services.take_cleanup();
-        self.merge_cleanup(cleanup);
+        self.absorb_service_cleanup();
         result
     }
 
@@ -11697,8 +11695,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             pin.release_terminal(&self.active.user_pins)
                 .unwrap_or_else(|_| panic!("Thread termination atomic pin drifted"));
         }
-        let cleanup = self.services.take_cleanup();
-        self.merge_cleanup(cleanup);
+        self.absorb_service_cleanup();
         result
     }
 
@@ -11790,7 +11787,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             pin.release_terminal(&self.active.user_pins)
                 .unwrap_or_else(|_| panic!("terminal adapter atomic pin drifted"));
         }
-        let cleanup = self.services.take_cleanup();
-        self.merge_cleanup(cleanup);
+        self.absorb_service_cleanup();
     }
 }

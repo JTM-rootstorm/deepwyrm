@@ -123,9 +123,22 @@ macro_rules! process_handle_operation {
     }};
 }
 
+/// Finalizers awaiting routing, drained in place.
+///
+/// Reset card R5D made this a queue rather than a batch. It used to be moved by
+/// value to be read -- `mem::replace` out of the carrier field, then
+/// `into_releases()` again -- which cost two copies of a `CAPACITY`-sized array
+/// per drain site, 5,128 bytes each at the E8 registry geometry, on the syscall
+/// frames that route finalizers. `pop` reads it where it lives instead.
+///
+/// The `mem::replace` was never about ordering: finalization cascades, and
+/// routing one release pushes more into the same queue, which a `for` loop over
+/// a borrowed array cannot allow. Popping from the head with pushes at the tail
+/// visits a cascade in exactly the order the snapshot-per-generation loop did.
 #[must_use = "typed final releases must be routed after syscall pins/locks are dropped"]
 pub(crate) struct CleanupQueue<const CAPACITY: usize> {
     releases: [Option<FinalRelease>; CAPACITY],
+    head: usize,
     len: usize,
 }
 
@@ -133,6 +146,7 @@ impl<const CAPACITY: usize> CleanupQueue<CAPACITY> {
     pub(crate) fn new() -> Self {
         Self {
             releases: core::array::from_fn(|_| None),
+            head: 0,
             len: 0,
         }
     }
@@ -142,7 +156,8 @@ impl<const CAPACITY: usize> CleanupQueue<CAPACITY> {
             self.len < CAPACITY,
             "E5 cleanup queue exceeded ObjectRegistry capacity"
         );
-        self.releases[self.len] = Some(release);
+        let index = (self.head + self.len) % CAPACITY;
+        self.releases[index] = Some(release);
         self.len += 1;
     }
 
@@ -152,12 +167,32 @@ impl<const CAPACITY: usize> CleanupQueue<CAPACITY> {
         }
     }
 
-    pub(crate) const fn is_empty(&self) -> bool {
-        self.len == 0
+    /// Takes the oldest queued finalizer, or `None` when the queue is drained.
+    ///
+    /// A caller may push while draining; what it pushes is popped later in this
+    /// same loop rather than left for a second pass.
+    pub(crate) fn pop(&mut self) -> Option<FinalRelease> {
+        if self.len == 0 {
+            return None;
+        }
+        let release = self.releases[self.head].take();
+        self.head = (self.head + 1) % CAPACITY;
+        self.len -= 1;
+        debug_assert!(release.is_some(), "cleanup queue lost a queued finalizer");
+        release
     }
 
-    pub(crate) fn into_releases(self) -> [Option<FinalRelease>; CAPACITY] {
-        self.releases
+    /// Moves every queued finalizer into `other`, in order.
+    ///
+    /// This replaces moving the whole queue by value between owners.
+    pub(crate) fn drain_into<const OTHER: usize>(&mut self, other: &mut CleanupQueue<OTHER>) {
+        while let Some(release) = self.pop() {
+            other.push(release);
+        }
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.len == 0
     }
 }
 
@@ -1119,11 +1154,10 @@ fn collect_retired_pins<
     registry: &mut ObjectRegistry<OBJECTS>,
     execution: &ExecutionDomain<EXECUTION>,
     waits: &WaitRegistry<WAITERS>,
-    pins: RetiredExitPins<THREADS>,
+    mut pins: RetiredExitPins<THREADS>,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) {
-    let (process, threads) = pins.into_parts();
-    for pin in threads.into_iter().flatten().chain(process) {
+    while let Some(pin) = pins.pop() {
         complete_wait_wakes(
             registry,
             execution,

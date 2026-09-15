@@ -2839,12 +2839,12 @@ fn terminal_reaper_reuses_replacement_selected_by_deferred_retirement() {
         Some(SchedulerThreadState::Running)
     );
 
-    let (process_pin, thread_pins) = retired.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut retired = retired;
+    while let Some(pin) = retired.pop() {
         assert!(registry.release_internal(pin).unwrap().is_none());
     }
-    let (process_pin, thread_pins) = deferred_pins.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut deferred_pins = deferred_pins;
+    while let Some(pin) = deferred_pins.pop() {
         assert!(registry.release_internal(pin).unwrap().is_none());
     }
     for reference in [current_handle, replacement_handle, process_handle] {
@@ -2892,12 +2892,12 @@ fn terminal_reaper_schedules_work_published_after_deferred_retirement() {
         Some(SchedulerThreadState::Running)
     );
 
-    let (process_pin, thread_pins) = retired.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut retired = retired;
+    while let Some(pin) = retired.pop() {
         assert!(registry.release_internal(pin).unwrap().is_none());
     }
-    let (process_pin, thread_pins) = deferred_pins.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut deferred_pins = deferred_pins;
+    while let Some(pin) = deferred_pins.pop() {
         assert!(registry.release_internal(pin).unwrap().is_none());
     }
     for reference in [current_handle, awakened_handle, process_handle] {

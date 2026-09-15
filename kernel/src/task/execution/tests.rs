@@ -155,12 +155,12 @@ fn local_quantum_expiry_cannot_revive_a_normally_exited_thread() {
         Err(TaskError::BadState)
     ));
 
-    let (process_pin, thread_pins) = retired.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut retired = retired;
+    while let Some(pin) = retired.pop() {
         assert!(registry.release_internal(pin).unwrap().is_none());
     }
-    let (process_pin, thread_pins) = deferred_pins.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut deferred_pins = deferred_pins;
+    while let Some(pin) = deferred_pins.pop() {
         assert!(registry.release_internal(pin).unwrap().is_none());
     }
     for reference in [current_handle, replacement_handle, process_handle] {
@@ -246,12 +246,12 @@ fn authorized_process_termination_waits_for_exact_remote_stop_ack() {
         Err(SchedulerError::StaleExecutionClaim)
     );
 
-    let (process_pin, thread_pins) = retired.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut retired = retired;
+    while let Some(pin) = retired.pop() {
         assert!(registry.release_internal(pin).unwrap().is_none());
     }
-    let (process_pin, thread_pins) = deferred_pins.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut deferred_pins = deferred_pins;
+    while let Some(pin) = deferred_pins.pop() {
         assert!(registry.release_internal(pin).unwrap().is_none());
     }
     for reference in [current_handle, remote_handle, process_handle] {
@@ -311,12 +311,12 @@ fn remote_stop_completion_retires_exact_suspended_physical_current() {
     assert_eq!(domain.scheduler_state(current), None);
     assert_eq!(domain.scheduler_state(remote), None);
 
-    let (process_pin, thread_pins) = retired.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut retired = retired;
+    while let Some(pin) = retired.pop() {
         assert!(registry.release_internal(pin).unwrap().is_none());
     }
-    let (process_pin, thread_pins) = deferred_pins.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut deferred_pins = deferred_pins;
+    while let Some(pin) = deferred_pins.pop() {
         assert!(registry.release_internal(pin).unwrap().is_none());
     }
     for reference in [current_handle, remote_handle, process_handle] {
@@ -390,12 +390,12 @@ fn remote_stop_completion_preserves_suspended_caller_with_logical_replacement() 
         DW_TASK_STATE_RUNNING
     );
 
-    let (process_pin, thread_pins) = retired.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut retired = retired;
+    while let Some(pin) = retired.pop() {
         assert!(registry.release_internal(pin).unwrap().is_none());
     }
-    let (process_pin, thread_pins) = deferred_pins.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut deferred_pins = deferred_pins;
+    while let Some(pin) = deferred_pins.pop() {
         assert!(registry.release_internal(pin).unwrap().is_none());
     }
     for reference in [
@@ -532,12 +532,12 @@ fn execution_domain_starts_schedules_and_reclaims_exact_thread_resources() {
         domain.load_context(context),
         Err(ExecutionResourceError::StaleId)
     );
-    let (process_pin, thread_pins) = retired.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut retired = retired;
+    while let Some(pin) = retired.pop() {
         assert!(registry.release_internal(pin).unwrap().is_none());
     }
-    let (process_pin, thread_pins) = deferred_pins.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut deferred_pins = deferred_pins;
+    while let Some(pin) = deferred_pins.pop() {
         assert!(registry.release_internal(pin).unwrap().is_none());
     }
 }
@@ -639,12 +639,12 @@ fn current_terminal_resources_remain_allocated_until_linear_token_is_consumed() 
         Err(ExecutionResourceError::StaleId)
     );
 
-    let (process_pin, thread_pins) = retired.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut retired = retired;
+    while let Some(pin) = retired.pop() {
         let _ = registry.release_internal(pin).unwrap();
     }
-    let (process_pin, thread_pins) = deferred_pins.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut deferred_pins = deferred_pins;
+    while let Some(pin) = deferred_pins.pop() {
         let _ = registry.release_internal(pin).unwrap();
     }
     for reference in [current_ref, sibling_ref, process_ref] {
@@ -810,12 +810,12 @@ fn process_fatal_exception_defers_current_ownership_until_divergent_reclaim() {
     domain.contexts.reclaim(replacement_context).unwrap();
     domain.contexts.reclaim(post_reclaim_context).unwrap();
 
-    let (process_pin, thread_pins) = retired.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut retired = retired;
+    while let Some(pin) = retired.pop() {
         assert!(registry.release_internal(pin).unwrap().is_none());
     }
-    let (process_pin, thread_pins) = deferred_pins.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut deferred_pins = deferred_pins;
+    while let Some(pin) = deferred_pins.pop() {
         assert!(registry.release_internal(pin).unwrap().is_none());
     }
 }
@@ -885,12 +885,12 @@ fn ap_exception_retires_exact_cpu_generation_before_reclaim() {
         Err(SchedulerError::StaleExecutionClaim)
     );
 
-    let (process_pin, thread_pins) = retired.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut retired = retired;
+    while let Some(pin) = retired.pop() {
         assert!(registry.release_internal(pin).unwrap().is_none());
     }
-    let (process_pin, thread_pins) = deferred_pins.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut deferred_pins = deferred_pins;
+    while let Some(pin) = deferred_pins.pop() {
         assert!(registry.release_internal(pin).unwrap().is_none());
     }
     for reference in [faulting_handle, sibling_handle, process_handle] {
@@ -950,8 +950,8 @@ fn blocked_thread_retains_resources_until_terminal_retirement() {
         domain.load_context(context),
         Err(ExecutionResourceError::StaleId)
     );
-    let (process_pin, thread_pins) = retired.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut retired = retired;
+    while let Some(pin) = retired.pop() {
         assert!(registry.release_internal(pin).unwrap().is_none());
     }
 }
@@ -1050,12 +1050,12 @@ fn destination_acknowledges_prior_suspension_before_terminal_process_retirement(
     let deferred_pins = domain.reclaim_deferred_current_on(cpu0, deferred);
     assert_eq!(domain.suspended_claim_on(cpu0), None);
 
-    let (process_pin, thread_pins) = retired.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut retired = retired;
+    while let Some(pin) = retired.pop() {
         assert!(registry.release_internal(pin).unwrap().is_none());
     }
-    let (process_pin, thread_pins) = deferred_pins.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut deferred_pins = deferred_pins;
+    while let Some(pin) = deferred_pins.pop() {
         assert!(registry.release_internal(pin).unwrap().is_none());
     }
 }
@@ -1387,4 +1387,27 @@ fn blocking_switch_prepares_fresh_destination_without_seeding_suspended_slot() {
         assert_eq!(frame.add(7).read(), trusted_entry);
         assert_eq!(frame.add(8).read(), 0);
     }
+}
+
+/// R5D: abandoning a retired execution pin is a panic, not a silent leak.
+///
+/// `into_parts` could not enforce this -- it handed the two arrays out, and
+/// dropping them was legal. Draining in place lets the record check itself, which
+/// is worth more than the bytes the conversion saved.
+#[test]
+#[should_panic = "retired terminal execution pins dropped without release"]
+fn r5d_a_retired_pin_cannot_be_abandoned() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let pins = RetiredExitPins::<1> {
+        process: Some(root_owner),
+        threads: [None],
+        next: 0,
+    };
+    // Nothing else may panic while unwinding, or the abort would hide which
+    // assertion this test is about.
+    core::mem::forget(registry);
+    core::mem::forget(tasks);
+    drop(pins);
 }

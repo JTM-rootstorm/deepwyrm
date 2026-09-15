@@ -453,7 +453,7 @@ impl Fixture {
         }
     }
 
-    fn dispatch(&mut self, request: NativeSyscallRequest) -> FServiceDispatch<OBJECTS> {
+    fn dispatch(&mut self, request: NativeSyscallRequest) -> FServiceDispatch {
         self.dispatch_as(self.thread, crate::cpu::CpuIndex::BOOTSTRAP, request)
     }
 
@@ -462,7 +462,7 @@ impl Fixture {
         thread: ThreadKey,
         cpu: crate::cpu::CpuIndex,
         request: NativeSyscallRequest,
-    ) -> FServiceDispatch<OBJECTS> {
+    ) -> FServiceDispatch {
         let prepared = self.services.prepare_dispatch(request, thread, 1).unwrap();
         self.services.dispatch_prepared(
             &mut self.control,
@@ -490,8 +490,9 @@ impl Fixture {
     }
 
     fn handled(&mut self, request: NativeSyscallRequest) -> NativeSyscallResult {
-        let (route, cleanup) = self.dispatch(request).into_parts();
-        Self::handled_route(route, cleanup)
+        let route = self.dispatch(request).into_route();
+        assert!(self.services.cleanup_is_empty());
+        Self::handled_route(route)
     }
 
     fn handled_as(
@@ -500,12 +501,12 @@ impl Fixture {
         cpu: crate::cpu::CpuIndex,
         request: NativeSyscallRequest,
     ) -> NativeSyscallResult {
-        let (route, cleanup) = self.dispatch_as(thread, cpu, request).into_parts();
-        Self::handled_route(route, cleanup)
+        let route = self.dispatch_as(thread, cpu, request).into_route();
+        assert!(self.services.cleanup_is_empty());
+        Self::handled_route(route)
     }
 
-    fn handled_route(route: FServiceRoute, cleanup: CleanupQueue<OBJECTS>) -> NativeSyscallResult {
-        assert_empty_cleanup(cleanup);
+    fn handled_route(route: FServiceRoute) -> NativeSyscallResult {
         match route {
             FServiceRoute::Handled(result) => result,
             FServiceRoute::Fallthrough(request) => {
@@ -521,15 +522,6 @@ fn test_stack_bounds() -> [crate::memory::kernel_stack::KernelStackBounds; EXECU
         crate::memory::kernel_stack::KernelStackBounds::new(guard, guard + 0x1000, guard + 0x11_000)
             .unwrap()
     })
-}
-
-fn assert_empty_cleanup(cleanup: CleanupQueue<OBJECTS>) {
-    assert!(
-        cleanup
-            .into_releases()
-            .into_iter()
-            .all(|release| release.is_none())
-    );
 }
 
 fn u64_at(user: &FakeUserMemory, address: u64) -> u64 {
@@ -628,8 +620,8 @@ fn write_process_create_args(
     bytes[40..48].copy_from_slice(&DW_RIGHT_READ.0.to_le_bytes());
 }
 
-fn finish_task_cleanup(fixture: &mut Fixture, cleanup: CleanupQueue<OBJECTS>) {
-    for release in cleanup.into_releases().into_iter().flatten() {
+fn finish_task_cleanup(fixture: &mut Fixture, mut cleanup: CleanupQueue<OBJECTS>) {
+    while let Some(release) = cleanup.pop() {
         let mut pending = Some(release);
         while let Some(release) = pending.take() {
             let finalization = fixture.tasks.take_finalization(release).unwrap();
@@ -728,9 +720,9 @@ fn f_routes_its_public_owners_and_preserves_e_fallthrough() {
     let basic = NativeSyscallRequest::HandleClose {
         handle: DwHandle(u64::MAX),
     };
-    let (route, cleanup) = fixture.dispatch(basic).into_parts();
+    let route = fixture.dispatch(basic).into_route();
     assert_eq!(route, FServiceRoute::Fallthrough(basic));
-    assert_empty_cleanup(cleanup);
+    assert!(fixture.services.cleanup_is_empty());
 
     let clock = fixture.handled(NativeSyscallRequest::ClockGet {
         clock_id: deepwyrm_abi::DW_CLOCK_MONOTONIC_ACTIVE,
@@ -971,7 +963,7 @@ fn channel_send_wakes_blocked_peer_then_sender_immediately_dispatches() {
             &mut cleanup,
         );
     }
-    assert_empty_cleanup(cleanup);
+    assert!(cleanup.is_empty());
     assert_eq!(
         fixture.services.operation_owner(fixture.thread),
         Err(FServiceOwnerError::Missing)
@@ -1138,9 +1130,8 @@ fn channel_send_resumes_same_cpu_wait_many_peer_without_an_unrelated_interrupt()
             Some(&mut fixture.wait_deadlines),
         )
         .unwrap();
-    let (status, cleanup) = resumed.into_parts();
-    assert_eq!(status, DW_STATUS_SUCCESS);
-    assert_empty_cleanup(cleanup);
+    assert_eq!(resumed.status(), DW_STATUS_SUCCESS);
+    assert!(fixture.services.cleanup_is_empty());
     assert_eq!(u32_at(&fixture.user, BASE + 0x200 + 8), 0);
     assert_ne!(
         u64_at(&fixture.user, BASE + 0x200 + 16) & DW_SIGNAL_READABLE.0,
@@ -1179,7 +1170,7 @@ fn channel_send_resumes_same_cpu_wait_many_peer_without_an_unrelated_interrupt()
             &mut cleanup,
         );
     }
-    assert_empty_cleanup(cleanup);
+    assert!(cleanup.is_empty());
 
     close_event(&mut fixture, sender_idle_event);
     close_channel(&mut fixture, sender_channel);
@@ -1264,9 +1255,8 @@ fn finite_wait_dispatch_idles_times_out_and_resumes_exact_owner() {
             Some(&mut fixture.wait_deadlines),
         )
         .unwrap();
-    let (status, cleanup) = resumed.into_parts();
-    assert_eq!(status, DW_STATUS_TIMED_OUT);
-    assert_empty_cleanup(cleanup);
+    assert_eq!(resumed.status(), DW_STATUS_TIMED_OUT);
+    assert!(fixture.services.cleanup_is_empty());
     assert_eq!(
         fixture.services.operation_owner(fixture.thread),
         Err(FServiceOwnerError::Missing)
@@ -1387,9 +1377,8 @@ fn atomic_mismatch_then_suspend_wake_and_resume_has_one_exact_owner() {
             None,
         )
         .unwrap();
-    let (status, cleanup) = resumed.into_parts();
-    assert_eq!(status, DW_STATUS_SUCCESS);
-    assert_empty_cleanup(cleanup);
+    assert_eq!(resumed.status(), DW_STATUS_SUCCESS);
+    assert!(fixture.services.cleanup_is_empty());
     assert_eq!(fixture.user.atomic_pins, 0);
     assert_eq!(
         fixture.services.operation_owner(fixture.thread),
@@ -1543,7 +1532,7 @@ fn process_create_dispatch_publishes_created_root_and_child_bootstrap() {
         ),
         DW_STATUS_SUCCESS
     );
-    assert_empty_cleanup(cleanup);
+    assert!(cleanup.is_empty());
 
     let mut cleanup = CleanupQueue::<OBJECTS>::new();
     assert_eq!(
@@ -1566,7 +1555,7 @@ fn process_create_dispatch_publishes_created_root_and_child_bootstrap() {
         ),
         DW_STATUS_SUCCESS
     );
-    assert_empty_cleanup(cleanup);
+    assert!(cleanup.is_empty());
     let output = FakeUserMemory::offset(BASE + 0xa80, payload.len());
     assert_eq!(&fixture.user.bytes[output..output + payload.len()], payload);
     assert_eq!(u32_at(&fixture.user, BASE + 0xb00 + 8), 40);
@@ -1639,7 +1628,7 @@ fn terminal_generic_and_atomic_cleanup_leave_the_service_quiescent() {
             &mut cleanup,
         );
     }
-    assert_empty_cleanup(cleanup);
+    assert!(cleanup.is_empty());
     assert_eq!(generic.user.owned_outputs, 0);
     assert_eq!(
         generic.services.operation_owner(generic.thread),
@@ -1694,7 +1683,7 @@ fn terminal_generic_and_atomic_cleanup_leave_the_service_quiescent() {
             &mut cleanup,
         );
     }
-    assert_empty_cleanup(cleanup);
+    assert!(cleanup.is_empty());
     assert_eq!(atomic.user.atomic_pins, 0);
     assert_eq!(
         atomic.services.operation_owner(atomic.thread),
@@ -1813,7 +1802,7 @@ fn terminal_cleanup_drains_two_atomic_waits_with_a_finite_deadline() {
             );
         }
     }
-    assert_empty_cleanup(cleanup);
+    assert!(cleanup.is_empty());
     assert_eq!(user.atomic_pins, 0);
     assert_eq!(deadlines.queue.earliest(), None);
     assert!(services.is_quiescent());

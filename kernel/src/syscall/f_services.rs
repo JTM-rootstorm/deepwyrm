@@ -5,8 +5,6 @@
 //! Process/Thread, address-space access, stationary IRQ-visible authorities,
 //! and typed finalizer routing.
 
-use core::mem;
-
 use deepwyrm_abi::{
     DW_DEADLINE_INFINITE, DW_DEADLINE_NOW, DW_STATUS_BAD_ADDRESS, DW_STATUS_BAD_STATE,
     DW_STATUS_NO_RESOURCES, DW_STATUS_SUCCESS, DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK,
@@ -88,9 +86,8 @@ pub(crate) enum FServiceRoute {
 /// The caller obtains both together so it cannot consume only the syscall route
 /// while silently abandoning deferred finalization.
 #[must_use = "F service dispatch cleanup must be routed through PayloadFinalizer"]
-pub(crate) struct FServiceDispatch<const OBJECTS: usize> {
+pub(crate) struct FServiceDispatch {
     route: FServiceRoute,
-    cleanup: CleanupQueue<OBJECTS>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,22 +140,21 @@ impl PreparedFServiceDispatch {
     pub(crate) fn abort(self) {}
 }
 
-impl<const OBJECTS: usize> FServiceDispatch<OBJECTS> {
-    pub(crate) fn into_parts(self) -> (FServiceRoute, CleanupQueue<OBJECTS>) {
-        (self.route, self.cleanup)
+impl FServiceDispatch {
+    pub(crate) fn into_route(self) -> FServiceRoute {
+        self.route
     }
 }
 
 /// One resumed syscall result and every typed final release it produced.
 #[must_use = "resumed F service cleanup must be routed through PayloadFinalizer"]
-pub(crate) struct FServiceResume<const OBJECTS: usize> {
+pub(crate) struct FServiceResume {
     status: DwStatus,
-    cleanup: CleanupQueue<OBJECTS>,
 }
 
-impl<const OBJECTS: usize> FServiceResume<OBJECTS> {
-    pub(crate) fn into_parts(self) -> (DwStatus, CleanupQueue<OBJECTS>) {
-        (self.status, self.cleanup)
+impl FServiceResume {
+    pub(crate) const fn status(self) -> DwStatus {
+        self.status
     }
 }
 
@@ -252,7 +248,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         timer_deadlines: &mut dyn TimerDeadlineAuthority,
         channel_staging: &mut [u8],
         mut read_clock: CLOCK,
-    ) -> FServiceDispatch<OBJECTS>
+    ) -> FServiceDispatch
     where
         U: FAtomicUserAccess<AtomicPin = AtomicPin, OwnedOutput = OUTPUT>,
         CLOCK: FnMut() -> Result<u64, DwStatus>,
@@ -505,10 +501,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
             }
             request => FServiceRoute::Fallthrough(request),
         };
-        FServiceDispatch {
-            route,
-            cleanup: self.take_cleanup(),
-        }
+        FServiceDispatch { route }
     }
 
     #[allow(
@@ -821,7 +814,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         execution: &ExecutionDomain<EXECUTION>,
         thread: ThreadKey,
         wait_deadlines: Option<&mut dyn WaitDeadlineAuthority>,
-    ) -> Result<FServiceResume<OBJECTS>, FServiceResumeError>
+    ) -> Result<FServiceResume, FServiceResumeError>
     where
         U: FAtomicUserAccess<AtomicPin = AtomicPin, OwnedOutput = OUTPUT>,
     {
@@ -863,10 +856,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
                 }
             }
         };
-        Ok(FServiceResume {
-            status,
-            cleanup: self.take_cleanup(),
-        })
+        Ok(FServiceResume { status })
     }
 
     /// Borrows the two durable operation registries as one terminal-teardown
@@ -892,9 +882,24 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         }
     }
 
-    #[must_use = "deferred releases must be routed through PayloadFinalizer"]
-    pub(crate) fn take_cleanup(&mut self) -> CleanupQueue<OBJECTS> {
-        mem::replace(&mut self.cleanup, CleanupQueue::new())
+    /// Whether this carrier has any finalizer still awaiting routing.
+    ///
+    /// The queue is no longer handed out by value, so observing it needs an
+    /// accessor rather than a move.
+    pub(crate) const fn cleanup_is_empty(&self) -> bool {
+        self.cleanup.is_empty()
+    }
+
+    /// Moves this carrier's queued finalizers into `other`.
+    ///
+    /// Reset card R5D replaced a `take_cleanup` that returned the queue by
+    /// value: at the E8 registry geometry that was a 5,128-byte copy out and
+    /// another into whichever queue absorbed it, at ten call sites.
+    pub(crate) fn drain_cleanup_into<const OTHER: usize>(
+        &mut self,
+        other: &mut CleanupQueue<OTHER>,
+    ) {
+        self.cleanup.drain_into(other);
     }
 }
 

@@ -542,8 +542,8 @@ fn concrete_authority_adapter_commits_real_init_transfer_and_exact_start_state()
         );
     }
     let retired = execution.retire_exit_pins(effects);
-    let (process_pin, thread_pins) = retired.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut retired = retired;
+    while let Some(pin) = retired.pop() {
         if let Some(release) = registry.release_internal(pin).unwrap() {
             finalize_known(
                 &mut platform,

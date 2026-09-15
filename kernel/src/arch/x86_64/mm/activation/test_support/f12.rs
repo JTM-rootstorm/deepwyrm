@@ -761,10 +761,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         usize::from(self.current_thread() != self.threads[0])
     }
 
-    fn merge_cleanup(&mut self, cleanup: CleanupQueue<REGISTRY_OBJECTS>) {
-        for release in cleanup.into_releases().into_iter().flatten() {
-            self.cleanup.push(release);
-        }
+    fn absorb_service_cleanup(&mut self) {
+        self.services.drain_cleanup_into(&mut self.cleanup);
     }
 
     fn read_user_bytes<const BYTES: usize>(&mut self, address: u64) -> [u8; BYTES] {
@@ -1283,8 +1281,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                             fail(0xc2);
                         }
                     }
-                    let cleanup = self.services.take_cleanup();
-                    self.merge_cleanup(cleanup);
+                    self.absorb_service_cleanup();
                     NativeSyscallResult { status, control }
                 }
                 _ => NativeSyscallResult::returning(DW_STATUS_NOT_SUPPORTED),
@@ -1408,22 +1405,24 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn drain_finalizers(&mut self) {
-        let cleanup = core::mem::replace(&mut self.cleanup, CleanupQueue::new());
-        let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
-        let mut finalizer = crate::object::PayloadFinalizer::new(
-            &mut self.registry,
-            &mut *self.active.target.roles,
-            &mut self.memory,
-            &self.events,
-            &self.timers,
-            &mut timer_deadlines,
-            &self.channels,
-            &self.waits,
-            &mut self.tasks,
-            &mut self.spaces,
-            &mut self.regions,
-        );
-        for release in cleanup.into_releases().into_iter().flatten() {
+        // The finalizer borrows the same authorities the queue lives beside, so
+        // it is built per release rather than held across a snapshot of the
+        // queue. That is what lets the queue stay where it is.
+        while let Some(release) = self.cleanup.pop() {
+            let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
+            let mut finalizer = crate::object::PayloadFinalizer::new(
+                &mut self.registry,
+                &mut *self.active.target.roles,
+                &mut self.memory,
+                &self.events,
+                &self.timers,
+                &mut timer_deadlines,
+                &self.channels,
+                &self.waits,
+                &mut self.tasks,
+                &mut self.spaces,
+                &mut self.regions,
+            );
             let batch = finalizer.finalize_chain(release);
             let (wakes, pins) = batch.into_parts();
             if wakes.into_iter().flatten().next().is_some()
@@ -1550,14 +1549,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         {
             fail(0xf2);
         }
-        let trailing = core::mem::replace(&mut self.cleanup, CleanupQueue::new());
-        if trailing
-            .into_releases()
-            .into_iter()
-            .flatten()
-            .next()
-            .is_some()
-        {
+        if !self.cleanup.is_empty() {
             fail(0xf3);
         }
         self.prove_registry_capacity();

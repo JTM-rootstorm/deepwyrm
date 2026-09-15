@@ -393,10 +393,17 @@ pub(crate) enum ExecutionSwitchError {
     InitialContext(crate::arch::x86_64::context::InitialKernelContinuationError),
 }
 
+/// Terminal execution pins E3 has finished with, drained in place.
+///
+/// Reset card R5D replaced `into_parts`, which handed the arrays out by value so
+/// a caller could iterate them. Popping keeps the record where it is and lets it
+/// assert on drop, which the array handoff could not: a pin abandoned here is a
+/// leaked object reference, and now it is a panic rather than a silent loss.
 #[must_use = "retired task pins must be released through ObjectRegistry after E3 resources are reclaimed"]
 pub(crate) struct RetiredExitPins<const THREADS: usize> {
     process: Option<crate::object::InternalRef>,
     threads: [Option<crate::object::InternalRef>; THREADS],
+    next: usize,
 }
 
 /// Linear ownership of the execution resources belonging to the Thread whose
@@ -441,13 +448,28 @@ impl Drop for DeferredCurrentExecutionResources {
 }
 
 impl<const THREADS: usize> RetiredExitPins<THREADS> {
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        Option<crate::object::InternalRef>,
-        [Option<crate::object::InternalRef>; THREADS],
-    ) {
-        (self.process, self.threads)
+    /// Takes the next pin to release: every Thread's, then the Process's own.
+    ///
+    /// The order is the one the by-value iteration used, so a caller that
+    /// releases in pop order releases in the order it always did.
+    pub(crate) fn pop(&mut self) -> Option<crate::object::InternalRef> {
+        while self.next < THREADS {
+            let index = self.next;
+            self.next += 1;
+            if let Some(pin) = self.threads[index].take() {
+                return Some(pin);
+            }
+        }
+        self.process.take()
+    }
+}
+
+impl<const THREADS: usize> Drop for RetiredExitPins<THREADS> {
+    fn drop(&mut self) {
+        assert!(
+            self.process.is_none() && self.threads.iter().all(Option::is_none),
+            "retired terminal execution pins dropped without release"
+        );
     }
 }
 
@@ -1820,6 +1842,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
             RetiredExitPins {
                 process,
                 threads: retired_threads,
+                next: 0,
             },
             deferred,
         )
@@ -1877,6 +1900,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         RetiredExitPins {
             process: deferred.process_pin.take(),
             threads: [Some(thread)],
+            next: 0,
         }
     }
 

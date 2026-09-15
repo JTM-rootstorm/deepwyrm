@@ -395,7 +395,7 @@ fn i1_post_ack_carrier_never_reuses_a_retired_frame_for_late_holdsafe() {
         .split_once("fn prove_registry_capacity")
         .expect("finalizer drain extent")
         .0;
-    assert!(finalizers.contains("while !self.cleanup.is_empty()"));
+    assert!(finalizers.contains("while let Some(release) = self.cleanup.pop()"));
     assert!(finalizers.contains("crate::syscall::complete_wait_wakes("));
 }
 

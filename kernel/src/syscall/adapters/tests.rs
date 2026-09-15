@@ -11,6 +11,20 @@ use crate::object::ObjectRegistry;
 use crate::task::{BlockedOperation, BlockedOperationWinner, TaskAuthority};
 use deepwyrm_abi::{DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_MODIFY};
 
+/// Mints one real `FinalRelease` by creating an object and dropping its only
+/// reference. R5D's queue tests route genuine obligations rather than stand-ins.
+fn final_release_for_test<const OBJECTS: usize>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    object_type: deepwyrm_abi::DwObjectType,
+) -> crate::object::FinalRelease {
+    let creation = registry.create(object_type).unwrap();
+    let reference = registry.creation_into_handle(creation).unwrap();
+    registry
+        .release_handle(reference)
+        .unwrap()
+        .expect("the only reference to a new object finalizes")
+}
+
 const BASE: u64 = 0x4000;
 const BYTES: usize = 4096;
 
@@ -712,7 +726,7 @@ fn event_create_preflights_output_before_object_and_handle_publication() {
         ),
         DW_STATUS_SUCCESS
     );
-    for release in cleanup.into_releases().into_iter().flatten() {
+    while let Some(release) = cleanup.pop() {
         assert_eq!(release.object_type(), DW_OBJECT_TYPE_EVENT);
         let finalization = events.take_finalization(release).unwrap();
         crate::wait::complete_event_finalization(&mut registry, finalization);
@@ -808,9 +822,12 @@ fn complete_channel_cleanup_for_test<
     registry: &mut ObjectRegistry<16>,
     channels: &ChannelAuthority<PAIRS, DEPTH>,
     waits: &WaitRegistry<WAITERS>,
-    cleanup: CleanupQueue<16>,
+    mut cleanup: CleanupQueue<16>,
 ) {
-    let mut pending: std::vec::Vec<_> = cleanup.into_releases().into_iter().flatten().collect();
+    let mut pending = std::vec::Vec::new();
+    while let Some(release) = cleanup.pop() {
+        pending.push(release);
+    }
     while let Some(release) = pending.pop() {
         assert_eq!(release.object_type(), deepwyrm_abi::DW_OBJECT_TYPE_CHANNEL);
         let finalization = channels.take_finalization(release, waits).unwrap();
@@ -912,14 +929,7 @@ fn channel_create_preflights_both_outputs_before_pair_publication() {
         ),
         DW_STATUS_SUCCESS
     );
-    assert!(
-        cleanup
-            .into_releases()
-            .into_iter()
-            .flatten()
-            .next()
-            .is_none()
-    );
+    assert!(cleanup.is_empty());
 }
 
 #[test]
@@ -1403,14 +1413,7 @@ fn retired_channel_generations_cannot_mutate_reused_endpoint_state() {
             assert_eq!(channels.current_signals(keys[1]).unwrap(), empty_signals[1]);
             assert_eq!(tasks.process_handle_count(process).unwrap(), handle_count);
             assert_eq!(registry.test_slot_generations(), object_generations);
-            assert!(
-                stale_cleanup
-                    .into_releases()
-                    .into_iter()
-                    .flatten()
-                    .next()
-                    .is_none()
-            );
+            assert!(stale_cleanup.is_empty());
         }
 
         if generation_index < retired_payloads.len() {
@@ -1442,14 +1445,7 @@ fn retired_channel_generations_cannot_mutate_reused_endpoint_state() {
                 channels.current_signals(keys[1]).unwrap().0 & DW_SIGNAL_READABLE.0,
                 0
             );
-            assert!(
-                cleanup
-                    .into_releases()
-                    .into_iter()
-                    .flatten()
-                    .next()
-                    .is_none()
-            );
+            assert!(cleanup.is_empty());
             retired.push((handles, keys, identities));
         }
         close_channel_for_test(
@@ -1489,14 +1485,7 @@ fn retired_channel_generations_cannot_mutate_reused_endpoint_state() {
         ),
         DW_STATUS_SUCCESS
     );
-    assert!(
-        cleanup
-            .into_releases()
-            .into_iter()
-            .flatten()
-            .next()
-            .is_none()
-    );
+    assert!(cleanup.is_empty());
 }
 
 #[test]
@@ -1940,7 +1929,7 @@ fn event_signal_rejects_invalid_masks_and_missing_signal_right_before_mutation()
         ),
         DW_STATUS_SUCCESS
     );
-    for release in cleanup.into_releases().into_iter().flatten() {
+    while let Some(release) = cleanup.pop() {
         assert_eq!(release.object_type(), DW_OBJECT_TYPE_EVENT);
         let finalization = events.take_finalization(release).unwrap();
         crate::wait::complete_event_finalization(&mut registry, finalization);
@@ -2096,7 +2085,7 @@ fn memory_object_create_preflights_output_before_backing_allocation() {
         ),
         DW_STATUS_SUCCESS
     );
-    for release in cleanup.into_releases().into_iter().flatten() {
+    while let Some(release) = cleanup.pop() {
         let finalization = memory.take_finalization(release).unwrap();
         crate::memory::object::complete_memory_finalization(
             &mut registry,
@@ -2398,7 +2387,7 @@ fn address_region_map_preflights_copyout_and_preserves_mapping_leases() {
         ),
         DW_STATUS_SUCCESS
     );
-    for release in cleanup.into_releases().into_iter().flatten() {
+    while let Some(release) = cleanup.pop() {
         let finalization = memory.take_finalization(release).unwrap();
         crate::memory::object::complete_memory_finalization(
             &mut registry,
@@ -2635,7 +2624,7 @@ fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
             DW_STATUS_SUCCESS
         );
     }
-    for release in cleanup.into_releases().into_iter().flatten() {
+    while let Some(release) = cleanup.pop() {
         if release.object_type() == deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT {
             let finalization = memory.take_finalization(release).unwrap();
             crate::memory::object::complete_memory_finalization(
@@ -2675,9 +2664,9 @@ fn finish_task_cleanup<
 >(
     registry: &mut ObjectRegistry<OBJECTS>,
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
-    cleanup: CleanupQueue<OBJECTS>,
+    mut cleanup: CleanupQueue<OBJECTS>,
 ) {
-    for release in cleanup.into_releases().into_iter().flatten() {
+    while let Some(release) = cleanup.pop() {
         let mut pending = Some(release);
         while let Some(release) = pending.take() {
             let finalization = tasks.take_finalization(release).unwrap();
@@ -3257,7 +3246,7 @@ fn non_current_process_termination_drains_a_suspended_wait_lease() {
     cleanup.push_optional(registry.release_handle(target_thread_ref).unwrap());
     cleanup.push_optional(registry.release_handle(current_process_ref).unwrap());
     cleanup.push_optional(registry.release_internal(root_owner).unwrap());
-    for release in cleanup.into_releases().into_iter().flatten() {
+    while let Some(release) = cleanup.pop() {
         if release.object_type() == deepwyrm_abi::DW_OBJECT_TYPE_EVENT {
             let finalization = events.take_finalization(release).unwrap();
             crate::wait::complete_event_finalization(&mut registry, finalization);
@@ -3445,7 +3434,7 @@ fn external_final_blocked_thread_cleanup_precedes_process_quiescence_and_reclaim
     cleanup.push_optional(registry.release_handle(caller_process_ref).unwrap());
     cleanup.push_optional(registry.release_handle(target_process_ref).unwrap());
     cleanup.push_optional(registry.release_internal(root_owner).unwrap());
-    for release in cleanup.into_releases().into_iter().flatten() {
+    while let Some(release) = cleanup.pop() {
         if release.object_type() == deepwyrm_abi::DW_OBJECT_TYPE_EVENT {
             let finalization = events.take_finalization(release).unwrap();
             crate::wait::complete_event_finalization(&mut registry, finalization);
@@ -3628,11 +3617,7 @@ fn final_external_thread_exit_preserves_process_identity_for_mapped_root_recycli
     for release in releases.into_items().into_iter().flatten() {
         cleanup.push(release);
     }
-    for release in core::mem::replace(&mut cleanup, CleanupQueue::new())
-        .into_releases()
-        .into_iter()
-        .flatten()
-    {
+    while let Some(release) = cleanup.pop() {
         assert_eq!(
             release.object_type(),
             deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT
@@ -3845,7 +3830,7 @@ fn terminate_current_process_with_blocked_sibling(exception: bool) {
     );
     cleanup.push_optional(registry.release_handle(current_ref).unwrap());
     cleanup.push_optional(registry.release_handle(sibling_ref).unwrap());
-    for release in cleanup.into_releases().into_iter().flatten() {
+    while let Some(release) = cleanup.pop() {
         if release.object_type() == deepwyrm_abi::DW_OBJECT_TYPE_EVENT {
             let finalization = events.take_finalization(release).unwrap();
             crate::wait::complete_event_finalization(&mut registry, finalization);
@@ -4035,7 +4020,7 @@ fn authorized_process_termination_drains_two_generic_waits_in_one_process() {
         cleanup.push_optional(registry.release_handle(reference).unwrap());
     }
     cleanup.push_optional(registry.release_internal(root_owner).unwrap());
-    for release in cleanup.into_releases().into_iter().flatten() {
+    while let Some(release) = cleanup.pop() {
         if release.object_type() == deepwyrm_abi::DW_OBJECT_TYPE_EVENT {
             let finalization = events.take_finalization(release).unwrap();
             crate::wait::complete_event_finalization(&mut registry, finalization);
@@ -4620,8 +4605,8 @@ fn process_termination_inspection_omits_exited_sibling_from_live_target() {
         .terminate_thread_authorized(exited_thread, 0x70)
         .unwrap();
     let retired = execution.retire_exit_pins(exited);
-    let (process_pin, thread_pins) = retired.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut retired = retired;
+    while let Some(pin) = retired.pop() {
         cleanup.push_optional(registry.release_internal(pin).unwrap());
     }
     assert_eq!(
@@ -4788,8 +4773,8 @@ fn task_group_termination_inspection_omits_exited_sibling_in_nested_live_process
         .terminate_thread_authorized(exited_thread, 0x72)
         .unwrap();
     let retired = execution.retire_exit_pins(exited);
-    let (process_pin, thread_pins) = retired.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut retired = retired;
+    while let Some(pin) = retired.pop() {
         cleanup.push_optional(registry.release_internal(pin).unwrap());
     }
     assert_eq!(
@@ -5173,7 +5158,7 @@ fn task_group_termination_drains_blocked_descendant_wait_before_terminal_batches
     cleanup.push_optional(registry.release_handle(current_process_ref).unwrap());
     cleanup.push_optional(registry.release_handle(target_process_ref).unwrap());
     cleanup.push_optional(registry.release_internal(root_owner).unwrap());
-    for release in cleanup.into_releases().into_iter().flatten() {
+    while let Some(release) = cleanup.pop() {
         if release.object_type() == deepwyrm_abi::DW_OBJECT_TYPE_EVENT {
             let finalization = events.take_finalization(release).unwrap();
             crate::wait::complete_event_finalization(&mut registry, finalization);
@@ -5499,13 +5484,13 @@ fn thread_start_validates_the_target_process_address_space() {
     assert_eq!(execution.schedule_next().unwrap().current, Some(thread));
     let pins = tasks.exit_thread(thread, 0).unwrap();
     let (retired, deferred) = execution.retire_exit_pins_defer_current(pins, thread);
-    let (process_pin, thread_pins) = retired.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut retired = retired;
+    while let Some(pin) = retired.pop() {
         cleanup.push_optional(registry.release_internal(pin).unwrap());
     }
     let deferred_pins = execution.reclaim_deferred_current(deferred);
-    let (process_pin, thread_pins) = deferred_pins.into_parts();
-    for pin in thread_pins.into_iter().flatten().chain(process_pin) {
+    let mut deferred_pins = deferred_pins;
+    while let Some(pin) = deferred_pins.pop() {
         cleanup.push_optional(registry.release_internal(pin).unwrap());
     }
     assert_eq!(
@@ -10094,9 +10079,9 @@ fn close_f10_fixture(fixture: F10Fixture) {
 fn finish_f10_task_cleanup<const OBJECTS: usize>(
     registry: &mut ObjectRegistry<OBJECTS>,
     tasks: &mut F10Tasks,
-    cleanup: CleanupQueue<OBJECTS>,
+    mut cleanup: CleanupQueue<OBJECTS>,
 ) {
-    for release in cleanup.into_releases().into_iter().flatten() {
+    while let Some(release) = cleanup.pop() {
         let mut pending = Some(release);
         while let Some(release) = pending.take() {
             let finalization = tasks.take_finalization(release).unwrap();
@@ -11196,4 +11181,116 @@ fn r5c_the_prepared_group_record_no_longer_scales_with_process_capacity() {
 
     // One Process's worth of live obligations, which is the peak the loop holds.
     assert_eq!(size_of::<crate::task::ExitPins<64>>(), 3_624);
+}
+
+/// R5D: the cleanup queue is FIFO, so a finalizer cascade is visited in the same
+/// order the snapshot-per-generation loop visited it.
+///
+/// Pushing while draining is the case that matters: finalizing one release
+/// produces its parents, and they must come after everything already queued, not
+/// before it. A stack would reverse that.
+#[test]
+fn r5d_the_cleanup_queue_drains_oldest_first_while_being_pushed_to() {
+    use deepwyrm_abi::{DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_EVENT, DW_OBJECT_TYPE_TIMER};
+    let mut registry = ObjectRegistry::<8>::new();
+    let mut queue = CleanupQueue::<8>::new();
+    let mut order = std::vec::Vec::new();
+
+    let first = final_release_for_test(&mut registry, DW_OBJECT_TYPE_EVENT);
+    let second = final_release_for_test(&mut registry, DW_OBJECT_TYPE_TIMER);
+    let first_id = first.id();
+    let second_id = second.id();
+    queue.push(first);
+    queue.push(second);
+
+    // Drain one, then push a "cascade" release mid-drain.
+    let popped = queue.pop().unwrap();
+    assert_eq!(popped.id(), first_id);
+    order.push(popped);
+    let cascaded = final_release_for_test(&mut registry, DW_OBJECT_TYPE_CHANNEL);
+    let cascaded_id = cascaded.id();
+    queue.push(cascaded);
+
+    // The release queued before the cascade still comes first.
+    let popped = queue.pop().unwrap();
+    assert_eq!(popped.id(), second_id);
+    order.push(popped);
+    let popped = queue.pop().unwrap();
+    assert_eq!(popped.id(), cascaded_id);
+    order.push(popped);
+
+    assert!(queue.pop().is_none());
+    assert!(queue.is_empty());
+    for release in order {
+        registry.complete_finalization(release).unwrap();
+    }
+}
+
+/// R5D: the queue is a ring, so a push reuses a drained slot behind the head.
+///
+/// The queue must never be empty at the moment of the wrapping push -- that is
+/// the only case that distinguishes a ring from a queue that walks off the end of
+/// its array. Here A and B fill a two-slot queue, A is drained, and C must land
+/// in A's old slot while B is still live.
+#[test]
+fn r5d_a_push_behind_the_head_reuses_a_drained_slot() {
+    use deepwyrm_abi::{DW_OBJECT_TYPE_EVENT, DW_OBJECT_TYPE_TIMER};
+    let mut registry = ObjectRegistry::<8>::new();
+    let mut queue = CleanupQueue::<2>::new();
+
+    let first = final_release_for_test(&mut registry, DW_OBJECT_TYPE_EVENT);
+    let second = final_release_for_test(&mut registry, DW_OBJECT_TYPE_TIMER);
+    let second_id = second.id();
+    queue.push(first);
+    queue.push(second);
+
+    let popped = queue.pop().unwrap();
+    registry.complete_finalization(popped).unwrap();
+    assert!(!queue.is_empty());
+
+    // One slot free, and it is the one before the head.
+    let third = final_release_for_test(&mut registry, DW_OBJECT_TYPE_EVENT);
+    let third_id = third.id();
+    queue.push(third);
+
+    let popped = queue.pop().unwrap();
+    assert_eq!(popped.id(), second_id);
+    registry.complete_finalization(popped).unwrap();
+    let popped = queue.pop().unwrap();
+    assert_eq!(popped.id(), third_id);
+    registry.complete_finalization(popped).unwrap();
+    assert!(queue.is_empty());
+}
+
+/// R5D: what the finalizer and thread-pin traversals used to cost a frame.
+///
+/// Both were read by moving a capacity-sized array out of its owner. Measured at
+/// the E8 registry geometry (`REGISTRY_OBJECTS = 160`, `THREADS = 64`):
+///
+/// | Moved by value, per drain site, before R5D | Bytes |
+/// | --- | ---: |
+/// | `CleanupQueue<160>` | 5,128 |
+/// | `RetiredExitPins<64>` | 2,080 |
+///
+/// The queue crossed a frame twice per drain -- out of its owner, then again as a
+/// bare array -- and two of those sites were on the ordinary F-service dispatch
+/// path rather than a terminal one. Both types are now drained in place, so
+/// neither figure lands on a frame at all.
+///
+/// Each grew by the 8-byte cursor that replaced the move, which is the whole
+/// trade: 8 bytes once in the owner against two capacity-sized copies per drain.
+#[test]
+fn r5d_the_finalizer_and_pin_traversals_no_longer_move_their_arrays() {
+    assert_eq!(size_of::<CleanupQueue<160>>(), 5_128 + size_of::<usize>());
+    assert_eq!(
+        size_of::<crate::task::RetiredExitPins<64>>(),
+        2_080 + size_of::<usize>()
+    );
+
+    // A queue's cost is still proportional to its capacity — it has to hold the
+    // obligations somewhere. What changed is that the holder never moves.
+    assert_eq!(
+        size_of::<CleanupQueue<320>>() - size_of::<CleanupQueue<160>>(),
+        160 * size_of::<Option<crate::object::FinalRelease>>()
+    );
 }

@@ -1073,7 +1073,7 @@ fn r5b_a_full_handle_table_drains_across_bounded_steps() {
     let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
     let (process, process_handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
     let temporary_process_pin = process_parent_pin(&mut registry, &process_handle);
-    let (thread, thread_handle) = tasks
+    let (thread, _thread_handle) = tasks
         .create_thread(&mut registry, &temporary_process_pin)
         .unwrap();
     release_nonfinal_pin(&mut registry, temporary_process_pin);
@@ -1208,7 +1208,8 @@ fn r5c_untaken_pins_keep_a_terminal_process_from_reaching_finalization() {
     let mut tasks = Tasks::new();
     let (root, root_owner, process, thread, process_handle, thread_handle) =
         one_process_group(&mut tasks, &mut registry);
-    tasks.terminate_group(root).unwrap();
+    let teardown = tasks.terminate_group(root).unwrap();
+    assert_eq!(teardown.len(), 1);
     let (_, drained) = tasks
         .drain_exited_process_handles_stepwise(&mut registry, process)
         .unwrap();

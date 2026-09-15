@@ -603,14 +603,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         {
             fail(0x96);
         }
-        let cleanup = core::mem::replace(&mut self.cleanup, CleanupQueue::new());
-        if cleanup
-            .into_releases()
-            .into_iter()
-            .flatten()
-            .next()
-            .is_some()
-        {
+        if !self.cleanup.is_empty() {
             fail(0x97);
         }
         self.finalize_task_refs();
