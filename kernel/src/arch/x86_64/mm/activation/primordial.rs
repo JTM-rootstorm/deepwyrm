@@ -1339,8 +1339,14 @@ struct RuntimeAuthorityLock<T> {
 // layout change fails this build instead of silently making every published
 // ticket pair two words of carrier data.
 const _: () = {
-    let next = core::mem::offset_of!(RuntimeAuthorityLock<PrimordialRuntimeCarrier<128, 4096>>, next_ticket);
-    let serving = core::mem::offset_of!(RuntimeAuthorityLock<PrimordialRuntimeCarrier<128, 4096>>, serving);
+    let next = core::mem::offset_of!(
+        RuntimeAuthorityLock<PrimordialRuntimeCarrier<128, 4096>>,
+        next_ticket
+    );
+    let serving = core::mem::offset_of!(
+        RuntimeAuthorityLock<PrimordialRuntimeCarrier<128, 4096>>,
+        serving
+    );
     assert!(
         serving == next + 8,
         "the runtime authority's ticket pair is no longer two adjacent words, so \
