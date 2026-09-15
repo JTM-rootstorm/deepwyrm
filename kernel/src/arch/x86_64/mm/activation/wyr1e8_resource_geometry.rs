@@ -150,6 +150,32 @@ pub(super) const fn fits(capacity: Capacity) -> bool {
 
 const _: () = assert!(fits(SELECTED));
 const _: () = assert!(TRANSITION_REGISTRY_BOUND <= REGISTRY_PEAK);
+// Reset card R7D. Selector 34's ledger carries the two reconciliations below
+// and this one did not, which left the *selected product* -- the one R7F mints
+// -- holding the pair of unchecked equalities.
+//
+// `identities` becomes `THREADS`, and every Thread needs one of the linked
+// per-thread kernel stacks. Selecting more Threads than the arena has stacks
+// does not fail a bounds check at run time: it makes thread creation
+// unsatisfiable for constants the optimizer can see, so a release build folds
+// `primordial::enter` to a panic, `--gc-sections` drops every subsystem the
+// folded continuation no longer reaches, and the artifact boots no product at
+// all. That is the failure selector 34 measured at R1C; it is silent, and it
+// does not look like a capacity bug. E8 selects 64 against an arena of 64, so
+// it holds today by coincidence of two edits agreeing rather than by check.
+//
+// Selector-gated because the arena is selector-gated: outside an E8 build the
+// linked arena is the ordinary sixteen, and this ledger's 64 is not that
+// build's demand. The host gate checks the same relation against the source
+// below, so neither lane leaves it unread.
+#[cfg(deepwyrm_wyr1e8_evidence)]
+const _: () = assert!(SELECTED.identities <= crate::memory::kernel_stack::E3_THREAD_STACK_COUNT);
+// The ledger does not get its own opinion about how many records the collector
+// can hold. A capacity change on either side must be reconciled here. Gated on
+// the feature that admits `test_support` at all; the collector cannot exist
+// without it, so there is nothing to reconcile when it is absent.
+#[cfg(all(feature = "test-support", any(test, deepwyrm_wyr1e_evidence)))]
+const _: () = assert!(SELECTED.evidence == crate::test_support::WYR1E_EVIDENCE_RECORD_CAPACITY);
 
 #[cfg(test)]
 mod tests {
@@ -158,6 +184,28 @@ mod tests {
     use crate::handle::{HandleTable, HandleTableError};
     use crate::object::ObjectRegistry;
     use deepwyrm_abi::{DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_INSPECT};
+
+    /// The target-side assertion above is selector-gated, because the linked
+    /// arena is. This is the same relation read from the source, so the host
+    /// gate fails too when either side moves.
+    #[test]
+    fn selector33_e8_identities_fit_the_arena_this_selector_links() {
+        let declared = std::format!(
+            "pub(crate) const E3_THREAD_STACK_COUNT: usize = {};",
+            SELECTED.identities
+        );
+        let source = include_str!("../../../../memory/kernel_stack.rs");
+        let selected = source
+            .lines()
+            .skip_while(|line| *line != "#[cfg(deepwyrm_wyr1e8_evidence)]")
+            .nth(1)
+            .expect("kernel_stack.rs declares an E8-gated thread-stack count");
+        assert_eq!(
+            selected.trim(),
+            declared,
+            "E8 links a thread-stack arena that no longer matches this ledger's identities"
+        );
+    }
 
     #[test]
     fn selector33_e8_selected_marker_matches_executable_capacities() {

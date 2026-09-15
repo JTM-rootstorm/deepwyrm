@@ -530,7 +530,9 @@ const HANDLES: usize = 64;
 // init's fourteen-handle resident baseline, two retained handles per hog at the
 // eight-hog ceiling, and the zero-stream loader's additive seven: exact peak
 // 37. Deliberately below E8's 64 — its widened tables are why E8's termination
-// path needed a 4 MiB per-thread stack, and this product's demand does not.
+// requirement was 3,014,752 bytes and it alone linked a 4 MiB per-thread stack
+// until R5E measured that chain down to 109,472, and this product's demand
+// does not need them.
 #[cfg(deepwyrm_r1_evidence)]
 const HANDLES: usize = super::r1_resource_geometry::SELECTED.handles;
 const SPACES: usize = USERSPACE_CHAIN_PROCESSES;

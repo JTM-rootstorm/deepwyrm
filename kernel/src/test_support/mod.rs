@@ -203,6 +203,11 @@ pub(crate) use wyr1c_evidence::WYR1C_EVIDENCE_RAW_SYSCALL;
 pub(crate) use wyr1d_evidence::WYR1D_EVIDENCE_RAW_SYSCALL;
 #[cfg(deepwyrm_wyr1e_evidence)]
 pub(crate) use wyr1e_evidence::WYR1E_EVIDENCE_RAW_SYSCALL;
+// Reset card R7D. E8's ledger owed the same reconciliation and did not have
+// it: two independent copies of 128, one in the collector and one in the
+// selected capacity record.
+#[cfg(any(test, deepwyrm_wyr1e_evidence))]
+pub(crate) use wyr1e_evidence::WYR1E_EVIDENCE_RECORD_CAPACITY;
 
 #[cfg(deepwyrm_dw1c_evidence)]
 #[allow(

@@ -241,9 +241,17 @@ const _: () = assert!(fits(SELECTED));
 // runtime. Measured 2026-09-12; see `DW1_WYR1_RESET_R1C_VM_REQUEST.md` §8.
 //
 // Raising the arena instead is not the remedy. The alternative linked geometry
-// is E8's 64 x 4 MiB, whose widened tables are why its termination path needed
-// a 4 MiB per-thread stack, and plan §12 forbids growing a multi-megabyte stack
-// in place of reducing frames.
+// is E8's, which is sixty-four carriers rather than sixteen.
+//
+// Corrected at R7D, 2026-09-15. This comment said "64 x 4 MiB" and that stopped
+// being true two days after it was written. E8 linked a 4 MiB per-thread stack
+// because its widened tables put its termination requirement at 3,014,752
+// bytes; R5E (`fb9f0ae`) re-measured that chain at 109,472 and returned E8 to
+// the frozen 512 KiB, taking the arena from 256 MiB to 32 MiB. Only the stack
+// *count* still differs for E8. The argument survives the correction -- 32 MiB
+// of linked BSS is still a cost this product has no demand for -- but the
+// figure it rested on does not, and §12's prohibition is on growing a stack in
+// place of reducing frames, which is exactly what R5 did instead.
 const _: () = assert!(SELECTED.identities <= crate::memory::kernel_stack::E3_THREAD_STACK_COUNT);
 // The ledger does not get its own opinion about how many records the collector
 // can hold. A capacity change on either side must be reconciled here. Gated on
@@ -252,9 +260,10 @@ const _: () = assert!(SELECTED.identities <= crate::memory::kernel_stack::E3_THR
 #[cfg(feature = "test-support")]
 const _: () = assert!(SELECTED.evidence == crate::test_support::R1_EVIDENCE_RECORD_CAPACITY);
 // Deliberately below E8's 64-handle tables. E8's widened per-Process pools are
-// why its termination path needed a 4 MiB per-thread stack; this product's
-// demand does not require them, and plan section 12 forbids growing a
-// multi-megabyte kernel stack in place of reducing giant frames.
+// why its termination requirement was 3,014,752 bytes and it alone linked a
+// 4 MiB per-thread stack until R5E measured that chain down to 109,472; this
+// product's demand does not require those tables, and plan section 12 forbids
+// growing a multi-megabyte kernel stack in place of reducing giant frames.
 const _: () = assert!(SELECTED.handles < 64);
 
 #[cfg(test)]
