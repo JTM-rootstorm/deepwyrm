@@ -1070,8 +1070,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                 || crate::time::monotonic_now().map_err(|_| deepwyrm_abi::DW_STATUS_BAD_STATE),
             )
         };
-        let (route, cleanup) = dispatch.into_parts();
-        self.merge_cleanup(cleanup);
+        let route = dispatch.into_route();
+        self.absorb_service_cleanup();
 
         let result = match route {
             FServiceRoute::Handled(result) => result,
@@ -1707,8 +1707,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
             )
         }
         .unwrap_or_else(|_| fail(0xfc));
-        let (status, cleanup) = resumed.into_parts();
-        self.merge_cleanup(cleanup);
+        let status = resumed.status();
+        self.absorb_service_cleanup();
         if status != DW_STATUS_SUCCESS {
             fail(0xfd);
         }
