@@ -1113,6 +1113,19 @@ fn the_production_product_selects_its_own_resource_geometry() {
     assert!(activation.contains(
         "#[cfg(deepwyrm_production_product)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = production_resource_geometry::SELECTED.identities;"
     ));
+
+    // The instrumented half of the same reconciliation. Wyrmroot's WYR1-F
+    // receipt records `kernel_resource_geometry = "wyr1e-interactive"` with a
+    // 32-handle, 160-entry, sixteen-identity table for the selector-35
+    // siblings, and it cannot read these arms. Asserted here so a change to
+    // them fails in this repository first.
+    assert!(runtime.contains(
+        "#[cfg(all(deepwyrm_wyr1e_evidence, not(deepwyrm_wyr1e8_evidence)))]\nconst USERSPACE_CHAIN_PROCESSES: usize = 16;"
+    ));
+    assert!(runtime.contains("))]\nconst HANDLES: usize = 32;"));
+    assert!(runtime.contains(
+        "#[cfg(all(deepwyrm_wyr1e_evidence, not(deepwyrm_wyr1e8_evidence)))]\nconst TASK_GROUPS: usize = 8;"
+    ));
 }
 
 #[test]

@@ -283,6 +283,21 @@ mod tests {
     }
 
     #[test]
+    fn the_selected_capacities_are_the_numbers_the_f_receipt_binds() {
+        // Wyrmroot's `tools/xtask/src/wyr1f.rs` writes these into every WYR1-F
+        // freeze receipt as `kernel_identity_capacity`,
+        // `kernel_handle_capacity`, `kernel_registry_capacity` and
+        // `kernel_thread_stack_count`. It cannot read them from here, so this
+        // is the reconciliation: a capacity change fails in this repository
+        // before it can reach a product whose receipt still claims the old
+        // figure.
+        assert_eq!(SELECTED.identities, 16);
+        assert_eq!(SELECTED.handles, 48);
+        assert_eq!(SELECTED.registry, 160);
+        assert_eq!(crate::memory::kernel_stack::E3_THREAD_STACK_COUNT, 16);
+    }
+
+    #[test]
     fn production_peaks_are_the_documented_arithmetic() {
         assert_eq!(INIT_BASELINE_HANDLES, 21);
         assert_eq!(STREAM_JOB_LOADER_HANDLES, 8);
