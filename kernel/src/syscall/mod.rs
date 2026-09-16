@@ -121,6 +121,12 @@ pub(crate) use adapters::{handle_close, handle_duplicate, object_get_info_v1};
         deepwyrm_wyr1c_evidence,
         deepwyrm_wyr1d_evidence,
         deepwyrm_wyr1e_evidence,
+        // F2A.3: the WYR1-F production product is newer than this arm. Its
+        // primordial calls `object_get_info_v1_with_device_objects`, imported
+        // unconditionally above, so re-exporting the two older adapters here
+        // left the production build with two unused imports -- the only
+        // warnings-denied failure the production target row had.
+        deepwyrm_production_product,
     ))
 ))]
 pub(crate) use adapters::{object_get_info_v1, object_get_info_v1_with_devices};

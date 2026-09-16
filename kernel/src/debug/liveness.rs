@@ -206,7 +206,16 @@ fn note_channel_refusal_on(snapshot: &LivenessSnapshot, refusal: ChannelRefusal)
     counter.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Both totals, for a host debugger and for tests.
+/// Both totals against the process-wide snapshot, for a host debugger.
+///
+/// F2A.3: nothing calls it. The host suite drives `channel_refusals_on` with
+/// its own snapshot instead, which is what makes those tests independent, so
+/// this accessor exists only for interactive inspection and is admitted as
+/// such rather than counted as coverage.
+#[allow(
+    dead_code,
+    reason = "interactive host-debugger accessor; tests use channel_refusals_on with their own snapshot"
+)]
 pub(crate) fn channel_refusals() -> (u64, u64) {
     channel_refusals_on(&LIVENESS)
 }

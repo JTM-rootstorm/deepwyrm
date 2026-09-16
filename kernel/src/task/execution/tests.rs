@@ -1405,9 +1405,10 @@ fn r5d_a_retired_pin_cannot_be_abandoned() {
         threads: [None],
         next: 0,
     };
-    // Nothing else may panic while unwinding, or the abort would hide which
-    // assertion this test is about.
-    core::mem::forget(registry);
+    // `tasks` is forgotten rather than dropped so that nothing else panics
+    // while unwinding, which would abort and hide which assertion this test is
+    // about. The registry has no `Drop`, so neither forgetting nor dropping
+    // it says anything; it simply falls out of scope.
     core::mem::forget(tasks);
     drop(pins);
 }

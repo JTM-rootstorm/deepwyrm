@@ -230,7 +230,11 @@ pub(super) const fn fits(capacity: Capacity) -> bool {
         && capacity.registry >= REGISTRY_PEAK
         && capacity.channel_pairs >= CHANNEL_PAIR_PEAK
         && capacity.waits >= WAIT_PEAK
-        && capacity.evidence >= EVIDENCE_PEAK
+        // Equality, not `>=`. Every other bound is a floor, but a production
+        // build with a nonzero evidence capacity has inherited a selector's
+        // collector rather than satisfied a demand, so the check must reject
+        // above as well as below.
+        && capacity.evidence == EVIDENCE_PEAK
 }
 
 const _: () = assert!(fits(SELECTED));

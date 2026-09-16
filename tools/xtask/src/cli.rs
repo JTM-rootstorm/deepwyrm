@@ -23,6 +23,8 @@ pub(super) fn parse(args: &[String]) -> Action {
     match command {
         "format" if args.len() == 1 => Action::Command(Invocation::Format),
         "check" if args.len() == 1 => Action::Command(Invocation::Check),
+        "clippy" if args.len() == 1 => Action::Command(Invocation::Clippy),
+        "doc" if args.len() == 1 => Action::Command(Invocation::Rustdoc),
         "abi" => parse_abi(&args[1..]),
         "run" => parse_harness_command(HarnessKind::Run, &args[1..]),
         "gdb" => parse_harness_command(HarnessKind::Gdb, &args[1..]),
@@ -188,6 +190,14 @@ pub(super) fn print_help(mut writer: impl Write, command: Option<&str>) -> io::R
         Some(command @ ("format" | "check")) => write!(
             writer,
             "Usage: cargo xtask {command}\n\nStatus: available host tooling.\n"
+        ),
+        Some("clippy") => write!(
+            writer,
+            "Usage: cargo xtask clippy\n\nWarnings-denied Clippy over the production kernel on the target lane first, then the host workspace.\n"
+        ),
+        Some("doc") => write!(
+            writer,
+            "Usage: cargo xtask doc\n\nWarnings-denied rustdoc over the workspace, dependencies excluded.\n"
         ),
         Some(command) => write!(
             writer,

@@ -269,7 +269,6 @@ impl PlatformIrqRoute {
 pub(crate) enum Q35Com2RouteError {
     InvalidMadt,
     Topology(CpuTopologyError),
-    IoApicCapacity,
     DuplicateIoApicId(u8),
     DuplicateIoApicAddress(u64),
     DuplicateIoApicGsiBase(u32),
@@ -318,6 +317,11 @@ impl Q35Com2MadtSnapshot {
 
 /// Snapshot and resolve only the q35 COM2 route.  This function is deliberately
 /// independent of target MMIO and is not invoked by the live BSP in E1.
+///
+/// F2A.3: nor by any later live path. `kernel/src/lib.rs` calls
+/// `snapshot_q35_com2_madt` directly, so the only caller of this composition is
+/// the host suite below, and a freestanding build carried it as dead code.
+#[cfg(test)]
 pub(crate) fn discover_q35_com2_route<R: AcpiByteReader>(
     reader: &mut R,
     rsdp_physical: u64,
@@ -440,11 +444,18 @@ fn validate_irq3_override(flags: u16) -> Result<(), Q35Com2RouteError> {
     }
 }
 
+// F2A.3: the decode direction of this register is a host-suite instrument.
+// The live path only ever encodes -- `encode_q35_com2` below and
+// `ioapic_live`'s volatile write -- so a freestanding build carried the whole
+// decode surface, its two constants and its error type as dead code.
+#[cfg(test)]
 const IOAPIC_REDIR_VECTOR_MASK: u64 = 0xff;
+#[cfg(test)]
 const IOAPIC_REDIR_DELIVERY_STATUS: u64 = 1 << 12;
 const IOAPIC_REDIR_MASK: u64 = 1 << 16;
 const IOAPIC_REDIR_DESTINATION_SHIFT: u32 = 56;
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IoApicDeliveryStatus {
     Idle,
@@ -454,6 +465,7 @@ pub(crate) enum IoApicDeliveryStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct IoApicRedirectionEntry(u64);
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DecodedIoApicRedirectionEntry {
     vector: u8,
@@ -462,6 +474,7 @@ pub(crate) struct DecodedIoApicRedirectionEntry {
     delivery_status: IoApicDeliveryStatus,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IoApicRedirectionError {
     UnsupportedBits(u64),
@@ -482,6 +495,7 @@ impl IoApicRedirectionEntry {
         self.0
     }
 
+    #[cfg(test)]
     pub(crate) fn decode(self) -> Result<DecodedIoApicRedirectionEntry, IoApicRedirectionError> {
         let allowed = IOAPIC_REDIR_VECTOR_MASK
             | IOAPIC_REDIR_DELIVERY_STATUS
@@ -508,6 +522,7 @@ impl IoApicRedirectionEntry {
     }
 }
 
+#[cfg(test)]
 impl DecodedIoApicRedirectionEntry {
     pub(crate) const fn vector(self) -> u8 {
         self.vector

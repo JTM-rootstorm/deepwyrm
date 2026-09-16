@@ -19,6 +19,8 @@ pub const EXIT_USAGE: u8 = 2;
 const COMMANDS: &[&str] = &[
     "format",
     "check",
+    "clippy",
+    "doc",
     "abi",
     "build",
     "image",
@@ -123,6 +125,8 @@ Usage:
 Commands:
   format                             Verify Rust formatting
   check                              Run the workspace check
+  clippy                             Warnings-denied Clippy: production kernel, then host workspace
+  doc                                Warnings-denied rustdoc over the workspace
   abi generate                       Generate ABI-owned artifacts
   abi check                          Verify generated ABI artifacts have no drift
   test host [abi|memory|handles|tasks|ipc]
@@ -165,6 +169,8 @@ enum Action {
 enum Invocation {
     Format,
     Check,
+    Clippy,
+    Rustdoc,
     AbiGenerate,
     AbiCheck,
     HostTests(Option<HostTestFilter>),
@@ -413,6 +419,31 @@ fn run_invocation(invocation: Invocation) -> io::Result<u8> {
             }
             command.args(["check", "--locked", "--workspace", "--all-targets"]);
         }
+        Invocation::Clippy => {
+            // The production kernel is gated in the shape it ships in --
+            // freestanding target, no selector, no test-support -- before the
+            // host workspace, for the same reason `check` orders its rows that
+            // way. DW1-F/WYR1-F F2A found two dead surfaces that only this row
+            // can see: the IOAPIC redirection decode instruments and a pair of
+            // pre-WYR1-C syscall adapter re-exports.
+            let production = run_production_kernel_warning_gate()?;
+            if production != 0 {
+                return Ok(production);
+            }
+            command.args([
+                "clippy",
+                "--locked",
+                "--workspace",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ]);
+        }
+        Invocation::Rustdoc => {
+            command.env("RUSTDOCFLAGS", "-D warnings");
+            command.args(["doc", "--locked", "--workspace", "--no-deps"]);
+        }
         Invocation::AbiGenerate => {
             command.args(["run", "--locked", "--package", "abi-gen", "--", "generate"]);
         }
@@ -657,6 +688,50 @@ fn run_selector_library_checks() -> io::Result<u8> {
             }
             return Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8);
         }
+    }
+    Ok(0)
+}
+
+/// Warnings-denied rustc over the production kernel: the exact
+/// `PRODUCTION_KERNEL_ROW` shape `run_selector_library_checks` checks first, on
+/// the target lane, with no selector and no `test-support`.
+///
+/// Not Clippy. The accepted Wyrmroot toolchain ships `cargo` and `rustc` only
+/// (`tooling/rust-toolchain.toml`), so there is no `clippy-driver` that can see
+/// the freestanding sysroot, and substituting the host lane's newer driver
+/// would lint a different compiler's view of the code. `-D warnings` on the
+/// accepted compiler is the strongest gate this shape can actually have, and
+/// it is the one that matters: the surfaces F2A found dead here -- the IOAPIC
+/// redirection decode instruments and two pre-WYR1-C syscall adapter
+/// re-exports -- are ordinary rustc `dead_code`/`unused_imports` findings that
+/// no other row in the tree denies.
+fn run_production_kernel_warning_gate() -> io::Result<u8> {
+    let workspace = workspace_root();
+    let status = Command::new(workspace.join("tools/pinned-cargo"))
+        .current_dir(&workspace)
+        .env_remove("CARGO_HOME")
+        .env_remove("DEEPWYRM_GUEST_TEST_SELECTOR")
+        .args([
+            "target",
+            "rustc",
+            "--locked",
+            "--package",
+            "deepwyrm-kernel",
+            "--lib",
+            "--target",
+            "x86_64-unknown-none",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .status()?;
+    if !status.success() {
+        let mut stderr = io::stderr().lock();
+        writeln!(
+            stderr,
+            "error: the production kernel does not compile warning-free"
+        )?;
+        return Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8);
     }
     Ok(0)
 }

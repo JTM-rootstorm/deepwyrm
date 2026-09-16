@@ -917,6 +917,10 @@ fn add_from_the_launching_cpu(
 
 /// Quanta served over a window, bounded across the threads that were live for
 /// it. A terminated slot serves none and would otherwise floor the minimum.
+#[allow(
+    clippy::needless_range_loop,
+    reason = "the index selects from three parallel arrays -- task state, served quanta and the caller's baseline -- so it is the subject, not an iteration artifact"
+)]
 fn served_bounds(model: &NormalPolicyModel, baseline: [u64; TASK_CAPACITY]) -> (u64, u64) {
     let mut min = u64::MAX;
     let mut max = 0;
@@ -1003,8 +1007,8 @@ fn quantum_expiry_rotates_a_saturated_queue_in_fifo_age_order() {
     let depth = model.runnable_depth(0);
     assert!(depth > 1, "CPU 0 carries a queue to rotate");
     let mut observed = [None; TASK_CAPACITY];
-    for step in 0..depth {
-        observed[step] = model.running[0].map(|token| token.task);
+    for entry in observed.iter_mut().take(depth) {
+        *entry = model.running[0].map(|token| token.task);
         model.advance_one_quantum().unwrap();
     }
     for step in 0..depth {
@@ -1235,6 +1239,10 @@ fn every_deadline_waiter_runs_at_the_first_expiry_after_its_wake() {
     }
     let baseline = model.quanta_served;
     model.advance_one_quantum().unwrap();
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "the slot number names the waiter in the assertion message and selects its task identity, not only the baseline entry"
+    )]
     for slot in 0..3 {
         assert_eq!(
             model.quanta_served(task(slot, 1)) - baseline[slot],
