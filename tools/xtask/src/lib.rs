@@ -407,6 +407,10 @@ fn run_invocation(invocation: Invocation) -> io::Result<u8> {
             command.args(["fmt", "--all", "--", "--check"]);
         }
         Invocation::Check => {
+            let selectors = run_selector_library_checks()?;
+            if selectors != 0 {
+                return Ok(selectors);
+            }
             command.args(["check", "--locked", "--workspace", "--all-targets"]);
         }
         Invocation::AbiGenerate => {
@@ -445,6 +449,185 @@ fn run_invocation(invocation: Invocation) -> io::Result<u8> {
 
     let status = command.status()?;
     Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8)
+}
+
+/// The compile-time environment a selector needs before it will build at all.
+///
+/// `kernel/build.rs` refuses a selector whose nonce, digest or page ceiling is
+/// absent, so a row here is what makes that selector compilable. The values are
+/// placeholders: this gate compiles and never links, boots or records, so any
+/// well-formed value answers the only question it asks. Real runs supply real
+/// ones. A selector absent from this table is built with no extra environment,
+/// and if it turns out to need some, this gate fails and names it -- which is
+/// the correct outcome, not a gap.
+const SELECTOR_ENVIRONMENTS: [(&str, &[(&str, &str)]); 11] = [
+    (
+        "smp-runtime-acceptance",
+        &[("DEEPWYRM_I1_EVIDENCE_NONCE", "0000000000000001")],
+    ),
+    (
+        "permanent-supervisor-rrc",
+        &[
+            ("DEEPWYRM_WYR1_EVIDENCE_NONCE", "0000000000000001"),
+            ("DEEPWYRM_WYR1_EVIDENCE_SCENARIO", "normal"),
+        ],
+    ),
+    (
+        "normal-preemption-up",
+        &[
+            ("DEEPWYRM_DW1B_EVIDENCE_NONCE", "0000000000000001"),
+            ("DEEPWYRM_DW1B_CHALLENGE_DIGEST", "0000000000000001"),
+            ("DEEPWYRM_DW1B_BOOTFS_MAX_PAGES", "31"),
+        ],
+    ),
+    (
+        "bootstrap-registry-launch",
+        &[
+            ("DEEPWYRM_WYR1B_EVIDENCE_NONCE", "0000000000000001"),
+            ("DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES", "117"),
+        ],
+    ),
+    (
+        "normal-preemption-smp",
+        &[
+            ("DEEPWYRM_DW1C_EVIDENCE_NONCE", "0000000000000001"),
+            ("DEEPWYRM_DW1C_PROGRESS_DIGEST", "0000000000000001"),
+            ("DEEPWYRM_DW1C_BOOTFS_MAX_PAGES", "53"),
+        ],
+    ),
+    (
+        "device-resource-interrupt-synthetic",
+        &[
+            ("DEEPWYRM_DW1D_EVIDENCE_NONCE", "0000000000000001"),
+            ("DEEPWYRM_DW1D_EVIDENCE_CHALLENGE", "0000000000000001"),
+        ],
+    ),
+    (
+        "device-coordinator-restart",
+        &[("DEEPWYRM_WYR1C_EVIDENCE_NONCE", "0000000000000001")],
+    ),
+    (
+        "native-console-streams",
+        &[("DEEPWYRM_WYR1D_EVIDENCE_NONCE", "0000000000000001")],
+    ),
+    (
+        "interactive-wyrmsh",
+        &[("DEEPWYRM_WYR1E7_EVIDENCE_NONCE", "0000000000000001")],
+    ),
+    (
+        "q35-com2-interrupt",
+        &[("DEEPWYRM_DW1E_EVIDENCE_NONCE", "0000000000000001")],
+    ),
+    (
+        "dynamic-launch-saturation",
+        &[
+            ("DEEPWYRM_R1_EVIDENCE_NONCE", "0000000000000001"),
+            ("DEEPWYRM_R1_BOOTFS_MAX_PAGES", "145"),
+        ],
+    ),
+];
+
+/// The E8 evidence surface: a second configuration of one selector rather than
+/// a selector of its own, so the manifest does not list it separately.
+const WYR1E8_SELECTOR: (&str, &[(&str, &str)]) = (
+    "interactive-wyrmsh",
+    &[
+        ("DEEPWYRM_WYR1E8_EVIDENCE", "1"),
+        ("DEEPWYRM_WYR1E8_EVIDENCE_NONCE", "E800000000000001"),
+    ],
+);
+
+/// Reads the implemented guest selectors from the harness manifest.
+///
+/// Derived rather than listed, so a selector added to the manifest joins this
+/// gate without anyone remembering to add it here -- the drift this gate exists
+/// to catch is exactly the drift a second hand-maintained list would
+/// reintroduce. `reserved` entries are skipped: they have no implementation to
+/// compile, and `build.rs` refuses them by name.
+fn implemented_guest_selectors(manifest: &str) -> Vec<String> {
+    let mut selectors = Vec::new();
+    let mut current = None;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("[guest_test.") {
+            current = rest.strip_suffix(']').map(str::to_owned);
+        } else if line == "state = \"implemented\"" {
+            if let Some(selector) = current.take() {
+                selectors.push(selector);
+            }
+        } else if line.starts_with('[') {
+            current = None;
+        }
+    }
+    selectors
+}
+
+/// Compiles every implemented selector's kernel library.
+///
+/// Selector-gated code is `target_os = "none"`, so `check`'s host workspace
+/// pass has never compiled any of it -- only the product paths that mint VM
+/// images do. That is how R5D's rename survived with two stale call sites in
+/// `ipc-blocking-smoke`, and it is the same shape as the two Wyrmroot selectors
+/// that broke the same week. Running here means no selector's compilability
+/// depends on anyone remembering its name.
+///
+/// This re-enters `tools/pinned-cargo` on the target lane rather than calling
+/// Cargo directly, because only that lane verifies the accepted toolchain and
+/// exports the freestanding linker a target build needs. `CARGO_HOME` is
+/// cleared because the lane owns it and refuses to be handed one.
+fn run_selector_library_checks() -> io::Result<u8> {
+    let workspace = workspace_root();
+    let lane = workspace.join("tools/pinned-cargo");
+    let manifest = fs::read_to_string(workspace.join("tooling/guest-harness.toml"))?;
+    let selectors = implemented_guest_selectors(&manifest);
+    if selectors.is_empty() {
+        let mut stderr = io::stderr().lock();
+        writeln!(
+            stderr,
+            "error: the guest harness manifest lists no implemented selectors"
+        )?;
+        return Ok(EXIT_NOT_IMPLEMENTED);
+    }
+    let rows = selectors
+        .iter()
+        .map(|selector| {
+            let environment = SELECTOR_ENVIRONMENTS
+                .iter()
+                .find(|(name, _)| name == selector)
+                .map_or(&[][..], |(_, environment)| environment);
+            (selector.as_str(), environment)
+        })
+        .chain(core::iter::once(WYR1E8_SELECTOR));
+    for (selector, environment) in rows {
+        let mut command = Command::new(&lane);
+        command
+            .current_dir(&workspace)
+            .env_remove("CARGO_HOME")
+            .env("DEEPWYRM_GUEST_TEST_SELECTOR", selector);
+        for (name, value) in environment {
+            command.env(name, value);
+        }
+        let status = command
+            .args([
+                "target",
+                "check",
+                "--locked",
+                "--package",
+                "deepwyrm-kernel",
+                "--lib",
+                "--target",
+                "x86_64-unknown-none",
+                "--features",
+                "test-support",
+            ])
+            .status()?;
+        if !status.success() {
+            let mut stderr = io::stderr().lock();
+            writeln!(stderr, "error: selector {selector} does not compile")?;
+            return Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8);
+        }
+    }
+    Ok(0)
 }
 
 fn run_handle_host_tests() -> io::Result<u8> {

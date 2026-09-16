@@ -901,3 +901,48 @@ fn terminal(status: &str, test_id: u32, detail: u32) -> Vec<u8> {
     record.extend_from_slice(format!("{:08X}\n", fnv1a32(&record)).as_bytes());
     record
 }
+
+#[test]
+fn the_selector_gate_reads_implemented_selectors_and_skips_reserved_ones() {
+    // A parser that silently returns nothing would turn the selector gate into
+    // a no-op that still reports success, which is the failure mode the gate
+    // exists to prevent. Pin both halves against the real manifest.
+    let manifest = fs::read_to_string(workspace_root().join("tooling/guest-harness.toml")).unwrap();
+    let selectors = implemented_guest_selectors(&manifest);
+    assert!(
+        selectors.len() > 20,
+        "the manifest lists {} implemented selectors, which is too few to be a real parse",
+        selectors.len()
+    );
+    for implemented in ["ipc-blocking-smoke", "interactive-wyrmsh", "memory-mapping"] {
+        assert!(
+            selectors.iter().any(|selector| selector == implemented),
+            "{implemented} is implemented and must be gated"
+        );
+    }
+    for reserved in ["task-syscall-sanitize", "task-user-exception"] {
+        assert!(
+            !selectors.iter().any(|selector| selector == reserved),
+            "{reserved} is reserved and has no implementation to compile"
+        );
+    }
+}
+
+#[test]
+fn every_selector_environment_names_a_selector_that_exists() {
+    // A row whose selector was renamed would stop applying and leave that
+    // selector failing for a missing nonce, which reads as a broken selector
+    // rather than a stale table.
+    let manifest = fs::read_to_string(workspace_root().join("tooling/guest-harness.toml")).unwrap();
+    let selectors = implemented_guest_selectors(&manifest);
+    for (selector, _) in SELECTOR_ENVIRONMENTS {
+        assert!(
+            selectors.iter().any(|known| known == selector),
+            "{selector} has an environment row but is not an implemented selector"
+        );
+    }
+    assert!(
+        selectors.iter().any(|known| known == WYR1E8_SELECTOR.0),
+        "the E8 configuration names a selector that no longer exists"
+    );
+}
