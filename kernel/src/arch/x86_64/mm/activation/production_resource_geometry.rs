@@ -148,27 +148,24 @@ pub(super) const REGISTRY_PEAK: usize = LIVE_PROCESSES * 3 // Process, Thread, r
     + INTERRUPTS
     + TIMER_PEAK;
 
-// Each WAIT_ANY owns a Channel and a Process registration. init supervises its
-// six resident children, holds one in-flight synchronous READY wait, and holds
-// an exit wait for the live job and for the replacement generation. The roles
-// hold their own: consoled's stream set, the shell's job set, devmgr's control
-// set, the driver's three-item control/device array, registryd's service wait.
-const INIT_RESIDENT_SUPERVISION_WAITS: usize = RESIDENT_IMAGES * 2;
-const INIT_SYNCHRONOUS_READY_WAIT: usize = 2;
-const INIT_CHILD_EXIT_WAITS: usize = (LIVE_SHELL_JOBS + REPLACEMENT_GENERATIONS) * 2;
-const CONSOLED_STREAM_WAITS: usize = 3;
-const SHELL_JOB_WAITS: usize = 3;
-const DEVMGR_CONTROL_WAITS: usize = 3;
-const DRIVER_CONTROL_WAITS: usize = 3;
-const REGISTRYD_SERVICE_WAITS: usize = 2;
-pub(super) const WAIT_PEAK: usize = INIT_RESIDENT_SUPERVISION_WAITS
-    + INIT_SYNCHRONOUS_READY_WAIT
-    + INIT_CHILD_EXIT_WAITS
-    + CONSOLED_STREAM_WAITS
-    + SHELL_JOB_WAITS
-    + DEVMGR_CONTROL_WAITS
-    + DRIVER_CONTROL_WAITS
-    + REGISTRYD_SERVICE_WAITS;
+// Not re-derived. `wyr1e_wait_geometry` already models this exact six-role
+// interactive graph, and its non-E8 arm is 12 + 3 + 4 + 6 + 7 + 7 = 39: the
+// controller's resident supervision set, the registry, device, console, shell
+// and job sets. An independent enumeration here first reached 32, which is not
+// a smaller graph -- it is the same graph with rows missed. Two decompositions
+// of one topology disagreeing means the lower one is wrong, so this takes the
+// established model rather than competing with it.
+//
+// Reconcile here if that ledger's arm moves. The two cannot be linked by a
+// `const` because `wyr1e_wait_geometry` compiles only under the selector that
+// needs it, which is the same reason selector 34's ledger restates E8's
+// figures instead of importing them.
+pub(super) const INTERACTIVE_GRAPH_WAITS: usize = 12 + 3 + 4 + 6 + 7 + 7;
+/// What this product adds to that graph: an exit wait apiece for the live job
+/// and the replacement generation, each owning a Channel and a Process
+/// registration.
+const ADDED_EXIT_WAITS: usize = (LIVE_SHELL_JOBS + REPLACEMENT_GENERATIONS) * 2;
+pub(super) const WAIT_PEAK: usize = INTERACTIVE_GRAPH_WAITS + ADDED_EXIT_WAITS;
 
 // Wyrmroot owns the archive parser, whose selected record limit is 4096.
 // Reconciled against the built archive, 2026-09-16 (`f1b/normal-01`,
@@ -311,7 +308,8 @@ mod tests {
         assert_eq!(CHANNEL_PAIR_PEAK, 24);
         assert_eq!(CHANNEL_ENDPOINT_PEAK, 48);
         assert_eq!(REGISTRY_PEAK, 113);
-        assert_eq!(WAIT_PEAK, 32);
+        assert_eq!(INTERACTIVE_GRAPH_WAITS, 39);
+        assert_eq!(WAIT_PEAK, 43);
         assert_eq!(BOOTFS_ENTRY_PEAK, 12);
     }
 
