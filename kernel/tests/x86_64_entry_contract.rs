@@ -542,7 +542,13 @@ fn selector32_wrd1_console_relay_is_private_bounded_joined_and_atomic() {
 
     assert!(build.contains("selector == \"native-console-streams\""));
     assert!(build.contains("deepwyrm_wyr1d_evidence"));
-    assert!(build.contains("\"q35-com2-interrupt\" | \"native-console-streams\""));
+    // Read out of the selector predicate rather than matched as one literal
+    // line: the list gained a fourth selector in F1A.4 and is now wrapped, and
+    // what this test protects is membership, not formatting.
+    assert!(
+        build_fn_body(&build, "fn is_dw1e_platform_selector(selector: &str) -> bool {")
+            .contains("\"native-console-streams\"")
+    );
     assert!(support.contains("mod wyr1d_evidence;"));
     assert!(evidence.contains("WYR1D_EVIDENCE_RAW_SYSCALL: u32 = 0xffff_ff20"));
     assert!(evidence.contains("WYR1D_EVIDENCE_RECORD_LEN: usize = 192"));
@@ -589,7 +595,10 @@ fn selector33_wre1_shell_relay_is_private_bounded_and_atomic() {
     let public_abi = fs::read_to_string(root.join("../abi/generated/deepwyrm_abi.rs"))
         .expect("read generated ABI");
 
-    assert!(build.contains("selector == \"interactive-wyrmsh\""));
+    assert!(
+        build_fn_body(&build, "fn is_wyr1e_evidence_selector(selector: &str) -> bool {")
+            .contains("\"interactive-wyrmsh\"")
+    );
     assert!(build.contains("deepwyrm_wyr1e_evidence"));
     assert!(build.contains("DEEPWYRM_WYR1E7_EVIDENCE_NONCE"));
     assert!(support.contains("mod wyr1e_evidence;"));
@@ -1836,4 +1845,32 @@ impl Drop for TemporaryDirectory {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+/// Returns the body of one `build.rs` function by brace matching.
+///
+/// These selector assertions used to match a single literal line, which made
+/// them break whenever a list grew and rustfmt rewrapped it — a formatting
+/// failure dressed up as a contract failure. Scoping the search to the
+/// function keeps the assertion about membership in *that* predicate while
+/// letting the text move.
+fn build_fn_body<'a>(source: &'a str, signature: &str) -> &'a str {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("build.rs no longer defines `{signature}`"))
+        + signature.len();
+    let mut depth = 1usize;
+    for (offset, byte) in source[start..].bytes().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[start..start + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("build.rs function `{signature}` is unterminated");
 }

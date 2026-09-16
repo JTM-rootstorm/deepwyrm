@@ -208,3 +208,19 @@ state = "implemented"
 [guest_test.dynamic-launch-saturation]
 id = 34
 state = "implemented"
+
+# The DW1-F/WYR1-F final closure selector, frozen by
+# DW1_WYR1_FINAL_CLOSURE_CONTRACT.md section 4. Id 34 was proposed by the master
+# plan and is already taken by dynamic-launch-saturation, so 35 is the
+# allocation. It carries the same bounded WRE1 transport and reporter custody as
+# interactive-wyrmsh; the normal/degraded scenario meaning stays in Wyrmroot's
+# retained gate configuration and the host decoder, not in the kernel.
+#
+# Reserved rather than implemented: the id and the kernel-side admission are
+# fixed by F1A.4, but the instrumented Wyrmroot product that selects it is
+# F1B's. The normal final product built by F1A.5 uses the uninstrumented
+# no-selector kernel and does not select this or any other guest test. F1B
+# flips this to "implemented" when that product exists.
+[guest_test.dw1-wyr1-interactive-closure]
+id = 35
+state = "reserved"

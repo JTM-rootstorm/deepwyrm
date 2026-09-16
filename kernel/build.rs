@@ -464,8 +464,22 @@ fn is_wyr1d_evidence_selector(selector: &str) -> bool {
     selector == "native-console-streams"
 }
 
+/// The final DW1-F/WYR1-F closure selector, test id 35.
+///
+/// Frozen by `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §4. Id 34 was proposed by the
+/// master plan and is taken by `dynamic-launch-saturation`; 35 is the next free
+/// allocation.
+const WYR1F_CLOSURE_SELECTOR: &str = "dw1-wyr1-interactive-closure";
+
+/// Selectors whose shell evidence is WRE1.
+///
+/// The final closure selector joins `interactive-wyrmsh` here rather than
+/// getting a transport of its own. Its shell evidence *is* WRE1 v1.1, and the
+/// kernel's obligation for both is the same bounded transport and reporter
+/// custody check; the closure-specific meaning lives in Wyrmroot and the host
+/// decoder, exactly as it does for the selector this one follows.
 fn is_wyr1e_evidence_selector(selector: &str) -> bool {
-    selector == "interactive-wyrmsh"
+    matches!(selector, "interactive-wyrmsh" | WYR1F_CLOSURE_SELECTOR)
 }
 
 /// Reset card R1's dynamic-launch saturation probe. Deliberately a selector of
@@ -487,7 +501,10 @@ fn is_synthetic_interrupt_platform_selector(selector: &str) -> bool {
 fn is_dw1e_platform_selector(selector: &str) -> bool {
     matches!(
         selector,
-        "q35-com2-interrupt" | "native-console-streams" | "interactive-wyrmsh"
+        "q35-com2-interrupt"
+            | "native-console-streams"
+            | "interactive-wyrmsh"
+            | WYR1F_CLOSURE_SELECTOR
     )
 }
 
@@ -1043,8 +1060,14 @@ fn configure_guest_test(harness_path: &Path) -> Result<(), String> {
     };
     let direct_id_present = env::var_os("DEEPWYRM_GUEST_TEST_ID").is_some();
     let wyr1e8 = optional_wyr1e8_evidence()?;
-    if wyr1e8 && selector.as_deref() != Some("interactive-wyrmsh") {
-        return Err("DEEPWYRM_WYR1E8_EVIDENCE=1 requires selector interactive-wyrmsh".into());
+    // The E8 evidence flag belongs to the two selectors that carry the WRE1
+    // interactive-shell geometry, and to nothing else. The final closure
+    // selector is admitted because its degraded scenario drives the same
+    // console recovery path E8 added.
+    if wyr1e8 && !selector.as_deref().is_some_and(is_wyr1e_evidence_selector) {
+        return Err(format!(
+            "DEEPWYRM_WYR1E8_EVIDENCE=1 requires selector interactive-wyrmsh or {WYR1F_CLOSURE_SELECTOR}"
+        ));
     }
     if env::var_os("DEEPWYRM_WYR1E8_EVIDENCE_NONCE").is_some() && !wyr1e8 {
         return Err("DEEPWYRM_WYR1E8_EVIDENCE_NONCE requires DEEPWYRM_WYR1E8_EVIDENCE=1".into());
@@ -1180,7 +1203,8 @@ fn required_wyr1d_hex(name: &str) -> Result<String, String> {
 }
 
 fn required_wyr1e_hex(name: &str) -> Result<String, String> {
-    let value = env::var(name).map_err(|_| format!("interactive-wyrmsh requires {name}"))?;
+    let value = env::var(name)
+        .map_err(|_| format!("the WRE1 interactive-shell selectors require {name}"))?;
     validate_upper_nonzero_hex_nonce(&value, name)?;
     Ok(value)
 }
@@ -2653,6 +2677,37 @@ mod tests {
         ] {
             assert!(validate_upper_nonzero_hex_nonce(invalid, "WYR1D").is_err());
         }
+    }
+
+    /// DW1-F/WYR1-F F1A.4: the final closure selector's identity and admission.
+    #[test]
+    fn wyr1f_closure_selector_is_reserved_at_35_and_reuses_the_wre1_transport() {
+        let manifest = include_str!("../tooling/guest-harness.toml");
+        assert_eq!(WYR1F_CLOSURE_SELECTOR, "dw1-wyr1-interactive-closure");
+        assert!(manifest.contains("[guest_test.dw1-wyr1-interactive-closure]\nid = 35\nstate = \"reserved\""));
+        // Id 34 stayed where it was; the plan's proposed 34 was not taken over.
+        assert_eq!(
+            select_guest_test(true, Some("dynamic-launch-saturation"), false, manifest),
+            Ok(Some(34))
+        );
+        // Reserved, so it is not selectable yet. F1B's instrumented product
+        // flips it to implemented; until then selecting it must fail loudly
+        // rather than silently build something.
+        assert!(select_guest_test(true, Some(WYR1F_CLOSURE_SELECTOR), false, manifest).is_err());
+        // The kernel-side admission is nonetheless fixed now: same WRE1
+        // transport and same DW1-E platform as the selector it follows, and no
+        // older collector inherited.
+        assert!(is_wyr1e_evidence_selector(WYR1F_CLOSURE_SELECTOR));
+        assert!(is_dw1e_platform_selector(WYR1F_CLOSURE_SELECTOR));
+        assert!(!is_dw1e_evidence_selector(WYR1F_CLOSURE_SELECTOR));
+        assert!(!is_wyr1d_evidence_selector(WYR1F_CLOSURE_SELECTOR));
+        assert!(!is_r1_evidence_selector(WYR1F_CLOSURE_SELECTOR));
+        assert!(!is_wyr1_evidence_selector(WYR1F_CLOSURE_SELECTOR));
+        // It supplies no synthetic interrupt platform, so F1A.2's production
+        // q35 bring-up applies to it unchanged.
+        assert!(!is_synthetic_interrupt_platform_selector(
+            WYR1F_CLOSURE_SELECTOR
+        ));
     }
 
     #[test]
