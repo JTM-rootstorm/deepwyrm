@@ -366,7 +366,20 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
         let cpu_topology = {
             // The one-shot BSP owns this workspace serially. CPU discovery
             // snapshots every table again and does not retain workspace data.
-            let workspace = unsafe { &mut *(*BOOTSTRAP_ACPI_WORKSPACE.slot()).as_mut_ptr() };
+            //
+            // F2A.4 finding L4: that argument is about staleness, not about
+            // initialization. This borrow used to be valid only because the
+            // PM-timer block above had already zeroed the slot, and nothing
+            // enforced that ordering -- making that block conditional or
+            // moving it would have handed out a `&mut` to uninitialized memory
+            // with no type error. Initialize here too, so the two sites are
+            // independent.
+            let workspace = unsafe {
+                let slot = &mut *BOOTSTRAP_ACPI_WORKSPACE.slot();
+                let workspace = slot.as_mut_ptr();
+                core::ptr::write_bytes(workspace, 0, 1);
+                &mut *workspace
+            };
             let mut acpi =
                 arch::x86_64::acpi::AcpiScratchReader::new(&mut active_paging, &boot_info);
             arch::x86_64::acpi::discover_cpu_topology(

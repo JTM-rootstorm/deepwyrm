@@ -136,6 +136,15 @@ pub(crate) fn bind_q35_external_interrupt_handler<T: Q35ExternalInterruptHandler
     })
 }
 
+/// Restores the erased handler reference and dispatches through it.
+///
+/// # Safety
+///
+/// `context` must be the `&'static T` that
+/// `bind_q35_external_interrupt_handler::<T>` erased, for the same `T` this
+/// trampoline was monomorphized for. `HandlerBinding` is constructed only
+/// there, and it sets the pointer and this trampoline together, so no caller
+/// can pair a context with the wrong `T`.
 #[allow(
     unsafe_code,
     reason = "the context was erased together with the matching shared-reference dispatch trampoline"

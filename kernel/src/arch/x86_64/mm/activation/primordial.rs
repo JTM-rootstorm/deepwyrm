@@ -3658,6 +3658,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         *slot = Some(deferred);
     }
 
+    /// # Safety
+    ///
+    /// Inherits `NativeRuntime::prepare_preemption`'s precondition: the caller
+    /// must be the raw timer/syscall safe-boundary trampoline on the current
+    /// Thread's bound kernel stack. The four callers in this file are those
+    /// trait implementations; nothing else may reach it.
     unsafe fn prepare_preemption_stationary(
         &mut self,
     ) -> crate::syscall::native::NativePreemptionPlan<'static> {
@@ -3706,6 +3712,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
+    /// # Safety
+    ///
+    /// The same precondition as `prepare_preemption_stationary` above.
     unsafe fn poll_idle_suspend_stationary(
         &mut self,
     ) -> crate::syscall::native::NativeIdleSuspendPoll<'static> {

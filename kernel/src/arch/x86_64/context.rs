@@ -260,6 +260,21 @@ pub(crate) unsafe fn switch_kernel_context(current_rsp_out: *mut u64, next_rsp: 
     unsafe { dw_x86_64_switch_kernel_context(current_rsp_out, next_rsp) };
 }
 
+/// Switches kernel continuations with the outgoing Thread's stack bounds named
+/// explicitly, so the assembly can reject a frame that does not belong to it.
+///
+/// # Safety
+///
+/// `current_stack` must be the bounds of the kernel stack currently bound to
+/// the outgoing Thread, and the call must be made on that stack. `next_rsp`
+/// must be an execution-domain continuation for the incoming Thread, or a
+/// freshly prepared initial continuation on that Thread's bound kernel stack.
+///
+/// The bounds are checked: `dw_x86_64_switch_owned_kernel_context` executes
+/// `ud2` if the entry RSP is misaligned or the saved frame would fall outside
+/// `current_stack`. That makes a violated precondition fail closed rather than
+/// corrupt another Thread's stack, but it does not make the precondition
+/// optional.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[allow(
     unsafe_code,
