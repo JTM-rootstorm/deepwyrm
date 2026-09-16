@@ -529,6 +529,11 @@ const SELECTOR_ENVIRONMENTS: [(&str, &[(&str, &str)]); 11] = [
 
 /// The E8 evidence surface: a second configuration of one selector rather than
 /// a selector of its own, so the manifest does not list it separately.
+/// The no-selector production kernel. `None` means the selector environment
+/// variable is removed rather than set, which is the shape a product build of
+/// the uninstrumented kernel actually has.
+const PRODUCTION_KERNEL_ROW: (Option<&str>, &[(&str, &str)]) = (None, &[]);
+
 const WYR1E8_SELECTOR: (&str, &[(&str, &str)]) = (
     "interactive-wyrmsh",
     &[
@@ -598,32 +603,51 @@ fn run_selector_library_checks() -> io::Result<u8> {
             (selector.as_str(), environment)
         })
         .chain(core::iter::once(WYR1E8_SELECTOR));
+    // The production kernel is the shape no selector selects, and until
+    // DW1-F/WYR1-F F1A.2 nothing ever compiled it on the target lane: every row
+    // above sets `DEEPWYRM_GUEST_TEST_SELECTOR`. That gap is how the q35 IOAPIC
+    // bring-up stayed reachable only under three selector strings without
+    // anything noticing -- an uninstrumented kernel compiled fine, it just had
+    // no interrupt-driven console. Check it first, because a production break
+    // matters more than a selector break.
+    let rows = core::iter::once(PRODUCTION_KERNEL_ROW).chain(rows.map(|(s, e)| (Some(s), e)));
     for (selector, environment) in rows {
         let mut command = Command::new(&lane);
-        command
-            .current_dir(&workspace)
-            .env_remove("CARGO_HOME")
-            .env("DEEPWYRM_GUEST_TEST_SELECTOR", selector);
+        command.current_dir(&workspace).env_remove("CARGO_HOME");
+        match selector {
+            Some(selector) => {
+                command.env("DEEPWYRM_GUEST_TEST_SELECTOR", selector);
+            }
+            None => {
+                command.env_remove("DEEPWYRM_GUEST_TEST_SELECTOR");
+            }
+        }
         for (name, value) in environment {
             command.env(name, value);
         }
-        let status = command
-            .args([
-                "target",
-                "check",
-                "--locked",
-                "--package",
-                "deepwyrm-kernel",
-                "--lib",
-                "--target",
-                "x86_64-unknown-none",
-                "--features",
-                "test-support",
-            ])
-            .status()?;
+        let mut arguments = vec![
+            "target",
+            "check",
+            "--locked",
+            "--package",
+            "deepwyrm-kernel",
+            "--lib",
+            "--target",
+            "x86_64-unknown-none",
+        ];
+        // `test-support` is what a selector build needs; the production row is
+        // checked without it, so this also proves the production kernel does
+        // not depend on the test-support surface to compile.
+        if selector.is_some() {
+            arguments.extend(["--features", "test-support"]);
+        }
+        let status = command.args(arguments).status()?;
         if !status.success() {
             let mut stderr = io::stderr().lock();
-            writeln!(stderr, "error: selector {selector} does not compile")?;
+            match selector {
+                Some(selector) => writeln!(stderr, "error: selector {selector} does not compile")?,
+                None => writeln!(stderr, "error: the production kernel does not compile")?,
+            }
             return Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8);
         }
     }

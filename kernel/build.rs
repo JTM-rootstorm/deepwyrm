@@ -140,10 +140,36 @@ fn run() -> Result<(), String> {
     // Selectors 31 and 32 share the q35 platform surface while selecting
     // distinct private evidence collectors. Ordinary q35 code must not
     // depend on either collector module.
-    if env::var("DEEPWYRM_GUEST_TEST_SELECTOR")
-        .ok()
+    //
+    // DW1-F/WYR1-F F1A.2 moved the surface itself off the guest-test selector.
+    // Every freestanding kernel now brings up the q35 IOAPIC and installs the
+    // COM2 external-vector dispatch, because the whole WYR1 console spine
+    // depends on interrupt-driven UART delivery: a kernel built without a
+    // selector used to compile that path out entirely and could not reach a
+    // prompt, which made the uninstrumented artifact something other than a
+    // production system. The selector clause is retained deliberately — it
+    // still records that those three selectors require this surface, and it
+    // keeps the emission a strict superset of the previous behaviour.
+    //
+    // Host builds stay excluded. The q35 modules already compile under
+    // `cfg(test)` where host tests need them, and `idt.rs`'s
+    // `only_approved_early_vectors_have_gates` asserts the non-q35 IDT shape
+    // under `cfg(not(deepwyrm_dw1e_platform))`; emitting the cfg for host
+    // builds would silently delete that coverage.
+    //
+    // DW1-D's synthetic selector opts out. `device-resource-interrupt-synthetic`
+    // proves the DeviceResource/Interrupt seam against a model platform on
+    // purpose, and its `deepwyrm_dw1d_evidence` syscall path takes a concrete
+    // `InterruptPlatformModel<SOURCES>`; giving it the real `Q35InterruptPlatform`
+    // does not type-check. Opting it out keeps that selector's product exactly
+    // what it was rather than reshaping a reached gate to suit F.
+    let selector = env::var("DEEPWYRM_GUEST_TEST_SELECTOR").ok();
+    let synthetic_interrupt_platform = selector
         .as_deref()
-        .is_some_and(is_dw1e_platform_selector)
+        .is_some_and(is_synthetic_interrupt_platform_selector);
+    if !synthetic_interrupt_platform
+        && (required_env("TARGET")? == KERNEL_TARGET
+            || selector.as_deref().is_some_and(is_dw1e_platform_selector))
     {
         println!("cargo:rustc-cfg=deepwyrm_dw1e_platform");
     }
@@ -446,6 +472,16 @@ fn is_wyr1e_evidence_selector(selector: &str) -> bool {
 /// its own: it must not inherit any interactive-shell or recovery geometry.
 fn is_r1_evidence_selector(selector: &str) -> bool {
     selector == "dynamic-launch-saturation"
+}
+
+/// Selectors that supply their own synthetic interrupt platform.
+///
+/// These opt out of the ordinary q35 platform surface. Kept separate from
+/// `is_dw1d_evidence_selector` because the two answer different questions: that
+/// one selects a private evidence collector, this one selects a substitute
+/// `InterruptPlatform` implementation.
+fn is_synthetic_interrupt_platform_selector(selector: &str) -> bool {
+    selector == "device-resource-interrupt-synthetic"
 }
 
 fn is_dw1e_platform_selector(selector: &str) -> bool {
