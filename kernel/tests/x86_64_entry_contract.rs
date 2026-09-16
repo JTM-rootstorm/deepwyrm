@@ -546,8 +546,11 @@ fn selector32_wrd1_console_relay_is_private_bounded_joined_and_atomic() {
     // line: the list gained a fourth selector in F1A.4 and is now wrapped, and
     // what this test protects is membership, not formatting.
     assert!(
-        build_fn_body(&build, "fn is_dw1e_platform_selector(selector: &str) -> bool {")
-            .contains("\"native-console-streams\"")
+        build_fn_body(
+            &build,
+            "fn is_dw1e_platform_selector(selector: &str) -> bool {"
+        )
+        .contains("\"native-console-streams\"")
     );
     assert!(support.contains("mod wyr1d_evidence;"));
     assert!(evidence.contains("WYR1D_EVIDENCE_RAW_SYSCALL: u32 = 0xffff_ff20"));
@@ -596,8 +599,11 @@ fn selector33_wre1_shell_relay_is_private_bounded_and_atomic() {
         .expect("read generated ABI");
 
     assert!(
-        build_fn_body(&build, "fn is_wyr1e_evidence_selector(selector: &str) -> bool {")
-            .contains("\"interactive-wyrmsh\"")
+        build_fn_body(
+            &build,
+            "fn is_wyr1e_evidence_selector(selector: &str) -> bool {"
+        )
+        .contains("\"interactive-wyrmsh\"")
     );
     assert!(build.contains("deepwyrm_wyr1e_evidence"));
     assert!(build.contains("DEEPWYRM_WYR1E7_EVIDENCE_NONCE"));

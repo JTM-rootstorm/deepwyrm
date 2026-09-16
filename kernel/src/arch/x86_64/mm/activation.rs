@@ -72,6 +72,12 @@ mod wyr1e8_resource_geometry;
 #[cfg(any(test, all(target_os = "none", deepwyrm_wyr1e_evidence)))]
 #[path = "activation/wyr1e_wait_geometry.rs"]
 mod wyr1e_wait_geometry;
+// Compiled in the host lane as well so the ledger's own tests and the
+// bootstrap-era negative case run where every other geometry model's do; the
+// production arm itself is target-only.
+#[cfg(any(test, deepwyrm_production_product))]
+#[path = "activation/production_resource_geometry.rs"]
+mod production_resource_geometry;
 #[allow(
     unused_imports,
     reason = "I0 root-binding typestates are consumed by the integrated carrier and focused host models"
@@ -139,8 +145,14 @@ const _: () = {
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
     deepwyrm_r1_evidence,
+    deepwyrm_production_product,
 )))]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;
+// WYR1-F production keeps the six resident roots, one replacement generation
+// and one shell job live together, matched to the same identity pool so root
+// bindings and Process identities cannot drift apart.
+#[cfg(deepwyrm_production_product)]
+const LIVE_ADDRESS_SPACE_CAPACITY: usize = production_resource_geometry::SELECTED.identities;
 // Selector 34 keeps four residents, every hog up to the scenario's eight-hog
 // ceiling, and one progress child live together, plus the retiring primordial
 // root. Matched to the selector's lifetime-identity pool so root bindings and

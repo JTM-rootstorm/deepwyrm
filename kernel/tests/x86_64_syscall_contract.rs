@@ -1051,17 +1051,82 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
 }
 
 #[test]
+fn the_production_product_selects_its_own_resource_geometry() {
+    // DW1-F/WYR1-F F2A. Every capacity arm below used to key off an evidence
+    // cfg, so the freestanding kernel that selects no guest test fell through
+    // to the bootstrap-era DW0 geometry -- three Processes, one TaskGroup, ten
+    // MemoryObjects, four wait registrations -- and could not instantiate the
+    // frozen six-role WYR1-F product. Each arm is asserted by its exact text
+    // because the failure is silent: the wrong arm compiles, links, and
+    // produces an artifact whose shortfall appears only at boot.
+    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+    for (name, field) in [
+        ("REGISTRY_OBJECTS", "registry"),
+        ("MEMORY_OBJECTS", "memory"),
+        ("MEMORY_LEASES", "mappings"),
+        ("USERSPACE_CHAIN_PROCESSES", "identities"),
+        ("CHANNEL_PAIRS", "channel_pairs"),
+        ("WAITERS", "waits"),
+        ("TASK_GROUPS", "identities"),
+        ("HANDLES", "handles"),
+    ] {
+        let arm = format!(
+            "#[cfg(deepwyrm_production_product)]\nconst {name}: usize = super::production_resource_geometry::SELECTED.{field};"
+        );
+        assert!(runtime.contains(&arm), "missing production arm for {name}");
+    }
+    // The bootstrap-era arm must exclude the production product, or both arms
+    // apply and the build breaks -- which is the loud outcome, but the
+    // exclusion is what makes the production arm reachable at all.
+    assert_eq!(
+        runtime
+            .matches("#[cfg(not(any(\n    deepwyrm_production_product,")
+            .count(),
+        8
+    );
+    // The ninth is the ten-handle drift guard, whose exclusion sits at the end
+    // of its list rather than the start.
+    assert_eq!(
+        runtime
+            .matches("    deepwyrm_production_product,\n)))]\nconst _: [(); 10] = [(); HANDLES];")
+            .count(),
+        1
+    );
+    assert!(
+        runtime.contains("#[cfg(deepwyrm_production_product)]\nconst _: [(); 48] = [(); HANDLES];")
+    );
+    // The ledger is consulted, not restated: the arms name the selected
+    // capacity rather than literals, so a demand change cannot drift from the
+    // number the kernel links.
+    assert!(!runtime.contains(
+        "#[cfg(deepwyrm_production_product)]\nconst USERSPACE_CHAIN_PROCESSES: usize = 16;"
+    ));
+
+    let geometry = source("src/arch/x86_64/mm/activation/production_resource_geometry.rs");
+    assert!(geometry.contains("const _: () = assert!(fits(SELECTED));"));
+    assert!(geometry.contains(
+        "const _: () = assert!(SELECTED.identities <= crate::memory::kernel_stack::E3_THREAD_STACK_COUNT);"
+    ));
+    assert!(geometry.contains("const _: () = assert!(SELECTED.evidence == 0);"));
+
+    let activation = source("src/arch/x86_64/mm/activation.rs");
+    assert!(activation.contains(
+        "#[cfg(deepwyrm_production_product)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = production_resource_geometry::SELECTED.identities;"
+    ));
+}
+
+#[test]
 fn live_uart_selectors_provision_overlapping_control_and_temt_timers() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
 
     assert!(runtime.contains(
-        "#[cfg(not(any(\n    deepwyrm_i2_stress,\n    deepwyrm_dw1e_evidence,\n    deepwyrm_wyr1d_evidence,\n    deepwyrm_wyr1e_evidence\n)))]\nconst TIMERS: usize = 1;"
+        "#[cfg(not(any(\n    deepwyrm_i2_stress,\n    deepwyrm_dw1e_evidence,\n    deepwyrm_wyr1d_evidence,\n    deepwyrm_wyr1e_evidence,\n    deepwyrm_production_product\n)))]\nconst TIMERS: usize = 1;"
     ));
     assert!(runtime.contains(
-        "#[cfg(any(\n    deepwyrm_i2_stress,\n    deepwyrm_dw1e_evidence,\n    deepwyrm_wyr1d_evidence,\n    deepwyrm_wyr1e_evidence\n))]\nconst TIMERS: usize = 2;"
+        "#[cfg(any(\n    deepwyrm_i2_stress,\n    deepwyrm_dw1e_evidence,\n    deepwyrm_wyr1d_evidence,\n    deepwyrm_wyr1e_evidence,\n    deepwyrm_production_product\n))]\nconst TIMERS: usize = 2;"
     ));
     assert!(runtime.contains(
-        "#[cfg(any(\n    deepwyrm_dw1e_evidence,\n    deepwyrm_wyr1d_evidence,\n    deepwyrm_wyr1e_evidence\n))]\nconst _: [(); 2] = [(); TIMERS];"
+        "#[cfg(any(\n    deepwyrm_dw1e_evidence,\n    deepwyrm_wyr1d_evidence,\n    deepwyrm_wyr1e_evidence,\n    deepwyrm_production_product\n))]\nconst _: [(); 2] = [(); TIMERS];"
     ));
 }
 

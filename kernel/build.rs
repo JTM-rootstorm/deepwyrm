@@ -132,6 +132,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_r1_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1e8_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1e_platform)");
+    println!("cargo:rustc-check-cfg=cfg(deepwyrm_production_product)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1e_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1e_e3b_full)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_integrated)");
@@ -172,6 +173,19 @@ fn run() -> Result<(), String> {
             || selector.as_deref().is_some_and(is_dw1e_platform_selector))
     {
         println!("cargo:rustc-cfg=deepwyrm_dw1e_platform");
+    }
+
+    // DW1-F/WYR1-F F2A.2. The production product is the freestanding kernel
+    // that selects no guest test, and until F2A.1 nothing in the tree said so:
+    // every capacity arm in `activation/primordial.rs` keys off an evidence
+    // cfg, so a selectorless build fell through to the bootstrap-era DW0
+    // geometry of three Processes and one TaskGroup and could not instantiate
+    // the frozen six-role product. This marker is what the production arm
+    // selects on. Host builds are excluded, so the model tests keep the
+    // bootstrap-era shape they were written against; selector builds are
+    // excluded because each already carries its own ledger.
+    if selector.is_none() && required_env("TARGET")? == KERNEL_TARGET {
+        println!("cargo:rustc-cfg=deepwyrm_production_product");
     }
 
     let layout_source = fs::read_to_string(&layout_path)
@@ -2686,7 +2700,9 @@ mod tests {
     fn wyr1f_closure_selector_is_implemented_at_35_and_reuses_the_wre1_transport() {
         let manifest = include_str!("../tooling/guest-harness.toml");
         assert_eq!(WYR1F_CLOSURE_SELECTOR, "dw1-wyr1-interactive-closure");
-        assert!(manifest.contains("[guest_test.dw1-wyr1-interactive-closure]\nid = 35\nstate = \"implemented\""));
+        assert!(manifest.contains(
+            "[guest_test.dw1-wyr1-interactive-closure]\nid = 35\nstate = \"implemented\""
+        ));
         // Id 34 stayed where it was; the plan's proposed 34 was not taken over.
         assert_eq!(
             select_guest_test(true, Some("dynamic-launch-saturation"), false, manifest),
