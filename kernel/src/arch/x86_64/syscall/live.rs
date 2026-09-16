@@ -231,6 +231,12 @@ pub(crate) enum SyscallInstallError {
     AlreadyInstallingOrInstalled,
     DescriptorState,
     UnsupportedCpu,
+    /// The installing context was not ring 0.
+    ///
+    /// Distinct from `InterruptsEnabled`: that one is an atomicity failure,
+    /// this one is an authority failure, and they were reported as the same
+    /// value until the check was split.
+    UnprivilegedContext,
     InterruptsEnabled,
     FsgsbaseNotCleared,
     FpSimdPolicyNotEnforced,
@@ -389,11 +395,28 @@ unsafe fn normalize_live_cr4() -> Result<(), SyscallInstallError> {
     Ok(())
 }
 
+/// Checks the two independent preconditions the installation context owes, and
+/// reports which one failed.
+///
+/// They are separate obligations and are now reported separately. Ring 0 is an
+/// *authority* precondition: only kernel context may install the syscall
+/// boundary at all. IF-clear is an *atomicity* precondition: the CR4 and MSR
+/// programming sequence that follows must not be interrupted partway. Nothing
+/// about either implies the other.
+///
+/// This was one `bool`, and its only caller turned any failure into
+/// `InterruptsEnabled`. A ring-3 caller therefore reported the one thing that
+/// was not wrong, which is the cause erasure
+/// `Plans/DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` exists to stop -- and it sat
+/// on `install_syscall_boundary_for_slot`, where the authority half is the
+/// security-relevant one. A single name over two invariants also means a later
+/// edit to one half can drop the other without the name reading any
+/// differently.
 #[allow(
     unsafe_code,
     reason = "RFLAGS/CS observation verifies the privileged IF-clear installation context"
 )]
-unsafe fn installation_cpu_state_is_valid() -> bool {
+unsafe fn verify_installation_cpu_state() -> Result<(), SyscallInstallError> {
     let rflags: u64;
     let cs: u16;
     unsafe {
@@ -409,7 +432,13 @@ unsafe fn installation_cpu_state_is_valid() -> bool {
             options(nomem, nostack, preserves_flags)
         );
     }
-    cs & 3 == 0 && rflags & RFLAGS_IF == 0
+    if cs & 3 != 0 {
+        return Err(SyscallInstallError::UnprivilegedContext);
+    }
+    if rflags & RFLAGS_IF != 0 {
+        return Err(SyscallInstallError::InterruptsEnabled);
+    }
+    Ok(())
 }
 
 fn cpu_supports_syscall() -> bool {
@@ -614,9 +643,7 @@ pub(crate) unsafe fn install_syscall_boundary_for_slot(
         return Err(SyscallInstallError::AlreadyInstallingOrInstalled);
     }
     let result = (|| {
-        if !unsafe { installation_cpu_state_is_valid() } {
-            return Err(SyscallInstallError::InterruptsEnabled);
-        }
+        unsafe { verify_installation_cpu_state() }?;
         if crate::arch::x86_64::runtime_cpu_descriptor_lifecycle(cpu_index)
             != Some(crate::arch::x86_64::RuntimeCpuDescriptorLifecycle::DescriptorsActive)
         {
