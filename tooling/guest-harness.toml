@@ -216,11 +216,12 @@ state = "implemented"
 # interactive-wyrmsh; the normal/degraded scenario meaning stays in Wyrmroot's
 # retained gate configuration and the host decoder, not in the kernel.
 #
-# Reserved rather than implemented: the id and the kernel-side admission are
-# fixed by F1A.4, but the instrumented Wyrmroot product that selects it is
-# F1B's. The normal final product built by F1A.5 uses the uninstrumented
-# no-selector kernel and does not select this or any other guest test. F1B
-# flips this to "implemented" when that product exists.
+# Implemented as of F1B.2: the instrumented Wyrmroot product that selects it
+# exists. `xtask wyr1f prepare --scenario normal-instrumented|degraded` builds
+# a kernel with this selector and an init carrying the `wyr1f-closure` feature,
+# which is the only build that contains the declared post-console failure
+# episode. The production product, `--scenario normal`, still uses the
+# uninstrumented no-selector kernel and selects no guest test at all.
 [guest_test.dw1-wyr1-interactive-closure]
 id = 35
-state = "reserved"
+state = "implemented"

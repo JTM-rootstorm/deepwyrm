@@ -2679,21 +2679,23 @@ mod tests {
         }
     }
 
-    /// DW1-F/WYR1-F F1A.4: the final closure selector's identity and admission.
+    /// DW1-F/WYR1-F F1A.4 and F1B.2: the final closure selector's identity and
+    /// admission. F1B.2 flipped it from `reserved` to `implemented`, because
+    /// the instrumented Wyrmroot product that selects it now exists.
     #[test]
-    fn wyr1f_closure_selector_is_reserved_at_35_and_reuses_the_wre1_transport() {
+    fn wyr1f_closure_selector_is_implemented_at_35_and_reuses_the_wre1_transport() {
         let manifest = include_str!("../tooling/guest-harness.toml");
         assert_eq!(WYR1F_CLOSURE_SELECTOR, "dw1-wyr1-interactive-closure");
-        assert!(manifest.contains("[guest_test.dw1-wyr1-interactive-closure]\nid = 35\nstate = \"reserved\""));
+        assert!(manifest.contains("[guest_test.dw1-wyr1-interactive-closure]\nid = 35\nstate = \"implemented\""));
         // Id 34 stayed where it was; the plan's proposed 34 was not taken over.
         assert_eq!(
             select_guest_test(true, Some("dynamic-launch-saturation"), false, manifest),
             Ok(Some(34))
         );
-        // Reserved, so it is not selectable yet. F1B's instrumented product
-        // flips it to implemented; until then selecting it must fail loudly
-        // rather than silently build something.
-        assert!(select_guest_test(true, Some(WYR1F_CLOSURE_SELECTOR), false, manifest).is_err());
+        assert_eq!(
+            select_guest_test(true, Some(WYR1F_CLOSURE_SELECTOR), false, manifest),
+            Ok(Some(35))
+        );
         // The kernel-side admission is nonetheless fixed now: same WRE1
         // transport and same DW1-E platform as the selector it follows, and no
         // older collector inherited.

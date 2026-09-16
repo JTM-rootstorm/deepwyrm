@@ -45,6 +45,10 @@ pub(crate) enum BuildGuestTest {
     NativeConsoleStreams,
     InteractiveWyrmsh,
     DynamicLaunchSaturation,
+    /// DW1-F/WYR1-F's final closure selector. It reuses `InteractiveWyrmsh`'s
+    /// WRE1 transport and DW1-E platform admission; the kernel's obligation for
+    /// both is identical, and the difference is entirely Wyrmroot's.
+    Dw1Wyr1InteractiveClosure,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,6 +122,7 @@ impl BuildGuestTest {
             Self::NativeConsoleStreams => 32,
             Self::InteractiveWyrmsh => 33,
             Self::DynamicLaunchSaturation => 34,
+            Self::Dw1Wyr1InteractiveClosure => 35,
         }
     }
 
@@ -164,6 +169,7 @@ impl BuildGuestTest {
                 | Self::NativeConsoleStreams
                 | Self::InteractiveWyrmsh
                 | Self::DynamicLaunchSaturation
+                | Self::Dw1Wyr1InteractiveClosure
         )
     }
 
@@ -291,6 +297,8 @@ const fn parse_known_selector(value: &str) -> BuildGuestTest {
         BuildGuestTest::InteractiveWyrmsh
     } else if string_equals(value, "dynamic-launch-saturation") {
         BuildGuestTest::DynamicLaunchSaturation
+    } else if string_equals(value, "dw1-wyr1-interactive-closure") {
+        BuildGuestTest::Dw1Wyr1InteractiveClosure
     } else {
         panic!("unknown build-selected guest test")
     }
