@@ -1081,7 +1081,27 @@ fn g3_primordial_mapping_failures_remain_recoverable_and_rollback_owned_candidat
     );
     assert!(primordial.contains("cancel_zeroed(failure.into_grant())"));
     assert!(user_access.contains("cancel_zeroed(failure.into_grant())"));
-    assert!(primordial.contains("const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 17;"));
+    // F3A.6y. This pinned the literal `= 17;`. Production now derives the
+    // ceiling from the producer's measurement, so the pin moves to the derived
+    // form -- and to the default living in `build.rs`, because the thing worth
+    // pinning is that an unmeasured build still admits exactly what it used
+    // to. Pinning only the derived call would let the default drift silently,
+    // which is the class of defect this whole amendment chain is about.
+    assert!(
+        primordial.contains(
+            "const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_production_bootfs_pages();"
+        )
+    );
+    assert!(primordial.contains("env!(\"DEEPWYRM_BOOTFS_MAX_PAGES\")"));
+    let build = fs::read_to_string(kernel_root().join("build.rs")).expect("kernel build script");
+    assert!(
+        build.contains("const HISTORICAL_WAVE4_PAGES: &str = \"17\";"),
+        "an unmeasured production build must still admit the historical 17 pages"
+    );
+    assert!(
+        build.contains("cargo:rerun-if-env-changed=DEEPWYRM_BOOTFS_MAX_PAGES"),
+        "a changed measurement must rebuild the kernel"
+    );
     assert!(primordial.contains("deepwyrm_wyr1b_evidence"));
     assert!(
         primordial

@@ -91,6 +91,7 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_TEST_SUPPORT");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_GUEST_TEST_SELECTOR");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_GUEST_TEST_ID");
+    println!("cargo:rerun-if-env-changed=DEEPWYRM_BOOTFS_MAX_PAGES");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_I1_EVIDENCE_NONCE");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1_EVIDENCE_NONCE");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1_EVIDENCE_SCENARIO");
@@ -1098,6 +1099,16 @@ fn configure_guest_test(harness_path: &Path) -> Result<(), String> {
         String::new()
     };
 
+    // Emitted for every configuration, selector or not, so the production
+    // `PRIMORDIAL_BOOTFS_MAX_PAGES` arm can read it with `env!` rather than
+    // `option_env!` and a second default. The selector arms keep their own
+    // per-selector variables; this one is only consulted by the no-selector
+    // arm. F3A.6y.
+    println!(
+        "cargo:rustc-env=DEEPWYRM_BOOTFS_MAX_PAGES={}",
+        production_bootfs_pages()?
+    );
+
     if let Some(test_id) = select_guest_test(
         feature_enabled,
         selector.as_deref(),
@@ -1258,6 +1269,48 @@ fn validate_dw1e_e3b_full(value: Option<&str>, selected: bool) -> Result<bool, S
         }
         Some(_) => Err("DEEPWYRM_DW1E_E3B_FULL must be absent or exact ASCII 1".to_owned()),
     }
+}
+
+/// The production bootfs page ceiling, measured by the producer when it is
+/// available and otherwise the historical Wave 4 constant.
+///
+/// F3A.6y. The four selector arms derive this from the producer's measured
+/// archive; production held a literal 17, which is a measurement of the Wave 4
+/// archive and eleven revisions of F3A were spent discovering that the WYR1-F
+/// archive is 203 pages. Selector 34's own comment already said why: "a
+/// guessed constant is what made an oversized archive surface as an opaque
+/// NO_RESOURCES from the bootstrap's bootfs mapping instead of a build error."
+///
+/// Unlike the selector arms this is **optional**, and that is deliberate. A
+/// selector build is always driven by a producer that knows its archive, so a
+/// missing variable there is a bug worth failing on. The production kernel
+/// must also build standalone -- `cargo build`, the host gates, the target
+/// clippy lane -- where no archive exists to measure. So an absent variable
+/// keeps the historical value rather than failing, and a present one is
+/// validated exactly as the selector arms validate theirs.
+fn production_bootfs_pages() -> Result<String, String> {
+    const NAME: &str = "DEEPWYRM_BOOTFS_MAX_PAGES";
+    // The Wave 4 archive's measured size, retained so a build with no producer
+    // behaves exactly as it did before this revision.
+    const HISTORICAL_WAVE4_PAGES: &str = "17";
+    match env::var(NAME) {
+        Err(_) => Ok(HISTORICAL_WAVE4_PAGES.to_owned()),
+        Ok(value) => {
+            validate_production_bootfs_pages(&value)?;
+            Ok(value)
+        }
+    }
+}
+
+fn validate_production_bootfs_pages(value: &str) -> Result<usize, String> {
+    const NAME: &str = "DEEPWYRM_BOOTFS_MAX_PAGES";
+    let pages = value
+        .parse::<usize>()
+        .map_err(|_| format!("{NAME} must be canonical decimal"))?;
+    if pages == 0 || pages > 8192 || pages.to_string() != value {
+        return Err(format!("{NAME} must be canonical decimal in 1..=8192"));
+    }
+    Ok(pages)
 }
 
 fn required_r1_bootfs_pages() -> Result<String, String> {
@@ -2548,6 +2601,29 @@ mod tests {
         }
         for invalid in ["", "0", "01", "+1", "8193", "not-pages"] {
             assert!(validate_dw1b_bootfs_pages(invalid).is_err());
+        }
+    }
+
+    /// F3A.6y. Production's ceiling is now measured when a producer measured
+    /// it, and the historical Wave 4 value otherwise.
+    ///
+    /// The default matters as much as the validation: the production kernel
+    /// must build standalone, and silently changing what a plain `cargo build`
+    /// admits would be a behaviour change smuggled in behind a diagnostic fix.
+    #[test]
+    fn the_production_bootfs_bound_is_measured_when_measured_and_historical_otherwise() {
+        // 203 is the WYR1-F archive that exposed the 17-page ceiling (F3A.6x);
+        // the bound must accept it and the whole range the const parser asserts.
+        for (value, pages) in [("1", 1), ("17", 17), ("203", 203), ("8192", 8192)] {
+            assert_eq!(validate_production_bootfs_pages(value), Ok(pages));
+        }
+        // Non-canonical and out-of-range values are refused rather than
+        // silently clamped -- a clamped ceiling is the guess this replaced.
+        for invalid in ["", "0", "01", "+1", " 17", "17 ", "8193", "not-pages"] {
+            assert!(
+                validate_production_bootfs_pages(invalid).is_err(),
+                "{invalid:?} must be refused"
+            );
         }
     }
 

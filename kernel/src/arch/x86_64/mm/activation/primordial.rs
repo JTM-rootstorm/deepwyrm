@@ -715,7 +715,24 @@ const PRIMORDIAL_TABLE_CANDIDATES: usize = 6;
     deepwyrm_wyr1e_evidence,
     deepwyrm_r1_evidence,
 )))]
-const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 17;
+// F3A.6y. This was a literal 17 -- "the ordinary Wave 4 bootfs is exactly 17
+// pages", per the comment above, and true of the archive that was current when
+// it was written. The WYR1-F production archive is 203 pages, so the mapping
+// asked the publisher's invalidation array for 203 slots and got 17, which
+// surfaced as an opaque `NO_RESOURCES` from the bootstrap's bootfs mapping and
+// cost the F3A campaign eleven revisions to name (F3A.6x).
+//
+// Selector 34's arm below already said why, and fixed it for itself: "a
+// guessed constant is what made an oversized archive surface as an opaque
+// NO_RESOURCES ... instead of a build error." Four selector arms derive the
+// ceiling from the producer's measured archive. Production, which is the
+// absence of every selector, was never given the fix.
+//
+// `DEEPWYRM_BOOTFS_MAX_PAGES` is emitted by `build.rs` for every
+// configuration: the producer's measurement when a producer built this kernel,
+// and the historical Wave 4 value when nothing measured it, so a standalone
+// `cargo build` is unchanged.
+const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_production_bootfs_pages();
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
 const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 32;
 #[cfg(deepwyrm_wrcap_relay)]
@@ -1028,6 +1045,43 @@ const fn parse_r1_bootfs_pages() -> usize {
     assert!(
         value > 0 && value <= 8192,
         "selector-34 bootfs page ceiling is out of range"
+    );
+    value
+}
+
+// Mirrors the production arm of `PRIMORDIAL_BOOTFS_MAX_PAGES` exactly. Without
+// it this is dead code in every selector build, and a selector that reaches the
+// const's arm without reaching this one is a compile error rather than a silent
+// mismatch.
+#[cfg(not(any(
+    deepwyrm_i2_stress,
+    deepwyrm_wrcap_relay,
+    deepwyrm_wyr1_evidence,
+    deepwyrm_dw1b_evidence,
+    deepwyrm_wyr1b_evidence,
+    deepwyrm_dw1c_evidence,
+    deepwyrm_dw1e_evidence,
+    deepwyrm_wyr1c_evidence,
+    deepwyrm_wyr1d_evidence,
+    deepwyrm_wyr1e_evidence,
+    deepwyrm_r1_evidence,
+)))]
+const fn parse_production_bootfs_pages() -> usize {
+    let bytes = env!("DEEPWYRM_BOOTFS_MAX_PAGES").as_bytes();
+    let mut value = 0_usize;
+    let mut index = 0;
+    assert!(!bytes.is_empty(), "production bootfs page ceiling is empty");
+    while index < bytes.len() {
+        assert!(
+            bytes[index].is_ascii_digit(),
+            "production bootfs page ceiling is not decimal"
+        );
+        value = value * 10 + (bytes[index] - b'0') as usize;
+        index += 1;
+    }
+    assert!(
+        value > 0 && value <= 8192,
+        "production bootfs page ceiling is out of range"
     );
     value
 }

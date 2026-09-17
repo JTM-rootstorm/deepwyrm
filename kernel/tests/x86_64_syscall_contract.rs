@@ -1031,7 +1031,15 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
         "#[cfg(deepwyrm_wrcap_relay)]\nconst CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;"
     ));
     assert!(runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst REGISTRY_OBJECTS: usize = 48;"));
-    assert!(runtime.contains("const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 17;"));
+    // F3A.6y. Production derives this from the producer's measured archive
+    // rather than pinning the Wave 4 literal; the other arms below still pin
+    // their own forms, which is what keeps this selector's 32 distinct from
+    // production's derived value.
+    assert!(
+        runtime.contains(
+            "const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_production_bootfs_pages();"
+        )
+    );
     assert!(runtime.contains(
         "#[cfg(deepwyrm_wyr1b_evidence)]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_wyr1b_bootfs_pages();"
     ));
