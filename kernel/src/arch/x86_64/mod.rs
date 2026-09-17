@@ -34,6 +34,12 @@ pub(crate) mod ioapic_live;
 )]
 pub(crate) mod ipi;
 pub mod mm;
+#[cfg(all(
+    not(feature = "test-support"),
+    target_os = "none",
+    target_arch = "x86_64"
+))]
+pub(crate) mod power;
 #[allow(
     dead_code,
     reason = "H2-D rendezvous ownership model precedes serialized live APIC transport integration"

@@ -12,6 +12,8 @@
 //! parsed only from that immutable observation. Discovery yields a resource
 //! proposal. The locked q35 profile separately authorizes the exact PM I/O port.
 
+pub(crate) mod sleep;
+
 use crate::time::{PmTimerDescriptor, PmTimerWidth};
 
 const RSDP_V1_BYTES: usize = 20;

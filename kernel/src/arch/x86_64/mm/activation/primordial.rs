@@ -4432,11 +4432,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 record.detail,
                 record.exit.map(|exit| (exit.name(), exit.code())),
             );
-            loop {
-                unsafe {
-                    core::arch::asm!("sti", "hlt", options(nomem, nostack));
-                }
-            }
+            // Nothing remains runnable. Production used to halt here forever
+            // while every instrumented build ended its domain through the
+            // test-only debug-exit transport, so only an instrumented image
+            // could finish a run. Power the platform off instead; the fallback
+            // inside is the halt loop this replaced.
+            crate::arch::x86_64::power::soft_off_then_halt()
         }
     }
 
@@ -4968,11 +4969,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 record.detail,
                 record.exit.map(|exit| (exit.name(), exit.code())),
             );
-            loop {
-                unsafe {
-                    core::arch::asm!("sti", "hlt", options(nomem, nostack));
-                }
-            }
+            // Nothing remains runnable. Production used to halt here forever
+            // while every instrumented build ended its domain through the
+            // test-only debug-exit transport, so only an instrumented image
+            // could finish a run. Power the platform off instead; the fallback
+            // inside is the halt loop this replaced.
+            crate::arch::x86_64::power::soft_off_then_halt()
         }
     }
 

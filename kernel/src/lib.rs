@@ -361,6 +361,39 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
         time::initialize(&mut active_paging, pm_timer)
             .unwrap_or_else(|error| panic!("failed to initialize DW0-F3 time service: {error:?}"));
 
+        // Discover and authorize ACPI S5 while the firmware tables are still
+        // reachable; the terminal path needs it long after this workspace is
+        // gone. Unlike the PM timer this is not load-bearing for the boot, so a
+        // platform that cannot describe S5 is reported and then runs exactly as
+        // it did before rather than being refused.
+        {
+            let workspace = unsafe {
+                let slot = &mut *BOOTSTRAP_ACPI_WORKSPACE.slot();
+                let workspace = slot.as_mut_ptr();
+                core::ptr::write_bytes(workspace, 0, 1);
+                &mut *workspace
+            };
+            let mut acpi =
+                arch::x86_64::acpi::AcpiScratchReader::new(&mut active_paging, &boot_info);
+            match arch::x86_64::acpi::sleep::discover_s5_proposal(
+                &mut acpi,
+                boot_info.header().acpi_rsdp_physical_address,
+                workspace,
+            )
+            .and_then(arch::x86_64::acpi::sleep::authorize_q35_s5)
+            {
+                Ok(command) => arch::x86_64::acpi::sleep::publish_authorized_soft_off(command),
+                Err(_error) => {
+                    #[cfg(not(feature = "test-support"))]
+                    let _ = debug::emit_early_record(
+                        debug::DiagnosticLevel::Warn,
+                        "power",
+                        "ACPI S5 soft-off not discovered; this boot cannot power off",
+                    );
+                }
+            }
+        }
+
         let (bsp_local_apic_id, bsp_local_apic_base) = time::bsp_local_apic_identity()
             .unwrap_or_else(|error| panic!("failed to identify the H1 bootstrap CPU: {error:?}"));
         let cpu_topology = {
