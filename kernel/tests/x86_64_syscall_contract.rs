@@ -1476,12 +1476,12 @@ fn wyr1_primordial_completion_failures_have_variant_specific_details() {
     assert!(!terminal.contains("supervisor_evidence_detail(0xd001)"));
 
     for mapping in [
-        "PrimordialCompletionError::MalformedReady => 0xd200",
+        "PrimordialCompletionError::MalformedReady(_) => 0xd200",
         "PrimordialCompletionError::ObserveExit(code) => 0xd300 | (code & 0xff)",
         "PrimordialCompletionError::NonzeroExit(code) => 0xd400 | (code & 0xff)",
         "PrimordialCompletionError::UnhandledException => 0xd500",
         "PrimordialCompletionError::AuthorizedTermination => 0xd600",
-        "PrimordialCompletionError::NotQuiescent(code) => 0xd700 | (code & 0xff)",
+        "PrimordialCompletionError::NotQuiescent(code, _) => 0xd700 | (code & 0xff)",
     ] {
         assert!(
             runtime.contains(mapping),

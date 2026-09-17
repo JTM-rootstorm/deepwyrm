@@ -329,12 +329,24 @@ fn emit_bootstrap_completion_record<P: BytePortIo>(
     level: DiagnosticLevel,
     cause: &str,
     detail: u32,
+    exit: Option<(&str, u32)>,
 ) -> Result<(), SerialError> {
     let _guard = OutputGuard::acquire().ok_or(SerialError::Busy)?;
     write!(serial, "[DW0][{}][primordial] bootstrap ", level.label())
         .map_err(|_| SerialError::TransmitTimeout)?;
     write_limited(serial, cause.as_bytes(), MAX_DIAGNOSTIC_MESSAGE_BYTES)?;
     write!(serial, " detail={detail:08X}").map_err(|_| SerialError::TransmitTimeout)?;
+    // F3A.6t. The suffix appears exactly when the reported cause is not itself
+    // the exit, so a reader can tell "nothing was queued" from "nothing was
+    // queued because the application had already exited 5". Absent otherwise
+    // rather than repeating the cause as its own context.
+    if let Some((exit_cause, exit_detail)) = exit {
+        serial
+            .write_str(" exit=")
+            .map_err(|_| SerialError::TransmitTimeout)?;
+        write_limited(serial, exit_cause.as_bytes(), MAX_DIAGNOSTIC_MESSAGE_BYTES)?;
+        write!(serial, " code={exit_detail:08X}").map_err(|_| SerialError::TransmitTimeout)?;
+    }
     serial
         .write_str("\n")
         .map_err(|_| SerialError::TransmitTimeout)
@@ -537,9 +549,10 @@ pub(crate) fn emit_early_bootstrap_completion_record(
     level: DiagnosticLevel,
     cause: &str,
     detail: u32,
+    exit: Option<(&str, u32)>,
 ) -> Result<(), SerialError> {
     let mut serial = Com1::new(X86PortIo);
-    emit_bootstrap_completion_record(&mut serial, level, cause, detail)
+    emit_bootstrap_completion_record(&mut serial, level, cause, detail, exit)
 }
 
 /// Emits a panic record through the kernel's COM1 diagnostic writer.

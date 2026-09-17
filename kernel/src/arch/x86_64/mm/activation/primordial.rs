@@ -1300,8 +1300,11 @@ impl G5PrimordialProbe {
         match completion {
             Err(crate::boot::primordial::construction::PrimordialCompletionError::Receive(
                 detail,
+                _,
             )) => *detail,
-            Err(crate::boot::primordial::construction::PrimordialCompletionError::MalformedReady) => 3,
+            Err(
+                crate::boot::primordial::construction::PrimordialCompletionError::MalformedReady(_),
+            ) => 3,
             Err(crate::boot::primordial::construction::PrimordialCompletionError::ObserveExit(
                 detail,
             )) => *detail,
@@ -1312,6 +1315,7 @@ impl G5PrimordialProbe {
             Err(crate::boot::primordial::construction::PrimordialCompletionError::AuthorizedTermination) => 6,
             Err(crate::boot::primordial::construction::PrimordialCompletionError::NotQuiescent(
                 detail,
+                _,
             )) => *detail,
             Ok(()) => 1,
         }
@@ -4367,9 +4371,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         #[cfg(not(feature = "test-support"))]
         {
-            let (level, cause, detail) =
-                crate::boot::primordial::construction::completion_record(&completion);
-            let _ = crate::debug::emit_early_bootstrap_completion_record(level, cause, detail);
+            let record = crate::boot::primordial::construction::completion_record(&completion);
+            let _ = crate::debug::emit_early_bootstrap_completion_record(
+                record.level,
+                record.cause,
+                record.detail,
+                record.exit.map(|exit| (exit.name(), exit.code())),
+            );
             loop {
                 unsafe {
                     core::arch::asm!("sti", "hlt", options(nomem, nostack));
@@ -4899,9 +4907,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         #[cfg(not(feature = "test-support"))]
         {
-            let (level, cause, detail) =
-                crate::boot::primordial::construction::completion_record(&completion);
-            let _ = crate::debug::emit_early_bootstrap_completion_record(level, cause, detail);
+            let record = crate::boot::primordial::construction::completion_record(&completion);
+            let _ = crate::debug::emit_early_bootstrap_completion_record(
+                record.level,
+                record.cause,
+                record.detail,
+                record.exit.map(|exit| (exit.name(), exit.code())),
+            );
             loop {
                 unsafe {
                     core::arch::asm!("sti", "hlt", options(nomem, nostack));
@@ -8205,17 +8217,17 @@ fn primordial_completion_case(
     // terminal category (including exact AF01_0002 versus bootstrap-family).
     // Other completion stages retain their existing stable low-byte detail.
     match error {
-        PrimordialCompletionError::Receive(code) => {
+        PrimordialCompletionError::Receive(code, _) => {
             0xe000
                 | (primordial_receive_failure_tag(code) << 8)
                 | primordial_terminal_summary(terminal_info)
         }
-        PrimordialCompletionError::MalformedReady => 0xd200,
+        PrimordialCompletionError::MalformedReady(_) => 0xd200,
         PrimordialCompletionError::ObserveExit(code) => 0xd300 | (code & 0xff),
         PrimordialCompletionError::NonzeroExit(code) => 0xd400 | (code & 0xff),
         PrimordialCompletionError::UnhandledException => 0xd500,
         PrimordialCompletionError::AuthorizedTermination => 0xd600,
-        PrimordialCompletionError::NotQuiescent(code) => 0xd700 | (code & 0xff),
+        PrimordialCompletionError::NotQuiescent(code, _) => 0xd700 | (code & 0xff),
     }
 }
 

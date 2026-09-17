@@ -317,6 +317,7 @@ fn bootstrap_completion_records_carry_the_cause_and_its_detail() {
         DiagnosticLevel::Error,
         "nonzero-exit",
         0xAF21_0B41,
+        None,
     )
     .unwrap();
     let port = serial.io;
@@ -328,14 +329,48 @@ fn bootstrap_completion_records_carry_the_cause_and_its_detail() {
     );
 }
 
+/// F3A.6t. A receive failure carries the exit disposition observed in the same
+/// call, and the transcript must show both: `WouldBlock` alone says only that
+/// nothing was queued, while `exit=exited code=AF010002` says the application
+/// had already failed with a WYR1 status. The suffix is absent when the cause
+/// *is* the exit, so its presence is what tells a reader the two facts are
+/// independent.
+#[test]
+fn a_bootstrap_completion_renders_a_secondary_exit_observation() {
+    let _test_lock = lock_output_guard_test();
+    let mut serial = Com1::new(FakePort::ready());
+    emit_bootstrap_completion_record(
+        &mut serial,
+        DiagnosticLevel::Error,
+        "ready-not-received",
+        0x7100_0015,
+        Some(("exited", 0xAF01_0002)),
+    )
+    .unwrap();
+    let port = serial.io;
+    let bytes = port.bytes();
+    let text = core::str::from_utf8(&bytes[..port.write_count]).unwrap();
+    assert_eq!(
+        text,
+        "[DW0][ERROR][primordial] bootstrap ready-not-received detail=71000015 \
+exit=exited code=AF010002\r\n"
+    );
+}
+
 /// A cause with no number of its own still renders a full-width zero rather
 /// than an empty field, so a transcript is parseable by one rule.
 #[test]
 fn a_bootstrap_completion_cause_without_a_detail_still_renders_one() {
     let _test_lock = lock_output_guard_test();
     let mut serial = Com1::new(FakePort::ready());
-    emit_bootstrap_completion_record(&mut serial, DiagnosticLevel::Info, "completed normally", 0)
-        .unwrap();
+    emit_bootstrap_completion_record(
+        &mut serial,
+        DiagnosticLevel::Info,
+        "completed normally",
+        0,
+        None,
+    )
+    .unwrap();
     let port = serial.io;
     let bytes = port.bytes();
     let text = core::str::from_utf8(&bytes[..port.write_count]).unwrap();

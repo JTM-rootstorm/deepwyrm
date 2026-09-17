@@ -518,7 +518,9 @@ fn committed_ready_is_consumed_before_normal_exit_and_quiescence() {
     malformed.ready = Ok(vec![0; 40]);
     assert_eq!(
         complete_primordial_launch(&mut malformed),
-        Err(PrimordialCompletionError::MalformedReady)
+        Err(PrimordialCompletionError::MalformedReady(
+            PrimordialExitObservation::Exited(0)
+        ))
     );
     assert!(malformed.observed_exit);
     assert!(malformed.verified_quiescence);
@@ -533,14 +535,18 @@ fn resource_completion_requires_v3_ready_without_widening_v2() {
     let mut historical = completion_host(PrimordialExitDisposition::Normal(0));
     assert_eq!(
         complete_resource_primordial_launch(&mut historical),
-        Err(PrimordialCompletionError::MalformedReady)
+        Err(PrimordialCompletionError::MalformedReady(
+            PrimordialExitObservation::Exited(0)
+        ))
     );
 
     let mut resource_on_historical = completion_host(PrimordialExitDisposition::Normal(0));
     resource_on_historical.ready = Ok(RESOURCE_READY_BYTES.to_vec());
     assert_eq!(
         complete_primordial_launch(&mut resource_on_historical),
-        Err(PrimordialCompletionError::MalformedReady)
+        Err(PrimordialCompletionError::MalformedReady(
+            PrimordialExitObservation::Exited(0)
+        ))
     );
 }
 
@@ -551,7 +557,8 @@ fn completion_rejects_peer_failure_exception_nonzero_exit_and_residue() {
     assert_eq!(
         complete_primordial_launch(&mut peer_closed),
         Err(PrimordialCompletionError::Receive(
-            CompletionFailure::Receive
+            CompletionFailure::Receive,
+            PrimordialExitObservation::Exited(0)
         ))
     );
     assert!(peer_closed.observed_exit);
@@ -590,7 +597,8 @@ fn completion_rejects_peer_failure_exception_nonzero_exit_and_residue() {
     assert_eq!(
         complete_primordial_launch(&mut residue),
         Err(PrimordialCompletionError::NotQuiescent(
-            CompletionFailure::Quiescence
+            CompletionFailure::Quiescence,
+            PrimordialExitObservation::Exited(0)
         ))
     );
 
@@ -611,14 +619,16 @@ fn completion_rejects_peer_failure_exception_nonzero_exit_and_residue() {
     assert_eq!(
         complete_primordial_launch(&mut peer_failure_with_residue),
         Err(PrimordialCompletionError::NotQuiescent(
-            CompletionFailure::Quiescence
+            CompletionFailure::Quiescence,
+            PrimordialExitObservation::Exited(0)
         ))
     );
     #[cfg(deepwyrm_r1_evidence)]
     assert_eq!(
         complete_primordial_launch(&mut peer_failure_with_residue),
         Err(PrimordialCompletionError::Receive(
-            CompletionFailure::Receive
+            CompletionFailure::Receive,
+            PrimordialExitObservation::Exited(0)
         )),
         "selector 34 reports the child's own failure ahead of the kernel-side \
          residue invariant; see complete_primordial_launch_with_ready"
@@ -631,8 +641,13 @@ fn retirement_fact_split_samples_exit_without_consuming_quiescence() {
     receive_failure.ready = Err(CompletionFailure::Receive);
     assert_eq!(
         validate_primordial_retirement_facts(&mut receive_failure),
+        // F3A.6t. The fixture's application exited `0xaf01_0002` -- a real
+        // WYR1 status -- while the receive failed. Before this revision that
+        // status was computed and discarded, and this assertion could not see
+        // the difference. It is the whole point of the change.
         Err(PrimordialCompletionError::Receive(
-            CompletionFailure::Receive
+            CompletionFailure::Receive,
+            PrimordialExitObservation::Exited(0xaf01_0002)
         ))
     );
     assert!(receive_failure.observed_exit);
@@ -643,7 +658,11 @@ fn retirement_fact_split_samples_exit_without_consuming_quiescence() {
     malformed.exit = Err(CompletionFailure::Exit);
     assert_eq!(
         validate_primordial_retirement_facts(&mut malformed),
-        Err(PrimordialCompletionError::MalformedReady)
+        // `observe_exit` failed here, so there is no disposition to report and
+        // the secondary fact says exactly that rather than inventing a zero.
+        Err(PrimordialCompletionError::MalformedReady(
+            PrimordialExitObservation::Unobserved
+        ))
     );
     assert!(malformed.observed_exit);
     assert!(!malformed.verified_quiescence);
@@ -668,7 +687,9 @@ fn retirement_fact_split_samples_exit_without_consuming_quiescence() {
     let mut resource_on_historical = completion_host(PrimordialExitDisposition::Normal(0));
     assert_eq!(
         validate_resource_primordial_retirement_facts(&mut resource_on_historical),
-        Err(PrimordialCompletionError::MalformedReady)
+        Err(PrimordialCompletionError::MalformedReady(
+            PrimordialExitObservation::Exited(0)
+        ))
     );
 }
 
@@ -678,57 +699,89 @@ fn retirement_fact_split_samples_exit_without_consuming_quiescence() {
 /// variant that got discarded.
 #[test]
 fn completion_records_name_every_variant_and_keep_the_exit_code() {
-    /// One expected answer: the completion, its cause name, its detail.
+    /// One expected answer: the completion, its cause name, its detail, and
+    /// the secondary exit observation the reader's channel should carry.
     type Expectation = (
         Result<(), PrimordialCompletionError<u32>>,
         &'static str,
         u32,
+        Option<PrimordialExitObservation>,
     );
 
     let cases: Vec<Expectation> = vec![
-        (Ok(()), "completed normally", 0),
+        (Ok(()), "completed normally", 0, None),
         (
-            Err(PrimordialCompletionError::Receive(0x7100_0017)),
+            Err(PrimordialCompletionError::Receive(
+                0x7100_0017,
+                PrimordialExitObservation::Exited(0xaf01_0002),
+            )),
             "ready-not-received",
             0x7100_0017,
+            Some(PrimordialExitObservation::Exited(0xaf01_0002)),
         ),
         (
-            Err(PrimordialCompletionError::MalformedReady),
+            Err(PrimordialCompletionError::MalformedReady(
+                PrimordialExitObservation::UnhandledException,
+            )),
             "ready-malformed",
             3,
+            Some(PrimordialExitObservation::UnhandledException),
         ),
         (
-            Err(PrimordialCompletionError::ObserveExit(0x7100_0016)),
+            Err(PrimordialCompletionError::ObserveExit(9)),
             "exit-not-observed",
-            0x7100_0016,
+            9,
+            None,
         ),
         (
             Err(PrimordialCompletionError::NonzeroExit(0xAF21_0B41)),
             "nonzero-exit",
             0xAF21_0B41,
+            None,
         ),
         (
             Err(PrimordialCompletionError::UnhandledException),
             "unhandled-exception",
             5,
+            None,
         ),
         (
             Err(PrimordialCompletionError::AuthorizedTermination),
             "authorized-termination",
             6,
+            None,
         ),
         (
-            Err(PrimordialCompletionError::NotQuiescent(0x7100_0015)),
+            Err(PrimordialCompletionError::NotQuiescent(
+                0x7100_0015,
+                PrimordialExitObservation::Unobserved,
+            )),
             "not-quiescent",
             0x7100_0015,
+            Some(PrimordialExitObservation::Unobserved),
         ),
     ];
 
+    // F3A.6s. The three payload-bearing variants are given distinct codes
+    // above precisely so this test fails if `completion_record` ever renders a
+    // constant -- a zero, or one payload for all three -- instead of each
+    // variant's own carried value. The codes are real
+    // `primordial_channel_receive_error` encodings: BufferTooSmall,
+    // PeerClosed, WouldBlock.
+    //
+    // F3A.6t adds the fourth column. The three variants decided while the exit
+    // disposition is in scope must surface it; the four that *are* the exit
+    // must not restate themselves as their own context. Each carried
+    // observation here is a different one, so a mapping that returned a fixed
+    // `Some`/`None` fails.
+
     let mut names = Vec::new();
-    for (index, (completion, cause, detail)) in cases.into_iter().enumerate() {
-        let (level, observed_cause, observed_detail) = completion_record(&completion);
+    for (index, (completion, cause, detail, exit)) in cases.into_iter().enumerate() {
+        let record = completion_record(&completion);
+        let (level, observed_cause, observed_detail) = (record.level, record.cause, record.detail);
         assert_eq!(observed_cause, cause);
         assert_eq!(observed_detail, detail, "{cause} lost its detail");
+        assert_eq!(record.exit, exit, "{cause} lost its exit observation");
         // Only success is informational; every failure is an error.
         let expected = if index == 0 {
             crate::debug::DiagnosticLevel::Info

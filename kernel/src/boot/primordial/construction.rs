@@ -501,15 +501,75 @@ pub(crate) enum PrimordialExitDisposition {
     AuthorizedTermination,
 }
 
+/// What `observe_exit` reported, carried beside a failure that is not itself
+/// about the exit.
+///
+/// F3A.6t. Both completion paths compute the structured exit disposition
+/// *before* applying READY-first error precedence, and then drop it when the
+/// receive, the READY shape, or the quiescence invariant is what fails.
+/// `validate_primordial_retirement_facts_with_ready` even carried a comment
+/// saying it must not -- "a failed receive must not erase the concurrent
+/// structured Process disposition" -- above code whose `?` erased it anyway.
+/// The intent was documented and never implemented.
+///
+/// It matters because `WouldBlock` (F3A.6s, production) says only that
+/// nothing was queued. Whether the bootstrap application never sent READY,
+/// exited first, or faulted is the *next* question, and the answer was already
+/// in a local three lines above the discard.
+///
+/// A failed `observe_exit` collapses to `Unobserved` rather than carrying its
+/// own error. The primary cause already owns the detail field, and "no
+/// disposition exists to report" is the whole of what a reader needs from a
+/// secondary fact; `ObserveExit` carries the instance when the exit
+/// observation is itself the failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PrimordialExitObservation {
+    /// `observe_exit` failed, so no disposition exists to report.
+    Unobserved,
+    /// The application exited with this status.
+    Exited(u32),
+    UnhandledException,
+    AuthorizedTermination,
+}
+
+impl PrimordialExitObservation {
+    fn observe<E>(exit: &Result<PrimordialExitDisposition, E>) -> Self {
+        match exit {
+            Err(_) => Self::Unobserved,
+            Ok(PrimordialExitDisposition::Normal(code)) => Self::Exited(*code),
+            Ok(PrimordialExitDisposition::UnhandledException) => Self::UnhandledException,
+            Ok(PrimordialExitDisposition::AuthorizedTermination) => Self::AuthorizedTermination,
+        }
+    }
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Unobserved => "unobserved",
+            Self::Exited(_) => "exited",
+            Self::UnhandledException => "unhandled-exception",
+            Self::AuthorizedTermination => "authorized-termination",
+        }
+    }
+
+    /// The exit status where one exists, and zero where the disposition is not
+    /// a status. Read it only together with `name`.
+    pub(crate) const fn code(self) -> u32 {
+        match self {
+            Self::Exited(code) => code,
+            Self::Unobserved | Self::UnhandledException | Self::AuthorizedTermination => 0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PrimordialCompletionError<E> {
-    Receive(E),
-    MalformedReady,
+    Receive(E, PrimordialExitObservation),
+    MalformedReady(PrimordialExitObservation),
     ObserveExit(E),
     NonzeroExit(u32),
     UnhandledException,
     AuthorizedTermination,
-    NotQuiescent(E),
+    NotQuiescent(E, PrimordialExitObservation),
 }
 
 /// How a backend error renders as the one number a boot transcript carries.
@@ -528,6 +588,22 @@ impl PrimordialCompletionDetail for u32 {
     fn completion_detail(&self) -> u32 {
         *self
     }
+}
+
+/// One completion, as the reader's channel receives it.
+///
+/// F3A.6t widened this from a tuple. `exit` is `Some` exactly when the
+/// reported cause is *not* itself the exit -- a receive failure, a malformed
+/// READY, or a quiescence failure -- and carries the disposition those paths
+/// used to discard. It is `None` when the cause already *is* the exit
+/// (`ObserveExit`, `NonzeroExit`, `UnhandledException`,
+/// `AuthorizedTermination`) or when there is no failure, because a second
+/// rendering of the same fact would be noise rather than carriage.
+pub(crate) struct BootstrapCompletionRecord {
+    pub(crate) level: crate::debug::DiagnosticLevel,
+    pub(crate) cause: &'static str,
+    pub(crate) detail: u32,
+    pub(crate) exit: Option<PrimordialExitObservation>,
 }
 
 /// One completion, as a diagnostic level, a cause name and a number.
@@ -580,42 +656,62 @@ impl PrimordialCompletionDetail for u32 {
 /// inheriting a zero.
 pub(crate) fn completion_record<E: PrimordialCompletionDetail>(
     completion: &Result<(), PrimordialCompletionError<E>>,
-) -> (crate::debug::DiagnosticLevel, &'static str, u32) {
+) -> BootstrapCompletionRecord {
     use crate::debug::DiagnosticLevel;
 
     match completion {
-        Ok(()) => (DiagnosticLevel::Info, "completed normally", 0),
-        Err(PrimordialCompletionError::Receive(error)) => (
-            DiagnosticLevel::Error,
-            "ready-not-received",
-            error.completion_detail(),
-        ),
-        Err(PrimordialCompletionError::MalformedReady) => {
-            (DiagnosticLevel::Error, "ready-malformed", 3)
-        }
-        Err(PrimordialCompletionError::ObserveExit(error)) => (
-            DiagnosticLevel::Error,
-            "exit-not-observed",
-            error.completion_detail(),
-        ),
+        Ok(()) => BootstrapCompletionRecord {
+            level: DiagnosticLevel::Info,
+            cause: "completed normally",
+            detail: 0,
+            exit: None,
+        },
+        Err(PrimordialCompletionError::Receive(error, exit)) => BootstrapCompletionRecord {
+            level: DiagnosticLevel::Error,
+            cause: "ready-not-received",
+            detail: error.completion_detail(),
+            exit: Some(*exit),
+        },
+        Err(PrimordialCompletionError::MalformedReady(exit)) => BootstrapCompletionRecord {
+            level: DiagnosticLevel::Error,
+            cause: "ready-malformed",
+            detail: 3,
+            exit: Some(*exit),
+        },
+        Err(PrimordialCompletionError::ObserveExit(error)) => BootstrapCompletionRecord {
+            level: DiagnosticLevel::Error,
+            cause: "exit-not-observed",
+            detail: error.completion_detail(),
+            exit: None,
+        },
         // The one variant whose payload is unconditionally numeric, and the
         // one worth the most: this is the userspace application status, which
         // for a WYR1 product is the whole `0xAF..` failure encoding the F3A
         // campaign spent nine revisions building.
-        Err(PrimordialCompletionError::NonzeroExit(code)) => {
-            (DiagnosticLevel::Error, "nonzero-exit", *code)
-        }
-        Err(PrimordialCompletionError::UnhandledException) => {
-            (DiagnosticLevel::Error, "unhandled-exception", 5)
-        }
-        Err(PrimordialCompletionError::AuthorizedTermination) => {
-            (DiagnosticLevel::Error, "authorized-termination", 6)
-        }
-        Err(PrimordialCompletionError::NotQuiescent(error)) => (
-            DiagnosticLevel::Error,
-            "not-quiescent",
-            error.completion_detail(),
-        ),
+        Err(PrimordialCompletionError::NonzeroExit(code)) => BootstrapCompletionRecord {
+            level: DiagnosticLevel::Error,
+            cause: "nonzero-exit",
+            detail: *code,
+            exit: None,
+        },
+        Err(PrimordialCompletionError::UnhandledException) => BootstrapCompletionRecord {
+            level: DiagnosticLevel::Error,
+            cause: "unhandled-exception",
+            detail: 5,
+            exit: None,
+        },
+        Err(PrimordialCompletionError::AuthorizedTermination) => BootstrapCompletionRecord {
+            level: DiagnosticLevel::Error,
+            cause: "authorized-termination",
+            detail: 6,
+            exit: None,
+        },
+        Err(PrimordialCompletionError::NotQuiescent(error, exit)) => BootstrapCompletionRecord {
+            level: DiagnosticLevel::Error,
+            cause: "not-quiescent",
+            detail: error.completion_detail(),
+            exit: Some(*exit),
+        },
     }
 }
 
@@ -659,6 +755,10 @@ fn complete_primordial_launch_with_ready<B: PrimordialCompletionBackend>(
     let ready = backend.receive_ready(&mut bytes);
     let exit = backend.observe_exit();
     let quiescent = backend.verify_quiescent();
+    // F3A.6t. Snapshot the disposition before precedence consumes `exit`, so
+    // a receive, READY-shape or quiescence failure reports what the
+    // application did instead of erasing it.
+    let observation = PrimordialExitObservation::observe(&exit);
 
     // Selector 34 reports quiescence last. Its permanent-supervisor product
     // failed run 4 on a quiescence invariant that erased the supervised child's
@@ -666,10 +766,10 @@ fn complete_primordial_launch_with_ready<B: PrimordialCompletionBackend>(
     // facts are reported first and the kernel-side invariant afterwards. Every
     // other selector keeps the established quiescence-first precedence.
     #[cfg(not(deepwyrm_r1_evidence))]
-    quiescent.map_err(PrimordialCompletionError::NotQuiescent)?;
-    let actual = ready.map_err(PrimordialCompletionError::Receive)?;
+    quiescent.map_err(|error| PrimordialCompletionError::NotQuiescent(error, observation))?;
+    let actual = ready.map_err(|error| PrimordialCompletionError::Receive(error, observation))?;
     if actual != expected_ready.len() || bytes != *expected_ready {
-        return Err(PrimordialCompletionError::MalformedReady);
+        return Err(PrimordialCompletionError::MalformedReady(observation));
     }
     let disposition = exit.map_err(PrimordialCompletionError::ObserveExit)?;
     match disposition {
@@ -685,7 +785,7 @@ fn complete_primordial_launch_with_ready<B: PrimordialCompletionBackend>(
         }
     }
     #[cfg(deepwyrm_r1_evidence)]
-    quiescent.map_err(PrimordialCompletionError::NotQuiescent)?;
+    quiescent.map_err(|error| PrimordialCompletionError::NotQuiescent(error, observation))?;
     Ok(())
 }
 
@@ -733,10 +833,14 @@ fn validate_primordial_retirement_facts_with_ready<B: PrimordialCompletionBacken
     // Process disposition needed by selector-local failure diagnostics.
     let ready = backend.receive_ready(&mut bytes);
     let exit = backend.observe_exit();
+    // F3A.6t makes the comment above true. It claimed a failed receive must
+    // not erase the concurrent disposition; until this revision the `?` below
+    // erased it regardless.
+    let observation = PrimordialExitObservation::observe(&exit);
 
-    let actual = ready.map_err(PrimordialCompletionError::Receive)?;
+    let actual = ready.map_err(|error| PrimordialCompletionError::Receive(error, observation))?;
     if actual != expected_ready.len() || bytes != *expected_ready {
-        return Err(PrimordialCompletionError::MalformedReady);
+        return Err(PrimordialCompletionError::MalformedReady(observation));
     }
     match exit.map_err(PrimordialCompletionError::ObserveExit)? {
         PrimordialExitDisposition::Normal(0) => Ok(()),
