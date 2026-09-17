@@ -131,6 +131,11 @@ fn run() -> Result<(), String> {
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1e_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_r1_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1e8_evidence)");
+    // Declared, not selected: no selector string activates this cfg yet.
+    // `wyr1f_fairness_resource_geometry.rs` (F3A.6p) is a test-support
+    // fixture only; wiring a selector to it is a separate, coordinator-owned
+    // cross-repository step.
+    println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1f_fairness_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1e_platform)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_production_product)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1e_evidence)");

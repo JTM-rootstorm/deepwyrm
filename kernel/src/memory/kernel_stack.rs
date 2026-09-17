@@ -1,9 +1,18 @@
 //! Architecture-neutral geometry for bounded DW0-E kernel stack carriers.
 
 pub(crate) const E3_BASE_PAGE_SIZE: u64 = 4096;
-#[cfg(not(deepwyrm_wyr1e8_evidence))]
+#[cfg(not(any(deepwyrm_wyr1e8_evidence, deepwyrm_wyr1f_fairness_evidence)))]
 pub(crate) const E3_THREAD_STACK_COUNT: usize = 16;
 #[cfg(deepwyrm_wyr1e8_evidence)]
+pub(crate) const E3_THREAD_STACK_COUNT: usize = 64;
+// The WYR1-F fairness leg's own ledger (`wyr1f_fairness_resource_geometry.rs`,
+// cite F3A.6p) needs seventeen simultaneous identities for six concurrent
+// hogs plus one interleaved `run bin/hello` probe -- one over the ordinary
+// arena. Gated on its own cfg rather than `deepwyrm_wyr1e8_evidence` so this
+// arena is not silently tied to E8's unrelated evidence-collection scenario;
+// `not(deepwyrm_wyr1e8_evidence)` keeps the two mutually exclusive if both
+// are ever set.
+#[cfg(all(deepwyrm_wyr1f_fairness_evidence, not(deepwyrm_wyr1e8_evidence)))]
 pub(crate) const E3_THREAD_STACK_COUNT: usize = 64;
 pub(crate) const E3_THREAD_STACK_SIZE: u64 = 524_288;
 pub(crate) const E3_THREAD_STACK_GUARD_SIZE: u64 = E3_BASE_PAGE_SIZE;

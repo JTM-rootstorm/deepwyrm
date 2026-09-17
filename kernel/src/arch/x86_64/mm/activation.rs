@@ -72,6 +72,14 @@ mod wyr1e8_resource_geometry;
 #[cfg(any(test, all(target_os = "none", deepwyrm_wyr1e_evidence)))]
 #[path = "activation/wyr1e_wait_geometry.rs"]
 mod wyr1e_wait_geometry;
+// Test-support fixture for the WYR1-F fairness leg (F3A.6p), separate from
+// `production_resource_geometry`'s frozen single-live-job production demand.
+// Not selected by any product arm in `primordial.rs`; compiled here only so
+// its own tests (and, target-side, a future selector's explicit choice) run
+// where every other geometry model's do.
+#[cfg(any(test, all(target_os = "none", deepwyrm_wyr1f_fairness_evidence)))]
+#[path = "activation/wyr1f_fairness_resource_geometry.rs"]
+mod wyr1f_fairness_resource_geometry;
 // Compiled in the host lane as well so the ledger's own tests and the
 // bootstrap-era negative case run where every other geometry model's do; the
 // production arm itself is target-only.
