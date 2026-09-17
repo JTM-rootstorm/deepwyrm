@@ -14,7 +14,9 @@ fn queue_mapping_releases<const OBJECTS: usize>(
     }
 }
 
-fn address_region_status(error: crate::memory::address_region::AddressRegionError) -> DwStatus {
+pub(super) fn address_region_status(
+    error: crate::memory::address_region::AddressRegionError,
+) -> DwStatus {
     use crate::memory::address_region::AddressRegionError;
     use crate::memory::object::MemoryObjectError;
     match error {
@@ -52,11 +54,23 @@ fn address_region_status(error: crate::memory::address_region::AddressRegionErro
 
 pub(crate) trait AddressSpacePublishStatus {
     fn syscall_status(&self) -> DwStatus;
+
+    /// Names the exhausted resource when `syscall_status` is
+    /// `DW_STATUS_NO_RESOURCES`, and `None` otherwise.
+    ///
+    /// F3A.6w. On the trait rather than beside it so a new publisher cannot
+    /// answer the status question without answering the reader's, per
+    /// `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.2.
+    fn capacity_resource(&self) -> Option<&'static str>;
 }
 
 impl AddressSpacePublishStatus for () {
     fn syscall_status(&self) -> DwStatus {
         DW_STATUS_BAD_STATE
+    }
+
+    fn capacity_resource(&self) -> Option<&'static str> {
+        None
     }
 }
 
@@ -67,6 +81,10 @@ impl<E> AddressSpacePublishStatus for crate::arch::x86_64::mm::X86AddressSpacePu
         } else {
             DW_STATUS_BAD_STATE
         }
+    }
+
+    fn capacity_resource(&self) -> Option<&'static str> {
+        crate::arch::x86_64::mm::X86AddressSpacePublishError::capacity_resource(self)
     }
 }
 
@@ -82,6 +100,106 @@ impl<E: AddressSpacePublishStatus> AddressSpacePublishStatus
             Self::Identity | Self::InvalidBatch | Self::Coherency(_) => DW_STATUS_BAD_STATE,
         }
     }
+
+    fn capacity_resource(&self) -> Option<&'static str> {
+        match self {
+            Self::Publish(error) => error.capacity_resource(),
+            Self::Coherency(
+                crate::memory::address_region::AddressSpaceCoherencyError::GenerationExhausted,
+            ) => Some("address-space-generation"),
+            Self::Identity | Self::InvalidBatch | Self::Coherency(_) => None,
+        }
+    }
+}
+
+/// Names the exhausted resource behind an `AddressRegionError`-derived
+/// `NO_RESOURCES`. Exhaustive so a new capacity variant cannot inherit `None`.
+pub(super) fn address_region_capacity_resource(
+    error: crate::memory::address_region::AddressRegionError,
+) -> Option<&'static str> {
+    use crate::memory::address_region::AddressRegionError;
+    match error {
+        AddressRegionError::Capacity => Some("region-mapping-slots"),
+        AddressRegionError::Empty
+        | AddressRegionError::Unaligned
+        | AddressRegionError::Overflow
+        | AddressRegionError::InvalidProtection
+        | AddressRegionError::PageZero
+        | AddressRegionError::OutsideRegion
+        | AddressRegionError::Overlap
+        | AddressRegionError::Unmapped
+        | AddressRegionError::NoSpace
+        | AddressRegionError::UnsupportedProtection
+        | AddressRegionError::LiveMappings
+        | AddressRegionError::LiveRegions
+        | AddressRegionError::PublisherIdentity
+        | AddressRegionError::Object(_) => None,
+    }
+}
+
+/// Names the exhausted resource behind an `AddressRegionObjectError`-derived
+/// `NO_RESOURCES`. Three distinct walls reach one status here: the region
+/// object table, the object registry, and a registry reference count.
+pub(super) fn address_region_object_capacity_resource(
+    error: crate::memory::address_region::AddressRegionObjectError,
+) -> Option<&'static str> {
+    use crate::memory::address_region::AddressRegionObjectError;
+    match error {
+        AddressRegionObjectError::Capacity => Some("region-objects"),
+        AddressRegionObjectError::Registry(ObjectRegistryError::Capacity) => {
+            Some("object-registry")
+        }
+        AddressRegionObjectError::Registry(ObjectRegistryError::ReferenceCountExhausted) => {
+            Some("object-registry-refcount")
+        }
+        // Only `TaskError::Capacity` reaches `NO_RESOURCES` through
+        // `task_status`, so the task authority needs no finer classifier here.
+        AddressRegionObjectError::Task(_) => Some("task-authority"),
+        AddressRegionObjectError::Model(error) => address_region_capacity_resource(error),
+        AddressRegionObjectError::WrongObjectType
+        | AddressRegionObjectError::WrongProcess
+        | AddressRegionObjectError::RuntimePin
+        | AddressRegionObjectError::LiveMappings
+        | AddressRegionObjectError::BlockedOperation(_)
+        | AddressRegionObjectError::Registry(_) => None,
+    }
+}
+
+fn address_transaction_capacity_resource<E: AddressSpacePublishStatus>(
+    error: &crate::memory::address_region::AddressSpaceTransactionError<E>,
+) -> Option<&'static str> {
+    match error {
+        crate::memory::address_region::AddressSpaceTransactionError::Model(error) => {
+            address_region_capacity_resource(*error)
+        }
+        crate::memory::address_region::AddressSpaceTransactionError::Publish(error) => {
+            error.capacity_resource()
+        }
+    }
+}
+
+const MAP_SITE_REGION_RESOLVE: u8 = 0x01;
+const MAP_SITE_REGION_PROCESS: u8 = 0x02;
+const MAP_SITE_OPERATION_LEASE: u8 = 0x03;
+const MAP_SITE_REGION_FOR_OPERATION: u8 = 0x04;
+const MAP_SITE_PUBLISH: u8 = 0x06;
+
+/// Writes the exhausted resource to the reader's transcript when a map
+/// boundary collapses a typed capacity error into `DW_STATUS_NO_RESOURCES`.
+///
+/// F3A.6w. `site` distinguishes which of the map model's boundaries reported
+/// it, and `None` renders as `unclassified` rather than being suppressed --
+/// the handle-resolution boundary returns a bare status with no error value
+/// left to classify, and a transcript that says so is what makes the
+/// experiment decisive either way.
+fn note_map_capacity(status: DwStatus, resource: Option<&'static str>, site: u8) -> DwStatus {
+    if status.0 == DW_STATUS_NO_RESOURCES.0 {
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        let _ = crate::debug::emit_early_capacity_record(resource.unwrap_or("unclassified"), site);
+        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+        let _ = (resource, site);
+    }
+    status
 }
 
 pub(super) fn address_transaction_status<E: AddressSpacePublishStatus>(
@@ -462,7 +580,8 @@ where
         address_region,
         deepwyrm_abi::DW_OBJECT_TYPE_ADDRESS_REGION,
         DwRights(deepwyrm_abi::DW_RIGHT_MAP.0 | deepwyrm_abi::DW_RIGHT_MODIFY.0),
-    )?;
+    )
+    .map_err(|status| note_map_capacity(status, None, MAP_SITE_REGION_RESOLVE))?;
     let region_key = crate::memory::address_region::AddressRegionObjectKey::from_object_id(
         region_resolved.object_id(),
     );
@@ -485,7 +604,11 @@ where
         Err(error) => {
             release_lookup_pin(registry, memory_resolved.into_internal(), cleanup);
             release_lookup_pin(registry, region_resolved.into_internal(), cleanup);
-            return Err(address_region_object_status(error));
+            return Err(note_map_capacity(
+                address_region_object_status(error),
+                address_region_object_capacity_resource(error),
+                MAP_SITE_REGION_PROCESS,
+            ));
         }
     };
     let operation_lease = match tasks.acquire_process_operation(target_process) {
@@ -493,7 +616,11 @@ where
         Err(error) => {
             release_lookup_pin(registry, memory_resolved.into_internal(), cleanup);
             release_lookup_pin(registry, region_resolved.into_internal(), cleanup);
-            return Err(task_status(error));
+            return Err(note_map_capacity(
+                task_status(error),
+                Some("task-authority"),
+                MAP_SITE_OPERATION_LEASE,
+            ));
         }
     };
     let region = match regions.region_mut_for_operation(tasks, &operation_lease, region_key) {
@@ -506,7 +633,11 @@ where
                 });
             release_lookup_pin(registry, memory_resolved.into_internal(), cleanup);
             release_lookup_pin(registry, region_resolved.into_internal(), cleanup);
-            return Err(address_region_object_status(error));
+            return Err(note_map_capacity(
+                address_region_object_status(error),
+                address_region_object_capacity_resource(error),
+                MAP_SITE_REGION_FOR_OPERATION,
+            ));
         }
     };
     let authorization = match region.authorize_map(memory, memory_resolved, protection) {
@@ -577,7 +708,11 @@ where
         Err(failure) => {
             let (error, releases) = failure.into_parts();
             queue_mapping_releases(cleanup, releases);
-            Err(address_transaction_status(&error))
+            Err(note_map_capacity(
+                address_transaction_status(&error),
+                address_transaction_capacity_resource(&error),
+                MAP_SITE_PUBLISH,
+            ))
         }
     }
 }

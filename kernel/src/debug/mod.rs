@@ -352,6 +352,37 @@ fn emit_bootstrap_completion_record<P: BytePortIo>(
         .map_err(|_| SerialError::TransmitTimeout)
 }
 
+/// Names the kernel resource whose exhaustion produced a `NO_RESOURCES`
+/// status, and the boundary that reported it.
+///
+/// F3A.6w. `DW_STATUS_NO_RESOURCES` is returned by at least six distinct
+/// capacity sources reachable from one `address_region_map` call -- mapping
+/// slots, region objects, the object registry, registry refcounts, page-table
+/// candidates and the address-space generation counter -- and the ABI has one
+/// value for all of them. The production Wyrmroot bootstrap exits on exactly
+/// that status while mapping bootfs (F3A.6u) and the transcript could not say
+/// which wall it hit.
+///
+/// Widening the status is an ABI change and widening the authorities with
+/// occupancy accessors would grow kernel surface for a diagnostic, so this is
+/// contract §4.2's out-of-band channel instead: the reader's own transcript,
+/// written at the boundary that still holds the typed error.
+fn emit_capacity_record<P: BytePortIo>(
+    serial: &mut Com1<P>,
+    resource: &str,
+    site: u8,
+) -> Result<(), SerialError> {
+    let _guard = OutputGuard::acquire().ok_or(SerialError::Busy)?;
+    serial
+        .write_str("[DW0][ERROR][mm] capacity-exhausted resource=")
+        .map_err(|_| SerialError::TransmitTimeout)?;
+    write_limited(serial, resource.as_bytes(), MAX_DIAGNOSTIC_MESSAGE_BYTES)?;
+    write!(serial, " site={site:02X}").map_err(|_| SerialError::TransmitTimeout)?;
+    serial
+        .write_str("\n")
+        .map_err(|_| SerialError::TransmitTimeout)
+}
+
 fn emit_cpu_state_record<P: BytePortIo>(
     serial: &mut Com1<P>,
     cpu_index: usize,
@@ -553,6 +584,19 @@ pub(crate) fn emit_early_bootstrap_completion_record(
 ) -> Result<(), SerialError> {
     let mut serial = Com1::new(X86PortIo);
     emit_bootstrap_completion_record(&mut serial, level, cause, detail, exit)
+}
+
+/// Target-only wrapper for `emit_capacity_record`, for the syscall boundaries
+/// that collapse a typed capacity error into `DW_STATUS_NO_RESOURCES`.
+///
+/// Unlike its neighbours this is *not* gated on `not(feature = "test-support")`:
+/// the syscall adapter that calls it is compiled into instrumented images too,
+/// and an instrumented build that silently lost this record would reproduce
+/// exactly the production-versus-instrumented asymmetry F3A.6s was about.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn emit_early_capacity_record(resource: &str, site: u8) -> Result<(), SerialError> {
+    let mut serial = Com1::new(X86PortIo);
+    emit_capacity_record(&mut serial, resource, site)
 }
 
 /// Emits a panic record through the kernel's COM1 diagnostic writer.

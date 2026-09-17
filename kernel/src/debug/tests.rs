@@ -329,6 +329,42 @@ fn bootstrap_completion_records_carry_the_cause_and_its_detail() {
     );
 }
 
+/// F3A.6w. `DW_STATUS_NO_RESOURCES` is one ABI value for at least six
+/// distinct kernel walls reachable from a single `address_region_map`. The
+/// production Wyrmroot bootstrap exits on that status while mapping bootfs
+/// (F3A.6u), so this record is the reader's only channel for *which* wall --
+/// and the site byte says which boundary reported it, including the
+/// handle-resolution boundary that has no typed error left to classify.
+#[test]
+fn a_capacity_record_names_the_resource_and_the_site() {
+    let _test_lock = lock_output_guard_test();
+    let mut serial = Com1::new(FakePort::ready());
+    emit_capacity_record(&mut serial, "page-table-frames", 0x06).unwrap();
+    let port = serial.io;
+    let bytes = port.bytes();
+    let text = core::str::from_utf8(&bytes[..port.write_count]).unwrap();
+    assert_eq!(
+        text,
+        "[DW0][ERROR][mm] capacity-exhausted resource=page-table-frames site=06\r\n"
+    );
+}
+
+/// An unclassifiable wall still renders, or its absence would be read as "no
+/// capacity failure happened" rather than "we could not name it".
+#[test]
+fn an_unclassified_capacity_record_still_renders() {
+    let _test_lock = lock_output_guard_test();
+    let mut serial = Com1::new(FakePort::ready());
+    emit_capacity_record(&mut serial, "unclassified", 0x01).unwrap();
+    let port = serial.io;
+    let bytes = port.bytes();
+    let text = core::str::from_utf8(&bytes[..port.write_count]).unwrap();
+    assert_eq!(
+        text,
+        "[DW0][ERROR][mm] capacity-exhausted resource=unclassified site=01\r\n"
+    );
+}
+
 /// F3A.6t. A receive failure carries the exit disposition observed in the same
 /// call, and the transcript must show both: `WouldBlock` alone says only that
 /// nothing was queued, while `exit=exited code=AF010002` says the application

@@ -1293,3 +1293,61 @@ fn two_bound_publishers_map_same_va_to_distinct_root_local_frames() {
         Err(X86AddressSpacePublishError::Identity)
     ));
 }
+
+/// F3A.6w. The publisher's four capacity walls must stay distinct.
+///
+/// This test exists because a mutation check caught its absence: collapsing
+/// `page-table-frames` onto `publisher-slots` left every other test in the
+/// tree green. `is_capacity_error` answers the syscall boundary's question
+/// with a bool, so these four named variants were already indistinguishable
+/// to a reader *before* the status was chosen. It is the highest-value
+/// collapse on the `address_region_map` path -- the path the production
+/// Wyrmroot bootstrap fails on while mapping bootfs (F3A.6u).
+#[test]
+fn the_publisher_capacity_walls_each_name_a_distinct_resource() {
+    use super::super::MapError;
+    use super::publisher::X86AddressSpacePublishError;
+
+    let cases: [(X86AddressSpacePublishError<()>, &'static str); 4] = [
+        (X86AddressSpacePublishError::Capacity, "publisher-slots"),
+        (
+            X86AddressSpacePublishError::Journal(OwnedPageTableJournalError::JournalCapacity),
+            "page-table-journal",
+        ),
+        (
+            X86AddressSpacePublishError::Map(MapError::InsufficientTableFrames),
+            "page-table-frames",
+        ),
+        (
+            X86AddressSpacePublishError::Map(MapError::Access(
+                OwnedPageTableJournalError::JournalCapacity,
+            )),
+            "page-table-journal-access",
+        ),
+    ];
+
+    let mut names = std::vec::Vec::new();
+    for (error, expected) in cases {
+        // Paired against the bool that picks the status: a variant naming a
+        // wall must be one the status boundary agrees is a capacity error.
+        assert!(
+            error.is_capacity_error(),
+            "{expected} must be a capacity error"
+        );
+        assert_eq!(error.capacity_resource(), Some(expected));
+        names.push(expected);
+    }
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), 4, "four distinct publisher walls: {names:?}");
+
+    // The converse: a non-capacity variant names nothing, or a reader would be
+    // told a resource ran out when the refusal was about identity or state.
+    for error in [
+        X86AddressSpacePublishError::<()>::Identity,
+        X86AddressSpacePublishError::<()>::InvalidMapping,
+    ] {
+        assert!(!error.is_capacity_error());
+        assert_eq!(error.capacity_resource(), None);
+    }
+}

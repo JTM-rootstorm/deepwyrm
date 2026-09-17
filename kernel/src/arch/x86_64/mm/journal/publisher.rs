@@ -25,6 +25,36 @@ impl<E> X86AddressSpacePublishError<E> {
                 ))
         )
     }
+
+    /// Names which bounded publisher resource was exhausted.
+    ///
+    /// F3A.6w. `is_capacity_error` answers the *status* question with a bool,
+    /// which is correct for choosing `NO_RESOURCES` and useless to a reader:
+    /// it erases which of four distinct walls was hit before the status is even
+    /// chosen. The production Wyrmroot bootstrap fails on that status while
+    /// mapping bootfs, and the transcript could not say which. The bool still
+    /// decides the status; this names the instance for the diagnostic channel,
+    /// per `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.2.
+    ///
+    /// Exhaustive over `Self` so a new variant must decide whether it is a
+    /// capacity failure rather than inheriting `None`.
+    pub(crate) const fn capacity_resource(&self) -> Option<&'static str> {
+        match self {
+            Self::Capacity => Some("publisher-slots"),
+            Self::Journal(OwnedPageTableJournalError::JournalCapacity) => {
+                Some("page-table-journal")
+            }
+            Self::Map(MapError::InsufficientTableFrames) => Some("page-table-frames"),
+            Self::Map(MapError::Access(OwnedPageTableJournalError::JournalCapacity)) => {
+                Some("page-table-journal-access")
+            }
+            Self::Identity
+            | Self::InvalidMapping
+            | Self::FrameRole(_)
+            | Self::Map(_)
+            | Self::Journal(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

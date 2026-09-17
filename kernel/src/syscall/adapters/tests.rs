@@ -11294,3 +11294,82 @@ fn r5d_the_finalizer_and_pin_traversals_no_longer_move_their_arrays() {
         160 * size_of::<Option<crate::object::FinalRelease>>()
     );
 }
+
+/// F3A.6w. Every capacity source reachable from `address_region_map` that
+/// collapses into one `DW_STATUS_NO_RESOURCES` must name a *distinct*
+/// resource, or the transcript still cannot say which wall the production
+/// bootstrap hit while mapping bootfs (F3A.6u).
+///
+/// The pairing is asserted against the status, not in isolation: a variant
+/// that names a resource must actually produce `NO_RESOURCES`, and one that
+/// produces it must name a resource. That is the property a reader depends on.
+#[test]
+fn every_map_capacity_source_names_a_distinct_resource() {
+    use crate::memory::address_region::{AddressRegionError, AddressRegionObjectError};
+    use crate::object::ObjectRegistryError;
+
+    let region_cases = [(AddressRegionError::Capacity, "region-mapping-slots")];
+    let object_cases = [
+        (AddressRegionObjectError::Capacity, "region-objects"),
+        (
+            AddressRegionObjectError::Registry(ObjectRegistryError::Capacity),
+            "object-registry",
+        ),
+        (
+            AddressRegionObjectError::Registry(ObjectRegistryError::ReferenceCountExhausted),
+            "object-registry-refcount",
+        ),
+        (
+            AddressRegionObjectError::Model(AddressRegionError::Capacity),
+            "region-mapping-slots",
+        ),
+    ];
+
+    let mut names = std::vec::Vec::new();
+    for (error, expected) in region_cases {
+        assert_eq!(
+            super::address_region::address_region_status(error),
+            deepwyrm_abi::DW_STATUS_NO_RESOURCES,
+            "{expected} must be a NO_RESOURCES source"
+        );
+        let named = super::address_region::address_region_capacity_resource(error);
+        assert_eq!(named, Some(expected));
+        names.push(expected);
+    }
+    for (error, expected) in object_cases {
+        assert_eq!(
+            super::address_region::address_region_object_status(error),
+            deepwyrm_abi::DW_STATUS_NO_RESOURCES,
+            "{expected} must be a NO_RESOURCES source"
+        );
+        assert_eq!(
+            super::address_region::address_region_object_capacity_resource(error),
+            Some(expected)
+        );
+        names.push(expected);
+    }
+
+    // A non-capacity error must name nothing, or a reader would be told a
+    // resource was exhausted when the refusal was about authority or state.
+    assert_eq!(
+        super::address_region::address_region_capacity_resource(AddressRegionError::Overlap),
+        None
+    );
+    assert_eq!(
+        super::address_region::address_region_object_capacity_resource(
+            AddressRegionObjectError::WrongObjectType
+        ),
+        None
+    );
+
+    // `Model(Capacity)` deliberately shares `region-mapping-slots` with the
+    // direct variant -- it is the same wall reached through a delegation --
+    // so uniqueness is asserted over the distinct walls, not the arm count.
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(
+        names.len(),
+        4,
+        "four distinct walls reach NO_RESOURCES on the region path: {names:?}"
+    );
+}
