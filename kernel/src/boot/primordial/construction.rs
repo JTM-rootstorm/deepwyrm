@@ -512,6 +512,24 @@ pub(crate) enum PrimordialCompletionError<E> {
     NotQuiescent(E),
 }
 
+/// How a backend error renders as the one number a boot transcript carries.
+///
+/// F3A.6s. `completion_record` reports a single `u32` detail beside its cause
+/// name, so every `PrimordialCompletionBackend::Error` used with it must say
+/// what that number is. The only non-test backend's error *is* a `u32` of
+/// structured cause codes (`primordial_channel_receive_error`), so that impl
+/// is the identity; the trait exists so a richer error type has to answer the
+/// question rather than defaulting to zero.
+pub(crate) trait PrimordialCompletionDetail {
+    fn completion_detail(&self) -> u32;
+}
+
+impl PrimordialCompletionDetail for u32 {
+    fn completion_detail(&self) -> u32 {
+        *self
+    }
+}
+
 /// One completion, as a diagnostic level, a cause name and a number.
 ///
 /// F3A.6q. The production arm of the x86_64 primordial completion handler read
@@ -536,27 +554,50 @@ pub(crate) enum PrimordialCompletionError<E> {
 /// compile instead of inheriting a name it has not earned. The numbers match
 /// `failure_detail`'s so an instrumented and a production transcript agree.
 ///
-/// The three variants carrying a backend error report their class and a zero
-/// detail. That payload's type varies with the build -- `u32` on the resource
-/// path, `LiveUserAccessError` on the live one -- and rendering it needs a
-/// per-type mapping this deliberately does not invent. The class is the
-/// recovered fact; the nested payload is a named next step.
-pub(crate) fn completion_record<E>(
+/// The three variants carrying a backend error render that payload through
+/// `PrimordialCompletionDetail`, so `ready-not-received` names *why* the
+/// receive failed rather than reporting a zero.
+///
+/// F3A.6s corrects F3A.6q on this point. That revision left the payload
+/// unrendered on the stated grounds that its type "varies with the build --
+/// `u32` on the resource path, `LiveUserAccessError` on the live one". That
+/// was wrong, and wrong in a way worth recording: `LiveUserAccessError` is
+/// `PrimordialPlatform::Error`, a *different* trait describing userspace
+/// memory access. The payload here is `PrimordialCompletionBackend::Error`,
+/// and that trait has exactly one non-test implementation -- `type Error =
+/// u32` on `PrimordialRuntimeCarrier`. There was never a second type to write
+/// a mapping for. The claim came from reading two `type Error` lines in one
+/// file without checking which trait each belonged to.
+///
+/// The zero also made the neighbouring claim that these numbers match
+/// `failure_detail`'s false for precisely these three variants: that mapping
+/// is declared over `PrimordialCompletionError<u32>` and returns `*detail`
+/// for each. This restores the agreement the doc comment already asserted.
+///
+/// The bound is a trait rather than a `u32` field because it keeps the
+/// obligation on the enum: a future backend carrying a richer error cannot be
+/// used here until it says how it renders as one number, instead of silently
+/// inheriting a zero.
+pub(crate) fn completion_record<E: PrimordialCompletionDetail>(
     completion: &Result<(), PrimordialCompletionError<E>>,
 ) -> (crate::debug::DiagnosticLevel, &'static str, u32) {
     use crate::debug::DiagnosticLevel;
 
     match completion {
         Ok(()) => (DiagnosticLevel::Info, "completed normally", 0),
-        Err(PrimordialCompletionError::Receive(_)) => {
-            (DiagnosticLevel::Error, "ready-not-received", 0)
-        }
+        Err(PrimordialCompletionError::Receive(error)) => (
+            DiagnosticLevel::Error,
+            "ready-not-received",
+            error.completion_detail(),
+        ),
         Err(PrimordialCompletionError::MalformedReady) => {
             (DiagnosticLevel::Error, "ready-malformed", 3)
         }
-        Err(PrimordialCompletionError::ObserveExit(_)) => {
-            (DiagnosticLevel::Error, "exit-not-observed", 0)
-        }
+        Err(PrimordialCompletionError::ObserveExit(error)) => (
+            DiagnosticLevel::Error,
+            "exit-not-observed",
+            error.completion_detail(),
+        ),
         // The one variant whose payload is unconditionally numeric, and the
         // one worth the most: this is the userspace application status, which
         // for a WYR1 product is the whole `0xAF..` failure encoding the F3A
@@ -570,9 +611,11 @@ pub(crate) fn completion_record<E>(
         Err(PrimordialCompletionError::AuthorizedTermination) => {
             (DiagnosticLevel::Error, "authorized-termination", 6)
         }
-        Err(PrimordialCompletionError::NotQuiescent(_)) => {
-            (DiagnosticLevel::Error, "not-quiescent", 0)
-        }
+        Err(PrimordialCompletionError::NotQuiescent(error)) => (
+            DiagnosticLevel::Error,
+            "not-quiescent",
+            error.completion_detail(),
+        ),
     }
 }
 

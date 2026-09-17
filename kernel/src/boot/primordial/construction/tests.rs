@@ -688,9 +688,9 @@ fn completion_records_name_every_variant_and_keep_the_exit_code() {
     let cases: Vec<Expectation> = vec![
         (Ok(()), "completed normally", 0),
         (
-            Err(PrimordialCompletionError::Receive(9)),
+            Err(PrimordialCompletionError::Receive(0x7100_0017)),
             "ready-not-received",
-            0,
+            0x7100_0017,
         ),
         (
             Err(PrimordialCompletionError::MalformedReady),
@@ -698,9 +698,9 @@ fn completion_records_name_every_variant_and_keep_the_exit_code() {
             3,
         ),
         (
-            Err(PrimordialCompletionError::ObserveExit(9)),
+            Err(PrimordialCompletionError::ObserveExit(0x7100_0016)),
             "exit-not-observed",
-            0,
+            0x7100_0016,
         ),
         (
             Err(PrimordialCompletionError::NonzeroExit(0xAF21_0B41)),
@@ -718,9 +718,9 @@ fn completion_records_name_every_variant_and_keep_the_exit_code() {
             6,
         ),
         (
-            Err(PrimordialCompletionError::NotQuiescent(9)),
+            Err(PrimordialCompletionError::NotQuiescent(0x7100_0015)),
             "not-quiescent",
-            0,
+            0x7100_0015,
         ),
     ];
 
@@ -738,6 +738,13 @@ fn completion_records_name_every_variant_and_keep_the_exit_code() {
         assert_eq!(level, expected, "{cause} has the wrong level");
         names.push(observed_cause);
     }
+
+    // F3A.6s. The three payload-bearing variants are given distinct codes
+    // above precisely so this test fails if `completion_record` ever renders a
+    // constant -- a zero, or one payload for all three -- instead of each
+    // variant's own carried value. The codes are real
+    // `primordial_channel_receive_error` encodings: BufferTooSmall,
+    // PeerClosed, WouldBlock.
 
     // No two causes share a name, or a transcript still could not tell them
     // apart -- which is the entire defect this replaced.
