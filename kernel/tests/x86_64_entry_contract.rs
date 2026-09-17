@@ -680,8 +680,14 @@ fn selector33_e8_profile_is_additive_exact_and_private() {
     assert!(activation.contains(
         "#[cfg(deepwyrm_wyr1e8_evidence)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 64;"
     ));
+    // F3A.6p widened the negation. Selector 33's *behaviour* is unchanged --
+    // E8 still selects 64 and a build with neither selector still gets the
+    // ordinary 16 -- but the WYR1-F fairness ledger needs the same 64-stack
+    // arena under its own cfg, so the sixteen arm now excludes both. Pinned
+    // at the new exact text rather than loosened to a prefix: this assertion
+    // exists to notice a change to that line, and a prefix would stop.
     assert!(kernel_stack.contains(
-        "#[cfg(not(deepwyrm_wyr1e8_evidence))]\npub(crate) const E3_THREAD_STACK_COUNT: usize = 16;"
+        "#[cfg(not(any(deepwyrm_wyr1e8_evidence, deepwyrm_wyr1f_fairness_evidence)))]\npub(crate) const E3_THREAD_STACK_COUNT: usize = 16;"
     ));
     assert!(kernel_stack.contains(
         "#[cfg(deepwyrm_wyr1e8_evidence)]\npub(crate) const E3_THREAD_STACK_COUNT: usize = 64;"

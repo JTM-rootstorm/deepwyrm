@@ -671,3 +671,78 @@ fn retirement_fact_split_samples_exit_without_consuming_quiescence() {
         Err(PrimordialCompletionError::MalformedReady)
     );
 }
+
+/// F3A.6q. Seven variants, seven answers. The production arm used to emit one
+/// sentence for six of them at the last boundary in the boot, and the exit
+/// code -- a WYR1 product's whole `0xAF..` failure encoding -- sat inside the
+/// variant that got discarded.
+#[test]
+fn completion_records_name_every_variant_and_keep_the_exit_code() {
+    /// One expected answer: the completion, its cause name, its detail.
+    type Expectation = (
+        Result<(), PrimordialCompletionError<u32>>,
+        &'static str,
+        u32,
+    );
+
+    let cases: Vec<Expectation> = vec![
+        (Ok(()), "completed normally", 0),
+        (
+            Err(PrimordialCompletionError::Receive(9)),
+            "ready-not-received",
+            0,
+        ),
+        (
+            Err(PrimordialCompletionError::MalformedReady),
+            "ready-malformed",
+            3,
+        ),
+        (
+            Err(PrimordialCompletionError::ObserveExit(9)),
+            "exit-not-observed",
+            0,
+        ),
+        (
+            Err(PrimordialCompletionError::NonzeroExit(0xAF21_0B41)),
+            "nonzero-exit",
+            0xAF21_0B41,
+        ),
+        (
+            Err(PrimordialCompletionError::UnhandledException),
+            "unhandled-exception",
+            5,
+        ),
+        (
+            Err(PrimordialCompletionError::AuthorizedTermination),
+            "authorized-termination",
+            6,
+        ),
+        (
+            Err(PrimordialCompletionError::NotQuiescent(9)),
+            "not-quiescent",
+            0,
+        ),
+    ];
+
+    let mut names = Vec::new();
+    for (index, (completion, cause, detail)) in cases.into_iter().enumerate() {
+        let (level, observed_cause, observed_detail) = completion_record(&completion);
+        assert_eq!(observed_cause, cause);
+        assert_eq!(observed_detail, detail, "{cause} lost its detail");
+        // Only success is informational; every failure is an error.
+        let expected = if index == 0 {
+            crate::debug::DiagnosticLevel::Info
+        } else {
+            crate::debug::DiagnosticLevel::Error
+        };
+        assert_eq!(level, expected, "{cause} has the wrong level");
+        names.push(observed_cause);
+    }
+
+    // No two causes share a name, or a transcript still could not tell them
+    // apart -- which is the entire defect this replaced.
+    let total = names.len();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), total, "two completion causes share a name");
+}

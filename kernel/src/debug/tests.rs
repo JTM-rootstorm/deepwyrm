@@ -302,6 +302,49 @@ fn ordinary_records_have_bounded_fields() {
     assert!(text.ends_with("...\r\n"));
 }
 
+/// F3A.6q. The last diagnostic boundary in the boot used to emit one sentence
+/// for six distinct completion failures. The renderer must carry both the
+/// cause's name and its number, and the number must be the full eight hex
+/// digits: a WYR1 application status is `0xAF21_0B41`-shaped, and a truncated
+/// or decimal rendering would cost the reader the encoding the product spent
+/// nine revisions building.
+#[test]
+fn bootstrap_completion_records_carry_the_cause_and_its_detail() {
+    let _test_lock = lock_output_guard_test();
+    let mut serial = Com1::new(FakePort::ready());
+    emit_bootstrap_completion_record(
+        &mut serial,
+        DiagnosticLevel::Error,
+        "nonzero-exit",
+        0xAF21_0B41,
+    )
+    .unwrap();
+    let port = serial.io;
+    let bytes = port.bytes();
+    let text = core::str::from_utf8(&bytes[..port.write_count]).unwrap();
+    assert_eq!(
+        text,
+        "[DW0][ERROR][primordial] bootstrap nonzero-exit detail=AF210B41\r\n"
+    );
+}
+
+/// A cause with no number of its own still renders a full-width zero rather
+/// than an empty field, so a transcript is parseable by one rule.
+#[test]
+fn a_bootstrap_completion_cause_without_a_detail_still_renders_one() {
+    let _test_lock = lock_output_guard_test();
+    let mut serial = Com1::new(FakePort::ready());
+    emit_bootstrap_completion_record(&mut serial, DiagnosticLevel::Info, "completed normally", 0)
+        .unwrap();
+    let port = serial.io;
+    let bytes = port.bytes();
+    let text = core::str::from_utf8(&bytes[..port.write_count]).unwrap();
+    assert_eq!(
+        text,
+        "[DW0][INFO][primordial] bootstrap completed normally detail=00000000\r\n"
+    );
+}
+
 #[test]
 fn smp_records_identify_cpu_apic_and_state() {
     let _test_lock = lock_output_guard_test();

@@ -512,6 +512,70 @@ pub(crate) enum PrimordialCompletionError<E> {
     NotQuiescent(E),
 }
 
+/// One completion, as a diagnostic level, a cause name and a number.
+///
+/// F3A.6q. The production arm of the x86_64 primordial completion handler read
+/// `Err(_)` over this enum and emitted one sentence for six of its seven
+/// variants, at the last diagnostic boundary in the boot -- that arm emits and
+/// then halts in `sti; hlt`, so nothing downstream can recover what it drops.
+/// `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.3 requires a diagnostic boundary
+/// to preserve the instance, and an instrumented build already did: the same
+/// value reached `G5PrimordialProbe::failure_detail`, which is exhaustive and
+/// returns the exit code. A production build got prose. That asymmetry is why
+/// the F3A campaign diagnosed the instrumented sibling for nine revisions
+/// while the production product's own failure stayed one sentence.
+///
+/// It lives beside the error rather than beside the emitter deliberately. The
+/// mapping is a property of this enum, not of an architecture, and
+/// `arch::x86_64::mm::activation::primordial` is compiled only for an
+/// integrated target build -- so a mapping placed there could not be tested at
+/// all, and dropping the exit code would have turned no test red. Here it is
+/// exercised by `completion_records_name_every_variant_and_keep_the_exit_code`.
+///
+/// The match is exhaustive rather than defaulting, so a new variant fails to
+/// compile instead of inheriting a name it has not earned. The numbers match
+/// `failure_detail`'s so an instrumented and a production transcript agree.
+///
+/// The three variants carrying a backend error report their class and a zero
+/// detail. That payload's type varies with the build -- `u32` on the resource
+/// path, `LiveUserAccessError` on the live one -- and rendering it needs a
+/// per-type mapping this deliberately does not invent. The class is the
+/// recovered fact; the nested payload is a named next step.
+pub(crate) fn completion_record<E>(
+    completion: &Result<(), PrimordialCompletionError<E>>,
+) -> (crate::debug::DiagnosticLevel, &'static str, u32) {
+    use crate::debug::DiagnosticLevel;
+
+    match completion {
+        Ok(()) => (DiagnosticLevel::Info, "completed normally", 0),
+        Err(PrimordialCompletionError::Receive(_)) => {
+            (DiagnosticLevel::Error, "ready-not-received", 0)
+        }
+        Err(PrimordialCompletionError::MalformedReady) => {
+            (DiagnosticLevel::Error, "ready-malformed", 3)
+        }
+        Err(PrimordialCompletionError::ObserveExit(_)) => {
+            (DiagnosticLevel::Error, "exit-not-observed", 0)
+        }
+        // The one variant whose payload is unconditionally numeric, and the
+        // one worth the most: this is the userspace application status, which
+        // for a WYR1 product is the whole `0xAF..` failure encoding the F3A
+        // campaign spent nine revisions building.
+        Err(PrimordialCompletionError::NonzeroExit(code)) => {
+            (DiagnosticLevel::Error, "nonzero-exit", *code)
+        }
+        Err(PrimordialCompletionError::UnhandledException) => {
+            (DiagnosticLevel::Error, "unhandled-exception", 5)
+        }
+        Err(PrimordialCompletionError::AuthorizedTermination) => {
+            (DiagnosticLevel::Error, "authorized-termination", 6)
+        }
+        Err(PrimordialCompletionError::NotQuiescent(_)) => {
+            (DiagnosticLevel::Error, "not-quiescent", 0)
+        }
+    }
+}
+
 /// Kernel-peer/structured-task adapter for the bounded G2 host gate.
 pub(crate) trait PrimordialCompletionBackend {
     type Error;

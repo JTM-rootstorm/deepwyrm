@@ -324,6 +324,22 @@ fn emit_record<P: BytePortIo>(
         reason = "production CPU lifecycle diagnostics are omitted from test images"
     )
 )]
+fn emit_bootstrap_completion_record<P: BytePortIo>(
+    serial: &mut Com1<P>,
+    level: DiagnosticLevel,
+    cause: &str,
+    detail: u32,
+) -> Result<(), SerialError> {
+    let _guard = OutputGuard::acquire().ok_or(SerialError::Busy)?;
+    write!(serial, "[DW0][{}][primordial] bootstrap ", level.label())
+        .map_err(|_| SerialError::TransmitTimeout)?;
+    write_limited(serial, cause.as_bytes(), MAX_DIAGNOSTIC_MESSAGE_BYTES)?;
+    write!(serial, " detail={detail:08X}").map_err(|_| SerialError::TransmitTimeout)?;
+    serial
+        .write_str("\n")
+        .map_err(|_| SerialError::TransmitTimeout)
+}
+
 fn emit_cpu_state_record<P: BytePortIo>(
     serial: &mut Com1<P>,
     cpu_index: usize,
@@ -496,6 +512,34 @@ pub(crate) fn emit_early_cpu_state_record(
 ) -> Result<(), SerialError> {
     let mut serial = Com1::new(X86PortIo);
     emit_cpu_state_record(&mut serial, cpu_index, local_apic_id, state)
+}
+
+#[cfg(all(
+    not(feature = "test-support"),
+    target_os = "none",
+    target_arch = "x86_64"
+))]
+/// Emits the primordial bootstrap's completion record with its cause.
+///
+/// F3A.6q. The production arm of `primordial`'s completion handler matched
+/// `Err(_)` over a seven-variant error and emitted one sentence for six of
+/// them, at the last diagnostic boundary of the boot -- the arm emits and then
+/// halts. `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.3 says a diagnostic
+/// boundary must preserve the instance, and this is the boundary with nothing
+/// downstream of it.
+///
+/// `detail` is the variant's own numeric cause where it has one -- a nonzero
+/// exit carries the userspace application status, which is the value a WYR1
+/// product spends its whole failure encoding producing -- and the variant's
+/// fixed code otherwise, matching `G5PrimordialProbe::failure_detail`'s
+/// numbering so an instrumented and a production transcript agree.
+pub(crate) fn emit_early_bootstrap_completion_record(
+    level: DiagnosticLevel,
+    cause: &str,
+    detail: u32,
+) -> Result<(), SerialError> {
+    let mut serial = Com1::new(X86PortIo);
+    emit_bootstrap_completion_record(&mut serial, level, cause, detail)
 }
 
 /// Emits a panic record through the kernel's COM1 diagnostic writer.

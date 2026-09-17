@@ -4367,21 +4367,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         #[cfg(not(feature = "test-support"))]
         {
-            let (level, message) = match completion {
-                Ok(()) => (
-                    crate::debug::DiagnosticLevel::Info,
-                    "Wyrmroot bootstrap completed normally",
-                ),
-                Err(crate::boot::primordial::construction::PrimordialCompletionError::UnhandledException) => (
-                    crate::debug::DiagnosticLevel::Error,
-                    "Wyrmroot bootstrap terminated after an unhandled userspace exception",
-                ),
-                Err(_) => (
-                    crate::debug::DiagnosticLevel::Error,
-                    "Wyrmroot bootstrap terminated with a structured completion failure",
-                ),
-            };
-            let _ = crate::debug::emit_early_record(level, "primordial", message);
+            let (level, cause, detail) =
+                crate::boot::primordial::construction::completion_record(&completion);
+            let _ = crate::debug::emit_early_bootstrap_completion_record(level, cause, detail);
             loop {
                 unsafe {
                     core::arch::asm!("sti", "hlt", options(nomem, nostack));
@@ -4911,21 +4899,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         #[cfg(not(feature = "test-support"))]
         {
-            let (level, message) = match completion {
-                Ok(()) => (
-                    crate::debug::DiagnosticLevel::Info,
-                    "Wyrmroot bootstrap completed normally",
-                ),
-                Err(crate::boot::primordial::construction::PrimordialCompletionError::UnhandledException) => (
-                    crate::debug::DiagnosticLevel::Error,
-                    "Wyrmroot bootstrap terminated after an unhandled userspace exception",
-                ),
-                Err(_) => (
-                    crate::debug::DiagnosticLevel::Error,
-                    "Wyrmroot bootstrap terminated with a structured completion failure",
-                ),
-            };
-            let _ = crate::debug::emit_early_record(level, "primordial", message);
+            let (level, cause, detail) =
+                crate::boot::primordial::construction::completion_record(&completion);
+            let _ = crate::debug::emit_early_bootstrap_completion_record(level, cause, detail);
             loop {
                 unsafe {
                     core::arch::asm!("sti", "hlt", options(nomem, nostack));
