@@ -383,6 +383,40 @@ fn emit_capacity_record<P: BytePortIo>(
         .map_err(|_| SerialError::TransmitTimeout)
 }
 
+/// Emits one bounded record for a supervised process reaching its terminal
+/// retirement.
+///
+/// F3A.7h. Production said nothing when a process died. Every branch of the
+/// terminal handoff that names a retiring WYR1 primordial or child is behind
+/// an evidence cfg, so an instrumented image could describe the shutdown of
+/// its own supervision tree and the production image it is supposed to stand
+/// for could not -- the same asymmetry F3A.6s and F3A.7f were each about, at
+/// the one boundary where a run ends.
+///
+/// `application` is the exiting process's own status word, which is what a
+/// WYR1 product spends its whole failure encoding producing, and `reason` is
+/// the kernel's termination classification. `primordial` says whether the
+/// primordial process is still live, because a child retiring while it is and
+/// a child retiring after it is are different points in the same shutdown.
+fn emit_process_retirement_record<P: BytePortIo>(
+    serial: &mut Com1<P>,
+    application: u32,
+    reason: u32,
+    primordial_live: bool,
+) -> Result<(), SerialError> {
+    let _guard = OutputGuard::acquire().ok_or(SerialError::Busy)?;
+    let primordial = if primordial_live { "live" } else { "retired" };
+    write!(
+        serial,
+        "[DW0][INFO][task] retired application={application:08X} reason={reason} \
+         primordial={primordial}"
+    )
+    .map_err(|_| SerialError::TransmitTimeout)?;
+    serial
+        .write_str("\n")
+        .map_err(|_| SerialError::TransmitTimeout)
+}
+
 fn emit_cpu_state_record<P: BytePortIo>(
     serial: &mut Com1<P>,
     cpu_index: usize,
@@ -540,6 +574,21 @@ pub(crate) fn emit_early_record(
 ) -> Result<(), SerialError> {
     let mut serial = Com1::new(X86PortIo);
     emit_record(&mut serial, level, subsystem, message)
+}
+
+/// Target-only wrapper for `emit_process_retirement_record`.
+#[cfg(all(
+    not(feature = "test-support"),
+    target_os = "none",
+    target_arch = "x86_64"
+))]
+pub(crate) fn emit_early_process_retirement_record(
+    application: u32,
+    reason: u32,
+    primordial_live: bool,
+) -> Result<(), SerialError> {
+    let mut serial = Com1::new(X86PortIo);
+    emit_process_retirement_record(&mut serial, application, reason, primordial_live)
 }
 
 /// Emits one allocation-free CPU identity/lifecycle record through COM1.

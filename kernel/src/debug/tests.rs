@@ -416,6 +416,50 @@ fn a_bootstrap_completion_cause_without_a_detail_still_renders_one() {
     );
 }
 
+/// F3A.7h. The record exists so a production transcript can say what exited
+/// and with what status, so the status is checked as a literal rather than as
+/// "some hex": a run reads `application=` to tell a clean supervisor shutdown
+/// from a failure status, and a field that rendered decimally, truncated, or
+/// dropped its leading zeroes would be read wrong rather than not read.
+#[test]
+fn process_retirement_records_carry_the_exit_status_and_the_primordial_state() {
+    let _test_lock = lock_output_guard_test();
+
+    let rendered = |application, reason, primordial_live, expected: &str| {
+        let mut serial = Com1::new(FakePort::ready());
+        emit_process_retirement_record(&mut serial, application, reason, primordial_live).unwrap();
+        let port = serial.io;
+        let bytes = port.bytes();
+        assert_eq!(
+            core::str::from_utf8(&bytes[..port.write_count]).unwrap(),
+            expected
+        );
+    };
+
+    rendered(
+        0,
+        1,
+        true,
+        "[DW0][INFO][task] retired application=00000000 reason=1 primordial=live\r\n",
+    );
+    // A supervisor that ended a session exits zero; one that failed carries
+    // its own encoding, and `0xAF01_0005` is a real one from `system-init`.
+    rendered(
+        0xAF01_0005,
+        1,
+        false,
+        "[DW0][INFO][task] retired application=AF010005 reason=1 primordial=retired\r\n",
+    );
+    // An unhandled exception leaves the status field meaningless, which is
+    // exactly why the reason travels with it.
+    rendered(
+        0,
+        3,
+        false,
+        "[DW0][INFO][task] retired application=00000000 reason=3 primordial=retired\r\n",
+    );
+}
+
 #[test]
 fn smp_records_identify_cpu_apic_and_state() {
     let _test_lock = lock_output_guard_test();

@@ -4104,6 +4104,25 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
 
         if retirement.retired_process != self.primordial_process {
+            // F3A.7h. The one production record of a supervised process
+            // ending. Every branch above that could say this is behind an
+            // evidence cfg, so a production image reached its own shutdown
+            // silently: the F3A.7g runs could see that the domain had not
+            // powered off and could not see whether anything had exited.
+            //
+            // Emitted before the root switch, while this process's own
+            // termination information is still readable, and ignored on
+            // failure -- a busy COM1 must not change a retirement.
+            #[cfg(not(feature = "test-support"))]
+            if let Ok(info) = self.tasks.process_info(retirement.retired_process) {
+                let primordial_live =
+                    matches!(self.tasks.root_region(self.primordial_process), Ok(Some(_)));
+                let _ = crate::debug::emit_early_process_retirement_record(
+                    info.application_code,
+                    info.reason.0,
+                    primordial_live,
+                );
+            }
             if crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
                 != Some(self.cpu.index())
             {
