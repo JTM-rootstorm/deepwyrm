@@ -583,6 +583,13 @@ const SELECTOR_ENVIRONMENTS: [(&str, &[(&str, &str)]); 12] = [
 /// the uninstrumented kernel actually has.
 const PRODUCTION_KERNEL_ROW: (Option<&str>, &[(&str, &str)]) = (None, &[]);
 
+/// `(label, selector, environment)`: see `SELECTOR_VARIANTS`.
+type SelectorVariant = (
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+);
+
 /// Second configurations of an existing selector rather than selectors of their
 /// own, so the manifest does not list them: `(label, selector, environment)`.
 /// Each row's environment is complete; `SELECTOR_ENVIRONMENTS` is not merged in.
@@ -591,7 +598,7 @@ const PRODUCTION_KERNEL_ROW: (Option<&str>, &[(&str, &str)]) = (None, &[]);
 ///   sixty-four-stack arena (`deepwyrm_wyr1e8_evidence`).
 /// - E3B-full is selector 31's private full-path cfg
 ///   (`deepwyrm_dw1e_e3b_full`), which `build.rs` emits only for that selector.
-const SELECTOR_VARIANTS: [(&str, &str, &[(&str, &str)]); 2] = [
+const SELECTOR_VARIANTS: [SelectorVariant; 2] = [
     (
         "interactive-wyrmsh+wyr1e8",
         "interactive-wyrmsh",
