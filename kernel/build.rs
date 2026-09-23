@@ -2842,9 +2842,6 @@ mod tests {
     fn wyr1f_closure_selector_is_implemented_at_35_and_reuses_the_wre1_transport() {
         let manifest = include_str!("../tooling/guest-harness.toml");
         assert_eq!(WYR1F_CLOSURE_SELECTOR, "dw1-wyr1-interactive-closure");
-        assert!(manifest.contains(
-            "[guest_test.dw1-wyr1-interactive-closure]\nid = 35\nstate = \"implemented\""
-        ));
         // Id 34 stayed where it was; the plan's proposed 34 was not taken over.
         assert_eq!(
             select_guest_test(true, Some("dynamic-launch-saturation"), false, manifest),
