@@ -1221,6 +1221,53 @@ mod tests {
         );
     }
 
+    /// F3A.7k. The primordial completion arm powers off, so it must be
+    /// reached only when the primordial is the last Process. A primordial
+    /// retiring while others live -- bootstrap on SMP -- retires to idle.
+    #[test]
+    fn a_primordial_retiring_before_the_last_process_idles_instead_of_completing() {
+        const PRIMORDIAL: &str = include_str!("../mm/activation/primordial.rs");
+        let squeeze = |text: &str| -> std::string::String {
+            text.chars().filter(|c| !c.is_whitespace()).collect()
+        };
+        let start = PRIMORDIAL
+            .find("fn prepare_terminal_handoff_detached(")
+            .expect("the detached terminal path is gone");
+        let end = start
+            + PRIMORDIAL[start..]
+                .find("fn finish_terminal_successor(")
+                .expect("the detached terminal path never ends");
+        let body = squeeze(&PRIMORDIAL[start..end]);
+
+        let completion = body
+            .rfind("self.finish_primordial_terminal_handoff(")
+            .expect("the primordial completion arm is gone");
+        let guard = body[..completion]
+            .rfind("ifself.tasks.any_process_unexited_except(retirement.retired_process){")
+            .expect("the primordial completion arm is not guarded by the last-Process check");
+        let retire = body[guard..completion]
+            .find("TerminalKernelContinuation::RetirePrimordialToIdle{")
+            .expect("a primordial that is not last must retire to idle");
+        // The guarded block returns before the completion arm can run.
+        assert!(body[guard..guard + retire].contains("returnPreparedTerminalStep::KernelRoot{"));
+        assert!(body[guard..guard + retire].contains("self.unmap_primordial_userspace(&proof)"));
+
+        let arm_start = PRIMORDIAL
+            .find(
+                "TerminalKernelContinuation::RetirePrimordialToIdle {\n                retirement,",
+            )
+            .expect("the retire-to-idle continuation is never handled");
+        let arm = squeeze(&PRIMORDIAL[arm_start..arm_start + 900]);
+        let retired = arm
+            .find("self.finish_quiesced_process_root_retirement(")
+            .expect("the continuation does not retire the primordial root");
+        let idle = arm
+            .find("PreparedTerminalStep::Final(PreparedTerminalHandoff::IdleScheduler)")
+            .expect("the continuation does not idle");
+        assert!(retired < idle);
+        assert!(!arm[..idle].contains("soft_off_then_halt"));
+    }
+
     #[test]
     fn the_power_off_path_writes_pm1_control_before_it_halts() {
         const POWER: &str = include_str!("../power.rs");

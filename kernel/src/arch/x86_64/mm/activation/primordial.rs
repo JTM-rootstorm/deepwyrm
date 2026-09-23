@@ -2046,6 +2046,15 @@ enum TerminalKernelContinuation {
     },
     EnterPrimordialPublisher(TerminalRetirementState),
     FinishGenericChild(TerminalRetirementState),
+    /// F3A.7k. Production's primordial retiring while other Processes live,
+    /// with nothing runnable on its own CPU. The userspace half is already
+    /// unmapped; the root is retired from the kernel root and the CPU idles.
+    #[cfg(not(feature = "test-support"))]
+    RetirePrimordialToIdle {
+        retirement: TerminalRetirementState,
+        proof: crate::task::ProcessQuiescenceProof,
+        drained: crate::task::BlockedOperationsDrained,
+    },
 }
 
 enum PreparedTerminalStep {
@@ -4160,6 +4169,43 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             };
         }
 
+        // F3A.7k. Reaching here means the primordial is retiring with nothing
+        // runnable on this CPU, which is completion only if it is also the
+        // last Process. Under WYR1 on more than one CPU it is not: bootstrap
+        // exits while init runs elsewhere, and the completion arm below found
+        // the system not quiescent and -- since F3A.7f -- powered the machine
+        // off mid-boot (F3A.7 q2, normal/smp). Retire it the way the
+        // instrumented `RetireWyr1Primordial` does, without the evidence
+        // reporter, and idle this CPU. The address space stays: it is the idle
+        // carrier's publisher root, which `finish_quiesced_process_root_
+        // retirement` never tears down for the primordial.
+        #[cfg(not(feature = "test-support"))]
+        if self
+            .tasks
+            .any_process_unexited_except(retirement.retired_process)
+        {
+            let proof = self
+                .tasks
+                .process_quiescence_proof(retirement.retired_process)
+                .unwrap_or_else(|error| panic!("retiring primordial is not quiescent: {error:?}"));
+            let drained = self
+                .shared
+                .execution
+                .blocked_operations_drained(&self.tasks, &proof)
+                .unwrap_or_else(|_| panic!("retiring primordial kept blocked operations"));
+            self.unmap_primordial_userspace(&proof)
+                .unwrap_or_else(|()| panic!("retiring primordial userspace unmap failed"));
+            let prepared = self.prepare_terminal_kernel_root_switch();
+            return PreparedTerminalStep::KernelRoot {
+                prepared,
+                continuation: TerminalKernelContinuation::RetirePrimordialToIdle {
+                    retirement,
+                    proof,
+                    drained,
+                },
+            };
+        }
+
         PreparedTerminalStep::Final(self.finish_primordial_terminal_handoff(
             #[cfg(deepwyrm_dw1c_evidence)]
             retirement.product_execution_generation,
@@ -4344,6 +4390,22 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 self.root_key = self.primordial_root_key;
                 self.local.record_idle();
                 drop(retirement);
+                PreparedTerminalStep::Final(PreparedTerminalHandoff::IdleScheduler)
+            }
+            #[cfg(not(feature = "test-support"))]
+            TerminalKernelContinuation::RetirePrimordialToIdle {
+                retirement,
+                proof,
+                drained,
+            } => {
+                self.finish_quiesced_process_root_retirement(
+                    retirement.retired_process,
+                    retirement.retired_address_space,
+                    &proof,
+                    drained,
+                )
+                .unwrap_or_else(|()| panic!("primordial root retirement failed"));
+                self.local.record_idle();
                 PreparedTerminalStep::Final(PreparedTerminalHandoff::IdleScheduler)
             }
         }
