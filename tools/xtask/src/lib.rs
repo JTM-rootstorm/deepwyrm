@@ -565,20 +565,103 @@ const SELECTOR_ENVIRONMENTS: [(&str, &[(&str, &str)]); 12] = [
     ),
 ];
 
-/// The E8 evidence surface: a second configuration of one selector rather than
-/// a selector of its own, so the manifest does not list it separately.
 /// The no-selector production kernel. `None` means the selector environment
 /// variable is removed rather than set, which is the shape a product build of
 /// the uninstrumented kernel actually has.
 const PRODUCTION_KERNEL_ROW: (Option<&str>, &[(&str, &str)]) = (None, &[]);
 
-const WYR1E8_SELECTOR: (&str, &[(&str, &str)]) = (
-    "interactive-wyrmsh",
-    &[
-        ("DEEPWYRM_WYR1E8_EVIDENCE", "1"),
-        ("DEEPWYRM_WYR1E8_EVIDENCE_NONCE", "E800000000000001"),
-    ],
-);
+/// Second configurations of an existing selector rather than selectors of their
+/// own, so the manifest does not list them: `(label, selector, environment)`.
+/// Each row's environment is complete; `SELECTOR_ENVIRONMENTS` is not merged in.
+///
+/// - E8 evidence swaps selector 33's E7 nonce for its own and links the
+///   sixty-four-stack arena (`deepwyrm_wyr1e8_evidence`).
+/// - E3B-full is selector 31's private full-path cfg
+///   (`deepwyrm_dw1e_e3b_full`), which `build.rs` emits only for that selector.
+const SELECTOR_VARIANTS: [(&str, &str, &[(&str, &str)]); 2] = [
+    (
+        "interactive-wyrmsh+wyr1e8",
+        "interactive-wyrmsh",
+        &[
+            ("DEEPWYRM_WYR1E8_EVIDENCE", "1"),
+            ("DEEPWYRM_WYR1E8_EVIDENCE_NONCE", "E800000000000001"),
+        ],
+    ),
+    (
+        "q35-com2-interrupt+e3b-full",
+        "q35-com2-interrupt",
+        &[
+            ("DEEPWYRM_DW1E_EVIDENCE_NONCE", "0000000000000001"),
+            ("DEEPWYRM_DW1E_E3B_FULL", "1"),
+        ],
+    ),
+];
+
+/// One selector build configuration: every implemented selector with its
+/// `SELECTOR_ENVIRONMENTS` row, then every `SELECTOR_VARIANTS` row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SelectorBuild<'a> {
+    label: &'a str,
+    selector: &'a str,
+    environment: &'a [(&'static str, &'static str)],
+}
+
+/// The single list of selector build configurations every selector gate reads.
+fn selector_builds(selectors: &[String]) -> Vec<SelectorBuild<'_>> {
+    selectors
+        .iter()
+        .map(|selector| SelectorBuild {
+            label: selector,
+            selector,
+            environment: SELECTOR_ENVIRONMENTS
+                .iter()
+                .find(|(name, _)| name == selector)
+                .map_or(&[][..], |(_, environment)| environment),
+        })
+        .chain(
+            SELECTOR_VARIANTS
+                .iter()
+                .map(|(label, selector, environment)| SelectorBuild {
+                    label,
+                    selector,
+                    environment,
+                }),
+        )
+        .collect()
+}
+
+/// Removes every variable a selector row can set, so a value left in the
+/// caller's shell cannot leak into a row that does not name it.
+fn clear_selector_environment(command: &mut Command) {
+    command.env_remove("DEEPWYRM_GUEST_TEST_SELECTOR");
+    let rows = SELECTOR_ENVIRONMENTS
+        .iter()
+        .flat_map(|(_, environment)| environment.iter())
+        .chain(
+            SELECTOR_VARIANTS
+                .iter()
+                .flat_map(|(_, _, environment)| environment.iter()),
+        );
+    for (name, _) in rows {
+        command.env_remove(name);
+    }
+}
+
+/// Reads the implemented selectors from the harness manifest, refusing an empty
+/// parse: a gate over zero selectors would pass without checking anything.
+fn read_implemented_guest_selectors() -> io::Result<Option<Vec<String>>> {
+    let manifest = fs::read_to_string(workspace_root().join(HARNESS_CONFIG))?;
+    let selectors = implemented_guest_selectors(&manifest);
+    if selectors.is_empty() {
+        let mut stderr = io::stderr().lock();
+        writeln!(
+            stderr,
+            "error: the guest harness manifest lists no implemented selectors"
+        )?;
+        return Ok(None);
+    }
+    Ok(Some(selectors))
+}
 
 /// Reads the implemented guest selectors from the harness manifest.
 ///
@@ -621,26 +704,10 @@ fn implemented_guest_selectors(manifest: &str) -> Vec<String> {
 fn run_selector_library_checks() -> io::Result<u8> {
     let workspace = workspace_root();
     let lane = workspace.join("tools/pinned-cargo");
-    let manifest = fs::read_to_string(workspace.join("tooling/guest-harness.toml"))?;
-    let selectors = implemented_guest_selectors(&manifest);
-    if selectors.is_empty() {
-        let mut stderr = io::stderr().lock();
-        writeln!(
-            stderr,
-            "error: the guest harness manifest lists no implemented selectors"
-        )?;
+    let Some(selectors) = read_implemented_guest_selectors()? else {
         return Ok(EXIT_NOT_IMPLEMENTED);
-    }
-    let rows = selectors
-        .iter()
-        .map(|selector| {
-            let environment = SELECTOR_ENVIRONMENTS
-                .iter()
-                .find(|(name, _)| name == selector)
-                .map_or(&[][..], |(_, environment)| environment);
-            (selector.as_str(), environment)
-        })
-        .chain(core::iter::once(WYR1E8_SELECTOR));
+    };
+    let builds = selector_builds(&selectors);
     // The production kernel is the shape no selector selects, and until
     // DW1-F/WYR1-F F1A.2 nothing ever compiled it on the target lane: every row
     // above sets `DEEPWYRM_GUEST_TEST_SELECTOR`. That gap is how the q35 IOAPIC
@@ -648,17 +715,17 @@ fn run_selector_library_checks() -> io::Result<u8> {
     // anything noticing -- an uninstrumented kernel compiled fine, it just had
     // no interrupt-driven console. Check it first, because a production break
     // matters more than a selector break.
-    let rows = core::iter::once(PRODUCTION_KERNEL_ROW).chain(rows.map(|(s, e)| (Some(s), e)));
+    let rows = core::iter::once((None, PRODUCTION_KERNEL_ROW.1)).chain(
+        builds
+            .iter()
+            .map(|build| (Some((build.label, build.selector)), build.environment)),
+    );
     for (selector, environment) in rows {
         let mut command = Command::new(&lane);
         command.current_dir(&workspace).env_remove("CARGO_HOME");
-        match selector {
-            Some(selector) => {
-                command.env("DEEPWYRM_GUEST_TEST_SELECTOR", selector);
-            }
-            None => {
-                command.env_remove("DEEPWYRM_GUEST_TEST_SELECTOR");
-            }
+        clear_selector_environment(&mut command);
+        if let Some((_, selector)) = selector {
+            command.env("DEEPWYRM_GUEST_TEST_SELECTOR", selector);
         }
         for (name, value) in environment {
             command.env(name, value);
@@ -683,7 +750,7 @@ fn run_selector_library_checks() -> io::Result<u8> {
         if !status.success() {
             let mut stderr = io::stderr().lock();
             match selector {
-                Some(selector) => writeln!(stderr, "error: selector {selector} does not compile")?,
+                Some((label, _)) => writeln!(stderr, "error: selector {label} does not compile")?,
                 None => writeln!(stderr, "error: the production kernel does not compile")?,
             }
             return Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8);

@@ -941,8 +941,43 @@ fn every_selector_environment_names_a_selector_that_exists() {
             "{selector} has an environment row but is not an implemented selector"
         );
     }
+    for (label, selector, _) in SELECTOR_VARIANTS {
+        assert!(
+            selectors.iter().any(|known| known == selector),
+            "variant {label} names {selector}, which is not an implemented selector"
+        );
+    }
+}
+
+#[test]
+fn selector_builds_are_every_selector_once_then_every_variant() {
+    let manifest = fs::read_to_string(workspace_root().join("tooling/guest-harness.toml")).unwrap();
+    let selectors = implemented_guest_selectors(&manifest);
+    let builds = selector_builds(&selectors);
+    assert_eq!(builds.len(), selectors.len() + SELECTOR_VARIANTS.len());
+    for (build, selector) in builds.iter().zip(&selectors) {
+        assert_eq!(
+            (build.label, build.selector),
+            (selector.as_str(), selector.as_str())
+        );
+    }
+    let labels = builds
+        .iter()
+        .map(|build| build.label)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        labels.len(),
+        builds.len(),
+        "selector build labels must be unique"
+    );
+    let e8 = builds
+        .iter()
+        .find(|build| build.label == "interactive-wyrmsh+wyr1e8")
+        .unwrap();
     assert!(
-        selectors.iter().any(|known| known == WYR1E8_SELECTOR.0),
-        "the E8 configuration names a selector that no longer exists"
+        !e8.environment
+            .iter()
+            .any(|(name, _)| *name == "DEEPWYRM_WYR1E7_EVIDENCE_NONCE"),
+        "build.rs rejects the E7 nonce in an E8 build"
     );
 }
