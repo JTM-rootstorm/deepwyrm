@@ -619,6 +619,10 @@ mod thread_arena {
     #[test]
     fn selector34_r1_identity_capacity_stays_inside_the_linked_thread_arena() {
         const ARENA: usize = crate::memory::kernel_stack::E3_THREAD_STACK_COUNT;
+        // Selector 34 links the ordinary arena. Only the E8 and F-closure
+        // fairness builds link sixty-four stacks (`kernel_stack.rs`), and this
+        // module is compiled into their host tests too.
+        #[cfg(not(any(deepwyrm_wyr1e8_evidence, deepwyrm_wyr1f_fairness_evidence)))]
         assert_eq!(ARENA, 16);
         const {
             assert!(SELECTED.identities <= ARENA);

@@ -5636,6 +5636,10 @@ fn task_group_create_cannot_manufacture_resource_authority() {
     );
 }
 
+/// Not compiled under selector 30's `deepwyrm_dw1d_evidence`: there a committed
+/// claim also feeds the process-global DW1-D collector, which by design
+/// refuses any resource but its scenario's and panics the claim.
+#[cfg(not(deepwyrm_dw1d_evidence))]
 #[test]
 fn device_resource_claim_requires_domain_membership_and_reclaims_exact_lease() {
     let mut registry = ObjectRegistry::<16>::new();
@@ -5941,6 +5945,10 @@ fn device_resource_claim_handle_errors_precede_terminating_caller_state() {
     finish_task_cleanup(&mut registry, &mut tasks, cleanup);
 }
 
+/// Not compiled under selector 30's `deepwyrm_dw1d_evidence`: there a committed
+/// claim also feeds the process-global DW1-D collector, which by design
+/// refuses any resource but its scenario's and panics the claim.
+#[cfg(not(deepwyrm_dw1d_evidence))]
 #[test]
 fn device_resource_claim_publication_failures_use_typed_close_and_restore_capacity() {
     let mut registry = ObjectRegistry::<16>::new();

@@ -291,6 +291,10 @@ mod tests {
         assert_eq!(SELECTED.identities, 16);
         assert_eq!(SELECTED.handles, 48);
         assert_eq!(SELECTED.registry, 160);
+        // Production links the ordinary arena. Only the E8 and F-closure
+        // fairness builds link sixty-four stacks (`kernel_stack.rs`), and this
+        // module is compiled into their host tests too.
+        #[cfg(not(any(deepwyrm_wyr1e8_evidence, deepwyrm_wyr1f_fairness_evidence)))]
         assert_eq!(crate::memory::kernel_stack::E3_THREAD_STACK_COUNT, 16);
     }
 
