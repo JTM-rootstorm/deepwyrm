@@ -266,26 +266,19 @@ fn reentrant_output_fails_fast() {
     assert!(OutputGuard::acquire().is_some());
 }
 
+/// Reads source text because both functions are target-only (they drive the
+/// real COM1 port through `X86PortIo`, and the panic handler never returns), so
+/// no host test can call them.
 #[test]
 fn bootstrap_com1_initialization_does_not_depend_on_output_guard_state() {
     let source = include_str!("mod.rs");
-    let initializer = source
-        .split("pub(crate) fn initialize_early_com1()")
-        .nth(1)
-        .unwrap()
-        .split("/// Emits a structured record")
-        .next()
-        .unwrap();
+    let initializer = crate::source_text::fn_body(source, "pub(crate) fn initialize_early_com1()");
+    assert!(initializer.contains("serial.initialize();"));
     assert!(!initializer.contains("OutputGuard"));
     assert!(!initializer.contains("EARLY_OUTPUT_ACTIVE"));
 
-    let panic_handler = source
-        .split("pub(crate) fn handle_early_panic(")
-        .nth(1)
-        .unwrap()
-        .split("fn test_panic_location_detail")
-        .next()
-        .unwrap();
+    let panic_handler = crate::source_text::fn_body(source, "pub(crate) fn handle_early_panic(");
+    assert!(panic_handler.contains("emit_early_panic_record(&record)"));
     assert!(!panic_handler.contains("initialize_early_com1"));
 }
 

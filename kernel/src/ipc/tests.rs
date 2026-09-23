@@ -1174,13 +1174,7 @@ fn the_small_bound_is_exact() {
 fn both_refusal_sites_name_their_own_resource() {
     const SOURCE: &str = include_str!("mod.rs");
 
-    let allocate = SOURCE
-        .split("fn allocate(&self, payload: &[u8])")
-        .nth(1)
-        .expect("the payload pool still has its allocator")
-        .split("\n    }")
-        .next()
-        .expect("the allocator is still a bounded function body");
+    let allocate = crate::source_text::fn_body(SOURCE, "fn allocate(&self, payload: &[u8])");
     assert!(
         allocate.contains("ChannelRefusal::PayloadExhausted"),
         "an exhausted payload pool is no longer counted, so a run that waited \
@@ -1191,13 +1185,7 @@ fn both_refusal_sites_name_their_own_resource() {
         "the allocator counts a payload refusal as a full queue"
     );
 
-    let reserve = SOURCE
-        .split("fn reserve_send(&mut self)")
-        .nth(1)
-        .expect("the queue still has its send reservation")
-        .split("\n    }")
-        .next()
-        .expect("reserve_send is still a bounded function body");
+    let reserve = crate::source_text::fn_body(SOURCE, "fn reserve_send(&mut self)");
     assert_eq!(
         reserve.matches("ChannelRefusal::QueueFull").count(),
         reserve.matches("ChannelError::WouldBlock").count(),

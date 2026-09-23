@@ -70,6 +70,9 @@ pub(crate) mod time;
 )]
 pub(crate) mod wait;
 
+#[cfg(test)]
+mod source_text;
+
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
