@@ -1,3 +1,6 @@
+#[path = "support/host_tools.rs"]
+mod host_tools;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -117,12 +120,9 @@ fn e5_fp_simd_unavailable_policy_is_enforced_at_every_user_boundary() {
 
 #[test]
 fn syscall_assembly_is_freestanding_and_calls_only_the_rust_dispatch() {
-    let clang = "/usr/lib/llvm/22/bin/clang-22";
-    if Command::new(clang).arg("--version").output().is_err() {
-        return;
-    }
+    let clang = host_tools::clang();
     let output = std::env::temp_dir().join(format!("deepwyrm-e4-syscall-{}.o", std::process::id()));
-    let status = Command::new(clang)
+    let status = Command::new(&clang)
         .args([
             "--no-default-config",
             "--target=x86_64-unknown-none",

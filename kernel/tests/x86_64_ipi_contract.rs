@@ -1,9 +1,10 @@
+#[path = "support/host_tools.rs"]
+mod host_tools;
 #[allow(dead_code)]
 #[path = "../build.rs"]
 mod kernel_build;
 
 use std::env;
-use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -826,13 +827,9 @@ fn h2_bsp_timer_and_ap_idle_publish_in_fail_closed_order() {
 
 #[test]
 fn h2_h3_production_assembly_object_retains_both_exact_returning_entries() {
-    let clang = env::var_os("DEEPWYRM_CLANG").unwrap_or_else(|| "clang".into());
-    let objdump =
-        env::var_os("DEEPWYRM_LLVM_OBJDUMP").unwrap_or_else(|| OsString::from("llvm-objdump"));
-    if !tool_available(&clang) || !tool_available(&objdump) {
-        eprintln!("skipping fixed IPI artifact probe: clang or llvm-objdump unavailable");
-        return;
-    }
+    // `assemble_source` reads DEEPWYRM_CLANG itself; this verifies it first.
+    host_tools::clang();
+    let objdump = host_tools::llvm_tool("llvm-objdump");
 
     let layout_source = source("arch/x86_64/layout.toml");
     let layout = kernel_build::Layout::parse(&layout_source).expect("parse kernel layout");
@@ -867,13 +864,6 @@ fn h2_h3_production_assembly_object_retains_both_exact_returning_entries() {
         assert!(body.contains("testb\t$0x3, %al"));
     }
     let _ = fs::remove_file(object);
-}
-
-fn tool_available(program: &OsStr) -> bool {
-    Command::new(program)
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
 }
 
 fn function_body<'a>(disassembly: &'a str, symbol: &str) -> &'a str {

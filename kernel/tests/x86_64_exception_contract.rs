@@ -1,3 +1,6 @@
+#[path = "support/host_tools.rs"]
+mod host_tools;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -152,13 +155,10 @@ fn g5_primordial_selectors_have_exact_post_teardown_oracles() {
 
 #[test]
 fn e4_exception_assembly_remains_freestanding() {
-    let clang = "/usr/lib/llvm/22/bin/clang-22";
-    if Command::new(clang).arg("--version").output().is_err() {
-        return;
-    }
+    let clang = host_tools::clang();
     let output =
         std::env::temp_dir().join(format!("deepwyrm-e4-exceptions-{}.o", std::process::id()));
-    let status = Command::new(clang)
+    let status = Command::new(&clang)
         .args([
             "--no-default-config",
             "--target=x86_64-unknown-none",

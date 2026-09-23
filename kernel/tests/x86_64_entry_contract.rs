@@ -1,10 +1,11 @@
+#[path = "support/host_tools.rs"]
+mod host_tools;
 #[allow(dead_code)]
 #[path = "../build.rs"]
 mod kernel_build;
 
 use std::collections::BTreeMap;
 use std::env;
-use std::ffi::OsStr;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -1452,15 +1453,10 @@ fn kernel_assembler_disables_clang_default_configuration_discovery() {
 
 #[test]
 fn linked_entry_and_rust_boundary_match_the_canonical_elf_policy() {
-    let clang = env::var_os("DEEPWYRM_CLANG").unwrap_or_else(|| "clang".into());
-    if !tool_available(&clang)
-        || !tool_available(OsStr::new("rustc"))
-        || !tool_available(OsStr::new("ld.lld"))
-        || !tool_available(OsStr::new("llvm-nm"))
-    {
-        eprintln!("skipping x86_64 entry link probe: clang, rustc, ld.lld, or llvm-nm unavailable");
-        return;
-    }
+    let clang = host_tools::clang();
+    let rustc = host_tools::rustc();
+    let ld_lld = host_tools::llvm_tool("ld.lld");
+    let llvm_nm = host_tools::llvm_tool("llvm-nm");
 
     let source = fs::read_to_string(layout_path()).expect("read canonical layout manifest");
     let layout = kernel_build::Layout::parse(&source).expect("parse canonical layout manifest");
@@ -1521,7 +1517,7 @@ extern "sysv64" fn dw_x86_64_terminal_interrupt_dispatch(_vector: u64) -> ! {{
     .expect("write Rust boundary probe");
 
     run_success(
-        Command::new("rustc")
+        Command::new(&rustc)
             .args([
                 "--edition=2024",
                 "--crate-type=lib",
@@ -1594,7 +1590,7 @@ dw_test_bss_probe:
         ],
     );
     run_success(
-        Command::new("ld.lld")
+        Command::new(&ld_lld)
             .args(["-m", "elf_x86_64"])
             .args(link_arguments)
             .args([
@@ -1613,7 +1609,7 @@ dw_test_bss_probe:
     validate_elf(&elf, layout);
 
     let symbols = run_success(
-        Command::new("llvm-nm")
+        Command::new(&llvm_nm)
             .arg("--defined-only")
             .arg(&kernel_elf),
         "inspect retained entry symbols",
@@ -1812,13 +1808,6 @@ fn run_success(command: &mut Command, description: &str) -> Output {
         String::from_utf8_lossy(&output.stderr)
     );
     output
-}
-
-fn tool_available(program: &OsStr) -> bool {
-    Command::new(program)
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
 }
 
 fn kernel_root() -> PathBuf {

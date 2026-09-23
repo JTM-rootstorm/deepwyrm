@@ -1,12 +1,12 @@
+#[path = "support/host_tools.rs"]
+mod host_tools;
 #[allow(dead_code)]
 #[path = "../build.rs"]
 mod kernel_build;
 
 use std::env;
-use std::ffi::OsStr;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const ELF64_SECTION_HEADER_SIZE: usize = 64;
@@ -37,11 +37,8 @@ fn h1_trampoline_build_and_link_paths_retain_the_template_section() {
 
 #[test]
 fn h1_trampoline_template_is_one_page_and_relocation_free() {
-    let clang = env::var_os("DEEPWYRM_CLANG").unwrap_or_else(|| "clang".into());
-    if !tool_available(&clang) {
-        eprintln!("skipping AP trampoline artifact probe: clang unavailable");
-        return;
-    }
+    // `assemble_source` reads DEEPWYRM_CLANG itself; this verifies it first.
+    host_tools::clang();
 
     let layout_source = fs::read_to_string(kernel_root().join("arch/x86_64/layout.toml"))
         .expect("read canonical layout manifest");
@@ -118,13 +115,6 @@ fn kernel_root() -> PathBuf {
 
 fn assembly_path() -> PathBuf {
     kernel_root().join("src/arch/x86_64/ap_trampoline.S")
-}
-
-fn tool_available(program: &OsStr) -> bool {
-    Command::new(program)
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
 }
 
 struct TemporaryDirectory {
