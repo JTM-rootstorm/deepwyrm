@@ -2655,6 +2655,9 @@ mod tests {
         );
     }
 
+    /// Reads source text because the Submit branch and the partial flush live in
+    /// target-only files (activation/primordial.rs, test_support/x86_64.rs) that
+    /// no host test compiles.
     #[test]
     fn selector_private_raw_id_and_e3a_partial_path_cannot_be_public_acceptance() {
         let schema = include_str!("../../../abi/schema/syscalls.toml");
@@ -2726,12 +2729,19 @@ mod tests {
             terminal
                 .contains("complete_dw1e_failure_terminal(CompletionOutcome::Fail, 0x3110_ffff)")
         );
+    }
 
-        let build = include_str!("../../build.rs");
-        assert!(build.contains("cargo:rerun-if-env-changed=DEEPWYRM_DW1E_E3B_FULL"));
-        assert!(build.contains("cargo:rustc-check-cfg=cfg(deepwyrm_dw1e_e3b_full)"));
-        assert!(build.contains("cargo:rustc-cfg=deepwyrm_dw1e_e3b_full"));
-        assert!(build.contains("Some(\"1\") if selected => Ok(true)"));
+    /// Behavior, not text: the E3B-full cfg is on exactly when the build
+    /// environment asked for it. `xtask test host` runs this in every selector
+    /// row, including q35-com2-interrupt+e3b-full, so it fails if build.rs stops
+    /// emitting the cfg or stops rebuilding when the variable changes; build.rs's
+    /// own tests hold `validate_dw1e_e3b_full`'s admission rules.
+    #[test]
+    fn e3b_full_cfg_follows_the_build_environment() {
+        assert_eq!(
+            cfg!(deepwyrm_dw1e_e3b_full),
+            option_env!("DEEPWYRM_DW1E_E3B_FULL") == Some("1")
+        );
     }
 
     #[test]
