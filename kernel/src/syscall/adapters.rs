@@ -399,7 +399,7 @@ fn copy_input<U: UserPageAccess, const N: usize>(
 
 /// Selector-specialized fixed-size diagnostic input copy. This is kept behind
 /// the private test cfg so production adapters expose no additional surface.
-#[cfg(deepwyrm_wyr1_evidence)]
+#[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1f_supervisor_relay))]
 pub(crate) fn copy_wyr1_evidence_input<U: UserPageAccess, const N: usize>(
     user: &mut U,
     address: DwUserAddress,

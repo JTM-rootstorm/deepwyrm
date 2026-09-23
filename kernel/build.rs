@@ -137,6 +137,8 @@ fn run() -> Result<(), String> {
     // `wyr1f_fairness_resource_geometry.rs` (F3A.6p) into the kernel's
     // capacity arms.
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1f_fairness_evidence)");
+    // The F closure selector's WYR1EVID1 supervisor-evidence relay (F3A.7k).
+    println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1f_supervisor_relay)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1e_platform)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_production_product)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1e_evidence)");
@@ -1199,6 +1201,19 @@ fn configure_guest_test(harness_path: &Path) -> Result<(), String> {
             } else {
                 let nonce = required_wyr1e_hex("DEEPWYRM_WYR1E7_EVIDENCE_NONCE")?;
                 println!("cargo:rustc-env=DEEPWYRM_WYR1E7_EVIDENCE_NONCE={nonce}");
+                // F3A.7k. The F closure selector's supervisor evidence is
+                // WYR1EVID1 (closure contract §5.4), relayed beside its WRE1
+                // shell transport. Its nonce is the pair's own, the same one
+                // the gate config seals and init writes into every record, so
+                // it is derived here instead of asking the product builder
+                // for a second variable the matched siblings would have to
+                // agree on. There is deliberately no build-owned scenario: the
+                // two siblings share this kernel, so the transcript's first
+                // record fixes it.
+                if wyr1f_fairness_selected(Some(selector.as_str()), wyr1e8) {
+                    println!("cargo:rustc-cfg=deepwyrm_wyr1f_supervisor_relay");
+                    println!("cargo:rustc-env=DEEPWYRM_WYR1_EVIDENCE_NONCE={nonce}");
+                }
             }
             if wyr1f_fairness_selected(Some(selector.as_str()), wyr1e8) {
                 println!("cargo:rustc-cfg=deepwyrm_wyr1f_fairness_evidence");

@@ -858,7 +858,7 @@ fn wyr1_terminal_outcomes_share_one_claimed_prefix_transaction() {
         .find("fn complete_wyr1_evidence_kernel_terminal(")
         .expect("selector-25 kernel terminal helper");
     let end = terminal[start..]
-        .find("\n#[cfg(deepwyrm_wyr1_evidence)]\nfn wyr1_failure_detail")
+        .find("\n#[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1f_supervisor_relay))]\nfn wyr1_failure_detail")
         .map(|offset| start + offset)
         .expect("selector-25 kernel terminal helper boundary");
     let shared = &terminal[start..end];

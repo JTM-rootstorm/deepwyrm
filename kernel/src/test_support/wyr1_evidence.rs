@@ -35,10 +35,35 @@ impl Scenario {
             Self::DegradedRecovery => 2,
         }
     }
+
+    const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Normal),
+            2 => Some(Self::DegradedRecovery),
+            _ => None,
+        }
+    }
 }
 
-#[cfg(not(test))]
-const fn build_scenario() -> Scenario {
+/// Who fixes the transcript's scenario.
+///
+/// Selector 25 fixes it at build time. The F closure selector's relay
+/// (F3A.7k) serves the instrumented-normal and degraded siblings, whose
+/// kernels contract §5.4 requires to be byte-identical, so a build-owned
+/// scenario would make them differ. There the scenario is the transcript's
+/// own: the first record fixes it and every later record must agree.
+#[cfg(all(not(test), deepwyrm_wyr1_evidence))]
+const fn build_scenario() -> Option<Scenario> {
+    Some(selector25_build_scenario())
+}
+
+#[cfg(all(not(test), not(deepwyrm_wyr1_evidence)))]
+const fn build_scenario() -> Option<Scenario> {
+    None
+}
+
+#[cfg(all(not(test), deepwyrm_wyr1_evidence))]
+const fn selector25_build_scenario() -> Scenario {
     const VALUE: &str = env!(
         "DEEPWYRM_WYR1_EVIDENCE_SCENARIO",
         "selector 25 requires its build-owned evidence scenario"
@@ -53,8 +78,8 @@ const fn build_scenario() -> Scenario {
 }
 
 #[cfg(test)]
-const fn build_scenario() -> Scenario {
-    Scenario::Normal
+const fn build_scenario() -> Option<Scenario> {
+    Some(Scenario::Normal)
 }
 
 const fn string_equals(left: &str, right: &str) -> bool {
@@ -135,6 +160,9 @@ struct Transcript {
     retired: bool,
     terminal: bool,
     failure: Option<Wyr1EvidenceError>,
+    /// The scenario the transcript's first record fixed, where the build
+    /// does not fix one. See `build_scenario`.
+    scenario: Option<Scenario>,
 }
 
 impl Transcript {
@@ -146,6 +174,7 @@ impl Transcript {
             retired: false,
             terminal: false,
             failure: None,
+            scenario: None,
         }
     }
 
@@ -222,10 +251,22 @@ impl Wyr1EvidenceCollector {
         process: ProcessKey,
         record: &[u8; WYR1_EVIDENCE_RECORD_LEN],
     ) -> Result<Wyr1EvidenceSubmit<'_>, Wyr1EvidenceError> {
+        self.submit_under(process, record, build_scenario())
+    }
+
+    /// `submit`, with the scenario policy explicit so both can be tested.
+    fn submit_under(
+        &self,
+        process: ProcessKey,
+        record: &[u8; WYR1_EVIDENCE_RECORD_LEN],
+        build: Option<Scenario>,
+    ) -> Result<Wyr1EvidenceSubmit<'_>, Wyr1EvidenceError> {
         let mut transcript = self.transcript.lock();
         authorize_locked(&mut transcript, process)?;
-        let terminal = match validate_record(record, transcript.count as u32, build_scenario()) {
-            Ok(terminal) => terminal,
+        let expected = expected_scenario(build, transcript.scenario);
+        let (terminal, scenario) = match validate_record(record, transcript.count as u32, expected)
+        {
+            Ok(accepted) => accepted,
             Err(error) => return Err(transcript.latch(error)),
         };
         if terminal {
@@ -236,6 +277,7 @@ impl Wyr1EvidenceCollector {
         let index = transcript.count;
         transcript.records[index] = *record;
         transcript.count += 1;
+        transcript.scenario = Some(scenario);
         if terminal {
             transcript.terminal = true;
             drop(transcript);
@@ -348,11 +390,21 @@ const fn flush_error(error: Wyr1EvidenceError) -> Wyr1EvidenceFlushError {
     }
 }
 
+/// The scenario a record must carry: the build's if it fixes one, otherwise
+/// whatever the transcript's first record fixed, and anything valid for the
+/// first record itself.
+const fn expected_scenario(build: Option<Scenario>, latched: Option<Scenario>) -> Option<Scenario> {
+    match build {
+        Some(scenario) => Some(scenario),
+        None => latched,
+    }
+}
+
 fn validate_record(
     record: &[u8; WYR1_EVIDENCE_RECORD_LEN],
     expected_sequence: u32,
-    scenario: Scenario,
-) -> Result<bool, Wyr1EvidenceError> {
+    expected: Option<Scenario>,
+) -> Result<(bool, Scenario), Wyr1EvidenceError> {
     if &record[0..9] != b"WYR1EVID1"
         || record[9] != b'|'
         || &record[10..12] != b"01"
@@ -399,17 +451,21 @@ fn validate_record(
     if sequence != expected_sequence {
         return Err(Wyr1EvidenceError::OutOfOrder);
     }
-    if record_scenario != scenario.code() || checksum != fnv1a32(&record[..CHECKSUM_OFFSET]) {
+    let scenario = Scenario::from_code(record_scenario).ok_or(Wyr1EvidenceError::Malformed)?;
+    if expected.is_some_and(|expected| expected != scenario)
+        || checksum != fnv1a32(&record[..CHECKSUM_OFFSET])
+    {
         return Err(Wyr1EvidenceError::Malformed);
     }
-    match kind {
-        0x01 if role != 0 && generation != 0 && transaction != 0 && value == 0 => Ok(false),
-        0x02 if role != 0 && generation != 0 && transaction != 0 => Ok(false),
-        0x03 if role != 0 && generation != 0 && transaction != 0 && value > generation => Ok(false),
-        0x04 if role != 0 && generation != 0 && transaction != 0 && value != 0 => Ok(false),
-        TERMINAL_KIND if role == 0 && generation == 0 && transaction == 0 && value == 0 => Ok(true),
-        _ => Err(Wyr1EvidenceError::Malformed),
-    }
+    let terminal = match kind {
+        0x01 if role != 0 && generation != 0 && transaction != 0 && value == 0 => false,
+        0x02 if role != 0 && generation != 0 && transaction != 0 => false,
+        0x03 if role != 0 && generation != 0 && transaction != 0 && value > generation => false,
+        0x04 if role != 0 && generation != 0 && transaction != 0 && value != 0 => false,
+        TERMINAL_KIND if role == 0 && generation == 0 && transaction == 0 && value == 0 => true,
+        _ => return Err(Wyr1EvidenceError::Malformed),
+    };
+    Ok((terminal, scenario))
 }
 
 #[cfg(not(test))]
@@ -513,7 +569,7 @@ mod tests {
         record[13..29].copy_from_slice(build_nonce().as_bytes());
         write_hex(u64::from(sequence), &mut record[30..38]);
         write_hex(u64::from(kind), &mut record[39..41]);
-        write_hex(u64::from(build_scenario().code()), &mut record[42..44]);
+        write_hex(u64::from(Scenario::Normal.code()), &mut record[42..44]);
         write_hex(u64::from(role), &mut record[45..53]);
         write_hex(generation, &mut record[54..70]);
         write_hex(transaction, &mut record[71..87]);
@@ -707,5 +763,123 @@ mod tests {
         let failure = Wyr1EvidenceCollector::new();
         assert!(failure.claim_failure().is_some());
         assert!(failure.claim_failure().is_none());
+    }
+
+    fn rescenario(
+        mut record: [u8; WYR1_EVIDENCE_RECORD_LEN],
+        code: u8,
+    ) -> [u8; WYR1_EVIDENCE_RECORD_LEN] {
+        write_hex(u64::from(code), &mut record[42..44]);
+        let checksum = fnv1a32(&record[..CHECKSUM_OFFSET]);
+        write_hex(u64::from(checksum), &mut record[105..113]);
+        record
+    }
+
+    /// F3A.7k. Where the build fixes no scenario, the first record does, and
+    /// the transcript cannot change it afterwards -- including at the
+    /// terminal, which is where a mismatch would decide the verdict.
+    #[test]
+    fn a_transcript_owned_scenario_is_fixed_by_the_first_record() {
+        let ready = record(0, 0x01, 1, 1, 1, 0);
+        let degraded_ready = rescenario(ready, 2);
+        assert_eq!(
+            validate_record(&degraded_ready, 0, expected_scenario(None, None)),
+            Ok((false, Scenario::DegradedRecovery))
+        );
+        assert_eq!(
+            validate_record(&ready, 0, expected_scenario(None, None)),
+            Ok((false, Scenario::Normal))
+        );
+        let terminal = record(1, TERMINAL_KIND, 0, 0, 0, 0);
+        assert_eq!(
+            validate_record(
+                &terminal,
+                1,
+                expected_scenario(None, Some(Scenario::DegradedRecovery))
+            ),
+            Err(Wyr1EvidenceError::Malformed)
+        );
+        assert_eq!(
+            validate_record(
+                &rescenario(terminal, 2),
+                1,
+                expected_scenario(None, Some(Scenario::DegradedRecovery))
+            ),
+            Ok((true, Scenario::DegradedRecovery))
+        );
+        // No scenario outside the two the protocol names, in either policy.
+        assert_eq!(
+            validate_record(&rescenario(ready, 3), 0, expected_scenario(None, None)),
+            Err(Wyr1EvidenceError::Malformed)
+        );
+    }
+
+    /// Selector 25's build-owned scenario still wins over anything latched.
+    #[test]
+    fn a_build_owned_scenario_ignores_the_transcript() {
+        assert_eq!(
+            expected_scenario(Some(Scenario::Normal), Some(Scenario::DegradedRecovery)),
+            Some(Scenario::Normal)
+        );
+        assert_eq!(
+            validate_record(
+                &rescenario(record(0, 0x01, 1, 1, 1, 0), 2),
+                0,
+                expected_scenario(Some(Scenario::Normal), None)
+            ),
+            Err(Wyr1EvidenceError::Malformed)
+        );
+    }
+
+    /// The relay's collector itself, not just the validator: the first
+    /// accepted record fixes the scenario, a later record that disagrees is
+    /// refused and latched, and a transcript that agrees reaches its terminal.
+    #[test]
+    fn the_relay_collector_latches_the_first_records_scenario() {
+        let reporter = process_key();
+        let collector = Wyr1EvidenceCollector::new();
+        collector
+            .bind_reporter_after_retirement(reporter, RETIRED)
+            .unwrap();
+        let degraded = |record| rescenario(record, 2);
+        assert!(matches!(
+            collector.submit_under(reporter, &degraded(record(0, 0x01, 1, 1, 1, 0)), None),
+            Ok(Wyr1EvidenceSubmit::Accepted)
+        ));
+        assert!(matches!(
+            collector.submit_under(reporter, &degraded(record(1, 0x01, 2, 1, 1, 0)), None),
+            Ok(Wyr1EvidenceSubmit::Accepted)
+        ));
+        assert!(matches!(
+            collector.submit_under(
+                reporter,
+                &degraded(record(2, TERMINAL_KIND, 0, 0, 0, 0)),
+                None
+            ),
+            Ok(Wyr1EvidenceSubmit::Terminal(_))
+        ));
+
+        let mixed = Wyr1EvidenceCollector::new();
+        mixed
+            .bind_reporter_after_retirement(reporter, RETIRED)
+            .unwrap();
+        assert!(matches!(
+            mixed.submit_under(reporter, &degraded(record(0, 0x01, 1, 1, 1, 0)), None),
+            Ok(Wyr1EvidenceSubmit::Accepted)
+        ));
+        assert!(matches!(
+            mixed.submit_under(reporter, &record(1, TERMINAL_KIND, 0, 0, 0, 0), None),
+            Err(Wyr1EvidenceError::Malformed)
+        ));
+        // Latched: the transcript cannot be rescued by a matching retry.
+        assert!(
+            mixed
+                .submit_under(
+                    reporter,
+                    &degraded(record(1, TERMINAL_KIND, 0, 0, 0, 0)),
+                    None
+                )
+                .is_err()
+        );
     }
 }

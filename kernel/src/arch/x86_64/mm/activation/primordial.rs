@@ -6162,7 +6162,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .push_optional(self.registry.release_handle(reference).map_err(|_| ())?);
         }
         self.drain_finalizers()?;
-        #[cfg(deepwyrm_wyr1_evidence)]
+        #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1f_supervisor_relay))]
         crate::test_support::WYR1_EVIDENCE
             .bind_reporter_after_retirement(
                 reporter,
@@ -7093,7 +7093,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         self.authorize_return(frame, current_binding_generation)
     }
 
-    #[cfg(deepwyrm_wyr1_evidence)]
+    #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1f_supervisor_relay))]
     fn intercept_wyr1_evidence_raw(
         &mut self,
         arguments: crate::syscall::RawSyscallArguments,
@@ -8185,7 +8185,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 }
 
-#[cfg(deepwyrm_wyr1_evidence)]
+#[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1f_supervisor_relay))]
 const fn wyr1_submit_detail(error: crate::test_support::Wyr1EvidenceError) -> u32 {
     use crate::test_support::Wyr1EvidenceError;
     match error {
@@ -8882,7 +8882,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         runtime.authorize_return(frame, current_binding_generation)
     }
 
-    #[cfg(deepwyrm_wyr1_evidence)]
+    #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1f_supervisor_relay))]
     fn intercept_wyr1_evidence_raw(
         &mut self,
         arguments: crate::syscall::RawSyscallArguments,

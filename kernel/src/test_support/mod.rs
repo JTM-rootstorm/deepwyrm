@@ -119,7 +119,7 @@ mod task;
 mod transport;
 #[cfg(any(test, deepwyrm_wrcap_relay))]
 mod wrcap;
-#[cfg(any(test, deepwyrm_wyr1_evidence))]
+#[cfg(any(test, deepwyrm_wyr1_evidence, deepwyrm_wyr1f_supervisor_relay))]
 mod wyr1_evidence;
 #[cfg(any(
     test,
@@ -193,7 +193,7 @@ pub(crate) use r1_evidence::{
 // so export it rather than letting the two carry independent copies of 64.
 #[cfg(any(test, deepwyrm_r1_evidence))]
 pub(crate) use r1_evidence::R1_EVIDENCE_RECORD_CAPACITY;
-#[cfg(deepwyrm_wyr1_evidence)]
+#[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1f_supervisor_relay))]
 pub(crate) use wyr1_evidence::WYR1_EVIDENCE_RAW_SYSCALL;
 #[cfg(deepwyrm_wyr1b_evidence)]
 pub(crate) use wyr1b_evidence::WYR1B_EVIDENCE_RAW_SYSCALL;
@@ -226,7 +226,11 @@ pub(crate) use dw1b_evidence::{
     exact_single_thread,
 };
 
-#[cfg(all(deepwyrm_wyr1_evidence, target_arch = "x86_64", target_os = "none"))]
+#[cfg(all(
+    any(deepwyrm_wyr1_evidence, deepwyrm_wyr1f_supervisor_relay),
+    target_arch = "x86_64",
+    target_os = "none"
+))]
 pub(crate) use wyr1_evidence::{
     WYR1_EVIDENCE, WYR1_EVIDENCE_RECORD_LEN, Wyr1EvidenceError, Wyr1EvidenceFlushError,
     Wyr1EvidenceSubmit, Wyr1RetirementFacts,
@@ -305,7 +309,11 @@ pub(crate) use x86_64::complete_dw1d_evidence;
 pub(crate) use x86_64::complete_dw1e_evidence;
 #[cfg(all(deepwyrm_r1_evidence, target_arch = "x86_64", target_os = "none"))]
 pub(crate) use x86_64::complete_r1_evidence;
-#[cfg(all(deepwyrm_wyr1_evidence, target_arch = "x86_64", target_os = "none"))]
+#[cfg(all(
+    any(deepwyrm_wyr1_evidence, deepwyrm_wyr1f_supervisor_relay),
+    target_arch = "x86_64",
+    target_os = "none"
+))]
 pub(crate) use x86_64::complete_wyr1_evidence;
 #[cfg(all(deepwyrm_wyr1b_evidence, target_arch = "x86_64", target_os = "none"))]
 pub(crate) use x86_64::complete_wyr1b_evidence;

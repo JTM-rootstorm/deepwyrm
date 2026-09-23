@@ -1160,12 +1160,16 @@ fn the_production_product_selects_its_own_resource_geometry() {
     assert!(build.contains("!wyr1e8 && selector == Some(WYR1F_CLOSURE_SELECTOR)"));
     // Without the emission, selector 35 falls back to the thirty-two-handle
     // arms and every gate still compiles.
-    let selected = build
-        .find("if wyr1f_fairness_selected(Some(selector.as_str()), wyr1e8) {")
-        .expect("the closure selector no longer asks for the fairness geometry");
-    assert!(build[selected..].lines().nth(1).is_some_and(
-        |line| line.trim() == "println!(\"cargo:rustc-cfg=deepwyrm_wyr1f_fairness_evidence\");"
-    ));
+    // The same condition also guards the supervisor-evidence relay, so any
+    // guarded block may be the one that carries the emission.
+    assert!(
+        build
+            .match_indices("if wyr1f_fairness_selected(Some(selector.as_str()), wyr1e8) {")
+            .any(|(at, _)| build[at..].lines().nth(1).is_some_and(|line| {
+                line.trim() == "println!(\"cargo:rustc-cfg=deepwyrm_wyr1f_fairness_evidence\");"
+            })),
+        "the closure selector no longer emits the fairness cfg"
+    );
 }
 
 #[test]

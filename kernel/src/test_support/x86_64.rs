@@ -63,7 +63,7 @@ use super::dw1b_evidence::Dw1bEvidenceFlushPermit;
 use super::{EvidenceFlushError, I1_EVIDENCE};
 #[cfg(deepwyrm_wrcap_relay)]
 use super::{WRCAP_RELAY, WrcapFlushError};
-#[cfg(deepwyrm_wyr1_evidence)]
+#[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1f_supervisor_relay))]
 use super::{Wyr1EvidenceFlushError, wyr1_evidence::Wyr1EvidenceFlushPermit};
 #[cfg(deepwyrm_wyr1b_evidence)]
 use super::{Wyr1bEvidenceFlushError, wyr1b_evidence::Wyr1bEvidenceFlushPermit};
@@ -284,7 +284,7 @@ pub(crate) fn complete_dw1b_evidence(permit: Dw1bEvidenceFlushPermit) -> ! {
 
 /// Flush selector-25's preserved transcript and append its PASS terminal in
 /// the same exclusive COM1 transaction before issuing debug-exit.
-#[cfg(deepwyrm_wyr1_evidence)]
+#[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1f_supervisor_relay))]
 pub(crate) fn complete_wyr1_evidence(permit: Wyr1EvidenceFlushPermit<'_>) -> ! {
     let mut transport = unsafe { QemuCompletionTransport::new() };
     let outcome = match begin_test_serial_transaction() {
@@ -847,7 +847,7 @@ fn complete_wyr1b_evidence_kernel_terminal(outcome: CompletionOutcome, detail: u
     complete(&mut transport, completion_record(outcome, detail))
 }
 
-#[cfg(deepwyrm_wyr1_evidence)]
+#[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1f_supervisor_relay))]
 fn wyr1_failure_detail(error: Wyr1EvidenceFlushError) -> u32 {
     match error {
         Wyr1EvidenceFlushError::Incomplete => 0x2510_f001,

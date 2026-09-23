@@ -938,7 +938,7 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
     /// Selector-25-only interception of one raw ID deliberately absent from
     /// native ABI decode. Production and every other selector compile neither
     /// this method nor its call site, so the ID remains NOT_SUPPORTED there.
-    #[cfg(deepwyrm_wyr1_evidence)]
+    #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1f_supervisor_relay))]
     fn intercept_wyr1_evidence_raw(
         &mut self,
         arguments: RawSyscallArguments,
@@ -1164,7 +1164,7 @@ pub(crate) fn dispatch_frame<R: NativeSyscallFrameRuntime>(
         deepwyrm_r1_evidence,
     ))]
     let result = match frame.request() {
-        #[cfg(deepwyrm_wyr1_evidence)]
+        #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1f_supervisor_relay))]
         Some((id, arguments)) if id.0 == crate::test_support::WYR1_EVIDENCE_RAW_SYSCALL => {
             runtime.intercept_wyr1_evidence_raw(arguments)
         }
