@@ -1370,8 +1370,23 @@ mod tests {
             .reserve_paused_for_test(EvidenceEvent::cpu_online(0, 0x20))
             .unwrap();
         let permit = collector.finalize_running_invariant().unwrap();
+        let publisher_running = core::sync::atomic::AtomicBool::new(false);
         std::thread::scope(|scope| {
-            scope.spawn(|| collector.publish_paused_for_test(sequence));
+            // The publisher is already running when the reporter claims, and
+            // publishes on seeing the claim. Spawning it to publish at once
+            // raced thread start-up against the reporter's bounded
+            // `MAX_PUBLICATION_SPINS` wait, and lost under a loaded parallel
+            // test run (S1.1: one run in ten of this selector's host suite).
+            scope.spawn(|| {
+                publisher_running.store(true, Ordering::Release);
+                while collector.reporter_claimed.load(Ordering::Acquire) == 0 {
+                    core::hint::spin_loop();
+                }
+                collector.publish_paused_for_test(sequence);
+            });
+            while !publisher_running.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
             assert_eq!(permit.flush(|_| Ok(())), Err(EvidenceFlushError::Invariant));
         });
     }
