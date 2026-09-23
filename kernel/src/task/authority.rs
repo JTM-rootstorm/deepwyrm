@@ -526,6 +526,19 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         Ok(self.process(key)?.state.abi())
     }
 
+    /// Whether any Process other than `key` has not exited.
+    ///
+    /// F3A.7j. The terminal path asks this when `key` is retiring with nothing
+    /// runnable: if no other Process remains, nothing can ever run again, and
+    /// idling would hang the machine rather than wait for anything. A Process
+    /// that was created and never started counts as remaining, so the answer
+    /// errs toward the idle the kernel always did.
+    pub(crate) fn any_process_unexited_except(&self, key: ProcessKey) -> bool {
+        self.processes.iter().flatten().any(|record| {
+            ProcessKey(record.object) != key && record.state.state != DW_TASK_STATE_EXITED
+        })
+    }
+
     pub(crate) fn process_lifecycle(
         &self,
         key: ProcessKey,

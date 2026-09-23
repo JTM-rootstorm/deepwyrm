@@ -417,6 +417,16 @@ fn emit_process_retirement_record<P: BytePortIo>(
         .map_err(|_| SerialError::TransmitTimeout)
 }
 
+/// F3A.7j. Said once, just before the production kernel powers off because
+/// the last Process has exited, so a transcript can tell a machine that shut
+/// itself down from one whose power was cut.
+fn emit_system_empty_record<P: BytePortIo>(serial: &mut Com1<P>) -> Result<(), SerialError> {
+    let _guard = OutputGuard::acquire().ok_or(SerialError::Busy)?;
+    serial
+        .write_str("[DW0][INFO][task] no process remains; powering off\n")
+        .map_err(|_| SerialError::TransmitTimeout)
+}
+
 fn emit_cpu_state_record<P: BytePortIo>(
     serial: &mut Com1<P>,
     cpu_index: usize,
@@ -589,6 +599,17 @@ pub(crate) fn emit_early_process_retirement_record(
 ) -> Result<(), SerialError> {
     let mut serial = Com1::new(X86PortIo);
     emit_process_retirement_record(&mut serial, application, reason, primordial_live)
+}
+
+/// Emits the record that precedes powering off with no Process left.
+#[cfg(all(
+    not(feature = "test-support"),
+    target_os = "none",
+    target_arch = "x86_64"
+))]
+pub(crate) fn emit_early_system_empty_record() -> Result<(), SerialError> {
+    let mut serial = Com1::new(X86PortIo);
+    emit_system_empty_record(&mut serial)
 }
 
 /// Emits one allocation-free CPU identity/lifecycle record through COM1.

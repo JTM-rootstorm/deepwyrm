@@ -257,6 +257,67 @@ fn process_exit_drains_handles_and_records_per_thread_reason() {
     finish_task_release(&mut tasks, &mut registry, root_final);
 }
 
+/// F3A.7j. The production terminal path powers the machine off only when the
+/// retiring Process is the last one that has not exited.
+#[test]
+fn only_the_last_unexited_process_leaves_nothing_behind() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (first, first_handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let (second, second_handle) = tasks.create_process(&mut registry, &root_owner).unwrap();
+
+    // Created and never started still counts: nothing has exited yet.
+    assert!(tasks.any_process_unexited_except(first));
+    assert!(tasks.any_process_unexited_except(second));
+
+    let mut start = |process_handle: &HandleRef, seed: u64| {
+        let pin = process_parent_pin(&mut registry, process_handle);
+        let (thread, thread_handle) = tasks.create_thread(&mut registry, &pin).unwrap();
+        release_nonfinal_pin(&mut registry, pin);
+        prepare_thread(&mut tasks, thread, seed);
+        tasks.start_thread(thread).unwrap();
+        (thread, thread_handle)
+    };
+    let (first_thread, first_thread_handle) = start(&first_handle, 2);
+    let (second_thread, second_thread_handle) = start(&second_handle, 3);
+    assert!(tasks.any_process_unexited_except(first));
+
+    let effects = tasks.exit_process(second, second_thread, 0).unwrap();
+    assert!(
+        release_pins(&mut registry, effects)
+            .into_iter()
+            .flatten()
+            .next()
+            .is_none()
+    );
+    // The second has exited and the first is the one asking.
+    assert!(!tasks.any_process_unexited_except(first));
+    // Asked on the second's behalf, the first is still running.
+    assert!(tasks.any_process_unexited_except(second));
+
+    let effects = tasks.exit_process(first, first_thread, 0).unwrap();
+    assert!(
+        release_pins(&mut registry, effects)
+            .into_iter()
+            .flatten()
+            .next()
+            .is_none()
+    );
+    assert!(!tasks.any_process_unexited_except(second));
+
+    for handle in [first_thread_handle, second_thread_handle] {
+        let final_release = registry.release_handle(handle).unwrap().unwrap();
+        finish_task_release(&mut tasks, &mut registry, final_release);
+    }
+    for handle in [first_handle, second_handle] {
+        let final_release = registry.release_handle(handle).unwrap().unwrap();
+        finish_task_release(&mut tasks, &mut registry, final_release);
+    }
+    let root_final = registry.release_internal(root_owner).unwrap().unwrap();
+    finish_task_release(&mut tasks, &mut registry, root_final);
+}
+
 #[test]
 fn process_gate_selects_one_termination_and_drains_preexisting_operations() {
     let mut registry = ObjectRegistry::<OBJECTS>::new();

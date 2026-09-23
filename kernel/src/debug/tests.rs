@@ -461,6 +461,19 @@ fn process_retirement_records_carry_the_exit_status_and_the_primordial_state() {
 }
 
 #[test]
+fn the_power_off_record_says_no_process_remains() {
+    let _test_lock = lock_output_guard_test();
+    let mut serial = Com1::new(FakePort::ready());
+    emit_system_empty_record(&mut serial).unwrap();
+    let port = serial.io;
+    let bytes = port.bytes();
+    assert_eq!(
+        core::str::from_utf8(&bytes[..port.write_count]).unwrap(),
+        "[DW0][INFO][task] no process remains; powering off\r\n"
+    );
+}
+
+#[test]
 fn smp_records_identify_cpu_apic_and_state() {
     let _test_lock = lock_output_guard_test();
     let mut serial = Com1::new(FakePort::ready());

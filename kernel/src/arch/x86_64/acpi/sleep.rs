@@ -1160,53 +1160,66 @@ mod tests {
 
     // ---- the production terminal path ----
     //
-    // The two arms below are compiled only for the freestanding production
+    // The arms below are compiled only for the freestanding production
     // target, so no host test can execute them and no instrumented product
     // reaches them. Without these checks the whole feature could be silently
     // reverted to a halt loop and every gate would stay green.
+    //
+    // Two kinds of arm end a production run: the primordial completion
+    // (F3A.7f), and the last Process leaving the machine empty (F3A.7j), which
+    // is the one WYR1 actually reaches. Each kind appears once per terminal
+    // path, and there are two terminal paths.
+
+    const TERMINAL_REPORTS: [(&str, usize); 2] = [
+        ("emit_early_bootstrap_completion_record", 2),
+        ("emit_early_system_empty_record", 2),
+    ];
 
     #[test]
-    fn each_production_completion_arm_powers_off_instead_of_halting() {
+    fn each_production_terminal_arm_powers_off_instead_of_halting() {
         const PRIMORDIAL: &str = include_str!("../mm/activation/primordial.rs");
-        const REPORT: &str = "emit_early_bootstrap_completion_record";
         const POWER_OFF: &str = "crate::arch::x86_64::power::soft_off_then_halt()";
 
-        let arms: Vec<&str> = PRIMORDIAL
-            .match_indices(REPORT)
-            .map(|(at, _)| &PRIMORDIAL[at..])
-            .collect();
-        assert_eq!(
-            arms.len(),
-            2,
-            "production has two completion-reporting arms; a new one needs a terminator too",
-        );
+        let mut total = 0;
+        for (report, expected) in TERMINAL_REPORTS {
+            let arms: Vec<&str> = PRIMORDIAL
+                .match_indices(report)
+                .map(|(at, _)| &PRIMORDIAL[at..])
+                .collect();
+            assert_eq!(
+                arms.len(),
+                expected,
+                "{report}: a new terminal arm needs a terminator too",
+            );
+            total += arms.len();
+            for (index, arm) in arms.iter().enumerate() {
+                // Skip the arm's own report so the scan measures what follows.
+                let body = &arm[report.len()..];
+                let power_off = body
+                    .find(POWER_OFF)
+                    .unwrap_or_else(|| panic!("{report} arm {index} never powers off"));
+                // Nothing may halt between reporting the cause and acting on it.
+                let before = &body[..power_off];
+                assert!(
+                    !before.contains("\"hlt\""),
+                    "{report} arm {index} halts before it reaches soft-off",
+                );
+                // A report of either kind before the terminator means the scan
+                // walked past the end of this arm and validated another one.
+                for (other, _) in TERMINAL_REPORTS {
+                    assert!(
+                        !before.contains(&std::format!("{other}(")),
+                        "{report} arm {index} runs into another arm instead of terminating",
+                    );
+                }
+            }
+        }
         assert_eq!(
             PRIMORDIAL.matches(POWER_OFF).count(),
-            arms.len(),
-            "every completion-reporting arm must end in soft-off",
+            total,
+            "every terminal arm, and nothing else, ends in soft-off",
         );
-        for (index, arm) in arms.iter().enumerate() {
-            // Skip the arm's own report so the scan measures what follows it.
-            let body = &arm[REPORT.len()..];
-            let power_off = body
-                .find(POWER_OFF)
-                .unwrap_or_else(|| panic!("completion arm {index} never powers the platform off"));
-            // Nothing may halt between reporting the cause and acting on it.
-            let before = &body[..power_off];
-            assert!(
-                !before.contains("\"hlt\""),
-                "completion arm {index} halts before it reaches soft-off",
-            );
-            assert!(
-                !before.contains(REPORT_TWICE_GUARD),
-                "completion arm {index} runs into the next arm instead of terminating",
-            );
-        }
     }
-
-    /// A second report inside one arm would mean the scan above walked past the
-    /// end of that arm and validated the wrong block.
-    const REPORT_TWICE_GUARD: &str = "emit_early_bootstrap_completion_record(";
 
     #[test]
     fn the_power_off_path_writes_pm1_control_before_it_halts() {

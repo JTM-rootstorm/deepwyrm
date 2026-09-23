@@ -4123,6 +4123,24 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     primordial_live,
                 );
             }
+            // F3A.7j. The primordial completion below is reached only when the
+            // primordial Process is itself the last to exit. Under WYR1 it
+            // never is: bootstrap hands off to permanent init and exits while
+            // init is runnable, so its exit takes the successor path above,
+            // and the Process that finally leaves the machine empty arrives
+            // here. Idling then waits for nothing -- no Process remains to be
+            // woken -- so F3A.7f's power-off was unreachable in production.
+            // Asked only here, with nothing runnable on this CPU, and only of
+            // Processes: one that still exists, in any state short of exited,
+            // keeps the idle this path always took.
+            #[cfg(not(feature = "test-support"))]
+            if !self
+                .tasks
+                .any_process_unexited_except(retirement.retired_process)
+            {
+                let _ = crate::debug::emit_early_system_empty_record();
+                crate::arch::x86_64::power::soft_off_then_halt()
+            }
             if crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
                 != Some(self.cpu.index())
             {
@@ -4811,6 +4829,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
 
         if retired_process != self.primordial_process {
+            // F3A.7j; see the same check in `prepare_terminal_handoff_detached`.
+            #[cfg(not(feature = "test-support"))]
+            if !self.tasks.any_process_unexited_except(retired_process) {
+                let _ = crate::debug::emit_early_system_empty_record();
+                crate::arch::x86_64::power::soft_off_then_halt()
+            }
             if crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
                 != Some(self.cpu.index())
             {
