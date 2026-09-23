@@ -21,13 +21,48 @@ fn h1_runtime_storage_is_bounded_cpu_private_and_guarded() {
     assert!(!SMP_SOURCE.contains("[local_apic_id as usize]"));
 }
 
+/// Reads source text because a host test cannot observe memory ordering. The
+/// zero-value refusals and the Failed transition are behavior, held by
+/// smp.rs's own `tests`; this pins what they cannot: each value is refused
+/// when zero, then stored, then published by a Release lifecycle CAS.
 #[test]
 fn h1_online_publication_and_failure_are_explicit() {
-    assert!(SMP_SOURCE.contains("Ordering::Release"));
-    assert!(SMP_SOURCE.contains("Ordering::Acquire"));
-    assert!(SMP_SOURCE.contains("CpuLifecycle::Failed"));
-    assert!(SMP_SOURCE.contains("ZeroGeneration"));
-    assert!(SMP_SOURCE.contains("ZeroFailureReason"));
+    assert_in_order(
+        fn_body(
+            SMP_SOURCE,
+            "pub(crate) fn publish_online(&self, generation: u64)",
+        ),
+        &[
+            "return Err(CpuStateError::ZeroGeneration);",
+            "self.online_generation.store(generation, Ordering::Relaxed);",
+            "self.transition(CpuLifecycle::Starting, CpuLifecycle::Online)",
+        ],
+    );
+    assert_in_order(
+        fn_body(
+            SMP_SOURCE,
+            "fn transition(&self, expected: CpuLifecycle, next: CpuLifecycle)",
+        ),
+        &[
+            ".compare_exchange(",
+            "expected as u8,",
+            "next as u8,",
+            "Ordering::Release,",
+            "Ordering::Acquire,",
+        ],
+    );
+    assert_in_order(
+        fn_body(SMP_SOURCE, "pub(crate) fn fail(&self, reason: u32)"),
+        &[
+            "return Err(CpuStateError::ZeroFailureReason);",
+            "self.failure_reason.store(reason, Ordering::Relaxed);",
+            ".compare_exchange(",
+            "observed,",
+            "CpuLifecycle::Failed as u8,",
+            "Ordering::Release,",
+            "Ordering::Acquire,",
+        ],
+    );
 }
 
 #[test]
@@ -84,4 +119,46 @@ fn h1_runtime_descriptor_bundles_are_fixed_private_and_release_published() {
     assert!(ARCH_SOURCE.contains("migrate_bsp_to_runtime_slot0_after_deep_paging"));
     assert!(ARCH_SOURCE.contains("initialize_ap_runtime_slot"));
     assert!(ARCH_SOURCE.contains("if cpu_index == 0"));
+}
+
+/// The body of the function whose signature starts with `signature`, from its
+/// opening brace to the matching closing brace.
+fn fn_body<'a>(source: &'a str, signature: &str) -> &'a str {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("missing `{signature}`"));
+    assert_eq!(
+        source.matches(signature).count(),
+        1,
+        "`{signature}` must name exactly one function"
+    );
+    let open = start
+        + source[start..]
+            .find('{')
+            .unwrap_or_else(|| panic!("`{signature}` has no body"));
+    let mut depth = 0_usize;
+    for (offset, character) in source[open..].char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[open..=open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("`{signature}` has an unterminated body")
+}
+
+/// Each needle occurs in `body`, after the previous one.
+fn assert_in_order(body: &str, needles: &[&str]) {
+    let mut cursor = 0;
+    for needle in needles {
+        let found = body[cursor..]
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` is missing or out of order in:\n{body}"));
+        cursor += found + needle.len();
+    }
 }
