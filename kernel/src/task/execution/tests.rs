@@ -701,6 +701,9 @@ fn failed_task_preparation_rolls_back_scheduler_stack_and_context_capacity() {
     );
 }
 
+/// The guard half of this contract is compile-fail: `sync` exporting either
+/// lock guard makes one of `tests/ui/sync_*_not_exported.rs` or
+/// `tests/ui/sync_*_module_private.rs` compile, which `task_authority_ui` fails.
 #[test]
 fn e3_execution_owners_are_send_sync_without_exporting_lock_guards() {
     fn assert_send_sync<T: Send + Sync>() {}
@@ -708,9 +711,6 @@ fn e3_execution_owners_are_send_sync_without_exporting_lock_guards() {
     assert_send_sync::<KernelStackPool<4>>();
     assert_send_sync::<ThreadContextPool<4>>();
     assert_send_sync::<ExecutionDomain<4>>();
-
-    let sync_surface = include_str!("../../sync/mod.rs");
-    assert!(!sync_surface.contains("SpinMutexGuard"));
 }
 
 #[test]

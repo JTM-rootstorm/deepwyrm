@@ -24,10 +24,30 @@ fn task_authority_compile_fail_contracts() {
         env::temp_dir().join(format!("deepwyrm-task-authority-ui-{}", std::process::id()));
     fs::create_dir_all(&output_dir).expect("create UI-test output directory");
 
-    let cases = [CompileFailCase {
-        fixture: "task_scheduler_reservation_clone.rs",
-        expected_error: "error[E0277]: the trait bound `SchedulerReservation: Clone` is not satisfied",
-    }];
+    let cases = [
+        CompileFailCase {
+            fixture: "task_scheduler_reservation_clone.rs",
+            expected_error: "error[E0277]: the trait bound `SchedulerReservation: Clone` is not satisfied",
+        },
+        // E3 execution owners hold no lock guard: `sync` exports neither guard
+        // type, by re-export or by a public module.
+        CompileFailCase {
+            fixture: "sync_spin_guard_not_exported.rs",
+            expected_error: "error[E0432]: unresolved import `sync::SpinMutexGuard`",
+        },
+        CompileFailCase {
+            fixture: "sync_irq_guard_not_exported.rs",
+            expected_error: "error[E0432]: unresolved import `sync::IrqSpinMutexGuard`",
+        },
+        CompileFailCase {
+            fixture: "sync_spin_module_private.rs",
+            expected_error: "error[E0603]: module `spin` is private",
+        },
+        CompileFailCase {
+            fixture: "sync_irq_module_private.rs",
+            expected_error: "error[E0603]: module `irq` is private",
+        },
+    ];
 
     for case in cases {
         run_compile_fail_case(
