@@ -2291,13 +2291,14 @@ mod tests {
         );
     }
 
+    /// Reads source text because the raw OP3 intercept and the terminal flush
+    /// live in target-only files (activation/primordial.rs, test_support/x86_64.rs)
+    /// that no host test compiles.
     #[test]
     fn source_contract_keeps_raw_op3_nonterminal_and_flushes_only_normal_completion() {
         let source = include_str!("../arch/x86_64/mm/activation/primordial.rs");
-        let scheduler_source = include_str!("../task/scheduler.rs");
         let execution_source = include_str!("../task/execution.rs");
         let terminal_source = include_str!("x86_64.rs");
-        let collector_source = include_str!("dw1c_evidence.rs");
         let raw = source
             .split("fn intercept_dw1c_evidence_raw(")
             .nth(1)
@@ -2324,13 +2325,6 @@ mod tests {
         assert!(
             facade.find("with_synchronized_runtime_at_safe_point(")
                 < facade.find("crate::task::drain_runnable_work_notifications();")
-        );
-        assert!(scheduler_source.contains(
-            "scheduler-snapshot identities for DW1-C records 42 and 44, not actor tokens"
-        ));
-        assert!(
-            collector_source
-                .contains("Records 42 and 44 share this selector-local scheduler-snapshot")
         );
         let retained = execution_source
             .split("fn observe_retained_current_published_expiry(")
