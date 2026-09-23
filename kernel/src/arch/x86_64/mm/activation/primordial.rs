@@ -141,6 +141,7 @@ const REGISTRY_OBJECTS: usize = 160;
 // historical bootstrap geometry.
 #[cfg(all(
     not(deepwyrm_wyr1e8_evidence),
+    not(deepwyrm_wyr1f_fairness_evidence),
     any(
         deepwyrm_wyr1c_evidence,
         deepwyrm_wyr1d_evidence,
@@ -153,6 +154,8 @@ const REGISTRY_OBJECTS: usize = 160;
 // endpoints. Select explicitly even though this bound also serves E7.
 #[cfg(deepwyrm_wyr1e8_evidence)]
 const REGISTRY_OBJECTS: usize = 160;
+#[cfg(deepwyrm_wyr1f_fairness_evidence)]
+const REGISTRY_OBJECTS: usize = super::wyr1f_fairness_resource_geometry::SELECTED.registry;
 // Selector 34's live graph: thirteen Process/Thread/root triples, fourteen
 // TaskGroups, the image MemoryObject peak, the Channel endpoint peak, devmgr's
 // boot resource domain, and init's control tick. Exact peak 115.
@@ -194,6 +197,7 @@ const MEMORY_OBJECTS: usize = 16;
 const MEMORY_OBJECTS: usize = 28;
 #[cfg(all(
     not(deepwyrm_wyr1e8_evidence),
+    not(deepwyrm_wyr1f_fairness_evidence),
     any(
         deepwyrm_wyr1c_evidence,
         deepwyrm_wyr1d_evidence,
@@ -204,6 +208,8 @@ const MEMORY_OBJECTS: usize = 28;
 const MEMORY_OBJECTS: usize = 28;
 #[cfg(deepwyrm_wyr1e8_evidence)]
 const MEMORY_OBJECTS: usize = 64;
+#[cfg(deepwyrm_wyr1f_fairness_evidence)]
+const MEMORY_OBJECTS: usize = super::wyr1f_fairness_resource_geometry::SELECTED.memory;
 // Four resident three-object images plus the shared bootfs, each hog's single
 // PT_LOAD and stack at the eight-hog ceiling, and one live progress child.
 #[cfg(deepwyrm_r1_evidence)]
@@ -241,6 +247,7 @@ const MEMORY_LEASES: usize = 16;
 const MEMORY_LEASES: usize = 28;
 #[cfg(all(
     not(deepwyrm_wyr1e8_evidence),
+    not(deepwyrm_wyr1f_fairness_evidence),
     any(
         deepwyrm_wyr1c_evidence,
         deepwyrm_wyr1d_evidence,
@@ -251,6 +258,8 @@ const MEMORY_LEASES: usize = 28;
 const MEMORY_LEASES: usize = 28;
 #[cfg(deepwyrm_wyr1e8_evidence)]
 const MEMORY_LEASES: usize = 64;
+#[cfg(deepwyrm_wyr1f_fairness_evidence)]
+const MEMORY_LEASES: usize = super::wyr1f_fairness_resource_geometry::SELECTED.mappings;
 // Every live image object is mapped exactly once; the loader unmaps its
 // scratch view before mapping the child, so leases track objects.
 #[cfg(deepwyrm_r1_evidence)]
@@ -313,7 +322,11 @@ const USERSPACE_CHAIN_PROCESSES: usize = 8;
 // Selector 33 adds four lifetime-distinct job actors to the resident E6
 // service graph. The scheduler retains terminal identities for the boot, so
 // size this selector-local test artifact for the full interactive sequence.
-#[cfg(all(deepwyrm_wyr1e_evidence, not(deepwyrm_wyr1e8_evidence)))]
+#[cfg(all(
+    deepwyrm_wyr1e_evidence,
+    not(deepwyrm_wyr1e8_evidence),
+    not(deepwyrm_wyr1f_fairness_evidence)
+))]
 const USERSPACE_CHAIN_PROCESSES: usize = 16;
 // E8 includes thirty lifetime identities across actors and replacement service
 // generations, with thirteen simultaneously live Processes at S4's peak.
@@ -321,6 +334,9 @@ const USERSPACE_CHAIN_PROCESSES: usize = 16;
 // the accepted selector-private 64 task-family headroom for the full scenario.
 #[cfg(deepwyrm_wyr1e8_evidence)]
 const USERSPACE_CHAIN_PROCESSES: usize = 64;
+#[cfg(deepwyrm_wyr1f_fairness_evidence)]
+const USERSPACE_CHAIN_PROCESSES: usize =
+    super::wyr1f_fairness_resource_geometry::SELECTED.identities;
 #[cfg(any(
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
@@ -363,12 +379,18 @@ const CHANNEL_PAIRS: usize = 24;
     deepwyrm_dw1e_evidence
 ))]
 const CHANNEL_PAIRS: usize = 24;
-#[cfg(all(deepwyrm_wyr1e_evidence, not(deepwyrm_wyr1e8_evidence)))]
+#[cfg(all(
+    deepwyrm_wyr1e_evidence,
+    not(deepwyrm_wyr1e8_evidence),
+    not(deepwyrm_wyr1f_fairness_evidence)
+))]
 const CHANNEL_PAIRS: usize = 24;
 // E8 adds the retained consoled control endpoint and overlapping job actors.
 // Thirty-two pairs give bounded headroom without changing production ABI.
 #[cfg(deepwyrm_wyr1e8_evidence)]
 const CHANNEL_PAIRS: usize = 32;
+#[cfg(deepwyrm_wyr1f_fairness_evidence)]
+const CHANNEL_PAIRS: usize = super::wyr1f_fairness_resource_geometry::SELECTED.channel_pairs;
 // Nine baseline startup/service pairs, one retained one-sided startup pair per
 // hog at the ceiling, and the live progress child's pair: exact peak 18.
 #[cfg(deepwyrm_r1_evidence)]
@@ -459,10 +481,16 @@ const TASK_GROUPS: usize = 8;
     deepwyrm_dw1e_evidence
 ))]
 const TASK_GROUPS: usize = 8;
-#[cfg(all(deepwyrm_wyr1e_evidence, not(deepwyrm_wyr1e8_evidence)))]
+#[cfg(all(
+    deepwyrm_wyr1e_evidence,
+    not(deepwyrm_wyr1e8_evidence),
+    not(deepwyrm_wyr1f_fairness_evidence)
+))]
 const TASK_GROUPS: usize = 8;
 #[cfg(deepwyrm_wyr1e8_evidence)]
 const TASK_GROUPS: usize = 64;
+#[cfg(deepwyrm_wyr1f_fairness_evidence)]
+const TASK_GROUPS: usize = super::wyr1f_fairness_resource_geometry::SELECTED.identities;
 // One attempt TaskGroup per launched identity plus root. Held to the same
 // lifetime pool as Processes so a launch cannot outlive its group accounting.
 #[cfg(deepwyrm_r1_evidence)]
@@ -541,6 +569,7 @@ const HANDLES: usize = 16;
 const HANDLES: usize = 32;
 #[cfg(all(
     not(deepwyrm_wyr1e8_evidence),
+    not(deepwyrm_wyr1f_fairness_evidence),
     any(
         deepwyrm_wyr1c_evidence,
         deepwyrm_wyr1d_evidence,
@@ -551,6 +580,8 @@ const HANDLES: usize = 32;
 const HANDLES: usize = 32;
 #[cfg(deepwyrm_wyr1e8_evidence)]
 const HANDLES: usize = 64;
+#[cfg(deepwyrm_wyr1f_fairness_evidence)]
+const HANDLES: usize = super::wyr1f_fairness_resource_geometry::SELECTED.handles;
 // init's fourteen-handle resident baseline, two retained handles per hog at the
 // eight-hog ceiling, and the zero-stream loader's additive seven: exact peak
 // 37. Deliberately below E8's 64 — its widened tables are why E8's termination
@@ -586,6 +617,36 @@ const _: () = {
     assert!(TIMERS >= super::wyr1e8_resource_geometry::TIMER_PEAK);
     assert!(EVENTS >= super::wyr1e8_resource_geometry::EVENT_PEAK);
     assert!(REGION_SLOTS >= super::wyr1e8_resource_geometry::REGION_MAPPING_PEAK);
+    assert!(fits(Capacity {
+        handles: HANDLES,
+        memory: MEMORY_OBJECTS,
+        mappings: MEMORY_LEASES,
+        identities: PROCESSES,
+        registry: REGISTRY_OBJECTS,
+        channel_pairs: CHANNEL_PAIRS,
+        waits: WAITERS,
+        evidence: SELECTED.evidence,
+    }));
+};
+// F3A.7k. The F closure selector's concurrent-hog leg, pinned to its ledger
+// the way E8 is to its own. `WAITERS` is the shared interactive wait geometry,
+// which already meets this ledger's figure.
+#[cfg(deepwyrm_wyr1f_fairness_evidence)]
+const _: () = {
+    use super::wyr1f_fairness_resource_geometry::{Capacity, SELECTED, fits};
+    assert!(HANDLES == SELECTED.handles);
+    assert!(MEMORY_OBJECTS == SELECTED.memory);
+    assert!(MEMORY_LEASES == SELECTED.mappings);
+    assert!(PROCESSES == SELECTED.identities);
+    assert!(THREADS == SELECTED.identities);
+    assert!(TASK_GROUPS == SELECTED.identities);
+    assert!(REGISTRY_OBJECTS == SELECTED.registry);
+    assert!(CHANNEL_PAIRS == SELECTED.channel_pairs);
+    assert!(WAITERS >= SELECTED.waits);
+    assert!(TIMERS >= super::wyr1f_fairness_resource_geometry::TIMER_PEAK);
+    assert!(EVENTS >= super::wyr1f_fairness_resource_geometry::EVENT_PEAK);
+    assert!(REGION_SLOTS >= super::wyr1f_fairness_resource_geometry::REGION_MAPPING_PEAK);
+    assert!(super::LIVE_ADDRESS_SPACE_CAPACITY == SELECTED.identities);
     assert!(fits(Capacity {
         handles: HANDLES,
         memory: MEMORY_OBJECTS,
@@ -885,7 +946,11 @@ const _: [(); 160] = [(); REGISTRY_OBJECTS];
     deepwyrm_dw1e_evidence
 ))]
 const _: [(); 8] = [(); USERSPACE_CHAIN_PROCESSES];
-#[cfg(all(deepwyrm_wyr1e_evidence, not(deepwyrm_wyr1e8_evidence)))]
+#[cfg(all(
+    deepwyrm_wyr1e_evidence,
+    not(deepwyrm_wyr1e8_evidence),
+    not(deepwyrm_wyr1f_fairness_evidence)
+))]
 const _: [(); 16] = [(); USERSPACE_CHAIN_PROCESSES];
 #[cfg(deepwyrm_wyr1e8_evidence)]
 const _: [(); 64] = [(); USERSPACE_CHAIN_PROCESSES];
@@ -895,12 +960,17 @@ const _: [(); 64] = [(); USERSPACE_CHAIN_PROCESSES];
     deepwyrm_dw1e_evidence
 ))]
 const _: [(); 24] = [(); CHANNEL_PAIRS];
-#[cfg(all(deepwyrm_wyr1e_evidence, not(deepwyrm_wyr1e8_evidence)))]
+#[cfg(all(
+    deepwyrm_wyr1e_evidence,
+    not(deepwyrm_wyr1e8_evidence),
+    not(deepwyrm_wyr1f_fairness_evidence)
+))]
 const _: [(); 24] = [(); CHANNEL_PAIRS];
 #[cfg(deepwyrm_wyr1e8_evidence)]
 const _: [(); 32] = [(); CHANNEL_PAIRS];
 #[cfg(all(
     not(deepwyrm_wyr1e8_evidence),
+    not(deepwyrm_wyr1f_fairness_evidence),
     any(
         deepwyrm_wyr1c_evidence,
         deepwyrm_wyr1d_evidence,
@@ -911,6 +981,7 @@ const _: [(); 32] = [(); CHANNEL_PAIRS];
 const _: [(); 32] = [(); HANDLES];
 #[cfg(all(
     not(deepwyrm_wyr1e8_evidence),
+    not(deepwyrm_wyr1f_fairness_evidence),
     any(
         deepwyrm_wyr1c_evidence,
         deepwyrm_wyr1d_evidence,
@@ -921,6 +992,7 @@ const _: [(); 32] = [(); HANDLES];
 const _: [(); 28] = [(); MEMORY_OBJECTS];
 #[cfg(all(
     not(deepwyrm_wyr1e8_evidence),
+    not(deepwyrm_wyr1f_fairness_evidence),
     any(
         deepwyrm_wyr1c_evidence,
         deepwyrm_wyr1d_evidence,
@@ -929,11 +1001,14 @@ const _: [(); 28] = [(); MEMORY_OBJECTS];
     )
 ))]
 const _: [(); 28] = [(); MEMORY_LEASES];
-#[cfg(any(
-    deepwyrm_wyr1c_evidence,
-    deepwyrm_wyr1d_evidence,
-    deepwyrm_wyr1e_evidence,
-    deepwyrm_dw1e_evidence
+#[cfg(all(
+    not(deepwyrm_wyr1f_fairness_evidence),
+    any(
+        deepwyrm_wyr1c_evidence,
+        deepwyrm_wyr1d_evidence,
+        deepwyrm_wyr1e_evidence,
+        deepwyrm_dw1e_evidence
+    )
 ))]
 const _: [(); 160] = [(); REGISTRY_OBJECTS];
 #[cfg(any(deepwyrm_wyr1c_evidence, deepwyrm_dw1e_evidence))]
@@ -951,7 +1026,11 @@ const _: [(); 64] = [(); WAITERS];
 const _: [(); 2] = [(); TIMERS];
 #[cfg(any(deepwyrm_dw1e_evidence, deepwyrm_wyr1d_evidence))]
 const _: [(); 8] = [(); TASK_GROUPS];
-#[cfg(all(deepwyrm_wyr1e_evidence, not(deepwyrm_wyr1e8_evidence)))]
+#[cfg(all(
+    deepwyrm_wyr1e_evidence,
+    not(deepwyrm_wyr1e8_evidence),
+    not(deepwyrm_wyr1f_fairness_evidence)
+))]
 const _: [(); 8] = [(); TASK_GROUPS];
 #[cfg(deepwyrm_wyr1e8_evidence)]
 const _: [(); 64] = [(); TASK_GROUPS];

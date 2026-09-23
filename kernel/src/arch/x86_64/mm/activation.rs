@@ -72,11 +72,11 @@ mod wyr1e8_resource_geometry;
 #[cfg(any(test, all(target_os = "none", deepwyrm_wyr1e_evidence)))]
 #[path = "activation/wyr1e_wait_geometry.rs"]
 mod wyr1e_wait_geometry;
-// Test-support fixture for the WYR1-F fairness leg (F3A.6p), separate from
+// Test-support ledger for the WYR1-F fairness leg (F3A.6p), separate from
 // `production_resource_geometry`'s frozen single-live-job production demand.
-// Not selected by any product arm in `primordial.rs`; compiled here only so
-// its own tests (and, target-side, a future selector's explicit choice) run
-// where every other geometry model's do.
+// Selected by the F closure selector since F3A.7k (see `build.rs`), and
+// compiled in the host lane so its own tests run where every other geometry
+// model's do.
 #[cfg(any(test, all(target_os = "none", deepwyrm_wyr1f_fairness_evidence)))]
 #[path = "activation/wyr1f_fairness_resource_geometry.rs"]
 mod wyr1f_fairness_resource_geometry;
@@ -194,8 +194,15 @@ const LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;
 // Selector 33 retains the E6 product plus the selected shell and bounded job
 // actor generations under the permanent controller.
-#[cfg(all(deepwyrm_wyr1e_evidence, not(deepwyrm_wyr1e8_evidence)))]
+#[cfg(all(
+    deepwyrm_wyr1e_evidence,
+    not(deepwyrm_wyr1e8_evidence),
+    not(deepwyrm_wyr1f_fairness_evidence)
+))]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 16;
+// The F closure selector's concurrent-hog leg (F3A.7k).
+#[cfg(deepwyrm_wyr1f_fairness_evidence)]
+const LIVE_ADDRESS_SPACE_CAPACITY: usize = wyr1f_fairness_resource_geometry::SELECTED.identities;
 // E8 retains every replaced product generation and runs six concurrent hogs.
 // The selector-local 64-root geometry covers the enumerated 30-identity
 // lifetime floor with useful recovery and cleanup headroom.

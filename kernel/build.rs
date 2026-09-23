@@ -132,10 +132,10 @@ fn run() -> Result<(), String> {
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1e_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_r1_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1e8_evidence)");
-    // Declared, not selected: no selector string activates this cfg yet.
-    // `wyr1f_fairness_resource_geometry.rs` (F3A.6p) is a test-support
-    // fixture only; wiring a selector to it is a separate, coordinator-owned
-    // cross-repository step.
+    // Selected by the F closure selector, `dw1-wyr1-interactive-closure`,
+    // unless E8 evidence is also requested (F3A.7k). Wires
+    // `wyr1f_fairness_resource_geometry.rs` (F3A.6p) into the kernel's
+    // capacity arms.
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1f_fairness_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1e_platform)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_production_product)");
@@ -203,7 +203,12 @@ fn run() -> Result<(), String> {
     let task_layout = TaskLayout::parse(&task_layout_source)
         .map_err(|error| format!("{}: {error}", task_layout_path.display()))?;
     let wyr1e8 = optional_wyr1e8_evidence()?;
-    let task_layout = select_task_layout(task_layout, wyr1e8);
+    // F3A.7k. The F closure selector's fairness ledger needs seventeen live
+    // identities, one above the ordinary sixteen-stack arena, so it links the
+    // same sixty-four-stack layout E8 does -- the only other shape the linker
+    // script admits -- without taking E8's evidence machinery with it.
+    let sixty_four_stacks = wyr1e8 || wyr1f_fairness_selected(optional_guest_selector()?, wyr1e8);
+    let task_layout = select_task_layout(task_layout, sixty_four_stacks);
     emit_task_layout_env(task_layout);
 
     configure_guest_test(&guest_harness_path)?;
@@ -410,7 +415,13 @@ fn run() -> Result<(), String> {
         link_objects.push(f12_user_object.as_path());
     }
 
-    for argument in linker_arguments(layout, task_layout, wyr1e8, &linker_path, &link_objects) {
+    for argument in linker_arguments(
+        layout,
+        task_layout,
+        sixty_four_stacks,
+        &linker_path,
+        &link_objects,
+    ) {
         println!("cargo:rustc-link-arg={argument}");
     }
 
@@ -1189,9 +1200,30 @@ fn configure_guest_test(harness_path: &Path) -> Result<(), String> {
                 let nonce = required_wyr1e_hex("DEEPWYRM_WYR1E7_EVIDENCE_NONCE")?;
                 println!("cargo:rustc-env=DEEPWYRM_WYR1E7_EVIDENCE_NONCE={nonce}");
             }
+            if wyr1f_fairness_selected(Some(selector.as_str()), wyr1e8) {
+                println!("cargo:rustc-cfg=deepwyrm_wyr1f_fairness_evidence");
+            }
         }
     }
     Ok(())
+}
+
+/// F3A.7k. The F closure selector's concurrent-hog leg runs against
+/// `wyr1f_fairness_resource_geometry` (F3A.6p) rather than the thirty-two-
+/// handle interactive geometry, which refuses the second concurrent hog. E8
+/// keeps its own geometry: the two are mutually exclusive, and E8 wins.
+fn wyr1f_fairness_selected(selector: Option<&str>, wyr1e8: bool) -> bool {
+    !wyr1e8 && selector == Some(WYR1F_CLOSURE_SELECTOR)
+}
+
+fn optional_guest_selector() -> Result<Option<&'static str>, String> {
+    match env::var("DEEPWYRM_GUEST_TEST_SELECTOR") {
+        Ok(selector) if selector == WYR1F_CLOSURE_SELECTOR => Ok(Some(WYR1F_CLOSURE_SELECTOR)),
+        Ok(_) | Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err("DEEPWYRM_GUEST_TEST_SELECTOR must be valid UTF-8".into())
+        }
+    }
 }
 
 fn optional_wyr1e8_evidence() -> Result<bool, String> {
@@ -2547,6 +2579,20 @@ mod tests {
         assert!(validate_wyr1_evidence_scenario("normal").is_ok());
         assert!(validate_wyr1_evidence_scenario("degraded_recovery").is_ok());
         assert!(validate_wyr1_evidence_scenario("degraded").is_err());
+    }
+
+    #[test]
+    fn only_the_closure_selector_without_e8_selects_the_fairness_geometry() {
+        assert!(wyr1f_fairness_selected(
+            Some("dw1-wyr1-interactive-closure"),
+            false
+        ));
+        assert!(!wyr1f_fairness_selected(
+            Some("dw1-wyr1-interactive-closure"),
+            true
+        ));
+        assert!(!wyr1f_fairness_selected(Some("interactive-wyrmsh"), false));
+        assert!(!wyr1f_fairness_selected(None, false));
     }
 
     #[test]

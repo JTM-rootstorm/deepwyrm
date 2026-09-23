@@ -1122,17 +1122,49 @@ fn the_production_product_selects_its_own_resource_geometry() {
         "#[cfg(deepwyrm_production_product)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = production_resource_geometry::SELECTED.identities;"
     ));
 
-    // The instrumented half of the same reconciliation. Wyrmroot's WYR1-F
-    // receipt records `kernel_resource_geometry = "wyr1e-interactive"` with a
-    // 32-handle, 160-entry, sixteen-identity table for the selector-35
-    // siblings, and it cannot read these arms. Asserted here so a change to
-    // them fails in this repository first.
-    assert!(runtime.contains(
-        "#[cfg(all(deepwyrm_wyr1e_evidence, not(deepwyrm_wyr1e8_evidence)))]\nconst USERSPACE_CHAIN_PROCESSES: usize = 16;"
+    // The instrumented half of the same reconciliation. Since F3A.7k the
+    // selector-35 siblings select the WYR1-F fairness ledger, and Wyrmroot's
+    // WYR1-F receipt records `kernel_resource_geometry = "wyr1f-fairness"` with
+    // a 64-handle, 192-entry, sixty-four-identity table. Wyrmroot cannot read
+    // these arms, so they are asserted here, and a change to them fails in
+    // this repository first. The arms name the ledger rather than literals,
+    // and the ledger holds the figures.
+    let squeezed: String = runtime.chars().filter(|c| !c.is_whitespace()).collect();
+    for (name, field) in [
+        ("USERSPACE_CHAIN_PROCESSES", "identities"),
+        ("TASK_GROUPS", "identities"),
+        ("HANDLES", "handles"),
+        ("REGISTRY_OBJECTS", "registry"),
+        ("MEMORY_OBJECTS", "memory"),
+        ("MEMORY_LEASES", "mappings"),
+        ("CHANNEL_PAIRS", "channel_pairs"),
+    ] {
+        assert!(
+            squeezed.contains(&format!(
+                "#[cfg(deepwyrm_wyr1f_fairness_evidence)]const{name}:usize=super::wyr1f_fairness_resource_geometry::SELECTED.{field};"
+            )),
+            "{name} does not select the fairness ledger"
+        );
+    }
+    let fairness = source("src/arch/x86_64/mm/activation/wyr1f_fairness_resource_geometry.rs");
+    for figure in ["handles: 64,", "identities: 64,", "registry: 192,"] {
+        assert!(
+            fairness.contains(figure),
+            "fairness ledger no longer says {figure}"
+        );
+    }
+    assert!(activation.contains(
+        "#[cfg(deepwyrm_wyr1f_fairness_evidence)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = wyr1f_fairness_resource_geometry::SELECTED.identities;"
     ));
-    assert!(runtime.contains("))]\nconst HANDLES: usize = 32;"));
-    assert!(runtime.contains(
-        "#[cfg(all(deepwyrm_wyr1e_evidence, not(deepwyrm_wyr1e8_evidence)))]\nconst TASK_GROUPS: usize = 8;"
+    let build = source("build.rs");
+    assert!(build.contains("!wyr1e8 && selector == Some(WYR1F_CLOSURE_SELECTOR)"));
+    // Without the emission, selector 35 falls back to the thirty-two-handle
+    // arms and every gate still compiles.
+    let selected = build
+        .find("if wyr1f_fairness_selected(Some(selector.as_str()), wyr1e8) {")
+        .expect("the closure selector no longer asks for the fairness geometry");
+    assert!(build[selected..].lines().nth(1).is_some_and(
+        |line| line.trim() == "println!(\"cargo:rustc-cfg=deepwyrm_wyr1f_fairness_evidence\");"
     ));
 }
 
