@@ -102,7 +102,7 @@ pub(crate) use address_space::{
 use graph::*;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) use user_access::LiveProcessAddressSpace;
-#[cfg(deepwyrm_f9_guest)]
+#[cfg(all(deepwyrm_f9_guest, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use user_access::OwnedLiveAtomicU32;
 #[path = "activation/build.rs"]
 mod build;

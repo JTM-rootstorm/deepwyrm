@@ -3901,7 +3901,7 @@ pub(crate) unsafe fn poll_wait_idle_suspend<
             .map_err(WaitSuspendError::Switch)?;
             Ok(NativeIdleSuspendPoll::Switch(plan))
         }
-        #[cfg(deepwyrm_dw1c_evidence)]
+        #[cfg(all(deepwyrm_dw1c_evidence, target_os = "none", target_arch = "x86_64"))]
         IdleScheduleDecision::Detach(request) => {
             let idle_stack = crate::arch::x86_64::linked_runtime_cpu_stack_layout()
                 .map_err(|_| WaitSuspendError::InvalidDecision)?
@@ -3919,7 +3919,13 @@ pub(crate) unsafe fn poll_wait_idle_suspend<
             .map_err(WaitSuspendError::Switch)?;
             Ok(NativeIdleSuspendPoll::Detach { plan, request })
         }
-        #[cfg(all(test, not(deepwyrm_dw1c_evidence)))]
+        // The live detach needs the linked per-CPU stacks and the detached
+        // idle entry, which exist only in the freestanding kernel. A host test
+        // build under the DW1-C evidence cfg has the variant but not those.
+        #[cfg(all(
+            any(test, deepwyrm_dw1c_evidence),
+            not(all(deepwyrm_dw1c_evidence, target_os = "none", target_arch = "x86_64"))
+        ))]
         IdleScheduleDecision::Detach(_) => Err(WaitSuspendError::InvalidDecision),
     }
 }
@@ -3964,7 +3970,7 @@ pub(crate) unsafe fn poll_wait_idle_suspend_on<
             .map_err(WaitSuspendError::Switch)?;
             Ok(NativeIdleSuspendPoll::Switch(plan))
         }
-        #[cfg(deepwyrm_dw1c_evidence)]
+        #[cfg(all(deepwyrm_dw1c_evidence, target_os = "none", target_arch = "x86_64"))]
         IdleScheduleDecision::Detach(request) => {
             let idle_stack = crate::arch::x86_64::linked_runtime_cpu_stack_layout()
                 .map_err(|_| WaitSuspendError::InvalidDecision)?
@@ -3982,7 +3988,13 @@ pub(crate) unsafe fn poll_wait_idle_suspend_on<
             .map_err(WaitSuspendError::Switch)?;
             Ok(NativeIdleSuspendPoll::Detach { plan, request })
         }
-        #[cfg(all(test, not(deepwyrm_dw1c_evidence)))]
+        // The live detach needs the linked per-CPU stacks and the detached
+        // idle entry, which exist only in the freestanding kernel. A host test
+        // build under the DW1-C evidence cfg has the variant but not those.
+        #[cfg(all(
+            any(test, deepwyrm_dw1c_evidence),
+            not(all(deepwyrm_dw1c_evidence, target_os = "none", target_arch = "x86_64"))
+        ))]
         IdleScheduleDecision::Detach(_) => Err(WaitSuspendError::InvalidDecision),
     }
 }

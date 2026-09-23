@@ -20,7 +20,7 @@ pub(crate) use f_services::{
     FServiceResume, FServiceResumeError, FServiceRoute, FServiceState, FServiceTerminalCleanup,
 };
 
-#[cfg(deepwyrm_f9_guest)]
+#[cfg(all(deepwyrm_f9_guest, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use adapters::atomic_wake_with;
 #[cfg(all(deepwyrm_dw1c_evidence, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use adapters::copy_dw1c_evidence_input;
