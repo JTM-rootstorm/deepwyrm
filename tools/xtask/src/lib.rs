@@ -129,8 +129,9 @@ Commands:
   doc                                Warnings-denied rustdoc over the workspace
   abi generate                       Generate ABI-owned artifacts
   abi check                          Verify generated ABI artifacts have no drift
-  test host [abi|memory|handles|tasks|ipc]
-                                     Run focused host tests
+  test host [abi|memory|handles|tasks|ipc|selectors]
+                                     Run host tests: unfiltered is the workspace
+                                     then the kernel under every selector build
   run --plan --request <path>        Emit the canonical QEMU run plan only
   gdb --plan --request <path>        Emit paused QEMU/GDB command plans only
   test guest <selector> --plan --request <path>
@@ -184,6 +185,7 @@ enum HostTestFilter {
     Handles,
     Tasks,
     Ipc,
+    Selectors,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -468,8 +470,19 @@ fn run_invocation(invocation: Invocation) -> io::Result<u8> {
                 Some(HostTestFilter::Ipc) => {
                     return run_ipc_host_tests();
                 }
+                Some(HostTestFilter::Selectors) => {
+                    return run_selector_host_tests();
+                }
                 None => {
+                    // The workspace first, then the kernel under every selector
+                    // build: the per-selector rows cost about four minutes, well
+                    // inside what the default run can carry (S1.1).
                     command.args(["--workspace", "--all-targets"]);
+                    let status = command.status()?;
+                    if !status.success() {
+                        return Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8);
+                    }
+                    return run_selector_host_tests();
                 }
             }
         }
@@ -799,6 +812,59 @@ fn run_production_kernel_warning_gate() -> io::Result<u8> {
             "error: the production kernel does not compile warning-free"
         )?;
         return Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8);
+    }
+    Ok(0)
+}
+
+/// Runs the kernel's host unit tests once per selector build, with
+/// `test-support` and that row's environment.
+///
+/// The workspace run has no selector, so it compiles neither the
+/// `feature = "test-support"` code nor anything under the evidence cfgs
+/// `build.rs` derives from `DEEPWYRM_GUEST_TEST_SELECTOR`. Until S1.1 no gate
+/// ran those host tests, and the first run found two selectors whose host test
+/// builds did not compile and four tests that failed under another selector's
+/// cfg. Only `--lib`: the lane admits `test-support` for nothing else.
+fn run_selector_host_tests() -> io::Result<u8> {
+    let Some(selectors) = read_implemented_guest_selectors()? else {
+        return Ok(EXIT_NOT_IMPLEMENTED);
+    };
+    for build in selector_builds(&selectors) {
+        {
+            let mut stderr = io::stderr().lock();
+            writeln!(
+                stderr,
+                "xtask: kernel host tests for selector {}",
+                build.label
+            )?;
+        }
+        let mut command = Command::new("cargo");
+        command.current_dir(workspace_root());
+        clear_selector_environment(&mut command);
+        command.env("DEEPWYRM_GUEST_TEST_SELECTOR", build.selector);
+        for (name, value) in build.environment {
+            command.env(name, value);
+        }
+        let status = command
+            .args([
+                "test",
+                "--locked",
+                "--package",
+                "deepwyrm-kernel",
+                "--lib",
+                "--features",
+                "test-support",
+            ])
+            .status()?;
+        if !status.success() {
+            let mut stderr = io::stderr().lock();
+            writeln!(
+                stderr,
+                "error: kernel host tests fail for selector {}",
+                build.label
+            )?;
+            return Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8);
+        }
     }
     Ok(0)
 }

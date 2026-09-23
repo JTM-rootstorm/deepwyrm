@@ -105,8 +105,11 @@ pub(super) fn parse_test(args: &[String]) -> Action {
                     Action::Command(Invocation::HostTests(Some(HostTestFilter::Tasks)))
                 }
                 "ipc" => Action::Command(Invocation::HostTests(Some(HostTestFilter::Ipc))),
+                "selectors" => {
+                    Action::Command(Invocation::HostTests(Some(HostTestFilter::Selectors)))
+                }
                 _ => Action::UsageError(
-                    "unknown host-test filter; expected `abi`, `memory`, `handles`, `tasks`, or `ipc`"
+                    "unknown host-test filter; expected `abi`, `memory`, `handles`, `tasks`, `ipc`, or `selectors`"
                         .into(),
                 ),
             },
@@ -173,7 +176,7 @@ pub(super) fn print_help(mut writer: impl Write, command: Option<&str>) -> io::R
         ),
         Some("test") => write!(
             writer,
-            "Usage: cargo xtask test <host|guest|integration> ...\n\nHost filters are `abi`, `memory`, `handles`, `tasks`, and `ipc`. `test host ipc` runs the bounded IPC, wait, time, handle-transfer, timer, finalizer, and process-creation host suite. `test guest` emits a plan only; guest execution remains coordinator-owned.\n"
+            "Usage: cargo xtask test <host|guest|integration> ...\n\nUnfiltered `test host` runs the workspace tests, then the kernel's host unit tests once per selector build (every implemented selector plus its variants) with `test-support`. Host filters are `abi`, `memory`, `handles`, `tasks`, `ipc`, and `selectors`. `test host ipc` runs the bounded IPC, wait, time, handle-transfer, timer, finalizer, and process-creation host suite. `test host selectors` runs only the per-selector kernel host tests. `test guest` emits a plan only; guest execution remains coordinator-owned.\n"
         ),
         Some(command @ ("run" | "gdb")) => write!(
             writer,

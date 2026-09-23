@@ -79,6 +79,10 @@ fn available_commands_have_explicit_actions() {
             Action::Command(Invocation::HostTests(Some(HostTestFilter::Ipc))),
         ),
         (
+            &["test", "host", "selectors"][..],
+            Action::Command(Invocation::HostTests(Some(HostTestFilter::Selectors))),
+        ),
+        (
             &["run", "--plan", "--request", "request.toml"][..],
             Action::Command(Invocation::HarnessPlan(
                 HarnessKind::Run,
