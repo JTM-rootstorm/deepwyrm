@@ -1,0 +1,18 @@
+# Lint ratchet baseline (S1.3), read by `xtask clippy`.
+#
+# `<scope> <counter> <count>`. The gate fails when a current count exceeds its
+# row (a missing row is zero) and prints every count that fell; lower the row
+# in the same change that lowers the count. Never raise a row to admit new
+# findings.
+#
+# Clippy rows: host `cargo clippy --workspace --all-targets` at warn level,
+# per package, each primary location once. Host Clippy does not see
+# `target_os = "none"` code or `test-support`/selector builds.
+#
+# Text rows: `unsafe {` blocks without `// SAFETY:` in the four preceding
+# lines, for target-only files host Clippy never compiles.
+
+deepwyrm-kernel clippy::undocumented_unsafe_blocks 240
+deepwyrm-kernel clippy::wildcard_enum_match_arm 88
+kernel/src/arch/x86_64/mm/activation/primordial.rs unsafe-block-without-safety-comment 47
+kernel/src/arch/x86_64/syscall/live.rs unsafe-block-without-safety-comment 86

@@ -985,3 +985,142 @@ fn selector_builds_are_every_selector_once_then_every_variant() {
         "build.rs rejects the E7 nonce in an E8 build"
     );
 }
+
+fn clippy_message(package_id: &str, lint: &str, file: &str, line: u32, column: u32) -> String {
+    format!(
+        concat!(
+            r#"{{"reason":"compiler-message","package_id":"{package_id}","#,
+            r#""target":{{"kind":["lib"],"name":"x"}},"message":{{"rendered":"warning: é\n --> {file}:{line}:{column}\n","#,
+            r#""$message_type":"diagnostic","children":[{{"children":[],"code":null,"level":"help","message":"h","rendered":null,"spans":[]}}],"#,
+            r#""code":{{"code":"{lint}","explanation":null}},"level":"warning","message":"m","#,
+            r#""spans":[{{"file_name":"other.rs","is_primary":false,"line_start":1,"column_start":1}},"#,
+            r#"{{"byte_end":10,"file_name":"{file}","is_primary":true,"line_start":{line},"column_start":{column},"text":[]}}]}}}}"#
+        ),
+        package_id = package_id,
+        lint = lint,
+        file = file,
+        line = line,
+        column = column,
+    )
+}
+
+#[test]
+fn the_lint_ratchet_counts_each_finding_once_per_package_and_lint() {
+    let kernel = "path+file:///w/kernel#deepwyrm-kernel@0.0.0";
+    let stream = [
+        r#"{"reason":"compiler-artifact","package_id":"x"}"#.to_owned(),
+        clippy_message(
+            kernel,
+            "clippy::wildcard_enum_match_arm",
+            "kernel/src/a.rs",
+            3,
+            9,
+        ),
+        // The same finding again, as `--all-targets` reports it for the
+        // library's test harness.
+        clippy_message(
+            kernel,
+            "clippy::wildcard_enum_match_arm",
+            "kernel/src/a.rs",
+            3,
+            9,
+        ),
+        clippy_message(
+            kernel,
+            "clippy::wildcard_enum_match_arm",
+            "kernel/src/a.rs",
+            4,
+            9,
+        ),
+        clippy_message(
+            kernel,
+            "clippy::undocumented_unsafe_blocks",
+            "kernel/src/a.rs",
+            3,
+            9,
+        ),
+        clippy_message(
+            "abi-gen 0.0.0 (path+file:///w/tools/abi-gen)",
+            "clippy::undocumented_unsafe_blocks",
+            "tools/abi-gen/src/main.rs",
+            1,
+            1,
+        ),
+        clippy_message(kernel, "clippy::needless_return", "kernel/src/a.rs", 5, 1),
+        r#"{"reason":"build-finished","success":true}"#.to_owned(),
+    ]
+    .join("\n");
+    let counts = count_clippy_findings(&stream).unwrap();
+    let key = |scope: &str, lint: &str| (scope.to_owned(), lint.to_owned());
+    assert_eq!(
+        counts,
+        BTreeMap::from([
+            (key("abi-gen", "clippy::undocumented_unsafe_blocks"), 1),
+            (
+                key("deepwyrm-kernel", "clippy::undocumented_unsafe_blocks"),
+                1
+            ),
+            (key("deepwyrm-kernel", "clippy::wildcard_enum_match_arm"), 2),
+        ])
+    );
+}
+
+#[test]
+fn the_lint_ratchet_refuses_a_stream_that_did_not_finish() {
+    // A parser that matched nothing would otherwise read as a clean tree.
+    let unfinished = r#"{"reason":"compiler-artifact","package_id":"x"}"#;
+    assert!(count_clippy_findings(unfinished).is_err());
+    let failed = r#"{"reason":"build-finished","success":false}"#;
+    assert!(count_clippy_findings(failed).is_err());
+    assert!(count_clippy_findings("{\"reason\":").is_err());
+}
+
+#[test]
+fn the_unsafe_text_counter_needs_a_safety_comment_in_the_four_lines_before() {
+    let source = "\
+// SAFETY: documented five lines up, too far.
+a();
+b();
+c();
+d();
+let x = unsafe { e() };
+// SAFETY: documented.
+let y = unsafe { f() };
+// SAFETY: covers this line's two blocks.
+let z = unsafe { g() } + unsafe { h() };
+j();
+k();
+l();
+// SAFETY without the colon convention.
+let w = unsafe { i() };
+";
+    assert_eq!(count_unsafe_blocks_without_safety_comment(source), 2);
+}
+
+#[test]
+fn the_lint_ratchet_fails_rises_and_reports_falls() {
+    let key = |scope: &str| (scope.to_owned(), "lint".to_owned());
+    let baseline = BTreeMap::from([(key("a"), 5), (key("b"), 5), (key("c"), 5)]);
+    let current = BTreeMap::from([(key("a"), 5), (key("b"), 6), (key("d"), 1)]);
+    let comparison = compare_ratchet(&baseline, &current);
+    assert_eq!(
+        comparison.higher,
+        BTreeMap::from([(key("b"), (5, 6)), (key("d"), (0, 1))])
+    );
+    assert_eq!(comparison.lower, BTreeMap::from([(key("c"), (5, 0))]));
+}
+
+#[test]
+fn the_checked_in_lint_baseline_parses_and_names_both_text_files() {
+    let source = fs::read_to_string(workspace_root().join(LINT_RATCHET_BASELINE)).unwrap();
+    let baseline = parse_ratchet_baseline(&source).unwrap();
+    for file in SAFETY_TEXT_FILES {
+        assert!(
+            baseline.contains_key(&(file.to_owned(), SAFETY_TEXT_COUNTER.to_owned())),
+            "{file} has no text-counter row"
+        );
+    }
+    assert!(parse_ratchet_baseline("a b").is_err());
+    assert!(parse_ratchet_baseline("a b 1\na b 2").is_err());
+    assert!(parse_ratchet_baseline("a b -1").is_err());
+}

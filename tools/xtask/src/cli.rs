@@ -196,7 +196,7 @@ pub(super) fn print_help(mut writer: impl Write, command: Option<&str>) -> io::R
         ),
         Some("clippy") => write!(
             writer,
-            "Usage: cargo xtask clippy\n\nWarnings-denied Clippy over the production kernel on the target lane first, then the host workspace.\n"
+            "Usage: cargo xtask clippy\n\nWarnings-denied Clippy over the production kernel on the target lane first, then the host workspace, then the lint ratchet: host Clippy at warn level for clippy::wildcard_enum_match_arm and clippy::undocumented_unsafe_blocks per package, plus `unsafe {{` blocks lacking a `// SAFETY:` comment in the target-only files host Clippy cannot see. Fails if any count exceeds tooling/lint-ratchet.txt; prints any count that fell so the baseline can be tightened.\n"
         ),
         Some("doc") => write!(
             writer,

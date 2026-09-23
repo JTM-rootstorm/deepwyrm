@@ -7,10 +7,12 @@ use std::process::{Command, Stdio};
 
 mod cli;
 mod harness;
+mod lint_ratchet;
 mod toolchain;
 
 use cli::*;
 use harness::*;
+use lint_ratchet::*;
 use toolchain::*;
 
 pub const EXIT_NOT_IMPLEMENTED: u8 = 1;
@@ -125,7 +127,8 @@ Usage:
 Commands:
   format                             Verify Rust formatting
   check                              Run the workspace check
-  clippy                             Warnings-denied Clippy: production kernel, then host workspace
+  clippy                             Warnings-denied Clippy: production kernel, then host
+                                     workspace, then the lint ratchet
   doc                                Warnings-denied rustdoc over the workspace
   abi generate                       Generate ABI-owned artifacts
   abi check                          Verify generated ABI artifacts have no drift
@@ -441,6 +444,13 @@ fn run_invocation(invocation: Invocation) -> io::Result<u8> {
                 "-D",
                 "warnings",
             ]);
+            let status = command.status()?;
+            if !status.success() {
+                return Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8);
+            }
+            // Warn-level lints whose counts may only fall (S1.3); see
+            // `lint_ratchet.rs` and `tooling/lint-ratchet.txt`.
+            return run_lint_ratchet();
         }
         Invocation::Rustdoc => {
             command.env("RUSTDOCFLAGS", "-D warnings");
