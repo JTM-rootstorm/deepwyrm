@@ -11,8 +11,12 @@
 #
 # Text rows: `unsafe {` blocks without `// SAFETY:` in the four preceding
 # lines, for target-only files host Clippy never compiles.
+#
+# S2K SAFETY pass (2026-09-27): both text rows fell to 0 (47 and 86). Every
+# block now carries a SAFETY comment; the ones marked `UNVERIFIED (S2K)` count
+# as documented here but state an open soundness question, not a proof.
 
 deepwyrm-kernel clippy::undocumented_unsafe_blocks 240
 deepwyrm-kernel clippy::wildcard_enum_match_arm 88
-kernel/src/arch/x86_64/mm/activation/primordial.rs unsafe-block-without-safety-comment 47
-kernel/src/arch/x86_64/syscall/live.rs unsafe-block-without-safety-comment 86
+kernel/src/arch/x86_64/mm/activation/primordial.rs unsafe-block-without-safety-comment 0
+kernel/src/arch/x86_64/syscall/live.rs unsafe-block-without-safety-comment 0
