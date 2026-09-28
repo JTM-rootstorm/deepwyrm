@@ -1516,6 +1516,47 @@ impl crate::time::TimerExpiryTarget for PrimordialRuntimeShared {
     }
 }
 
+// Safety notes (S2K). Each SAFETY comment on an unsafe block below cites one of these shared
+// justifications by its bracketed tag. Tags from `syscall/live.rs` ([CARRIER], [ENTRY-REF]) are
+// defined there.
+//
+// [P-ONESHOT] Each static storage cell here (`SHARED_RUNTIME_STORAGE`, each
+// `RUNTIME_CARRIER_STORAGE` slot) is written exactly once, on the BSP, by the caller that wins its
+// state word's 0->1 exchange, and read only after that word's Release store of 2 is observed with
+// Acquire. Nothing writes the cell again; later mutation goes through the synchronized types inside
+// it.
+//
+// [P-PLAN] The `prepare_*_on` / `poll_*_on` scheduler and service facades are `unsafe` because they
+// trust two facts the types cannot check: the CPU argument is the physically current CPU, running
+// on the current Thread's bound kernel stack, and the entry is the fixed
+// `first_run_thread_entry_rip`. The entry is always passed literally. Carrier facades call
+// `switch_cpu(self.cpu)` first, and a facade is reached only through its own CPU's binding. The
+// trait methods that lead here (`prepare_preemption`, `prepare_suspend`, `poll_idle_suspend`) are
+// called only by the syscall trampoline and timer pre-IRET gate in `syscall/live.rs`, which meet
+// their `# Safety`.
+//
+// [P-HANDOFF] Divergent handoffs (terminal reaper, rendezvous reaper, AP idle scheduler) run on a
+// CPU-private stack with IF clear, never on the Thread stack they hand to. Each first rebinds the
+// entry record to the next Thread's stack (`bind_current_thread_stack`), then either IRETs to a
+// fresh Thread through `enter_bound_validated_user`, which rechecks that binding, or resumes the
+// Thread's saved continuation with `abandon_to_kernel_continuation`. The handoff frame is abandoned
+// and nothing refers into it afterwards. A fresh Thread (continuation 0) has never run, so nothing
+// lives on its stack and building its first-run frame there is exclusive.
+//
+// [P-PUBLISHER] `LivePlatform` exists only while `enter` constructs the primordial Process.
+// Construction maps and unmaps only in the primordial root region (`AuthorityPrimordialBackend`),
+// whose address space `enter` then binds to this same `active.root`
+// (`bind_primordial_address_space`). The roles and tracked target passed with it serialize that
+// root, and `LivePlatform`'s `&mut active` excludes any other publisher for its lifetime.
+//
+// [P-FACADE] UNVERIFIED (S2K). `bind_runtime_carrier_facades` publishes a raw pointer to every
+// facade in `enter`'s pinned array, and `bind_native_runtime_carrier_for_slot` requires the caller
+// never to recover another reference to a published carrier. `enter` then re-borrows the whole
+// array mutably (`facades_mut`), writes each facade's `admission`, and re-pins facade 0 for
+// `enter_native_syscall_runtime`. APs are still parked, so nothing dereferences a published pointer
+// concurrently, but under Stacked or Tree Borrows that fresh mutable borrow and its writes
+// invalidate the pointers published earlier, which the carriers keep using.
+
 struct SharedRuntimeStorage(UnsafeCell<MaybeUninit<PrimordialRuntimeShared>>);
 
 impl SharedRuntimeStorage {
@@ -1620,12 +1661,17 @@ impl<T> Deref for RuntimeAuthorityGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
+        // SAFETY: `lock` is the only constructor of a guard and sets `owns_lock`, so a guard exists
+        // only while it holds the ticket; `drop` releases it with a Release store that the next
+        // `lock` spins on with Acquire.
         unsafe { &*self.lock.value.get() }
     }
 }
 
 impl<T> DerefMut for RuntimeAuthorityGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: as in `deref`, the guard holds the ticket, and `&mut self` on the guard makes
+        // this the only reference to the value for its lifetime.
         unsafe { &mut *self.lock.value.get() }
     }
 }
@@ -2253,6 +2299,8 @@ fn publish_runtime_shared(
         .unwrap_or_else(|error| panic!("selector-31 route observation failed: {error:?}"));
     #[cfg(not(deepwyrm_dw1e_platform))]
     let interrupt_platform = crate::device::InterruptPlatformModel::new();
+    // SAFETY: [P-ONESHOT] the 0->1 exchange above admits exactly one writer, and nothing reads the
+    // storage before the state-2 Release store below.
     unsafe {
         (*SHARED_RUNTIME_STORAGE.0.get()).write(PrimordialRuntimeShared {
             execution,
@@ -2270,6 +2318,8 @@ fn publish_runtime_shared(
         });
     }
     SHARED_RUNTIME_STATE.store(2, Ordering::Release);
+    // SAFETY: [P-ONESHOT] this thread just wrote the storage, and it is never written again, so a
+    // shared `'static` reference is valid for the rest of the kernel's life.
     let target = unsafe { &*(*SHARED_RUNTIME_STORAGE.0.get()).as_ptr() };
     #[cfg(deepwyrm_dw1e_platform)]
     crate::arch::x86_64::external_interrupt::bind_q35_external_interrupt_handler(target)
@@ -2334,6 +2384,8 @@ fn complete_q35_handler_after_eoi(generation: u64) {
     if SHARED_RUNTIME_STATE.load(Ordering::Acquire) != 2 {
         panic!("DW1-E2C handler completion preceded shared-runtime publication");
     }
+    // SAFETY: [P-ONESHOT] state 2 was observed with Acquire above, pairing with
+    // `publish_runtime_shared`'s Release store after its one write.
     let shared = unsafe { &*(*SHARED_RUNTIME_STORAGE.0.get()).as_ptr() };
     shared.interrupt_platform.complete_handler(generation);
 }
@@ -2345,6 +2397,9 @@ fn initialize_per_cpu_live_carriers() {
         RUNTIME_CARRIER_STATE[cpu_index]
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .unwrap_or_else(|_| panic!("CPU {cpu_index} native carrier was initialized twice"));
+        // SAFETY: [P-ONESHOT] this slot's 0->1 exchange admits one writer. The `&mut` spans the
+        // whole array, but no reference to any slot exists yet: `enter` calls this before any
+        // carrier is built, with APs parked.
         unsafe {
             let slots = &mut *RUNTIME_CARRIER_STORAGE.0.get();
             slots[cpu_index].write(PerCpuLiveCarrier {
@@ -2369,6 +2424,8 @@ fn per_cpu_live_carrier(cpu: crate::cpu::CpuIndex) -> &'static PerCpuLiveCarrier
     {
         panic!("CPU {index} native carrier storage is unavailable");
     }
+    // SAFETY: [P-ONESHOT] state 2 (Acquire) means the one-shot per-CPU initializer above wrote this
+    // slot once; it is never written again, and later mutation goes through its `IrqSpinMutex`.
     unsafe { &*(*RUNTIME_CARRIER_STORAGE.0.get())[index].as_ptr() }
 }
 
@@ -2396,6 +2453,8 @@ fn bind_runtime_carrier_facades<
         crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT,
         "DW1-C1 requires the exact four-CPU runtime topology"
     );
+    // SAFETY: no facade is moved out of the array; elements are only re-pinned in place below or
+    // have fields read.
     let facades = unsafe { core::pin::Pin::get_unchecked_mut(facades) };
     for cpu_index in 0..live_cpu_count {
         let snapshot = registry
@@ -2407,8 +2466,13 @@ fn bind_runtime_carrier_facades<
         }
         let cpu = crate::cpu::CpuIndex::new(cpu_index)
             .unwrap_or_else(|| panic!("CPU {cpu_index} exceeds the native carrier bound"));
+        // SAFETY: the element lives in `enter`'s `pin!` array, which is never moved and whose frame
+        // never returns.
         let carrier = unsafe { core::pin::Pin::new_unchecked(&mut facades[cpu_index]) };
         if cpu_index == 0 {
+            // SAFETY: UNVERIFIED (S2K): the carrier is stationary, but the callee also requires
+            // that no other reference to it is recovered after publication, and `enter` recovers
+            // one; see [P-FACADE].
             unsafe {
                 crate::arch::x86_64::syscall::bind_running_native_runtime_carrier_for_slot(
                     cpu, carrier,
@@ -2422,6 +2486,9 @@ fn bind_runtime_carrier_facades<
                 panic!("could not bind CPU0 running native carrier: {error:?}")
             });
         } else {
+            // SAFETY: UNVERIFIED (S2K): the carrier is stationary, but the callee also requires
+            // that no other reference to it is recovered after publication, and `enter` recovers
+            // one; see [P-FACADE].
             unsafe {
                 crate::arch::x86_64::syscall::bind_native_runtime_carrier_for_slot(cpu, carrier)
             }
@@ -2685,6 +2752,9 @@ fn take_channel_staging_once(
             panic!("primordial Channel staging CPU slot was claimed twice");
         }
     }
+    // SAFETY: at most one reference per buffer is live. The single carrier holds it (`enter` takes
+    // CPU0's); `switch_cpu_state` takes another only for a different CPU and overwrites the old
+    // one. The lock serializes the carrier.
     unsafe { &mut *staging.0.get() }
 }
 
@@ -2727,6 +2797,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
             offset += PAGE_SIZE;
         }
+        // SAFETY: the loop above zeroed every page of this freshly granted, exclusively owned run
+        // through the scratch window (`zero_allocator_frame`); x86 caches are coherent, so no
+        // maintenance is needed.
         let zeroed = unsafe { self.active.target.roles.assume_zeroed(allocation) }
             .unwrap_or_else(|_| panic!("primordial zeroed-backing transition drifted"));
         match self.active.target.roles.assign_object_backing(zeroed) {
@@ -2771,6 +2844,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .unwrap_or_else(|_| panic!("primordial table rollback lost allocation"));
             return Err(user_access::LiveUserAccessError::MissingOrInvalid);
         }
+        // SAFETY: the single page of this freshly granted, exclusively owned allocation was zeroed
+        // above (`zero_allocator_frame`); x86 caches are coherent, so no maintenance is needed.
         let zeroed = unsafe { self.active.target.roles.assume_zeroed(allocation) }
             .unwrap_or_else(|_| panic!("primordial zeroed-table transition drifted"));
         match self
@@ -2819,6 +2894,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 pins: &self.active.user_pins,
                 address_space: region.address_space_key(),
             };
+            // SAFETY: [P-PUBLISHER] `region` is the primordial root region, whose address space is
+            // `active.root`; `target.roles` and `tracked` serialize that root, and no other
+            // publisher runs meanwhile.
             let mut publisher = unsafe {
                 crate::arch::x86_64::mm::X86AddressSpacePublisher::<
                     _,
@@ -2945,6 +3023,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
                 pins: &self.active.user_pins,
                 address_space: region.address_space_key(),
             };
+            // SAFETY: [P-PUBLISHER] `region` is the primordial root region, whose address space is
+            // `active.root`; `target.roles` and `tracked` serialize that root, and no other
+            // publisher runs meanwhile.
             let mut publisher = unsafe {
                 crate::arch::x86_64::mm::X86AddressSpacePublisher::<
                     _,
@@ -3706,6 +3787,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let control = &mut self.wait_controls[self.cpu.index()];
         #[cfg(deepwyrm_i1_evidence)]
         let pending_wake = control.pending_wake_key();
+        // SAFETY: [P-PLAN] forwarded: this `unsafe fn` has no `# Safety` section; its callers (the
+        // `prepare_suspend` trait impls) supply the physically current `self.cpu`, and the entry is
+        // the fixed one.
         let plan = unsafe {
             self.services.prepare_suspend_on(
                 control,
@@ -3835,6 +3919,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     self.shared.execution.suspended_claim_on(self.cpu),
                     Some(outgoing)
                 );
+                // SAFETY: [P-PLAN] forwarded from this function's `# Safety`; `self.cpu` is the
+                // physically current CPU and the entry is the fixed `first_run_thread_entry_rip`.
                 let plan = unsafe {
                     self.shared.execution.prepare_preemptive_kernel_switch_on(
                         &self.tasks,
@@ -3867,6 +3953,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         #[cfg(feature = "test-support")]
         let owner = self.services.operation_owner(self.thread);
         let control = &mut self.wait_controls[self.cpu.index()];
+        // SAFETY: [P-PLAN] forwarded from this function's `# Safety`; `self.cpu` is the physically
+        // current CPU and the entry is the fixed `first_run_thread_entry_rip`.
         let poll = unsafe {
             self.services.poll_idle_suspend_on(
                 control,
@@ -4371,9 +4459,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     crate::test_support::complete_fail(supervisor_evidence_detail(0xd003))
                 });
         }
+        // SAFETY: [P-HANDOFF] runs on this CPU's terminal reaper stack with IF clear, and holds no
+        // entry-record reference; `state.stack` is the stack of the Thread resumed below.
         unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(state.stack) }
             .unwrap_or_else(|error| panic!("terminal next stack binding failed: {error:?}"));
         let continuation = if state.continuation == 0 {
+            // SAFETY: [P-HANDOFF] continuation 0: the next Thread has never run, so its stack is
+            // exclusively ours to build on, and the entry is the fixed
+            // `first_run_thread_entry_rip`.
             unsafe {
                 crate::arch::x86_64::context::prepare_initial_kernel_continuation(
                     state.stack,
@@ -4813,9 +4906,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         crate::test_support::complete_fail(supervisor_evidence_detail(0xd003))
                     });
             }
+            // SAFETY: [P-HANDOFF] runs on this CPU's terminal reaper stack with IF clear, and holds
+            // no entry-record reference; `stack` is the stack of the Thread resumed below.
             unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(stack) }
                 .unwrap_or_else(|error| panic!("terminal next stack binding failed: {error:?}"));
             let continuation = if continuation == 0 {
+                // SAFETY: [P-HANDOFF] continuation 0: the next Thread has never run, so its stack
+                // is exclusively ours to build on, and the entry is the fixed
+                // `first_run_thread_entry_rip`.
                 unsafe {
                     crate::arch::x86_64::context::prepare_initial_kernel_continuation(
                         stack,
@@ -7068,6 +7166,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     unsafe fn prepare_preemption<'owner>(
         &'owner mut self,
     ) -> crate::syscall::native::NativePreemptionPlan<'owner> {
+        // SAFETY: forwards this trait method's `# Safety`
+        // (`NativeSyscallFrameRuntime::prepare_preemption`), which is exactly
+        // `prepare_preemption_stationary`'s.
         unsafe { self.prepare_preemption_stationary() }
     }
 
@@ -8093,6 +8194,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     fn terminate_current(&mut self) -> ! {
         self.execute_local_scheduler_quantum_cancellation();
         match self.prepare_terminal_handoff() {
+            // SAFETY: [P-HANDOFF] `prepare_terminal_handoff` bound the next Thread's stack and
+            // returned its continuation (or built a fresh one there); this reaper frame is
+            // abandoned.
             PreparedTerminalHandoff::Continuation(continuation) => unsafe {
                 crate::arch::x86_64::context::abandon_to_kernel_continuation(continuation)
             },
@@ -8107,6 +8211,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         let publication = self.complete_physical_switch_handoff();
         crate::task::notify_completed_switch_runnable(publication);
         let (state, stack) = self.prepare_fresh_user_entry();
+        // SAFETY: [P-HANDOFF] `state` was validated against the current Process; the first-run
+        // switch bound `stack`, which the callee rechecks. See its same-stack pivot note at
+        // `iret_validated_user`.
         unsafe { crate::arch::x86_64::syscall::enter_bound_validated_user(&state, stack) }
     }
 
@@ -8131,6 +8238,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         &'owner mut self,
         _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     ) -> crate::syscall::native::NativeSuspendPlan<'owner> {
+        // SAFETY: forwards this trait method's `# Safety`
+        // (`NativeSyscallFrameRuntime::prepare_suspend`) to `prepare_suspend_stationary`.
         let plan = unsafe { self.prepare_suspend_stationary() };
         self.execute_local_scheduler_quantum_cancellation();
         plan
@@ -8147,6 +8256,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
             #[cfg(deepwyrm_dw1e_e3b_full)]
             self.service_pending_dw1e_terminal();
         }
+        // SAFETY: forwards this trait method's `# Safety`
+        // (`NativeSyscallFrameRuntime::poll_idle_suspend`), which is
+        // `poll_idle_suspend_stationary`'s.
         unsafe { self.poll_idle_suspend_stationary() }
     }
 
@@ -8758,13 +8870,19 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         };
         match entry {
             PreparedCarrierEntry::Fresh { state, stack } => {
+                // SAFETY: [P-HANDOFF] on this CPU's rendezvous reaper stack with IF clear; `stack`
+                // is the scheduled Thread's, entered below.
                 unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(stack) }
                     .unwrap_or_else(|error| {
                         panic!("rendezvous fresh stack binding failed: {error:?}")
                     });
+                // SAFETY: [P-HANDOFF] `state` was validated for the scheduled Thread's Process and
+                // `stack` was bound just above; the callee rechecks both bindings.
                 unsafe { crate::arch::x86_64::syscall::enter_bound_validated_user(&state, stack) }
             }
             PreparedCarrierEntry::Continuation { stack, rsp } => {
+                // SAFETY: [P-HANDOFF] on this CPU's rendezvous reaper stack with IF clear; `stack`
+                // is the scheduled Thread's, resumed below.
                 unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(stack) }
                     .unwrap_or_else(|error| {
                         panic!("rendezvous replacement stack binding failed: {error:?}")
@@ -8772,6 +8890,8 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 crate::arch::x86_64::syscall::validate_live_syscall_boundary().unwrap_or_else(
                     |error| panic!("rendezvous replacement boundary failed: {error:?}"),
                 );
+                // SAFETY: [P-HANDOFF] `rsp` is the scheduled Thread's saved continuation and its
+                // stack is bound above; this reaper frame is abandoned.
                 unsafe { crate::arch::x86_64::context::abandon_to_kernel_continuation(rsp) }
             }
             PreparedCarrierEntry::Idle => self.enter_idle_scheduler(),
@@ -8841,6 +8961,8 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
     ) -> crate::syscall::native::NativePreemptionPlan<'owner> {
         let mut runtime = self.runtime.lock();
         runtime.switch_cpu(self.cpu);
+        // SAFETY: forwards this trait method's `# Safety` to `prepare_preemption_stationary`;
+        // `switch_cpu(self.cpu)` just selected this CPU.
         unsafe { runtime.prepare_preemption_stationary() }
     }
 
@@ -9186,6 +9308,9 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                     runtime.continue_terminal_after_primordial_root(retirement)
                 }
                 PreparedTerminalStep::Final(handoff) => match handoff {
+                    // SAFETY: [P-HANDOFF] `prepare_terminal_handoff` bound the next Thread's stack
+                    // and returned its continuation (or built a fresh one there); this reaper frame
+                    // is abandoned.
                     PreparedTerminalHandoff::Continuation(continuation) => unsafe {
                         crate::arch::x86_64::context::abandon_to_kernel_continuation(continuation)
                     },
@@ -9210,6 +9335,9 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             runtime.switch_cpu(self.cpu);
             runtime.prepare_fresh_user_entry_synchronized()
         };
+        // SAFETY: [P-HANDOFF] `state` was validated against the current Process; the first-run
+        // switch bound `stack`, which the callee rechecks. See its same-stack pivot note at
+        // `iret_validated_user`.
         unsafe { crate::arch::x86_64::syscall::enter_bound_validated_user(&state, stack) }
     }
 
@@ -9430,13 +9558,19 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             });
             match entry {
                 Some(Entry::Fresh { state, stack }) => {
+                    // SAFETY: [P-HANDOFF] this idle loop runs on a CPU-private stack with IF clear;
+                    // `stack` is the scheduled Thread's, entered below.
                     unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(stack) }
                         .unwrap_or_else(|error| panic!("AP fresh stack binding failed: {error:?}"));
+                    // SAFETY: [P-HANDOFF] `state` was validated for the scheduled Thread's Process
+                    // and `stack` was bound just above; the callee rechecks both bindings.
                     unsafe {
                         crate::arch::x86_64::syscall::enter_bound_validated_user(&state, stack)
                     }
                 }
                 Some(Entry::Continuation { stack, rsp }) => {
+                    // SAFETY: [P-HANDOFF] this idle loop runs on a CPU-private stack with IF clear;
+                    // `stack` is the scheduled Thread's, resumed below.
                     unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(stack) }
                         .unwrap_or_else(|error| {
                             panic!("AP continuation stack binding failed: {error:?}")
@@ -9444,6 +9578,8 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                     crate::arch::x86_64::syscall::validate_live_syscall_boundary().unwrap_or_else(
                         |error| panic!("AP continuation syscall boundary failed: {error:?}"),
                     );
+                    // SAFETY: [P-HANDOFF] `rsp` is the scheduled Thread's saved continuation and
+                    // its stack is bound above; this idle frame is abandoned.
                     unsafe { crate::arch::x86_64::context::abandon_to_kernel_continuation(rsp) }
                 }
                 None => {
@@ -9460,6 +9596,9 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                                 .unwrap_or_else(|error| {
                                     panic!("AP idle accounting publication failed: {error:?}")
                                 });
+                            // SAFETY: UNVERIFIED (S2K): as at `wait_for_suspend_interrupt` in
+                            // `syscall/live.rs`, `nomem` is claimed while handlers that run inside
+                            // the STI window write memory read after it.
                             unsafe {
                                 core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
                             }
@@ -9521,6 +9660,8 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         let plan = {
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);
+            // SAFETY: forwards this trait method's `# Safety` to `prepare_suspend_stationary`;
+            // `switch_cpu(self.cpu)` just selected this CPU.
             unsafe { runtime.prepare_suspend_stationary() }
         };
         self.drain_quantum_cancellation_detached();
@@ -9543,6 +9684,8 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 #[cfg(deepwyrm_dw1e_e3b_full)]
                 runtime.service_pending_dw1e_terminal();
             }
+            // SAFETY: forwards this trait method's `# Safety` to `poll_idle_suspend_stationary`;
+            // `switch_cpu(self.cpu)` just selected this CPU.
             unsafe { runtime.poll_idle_suspend_stationary() }
         };
         crate::task::drain_runnable_work_notifications();
@@ -9706,6 +9849,8 @@ fn copy_module<'a, const BYTES: usize, const RANGE_CAPACITY: usize, const ROLE_C
     if byte_len == 0 || byte_len > BYTES {
         panic!("{label} module exceeds its bounded G3 intake buffer");
     }
+    // SAFETY: UNVERIFIED (S2K): exclusivity holds (one-shot BSP path, one call per static), but
+    // `from_raw_parts_mut` requires initialized bytes and this storage is `MaybeUninit`.
     let destination = unsafe {
         core::slice::from_raw_parts_mut((*storage.0.get()).as_mut_ptr().cast::<u8>(), byte_len)
     };
@@ -9805,6 +9950,8 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     let mut registry = Registry::new();
     let mut memory = Memory::new();
     let mut tasks = Tasks::new();
+    // SAFETY: this is the only production `AddressSpaceAuthority`, so every root is registered
+    // through it; it moves into the carrier, which lives in this never-returning frame.
     let mut spaces = unsafe { Spaces::new() };
     let mut regions = Regions::new();
     #[cfg(deepwyrm_dw1d_evidence)]
@@ -10091,15 +10238,22 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     let mut facades = core::pin::pin!(facades);
     let live_cpu_count = bind_runtime_carrier_facades(facades.as_mut());
     user_access::initialize_live_tlb_shootdown();
+    // SAFETY: UNVERIFIED (S2K): nothing is moved out, so the pin holds, but this new `&mut` and its
+    // `admission` writes invalidate the carrier pointers published above; see [P-FACADE].
     let facades_mut = unsafe { core::pin::Pin::get_unchecked_mut(facades.as_mut()) };
     prepare_runtime_carrier_admission(facades_mut, live_cpu_count);
     normalize_bootstrap_carrier(&mut facades_mut[0]);
     let admissions = core::array::from_fn(|cpu_index| facades_mut[cpu_index].admission);
+    // SAFETY: UNVERIFIED (S2K): facade 0 stays in the pinned array, but re-deriving it here is the
+    // recovered reference [P-FACADE] describes.
     let bsp_carrier = unsafe {
         let facade = &mut facades_mut[0];
         core::pin::Pin::new_unchecked(facade)
     };
     release_runtime_carrier_facades(shared, runtime_ref, admissions);
+    // SAFETY: `state` was validated against the primordial mappings and `stack` is the primordial
+    // Thread's own kernel stack, which is the callee's `# Safety`; the carrier is pinned in this
+    // never-returning frame.
     unsafe {
         crate::arch::x86_64::syscall::enter_native_syscall_runtime(
             bsp_carrier,
