@@ -19,6 +19,56 @@ use super::runtime_binding::{
     RuntimeCarrierLifecycles,
 };
 
+// Safety notes (S2K). Each SAFETY comment on an unsafe block below cites one of these shared
+// justifications by its bracketed tag.
+//
+// [ASM] Inline assembly here runs only in kernel code, at CPL0. CR0/CR4 moves, RDMSR/WRMSR of the
+// SYSCALL and GS-base MSRs, PUSHFQ/POP, and copying RSP neither read nor write memory Rust can
+// observe, so `nomem` is accurate for them. The STI;HLT window is the exception; see its UNVERIFIED
+// note. The kernel target (`x86_64-unknown-none`, `red_zone = false` in
+// `kernel/arch/x86_64/layout.toml`) has no red zone, so PUSHFQ, and any interrupt taken inside a
+// STI window, only write below RSP.
+//
+// [PER-CPU-SLOT] `ENTRY_STATE`, `EXPECTED_PLAN`, `RUNTIME`, `TERMINAL_ACTION` and
+// `RENDEZVOUS_ACTION` are per-CPU `UnsafeCell` slots. A CPU selects a slot by `current_cpu_index`,
+// i.e. by the GS / KERNEL_GS_BASE value that `install_syscall_boundary_for_slot` programmed to that
+// slot's own `ENTRY_STATE` address, so a CPU only ever selects its own slot. Each slot's atomic
+// state word orders it: the writer claims the word, writes, then stores the published state with
+// Release; a reader observes that state with Acquire before reading.
+//
+// [ENTRY-REF] `current_entry_state` returns `&'static` and `current_entry_state_mut` returns
+// `&'static mut` to the same per-CPU record. Neither lifetime is real. Soundness rests on every
+// caller using the reference transiently and never across the two Rust writers
+// (`bind_current_thread_stack`, `bind_current_switch_stack`), which holds for every caller in this
+// file today, and on the entry assembly writing the record's staged-user fields only on SYSCALL
+// from CPL3, when no kernel frame on this CPU holds either reference. The S2K design should narrow
+// these lifetimes.
+//
+// [CARRIER] A published context is the address of one pinned, stationary carrier `R`.
+// `publish_syscall_runtime` writes it once per CPU slot, together with handlers monomorphized for
+// that same `R`, so every cast back to `R` is to the right type, and `RUNTIME_CARRIER_CLAIMS`
+// rejects publishing one address for two slots. Only the owning CPU dereferences it (via
+// `runtime_binding`). Each `&mut *context` reborrow is scoped to one block that ends before any
+// kernel-context switch, stack pivot or divergent handoff, and after a switch the context is
+// re-read from the destination CPU's binding. The `bind_*` and `enter_native_syscall_runtime`
+// callers owe the stationarity and no-other-reference contract.
+//
+// [CARRIER] model gaps, UNVERIFIED (S2K). (1) Divergent carrier methods taking `&mut self`
+// (`terminate_current`, `enter_idle_scheduler`, `rendezvous_stop`, or a detached caller reaching
+// `handoff_current_rendezvous_from_carrier`) abandon frames that still hold a protected `&mut R`,
+// and the carrier is later reborrowed through the published pointer. No abandoned frame resumes,
+// but Stacked and Tree Borrows do not treat the protector as ended. (2)
+// `native_runtime_quantum_expiry` can reborrow the carrier while a `&mut self` method of the same
+// carrier is suspended and will resume: synchronously through
+// `RuntimeCarrierFacade::drain_quantum_cancellation_detached` -> `cancel_scheduler_quantum` on an
+// AP, and from the timer IRQ during the facade idle loop's STI window. The nested call reads only
+// immutable facade fields, but Stacked Borrows rejects the overlap.
+//
+// [FRAME] `dw_x86_64_syscall_dispatch` and `dw_x86_64_timer_pre_iret_gate` receive frame pointers
+// from assembly (`syscall_entry.S`, `exceptions.S`). Rust checks them for null and alignment. That
+// each points to one complete frame, owned by this entry and living on the current Thread's bound
+// kernel stack, is the assembly's contract.
+
 const INSTALL_UNSTARTED: u8 = 0;
 const INSTALLING: u8 = 1;
 const INSTALLED: u8 = 2;
@@ -261,10 +311,17 @@ impl SyscallMsrAccess for LiveMsrAccess {
     type Error = Infallible;
 
     fn read(&mut self, msr: u32) -> Result<u64, Self::Error> {
+        // SAFETY: [ASM] `LiveMsrAccess` is used only by `install_syscall_boundary_for_slot` and
+        // `validate_live_syscall_boundary`, at CPL0 on a CPU with SYSCALL support, for the
+        // architectural MSRs `SyscallMsrPlan` names.
         Ok(unsafe { read_msr(msr) })
     }
 
     fn write(&mut self, msr: u32, value: u64) -> Result<(), Self::Error> {
+        // SAFETY: [ASM] only `program_and_verify` writes, inside
+        // `install_syscall_boundary_for_slot` after CPL0 and IF-clear were checked; values come
+        // from a `SyscallMsrPlan` whose addresses `SyscallMsrPlan::new` checked non-zero and
+        // canonical.
         unsafe { write_msr(msr, value) };
         Ok(())
     }
@@ -277,6 +334,8 @@ impl SyscallMsrAccess for LiveMsrAccess {
 unsafe fn read_msr(msr: u32) -> u64 {
     let low: u32;
     let high: u32;
+    // SAFETY: [ASM] RDMSR of an MSR the caller guarantees exists (only the SYSCALL/GS-base set is
+    // used); results come back in registers.
     unsafe {
         core::arch::asm!(
             "rdmsr",
@@ -294,6 +353,8 @@ unsafe fn read_msr(msr: u32) -> u64 {
     reason = "WRMSR is the audited E4 privileged MSR write boundary"
 )]
 unsafe fn write_msr(msr: u32, value: u64) {
+    // SAFETY: [ASM] WRMSR of an MSR and value the caller guarantees valid (see
+    // `LiveMsrAccess::write`); no memory or stack access.
     unsafe {
         core::arch::asm!(
             "wrmsr",
@@ -311,6 +372,7 @@ unsafe fn write_msr(msr: u32, value: u64) {
 )]
 unsafe fn enforce_live_fp_simd_unavailable() -> Result<(), SyscallInstallError> {
     let before: u64;
+    // SAFETY: [ASM] side-effect-free CR0 read; the only caller has already checked CPL0.
     unsafe {
         core::arch::asm!(
             "mov {}, cr0",
@@ -320,6 +382,8 @@ unsafe fn enforce_live_fp_simd_unavailable() -> Result<(), SyscallInstallError> 
     }
     let expected = normalize_cr0_for_e5(before);
     if before != expected {
+        // SAFETY: [ASM] sets only CR0.TS (`normalize_cr0_for_e5`). The kernel target is soft-float
+        // (`-mno-sse` for C), so no kernel code executes an FP/SIMD instruction that TS would trap.
         unsafe {
             core::arch::asm!(
                 "mov cr0, {}",
@@ -329,6 +393,7 @@ unsafe fn enforce_live_fp_simd_unavailable() -> Result<(), SyscallInstallError> 
         }
     }
     let observed: u64;
+    // SAFETY: [ASM] side-effect-free CR0 read, as above.
     unsafe {
         core::arch::asm!(
             "mov {}, cr0",
@@ -348,6 +413,7 @@ unsafe fn enforce_live_fp_simd_unavailable() -> Result<(), SyscallInstallError> 
 )]
 fn live_fp_simd_unavailable_is_enforced() -> bool {
     let cr0: u64;
+    // SAFETY: [ASM] side-effect-free CR0 read; every caller is kernel code at CPL0.
     unsafe {
         core::arch::asm!(
             "mov {}, cr0",
@@ -364,6 +430,7 @@ fn live_fp_simd_unavailable_is_enforced() -> bool {
 )]
 unsafe fn normalize_live_cr4() -> Result<(), SyscallInstallError> {
     let before: u64;
+    // SAFETY: [ASM] side-effect-free CR4 read; the only caller has already checked CPL0.
     unsafe {
         core::arch::asm!(
             "mov {}, cr4",
@@ -373,6 +440,8 @@ unsafe fn normalize_live_cr4() -> Result<(), SyscallInstallError> {
     }
     let expected = normalize_cr4_for_e4(before);
     if before != expected {
+        // SAFETY: [ASM] clears only CR4.FSGSBASE (`normalize_cr4_for_e4`); no kernel code uses
+        // RD/WR{FS,GS}BASE, so disabling them breaks nothing Rust relies on.
         unsafe {
             core::arch::asm!(
                 "mov cr4, {}",
@@ -382,6 +451,7 @@ unsafe fn normalize_live_cr4() -> Result<(), SyscallInstallError> {
         }
     }
     let observed: u64;
+    // SAFETY: [ASM] side-effect-free CR4 read, as above.
     unsafe {
         core::arch::asm!(
             "mov {}, cr4",
@@ -419,6 +489,8 @@ unsafe fn normalize_live_cr4() -> Result<(), SyscallInstallError> {
 unsafe fn verify_installation_cpu_state() -> Result<(), SyscallInstallError> {
     let rflags: u64;
     let cs: u16;
+    // SAFETY: [ASM] PUSHFQ/POP writes only below RSP (no `nostack`, no red zone) and reading CS is
+    // unprivileged; no Rust-visible memory is touched.
     unsafe {
         core::arch::asm!(
             "pushfq",
@@ -464,6 +536,9 @@ unsafe fn initialize_entry_state(
     let state = ENTRY_STATE
         .get(cpu_index)
         .ok_or(SyscallInstallError::DescriptorState)?;
+    // SAFETY: [PER-CPU-SLOT] the caller won this slot's UNSTARTED->INSTALLING exchange, so it is
+    // the only writer, and it runs on this CPU with IF clear, so no entry through GS can read the
+    // record mid-write. No reference to the record exists.
     unsafe {
         state.0.get().write(PerCpuEntryState {
             entry_stack_top,
@@ -480,6 +555,9 @@ unsafe fn initialize_entry_state(
 )]
 unsafe fn expected_plan(cpu_index: usize) -> Option<SyscallMsrPlan> {
     let plan = EXPECTED_PLAN.get(cpu_index)?;
+    // SAFETY: [PER-CPU-SLOT] callers first observe INSTALLED with Acquire;
+    // `install_syscall_boundary_for_slot` stores it with Release only after writing this plan,
+    // which is never rewritten. The plan is `Copy`.
     Some(unsafe { (*plan.0.get()).assume_init() })
 }
 
@@ -515,8 +593,11 @@ fn cpu_index_for_entry_state_address(address: u64) -> Option<usize> {
     reason = "RDMSR reads the current CPU's architectural GS base pair without mutating it"
 )]
 fn current_cpu_index() -> Option<usize> {
+    // SAFETY: [ASM] IA32_GS_BASE exists on every x86-64 CPU and reading it has no side effects.
     let gs_base = unsafe { read_msr(super::msr::IA32_GS_BASE) };
     cpu_index_for_entry_state_address(gs_base).or_else(|| {
+        // SAFETY: [ASM] IA32_KERNEL_GS_BASE exists on every x86-64 CPU and reading it has no side
+        // effects.
         let kernel_gs_base = unsafe { read_msr(super::msr::IA32_KERNEL_GS_BASE) };
         cpu_index_for_entry_state_address(kernel_gs_base)
     })
@@ -554,6 +635,8 @@ pub(crate) fn current_native_usercopy_is_quiescent() -> bool {
         unsafe_code,
         reason = "PUSHFQ/POP observes the current CPU flag word without changing it"
     )]
+    // SAFETY: [ASM] PUSHFQ/POP writes only below RSP (no `nostack`, no red zone); no Rust-visible
+    // memory is touched.
     unsafe {
         core::arch::asm!(
             "pushfq",
@@ -585,6 +668,7 @@ pub(crate) fn current_cpu_is_on_terminal_reaper_stack() -> bool {
         unsafe_code,
         reason = "the reaper proof observes the current stack pointer without changing execution state"
     )]
+    // SAFETY: [ASM] copies RSP into a register; no memory or flags change.
     unsafe {
         core::arch::asm!("mov {}, rsp", out(reg) stack_pointer, options(nomem, nostack, preserves_flags));
     }
@@ -600,6 +684,8 @@ pub(crate) fn current_cpu_is_on_terminal_reaper_stack() -> bool {
 fn current_entry_state() -> Option<&'static PerCpuEntryState> {
     let cpu_index = current_cpu_index()?;
     let state = ENTRY_STATE.get(cpu_index)?;
+    // SAFETY: [PER-CPU-SLOT] this CPU's own record, written before its GS base was programmed. See
+    // [ENTRY-REF] for why the `'static` reference is only sound while callers keep it transient.
     Some(unsafe { &*state.0.get() })
 }
 
@@ -610,6 +696,8 @@ fn current_entry_state() -> Option<&'static PerCpuEntryState> {
 unsafe fn current_entry_state_mut() -> Option<(usize, &'static mut PerCpuEntryState)> {
     let cpu_index = current_cpu_index()?;
     let state = ENTRY_STATE.get(cpu_index)?;
+    // SAFETY: [PER-CPU-SLOT] this CPU's own record. See [ENTRY-REF]: both callers write two fields
+    // and return, and no `current_entry_state` reference is live across them.
     Some((cpu_index, unsafe { &mut *state.0.get() }))
 }
 
@@ -643,6 +731,7 @@ pub(crate) unsafe fn install_syscall_boundary_for_slot(
         return Err(SyscallInstallError::AlreadyInstallingOrInstalled);
     }
     let result = (|| {
+        // SAFETY: [ASM] the callee only observes RFLAGS and CS, which kernel code may always do.
         unsafe { verify_installation_cpu_state() }?;
         if crate::arch::x86_64::runtime_cpu_descriptor_lifecycle(cpu_index)
             != Some(crate::arch::x86_64::RuntimeCpuDescriptorLifecycle::DescriptorsActive)
@@ -652,8 +741,12 @@ pub(crate) unsafe fn install_syscall_boundary_for_slot(
         if !cpu_supports_syscall() {
             return Err(SyscallInstallError::UnsupportedCpu);
         }
+        // SAFETY: CPL0 and IF clear were just checked, which is what the callee's CR0 write needs.
         unsafe { enforce_live_fp_simd_unavailable()? };
+        // SAFETY: CPL0 and IF clear were just checked, which is what the callee's CR4 write needs.
         unsafe { normalize_live_cr4()? };
+        // SAFETY: this call won the slot's UNSTARTED->INSTALLING exchange above, so it is the
+        // record's only writer; see `initialize_entry_state`.
         unsafe {
             initialize_entry_state(
                 cpu_index,
@@ -675,6 +768,8 @@ pub(crate) unsafe fn install_syscall_boundary_for_slot(
         let expected = EXPECTED_PLAN
             .get(cpu_index)
             .ok_or(SyscallInstallError::DescriptorState)?;
+        // SAFETY: [PER-CPU-SLOT] the INSTALLING claim makes this the slot's only writer;
+        // `expected_plan` readers wait for the INSTALLED Release store below.
         unsafe { (*expected.0.get()).write(plan) };
         Ok(())
     })();
@@ -704,6 +799,8 @@ pub(crate) unsafe fn install_syscall_boundary_for_slot(
 pub(crate) unsafe fn install_syscall_boundary() -> Result<(), SyscallInstallError> {
     let stacks = crate::arch::x86_64::runtime_cpu_stack_layout(0)
         .map_err(|_| SyscallInstallError::DescriptorState)?;
+    // SAFETY: forwarded from this function's `# Safety` (BSP, IF clear, slot 0 descriptors active
+    // after `migrate_bsp_to_runtime_slot0_after_deep_paging`), which is what the callee requires.
     unsafe { install_syscall_boundary_for_slot(0, stacks) }?;
     crate::arch::x86_64::publish_runtime_cpu_online(0)
         .map_err(|_| SyscallInstallError::DescriptorState)
@@ -722,6 +819,8 @@ pub(crate) fn validate_live_syscall_boundary() -> Result<(), SyscallInstallError
         return Err(SyscallInstallError::DescriptorState);
     }
     let cr4: u64;
+    // SAFETY: [ASM] side-effect-free CR4 read; the slot is installed, so this is kernel code at
+    // CPL0.
     unsafe {
         core::arch::asm!(
             "mov {}, cr4",
@@ -735,6 +834,8 @@ pub(crate) fn validate_live_syscall_boundary() -> Result<(), SyscallInstallError
     if !live_fp_simd_unavailable_is_enforced() {
         return Err(SyscallInstallError::FpSimdPolicyNotEnforced);
     }
+    // SAFETY: INSTALL_STATE for this slot was just observed INSTALLED with Acquire, which is what
+    // `expected_plan` requires.
     let plan = unsafe { expected_plan(cpu_index) }.ok_or(SyscallInstallError::DescriptorState)?;
     verify(&mut LiveMsrAccess, plan).map_err(map_program_error)
 }
@@ -747,6 +848,9 @@ pub(crate) unsafe fn bind_current_thread_stack(
     stack: KernelStackBounds,
 ) -> Result<u64, EntryBindingError> {
     let (cpu_index, state) =
+        // SAFETY: [ENTRY-REF] the reference is used only inside this function and callers hold no
+        // `current_entry_state` reference across the call; entry assembly writes the record only on
+        // SYSCALL from CPL3.
         unsafe { current_entry_state_mut() }.ok_or(EntryBindingError::BoundaryNotInstalled)?;
     if INSTALL_STATE[cpu_index].load(Ordering::Acquire) != INSTALLED {
         return Err(EntryBindingError::BoundaryNotInstalled);
@@ -776,6 +880,8 @@ pub(crate) unsafe fn bind_current_thread_stack(
 )]
 fn bind_current_switch_stack(stack: KernelStackBounds) -> Result<u64, EntryBindingError> {
     let (cpu_index, state) =
+        // SAFETY: [ENTRY-REF] the reference is used only inside this function; the callers
+        // (`switch_kernel_context`) run with IF clear and hold no other reference to the record.
         unsafe { current_entry_state_mut() }.ok_or(EntryBindingError::BoundaryNotInstalled)?;
     if INSTALL_STATE[cpu_index].load(Ordering::Acquire) != INSTALLED {
         return Err(EntryBindingError::BoundaryNotInstalled);
@@ -835,7 +941,11 @@ pub(crate) unsafe fn bind_native_runtime_carrier_for_slot<
     {
         return Err(SyscallRuntimeBindError::BoundaryNotInstalled);
     }
+    // SAFETY: the pointer is only published, never used to move `R`; this function's `# Safety`
+    // keeps the carrier stationary for the kernel's lifetime.
     let context = unsafe { Pin::get_unchecked_mut(runtime.as_mut()) as *mut R };
+    // SAFETY: [CARRIER] this function's `# Safety` supplies the callee's: a pinned, stationary
+    // carrier owned by `cpu_index`, with every handler monomorphized for the same `R`.
     unsafe {
         publish_syscall_runtime(
             cpu_index,
@@ -874,6 +984,9 @@ pub(crate) unsafe fn bind_running_native_runtime_carrier_for_slot<
     if cpu != crate::cpu::CpuIndex::BOOTSTRAP {
         return Err(SyscallRuntimeBindError::InvalidCpu);
     }
+    // SAFETY: forwarded. This `unsafe fn` has no `# Safety` section; its caller owes
+    // `bind_native_runtime_carrier_for_slot`'s contract. See [P-FACADE] in `primordial.rs` for
+    // where that caller falls short.
     unsafe { bind_native_runtime_carrier_for_slot(cpu, runtime) }?;
     release_native_runtime_carrier_for_slot(cpu)
 }
@@ -965,6 +1078,9 @@ unsafe fn publish_syscall_runtime(
             }
         });
     }
+    // SAFETY: [PER-CPU-SLOT] the UNBOUND->BINDING exchange above makes this the slot's only writer,
+    // and readers wait for the BOUND Release store below. BOUND is never undone, so the slot is
+    // never rewritten.
     unsafe {
         (*storage.0.get()).write(RuntimeBindingState {
             context,
@@ -996,6 +1112,8 @@ fn runtime_binding() -> Option<RuntimeBindingState> {
         return None;
     }
     let storage = RUNTIME.get(cpu_index)?;
+    // SAFETY: [PER-CPU-SLOT] BOUND was loaded with Acquire, so `publish_syscall_runtime`'s one
+    // write is visible and never changes; `RuntimeBindingState` is `Copy`.
     Some(unsafe { (*storage.0.get()).assume_init() })
 }
 
@@ -1029,6 +1147,8 @@ fn stage_rendezvous_action(action: RendezvousAction) -> Result<(), ()> {
             Ordering::Acquire,
         )
         .map_err(|_| ())?;
+    // SAFETY: [PER-CPU-SLOT] the EMPTY->WRITING exchange gives exclusive write access to this CPU's
+    // slot; the READY Release store below publishes it.
     unsafe { (*storage.0.get()).write(action) };
     state.store(RENDEZVOUS_ACTION_READY, Ordering::Release);
     Ok(())
@@ -1050,6 +1170,9 @@ fn take_rendezvous_action() -> Option<RendezvousAction> {
             Ordering::Acquire,
         )
         .ok()?;
+    // SAFETY: [PER-CPU-SLOT] READY->READING (Acquire) pairs with `stage_rendezvous_action`'s READY
+    // Release store, so the `Copy` payload is initialized; it is read once before the slot returns
+    // to EMPTY.
     let action = unsafe { (*storage.0.get()).assume_init_read() };
     state.store(RENDEZVOUS_ACTION_EMPTY, Ordering::Release);
     Some(action)
@@ -1090,6 +1213,9 @@ unsafe fn native_runtime_rendezvous_reaper<R: crate::syscall::native::NativeRend
     let RendezvousAction(request) = take_rendezvous_action().unwrap_or_else(|| halt_forever());
     let reaper = crate::arch::x86_64::rendezvous::verify_native_rendezvous_reaper_entry()
         .unwrap_or_else(|| halt_forever());
+    // SAFETY: [CARRIER] `context` is this CPU's binding (`dw_x86_64_rendezvous_reaper`) and the
+    // pivot abandoned the interrupted frame. A detached caller's abandoned `&mut self` is gap (1)
+    // in [CARRIER].
     let runtime = unsafe { &mut *context.cast::<R>() };
     runtime.rendezvous_stop(request, reaper)
 }
@@ -1111,6 +1237,9 @@ fn handoff_to_rendezvous_reaper(context: *mut ()) -> ! {
         unsafe_code,
         reason = "the audited assembly pivot selects the current CPU's private reaper stack and never returns"
     )]
+    // SAFETY: the assembly (`syscall_entry.S`) clears IF, moves to this CPU's reaper stack and
+    // never returns; every caller staged the rendezvous action first, and the reaper halts if none
+    // is staged.
     unsafe {
         dw_x86_64_rendezvous_reaper_handoff()
     }
@@ -1141,6 +1270,8 @@ pub(crate) fn handoff_current_rendezvous_from_carrier() -> ! {
 #[unsafe(no_mangle)]
 pub(crate) extern "sysv64" fn dw_x86_64_rendezvous_pre_iret_gate() -> u8 {
     let binding = runtime_binding().unwrap_or_else(|| halt_forever());
+    // SAFETY: [CARRIER] `runtime_binding` returned this CPU's immutable binding; the handler is
+    // `native_runtime_rendezvous_gate::<R>` for the `R` behind `context`.
     unsafe { (binding.rendezvous_gate_handler)(binding.context) }
 }
 
@@ -1152,6 +1283,8 @@ pub(crate) extern "sysv64" fn dw_x86_64_rendezvous_pre_iret_gate() -> u8 {
 #[unsafe(no_mangle)]
 pub(crate) extern "sysv64" fn dw_x86_64_rendezvous_reaper() -> ! {
     let binding = runtime_binding().unwrap_or_else(|| halt_forever());
+    // SAFETY: [CARRIER] `runtime_binding` returned this CPU's immutable binding; the handler is
+    // `native_runtime_rendezvous_reaper::<R>` for the `R` behind `context`.
     unsafe { (binding.rendezvous_reaper_handler)(binding.context) }
 }
 
@@ -1163,6 +1296,8 @@ unsafe fn native_runtime_quantum_expiry<R: crate::syscall::native::NativeSyscall
     context: *mut (),
     ticket: crate::task::SchedulerQuantumTicket,
 ) -> bool {
+    // SAFETY: UNVERIFIED (S2K): no `&mut` to this CPU's carrier may be live in any frame that
+    // resumes after this call. Gap (2) in [CARRIER] shows two paths where one is.
     let runtime = unsafe { &mut *context.cast::<R>() };
     runtime
         .publish_quantum_expiry(ticket)
@@ -1176,6 +1311,8 @@ unsafe fn native_runtime_quantum_expiry<R: crate::syscall::native::NativeSyscall
 unsafe fn native_runtime_prepare_quantum<R: crate::syscall::native::NativeSyscallFrameRuntime>(
     context: *mut (),
 ) -> Option<crate::task::SchedulerQuantumTicket> {
+    // SAFETY: [CARRIER] reached only from `arm_current_normal_quantum`, whose callers hold no
+    // reborrow of the carrier at that point; the reborrow ends with this function.
     let runtime = unsafe { &mut *context.cast::<R>() };
     runtime
         .prepare_quantum(|| crate::time::monotonic_now().unwrap_or_else(|_| halt_forever()))
@@ -1190,6 +1327,8 @@ pub(crate) fn publish_current_quantum_expiry(
     ticket: crate::task::SchedulerQuantumTicket,
 ) -> Result<bool, ()> {
     let binding = runtime_binding().ok_or(())?;
+    // SAFETY: UNVERIFIED (S2K): the handler is the matching `native_runtime_quantum_expiry::<R>`,
+    // but it needs what that function's UNVERIFIED note states, which gap (2) in [CARRIER] breaks.
     Ok(unsafe { (binding.quantum_expiry_handler)(binding.context, ticket) })
 }
 
@@ -1203,6 +1342,9 @@ pub(crate) fn publish_current_quantum_expiry(
 )]
 fn arm_current_normal_quantum() -> bool {
     let binding = runtime_binding().unwrap_or_else(|| halt_forever());
+    // SAFETY: [CARRIER] this CPU's immutable binding; the handler is
+    // `native_runtime_prepare_quantum::<R>`, and no carrier reborrow is live in the callers at this
+    // point.
     if let Some(ticket) = unsafe { (binding.prepare_quantum_handler)(binding.context) } {
         return crate::time::arm_scheduler_quantum(ticket).unwrap_or_else(|_| halt_forever());
     }
@@ -1236,18 +1378,26 @@ unsafe fn native_runtime_timer_pre_iret<
         poll_timer_return_stop(context);
         validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
         {
+            // SAFETY: [CARRIER] scoped reborrow of this CPU's carrier; the IRQ-origin gate has no
+            // other Rust frame on this CPU that holds one.
             let runtime = unsafe { &mut *context.cast::<R>() };
             if let Err(error) = runtime.authorize_timer_return(frame) {
                 invalid_bound_return::<R>(context, error);
             }
         }
         let has_request = {
+            // SAFETY: [CARRIER] scoped reborrow of this CPU's carrier; the previous one has ended.
             let runtime = unsafe { &mut *context.cast::<R>() };
             runtime.has_reschedule_request()
         };
         if has_request {
             let plan = {
+                // SAFETY: [CARRIER] scoped reborrow of this CPU's carrier; the previous one has
+                // ended.
                 let runtime = unsafe { &mut *context.cast::<R>() };
+                // SAFETY: this is the timer safe-boundary gate on the current Thread's bound kernel
+                // stack, which is the trait method's `# Safety`; the plan is consumed immediately
+                // below.
                 unsafe { runtime.prepare_preemption() }
             };
             match plan {
@@ -1255,6 +1405,8 @@ unsafe fn native_runtime_timer_pre_iret<
                 crate::syscall::native::NativePreemptionPlan::Switch(plan) => {
                     switch_kernel_context(plan);
                     context = current_runtime_context::<R>().unwrap_or_else(|| halt_forever());
+                    // SAFETY: [CARRIER] `context` was just re-read from the destination CPU's
+                    // binding after the switch.
                     let runtime = unsafe { &mut *context.cast::<R>() };
                     if let Err(error) = runtime.resume_timer_preemption(frame) {
                         invalid_bound_return::<R>(context, error);
@@ -1286,6 +1438,8 @@ pub(crate) unsafe extern "sysv64" fn dw_x86_64_timer_pre_iret_gate(
         halt_forever();
     }
     let binding = runtime_binding().unwrap_or_else(|| halt_forever());
+    // SAFETY: [CARRIER] this CPU's immutable binding and its matching handler. [FRAME] the frame
+    // was checked non-null and aligned above.
     unsafe { (binding.timer_pre_iret_handler)(binding.context, &mut *frame) }
 }
 
@@ -1305,6 +1459,8 @@ fn stage_terminal_action(action: TerminalAction) -> Result<(), ()> {
             Ordering::Acquire,
         )
         .map_err(|_| ())?;
+    // SAFETY: [PER-CPU-SLOT] the EMPTY->WRITING exchange gives exclusive write access to this CPU's
+    // slot; the READY Release store below publishes it.
     unsafe { (*storage.0.get()).write(action) };
     state.store(TERMINAL_ACTION_READY, Ordering::Release);
     Ok(())
@@ -1326,6 +1482,9 @@ fn take_terminal_action() -> Option<TerminalAction> {
             Ordering::Acquire,
         )
         .ok()?;
+    // SAFETY: [PER-CPU-SLOT] READY->READING (Acquire) pairs with `stage_terminal_action`'s READY
+    // Release store, so the `Copy` payload is initialized; it is read once before the slot returns
+    // to EMPTY.
     let action = unsafe { (*storage.0.get()).assume_init_read() };
     state.store(TERMINAL_ACTION_EMPTY, Ordering::Release);
     Some(action)
@@ -1371,6 +1530,9 @@ fn dispatch_bound_native_runtime_user_exception(
     let Some(binding) = runtime_binding() else {
         halt_forever();
     };
+    // SAFETY: [CARRIER] this CPU's immutable binding; the handler is
+    // `native_runtime_user_exception::<R>` for the `R` behind `context`. The CPL3 fault left no
+    // Rust frame holding the carrier.
     unsafe { (binding.user_exception_handler)(binding.context, record) }
 }
 
@@ -1392,6 +1554,8 @@ pub(crate) fn bind_native_runtime_user_exception_handler() -> Result<
 unsafe fn native_runtime_fresh_thread<R: crate::syscall::native::NativeSyscallFrameRuntime>(
     context: *mut (),
 ) -> ! {
+    // SAFETY: [CARRIER] reached only through `dw_x86_64_first_run_thread_entry` on a fresh Thread's
+    // stack, so no other frame on this CPU holds a reborrow.
     let runtime = unsafe { &mut *context.cast::<R>() };
     runtime.enter_scheduled_fresh_thread()
 }
@@ -1403,6 +1567,8 @@ unsafe fn native_runtime_fresh_thread<R: crate::syscall::native::NativeSyscallFr
 unsafe fn native_runtime_idle_scheduler<R: crate::syscall::native::NativeSyscallFrameRuntime>(
     context: *mut (),
 ) -> ! {
+    // SAFETY: [CARRIER] reached only through `enter_bound_idle_scheduler`. Callers that are
+    // themselves `&mut self` carrier methods abandon that frame; see gap (1) in [CARRIER].
     let runtime = unsafe { &mut *context.cast::<R>() };
     runtime.enter_idle_scheduler()
 }
@@ -1420,6 +1586,8 @@ unsafe extern "sysv64" fn native_runtime_terminal_reaper<
     let Some(action) = take_terminal_action() else {
         halt_forever();
     };
+    // SAFETY: [CARRIER] `context` is this CPU's binding, passed through the reaper handoff, which
+    // abandoned the deferred Thread stack and every reborrow on it.
     let runtime = unsafe { &mut *context.cast::<R>() };
     match action {
         TerminalAction::CompleteCurrent => {}
@@ -1460,6 +1628,9 @@ fn handoff_to_terminal_reaper<
     {
         halt_forever();
     }
+    // SAFETY: the reaper stack top was checked non-zero above; the assembly (`syscall_entry.S`)
+    // clears IF, switches to it and calls the callback, which matches `R`. Callers staged the
+    // action first.
     unsafe { dw_x86_64_terminal_reaper_handoff(context, native_runtime_terminal_reaper::<R>) }
 }
 
@@ -1494,6 +1665,8 @@ unsafe fn native_runtime_trampoline<
     }
     let usercopy_window = NativeUsercopyWindow::enter_current().unwrap_or_else(|_| halt_forever());
     let control = {
+        // SAFETY: [CARRIER] first scoped reborrow in this trampoline; the SYSCALL entry left no
+        // other Rust frame on this CPU holding one.
         let runtime = unsafe { &mut *context.cast::<R>() };
         crate::syscall::native::dispatch_frame(runtime, frame, current_binding_generation())
     };
@@ -1536,6 +1709,7 @@ unsafe fn native_runtime_trampoline<
         }
     }
     let control = if control == crate::syscall::native::SyscallControl::CompleteRemoteStop {
+        // SAFETY: [CARRIER] scoped reborrow; the previous one has ended.
         let runtime = unsafe { &mut *context.cast::<R>() };
         runtime.complete_remote_stop(frame, current_binding_generation())
     } else {
@@ -1550,6 +1724,7 @@ unsafe fn native_runtime_trampoline<
         }
         crate::syscall::native::SyscallControl::SuspendCurrent => {
             let plan = {
+                // SAFETY: [CARRIER] scoped reborrow; the previous one has ended.
                 let runtime = unsafe { &mut *context.cast::<R>() };
                 // SAFETY: the syscall assembly transferred this exact current
                 // Thread frame to its bound kernel stack before entering the
@@ -1566,6 +1741,8 @@ unsafe fn native_runtime_trampoline<
                         let idle = crate::arch::x86_64::idle::prepare_current_idle()
                             .unwrap_or_else(|_| halt_forever());
                         let poll = {
+                            // SAFETY: [CARRIER] scoped reborrow inside the idle loop; no other
+                            // reborrow is live.
                             let runtime = unsafe { &mut *context.cast::<R>() };
                             // SAFETY: this loop has not left the suspended current
                             // continuation; IRQ polling may change logical state but
@@ -1626,6 +1803,7 @@ unsafe fn native_runtime_trampoline<
                                 let idle_accounting = {
                                     let started_at_ns = crate::time::monotonic_now()
                                         .unwrap_or_else(|_| halt_forever());
+                                    // SAFETY: [CARRIER] scoped reborrow; no other reborrow is live.
                                     let runtime = unsafe { &mut *context.cast::<R>() };
                                     runtime
                                         .publish_scheduler_idle(started_at_ns)
@@ -1641,6 +1819,7 @@ unsafe fn native_runtime_trampoline<
                                 let finished_at_ns =
                                     crate::time::monotonic_now().unwrap_or_else(|_| halt_forever());
                                 {
+                                    // SAFETY: [CARRIER] scoped reborrow; no other reborrow is live.
                                     let runtime = unsafe { &mut *context.cast::<R>() };
                                     runtime
                                         .finish_scheduler_idle(idle_accounting, finished_at_ns)
@@ -1692,6 +1871,8 @@ unsafe fn native_runtime_trampoline<
             // any scheduler, terminal, mapping, or user-return operation.
             context = current_runtime_context::<R>().unwrap_or_else(|| halt_forever());
             let result = {
+                // SAFETY: [CARRIER] `context` was just re-read from the destination CPU's binding
+                // after the switch.
                 let runtime = unsafe { &mut *context.cast::<R>() };
                 match runtime.resume_suspended(frame) {
                     crate::syscall::native::NativeResumeOutcome::Resumed => {
@@ -1748,18 +1929,25 @@ fn service_syscall_return_preemption<
         crate::time::service_current_scheduler_quantum_deadline()
             .unwrap_or_else(|_| halt_forever());
         let has_request = {
+            // SAFETY: [CARRIER] scoped reborrow; the trampoline holds no other one.
             let runtime = unsafe { &mut *(*context).cast::<R>() };
             runtime.has_reschedule_request()
         };
         if has_request {
             let plan = {
+                // SAFETY: [CARRIER] scoped reborrow; the previous one has ended.
                 let runtime = unsafe { &mut *(*context).cast::<R>() };
+                // SAFETY: this is the syscall safe-boundary trampoline on the current Thread's
+                // bound kernel stack, which is the trait method's `# Safety`; the plan is consumed
+                // immediately below.
                 unsafe { runtime.prepare_preemption() }
             };
             if let crate::syscall::native::NativePreemptionPlan::Switch(plan) = plan {
                 frame.revoke_authorized_return();
                 switch_kernel_context(plan);
                 *context = current_runtime_context::<R>().unwrap_or_else(|| halt_forever());
+                // SAFETY: [CARRIER] `*context` was just re-read from the destination CPU's binding
+                // after the switch.
                 let runtime = unsafe { &mut *(*context).cast::<R>() };
                 if let Err(error) = runtime.resume_syscall_preemption(frame) {
                     invalid_bound_return::<R>(*context, error);
@@ -1783,10 +1971,15 @@ fn switch_kernel_context(plan: crate::arch::x86_64::context::KernelSwitchPlan<'_
     #[cfg(deepwyrm_dw1c_evidence)]
     bind_current_switch_stack(plan.next_stack()).unwrap_or_else(|_| halt_forever());
     #[cfg(not(deepwyrm_dw1c_evidence))]
+    // SAFETY: [ENTRY-REF] callers (syscall trampoline, timer gate) run with IF clear and hold no
+    // record reference; the stack bound is the one `execute_kernel_switch` below switches to.
     unsafe { bind_current_thread_stack(plan.next_stack()) }.unwrap_or_else(|_| halt_forever());
     if !live_fp_simd_unavailable_is_enforced() {
         halt_forever();
     }
+    // SAFETY: the plan came from a runtime `prepare_*` method whose `# Safety` the caller met, and
+    // is consumed immediately; the assembly also rejects a save frame outside `current_stack` with
+    // `ud2`.
     unsafe { crate::arch::x86_64::context::execute_kernel_switch(plan) };
     if !live_fp_simd_unavailable_is_enforced() {
         halt_forever();
@@ -1798,6 +1991,9 @@ fn switch_kernel_context(plan: crate::arch::x86_64::context::KernelSwitchPlan<'_
     reason = "STI immediately followed by HLT is the race-free x86 idle sequence; CLI restores the IF-clear syscall runtime before polling kernel state"
 )]
 fn wait_for_suspend_interrupt() {
+    // SAFETY: UNVERIFIED (S2K): `nomem` claims no memory effects, yet handlers run inside the STI
+    // window and write memory read after it. Needs those writes to count as concurrent, not this
+    // block's; Linux uses a memory clobber.
     unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)) };
 }
 
@@ -1820,6 +2016,9 @@ pub(crate) unsafe extern "sysv64" fn dw_x86_64_first_run_thread_entry() -> ! {
     let Some(binding) = runtime_binding() else {
         halt_forever();
     };
+    // SAFETY: [CARRIER] this CPU's immutable binding and its matching
+    // `native_runtime_fresh_thread::<R>`, checked after the boundary and exception runtime were
+    // validated above.
     unsafe { (binding.fresh_thread_handler)(binding.context) }
 }
 
@@ -1832,6 +2031,8 @@ pub(crate) unsafe extern "sysv64" fn dw_x86_64_first_run_thread_entry() -> ! {
 pub(crate) fn enter_bound_idle_scheduler() -> ! {
     validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
     let binding = runtime_binding().unwrap_or_else(|| halt_forever());
+    // SAFETY: [CARRIER] this CPU's immutable binding and its matching
+    // `native_runtime_idle_scheduler::<R>`.
     unsafe { (binding.idle_scheduler_handler)(binding.context) }
 }
 
@@ -1865,6 +2066,8 @@ unsafe fn dispatch_bound_runtime(frame: &mut RawSyscallFrame) {
     let Some(binding) = runtime_binding() else {
         halt_forever();
     };
+    // SAFETY: [CARRIER] this CPU's immutable binding and its matching trampoline; [FRAME] `frame`
+    // is the caller's validated raw frame.
     unsafe { (binding.handler)(binding.context, frame) };
 }
 
@@ -1893,6 +2096,9 @@ pub(crate) unsafe fn enter_bound_validated_user(
     {
         halt_forever();
     }
+    // SAFETY: the boundary, the runtime binding, the exception runtime and the stack binding were
+    // all checked above; `state` is a `ValidatedUserReturn`. The pivot condition is at
+    // `iret_validated_user`.
     unsafe { iret_validated_user(state) }
 }
 
@@ -1906,6 +2112,9 @@ unsafe fn iret_validated_user(state: &ValidatedUserReturn) -> ! {
     }
     // The assembly helper first pivots from the bootstrap/idle/reaper carrier
     // to the bound Thread stack, then runs the ordinary pre-IRET gate there.
+    // SAFETY: UNVERIFIED (S2K): the assembly pivots to the bound stack top and pushes 40 bytes
+    // before reading the rest of `*state`, so `state` must not lie in those bytes. The first-run
+    // path runs on that same stack.
     unsafe { dw_x86_64_iret_to_user(state.raw()) }
 }
 
@@ -1931,6 +2140,8 @@ pub(crate) unsafe fn enter_native_syscall_runtime<
     exception_binding: &crate::arch::x86_64::exceptions::UserExceptionBinding,
 ) -> ! {
     let entry = NativeSyscallRuntimeEntry { runtime };
+    // SAFETY: forwarded from this function's `# Safety`; `enter` performs the remaining binding
+    // checks itself.
     unsafe { entry.enter(state, stack, exception_binding) }
 }
 
@@ -1954,15 +2165,21 @@ impl<
         if !crate::arch::x86_64::exceptions::user_exception_binding_is_current(exception_binding) {
             halt_forever();
         }
+        // SAFETY: [ENTRY-REF] no record reference is live here; `stack` is the selected Thread's
+        // live stack per this function's caller contract.
         unsafe { bind_current_thread_stack(stack) }.unwrap_or_else(|_| halt_forever());
         // Reborrow the Pin so `self.runtime` remains owned by this nonreturning
         // frame after its address is erased into this CPU's immutable binding.
+        // SAFETY: the pointer is only published, never used to move `R`; `self.runtime` stays
+        // pinned in this never-returning frame, so the carrier stays put.
         let context = unsafe { Pin::get_unchecked_mut(self.runtime.as_mut()) as *mut R };
         let cpu_index = current_cpu_index_for_diagnostics().unwrap_or_else(|| halt_forever());
         if RUNTIME_STATE
             .get(cpu_index)
             .is_some_and(|slot| slot.load(Ordering::Acquire) == RUNTIME_UNBOUND)
         {
+            // SAFETY: [CARRIER] the carrier is pinned and this frame never returns, so it is
+            // stationary for every later use of the pointer and owned by this CPU's slot.
             unsafe {
                 publish_syscall_runtime(
                     cpu_index,
@@ -1992,6 +2209,8 @@ impl<
                         && RUNTIME_CARRIER_LIFECYCLES.lifecycle(cpu_index)
                             == Some(RuntimeCarrierLifecycle::Executing)
                 })
+                // SAFETY: [PER-CPU-SLOT] the filter observed BOUND with Acquire, so the one-shot
+                // binding is initialized and immutable; it is `Copy`.
                 .map(|storage| unsafe { (*storage.0.get()).assume_init() })
                 .unwrap_or_else(|| halt_forever());
             if binding.context != context.cast::<()>()
@@ -2002,6 +2221,9 @@ impl<
                 halt_forever();
             }
         }
+        // SAFETY: the boundary was validated, `stack` was bound above per the caller's contract,
+        // and `state` is a `ValidatedUserReturn`; the primordial caller keeps it on the boot stack,
+        // off the bound stack.
         unsafe { iret_validated_user(state) }
     }
 }
@@ -2015,6 +2237,8 @@ pub(crate) unsafe extern "sysv64" fn dw_x86_64_syscall_dispatch(frame: *mut RawS
     if frame.is_null() || (frame as usize) & 0xf != 0 {
         halt_forever();
     }
+    // SAFETY: [FRAME] checked non-null and 16-byte aligned above; the entry assembly passes its own
+    // frame and keeps no other reference to it.
     let frame = unsafe { &mut *frame };
     if !frame.validates_entry()
         || frame.binding_generation() != current_binding_generation()
@@ -2022,6 +2246,8 @@ pub(crate) unsafe extern "sysv64" fn dw_x86_64_syscall_dispatch(frame: *mut RawS
     {
         halt_forever();
     }
+    // SAFETY: the frame's entry signature and binding generation were validated above;
+    // `dispatch_bound_runtime` halts if this CPU has no binding.
     unsafe { dispatch_bound_runtime(frame) };
     if !live_fp_simd_unavailable_is_enforced() {
         halt_forever();
@@ -2036,6 +2262,7 @@ pub(crate) unsafe extern "sysv64" fn dw_x86_64_syscall_dispatch(frame: *mut RawS
 )]
 fn halt_forever() -> ! {
     loop {
+        // SAFETY: [ASM] CLI then HLT, with nothing after it; neither touches memory or the stack.
         unsafe {
             core::arch::asm!("cli", "hlt", options(nomem, nostack));
         }
