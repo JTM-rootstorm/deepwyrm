@@ -40,9 +40,10 @@ use super::runtime_binding::{
 // `&'static mut` to the same per-CPU record. Neither lifetime is real. Soundness rests on every
 // caller using the reference transiently and never across the two Rust writers
 // (`bind_current_thread_stack`, `bind_current_switch_stack`), which holds for every caller in this
-// file today, and on the entry assembly writing the record's staged-user fields only on SYSCALL
-// from CPL3, when no kernel frame on this CPU holds either reference. The S2K design should narrow
-// these lifetimes.
+// file today, and on the assembly writing the record's staged-user fields only when no kernel
+// frame on this CPU will use either reference again: SYSCALL entry from CPL3, and
+// `dw_x86_64_iret_to_user`, which stages the IRET words there on its divergent path to CPL3. The
+// S2K design should narrow these lifetimes.
 //
 // [CARRIER] A published context is the address of one pinned, stationary carrier `R`.
 // `publish_syscall_runtime` writes it once per CPU slot, together with handlers monomorphized for
@@ -2102,8 +2103,8 @@ pub(crate) unsafe fn enter_bound_validated_user(
         halt_forever();
     }
     // SAFETY: the boundary, the runtime binding, the exception runtime and the stack binding were
-    // all checked above; `state` is a `ValidatedUserReturn`. The pivot condition is at
-    // `iret_validated_user`.
+    // all checked above; `state` is a `ValidatedUserReturn`, which `iret_validated_user` reads in
+    // full before it writes the bound stack.
     unsafe { iret_validated_user(state) }
 }
 
@@ -2115,11 +2116,12 @@ unsafe fn iret_validated_user(state: &ValidatedUserReturn) -> ! {
     unsafe extern "sysv64" {
         fn dw_x86_64_iret_to_user(state: *const super::frame::RawUserReturnContext) -> !;
     }
-    // The assembly helper first pivots from the bootstrap/idle/reaper carrier
-    // to the bound Thread stack, then runs the ordinary pre-IRET gate there.
-    // SAFETY: UNVERIFIED (S2K): the assembly pivots to the bound stack top and pushes 40 bytes
-    // before reading the rest of `*state`, so `state` must not lie in those bytes. The first-run
-    // path runs on that same stack.
+    // The assembly helper reads the whole context, then pivots from the bootstrap/idle/reaper
+    // carrier (or, on the first-run path, from lower on the same stack) to the bound Thread stack
+    // top and runs the ordinary pre-IRET gate there.
+    // SAFETY: `state` is a `ValidatedUserReturn`, and the caller established the stack binding and
+    // runtime ownership. The helper finishes every read of `*state` before its pivot and its first
+    // stack write, so the frames it builds cannot clobber the context wherever it lives.
     unsafe { dw_x86_64_iret_to_user(state.raw()) }
 }
 

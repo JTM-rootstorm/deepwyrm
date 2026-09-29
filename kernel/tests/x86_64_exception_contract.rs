@@ -312,14 +312,68 @@ fn every_user_entry_consumes_a_quantum_that_expires_during_arming() {
         .split_once(".size dw_x86_64_iret_to_user")
         .unwrap()
         .0;
+    // Text test: the order of assembly reads, the RSP pivot and pushes is invisible to Rust
+    // types and host tests. The context may sit in the stack top the frame overwrites (the
+    // first-run path keeps it there), so all 18 fields are read before the pivot and first push.
     let pivot = initial
         .find("movq %gs:E4_GS_CURRENT_STACK_TOP, %rsp")
         .unwrap();
+    let before_pivot = &initial[..pivot];
+    for field in [
+        "R15",
+        "R14",
+        "R13",
+        "R12",
+        "RBP",
+        "RBX",
+        "R9",
+        "R8",
+        "R10",
+        "RDX",
+        "RSI",
+        "RDI",
+        "RAX",
+        "RCX",
+        "R11",
+        "USER_RIP",
+        "USER_RFLAGS",
+        "USER_RSP",
+    ] {
+        assert_eq!(
+            before_pivot
+                .matches(&format!("E4_UR_{field}(%r12)"))
+                .count(),
+            1,
+            "context field {field} must be read exactly once before the pivot"
+        );
+    }
+    assert!(!before_pivot.contains("push") && !before_pivot.contains("(%rsp)"));
+    assert!(
+        !initial[pivot..].contains("E4_UR_"),
+        "no context read after the pivot"
+    );
     let source_read = initial.find("movq E4_UR_R12(%r12), %r12").unwrap();
+    let iret_frame = initial.find("pushq $0x2b").unwrap();
+    assert!(source_read < pivot && pivot < iret_frame);
+    let iret_words: Vec<_> = initial[pivot..]
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("pushq "))
+        .take(5)
+        .collect();
+    assert_eq!(
+        iret_words,
+        [
+            "$0x2b",
+            "%gs:E4_GS_STAGED_USER_RSP",
+            "%gs:E4_GS_STAGED_USER_RFLAGS",
+            "$0x33",
+            "%gs:E4_GS_STAGED_USER_RIP"
+        ]
+    );
     let frame = initial.find("pushq %rax").unwrap();
     let gate = initial.find("callq dw_x86_64_timer_pre_iret_gate").unwrap();
     let entry = initial.find("    iretq").unwrap();
-    assert!(pivot < source_read && source_read < frame && frame < gate && gate < entry);
+    assert!(pivot < frame && frame < gate && gate < entry);
     let saved: Vec<_> = initial[frame..gate]
         .lines()
         .filter_map(|line| line.trim().strip_prefix("pushq "))

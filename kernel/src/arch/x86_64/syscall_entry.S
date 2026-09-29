@@ -156,18 +156,24 @@ dw_x86_64_syscall_entry:
 .globl dw_x86_64_iret_to_user
 .type dw_x86_64_iret_to_user,@function
 dw_x86_64_iret_to_user:
-    /* RDI is a Rust-validated RawUserReturnContext. */
+    /*
+     * RDI is a Rust-validated RawUserReturnContext. Every field of it is read
+     * before the stack pivot and before the first stack write, so the context
+     * may live anywhere -- including inside the top of the bound Thread stack
+     * that the frames below overwrite, where the first-run path keeps it.
+     * Eighteen words do not fit in the fifteen free registers, so the three
+     * IRET-frame words go to this CPU's supervisor-only GS scratch, the same
+     * slots E0 fixes for SYSCALL entry's own before-pivot staging. Nothing
+     * else can use them meanwhile: this CPU is at CPL0 with IF clear, so no
+     * SYSCALL arrives, and NMI/#DF/#MC run on IST stacks and never touch GS.
+     */
     movq %rdi, %r12
-    movq %gs:E4_GS_CURRENT_STACK_TOP, %rsp
-    testq %rsp, %rsp
-    jz .Le4_entry_fail
-
-    pushq $0x2b
-    pushq E4_UR_USER_RSP(%r12)
-    pushq E4_UR_USER_RFLAGS(%r12)
-    pushq $0x33
-    pushq E4_UR_USER_RIP(%r12)
-
+    movq E4_UR_USER_RSP(%r12), %rax
+    movq %rax, %gs:E4_GS_STAGED_USER_RSP
+    movq E4_UR_USER_RFLAGS(%r12), %rax
+    movq %rax, %gs:E4_GS_STAGED_USER_RFLAGS
+    movq E4_UR_USER_RIP(%r12), %rax
+    movq %rax, %gs:E4_GS_STAGED_USER_RIP
     movq E4_UR_R15(%r12), %r15
     movq E4_UR_R14(%r12), %r14
     movq E4_UR_R13(%r12), %r13
@@ -183,8 +189,18 @@ dw_x86_64_iret_to_user:
     movq E4_UR_RCX(%r12), %rcx
     movq E4_UR_R11(%r12), %r11
     movq E4_UR_R12(%r12), %r12
+    /* The context is dead from here; nothing below reads it. */
+
+    movq %gs:E4_GS_CURRENT_STACK_TOP, %rsp
+    testq %rsp, %rsp
+    jz .Le4_entry_fail
+
+    pushq $0x2b
+    pushq %gs:E4_GS_STAGED_USER_RSP
+    pushq %gs:E4_GS_STAGED_USER_RFLAGS
+    pushq $0x33
+    pushq %gs:E4_GS_STAGED_USER_RIP
     /* Complete a RawCpl3TimerReturnFrame only after the physical stack pivot.
-     * All source-context reads finish before these additional stack writes.
      * A quantum that expires during its arm must be serviced before IRET;
      * an AP otherwise has no armed timer to preempt an uncooperative Thread.
      */
