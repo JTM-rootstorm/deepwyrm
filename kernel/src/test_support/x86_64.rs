@@ -634,7 +634,7 @@ fn claim_r1_terminal(owner: u8) -> bool {
 
 #[cfg(deepwyrm_dw1c_evidence)]
 fn claim_dw1c_terminal(owner: u8) -> bool {
-    claim_dw1c_terminal_on(&DW1C_TERMINAL_OWNER, owner)
+    super::dw1c_evidence::claim_dw1c_terminal_on(&DW1C_TERMINAL_OWNER, owner)
 }
 
 #[cfg(deepwyrm_dw1d_evidence)]
@@ -666,13 +666,6 @@ fn claim_wyr1d_terminal(owner: u8) -> bool {
 #[cfg(deepwyrm_wyr1e_evidence)]
 fn claim_wyr1e_terminal(owner: u8) -> bool {
     WYR1E_TERMINAL_OWNER
-        .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-}
-
-#[cfg(any(test, deepwyrm_dw1c_evidence))]
-fn claim_dw1c_terminal_on(state: &AtomicU8, owner: u8) -> bool {
-    state
         .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
 }
@@ -1361,23 +1354,5 @@ fn halt_after_completion() -> ! {
         unsafe {
             asm!("cli; hlt", options(nomem, nostack));
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dw1c_terminal_arbitration_has_one_success_or_failure_winner() {
-        let success_first = AtomicU8::new(0);
-        assert!(claim_dw1c_terminal_on(&success_first, 1));
-        assert!(!claim_dw1c_terminal_on(&success_first, 2));
-        assert_eq!(success_first.load(Ordering::Acquire), 1);
-
-        let failure_first = AtomicU8::new(0);
-        assert!(claim_dw1c_terminal_on(&failure_first, 2));
-        assert!(!claim_dw1c_terminal_on(&failure_first, 1));
-        assert_eq!(failure_first.load(Ordering::Acquire), 2);
     }
 }

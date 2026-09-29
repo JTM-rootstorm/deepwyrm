@@ -1993,6 +1993,15 @@ pub(crate) static DW1C_EVIDENCE: Dw1cEvidenceCollector = Dw1cEvidenceCollector::
     parse_hex(env!("DEEPWYRM_DW1C_PROGRESS_DIGEST")),
 );
 
+/// Arbitrates selector 28's single terminal record: the first claimant, success
+/// or failure, owns the transcript and every later claim loses. Moved from the
+/// target-only `test_support/x86_64.rs` (S2K-0) so its test runs on the host.
+pub(super) fn claim_dw1c_terminal_on(state: &AtomicU8, owner: u8) -> bool {
+    state
+        .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5132,5 +5141,18 @@ mod tests {
         let state = collector.state.lock();
         assert!(!state.terminal);
         assert_eq!(state.failure, Some(Dw1cEvidenceError::Incomplete));
+    }
+
+    #[test]
+    fn dw1c_terminal_arbitration_has_one_success_or_failure_winner() {
+        let success_first = AtomicU8::new(0);
+        assert!(claim_dw1c_terminal_on(&success_first, 1));
+        assert!(!claim_dw1c_terminal_on(&success_first, 2));
+        assert_eq!(success_first.load(Ordering::Acquire), 1);
+
+        let failure_first = AtomicU8::new(0);
+        assert!(claim_dw1c_terminal_on(&failure_first, 2));
+        assert!(!claim_dw1c_terminal_on(&failure_first, 1));
+        assert_eq!(failure_first.load(Ordering::Acquire), 2);
     }
 }
