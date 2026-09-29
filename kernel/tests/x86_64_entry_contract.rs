@@ -1146,6 +1146,35 @@ fn g5_primordial_blocking_uses_the_f12_idle_suspend_resume_flow() {
     assert!(!primordial.contains("primordial bootstrap unexpectedly resumed a blocked syscall"));
 }
 
+/// Text test: `copy_module` runs only on the target BSP path (primordial.rs is target-only and
+/// the pinned toolchains have no Miri), so no host test can observe forming a slice over
+/// uninitialized `MaybeUninit` storage.
+#[test]
+fn g3_module_intake_initializes_its_storage_before_forming_a_slice() {
+    let primordial =
+        fs::read_to_string(kernel_root().join("src/arch/x86_64/mm/activation/primordial.rs"))
+            .expect("read primordial runtime source");
+    let intake = primordial
+        .split_once("fn copy_module<")
+        .expect("G3 module intake")
+        .1
+        .split_once("\n}\n")
+        .expect("G3 module intake extent")
+        .0;
+    let initialize = intake
+        .find("start.write_bytes(0, byte_len);")
+        .expect("the intake prefix is initialized through the raw pointer");
+    let slice = intake
+        .find("core::slice::from_raw_parts_mut(start, byte_len)")
+        .expect("the intake slice");
+    let read = intake
+        .find(".read_physical_bytes(")
+        .expect("the physical module copy");
+    assert!(initialize < slice && slice < read);
+    assert_eq!(intake.matches("from_raw_parts_mut").count(), 1);
+    assert!(!intake.contains("as_mut_ptr()"));
+}
+
 #[test]
 fn wyr1_bootfs_capacity_owns_the_page_ceiling_without_recursive_media_identity() {
     let primordial =

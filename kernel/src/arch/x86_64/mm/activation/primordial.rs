@@ -9850,10 +9850,14 @@ fn copy_module<'a, const BYTES: usize, const RANGE_CAPACITY: usize, const ROLE_C
     if byte_len == 0 || byte_len > BYTES {
         panic!("{label} module exceeds its bounded G3 intake buffer");
     }
-    // SAFETY: UNVERIFIED (S2K): exclusivity holds (one-shot BSP path, one call per static), but
-    // `from_raw_parts_mut` requires initialized bytes and this storage is `MaybeUninit`.
+    let start = storage.0.get().cast::<u8>();
+    // SAFETY: exclusive: `enter` is the one-shot BSP path, calls this once per static and publishes
+    // no reference to either buffer first. `byte_len <= BYTES` (checked above), and the prefix is
+    // initialized through the raw pointer before any reference to it exists, so the slice covers
+    // only initialized bytes of this `MaybeUninit` storage.
     let destination = unsafe {
-        core::slice::from_raw_parts_mut((*storage.0.get()).as_mut_ptr().cast::<u8>(), byte_len)
+        start.write_bytes(0, byte_len);
+        core::slice::from_raw_parts_mut(start, byte_len)
     };
     active
         .read_physical_bytes(module.range().physical_start(), destination)
