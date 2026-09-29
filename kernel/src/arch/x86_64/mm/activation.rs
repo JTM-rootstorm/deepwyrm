@@ -30,6 +30,28 @@ use super::super::{
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 #[path = "activation/address_space.rs"]
 mod address_space;
+// The selector-local bootfs measurement `primordial.rs` uses, host-compiled
+// under `test` so its test runs (S2K-0).
+#[cfg(any(
+    test,
+    all(
+        deepwyrm_integrated,
+        target_os = "none",
+        target_arch = "x86_64",
+        any(
+            deepwyrm_wyr1_evidence,
+            deepwyrm_dw1b_evidence,
+            deepwyrm_wyr1b_evidence,
+            deepwyrm_dw1c_evidence,
+            deepwyrm_dw1d_evidence,
+            deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence,
+            deepwyrm_wyr1e_evidence,
+        )
+    )
+))]
+#[path = "activation/bootfs_capacity.rs"]
+mod bootfs_capacity;
 #[path = "activation/graph.rs"]
 mod graph;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]

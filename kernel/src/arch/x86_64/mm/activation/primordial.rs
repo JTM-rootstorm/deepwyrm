@@ -9865,27 +9865,6 @@ fn copy_module<'a, const BYTES: usize, const RANGE_CAPACITY: usize, const ROLE_C
     destination
 }
 
-#[cfg(any(
-    test,
-    deepwyrm_wyr1_evidence,
-    deepwyrm_dw1b_evidence,
-    deepwyrm_wyr1b_evidence,
-    deepwyrm_dw1c_evidence,
-    deepwyrm_dw1d_evidence,
-    deepwyrm_wyr1c_evidence,
-    deepwyrm_wyr1d_evidence,
-    deepwyrm_wyr1e_evidence,
-))]
-const fn integration_bootfs_page_count(byte_len: usize) -> Option<usize> {
-    if byte_len == 0 {
-        return None;
-    }
-    match byte_len.checked_add(4095) {
-        Some(rounded) => Some(rounded / 4096),
-        None => None,
-    }
-}
-
 #[allow(
     unsafe_code,
     reason = "G3 publishes stationary synchronized authorities, seals fail-closed AP carriers, and binds the BSP-exclusive carrier for audited initial CPL3 transition"
@@ -9909,42 +9888,42 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     let bootfs = copy_module(&mut active, modules.bootfs(), &BOOTFS_BYTES, "bootfs");
     #[cfg(deepwyrm_wyr1_evidence)]
     if !matches!(
-        integration_bootfs_page_count(bootfs.len()),
+        bootfs_capacity::integration_bootfs_page_count(bootfs.len()),
         Some(1..=PRIMORDIAL_BOOTFS_MAX_PAGES)
     ) {
         crate::test_support::complete_fail(0x2510_b001)
     }
     #[cfg(deepwyrm_dw1b_evidence)]
     if !matches!(
-        integration_bootfs_page_count(bootfs.len()),
+        bootfs_capacity::integration_bootfs_page_count(bootfs.len()),
         Some(1..=PRIMORDIAL_BOOTFS_MAX_PAGES)
     ) {
         crate::test_support::complete_fail(0x2610_b001)
     }
     #[cfg(deepwyrm_wyr1b_evidence)]
     if !matches!(
-        integration_bootfs_page_count(bootfs.len()),
+        bootfs_capacity::integration_bootfs_page_count(bootfs.len()),
         Some(1..=PRIMORDIAL_BOOTFS_MAX_PAGES)
     ) {
         crate::test_support::complete_fail(0x2710_b001)
     }
     #[cfg(deepwyrm_dw1c_evidence)]
     if !matches!(
-        integration_bootfs_page_count(bootfs.len()),
+        bootfs_capacity::integration_bootfs_page_count(bootfs.len()),
         Some(1..=PRIMORDIAL_BOOTFS_MAX_PAGES)
     ) {
         crate::test_support::complete_fail(0x2810_b001)
     }
     #[cfg(deepwyrm_dw1d_evidence)]
     if !matches!(
-        integration_bootfs_page_count(bootfs.len()),
+        bootfs_capacity::integration_bootfs_page_count(bootfs.len()),
         Some(1..=PRIMORDIAL_BOOTFS_MAX_PAGES)
     ) {
         crate::test_support::complete_fail(0x3010_b001)
     }
     #[cfg(deepwyrm_wyr1c_evidence)]
     if !matches!(
-        integration_bootfs_page_count(bootfs.len()),
+        bootfs_capacity::integration_bootfs_page_count(bootfs.len()),
         Some(1..=PRIMORDIAL_BOOTFS_MAX_PAGES)
     ) {
         crate::test_support::complete_fail(0x2910_b001)
@@ -10266,34 +10245,6 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
             stack,
             &exception_binding,
         )
-    }
-}
-
-#[cfg(test)]
-mod wyr1_capacity_tests {
-    use super::*;
-
-    #[test]
-    fn integration_bootfs_measurement_accepts_selector_local_capacity_and_rejects_larger_inputs() {
-        assert_eq!(integration_bootfs_page_count(0), None);
-        assert_eq!(integration_bootfs_page_count(1), Some(1));
-        assert_eq!(integration_bootfs_page_count(4096), Some(1));
-        assert_eq!(integration_bootfs_page_count(4097), Some(2));
-        assert_eq!(integration_bootfs_page_count(169_896), Some(42));
-        assert_eq!(integration_bootfs_page_count(170_496), Some(42));
-        assert_eq!(integration_bootfs_page_count(308_576), Some(76));
-        assert_eq!(integration_bootfs_page_count(309_192), Some(76));
-        assert_eq!(integration_bootfs_page_count(128 * 4096), Some(128));
-        assert!(matches!(
-            integration_bootfs_page_count(128 * 4096),
-            Some(1..=PRIMORDIAL_BOOTFS_MAX_PAGES)
-        ));
-        assert_eq!(integration_bootfs_page_count(128 * 4096 + 1), Some(129));
-        assert!(!matches!(
-            integration_bootfs_page_count(128 * 4096 + 1),
-            Some(1..=PRIMORDIAL_BOOTFS_MAX_PAGES)
-        ));
-        assert_eq!(integration_bootfs_page_count(usize::MAX), None);
     }
 }
 

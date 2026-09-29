@@ -1176,24 +1176,6 @@ fn g3_module_intake_initializes_its_storage_before_forming_a_slice() {
 }
 
 #[test]
-fn wyr1_bootfs_capacity_owns_the_page_ceiling_without_recursive_media_identity() {
-    let primordial =
-        fs::read_to_string(kernel_root().join("src/arch/x86_64/mm/activation/primordial.rs"))
-            .expect("read primordial runtime source");
-    assert!(primordial.contains("const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 128;"));
-    assert!(primordial.contains("accepted WYR1-A inputs were 170,496 and 169,896 bytes"));
-    assert!(primordial.contains("integrated WYR1-B regression inputs are 309,192 and 308,576"));
-    assert!(primordial.contains("functional-first selector-local ceiling is 128"));
-    assert!(primordial.contains("Deepwyrm owns this page ceiling and its rejection"));
-    assert!(primordial.contains("hashes belong to receipt/root evidence"));
-    assert!(primordial.contains("integration_bootfs_page_count(128 * 4096), Some(128)"));
-    assert!(primordial.contains("integration_bootfs_page_count(128 * 4096 + 1), Some(129)"));
-    assert!(primordial.contains("integration_bootfs_page_count(usize::MAX), None"));
-    assert!(primordial.contains("Some(1..=PRIMORDIAL_BOOTFS_MAX_PAGES)"));
-    assert!(primordial.contains("crate::test_support::complete_fail(0x2510_b001)"));
-}
-
-#[test]
 fn g5_terminal_completion_drains_all_primordial_authority_before_capacity_proof() {
     let primordial =
         fs::read_to_string(kernel_root().join("src/arch/x86_64/mm/activation/primordial.rs"))
