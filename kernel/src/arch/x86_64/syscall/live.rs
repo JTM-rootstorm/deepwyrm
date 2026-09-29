@@ -3,7 +3,6 @@
 use core::cell::UnsafeCell;
 use core::convert::Infallible;
 use core::mem::MaybeUninit;
-use core::pin::Pin;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::memory::kernel_stack::KernelStackBounds;
@@ -270,12 +269,13 @@ static TERMINAL_ACTION_STATE: [AtomicU8; crate::arch::x86_64::H1_RUNTIME_CPU_SLO
 static TERMINAL_ACTION: [TerminalActionStorage; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] =
     [const { TerminalActionStorage::uninit() }; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT];
 
+/// The carrier a CPU enters with, held as the raw pointer every later access
+/// uses (F1): no `&mut R` is retagged over it after publication.
 struct NativeSyscallRuntimeEntry<
-    'runtime,
     R: crate::syscall::native::NativeSyscallFrameRuntime
         + crate::syscall::native::NativeRendezvousRuntime,
 > {
-    runtime: Pin<&'runtime mut R>,
+    runtime: core::ptr::NonNull<R>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -930,12 +930,14 @@ fn bind_current_switch_stack(
 ///
 /// # Safety
 ///
-/// `runtime` must remain stationary for the full kernel lifetime. The caller
-/// must prove that `cpu_index` cannot execute userspace or otherwise reach the
-/// carrier callbacks during publication, and must never recover another
-/// reference to its sealed static storage. Binding only publishes a `Parked`
-/// lifecycle state; a later explicit release is required before dispatch can
-/// observe the binding.
+/// `runtime` points to a live `R` that stays stationary for the full kernel
+/// lifetime. From this call on, every access to it uses this pointer's
+/// provenance (the pointer or one derived from it), and no reference derived
+/// from it outlives one scoped use, so the published address is never
+/// invalidated by a later retag (F1). The caller must prove that `cpu_index`
+/// cannot execute userspace or otherwise reach the carrier callbacks during
+/// publication. Binding only publishes a `Parked` lifecycle state; a later
+/// explicit release is required before dispatch can observe the binding.
 #[allow(
     unsafe_code,
     reason = "one-shot AP carrier binding erases a unique pinned static address only after the CPU-private boundary is installed"
@@ -945,7 +947,7 @@ pub(crate) unsafe fn bind_native_runtime_carrier_for_slot<
         + crate::syscall::native::NativeRendezvousRuntime,
 >(
     cpu_index: crate::cpu::CpuIndex,
-    mut runtime: Pin<&mut R>,
+    runtime: core::ptr::NonNull<R>,
 ) -> Result<(), SyscallRuntimeBindError> {
     let cpu_index = cpu_index.index();
     if INSTALL_STATE
@@ -956,11 +958,11 @@ pub(crate) unsafe fn bind_native_runtime_carrier_for_slot<
     {
         return Err(SyscallRuntimeBindError::BoundaryNotInstalled);
     }
-    // SAFETY: the pointer is only published, never used to move `R`; this function's `# Safety`
-    // keeps the carrier stationary for the kernel's lifetime.
-    let context = unsafe { Pin::get_unchecked_mut(runtime.as_mut()) as *mut R };
-    // SAFETY: [CARRIER] this function's `# Safety` supplies the callee's: a pinned, stationary
-    // carrier owned by `cpu_index`, with every handler monomorphized for the same `R`.
+    // The caller's pointer itself is published: no reference is created here.
+    let context = runtime.as_ptr();
+    // SAFETY: [CARRIER] this function's `# Safety` supplies the callee's: a stationary carrier
+    // owned by `cpu_index` and reached only through this pointer's provenance, with every handler
+    // monomorphized for the same `R`.
     unsafe {
         publish_syscall_runtime(
             cpu_index,
@@ -985,6 +987,10 @@ pub(crate) unsafe fn bind_native_runtime_carrier_for_slot<
 /// AP holding protocol. The two one-shot lifecycle stores are adjacent: CPU0
 /// never waits in `Parked`, and scheduler normalization separately proves its
 /// existing Running claim before AP release.
+///
+/// # Safety
+///
+/// As `bind_native_runtime_carrier_for_slot`.
 #[allow(
     unsafe_code,
     reason = "CPU0 uses the same stationary one-shot carrier publication as APs but has an already-running scheduler claim"
@@ -994,14 +1000,12 @@ pub(crate) unsafe fn bind_running_native_runtime_carrier_for_slot<
         + crate::syscall::native::NativeRendezvousRuntime,
 >(
     cpu: crate::cpu::CpuIndex,
-    runtime: Pin<&mut R>,
+    runtime: core::ptr::NonNull<R>,
 ) -> Result<(), SyscallRuntimeBindError> {
     if cpu != crate::cpu::CpuIndex::BOOTSTRAP {
         return Err(SyscallRuntimeBindError::InvalidCpu);
     }
-    // SAFETY: forwarded. This `unsafe fn` has no `# Safety` section; its caller owes
-    // `bind_native_runtime_carrier_for_slot`'s contract. See [P-FACADE] in `primordial.rs` for
-    // where that caller falls short.
+    // SAFETY: forwarded: this function's `# Safety` is `bind_native_runtime_carrier_for_slot`'s.
     unsafe { bind_native_runtime_carrier_for_slot(cpu, runtime) }?;
     release_native_runtime_carrier_for_slot(cpu)
 }
@@ -2222,6 +2226,9 @@ unsafe fn iret_validated_user(state: &ValidatedUserReturn) -> ! {
 /// # Safety
 ///
 /// `stack` is the exact live E3 kernel-stack carrier of the selected Thread.
+// Only the E7, F9 and F12 guest runtimes pin a stack carrier and enter with it;
+// the primordial runtime enters through `enter_published_native_syscall_runtime`.
+#[cfg(any(deepwyrm_e7_guest, deepwyrm_f9_guest, deepwyrm_f12_guest))]
 #[allow(
     unsafe_code,
     reason = "the divergent entry frame retains one CPU's pinned carrier borrow after unique per-CPU publication and transfers through audited IRETQ assembly"
@@ -2231,29 +2238,59 @@ pub(crate) unsafe fn enter_native_syscall_runtime<
     R: crate::syscall::native::NativeSyscallFrameRuntime
         + crate::syscall::native::NativeRendezvousRuntime,
 >(
-    runtime: Pin<&'runtime mut R>,
+    runtime: core::pin::Pin<&'runtime mut R>,
     state: &ValidatedUserReturn,
     stack: KernelStackBounds,
     exception_binding: &crate::arch::x86_64::exceptions::UserExceptionBinding,
 ) -> ! {
+    // SAFETY: the pointer is taken once from the pin, which is consumed here and never used again,
+    // so every later access goes through it; nothing moves `R`.
+    let runtime = core::ptr::NonNull::from(unsafe { core::pin::Pin::get_unchecked_mut(runtime) });
     let entry = NativeSyscallRuntimeEntry { runtime };
     // SAFETY: forwarded from this function's `# Safety`; `enter` performs the remaining binding
     // checks itself.
     unsafe { entry.enter(state, stack, exception_binding) }
 }
 
-impl<
-    'runtime,
+/// Enters CPL3 on a carrier its caller already published with
+/// `bind_running_native_runtime_carrier_for_slot`, through the same pointer,
+/// so no reference is retagged over the published address (F1).
+///
+/// # Safety
+///
+/// `stack` is the exact live E3 kernel-stack carrier of the selected Thread,
+/// and `runtime` is the pointer this CPU's carrier was published with, under
+/// `bind_native_runtime_carrier_for_slot`'s `# Safety`.
+#[allow(
+    unsafe_code,
+    reason = "the divergent entry keeps the published carrier pointer and transfers through audited IRETQ assembly"
+)]
+pub(crate) unsafe fn enter_published_native_syscall_runtime<
     R: crate::syscall::native::NativeSyscallFrameRuntime
         + crate::syscall::native::NativeRendezvousRuntime,
-> NativeSyscallRuntimeEntry<'runtime, R>
+>(
+    runtime: core::ptr::NonNull<R>,
+    state: &ValidatedUserReturn,
+    stack: KernelStackBounds,
+    exception_binding: &crate::arch::x86_64::exceptions::UserExceptionBinding,
+) -> ! {
+    let entry = NativeSyscallRuntimeEntry { runtime };
+    // SAFETY: forwarded from this function's `# Safety`; `enter` checks the pointer against the
+    // published binding and halts on a mismatch.
+    unsafe { entry.enter(state, stack, exception_binding) }
+}
+
+impl<
+    R: crate::syscall::native::NativeSyscallFrameRuntime
+        + crate::syscall::native::NativeRendezvousRuntime,
+> NativeSyscallRuntimeEntry<R>
 {
     #[allow(
         unsafe_code,
         reason = "the private divergent entry owns one CPU's pinned carrier borrow for every path after unique per-CPU raw-pointer publication"
     )]
     unsafe fn enter(
-        mut self,
+        self,
         state: &ValidatedUserReturn,
         stack: KernelStackBounds,
         exception_binding: &crate::arch::x86_64::exceptions::UserExceptionBinding,
@@ -2265,18 +2302,18 @@ impl<
         // SAFETY: [ENTRY-REF] no record reference is live here; `stack` is the selected Thread's
         // live stack per this function's caller contract.
         unsafe { bind_current_thread_stack(stack) }.unwrap_or_else(|_| halt_forever());
-        // Reborrow the Pin so `self.runtime` remains owned by this nonreturning
-        // frame after its address is erased into this CPU's immutable binding.
-        // SAFETY: the pointer is only published, never used to move `R`; `self.runtime` stays
-        // pinned in this never-returning frame, so the carrier stays put.
-        let context = unsafe { Pin::get_unchecked_mut(self.runtime.as_mut()) as *mut R };
+        // The entry's pointer is the one published (or compared with the published binding): no
+        // reference is created over the carrier here.
+        let context = self.runtime.as_ptr();
         let cpu_index = current_cpu_index_for_diagnostics().unwrap_or_else(|| halt_forever());
         if RUNTIME_STATE
             .get(cpu_index)
             .is_some_and(|slot| slot.load(Ordering::Acquire) == RUNTIME_UNBOUND)
         {
-            // SAFETY: [CARRIER] the carrier is pinned and this frame never returns, so it is
-            // stationary for every later use of the pointer and owned by this CPU's slot.
+            // SAFETY: [CARRIER] the entry's caller keeps the carrier stationary for the kernel's life
+            // (a pin consumed by a never-returning frame, or a pointer published under
+            // `bind_native_runtime_carrier_for_slot`'s contract), and every later use goes through
+            // this pointer; it is owned by this CPU's slot.
             unsafe {
                 publish_syscall_runtime(
                     cpu_index,

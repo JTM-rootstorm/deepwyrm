@@ -1850,11 +1850,9 @@ fn h2_syscall_entry_and_native_runtime_carriers_are_fixed_per_cpu() {
     assert!(primordial.contains("    runtime: RuntimeAuthorityHandle<"));
     assert!(primordial.contains("struct PerCpuLiveCarrier"));
     assert!(primordial.contains("initialize_per_cpu_live_carriers()"));
-    assert!(
-        primordial.contains("let live_cpu_count = bind_runtime_carrier_facades(facades.as_mut())")
-    );
+    assert!(primordial.contains("let live_cpu_count = bind_runtime_carrier_facades(facades);"));
     assert!(primordial.contains(
-        "release_runtime_carrier_facades(shared, &mut facades_mut[0].runtime, admissions)"
+        "release_runtime_carrier_facades(\n        shared,\n        unsafe { &mut (*facades.as_ptr()).runtime },"
     ));
     assert!(primordial.contains("runtime.switch_cpu(self.cpu)"));
     assert!(primordial.contains("runtime.prepare_fresh_user_entry_synchronized()"));
@@ -1876,11 +1874,9 @@ fn i1_stationary_foundation_keeps_authority_and_carrier_boundaries_explicit() {
     assert!(primordial.contains("initialize_per_cpu_live_carriers"));
     assert!(primordial.contains("0..crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT"));
     assert!(primordial.contains("local: &'static PerCpuLiveCarrier"));
-    assert!(
-        primordial.contains("let live_cpu_count = bind_runtime_carrier_facades(facades.as_mut())")
-    );
+    assert!(primordial.contains("let live_cpu_count = bind_runtime_carrier_facades(facades);"));
     assert!(primordial.contains(
-        "release_runtime_carrier_facades(shared, &mut facades_mut[0].runtime, admissions)"
+        "release_runtime_carrier_facades(\n        shared,\n        unsafe { &mut (*facades.as_ptr()).runtime },"
     ));
     assert!(!primordial.contains("reject_entry"));
 }
@@ -1913,10 +1909,10 @@ fn dw1c1_ap_carriers_cross_generation_bound_scheduler_admission_before_dispatch(
     let scheduler = source("src/task/scheduler.rs");
 
     assert!(live.contains("bind_running_native_runtime_carrier_for_slot"));
-    assert!(primordial.contains("prepare_runtime_carrier_admission(facades_mut, live_cpu_count)"));
+    assert!(primordial.contains("prepare_runtime_carrier_admission(facades, live_cpu_count)"));
     assert!(primordial.contains("#[cfg(deepwyrm_dw1c_evidence)]\n    assert_eq!("));
-    assert!(primordial.contains("for facade in aps[..live_cpu_count - 1].iter_mut()"));
-    assert!(primordial.contains("normalize_bootstrap_carrier(&mut facades_mut[0])"));
+    assert!(primordial.contains("for cpu_index in 1..live_cpu_count {"));
+    assert!(primordial.contains("normalize_bootstrap_carrier(facades)"));
     assert!(primordial.contains("publish_ap_carrier_ready"));
     assert!(primordial.contains("carrier_ticket_is_schedulable(ticket)"));
     assert!(primordial.contains("commit_ap_schedulable(ticket, resources, ||"));
@@ -1997,6 +1993,52 @@ fn f2_kernel_context_switch_is_sysv_only_and_separate_from_user_return() {
     assert!(build.contains("deepwyrm-x86_64-kernel-context.o"));
 }
 
+/// Text test: Stacked/Tree Borrows validity of the published facade pointers is invisible to the
+/// type system and to host tests (the pinned toolchains ship no Miri), and `enter` is target-only.
+#[test]
+fn f1_facades_are_reached_only_through_their_published_pointers() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let enter = primordial
+        .split_once("pub(super) fn enter<")
+        .expect("primordial enter")
+        .1;
+    let pinned = enter
+        .split_once("let facades = core::pin::pin!(facades);")
+        .expect("pinned facade array")
+        .1;
+    // The pin is consumed once into the base pointer; nothing after it re-derives a reference to
+    // the array or a facade, and CPU0 enters through the published pointer itself.
+    let base = pinned
+        .find("core::pin::Pin::get_unchecked_mut(facades)")
+        .expect("one base pointer from the pin");
+    let after = &pinned[base + "core::pin::Pin::get_unchecked_mut(facades)".len()..];
+    for forbidden in [
+        "get_unchecked_mut",
+        "Pin::new_unchecked",
+        "facades.as_mut()",
+        "facades_mut",
+        "&mut facades[",
+        "enter_native_syscall_runtime(",
+    ] {
+        assert!(
+            !after.contains(forbidden),
+            "a published facade is re-borrowed after publication: {forbidden}"
+        );
+    }
+    assert!(after.contains("let live_cpu_count = bind_runtime_carrier_facades(facades);"));
+    assert!(after.contains("enter_published_native_syscall_runtime(\n            facades,"));
+    let bind = primordial
+        .split_once("fn bind_runtime_carrier_facades<")
+        .expect("facade publication")
+        .1
+        .split_once("\n}\n")
+        .expect("facade publication extent")
+        .0;
+    assert!(bind.contains("let carrier = unsafe { facades.add(cpu_index) };"));
+    assert!(!bind.contains("get_unchecked_mut") && !bind.contains("Pin::new_unchecked"));
+}
+
+/// Text test: how the target-only divergent entry retains its carrier is visible to no host test.
 #[test]
 fn f2_runtime_binding_is_retained_by_divergent_entry_and_suspension_drops_short_reborrows() {
     let live = source("src/arch/x86_64/syscall/live.rs");
@@ -2009,12 +2051,14 @@ fn f2_runtime_binding_is_retained_by_divergent_entry_and_suspension_drops_short_
         .expect("private divergent entry implementation")
         .0;
     assert!(divergent_entry_api.contains(") -> ! {"));
-    assert!(live.contains("NativeSyscallRuntimeEntry<'runtime, R>"));
-    assert!(live.contains("runtime: Pin<&'runtime mut R>"));
-    assert!(live.contains("Pin<&'runtime mut R>"));
+    // F1 (S2K): the divergent entry retains the carrier as the raw pointer it was published with,
+    // taken once from the caller's pin, so no `&mut` is retagged over the published address.
+    assert!(divergent_entry_api.contains("runtime: core::pin::Pin<&'runtime mut R>"));
+    assert!(live.contains("    runtime: core::ptr::NonNull<R>,\n}"));
     assert!(live.contains("let entry = NativeSyscallRuntimeEntry { runtime };"));
     assert!(live.contains("unsafe { entry.enter(state, stack, exception_binding) }"));
-    assert!(live.contains("Pin::get_unchecked_mut(self.runtime.as_mut())"));
+    assert!(live.contains("let context = self.runtime.as_ptr();"));
+    assert!(!live.contains("Pin::get_unchecked_mut(self.runtime.as_mut())"));
     assert!(!live.contains("SyscallRuntimeBinding"));
     assert!(!live.contains("bind_native_syscall_runtime"));
     assert!(live.contains("let control = {"));

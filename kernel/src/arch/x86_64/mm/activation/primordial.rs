@@ -1560,13 +1560,14 @@ impl crate::time::TimerExpiryTarget for PrimordialRuntimeShared {
 // (`bind_primordial_address_space`). The roles and tracked target passed with it serialize that
 // root, and `LivePlatform`'s `&mut active` excludes any other publisher for its lifetime.
 //
-// [P-FACADE] UNVERIFIED (S2K). `bind_runtime_carrier_facades` publishes a raw pointer to every
-// facade in `enter`'s pinned array, and `bind_native_runtime_carrier_for_slot` requires the caller
-// never to recover another reference to a published carrier. `enter` then re-borrows the whole
-// array mutably (`facades_mut`), writes each facade's `admission`, and re-pins facade 0 for
-// `enter_native_syscall_runtime`. APs are still parked, so nothing dereferences a published pointer
-// concurrently, but under Stacked or Tree Borrows that fresh mutable borrow and its writes
-// invalidate the pointers published earlier, which the carriers keep using.
+// [P-FACADE] (F1, S2K) `enter` pins the facade array in its never-returning frame and converts the
+// pin, once, into one raw base pointer; the pin is consumed there and never used again. Every later
+// access to a facade, including its publication (`bind_runtime_carrier_facades` publishes
+// `base.add(cpu)` itself), admission, the BSP's lock and release, and CPU0's entry
+// (`enter_published_native_syscall_runtime`), goes through a pointer derived from that base.
+// References are created only for one scoped use (a handle's `lock`) and never over a published
+// facade while another CPU uses it. So no retag ever sits between a published pointer and its
+// allocation, and the published addresses stay valid under Stacked and Tree Borrows.
 
 struct SharedRuntimeStorage(UnsafeCell<MaybeUninit<PrimordialRuntimeShared>>);
 
@@ -2338,17 +2339,8 @@ fn per_cpu_live_carrier(cpu: crate::cpu::CpuIndex) -> &'static PerCpuLiveCarrier
     unsafe { &*(*RUNTIME_CARRIER_STORAGE.0.get())[index].as_ptr() }
 }
 
-fn bind_runtime_carrier_facades<
-    'borrow,
-    'runtime,
-    'roles,
-    const RANGE_CAPACITY: usize,
-    const ROLE_CAPACITY: usize,
->(
-    facades: core::pin::Pin<
-        &'borrow mut [RuntimeCarrierFacade<'runtime, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>;
-                         crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
-    >,
+fn bind_runtime_carrier_facades<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
+    facades: core::ptr::NonNull<RuntimeCarrierFacade<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>>,
 ) -> usize {
     let registry = crate::arch::x86_64::smp::live_cpu_registry();
     let live_cpu_count = registry.len();
@@ -2362,9 +2354,6 @@ fn bind_runtime_carrier_facades<
         crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT,
         "DW1-C1 requires the exact four-CPU runtime topology"
     );
-    // SAFETY: no facade is moved out of the array; elements are only re-pinned in place below or
-    // have fields read.
-    let facades = unsafe { core::pin::Pin::get_unchecked_mut(facades) };
     for cpu_index in 0..live_cpu_count {
         let snapshot = registry
             .snapshot(cpu_index)
@@ -2375,37 +2364,32 @@ fn bind_runtime_carrier_facades<
         }
         let cpu = crate::cpu::CpuIndex::new(cpu_index)
             .unwrap_or_else(|| panic!("CPU {cpu_index} exceeds the native carrier bound"));
-        // SAFETY: the element lives in `enter`'s `pin!` array, which is never moved and whose frame
-        // never returns.
-        let carrier = unsafe { core::pin::Pin::new_unchecked(&mut facades[cpu_index]) };
+        // SAFETY: [P-FACADE] `cpu_index < live_cpu_count <= H1_RUNTIME_CPU_SLOT_COUNT`, so this is
+        // an element of `enter`'s pinned array, derived from its one base pointer.
+        let carrier = unsafe { facades.add(cpu_index) };
+        // SAFETY: [P-FACADE] a field read through the element pointer; no reference to the facade.
+        let shared = unsafe { (*carrier.as_ptr()).shared };
         if cpu_index == 0 {
-            // SAFETY: UNVERIFIED (S2K): the carrier is stationary, but the callee also requires
-            // that no other reference to it is recovered after publication, and `enter` recovers
-            // one; see [P-FACADE].
+            // SAFETY: [P-FACADE] the facade lives in `enter`'s never-returning frame, so it is
+            // stationary for the kernel's life, and every later access uses this pointer's
+            // provenance, which is the callee's contract.
             unsafe {
                 crate::arch::x86_64::syscall::bind_running_native_runtime_carrier_for_slot(
                     cpu, carrier,
                 )
             }
             .unwrap_or_else(|error| {
-                facades[cpu_index]
-                    .shared
-                    .execution
-                    .fail_carrier_admission(cpu);
+                shared.execution.fail_carrier_admission(cpu);
                 panic!("could not bind CPU0 running native carrier: {error:?}")
             });
         } else {
-            // SAFETY: UNVERIFIED (S2K): the carrier is stationary, but the callee also requires
-            // that no other reference to it is recovered after publication, and `enter` recovers
-            // one; see [P-FACADE].
+            // SAFETY: [P-FACADE] as for CPU0 above; the AP is parked and cannot reach the carrier
+            // callbacks during publication.
             unsafe {
                 crate::arch::x86_64::syscall::bind_native_runtime_carrier_for_slot(cpu, carrier)
             }
             .unwrap_or_else(|error| {
-                facades[cpu_index]
-                    .shared
-                    .execution
-                    .fail_carrier_admission(cpu);
+                shared.execution.fail_carrier_admission(cpu);
                 panic!("could not bind AP {cpu_index} native carrier: {error:?}")
             });
         }
@@ -2505,64 +2489,72 @@ fn fail_live_carrier_admission(
     panic!("CPU {} carrier admission failed: {reason}", cpu.index());
 }
 
+/// Prepares every AP's admission. Runs after publication, so it reaches the
+/// facades only through `enter`'s element pointers ([P-FACADE]).
 fn prepare_runtime_carrier_admission<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
-    facades: &mut [RuntimeCarrierFacade<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>;
-             crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+    facades: core::ptr::NonNull<RuntimeCarrierFacade<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>>,
     live_cpu_count: usize,
 ) {
-    let (bsp, aps) = facades.split_at_mut(1);
-    let runtime = bsp[0].runtime.lock();
-    for facade in aps[..live_cpu_count - 1].iter_mut() {
+    // SAFETY: [P-FACADE] facade 0's handle, borrowed for this function only; the APs are parked,
+    // and the loop below touches only their facades, not facade 0.
+    let runtime = unsafe { (*facades.as_ptr()).runtime.lock() };
+    for cpu_index in 1..live_cpu_count {
+        // SAFETY: [P-FACADE] an element of `enter`'s pinned array (`cpu_index` is below the live
+        // count); its fields are read and written in place, without a reference to the facade.
+        let facade = unsafe { facades.add(cpu_index) }.as_ptr();
+        // SAFETY: [P-FACADE] as above.
+        let (cpu, shared) = unsafe { ((*facade).cpu, (*facade).shared) };
         let resources = carrier_resource_tuple(
             &runtime,
-            facade.cpu,
+            cpu,
             crate::arch::x86_64::smp::CpuLifecycle::Parked,
             crate::arch::x86_64::syscall::RuntimeCarrierLifecycle::Parked,
             false,
         );
-        let ticket = facade
-            .shared
+        let ticket = shared
             .execution
             .prepare_ap_carrier(resources, crate::task::CarrierRuntimeState::Parked)
             .unwrap_or_else(|error| {
-                facade.shared.execution.fail_carrier_admission(facade.cpu);
-                panic!(
-                    "could not prepare AP {} admission: {error:?}",
-                    facade.cpu.index()
-                )
+                shared.execution.fail_carrier_admission(cpu);
+                panic!("could not prepare AP {} admission: {error:?}", cpu.index())
             });
-        facade.admission = Some((ticket, resources));
+        // SAFETY: [P-FACADE] as above; this AP is still parked, so nothing else reads the field.
+        unsafe { (*facade).admission = Some((ticket, resources)) };
     }
 }
 
+/// Admits CPU0. Runs after publication, so it reaches facade 0 only through
+/// `enter`'s element pointer ([P-FACADE]).
 fn normalize_bootstrap_carrier<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
-    facade: &mut RuntimeCarrierFacade<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>,
+    facade: core::ptr::NonNull<RuntimeCarrierFacade<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>>,
 ) {
+    let facade = facade.as_ptr();
+    // SAFETY: [P-FACADE] field reads through facade 0's element pointer.
+    let (cpu, shared) = unsafe { ((*facade).cpu, (*facade).shared) };
     let resources = {
-        let runtime = facade.runtime.lock();
+        // SAFETY: [P-FACADE] facade 0's handle, borrowed for this block only.
+        let runtime = unsafe { (*facade).runtime.lock() };
         carrier_resource_tuple(
             &runtime,
-            facade.cpu,
-            crate::arch::x86_64::smp::runtime_pre_admission_lifecycle(facade.cpu.index()),
+            cpu,
+            crate::arch::x86_64::smp::runtime_pre_admission_lifecycle(cpu.index()),
             crate::arch::x86_64::syscall::RuntimeCarrierLifecycle::Executing,
             true,
         )
     };
-    if crate::arch::x86_64::syscall::native_runtime_carrier_lifecycle(facade.cpu)
+    if crate::arch::x86_64::syscall::native_runtime_carrier_lifecycle(cpu)
         != Some(crate::arch::x86_64::syscall::RuntimeCarrierLifecycle::Executing)
     {
         panic!("CPU0 running runtime carrier was not published");
     }
-    let ticket = facade
-        .shared
+    let ticket = shared
         .execution
         .prepare_bootstrap_carrier(resources, crate::task::CarrierRuntimeState::Running)
         .unwrap_or_else(|error| {
-            facade.shared.execution.fail_carrier_admission(facade.cpu);
+            shared.execution.fail_carrier_admission(cpu);
             panic!("could not prepare CPU0 carrier: {error:?}")
         });
-    facade
-        .shared
+    shared
         .execution
         .publish_bootstrap_carrier_ready(
             ticket,
@@ -2570,19 +2562,22 @@ fn normalize_bootstrap_carrier<const RANGE_CAPACITY: usize, const ROLE_CAPACITY:
             crate::task::CarrierRuntimeState::Running,
         )
         .unwrap_or_else(|error| {
-            facade.shared.execution.fail_carrier_admission(facade.cpu);
+            shared.execution.fail_carrier_admission(cpu);
             panic!("could not ready CPU0 carrier: {error:?}")
         });
-    facade
-        .shared
+    shared
         .execution
         .commit_bootstrap_schedulable(ticket, resources)
         .unwrap_or_else(|error| {
-            facade.shared.execution.fail_carrier_admission(facade.cpu);
+            shared.execution.fail_carrier_admission(cpu);
             panic!("could not commit CPU0 carrier: {error:?}")
         });
-    facade.admission = Some((ticket, resources));
-    facade.admission_entered = true;
+    // SAFETY: [P-FACADE] in-place field writes through facade 0's element pointer; CPU0 has not
+    // entered its runtime yet, so nothing else reads them.
+    unsafe {
+        (*facade).admission = Some((ticket, resources));
+        (*facade).admission_entered = true;
+    }
 }
 
 fn release_runtime_carrier_facades<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
@@ -9228,42 +9223,49 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         (state, stack, exception_binding)
     };
     let mut bsp_handle = Some(bsp_handle);
-    let facades = core::array::from_fn(|cpu_index| RuntimeCarrierFacade {
-        cpu: crate::cpu::CpuIndex::new(cpu_index)
-            .unwrap_or_else(|| panic!("native carrier CPU {cpu_index} is out of range")),
-        runtime: if cpu_index == 0 {
-            bsp_handle.take()
-        } else {
-            handles.next()
-        }
-        .unwrap_or_else(|| panic!("no runtime authority handle for CPU {cpu_index}")),
-        shared,
-        admission: None,
-        admission_entered: false,
-        pending_remote_termination: None,
-    });
-    let mut facades = core::pin::pin!(facades);
-    let live_cpu_count = bind_runtime_carrier_facades(facades.as_mut());
+    let facades: [_; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] =
+        core::array::from_fn(|cpu_index| RuntimeCarrierFacade {
+            cpu: crate::cpu::CpuIndex::new(cpu_index)
+                .unwrap_or_else(|| panic!("native carrier CPU {cpu_index} is out of range")),
+            runtime: if cpu_index == 0 {
+                bsp_handle.take()
+            } else {
+                handles.next()
+            }
+            .unwrap_or_else(|| panic!("no runtime authority handle for CPU {cpu_index}")),
+            shared,
+            admission: None,
+            admission_entered: false,
+            pending_remote_termination: None,
+        });
+    let facades = core::pin::pin!(facades);
+    // [P-FACADE] The one base pointer every later facade access derives from. The pin is consumed
+    // here and never used again.
+    // SAFETY: nothing is moved out of the pinned array, which lives in this never-returning frame.
+    let facades = core::ptr::NonNull::from(unsafe { core::pin::Pin::get_unchecked_mut(facades) })
+        .cast::<RuntimeCarrierFacade<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>>();
+    let live_cpu_count = bind_runtime_carrier_facades(facades);
     user_access::initialize_live_tlb_shootdown();
-    // SAFETY: UNVERIFIED (S2K): nothing is moved out, so the pin holds, but this new `&mut` and its
-    // `admission` writes invalidate the carrier pointers published above; see [P-FACADE].
-    let facades_mut = unsafe { core::pin::Pin::get_unchecked_mut(facades.as_mut()) };
-    prepare_runtime_carrier_admission(facades_mut, live_cpu_count);
-    normalize_bootstrap_carrier(&mut facades_mut[0]);
-    let admissions = core::array::from_fn(|cpu_index| facades_mut[cpu_index].admission);
-    release_runtime_carrier_facades(shared, &mut facades_mut[0].runtime, admissions);
-    // SAFETY: UNVERIFIED (S2K): facade 0 stays in the pinned array, but re-deriving it here is the
-    // recovered reference [P-FACADE] describes.
-    let bsp_carrier = unsafe {
-        let facade = &mut facades_mut[0];
-        core::pin::Pin::new_unchecked(facade)
-    };
+    prepare_runtime_carrier_admission(facades, live_cpu_count);
+    normalize_bootstrap_carrier(facades);
+    let admissions = core::array::from_fn(|cpu_index| {
+        // SAFETY: [P-FACADE] field reads through element pointers of the pinned array; every AP is
+        // still parked and CPU0 is this CPU.
+        unsafe { (*facades.add(cpu_index).as_ptr()).admission }
+    });
+    // SAFETY: [P-FACADE] facade 0's handle, borrowed for this call only; the released APs use only
+    // their own facades.
+    release_runtime_carrier_facades(
+        shared,
+        unsafe { &mut (*facades.as_ptr()).runtime },
+        admissions,
+    );
     // SAFETY: `state` was validated against the primordial mappings and `stack` is the primordial
-    // Thread's own kernel stack, which is the callee's `# Safety`; the carrier is pinned in this
-    // never-returning frame.
+    // Thread's own kernel stack; `facades` is facade 0's element pointer, the one CPU0 was published
+    // with ([P-FACADE]), in this never-returning frame. That is the callee's `# Safety`.
     unsafe {
-        crate::arch::x86_64::syscall::enter_native_syscall_runtime(
-            bsp_carrier,
+        crate::arch::x86_64::syscall::enter_published_native_syscall_runtime(
+            facades,
             &state,
             stack,
             &exception_binding,
