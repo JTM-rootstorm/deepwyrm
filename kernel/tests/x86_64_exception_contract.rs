@@ -61,6 +61,7 @@ fn cpl3_entry_requires_exception_runtime_binding() {
     assert!(exceptions.contains("compare_exchange("));
 }
 
+/// Text test: the user-fault and invalid-return routing is target-only live wiring (live.rs, primordial.rs) that no host test compiles.
 #[test]
 fn g5_user_faults_and_invalid_returns_share_structured_terminal_reaper_handoff() {
     let live = source("src/arch/x86_64/syscall/live.rs");
@@ -70,7 +71,10 @@ fn g5_user_faults_and_invalid_returns_share_structured_terminal_reaper_handoff()
     assert!(live.contains("runtime.invalid_return(error);"));
     assert!(live.contains("handoff_to_terminal_reaper::<R>(context)"));
     assert!(live.contains("binding.user_exception_handler"));
-    assert!(primordial.contains("process_unhandled_exception_on("));
+    // S2K-3.1: the live exception path is the facade's remote-stop-aware
+    // termination; the carrier's direct copy that called
+    // `process_unhandled_exception_on` was never reached and is deleted.
+    assert!(primordial.contains("crate::syscall::prepare_process_unhandled_exception("));
     assert!(primordial.contains("bind_native_runtime_user_exception_handler()"));
     assert!(!primordial.contains("primordial userspace exception:"));
     assert!(!primordial.contains("invalid primordial userspace return:"));
@@ -113,6 +117,7 @@ fn h2_user_exception_stages_before_the_cpu_private_reaper_then_mutates_runtime()
     assert!(reaper.contains("take_terminal_action()"));
 }
 
+/// Text test: the G5 completion oracle runs only on the target-only primordial terminal path.
 #[test]
 fn g5_primordial_selectors_have_exact_post_teardown_oracles() {
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
@@ -137,8 +142,10 @@ fn g5_primordial_selectors_have_exact_post_teardown_oracles() {
         );
     }
 
+    // The live terminal path: the facade's detached handoff and its helpers,
+    // through `finish_primordial_terminal_handoff`.
     let terminate = primordial
-        .split_once("fn prepare_terminal_handoff(&mut self) -> PreparedTerminalHandoff")
+        .split_once("fn prepare_terminal_retirement_state(")
         .expect("primordial terminal handoff")
         .1
         .split_once("fn reserve_runtime_phase")
@@ -549,6 +556,7 @@ fn dw1b_timer_return_validation_is_fail_closed_before_resume_or_rearm() {
     assert!(frame.contains("sanitize_user_rflags(self.rflags)"));
 }
 
+/// Text test: the quantum and timer-return paths are target-only (live.rs, primordial.rs); no host test compiles them.
 #[test]
 fn dw1b_syscall_return_accounts_due_budget_before_preemption_and_rearm() {
     let live = source("src/arch/x86_64/syscall/live.rs");
@@ -619,7 +627,7 @@ fn dw1b_syscall_return_accounts_due_budget_before_preemption_and_rearm() {
         .split_once("fn authorize_timer_return(")
         .expect("DW1-C2 timer-return authorization")
         .1
-        .split_once("unsafe fn prepare_preemption")
+        .split_once("\n    }\n")
         .expect("DW1-C2 timer-return authorization extent")
         .0;
     assert!(!authorize.contains("CpuIndex::BOOTSTRAP"));

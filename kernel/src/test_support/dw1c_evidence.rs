@@ -2407,9 +2407,10 @@ mod tests {
                 .contains("complete_dw1c_failure_terminal(CompletionOutcome::Panic, detail)")
         );
 
+        // One live terminal path since S2K-3 deleted the carrier's never-reached copy.
         assert_eq!(
             source.matches("complete_primordial_launch(self);").count(),
-            2
+            1
         );
         assert_eq!(
             source
@@ -2417,13 +2418,13 @@ mod tests {
                     "crate::test_support::DW1C_EVIDENCE\n                .final_normal_completion("
                 )
                 .count(),
-            2
+            1
         );
         assert_eq!(
             source
                 .matches("crate::test_support::complete_dw1c_evidence(permit)")
                 .count(),
-            2
+            1
         );
         for completion in source.split("complete_primordial_launch(self);").skip(1) {
             let hook = completion

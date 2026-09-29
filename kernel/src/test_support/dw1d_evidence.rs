@@ -1646,7 +1646,8 @@ mod tests {
             .unwrap();
         assert!(controller.contains("self.process == self.primordial_process"));
         assert!(!controller.contains("evidence_init_process"));
-        assert_eq!(primordial.matches(".final_normal_completion()").count(), 2);
+        // One live terminal path since S2K-3 deleted the carrier's never-reached copy.
+        assert_eq!(primordial.matches(".final_normal_completion()").count(), 1);
 
         let ack = adapters
             .split("pub(crate) fn interrupt_ack_dw1d<")

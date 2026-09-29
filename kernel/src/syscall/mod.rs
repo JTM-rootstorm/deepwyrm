@@ -106,7 +106,7 @@ pub(crate) use adapters::{
     inspect_thread_termination_threads, interrupt_create, object_get_info_v1_with_device_objects,
     prepare_address_region_mutation, prepare_process_exit, prepare_process_terminate,
     prepare_process_unhandled_exception, prepare_task_group_terminate, prepare_thread_terminate,
-    process_exit_on, process_unhandled_exception_on, task_group_create,
+    process_exit_on, task_group_create,
 };
 #[cfg(all(
     not(deepwyrm_integrated),

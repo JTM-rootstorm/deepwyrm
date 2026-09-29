@@ -346,6 +346,7 @@ fn address_region_adapter_source_contract_tracks_the_private_module() {
     }
 }
 
+/// Text test: the post-acknowledgement carrier continuation is target-only primordial.rs code.
 #[test]
 fn i1_post_ack_carrier_never_reuses_a_retired_frame_for_late_holdsafe() {
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
@@ -353,7 +354,7 @@ fn i1_post_ack_carrier_never_reuses_a_retired_frame_for_late_holdsafe() {
         .split_once("fn prepare_after_rendezvous_stop(&mut self) -> PreparedRendezvousNext")
         .expect("post-ack carrier continuation")
         .1
-        .split_once("fn terminate_exception")
+        .split_once("\n    }\n")
         .expect("post-ack carrier continuation end")
         .0;
     assert!(continuation.contains("complete_switch_on(stopped_claim)"));
@@ -619,6 +620,7 @@ fn i1_live_process_exit_retires_the_current_cpu_carrier() {
     assert!(adapters.contains("retire_quiesced_exit_pins_defer_current_after_remote_stops_on("));
 }
 
+/// Text test: switch acknowledgement ordering is target-only facade code in primordial.rs.
 #[test]
 fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
@@ -652,28 +654,16 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
     assert!(resume.contains("runtime.switch_cpu(self.cpu);"));
     assert!(resume.contains("runtime.resume_suspended(frame)"));
 
-    let direct_invalid = runtime
+    // The facade's invalid return takes the remote-stop-aware terminal path
+    // pinned below. (The carrier's direct copy, never reached, is deleted.)
+    let invalid = runtime
         .split_once("fn invalid_return(&mut self, error:")
-        .expect("direct invalid-return terminal path")
+        .expect("live invalid-return terminal path")
         .1
         .split_once("fn user_exception(")
-        .expect("direct user-exception boundary")
+        .expect("live user-exception boundary")
         .0;
-    let direct_ack = direct_invalid
-        .find("self.complete_physical_switch_handoff()")
-        .expect("direct invalid-return switch acknowledgement");
-    let direct_sync = direct_invalid
-        .find("self.synchronize_scheduler_current();")
-        .expect("direct invalid-return scheduler synchronization");
-    let direct_terminal = direct_invalid
-        .find("self.terminate_exception(")
-        .expect("direct invalid-return termination");
-    let direct_notify = direct_invalid
-        .find("crate::task::notify_completed_switch_runnable(publication);")
-        .expect("direct invalid-return Runnable notification");
-    assert!(
-        direct_sync < direct_ack && direct_ack < direct_notify && direct_notify < direct_terminal
-    );
+    assert!(invalid.contains("self.terminate_exception_with_remote_stops("));
 
     let remote_terminal = runtime
         .split_once("fn terminate_exception_with_remote_stops(")
@@ -1357,6 +1347,7 @@ fn q35_external_entry_binds_the_selector_runtime_and_live_eoi_targets() {
     assert!(transport_binding.contains("eoi: transport_eoi::<T>,"));
 }
 
+/// Text test: live dispatch coverage is target-only primordial.rs wiring (D1 builds a host router).
 #[test]
 fn i2_live_dispatch_covers_every_stress_payload_syscall_family() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
@@ -1391,8 +1382,8 @@ fn i2_live_dispatch_covers_every_stress_payload_syscall_family() {
             "pub(crate) fn complete_prepared_task_group_termination_after_remote_stops_on<"
         )
     );
-    assert!(runtime.contains("crate::syscall::process_unhandled_exception_on("));
-    assert!(adapters.contains("pub(crate) fn process_unhandled_exception_on<"));
+    assert!(runtime.contains("crate::syscall::prepare_process_unhandled_exception("));
+    assert!(adapters.contains("pub(crate) fn prepare_process_unhandled_exception<"));
     assert!(
         runtime.contains(
             "crate::syscall::complete_prepared_process_termination_after_remote_stops_on("
@@ -1400,20 +1391,24 @@ fn i2_live_dispatch_covers_every_stress_payload_syscall_family() {
     );
 }
 
+/// Text test: the terminal handoff is target-only primordial.rs code until the D2 terminal engine.
 #[test]
 fn i1_terminal_child_without_local_work_rejoins_the_idle_scheduler() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
 
     assert!(runtime.contains("enum PreparedTerminalHandoff"));
-    assert!(runtime.contains("if retired_process != self.primordial_process"));
+    assert!(runtime.contains("if retirement.retired_process != self.primordial_process"));
     assert!(runtime.contains("self.finish_inactive_process_teardown("));
     assert!(runtime.contains("PreparedTerminalHandoff::IdleScheduler"));
     assert!(runtime.contains("enter_bound_idle_scheduler()"));
+    // The live terminal path (S2K-3.1 re-anchored it off the carrier's
+    // never-reached copy): retirement state, the detached handoff and its
+    // continuations.
     let terminal = runtime
-        .split_once("fn prepare_terminal_handoff(")
+        .split_once("fn prepare_terminal_retirement_state(")
         .expect("terminal handoff")
         .1
-        .split_once("fn terminate_exception(")
+        .split_once("fn reserve_runtime_phase")
         .expect("terminal handoff terminator")
         .0;
     let primordial_unmap = terminal
@@ -1421,76 +1416,94 @@ fn i1_terminal_child_without_local_work_rejoins_the_idle_scheduler() {
         .unwrap();
     let next_selection = terminal.find("terminal_reaper_next_on(self.cpu)").unwrap();
     assert!(primordial_unmap < next_selection);
+    // With no successor, a retiring WYR1 primordial enters the kernel root
+    // first and is retired only by that root switch's continuation.
     let no_successor = terminal
-        .split_once(
-            "if retiring_wyr1_primordial {\n            // A permanent supervisor may already be Running on another CPU",
-        )
+        .split_once("if retirement.retiring_wyr1_primordial {")
         .expect("WYR1 no-successor branch")
         .1
-        .split_once("\n        if retired_process != self.primordial_process {")
-        .expect("ordinary no-successor branch")
+        .split_once("\n        }\n")
+        .expect("WYR1 no-successor branch end")
         .0;
-    let kernel_root = no_successor
-        .find("enter_kernel_execution_root(previous)")
-        .unwrap();
-    let retirement = no_successor
-        .find("self.finish_quiesced_process_root_retirement(")
-        .unwrap();
-    assert!(kernel_root < retirement);
-    assert!(!no_successor.contains("self.unmap_primordial_userspace("));
-    assert!(!no_successor.contains("self.finish_inactive_process_teardown("));
+    assert!(no_successor.contains("self.prepare_terminal_kernel_root_switch()"));
+    assert!(no_successor.contains("TerminalKernelContinuation::RetireWyr1Primordial(retirement)"));
+    let retire = terminal
+        .split_once("TerminalKernelContinuation::RetireWyr1Primordial(mut retirement) =>")
+        .expect("WYR1 primordial kernel-root continuation")
+        .1
+        .split_once("TerminalKernelContinuation::RetireWyr1Child")
+        .expect("WYR1 primordial kernel-root continuation end")
+        .0;
+    assert!(retire.contains("self.finish_quiesced_process_root_retirement("));
+    assert!(!retire.contains("self.unmap_primordial_userspace("));
+    assert!(!retire.contains("self.finish_inactive_process_teardown("));
     assert!(!terminal.contains("terminal idle safe-root"));
 }
 
+/// Text test: the terminal handoff is target-only primordial.rs code until the D2 terminal engine.
 #[test]
 fn wyr1_terminal_child_after_primordial_retirement_uses_its_current_root() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+    // The live terminal path (re-anchored by S2K-3.1, as above).
     let terminal = runtime
-        .split_once("fn prepare_terminal_handoff(")
+        .split_once("fn prepare_terminal_retirement_state(")
         .expect("terminal handoff")
         .1
-        .split_once("fn terminate_exception(")
+        .split_once("fn reserve_runtime_phase")
         .expect("terminal handoff terminator")
         .0;
     let retired_child = terminal
-        .split_once("if retired_process != self.primordial_process && primordial_retired {")
+        .split_once(
+            "if retirement.retired_process != self.primordial_process && primordial_retired {",
+        )
         .expect("WYR1 retired-primordial child branch")
         .1
-        .split_once("\n        if retired_process != self.primordial_process {")
+        .split_once("\n        if retirement.retired_process != self.primordial_process {")
         .expect("legacy retained-primordial child branch")
         .0;
     let retirement_fact = terminal
         .split_once("let primordial_retired = match")
         .expect("WYR1 primordial retirement fact")
         .1
-        .split_once("if retired_process != self.primordial_process && primordial_retired {")
+        .split_once(
+            "if retirement.retired_process != self.primordial_process && primordial_retired {",
+        )
         .expect("WYR1 retired-primordial child branch")
         .0;
     let unmap = retired_child.find("self.unmap_current_userspace(").unwrap();
     let kernel_root = retired_child
-        .find("enter_kernel_execution_root(previous)")
+        .find("self.prepare_terminal_kernel_root_switch()")
         .unwrap();
-    let retirement = retired_child
-        .find("self.finish_quiesced_process_root_retirement(")
-        .unwrap();
-    let idle = retired_child.find("self.local.record_idle()").unwrap();
     let reporter_guard = retired_child.find("if retiring_reporter {").unwrap();
     let reporter_info = retired_child
-        .find(".process_info(retired_process)")
+        .find(".process_info(retirement.retired_process)")
         .unwrap();
     let reporter_failure = retired_child
         .find("crate::test_support::complete_fail(detail)")
         .unwrap();
+    // The root is retired, and the CPU idles, only in the kernel-root
+    // switch's continuation, after the CR3 switch the facade executes.
+    let continuation = terminal
+        .split_once("TerminalKernelContinuation::RetireWyr1Child {\n                retirement,")
+        .expect("WYR1 child kernel-root continuation")
+        .1
+        .split_once("TerminalKernelContinuation::EnterPrimordialPublisher")
+        .expect("WYR1 child kernel-root continuation end")
+        .0;
+    let retirement = continuation
+        .find("self.finish_quiesced_process_root_retirement(")
+        .unwrap();
+    let idle = continuation.find("self.local.record_idle()").unwrap();
 
     assert!(reporter_guard < reporter_info);
     assert!(reporter_info < reporter_failure);
     assert!(reporter_failure < unmap);
     assert!(retired_child.contains("if info.application_code == 0"));
     assert!(retired_child.contains("supervisor_evidence_detail(0xd014)"));
+    assert!(retired_child.contains("TerminalKernelContinuation::RetireWyr1Child {"));
     assert!(runtime.contains("return 0x2510_0000 | case;"));
     assert!(runtime.contains("return 0x2710_0000 | case;"));
     assert!(unmap < kernel_root);
-    assert!(kernel_root < retirement);
     assert!(retirement < idle);
     assert!(
         retirement_fact.contains("Ok(None) | Err(crate::task::TaskError::InvalidTask) => true")
@@ -1501,22 +1514,26 @@ fn wyr1_terminal_child_after_primordial_retirement_uses_its_current_root() {
     assert!(!retired_child.contains("self.primordial_address_space"));
 }
 
+/// Text test: the completion-failure details are emitted only on the target-only terminal path.
 #[test]
 fn wyr1_primordial_completion_failures_have_variant_specific_details() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
     let diagnostic = source("src/arch/x86_64/mm/activation/primordial_diagnostic.rs");
+    // The live terminal path (re-anchored by S2K-3.1 off the carrier's
+    // never-reached copy, which alone formatted the detail call over lines).
     let terminal = runtime
-        .split_once("fn prepare_terminal_handoff(&mut self) -> PreparedTerminalHandoff")
+        .split_once("fn prepare_terminal_retirement_state(")
         .expect("terminal handoff")
         .1
         .split_once("fn reserve_runtime_phase")
         .expect("terminal handoff extent")
         .0;
 
-    assert!(terminal.contains("if let Err(error) = validate_primordial_retirement_facts(self)"));
+    assert!(terminal.contains(
+        "if retiring_wyr1_primordial && let Err(error) = validate_primordial_retirement_facts(self)"
+    ));
     assert!(terminal.contains("let terminal_info = self.g5_probe.terminal_info;"));
-    assert!(terminal.contains("complete_fail(primordial_completion_detail("));
-    assert!(terminal.contains("                    error,\n                    terminal_info,"));
+    assert!(terminal.contains("complete_fail(primordial_completion_detail(error, terminal_info))"));
     assert!(!terminal.contains("supervisor_evidence_detail(0xd001)"));
 
     for mapping in [

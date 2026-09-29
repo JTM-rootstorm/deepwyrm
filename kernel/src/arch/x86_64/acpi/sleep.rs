@@ -1167,12 +1167,13 @@ mod tests {
     //
     // Two kinds of arm end a production run: the primordial completion
     // (F3A.7f), and the last Process leaving the machine empty (F3A.7j), which
-    // is the one WYR1 actually reaches. Each kind appears once per terminal
-    // path, and there are two terminal paths.
+    // is the one WYR1 actually reaches. Each kind appears once on the one
+    // terminal path, the facade's detached handoff. (S2K-3 deleted the
+    // carrier's second, never-reached copy of that path.)
 
     const TERMINAL_REPORTS: [(&str, usize); 2] = [
-        ("emit_early_bootstrap_completion_record", 2),
-        ("emit_early_system_empty_record", 2),
+        ("emit_early_bootstrap_completion_record", 1),
+        ("emit_early_system_empty_record", 1),
     ];
 
     #[test]
