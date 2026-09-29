@@ -337,5 +337,13 @@ pub(crate) fn run_target_timer_probe() -> Result<F8TargetTimerProbe, LiveTimeErr
     reason = "STI;HLT is the F3 target proof's race-free sleeping wait; CLI restores the caller's IF-clear test state"
 )]
 fn wait_for_interrupt() {
-    unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)) };
+    // Handlers taken inside the STI window write the scheduler and timer state
+    // the probe loops re-read after it, so this block omits `nomem`: the
+    // compiler must treat it as reading and writing memory, and may not hoist
+    // such a load out of the waiting loop.
+    // SAFETY: CPL0 with IF clear (the probe's test state), so STI's shadow makes
+    // STI;HLT race-free and CLI restores IF clear. `nostack` holds: the block
+    // pushes nothing, and a handler taken in the window writes only below RSP
+    // on the red-zone-free kernel target.
+    unsafe { core::arch::asm!("sti", "hlt", "cli", options(nostack)) };
 }

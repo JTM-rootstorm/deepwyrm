@@ -706,6 +706,121 @@ fn f3_spurious_apic_interrupt_returns_without_eoi_or_rust_dispatch() {
     assert!(!body.contains("dw_x86_64_terminal_interrupt_dispatch"));
 }
 
+/// Every `asm!` block in `kernel/src`, as `(file, template, options)`.
+fn kernel_asm_blocks() -> Vec<(String, String, String)> {
+    fn visit(directory: &std::path::Path, blocks: &mut Vec<(String, String, String)>) {
+        let mut entries: Vec<_> = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                visit(&path, blocks);
+                continue;
+            }
+            if path.extension().is_none_or(|extension| extension != "rs") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).unwrap();
+            let file = path
+                .strip_prefix(root())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let mut rest = text.as_str();
+            while let Some(start) = rest.find("asm!(") {
+                let body = &rest[start + "asm!(".len()..];
+                let mut depth = 1_usize;
+                let mut in_string = false;
+                let mut end = body.len();
+                for (index, character) in body.char_indices() {
+                    match character {
+                        '"' => in_string = !in_string,
+                        '(' if !in_string => depth += 1,
+                        ')' if !in_string => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = index;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let block = &body[..end];
+                let template = block
+                    .split('"')
+                    .skip(1)
+                    .step_by(2)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let options = block
+                    .split_once("options(")
+                    .map_or("", |(_, options)| options.split(')').next().unwrap_or(""))
+                    .to_owned();
+                blocks.push((file.clone(), template, options));
+                rest = &body[end..];
+            }
+        }
+    }
+    let mut blocks = Vec::new();
+    visit(&root().join("src"), &mut blocks);
+    blocks
+}
+
+/// Text test: whether an interrupt-flag change is a compiler memory barrier is an inline-asm
+/// option, which no host test or type can observe.
+///
+/// Enabling or disabling interrupts orders the memory an interrupt handler shares with the
+/// interrupted code, so such a block must not claim `nomem`. The only exception is a terminal
+/// `cli; hlt`, after which no code runs. `KNOWN` lists sites outside the S2K lane that were
+/// reported to the coordinator; each must still exist, so a fix forces its removal here.
+#[test]
+fn interrupt_flag_changes_are_compiler_barriers() {
+    const KNOWN: [(&str, &str); 4] = [
+        ("src/arch/x86_64/mod.rs", "cli"),
+        ("src/arch/x86_64/power.rs", "sti; hlt"),
+        ("src/sync/irq.rs", "pushfq; pop {}; cli"),
+        ("src/sync/irq.rs", "sti"),
+    ];
+    let blocks = kernel_asm_blocks();
+    let toggles_if = |template: &str| {
+        template
+            .split([';', '\n'])
+            .any(|instruction| matches!(instruction.trim(), "sti" | "cli"))
+    };
+    let mut claimed = Vec::new();
+    for (file, template, options) in &blocks {
+        if !toggles_if(template) || !options.contains("nomem") {
+            continue;
+        }
+        if template == "cli; hlt" {
+            continue;
+        }
+        claimed.push((file.as_str(), template.as_str()));
+    }
+    let mut unexpected = claimed.clone();
+    unexpected.retain(|site| !KNOWN.contains(site));
+    assert!(
+        unexpected.is_empty(),
+        "interrupt-flag changes that claim `nomem`: {unexpected:?}"
+    );
+    for known in KNOWN {
+        assert!(
+            claimed.contains(&known),
+            "{known:?} no longer claims `nomem`; remove it from KNOWN"
+        );
+    }
+    assert!(
+        blocks
+            .iter()
+            .any(|(file, template, _)| file == "src/time/live/probes.rs"
+                && template == "sti; hlt; cli"),
+        "the scan must see the probe's idle halt"
+    );
+}
+
 #[test]
 fn f3_irq_lock_disables_interrupts_before_spin_ownership_and_restores_after_drop() {
     let irq = source("src/sync/irq.rs");
