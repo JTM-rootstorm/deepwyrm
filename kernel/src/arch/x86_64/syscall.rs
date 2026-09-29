@@ -59,13 +59,11 @@ pub(crate) use live::enter_native_syscall_runtime;
     reason = "E4 target entry is wired into primordial runtime and E5 syscall adapters in later E work"
 )]
 pub(crate) use live::{
-    SyscallInstallError, abandon_to_kernel_continuation, bind_current_thread_stack,
-    bind_native_runtime_carrier_for_slot, bind_native_runtime_user_exception_handler,
-    bind_running_native_runtime_carrier_for_slot, current_binding_generation,
-    current_bound_kernel_stack, current_cpu_index_for_diagnostics,
+    SyscallInstallError, bind_current_thread_stack, bind_native_runtime_carrier_for_slot,
+    bind_native_runtime_user_exception_handler, bind_running_native_runtime_carrier_for_slot,
+    current_binding_generation, current_bound_kernel_stack, current_cpu_index_for_diagnostics,
     current_cpu_index_for_scheduler_request, current_cpu_is_on_terminal_reaper_stack,
-    current_native_usercopy_is_quiescent, enter_bound_idle_scheduler,
-    enter_bound_idle_scheduler_guard_free, enter_bound_validated_user,
+    current_native_usercopy_is_quiescent, enter_bound_idle_scheduler, enter_bound_validated_user,
     enter_published_native_syscall_runtime, first_run_thread_entry_rip,
     handoff_current_rendezvous_from_carrier, install_syscall_boundary,
     install_syscall_boundary_for_slot, native_runtime_carrier_lifecycle,

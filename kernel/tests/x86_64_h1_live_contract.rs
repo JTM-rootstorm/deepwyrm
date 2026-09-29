@@ -40,7 +40,9 @@ fn ap_entry_publishes_only_after_private_architecture_and_local_apic_state() {
         .unwrap();
     let online = body.find("publish_online(cpu_index").unwrap();
     let parked = body.find(".park(cpu_index)").unwrap();
-    let idle = body.find("idle_h2_application_processor()").unwrap();
+    let idle = body
+        .find("idle_h2_application_processor(guard_free)")
+        .unwrap();
     let failure_halt = body.find("park_h1_application_processor()").unwrap();
 
     assert!(private < apic);
@@ -48,7 +50,12 @@ fn ap_entry_publishes_only_after_private_architecture_and_local_apic_state() {
     assert!(online < parked);
     assert!(parked < idle);
     assert!(source.contains("core::arch::asm!(\"cli; hlt\""));
-    assert!(source.contains("arch::x86_64::syscall::enter_bound_idle_scheduler()"));
+    // S2K-3a: the AP mints its guard-free token at its root frame and carries it to the boundary.
+    assert!(source.contains("arch::x86_64::syscall::enter_bound_idle_scheduler(guard_free)"));
+    let mint = body
+        .find("let guard_free = unsafe { arch::x86_64::syscall::GuardFree::assume() };")
+        .unwrap();
+    assert!(parked < mint && mint < idle);
     let runtime =
         fs::read_to_string(kernel_root().join("src/arch/x86_64/mm/activation/primordial.rs"))
             .unwrap();

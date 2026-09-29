@@ -7935,7 +7935,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 // SAFETY: [P-HANDOFF] `rsp` is the scheduled Thread's saved continuation and its
                 // stack is bound above; this reaper frame is abandoned.
                 unsafe {
-                    crate::arch::x86_64::syscall::abandon_to_kernel_continuation(
+                    crate::arch::x86_64::context::abandon_to_kernel_continuation(
                         rsp,
                         self.runtime.guard_free(),
                     )
@@ -8362,13 +8362,13 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                     // and returned its continuation (or built a fresh one there); this reaper frame
                     // is abandoned.
                     PreparedTerminalHandoff::Continuation(continuation) => unsafe {
-                        crate::arch::x86_64::syscall::abandon_to_kernel_continuation(
+                        crate::arch::x86_64::context::abandon_to_kernel_continuation(
                             continuation,
                             self.runtime.guard_free(),
                         )
                     },
                     PreparedTerminalHandoff::IdleScheduler => {
-                        crate::arch::x86_64::syscall::enter_bound_idle_scheduler_guard_free(
+                        crate::arch::x86_64::syscall::enter_bound_idle_scheduler(
                             self.runtime.guard_free(),
                         )
                     }
@@ -8651,7 +8651,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                     // SAFETY: [P-HANDOFF] `rsp` is the scheduled Thread's saved continuation and
                     // its stack is bound above; this idle frame is abandoned.
                     unsafe {
-                        crate::arch::x86_64::syscall::abandon_to_kernel_continuation(
+                        crate::arch::x86_64::context::abandon_to_kernel_continuation(
                             rsp,
                             self.runtime.guard_free(),
                         )

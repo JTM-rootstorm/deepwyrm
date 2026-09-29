@@ -65,8 +65,8 @@ use super::runtime_binding::{
 // immutable facade fields, but Stacked Borrows rejects the overlap.
 //
 // [GUARD-FREE] Crate-visible physical boundaries here (`enter_bound_validated_user`,
-// `abandon_to_kernel_continuation`, `enter_bound_idle_scheduler_guard_free`,
-// `handoff_current_rendezvous_from_carrier`) take a `GuardFree` token, so a carrier cannot reach
+// `enter_bound_idle_scheduler`, `handoff_current_rendezvous_from_carrier`), and
+// `context::abandon_to_kernel_continuation`, take a `GuardFree` token, so a carrier cannot reach
 // them while it holds its runtime-authority guard. The private boundaries (`switch_kernel_context`,
 // `handoff_to_rendezvous_reaper`, `handoff_to_terminal_reaper`) are guard-free by construction:
 // only this file's trampolines call them, this file cannot name `RuntimeAuthorityGuard`
@@ -2067,31 +2067,15 @@ pub(crate) unsafe extern "sysv64" fn dw_x86_64_first_run_thread_entry() -> ! {
     unsafe { (binding.fresh_thread_handler)(binding.context) }
 }
 
-/// Enters the bound cooperative scheduler from an AP's private bootstrap
-/// stack. The AP carrier must already be released to `Executing`.
-///
-/// For the two entries no runtime-authority guard can precede: AP bring-up
-/// (`kernel_main`'s AP path) and the detached idle entry, a fresh frame on the
-/// CPU-private bootstrap stack. Carrier code, which may hold the guard, uses
-/// `enter_bound_idle_scheduler_guard_free`.
-#[allow(
-    unsafe_code,
-    reason = "the two callers run on fresh CPU-private frames that no runtime-authority guard can precede"
-)]
-pub(crate) fn enter_bound_idle_scheduler() -> ! {
-    // SAFETY: both callers (AP bring-up in `kernel_main`, whose carrier has not yet entered, and
-    // `dw_x86_64_detached_idle_entry`, a fresh frame on the CPU-private bootstrap stack) run with
-    // no frame of this CPU holding a runtime-authority guard.
-    enter_bound_idle_scheduler_guard_free(unsafe { super::GuardFree::assume() })
-}
-
-/// Enters the bound cooperative scheduler from a carrier, which must first
-/// prove it holds no runtime-authority guard.
+/// Enters the bound cooperative scheduler, abandoning the caller's frame. The
+/// caller proves it holds no runtime-authority guard: a carrier with its
+/// handle's token, and the two execution roots (AP bring-up and the detached
+/// idle entry) with the token they mint at their root frame.
 #[allow(
     unsafe_code,
     reason = "the immutable current-CPU binding pairs its carrier with the monomorphized divergent scheduler callback"
 )]
-pub(crate) fn enter_bound_idle_scheduler_guard_free(_guard_free: super::GuardFree<'_>) -> ! {
+pub(crate) fn enter_bound_idle_scheduler(_guard_free: super::GuardFree<'_>) -> ! {
     validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
     let binding = runtime_binding().unwrap_or_else(|| halt_forever());
     // SAFETY: [CARRIER] this CPU's immutable binding and its matching
@@ -2103,8 +2087,15 @@ pub(crate) fn enter_bound_idle_scheduler_guard_free(_guard_free: super::GuardFre
 /// context lands here on the CPU-private bootstrap stack before the bound
 /// runtime releases scheduler ownership of the outgoing actor.
 #[cfg(deepwyrm_dw1c_evidence)]
+#[allow(
+    unsafe_code,
+    reason = "the root frame of a fresh execution mints the only guard-free proof it can have"
+)]
 extern "sysv64" fn dw_x86_64_detached_idle_entry() -> ! {
-    enter_bound_idle_scheduler()
+    // SAFETY: this is the root Rust frame of a fresh execution: the detach's synthetic context
+    // switches here on the CPU-private bootstrap stack, abandoning the frame that held the carrier.
+    // No frame below this one exists, so no runtime-authority guard can be held.
+    enter_bound_idle_scheduler(unsafe { super::GuardFree::assume() })
 }
 
 #[cfg(deepwyrm_dw1c_evidence)]
@@ -2181,25 +2172,6 @@ pub(crate) unsafe fn enter_bound_validated_user(
     // all checked above; `state` is a `ValidatedUserReturn`, which `iret_validated_user` reads in
     // full before it writes the bound stack.
     unsafe { iret_validated_user(state) }
-}
-
-/// Abandons the current (reaper or carrier) frame for a scheduler-owned kernel
-/// continuation, guard-free. Carrier code reaches
-/// `context::abandon_to_kernel_continuation` only through here.
-///
-/// # Safety
-///
-/// As `crate::arch::x86_64::context::abandon_to_kernel_continuation`.
-#[allow(
-    unsafe_code,
-    reason = "forwards the context switch's continuation contract; the token adds the guard-free proof"
-)]
-pub(crate) unsafe fn abandon_to_kernel_continuation(
-    next_rsp: u64,
-    _guard_free: super::GuardFree<'_>,
-) -> ! {
-    // SAFETY: forwarded from this function's `# Safety`.
-    unsafe { crate::arch::x86_64::context::abandon_to_kernel_continuation(next_rsp) }
 }
 
 #[allow(

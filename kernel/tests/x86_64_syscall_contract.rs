@@ -1394,7 +1394,7 @@ fn i1_terminal_child_without_local_work_rejoins_the_idle_scheduler() {
     assert!(runtime.contains("if retirement.retired_process != self.primordial_process"));
     assert!(runtime.contains("self.finish_inactive_process_teardown("));
     assert!(runtime.contains("PreparedTerminalHandoff::IdleScheduler"));
-    assert!(runtime.contains("syscall::enter_bound_idle_scheduler_guard_free(\n"));
+    assert!(runtime.contains("syscall::enter_bound_idle_scheduler(\n"));
     // The live terminal path (S2K-3.1 re-anchored it off the carrier's
     // never-reached copy): retirement state, the detached handoff and its
     // continuations.

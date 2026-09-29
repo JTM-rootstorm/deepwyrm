@@ -128,9 +128,30 @@ fn guard_free_tokens_cannot_be_minted_under_the_runtime_guard() {
 }
 
 fn run_case(rustc: &std::ffi::OsStr, manifest_dir: &Path, output_dir: &Path, case: &UiCase<'_>) {
+    run_case_with(rustc, manifest_dir, output_dir, case, &[]);
+}
+
+/// Target-only items: `--cfg target_os="none"` makes rustc type-check the
+/// `target_os = "none"` items of the included kernel sources on the host.
+/// Only metadata is emitted, so nothing target-specific is generated or run.
+const TARGET_ONLY_CFG: [&str; 4] = [
+    "--cfg",
+    "target_os=\"none\"",
+    "-A",
+    "explicit_builtin_cfgs_in_flags",
+];
+
+fn run_case_with(
+    rustc: &std::ffi::OsStr,
+    manifest_dir: &Path,
+    output_dir: &Path,
+    case: &UiCase<'_>,
+    extra: &[&str],
+) {
     let fixture = manifest_dir.join("tests/ui").join(case.fixture);
     let crate_name = case.fixture.trim_end_matches(".rs");
     let output = Command::new(rustc)
+        .args(extra)
         .arg("--edition=2024")
         .arg("--crate-type=lib")
         .arg("--emit=metadata")
@@ -228,4 +249,63 @@ fn entry_boundaries_take_unforgeable_proofs() {
 
     fs::remove_dir_all(&output_dir)
         .expect("remove exact project-local boundary-token UI output directory");
+}
+
+/// S2K-3a: every frame-abandoning boundary takes the guard-free token. The
+/// real `context::abandon_to_kernel_continuation` refuses a call without one
+/// and refuses one minted under the guard. The token that execution roots
+/// (AP bring-up, the detached idle entry) mint at their root frame and carry
+/// by value to `enter_bound_idle_scheduler` can be neither copied nor sent to
+/// another CPU.
+#[test]
+fn every_abandoning_boundary_takes_a_guard_free_token() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_dir = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("kernel is nested below the workspace root");
+    let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let output_dir = workspace_dir
+        .join(".tmp")
+        .join("abandon-ui")
+        .join(std::process::id().to_string());
+    fs::create_dir_all(&output_dir).expect("create project-local abandon UI output directory");
+
+    for case in [
+        UiCase {
+            fixture: "context_abandon_compiles.rs",
+            expected_error: None,
+        },
+        UiCase {
+            fixture: "context_abandon_without_token.rs",
+            expected_error: Some(
+                "error[E0061]: this function takes 2 arguments but 1 argument was supplied",
+            ),
+        },
+        UiCase {
+            fixture: "context_abandon_under_guard.rs",
+            expected_error: Some(
+                "error[E0499]: cannot borrow `*handle` as mutable more than once at a time",
+            ),
+        },
+    ] {
+        run_case_with(&rustc, &manifest_dir, &output_dir, &case, &TARGET_ONLY_CFG);
+    }
+    for case in [
+        UiCase {
+            fixture: "guard_free_clone.rs",
+            expected_error: Some(
+                "error[E0277]: the trait bound `GuardFree<'_>: Clone` is not satisfied",
+            ),
+        },
+        UiCase {
+            fixture: "guard_free_send.rs",
+            expected_error: Some("error[E0277]: `*mut ()` cannot be sent between threads safely"),
+        },
+    ] {
+        run_case(&rustc, &manifest_dir, &output_dir, &case);
+    }
+
+    fs::remove_dir_all(&output_dir)
+        .expect("remove exact project-local abandon UI output directory");
 }
