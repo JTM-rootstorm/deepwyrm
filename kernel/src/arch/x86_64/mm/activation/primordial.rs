@@ -1560,14 +1560,27 @@ impl crate::time::TimerExpiryTarget for PrimordialRuntimeShared {
 // (`bind_primordial_address_space`). The roles and tracked target passed with it serialize that
 // root, and `LivePlatform`'s `&mut active` excludes any other publisher for its lifetime.
 //
-// [P-FACADE] (F1, S2K) `enter` pins the facade array in its never-returning frame and converts the
-// pin, once, into one raw base pointer; the pin is consumed there and never used again. Every later
+// [P-FACADE] (F1, S2K) `enter` builds the facade array into its one-shot static storage
+// (`PRIMORDIAL_FACADES`, S2K-4) and converts the storage's one `&'static mut`, once, into one raw
+// base pointer; that reference is consumed there and never used again. Every later
 // access to a facade, including its publication (`bind_runtime_carrier_facades` publishes
 // `base.add(cpu)` itself), admission, the BSP's lock and release, and CPU0's entry
 // (`enter_published_native_syscall_runtime`), goes through a pointer derived from that base.
 // References are created only for one scoped use (a handle's `lock`) and never over a published
 // facade while another CPU uses it. So no retag ever sits between a published pointer and its
 // allocation, and the published addresses stay valid under Stacked and Tree Borrows.
+
+/// The per-CPU runtime carrier facades, owned once for the kernel's lifetime
+/// (S2K-4, reset R2D) and reached only through their published pointers
+/// ([P-FACADE]).
+static PRIMORDIAL_FACADES: crate::one_shot::OneShotStorage<
+    [RuntimeCarrierFacade<
+        'static,
+        'static,
+        { crate::BOOTSTRAP_FRAME_RANGE_CAPACITY },
+        { crate::BOOTSTRAP_FRAME_ROLE_CAPACITY },
+    >; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+> = crate::one_shot::OneShotStorage::new();
 
 /// The primordial runtime's authority lock and the carrier it guards, owned
 /// once for the kernel's lifetime (S2K-4, reset R2D).
@@ -2377,12 +2390,12 @@ fn bind_runtime_carrier_facades<const RANGE_CAPACITY: usize, const ROLE_CAPACITY
         let cpu = crate::cpu::CpuIndex::new(cpu_index)
             .unwrap_or_else(|| panic!("CPU {cpu_index} exceeds the native carrier bound"));
         // SAFETY: [P-FACADE] `cpu_index < live_cpu_count <= H1_RUNTIME_CPU_SLOT_COUNT`, so this is
-        // an element of `enter`'s pinned array, derived from its one base pointer.
+        // an element of the permanent facade array, derived from its one base pointer.
         let carrier = unsafe { facades.add(cpu_index) };
         // SAFETY: [P-FACADE] a field read through the element pointer; no reference to the facade.
         let shared = unsafe { (*carrier.as_ptr()).shared };
         if cpu_index == 0 {
-            // SAFETY: [P-FACADE] the facade lives in `enter`'s never-returning frame, so it is
+            // SAFETY: [P-FACADE] the facade lives in permanent static storage, so it is
             // stationary for the kernel's life, and every later access uses this pointer's
             // provenance, which is the callee's contract.
             unsafe {
@@ -2511,7 +2524,7 @@ fn prepare_runtime_carrier_admission<const RANGE_CAPACITY: usize, const ROLE_CAP
     // and the loop below touches only their facades, not facade 0.
     let runtime = unsafe { (*facades.as_ptr()).runtime.lock() };
     for cpu_index in 1..live_cpu_count {
-        // SAFETY: [P-FACADE] an element of `enter`'s pinned array (`cpu_index` is below the live
+        // SAFETY: [P-FACADE] an element of the permanent facade array (`cpu_index` is below the live
         // count); its fields are read and written in place, without a reference to the facade.
         let facade = unsafe { facades.add(cpu_index) }.as_ptr();
         // SAFETY: [P-FACADE] as above.
@@ -9286,18 +9299,17 @@ pub(super) fn enter(
             admission_entered: false,
             pending_remote_termination: None,
         });
-    let facades = core::pin::pin!(facades);
-    // [P-FACADE] The one base pointer every later facade access derives from. The pin is consumed
-    // here and never used again.
-    // SAFETY: nothing is moved out of the pinned array, which lives in this never-returning frame.
-    let facades = core::ptr::NonNull::from(unsafe { core::pin::Pin::get_unchecked_mut(facades) })
-        .cast::<RuntimeCarrierFacade<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>>();
+    // Permanent storage (S2K-4, reset R2D): the facade array lives in one-shot static storage for
+    // the kernel's lifetime. [P-FACADE] Its one owner's reference is converted, here and once,
+    // into the base pointer every later facade access derives from, and is never used again.
+    let facades = core::ptr::NonNull::from(PRIMORDIAL_FACADES.init(facades))
+        .cast::<RuntimeCarrierFacade<'static, 'static, RANGE_CAPACITY, ROLE_CAPACITY>>();
     let live_cpu_count = bind_runtime_carrier_facades(facades);
     user_access::initialize_live_tlb_shootdown();
     prepare_runtime_carrier_admission(facades, live_cpu_count);
     normalize_bootstrap_carrier(facades);
     let admissions = core::array::from_fn(|cpu_index| {
-        // SAFETY: [P-FACADE] field reads through element pointers of the pinned array; every AP is
+        // SAFETY: [P-FACADE] field reads through element pointers of the facade array; every AP is
         // still parked and CPU0 is this CPU.
         unsafe { (*facades.add(cpu_index).as_ptr()).admission }
     });
@@ -9309,8 +9321,8 @@ pub(super) fn enter(
         admissions,
     );
     // SAFETY: `state` was validated against the primordial mappings and `stack` is the primordial
-    // Thread's own kernel stack; `facades` is facade 0's element pointer, the one CPU0 was published
-    // with ([P-FACADE]), in this never-returning frame. That is the callee's `# Safety`.
+    // Thread's own kernel stack; `facades` is facade 0's element pointer into its permanent storage,
+    // the one CPU0 was published with ([P-FACADE]). That is the callee's `# Safety`.
     unsafe {
         crate::arch::x86_64::syscall::enter_published_native_syscall_runtime(
             facades,

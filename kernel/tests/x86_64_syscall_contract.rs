@@ -2015,16 +2015,20 @@ fn f1_facades_are_reached_only_through_their_published_pointers() {
         .split_once("pub(super) fn enter(")
         .expect("primordial enter")
         .1;
-    let pinned = enter
-        .split_once("let facades = core::pin::pin!(facades);")
-        .expect("pinned facade array")
-        .1;
-    // The pin is consumed once into the base pointer; nothing after it re-derives a reference to
-    // the array or a facade, and CPU0 enters through the published pointer itself.
-    let base = pinned
-        .find("core::pin::Pin::get_unchecked_mut(facades)")
-        .expect("one base pointer from the pin");
-    let after = &pinned[base + "core::pin::Pin::get_unchecked_mut(facades)".len()..];
+    // S2K-4: the runtime lives in permanent storage, not on `enter`'s boot-stack frame.
+    assert!(
+        !enter.contains("core::pin::pin!("),
+        "a runtime object is pinned on the boot stack"
+    );
+    assert!(enter.contains("PRIMORDIAL_RUNTIME_AUTHORITY.init(RuntimeAuthorityLock::new("));
+    // The storage's one `&'static mut` is consumed once into the base pointer; nothing after it
+    // re-derives a reference to the array or a facade, and CPU0 enters through the published
+    // pointer itself.
+    let base_anchor = "core::ptr::NonNull::from(PRIMORDIAL_FACADES.init(facades))";
+    let base = enter
+        .find(base_anchor)
+        .expect("one base pointer from the facade storage");
+    let after = &enter[base + base_anchor.len()..];
     for forbidden in [
         "get_unchecked_mut",
         "Pin::new_unchecked",
@@ -2032,6 +2036,7 @@ fn f1_facades_are_reached_only_through_their_published_pointers() {
         "facades_mut",
         "&mut facades[",
         "enter_native_syscall_runtime(",
+        "PRIMORDIAL_FACADES",
     ] {
         assert!(
             !after.contains(forbidden),
