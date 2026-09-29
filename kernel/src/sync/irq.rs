@@ -71,13 +71,18 @@ impl<T> Drop for IrqSpinMutexGuard<'_, T> {
 )]
 fn disable_and_save_interrupts() -> bool {
     let rflags: u64;
+    // No `nomem`: disabling interrupts must be a compiler memory barrier. With
+    // `nomem` the compiler may move the spin-lock acquisition, or any access to
+    // the data it protects, above the CLI, where an interrupt handler on this
+    // CPU could take the same lock and spin forever on its own holder.
+    // SAFETY: CPL0 only. PUSHFQ/POP read RFLAGS through one stack slot (hence no
+    // `nostack`) and CLI clears IF; the caller records IF to restore it.
     unsafe {
         core::arch::asm!(
             "pushfq",
             "pop {}",
             "cli",
             out(reg) rflags,
-            options(nomem),
         );
     }
     rflags & (1 << 9) != 0
@@ -90,7 +95,12 @@ fn disable_and_save_interrupts() -> bool {
 )]
 fn restore_interrupts(was_enabled: bool) {
     if was_enabled {
-        unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)) };
+        // No `nomem`: re-enabling interrupts must be a compiler memory barrier,
+        // so the lock release and every protected access stay before the STI.
+        // SAFETY: CPL0 only, and IF was set when the guard was acquired, so this
+        // restores exactly the prior state. `preserves_flags` holds: STI changes
+        // IF, which is not one of the status flags that option covers.
+        unsafe { core::arch::asm!("sti", options(nostack, preserves_flags)) };
     }
 }
 

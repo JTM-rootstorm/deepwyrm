@@ -778,11 +778,9 @@ fn kernel_asm_blocks() -> Vec<(String, String, String)> {
 /// reported to the coordinator; each must still exist, so a fix forces its removal here.
 #[test]
 fn interrupt_flag_changes_are_compiler_barriers() {
-    const KNOWN: [(&str, &str); 4] = [
+    const KNOWN: [(&str, &str); 2] = [
         ("src/arch/x86_64/mod.rs", "cli"),
         ("src/arch/x86_64/power.rs", "sti; hlt"),
-        ("src/sync/irq.rs", "pushfq; pop {}; cli"),
-        ("src/sync/irq.rs", "sti"),
     ];
     let blocks = kernel_asm_blocks();
     let toggles_if = |template: &str| {
@@ -819,6 +817,14 @@ fn interrupt_flag_changes_are_compiler_barriers() {
                 && template == "sti; hlt; cli"),
         "the scan must see the probe's idle halt"
     );
+    for template in ["pushfq; pop {}; cli", "sti"] {
+        assert!(
+            blocks
+                .iter()
+                .any(|(file, found, _)| file == "src/sync/irq.rs" && found == template),
+            "the scan must see the IRQ lock's `{template}`"
+        );
+    }
 }
 
 #[test]
