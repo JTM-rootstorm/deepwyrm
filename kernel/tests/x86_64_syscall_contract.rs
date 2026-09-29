@@ -419,7 +419,7 @@ fn i1_remote_termination_waits_guard_free_for_exact_ack_before_reclaim() {
     assert!(dispatch.contains("let mut runtime = self.runtime.lock();"));
     assert!(primordial.contains("fn stopped_service_state_is_quiescent(&self)"));
     assert!(primordial.contains("self.services.operation_owner(self.thread)"));
-    assert!(primordial.contains("self.wait_controls[self.cpu.index()].is_clear()"));
+    assert!(primordial.contains("self.cpus[self.cpu.index()].wait_control.is_clear()"));
     // The wait-before-reacquire order is static since S2K-3: `await_remote_stop_permits` takes a
     // `GuardFree` token, which the facade cannot mint while it holds the runtime guard, and the
     // reclaim is a carrier method, which only a guard reaches.
@@ -890,17 +890,30 @@ fn i2_terminal_reclaim_handoff_is_owned_by_the_exact_physical_cpu() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
     let live = source("src/arch/x86_64/syscall/live.rs");
 
+    // S2K-5: the deferred current is a field of each CPU's `CpuRuntimeState`, and the shared
+    // carrier has no single one that another CPU could consume.
+    let per_cpu = runtime
+        .split_once("struct CpuRuntimeState {")
+        .expect("per-CPU runtime state")
+        .1
+        .split_once("\n}\n")
+        .expect("per-CPU runtime state extent")
+        .0;
     assert!(
-        runtime.contains(
-            "deferred_currents: [Option<crate::task::DeferredCurrentExecutionResources>;"
+        per_cpu.contains(
+            "    deferred_current: Option<crate::task::DeferredCurrentExecutionResources>,"
         )
     );
-    assert!(runtime.contains("self.deferred_currents[self.cpu.index()]"));
-    assert!(runtime.contains("deferred_currents: core::array::from_fn(|_| None)"));
-    assert!(
-        !runtime
-            .contains("deferred_current: Option<crate::task::DeferredCurrentExecutionResources>")
-    );
+    let carrier = runtime
+        .split_once("struct PrimordialRuntimeCarrier<")
+        .expect("shared carrier")
+        .1
+        .split_once("\n}\n")
+        .expect("shared carrier extent")
+        .0;
+    assert!(!carrier.contains("deferred_current"));
+    assert!(runtime.contains("self.cpus[self.cpu.index()].deferred_current"));
+    assert!(runtime.contains("            deferred_current: None,"));
     assert!(runtime.contains("NativeResumeOutcome::TerminateCurrent"));
 
     let suspended = live
@@ -2076,11 +2089,13 @@ fn i1_live_wait_control_is_owned_by_each_physical_cpu_carrier() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
     let services = source("src/syscall/f_services.rs");
 
-    assert!(runtime.contains(
-        "wait_controls: [NativeWaitControl; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT]"
-    ));
-    assert!(runtime.contains("&mut self.wait_controls[self.cpu.index()]"));
-    assert!(runtime.contains(".all(NativeWaitControl::is_clear)"));
+    // S2K-5: each CPU's wait control is a field of its `CpuRuntimeState`.
+    assert!(
+        runtime.contains("cpus: [CpuRuntimeState; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT]")
+    );
+    assert!(runtime.contains("    wait_control: NativeWaitControl,"));
+    assert!(runtime.contains("&mut self.cpus[self.cpu.index()].wait_control"));
+    assert!(runtime.contains(".all(|cpu| cpu.wait_control.is_clear())"));
     assert!(
         !services.contains("control: NativeWaitControl,"),
         "shared F-service state must not own one cross-CPU suspension handoff"

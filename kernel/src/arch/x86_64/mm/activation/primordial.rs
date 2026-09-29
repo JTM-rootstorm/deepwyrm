@@ -3085,29 +3085,69 @@ impl PreparedSchedulerRootSwitch {
 /// BSP execution carrier. Plain mutable authorities remain exclusively owned
 /// here because their adapter surfaces do not yet provide transactional
 /// interior synchronization. AP carriers cannot name or borrow this state.
+/// One CPU's execution identity, recorded whole: its current Process, Thread,
+/// kernel stack, context and Process root.
+#[derive(Clone, Copy)]
+struct CpuIdentity {
+    process: ProcessKey,
+    thread: ThreadKey,
+    stack_id: crate::task::KernelStackId,
+    context_id: crate::task::ThreadContextId,
+    root_key: crate::memory::address_region::AddressRegionObjectKey,
+}
+
+/// One CPU's runtime state inside the shared carrier (S2K-5, design §4.2
+/// row 1). S2K-6 moves it into the CPU's own facade.
+struct CpuRuntimeState {
+    /// The identity recorded when `switch_cpu_state` last left this CPU.
+    /// `None` until then; selecting a CPU with no recorded identity keeps the
+    /// previous CPU's identity in the carrier's current fields (design §2.4
+    /// finding 4, preserved exactly until S2K-6 decides it).
+    identity: Option<CpuIdentity>,
+    active_root: CarrierActiveRoot,
+    root_switch_epoch: u64,
+    root_switch_flight: Option<RootSwitchFlight>,
+    // Suspension handoff is physical-carrier state, unlike the durable wait
+    // registries. One CPU must never consume another CPU's pending/idle
+    // control decision even though both serialize the shared service owners.
+    wait_control: NativeWaitControl,
+    deferred_current: Option<crate::task::DeferredCurrentExecutionResources>,
+    pending_quantum_cancellation: Option<crate::task::SchedulerQuantumTicket>,
+    #[cfg(deepwyrm_dw1b_evidence)]
+    dw1b_preemption_outgoing: Option<ThreadKey>,
+    #[cfg(deepwyrm_dw1c_evidence)]
+    dw1c_pending_detach: Option<crate::task::Dw1cContinuationDetachRequest>,
+}
+
+impl CpuRuntimeState {
+    fn new() -> Self {
+        Self {
+            identity: None,
+            active_root: CarrierActiveRoot::Unselected,
+            root_switch_epoch: 0,
+            root_switch_flight: None,
+            wait_control: NativeWaitControl::new(),
+            deferred_current: None,
+            pending_quantum_cancellation: None,
+            #[cfg(deepwyrm_dw1b_evidence)]
+            dw1b_preemption_outgoing: None,
+            #[cfg(deepwyrm_dw1c_evidence)]
+            dw1c_pending_detach: None,
+        }
+    }
+}
+
 struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
     cpu: crate::cpu::CpuIndex,
     local: &'static PerCpuLiveCarrier,
     active: ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
     active_root: CarrierActiveRoot,
-    active_roots: [CarrierActiveRoot; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
-    root_switch_epochs: [u64; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
-    root_switch_flights: [Option<RootSwitchFlight>; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
-    cpu_processes: [Option<ProcessKey>; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
-    cpu_threads: [Option<ThreadKey>; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
-    cpu_stack_ids:
-        [Option<crate::task::KernelStackId>; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
-    cpu_context_ids:
-        [Option<crate::task::ThreadContextId>; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
-    cpu_root_keys: [Option<crate::memory::address_region::AddressRegionObjectKey>;
-        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+    /// Every CPU's runtime state, by CPU index (S2K-5). The slot of the CPU
+    /// `switch_cpu_state` last selected is stale in `identity` and
+    /// `active_root`, whose live values are this carrier's current fields.
+    cpus: [CpuRuntimeState; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
     stopping_claim: Option<crate::task::SchedulerExecutionClaim>,
     stopping_claim_was_suspended: bool,
-    #[cfg(deepwyrm_dw1b_evidence)]
-    dw1b_preemption_outgoing: [Option<ThreadKey>; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
-    #[cfg(deepwyrm_dw1c_evidence)]
-    dw1c_pending_detach: [Option<crate::task::Dw1cContinuationDetachRequest>;
-        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
     rendezvous_reaper: Option<crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry>,
     registry: Registry,
     memory: Memory,
@@ -3120,10 +3160,6 @@ struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_
         WAITERS,
         EXECUTION_THREADS,
     >,
-    // Suspension handoff is physical-carrier state, unlike the durable wait
-    // registries above. One CPU must never consume another CPU's pending/idle
-    // control decision even though both serialize the shared service owners.
-    wait_controls: [NativeWaitControl; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
     channel_staging: &'static mut [u8; DW_CHANNEL_MAX_PAYLOAD as usize],
     spaces: Spaces,
     regions: Regions,
@@ -3158,10 +3194,6 @@ struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_
     kernel_peer: Option<HandleRef>,
     process_monitor: Option<HandleRef>,
     root_owner: Option<InternalRef>,
-    deferred_currents: [Option<crate::task::DeferredCurrentExecutionResources>;
-        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
-    pending_quantum_cancellations: [Option<crate::task::SchedulerQuantumTicket>;
-        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
     cleanup: CleanupQueue<REGISTRY_OBJECTS>,
     // Pending final releases are moved before the irreversible stop commit.
     // They are drained only by the post-ack kernel-root continuation.
@@ -3235,7 +3267,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
     fn switch_cpu(&mut self, cpu: crate::cpu::CpuIndex) {
-        if self.root_switch_flights[cpu.index()].is_some() {
+        if self.cpus[cpu.index()].root_switch_flight.is_some() {
             panic!("ordinary runtime selection targeted an in-flight root switch");
         }
         self.switch_cpu_state(cpu);
@@ -3245,29 +3277,32 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if self.cpu != cpu {
             let previous = self.cpu.index();
             let outgoing = core::mem::replace(&mut self.active_root, CarrierActiveRoot::Unselected);
-            let displaced = core::mem::replace(&mut self.active_roots[previous], outgoing);
+            let displaced = core::mem::replace(&mut self.cpus[previous].active_root, outgoing);
             assert!(
                 matches!(displaced, CarrierActiveRoot::Unselected),
                 "active CPU slot already retained a root"
             );
-            self.cpu_processes[previous] = Some(self.process);
-            self.cpu_threads[previous] = Some(self.thread);
-            self.cpu_stack_ids[previous] = Some(self.stack_id);
-            self.cpu_context_ids[previous] = Some(self.context_id);
-            self.cpu_root_keys[previous] = Some(self.root_key);
+            self.cpus[previous].identity = Some(CpuIdentity {
+                process: self.process,
+                thread: self.thread,
+                stack_id: self.stack_id,
+                context_id: self.context_id,
+                root_key: self.root_key,
+            });
             self.cpu = cpu;
             let current = cpu.index();
             self.active_root = core::mem::replace(
-                &mut self.active_roots[current],
+                &mut self.cpus[current].active_root,
                 CarrierActiveRoot::Unselected,
             );
             self.local = per_cpu_live_carrier(cpu);
-            if let Some(process) = self.cpu_processes[current] {
-                self.process = process;
-                self.thread = self.cpu_threads[current].expect("CPU state omitted Thread");
-                self.stack_id = self.cpu_stack_ids[current].expect("CPU state omitted stack");
-                self.context_id = self.cpu_context_ids[current].expect("CPU state omitted context");
-                self.root_key = self.cpu_root_keys[current].expect("CPU state omitted root");
+            // Finding 4: with no recorded identity, the previous CPU's stays current.
+            if let Some(identity) = self.cpus[current].identity {
+                self.process = identity.process;
+                self.thread = identity.thread;
+                self.stack_id = identity.stack_id;
+                self.context_id = identity.context_id;
+                self.root_key = identity.root_key;
             }
             self.channel_staging = take_channel_staging_once(cpu.index(), true);
             self.mirror_current_identity(crate::debug::liveness::LivenessEvent::CarrierSelected);
@@ -3292,7 +3327,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     fn begin_root_switch_flight(&mut self) -> RootSwitchFlight {
         let cpu = self.cpu;
-        let slot = &mut self.root_switch_epochs[cpu.index()];
+        let slot = &mut self.cpus[cpu.index()].root_switch_epoch;
         *slot = slot
             .checked_add(1)
             .filter(|generation| *generation != 0)
@@ -3301,7 +3336,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             cpu,
             generation: *slot,
         };
-        if self.root_switch_flights[cpu.index()]
+        if self.cpus[cpu.index()]
+            .root_switch_flight
             .replace(flight)
             .is_some()
         {
@@ -3311,7 +3347,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn select_root_switch_flight(&mut self, flight: RootSwitchFlight) {
-        if self.root_switch_flights[flight.cpu.index()] != Some(flight) {
+        if self.cpus[flight.cpu.index()].root_switch_flight != Some(flight) {
             panic!("root-switch flight identity drifted before commit");
         }
         self.switch_cpu_state(flight.cpu);
@@ -3321,10 +3357,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn finish_root_switch_flight(&mut self, flight: RootSwitchFlight) {
-        if self.root_switch_flights[flight.cpu.index()] != Some(flight) {
+        if self.cpus[flight.cpu.index()].root_switch_flight != Some(flight) {
             panic!("root-switch flight identity drifted at commit");
         }
-        self.root_switch_flights[flight.cpu.index()] = None;
+        self.cpus[flight.cpu.index()].root_switch_flight = None;
     }
 
     fn prepare_stop_root_switch(&mut self) -> PreparedStopRootSwitch {
@@ -3512,9 +3548,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> crate::syscall::native::NativeSuspendPlan<'static> {
         #[cfg(feature = "test-support")]
         let owner = self.services.operation_owner(self.thread);
-        let cancelled_quantum = self.wait_controls[self.cpu.index()].pending_quantum_cancellation();
+        let cancelled_quantum = self.cpus[self.cpu.index()]
+            .wait_control
+            .pending_quantum_cancellation();
         self.stage_local_scheduler_quantum_cancellation(cancelled_quantum);
-        let control = &mut self.wait_controls[self.cpu.index()];
+        let control = &mut self.cpus[self.cpu.index()].wait_control;
         #[cfg(deepwyrm_i1_evidence)]
         let pending_wake = control.pending_wake_key();
         // SAFETY: [P-PLAN] forwarded: this `unsafe fn` has no `# Safety` section; its callers (the
@@ -3561,7 +3599,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             return;
         };
         assert_eq!(ticket.cpu(), cpu, "quantum cancellation changed CPU");
-        let slot = &mut self.pending_quantum_cancellations[cpu.index()];
+        let slot = &mut self.cpus[cpu.index()].pending_quantum_cancellation;
         assert!(
             slot.is_none(),
             "CPU already owns a pending quantum cancellation"
@@ -3572,7 +3610,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     fn take_local_scheduler_quantum_cancellation(
         &mut self,
     ) -> Option<crate::task::SchedulerQuantumTicket> {
-        self.pending_quantum_cancellations[self.cpu.index()].take()
+        self.cpus[self.cpu.index()]
+            .pending_quantum_cancellation
+            .take()
     }
 
     fn commit_local_scheduler_quantum_cancellation(
@@ -3585,7 +3625,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             "quantum cancellation committed on another CPU"
         );
         assert!(
-            self.pending_quantum_cancellations[self.cpu.index()].is_none(),
+            self.cpus[self.cpu.index()]
+                .pending_quantum_cancellation
+                .is_none(),
             "a newer CPU-local cancellation overtook physical reconciliation"
         );
         assert_ne!(
@@ -3603,7 +3645,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         deferred: crate::task::DeferredCurrentExecutionResources,
     ) {
         self.stage_local_scheduler_quantum_cancellation(deferred.cancelled_quantum());
-        let slot = &mut self.deferred_currents[self.cpu.index()];
+        let slot = &mut self.cpus[self.cpu.index()].deferred_current;
         assert!(slot.is_none(), "deferred current resources installed twice");
         *slot = Some(deferred);
     }
@@ -3651,7 +3693,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .unwrap_or_else(|error| panic!("DW1-B switch preparation drifted: {error:?}"));
                 #[cfg(deepwyrm_dw1b_evidence)]
                 {
-                    let pending = &mut self.dw1b_preemption_outgoing[self.cpu.index()];
+                    let pending = &mut self.cpus[self.cpu.index()].dw1b_preemption_outgoing;
                     assert!(
                         pending.is_none(),
                         "selector-26 preemption attribution overlapped"
@@ -3671,7 +3713,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> crate::syscall::native::NativeIdleSuspendPoll<'static> {
         #[cfg(feature = "test-support")]
         let owner = self.services.operation_owner(self.thread);
-        let control = &mut self.wait_controls[self.cpu.index()];
+        let control = &mut self.cpus[self.cpu.index()].wait_control;
         // SAFETY: [P-PLAN] forwarded from this function's `# Safety`; `self.cpu` is the physically
         // current CPU and the entry is the fixed `first_run_thread_entry_rip`.
         let poll = unsafe {
@@ -3686,7 +3728,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         .unwrap_or_else(|error| panic!("primordial idle-suspend poll drifted: {error:?}"));
         #[cfg(deepwyrm_dw1c_evidence)]
         if let crate::syscall::native::NativeIdleSuspendPoll::Detach { request, .. } = &poll {
-            let slot = &mut self.dw1c_pending_detach[self.cpu.index()];
+            let slot = &mut self.cpus[self.cpu.index()].dw1c_pending_detach;
             assert!(slot.is_none(), "selector-28 idle detach overlapped");
             *slot = Some(*request);
         }
@@ -3744,10 +3786,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .region(retired_root_key)
             .unwrap_or_else(|error| panic!("terminal Process root disappeared: {error:?}"))
             .address_space_key();
-        let deferred = self.deferred_currents[self.cpu.index()]
+        let deferred = self.cpus[self.cpu.index()]
+            .deferred_current
             .take()
             .unwrap_or_else(|| {
-                if self.deferred_currents.iter().any(Option::is_some) {
+                if self.cpus.iter().any(|cpu| cpu.deferred_current.is_some()) {
                     panic!("terminal deferred resources migrated to another CPU")
                 }
                 if self.shared.execution.current_thread_on(self.cpu).is_some() {
@@ -4780,7 +4823,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     panic!("physical kernel switch completion drifted: {error:?}")
                 });
             #[cfg(deepwyrm_dw1b_evidence)]
-            if let Some(expected_outgoing) = self.dw1b_preemption_outgoing[self.cpu.index()].take()
+            if let Some(expected_outgoing) =
+                self.cpus[self.cpu.index()].dw1b_preemption_outgoing.take()
             {
                 assert_eq!(expected_outgoing, outgoing.thread());
                 let incoming = self
@@ -4865,14 +4909,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn service_state_is_quiescent(&self) -> bool {
-        self.services.is_quiescent() && self.wait_controls.iter().all(NativeWaitControl::is_clear)
+        self.services.is_quiescent() && self.cpus.iter().all(|cpu| cpu.wait_control.is_clear())
     }
 
     fn stopped_service_state_is_quiescent(&self) -> bool {
         matches!(
             self.services.operation_owner(self.thread),
             Err(crate::syscall::FServiceOwnerError::Missing)
-        ) && self.wait_controls[self.cpu.index()].is_clear()
+        ) && self.cpus[self.cpu.index()].wait_control.is_clear()
     }
 
     fn drain_staged_rendezvous_cleanup(&mut self) {
@@ -5815,9 +5859,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             return Err(0x7000_0100_u32 | service_residue);
         }
         if let Some(cpu) = self
-            .wait_controls
+            .cpus
             .iter()
-            .position(|control| !control.is_clear())
+            .position(|cpu| !cpu.wait_control.is_clear())
         {
             return Err(0x7000_0110_u32 | u32::try_from(cpu).unwrap_or(u32::MAX));
         }
@@ -6129,7 +6173,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         // reaper witness is consumed; only the post-ack continuation may
         // finalize them.
         if was_suspended {
-            let control = &mut self.wait_controls[self.cpu.index()];
+            let control = &mut self.cpus[self.cpu.index()].wait_control;
             self.services
                 .retire_idle_control_for_stop(control, self.thread, claim.generation())
                 .unwrap_or_else(|_| {
@@ -6200,7 +6244,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.cleanup.is_empty()
             && self.rendezvous_cleanup_staged
             && self.stopped_service_state_is_quiescent()
-            && self.deferred_currents[self.cpu.index()].is_none()
+            && self.cpus[self.cpu.index()].deferred_current.is_none()
             && self
                 .shared
                 .execution
@@ -6953,7 +6997,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             } => {
                 if event == 0x17 {
                     if !self.services.is_quiescent()
-                        || self.wait_controls.iter().any(|control| !control.is_clear())
+                        || self.cpus.iter().any(|cpu| !cpu.wait_control.is_clear())
                     {
                         crate::test_support::complete_fail(0x3010_e180)
                     }
@@ -8367,7 +8411,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         {
             let pending = {
                 let runtime = self.runtime.lock();
-                runtime.dw1c_pending_detach[self.cpu.index()]
+                runtime.cpus[self.cpu.index()].dw1c_pending_detach
             };
             if let Some(request) = pending {
                 let prepared = {
@@ -8397,7 +8441,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                         .unwrap_or_else(|error| {
                             panic!("selector-28 idle-detach completion drifted: {error:?}")
                         });
-                    runtime.dw1c_pending_detach[self.cpu.index()] = None;
+                    runtime.cpus[self.cpu.index()].dw1c_pending_detach = None;
                     runtime.local.record_idle();
                     publication
                 };
@@ -8714,7 +8758,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             let suspended_claim = runtime.shared.execution.suspended_claim_on(self.cpu);
             match (
                 suspended_claim,
-                runtime.deferred_currents[self.cpu.index()].as_ref(),
+                runtime.cpus[self.cpu.index()].deferred_current.as_ref(),
             ) {
                 (Some(suspended), Some(deferred)) => {
                     assert_eq!(
@@ -8774,7 +8818,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                     panic!("resume lost current without a mailbox notification or suspension")
                 }
                 (crate::arch::x86_64::rendezvous::MailboxNotification::None, true) => {
-                    if runtime.wait_controls[self.cpu.index()].is_clear() {
+                    if runtime.cpus[self.cpu.index()].wait_control.is_clear() {
                         match suspended_claim.and_then(|claim| {
                             runtime
                                 .shared
@@ -8785,7 +8829,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                             None if runtime.stopping_claim.is_some() => {
                                 panic!("resume crossed an in-progress remote-stop carrier")
                             }
-                            None if runtime.deferred_currents[self.cpu.index()].is_some() => {
+                            None if runtime.cpus[self.cpu.index()].deferred_current.is_some() => {
                                 panic!("resume crossed another local terminal carrier on this CPU")
                             }
                             None if suspended_claim.is_some_and(|claim| {
@@ -9100,27 +9144,15 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         local: per_cpu_live_carrier(crate::cpu::CpuIndex::BOOTSTRAP),
         active,
         active_root: CarrierActiveRoot::Process(initial_root),
-        active_roots: core::array::from_fn(|_| CarrierActiveRoot::Unselected),
-        root_switch_epochs: [0; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
-        root_switch_flights: [None; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
-        cpu_processes: core::array::from_fn(|_| None),
-        cpu_threads: core::array::from_fn(|_| None),
-        cpu_stack_ids: core::array::from_fn(|_| None),
-        cpu_context_ids: core::array::from_fn(|_| None),
-        cpu_root_keys: core::array::from_fn(|_| None),
+        cpus: core::array::from_fn(|_| CpuRuntimeState::new()),
         stopping_claim: None,
         stopping_claim_was_suspended: false,
-        #[cfg(deepwyrm_dw1b_evidence)]
-        dw1b_preemption_outgoing: core::array::from_fn(|_| None),
-        #[cfg(deepwyrm_dw1c_evidence)]
-        dw1c_pending_detach: core::array::from_fn(|_| None),
         rendezvous_reaper: None,
         registry,
         memory,
         tasks,
         shared,
         services: FServiceState::new(),
-        wait_controls: core::array::from_fn(|_| NativeWaitControl::new()),
         channel_staging: take_channel_staging(cpu_index),
         spaces,
         regions,
@@ -9155,8 +9187,6 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         kernel_peer: Some(kernel_peer),
         process_monitor: Some(process_monitor),
         root_owner: Some(root_owner),
-        deferred_currents: core::array::from_fn(|_| None),
-        pending_quantum_cancellations: core::array::from_fn(|_| None),
         cleanup: CleanupQueue::new(),
         rendezvous_cleanup: CleanupQueue::new(),
         rendezvous_cleanup_staged: false,
@@ -9438,7 +9468,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                         self.process,
                     );
                     self.services.dispatch_prepared(
-                        &mut self.wait_controls[self.cpu.index()],
+                        &mut self.cpus[self.cpu.index()].wait_control,
                         prepared,
                         &mut user,
                         &mut self.registry,
@@ -10580,7 +10610,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     // successful terminal preparation retires the replacement
                     // transactionally before publishing that Stop.
                     if physical.thread() == logical.thread()
-                        || self.cpu_threads[cpu_index] != Some(physical.thread())
+                        || self.cpus[cpu_index]
+                            .identity
+                            .map(|identity| identity.thread)
+                            != Some(physical.thread())
                     {
                         return Err(());
                     }
@@ -10588,12 +10621,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     physical
                 }
             };
-            if self.root_switch_flights[cpu_index].is_some()
-                || self.cpu_threads[cpu_index] != Some(claim.thread())
+            if self.cpus[cpu_index].root_switch_flight.is_some()
+                || self.cpus[cpu_index]
+                    .identity
+                    .map(|identity| identity.thread)
+                    != Some(claim.thread())
             {
                 return Err(());
             }
-            let Some(root) = self.active_roots[cpu_index].as_ref() else {
+            let Some(root) = self.cpus[cpu_index].active_root.as_ref() else {
                 return Err(());
             };
             let owner = self
