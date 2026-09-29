@@ -2237,20 +2237,28 @@ fn dw1c_detach_commits_its_root_flight_without_ordinary_cpu_reselection() {
     );
 }
 
+/// Text test: that the AP revalidates its private resources after entering its kernel root and
+/// before publishing ready is control flow in the target-only facade. (Entering the root before
+/// the ready publication is static since S2K D5: the publication takes the executing state only
+/// the entry's commit mints.)
 #[test]
 fn dw1c1_ap_carrier_enters_its_exact_kernel_root_before_ready_publication() {
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
     let idle = primordial
         .split_once("fn enter_idle_scheduler(&mut self) -> !")
         .expect("live idle carrier")
-        .1;
-    let root = idle.find("self.enter_ap_kernel_root_detached()").unwrap();
+        .1
+        .split_once("\n    }\n")
+        .expect("live idle carrier extent")
+        .0;
+    let root = idle
+        .find("let executing = self.enter_ap_kernel_root_detached();")
+        .unwrap();
     let resources = idle.find("carrier_resource_tuple(").unwrap();
-    let ready = idle.find("publish_ap_carrier_ready(").unwrap();
+    let ready = idle
+        .find("publish_ap_carrier_ready(ticket, resources, executing)")
+        .unwrap();
     assert!(root < resources && resources < ready);
-    assert!(primordial.contains("runtime.prepare_ap_kernel_root_entry()"));
-    assert!(primordial.contains("runtime.commit_ap_kernel_root_entry(executed)"));
-    assert!(primordial.contains("CarrierActiveRoot::Kernel(kernel)"));
 }
 
 #[test]

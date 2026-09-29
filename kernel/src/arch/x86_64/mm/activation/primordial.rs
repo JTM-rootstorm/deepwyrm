@@ -1928,7 +1928,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         runtime.service_pending_dw1e_terminal();
     }
 
-    fn enter_ap_kernel_root_detached(&mut self) {
+    /// Enters this AP's retained kernel root and returns the executing state
+    /// that carries the proof, which its ready publication requires.
+    fn enter_ap_kernel_root_detached(&mut self) -> crate::task::CarrierRuntimeState {
         let prepared = {
             let mut runtime = self.runtime.lock();
             runtime.switch_cpu(self.cpu);
@@ -1943,7 +1945,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
         };
         let mut runtime = self.runtime.lock();
-        runtime.commit_ap_kernel_root_entry(executed);
+        runtime.commit_ap_kernel_root_entry(executed)
     }
 
     fn terminate_exception_with_remote_stops(
@@ -3540,7 +3542,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         PreparedApKernelRootEntry::new(flight, prepared)
     }
 
-    fn commit_ap_kernel_root_entry(&mut self, executed: ExecutedApKernelRootEntry) {
+    /// Commits the AP kernel-root entry and mints the executing state that
+    /// proves it (TSV row 102): the only mint site.
+    #[allow(
+        unsafe_code,
+        reason = "the kernel-root entry proof is minted only by its commit"
+    )]
+    fn commit_ap_kernel_root_entry(
+        &mut self,
+        executed: ExecutedApKernelRootEntry,
+    ) -> crate::task::CarrierRuntimeState {
         self.select_root_switch_flight(executed.flight);
         let flight = executed.flight;
         let kernel = self
@@ -3548,6 +3559,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .commit_ap_kernel_root_entry(executed.into_executed());
         self.active_root = CarrierActiveRoot::Kernel(kernel);
         self.finish_root_switch_flight(flight);
+        // SAFETY: the `Executed` entry above exists only after its CR3 switch ran (`execute_on`),
+        // and this CPU's carrier has just committed it as its active kernel root.
+        unsafe { crate::task::CarrierRuntimeState::after_kernel_root_entry() }
     }
 
     fn cancel_ap_kernel_root_entry(
@@ -8477,7 +8491,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             let (ticket, resources) = self
                 .admission
                 .unwrap_or_else(|| panic!("AP carrier omitted scheduler admission identity"));
-            self.enter_ap_kernel_root_detached();
+            let executing = self.enter_ap_kernel_root_detached();
             if ticket.cpu() != self.cpu
                 || crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
                     != Some(self.cpu.index())
@@ -8538,11 +8552,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             });
             self.shared
                 .execution
-                .publish_ap_carrier_ready(
-                    ticket,
-                    resources,
-                    crate::task::CarrierRuntimeState::Executing,
-                )
+                .publish_ap_carrier_ready(ticket, resources, executing)
                 .unwrap_or_else(|error| {
                     self.shared.execution.fail_carrier_admission(self.cpu);
                     panic!(

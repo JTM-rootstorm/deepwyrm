@@ -144,6 +144,15 @@ fn f11_move_only_ipc_wait_time_and_architecture_contracts() {
             fixture: "d5_finalizers_drained_clone.rs",
             expected_error: "error[E0277]: the trait bound `FinalizersDrained: Clone` is not satisfied",
         },
+        // S2K D5 (TSV row 102): an AP publishes ready only with its kernel-root entry proof.
+        CompileFailCase {
+            fixture: "d5_ap_root_entry_forged.rs",
+            expected_error: "error[E0133]: call to unsafe function `CarrierRuntimeState::after_kernel_root_entry` is unsafe and requires unsafe block",
+        },
+        CompileFailCase {
+            fixture: "d5_ap_root_entry_clone.rs",
+            expected_error: "error[E0277]: the trait bound `CarrierRuntimeState: Clone` is not satisfied",
+        },
     ] {
         run_compile_fail_case(
             &rustc,

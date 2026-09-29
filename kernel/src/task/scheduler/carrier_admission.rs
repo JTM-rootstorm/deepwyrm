@@ -17,14 +17,59 @@ pub(crate) enum CarrierAdmissionLifecycle {
     Failed,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Proof that an AP carrier executed its kernel-root entry (the CR3 switch to
+/// its CPU's retained kernel root) and committed it. An AP publishes itself
+/// ready only with one, so no AP carrier can be admitted to the scheduler on
+/// another root (S2K D5, TSV row 102).
+///
+/// Neither `Clone` nor `Copy`: one entry admits one publication.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ApKernelRootEntered {
+    _private: (),
+}
+
+impl ApKernelRootEntered {
+    /// # Safety
+    ///
+    /// As `CarrierRuntimeState::after_kernel_root_entry`.
+    #[allow(
+        unsafe_code,
+        reason = "the unchecked constructor states a root-switch fact no type here can see"
+    )]
+    const unsafe fn assume() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Not `Copy`: `Executing` carries the AP's one kernel-root entry proof.
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) enum CarrierRuntimeState {
     /// CPU0's already-running primordial carrier.
     Running,
     /// An AP carrier is bound but cannot yet execute scheduler work.
     Parked,
-    /// The native carrier and CPU lifecycle have both been released.
-    Executing,
+    /// The native carrier and CPU lifecycle have both been released, and the
+    /// AP carrier has entered its kernel root.
+    Executing(ApKernelRootEntered),
+}
+
+impl CarrierRuntimeState {
+    /// The executing state an AP carrier publishes ready with, carrying its
+    /// kernel-root entry proof. The type of the proof is not nameable outside
+    /// this module, so this is the only way to build it.
+    ///
+    /// # Safety
+    ///
+    /// This CPU's AP carrier has just executed its kernel-root entry and
+    /// committed it as the carrier's active root.
+    #[allow(
+        unsafe_code,
+        reason = "the unchecked constructor states a root-switch fact no type here can see"
+    )]
+    pub(crate) const unsafe fn after_kernel_root_entry() -> Self {
+        // SAFETY: forwarded from this function's `# Safety`.
+        Self::Executing(unsafe { ApKernelRootEntered::assume() })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -354,13 +399,14 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             return Err(CarrierAdmissionError::StaleTicket);
         }
         let slot = &mut state.carrier_admission.slots[ticket.cpu.index()];
-        if runtime != CarrierRuntimeState::Executing
+        let executing = matches!(runtime, CarrierRuntimeState::Executing(_));
+        if !executing
             || !resources.validates_fixed_ownership()
             || slot.lifecycle != CarrierAdmissionLifecycle::Preparing
             || slot.resources != Some(resources)
         {
             slot.lifecycle = CarrierAdmissionLifecycle::Failed;
-            return Err(if runtime != CarrierRuntimeState::Executing {
+            return Err(if !executing {
                 CarrierAdmissionError::WrongRuntimeState
             } else {
                 CarrierAdmissionError::UnexpectedState
@@ -483,6 +529,16 @@ mod tests {
         SchedulerCpuId::new(index).expect("test CPU is inside the fixed scheduler bound")
     }
 
+    /// Host models stand in for the live kernel-root entry.
+    #[allow(
+        unsafe_code,
+        reason = "host models stand in for the live kernel-root entry"
+    )]
+    fn executing() -> CarrierRuntimeState {
+        // SAFETY: a host model has no CR3; it models an AP that entered its kernel root.
+        unsafe { CarrierRuntimeState::after_kernel_root_entry() }
+    }
+
     fn resources(index: usize, runtime_generation: u64) -> CarrierResourceTuple {
         let owner = cpu(index);
         CarrierResourceTuple {
@@ -553,7 +609,7 @@ mod tests {
                 .unwrap();
             assert!(!scheduler.carrier_accepts_runnable_target(cpu(index)));
             scheduler
-                .publish_ap_carrier_ready(ticket, tuple, CarrierRuntimeState::Executing)
+                .publish_ap_carrier_ready(ticket, tuple, executing())
                 .unwrap();
             assert!(!scheduler.carrier_accepts_runnable_target(cpu(index)));
             scheduler
@@ -627,7 +683,7 @@ mod tests {
             ..ticket
         };
         assert_eq!(
-            scheduler.publish_ap_carrier_ready(stale, tuple, CarrierRuntimeState::Executing),
+            scheduler.publish_ap_carrier_ready(stale, tuple, executing()),
             Err(CarrierAdmissionError::StaleTicket)
         );
         assert!(!scheduler.carrier_accepts_runnable_target(cpu(2)));
@@ -641,7 +697,7 @@ mod tests {
             .prepare_ap_carrier(tuple, CarrierRuntimeState::Parked)
             .unwrap();
         scheduler
-            .publish_ap_carrier_ready(ticket, tuple, CarrierRuntimeState::Executing)
+            .publish_ap_carrier_ready(ticket, tuple, executing())
             .unwrap();
         assert_eq!(
             scheduler.commit_ap_schedulable(ticket, tuple, || false),
@@ -652,7 +708,7 @@ mod tests {
         assert!(!snapshot.idle_wake_ready);
         assert!(!scheduler.carrier_accepts_runnable_target(cpu(3)));
         assert_eq!(
-            scheduler.publish_ap_carrier_ready(ticket, tuple, CarrierRuntimeState::Executing),
+            scheduler.publish_ap_carrier_ready(ticket, tuple, executing()),
             Err(CarrierAdmissionError::UnexpectedState)
         );
     }
@@ -665,7 +721,7 @@ mod tests {
             .prepare_ap_carrier(tuple, CarrierRuntimeState::Parked)
             .unwrap();
         scheduler
-            .publish_ap_carrier_ready(ticket, tuple, CarrierRuntimeState::Executing)
+            .publish_ap_carrier_ready(ticket, tuple, executing())
             .unwrap();
         let fault = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = scheduler.commit_ap_schedulable_inner(
