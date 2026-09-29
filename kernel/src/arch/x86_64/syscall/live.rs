@@ -24,10 +24,10 @@ use super::runtime_binding::{
 //
 // [ASM] Inline assembly here runs only in kernel code, at CPL0. CR0/CR4 moves, RDMSR/WRMSR of the
 // SYSCALL and GS-base MSRs, PUSHFQ/POP, and copying RSP neither read nor write memory Rust can
-// observe, so `nomem` is accurate for them. The STI;HLT window is the exception; see its UNVERIFIED
-// note. The kernel target (`x86_64-unknown-none`, `red_zone = false` in
-// `kernel/arch/x86_64/layout.toml`) has no red zone, so PUSHFQ, and any interrupt taken inside a
-// STI window, only write below RSP.
+// observe, so `nomem` is accurate for them. The STI;HLT;CLI idle window is the exception and
+// omits `nomem`; see `wait_for_suspend_interrupt`. The kernel target (`x86_64-unknown-none`,
+// `red_zone = false` in `kernel/arch/x86_64/layout.toml`) has no red zone, so PUSHFQ, and any
+// interrupt taken inside a STI window, only write below RSP.
 //
 // [PER-CPU-SLOT] `ENTRY_STATE`, `EXPECTED_PLAN`, `RUNTIME`, `TERMINAL_ACTION` and
 // `RENDEZVOUS_ACTION` are per-CPU `UnsafeCell` slots. A CPU selects a slot by `current_cpu_index`,
@@ -1991,10 +1991,15 @@ fn switch_kernel_context(plan: crate::arch::x86_64::context::KernelSwitchPlan<'_
     reason = "STI immediately followed by HLT is the race-free x86 idle sequence; CLI restores the IF-clear syscall runtime before polling kernel state"
 )]
 fn wait_for_suspend_interrupt() {
-    // SAFETY: UNVERIFIED (S2K): `nomem` claims no memory effects, yet handlers run inside the STI
-    // window and write memory read after it. Needs those writes to count as concurrent, not this
-    // block's; Linux uses a memory clobber.
-    unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)) };
+    // Handlers taken inside the STI window write memory the caller reads after it (wake latches,
+    // mailboxes, timer state), so this block deliberately omits `nomem`: the compiler must treat
+    // it as reading and writing memory, and may neither cache such a load across the halt nor sink
+    // an earlier store below it. Linux's `safe_halt` carries a "memory" clobber for the same reason.
+    // SAFETY: [ASM] CPL0 with IF clear (the syscall runtime's state), so STI's one-instruction
+    // shadow makes STI;HLT race-free and CLI restores IF clear before kernel state is read.
+    // `nostack` holds: the block pushes nothing, and a handler taken in the window writes only
+    // below RSP.
+    unsafe { core::arch::asm!("sti", "hlt", "cli", options(nostack)) };
 }
 
 /// Fixed trusted return target used by F7 synthetic first-run kernel frames.

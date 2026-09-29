@@ -52,7 +52,19 @@ fn ap_entry_publishes_only_after_private_architecture_and_local_apic_state() {
     let runtime =
         fs::read_to_string(kernel_root().join("src/arch/x86_64/mm/activation/primordial.rs"))
             .unwrap();
-    assert!(runtime.contains("core::arch::asm!(\"sti\", \"hlt\", \"cli\""));
+    // Text test: the AP idle halt must be a compiler memory barrier (no `nomem`), an inline-asm
+    // option on a target-only block that no host test or type can observe.
+    let idle_halts = runtime
+        .matches("core::arch::asm!(\"sti\", \"hlt\", \"cli\"")
+        .count();
+    assert_eq!(idle_halts, 1);
+    assert_eq!(
+        runtime
+            .matches("core::arch::asm!(\"sti\", \"hlt\", \"cli\", options(nostack))")
+            .count(),
+        idle_halts,
+        "every AP idle halt must omit `nomem`"
+    );
     assert!(
         failure_halt < private,
         "validation failures must park before initialization"

@@ -635,7 +635,13 @@ fn h4_idle_publication_brackets_rescan_and_uses_only_coalesced_e1_wake() {
         .split_once("dw_x86_64_first_run_thread_entry")
         .expect("architectural idle halt extent")
         .0;
-    assert!(wait.contains("core::arch::asm!(\"sti\", \"hlt\", \"cli\""));
+    // Text test: whether the idle halt is a compiler memory barrier is an inline-asm option on a
+    // target-only block, which no host test or type can observe.
+    assert!(wait.contains("core::arch::asm!(\"sti\", \"hlt\", \"cli\", options(nostack))"));
+    assert!(
+        !wait.contains("options(nomem"),
+        "the idle halt must not claim `nomem`"
+    );
     let msr = source("src/arch/x86_64/syscall/msr.rs");
     assert!(msr.contains("pub(crate) const E4_FMASK: u64 = 0x001f_7700"));
     assert_ne!(

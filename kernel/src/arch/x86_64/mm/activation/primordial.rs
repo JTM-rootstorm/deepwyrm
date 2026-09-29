@@ -9596,11 +9596,12 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                                 .unwrap_or_else(|error| {
                                     panic!("AP idle accounting publication failed: {error:?}")
                                 });
-                            // SAFETY: UNVERIFIED (S2K): as at `wait_for_suspend_interrupt` in
-                            // `syscall/live.rs`, `nomem` is claimed while handlers that run inside
-                            // the STI window write memory read after it.
+                            // SAFETY: as at `wait_for_suspend_interrupt` in `syscall/live.rs`:
+                            // CPL0 with IF clear, so STI;HLT is race-free and CLI restores IF
+                            // clear. Handlers run inside the window write memory read after it,
+                            // so the block omits `nomem` and is a compiler memory barrier.
                             unsafe {
-                                core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
+                                core::arch::asm!("sti", "hlt", "cli", options(nostack));
                             }
                             crate::arch::x86_64::idle::finish_current_idle(halt).unwrap_or_else(
                                 |error| panic!("AP idle completion failed: {error:?}"),
