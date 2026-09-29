@@ -7,9 +7,9 @@ use super::*;
 /// now carries the folded dispatch frame, and the production handler.
 /// `EXPECTED_TERMINATE` adds the task-group terminate helpers, and
 /// `EXPECTED_REQUIRED` adds architectural headroom and required spare.
-pub(crate) const EXPECTED_COMMON: usize = 50_528;
-pub(crate) const EXPECTED_TERMINATE: usize = 72_608;
-pub(crate) const EXPECTED_REQUIRED: usize = 109_472;
+pub(crate) const EXPECTED_COMMON: usize = 50_688;
+pub(crate) const EXPECTED_TERMINATE: usize = 72_768;
+pub(crate) const EXPECTED_REQUIRED: usize = 109_632;
 
 pub(crate) fn validate_wyr1e8_thread_stack_margin(
     sizes: &[StackSize],
@@ -37,21 +37,16 @@ pub(crate) fn validate_wyr1e8_thread_stack_margin(
                 && symbol.contains("RuntimeCarrierFacade<128, 4096>")
                 && !symbol.contains("::{closure")
         });
-    // R5E: `dispatch_frame` is no longer emitted as its own function. R5B to
-    // R5D took the by-value termination batches out of the frames below it,
-    // and the remaining body is small enough that LLVM folds it into its one
-    // caller, the trampoline. Its slots are therefore already inside
-    // `runtime_trampoline_bytes`, and the trampoline calls the handler
-    // directly, one return word shallower than before. Assert the fold rather
-    // than tolerate it: if a later change re-emits the frame, this fails and
-    // the chain must be re-measured instead of silently losing a level.
-    assert!(
-        !sizes.iter().any(|entry| {
-            entry.symbol.contains("syscall::native::dispatch_frame::<")
-                && entry.symbol.contains("RuntimeCarrierFacade<128, 4096>")
-        }),
-        "E8 dispatch_frame is emitted again; re-measure the common syscall chain"
-    );
+    // R5E recorded `dispatch_frame` folded into the trampoline. It is emitted as
+    // its own function again (already at deepwyrm 4341464, before S2K), so the
+    // chain carries it and one more return word; re-measured below. Assert the
+    // emission: if it folds again, the chain must be re-measured rather than
+    // silently gain a level.
+    let (dispatch_frame, dispatch_frame_bytes) = select("E8 runtime dispatch frame", &|symbol| {
+        symbol.contains("syscall::native::dispatch_frame::<")
+            && symbol.contains("RuntimeCarrierFacade<128, 4096>")
+            && !symbol.contains("::{closure")
+    });
     let (runtime_handler, runtime_handler_bytes) = select("E8 runtime handler", &|symbol| {
         symbol.contains("RuntimeCarrierFacade<128, 4096>")
             && symbol
@@ -78,8 +73,12 @@ pub(crate) fn validate_wyr1e8_thread_stack_margin(
     assert_eq!(bound_body.matches("\tjmp\trcx").count(), 1);
     assert!(bound_body.contains("syscall::live::RUNTIME"));
     assert!(
-        function_body(disassembly, &runtime_trampoline).contains(&format!(" <{runtime_handler}>")),
-        "E8 trampoline no longer reaches the production handler directly"
+        function_body(disassembly, &runtime_trampoline).contains(&format!(" <{dispatch_frame}>")),
+        "E8 trampoline no longer calls the dispatch frame"
+    );
+    assert!(
+        function_body(disassembly, &dispatch_frame).contains(&format!(" <{runtime_handler}>")),
+        "E8 dispatch frame no longer reaches the production handler directly"
     );
     assert!(
         function_body(disassembly, &runtime_handler).contains(&format!(" <{prepare_terminate}>"))
@@ -91,10 +90,10 @@ pub(crate) fn validate_wyr1e8_thread_stack_margin(
     // The entry copies a 144-byte frame onto the Thread stack and calls the
     // dispatcher. The dispatcher pushes one word before calling the bound
     // runtime. That function tail-jumps into the installed trampoline, so it
-    // adds no second return word. The trampoline, which now carries the
-    // folded dispatch frame, calls the production handler, and the handler
-    // calls the selected terminate helper.
-    const COMMON_RETURN_WORDS: usize = 3;
+    // adds no second return word. The trampoline calls the dispatch frame, the
+    // dispatch frame calls the production handler, and the handler calls the
+    // selected terminate helper.
+    const COMMON_RETURN_WORDS: usize = 4;
     const TERMINATE_RETURN_WORDS: usize = 2;
     assert_eq!(syscall_dispatch_bytes, size_of::<u64>());
     assert_eq!(bound_dispatch_bytes, 0);
@@ -102,6 +101,7 @@ pub(crate) fn validate_wyr1e8_thread_stack_margin(
         syscall_dispatch_bytes,
         bound_dispatch_bytes,
         runtime_trampoline_bytes,
+        dispatch_frame_bytes,
         runtime_handler_bytes,
     ]
     .into_iter()
@@ -156,5 +156,5 @@ fn e8_thread_capacity_fits_the_ordinary_thread_stack_after_r5() {
         assert!(PRE_R5_REQUIRED > ORDINARY);
         assert!(EXPECTED_REQUIRED <= ORDINARY);
     }
-    assert_eq!(ORDINARY - EXPECTED_REQUIRED, 414_816);
+    assert_eq!(ORDINARY - EXPECTED_REQUIRED, 414_656);
 }
