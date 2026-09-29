@@ -1032,14 +1032,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
             crate::arch::x86_64::syscall::ValidatedUserReturn::initial(context, &mut mappings)
                 .unwrap_or_else(|_| fail(0xbb))
         };
-        // SAFETY: `state` was just validated against this Process's mappings and `stack` is the
-        // entered Thread's own kernel stack, which the callee rechecks against the current binding.
-        // The token is assumed because this guest runtime has no runtime-authority lock, so no
-        // frame of this CPU can hold its guard.
+        // The first-run switch bound `stack`; check that binding.
+        let bound = crate::arch::x86_64::syscall::current_bound_kernel_stack(stack);
+        // SAFETY: `state` was just validated against this Process's mappings and `bound` proves
+        // the entered Thread's stack binding, which the callee rechecks. The token is assumed
+        // because this guest runtime has no runtime-authority lock, so no frame of this CPU can
+        // hold its guard.
         unsafe {
             crate::arch::x86_64::syscall::enter_bound_validated_user(
                 &state,
-                stack,
+                bound,
                 crate::arch::x86_64::syscall::GuardFree::assume(),
             )
         }

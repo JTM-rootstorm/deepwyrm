@@ -170,3 +170,47 @@ fn run_case(rustc: &std::ffi::OsStr, manifest_dir: &Path, output_dir: &Path, cas
         fixture.display()
     );
 }
+
+/// S2K-3: a CPL3 entry takes a `BoundKernelStack`, which only the live
+/// boundary mints, when it binds the selected Thread's stack or re-checks the
+/// binding a kernel context switch made. So no fresh entry can reach CPL3
+/// without its stack binding (TSV row 93).
+#[test]
+fn cpl3_entry_takes_an_unforgeable_bound_kernel_stack() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_dir = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("kernel is nested below the workspace root");
+    let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let output_dir = workspace_dir
+        .join(".tmp")
+        .join("boundary-token-ui")
+        .join(std::process::id().to_string());
+    fs::create_dir_all(&output_dir)
+        .expect("create project-local boundary-token UI output directory");
+
+    for case in [
+        UiCase {
+            fixture: "boundary_tokens_compiles.rs",
+            expected_error: None,
+        },
+        UiCase {
+            fixture: "bound_kernel_stack_forged.rs",
+            expected_error: Some(
+                "error[E0133]: call to unsafe function `BoundKernelStack::assume` is unsafe and requires unsafe block",
+            ),
+        },
+        UiCase {
+            fixture: "bound_kernel_stack_clone.rs",
+            expected_error: Some(
+                "error[E0277]: the trait bound `BoundKernelStack: Clone` is not satisfied",
+            ),
+        },
+    ] {
+        run_case(&rustc, &manifest_dir, &output_dir, &case);
+    }
+
+    fs::remove_dir_all(&output_dir)
+        .expect("remove exact project-local boundary-token UI output directory");
+}

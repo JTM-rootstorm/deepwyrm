@@ -7843,16 +7843,17 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             PreparedCarrierEntry::Fresh { state, stack } => {
                 // SAFETY: [P-HANDOFF] on this CPU's rendezvous reaper stack with IF clear; `stack`
                 // is the scheduled Thread's, entered below.
-                unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(stack) }
-                    .unwrap_or_else(|error| {
-                        panic!("rendezvous fresh stack binding failed: {error:?}")
-                    });
+                let bound =
+                    unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(stack) }
+                        .unwrap_or_else(|error| {
+                            panic!("rendezvous fresh stack binding failed: {error:?}")
+                        });
                 // SAFETY: [P-HANDOFF] `state` was validated for the scheduled Thread's Process and
-                // `stack` was bound just above; the callee rechecks both bindings.
+                // `bound` proves the binding just above; the callee rechecks both bindings.
                 unsafe {
                     crate::arch::x86_64::syscall::enter_bound_validated_user(
                         &state,
-                        stack,
+                        bound,
                         self.runtime.guard_free(),
                     )
                 }
@@ -8325,13 +8326,15 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             runtime.switch_cpu(self.cpu);
             runtime.prepare_fresh_user_entry_synchronized()
         };
-        // SAFETY: [P-HANDOFF] `state` was validated against the current Process; the first-run
-        // switch bound `stack`, which the callee rechecks. See its same-stack pivot note at
-        // `iret_validated_user`.
+        // The first-run switch bound `stack` before this frame existed; check that binding.
+        let bound = crate::arch::x86_64::syscall::current_bound_kernel_stack(stack);
+        // SAFETY: [P-HANDOFF] `state` was validated against the current Process and `bound`
+        // proves the first-run switch's binding, which the callee rechecks. See its same-stack
+        // note at `iret_validated_user`.
         unsafe {
             crate::arch::x86_64::syscall::enter_bound_validated_user(
                 &state,
-                stack,
+                bound,
                 self.runtime.guard_free(),
             )
         }
@@ -8556,14 +8559,17 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 Some(Entry::Fresh { state, stack }) => {
                     // SAFETY: [P-HANDOFF] this idle loop runs on a CPU-private stack with IF clear;
                     // `stack` is the scheduled Thread's, entered below.
-                    unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(stack) }
-                        .unwrap_or_else(|error| panic!("AP fresh stack binding failed: {error:?}"));
+                    let bound =
+                        unsafe { crate::arch::x86_64::syscall::bind_current_thread_stack(stack) }
+                            .unwrap_or_else(|error| {
+                                panic!("AP fresh stack binding failed: {error:?}")
+                            });
                     // SAFETY: [P-HANDOFF] `state` was validated for the scheduled Thread's Process
-                    // and `stack` was bound just above; the callee rechecks both bindings.
+                    // and `bound` proves the binding just above; the callee rechecks both.
                     unsafe {
                         crate::arch::x86_64::syscall::enter_bound_validated_user(
                             &state,
-                            stack,
+                            bound,
                             self.runtime.guard_free(),
                         )
                     }

@@ -855,7 +855,7 @@ pub(crate) fn validate_live_syscall_boundary() -> Result<(), SyscallInstallError
 )]
 pub(crate) unsafe fn bind_current_thread_stack(
     stack: KernelStackBounds,
-) -> Result<u64, EntryBindingError> {
+) -> Result<super::BoundKernelStack, EntryBindingError> {
     let (cpu_index, state) =
         // SAFETY: [ENTRY-REF] the reference is used only inside this function and callers hold no
         // `current_entry_state` reference across the call; entry assembly writes the record only on
@@ -876,7 +876,8 @@ pub(crate) unsafe fn bind_current_thread_stack(
         .ok_or(EntryBindingError::GenerationExhausted)?;
     state.current_kernel_stack_top = stack.top;
     state.binding_generation = next;
-    Ok(next)
+    // SAFETY: the two stores above made `stack` this CPU's current kernel stack.
+    Ok(unsafe { super::BoundKernelStack::assume(stack) })
 }
 
 /// Binds a context-switch destination that is either an owned Thread stack or
@@ -887,7 +888,9 @@ pub(crate) unsafe fn bind_current_thread_stack(
     unsafe_code,
     reason = "the current CPU exclusively updates its GS-selected entry record while IF remains clear"
 )]
-fn bind_current_switch_stack(stack: KernelStackBounds) -> Result<u64, EntryBindingError> {
+fn bind_current_switch_stack(
+    stack: KernelStackBounds,
+) -> Result<super::BoundKernelStack, EntryBindingError> {
     let (cpu_index, state) =
         // SAFETY: [ENTRY-REF] the reference is used only inside this function; the callers
         // (`switch_kernel_context`) run with IF clear and hold no other reference to the record.
@@ -912,7 +915,8 @@ fn bind_current_switch_stack(stack: KernelStackBounds) -> Result<u64, EntryBindi
         .ok_or(EntryBindingError::GenerationExhausted)?;
     state.current_kernel_stack_top = stack.top;
     state.binding_generation = next;
-    Ok(next)
+    // SAFETY: the two stores above made `stack` this CPU's current kernel stack.
+    Ok(unsafe { super::BoundKernelStack::assume(stack) })
 }
 
 /// Publishes a stationary carrier for an installed CPU while it remains parked
@@ -2115,6 +2119,22 @@ fn current_kernel_stack_is(stack: KernelStackBounds) -> bool {
     current_entry_state().is_some_and(|state| state.current_kernel_stack_top == stack.top)
 }
 
+/// The proof for a binding a kernel context switch made: the first-run path
+/// starts on the stack `switch_kernel_context` bound before the switch, in a
+/// frame the proof could not cross. Halts if this CPU does not bind `stack`,
+/// exactly as `enter_bound_validated_user` always has.
+#[allow(
+    unsafe_code,
+    reason = "the token is minted only after the entry record was checked to bind the stack"
+)]
+pub(crate) fn current_bound_kernel_stack(stack: KernelStackBounds) -> super::BoundKernelStack {
+    if !current_kernel_stack_is(stack) {
+        halt_forever();
+    }
+    // SAFETY: the check above found this CPU's entry record binding `stack`.
+    unsafe { super::BoundKernelStack::assume(stack) }
+}
+
 #[allow(
     dead_code,
     unsafe_code,
@@ -2122,13 +2142,14 @@ fn current_kernel_stack_is(stack: KernelStackBounds) -> bool {
 )]
 pub(crate) unsafe fn enter_bound_validated_user(
     state: &ValidatedUserReturn,
-    stack: KernelStackBounds,
+    stack: super::BoundKernelStack,
     _guard_free: super::GuardFree<'_>,
 ) -> ! {
     validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
+    // The token proves a binding happened; the check proves it is still the current one.
     if runtime_binding().is_none()
         || !crate::arch::x86_64::exceptions::user_exception_runtime_is_bound()
-        || !current_kernel_stack_is(stack)
+        || !current_kernel_stack_is(stack.stack())
     {
         halt_forever();
     }
