@@ -57,13 +57,13 @@ impl LiveTlbMailbox {
             .unwrap_or_else(|state| {
                 panic!("TLB shootdown target already has an outstanding mailbox: {state}")
             });
-        // SAFETY: this sender exclusively owns PUBLISHING. The request is
-        // immutable after the following Release publication, and the handler
-        // may read it only after it Acquire-observes PUBLISHED.
         #[allow(
             unsafe_code,
             reason = "the sender exclusively owns PUBLISHING until its Release publication"
         )]
+        // SAFETY: this sender exclusively owns PUBLISHING. The request is
+        // immutable after the following Release publication, and the handler
+        // may read it only after it Acquire-observes PUBLISHED.
         unsafe {
             (*self.request.get()).write(request);
         }
@@ -99,19 +99,20 @@ impl LiveTlbMailbox {
         if coherency.is_null() {
             panic!("published TLB shootdown mailbox omitted coherency domain");
         }
-        // SAFETY: the successful AcqRel transition owns the immutable request
-        // after the sender's Release publication. The pointer names the exact
-        // stationary root-binding coherency object; binding teardown remains
-        // gated by the acknowledgement completed below.
         #[allow(
             unsafe_code,
             reason = "the handler exclusively owns CONSUMING after acquire-consuming the sender publication"
         )]
+        // SAFETY: the successful AcqRel transition owns the immutable request
+        // after the sender's Release publication, which initialized it.
         let request = unsafe { (*self.request.get()).assume_init_read() };
         #[allow(
             unsafe_code,
             reason = "the exact stationary coherency pointer is retained by its root binding until acknowledgement-gated reclaim"
         )]
+        // SAFETY: the non-null pointer names the exact stationary root-binding
+        // coherency object the sender published; binding teardown remains
+        // gated by the acknowledgement this handler completes later.
         let coherency = unsafe { &*coherency };
         Some((coherency, request))
     }
@@ -130,12 +131,12 @@ impl LiveTlbMailbox {
     }
 }
 
-// SAFETY: the request cell is read only by the e2 CPU after acquire-consuming
-// the state publication and before release-clearing its unique mailbox state.
 #[allow(
     unsafe_code,
     reason = "mailbox state serializes the UnsafeCell request between one sender and one e2 handler"
 )]
+// SAFETY: the request cell is read only by the e2 CPU after acquire-consuming
+// the state publication and before release-clearing its unique mailbox state.
 unsafe impl Sync for LiveTlbMailbox {}
 
 static LIVE_TLB_MAILBOXES: [LiveTlbMailbox; crate::cpu::CPU_CAPACITY] =
