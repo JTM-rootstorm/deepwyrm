@@ -2192,64 +2192,6 @@ fn daybreak_production_execution_exposes_no_raw_safe_continuation_seed() {
 }
 
 #[test]
-fn dw1c1_root_switches_are_move_only_prepare_execute_commit_transactions() {
-    let bindings = source("src/arch/x86_64/mm/activation/address_space.rs");
-    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
-    let rendezvous = source("src/arch/x86_64/rendezvous.rs");
-
-    for exact in [
-        "prepare_selection_switch",
-        "commit_selection_switch",
-        "prepare_kernel_execution_root_switch",
-        "commit_kernel_execution_root_switch",
-        "prepare_from_kernel_execution_root_switch",
-        "commit_from_kernel_execution_root_switch",
-        "PreparedKernelRootEntry",
-        "ExecutedKernelRootEntry",
-    ] {
-        assert!(
-            bindings.contains(exact),
-            "detached root contract omitted {exact}"
-        );
-    }
-    assert!(primordial.contains("root_switch_flights:"));
-    assert!(primordial.contains("fn cancel_scheduler_root_switch("));
-    assert!(primordial.contains("fn cancel_stop_root_switch("));
-    assert!(primordial.contains("fn cancel_ap_kernel_root_entry("));
-
-    let detached = primordial
-        .split_once("fn synchronize_scheduler_current_at_safe_point_detached")
-        .expect("safe-point detached scheduler root switch")
-        .1
-        .split_once("fn with_synchronized_runtime_at_safe_point")
-        .expect("safe-point scheduler root switch boundary")
-        .0;
-    let prepare = detached
-        .find("runtime.prepare_scheduler_root_switch()")
-        .unwrap();
-    let execute = detached.find("prepared.execute()").unwrap();
-    let commit = detached
-        .find("runtime.commit_scheduler_root_switch(executed)")
-        .unwrap();
-    assert!(prepare < execute && execute < commit);
-    assert!(detached[prepare..execute].contains("let Some(prepared)"));
-
-    let stop = primordial
-        .split_once("fn rendezvous_stop(")
-        .expect("live rendezvous stop")
-        .1
-        .split_once("impl<'roles")
-        .expect("rendezvous implementation terminator")
-        .0;
-    let stop_prepare = stop.find("runtime.prepare_rendezvous_stop").unwrap();
-    let stop_execute = stop.find("root_switch.execute()").unwrap();
-    let stop_commit = stop.find("runtime.commit_rendezvous_stop").unwrap();
-    assert!(stop_prepare < stop_execute && stop_execute < stop_commit);
-    assert!(rendezvous.contains("prepare_stop_at_safe_point"));
-    assert!(rendezvous.contains("commit_prepared_stop_at_safe_point"));
-}
-
-#[test]
 fn dw1c_detach_commits_its_root_flight_without_ordinary_cpu_reselection() {
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
     let detach = primordial

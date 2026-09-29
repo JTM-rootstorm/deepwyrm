@@ -18,6 +18,16 @@ use super::*;
 ))]
 use super::primordial_diagnostic::primordial_terminal_summary;
 
+use super::root_switch::{
+    CarrierActiveRoot, ExecutedApKernelRootEntry, ExecutedSchedulerRootSwitch,
+    ExecutedSchedulerRootSwitchKind, ExecutedStopRootSwitch, ExecutedTerminalKernelRootSwitch,
+    ExecutedTerminalProcessRootSwitch, FailedApKernelRootEntry, FailedSchedulerRootSwitch,
+    FailedSchedulerRootSwitchKind, FailedStopRootSwitch, FailedTerminalKernelRootSwitch,
+    FailedTerminalProcessRootSwitch, PreparedApKernelRootEntry, PreparedSchedulerRootSwitch,
+    PreparedSchedulerRootSwitchKind, PreparedStopRootSwitch, PreparedTerminalKernelRootSwitch,
+    PreparedTerminalProcessRootSwitch, RootSwitchFlight, SchedulerRootIdentity,
+};
+
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
@@ -3126,247 +3136,42 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
     }
 }
 
-/// BSP execution carrier. Plain mutable authorities remain exclusively owned
-/// here because their adapter surfaces do not yet provide transactional
-/// interior synchronization. AP carriers cannot name or borrow this state.
-enum CarrierActiveRoot {
-    Unselected,
-    Process(super::ActiveRootSelection),
-    StopPrecommitted(super::ActiveRootSelection),
-    Kernel(super::ActiveKernelExecutionRoot),
-    Transitioning,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RootSwitchFlight {
-    cpu: crate::cpu::CpuIndex,
-    generation: u64,
-}
-
-struct SchedulerRootIdentity {
-    process: ProcessKey,
-    thread: ThreadKey,
-    root_key: crate::memory::address_region::AddressRegionObjectKey,
-    stack_id: crate::task::KernelStackId,
-    context_id: crate::task::ThreadContextId,
-}
-
-enum PreparedSchedulerRootSwitchKind {
-    Process(super::PreparedProcessRootSwitch),
-    FromKernel(super::PreparedKernelToProcessRootSwitch),
-}
-
-struct PreparedSchedulerRootSwitch {
-    flight: RootSwitchFlight,
-    identity: SchedulerRootIdentity,
-    kind: PreparedSchedulerRootSwitchKind,
-}
-
-enum ExecutedSchedulerRootSwitchKind {
-    Process(super::ExecutedProcessRootSwitch),
-    FromKernel(super::ExecutedKernelToProcessRootSwitch),
-}
-
-struct ExecutedSchedulerRootSwitch {
-    flight: RootSwitchFlight,
-    identity: SchedulerRootIdentity,
-    kind: ExecutedSchedulerRootSwitchKind,
-}
-
-enum FailedSchedulerRootSwitchKind {
-    Process(super::RootSelectionFailure),
-    FromKernel(super::KernelRootSelectionFailure),
-}
-
-struct FailedSchedulerRootSwitch {
-    flight: RootSwitchFlight,
-    kind: FailedSchedulerRootSwitchKind,
-}
-
-struct PreparedStopRootSwitch {
-    flight: RootSwitchFlight,
-    prepared: super::PreparedKernelExecutionRootSwitch,
-}
-
-struct ExecutedStopRootSwitch {
-    flight: RootSwitchFlight,
-    executed: super::ExecutedKernelExecutionRootSwitch,
-}
-
-struct FailedStopRootSwitch {
-    flight: RootSwitchFlight,
-    error: super::RootBindingError,
-    previous: super::ActiveRootSelection,
-}
-
-struct PreparedTerminalKernelRootSwitch {
-    flight: RootSwitchFlight,
-    prepared: super::PreparedKernelExecutionRootSwitch,
-}
-
-struct ExecutedTerminalKernelRootSwitch {
-    flight: RootSwitchFlight,
-    executed: super::ExecutedKernelExecutionRootSwitch,
-}
-
-struct FailedTerminalKernelRootSwitch {
-    flight: RootSwitchFlight,
-    error: super::RootBindingError,
-    previous: super::ActiveRootSelection,
-}
-
-struct PreparedTerminalProcessRootSwitch {
-    flight: RootSwitchFlight,
-    prepared: super::PreparedKernelToProcessRootSwitch,
-}
-
-struct ExecutedTerminalProcessRootSwitch {
-    flight: RootSwitchFlight,
-    executed: super::ExecutedKernelToProcessRootSwitch,
-}
-
-struct FailedTerminalProcessRootSwitch {
-    flight: RootSwitchFlight,
-    failure: super::KernelRootSelectionFailure,
-}
-
-struct PreparedApKernelRootEntry {
-    flight: RootSwitchFlight,
-    prepared: super::PreparedKernelRootEntry,
-}
-
-struct ExecutedApKernelRootEntry {
-    flight: RootSwitchFlight,
-    executed: super::ExecutedKernelRootEntry,
-}
-
-struct FailedApKernelRootEntry {
-    flight: RootSwitchFlight,
-    error: super::RootBindingError,
-    prepared: super::PreparedKernelRootEntry,
-}
-
+// The live-target bindings of the host-compiled root-switch transactions in
+// `root_switch.rs`: each `execute` performs its CR3 effect through
+// `LiveRootSwitchTarget`.
 impl PreparedApKernelRootEntry {
     fn execute(self) -> Result<ExecutedApKernelRootEntry, FailedApKernelRootEntry> {
-        match self.prepared.execute(&mut super::LiveRootSwitchTarget) {
-            Ok(executed) => Ok(ExecutedApKernelRootEntry {
-                flight: self.flight,
-                executed,
-            }),
-            Err((error, prepared)) => Err(FailedApKernelRootEntry {
-                flight: self.flight,
-                error,
-                prepared,
-            }),
-        }
+        self.execute_on(&mut super::LiveRootSwitchTarget)
     }
 }
 
 impl PreparedStopRootSwitch {
     fn execute(self) -> Result<ExecutedStopRootSwitch, FailedStopRootSwitch> {
-        match self.prepared.execute(&mut super::LiveRootSwitchTarget) {
-            Ok(executed) => Ok(ExecutedStopRootSwitch {
-                flight: self.flight,
-                executed,
-            }),
-            Err((error, previous)) => Err(FailedStopRootSwitch {
-                flight: self.flight,
-                error,
-                previous,
-            }),
-        }
+        self.execute_on(&mut super::LiveRootSwitchTarget)
     }
 }
 
 impl PreparedTerminalKernelRootSwitch {
     fn execute(self) -> Result<ExecutedTerminalKernelRootSwitch, FailedTerminalKernelRootSwitch> {
-        match self.prepared.execute(&mut super::LiveRootSwitchTarget) {
-            Ok(executed) => Ok(ExecutedTerminalKernelRootSwitch {
-                flight: self.flight,
-                executed,
-            }),
-            Err((error, previous)) => Err(FailedTerminalKernelRootSwitch {
-                flight: self.flight,
-                error,
-                previous,
-            }),
-        }
+        self.execute_on(&mut super::LiveRootSwitchTarget)
     }
 }
 
 impl PreparedTerminalProcessRootSwitch {
     fn execute(self) -> Result<ExecutedTerminalProcessRootSwitch, FailedTerminalProcessRootSwitch> {
-        match self.prepared.execute(&mut super::LiveRootSwitchTarget) {
-            Ok(executed) => Ok(ExecutedTerminalProcessRootSwitch {
-                flight: self.flight,
-                executed,
-            }),
-            Err(failure) => Err(FailedTerminalProcessRootSwitch {
-                flight: self.flight,
-                failure,
-            }),
-        }
+        self.execute_on(&mut super::LiveRootSwitchTarget)
     }
 }
 
 impl PreparedSchedulerRootSwitch {
     fn execute(self) -> Result<ExecutedSchedulerRootSwitch, FailedSchedulerRootSwitch> {
-        let kind = match self.kind {
-            PreparedSchedulerRootSwitchKind::Process(prepared) => {
-                match prepared.execute(&mut super::LiveRootSwitchTarget) {
-                    Ok(executed) => ExecutedSchedulerRootSwitchKind::Process(executed),
-                    Err(failure) => {
-                        return Err(FailedSchedulerRootSwitch {
-                            flight: self.flight,
-                            kind: FailedSchedulerRootSwitchKind::Process(failure),
-                        });
-                    }
-                }
-            }
-            PreparedSchedulerRootSwitchKind::FromKernel(prepared) => {
-                match prepared.execute(&mut super::LiveRootSwitchTarget) {
-                    Ok(executed) => ExecutedSchedulerRootSwitchKind::FromKernel(executed),
-                    Err(failure) => {
-                        return Err(FailedSchedulerRootSwitch {
-                            flight: self.flight,
-                            kind: FailedSchedulerRootSwitchKind::FromKernel(failure),
-                        });
-                    }
-                }
-            }
-        };
-        Ok(ExecutedSchedulerRootSwitch {
-            flight: self.flight,
-            identity: self.identity,
-            kind,
-        })
+        self.execute_on(&mut super::LiveRootSwitchTarget)
     }
 }
 
-impl CarrierActiveRoot {
-    fn as_ref(&self) -> Option<&super::ActiveRootSelection> {
-        match self {
-            Self::Process(root) => Some(root),
-            Self::Unselected
-            | Self::StopPrecommitted(_)
-            | Self::Kernel(_)
-            | Self::Transitioning => None,
-        }
-    }
-
-    fn take_process(&mut self) -> super::ActiveRootSelection {
-        match core::mem::replace(self, Self::Transitioning) {
-            Self::Process(root) => root,
-            Self::Unselected
-            | Self::StopPrecommitted(_)
-            | Self::Kernel(_)
-            | Self::Transitioning => {
-                panic!("carrier has no active Process root")
-            }
-        }
-    }
-}
-
+/// BSP execution carrier. Plain mutable authorities remain exclusively owned
+/// here because their adapter surfaces do not yet provide transactional
+/// interior synchronization. AP carriers cannot name or borrow this state.
 struct PrimordialRuntimeCarrier<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
     cpu: crate::cpu::CpuIndex,
     local: &'static PerCpuLiveCarrier,
@@ -3623,16 +3428,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 panic!("remote stop kernel-root preflight failed: {error:?}")
             });
         let flight = self.begin_root_switch_flight();
-        PreparedStopRootSwitch { flight, prepared }
+        PreparedStopRootSwitch::new(flight, prepared)
     }
 
     fn commit_stop_root_switch(&mut self, executed: ExecutedStopRootSwitch) {
         self.select_root_switch_flight(executed.flight);
+        let flight = executed.flight;
         let kernel = self
             .active
-            .commit_kernel_execution_root_switch(executed.executed);
+            .commit_kernel_execution_root_switch(executed.into_executed());
         self.active_root = CarrierActiveRoot::Kernel(kernel);
-        self.finish_root_switch_flight(executed.flight);
+        self.finish_root_switch_flight(flight);
     }
 
     fn cancel_stop_root_switch(
@@ -3640,9 +3446,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         failure: FailedStopRootSwitch,
     ) -> super::RootBindingError {
         self.select_root_switch_flight(failure.flight);
-        self.active_root = CarrierActiveRoot::StopPrecommitted(failure.previous);
-        self.finish_root_switch_flight(failure.flight);
-        failure.error
+        let flight = failure.flight;
+        let (error, previous) = failure.into_parts();
+        self.active_root = CarrierActiveRoot::StopPrecommitted(previous);
+        self.finish_root_switch_flight(flight);
+        error
     }
 
     fn prepare_terminal_kernel_root_switch(&mut self) -> PreparedTerminalKernelRootSwitch {
@@ -3655,16 +3463,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 panic!("terminal kernel-root preflight failed: {error:?}")
             });
         let flight = self.begin_root_switch_flight();
-        PreparedTerminalKernelRootSwitch { flight, prepared }
+        PreparedTerminalKernelRootSwitch::new(flight, prepared)
     }
 
     fn commit_terminal_kernel_root_switch(&mut self, executed: ExecutedTerminalKernelRootSwitch) {
         self.select_root_switch_flight(executed.flight);
+        let flight = executed.flight;
         let kernel = self
             .active
-            .commit_kernel_execution_root_switch(executed.executed);
+            .commit_kernel_execution_root_switch(executed.into_executed());
         self.active_root = CarrierActiveRoot::Kernel(kernel);
-        self.finish_root_switch_flight(executed.flight);
+        self.finish_root_switch_flight(flight);
     }
 
     fn cancel_terminal_kernel_root_switch(
@@ -3672,9 +3481,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         failure: FailedTerminalKernelRootSwitch,
     ) -> super::RootBindingError {
         self.select_root_switch_flight(failure.flight);
-        self.active_root = CarrierActiveRoot::Process(failure.previous);
-        self.finish_root_switch_flight(failure.flight);
-        failure.error
+        let flight = failure.flight;
+        let (error, previous) = failure.into_parts();
+        self.active_root = CarrierActiveRoot::Process(previous);
+        self.finish_root_switch_flight(flight);
+        error
     }
 
     fn prepare_terminal_primordial_root_switch(&mut self) -> PreparedTerminalProcessRootSwitch {
@@ -3707,7 +3518,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 panic!("terminal publisher-root preflight failed: {error:?}")
             });
         let flight = self.begin_root_switch_flight();
-        PreparedTerminalProcessRootSwitch { flight, prepared }
+        PreparedTerminalProcessRootSwitch::new(flight, prepared)
     }
 
     fn commit_terminal_primordial_root_switch(
@@ -3715,11 +3526,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         executed: ExecutedTerminalProcessRootSwitch,
     ) {
         self.select_root_switch_flight(executed.flight);
+        let flight = executed.flight;
         let selected = self
             .active
-            .commit_from_kernel_execution_root_switch(executed.executed);
+            .commit_from_kernel_execution_root_switch(executed.into_executed());
         self.active_root = CarrierActiveRoot::Process(selected);
-        self.finish_root_switch_flight(executed.flight);
+        self.finish_root_switch_flight(flight);
     }
 
     fn cancel_terminal_primordial_root_switch(
@@ -3727,14 +3539,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         failure: FailedTerminalProcessRootSwitch,
     ) -> super::RootBindingError {
         self.select_root_switch_flight(failure.flight);
-        let (error, prepared, previous) = failure.failure.into_parts();
+        let flight = failure.flight;
+        let (error, prepared, previous) = failure.into_failure().into_parts();
         self.active
             .abandon_process_root_selection(prepared)
             .unwrap_or_else(|abandon| {
                 panic!("cancelled terminal publisher switch lost residency: {abandon:?}")
             });
         self.active_root = CarrierActiveRoot::Kernel(previous);
-        self.finish_root_switch_flight(failure.flight);
+        self.finish_root_switch_flight(flight);
         error
     }
 
@@ -3750,14 +3563,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .unwrap_or_else(|error| panic!("AP kernel-root entry preflight failed: {error:?}"));
         self.active_root = CarrierActiveRoot::Transitioning;
         let flight = self.begin_root_switch_flight();
-        PreparedApKernelRootEntry { flight, prepared }
+        PreparedApKernelRootEntry::new(flight, prepared)
     }
 
     fn commit_ap_kernel_root_entry(&mut self, executed: ExecutedApKernelRootEntry) {
         self.select_root_switch_flight(executed.flight);
-        let kernel = self.active.commit_ap_kernel_root_entry(executed.executed);
+        let flight = executed.flight;
+        let kernel = self
+            .active
+            .commit_ap_kernel_root_entry(executed.into_executed());
         self.active_root = CarrierActiveRoot::Kernel(kernel);
-        self.finish_root_switch_flight(executed.flight);
+        self.finish_root_switch_flight(flight);
     }
 
     fn cancel_ap_kernel_root_entry(
@@ -3765,10 +3581,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         failure: FailedApKernelRootEntry,
     ) -> super::RootBindingError {
         self.select_root_switch_flight(failure.flight);
-        let _prepared = failure.prepared;
+        let flight = failure.flight;
+        let (error, _prepared) = failure.into_parts();
         self.active_root = CarrierActiveRoot::Unselected;
-        self.finish_root_switch_flight(failure.flight);
-        failure.error
+        self.finish_root_switch_flight(flight);
+        error
     }
 
     #[track_caller]
@@ -5544,16 +5361,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
         };
         let flight = self.begin_root_switch_flight();
-        Some(PreparedSchedulerRootSwitch {
-            flight,
-            identity,
-            kind,
-        })
+        Some(PreparedSchedulerRootSwitch::new(flight, identity, kind))
     }
 
     fn commit_scheduler_root_switch(&mut self, executed: ExecutedSchedulerRootSwitch) {
         self.select_root_switch_flight(executed.flight);
-        let selected = match executed.kind {
+        let flight = executed.flight;
+        let (identity, kind) = executed.into_parts();
+        let selected = match kind {
             ExecutedSchedulerRootSwitchKind::Process(executed) => {
                 self.active.commit_process_root_switch(executed)
             }
@@ -5562,8 +5377,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .commit_from_kernel_execution_root_switch(executed),
         };
         self.active_root = CarrierActiveRoot::Process(selected);
-        self.publish_scheduler_root_identity(executed.identity);
-        self.finish_root_switch_flight(executed.flight);
+        self.publish_scheduler_root_identity(identity);
+        self.finish_root_switch_flight(flight);
     }
 
     fn cancel_scheduler_root_switch(
@@ -5571,7 +5386,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         failure: FailedSchedulerRootSwitch,
     ) -> super::RootBindingError {
         self.select_root_switch_flight(failure.flight);
-        let error = match failure.kind {
+        let flight = failure.flight;
+        let error = match failure.into_kind() {
             FailedSchedulerRootSwitchKind::Process(failure) => {
                 let (error, prepared, previous) = failure.into_parts();
                 self.active
@@ -5595,7 +5411,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 error
             }
         };
-        self.finish_root_switch_flight(failure.flight);
+        self.finish_root_switch_flight(flight);
         error
     }
 
