@@ -1859,32 +1859,16 @@ fn h2_syscall_entry_and_native_runtime_carriers_are_fixed_per_cpu() {
     assert!(!primordial.contains("reject_entry"));
 }
 
+/// Text test: facade binding and per-CPU carrier publication are target-only live wiring in
+/// primordial.rs, which no host test compiles.
 #[test]
 fn i1_stationary_foundation_keeps_authority_and_carrier_boundaries_explicit() {
     let stationary = source("src/arch/x86_64/syscall/stationary_runtime.rs");
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
 
-    for authority in [
-        "struct RuntimeCore",
-        "registry: REGISTRY",
-        "memory: MEMORY",
-        "tasks: TASKS",
-        "spaces: SPACES",
-        "regions: REGIONS",
-        "struct PagingAuthority",
-        "struct ThreadServiceSlots",
-        "struct PerCpuStaging",
-        "fn assert_clear",
-    ] {
-        assert!(
-            stationary.contains(authority),
-            "missing stationary {authority}"
-        );
-    }
-    assert!(stationary.contains("stationary authority nesting on CPU"));
-    assert!(stationary.contains("assert_clear_on"));
-    assert!(stationary.contains("prepare_on"));
-    assert!(stationary.contains("ThreadServiceSlotError::StaleLease"));
+    // S2K-1 deleted the never-instantiated RuntimeCore/PagingAuthority family;
+    // the guard-depth check stays until S2K-3 replaces it with a token.
+    assert!(stationary.contains("fn assert_clear_on"));
     assert!(primordial.contains("struct PerCpuLiveCarrier"));
     assert!(primordial.contains("initialize_per_cpu_live_carriers"));
     assert!(primordial.contains("0..crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT"));
