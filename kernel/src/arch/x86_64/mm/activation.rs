@@ -84,6 +84,14 @@ mod primordial_diagnostic;
 ))]
 #[path = "activation/root_switch.rs"]
 mod root_switch;
+// The primordial runtime's coarse authority lock and its per-CPU handles,
+// host-compiled under `test` (S2K-3).
+#[cfg(any(
+    test,
+    all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")
+))]
+#[path = "activation/runtime_authority.rs"]
+mod runtime_authority;
 // The e2 TLB mailbox `user_access.rs` uses, host-compiled under `test` so its
 // tests run (S2K-0).
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]

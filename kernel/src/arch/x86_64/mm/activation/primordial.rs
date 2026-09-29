@@ -28,10 +28,10 @@ use super::root_switch::{
     PreparedTerminalProcessRootSwitch, RootSwitchFlight, SchedulerRootIdentity,
 };
 
+use super::runtime_authority::{RuntimeAuthorityHandle, RuntimeAuthorityLock};
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::boot::primordial::construction::authority::{
     AuthorityPrimordialBackend, AuthorityPrimordialMonitor, PrimordialPlatform,
@@ -1585,115 +1585,6 @@ static SHARED_RUNTIME_STORAGE: SharedRuntimeStorage = SharedRuntimeStorage::new(
 static STATIONARY_GUARD_DEPTH: crate::arch::x86_64::syscall::StationaryGuardDepth =
     crate::arch::x86_64::syscall::StationaryGuardDepth::new();
 
-/// Coarse DW0-H transaction boundary for the still-monolithic live authority
-/// set. Per-CPU carrier state remains outside this lock; shared mutations are
-/// serialized until the individual authorities grow narrower SMP adapters.
-struct RuntimeAuthorityLock<T> {
-    next_ticket: AtomicU64,
-    serving: AtomicU64,
-    value: UnsafeCell<T>,
-}
-
-// `serving` must sit exactly one word after `next_ticket`.
-//
-// `publish_runtime_authority` hands a debugger the address of `next_ticket` and
-// `tools/gdb/r1-liveness.gdb` reads two words from it, so the pair has to be
-// contiguous in that order. This is not guaranteed by `repr(Rust)` -- the
-// compiler already reorders this struct, putting `value` first -- so it is
-// asserted here rather than assumed by a script that cannot check it. A future
-// layout change fails this build instead of silently making every published
-// ticket pair two words of carrier data.
-const _: () = {
-    let next = core::mem::offset_of!(
-        RuntimeAuthorityLock<PrimordialRuntimeCarrier<128, 4096>>,
-        next_ticket
-    );
-    let serving = core::mem::offset_of!(
-        RuntimeAuthorityLock<PrimordialRuntimeCarrier<128, 4096>>,
-        serving
-    );
-    assert!(
-        serving == next + 8,
-        "the runtime authority's ticket pair is no longer two adjacent words, so \
-         the address published for GDB no longer locates it"
-    );
-};
-
-impl<T> RuntimeAuthorityLock<T> {
-    const fn new(value: T) -> Self {
-        Self {
-            next_ticket: AtomicU64::new(0),
-            serving: AtomicU64::new(0),
-            value: UnsafeCell::new(value),
-        }
-    }
-
-    fn lock(&self) -> RuntimeAuthorityGuard<'_, T> {
-        let mut observed = self.next_ticket.load(Ordering::Relaxed);
-        let ticket = loop {
-            if observed == u64::MAX {
-                panic!("runtime authority ticket space exhausted");
-            }
-            match self.next_ticket.compare_exchange_weak(
-                observed,
-                observed + 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(ticket) => break ticket,
-                Err(current) => observed = current,
-            }
-        };
-        while self.serving.load(Ordering::Acquire) != ticket {
-            core::hint::spin_loop();
-        }
-        RuntimeAuthorityGuard {
-            lock: self,
-            ticket,
-            owns_lock: true,
-        }
-    }
-}
-
-// SAFETY: `value` is initialized before any AP carrier is released, never
-// moved afterward, and every access is serialized by the ticket pair. This is the
-// explicit DW0-H bridge for authorities whose types intentionally do not claim
-// `Send`/`Sync` independently.
-unsafe impl<T> Sync for RuntimeAuthorityLock<T> {}
-
-struct RuntimeAuthorityGuard<'a, T> {
-    lock: &'a RuntimeAuthorityLock<T>,
-    ticket: u64,
-    owns_lock: bool,
-}
-
-impl<T> Deref for RuntimeAuthorityGuard<'_, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        // SAFETY: `lock` is the only constructor of a guard and sets `owns_lock`, so a guard exists
-        // only while it holds the ticket; `drop` releases it with a Release store that the next
-        // `lock` spins on with Acquire.
-        unsafe { &*self.lock.value.get() }
-    }
-}
-
-impl<T> DerefMut for RuntimeAuthorityGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        // SAFETY: as in `deref`, the guard holds the ticket, and `&mut self` on the guard makes
-        // this the only reference to the value for its lifetime.
-        unsafe { &mut *self.lock.value.get() }
-    }
-}
-
-impl<T> Drop for RuntimeAuthorityGuard<'_, T> {
-    fn drop(&mut self) {
-        if self.owns_lock {
-            self.lock.serving.store(self.ticket + 1, Ordering::Release);
-        }
-    }
-}
-
 /// CPU-local immutable identity over the stationary synchronized runtime.
 struct PendingRemoteProcessTermination {
     phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
@@ -1794,7 +1685,9 @@ struct RuntimeCarrierFacade<
     const ROLE_CAPACITY: usize,
 > {
     cpu: crate::cpu::CpuIndex,
-    runtime: &'runtime RuntimeAuthorityLock<
+    /// This CPU's only way to acquire the runtime authority.
+    runtime: RuntimeAuthorityHandle<
+        'runtime,
         PrimordialRuntimeCarrier<'roles, RANGE_CAPACITY, ROLE_CAPACITY>,
     >,
     shared: &'static PrimordialRuntimeShared,
@@ -2611,8 +2504,9 @@ fn prepare_runtime_carrier_admission<const RANGE_CAPACITY: usize, const ROLE_CAP
              crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
     live_cpu_count: usize,
 ) {
-    let runtime = facades[0].runtime.lock();
-    for facade in facades[..live_cpu_count].iter_mut().skip(1) {
+    let (bsp, aps) = facades.split_at_mut(1);
+    let runtime = bsp[0].runtime.lock();
+    for facade in aps[..live_cpu_count - 1].iter_mut() {
         let resources = carrier_resource_tuple(
             &runtime,
             facade.cpu,
@@ -2687,7 +2581,10 @@ fn normalize_bootstrap_carrier<const RANGE_CAPACITY: usize, const ROLE_CAPACITY:
 
 fn release_runtime_carrier_facades<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     shared: &'static PrimordialRuntimeShared,
-    runtime: &RuntimeAuthorityLock<PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>>,
+    runtime: &mut RuntimeAuthorityHandle<
+        '_,
+        PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>,
+    >,
     admissions: [Option<(
         crate::task::CarrierAdmissionTicket,
         crate::task::CarrierResourceTuple,
@@ -9231,14 +9128,20 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     // carrier while labelling them a ticket pair. They were self-evidently wrong
     // -- a ticket lock cannot serve more tickets than it has issued -- but a
     // plausible-looking pair would have been reported as contention that was
-    // never there. the adjacency assertion by the lock's definition keeps the two words contiguous so
-    // one read still covers both.
-    crate::debug::liveness::publish_runtime_authority(
-        core::ptr::from_ref(&runtime.next_ticket).cast::<()>(),
-    );
+    // never there. The pair is its own `repr(C)` struct, asserted adjacent by
+    // `runtime_authority.rs`, so one read still covers both words.
+    crate::debug::liveness::publish_runtime_authority(runtime.ticket_pair_address());
     let runtime_ref = runtime.as_ref().get_ref();
+    // One handle per CPU slot, minted once. Handle 0 serves this BSP path
+    // until it moves into facade 0.
+    let mut handles = runtime_ref
+        .handles::<{ crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT }>()
+        .into_iter();
+    let mut bsp_handle = handles
+        .next()
+        .unwrap_or_else(|| panic!("no runtime authority handle for the BSP"));
     let (state, stack, exception_binding) = {
-        let mut runtime = runtime_ref.lock();
+        let mut runtime = bsp_handle.lock();
         runtime
             .local
             .record_current(runtime.thread, runtime.stack_id, runtime.context_id);
@@ -9271,10 +9174,16 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
         };
         (state, stack, exception_binding)
     };
+    let mut bsp_handle = Some(bsp_handle);
     let facades = core::array::from_fn(|cpu_index| RuntimeCarrierFacade {
         cpu: crate::cpu::CpuIndex::new(cpu_index)
             .unwrap_or_else(|| panic!("native carrier CPU {cpu_index} is out of range")),
-        runtime: runtime_ref,
+        runtime: if cpu_index == 0 {
+            bsp_handle.take()
+        } else {
+            handles.next()
+        }
+        .unwrap_or_else(|| panic!("no runtime authority handle for CPU {cpu_index}")),
         shared,
         admission: None,
         admission_entered: false,
@@ -9289,13 +9198,13 @@ pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     prepare_runtime_carrier_admission(facades_mut, live_cpu_count);
     normalize_bootstrap_carrier(&mut facades_mut[0]);
     let admissions = core::array::from_fn(|cpu_index| facades_mut[cpu_index].admission);
+    release_runtime_carrier_facades(shared, &mut facades_mut[0].runtime, admissions);
     // SAFETY: UNVERIFIED (S2K): facade 0 stays in the pinned array, but re-deriving it here is the
     // recovered reference [P-FACADE] describes.
     let bsp_carrier = unsafe {
         let facade = &mut facades_mut[0];
         core::pin::Pin::new_unchecked(facade)
     };
-    release_runtime_carrier_facades(shared, runtime_ref, admissions);
     // SAFETY: `state` was validated against the primordial mappings and `stack` is the primordial
     // Thread's own kernel stack, which is the callee's `# Safety`; the carrier is pinned in this
     // never-returning frame.
