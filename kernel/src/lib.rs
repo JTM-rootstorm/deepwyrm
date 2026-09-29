@@ -38,6 +38,8 @@ pub mod memory;
     reason = "DW0-D5 consumes generic lifetime primitives ahead of DW0-E process/syscall ownership"
 )]
 pub(crate) mod object;
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+pub(crate) mod one_shot;
 #[path = "handle/service.rs"]
 #[allow(
     dead_code,
@@ -115,22 +117,30 @@ impl<T> BootstrapStorage<T> {
 )]
 unsafe impl<T> Sync for BootstrapStorage<T> {}
 
+// The boot data the frame-role manager borrows, and the manager itself, are
+// owned once for the kernel's lifetime (S2K-4): the manager, and so the live
+// paging target and the primordial runtime over it, are `'static` because
+// everything they borrow is.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-static BOOTSTRAP_ROLE_MANAGER: BootstrapStorage<
+static BOOTSTRAP_BOOT_INFO: one_shot::OneShotStorage<boot::ValidatedBootInfo> =
+    one_shot::OneShotStorage::new();
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+static BOOTSTRAP_ROLE_MANAGER: one_shot::OneShotStorage<
     memory::frame_roles::FrameRoleManager<
         BOOTSTRAP_FRAME_RANGE_CAPACITY,
         BOOTSTRAP_FRAME_ROLE_CAPACITY,
     >,
-> = BootstrapStorage::uninit();
+> = one_shot::OneShotStorage::new();
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-static BOOTSTRAP_RESERVATIONS: BootstrapStorage<
+static BOOTSTRAP_RESERVATIONS: one_shot::OneShotStorage<
     [memory::boot_map::BootstrapReservation; memory::boot_map::MAX_BOOTSTRAP_RESERVATIONS],
-> = BootstrapStorage::uninit();
+> = one_shot::OneShotStorage::new();
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-static BOOTSTRAP_SANITIZED_MAP: BootstrapStorage<memory::boot_map::SanitizedBootMap> =
-    BootstrapStorage::uninit();
+static BOOTSTRAP_SANITIZED_MAP: one_shot::OneShotStorage<memory::boot_map::SanitizedBootMap> =
+    one_shot::OneShotStorage::new();
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 static BOOTSTRAP_ACPI_WORKSPACE: BootstrapStorage<arch::x86_64::acpi::AcpiSnapshotWorkspace> =
@@ -251,8 +261,12 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
     }
 
     let reader = IdentityMappedBootInfoReader;
-    let boot_info = boot::validate_boot_info(&reader, boot_info_physical)
-        .unwrap_or_else(|error| panic!("invalid DwBootInfoV1 handoff: {error:?}"));
+    // The validated copy of the boot information is owned for the kernel's lifetime: the paging
+    // handoff inside it is borrowed by the live paging target the runtime keeps forever.
+    let boot_info: &'static boot::ValidatedBootInfo = BOOTSTRAP_BOOT_INFO.init(
+        boot::validate_boot_info(&reader, boot_info_physical)
+            .unwrap_or_else(|error| panic!("invalid DwBootInfoV1 handoff: {error:?}")),
+    );
     let boot_resource_grants = boot_info.boot_resource_grants();
 
     #[cfg(not(feature = "test-support"))]
@@ -289,44 +303,47 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
         let physical_limit =
             memory::physical::PhysicalAddressLimit::from_address_bits(physical_width)
                 .unwrap_or_else(|error| panic!("invalid paging physical limit: {error:?}"));
-        // SAFETY: `kernel_main` is the sole BSP owner and this static slot is
-        // uninitialized. A sanitizer failure terminates this boot attempt.
-        let sanitized = unsafe {
+        // SAFETY: the slot is this storage's one owner's, uninitialized. A sanitizer failure
+        // terminates this boot attempt.
+        let sanitized: &'static memory::boot_map::SanitizedBootMap = unsafe {
             memory::boot_map::sanitize_boot_map_in(
-                &mut *BOOTSTRAP_SANITIZED_MAP.slot(),
-                &boot_info,
+                BOOTSTRAP_SANITIZED_MAP.take(),
+                boot_info,
                 boot_info_physical,
                 physical_limit,
             )
         }
         .unwrap_or_else(|error| panic!("invalid bootstrap memory map: {error:?}"));
+        // Initialized element by element in place, with no boot-stack temporary.
+        let reservations = BOOTSTRAP_RESERVATIONS.take();
+        // SAFETY: every element of the owned, uninitialized array is written below before the
+        // array is assumed initialized.
         let reservations = unsafe {
-            let array = (*BOOTSTRAP_RESERVATIONS.slot()).as_mut_ptr();
-            let element = array.cast::<memory::boot_map::BootstrapReservation>();
+            let element = reservations
+                .as_mut_ptr()
+                .cast::<memory::boot_map::BootstrapReservation>();
             for index in 0..memory::boot_map::MAX_BOOTSTRAP_RESERVATIONS {
                 element
                     .add(index)
                     .write(memory::boot_map::BootstrapReservation::placeholder());
             }
-            &mut *array
+            reservations.assume_init_mut()
         };
         let reservation_count = memory::boot_map::collect_bootstrap_reservations(
-            &boot_info,
+            boot_info,
             boot_info_physical,
             reservations,
         )
         .unwrap_or_else(|error| panic!("invalid bootstrap reservations: {error:?}"));
+        let reservations: &'static [memory::boot_map::BootstrapReservation] =
+            &reservations[..reservation_count];
         // SAFETY: `kernel_main` is the non-reentrant BSP owner of the consumed
         // boot snapshot and has created no other allocator over its candidates.
         let (roles, memory_witness) = unsafe {
             memory::frame_roles::FrameRoleManager::<
                 BOOTSTRAP_FRAME_RANGE_CAPACITY,
                 BOOTSTRAP_FRAME_ROLE_CAPACITY,
-            >::from_boot_map_in(
-                &mut *BOOTSTRAP_ROLE_MANAGER.slot(),
-                &sanitized,
-                &reservations[..reservation_count],
-            )
+            >::from_boot_map_in(BOOTSTRAP_ROLE_MANAGER.take(), sanitized, reservations)
         }
         .unwrap_or_else(|error| panic!("failed to claim physical ownership: {error:?}"));
         // SAFETY: the raw entry and descriptor installer establish the sole-BSP,
@@ -351,7 +368,7 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
                 &mut *workspace
             };
             let mut acpi =
-                arch::x86_64::acpi::AcpiScratchReader::new(&mut active_paging, &boot_info);
+                arch::x86_64::acpi::AcpiScratchReader::new(&mut active_paging, boot_info);
             let proposal = arch::x86_64::acpi::discover_pm_timer_proposal(
                 &mut acpi,
                 boot_info.header().acpi_rsdp_physical_address,
@@ -377,7 +394,7 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
                 &mut *workspace
             };
             let mut acpi =
-                arch::x86_64::acpi::AcpiScratchReader::new(&mut active_paging, &boot_info);
+                arch::x86_64::acpi::AcpiScratchReader::new(&mut active_paging, boot_info);
             match arch::x86_64::acpi::sleep::discover_s5_proposal(
                 &mut acpi,
                 boot_info.header().acpi_rsdp_physical_address,
@@ -417,7 +434,7 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
                 &mut *workspace
             };
             let mut acpi =
-                arch::x86_64::acpi::AcpiScratchReader::new(&mut active_paging, &boot_info);
+                arch::x86_64::acpi::AcpiScratchReader::new(&mut active_paging, boot_info);
             arch::x86_64::acpi::discover_cpu_topology(
                 &mut acpi,
                 boot_info.header().acpi_rsdp_physical_address,
@@ -442,7 +459,7 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             let q35_snapshot = {
                 let workspace = unsafe { &mut *(*BOOTSTRAP_ACPI_WORKSPACE.slot()).as_mut_ptr() };
                 let mut acpi =
-                    arch::x86_64::acpi::AcpiScratchReader::new(&mut active_paging, &boot_info);
+                    arch::x86_64::acpi::AcpiScratchReader::new(&mut active_paging, boot_info);
                 arch::x86_64::acpi::snapshot_q35_com2_madt(
                     &mut acpi,
                     boot_info.header().acpi_rsdp_physical_address,

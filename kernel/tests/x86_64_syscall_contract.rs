@@ -159,7 +159,7 @@ fn i1_bsp_scratch_is_usable_for_acpi_and_mmio_before_syscall_install() {
         .find("activate_bootstrap_deep_paging(")
         .expect("Deep root activation");
     let acpi = kernel
-        .find("AcpiScratchReader::new(&mut active_paging, &boot_info)")
+        .find("AcpiScratchReader::new(&mut active_paging, boot_info)")
         .expect("post-activation ACPI scratch reader");
     let mmio = kernel
         .find("time::initialize(&mut active_paging, pm_timer)")
@@ -2012,7 +2012,7 @@ fn f2_kernel_context_switch_is_sysv_only_and_separate_from_user_return() {
 fn f1_facades_are_reached_only_through_their_published_pointers() {
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
     let enter = primordial
-        .split_once("pub(super) fn enter<")
+        .split_once("pub(super) fn enter(")
         .expect("primordial enter")
         .1;
     let pinned = enter

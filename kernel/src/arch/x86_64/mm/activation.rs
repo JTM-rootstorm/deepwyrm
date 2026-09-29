@@ -2229,7 +2229,24 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             reservation,
         )
     }
+}
 
+/// The one paging target the primordial runtime runs on: the BSP's, over the
+/// frame-role manager `kernel_main` owns for the kernel's lifetime
+/// (`crate::BOOTSTRAP_ROLE_MANAGER`), hence `'static` and the bootstrap
+/// capacities. The runtime's permanent storage (S2K-4) needs this one
+/// concrete type.
+#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+pub(crate) type PrimordialActivePaging = ActiveDeepPaging<
+    LiveActivePagingTarget<
+        'static,
+        { crate::BOOTSTRAP_FRAME_RANGE_CAPACITY },
+        { crate::BOOTSTRAP_FRAME_ROLE_CAPACITY },
+    >,
+>;
+
+#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+impl PrimordialActivePaging {
     pub(crate) fn run_primordial(
         self,
         modules: crate::boot::primordial::PrimordialBootModules,

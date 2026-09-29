@@ -19,8 +19,8 @@ pub(crate) fn validate_primordial_boot_stack_margin(
         symbol.ends_with(">>::run_primordial")
     });
     let primordial_enter = one_stack_size(sizes, "primordial enter", |symbol| {
-        symbol.contains("::mm::transition::activation::primordial::enter::<")
-            && !symbol.contains("::{closure")
+        // Non-generic since S2K-4: the runtime runs over the one concrete paging target.
+        symbol.ends_with("::mm::transition::activation::primordial::enter")
     });
     let measured_chain = kernel_main
         .checked_add(run_primordial)

@@ -8919,11 +8919,15 @@ fn copy_module<'a, const BYTES: usize, const RANGE_CAPACITY: usize, const ROLE_C
     unsafe_code,
     reason = "G3 publishes stationary synchronized authorities, seals fail-closed AP carriers, and binds the BSP-exclusive carrier for audited initial CPL3 transition"
 )]
-pub(super) fn enter<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
-    mut active: ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
+pub(super) fn enter(
+    mut active: super::PrimordialActivePaging,
     modules: crate::boot::primordial::PrimordialBootModules,
     boot_resource_grants: crate::boot::BootResourceGrants,
 ) -> ! {
+    // The runtime is built over the one concrete, `'static` paging target, so its permanent
+    // storage can be a static (S2K-4).
+    const RANGE_CAPACITY: usize = crate::BOOTSTRAP_FRAME_RANGE_CAPACITY;
+    const ROLE_CAPACITY: usize = crate::BOOTSTRAP_FRAME_ROLE_CAPACITY;
     let cpu_index = crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
         .unwrap_or_else(|| panic!("primordial runtime entered without an installed CPU slot"));
     if cpu_index != crate::cpu::CpuIndex::BOOTSTRAP.index() {
