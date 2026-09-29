@@ -98,7 +98,9 @@ struct NativeUsercopyWindow {
 }
 
 impl NativeUsercopyWindow {
-    fn enter_current() -> Result<Self, ()> {
+    /// Opens the window. Only after the entry's safe-point poll found no
+    /// remote Stop: an adapter must never copy for a Thread already stopped.
+    fn enter_current(_safe_point: super::SafePointClear) -> Result<Self, ()> {
         let cpu_index = current_cpu_index_for_diagnostics().ok_or(())?;
         NATIVE_USERCOPY_WINDOW[cpu_index]
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
@@ -1216,6 +1218,25 @@ unsafe fn native_runtime_rendezvous_gate<R: crate::syscall::native::NativeRendez
     }
 }
 
+/// The syscall entry's first safe point: the only place a `SafePointClear`
+/// is minted, and so the only way to open the native usercopy window.
+#[allow(
+    unsafe_code,
+    reason = "the proof is minted only from a mailbox observation that was not a Stop"
+)]
+fn poll_entry_safe_point()
+-> Result<super::SafePointClear, crate::arch::x86_64::rendezvous::StopRequest> {
+    match crate::arch::x86_64::idle::take_current_notification_at_safe_point() {
+        crate::arch::x86_64::rendezvous::MailboxNotification::None
+        | crate::arch::x86_64::rendezvous::MailboxNotification::Wake
+        | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {
+            // SAFETY: the authoritative mailbox was just polled and held no Stop.
+            Ok(unsafe { super::SafePointClear::assume() })
+        }
+        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request) => Err(request),
+    }
+}
+
 #[allow(
     unsafe_code,
     reason = "the dedicated rendezvous reaper receives the immutable current-CPU carrier context"
@@ -1670,16 +1691,15 @@ unsafe fn native_runtime_trampoline<
     // published in the stationary mailbox while its e1 delivery is still
     // pending in the local APIC. Poll the authoritative mailbox before any
     // usercopy or syscall authority can observe terminal task state.
-    match crate::arch::x86_64::idle::take_current_notification_at_safe_point() {
-        crate::arch::x86_64::rendezvous::MailboxNotification::None
-        | crate::arch::x86_64::rendezvous::MailboxNotification::Wake
-        | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {}
-        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request) => {
+    let safe_point = match poll_entry_safe_point() {
+        Ok(clear) => clear,
+        Err(request) => {
             stage_rendezvous_action(RendezvousAction(request)).unwrap_or_else(|_| halt_forever());
             handoff_to_rendezvous_reaper(context);
         }
-    }
-    let usercopy_window = NativeUsercopyWindow::enter_current().unwrap_or_else(|_| halt_forever());
+    };
+    let usercopy_window =
+        NativeUsercopyWindow::enter_current(safe_point).unwrap_or_else(|_| halt_forever());
     let control = {
         // SAFETY: [CARRIER] first scoped reborrow in this trampoline; the SYSCALL entry left no
         // other Rust frame on this CPU holding one.

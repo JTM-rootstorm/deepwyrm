@@ -2043,6 +2043,9 @@ fn i1_live_wait_control_is_owned_by_each_physical_cpu_carrier() {
     );
 }
 
+/// Text test: the two post-dispatch mailbox rechecks are control flow inside the target-only
+/// trampoline, which no type orders. (The entry poll before usercopy is static since S2K-3: the
+/// usercopy window takes the `SafePointClear` only `poll_entry_safe_point` mints.)
 #[test]
 fn i1_syscall_entry_polls_remote_stop_before_usercopy_or_dispatch() {
     let live = source("src/arch/x86_64/syscall/live.rs");
@@ -2053,22 +2056,19 @@ fn i1_syscall_entry_polls_remote_stop_before_usercopy_or_dispatch() {
         .split_once("fn switch_kernel_context(")
         .expect("native runtime trampoline terminator")
         .0;
-    let stop_poll = trampoline
-        .find("take_current_notification_at_safe_point()")
-        .expect("entry mailbox safe point");
     let usercopy = trampoline
-        .find("NativeUsercopyWindow::enter_current()")
+        .find("NativeUsercopyWindow::enter_current(safe_point)")
         .expect("usercopy entry");
     let dispatch = trampoline
         .find("dispatch_frame(runtime, frame")
         .expect("native dispatch");
-    assert!(stop_poll < usercopy && usercopy < dispatch);
+    assert!(usercopy < dispatch);
     assert!(
         trampoline
             .match_indices("take_current_notification_at_safe_point()")
             .count()
-            >= 3,
-        "entry, post-dispatch, and rendezvous-control seams must poll the authoritative mailbox"
+            >= 2,
+        "post-dispatch and rendezvous-control seams must poll the authoritative mailbox"
     );
     let usercopy_drop = trampoline.find("drop(usercopy_window)").unwrap();
     let post_dispatch_poll = trampoline[usercopy_drop..]

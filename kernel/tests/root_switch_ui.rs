@@ -174,9 +174,11 @@ fn run_case(rustc: &std::ffi::OsStr, manifest_dir: &Path, output_dir: &Path, cas
 /// S2K-3: a CPL3 entry takes a `BoundKernelStack`, which only the live
 /// boundary mints, when it binds the selected Thread's stack or re-checks the
 /// binding a kernel context switch made. So no fresh entry can reach CPL3
-/// without its stack binding (TSV row 93).
+/// without its stack binding (TSV row 93). Likewise the native usercopy
+/// window takes the `SafePointClear` that only the syscall entry's mailbox
+/// poll mints (TSV row 97, first seam).
 #[test]
-fn cpl3_entry_takes_an_unforgeable_bound_kernel_stack() {
+fn entry_boundaries_take_unforgeable_proofs() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_dir = manifest_dir
         .parent()
@@ -205,6 +207,19 @@ fn cpl3_entry_takes_an_unforgeable_bound_kernel_stack() {
             fixture: "bound_kernel_stack_clone.rs",
             expected_error: Some(
                 "error[E0277]: the trait bound `BoundKernelStack: Clone` is not satisfied",
+            ),
+        },
+        // TSV row 97, first seam: the usercopy window opens only with the entry poll's proof.
+        UiCase {
+            fixture: "safe_point_clear_forged.rs",
+            expected_error: Some(
+                "error[E0133]: call to unsafe function `SafePointClear::assume` is unsafe and requires unsafe block",
+            ),
+        },
+        UiCase {
+            fixture: "safe_point_clear_clone.rs",
+            expected_error: Some(
+                "error[E0277]: the trait bound `SafePointClear: Clone` is not satisfied",
             ),
         },
     ] {
