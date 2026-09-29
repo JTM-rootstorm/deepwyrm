@@ -26,6 +26,22 @@ config_value() {
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 workspace=$(CDPATH='' cd -- "$script_dir/.." && pwd -P)
 project_root=$(CDPATH='' cd -- "$workspace/.." && pwd -P)
+# A coordinator-owned .worktrees/deepwyrm/<lane> worktree takes the accepted
+# toolchain from the canonical OS-Project root, exactly as tools/pinned-cargo
+# resolves it; the lane's parent directory is not the project root.
+workspace_parent=$(basename -- "$(dirname -- "$workspace")")
+workspace_grandparent=$(basename -- "$(dirname -- "$(dirname -- "$workspace")")")
+if [ "$workspace_parent" = "deepwyrm" ] && [ "$workspace_grandparent" = ".worktrees" ]; then
+    lane_project_root=$(CDPATH='' cd -- "$workspace/../../.." && pwd -P)
+    canonical_git_dir="$lane_project_root/deepwyrm/.git"
+    [ -d "$canonical_git_dir" ] && [ ! -L "$canonical_git_dir" ] || \
+        fail "lane layout has no canonical deepwyrm git directory"
+    common_git_dir=$(git -C "$workspace" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || \
+        fail "lane worktree does not expose a common git directory"
+    [ "$common_git_dir" = "$canonical_git_dir" ] || \
+        fail "lane worktree is not registered to canonical deepwyrm"
+    project_root=$lane_project_root
+fi
 host_identity="$workspace/tooling/host-rust-toolchain.toml"
 accepted_identity="$workspace/tooling/rust-toolchain.toml"
 build_identity="$workspace/tooling/build-tools.toml"
