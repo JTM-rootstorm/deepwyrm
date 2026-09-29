@@ -1569,6 +1569,18 @@ impl crate::time::TimerExpiryTarget for PrimordialRuntimeShared {
 // facade while another CPU uses it. So no retag ever sits between a published pointer and its
 // allocation, and the published addresses stay valid under Stacked and Tree Borrows.
 
+/// The primordial runtime's authority lock and the carrier it guards, owned
+/// once for the kernel's lifetime (S2K-4, reset R2D).
+static PRIMORDIAL_RUNTIME_AUTHORITY: crate::one_shot::OneShotStorage<
+    RuntimeAuthorityLock<
+        PrimordialRuntimeCarrier<
+            'static,
+            { crate::BOOTSTRAP_FRAME_RANGE_CAPACITY },
+            { crate::BOOTSTRAP_FRAME_ROLE_CAPACITY },
+        >,
+    >,
+> = crate::one_shot::OneShotStorage::new();
+
 struct SharedRuntimeStorage(UnsafeCell<MaybeUninit<PrimordialRuntimeShared>>);
 
 impl SharedRuntimeStorage {
@@ -9143,7 +9155,11 @@ pub(super) fn enter(
         channel_keys,
         ..
     } = monitor;
-    let runtime = core::pin::pin!(RuntimeAuthorityLock::new(PrimordialRuntimeCarrier {
+    // Permanent storage (S2K-4, reset R2D): the lock and the carrier it guards live in one-shot
+    // static storage for the kernel's lifetime, not on the boot stack.
+    let runtime_ref: &'static RuntimeAuthorityLock<
+        PrimordialRuntimeCarrier<'static, RANGE_CAPACITY, ROLE_CAPACITY>,
+    > = PRIMORDIAL_RUNTIME_AUTHORITY.init(RuntimeAuthorityLock::new(PrimordialRuntimeCarrier {
         cpu: crate::cpu::CpuIndex::BOOTSTRAP,
         local: per_cpu_live_carrier(crate::cpu::CpuIndex::BOOTSTRAP),
         active,
@@ -9199,10 +9215,9 @@ pub(super) fn enter(
     }));
 
     // Reset card R1B: record the live authority's ticket pair once so host GDB
-    // over the QEMU gdbstub can read it without executing guest code. The
-    // carrier is pinned to the boot stack, so this is the only fixed handle a
-    // debugger has; card R2D removes that boot-stack lifetime and this
-    // publication stays valid wherever it moves.
+    // over the QEMU gdbstub can read it without executing guest code. Since
+    // S2K-4 (card R2D) the lock is a static, so this address is fixed for the
+    // kernel's lifetime.
     //
     // The *ticket pair's* address, not the lock's. `RuntimeAuthorityLock` is
     // `repr(Rust)` and the compiler puts `value` first, so card R1's run 10 read
@@ -9212,8 +9227,7 @@ pub(super) fn enter(
     // plausible-looking pair would have been reported as contention that was
     // never there. The pair is its own `repr(C)` struct, asserted adjacent by
     // `runtime_authority.rs`, so one read still covers both words.
-    crate::debug::liveness::publish_runtime_authority(runtime.ticket_pair_address());
-    let runtime_ref = runtime.as_ref().get_ref();
+    crate::debug::liveness::publish_runtime_authority(runtime_ref.ticket_pair_address());
     // One handle per CPU slot, minted once. Handle 0 serves this BSP path
     // until it moves into facade 0.
     let mut handles = runtime_ref
