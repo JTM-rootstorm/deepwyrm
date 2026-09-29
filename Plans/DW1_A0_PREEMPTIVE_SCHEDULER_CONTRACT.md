@@ -401,7 +401,7 @@ changing policy:
 | Transition surface | Concrete current owner/call path | DW1 preservation point |
 | --- | --- | --- |
 | reserve, commit, cancel, and initial Runnable publication | `CooperativeScheduler::{reserve,commit,cancel}` in `kernel/src/task/scheduler.rs`; task creation reaches it through `ExecutionAuthority` in `kernel/src/task/execution.rs` | Reservation tokens and enqueue generations remain exact; the normal-policy model is separate and test-only. |
-| idle claim and Running publication | `CooperativeScheduler::{schedule_next_on,schedule_from_idle_on}`; façade `ExecutionAuthority::{schedule_next_on,schedule_from_idle_on}` | Claim removes one queue identity and publishes one CPU/execution generation. AP live scheduling is still parked. |
+| idle claim and Running publication | `CooperativeScheduler::{schedule_next_on,schedule_from_idle_on}`; façade `ExecutionAuthority::{schedule_next_on,schedule_from_idle_on}` | Claim removes one queue identity and publishes one CPU/execution generation. AP live scheduling was parked when this contract was written; APs have claimed and run ordinary userspace since `83856db`. |
 | voluntary yield and continuation publication | `CooperativeScheduler::{yield_current_on,complete_switch_on,complete_switch_on_with_runnable_publication}`; `ExecutionAuthority::{yield_current_on,complete_switch_on}`; physical switch preparation in `ExecutionAuthority::prepare_kernel_switch_inner` | No scheduler guard crosses the root/carrier switch; the suspended continuation remains CPU/generation-bound until completion. |
 | block prepare, cancel, and commit | `CooperativeScheduler::{prepare_block_current_on,cancel_block_on,commit_block_on}` via `ExecutionAuthority`; callers in `kernel/src/wait/operation.rs`, `kernel/src/atomic_wait.rs`, and the primordial syscall adapter | Registration commits before Running removal; timer/quantum work must defer while preparation owns the exact claim. |
 | ordinary wait and deadline wake | `kernel/src/wait/engine.rs` and `kernel/src/wait/operation.rs` produce exact `BlockWakeKey`; `ExecutionAuthority::wake` calls `CooperativeScheduler::wake_with_affinity`; `kernel/src/time/live.rs::wake_trampoline` reaches the bound deadline target | One matching block generation is consumed; stale/competing wakes cannot enqueue. |
@@ -448,10 +448,15 @@ Running ownership, and the existing DW0 host regression set remains green.
 
 DW1-B then proves one-vCPU involuntary userspace preemption on CPU0.
 
-At the accepted baseline, APs reach the online barrier and remain parked; the
-current I1 stationary runtime/carrier work does not yet admit ordinary AP
-userspace execution. Before DW1-C schedules a Thread on any AP, implementation
-and focused tests must complete and validate:
+At the baseline this contract was written against, APs reached the online
+barrier and remained parked, and the I1 stationary runtime/carrier work did
+not admit ordinary AP userspace execution. (Corrected 2026-09-28: that stopped
+being true at `83856db`, "Release APs into the live cooperative runtime",
+which runs AP userspace through the coarse `RuntimeAuthorityLock` that
+`DW1_C0_SMP_PREEMPTION_DESIGN.md` §6 accepts as a bridge; DW1-C closed on
+that shape in `docs/DW1_C_VALIDATION.md`. The runtime-authority successor is
+`DW1_S2K_RUNTIME_AUTHORITY_DESIGN.md`.) Before DW1-C schedules a Thread on any
+AP, implementation and focused tests must complete and validate:
 
 - per-AP stationary runtime authority and live carrier publication;
 - CPU-private retained kernel/root, entry, reaper, scratch, and return state;
@@ -469,9 +474,11 @@ contract without an explicit reached revision.
 Required project sources were read as listed in the paired DW1/WYR1 plan,
 including the accepted H/I contracts, validation, completion, security record,
 and canonical ABI schema. Those sources prove SMP topology, CPU-private state,
-remote acknowledgement, and cooperative scheduler invariants, but the current
-baseline still parks AP execution. This contract therefore treats AP carrier
-enablement as an explicit DW1-C prerequisite rather than accepted prior state.
+remote acknowledgement, and cooperative scheduler invariants, but the baseline
+this contract was written against still parked AP execution. This contract
+therefore treats AP carrier enablement as an explicit DW1-C prerequisite rather
+than accepted prior state. (Corrected 2026-09-28: APs run userspace since
+`83856db`; see section 12.)
 
 Pinned prior art was used conceptually only:
 

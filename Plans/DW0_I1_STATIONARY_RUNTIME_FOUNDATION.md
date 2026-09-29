@@ -1,6 +1,29 @@
 # DW0-I1 Stationary Runtime Foundation
 
-**Status:** staged foundation; AP execution remains parked
+**Status:** superseded on 2026-09-28 by
+[`DW1_S2K_RUNTIME_AUTHORITY_DESIGN.md`](DW1_S2K_RUNTIME_AUTHORITY_DESIGN.md),
+which Mike approved that day. Kept as the historical record of the staged
+foundation; it is no longer authority for runtime-authority work.
+
+**Correction:** this document's original status line said "AP execution
+remains parked". That stopped being true at `83856db` (2026-08-23, "Release
+APs into the live cooperative runtime"), which released the APs into ordinary
+userspace execution through the coarse `RuntimeAuthorityLock`. DW1-C then
+accepted four-vCPU scheduling (`docs/DW1_C_VALIDATION.md`). The paragraphs
+below describe the tree before that release.
+
+**What the S2K design decides about this foundation** (its §4.1):
+
+- `RuntimeCore` and `PagingAuthority` are replaced, not resumed. They and
+  `RuntimeCoreState`, `ThreadServiceSlots`, `PerCpuStaging` and
+  `StationaryGuardDepth` were never instantiated outside their own tests, and
+  the S2K steps delete them.
+- `RuntimePhaseReservation`, the non-escaping closure discipline and the
+  non-nesting idea survive; the non-nesting idea becomes a compile-time
+  guard-free token.
+- The three unfinished steps listed at the end of this document are carried
+  by the S2K design's D1 (lock decomposition and owned adapter payloads), D3
+  (owned paging transaction) and D2 (terminal engine).
 
 The existing primordial adapter owns `Registry`, `Memory`, `Tasks`, `Spaces`,
 and `Regions` as plain mutable fields. Moving that adapter wholesale behind a
@@ -63,3 +86,5 @@ The remaining required migration is intentionally explicit:
 
 No AP release, e2 acknowledgement, public ABI, or scheduler-policy change is
 implied by this foundation.
+(As staged. The AP release came separately at `83856db`; see the correction
+at the top.)
