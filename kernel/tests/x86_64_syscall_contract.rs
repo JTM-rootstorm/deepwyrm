@@ -200,7 +200,7 @@ fn i1_native_adapter_phases_revalidate_exact_identity_after_guard_free_work() {
     // The reservation order stays pinned until D1 makes it live.
     let handle = primordial
         .split_once(
-            "for PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>\n{\n    fn handle(&mut self, request: NativeSyscallRequest)",
+            "fn handle(&mut self, request: NativeSyscallRequest) -> crate::syscall::native::ReturnReady {",
         )
         .expect("carrier native handler")
         .1
@@ -1169,25 +1169,6 @@ fn live_uart_selectors_provision_overlapping_control_and_temt_timers() {
     assert!(runtime.contains(
         "#[cfg(any(\n    deepwyrm_dw1e_evidence,\n    deepwyrm_wyr1d_evidence,\n    deepwyrm_wyr1e_evidence,\n    deepwyrm_production_product\n))]\nconst _: [(); 2] = [(); TIMERS];"
     ));
-}
-
-#[test]
-fn live_return_boundary_publishes_final_release_effects_before_userspace_resume() {
-    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
-    let dispatch = runtime
-        .find("impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandler")
-        .expect("live native handler");
-    let return_boundary = runtime[dispatch..]
-        .find("if result.control == SyscallControl::ReturnToCaller")
-        .expect("normal syscall return finalizer boundary");
-    let drain = runtime[dispatch..]
-        .find("self.drain_finalizers()")
-        .expect("normal syscall return drains finalizers");
-    let result_return = runtime[dispatch..]
-        .find("\n        result\n")
-        .expect("native handler result return");
-
-    assert!(return_boundary < drain && drain < result_return);
 }
 
 #[test]

@@ -414,6 +414,58 @@ pub(crate) trait NativeSyscallHandler {
     fn handle(&mut self, request: NativeSyscallRequest) -> NativeSyscallResult;
 }
 
+/// Proof that a runtime published its final releases: its cleanup queue was
+/// drained, so peer signals, waiter wakes and payload reclamation from this
+/// syscall are visible before userspace resumes (S2K D5, TSV row 76).
+///
+/// Neither `Clone` nor `Copy`: one drain proves one return.
+#[must_use = "a drain proof exists to admit one return to userspace"]
+pub(crate) struct FinalizersDrained {
+    _private: (),
+}
+
+impl FinalizersDrained {
+    /// # Safety
+    ///
+    /// The caller's finalizer drain has just completed: its cleanup queue is
+    /// empty and no deferred parent release remains.
+    #[allow(
+        unsafe_code,
+        reason = "the unchecked constructor states a runtime queue fact no type here can see"
+    )]
+    pub(crate) const unsafe fn assume() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// A syscall result a runtime may hand back to its dispatcher. A
+/// `ReturnToCaller` result exists only with a `FinalizersDrained` proof, so a
+/// runtime cannot resume userspace with its final releases still queued.
+pub(crate) struct ReturnReady {
+    result: NativeSyscallResult,
+}
+
+impl ReturnReady {
+    /// Any result, returning to the caller or not, with the drain proof.
+    pub(crate) const fn drained(result: NativeSyscallResult, _drained: FinalizersDrained) -> Self {
+        Self { result }
+    }
+
+    /// A result that does not return to the caller needs no proof. A
+    /// `ReturnToCaller` result comes back unchanged, still owing one.
+    pub(crate) fn without_return(result: NativeSyscallResult) -> Result<Self, NativeSyscallResult> {
+        if result.control == SyscallControl::ReturnToCaller {
+            Err(result)
+        } else {
+            Ok(Self { result })
+        }
+    }
+
+    pub(crate) const fn into_result(self) -> NativeSyscallResult {
+        self.result
+    }
+}
+
 pub(crate) fn dispatch_native<H: NativeSyscallHandler>(
     handler: &mut H,
     id: DwSyscallId,

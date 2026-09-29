@@ -7838,7 +7838,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
                 runtime.service_pending_timer_expiries_on_bootstrap();
             }
-            runtime.handle(request)
+            runtime.handle(request).into_result()
         }) {
             Ok(result) => result,
             Err(()) => {
@@ -9333,10 +9333,13 @@ pub(super) fn enter(
     }
 }
 
-impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandler
-    for PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
-    fn handle(&mut self, request: NativeSyscallRequest) -> NativeSyscallResult {
+    /// Handles one ordinary syscall under the runtime guard. A result that
+    /// returns to the caller is `ReturnReady` only with the proof that the
+    /// final releases were published first (TSV row 76).
+    fn handle(&mut self, request: NativeSyscallRequest) -> crate::syscall::native::ReturnReady {
         if self.shared.execution.scheduler_state(self.thread) != Some(SchedulerThreadState::Running)
         {
             panic!("primordial syscall arrived without its running Thread");
@@ -9533,15 +9536,29 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
             }
         };
         self.commit_runtime_phase(phase);
-        if result.control == SyscallControl::ReturnToCaller {
+        match crate::syscall::native::ReturnReady::without_return(result) {
+            Ok(ready) => ready,
             // A normal syscall return is the publication boundary for final
             // handle releases. Do not expose a successful close to userspace
             // while its peer signal, waiter wakes, or payload reclamation is
             // still parked in the carrier-local cleanup queue.
-            self.drain_finalizers()
-                .unwrap_or_else(|_| panic!("normal syscall return could not drain finalizers"));
+            Err(result) => {
+                crate::syscall::native::ReturnReady::drained(result, self.publish_final_releases())
+            }
         }
-        result
+    }
+
+    /// Drains the finalizers and returns the proof a syscall return needs.
+    #[allow(
+        unsafe_code,
+        reason = "the drain proof is minted only after the drain completed"
+    )]
+    fn publish_final_releases(&mut self) -> crate::syscall::native::FinalizersDrained {
+        self.drain_finalizers()
+            .unwrap_or_else(|_| panic!("normal syscall return could not drain finalizers"));
+        // SAFETY: `drain_finalizers` returns `Ok` only after its loop emptied the cleanup queue
+        // and found no deferred parent release to push.
+        unsafe { crate::syscall::native::FinalizersDrained::assume() }
     }
 }
 

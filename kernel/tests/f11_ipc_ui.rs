@@ -131,6 +131,19 @@ fn f11_move_only_ipc_wait_time_and_architecture_contracts() {
             fixture: "f13_safe_suspend_facade_requires_unsafe.rs",
             expected_error: "error[E0133]: call to unsafe function `NativeWaitControl::prepare_suspend` is unsafe and requires unsafe block",
         },
+        // S2K D5 (TSV row 76): a return to userspace needs the finalizer-drain proof.
+        CompileFailCase {
+            fixture: "d5_return_ready_forged.rs",
+            expected_error: "error[E0451]: field `result` of struct `ReturnReady` is private",
+        },
+        CompileFailCase {
+            fixture: "d5_finalizers_drained_forged.rs",
+            expected_error: "error[E0133]: call to unsafe function `FinalizersDrained::assume` is unsafe and requires unsafe block",
+        },
+        CompileFailCase {
+            fixture: "d5_finalizers_drained_clone.rs",
+            expected_error: "error[E0277]: the trait bound `FinalizersDrained: Clone` is not satisfied",
+        },
     ] {
         run_compile_fail_case(
             &rustc,
