@@ -59,12 +59,72 @@ fn root_switch_transactions_are_move_only_and_unforgeable() {
                 "error[E0451]: fields `error` and `previous` of struct `FailedStopRootSwitch` are private",
             ),
         },
+        // S2K-3: a CR3 switch takes a guard-free token, which a locked handle cannot mint.
+        UiCase {
+            fixture: "root_switch_execute_under_guard.rs",
+            expected_error: Some(
+                "error[E0499]: cannot borrow `*handle` as mutable more than once at a time",
+            ),
+        },
     ] {
         run_case(&rustc, &manifest_dir, &output_dir, &case);
     }
 
     fs::remove_dir_all(&output_dir)
         .expect("remove exact project-local root-switch UI output directory");
+}
+
+/// S2K-3: the guard-free token is a borrow-checker fact. A CPU locks only
+/// through its one handle, a guard borrows that handle, and only the handle
+/// (or `unsafe`) mints a token, so no physical boundary that takes one can run
+/// under the runtime authority guard.
+#[test]
+fn guard_free_tokens_cannot_be_minted_under_the_runtime_guard() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_dir = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("kernel is nested below the workspace root");
+    let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let output_dir = workspace_dir
+        .join(".tmp")
+        .join("guard-free-ui")
+        .join(std::process::id().to_string());
+    fs::create_dir_all(&output_dir).expect("create project-local guard-free UI output directory");
+
+    for case in [
+        UiCase {
+            fixture: "guard_free_compiles.rs",
+            expected_error: None,
+        },
+        UiCase {
+            fixture: "guard_free_while_locked.rs",
+            expected_error: Some(
+                "error[E0499]: cannot borrow `handle` as mutable more than once at a time",
+            ),
+        },
+        UiCase {
+            fixture: "guard_free_forged.rs",
+            expected_error: Some(
+                "error[E0133]: call to unsafe function `GuardFree::<'_>::assume` is unsafe and requires unsafe block",
+            ),
+        },
+        UiCase {
+            fixture: "runtime_authority_lock_private.rs",
+            expected_error: Some("error[E0624]: method `lock` is private"),
+        },
+        UiCase {
+            fixture: "runtime_authority_handle_clone.rs",
+            expected_error: Some(
+                "error[E0277]: the trait bound `RuntimeAuthorityHandle<'_, u32>: Clone` is not satisfied",
+            ),
+        },
+    ] {
+        run_case(&rustc, &manifest_dir, &output_dir, &case);
+    }
+
+    fs::remove_dir_all(&output_dir)
+        .expect("remove exact project-local guard-free UI output directory");
 }
 
 fn run_case(rustc: &std::ffi::OsStr, manifest_dir: &Path, output_dir: &Path, case: &UiCase<'_>) {

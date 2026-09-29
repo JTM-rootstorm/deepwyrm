@@ -7,7 +7,9 @@
 //! cancel. The types carry the ordering: a `Prepared*` is consumed by
 //! `execute_on`, and only `execute_on` can produce an `Executed*` or `Failed*`,
 //! because their payload fields are private to this module. The flight stays
-//! readable for the carrier's identity checks.
+//! readable for the carrier's identity checks. `execute_on` also takes a
+//! `GuardFree` token, so no CR3 switch can run under the runtime authority
+//! guard (S2K-3).
 //!
 //! Split out of the target-only `primordial.rs` (S2K-2) and made generic over
 //! `RootSwitchTarget`, so the host build compiles it and the compile-fail
@@ -22,7 +24,7 @@
     )
 )]
 
-use super::RootSwitchTarget;
+use super::{GuardFree, RootSwitchTarget};
 use crate::memory::address_region::AddressRegionObjectKey;
 use crate::task::{KernelStackId, ProcessKey, ThreadContextId, ThreadKey};
 
@@ -176,6 +178,7 @@ impl PreparedApKernelRootEntry {
     pub(super) fn execute_on<T: RootSwitchTarget>(
         self,
         target: &mut T,
+        _guard_free: GuardFree<'_>,
     ) -> Result<ExecutedApKernelRootEntry, FailedApKernelRootEntry> {
         match self.prepared.execute(target) {
             Ok(executed) => Ok(ExecutedApKernelRootEntry {
@@ -218,6 +221,7 @@ impl PreparedStopRootSwitch {
     pub(super) fn execute_on<T: RootSwitchTarget>(
         self,
         target: &mut T,
+        _guard_free: GuardFree<'_>,
     ) -> Result<ExecutedStopRootSwitch, FailedStopRootSwitch> {
         match self.prepared.execute(target) {
             Ok(executed) => Ok(ExecutedStopRootSwitch {
@@ -260,6 +264,7 @@ impl PreparedTerminalKernelRootSwitch {
     pub(super) fn execute_on<T: RootSwitchTarget>(
         self,
         target: &mut T,
+        _guard_free: GuardFree<'_>,
     ) -> Result<ExecutedTerminalKernelRootSwitch, FailedTerminalKernelRootSwitch> {
         match self.prepared.execute(target) {
             Ok(executed) => Ok(ExecutedTerminalKernelRootSwitch {
@@ -302,6 +307,7 @@ impl PreparedTerminalProcessRootSwitch {
     pub(super) fn execute_on<T: RootSwitchTarget>(
         self,
         target: &mut T,
+        _guard_free: GuardFree<'_>,
     ) -> Result<ExecutedTerminalProcessRootSwitch, FailedTerminalProcessRootSwitch> {
         match self.prepared.execute(target) {
             Ok(executed) => Ok(ExecutedTerminalProcessRootSwitch {
@@ -348,6 +354,7 @@ impl PreparedSchedulerRootSwitch {
     pub(super) fn execute_on<T: RootSwitchTarget>(
         self,
         target: &mut T,
+        _guard_free: GuardFree<'_>,
     ) -> Result<ExecutedSchedulerRootSwitch, FailedSchedulerRootSwitch> {
         let kind = match self.kind {
             PreparedSchedulerRootSwitchKind::Process(prepared) => match prepared.execute(target) {

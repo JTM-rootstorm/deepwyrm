@@ -65,6 +65,14 @@ use super::runtime_binding::{
 // AP, and from the timer IRQ during the facade idle loop's STI window. The nested call reads only
 // immutable facade fields, but Stacked Borrows rejects the overlap.
 //
+// [GUARD-FREE] Crate-visible physical boundaries here (`enter_bound_validated_user`,
+// `abandon_to_kernel_continuation`, `enter_bound_idle_scheduler_guard_free`,
+// `handoff_current_rendezvous_from_carrier`) take a `GuardFree` token, so a carrier cannot reach
+// them while it holds its runtime-authority guard. The private boundaries (`switch_kernel_context`,
+// `handoff_to_rendezvous_reaper`, `handoff_to_terminal_reaper`) are guard-free by construction:
+// only this file's trampolines call them, this file cannot name `RuntimeAuthorityGuard`
+// (`pub(super)` in `mm::activation`), and no runtime trait method can return one.
+//
 // [FRAME] `dw_x86_64_syscall_dispatch` and `dw_x86_64_timer_pre_iret_gate` receive frame pointers
 // from assembly (`syscall_entry.S`, `exceptions.S`). Rust checks them for null and alignment. That
 // each points to one complete frame, owned by this entry and living on the current Thread's bound
@@ -1250,7 +1258,10 @@ fn handoff_to_rendezvous_reaper(context: *mut ()) -> ! {
 /// scheduler synchronization observes an exact remote Stop. Detached entries
 /// have no syscall/timer frame to return through, so they must consume the
 /// same stationary mailbox authority directly and abandon their carrier stack.
-pub(crate) fn handoff_current_rendezvous_from_carrier() -> ! {
+///
+/// Takes a `GuardFree` token: a carrier must drop its runtime-authority guard
+/// before it abandons its stack for the reaper.
+pub(crate) fn handoff_current_rendezvous_from_carrier(_guard_free: super::GuardFree<'_>) -> ! {
     match crate::arch::x86_64::idle::take_current_notification_at_safe_point() {
         crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request) => {
             stage_rendezvous_action(RendezvousAction(request)).unwrap_or_else(|_| halt_forever());
@@ -2030,11 +2041,29 @@ pub(crate) unsafe extern "sysv64" fn dw_x86_64_first_run_thread_entry() -> ! {
 
 /// Enters the bound cooperative scheduler from an AP's private bootstrap
 /// stack. The AP carrier must already be released to `Executing`.
+///
+/// For the two entries no runtime-authority guard can precede: AP bring-up
+/// (`kernel_main`'s AP path) and the detached idle entry, a fresh frame on the
+/// CPU-private bootstrap stack. Carrier code, which may hold the guard, uses
+/// `enter_bound_idle_scheduler_guard_free`.
+#[allow(
+    unsafe_code,
+    reason = "the two callers run on fresh CPU-private frames that no runtime-authority guard can precede"
+)]
+pub(crate) fn enter_bound_idle_scheduler() -> ! {
+    // SAFETY: both callers (AP bring-up in `kernel_main`, whose carrier has not yet entered, and
+    // `dw_x86_64_detached_idle_entry`, a fresh frame on the CPU-private bootstrap stack) run with
+    // no frame of this CPU holding a runtime-authority guard.
+    enter_bound_idle_scheduler_guard_free(unsafe { super::GuardFree::assume() })
+}
+
+/// Enters the bound cooperative scheduler from a carrier, which must first
+/// prove it holds no runtime-authority guard.
 #[allow(
     unsafe_code,
     reason = "the immutable current-CPU binding pairs its carrier with the monomorphized divergent scheduler callback"
 )]
-pub(crate) fn enter_bound_idle_scheduler() -> ! {
+pub(crate) fn enter_bound_idle_scheduler_guard_free(_guard_free: super::GuardFree<'_>) -> ! {
     validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
     let binding = runtime_binding().unwrap_or_else(|| halt_forever());
     // SAFETY: [CARRIER] this CPU's immutable binding and its matching
@@ -2094,6 +2123,7 @@ fn current_kernel_stack_is(stack: KernelStackBounds) -> bool {
 pub(crate) unsafe fn enter_bound_validated_user(
     state: &ValidatedUserReturn,
     stack: KernelStackBounds,
+    _guard_free: super::GuardFree<'_>,
 ) -> ! {
     validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
     if runtime_binding().is_none()
@@ -2106,6 +2136,25 @@ pub(crate) unsafe fn enter_bound_validated_user(
     // all checked above; `state` is a `ValidatedUserReturn`, which `iret_validated_user` reads in
     // full before it writes the bound stack.
     unsafe { iret_validated_user(state) }
+}
+
+/// Abandons the current (reaper or carrier) frame for a scheduler-owned kernel
+/// continuation, guard-free. Carrier code reaches
+/// `context::abandon_to_kernel_continuation` only through here.
+///
+/// # Safety
+///
+/// As `crate::arch::x86_64::context::abandon_to_kernel_continuation`.
+#[allow(
+    unsafe_code,
+    reason = "forwards the context switch's continuation contract; the token adds the guard-free proof"
+)]
+pub(crate) unsafe fn abandon_to_kernel_continuation(
+    next_rsp: u64,
+    _guard_free: super::GuardFree<'_>,
+) -> ! {
+    // SAFETY: forwarded from this function's `# Safety`.
+    unsafe { crate::arch::x86_64::context::abandon_to_kernel_continuation(next_rsp) }
 }
 
 #[allow(

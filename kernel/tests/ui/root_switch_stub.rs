@@ -11,6 +11,10 @@
 #[path = "../../src/cpu.rs"]
 mod cpu;
 
+// `root_switch.rs` takes the guard-free token from `super`, as do the handles
+// that mint it.
+include!("runtime_authority_stub.rs");
+
 pub(crate) mod task {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) struct ProcessKey;

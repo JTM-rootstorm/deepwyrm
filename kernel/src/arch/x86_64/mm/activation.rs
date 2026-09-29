@@ -129,6 +129,8 @@ mod wyr1f_fairness_resource_geometry;
 #[cfg(any(test, deepwyrm_production_product))]
 #[path = "activation/production_resource_geometry.rs"]
 mod production_resource_geometry;
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+use crate::arch::x86_64::syscall::GuardFree;
 #[allow(
     unused_imports,
     reason = "I0 root-binding typestates are consumed by the integrated carrier and focused host models"

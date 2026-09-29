@@ -192,40 +192,34 @@ fn i1_native_adapter_phases_revalidate_exact_identity_after_guard_free_work() {
     assert!(primordial.contains(".prepare_dispatch(request, self.thread, root_generation)"));
     assert!(primordial.contains("self.services.dispatch_prepared("));
     assert!(primordial.contains("let phase = self.reserve_runtime_phase();"));
-    assert!(primordial.contains("self.assert_guard_free_external_work();"));
     assert!(primordial.contains("self.commit_runtime_phase(phase);"));
 
+    // The carrier's handler, not the facade's (which comes first in the file). S2K-3 removed the
+    // runtime guard-free check the reservation used to bracket: it could never fire (S2K design
+    // §2.4 finding 1), and the `GuardFree` token now keeps physical boundaries out of the guard.
+    // The reservation order stays pinned until D1 makes it live.
     let handle = primordial
-        .split_once("fn handle(&mut self, request: NativeSyscallRequest)")
-        .expect("native handler")
-        .1;
+        .split_once(
+            "for PrimordialRuntimeCarrier<'_, RANGE_CAPACITY, ROLE_CAPACITY>\n{\n    fn handle(&mut self, request: NativeSyscallRequest)",
+        )
+        .expect("carrier native handler")
+        .1
+        .split_once("\n    }\n")
+        .expect("carrier native handler extent")
+        .0;
     let reserve = handle
         .find("let phase = self.reserve_runtime_phase();")
         .unwrap();
-    let guard_free = handle
-        .find("self.assert_guard_free_external_work();")
-        .unwrap();
     let commit = handle.find("self.commit_runtime_phase(phase);").unwrap();
-    assert!(reserve < guard_free && guard_free < commit);
+    assert!(reserve < commit);
 
     for adapter in ["fn map_memory(", "fn unmap_memory(", "fn exit_process("] {
         let adapter = primordial.split_once(adapter).expect("staged adapter").1;
         let reserve = adapter
             .find("let phase = self.reserve_runtime_phase();")
             .unwrap();
-        let guard_free = adapter
-            .find("self.assert_guard_free_external_work();")
-            .unwrap();
         let commit = adapter.find("self.commit_runtime_phase(phase);").unwrap();
-        assert!(reserve < guard_free && guard_free < commit, "{adapter}");
-    }
-
-    for external_boundary in ["fn precommit_exact_stop(", "fn rendezvous_stop("] {
-        let boundary = primordial
-            .split_once(external_boundary)
-            .expect("guard-free divergent boundary")
-            .1;
-        assert!(boundary.contains("self.assert_guard_free_external_work();"));
+        assert!(reserve < commit, "{adapter}");
     }
 }
 
@@ -426,29 +420,14 @@ fn i1_remote_termination_waits_guard_free_for_exact_ack_before_reclaim() {
     assert!(primordial.contains("fn stopped_service_state_is_quiescent(&self)"));
     assert!(primordial.contains("self.services.operation_owner(self.thread)"));
     assert!(primordial.contains("self.wait_controls[self.cpu.index()].is_clear()"));
-    let initiator = primordial
-        .split_once("fn complete_remote_stop(")
-        .expect("remote-stop initiator")
-        .1
-        .split_once("fn authorize_return(")
-        .expect("remote-stop initiator extent")
-        .0;
+    // The wait-before-reacquire order is static since S2K-3: `await_remote_stop_permits` takes a
+    // `GuardFree` token, which the facade cannot mint while it holds the runtime guard, and the
+    // reclaim is a carrier method, which only a guard reaches.
     assert!(primordial.contains("fn await_remote_stop_permits("));
+    assert!(primordial.contains("    _guard_free: GuardFree<'_>,\n) -> ["));
     let await_ack = primordial.find("await_live_remote_stop(deferred)").unwrap();
-    let await_call = initiator
-        .find("let permits = await_remote_stop_permits(pending.deferred)")
-        .unwrap();
-    let authority_lock = initiator[await_call..]
-        .find("let mut runtime = self.runtime.lock();")
-        .map(|offset| await_call + offset)
-        .unwrap();
-    let reclaim = initiator
-        .find("runtime.complete_process_termination(")
-        .unwrap();
     let helper = primordial.find("fn await_remote_stop_permits(").unwrap();
     assert!(helper < await_ack);
-    assert!(await_call < authority_lock);
-    assert!(authority_lock < reclaim);
     assert!(primordial.contains("permits[cpu_index] = Some(permit)"));
 
     let adapters = source("src/syscall/adapters.rs");
@@ -688,7 +667,7 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
         .find("crate::task::notify_completed_switch_runnable(published);")
         .expect("remote terminal Runnable notification");
     let remote_wait = remote_terminal
-        .find("await_remote_stop_permits(pending.deferred)")
+        .find("await_remote_stop_permits(pending.deferred, self.runtime.guard_free())")
         .expect("remote terminal acknowledgement wait");
     let remote_final_sync = remote_terminal
         .rfind("self.synchronize_scheduler_current_after_remote_stops_detached();")
@@ -725,7 +704,7 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
         "runtime.complete_thread_termination(",
     ] {
         let wait = remote_completion
-            .find("await_remote_stop_permits(pending.deferred)")
+            .find("await_remote_stop_permits(pending.deferred, self.runtime.guard_free())")
             .unwrap();
         let sync = remote_completion[wait..]
             .find("self.synchronize_scheduler_current_after_remote_stops_detached();")
@@ -778,7 +757,9 @@ fn i1_detached_scheduler_sync_honors_terminal_stop_publication() {
     assert!(detached.contains("self.synchronize_scheduler_current_at_safe_point_detached()"));
     assert!(
         detached
-            .contains("crate::arch::x86_64::syscall::handoff_current_rendezvous_from_carrier()")
+            .contains(
+                "crate::arch::x86_64::syscall::handoff_current_rendezvous_from_carrier(\n                self.runtime.guard_free(),\n            )",
+            )
     );
     assert!(!detached.contains("runtime.prepare_scheduler_root_switch()"));
     assert_eq!(
@@ -808,7 +789,7 @@ fn i1_detached_scheduler_sync_honors_terminal_stop_publication() {
     assert!(mailbox < barrier && barrier < prepare);
 
     let handoff = live
-        .split_once("pub(crate) fn handoff_current_rendezvous_from_carrier() -> !")
+        .split_once("pub(crate) fn handoff_current_rendezvous_from_carrier(_guard_free: super::GuardFree<'_>) -> !")
         .expect("detached carrier rendezvous handoff")
         .1
         .split_once("/// Called by the CPL3-origin e1 assembly boundary")
@@ -1400,7 +1381,7 @@ fn i1_terminal_child_without_local_work_rejoins_the_idle_scheduler() {
     assert!(runtime.contains("if retirement.retired_process != self.primordial_process"));
     assert!(runtime.contains("self.finish_inactive_process_teardown("));
     assert!(runtime.contains("PreparedTerminalHandoff::IdleScheduler"));
-    assert!(runtime.contains("enter_bound_idle_scheduler()"));
+    assert!(runtime.contains("syscall::enter_bound_idle_scheduler_guard_free(\n"));
     // The live terminal path (S2K-3.1 re-anchored it off the carrier's
     // never-reached copy): retirement state, the detached handoff and its
     // continuations.
@@ -1877,7 +1858,7 @@ fn h2_syscall_entry_and_native_runtime_carriers_are_fixed_per_cpu() {
     ));
     assert!(primordial.contains("runtime.switch_cpu(self.cpu)"));
     assert!(primordial.contains("runtime.prepare_fresh_user_entry_synchronized()"));
-    assert!(primordial.contains("enter_bound_validated_user(&state, stack)"));
+    assert!(primordial.contains("syscall::enter_bound_validated_user(\n"));
     assert!(!primordial.contains("reject_entry"));
 }
 
@@ -1888,9 +1869,9 @@ fn i1_stationary_foundation_keeps_authority_and_carrier_boundaries_explicit() {
     let stationary = source("src/arch/x86_64/syscall/stationary_runtime.rs");
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
 
-    // S2K-1 deleted the never-instantiated RuntimeCore/PagingAuthority family;
-    // the guard-depth check stays until S2K-3 replaces it with a token.
-    assert!(stationary.contains("fn assert_clear_on"));
+    // S2K-1 deleted the never-instantiated RuntimeCore/PagingAuthority family
+    // and S2K-3 its guard-depth check; the reservation remains.
+    assert!(stationary.contains("struct RuntimePhaseReservation"));
     assert!(primordial.contains("struct PerCpuLiveCarrier"));
     assert!(primordial.contains("initialize_per_cpu_live_carriers"));
     assert!(primordial.contains("0..crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT"));
@@ -2003,7 +1984,7 @@ fn i1_ap_and_rendezvous_fresh_entries_bind_the_selected_thread_stack_before_cpl3
             .find("bind_current_thread_stack(stack)")
             .expect("selected stack binding");
         let enter = fresh
-            .find("enter_bound_validated_user(&state, stack)")
+            .find("enter_bound_validated_user(")
             .expect("CPL3 entry");
         assert!(bind < enter, "fresh CPL3 entry preceded its stack binding");
     }
@@ -2227,7 +2208,7 @@ fn dw1c_detach_commits_its_root_flight_without_ordinary_cpu_reselection() {
         .find("runtime.prepare_terminal_kernel_root_switch()")
         .expect("detach prepares its root-switch flight");
     let execute = detach[prepare..]
-        .find("prepared.execute()")
+        .find("prepared.execute(self.runtime.guard_free())")
         .map(|offset| prepare + offset)
         .expect("detach executes its root-switch flight");
     let commit = detach[execute..]
@@ -2286,25 +2267,20 @@ fn dw1c1_terminal_handoff_executes_every_root_switch_outside_the_runtime_guard()
         .0;
     assert!(facade.contains("runtime.prepare_terminal_handoff_detached()"));
     assert!(!facade.contains("runtime.prepare_terminal_handoff()"));
+    // Every terminal root switch runs outside the runtime guard, and every commit after it under
+    // a reacquired guard: static since S2K-3 (`execute` takes a `GuardFree` token and the commits
+    // are carrier methods; see `kernel/tests/root_switch_ui.rs`). What stays here until S2K-6
+    // deletes `switch_cpu`: a commit or cancel must not reselect the CPU, because its flight
+    // selects the exact in-flight CPU.
     for commit in [
         "runtime.commit_scheduler_root_switch(executed)",
         "runtime.commit_terminal_kernel_root_switch(executed)",
         "runtime.commit_terminal_primordial_root_switch(executed)",
     ] {
-        let execute = facade.find("prepared.execute()").unwrap();
         let commit = facade.find(commit).unwrap();
-        assert!(
-            execute < commit,
-            "terminal root commit preceded detached execute"
-        );
-        assert!(
-            facade[execute..commit].contains("let mut runtime = self.runtime.lock()"),
-            "terminal root commit did not reacquire serialized authority"
-        );
-        let reacquire = facade[execute..commit]
+        let reacquire = facade[..commit]
             .rfind("let mut runtime = self.runtime.lock()")
-            .unwrap()
-            + execute;
+            .unwrap();
         assert!(
             !facade[reacquire..commit].contains("runtime.switch_cpu(self.cpu)"),
             "terminal root commit bypassed its exact in-flight selector"

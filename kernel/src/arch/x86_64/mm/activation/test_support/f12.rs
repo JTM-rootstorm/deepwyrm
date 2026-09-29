@@ -1640,7 +1640,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
             crate::arch::x86_64::syscall::ValidatedUserReturn::initial(context, &mut mappings)
                 .unwrap_or_else(|_| fail(0xf8))
         };
-        unsafe { crate::arch::x86_64::syscall::enter_bound_validated_user(&state, stack) }
+        // SAFETY: `state` was just validated against this Process's mappings and `stack` is the
+        // entered Thread's own kernel stack, which the callee rechecks against the current binding.
+        // The token is assumed because this guest runtime has no runtime-authority lock, so no
+        // frame of this CPU can hold its guard.
+        unsafe {
+            crate::arch::x86_64::syscall::enter_bound_validated_user(
+                &state,
+                stack,
+                crate::arch::x86_64::syscall::GuardFree::assume(),
+            )
+        }
     }
 
     unsafe fn prepare_suspend<'owner>(

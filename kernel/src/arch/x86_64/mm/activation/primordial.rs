@@ -28,6 +28,7 @@ use super::root_switch::{
     PreparedTerminalProcessRootSwitch, RootSwitchFlight, SchedulerRootIdentity,
 };
 
+use super::GuardFree;
 use super::runtime_authority::{RuntimeAuthorityHandle, RuntimeAuthorityLock};
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
@@ -1582,8 +1583,6 @@ unsafe impl Sync for SharedRuntimeStorage {}
 
 static SHARED_RUNTIME_STATE: AtomicU8 = AtomicU8::new(0);
 static SHARED_RUNTIME_STORAGE: SharedRuntimeStorage = SharedRuntimeStorage::new();
-static STATIONARY_GUARD_DEPTH: crate::arch::x86_64::syscall::StationaryGuardDepth =
-    crate::arch::x86_64::syscall::StationaryGuardDepth::new();
 
 /// CPU-local immutable identity over the stationary synchronized runtime.
 struct PendingRemoteProcessTermination {
@@ -1657,9 +1656,14 @@ enum ThreadTerminationPreparation {
     Remote(PreparedRemoteThreadTermination),
 }
 
+/// Waits, guard-free, for every published remote Stop's exact
+/// acknowledgement. The token keeps the wait out of any runtime-authority
+/// guard: a stopped CPU acknowledges from its own safe point, which may need
+/// that authority.
 fn await_remote_stop_permits(
     deferred: [Option<crate::arch::x86_64::rendezvous::DeferredReclaim<()>>;
         crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+    _guard_free: GuardFree<'_>,
 ) -> [Option<crate::arch::x86_64::rendezvous::RemoteStopReclaimPermit>;
     crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] {
     let mut permits = core::array::from_fn(|_| None);
@@ -1720,7 +1724,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     fn synchronize_scheduler_current_detached(&mut self) {
         if !self.synchronize_scheduler_current_at_safe_point_detached() {
-            crate::arch::x86_64::syscall::handoff_current_rendezvous_from_carrier()
+            crate::arch::x86_64::syscall::handoff_current_rendezvous_from_carrier(
+                self.runtime.guard_free(),
+            )
         }
     }
 
@@ -1731,7 +1737,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let Some(prepared) = prepared else {
             return;
         };
-        let executed = match prepared.execute() {
+        let executed = match prepared.execute(self.runtime.guard_free()) {
             Ok(executed) => executed,
             Err(failure) => {
                 let mut runtime = self.runtime.lock();
@@ -1836,7 +1842,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let Some(prepared) = prepared else {
             return true;
         };
-        let executed = match prepared.execute() {
+        let executed = match prepared.execute(self.runtime.guard_free()) {
             Ok(executed) => executed,
             Err(failure) => {
                 let mut runtime = self.runtime.lock();
@@ -1902,7 +1908,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             runtime.switch_cpu(self.cpu);
             runtime.prepare_ap_kernel_root_entry()
         };
-        let executed = match prepared.execute() {
+        let executed = match prepared.execute(self.runtime.guard_free()) {
             Ok(executed) => executed,
             Err(failure) => {
                 let mut runtime = self.runtime.lock();
@@ -1972,7 +1978,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 }
             }
         };
-        let permits = await_remote_stop_permits(pending.deferred);
+        let permits = await_remote_stop_permits(pending.deferred, self.runtime.guard_free());
         self.synchronize_scheduler_current_after_remote_stops_detached();
         let result = {
             let mut runtime = self.runtime.lock();
@@ -3037,32 +3043,47 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
 // `root_switch.rs`: each `execute` performs its CR3 effect through
 // `LiveRootSwitchTarget`.
 impl PreparedApKernelRootEntry {
-    fn execute(self) -> Result<ExecutedApKernelRootEntry, FailedApKernelRootEntry> {
-        self.execute_on(&mut super::LiveRootSwitchTarget)
+    fn execute(
+        self,
+        guard_free: GuardFree<'_>,
+    ) -> Result<ExecutedApKernelRootEntry, FailedApKernelRootEntry> {
+        self.execute_on(&mut super::LiveRootSwitchTarget, guard_free)
     }
 }
 
 impl PreparedStopRootSwitch {
-    fn execute(self) -> Result<ExecutedStopRootSwitch, FailedStopRootSwitch> {
-        self.execute_on(&mut super::LiveRootSwitchTarget)
+    fn execute(
+        self,
+        guard_free: GuardFree<'_>,
+    ) -> Result<ExecutedStopRootSwitch, FailedStopRootSwitch> {
+        self.execute_on(&mut super::LiveRootSwitchTarget, guard_free)
     }
 }
 
 impl PreparedTerminalKernelRootSwitch {
-    fn execute(self) -> Result<ExecutedTerminalKernelRootSwitch, FailedTerminalKernelRootSwitch> {
-        self.execute_on(&mut super::LiveRootSwitchTarget)
+    fn execute(
+        self,
+        guard_free: GuardFree<'_>,
+    ) -> Result<ExecutedTerminalKernelRootSwitch, FailedTerminalKernelRootSwitch> {
+        self.execute_on(&mut super::LiveRootSwitchTarget, guard_free)
     }
 }
 
 impl PreparedTerminalProcessRootSwitch {
-    fn execute(self) -> Result<ExecutedTerminalProcessRootSwitch, FailedTerminalProcessRootSwitch> {
-        self.execute_on(&mut super::LiveRootSwitchTarget)
+    fn execute(
+        self,
+        guard_free: GuardFree<'_>,
+    ) -> Result<ExecutedTerminalProcessRootSwitch, FailedTerminalProcessRootSwitch> {
+        self.execute_on(&mut super::LiveRootSwitchTarget, guard_free)
     }
 }
 
 impl PreparedSchedulerRootSwitch {
-    fn execute(self) -> Result<ExecutedSchedulerRootSwitch, FailedSchedulerRootSwitch> {
-        self.execute_on(&mut super::LiveRootSwitchTarget)
+    fn execute(
+        self,
+        guard_free: GuardFree<'_>,
+    ) -> Result<ExecutedSchedulerRootSwitch, FailedSchedulerRootSwitch> {
+        self.execute_on(&mut super::LiveRootSwitchTarget, guard_free)
     }
 }
 
@@ -3601,7 +3622,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     unsafe fn prepare_preemption_stationary(
         &mut self,
     ) -> crate::syscall::native::NativePreemptionPlan<'static> {
-        self.assert_guard_free_external_work();
         crate::debug::liveness::note_event(
             self.cpu,
             crate::debug::liveness::LivenessEvent::Preempted,
@@ -4428,10 +4448,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .unwrap_or_else(|_| panic!("runtime phase identity drifted across guard-free work"));
     }
 
-    fn assert_guard_free_external_work(&self) {
-        STATIONARY_GUARD_DEPTH.assert_clear_on(self.cpu);
-    }
-
     #[track_caller]
     fn synchronize_scheduler_current(&mut self) {
         assert_eq!(self.local.cpu, self.cpu, "BSP carrier storage CPU drifted");
@@ -4883,7 +4899,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         crate::arch::x86_64::rendezvous::ExactSafeWitness,
         PreparedStopRootSwitch,
     ) {
-        self.assert_guard_free_external_work();
         self.rendezvous_reaper = Some(reaper);
         let witness = crate::arch::x86_64::idle::prepare_current_rendezvous_stop(request, self)
             .unwrap_or_else(|error| {
@@ -4961,7 +4976,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             Err(()) => return ProcessTerminationPreparation::Retry,
         };
         let phase = self.reserve_runtime_phase();
-        self.assert_guard_free_external_work();
         let mut prepared = match self.prepare_process_exception_with_wait_cleanup(exception) {
             Ok(prepared) => prepared,
             Err(status) => {
@@ -6049,7 +6063,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         // The IPI/reaper seam is an external, divergent boundary.  It must
         // never inherit a stationary authority guard from a preceding adapter
         // phase before it consumes the move-only reaper witness.
-        self.assert_guard_free_external_work();
         if self.rendezvous_reaper.as_ref().is_none() {
             return Err(crate::arch::x86_64::rendezvous::RemoteStopError::UnsafePrecommit);
         }
@@ -7791,7 +7804,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             runtime.switch_cpu(self.cpu);
             runtime.prepare_rendezvous_stop(request, reaper)
         };
-        let root_switch = match root_switch.execute() {
+        let root_switch = match root_switch.execute(self.runtime.guard_free()) {
             Ok(executed) => executed,
             Err(failure) => {
                 let mut runtime = self.runtime.lock();
@@ -7836,7 +7849,13 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     });
                 // SAFETY: [P-HANDOFF] `state` was validated for the scheduled Thread's Process and
                 // `stack` was bound just above; the callee rechecks both bindings.
-                unsafe { crate::arch::x86_64::syscall::enter_bound_validated_user(&state, stack) }
+                unsafe {
+                    crate::arch::x86_64::syscall::enter_bound_validated_user(
+                        &state,
+                        stack,
+                        self.runtime.guard_free(),
+                    )
+                }
             }
             PreparedCarrierEntry::Continuation { stack, rsp } => {
                 // SAFETY: [P-HANDOFF] on this CPU's rendezvous reaper stack with IF clear; `stack`
@@ -7850,7 +7869,12 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 );
                 // SAFETY: [P-HANDOFF] `rsp` is the scheduled Thread's saved continuation and its
                 // stack is bound above; this reaper frame is abandoned.
-                unsafe { crate::arch::x86_64::context::abandon_to_kernel_continuation(rsp) }
+                unsafe {
+                    crate::arch::x86_64::syscall::abandon_to_kernel_continuation(
+                        rsp,
+                        self.runtime.guard_free(),
+                    )
+                }
             }
             PreparedCarrierEntry::Idle => self.enter_idle_scheduler(),
         }
@@ -8136,7 +8160,8 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             .unwrap_or_else(|| panic!("remote-stop control omitted its CPU-local termination"));
         let result = match pending {
             PendingRemoteTermination::Process(pending) => {
-                let permits = await_remote_stop_permits(pending.deferred);
+                let permits =
+                    await_remote_stop_permits(pending.deferred, self.runtime.guard_free());
                 self.synchronize_scheduler_current_after_remote_stops_detached();
                 {
                     let mut runtime = self.runtime.lock();
@@ -8145,7 +8170,8 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 }
             }
             PendingRemoteTermination::TaskGroup(pending) => {
-                let permits = await_remote_stop_permits(pending.deferred);
+                let permits =
+                    await_remote_stop_permits(pending.deferred, self.runtime.guard_free());
                 self.synchronize_scheduler_current_after_remote_stops_detached();
                 {
                     let mut runtime = self.runtime.lock();
@@ -8158,7 +8184,8 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 }
             }
             PendingRemoteTermination::Thread(pending) => {
-                let permits = await_remote_stop_permits(pending.deferred);
+                let permits =
+                    await_remote_stop_permits(pending.deferred, self.runtime.guard_free());
                 self.synchronize_scheduler_current_after_remote_stops_detached();
                 {
                     let mut runtime = self.runtime.lock();
@@ -8221,7 +8248,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         loop {
             step = match step {
                 PreparedTerminalStep::SchedulerRoot { prepared, state } => {
-                    let executed = match prepared.execute() {
+                    let executed = match prepared.execute(self.runtime.guard_free()) {
                         Ok(executed) => executed,
                         Err(failure) => {
                             let mut runtime = self.runtime.lock();
@@ -8237,7 +8264,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                     prepared,
                     continuation,
                 } => {
-                    let executed = match prepared.execute() {
+                    let executed = match prepared.execute(self.runtime.guard_free()) {
                         Ok(executed) => executed,
                         Err(failure) => {
                             let mut runtime = self.runtime.lock();
@@ -8253,7 +8280,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                     prepared,
                     retirement,
                 } => {
-                    let executed = match prepared.execute() {
+                    let executed = match prepared.execute(self.runtime.guard_free()) {
                         Ok(executed) => executed,
                         Err(failure) => {
                             let mut runtime = self.runtime.lock();
@@ -8270,10 +8297,15 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                     // and returned its continuation (or built a fresh one there); this reaper frame
                     // is abandoned.
                     PreparedTerminalHandoff::Continuation(continuation) => unsafe {
-                        crate::arch::x86_64::context::abandon_to_kernel_continuation(continuation)
+                        crate::arch::x86_64::syscall::abandon_to_kernel_continuation(
+                            continuation,
+                            self.runtime.guard_free(),
+                        )
                     },
                     PreparedTerminalHandoff::IdleScheduler => {
-                        crate::arch::x86_64::syscall::enter_bound_idle_scheduler()
+                        crate::arch::x86_64::syscall::enter_bound_idle_scheduler_guard_free(
+                            self.runtime.guard_free(),
+                        )
                     }
                 },
             };
@@ -8296,7 +8328,13 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
         // SAFETY: [P-HANDOFF] `state` was validated against the current Process; the first-run
         // switch bound `stack`, which the callee rechecks. See its same-stack pivot note at
         // `iret_validated_user`.
-        unsafe { crate::arch::x86_64::syscall::enter_bound_validated_user(&state, stack) }
+        unsafe {
+            crate::arch::x86_64::syscall::enter_bound_validated_user(
+                &state,
+                stack,
+                self.runtime.guard_free(),
+            )
+        }
     }
 
     fn publish_scheduler_idle(
@@ -8339,7 +8377,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                     runtime.switch_cpu(self.cpu);
                     runtime.prepare_terminal_kernel_root_switch()
                 };
-                let executed = match prepared.execute() {
+                let executed = match prepared.execute(self.runtime.guard_free()) {
                     Ok(executed) => executed,
                     Err(failure) => {
                         let mut runtime = self.runtime.lock();
@@ -8523,7 +8561,11 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                     // SAFETY: [P-HANDOFF] `state` was validated for the scheduled Thread's Process
                     // and `stack` was bound just above; the callee rechecks both bindings.
                     unsafe {
-                        crate::arch::x86_64::syscall::enter_bound_validated_user(&state, stack)
+                        crate::arch::x86_64::syscall::enter_bound_validated_user(
+                            &state,
+                            stack,
+                            self.runtime.guard_free(),
+                        )
                     }
                 }
                 Some(Entry::Continuation { stack, rsp }) => {
@@ -8538,7 +8580,12 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                     );
                     // SAFETY: [P-HANDOFF] `rsp` is the scheduled Thread's saved continuation and
                     // its stack is bound above; this idle frame is abandoned.
-                    unsafe { crate::arch::x86_64::context::abandon_to_kernel_continuation(rsp) }
+                    unsafe {
+                        crate::arch::x86_64::syscall::abandon_to_kernel_continuation(
+                            rsp,
+                            self.runtime.guard_free(),
+                        )
+                    }
                 }
                 None => {
                     let idle = crate::arch::x86_64::idle::prepare_current_idle()
@@ -9246,7 +9293,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                 out_result,
                 result_size,
             } => {
-                self.assert_guard_free_external_work();
                 let mut user = self.active.current_process_address_space(
                     self.active_root.as_ref().expect("active root"),
                     self.process,
@@ -9365,7 +9411,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                 NativeSyscallResult::returning(status)
             }
             request => {
-                self.assert_guard_free_external_work();
                 let dispatch = {
                     let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
                     let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
@@ -9522,7 +9567,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn handle_fallthrough(&mut self, request: NativeSyscallRequest) -> NativeSyscallResult {
-        self.assert_guard_free_external_work();
         match request {
             NativeSyscallRequest::AbiGetInfo {
                 out_info,
@@ -9916,7 +9960,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         out_address: deepwyrm_abi::DwUserAddress,
     ) -> deepwyrm_abi::DwStatus {
         let phase = self.reserve_runtime_phase();
-        self.assert_guard_free_external_work();
         let status = (|| {
             let mut user = self.active.current_process_address_space(
                 self.active_root.as_ref().expect("active root"),
@@ -10064,7 +10107,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         byte_len: u64,
     ) -> deepwyrm_abi::DwStatus {
         let phase = self.reserve_runtime_phase();
-        self.assert_guard_free_external_work();
         let status = (|| {
             let prepared = match crate::syscall::prepare_address_region_mutation(
                 &mut self.registry,
@@ -10142,7 +10184,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         protections: u32,
     ) -> deepwyrm_abi::DwStatus {
         let phase = self.reserve_runtime_phase();
-        self.assert_guard_free_external_work();
         let status = (|| {
             let prepared = match crate::syscall::prepare_address_region_mutation(
                 &mut self.registry,
@@ -10215,7 +10256,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     fn exit_process(&mut self, exit_code: u32) -> NativeSyscallResult {
         let phase = self.reserve_runtime_phase();
-        self.assert_guard_free_external_work();
         #[cfg(deepwyrm_i1_evidence)]
         let exiting_claim = self.shared.execution.running_claim_on(self.cpu);
         let mut discarded: [Option<user_access::OwnedLiveUserOutput>; THREADS] =
@@ -10294,7 +10334,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             Err(()) => return ProcessTerminationPreparation::Retry,
         };
         let phase = self.reserve_runtime_phase();
-        self.assert_guard_free_external_work();
         #[cfg(deepwyrm_i1_evidence)]
         let exiting_claim = self.shared.execution.running_claim_on(self.cpu);
         let mut prepared = match self.prepare_process_exit_with_wait_cleanup(exit_code) {
@@ -10397,7 +10436,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         code: u32,
     ) -> NativeSyscallResult {
         let phase = self.reserve_runtime_phase();
-        self.assert_guard_free_external_work();
         let prepared =
             match self.prepare_process_termination_with_wait_cleanup(process, reason, code) {
                 Ok(prepared) => prepared,
@@ -10445,7 +10483,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
         };
         let phase = self.reserve_runtime_phase();
-        self.assert_guard_free_external_work();
         let mut prepared =
             match self.prepare_process_termination_with_wait_cleanup(process, reason, code) {
                 Ok(prepared) => prepared,
@@ -10702,7 +10739,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
         };
         let phase = self.reserve_runtime_phase();
-        self.assert_guard_free_external_work();
         let mut prepared =
             match self.prepare_task_group_termination_with_wait_cleanup(task_group, reason) {
                 Ok(prepared) => prepared,
@@ -10954,7 +10990,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         code: u32,
     ) -> NativeSyscallResult {
         let phase = self.reserve_runtime_phase();
-        self.assert_guard_free_external_work();
         let mut discarded: [Option<user_access::OwnedLiveUserOutput>; 1] = [None];
         let mut atomic_pins: [Option<user_access::OwnedLiveAtomicU32>; 1] = [None];
         let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
@@ -11014,7 +11049,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
         };
         let phase = self.reserve_runtime_phase();
-        self.assert_guard_free_external_work();
         let mut prepared =
             match self.prepare_thread_termination_with_wait_cleanup(thread, reason, code) {
                 Ok(prepared) => prepared,

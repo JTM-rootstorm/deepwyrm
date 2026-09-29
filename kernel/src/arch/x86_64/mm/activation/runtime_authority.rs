@@ -22,6 +22,8 @@ use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use super::GuardFree;
+
 /// The ticket pair, `repr(C)` so `serving` sits exactly one word after
 /// `next_ticket`.
 ///
@@ -123,6 +125,17 @@ impl<T> RuntimeAuthorityHandle<'_, T> {
     /// handle until it drops.
     pub(super) fn lock(&mut self) -> RuntimeAuthorityGuard<'_, T> {
         self.lock.lock()
+    }
+
+    /// Certifies that this CPU holds no runtime-authority guard. Refused by
+    /// the borrow checker while a guard from this handle is alive.
+    pub(super) fn guard_free(&mut self) -> GuardFree<'_> {
+        // SAFETY: this handle is its CPU's only way to acquire the lock (`handles` mints one per
+        // CPU, once, and `lock(&self)` is private to this module), and a guard mutably borrows the
+        // handle for its whole life. `&mut self` here therefore proves no guard of this CPU is
+        // alive, and the token's borrow of the handle keeps one from being acquired before the
+        // token is consumed.
+        unsafe { GuardFree::assume() }
     }
 }
 

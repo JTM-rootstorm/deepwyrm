@@ -1,6 +1,8 @@
 //! DW0-E4 x86_64 privilege transition, SYSCALL, and IRETQ contracts.
 
 mod frame;
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+mod guard_free;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod live;
 mod msr;
@@ -10,7 +12,10 @@ mod runtime_binding;
 mod stationary_runtime;
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub(crate) use stationary_runtime::{RuntimePhaseReservation, StationaryGuardDepth};
+pub(crate) use stationary_runtime::RuntimePhaseReservation;
+
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+pub(crate) use guard_free::GuardFree;
 
 #[allow(
     unused_imports,
@@ -44,11 +49,12 @@ pub(crate) use live::detached_idle_entry_rip;
     reason = "E4 target entry is wired into primordial runtime and E5 syscall adapters in later E work"
 )]
 pub(crate) use live::{
-    SyscallInstallError, bind_current_thread_stack, bind_native_runtime_carrier_for_slot,
-    bind_native_runtime_user_exception_handler, bind_running_native_runtime_carrier_for_slot,
-    current_binding_generation, current_cpu_index_for_diagnostics,
-    current_cpu_index_for_scheduler_request, current_cpu_is_on_terminal_reaper_stack,
-    current_native_usercopy_is_quiescent, enter_bound_idle_scheduler, enter_bound_validated_user,
+    SyscallInstallError, abandon_to_kernel_continuation, bind_current_thread_stack,
+    bind_native_runtime_carrier_for_slot, bind_native_runtime_user_exception_handler,
+    bind_running_native_runtime_carrier_for_slot, current_binding_generation,
+    current_cpu_index_for_diagnostics, current_cpu_index_for_scheduler_request,
+    current_cpu_is_on_terminal_reaper_stack, current_native_usercopy_is_quiescent,
+    enter_bound_idle_scheduler, enter_bound_idle_scheduler_guard_free, enter_bound_validated_user,
     enter_native_syscall_runtime, first_run_thread_entry_rip,
     handoff_current_rendezvous_from_carrier, install_syscall_boundary,
     install_syscall_boundary_for_slot, native_runtime_carrier_lifecycle,
