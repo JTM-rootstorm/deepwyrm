@@ -15,8 +15,28 @@
 # S2K SAFETY pass (2026-09-27): both text rows fell to 0 (47 and 86). Every
 # block now carries a SAFETY comment; the ones marked `UNVERIFIED (S2K)` count
 # as documented here but state an open soundness question, not a proof.
+#
+# Orphaned-test rows (S2K-0, 2026-09-28): `#[test]` attributes in files only a
+# `target_os = "none"` build compiles (`TARGET_ONLY_FILES`). No host test build
+# sees them and the target has no harness, so every row stays 0: move a test
+# and the pure code it tests into a host-compiled module instead.
 
 deepwyrm-kernel clippy::undocumented_unsafe_blocks 240
 deepwyrm-kernel clippy::wildcard_enum_match_arm 88
 kernel/src/arch/x86_64/mm/activation/primordial.rs unsafe-block-without-safety-comment 0
 kernel/src/arch/x86_64/syscall/live.rs unsafe-block-without-safety-comment 0
+kernel/src/arch/x86_64/apic_live.rs test-attribute-in-target-only-file 0
+kernel/src/arch/x86_64/entry.rs test-attribute-in-target-only-file 0
+kernel/src/arch/x86_64/mm/activation/primordial.rs test-attribute-in-target-only-file 0
+kernel/src/arch/x86_64/mm/activation/test_support.rs test-attribute-in-target-only-file 0
+kernel/src/arch/x86_64/mm/activation/test_support/e7.rs test-attribute-in-target-only-file 0
+kernel/src/arch/x86_64/mm/activation/test_support/f12.rs test-attribute-in-target-only-file 0
+kernel/src/arch/x86_64/mm/activation/test_support/f9.rs test-attribute-in-target-only-file 0
+kernel/src/arch/x86_64/mm/activation/user_access.rs test-attribute-in-target-only-file 0
+kernel/src/arch/x86_64/power.rs test-attribute-in-target-only-file 0
+kernel/src/arch/x86_64/syscall/live.rs test-attribute-in-target-only-file 0
+kernel/src/time/live.rs test-attribute-in-target-only-file 0
+kernel/src/time/live/probes.rs test-attribute-in-target-only-file 0
+kernel/src/test_support/memory.rs test-attribute-in-target-only-file 0
+kernel/src/test_support/task.rs test-attribute-in-target-only-file 0
+kernel/src/test_support/x86_64.rs test-attribute-in-target-only-file 0

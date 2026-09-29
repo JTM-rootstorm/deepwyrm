@@ -1098,6 +1098,38 @@ let w = unsafe { i() };
 }
 
 #[test]
+fn the_lint_ratchet_counts_test_attributes_only_where_code_opens_them() {
+    let source = "\
+#[test]
+fn a() {}
+    #[test]
+    fn b() {}
+// #[test] in a comment
+let text = \"#[test]\";
+#[cfg(test)]
+#[test_case]
+";
+    assert_eq!(count_test_attributes(source), 2);
+}
+
+#[test]
+fn every_target_only_file_exists_and_has_a_zero_test_row() {
+    let source = fs::read_to_string(workspace_root().join(LINT_RATCHET_BASELINE)).unwrap();
+    let baseline = parse_ratchet_baseline(&source).unwrap();
+    for file in TARGET_ONLY_FILES {
+        assert!(
+            workspace_root().join(file).is_file(),
+            "{file} is listed as target-only but does not exist"
+        );
+        assert_eq!(
+            baseline.get(&(file.to_owned(), TEST_TEXT_COUNTER.to_owned())),
+            Some(&0),
+            "{file} has no zero orphaned-test row"
+        );
+    }
+}
+
+#[test]
 fn the_lint_ratchet_fails_rises_and_reports_falls() {
     let key = |scope: &str| (scope.to_owned(), "lint".to_owned());
     let baseline = BTreeMap::from([(key("a"), 5), (key("b"), 5), (key("c"), 5)]);

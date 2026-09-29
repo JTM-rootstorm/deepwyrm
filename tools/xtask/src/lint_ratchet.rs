@@ -7,7 +7,11 @@
 //! - a text count of `unsafe {` blocks without a `// SAFETY:` comment in the
 //!   four preceding lines, for `SAFETY_TEXT_FILES`. Those files are
 //!   `target_os = "none"` only, so host Clippy never sees them, and the target
-//!   toolchain ships no Clippy.
+//!   toolchain ships no Clippy;
+//! - a text count of `#[test]` attributes in `TARGET_ONLY_FILES`, whose
+//!   baseline is zero. No host test build compiles those files and the target
+//!   has no test harness, so a test there never runs (S2K-0 moved the four
+//!   that had accumulated).
 //!
 //! The gate fails when any count exceeds its baseline (a key absent from the
 //! baseline has baseline zero), and names every count that fell so the
@@ -25,6 +29,35 @@ pub(super) const SAFETY_TEXT_COUNTER: &str = "unsafe-block-without-safety-commen
 pub(super) const SAFETY_TEXT_FILES: [&str; 2] = [
     "kernel/src/arch/x86_64/mm/activation/primordial.rs",
     "kernel/src/arch/x86_64/syscall/live.rs",
+];
+
+/// The orphaned-test counter's key for one file.
+pub(super) const TEST_TEXT_COUNTER: &str = "test-attribute-in-target-only-file";
+/// Kernel source files that only a `target_os = "none"` build compiles: their
+/// module declarations are target-gated without `test`, or they sit under a
+/// module that is. No host test build (workspace or any selector) sees them.
+///
+/// Derived at S2K-0 (deepwyrm 4341464) from every `mod` declaration in
+/// `kernel/src` whose cfg names `target_os = "none"` without `test`, and
+/// their child modules; the list starts from S1's list of code host Clippy
+/// never sees. A new target-only file must be added here: the list cannot
+/// discover one by itself.
+pub(super) const TARGET_ONLY_FILES: [&str; 15] = [
+    "kernel/src/arch/x86_64/apic_live.rs",
+    "kernel/src/arch/x86_64/entry.rs",
+    "kernel/src/arch/x86_64/mm/activation/primordial.rs",
+    "kernel/src/arch/x86_64/mm/activation/test_support.rs",
+    "kernel/src/arch/x86_64/mm/activation/test_support/e7.rs",
+    "kernel/src/arch/x86_64/mm/activation/test_support/f12.rs",
+    "kernel/src/arch/x86_64/mm/activation/test_support/f9.rs",
+    "kernel/src/arch/x86_64/mm/activation/user_access.rs",
+    "kernel/src/arch/x86_64/power.rs",
+    "kernel/src/arch/x86_64/syscall/live.rs",
+    "kernel/src/time/live.rs",
+    "kernel/src/time/live/probes.rs",
+    "kernel/src/test_support/memory.rs",
+    "kernel/src/test_support/task.rs",
+    "kernel/src/test_support/x86_64.rs",
 ];
 
 /// `(scope, counter)`: a package and lint, or a file and the text counter.
@@ -62,6 +95,15 @@ pub(super) fn run_lint_ratchet() -> io::Result<u8> {
         current.insert(
             (file.to_owned(), SAFETY_TEXT_COUNTER.to_owned()),
             count_unsafe_blocks_without_safety_comment(&source),
+        );
+    }
+    // A listed file that no longer exists is an error, not a zero: a rename
+    // would otherwise drop the file from this counter silently.
+    for file in TARGET_ONLY_FILES {
+        let source = fs::read_to_string(workspace.join(file))?;
+        current.insert(
+            (file.to_owned(), TEST_TEXT_COUNTER.to_owned()),
+            count_test_attributes(&source),
         );
     }
     let baseline_source = fs::read_to_string(workspace.join(LINT_RATCHET_BASELINE))?;
@@ -166,6 +208,15 @@ pub(super) fn count_unsafe_blocks_without_safety_comment(source: &str) -> usize 
             if documented { 0 } else { blocks }
         })
         .sum()
+}
+
+/// Counts lines whose code opens with a `#[test]` attribute, so a mention in
+/// a comment or string does not count.
+pub(super) fn count_test_attributes(source: &str) -> usize {
+    source
+        .lines()
+        .filter(|line| line.trim_start().starts_with("#[test]"))
+        .count()
 }
 
 /// Counts `RATCHET_LINTS` findings in Cargo's JSON message stream per package,
