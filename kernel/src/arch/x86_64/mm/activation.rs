@@ -76,6 +76,11 @@ mod primordial;
 ))]
 #[path = "activation/primordial_diagnostic.rs"]
 mod primordial_diagnostic;
+// The e2 TLB mailbox `user_access.rs` uses, host-compiled under `test` so its
+// tests run (S2K-0).
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+#[path = "activation/tlb_mailbox.rs"]
+mod tlb_mailbox;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[path = "activation/user_access.rs"]
 mod user_access;
