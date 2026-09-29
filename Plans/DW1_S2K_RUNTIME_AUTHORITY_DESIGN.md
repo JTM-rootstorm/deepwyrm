@@ -1,6 +1,6 @@
 # DW1 S2K Runtime Authority Design
 
-**Status:** proposed; awaiting Mike's approval (no S2K implementation before approval)
+**Status:** approved by Mike on 2026-09-28, with the decisions in §11. §11 overrides §5.2, §5.3 and §8 where they differ.
 
 **Plan:** root `DW1_WYR1_STRUCTURAL_REFACTOR_PLAN.md` §4 S2K
 **Prepared:** 2026-09-27 by the S2K-design worker (Claude Opus 5.5)
@@ -530,3 +530,49 @@ All of these are semantic. Each needs its own approval and SMP VM evidence.
 - Nothing here claims R4, R5, R6 or R7 outcomes, or DW1/WYR1 closure.
 - The step boundaries are proposals. Mike's approval, not this document,
   authorizes any S2K implementation.
+
+## 11. Mike's decisions (2026-09-28)
+
+Mike's instruction: "Proceed with the most proper solution we have at the time
+for all items in S2K -- no temporary bandaids." Applied to §8:
+
+1. **The design is approved.** S2K-0 through S2K-5 proceed as §5.1 stages them.
+2. **S2K-6 proceeds inside S2**, after S2K-0 through S2K-5 are green. The
+   finding-4 probe (§5.2) runs first, and its answer is recorded in S2K-6's
+   commit message as the named behavior change or its absence.
+3. **The unused stationary types are deleted** (S2K-1).
+4. **The lane is widened to all three files:** `kernel/src/test_support/x86_64.rs`
+   for S2K-0, and `kernel/src/syscall/native.rs` and
+   `kernel/src/task/scheduler/carrier_admission.rs`. D5 (rows 76 and 102) is
+   therefore not deferred. Those rows are type-enforced in S2, not left KEEP.
+5. **The I1 foundation is marked superseded** by this design, and the three stale
+   "APs parked" statements (§3) are corrected.
+6. **The H0 §12.8 / C0 §6 conflict is resolved by D1, not by amending H0.**
+   Recording the coarse lock as an accepted bridge would be the temporary
+   measure the instruction rules out.
+   - D1 (lock decomposition, §5.3) moves out of the deferred list and follows
+     S2K-6.
+   - H0 §12.8 stands as written: no runtime lock is held across usercopy.
+   - D1 starts with a short design addendum in this file: the measured borrow
+     set of each syscall family, and the prepare/commit split for each.
+     Implementation follows it. Each semantic commit carries its own SMP VM
+     evidence, per §5.3.
+7. **The S2K SAFETY pass's findings get proper fixes, not comments.** They are
+   recorded in root `DW1_WYR1_S2_SEAMS_RECORD.md` §1 S2K and in the
+   `UNVERIFIED (S2K)` comments. Each fix is its own named semantic commit.
+   - **F1:** the facades' admission state is set before carrier pointers are
+     published, or the facades are held behind raw pointers from creation, so
+     no `&mut` is taken after publication.
+   - **Idle halts:** drop `nomem` from both `sti; hlt; cli` sequences.
+   - **`iret_validated_user`'s 40-byte push:** measure it on the release kernel,
+     and make the path correct by construction whatever codegen does.
+   - **The quantum-expiry reborrow:** fixed by the per-CPU ownership S2K-6
+     establishes, or directly if S2K-6 does not reach it.
+   - **`copy_module`:** use `MaybeUninit`-correct writes.
+
+   Each `UNVERIFIED (S2K)` comment is replaced by a real justification when its
+   fix lands.
+
+D2 (terminal engine) and D3 (owned paging transaction) were not questions to
+Mike. They stay deferred until after the S3 reassessment. D4 remains outside
+this plan's authority.
