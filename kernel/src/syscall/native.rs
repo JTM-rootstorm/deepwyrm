@@ -953,6 +953,60 @@ pub(crate) enum NativePreemptionPlan<'owner> {
     Switch(crate::arch::x86_64::context::KernelSwitchPlan<'owner>),
 }
 
+/// A divergent entry's handle on this CPU's carrier ([DIVERGENT] in
+/// `syscall/live.rs`, closing the former [CARRIER] gap (1), S2K-6).
+///
+/// A divergent entry never returns, so a `&mut self` receiver would leave a
+/// function-argument reference, protected for the callee's whole run, in a
+/// frame that is abandoned rather than returned from; the carrier's later
+/// reborrows through its published pointer would then conflict with that
+/// protector under Stacked and Tree Borrows. This handle carries the same
+/// unique borrow as a raw pointer, which passing does not retag or protect.
+/// The entry turns it into a local `&mut` with `into_mut`; a local is never
+/// protected, so abandoning the frame leaves nothing for a later reborrow to
+/// conflict with. Neither `Clone` nor `Copy`.
+pub(crate) struct DivergentCarrier<'a, R> {
+    carrier: core::ptr::NonNull<R>,
+    _borrow: core::marker::PhantomData<&'a mut R>,
+}
+
+impl<'a, R> DivergentCarrier<'a, R> {
+    /// A carrier already uniquely borrowed for `'a`, handed to another
+    /// divergent entry.
+    pub(crate) fn from_mut(carrier: &'a mut R) -> Self {
+        Self {
+            carrier: core::ptr::NonNull::from(carrier),
+            _borrow: core::marker::PhantomData,
+        }
+    }
+
+    /// # Safety
+    ///
+    /// `carrier` is this CPU's published carrier, valid for `'a`, and no
+    /// reference to it is live in any frame that will resume.
+    #[allow(
+        unsafe_code,
+        reason = "the unchecked constructor states a published-carrier fact no type here can see"
+    )]
+    pub(crate) const unsafe fn published(carrier: core::ptr::NonNull<R>) -> Self {
+        Self {
+            carrier,
+            _borrow: core::marker::PhantomData,
+        }
+    }
+
+    /// The carrier for the rest of the divergent entry, as a local reference.
+    #[allow(
+        unsafe_code,
+        reason = "the handle carries a unique borrow for 'a by construction"
+    )]
+    pub(crate) fn into_mut(self) -> &'a mut R {
+        // SAFETY: `from_mut` took a unique `&'a mut R`, and `published`'s caller vouched for the
+        // same; the handle is consumed here, so this is that borrow's only use.
+        unsafe { &mut *self.carrier.as_ptr() }
+    }
+}
+
 /// One CPU's quantum-expiry publisher. Expiry is published from the timer
 /// interrupt and from synchronous quantum cancellation, both of which can run
 /// while this CPU's runtime is borrowed by a suspended frame that will resume
@@ -1145,19 +1199,26 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
     /// reaper-stack handoff after this method returns.
     fn user_exception(&mut self, record: crate::arch::x86_64::exceptions::UserExceptionRecord);
 
-    fn terminate_current(&mut self) -> !;
+    fn terminate_current(this: DivergentCarrier<'_, Self>) -> !
+    where
+        Self: Sized;
 
     /// Enters userspace for the scheduler-selected Thread whose kernel
     /// continuation slot is still zero. Called only from the fixed trusted
     /// first-run kernel continuation after the context-switch boundary has
     /// already bound that Thread's owned kernel stack.
-    fn enter_scheduled_fresh_thread(&mut self) -> !;
+    fn enter_scheduled_fresh_thread(this: DivergentCarrier<'_, Self>) -> !
+    where
+        Self: Sized;
 
     /// Acquires work for a CPU that entered the live runtime from its private
     /// AP bootstrap stack rather than from an existing Thread continuation.
     /// Implementations must remain cooperative: an idle CPU may claim Runnable
     /// work, but this entry does not displace a Running Thread.
-    fn enter_idle_scheduler(&mut self) -> ! {
+    fn enter_idle_scheduler(_this: DivergentCarrier<'_, Self>) -> !
+    where
+        Self: Sized,
+    {
         panic!("native runtime does not admit idle-CPU scheduler entry")
     }
 
@@ -1239,10 +1300,12 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
 /// return to the interrupted user context.
 pub(crate) trait NativeRendezvousRuntime {
     fn rendezvous_stop(
-        &mut self,
+        this: DivergentCarrier<'_, Self>,
         request: crate::arch::x86_64::rendezvous::StopRequest,
         reaper: crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry,
-    ) -> !;
+    ) -> !
+    where
+        Self: Sized;
 }
 
 pub(crate) fn dispatch_frame<R: NativeSyscallFrameRuntime>(

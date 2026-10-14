@@ -273,11 +273,11 @@ impl NativeSyscallFrameRuntime for FrameRuntime {
         panic!("unexpected synthetic user exception")
     }
 
-    fn terminate_current(&mut self) -> ! {
+    fn terminate_current(_this: DivergentCarrier<'_, Self>) -> ! {
         panic!("unexpected synthetic termination")
     }
 
-    fn enter_scheduled_fresh_thread(&mut self) -> ! {
+    fn enter_scheduled_fresh_thread(_this: DivergentCarrier<'_, Self>) -> ! {
         panic!("unexpected synthetic fresh-thread entry")
     }
 
@@ -414,11 +414,11 @@ impl NativeSyscallFrameRuntime for SuspendingRuntime {
         panic!("unexpected suspended user exception")
     }
 
-    fn terminate_current(&mut self) -> ! {
+    fn terminate_current(_this: DivergentCarrier<'_, Self>) -> ! {
         panic!("suspended dispatch must not terminate")
     }
 
-    fn enter_scheduled_fresh_thread(&mut self) -> ! {
+    fn enter_scheduled_fresh_thread(_this: DivergentCarrier<'_, Self>) -> ! {
         panic!("direct dispatch test never launches a fresh Thread")
     }
 

@@ -359,7 +359,7 @@ fn i1_post_ack_carrier_never_reuses_a_retired_frame_for_late_holdsafe() {
     assert!(continuation.contains("terminal_reaper_next_on(self.cpu)"));
 
     let idle = primordial
-        .split_once("fn enter_idle_scheduler(&mut self) -> !")
+        .split_once("fn enter_idle_scheduler(this: DivergentCarrier<'_, Self>) -> !")
         .expect("kernel-root idle path")
         .1
         .split_once("unsafe fn prepare_suspend")
@@ -610,7 +610,7 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
     assert!(runtime.contains("fn complete_physical_switch_handoff(&mut self)"));
     assert!(runtime.contains(".complete_switch_on(outgoing)"));
     let fresh = runtime
-        .rsplit_once("fn enter_scheduled_fresh_thread(&mut self) -> !")
+        .rsplit_once("fn enter_scheduled_fresh_thread(this: DivergentCarrier<'_, Self>) -> !")
         .expect("live fresh-thread entry")
         .1
         .split_once("fn publish_scheduler_idle")
@@ -620,7 +620,7 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
         .find("runtime.complete_physical_switch_handoff()")
         .unwrap();
     let fresh_sync = fresh
-        .find("self.synchronize_scheduler_current_detached();")
+        .find("if !this.synchronize_scheduler_current_at_safe_point_detached() {")
         .unwrap();
     let fresh_notify = fresh
         .find("crate::task::notify_completed_switch_runnable(publication);")
@@ -752,28 +752,22 @@ fn i1_detached_scheduler_sync_honors_terminal_stop_publication() {
     let live = source("src/arch/x86_64/syscall/live.rs");
     let syscall = source("src/arch/x86_64/syscall.rs");
 
-    let detached = runtime
-        .split_once("fn synchronize_scheduler_current_detached(&mut self)")
-        .expect("detached scheduler synchronization")
-        .1
-        .split_once("fn finish_scheduler_root_switch_detached(")
-        .expect("detached scheduler synchronization boundary")
-        .0;
-    assert!(detached.contains("self.synchronize_scheduler_current_at_safe_point_detached()"));
-    assert!(
-        detached
-            .contains(
-                "crate::arch::x86_64::syscall::handoff_current_rendezvous_from_carrier(\n                self.runtime.guard_free(),\n            )",
-            )
-    );
-    assert!(!detached.contains("runtime.prepare_scheduler_root_switch()"));
+    // S2K-6 ([DIVERGENT] in live.rs): each detached scheduler-root entry runs the safe-point
+    // synchronization and, on a published Stop, the rendezvous handoff in its own frame, not
+    // behind a `&mut self` helper.
+    let stop_arm = "if !this.synchronize_scheduler_current_at_safe_point_detached() {";
     assert_eq!(
-        runtime
-            .matches("self.synchronize_scheduler_current_detached();")
-            .count(),
+        runtime.matches(stop_arm).count(),
         3,
         "every detached scheduler-root entry must share Stop arbitration"
     );
+    for entry in runtime.split(stop_arm).skip(1) {
+        let handoff = entry.split_once('}').expect("detached Stop arm").0;
+        assert!(handoff.contains("handoff_current_rendezvous_from_carrier("));
+        assert!(handoff.contains("this.runtime.guard_free()"));
+        assert!(!handoff.contains("runtime.prepare_scheduler_root_switch()"));
+    }
+    assert!(!runtime.contains("fn synchronize_scheduler_current_detached("));
 
     let safe = runtime
         .split_once("fn synchronize_scheduler_current_at_safe_point_detached(")
@@ -1253,7 +1247,7 @@ fn live_timer_expiry_is_bound_and_serviced_only_from_carrier_safe_points() {
         .expect("timer-return reschedule decision");
     assert!(expiry_service < reschedule);
     let idle_scheduler = shared_carrier
-        .split_once("fn enter_idle_scheduler(&mut self) -> !")
+        .split_once("fn enter_idle_scheduler(this: DivergentCarrier<'_, Self>) -> !")
         .expect("shared native carrier idle scheduler")
         .1
         .split_once("unsafe fn prepare_suspend")
@@ -1263,9 +1257,9 @@ fn live_timer_expiry_is_bound_and_serviced_only_from_carrier_safe_points() {
         .find("runtime.service_pending_timer_expiries_on_bootstrap();")
         .expect("kernel-root idle expiry service");
     let idle_schedule = idle_scheduler
-        .find(".schedule_next_on(self.cpu)")
+        .find(".schedule_next_on(this.cpu)")
         .expect("kernel-root idle scheduler decision");
-    assert!(idle_scheduler.contains("self.cpu == crate::cpu::CpuIndex::BOOTSTRAP"));
+    assert!(idle_scheduler.contains("this.cpu == crate::cpu::CpuIndex::BOOTSTRAP"));
     assert!(idle_expiry_service < idle_schedule);
     assert!(idle_scheduler.contains(
         ".current\n            };\n            crate::task::drain_runnable_work_notifications();"
@@ -1904,7 +1898,7 @@ fn i1_runtime_join_keeps_cpu_identity_and_dispatch_release_separate() {
     assert!(primordial.contains("current_thread_on(self.cpu)"));
     assert!(primordial.contains("prepare_process_root_selection(self.cpu"));
     assert!(primordial.contains("terminal_reaper_next_on(self.cpu)"));
-    assert!(primordial.contains("schedule_next_on(self.cpu)"));
+    assert!(primordial.contains("schedule_next_on(this.cpu)"));
     assert!(primordial.contains("begin_execution(cpu_index)"));
     assert!(primordial.contains("idle::enable_live_cpu(cpu)"));
     assert!(execution.contains("pub(crate) fn terminal_reaper_next_on"));
@@ -2230,17 +2224,17 @@ fn daybreak_production_execution_exposes_no_raw_safe_continuation_seed() {
 fn dw1c_detach_commits_its_root_flight_without_ordinary_cpu_reselection() {
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
     let detach = primordial
-        .split_once("fn enter_idle_scheduler(&mut self) -> !")
+        .split_once("fn enter_idle_scheduler(this: DivergentCarrier<'_, Self>) -> !")
         .expect("live idle scheduler")
         .1
-        .split_once("if !self.admission_entered")
+        .split_once("if !this.admission_entered")
         .expect("AP admission boundary")
         .0;
     let prepare = detach
         .find("runtime.prepare_terminal_kernel_root_switch()")
         .expect("detach prepares its root-switch flight");
     let execute = detach[prepare..]
-        .find("prepared.execute(self.runtime.guard_free())")
+        .find("prepared.execute(this.runtime.guard_free())")
         .map(|offset| prepare + offset)
         .expect("detach executes its root-switch flight");
     let commit = detach[execute..]
@@ -2250,8 +2244,8 @@ fn dw1c_detach_commits_its_root_flight_without_ordinary_cpu_reselection() {
 
     assert!(prepare < execute && execute < commit);
     assert!(
-        detach[execute..commit].contains("guard.on_root_switch_flight(&mut self.owned)")
-            && !detach[execute..commit].contains("guard.on(&mut self.owned)"),
+        detach[execute..commit].contains("guard.on_root_switch_flight(&mut this.owned)")
+            && !detach[execute..commit].contains("guard.on(&mut this.owned)"),
         "the executed root-switch flight must be committed by its flight carrier"
     );
 }
@@ -2264,14 +2258,14 @@ fn dw1c_detach_commits_its_root_flight_without_ordinary_cpu_reselection() {
 fn dw1c1_ap_carrier_enters_its_exact_kernel_root_before_ready_publication() {
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
     let idle = primordial
-        .split_once("fn enter_idle_scheduler(&mut self) -> !")
+        .split_once("fn enter_idle_scheduler(this: DivergentCarrier<'_, Self>) -> !")
         .expect("live idle carrier")
         .1
         .split_once("\n    }\n")
         .expect("live idle carrier extent")
         .0;
     let root = idle
-        .find("let executing = self.enter_ap_kernel_root_detached();")
+        .find("let executing = this.enter_ap_kernel_root_detached();")
         .unwrap();
     let resources = idle.find("carrier_resource_tuple(").unwrap();
     let ready = idle
@@ -2300,7 +2294,7 @@ fn dw1c1_terminal_handoff_executes_every_root_switch_outside_the_runtime_guard()
     }
 
     let facade = primordial
-        .rsplit_once("fn terminate_current(&mut self) -> !")
+        .rsplit_once("fn terminate_current(this: DivergentCarrier<'_, Self>) -> !")
         .expect("runtime facade terminal path")
         .1
         .split_once("fn enter_scheduled_fresh_thread")
@@ -2319,10 +2313,10 @@ fn dw1c1_terminal_handoff_executes_every_root_switch_outside_the_runtime_guard()
     ] {
         let commit = facade.find(commit).unwrap();
         let reacquire = facade[..commit]
-            .rfind("let mut guard = self.runtime.lock()")
+            .rfind("let mut guard = this.runtime.lock()")
             .unwrap();
         assert!(
-            facade[reacquire..commit].contains("guard.on_root_switch_flight(&mut self.owned)"),
+            facade[reacquire..commit].contains("guard.on_root_switch_flight(&mut this.owned)"),
             "terminal root commit bypassed its flight carrier"
         );
     }
@@ -2333,9 +2327,9 @@ fn dw1c1_terminal_handoff_executes_every_root_switch_outside_the_runtime_guard()
     ] {
         let cancel = facade.find(cancel).unwrap();
         let reacquire = facade[..cancel]
-            .rfind("let mut guard = self.runtime.lock()")
+            .rfind("let mut guard = this.runtime.lock()")
             .unwrap();
-        assert!(facade[reacquire..cancel].contains("guard.on_root_switch_flight(&mut self.owned)"));
+        assert!(facade[reacquire..cancel].contains("guard.on_root_switch_flight(&mut this.owned)"));
     }
     assert!(primordial.contains("self.assert_root_switch_flight(executed.flight)"));
     assert!(primordial.contains("self.assert_root_switch_flight(failure.flight)"));

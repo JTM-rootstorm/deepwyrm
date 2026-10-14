@@ -111,7 +111,7 @@ fn h2_user_exception_stages_before_the_cpu_private_reaper_then_mutates_runtime()
         .find("runtime.user_exception(record);")
         .expect("reaper delivers staged user exception");
     let terminate = reaper
-        .find("runtime.terminate_current()")
+        .find("R::terminate_current(DivergentCarrier::from_mut(runtime))")
         .expect("reaper terminal reclaim");
     assert!(user_exception < terminate);
     assert!(reaper.contains("take_terminal_action()"));
@@ -640,7 +640,7 @@ fn dw1b_syscall_return_accounts_due_budget_before_preemption_and_rearm() {
         .split_once("fn drain_quantum_cancellation_detached(&mut self)")
         .expect("DW1-C2 detached physical cancellation")
         .1
-        .split_once("fn synchronize_scheduler_current_detached")
+        .split_once("fn finish_scheduler_root_switch_detached(")
         .expect("DW1-C2 detached physical cancellation extent")
         .0;
     let take = detached_cancel

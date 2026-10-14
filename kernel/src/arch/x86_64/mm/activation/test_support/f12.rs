@@ -1562,7 +1562,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     for F12Runtime<'_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
     fn rendezvous_stop(
-        &mut self,
+        _this: crate::syscall::native::DivergentCarrier<'_, Self>,
         _request: crate::arch::x86_64::rendezvous::StopRequest,
         _reaper: crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry,
     ) -> ! {
@@ -1604,41 +1604,43 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         fail(0x100 | (record.vector & 0x0f))
     }
 
-    fn terminate_current(&mut self) -> ! {
+    fn terminate_current(this: crate::syscall::native::DivergentCarrier<'_, Self>) -> ! {
+        let this = this.into_mut();
         crate::syscall::complete_deferred_current_reclaim_on(
-            &mut self.registry,
-            self.execution,
-            &self.waits,
+            &mut this.registry,
+            this.execution,
+            &this.waits,
             crate::cpu::CpuIndex::BOOTSTRAP,
-            self.deferred_current.take().unwrap_or_else(|| fail(0xf4)),
-            &mut self.cleanup,
+            this.deferred_current.take().unwrap_or_else(|| fail(0xf4)),
+            &mut this.cleanup,
         );
-        self.finish_and_pass()
+        this.finish_and_pass()
     }
 
     #[allow(
         unsafe_code,
         reason = "F12 enters the scheduler-selected producer through its validated bound context"
     )]
-    fn enter_scheduled_fresh_thread(&mut self) -> ! {
-        if self.current_index() != 1
-            || self.scenario.service_phase != 6
-            || self.scenario.producer_phase != 0
+    fn enter_scheduled_fresh_thread(this: crate::syscall::native::DivergentCarrier<'_, Self>) -> ! {
+        let this = this.into_mut();
+        if this.current_index() != 1
+            || this.scenario.service_phase != 6
+            || this.scenario.producer_phase != 0
         {
             fail(0xf5);
         }
-        let context = self
+        let context = this
             .execution
-            .load_context(self.context_ids[1])
+            .load_context(this.context_ids[1])
             .unwrap_or_else(|_| fail(0xf6));
-        let stack = self
+        let stack = this
             .execution
-            .stack_bounds(self.stack_ids[1])
+            .stack_bounds(this.stack_ids[1])
             .unwrap_or_else(|_| fail(0xf7));
         let state = {
-            let mut mappings = self
+            let mut mappings = this
                 .active
-                .current_process_address_space(&self.active_root, self.process);
+                .current_process_address_space(&this.active_root, this.process);
             crate::arch::x86_64::syscall::ValidatedUserReturn::initial(context, &mut mappings)
                 .unwrap_or_else(|_| fail(0xf8))
         };

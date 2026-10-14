@@ -527,7 +527,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     for E7SmokeRuntime<'_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
     fn rendezvous_stop(
-        &mut self,
+        _this: crate::syscall::native::DivergentCarrier<'_, Self>,
         _request: crate::arch::x86_64::rendezvous::StopRequest,
         _reaper: crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry,
     ) -> ! {
@@ -568,25 +568,26 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         fail(0x100 | (record.vector & 0x0f))
     }
 
-    fn terminate_current(&mut self) -> ! {
+    fn terminate_current(this: crate::syscall::native::DivergentCarrier<'_, Self>) -> ! {
+        let this = this.into_mut();
         crate::syscall::complete_deferred_current_reclaim_on(
-            &mut self.registry,
-            &self.execution,
-            &self.waits,
+            &mut this.registry,
+            &this.execution,
+            &this.waits,
             crate::cpu::CpuIndex::BOOTSTRAP,
-            self.deferred_current.take().unwrap_or_else(|| fail(0x8f)),
-            &mut self.cleanup,
+            this.deferred_current.take().unwrap_or_else(|| fail(0x8f)),
+            &mut this.cleanup,
         );
-        if !self.abi_seen || !self.clock_seen || !self.exit_seen {
+        if !this.abi_seen || !this.clock_seen || !this.exit_seen {
             fail(0x91);
         }
-        let process = self
+        let process = this
             .tasks
-            .process_info(self.process)
+            .process_info(this.process)
             .unwrap_or_else(|_| fail(0x92));
-        let thread = self
+        let thread = this
             .tasks
-            .thread_info(self.thread)
+            .thread_info(this.thread)
             .unwrap_or_else(|_| fail(0x93));
         if process.state != DW_TASK_STATE_EXITED
             || thread.state != DW_TASK_STATE_EXITED
@@ -597,22 +598,24 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         {
             fail(0x94);
         }
-        if self.execution.scheduler_state(self.thread).is_some() {
+        if this.execution.scheduler_state(this.thread).is_some() {
             fail(0x95);
         }
-        if self.execution.stack_bounds(self.stack_id).is_ok()
-            || self.execution.load_context(self.context_id).is_ok()
+        if this.execution.stack_bounds(this.stack_id).is_ok()
+            || this.execution.load_context(this.context_id).is_ok()
         {
             fail(0x96);
         }
-        if !self.cleanup.is_empty() {
+        if !this.cleanup.is_empty() {
             fail(0x97);
         }
-        self.finalize_task_refs();
+        this.finalize_task_refs();
         crate::test_support::complete_pass(0)
     }
 
-    fn enter_scheduled_fresh_thread(&mut self) -> ! {
+    fn enter_scheduled_fresh_thread(
+        _this: crate::syscall::native::DivergentCarrier<'_, Self>,
+    ) -> ! {
         fail(0xa5)
     }
 

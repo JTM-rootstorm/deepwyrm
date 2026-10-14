@@ -83,8 +83,8 @@ use crate::sync::IrqSpinMutex;
 #[cfg(feature = "test-support")]
 use crate::syscall::FServiceOperationOwner;
 use crate::syscall::native::{
-    NativeSyscallFrameRuntime, NativeSyscallHandler, NativeSyscallRequest, NativeSyscallResult,
-    SyscallControl,
+    DivergentCarrier, NativeSyscallFrameRuntime, NativeSyscallHandler, NativeSyscallRequest,
+    NativeSyscallResult, SyscallControl,
 };
 use crate::syscall::{
     CleanupQueue, FServiceRoute, FServiceState, NativeWaitControl, TerminalWaitCleanup,
@@ -1802,14 +1802,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let mut guard = self.runtime.lock();
         let runtime = guard.on(&mut self.owned);
         runtime.commit_local_scheduler_quantum_cancellation(ticket);
-    }
-
-    fn synchronize_scheduler_current_detached(&mut self) {
-        if !self.synchronize_scheduler_current_at_safe_point_detached() {
-            crate::arch::x86_64::syscall::handoff_current_rendezvous_from_carrier(
-                self.runtime.guard_free(),
-            )
-        }
     }
 
     fn finish_scheduler_root_switch_detached(
@@ -8294,41 +8286,46 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     for RuntimeCarrierFacade<'_, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>
 {
     fn rendezvous_stop(
-        &mut self,
+        this: DivergentCarrier<'_, Self>,
         request: crate::arch::x86_64::rendezvous::StopRequest,
         reaper: crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry,
     ) -> ! {
+        let this = this.into_mut();
         let (witness, root_switch) = {
-            let mut guard = self.runtime.lock();
-            let mut runtime = guard.on(&mut self.owned);
+            let mut guard = this.runtime.lock();
+            let mut runtime = guard.on(&mut this.owned);
             runtime.prepare_rendezvous_stop(request, reaper)
         };
-        let root_switch = match root_switch.execute(self.runtime.guard_free()) {
+        let root_switch = match root_switch.execute(this.runtime.guard_free()) {
             Ok(executed) => executed,
             Err(failure) => {
-                let mut guard = self.runtime.lock();
-                let mut runtime = guard.on_root_switch_flight(&mut self.owned);
+                let mut guard = this.runtime.lock();
+                let mut runtime = guard.on_root_switch_flight(&mut this.owned);
                 let error = runtime.cancel_stop_root_switch(failure);
                 panic!("detached remote-stop root switch failed before CR3: {error:?}")
             }
         };
         let next = {
-            let mut guard = self.runtime.lock();
-            let mut runtime = guard.on_root_switch_flight(&mut self.owned);
+            let mut guard = this.runtime.lock();
+            let mut runtime = guard.on_root_switch_flight(&mut this.owned);
             runtime.commit_rendezvous_stop(witness, root_switch)
         };
-        self.drain_quantum_cancellation_detached();
+        this.drain_quantum_cancellation_detached();
         let entry = match next {
             PreparedRendezvousNext::Idle => PreparedCarrierEntry::Idle,
             PreparedRendezvousNext::Scheduled {
                 stack,
                 continuation,
             } => {
-                self.synchronize_scheduler_current_detached();
+                if !this.synchronize_scheduler_current_at_safe_point_detached() {
+                    crate::arch::x86_64::syscall::handoff_current_rendezvous_from_carrier(
+                        this.runtime.guard_free(),
+                    )
+                }
                 if continuation == 0 {
                     let (state, stack) = {
-                        let mut guard = self.runtime.lock();
-                        let mut runtime = guard.on(&mut self.owned);
+                        let mut guard = this.runtime.lock();
+                        let mut runtime = guard.on(&mut this.owned);
                         runtime.prepare_fresh_user_entry_synchronized()
                     };
                     PreparedCarrierEntry::Fresh { state, stack }
@@ -8355,7 +8352,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     crate::arch::x86_64::syscall::enter_bound_validated_user(
                         &state,
                         bound,
-                        self.runtime.guard_free(),
+                        this.runtime.guard_free(),
                     )
                 }
             }
@@ -8374,11 +8371,13 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 unsafe {
                     crate::arch::x86_64::context::abandon_to_kernel_continuation(
                         rsp,
-                        self.runtime.guard_free(),
+                        this.runtime.guard_free(),
                     )
                 }
             }
-            PreparedCarrierEntry::Idle => self.enter_idle_scheduler(),
+            PreparedCarrierEntry::Idle => {
+                Self::enter_idle_scheduler(DivergentCarrier::from_mut(this))
+            }
         }
     }
 }
@@ -8743,27 +8742,28 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.terminate_exception_with_remote_stops(record.task_exception());
     }
 
-    fn terminate_current(&mut self) -> ! {
-        self.drain_quantum_cancellation_detached();
+    fn terminate_current(this: DivergentCarrier<'_, Self>) -> ! {
+        let this = this.into_mut();
+        this.drain_quantum_cancellation_detached();
         let mut step = {
-            let mut guard = self.runtime.lock();
-            let mut runtime = guard.on(&mut self.owned);
+            let mut guard = this.runtime.lock();
+            let mut runtime = guard.on(&mut this.owned);
             runtime.prepare_terminal_handoff_detached()
         };
         loop {
             step = match step {
                 PreparedTerminalStep::SchedulerRoot { prepared, state } => {
-                    let executed = match prepared.execute(self.runtime.guard_free()) {
+                    let executed = match prepared.execute(this.runtime.guard_free()) {
                         Ok(executed) => executed,
                         Err(failure) => {
-                            let mut guard = self.runtime.lock();
-                            let mut runtime = guard.on_root_switch_flight(&mut self.owned);
+                            let mut guard = this.runtime.lock();
+                            let mut runtime = guard.on_root_switch_flight(&mut this.owned);
                             let error = runtime.cancel_scheduler_root_switch(failure);
                             panic!("terminal scheduler root switch failed before CR3: {error:?}")
                         }
                     };
-                    let mut guard = self.runtime.lock();
-                    let mut runtime = guard.on_root_switch_flight(&mut self.owned);
+                    let mut guard = this.runtime.lock();
+                    let mut runtime = guard.on_root_switch_flight(&mut this.owned);
                     runtime.commit_scheduler_root_switch(executed);
                     PreparedTerminalStep::Final(runtime.finish_terminal_successor(state))
                 }
@@ -8771,17 +8771,17 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     prepared,
                     continuation,
                 } => {
-                    let executed = match prepared.execute(self.runtime.guard_free()) {
+                    let executed = match prepared.execute(this.runtime.guard_free()) {
                         Ok(executed) => executed,
                         Err(failure) => {
-                            let mut guard = self.runtime.lock();
-                            let mut runtime = guard.on_root_switch_flight(&mut self.owned);
+                            let mut guard = this.runtime.lock();
+                            let mut runtime = guard.on_root_switch_flight(&mut this.owned);
                             let error = runtime.cancel_terminal_kernel_root_switch(failure);
                             panic!("terminal kernel-root switch failed before CR3: {error:?}")
                         }
                     };
-                    let mut guard = self.runtime.lock();
-                    let mut runtime = guard.on_root_switch_flight(&mut self.owned);
+                    let mut guard = this.runtime.lock();
+                    let mut runtime = guard.on_root_switch_flight(&mut this.owned);
                     runtime.commit_terminal_kernel_root_switch(executed);
                     runtime.continue_terminal_after_kernel_root(continuation)
                 }
@@ -8789,17 +8789,17 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     prepared,
                     retirement,
                 } => {
-                    let executed = match prepared.execute(self.runtime.guard_free()) {
+                    let executed = match prepared.execute(this.runtime.guard_free()) {
                         Ok(executed) => executed,
                         Err(failure) => {
-                            let mut guard = self.runtime.lock();
-                            let mut runtime = guard.on_root_switch_flight(&mut self.owned);
+                            let mut guard = this.runtime.lock();
+                            let mut runtime = guard.on_root_switch_flight(&mut this.owned);
                             let error = runtime.cancel_terminal_primordial_root_switch(failure);
                             panic!("terminal publisher-root switch failed before CR3: {error:?}")
                         }
                     };
-                    let mut guard = self.runtime.lock();
-                    let mut runtime = guard.on_root_switch_flight(&mut self.owned);
+                    let mut guard = this.runtime.lock();
+                    let mut runtime = guard.on_root_switch_flight(&mut this.owned);
                     runtime.commit_terminal_primordial_root_switch(executed);
                     runtime.continue_terminal_after_primordial_root(retirement)
                 }
@@ -8810,12 +8810,12 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     PreparedTerminalHandoff::Continuation(continuation) => unsafe {
                         crate::arch::x86_64::context::abandon_to_kernel_continuation(
                             continuation,
-                            self.runtime.guard_free(),
+                            this.runtime.guard_free(),
                         )
                     },
                     PreparedTerminalHandoff::IdleScheduler => {
                         crate::arch::x86_64::syscall::enter_bound_idle_scheduler(
-                            self.runtime.guard_free(),
+                            this.runtime.guard_free(),
                         )
                     }
                 },
@@ -8823,17 +8823,22 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
-    fn enter_scheduled_fresh_thread(&mut self) -> ! {
-        self.synchronize_scheduler_current_detached();
+    fn enter_scheduled_fresh_thread(this: DivergentCarrier<'_, Self>) -> ! {
+        let this = this.into_mut();
+        if !this.synchronize_scheduler_current_at_safe_point_detached() {
+            crate::arch::x86_64::syscall::handoff_current_rendezvous_from_carrier(
+                this.runtime.guard_free(),
+            )
+        }
         let publication = {
-            let mut guard = self.runtime.lock();
-            let mut runtime = guard.on(&mut self.owned);
+            let mut guard = this.runtime.lock();
+            let mut runtime = guard.on(&mut this.owned);
             runtime.complete_physical_switch_handoff()
         };
         crate::task::notify_completed_switch_runnable(publication);
         let (state, stack) = {
-            let mut guard = self.runtime.lock();
-            let mut runtime = guard.on(&mut self.owned);
+            let mut guard = this.runtime.lock();
+            let mut runtime = guard.on(&mut this.owned);
             runtime.prepare_fresh_user_entry_synchronized()
         };
         // The first-run switch bound `stack` before this frame existed; check that binding.
@@ -8845,7 +8850,7 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             crate::arch::x86_64::syscall::enter_bound_validated_user(
                 &state,
                 bound,
-                self.runtime.guard_free(),
+                this.runtime.guard_free(),
             )
         }
     }
@@ -8875,32 +8880,33 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .finish_idle_on(token, finished_at_ns)
     }
 
-    fn enter_idle_scheduler(&mut self) -> ! {
+    fn enter_idle_scheduler(this: DivergentCarrier<'_, Self>) -> ! {
+        let this = this.into_mut();
         crate::debug::liveness::note_event(
-            self.cpu,
+            this.cpu,
             crate::debug::liveness::LivenessEvent::IdleEntered,
         );
         #[cfg(deepwyrm_dw1c_evidence)]
         {
-            let pending = self.owned.dw1c_pending_detach;
+            let pending = this.owned.dw1c_pending_detach;
             if let Some(request) = pending {
                 let prepared = {
-                    let mut guard = self.runtime.lock();
-                    let mut runtime = guard.on(&mut self.owned);
+                    let mut guard = this.runtime.lock();
+                    let mut runtime = guard.on(&mut this.owned);
                     runtime.prepare_terminal_kernel_root_switch()
                 };
-                let executed = match prepared.execute(self.runtime.guard_free()) {
+                let executed = match prepared.execute(this.runtime.guard_free()) {
                     Ok(executed) => executed,
                     Err(failure) => {
-                        let mut guard = self.runtime.lock();
-                        let mut runtime = guard.on_root_switch_flight(&mut self.owned);
+                        let mut guard = this.runtime.lock();
+                        let mut runtime = guard.on_root_switch_flight(&mut this.owned);
                         let error = runtime.cancel_terminal_kernel_root_switch(failure);
                         panic!("selector-28 idle-detach root switch failed: {error:?}")
                     }
                 };
                 let publication = {
-                    let mut guard = self.runtime.lock();
-                    let mut runtime = guard.on_root_switch_flight(&mut self.owned);
+                    let mut guard = this.runtime.lock();
+                    let mut runtime = guard.on_root_switch_flight(&mut this.owned);
                     // Only a carrier built for the root-switch flight may
                     // commit it; an ordinary carrier is refused while the
                     // flight remains in progress.
@@ -8921,36 +8927,36 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 crate::task::notify_completed_switch_runnable(publication);
             }
         }
-        if !self.admission_entered {
-            let (ticket, resources) = self
+        if !this.admission_entered {
+            let (ticket, resources) = this
                 .admission
                 .unwrap_or_else(|| panic!("AP carrier omitted scheduler admission identity"));
-            let executing = self.enter_ap_kernel_root_detached();
-            if ticket.cpu() != self.cpu
+            let executing = this.enter_ap_kernel_root_detached();
+            if ticket.cpu() != this.cpu
                 || crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
-                    != Some(self.cpu.index())
-                || crate::arch::x86_64::runtime_cpu_descriptor_lifecycle(self.cpu.index())
+                    != Some(this.cpu.index())
+                || crate::arch::x86_64::runtime_cpu_descriptor_lifecycle(this.cpu.index())
                     != Some(crate::arch::x86_64::RuntimeCpuDescriptorLifecycle::Online)
-                || crate::arch::x86_64::syscall::native_runtime_carrier_lifecycle(self.cpu)
+                || crate::arch::x86_64::syscall::native_runtime_carrier_lifecycle(this.cpu)
                     != Some(crate::arch::x86_64::syscall::RuntimeCarrierLifecycle::Executing)
                 || !crate::arch::x86_64::ipi::live_ipi_transport_is_bound()
                 || !crate::arch::x86_64::ipi::live_rendezvous_handler_is_bound()
                 || !user_access::live_tlb_shootdown_is_ready()
-                || crate::arch::x86_64::idle::live_idle_wake_is_enabled(self.cpu)
-                || !crate::time::ap_scheduler_timer_is_masked(self.cpu)
+                || crate::arch::x86_64::idle::live_idle_wake_is_enabled(this.cpu)
+                || !crate::time::ap_scheduler_timer_is_masked(this.cpu)
             {
                 fail_live_carrier_admission(
-                    self.shared,
-                    self.cpu,
+                    this.shared,
+                    this.cpu,
                     "AP carrier admission revalidation failed",
                 );
             }
             let snapshot = crate::arch::x86_64::smp::live_cpu_registry()
-                .snapshot(self.cpu.index())
+                .snapshot(this.cpu.index())
                 .unwrap_or_else(|_| {
                     fail_live_carrier_admission(
-                        self.shared,
-                        self.cpu,
+                        this.shared,
+                        this.cpu,
                         "AP registry revalidation failed",
                     )
                 });
@@ -8958,13 +8964,13 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 || snapshot.local_apic_id != resources.local_apic_id
                 || snapshot.online_generation != resources.online_generation
             {
-                fail_live_carrier_admission(self.shared, self.cpu, "AP execution identity drifted");
+                fail_live_carrier_admission(this.shared, this.cpu, "AP execution identity drifted");
             }
             let observed_resources = {
-                let runtime = self.runtime.lock();
+                let runtime = this.runtime.lock();
                 carrier_resource_tuple(
                     &runtime.core,
-                    self.cpu,
+                    this.cpu,
                     crate::arch::x86_64::smp::CpuLifecycle::Executing,
                     crate::arch::x86_64::syscall::RuntimeCarrierLifecycle::Executing,
                     false,
@@ -8972,36 +8978,36 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             };
             if observed_resources != resources {
                 fail_live_carrier_admission(
-                    self.shared,
-                    self.cpu,
+                    this.shared,
+                    this.cpu,
                     "AP private carrier resources drifted",
                 );
             }
             crate::arch::x86_64::syscall::validate_live_syscall_boundary().unwrap_or_else(|_| {
                 fail_live_carrier_admission(
-                    self.shared,
-                    self.cpu,
+                    this.shared,
+                    this.cpu,
                     "AP syscall boundary validation failed",
                 )
             });
-            self.shared
+            this.shared
                 .execution
                 .publish_ap_carrier_ready(ticket, resources, executing)
                 .unwrap_or_else(|error| {
-                    self.shared.execution.fail_carrier_admission(self.cpu);
+                    this.shared.execution.fail_carrier_admission(this.cpu);
                     panic!(
                         "AP {} readiness publication failed: {error:?}",
-                        self.cpu.index()
+                        this.cpu.index()
                     )
                 });
-            while !self.shared.execution.carrier_ticket_is_schedulable(ticket) {
-                let observed = self.shared.execution.carrier_admission_snapshot(self.cpu);
+            while !this.shared.execution.carrier_ticket_is_schedulable(ticket) {
+                let observed = this.shared.execution.carrier_admission_snapshot(this.cpu);
                 if observed.lifecycle == crate::task::CarrierAdmissionLifecycle::Failed {
-                    panic!("AP {} admission failed", self.cpu.index());
+                    panic!("AP {} admission failed", this.cpu.index());
                 }
                 core::hint::spin_loop();
             }
-            self.admission_entered = true;
+            this.admission_entered = true;
         }
         loop {
             enum Entry {
@@ -9016,8 +9022,8 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
 
             let scheduled = {
-                let mut guard = self.runtime.lock();
-                let mut runtime = guard.on(&mut self.owned);
+                let mut guard = this.runtime.lock();
+                let mut runtime = guard.on(&mut this.owned);
                 // A Timer owned by a Thread running on an AP still expires on
                 // the BSP's unified timer service.  CPU0 may have no current
                 // Thread and remain in this kernel-root idle loop while that
@@ -9026,46 +9032,55 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 // Drain before choosing the next runnable Thread; the
                 // existing post-lock notification drain publishes any remote
                 // wake without extending the shared authority critical path.
-                if self.cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                if this.cpu == crate::cpu::CpuIndex::BOOTSTRAP {
                     runtime.service_pending_timer_expiries_on_bootstrap();
                 }
                 runtime
                     .core
                     .shared
                     .execution
-                    .schedule_next_on(self.cpu)
+                    .schedule_next_on(this.cpu)
                     .unwrap_or_else(|error| panic!("AP scheduling failed: {error:?}"))
                     .current
             };
             crate::task::drain_runnable_work_notifications();
-            let entry = scheduled.map(|thread| {
-                self.synchronize_scheduler_current_detached();
-                let mut guard = self.runtime.lock();
-                let mut runtime = guard.on(&mut self.owned);
-                let continuation = runtime
-                    .core
-                    .shared
-                    .execution
-                    .kernel_continuation_rsp(runtime.own.scheduled().context_id)
-                    .unwrap_or_else(|error| {
-                        panic!("AP continuation lookup failed for {thread:?}: {error:?}")
-                    });
-                if continuation == 0 {
-                    let (state, stack) = runtime.prepare_fresh_user_entry_synchronized();
-                    Entry::Fresh { state, stack }
-                } else {
-                    let stack = runtime
+            // A `match`, not `Option::map`: the rendezvous handoff below diverges, and it must do
+            // so in this entry's own frame, not inside a closure holding the carrier ([DIVERGENT]).
+            let entry = match scheduled {
+                None => None,
+                Some(thread) => Some({
+                    if !this.synchronize_scheduler_current_at_safe_point_detached() {
+                        crate::arch::x86_64::syscall::handoff_current_rendezvous_from_carrier(
+                            this.runtime.guard_free(),
+                        )
+                    }
+                    let mut guard = this.runtime.lock();
+                    let mut runtime = guard.on(&mut this.owned);
+                    let continuation = runtime
                         .core
                         .shared
                         .execution
-                        .stack_bounds(runtime.own.scheduled().stack_id)
-                        .unwrap_or_else(|error| panic!("AP stack lookup failed: {error:?}"));
-                    Entry::Continuation {
-                        stack,
-                        rsp: continuation,
+                        .kernel_continuation_rsp(runtime.own.scheduled().context_id)
+                        .unwrap_or_else(|error| {
+                            panic!("AP continuation lookup failed for {thread:?}: {error:?}")
+                        });
+                    if continuation == 0 {
+                        let (state, stack) = runtime.prepare_fresh_user_entry_synchronized();
+                        Entry::Fresh { state, stack }
+                    } else {
+                        let stack = runtime
+                            .core
+                            .shared
+                            .execution
+                            .stack_bounds(runtime.own.scheduled().stack_id)
+                            .unwrap_or_else(|error| panic!("AP stack lookup failed: {error:?}"));
+                        Entry::Continuation {
+                            stack,
+                            rsp: continuation,
+                        }
                     }
-                }
-            });
+                }),
+            };
             match entry {
                 Some(Entry::Fresh { state, stack }) => {
                     // SAFETY: [P-HANDOFF] this idle loop runs on a CPU-private stack with IF clear;
@@ -9081,7 +9096,7 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         crate::arch::x86_64::syscall::enter_bound_validated_user(
                             &state,
                             bound,
-                            self.runtime.guard_free(),
+                            this.runtime.guard_free(),
                         )
                     }
                 }
@@ -9100,7 +9115,7 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     unsafe {
                         crate::arch::x86_64::context::abandon_to_kernel_continuation(
                             rsp,
-                            self.runtime.guard_free(),
+                            this.runtime.guard_free(),
                         )
                     }
                 }
@@ -9113,12 +9128,12 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 crate::time::monotonic_now().unwrap_or_else(|error| {
                                     panic!("AP idle start sample failed: {error:?}")
                                 });
-                            let idle_accounting = self
+                            let idle_accounting = this
                                 .publish_scheduler_idle(started_at_ns)
                                 .unwrap_or_else(|error| {
                                     panic!("AP idle accounting publication failed: {error:?}")
                                 });
-                            halt_for_interrupt(self.runtime.guard_free());
+                            halt_for_interrupt(this.runtime.guard_free());
                             crate::arch::x86_64::idle::finish_current_idle(halt).unwrap_or_else(
                                 |error| panic!("AP idle completion failed: {error:?}"),
                             );
@@ -9126,7 +9141,7 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 crate::time::monotonic_now().unwrap_or_else(|error| {
                                     panic!("AP idle finish sample failed: {error:?}")
                                 });
-                            self.finish_scheduler_idle(idle_accounting, finished_at_ns)
+                            this.finish_scheduler_idle(idle_accounting, finished_at_ns)
                                 .unwrap_or_else(|error| {
                                     panic!("AP idle accounting completion failed: {error:?}")
                                 });
@@ -9157,14 +9172,14 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {}
                         crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {
                             #[cfg(deepwyrm_i1_evidence)]
-                            crate::test_support::observe_i1_remote_wake_received(self.cpu);
+                            crate::test_support::observe_i1_remote_wake_received(this.cpu);
                         }
                         crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_) => {
                             panic!("kernel-root idle carrier received an unexpected stop request")
                         }
                     }
                     #[cfg(deepwyrm_dw1e_platform)]
-                    self.service_q35_retirement_at_bsp_safe_point();
+                    this.service_q35_retirement_at_bsp_safe_point();
                 }
             }
         }

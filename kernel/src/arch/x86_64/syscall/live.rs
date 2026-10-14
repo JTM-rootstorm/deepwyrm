@@ -6,6 +6,7 @@ use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::memory::kernel_stack::KernelStackBounds;
+use crate::syscall::native::DivergentCarrier;
 
 use super::frame::{PerCpuEntryState, RawSyscallFrame, ValidatedUserReturn};
 use super::msr::{
@@ -53,11 +54,14 @@ use super::runtime_binding::{
 // re-read from the destination CPU's binding. The `bind_*` and `enter_native_syscall_runtime`
 // callers owe the stationarity and no-other-reference contract.
 //
-// [CARRIER] model gap, UNVERIFIED (S2K). (1) Divergent carrier methods taking `&mut self`
-// (`terminate_current`, `enter_idle_scheduler`, `rendezvous_stop`, or a detached caller reaching
-// `handoff_current_rendezvous_from_carrier`) abandon frames that still hold a protected `&mut R`,
-// and the carrier is later reborrowed through the published pointer. No abandoned frame resumes,
-// but Stacked and Tree Borrows do not treat the protector as ended.
+// [DIVERGENT] (closes the former [CARRIER] gap (1), S2K-6) A divergent entry (`terminate_current`,
+// `enter_scheduled_fresh_thread`, `enter_idle_scheduler`, `rendezvous_stop`) abandons its frame
+// instead of returning, and the carrier is later reborrowed through the published pointer. So a
+// divergent entry never receives the carrier as a `&mut` argument, whose protector would outlive
+// the abandoned frame: it takes a `DivergentCarrier` (a raw pointer, which passing neither retags
+// nor protects) and turns it into a local `&mut`, which is never protected. Every divergence runs
+// in such an entry's own frame, never inside a method or closure it called with the carrier: the
+// facade's detached rendezvous handoff is inlined there, not behind a `&mut self` helper.
 //
 // [QUANTUM-EXPIRY] (closes the former gap (2), S2K-6) Quantum expiry is published from the timer
 // interrupt and from synchronous quantum cancellation, both of which can run while a `&mut self`
@@ -73,7 +77,13 @@ use super::runtime_binding::{
 // them while it holds its runtime-authority guard. The private boundaries (`switch_kernel_context`,
 // `handoff_to_rendezvous_reaper`, `handoff_to_terminal_reaper`) are guard-free by construction:
 // only this file's trampolines call them, this file cannot name `RuntimeAuthorityGuard`
-// (`pub(super)` in `mm::activation`), and no runtime trait method can return one.
+// (`pub(super)` in `mm::activation`), and no runtime trait method can return one. Since S2K-6 the
+// argument covers both of a CPU's handles: only the facade's `RuntimeAuthorityHandle` mints a
+// token, and the quantum-expiry publisher's `InterruptAuthorityHandle` cannot; its guard lives
+// only inside one publication, which runs no physical boundary and returns before the code it
+// interrupted or was called from continues. The remaining mints are `GuardFree::assume` in root
+// frames that hold no guard by construction (the AP entry in `lib.rs`, the dw1c detached idle
+// entry here, and the F9/F12 guest runtimes).
 //
 // [FRAME] `dw_x86_64_syscall_dispatch` and `dw_x86_64_timer_pre_iret_gate` receive frame pointers
 // from assembly (`syscall_entry.S`, `exceptions.S`). Rust checks them for null and alignment. That
@@ -1269,11 +1279,14 @@ unsafe fn native_runtime_rendezvous_reaper<R: crate::syscall::native::NativeRend
     let RendezvousAction(request) = take_rendezvous_action().unwrap_or_else(|| halt_forever());
     let reaper = crate::arch::x86_64::rendezvous::verify_native_rendezvous_reaper_entry()
         .unwrap_or_else(|| halt_forever());
-    // SAFETY: [CARRIER] `context` is this CPU's binding (`dw_x86_64_rendezvous_reaper`) and the
-    // pivot abandoned the interrupted frame. A detached caller's abandoned `&mut self` is gap (1)
-    // in [CARRIER].
-    let runtime = unsafe { &mut *context.cast::<R>() };
-    runtime.rendezvous_stop(request, reaper)
+    let carrier = core::ptr::NonNull::new(context.cast::<R>()).unwrap_or_else(|| halt_forever());
+    // SAFETY: [DIVERGENT] `context` is this CPU's binding (`dw_x86_64_rendezvous_reaper`) and the
+    // pivot abandoned the interrupted frame, so no frame that resumes holds a reference to it.
+    R::rendezvous_stop(
+        unsafe { DivergentCarrier::published(carrier) },
+        request,
+        reaper,
+    )
 }
 
 /// Abandons the current continuation for the separate e1 reaper seam.  The
@@ -1614,10 +1627,10 @@ pub(crate) fn bind_native_runtime_user_exception_handler() -> Result<
 unsafe fn native_runtime_fresh_thread<R: crate::syscall::native::NativeSyscallFrameRuntime>(
     context: *mut (),
 ) -> ! {
-    // SAFETY: [CARRIER] reached only through `dw_x86_64_first_run_thread_entry` on a fresh Thread's
-    // stack, so no other frame on this CPU holds a reborrow.
-    let runtime = unsafe { &mut *context.cast::<R>() };
-    runtime.enter_scheduled_fresh_thread()
+    let carrier = core::ptr::NonNull::new(context.cast::<R>()).unwrap_or_else(|| halt_forever());
+    // SAFETY: [DIVERGENT] reached only through `dw_x86_64_first_run_thread_entry` on a fresh
+    // Thread's stack, so no frame that resumes holds a reference to this CPU's carrier.
+    R::enter_scheduled_fresh_thread(unsafe { DivergentCarrier::published(carrier) })
 }
 
 #[allow(
@@ -1627,10 +1640,11 @@ unsafe fn native_runtime_fresh_thread<R: crate::syscall::native::NativeSyscallFr
 unsafe fn native_runtime_idle_scheduler<R: crate::syscall::native::NativeSyscallFrameRuntime>(
     context: *mut (),
 ) -> ! {
-    // SAFETY: [CARRIER] reached only through `enter_bound_idle_scheduler`. Callers that are
-    // themselves `&mut self` carrier methods abandon that frame; see gap (1) in [CARRIER].
-    let runtime = unsafe { &mut *context.cast::<R>() };
-    runtime.enter_idle_scheduler()
+    let carrier = core::ptr::NonNull::new(context.cast::<R>()).unwrap_or_else(|| halt_forever());
+    // SAFETY: [DIVERGENT] reached only through `enter_bound_idle_scheduler`, whose callers are
+    // divergent entries holding the carrier only as a local, so no frame that resumes holds a
+    // reference to it.
+    R::enter_idle_scheduler(unsafe { DivergentCarrier::published(carrier) })
 }
 
 #[allow(
@@ -1646,9 +1660,10 @@ unsafe extern "sysv64" fn native_runtime_terminal_reaper<
     let Some(action) = take_terminal_action() else {
         halt_forever();
     };
-    // SAFETY: [CARRIER] `context` is this CPU's binding, passed through the reaper handoff, which
+    let carrier = core::ptr::NonNull::new(context.cast::<R>()).unwrap_or_else(|| halt_forever());
+    // SAFETY: [DIVERGENT] `context` is this CPU's binding, passed through the reaper handoff, which
     // abandoned the deferred Thread stack and every reborrow on it.
-    let runtime = unsafe { &mut *context.cast::<R>() };
+    let runtime = unsafe { DivergentCarrier::published(carrier) }.into_mut();
     match action {
         TerminalAction::CompleteCurrent => {}
         TerminalAction::InvalidReturn(error) => {
@@ -1658,7 +1673,7 @@ unsafe extern "sysv64" fn native_runtime_terminal_reaper<
             runtime.user_exception(record);
         }
     }
-    runtime.terminate_current()
+    R::terminate_current(DivergentCarrier::from_mut(runtime))
 }
 
 #[allow(

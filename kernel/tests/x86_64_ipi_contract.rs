@@ -163,7 +163,7 @@ fn i1_cpl3_rendezvous_gate_diverges_before_iret() {
         "commit_current_rendezvous_stop(witness, self)",
         "prepare_after_rendezvous_stop()",
         "terminal_reaper_next_on(self.cpu)",
-        "PreparedCarrierEntry::Idle => self.enter_idle_scheduler()",
+        "PreparedCarrierEntry::Idle => {\n                Self::enter_idle_scheduler(DivergentCarrier::from_mut(this))",
         "runtime.prepare_rendezvous_stop(request, reaper)",
         "runtime.commit_rendezvous_stop(witness, root_switch)",
     ] {
@@ -687,7 +687,7 @@ fn h4_idle_publication_brackets_rescan_and_uses_only_coalesced_e1_wake() {
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
     assert!(primordial.contains("crate::task::notify_completed_switch_runnable(published);"));
     let ap_schedule = primordial
-        .split_once("fn enter_idle_scheduler(&mut self) -> !")
+        .split_once("fn enter_idle_scheduler(this: DivergentCarrier<'_, Self>) -> !")
         .expect("AP scheduling loop")
         .1
         .split_once("unsafe fn prepare_suspend")
@@ -697,9 +697,9 @@ fn h4_idle_publication_brackets_rescan_and_uses_only_coalesced_e1_wake() {
         .find("runtime.service_pending_timer_expiries_on_bootstrap();")
         .expect("CPU0 kernel-root idle timer-expiry service");
     let schedule = ap_schedule
-        .find(".schedule_next_on(self.cpu)")
+        .find(".schedule_next_on(this.cpu)")
         .expect("kernel-root idle scheduler decision");
-    assert!(ap_schedule.contains("self.cpu == crate::cpu::CpuIndex::BOOTSTRAP"));
+    assert!(ap_schedule.contains("this.cpu == crate::cpu::CpuIndex::BOOTSTRAP"));
     assert!(timer_service < schedule);
     assert!(primordial.contains(
         ".current\n            };\n            crate::task::drain_runnable_work_notifications();"

@@ -897,7 +897,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     for F9Runtime<'_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
     fn rendezvous_stop(
-        &mut self,
+        _this: crate::syscall::native::DivergentCarrier<'_, Self>,
         _request: crate::arch::x86_64::rendezvous::StopRequest,
         _reaper: crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry,
     ) -> ! {
@@ -939,26 +939,27 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         fail(0x100 | (record.vector & 0x0f))
     }
 
-    fn terminate_current(&mut self) -> ! {
+    fn terminate_current(this: crate::syscall::native::DivergentCarrier<'_, Self>) -> ! {
+        let this = this.into_mut();
         crate::syscall::complete_deferred_current_reclaim_on(
-            &mut self.registry,
-            &self.execution,
-            &self.waits,
+            &mut this.registry,
+            &this.execution,
+            &this.waits,
             crate::cpu::CpuIndex::BOOTSTRAP,
-            self.deferred_current.take().unwrap_or_else(|| fail(0xae)),
-            &mut self.cleanup,
+            this.deferred_current.take().unwrap_or_else(|| fail(0xae)),
+            &mut this.cleanup,
         );
-        if !self.waiter_wait_seen
-            || !self.wake_seen
-            || !self.waker_wait_seen
-            || !self.waiter_resumed
-            || !self.exit_seen
+        if !this.waiter_wait_seen
+            || !this.wake_seen
+            || !this.waker_wait_seen
+            || !this.waiter_resumed
+            || !this.exit_seen
         {
             fail(0xb1);
         }
-        let process = self
+        let process = this
             .tasks
-            .process_info(self.process)
+            .process_info(this.process)
             .unwrap_or_else(|_| fail(0xb2));
         if process.state != DW_TASK_STATE_EXITED
             || process.reason != DW_TERMINATION_NORMAL_EXIT
@@ -966,8 +967,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         {
             fail(0xb3);
         }
-        for (index, thread) in self.threads.into_iter().enumerate() {
-            let info = self
+        for (index, thread) in this.threads.into_iter().enumerate() {
+            let info = this
                 .tasks
                 .thread_info(thread)
                 .unwrap_or_else(|_| fail(0xb4));
@@ -979,26 +980,26 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
             if info.state != DW_TASK_STATE_EXITED
                 || info.reason != expected_reason
                 || info.application_code != 0
-                || self.execution.scheduler_state(thread).is_some()
-                || self.execution.stack_bounds(self.stack_ids[index]).is_ok()
-                || self.execution.load_context(self.context_ids[index]).is_ok()
-                || self.atomic_operations.wake_key_for_thread(thread).is_some()
+                || this.execution.scheduler_state(thread).is_some()
+                || this.execution.stack_bounds(this.stack_ids[index]).is_ok()
+                || this.execution.load_context(this.context_ids[index]).is_ok()
+                || this.atomic_operations.wake_key_for_thread(thread).is_some()
             {
                 fail(0xb5);
             }
         }
-        let proof = self
+        let proof = this
             .tasks
-            .process_quiescence_proof(self.process)
+            .process_quiescence_proof(this.process)
             .unwrap_or_else(|_| fail(0xb6));
-        if self
+        if this
             .execution
-            .blocked_operations_drained(&self.tasks, &proof)
+            .blocked_operations_drained(&this.tasks, &proof)
             .is_err()
         {
             fail(0xb6);
         }
-        if !self.cleanup.is_empty() {
+        if !this.cleanup.is_empty() {
             fail(0xb7);
         }
         crate::test_support::complete_pass(0)
@@ -1008,29 +1009,30 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         unsafe_code,
         reason = "F9 enters the scheduler-selected fresh Thread through its validated bound context"
     )]
-    fn enter_scheduled_fresh_thread(&mut self) -> ! {
-        let outgoing = self
+    fn enter_scheduled_fresh_thread(this: crate::syscall::native::DivergentCarrier<'_, Self>) -> ! {
+        let this = this.into_mut();
+        let outgoing = this
             .execution
             .suspended_claim_on(crate::cpu::CpuIndex::BOOTSTRAP)
             .unwrap_or_else(|| fail(0xb8));
-        self.execution
+        this.execution
             .complete_switch_on(outgoing)
             .unwrap_or_else(|_| fail(0xb8));
-        if self.current_index() != 1 || !self.waiter_wait_seen {
+        if this.current_index() != 1 || !this.waiter_wait_seen {
             fail(0xb8);
         }
-        let context = self
+        let context = this
             .execution
-            .load_context(self.context_ids[1])
+            .load_context(this.context_ids[1])
             .unwrap_or_else(|_| fail(0xb9));
-        let stack = self
+        let stack = this
             .execution
-            .stack_bounds(self.stack_ids[1])
+            .stack_bounds(this.stack_ids[1])
             .unwrap_or_else(|_| fail(0xba));
         let state = {
-            let mut mappings = self
+            let mut mappings = this
                 .active
-                .current_process_address_space(&self.active_root, self.process);
+                .current_process_address_space(&this.active_root, this.process);
             crate::arch::x86_64::syscall::ValidatedUserReturn::initial(context, &mut mappings)
                 .unwrap_or_else(|_| fail(0xbb))
         };

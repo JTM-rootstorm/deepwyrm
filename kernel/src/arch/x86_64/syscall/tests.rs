@@ -400,7 +400,7 @@ fn dw1_a_idle_accounting_is_bound_to_successful_halted_publication() {
         .find("publish_scheduler_idle(started_at_ns)")
         .expect("successful AP HALTED publication must begin scheduler idle accounting");
     let wait = primordial
-        .find("halt_for_interrupt(self.runtime.guard_free())")
+        .find("halt_for_interrupt(this.runtime.guard_free())")
         .expect("AP scheduler idle accounting must precede the physical halt");
     let physical_finish = primordial
         .find("finish_current_idle(halt)")
