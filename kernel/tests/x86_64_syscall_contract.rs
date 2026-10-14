@@ -888,36 +888,14 @@ fn i2_suspended_resume_gives_remote_stop_priority_under_scheduler_authority() {
     assert!(!rendezvous.contains("rebind_after_kernel_resume"));
 }
 
+/// Text test: that the suspended trampoline stages the terminal action before its reaper handoff
+/// is control flow in the target-only trampoline, which no type orders.
 #[test]
 fn i2_terminal_reclaim_handoff_is_owned_by_the_exact_physical_cpu() {
-    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+    // The deferred current is owner-only by type since S2K-6 (TSV row 72): it lives in the
+    // CPU's `CpuSharedState` slot, which only that CPU's owner can borrow mutably (see
+    // `cpu_slots_mutate_only_through_their_owner` in `kernel/tests/root_switch_ui.rs`).
     let live = source("src/arch/x86_64/syscall/live.rs");
-
-    // S2K-6: the deferred current is a field of each CPU's `CpuSharedState`, and the shared
-    // carrier has no single one that another CPU could consume.
-    let per_cpu = runtime
-        .split_once("struct CpuSharedState {")
-        .expect("per-CPU runtime state")
-        .1
-        .split_once("\n}\n")
-        .expect("per-CPU runtime state extent")
-        .0;
-    assert!(
-        per_cpu.contains(
-            "    deferred_current: Option<crate::task::DeferredCurrentExecutionResources>,"
-        )
-    );
-    let carrier = runtime
-        .split_once("struct PrimordialRuntimeCarrier<")
-        .expect("shared carrier")
-        .1
-        .split_once("\n}\n")
-        .expect("shared carrier extent")
-        .0;
-    assert!(!carrier.contains("deferred_current"));
-    assert!(runtime.contains("self.own.deferred_current"));
-    assert!(runtime.contains("            deferred_current: None,"));
-    assert!(runtime.contains("NativeResumeOutcome::TerminateCurrent"));
 
     let suspended = live
         .split_once("SyscallControl::SuspendCurrent =>")
@@ -2082,18 +2060,14 @@ fn f2_runtime_binding_is_retained_by_divergent_entry_and_suspension_drops_short_
     assert!(!native.contains("runtime.reschedule()"));
 }
 
+/// Text test: that the shared F-service state holds no wait control is the absence of a field in
+/// a host type, which no positive type fact states.
 #[test]
 fn i1_live_wait_control_is_owned_by_each_physical_cpu_carrier() {
-    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+    // Each CPU's wait control is owner-only by type since S2K-6 (TSV row 96): it lives in the
+    // CPU's `CpuSharedState` slot, which only that CPU's owner can borrow mutably (see
+    // `cpu_slots_mutate_only_through_their_owner` in `kernel/tests/root_switch_ui.rs`).
     let services = source("src/syscall/f_services.rs");
-
-    // S2K-6: each CPU's wait control is a field of its guarded `CpuSharedState` slot.
-    assert!(runtime.contains(
-        "cpus: CpuSlots<CpuSharedState, { crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT }>,"
-    ));
-    assert!(runtime.contains("    wait_control: NativeWaitControl,"));
-    assert!(runtime.contains("&mut self.own.wait_control"));
-    assert!(runtime.contains(".all(|cpu| cpu.wait_control.is_clear())"));
     assert!(
         !services.contains("control: NativeWaitControl,"),
         "shared F-service state must not own one cross-CPU suspension handoff"

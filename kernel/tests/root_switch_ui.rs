@@ -134,6 +134,52 @@ fn guard_free_tokens_cannot_be_minted_under_the_runtime_guard() {
         .expect("remove exact project-local guard-free UI output directory");
 }
 
+/// S2K-6 (design §11.1; TSV rows 72 and 96): a CPU's remotely read runtime
+/// facts (its deferred current, wait control, root and identity) live in
+/// `CpuSlots`, which hands a slot out mutably only for that slot's
+/// `CpuOwner`. Owners are minted once, cannot be forged or cloned, and every
+/// other CPU's slot is read-only, so owner-only mutation is a type fact.
+#[test]
+fn cpu_slots_mutate_only_through_their_owner() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_dir = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("kernel is nested below the workspace root");
+    let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let output_dir = workspace_dir
+        .join(".tmp")
+        .join("cpu-slots-ui")
+        .join(std::process::id().to_string());
+    fs::create_dir_all(&output_dir).expect("create project-local CPU-slot UI output directory");
+
+    for case in [
+        UiCase {
+            fixture: "cpu_slots_compiles.rs",
+            expected_error: None,
+        },
+        UiCase {
+            fixture: "cpu_slots_remote_mutation.rs",
+            expected_error: Some("error[E0594]: cannot assign to data in a `&` reference"),
+        },
+        UiCase {
+            fixture: "cpu_slots_owner_forged.rs",
+            expected_error: Some("error[E0451]: field `cpu` of struct `CpuOwner` is private"),
+        },
+        UiCase {
+            fixture: "cpu_slots_owner_clone.rs",
+            expected_error: Some(
+                "error[E0599]: no method named `clone` found for struct `CpuOwner` in the current scope",
+            ),
+        },
+    ] {
+        run_case(&rustc, &manifest_dir, &output_dir, &case);
+    }
+
+    fs::remove_dir_all(&output_dir)
+        .expect("remove exact project-local CPU-slot UI output directory");
+}
+
 fn run_case(rustc: &std::ffi::OsStr, manifest_dir: &Path, output_dir: &Path, case: &UiCase<'_>) {
     run_case_with(rustc, manifest_dir, output_dir, case, &[]);
 }
