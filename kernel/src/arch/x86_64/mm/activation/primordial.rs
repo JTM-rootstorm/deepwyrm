@@ -7652,219 +7652,226 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
     for RuntimeCarrierFacade<'_, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>
 {
     fn handle(&mut self, request: NativeSyscallRequest) -> NativeSyscallResult {
-        if matches!(
-            request,
-            NativeSyscallRequest::ProcessExit { .. }
-                | NativeSyscallRequest::ProcessTerminate { .. }
-                | NativeSyscallRequest::TaskGroupTerminate { .. }
-                | NativeSyscallRequest::ThreadTerminate { .. }
-        ) {
-            assert!(
-                self.pending_remote_termination.is_none(),
-                "CPU-local carrier already owns a pending remote termination"
-            );
-            crate::debug::liveness::note_event(
-                self.cpu,
-                crate::debug::liveness::LivenessEvent::TerminationPrepared,
-            );
-            if !self.synchronize_scheduler_current_at_safe_point_detached() {
-                return NativeSyscallResult {
-                    status: DW_STATUS_SUCCESS,
-                    control: SyscallControl::ServiceRendezvous,
-                };
-            }
-            loop {
-                let mut runtime = self.runtime.lock();
-                runtime.switch_cpu(self.cpu);
-                if matches!(
-                    crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
-                    crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
-                ) {
-                    return NativeSyscallResult {
-                        status: DW_STATUS_SUCCESS,
-                        control: SyscallControl::ServiceRendezvous,
-                    };
+        // Every result that returns to the caller leaves through the carrier's
+        // `ready_to_return` under the guard that produced it, terminal results
+        // included, so none resumes userspace with final releases still queued.
+        let ready: crate::syscall::native::ReturnReady = 'handled: {
+            if matches!(
+                request,
+                NativeSyscallRequest::ProcessExit { .. }
+                    | NativeSyscallRequest::ProcessTerminate { .. }
+                    | NativeSyscallRequest::TaskGroupTerminate { .. }
+                    | NativeSyscallRequest::ThreadTerminate { .. }
+            ) {
+                assert!(
+                    self.pending_remote_termination.is_none(),
+                    "CPU-local carrier already owns a pending remote termination"
+                );
+                crate::debug::liveness::note_event(
+                    self.cpu,
+                    crate::debug::liveness::LivenessEvent::TerminationPrepared,
+                );
+                if !self.synchronize_scheduler_current_at_safe_point_detached() {
+                    break 'handled crate::syscall::native::ReturnReady::service_rendezvous();
                 }
-                #[cfg(deepwyrm_dw1c_evidence)]
-                if let NativeSyscallRequest::ProcessTerminate { process, .. } = request
-                    && let Some((_token8_thread, gate)) =
-                        runtime.dw1c_process_termination_gate(process)
-                    && gate == crate::task::Dw1cTerminalGate::AwaitingExpiry
-                {
-                    // Syscalls run with IF clear. Polling here would monopolize
-                    // token 8's assigned CPU and prevent the very quantum expiry
-                    // that opens this gate. Return through the ordinary syscall
-                    // boundary so return-time preemption can dispatch token 8;
-                    // the selector controller retries the complete operation.
-                    return NativeSyscallResult::returning(DW_STATUS_WOULD_BLOCK);
-                }
-                #[cfg(deepwyrm_dw1d_evidence)]
-                if let NativeSyscallRequest::ProcessTerminate { process, .. } = request
-                    && let Some(ready) = runtime.dw1d_replacement_termination_gate(process)
-                    && !ready
-                {
-                    // The controller can observe userspace's replacement-wait
-                    // intent before the replacement commits its real wait.
-                    // Leave the public termination operation untouched and
-                    // return through the ordinary boundary so userspace can
-                    // yield and retry after event 0A's registration exists.
-                    return NativeSyscallResult::returning(DW_STATUS_WOULD_BLOCK);
-                }
-                let prepared = match request {
-                    NativeSyscallRequest::ProcessExit { exit_code } => {
-                        match runtime.prepare_remote_process_exit(exit_code) {
-                            ProcessTerminationPreparation::Retry => {
-                                drop(runtime);
-                                for _ in 0..64 {
-                                    core::hint::spin_loop();
+                loop {
+                    let mut runtime = self.runtime.lock();
+                    runtime.switch_cpu(self.cpu);
+                    if matches!(
+                        crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
+                        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
+                    ) {
+                        break 'handled crate::syscall::native::ReturnReady::service_rendezvous();
+                    }
+                    #[cfg(deepwyrm_dw1c_evidence)]
+                    if let NativeSyscallRequest::ProcessTerminate { process, .. } = request
+                        && let Some((_token8_thread, gate)) =
+                            runtime.dw1c_process_termination_gate(process)
+                        && gate == crate::task::Dw1cTerminalGate::AwaitingExpiry
+                    {
+                        // Syscalls run with IF clear. Polling here would monopolize
+                        // token 8's assigned CPU and prevent the very quantum expiry
+                        // that opens this gate. Return through the ordinary syscall
+                        // boundary so return-time preemption can dispatch token 8;
+                        // the selector controller retries the complete operation.
+                        let retry = NativeSyscallResult::returning(DW_STATUS_WOULD_BLOCK);
+                        break 'handled runtime.ready_to_return(retry);
+                    }
+                    #[cfg(deepwyrm_dw1d_evidence)]
+                    if let NativeSyscallRequest::ProcessTerminate { process, .. } = request
+                        && let Some(ready) = runtime.dw1d_replacement_termination_gate(process)
+                        && !ready
+                    {
+                        // The controller can observe userspace's replacement-wait
+                        // intent before the replacement commits its real wait.
+                        // Leave the public termination operation untouched and
+                        // return through the ordinary boundary so userspace can
+                        // yield and retry after event 0A's registration exists.
+                        let retry = NativeSyscallResult::returning(DW_STATUS_WOULD_BLOCK);
+                        break 'handled runtime.ready_to_return(retry);
+                    }
+                    let prepared = match request {
+                        NativeSyscallRequest::ProcessExit { exit_code } => {
+                            match runtime.prepare_remote_process_exit(exit_code) {
+                                ProcessTerminationPreparation::Retry => {
+                                    drop(runtime);
+                                    for _ in 0..64 {
+                                        core::hint::spin_loop();
+                                    }
+                                    continue;
                                 }
-                                continue;
-                            }
-                            ProcessTerminationPreparation::Immediate(result) => {
-                                drop(runtime);
-                                self.drain_quantum_cancellation_detached();
-                                return result;
-                            }
-                            ProcessTerminationPreparation::Remote(prepared) => {
-                                let phase = prepared.phase;
-                                let identities = prepared.identities;
-                                let pending = PendingRemoteTermination::Process(
-                                    PendingRemoteProcessTermination {
-                                        phase,
-                                        prepared: prepared.prepared,
-                                        deferred: core::array::from_fn(|_| None),
-                                    },
-                                );
-                                (identities, pending)
-                            }
-                        }
-                    }
-                    NativeSyscallRequest::ProcessTerminate {
-                        process,
-                        reason,
-                        code,
-                    } => match runtime.prepare_remote_process_termination(process, reason, code) {
-                        ProcessTerminationPreparation::Retry => {
-                            unreachable!(
-                                "external Process termination uses an ordinary retry status"
-                            )
-                        }
-                        ProcessTerminationPreparation::Immediate(result) => {
-                            drop(runtime);
-                            self.drain_quantum_cancellation_detached();
-                            return result;
-                        }
-                        ProcessTerminationPreparation::Remote(prepared) => {
-                            let phase = prepared.phase;
-                            let identities = prepared.identities;
-                            let pending = PendingRemoteTermination::Process(
-                                PendingRemoteProcessTermination {
-                                    phase,
-                                    prepared: prepared.prepared,
-                                    deferred: core::array::from_fn(|_| None),
-                                },
-                            );
-                            (identities, pending)
-                        }
-                    },
-                    NativeSyscallRequest::TaskGroupTerminate { task_group, reason } => {
-                        match runtime.prepare_remote_task_group_termination(task_group, reason) {
-                            TaskGroupTerminationPreparation::Immediate(result) => {
-                                drop(runtime);
-                                self.drain_quantum_cancellation_detached();
-                                return result;
-                            }
-                            TaskGroupTerminationPreparation::Remote(prepared) => {
-                                let phase = prepared.phase;
-                                let identities = prepared.identities;
-                                let pending = PendingRemoteTermination::TaskGroup(
-                                    PendingRemoteTaskGroupTermination {
-                                        phase,
-                                        prepared: prepared.prepared,
-                                        deferred: core::array::from_fn(|_| None),
-                                    },
-                                );
-                                (identities, pending)
+                                ProcessTerminationPreparation::Immediate(result) => {
+                                    let ready = runtime.ready_to_return(result);
+                                    drop(runtime);
+                                    self.drain_quantum_cancellation_detached();
+                                    break 'handled ready;
+                                }
+                                ProcessTerminationPreparation::Remote(prepared) => {
+                                    let phase = prepared.phase;
+                                    let identities = prepared.identities;
+                                    let pending = PendingRemoteTermination::Process(
+                                        PendingRemoteProcessTermination {
+                                            phase,
+                                            prepared: prepared.prepared,
+                                            deferred: core::array::from_fn(|_| None),
+                                        },
+                                    );
+                                    (identities, pending)
+                                }
                             }
                         }
-                    }
-                    NativeSyscallRequest::ThreadTerminate {
-                        thread,
-                        reason,
-                        code,
-                    } => match runtime.prepare_remote_thread_termination(thread, reason, code) {
-                        ThreadTerminationPreparation::Immediate(result) => {
-                            drop(runtime);
-                            self.drain_quantum_cancellation_detached();
-                            return result;
+                        NativeSyscallRequest::ProcessTerminate {
+                            process,
+                            reason,
+                            code,
+                        } => {
+                            match runtime.prepare_remote_process_termination(process, reason, code)
+                            {
+                                ProcessTerminationPreparation::Retry => {
+                                    unreachable!(
+                                        "external Process termination uses an ordinary retry status"
+                                    )
+                                }
+                                ProcessTerminationPreparation::Immediate(result) => {
+                                    let ready = runtime.ready_to_return(result);
+                                    drop(runtime);
+                                    self.drain_quantum_cancellation_detached();
+                                    break 'handled ready;
+                                }
+                                ProcessTerminationPreparation::Remote(prepared) => {
+                                    let phase = prepared.phase;
+                                    let identities = prepared.identities;
+                                    let pending = PendingRemoteTermination::Process(
+                                        PendingRemoteProcessTermination {
+                                            phase,
+                                            prepared: prepared.prepared,
+                                            deferred: core::array::from_fn(|_| None),
+                                        },
+                                    );
+                                    (identities, pending)
+                                }
+                            }
                         }
-                        ThreadTerminationPreparation::Remote(prepared) => {
-                            let phase = prepared.phase;
-                            let identities = prepared.identities;
-                            let pending =
-                                PendingRemoteTermination::Thread(PendingRemoteThreadTermination {
-                                    phase,
-                                    prepared: prepared.prepared,
-                                    deferred: core::array::from_fn(|_| None),
-                                });
-                            (identities, pending)
+                        NativeSyscallRequest::TaskGroupTerminate { task_group, reason } => {
+                            match runtime.prepare_remote_task_group_termination(task_group, reason)
+                            {
+                                TaskGroupTerminationPreparation::Immediate(result) => {
+                                    let ready = runtime.ready_to_return(result);
+                                    drop(runtime);
+                                    self.drain_quantum_cancellation_detached();
+                                    break 'handled ready;
+                                }
+                                TaskGroupTerminationPreparation::Remote(prepared) => {
+                                    let phase = prepared.phase;
+                                    let identities = prepared.identities;
+                                    let pending = PendingRemoteTermination::TaskGroup(
+                                        PendingRemoteTaskGroupTermination {
+                                            phase,
+                                            prepared: prepared.prepared,
+                                            deferred: core::array::from_fn(|_| None),
+                                        },
+                                    );
+                                    (identities, pending)
+                                }
+                            }
                         }
-                    },
-                    _ => unreachable!("terminal request classification drifted"),
-                };
-                let (identities, mut pending) = prepared;
-                // Publish while the same authority guard still orders the terminal
-                // state transition. A target that was already in syscall entry
-                // must either finish its earlier guarded transaction or observe
-                // this Stop after acquiring it.
-                for (cpu_index, identity) in identities.into_iter().enumerate() {
-                    let Some(identity) = identity else {
-                        continue;
+                        NativeSyscallRequest::ThreadTerminate {
+                            thread,
+                            reason,
+                            code,
+                        } => {
+                            match runtime.prepare_remote_thread_termination(thread, reason, code) {
+                                ThreadTerminationPreparation::Immediate(result) => {
+                                    let ready = runtime.ready_to_return(result);
+                                    drop(runtime);
+                                    self.drain_quantum_cancellation_detached();
+                                    break 'handled ready;
+                                }
+                                ThreadTerminationPreparation::Remote(prepared) => {
+                                    let phase = prepared.phase;
+                                    let identities = prepared.identities;
+                                    let pending = PendingRemoteTermination::Thread(
+                                        PendingRemoteThreadTermination {
+                                            phase,
+                                            prepared: prepared.prepared,
+                                            deferred: core::array::from_fn(|_| None),
+                                        },
+                                    );
+                                    (identities, pending)
+                                }
+                            }
+                        }
+                        _ => unreachable!("terminal request classification drifted"),
                     };
-                    let deferred =
-                        crate::arch::x86_64::idle::publish_live_remote_stop(identity, ())
-                            .unwrap_or_else(|failure| {
-                                let error = failure.error();
-                                let _resource = failure.into_resource();
-                                panic!("remote-stop publication failed: {error:?}")
-                            });
-                    match &mut pending {
-                        PendingRemoteTermination::Process(pending) => {
-                            pending.deferred[cpu_index] = Some(deferred)
-                        }
-                        PendingRemoteTermination::TaskGroup(pending) => {
-                            pending.deferred[cpu_index] = Some(deferred)
-                        }
-                        PendingRemoteTermination::Thread(pending) => {
-                            pending.deferred[cpu_index] = Some(deferred)
+                    let (identities, mut pending) = prepared;
+                    // Publish while the same authority guard still orders the terminal
+                    // state transition. A target that was already in syscall entry
+                    // must either finish its earlier guarded transaction or observe
+                    // this Stop after acquiring it.
+                    for (cpu_index, identity) in identities.into_iter().enumerate() {
+                        let Some(identity) = identity else {
+                            continue;
+                        };
+                        let deferred =
+                            crate::arch::x86_64::idle::publish_live_remote_stop(identity, ())
+                                .unwrap_or_else(|failure| {
+                                    let error = failure.error();
+                                    let _resource = failure.into_resource();
+                                    panic!("remote-stop publication failed: {error:?}")
+                                });
+                        match &mut pending {
+                            PendingRemoteTermination::Process(pending) => {
+                                pending.deferred[cpu_index] = Some(deferred)
+                            }
+                            PendingRemoteTermination::TaskGroup(pending) => {
+                                pending.deferred[cpu_index] = Some(deferred)
+                            }
+                            PendingRemoteTermination::Thread(pending) => {
+                                pending.deferred[cpu_index] = Some(deferred)
+                            }
                         }
                     }
+                    self.pending_remote_termination = Some(pending);
+                    break 'handled crate::syscall::native::ReturnReady::complete_remote_stop();
                 }
-                self.pending_remote_termination = Some(pending);
-                return NativeSyscallResult {
-                    status: DW_STATUS_SUCCESS,
-                    control: SyscallControl::CompleteRemoteStop,
-                };
             }
-        }
-        let cpu = self.cpu;
-        let result = match self.with_synchronized_runtime_at_safe_point(|runtime| {
-            if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
-                runtime.service_pending_timer_expiries_on_bootstrap();
-            }
-            runtime.handle(request).into_result()
-        }) {
-            Ok(result) => result,
-            Err(()) => {
-                return NativeSyscallResult {
-                    status: DW_STATUS_SUCCESS,
-                    control: SyscallControl::ServiceRendezvous,
-                };
-            }
+            let cpu = self.cpu;
+            let ready = match self.with_synchronized_runtime_at_safe_point(|runtime| {
+                if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                    runtime.service_pending_timer_expiries_on_bootstrap();
+                }
+                runtime.handle(request)
+            }) {
+                Ok(ready) => ready,
+                Err(()) => {
+                    break 'handled crate::syscall::native::ReturnReady::service_rendezvous();
+                }
+            };
+            crate::task::drain_runnable_work_notifications();
+            self.drain_quantum_cancellation_detached();
+            ready
         };
-        crate::task::drain_runnable_work_notifications();
-        self.drain_quantum_cancellation_detached();
-        result
+        ready.into_result()
     }
 }
 
@@ -8237,7 +8244,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             .pending_remote_termination
             .take()
             .unwrap_or_else(|| panic!("remote-stop control omitted its CPU-local termination"));
-        let result = match pending {
+        let ready = match pending {
             PendingRemoteTermination::Process(pending) => {
                 let permits =
                     await_remote_stop_permits(pending.deferred, self.runtime.guard_free());
@@ -8245,7 +8252,12 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 {
                     let mut runtime = self.runtime.lock();
                     runtime.switch_cpu(self.cpu);
-                    runtime.complete_process_termination(pending.phase, pending.prepared, permits)
+                    let result = runtime.complete_process_termination(
+                        pending.phase,
+                        pending.prepared,
+                        permits,
+                    );
+                    runtime.ready_to_return(result)
                 }
             }
             PendingRemoteTermination::TaskGroup(pending) => {
@@ -8255,11 +8267,12 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 {
                     let mut runtime = self.runtime.lock();
                     runtime.switch_cpu(self.cpu);
-                    runtime.complete_task_group_termination(
+                    let result = runtime.complete_task_group_termination(
                         pending.phase,
                         pending.prepared,
                         permits,
-                    )
+                    );
+                    runtime.ready_to_return(result)
                 }
             }
             PendingRemoteTermination::Thread(pending) => {
@@ -8269,11 +8282,17 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 {
                     let mut runtime = self.runtime.lock();
                     runtime.switch_cpu(self.cpu);
-                    runtime.complete_thread_termination(pending.phase, pending.prepared, permits)
+                    let result = runtime.complete_thread_termination(
+                        pending.phase,
+                        pending.prepared,
+                        permits,
+                    );
+                    runtime.ready_to_return(result)
                 }
             }
         };
         self.drain_quantum_cancellation_detached();
+        let result = ready.into_result();
         frame.set_status(result.status);
         if result.control == SyscallControl::ReturnToCaller
             && let Err(error) = self.authorize_return(frame, current_binding_generation)
@@ -9546,12 +9565,20 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
         };
         self.commit_runtime_phase(phase);
+        self.ready_to_return(result)
+    }
+
+    /// The only way a syscall result leaves the runtime guard for its
+    /// dispatcher. A syscall return is the publication boundary for final
+    /// handle releases: a result that returns to the caller first drains the
+    /// carrier's cleanup queue, so no peer signal, waiter wake or payload
+    /// reclamation stays parked there while userspace resumes (TSV row 76).
+    fn ready_to_return(
+        &mut self,
+        result: NativeSyscallResult,
+    ) -> crate::syscall::native::ReturnReady {
         match crate::syscall::native::ReturnReady::without_return(result) {
             Ok(ready) => ready,
-            // A normal syscall return is the publication boundary for final
-            // handle releases. Do not expose a successful close to userspace
-            // while its peer signal, waiter wakes, or payload reclamation is
-            // still parked in the carrier-local cleanup queue.
             Err(result) => {
                 crate::syscall::native::ReturnReady::drained(result, self.publish_final_releases())
             }

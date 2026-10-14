@@ -1,6 +1,7 @@
 use deepwyrm_abi::{
-    DW_STATUS_INVALID_ARGUMENT, DW_STATUS_NOT_SUPPORTED, DwClockId, DwDeadline, DwHandle,
-    DwKnownSyscall, DwRights, DwSignals, DwStatus, DwSyscallId, DwTerminationReason, DwUserAddress,
+    DW_STATUS_INVALID_ARGUMENT, DW_STATUS_NOT_SUPPORTED, DW_STATUS_SUCCESS, DwClockId, DwDeadline,
+    DwHandle, DwKnownSyscall, DwRights, DwSignals, DwStatus, DwSyscallId, DwTerminationReason,
+    DwUserAddress,
 };
 
 use super::{DecodedSyscall, RawSyscallArguments, decode};
@@ -458,6 +459,28 @@ impl ReturnReady {
             Err(result)
         } else {
             Ok(Self { result })
+        }
+    }
+
+    /// A Stop reached the runtime at a safe point: the dispatcher services the
+    /// rendezvous and never returns this result to the caller.
+    pub(crate) const fn service_rendezvous() -> Self {
+        Self {
+            result: NativeSyscallResult {
+                status: DW_STATUS_SUCCESS,
+                control: SyscallControl::ServiceRendezvous,
+            },
+        }
+    }
+
+    /// A termination published remote Stops. The dispatcher completes them
+    /// before anything returns, and that completion owes its own proof.
+    pub(crate) const fn complete_remote_stop() -> Self {
+        Self {
+            result: NativeSyscallResult {
+                status: DW_STATUS_SUCCESS,
+                control: SyscallControl::CompleteRemoteStop,
+            },
         }
     }
 
