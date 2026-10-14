@@ -30,7 +30,9 @@ use super::root_switch::{
 
 use super::GuardFree;
 use super::cpu_slots::{CpuOwner, CpuSlots, OtherCpus, RemotelyStaged};
-use super::runtime_authority::{RuntimeAuthorityHandle, RuntimeAuthorityLock};
+use super::runtime_authority::{
+    InterruptAuthorityHandle, RuntimeAuthorityHandle, RuntimeAuthorityLock,
+};
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -1582,6 +1584,18 @@ static PRIMORDIAL_FACADES: crate::one_shot::OneShotStorage<
     >; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
 > = crate::one_shot::OneShotStorage::new();
 
+/// The per-CPU quantum-expiry publishers, owned once for the kernel's lifetime
+/// beside the facades and reached only through their published pointers
+/// ([P-FACADE]).
+static PRIMORDIAL_QUANTUM_EXPIRY: crate::one_shot::OneShotStorage<
+    [QuantumExpiryPublisher<
+        'static,
+        'static,
+        { crate::BOOTSTRAP_FRAME_RANGE_CAPACITY },
+        { crate::BOOTSTRAP_FRAME_ROLE_CAPACITY },
+    >; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+> = crate::one_shot::OneShotStorage::new();
+
 /// The primordial runtime's authority lock and the carrier it guards, owned
 /// once for the kernel's lifetime (S2K-4, reset R2D).
 static PRIMORDIAL_RUNTIME_AUTHORITY: crate::one_shot::OneShotStorage<
@@ -1732,6 +1746,46 @@ struct RuntimeCarrierFacade<
     pending_remote_termination: Option<PendingRemoteTermination>,
 }
 
+/// One CPU's quantum-expiry publisher (S2K-6, [CARRIER] gap 2 in
+/// `syscall/live.rs`). Its own per-CPU object beside the facade, published
+/// with the facade, so the timer interrupt and synchronous quantum
+/// cancellation publish an expiry without reborrowing a facade that a
+/// suspended frame on this CPU still holds.
+///
+/// Handle-locking rule: each CPU has two runtime-authority handles, its
+/// facade's `RuntimeAuthorityHandle` and this publisher's
+/// `InterruptAuthorityHandle`, which cannot mint `GuardFree`; at most one of
+/// them holds the guard.
+/// This publisher locks only from the timer interrupt, which this CPU takes
+/// only inside an STI window, and from synchronous quantum cancellation; the
+/// facade enters both only after dropping its guard (the idle STI window and
+/// `drain_quantum_cancellation_detached` take a `GuardFree` from the facade's
+/// handle).
+struct QuantumExpiryPublisher<
+    'runtime,
+    'roles,
+    const RANGE_CAPACITY: usize,
+    const ROLE_CAPACITY: usize,
+> {
+    runtime: InterruptAuthorityHandle<
+        'runtime,
+        PrimordialRuntimeState<'roles, RANGE_CAPACITY, ROLE_CAPACITY>,
+    >,
+}
+
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    crate::syscall::native::NativeQuantumExpiry
+    for QuantumExpiryPublisher<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn publish_quantum_expiry(
+        &mut self,
+        ticket: crate::task::SchedulerQuantumTicket,
+    ) -> Result<bool, crate::task::SchedulerError> {
+        let guard = self.runtime.lock();
+        guard.core.shared.execution.publish_quantum_expiry(ticket)
+    }
+}
+
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     RuntimeCarrierFacade<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
@@ -1744,8 +1798,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let Some(ticket) = ticket else {
             return;
         };
-        crate::time::cancel_scheduler_quantum(ticket)
-            .unwrap_or_else(|error| panic!("scheduler quantum cancellation failed: {error:?}"));
+        cancel_scheduler_quantum_guard_free(ticket, self.runtime.guard_free());
         let mut guard = self.runtime.lock();
         let runtime = guard.on(&mut self.owned);
         runtime.commit_local_scheduler_quantum_cancellation(ticket);
@@ -2275,8 +2328,18 @@ fn complete_q35_handler_after_eoi(generation: u64) {
     shared.interrupt_platform.complete_handler(generation);
 }
 
-fn bind_runtime_carrier_facades<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
-    facades: core::ptr::NonNull<RuntimeCarrierFacade<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>>,
+fn bind_runtime_carrier_facades<
+    'runtime,
+    'roles,
+    const RANGE_CAPACITY: usize,
+    const ROLE_CAPACITY: usize,
+>(
+    facades: core::ptr::NonNull<
+        RuntimeCarrierFacade<'runtime, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>,
+    >,
+    publishers: core::ptr::NonNull<
+        QuantumExpiryPublisher<'runtime, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>,
+    >,
 ) -> usize {
     let registry = crate::arch::x86_64::smp::live_cpu_registry();
     let live_cpu_count = registry.len();
@@ -2303,6 +2366,8 @@ fn bind_runtime_carrier_facades<const RANGE_CAPACITY: usize, const ROLE_CAPACITY
         // SAFETY: [P-FACADE] `cpu_index < live_cpu_count <= H1_RUNTIME_CPU_SLOT_COUNT`, so this is
         // an element of the permanent facade array, derived from its one base pointer.
         let carrier = unsafe { facades.add(cpu_index) };
+        // SAFETY: [P-FACADE] as above, an element of the permanent publisher array.
+        let publisher = unsafe { publishers.add(cpu_index) };
         // SAFETY: [P-FACADE] a field read through the element pointer; no reference to the facade.
         let shared = unsafe { (*carrier.as_ptr()).shared };
         if cpu_index == 0 {
@@ -2311,7 +2376,7 @@ fn bind_runtime_carrier_facades<const RANGE_CAPACITY: usize, const ROLE_CAPACITY
             // provenance, which is the callee's contract.
             unsafe {
                 crate::arch::x86_64::syscall::bind_running_native_runtime_carrier_for_slot(
-                    cpu, carrier,
+                    cpu, carrier, publisher,
                 )
             }
             .unwrap_or_else(|error| {
@@ -2322,7 +2387,9 @@ fn bind_runtime_carrier_facades<const RANGE_CAPACITY: usize, const ROLE_CAPACITY
             // SAFETY: [P-FACADE] as for CPU0 above; the AP is parked and cannot reach the carrier
             // callbacks during publication.
             unsafe {
-                crate::arch::x86_64::syscall::bind_native_runtime_carrier_for_slot(cpu, carrier)
+                crate::arch::x86_64::syscall::bind_native_runtime_carrier_for_slot(
+                    cpu, carrier, publisher,
+                )
             }
             .unwrap_or_else(|error| {
                 shared.execution.fail_carrier_admission(cpu);
@@ -2412,6 +2479,33 @@ fn carrier_resource_tuple<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
         } else {
             crate::task::CarrierDeadlineState::ApSchedulerTimerMasked
         },
+    }
+}
+
+/// Cancels this CPU's exact scheduler quantum. Cancellation can publish a due
+/// expiry synchronously through this CPU's quantum-expiry publisher, which
+/// locks the runtime authority through its own handle, so the caller must
+/// not hold its facade's guard: the `GuardFree` token proves it
+/// (`QuantumExpiryPublisher`'s handle-locking rule).
+fn cancel_scheduler_quantum_guard_free(
+    ticket: crate::task::SchedulerQuantumTicket,
+    _guard_free: GuardFree<'_>,
+) {
+    crate::time::cancel_scheduler_quantum(ticket)
+        .unwrap_or_else(|error| panic!("scheduler quantum cancellation failed: {error:?}"));
+}
+
+/// Halts the idle CPU until an interrupt, with IF set only inside the
+/// window. The timer interrupt taken there can publish a quantum expiry
+/// through this CPU's publisher, which locks the runtime authority, so the
+/// caller must not hold its facade's guard: the `GuardFree` token proves it
+/// (`QuantumExpiryPublisher`'s handle-locking rule).
+fn halt_for_interrupt(_guard_free: GuardFree<'_>) {
+    // SAFETY: as at `wait_for_suspend_interrupt` in `syscall/live.rs`: CPL0 with IF clear, so
+    // STI;HLT is race-free and CLI restores IF clear. Handlers run inside the window write memory
+    // read after it, so the block omits `nomem` and is a compiler memory barrier.
+    unsafe {
+        core::arch::asm!("sti", "hlt", "cli", options(nostack));
     }
 }
 
@@ -8293,24 +8387,11 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     unsafe_code,
     reason = "CPU-local carrier callbacks serialize shared authorities and drop their coarse guard before every AP idle or userspace handoff"
 )]
-impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrameRuntime
-    for RuntimeCarrierFacade<'_, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>
+impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    NativeSyscallFrameRuntime
+    for RuntimeCarrierFacade<'runtime, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>
 {
-    fn publish_quantum_expiry(
-        &mut self,
-        ticket: crate::task::SchedulerQuantumTicket,
-    ) -> Result<bool, crate::task::SchedulerError> {
-        let published = {
-            let mut guard = self.runtime.lock();
-            let runtime = guard.on(&mut self.owned);
-            runtime
-                .core
-                .shared
-                .execution
-                .publish_quantum_expiry(ticket)?
-        };
-        Ok(published)
-    }
+    type QuantumExpiry = QuantumExpiryPublisher<'runtime, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>;
 
     fn prepare_quantum(
         &mut self,
@@ -9037,13 +9118,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                                 .unwrap_or_else(|error| {
                                     panic!("AP idle accounting publication failed: {error:?}")
                                 });
-                            // SAFETY: as at `wait_for_suspend_interrupt` in `syscall/live.rs`:
-                            // CPL0 with IF clear, so STI;HLT is race-free and CLI restores IF
-                            // clear. Handlers run inside the window write memory read after it,
-                            // so the block omits `nomem` and is a compiler memory barrier.
-                            unsafe {
-                                core::arch::asm!("sti", "hlt", "cli", options(nostack));
-                            }
+                            halt_for_interrupt(self.runtime.guard_free());
                             crate::arch::x86_64::idle::finish_current_idle(halt).unwrap_or_else(
                                 |error| panic!("AP idle completion failed: {error:?}"),
                             );
@@ -9684,7 +9759,16 @@ pub(super) fn enter(
     // into the base pointer every later facade access derives from, and is never used again.
     let facades = core::ptr::NonNull::from(PRIMORDIAL_FACADES.init(facades))
         .cast::<RuntimeCarrierFacade<'static, 'static, RANGE_CAPACITY, ROLE_CAPACITY>>();
-    let live_cpu_count = bind_runtime_carrier_facades(facades);
+    // Each CPU's interrupt-context handle, minted once, goes to its quantum-expiry publisher.
+    let publishers: [_; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] = runtime_ref
+        .interrupt_handles()
+        .map(|runtime| QuantumExpiryPublisher { runtime });
+    // [P-FACADE] as for the facades: the publisher array's one owner's reference is converted
+    // here, once, into the base pointer every later access derives from.
+    let publishers = core::ptr::NonNull::from(PRIMORDIAL_QUANTUM_EXPIRY.init(publishers))
+        .cast::<QuantumExpiryPublisher<'static, 'static, RANGE_CAPACITY, ROLE_CAPACITY>>(
+    );
+    let live_cpu_count = bind_runtime_carrier_facades(facades, publishers);
     user_access::initialize_live_tlb_shootdown();
     prepare_runtime_carrier_admission(facades, live_cpu_count);
     normalize_bootstrap_carrier(facades);

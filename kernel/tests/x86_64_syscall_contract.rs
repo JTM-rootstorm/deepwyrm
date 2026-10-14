@@ -1234,7 +1234,7 @@ fn live_timer_expiry_is_bound_and_serviced_only_from_carrier_safe_points() {
     );
     let shared_carrier = runtime
         .split_once(
-            "impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrameRuntime\n    for RuntimeCarrierFacade",
+            "impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>\n    NativeSyscallFrameRuntime\n    for RuntimeCarrierFacade",
         )
         .expect("shared native carrier callbacks")
         .1;
@@ -1855,7 +1855,10 @@ fn h2_syscall_entry_and_native_runtime_carriers_are_fixed_per_cpu() {
     assert!(primordial.contains("    runtime: RuntimeAuthorityHandle<"));
     assert!(primordial.contains("    owned: CpuOwnedState,"));
     assert!(primordial.contains(".map(|owner| Some(CpuOwnedState::new(owner)));"));
-    assert!(primordial.contains("let live_cpu_count = bind_runtime_carrier_facades(facades);"));
+    assert!(
+        primordial
+            .contains("let live_cpu_count = bind_runtime_carrier_facades(facades, publishers);")
+    );
     assert!(primordial.contains(
         "release_runtime_carrier_facades(\n        shared,\n        unsafe { &mut (*facades.as_ptr()).runtime },"
     ));
@@ -1878,7 +1881,10 @@ fn i1_stationary_foundation_keeps_authority_and_carrier_boundaries_explicit() {
     assert!(primordial.contains("struct PhysicallyExecuting {"));
     assert!(primordial.contains("    physically_executing: PhysicallyExecuting,"));
     assert!(primordial.contains("    owned: CpuOwnedState,"));
-    assert!(primordial.contains("let live_cpu_count = bind_runtime_carrier_facades(facades);"));
+    assert!(
+        primordial
+            .contains("let live_cpu_count = bind_runtime_carrier_facades(facades, publishers);")
+    );
     assert!(primordial.contains(
         "release_runtime_carrier_facades(\n        shared,\n        unsafe { &mut (*facades.as_ptr()).runtime },"
     ));
@@ -2034,7 +2040,9 @@ fn f1_facades_are_reached_only_through_their_published_pointers() {
             "a published facade is re-borrowed after publication: {forbidden}"
         );
     }
-    assert!(after.contains("let live_cpu_count = bind_runtime_carrier_facades(facades);"));
+    assert!(
+        after.contains("let live_cpu_count = bind_runtime_carrier_facades(facades, publishers);")
+    );
     assert!(after.contains("enter_published_native_syscall_runtime(\n            facades,"));
     let bind = primordial
         .split_once("fn bind_runtime_carrier_facades<")
@@ -2063,8 +2071,8 @@ fn f2_runtime_binding_is_retained_by_divergent_entry_and_suspension_drops_short_
     // F1 (S2K): the divergent entry retains the carrier as the raw pointer it was published with,
     // taken once from the caller's pin, so no `&mut` is retagged over the published address.
     assert!(divergent_entry_api.contains("runtime: core::pin::Pin<&'runtime mut R>"));
-    assert!(live.contains("    runtime: core::ptr::NonNull<R>,\n}"));
-    assert!(live.contains("let entry = NativeSyscallRuntimeEntry { runtime };"));
+    assert!(live.contains("    runtime: core::ptr::NonNull<R>,\n"));
+    assert!(live.contains("let entry = NativeSyscallRuntimeEntry {\n        runtime,\n"));
     assert!(live.contains("unsafe { entry.enter(state, stack, exception_binding) }"));
     assert!(live.contains("let context = self.runtime.as_ptr();"));
     assert!(!live.contains("Pin::get_unchecked_mut(self.runtime.as_mut())"));

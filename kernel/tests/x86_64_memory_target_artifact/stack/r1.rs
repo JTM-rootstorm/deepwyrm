@@ -90,7 +90,8 @@ pub(crate) fn validate_r1_thread_stack_margin(
         function_body(disassembly, &syscall_dispatch).contains(&format!(" <{bound_dispatch}>"))
     );
     let bound_body = function_body(disassembly, &bound_dispatch);
-    assert_eq!(bound_body.matches("\tjmp\trcx").count(), 1);
+    // One indirect tail jump, through whichever register holds the handler.
+    assert_eq!(bound_body.matches("\tjmp\tr").count(), 1);
     assert!(bound_body.contains("syscall::live::RUNTIME"));
     assert!(
         function_body(disassembly, &runtime_trampoline).contains(&format!(" <{dispatch_frame}>"))

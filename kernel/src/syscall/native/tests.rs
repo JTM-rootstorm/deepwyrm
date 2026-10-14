@@ -231,6 +231,8 @@ impl crate::arch::x86_64::syscall::UserReturnMappingValidation for FrameRuntime 
     reason = "the host fixture implements the runtime suspension boundary without producing a live plan"
 )]
 impl NativeSyscallFrameRuntime for FrameRuntime {
+    type QuantumExpiry = super::NoQuantumExpiry;
+
     #[cfg(deepwyrm_dw1b_evidence)]
     fn intercept_dw1b_evidence_raw(
         &mut self,
@@ -370,6 +372,8 @@ impl NativeSyscallHandler for SuspendingRuntime {
     reason = "the host fixture implements the runtime suspension boundary without producing a live plan"
 )]
 impl NativeSyscallFrameRuntime for SuspendingRuntime {
+    type QuantumExpiry = super::NoQuantumExpiry;
+
     #[cfg(deepwyrm_dw1b_evidence)]
     fn intercept_dw1b_evidence_raw(
         &mut self,

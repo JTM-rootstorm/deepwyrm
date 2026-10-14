@@ -7,9 +7,9 @@ use super::*;
 /// now carries the folded dispatch frame, and the production handler.
 /// `EXPECTED_TERMINATE` adds the task-group terminate helpers, and
 /// `EXPECTED_REQUIRED` adds architectural headroom and required spare.
-pub(crate) const EXPECTED_COMMON: usize = 50_800;
-pub(crate) const EXPECTED_TERMINATE: usize = 72_880;
-pub(crate) const EXPECTED_REQUIRED: usize = 109_744;
+pub(crate) const EXPECTED_COMMON: usize = 50_816;
+pub(crate) const EXPECTED_TERMINATE: usize = 72_896;
+pub(crate) const EXPECTED_REQUIRED: usize = 109_760;
 
 pub(crate) fn validate_wyr1e8_thread_stack_margin(
     sizes: &[StackSize],
@@ -70,7 +70,8 @@ pub(crate) fn validate_wyr1e8_thread_stack_margin(
         function_body(disassembly, &syscall_dispatch).contains(&format!(" <{bound_dispatch}>"))
     );
     let bound_body = function_body(disassembly, &bound_dispatch);
-    assert_eq!(bound_body.matches("\tjmp\trcx").count(), 1);
+    // One indirect tail jump, through whichever register holds the handler.
+    assert_eq!(bound_body.matches("\tjmp\tr").count(), 1);
     assert!(bound_body.contains("syscall::live::RUNTIME"));
     assert!(
         function_body(disassembly, &runtime_trampoline).contains(&format!(" <{dispatch_frame}>")),
@@ -156,5 +157,5 @@ fn e8_thread_capacity_fits_the_ordinary_thread_stack_after_r5() {
         assert!(PRE_R5_REQUIRED > ORDINARY);
         assert!(EXPECTED_REQUIRED <= ORDINARY);
     }
-    assert_eq!(ORDINARY - EXPECTED_REQUIRED, 414_544);
+    assert_eq!(ORDINARY - EXPECTED_REQUIRED, 414_528);
 }

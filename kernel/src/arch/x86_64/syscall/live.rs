@@ -53,16 +53,19 @@ use super::runtime_binding::{
 // re-read from the destination CPU's binding. The `bind_*` and `enter_native_syscall_runtime`
 // callers owe the stationarity and no-other-reference contract.
 //
-// [CARRIER] model gaps, UNVERIFIED (S2K). (1) Divergent carrier methods taking `&mut self`
+// [CARRIER] model gap, UNVERIFIED (S2K). (1) Divergent carrier methods taking `&mut self`
 // (`terminate_current`, `enter_idle_scheduler`, `rendezvous_stop`, or a detached caller reaching
 // `handoff_current_rendezvous_from_carrier`) abandon frames that still hold a protected `&mut R`,
 // and the carrier is later reborrowed through the published pointer. No abandoned frame resumes,
-// but Stacked and Tree Borrows do not treat the protector as ended. (2)
-// `native_runtime_quantum_expiry` can reborrow the carrier while a `&mut self` method of the same
-// carrier is suspended and will resume: synchronously through
-// `RuntimeCarrierFacade::drain_quantum_cancellation_detached` -> `cancel_scheduler_quantum` on an
-// AP, and from the timer IRQ during the facade idle loop's STI window. The nested call reads only
-// immutable facade fields, but Stacked Borrows rejects the overlap.
+// but Stacked and Tree Borrows do not treat the protector as ended.
+//
+// [QUANTUM-EXPIRY] (closes the former gap (2), S2K-6) Quantum expiry is published from the timer
+// interrupt and from synchronous quantum cancellation, both of which can run while a `&mut self`
+// method of this CPU's carrier is suspended and will resume (the idle STI window; draining a
+// cancellation). Its context is therefore not the carrier: each CPU publishes a separate
+// `NativeQuantumExpiry` object with its binding (`quantum_expiry_context`), and only
+// `native_runtime_quantum_expiry` reborrows it. No carrier frame holds a reference to it, and
+// publication does not re-enter quantum expiry, so its reborrow never overlaps another.
 //
 // [GUARD-FREE] Crate-visible physical boundaries here (`enter_bound_validated_user`,
 // `enter_bound_idle_scheduler`, `handoff_current_rendezvous_from_carrier`), and
@@ -178,6 +181,9 @@ struct RuntimeBindingState {
     user_exception_handler: UserExceptionRuntimeHandler,
     rendezvous_gate_handler: RendezvousGateHandler,
     rendezvous_reaper_handler: RendezvousReaperHandler,
+    /// This CPU's quantum-expiry publisher: a separate object from `context`
+    /// (`NativeQuantumExpiry`), reached only by `quantum_expiry_handler`.
+    quantum_expiry_context: *mut (),
     quantum_expiry_handler: QuantumExpiryHandler,
     prepare_quantum_handler: PrepareQuantumHandler,
     timer_pre_iret_handler: TimerPreIretHandler,
@@ -276,6 +282,10 @@ struct NativeSyscallRuntimeEntry<
         + crate::syscall::native::NativeRendezvousRuntime,
 > {
     runtime: core::ptr::NonNull<R>,
+    /// The quantum-expiry publisher to bind when this entry publishes the
+    /// runtime itself (the guest runtimes); `None` when its caller already
+    /// published both (the primordial runtime).
+    quantum_expiry: Option<core::ptr::NonNull<R::QuantumExpiry>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -948,6 +958,7 @@ pub(crate) unsafe fn bind_native_runtime_carrier_for_slot<
 >(
     cpu_index: crate::cpu::CpuIndex,
     runtime: core::ptr::NonNull<R>,
+    quantum_expiry: core::ptr::NonNull<R::QuantumExpiry>,
 ) -> Result<(), SyscallRuntimeBindError> {
     let cpu_index = cpu_index.index();
     if INSTALL_STATE
@@ -973,7 +984,8 @@ pub(crate) unsafe fn bind_native_runtime_carrier_for_slot<
             native_runtime_user_exception::<R>,
             native_runtime_rendezvous_gate::<R>,
             native_runtime_rendezvous_reaper::<R>,
-            native_runtime_quantum_expiry::<R>,
+            quantum_expiry.as_ptr().cast::<()>(),
+            native_runtime_quantum_expiry::<R::QuantumExpiry>,
             native_runtime_prepare_quantum::<R>,
             native_runtime_timer_pre_iret::<R>,
         )
@@ -1001,12 +1013,13 @@ pub(crate) unsafe fn bind_running_native_runtime_carrier_for_slot<
 >(
     cpu: crate::cpu::CpuIndex,
     runtime: core::ptr::NonNull<R>,
+    quantum_expiry: core::ptr::NonNull<R::QuantumExpiry>,
 ) -> Result<(), SyscallRuntimeBindError> {
     if cpu != crate::cpu::CpuIndex::BOOTSTRAP {
         return Err(SyscallRuntimeBindError::InvalidCpu);
     }
     // SAFETY: forwarded: this function's `# Safety` is `bind_native_runtime_carrier_for_slot`'s.
-    unsafe { bind_native_runtime_carrier_for_slot(cpu, runtime) }?;
+    unsafe { bind_native_runtime_carrier_for_slot(cpu, runtime, quantum_expiry) }?;
     release_native_runtime_carrier_for_slot(cpu)
 }
 
@@ -1065,10 +1078,14 @@ unsafe fn publish_syscall_runtime(
     user_exception_handler: UserExceptionRuntimeHandler,
     rendezvous_gate_handler: RendezvousGateHandler,
     rendezvous_reaper_handler: RendezvousReaperHandler,
+    quantum_expiry_context: *mut (),
     quantum_expiry_handler: QuantumExpiryHandler,
     prepare_quantum_handler: PrepareQuantumHandler,
     timer_pre_iret_handler: TimerPreIretHandler,
 ) -> Result<(), SyscallRuntimeBindError> {
+    if quantum_expiry_context.is_null() {
+        return Err(SyscallRuntimeBindError::NullContext);
+    }
     let state = RUNTIME_STATE
         .get(cpu_index)
         .ok_or(SyscallRuntimeBindError::InvalidCpu)?;
@@ -1109,6 +1126,7 @@ unsafe fn publish_syscall_runtime(
             user_exception_handler,
             rendezvous_gate_handler,
             rendezvous_reaper_handler,
+            quantum_expiry_context,
             quantum_expiry_handler,
             prepare_quantum_handler,
             timer_pre_iret_handler,
@@ -1333,14 +1351,15 @@ pub(crate) extern "sysv64" fn dw_x86_64_rendezvous_reaper() -> ! {
     unsafe_code,
     reason = "the interrupt dispatcher invokes only the immutable CPU-local carrier callback with an exact scheduler ticket"
 )]
-unsafe fn native_runtime_quantum_expiry<R: crate::syscall::native::NativeSyscallFrameRuntime>(
+unsafe fn native_runtime_quantum_expiry<P: crate::syscall::native::NativeQuantumExpiry>(
     context: *mut (),
     ticket: crate::task::SchedulerQuantumTicket,
 ) -> bool {
-    // SAFETY: UNVERIFIED (S2K): no `&mut` to this CPU's carrier may be live in any frame that
-    // resumes after this call. Gap (2) in [CARRIER] shows two paths where one is.
-    let runtime = unsafe { &mut *context.cast::<R>() };
-    runtime
+    // SAFETY: [QUANTUM-EXPIRY] `context` is this CPU's publisher, bound with this handler
+    // monomorphized for its `P`; no carrier frame holds a reference to it, and this is its only,
+    // non-reentrant, reborrow.
+    let publisher = unsafe { &mut *context.cast::<P>() };
+    publisher
         .publish_quantum_expiry(ticket)
         .unwrap_or_else(|_| halt_forever())
 }
@@ -1368,9 +1387,9 @@ pub(crate) fn publish_current_quantum_expiry(
     ticket: crate::task::SchedulerQuantumTicket,
 ) -> Result<bool, ()> {
     let binding = runtime_binding().ok_or(())?;
-    // SAFETY: UNVERIFIED (S2K): the handler is the matching `native_runtime_quantum_expiry::<R>`,
-    // but it needs what that function's UNVERIFIED note states, which gap (2) in [CARRIER] breaks.
-    Ok(unsafe { (binding.quantum_expiry_handler)(binding.context, ticket) })
+    // SAFETY: this CPU's immutable binding pairs its quantum-expiry publisher with the matching
+    // `native_runtime_quantum_expiry::<P>`, whose contract that publisher meets.
+    Ok(unsafe { (binding.quantum_expiry_handler)(binding.quantum_expiry_context, ticket) })
 }
 
 /// Begins a fresh exact quantum only after all runtime/scheduler guards have
@@ -2218,7 +2237,18 @@ pub(crate) unsafe fn enter_native_syscall_runtime<
     // SAFETY: the pointer is taken once from the pin, which is consumed here and never used again,
     // so every later access goes through it; nothing moves `R`.
     let runtime = core::ptr::NonNull::from(unsafe { core::pin::Pin::get_unchecked_mut(runtime) });
-    let entry = NativeSyscallRuntimeEntry { runtime };
+    // The guest runtimes arm no quantum: their publisher is zero-sized, so a dangling, aligned
+    // pointer is a valid one, and no storage is needed.
+    const {
+        assert!(
+            size_of::<R::QuantumExpiry>() == 0,
+            "a guest runtime's quantum-expiry publisher must be zero-sized"
+        );
+    }
+    let entry = NativeSyscallRuntimeEntry {
+        runtime,
+        quantum_expiry: Some(core::ptr::NonNull::dangling()),
+    };
     // SAFETY: forwarded from this function's `# Safety`; `enter` performs the remaining binding
     // checks itself.
     unsafe { entry.enter(state, stack, exception_binding) }
@@ -2246,7 +2276,10 @@ pub(crate) unsafe fn enter_published_native_syscall_runtime<
     stack: KernelStackBounds,
     exception_binding: &crate::arch::x86_64::exceptions::UserExceptionBinding,
 ) -> ! {
-    let entry = NativeSyscallRuntimeEntry { runtime };
+    let entry = NativeSyscallRuntimeEntry {
+        runtime,
+        quantum_expiry: None,
+    };
     // SAFETY: forwarded from this function's `# Safety`; `enter` checks the pointer against the
     // published binding and halts on a mismatch.
     unsafe { entry.enter(state, stack, exception_binding) }
@@ -2296,7 +2329,11 @@ impl<
                     native_runtime_user_exception::<R>,
                     native_runtime_rendezvous_gate::<R>,
                     native_runtime_rendezvous_reaper::<R>,
-                    native_runtime_quantum_expiry::<R>,
+                    self.quantum_expiry
+                        .unwrap_or_else(|| halt_forever())
+                        .as_ptr()
+                        .cast::<()>(),
+                    native_runtime_quantum_expiry::<R::QuantumExpiry>,
                     native_runtime_prepare_quantum::<R>,
                     native_runtime_timer_pre_iret::<R>,
                 )

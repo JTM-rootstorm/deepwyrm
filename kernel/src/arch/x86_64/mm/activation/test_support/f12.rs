@@ -1577,6 +1577,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrameRuntime
     for F12Runtime<'_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
+    type QuantumExpiry = crate::syscall::native::NoQuantumExpiry;
+
     fn authorize_return(
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,

@@ -6,7 +6,10 @@
 //! `RuntimeAuthorityHandle` per CPU, once, and a handle locks through
 //! `&mut self`. A CPU's guard therefore borrows that CPU's handle for its
 //! whole lifetime, which is what lets the guard-free token (S2K-3) be a
-//! borrow-checker fact.
+//! borrow-checker fact. `interrupt_handles` mints each CPU a second,
+//! `InterruptAuthorityHandle`, once, for the publication that runs from
+//! interrupt context (S2K-6); it locks the same way but cannot certify the
+//! CPU guard-free.
 //!
 //! Split out of the target-only `primordial.rs` (S2K-3) because it uses only
 //! atomics and an `UnsafeCell`, so the host build compiles it, host Clippy
@@ -50,6 +53,7 @@ const _: () = assert!(
 pub(super) struct RuntimeAuthorityLock<T> {
     tickets: TicketPair,
     handles_taken: AtomicBool,
+    interrupt_handles_taken: AtomicBool,
     value: UnsafeCell<T>,
 }
 
@@ -67,6 +71,7 @@ impl<T> RuntimeAuthorityLock<T> {
                 serving: AtomicU64::new(0),
             },
             handles_taken: AtomicBool::new(false),
+            interrupt_handles_taken: AtomicBool::new(false),
             value: UnsafeCell::new(value),
         }
     }
@@ -84,6 +89,18 @@ impl<T> RuntimeAuthorityLock<T> {
             panic!("runtime authority handles were minted twice");
         }
         core::array::from_fn(|_| RuntimeAuthorityHandle { lock: self })
+    }
+
+    /// Mints each CPU slot's interrupt-context handle, once. It has no
+    /// `guard_free`, so a guard it holds can never coexist with a token
+    /// minted from it.
+    pub(super) fn interrupt_handles<const CPUS: usize>(
+        &self,
+    ) -> [InterruptAuthorityHandle<'_, T>; CPUS] {
+        if self.interrupt_handles_taken.swap(true, Ordering::AcqRel) {
+            panic!("runtime authority interrupt handles were minted twice");
+        }
+        core::array::from_fn(|_| InterruptAuthorityHandle { lock: self })
     }
 
     fn lock(&self) -> RuntimeAuthorityGuard<'_, T> {
@@ -114,8 +131,9 @@ impl<T> RuntimeAuthorityLock<T> {
     }
 }
 
-/// One CPU's only way to acquire the runtime authority. Neither `Clone` nor
-/// `Copy`: `RuntimeAuthorityLock::handles` mints one per CPU.
+/// One CPU's way to acquire the runtime authority and certify it guard-free.
+/// Neither `Clone` nor `Copy`: `RuntimeAuthorityLock::handles` mints one per
+/// CPU. The CPU's only other handle is its `InterruptAuthorityHandle`.
 pub(super) struct RuntimeAuthorityHandle<'a, T> {
     lock: &'a RuntimeAuthorityLock<T>,
 }
@@ -130,12 +148,30 @@ impl<T> RuntimeAuthorityHandle<'_, T> {
     /// Certifies that this CPU holds no runtime-authority guard. Refused by
     /// the borrow checker while a guard from this handle is alive.
     pub(super) fn guard_free(&mut self) -> GuardFree<'_> {
-        // SAFETY: this handle is its CPU's only way to acquire the lock (`handles` mints one per
-        // CPU, once, and `lock(&self)` is private to this module), and a guard mutably borrows the
-        // handle for its whole life. `&mut self` here therefore proves no guard of this CPU is
-        // alive, and the token's borrow of the handle keeps one from being acquired before the
-        // token is consumed.
+        // SAFETY: a guard mutably borrows its handle for its whole life, so `&mut self` proves no
+        // guard of this handle is alive, and the token's borrow keeps one from being acquired
+        // before it is consumed. `lock(&self)` is private to this module, so the CPU's only other
+        // handle is its `InterruptAuthorityHandle`: its guard lives only inside one interrupt-
+        // context publication, which mints no token and returns before this CPU's code resumes.
         unsafe { GuardFree::assume() }
+    }
+}
+
+/// One CPU's handle for publication from interrupt context (S2K-6: the
+/// quantum-expiry publisher). Neither `Clone` nor `Copy`, minted once per CPU
+/// by `RuntimeAuthorityLock::interrupt_handles`. It locks like a
+/// `RuntimeAuthorityHandle` but has no `guard_free`, so it never certifies
+/// the CPU guard-free. Its holder may lock only where the CPU's
+/// `RuntimeAuthorityHandle` holds no guard, or the ticket lock deadlocks.
+pub(super) struct InterruptAuthorityHandle<'a, T> {
+    lock: &'a RuntimeAuthorityLock<T>,
+}
+
+impl<T> InterruptAuthorityHandle<'_, T> {
+    /// Acquires the runtime authority. The guard mutably borrows this
+    /// handle until it drops.
+    pub(super) fn lock(&mut self) -> RuntimeAuthorityGuard<'_, T> {
+        self.lock.lock()
     }
 }
 
@@ -197,6 +233,20 @@ mod tests {
         assert_eq!(*first.lock(), 3);
         assert_eq!(lock.tickets.next_ticket.load(Ordering::Relaxed), 3);
         assert_eq!(lock.tickets.serving.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn interrupt_handles_are_minted_once_and_serialize_with_the_cpu_handles() {
+        let lock = RuntimeAuthorityLock::new(0_u32);
+        let [mut cpu] = lock.handles::<1>();
+        let [mut interrupt] = lock.interrupt_handles::<1>();
+        *interrupt.lock() += 1;
+        *cpu.lock() += 1;
+        assert_eq!(*interrupt.lock(), 2);
+        let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = lock.interrupt_handles::<1>();
+        }));
+        assert!(again.is_err());
     }
 
     #[test]

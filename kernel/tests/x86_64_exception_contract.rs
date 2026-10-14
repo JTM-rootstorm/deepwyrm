@@ -485,25 +485,21 @@ fn quantum_clock_is_sampled_only_inside_synchronized_preparation() {
 fn dw1b_timer_return_validation_is_fail_closed_before_resume_or_rearm() {
     let live = source("src/arch/x86_64/syscall/live.rs");
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    // S2K-6: the per-CPU quantum-expiry publisher, not the facade, publishes under its own
+    // runtime-authority handle.
     let expiry = primordial
-        .rsplit_once("fn publish_quantum_expiry(")
-        .expect("live facade quantum-expiry publisher")
+        .split_once("crate::syscall::native::NativeQuantumExpiry\n    for QuantumExpiryPublisher")
+        .expect("primordial quantum-expiry publisher")
         .1
-        .split_once("fn prepare_quantum(")
-        .expect("live facade quantum-expiry publisher extent")
+        .split_once("\n}\n")
+        .expect("primordial quantum-expiry publisher extent")
         .0;
-    assert!(expiry.contains("let runtime = guard.on(&mut self.owned);"));
-    assert!(!expiry.contains("runtime.select_cpu(self.cpu);"));
-    assert!(expiry.contains("runtime\n                .core\n                .shared\n                .execution\n                .publish_quantum_expiry(ticket)?"));
-    assert!(expiry.contains("let published = {"));
-    assert!(expiry.contains("Ok(published)"));
     assert!(!expiry.contains("notify_completed_switch_runnable"));
-    let runtime_lock = expiry.find("let mut guard = self.runtime.lock();").unwrap();
+    let runtime_lock = expiry.find("let guard = self.runtime.lock();").unwrap();
     let publish = expiry
-        .find("runtime\n                .core\n                .shared\n                .execution\n                .publish_quantum_expiry(ticket)?")
+        .find("guard.core.shared.execution.publish_quantum_expiry(ticket)")
         .unwrap();
-    let result = expiry.find("Ok(published)").unwrap();
-    assert!(runtime_lock < publish && publish < result);
+    assert!(runtime_lock < publish);
 
     let gate = live
         .split_once("unsafe fn native_runtime_timer_pre_iret")
@@ -651,7 +647,7 @@ fn dw1b_syscall_return_accounts_due_budget_before_preemption_and_rearm() {
         .find("take_local_scheduler_quantum_cancellation()")
         .expect("take exact transition ticket under runtime authority");
     let cancel = detached_cancel
-        .find("crate::time::cancel_scheduler_quantum(ticket)")
+        .find("cancel_scheduler_quantum_guard_free(ticket, self.runtime.guard_free())")
         .expect("cancel exact physical source without runtime authority");
     let commit = detached_cancel
         .find("runtime.commit_local_scheduler_quantum_cancellation(ticket)")

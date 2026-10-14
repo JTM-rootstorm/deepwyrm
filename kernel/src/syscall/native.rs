@@ -953,17 +953,41 @@ pub(crate) enum NativePreemptionPlan<'owner> {
     Switch(crate::arch::x86_64::context::KernelSwitchPlan<'owner>),
 }
 
-#[allow(
-    unsafe_code,
-    reason = "plan-producing runtime methods carry physical-current and fixed-entry obligations that safe Rust cannot encode"
-)]
-pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
+/// One CPU's quantum-expiry publisher. Expiry is published from the timer
+/// interrupt and from synchronous quantum cancellation, both of which can run
+/// while this CPU's runtime is borrowed by a suspended frame that will resume
+/// (a facade method in its idle STI window, or draining a cancellation). The
+/// publisher is therefore its own per-CPU object, published beside the runtime
+/// and never the runtime itself, so publication reborrows nothing that frame
+/// holds ([CARRIER] gap 2 in `syscall/live.rs`, closed by S2K-6).
+pub(crate) trait NativeQuantumExpiry {
+    fn publish_quantum_expiry(
+        &mut self,
+        ticket: crate::task::SchedulerQuantumTicket,
+    ) -> Result<bool, crate::task::SchedulerError>;
+}
+
+/// The publisher of a runtime that arms no quantum: every expiry is stale.
+/// Zero-sized, so its binding needs no storage.
+pub(crate) struct NoQuantumExpiry;
+
+impl NativeQuantumExpiry for NoQuantumExpiry {
     fn publish_quantum_expiry(
         &mut self,
         _ticket: crate::task::SchedulerQuantumTicket,
     ) -> Result<bool, crate::task::SchedulerError> {
         Ok(false)
     }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "plan-producing runtime methods carry physical-current and fixed-entry obligations that safe Rust cannot encode"
+)]
+pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
+    /// This runtime's per-CPU quantum-expiry publisher, a separate object from
+    /// the runtime itself (see [`NativeQuantumExpiry`]).
+    type QuantumExpiry: NativeQuantumExpiry;
 
     /// Samples a new dispatch budget only inside synchronized preparation,
     /// immediately before scheduler preparation. The sampler must not acquire
