@@ -2315,7 +2315,9 @@ mod tests {
             .split("fn authorize_return(")
             .next()
             .unwrap();
-        assert!(raw.contains(".workload_complete(self.process, values[1], values[2])"));
+        assert!(
+            raw.contains(".workload_complete(self.own.scheduled().process, values[1], values[2])")
+        );
         assert!(!raw.contains("complete_dw1c_evidence"));
         assert!(!raw.contains("final_normal_completion"));
         assert!(

@@ -1244,7 +1244,7 @@ mod tests {
             .rfind("self.finish_primordial_terminal_handoff(")
             .expect("the primordial completion arm is gone");
         let guard = body[..completion]
-            .rfind("ifself.tasks.any_process_unexited_except(retirement.retired_process){")
+            .rfind("ifself.core.tasks.any_process_unexited_except(retirement.retired_process){")
             .expect("the primordial completion arm is not guarded by the last-Process check");
         let retire = body[guard..completion]
             .find("TerminalKernelContinuation::RetirePrimordialToIdle{")

@@ -189,8 +189,11 @@ fn i1_native_adapter_phases_revalidate_exact_identity_after_guard_free_work() {
     );
     assert!(!services.contains("struct FServiceDispatchCommit"));
     assert!(services.contains("The enclosing native runtime phase owns the only"));
-    assert!(primordial.contains(".prepare_dispatch(request, self.thread, root_generation)"));
-    assert!(primordial.contains("self.services.dispatch_prepared("));
+    assert!(
+        primordial
+            .contains(".prepare_dispatch(request, self.own.scheduled().thread, root_generation)")
+    );
+    assert!(primordial.contains("self.core.services.dispatch_prepared("));
     assert!(primordial.contains("let phase = self.reserve_runtime_phase();"));
     assert!(primordial.contains("self.commit_runtime_phase(phase);"));
 
@@ -380,7 +383,7 @@ fn i1_post_ack_carrier_never_reuses_a_retired_frame_for_late_holdsafe() {
         .find("self.stage_rendezvous_cleanup();")
         .expect("cleanup staging");
     let consume_reaper = precommit
-        .find("self\n            .rendezvous_reaper\n            .take()")
+        .find("self\n            .core\n            .rendezvous_reaper\n            .take()")
         .expect("irreversible reaper witness consume");
     assert!(stage < consume_reaper);
     let finalizers = primordial
@@ -390,7 +393,7 @@ fn i1_post_ack_carrier_never_reuses_a_retired_frame_for_late_holdsafe() {
         .split_once("fn prove_registry_capacity")
         .expect("finalizer drain extent")
         .0;
-    assert!(finalizers.contains("while let Some(release) = self.cleanup.pop()"));
+    assert!(finalizers.contains("while let Some(release) = self.core.cleanup.pop()"));
     assert!(finalizers.contains("crate::syscall::complete_wait_wakes("));
 }
 
@@ -416,10 +419,10 @@ fn i1_remote_termination_waits_guard_free_for_exact_ack_before_reclaim() {
         .expect("live carrier dispatch extent")
         .0;
     assert!(dispatch.contains("publish_live_remote_stop(identity, ())"));
-    assert!(dispatch.contains("let mut runtime = self.runtime.lock();"));
+    assert!(dispatch.contains("let mut guard = self.runtime.lock();"));
     assert!(primordial.contains("fn stopped_service_state_is_quiescent(&self)"));
-    assert!(primordial.contains("self.services.operation_owner(self.thread)"));
-    assert!(primordial.contains("self.cpus[self.cpu.index()].wait_control.is_clear()"));
+    assert!(primordial.contains(".operation_owner(self.own.scheduled().thread)"));
+    assert!(primordial.contains("self.own.wait_control.is_clear()"));
     // The wait-before-reacquire order is static since S2K-3: `await_remote_stop_permits` takes a
     // `GuardFree` token, which the facade cannot mint while it holds the runtime guard, and the
     // reclaim is a carrier method, which only a guard reaches.
@@ -630,7 +633,7 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
         .split_once("fn resume_suspended(")
         .expect("live suspended-resume facade")
         .1;
-    assert!(resume.contains("runtime.switch_cpu(self.cpu);"));
+    assert!(resume.contains("let mut runtime = guard.on(&mut self.owned);"));
     assert!(resume.contains("runtime.resume_suspended(frame)"));
 
     // The facade's invalid return takes the remote-stop-aware terminal path
@@ -652,8 +655,8 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
         .expect("remote terminal exception boundary")
         .0;
     let remote_switch = remote_terminal
-        .find("runtime.switch_cpu(self.cpu);")
-        .expect("remote terminal CPU restoration");
+        .find("let mut runtime = guard.on(&mut self.owned);")
+        .expect("remote terminal carrier for this CPU");
     let remote_ack = remote_terminal
         .find("runtime.complete_physical_switch_handoff()")
         .expect("remote terminal switch acknowledgement");
@@ -725,15 +728,17 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
         .find(".suspended_claim_on(self.cpu)")
         .unwrap();
     let physical = post_ack_helper
-        .find("suspended.thread(),\n                        runtime.thread")
+        .find("suspended.thread(),\n                            runtime.own.scheduled().thread")
         .unwrap();
     let prepare = post_ack_helper
         .find(".prepare_scheduler_root_switch()")
         .unwrap();
     let terminal = post_ack_helper
-        .find(".terminal_scheduler_current_on(&runtime.tasks, self.cpu)")
+        .find(".terminal_scheduler_current_on(&runtime.core.tasks, self.cpu)")
         .unwrap();
-    let terminal_owner = post_ack_helper.find("terminal, runtime.thread").unwrap();
+    let terminal_owner = post_ack_helper
+        .find("terminal,\n                                runtime.own.scheduled().thread")
+        .unwrap();
     let process_root = post_ack_helper.find("active_root.process(),").unwrap();
     assert!(suspended < physical && physical < terminal && terminal < terminal_owner);
     assert!(terminal_owner < process_root && process_root < prepare);
@@ -781,7 +786,7 @@ fn i1_detached_scheduler_sync_honors_terminal_stop_publication() {
         .find("take_current_notification_at_safe_point()")
         .expect("preparation-time Stop arbitration");
     let barrier = safe
-        .find("terminal_scheduler_current_on(&runtime.tasks, self.cpu)")
+        .find("terminal_scheduler_current_on(&runtime.core.tasks, self.cpu)")
         .expect("terminal Stop publication barrier");
     let prepare = safe
         .find("runtime.prepare_scheduler_root_switch()")
@@ -821,7 +826,7 @@ fn i2_suspended_resume_gives_remote_stop_priority_under_scheduler_authority() {
         .expect("live suspended-resume facade terminator")
         .0;
     let authority = resume.find("self.runtime.lock()").unwrap();
-    let carrier = resume.find("runtime.switch_cpu(self.cpu)").unwrap();
+    let carrier = resume.find("= guard.on(&mut self.owned)").unwrap();
     let acknowledgement = resume
         .find("runtime.complete_physical_switch_handoff()")
         .unwrap();
@@ -849,7 +854,11 @@ fn i2_suspended_resume_gives_remote_stop_priority_under_scheduler_authority() {
     );
     assert!(resume.contains("NativeResumeOutcome::ServiceRendezvous"));
     assert!(!resume.contains("let no_current"));
-    assert!(resume.contains("suspended.thread(),\n                        runtime.thread"));
+    assert!(
+        resume.contains(
+            "suspended.thread(),\n                        runtime.own.scheduled().thread"
+        )
+    );
     assert!(resume.contains("suspended.thread(),\n                        deferred.thread()"));
 
     let suspended = live
@@ -890,10 +899,10 @@ fn i2_terminal_reclaim_handoff_is_owned_by_the_exact_physical_cpu() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
     let live = source("src/arch/x86_64/syscall/live.rs");
 
-    // S2K-5: the deferred current is a field of each CPU's `CpuRuntimeState`, and the shared
+    // S2K-6: the deferred current is a field of each CPU's `CpuSharedState`, and the shared
     // carrier has no single one that another CPU could consume.
     let per_cpu = runtime
-        .split_once("struct CpuRuntimeState {")
+        .split_once("struct CpuSharedState {")
         .expect("per-CPU runtime state")
         .1
         .split_once("\n}\n")
@@ -912,7 +921,7 @@ fn i2_terminal_reclaim_handoff_is_owned_by_the_exact_physical_cpu() {
         .expect("shared carrier extent")
         .0;
     assert!(!carrier.contains("deferred_current"));
-    assert!(runtime.contains("self.cpus[self.cpu.index()].deferred_current"));
+    assert!(runtime.contains("self.own.deferred_current"));
     assert!(runtime.contains("            deferred_current: None,"));
     assert!(runtime.contains("NativeResumeOutcome::TerminateCurrent"));
 
@@ -1215,7 +1224,7 @@ fn live_timer_expiry_is_bound_and_serviced_only_from_carrier_safe_points() {
     assert!(runtime.contains("crate::time::bind_timer_expiry_target(target)"));
     assert!(runtime.contains("fn service_pending_timer_expiries_on_bootstrap(&mut self)"));
     assert!(runtime.contains("general Timer expiry service escaped CPU0 ownership"));
-    assert!(runtime.contains(".expire(token, &self.shared.waits)"));
+    assert!(runtime.contains(".expire(token, &self.core.shared.waits)"));
     assert!(runtime.contains("timer_expiries:\n        IrqSpinMutex<"));
     assert_eq!(
         runtime
@@ -1372,7 +1381,7 @@ fn i1_terminal_child_without_local_work_rejoins_the_idle_scheduler() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
 
     assert!(runtime.contains("enum PreparedTerminalHandoff"));
-    assert!(runtime.contains("if retirement.retired_process != self.primordial_process"));
+    assert!(runtime.contains("if retirement.retired_process != self.core.primordial_process"));
     assert!(runtime.contains("self.finish_inactive_process_teardown("));
     assert!(runtime.contains("PreparedTerminalHandoff::IdleScheduler"));
     assert!(runtime.contains("syscall::enter_bound_idle_scheduler(\n"));
@@ -1429,11 +1438,11 @@ fn wyr1_terminal_child_after_primordial_retirement_uses_its_current_root() {
         .0;
     let retired_child = terminal
         .split_once(
-            "if retirement.retired_process != self.primordial_process && primordial_retired {",
+            "if retirement.retired_process != self.core.primordial_process && primordial_retired {",
         )
         .expect("WYR1 retired-primordial child branch")
         .1
-        .split_once("\n        if retirement.retired_process != self.primordial_process {")
+        .split_once("\n        if retirement.retired_process != self.core.primordial_process {")
         .expect("legacy retained-primordial child branch")
         .0;
     let retirement_fact = terminal
@@ -1441,7 +1450,7 @@ fn wyr1_terminal_child_after_primordial_retirement_uses_its_current_root() {
         .expect("WYR1 primordial retirement fact")
         .1
         .split_once(
-            "if retirement.retired_process != self.primordial_process && primordial_retired {",
+            "if retirement.retired_process != self.core.primordial_process && primordial_retired {",
         )
         .expect("WYR1 retired-primordial child branch")
         .0;
@@ -1468,7 +1477,9 @@ fn wyr1_terminal_child_after_primordial_retirement_uses_its_current_root() {
     let retirement = continuation
         .find("self.finish_quiesced_process_root_retirement(")
         .unwrap();
-    let idle = continuation.find("self.local.record_idle()").unwrap();
+    let idle = continuation
+        .find("self.owned.physically_executing.record_idle()")
+        .unwrap();
 
     assert!(reporter_guard < reporter_info);
     assert!(reporter_info < reporter_failure);
@@ -1486,7 +1497,7 @@ fn wyr1_terminal_child_after_primordial_retirement_uses_its_current_root() {
     assert!(retirement_fact.contains("Ok(Some(_)) => false"));
     assert!(retirement_fact.contains("supervisor_evidence_detail(0xd00d)"));
     assert!(!retired_child.contains("prepare_process_root_selection("));
-    assert!(!retired_child.contains("self.primordial_address_space"));
+    assert!(!retired_child.contains("self.core.primordial_address_space"));
 }
 
 /// Text test: the completion-failure details are emitted only on the target-only terminal path.
@@ -1507,7 +1518,7 @@ fn wyr1_primordial_completion_failures_have_variant_specific_details() {
     assert!(terminal.contains(
         "if retiring_wyr1_primordial && let Err(error) = validate_primordial_retirement_facts(self)"
     ));
-    assert!(terminal.contains("let terminal_info = self.g5_probe.terminal_info;"));
+    assert!(terminal.contains("let terminal_info = self.core.g5_probe.terminal_info;"));
     assert!(terminal.contains("complete_fail(primordial_completion_detail(error, terminal_info))"));
     assert!(!terminal.contains("supervisor_evidence_detail(0xd001)"));
 
@@ -1603,7 +1614,7 @@ fn final_external_thread_completion_retires_pins_before_process_root_teardown() 
         .find("self.finish_terminal_adapter_resources(")
         .expect("terminal resource completion");
     let external_guard = completion
-        .find("exited_process.filter(|target| *target != self.process)")
+        .find("exited_process.filter(|target| *target != self.own.scheduled().process)")
         .expect("external final-Process guard");
     let teardown = completion
         .find("self.finish_inactive_process_teardown(")
@@ -1621,15 +1632,15 @@ fn i1_live_wait_suspension_uses_the_physical_current_cpu() {
     let adapters = source("src/syscall/adapters.rs");
     let waits = source("src/wait/engine.rs");
 
-    assert!(runtime.contains("self.thread,\n                        self.cpu,"));
+    assert!(runtime.contains("scheduled.thread,\n                        self.cpu,"));
     assert!(services.contains("wait_many_syscall_on("));
     assert!(services.contains("wait_one_syscall_on("));
     assert!(services.contains("current_cpu,"));
     assert!(waits.contains("prepare_block_current_on(cpu, thread)"));
     assert!(waits.contains("cancel_block_on(cpu, block)"));
     assert!(waits.contains("commit_published_block_on(cpu, block)"));
-    assert!(runtime.contains("self.services.prepare_suspend_on("));
-    assert!(runtime.contains("self.services.poll_idle_suspend_on("));
+    assert!(runtime.contains("self.core.services.prepare_suspend_on("));
+    assert!(runtime.contains("self.core.services.poll_idle_suspend_on("));
     assert!(services.contains("control.prepare_suspend_on(cpu"));
     assert!(services.contains("control.poll_idle_on(cpu"));
     assert!(adapters.contains("schedule_from_idle_on(cpu, suspended)"));
@@ -1842,13 +1853,13 @@ fn h2_syscall_entry_and_native_runtime_carriers_are_fixed_per_cpu() {
             .contains("pub(super) struct RuntimeAuthorityLock<T>")
     );
     assert!(primordial.contains("    runtime: RuntimeAuthorityHandle<"));
-    assert!(primordial.contains("struct PerCpuLiveCarrier"));
-    assert!(primordial.contains("initialize_per_cpu_live_carriers()"));
+    assert!(primordial.contains("    owned: CpuOwnedState,"));
+    assert!(primordial.contains(".map(|owner| Some(CpuOwnedState::new(owner)));"));
     assert!(primordial.contains("let live_cpu_count = bind_runtime_carrier_facades(facades);"));
     assert!(primordial.contains(
         "release_runtime_carrier_facades(\n        shared,\n        unsafe { &mut (*facades.as_ptr()).runtime },"
     ));
-    assert!(primordial.contains("runtime.switch_cpu(self.cpu)"));
+    assert!(primordial.contains("let mut runtime = guard.on(&mut self.owned);"));
     assert!(primordial.contains("runtime.prepare_fresh_user_entry_synchronized()"));
     assert!(primordial.contains("syscall::enter_bound_validated_user(\n"));
     assert!(!primordial.contains("reject_entry"));
@@ -1864,10 +1875,9 @@ fn i1_stationary_foundation_keeps_authority_and_carrier_boundaries_explicit() {
     // S2K-1 deleted the never-instantiated RuntimeCore/PagingAuthority family
     // and S2K-3 its guard-depth check; the reservation remains.
     assert!(stationary.contains("struct RuntimePhaseReservation"));
-    assert!(primordial.contains("struct PerCpuLiveCarrier"));
-    assert!(primordial.contains("initialize_per_cpu_live_carriers"));
-    assert!(primordial.contains("0..crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT"));
-    assert!(primordial.contains("local: &'static PerCpuLiveCarrier"));
+    assert!(primordial.contains("struct PhysicallyExecuting {"));
+    assert!(primordial.contains("    physically_executing: PhysicallyExecuting,"));
+    assert!(primordial.contains("    owned: CpuOwnedState,"));
     assert!(primordial.contains("let live_cpu_count = bind_runtime_carrier_facades(facades);"));
     assert!(primordial.contains(
         "release_runtime_carrier_facades(\n        shared,\n        unsafe { &mut (*facades.as_ptr()).runtime },"
@@ -2075,12 +2085,12 @@ fn i1_live_wait_control_is_owned_by_each_physical_cpu_carrier() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
     let services = source("src/syscall/f_services.rs");
 
-    // S2K-5: each CPU's wait control is a field of its `CpuRuntimeState`.
-    assert!(
-        runtime.contains("cpus: [CpuRuntimeState; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT]")
-    );
+    // S2K-6: each CPU's wait control is a field of its guarded `CpuSharedState` slot.
+    assert!(runtime.contains(
+        "cpus: CpuSlots<CpuSharedState, { crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT }>,"
+    ));
     assert!(runtime.contains("    wait_control: NativeWaitControl,"));
-    assert!(runtime.contains("&mut self.cpus[self.cpu.index()].wait_control"));
+    assert!(runtime.contains("&mut self.own.wait_control"));
     assert!(runtime.contains(".all(|cpu| cpu.wait_control.is_clear())"));
     assert!(
         !services.contains("control: NativeWaitControl,"),
@@ -2232,8 +2242,9 @@ fn dw1c_detach_commits_its_root_flight_without_ordinary_cpu_reselection() {
 
     assert!(prepare < execute && execute < commit);
     assert!(
-        !detach[execute..commit].contains("runtime.switch_cpu(self.cpu)"),
-        "the executed root-switch flight must reselect its authenticated CPU"
+        detach[execute..commit].contains("guard.on_root_switch_flight(&mut self.owned)")
+            && !detach[execute..commit].contains("guard.on(&mut self.owned)"),
+        "the executed root-switch flight must be committed by its flight carrier"
     );
 }
 
@@ -2291,9 +2302,8 @@ fn dw1c1_terminal_handoff_executes_every_root_switch_outside_the_runtime_guard()
     assert!(!facade.contains("runtime.prepare_terminal_handoff()"));
     // Every terminal root switch runs outside the runtime guard, and every commit after it under
     // a reacquired guard: static since S2K-3 (`execute` takes a `GuardFree` token and the commits
-    // are carrier methods; see `kernel/tests/root_switch_ui.rs`). What stays here until S2K-6
-    // deletes `switch_cpu`: a commit or cancel must not reselect the CPU, because its flight
-    // selects the exact in-flight CPU.
+    // are carrier methods; see `kernel/tests/root_switch_ui.rs`). What stays here: a commit or
+    // cancel runs on the carrier built for its in-flight root switch, never an ordinary one.
     for commit in [
         "runtime.commit_scheduler_root_switch(executed)",
         "runtime.commit_terminal_kernel_root_switch(executed)",
@@ -2301,11 +2311,11 @@ fn dw1c1_terminal_handoff_executes_every_root_switch_outside_the_runtime_guard()
     ] {
         let commit = facade.find(commit).unwrap();
         let reacquire = facade[..commit]
-            .rfind("let mut runtime = self.runtime.lock()")
+            .rfind("let mut guard = self.runtime.lock()")
             .unwrap();
         assert!(
-            !facade[reacquire..commit].contains("runtime.switch_cpu(self.cpu)"),
-            "terminal root commit bypassed its exact in-flight selector"
+            facade[reacquire..commit].contains("guard.on_root_switch_flight(&mut self.owned)"),
+            "terminal root commit bypassed its flight carrier"
         );
     }
     for cancel in [
@@ -2315,12 +2325,12 @@ fn dw1c1_terminal_handoff_executes_every_root_switch_outside_the_runtime_guard()
     ] {
         let cancel = facade.find(cancel).unwrap();
         let reacquire = facade[..cancel]
-            .rfind("let mut runtime = self.runtime.lock()")
+            .rfind("let mut guard = self.runtime.lock()")
             .unwrap();
-        assert!(!facade[reacquire..cancel].contains("runtime.switch_cpu(self.cpu)"));
+        assert!(facade[reacquire..cancel].contains("guard.on_root_switch_flight(&mut self.owned)"));
     }
-    assert!(primordial.contains("self.select_root_switch_flight(executed.flight)"));
-    assert!(primordial.contains("self.select_root_switch_flight(failure.flight)"));
+    assert!(primordial.contains("self.assert_root_switch_flight(executed.flight)"));
+    assert!(primordial.contains("self.assert_root_switch_flight(failure.flight)"));
 }
 
 #[test]

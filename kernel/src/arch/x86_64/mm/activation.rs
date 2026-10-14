@@ -84,6 +84,14 @@ mod primordial_diagnostic;
 ))]
 #[path = "activation/root_switch.rs"]
 mod root_switch;
+// The per-CPU runtime facts other CPUs read under the runtime authority, with
+// owner-only mutation, host-compiled under `test` (S2K-6).
+#[cfg(any(
+    test,
+    all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")
+))]
+#[path = "activation/cpu_slots.rs"]
+mod cpu_slots;
 // The primordial runtime's coarse authority lock and its per-CPU handles,
 // host-compiled under `test` (S2K-3).
 #[cfg(any(

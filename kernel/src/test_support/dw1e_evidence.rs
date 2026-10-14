@@ -2835,7 +2835,9 @@ mod tests {
             .split("fn authorize_return(")
             .next()
             .unwrap();
-        let claim = terminal.find(".prepare_terminal(self.process)").unwrap();
+        let claim = terminal
+            .find(".prepare_terminal(self.own.scheduled().process)")
+            .unwrap();
         let freeze = terminal.find(".try_freeze_dw1e_terminal(claim)").unwrap();
         let freeze_helper = runtime
             .split("fn try_freeze_dw1e_terminal(")

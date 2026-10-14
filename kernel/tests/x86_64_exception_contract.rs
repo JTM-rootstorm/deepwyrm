@@ -155,7 +155,7 @@ fn g5_primordial_selectors_have_exact_post_teardown_oracles() {
         .find("let completion = complete_primordial_launch(self);")
         .expect("structured completion after reaper reclaim");
     let oracle = terminate
-        .find("self.g5_probe.accepts_completion(&completion)")
+        .find("self.core.g5_probe.accepts_completion(&completion)")
         .expect("G5 post-completion oracle");
     assert!(completion < oracle);
 }
@@ -446,7 +446,7 @@ fn quantum_clock_is_sampled_only_inside_synchronized_preparation() {
         .0;
     assert!(
         synchronized
-            .find("let mut runtime = self.runtime.lock();")
+            .find("let mut runtime = guard.on(&mut self.owned);")
             .unwrap()
             < synchronized.find("Ok(operation(&mut runtime))").unwrap()
     );
@@ -492,17 +492,15 @@ fn dw1b_timer_return_validation_is_fail_closed_before_resume_or_rearm() {
         .split_once("fn prepare_quantum(")
         .expect("live facade quantum-expiry publisher extent")
         .0;
-    assert!(expiry.contains("runtime.switch_cpu(self.cpu);"));
+    assert!(expiry.contains("let runtime = guard.on(&mut self.owned);"));
     assert!(!expiry.contains("runtime.select_cpu(self.cpu);"));
-    assert!(expiry.contains("runtime.shared.execution.publish_quantum_expiry(ticket)"));
+    assert!(expiry.contains("runtime\n                .core\n                .shared\n                .execution\n                .publish_quantum_expiry(ticket)?"));
     assert!(expiry.contains("let published = {"));
     assert!(expiry.contains("Ok(published)"));
     assert!(!expiry.contains("notify_completed_switch_runnable"));
-    let runtime_lock = expiry
-        .find("let mut runtime = self.runtime.lock();")
-        .unwrap();
+    let runtime_lock = expiry.find("let mut guard = self.runtime.lock();").unwrap();
     let publish = expiry
-        .find("runtime.shared.execution.publish_quantum_expiry(ticket)?")
+        .find("runtime\n                .core\n                .shared\n                .execution\n                .publish_quantum_expiry(ticket)?")
         .unwrap();
     let result = expiry.find("Ok(published)").unwrap();
     assert!(runtime_lock < publish && publish < result);

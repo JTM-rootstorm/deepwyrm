@@ -310,11 +310,14 @@ fn selector26_private_evidence_surface_is_isolated_and_terminally_ordered() {
         .expect("selector-26 PASS exists");
     assert!(evidence_write < pass, "DWPRE1 must precede PASS DWTEST1");
 
-    assert!(primordial.contains("self.evidence_init_process != Some(self.process)"));
+    assert!(
+        primordial
+            .contains("self.core.evidence_init_process != Some(self.own.scheduled().process)")
+    );
     assert!(primordial.contains("process_target_for_dw1b_evidence"));
     assert!(primordial.contains("exact_single_thread("));
     assert!(primordial.contains("Dw1bRawOperation::decode(arguments.as_array())"));
-    assert!(primordial.contains(".progress(self.process, exchange_count, digest)"));
+    assert!(primordial.contains(".progress(self.own.scheduled().process, exchange_count, digest)"));
     assert!(primordial.contains("g5_probe.accepts_completion(&completion)"));
     assert!(primordial.contains("complete_dw1b_evidence(permit)"));
     assert!(syscall.contains("deepwyrm_dw1b_evidence"));
@@ -349,7 +352,7 @@ fn selector27_private_wrb1_relay_is_exact_and_outside_public_abi() {
     assert!(!public_abi.contains("FFFF_FF1B"));
     assert!(!public_abi.contains("ffff_ff1b"));
     assert!(primordial.contains("WYR1B_EVIDENCE"));
-    assert!(primordial.contains(".authorize_submission(self.process)"));
+    assert!(primordial.contains(".authorize_submission(self.own.scheduled().process)"));
     assert!(primordial.contains("Wyr1bRetirementFacts"));
     assert!(primordial.contains("parse_wyr1b_bootfs_pages"));
     assert!(
@@ -510,7 +513,9 @@ fn selector29_wrc6_restart_relay_is_private_bounded_and_atomic() {
     assert!(evidence.contains("WYR1C_EVIDENCE_TERMINAL_EVENT"));
     assert!(!public_abi.contains("FFFF_FF1C"));
     assert!(!public_abi.contains("ffff_ff1e"));
-    assert!(primordial.contains("WYR1C_EVIDENCE\n            .authorize_submission(self.process)"));
+    assert!(primordial.contains(
+        "WYR1C_EVIDENCE\n            .authorize_submission(self.own.scheduled().process)"
+    ));
     assert!(primordial.contains("WYR1C_EVIDENCE\n            .observe_reporter_start"));
     assert!(primordial.contains("WYR1C_EVIDENCE\n            .bind_reporter_after_retirement"));
 
@@ -561,7 +566,9 @@ fn selector32_wrd1_console_relay_is_private_bounded_joined_and_atomic() {
     assert!(evidence.contains("b\"D5READY|\""));
     assert!(evidence.contains("expected_observation_value"));
     assert!(!public_abi.contains("ffff_ff20"));
-    assert!(primordial.contains("WYR1D_EVIDENCE\n            .authorize_submission(self.process)"));
+    assert!(primordial.contains(
+        "WYR1D_EVIDENCE\n            .authorize_submission(self.own.scheduled().process)"
+    ));
     assert!(primordial.contains("WYR1D_EVIDENCE\n            .observe_reporter_start"));
     assert!(primordial.contains("WYR1D_EVIDENCE\n            .bind_reporter_after_retirement"));
     assert!(primordial.contains("copy_wyr1d_evidence_input::<_, WYR1D_READY_RECORD_LEN>"));
@@ -618,13 +625,13 @@ fn selector33_wre1_shell_relay_is_private_bounded_and_atomic() {
     assert!(!public_abi.contains("ffff_ff21"));
 
     let authorize = primordial
-        .find("WYR1E_EVIDENCE\n            .authorize_submission(self.process)")
+        .find("WYR1E_EVIDENCE\n            .authorize_submission(self.own.scheduled().process)")
         .expect("selector-33 authority check before usercopy");
     let copy = primordial
         .find("copy_wyr1e_evidence_input::<_, WYR1E_EVIDENCE_RECORD_LEN>")
         .expect("selector-33 bounded usercopy");
     let submit = primordial
-        .find("match WYR1E_EVIDENCE.submit_with_diagnostic(self.process, &record)")
+        .find("match WYR1E_EVIDENCE.submit_with_diagnostic(self.own.scheduled().process, &record)")
         .expect("selector-33 authority recheck and commit");
     assert!(authorize < copy && copy < submit);
     assert!(primordial.contains("WYR1E_EVIDENCE\n            .observe_reporter_start"));
@@ -896,17 +903,15 @@ fn wyr1_reporter_enablement_requires_quiescence_after_root_retirement() {
         .map(|offset| start + offset)
         .expect("selector-25 reporter enablement boundary");
     let enablement = &primordial[start..end];
-    assert!(
-        enablement.contains(
-            ".process_quiescence_proof(self.primordial_process)\n                .is_err()"
-        )
-    );
+    assert!(enablement.contains(
+        ".process_quiescence_proof(self.core.primordial_process)\n                .is_err()"
+    ));
     assert!(
         !enablement.contains(
             ".process_quiescence_proof(self.primordial_process)\n                .is_ok()"
         )
     );
-    assert!(enablement.contains(".root_region(self.primordial_process)"));
+    assert!(enablement.contains(".root_region(self.core.primordial_process)"));
     assert!(enablement.contains(".is_some()"));
     assert!(enablement.contains("process_lifecycle(reporter)"));
 }
@@ -1137,9 +1142,9 @@ fn g5_primordial_blocking_uses_the_f12_idle_suspend_resume_flow() {
         fs::read_to_string(kernel_root().join("src/arch/x86_64/mm/activation/primordial.rs"))
             .expect("read G5 primordial runtime source");
 
-    assert!(primordial.contains("self.services.prepare_suspend_on("));
-    assert!(primordial.contains("self.services.poll_idle_suspend_on("));
-    assert!(primordial.contains("self.services.resume_suspended("));
+    assert!(primordial.contains("self.core.services.prepare_suspend_on("));
+    assert!(primordial.contains("self.core.services.poll_idle_suspend_on("));
+    assert!(primordial.contains("self.core.services.resume_suspended("));
     assert!(primordial.contains("bind_deadline_wake_target(target)"));
     assert!(!primordial.contains("primordial bootstrap blocked despite its prepublished INIT"));
     assert!(!primordial.contains("primordial bootstrap reached an unexpected idle suspension"));
@@ -1191,9 +1196,9 @@ fn g5_terminal_completion_drains_all_primordial_authority_before_capacity_proof(
         .expect("exact current-root unmap helper");
     let primordial_unmap = &primordial[primordial_unmap_start..current_unmap_start];
     for required in [
-        "self.primordial_process",
-        "self.primordial_root_key",
-        "self.primordial_address_space",
+        "self.core.primordial_process",
+        "self.core.primordial_root_key",
+        "self.core.primordial_address_space",
         "self.unmap_current_userspace(",
     ] {
         assert!(
@@ -1209,8 +1214,8 @@ fn g5_terminal_completion_drains_all_primordial_authority_before_capacity_proof(
     let current_unmap = &primordial[current_unmap_start..inactive_unmap_start];
     for required in [
         "validate_current_process_root_selection(",
-        "self.process != process",
-        "self.root_key != root_key",
+        "self.own.scheduled().process != process",
+        "self.own.scheduled().root_key != root_key",
         ".current_process_address_space(",
         ".publisher::<",
         ".unmap(",
@@ -1233,14 +1238,14 @@ fn g5_terminal_completion_drains_all_primordial_authority_before_capacity_proof(
     let terminal = &primordial[terminal_start..terminal_end];
 
     for required in [
-        "process_quiescence_proof(self.process)",
-        "blocked_operations_drained(&self.tasks, &proof)",
+        "process_quiescence_proof(self.own.scheduled().process)",
+        "blocked_operations_drained(&self.core.tasks, &proof)",
         "unmap_primordial_userspace(&proof)",
-        "if self.process == self.primordial_process",
+        "if self.own.scheduled().process == self.core.primordial_process",
         "prepare_process_root_selection(",
-        "self.primordial_address_space",
-        "self.unmap_inactive_userspace(self.process, self.root_key, &proof)",
-        "teardown_empty_child_address_space(self.process, address_space)",
+        "self.core.primordial_address_space",
+        "self.unmap_inactive_userspace(\n                self.own.scheduled().process,\n                self.own.scheduled().root_key,\n                &proof,",
+        "teardown_empty_child_address_space(self.own.scheduled().process, address_space)",
         "retire_quiesced_root(",
         "release_terminal_authority()",
         "drain_finalizers()",
@@ -1254,10 +1259,10 @@ fn g5_terminal_completion_drains_all_primordial_authority_before_capacity_proof(
     }
     assert!(!terminal.contains("LivePlatform {"));
     let child_unmap = terminal
-        .find("self.unmap_inactive_userspace(self.process, self.root_key, &proof)")
+        .find("self.unmap_inactive_userspace(\n                self.own.scheduled().process,\n                self.own.scheduled().root_key,\n                &proof,")
         .unwrap();
     let child_root_reclaim = terminal
-        .find("teardown_empty_child_address_space(self.process, address_space)")
+        .find("teardown_empty_child_address_space(self.own.scheduled().process, address_space)")
         .unwrap();
     let portable_root_retire = terminal.find("retire_quiesced_root(").unwrap();
     assert!(child_unmap < child_root_reclaim && child_root_reclaim < portable_root_retire);

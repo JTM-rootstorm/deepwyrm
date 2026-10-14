@@ -1644,7 +1644,9 @@ mod tests {
             .split("fn dw1d_process_handle(")
             .next()
             .unwrap();
-        assert!(controller.contains("self.process == self.primordial_process"));
+        assert!(
+            controller.contains("self.own.scheduled().process == self.core.primordial_process")
+        );
         assert!(!controller.contains("evidence_init_process"));
         // One live terminal path since S2K-3 deleted the carrier's never-reached copy.
         assert_eq!(primordial.matches(".final_normal_completion()").count(), 1);

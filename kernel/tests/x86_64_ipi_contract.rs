@@ -156,7 +156,7 @@ fn i1_cpl3_rendezvous_gate_diverges_before_iret() {
         "identity.root_binding_generation() != root.binding_generation()",
         "let scheduler_current_matches =",
         "let suspended_carrier_matches =",
-        "self.local.physically_executes(self.thread)",
+        ".physically_executes(self.own.scheduled().thread)",
         "prepare_kernel_execution_root_switch(previous)",
         "stop_running_claim_on(claim)",
         "prepare_current_rendezvous_stop(request, self)",
@@ -180,7 +180,7 @@ fn i1_cpl3_rendezvous_gate_diverges_before_iret() {
         .expect("carrier stop precommit end")
         .0;
     let reaper_observation = precommit
-        .find("self.rendezvous_reaper.as_ref().is_none()")
+        .find("self.core.rendezvous_reaper.as_ref().is_none()")
         .expect("borrowed reaper observation");
     let current_root = precommit
         .find("validate_current_process_root_selection")
