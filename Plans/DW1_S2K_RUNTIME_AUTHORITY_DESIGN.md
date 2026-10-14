@@ -576,3 +576,78 @@ for all items in S2K -- no temporary bandaids." Applied to §8:
 D2 (terminal engine) and D3 (owned paging transaction) were not questions to
 Mike. They stay deferred until after the S3 reassessment. D4 remains outside
 this plan's authority.
+
+### 11.1 S2K-6 revised: owner-local facts move, remotely read facts stay under the lock (2026-10-14)
+
+The S2K-6 worker stopped before step 2, as §7 and the stop rule require.
+§5.2 moves all of `CpuRuntimeState` into each facade, but six of its facts
+are read or written by *other* CPUs under the runtime lock. A facade is
+exclusively `&mut` on its own CPU, so those accesses would alias it.
+Confirmed from source at `2338f47` (`primordial.rs`):
+
+- `terminal_stop_plan` reads each remote CPU's `identity`,
+  `root_switch_flight` and `active_root`;
+- `retire_unentered_terminal_replacements` stages a remote CPU's
+  `pending_quantum_cancellation`;
+- `service_state_is_quiescent`, `finish_terminal_teardown` and the dw1d
+  event-0x17 check read every CPU's `wait_control`;
+- `prepare_terminal_retirement_state` asserts no CPU holds a
+  `deferred_current`.
+
+Coordinator decision, under Mike's "most proper solution, no temporary
+bandaids" instruction (§11). Mike may overrule it.
+
+1. **Owner-local facts move into the facade:**
+   - `channel_staging`;
+   - `root_switch_epoch`;
+   - the dw1b/dw1c evidence options;
+   - `PerCpuLiveCarrier`, folded in as a plain field without its
+     `IrqSpinMutex`. Every access goes through the current CPU's `local`,
+     so nothing else ever touches it.
+
+   Its `current_thread`, `current_stack` and `current_context` say what
+   physically executes now, and are `None` when the CPU idles. That is a
+   different fact from `identity`, the last scheduled identity that remote
+   CPUs read. Both are kept, under names that say which is which. Neither
+   copies the other.
+2. **Remotely read facts stay in the lock-protected carrier `cpus[]`,** as
+   the single source:
+   - `identity`;
+   - `active_root`;
+   - `root_switch_flight`;
+   - `wait_control`;
+   - `deferred_current`;
+   - `pending_quantum_cancellation`.
+
+   Only the owning CPU's facade path may mutate its own slot, and the type
+   system enforces it: carrier methods receive the owner's slot explicitly,
+   and remote access is read-only. The one remote write,
+   `stage_scheduler_quantum_cancellation_on` for another CPU, is its own
+   named, documented operation.
+3. **Deleted:**
+   - the carrier's current-CPU copies: `cpu`, `local`, `active_root`,
+     `process`, `thread`, `stack_id`, `context_id`, `root_key` and
+     `channel_staging`;
+   - `switch_cpu` and `switch_cpu_state`.
+
+   The R0C count at `2338f47` is 38 call sites (37 `switch_cpu(self.cpu)`,
+   1 dead `select_cpu`, 1 `switch_cpu_state` in `select_root_switch_flight`)
+   plus 2 definitions. All go to 0. §5.2's figure of 36 was an undercount.
+4. **Named behavior change** (finding-4 probe, recorded in the S2K-6 commit):
+   - an empty slot reports no identity;
+   - the liveness mirror no longer names another CPU's Thread or Process;
+   - no decision output changes.
+5. **[CARRIER] gaps 1 and 2** close by this ownership. If the
+   quantum-expiry handler needs a per-CPU context outside the facade to do
+   so, that context is owner-only and type-enforced. Its handle-locking
+   rule is stated in the commit and in this section, not left implicit.
+6. **Rows 72 and 96** become STATIC in this form: owner-only mutation is a
+   type fact. They no longer rest on the premise that no shared array
+   exists.
+
+Rejected:
+
+- **Keeping everything in `cpus[]` behind per-CPU tokens.** It is the
+  smaller diff, but it leaves the owner-local facts shared and proves less.
+- **Moving the six facts into the facades and reaching them remotely
+  through raw pointers.** That is the aliasing the stop prevented.
