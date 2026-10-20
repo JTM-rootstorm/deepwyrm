@@ -2324,7 +2324,7 @@ mod tests {
             raw.find("crate::time::monotonic_now()")
                 < raw.find("let phase = self.reserve_runtime_phase()")
         );
-        assert!(raw.contains(".running_claim_on(self.cpu)"));
+        assert!(raw.contains(".running_claim_on(self.cpu())"));
         assert!(raw.contains("product_execution_generation,"));
         let facade = source
             .split("fn intercept_dw1c_evidence_raw(")

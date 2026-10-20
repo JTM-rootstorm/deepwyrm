@@ -356,7 +356,7 @@ fn i1_post_ack_carrier_never_reuses_a_retired_frame_for_late_holdsafe() {
         .0;
     assert!(continuation.contains("complete_switch_on(stopped_claim)"));
     assert!(continuation.contains("self.drain_staged_rendezvous_cleanup();"));
-    assert!(continuation.contains("terminal_reaper_next_on(self.cpu)"));
+    assert!(continuation.contains("terminal_reaper_next_on(self.cpu())"));
 
     let idle = primordial
         .split_once("fn enter_idle_scheduler(this: DivergentCarrier<'_, Self>) -> !")
@@ -594,7 +594,7 @@ fn i1_live_process_exit_retires_the_current_cpu_carrier() {
     let adapters = source("src/syscall/adapters.rs");
 
     assert!(runtime.contains("crate::syscall::process_exit_on("));
-    assert!(runtime.contains("self.cpu,"));
+    assert!(runtime.contains("self.cpu(),"));
     assert!(adapters.contains("current_cpu: crate::cpu::CpuIndex"));
     assert!(adapters.contains("DeferredCurrentRetirement::Handoff"));
     assert!(adapters.contains("cpu: current_cpu"));
@@ -1370,7 +1370,9 @@ fn i1_terminal_child_without_local_work_rejoins_the_idle_scheduler() {
     let primordial_unmap = terminal
         .find("self.unmap_primordial_userspace(&proof)")
         .unwrap();
-    let next_selection = terminal.find("terminal_reaper_next_on(self.cpu)").unwrap();
+    let next_selection = terminal
+        .find("terminal_reaper_next_on(self.cpu())")
+        .unwrap();
     assert!(primordial_unmap < next_selection);
     // With no successor, a retiring WYR1 primordial enters the kernel root
     // first and is retired only by that root switch's continuation.
@@ -1597,22 +1599,22 @@ fn final_external_thread_completion_retires_pins_before_process_root_teardown() 
     assert!(completion.contains("control == SyscallControl::ReturnToCaller"));
 }
 
+/// Text test: the F-service, wait-engine and adapter seams take the suspension CPU as a
+/// `CpuIndex` argument, a value no type ties to the physical CPU. (The primordial carrier's CPU is
+/// static since S2K-6, TSV row 85: `PrimordialRuntimeCarrier::cpu` is its `CpuOwner`'s, with no
+/// field to reselect.)
 #[test]
 fn i1_live_wait_suspension_uses_the_physical_current_cpu() {
-    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
     let services = source("src/syscall/f_services.rs");
     let adapters = source("src/syscall/adapters.rs");
     let waits = source("src/wait/engine.rs");
 
-    assert!(runtime.contains("scheduled.thread,\n                        self.cpu,"));
     assert!(services.contains("wait_many_syscall_on("));
     assert!(services.contains("wait_one_syscall_on("));
     assert!(services.contains("current_cpu,"));
     assert!(waits.contains("prepare_block_current_on(cpu, thread)"));
     assert!(waits.contains("cancel_block_on(cpu, block)"));
     assert!(waits.contains("commit_published_block_on(cpu, block)"));
-    assert!(runtime.contains("self.core.services.prepare_suspend_on("));
-    assert!(runtime.contains("self.core.services.poll_idle_suspend_on("));
     assert!(services.contains("control.prepare_suspend_on(cpu"));
     assert!(services.contains("control.poll_idle_on(cpu"));
     assert!(adapters.contains("schedule_from_idle_on(cpu, suspended)"));
@@ -1873,9 +1875,9 @@ fn i1_runtime_join_keeps_cpu_identity_and_dispatch_release_separate() {
     assert!(live.contains("release_native_runtime_carrier_for_slot(cpu)"));
     assert!(live.contains("runtime_binding() -> Option<RuntimeBindingState>"));
     assert!(live.contains("!= Some(RuntimeCarrierLifecycle::Executing)"));
-    assert!(primordial.contains("current_thread_on(self.cpu)"));
+    assert!(primordial.contains("current_thread_on(self.cpu())"));
     assert!(primordial.contains("prepare_process_root_selection(self.cpu"));
-    assert!(primordial.contains("terminal_reaper_next_on(self.cpu)"));
+    assert!(primordial.contains("terminal_reaper_next_on(self.cpu())"));
     assert!(primordial.contains("schedule_next_on(this.cpu)"));
     assert!(primordial.contains("begin_execution(cpu_index)"));
     assert!(primordial.contains("idle::enable_live_cpu(cpu)"));

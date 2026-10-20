@@ -151,7 +151,7 @@ fn i1_cpl3_rendezvous_gate_diverges_before_iret() {
     for evidence in [
         "impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>\n    crate::arch::x86_64::rendezvous::RemoteStopSafePoint",
         "identity.cpu_online_generation() != snapshot.online_generation",
-        "current_cpu_index_for_diagnostics()\n            != Some(self.cpu.index())",
+        "current_cpu_index_for_diagnostics()\n            != Some(self.cpu().index())",
         "identity.execution_generation() != claim.generation()",
         "identity.root_binding_generation() != root.binding_generation()",
         "let scheduler_current_matches =",
@@ -162,7 +162,7 @@ fn i1_cpl3_rendezvous_gate_diverges_before_iret() {
         "prepare_current_rendezvous_stop(request, self)",
         "commit_current_rendezvous_stop(witness, self)",
         "prepare_after_rendezvous_stop()",
-        "terminal_reaper_next_on(self.cpu)",
+        "terminal_reaper_next_on(self.cpu())",
         "PreparedCarrierEntry::Idle => {\n                Self::enter_idle_scheduler(DivergentCarrier::from_mut(this))",
         "runtime.prepare_rendezvous_stop(request, reaper)",
         "runtime.commit_rendezvous_stop(witness, root_switch)",

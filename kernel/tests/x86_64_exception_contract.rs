@@ -429,7 +429,7 @@ fn quantum_clock_is_sampled_only_inside_synchronized_preparation() {
     assert_eq!(carrier.matches("sample_now_ns()").count(), 1);
     let sample = carrier.find("let now_ns = sample_now_ns();").unwrap();
     let prepare = carrier
-        .find(".prepare_quantum_if_needed_on(self.cpu, now_ns)")
+        .find(".prepare_quantum_if_needed_on(self.cpu(), now_ns)")
         .unwrap();
     assert!(sample < prepare);
     let facade = primordial.rsplit_once("fn prepare_quantum(").unwrap().1;

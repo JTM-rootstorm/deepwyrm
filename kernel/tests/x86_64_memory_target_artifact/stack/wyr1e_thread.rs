@@ -7,9 +7,9 @@ use super::*;
 /// carries the folded dispatch frame, and the production handler.
 /// `EXPECTED_TERMINATE` adds the task-group terminate helpers, and
 /// `EXPECTED_REQUIRED` adds architectural headroom and required spare.
-pub(crate) const EXPECTED_COMMON: usize = 50_656;
-pub(crate) const EXPECTED_TERMINATE: usize = 72_736;
-pub(crate) const EXPECTED_REQUIRED: usize = 109_600;
+pub(crate) const EXPECTED_COMMON: usize = 50_608;
+pub(crate) const EXPECTED_TERMINATE: usize = 72_688;
+pub(crate) const EXPECTED_REQUIRED: usize = 109_552;
 
 pub(crate) fn validate_wyr1e8_thread_stack_margin(
     sizes: &[StackSize],
@@ -155,5 +155,5 @@ fn e8_thread_capacity_fits_the_ordinary_thread_stack_after_r5() {
         assert!(PRE_R5_REQUIRED > ORDINARY);
         assert!(EXPECTED_REQUIRED <= ORDINARY);
     }
-    assert_eq!(ORDINARY - EXPECTED_REQUIRED, 414_688);
+    assert_eq!(ORDINARY - EXPECTED_REQUIRED, 414_736);
 }

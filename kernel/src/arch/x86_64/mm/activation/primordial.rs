@@ -3330,7 +3330,6 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> PrimordialRuntimeCarrier<'a, 'roles, RANGE_CAPACITY, ROLE_CAPACITY> {
         let (own, others) = self.cpus.split(&owned.owner);
         PrimordialRuntimeCarrier {
-            cpu: owned.owner.cpu(),
             core: &mut self.core,
             own,
             others,
@@ -3345,11 +3344,20 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 /// mutate.
 struct PrimordialRuntimeCarrier<'a, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 {
-    cpu: crate::cpu::CpuIndex,
     core: &'a mut PrimordialRuntimeCore<'roles, RANGE_CAPACITY, ROLE_CAPACITY>,
     own: &'a mut CpuSharedState,
     others: OtherCpus<'a, CpuSharedState>,
     owned: &'a mut CpuOwnedState,
+}
+
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    PrimordialRuntimeCarrier<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    /// The CPU this carrier was built for: its owner's, by construction. There
+    /// is no field to reselect (TSV row 85).
+    const fn cpu(&self) -> crate::cpu::CpuIndex {
+        self.owned.owner.cpu()
+    }
 }
 
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
@@ -3424,7 +3432,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     fn publish_last_scheduled(&mut self, identity: ScheduledIdentity) {
         self.own.last_scheduled = Some(identity);
         crate::debug::liveness::publish_current(
-            self.cpu,
+            self.cpu(),
             identity.thread.object_id().diagnostic_identity(),
             identity.process.object_id().diagnostic_identity(),
             identity.root_key.object_id().diagnostic_identity(),
@@ -3435,7 +3443,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn begin_root_switch_flight(&mut self) -> RootSwitchFlight {
-        let cpu = self.cpu;
+        let cpu = self.cpu();
         let epoch = &mut self.owned.root_switch_epoch;
         *epoch = epoch
             .checked_add(1)
@@ -3454,7 +3462,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// The commit or cancel of `flight` runs on the CPU that began it, against
     /// the transitioning slot that flight left.
     fn assert_root_switch_flight(&self, flight: RootSwitchFlight) {
-        if flight.cpu != self.cpu || self.own.root_switch_flight != Some(flight) {
+        if flight.cpu != self.cpu() || self.own.root_switch_flight != Some(flight) {
             panic!("root-switch flight identity drifted before commit");
         }
         if !matches!(self.own.active_root, CarrierActiveRoot::Transitioning) {
@@ -3552,7 +3560,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .core
             .active
             .prepare_process_root_selection(
-                self.cpu,
+                self.cpu(),
                 self.core.primordial_process,
                 self.core.primordial_address_space,
             )
@@ -3616,7 +3624,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn prepare_ap_kernel_root_entry(&mut self) -> PreparedApKernelRootEntry {
-        if self.cpu == crate::cpu::CpuIndex::BOOTSTRAP
+        if self.cpu() == crate::cpu::CpuIndex::BOOTSTRAP
             || !matches!(self.own.active_root, CarrierActiveRoot::Unselected)
         {
             panic!("AP kernel-root entry requires an unselected AP carrier");
@@ -3624,7 +3632,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let prepared = self
             .core
             .active
-            .prepare_ap_kernel_root_entry(self.cpu)
+            .prepare_ap_kernel_root_entry(self.cpu())
             .unwrap_or_else(|error| panic!("AP kernel-root entry preflight failed: {error:?}"));
         self.own.active_root = CarrierActiveRoot::Transitioning;
         let flight = self.begin_root_switch_flight();
@@ -3680,12 +3688,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         #[cfg(deepwyrm_i1_evidence)]
         let pending_wake = control.pending_wake_key();
         // SAFETY: [P-PLAN] forwarded: this `unsafe fn` has no `# Safety` section; its callers (the
-        // `prepare_suspend` trait impls) supply the physically current `self.cpu`, and the entry is
+        // `prepare_suspend` trait impls) supply the physically current `self.cpu()`, and the entry is
         // the fixed one.
         let plan = unsafe {
             self.core.services.prepare_suspend_on(
                 control,
-                self.cpu,
+                self.owned.owner.cpu(),
                 &self.core.tasks,
                 &self.core.shared.execution,
                 crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
@@ -3694,7 +3702,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         .unwrap_or_else(|error| panic!("primordial suspend preparation drifted: {error:?}"));
         #[cfg(deepwyrm_i1_evidence)]
         if let Some(wake) = pending_wake {
-            crate::test_support::observe_i1_parent_blocked(self.cpu, wake);
+            crate::test_support::observe_i1_parent_blocked(self.cpu(), wake);
         }
         #[cfg(feature = "test-support")]
         self.core.g5_probe.observe_prepare(
@@ -3714,7 +3722,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let Some(ticket) = ticket else {
             return;
         };
-        assert_eq!(ticket.cpu(), self.cpu, "quantum cancellation changed CPU");
+        assert_eq!(ticket.cpu(), self.cpu(), "quantum cancellation changed CPU");
         assert!(
             self.own
                 .pending_quantum_cancellation
@@ -3752,7 +3760,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) {
         assert_eq!(
             ticket.cpu(),
-            self.cpu,
+            self.cpu(),
             "quantum cancellation committed on another CPU"
         );
         assert!(
@@ -3763,7 +3771,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.core
                 .shared
                 .execution
-                .preemption_snapshot_on(self.cpu)
+                .preemption_snapshot_on(self.cpu())
                 .quantum,
             Some(ticket),
             "scheduler still owns the physically cancelled exact quantum"
@@ -3790,14 +3798,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
     ) -> crate::syscall::native::NativePreemptionPlan<'static> {
         crate::debug::liveness::note_event(
-            self.cpu,
+            self.cpu(),
             crate::debug::liveness::LivenessEvent::Preempted,
         );
         match self
             .core
             .shared
             .execution
-            .preempt_current_on(self.cpu)
+            .preempt_current_on(self.cpu())
             .unwrap_or_else(|error| panic!("DW1-B scheduler decision drifted: {error:?}"))
         {
             crate::task::SchedulerPreemptionDecision::Deferred => {
@@ -3808,10 +3816,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
             crate::task::SchedulerPreemptionDecision::Switch { decision, outgoing } => {
                 debug_assert_eq!(
-                    self.core.shared.execution.suspended_claim_on(self.cpu),
+                    self.core.shared.execution.suspended_claim_on(self.cpu()),
                     Some(outgoing)
                 );
-                // SAFETY: [P-PLAN] forwarded from this function's `# Safety`; `self.cpu` is the
+                // SAFETY: [P-PLAN] forwarded from this function's `# Safety`; `self.cpu()` is the
                 // physically current CPU and the entry is the fixed `first_run_thread_entry_rip`.
                 let plan = unsafe {
                     self.core
@@ -3819,7 +3827,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         .execution
                         .prepare_preemptive_kernel_switch_on(
                             &self.core.tasks,
-                            self.cpu,
+                            self.cpu(),
                             decision,
                             crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
                         )
@@ -3851,12 +3859,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .services
             .operation_owner(self.own.scheduled().thread);
         let control = &mut self.own.wait_control;
-        // SAFETY: [P-PLAN] forwarded from this function's `# Safety`; `self.cpu` is the physically
+        // SAFETY: [P-PLAN] forwarded from this function's `# Safety`; `self.cpu()` is the physically
         // current CPU and the entry is the fixed `first_run_thread_entry_rip`.
         let poll = unsafe {
             self.core.services.poll_idle_suspend_on(
                 control,
-                self.cpu,
+                self.owned.owner.cpu(),
                 &self.core.tasks,
                 &self.core.shared.execution,
                 crate::arch::x86_64::syscall::first_run_thread_entry_rip(),
@@ -3892,7 +3900,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) {
         #[cfg(deepwyrm_i1_evidence)]
         if self.own.scheduled().process != self.core.primordial_process {
-            crate::test_support::observe_i1_descendant_running(self.cpu);
+            crate::test_support::observe_i1_descendant_running(self.cpu());
         }
         let context = self
             .core
@@ -3938,7 +3946,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .core
                 .shared
                 .execution
-                .current_thread_on(self.cpu)
+                .current_thread_on(self.cpu())
                 .is_some()
             {
                 panic!("terminal handoff retained a scheduler-current Thread")
@@ -3947,7 +3955,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .core
                 .shared
                 .execution
-                .suspended_claim_on(self.cpu)
+                .suspended_claim_on(self.cpu())
                 .is_some()
             {
                 panic!("terminal handoff retained a suspended claim without resources")
@@ -3956,7 +3964,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .core
                 .shared
                 .execution
-                .running_claim_on(self.cpu)
+                .running_claim_on(self.cpu())
                 .is_some()
             {
                 panic!("terminal handoff retained a Running claim without resources")
@@ -3988,7 +3996,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             &mut self.core.registry,
             &self.core.shared.execution,
             &self.core.shared.waits,
-            self.cpu,
+            self.owned.owner.cpu(),
             deferred,
             &mut self.core.cleanup,
         );
@@ -4081,7 +4089,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     fn prepare_terminal_handoff_detached(&mut self) -> PreparedTerminalStep {
         let retirement = self.prepare_terminal_retirement_state();
-        if let Some(next) = self.core.shared.execution.terminal_reaper_next_on(self.cpu) {
+        if let Some(next) = self
+            .core
+            .shared
+            .execution
+            .terminal_reaper_next_on(self.cpu())
+        {
             let (stack_id, context_id) = self
                 .core
                 .tasks
@@ -4246,7 +4259,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 crate::arch::x86_64::power::soft_off_then_halt()
             }
             if crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
-                != Some(self.cpu.index())
+                != Some(self.cpu().index())
             {
                 panic!("terminal idle facade resumed on another physical CPU")
             }
@@ -4254,7 +4267,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .own
                 .active_root
                 .as_ref()
-                .is_none_or(|previous| previous.cpu() != self.cpu)
+                .is_none_or(|previous| previous.cpu() != self.cpu())
             {
                 panic!("terminal idle carrier retained another CPU's Process root")
             }
@@ -4678,7 +4691,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     #[track_caller]
     fn synchronize_scheduler_current(&mut self) {
-        let Some(thread) = self.core.shared.execution.current_thread_on(self.cpu) else {
+        let Some(thread) = self.core.shared.execution.current_thread_on(self.cpu()) else {
             panic!("runtime carrier has no scheduler-current Thread");
         };
         let process = self
@@ -4712,7 +4725,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .own
             .active_root
             .as_ref()
-            .is_some_and(|root| root.selects_exact(self.cpu, process, address_space))
+            .is_some_and(|root| root.selects_exact(self.cpu(), process, address_space))
         {
             if let Err(error) = self.core.active.validate_current_process_root_selection(
                 self.own.active_root.as_ref().expect("active root"),
@@ -4756,7 +4769,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let prepared = self
             .core
             .active
-            .prepare_process_root_selection(self.cpu, process, address_space)
+            .prepare_process_root_selection(self.cpu(), process, address_space)
             .unwrap_or_else(|error| panic!("could not prepare scheduler-current root: {error:?}"));
         let previous =
             core::mem::replace(&mut self.own.active_root, CarrierActiveRoot::Transitioning);
@@ -4847,7 +4860,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .core
             .shared
             .execution
-            .current_thread_on(self.cpu)
+            .current_thread_on(self.cpu())
             .unwrap_or_else(|| panic!("runtime carrier has no scheduler-current Thread"));
         let process = self
             .core
@@ -4887,7 +4900,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .own
             .active_root
             .as_ref()
-            .is_some_and(|root| root.selects_exact(self.cpu, process, address_space))
+            .is_some_and(|root| root.selects_exact(self.cpu(), process, address_space))
         {
             self.core
                 .active
@@ -4905,7 +4918,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let prepared = self
             .core
             .active
-            .prepare_process_root_selection(self.cpu, process, address_space)
+            .prepare_process_root_selection(self.cpu(), process, address_space)
             .unwrap_or_else(|error| panic!("could not prepare scheduler-current root: {error:?}"));
         let previous =
             core::mem::replace(&mut self.own.active_root, CarrierActiveRoot::Transitioning);
@@ -5052,7 +5065,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// no other CPU can acquire a Runnable continuation before its saved RSP
     /// is visible.
     fn complete_physical_switch_handoff(&mut self) -> Option<crate::task::RunnablePublication> {
-        if let Some(outgoing) = self.core.shared.execution.suspended_claim_on(self.cpu) {
+        if let Some(outgoing) = self.core.shared.execution.suspended_claim_on(self.cpu()) {
             let published = self
                 .core
                 .shared
@@ -5068,7 +5081,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     .core
                     .shared
                     .execution
-                    .current_thread_on(self.cpu)
+                    .current_thread_on(self.cpu())
                     .unwrap_or_else(|| panic!("selector-26 preemption completed without incoming"));
                 crate::test_support::DW1B_EVIDENCE
                     .observe_completed_preemption(expected_outgoing, incoming)
@@ -5226,7 +5239,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 panic!("rendezvous continuation could not clear retired slot: {error:?}")
             });
         self.drain_staged_rendezvous_cleanup();
-        let next = self.core.shared.execution.terminal_reaper_next_on(self.cpu);
+        let next = self
+            .core
+            .shared
+            .execution
+            .terminal_reaper_next_on(self.cpu());
         let Some(next) = next else {
             assert!(matches!(self.own.active_root, CarrierActiveRoot::Kernel(_)));
             return PreparedRendezvousNext::Idle;
@@ -5948,7 +5965,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     #[cfg(deepwyrm_dw1e_platform)]
     fn service_q35_retirement_at_bsp_safe_point(&mut self) -> Result<(), ()> {
-        if self.cpu != crate::cpu::CpuIndex::BOOTSTRAP {
+        if self.cpu() != crate::cpu::CpuIndex::BOOTSTRAP {
             return Ok(());
         }
         let pending = crate::time::pending_q35_bsp_retirement_check().map_err(|_| ())?;
@@ -6117,7 +6134,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     fn service_pending_timer_expiries_on_bootstrap(&mut self) {
         assert_eq!(
-            self.cpu,
+            self.cpu(),
             crate::cpu::CpuIndex::BOOTSTRAP,
             "general Timer expiry service escaped CPU0 ownership"
         );
@@ -6228,7 +6245,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .core
                 .active
                 .prepare_process_root_selection(
-                    self.cpu,
+                    self.cpu(),
                     self.core.primordial_process,
                     self.core.primordial_address_space,
                 )
@@ -6465,13 +6482,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         let registry = crate::arch::x86_64::smp::live_cpu_registry();
         let snapshot = registry
-            .snapshot(self.cpu.index())
+            .snapshot(self.cpu().index())
             .map_err(|_| crate::arch::x86_64::rendezvous::RemoteStopError::WrongIdentity)?;
         // An e1 Stop may arrive after the blocked syscall has committed its
         // exact Running generation into this CPU's suspended continuation.
         // Keep that case generation-bound; it is not a thread-only fallback.
-        let suspended = self.core.shared.execution.suspended_claim_on(self.cpu);
-        let running = self.core.shared.execution.running_claim_on(self.cpu);
+        let suspended = self.core.shared.execution.suspended_claim_on(self.cpu());
+        let running = self.core.shared.execution.running_claim_on(self.cpu());
         let matches_identity = |claim: crate::task::SchedulerExecutionClaim| {
             claim.thread() == identity.thread()
                 && claim.generation() == identity.execution_generation()
@@ -6490,7 +6507,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .as_ref()
             .ok_or(crate::arch::x86_64::rendezvous::RemoteStopError::UnsafePrecommit)?;
         let scheduler_current_matches = !was_suspended
-            && self.core.shared.execution.current_thread_on(self.cpu)
+            && self.core.shared.execution.current_thread_on(self.cpu())
                 == Some(self.own.scheduled().thread);
         // A block commit may have selected a logical replacement, but it has
         // not yet switched the physical carrier when this post-hlt e1 gate
@@ -6502,8 +6519,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .physically_executing
                 .physically_executes(self.own.scheduled().thread);
         if crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
-            != Some(self.cpu.index())
-            || identity.target_cpu() != self.cpu.index()
+            != Some(self.cpu().index())
+            || identity.target_cpu() != self.cpu().index()
             || identity.cpu_online_generation() != snapshot.online_generation
             || identity.thread() != self.own.scheduled().thread
             || identity.execution_generation() != claim.generation()
@@ -6625,7 +6642,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .core
                 .shared
                 .execution
-                .running_claim_on(self.cpu)
+                .running_claim_on(self.cpu())
                 .is_none_or(|running| running.thread() != stopped.thread())
     }
 }
@@ -6648,14 +6665,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.core
             .shared
             .execution
-            .prepare_quantum_if_needed_on(self.cpu, now_ns)
+            .prepare_quantum_if_needed_on(self.cpu(), now_ns)
     }
 
     fn has_reschedule_request(&mut self) -> bool {
         self.core
             .shared
             .execution
-            .has_reschedule_request_on(self.cpu)
+            .has_reschedule_request_on(self.cpu())
     }
 
     fn authorize_timer_return(
@@ -6664,7 +6681,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
         if self.core.tasks.thread_process(self.own.scheduled().thread)
             != Ok(self.own.scheduled().process)
-            || self.core.shared.execution.current_thread_on(self.cpu)
+            || self.core.shared.execution.current_thread_on(self.cpu())
                 != Some(self.own.scheduled().thread)
         {
             return Err(crate::arch::x86_64::syscall::UserReturnError::BindingChanged);
@@ -6968,9 +6985,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 hog_handle,
                 progress_handle,
             } => {
-                if self.cpu != crate::cpu::CpuIndex::BOOTSTRAP
+                if self.cpu() != crate::cpu::CpuIndex::BOOTSTRAP
                     || self.core.evidence_init_process != Some(self.own.scheduled().process)
-                    || self.core.shared.execution.current_thread_on(self.cpu)
+                    || self.core.shared.execution.current_thread_on(self.cpu())
                         != Some(self.own.scheduled().thread)
                     || self.core.tasks.thread_process(self.own.scheduled().thread)
                         != Ok(self.own.scheduled().process)
@@ -7023,7 +7040,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 ) {
                     crate::test_support::complete_fail(0x2610_e00b)
                 }
-                let snapshot = self.core.shared.execution.preemption_snapshot_on(self.cpu);
+                let snapshot = self
+                    .core
+                    .shared
+                    .execution
+                    .preemption_snapshot_on(self.cpu());
                 if snapshot.counters.overflow_fault
                     || snapshot.running.map(|claim| claim.thread())
                         != Some(self.own.scheduled().thread)
@@ -7110,7 +7131,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     .core
                     .shared
                     .execution
-                    .running_claim_on(self.cpu)
+                    .running_claim_on(self.cpu())
                     .filter(|claim| claim.thread() == self.own.scheduled().thread)
                     .unwrap_or_else(|| crate::test_support::complete_fail(0x2810_e019));
                 let product_execution_generation = product_claim.generation();
@@ -9834,9 +9855,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .core
                 .shared
                 .execution
-                .running_claim_on(self.cpu)
+                .running_claim_on(self.cpu())
                 .unwrap_or_else(|| panic!("I1 syscall has no running execution claim"));
-            crate::test_support::observe_i1_cpl3_syscall(self.cpu, claim.generation(), 1);
+            crate::test_support::observe_i1_cpl3_syscall(self.cpu(), claim.generation(), 1);
         }
         // This identity is deliberately detached from the carrier before any
         // usercopy or service dispatch.  The final check keeps a resumed
@@ -10005,7 +10026,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         &mut self.core.spaces,
                         scheduled.process,
                         scheduled.thread,
-                        self.cpu,
+                        self.owned.owner.cpu(),
                         root_generation,
                         Some(&mut wait_deadlines),
                         &mut timer_deadlines,
@@ -10065,7 +10086,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     #[cfg(deepwyrm_dw1c_evidence)]
     fn dw1c_controller_authorized(&self) -> bool {
         self.core.evidence_init_process == Some(self.own.scheduled().process)
-            && self.core.shared.execution.current_thread_on(self.cpu)
+            && self.core.shared.execution.current_thread_on(self.cpu())
                 == Some(self.own.scheduled().thread)
             && self.core.tasks.thread_process(self.own.scheduled().thread)
                 == Ok(self.own.scheduled().process)
@@ -10080,7 +10101,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     #[cfg(deepwyrm_dw1d_evidence)]
     fn dw1d_controller_authorized(&self) -> bool {
         self.own.scheduled().process == self.core.primordial_process
-            && self.core.shared.execution.current_thread_on(self.cpu)
+            && self.core.shared.execution.current_thread_on(self.cpu())
                 == Some(self.own.scheduled().thread)
             && self.core.tasks.thread_process(self.own.scheduled().thread)
                 == Ok(self.own.scheduled().process)
@@ -10215,8 +10236,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 if status == DW_STATUS_SUCCESS
                     && let Some(process) = closed_process
                 {
-                    crate::test_support::observe_i1_child_cleanup(process, self.cpu);
-                    crate::test_support::observe_i1_reclaim_allowed(self.cpu);
+                    crate::test_support::observe_i1_child_cleanup(process, self.cpu());
+                    crate::test_support::observe_i1_reclaim_allowed(self.cpu());
                 }
                 NativeSyscallResult::returning(status)
             }
@@ -10532,7 +10553,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     // pre-Masking acknowledgement was Pending/AckPrepared.
                     // Retry immediately after a successful CPU0 ack instead
                     // of relying on an unrelated later carrier safe point.
-                    if status == DW_STATUS_SUCCESS && self.cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                    if status == DW_STATUS_SUCCESS && self.cpu() == crate::cpu::CpuIndex::BOOTSTRAP
+                    {
                         #[cfg(deepwyrm_dw1e_e3b_full)]
                         self.service_pending_dw1e_terminal();
                     }
@@ -10859,7 +10881,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     fn exit_process(&mut self, exit_code: u32) -> NativeSyscallResult {
         let phase = self.reserve_runtime_phase();
         #[cfg(deepwyrm_i1_evidence)]
-        let exiting_claim = self.core.shared.execution.running_claim_on(self.cpu);
+        let exiting_claim = self.core.shared.execution.running_claim_on(self.cpu());
         let mut discarded: [Option<user_access::OwnedLiveUserOutput>; THREADS] =
             core::array::from_fn(|_| None);
         let mut atomic_pins: [Option<user_access::OwnedLiveAtomicU32>; THREADS] =
@@ -10887,7 +10909,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 &self.core.shared.execution,
                 &self.core.shared.waits,
                 &mut terminal,
-                self.cpu,
+                self.owned.owner.cpu(),
                 self.own.scheduled().process,
                 self.own.scheduled().thread,
                 exit_code,
@@ -10904,7 +10926,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     .unwrap_or_else(|| panic!("I1 child exit omitted its execution claim"));
                 crate::test_support::observe_i1_child_exit(
                     self.own.scheduled().process,
-                    self.cpu,
+                    self.cpu(),
                     claim.generation(),
                 );
             }
@@ -10938,7 +10960,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         };
         let phase = self.reserve_runtime_phase();
         #[cfg(deepwyrm_i1_evidence)]
-        let exiting_claim = self.core.shared.execution.running_claim_on(self.cpu);
+        let exiting_claim = self.core.shared.execution.running_claim_on(self.cpu());
         let mut prepared = match self.prepare_process_exit_with_wait_cleanup(exit_code) {
             Ok(prepared) => prepared,
             Err(status) => {
@@ -10954,7 +10976,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .unwrap_or_else(|| panic!("I1 child exit omitted its execution claim"));
             crate::test_support::observe_i1_child_exit(
                 self.own.scheduled().process,
-                self.cpu,
+                self.cpu(),
                 claim.generation(),
             );
         }
@@ -11156,7 +11178,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         for (cpu_index, identity) in identities.iter_mut().enumerate() {
             let cpu = crate::cpu::CpuIndex::new(cpu_index)
                 .unwrap_or_else(|| panic!("remote-stop CPU index is out of range"));
-            if cpu == self.cpu {
+            if cpu == self.cpu() {
                 continue;
             }
             let remote = self
@@ -11485,7 +11507,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 &self.core.shared.execution,
                 &self.core.shared.waits,
                 &mut terminal,
-                self.cpu,
+                self.owned.owner.cpu(),
                 self.own.scheduled().process,
                 self.own.scheduled().thread,
                 prepared,
@@ -11565,7 +11587,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 &self.core.shared.execution,
                 &self.core.shared.waits,
                 &mut terminal,
-                self.cpu,
+                self.owned.owner.cpu(),
                 self.own.scheduled().process,
                 self.own.scheduled().thread,
                 prepared,
@@ -11780,7 +11802,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 &self.core.shared.execution,
                 &self.core.shared.waits,
                 &mut terminal,
-                self.cpu,
+                self.owned.owner.cpu(),
                 self.own.scheduled().process,
                 self.own.scheduled().thread,
                 prepared,
