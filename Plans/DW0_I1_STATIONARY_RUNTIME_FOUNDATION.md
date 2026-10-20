@@ -5,6 +5,13 @@
 which Mike approved that day. Kept as the historical record of the staged
 foundation; it is no longer authority for runtime-authority work.
 
+**Note (2026-10-20):** S2K-6, as revised by that design's §11.1, removed the
+`PerCpuLiveCarrier` cells and `switch_cpu` this document describes. Each
+CPU's facade now owns its owner-local facts (including `PhysicallyExecuting`,
+the former `PerCpuLiveCarrier` record), and its remotely read facts live in
+the guarded `CpuSlots`, mutable only through that CPU's `CpuOwner`. The text
+below is left as written.
+
 **Correction:** this document's original status line said "AP execution
 remains parked". That stopped being true at `83856db` (2026-08-23, "Release
 APs into the live cooperative runtime"), which released the APs into ordinary

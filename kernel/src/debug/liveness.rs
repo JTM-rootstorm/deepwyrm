@@ -59,7 +59,10 @@ pub(crate) const NO_CPU: u32 = u32::MAX;
 #[repr(u32)]
 pub(crate) enum LivenessEvent {
     None = 0,
-    /// The carrier was re-seated onto this CPU by `switch_cpu_state`.
+    /// This CPU's carrier published its last scheduled identity: at a
+    /// scheduler synchronization or scheduler-root publication, a generic
+    /// child's terminal finish, or the BSP's start (S2K-6; before S2K-6, when
+    /// the shared carrier was re-seated onto this CPU).
     CarrierSelected = 1,
     /// A return-time preemption decision was taken on this CPU.
     Preempted = 2,

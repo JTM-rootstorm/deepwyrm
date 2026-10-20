@@ -87,6 +87,11 @@ Deepwyrm `main` has since advanced. The current source:
    CPU registry to `Executing`; and
 7. lets the AP enter the common idle scheduler and e1/e2 safe-point machinery.
 
+**Note (2026-10-20):** step 3 no longer exists. S2K-6
+(`DW1_S2K_RUNTIME_AUTHORITY_DESIGN.md` §11.1) folded `PerCpuLiveCarrier` into
+each facade's owner-local state as `PhysicallyExecuting` and deleted
+`switch_cpu`; see the amended "Current Thread/Process/root" row below.
+
 Accordingly, DW1-C0 does not design AP startup or cooperative userspace
 execution from scratch. Current APs can enter the shared scheduler, execute
 ordinary CPL3 Threads, and return through the established carrier. What is
@@ -218,7 +223,7 @@ termination; no path may infer physical ownership from scheduler state alone.
 | Per-CPU entry stack | The guarded `RuntimeCpuStackLayout::privilege_entry` span. A retained return frame must move to the Thread-owned stack before a switch. |
 | Reaper stack and action | The guarded `terminal_reaper` span plus per-CPU `TERMINAL_ACTION` and `RENDEZVOUS_ACTION`. Assembly stack pivot and the move-only reaper entry are authoritative. `PerCpuCarrierLocal::reaper_staged` has no current writer and is not accepted as evidence until wired or removed. |
 | Scratch | `PerCpuScratchBindings` owns one CPU-branded leaf/control pair. `ActiveScratchTarget` reattests the hardware-current CPU at each live access. `scratch_cpu` in the carrier is only a consistency check. Scratch sessions never migrate. |
-| Current Thread/Process/root | The pinned shared runtime owns exact per-CPU arrays and the scheduler claims; `PerCpuLiveCarrier` is the physical CPU-local mirror. `switch_cpu` and `synchronize_scheduler_current` must agree with actual CR3/root residency before local publication. |
+| Current Thread/Process/root | The pinned shared runtime owns exact per-CPU arrays and the scheduler claims; `PerCpuLiveCarrier` is the physical CPU-local mirror. `switch_cpu` and `synchronize_scheduler_current` must agree with actual CR3/root residency before local publication. *Amended 2026-10-20 (S2K-6, S2K design §11.1):* there is no `switch_cpu`; each CPU's last scheduled identity and active root live in its guarded `CpuSharedState` slot, mutable only through its `CpuOwner`, and its physical CPU-local record is the facade-owned `PhysicallyExecuting`. Scheduler synchronization must still agree with actual CR3/root residency before it publishes the identity. |
 | e1 mailbox | `LIVE_IDLE_WAKE` owns one `RendezvousMailbox` and post-EOI latch per CPU. Wake, Stop, and HoldSafe retain distinct semantics. |
 | e2 mailbox | `LIVE_TLB_MAILBOXES[cpu]` owns one exact request/ack slot per CPU, separate from e1. |
 | Local APIC | `LOCAL_APIC_SLOTS[cpu]` owns one controller/MMIO binding. EOI is CPU-local and lock-free with respect to the mutable controller guard. |

@@ -79,6 +79,12 @@ pub(crate) fn validate_dw1c_stack_margins(
         .and_then(|bytes| bytes.checked_add(ARCHITECTURAL_HEADROOM_BYTES))
         .expect("DW1C syscall stack bound fits usize");
 
+    // Measured 46,520 before S2K-6 and 54,792 after it (deepwyrm 7173b80). Almost all of the
+    // growth is `AddressRegion<10>::commit_specs` for the coherent publisher: 30,136 -> 38,328.
+    // That generic's source and monomorphization did not change. LLVM stopped inlining
+    // `CoherentAddressSpacePublisher::publish_replace` into it (it is now emitted on its own, with
+    // its `Mapping` slice comparison), and the frame grew to the 38,328 the same function already
+    // had for the plain `X86AddressSpacePublisher` instance. Incidental codegen, inside the bound.
     assert!(
         total + REQUIRED_SPARE_BYTES <= thread_stack_bytes,
         "DW1C syscall chain exceeds the linked per-thread stack: total={total} \
