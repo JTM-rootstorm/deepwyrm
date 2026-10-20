@@ -961,25 +961,26 @@ pub(crate) enum NativePreemptionPlan<'owner> {
 /// frame that is abandoned rather than returned from; the carrier's later
 /// reborrows through its published pointer would then conflict with that
 /// protector under Stacked and Tree Borrows. This handle carries the same
-/// unique borrow as a raw pointer, which passing does not retag or protect.
-/// The entry turns it into a local `&mut` with `into_mut`; a local is never
-/// protected, so abandoning the frame leaves nothing for a later reborrow to
-/// conflict with. Neither `Clone` nor `Copy`.
+/// unique borrow as a raw pointer, which passing neither retags nor
+/// protects. The entry borrows the carrier from it (`get`) for ordinary,
+/// returning work, and a divergent boundary accepts only the
+/// `CarrierRelease` that consuming the handle (`release`) yields. So a
+/// divergence can only happen in a frame that holds the handle by value,
+/// never inside a method that received the carrier as `&mut self`: such a
+/// method has no handle to release, and none can be made from a reference.
+/// Neither `Clone` nor `Copy`.
 pub(crate) struct DivergentCarrier<'a, R> {
     carrier: core::ptr::NonNull<R>,
     _borrow: core::marker::PhantomData<&'a mut R>,
 }
 
-impl<'a, R> DivergentCarrier<'a, R> {
-    /// A carrier already uniquely borrowed for `'a`, handed to another
-    /// divergent entry.
-    pub(crate) fn from_mut(carrier: &'a mut R) -> Self {
-        Self {
-            carrier: core::ptr::NonNull::from(carrier),
-            _borrow: core::marker::PhantomData,
-        }
-    }
+/// A carrier that certifies itself guard-free, for `DivergentCarrier::release`.
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+pub(crate) trait GuardFreeSource {
+    fn guard_free(&mut self) -> crate::arch::x86_64::syscall::GuardFree<'_>;
+}
 
+impl<'a, R> DivergentCarrier<'a, R> {
     /// # Safety
     ///
     /// `carrier` is this CPU's published carrier, valid for `'a`, and no
@@ -995,15 +996,33 @@ impl<'a, R> DivergentCarrier<'a, R> {
         }
     }
 
-    /// The carrier for the rest of the divergent entry, as a local reference.
+    /// The carrier, for returning work while the entry keeps the handle.
     #[allow(
         unsafe_code,
         reason = "the handle carries a unique borrow for 'a by construction"
     )]
-    pub(crate) fn into_mut(self) -> &'a mut R {
-        // SAFETY: `from_mut` took a unique `&'a mut R`, and `published`'s caller vouched for the
-        // same; the handle is consumed here, so this is that borrow's only use.
-        unsafe { &mut *self.carrier.as_ptr() }
+    pub(crate) fn get(&mut self) -> &mut R {
+        // SAFETY: `published`'s caller vouched for a unique borrow for `'a`; this reborrow is
+        // bounded by the handle's own `&mut` borrow, so it cannot outlive or alias another.
+        unsafe { self.carrier.as_mut() }
+    }
+
+    /// Consumes the handle for the one divergent boundary that ends the entry.
+    #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+    #[allow(
+        unsafe_code,
+        reason = "consuming the handle is what certifies no carrier reference survives"
+    )]
+    pub(crate) fn release(self) -> crate::arch::x86_64::syscall::CarrierRelease<'a>
+    where
+        R: GuardFreeSource,
+    {
+        // SAFETY: as in `get`, a unique borrow for `'a`, taken once here as the handle is consumed.
+        let carrier: &'a mut R = unsafe { &mut *self.carrier.as_ptr() };
+        // SAFETY: the handle is consumed, so this frame holds no other reference to the carrier
+        // and every earlier `get` borrow has ended; `published`'s caller vouched that no frame
+        // that resumes holds one.
+        unsafe { crate::arch::x86_64::syscall::CarrierRelease::new(carrier.guard_free()) }
     }
 }
 

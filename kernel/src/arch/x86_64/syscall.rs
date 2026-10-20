@@ -19,7 +19,7 @@ pub(crate) use stationary_runtime::RuntimePhaseReservation;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) use boundary_tokens::{BoundKernelStack, SafePointClear};
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
-pub(crate) use guard_free::GuardFree;
+pub(crate) use guard_free::{CarrierRelease, GuardFree};
 
 #[allow(
     unused_imports,

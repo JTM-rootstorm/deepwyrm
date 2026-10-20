@@ -8311,7 +8311,8 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         request: crate::arch::x86_64::rendezvous::StopRequest,
         reaper: crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry,
     ) -> ! {
-        let this = this.into_mut();
+        let mut carrier = this;
+        let this = carrier.get();
         let (witness, root_switch) = {
             let mut guard = this.runtime.lock();
             let mut runtime = guard.on(&mut this.owned);
@@ -8340,7 +8341,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             } => {
                 if !this.synchronize_scheduler_current_at_safe_point_detached() {
                     crate::arch::x86_64::syscall::handoff_current_rendezvous_from_carrier(
-                        this.runtime.guard_free(),
+                        carrier.release(),
                     )
                 }
                 if continuation == 0 {
@@ -8373,7 +8374,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     crate::arch::x86_64::syscall::enter_bound_validated_user(
                         &state,
                         bound,
-                        this.runtime.guard_free(),
+                        carrier.release(),
                     )
                 }
             }
@@ -8392,13 +8393,11 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 unsafe {
                     crate::arch::x86_64::context::abandon_to_kernel_continuation(
                         rsp,
-                        this.runtime.guard_free(),
+                        carrier.release(),
                     )
                 }
             }
-            PreparedCarrierEntry::Idle => {
-                Self::enter_idle_scheduler(DivergentCarrier::from_mut(this))
-            }
+            PreparedCarrierEntry::Idle => Self::enter_idle_scheduler(carrier),
         }
     }
 }
@@ -8407,6 +8406,15 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     unsafe_code,
     reason = "CPU-local carrier callbacks serialize shared authorities and drop their coarse guard before every AP idle or userspace handoff"
 )]
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    crate::syscall::native::GuardFreeSource
+    for RuntimeCarrierFacade<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn guard_free(&mut self) -> GuardFree<'_> {
+        self.runtime.guard_free()
+    }
+}
+
 impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     NativeSyscallFrameRuntime
     for RuntimeCarrierFacade<'runtime, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>
@@ -8764,7 +8772,8 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn terminate_current(this: DivergentCarrier<'_, Self>) -> ! {
-        let this = this.into_mut();
+        let mut carrier = this;
+        let this = carrier.get();
         this.drain_quantum_cancellation_detached();
         let mut step = {
             let mut guard = this.runtime.lock();
@@ -8831,13 +8840,11 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     PreparedTerminalHandoff::Continuation(continuation) => unsafe {
                         crate::arch::x86_64::context::abandon_to_kernel_continuation(
                             continuation,
-                            this.runtime.guard_free(),
+                            carrier.release(),
                         )
                     },
                     PreparedTerminalHandoff::IdleScheduler => {
-                        crate::arch::x86_64::syscall::enter_bound_idle_scheduler(
-                            this.runtime.guard_free(),
-                        )
+                        crate::arch::x86_64::syscall::enter_bound_idle_scheduler(carrier.release())
                     }
                 },
             };
@@ -8845,11 +8852,10 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn enter_scheduled_fresh_thread(this: DivergentCarrier<'_, Self>) -> ! {
-        let this = this.into_mut();
+        let mut carrier = this;
+        let this = carrier.get();
         if !this.synchronize_scheduler_current_at_safe_point_detached() {
-            crate::arch::x86_64::syscall::handoff_current_rendezvous_from_carrier(
-                this.runtime.guard_free(),
-            )
+            crate::arch::x86_64::syscall::handoff_current_rendezvous_from_carrier(carrier.release())
         }
         let publication = {
             let mut guard = this.runtime.lock();
@@ -8871,7 +8877,7 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             crate::arch::x86_64::syscall::enter_bound_validated_user(
                 &state,
                 bound,
-                this.runtime.guard_free(),
+                carrier.release(),
             )
         }
     }
@@ -8902,7 +8908,8 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn enter_idle_scheduler(this: DivergentCarrier<'_, Self>) -> ! {
-        let this = this.into_mut();
+        let mut carrier = this;
+        let this = carrier.get();
         crate::debug::liveness::note_event(
             this.cpu,
             crate::debug::liveness::LivenessEvent::IdleEntered,
@@ -9072,7 +9079,7 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 Some(thread) => Some({
                     if !this.synchronize_scheduler_current_at_safe_point_detached() {
                         crate::arch::x86_64::syscall::handoff_current_rendezvous_from_carrier(
-                            this.runtime.guard_free(),
+                            carrier.release(),
                         )
                     }
                     let mut guard = this.runtime.lock();
@@ -9117,7 +9124,7 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         crate::arch::x86_64::syscall::enter_bound_validated_user(
                             &state,
                             bound,
-                            this.runtime.guard_free(),
+                            carrier.release(),
                         )
                     }
                 }
@@ -9136,7 +9143,7 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     unsafe {
                         crate::arch::x86_64::context::abandon_to_kernel_continuation(
                             rsp,
-                            this.runtime.guard_free(),
+                            carrier.release(),
                         )
                     }
                 }

@@ -764,7 +764,7 @@ fn i1_detached_scheduler_sync_honors_terminal_stop_publication() {
     for entry in runtime.split(stop_arm).skip(1) {
         let handoff = entry.split_once('}').expect("detached Stop arm").0;
         assert!(handoff.contains("handoff_current_rendezvous_from_carrier("));
-        assert!(handoff.contains("this.runtime.guard_free()"));
+        assert!(handoff.contains("carrier.release()"));
         assert!(!handoff.contains("runtime.prepare_scheduler_root_switch()"));
     }
     assert!(!runtime.contains("fn synchronize_scheduler_current_detached("));
@@ -788,7 +788,7 @@ fn i1_detached_scheduler_sync_honors_terminal_stop_publication() {
     assert!(mailbox < barrier && barrier < prepare);
 
     let handoff = live
-        .split_once("pub(crate) fn handoff_current_rendezvous_from_carrier(_guard_free: super::GuardFree<'_>) -> !")
+        .split_once("pub(crate) fn handoff_current_rendezvous_from_carrier(_release: super::CarrierRelease<'_>) -> !")
         .expect("detached carrier rendezvous handoff")
         .1
         .split_once("/// Called by the CPL3-origin e1 assembly boundary")
@@ -1356,7 +1356,7 @@ fn i1_terminal_child_without_local_work_rejoins_the_idle_scheduler() {
     assert!(runtime.contains("if retirement.retired_process != self.core.primordial_process"));
     assert!(runtime.contains("self.finish_inactive_process_teardown("));
     assert!(runtime.contains("PreparedTerminalHandoff::IdleScheduler"));
-    assert!(runtime.contains("syscall::enter_bound_idle_scheduler(\n"));
+    assert!(runtime.contains("syscall::enter_bound_idle_scheduler(carrier.release())"));
     // The live terminal path (S2K-3.1 re-anchored it off the carrier's
     // never-reached copy): retirement state, the detached handoff and its
     // continuations.

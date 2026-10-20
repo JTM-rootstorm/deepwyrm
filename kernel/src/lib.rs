@@ -169,7 +169,7 @@ fn park_h1_application_processor() -> ! {
     unsafe_code,
     reason = "an initialized H2 AP uses the STI-HLT interrupt shadow to sleep without losing a fixed-IPI wake"
 )]
-fn idle_h2_application_processor(guard_free: arch::x86_64::syscall::GuardFree<'_>) -> ! {
+fn idle_h2_application_processor(release: arch::x86_64::syscall::CarrierRelease<'_>) -> ! {
     let cpu_index = arch::x86_64::syscall::current_cpu_index_for_diagnostics()
         .unwrap_or_else(|| park_h1_application_processor());
     loop {
@@ -184,7 +184,7 @@ fn idle_h2_application_processor(guard_free: arch::x86_64::syscall::GuardFree<'_
         }
         core::hint::spin_loop();
     }
-    arch::x86_64::syscall::enter_bound_idle_scheduler(guard_free)
+    arch::x86_64::syscall::enter_bound_idle_scheduler(release)
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -244,9 +244,12 @@ extern "sysv64" fn dw_x86_64_ap_higher_half_entry(cpu_index: u32, local_apic_id:
     // SAFETY: this is the root Rust frame of this AP's execution, entered once from the trampoline
     // assembly; no frame of this CPU exists below it, and everything it called has returned. A
     // runtime-authority guard exists only by borrowing this CPU's facade handle, which this path
-    // has never reached, so none is held here. The token is carried by value to the one boundary.
-    let guard_free = unsafe { arch::x86_64::syscall::GuardFree::assume() };
-    idle_h2_application_processor(guard_free)
+    // has never reached, so none is held here, and no carrier reference either. The release is
+    // carried by value to the one boundary.
+    let release = unsafe {
+        arch::x86_64::syscall::CarrierRelease::new(arch::x86_64::syscall::GuardFree::assume())
+    };
+    idle_h2_application_processor(release)
 }
 
 /// Transfers from the raw architecture entry into validated DW0-B bring-up.

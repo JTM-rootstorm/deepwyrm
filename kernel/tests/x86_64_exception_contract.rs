@@ -67,8 +67,8 @@ fn g5_user_faults_and_invalid_returns_share_structured_terminal_reaper_handoff()
     let live = source("src/arch/x86_64/syscall/live.rs");
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
 
-    assert!(live.contains("runtime.user_exception(record);"));
-    assert!(live.contains("runtime.invalid_return(error);"));
+    assert!(live.contains("carrier.get().user_exception(record);"));
+    assert!(live.contains("carrier.get().invalid_return(error);"));
     assert!(live.contains("handoff_to_terminal_reaper::<R>(context)"));
     assert!(live.contains("binding.user_exception_handler"));
     // S2K-3.1: the live exception path is the facade's remote-stop-aware
@@ -108,10 +108,10 @@ fn h2_user_exception_stages_before_the_cpu_private_reaper_then_mutates_runtime()
         .expect("H2 terminal reaper callback extent")
         .0;
     let user_exception = reaper
-        .find("runtime.user_exception(record);")
+        .find("carrier.get().user_exception(record);")
         .expect("reaper delivers staged user exception");
     let terminate = reaper
-        .find("R::terminate_current(DivergentCarrier::from_mut(runtime))")
+        .find("R::terminate_current(carrier)")
         .expect("reaper terminal reclaim");
     assert!(user_exception < terminate);
     assert!(reaper.contains("take_terminal_action()"));

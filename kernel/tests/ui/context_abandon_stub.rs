@@ -21,7 +21,7 @@ mod context;
 mod arch {
     pub(crate) mod x86_64 {
         pub(crate) mod syscall {
-            pub(crate) use crate::GuardFree;
+            pub(crate) use crate::{CarrierRelease, GuardFree};
         }
         pub(crate) use crate::context;
     }

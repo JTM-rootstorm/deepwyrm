@@ -317,9 +317,10 @@ unsafe fn switch_owned_kernel_context(
 /// `next_rsp` must be either an execution-domain continuation for the selected
 /// running Thread or a freshly prepared initial continuation on that Thread's
 /// currently bound kernel stack. The caller must have no live references into
-/// the terminal-reaper frame after this call. `_guard_free` proves this CPU
+/// the terminal-reaper frame after this call. `_release` proves this CPU
 /// holds no runtime-authority guard, which the abandoned frame could never
-/// release (S2K-3).
+/// release (S2K-3), and that no frame that resumes holds a reference to the
+/// carrier (S2K-6).
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[allow(
     unsafe_code,
@@ -327,7 +328,7 @@ unsafe fn switch_owned_kernel_context(
 )]
 pub(crate) unsafe fn abandon_to_kernel_continuation(
     next_rsp: u64,
-    _guard_free: crate::arch::x86_64::syscall::GuardFree<'_>,
+    _release: crate::arch::x86_64::syscall::CarrierRelease<'_>,
 ) -> ! {
     let mut abandoned_rsp = 0_u64;
     unsafe { switch_kernel_context(&mut abandoned_rsp, next_rsp) };

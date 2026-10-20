@@ -1570,6 +1570,20 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 }
 
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    crate::syscall::native::GuardFreeSource for F12Runtime<'_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    #[allow(
+        unsafe_code,
+        reason = "a guest runtime without a runtime-authority lock certifies itself guard-free"
+    )]
+    fn guard_free(&mut self) -> crate::arch::x86_64::syscall::GuardFree<'_> {
+        // SAFETY: this guest runtime has no runtime-authority lock, so no frame of this CPU can
+        // hold its guard.
+        unsafe { crate::arch::x86_64::syscall::GuardFree::assume() }
+    }
+}
+
 #[allow(
     unsafe_code,
     reason = "the target runtime propagates the physical-current carrier and architecture-owned first-run entry"
@@ -1605,7 +1619,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 
     fn terminate_current(this: crate::syscall::native::DivergentCarrier<'_, Self>) -> ! {
-        let this = this.into_mut();
+        let mut carrier = this;
+        let this = carrier.get();
         crate::syscall::complete_deferred_current_reclaim_on(
             &mut this.registry,
             this.execution,
@@ -1622,7 +1637,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         reason = "F12 enters the scheduler-selected producer through its validated bound context"
     )]
     fn enter_scheduled_fresh_thread(this: crate::syscall::native::DivergentCarrier<'_, Self>) -> ! {
-        let this = this.into_mut();
+        let mut carrier = this;
+        let this = carrier.get();
         if this.current_index() != 1
             || this.scenario.service_phase != 6
             || this.scenario.producer_phase != 0
@@ -1647,14 +1663,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         // The first-run switch bound `stack`; check that binding.
         let bound = crate::arch::x86_64::syscall::current_bound_kernel_stack(stack);
         // SAFETY: `state` was just validated against this Process's mappings and `bound` proves
-        // the entered Thread's stack binding, which the callee rechecks. The token is assumed
-        // because this guest runtime has no runtime-authority lock, so no frame of this CPU can
-        // hold its guard.
+        // the entered Thread's stack binding, which the callee rechecks. The carrier release
+        // consumes this entry's handle (see this runtime's `GuardFreeSource`).
         unsafe {
             crate::arch::x86_64::syscall::enter_bound_validated_user(
                 &state,
                 bound,
-                crate::arch::x86_64::syscall::GuardFree::assume(),
+                carrier.release(),
             )
         }
     }

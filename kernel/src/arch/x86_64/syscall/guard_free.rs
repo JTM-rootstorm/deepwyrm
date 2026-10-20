@@ -47,3 +47,34 @@ impl GuardFree<'_> {
         }
     }
 }
+
+/// Proof that a divergent physical boundary may abandon this frame: no
+/// runtime-authority guard is held (the `GuardFree` inside), and no frame of
+/// this CPU that will resume holds a reference to its published carrier
+/// (S2K-6, [DIVERGENT] in `syscall/live.rs`).
+///
+/// The safe way to obtain one is `DivergentCarrier::release`, which consumes
+/// the entry's handle on its carrier, so no `&mut` carrier, and in particular
+/// no protected `&mut self` argument, can outlive it in the releasing frame.
+/// Root frames that never held a carrier use the unsafe `new`.
+#[must_use = "a carrier release exists to be passed to a divergent boundary"]
+pub(crate) struct CarrierRelease<'a> {
+    _guard_free: GuardFree<'a>,
+}
+
+impl<'a> CarrierRelease<'a> {
+    /// # Safety
+    ///
+    /// No frame of this CPU that will resume holds a reference to its
+    /// published carrier: the caller holds the carrier only through the
+    /// `DivergentCarrier` it is consuming, or never held it.
+    #[allow(
+        unsafe_code,
+        reason = "the unchecked constructor states a frame fact no type here can see"
+    )]
+    pub(crate) const unsafe fn new(guard_free: GuardFree<'a>) -> Self {
+        Self {
+            _guard_free: guard_free,
+        }
+    }
+}

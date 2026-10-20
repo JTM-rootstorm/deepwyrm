@@ -569,7 +569,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
     }
 
     fn terminate_current(this: crate::syscall::native::DivergentCarrier<'_, Self>) -> ! {
-        let this = this.into_mut();
+        let mut carrier = this;
+        let this = carrier.get();
         crate::syscall::complete_deferred_current_reclaim_on(
             &mut this.registry,
             &this.execution,

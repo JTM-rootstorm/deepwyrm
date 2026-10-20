@@ -59,9 +59,13 @@ use super::runtime_binding::{
 // instead of returning, and the carrier is later reborrowed through the published pointer. So a
 // divergent entry never receives the carrier as a `&mut` argument, whose protector would outlive
 // the abandoned frame: it takes a `DivergentCarrier` (a raw pointer, which passing neither retags
-// nor protects) and turns it into a local `&mut`, which is never protected. Every divergence runs
-// in such an entry's own frame, never inside a method or closure it called with the carrier: the
-// facade's detached rendezvous handoff is inlined there, not behind a `&mut self` helper.
+// nor protects) and borrows the carrier from it only for returning work. The divergent boundaries
+// (`enter_bound_validated_user`, `enter_bound_idle_scheduler`,
+// `handoff_current_rendezvous_from_carrier`, `context::abandon_to_kernel_continuation`) take a
+// `CarrierRelease`, which safe code obtains only by consuming that handle
+// (`DivergentCarrier::release`). A `&mut self` method has no handle and cannot make one from a
+// reference, so no divergence can happen inside a method or closure holding the carrier; root
+// frames that never held a carrier mint the release with the unsafe `CarrierRelease::new`.
 //
 // [QUANTUM-EXPIRY] (closes the former gap (2), S2K-6) Quantum expiry is published from the timer
 // interrupt and from synchronous quantum cancellation, both of which can run while a `&mut self`
@@ -1319,9 +1323,10 @@ fn handoff_to_rendezvous_reaper(context: *mut ()) -> ! {
 /// have no syscall/timer frame to return through, so they must consume the
 /// same stationary mailbox authority directly and abandon their carrier stack.
 ///
-/// Takes a `GuardFree` token: a carrier must drop its runtime-authority guard
-/// before it abandons its stack for the reaper.
-pub(crate) fn handoff_current_rendezvous_from_carrier(_guard_free: super::GuardFree<'_>) -> ! {
+/// Takes a `CarrierRelease`: a carrier must drop its runtime-authority guard,
+/// and consume its divergent-entry handle, before it abandons its stack for
+/// the reaper.
+pub(crate) fn handoff_current_rendezvous_from_carrier(_release: super::CarrierRelease<'_>) -> ! {
     match crate::arch::x86_64::idle::take_current_notification_at_safe_point() {
         crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request) => {
             stage_rendezvous_action(RendezvousAction(request)).unwrap_or_else(|_| halt_forever());
@@ -1663,17 +1668,17 @@ unsafe extern "sysv64" fn native_runtime_terminal_reaper<
     let carrier = core::ptr::NonNull::new(context.cast::<R>()).unwrap_or_else(|| halt_forever());
     // SAFETY: [DIVERGENT] `context` is this CPU's binding, passed through the reaper handoff, which
     // abandoned the deferred Thread stack and every reborrow on it.
-    let runtime = unsafe { DivergentCarrier::published(carrier) }.into_mut();
+    let mut carrier = unsafe { DivergentCarrier::published(carrier) };
     match action {
         TerminalAction::CompleteCurrent => {}
         TerminalAction::InvalidReturn(error) => {
-            runtime.invalid_return(error);
+            carrier.get().invalid_return(error);
         }
         TerminalAction::UserException(record) => {
-            runtime.user_exception(record);
+            carrier.get().user_exception(record);
         }
     }
-    R::terminate_current(DivergentCarrier::from_mut(runtime))
+    R::terminate_current(carrier)
 }
 
 #[allow(
@@ -2109,7 +2114,7 @@ pub(crate) unsafe extern "sysv64" fn dw_x86_64_first_run_thread_entry() -> ! {
     unsafe_code,
     reason = "the immutable current-CPU binding pairs its carrier with the monomorphized divergent scheduler callback"
 )]
-pub(crate) fn enter_bound_idle_scheduler(_guard_free: super::GuardFree<'_>) -> ! {
+pub(crate) fn enter_bound_idle_scheduler(_release: super::CarrierRelease<'_>) -> ! {
     validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
     let binding = runtime_binding().unwrap_or_else(|| halt_forever());
     // SAFETY: [CARRIER] this CPU's immutable binding and its matching
@@ -2128,8 +2133,9 @@ pub(crate) fn enter_bound_idle_scheduler(_guard_free: super::GuardFree<'_>) -> !
 extern "sysv64" fn dw_x86_64_detached_idle_entry() -> ! {
     // SAFETY: this is the root Rust frame of a fresh execution: the detach's synthetic context
     // switches here on the CPU-private bootstrap stack, abandoning the frame that held the carrier.
-    // No frame below this one exists, so no runtime-authority guard can be held.
-    enter_bound_idle_scheduler(unsafe { super::GuardFree::assume() })
+    // No frame below this one exists, so no runtime-authority guard and no carrier reference can
+    // be held.
+    enter_bound_idle_scheduler(unsafe { super::CarrierRelease::new(super::GuardFree::assume()) })
 }
 
 #[cfg(deepwyrm_dw1c_evidence)]
@@ -2192,7 +2198,7 @@ pub(crate) fn current_bound_kernel_stack(stack: KernelStackBounds) -> super::Bou
 pub(crate) unsafe fn enter_bound_validated_user(
     state: &ValidatedUserReturn,
     stack: super::BoundKernelStack,
-    _guard_free: super::GuardFree<'_>,
+    _release: super::CarrierRelease<'_>,
 ) -> ! {
     validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
     // The token proves a binding happened; the check proves it is still the current one.

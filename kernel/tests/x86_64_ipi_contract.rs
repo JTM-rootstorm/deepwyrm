@@ -163,7 +163,7 @@ fn i1_cpl3_rendezvous_gate_diverges_before_iret() {
         "commit_current_rendezvous_stop(witness, self)",
         "prepare_after_rendezvous_stop()",
         "terminal_reaper_next_on(self.cpu())",
-        "PreparedCarrierEntry::Idle => {\n                Self::enter_idle_scheduler(DivergentCarrier::from_mut(this))",
+        "PreparedCarrierEntry::Idle => Self::enter_idle_scheduler(carrier)",
         "runtime.prepare_rendezvous_stop(request, reaper)",
         "runtime.commit_rendezvous_stop(witness, root_switch)",
     ] {

@@ -5,7 +5,8 @@
 
 #[path = "../../src/arch/x86_64/syscall/guard_free.rs"]
 mod guard_free;
-pub(crate) use guard_free::GuardFree;
+#[allow(unused_imports)]
+pub(crate) use guard_free::{CarrierRelease, GuardFree};
 
 #[path = "../../src/arch/x86_64/mm/activation/runtime_authority.rs"]
 mod runtime_authority;
