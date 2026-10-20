@@ -1793,6 +1793,8 @@ fn h2_syscall_entry_and_native_runtime_carriers_are_fixed_per_cpu() {
     assert!(live.contains("RuntimeCarrierLifecycle::Executing"));
     assert!(!live.contains("EntryBindingError::NonBootstrapCpu"));
 
+    // Text test: which authorities the stationary shared runtime holds is a field list no type
+    // orders.
     let shared = primordial
         .split_once("struct PrimordialRuntimeShared")
         .expect("stationary shared runtime")
@@ -1819,27 +1821,10 @@ fn h2_syscall_entry_and_native_runtime_carriers_are_fixed_per_cpu() {
             "unsynchronized {exclusive} leaked into the shared runtime"
         );
     }
-    assert!(primordial.contains("struct PrimordialRuntimeCarrier"));
-    assert!(primordial.contains("struct RuntimeCarrierFacade"));
-    // S2K-3 moved the lock to a host module; each facade holds its CPU's handle.
-    assert!(
-        source("src/arch/x86_64/mm/activation/runtime_authority.rs")
-            .contains("pub(super) struct RuntimeAuthorityLock<T>")
-    );
-    assert!(primordial.contains("    runtime: RuntimeAuthorityHandle<"));
-    assert!(primordial.contains("    owned: CpuOwnedState,"));
-    assert!(primordial.contains(".map(|owner| Some(CpuOwnedState::new(owner)));"));
-    assert!(
-        primordial
-            .contains("let live_cpu_count = bind_runtime_carrier_facades(facades, publishers);")
-    );
-    assert!(primordial.contains(
-        "release_runtime_carrier_facades(\n        shared,\n        unsafe { &mut (*facades.as_ptr()).runtime },"
-    ));
-    assert!(primordial.contains("let mut runtime = guard.on(&mut self.owned);"));
-    assert!(primordial.contains("runtime.prepare_fresh_user_entry_synchronized()"));
-    assert!(primordial.contains("syscall::enter_bound_validated_user(\n"));
-    assert!(!primordial.contains("reject_entry"));
+    // The primordial per-CPU binding is static since S2K-6 (TSV row 89): each facade holds its
+    // CPU's runtime-authority handle (minted once, not Clone) and its `CpuOwnedState`, whose
+    // `CpuOwner` (minted once, unforgeable, not Clone) is the only key to that CPU's slot and the
+    // only source of its carrier's CPU. See `kernel/tests/root_switch_ui.rs`.
 }
 
 /// Text test: facade binding and per-CPU carrier publication are target-only live wiring in
@@ -2196,36 +2181,6 @@ fn daybreak_production_execution_exposes_no_raw_safe_continuation_seed() {
     assert!(context.contains("INITIAL_KERNEL_CONTINUATION_RFLAGS"));
 }
 
-#[test]
-fn dw1c_detach_commits_its_root_flight_without_ordinary_cpu_reselection() {
-    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
-    let detach = primordial
-        .split_once("fn enter_idle_scheduler(this: DivergentCarrier<'_, Self>) -> !")
-        .expect("live idle scheduler")
-        .1
-        .split_once("if !this.admission_entered")
-        .expect("AP admission boundary")
-        .0;
-    let prepare = detach
-        .find("runtime.prepare_terminal_kernel_root_switch()")
-        .expect("detach prepares its root-switch flight");
-    let execute = detach[prepare..]
-        .find("prepared.execute(this.runtime.guard_free())")
-        .map(|offset| prepare + offset)
-        .expect("detach executes its root-switch flight");
-    let commit = detach[execute..]
-        .find("runtime.commit_terminal_kernel_root_switch(executed)")
-        .map(|offset| execute + offset)
-        .expect("detach commits its root-switch flight");
-
-    assert!(prepare < execute && execute < commit);
-    assert!(
-        detach[execute..commit].contains("guard.on_root_switch_flight(&mut this.owned)")
-            && !detach[execute..commit].contains("guard.on(&mut this.owned)"),
-        "the executed root-switch flight must be committed by its flight carrier"
-    );
-}
-
 /// Text test: that the AP revalidates its private resources after entering its kernel root and
 /// before publishing ready is control flow in the target-only facade. (Entering the root before
 /// the ready publication is static since S2K D5: the publication takes the executing state only
@@ -2280,35 +2235,10 @@ fn dw1c1_terminal_handoff_executes_every_root_switch_outside_the_runtime_guard()
     assert!(!facade.contains("runtime.prepare_terminal_handoff()"));
     // Every terminal root switch runs outside the runtime guard, and every commit after it under
     // a reacquired guard: static since S2K-3 (`execute` takes a `GuardFree` token and the commits
-    // are carrier methods; see `kernel/tests/root_switch_ui.rs`). What stays here: a commit or
-    // cancel runs on the carrier built for its in-flight root switch, never an ordinary one.
-    for commit in [
-        "runtime.commit_scheduler_root_switch(executed)",
-        "runtime.commit_terminal_kernel_root_switch(executed)",
-        "runtime.commit_terminal_primordial_root_switch(executed)",
-    ] {
-        let commit = facade.find(commit).unwrap();
-        let reacquire = facade[..commit]
-            .rfind("let mut guard = this.runtime.lock()")
-            .unwrap();
-        assert!(
-            facade[reacquire..commit].contains("guard.on_root_switch_flight(&mut this.owned)"),
-            "terminal root commit bypassed its flight carrier"
-        );
-    }
-    for cancel in [
-        "runtime.cancel_scheduler_root_switch(failure)",
-        "runtime.cancel_terminal_kernel_root_switch(failure)",
-        "runtime.cancel_terminal_primordial_root_switch(failure)",
-    ] {
-        let cancel = facade.find(cancel).unwrap();
-        let reacquire = facade[..cancel]
-            .rfind("let mut guard = this.runtime.lock()")
-            .unwrap();
-        assert!(facade[reacquire..cancel].contains("guard.on_root_switch_flight(&mut this.owned)"));
-    }
-    assert!(primordial.contains("self.assert_root_switch_flight(executed.flight)"));
-    assert!(primordial.contains("self.assert_root_switch_flight(failure.flight)"));
+    // are carrier methods; see `kernel/tests/root_switch_ui.rs`). No commit can reselect a CPU
+    // either, since S2K-6 (TSV row 103's residual): a carrier is built only for its owner's CPU,
+    // with no CPU field to reselect, and the flight's commit checks the flight's CPU and
+    // generation against that carrier.
 }
 
 #[test]
