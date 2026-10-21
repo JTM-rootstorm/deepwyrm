@@ -2368,6 +2368,186 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         ))
     }
 
+    /// `ChannelReceive` (design §11.2.3 family F and §11.2.8 decision 4, D1
+    /// commit 7b): a two-phase reserve. It follows `channel_receive`'s order,
+    /// split where it needs user memory.
+    /// 1. A first hold as for family A.
+    /// 2. With P alone: capacity validation and the result probe.
+    /// 3. A second hold: handle resolution and the head reservation.
+    /// 4. With P alone: the exact-size output ranges are formed and pinned as
+    ///    owned outputs, all or nothing.
+    /// 5. A third hold: the irreversible dequeue and handle publication, but
+    ///    only if every pin succeeded. Otherwise the reservation is
+    ///    cancelled (too small, or abandoned with the formation or pin
+    ///    status). Then the phase is committed and the syscall leaves
+    ///    through `ready_to_return`.
+    /// 6. With P alone: the outputs are written into their pins.
+    ///
+    /// The reservation lives in this frame only. See
+    /// `syscall::ChannelReceiveHold` for the abandonment invariant.
+    /// `None` for every other request.
+    // Kept out of line, like the other facade helpers, so the ordinary
+    // handler's measured frame does not absorb it.
+    #[inline(never)]
+    fn handle_channel_receive(
+        &mut self,
+        request: NativeSyscallRequest,
+    ) -> Option<Result<crate::syscall::native::ReturnReady, ()>> {
+        let NativeSyscallRequest::ChannelReceive {
+            channel,
+            out_bytes,
+            byte_capacity,
+            out_handles,
+            handle_capacity,
+            out_result,
+        } = request
+        else {
+            return None;
+        };
+        let cpu = self.cpu;
+        let Ok((phase, root, process)) = self.with_synchronized_runtime_at_safe_point(|runtime| {
+            if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                runtime.service_pending_timer_expiries_on_bootstrap();
+            }
+            runtime.prepare_guard_free_usercopy()
+        }) else {
+            return Some(Err(()));
+        };
+        let precheck = {
+            let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+            let mut paging = access.lock();
+            let mut user = paging.usercopy_process_address_space(root, process);
+            crate::syscall::channel_receive_precheck(
+                &mut user,
+                byte_capacity,
+                handle_capacity,
+                out_result,
+            )
+        };
+        let held = match precheck {
+            Err(status) => Err(status),
+            Ok(()) => {
+                let mut guard = self.runtime.lock();
+                let mut runtime = guard.on(&mut self.owned);
+                runtime.reserve_channel_receive(channel)
+            }
+        };
+        let hold = match held {
+            Err(status) => {
+                let mut guard = self.runtime.lock();
+                let mut runtime = guard.on(&mut self.owned);
+                runtime.commit_runtime_phase(phase);
+                return Some(Ok(
+                    runtime.ready_to_return(NativeSyscallResult::returning(status))
+                ));
+            }
+            Ok(hold) => hold,
+        };
+        // Form and pin every output, all or nothing, with P alone.
+        let outputs = crate::syscall::channel_receive_output_ranges(
+            hold.info(),
+            byte_capacity,
+            handle_capacity,
+            out_bytes,
+            out_handles,
+            out_result,
+        );
+        let mut pins = [None, None, None];
+        let pinned: Result<bool, deepwyrm_abi::DwStatus> = match outputs {
+            Err(status) => Err(status),
+            Ok(outputs) => {
+                let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+                let mut paging = access.lock();
+                let mut user = paging.usercopy_process_address_space(root, process);
+                let (too_small, ranges) = match outputs {
+                    crate::syscall::ChannelReceiveOutputs::TooSmall(range) => {
+                        (true, [None, None, Some(range)])
+                    }
+                    crate::syscall::ChannelReceiveOutputs::Fits(ranges) => (
+                        false,
+                        ranges.map(|(range, len)| (len != 0).then_some(range)),
+                    ),
+                };
+                let mut complete = true;
+                for (index, range) in ranges.into_iter().enumerate() {
+                    let Some(range) = range else {
+                        continue;
+                    };
+                    match user.preflight_owned_output(range) {
+                        Ok(output) => pins[index] = Some(output),
+                        Err(_) => {
+                            complete = false;
+                            break;
+                        }
+                    }
+                }
+                if complete {
+                    Ok(too_small)
+                } else {
+                    for output in pins.iter_mut().filter_map(Option::take) {
+                        user.discard_owned_output(output)
+                            .unwrap_or_else(|_| panic!("partial receive output discard drifted"));
+                    }
+                    Err(deepwyrm_abi::DW_STATUS_BAD_ADDRESS)
+                }
+            }
+        };
+        enum Written {
+            Nothing,
+            TooSmall([u8; deepwyrm_abi::DW_CHANNEL_RECEIVE_RESULT_V1_SIZE as usize]),
+            Received(crate::syscall::ChannelReceiveCopyOut),
+        }
+        let (ready, written) = {
+            let mut guard = self.runtime.lock();
+            let mut runtime = guard.on(&mut self.owned);
+            let (status, written) = match pinned {
+                Err(status) => (
+                    runtime.abandon_channel_receive(hold, status),
+                    Written::Nothing,
+                ),
+                Ok(true) => (
+                    deepwyrm_abi::DW_STATUS_BUFFER_TOO_SMALL,
+                    Written::TooSmall(runtime.channel_receive_too_small(hold)),
+                ),
+                Ok(false) => match runtime.commit_channel_receive(hold) {
+                    Ok(copy) => (deepwyrm_abi::DW_STATUS_SUCCESS, Written::Received(copy)),
+                    Err(status) => (status, Written::Nothing),
+                },
+            };
+            runtime.commit_runtime_phase(phase);
+            (
+                runtime.ready_to_return(NativeSyscallResult::returning(status)),
+                written,
+            )
+        };
+        if pins.iter().any(Option::is_some) {
+            let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+            let mut paging = access.lock();
+            let mut user = paging.usercopy_process_address_space(root, process);
+            for (index, output) in pins.into_iter().enumerate() {
+                let Some(output) = output else {
+                    continue;
+                };
+                let bytes = match &written {
+                    Written::Nothing => None,
+                    Written::TooSmall(result) => Some(&result[..]),
+                    Written::Received(copy) => {
+                        Some(copy.output(index, &self.owned.channel_staging[..]))
+                    }
+                };
+                match bytes {
+                    Some(bytes) => user
+                        .commit_owned_output(output, bytes)
+                        .unwrap_or_else(|_| panic!("pinned receive output commit drifted")),
+                    None => user
+                        .discard_owned_output(output)
+                        .unwrap_or_else(|_| panic!("pinned receive output discard drifted")),
+                }
+            }
+        }
+        Some(Ok(ready))
+    }
+
     /// Runs one scheduler-current transaction under the same runtime guard as
     /// the final Stop arbitration. This closes both detached windows: a Stop
     /// published before root synchronization and one published after the CR3
@@ -8801,6 +8981,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 .or_else(|| self.handle_deferred_output(request))
                 .or_else(|| self.handle_object_info(request))
                 .or_else(|| self.handle_channel_send(request))
+                .or_else(|| self.handle_channel_receive(request))
             {
                 Some(handled) => handled,
                 None => {
@@ -10840,6 +11021,66 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             scheduled.process,
             Some(scheduled.thread),
             channel,
+            &mut self.core.cleanup,
+        )
+    }
+
+    /// ChannelReceive's first guarded step (D1 commit 7b): resolve the
+    /// endpoint and reserve its head message for this receiver.
+    fn reserve_channel_receive(
+        &mut self,
+        channel: deepwyrm_abi::DwHandle,
+    ) -> Result<crate::syscall::ChannelReceiveHold, deepwyrm_abi::DwStatus> {
+        crate::syscall::channel_receive_reserve(
+            &mut self.core.registry,
+            &self.core.shared.channels,
+            &self.core.tasks,
+            self.own.scheduled().process,
+            channel,
+            &mut self.core.cleanup,
+        )
+    }
+
+    /// Cancels a held receive whose outputs could not be formed or pinned.
+    fn abandon_channel_receive(
+        &mut self,
+        hold: crate::syscall::ChannelReceiveHold,
+        status: deepwyrm_abi::DwStatus,
+    ) -> deepwyrm_abi::DwStatus {
+        hold.abandon(
+            status,
+            &mut self.core.registry,
+            &self.core.shared.channels,
+            &mut self.core.cleanup,
+        )
+    }
+
+    /// Cancels a held receive whose message does not fit.
+    fn channel_receive_too_small(
+        &mut self,
+        hold: crate::syscall::ChannelReceiveHold,
+    ) -> [u8; deepwyrm_abi::DW_CHANNEL_RECEIVE_RESULT_V1_SIZE as usize] {
+        hold.too_small(
+            &mut self.core.registry,
+            &self.core.shared.channels,
+            &mut self.core.cleanup,
+        )
+    }
+
+    /// Dequeues a held receive into this CPU's Channel staging, after every
+    /// output is pinned.
+    fn commit_channel_receive(
+        &mut self,
+        hold: crate::syscall::ChannelReceiveHold,
+    ) -> Result<crate::syscall::ChannelReceiveCopyOut, deepwyrm_abi::DwStatus> {
+        hold.commit(
+            &mut self.owned.channel_staging[..],
+            &mut self.core.registry,
+            &self.core.shared.channels,
+            &self.core.shared.waits,
+            &mut self.core.tasks,
+            &self.core.shared.execution,
+            self.own.scheduled().process,
             &mut self.core.cleanup,
         )
     }

@@ -1198,14 +1198,14 @@ fn live_timer_expiry_is_bound_and_serviced_only_from_carrier_safe_points() {
     assert!(runtime.contains("general Timer expiry service escaped CPU0 ownership"));
     assert!(runtime.contains(".expire(token, &self.core.shared.waits)"));
     assert!(runtime.contains("timer_expiries:\n        IrqSpinMutex<"));
-    // D1 commits 5, 6, 6d and 7 add the family-A, family-B, object-info and
-    // ChannelSend preparation holds, which service CPU0's timer expiries
-    // exactly like the ordinary hold.
+    // D1 commits 5, 6, 6d, 7 and 7b add the family-A, family-B, object-info,
+    // ChannelSend and ChannelReceive preparation holds, which service CPU0's
+    // timer expiries exactly like the ordinary hold.
     assert_eq!(
         runtime
             .matches("runtime.service_pending_timer_expiries_on_bootstrap();")
             .count(),
-        8
+        9
     );
     let shared_carrier = runtime
         .split_once(
@@ -2318,7 +2318,7 @@ fn family_a_usercopy_runs_guard_free() {
         .expect("phase commit");
     assert!(prepare < copy && copy < walk && walk < commit);
     assert!(primordial.contains(
-        "let handled = match self\n                .handle_guard_free_usercopy(request)\n                .or_else(|| self.handle_deferred_output(request))\n                .or_else(|| self.handle_object_info(request))\n                .or_else(|| self.handle_channel_send(request))\n            {"
+        "let handled = match self\n                .handle_guard_free_usercopy(request)\n                .or_else(|| self.handle_deferred_output(request))\n                .or_else(|| self.handle_object_info(request))\n                .or_else(|| self.handle_channel_send(request))\n                .or_else(|| self.handle_channel_receive(request))\n            {"
     ));
     assert!(primordial.contains(
         "NativeSyscallRequest::AbiGetInfo { .. } => {\n                unreachable!(\"AbiGetInfo must be served guard-free by the CPU-local facade\")"
@@ -2464,4 +2464,46 @@ fn channel_send_copies_in_before_the_hold() {
         .expect("guarded send commit");
     assert!(access < snapshot && snapshot < lock && lock < commit);
     assert!(helper.contains("&mut self.owned.channel_staging[..],"));
+}
+
+/// Text test (D1 commit 7b, design §11.2.8 decision 4): `ChannelReceive`
+/// reserves the head in one hold, pins its exact-size outputs with P alone,
+/// and dequeues only in a later hold, after the pins.
+#[test]
+fn channel_receive_dequeues_only_after_its_outputs_are_pinned() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let helper = primordial
+        .split_once("    fn handle_channel_receive(")
+        .expect("ChannelReceive facade helper")
+        .1
+        .split_once("\n    }\n")
+        .expect("ChannelReceive facade helper extent")
+        .0;
+    let order = [
+        "crate::syscall::channel_receive_precheck(",
+        "runtime.reserve_channel_receive(channel)",
+        "crate::syscall::channel_receive_output_ranges(",
+        "user.preflight_owned_output(range)",
+        "runtime.commit_channel_receive(hold)",
+        ".commit_owned_output(output, bytes)",
+    ]
+    .map(|anchor| {
+        helper
+            .find(anchor)
+            .unwrap_or_else(|| panic!("ChannelReceive helper omits {anchor}"))
+    });
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]));
+    for path in [
+        "runtime.abandon_channel_receive(hold, status)",
+        "runtime.channel_receive_too_small(hold)",
+    ] {
+        assert!(helper.contains(path), "ChannelReceive helper omits {path}");
+    }
+    assert_eq!(
+        helper
+            .matches("self.paging.guard_free_access(self.runtime.guard_free())")
+            .count(),
+        3,
+        "the precheck, the pins and the copy-out take P alone"
+    );
 }

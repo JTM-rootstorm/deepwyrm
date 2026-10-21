@@ -11682,3 +11682,350 @@ fn a_channel_send_snapshot_validates_and_copies_before_any_authority() {
     );
     assert_eq!(staging[0], 0x6b);
 }
+
+/// The live runtime's two-phase `ChannelReceive` (D1 commit 7b), composed
+/// as the facade composes it: precheck, then reserve, then form and pin the
+/// outputs all or nothing, then commit, too-small or abandon, then write
+/// the pinned outputs.
+#[allow(clippy::too_many_arguments, reason = "mirrors the receive syscall")]
+fn two_phase_receive(
+    user: &mut FakeUserMemory,
+    staging: &mut [u8],
+    registry: &mut ObjectRegistry<16>,
+    channels: &ChannelAuthority<2, 4>,
+    waits: &WaitRegistry<8>,
+    tasks: &mut Tasks,
+    execution: &ExecutionDomain<1>,
+    process: ProcessKey,
+    channel: DwHandle,
+    out_bytes: DwUserAddress,
+    byte_capacity: u32,
+    out_result: DwUserAddress,
+    cleanup: &mut CleanupQueue<16>,
+) -> DwStatus {
+    if let Err(status) = channel_receive_precheck(user, byte_capacity, 0, out_result) {
+        return status;
+    }
+    let hold = match channel_receive_reserve(registry, channels, tasks, process, channel, cleanup) {
+        Ok(hold) => hold,
+        Err(status) => return status,
+    };
+    let outputs = channel_receive_output_ranges(
+        hold.info(),
+        byte_capacity,
+        0,
+        out_bytes,
+        DwUserAddress(0),
+        out_result,
+    );
+    let mut pins = [None, None, None];
+    let pinned = outputs.and_then(|outputs| {
+        let (too_small, ranges) = match outputs {
+            ChannelReceiveOutputs::TooSmall(range) => (true, [None, None, Some(range)]),
+            ChannelReceiveOutputs::Fits(ranges) => (
+                false,
+                ranges.map(|(range, len)| (len != 0).then_some(range)),
+            ),
+        };
+        for (index, range) in ranges.into_iter().enumerate() {
+            if let Some(range) = range {
+                match user.preflight_owned_output(range) {
+                    Ok(output) => pins[index] = Some(output),
+                    Err(_) => {
+                        for output in pins.iter_mut().filter_map(Option::take) {
+                            user.discard_owned_output(output);
+                        }
+                        return Err(DW_STATUS_BAD_ADDRESS);
+                    }
+                }
+            }
+        }
+        Ok(too_small)
+    });
+    let (status, written): (DwStatus, Option<std::vec::Vec<std::vec::Vec<u8>>>) = match pinned {
+        Err(status) => (hold.abandon(status, registry, channels, cleanup), None),
+        Ok(true) => {
+            let result = hold.too_small(registry, channels, cleanup);
+            (
+                DW_STATUS_BUFFER_TOO_SMALL,
+                Some(std::vec![std::vec![], std::vec![], result.to_vec()]),
+            )
+        }
+        Ok(false) => match hold.commit(
+            staging, registry, channels, waits, tasks, execution, process, cleanup,
+        ) {
+            Ok(copy) => (
+                DW_STATUS_SUCCESS,
+                Some(
+                    (0..3)
+                        .map(|index| copy.output(index, staging).to_vec())
+                        .collect(),
+                ),
+            ),
+            Err(status) => (status, None),
+        },
+    };
+    for (index, output) in pins.into_iter().enumerate() {
+        if let Some(output) = output {
+            match &written {
+                Some(bytes) => user.commit_owned_output(output, &bytes[index]),
+                None => user.discard_owned_output(output),
+            }
+        }
+    }
+    status
+}
+
+/// D1 commit 7b (design §11.2.8 decision 4): the two-phase receive keeps
+/// `channel_receive`'s statuses and outputs. An abandoned receive (its
+/// outputs cannot be pinned) cancels the reservation without dequeuing. While
+/// one receiver holds the head, a second gets `WOULD_BLOCK` and never takes
+/// a later message.
+#[test]
+fn a_two_phase_receive_reserves_the_head_and_abandons_without_dequeuing() {
+    use deepwyrm_abi::{DW_RIGHT_READ, DW_RIGHT_WRITE};
+
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let channels = ChannelAuthority::<2, 4>::new();
+    let waits = WaitRegistry::<8>::new();
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let mut user = FakeUserMemory::new();
+    let mut cleanup = CleanupQueue::<16>::new();
+    let requested = DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0);
+    assert_eq!(
+        channel_create(
+            &mut user,
+            &mut registry,
+            &channels,
+            &mut tasks,
+            process,
+            requested,
+            DwUserAddress(BASE + 0x180),
+            DwUserAddress(BASE + 0x188),
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let endpoint0 = DwHandle(u64_at(&user, BASE + 0x180));
+    let endpoint1 = DwHandle(u64_at(&user, BASE + 0x188));
+    let mut staging = std::vec![0_u8; DW_CHANNEL_MAX_PAYLOAD as usize];
+    for (offset, message) in [(0x300, b"dragon"), (0x310, b"wyvern")] {
+        let input = FakeUserMemory::offset(BASE + offset, 6);
+        user.bytes[input..input + 6].copy_from_slice(message);
+        assert_eq!(
+            channel_send(
+                &mut user,
+                &mut staging,
+                &mut registry,
+                &channels,
+                &waits,
+                &mut tasks,
+                &execution,
+                process,
+                endpoint0,
+                DwUserAddress(BASE + offset),
+                6,
+                DwUserAddress(0),
+                0,
+                0,
+                &mut cleanup,
+            ),
+            DW_STATUS_SUCCESS
+        );
+    }
+
+    // Too small: the result alone, and the head stays queued.
+    assert_eq!(
+        two_phase_receive(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            endpoint1,
+            DwUserAddress(0),
+            4,
+            DwUserAddress(BASE + 0x500),
+            &mut cleanup,
+        ),
+        DW_STATUS_BUFFER_TOO_SMALL
+    );
+    assert_eq!(u32_at(&user, BASE + 0x500 + 16), 6);
+
+    // A held head: a second receiver on the same end gets WOULD_BLOCK.
+    let hold = channel_receive_reserve(
+        &mut registry,
+        &channels,
+        &tasks,
+        process,
+        endpoint1,
+        &mut cleanup,
+    )
+    .unwrap();
+    assert!(matches!(
+        channel_receive_reserve(
+            &mut registry,
+            &channels,
+            &tasks,
+            process,
+            endpoint1,
+            &mut cleanup,
+        ),
+        Err(deepwyrm_abi::DW_STATUS_WOULD_BLOCK)
+    ));
+    assert_eq!(
+        hold.abandon(
+            deepwyrm_abi::DW_STATUS_BAD_ADDRESS,
+            &mut registry,
+            &channels,
+            &mut cleanup,
+        ),
+        deepwyrm_abi::DW_STATUS_BAD_ADDRESS
+    );
+
+    // Abandoned: the payload output cannot be pinned, so nothing dequeues.
+    user.deny_write_at = Some(BASE + 0x600);
+    assert_eq!(
+        two_phase_receive(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            endpoint1,
+            DwUserAddress(BASE + 0x600),
+            8,
+            DwUserAddress(BASE + 0x500),
+            &mut cleanup,
+        ),
+        DW_STATUS_BAD_ADDRESS
+    );
+    user.deny_write_at = None;
+
+    // The head is still the first message, received in order.
+    for expected in [b"dragon", b"wyvern"] {
+        assert_eq!(
+            two_phase_receive(
+                &mut user,
+                &mut staging,
+                &mut registry,
+                &channels,
+                &waits,
+                &mut tasks,
+                &execution,
+                process,
+                endpoint1,
+                DwUserAddress(BASE + 0x600),
+                8,
+                DwUserAddress(BASE + 0x500),
+                &mut cleanup,
+            ),
+            DW_STATUS_SUCCESS
+        );
+        let output = FakeUserMemory::offset(BASE + 0x600, 6);
+        assert_eq!(&user.bytes[output..output + 6], expected);
+        assert_eq!(u32_at(&user, BASE + 0x500 + 8), 6);
+    }
+
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        endpoint0,
+    );
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        endpoint1,
+    );
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut cleanup
+        ),
+        DW_STATUS_SUCCESS
+    );
+}
+
+/// A receive reservation never outlives its syscall: an unconsumed hold
+/// panics when dropped.
+#[test]
+fn an_unconsumed_receive_hold_panics() {
+    use deepwyrm_abi::{DW_RIGHT_READ, DW_RIGHT_WRITE};
+
+    let (mut registry, mut tasks, process, _process_handle) = process_fixture();
+    let channels = ChannelAuthority::<2, 4>::new();
+    let waits = WaitRegistry::<8>::new();
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    let mut user = FakeUserMemory::new();
+    let mut cleanup = CleanupQueue::<16>::new();
+    assert_eq!(
+        channel_create(
+            &mut user,
+            &mut registry,
+            &channels,
+            &mut tasks,
+            process,
+            DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0),
+            DwUserAddress(BASE + 0x180),
+            DwUserAddress(BASE + 0x188),
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let endpoint0 = DwHandle(u64_at(&user, BASE + 0x180));
+    let endpoint1 = DwHandle(u64_at(&user, BASE + 0x188));
+    let mut staging = std::vec![0_u8; DW_CHANNEL_MAX_PAYLOAD as usize];
+    let input = FakeUserMemory::offset(BASE + 0x300, 1);
+    user.bytes[input] = 7;
+    assert_eq!(
+        channel_send(
+            &mut user,
+            &mut staging,
+            &mut registry,
+            &channels,
+            &waits,
+            &mut tasks,
+            &execution,
+            process,
+            endpoint0,
+            DwUserAddress(BASE + 0x300),
+            1,
+            DwUserAddress(0),
+            0,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let hold = channel_receive_reserve(
+        &mut registry,
+        &channels,
+        &tasks,
+        process,
+        endpoint1,
+        &mut cleanup,
+    )
+    .unwrap();
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(hold)));
+    let message = dropped.expect_err("an unconsumed hold must panic");
+    assert_eq!(
+        message.downcast_ref::<&str>().copied(),
+        Some("a Channel receive reservation outlived its syscall")
+    );
+    // The leaked reservation and pin leave the fixture unclosable, which is
+    // the failure the panic exists to stop; skip its teardown checks.
+    core::mem::forget(tasks);
+}

@@ -3410,6 +3410,361 @@ pub(crate) fn channel_send_commit<
     }
 }
 
+/// The live runtime's two-phase `ChannelReceive` (D1 commit 7b, design
+/// §11.2.8 decision 4).
+///
+/// It is the pieces of `channel_receive`, in its order, split at the two
+/// places that need user memory once the message size is known:
+/// 1. `channel_receive_precheck` (no lock): capacity validation and the
+///    result probe.
+/// 2. `channel_receive_reserve` (first hold): handle resolution and the head
+///    reservation.
+/// 3. `channel_receive_output_ranges` (no lock): the exact-size output
+///    ranges, which the caller pins.
+/// 4. In the second hold, exactly one of:
+///    - `ChannelReceiveHold::commit`: the irreversible dequeue and handle
+///      publication;
+///    - `ChannelReceiveHold::too_small`: cancel, with the result to write;
+///    - `ChannelReceiveHold::abandon`: cancel, with the status to return.
+///
+/// Between the holds the resolved endpoint stays pinned, so it cannot be
+/// finalized, and its queue cannot be drained under the reservation:
+/// `ChannelAuthority` removes an endpoint, and drains its queue, only at its
+/// final release.
+///
+/// Invariant (abandonment): a hold never outlives its owner's syscall. The
+/// facade keeps it in a local across the two holds. Between them the Thread
+/// runs with IF clear on its own CPU and passes no safe point: no Stop poll,
+/// no `sti`, no switch. So no stop, termination or teardown can run against
+/// it there. Exactly one of the three consumers takes it in the second hold,
+/// and dropping an unconsumed hold panics. The output pins live in the same
+/// syscall frame and are released at its end, so the reservation and its
+/// pins share one lifetime.
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live runtime splits ChannelReceive")
+)]
+pub(crate) struct ChannelReceiveHold {
+    pin: Option<InternalRef>,
+    endpoint: ChannelEndpointKey,
+    reservation: Option<crate::ipc::ChannelReceiveReservation>,
+}
+
+/// The exact-size output ranges a held receive pins, by `channel_receive`'s
+/// output index: payload bytes, received handle records, then the result.
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live runtime splits ChannelReceive")
+)]
+pub(crate) enum ChannelReceiveOutputs {
+    /// The message does not fit: only the result is written.
+    TooSmall(UserRange),
+    /// The message fits: every range, empty ones included, with its length.
+    Fits([(UserRange, usize); 3]),
+}
+
+/// What a committed receive writes after the hold, by output index.
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live runtime splits ChannelReceive")
+)]
+pub(crate) struct ChannelReceiveCopyOut {
+    actual: usize,
+    handles: [u8; HANDLE_TRANSFER_LIMIT * DW_RECEIVED_HANDLE_INFO_V1_SIZE as usize],
+    handle_len: usize,
+    result: [u8; DW_CHANNEL_RECEIVE_RESULT_V1_SIZE as usize],
+}
+
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live runtime splits ChannelReceive")
+)]
+impl ChannelReceiveCopyOut {
+    /// The bytes for output `index`, given the payload staging.
+    pub(crate) fn output<'a>(&'a self, index: usize, staging: &'a [u8]) -> &'a [u8] {
+        match index {
+            0 => &staging[..self.actual],
+            1 => &self.handles[..self.handle_len],
+            2 => &self.result,
+            _ => panic!("Channel receive has three outputs"),
+        }
+    }
+}
+
+/// Step 1: capacity validation and the result probe, before any authority.
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live runtime splits ChannelReceive")
+)]
+pub(crate) fn channel_receive_precheck<U: UserPageAccess>(
+    user: &mut U,
+    byte_capacity: u32,
+    handle_capacity: u32,
+    out_result: DwUserAddress,
+) -> Result<(), DwStatus> {
+    if byte_capacity > DW_CHANNEL_MAX_PAYLOAD || handle_capacity > DW_CHANNEL_MAX_HANDLES {
+        return Err(DW_STATUS_INVALID_ARGUMENT);
+    }
+    preflight_output(
+        user,
+        out_result,
+        DW_CHANNEL_RECEIVE_RESULT_V1_SIZE as usize,
+        8,
+    )
+    .map(drop)
+}
+
+/// Step 2: resolves the endpoint and reserves its head message for this
+/// receiver.
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live runtime splits ChannelReceive")
+)]
+pub(crate) fn channel_receive_reserve<
+    const OBJECTS: usize,
+    const PAIRS: usize,
+    const DEPTH: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    channels: &ChannelAuthority<PAIRS, DEPTH>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    current_process: ProcessKey,
+    channel: DwHandle,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> Result<ChannelReceiveHold, DwStatus> {
+    let pin = resolve_current_handle(
+        tasks,
+        registry,
+        current_process,
+        channel,
+        DW_OBJECT_TYPE_CHANNEL,
+        DW_RIGHT_READ,
+    )?;
+    let endpoint = ChannelEndpointKey::from_object_id(pin.id());
+    match channels.reserve_receive(endpoint) {
+        Ok(reservation) => Ok(ChannelReceiveHold {
+            pin: Some(pin),
+            endpoint,
+            reservation: Some(reservation),
+        }),
+        Err(error) => {
+            release_lookup_pin(registry, pin, cleanup);
+            Err(channel_status(error))
+        }
+    }
+}
+
+/// Step 3: the exact-size output ranges for the reserved message, formed in
+/// `channel_receive`'s order. A formation failure is the status the hold is
+/// abandoned with.
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live runtime splits ChannelReceive")
+)]
+pub(crate) fn channel_receive_output_ranges(
+    info: crate::ipc::ChannelMessageInfo,
+    byte_capacity: u32,
+    handle_capacity: u32,
+    out_bytes: DwUserAddress,
+    out_handles: DwUserAddress,
+    out_result: DwUserAddress,
+) -> Result<ChannelReceiveOutputs, DwStatus> {
+    let result_size = DW_CHANNEL_RECEIVE_RESULT_V1_SIZE as usize;
+    if info.required_bytes > byte_capacity || info.required_handles > handle_capacity {
+        return user_range(out_result, result_size, 8, UserAccess::WRITE)
+            .map(ChannelReceiveOutputs::TooSmall);
+    }
+    let byte_bytes = info.required_bytes as usize;
+    let handle_bytes = (info.required_handles as usize)
+        .checked_mul(DW_RECEIVED_HANDLE_INFO_V1_SIZE as usize)
+        .expect("generated Channel handle capacity fits usize");
+    let byte_range = channel_buffer_range(out_bytes, byte_bytes, 1, UserAccess::WRITE)?;
+    let handle_range = channel_buffer_range(out_handles, handle_bytes, 8, UserAccess::WRITE)?;
+    let result_range = user_range(out_result, result_size, 8, UserAccess::WRITE)?;
+    Ok(ChannelReceiveOutputs::Fits([
+        (byte_range, byte_bytes),
+        (handle_range, handle_bytes),
+        (result_range, result_size),
+    ]))
+}
+
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live runtime splits ChannelReceive")
+)]
+impl ChannelReceiveHold {
+    pub(crate) fn info(&self) -> crate::ipc::ChannelMessageInfo {
+        self.reservation
+            .as_ref()
+            .expect("live Channel receive hold keeps its reservation")
+            .info()
+    }
+
+    fn take(&mut self) -> (InternalRef, crate::ipc::ChannelReceiveReservation) {
+        (
+            self.pin
+                .take()
+                .expect("Channel receive hold consumed twice"),
+            self.reservation
+                .take()
+                .expect("Channel receive hold consumed twice"),
+        )
+    }
+
+    /// Cancels the reservation and returns `status`: an output range could
+    /// not be formed or pinned, so nothing is dequeued.
+    pub(crate) fn abandon<const OBJECTS: usize, const PAIRS: usize, const DEPTH: usize>(
+        mut self,
+        status: DwStatus,
+        registry: &mut ObjectRegistry<OBJECTS>,
+        channels: &ChannelAuthority<PAIRS, DEPTH>,
+        cleanup: &mut CleanupQueue<OBJECTS>,
+    ) -> DwStatus {
+        let (pin, reservation) = self.take();
+        channels
+            .cancel_receive(reservation)
+            .unwrap_or_else(|error| {
+                panic!("F6 receive reservation cancellation drifted: {error:?}")
+            });
+        release_lookup_pin(registry, pin, cleanup);
+        status
+    }
+
+    /// Cancels the reservation of a message that does not fit, returning
+    /// the result to write; the status is `BUFFER_TOO_SMALL`.
+    pub(crate) fn too_small<const OBJECTS: usize, const PAIRS: usize, const DEPTH: usize>(
+        self,
+        registry: &mut ObjectRegistry<OBJECTS>,
+        channels: &ChannelAuthority<PAIRS, DEPTH>,
+        cleanup: &mut CleanupQueue<OBJECTS>,
+    ) -> [u8; DW_CHANNEL_RECEIVE_RESULT_V1_SIZE as usize] {
+        let info = self.info();
+        let result = channel_receive_result(info.required_bytes, 0, info.required_handles, 0);
+        let status = self.abandon(DW_STATUS_BUFFER_TOO_SMALL, registry, channels, cleanup);
+        debug_assert_eq!(status, DW_STATUS_BUFFER_TOO_SMALL);
+        encode_channel_receive_result(result)
+    }
+
+    /// The irreversible dequeue into `staging`, after every output is
+    /// pinned. It publishes the transferred handles and completes the wakes,
+    /// returning what to copy out after the hold.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the receive commit keeps every authority it mutates explicit"
+    )]
+    pub(crate) fn commit<
+        const OBJECTS: usize,
+        const PAIRS: usize,
+        const DEPTH: usize,
+        const WAITERS: usize,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+        const EXECUTION: usize,
+    >(
+        mut self,
+        staging: &mut [u8],
+        registry: &mut ObjectRegistry<OBJECTS>,
+        channels: &ChannelAuthority<PAIRS, DEPTH>,
+        waits: &WaitRegistry<WAITERS>,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        execution: &ExecutionDomain<EXECUTION>,
+        current_process: ProcessKey,
+        cleanup: &mut CleanupQueue<OBJECTS>,
+    ) -> Result<ChannelReceiveCopyOut, DwStatus> {
+        let info = self.info();
+        let endpoint = self.endpoint;
+        let (pin, reservation) = self.take();
+        assert!(
+            staging.len() >= DW_CHANNEL_MAX_PAYLOAD as usize,
+            "F6 Channel staging must hold one ABI-maximum payload"
+        );
+        let byte_bytes = info.required_bytes as usize;
+        let handle_count = info.required_handles as usize;
+        let handle_bytes = handle_count
+            .checked_mul(DW_RECEIVED_HANDLE_INFO_V1_SIZE as usize)
+            .expect("generated Channel handle capacity fits usize");
+        let table = match tasks.process_handles_mut(current_process) {
+            Ok(table) => table,
+            Err(error) => {
+                channels
+                    .cancel_receive(reservation)
+                    .unwrap_or_else(|channel_error| {
+                        panic!("F6 receive reservation cancellation drifted: {channel_error:?}")
+                    });
+                release_lookup_pin(registry, pin, cleanup);
+                return Err(task_status(error));
+            }
+        };
+        let destination = match table.reserve_transfer_batch(handle_count) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                channels
+                    .cancel_receive(reservation)
+                    .unwrap_or_else(|channel_error| {
+                        panic!("F6 receive reservation cancellation drifted: {channel_error:?}")
+                    });
+                release_lookup_pin(registry, pin, cleanup);
+                return Err(handle_status(error));
+            }
+        };
+        let received =
+            match channels.receive_reserved(reservation, &mut staging[..byte_bytes], waits) {
+                Ok(received) => received,
+                Err(error) => {
+                    drop(destination);
+                    release_lookup_pin(registry, pin, cleanup);
+                    return Err(channel_status(error));
+                }
+            };
+        let (actual, transfer_batch, wakes) = received.into_parts();
+        let published = destination.publish(transfer_batch);
+        let mut handles = [0_u8; HANDLE_TRANSFER_LIMIT * DW_RECEIVED_HANDLE_INFO_V1_SIZE as usize];
+        for (index, info) in published[..handle_count]
+            .iter()
+            .flatten()
+            .copied()
+            .enumerate()
+        {
+            let encoded = encode_received_handle_info(DwReceivedHandleInfoV1 {
+                handle: info.handle,
+                rights: info.rights,
+                object_type: info.object_type,
+                reserved0: 0,
+                reserved: [0; 2],
+            });
+            let start = index * DW_RECEIVED_HANDLE_INFO_V1_SIZE as usize;
+            handles[start..start + DW_RECEIVED_HANDLE_INFO_V1_SIZE as usize]
+                .copy_from_slice(&encoded);
+        }
+        let actual_u32 = u32::try_from(actual).expect("Channel receive length fits generated u32");
+        let actual_handles = u32::try_from(handle_count).expect("Channel transfer count fits u32");
+        let result = channel_receive_result(actual_u32, actual_u32, actual_handles, actual_handles);
+        release_lookup_pin(registry, pin, cleanup);
+        complete_channel_receive_wait_wakes(registry, execution, endpoint, wakes, cleanup);
+        Ok(ChannelReceiveCopyOut {
+            actual,
+            handles,
+            handle_len: handle_bytes,
+            result: encode_channel_receive_result(result),
+        })
+    }
+}
+
+impl Drop for ChannelReceiveHold {
+    fn drop(&mut self) {
+        assert!(
+            self.pin.is_none() && self.reservation.is_none(),
+            "a Channel receive reservation outlived its syscall"
+        );
+    }
+}
+
 fn channel_receive_result(
     required_bytes: u32,
     actual_bytes: u32,

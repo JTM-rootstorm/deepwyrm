@@ -85,11 +85,12 @@ pub(crate) use adapters::interrupt_ack_dw1e;
 pub(crate) use adapters::process_terminate;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use adapters::{
-    ChannelSendInputs, PreparedProcessTermination, PreparedTaskGroupTermination,
-    PreparedThreadTermination, abi_get_info_with_features, address_region_map_prepared_model,
-    address_region_protect_prepared, address_region_unmap_prepared, channel_create,
-    channel_send_commit, channel_send_snapshot, clock_get_with,
-    complete_deferred_current_reclaim_on,
+    ChannelReceiveCopyOut, ChannelReceiveHold, ChannelReceiveOutputs, ChannelSendInputs,
+    PreparedProcessTermination, PreparedTaskGroupTermination, PreparedThreadTermination,
+    abi_get_info_with_features, address_region_map_prepared_model, address_region_protect_prepared,
+    address_region_unmap_prepared, channel_create, channel_receive_output_ranges,
+    channel_receive_precheck, channel_receive_reserve, channel_send_commit, channel_send_snapshot,
+    clock_get_with, complete_deferred_current_reclaim_on,
     complete_prepared_process_termination_after_remote_stops_on,
     complete_prepared_task_group_termination_after_remote_stops_on,
     complete_prepared_thread_termination_after_remote_stops_on, complete_wait_wakes,
