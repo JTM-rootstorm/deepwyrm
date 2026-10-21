@@ -1000,3 +1000,25 @@ Each commit is semantic and carries its own SMP VM evidence (§5.3).
 - Profiling shows T contention dominates SMP throughput once usercopy is
   out. Then Registry and Tasks need splitting after all. This is a later
   measurement, not a D1 blocker.
+
+#### 11.2.8 Mike's decisions (2026-10-21)
+
+1. **A pinned range fails with `BAD_STATE`.** An unmap or protect over a
+   range that a sibling Thread's in-flight syscall has pinned fails with the
+   existing `DW_STATUS_BAD_STATE`. No new status is added. This still changes
+   the kernel ABI schema: the documented errors of `address_region_unmap` and
+   `address_region_protect` in `abi/schema/syscalls.toml` change. It
+   therefore follows the shared-contract procedure:
+   - Deepwyrm changes the schema, and the kernel side, in the commit that
+     introduces the conflict;
+   - the coordinator then serializes the Wyrmroot consumer and pin update;
+   - the ABI drift and exact-pair tests run.
+2. **Handle ordering is accepted.** A sibling Thread may see, or close, a new
+   handle before the creator's copy-out stores its value. Pins make the
+   copy-out infallible. The commit that introduces this records it as a
+   named semantic change.
+3. **Proceed with §11.2.7 as sequenced,** starting with "Power off only after
+   the runtime guard is released".
+   - Commit 2 lands only if the §11.2.4 hypothesis is proved from source.
+   - Commit 3 orders T before P, never P before T, and makes that order a
+     type fact if it is feasible.
