@@ -485,21 +485,18 @@ fn quantum_clock_is_sampled_only_inside_synchronized_preparation() {
 fn dw1b_timer_return_validation_is_fail_closed_before_resume_or_rearm() {
     let live = source("src/arch/x86_64/syscall/live.rs");
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
-    // S2K-6: the per-CPU quantum-expiry publisher, not the facade, publishes under its own
-    // runtime-authority handle.
+    // S2K-6: the per-CPU quantum-expiry publisher, not the facade, publishes. D1 commit 2: it
+    // takes no runtime-authority lock, only the scheduler's own.
     let expiry = primordial
-        .split_once("crate::syscall::native::NativeQuantumExpiry\n    for QuantumExpiryPublisher")
+        .split_once("impl crate::syscall::native::NativeQuantumExpiry for QuantumExpiryPublisher {")
         .expect("primordial quantum-expiry publisher")
         .1
         .split_once("\n}\n")
         .expect("primordial quantum-expiry publisher extent")
         .0;
     assert!(!expiry.contains("notify_completed_switch_runnable"));
-    let runtime_lock = expiry.find("let guard = self.runtime.lock();").unwrap();
-    let publish = expiry
-        .find("guard.core.shared.execution.publish_quantum_expiry(ticket)")
-        .unwrap();
-    assert!(runtime_lock < publish);
+    assert!(!expiry.contains(".lock()"));
+    assert!(expiry.contains("self.shared.execution.publish_quantum_expiry(ticket)"));
 
     let gate = live
         .split_once("unsafe fn native_runtime_timer_pre_iret")

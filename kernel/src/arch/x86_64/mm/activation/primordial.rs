@@ -30,9 +30,7 @@ use super::root_switch::{
 
 use super::GuardFree;
 use super::cpu_slots::{CpuOwner, CpuSlots, OtherCpus, RemotelyStaged};
-use super::runtime_authority::{
-    InterruptAuthorityHandle, RuntimeAuthorityHandle, RuntimeAuthorityLock,
-};
+use super::runtime_authority::{RuntimeAuthorityHandle, RuntimeAuthorityLock};
 use crate::one_shot::init_fields;
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
@@ -1589,12 +1587,7 @@ static PRIMORDIAL_FACADES: crate::one_shot::OneShotStorage<
 /// beside the facades and reached only through their published pointers
 /// ([P-FACADE]).
 static PRIMORDIAL_QUANTUM_EXPIRY: crate::one_shot::OneShotStorage<
-    [QuantumExpiryPublisher<
-        'static,
-        'static,
-        { crate::BOOTSTRAP_FRAME_RANGE_CAPACITY },
-        { crate::BOOTSTRAP_FRAME_ROLE_CAPACITY },
-    >; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
+    [QuantumExpiryPublisher; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT],
 > = crate::one_shot::OneShotStorage::new();
 
 /// The primordial runtime's authority lock and the carrier it guards, owned
@@ -1753,37 +1746,31 @@ struct RuntimeCarrierFacade<
 /// cancellation publish an expiry without reborrowing a facade that a
 /// suspended frame on this CPU still holds.
 ///
-/// Handle-locking rule: each CPU has two runtime-authority handles, its
-/// facade's `RuntimeAuthorityHandle` and this publisher's
-/// `InterruptAuthorityHandle`, which cannot mint `GuardFree`; at most one of
-/// them holds the guard.
-/// This publisher locks only from the timer interrupt, which this CPU takes
-/// only inside an STI window, and from synchronous quantum cancellation; the
-/// facade enters both only after dropping its guard (the idle STI window and
-/// `drain_quantum_cancellation_detached` take a `GuardFree` from the facade's
-/// handle).
-struct QuantumExpiryPublisher<
-    'runtime,
-    'roles,
-    const RANGE_CAPACITY: usize,
-    const ROLE_CAPACITY: usize,
-> {
-    runtime: InterruptAuthorityHandle<
-        'runtime,
-        PrimordialRuntimeState<'roles, RANGE_CAPACITY, ROLE_CAPACITY>,
-    >,
+/// It publishes without the runtime authority (D1 commit 2, design §11.2.4),
+/// so nothing in interrupt context takes that lock. Publication is one
+/// `CooperativeScheduler` operation under the scheduler's own
+/// `IrqSpinMutex`. It writes only the publishing CPU's `quantum` and
+/// `need_resched` slots, the event accounting, and the selector-28 fixture,
+/// and it accepts only the ticket armed on that CPU for its exact running
+/// claim. No runtime-guard holder depends on excluding it:
+/// - on this CPU, a guard holder runs with IF clear and every synchronous
+///   publication path runs guard-free, so the two never overlap;
+/// - on another CPU, the guard-held scheduler operations that read this
+///   CPU's slots (`stop_running_claim_on`,
+///   `retire_unentered_running_claim_on`, the DW1-B counter snapshot) each
+///   run under the scheduler lock. They take an armed quantum or a published
+///   expiry, whichever they find. The selector-28 gate reports `Ready` only
+///   after the last of publication's three steps.
+struct QuantumExpiryPublisher {
+    shared: &'static PrimordialRuntimeShared,
 }
 
-impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
-    crate::syscall::native::NativeQuantumExpiry
-    for QuantumExpiryPublisher<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
-{
+impl crate::syscall::native::NativeQuantumExpiry for QuantumExpiryPublisher {
     fn publish_quantum_expiry(
         &mut self,
         ticket: crate::task::SchedulerQuantumTicket,
     ) -> Result<bool, crate::task::SchedulerError> {
-        let guard = self.runtime.lock();
-        guard.core.shared.execution.publish_quantum_expiry(ticket)
+        self.shared.execution.publish_quantum_expiry(ticket)
     }
 }
 
@@ -2335,9 +2322,7 @@ fn bind_runtime_carrier_facades<
     facades: core::ptr::NonNull<
         RuntimeCarrierFacade<'runtime, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>,
     >,
-    publishers: core::ptr::NonNull<
-        QuantumExpiryPublisher<'runtime, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>,
-    >,
+    publishers: core::ptr::NonNull<QuantumExpiryPublisher>,
 ) -> usize {
     let registry = crate::arch::x86_64::smp::live_cpu_registry();
     let live_cpu_count = registry.len();
@@ -2480,11 +2465,11 @@ fn carrier_resource_tuple<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
     }
 }
 
-/// Cancels this CPU's exact scheduler quantum. Cancellation can publish a due
-/// expiry synchronously through this CPU's quantum-expiry publisher, which
-/// locks the runtime authority through its own handle, so the caller must
-/// not hold its facade's guard: the `GuardFree` token proves it
-/// (`QuantumExpiryPublisher`'s handle-locking rule).
+/// Cancels this CPU's exact scheduler quantum, at the safe point after the
+/// facade drops its guard. Cancellation can publish a due expiry
+/// synchronously, which no longer takes the runtime authority (D1 commit 2).
+/// The token records where this runs; it is no longer needed to avoid a
+/// self-deadlock.
 fn cancel_scheduler_quantum_guard_free(
     ticket: crate::task::SchedulerQuantumTicket,
     _guard_free: GuardFree<'_>,
@@ -2494,10 +2479,8 @@ fn cancel_scheduler_quantum_guard_free(
 }
 
 /// Halts the idle CPU until an interrupt, with IF set only inside the
-/// window. The timer interrupt taken there can publish a quantum expiry
-/// through this CPU's publisher, which locks the runtime authority, so the
-/// caller must not hold its facade's guard: the `GuardFree` token proves it
-/// (`QuantumExpiryPublisher`'s handle-locking rule).
+/// window. No runtime lock may be held across `sti; hlt` (DW0-H §12.8):
+/// the `GuardFree` token proves the caller holds none.
 fn halt_for_interrupt(_guard_free: GuardFree<'_>) {
     // SAFETY: as at `wait_for_suspend_interrupt` in `syscall/live.rs`: CPL0 with IF clear, so
     // STI;HLT is race-free and CLI restores IF clear. Handlers run inside the window write memory
@@ -8426,7 +8409,7 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     NativeSyscallFrameRuntime
     for RuntimeCarrierFacade<'runtime, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>
 {
-    type QuantumExpiry = QuantumExpiryPublisher<'runtime, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>;
+    type QuantumExpiry = QuantumExpiryPublisher;
 
     fn prepare_quantum(
         &mut self,
@@ -9833,15 +9816,13 @@ pub(super) fn enter(
     // into the base pointer every later facade access derives from, and is never used again.
     let facades = core::ptr::NonNull::from(PRIMORDIAL_FACADES.init(facades))
         .cast::<RuntimeCarrierFacade<'static, 'static, RANGE_CAPACITY, ROLE_CAPACITY>>();
-    // Each CPU's interrupt-context handle, minted once, goes to its quantum-expiry publisher.
-    let publishers: [_; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] = runtime_ref
-        .interrupt_handles()
-        .map(|runtime| QuantumExpiryPublisher { runtime });
+    // Each CPU's quantum-expiry publisher reaches only the stationary shared authorities.
+    let publishers: [_; crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] =
+        core::array::from_fn(|_| QuantumExpiryPublisher { shared });
     // [P-FACADE] as for the facades: the publisher array's one owner's reference is converted
     // here, once, into the base pointer every later access derives from.
     let publishers = core::ptr::NonNull::from(PRIMORDIAL_QUANTUM_EXPIRY.init(publishers))
-        .cast::<QuantumExpiryPublisher<'static, 'static, RANGE_CAPACITY, ROLE_CAPACITY>>(
-    );
+        .cast::<QuantumExpiryPublisher>();
     let live_cpu_count = bind_runtime_carrier_facades(facades, publishers);
     user_access::initialize_live_tlb_shootdown();
     prepare_runtime_carrier_admission(facades, live_cpu_count);

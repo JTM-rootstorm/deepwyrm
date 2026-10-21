@@ -109,13 +109,6 @@ fn guard_free_tokens_cannot_be_minted_under_the_runtime_guard() {
                 "error[E0133]: call to unsafe function `GuardFree::<'_>::assume` is unsafe and requires unsafe block",
             ),
         },
-        // S2K-6: the interrupt-context handle has no `guard_free`.
-        UiCase {
-            fixture: "guard_free_from_interrupt_handle.rs",
-            expected_error: Some(
-                "error[E0599]: no method named `guard_free` found for struct `InterruptAuthorityHandle<'a, T>` in the current scope",
-            ),
-        },
         UiCase {
             fixture: "runtime_authority_lock_private.rs",
             expected_error: Some("error[E0624]: method `lock` is private"),

@@ -73,7 +73,8 @@ use super::runtime_binding::{
 // cancellation). Its context is therefore not the carrier: each CPU publishes a separate
 // `NativeQuantumExpiry` object with its binding (`quantum_expiry_context`), and only
 // `native_runtime_quantum_expiry` reborrows it. No carrier frame holds a reference to it, and
-// publication does not re-enter quantum expiry, so its reborrow never overlaps another.
+// publication does not re-enter quantum expiry, so its reborrow never overlaps another. Since D1
+// commit 2 it takes no runtime-authority lock, only the scheduler's own `IrqSpinMutex`.
 //
 // [GUARD-FREE] Crate-visible physical boundaries here (`enter_bound_validated_user`,
 // `enter_bound_idle_scheduler`, `handoff_current_rendezvous_from_carrier`), and
@@ -81,11 +82,10 @@ use super::runtime_binding::{
 // them while it holds its runtime-authority guard. The private boundaries (`switch_kernel_context`,
 // `handoff_to_rendezvous_reaper`, `handoff_to_terminal_reaper`) are guard-free by construction:
 // only this file's trampolines call them, this file cannot name `RuntimeAuthorityGuard`
-// (`pub(super)` in `mm::activation`), and no runtime trait method can return one. Since S2K-6 the
-// argument covers both of a CPU's handles: only the facade's `RuntimeAuthorityHandle` mints a
-// token, and the quantum-expiry publisher's `InterruptAuthorityHandle` cannot; its guard lives
-// only inside one publication, which runs no physical boundary and returns before the code it
-// interrupted or was called from continues. The remaining mints are `GuardFree::assume` in root
+// (`pub(super)` in `mm::activation`), and no runtime trait method can return one. The facade's
+// `RuntimeAuthorityHandle` is a CPU's only way to lock (the quantum-expiry publisher takes no
+// runtime lock since D1 commit 2), and only it mints a token. The remaining mints are
+// `GuardFree::assume` in root
 // frames that hold no guard by construction (the AP entry in `lib.rs`, the dw1c detached idle
 // entry here, and the F9/F12 guest runtimes).
 //
