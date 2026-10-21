@@ -1022,6 +1022,26 @@ Each commit is semantic and carries its own SMP VM evidence (§5.3).
    - Commit 2 lands only if the §11.2.4 hypothesis is proved from source.
    - Commit 3 orders T before P, never P before T, and makes that order a
      type fact if it is feasible.
+4. **ChannelReceive takes option (a), a two-phase reserve.**
+   - The first hold reserves the head message for this receiver.
+   - The exact-size outputs are preflighted and pinned with no runtime lock
+     held.
+   - The second hold dequeues and commits. The irreversible dequeue happens
+     only after the pins succeed.
+   - While the head is reserved, a second receiver on the same endpoint end
+     waits, or gets `WOULD_BLOCK` in non-blocking mode. It never takes a
+     later message out of order. Message order and statuses are otherwise
+     unchanged.
+   - Abandonment: a reservation must not outlive its owner. If the
+     reserving Thread is stopped or terminated between the holds, the
+     reservation is released by the same teardown that releases its pins.
+     The implementing commit states the invariant and tests the abandon
+     path.
+
+   Recorded 2026-10-21. The coordinator also sequenced the remaining work:
+   family F (ChannelReceive), then ProcessCreate, then commit 8 (family E),
+   then option B (B1 to B4), then commit 9. Commit 9 needs B3's
+   page-table-mutation session type.
 
 #### 11.2.9 Option B: the shootdown wait outside the hold (2026-10-21)
 
