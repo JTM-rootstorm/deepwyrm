@@ -842,11 +842,7 @@ pub(crate) fn begin_registered_wait<
             .take()
             .expect("failed wait-operation publication remains caller-owned");
         let (output, deadline) = operation
-            .complete(
-                execution.blocked_operations(),
-                tasks,
-                BlockedOperationWinner::Cancelled,
-            )
+            .complete_abandoned(execution.blocked_operations(), tasks)
             .unwrap_or_else(|failure| {
                 panic!("unpublished F7 operation cleanup drifted: {failure:?}")
             });
@@ -875,11 +871,7 @@ pub(crate) fn begin_registered_wait<
                 .take_wake(wake)
                 .expect("fresh F7 wait operation remains live");
             let (output, deadline) = operation
-                .complete(
-                    execution.blocked_operations(),
-                    tasks,
-                    BlockedOperationWinner::Cancelled,
-                )
+                .complete_abandoned(execution.blocked_operations(), tasks)
                 .unwrap_or_else(|failure| {
                     panic!("F7 ready rollback completion drifted: {failure:?}")
                 });
@@ -1039,11 +1031,7 @@ pub(crate) fn begin_registered_wait<
                 .take_wake(wake)
                 .expect("fresh F7 wait operation remains live");
             let (output, deadline) = operation
-                .complete(
-                    execution.blocked_operations(),
-                    tasks,
-                    BlockedOperationWinner::Cancelled,
-                )
+                .complete_abandoned(execution.blocked_operations(), tasks)
                 .unwrap_or_else(|failure| {
                     panic!("F7 failed publication cleanup drifted: {failure:?}")
                 });
@@ -2083,9 +2071,14 @@ mod tests {
         }
     }
 
+    /// Claims `winner` on the ledger as soon as the deadline is registered:
+    /// an interrupt-context claimant (the deadline's timeout, or an
+    /// Interrupt object's IRQ signal) winning between the waiter's
+    /// publication and its next step.
     struct PreclaimDeadline<'a> {
         queue: crate::time::DeadlineQueue<1>,
         ledger: &'a crate::task::BlockedOperationRegistry<1>,
+        winner: BlockedOperationWinner,
     }
 
     impl WaitDeadlineAuthority for PreclaimDeadline<'_> {
@@ -2098,11 +2091,7 @@ mod tests {
                 .queue
                 .register(deadline_ns, wake)
                 .map_err(|_| WaitDeadlineError::Fault)?;
-            assert!(
-                self.ledger
-                    .try_claim_winner(wake, BlockedOperationWinner::Timeout)
-                    .unwrap()
-            );
+            assert!(self.ledger.try_claim_winner(wake, self.winner).unwrap());
             Ok(registration)
         }
 
@@ -2384,6 +2373,7 @@ mod tests {
         let mut deadlines = PreclaimDeadline {
             queue: crate::time::DeadlineQueue::new(),
             ledger: execution.blocked_operations(),
+            winner: BlockedOperationWinner::Timeout,
         };
         match begin_registered_wait(
             set,
@@ -2420,5 +2410,134 @@ mod tests {
         assert_eq!(operations.len(), 0);
         assert_eq!(deadlines.queue.earliest(), None);
         close_event(&mut registry, &mut tasks, &events, process, event);
+    }
+
+    /// The D1 per-commit checkpoint's panic (`f3a/d1f2-deg-01/smp`): a wait
+    /// whose source is ready at registration rolls its published operation
+    /// back. An interrupt-context claimant may already have won it: the
+    /// deadline's timeout, or an Interrupt object's IRQ signal (COM2 typing).
+    /// Completing with `Cancelled` then lost, and the failed completion
+    /// dropped the live operation ("live blocked operation dropped without
+    /// signal/timeout/cancel/terminal completion"). The rollback now
+    /// completes with whichever winner the ledger holds, and the ready wait
+    /// still returns its selection.
+    /// Between the waiter's initial scan and its source registration, the
+    /// source becomes ready and an interrupt-context claimant wins the
+    /// published operation: the interleaving of an IRQ that lands while the
+    /// waiter registers. Injected at deadline registration, which falls in
+    /// that window.
+    struct ReadyThenClaimDeadline<'a> {
+        queue: crate::time::DeadlineQueue<1>,
+        ledger: &'a crate::task::BlockedOperationRegistry<1>,
+        winner: BlockedOperationWinner,
+        events: &'a Events,
+        waits: &'a Waits,
+        event: super::super::EventKey,
+    }
+
+    impl WaitDeadlineAuthority for ReadyThenClaimDeadline<'_> {
+        fn register_wait_deadline(
+            &mut self,
+            deadline_ns: u64,
+            wake: BlockWakeKey,
+        ) -> Result<DeadlineRegistration, WaitDeadlineError> {
+            let registration = self
+                .queue
+                .register(deadline_ns, wake)
+                .map_err(|_| WaitDeadlineError::Fault)?;
+            assert_eq!(
+                self.events
+                    .signal(self.event, DwSignals(0), DW_SIGNAL_SIGNALED, self.waits)
+                    .unwrap()
+                    .len(),
+                0
+            );
+            assert!(self.ledger.try_claim_winner(wake, self.winner).unwrap());
+            Ok(registration)
+        }
+
+        fn cancel_wait_deadline(
+            &mut self,
+            registration: DeadlineRegistration,
+        ) -> Result<(), WaitDeadlineError> {
+            self.queue
+                .cancel_if_live(registration)
+                .map(|_| ())
+                .map_err(|_| WaitDeadlineError::Fault)
+        }
+    }
+
+    #[test]
+    fn a_ready_rollback_completes_with_an_interrupt_claimed_winner() {
+        for winner in [
+            BlockedOperationWinner::Timeout,
+            BlockedOperationWinner::Signal {
+                item_index: 0,
+                observed: DW_SIGNAL_SIGNALED,
+            },
+        ] {
+            let (mut registry, mut tasks, execution, process, thread) = running_fixture();
+            let events = Events::new();
+            let timers = Timers::new();
+            let channels = Channels::new();
+            let waits = Waits::new();
+            let (event_key, event) = install_event(&mut registry, &mut tasks, &events, process);
+            let request = [DwWaitItemV1 {
+                handle: event,
+                signals: DW_SIGNAL_SIGNALED,
+            }];
+            let set = ResolvedWaitSet::resolve(&tasks, &mut registry, process, &request).unwrap();
+            let mut operations = WaitOperationRegistry::<u32, 1>::new();
+            let mut deadlines = ReadyThenClaimDeadline {
+                queue: crate::time::DeadlineQueue::new(),
+                ledger: execution.blocked_operations(),
+                winner,
+                events: &events,
+                waits: &waits,
+                event: event_key,
+            };
+            match begin_registered_wait(
+                set,
+                0xd1,
+                WaitDeadline::Finite(70),
+                WaitBeginContext {
+                    registry: &mut registry,
+                    tasks: &mut tasks,
+                    sources: WaitSources {
+                        events: &events,
+                        timers: &timers,
+                        channels: &channels,
+                        interrupts: None,
+                        waits: &waits,
+                    },
+                    execution: &execution,
+                    operations: &mut operations,
+                    cpu: crate::cpu::CpuIndex::BOOTSTRAP,
+                    process,
+                    thread,
+                },
+                Some(&mut deadlines),
+            )
+            .unwrap_or_else(|failure| panic!("ready wait failed: {:?}", failure.error))
+            {
+                WaitBeginOutcome::Ready { output, selection } => {
+                    assert_eq!(output, 0xd1);
+                    assert_eq!(selection.index, 0);
+                    assert_eq!(selection.observed, DW_SIGNAL_SIGNALED);
+                }
+                WaitBeginOutcome::Suspended { .. } | WaitBeginOutcome::TimedOut { .. } => {
+                    panic!("a wait ready at registration did not return ready")
+                }
+            }
+            assert_eq!(
+                execution.scheduler_state(thread),
+                Some(SchedulerThreadState::Running)
+            );
+            assert!(!execution.blocked_operations().has_thread(thread));
+            assert_eq!(waits.len(), 0);
+            assert_eq!(operations.len(), 0);
+            assert_eq!(deadlines.queue.earliest(), None);
+            close_event(&mut registry, &mut tasks, &events, process, event);
+        }
     }
 }

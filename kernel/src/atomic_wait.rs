@@ -390,6 +390,17 @@ impl<PIN> AtomicWaitOperation<PIN> {
         blocked.winner(self.wake_key())
     }
 
+    /// The winner this operation must complete with when its owner abandons
+    /// it: `preferred`, or one a deadline timeout already claimed from
+    /// interrupt context (see `BlockedOperation::settle_winner`).
+    pub(crate) fn settle_winner<const BLOCKED: usize>(
+        &self,
+        blocked: &BlockedOperationRegistry<BLOCKED>,
+        preferred: BlockedOperationWinner,
+    ) -> Result<BlockedOperationWinner, BlockedOperationError> {
+        self.blocked.settle_winner(blocked, preferred)
+    }
+
     pub(crate) fn complete<
         const BLOCKED: usize,
         const GROUPS: usize,
@@ -853,13 +864,16 @@ pub(crate) fn register_atomic_wait<
     let registration = match registry.register(key, wake) {
         Ok(registration) => registration,
         Err(error) => {
-            blocked
-                .complete_for_process(
+            // The finite deadline is registered, so its interrupt-context
+            // timeout may already have won.
+            let winner = blocked
+                .settle_winner(
                     execution.blocked_operations(),
-                    tasks,
                     BlockedOperationWinner::Cancelled,
-                    |()| (),
                 )
+                .expect("F9 registration failure winner remains exact");
+            blocked
+                .complete_for_process(execution.blocked_operations(), tasks, winner, |()| ())
                 .expect("F9 registration failure cleanup remains exact");
             cancel_deadline(&mut deadline_authority, deadline_registration)
                 .expect("F9 registration failure deadline remains cancellable");
@@ -887,9 +901,12 @@ pub(crate) fn register_atomic_wait<
 /// - otherwise the pin moves into a published operation and the block
 ///   commits.
 ///
-/// Every claimant of the winner ledger (a wake, a deadline expiry, terminal
-/// teardown) runs under the same runtime authority as this call, so no
-/// winner can appear between its read of the ledger and the block commit.
+/// A wake and terminal teardown run under the same runtime authority as
+/// this call, but a finite deadline times out from interrupt context, so a
+/// `Timeout` can be claimed at any moment until the operation completes. The
+/// mismatch path therefore settles its winner rather than assuming
+/// `Cancelled`, and the block commit replays any winner that raced it
+/// (`ExecutionDomain::commit_published_block_on`).
 #[allow(
     clippy::too_many_arguments,
     reason = "the wait settlement keeps registry, scheduler, operation, deadline, process, and thread authorities explicit"
@@ -946,12 +963,14 @@ pub(crate) fn settle_atomic_wait<
                 let operation = operation
                     .take()
                     .expect("failed F9 operation publication remains caller-owned");
-                let (pin, _, deadline) = operation
-                    .complete(
+                let winner = operation
+                    .settle_winner(
                         execution.blocked_operations(),
-                        tasks,
                         BlockedOperationWinner::Cancelled,
                     )
+                    .expect("unpublished F9 operation winner remains exact");
+                let (pin, _, deadline) = operation
+                    .complete(execution.blocked_operations(), tasks, winner)
                     .expect("unpublished F9 operation cleanup remains exact");
                 cancel_deadline(&mut deadline_authority, deadline)
                     .expect("unpublished F9 deadline remains cancellable");
@@ -969,26 +988,35 @@ pub(crate) fn settle_atomic_wait<
             Ok(AtomicWaitBegin::Suspended { wake, decision })
         }
         None => {
-            assert!(
-                registry
-                    .cancel_if_live(registration)
-                    .expect("undecided F9 registration remains exact"),
-                "an undecided F9 registration left the index"
-            );
-            blocked
-                .complete_for_process(
+            registry
+                .cancel_if_live(registration)
+                .expect("undecided F9 registration remains exact");
+            // A wake runs under the runtime authority, as this does, but a
+            // deadline times out from interrupt context: it may claim the
+            // winner after the read above. Honor it if it did.
+            let winner = blocked
+                .settle_winner(
                     execution.blocked_operations(),
-                    tasks,
                     BlockedOperationWinner::Cancelled,
-                    |()| (),
                 )
+                .expect("F9 reread mismatch winner remains exact");
+            blocked
+                .complete_for_process(execution.blocked_operations(), tasks, winner, |()| ())
                 .expect("F9 reread mismatch cleanup remains exact");
             cancel_deadline(&mut deadline_authority, deadline)
                 .expect("F9 reread mismatch deadline remains cancellable");
             execution
                 .cancel_block_on(cpu, block)
                 .expect("F9 reread mismatch block remains cancellable");
-            Ok(AtomicWaitBegin::Mismatch(pin))
+            match winner {
+                BlockedOperationWinner::Cancelled => Ok(AtomicWaitBegin::Mismatch(pin)),
+                BlockedOperationWinner::Timeout => Ok(AtomicWaitBegin::TimedOut(pin)),
+                BlockedOperationWinner::AtomicWake => Ok(AtomicWaitBegin::Ready(pin)),
+                other @ (BlockedOperationWinner::Signal { .. }
+                | BlockedOperationWinner::Terminal) => {
+                    panic!("unexpected F9 winner before block commit: {other:?}")
+                }
+            }
         }
         Some(winner @ (BlockedOperationWinner::AtomicWake | BlockedOperationWinner::Timeout)) => {
             registry
@@ -2178,5 +2206,113 @@ mod tests {
         // The leaked block, ledger entry and lease leave the fixture
         // unclosable, which is the failure the panic exists to stop.
         core::mem::forget(tasks);
+    }
+
+    /// Claims `Timeout` as soon as the deadline is registered: the deadline
+    /// expiring in interrupt context right after registration.
+    struct TimeoutOnRegistration<'a> {
+        queue: crate::time::DeadlineQueue<1>,
+        ledger: &'a BlockedOperationRegistry<1>,
+    }
+
+    impl WaitDeadlineAuthority for TimeoutOnRegistration<'_> {
+        fn register_wait_deadline(
+            &mut self,
+            deadline_ns: u64,
+            wake: BlockWakeKey,
+        ) -> Result<DeadlineRegistration, WaitDeadlineError> {
+            let registration = self
+                .queue
+                .register(deadline_ns, wake)
+                .map_err(|_| WaitDeadlineError::Fault)?;
+            assert!(
+                self.ledger
+                    .try_claim_winner(wake, BlockedOperationWinner::Timeout)
+                    .unwrap()
+            );
+            Ok(registration)
+        }
+
+        fn cancel_wait_deadline(
+            &mut self,
+            registration: DeadlineRegistration,
+        ) -> Result<(), WaitDeadlineError> {
+            self.queue
+                .cancel_if_live(registration)
+                .map(|_| ())
+                .map_err(|_| WaitDeadlineError::Fault)
+        }
+    }
+
+    /// The same class as the D1 checkpoint's panic, on the atomic side: a
+    /// registration that fails after its finite deadline is registered
+    /// rolls back its published operation, which the deadline's
+    /// interrupt-context timeout may already have won. The rollback now
+    /// completes with that winner instead of dropping the live operation.
+    #[test]
+    fn an_atomic_registration_failure_completes_with_an_interrupt_claimed_timeout() {
+        let (mut tasks, execution, process, thread, key) = running_fixture();
+        let (mut other_tasks, other_execution, other_process, other_thread, _) = running_fixture();
+        let registrations = AtomicWaitRegistry::<1>::new();
+        let mut other_operations = AtomicWaitOperationRegistry::<u32, 1>::new();
+        // Another waiter fills the one registry slot.
+        let Ok(other) = register_atomic_wait(
+            key,
+            7,
+            7,
+            WaitDeadline::Infinite,
+            &registrations,
+            &mut other_tasks,
+            &other_execution,
+            None,
+            crate::cpu::CpuIndex::BOOTSTRAP,
+            other_process,
+            other_thread,
+        ) else {
+            panic!("the first waiter did not register")
+        };
+        let mut deadlines = TimeoutOnRegistration {
+            queue: crate::time::DeadlineQueue::new(),
+            ledger: execution.blocked_operations(),
+        };
+        assert!(matches!(
+            register_atomic_wait(
+                key,
+                7,
+                7,
+                WaitDeadline::Finite(70),
+                &registrations,
+                &mut tasks,
+                &execution,
+                Some(&mut deadlines),
+                crate::cpu::CpuIndex::BOOTSTRAP,
+                process,
+                thread,
+            ),
+            Err(AtomicWaitUnregistered::Failed(
+                AtomicWaitBeginError::Registry(AtomicWaitError::Capacity)
+            ))
+        ));
+        assert_eq!(
+            execution.scheduler_state(thread),
+            Some(SchedulerThreadState::Running)
+        );
+        assert!(!execution.blocked_operations().has_thread(thread));
+        assert_eq!(deadlines.queue.earliest(), None);
+        let outcome = settle_atomic_wait(
+            other,
+            0x0e,
+            false,
+            &registrations,
+            &mut other_tasks,
+            &other_execution,
+            &mut other_operations,
+            None,
+            crate::cpu::CpuIndex::BOOTSTRAP,
+            other_process,
+            other_thread,
+        )
+        .unwrap_or_else(|failure| panic!("settlement failed: {:?}", failure.error));
+        assert!(matches!(outcome, AtomicWaitBegin::Mismatch(0x0e)));
     }
 }

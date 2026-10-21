@@ -61,6 +61,35 @@ impl<OUTPUT> WaitOperation<OUTPUT> {
         blocked.winner(self.wake_key())
     }
 
+    /// The winner this operation must complete with when its owner abandons
+    /// it: `preferred`, or one an interrupt-context signal or deadline
+    /// already claimed (see `BlockedOperation::settle_winner`).
+    pub(crate) fn settle_winner<const CAPACITY: usize>(
+        &self,
+        blocked_registry: &BlockedOperationRegistry<CAPACITY>,
+        preferred: BlockedOperationWinner,
+    ) -> Result<BlockedOperationWinner, BlockedOperationError> {
+        self.blocked.settle_winner(blocked_registry, preferred)
+    }
+
+    /// Completes an operation its owner abandons before it blocks: with
+    /// `Cancelled`, or with the winner an interrupt-context signal or a
+    /// deadline timeout claimed first.
+    pub(crate) fn complete_abandoned<
+        const CAPACITY: usize,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        self,
+        blocked_registry: &BlockedOperationRegistry<CAPACITY>,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    ) -> Result<(OUTPUT, Option<DeadlineRegistration>), BlockedOperationError> {
+        let winner = self.settle_winner(blocked_registry, BlockedOperationWinner::Cancelled)?;
+        self.complete(blocked_registry, tasks, winner)
+    }
+
     pub(crate) fn complete<
         const CAPACITY: usize,
         const GROUPS: usize,

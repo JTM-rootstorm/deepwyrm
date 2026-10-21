@@ -407,6 +407,27 @@ impl<RESOURCES> BlockedOperation<RESOURCES> {
             .wake
     }
 
+    /// Claims `preferred` as this operation's winner, or returns the winner
+    /// another contender already claimed. A caller that abandons an operation
+    /// it has published must complete it with the returned winner: a signal
+    /// delivered from interrupt context (an Interrupt object's IRQ) or a
+    /// deadline timeout can claim it at any moment, with no runtime lock, and
+    /// completing with a winner that lost fails, which drops the live
+    /// operation.
+    pub(crate) fn settle_winner<const CAPACITY: usize>(
+        &self,
+        registry: &BlockedOperationRegistry<CAPACITY>,
+        preferred: BlockedOperationWinner,
+    ) -> Result<BlockedOperationWinner, BlockedOperationError> {
+        let wake = self.wake_key();
+        if registry.try_claim_winner(wake, preferred)? {
+            return Ok(preferred);
+        }
+        registry
+            .winner(wake)?
+            .ok_or(BlockedOperationError::WinnerMismatch)
+    }
+
     #[cfg(test)]
     pub(crate) const fn has_process_lease(&self) -> bool {
         self.process_lease.is_some()
