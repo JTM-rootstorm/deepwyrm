@@ -96,7 +96,9 @@ impl crate::memory::address_region::ShootdownDriver<{ crate::cpu::CPU_CAPACITY }
     ) {
         // The initiator holds no IRQ-safe mailbox or address-space lock while
         // it waits. The target's acknowledgement is the Release event that
-        // lets the model mint its reclaim permit.
+        // lets the model mint its reclaim permit. It waits with IF clear, so it
+        // services its own mailbox here (D1 commit 4).
+        service_local_tlb_shootdown();
         core::hint::spin_loop();
     }
 }
@@ -121,6 +123,44 @@ fn live_tlb_shootdown_handler() {
     let cpu = crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
         .and_then(crate::cpu::CpuIndex::new)
         .unwrap_or_else(|| panic!("TLB shootdown arrived without CPU identity"));
+    service_tlb_mailbox_on(cpu);
+}
+
+/// Acknowledges this CPU's pending TLB shootdown, if one is published, from a
+/// spin that runs with IF clear (D1 commit 4, design §11.2.2): the runtime
+/// authority's ticket spin, the paging lock's spin, and the shootdown
+/// acknowledgement wait. A CPU spinning with IF clear cannot take e2, so an
+/// initiator waiting for its acknowledgement would otherwise wait forever.
+///
+/// Safe at each of those sites:
+/// - It takes no lock but the address space's `AddressSpaceCoherency` state
+///   lock, an `IrqSpinMutex` held only inside that type's own short methods.
+///   None of them spins on the runtime authority or the paging lock, or
+///   waits for an acknowledgement, so no spinner can already hold it.
+/// - It touches no runtime-authority or paging state. It reloads the current
+///   CR3, which is valid everywhere these spins run, and they never run
+///   inside a root switch (that takes `GuardFree`).
+/// - The handler does the same work wherever e2 can interrupt. The mailbox
+///   state machine admits one consumer, so if e2 lands during a serviced
+///   spin, it finds the mailbox consumed and returns.
+///
+/// Before the shootdown transport is ready, or on a CPU whose identity is not
+/// yet installed, there is nothing to acknowledge.
+pub(crate) fn service_local_tlb_shootdown() {
+    if !live_tlb_shootdown_is_ready() {
+        return;
+    }
+    let Some(cpu) = crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
+        .and_then(crate::cpu::CpuIndex::new)
+    else {
+        return;
+    };
+    if LiveTlbShootdownDriver::mailbox(cpu).is_published() {
+        service_tlb_mailbox_on(cpu);
+    }
+}
+
+fn service_tlb_mailbox_on(cpu: crate::cpu::CpuIndex) {
     let mailbox = LiveTlbShootdownDriver::mailbox(cpu);
     let Some((coherency, request)) = mailbox.consume() else {
         // A stale e2 after a failed sender cannot acknowledge any generation.

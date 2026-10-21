@@ -880,3 +880,47 @@ fn function_body<'a>(disassembly: &'a str, symbol: &str) -> &'a str {
         .1;
     body.split_once("\n\n").map_or(body, |(body, _)| body)
 }
+
+/// Text test (D1 commit 4, design §11.2.2): the acknowledgement wait, and the
+/// live runtime authority and paging locks, service this CPU's TLB mailbox
+/// while they spin with IF clear. The runtime-lock and paging-lock spins are
+/// host-modelled in `runtime_authority.rs`. The live wait and the live
+/// construction are target-only, so their wiring is pinned here.
+#[test]
+fn every_if_clear_spin_services_the_local_tlb_mailbox() {
+    let user_access = source("src/arch/x86_64/mm/activation/user_access.rs");
+    let wait = user_access
+        .split_once("    fn wait_step(")
+        .expect("live shootdown wait step")
+        .1
+        .split_once("\n    }\n")
+        .expect("live shootdown wait step extent")
+        .0;
+    assert!(wait.contains("service_local_tlb_shootdown();"));
+    let handler = user_access
+        .split_once("fn live_tlb_shootdown_handler() {")
+        .expect("e2 handler")
+        .1
+        .split_once("\n}\n")
+        .expect("e2 handler extent")
+        .0;
+    assert!(handler.contains("service_tlb_mailbox_on(cpu);"));
+
+    let authority = source("src/arch/x86_64/mm/activation/runtime_authority.rs");
+    assert_eq!(
+        authority
+            .matches("(self.spin_service)();\n            core::hint::spin_loop();")
+            .count(),
+        2,
+        "both runtime lock spins call their spin service"
+    );
+
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    assert_eq!(
+        primordial
+            .matches("user_access::service_local_tlb_shootdown,")
+            .count(),
+        2,
+        "the live runtime authority and paging lock both service the mailbox"
+    );
+}

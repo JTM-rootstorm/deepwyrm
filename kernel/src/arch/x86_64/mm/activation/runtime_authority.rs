@@ -54,8 +54,21 @@ const _: () = assert!(
 pub(super) struct RuntimeAuthorityLock<T> {
     tickets: TicketPair,
     handles_taken: AtomicBool,
+    /// Called on every iteration of the ticket spin (D1 commit 4): see
+    /// [`SpinService`].
+    spin_service: SpinService,
     value: UnsafeCell<T>,
 }
+
+/// What a CPU does while it spins on a runtime lock with interrupts clear
+/// (D1 commit 4, design §11.2.2). A CPU spinning with IF clear cannot take
+/// the TLB-shootdown IPI, so if the lock's holder is waiting for that CPU's
+/// acknowledgement, neither progresses. The live kernel passes
+/// `user_access::service_local_tlb_shootdown`, which acknowledges a pending
+/// shootdown from inside the spin. The service must take no lock this CPU
+/// could already hold, and must be safe to call at any point where the
+/// interrupt it stands in for could have been taken.
+pub(super) type SpinService = fn();
 
 // SAFETY: `value` is initialized before any AP carrier is released, never
 // moved afterward, and every access is serialized by the ticket pair. This is the
@@ -64,13 +77,14 @@ pub(super) struct RuntimeAuthorityLock<T> {
 unsafe impl<T> Sync for RuntimeAuthorityLock<T> {}
 
 impl<T> RuntimeAuthorityLock<T> {
-    pub(super) const fn new(value: T) -> Self {
+    pub(super) const fn new(value: T, spin_service: SpinService) -> Self {
         Self {
             tickets: TicketPair {
                 next_ticket: AtomicU64::new(0),
                 serving: AtomicU64::new(0),
             },
             handles_taken: AtomicBool::new(false),
+            spin_service,
             value: UnsafeCell::new(value),
         }
     }
@@ -83,7 +97,11 @@ impl<T> RuntimeAuthorityLock<T> {
     /// `slot` is valid for writes of `Self` and not otherwise referenced, and
     /// `value` fully initializes the `T` behind its pointer before it returns,
     /// reading nothing through it. Afterwards `*slot` is fully initialized.
-    pub(super) unsafe fn init_in_place(slot: *mut Self, value: impl FnOnce(*mut T)) {
+    pub(super) unsafe fn init_in_place(
+        slot: *mut Self,
+        spin_service: SpinService,
+        value: impl FnOnce(*mut T),
+    ) {
         // SAFETY: `slot` is valid for writes of `Self` (this function's contract); `init_fields!`
         // writes every field of the lock but `value` from its exhaustive field list, and `value`
         // builds that one in place through its `UnsafeCell`'s raw pointer.
@@ -97,6 +115,7 @@ impl<T> RuntimeAuthorityLock<T> {
                         serving: AtomicU64::new(0),
                     }),
                     handles_taken: (AtomicBool::new(false)),
+                    spin_service: spin_service,
                     value: in_place,
                 }
             );
@@ -135,6 +154,7 @@ impl<T> RuntimeAuthorityLock<T> {
             }
         };
         while self.tickets.serving.load(Ordering::Acquire) != ticket {
+            (self.spin_service)();
             core::hint::spin_loop();
         }
         RuntimeAuthorityGuard {
@@ -224,6 +244,8 @@ impl<T> Drop for RuntimeAuthorityGuard<'_, T> {
 /// way in without reaching into T's cell.
 pub(super) struct PagingLock<P> {
     locked: AtomicBool,
+    /// Called on every iteration of the spin, as for the runtime authority.
+    spin_service: SpinService,
     value: UnsafeCell<P>,
 }
 
@@ -234,9 +256,10 @@ pub(super) struct PagingLock<P> {
 unsafe impl<P> Sync for PagingLock<P> {}
 
 impl<P> PagingLock<P> {
-    pub(super) const fn new(value: P) -> Self {
+    pub(super) const fn new(value: P, spin_service: SpinService) -> Self {
         Self {
             locked: AtomicBool::new(false),
+            spin_service,
             value: UnsafeCell::new(value),
         }
     }
@@ -247,6 +270,7 @@ impl<P> PagingLock<P> {
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
+            (self.spin_service)();
             core::hint::spin_loop();
         }
         PagingGuard { lock: self }
@@ -319,9 +343,119 @@ mod tests {
 
     use super::*;
 
+    fn no_service() {}
+
+    /// A host model of addendum §11.2.2's deadlock (D1 commit 4). An
+    /// initiator holds a lock and waits, for a bounded number of steps, for
+    /// the acknowledgement of a request it published to a target. The target
+    /// is spinning on that same lock. In the kernel the target spins with IF
+    /// clear, so it can acknowledge only from inside the spin, through the
+    /// lock's `SpinService`.
+    struct ModelMailbox {
+        request: AtomicBool,
+        acknowledged: AtomicBool,
+    }
+
+    impl ModelMailbox {
+        const fn new() -> Self {
+            Self {
+                request: AtomicBool::new(false),
+                acknowledged: AtomicBool::new(false),
+            }
+        }
+
+        fn service(&self) {
+            if self.request.swap(false, Ordering::AcqRel) {
+                self.acknowledged.store(true, Ordering::Release);
+            }
+        }
+
+        /// Publishes the request, then waits for its acknowledgement.
+        fn publish_and_wait(&self) -> bool {
+            self.request.store(true, Ordering::Release);
+            for _ in 0..100_000 {
+                if self.acknowledged.load(Ordering::Acquire) {
+                    return true;
+                }
+                std::thread::yield_now();
+            }
+            false
+        }
+    }
+
+    static RUNTIME_SERVICED: ModelMailbox = ModelMailbox::new();
+    static RUNTIME_UNSERVICED: ModelMailbox = ModelMailbox::new();
+    static PAGING_SERVICED: ModelMailbox = ModelMailbox::new();
+    static PAGING_UNSERVICED: ModelMailbox = ModelMailbox::new();
+
+    /// The initiator holds the runtime authority while the target spins on it.
+    fn runtime_initiator_is_acknowledged(
+        mailbox: &'static ModelMailbox,
+        spin_service: SpinService,
+    ) -> bool {
+        let lock = RuntimeAuthorityLock::new(0_u32, spin_service);
+        let [mut initiator, mut target] = lock.handles::<2>();
+        std::thread::scope(|scope| {
+            let guard = initiator.lock();
+            let spinner = scope.spawn(move || *target.lock() += 1);
+            while lock.tickets.next_ticket.load(Ordering::Acquire) != 2 {
+                std::thread::yield_now();
+            }
+            let acknowledged = mailbox.publish_and_wait();
+            drop(guard);
+            spinner.join().expect("target thread");
+            acknowledged
+        })
+    }
+
+    /// The initiator holds the paging lock while the target spins on it.
+    fn paging_initiator_is_acknowledged(
+        mailbox: &'static ModelMailbox,
+        spin_service: SpinService,
+    ) -> bool {
+        let paging = PagingLock::new(0_u32, spin_service);
+        let spinning = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let held = paging.acquire();
+            let spinner = scope.spawn(|| {
+                spinning.store(true, Ordering::Release);
+                *paging.acquire() += 1;
+            });
+            while !spinning.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            let acknowledged = mailbox.publish_and_wait();
+            drop(held);
+            spinner.join().expect("target thread");
+            acknowledged
+        })
+    }
+
+    #[test]
+    fn a_runtime_lock_spinner_acknowledges_only_when_its_spin_services_the_mailbox() {
+        assert!(!runtime_initiator_is_acknowledged(
+            &RUNTIME_UNSERVICED,
+            no_service
+        ));
+        assert!(runtime_initiator_is_acknowledged(&RUNTIME_SERVICED, || {
+            RUNTIME_SERVICED.service()
+        }));
+    }
+
+    #[test]
+    fn a_paging_lock_spinner_acknowledges_only_when_its_spin_services_the_mailbox() {
+        assert!(!paging_initiator_is_acknowledged(
+            &PAGING_UNSERVICED,
+            no_service
+        ));
+        assert!(paging_initiator_is_acknowledged(&PAGING_SERVICED, || {
+            PAGING_SERVICED.service()
+        }));
+    }
+
     #[test]
     fn a_handle_serializes_the_value_and_releases_on_drop() {
-        let lock = RuntimeAuthorityLock::new(1_u32);
+        let lock = RuntimeAuthorityLock::new(1_u32, no_service);
         let [mut first, mut second] = lock.handles::<2>();
         {
             let mut guard = first.lock();
@@ -343,7 +477,9 @@ mod tests {
         // SAFETY: the storage is a fresh local, valid for writes and unreferenced, and the closure
         // writes the whole `[u32; 2]`.
         let lock = unsafe {
-            RuntimeAuthorityLock::init_in_place(storage.as_mut_ptr(), |value| value.write([3, 4]));
+            RuntimeAuthorityLock::init_in_place(storage.as_mut_ptr(), no_service, |value| {
+                value.write([3, 4])
+            });
             storage.assume_init_ref()
         };
         let [mut handle] = lock.handles::<1>();
@@ -357,8 +493,8 @@ mod tests {
     /// released when its guard drops, while T stays held.
     #[test]
     fn paging_is_taken_beneath_the_runtime_guard_and_released() {
-        let lock = RuntimeAuthorityLock::new(1_u32);
-        let paging = PagingLock::new(10_u32);
+        let lock = RuntimeAuthorityLock::new(1_u32, no_service);
+        let paging = PagingLock::new(10_u32, no_service);
         let [mut handle] = lock.handles::<1>();
         let mut guard = handle.lock();
         let (value, mut access) = guard.with_paging(&paging);
@@ -377,7 +513,7 @@ mod tests {
 
     #[test]
     fn handles_are_minted_once() {
-        let lock = RuntimeAuthorityLock::new(());
+        let lock = RuntimeAuthorityLock::new((), no_service);
         let _handles = lock.handles::<4>();
         let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = lock.handles::<4>();
@@ -387,7 +523,7 @@ mod tests {
 
     #[test]
     fn the_published_address_is_the_adjacent_ticket_pair() {
-        let lock = RuntimeAuthorityLock::new([0_u8; 64]);
+        let lock = RuntimeAuthorityLock::new([0_u8; 64], no_service);
         let [mut handle] = lock.handles::<1>();
         drop(handle.lock());
         let pair = lock.ticket_pair_address().cast::<u64>();

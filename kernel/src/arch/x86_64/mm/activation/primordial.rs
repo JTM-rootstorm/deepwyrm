@@ -9751,7 +9751,10 @@ pub(super) fn enter(
     // The paging authority's lock, P, lives in its own permanent storage beside the runtime
     // authority's, outside the value T guards, and is reached only beneath a T guard (D1 commit 3).
     let paging: &'static PagingLock<RuntimePaging<'static, RANGE_CAPACITY, ROLE_CAPACITY>> =
-        PRIMORDIAL_PAGING.init(PagingLock::new(active));
+        PRIMORDIAL_PAGING.init(PagingLock::new(
+            active,
+            user_access::service_local_tlb_shootdown,
+        ));
     // Permanent storage (S2K-4, reset R2D): the lock and the carrier it guards live in one-shot
     // static storage for the kernel's lifetime, not on the boot stack. Built in place there (S2K
     // stage 4), so no whole-carrier temporary is materialized in this frame first.
@@ -9764,62 +9767,66 @@ pub(super) fn enter(
         // before the storage is assumed initialized.
         unsafe {
             PRIMORDIAL_RUNTIME_AUTHORITY.init_in_place(|lock| {
-                RuntimeAuthorityLock::init_in_place(lock, |state| {
-                    init_fields!(
-                        core::ptr::addr_of_mut!((*state).core),
-                        PrimordialRuntimeCore {
-                            paging: paging,
-                            stopping_claim: None,
-                            stopping_claim_was_suspended: false,
-                            rendezvous_reaper: None,
-                            registry: registry,
-                            memory: memory,
-                            tasks: tasks,
-                            shared: shared,
-                            services: (FServiceState::new()),
-                            spaces: spaces,
-                            regions: regions,
-                            primordial_process: process,
-                            primordial_root_key: root_key,
-                            primordial_address_space: primordial_address_space,
-                            #[cfg(any(
-                                deepwyrm_wyr1_evidence,
-                                deepwyrm_dw1b_evidence,
-                                deepwyrm_wyr1b_evidence,
-                                deepwyrm_dw1c_evidence,
-                                deepwyrm_wyr1c_evidence,
-                                deepwyrm_wyr1d_evidence,
-                                deepwyrm_wyr1e_evidence,
-                                deepwyrm_dw1e_evidence,
-                                deepwyrm_r1_evidence,
-                            ))]
-                            evidence_init_process: None,
-                            #[cfg(any(
-                                deepwyrm_wyr1b_evidence,
-                                deepwyrm_wyr1c_evidence,
-                                deepwyrm_wyr1d_evidence,
-                                deepwyrm_wyr1e_evidence,
-                            ))]
-                            evidence_init_thread: None,
-                            channel_keys: channel_keys,
-                            kernel_peer: (Some(kernel_peer)),
-                            process_monitor: (Some(process_monitor)),
-                            root_owner: (Some(root_owner)),
-                            cleanup: (CleanupQueue::new()),
-                            rendezvous_cleanup: (CleanupQueue::new()),
-                            rendezvous_cleanup_staged: false,
-                            #[cfg(feature = "test-support")]
-                            g5_probe: (G5PrimordialProbe::for_build()),
-                        }
-                    );
-                    init_fields!(
-                        state,
-                        PrimordialRuntimeState {
-                            core: in_place,
-                            cpus: cpus,
-                        }
-                    );
-                });
+                RuntimeAuthorityLock::init_in_place(
+                    lock,
+                    user_access::service_local_tlb_shootdown,
+                    |state| {
+                        init_fields!(
+                            core::ptr::addr_of_mut!((*state).core),
+                            PrimordialRuntimeCore {
+                                paging: paging,
+                                stopping_claim: None,
+                                stopping_claim_was_suspended: false,
+                                rendezvous_reaper: None,
+                                registry: registry,
+                                memory: memory,
+                                tasks: tasks,
+                                shared: shared,
+                                services: (FServiceState::new()),
+                                spaces: spaces,
+                                regions: regions,
+                                primordial_process: process,
+                                primordial_root_key: root_key,
+                                primordial_address_space: primordial_address_space,
+                                #[cfg(any(
+                                    deepwyrm_wyr1_evidence,
+                                    deepwyrm_dw1b_evidence,
+                                    deepwyrm_wyr1b_evidence,
+                                    deepwyrm_dw1c_evidence,
+                                    deepwyrm_wyr1c_evidence,
+                                    deepwyrm_wyr1d_evidence,
+                                    deepwyrm_wyr1e_evidence,
+                                    deepwyrm_dw1e_evidence,
+                                    deepwyrm_r1_evidence,
+                                ))]
+                                evidence_init_process: None,
+                                #[cfg(any(
+                                    deepwyrm_wyr1b_evidence,
+                                    deepwyrm_wyr1c_evidence,
+                                    deepwyrm_wyr1d_evidence,
+                                    deepwyrm_wyr1e_evidence,
+                                ))]
+                                evidence_init_thread: None,
+                                channel_keys: channel_keys,
+                                kernel_peer: (Some(kernel_peer)),
+                                process_monitor: (Some(process_monitor)),
+                                root_owner: (Some(root_owner)),
+                                cleanup: (CleanupQueue::new()),
+                                rendezvous_cleanup: (CleanupQueue::new()),
+                                rendezvous_cleanup_staged: false,
+                                #[cfg(feature = "test-support")]
+                                g5_probe: (G5PrimordialProbe::for_build()),
+                            }
+                        );
+                        init_fields!(
+                            state,
+                            PrimordialRuntimeState {
+                                core: in_place,
+                                cpus: cpus,
+                            }
+                        );
+                    },
+                );
             })
         }
     };

@@ -68,6 +68,12 @@ impl LiveTlbMailbox {
         self.state.store(TLB_MAILBOX_PUBLISHED, Ordering::Release);
     }
 
+    /// Whether a request is published and not yet consumed: a cheap check a
+    /// spinning CPU makes before trying to consume.
+    pub(super) fn is_published(&self) -> bool {
+        self.state.load(Ordering::Acquire) == TLB_MAILBOX_PUBLISHED
+    }
+
     pub(super) fn cancel_if_published(&self) {
         let _ = self.state.compare_exchange(
             TLB_MAILBOX_PUBLISHED,
@@ -159,8 +165,14 @@ mod tests {
         let request = barrier.request();
         let mailbox = LiveTlbMailbox::new();
 
+        assert!(!mailbox.is_published());
         mailbox.publish(&coherency, request);
+        assert!(mailbox.is_published());
         let (received_coherency, received_request) = mailbox.consume().unwrap();
+        assert!(
+            !mailbox.is_published(),
+            "a consumed request is not published"
+        );
         assert_eq!(received_request, request);
         assert_eq!(
             received_coherency.request_for_cpu(cpu),
