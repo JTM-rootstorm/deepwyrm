@@ -1829,3 +1829,59 @@ fn prepared_dispatch_rejects_root_drift_before_usercopy_or_authority_borrow() {
         Err(FServiceDispatchPhaseError::IdentityDrift)
     ));
 }
+
+/// D1 commit 6b: an `AtomicWake` pinned before the runtime authority keeps
+/// the adapter's statuses, and always hands a successful early pin back to
+/// the caller for release after the authority.
+#[test]
+fn a_pinned_atomic_wake_keeps_its_statuses_and_returns_its_pin() {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (process, _process_reference) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let execution = ExecutionDomain::<EXECUTION>::new(test_stack_bounds()).unwrap();
+    let regions = AddressRegionObjectAuthority::<4, 8>::new();
+    let services = Services::new();
+    let range = crate::memory::user_range::UserRange::new(
+        crate::memory::user_range::UserAddressSpace::x86_64_four_level(4096).unwrap(),
+        BASE + 0xd00,
+        4,
+        4,
+        crate::memory::user_range::UserAccess::WRITE,
+        crate::memory::user_range::EmptyAddressRule::Reject,
+    )
+    .unwrap();
+
+    // The early pin failed: its status, no pin, no output.
+    let mut output = crate::memory::usercopy::DeferredUserOutput::new(Some(range));
+    let (status, pin) = services.dispatch_atomic_wake_pinned::<_, u8, 3, 3, 2, 16, 4, 8>(
+        &mut output,
+        Err(DW_STATUS_BAD_ADDRESS),
+        &mut tasks,
+        &execution,
+        &regions,
+        process,
+        DwUserAddress(BASE + 0xc00),
+        1,
+        DwUserAddress(BASE + 0xd00),
+    );
+    assert_eq!((status, pin), (DW_STATUS_BAD_ADDRESS, None));
+    assert_eq!(output.written(), None);
+
+    // The pin succeeded but the address names no stable key: the adapter's
+    // status, and the pin comes back for release.
+    let mut output = crate::memory::usercopy::DeferredUserOutput::new(Some(range));
+    let (status, pin) = services.dispatch_atomic_wake_pinned::<_, u8, 3, 3, 2, 16, 4, 8>(
+        &mut output,
+        Ok(7_u8),
+        &mut tasks,
+        &execution,
+        &regions,
+        process,
+        DwUserAddress(BASE + 0xc00),
+        1,
+        DwUserAddress(BASE + 0xd00),
+    );
+    assert_eq!((status, pin), (DW_STATUS_BAD_ADDRESS, Some(7)));
+    assert_eq!(output.written(), None);
+}

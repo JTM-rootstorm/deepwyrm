@@ -2015,22 +2015,23 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Some(Ok(runtime.ready_to_return(result)))
     }
 
-    /// Family B (design §11.2.3, D1 commit 6): a syscall whose only usercopy
-    /// is one fixed-size output. Its output is preflighted and pinned before
-    /// the authority work, and written after it, with no runtime lock held
-    /// for either.
+    /// Family B (design §11.2.3, D1 commits 6 and 6b): a syscall whose only
+    /// usercopy is fixed-size output, with at most an atomic pin besides.
+    /// Its outputs are preflighted and pinned before the authority work, and
+    /// written after it, with no runtime lock held for either.
     /// 1. As for family A, a first hold checks the Thread, reserves the
     ///    phase, and copies the root identity.
-    /// 2. With P alone (`GuardFree`), the output range is pinned as an owned
-    ///    output.
-    /// 3. A second hold runs the unchanged adapter against a
-    ///    `DeferredUserOutput`. The adapter keeps its order of validation,
-    ///    then preflight, then authority work, then commit, so statuses are
+    /// 2. With P alone (`GuardFree`), every output range is pinned as an
+    ///    owned output. `AtomicWake` pins its address first, and stops there
+    ///    if that pin fails, as the adapter does.
+    /// 3. A second hold runs the unchanged adapter sequence against a
+    ///    `DeferredUserOutput`. It keeps its order of validation, then
+    ///    preflight, then authority work, then commit, so statuses are
     ///    unchanged. The hold then commits the phase and leaves through
     ///    `ready_to_return`.
-    /// 4. With P alone again, the recorded bytes go into the pinned output,
-    ///    which cannot fail, or the output is discarded if nothing was
-    ///    written.
+    /// 4. With P alone again, the atomic pin is released, and each recorded
+    ///    output goes into its pinned output, which cannot fail. Every
+    ///    output that was not written is discarded.
     /// `None` for every other request.
     // Kept out of line so the ordinary syscall handler's frame, which the
     // stack oracles measure, does not absorb this family B path's locals.
@@ -2039,15 +2040,30 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
         request: NativeSyscallRequest,
     ) -> Option<Result<crate::syscall::native::ReturnReady, ()>> {
-        let (address, byte_len, alignment) = match request {
+        let handle = |address| [Some((address, 8, 8)), None, None];
+        let outputs: [Option<(deepwyrm_abi::DwUserAddress, usize, u64)>; 3] = match request {
             NativeSyscallRequest::HandleDuplicate { out_handle, .. }
-            | NativeSyscallRequest::TaskGroupCreate { out_handle, .. } => (out_handle, 8, 8),
-            NativeSyscallRequest::ThreadCreate { out_thread, .. } => (out_thread, 8, 8),
-            NativeSyscallRequest::DeviceResourceClaim { out_resource, .. } => (out_resource, 8, 8),
-            NativeSyscallRequest::DevicePioRead { out_value, .. } => (out_value, 4, 4),
-            NativeSyscallRequest::InterruptCreate { out_interrupt, .. } => (out_interrupt, 8, 8),
-            NativeSyscallRequest::EventCreate { out_event, .. } => (out_event, 8, 8),
-            NativeSyscallRequest::TimerCreate { out_timer, .. } => (out_timer, 8, 8),
+            | NativeSyscallRequest::TaskGroupCreate { out_handle, .. } => handle(out_handle),
+            NativeSyscallRequest::ThreadCreate { out_thread, .. } => handle(out_thread),
+            NativeSyscallRequest::DeviceResourceClaim { out_resource, .. } => handle(out_resource),
+            NativeSyscallRequest::DevicePioRead { out_value, .. } => {
+                [Some((out_value, 4, 4)), None, None]
+            }
+            NativeSyscallRequest::InterruptCreate { out_interrupt, .. } => handle(out_interrupt),
+            NativeSyscallRequest::EventCreate { out_event, .. } => handle(out_event),
+            NativeSyscallRequest::TimerCreate { out_timer, .. } => handle(out_timer),
+            NativeSyscallRequest::ChannelCreate {
+                out_endpoint0,
+                out_endpoint1,
+                ..
+            } => [
+                Some((out_endpoint0, 8, 8)),
+                Some((out_endpoint1, 8, 8)),
+                None,
+            ],
+            NativeSyscallRequest::AtomicWake { out_woken, .. } => {
+                [Some((out_woken, 4, 4)), None, None]
+            }
             _ => return None,
         };
         let cpu = self.cpu;
@@ -2059,36 +2075,111 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }) else {
             return Some(Err(()));
         };
-        let range = crate::syscall::output_range(address, byte_len, alignment).ok();
-        let pinned = range.and_then(|range| {
+        // Every range the adapter will preflight, or `None` if one cannot be
+        // formed (the adapter then fails at that range, before any pin).
+        let mut ranges = [None, None, None];
+        let mut formed = true;
+        for (index, output) in outputs.into_iter().enumerate() {
+            if let Some((address, byte_len, alignment)) = output {
+                match crate::syscall::output_range(address, byte_len, alignment) {
+                    Ok(range) => ranges[index] = Some(range),
+                    Err(_) => formed = false,
+                }
+            }
+        }
+        let (atomic_pin, pinned) = {
             let mut access = self.paging.guard_free_access(self.runtime.guard_free());
             let mut paging = access.lock();
             let mut user = paging.usercopy_process_address_space(root, process);
-            user.preflight_owned_output(range)
-                .ok()
-                .map(|output| (range, output))
-        });
-        let mut deferred = crate::memory::usercopy::DeferredUserOutput::new(
-            pinned.as_ref().map(|(range, _)| *range),
-        );
-        let ready = {
+            let atomic_pin = match request {
+                NativeSyscallRequest::AtomicWake { address, .. } => Some(
+                    crate::syscall::FAtomicUserAccess::pin_atomic_u32(&mut user, address),
+                ),
+                _ => None,
+            };
+            let pinned = if !formed || matches!(atomic_pin, Some(Err(_))) {
+                None
+            } else {
+                let mut owned = [None, None, None];
+                let mut complete = true;
+                for (index, range) in ranges.into_iter().enumerate() {
+                    let Some(range) = range else {
+                        continue;
+                    };
+                    match user.preflight_owned_output(range) {
+                        Ok(output) => owned[index] = Some(output),
+                        Err(_) => {
+                            complete = false;
+                            break;
+                        }
+                    }
+                }
+                if !complete {
+                    for output in owned.into_iter().flatten() {
+                        user.discard_owned_output(output)
+                            .unwrap_or_else(|_| panic!("partial deferred output discard drifted"));
+                    }
+                    None
+                } else {
+                    Some(owned)
+                }
+            };
+            (atomic_pin, pinned)
+        };
+        let pin_taken = matches!(atomic_pin, Some(Ok(_)));
+        let mut deferred =
+            crate::memory::usercopy::DeferredUserOutput::batch(pinned.as_ref().map(|_| ranges));
+        let (ready, released_pin) = {
             let mut guard = self.runtime.lock();
             let mut runtime = guard.on(&mut self.owned);
-            let status = runtime.run_deferred_output(request, &mut deferred);
+            let (status, released_pin) = match (request, atomic_pin) {
+                (
+                    NativeSyscallRequest::AtomicWake {
+                        address,
+                        count,
+                        out_woken,
+                    },
+                    Some(atomic_pin),
+                ) => runtime.run_deferred_atomic_wake(
+                    &mut deferred,
+                    atomic_pin,
+                    address,
+                    count,
+                    out_woken,
+                ),
+                (request, None) => (runtime.run_deferred_output(request, &mut deferred), None),
+                _ => unreachable!("deferred atomic pin classification drifted"),
+            };
             runtime.commit_runtime_phase(phase);
-            runtime.ready_to_return(NativeSyscallResult::returning(status))
+            (
+                runtime.ready_to_return(NativeSyscallResult::returning(status)),
+                released_pin,
+            )
         };
-        if let Some((_, output)) = pinned {
+        assert_eq!(
+            released_pin.is_some(),
+            pin_taken,
+            "a deferred atomic pin was not returned for release"
+        );
+        if released_pin.is_some() || pinned.is_some() {
             let mut access = self.paging.guard_free_access(self.runtime.guard_free());
             let mut paging = access.lock();
             let mut user = paging.usercopy_process_address_space(root, process);
-            match deferred.written() {
-                Some(bytes) => user
-                    .commit_owned_output(output, bytes)
-                    .unwrap_or_else(|_| panic!("pinned deferred output commit drifted")),
-                None => user
-                    .discard_owned_output(output)
-                    .unwrap_or_else(|_| panic!("pinned deferred output discard drifted")),
+            if let Some(pin) = released_pin {
+                crate::syscall::FAtomicUserAccess::release_atomic_u32(&mut user, pin);
+            }
+            for (index, output) in pinned.into_iter().flatten().enumerate() {
+                let Some(output) = output else {
+                    continue;
+                };
+                match deferred.written_at(index) {
+                    Some(bytes) => user
+                        .commit_owned_output(output, bytes)
+                        .unwrap_or_else(|_| panic!("pinned deferred output commit drifted")),
+                    None => user
+                        .discard_owned_output(output)
+                        .unwrap_or_else(|_| panic!("pinned deferred output discard drifted")),
+                }
             }
         }
         Some(Ok(ready))
@@ -10476,8 +10567,50 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 out_timer,
                 &mut self.core.cleanup,
             ),
+            NativeSyscallRequest::ChannelCreate {
+                requested_rights,
+                out_endpoint0,
+                out_endpoint1,
+            } => crate::syscall::channel_create(
+                user,
+                &mut self.core.registry,
+                &self.core.shared.channels,
+                &mut self.core.tasks,
+                process,
+                requested_rights,
+                out_endpoint0,
+                out_endpoint1,
+            ),
             _ => unreachable!("deferred-output classification drifted"),
         }
+    }
+
+    /// The guarded half of a deferred `AtomicWake` (D1 commit 6b). The early
+    /// atomic pin comes back for release after the hold.
+    fn run_deferred_atomic_wake(
+        &mut self,
+        user: &mut crate::memory::usercopy::DeferredUserOutput,
+        pinned: Result<user_access::OwnedLiveAtomicU32, deepwyrm_abi::DwStatus>,
+        address: deepwyrm_abi::DwUserAddress,
+        count: u32,
+        out_woken: deepwyrm_abi::DwUserAddress,
+    ) -> (
+        deepwyrm_abi::DwStatus,
+        Option<user_access::OwnedLiveAtomicU32>,
+    ) {
+        let process = self.own.scheduled().process;
+        let (status, released) = self.core.services.dispatch_atomic_wake_pinned(
+            user,
+            pinned,
+            &mut self.core.tasks,
+            &self.core.shared.execution,
+            &self.core.regions,
+            process,
+            address,
+            count,
+            out_woken,
+        );
+        (status, released)
     }
 
     /// The guarded half of a family-A syscall's preparation (D1 commit 5):

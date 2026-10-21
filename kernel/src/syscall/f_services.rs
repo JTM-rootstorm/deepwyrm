@@ -640,26 +640,66 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
             count,
             out_woken,
             |user, address| user.pin_atomic_u32(address),
-            |address, _pin| {
-                let lease = tasks
-                    .acquire_process_operation(process)
-                    .map_err(|_| DW_STATUS_BAD_STATE)?;
-                let key = regions
-                    .resolve_atomic_wait_key_for_operation(tasks, &lease, process, address.0)
-                    .map_err(|_| DW_STATUS_BAD_ADDRESS);
-                tasks
-                    .release_process_operation(lease)
-                    .unwrap_or_else(|(error, _)| {
-                        panic!("F9 wake key resolution leaked process lease: {error:?}")
-                    });
-                key
-            },
+            |address, _pin| resolve_atomic_wake_key(tasks, regions, process, address),
             |user, pin| user.release_atomic_u32(pin),
             |key, count| {
                 wake_atomic_waiters(&self.atomic_waits, execution, key, count)
                     .map_err(atomic_wait_status)
             },
         )
+    }
+
+    /// `AtomicWake` with its address pinned, and its output preflighted,
+    /// before the runtime authority (D1 commit 6b, design §11.2.3 family B).
+    /// `pinned` is the early atomic pin's result. The same `atomic_wake_with`
+    /// sequence runs against a deferred output, so every status and its
+    /// precedence is unchanged. The pin comes back to the caller, which
+    /// releases it after the authority, where the deferred output is also
+    /// committed.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the pinned atomic wake keeps the early pin, key resolver, scheduler, and output owners explicit"
+    )]
+    #[cfg_attr(
+        not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+        allow(dead_code, reason = "only the live runtime pins atomic wakes early")
+    )]
+    pub(crate) fn dispatch_atomic_wake_pinned<
+        U: crate::memory::usercopy::OwnedUserOutputAccess,
+        PIN,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+        const REGION_OBJECTS: usize,
+        const REGION_SLOTS: usize,
+    >(
+        &self,
+        user: &mut U,
+        pinned: Result<PIN, DwStatus>,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        execution: &ExecutionDomain<EXECUTION>,
+        regions: &AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
+        process: ProcessKey,
+        address: DwUserAddress,
+        count: u32,
+        out_woken: DwUserAddress,
+    ) -> (DwStatus, Option<PIN>) {
+        let mut released = None;
+        let status = atomic_wake_with(
+            user,
+            address,
+            count,
+            out_woken,
+            |_, _| pinned,
+            |address, _pin| resolve_atomic_wake_key(tasks, regions, process, address),
+            |_, pin| released = Some(pin),
+            |key, count| {
+                wake_atomic_waiters(&self.atomic_waits, execution, key, count)
+                    .map_err(atomic_wait_status)
+            },
+        );
+        (status, released)
     }
 
     #[allow(
@@ -1023,3 +1063,32 @@ fn atomic_wait_status(error: AtomicWaitBeginError) -> DwStatus {
 #[cfg(test)]
 #[path = "f_services/tests.rs"]
 mod tests;
+
+/// Resolves the stable key an `AtomicWake` address names, under a Process
+/// operation lease held only for the lookup.
+fn resolve_atomic_wake_key<
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const REGION_OBJECTS: usize,
+    const REGION_SLOTS: usize,
+>(
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    regions: &AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
+    process: ProcessKey,
+    address: DwUserAddress,
+) -> Result<crate::atomic_wait::AtomicWaitKey, DwStatus> {
+    let lease = tasks
+        .acquire_process_operation(process)
+        .map_err(|_| DW_STATUS_BAD_STATE)?;
+    let key = regions
+        .resolve_atomic_wait_key_for_operation(tasks, &lease, process, address.0)
+        .map_err(|_| DW_STATUS_BAD_ADDRESS);
+    tasks
+        .release_process_operation(lease)
+        .unwrap_or_else(|(error, _)| {
+            panic!("F9 wake key resolution leaked process lease: {error:?}")
+        });
+    key
+}

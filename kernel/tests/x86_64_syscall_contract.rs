@@ -2347,6 +2347,9 @@ fn family_b_outputs_are_pinned_before_and_written_after_the_hold() {
         "NativeSyscallRequest::InterruptCreate { out_interrupt, .. }",
         "NativeSyscallRequest::EventCreate { out_event, .. }",
         "NativeSyscallRequest::TimerCreate { out_timer, .. }",
+        // D1 commit 6b: a two-output creator and the atomic wake.
+        "NativeSyscallRequest::ChannelCreate {",
+        "NativeSyscallRequest::AtomicWake { out_woken, .. }",
     ] {
         assert!(helper.contains(request), "family B omits {request}");
     }
@@ -2357,16 +2360,22 @@ fn family_b_outputs_are_pinned_before_and_written_after_the_hold() {
         .find("user.preflight_owned_output(range)")
         .expect("early owned preflight");
     let run = helper
-        .find("runtime.run_deferred_output(request, &mut deferred);")
+        .find("runtime.run_deferred_output(request, &mut deferred)")
         .expect("guarded adapter run");
     let copy = helper
         .find(".commit_owned_output(output, bytes)")
         .expect("guard-free copy-out");
     assert!(prepare < pin && pin < run && run < copy);
-    // The adapter's preflight succeeds only if the early one pinned the range.
-    assert!(helper.contains(
-        "DeferredUserOutput::new(\n            pinned.as_ref().map(|(range, _)| *range),\n        );"
-    ));
+    // The adapter's preflight succeeds only if the early ones pinned every range.
+    assert!(helper.contains("DeferredUserOutput::batch(pinned.as_ref().map(|_| ranges));"));
+    // An atomic wake's early pin is released after the hold, before the output
+    // is written, as the adapter orders it.
+    let release = helper
+        .find("FAtomicUserAccess::release_atomic_u32(&mut user, pin);")
+        .expect("guard-free atomic pin release");
+    assert!(run < release && release < copy);
+    // Each owned output receives the bytes recorded at its own index.
+    assert!(helper.contains("match deferred.written_at(index) {"));
     assert_eq!(
         helper
             .matches("self.paging.guard_free_access(self.runtime.guard_free())")
