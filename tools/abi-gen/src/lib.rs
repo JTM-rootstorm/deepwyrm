@@ -5,10 +5,12 @@ use std::fmt::{self, Write as _};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod fingerprint;
 mod render;
 mod schema;
 mod validation;
 
+use fingerprint::*;
 use render::*;
 use schema::*;
 use validation::*;
@@ -49,6 +51,7 @@ const OUTPUT_FILES: &[&str] = &[
     "syscall_veneer_x86_64.S",
     "ABI.md",
     "README.md",
+    FINGERPRINT_FILE,
 ];
 
 #[derive(Debug)]

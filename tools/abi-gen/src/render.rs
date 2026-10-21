@@ -22,6 +22,7 @@ pub(super) fn render(model: &Model) -> Result<BTreeMap<String, String>> {
     );
     outputs.insert("ABI.md".to_owned(), render_markdown(model)?);
     outputs.insert("README.md".to_owned(), render_readme());
+    outputs.insert(FINGERPRINT_FILE.to_owned(), render_fingerprint(model));
     for contents in outputs.values_mut() {
         contents.truncate(contents.trim_end().len());
         contents.push('\n');
@@ -1169,7 +1170,7 @@ pub(super) fn title(section: &str) -> String {
 }
 
 pub(super) fn render_readme() -> String {
-    "# Generated Deepwyrm ABI artifacts\n\nThis directory is owned by `abi-gen`. Do not edit generated files directly.\n\nGenerated surfaces include the Rust/C ABI definitions, string-free kernel syscall routing, host-side dispatch/wrapper metadata, the libc-independent x86_64 syscall veneer, and ABI documentation.\n\nFrom the Deepwyrm repository root:\n\n```text\ncargo xtask abi generate\ncargo xtask abi check\n```\n\n`check` regenerates the expected files in memory and fails on missing, stale, or unexpected output.\n".to_owned()
+    "# Generated Deepwyrm ABI artifacts\n\nThis directory is owned by `abi-gen`. Do not edit generated files directly.\n\nGenerated surfaces include the Rust/C ABI definitions, string-free kernel syscall routing, host-side dispatch/wrapper metadata, the libc-independent x86_64 syscall veneer, ABI documentation, and `abi_fingerprint.toml`: a SHA-256 semantic fingerprint over the normalized schema that excludes documentation text and implementation-phase metadata. Paired consumers compare the fingerprint, so a documentation-only schema edit does not require them to repin.\n\nFrom the Deepwyrm repository root:\n\n```text\ncargo xtask abi generate\ncargo xtask abi check\n```\n\n`check` regenerates the expected files in memory and fails on missing, stale, or unexpected output.\n".to_owned()
 }
 
 pub(super) fn record_size_constant(name: &str) -> String {
