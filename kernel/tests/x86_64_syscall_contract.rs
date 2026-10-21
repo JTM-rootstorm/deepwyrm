@@ -1198,14 +1198,15 @@ fn live_timer_expiry_is_bound_and_serviced_only_from_carrier_safe_points() {
     assert!(runtime.contains("general Timer expiry service escaped CPU0 ownership"));
     assert!(runtime.contains(".expire(token, &self.core.shared.waits)"));
     assert!(runtime.contains("timer_expiries:\n        IrqSpinMutex<"));
-    // D1 commits 5, 6, 6d, 7 and 7b add the family-A, family-B, object-info,
-    // ChannelSend and ChannelReceive preparation holds, which service CPU0's
-    // timer expiries exactly like the ordinary hold.
+    // D1 commits 5, 6, 6d, 7, 7b and 7c add the family-A, family-B,
+    // object-info, ChannelSend, ChannelReceive and ProcessCreate preparation
+    // holds, which service CPU0's timer expiries exactly like the ordinary
+    // hold.
     assert_eq!(
         runtime
             .matches("runtime.service_pending_timer_expiries_on_bootstrap();")
             .count(),
-        9
+        10
     );
     let shared_carrier = runtime
         .split_once(
@@ -2318,7 +2319,7 @@ fn family_a_usercopy_runs_guard_free() {
         .expect("phase commit");
     assert!(prepare < copy && copy < walk && walk < commit);
     assert!(primordial.contains(
-        "let handled = match self\n                .handle_guard_free_usercopy(request)\n                .or_else(|| self.handle_deferred_output(request))\n                .or_else(|| self.handle_object_info(request))\n                .or_else(|| self.handle_channel_send(request))\n                .or_else(|| self.handle_channel_receive(request))\n            {"
+        "let handled = match self\n                .handle_guard_free_usercopy(request)\n                .or_else(|| self.handle_deferred_output(request))\n                .or_else(|| self.handle_object_info(request))\n                .or_else(|| self.handle_channel_send(request))\n                .or_else(|| self.handle_channel_receive(request))\n                .or_else(|| self.handle_process_create(request))\n            {"
     ));
     assert!(primordial.contains(
         "NativeSyscallRequest::AbiGetInfo { .. } => {\n                unreachable!(\"AbiGetInfo must be served guard-free by the CPU-local facade\")"
@@ -2506,4 +2507,38 @@ fn channel_receive_dequeues_only_after_its_outputs_are_pinned() {
         3,
         "the precheck, the pins and the copy-out take P alone"
     );
+}
+
+/// Text test (D1 commit 7c, design §11.2.3 family D): `ProcessCreate`
+/// copies its input in and pins its output with P alone, runs its F10
+/// transaction under the guard, and writes its result with P alone.
+#[test]
+fn process_create_copies_outside_its_transaction() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let helper = primordial
+        .split_once("    fn handle_process_create(")
+        .expect("ProcessCreate facade helper")
+        .1
+        .split_once("\n    }\n")
+        .expect("ProcessCreate facade helper extent")
+        .0;
+    let order = [
+        "crate::syscall::process_create_input(",
+        "runtime.run_process_create(prepared)",
+        ".commit_owned_output(output, &result)",
+    ]
+    .map(|anchor| {
+        helper
+            .find(anchor)
+            .unwrap_or_else(|| panic!("ProcessCreate helper omits {anchor}"))
+    });
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]));
+    assert_eq!(
+        helper
+            .matches("self.paging.guard_free_access(self.runtime.guard_free())")
+            .count(),
+        2,
+        "the input copy and the result write take P alone"
+    );
+    assert!(primordial.contains("crate::syscall::DeferredProcessCreateAccess::new(&mut live)"));
 }

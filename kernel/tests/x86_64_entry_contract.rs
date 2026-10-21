@@ -320,9 +320,12 @@ fn selector26_private_evidence_surface_is_isolated_and_terminally_ordered() {
     assert!(primordial.contains(".progress(self.own.scheduled().process, exchange_count, digest)"));
     assert!(primordial.contains("g5_probe.accepts_completion(&completion)"));
     assert!(primordial.contains("complete_dw1b_evidence(permit)"));
-    assert!(syscall.contains("deepwyrm_dw1b_evidence"));
-    assert!(syscall.contains("pub(crate) use adapters::process_create_with_root_observed;"));
-    assert!(adapters.contains("process_create_with_root_observed"));
+    // D1 commit 7c: the committed-child observer rides the prepared F10
+    // transaction the facade runs; the selector-gated observer export it
+    // replaces, and the dw1b cfg it carried in syscall/mod.rs, are gone.
+    assert!(syscall.contains("process_create_with_root_prepared"));
+    assert!(adapters.contains("pub(crate) fn process_create_with_root_prepared<"));
+    assert!(primordial.contains("committed_child = Some(_child);"));
 }
 
 #[test]

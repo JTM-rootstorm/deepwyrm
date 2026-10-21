@@ -47,7 +47,11 @@ pub(crate) fn validate_dw1c_stack_margins(
             && symbol.contains(", 256, 24, 12>>::dispatch_prepared::<")
             && symbol.contains("::dispatch_prepared::<")
             && symbol.contains("PrimordialRuntimeCarrier<128, 4096>")
-            && symbol.contains("PrimordialRuntimeCarrier<128, 4096>>::handle::{closure#3}")
+            // The carrier handler's clock closure. Its index moves whenever a
+            // closure earlier in `handle` is added or removed (D1 commit 7c
+            // removed the ProcessCreate arm's), so match the closure, not its
+            // number; the instantiation stays unique.
+            && symbol.contains("PrimordialRuntimeCarrier<128, 4096>>::handle::{closure#")
     });
     let coherent_commit = one_stack_size(sizes, "DW1C coherent AddressRegion commit", |symbol| {
         symbol.contains("AddressRegion<10>>::commit_specs::<40, 40, 256,")

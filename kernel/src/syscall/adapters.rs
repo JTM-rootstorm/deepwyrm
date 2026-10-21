@@ -2323,6 +2323,176 @@ pub(crate) trait ProcessRootReservation {
     );
 }
 
+/// The process-create result size, the one output a deferred creation
+/// records.
+const PROCESS_CREATE_RESULT_BYTES: usize = DW_PROCESS_CREATE_RESULT_V1_SIZE as usize;
+
+/// `ProcessCreate`'s access while its transaction runs under the runtime
+/// authority (D1 commit 7c, design §11.2.3 family D).
+///
+/// The input was copied, and the output pinned as an owned output, before
+/// the authority was taken. The transaction still reserves the child's
+/// architecture root through `inner`, a paging session taken beneath the
+/// guard, which is a page-table mutation and not a usercopy. Its output
+/// commit or discard is recorded here and carried out after the guard is
+/// released. Any other usercopy panics: the transaction does none after its
+/// input.
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live runtime defers ProcessCreate")
+)]
+pub(crate) struct DeferredProcessCreateAccess<'a, U: OwnedUserOutputAccess> {
+    inner: &'a mut U,
+    pending: Option<(U::OwnedOutput, Option<[u8; PROCESS_CREATE_RESULT_BYTES]>)>,
+}
+
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live runtime defers ProcessCreate")
+)]
+impl<'a, U: OwnedUserOutputAccess> DeferredProcessCreateAccess<'a, U> {
+    pub(crate) fn new(inner: &'a mut U) -> Self {
+        Self {
+            inner,
+            pending: None,
+        }
+    }
+
+    /// The pinned output, and the result to commit into it (`None` to
+    /// discard). The transaction settles its output on every path.
+    pub(crate) fn into_pending(
+        self,
+    ) -> (U::OwnedOutput, Option<[u8; PROCESS_CREATE_RESULT_BYTES]>) {
+        self.pending
+            .expect("ProcessCreate transaction left its output unsettled")
+    }
+}
+
+impl<U: OwnedUserOutputAccess> UserPageAccess for DeferredProcessCreateAccess<'_, U> {
+    type Error = U::Error;
+    type Pinned<'b>
+        = U::Pinned<'b>
+    where
+        Self: 'b;
+
+    fn pin(&mut self, _range: UserRange) -> Result<Self::Pinned<'_>, Self::Error> {
+        panic!("ProcessCreate does no usercopy under the runtime authority");
+    }
+}
+
+impl<U: OwnedUserOutputAccess> OwnedUserOutputAccess for DeferredProcessCreateAccess<'_, U> {
+    type OwnedOutput = U::OwnedOutput;
+
+    fn preflight_owned_output(
+        &mut self,
+        _range: UserRange,
+    ) -> Result<Self::OwnedOutput, Self::Error> {
+        panic!("ProcessCreate pins its output before the runtime authority");
+    }
+
+    fn commit_owned_output(&mut self, output: Self::OwnedOutput, source: &[u8]) {
+        let bytes: [u8; PROCESS_CREATE_RESULT_BYTES] = source
+            .try_into()
+            .expect("ProcessCreate result has its generated size");
+        assert!(
+            self.pending.replace((output, Some(bytes))).is_none(),
+            "ProcessCreate settled its output twice"
+        );
+    }
+
+    fn discard_owned_output(&mut self, output: Self::OwnedOutput) {
+        assert!(
+            self.pending.replace((output, None)).is_none(),
+            "ProcessCreate settled its output twice"
+        );
+    }
+}
+
+impl<U: OwnedUserOutputAccess + ProcessRootReservation> ProcessRootReservation
+    for DeferredProcessCreateAccess<'_, U>
+{
+    fn reserve_child_root(
+        &mut self,
+        process: ProcessKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    ) -> Result<(), DwStatus> {
+        self.inner.reserve_child_root(process, address_space)
+    }
+
+    fn rollback_empty_child_root(
+        &mut self,
+        process: ProcessKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    ) {
+        self.inner.rollback_empty_child_root(process, address_space);
+    }
+}
+
+/// `ProcessCreate`'s input copy and output pin (D1 commit 7c), for the live
+/// runtime to run with no runtime lock held.
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live runtime defers ProcessCreate")
+)]
+pub(crate) fn process_create_input<U: UserPageAccess + OwnedUserOutputAccess>(
+    user: &mut U,
+    args_address: DwUserAddress,
+    args_size: u64,
+    out_result: DwUserAddress,
+    result_size: u64,
+) -> Result<PreparedProcessCreate<U::OwnedOutput>, DwStatus> {
+    prepare_process_create_input(user, args_address, args_size, out_result, result_size)
+}
+
+/// `ProcessCreate`'s transaction over prepared input, reserving the child
+/// root through `user` and observing the committed child (D1 commit 7c).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the live F10 publication keeps portable construction and exact architecture-root reservation in one failure-atomic transaction"
+)]
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live runtime defers ProcessCreate")
+)]
+pub(crate) fn process_create_with_root_prepared<
+    U: OwnedUserOutputAccess + ProcessRootReservation,
+    O: FnOnce(ProcessKey),
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const REGION_OBJECTS: usize,
+    const REGION_SLOTS: usize,
+    const SPACES: usize,
+    const REGIONS: usize,
+>(
+    prepared: PreparedProcessCreate<U::OwnedOutput>,
+    user: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    regions: &mut AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
+    spaces: &mut AddressSpaceAuthority<SPACES, REGIONS>,
+    current_process: ProcessKey,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+    observe_committed_process: O,
+) -> DwStatus {
+    process_create_publish(
+        prepared,
+        user,
+        registry,
+        tasks,
+        regions,
+        spaces,
+        current_process,
+        cleanup,
+        |access, process, address_space| access.reserve_child_root(process, address_space),
+        |access, process, address_space| access.rollback_empty_child_root(process, address_space),
+        |_| Ok(()),
+        observe_committed_process,
+    )
+}
+
 fn cancel_prepared_process<
     const OBJECTS: usize,
     const GROUPS: usize,
@@ -2442,7 +2612,7 @@ fn cancel_prepared_root_and_process<
 }
 
 #[must_use = "prepared process-create user input owns its output reservation"]
-struct PreparedProcessCreate<OUTPUT> {
+pub(crate) struct PreparedProcessCreate<OUTPUT> {
     args: DwProcessCreateArgsV1,
     output: OUTPUT,
 }
@@ -2526,12 +2696,12 @@ fn process_create_transaction<
     out_result: DwUserAddress,
     result_size: u64,
     cleanup: &mut CleanupQueue<OBJECTS>,
-    mut reserve_root: R,
-    mut rollback_root: B,
-    mut inject: I,
+    reserve_root: R,
+    rollback_root: B,
+    inject: I,
     observe_committed_process: O,
 ) -> DwStatus {
-    let PreparedProcessCreate { args, output } = match prepare_process_create_input(
+    let prepared = match prepare_process_create_input(
         user,
         args_address,
         args_size,
@@ -2541,6 +2711,63 @@ fn process_create_transaction<
         Ok(prepared) => prepared,
         Err(status) => return status,
     };
+    process_create_publish(
+        prepared,
+        user,
+        registry,
+        tasks,
+        regions,
+        spaces,
+        current_process,
+        cleanup,
+        reserve_root,
+        rollback_root,
+        inject,
+        observe_committed_process,
+    )
+}
+
+/// `ProcessCreate` after its input is copied and its output pinned (D1
+/// commit 7c): the authority transaction, ending in the output's commit or
+/// discard through `user`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the F10 publication keeps portable construction and exact architecture-root reservation in one failure-atomic transaction"
+)]
+fn process_create_publish<
+    U: OwnedUserOutputAccess,
+    R: FnMut(
+        &mut U,
+        ProcessKey,
+        crate::memory::address_region::AddressSpaceKey,
+    ) -> Result<(), DwStatus>,
+    B: FnMut(&mut U, ProcessKey, crate::memory::address_region::AddressSpaceKey),
+    I: FnMut(ProcessCreatePreparation) -> Result<(), DwStatus>,
+    O: FnOnce(ProcessKey),
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const REGION_OBJECTS: usize,
+    const REGION_SLOTS: usize,
+    const SPACES: usize,
+    const REGIONS: usize,
+>(
+    prepared: PreparedProcessCreate<U::OwnedOutput>,
+    user: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    regions: &mut AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
+    spaces: &mut AddressSpaceAuthority<SPACES, REGIONS>,
+    current_process: ProcessKey,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+    mut reserve_root: R,
+    mut rollback_root: B,
+    mut inject: I,
+    observe_committed_process: O,
+) -> DwStatus {
+    let PreparedProcessCreate { args, output } = prepared;
 
     macro_rules! discard_and_return {
         ($status:expr) => {{
@@ -2941,72 +3168,6 @@ pub(crate) fn process_create_with_root<
         |access, process, address_space| access.rollback_empty_child_root(process, address_space),
         |_| Ok(()),
         |_| {},
-    )
-}
-
-/// Private evidence-selector live process construction with an exact
-/// kernel-commit observer. The observer sees the child only after its Process
-/// and root objects commit, but before parent result handles and user output
-/// publish; it is not a completed-syscall notification. Any later invariant
-/// failure is terminal, so the captured identity cannot reach reporter
-/// authorization.
-#[cfg(any(
-    deepwyrm_wyr1_evidence,
-    deepwyrm_dw1b_evidence,
-    deepwyrm_wyr1b_evidence,
-    deepwyrm_dw1c_evidence,
-    deepwyrm_wyr1c_evidence,
-    deepwyrm_wyr1d_evidence,
-    deepwyrm_wyr1e_evidence,
-    deepwyrm_dw1e_evidence,
-    deepwyrm_r1_evidence
-))]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the selector-local observer preserves the live F10 transaction boundaries"
-)]
-pub(crate) fn process_create_with_root_observed<
-    U: UserPageAccess + OwnedUserOutputAccess + ProcessRootReservation,
-    O: FnOnce(ProcessKey),
-    const OBJECTS: usize,
-    const GROUPS: usize,
-    const PROCESSES: usize,
-    const THREADS: usize,
-    const HANDLES: usize,
-    const REGION_OBJECTS: usize,
-    const REGION_SLOTS: usize,
-    const SPACES: usize,
-    const REGIONS: usize,
->(
-    user: &mut U,
-    registry: &mut ObjectRegistry<OBJECTS>,
-    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
-    regions: &mut AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
-    spaces: &mut AddressSpaceAuthority<SPACES, REGIONS>,
-    current_process: ProcessKey,
-    args_address: DwUserAddress,
-    args_size: u64,
-    out_result: DwUserAddress,
-    result_size: u64,
-    cleanup: &mut CleanupQueue<OBJECTS>,
-    observe_committed_process: O,
-) -> DwStatus {
-    process_create_transaction(
-        user,
-        registry,
-        tasks,
-        regions,
-        spaces,
-        current_process,
-        args_address,
-        args_size,
-        out_result,
-        result_size,
-        cleanup,
-        |access, process, address_space| access.reserve_child_root(process, address_space),
-        |access, process, address_space| access.rollback_empty_child_root(process, address_space),
-        |_| Ok(()),
-        observe_committed_process,
     )
 }
 

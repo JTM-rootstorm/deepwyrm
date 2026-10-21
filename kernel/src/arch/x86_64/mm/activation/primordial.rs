@@ -2548,6 +2548,84 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Some(Ok(ready))
     }
 
+    /// `ProcessCreate` (design §11.2.3 family D, D1 commit 7c). It copies its
+    /// input in and pins its output before the authority work, and writes
+    /// the result after it.
+    /// 1. A first hold as for family A.
+    /// 2. With P alone, `process_create_input` copies and validates the
+    ///    arguments and pins the result output.
+    /// 3. A second hold runs the F10 transaction. The child's architecture
+    ///    root is reserved through P beneath the guard, which is a page-table
+    ///    mutation, not a usercopy. The output's commit or discard is
+    ///    recorded. The hold then commits the phase and leaves through
+    ///    `ready_to_return`.
+    /// 4. With P alone, the recorded result goes into the pinned output, or
+    ///    the output is discarded.
+    /// Statuses and their precedence are the adapter's. `None` for every
+    /// other request.
+    // Kept out of line, like the other facade helpers, so the ordinary
+    // handler's measured frame does not absorb it.
+    #[inline(never)]
+    fn handle_process_create(
+        &mut self,
+        request: NativeSyscallRequest,
+    ) -> Option<Result<crate::syscall::native::ReturnReady, ()>> {
+        let NativeSyscallRequest::ProcessCreate {
+            args,
+            args_size,
+            out_result,
+            result_size,
+        } = request
+        else {
+            return None;
+        };
+        let cpu = self.cpu;
+        let Ok((phase, root, process)) = self.with_synchronized_runtime_at_safe_point(|runtime| {
+            if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                runtime.service_pending_timer_expiries_on_bootstrap();
+            }
+            runtime.prepare_guard_free_usercopy()
+        }) else {
+            return Some(Err(()));
+        };
+        let prepared = {
+            let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+            let mut paging = access.lock();
+            let mut user = paging.usercopy_process_address_space(root, process);
+            crate::syscall::process_create_input(
+                &mut user,
+                args,
+                args_size,
+                out_result,
+                result_size,
+            )
+        };
+        let (ready, pending) = {
+            let mut guard = self.runtime.lock();
+            let mut runtime = guard.on(&mut self.owned);
+            let (status, pending) = runtime.run_process_create(prepared);
+            runtime.commit_runtime_phase(phase);
+            (
+                runtime.ready_to_return(NativeSyscallResult::returning(status)),
+                pending,
+            )
+        };
+        if let Some((output, result)) = pending {
+            let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+            let mut paging = access.lock();
+            let mut user = paging.usercopy_process_address_space(root, process);
+            match result {
+                Some(result) => user
+                    .commit_owned_output(output, &result)
+                    .unwrap_or_else(|_| panic!("pinned ProcessCreate output commit drifted")),
+                None => user
+                    .discard_owned_output(output)
+                    .unwrap_or_else(|_| panic!("pinned ProcessCreate output discard drifted")),
+            }
+        }
+        Some(Ok(ready))
+    }
+
     /// Runs one scheduler-current transaction under the same runtime guard as
     /// the final Stop arbitration. This closes both detached windows: a Stop
     /// published before root synchronization and one published after the CR3
@@ -8982,6 +9060,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 .or_else(|| self.handle_object_info(request))
                 .or_else(|| self.handle_channel_send(request))
                 .or_else(|| self.handle_channel_receive(request))
+                .or_else(|| self.handle_process_create(request))
             {
                 Some(handled) => handled,
                 None => {
@@ -10614,130 +10693,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         // adapter from committing under a migrated Thread/root selection.
         let phase = self.reserve_runtime_phase();
         let result = match request {
-            NativeSyscallRequest::ProcessCreate {
-                args,
-                args_size,
-                out_result,
-                result_size,
-            } => {
-                let mut paging = self.paging.lock();
-                let mut user = paging.current_process_address_space(
-                    self.own.active_root.as_ref().expect("active root"),
-                    self.own.scheduled().process,
-                );
-                #[cfg(any(
-                    deepwyrm_wyr1_evidence,
-                    deepwyrm_dw1b_evidence,
-                    deepwyrm_wyr1b_evidence,
-                    deepwyrm_dw1c_evidence,
-                    deepwyrm_wyr1c_evidence,
-                    deepwyrm_wyr1d_evidence,
-                    deepwyrm_wyr1e_evidence,
-                    deepwyrm_dw1e_evidence,
-                    deepwyrm_r1_evidence,
-                ))]
-                let creating_evidence_init =
-                    self.own.scheduled().process == self.core.primordial_process;
-                #[cfg(any(
-                    deepwyrm_wyr1_evidence,
-                    deepwyrm_dw1b_evidence,
-                    deepwyrm_wyr1b_evidence,
-                    deepwyrm_dw1c_evidence,
-                    deepwyrm_wyr1c_evidence,
-                    deepwyrm_wyr1d_evidence,
-                    deepwyrm_wyr1e_evidence,
-                    deepwyrm_dw1e_evidence,
-                    deepwyrm_r1_evidence,
-                ))]
-                if creating_evidence_init && self.core.evidence_init_process.is_some() {
-                    crate::test_support::complete_fail(evidence_process_create_detail(1))
-                }
-                #[cfg(any(
-                    deepwyrm_wyr1_evidence,
-                    deepwyrm_dw1b_evidence,
-                    deepwyrm_wyr1b_evidence,
-                    deepwyrm_dw1c_evidence,
-                    deepwyrm_wyr1c_evidence,
-                    deepwyrm_wyr1d_evidence,
-                    deepwyrm_wyr1e_evidence,
-                    deepwyrm_dw1e_evidence,
-                    deepwyrm_r1_evidence,
-                ))]
-                let mut committed_child = None;
-                #[cfg(any(
-                    deepwyrm_wyr1_evidence,
-                    deepwyrm_dw1b_evidence,
-                    deepwyrm_wyr1b_evidence,
-                    deepwyrm_dw1c_evidence,
-                    deepwyrm_wyr1c_evidence,
-                    deepwyrm_wyr1d_evidence,
-                    deepwyrm_wyr1e_evidence,
-                    deepwyrm_dw1e_evidence,
-                    deepwyrm_r1_evidence,
-                ))]
-                let status = crate::syscall::process_create_with_root_observed(
-                    &mut user,
-                    &mut self.core.registry,
-                    &mut self.core.tasks,
-                    &mut self.core.regions,
-                    &mut self.core.spaces,
-                    self.own.scheduled().process,
-                    args,
-                    args_size,
-                    out_result,
-                    result_size,
-                    &mut self.core.cleanup,
-                    |child| {
-                        committed_child = Some(child);
-                        #[cfg(deepwyrm_dw1c_evidence)]
-                        crate::test_support::DW1C_EVIDENCE
-                            .observe_process_create(child)
-                            .unwrap_or_else(|error| {
-                                panic!("selector-28 Process CREATE observation failed: {error:?}")
-                            });
-                    },
-                );
-                #[cfg(not(any(
-                    deepwyrm_wyr1_evidence,
-                    deepwyrm_dw1b_evidence,
-                    deepwyrm_wyr1b_evidence,
-                    deepwyrm_dw1c_evidence,
-                    deepwyrm_wyr1c_evidence,
-                    deepwyrm_wyr1d_evidence,
-                    deepwyrm_wyr1e_evidence,
-                    deepwyrm_dw1e_evidence,
-                    deepwyrm_r1_evidence,
-                )))]
-                let status = crate::syscall::process_create_with_root(
-                    &mut user,
-                    &mut self.core.registry,
-                    &mut self.core.tasks,
-                    &mut self.core.regions,
-                    &mut self.core.spaces,
-                    self.own.scheduled().process,
-                    args,
-                    args_size,
-                    out_result,
-                    result_size,
-                    &mut self.core.cleanup,
-                );
-                #[cfg(any(
-                    deepwyrm_wyr1_evidence,
-                    deepwyrm_dw1b_evidence,
-                    deepwyrm_wyr1b_evidence,
-                    deepwyrm_dw1c_evidence,
-                    deepwyrm_wyr1c_evidence,
-                    deepwyrm_wyr1d_evidence,
-                    deepwyrm_wyr1e_evidence,
-                    deepwyrm_dw1e_evidence,
-                    deepwyrm_r1_evidence,
-                ))]
-                if creating_evidence_init && status == DW_STATUS_SUCCESS {
-                    self.core.evidence_init_process = Some(committed_child.unwrap_or_else(|| {
-                        crate::test_support::complete_fail(evidence_process_create_detail(2))
-                    }));
-                }
-                NativeSyscallResult::returning(status)
+            NativeSyscallRequest::ProcessCreate { .. } => {
+                unreachable!("ProcessCreate is served by the CPU-local facade (D1 commit 7c)")
             }
             request => {
                 let dispatch = {
@@ -11083,6 +11040,130 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.own.scheduled().process,
             &mut self.core.cleanup,
         )
+    }
+
+    /// The guarded half of `ProcessCreate` (D1 commit 7c): the selector
+    /// evidence checks, then the F10 transaction over the prepared input.
+    /// The child root is reserved through P beneath this guard, and the
+    /// output's commit or discard is returned for the facade to carry out.
+    #[allow(
+        clippy::type_complexity,
+        reason = "the pinned output and its optional result travel together"
+    )]
+    fn run_process_create(
+        &mut self,
+        prepared: Result<
+            crate::syscall::PreparedProcessCreate<user_access::OwnedLiveUserOutput>,
+            deepwyrm_abi::DwStatus,
+        >,
+    ) -> (
+        deepwyrm_abi::DwStatus,
+        Option<(
+            user_access::OwnedLiveUserOutput,
+            Option<[u8; deepwyrm_abi::DW_PROCESS_CREATE_RESULT_V1_SIZE as usize]>,
+        )>,
+    ) {
+        #[cfg(any(
+            deepwyrm_wyr1_evidence,
+            deepwyrm_dw1b_evidence,
+            deepwyrm_wyr1b_evidence,
+            deepwyrm_dw1c_evidence,
+            deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence,
+            deepwyrm_wyr1e_evidence,
+            deepwyrm_dw1e_evidence,
+            deepwyrm_r1_evidence,
+        ))]
+        let creating_evidence_init = self.own.scheduled().process == self.core.primordial_process;
+        #[cfg(any(
+            deepwyrm_wyr1_evidence,
+            deepwyrm_dw1b_evidence,
+            deepwyrm_wyr1b_evidence,
+            deepwyrm_dw1c_evidence,
+            deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence,
+            deepwyrm_wyr1e_evidence,
+            deepwyrm_dw1e_evidence,
+            deepwyrm_r1_evidence,
+        ))]
+        if creating_evidence_init && self.core.evidence_init_process.is_some() {
+            crate::test_support::complete_fail(evidence_process_create_detail(1))
+        }
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(status) => return (status, None),
+        };
+        #[cfg(any(
+            deepwyrm_wyr1_evidence,
+            deepwyrm_dw1b_evidence,
+            deepwyrm_wyr1b_evidence,
+            deepwyrm_dw1c_evidence,
+            deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence,
+            deepwyrm_wyr1e_evidence,
+            deepwyrm_dw1e_evidence,
+            deepwyrm_r1_evidence,
+        ))]
+        let mut committed_child = None;
+        let process = self.own.scheduled().process;
+        let (status, pending) = {
+            let mut paging = self.paging.lock();
+            let mut live = paging.current_process_address_space(
+                self.own.active_root.as_ref().expect("active root"),
+                process,
+            );
+            let mut access = crate::syscall::DeferredProcessCreateAccess::new(&mut live);
+            let status = crate::syscall::process_create_with_root_prepared(
+                prepared,
+                &mut access,
+                &mut self.core.registry,
+                &mut self.core.tasks,
+                &mut self.core.regions,
+                &mut self.core.spaces,
+                process,
+                &mut self.core.cleanup,
+                |_child| {
+                    #[cfg(any(
+                        deepwyrm_wyr1_evidence,
+                        deepwyrm_dw1b_evidence,
+                        deepwyrm_wyr1b_evidence,
+                        deepwyrm_dw1c_evidence,
+                        deepwyrm_wyr1c_evidence,
+                        deepwyrm_wyr1d_evidence,
+                        deepwyrm_wyr1e_evidence,
+                        deepwyrm_dw1e_evidence,
+                        deepwyrm_r1_evidence,
+                    ))]
+                    {
+                        committed_child = Some(_child);
+                    }
+                    #[cfg(deepwyrm_dw1c_evidence)]
+                    crate::test_support::DW1C_EVIDENCE
+                        .observe_process_create(_child)
+                        .unwrap_or_else(|error| {
+                            panic!("selector-28 Process CREATE observation failed: {error:?}")
+                        });
+                },
+            );
+            (status, access.into_pending())
+        };
+        #[cfg(any(
+            deepwyrm_wyr1_evidence,
+            deepwyrm_dw1b_evidence,
+            deepwyrm_wyr1b_evidence,
+            deepwyrm_dw1c_evidence,
+            deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence,
+            deepwyrm_wyr1e_evidence,
+            deepwyrm_dw1e_evidence,
+            deepwyrm_r1_evidence,
+        ))]
+        if creating_evidence_init && status == DW_STATUS_SUCCESS {
+            self.core.evidence_init_process = Some(committed_child.unwrap_or_else(|| {
+                crate::test_support::complete_fail(evidence_process_create_detail(2))
+            }));
+        }
+        (status, Some(pending))
     }
 
     /// The guarded half of a deferred `AtomicWake` (D1 commit 6b). The early

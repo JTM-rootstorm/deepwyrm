@@ -12029,3 +12029,136 @@ fn an_unconsumed_receive_hold_panics() {
     // the failure the panic exists to stop; skip its teardown checks.
     core::mem::forget(tasks);
 }
+
+impl ProcessRootReservation for FakeUserMemory {
+    fn reserve_child_root(
+        &mut self,
+        _process: ProcessKey,
+        _address_space: crate::memory::address_region::AddressSpaceKey,
+    ) -> Result<(), DwStatus> {
+        Ok(())
+    }
+
+    fn rollback_empty_child_root(
+        &mut self,
+        _process: ProcessKey,
+        _address_space: crate::memory::address_region::AddressSpaceKey,
+    ) {
+    }
+}
+
+/// D1 commit 7c: `ProcessCreate` with its input copied and output pinned
+/// before the runtime authority writes nothing during its transaction. It
+/// returns the result for the caller to commit afterwards, and a failed
+/// transaction returns its output for discard.
+#[test]
+fn a_deferred_process_create_settles_its_output_after_the_transaction() {
+    use deepwyrm_abi::{
+        DW_OBJECT_TYPE_PROCESS, DW_PROCESS_CREATE_ARGS_V1_SIZE, DW_PROCESS_CREATE_RESULT_V1_SIZE,
+    };
+
+    const ARGS: u64 = BASE + 0x600;
+    const OUT: u64 = BASE + 0x700;
+    let out_bytes = FakeUserMemory::offset(OUT, 64)..FakeUserMemory::offset(OUT, 64) + 64;
+
+    // Success: nothing is written until the caller commits the result.
+    let mut fixture = f10_fixture();
+    write_valid_f10_args(&mut fixture, ARGS);
+    fixture.user.bytes[out_bytes.clone()].fill(0xa5);
+    let mut cleanup = CleanupQueue::<16>::new();
+    let prepared = process_create_input(
+        &mut fixture.user,
+        DwUserAddress(ARGS),
+        u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE),
+        DwUserAddress(OUT),
+        u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE),
+    )
+    .unwrap();
+    let mut access = DeferredProcessCreateAccess::new(&mut fixture.user);
+    let status = process_create_with_root_prepared(
+        prepared,
+        &mut access,
+        &mut fixture.registry,
+        &mut fixture.tasks,
+        &mut fixture.regions,
+        &mut fixture.spaces,
+        fixture.current,
+        &mut cleanup,
+        |_| {},
+    );
+    let (output, result) = access.into_pending();
+    assert_eq!(status, DW_STATUS_SUCCESS);
+    assert!(
+        fixture.user.bytes[out_bytes.clone()]
+            .iter()
+            .all(|byte| *byte == 0xa5)
+    );
+    fixture
+        .user
+        .commit_owned_output(output, &result.expect("a created Process has a result"));
+    let result_process = DwHandle(u64_at(&fixture.user, OUT + 8));
+    let result_root = DwHandle(u64_at(&fixture.user, OUT + 16));
+    let child_bootstrap = DwHandle(u64_at(&fixture.user, OUT + 24));
+    let child_pin = resolve_current_handle(
+        &fixture.tasks,
+        &mut fixture.registry,
+        fixture.current,
+        result_process,
+        DW_OBJECT_TYPE_PROCESS,
+        DW_RIGHT_INSPECT,
+    )
+    .unwrap();
+    let child = ProcessKey::from_object_id(child_pin.id());
+    release_lookup_pin(&mut fixture.registry, child_pin, &mut cleanup);
+    retire_f10_created_process(
+        &mut fixture,
+        child,
+        result_process,
+        result_root,
+        child_bootstrap,
+        &mut cleanup,
+    );
+    close_f10_fixture_with_open_channels(fixture, false, true, true);
+
+    // A failed transaction (a stale task group) returns its output for discard.
+    let mut fixture = f10_fixture();
+    write_valid_f10_args(&mut fixture, ARGS);
+    let mut cleanup = CleanupQueue::<16>::new();
+    assert_eq!(
+        handle_close(
+            &mut fixture.registry,
+            &mut fixture.tasks,
+            fixture.current,
+            fixture.parent_group,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let prepared = process_create_input(
+        &mut fixture.user,
+        DwUserAddress(ARGS),
+        u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE),
+        DwUserAddress(OUT),
+        u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE),
+    )
+    .unwrap();
+    let mut access = DeferredProcessCreateAccess::new(&mut fixture.user);
+    let status = process_create_with_root_prepared(
+        prepared,
+        &mut access,
+        &mut fixture.registry,
+        &mut fixture.tasks,
+        &mut fixture.regions,
+        &mut fixture.spaces,
+        fixture.current,
+        &mut cleanup,
+        |_| {},
+    );
+    let (output, result) = access.into_pending();
+    assert_eq!(status, DW_STATUS_BAD_HANDLE);
+    assert!(result.is_none());
+    fixture.user.discard_owned_output(output);
+    assert_eq!(fixture.user.owned_outputs, 0);
+    finish_f10_task_cleanup(&mut fixture.registry, &mut fixture.tasks, cleanup);
+    close_f10_fixture_with_open_channels(fixture, true, true, false);
+}
