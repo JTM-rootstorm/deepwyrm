@@ -13,6 +13,7 @@
 
 use crate::arch::x86_64::acpi::sleep;
 use crate::arch::x86_64::io_port::X86PortIo;
+use crate::arch::x86_64::syscall::GuardFree;
 
 /// Request ACPI S5 soft-off, then halt.
 ///
@@ -22,11 +23,15 @@ use crate::arch::x86_64::io_port::X86PortIo;
 /// window between the write and the platform acting on it -- in every one of
 /// those cases the behaviour is exactly what production did before, so this can
 /// only ever end a boot that would otherwise have hung.
+///
+/// Takes a [`GuardFree`]: the halt loop's `sti; hlt` lets this CPU's
+/// interrupt handlers run, so no runtime lock may be held across it
+/// (DW0-H §12.8; design §11.2.6).
 #[allow(
     unsafe_code,
     reason = "the terminal path has no runnable work; halting with interrupts enabled is the pre-existing production behaviour this extends"
 )]
-pub(crate) fn soft_off_then_halt() -> ! {
+pub(crate) fn soft_off_then_halt(_guard_free: GuardFree<'_>) -> ! {
     match sleep::authorized_soft_off() {
         Some(command) => sleep::request_soft_off(&mut X86PortIo, command),
         None => {

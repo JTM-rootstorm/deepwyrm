@@ -126,6 +126,22 @@ fn guard_free_tokens_cannot_be_minted_under_the_runtime_guard() {
                 "error[E0277]: the trait bound `RuntimeAuthorityHandle<'_, u32>: Clone` is not satisfied",
             ),
         },
+        // Design §11.2.6: the power-off halt loop runs `sti; hlt`, so it takes
+        // a token, which a CPU holding its guard cannot mint.
+        UiCase {
+            fixture: "power_off_compiles.rs",
+            expected_error: None,
+        },
+        UiCase {
+            fixture: "power_off_under_guard.rs",
+            expected_error: Some(
+                "error[E0499]: cannot borrow `handle` as mutable more than once at a time",
+            ),
+        },
+        UiCase {
+            fixture: "power_off_without_token.rs",
+            expected_error: Some("error[E0308]: mismatched types"),
+        },
     ] {
         run_case(&rustc, &manifest_dir, &output_dir, &case);
     }

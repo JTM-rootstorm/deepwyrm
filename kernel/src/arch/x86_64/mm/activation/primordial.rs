@@ -2101,6 +2101,11 @@ enum PreparedRendezvousNext {
 enum PreparedTerminalHandoff {
     Continuation(u64),
     IdleScheduler,
+    /// Production only: nothing remains to run. The facade powers off after it
+    /// drops the runtime guard, because the fallback halt loop enables
+    /// interrupts (DW0-H §12.8; design §11.2.6).
+    #[cfg(not(feature = "test-support"))]
+    PowerOff,
 }
 
 struct TerminalRetirementState {
@@ -4257,7 +4262,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .any_process_unexited_except(retirement.retired_process)
             {
                 let _ = crate::debug::emit_early_system_empty_record();
-                crate::arch::x86_64::power::soft_off_then_halt()
+                return PreparedTerminalStep::Final(PreparedTerminalHandoff::PowerOff);
             }
             if crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
                 != Some(self.cpu().index())
@@ -4660,9 +4665,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             // Nothing remains runnable. Production used to halt here forever
             // while every instrumented build ended its domain through the
             // test-only debug-exit transport, so only an instrumented image
-            // could finish a run. Power the platform off instead; the fallback
-            // inside is the halt loop this replaced.
-            crate::arch::x86_64::power::soft_off_then_halt()
+            // could finish a run. Power the platform off instead, once the
+            // facade has dropped the guard; the fallback inside is the halt
+            // loop this replaced.
+            PreparedTerminalHandoff::PowerOff
         }
     }
 
@@ -8846,6 +8852,10 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     },
                     PreparedTerminalHandoff::IdleScheduler => {
                         crate::arch::x86_64::syscall::enter_bound_idle_scheduler(carrier.release())
+                    }
+                    #[cfg(not(feature = "test-support"))]
+                    PreparedTerminalHandoff::PowerOff => {
+                        crate::arch::x86_64::power::soft_off_then_halt(this.runtime.guard_free())
                     }
                 },
             };

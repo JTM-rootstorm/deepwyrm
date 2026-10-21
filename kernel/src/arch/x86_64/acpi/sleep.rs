@@ -1169,7 +1169,9 @@ mod tests {
     // (F3A.7f), and the last Process leaving the machine empty (F3A.7j), which
     // is the one WYR1 actually reaches. Each kind appears once on the one
     // terminal path, the facade's detached handoff. (S2K-3 deleted the
-    // carrier's second, never-reached copy of that path.)
+    // carrier's second, never-reached copy of that path.) Each arm returns the
+    // power-off outcome under the runtime guard, and the facade's one consumer
+    // powers off after dropping it (design §11.2.6).
 
     const TERMINAL_REPORTS: [(&str, usize); 2] = [
         ("emit_early_bootstrap_completion_record", 1),
@@ -1179,7 +1181,8 @@ mod tests {
     #[test]
     fn each_production_terminal_arm_powers_off_instead_of_halting() {
         const PRIMORDIAL: &str = include_str!("../mm/activation/primordial.rs");
-        const POWER_OFF: &str = "crate::arch::x86_64::power::soft_off_then_halt()";
+        const POWER_OFF: &str = "PreparedTerminalHandoff::PowerOff";
+        const CONSUMER: &str = "PreparedTerminalHandoff::PowerOff => {\n                        crate::arch::x86_64::power::soft_off_then_halt(this.runtime.guard_free())";
 
         let mut total = 0;
         for (report, expected) in TERMINAL_REPORTS {
@@ -1216,9 +1219,21 @@ mod tests {
             }
         }
         assert_eq!(
+            PRIMORDIAL.matches(CONSUMER).count(),
+            1,
+            "one consumer powers off, guard-free",
+        );
+        assert_eq!(
             PRIMORDIAL.matches(POWER_OFF).count(),
-            total,
+            total + 1,
             "every terminal arm, and nothing else, ends in soft-off",
+        );
+        assert_eq!(
+            PRIMORDIAL
+                .matches("crate::arch::x86_64::power::soft_off_then_halt(")
+                .count(),
+            1,
+            "only the guard-free consumer calls soft-off",
         );
     }
 
