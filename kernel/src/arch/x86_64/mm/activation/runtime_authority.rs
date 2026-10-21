@@ -429,10 +429,12 @@ impl ShootdownInitiatorGuard<'_> {
         settled
     }
 
-    /// Releases an S whose transaction failed before it built a coherent
-    /// publisher, so it covered no shootdown. Every S whose transaction
-    /// reached a publisher is released through [`Self::release`], on that
-    /// publisher's settlement.
+    /// Releases an S whose transaction published no shootdown and so holds
+    /// no settlement: a family-G transaction that failed before it built a
+    /// coherent publisher, or a root teardown that failed before its
+    /// publication. Every S whose transaction reached a publisher, or
+    /// published a teardown, is released through [`Self::release`], on its
+    /// settlement.
     pub(super) fn release_unused(self) {
         self.unlock();
     }

@@ -878,10 +878,6 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
     }
 
     /// Retires and returns one non-primordial, empty, nonresident root.
-    #[allow(
-        unsafe_code,
-        reason = "the completed H0 teardown barrier discharges the empty-root reclaim proof"
-    )]
     pub(crate) fn teardown_empty_owned<
         const RANGES: usize,
         const ROLES: usize,
@@ -896,6 +892,32 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
         pins: &UserPinTracker<PINS>,
         reservation: AddressSpaceTeardownReservation<'_, PINS>,
     ) -> Result<(), RootBindingError> {
+        self.teardown_empty_owned_settled(roles, target, process, address_space, pins, reservation)
+            .map(drop)
+    }
+
+    /// As [`Self::teardown_empty_owned`], returning the teardown barrier's
+    /// reclaim permit, which releases the shootdown-initiator lock S the
+    /// live caller took before preparing (D1 option B4). An error is returned
+    /// only before the teardown's publication, so it published nothing.
+    #[allow(
+        unsafe_code,
+        reason = "the completed H0 teardown barrier discharges the empty-root reclaim proof"
+    )]
+    pub(crate) fn teardown_empty_owned_settled<
+        const RANGES: usize,
+        const ROLES: usize,
+        const PINS: usize,
+        T: AtomicPageTableTarget,
+    >(
+        &mut self,
+        roles: &mut FrameRoleManager<RANGES, ROLES>,
+        target: &mut T,
+        process: ProcessKey,
+        address_space: AddressSpaceKey,
+        pins: &UserPinTracker<PINS>,
+        reservation: AddressSpaceTeardownReservation<'_, PINS>,
+    ) -> Result<crate::memory::address_region::ReclaimPermit, RootBindingError> {
         if !pins.owns_teardown_reservation(&reservation) || !reservation.covers(address_space) {
             return Err(RootBindingError::RootMismatch);
         }
@@ -966,7 +988,7 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
         // Zero residency and the closed gate make barrier completion infallible;
         // returning a recoverable error after this point would poison teardown.
         let barrier = transaction.publish();
-        let _permit = barrier
+        let permit = barrier
             .try_complete()
             .unwrap_or_else(|_| panic!("zero-resident teardown barrier became incomplete"));
         let empty_root = unsafe { roles.reclaim_preflighted_empty_table_hierarchy(hierarchy) };
@@ -974,7 +996,7 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
             roles.reclaim_preflighted_empty_table_root(empty_root);
         }
         self.entries[slot] = None;
-        Ok(())
+        Ok(permit)
     }
 
     fn binding(

@@ -356,4 +356,90 @@ mod tests {
         assert_eq!(acknowledged.load(Ordering::Acquire), 2);
         assert!(SECOND_SPINS_ON_S.load(Ordering::Acquire));
     }
+
+    /// D1 option B4 (design §11.2.9): a root teardown takes S before it
+    /// prepares, so it waits for a family-G shootdown in flight instead of
+    /// meeting `MutationInFlight`. The model: an initiator publishes an unmap
+    /// of one address space with CPU 1 resident, and holds S alone. CPU 1
+    /// leaves (acknowledging), so the space has no resident, but the mutation
+    /// stays published until its initiator mints the permit. The initiator
+    /// mints it only once the teardown spins on S (or after a bounded wait).
+    /// With S, the teardown then prepares cleanly. Without S, it meets the
+    /// published mutation: removing S from the teardown fails this test.
+    #[test]
+    fn a_teardown_under_s_waits_for_the_shootdown_in_flight() {
+        use super::super::runtime_authority::{
+            PagingLock, RuntimeAuthorityLock, ShootdownInitiatorLock,
+        };
+        use crate::memory::address_region::{
+            AddressSpaceCoherency, AddressSpaceKey, InvalidationScope, MappingMutation,
+            ShootdownOutcome,
+        };
+        use core::sync::atomic::AtomicBool;
+
+        static TEARDOWN_SPINS_ON_S: AtomicBool = AtomicBool::new(false);
+        fn note_spin() {
+            TEARDOWN_SPINS_ON_S.store(true, Ordering::Release);
+        }
+        fn no_service() {}
+
+        let runtime = RuntimeAuthorityLock::new((), no_service);
+        let paging = PagingLock::new((), no_service);
+        let initiator_lock = ShootdownInitiatorLock::new(note_spin);
+        let space = AddressSpaceCoherency::<{ crate::cpu::CPU_CAPACITY }>::new(
+            AddressSpaceKey::for_test(23, 33),
+        );
+        let cpu1 = crate::cpu::CpuIndex::new(1).unwrap();
+        let residency = space.enter(cpu1).unwrap();
+        let [mut initiator_handle, mut teardown_handle] = runtime.handles::<2>();
+        let left = AtomicBool::new(false);
+
+        let teardown = std::thread::scope(|scope| {
+            let initiator = {
+                let mut guard = initiator_handle.lock();
+                let (_, mut access) = guard.with_paging(&paging);
+                let held = access.lock();
+                initiator_lock.acquire_beneath(&held)
+            };
+            let mut barrier = space
+                .prepare_mutation(
+                    MappingMutation::Unmap,
+                    InvalidationScope::pages(0x4000, 0x1000).unwrap(),
+                )
+                .unwrap()
+                .publish();
+            // CPU 1 leaves, acknowledging: no resident remains, but the
+            // mutation stays published until the permit is minted.
+            space.leave_after_local_flush(residency).unwrap();
+            left.store(true, Ordering::Release);
+            let teardown = scope.spawn(|| {
+                while !left.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                let mut guard = teardown_handle.lock();
+                let (_, mut access) = guard.with_paging(&paging);
+                let held = access.lock();
+                let initiator = initiator_lock.acquire_beneath(&held);
+                let prepared = space.prepare_uncontended_teardown().map(drop);
+                initiator.release_unused();
+                prepared
+            });
+            let mut waited = 0_u32;
+            while !TEARDOWN_SPINS_ON_S.load(Ordering::Acquire) && waited < 200_000 {
+                waited += 1;
+                std::thread::yield_now();
+            }
+            let permit = loop {
+                match barrier.try_complete() {
+                    Ok(permit) => break permit,
+                    Err(pending) => barrier = pending,
+                }
+                std::thread::yield_now();
+            };
+            drop(initiator.release(ShootdownOutcome::Completed(permit)));
+            teardown.join().expect("teardown thread")
+        });
+        assert_eq!(teardown, Ok(()), "the teardown met the shootdown in flight");
+        assert!(TEARDOWN_SPINS_ON_S.load(Ordering::Acquire));
+    }
 }

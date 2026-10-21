@@ -6563,6 +6563,34 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok(())
     }
 
+    /// Retires an exited child's empty root under the shootdown-initiator
+    /// lock S (D1 option B4, design §11.2.9). S is taken beneath P before the
+    /// teardown prepares, so the teardown waits for any family-G shootdown
+    /// in flight, whose initiator holds S until its permit, instead of
+    /// meeting `MutationInFlight`. A teardown publishes no remote request
+    /// (it requires zero residents). S is released on its permit, or unused
+    /// if it failed before its publication.
+    fn teardown_child_root_under_initiator(
+        &mut self,
+        process: ProcessKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    ) -> Result<(), super::RootBindingError> {
+        let mut paging = self.paging.lock();
+        let initiator = PRIMORDIAL_SHOOTDOWN_INITIATOR.acquire_beneath(&paging);
+        match paging.teardown_empty_child_address_space(process, address_space) {
+            Ok(permit) => {
+                let _settled = initiator.release(
+                    crate::memory::address_region::ShootdownOutcome::Completed(permit),
+                );
+                Ok(())
+            }
+            Err(error) => {
+                initiator.release_unused();
+                Err(error)
+            }
+        }
+    }
+
     fn finish_quiesced_process_root_retirement(
         &mut self,
         process: ProcessKey,
@@ -6571,9 +6599,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         drained: crate::task::BlockedOperationsDrained,
     ) -> Result<(), ()> {
         if process != self.core.primordial_process {
-            self.paging
-                .lock()
-                .teardown_empty_child_address_space(process, address_space)
+            self.teardown_child_root_under_initiator(process, address_space)
                 .map_err(|_| ())?;
         }
         let root_pin = self
@@ -7283,9 +7309,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 &proof,
             )
             .map_err(|_| 0x7000_0008_u32)?;
-            self.paging
-                .lock()
-                .teardown_empty_child_address_space(self.own.scheduled().process, address_space)
+            self.teardown_child_root_under_initiator(self.own.scheduled().process, address_space)
                 .map_err(|_| 0x7000_0009_u32)?;
         }
         if self.core.memory.active_lease_count() != 0 {

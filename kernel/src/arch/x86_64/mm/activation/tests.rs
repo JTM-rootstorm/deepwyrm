@@ -2040,8 +2040,10 @@ fn exact_roots_isolate_same_virtual_address_and_switch_a_b_a() {
     );
     assert!(a1.selects_exact(cpu, process_a, key_a));
     let pins = UserPinTracker::<1>::new();
-    bindings
-        .teardown_empty_owned(
+    // D1 option B4: the teardown hands back its barrier's permit, which
+    // releases the shootdown-initiator lock its live caller holds.
+    let permit = bindings
+        .teardown_empty_owned_settled(
             &mut roles,
             &mut empty_flat_root_target(),
             process_b,
@@ -2050,6 +2052,11 @@ fn exact_roots_isolate_same_virtual_address_and_switch_a_b_a() {
             pins.reserve_teardown(key_b).unwrap(),
         )
         .unwrap();
+    assert_eq!(
+        permit.request().mutation(),
+        crate::memory::address_region::MappingMutation::Teardown
+    );
+    assert_eq!(permit.target_count(), 0);
     assert!(matches!(
         bindings.root_for_process(&root_a, process_b),
         Err(RootBindingError::Missing)

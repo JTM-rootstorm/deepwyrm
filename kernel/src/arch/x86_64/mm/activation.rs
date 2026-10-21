@@ -2233,11 +2233,14 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.root_bindings.abandon_selection(prepared)
     }
 
+    /// Retires an exited child's empty root. Returns the teardown barrier's
+    /// permit, which releases the shootdown-initiator lock S its caller took
+    /// beneath P (D1 option B4); an error means nothing was published.
     pub(crate) fn teardown_empty_child_address_space(
         &mut self,
         process: crate::task::ProcessKey,
         address_space: crate::memory::address_region::AddressSpaceKey,
-    ) -> Result<(), RootBindingError> {
+    ) -> Result<crate::memory::address_region::ReclaimPermit, RootBindingError> {
         let reservation = self
             .user_pins
             .reserve_teardown(address_space)
@@ -2246,7 +2249,7 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .target
             .current_scratch_target()
             .map_err(|_| RootBindingError::CpuMismatch)?;
-        self.root_bindings.teardown_empty_owned(
+        self.root_bindings.teardown_empty_owned_settled(
             self.target.roles,
             &mut scratch,
             process,

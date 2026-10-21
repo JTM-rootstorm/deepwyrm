@@ -2714,3 +2714,44 @@ fn family_g_publishers_run_under_the_shootdown_initiator_lock() {
         );
     }
 }
+
+/// Text test (D1 option B4, design §11.2.9): both live root teardowns take
+/// the shootdown-initiator lock S beneath P before the teardown prepares, and
+/// release it on the teardown's permit, or unused if it failed first.
+#[test]
+fn root_teardown_runs_under_the_shootdown_initiator_lock() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    assert_eq!(
+        primordial
+            .matches(".teardown_empty_child_address_space(")
+            .count(),
+        1,
+        "only the S-holding helper tears a child root down"
+    );
+    assert_eq!(
+        primordial
+            .matches("self.teardown_child_root_under_initiator(")
+            .count(),
+        2
+    );
+    let helper = primordial
+        .split_once("    fn teardown_child_root_under_initiator(")
+        .expect("teardown helper")
+        .1
+        .split_once("\n    }\n")
+        .expect("teardown helper extent")
+        .0;
+    let order = [
+        "let mut paging = self.paging.lock();",
+        "PRIMORDIAL_SHOOTDOWN_INITIATOR.acquire_beneath(&paging);",
+        "paging.teardown_empty_child_address_space(process, address_space)",
+        "ShootdownOutcome::Completed(permit)",
+        "initiator.release_unused();",
+    ]
+    .map(|anchor| {
+        helper
+            .find(anchor)
+            .unwrap_or_else(|| panic!("teardown helper omits {anchor}"))
+    });
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]));
+}

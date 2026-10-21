@@ -1252,7 +1252,7 @@ fn g5_terminal_completion_drains_all_primordial_authority_before_capacity_proof(
         "prepare_process_root_selection(",
         "self.core.primordial_address_space",
         "self.unmap_inactive_userspace(\n                self.own.scheduled().process,\n                self.own.scheduled().root_key,\n                &proof,",
-        "teardown_empty_child_address_space(self.own.scheduled().process, address_space)",
+        "teardown_child_root_under_initiator(self.own.scheduled().process, address_space)",
         "retire_quiesced_root(",
         "release_terminal_authority()",
         "drain_finalizers()",
@@ -1269,7 +1269,7 @@ fn g5_terminal_completion_drains_all_primordial_authority_before_capacity_proof(
         .find("self.unmap_inactive_userspace(\n                self.own.scheduled().process,\n                self.own.scheduled().root_key,\n                &proof,")
         .unwrap();
     let child_root_reclaim = terminal
-        .find("teardown_empty_child_address_space(self.own.scheduled().process, address_space)")
+        .find("teardown_child_root_under_initiator(self.own.scheduled().process, address_space)")
         .unwrap();
     let portable_root_retire = terminal.find("retire_quiesced_root(").unwrap();
     assert!(child_unmap < child_root_reclaim && child_root_reclaim < portable_root_retire);
