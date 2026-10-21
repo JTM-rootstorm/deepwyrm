@@ -987,31 +987,19 @@ fn object_get_info_v1_impl<
     if let Err(error) = preflight_user_output(user, required_range, 8) {
         return usercopy_status(error);
     }
-    let table = match tasks.process_handles(current_process) {
-        Ok(table) => table,
-        Err(error) => return task_status(error),
-    };
-    let result = match (devices, interrupts) {
-        (Some(devices), Some(interrupts)) => {
-            crate::service::object_get_info_v1_with_tasks_and_device_objects(
-                table, registry, memory, tasks, devices, interrupts, handle, topic,
-            )
-        }
-        (Some(devices), None) => crate::service::object_get_info_v1_with_tasks_and_devices(
-            table, registry, memory, tasks, devices, handle, topic,
-        ),
-        (None, None) => crate::service::object_get_info_v1_with_tasks(
-            table, registry, memory, tasks, handle, topic,
-        ),
-        (None, Some(_)) => {
-            panic!("Interrupt object info cannot be wired without DeviceResource info")
-        }
-    };
-    let result = match result {
-        Ok(result) => result,
+    let encoded = match object_info_query(
+        registry,
+        memory,
+        tasks,
+        devices,
+        interrupts,
+        current_process,
+        handle,
+        topic,
+    ) {
+        Ok(encoded) => encoded,
         Err(status) => return status,
     };
-    let encoded = encode_object_info(result);
     let required = encoded.len() as u64;
     if out_size < required {
         return match copy_to_user(user, required_range, &encode_u64(required)) {
@@ -1036,6 +1024,137 @@ fn object_get_info_v1_impl<
         Ok(()) => DW_STATUS_SUCCESS,
         Err(error) => usercopy_status(error),
     }
+}
+
+/// The read-only half of `ObjectGetInfoV1` (D1 commit 6d, design §11.2.3
+/// family B): resolves the handle and encodes the topic's info, touching no
+/// user memory.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the info query keeps every authority it reads explicit"
+)]
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live runtime splits the info query")
+)]
+pub(crate) fn object_get_info_v1_query_with_device_objects<
+    const OBJECTS: usize,
+    const MEMORY_OBJECTS: usize,
+    const LEASES: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    memory: &MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    devices: &dyn crate::device::DeviceResourceInfoProvider,
+    interrupts: &dyn crate::device::InterruptInfoProvider,
+    current_process: ProcessKey,
+    handle: DwHandle,
+    topic: u32,
+) -> Result<super::abi_bytes::EncodedObjectInfo, DwStatus> {
+    object_info_query(
+        registry,
+        memory,
+        tasks,
+        Some(devices),
+        Some(interrupts),
+        current_process,
+        handle,
+        topic,
+    )
+}
+
+/// The copy-out half of `ObjectGetInfoV1` (D1 commit 6d), after the query,
+/// with the required-size output already pinned as `required`. It follows
+/// `object_get_info_v1_impl`'s order exactly:
+/// - a buffer too small writes only the required size;
+/// - otherwise the info range is formed and preflighted, the info is
+///   written, and then the required size is written.
+///
+/// It consumes `required` on every path.
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live runtime splits the info query")
+)]
+pub(crate) fn object_get_info_v1_copy_out<U: OwnedUserOutputAccess>(
+    user: &mut U,
+    required: U::OwnedOutput,
+    encoded: &super::abi_bytes::EncodedObjectInfo,
+    out_info: DwUserAddress,
+    out_size: u64,
+) -> DwStatus {
+    let required_size = encoded.len() as u64;
+    if out_size < required_size {
+        user.commit_owned_output(required, &encode_u64(required_size));
+        return DW_STATUS_BUFFER_TOO_SMALL;
+    }
+    let info_range = match user_range(out_info, encoded.len(), 8, UserAccess::WRITE) {
+        Ok(range) => range,
+        Err(status) => {
+            user.discard_owned_output(required);
+            return status;
+        }
+    };
+    let preflight = preflight_user_output(user, info_range, encoded.len()).map(drop);
+    if let Err(error) = preflight {
+        user.discard_owned_output(required);
+        return usercopy_status(error);
+    }
+    let copied = copy_to_user(user, info_range, encoded.bytes());
+    if let Err(error) = copied {
+        user.discard_owned_output(required);
+        return usercopy_status(error);
+    }
+    user.commit_owned_output(required, &encode_u64(required_size));
+    DW_STATUS_SUCCESS
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the info query keeps every authority it reads explicit"
+)]
+fn object_info_query<
+    const OBJECTS: usize,
+    const MEMORY_OBJECTS: usize,
+    const LEASES: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    memory: &MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    devices: Option<&dyn crate::device::DeviceResourceInfoProvider>,
+    interrupts: Option<&dyn crate::device::InterruptInfoProvider>,
+    current_process: ProcessKey,
+    handle: DwHandle,
+    topic: u32,
+) -> Result<super::abi_bytes::EncodedObjectInfo, DwStatus> {
+    let table = match tasks.process_handles(current_process) {
+        Ok(table) => table,
+        Err(error) => return Err(task_status(error)),
+    };
+    let result = match (devices, interrupts) {
+        (Some(devices), Some(interrupts)) => {
+            crate::service::object_get_info_v1_with_tasks_and_device_objects(
+                table, registry, memory, tasks, devices, interrupts, handle, topic,
+            )
+        }
+        (Some(devices), None) => crate::service::object_get_info_v1_with_tasks_and_devices(
+            table, registry, memory, tasks, devices, handle, topic,
+        ),
+        (None, None) => crate::service::object_get_info_v1_with_tasks(
+            table, registry, memory, tasks, handle, topic,
+        ),
+        (None, Some(_)) => {
+            panic!("Interrupt object info cannot be wired without DeviceResource info")
+        }
+    };
+    result.map(encode_object_info)
 }
 
 pub(crate) const fn object_info_required_size(topic: u32) -> Option<u64> {

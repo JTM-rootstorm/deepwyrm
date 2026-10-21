@@ -11527,3 +11527,86 @@ fn a_deferred_memory_object_create_consumes_or_returns_its_early_backing() {
         DW_STATUS_SUCCESS
     );
 }
+
+/// D1 commit 6d: `ObjectGetInfoV1` split into its read-only query and its
+/// copy-out, with the required-size output pinned first, produces exactly the
+/// combined adapter's statuses and bytes.
+#[test]
+fn a_split_object_info_query_matches_the_combined_adapter() {
+    use deepwyrm_abi::DW_OBJECT_INFO_BASIC_V1;
+
+    let memory = MemoryObjectAuthority::<1, 1>::new();
+    let required_address = DwUserAddress(BASE + 0x100);
+    let info_address = DwUserAddress(BASE + 0x200);
+    let cases = [
+        // (handle is the inspected process, out_size, deny_write_at)
+        (true, 256, None),
+        (true, 8, None),
+        (true, 256, Some(BASE + 0x200)),
+        (false, 256, None),
+    ];
+    for (valid_handle, out_size, deny_write_at) in cases {
+        let (mut registry, tasks, process, process_handle) = process_fixture();
+        let handle = if valid_handle {
+            process_handle
+        } else {
+            DwHandle(0)
+        };
+
+        let mut combined = FakeUserMemory::new();
+        combined.deny_write_at = deny_write_at;
+        let combined_status = object_get_info_v1_impl(
+            &mut combined,
+            &mut registry,
+            &memory,
+            &tasks,
+            None,
+            None,
+            process,
+            handle,
+            DW_OBJECT_INFO_BASIC_V1,
+            info_address,
+            out_size,
+            required_address,
+        );
+
+        let mut split = FakeUserMemory::new();
+        split.deny_write_at = deny_write_at;
+        let required = split
+            .preflight_owned_output(output_range(required_address, 8, 8).unwrap())
+            .unwrap();
+        let split_status = match object_info_query(
+            &mut registry,
+            &memory,
+            &tasks,
+            None,
+            None,
+            process,
+            handle,
+            DW_OBJECT_INFO_BASIC_V1,
+        ) {
+            Ok(encoded) => {
+                object_get_info_v1_copy_out(&mut split, required, &encoded, info_address, out_size)
+            }
+            Err(status) => {
+                split.discard_owned_output(required);
+                status
+            }
+        };
+        assert_eq!(split_status, combined_status);
+        assert_eq!(split.bytes, combined.bytes);
+
+        let mut tasks = tasks;
+        let mut cleanup = CleanupQueue::<16>::new();
+        assert_eq!(
+            handle_close(
+                &mut registry,
+                &mut tasks,
+                process,
+                process_handle,
+                &mut cleanup
+            ),
+            DW_STATUS_SUCCESS
+        );
+    }
+}

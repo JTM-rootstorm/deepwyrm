@@ -8,6 +8,8 @@
 pub(crate) mod native;
 
 mod abi_bytes;
+#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+pub(crate) use abi_bytes::EncodedObjectInfo;
 mod adapters;
 mod f_services;
 
@@ -105,9 +107,10 @@ pub(crate) use adapters::{
     decode_map_args, device_pio_read, device_pio_write, device_resource_claim, event_create,
     handle_close, handle_duplicate, inspect_process_termination_threads,
     inspect_task_group_termination_threads, inspect_thread_termination_threads, interrupt_create,
-    object_get_info_v1_with_device_objects, output_range, prepare_address_region_mutation,
-    prepare_process_exit, prepare_process_terminate, prepare_process_unhandled_exception,
-    prepare_task_group_terminate, prepare_thread_terminate, process_exit_on, task_group_create,
+    object_get_info_v1_copy_out, object_get_info_v1_query_with_device_objects, output_range,
+    prepare_address_region_mutation, prepare_process_exit, prepare_process_terminate,
+    prepare_process_unhandled_exception, prepare_task_group_terminate, prepare_thread_terminate,
+    process_exit_on, task_group_create,
 };
 #[cfg(all(
     not(deepwyrm_integrated),

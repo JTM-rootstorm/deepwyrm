@@ -2227,6 +2227,82 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Some(Ok(ready))
     }
 
+    /// `ObjectGetInfoV1` (design §11.2.3 family B, D1 commit 6d). It is a
+    /// read-only query whose info length is known only after the query.
+    /// 1. A first hold as for family A.
+    /// 2. With P alone, the required-size output is formed and pinned as an
+    ///    owned output, its preflight coming first as in the adapter.
+    /// 3. A second hold runs only the query.
+    /// 4. With P alone again, the adapter's copy-out sequence runs: the
+    ///    required size alone if the buffer is too small, otherwise the info
+    ///    range's preflight and copy, then the required size.
+    /// 5. A last hold commits the phase and leaves through `ready_to_return`.
+    /// Statuses and their precedence are the adapter's. No usercopy runs
+    /// under a runtime lock. `None` for every other request.
+    // Kept out of line, like the other facade helpers, so the ordinary
+    // handler's measured frame does not absorb it.
+    #[inline(never)]
+    fn handle_object_info(
+        &mut self,
+        request: NativeSyscallRequest,
+    ) -> Option<Result<crate::syscall::native::ReturnReady, ()>> {
+        let NativeSyscallRequest::ObjectGetInfoV1 {
+            handle,
+            topic,
+            out_info,
+            out_size,
+            out_required_size,
+        } = request
+        else {
+            return None;
+        };
+        let cpu = self.cpu;
+        let Ok((phase, root, process)) = self.with_synchronized_runtime_at_safe_point(|runtime| {
+            if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                runtime.service_pending_timer_expiries_on_bootstrap();
+            }
+            runtime.prepare_guard_free_usercopy()
+        }) else {
+            return Some(Err(()));
+        };
+        let required = crate::syscall::output_range(out_required_size, 8, 8).and_then(|range| {
+            let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+            let mut paging = access.lock();
+            let mut user = paging.usercopy_process_address_space(root, process);
+            user.preflight_owned_output(range)
+                .map_err(|_| deepwyrm_abi::DW_STATUS_BAD_ADDRESS)
+        });
+        let status = match required {
+            Err(status) => status,
+            Ok(required) => {
+                let queried = {
+                    let mut guard = self.runtime.lock();
+                    let mut runtime = guard.on(&mut self.owned);
+                    runtime.query_object_info(handle, topic)
+                };
+                let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+                let mut paging = access.lock();
+                let mut user = paging.usercopy_process_address_space(root, process);
+                match queried {
+                    Err(status) => {
+                        user.discard_owned_output(required)
+                            .unwrap_or_else(|_| panic!("pinned info output discard drifted"));
+                        status
+                    }
+                    Ok(encoded) => crate::syscall::object_get_info_v1_copy_out(
+                        &mut user, required, &encoded, out_info, out_size,
+                    ),
+                }
+            }
+        };
+        let mut guard = self.runtime.lock();
+        let mut runtime = guard.on(&mut self.owned);
+        runtime.commit_runtime_phase(phase);
+        Some(Ok(
+            runtime.ready_to_return(NativeSyscallResult::returning(status))
+        ))
+    }
+
     /// Runs one scheduler-current transaction under the same runtime guard as
     /// the final Stop arbitration. This closes both detached windows: a Stop
     /// published before root synchronization and one published after the CR3
@@ -8658,6 +8734,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
             let handled = match self
                 .handle_guard_free_usercopy(request)
                 .or_else(|| self.handle_deferred_output(request))
+                .or_else(|| self.handle_object_info(request))
             {
                 Some(handled) => handled,
                 None => {
@@ -10659,6 +10736,25 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         )
     }
 
+    /// The guarded half of `ObjectGetInfoV1` (D1 commit 6d): the read-only
+    /// query, touching no user memory.
+    fn query_object_info(
+        &mut self,
+        handle: deepwyrm_abi::DwHandle,
+        topic: u32,
+    ) -> Result<crate::syscall::EncodedObjectInfo, deepwyrm_abi::DwStatus> {
+        crate::syscall::object_get_info_v1_query_with_device_objects(
+            &mut self.core.registry,
+            &self.core.memory,
+            &self.core.tasks,
+            &self.core.shared.device_resources,
+            &self.core.shared.interrupts,
+            self.own.scheduled().process,
+            handle,
+            topic,
+        )
+    }
+
     /// The guarded half of a deferred `AtomicWake` (D1 commit 6b). The early
     /// atomic pin comes back for release after the hold.
     fn run_deferred_atomic_wake(
@@ -10875,7 +10971,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             | NativeSyscallRequest::DeviceResourceClaim { .. }
             | NativeSyscallRequest::DevicePioRead { .. }
             | NativeSyscallRequest::InterruptCreate { .. }
-            | NativeSyscallRequest::MemoryObjectCreate { .. } => {
+            | NativeSyscallRequest::MemoryObjectCreate { .. }
+            | NativeSyscallRequest::ObjectGetInfoV1 { .. } => {
                 unreachable!(
                     "family-B requests are served by the CPU-local facade's deferred output"
                 )
@@ -10915,35 +11012,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     crate::test_support::observe_i1_reclaim_allowed(self.cpu());
                 }
                 NativeSyscallResult::returning(status)
-            }
-            NativeSyscallRequest::ObjectGetInfoV1 {
-                handle,
-                topic,
-                out_info,
-                out_size,
-                out_required_size,
-            } => {
-                let mut paging = self.paging.lock();
-                let mut user = paging.current_process_address_space(
-                    self.own.active_root.as_ref().expect("active root"),
-                    self.own.scheduled().process,
-                );
-                NativeSyscallResult::returning(
-                    crate::syscall::object_get_info_v1_with_device_objects(
-                        &mut user,
-                        &mut self.core.registry,
-                        &self.core.memory,
-                        &self.core.tasks,
-                        &self.core.shared.device_resources,
-                        &self.core.shared.interrupts,
-                        self.own.scheduled().process,
-                        handle,
-                        topic,
-                        out_info,
-                        out_size,
-                        out_required_size,
-                    ),
-                )
             }
             NativeSyscallRequest::TaskGroupTerminate { .. } => {
                 unreachable!("TaskGroupTerminate must be intercepted by the CPU-local facade")
