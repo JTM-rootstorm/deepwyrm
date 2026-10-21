@@ -2775,15 +2775,20 @@ fn family_g_waits_for_acknowledgement_outside_the_hold() {
         .split_once("\n    }\n")
         .expect("family-G facade helper extent")
         .0;
+    // D1 commit 9: map's arguments and output pin are taken with P alone
+    // before the first hold, and its output written with P alone after the
+    // last one.
     let order = [
+        "runtime.prepare_guard_free_usercopy()",
+        "Some(map_input(&mut user, args, args_size, out_address))",
         "let mut held = crate::syscall::HeldReleases::new();",
-        "runtime.begin_address_region_mutation(request, &mut held)",
-        "FamilyGBegun::Returned(ready) => return Some(Ok(ready)),",
+        "runtime.begin_address_region_mutation(request, map_input, phase, &mut held)",
+        "FamilyGBegun::Returned(ready) => ready,",
         "user_access::await_shootdown(self.runtime.guard_free(), pending, &mut driver);",
         "initiator.release(",
         "ShootdownOutcome::Completed(permit)",
-        "let mut guard = self.runtime.lock();",
-        "runtime.finish_address_region_mutation(",
+        "runtime.finish_address_region_mutation(&mut held, settlement, phase, status)",
+        ".commit_owned_output(output, &address.to_le_bytes())",
     ]
     .map(|anchor| {
         helper
@@ -2794,6 +2799,30 @@ fn family_g_waits_for_acknowledgement_outside_the_hold() {
     assert!(primordial.contains(
         ".or_else(|| self.handle_atomic_wait(request))\n                .or_else(|| self.handle_address_region_mutation(request))"
     ));
+    assert_eq!(
+        helper
+            .matches("self.paging.guard_free_access(self.runtime.guard_free())")
+            .count(),
+        2,
+        "map's copy-in and its output write take P alone"
+    );
+    // No family-G hold reaches a usercopy session.
+    for hold in [
+        "    fn map_memory(",
+        "    fn begin_address_region_mutation(",
+    ] {
+        let body = primordial
+            .split_once(hold)
+            .unwrap_or_else(|| panic!("{hold} exists"))
+            .1
+            .split_once("\n    }\n")
+            .unwrap_or_else(|| panic!("{hold} extent"))
+            .0;
+        assert!(
+            !body.contains("current_process_address_space"),
+            "{hold} copies under T"
+        );
+    }
     assert!(
         primordial
             .contains("\"family-G requests are served by the CPU-local facade (D1 option B3)\"")

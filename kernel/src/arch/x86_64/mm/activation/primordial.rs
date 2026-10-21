@@ -1809,6 +1809,22 @@ struct FamilyGShootdown {
     initiator: ShootdownInitiatorGuard<'static>,
 }
 
+/// `AddressRegionMap`'s input, copied in and validated, and its output,
+/// pinned, with P alone before the first hold (D1 commit 9), or the status
+/// the adapter's order fails it with.
+type MapInput = Result<
+    (
+        deepwyrm_abi::DwAddressRegionMapArgsV1,
+        MemoryProtection,
+        user_access::OwnedLiveUserOutput,
+    ),
+    deepwyrm_abi::DwStatus,
+>;
+
+/// `AddressRegionMap`'s pinned output and the address to commit into it
+/// (`None` to discard it), written with P alone after the last hold.
+type MapOutput = (user_access::OwnedLiveUserOutput, Option<u64>);
+
 /// The first hold of a family-G syscall (D1 option B3).
 #[must_use = "a family-G syscall leaves through ready_to_return, now or after its acknowledgement"]
 enum FamilyGBegun {
@@ -2890,38 +2906,72 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             return None;
         }
         let cpu = self.cpu;
-        let mut held = crate::syscall::HeldReleases::new();
-        let Ok(begun) = self.with_synchronized_runtime_at_safe_point(|runtime| {
+        let Ok((phase, root, process)) = self.with_synchronized_runtime_at_safe_point(|runtime| {
             if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
                 runtime.service_pending_timer_expiries_on_bootstrap();
             }
-            runtime.begin_address_region_mutation(request, &mut held)
+            runtime.prepare_guard_free_usercopy()
         }) else {
             return Some(Err(()));
         };
-        let (phase, status, shootdown) = match begun {
-            FamilyGBegun::Returned(ready) => return Some(Ok(ready)),
+        // Map's arguments and output pin, with P alone (D1 commit 9).
+        let map_input = match request {
+            NativeSyscallRequest::AddressRegionMap {
+                args,
+                args_size,
+                out_address,
+                ..
+            } => {
+                let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+                let mut paging = access.lock();
+                let mut user = paging.usercopy_process_address_space(root, process);
+                Some(map_input(&mut user, args, args_size, out_address))
+            }
+            _ => None,
+        };
+        let mut held = crate::syscall::HeldReleases::new();
+        let (begun, map_output) = {
+            let mut guard = self.runtime.lock();
+            let mut runtime = guard.on(&mut self.owned);
+            runtime.begin_address_region_mutation(request, map_input, phase, &mut held)
+        };
+        let ready = match begun {
+            FamilyGBegun::Returned(ready) => ready,
             FamilyGBegun::Published {
                 phase,
                 status,
                 shootdown,
-            } => (phase, status, shootdown),
+            } => {
+                let FamilyGShootdown {
+                    pending,
+                    mut driver,
+                    initiator,
+                } = shootdown;
+                let permit =
+                    user_access::await_shootdown(self.runtime.guard_free(), pending, &mut driver);
+                drop(driver);
+                let settlement = initiator.release(
+                    crate::memory::address_region::ShootdownOutcome::Completed(permit),
+                );
+                let mut guard = self.runtime.lock();
+                let mut runtime = guard.on(&mut self.owned);
+                runtime.finish_address_region_mutation(&mut held, settlement, phase, status)
+            }
         };
-        let FamilyGShootdown {
-            pending,
-            mut driver,
-            initiator,
-        } = shootdown;
-        let permit = user_access::await_shootdown(self.runtime.guard_free(), pending, &mut driver);
-        drop(driver);
-        let settlement = initiator.release(
-            crate::memory::address_region::ShootdownOutcome::Completed(permit),
-        );
-        let mut guard = self.runtime.lock();
-        let mut runtime = guard.on(&mut self.owned);
-        Some(Ok(runtime.finish_address_region_mutation(
-            &mut held, settlement, phase, status,
-        )))
+        if let Some((output, address)) = map_output {
+            let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+            let mut paging = access.lock();
+            let mut user = paging.usercopy_process_address_space(root, process);
+            match address {
+                Some(address) => user
+                    .commit_owned_output(output, &address.to_le_bytes())
+                    .unwrap_or_else(|_| panic!("primordial map output pin drifted")),
+                None => user
+                    .discard_owned_output(output)
+                    .unwrap_or_else(|_| panic!("primordial map output pin drifted")),
+            }
+        }
+        Some(Ok(ready))
     }
 
     /// Applies a resumed F operation's recorded user effects with P alone,
@@ -10549,6 +10599,38 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 }
 
+/// `AddressRegionMap`'s copy-in and output pin, in the adapter's order:
+/// the arguments, their protection, then the output (D1 commit 9).
+fn map_input<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
+    user: &mut user_access::LiveProcessAddressSpace<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>,
+    args_address: deepwyrm_abi::DwUserAddress,
+    args_size: u64,
+    out_address: deepwyrm_abi::DwUserAddress,
+) -> MapInput {
+    let args = crate::syscall::decode_map_args(user, args_address, args_size)?;
+    let protection = match MemoryProtection::mapping(args.protections.0 as u8) {
+        Ok(protection) => protection,
+        Err(crate::memory::object::MemoryObjectError::UnsupportedProtection) => {
+            return Err(deepwyrm_abi::DW_STATUS_NOT_SUPPORTED);
+        }
+        Err(_) => return Err(deepwyrm_abi::DW_STATUS_INVALID_ARGUMENT),
+    };
+    let output_range = UserRange::new(
+        UserAddressSpace::x86_64_four_level(PAGE_SIZE)
+            .unwrap_or_else(|_| panic!("x86_64 userspace model unavailable")),
+        out_address.0,
+        8,
+        8,
+        UserAccess::WRITE,
+        EmptyAddressRule::Reject,
+    )
+    .map_err(|_| deepwyrm_abi::DW_STATUS_BAD_ADDRESS)?;
+    let output = user
+        .preflight_owned_output(output_range)
+        .map_err(|_| deepwyrm_abi::DW_STATUS_BAD_ADDRESS)?;
+    Ok((args, protection, output))
+}
+
 const fn invalid_user_return_detail(error: crate::arch::x86_64::syscall::UserReturnError) -> u32 {
     use crate::arch::x86_64::syscall::UserReturnError;
     match error {
@@ -12021,9 +12103,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
-    /// The first hold of a family-G syscall (D1 option B3, design §11.2.9):
-    /// the phase reservation and the running-Thread check of `handle`, then
-    /// map, unmap or protect. A mutation whose shootdown is settled in this
+    /// The first hold of a family-G syscall (D1 option B3, design §11.2.9),
+    /// after the facade's preparation hold reserved the phase and, for map,
+    /// copied the arguments in and pinned the output with P alone (D1 commit
+    /// 9): map, unmap or protect. A mutation whose shootdown is settled in this
     /// hold (nothing published, or no target left to acknowledge) has its
     /// releases merged, commits the phase and leaves through
     /// `ready_to_return`. A published one hands its pending shootdown, the
@@ -12032,38 +12115,47 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     fn begin_address_region_mutation(
         &mut self,
         request: NativeSyscallRequest,
+        map_input: Option<MapInput>,
+        phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
         held: &mut crate::syscall::HeldReleases<REGISTRY_OBJECTS>,
-    ) -> FamilyGBegun {
-        let (phase, _, _) = self.prepare_guard_free_usercopy();
-        let (status, shootdown) = match request {
-            NativeSyscallRequest::AddressRegionMap {
-                address_region,
-                memory_object,
-                args,
-                args_size,
-                out_address,
-            } => self.map_memory(
-                address_region,
-                memory_object,
-                args,
-                args_size,
-                out_address,
-                held,
-            ),
-            NativeSyscallRequest::AddressRegionUnmap {
-                address_region,
-                address,
-                byte_len,
-            } => self.unmap_memory(address_region, address, byte_len, held),
-            NativeSyscallRequest::AddressRegionProtect {
-                address_region,
-                address,
-                byte_len,
-                protections,
-            } => self.protect_memory(address_region, address, byte_len, protections, held),
+    ) -> (FamilyGBegun, Option<MapOutput>) {
+        let (status, shootdown, map_output) = match (request, map_input) {
+            (
+                NativeSyscallRequest::AddressRegionMap {
+                    address_region,
+                    memory_object,
+                    ..
+                },
+                Some(input),
+            ) => self.map_memory(address_region, memory_object, input, held),
+            (
+                NativeSyscallRequest::AddressRegionUnmap {
+                    address_region,
+                    address,
+                    byte_len,
+                },
+                None,
+            ) => {
+                let (status, shootdown) =
+                    self.unmap_memory(address_region, address, byte_len, held);
+                (status, shootdown, None)
+            }
+            (
+                NativeSyscallRequest::AddressRegionProtect {
+                    address_region,
+                    address,
+                    byte_len,
+                    protections,
+                },
+                None,
+            ) => {
+                let (status, shootdown) =
+                    self.protect_memory(address_region, address, byte_len, protections, held);
+                (status, shootdown, None)
+            }
             _ => unreachable!("family-G classification drifted"),
         };
-        match shootdown {
+        let begun = match shootdown {
             None => {
                 self.commit_runtime_phase(phase);
                 FamilyGBegun::Returned(self.ready_to_return(NativeSyscallResult::returning(status)))
@@ -12073,7 +12165,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 status,
                 shootdown,
             },
-        }
+        };
+        (begun, map_output)
     }
 
     /// The last hold of a published family-G syscall (D1 option B3): its
@@ -12117,28 +12210,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
-    /// Commits or discards `AddressRegionMap`'s pinned output on the caller's
-    /// usercopy session (commit 9 moves this out of the hold).
-    fn settle_map_output(
-        &mut self,
-        output: user_access::OwnedLiveUserOutput,
-        address: Option<u64>,
-    ) {
-        let mut paging = self.paging.lock();
-        let mut user = paging.current_process_address_space(
-            self.own.active_root.as_ref().expect("active root"),
-            self.own.scheduled().process,
-        );
-        match address {
-            Some(address) => user
-                .commit_owned_output(output, &address.to_le_bytes())
-                .unwrap_or_else(|_| panic!("primordial map output pin drifted")),
-            None => user
-                .discard_owned_output(output)
-                .unwrap_or_else(|_| panic!("primordial map output pin drifted")),
-        }
-    }
-
     // Out of line (D1 option B2): its held releases stay out of the
     // ordinary handler's measured frame.
     #[inline(never)]
@@ -12146,51 +12217,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
         address_region: deepwyrm_abi::DwHandle,
         memory_object: deepwyrm_abi::DwHandle,
-        args_address: deepwyrm_abi::DwUserAddress,
-        args_size: u64,
-        out_address: deepwyrm_abi::DwUserAddress,
+        input: MapInput,
         held: &mut crate::syscall::HeldReleases<REGISTRY_OBJECTS>,
-    ) -> (deepwyrm_abi::DwStatus, Option<FamilyGShootdown>) {
+    ) -> (
+        deepwyrm_abi::DwStatus,
+        Option<FamilyGShootdown>,
+        Option<MapOutput>,
+    ) {
+        let (args, protection, output) = match input {
+            Ok(input) => input,
+            Err(status) => return (status, None, None),
+        };
         let mut shootdown = None;
-        let status = (|| {
-            // The arguments and the output pin, on the caller's usercopy
-            // session (commit 9 moves them out of the hold).
-            let (args, protection, output) = {
-                let mut paging = self.paging.lock();
-                let mut user = paging.current_process_address_space(
-                    self.own.active_root.as_ref().expect("active root"),
-                    self.own.scheduled().process,
-                );
-                let args = match crate::syscall::decode_map_args(&mut user, args_address, args_size)
-                {
-                    Ok(args) => args,
-                    Err(status) => return status,
-                };
-                let protection = match MemoryProtection::mapping(args.protections.0 as u8) {
-                    Ok(protection) => protection,
-                    Err(crate::memory::object::MemoryObjectError::UnsupportedProtection) => {
-                        return deepwyrm_abi::DW_STATUS_NOT_SUPPORTED;
-                    }
-                    Err(_) => return deepwyrm_abi::DW_STATUS_INVALID_ARGUMENT,
-                };
-                let output_range = match UserRange::new(
-                    UserAddressSpace::x86_64_four_level(PAGE_SIZE)
-                        .unwrap_or_else(|_| panic!("x86_64 userspace model unavailable")),
-                    out_address.0,
-                    8,
-                    8,
-                    UserAccess::WRITE,
-                    EmptyAddressRule::Reject,
-                ) {
-                    Ok(range) => range,
-                    Err(_) => return deepwyrm_abi::DW_STATUS_BAD_ADDRESS,
-                };
-                let output = match user.preflight_owned_output(output_range) {
-                    Ok(output) => output,
-                    Err(_) => return deepwyrm_abi::DW_STATUS_BAD_ADDRESS,
-                };
-                (args, protection, output)
-            };
+        let result = (|| {
             let prepared = match crate::syscall::prepare_address_region_mutation(
                 &mut self.core.registry,
                 &self.core.tasks,
@@ -12203,10 +12242,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 &mut self.core.cleanup,
             ) {
                 Ok(target) => target,
-                Err(status) => {
-                    self.settle_map_output(output, None);
-                    return status;
-                }
+                Err(status) => return Err(status),
             };
             let target = prepared.target();
             let caller_process = self.own.scheduled().process;
@@ -12319,18 +12355,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     result
                 }
             };
-            match result {
-                Ok(address) => {
-                    self.settle_map_output(output, Some(address));
-                    DW_STATUS_SUCCESS
-                }
-                Err(status) => {
-                    self.settle_map_output(output, None);
-                    status
-                }
-            }
+            result
         })();
-        (status, shootdown)
+        match result {
+            Ok(address) => (DW_STATUS_SUCCESS, shootdown, Some((output, Some(address)))),
+            Err(status) => (status, shootdown, Some((output, None))),
+        }
     }
 
     // Out of line (D1 option B2): its held releases stay out of the
