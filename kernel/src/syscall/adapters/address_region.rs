@@ -5,6 +5,81 @@
 
 use super::*;
 
+/// Every final release of one family-G transaction, held back from the
+/// shared cleanup queue until that transaction's shootdown is settled (D1
+/// option B2, design §11.2.9 item 4).
+///
+/// The adapters push into it, never into the shared queue: the mapping
+/// releases of the mutation, and the lookup-pin releases of its handles. A
+/// lookup pin can be the last reference to its AddressRegion or MemoryObject,
+/// whose finalizer reclaims mappings, tables or backing. Any CPU that takes
+/// the runtime authority drains the shared queue, so once B3 releases it
+/// before the acknowledgement, a release pushed there could be reclaimed
+/// first. `merge` moves the held releases only on a `ShootdownOutcome`: the
+/// reclaim permit of the published shootdown, or the publisher's proof that
+/// it published none. So acknowledgement precedes reclamation (H0 §12.6) is a
+/// type fact for every family-G release. Dropping unmerged releases panics.
+#[must_use = "held family-G releases reach the cleanup queue only on their shootdown's settlement"]
+pub(crate) struct HeldReleases<const OBJECTS: usize> {
+    queue: CleanupQueue<OBJECTS>,
+}
+
+impl<const OBJECTS: usize> HeldReleases<OBJECTS> {
+    pub(crate) fn new() -> Self {
+        Self {
+            queue: CleanupQueue::new(),
+        }
+    }
+
+    fn queue(&mut self) -> &mut CleanupQueue<OBJECTS> {
+        &mut self.queue
+    }
+
+    /// Moves every held release into `cleanup` on the settlement of the
+    /// transaction's shootdown, which this consumes.
+    pub(crate) fn merge<const OTHER: usize>(
+        &mut self,
+        _settlement: crate::memory::address_region::ShootdownOutcome,
+        cleanup: &mut CleanupQueue<OTHER>,
+    ) {
+        self.queue.drain_into(cleanup);
+    }
+
+    #[cfg(test)]
+    pub(super) fn hold_for_test(&mut self, release: FinalRelease) {
+        self.queue.push(release);
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    /// Host adapters drive non-coherent publishers, which publish no
+    /// shootdown and so settle none.
+    #[cfg(test)]
+    pub(crate) fn merge_without_shootdown<const OTHER: usize>(
+        &mut self,
+        cleanup: &mut CleanupQueue<OTHER>,
+    ) {
+        self.queue.drain_into(cleanup);
+    }
+}
+
+impl<const OBJECTS: usize> Drop for HeldReleases<OBJECTS> {
+    fn drop(&mut self) {
+        if !self.queue.is_empty() {
+            // The releases are leaked, not dropped: each would fail stop on
+            // its own and turn this report into a double panic.
+            let _leaked = core::mem::ManuallyDrop::new(core::mem::replace(
+                &mut self.queue,
+                CleanupQueue::new(),
+            ));
+            panic!("family-G releases were dropped before their shootdown settled");
+        }
+    }
+}
+
 fn queue_mapping_releases<const OBJECTS: usize>(
     cleanup: &mut CleanupQueue<OBJECTS>,
     releases: crate::memory::object::MappingFinalReleases<OBJECTS>,
@@ -452,7 +527,7 @@ pub(crate) fn address_region_map<
     args_address: DwUserAddress,
     args_size: u64,
     out_address: DwUserAddress,
-    cleanup: &mut CleanupQueue<OBJECTS>,
+    held: &mut HeldReleases<OBJECTS>,
 ) -> DwStatus
 where
     P::Error: AddressSpacePublishStatus,
@@ -485,7 +560,7 @@ where
         memory_object,
         args,
         protection,
-        cleanup,
+        held,
     )
 }
 
@@ -516,7 +591,7 @@ fn address_region_map_preflighted<
     memory_object: DwHandle,
     args: deepwyrm_abi::DwAddressRegionMapArgsV1,
     protection: crate::memory::address_region::Protection,
-    cleanup: &mut CleanupQueue<OBJECTS>,
+    held: &mut HeldReleases<OBJECTS>,
 ) -> DwStatus
 where
     P::Error: AddressSpacePublishStatus,
@@ -532,7 +607,7 @@ where
         memory_object,
         args,
         protection,
-        cleanup,
+        held,
     ) {
         Ok(address) => {
             output.commit(&encode_u64(address));
@@ -568,11 +643,12 @@ pub(crate) fn address_region_map_model<
     memory_object: DwHandle,
     args: deepwyrm_abi::DwAddressRegionMapArgsV1,
     protection: crate::memory::address_region::Protection,
-    cleanup: &mut CleanupQueue<OBJECTS>,
+    held: &mut HeldReleases<OBJECTS>,
 ) -> Result<u64, DwStatus>
 where
     P::Error: AddressSpacePublishStatus,
 {
+    let cleanup = held.queue();
     let region_resolved = resolve_current(
         tasks,
         registry,
@@ -742,7 +818,7 @@ pub(crate) fn address_region_map_prepared_model<
     memory_object: DwHandle,
     args: deepwyrm_abi::DwAddressRegionMapArgsV1,
     protection: crate::memory::address_region::Protection,
-    cleanup: &mut CleanupQueue<OBJECTS>,
+    held: &mut HeldReleases<OBJECTS>,
 ) -> Result<u64, DwStatus>
 where
     P::Error: AddressSpacePublishStatus,
@@ -759,7 +835,7 @@ where
         memory_object,
         args,
         protection,
-        cleanup,
+        held,
     )
 }
 
@@ -787,11 +863,12 @@ pub(crate) fn address_region_unmap<
     address_region: DwHandle,
     address: DwUserAddress,
     byte_len: u64,
-    cleanup: &mut CleanupQueue<OBJECTS>,
+    held: &mut HeldReleases<OBJECTS>,
 ) -> DwStatus
 where
     P::Error: AddressSpacePublishStatus,
 {
+    let cleanup = held.queue();
     let resolved = match resolve_current(
         tasks,
         registry,
@@ -873,7 +950,7 @@ pub(crate) fn address_region_unmap_prepared<
     address_region: DwHandle,
     address: DwUserAddress,
     byte_len: u64,
-    cleanup: &mut CleanupQueue<OBJECTS>,
+    held: &mut HeldReleases<OBJECTS>,
 ) -> DwStatus
 where
     P::Error: AddressSpacePublishStatus,
@@ -891,7 +968,7 @@ where
         address_region,
         address,
         byte_len,
-        cleanup,
+        held,
     )
 }
 pub(crate) fn address_region_protect<
@@ -919,11 +996,12 @@ pub(crate) fn address_region_protect<
     address: DwUserAddress,
     byte_len: u64,
     protections: u32,
-    cleanup: &mut CleanupQueue<OBJECTS>,
+    held: &mut HeldReleases<OBJECTS>,
 ) -> DwStatus
 where
     P::Error: AddressSpacePublishStatus,
 {
+    let cleanup = held.queue();
     if protections & !deepwyrm_abi::DW_MEMORY_PROTECTION_SUPPORTED_MASK.0 != 0 {
         return DW_STATUS_INVALID_ARGUMENT;
     }
@@ -1016,7 +1094,7 @@ pub(crate) fn address_region_protect_prepared<
     address: DwUserAddress,
     byte_len: u64,
     protections: u32,
-    cleanup: &mut CleanupQueue<OBJECTS>,
+    held: &mut HeldReleases<OBJECTS>,
 ) -> DwStatus
 where
     P::Error: AddressSpacePublishStatus,
@@ -1035,6 +1113,6 @@ where
         address,
         byte_len,
         protections,
-        cleanup,
+        held,
     )
 }

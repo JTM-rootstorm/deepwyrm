@@ -93,11 +93,11 @@ use address_region::address_transaction_status;
     reason = "preserve the established crate-private adapter facade across the private module extraction"
 )]
 pub(crate) use address_region::{
-    AddressRegionMutationTarget, AddressSpacePublishStatus, PreparedAddressRegionMutation,
-    address_region_map, address_region_map_model, address_region_map_prepared_model,
-    address_region_mutation_target, address_region_protect, address_region_protect_prepared,
-    address_region_unmap, address_region_unmap_prepared, decode_map_args,
-    prepare_address_region_mutation, process_handle_target,
+    AddressRegionMutationTarget, AddressSpacePublishStatus, HeldReleases,
+    PreparedAddressRegionMutation, address_region_map, address_region_map_model,
+    address_region_map_prepared_model, address_region_mutation_target, address_region_protect,
+    address_region_protect_prepared, address_region_unmap, address_region_unmap_prepared,
+    decode_map_args, prepare_address_region_mutation, process_handle_target,
 };
 
 /// Runs one bounded HandleTable mutation while retaining the exact process

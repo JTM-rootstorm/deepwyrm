@@ -2693,11 +2693,16 @@ fn family_g_publishers_run_under_the_shootdown_initiator_lock() {
             .split_once("\n    }\n")
             .unwrap_or_else(|| panic!("{name} extent"))
             .0;
+        // D1 option B2: the adapter's releases go into the held set, which
+        // merges into the shared queue only on S's released settlement.
         let order = [
             "PRIMORDIAL_SHOOTDOWN_INITIATOR.acquire_beneath(",
             "CoherentAddressSpacePublisher::<",
+            "let mut held = crate::syscall::HeldReleases::new();",
             adapter,
-            "initiator.release(publisher.finish())",
+            "&mut held,",
+            "let settled = initiator.release(publisher.finish());",
+            "held.merge(settled, &mut self.core.cleanup);",
         ]
         .map(|anchor| {
             body.find(anchor)

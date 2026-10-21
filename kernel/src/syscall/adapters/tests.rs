@@ -2276,21 +2276,26 @@ fn address_region_map_preflights_copyout_and_preserves_mapping_leases() {
 
     user.deny_write = true;
     assert_eq!(
-        address_region_map(
-            &mut user,
-            &mut publisher,
-            &mut registry,
-            &mut memory,
-            &mut tasks,
-            &mut regions,
-            process,
-            region_handle,
-            memory_handle,
-            DwUserAddress(BASE + 0x200),
-            u64::from(deepwyrm_abi::DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE),
-            DwUserAddress(BASE + 0x300),
-            &mut cleanup,
-        ),
+        {
+            let mut held = HeldReleases::new();
+            let result = address_region_map(
+                &mut user,
+                &mut publisher,
+                &mut registry,
+                &mut memory,
+                &mut tasks,
+                &mut regions,
+                process,
+                region_handle,
+                memory_handle,
+                DwUserAddress(BASE + 0x200),
+                u64::from(deepwyrm_abi::DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE),
+                DwUserAddress(BASE + 0x300),
+                &mut held,
+            );
+            held.merge_without_shootdown(&mut cleanup);
+            result
+        },
         DW_STATUS_BAD_ADDRESS
     );
     assert_eq!(publisher.replacements, 0);
@@ -2304,21 +2309,26 @@ fn address_region_map_preflights_copyout_and_preserves_mapping_leases() {
     );
     user.deny_write = false;
     assert_eq!(
-        address_region_map(
-            &mut user,
-            &mut publisher,
-            &mut registry,
-            &mut memory,
-            &mut tasks,
-            &mut regions,
-            process,
-            region_handle,
-            memory_handle,
-            DwUserAddress(BASE + 0x200),
-            u64::from(deepwyrm_abi::DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE),
-            DwUserAddress(BASE + 0x300),
-            &mut cleanup,
-        ),
+        {
+            let mut held = HeldReleases::new();
+            let result = address_region_map(
+                &mut user,
+                &mut publisher,
+                &mut registry,
+                &mut memory,
+                &mut tasks,
+                &mut regions,
+                process,
+                region_handle,
+                memory_handle,
+                DwUserAddress(BASE + 0x200),
+                u64::from(deepwyrm_abi::DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE),
+                DwUserAddress(BASE + 0x300),
+                &mut held,
+            );
+            held.merge_without_shootdown(&mut cleanup);
+            result
+        },
         DW_STATUS_SUCCESS
     );
     let mapped = u64_at(&user, BASE + 0x300);
@@ -2336,35 +2346,45 @@ fn address_region_map_preflights_copyout_and_preserves_mapping_leases() {
     );
 
     assert_eq!(
-        address_region_protect(
-            &mut publisher,
-            &mut registry,
-            &mut memory,
-            &mut tasks,
-            &mut regions,
-            process,
-            region_handle,
-            DwUserAddress(mapped),
-            4096,
-            DW_MEMORY_PROTECTION_READ.0,
-            &mut cleanup,
-        ),
+        {
+            let mut held = HeldReleases::new();
+            let result = address_region_protect(
+                &mut publisher,
+                &mut registry,
+                &mut memory,
+                &mut tasks,
+                &mut regions,
+                process,
+                region_handle,
+                DwUserAddress(mapped),
+                4096,
+                DW_MEMORY_PROTECTION_READ.0,
+                &mut held,
+            );
+            held.merge_without_shootdown(&mut cleanup);
+            result
+        },
         DW_STATUS_SUCCESS
     );
     assert_eq!(publisher.replacements, 2);
     assert_eq!(
-        address_region_unmap(
-            &mut publisher,
-            &mut registry,
-            &mut memory,
-            &mut tasks,
-            &mut regions,
-            process,
-            region_handle,
-            DwUserAddress(mapped),
-            4096,
-            &mut cleanup,
-        ),
+        {
+            let mut held = HeldReleases::new();
+            let result = address_region_unmap(
+                &mut publisher,
+                &mut registry,
+                &mut memory,
+                &mut tasks,
+                &mut regions,
+                process,
+                region_handle,
+                DwUserAddress(mapped),
+                4096,
+                &mut held,
+            );
+            held.merge_without_shootdown(&mut cleanup);
+            result
+        },
         DW_STATUS_SUCCESS
     );
     assert_eq!(publisher.replacements, 3);
@@ -2518,40 +2538,50 @@ fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
     prepared.abort();
 
     assert_eq!(
-        address_region_map(
-            &mut user,
-            &mut publisher,
-            &mut registry,
-            &mut memory,
-            &mut tasks,
-            &mut regions,
-            caller,
-            child_region_handle,
-            memory_handle,
-            DwUserAddress(BASE + 0x200),
-            u64::from(deepwyrm_abi::DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE),
-            DwUserAddress(BASE + 0x300),
-            &mut cleanup,
-        ),
+        {
+            let mut held = HeldReleases::new();
+            let result = address_region_map(
+                &mut user,
+                &mut publisher,
+                &mut registry,
+                &mut memory,
+                &mut tasks,
+                &mut regions,
+                caller,
+                child_region_handle,
+                memory_handle,
+                DwUserAddress(BASE + 0x200),
+                u64::from(deepwyrm_abi::DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE),
+                DwUserAddress(BASE + 0x300),
+                &mut held,
+            );
+            held.merge_without_shootdown(&mut cleanup);
+            result
+        },
         DW_STATUS_SUCCESS
     );
     let mapped = u64_at(&user, BASE + 0x300);
     assert_eq!(publisher.replacements, 1);
     assert_eq!(regions.region_process(child_region).unwrap(), child);
     assert_eq!(
-        address_region_protect(
-            &mut publisher,
-            &mut registry,
-            &mut memory,
-            &mut tasks,
-            &mut regions,
-            caller,
-            child_region_handle,
-            DwUserAddress(mapped),
-            4096,
-            DW_MEMORY_PROTECTION_READ.0,
-            &mut cleanup,
-        ),
+        {
+            let mut held = HeldReleases::new();
+            let result = address_region_protect(
+                &mut publisher,
+                &mut registry,
+                &mut memory,
+                &mut tasks,
+                &mut regions,
+                caller,
+                child_region_handle,
+                DwUserAddress(mapped),
+                4096,
+                DW_MEMORY_PROTECTION_READ.0,
+                &mut held,
+            );
+            held.merge_without_shootdown(&mut cleanup);
+            result
+        },
         DW_STATUS_SUCCESS
     );
     assert_eq!(publisher.replacements, 2);
@@ -2565,19 +2595,24 @@ fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
         Err(crate::task::TaskError::OperationsInFlight)
     ));
     assert_eq!(
-        address_region_protect(
-            &mut publisher,
-            &mut registry,
-            &mut memory,
-            &mut tasks,
-            &mut regions,
-            caller,
-            child_region_handle,
-            DwUserAddress(mapped),
-            4096,
-            DW_MEMORY_PROTECTION_READ.0,
-            &mut cleanup,
-        ),
+        {
+            let mut held = HeldReleases::new();
+            let result = address_region_protect(
+                &mut publisher,
+                &mut registry,
+                &mut memory,
+                &mut tasks,
+                &mut regions,
+                caller,
+                child_region_handle,
+                DwUserAddress(mapped),
+                4096,
+                DW_MEMORY_PROTECTION_READ.0,
+                &mut held,
+            );
+            held.merge_without_shootdown(&mut cleanup);
+            result
+        },
         DW_STATUS_BAD_STATE
     );
     assert_eq!(publisher.replacements, 2);
@@ -2596,19 +2631,24 @@ fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
     // The terminal target remains unavailable even after the last old
     // operation drains.
     assert_eq!(
-        address_region_protect(
-            &mut publisher,
-            &mut registry,
-            &mut memory,
-            &mut tasks,
-            &mut regions,
-            caller,
-            child_region_handle,
-            DwUserAddress(mapped),
-            4096,
-            DW_MEMORY_PROTECTION_READ.0,
-            &mut cleanup,
-        ),
+        {
+            let mut held = HeldReleases::new();
+            let result = address_region_protect(
+                &mut publisher,
+                &mut registry,
+                &mut memory,
+                &mut tasks,
+                &mut regions,
+                caller,
+                child_region_handle,
+                DwUserAddress(mapped),
+                4096,
+                DW_MEMORY_PROTECTION_READ.0,
+                &mut held,
+            );
+            held.merge_without_shootdown(&mut cleanup);
+            result
+        },
         DW_STATUS_BAD_STATE
     );
     assert_eq!(publisher.replacements, 2);
@@ -2635,6 +2675,207 @@ fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
         }
     }
     assert_eq!(tasks.process_handle_count(caller).unwrap(), 0);
+}
+
+/// D1 option B2 (design §11.2.9 item 4): a family-G adapter pushes its
+/// releases into the transaction's `HeldReleases`, never into the shared
+/// cleanup queue. An unmap of the last mapping of a closed MemoryObject
+/// yields that object's final release, which reaches the shared queue only
+/// when the held set is merged. Dropping an unmerged set panics.
+#[test]
+fn a_family_g_unmap_holds_its_final_release_until_merged() {
+    use deepwyrm_abi::{
+        DW_MEMORY_PROTECTION_READ, DW_MEMORY_PROTECTION_WRITE, DW_RIGHT_MAP, DW_RIGHT_READ,
+        DW_RIGHT_WRITE,
+    };
+
+    let (
+        mut registry,
+        mut tasks,
+        process,
+        process_handle,
+        _spaces,
+        mut regions,
+        region_key,
+        region_handle,
+    ) = region_fixture();
+    let mut user = FakeUserMemory::new();
+    let mut backing = TestBacking::new();
+    let mut memory = MemoryObjectAuthority::<4, 8>::new();
+    let mut cleanup = CleanupQueue::<24>::new();
+    assert_eq!(
+        memory_object_create(
+            &mut user,
+            &mut backing,
+            &mut registry,
+            &mut memory,
+            &mut tasks,
+            process,
+            4096,
+            0,
+            DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MAP.0),
+            DwUserAddress(BASE + 0x100),
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let memory_handle = DwHandle(u64_at(&user, BASE + 0x100));
+    write_map_args(
+        &mut user,
+        BASE + 0x200,
+        DW_MEMORY_PROTECTION_READ.0 | DW_MEMORY_PROTECTION_WRITE.0,
+    );
+    let region_model = regions.region(region_key).unwrap();
+    let mut publisher = FakePublisher {
+        address_space: region_model.address_space_key(),
+        region: region_model.region_key(),
+        replacements: 0,
+    };
+    let mut held = HeldReleases::new();
+    assert_eq!(
+        address_region_map(
+            &mut user,
+            &mut publisher,
+            &mut registry,
+            &mut memory,
+            &mut tasks,
+            &mut regions,
+            process,
+            region_handle,
+            memory_handle,
+            DwUserAddress(BASE + 0x200),
+            u64::from(deepwyrm_abi::DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE),
+            DwUserAddress(BASE + 0x300),
+            &mut held,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    held.merge_without_shootdown(&mut cleanup);
+    let mapped = u64_at(&user, BASE + 0x300);
+    // The mapping now holds the MemoryObject's last reference.
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            memory_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert!(cleanup.is_empty());
+
+    // The unmap runs through a coherent publisher, as the live one does, with
+    // no CPU resident, so its shootdown completes at once.
+    struct NoRemoteTargets;
+    impl crate::memory::address_region::ShootdownDriver<4> for NoRemoteTargets {
+        fn initiating_cpu(&self) -> crate::cpu::CpuIndex {
+            crate::cpu::CpuIndex::BOOTSTRAP
+        }
+
+        fn notify_remote(
+            &mut self,
+            _coherency: &crate::memory::address_region::AddressSpaceCoherency<4>,
+            _target: crate::cpu::CpuIndex,
+            _request: crate::memory::address_region::ShootdownRequest,
+        ) {
+            unreachable!("no CPU is resident")
+        }
+
+        fn wait_step(
+            &mut self,
+            _coherency: &crate::memory::address_region::AddressSpaceCoherency<4>,
+        ) {
+            unreachable!("a shootdown with no targets completes at once")
+        }
+    }
+    let coherency = crate::memory::address_region::AddressSpaceCoherency::<4>::new(
+        regions.region(region_key).unwrap().address_space_key(),
+    );
+    let mut driver = NoRemoteTargets;
+    let mut coherent =
+        crate::memory::address_region::CoherentAddressSpacePublisher::<_, _, 4, 1>::new(
+            &mut publisher,
+            &coherency,
+            &mut driver,
+        );
+    assert_eq!(
+        address_region_unmap(
+            &mut coherent,
+            &mut registry,
+            &mut memory,
+            &mut tasks,
+            &mut regions,
+            process,
+            region_handle,
+            DwUserAddress(mapped),
+            4096,
+            &mut held,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert!(
+        cleanup.is_empty(),
+        "a family-G adapter pushed a release past its held set"
+    );
+    assert!(!held.is_empty());
+    let settlement = coherent.finish();
+    assert!(matches!(
+        settlement,
+        crate::memory::address_region::ShootdownOutcome::Completed(_)
+    ));
+    held.merge(settlement, &mut cleanup);
+    assert!(held.is_empty());
+    let release = cleanup.pop().expect("the merged final release");
+    assert_eq!(
+        release.object_type(),
+        deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT
+    );
+    assert!(cleanup.is_empty());
+    let finalization = memory.take_finalization(release).unwrap();
+    crate::memory::object::complete_memory_finalization(
+        &mut registry,
+        &mut backing.roles,
+        finalization,
+    );
+
+    // An unmerged held set fails stop. A fresh MemoryObject whose only
+    // handle is closed supplies a final release to hold.
+    assert_eq!(
+        memory_object_create(
+            &mut user,
+            &mut backing,
+            &mut registry,
+            &mut memory,
+            &mut tasks,
+            process,
+            4096,
+            0,
+            DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MAP.0),
+            DwUserAddress(BASE + 0x100),
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    let doomed = DwHandle(u64_at(&user, BASE + 0x100));
+    assert_eq!(
+        handle_close(&mut registry, &mut tasks, process, doomed, &mut cleanup),
+        DW_STATUS_SUCCESS
+    );
+    let mut unmerged = HeldReleases::<24>::new();
+    unmerged.hold_for_test(
+        cleanup
+            .pop()
+            .expect("the closed MemoryObject's final release"),
+    );
+    let _ = (region_handle, process_handle);
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(unmerged)));
+    let message = dropped.expect_err("unmerged releases must panic");
+    assert_eq!(
+        message.downcast_ref::<&str>().copied(),
+        Some("family-G releases were dropped before their shootdown settled")
+    );
+    core::mem::forget(tasks);
 }
 
 fn test_stack_bounds<const N: usize>() -> [crate::memory::kernel_stack::KernelStackBounds; N] {
@@ -3536,21 +3777,26 @@ fn final_external_thread_exit_preserves_process_identity_for_mapped_root_recycli
         replacements: 0,
     };
     assert_eq!(
-        address_region_map(
-            &mut user,
-            &mut publisher,
-            &mut registry,
-            &mut memory,
-            &mut tasks,
-            &mut regions,
-            target_process,
-            target_root_handle,
-            memory_handle,
-            DwUserAddress(BASE + 0x200),
-            u64::from(deepwyrm_abi::DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE),
-            DwUserAddress(BASE + 0x300),
-            &mut cleanup,
-        ),
+        {
+            let mut held = HeldReleases::new();
+            let result = address_region_map(
+                &mut user,
+                &mut publisher,
+                &mut registry,
+                &mut memory,
+                &mut tasks,
+                &mut regions,
+                target_process,
+                target_root_handle,
+                memory_handle,
+                DwUserAddress(BASE + 0x200),
+                u64::from(deepwyrm_abi::DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE),
+                DwUserAddress(BASE + 0x300),
+                &mut held,
+            );
+            held.merge_without_shootdown(&mut cleanup);
+            result
+        },
         DW_STATUS_SUCCESS
     );
     let mapped = u64_at(&user, BASE + 0x300);

@@ -11935,6 +11935,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
+    // Out of line (D1 option B2): its held releases stay out of the
+    // ordinary handler's measured frame.
+    #[inline(never)]
     fn map_memory(
         &mut self,
         address_region: deepwyrm_abi::DwHandle,
@@ -12054,6 +12057,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         { crate::cpu::CPU_CAPACITY },
                         1_000_000,
                     >::new(&mut publisher, coherency, &mut shootdown);
+                let mut held = crate::syscall::HeldReleases::new();
                 let result = crate::syscall::address_region_map_prepared_model(
                     prepared,
                     &mut publisher,
@@ -12066,9 +12070,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     memory_object,
                     args,
                     protection,
-                    &mut self.core.cleanup,
+                    &mut held,
                 );
-                let _settled = initiator.release(publisher.finish());
+                let settled = initiator.release(publisher.finish());
+                held.merge(settled, &mut self.core.cleanup);
                 result
             })();
             for candidate in candidates.into_iter().flatten() {
@@ -12095,6 +12100,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         status
     }
 
+    // Out of line (D1 option B2): its held releases stay out of the
+    // ordinary handler's measured frame.
+    #[inline(never)]
     fn unmap_memory(
         &mut self,
         address_region: deepwyrm_abi::DwHandle,
@@ -12147,6 +12155,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         { crate::cpu::CPU_CAPACITY },
                         1_000_000,
                     >::new(&mut publisher, coherency, &mut shootdown);
+                let mut held = crate::syscall::HeldReleases::new();
                 let status = crate::syscall::address_region_unmap_prepared(
                     prepared,
                     &mut publisher,
@@ -12158,9 +12167,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     address_region,
                     address,
                     byte_len,
-                    &mut self.core.cleanup,
+                    &mut held,
                 );
-                let _settled = initiator.release(publisher.finish());
+                let settled = initiator.release(publisher.finish());
+                held.merge(settled, &mut self.core.cleanup);
                 status
             };
             for candidate in candidates.into_iter().flatten() {
@@ -12176,6 +12186,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         status
     }
 
+    // Out of line (D1 option B2): its held releases stay out of the
+    // ordinary handler's measured frame.
+    #[inline(never)]
     fn protect_memory(
         &mut self,
         address_region: deepwyrm_abi::DwHandle,
@@ -12229,6 +12242,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         { crate::cpu::CPU_CAPACITY },
                         1_000_000,
                     >::new(&mut publisher, coherency, &mut shootdown);
+                let mut held = crate::syscall::HeldReleases::new();
                 let status = crate::syscall::address_region_protect_prepared(
                     prepared,
                     &mut publisher,
@@ -12241,9 +12255,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     address,
                     byte_len,
                     protections,
-                    &mut self.core.cleanup,
+                    &mut held,
                 );
-                let _settled = initiator.release(publisher.finish());
+                let settled = initiator.release(publisher.finish());
+                held.merge(settled, &mut self.core.cleanup);
                 status
             };
             for candidate in candidates.into_iter().flatten() {

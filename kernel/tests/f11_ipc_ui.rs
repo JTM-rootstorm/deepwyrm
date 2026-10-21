@@ -153,6 +153,20 @@ fn f11_move_only_ipc_wait_time_and_architecture_contracts() {
             fixture: "d5_ap_root_entry_clone.rs",
             expected_error: "error[E0277]: the trait bound `CarrierRuntimeState: Clone` is not satisfied",
         },
+        // D1 option B2 (design §11.2.9 item 4): held family-G releases merge only
+        // on their shootdown's settlement, which cannot be forged.
+        CompileFailCase {
+            fixture: "d1_held_releases_merge_without_settlement.rs",
+            expected_error: "error[E0061]: this method takes 2 arguments but 1 argument was supplied",
+        },
+        CompileFailCase {
+            fixture: "d1_nothing_published_forged.rs",
+            expected_error: "error[E0451]: field `_private` of struct `NothingPublished` is private",
+        },
+        CompileFailCase {
+            fixture: "d1_reclaim_permit_forged.rs",
+            expected_error: "error[E0451]: fields `request` and `target_count` of struct `ReclaimPermit` are private",
+        },
     ] {
         run_compile_fail_case(
             &rustc,
