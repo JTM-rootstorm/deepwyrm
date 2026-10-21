@@ -33,6 +33,7 @@ use super::cpu_slots::{CpuOwner, CpuSlots, OtherCpus, RemotelyStaged};
 use super::runtime_authority::{
     InterruptAuthorityHandle, RuntimeAuthorityHandle, RuntimeAuthorityLock,
 };
+use crate::one_shot::init_fields;
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -9663,56 +9664,76 @@ pub(super) fn enter(
         .take()
         .unwrap_or_else(|| panic!("no owner-local state for the BSP"));
     // Permanent storage (S2K-4, reset R2D): the lock and the carrier it guards live in one-shot
-    // static storage for the kernel's lifetime, not on the boot stack.
+    // static storage for the kernel's lifetime, not on the boot stack. Built in place there (S2K
+    // stage 4), so no whole-carrier temporary is materialized in this frame first.
     let runtime_ref: &'static RuntimeAuthorityLock<
         PrimordialRuntimeState<'static, RANGE_CAPACITY, ROLE_CAPACITY>,
-    > = PRIMORDIAL_RUNTIME_AUTHORITY.init(RuntimeAuthorityLock::new(PrimordialRuntimeState {
-        core: PrimordialRuntimeCore {
-            active,
-            stopping_claim: None,
-            stopping_claim_was_suspended: false,
-            rendezvous_reaper: None,
-            registry,
-            memory,
-            tasks,
-            shared,
-            services: FServiceState::new(),
-            spaces,
-            regions,
-            primordial_process: process,
-            primordial_root_key: root_key,
-            primordial_address_space,
-            #[cfg(any(
-                deepwyrm_wyr1_evidence,
-                deepwyrm_dw1b_evidence,
-                deepwyrm_wyr1b_evidence,
-                deepwyrm_dw1c_evidence,
-                deepwyrm_wyr1c_evidence,
-                deepwyrm_wyr1d_evidence,
-                deepwyrm_wyr1e_evidence,
-                deepwyrm_dw1e_evidence,
-                deepwyrm_r1_evidence,
-            ))]
-            evidence_init_process: None,
-            #[cfg(any(
-                deepwyrm_wyr1b_evidence,
-                deepwyrm_wyr1c_evidence,
-                deepwyrm_wyr1d_evidence,
-                deepwyrm_wyr1e_evidence,
-            ))]
-            evidence_init_thread: None,
-            channel_keys,
-            kernel_peer: Some(kernel_peer),
-            process_monitor: Some(process_monitor),
-            root_owner: Some(root_owner),
-            cleanup: CleanupQueue::new(),
-            rendezvous_cleanup: CleanupQueue::new(),
-            rendezvous_cleanup_staged: false,
-            #[cfg(feature = "test-support")]
-            g5_probe: G5PrimordialProbe::for_build(),
-        },
-        cpus,
-    }));
+    > = {
+        // SAFETY: the storage's one pointer is valid for writes of the whole lock, whose own
+        // fields `RuntimeAuthorityLock::init_in_place` writes; the two `init_fields!` write every
+        // field of the state and of its core from exhaustive field lists, and nothing is read
+        // before the storage is assumed initialized.
+        unsafe {
+            PRIMORDIAL_RUNTIME_AUTHORITY.init_in_place(|lock| {
+                RuntimeAuthorityLock::init_in_place(lock, |state| {
+                    init_fields!(
+                        core::ptr::addr_of_mut!((*state).core),
+                        PrimordialRuntimeCore {
+                            active: active,
+                            stopping_claim: None,
+                            stopping_claim_was_suspended: false,
+                            rendezvous_reaper: None,
+                            registry: registry,
+                            memory: memory,
+                            tasks: tasks,
+                            shared: shared,
+                            services: (FServiceState::new()),
+                            spaces: spaces,
+                            regions: regions,
+                            primordial_process: process,
+                            primordial_root_key: root_key,
+                            primordial_address_space: primordial_address_space,
+                            #[cfg(any(
+                                deepwyrm_wyr1_evidence,
+                                deepwyrm_dw1b_evidence,
+                                deepwyrm_wyr1b_evidence,
+                                deepwyrm_dw1c_evidence,
+                                deepwyrm_wyr1c_evidence,
+                                deepwyrm_wyr1d_evidence,
+                                deepwyrm_wyr1e_evidence,
+                                deepwyrm_dw1e_evidence,
+                                deepwyrm_r1_evidence,
+                            ))]
+                            evidence_init_process: None,
+                            #[cfg(any(
+                                deepwyrm_wyr1b_evidence,
+                                deepwyrm_wyr1c_evidence,
+                                deepwyrm_wyr1d_evidence,
+                                deepwyrm_wyr1e_evidence,
+                            ))]
+                            evidence_init_thread: None,
+                            channel_keys: channel_keys,
+                            kernel_peer: (Some(kernel_peer)),
+                            process_monitor: (Some(process_monitor)),
+                            root_owner: (Some(root_owner)),
+                            cleanup: (CleanupQueue::new()),
+                            rendezvous_cleanup: (CleanupQueue::new()),
+                            rendezvous_cleanup_staged: false,
+                            #[cfg(feature = "test-support")]
+                            g5_probe: (G5PrimordialProbe::for_build()),
+                        }
+                    );
+                    init_fields!(
+                        state,
+                        PrimordialRuntimeState {
+                            core: in_place,
+                            cpus: cpus,
+                        }
+                    );
+                });
+            })
+        }
+    };
 
     // Reset card R1B: record the live authority's ticket pair once so host GDB
     // over the QEMU gdbstub can read it without executing guest code. Since

@@ -1976,7 +1976,12 @@ fn f1_facades_are_reached_only_through_their_published_pointers() {
         !enter.contains("core::pin::pin!("),
         "a runtime object is pinned on the boot stack"
     );
-    assert!(enter.contains("PRIMORDIAL_RUNTIME_AUTHORITY.init(RuntimeAuthorityLock::new("));
+    // S2K stage 4: it is built in place there, so no whole-lock temporary exists on that frame.
+    assert!(enter.contains("PRIMORDIAL_RUNTIME_AUTHORITY.init_in_place("));
+    assert!(
+        !enter.contains("RuntimeAuthorityLock::new("),
+        "the runtime authority is built as a temporary and then moved"
+    );
     // The storage's one `&'static mut` is consumed once into the base pointer; nothing after it
     // re-derives a reference to the array or a facade, and CPU0 enters through the published
     // pointer itself.

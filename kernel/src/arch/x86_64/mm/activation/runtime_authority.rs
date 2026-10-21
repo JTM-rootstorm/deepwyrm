@@ -26,6 +26,7 @@ use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::GuardFree;
+use crate::one_shot::init_fields;
 
 /// The ticket pair, `repr(C)` so `serving` sits exactly one word after
 /// `next_ticket`.
@@ -73,6 +74,35 @@ impl<T> RuntimeAuthorityLock<T> {
             handles_taken: AtomicBool::new(false),
             interrupt_handles_taken: AtomicBool::new(false),
             value: UnsafeCell::new(value),
+        }
+    }
+
+    /// Builds the lock directly at `slot`, with its value built in place by
+    /// `value`, so no whole-lock temporary exists (S2K stage 4).
+    ///
+    /// # Safety
+    ///
+    /// `slot` is valid for writes of `Self` and not otherwise referenced, and
+    /// `value` fully initializes the `T` behind its pointer before it returns,
+    /// reading nothing through it. Afterwards `*slot` is fully initialized.
+    pub(super) unsafe fn init_in_place(slot: *mut Self, value: impl FnOnce(*mut T)) {
+        // SAFETY: `slot` is valid for writes of `Self` (this function's contract); `init_fields!`
+        // writes every field of the lock but `value` from its exhaustive field list, and `value`
+        // builds that one in place through its `UnsafeCell`'s raw pointer.
+        unsafe {
+            value(UnsafeCell::raw_get(core::ptr::addr_of_mut!((*slot).value)));
+            init_fields!(
+                slot,
+                RuntimeAuthorityLock {
+                    tickets: (TicketPair {
+                        next_ticket: AtomicU64::new(0),
+                        serving: AtomicU64::new(0),
+                    }),
+                    handles_taken: (AtomicBool::new(false)),
+                    interrupt_handles_taken: (AtomicBool::new(false)),
+                    value: in_place,
+                }
+            );
         }
     }
 
@@ -247,6 +277,24 @@ mod tests {
             let _ = lock.interrupt_handles::<1>();
         }));
         assert!(again.is_err());
+    }
+
+    /// A lock built in place serves exactly like one built by value.
+    #[test]
+    fn a_lock_built_in_place_serves_its_value() {
+        let mut storage = core::mem::MaybeUninit::<RuntimeAuthorityLock<[u32; 2]>>::uninit();
+        // SAFETY: the storage is a fresh local, valid for writes and unreferenced, and the closure
+        // writes the whole `[u32; 2]`.
+        let lock = unsafe {
+            RuntimeAuthorityLock::init_in_place(storage.as_mut_ptr(), |value| value.write([3, 4]));
+            storage.assume_init_ref()
+        };
+        let [mut handle] = lock.handles::<1>();
+        assert_eq!(*handle.lock(), [3, 4]);
+        assert_eq!(lock.tickets.next_ticket.load(Ordering::Relaxed), 1);
+        let [mut interrupt] = lock.interrupt_handles::<1>();
+        interrupt.lock()[0] = 5;
+        assert_eq!(*handle.lock(), [5, 4]);
     }
 
     #[test]
