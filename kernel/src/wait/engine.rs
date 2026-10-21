@@ -1421,20 +1421,26 @@ mod tests {
             None
         );
 
-        // Simulate a transition after the caller's initial scan but before
-        // source registration. register_wait's source lock must catch it.
-        assert_eq!(
-            events
-                .signal(event_key, DwSignals(0), DW_SIGNAL_SIGNALED, &waits)
-                .unwrap()
-                .len(),
-            0
-        );
+        // The source flips after `begin_registered_wait`'s own initial scan
+        // and before source registration: the deadline registration falls
+        // in that window, so the flip is injected there. The registration
+        // barrier must catch it. (Signalling before the call, as this test
+        // once did, let the initial scan return ready, so the barrier was
+        // never reached.)
         let mut operations = WaitOperationRegistry::<u32, 1>::new();
+        let mut deadlines = ReadyThenClaimDeadline {
+            queue: crate::time::DeadlineQueue::new(),
+            ledger: execution.blocked_operations(),
+            winner: None,
+            events: &events,
+            waits: &waits,
+            event: event_key,
+            flipped: false,
+        };
         match begin_registered_wait(
             set,
             0x55,
-            WaitDeadline::Infinite,
+            WaitDeadline::Finite(70),
             WaitBeginContext {
                 registry: &mut registry,
                 tasks: &mut tasks,
@@ -1451,7 +1457,7 @@ mod tests {
                 process,
                 thread,
             },
-            None,
+            Some(&mut deadlines),
         )
         .unwrap_or_else(|failure| panic!("wait begin failed: {:?}", failure.error))
         {
@@ -1461,12 +1467,18 @@ mod tests {
                 assert_eq!(selection.observed, DW_SIGNAL_SIGNALED);
             }
             WaitBeginOutcome::Suspended { .. } => panic!("ready registration barrier blocked"),
-            WaitBeginOutcome::TimedOut { .. } => panic!("infinite ready wait timed out"),
+            WaitBeginOutcome::TimedOut { .. } => panic!("a ready wait timed out"),
         }
         assert_eq!(
             execution.scheduler_state(thread),
             Some(SchedulerThreadState::Running)
         );
+        assert!(
+            deadlines.flipped,
+            "the flip never reached the registration window"
+        );
+        assert_eq!(deadlines.queue.earliest(), None);
+        assert!(!execution.blocked_operations().has_thread(thread));
         assert_eq!(operations.len(), 0);
         assert_eq!(waits.len(), 0);
         close_event(&mut registry, &mut tasks, &events, process, event);
@@ -2429,10 +2441,11 @@ mod tests {
     struct ReadyThenClaimDeadline<'a> {
         queue: crate::time::DeadlineQueue<1>,
         ledger: &'a crate::task::BlockedOperationRegistry<1>,
-        winner: BlockedOperationWinner,
+        winner: Option<BlockedOperationWinner>,
         events: &'a Events,
         waits: &'a Waits,
         event: super::super::EventKey,
+        flipped: bool,
     }
 
     impl WaitDeadlineAuthority for ReadyThenClaimDeadline<'_> {
@@ -2452,7 +2465,10 @@ mod tests {
                     .len(),
                 0
             );
-            assert!(self.ledger.try_claim_winner(wake, self.winner).unwrap());
+            self.flipped = true;
+            if let Some(winner) = self.winner {
+                assert!(self.ledger.try_claim_winner(wake, winner).unwrap());
+            }
             Ok(registration)
         }
 
@@ -2491,10 +2507,11 @@ mod tests {
             let mut deadlines = ReadyThenClaimDeadline {
                 queue: crate::time::DeadlineQueue::new(),
                 ledger: execution.blocked_operations(),
-                winner,
+                winner: Some(winner),
                 events: &events,
                 waits: &waits,
                 event: event_key,
+                flipped: false,
             };
             match begin_registered_wait(
                 set,
