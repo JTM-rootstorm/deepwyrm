@@ -1022,3 +1022,152 @@ Each commit is semantic and carries its own SMP VM evidence (§5.3).
    - Commit 2 lands only if the §11.2.4 hypothesis is proved from source.
    - Commit 3 orders T before P, never P before T, and makes that order a
      type fact if it is feasible.
+
+#### 11.2.9 Option B: the shootdown wait outside the hold (2026-10-21)
+
+D1 commit 4 (`cdacbef`) took option A. Every spin that runs with IF clear
+now services this CPU's TLB mailbox, which removes §11.2.2's deadlock.
+The acknowledgement wait for map, unmap and protect still runs inside the
+T and P hold, so H0 §12.8 stays open for family G. This section designs
+option B, which closes it. No B code lands before this section is
+accepted.
+
+**Mike's decision (2026-10-21).** A second mutation on the same address
+space waits its turn. Its initiator waits for the in-flight mutation,
+servicing its own mailbox. This needs no ABI change, and no new documented
+error for map, unmap or protect.
+
+**Why releasing T and P is not enough** (all measured at `c2a5426`):
+
+1. Each CPU's TLB mailbox holds one request. `LiveTlbMailbox::publish`
+   panics while a request is outstanding (`tlb_mailbox.rs:54`). Today T
+   keeps one shootdown in flight system-wide.
+2. Any CPU that spins with IF clear and does not service its mailbox can
+   deadlock an initiator. Option A now covers this.
+3. While a barrier is published, `AddressSpaceCoherency::prepare_mutation`
+   refuses a second mutation with `MutationInFlight` (`coherency.rs:323`),
+   and so does `prepare_uncontended_teardown`.
+4. `AddressRegion`'s transaction commits the model right after
+   `publish_replace` (`region.rs`, after the publish call). The adapters
+   then push the mapping releases into the shared `core.cleanup`
+   (`queue_mapping_releases`, `adapters/address_region.rs`). Any CPU that
+   takes T would drain them, so reclamation could run before the
+   acknowledgement. That violates H0 §12.6.
+
+**Design.**
+
+- **S, the shootdown-initiator lock: one shootdown in flight
+  system-wide.** S is chosen over multi-slot mailboxes because of the
+  following.
+  - The one-slot mailbox and its tests stay as they are.
+  - One request per target keeps acknowledgement routing trivial.
+  - S also implements Mike's decision directly: a second mutation on the
+    same address space cannot prepare until the first has completed its
+    acknowledgement and released S. So `MutationInFlight` cannot be
+    reached from map, unmap or protect.
+  - Shootdowns with remote targets are rare (unmap, protect and
+    replacement over an address space resident elsewhere), so one in
+    flight costs little.
+
+  No concrete reason pointed the other way.
+- **Lock order: T, then P, then S.** S is acquired while T and P are held,
+  before `prepare_mutation`. It is then held alone, after T and P are
+  released, through the acknowledgement, and released only once the
+  `ReclaimPermit` exists.
+
+  While holding only S, a CPU acquires nothing. It waits only for
+  acknowledgements, which targets give from e2 or from inside any IF-clear
+  spin (option A).
+
+  A CPU spinning for S must hold T, so at most one CPU spins on S at a
+  time; every other CPU spins on T and services its mailbox. S's spin also
+  calls the `SpinService`.
+
+  Type shape: an `S` guard is minted only from a held P guard, like
+  `PagingAccess`. Unlike P, it is released by consuming a permit, not by
+  lexical scope, so it can outlive the T and P guards it was taken
+  beneath.
+- **Item 2:** every IF-clear spin services the mailbox. Option A did this
+  for T, P and `wait_step`. B adds S's spin. Any later spin lock with IF
+  clear takes a `SpinService` by construction, as both lock types now
+  require.
+- **Item 4: per-transaction held-back final releases.** The mapping
+  releases of a published mutation go into a `HeldReleases` value owned by
+  the syscall frame, not into `core.cleanup`. It merges into `core.cleanup`
+  only through `HeldReleases::merge(self, permit: ReclaimPermit, cleanup)`.
+  A permit exists only after every target has acknowledged, so
+  "acknowledgement precedes reclamation" (H0 §12.6) becomes a type fact.
+
+**Invariant that makes releasing T and P before the acknowledgement safe:**
+the transaction's identity plus the permit.
+
+- The coherency `MutationTransaction` generation in the `Published` phase
+  excludes every other mutation of that address space, and its teardown.
+- S excludes every other initiator system-wide, so target mailboxes stay
+  single-slot.
+- The page-table publication and the model commit (`mappings = next`) are
+  complete before release. The only thing deferred is reclamation, held
+  in `HeldReleases`.
+- At the post-acknowledgement commit under T, `RuntimePhaseReservation`
+  revalidates the CPU's Thread and root generation (drift is a `panic!`).
+  `HeldReleases::merge` takes the `ReclaimPermit` from
+  `barrier.try_complete()`.
+
+**Flow for map, unmap and protect:**
+
+1. Under T, then P: prepare (handles, region reservation, table
+   candidates).
+2. Still under T and P: acquire S, `prepare_mutation`, publish the page
+   tables, commit the model, publish the target mailboxes, and collect the
+   `HeldReleases`.
+3. Drop P, then T, and take `GuardFree`. Wait for the acknowledgements,
+   servicing the mailbox, then mint the permit.
+4. Release S.
+5. Reacquire T: revalidate the phase, merge the `HeldReleases` with the
+   permit, and leave through `ready_to_return`, whose drain now runs after
+   the acknowledgement.
+
+Teardown uses `prepare_uncontended_teardown`, which needs zero residents,
+so it publishes no remote request. It still takes S before preparing, so
+it too waits its turn instead of meeting `MutationInFlight`.
+
+**Implementation commits.** Each is semantic and carries its own SMP VM
+evidence.
+
+- **B1. Introduce S, held around today's publish+wait inside the hold.**
+  Behavior is unchanged except for the lock structure. It adds UI cases:
+  S without P, and S outliving its permit.
+- **B2. `HeldReleases` and the permit-gated merge, still inside the
+  hold.** The three adapters' `queue_mapping_releases` calls go into the
+  held set. UI case: a merge without a permit.
+- **B3. Split `CoherentAddressSpacePublisher` into publish and await, and
+  move the await out of the hold for map, unmap and protect.** It takes a
+  `GuardFree`, so T and P are released. This closes H0 §12.8 for family G.
+- **B4. Teardown acquires S.** This may fold into B1 if the change is
+  small.
+
+**Overlap with D3** (the owned paging transaction, I1 step 2):
+
+- B2 and B3 are the commit point of D3's transaction: publish, then a
+  permit-gated reclamation.
+- D3 would add the owned prepare payload ahead of B's step 1.
+
+B does not attempt D3's other half, an owned paging-transaction type that
+replaces the adapters' borrow of the paging authority. B must not
+foreclose it.
+
+**Fixture to propose to Wyrmroot (the coordinator sequences it).** This is
+the minimal multithreaded unmapper:
+
+- One Process with two Threads that the scheduler places on different
+  CPUs (normal/smp).
+- Thread A loops N times over: create a MemoryObject, map it, write one
+  byte, unmap, close.
+- Thread B stays resident in the same address space. It alternates a user
+  spin with a cheap syscall (`ClockGet`), so it is sometimes in user mode
+  (it takes e2) and sometimes spinning on T (it services the mailbox from
+  the spin).
+- Pass: A completes all N iterations and both Threads exit cleanly.
+- Fail: any panic, including "address-space shootdown acknowledgement
+  timeout", or a hang.
+- Before B3, it proves option A under contention. After B3, it proves B.
