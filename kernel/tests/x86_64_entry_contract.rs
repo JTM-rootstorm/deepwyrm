@@ -442,15 +442,19 @@ fn selector27_binds_reporter_start_to_fixed_stack_root_and_guard() {
         );
     }
 
+    // D1 commit 9: ThreadStart's guarded half is `run_thread_start`, whose
+    // return-validation session closes before the evidence observation.
     let thread_start = primordial
-        .split_once("NativeSyscallRequest::ThreadStart { args, args_size } => {")
+        .split_once("    fn run_thread_start(")
         .expect("ThreadStart dispatch")
         .1
-        .split_once("NativeSyscallRequest::ProcessTerminate")
+        .split_once("\n    }\n")
         .expect("ThreadStart dispatch extent")
         .0;
-    let commit = thread_start.find("thread_start_with_access(").unwrap();
-    let release_user = thread_start.find("drop(user);").unwrap();
+    let commit = thread_start.find("thread_start_prepared(").unwrap();
+    let release_user = thread_start
+        .find("&mut self.core.cleanup,\n            )\n        };")
+        .unwrap();
     let success = thread_start.find("if status == DW_STATUS_SUCCESS").unwrap();
     let observe = thread_start
         .find("self.observe_wyr1b_system_init_start()")

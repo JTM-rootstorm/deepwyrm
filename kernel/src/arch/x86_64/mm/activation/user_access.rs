@@ -105,6 +105,68 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> super::runtime_aut
 {
 }
 
+/// A user-return validation session (D1 commit 9): read-only walks of a
+/// resident process root, checking that a user RIP is mapped executable and
+/// the byte below a user RSP is mapped writable, and the retargeting that
+/// selects which process root is walked. It reads page-table entries
+/// through the scratch window, which P serializes, and never user memory.
+/// So it is no usercopy, and H0 §12.8 does not apply to it: a return
+/// authorization keeps it in its runtime-authority hold, where it checks the
+/// root's binding generation.
+pub(crate) struct ReturnValidationSession<
+    'borrow,
+    'root,
+    const RANGE_CAPACITY: usize,
+    const ROLE_CAPACITY: usize,
+> {
+    session: LiveProcessAddressSpace<'borrow, 'root, RANGE_CAPACITY, ROLE_CAPACITY>,
+}
+
+impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    ReturnValidationSession<'borrow, 'root, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    pub(super) const fn new(
+        session: LiveProcessAddressSpace<'borrow, 'root, RANGE_CAPACITY, ROLE_CAPACITY>,
+    ) -> Self {
+        Self { session }
+    }
+
+    pub(crate) fn select_process_for_return_validation(
+        &mut self,
+        process: crate::task::ProcessKey,
+    ) -> Result<(), super::RootBindingError> {
+        self.session.select_process_for_return_validation(process)
+    }
+}
+
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    crate::arch::x86_64::syscall::UserReturnMappingValidation
+    for ReturnValidationSession<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn executable_at(&mut self, address: u64) -> bool {
+        crate::arch::x86_64::syscall::UserReturnMappingValidation::executable_at(
+            &mut self.session,
+            address,
+        )
+    }
+
+    fn writable_byte_below(&mut self, stack_pointer: u64) -> bool {
+        crate::arch::x86_64::syscall::UserReturnMappingValidation::writable_byte_below(
+            &mut self.session,
+            stack_pointer,
+        )
+    }
+}
+
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    crate::arch::x86_64::syscall::ProcessUserReturnMappingValidation
+    for ReturnValidationSession<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn process_key(&self) -> crate::task::ProcessKey {
+        crate::arch::x86_64::syscall::ProcessUserReturnMappingValidation::process_key(&self.session)
+    }
+}
+
 /// Waits, with neither T nor P held, for every acknowledgement of a family-G
 /// shootdown published beneath them, and mints its reclaim permit (D1 option
 /// B3, design §11.2.9). The `GuardFree` token makes "no runtime lock across

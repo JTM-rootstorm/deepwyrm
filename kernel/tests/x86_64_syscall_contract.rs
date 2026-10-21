@@ -1198,15 +1198,15 @@ fn live_timer_expiry_is_bound_and_serviced_only_from_carrier_safe_points() {
     assert!(runtime.contains("general Timer expiry service escaped CPU0 ownership"));
     assert!(runtime.contains(".expire(token, &self.core.shared.waits)"));
     assert!(runtime.contains("timer_expiries:\n        IrqSpinMutex<"));
-    // D1 commits 5, 6, 6d, 7, 7b, 7c, 8, 8b and option B3 add the family-A,
-    // family-B, object-info, ChannelSend, ChannelReceive, ProcessCreate, wait,
-    // atomic-wait and family-G first holds, which service CPU0's timer
-    // expiries exactly like the ordinary hold.
+    // D1 commits 5, 6, 6d, 7, 7b, 7c, 8, 8b, option B3 and commit 9 add the
+    // family-A, family-B, object-info, ChannelSend, ChannelReceive,
+    // ProcessCreate, wait, atomic-wait, family-G and ThreadStart first holds,
+    // which service CPU0's timer expiries exactly like the ordinary hold.
     assert_eq!(
         runtime
             .matches("runtime.service_pending_timer_expiries_on_bootstrap();")
             .count(),
-        13
+        14
     );
     let shared_carrier = runtime
         .split_once(
@@ -1330,6 +1330,9 @@ fn i2_live_dispatch_covers_every_stress_payload_syscall_family() {
         "NativeSyscallRequest::AddressRegionProtect",
         "NativeSyscallRequest::ProcessTerminate",
         "NativeSyscallRequest::ProcessExit",
+        // D1 commit 9: I2's stage 7 (concurrent unmap) starts a second Thread.
+        "NativeSyscallRequest::ThreadCreate",
+        "NativeSyscallRequest::ThreadStart",
     ] {
         assert!(runtime.contains(family), "live carrier omitted {family}");
     }
@@ -2319,7 +2322,7 @@ fn family_a_usercopy_runs_guard_free() {
         .expect("phase commit");
     assert!(prepare < copy && copy < walk && walk < commit);
     assert!(primordial.contains(
-        "let handled = match self\n                .handle_guard_free_usercopy(request)\n                .or_else(|| self.handle_deferred_output(request))\n                .or_else(|| self.handle_object_info(request))\n                .or_else(|| self.handle_channel_send(request))\n                .or_else(|| self.handle_channel_receive(request))\n                .or_else(|| self.handle_process_create(request))\n                .or_else(|| self.handle_wait(request))\n                .or_else(|| self.handle_atomic_wait(request))\n                .or_else(|| self.handle_address_region_mutation(request))\n            {"
+        "let handled = match self\n                .handle_guard_free_usercopy(request)\n                .or_else(|| self.handle_deferred_output(request))\n                .or_else(|| self.handle_object_info(request))\n                .or_else(|| self.handle_channel_send(request))\n                .or_else(|| self.handle_channel_receive(request))\n                .or_else(|| self.handle_process_create(request))\n                .or_else(|| self.handle_wait(request))\n                .or_else(|| self.handle_atomic_wait(request))\n                .or_else(|| self.handle_address_region_mutation(request))\n                .or_else(|| self.handle_thread_start(request))\n            {"
     ));
     assert!(primordial.contains(
         "NativeSyscallRequest::AbiGetInfo { .. } => {\n                unreachable!(\"AbiGetInfo must be served guard-free by the CPU-local facade\")"
@@ -2864,4 +2867,45 @@ fn family_g_waits_for_acknowledgement_outside_the_hold() {
         !user_access
             .contains("super::runtime_authority::PagingHeld\n    for LiveProcessAddressSpace<")
     );
+}
+
+/// Text test (D1 commit 9, design §11.2.3 family D): `ThreadStart` copies its
+/// arguments in with P alone, then resolves, validates RIP and RSP on a
+/// return-validation session, and starts the Thread under the guard, with no
+/// usercopy there.
+#[test]
+fn thread_start_copies_in_outside_the_hold() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let helper = primordial
+        .split_once("    fn handle_thread_start(")
+        .expect("ThreadStart facade helper")
+        .1
+        .split_once("\n    }\n")
+        .expect("ThreadStart facade helper extent")
+        .0;
+    let order = [
+        "runtime.prepare_guard_free_usercopy()",
+        "self.paging.guard_free_access(self.runtime.guard_free())",
+        "crate::syscall::thread_start_input(&mut user, args, args_size)",
+        "let mut guard = self.runtime.lock();",
+        "runtime.run_thread_start(input)",
+        "runtime.commit_runtime_phase(phase);",
+    ]
+    .map(|anchor| {
+        helper
+            .find(anchor)
+            .unwrap_or_else(|| panic!("ThreadStart helper omits {anchor}"))
+    });
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]));
+    let run = primordial
+        .split_once("    fn run_thread_start(")
+        .expect("guarded ThreadStart")
+        .1
+        .split_once("\n    }\n")
+        .expect("guarded ThreadStart extent")
+        .0;
+    assert!(run.contains("paging.return_validation_session("));
+    assert!(run.contains("crate::syscall::thread_start_prepared("));
+    assert!(!run.contains("current_process_address_space"));
+    assert!(primordial.contains("\"ThreadStart is served by the CPU-local facade (D1 commit 9)\""));
 }

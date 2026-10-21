@@ -2877,6 +2877,49 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Some(Ok(ready))
     }
 
+    /// `ThreadStart` (design §11.2.3 family D, D1 commit 9).
+    /// 1. A first hold as for family A.
+    /// 2. With P alone, `thread_start_input` copies in and validates the
+    ///    arguments.
+    /// 3. A second hold resolves the Thread, walks RIP and RSP on a
+    ///    return-validation session (no usercopy), starts it, commits the
+    ///    phase and leaves through `ready_to_return`.
+    /// Statuses and their precedence are the adapter's. `None` for every
+    /// other request.
+    // Kept out of line, like the other facade helpers, so the ordinary
+    // handler's measured frame does not absorb it.
+    #[inline(never)]
+    fn handle_thread_start(
+        &mut self,
+        request: NativeSyscallRequest,
+    ) -> Option<Result<crate::syscall::native::ReturnReady, ()>> {
+        let NativeSyscallRequest::ThreadStart { args, args_size } = request else {
+            return None;
+        };
+        let cpu = self.cpu;
+        let Ok((phase, root, process)) = self.with_synchronized_runtime_at_safe_point(|runtime| {
+            if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                runtime.service_pending_timer_expiries_on_bootstrap();
+            }
+            runtime.prepare_guard_free_usercopy()
+        }) else {
+            return Some(Err(()));
+        };
+        let input = {
+            let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+            let mut paging = access.lock();
+            let mut user = paging.usercopy_process_address_space(root, process);
+            crate::syscall::thread_start_input(&mut user, args, args_size)
+        };
+        let mut guard = self.runtime.lock();
+        let mut runtime = guard.on(&mut self.owned);
+        let status = runtime.run_thread_start(input);
+        runtime.commit_runtime_phase(phase);
+        Some(Ok(
+            runtime.ready_to_return(NativeSyscallResult::returning(status))
+        ))
+    }
+
     /// `AddressRegionMap`, `AddressRegionUnmap` and `AddressRegionProtect`
     /// (design §11.2.3 family G and §11.2.9, D1 option B3).
     /// 1. A first hold, under T and then P: prepare, take S, publish the page
@@ -4525,6 +4568,18 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> crate::syscall::Pr
     ) {
         self.rollback_empty_child_address_space(process, address_space)
             .unwrap_or_else(|error| panic!("empty child-root rollback drifted: {error:?}"));
+    }
+}
+
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> crate::syscall::ThreadStartRetarget
+    for user_access::ReturnValidationSession<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn retarget_for_thread_start(
+        &mut self,
+        process: ProcessKey,
+    ) -> Result<(), deepwyrm_abi::DwStatus> {
+        self.select_process_for_return_validation(process)
+            .map_err(|_| DW_STATUS_BAD_STATE)
     }
 }
 
@@ -9478,6 +9533,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 .or_else(|| self.handle_wait(request))
                 .or_else(|| self.handle_atomic_wait(request))
                 .or_else(|| self.handle_address_region_mutation(request))
+                .or_else(|| self.handle_thread_start(request))
             {
                 Some(handled) => handled,
                 None => {
@@ -11559,6 +11615,55 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         )
     }
 
+    /// The guarded half of `ThreadStart` (D1 commit 9): resolve, retarget a
+    /// return-validation session, walk RIP and RSP, start the Thread. No
+    /// usercopy; the arguments were copied in with P alone.
+    fn run_thread_start(
+        &mut self,
+        args: Result<deepwyrm_abi::DwThreadStartArgsV1, deepwyrm_abi::DwStatus>,
+    ) -> deepwyrm_abi::DwStatus {
+        let status = {
+            let mut paging = self.paging.lock();
+            let mut validation = paging.return_validation_session(
+                self.own.active_root.as_ref().expect("active root"),
+                self.own.scheduled().process,
+            );
+            crate::syscall::thread_start_prepared(
+                args,
+                &mut validation,
+                &mut self.core.registry,
+                &mut self.core.tasks,
+                &self.core.shared.execution,
+                self.own.scheduled().process,
+                &mut self.core.cleanup,
+            )
+        };
+        #[cfg(any(
+            deepwyrm_wyr1b_evidence,
+            deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence,
+            deepwyrm_wyr1e_evidence,
+        ))]
+        if status == DW_STATUS_SUCCESS {
+            self.observe_wyr1b_system_init_start()
+                .unwrap_or_else(|error| {
+                    crate::test_support::complete_fail(wyr1b_submit_detail(error))
+                });
+        }
+        #[cfg(deepwyrm_dw1c_evidence)]
+        if status == DW_STATUS_SUCCESS
+            && self.own.scheduled().process == self.core.primordial_process
+            && self.core.evidence_init_process.is_some()
+        {
+            crate::test_support::DW1C_EVIDENCE
+                .install()
+                .unwrap_or_else(|error| {
+                    crate::test_support::complete_fail(0x2810_c000 | error as u32)
+                });
+        }
+        status
+    }
+
     /// The guarded half of `WaitOne` and `WaitMany` (D1 commit 8): the
     /// same wait begin as the ordinary dispatch, over prepared input.
     fn begin_wait(
@@ -11975,48 +12080,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             NativeSyscallRequest::TaskGroupTerminate { .. } => {
                 unreachable!("TaskGroupTerminate must be intercepted by the CPU-local facade")
             }
-            NativeSyscallRequest::ThreadStart { args, args_size } => {
-                let mut paging = self.paging.lock();
-                let mut user = paging.current_process_address_space(
-                    self.own.active_root.as_ref().expect("active root"),
-                    self.own.scheduled().process,
-                );
-                let status = crate::syscall::thread_start_with_access(
-                    &mut user,
-                    &mut self.core.registry,
-                    &mut self.core.tasks,
-                    &self.core.shared.execution,
-                    self.own.scheduled().process,
-                    args,
-                    args_size,
-                    &mut self.core.cleanup,
-                );
-                drop(user);
-                drop(paging);
-                #[cfg(any(
-                    deepwyrm_wyr1b_evidence,
-                    deepwyrm_wyr1c_evidence,
-                    deepwyrm_wyr1d_evidence,
-                    deepwyrm_wyr1e_evidence,
-                ))]
-                if status == DW_STATUS_SUCCESS {
-                    self.observe_wyr1b_system_init_start()
-                        .unwrap_or_else(|error| {
-                            crate::test_support::complete_fail(wyr1b_submit_detail(error))
-                        });
-                }
-                #[cfg(deepwyrm_dw1c_evidence)]
-                if status == DW_STATUS_SUCCESS
-                    && self.own.scheduled().process == self.core.primordial_process
-                    && self.core.evidence_init_process.is_some()
-                {
-                    crate::test_support::DW1C_EVIDENCE
-                        .install()
-                        .unwrap_or_else(|error| {
-                            crate::test_support::complete_fail(0x2810_c000 | error as u32)
-                        });
-                }
-                NativeSyscallResult::returning(status)
+            NativeSyscallRequest::ThreadStart { .. } => {
+                unreachable!("ThreadStart is served by the CPU-local facade (D1 commit 9)")
             }
             NativeSyscallRequest::ProcessTerminate {
                 process,

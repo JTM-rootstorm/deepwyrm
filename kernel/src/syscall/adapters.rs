@@ -7547,11 +7547,47 @@ pub(crate) trait ThreadStartMappingAccess:
     -> Result<(), DwStatus>;
 }
 
-/// Decodes the ThreadStart record against the active caller first, then
-/// retargets this same serialized scratch session to the child Process solely
-/// for RIP/RSP mapping validation. No caller usercopy occurs after retargeting.
-pub(crate) fn thread_start_with_access<
-    U: ThreadStartMappingAccess,
+/// Retargets a ThreadStart validation session to the started Thread's
+/// Process (D1 commit 9). Every `ThreadStartMappingAccess` can.
+pub(crate) trait ThreadStartRetarget:
+    crate::arch::x86_64::syscall::ProcessUserReturnMappingValidation
+{
+    fn retarget_for_thread_start(&mut self, process: ProcessKey) -> Result<(), DwStatus>;
+}
+
+impl<T: ThreadStartMappingAccess> ThreadStartRetarget for T {
+    fn retarget_for_thread_start(&mut self, process: ProcessKey) -> Result<(), DwStatus> {
+        self.select_process_for_return_validation(process)
+    }
+}
+
+/// ThreadStart's argument copy-in and validation (D1 commit 9), for the live
+/// runtime to run with no runtime lock held.
+pub(crate) fn thread_start_input<U: UserPageAccess>(
+    user: &mut U,
+    args_address: DwUserAddress,
+    args_size: u64,
+) -> Result<deepwyrm_abi::DwThreadStartArgsV1, DwStatus> {
+    if args_size != THREAD_START_BYTES as u64 {
+        return Err(DW_STATUS_INVALID_ARGUMENT);
+    }
+    let bytes = copy_input::<U, THREAD_START_BYTES>(user, args_address, 8)?;
+    let args = decode_thread_start(&bytes);
+    if args.size != THREAD_START_BYTES as u32
+        || args.version != 1
+        || args.flags != 0
+        || args.reserved != [0; 3]
+    {
+        return Err(DW_STATUS_INVALID_ARGUMENT);
+    }
+    Ok(args)
+}
+
+/// ThreadStart over copied arguments (D1 commit 9): resolve the Thread,
+/// retarget `access` to its Process, validate RIP and RSP by page-table walk,
+/// and start it. No user memory is touched.
+pub(crate) fn thread_start_prepared<
+    U: ThreadStartRetarget,
     const OBJECTS: usize,
     const GROUPS: usize,
     const PROCESSES: usize,
@@ -7559,30 +7595,18 @@ pub(crate) fn thread_start_with_access<
     const HANDLES: usize,
     const EXECUTION: usize,
 >(
+    args: Result<deepwyrm_abi::DwThreadStartArgsV1, DwStatus>,
     access: &mut U,
     registry: &mut ObjectRegistry<OBJECTS>,
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
     current_process: ProcessKey,
-    args_address: DwUserAddress,
-    args_size: u64,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> DwStatus {
-    if args_size != THREAD_START_BYTES as u64 {
-        return DW_STATUS_INVALID_ARGUMENT;
-    }
-    let bytes = match copy_input::<U, THREAD_START_BYTES>(access, args_address, 8) {
-        Ok(bytes) => bytes,
+    let args = match args {
+        Ok(args) => args,
         Err(status) => return status,
     };
-    let args = decode_thread_start(&bytes);
-    if args.size != THREAD_START_BYTES as u32
-        || args.version != 1
-        || args.flags != 0
-        || args.reserved != [0; 3]
-    {
-        return DW_STATUS_INVALID_ARGUMENT;
-    }
     let pin = match resolve_current_handle(
         tasks,
         registry,
@@ -7602,7 +7626,7 @@ pub(crate) fn thread_start_with_access<
             return task_status(error);
         }
     };
-    if let Err(status) = access.select_process_for_return_validation(target_process) {
+    if let Err(status) = access.retarget_for_thread_start(target_process) {
         release_lookup_pin(registry, pin, cleanup);
         return status;
     }
@@ -7628,6 +7652,39 @@ pub(crate) fn thread_start_with_access<
         Ok(()) => DW_STATUS_SUCCESS,
         Err(error) => start_thread_status(error),
     }
+}
+
+/// Decodes the ThreadStart record against the active caller first, then
+/// retargets this same serialized scratch session to the child Process solely
+/// for RIP/RSP mapping validation. No caller usercopy occurs after retargeting.
+pub(crate) fn thread_start_with_access<
+    U: ThreadStartMappingAccess,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EXECUTION: usize,
+>(
+    access: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    current_process: ProcessKey,
+    args_address: DwUserAddress,
+    args_size: u64,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
+    let args = thread_start_input(access, args_address, args_size);
+    thread_start_prepared(
+        args,
+        access,
+        registry,
+        tasks,
+        execution,
+        current_process,
+        cleanup,
+    )
 }
 
 #[cfg(test)]
